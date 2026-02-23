@@ -13,7 +13,7 @@
 
 **Stream Tables for PostgreSQL 18**
 
-pg_stream brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](plans/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
+pg_stream brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
 
 ## Key Features
 

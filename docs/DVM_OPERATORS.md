@@ -4,7 +4,7 @@ This document describes the Differential View Maintenance (DVM) operators implem
 
 ## Prior Art
 
-- Budiu, M. et al. (2023). "DBSP: Automatic Incremental View Maintenance." VLDB 2023. ([comparison](../plans/research/DBSP_COMPARISON.md))
+- Budiu, M. et al. (2023). "DBSP: Automatic Incremental View Maintenance." VLDB 2023. ([comparison](research/DBSP_COMPARISON.md))
 - Gupta, A. & Mumick, I.S. (1999). *Materialized Views: Techniques, Implementations, and Applications.* MIT Press.
 - Koch, C. et al. (2014). "DBToaster: Higher-order Delta Processing for Dynamic, Frequently Fresh Views." VLDB Journal.
 - PostgreSQL 9.4+ — Materialized views with `REFRESH MATERIALIZED VIEW CONCURRENTLY`.
