@@ -26,6 +26,7 @@ jobs:
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -64,5 +65,5 @@ jobs:
         with:
           name: coverage-lcov
           path: coverage/lcov.info
-          retention-days: 14
+          retention-days: 7
           if-no-files-found: ignore

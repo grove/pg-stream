@@ -287,16 +287,16 @@ The `setup-pgrx` action is already well-cached. Minor improvements:
 
 ## Implementation Order
 
-| Priority | Step | Effort | Savings | Risk |
-|----------|------|--------|---------|------|
-| **P1** | 1. Path filters on Build | 5 min | 30–50% fewer runs | Low — may need pass-through job |
-| **P1** | 2. Drop Windows from Build | 5 min | ~10–15 min/run | Low — Windows stays in manual CI |
-| **P1** | 3. Add timeout-minutes | 10 min | Prevents runaway cost | None |
-| **P2** | 4. Reduce artifact retention | 5 min | Storage savings | None |
-| **P2** | 5. Fast check gate | 15 min | ~20 min on failures | Low |
-| **P2** | 6. Skip Docker conditionally | 15 min | ~5–8 min/run when skipped | Low |
-| **P3** | 7. Lint-only automatic | 10 min | ~80% reduction | Higher — no auto build artifacts |
-| **P3** | 8. Optimize setup-pgrx | 5 min | Marginal | None |
+| Priority | Step | Effort | Savings | Risk | Status |
+|----------|------|--------|---------|------|--------|
+| **P1** | 1. Path filters on Build | 5 min | 30–50% fewer runs | Low — may need pass-through job | ✅ Done |
+| **P1** | 2. Drop Windows from Build | 5 min | ~10–15 min/run | Low — Windows stays in manual CI | ✅ Done |
+| **P1** | 3. Add timeout-minutes | 10 min | Prevents runaway cost | None | ✅ Done |
+| **P2** | 4. Reduce artifact retention | 5 min | Storage savings | None | ✅ Done |
+| **P2** | 5. Fast check gate | 15 min | ~20 min on failures | Low | ✅ Done |
+| **P2** | 6. Skip Docker conditionally | 15 min | ~5–8 min/run when skipped | Low | ✅ Done |
+| **P3** | 7. Lint-only automatic | 10 min | ~80% reduction | Higher — no auto build artifacts | ✅ Done |
+| **P3** | 8. Optimize setup-pgrx | 5 min | Marginal | None | ✅ Done |
 
 ---
 

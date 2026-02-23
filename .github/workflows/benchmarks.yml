@@ -34,6 +34,7 @@ jobs:
   benchmark:
     name: Criterion benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +54,7 @@ jobs:
           path: |
             bench-output.txt
             target/criterion/
-          retention-days: 30
+          retention-days: 7
           if-no-files-found: ignore
 
       # ── Install Bencher CLI ─────────────────────────────────────────────

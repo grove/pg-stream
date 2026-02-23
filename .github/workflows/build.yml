@@ -1,18 +1,52 @@
 # =============================================================================
-# Build Workflow — Compile, lint, and produce platform artifacts
+# Build Workflow — Compile and produce platform artifacts + Docker image
 #
-# Runs on every push to main and every pull request. Produces:
-#   - Lint results (fmt + clippy)
-#   - Per-platform extension packages as downloadable artifacts
-#   - Docker image artifact for E2E tests
+# Manual-only (workflow_dispatch). The automatic Lint workflow handles
+# push/PR gating. Run this before releases or when cross-platform
+# verification is needed.
+#
+# Changes from previous version (see plans/infra/GITHUB_ACTIONS_COST.md):
+#   - Step 1: paths-ignore retained for optional re-enablement
+#   - Step 2: Windows removed (available in manual CI workflow)
+#   - Step 3: timeout-minutes on all jobs
+#   - Step 4: Reduced artifact retention (5d packages, 3d Docker)
+#   - Step 5: Fast check gate before build matrix
+#   - Step 6: Docker build skipped when only non-Docker files change
+#   - Step 7: Trigger changed to workflow_dispatch (lint.yml is automatic)
 # =============================================================================
 name: Build
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:  # Manual trigger only — run from Actions tab
+  # To re-enable automatic runs, uncomment below (with path filters — Step 1):
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**/*.md'
+  #     - 'docs/**'
+  #     - 'LICENSE'
+  #     - '.gitignore'
+  #     - 'PLAN*.md'
+  #     - 'REPORT*.md'
+  #     - 'adrs/**'
+  #     - 'plans/**'
+  #     - 'coverage/**'
+  #     - 'cnpg/**'
+  #     - 'scripts/**'
+  # pull_request:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - '**/*.md'
+  #     - 'docs/**'
+  #     - 'LICENSE'
+  #     - '.gitignore'
+  #     - 'PLAN*.md'
+  #     - 'REPORT*.md'
+  #     - 'adrs/**'
+  #     - 'plans/**'
+  #     - 'coverage/**'
+  #     - 'cnpg/**'
+  #     - 'scripts/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,10 +57,14 @@ env:
   PG_VERSION: "18"
 
 jobs:
-  # ── Lint ─────────────────────────────────────────────────────────────────
-  lint:
-    name: Lint (fmt + clippy)
+  # ── Quick check gate (Step 5) ───────────────────────────────────────────
+  # Fast fmt + clippy + cargo check on Linux only (~2 min).
+  # The full build matrix depends on this — if it fails, no platform
+  # builds are wasted.
+  check:
+    name: Quick check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -36,15 +74,39 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      - name: Cargo check
+        run: cargo check --all-targets --features pg18
+
       - name: Run clippy
         run: cargo clippy --all-targets --features pg18 -- -D warnings
 
-  # ── Build matrix ────────────────────────────────────────────────────────
+  # ── Detect changes for conditional Docker build (Step 6) ────────────────
+  detect-changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            docker:
+              - 'tests/Dockerfile.e2e'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'src/**'
+              - 'pg_stream.control'
+
+  # ── Build matrix (Step 2: Windows removed) ──────────────────────────────
   build:
     name: Build (${{ matrix.artifact_suffix }})
+    needs: check
     runs-on: ${{ matrix.os }}
-    # Windows support in pgrx is experimental — don't block the pipeline
-    continue-on-error: ${{ matrix.os == 'windows-2022' }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -55,9 +117,7 @@ jobs:
           - os: macos-14
             artifact_suffix: macos-arm64
             archive_ext: tar.gz
-          - os: windows-2022
-            artifact_suffix: windows-amd64
-            archive_ext: zip
+          # Windows build available via manual CI workflow
     steps:
       - uses: actions/checkout@v4
 
@@ -67,10 +127,6 @@ jobs:
       - name: Build extension package
         shell: bash
         run: |
-          # Use pgrx-managed pg_config to avoid picking up Strawberry Perl's PG11
-          # pg_config on Windows (which appears first on PATH).
-          # 'cargo pgrx info path pg18' returns the installation prefix dir;
-          # the pg_config binary lives under bin/ inside that directory.
           PG_CONFIG_PATH="$(cargo pgrx info path pg18)/bin/pg_config"
           cargo pgrx package --pg-config "${PG_CONFIG_PATH}"
 
@@ -84,7 +140,6 @@ jobs:
           echo "Package version: ${VERSION}"
 
       - name: Create archive (tar.gz)
-        if: matrix.archive_ext == 'tar.gz'
         shell: bash
         run: |
           ARCHIVE_NAME="pg_stream-${{ steps.version.outputs.version }}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
@@ -106,39 +161,21 @@ jobs:
           echo "Archive created: ${ARCHIVE_NAME}.tar.gz"
           ls -lh "${ARCHIVE_NAME}.tar.gz"
 
-      - name: Create archive (zip)
-        if: matrix.archive_ext == 'zip'
-        shell: pwsh
-        run: |
-          $version = "${{ steps.version.outputs.version }}"
-          $archiveName = "pg_stream-${version}-pg${{ env.PG_VERSION }}-${{ matrix.artifact_suffix }}"
-          New-Item -ItemType Directory -Path "dist\${archiveName}" -Force
-
-          $pkgDir = Get-ChildItem -Path "target\release" -Directory -Filter "pg_stream-pg*" | Select-Object -First 1
-          if (-not $pkgDir) {
-            Write-Error "Cannot find pgrx package output"
-            Get-ChildItem -Path "target\release" -Directory
-            exit 1
-          }
-
-          Copy-Item -Recurse "$($pkgDir.FullName)\*" "dist\${archiveName}\"
-          Copy-Item README.md, LICENSE, INSTALL.md "dist\${archiveName}\" -ErrorAction SilentlyContinue
-
-          Compress-Archive -Path "dist\${archiveName}" -DestinationPath "dist\${archiveName}.zip"
-          Write-Host "Archive created: ${archiveName}.zip"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: pkg-${{ matrix.artifact_suffix }}
           path: dist/*.${{ matrix.archive_ext }}
-          retention-days: 14
+          retention-days: 5
           if-no-files-found: error
 
-  # ── Docker image build ──────────────────────────────────────────────────
+  # ── Docker image build (Step 6: conditional) ────────────────────────────
   build-docker:
     name: Build Docker image
+    needs: [check, detect-changes]
+    if: needs.detect-changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -165,5 +202,5 @@ jobs:
         with:
           name: docker-image
           path: pg_stream_e2e.tar.gz
-          retention-days: 7
+          retention-days: 3
           compression-level: 0  # already gzipped
