@@ -292,9 +292,9 @@ INSERT INTO dt SELECT ... FROM delta WHERE __pgs_action = 'I';
 **Fix**: **Statement-level triggers with transition tables** (PostgreSQL AFTER STATEMENT with referencing OLD/NEW TABLE). This batches all changes from a single statement into one buffer INSERT:
 
 ```sql
-CREATE TRIGGER pgdt_cdc_tr AFTER INSERT OR UPDATE OR DELETE
+CREATE TRIGGER pg_stream_cdc_tr AFTER INSERT OR UPDATE OR DELETE
 ON source_table REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows
-FOR EACH STATEMENT EXECUTE FUNCTION pgdt_cdc_stmt_fn();
+FOR EACH STATEMENT EXECUTE FUNCTION pg_stream_cdc_stmt_fn();
 ```
 
 **Effort**: 8 hours (requires CDC rewrite). **Impact**: 50-80% reduction in trigger overhead at high write volumes. No change for single-row DML.

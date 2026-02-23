@@ -118,7 +118,7 @@ customer | total | order_count | __pgs_row_id | __pgs_action
 alice    | 50.00 | 1           | 7283194      | I
 ```
 
-Note: the 'U' meta-action is emitted as `__pgs_action = 'I'` because the MERGE treats it as an update-via-INSERT (see aggregate final CTE: `CASE WHEN __pgdt_meta_action = 'D' THEN 'D' ELSE 'I' END`).
+Note: the 'U' meta-action is emitted as `__pgs_action = 'I'` because the MERGE treats it as an update-via-INSERT (see aggregate final CTE: `CASE WHEN __pgs_meta_action = 'D' THEN 'D' ELSE 'I' END`).
 
 ### Phase 6: MERGE
 
@@ -546,21 +546,21 @@ With the `FULL` refresh mode (or by setting the reinitialize flag), the stream t
 
 ## The Reference Counting Principle
 
-The core insight behind incremental DELETE handling is **reference counting**. Every aggregate group in the stream table maintains an internal counter (`__pgdt_count`) that tracks how many source rows contribute to the group:
+The core insight behind incremental DELETE handling is **reference counting**. Every aggregate group in the stream table maintains an internal counter (`__pgs_count`) that tracks how many source rows contribute to the group:
 
 ```
 Stream table internal state:
-customer | total | order_count | __pgdt_count (hidden)
+customer | total | order_count | __pgs_count (hidden)
 ---------|-------|-------------|---------------------
 alice    | 80.00 | 2           | 2
 bob      | 100.00| 2           | 2
 ```
 
-- **INSERT** → `__pgdt_count += 1`
-- **DELETE** → `__pgdt_count -= 1`
-- **UPDATE** → `__pgdt_count += 0` (D cancels I for same-group updates)
+- **INSERT** → `__pgs_count += 1`
+- **DELETE** → `__pgs_count -= 1`
+- **UPDATE** → `__pgs_count += 0` (D cancels I for same-group updates)
 
-When `__pgdt_count` reaches 0:
+When `__pgs_count` reaches 0:
 - The group has zero contributing rows
 - The aggregate emits a DELETE event
 - The MERGE removes the row from the stream table

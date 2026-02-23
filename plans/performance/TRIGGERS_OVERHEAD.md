@@ -5,7 +5,7 @@
 The existing benchmark suite (`tests/e2e_bench_tests.rs`) measures **refresh duration** — how fast incremental refresh processes changes — but says nothing about the **write-side cost** the CDC trigger imposes on source tables. Every INSERT, UPDATE, or DELETE on a source table fires a PL/pgSQL AFTER trigger that:
 
 1. Calls `pg_current_wal_lsn()`
-2. Computes `pgdt_hash(NEW."pk"::text)` (or `pgdt_hash_multi(ARRAY[...])` for composite PKs)
+2. Computes `pg_stream_hash(NEW."pk"::text)` (or `pg_stream_hash_multi(ARRAY[...])` for composite PKs)
 3. Inserts a row into `pg_stream_changes.changes_<oid>` with typed `new_*`/`old_*` columns
 4. Maintains the covering B-tree index `(lsn, pk_hash, change_id) INCLUDE (action)`
 5. Increments the `change_id` BIGSERIAL sequence
@@ -17,27 +17,27 @@ This overhead is invisible in refresh benchmarks but directly impacts the **DML 
 For a table with OID `16384` and columns `(id INT, amount NUMERIC)` with PK on `id`:
 
 ```sql
-CREATE OR REPLACE FUNCTION pg_stream_changes.pgdt_cdc_fn_16384()
+CREATE OR REPLACE FUNCTION pg_stream_changes.pg_stream_cdc_fn_16384()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
         INSERT INTO pg_stream_changes.changes_16384
             (lsn, action, pk_hash, "new_id", "new_amount")
         VALUES (pg_current_wal_lsn(), 'I',
-                pg_stream.pgdt_hash(NEW."id"::text), NEW."id", NEW."amount");
+                pg_stream.pg_stream_hash(NEW."id"::text), NEW."id", NEW."amount");
         RETURN NEW;
     ELSIF TG_OP = 'UPDATE' THEN
         INSERT INTO pg_stream_changes.changes_16384
             (lsn, action, pk_hash, "new_id", "new_amount", "old_id", "old_amount")
         VALUES (pg_current_wal_lsn(), 'U',
-                pg_stream.pgdt_hash(NEW."id"::text), NEW."id", NEW."amount",
+                pg_stream.pg_stream_hash(NEW."id"::text), NEW."id", NEW."amount",
                 OLD."id", OLD."amount");
         RETURN NEW;
     ELSIF TG_OP = 'DELETE' THEN
         INSERT INTO pg_stream_changes.changes_16384
             (lsn, action, pk_hash, "old_id", "old_amount")
         VALUES (pg_current_wal_lsn(), 'D',
-                pg_stream.pgdt_hash(OLD."id"::text), OLD."id", OLD."amount");
+                pg_stream.pg_stream_hash(OLD."id"::text), OLD."id", OLD."amount");
         RETURN OLD;
     END IF;
     RETURN NULL;
@@ -47,7 +47,7 @@ $$;
 
 The trigger cost is proportional to:
 - **Column count** — each column produces a `new_*` and/or `old_*` typed value in the INSERT
-- **PK type** — single-column uses `pgdt_hash()`, composite uses `pgdt_hash_multi(ARRAY[...])`
+- **PK type** — single-column uses `pg_stream_hash()`, composite uses `pg_stream_hash_multi(ARRAY[...])`
 - **DML operation** — UPDATE writes both `new_*` and `old_*` (widest buffer row)
 
 ---
@@ -137,8 +137,8 @@ Trigger INSERT has ~40 column references for UPDATE (20 `new_*` + 20 `old_*`). B
 
 | PK Type | Schema Modification | Hash Function | Notes |
 |---------|-------------------|---------------|-------|
-| **Single INT** | `id SERIAL PRIMARY KEY` | `pgdt_hash(NEW."id"::text)` | Baseline — cheapest hash |
-| **Composite 2-col** | `PRIMARY KEY (id, seq)` with extra `seq INT NOT NULL DEFAULT 1` | `pgdt_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-hash |
+| **Single INT** | `id SERIAL PRIMARY KEY` | `pg_stream_hash(NEW."id"::text)` | Baseline — cheapest hash |
+| **Composite 2-col** | `PRIMARY KEY (id, seq)` with extra `seq INT NOT NULL DEFAULT 1` | `pg_stream_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-hash |
 | **No PK** | Remove PRIMARY KEY constraint | No `pk_hash` column in buffer | Simpler trigger, but `lsn`-only index; tests the fallback path in `src/cdc.rs` |
 
 ### 3.5. DML Operations
@@ -431,8 +431,8 @@ bench-trigger:
 
 | PK Type | Hash Call | Expected overhead |
 |---------|-----------|------------------|
-| Single INT | `pgdt_hash(NEW."id"::text)` | Baseline — single `::text` cast + xxh64 |
-| Composite (id, seq) | `pgdt_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-element hash |
+| Single INT | `pg_stream_hash(NEW."id"::text)` | Baseline — single `::text` cast + xxh64 |
+| Composite (id, seq) | `pg_stream_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-element hash |
 | No PK | (none — `pk_hash` column omitted) | Cheaper trigger, but index is `(lsn)` only |
 
 **Hypothesis:** Composite PK adds ~0.5–1 µs/row over single PK due to array construction. No-PK should be slightly cheaper than single PK (no hash computation), but the `lsn`-only index may lead to wider scan ranges during refresh (not measured here, but worth noting).
@@ -473,7 +473,7 @@ These are rough estimates. The benchmark will provide actual numbers for this sp
 |-----------|---------|-------|
 | PL/pgSQL function entry/exit | 0.5–1.0 | Fixed overhead per trigger invocation |
 | `pg_current_wal_lsn()` call | 0.1–0.2 | Lightweight system function |
-| `pgdt_hash(pk::text)` | 0.2–0.5 | Cast + xxh64 hash |
+| `pg_stream_hash(pk::text)` | 0.2–0.5 | Cast + xxh64 hash |
 | `INSERT INTO changes_<oid>` (heap) | 0.5–1.0 | Scales with row width |
 | B-tree index update | 0.3–0.8 | Single covering index (was 2 previously) |
 | WAL write for buffer row | 0.3–0.5 | Scales with row width |

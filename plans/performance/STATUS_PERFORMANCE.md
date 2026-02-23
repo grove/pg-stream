@@ -241,7 +241,7 @@ Aggregates originally emitted D+I (delete+insert) row pairs per updated group, r
 
 ### Join Hash Simplification (Phase E)
 
-Original join row IDs used nested hash calls: `pgdt_hash_multi(ARRAY[dl.__pgdt_row_id::TEXT, pgdt_hash_multi(ARRAY[r."id"::TEXT])::TEXT])` — 2 Rust FFI crossings + 3 TEXT casts per row. Flattened to a single `pgdt_hash_multi(ARRAY[...])` call, reducing from 2 hash calls to 1 per row.
+Original join row IDs used nested hash calls: `pg_stream_hash_multi(ARRAY[dl.__pgs_row_id::TEXT, pg_stream_hash_multi(ARRAY[r."id"::TEXT])::TEXT])` — 2 Rust FFI crossings + 3 TEXT casts per row. Flattened to a single `pg_stream_hash_multi(ARRAY[...])` call, reducing from 2 hash calls to 1 per row.
 
 ### Where Time is Spent (Current)
 
@@ -276,4 +276,4 @@ With pipeline overhead reduced to sub-2ms on cache hits, **MERGE execution domin
 
 ### Adaptive Threshold
 
-The system automatically falls back from INCREMENTAL to FULL refresh when the change rate exceeds a configurable threshold (default: 15%). This prevents the pathological case where delta processing on large change sets is slower than full recomputation. The threshold can be tuned per stream table via the `pgdt.adaptive_fallback_threshold` GUC.
+The system automatically falls back from INCREMENTAL to FULL refresh when the change rate exceeds a configurable threshold (default: 15%). This prevents the pathological case where delta processing on large change sets is slower than full recomputation. The threshold can be tuned per stream table via the `pg_stream.differential_max_change_ratio` GUC.

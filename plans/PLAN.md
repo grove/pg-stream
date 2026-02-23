@@ -93,7 +93,7 @@ A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declar
 │    aggregate.rs, distinct.rs, window.rs, union_all.rs,           │
 │    outer_join.rs                                                 │
 │                                                                  │
-│  Output: SQL delta query with __pgdt_row_id + __pgdt_action      │
+│  Output: SQL delta query with __pgs_row_id + __pgs_action      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -117,7 +117,7 @@ Base Tables ──TRIGGER──▶ Change Buffer Tables
                             │
                             ▼
                    Delta Result Set
-                   (__pgdt_row_id, __pgdt_action, cols...)
+                   (__pgs_row_id, __pgs_action, cols...)
                             │
                             ▼
                    MERGE into ST storage table
@@ -196,14 +196,14 @@ Define shared memory structures for scheduler↔backend coordination:
 
 ```rust
 #[derive(Copy, Clone)]
-struct PgdtSharedState {
+struct PgStreamSharedState {
     dag_version: u64,             // Incremented on DAG changes
     scheduler_pid: i32,           // PID of scheduler worker
     scheduler_running: bool,      // Is scheduler alive?
     last_scheduler_wake: i64,     // Unix timestamp of last wake
 }
 
-static PGDT_STATE: PgLwLock<PgdtSharedState> = PgLwLock::new();
+static PGS_STATE: PgLwLock<PgStreamSharedState> = PgLwLock::new();
 static DAG_REBUILD_SIGNAL: PgAtomic<u64> = PgAtomic::new();
 ```
 
@@ -220,7 +220,7 @@ When a user creates/alters/drops a ST, they increment `DAG_REBUILD_SIGNAL` atomi
 Create via `extension_sql!()` in the migration script (`pg_stream--0.1.0.sql`):
 
 ```sql
-CREATE SCHEMA IF NOT EXISTS pgdt;
+CREATE SCHEMA IF NOT EXISTS pgstream;
 CREATE SCHEMA IF NOT EXISTS pg_stream_changes;
 
 -- Core ST metadata
@@ -275,7 +275,7 @@ CREATE TABLE pg_stream.pgs_refresh_history (
 
 CREATE INDEX ON pg_stream.pgs_refresh_history (pgs_id, data_timestamp);
 
--- Per-source CDC trigger tracking (slot_name stores trigger name, e.g., 'pgdt_cdc_16384')
+-- Per-source CDC trigger tracking (slot_name stores trigger name, e.g., 'pg_stream_cdc_16384')
 CREATE TABLE pg_stream.pgs_change_tracking (
     source_relid      OID PRIMARY KEY,
     slot_name         TEXT NOT NULL,
@@ -308,15 +308,15 @@ pub enum RefreshMode { Full, Incremental }
 pub enum DtStatus { Initializing, Active, Suspended, Error }
 
 impl StreamTableMeta {
-    pub fn insert(meta: &StreamTableMeta) -> Result<i64, PgdtError> { ... }
-    pub fn get_by_name(schema: &str, name: &str) -> Result<Self, PgdtError> { ... }
-    pub fn get_by_relid(relid: Oid) -> Result<Self, PgdtError> { ... }
-    pub fn get_all_active() -> Result<Vec<Self>, PgdtError> { ... }
-    pub fn update_status(pgs_id: i64, status: DtStatus) -> Result<(), PgdtError> { ... }
+    pub fn insert(meta: &StreamTableMeta) -> Result<i64, PgStreamError> { ... }
+    pub fn get_by_name(schema: &str, name: &str) -> Result<Self, PgStreamError> { ... }
+    pub fn get_by_relid(relid: Oid) -> Result<Self, PgStreamError> { ... }
+    pub fn get_all_active() -> Result<Vec<Self>, PgStreamError> { ... }
+    pub fn update_status(pgs_id: i64, status: DtStatus) -> Result<(), PgStreamError> { ... }
     pub fn update_after_refresh(pgs_id: i64, data_ts: TimestampWithTimeZone,
-                                frontier: JsonB) -> Result<(), PgdtError> { ... }
-    pub fn increment_errors(pgs_id: i64) -> Result<i32, PgdtError> { ... }
-    pub fn delete(pgs_id: i64) -> Result<(), PgdtError> { ... }
+                                frontier: JsonB) -> Result<(), PgStreamError> { ... }
+    pub fn increment_errors(pgs_id: i64) -> Result<i32, PgStreamError> { ... }
+    pub fn delete(pgs_id: i64) -> Result<(), PgStreamError> { ... }
 }
 
 pub struct DtDependency { ... }
@@ -324,7 +324,7 @@ pub struct RefreshRecord { ... }
 // Similar CRUD implementations for dependencies and refresh history.
 ```
 
-All catalog access goes through `Spi::connect()`. Error handling wraps PostgreSQL errors into `PgdtError` type.
+All catalog access goes through `Spi::connect()`. Error handling wraps PostgreSQL errors into `PgStreamError` type.
 
 ---
 
@@ -344,7 +344,7 @@ pg_stream.create_stream_table(
 ) RETURNS VOID
 ```
 
-**Implementation (`api.rs` — `#[pg_extern(schema = "pgdt")]`):**
+**Implementation (`api.rs` — `#[pg_extern(schema = "pgstream")]`):**
 
 1. **Parse name** into `(schema, table_name)`. Default schema = `current_schema()`.
 
@@ -365,21 +365,21 @@ pg_stream.create_stream_table(
 5. **Create the underlying storage table:**
    ```sql
    CREATE TABLE <schema>.<name> (
-       __pgdt_row_id BIGINT,
+       __pgs_row_id BIGINT,
        -- ... all columns from the defining query ...
    )
    ```
    Derive the column list from the `LIMIT 0` result metadata.
    
    For aggregate queries (INCREMENTAL mode), also add auxiliary columns:
-   - `__pgdt_count BIGINT` — for COUNT/DISTINCT tracking
-   - `__pgdt_sum_<col> NUMERIC` — for each SUM/AVG aggregate
+   - `__pgs_count BIGINT` — for COUNT/DISTINCT tracking
+   - `__pgs_sum_<col> NUMERIC` — for each SUM/AVG aggregate
    
-   Create a unique index on `__pgdt_row_id`.
+   Create a unique index on `__pgs_row_id`.
 
 6. **Initialize** (if `initialize = true`):
    ```sql
-   INSERT INTO <schema>.<name> (__pgdt_row_id, <user_cols>, [__pgdt_count, ...])
+   INSERT INTO <schema>.<name> (__pgs_row_id, <user_cols>, [__pgs_count, ...])
    SELECT <row_id_expr>, sub.*, [1, <col>, ...] FROM (<query>) sub
    ```
    Set `is_populated = true`, `data_timestamp = now()`.
@@ -387,8 +387,8 @@ pg_stream.create_stream_table(
 7. **Insert catalog entries** into `pg_stream.pgs_stream_tables` and `pg_stream.pgs_dependencies`.
 
 8. **Create CDC triggers** for any new base table sources not already tracked:
-   - Create a PL/pgSQL trigger function `pg_stream.pgdt_cdc_fn_<source_oid>()`
-   - Create an `AFTER INSERT OR UPDATE OR DELETE` trigger `pgdt_cdc_<source_oid>` on the source table
+   - Create a PL/pgSQL trigger function `pg_stream.pg_stream_cdc_fn_<source_oid>()`
+   - Create an `AFTER INSERT OR UPDATE OR DELETE` trigger `pg_stream_cdc_<source_oid>` on the source table
    - Trigger writes change data (LSN, XID, action, row data as JSONB) to `pg_stream_changes.changes_<source_oid>`
    - Insert tracking record into `pg_stream.pgs_change_tracking` with trigger name
 
@@ -420,8 +420,8 @@ pg_stream.drop_stream_table(name TEXT) RETURNS VOID
 - Drop the underlying storage table: `DROP TABLE <schema>.<name>`.
 - Delete entries from `pg_stream.pgs_stream_tables`, `pg_stream.pgs_dependencies`, `pg_stream.pgs_refresh_history`.
 - Clean up CDC triggers if no other STs reference the source:
-  - `DROP TRIGGER pgdt_cdc_<source_oid> ON <source_table>`
-  - `DROP FUNCTION pg_stream.pgdt_cdc_fn_<source_oid>() CASCADE`
+  - `DROP TRIGGER pg_stream_cdc_<source_oid> ON <source_table>`
+  - `DROP FUNCTION pg_stream.pg_stream_cdc_fn_<source_oid>() CASCADE`
 - Remove orphaned change buffer tables in `pg_stream_changes`.
 - Signal scheduler.
 
@@ -477,8 +477,8 @@ RETURNS TABLE(
 
 For each base table tracked by at least one ST, maintain a row-level trigger that captures changes:
 
-- **Trigger name:** `pgdt_cdc_<source_oid>` (e.g., `pgdt_cdc_16384`)
-- **Trigger function:** `pg_stream.pgdt_cdc_fn_<source_oid>()` (PL/pgSQL)
+- **Trigger name:** `pg_stream_cdc_<source_oid>` (e.g., `pg_stream_cdc_16384`)
+- **Trigger function:** `pg_stream.pg_stream_cdc_fn_<source_oid>()` (PL/pgSQL)
 - **Timing:** `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW`
 - **Action:** Writes change metadata and row data (as JSONB) directly to the change buffer table
 - **Creation:** via `CREATE TRIGGER` during `pg_stream.create_stream_table()`
@@ -517,7 +517,7 @@ Tables are created by `pg_stream.create_stream_table()` when a new source is fir
 The PL/pgSQL trigger function writes changes directly to the buffer table:
 
 ```sql
-CREATE OR REPLACE FUNCTION pg_stream.pgdt_cdc_fn_<oid>()
+CREATE OR REPLACE FUNCTION pg_stream.pg_stream_cdc_fn_<oid>()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
@@ -555,7 +555,7 @@ $$;
 During incremental refresh, the scheduler reads pending changes from buffer tables:
 
 ```rust
-fn get_pending_changes(source_oid: Oid, from_lsn: PgLsn, to_lsn: PgLsn) -> Result<Vec<Change>, PgdtError> {
+fn get_pending_changes(source_oid: Oid, from_lsn: PgLsn, to_lsn: PgLsn) -> Result<Vec<Change>, PgStreamError> {
     Spi::connect(|client| {
         let changes = client.select(
             &format!(
@@ -673,7 +673,7 @@ Register in `_PG_init()`:
 
 ```rust
 BackgroundWorkerBuilder::new("pg_stream scheduler")
-    .set_function("pgdt_scheduler_main")
+    .set_function("pg_stream_scheduler_main")
     .set_library("pg_stream")
     .enable_spi_access()
     .set_start_time(BgWorkerStartTime::RecoveryFinished)
@@ -686,7 +686,7 @@ BackgroundWorkerBuilder::new("pg_stream scheduler")
 ```rust
 #[pg_guard]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn pgdt_scheduler_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(
         SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM
     );
@@ -698,7 +698,7 @@ pub extern "C-unwind" fn pgdt_scheduler_main(_arg: pg_sys::Datum) {
     loop {
         // Wait for scheduler interval or signal
         if !BackgroundWorker::wait_latch(Some(Duration::from_millis(
-            pgdt_scheduler_interval_ms()
+            pg_stream_scheduler_interval_ms()
         ))) {
             break; // SIGTERM received
         }
@@ -741,7 +741,7 @@ pub extern "C-unwind" fn pgdt_scheduler_main(_arg: pg_sys::Datum) {
                 execute_single_refresh(refresh_task, &dag);
             }
 
-            Ok::<(), PgdtError>(())
+            Ok::<(), PgStreamError>(())
         }).unwrap_or_else(|e| {
             log!("Scheduler error: {}", e);
         });
@@ -828,14 +828,14 @@ Zero-cost: no warehouse/compute used, only metadata update.
 
 ```sql
 BEGIN;
-SELECT pg_replication_origin_session_setup('pgdt_refresh');
+SELECT pg_replication_origin_session_setup('pg_stream_refresh');
 
 -- Lock the ST to prevent concurrent access during refresh
 SELECT pg_advisory_xact_lock(pgs_relid::bigint);
 
 -- Truncate and repopulate
 TRUNCATE <schema>.<name>;
-INSERT INTO <schema>.<name> (__pgdt_row_id, <user_cols>)
+INSERT INTO <schema>.<name> (__pgs_row_id, <user_cols>)
 SELECT <row_id_expr>, sub.* FROM (<defining_query>) sub;
 
 -- Update catalog
@@ -859,26 +859,26 @@ COMMIT;
 
 ```sql
 BEGIN;
-SELECT pg_replication_origin_session_setup('pgdt_refresh');
+SELECT pg_replication_origin_session_setup('pg_stream_refresh');
 SELECT pg_advisory_xact_lock(pgs_relid::bigint);
 
 -- Step 1: Compute the delta (SQL generated by IVM engine — see Phase 6)
-CREATE TEMP TABLE __pgdt_delta ON COMMIT DROP AS
+CREATE TEMP TABLE __pgs_delta ON COMMIT DROP AS
 <generated_delta_query>;
--- Result has columns: __pgdt_row_id, __pgdt_action ('I' or 'D'), <user_cols>,
---                     [__pgdt_count, __pgdt_sum_*, ...] (auxiliary cols for aggregates)
+-- Result has columns: __pgs_row_id, __pgs_action ('I' or 'D'), <user_cols>,
+--                     [__pgs_count, __pgs_sum_*, ...] (auxiliary cols for aggregates)
 
 -- Step 2: Delete removed/updated rows
 DELETE FROM <schema>.<name> dt
-USING __pgdt_delta d
-WHERE dt.__pgdt_row_id = d.__pgdt_row_id
-  AND d.__pgdt_action = 'D';
+USING __pgs_delta d
+WHERE dt.__pgs_row_id = d.__pgs_row_id
+  AND d.__pgs_action = 'D';
 
 -- Step 3: Insert new/updated rows
-INSERT INTO <schema>.<name> (__pgdt_row_id, <user_cols>, [__pgdt_count, ...])
-SELECT d.__pgdt_row_id, <user_cols>, [d.__pgdt_count, ...]
-FROM __pgdt_delta d
-WHERE d.__pgdt_action = 'I';
+INSERT INTO <schema>.<name> (__pgs_row_id, <user_cols>, [__pgs_count, ...])
+SELECT d.__pgs_row_id, <user_cols>, [d.__pgs_count, ...]
+FROM __pgs_delta d
+WHERE d.__pgs_action = 'I';
 
 -- Step 4: Update catalog, record history, clean up change buffers
 -- (same as FULL refresh)
@@ -887,12 +887,12 @@ SELECT pg_replication_origin_session_reset();
 COMMIT;
 ```
 
-For updates (a value changes within the same row ID), the delta contains both a `'D'` row (old) and an `'I'` row (new) for the same `__pgdt_row_id`. The DELETE runs first, followed by the INSERT.
+For updates (a value changes within the same row ID), the delta contains both a `'D'` row (old) and an `'I'` row (new) for the same `__pgs_row_id`. The DELETE runs first, followed by the INSERT.
 
 ### Step 5.5 — REINITIALIZE refresh
 
 Same as FULL refresh, but also:
-- Recompute auxiliary columns (`__pgdt_count`, `__pgdt_sum_*`) for aggregate STs
+- Recompute auxiliary columns (`__pgs_count`, `__pgs_sum_*`) for aggregate STs
 - Rebuild any internal metadata about the query structure (in case the defining query's semantics changed due to upstream DDL)
 - Reset the frontier to reflect the fresh computation
 
@@ -992,24 +992,24 @@ pub struct Column {
 
 ### Step 6.2 — Row ID generation (`dvm/row_id.rs`)
 
-Every row in an incrementally-maintained ST has a unique `__pgdt_row_id BIGINT`. Row IDs must be deterministic (same input → same ID) for the MERGE to work correctly.
+Every row in an incrementally-maintained ST has a unique `__pgs_row_id BIGINT`. Row IDs must be deterministic (same input → same ID) for the MERGE to work correctly.
 
 **Strategy per operator:**
 
 | Operator | Row ID computation |
 |---|---|
-| Scan(table) | `pgdt_hash(pk_col1, pk_col2, ...)` using primary key, or `pgdt_hash(all_cols)` if no PK (with warning) |
+| Scan(table) | `pg_stream_hash(pk_col1, pk_col2, ...)` using primary key, or `pg_stream_hash(all_cols)` if no PK (with warning) |
 | Project | Pass through child's row ID |
 | Filter | Pass through child's row ID |
-| InnerJoin | `pgdt_hash(left.__pgdt_row_id, right.__pgdt_row_id)` |
-| Aggregate | `pgdt_hash(group_by_col1, group_by_col2, ...)` |
-| Distinct | `pgdt_hash(all_output_cols)` |
+| InnerJoin | `pg_stream_hash(left.__pgs_row_id, right.__pgs_row_id)` |
+| Aggregate | `pg_stream_hash(group_by_col1, group_by_col2, ...)` |
+| Distinct | `pg_stream_hash(all_output_cols)` |
 
 **Hash function:** Use xxHash64 via a SQL function:
 
 ```sql
 -- Exposed as a pg_extern
-CREATE FUNCTION pg_stream.pgdt_hash(VARIADIC args ANYARRAY) RETURNS BIGINT ...;
+CREATE FUNCTION pg_stream.pg_stream_hash(VARIADIC args ANYARRAY) RETURNS BIGINT ...;
 ```
 
 Implement in Rust using the `xxhash-rust` crate. Accept variadic input, serialize all arguments, compute xxHash64, return as BIGINT.
@@ -1029,7 +1029,7 @@ pub struct DiffContext {
 impl DiffContext {
     /// Generate the delta query for the entire operator tree.
     /// Returns the final SQL query string.
-    pub fn differentiate(&mut self, op: &OpTree) -> Result<String, PgdtError> {
+    pub fn differentiate(&mut self, op: &OpTree) -> Result<String, PgStreamError> {
         let final_cte = self.diff_node(op)?;
 
         // Build the WITH query
@@ -1044,7 +1044,7 @@ impl DiffContext {
         ))
     }
 
-    fn diff_node(&mut self, op: &OpTree) -> Result<String, PgdtError> {
+    fn diff_node(&mut self, op: &OpTree) -> Result<String, PgStreamError> {
         match op {
             OpTree::Scan { .. } => self.diff_scan(op),
             OpTree::Project { .. } => self.diff_project(op),
@@ -1061,7 +1061,7 @@ impl DiffContext {
 
     fn next_cte_name(&mut self) -> String {
         self.cte_counter += 1;
-        format!("__pgdt_cte_{}", self.cte_counter)
+        format!("__pgs_cte_{}", self.cte_counter)
     }
 }
 ```
@@ -1071,7 +1071,7 @@ impl DiffContext {
 $\Delta_I(\text{Scan}(T))$ reads from the change buffer table:
 
 ```rust
-fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgdtError> {
+fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgStreamError> {
     let OpTree::Scan { table_oid, columns, alias, .. } = scan else { unreachable!() };
 
     let cte_name = self.next_cte_name();
@@ -1083,31 +1083,31 @@ fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgdtError> {
     let sql = format!(
         "SELECT
             CASE WHEN action = 'D' THEN
-                pg_stream.pgdt_hash({pk_extraction_from_old})
+                pg_stream.pg_stream_hash({pk_extraction_from_old})
             ELSE
-                pg_stream.pgdt_hash({pk_extraction_from_new})
-            END AS __pgdt_row_id,
+                pg_stream.pg_stream_hash({pk_extraction_from_new})
+            END AS __pgs_row_id,
             CASE
                 WHEN action = 'I' THEN 'I'
                 WHEN action = 'D' THEN 'D'
-                WHEN action = 'U' AND __pgdt_update_part = 'old' THEN 'D'
-                WHEN action = 'U' AND __pgdt_update_part = 'new' THEN 'I'
-            END AS __pgdt_action,
+                WHEN action = 'U' AND __pgs_update_part = 'old' THEN 'D'
+                WHEN action = 'U' AND __pgs_update_part = 'new' THEN 'I'
+            END AS __pgs_action,
             {col_extractions}
         FROM (
             -- Direct inserts and deletes
-            SELECT action, row_data, old_row_data, NULL AS __pgdt_update_part
+            SELECT action, row_data, old_row_data, NULL AS __pgs_update_part
             FROM pg_stream_changes.changes_{table_oid}
             WHERE lsn > '{prev_lsn}' AND lsn <= '{new_lsn}'
               AND action IN ('I', 'D')
             UNION ALL
             -- Updates expanded to old+new pairs
-            SELECT action, row_data, old_row_data, 'old' AS __pgdt_update_part
+            SELECT action, row_data, old_row_data, 'old' AS __pgs_update_part
             FROM pg_stream_changes.changes_{table_oid}
             WHERE lsn > '{prev_lsn}' AND lsn <= '{new_lsn}'
               AND action = 'U'
             UNION ALL
-            SELECT action, row_data, old_row_data, 'new' AS __pgdt_update_part
+            SELECT action, row_data, old_row_data, 'new' AS __pgs_update_part
             FROM pg_stream_changes.changes_{table_oid}
             WHERE lsn > '{prev_lsn}' AND lsn <= '{new_lsn}'
               AND action = 'U'
@@ -1131,10 +1131,10 @@ fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgdtError> {
 
 $$\Delta_I(\pi_E(Q)) = \pi_E(\Delta_I(Q))$$
 
-Simply apply the same projection expressions to the child's delta, passing through `__pgdt_row_id` and `__pgdt_action`:
+Simply apply the same projection expressions to the child's delta, passing through `__pgs_row_id` and `__pgs_action`:
 
 ```rust
-fn diff_project(&mut self, project: &OpTree) -> Result<String, PgdtError> {
+fn diff_project(&mut self, project: &OpTree) -> Result<String, PgStreamError> {
     let OpTree::Project { expressions, child } = project else { unreachable!() };
     let child_cte = self.diff_node(child)?;
     let cte_name = self.next_cte_name();
@@ -1145,7 +1145,7 @@ fn diff_project(&mut self, project: &OpTree) -> Result<String, PgdtError> {
         .join(", ");
 
     let sql = format!(
-        "SELECT __pgdt_row_id, __pgdt_action, {} FROM {}",
+        "SELECT __pgs_row_id, __pgs_action, {} FROM {}",
         expr_list, child_cte
     );
 
@@ -1163,13 +1163,13 @@ For inserts: keep those satisfying $P$. For deletes: keep those that *were* sati
 Simplified approach — apply the predicate to both inserts and deletes:
 
 ```rust
-fn diff_filter(&mut self, filter: &OpTree) -> Result<String, PgdtError> {
+fn diff_filter(&mut self, filter: &OpTree) -> Result<String, PgStreamError> {
     let OpTree::Filter { predicate, child } = filter else { unreachable!() };
     let child_cte = self.diff_node(child)?;
     let cte_name = self.next_cte_name();
 
     let sql = format!(
-        "SELECT __pgdt_row_id, __pgdt_action, * FROM {} WHERE {}",
+        "SELECT __pgs_row_id, __pgs_action, * FROM {} WHERE {}",
         child_cte, predicate.to_sql()
     );
 
@@ -1201,8 +1201,8 @@ Where:
 
 ```sql
 -- Part 1: delta_left JOIN current_right
-SELECT pg_stream.pgdt_hash(dl.__pgdt_row_id, r.<pk>) AS __pgdt_row_id,
-       dl.__pgdt_action,
+SELECT pg_stream.pg_stream_hash(dl.__pgs_row_id, r.<pk>) AS __pgs_row_id,
+       dl.__pgs_action,
        <output_cols>
 FROM <delta_left_cte> dl
 JOIN <right_table> r ON <join_condition>
@@ -1212,16 +1212,16 @@ UNION ALL
 -- Part 2: previous_left JOIN delta_right
 -- previous_left = current ST state for upstream STs,
 --                 or current table for base tables
-SELECT pg_stream.pgdt_hash(l.<pk>, dr.__pgdt_row_id) AS __pgdt_row_id,
-       dr.__pgdt_action,
+SELECT pg_stream.pg_stream_hash(l.<pk>, dr.__pgs_row_id) AS __pgs_row_id,
+       dr.__pgs_action,
        <output_cols>
 FROM <left_table_current> l
 JOIN <delta_right_cte> dr ON <join_condition>
 -- Exclude rows already counted in Part 1 (anti-join on left keys)
 WHERE NOT EXISTS (
     SELECT 1 FROM <delta_left_cte> dl2
-    WHERE dl2.__pgdt_row_id = pg_stream.pgdt_hash(l.<pk>)
-      AND dl2.__pgdt_action = 'I'
+    WHERE dl2.__pgs_row_id = pg_stream.pg_stream_hash(l.<pk>)
+      AND dl2.__pgs_action = 'I'
 )
 ```
 
@@ -1237,52 +1237,52 @@ This is the most intricate operator. Uses auxiliary counters stored in the ST al
 
 | User aggregate | Auxiliary columns in ST | Maintenance logic |
 |---|---|---|
-| `COUNT(*)` | `__pgdt_count` | `+= count_of_inserts - count_of_deletes` |
-| `COUNT(col)` | `__pgdt_count`, `__pgdt_count_nonnull` | Track total and non-null counts |
-| `SUM(col)` | `__pgdt_count`, `__pgdt_sum_col` | `sum += sum_of_inserts - sum_of_deletes` |
-| `AVG(col)` | `__pgdt_count`, `__pgdt_sum_col` | `avg = sum / count` |
-| `MIN(col)` | `__pgdt_count`, `__pgdt_min_col`, `__pgdt_min_count` | If current min deleted & min_count reaches 0: RESCAN group |
-| `MAX(col)` | `__pgdt_count`, `__pgdt_max_col`, `__pgdt_max_count` | If current max deleted & max_count reaches 0: RESCAN group |
+| `COUNT(*)` | `__pgs_count` | `+= count_of_inserts - count_of_deletes` |
+| `COUNT(col)` | `__pgs_count`, `__pgs_count_nonnull` | Track total and non-null counts |
+| `SUM(col)` | `__pgs_count`, `__pgs_sum_col` | `sum += sum_of_inserts - sum_of_deletes` |
+| `AVG(col)` | `__pgs_count`, `__pgs_sum_col` | `avg = sum / count` |
+| `MIN(col)` | `__pgs_count`, `__pgs_min_col`, `__pgs_min_count` | If current min deleted & min_count reaches 0: RESCAN group |
+| `MAX(col)` | `__pgs_count`, `__pgs_max_col`, `__pgs_max_count` | If current max deleted & max_count reaches 0: RESCAN group |
 
 **Generated delta SQL:**
 
 ```sql
 -- Compute per-group changes from the child delta
-__pgdt_cte_agg_delta AS (
+__pgs_cte_agg_delta AS (
     SELECT
         <group_by_cols>,
-        SUM(CASE WHEN __pgdt_action = 'I' THEN 1 ELSE 0 END) AS __ins_count,
-        SUM(CASE WHEN __pgdt_action = 'D' THEN 1 ELSE 0 END) AS __del_count,
-        SUM(CASE WHEN __pgdt_action = 'I' THEN <agg_col> ELSE 0 END) AS __ins_sum,
-        SUM(CASE WHEN __pgdt_action = 'D' THEN <agg_col> ELSE 0 END) AS __del_sum
+        SUM(CASE WHEN __pgs_action = 'I' THEN 1 ELSE 0 END) AS __ins_count,
+        SUM(CASE WHEN __pgs_action = 'D' THEN 1 ELSE 0 END) AS __del_count,
+        SUM(CASE WHEN __pgs_action = 'I' THEN <agg_col> ELSE 0 END) AS __ins_sum,
+        SUM(CASE WHEN __pgs_action = 'D' THEN <agg_col> ELSE 0 END) AS __del_sum
     FROM <child_delta_cte>
     GROUP BY <group_by_cols>
 ),
 
 -- Merge with existing ST state to classify actions
-__pgdt_cte_agg_merge AS (
+__pgs_cte_agg_merge AS (
     SELECT
-        pg_stream.pgdt_hash(<group_by_cols>) AS __pgdt_row_id,
+        pg_stream.pg_stream_hash(<group_by_cols>) AS __pgs_row_id,
         <group_by_cols>,
 
         -- New auxiliary values
-        COALESCE(dt.__pgdt_count, 0) + d.__ins_count - d.__del_count
+        COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count
             AS new_count,
-        COALESCE(dt.__pgdt_sum_col, 0) + d.__ins_sum - d.__del_sum
+        COALESCE(dt.__pgs_sum_col, 0) + d.__ins_sum - d.__del_sum
             AS new_sum,
 
         -- Determine action
         CASE
-            WHEN dt.__pgdt_count IS NULL AND (d.__ins_count - d.__del_count) > 0
+            WHEN dt.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0
                 THEN 'I'   -- New group appears
-            WHEN COALESCE(dt.__pgdt_count, 0) + d.__ins_count - d.__del_count <= 0
+            WHEN COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0
                 THEN 'D'   -- Group vanishes
             ELSE 'U'       -- Group value changes (emit D+I pair)
-        END AS __pgdt_meta_action,
+        END AS __pgs_meta_action,
 
-        dt.__pgdt_count AS old_count
+        dt.__pgs_count AS old_count
 
-    FROM __pgdt_cte_agg_delta d
+    FROM __pgs_cte_agg_delta d
     LEFT JOIN <dt_table> dt
         ON dt.<group_key_1> = d.<group_key_1>
        AND dt.<group_key_2> = d.<group_key_2>
@@ -1290,45 +1290,45 @@ __pgdt_cte_agg_merge AS (
 ),
 
 -- Expand 'U' (update) into D+I pairs, emit final delta
-__pgdt_cte_agg_final AS (
+__pgs_cte_agg_final AS (
     -- Inserts (new groups)
-    SELECT __pgdt_row_id, 'I' AS __pgdt_action,
+    SELECT __pgs_row_id, 'I' AS __pgs_action,
            <group_by_cols>,
-           new_count AS __pgdt_count,
-           new_sum AS __pgdt_sum_col,
+           new_count AS __pgs_count,
+           new_sum AS __pgs_sum_col,
            CASE WHEN new_count > 0 THEN new_sum::numeric / new_count ELSE NULL END AS avg_col
-    FROM __pgdt_cte_agg_merge
-    WHERE __pgdt_meta_action = 'I'
+    FROM __pgs_cte_agg_merge
+    WHERE __pgs_meta_action = 'I'
 
     UNION ALL
 
     -- Deletes (vanished groups)
-    SELECT __pgdt_row_id, 'D' AS __pgdt_action,
+    SELECT __pgs_row_id, 'D' AS __pgs_action,
            <group_by_cols>,
-           0 AS __pgdt_count, 0 AS __pgdt_sum_col, NULL AS avg_col
-    FROM __pgdt_cte_agg_merge
-    WHERE __pgdt_meta_action = 'D'
+           0 AS __pgs_count, 0 AS __pgs_sum_col, NULL AS avg_col
+    FROM __pgs_cte_agg_merge
+    WHERE __pgs_meta_action = 'D'
 
     UNION ALL
 
     -- Updates: emit delete of old row
-    SELECT __pgdt_row_id, 'D' AS __pgdt_action,
+    SELECT __pgs_row_id, 'D' AS __pgs_action,
            <group_by_cols>,
-           old_count AS __pgdt_count,
-           NULL AS __pgdt_sum_col, NULL AS avg_col
-    FROM __pgdt_cte_agg_merge
-    WHERE __pgdt_meta_action = 'U'
+           old_count AS __pgs_count,
+           NULL AS __pgs_sum_col, NULL AS avg_col
+    FROM __pgs_cte_agg_merge
+    WHERE __pgs_meta_action = 'U'
 
     UNION ALL
 
     -- Updates: emit insert of new row
-    SELECT __pgdt_row_id, 'I' AS __pgdt_action,
+    SELECT __pgs_row_id, 'I' AS __pgs_action,
            <group_by_cols>,
-           new_count AS __pgdt_count,
-           new_sum AS __pgdt_sum_col,
+           new_count AS __pgs_count,
+           new_sum AS __pgs_sum_col,
            CASE WHEN new_count > 0 THEN new_sum::numeric / new_count ELSE NULL END AS avg_col
-    FROM __pgdt_cte_agg_merge
-    WHERE __pgdt_meta_action = 'U'
+    FROM __pgs_cte_agg_merge
+    WHERE __pgs_meta_action = 'U'
 )
 ```
 
@@ -1346,7 +1346,7 @@ This is the same approach used by pg_ivm. It degrades to a per-group full recomp
 DISTINCT is modeled as `GROUP BY ALL` with `COUNT(*)`:
 
 ```rust
-fn diff_distinct(&mut self, distinct: &OpTree) -> Result<String, PgdtError> {
+fn diff_distinct(&mut self, distinct: &OpTree) -> Result<String, PgStreamError> {
     let OpTree::Distinct { child } = distinct else { unreachable!() };
 
     // Rewrite DISTINCT as: Aggregate(group_by=all_cols, agg=[COUNT(*)], child)
@@ -1356,19 +1356,19 @@ fn diff_distinct(&mut self, distinct: &OpTree) -> Result<String, PgdtError> {
 }
 ```
 
-The ST storage table includes a `__pgdt_count` column tracking multiplicity. Rows only appear/disappear when count crosses the 0 boundary.
+The ST storage table includes a `__pgs_count` column tracking multiplicity. Rows only appear/disappear when count crosses the 0 boundary.
 
 ### Step 6.10 — Change consolidation
 
-After the full delta is computed, ensure at most one row per `(__pgdt_row_id, __pgdt_action)` pair:
+After the full delta is computed, ensure at most one row per `(__pgs_row_id, __pgs_action)` pair:
 
 ```sql
 -- Final consolidation (can be skipped for insert-only optimized paths)
-SELECT __pgdt_row_id, __pgdt_action, <cols>
+SELECT __pgs_row_id, __pgs_action, <cols>
 FROM (
     SELECT *, ROW_NUMBER() OVER (
-        PARTITION BY __pgdt_row_id, __pgdt_action
-        ORDER BY __pgdt_row_id -- deterministic tie-breaking
+        PARTITION BY __pgs_row_id, __pgs_action
+        ORDER BY __pgs_row_id -- deterministic tie-breaking
     ) AS __rn
     FROM <final_delta_cte>
 ) sub
@@ -1400,7 +1400,7 @@ UNION ALL
 -- Rows in Q that gained their first match in R → DELETE the NULL-padded row
 ```
 
-This requires tracking whether each left row has any match in R. Use a count: `__pgdt_match_count`. When it transitions 0→1 (first match appears), delete the NULL-padded row. When 1→0 (last match disappears), insert the NULL-padded row.
+This requires tracking whether each left row has any match in R. Use a count: `__pgs_match_count`. When it transitions 0→1 (first match appears), delete the NULL-padded row. When 1→0 (last match disappears), insert the NULL-padded row.
 
 #### UNION ALL differentiation (`dvm/operators/union_all.rs`)
 
@@ -1409,12 +1409,12 @@ $$\Delta_I(Q_1 \cup Q_2) = \Delta_I(Q_1) \cup \Delta_I(Q_2)$$
 Straightforward — just UNION ALL the deltas of each child, prefixing row IDs with a child index to prevent collisions:
 
 ```sql
-SELECT pg_stream.pgdt_hash(1, __pgdt_row_id) AS __pgdt_row_id,
-       __pgdt_action, <cols>
+SELECT pg_stream.pg_stream_hash(1, __pgs_row_id) AS __pgs_row_id,
+       __pgs_action, <cols>
 FROM <delta_child_1>
 UNION ALL
-SELECT pg_stream.pgdt_hash(2, __pgdt_row_id) AS __pgdt_row_id,
-       __pgdt_action, <cols>
+SELECT pg_stream.pg_stream_hash(2, __pgs_row_id) AS __pgs_row_id,
+       __pgs_action, <cols>
 FROM <delta_child_2>
 ```
 
@@ -1426,37 +1426,37 @@ Approach: recompute the window function for all partitions that have *any* chang
 
 ```sql
 -- Step 1: Find changed partition keys
-__pgdt_changed_partitions AS (
+__pgs_changed_partitions AS (
     SELECT DISTINCT <partition_by_cols>
     FROM <child_delta_cte>
 ),
 
 -- Step 2: Delete old window results for changed partitions
 -- (emit as 'D' actions)
-__pgdt_window_deletes AS (
-    SELECT dt.__pgdt_row_id, 'D' AS __pgdt_action, <cols>
+__pgs_window_deletes AS (
+    SELECT dt.__pgs_row_id, 'D' AS __pgs_action, <cols>
     FROM <dt_table> dt
-    SEMI JOIN __pgdt_changed_partitions cp
+    SEMI JOIN __pgs_changed_partitions cp
         ON dt.<pk1> = cp.<pk1> AND ...
 ),
 
 -- Step 3: Recompute window function for changed partitions
 -- using current (post-refresh) source data
-__pgdt_window_inserts AS (
-    SELECT pg_stream.pgdt_hash(<pk_cols>) AS __pgdt_row_id,
-           'I' AS __pgdt_action,
+__pgs_window_inserts AS (
+    SELECT pg_stream.pg_stream_hash(<pk_cols>) AS __pgs_row_id,
+           'I' AS __pgs_action,
            <cols>,
            <window_function> OVER (PARTITION BY <pk> ORDER BY <ok>) AS <wf_col>
     FROM <source_table_current> src
-    SEMI JOIN __pgdt_changed_partitions cp
+    SEMI JOIN __pgs_changed_partitions cp
         ON src.<pk1> = cp.<pk1> AND ...
 ),
 
 -- Step 4: Combine
-__pgdt_window_delta AS (
-    SELECT * FROM __pgdt_window_deletes
+__pgs_window_delta AS (
+    SELECT * FROM __pgs_window_deletes
     UNION ALL
-    SELECT * FROM __pgdt_window_inserts
+    SELECT * FROM __pgs_window_inserts
 )
 ```
 
@@ -1475,9 +1475,9 @@ Create event triggers via `extension_sql!()`:
 CREATE OR REPLACE FUNCTION pg_stream._on_ddl_end()
 RETURNS event_trigger
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'pgdt_on_ddl_end_wrapper';
+AS 'MODULE_PATHNAME', 'pg_stream_on_ddl_end_wrapper';
 
-CREATE EVENT TRIGGER pgdt_ddl_tracker
+CREATE EVENT TRIGGER pg_stream_ddl_tracker
 ON ddl_command_end
 EXECUTE FUNCTION pg_stream._on_ddl_end();
 ```
@@ -1541,12 +1541,12 @@ static mut PREV_OBJECT_ACCESS_HOOK: Option<pg_sys::object_access_hook_type> = No
 pub fn register_object_access_hook() {
     unsafe {
         PREV_OBJECT_ACCESS_HOOK = pg_sys::object_access_hook;
-        pg_sys::object_access_hook = Some(pgdt_object_access_hook);
+        pg_sys::object_access_hook = Some(pg_stream_object_access_hook);
     }
 }
 
 #[pg_guard]
-extern "C-unwind" fn pgdt_object_access_hook(
+extern "C-unwind" fn pg_stream_object_access_hook(
     access: pg_sys::ObjectAccessType,
     class_id: pg_sys::Oid,
     object_id: pg_sys::Oid,
@@ -1730,7 +1730,7 @@ fn emit_alert(channel: &str, payload: &str) {
 }
 
 // Usage:
-emit_alert("pgdt_alert", &format!(
+emit_alert("pg_stream_alert", &format!(
     "{{\"event\": \"lag_exceeded\", \"dt\": \"{}\", \"lag_seconds\": {}}}",
     dt.pgs_name, current_lag_secs
 ));
@@ -1742,7 +1742,7 @@ Alert events:
 - `reinitialize_needed` — Upstream DDL change detected
 - `buffer_lag_warning` — Change buffer table row count growing large (>1M pending changes)
 
-Users can `LISTEN pgdt_alert;` for integration with monitoring/alerting systems.
+Users can `LISTEN pg_stream_alert;` for integration with monitoring/alerting systems.
 
 ---
 
@@ -1751,7 +1751,7 @@ Users can `LISTEN pgdt_alert;` for integration with monitoring/alerting systems.
 ### Step 10.1 — Error classification
 
 ```rust
-pub enum PgdtError {
+pub enum PgStreamError {
     // User errors — fail, don't retry
     QueryParseError(String),
     DivisionByZero(String),
@@ -1777,15 +1777,15 @@ pub enum PgdtError {
 ### Step 10.2 — Auto-suspend
 
 ```rust
-fn handle_refresh_failure(dt: &StreamTableMeta, error: &PgdtError) {
+fn handle_refresh_failure(dt: &StreamTableMeta, error: &PgStreamError) {
     let new_error_count = StreamTableMeta::increment_errors(dt.pgs_id).unwrap();
 
     insert_refresh_history(dt.pgs_id, target_ts, action, "FAILED",
                           0, 0, Some(error.to_string()));
 
-    if new_error_count >= pgdt_max_consecutive_errors() {
+    if new_error_count >= pg_stream_max_consecutive_errors() {
         StreamTableMeta::update_status(dt.pgs_id, DtStatus::Suspended);
-        emit_alert("pgdt_alert", &format!(
+        emit_alert("pg_stream_alert", &format!(
             "{{\"event\": \"auto_suspended\", \"dt\": \"{}\", \"errors\": {}, \"last_error\": \"{}\"}}",
             dt.pgs_name, new_error_count, error
         ));
@@ -2046,4 +2046,4 @@ max_worker_processes = 8     # Must include scheduler + refresh workers
 | **Scheduling heuristic** | Canonical periods of 48·2ⁿ seconds | Guarantees timestamp alignment across STs with different target lags | Refresh period may be much smaller than target lag |
 | **Change storage** | Buffer tables (not in-memory) | Durable across crashes, queryable for debugging, supports arbitrary-size change sets | Extra I/O; mitigated by aggressive cleanup and auto-vacuum |
 | **Aggregate maintenance** | Auxiliary counter columns (like pg_ivm) | Well-understood approach, correct for COUNT/SUM/AVG; MIN/MAX degrade gracefully | Hidden columns increase storage; MIN/MAX may require rescan |
-| **Replication origin** | `pgdt_refresh` origin to prevent feedback loops | Standard PostgreSQL mechanism, reliable filtering | Requires origin tracking overhead |
+| **Replication origin** | `pg_stream_refresh` origin to prevent feedback loops | Standard PostgreSQL mechanism, reliable filtering | Requires origin tracking overhead |

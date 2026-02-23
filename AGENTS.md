@@ -34,7 +34,7 @@ just test-all          # All of the above + pgrx tests
 > E2E tests require a Docker image. Run `just build-e2e-image` if the image is
 > stale, or use `just test-e2e` which rebuilds automatically.
 
-When done, output a `git commit` command summarising the change.
+When done, output a `git commit` command summarising the change.out
 
 ---
 
@@ -42,9 +42,9 @@ When done, output a `git commit` command summarising the change.
 
 ### Error Handling
 
-- Define errors in `src/error.rs` as `PgdtError` enum variants.
+- Define errors in `src/error.rs` as `PgStreamError` enum variants.
 - Never `unwrap()` or `panic!()` in code reachable from SQL.
-- Propagate via `Result<T, PgdtError>`; convert at the API boundary with
+- Propagate via `Result<T, PgStreamError>`; convert at the API boundary with
   `pgrx::error!()` or `ereport!()`.
 
 ### SPI
@@ -75,7 +75,7 @@ When done, output a `git commit` command summarising the change.
 
 ### SQL Functions
 
-- Annotate with `#[pg_extern(schema = "pgdt")]`.
+- Annotate with `#[pg_extern(schema = "pgstream")]`.
 - Catalog tables live in schema `pgstream`, change buffers in `pgstream_changes`.
 
 ---
@@ -90,7 +90,7 @@ src/
 ├── cdc.rs          # Change-data-capture (trigger-based)
 ├── config.rs       # GUC definitions
 ├── dag.rs          # Dependency graph, topological sort, cycle detection
-├── error.rs        # PgdtError enum
+├── error.rs        # PgStreamError enum
 ├── hash.rs         # Content hashing for change detection
 ├── hooks.rs        # DDL event trigger hooks
 ├── monitor.rs      # Monitoring / metrics
@@ -143,7 +143,7 @@ for the full rationale.
 - [ ] No `unwrap()` / `panic!()` in non-test code
 - [ ] All `unsafe` blocks have `// SAFETY:` comments
 - [ ] SPI connections are short-lived
-- [ ] New SQL functions use `#[pg_extern(schema = "pgdt")]`
+- [ ] New SQL functions use `#[pg_extern(schema = "pgstream")]`
 - [ ] Tests use Testcontainers — never a local PG instance
 - [ ] Error messages include context (table name, query fragment)
 - [ ] GUC variables are documented with sensible defaults

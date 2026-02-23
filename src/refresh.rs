@@ -129,7 +129,7 @@ fn drain_pending_cleanups() {
                     "TRUNCATE \"{schema}\".changes_{oid}",
                     schema = job.change_schema,
                 )) {
-                    pgrx::debug1!("[PGDT] Deferred cleanup TRUNCATE failed: {}", e);
+                    pgrx::debug1!("[pg_stream] Deferred cleanup TRUNCATE failed: {}", e);
                 }
             } else {
                 let delete_sql = format!(
@@ -139,7 +139,7 @@ fn drain_pending_cleanups() {
                     schema = job.change_schema,
                 );
                 if let Err(e) = Spi::run(&delete_sql) {
-                    pgrx::debug1!("[PGDT] Deferred cleanup DELETE failed: {}", e);
+                    pgrx::debug1!("[pg_stream] Deferred cleanup DELETE failed: {}", e);
                 }
             }
         }
@@ -170,16 +170,22 @@ fn apply_planner_hints(estimated_delta: i64) {
     if estimated_delta >= PLANNER_HINT_WORKMEM_THRESHOLD {
         // Large delta: disable nested loops AND raise work_mem for hash joins
         if let Err(e) = Spi::run("SET LOCAL enable_nestloop = off") {
-            pgrx::debug1!("[PGDT] D-1: failed to SET LOCAL enable_nestloop: {}", e);
+            pgrx::debug1!(
+                "[pg_stream] D-1: failed to SET LOCAL enable_nestloop: {}",
+                e
+            );
         }
         let mb = crate::config::pg_stream_merge_work_mem_mb();
         if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
-            pgrx::debug1!("[PGDT] D-1: failed to SET LOCAL work_mem: {}", e);
+            pgrx::debug1!("[pg_stream] D-1: failed to SET LOCAL work_mem: {}", e);
         }
     } else if estimated_delta >= PLANNER_HINT_NESTLOOP_THRESHOLD {
         // Medium delta: just disable nested loops
         if let Err(e) = Spi::run("SET LOCAL enable_nestloop = off") {
-            pgrx::debug1!("[PGDT] D-1: failed to SET LOCAL enable_nestloop: {}", e);
+            pgrx::debug1!(
+                "[pg_stream] D-1: failed to SET LOCAL enable_nestloop: {}",
+                e
+            );
         }
     }
 }
@@ -696,7 +702,7 @@ pub fn execute_differential_refresh(
 
     if should_fallback {
         pgrx::info!(
-            "[PGDT] Adaptive fallback: change ratio exceeds threshold {:.0}% — using FULL refresh",
+            "[pg_stream] Adaptive fallback: change ratio exceeds threshold {:.0}% — using FULL refresh",
             max_ratio * 100.0,
         );
         let t_full_start = Instant::now();
@@ -708,7 +714,7 @@ pub fn execute_differential_refresh(
             dt.auto_threshold, // keep current threshold
             Some(full_ms),
         ) {
-            pgrx::debug1!("[PGDT] Failed to update last_full_ms: {}", e);
+            pgrx::debug1!("[pg_stream] Failed to update last_full_ms: {}", e);
         }
         return result;
     }
@@ -1088,7 +1094,7 @@ pub fn execute_differential_refresh(
         let new_threshold = compute_adaptive_threshold(current_threshold, incr_total_ms, last_full);
         if (new_threshold - current_threshold).abs() > 0.001 {
             pgrx::debug1!(
-                "[PGDT] Adaptive threshold: INCR={:.1}ms vs FULL={:.1}ms (ratio={:.2}), threshold {:.3} → {:.3}",
+                "[pg_stream] Adaptive threshold: INCR={:.1}ms vs FULL={:.1}ms (ratio={:.2}), threshold {:.3} → {:.3}",
                 incr_total_ms,
                 last_full,
                 incr_total_ms / last_full,
@@ -1099,7 +1105,7 @@ pub fn execute_differential_refresh(
         if let Err(e) =
             StreamTableMeta::update_adaptive_threshold(dt.pgs_id, Some(new_threshold), None)
         {
-            pgrx::debug1!("[PGDT] Failed to update adaptive threshold: {}", e);
+            pgrx::debug1!("[pg_stream] Failed to update adaptive threshold: {}", e);
         }
     }
 

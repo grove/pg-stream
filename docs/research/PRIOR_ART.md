@@ -19,7 +19,7 @@ Maintaining this record serves two purposes:
 > <https://arxiv.org/abs/2203.16684>
 
 The Z-set abstraction (rows annotated with +1/−1 multiplicity) is the
-theoretical foundation for the `__pgdt_action` column produced by the delta
+theoretical foundation for the `__pgs_action` column produced by the delta
 operators in `src/dvm/operators/`. The per-operator differentiation rules
 (scan, filter, project, join, aggregate, union) are direct applications of
 the DBSP lifting operator (D) described in this paper.

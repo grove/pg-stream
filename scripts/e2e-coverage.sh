@@ -102,14 +102,14 @@ if [[ "${SKIP_TEST}" == "false" ]]; then
     rm -f "${E2E_COV_DIR}"/*.profraw
 
     info "Running E2E tests against coverage-instrumented image..."
-    info "  PGDT_E2E_IMAGE=${COV_IMAGE}"
-    info "  PGDT_E2E_COVERAGE_DIR=${E2E_COV_DIR}"
+    info "  PGS_E2E_IMAGE=${COV_IMAGE}"
+    info "  PGS_E2E_COVERAGE_DIR=${E2E_COV_DIR}"
 
     # The E2eDb harness reads these env vars:
-    # - PGDT_E2E_IMAGE: overrides the Docker image name
-    # - PGDT_E2E_COVERAGE_DIR: enables /coverage volume mount
-    PGDT_E2E_IMAGE="${COV_IMAGE}" \
-    PGDT_E2E_COVERAGE_DIR="${E2E_COV_DIR}" \
+    # - PGS_E2E_IMAGE: overrides the Docker image name
+    # - PGS_E2E_COVERAGE_DIR: enables /coverage volume mount
+    PGS_E2E_IMAGE="${COV_IMAGE}" \
+    PGS_E2E_COVERAGE_DIR="${E2E_COV_DIR}" \
         cargo test --test 'e2e_*' --features pg18 -- --test-threads=1
 
     # Count profraw files

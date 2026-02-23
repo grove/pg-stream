@@ -150,7 +150,7 @@ SELECT pgstream.create_stream_table(
 That single function call did a lot of work atomically (all in one transaction):
 
 1. **Parsed** the defining query into an operator tree — identifying the recursive CTE, the scan on `departments`, the join, the union
-2. **Created a storage table** called `department_tree` in the `public` schema — a real PostgreSQL heap table with columns matching the SELECT output, plus internal columns `__pgdt_row_id` (a hash used to track individual rows)
+2. **Created a storage table** called `department_tree` in the `public` schema — a real PostgreSQL heap table with columns matching the SELECT output, plus internal columns `__pgs_row_id` (a hash used to track individual rows)
 3. **Installed CDC triggers** on the `departments` table — lightweight `AFTER INSERT OR UPDATE OR DELETE` row-level triggers that will capture every future change
 4. **Created a change buffer table** in the `pgstream_changes` schema — this is where the triggers write captured changes
 5. **Ran an initial full refresh** — executed the recursive query against the current data and populated the storage table

@@ -23,8 +23,8 @@ Change buffer tables are named `pg_stream_changes.changes_<oid>` where `<oid>` i
 Affected patterns:
 - Table creation: `CREATE TABLE IF NOT EXISTS {schema}.changes_{oid}`
 - Trigger creation: `INSERT INTO {change_schema}.changes_{oid}`
-- Trigger naming: `pgdt_cdc_{oid}`
-- Function naming: `pgdt_cdc_fn_{oid}`
+- Trigger naming: `pg_stream_cdc_{oid}`
+- Function naming: `pg_stream_cdc_fn_{oid}`
 - Index creation: `idx_changes_{oid}_lsn_pk_cid`
 - Cleanup: `DELETE FROM {schema}.changes_{oid}`
 - Delta CTE SQL: `"{}.changes_{}"` keyed by `table_oid`
@@ -66,7 +66,7 @@ Affected code:
 
 Affected code:
 - `BackgroundWorkerBuilder::new("pg_stream scheduler")` in `src/scheduler.rs` (L41-L48)
-- `PGDT_STATE: PgLwLock<PgdtSharedState>` in `src/shmem.rs` (L31)
+- `PGS_STATE: PgLwLock<PgStreamSharedState>` in `src/shmem.rs` (L31)
 - `DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64>` in `src/shmem.rs` (L37)
 - `pg_try_advisory_lock(dt.pgs_id)` in `src/scheduler.rs` (L281-L296, L425-L431)
 
@@ -129,11 +129,11 @@ pub fn get_worker_nodes() -> Vec<(String, i32)>
 // Queries: SELECT nodename, nodeport FROM pg_dist_node WHERE isactive AND noderole = 'primary'
 
 /// Execute SQL on all nodes (coordinator + workers)
-pub fn run_on_all_nodes(sql: &str) -> Result<(), PgdtError>
+pub fn run_on_all_nodes(sql: &str) -> Result<(), PgStreamError>
 // Wraps: SELECT run_command_on_all_nodes($1)
 
 /// Execute SQL on workers only
-pub fn run_on_workers(sql: &str) -> Result<(), PgdtError>
+pub fn run_on_workers(sql: &str) -> Result<(), PgStreamError>
 // Wraps: SELECT run_command_on_workers($1)
 ```
 
@@ -168,7 +168,7 @@ Used throughout the codebase to branch behavior.
 ```rust
 pub struct SourceIdentifier {
     pub oid: pg_sys::Oid,
-    pub stable_name: String,  // pgdt_hash(schema_name || '.' || table_name)
+    pub stable_name: String,  // pg_stream_hash(schema_name || '.' || table_name)
 }
 ```
 
@@ -181,8 +181,8 @@ Replace `changes_{oid}` with `changes_{stable_hash}` in all locations:
 | Location | Current | New |
 |----------|---------|-----|
 | `src/cdc.rs` `create_change_buffer_table()` (L209) | `changes_{oid}` | `changes_{stable_hash}` |
-| `src/cdc.rs` `create_change_trigger()` (L37) | `pgdt_cdc_fn_{oid}` | `pgdt_cdc_fn_{stable_hash}` |
-| `src/cdc.rs` trigger name (L577) | `pgdt_cdc_{oid}` | `pgdt_cdc_{stable_hash}` |
+| `src/cdc.rs` `create_change_trigger()` (L37) | `pg_stream_cdc_fn_{oid}` | `pg_stream_cdc_fn_{stable_hash}` |
+| `src/cdc.rs` trigger name (L577) | `pg_stream_cdc_{oid}` | `pg_stream_cdc_{stable_hash}` |
 | `src/cdc.rs` index name (L245-L259) | `idx_changes_{oid}_*` | `idx_changes_{stable_hash}_*` |
 | `src/cdc.rs` `delete_consumed_changes()` (L430) | `changes_{oid}` | `changes_{stable_hash}` |
 | `src/refresh.rs` cleanup (L617-L624) | `changes_{oid}` | `changes_{stable_hash}` |
@@ -312,7 +312,7 @@ pub fn create_change_trigger(
     pk_columns: &[String],
     columns: &[(String, String)],
     placement: &TablePlacement,
-) -> Result<String, PgdtError>
+) -> Result<String, PgStreamError>
 ```
 
 For `CitusDistributed`:
@@ -374,7 +374,7 @@ When creating a ST, auto-select placement:
 | All sources local | `local` | Current behavior, no changes |
 | Any source is reference, none distributed | `local` | Reference table data is on coordinator |
 | Any source is distributed, ST estimated < 100K rows | `reference` | Small STs replicated everywhere for fast reads |
-| Any source is distributed, ST estimated ≥ 100K rows | `distributed` | Large STs distributed by `__pgdt_row_id` |
+| Any source is distributed, ST estimated ≥ 100K rows | `distributed` | Large STs distributed by `__pgs_row_id` |
 
 Add `dt_placement TEXT` column to `pg_stream.pgs_stream_tables` in `src/lib.rs` (L80). Values: `'local'`, `'reference'`, `'distributed'`. Default: `'local'`.
 
@@ -387,10 +387,10 @@ After `CREATE TABLE {pgs_schema}.{pgs_name}`, based on placement:
 SELECT create_reference_table('{pgs_schema}.{pgs_name}');
 
 -- For distributed STs:
-SELECT create_distributed_table('{pgs_schema}.{pgs_name}', '__pgdt_row_id');
+SELECT create_distributed_table('{pgs_schema}.{pgs_name}', '__pgs_row_id');
 ```
 
-The unique index on `__pgdt_row_id` serves as the distribution key.
+The unique index on `__pgs_row_id` serves as the distribution key.
 
 **P5.3: Replace MERGE with INSERT ON CONFLICT + DELETE**
 
@@ -398,20 +398,20 @@ For `dt_placement = 'distributed'`, replace the MERGE statement in `src/refresh.
 
 ```sql
 -- Step 1: Delete rows that are removed or updated
-DELETE FROM {dt} WHERE __pgdt_row_id IN (
-    SELECT __pgdt_row_id FROM ({delta_cte}) d WHERE d.__pgdt_action = 'D'
+DELETE FROM {dt} WHERE __pgs_row_id IN (
+    SELECT __pgs_row_id FROM ({delta_cte}) d WHERE d.__pgs_action = 'D'
 );
 
 -- Step 2: Insert new rows or update existing
 INSERT INTO {dt} ({columns})
-SELECT {columns} FROM ({delta_cte}) d WHERE d.__pgdt_action = 'I'
-ON CONFLICT (__pgdt_row_id) DO UPDATE SET
+SELECT {columns} FROM ({delta_cte}) d WHERE d.__pgs_action = 'I'
+ON CONFLICT (__pgs_row_id) DO UPDATE SET
     {col1} = EXCLUDED.{col1},
     {col2} = EXCLUDED.{col2},
     ...;
 ```
 
-This is fully supported by Citus when `__pgdt_row_id` is the distribution column.
+This is fully supported by Citus when `__pgs_row_id` is the distribution column.
 
 **P5.4: Extend `CachedMergeTemplate`**
 
@@ -441,10 +441,10 @@ The delta CTE chain (generated by `src/dvm/operators/`) references `changes_{sta
 1. Profile with `EXPLAIN ANALYZE` in integration tests
 2. If push-down fails, materialize the delta into a temp table before apply:
    ```sql
-   CREATE TEMP TABLE __pgdt_delta AS ({delta_cte});
-   DELETE FROM {dt} WHERE __pgdt_row_id IN (SELECT __pgdt_row_id FROM __pgdt_delta WHERE __pgdt_action = 'D');
-   INSERT INTO {dt} SELECT ... FROM __pgdt_delta WHERE __pgdt_action = 'I' ON CONFLICT ...;
-   DROP TABLE __pgdt_delta;
+   CREATE TEMP TABLE __pgs_delta AS ({delta_cte});
+   DELETE FROM {dt} WHERE __pgs_row_id IN (SELECT __pgs_row_id FROM __pgs_delta WHERE __pgs_action = 'D');
+   INSERT INTO {dt} SELECT ... FROM __pgs_delta WHERE __pgs_action = 'I' ON CONFLICT ...;
+   DROP TABLE __pgs_delta;
    ```
 
 **P5.7: Fix row count estimates for distributed tables**
@@ -505,20 +505,20 @@ Add a stale-lock cleanup: locks older than `pg_stream.lock_timeout` (default: 10
 
 Replace `PgAtomic<AtomicU64>` DAG rebuild signal at `src/shmem.rs` (L37) with PostgreSQL's LISTEN/NOTIFY:
 
-- `signal_dag_rebuild()` → `NOTIFY pgdt_dag_rebuild`
-- Scheduler loop → `LISTEN pgdt_dag_rebuild` + poll with `pg_sleep_for()`
+- `signal_dag_rebuild()` → `NOTIFY pg_stream_dag_rebuild`
+- Scheduler loop → `LISTEN pg_stream_dag_rebuild` + poll with `pg_sleep_for()`
 
 This works across all connections to the same database (coordinator). For multi-coordinator HA setups, only one coordinator is writable at a time, so LISTEN/NOTIFY is sufficient.
 
 **P6.4: Conditional shared memory usage**
 
-Keep `PgLwLock<PgdtSharedState>` for `scheduler_pid` and `scheduler_running` — these are coordinator-local state that doesn't need cross-node visibility. Only replace the DAG rebuild signal.
+Keep `PgLwLock<PgStreamSharedState>` for `scheduler_pid` and `scheduler_running` — these are coordinator-local state that doesn't need cross-node visibility. Only replace the DAG rebuild signal.
 
 Update `src/shmem.rs`:
 ```rust
 pub fn signal_dag_rebuild() {
     // Use NOTIFY for Citus-safe signaling
-    let _ = Spi::run("NOTIFY pgdt_dag_rebuild");
+    let _ = Spi::run("NOTIFY pg_stream_dag_rebuild");
     // Also update atomic for backward compat with local shmem consumers
     if is_shmem_available() {
         DAG_REBUILD_SIGNAL.get().fetch_add(1, Ordering::SeqCst);

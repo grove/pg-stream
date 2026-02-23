@@ -55,7 +55,7 @@ This document describes the internal architecture of pg_stream — a PostgreSQL 
 
 ### 1. SQL API Layer (`src/api.rs`)
 
-The public entry point for users. All operations are exposed as `#[pg_extern]` functions in the `pgdt` schema:
+The public entry point for users. All operations are exposed as `#[pg_extern]` functions in the `pgstream` schema:
 
 - **create_stream_table** — Parses the defining query, builds an operator tree, creates the storage table, registers CDC slots, populates the catalog, and optionally performs an initial full refresh.
 - **alter_stream_table** — Modifies schedule, refresh mode, or status (ACTIVE/SUSPENDED).
@@ -141,7 +141,7 @@ erDiagram
 
 Captures row-level changes from source tables using lightweight PostgreSQL triggers:
 
-1. **Trigger Management** — Creates `AFTER INSERT OR UPDATE OR DELETE` row-level triggers (`pgdt_cdc_<oid>`) on each tracked source table. Each trigger fires a PL/pgSQL function (`pgdt_cdc_fn_<oid>()`) that writes changes to the buffer table.
+1. **Trigger Management** — Creates `AFTER INSERT OR UPDATE OR DELETE` row-level triggers (`pg_stream_cdc_<oid>`) on each tracked source table. Each trigger fires a PL/pgSQL function (`pg_stream_cdc_fn_<oid>()`) that writes changes to the buffer table.
 2. **Change Buffering** — Decoded changes are written to per-source change buffer tables in the `pgstream_changes` schema. Each row captures the LSN (`pg_current_wal_lsn()`), transaction ID, action type (I/U/D), and the new/old row data as JSONB via `to_jsonb()`.
 3. **Cleanup** — Consumed changes are deleted after each successful refresh via `delete_consumed_changes()`, bounded by the upper LSN to prevent unbounded scans.
 4. **Lifecycle** — Triggers and trigger functions are automatically created when a source table is first tracked and dropped when the last stream table referencing a source is removed.
@@ -270,7 +270,7 @@ Automatic refresh scheduling uses **canonical periods** (48·2ⁿ seconds, n = 0
 
 #### Shared Memory (`src/shmem.rs`)
 
-The scheduler background worker and user sessions share a `PgdtSharedState` structure protected by a `PgLwLock`. Key fields:
+The scheduler background worker and user sessions share a `PgStreamSharedState` structure protected by a `PgLwLock`. Key fields:
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -294,7 +294,7 @@ Reinitialization is deferred until the next refresh cycle, which then performs a
 
 Centralized error types using `thiserror`:
 
-- `PgdtError` variants cover catalog access, SQL execution, CDC, DVM, DAG, and config errors.
+- `PgStreamError` variants cover catalog access, SQL execution, CDC, DVM, DAG, and config errors.
 - Each refresh failure increments `consecutive_errors`.
 - When `consecutive_errors` reaches `pg_stream.max_consecutive_errors` (default 3), the ST is moved to `ERROR` status and suspended from automatic refresh.
 - Manual intervention (`ALTER ... status => 'ACTIVE'`) resets the counter.
@@ -312,7 +312,7 @@ Provides observability functions:
 
 #### NOTIFY Alerting
 
-Operational events are broadcast via PostgreSQL `NOTIFY` on the `pgdt_alert` channel. Clients can subscribe with `LISTEN pgdt_alert;` and receive JSON-formatted events:
+Operational events are broadcast via PostgreSQL `NOTIFY` on the `pg_stream_alert` channel. Clients can subscribe with `LISTEN pg_stream_alert;` and receive JSON-formatted events:
 
 | Event | Condition |
 |---|---|
@@ -327,10 +327,10 @@ Operational events are broadcast via PostgreSQL `NOTIFY` on the `pgdt_alert` cha
 
 Provides deterministic 64-bit row identifiers using **xxHash (xxh64)** with a fixed seed. Two SQL functions are exposed:
 
-- **`pgstream.pgdt_hash(text)`** — Hash a single text value; used for simple single-column row IDs.
-- **`pgstream.pgdt_hash_multi(text[])`** — Hash multiple values (separated by a record-separator byte `\x1E`) for composite keys (join row IDs, GROUP BY keys).
+- **`pgstream.pg_stream_hash(text)`** — Hash a single text value; used for simple single-column row IDs.
+- **`pgstream.pg_stream_hash_multi(text[])`** — Hash multiple values (separated by a record-separator byte `\x1E`) for composite keys (join row IDs, GROUP BY keys).
 
-Row IDs are written into every stream table's storage as an internal `pgdt_row_id BIGINT` column and are used by the delta application phase to match `DELETE` candidates precisely.
+Row IDs are written into every stream table's storage as an internal `__pgs_row_id BIGINT` column and are used by the delta application phase to match `DELETE` candidates precisely.
 
 ### 13. Configuration (`src/config.rs`)
 
@@ -355,7 +355,7 @@ Eight GUC (Grand Unified Configuration) variables control runtime behavior. See 
  Source Table INSERT/UPDATE/DELETE
            │
            ▼
- Row-Level Trigger (pgdt_cdc_fn_<oid>)
+ Row-Level Trigger (pg_stream_cdc_fn_<oid>)
            │
            ▼
  Change Buffer Table (pgstream_changes.changes_<oid>)
@@ -372,7 +372,7 @@ Eight GUC (Grand Unified Configuration) variables control runtime behavior. See 
            │
            ▼
  Delta Application:
-   DELETE FROM storage WHERE pgdt_row_id IN (removed)
+   DELETE FROM storage WHERE __pgs_row_id IN (removed)
    INSERT INTO storage SELECT ... FROM (added)
            │
            ▼
@@ -397,9 +397,9 @@ src/
 ├── config.rs        # GUC variable registration
 ├── dag.rs           # Dependency graph (cycle detection, topo sort)
 ├── error.rs         # Centralized error types
-├── hash.rs          # xxHash row ID generation (pgdt_hash / pgdt_hash_multi)
+├── hash.rs          # xxHash row ID generation (pg_stream_hash / pg_stream_hash_multi)
 ├── hooks.rs         # DDL event trigger handlers (_on_ddl_end, _on_sql_drop)
-├── shmem.rs         # Shared memory state (PgdtSharedState, DAG_REBUILD_SIGNAL)
+├── shmem.rs         # Shared memory state (PgStreamSharedState, DAG_REBUILD_SIGNAL)
 ├── dvm/
 │   ├── mod.rs       # DVM module root + recursive CTE recomputation diff
 │   ├── parser.rs    # Query → OpTree converter (CTE extraction, subquery, window support)

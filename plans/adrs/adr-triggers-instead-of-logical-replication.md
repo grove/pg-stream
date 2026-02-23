@@ -123,9 +123,9 @@ For each source table tracked by at least one stream table:
 ```
 Source Table (e.g., orders)
     │
-    ├── AFTER INSERT OR UPDATE OR DELETE trigger: pgdt_cdc_<source_oid>
+    ├── AFTER INSERT OR UPDATE OR DELETE trigger: pg_stream_cdc_<source_oid>
     │       │
-    │       └── Calls: pg_stream_changes.pgdt_cdc_fn_<source_oid>()
+    │       └── Calls: pg_stream_changes.pg_stream_cdc_fn_<source_oid>()
     │               │
     │               └── INSERTs into: pg_stream_changes.changes_<source_oid>
     │
@@ -137,7 +137,7 @@ Source Table (e.g., orders)
 Each source table gets a dedicated PL/pgSQL trigger function:
 
 ```sql
-CREATE OR REPLACE FUNCTION pg_stream_changes.pgdt_cdc_fn_<oid>()
+CREATE OR REPLACE FUNCTION pg_stream_changes.pg_stream_cdc_fn_<oid>()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN

@@ -110,7 +110,7 @@ RUN mkdir -p /coverage && chmod 777 /coverage
 
 # Tell the LLVM runtime to write profraw files into /coverage.
 # %p = PID, %m = binary signature hash — avoids collisions across processes.
-ENV LLVM_PROFILE_FILE="/coverage/pgdt-%p-%m.profraw"
+ENV LLVM_PROFILE_FILE="/coverage/pgs-%p-%m.profraw"
 
 # Configure shared_preload_libraries
 RUN echo "" >> /usr/share/postgresql/postgresql.conf.sample && \

@@ -6,7 +6,7 @@ Complete reference for all pg_stream GUC (Grand Unified Configuration) variables
 
 ## Overview
 
-pg_stream exposes six configuration variables in the `pgdt` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_stream exposes six configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 

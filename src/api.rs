@@ -188,7 +188,7 @@ fn create_stream_table_impl(
         if refresh_mode == RefreshMode::Differential
             && let Err(e) = StreamTableMeta::update_adaptive_threshold(pgs_id, None, Some(init_ms))
         {
-            pgrx::debug1!("[PGDT] Failed to record initial last_full_ms: {}", e);
+            pgrx::debug1!("[pg_stream] Failed to record initial last_full_ms: {}", e);
         }
     }
 

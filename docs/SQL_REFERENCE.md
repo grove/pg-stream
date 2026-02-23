@@ -736,7 +736,7 @@ SELECT * FROM pgstream.slot_health();
 
 | slot_name | source_relid | active | retained_wal_bytes | wal_status |
 |---|---|---|---|---|
-| pgdt_slot_16384 | 16384 | false | 1048576 | reserved |
+| pg_stream_slot_16384 | 16384 | false | 1048576 | reserved |
 
 ---
 
@@ -767,12 +767,12 @@ SELECT * FROM pgstream.explain_dt('order_totals');
 
 ---
 
-### pgstream.pgdt_hash
+### pgstream.pg_stream_hash
 
 Compute a 64-bit xxHash row ID from a text value.
 
 ```sql
-pgstream.pgdt_hash(input text) → bigint
+pgstream.pg_stream_hash(input text) → bigint
 ```
 
 Marked `IMMUTABLE, PARALLEL SAFE`.
@@ -780,18 +780,18 @@ Marked `IMMUTABLE, PARALLEL SAFE`.
 **Example:**
 
 ```sql
-SELECT pgstream.pgdt_hash('some_key');
+SELECT pgstream.pg_stream_hash('some_key');
 -- Returns: 1234567890123456789
 ```
 
 ---
 
-### pgstream.pgdt_hash_multi
+### pgstream.pg_stream_hash_multi
 
 Compute a row ID by hashing multiple text values (composite keys).
 
 ```sql
-pgstream.pgdt_hash_multi(inputs text[]) → bigint
+pgstream.pg_stream_hash_multi(inputs text[]) → bigint
 ```
 
 Marked `IMMUTABLE, PARALLEL SAFE`. Uses `\x1E` (record separator) between values and `\x00NULL\x00` for NULL entries.
@@ -799,7 +799,7 @@ Marked `IMMUTABLE, PARALLEL SAFE`. Uses `\x1E` (record separator) between values
 **Example:**
 
 ```sql
-SELECT pgstream.pgdt_hash_multi(ARRAY['key1', 'key2']);
+SELECT pgstream.pg_stream_hash_multi(ARRAY['key1', 'key2']);
 ```
 
 ---

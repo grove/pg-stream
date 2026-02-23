@@ -62,7 +62,7 @@ WHERE xid >= <last_consumed_xid>
 **Notes:**
 - Each source table has a dedicated change buffer table created by the CDC module.
 - Row data is stored as JSONB with column names as keys.
-- The `pgdt_row_id` column (xxHash of primary key) is included for deduplication.
+- The `__pgs_row_id` column (xxHash of primary key) is included for deduplication.
 
 ---
 
@@ -288,7 +288,7 @@ The filter predicate is applied within the delta computation — only rows match
 
 The aggregate operator uses a 3-CTE pipeline:
 
-1. **Merge CTE** — Joins affected group keys against old (storage) and new (source) aggregate values, producing `__pgdt_meta_action` ('I' for new-only groups, 'D' for disappeared groups, 'U' for changed groups).
+1. **Merge CTE** — Joins affected group keys against old (storage) and new (source) aggregate values, producing `__pgs_meta_action` ('I' for new-only groups, 'D' for disappeared groups, 'U' for changed groups).
 2. **LATERAL VALUES expansion** — A single-pass `LATERAL (VALUES ...)` clause expands each merge row into insert and delete actions, avoiding a 4-branch UNION ALL:
 
 ```sql
@@ -297,9 +297,9 @@ LATERAL (VALUES
     ('I', m.new_count, m.new_total),
     ('D', m.old_count, m.old_total)
 ) v(action, count_val, val_total)
-WHERE (m.__pgdt_meta_action = 'I' AND v.action = 'I')
-   OR (m.__pgdt_meta_action = 'D' AND v.action = 'D')
-   OR (m.__pgdt_meta_action = 'U')
+WHERE (m.__pgs_meta_action = 'I' AND v.action = 'I')
+   OR (m.__pgs_meta_action = 'D' AND v.action = 'D')
+   OR (m.__pgs_meta_action = 'U')
 ```
 
 3. **Final projection** — Emits `('+', row)` and `('-', row)` tuples for the refresh engine.
@@ -330,14 +330,14 @@ In other words:
 
 **Strategy:**
 
-Maintains a hidden `__pgdt_dup_count` column in the storage table to track how many times each distinct row appears in the pre-distinct input.
+Maintains a hidden `__pgs_dup_count` column in the storage table to track how many times each distinct row appears in the pre-distinct input.
 
 1. On insert: increment count. If count was 0, emit `('+', row)`.
 2. On delete: decrement count. If count becomes 0, emit `('-', row)`.
 
 **Notes:**
 - The duplicate count is not visible in user queries against the storage table (projected away by the view layer).
-- Duplicate counting uses `pgdt_row_id` (xxHash) for efficient lookups.
+- Duplicate counting uses `__pgs_row_id` (xxHash) for efficient lookups.
 
 ---
 
@@ -433,7 +433,7 @@ A subquery wrapper is transparent for differentiation — it delegates to its ch
 **SQL Generation:**
 ```sql
 -- If column aliases differ from child output columns:
-SELECT __pgdt_row_id, __pgdt_action, child_col1 AS alias_col1, child_col2 AS alias_col2
+SELECT __pgs_row_id, __pgs_action, child_col1 AS alias_col1, child_col2 AS alias_col2
 FROM (<child_delta>)
 ```
 
@@ -462,8 +462,8 @@ When a CTE is referenced multiple times in a query, each reference produces a `C
 ```sql
 -- First reference: differentiates the CTE body and stores result in cache
 -- Subsequent references: point to the same system CTE name
-SELECT __pgdt_row_id, __pgdt_action, <columns>
-FROM __pgdt_cte_<cte_name>_delta  -- shared across all references
+SELECT __pgs_row_id, __pgs_action, <columns>
+FROM __pgs_cte_<cte_name>_delta  -- shared across all references
 ```
 
 If column aliases are present, a thin renaming CTE is added on top of the cached delta.
@@ -496,31 +496,31 @@ Recursive CTEs with `refresh_mode = 'DIFFERENTIAL'` use a **recomputation diff**
 
 **SQL Pattern:**
 ```sql
-WITH __pgdt_recomp_new AS (
-    SELECT pgstream.pgdt_hash(row_to_json(sub)::text) AS __pgdt_row_id, col1, col2, ...
+WITH __pgs_recomp_new AS (
+    SELECT pgstream.pg_stream_hash(row_to_json(sub)::text) AS __pgs_row_id, col1, col2, ...
     FROM (<defining_query>) sub
 ),
-__pgdt_recomp_ins AS (
-    SELECT n.__pgdt_row_id, 'I'::text AS __pgdt_action, n.col1, n.col2, ...
-    FROM __pgdt_recomp_new n
-    LEFT JOIN <storage_table> s ON s.__pgdt_row_id = n.__pgdt_row_id
-    WHERE s.__pgdt_row_id IS NULL
+__pgs_recomp_ins AS (
+    SELECT n.__pgs_row_id, 'I'::text AS __pgs_action, n.col1, n.col2, ...
+    FROM __pgs_recomp_new n
+    LEFT JOIN <storage_table> s ON s.__pgs_row_id = n.__pgs_row_id
+    WHERE s.__pgs_row_id IS NULL
 ),
-__pgdt_recomp_del AS (
-    SELECT s.__pgdt_row_id, 'D'::text AS __pgdt_action, s.col1, s.col2, ...
+__pgs_recomp_del AS (
+    SELECT s.__pgs_row_id, 'D'::text AS __pgs_action, s.col1, s.col2, ...
     FROM <storage_table> s
-    LEFT JOIN __pgdt_recomp_new n ON n.__pgdt_row_id = s.__pgdt_row_id
-    WHERE n.__pgdt_row_id IS NULL
+    LEFT JOIN __pgs_recomp_new n ON n.__pgs_row_id = s.__pgs_row_id
+    WHERE n.__pgs_row_id IS NULL
 )
-SELECT * FROM __pgdt_recomp_ins
+SELECT * FROM __pgs_recomp_ins
 UNION ALL
-SELECT * FROM __pgdt_recomp_del
+SELECT * FROM __pgs_recomp_del
 ```
 
 **Notes:**
 - The cost is proportional to the full result set size, not the delta size. This is a trade-off: correctness is guaranteed for arbitrarily complex recursive structures, but performance is not proportional to the change.
 - For write-heavy workloads on large recursive result sets, `refresh_mode = 'FULL'` may be more efficient since it avoids the anti-join overhead.
-- The `__pgdt_row_id` column (xxHash of the JSON-serialized row) is used for row identity across the anti-join.
+- The `__pgs_row_id` column (xxHash of the JSON-serialized row) is used for row identity across the anti-join.
 - Future work (Tier 3c) may introduce semi-naive evaluation for true differential maintenance of linear recursion.
 
 ---
@@ -557,7 +557,7 @@ WITH affected_partitions AS (
 surviving AS (
     SELECT * FROM <storage_table>
     WHERE (<partition_cols>) IN (SELECT * FROM affected_partitions)
-    AND __pgdt_row_id NOT IN (SELECT __pgdt_row_id FROM (<child_delta>) WHERE __pgdt_action = 'D')
+    AND __pgs_row_id NOT IN (SELECT __pgs_row_id FROM (<child_delta>) WHERE __pgs_action = 'D')
 ),
 -- CTE 3: Recompute window function
 recomputed AS (
@@ -565,9 +565,9 @@ recomputed AS (
     FROM surviving
 )
 -- Delete old results + insert recomputed results
-SELECT 'D' AS __pgdt_action, ...  -- old rows from affected partitions
+SELECT 'D' AS __pgs_action, ...  -- old rows from affected partitions
 UNION ALL
-SELECT 'I' AS __pgdt_action, ...  -- recomputed rows
+SELECT 'I' AS __pgs_action, ...  -- recomputed rows
 ```
 
 **Notes:**

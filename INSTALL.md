@@ -126,7 +126,7 @@ CREATE EXTENSION pg_stream;
 
 This creates:
 
-- The `pgdt` schema with catalog tables and SQL functions
+- The `pgstream` schema with catalog tables and SQL functions
 - The `pgstream_changes` schema for change buffer tables
 - Event triggers for DDL tracking
 - The `pgstream.pg_stat_stream_tables` monitoring view
@@ -139,8 +139,8 @@ After installation, verify everything is working:
 -- Check the extension is loaded
 SELECT * FROM pg_extension WHERE extname = 'pg_stream';
 
--- Check the pgdt schema exists
-SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'pgdt';
+-- Check the pgstream schema exists
+SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'pgstream';
 
 -- Check GUC variables are registered
 SHOW pg_stream.enabled;
