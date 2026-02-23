@@ -647,3 +647,67 @@ Regression aggregates like `CORR`, `COVAR_POP`, `COVAR_SAMP`, and the `REGR_*` f
 2. **Would degrade to group-rescan anyway.** Even if supported, the implementation would need to rescan the full group from source — identical to FULL mode for most practical group sizes.
 
 These aggregates work fine in **FULL** refresh mode, which re-runs the entire query from scratch each cycle.
+
+---
+
+## Why Are These Stream Table Operations Restricted?
+
+Stream tables are regular PostgreSQL heap tables under the hood, but their contents are managed exclusively by the refresh engine. This section explains why certain operations that work on ordinary tables are disallowed or unsupported on stream tables.
+
+### Why can't I `INSERT`, `UPDATE`, or `DELETE` rows in a stream table?
+
+Stream table contents are the **output** of the refresh engine — they represent the materialized result of the defining query at a specific point in time. Direct DML would corrupt this contract in several ways:
+
+1. **Row ID integrity.** Every row has a `__pgs_row_id` (a 64-bit xxHash of the group-by key or all columns). The refresh engine uses this for delta `MERGE` — matching incoming deltas against existing rows. A manually inserted row with an incorrect or duplicate `__pgs_row_id` would cause the next differential refresh to produce wrong results (double-counting, missed deletes, or merge conflicts).
+
+2. **Frontier inconsistency.** Each refresh records a *frontier* — a set of per-source LSN positions that represent "data up to this point has been materialized." A manual DML change is not tracked by any frontier. The next differential refresh would either overwrite the change (if the delta touches the same row) or leave the stream table in a state that doesn't match any consistent point-in-time snapshot of the source data.
+
+3. **Change buffer desync.** The CDC triggers on source tables write changes to buffer tables. The refresh engine reads these buffers and advances the frontier. Manual DML on the stream table bypasses this pipeline entirely — the buffer and frontier have no record of the change, so future refreshes cannot account for it.
+
+If you need to post-process stream table data, create a **view** or a **second stream table** that references the first one.
+
+### Why can't I add foreign keys to or from a stream table?
+
+Foreign key constraints require that referenced/referencing rows exist at the time of each DML statement. The refresh engine violates this assumption:
+
+1. **Bulk `MERGE` ordering.** A differential refresh executes a single `MERGE INTO` statement that applies all deltas (inserts and deletes) atomically. PostgreSQL evaluates FK constraints row-by-row within this `MERGE`. If a parent row is deleted and a new parent inserted in the same delta batch, the child FK check may fail because it sees the delete before the insert — even though the final state would be consistent.
+
+2. **Full refresh uses `TRUNCATE` + `INSERT`.** In FULL mode, the refresh engine truncates the stream table and re-inserts all rows. `TRUNCATE` does not fire individual `DELETE` triggers and bypasses FK cascade logic, which would leave referencing tables with dangling references.
+
+3. **Cross-table refresh ordering.** If stream table A has an FK referencing stream table B, both tables refresh independently (in topological order, but in separate transactions). There is no guarantee that A's refresh sees B's latest data — the FK constraint could transiently fail between refreshes.
+
+**Workaround:** Enforce referential integrity in the consuming application or use a view that joins the stream tables and validates the relationship.
+
+### Why are user-defined triggers on stream tables unsupported?
+
+PostgreSQL allows adding triggers to any table, including stream tables. However, the refresh engine's behavior makes triggers unreliable:
+
+1. **`MERGE` fires unexpected trigger combinations.** A differential refresh uses `MERGE INTO ... WHEN MATCHED THEN DELETE ... WHEN NOT MATCHED THEN INSERT`. From the trigger system's perspective, this produces `DELETE` and `INSERT` events — not `UPDATE`. If a source row is updated, the stream table sees a DELETE of the old row and an INSERT of the new row, meaning an `ON UPDATE` trigger never fires but `ON DELETE` and `ON INSERT` both do.
+
+2. **Full refresh fires mass deletes and inserts.** A FULL refresh truncates (or deletes) all existing rows and re-inserts the full result set. Every trigger on the stream table fires for every row — potentially millions of trigger invocations for what is logically a single "refresh" event.
+
+3. **No stable row identity across refreshes.** The `__pgs_row_id` is a content hash, not a surrogate key. If a source row's group-by key changes, the old `__pgs_row_id` is deleted and a new one is inserted. Triggers that track row lifecycle (e.g., audit triggers) would log this as a delete + insert rather than an update.
+
+4. **Trigger execution inside refresh transaction.** All trigger logic runs within the refresh transaction. A slow or failing trigger blocks the entire refresh, potentially causing the stream table to become stale or the refresh to be marked as failed.
+
+**Workaround:** Use PostgreSQL `LISTEN`/`NOTIFY` on the `pg_stream_alert` channel to react to refresh events, or create a second stream table that applies the transformation you need.
+
+### Why can't I `ALTER TABLE` a stream table directly?
+
+Stream table metadata (defining query, schedule, refresh mode) is stored in the pg_stream catalog (`pgstream.pgs_stream_tables`). A direct `ALTER TABLE` would change the physical table without updating the catalog, causing:
+
+1. **Column mismatch.** If you add or remove columns, the refresh engine's cached delta query and `MERGE` statement would reference columns that no longer exist (or miss new ones), causing runtime errors.
+
+2. **`__pgs_row_id` invalidation.** The row ID hash is computed from the defining query's output columns. Altering the table schema without updating the defining query would make existing row IDs inconsistent with the new column set.
+
+Use `pgstream.alter_stream_table()` to change schedule, refresh mode, or status. To change the defining query or column structure, drop and recreate the stream table.
+
+### Why can't I `TRUNCATE` a stream table?
+
+`TRUNCATE` removes all rows instantly but does not update the pg_stream frontier or change buffers. After a `TRUNCATE`:
+
+1. **Differential refresh sees no changes.** The frontier still records the last-processed LSN. No new source changes may have occurred, so the next differential refresh produces an empty delta — leaving the stream table empty even though the source still has data.
+
+2. **No recovery path for differential mode.** The refresh engine has no way to detect that the stream table was externally truncated. It assumes the current contents match the frontier.
+
+Use `pgstream.refresh_stream_table('my_table')` to force a full re-materialization, or drop and recreate the stream table if you need a clean slate.

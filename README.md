@@ -196,6 +196,8 @@ The following SQL features are **rejected with clear error messages** explaining
 
 ### Stream Table Restrictions
 
+Stream tables are regular PostgreSQL heap tables, but their contents are managed exclusively by the refresh engine. See [FAQ — Why Are These Stream Table Operations Restricted?](docs/FAQ.md#why-are-these-stream-table-operations-restricted) for detailed explanations.
+
 | Operation | Allowed? | Notes |
 |---|---|---|
 | ST references other STs | ✅ Yes | DAG-ordered refresh; cycles are rejected |
