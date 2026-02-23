@@ -9,6 +9,8 @@
 [![PostgreSQL 18](https://img.shields.io/badge/PostgreSQL-18-blue?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![pgrx 0.17](https://img.shields.io/badge/pgrx-0.17-orange)](https://github.com/pgcentralfoundation/pgrx)
 
+> **Early Release Notice:** This project is in an early stage of development and is **not yet production ready**. APIs, configuration options, and internal behavior may change without notice. Use at your own risk and please report any issues you encounter.
+
 **Stream Tables for PostgreSQL 18**
 
 pg_stream brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](plans/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
