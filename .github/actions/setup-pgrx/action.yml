@@ -1,0 +1,106 @@
+name: Setup pgrx build environment
+description: >
+  Install Rust toolchain, cargo-pgrx 0.17.0, and PostgreSQL 18 development
+  headers. Works on Linux, macOS, and Windows runners.
+
+inputs:
+  rust-toolchain:
+    description: Rust toolchain version
+    default: stable
+  pg-version:
+    description: PostgreSQL major version
+    default: "18"
+
+runs:
+  using: composite
+  steps:
+    # ── Rust toolchain ────────────────────────────────────────────────────
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        components: clippy, rustfmt
+
+    # ── Caching ───────────────────────────────────────────────────────────
+    - name: Cache Rust build artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        # Include pgrx version in key so cache is invalidated on pgrx upgrade
+        prefix-key: v0-rust-pgrx0.17
+
+    - name: Cache cargo-pgrx binary
+      id: cache-pgrx-bin
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-pgrx
+        key: cargo-pgrx-${{ runner.os }}-0.17.0
+
+    - name: Cache pgrx home directory (~/.pgrx)
+      id: cache-pgrx-home
+      uses: actions/cache@v4
+      with:
+        path: ~/.pgrx
+        key: pgrx-home-${{ runner.os }}-pg${{ inputs.pg-version }}-pgrx0.17.0
+
+    # ── PostgreSQL headers (Linux) ────────────────────────────────────────
+    - name: Install PostgreSQL ${{ inputs.pg-version }} (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq curl ca-certificates gnupg lsb-release >/dev/null
+
+        # Add PGDG repository
+        sudo install -d /usr/share/postgresql-common/pgdg
+        sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+          --fail -sS https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+          https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+          | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+          postgresql-${{ inputs.pg-version }} \
+          postgresql-server-dev-${{ inputs.pg-version }} >/dev/null
+
+        # Make pg_config available on PATH
+        echo "/usr/lib/postgresql/${{ inputs.pg-version }}/bin" >> "$GITHUB_PATH"
+
+    # ── PostgreSQL headers (macOS) ────────────────────────────────────────
+    - name: Install PostgreSQL ${{ inputs.pg-version }} (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        brew install --quiet postgresql@${{ inputs.pg-version }} || true
+        PG_PREFIX="$(brew --prefix postgresql@${{ inputs.pg-version }})"
+        echo "${PG_PREFIX}/bin" >> "$GITHUB_PATH"
+
+    # ── PostgreSQL headers (Windows) ──────────────────────────────────────
+    # Windows: no system pg_config needed — pgrx init uses 'download' mode
+    # which compiles PostgreSQL from source inside ~/.pgrx (cached above).
+
+    # ── cargo-pgrx ────────────────────────────────────────────────────────
+    - name: Install cargo-pgrx
+      if: steps.cache-pgrx-bin.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --locked cargo-pgrx --version 0.17.0
+
+    # ── pgrx init ─────────────────────────────────────────────────────────
+    - name: Initialize pgrx for PostgreSQL ${{ inputs.pg-version }}
+      if: steps.cache-pgrx-home.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" = "Windows" ]; then
+          # Windows: download and compile PG from source (no system pg_config)
+          cargo pgrx init --pg${{ inputs.pg-version }} download
+        else
+          PG_CONFIG_PATH="$(which pg_config 2>/dev/null || echo pg_config)"
+          echo "Using pg_config at: ${PG_CONFIG_PATH}"
+          "${PG_CONFIG_PATH}" --version
+          cargo pgrx init --pg${{ inputs.pg-version }} "${PG_CONFIG_PATH}"
+        fi
+
+    - name: Verify pgrx environment
+      shell: bash
+      run: cargo pgrx info path pg${{ inputs.pg-version }}

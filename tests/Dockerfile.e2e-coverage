@@ -1,0 +1,124 @@
+# =============================================================================
+# Multi-stage Dockerfile for pg_stream E2E coverage measurement.
+#
+# Identical to Dockerfile.e2e but compiles with LLVM coverage instrumentation
+# so that profraw files are generated when PostgreSQL exercises the extension.
+#
+# Stage 1 (builder): Compiles the extension with -C instrument-coverage
+# Stage 2 (runtime):  Runs PostgreSQL with the instrumented .so, writing
+#                      profraw files to /coverage inside the container.
+#
+# Usage:
+#   docker build -t pg_stream_e2e_cov:latest \
+#       -f tests/Dockerfile.e2e-coverage .
+#
+# The build context must be the project root (parent of tests/).
+# =============================================================================
+
+# ── Stage 1: Build the extension with coverage instrumentation ──────────────
+FROM postgres:18.1 AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        build-essential \
+        libreadline-dev \
+        zlib1g-dev \
+        pkg-config \
+        libssl-dev \
+        libclang-dev \
+        clang \
+        postgresql-server-dev-18 \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain (stable)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install llvm-tools-preview for profdata/cov binaries
+RUN rustup component add llvm-tools-preview
+
+# Install cargo-pgrx (must match the version in Cargo.toml)
+RUN cargo install --locked cargo-pgrx --version 0.17.0
+
+# Initialize pgrx for PG 18 using the system pg_config
+RUN cargo pgrx init --pg18 /usr/bin/pg_config
+
+# ── Dependency caching layer ────────────────────────────────────────────────
+WORKDIR /build
+COPY Cargo.toml ./
+
+RUN mkdir -p src/bin src/ivm/operators benches && \
+    echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
+    echo '#![allow(warnings)]' > src/lib.rs && \
+    echo '' > src/ivm/mod.rs && \
+    echo '' > src/ivm/operators/mod.rs && \
+    echo 'fn main() {}' > benches/refresh_bench.rs && \
+    echo 'fn main() {}' > benches/diff_operators.rs && \
+    cargo generate-lockfile && \
+    cargo fetch
+
+# ── Build the real extension with coverage instrumentation ──────────────────
+COPY src/ src/
+COPY pg_stream.control ./
+
+# Enable LLVM source-based code coverage
+ENV RUSTFLAGS="-C instrument-coverage"
+RUN cargo pgrx package --pg-config /usr/bin/pg_config
+
+# Verify the artifacts were produced
+RUN echo "=== Coverage-instrumented package artifacts ===" && \
+    find target/release/pg_stream-pg18 -type f && \
+    echo "========================="
+
+# Copy llvm-profdata into a well-known location for the final image.
+# The binary lives under rustc's sysroot — find it dynamically.
+RUN SYSROOT="$(rustc --print sysroot)" && \
+    PROFDATA="$(find "$SYSROOT" -name llvm-profdata -type f | head -1)" && \
+    if [ -n "$PROFDATA" ]; then \
+        cp "$PROFDATA" /usr/local/bin/llvm-profdata; \
+        echo "llvm-profdata copied from $PROFDATA"; \
+    else \
+        echo "WARNING: llvm-profdata not found — combined merge will need host toolchain"; \
+    fi
+
+# ── Stage 2: Runtime image with instrumented extension ──────────────────────
+FROM postgres:18.1
+
+LABEL org.opencontainers.image.title="pg_stream E2E coverage image"
+LABEL org.opencontainers.image.description="PostgreSQL 18.1 with coverage-instrumented pg_stream"
+
+# Copy extension artifacts from the builder stage
+COPY --from=builder \
+    /build/target/release/pg_stream-pg18/usr/share/postgresql/18/extension/ \
+    /usr/share/postgresql/18/extension/
+
+COPY --from=builder \
+    /build/target/release/pg_stream-pg18/usr/lib/postgresql/18/lib/ \
+    /usr/lib/postgresql/18/lib/
+
+# Copy llvm-profdata for optional in-container merge
+COPY --from=builder /usr/local/bin/llvm-profdata /usr/local/bin/
+
+# Create a world-writable directory for profraw output.
+# The postgres user (uid 999) writes here; the host user reads from the
+# bind-mounted directory.
+RUN mkdir -p /coverage && chmod 777 /coverage
+
+# Tell the LLVM runtime to write profraw files into /coverage.
+# %p = PID, %m = binary signature hash — avoids collisions across processes.
+ENV LLVM_PROFILE_FILE="/coverage/pgdt-%p-%m.profraw"
+
+# Configure shared_preload_libraries
+RUN echo "" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "# pg_stream E2E coverage configuration" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "shared_preload_libraries = 'pg_stream'" >> /usr/share/postgresql/postgresql.conf.sample
+
+# Verify the extension files are in place
+RUN ls -la /usr/share/postgresql/18/extension/pg_stream* && \
+    ls -la /usr/lib/postgresql/18/lib/pg_stream*
+
+EXPOSE 5432

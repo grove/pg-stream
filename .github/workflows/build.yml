@@ -1,0 +1,169 @@
+# =============================================================================
+# Build Workflow — Compile, lint, and produce platform artifacts
+#
+# Runs on every push to main and every pull request. Produces:
+#   - Lint results (fmt + clippy)
+#   - Per-platform extension packages as downloadable artifacts
+#   - Docker image artifact for E2E tests
+# =============================================================================
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+
+jobs:
+  # ── Lint ─────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --features pg18 -- -D warnings
+
+  # ── Build matrix ────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.artifact_suffix }})
+    runs-on: ${{ matrix.os }}
+    # Windows support in pgrx is experimental — don't block the pipeline
+    continue-on-error: ${{ matrix.os == 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_suffix: linux-amd64
+            archive_ext: tar.gz
+          - os: macos-14
+            artifact_suffix: macos-arm64
+            archive_ext: tar.gz
+          - os: windows-2022
+            artifact_suffix: windows-amd64
+            archive_ext: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build extension package
+        shell: bash
+        run: |
+          # Use pgrx-managed pg_config to avoid picking up Strawberry Perl's PG11
+          # pg_config on Windows (which appears first on PATH).
+          # 'cargo pgrx info path pg18' returns the installation prefix dir;
+          # the pg_config binary lives under bin/ inside that directory.
+          PG_CONFIG_PATH="$(cargo pgrx info path pg18)/bin/pg_config"
+          cargo pgrx package --pg-config "${PG_CONFIG_PATH}"
+
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version=1 \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Package version: ${VERSION}"
+
+      - name: Create archive (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          ARCHIVE_NAME="pg_stream-${{ steps.version.outputs.version }}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "dist/${ARCHIVE_NAME}"
+
+          # Find and copy the pgrx package output
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_stream-pg*' -type d | head -1)
+          if [[ -z "$PKG_DIR" ]]; then
+            echo "ERROR: cannot find pgrx package output"
+            find target/release -maxdepth 2 -type d
+            exit 1
+          fi
+
+          cp -r "${PKG_DIR}"/* "dist/${ARCHIVE_NAME}/"
+          cp README.md LICENSE INSTALL.md "dist/${ARCHIVE_NAME}/" 2>/dev/null || true
+
+          cd dist
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "Archive created: ${ARCHIVE_NAME}.tar.gz"
+          ls -lh "${ARCHIVE_NAME}.tar.gz"
+
+      - name: Create archive (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "pg_stream-${version}-pg${{ env.PG_VERSION }}-${{ matrix.artifact_suffix }}"
+          New-Item -ItemType Directory -Path "dist\${archiveName}" -Force
+
+          $pkgDir = Get-ChildItem -Path "target\release" -Directory -Filter "pg_stream-pg*" | Select-Object -First 1
+          if (-not $pkgDir) {
+            Write-Error "Cannot find pgrx package output"
+            Get-ChildItem -Path "target\release" -Directory
+            exit 1
+          }
+
+          Copy-Item -Recurse "$($pkgDir.FullName)\*" "dist\${archiveName}\"
+          Copy-Item README.md, LICENSE, INSTALL.md "dist\${archiveName}\" -ErrorAction SilentlyContinue
+
+          Compress-Archive -Path "dist\${archiveName}" -DestinationPath "dist\${archiveName}.zip"
+          Write-Host "Archive created: ${archiveName}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.artifact_suffix }}
+          path: dist/*.${{ matrix.archive_ext }}
+          retention-days: 14
+          if-no-files-found: error
+
+  # ── Docker image build ──────────────────────────────────────────────────
+  build-docker:
+    name: Build Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build E2E Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: tests/Dockerfile.e2e
+          tags: pg_stream_e2e:latest
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save Docker image as artifact
+        run: |
+          docker save pg_stream_e2e:latest | gzip > pg_stream_e2e.tar.gz
+          ls -lh pg_stream_e2e.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: pg_stream_e2e.tar.gz
+          retention-days: 7
+          compression-level: 0  # already gzipped

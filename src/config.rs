@@ -1,0 +1,286 @@
+//! GUC (Grand Unified Configuration) variables for pgstream.
+//!
+//! These are registered in `_PG_init()` and control the extension's behavior.
+//! All GUC names are prefixed with `pgstream.`.
+
+use pgrx::guc::*;
+
+/// Master enable/disable switch for the extension.
+pub static PGS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Scheduler wake interval in milliseconds.
+pub static PGS_SCHEDULER_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(1000);
+
+/// Minimum allowed schedule in seconds.
+pub static PGS_MIN_SCHEDULE_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(60);
+
+/// Maximum consecutive errors before auto-suspending a stream table.
+pub static PGS_MAX_CONSECUTIVE_ERRORS: GucSetting<i32> = GucSetting::<i32>::new(3);
+
+/// Schema name for change buffer tables.
+pub static PGS_CHANGE_BUFFER_SCHEMA: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"pgstream_changes"));
+
+/// Maximum number of concurrent refresh workers.
+pub static PGS_MAX_CONCURRENT_REFRESHES: GucSetting<i32> = GucSetting::<i32>::new(4);
+
+/// Maximum change-to-table ratio before falling back to FULL refresh.
+///
+/// When the number of pending change buffer rows exceeds this fraction of
+/// the source table's estimated row count, DIFFERENTIAL refresh automatically
+/// falls back to FULL refresh to avoid the JSONB/window-function overhead
+/// that makes DIFFERENTIAL slower than FULL at high change rates.
+///
+/// Set to 0.0 to disable adaptive fallback (always use DIFFERENTIAL).
+/// Set to 1.0 to always fall back (effectively forcing FULL mode).
+pub static PGS_DIFFERENTIAL_MAX_CHANGE_RATIO: GucSetting<f64> = GucSetting::<f64>::new(0.15);
+
+/// Whether to use TRUNCATE instead of DELETE for change buffer cleanup
+/// when the entire buffer is consumed by a refresh.
+///
+/// TRUNCATE is O(1) regardless of row count, versus per-row DELETE which
+/// must update indexes. This saves 3–5ms per refresh at 10%+ change rates.
+///
+/// Set to false if the TRUNCATE AccessExclusiveLock on the change buffer
+/// is problematic for concurrent DML on the source table.
+pub static PGS_CLEANUP_USE_TRUNCATE: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Whether to inject `SET LOCAL` planner hints before MERGE execution.
+///
+/// When enabled, the refresh executor estimates the delta size and applies:
+/// - delta >= 100 rows: `SET LOCAL enable_nestloop = off` (favour hash joins)
+/// - delta >= 10 000 rows: additionally `SET LOCAL work_mem = '<N>MB'`
+///
+/// This reduces P95 latency spikes caused by PostgreSQL choosing nested-loop
+/// plans for medium/large delta sizes.
+pub static PGS_MERGE_PLANNER_HINTS: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// `work_mem` (in MB) applied via `SET LOCAL` when the estimated delta
+/// exceeds 10 000 rows and planner hints are enabled.
+///
+/// A higher value lets PostgreSQL use larger hash tables for the MERGE
+/// join, avoiding disk-spilling sort/merge strategies on large deltas.
+pub static PGS_MERGE_WORK_MEM_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
+
+/// Strategy for applying delta changes to the stream table.
+///
+/// - `"auto"` (default): Use MERGE for small deltas; switch to
+///   DELETE + INSERT when the estimated delta exceeds 25% of the stream
+///   table row count.
+/// - `"merge"`: Always use a single MERGE statement.
+/// - `"delete_insert"`: Always use DELETE + INSERT.
+pub static PGS_MERGE_STRATEGY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+
+/// Whether to use SQL PREPARE / EXECUTE for MERGE statements.
+///
+/// When enabled, the refresh executor issues `PREPARE __pgs_merge_{id}`
+/// on the first cache-hit cycle, then uses `EXECUTE` on subsequent cycles.
+/// After ~5 executions PostgreSQL switches from a custom plan to a generic
+/// plan, saving 1–2ms of parse/plan overhead per refresh.
+///
+/// Disable if prepared-statement parameter sniffing produces poor plans
+/// (e.g., highly skewed LSN distributions).
+pub static PGS_USE_PREPARED_STATEMENTS: GucSetting<bool> = GucSetting::<bool>::new(true);
+
+/// Register all GUC variables. Called from `_PG_init()`.
+pub fn register_gucs() {
+    GucRegistry::define_bool_guc(
+        c"pg_stream.enabled",
+        c"Master enable/disable switch for pgstream.",
+        c"When false, the scheduler will not run and no refreshes will be triggered.",
+        &PGS_ENABLED,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_stream.scheduler_interval_ms",
+        c"Scheduler wake interval in milliseconds.",
+        c"Controls how frequently the background scheduler checks for STs that need refresh.",
+        &PGS_SCHEDULER_INTERVAL_MS,
+        100,    // min
+        60_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_stream.min_schedule_seconds",
+        c"Minimum allowed schedule in seconds.",
+        c"Stream tables cannot specify a schedule smaller than this value.",
+        &PGS_MIN_SCHEDULE_SECONDS,
+        1,      // min
+        86_400, // max (1 day)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_stream.max_consecutive_errors",
+        c"Maximum consecutive errors before auto-suspend.",
+        c"After this many consecutive refresh failures, the stream table is automatically suspended.",
+        &PGS_MAX_CONSECUTIVE_ERRORS,
+        1,    // min
+        100,  // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_stream.change_buffer_schema",
+        c"Schema name for change buffer tables.",
+        c"CDC change data is stored in tables within this schema.",
+        &PGS_CHANGE_BUFFER_SCHEMA,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_stream.max_concurrent_refreshes",
+        c"Maximum number of concurrent refresh workers.",
+        c"Controls the maximum number of stream tables that can be refreshed in parallel.",
+        &PGS_MAX_CONCURRENT_REFRESHES,
+        1,  // min
+        32, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_float_guc(
+        c"pg_stream.differential_max_change_ratio",
+        c"Max change ratio before falling back to FULL refresh.",
+        c"When pending changes exceed this fraction of the source table size, DIFFERENTIAL refresh falls back to FULL. Set to 0.0 to disable.",
+        &PGS_DIFFERENTIAL_MAX_CHANGE_RATIO,
+        0.0,  // min
+        1.0,  // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_stream.cleanup_use_truncate",
+        c"Use TRUNCATE for change buffer cleanup when all rows are consumed.",
+        c"When true and the entire change buffer is consumed by a refresh, uses TRUNCATE (O(1)) instead of per-row DELETE. Disable if the AccessExclusiveLock is problematic.",
+        &PGS_CLEANUP_USE_TRUNCATE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_stream.merge_planner_hints",
+        c"Inject SET LOCAL planner hints before MERGE execution.",
+        c"When true, disables nested-loop joins and optionally raises work_mem for medium/large delta sizes to stabilise P95 latency.",
+        &PGS_MERGE_PLANNER_HINTS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_stream.merge_work_mem_mb",
+        c"work_mem (MB) for large-delta MERGE execution.",
+        c"Applied via SET LOCAL when planner hints are enabled and the delta exceeds 10 000 rows.",
+        &PGS_MERGE_WORK_MEM_MB,
+        8,    // min
+        4096, // max (4 GB)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_stream.merge_strategy",
+        c"Delta apply strategy: auto, merge, or delete_insert.",
+        c"'auto' uses MERGE for small deltas and DELETE+INSERT for large ones. \
+           'merge' always uses MERGE. 'delete_insert' always uses DELETE+INSERT.",
+        &PGS_MERGE_STRATEGY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_stream.use_prepared_statements",
+        c"Use SQL PREPARE/EXECUTE for MERGE during differential refresh.",
+        c"When true, the first cache-hit cycle PREPAREs the MERGE statement and subsequent cycles EXECUTE it. Saves 1-2ms of parse/plan overhead. Disable if plan-parameter sniffing causes poor plans.",
+        &PGS_USE_PREPARED_STATEMENTS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+}
+
+// ── Convenience accessors ──────────────────────────────────────────────────
+
+/// Returns the current value of `pg_stream.enabled`.
+pub fn pg_stream_enabled() -> bool {
+    PGS_ENABLED.get()
+}
+
+/// Returns the scheduler interval in milliseconds.
+pub fn pg_stream_scheduler_interval_ms() -> i32 {
+    PGS_SCHEDULER_INTERVAL_MS.get()
+}
+
+/// Returns the minimum schedule in seconds.
+pub fn pg_stream_min_schedule_seconds() -> i32 {
+    PGS_MIN_SCHEDULE_SECONDS.get()
+}
+
+/// Returns the max consecutive errors before auto-suspend.
+pub fn pg_stream_max_consecutive_errors() -> i32 {
+    PGS_MAX_CONSECUTIVE_ERRORS.get()
+}
+
+/// Returns the max change ratio for adaptive FULL fallback.
+pub fn pg_stream_differential_max_change_ratio() -> f64 {
+    PGS_DIFFERENTIAL_MAX_CHANGE_RATIO.get()
+}
+
+/// Returns the change buffer schema name.
+pub fn pg_stream_change_buffer_schema() -> String {
+    PGS_CHANGE_BUFFER_SCHEMA
+        .get()
+        .map(|cs| cs.to_str().unwrap_or("pgstream_changes").to_string())
+        .unwrap_or_else(|| "pgstream_changes".to_string())
+}
+
+/// Returns the maximum number of concurrent refresh workers.
+pub fn pg_stream_max_concurrent_refreshes() -> i32 {
+    PGS_MAX_CONCURRENT_REFRESHES.get()
+}
+
+/// Returns whether TRUNCATE cleanup is enabled.
+pub fn pg_stream_cleanup_use_truncate() -> bool {
+    PGS_CLEANUP_USE_TRUNCATE.get()
+}
+
+/// Returns whether MERGE planner hints are enabled.
+pub fn pg_stream_merge_planner_hints() -> bool {
+    PGS_MERGE_PLANNER_HINTS.get()
+}
+
+/// Returns the work_mem value (in MB) for large-delta MERGE.
+pub fn pg_stream_merge_work_mem_mb() -> i32 {
+    PGS_MERGE_WORK_MEM_MB.get()
+}
+
+/// Returns the merge strategy: "auto", "merge", or "delete_insert".
+pub fn pg_stream_merge_strategy() -> String {
+    PGS_MERGE_STRATEGY
+        .get()
+        .map(|cs| cs.to_str().unwrap_or("auto").to_string())
+        .unwrap_or_else(|| "auto".to_string())
+}
+
+/// Returns whether prepared statements are enabled for MERGE.
+pub fn pg_stream_use_prepared_statements() -> bool {
+    PGS_USE_PREPARED_STATEMENTS.get()
+}
+
+/// Ratio of delta / stream-table size above which `auto` strategy
+/// would switch from MERGE to DELETE + INSERT.
+///
+/// Currently unused: the "auto" strategy always uses MERGE for
+/// correctness. DELETE+INSERT has known issues with aggregate/DISTINCT
+/// delta queries that LEFT JOIN back to the stream table.
+/// Kept for future use once the DELETE+INSERT path is fixed.
+#[allow(dead_code)]
+pub const MERGE_STRATEGY_AUTO_THRESHOLD: f64 = 0.25;

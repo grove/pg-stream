@@ -1,0 +1,251 @@
+# =============================================================================
+# CI Workflow — Run the full test matrix
+#
+# Manual-only. Trigger from the Actions tab. Exercises:
+#   - Unit tests on all platforms (Linux, macOS x2, Windows)
+#   - Integration tests (testcontainers) on Linux
+#   - E2E tests (full extension in Docker) on Linux
+#   - pgrx-managed tests on Linux
+#   - Benchmarks (non-blocking) on Linux
+#   - CNPG smoke test (non-blocking) on Linux
+# =============================================================================
+name: CI
+
+on:
+  workflow_dispatch:  # Manual trigger only — run from Actions tab
+  # To re-enable automatic runs, uncomment:
+  # push:
+  #   branches: [main]
+  # pull_request:
+  #   branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+
+jobs:
+  # ── Unit tests (cross-platform) ─────────────────────────────────────────
+  unit-tests:
+    name: Unit tests (${{ matrix.artifact_suffix }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_suffix: linux-amd64
+          - os: macos-14
+            artifact_suffix: macos-arm64
+          - os: windows-2022
+            artifact_suffix: windows-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Run unit tests
+        run: cargo test --lib --features pg18
+
+  # ── Integration tests (testcontainers, Linux only) ──────────────────────
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Run integration tests
+        run: |
+          cargo test \
+            --test catalog_tests \
+            --test extension_tests \
+            --test monitoring_tests \
+            --test smoke_tests \
+            --test resilience_tests \
+            --test scenario_tests \
+            --test workflow_tests \
+            --test property_tests \
+            -- --test-threads=1
+
+  # ── E2E tests (full extension in Docker, Linux only) ────────────────────
+  e2e-tests:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run E2E test suite
+        run: cargo test --test 'e2e_*' -- --test-threads=1
+
+  # ── Benchmarks (non-blocking, Linux only) ───────────────────────────────
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Run benchmarks
+        run: cargo bench --bench refresh_bench --bench diff_operators
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: target/criterion/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── CloudNativePG smoke test (non-blocking, Linux only) ─────────────────
+  cnpg-smoke-test:
+    name: CNPG smoke test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: cnpg-test
+
+      - name: Build extension Docker image
+        run: |
+          docker build -t pg_stream:18.1 \
+            -f cnpg/Dockerfile .
+
+      - name: Load image into kind
+        run: kind load docker-image pg_stream:18.1 --name cnpg-test
+
+      - name: Install CNPG operator
+        run: |
+          kubectl apply --server-side -f \
+            https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.0.yaml
+          kubectl wait --for=condition=Available \
+            deployment/cnpg-controller-manager \
+            -n cnpg-system \
+            --timeout=120s
+
+      - name: Deploy cluster with extension
+        run: |
+          # Use an inline CI-specific manifest.
+          # imagePullPolicy: Never is required for kind-loaded images.
+          #
+          # Do NOT put shared_preload_libraries here: CNPG propagates
+          # postgresql.conf (incl. shared_preload_libraries) into the
+          # initdb container's temporary PostgreSQL start. If _PG_init()
+          # has any issue in that early phase the initdb pod crashes.
+          # Our _PG_init() already handles the missing-SPL case: it
+          # registers GUCs but skips shmem/bgworker — all DDL/DML still
+          # works. Background scheduler is not needed for a smoke test.
+          kubectl apply -f - <<'EOF'
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: pg-stream-demo
+          spec:
+            instances: 1
+            imageName: pg_stream:18.1
+            imagePullPolicy: Never
+            bootstrap:
+              initdb:
+                database: app
+                owner: app
+            storage:
+              size: 1Gi
+              storageClass: standard
+          EOF
+
+      - name: Wait for cluster primary pod
+        run: |
+          echo "Waiting for CNPG Cluster to be ready (up to 8 min)..."
+          kubectl wait cluster/pg-stream-demo \
+            --for=condition=Ready \
+            --timeout=480s || {
+              echo "--- Cluster status ---"
+              kubectl describe cluster/pg-stream-demo | tail -40
+              echo "--- Pod status ---"
+              kubectl get pods -l cnpg.io/cluster=pg-stream-demo -o wide
+              echo "--- Initdb pod logs (most recent) ---"
+              FAILED_POD=$(kubectl get pods \
+                -l cnpg.io/cluster=pg-stream-demo \
+                --field-selector=status.phase=Failed \
+                -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || true)
+              if [[ -n "$FAILED_POD" ]]; then
+                echo "Logs for ${FAILED_POD}:"
+                kubectl logs "${FAILED_POD}" --all-containers 2>&1 | tail -60
+              fi
+              exit 1
+            }
+
+          echo "Waiting for primary pod to be Ready (up to 3 min)..."
+          kubectl wait pods \
+            -l cnpg.io/cluster=pg-stream-demo,role=primary \
+            --for=condition=Ready \
+            --timeout=180s
+
+      - name: Run CNPG smoke test
+        run: |
+          PRIMARY=$(kubectl get pods \
+            -l cnpg.io/cluster=pg-stream-demo \
+            -l role=primary \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          if [[ -z "$PRIMARY" ]]; then
+            echo "ERROR: no primary pod found"
+            kubectl get pods -l cnpg.io/cluster=pg-stream-demo
+            exit 1
+          fi
+
+          echo "Primary pod: ${PRIMARY}"
+
+          # Run all checks in a SINGLE psql session.
+          #
+          # Why one session? Without shared_preload_libraries the extension
+          # .so is loaded dynamically when CREATE EXTENSION runs. PostgreSQL
+          # only registers GUCs (SHOW pg_stream.*) for the lifetime of the
+          # connection that triggered the dynamic load. Separate kubectl exec
+          # calls each start a new backend that hasn't loaded the library yet,
+          # so SHOW pg_stream.enabled returns "unrecognized configuration parameter".
+          # Consolidating into one session avoids this limitation entirely.
+          #
+          # Note: heredoc (<<EOF) is avoided here because GitHub Actions YAML
+          # parses << as a merge key even inside run: | block scalars,
+          # causing a syntax error. Use -c with a multi-line string instead.
+          kubectl exec "${PRIMARY}" -- \
+            psql -U postgres -d app -v ON_ERROR_STOP=1 -c "
+              CREATE EXTENSION pg_stream;
+              SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';
+              SHOW pg_stream.enabled;
+              CREATE TABLE cnpg_test_src (id INT PRIMARY KEY, val TEXT);
+              INSERT INTO cnpg_test_src VALUES (1, 'hello');
+              SELECT pgstream.create_stream_table(
+                  'cnpg_test_dt',
+                  'SELECT id, val FROM cnpg_test_src',
+                  '1m',
+                  'FULL'
+              );
+              SELECT * FROM cnpg_test_dt;
+              SELECT pgstream.drop_stream_table('cnpg_test_dt');
+              DROP TABLE cnpg_test_src;
+            "
+
+          echo "CNPG smoke test passed!"

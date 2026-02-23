@@ -1,0 +1,99 @@
+# =============================================================================
+# Benchmark Tracking Workflow
+#
+# Runs Criterion benchmarks and tracks results using Bencher for continuous
+# benchmarking. On pushes to main, stores baseline results. On PRs, compares
+# against the baseline and comments with any regressions.
+#
+# Setup:
+#   1. Create a Bencher project: https://bencher.dev
+#   2. Add BENCHER_API_TOKEN to repository secrets
+#   3. Optionally configure thresholds in the Bencher dashboard
+# =============================================================================
+name: Benchmarks
+
+# Disabled: Bencher integration not currently active.
+# To re-enable, restore push/pull_request triggers.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+
+jobs:
+  # ── Run Criterion benchmarks and track with Bencher ─────────────────────
+  benchmark:
+    name: Criterion benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Run Criterion benchmarks
+        run: |
+          cargo bench --bench refresh_bench --bench diff_operators \
+            -- --output-format bencher | tee bench-output.txt
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-results
+          path: |
+            bench-output.txt
+            target/criterion/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      # ── Install Bencher CLI ─────────────────────────────────────────────
+      - name: Install Bencher CLI
+        if: env.BENCHER_API_TOKEN != ''
+        uses: bencherdev/bencher@main
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+
+      # ── Bencher: track baseline on main ─────────────────────────────────
+      - name: Track benchmarks (main baseline)
+        if: github.ref == 'refs/heads/main' && env.BENCHER_API_TOKEN != ''
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+        run: |
+          bencher run \
+            --project pg-stream \
+            --token "$BENCHER_API_TOKEN" \
+            --branch main \
+            --testbed github-actions \
+            --adapter rust_bench \
+            --file bench-output.txt
+
+      # ── Bencher: PR regression check ────────────────────────────────────
+      - name: Check for regressions (PR)
+        if: github.event_name == 'pull_request' && env.BENCHER_API_TOKEN != ''
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bencher run \
+            --project pg-stream \
+            --token "$BENCHER_API_TOKEN" \
+            --branch "${{ github.head_ref }}" \
+            --branch-start-point "${{ github.base_ref }}" \
+            --testbed github-actions \
+            --adapter rust_bench \
+            --file bench-output.txt \
+            --threshold-measure latency \
+            --threshold-test t_test \
+            --threshold-upper-boundary 0.99 \
+            --github-actions "$GITHUB_TOKEN" \
+            --err

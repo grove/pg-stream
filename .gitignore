@@ -1,0 +1,13 @@
+.DS_Store
+.idea/
+/target
+*.iml
+**/*.rs.bk
+tests/pg_regress/results
+tests/pg_regress/regression.diffs
+tests/pg_regress/regression.out
+
+# Code coverage
+/coverage/
+*.profraw
+*.profdata

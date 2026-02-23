@@ -1,0 +1,592 @@
+# What Happens When You DELETE a Row?
+
+This tutorial traces what happens when a `DELETE` statement hits a base table that is referenced by a stream table. It covers the trigger capture, how the scan delta emits a single DELETE event, and how each DVM operator propagates the removal — including group deletion, partial group reduction, JOINs, cascading deletes within a single refresh window, and the important edge case where a DELETE cancels a prior INSERT.
+
+> **Prerequisite:** Read [TUTORIAL_WHAT_HAPPENS_ON_INSERT.md](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md) first — it introduces the full 7-phase lifecycle (trigger → scheduler → frontier → change detection → DVM delta → MERGE → cleanup). This tutorial focuses on how DELETE differs.
+
+## Setup
+
+Same e-commerce example used throughout the series:
+
+```sql
+CREATE TABLE orders (
+    id       SERIAL PRIMARY KEY,
+    customer TEXT NOT NULL,
+    amount   NUMERIC(10,2) NOT NULL
+);
+
+SELECT pgstream.create_stream_table(
+    'customer_totals',
+    $$
+      SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
+      FROM orders GROUP BY customer
+    $$,
+    '1m',
+    'DIFFERENTIAL'
+);
+
+-- Seed some data
+INSERT INTO orders (customer, amount) VALUES
+    ('alice', 50.00),
+    ('alice', 30.00),
+    ('bob',   75.00),
+    ('bob',   25.00);
+```
+
+After the first refresh, the stream table contains:
+
+```
+customer | total  | order_count
+---------|--------|------------
+alice    | 80.00  | 2
+bob      | 100.00 | 2
+```
+
+---
+
+## Case 1: Delete One Row (Group Survives)
+
+```sql
+DELETE FROM orders WHERE id = 2;  -- alice's 30.00 order
+```
+
+Alice still has one remaining order (id=1, amount=50.00). The group shrinks but doesn't vanish.
+
+### Phase 1: Trigger Capture
+
+The AFTER DELETE trigger fires and writes **one row** to the change buffer with only OLD values:
+
+```
+pgstream_changes.changes_16384
+┌───────────┬─────────────┬────────┬──────────┬──────────┬────────────┬──────────┬────────────┐
+│ change_id │ lsn         │ action │ new_cust │ new_amt  │ old_cust   │ old_amt  │ pk_hash    │
+├───────────┼─────────────┼────────┼──────────┼──────────┼────────────┼──────────┼────────────┤
+│ 5         │ 0/1A3F3000  │ D      │ NULL     │ NULL     │ alice      │ 30.00    │ 4521038    │
+└───────────┴─────────────┴────────┴──────────┴──────────┴────────────┴──────────┴────────────┘
+```
+
+Key difference from INSERT and UPDATE:
+- **`new_*` columns are all NULL** — the row no longer exists, so there are no NEW values
+- **`old_*` columns contain the deleted row's data** — this is what gets subtracted
+- **`pk_hash`** is computed from `OLD.id` (the deleted row's primary key)
+
+### Phase 2–4: Scheduler, Frontier, Change Detection
+
+Identical to the INSERT flow. The scheduler detects one change row in the LSN window.
+
+### Phase 5: Scan Differentiation — Pure DELETE
+
+Unlike UPDATE (which splits into D+I), a DELETE produces a **single event**:
+
+```
+__pgs_row_id | __pgs_action | customer | amount
+-------------|--------------|----------|-------
+4521038      | D            | alice    | 30.00
+```
+
+The scan delta applies the net-effect filtering rule:
+- `first_action = 'D'` → row existed before the refresh window
+- `last_action = 'D'` → row does not exist after
+
+Result: emit a DELETE using old values. **No INSERT is emitted** (because `last_action = 'D'`).
+
+This is the simplest path through the scan delta — one change, one PK, one DELETE event.
+
+### Phase 5 (continued): Aggregate Differentiation
+
+The aggregate operator processes the DELETE event against the `alice` group:
+
+```sql
+-- DELETE event: subtract old values from alice's group
+__ins_count = 0         -- no inserts
+__del_count = 1         -- one deletion
+__ins_total = 0         -- no amount added
+__del_total = 30.00     -- 30.00 removed
+```
+
+The merge CTE joins this delta with the existing stream table state:
+
+```
+new_count = old_count + ins_count - del_count = 2 + 0 - 1 = 1  (still > 0)
+```
+
+Since `new_count > 0` and the group already existed (`old_count = 2`), the action is classified as **'U' (update)**. The aggregate emits the group with its new values:
+
+```
+customer | total | order_count | __pgs_row_id | __pgs_action
+---------|-------|-------------|--------------|-------------
+alice    | 50.00 | 1           | 7283194      | I
+```
+
+Note: the 'U' meta-action is emitted as `__pgs_action = 'I'` because the MERGE treats it as an update-via-INSERT (see aggregate final CTE: `CASE WHEN __pgdt_meta_action = 'D' THEN 'D' ELSE 'I' END`).
+
+### Phase 6: MERGE
+
+The MERGE statement matches alice's existing row and updates it:
+
+```sql
+MERGE INTO customer_totals AS dt
+USING (...delta...) AS d
+ON dt.__pgs_row_id = d.__pgs_row_id
+WHEN MATCHED AND d.__pgs_action = 'I' THEN
+  UPDATE SET customer = d.customer, total = d.total, order_count = d.order_count, ...
+```
+
+Result:
+
+```sql
+SELECT * FROM customer_totals;
+ customer | total  | order_count
+----------|--------|------------
+ alice    | 50.00  | 1            ← was 80.00 / 2
+ bob      | 100.00 | 2
+```
+
+### Phase 7: Cleanup
+
+The change buffer rows in the consumed LSN window are deleted:
+
+```sql
+DELETE FROM pgstream_changes.changes_16384
+WHERE lsn > '0/1A3F2FFF'::pg_lsn AND lsn <= '0/1A3F3000'::pg_lsn;
+```
+
+---
+
+## Case 2: Delete Last Row in Group (Group Vanishes)
+
+```sql
+-- Alice has one order left (id=1, amount=50.00). Delete it.
+DELETE FROM orders WHERE id = 1;
+```
+
+### Trigger Capture
+
+```
+change_id | lsn         | action | old_cust | old_amt | pk_hash
+6         | 0/1A3F3100  | D      | alice    | 50.00   | -837291
+```
+
+### Scan Delta
+
+Single DELETE event:
+
+```
+__pgs_row_id | __pgs_action | customer | amount
+-------------|--------------|----------|-------
+-837291      | D            | alice    | 50.00
+```
+
+### Aggregate Delta
+
+```
+Group "alice":
+  ins_count = 0
+  del_count = 1
+  new_count = old_count + 0 - 1 = 1 - 1 = 0  → group vanishes!
+```
+
+When `new_count` drops to 0 (or below), the aggregate classifies this as action **'D' (delete)**. The reference count has reached zero — no rows contribute to this group anymore.
+
+The aggregate emits a DELETE for alice's group:
+
+```
+customer | __pgs_row_id | __pgs_action
+---------|--------------|-------------
+alice    | 7283194      | D
+```
+
+### MERGE
+
+The MERGE matches alice's existing row and **deletes** it:
+
+```sql
+WHEN MATCHED AND d.__pgs_action = 'D' THEN DELETE
+```
+
+Result:
+
+```sql
+SELECT * FROM customer_totals;
+ customer | total  | order_count
+----------|--------|------------
+ bob      | 100.00 | 2
+```
+
+Alice's row is completely removed from the stream table. This is the correct behavior — with zero contributing rows, the group should not exist.
+
+---
+
+## Case 3: Delete Multiple Rows (Same Group, Same Window)
+
+```sql
+-- Delete both of bob's orders before the next refresh
+DELETE FROM orders WHERE id = 3;  -- bob, 75.00
+DELETE FROM orders WHERE id = 4;  -- bob, 25.00
+```
+
+The change buffer has two rows with different pk_hash values (different PKs):
+
+```
+change_id | action | old_cust | old_amt | pk_hash
+7         | D      | bob      | 75.00   | pk_hash_3
+8         | D      | bob      | 25.00   | pk_hash_4
+```
+
+### Scan Delta
+
+Each PK has exactly one change, so both take the single-change fast path:
+
+```
+__pgs_row_id | __pgs_action | customer | amount
+-------------|--------------|----------|-------
+pk_hash_3    | D            | bob      | 75.00
+pk_hash_4    | D            | bob      | 25.00
+```
+
+Two DELETE events, both targeting bob's group.
+
+### Aggregate Delta
+
+The aggregate sums both deletions:
+
+```
+Group "bob":
+  ins_count = 0
+  del_count = 2
+  del_total = 75.00 + 25.00 = 100.00
+  new_count = 2 + 0 - 2 = 0  → group vanishes!
+```
+
+The aggregate emits a DELETE for bob's group.
+
+### MERGE
+
+Bob's row is deleted from the stream table. With both alice and bob gone (from Cases 1+2+3), the stream table is now empty.
+
+---
+
+## Case 4: INSERT + DELETE in Same Window (Cancellation)
+
+What if a row is inserted and then deleted before the next refresh?
+
+```sql
+INSERT INTO orders (customer, amount) VALUES ('charlie', 200.00);
+DELETE FROM orders WHERE customer = 'charlie';
+```
+
+The change buffer has:
+
+```
+change_id | action | new_cust | new_amt | old_cust | old_amt | pk_hash
+9         | I      | charlie  | 200.00  | NULL     | NULL    | pk_hash_new
+10        | D      | NULL     | NULL    | charlie  | 200.00  | pk_hash_new
+```
+
+### Net-Effect Computation
+
+Both changes share the same pk_hash. The pk_stats CTE finds `cnt = 2`, so this goes through the multi-change path:
+
+```sql
+first_action = FIRST_VALUE(action) OVER (...) → 'I'
+last_action  = LAST_VALUE(action)  OVER (...) → 'D'
+```
+
+The scan delta applies the net-effect filtering:
+- **DELETE branch**: requires `first_action != 'I'` → FAILS (first_action = 'I')
+- **INSERT branch**: requires `last_action != 'D'` → FAILS (last_action = 'D')
+
+**Result: zero events emitted.** The INSERT and DELETE completely cancel each other out.
+
+The aggregate never sees charlie. The stream table is unchanged. This is correct — the row was born and died within the same refresh window, so it should have no visible effect.
+
+---
+
+## Case 5: UPDATE + DELETE in Same Window
+
+```sql
+UPDATE orders SET amount = 999.99 WHERE id = 3;  -- bob: 75 → 999.99
+DELETE FROM orders WHERE id = 3;
+```
+
+The change buffer:
+
+```
+change_id | action | old_amt | new_amt
+11        | U      | 75.00   | 999.99
+12        | D      | 999.99  | NULL
+```
+
+### Net-Effect Computation
+
+Same pk_hash, `cnt = 2`:
+
+```
+first_action = 'U'  (row existed before this window)
+last_action  = 'D'  (row no longer exists)
+```
+
+Filtering:
+- **DELETE branch**: `first_action != 'I'` → OK. Emit DELETE with old values from the **earliest** change: `old_amt = 75.00`
+- **INSERT branch**: `last_action != 'D'` → FAILS. No INSERT emitted.
+
+Net delta:
+
+```
+__pgs_row_id | __pgs_action | amount
+-------------|--------------|-------
+pk_hash_3    | D            | 75.00
+```
+
+The intermediate value of 999.99 never appears. The aggregate sees only the removal of the **original** value (75.00), which is correct — that's the value that was previously accounted for in the stream table.
+
+---
+
+## Case 6: DELETE with JOINs
+
+Consider a stream table that joins two tables:
+
+```sql
+CREATE TABLE customers (
+    id   SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT 'standard'
+);
+
+CREATE TABLE orders (
+    id          SERIAL PRIMARY KEY,
+    customer_id INT REFERENCES customers(id),
+    amount      NUMERIC(10,2)
+);
+
+SELECT pgstream.create_stream_table(
+    'order_details',
+    $$
+      SELECT c.name, c.tier, o.amount
+      FROM orders o
+      JOIN customers c ON o.customer_id = c.id
+    $$,
+    '1m',
+    'DIFFERENTIAL'
+);
+```
+
+Seed data:
+
+```sql
+INSERT INTO customers VALUES (1, 'alice', 'premium'), (2, 'bob', 'standard');
+INSERT INTO orders VALUES (1, 1, 50.00), (2, 1, 30.00), (3, 2, 75.00);
+```
+
+After refresh, the stream table has:
+
+```
+name  | tier     | amount
+------|----------|-------
+alice | premium  | 50.00
+alice | premium  | 30.00
+bob   | standard | 75.00
+```
+
+Now delete an order:
+
+```sql
+DELETE FROM orders WHERE id = 2;  -- alice's 30.00 order
+```
+
+### How the JOIN Delta Works
+
+The join differentiation formula:
+
+$$\Delta(L \bowtie R) = (\Delta L \bowtie R) \cup (L \bowtie \Delta R) - (\Delta L \bowtie \Delta R)$$
+
+Since only the `orders` table changed:
+- $\Delta L$ = changes to orders (one DELETE: order #2)
+- $\Delta R$ = changes to customers (empty)
+
+So:
+- **Part 1**: $\Delta\text{orders} \bowtie \text{customers}$ = the deleted order joined with its customer
+- **Part 2**: $\text{orders} \bowtie \Delta\text{customers}$ = empty (no customer changes)
+- **Part 3**: $\Delta\text{orders} \bowtie \Delta\text{customers}$ = empty (customers unchanged)
+
+Part 1 produces:
+```
+name  | tier    | amount | __pgs_action
+------|---------|--------|-------------
+alice | premium | 30.00  | D
+```
+
+The deleted order is joined with alice's customer record to produce a DELETE delta row with the complete joined values.
+
+### MERGE
+
+The MERGE matches the row `(alice, premium, 30.00)` and deletes it:
+
+```sql
+SELECT * FROM order_details;
+ name  | tier     | amount
+-------|----------|-------
+ alice | premium  | 50.00      ← alice's remaining order
+ bob   | standard | 75.00
+```
+
+### What About Deleting From the Dimension Table?
+
+```sql
+DELETE FROM customers WHERE id = 2;  -- remove bob entirely
+```
+
+Now $\Delta R$ has a DELETE for bob, while $\Delta L$ is empty:
+
+- **Part 1**: $\Delta\text{orders} \bowtie \text{customers}$ = empty
+- **Part 2**: $\text{orders} \bowtie \Delta\text{customers}$ = bob's order(s) joined with deleted customer record
+
+Part 2 produces DELETE events for every order that referenced bob:
+
+```
+name | tier     | amount | __pgs_action
+-----|----------|--------|-------------
+bob  | standard | 75.00  | D
+```
+
+After MERGE, bob's rows vanish from the stream table.
+
+> **Note**: This assumes referential integrity — if `orders` still references customer #2, a foreign key constraint would prevent the DELETE in practice. But from the IVM perspective, the join delta correctly handles the removal regardless.
+
+---
+
+## Case 7: Bulk DELETE
+
+```sql
+DELETE FROM orders WHERE amount < 50.00;
+```
+
+This deletes multiple rows across potentially multiple groups. The trigger fires once per row (it's a `FOR EACH ROW` trigger), writing one change buffer entry per deleted row:
+
+```
+change_id | action | old_cust | old_amt | pk_hash
+13        | D      | alice    | 30.00   | pk_hash_2
+14        | D      | bob      | 25.00   | pk_hash_4
+```
+
+### Scan Delta
+
+Each deleted PK is independent (different pk_hash values), so each takes the single-change fast path. Two DELETE events:
+
+```
+__pgs_row_id | __pgs_action | customer | amount
+-------------|--------------|----------|-------
+pk_hash_2    | D            | alice    | 30.00
+pk_hash_4    | D            | bob      | 25.00
+```
+
+### Aggregate Delta
+
+The aggregate groups these by customer:
+
+```
+Group "alice":
+  del_count = 1, del_total = 30.00
+  new_count = 2 - 1 = 1  (survives)
+
+Group "bob":
+  del_count = 1, del_total = 25.00
+  new_count = 2 - 1 = 1  (survives)
+```
+
+Both groups survive (count > 0), so the aggregate emits UPDATE (as 'I') events with new values:
+
+```
+customer | total | order_count
+---------|-------|------------
+alice    | 50.00 | 1
+bob      | 75.00 | 1
+```
+
+The MERGE updates both rows. **All work is proportional to the number of deleted rows (2), not the total table size.**
+
+---
+
+## Case 8: TRUNCATE (What Doesn't Work)
+
+```sql
+TRUNCATE orders;
+```
+
+`TRUNCATE` does **not** fire row-level triggers. The change buffer receives zero entries. The next refresh cycle will detect no changes and skip the stream table.
+
+This means the stream table becomes **stale** — it still shows the old aggregate values while the base table is empty.
+
+**Workaround**: After a TRUNCATE, manually reinitialize:
+
+```sql
+SELECT pgstream.refresh_stream_table('customer_totals');
+```
+
+With the `FULL` refresh mode (or by setting the reinitialize flag), the stream table is recomputed from scratch, producing correct results.
+
+> **Why no TRUNCATE support?** PostgreSQL fires statement-level `AFTER TRUNCATE` triggers, but they don't provide OLD row data. The trigger can detect that a TRUNCATE happened, but cannot enumerate which rows were removed. Supporting TRUNCATE would require reading the stream table to determine what to subtract — effectively a full refresh anyway.
+
+---
+
+## How DELETE Differs From INSERT and UPDATE — A Summary
+
+| Aspect | INSERT | UPDATE | DELETE |
+|--------|--------|--------|--------|
+| **Trigger writes** | `new_*` columns only | Both `new_*` and `old_*` | `old_*` columns only |
+| **new_* columns** | Row values | New values | NULL |
+| **old_* columns** | NULL | Old values | Row values |
+| **pk_hash source** | `NEW.pk` | `NEW.pk` | `OLD.pk` |
+| **Scan delta output** | 1 INSERT event | 2 events (D+I split) | 1 DELETE event |
+| **Aggregate effect** | Adds to group count/sum | Subtracts old, adds new | Subtracts from group |
+| **Can delete a group?** | No (only creates/grows) | Yes (if group key changes) | Yes (if count reaches 0) |
+| **MERGE action** | INSERT new row | UPDATE existing row | DELETE matched row |
+
+---
+
+## The Reference Counting Principle
+
+The core insight behind incremental DELETE handling is **reference counting**. Every aggregate group in the stream table maintains an internal counter (`__pgdt_count`) that tracks how many source rows contribute to the group:
+
+```
+Stream table internal state:
+customer | total | order_count | __pgdt_count (hidden)
+---------|-------|-------------|---------------------
+alice    | 80.00 | 2           | 2
+bob      | 100.00| 2           | 2
+```
+
+- **INSERT** → `__pgdt_count += 1`
+- **DELETE** → `__pgdt_count -= 1`
+- **UPDATE** → `__pgdt_count += 0` (D cancels I for same-group updates)
+
+When `__pgdt_count` reaches 0:
+- The group has zero contributing rows
+- The aggregate emits a DELETE event
+- The MERGE removes the row from the stream table
+
+This is mathematically rigorous — the stream table always reflects the correct result of the defining query over the current base table contents, incrementally maintained through algebraic delta operations.
+
+---
+
+## Performance Summary
+
+| Scenario | Buffer rows | Delta rows emitted | Work |
+|----------|------------|-------------------|------|
+| Single row DELETE (group survives) | 1 | 1 (D) | O(1) per group |
+| Single row DELETE (group vanishes) | 1 | 1 (D) | O(1) |
+| N deletes same group | N | N (D) → 1 group delta | O(N) scan, O(1) per group |
+| INSERT+DELETE same window | 2 | 0 (cancels) | O(1) |
+| UPDATE+DELETE same window | 2 | 1 (D original) | O(1) |
+| Bulk DELETE across M groups | N | N (D) → M group deltas | O(N) scan, O(M) aggregate |
+| JOIN table DELETE | 1 | K (one per matched join row) | O(K) join |
+
+In all cases, the work is proportional to the number of **changed rows**, not the total table size. Deleting 3 rows from a billion-row table produces the same delta cost as from a 10-row table.
+
+---
+
+## Next in This Series
+
+- **[What Happens When You INSERT a Row?](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
+- **[What Happens When You UPDATE a Row?](TUTORIAL_WHAT_HAPPENS_ON_UPDATE.md)** — D+I split, group key changes, net-effect for multiple UPDATEs
+- **[What Happens When You TRUNCATE a Table?](TUTORIAL_WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover

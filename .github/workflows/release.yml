@@ -1,0 +1,280 @@
+# =============================================================================
+# Release Workflow — Build release artifacts, publish GitHub Release,
+# and push CNPG-ready Docker image to GHCR.
+#
+# Triggered when a version tag (v*) is pushed.
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # never cancel a release in progress
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/pg_stream
+
+permissions:
+  contents: write   # create GitHub Releases
+  packages: write   # push to GHCR
+
+jobs:
+  # ── Build release artifacts for each platform ───────────────────────────
+  build-release:
+    name: Build (${{ matrix.artifact_suffix }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact_suffix: linux-amd64
+            archive_ext: tar.gz
+          - os: macos-14
+            artifact_suffix: macos-arm64
+            archive_ext: tar.gz
+          - os: windows-2022
+            artifact_suffix: windows-amd64
+            archive_ext: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}"
+
+      - name: Build extension package
+        shell: bash
+        run: |
+          # Use pgrx-managed pg_config to avoid picking up Strawberry Perl's PG11
+          # pg_config on Windows (which appears first on PATH).
+          # 'cargo pgrx info path pg18' returns the installation prefix dir;
+          # the pg_config binary lives under bin/ inside that directory.
+          PG_CONFIG_PATH="$(cargo pgrx info path pg18)/bin/pg_config"
+          cargo pgrx package --pg-config "${PG_CONFIG_PATH}"
+
+      - name: Create archive (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE_NAME="pg_stream-${VERSION}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "dist/${ARCHIVE_NAME}/lib" "dist/${ARCHIVE_NAME}/extension"
+
+          # Find pgrx package output
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_stream-pg*' -type d | head -1)
+          if [[ -z "$PKG_DIR" ]]; then
+            echo "ERROR: cannot find pgrx package output"
+            exit 1
+          fi
+
+          # Copy shared library
+          find "${PKG_DIR}" -name '*.so' -o -name '*.dylib' | while read f; do
+            cp "$f" "dist/${ARCHIVE_NAME}/lib/"
+          done
+
+          # Copy extension control + SQL files
+          find "${PKG_DIR}" -name '*.control' -o -name '*.sql' | while read f; do
+            cp "$f" "dist/${ARCHIVE_NAME}/extension/"
+          done
+
+          # Copy docs
+          cp README.md LICENSE INSTALL.md "dist/${ARCHIVE_NAME}/" 2>/dev/null || true
+
+          cd dist
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "Archive: ${ARCHIVE_NAME}.tar.gz ($(du -h "${ARCHIVE_NAME}.tar.gz" | cut -f1))"
+
+      - name: Create archive (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "pg_stream-${version}-pg${{ env.PG_VERSION }}-${{ matrix.artifact_suffix }}"
+          New-Item -ItemType Directory -Path "dist\${archiveName}\lib" -Force
+          New-Item -ItemType Directory -Path "dist\${archiveName}\extension" -Force
+
+          $pkgDir = Get-ChildItem -Path "target\release" -Directory -Filter "pg_stream-pg*" | Select-Object -First 1
+          if (-not $pkgDir) {
+            Write-Error "Cannot find pgrx package output"
+            exit 1
+          }
+
+          # Copy DLL
+          Get-ChildItem -Path $pkgDir.FullName -Recurse -Filter "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName "dist\${archiveName}\lib\"
+          }
+
+          # Copy control + SQL
+          Get-ChildItem -Path $pkgDir.FullName -Recurse -Include "*.control","*.sql" | ForEach-Object {
+            Copy-Item $_.FullName "dist\${archiveName}\extension\"
+          }
+
+          # Copy docs
+          Copy-Item README.md, LICENSE, INSTALL.md "dist\${archiveName}\" -ErrorAction SilentlyContinue
+
+          Compress-Archive -Path "dist\${archiveName}" -DestinationPath "dist\${archiveName}.zip"
+          Write-Host "Archive: ${archiveName}.zip"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact_suffix }}
+          path: dist/*.${{ matrix.archive_ext }}
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Smoke-test the Linux release artifact ───────────────────────────────
+  test-release:
+    name: Test release artifact
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux-amd64
+          path: dist/
+
+      - name: Extract and install artifact
+        run: |
+          cd dist
+          tar xzf *.tar.gz
+          ARCHIVE_DIR=$(ls -d pg_stream-*-linux-amd64)
+
+          # Find PostgreSQL paths
+          SHAREDIR=$(pg_config --sharedir)
+          PKGLIBDIR=$(pg_config --pkglibdir)
+
+          # Install extension files
+          sudo cp "${ARCHIVE_DIR}"/lib/*.so "${PKGLIBDIR}/"
+          sudo cp "${ARCHIVE_DIR}"/extension/*.control "${SHAREDIR}/extension/"
+          sudo cp "${ARCHIVE_DIR}"/extension/*.sql "${SHAREDIR}/extension/"
+
+          echo "Extension files installed to:"
+          ls -la "${PKGLIBDIR}"/pg_stream*
+          ls -la "${SHAREDIR}/extension"/pg_stream*
+
+      - name: Configure and start PostgreSQL
+        run: |
+          # Add shared_preload_libraries
+          echo "shared_preload_libraries = 'pg_stream'" \
+            | sudo tee -a /etc/postgresql/${{ env.PG_VERSION }}/main/postgresql.conf
+
+          sudo systemctl restart postgresql@${{ env.PG_VERSION }}-main
+
+          # Wait for PostgreSQL to be ready
+          for i in $(seq 1 30); do
+            if pg_isready -p 5432 2>/dev/null; then break; fi
+            sleep 1
+          done
+
+      - name: Run release smoke test
+        run: |
+          sudo -u postgres psql -c "CREATE EXTENSION pg_stream;"
+          sudo -u postgres psql -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';"
+          sudo -u postgres psql -c "SHOW pg_stream.enabled;"
+          sudo -u postgres psql -c "SELECT * FROM pgstream.pgs_status();"
+          echo "Release smoke test passed!"
+
+  # ── Publish GitHub Release ──────────────────────────────────────────────
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-release, test-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: release-*
+
+      - name: Collect release files
+        run: |
+          mkdir -p release-files
+          find artifacts/ -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec cp {} release-files/ \;
+          echo "Release files:"
+          ls -lh release-files/
+
+      - name: Generate checksums
+        run: |
+          cd release-files
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-files/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+
+  # ── Publish Docker image to GHCR ───────────────────────────────────────
+  publish-docker:
+    name: Publish Docker image
+    needs: [build-release, test-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU (for multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: cnpg/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.title=pg_stream
+            org.opencontainers.image.description=PostgreSQL 18 with pg_stream extension
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
