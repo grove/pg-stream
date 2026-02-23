@@ -181,7 +181,7 @@ SELECT pgstream.drop_stream_table('regional_totals');
 
 ## Known Limitations
 
-The following SQL features are **rejected with clear error messages** explaining the limitation and suggesting rewrites:
+The following SQL features are **rejected with clear error messages** explaining the limitation and suggesting rewrites. See [FAQ — Why Are These SQL Features Not Supported?](docs/FAQ.md#why-are-these-sql-features-not-supported) for detailed technical explanations.
 
 | Feature | Reason | Suggested Rewrite |
 |---|---|---|

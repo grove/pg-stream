@@ -215,6 +215,8 @@ The following are rejected with clear error messages and suggested rewrites:
 | `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
 | `ALL (subquery)` | Not supported | Use `NOT EXISTS` with negated condition |
 
+Each of these is explained in detail in the [Why Are These SQL Features Not Supported?](#why-are-these-sql-features-not-supported) section below.
+
 ### What happens to `ORDER BY` in defining queries?
 
 `ORDER BY` is **accepted but silently discarded**. Row order in a stream table is undefined (consistent with PostgreSQL's `CREATE MATERIALIZED VIEW` behavior). Apply `ORDER BY` when **querying** the stream table, not in the defining query.
@@ -446,3 +448,202 @@ SELECT pgstream.explain_dt('order_totals');
 ```
 
 This shows the DVM operator tree, source tables, and the generated delta SQL.
+
+---
+
+## Why Are These SQL Features Not Supported?
+
+This section gives detailed technical explanations for each SQL limitation. pg_stream follows the principle of **"fail loudly rather than produce wrong data"** — every unsupported feature is detected at stream-table creation time and rejected with a clear error message and a suggested rewrite.
+
+### Why is `NATURAL JOIN` rejected?
+
+A full `NATURAL JOIN` implementation was prototyped and then **reverted** because it could silently produce wrong results.
+
+`NATURAL JOIN` implicitly joins on **all columns with matching names** between the two tables. This creates three problems for stream tables:
+
+1. **Hidden `__pgs_row_id` collision.** Every stream table has a `__pgs_row_id BIGINT PRIMARY KEY` column used internally for delta `MERGE` operations. If a stream table references another stream table via `NATURAL JOIN`, PostgreSQL will silently include `__pgs_row_id` in the join condition — producing wrong results without any error or warning.
+
+2. **Schema-evolution fragility.** If a column is added to a source table that happens to share a name with a column in the other table, the join semantics silently change. In an ad-hoc query you'd notice immediately, but a stream table's defining query is stored and re-executed on every refresh, so the breakage could persist undetected across many refresh cycles.
+
+3. **Raw parse tree limitation.** PostgreSQL's raw parser sets the `isNatural` flag on `JoinExpr` but does **not** resolve the actual join column list — the `quals` field is `NULL`. Column resolution happens later during query analysis. This means that at parse time, where pg_stream builds its operator tree, the actual join conditions are unknown. Without explicit conditions, the DVM engine cannot generate correct delta queries.
+
+**Rewrite:**
+```sql
+-- Instead of:
+SELECT * FROM orders NATURAL JOIN customers
+
+-- Use explicit join conditions:
+SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id
+```
+
+### Why are `GROUPING SETS`, `CUBE`, and `ROLLUP` rejected?
+
+These constructs produce **multiple grouping levels in a single query** — for example, `GROUP BY CUBE(dept, region)` yields subtotals for `(dept, region)`, `(dept)`, `(region)`, and `()` (grand total), all interleaved in one result set.
+
+This is fundamentally incompatible with incremental maintenance for two reasons:
+
+1. **Ambiguous row identity.** pg_stream uses a hash of the group-by key columns to identify each row (`__pgs_row_id`). With `GROUPING SETS`, the same column values can appear in multiple grouping levels (a row for `dept='Sales'` appears in both the per-department subtotal and the grand total), making row identity ambiguous. There is no way to distinguish "the subtotal for Sales" from "the grand total" using column values alone.
+
+2. **Delta computation complexity.** Each grouping level is effectively a separate aggregate query with a different `GROUP BY` clause. A single source-row change can affect multiple grouping levels differently. Deriving a correct, efficient delta query that handles all levels simultaneously is an open research problem for incremental view maintenance.
+
+PostgreSQL internally expands `CUBE`/`ROLLUP` during query analysis, but the raw parse tree (where pg_stream detects them) still carries `T_GroupingSet` nodes. These are detected early and rejected before any resources are allocated.
+
+**Rewrite:**
+```sql
+-- Instead of:
+SELECT dept, region, SUM(amount) FROM sales GROUP BY CUBE(dept, region)
+
+-- Create separate stream tables:
+SELECT dept, region, SUM(amount) FROM sales GROUP BY dept, region  -- detail
+SELECT dept, SUM(amount) FROM sales GROUP BY dept                  -- by dept
+SELECT region, SUM(amount) FROM sales GROUP BY region              -- by region
+SELECT SUM(amount) FROM sales                                      -- grand total
+
+-- Or combine them:
+SELECT dept, region, SUM(amount) FROM sales GROUP BY dept, region
+UNION ALL
+SELECT dept, NULL, SUM(amount) FROM sales GROUP BY dept
+UNION ALL
+SELECT NULL, region, SUM(amount) FROM sales GROUP BY region
+UNION ALL
+SELECT NULL, NULL, SUM(amount) FROM sales
+```
+
+### Why is `DISTINCT ON (…)` rejected?
+
+`DISTINCT ON` is a PostgreSQL-specific extension (not in the SQL standard) that returns the first row for each unique combination of the specified expressions, with "first" determined by `ORDER BY`.
+
+It cannot be incrementally maintained because:
+
+1. **Non-deterministic row selection.** Which row is "first" depends on the physical ordering at query time. When source data changes, the "winner" for each distinct group can change unpredictably — the delta would need to compare new and old winners for every group, which degrades to a full rescan.
+
+2. **ORDER BY dependency.** `DISTINCT ON` semantics are tightly coupled to `ORDER BY`, but stream tables intentionally discard ordering (row storage order is undefined). This means the `ORDER BY` that `DISTINCT ON` depends on cannot be preserved.
+
+**Rewrite:**
+```sql
+-- Instead of:
+SELECT DISTINCT ON (dept) dept, employee, salary
+FROM employees ORDER BY dept, salary DESC
+
+-- Use a window function:
+SELECT dept, employee, salary FROM (
+    SELECT dept, employee, salary,
+           ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn
+    FROM employees
+) sub WHERE rn = 1
+```
+
+### Why is `TABLESAMPLE` rejected?
+
+`TABLESAMPLE` returns a random subset of rows from a table (e.g., `FROM orders TABLESAMPLE BERNOULLI(10)` gives ~10% of rows).
+
+Stream tables materialize the **complete** result set of the defining query and keep it up-to-date across refreshes. Baking a random sample into the defining query is not meaningful because:
+
+1. **Non-determinism.** Each refresh would sample different rows, making the stream table contents unstable and unpredictable. The delta between refreshes would be dominated by sampling noise, not actual data changes.
+
+2. **CDC incompatibility.** The trigger-based change-capture system tracks specific row-level changes (inserts, updates, deletes). A `TABLESAMPLE` defining query has no stable row identity — the "changed rows" concept doesn't apply when the entire sample shifts each cycle.
+
+**Rewrite:**
+```sql
+-- Instead of sampling in the defining query:
+SELECT * FROM orders TABLESAMPLE BERNOULLI(10)
+
+-- Materialize the full result and sample when querying:
+SELECT * FROM order_stream_table WHERE random() < 0.1
+```
+
+### Why is `LIMIT` / `OFFSET` rejected?
+
+Stream tables materialize the complete result set and keep it synchronized with source data. `LIMIT`/`OFFSET` would truncate the result:
+
+1. **Undefined ordering.** `LIMIT` without `ORDER BY` returns an arbitrary subset. Even with `ORDER BY`, stream tables discard ordering — the "top N" rows concept doesn't apply to a set-based materialized result.
+
+2. **Delta instability.** When source rows change, the boundary between "in the LIMIT" and "out of the LIMIT" shifts. A single INSERT could evict one row and admit another, requiring the refresh to track the full ordered position of every row — essentially a full rescan.
+
+3. **Semantic mismatch.** Users who write `LIMIT 100` typically want to limit what they *read*, not what is *stored*. Since stream tables are queried separately from their definition, the `LIMIT` belongs in the consuming query.
+
+**Rewrite:**
+```sql
+-- Instead of:
+'SELECT * FROM orders ORDER BY created_at DESC LIMIT 100'
+
+-- Omit LIMIT from the defining query, apply when reading:
+SELECT * FROM orders_stream_table ORDER BY created_at DESC LIMIT 100
+```
+
+### Why are window functions in expressions rejected?
+
+Window functions like `ROW_NUMBER() OVER (…)` are supported as **standalone columns** in stream tables. However, embedding a window function inside an expression — such as `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN ...` or `SUM(x) OVER (...) + 1` — is rejected.
+
+This restriction exists because:
+
+1. **Partition-based recomputation.** pg_stream's differential mode handles window functions by recomputing entire partitions that were affected by changes. When a window function is buried inside an expression, the DVM engine cannot isolate the window computation from the surrounding expression, making it impossible to correctly identify which partitions to recompute.
+
+2. **Expression tree ambiguity.** The DVM parser would need to differentiate the outer expression (arithmetic, `CASE`, etc.) while treating the inner window function specially. This creates a combinatorial explosion of differentiation rules for every possible expression type × window function combination.
+
+**Rewrite:**
+```sql
+-- Instead of:
+SELECT id, CASE WHEN ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) = 1
+                THEN 'top' ELSE 'other' END AS rank_label
+FROM employees
+
+-- Move window function to a separate column, then use a wrapping stream table:
+-- ST1:
+SELECT id, dept, salary,
+       ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn
+FROM employees
+
+-- ST2 (references ST1):
+SELECT id, CASE WHEN rn = 1 THEN 'top' ELSE 'other' END AS rank_label
+FROM pgstream.employees_ranked
+```
+
+### Why is `FOR UPDATE` / `FOR SHARE` rejected?
+
+`FOR UPDATE` and related locking clauses (`FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE`) acquire row-level locks on selected rows. This is incompatible with stream tables because:
+
+1. **Refresh semantics.** Stream table contents are managed by the refresh engine using bulk `MERGE` operations. Row-level locks taken during the defining query would conflict with the refresh engine's own locking strategy.
+
+2. **No direct DML.** Since users cannot directly modify stream table rows, there is no use case for locking rows inside the defining query. The locks would be held for the duration of the refresh transaction and then released, serving no purpose.
+
+### Why is `ALL (subquery)` not supported?
+
+`ALL (subquery)` compares a value against every row returned by a subquery (e.g., `WHERE x > ALL (SELECT y FROM t)`). It is rejected because:
+
+1. **Negation rewrite complexity.** `x > ALL (SELECT y FROM t)` is logically equivalent to `NOT EXISTS (SELECT 1 FROM t WHERE y >= x)`, which pg_stream can handle via its anti-join operator. The rewrite is straightforward.
+
+2. **Rare usage.** `ALL (subquery)` is uncommon in analytical queries. Supporting it directly would add operator complexity for minimal benefit.
+
+**Rewrite:**
+```sql
+-- Instead of:
+WHERE amount > ALL (SELECT threshold FROM limits)
+
+-- Use NOT EXISTS:
+WHERE NOT EXISTS (SELECT 1 FROM limits WHERE threshold >= amount)
+```
+
+### Why is `ORDER BY` silently discarded?
+
+`ORDER BY` in the defining query is **accepted but ignored**. This is consistent with how PostgreSQL treats `CREATE MATERIALIZED VIEW AS SELECT ... ORDER BY ...` — the ordering is not preserved in the stored data.
+
+Stream tables are heap tables with no guaranteed row order. The `ORDER BY` in the defining query would only affect the order of the initial `INSERT`, which has no lasting effect. Apply ordering when **querying** the stream table:
+
+```sql
+-- This ORDER BY is meaningless in the defining query:
+'SELECT region, SUM(amount) FROM orders GROUP BY region ORDER BY total DESC'
+
+-- Instead, order when reading:
+SELECT * FROM regional_totals ORDER BY total DESC
+```
+
+### Why are unsupported aggregates (`CORR`, `COVAR_*`, `REGR_*`) limited to FULL mode?
+
+Regression aggregates like `CORR`, `COVAR_POP`, `COVAR_SAMP`, and the `REGR_*` family require maintaining running sums of products and squares across the entire group. Unlike `COUNT`/`SUM`/`AVG` (where deltas can be computed from the change alone) or group-rescan aggregates (where only affected groups are re-read), regression aggregates:
+
+1. **Lack algebraic delta rules.** There is no closed-form way to update a correlation coefficient from a single row change without access to the full group's data.
+
+2. **Would degrade to group-rescan anyway.** Even if supported, the implementation would need to rescan the full group from source — identical to FULL mode for most practical group sizes.
+
+These aggregates work fine in **FULL** refresh mode, which re-runs the entire query from scratch each cycle.
