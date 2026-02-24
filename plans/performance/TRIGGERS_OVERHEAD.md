@@ -493,7 +493,7 @@ If the overhead is > 5 µs/row for wide tables, an `UNLOGGED` change buffer woul
 
 ### 7.2. Decision: When to Migrate to Logical Replication
 
-Per `AGENTS.md` and `adrs/adr-triggers-instead-of-logical-replication.md`, triggers are recommended for < 1,000 writes/sec and logical replication for > 5,000 writes/sec. This benchmark provides **actual per-row cost** to compute the crossover point:
+Per `AGENTS.md` and ADR-001/ADR-002 in `plans/adrs/PLAN_ADRS.md`, triggers are recommended for < 1,000 writes/sec and logical replication for > 5,000 writes/sec. This benchmark provides **actual per-row cost** to compute the crossover point:
 
 - If trigger overhead = 3 µs/row → max sustained throughput ≈ 333K rows/sec (probably fine for most workloads)
 - If trigger overhead = 10 µs/row → max sustained throughput ≈ 100K rows/sec (start considering alternatives at 50K+ rows/sec)

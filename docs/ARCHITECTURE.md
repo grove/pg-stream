@@ -164,7 +164,7 @@ When `pg_stream.cdc_mode` is set to `'auto'` or `'wal'` and `wal_level = logical
 3. **Transition Orchestration** — The transition is a three-step process: (a) create a replication slot, (b) wait for the decoder to catch up to the trigger's last confirmed LSN, (c) drop the trigger and switch the dependency to WAL mode. If the decoder doesn't catch up within `pg_stream.wal_transition_timeout` (default 300s), the system falls back to triggers.
 4. **CDC Mode Tracking** — Each source dependency in `pgs_dependencies` carries a `cdc_mode` column (TRIGGER / TRANSITIONING / WAL) and WAL-specific metadata (`slot_name`, `decoder_confirmed_lsn`, `transition_started_at`).
 
-See [plans/adrs/adr-triggers-instead-of-logical-replication.md](../plans/adrs/adr-triggers-instead-of-logical-replication.md) for the original design rationale and [plans/sql/PLAN_HYBRID_CDC.md](../plans/sql/PLAN_HYBRID_CDC.md) for the full implementation plan.
+See ADR-001 and ADR-002 in [plans/adrs/PLAN_ADRS.md](../plans/adrs/PLAN_ADRS.md) for the original design rationale and [plans/sql/PLAN_HYBRID_CDC.md](../plans/sql/PLAN_HYBRID_CDC.md) for the full implementation plan.
 
 ### 4. DVM Engine (`src/dvm/`)
 

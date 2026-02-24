@@ -2,7 +2,7 @@
 
 **Status:** Evaluation Report (updated with implementation status)  
 **Date:** 2026-02-24  
-**Context:** [ADR — Triggers Instead of Logical Replication](../adrs/adr-triggers-instead-of-logical-replication.md) · [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
+**Context:** ADR-001/ADR-002 in [PLAN_ADRS.md](../adrs/PLAN_ADRS.md) · [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
 
 ---
 

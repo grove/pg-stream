@@ -138,9 +138,8 @@ Three test tiers, each with its own infrastructure:
 
 The extension uses **row-level AFTER triggers** (not logical replication) to
 capture changes into buffer tables (`pgstream_changes.changes_<oid>`). This
-was chosen for single-transaction atomicity — see
-[adrs/adr-triggers-instead-of-logical-replication.md](adrs/adr-triggers-instead-of-logical-replication.md)
-for the full rationale.
+was chosen for single-transaction atomicity — see ADR-001 and ADR-002 in
+[plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) for the full rationale.
 
 ---
 
