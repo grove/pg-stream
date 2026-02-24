@@ -541,10 +541,40 @@ pub fn determine_refresh_action(dt: &StreamTableMeta, has_upstream_changes: bool
 }
 
 /// Execute a full refresh: TRUNCATE + INSERT from defining query.
+///
+/// When user triggers are detected (and the GUC is not `"off"`), they are
+/// suppressed during the TRUNCATE + INSERT via `DISABLE TRIGGER USER` /
+/// `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so
+/// listeners know a FULL refresh occurred.
+///
+/// **Note:** Row-level user triggers do NOT fire correctly for FULL refresh.
+/// Users who need per-row trigger semantics should use `REFRESH MODE
+/// DIFFERENTIAL`. See PLAN_USER_TRIGGERS_EXPLICIT_DML.md §2.
 pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStreamError> {
     let schema = &dt.pgs_schema;
     let name = &dt.pgs_name;
     let query = &dt.defining_query;
+
+    let quoted_table = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        name.replace('"', "\"\""),
+    );
+
+    // Check for user triggers to suppress during FULL refresh.
+    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let has_triggers = match user_triggers_mode.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => crate::cdc::has_user_triggers(dt.pgs_relid)?,
+    };
+
+    // Suppress user triggers during TRUNCATE + INSERT to prevent
+    // spurious trigger invocations with wrong semantics.
+    if has_triggers {
+        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    }
 
     // For aggregate/distinct STs, inject COUNT(*) AS __pgs_count into the
     // defining query so the auxiliary column is populated correctly.
@@ -557,12 +587,8 @@ pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStream
     };
 
     // Truncate
-    let truncate_sql = format!(
-        "TRUNCATE \"{}\".\"{}\"",
-        schema.replace('"', "\"\""),
-        name.replace('"', "\"\""),
-    );
-    Spi::run(&truncate_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    Spi::run(&format!("TRUNCATE {quoted_table}"))
+        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
@@ -575,11 +601,7 @@ pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStream
         format!("SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({effective_query}) sub",)
     };
 
-    let insert_sql = format!(
-        "INSERT INTO \"{schema}\".\"{table}\" {insert_body}",
-        schema = schema.replace('"', "\"\""),
-        table = name.replace('"', "\"\""),
-    );
+    let insert_sql = format!("INSERT INTO {quoted_table} {insert_body}");
 
     let rows_inserted = Spi::connect_mut(|client| {
         let result = client
@@ -587,6 +609,30 @@ pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStream
             .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
         Ok::<usize, PgStreamError>(result.len())
     })?;
+
+    // Re-enable user triggers and emit NOTIFY so listeners know a FULL
+    // refresh occurred.
+    if has_triggers {
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+        // Escape single quotes in the JSON payload.
+        let escaped_name = name.replace('\'', "''");
+        let escaped_schema = schema.replace('\'', "''");
+        Spi::run(&format!(
+            "NOTIFY pgstream_refresh, '{{\"stream_table\": \"{escaped_name}\", \
+             \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\", \"rows\": {rows_inserted}}}'"
+        ))
+        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+        pgrx::info!(
+            "pg_stream: FULL refresh of {}.{} with user triggers suppressed ({} rows). \
+             Row-level triggers do NOT fire for FULL refresh; use REFRESH MODE DIFFERENTIAL.",
+            schema,
+            name,
+            rows_inserted,
+        );
+    }
 
     Ok((rows_inserted as i64, 0))
 }
@@ -1041,6 +1087,19 @@ pub fn execute_differential_refresh(
     // SET LOCAL hints that are automatically reset at transaction end.
     apply_planner_hints(total_change_count);
 
+    // ── User-trigger detection ───────────────────────────────────────
+    // Determine whether to use the explicit DML path based on the GUC
+    // and the presence of user-defined row-level triggers on the ST.
+    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let use_explicit_dml = match user_triggers_mode.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => {
+            // "auto": detect user triggers
+            crate::cdc::has_user_triggers(dt.pgs_relid)?
+        }
+    };
+
     // ── B-3: Strategy selection ──────────────────────────────────────
     // Choose between MERGE and DELETE+INSERT based on the GUC setting.
     //
@@ -1061,7 +1120,69 @@ pub fn execute_differential_refresh(
     let use_prepared =
         crate::config::pg_stream_use_prepared_statements() && !use_delete_insert && was_cache_hit;
 
-    let (merge_count, strategy_label) = if use_delete_insert {
+    let (merge_count, strategy_label) = if use_explicit_dml {
+        // ── User-trigger path: explicit DML ─────────────────────────
+        // Decompose the MERGE into DELETE + UPDATE + INSERT so that
+        // user-defined triggers fire with correct TG_OP / OLD / NEW.
+
+        // Step 1: Materialize delta into a temp table (ON COMMIT DROP).
+        // This avoids evaluating the delta query three times.
+        let t_mat_start = Instant::now();
+        let materialize_sql = format!(
+            "CREATE TEMP TABLE __pgs_delta_{pgs_id} ON COMMIT DROP AS \
+             SELECT * FROM {using_clause} AS d",
+            pgs_id = dt.pgs_id,
+            using_clause = resolved.trigger_using_sql,
+        );
+        Spi::run(&materialize_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        let t_mat = t_mat_start.elapsed();
+
+        // Step 2: DELETE removed rows (AFTER DELETE triggers fire)
+        let t_del_start = Instant::now();
+        let del_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_delete_sql, None, &[])
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            Ok::<usize, PgStreamError>(result.len())
+        })?;
+        let t_del = t_del_start.elapsed();
+
+        // Step 3: UPDATE changed existing rows (AFTER UPDATE triggers fire)
+        // The IS DISTINCT FROM guard (B-1) prevents no-op UPDATE triggers.
+        let t_upd_start = Instant::now();
+        let upd_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_update_sql, None, &[])
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            Ok::<usize, PgStreamError>(result.len())
+        })?;
+        let t_upd = t_upd_start.elapsed();
+
+        // Step 4: INSERT genuinely new rows (AFTER INSERT triggers fire)
+        let t_ins_start = Instant::now();
+        let ins_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_insert_sql, None, &[])
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            Ok::<usize, PgStreamError>(result.len())
+        })?;
+        let t_ins = t_ins_start.elapsed();
+
+        pgrx::info!(
+            "[PGS_PROFILE] explicit_dml: materialize={:.2}ms delete={:.2}ms({}) update={:.2}ms({}) insert={:.2}ms({}) for {}.{}",
+            t_mat.as_secs_f64() * 1000.0,
+            t_del.as_secs_f64() * 1000.0,
+            del_count,
+            t_upd.as_secs_f64() * 1000.0,
+            upd_count,
+            t_ins.as_secs_f64() * 1000.0,
+            ins_count,
+            schema,
+            name,
+        );
+
+        (del_count + upd_count + ins_count, "explicit_dml")
+    } else if use_delete_insert {
         // ── DELETE + INSERT path ─────────────────────────────────────
         let stmts: Vec<&str> = resolved
             .delete_insert_sql
