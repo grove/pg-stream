@@ -7,6 +7,7 @@
 #   - E2E tests (full extension in Docker) on Linux
 #   - pgrx-managed tests on Linux
 #   - Benchmarks (non-blocking) on Linux
+#   - dbt-pgstream integration tests (dbt 1.6-1.9 matrix) on Linux
 #   - CNPG smoke test (non-blocking) on Linux
 # =============================================================================
 name: CI
@@ -117,6 +118,81 @@ jobs:
           path: target/criterion/
           retention-days: 7
           if-no-files-found: ignore
+
+  # ── dbt-pgstream integration tests (Linux only) ──────────────────────────
+  dbt-integration:
+    name: dbt integration (${{ matrix.dbt-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        dbt-version: ['1.6', '1.7', '1.8', '1.9']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Start PostgreSQL with pg_stream
+        run: |
+          docker run -d \
+            --name pgstream-dbt-test \
+            -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 \
+            pg_stream_e2e:latest
+
+          # Wait for PostgreSQL to accept connections
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec pgstream-dbt-test \
+              pg_isready -U postgres -q 2>/dev/null; then
+              echo "PostgreSQL is ready (attempt $i)"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Create pg_stream extension
+        run: |
+          docker exec pgstream-dbt-test \
+            psql -U postgres -c "CREATE EXTENSION pg_stream;"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dbt
+        run: |
+          pip install \
+            "dbt-core~=${{ matrix.dbt-version }}.0" \
+            "dbt-postgres~=${{ matrix.dbt-version }}.0"
+          dbt --version
+
+      - name: Run dbt integration tests
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+        run: |
+          cd dbt-pgstream/integration_tests
+          dbt deps
+          dbt seed
+          dbt run
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run --full-refresh
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run-operation pgstream_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgstream_check_freshness
+          dbt run-operation drop_all_stream_tables
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f pgstream-dbt-test 2>/dev/null || true
 
   # ── CloudNativePG smoke test (non-blocking, Linux only) ─────────────────
   cnpg-smoke-test:

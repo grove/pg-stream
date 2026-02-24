@@ -5,6 +5,13 @@
 Date: 2026-02-24
 Status: PROPOSED
 
+> **Note (2026-02-24):** Option A — the macro-only package
+> ([PLAN_DBT_MACRO.md](PLAN_DBT_MACRO.md)) — has been **implemented** in
+> `dbt-pgstream/` (Phases 1–8, 10). CI pipeline (Phase 9) is live in
+> `.github/workflows/ci.yml`. This adapter plan (Option B) is the *upgrade
+> path* for when first-class relation types, column filtering, and native
+> source-freshness support are needed.
+
 ---
 
 ## Overview
@@ -16,10 +23,12 @@ native catalog introspection, column filtering (`__pgs_row_id` hidden), and firs
 support for stream-table-specific operations (manual refresh, CDC health checks, staleness
 monitoring).
 
-This is the heavier option compared to a macro-only package (see
-[PLAN_DBT_MACRO.md](PLAN_DBT_MACRO.md)). It is appropriate when pg_stream is a core part
-of the data stack and users want a polished, production-grade dbt experience with stream
-tables treated as first-class citizens alongside regular tables and views.
+Option A (macro-only package) is already implemented and provides the core
+`stream_table` materialization, SQL API wrappers, lifecycle operations, freshness
+monitoring, and integration tests. This adapter plan (Option B) builds on that
+foundation when pg_stream becomes a central part of the data platform and users
+need a richer dbt experience — hidden `__pgs_row_id` columns, `stream_table`
+relation type in `dbt docs`, and native `dbt source freshness` support.
 
 ---
 
@@ -934,27 +943,34 @@ Follow semantic versioning aligned with dbt Core major versions:
 
 ## Comparison with Option A
 
-| Aspect | Option A (Macro Package) | Option B (Full Adapter) |
-|--------|--------------------------|------------------------|
-| **Effort** | ~15 hours | ~60–80 hours |
+| Aspect | Option A (Macro Package) ✅ Implemented | Option B (Full Adapter) |
+|--------|----------------------------------------|------------------------|
+| **Effort** | ~15 hours (done) | ~54 hours |
 | **Dependencies** | dbt-postgres only | Custom Python package |
 | **Installation** | `dbt deps` (git/Hub) | `pip install dbt-pgstream` |
 | **`__pgs_row_id` hidden** | No (visible in docs) | Yes (filtered in adapter) |
 | **Relation type** | Shows as `table` | Shows as `stream_table` |
-| **Source freshness** | Manual via macro | Native adapter override |
-| **Custom operations** | Basic run-operations | Rich: explain, health, history |
+| **Source freshness** | `pgstream_check_freshness` run-operation | Native `dbt source freshness` |
+| **Custom operations** | refresh, drop, CDC health, freshness | + explain, refresh history |
 | **Catalog integration** | Standard postgres | Enhanced with ST metadata |
 | **Profile type** | `postgres` | `pgstream` (verifies extension) |
-| **Testing** | dbt project tests | Python unit + functional tests |
+| **Testing** | dbt project tests + CI matrix (1.6–1.9) | Python unit + functional tests |
 | **Maintenance** | Low (Jinja only) | Higher (Python + Jinja) |
+| **CI** | ✅ dbt-integration job in ci.yml | Extends existing CI |
 
-**Recommendation:** Start with Option A for quick adoption. Migrate to Option B when
+**Current status:** Option A is implemented and running in CI. Migrate to Option B when
 stream tables are a central part of the data platform and users need first-class IDE
-support, clean docs, and operational tooling.
+support, hidden `__pgs_row_id` columns in docs, and native `dbt source freshness`.
 
 ---
 
 ## File Layout
+
+> **Migration note:** The `dbt-pgstream/` directory currently contains the
+> Option A macro package. Implementing this adapter plan would restructure
+> the directory into a Python package, moving existing macros under
+> `dbt/include/pgstream/macros/` and adding the Python adapter code.
+> The integration tests would move into `tests/functional/`.
 
 ```
 dbt-pgstream/

@@ -3,7 +3,7 @@
 **Option A — dbt Package with Custom Materialization**
 
 Date: 2026-02-24
-Status: PROPOSED
+Status: IMPLEMENTED (Phases 1–8, 10 complete; Phase 9 CI live in `.github/workflows/ci.yml`)
 
 ---
 
