@@ -263,6 +263,80 @@ pg_stream has DDL event triggers that detect `ALTER TABLE` and `DROP TABLE` on s
 - The next refresh cycle performs a full reinitialization (drops and recreates the storage table)
 - A `reinitialize_needed` NOTIFY alert is sent
 
+### How do I check if a source table has switched from trigger-based CDC to WAL-based CDC?
+
+When you enable hybrid CDC (`pg_stream.cdc_mode = 'auto'`), pg_stream starts capturing changes with triggers and can automatically transition to WAL-based logical replication once conditions are met. There are several ways to check the current CDC mode for each source table:
+
+**1. Query the dependency catalog directly:**
+
+```sql
+SELECT d.source_relid, c.relname AS source_table, d.cdc_mode,
+       d.slot_name, d.decoder_confirmed_lsn, d.transition_started_at
+FROM pgstream.pgs_dependencies d
+JOIN pg_class c ON c.oid = d.source_relid;
+```
+
+The `cdc_mode` column shows one of three values:
+- `TRIGGER` — changes are captured via row-level triggers (the default)
+- `TRANSITIONING` — the system is in the process of switching from triggers to WAL
+- `WAL` — changes are captured via logical replication
+
+**2. Use the built-in health check function:**
+
+```sql
+SELECT source_table, cdc_mode, slot_name, lag_bytes, alert
+FROM pgstream.check_cdc_health();
+```
+
+This returns a row per source table with the current mode, replication slot lag (for WAL-mode sources), and any alert conditions such as `slot_lag_exceeds_threshold` or `replication_slot_missing`.
+
+**3. Listen for real-time transition notifications:**
+
+```sql
+LISTEN pg_stream_cdc_transition;
+```
+
+pg_stream sends a `NOTIFY` with a JSON payload whenever a transition starts, completes, or is rolled back. Example payload:
+
+```json
+{
+  "event": "transition_complete",
+  "source_table": "public.orders",
+  "old_mode": "TRANSITIONING",
+  "new_mode": "WAL",
+  "slot_name": "pg_stream_slot_16384"
+}
+```
+
+This lets you integrate CDC mode changes into your monitoring stack without polling.
+
+**4. Check the global GUC setting:**
+
+```sql
+SHOW pg_stream.cdc_mode;
+```
+
+This shows the *desired* global behavior (`trigger`, `auto`, or `wal`), not the per-table actual state. The per-table state lives in `pgs_dependencies.cdc_mode` as described above.
+
+See [CONFIGURATION.md](CONFIGURATION.md) for details on the `pg_stream.cdc_mode` and `pg_stream.wal_transition_timeout` GUCs.
+
+### Is it safe to add triggers to a stream table while the source table is switching CDC modes?
+
+**Yes, this is completely safe.** CDC mode transitions and user-defined triggers operate on different tables and do not interfere with each other:
+
+- **CDC transitions** affect how changes are captured from **source tables** (e.g., `orders`). The transition switches the capture mechanism from row-level triggers on the source table to WAL-based logical replication.
+- **User-defined triggers** live on **stream tables** (e.g., `order_totals`) and control how the refresh engine *applies* changes to the materialized output.
+
+Because these are independent concerns, you can freely add, modify, or remove triggers on a stream table at any point — including during an active CDC transition on its source tables.
+
+**How it works in practice:**
+
+1. The refresh engine checks for user-defined triggers on the stream table at the start of each refresh cycle (via a fast `pg_trigger` lookup, <0.1 ms).
+2. If user triggers are detected, the engine uses explicit `DELETE` / `UPDATE` / `INSERT` statements instead of `MERGE`, so your triggers fire with correct `TG_OP`, `OLD`, and `NEW` values.
+3. The change data consumed by the refresh engine has the same format regardless of whether it came from CDC triggers or WAL decoding — so the trigger detection and the CDC mode are fully decoupled.
+
+A trigger added between two refresh cycles will simply be picked up on the next cycle. The only (theoretical) edge case is adding a trigger in the tiny window *during* a single refresh transaction, between the trigger-detection check and the MERGE execution — but since both happen within the same transaction, this is virtually impossible in practice.
+
 ---
 
 ## Performance & Tuning
