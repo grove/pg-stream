@@ -14,11 +14,15 @@ This report evaluates the trigger-based approach against **logical replication**
 and two end-user features — user-defined triggers on stream tables and logical
 replication subscriptions from stream tables.
 
-**Conclusion:** Triggers remain the correct choice for the current scope. The
-single-transaction atomicity requirement is a hard constraint that logical
-replication cannot meet without significant API compromises. The two end-user
-features (user triggers and logical replication FROM stream tables) are both
-achievable without changing the CDC mechanism.
+**Conclusion:** Triggers remain the correct choice for the current scope given
+operational simplicity and zero-config deployment. However, the atomicity
+constraint — the original reason for choosing triggers — is primarily a
+**creation-time inconvenience**, not a steady-state limitation. Once a stream
+table exists, logical replication is superior on write-side performance,
+TRUNCATE capture, and WAL-native change ordering. The two end-user features
+(user triggers and logical replication FROM stream tables) are both achievable
+without changing the CDC mechanism. A hybrid approach (triggers for creation,
+logical replication for steady-state) deserves serious consideration.
 
 ---
 
@@ -68,7 +72,7 @@ decisive factor in the original ADR.
 **Key insight:** The TRUNCATE gap is the most significant correctness
 limitation of the trigger approach. A statement-level `AFTER TRUNCATE` trigger
 that marks downstream STs for automatic FULL refresh would close this gap
-without changing the CDC architecture (see §5 Recommendation 3).
+without changing the CDC architecture (see §6 Recommendation 3).
 
 ### 2.2 Performance
 
@@ -129,6 +133,10 @@ triggers or logical replication. The existing plan in
 replication **publishing** from stream tables (see §2.5). This needs
 verification before implementation.
 
+> **Note:** Sections 2.1–2.5 compare creation-time and operational aspects.
+> For a focused steady-state comparison (what matters once the ST exists),
+> see §3.
+
 ### 2.5 Feature: Logical Replication FROM Stream Tables
 
 This addresses end-users **subscribing** to stream table changes via
@@ -170,7 +178,120 @@ the overhead entirely.
 
 ---
 
-## 3. TRUNCATE: The Gap and How to Close It
+## 3. Separating Creation-Time from Steady-State
+
+The original ADR chose triggers because `pg_create_logical_replication_slot()`
+cannot execute inside a transaction that has already performed writes. This
+report initially treated that constraint as "decisive." But it deserves
+scrutiny: **the atomicity constraint only affects the `create_stream_table()`
+call — a one-time event.** Once a stream table exists, CDC runs for hours,
+days, or months. The steady-state characteristics are what actually matter for
+performance, correctness, and user experience.
+
+### 3.1 The Atomicity Constraint Is a Solvable Engineering Problem
+
+The constraint is real but workable. Three approaches exist, all with
+well-understood trade-offs:
+
+| Approach | How It Works | Downside |
+|---|---|---|
+| **Two-phase creation** | Phase 1: DDL + catalog in one transaction. Phase 2: slot creation in a separate transaction. Rollback Phase 1 artifacts on Phase 2 failure. | Brief window where catalog entry exists without CDC. Cleanup on failure adds ~50 lines of code. |
+| **Background worker handoff** | Main transaction creates DDL + catalog + temporary trigger. Background worker creates slot asynchronously, then drops trigger. | Race window: changes between COMMIT and slot creation are captured by the temporary trigger, so no data is lost. Adds complexity (~100 lines). |
+| **Trigger bootstrap → slot transition** | Create with triggers (current approach). After first successful refresh, migrate to logical replication in the background. | Trigger overhead during bootstrap period (minutes). Most natural hybrid approach. |
+
+None of these are architecturally difficult. The two-phase approach is
+straightforward — if slot creation fails, drop the storage table and catalog
+entry. The temporary-trigger approach eliminates even the theoretical data-loss
+window. These are **engineering inconveniences**, not fundamental blockers.
+
+### 3.2 Steady-State: Triggers vs Logical Replication (Honest Comparison)
+
+Once the stream table exists and CDC is running, here is how the two approaches
+compare on their actual runtime merits:
+
+#### Where Logical Replication Wins (Steady-State)
+
+| Dimension | Trigger Impact | Logical Replication Advantage |
+|---|---|---|
+| **Write-path latency** | Every INSERT/UPDATE/DELETE on a tracked source pays ~2–15 μs synchronous overhead (PL/pgSQL dispatch, buffer INSERT, index update). This is **inside the committing transaction's critical path.** | Zero additional write-path cost. WAL writes happen regardless; decoding is asynchronous. Source table DML performance is completely unaffected. |
+| **Write amplification** | Each source row change produces: (1) source table WAL, (2) buffer table heap write, (3) buffer table WAL, (4) buffer index update, (5) index WAL. **~2–3× total write amplification.** | 1× — only the source table's normal WAL. No additional heap writes, no secondary indexes. |
+| **TRUNCATE capture** | Cannot capture. Row-level triggers don't fire. Requires a separate statement-level AFTER TRUNCATE workaround (§4) that only marks for reinit — the actual row deletions are invisible to differential mode. | Native. WAL emits TRUNCATE events since PG 11. The decoder receives a clean signal that all rows were removed. |
+| **Throughput ceiling** | Estimated ~5,000 writes/sec on tracked sources before trigger overhead dominates. PL/pgSQL function dispatch is the bottleneck. | Bounded by WAL throughput — typically 50,000–200,000+ writes/sec depending on hardware and `wal_buffers`. |
+| **Connection-pool pressure** | Trigger executes in the application's connection. Long-running trigger INSERTs can increase connection hold time under load. | Decoding runs in a dedicated WAL sender process. Application connections are unaffected. |
+| **Vacuum pressure** | Buffer tables accumulate dead tuples between cleanups. Each refresh cycle creates bloat that autovacuum must reclaim. | No buffer tables to vacuum. WAL segments are recycled by the WAL management subsystem. |
+| **Transaction ID consumption** | Each trigger INSERT consumes sub-transaction resources within the outer transaction. High-volume batch operations can cause excessive subtransaction overhead. | No additional transaction work. |
+
+#### Where Triggers Win (Steady-State)
+
+| Dimension | Trigger Advantage | Logical Replication Impact |
+|---|---|---|
+| **Operational simplicity** | No external state to manage. Buffer tables are regular heap tables — queryable, monitorable, backed up normally. Drop the trigger and it's gone. | Replication slots are persistent server-side state. A stuck or crashed consumer prevents WAL recycling, potentially filling the disk. Requires monitoring, max_slot_wal_keep_size guards, and orphan-slot cleanup. |
+| **Zero configuration** | Works with any `wal_level` (`minimal`, `replica`, `logical`). No restart required. No `REPLICA IDENTITY` configuration. | Requires `wal_level = logical` (server restart), `max_replication_slots` sizing, and `REPLICA IDENTITY` on every tracked source table. Many managed PostgreSQL providers default to `wal_level = replica`. |
+| **Schema evolution** | DDL event hooks rebuild the trigger function via `CREATE OR REPLACE FUNCTION`. New columns are added to the buffer table with `ADD COLUMN IF NOT EXISTS`. Simple, same-transaction, no coordination. | Schema changes on tracked tables require careful handling. The output plugin must be aware of column additions/removals. Slot may need to be recreated. `ALTER TABLE` during active decoding can cause protocol errors. |
+| **Debugging & visibility** | Change buffers are queryable tables: `SELECT * FROM pgstream_changes.changes_12345 ORDER BY change_id DESC LIMIT 10`. Immediate visibility into what was captured. | WAL is binary and opaque. Inspecting captured changes requires `pg_logical_slot_peek_changes()` which advances or peeks the slot — disruptive in production. |
+| **Crash recovery** | Buffer tables are WAL-logged and survive crashes. No special recovery needed — the refresh engine picks up from the last frontier LSN. | Slots survive crashes, but the decoding position may be ahead of what pg_stream has consumed. Requires careful bookkeeping to avoid replaying or losing changes. |
+| **Multi-source coordination** | Each source has an independent buffer table. The refresh engine reads from multiple buffers with independent LSN ranges. No coordination between sources. | Multiple sources could share a single slot (decoding all tables) or use per-source slots. Shared slots require demultiplexing; per-source slots multiply the slot management burden. |
+| **Isolation** | Trigger failure (e.g., buffer table full) raises an error in the application transaction — visible and immediate. | Decoding failure is asynchronous. The application commits successfully, but changes may never reach the buffer. Silent data loss is possible unless monitored. |
+
+#### Neutral (Roughly Equivalent)
+
+| Dimension | Notes |
+|---|---|
+| **Refresh-path performance** | Both approaches populate the same buffer table schema. The MERGE/DVM pipeline is identical regardless of how buffers were filled. |
+| **Zero-change detection** | Triggers: `EXISTS` check on empty buffer (~3 ms). Logical replication: check slot position vs current WAL LSN (~3 ms). Equivalent. |
+| **Memory footprint** | Triggers: PL/pgSQL function cache per backend. Logical replication: WAL sender process + decoding context. Both are modest. |
+
+### 3.3 When Does Logical Replication Become the Better Choice?
+
+The crossover point depends on workload characteristics:
+
+| Scenario | Better Choice | Why |
+|---|---|---|
+| **< 1,000 writes/sec** on tracked sources | Triggers | Overhead is negligible; operational simplicity dominates |
+| **1,000–5,000 writes/sec** | Either / Triggers still acceptable | Trigger overhead is measurable but unlikely to be the bottleneck |
+| **> 5,000 writes/sec** | Logical Replication | Write-path overhead starts to matter; 2–3× write amplification compounds |
+| **ETL patterns** (TRUNCATE + bulk INSERT) | Logical Replication | Native TRUNCATE capture; no stale-data gap |
+| **Wide tables** (20+ columns) | Logical Replication | Trigger overhead scales with column count (~5–15 μs); WAL overhead does not |
+| **Managed PostgreSQL** with `wal_level` restrictions | Triggers | No choice — logical replication may not be available |
+| **Many tracked sources** (50+) | Logical Replication | Fewer moving parts than 50 triggers + 50 buffer tables + 50 indexes |
+| **Need logical replication FROM stream tables** | Triggers (with caveats) | see §2.5 — `session_replication_role` conflict with `DISABLE TRIGGER USER` as workaround |
+
+### 3.4 Reassessing the Decision
+
+With the atomicity constraint properly scoped as a creation-time concern, the
+decision to use triggers rests on three remaining pillars:
+
+1. **Operational simplicity** — no `wal_level` change, no slot management, no
+   `REPLICA IDENTITY` configuration. This is genuinely valuable for an
+   early-stage extension that needs frictionless adoption.
+
+2. **Debugging visibility** — queryable buffer tables are a major developer
+   experience advantage. Being able to `SELECT * FROM changes_<oid>` during
+   debugging is invaluable.
+
+3. **Zero-config deployment** — works on any PostgreSQL 18 instance without
+   server restarts or configuration changes. Critical for managed PostgreSQL
+   environments.
+
+However, these advantages are primarily about **developer and operator
+experience**, not about the fundamental capability of the system. A mature
+pg_stream deployment that needs high write throughput, TRUNCATE support, or
+minimal source-table impact would be better served by logical replication in
+steady-state.
+
+**The honest assessment:** Triggers are the right choice *today* for pragmatic
+reasons (simplicity, early-stage adoption, managed PG compatibility). But the
+report should not overstate the atomicity constraint as a fundamental blocker —
+it is a solvable problem. If pg_stream grows to serve high-throughput
+production workloads, the migration to logical replication for steady-state CDC
+should be treated as a planned evolution, not a theoretical future.
+
+---
+
+## 4. TRUNCATE: The Gap and How to Close It
+
+> This limitation is one of the strongest arguments for logical replication
+> in steady-state — see §3.2 for the comparison.
 
 The TRUNCATE limitation is the most commonly cited drawback of trigger-based
 CDC. PostgreSQL does not fire row-level triggers for TRUNCATE because TRUNCATE
@@ -209,12 +330,13 @@ Rust function for `on_source_truncated`, cascade logic reuse from `hooks.rs`).
 
 ---
 
-## 4. Migration Path: Trigger → Logical Replication
+## 5. Migration Path: Trigger → Logical Replication
 
-The original ADR notes that the buffer table schema and downstream IVM pipeline
-are **decoupled** from the capture mechanism. If future requirements demand
-logical replication (>5,000 writes/sec, cross-database CDC), migration is
-isolated to the CDC layer:
+As discussed in §3, the atomicity constraint is a creation-time problem with
+known solutions. The buffer table schema and downstream IVM pipeline are
+**decoupled** from the capture mechanism, so migration is isolated to the CDC
+layer. This should be treated as a **planned evolution** for high-throughput
+deployments, not a theoretical future:
 
 ### Phase A: Hybrid Creation
 
@@ -241,13 +363,20 @@ isolated to the CDC layer:
 
 ---
 
-## 5. Recommendations
+## 6. Recommendations
 
-### Recommendation 1: Keep Trigger-Based CDC
+### Recommendation 1: Keep Trigger-Based CDC (For Now)
 
-The atomicity constraint is decisive. Operational simplicity and zero-config
-deployment are strong advantages for an early-stage extension. The performance
-ceiling (~5,000 writes/sec) is adequate for the target use cases.
+Operational simplicity and zero-config deployment are strong advantages for an
+early-stage extension. The performance ceiling (~5,000 writes/sec) is adequate
+for current target use cases. The atomicity constraint, while solvable (see
+§3.1), adds creation-time complexity that is not yet justified.
+
+**However:** This decision should be revisited when any of these triggers are
+hit: (a) users report write-path latency from CDC triggers, (b) TRUNCATE-based
+ETL patterns become a common pain point, (c) pg_stream targets environments
+where `wal_level = logical` is already the norm. The steady-state advantages of
+logical replication (§3.2) are substantial and should not be dismissed.
 
 ### Recommendation 2: Implement User Trigger Suppression
 
@@ -276,15 +405,30 @@ including:
 Execute the benchmark plan in
 [TRIGGERS_OVERHEAD.md](../performance/TRIGGERS_OVERHEAD.md) to establish
 data-driven thresholds for the logical replication migration crossover point.
+The results should feed directly into the §3.3 crossover analysis.
+
+### Recommendation 6: Prototype the Hybrid Approach
+
+The "trigger bootstrap → slot transition" pattern from §3.1 deserves a
+prototype. It combines the best of both worlds: zero-config creation (triggers)
+with optimal steady-state performance (logical replication). The migration
+would happen transparently after the first successful refresh, with the trigger
+serving as a temporary safety net.
+
+**Effort estimate:** 1–2 weeks for a working prototype (slot creation in
+background worker, buffer table population from WAL decode, trigger teardown,
+fallback to trigger on slot creation failure).
 
 ---
 
-## 6. Decision Log
+## 7. Decision Log
 
 | # | Decision | Rationale |
 |---|---|---|
-| D1 | Keep triggers for CDC on source tables | Atomicity, zero-config, adequate performance |
-| D2 | User triggers on STs are orthogonal to CDC choice | `session_replication_role` / `DISABLE TRIGGER USER` works with either approach |
-| D3 | Logical replication FROM STs works today | Regular heap tables; needs documentation, not code |
-| D4 | TRUNCATE gap is closable with statement-level trigger | Low effort, high impact |
-| D5 | Logical replication CDC is a viable future migration | Buffer table schema is decoupled; migration is isolated |
+| D1 | Keep triggers for CDC on source tables — for now | Zero-config, operational simplicity, adequate for current scale |
+| D2 | Atomicity constraint is solvable, not fundamental | Two-phase creation and hybrid bootstrap are proven patterns (§3.1) |
+| D3 | Logical replication is superior in steady-state | Zero write overhead, TRUNCATE capture, higher throughput ceiling (§3.2) |
+| D4 | User triggers on STs are orthogonal to CDC choice | `session_replication_role` / `DISABLE TRIGGER USER` works with either approach |
+| D5 | Logical replication FROM STs works today | Regular heap tables; needs documentation, not code |
+| D6 | TRUNCATE gap is closable with statement-level trigger | Low effort, high impact — but logical replication handles it natively |
+| D7 | Hybrid approach is the optimal long-term target | Trigger bootstrap for creation + logical replication for steady-state |

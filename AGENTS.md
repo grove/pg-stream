@@ -36,6 +36,9 @@ just test-all          # All of the above + pgrx tests
 
 When done, output a `git commit` command summarising the change.out
 
+When you have edited files always remember to output git commands for staging 
+and committing the changes.
+
 ---
 
 ## Coding Conventions
