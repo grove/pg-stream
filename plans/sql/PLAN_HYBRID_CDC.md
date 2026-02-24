@@ -1,6 +1,6 @@
 # PLAN: Hybrid CDC — Trigger Bootstrap → Logical Replication Steady-State
 
-**Status:** Proposed  
+**Status:** In Progress (Phases 1–2 implemented)  
 **Date:** 2026-02-24  
 **Origin:** [REPORT_TRIGGERS_VS_REPLICATION.md](REPORT_TRIGGERS_VS_REPLICATION.md) — Recommendation 6  
 **Effort:** 3–5 weeks (6 phases, incrementally deliverable)
@@ -107,7 +107,7 @@ TRIGGER ──▸ TRANSITIONING ──▸ WAL
 
 ## Implementation Phases
 
-### Phase 1: Catalog Schema Extension (~2 days)
+### Phase 1: Catalog Schema Extension ✅ (~2 days)
 
 **Goal:** Add the metadata columns needed to track CDC mode per source.
 
@@ -195,7 +195,7 @@ pub static PGS_WAL_TRANSITION_TIMEOUT: GucSetting<i32> =
 
 ---
 
-### Phase 2: WAL Availability Detection (~1 day)
+### Phase 2: WAL Availability Detection ✅ (~1 day)
 
 **Goal:** Detect at runtime whether logical replication is available.
 

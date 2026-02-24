@@ -35,6 +35,7 @@
 use pgrx::prelude::*;
 use std::collections::HashMap;
 
+use crate::config;
 use crate::error::PgStreamError;
 
 /// Create a CDC trigger on a source table.
@@ -695,6 +696,78 @@ pub fn trigger_exists(source_oid: pg_sys::Oid) -> Result<bool, PgStreamError> {
 /// Get the trigger name for a source OID.
 pub fn trigger_name_for_source(source_oid: pg_sys::Oid) -> String {
     format!("pg_stream_cdc_{}", source_oid.to_u32())
+}
+
+// ── WAL Availability Detection ─────────────────────────────────────────────
+
+/// Check if the server supports logical replication for CDC.
+///
+/// Returns `true` if ALL of:
+/// - `pg_stream.cdc_mode` is `"auto"` or `"wal"` (not `"trigger"`)
+/// - `wal_level` is `'logical'`
+/// - `max_replication_slots` > currently used slots
+///
+/// When `cdc_mode = "wal"` and `wal_level != logical`, returns an error
+/// instead of `false` (hard requirement).
+pub fn can_use_logical_replication() -> Result<bool, PgStreamError> {
+    let cdc_mode = config::pg_stream_cdc_mode();
+    if cdc_mode == "trigger" {
+        return Ok(false);
+    }
+
+    let wal_level = Spi::get_one::<String>("SELECT current_setting('wal_level')")
+        .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+        .unwrap_or_default();
+
+    if wal_level != "logical" {
+        if cdc_mode == "wal" {
+            return Err(PgStreamError::InvalidArgument(
+                "pg_stream.cdc_mode = 'wal' requires wal_level = logical".into(),
+            ));
+        }
+        return Ok(false);
+    }
+
+    // Check available replication slots
+    let available = Spi::get_one::<i64>(
+        "SELECT current_setting('max_replication_slots')::bigint \
+         - (SELECT count(*) FROM pg_replication_slots)",
+    )
+    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .unwrap_or(0);
+
+    Ok(available > 0)
+}
+
+/// Check if a source table has adequate REPLICA IDENTITY for logical decoding.
+///
+/// Returns `true` if REPLICA IDENTITY is `DEFAULT` (has PK) or `FULL`.
+/// Returns `false` if `NOTHING` or if using an index that doesn't cover
+/// all needed columns.
+///
+/// The `relreplident` column in `pg_class` encodes:
+/// - `'d'` → DEFAULT (PK-based, sufficient for UPDATE/DELETE old values)
+/// - `'f'` → FULL (always includes all columns)
+/// - `'n'` → NOTHING (no old values for UPDATE/DELETE)
+/// - `'i'` → INDEX (uses a specific index; may or may not be sufficient)
+pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgStreamError> {
+    let identity = Spi::get_one_with_args::<String>(
+        "SELECT CASE relreplident \
+           WHEN 'd' THEN 'default' \
+           WHEN 'f' THEN 'full' \
+           WHEN 'n' THEN 'nothing' \
+           WHEN 'i' THEN 'index' \
+         END FROM pg_class WHERE oid = $1",
+        &[source_oid.into()],
+    )
+    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .unwrap_or_else(|| "nothing".into());
+
+    // 'default' works if the table has a PK (which pg_stream already checks)
+    // 'full' always works
+    // 'nothing' doesn't provide OLD values for UPDATE/DELETE
+    // 'index' may work but needs further validation in later phases
+    Ok(identity == "default" || identity == "full")
 }
 
 /// Returns true if the relation has any user-defined row-level triggers

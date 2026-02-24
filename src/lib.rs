@@ -116,6 +116,11 @@ CREATE TABLE IF NOT EXISTS pgstream.pgs_dependencies (
     source_relid OID NOT NULL,
     source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW')),
     columns_used TEXT[],
+    cdc_mode     TEXT NOT NULL DEFAULT 'TRIGGER'
+                  CHECK (cdc_mode IN ('TRIGGER', 'TRANSITIONING', 'WAL')),
+    slot_name    TEXT,
+    decoder_confirmed_lsn PG_LSN,
+    transition_started_at TIMESTAMPTZ,
     PRIMARY KEY (pgs_id, source_relid)
 );
 

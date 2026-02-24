@@ -93,6 +93,18 @@ pub static PGS_USE_PREPARED_STATEMENTS: GucSetting<bool> = GucSetting::<bool>::n
 pub static PGS_USER_TRIGGERS: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
 
+/// CDC mechanism selection.
+///
+/// - `"trigger"` (default): Always use row-level triggers for CDC.
+/// - `"auto"`: Use triggers for creation, transition to WAL if available.
+/// - `"wal"`: Require WAL-based CDC (fail if `wal_level != logical`).
+pub static PGS_CDC_MODE: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"trigger"));
+
+/// Maximum time (seconds) to wait for the WAL decoder to catch up during
+/// transition from triggers to WAL-based CDC before falling back to triggers.
+pub static PGS_WAL_TRANSITION_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(300);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -226,6 +238,30 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_string_guc(
+        c"pg_stream.cdc_mode",
+        c"CDC mechanism: trigger, auto, or wal.",
+        c"'trigger' always uses row-level triggers for change capture. \
+           'auto' uses triggers initially and transitions to WAL-based CDC if wal_level=logical. \
+           'wal' requires wal_level=logical (fails otherwise).",
+        &PGS_CDC_MODE,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_stream.wal_transition_timeout",
+        c"Max seconds for WAL decoder catch-up during CDC transition.",
+        c"When transitioning from trigger-based to WAL-based CDC, the WAL decoder must catch up \
+           past the trigger's last captured LSN. If it hasn't caught up within this timeout, \
+           the system falls back to trigger-based CDC.",
+        &PGS_WAL_TRANSITION_TIMEOUT,
+        10,    // min: 10 seconds
+        3_600, // max: 1 hour
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -302,6 +338,19 @@ pub fn pg_stream_user_triggers() -> String {
         .get()
         .map(|cs| cs.to_str().unwrap_or("auto").to_string())
         .unwrap_or_else(|| "auto".to_string())
+}
+
+/// Returns the CDC mode: `"trigger"`, `"auto"`, or `"wal"`.
+pub fn pg_stream_cdc_mode() -> String {
+    PGS_CDC_MODE
+        .get()
+        .map(|cs| cs.to_str().unwrap_or("trigger").to_string())
+        .unwrap_or_else(|| "trigger".to_string())
+}
+
+/// Returns the WAL transition timeout in seconds.
+pub fn pg_stream_wal_transition_timeout() -> i32 {
+    PGS_WAL_TRANSITION_TIMEOUT.get()
 }
 
 /// Ratio of delta / stream-table size above which `auto` strategy
