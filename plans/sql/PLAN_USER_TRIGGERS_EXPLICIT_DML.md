@@ -11,7 +11,7 @@
 | Phase | Status | Notes |
 |---|---|---|
 | Phase 1: Trigger detection + explicit DML | ✅ Complete | `has_user_triggers()` in cdc.rs, explicit DML path in refresh.rs, `CachedMergeTemplate` extended, per-step profiling |
-| Phase 2: FULL refresh trigger support | ⏳ Deferred | Row-level triggers suppressed during FULL refresh via `DISABLE TRIGGER USER` + `NOTIFY pgstream_refresh`. Snapshot-diff replay deferred as documented limitation. |
+| Phase 2: FULL refresh trigger support | ❌ Will not implement | Row-level triggers suppressed during FULL refresh via `DISABLE TRIGGER USER` + `NOTIFY pgstream_refresh`. Snapshot-diff replay rejected — see [Phase 2 Decision](#phase-2-decision-will-not-implement). |
 | Phase 3: Documentation + GUC + DDL warning | ✅ Complete | `pg_stream.user_triggers` GUC (auto/on/off), DDL warning in hooks.rs, docs updated (SQL_REFERENCE.md, FAQ.md, CONFIGURATION.md) |
 
 **Files modified:**
@@ -691,9 +691,43 @@ mechanism for user trigger support.
 | Phase | Effort | Priority | Status |
 |---|---|---|---|
 | Phase 1: Trigger detection + explicit DML | ~2 days | **High** | ✅ Complete |
-| Phase 2: FULL refresh support | ~2 days | Medium | ⏳ Deferred (suppression implemented, snapshot-diff deferred) |
+| Phase 2: FULL refresh support | ~2 days | Medium | ❌ Will not implement (see [rationale](#phase-2-decision-will-not-implement)) |
 | Phase 3: Documentation + GUC + DDL warning | ~1 day | Medium | ✅ Complete |
 | **Total** | **~3–5 days** | | Phases 1 & 3 done |
+
+---
+
+## Phase 2 Decision: Will Not Implement
+
+Phase 2 (snapshot-diff trigger replay for FULL refresh) has been evaluated and
+**rejected**. The rationale:
+
+1. **The plan's own analysis concluded it's not viable.** Section 2.2's
+   implementation sketch devolved into increasingly fragile workarounds —
+   re-inserting old rows just to delete them, toggling triggers on/off with
+   SAVEPOINTs — and ultimately ended with `todo!()` and a pragmatic decision
+   to punt to NOTIFY. The document literally talked itself out of the
+   approach.
+
+2. **What is already implemented is the pragmatic answer.** The current code:
+   - Suppresses row-level triggers during FULL refresh (`DISABLE TRIGGER USER`
+     / `ENABLE TRIGGER USER`)
+   - Emits `NOTIFY pgstream_refresh` with a JSON payload so listeners can
+     react
+   - Logs an INFO message directing users to DIFFERENTIAL mode
+   - Is documented in FAQ.md, SQL_REFERENCE.md, and CONFIGURATION.md
+
+3. **The cost/benefit doesn't justify it.** ~2 days of complex implementation
+   for a narrow edge case. The snapshot + diff + re-insert/delete/update dance
+   adds fragility and performance overhead to every FULL refresh. Users who
+   care about per-row triggers have a clean answer: use
+   `REFRESH MODE DIFFERENTIAL`. Users on FULL mode typically chose it because
+   they don't need per-row granularity.
+
+4. **If demand emerges later**, the better path would be to auto-promote
+   FULL → DIFFERENTIAL for stream tables that have user triggers, rather than
+   bolting snapshot-diff onto FULL refresh. That is a one-line strategy check,
+   not a new subsystem.
 
 ---
 
