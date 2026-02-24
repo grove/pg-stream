@@ -18,11 +18,33 @@ replication subscriptions from stream tables.
 operational simplicity and zero-config deployment. However, the atomicity
 constraint — the original reason for choosing triggers — is primarily a
 **creation-time inconvenience**, not a steady-state limitation. Once a stream
-table exists, logical replication is superior on write-side performance,
-TRUNCATE capture, and WAL-native change ordering. The two end-user features
-(user triggers and logical replication FROM stream tables) are both achievable
-without changing the CDC mechanism. A hybrid approach (triggers for creation,
-logical replication for steady-state) deserves serious consideration.
+table exists, logical replication has three significant runtime advantages:
+
+- **No write-side overhead** — With triggers, every INSERT/UPDATE/DELETE on a
+  tracked source table does extra work *before the application's transaction
+  can commit*: it runs a PL/pgSQL function, writes a row into a buffer table,
+  and updates an index. This slows down the application. With logical
+  replication, PostgreSQL already writes every change to its internal
+  transaction log (WAL) regardless — the CDC layer simply reads that log
+  after the fact, so the application's writes are not slowed down at all.
+
+- **TRUNCATE capture** — When someone runs `TRUNCATE` on a source table, row-level
+  triggers do not fire (TRUNCATE replaces the entire file rather than deleting
+  rows one-by-one). This leaves stream tables silently stale until a manual
+  refresh. Logical replication captures TRUNCATE natively from the WAL,
+  so pg_stream would know immediately that all rows were removed.
+
+- **Change ordering from the transaction log** — With triggers, each trigger
+  independently calls `pg_current_wal_lsn()` to timestamp its change. With
+  logical replication, the ordering comes directly from the WAL — the
+  authoritative, global record of all database changes — which means change
+  ordering is guaranteed to match commit order, even across concurrent
+  transactions.
+
+The two end-user features (user triggers and logical replication FROM stream
+tables) are both achievable without changing the CDC mechanism. A hybrid
+approach (triggers for creation, logical replication for steady-state) deserves
+serious consideration. See §3 for the full analysis.
 
 ---
 
@@ -207,7 +229,20 @@ window. These are **engineering inconveniences**, not fundamental blockers.
 ### 3.2 Steady-State: Triggers vs Logical Replication (Honest Comparison)
 
 Once the stream table exists and CDC is running, here is how the two approaches
-compare on their actual runtime merits:
+compare on their actual runtime merits.
+
+**In plain terms:** With triggers, every time the application writes a row to a
+tracked source table, the database does *extra work right then and there* —
+calling a function, writing to a buffer table, updating an index — all before
+the application's transaction can finish. This is like a toll booth on a highway:
+every car (write) must stop and pay (trigger overhead) before continuing.
+
+With logical replication, the database already writes every change to its
+internal transaction log (the WAL) as part of normal operation. CDC simply reads
+that log *after the fact*, in a separate background process. The application's
+writes pass through without stopping — there is no toll booth. The cost of
+reading the log is paid by the database server, but it happens asynchronously
+and never slows down the application.
 
 #### Where Logical Replication Wins (Steady-State)
 
