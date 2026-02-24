@@ -70,6 +70,10 @@ pub enum PgStreamError {
     #[error("replication slot error: {0}")]
     ReplicationSlotError(String),
 
+    /// An error occurred during WAL-based CDC transition (trigger → WAL).
+    #[error("WAL transition error: {0}")]
+    WalTransitionError(String),
+
     /// An SPI (Server Programming Interface) error occurred.
     #[error("SPI error: {0}")]
     SpiError(String),
@@ -95,6 +99,7 @@ impl PgStreamError {
             self,
             PgStreamError::LockTimeout(_)
                 | PgStreamError::ReplicationSlotError(_)
+                | PgStreamError::WalTransitionError(_)
                 | PgStreamError::SpiError(_)
                 | PgStreamError::RefreshSkipped(_)
         )
@@ -155,6 +160,7 @@ impl PgStreamError {
 
             PgStreamError::LockTimeout(_)
             | PgStreamError::ReplicationSlotError(_)
+            | PgStreamError::WalTransitionError(_)
             | PgStreamError::SpiError(_)
             | PgStreamError::RefreshSkipped(_) => PgStreamErrorKind::System,
 

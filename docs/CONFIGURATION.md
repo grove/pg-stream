@@ -212,6 +212,46 @@ SET pg_stream.user_triggers = 'off';
 
 ---
 
+### pg_stream.cdc_mode
+
+CDC (Change Data Capture) mechanism selection.
+
+| Value | Description |
+|-------|-------------|
+| `'trigger'` | **(default)** Always use row-level triggers for change capture |
+| `'auto'` | Use triggers for creation; transition to WAL-based CDC if `wal_level = logical` |
+| `'wal'` | Require WAL-based CDC (fails if `wal_level != logical`) |
+
+**Default:** `'trigger'`
+
+```sql
+-- Always use triggers (default, zero-config)
+SET pg_stream.cdc_mode = 'trigger';
+
+-- Enable automatic trigger → WAL transition
+SET pg_stream.cdc_mode = 'auto';
+
+-- Require WAL-based CDC (error if wal_level != logical)
+SET pg_stream.cdc_mode = 'wal';
+```
+
+---
+
+### pg_stream.wal_transition_timeout
+
+Maximum time (seconds) to wait for the WAL decoder to catch up during
+the transition from trigger-based to WAL-based CDC. If the decoder has
+not caught up within this timeout, the system falls back to triggers.
+
+**Default:** `300` (5 minutes)  
+**Range:** `10` – `3600`
+
+```sql
+SET pg_stream.wal_transition_timeout = 300;
+```
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -226,6 +266,8 @@ pg_stream.max_consecutive_errors = 3
 pg_stream.change_buffer_schema = 'pgstream_changes'
 pg_stream.max_concurrent_refreshes = 4
 pg_stream.user_triggers = 'auto'
+pg_stream.cdc_mode = 'trigger'
+pg_stream.wal_transition_timeout = 300
 ```
 
 ---

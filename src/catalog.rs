@@ -34,6 +34,45 @@ pub struct StreamTableMeta {
     pub frontier: Option<Frontier>,
 }
 
+/// CDC mode for a source dependency — tracks whether change capture uses
+/// row-level triggers, WAL-based logical replication, or is transitioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CdcMode {
+    /// Row-level AFTER trigger writes to buffer table (default).
+    Trigger,
+    /// Both trigger and WAL decoder are active; decoder is catching up.
+    Transitioning,
+    /// Only the WAL decoder populates the buffer table; trigger dropped.
+    Wal,
+}
+
+impl CdcMode {
+    /// Serialize to the SQL CHECK constraint value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CdcMode::Trigger => "TRIGGER",
+            CdcMode::Transitioning => "TRANSITIONING",
+            CdcMode::Wal => "WAL",
+        }
+    }
+
+    /// Deserialize from SQL string. Falls back to `Trigger` for unknown values.
+    pub fn from_str(s: &str) -> Self {
+        match s.to_uppercase().as_str() {
+            "TRIGGER" => CdcMode::Trigger,
+            "TRANSITIONING" => CdcMode::Transitioning,
+            "WAL" => CdcMode::Wal,
+            _ => CdcMode::Trigger,
+        }
+    }
+}
+
+impl std::fmt::Display for CdcMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// A dependency edge from a stream table to one of its upstream sources.
 #[derive(Debug, Clone)]
 pub struct DtDependency {
@@ -41,6 +80,14 @@ pub struct DtDependency {
     pub source_relid: pg_sys::Oid,
     pub source_type: String,
     pub columns_used: Option<Vec<String>>,
+    /// Current CDC mechanism for this source.
+    pub cdc_mode: CdcMode,
+    /// Name of the replication slot (NULL when using triggers).
+    pub slot_name: Option<String>,
+    /// Last LSN confirmed by the WAL decoder.
+    pub decoder_confirmed_lsn: Option<String>,
+    /// When the transition from triggers to WAL started (for timeout detection).
+    pub transition_started_at: Option<String>,
 }
 
 /// A refresh history record.
@@ -515,10 +562,42 @@ impl DtDependency {
         source_type: &str,
     ) -> Result<(), PgStreamError> {
         Spi::run_with_args(
-            "INSERT INTO pgstream.pgs_dependencies (pgs_id, source_relid, source_type) \
-             VALUES ($1, $2, $3) \
+            "INSERT INTO pgstream.pgs_dependencies (pgs_id, source_relid, source_type, cdc_mode) \
+             VALUES ($1, $2, $3, 'TRIGGER') \
              ON CONFLICT DO NOTHING",
             &[pgs_id.into(), source_relid.into(), source_type.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+    }
+
+    /// Update the CDC mode and related fields for a dependency.
+    pub fn update_cdc_mode(
+        pgs_id: i64,
+        source_relid: pg_sys::Oid,
+        cdc_mode: CdcMode,
+        slot_name: Option<&str>,
+        decoder_confirmed_lsn: Option<&str>,
+    ) -> Result<(), PgStreamError> {
+        let transition_started = if cdc_mode == CdcMode::Transitioning {
+            "now()"
+        } else {
+            "NULL"
+        };
+        Spi::run_with_args(
+            &format!(
+                "UPDATE pgstream.pgs_dependencies \
+                 SET cdc_mode = $1, slot_name = $2, decoder_confirmed_lsn = $3::pg_lsn, \
+                     transition_started_at = {} \
+                 WHERE pgs_id = $4 AND source_relid = $5",
+                transition_started
+            ),
+            &[
+                cdc_mode.as_str().into(),
+                slot_name.into(),
+                decoder_confirmed_lsn.into(),
+                pgs_id.into(),
+                source_relid.into(),
+            ],
         )
         .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
     }
@@ -528,7 +607,9 @@ impl DtDependency {
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id, source_relid, source_type, columns_used \
+                    "SELECT pgs_id, source_relid, source_type, columns_used, \
+                            cdc_mode, slot_name, decoder_confirmed_lsn::text, \
+                            transition_started_at::text \
                      FROM pgstream.pgs_dependencies WHERE pgs_id = $1",
                     None,
                     &[pgs_id.into()],
@@ -544,11 +625,19 @@ impl DtDependency {
                     .map_err(map_spi)?
                     .unwrap_or(pg_sys::InvalidOid);
                 let source_type = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
+                let cdc_mode_str = row.get::<String>(5).map_err(map_spi)?.unwrap_or_default();
+                let slot_name = row.get::<String>(6).map_err(map_spi)?;
+                let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
+                let transition_started_at = row.get::<String>(8).map_err(map_spi)?;
                 result.push(DtDependency {
                     pgs_id,
                     source_relid,
                     source_type,
                     columns_used: None,
+                    cdc_mode: CdcMode::from_str(&cdc_mode_str),
+                    slot_name,
+                    decoder_confirmed_lsn,
+                    transition_started_at,
                 });
             }
             Ok(result)
@@ -560,7 +649,9 @@ impl DtDependency {
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id, source_relid, source_type, columns_used \
+                    "SELECT pgs_id, source_relid, source_type, columns_used, \
+                            cdc_mode, slot_name, decoder_confirmed_lsn::text, \
+                            transition_started_at::text \
                      FROM pgstream.pgs_dependencies",
                     None,
                     &[],
@@ -576,11 +667,19 @@ impl DtDependency {
                     .map_err(map_spi)?
                     .unwrap_or(pg_sys::InvalidOid);
                 let source_type = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
+                let cdc_mode_str = row.get::<String>(5).map_err(map_spi)?.unwrap_or_default();
+                let slot_name = row.get::<String>(6).map_err(map_spi)?;
+                let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
+                let transition_started_at = row.get::<String>(8).map_err(map_spi)?;
                 result.push(DtDependency {
                     pgs_id,
                     source_relid,
                     source_type,
                     columns_used: None,
+                    cdc_mode: CdcMode::from_str(&cdc_mode_str),
+                    slot_name,
+                    decoder_confirmed_lsn,
+                    transition_started_at,
                 });
             }
             Ok(result)
@@ -657,5 +756,69 @@ impl RefreshRecord {
             ],
         )
         .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── CdcMode tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_cdc_mode_as_str() {
+        assert_eq!(CdcMode::Trigger.as_str(), "TRIGGER");
+        assert_eq!(CdcMode::Transitioning.as_str(), "TRANSITIONING");
+        assert_eq!(CdcMode::Wal.as_str(), "WAL");
+    }
+
+    #[test]
+    fn test_cdc_mode_from_str_valid() {
+        assert_eq!(CdcMode::from_str("TRIGGER"), CdcMode::Trigger);
+        assert_eq!(CdcMode::from_str("TRANSITIONING"), CdcMode::Transitioning);
+        assert_eq!(CdcMode::from_str("WAL"), CdcMode::Wal);
+    }
+
+    #[test]
+    fn test_cdc_mode_from_str_case_insensitive() {
+        assert_eq!(CdcMode::from_str("trigger"), CdcMode::Trigger);
+        assert_eq!(CdcMode::from_str("Transitioning"), CdcMode::Transitioning);
+        assert_eq!(CdcMode::from_str("wal"), CdcMode::Wal);
+        assert_eq!(CdcMode::from_str("Wal"), CdcMode::Wal);
+    }
+
+    #[test]
+    fn test_cdc_mode_from_str_unknown_defaults_to_trigger() {
+        assert_eq!(CdcMode::from_str(""), CdcMode::Trigger);
+        assert_eq!(CdcMode::from_str("unknown"), CdcMode::Trigger);
+        assert_eq!(CdcMode::from_str("LOGICAL"), CdcMode::Trigger);
+    }
+
+    #[test]
+    fn test_cdc_mode_display() {
+        assert_eq!(format!("{}", CdcMode::Trigger), "TRIGGER");
+        assert_eq!(format!("{}", CdcMode::Transitioning), "TRANSITIONING");
+        assert_eq!(format!("{}", CdcMode::Wal), "WAL");
+    }
+
+    #[test]
+    fn test_cdc_mode_roundtrip() {
+        for mode in [CdcMode::Trigger, CdcMode::Transitioning, CdcMode::Wal] {
+            assert_eq!(CdcMode::from_str(mode.as_str()), mode);
+        }
+    }
+
+    #[test]
+    fn test_cdc_mode_equality() {
+        assert_eq!(CdcMode::Trigger, CdcMode::Trigger);
+        assert_ne!(CdcMode::Trigger, CdcMode::Wal);
+        assert_ne!(CdcMode::Transitioning, CdcMode::Wal);
+    }
+
+    #[test]
+    fn test_cdc_mode_clone_copy() {
+        let mode = CdcMode::Wal;
+        let cloned = mode;
+        assert_eq!(mode, cloned);
     }
 }
