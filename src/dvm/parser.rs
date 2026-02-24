@@ -186,6 +186,20 @@ pub enum AggFunc {
     Mode,
     PercentileCont,
     PercentileDisc,
+    /// Regression/correlation aggregates — group-rescan strategy.
+    /// These are two-argument aggregates: `func(Y, X)`.
+    Corr,
+    CovarPop,
+    CovarSamp,
+    RegrAvgx,
+    RegrAvgy,
+    RegrCount,
+    RegrIntercept,
+    RegrR2,
+    RegrSlope,
+    RegrSxx,
+    RegrSxy,
+    RegrSyy,
 }
 
 impl AggFunc {
@@ -215,6 +229,18 @@ impl AggFunc {
             AggFunc::Mode => "MODE",
             AggFunc::PercentileCont => "PERCENTILE_CONT",
             AggFunc::PercentileDisc => "PERCENTILE_DISC",
+            AggFunc::Corr => "CORR",
+            AggFunc::CovarPop => "COVAR_POP",
+            AggFunc::CovarSamp => "COVAR_SAMP",
+            AggFunc::RegrAvgx => "REGR_AVGX",
+            AggFunc::RegrAvgy => "REGR_AVGY",
+            AggFunc::RegrCount => "REGR_COUNT",
+            AggFunc::RegrIntercept => "REGR_INTERCEPT",
+            AggFunc::RegrR2 => "REGR_R2",
+            AggFunc::RegrSlope => "REGR_SLOPE",
+            AggFunc::RegrSxx => "REGR_SXX",
+            AggFunc::RegrSxy => "REGR_SXY",
+            AggFunc::RegrSyy => "REGR_SYY",
         }
     }
 
@@ -241,6 +267,18 @@ impl AggFunc {
                 | AggFunc::Mode
                 | AggFunc::PercentileCont
                 | AggFunc::PercentileDisc
+                | AggFunc::Corr
+                | AggFunc::CovarPop
+                | AggFunc::CovarSamp
+                | AggFunc::RegrAvgx
+                | AggFunc::RegrAvgy
+                | AggFunc::RegrCount
+                | AggFunc::RegrIntercept
+                | AggFunc::RegrR2
+                | AggFunc::RegrSlope
+                | AggFunc::RegrSxx
+                | AggFunc::RegrSxy
+                | AggFunc::RegrSyy
         )
     }
 }
@@ -1265,6 +1303,238 @@ fn scan_pk_columns(op: &OpTree) -> Vec<String> {
     }
 }
 
+// ── Volatility checking ─────────────────────────────────────────────────
+
+/// Volatility ordering: volatile > stable > immutable.
+///
+/// Returns the "worse" (more volatile) of two volatility classes.
+///   - `'v'` (volatile) > `'s'` (stable) > `'i'` (immutable)
+pub fn max_volatility(a: char, b: char) -> char {
+    match (a, b) {
+        ('v', _) | (_, 'v') => 'v',
+        ('s', _) | (_, 's') => 's',
+        _ => 'i',
+    }
+}
+
+/// Look up the volatility category of a PostgreSQL function by name.
+///
+/// Returns `'i'` (immutable), `'s'` (stable), or `'v'` (volatile).
+/// Returns `'v'` (volatile) if the function cannot be found (safe default).
+///
+/// For overloaded functions (multiple `pg_proc` rows with the same `proname`),
+/// returns the worst volatility across all overloads.
+#[cfg(not(test))]
+pub fn lookup_function_volatility(func_name: &str) -> Result<char, PgStreamError> {
+    // Strip schema qualification if present (e.g., "pg_catalog.lower" → "lower").
+    let bare_name = func_name.rsplit('.').next().unwrap_or(func_name);
+
+    Spi::connect(|client| {
+        let result = client.select(
+            "SELECT provolatile::text FROM pg_catalog.pg_proc \
+             WHERE proname = $1",
+            None,
+            &[bare_name.into()],
+        )?;
+
+        let mut worst = 'i';
+        let mut found = false;
+        for row in result {
+            found = true;
+            let vol: String = row
+                .get_by_name::<String, _>("provolatile")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "v".to_string());
+            let ch = vol.chars().next().unwrap_or('v');
+            worst = max_volatility(worst, ch);
+        }
+        if !found {
+            // Unknown function → assume volatile (safe default).
+            return Ok('v');
+        }
+        Ok(worst)
+    })
+    .map_err(|e: pgrx::spi::SpiError| {
+        PgStreamError::SpiError(format!("volatility lookup failed: {e}"))
+    })
+}
+
+/// Test-only stub: SPI is unavailable in unit tests, so assume volatile.
+#[cfg(test)]
+pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgStreamError> {
+    Ok('v')
+}
+
+/// Recursively scan an `Expr` tree and update `worst` with the volatility
+/// of any `FuncCall` nodes found.
+pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStreamError> {
+    match expr {
+        Expr::FuncCall { func_name, args } => {
+            let vol = lookup_function_volatility(func_name)?;
+            *worst = max_volatility(*worst, vol);
+            for arg in args {
+                collect_volatilities(arg, worst)?;
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_volatilities(left, worst)?;
+            collect_volatilities(right, worst)?;
+        }
+        // ColumnRef, Literal, Star, Raw: no function calls.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Return the worst volatility found in an expression tree.
+pub fn worst_volatility(expr: &Expr) -> Result<char, PgStreamError> {
+    let mut worst = 'i';
+    collect_volatilities(expr, &mut worst)?;
+    Ok(worst)
+}
+
+/// Walk an entire OpTree and return the worst volatility found in any
+/// expression (target list, WHERE, JOIN conditions, HAVING, aggregates,
+/// window functions).
+pub fn tree_worst_volatility(tree: &OpTree) -> Result<char, PgStreamError> {
+    let mut worst = 'i';
+    tree_collect_volatility(tree, &mut worst)?;
+    Ok(worst)
+}
+
+/// Walk an entire [`ParseResult`] (tree + CTE registry) for volatility.
+pub fn tree_worst_volatility_with_registry(result: &ParseResult) -> Result<char, PgStreamError> {
+    let mut worst = 'i';
+    // Check all CTE bodies
+    for (_name, body) in &result.cte_registry.entries {
+        tree_collect_volatility(body, &mut worst)?;
+    }
+    tree_collect_volatility(&result.tree, &mut worst)?;
+    Ok(worst)
+}
+
+fn tree_collect_volatility(tree: &OpTree, worst: &mut char) -> Result<(), PgStreamError> {
+    match tree {
+        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+        OpTree::Project {
+            expressions, child, ..
+        } => {
+            for expr in expressions {
+                collect_volatilities(expr, worst)?;
+            }
+            tree_collect_volatility(child, worst)?;
+        }
+        OpTree::Filter { predicate, child } => {
+            collect_volatilities(predicate, worst)?;
+            tree_collect_volatility(child, worst)?;
+        }
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        }
+        | OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        }
+        | OpTree::FullJoin {
+            condition,
+            left,
+            right,
+        }
+        | OpTree::SemiJoin {
+            condition,
+            left,
+            right,
+        }
+        | OpTree::AntiJoin {
+            condition,
+            left,
+            right,
+        } => {
+            collect_volatilities(condition, worst)?;
+            tree_collect_volatility(left, worst)?;
+            tree_collect_volatility(right, worst)?;
+        }
+        OpTree::Aggregate {
+            group_by,
+            aggregates,
+            child,
+        } => {
+            for expr in group_by {
+                collect_volatilities(expr, worst)?;
+            }
+            for agg in aggregates {
+                if let Some(arg) = &agg.argument {
+                    collect_volatilities(arg, worst)?;
+                }
+                if let Some(filter) = &agg.filter {
+                    collect_volatilities(filter, worst)?;
+                }
+                if let Some(second) = &agg.second_arg {
+                    collect_volatilities(second, worst)?;
+                }
+            }
+            tree_collect_volatility(child, worst)?;
+        }
+        OpTree::Distinct { child }
+        | OpTree::Subquery { child, .. }
+        | OpTree::LateralFunction { child, .. }
+        | OpTree::LateralSubquery { child, .. } => {
+            tree_collect_volatility(child, worst)?;
+        }
+        OpTree::UnionAll { children } => {
+            for child in children {
+                tree_collect_volatility(child, worst)?;
+            }
+        }
+        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+            tree_collect_volatility(left, worst)?;
+            tree_collect_volatility(right, worst)?;
+        }
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => {
+            tree_collect_volatility(base, worst)?;
+            tree_collect_volatility(recursive, worst)?;
+        }
+        OpTree::Window {
+            window_exprs,
+            partition_by,
+            pass_through,
+            child,
+        } => {
+            for we in window_exprs {
+                for arg in &we.args {
+                    collect_volatilities(arg, worst)?;
+                }
+                for pb in &we.partition_by {
+                    collect_volatilities(pb, worst)?;
+                }
+                for ob in &we.order_by {
+                    collect_volatilities(&ob.expr, worst)?;
+                }
+            }
+            for pb in partition_by {
+                collect_volatilities(pb, worst)?;
+            }
+            for (expr, _) in pass_through {
+                collect_volatilities(expr, worst)?;
+            }
+            tree_collect_volatility(child, worst)?;
+        }
+        OpTree::ScalarSubquery {
+            subquery, child, ..
+        } => {
+            tree_collect_volatility(subquery, worst)?;
+            tree_collect_volatility(child, worst)?;
+        }
+    }
+    Ok(())
+}
+
 /// Check if an operator tree is supported for differential maintenance.
 pub fn check_ivm_support(tree: &OpTree) -> Result<(), PgStreamError> {
     check_ivm_support_inner(tree)
@@ -1381,7 +1651,19 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgStreamError> {
                     | AggFunc::VarSamp
                     | AggFunc::Mode
                     | AggFunc::PercentileCont
-                    | AggFunc::PercentileDisc => {}
+                    | AggFunc::PercentileDisc
+                    | AggFunc::Corr
+                    | AggFunc::CovarPop
+                    | AggFunc::CovarSamp
+                    | AggFunc::RegrAvgx
+                    | AggFunc::RegrAvgy
+                    | AggFunc::RegrCount
+                    | AggFunc::RegrIntercept
+                    | AggFunc::RegrR2
+                    | AggFunc::RegrSlope
+                    | AggFunc::RegrSxx
+                    | AggFunc::RegrSxy
+                    | AggFunc::RegrSyy => {}
                 }
             }
             check_ivm_support(child)
@@ -1554,6 +1836,331 @@ unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgStreamErr
 /// For set-operation queries (UNION/INTERSECT/EXCEPT), LIMIT/OFFSET on
 /// the top-level wrapper is checked. LIMIT inside subqueries or LATERAL
 /// is intentionally allowed.
+/// Detect and rewrite `DISTINCT ON (...)` queries.
+///
+/// `SELECT DISTINCT ON (e1, e2) col1, col2 FROM t ORDER BY e1, e2, col3`
+///
+/// is rewritten to:
+///
+/// ```sql
+/// SELECT col1, col2 FROM (
+///   SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY e1, e2 ORDER BY ...) AS __pgs_rn
+///   FROM t
+/// ) __pgs_do WHERE __pgs_rn = 1
+/// ```
+///
+/// Returns the original query unchanged if it does not use DISTINCT ON.
+pub fn rewrite_distinct_on(query: &str) -> Result<String, PgStreamError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return Ok(query.to_string()),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(query.to_string());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // Only rewrite if DISTINCT ON (not plain DISTINCT or no DISTINCT)
+    if select.distinctClause.is_null() {
+        return Ok(query.to_string());
+    }
+    let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.distinctClause) };
+    let has_real_exprs = distinct_list.iter_ptr().any(|ptr| !ptr.is_null());
+    if !has_real_exprs {
+        // Plain DISTINCT (all NULLs in distinctClause) — no rewrite needed
+        return Ok(query.to_string());
+    }
+
+    // Set operations with DISTINCT ON don't make sense — skip
+    if select.op != pg_sys::SetOperation::SETOP_NONE {
+        return Ok(query.to_string());
+    }
+
+    // Extract DISTINCT ON expressions as SQL text
+    let mut distinct_on_exprs = Vec::new();
+    for node_ptr in distinct_list.iter_ptr() {
+        if node_ptr.is_null() {
+            continue;
+        }
+        let expr_sql = unsafe { node_to_expr(node_ptr) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| {
+                // Fallback: deparse using PostgreSQL's nodeToString
+                "?".to_string()
+            });
+        if expr_sql != "?" {
+            distinct_on_exprs.push(expr_sql);
+        }
+    }
+
+    if distinct_on_exprs.is_empty() {
+        return Ok(query.to_string());
+    }
+
+    // Extract ORDER BY clause as SQL text (if any)
+    let order_by_sql = if !select.sortClause.is_null() {
+        let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
+        let mut order_parts = Vec::new();
+        for node_ptr in sort_list.iter_ptr() {
+            if node_ptr.is_null() {
+                continue;
+            }
+            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_SortBy) } {
+                let sort_by = unsafe { &*(node_ptr as *const pg_sys::SortBy) };
+                if !sort_by.node.is_null() {
+                    let expr_sql = unsafe { node_to_expr(sort_by.node) }
+                        .map(|e| e.to_sql())
+                        .unwrap_or_else(|_| "?".to_string());
+                    let dir = match sort_by.sortby_dir {
+                        pg_sys::SortByDir::SORTBY_DESC => " DESC",
+                        pg_sys::SortByDir::SORTBY_ASC => " ASC",
+                        _ => "",
+                    };
+                    let nulls = match sort_by.sortby_nulls {
+                        pg_sys::SortByNulls::SORTBY_NULLS_FIRST => " NULLS FIRST",
+                        pg_sys::SortByNulls::SORTBY_NULLS_LAST => " NULLS LAST",
+                        _ => "",
+                    };
+                    order_parts.push(format!("{expr_sql}{dir}{nulls}"));
+                }
+            }
+        }
+        if order_parts.is_empty() {
+            None
+        } else {
+            Some(order_parts.join(", "))
+        }
+    } else {
+        None
+    };
+
+    // Extract target list column names/aliases for the outer SELECT
+    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let mut outer_cols = Vec::new();
+    let mut inner_target_parts = Vec::new();
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+
+        // Extract alias name
+        let alias = if !rt.name.is_null() {
+            let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                .to_str()
+                .unwrap_or("?col");
+            Some(name.to_string())
+        } else {
+            None
+        };
+
+        // Extract expression SQL
+        if rt.val.is_null() {
+            continue;
+        }
+        let expr_sql = unsafe { node_to_expr(rt.val) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "?".to_string());
+
+        // For outer SELECT, use the alias if it exists, otherwise the expression
+        let outer_name = alias.as_deref().unwrap_or(&expr_sql);
+        outer_cols.push(format!("__pgs_do.\"{}\"", outer_name.replace('"', "\"\"")));
+
+        // Inner target: expression AS alias (or just expression)
+        if let Some(ref a) = alias {
+            inner_target_parts.push(format!("{} AS \"{}\"", expr_sql, a.replace('"', "\"\"")));
+        } else {
+            inner_target_parts.push(expr_sql);
+        }
+    }
+
+    if inner_target_parts.is_empty() || outer_cols.is_empty() {
+        return Ok(query.to_string());
+    }
+
+    // Build the ROW_NUMBER() window function
+    let partition_by = distinct_on_exprs.join(", ");
+    let order_clause = order_by_sql
+        .map(|ob| format!(" ORDER BY {ob}"))
+        .unwrap_or_default();
+    let row_number =
+        format!("ROW_NUMBER() OVER (PARTITION BY {partition_by}{order_clause}) AS __pgs_rn");
+
+    // Reconstruct the inner SELECT (without DISTINCT ON and ORDER BY)
+    // We need: FROM clause, WHERE clause, GROUP BY, HAVING
+    // The simplest approach: strip "DISTINCT ON (...)" and "ORDER BY ..." from the original query
+    // But this is fragile with raw string manipulation. Instead, reconstruct from parts.
+
+    // Extract FROM clause as raw SQL from the original query
+    // For robustness, use a subquery approach: wrap the original query minus DISTINCT ON/ORDER BY
+
+    // Build FROM clause SQL from the original parse tree
+    let from_sql = extract_from_clause_sql(select)?;
+    let where_sql = if select.whereClause.is_null() {
+        String::new()
+    } else {
+        let where_expr = unsafe { node_to_expr(select.whereClause) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "TRUE".to_string());
+        format!(" WHERE {where_expr}")
+    };
+
+    // GROUP BY
+    let group_sql = if select.groupClause.is_null() {
+        String::new()
+    } else {
+        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        let mut parts = Vec::new();
+        for node_ptr in group_list.iter_ptr() {
+            if node_ptr.is_null() {
+                continue;
+            }
+            if let Ok(expr) = unsafe { node_to_expr(node_ptr) } {
+                parts.push(expr.to_sql());
+            }
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" GROUP BY {}", parts.join(", "))
+        }
+    };
+
+    // HAVING
+    let having_sql = if select.havingClause.is_null() {
+        String::new()
+    } else {
+        let having_expr = unsafe { node_to_expr(select.havingClause) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "TRUE".to_string());
+        format!(" HAVING {having_expr}")
+    };
+
+    // Build the rewritten query
+    let inner_targets = inner_target_parts.join(", ");
+    let outer_select = outer_cols.join(", ");
+    let rewritten = format!(
+        "SELECT {outer_select} FROM (\
+         SELECT {inner_targets}, {row_number} \
+         FROM {from_sql}{where_sql}{group_sql}{having_sql}\
+         ) __pgs_do WHERE __pgs_do.__pgs_rn = 1"
+    );
+
+    pgrx::debug1!(
+        "[pg_stream] Rewrote DISTINCT ON query to ROW_NUMBER(): {}",
+        rewritten
+    );
+
+    Ok(rewritten)
+}
+
+/// Extract FROM clause as SQL text from a SelectStmt.
+fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgStreamError> {
+    if select.fromClause.is_null() {
+        return Err(PgStreamError::QueryParseError(
+            "DISTINCT ON query must have a FROM clause".into(),
+        ));
+    }
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    let mut parts = Vec::new();
+    for node_ptr in from_list.iter_ptr() {
+        if node_ptr.is_null() {
+            continue;
+        }
+        parts.push(unsafe { from_item_to_sql(node_ptr)? });
+    }
+    if parts.is_empty() {
+        return Err(PgStreamError::QueryParseError(
+            "DISTINCT ON query FROM clause is empty".into(),
+        ));
+    }
+    Ok(parts.join(", "))
+}
+
+/// Convert a FROM clause item (RangeVar, JoinExpr, RangeSubselect) back to SQL.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree Node.
+unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
+        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+        let mut name = String::new();
+        if !rv.schemaname.is_null() {
+            let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
+                .to_str()
+                .unwrap_or("public");
+            name.push_str(&format!("\"{}\".", schema.replace('"', "\"\"")));
+        }
+        if !rv.relname.is_null() {
+            let rel = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
+                .to_str()
+                .unwrap_or("?");
+            name.push_str(&format!("\"{}\"", rel.replace('"', "\"\"")));
+        }
+        if !rv.alias.is_null() {
+            let alias_struct = unsafe { &*rv.alias };
+            if !alias_struct.aliasname.is_null() {
+                let alias = unsafe { std::ffi::CStr::from_ptr(alias_struct.aliasname) }
+                    .to_str()
+                    .unwrap_or("?");
+                name.push_str(&format!(" AS \"{}\"", alias.replace('"', "\"\"")));
+            }
+        }
+        Ok(name)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        let left = if join.larg.is_null() {
+            "?".to_string()
+        } else {
+            unsafe { from_item_to_sql(join.larg)? }
+        };
+        let right = if join.rarg.is_null() {
+            "?".to_string()
+        } else {
+            unsafe { from_item_to_sql(join.rarg)? }
+        };
+        let join_type = match join.jointype {
+            pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
+            pg_sys::JoinType::JOIN_FULL => "FULL JOIN",
+            pg_sys::JoinType::JOIN_RIGHT => "RIGHT JOIN",
+            pg_sys::JoinType::JOIN_INNER => {
+                if join.quals.is_null() {
+                    "CROSS JOIN"
+                } else {
+                    "JOIN"
+                }
+            }
+            _ => "JOIN",
+        };
+        let on_clause = if join.quals.is_null() {
+            String::new()
+        } else {
+            let cond = unsafe { node_to_expr(join.quals)? };
+            format!(" ON {}", cond.to_sql())
+        };
+        Ok(format!("{left} {join_type} {right}{on_clause}"))
+    } else {
+        // Fallback for subselects and other FROM items
+        Ok("?".to_string())
+    }
+}
+
 pub fn reject_limit_offset(query: &str) -> Result<(), PgStreamError> {
     use std::ffi::CString;
 
@@ -1660,17 +2267,9 @@ pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgStreamError> {
 /// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
 unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgStreamError> {
     // ── DISTINCT ON ─────────────────────────────────────────────────
-    if !select.distinctClause.is_null() {
-        let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.distinctClause) };
-        let has_real_exprs = distinct_list.iter_ptr().any(|ptr| !ptr.is_null());
-        if has_real_exprs {
-            return Err(PgStreamError::UnsupportedOperator(
-                "DISTINCT ON is not supported in defining queries. \
-                 Use plain DISTINCT or rewrite with window functions."
-                    .into(),
-            ));
-        }
-    }
+    // DISTINCT ON is handled by auto-rewriting to a ROW_NUMBER() window
+    // function in the DVM parser (`rewrite_distinct_on()`). No rejection
+    // needed here.
 
     // ── Unsupported join features (currently: NATURAL JOIN) ─────────
     if !select.fromClause.is_null() {
@@ -1780,9 +2379,9 @@ unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgS
 
 /// Check if a WHERE clause node tree contains unsupported SubLink types.
 ///
-/// EXISTS_SUBLINK and ANY_SUBLINK (IN) are now supported via SemiJoin/AntiJoin.
-/// EXPR_SUBLINK (scalar subquery) is supported in the target list.
-/// ALL_SUBLINK is not yet supported and is rejected here.
+/// EXISTS_SUBLINK, ANY_SUBLINK (IN), and ALL_SUBLINK are now supported
+/// via SemiJoin/AntiJoin. EXPR_SUBLINK (scalar subquery) is supported
+/// in the target list. No SubLink types are rejected here any longer.
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
@@ -1790,15 +2389,7 @@ unsafe fn check_where_for_unsupported_sublinks(
     node: *mut pg_sys::Node,
 ) -> Result<(), PgStreamError> {
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
-        let sublink = unsafe { &*(node as *const pg_sys::SubLink) };
-        if sublink.subLinkType == pg_sys::SubLinkType::ALL_SUBLINK {
-            return Err(PgStreamError::UnsupportedOperator(
-                "ALL (subquery) is not supported in defining queries. \
-                 Rewrite using NOT EXISTS or a JOIN."
-                    .into(),
-            ));
-        }
-        // EXISTS, ANY (IN), and EXPR SubLinks are handled during parsing
+        // EXISTS, ANY (IN), ALL, and EXPR SubLinks are handled during parsing
         return Ok(());
     }
     // Check inside BoolExpr (AND/OR/NOT) which commonly wraps SubLinks
@@ -2145,6 +2736,12 @@ unsafe fn parse_sublink_to_wrapper(
             // ANY_SUBLINK is used for both `x IN (SELECT ...)` and `x = ANY (SELECT ...)`
             unsafe { parse_any_sublink(sublink, negated, cte_ctx) }
         }
+        pg_sys::SubLinkType::ALL_SUBLINK => {
+            // ALL_SUBLINK: `x op ALL (SELECT col FROM ...)`.
+            // Rewritten as AntiJoin with negated condition:
+            // NOT EXISTS (SELECT 1 FROM ... WHERE NOT (x op col))
+            unsafe { parse_all_sublink(sublink, negated, cte_ctx) }
+        }
         pg_sys::SubLinkType::EXPR_SUBLINK => {
             // Scalar subquery in WHERE — treat as a regular expression
             // (it will be handled by node_to_expr as a Raw expression).
@@ -2321,6 +2918,121 @@ unsafe fn parse_any_sublink(
     })
 }
 
+/// Parse an ALL SubLink (`x op ALL (SELECT col FROM ...)`) into a SublinkWrapper.
+///
+/// `x op ALL (SELECT col FROM inner_table WHERE filter)` is rewritten as:
+/// `NOT EXISTS (SELECT 1 FROM inner_table WHERE NOT (x op col) [AND filter])`
+///
+/// This produces an AntiJoin where the condition is the negated comparison.
+/// If the ALL expression itself is negated (`NOT (x op ALL (...))`), the
+/// double negation produces a SemiJoin with the negated operator.
+///
+/// # Safety
+/// Caller must ensure `sublink` points to a valid `pg_sys::SubLink`.
+unsafe fn parse_all_sublink(
+    sublink: &pg_sys::SubLink,
+    negated: bool,
+    cte_ctx: &mut CteParseContext,
+) -> Result<SublinkWrapper, PgStreamError> {
+    if sublink.subselect.is_null() {
+        return Err(PgStreamError::QueryParseError(
+            "ALL subquery has NULL subselect".into(),
+        ));
+    }
+
+    let inner_select = unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
+
+    // Parse the inner FROM clause
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.fromClause) };
+    if from_list.is_empty() {
+        return Err(PgStreamError::QueryParseError(
+            "ALL subquery must have a FROM clause".into(),
+        ));
+    }
+
+    let mut inner_tree = unsafe { parse_from_item(from_list.head().unwrap(), cte_ctx)? };
+    for i in 1..from_list.len() {
+        if let Some(item) = from_list.get_ptr(i) {
+            let right = unsafe { parse_from_item(item, cte_ctx)? };
+            inner_tree = OpTree::InnerJoin {
+                condition: Expr::Literal("TRUE".into()),
+                left: Box::new(inner_tree),
+                right: Box::new(right),
+            };
+        }
+    }
+
+    // Extract the test expression (left-hand side: `x` in `x op ALL (...)`)
+    let test_expr = if sublink.testexpr.is_null() {
+        return Err(PgStreamError::QueryParseError(
+            "ALL subquery has NULL test expression".into(),
+        ));
+    } else {
+        unsafe { node_to_expr(sublink.testexpr)? }
+    };
+
+    // Extract the inner SELECT target column
+    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
+    if target_list.is_empty() {
+        return Err(PgStreamError::QueryParseError(
+            "ALL subquery SELECT list is empty".into(),
+        ));
+    }
+
+    let first_target = target_list.head().unwrap();
+    let inner_col_expr = if unsafe { pgrx::is_a(first_target, pg_sys::NodeTag::T_ResTarget) } {
+        let rt = unsafe { &*(first_target as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            return Err(PgStreamError::QueryParseError(
+                "ALL subquery target column is NULL".into(),
+            ));
+        }
+        unsafe { node_to_expr(rt.val)? }
+    } else {
+        return Err(PgStreamError::QueryParseError(
+            "ALL subquery target is not a ResTarget".into(),
+        ));
+    };
+
+    // Extract the comparison operator from operName.
+    // For `x = ALL (...)`, operName is a list containing "=".
+    // We use extract_func_name which handles pg_sys::List of String/Value nodes.
+    let op_name = if sublink.operName.is_null() {
+        "=".to_string() // default to equality
+    } else {
+        unsafe { extract_func_name(sublink.operName) }.unwrap_or_else(|_| "=".to_string())
+    };
+
+    // Build negated condition: NOT (test_expr op inner_col)
+    // The negation is expressed as raw SQL to avoid complex operator inversion.
+    let negated_cond = Expr::Raw(format!(
+        "NOT ({} {} {})",
+        test_expr.to_sql(),
+        op_name,
+        inner_col_expr.to_sql()
+    ));
+
+    // Combine with inner WHERE clause if present
+    let condition = if inner_select.whereClause.is_null() {
+        negated_cond
+    } else {
+        let inner_where = unsafe { node_to_expr(inner_select.whereClause)? };
+        Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(negated_cond),
+            right: Box::new(inner_where),
+        }
+    };
+
+    // ALL → NOT EXISTS (AntiJoin). If the expression is negated
+    // (NOT (x op ALL (...))), the double negation produces SemiJoin.
+    Ok(SublinkWrapper {
+        negated: !negated,
+        condition,
+        inner_tree,
+    })
+}
+
 /// Parse a defining query string into an OpTree.
 ///
 /// Uses `pg_sys::raw_parser()` to get the raw parse tree, then walks
@@ -2477,7 +3189,9 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgStrea
 /// - `INTERSECT [ALL]` produces `OpTree::Intersect { left, right, all }`.
 /// - `EXCEPT [ALL]` produces `OpTree::Except { left, right, all }`.
 ///
-/// Mixed UNION/UNION ALL trees are rejected with a clear error.
+/// Mixed UNION/UNION ALL trees are handled by respecting PostgreSQL's nested
+/// `SetOperationStmt` tree structure: children with a different `all` flag
+/// are parsed as separate set operations rather than flattened.
 unsafe fn parse_set_operation(
     select: &pg_sys::SelectStmt,
     cte_ctx: &mut CteParseContext,
@@ -2556,9 +3270,10 @@ unsafe fn parse_set_op_child(
 /// nodes, because PostgreSQL 18 may leave `larg`/`rarg` non-null on simple
 /// SELECT nodes within CTE bodies.
 ///
-/// `parent_all` is the `all` flag of the top-level node.  Mixed trees where an
-/// intermediate node has a different `all` value are rejected — callers should
-/// use all-UNION or all-UNION-ALL consistently.
+/// `parent_all` is the `all` flag of the top-level node. When an intermediate
+/// UNION node has a different `all` flag (mixed UNION / UNION ALL), it is
+/// parsed as a separate set operation rather than flattened, preserving
+/// PostgreSQL's nested `SetOperationStmt` tree structure.
 unsafe fn collect_union_children(
     select: &pg_sys::SelectStmt,
     parent_all: bool,
@@ -2571,26 +3286,29 @@ unsafe fn collect_union_children(
             let rarg = &*select.rarg;
 
             if larg.op != pg_sys::SetOperation::SETOP_NONE {
-                if larg.all != parent_all {
-                    return Err(PgStreamError::UnsupportedOperator(
-                        "Mixed UNION / UNION ALL not supported; use all UNION or all UNION ALL"
-                            .into(),
-                    ));
+                if larg.op == pg_sys::SetOperation::SETOP_UNION && larg.all == parent_all {
+                    // Same UNION type — flatten into the same children list
+                    collect_union_children(larg, parent_all, children, cte_ctx)?;
+                } else {
+                    // Different set operation or mixed UNION/UNION ALL —
+                    // parse as a separate sub-tree (preserves nesting).
+                    let tree = parse_set_operation(larg, cte_ctx)?;
+                    children.push(tree);
                 }
-                collect_union_children(larg, parent_all, children, cte_ctx)?;
             } else {
                 let tree = parse_select_stmt(larg, "", cte_ctx)?;
                 children.push(tree);
             }
 
             if rarg.op != pg_sys::SetOperation::SETOP_NONE {
-                if rarg.all != parent_all {
-                    return Err(PgStreamError::UnsupportedOperator(
-                        "Mixed UNION / UNION ALL not supported; use all UNION or all UNION ALL"
-                            .into(),
-                    ));
+                if rarg.op == pg_sys::SetOperation::SETOP_UNION && rarg.all == parent_all {
+                    // Same UNION type — flatten
+                    collect_union_children(rarg, parent_all, children, cte_ctx)?;
+                } else {
+                    // Different set operation or mixed — parse as sub-tree
+                    let tree = parse_set_operation(rarg, cte_ctx)?;
+                    children.push(tree);
                 }
-                collect_union_children(rarg, parent_all, children, cte_ctx)?;
             } else {
                 let tree = parse_select_stmt(rarg, "", cte_ctx)?;
                 children.push(tree);
@@ -5220,6 +5938,18 @@ unsafe fn extract_aggregates(
                 "mode" => Some(AggFunc::Mode),
                 "percentile_cont" => Some(AggFunc::PercentileCont),
                 "percentile_disc" => Some(AggFunc::PercentileDisc),
+                "corr" => Some(AggFunc::Corr),
+                "covar_pop" => Some(AggFunc::CovarPop),
+                "covar_samp" => Some(AggFunc::CovarSamp),
+                "regr_avgx" => Some(AggFunc::RegrAvgx),
+                "regr_avgy" => Some(AggFunc::RegrAvgy),
+                "regr_count" => Some(AggFunc::RegrCount),
+                "regr_intercept" => Some(AggFunc::RegrIntercept),
+                "regr_r2" => Some(AggFunc::RegrR2),
+                "regr_slope" => Some(AggFunc::RegrSlope),
+                "regr_sxx" => Some(AggFunc::RegrSxx),
+                "regr_sxy" => Some(AggFunc::RegrSxy),
+                "regr_syy" => Some(AggFunc::RegrSyy),
                 _ => None,
             } {
                 let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
@@ -5287,7 +6017,9 @@ unsafe fn extract_aggregates(
                      Supported aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, \
                      STRING_AGG, ARRAY_AGG, JSON_AGG, JSONB_AGG, BIT_AND, BIT_OR, BIT_XOR, \
                      JSON_OBJECT_AGG, JSONB_OBJECT_AGG, STDDEV, STDDEV_POP, STDDEV_SAMP, \
-                     VARIANCE, VAR_POP, VAR_SAMP, MODE, PERCENTILE_CONT, PERCENTILE_DISC. \
+                     VARIANCE, VAR_POP, VAR_SAMP, MODE, PERCENTILE_CONT, PERCENTILE_DISC, \
+                     CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY, REGR_COUNT, \
+                     REGR_INTERCEPT, REGR_R2, REGR_SLOPE, REGR_SXX, REGR_SXY, REGR_SYY. \
                      Use FULL refresh mode instead.",
                 )));
             } else {
@@ -5554,6 +6286,18 @@ mod tests {
         assert_eq!(AggFunc::Mode.sql_name(), "MODE");
         assert_eq!(AggFunc::PercentileCont.sql_name(), "PERCENTILE_CONT");
         assert_eq!(AggFunc::PercentileDisc.sql_name(), "PERCENTILE_DISC");
+        assert_eq!(AggFunc::Corr.sql_name(), "CORR");
+        assert_eq!(AggFunc::CovarPop.sql_name(), "COVAR_POP");
+        assert_eq!(AggFunc::CovarSamp.sql_name(), "COVAR_SAMP");
+        assert_eq!(AggFunc::RegrAvgx.sql_name(), "REGR_AVGX");
+        assert_eq!(AggFunc::RegrAvgy.sql_name(), "REGR_AVGY");
+        assert_eq!(AggFunc::RegrCount.sql_name(), "REGR_COUNT");
+        assert_eq!(AggFunc::RegrIntercept.sql_name(), "REGR_INTERCEPT");
+        assert_eq!(AggFunc::RegrR2.sql_name(), "REGR_R2");
+        assert_eq!(AggFunc::RegrSlope.sql_name(), "REGR_SLOPE");
+        assert_eq!(AggFunc::RegrSxx.sql_name(), "REGR_SXX");
+        assert_eq!(AggFunc::RegrSxy.sql_name(), "REGR_SXY");
+        assert_eq!(AggFunc::RegrSyy.sql_name(), "REGR_SYY");
     }
 
     // ── OpTree::alias tests ─────────────────────────────────────────
@@ -8596,5 +9340,59 @@ mod tests {
             right: Box::new(make_scan(2, "thresholds", "t", &["cust_id"])),
         };
         assert!(check_ivm_support(&tree).is_ok());
+    }
+
+    // ── Volatility helper tests ─────────────────────────────────────
+
+    #[test]
+    fn test_max_volatility_ordering() {
+        assert_eq!(max_volatility('i', 'i'), 'i');
+        assert_eq!(max_volatility('i', 's'), 's');
+        assert_eq!(max_volatility('s', 'i'), 's');
+        assert_eq!(max_volatility('s', 's'), 's');
+        assert_eq!(max_volatility('i', 'v'), 'v');
+        assert_eq!(max_volatility('v', 'i'), 'v');
+        assert_eq!(max_volatility('s', 'v'), 'v');
+        assert_eq!(max_volatility('v', 's'), 'v');
+        assert_eq!(max_volatility('v', 'v'), 'v');
+    }
+
+    #[test]
+    fn test_collect_volatilities_no_func_calls() {
+        // An expression with no function calls should remain 'i' (immutable).
+        let expr = Expr::BinaryOp {
+            op: "+".to_string(),
+            left: Box::new(col("a")),
+            right: Box::new(Expr::Literal("1".to_string())),
+        };
+        let mut worst = 'i';
+        // collect_volatilities with no FuncCall should leave worst at 'i'.
+        // (Can't call SPI in unit tests, but no FuncCall → no SPI call.)
+        collect_volatilities(&expr, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
+    }
+
+    #[test]
+    fn test_tree_collect_volatility_scan_only() {
+        // A plain Scan node has no expressions → worst stays 'i'.
+        let tree = make_scan(1, "orders", "o", &["id", "amount"]);
+        let mut worst = 'i';
+        tree_collect_volatility(&tree, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
+    }
+
+    #[test]
+    fn test_tree_collect_volatility_filter_no_funcs() {
+        let tree = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: ">".to_string(),
+                left: Box::new(col("amount")),
+                right: Box::new(Expr::Literal("100".to_string())),
+            },
+            child: Box::new(make_scan(1, "orders", "o", &["id", "amount"])),
+        };
+        let mut worst = 'i';
+        tree_collect_volatility(&tree, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
     }
 }

@@ -608,6 +608,23 @@ pub fn percentile_disc_col(fraction: &str, order_col: &str, alias: &str) -> AggE
     }
 }
 
+/// Build a generic two-argument regression aggregate: `func(y_col, x_col)`.
+///
+/// Covers: CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY,
+/// REGR_COUNT, REGR_INTERCEPT, REGR_R2, REGR_SLOPE, REGR_SXX,
+/// REGR_SXY, REGR_SYY.
+pub fn regression_agg(func: AggFunc, y_col: &str, x_col: &str, alias: &str) -> AggExpr {
+    AggExpr {
+        function: func,
+        argument: Some(colref(y_col)),
+        alias: alias.to_string(),
+        is_distinct: false,
+        filter: None,
+        second_arg: Some(colref(x_col)),
+        order_within_group: None,
+    }
+}
+
 // ── WindowExpr helpers ──────────────────────────────────────────────────
 
 /// Build a simple window expression (e.g., `ROW_NUMBER() OVER (PARTITION BY ...)`).

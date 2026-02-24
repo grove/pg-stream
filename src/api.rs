@@ -61,6 +61,12 @@ fn create_stream_table_impl(
         None => None,
     };
 
+    // ── DISTINCT ON auto-rewrite ───────────────────────────────────
+    // DISTINCT ON (e1, e2) is rewritten to a ROW_NUMBER() window function
+    // subquery before further parsing. The original query string is replaced
+    // so all downstream validation and parsing sees the rewritten form.
+    let query = &crate::dvm::rewrite_distinct_on(query)?;
+
     // Validate the defining query by running LIMIT 0
     let columns = validate_defining_query(query)?;
 
@@ -69,7 +75,7 @@ fn create_stream_table_impl(
     crate::dvm::reject_limit_offset(query)?;
 
     // Reject constructs that are unsupported regardless of refresh mode
-    // (NATURAL JOIN, DISTINCT ON, subquery expressions like EXISTS/IN).
+    // (NATURAL JOIN, subquery expressions like EXISTS/IN).
     // This is a lightweight check that inspects the raw parse tree without
     // doing full DVM tree construction.
     crate::dvm::reject_unsupported_constructs(query)?;
@@ -79,15 +85,52 @@ fn create_stream_table_impl(
     // for incremental view maintenance. FULL mode skips this since it
     // just truncates and reloads.
     let parsed_tree = if refresh_mode == RefreshMode::Differential {
-        Some(crate::dvm::parse_defining_query(query)?)
+        Some(crate::dvm::parse_defining_query_full(query)?)
     } else {
         None
     };
 
+    // ── Volatility check ────────────────────────────────────────────
+    // Volatile functions break delta computation in DIFFERENTIAL mode.
+    // Stable functions are allowed with a warning.
+    if let Some(ref pr) = parsed_tree {
+        let vol = crate::dvm::tree_worst_volatility_with_registry(pr)?;
+        match vol {
+            'v' => {
+                return Err(PgStreamError::UnsupportedOperator(
+                    "Defining query contains volatile functions (e.g., random(), \
+                     clock_timestamp()). Volatile functions are not supported in \
+                     DIFFERENTIAL mode because they produce different values on \
+                     each evaluation, breaking delta computation. \
+                     Use FULL refresh mode instead, or replace with a \
+                     deterministic alternative."
+                        .into(),
+                ));
+            }
+            's' => {
+                pgrx::warning!(
+                    "Defining query contains stable functions (e.g., now(), \
+                     current_timestamp). These return the same value within a \
+                     single refresh but may shift between refreshes. \
+                     Delta computation is correct within each refresh cycle."
+                );
+            }
+            _ => {} // 'i' (immutable) — no action
+        }
+    } else if refresh_mode == RefreshMode::Full {
+        // FULL mode: warn if volatile functions are present.
+        // We still validate the query by parsing it (LIMIT 0 already ran),
+        // but we don't have a full OpTree. Do a lightweight SPI check on
+        // any function names we can extract. This is best-effort — the
+        // user already chose FULL mode, so we just warn.
+        // (Skip for now — FULL mode re-evaluates everything from scratch,
+        // so volatile is expected-but-surprising behavior.)
+    }
+
     // Detect if the query has aggregate/distinct (needs __pgs_count auxiliary column).
     let needs_count = parsed_tree
         .as_ref()
-        .is_some_and(|tree| tree.needs_pgs_count());
+        .is_some_and(|pr| pr.tree.needs_pgs_count());
 
     // Note: recursive CTEs (WITH RECURSIVE) are allowed in both FULL and
     // DIFFERENTIAL modes. For DIFFERENTIAL, the DVM engine uses a
@@ -134,8 +177,8 @@ fn create_stream_table_impl(
     // queries. This accelerates the LEFT JOIN in the agg_merge CTE during
     // differential refreshes by allowing index lookups instead of seq scans.
     if refresh_mode == RefreshMode::Differential
-        && let Some(ref tree) = parsed_tree
-        && let Some(group_cols) = tree.group_by_columns()
+        && let Some(ref pr) = parsed_tree
+        && let Some(group_cols) = pr.tree.group_by_columns()
         && !group_cols.is_empty()
     {
         let quoted_cols: Vec<String> = group_cols

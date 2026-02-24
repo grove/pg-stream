@@ -154,7 +154,7 @@ pub fn create_change_trigger(
         PgStreamError::SpiError(format!("Failed to create CDC trigger function: {}", e))
     })?;
 
-    // Create the trigger on the source table
+    // Create the row-level trigger on the source table
     let create_trigger_sql = format!(
         "CREATE TRIGGER {trigger}
          AFTER INSERT OR UPDATE OR DELETE ON {table}
@@ -168,6 +168,50 @@ pub fn create_change_trigger(
     Spi::run(&create_trigger_sql).map_err(|e| {
         PgStreamError::SpiError(format!(
             "Failed to create CDC trigger on {}: {}",
+            source_table, e
+        ))
+    })?;
+
+    // ── TRUNCATE capture (statement-level trigger) ──────────────────
+    // TRUNCATE bypasses row-level triggers entirely. A separate
+    // statement-level AFTER TRUNCATE trigger writes a single marker row
+    // with action='T' into the change buffer. The refresh engine
+    // detects this marker and falls back to a full refresh.
+    let truncate_fn_sql = format!(
+        "CREATE OR REPLACE FUNCTION {change_schema}.pg_stream_cdc_truncate_fn_{oid}()
+         RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             INSERT INTO {change_schema}.changes_{oid}
+                 (lsn, action)
+             VALUES (pg_current_wal_lsn(), 'T');
+             RETURN NULL;
+         END;
+         $$",
+        change_schema = change_schema,
+        oid = oid_u32,
+    );
+
+    Spi::run(&truncate_fn_sql).map_err(|e| {
+        PgStreamError::SpiError(format!(
+            "Failed to create CDC TRUNCATE trigger function: {}",
+            e
+        ))
+    })?;
+
+    let truncate_trigger_name = format!("pg_stream_cdc_truncate_{}", oid_u32);
+    let create_truncate_trigger_sql = format!(
+        "CREATE TRIGGER {trigger}
+         AFTER TRUNCATE ON {table}
+         FOR EACH STATEMENT EXECUTE FUNCTION {change_schema}.pg_stream_cdc_truncate_fn_{oid}()",
+        trigger = truncate_trigger_name,
+        table = source_table,
+        change_schema = change_schema,
+        oid = oid_u32,
+    );
+
+    Spi::run(&create_truncate_trigger_sql).map_err(|e| {
+        PgStreamError::SpiError(format!(
+            "Failed to create CDC TRUNCATE trigger on {}: {}",
             source_table, e
         ))
     })?;
@@ -192,14 +236,28 @@ pub fn drop_change_trigger(
     if let Some(ref table) = source_table {
         let drop_trigger_sql = format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, table,);
         let _ = Spi::run(&drop_trigger_sql);
+
+        // Drop the TRUNCATE trigger as well
+        let truncate_trigger_name = format!("pg_stream_cdc_truncate_{}", oid_u32);
+        let drop_truncate_sql = format!(
+            "DROP TRIGGER IF EXISTS {} ON {}",
+            truncate_trigger_name, table,
+        );
+        let _ = Spi::run(&drop_truncate_sql);
     }
 
-    // Drop the trigger function
+    // Drop the trigger functions (row-level + TRUNCATE)
     let drop_fn_sql = format!(
         "DROP FUNCTION IF EXISTS {}.pg_stream_cdc_fn_{}() CASCADE",
         change_schema, oid_u32,
     );
     let _ = Spi::run(&drop_fn_sql);
+
+    let drop_truncate_fn_sql = format!(
+        "DROP FUNCTION IF EXISTS {}.pg_stream_cdc_truncate_fn_{}() CASCADE",
+        change_schema, oid_u32,
+    );
+    let _ = Spi::run(&drop_truncate_fn_sql);
 
     Ok(())
 }

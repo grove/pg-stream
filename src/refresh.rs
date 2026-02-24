@@ -736,6 +736,35 @@ pub fn execute_differential_refresh(
         return Ok((0, 0));
     }
 
+    // ── S2: TRUNCATE detection ───────────────────────────────────────
+    // If any source table was TRUNCATEd, the change buffer contains a
+    // marker row with action='T'. Differential deltas cannot represent
+    // a TRUNCATE — fall back to full refresh.
+    let has_truncate = catalog_source_oids.iter().any(|oid| {
+        let prev_lsn = prev_frontier.get_lsn(*oid);
+        let new_lsn = new_frontier.get_lsn(*oid);
+        Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(\
+               SELECT 1 FROM \"{change_schema}\".changes_{oid} \
+               WHERE lsn > '{prev_lsn}'::pg_lsn \
+               AND lsn <= '{new_lsn}'::pg_lsn \
+               AND action = 'T' \
+               LIMIT 1\
+             )",
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false)
+    });
+
+    if has_truncate {
+        pgrx::info!(
+            "[pg_stream] Source table TRUNCATE detected — falling back to FULL refresh for {}.{}",
+            schema,
+            name,
+        );
+        return execute_full_refresh(st);
+    }
+
     // ── P2: Capped-count threshold check (only when changes exist) ───────
     // Now that we know changes exist, check whether the change volume
     // exceeds the adaptive fallback threshold.  This heavier query is
