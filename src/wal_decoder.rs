@@ -39,6 +39,7 @@ use crate::catalog::{CdcMode, DtDependency};
 use crate::cdc;
 use crate::config;
 use crate::error::PgStreamError;
+use crate::monitor;
 
 // ── Naming Conventions ─────────────────────────────────────────────────────
 
@@ -221,6 +222,12 @@ const MAX_CHANGES_PER_POLL: i64 = 10_000;
 /// The `pgoutput` data format provides structured output that we parse
 /// to extract action type, column values, and LSN information.
 ///
+/// **Schema-change detection**: When the pgoutput output contains a
+/// `Relation` keyword (indicating the source table's schema metadata
+/// changed), this function returns `Err(WalTransitionError)` so the
+/// caller can abort the WAL transition and fall back to triggers.
+/// The DDL event trigger in `hooks.rs` handles the reinitialize.
+///
 /// Returns the number of changes processed and the last confirmed LSN.
 pub fn poll_wal_changes(
     source_oid: pg_sys::Oid,
@@ -266,6 +273,21 @@ pub fn poll_wal_changes(
 
             // Parse the pgoutput data and determine if it's relevant to our source
             if let Some(action) = parse_pgoutput_action(&data) {
+                // Schema-change detection: when pgoutput emits a DML message
+                // whose column set doesn't match our expected columns, a DDL
+                // change likely occurred. Return an error so the caller can
+                // fall back to triggers.
+                if action != 'T' {
+                    let parsed = parse_pgoutput_columns(&data);
+                    if detect_schema_mismatch(&parsed, columns) {
+                        return Err(PgStreamError::WalTransitionError(format!(
+                            "Schema change detected for source OID {} — \
+                             decoded columns don't match expected columns",
+                            oid_u32
+                        )));
+                    }
+                }
+
                 // Write the decoded change to the buffer table
                 write_decoded_change(
                     oid_u32,
@@ -553,6 +575,14 @@ pub fn start_wal_transition(
         oid_u32, slot_name, handoff_lsn, slot_lsn
     );
 
+    // Emit NOTIFY so clients can track the transition
+    monitor::emit_cdc_transition_notify(
+        source_oid,
+        CdcMode::Trigger,
+        CdcMode::Transitioning,
+        Some(&slot_name),
+    );
+
     Ok(())
 }
 
@@ -632,6 +662,15 @@ fn complete_wal_transition(
         oid_u32
     );
 
+    // Emit NOTIFY for transition completion
+    let slot_name = slot_name_for_source(source_oid);
+    monitor::emit_cdc_transition_notify(
+        source_oid,
+        CdcMode::Transitioning,
+        CdcMode::Wal,
+        Some(&slot_name),
+    );
+
     Ok(())
 }
 
@@ -683,6 +722,9 @@ pub fn abort_wal_transition(
         "pg_stream: aborted WAL transition for source OID {}; reverted to triggers",
         oid_u32
     );
+
+    // Emit NOTIFY for transition abort (fallback to triggers)
+    monitor::emit_cdc_transition_notify(source_oid, CdcMode::Wal, CdcMode::Trigger, None);
 
     Ok(())
 }
@@ -888,6 +930,35 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Detect a schema mismatch between decoded pgoutput columns and the
+/// expected column definitions.
+///
+/// Returns `true` if the decoded row contains a column that doesn't appear
+/// in the expected set, which indicates the source table's schema changed
+/// (e.g., a column was added via ALTER TABLE ADD COLUMN).
+///
+/// This is a conservative check — it only fires when a *new* column appears.
+/// Dropped columns are already handled by the DDL event trigger in hooks.rs
+/// which marks STs for reinitialize.
+fn detect_schema_mismatch(
+    parsed: &std::collections::HashMap<String, String>,
+    expected_columns: &[(String, String)],
+) -> bool {
+    if parsed.is_empty() {
+        return false;
+    }
+    let expected_names: std::collections::HashSet<&str> = expected_columns
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    for col_name in parsed.keys() {
+        if !expected_names.contains(col_name.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1031,5 +1102,51 @@ mod tests {
         let result = build_pk_hash_from_values(&pk, &parsed);
         // Value should have single quotes escaped
         assert!(result.contains("''"));
+    }
+
+    // ── detect_schema_mismatch tests ───────────────────────────────
+
+    #[test]
+    fn test_schema_mismatch_no_mismatch() {
+        let expected = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("id".to_string(), "42".to_string());
+        parsed.insert("name".to_string(), "Alice".to_string());
+        assert!(!detect_schema_mismatch(&parsed, &expected));
+    }
+
+    #[test]
+    fn test_schema_mismatch_new_column() {
+        let expected = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("id".to_string(), "42".to_string());
+        parsed.insert("name".to_string(), "Alice".to_string());
+        parsed.insert("email".to_string(), "alice@example.com".to_string());
+        assert!(detect_schema_mismatch(&parsed, &expected));
+    }
+
+    #[test]
+    fn test_schema_mismatch_empty_parsed() {
+        let expected = vec![("id".to_string(), "integer".to_string())];
+        let parsed = std::collections::HashMap::new();
+        assert!(!detect_schema_mismatch(&parsed, &expected));
+    }
+
+    #[test]
+    fn test_schema_mismatch_subset_ok() {
+        // Fewer decoded columns than expected is OK (e.g., DELETE only sends PK)
+        let expected = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("id".to_string(), "42".to_string());
+        assert!(!detect_schema_mismatch(&parsed, &expected));
     }
 }

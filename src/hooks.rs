@@ -28,11 +28,11 @@
 
 use pgrx::prelude::*;
 
-use crate::catalog::StreamTableMeta;
+use crate::catalog::{CdcMode, DtDependency, StreamTableMeta};
 use crate::dag::DtStatus;
 use crate::error::PgStreamError;
 use crate::shmem;
-use crate::{cdc, config};
+use crate::{cdc, config, wal_decoder};
 
 // ── Event trigger handler ──────────────────────────────────────────────────
 
@@ -210,6 +210,12 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
         );
     }
 
+    // If any dependency on this source uses WAL-based CDC, abort the
+    // transition and fall back to triggers. The schema change invalidates
+    // the WAL decoder's column mapping — pgoutput will send a new Relation
+    // message, but it's safer to reinitialize from triggers.
+    handle_alter_table_wal_fallback(objid, identity, &change_schema);
+
     let total = affected_pgs_ids.len() + cascade_ids.len();
     if total > 0 {
         log!(
@@ -217,6 +223,50 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
             identity,
             total,
         );
+    }
+}
+
+/// When ALTER TABLE is detected on a source using WAL-based CDC, abort the
+/// WAL transition and fall back to trigger-based CDC.
+///
+/// `pgoutput` sends a Relation message when the schema changes, but our WAL
+/// decoder may not yet handle dynamic column remapping. It's safer to fall
+/// back to triggers, reinitialize the downstream STs, and let the transition
+/// restart once the reinitialize completes.
+fn handle_alter_table_wal_fallback(source_oid: pg_sys::Oid, identity: &str, change_schema: &str) {
+    let deps = match DtDependency::get_all() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    for dep in &deps {
+        if dep.source_relid != source_oid {
+            continue;
+        }
+        match dep.cdc_mode {
+            CdcMode::Wal | CdcMode::Transitioning => {
+                if let Err(e) =
+                    wal_decoder::abort_wal_transition(dep.source_relid, dep.pgs_id, change_schema)
+                {
+                    pgrx::warning!(
+                        "pg_stream_ddl_tracker: failed to abort WAL transition for {} (pgs_id={}): {}",
+                        identity,
+                        dep.pgs_id,
+                        e,
+                    );
+                } else {
+                    log!(
+                        "pg_stream_ddl_tracker: ALTER TABLE on {} — \
+                         aborted WAL transition (pgs_id={}), reverted to triggers",
+                        identity,
+                        dep.pgs_id,
+                    );
+                }
+            }
+            CdcMode::Trigger => {
+                // Already on triggers — nothing to do
+            }
+        }
     }
 }
 
