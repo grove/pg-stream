@@ -21,8 +21,10 @@
 
 use pgrx::prelude::*;
 
+use crate::catalog::{CdcMode, DtDependency};
 use crate::config;
 use crate::error::PgStreamError;
+use crate::wal_decoder;
 
 // ── NOTIFY Alerting ────────────────────────────────────────────────────────
 
@@ -411,7 +413,8 @@ fn get_staleness(name: &str) -> Option<f64> {
 
 /// Check CDC trigger health for all tracked sources.
 ///
-/// Returns trigger name, source table, and pending change count.
+/// Returns trigger/slot name, source table, active status, retained WAL bytes,
+/// and the CDC mode (`trigger`, `wal`, or `transitioning`).
 /// Exposed as `pgstream.slot_health()` (kept for API compatibility).
 #[pg_extern(schema = "pgstream", name = "slot_health")]
 fn slot_health() -> TableIterator<
@@ -424,15 +427,15 @@ fn slot_health() -> TableIterator<
         name!(wal_status, String),
     ),
 > {
-    let rows: Vec<_> = Spi::connect(|client| {
+    let mut rows = Vec::new();
+
+    // Trigger-mode sources from change_tracking
+    let trigger_rows: Vec<_> = Spi::connect(|client| {
         let result = client
             .select(
                 "SELECT
                     ct.slot_name,
-                    ct.source_relid::bigint,
-                    true,
-                    0::bigint,
-                    'trigger'
+                    ct.source_relid::bigint
                 FROM pgstream.pgs_change_tracking ct",
                 None,
                 &[],
@@ -443,16 +446,49 @@ fn slot_health() -> TableIterator<
         for row in result {
             let slot = row.get::<String>(1).unwrap().unwrap_or_default();
             let relid = row.get::<i64>(2).unwrap().unwrap_or(0);
-            let active = row.get::<bool>(3).unwrap().unwrap_or(true);
-            let retained = row.get::<i64>(4).unwrap().unwrap_or(0);
-            let wal_status = row
-                .get::<String>(5)
-                .unwrap()
-                .unwrap_or_else(|| "trigger".to_string());
-            out.push((slot, relid, active, retained, wal_status));
+            out.push((slot, relid));
         }
         out
     });
+
+    // Collect source OIDs that have WAL-mode deps (to avoid duplicating)
+    let all_deps = DtDependency::get_all().unwrap_or_default();
+    let mut wal_sources = std::collections::HashMap::new();
+    for dep in &all_deps {
+        if matches!(dep.cdc_mode, CdcMode::Wal | CdcMode::Transitioning) {
+            wal_sources
+                .entry(dep.source_relid.to_u32())
+                .or_insert((dep.cdc_mode, dep.slot_name.clone()));
+        }
+    }
+
+    for (slot, relid) in trigger_rows {
+        let source_oid_u32 = relid as u32;
+        if let Some((mode, _)) = wal_sources.remove(&source_oid_u32) {
+            // Source is WAL or transitioning — get real slot info
+            let slot_name = wal_decoder::slot_name_for_source(pg_sys::Oid::from(source_oid_u32));
+            let lag = wal_decoder::get_slot_lag_bytes(&slot_name).unwrap_or(0);
+            rows.push((slot_name, relid, true, lag, mode.as_str().to_lowercase()));
+        } else {
+            // Trigger-mode source
+            rows.push((slot, relid, true, 0, "trigger".to_string()));
+        }
+    }
+
+    // Any remaining WAL sources not in change_tracking (shouldn't happen
+    // in practice, but handle for robustness)
+    for (oid_u32, (mode, slot_opt)) in wal_sources {
+        let slot_name = slot_opt
+            .unwrap_or_else(|| wal_decoder::slot_name_for_source(pg_sys::Oid::from(oid_u32)));
+        let lag = wal_decoder::get_slot_lag_bytes(&slot_name).unwrap_or(0);
+        rows.push((
+            slot_name,
+            oid_u32 as i64,
+            true,
+            lag,
+            mode.as_str().to_lowercase(),
+        ));
+    }
 
     TableIterator::new(rows)
 }
@@ -552,6 +588,143 @@ fn explain_dt_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String
     }
 
     Ok(props)
+}
+
+// ── CDC Health Monitoring ───────────────────────────────────────────────────
+
+/// Check CDC health for all tracked sources.
+///
+/// Returns per-source health status including CDC mode, estimated lag,
+/// last confirmed LSN, and whether the slot lag exceeds a threshold.
+///
+/// Exposed as `pgstream.check_cdc_health()`.
+#[pg_extern(schema = "pgstream", name = "check_cdc_health")]
+#[allow(clippy::type_complexity)]
+fn check_cdc_health() -> TableIterator<
+    'static,
+    (
+        name!(source_relid, i64),
+        name!(source_table, String),
+        name!(cdc_mode, String),
+        name!(slot_name, Option<String>),
+        name!(lag_bytes, Option<i64>),
+        name!(confirmed_lsn, Option<String>),
+        name!(alert, Option<String>),
+    ),
+> {
+    let all_deps = DtDependency::get_all().unwrap_or_default();
+    let mut rows = Vec::new();
+    let mut seen_sources = std::collections::HashSet::new();
+
+    const LAG_ALERT_BYTES: i64 = 1_073_741_824; // 1 GB
+
+    for dep in &all_deps {
+        if dep.source_type != "TABLE" {
+            continue;
+        }
+        let oid_u32 = dep.source_relid.to_u32();
+        if !seen_sources.insert(oid_u32) {
+            continue;
+        }
+
+        // Resolve source table name
+        let source_name = Spi::get_one_with_args::<String>(
+            "SELECT $1::oid::regclass::text",
+            &[dep.source_relid.into()],
+        )
+        .unwrap_or(None)
+        .unwrap_or_else(|| format!("oid:{}", oid_u32));
+
+        let mode_str = dep.cdc_mode.as_str().to_string();
+
+        match dep.cdc_mode {
+            CdcMode::Trigger => {
+                rows.push((
+                    oid_u32 as i64,
+                    source_name,
+                    mode_str,
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
+            }
+            CdcMode::Wal | CdcMode::Transitioning => {
+                let slot = dep
+                    .slot_name
+                    .clone()
+                    .unwrap_or_else(|| wal_decoder::slot_name_for_source(dep.source_relid));
+                let lag = wal_decoder::get_slot_lag_bytes(&slot).unwrap_or(0);
+                let lsn = dep.decoder_confirmed_lsn.clone();
+
+                let alert = if lag > LAG_ALERT_BYTES {
+                    Some(format!("slot_lag_exceeds_threshold: {} bytes", lag))
+                } else {
+                    // Check if the slot still exists
+                    let slot_exists = Spi::get_one_with_args::<bool>(
+                        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+                        &[slot.as_str().into()],
+                    )
+                    .unwrap_or(Some(false))
+                    .unwrap_or(false);
+
+                    if !slot_exists && dep.cdc_mode == CdcMode::Wal {
+                        Some("replication_slot_missing".to_string())
+                    } else {
+                        None
+                    }
+                };
+
+                rows.push((
+                    oid_u32 as i64,
+                    source_name,
+                    mode_str,
+                    Some(slot),
+                    Some(lag),
+                    lsn,
+                    alert,
+                ));
+            }
+        }
+    }
+
+    TableIterator::new(rows)
+}
+
+// ── CDC Transition NOTIFY ──────────────────────────────────────────────────
+
+/// Emit a `NOTIFY pg_stream_cdc_transition` with a JSON payload when a
+/// source transitions between CDC modes.
+///
+/// Payload includes source table name, old mode, new mode, and slot name.
+pub fn emit_cdc_transition_notify(
+    source_oid: pg_sys::Oid,
+    old_mode: CdcMode,
+    new_mode: CdcMode,
+    slot_name: Option<&str>,
+) {
+    let source_name =
+        Spi::get_one_with_args::<String>("SELECT $1::oid::regclass::text", &[source_oid.into()])
+            .unwrap_or(None)
+            .unwrap_or_else(|| format!("oid:{}", source_oid.to_u32()));
+
+    let payload = format!(
+        r#"{{"event":"cdc_transition","source_table":"{}","old_mode":"{}","new_mode":"{}","slot_name":{}}}"#,
+        source_name.replace('"', r#"\""#),
+        old_mode.as_str(),
+        new_mode.as_str(),
+        match slot_name {
+            Some(s) => format!("\"{}\"", s.replace('"', r#"\""#)),
+            None => "null".to_string(),
+        },
+    );
+
+    let escaped = payload.replace('\'', "''");
+    let sql = format!("NOTIFY pg_stream_cdc_transition, '{}'", escaped);
+
+    if let Err(e) = Spi::run(&sql) {
+        pgrx::warning!("pg_stream: failed to emit cdc_transition NOTIFY: {}", e);
+    }
 }
 
 // ── Slot Health Monitoring (used by scheduler) ─────────────────────────────

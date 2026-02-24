@@ -1,6 +1,6 @@
 # PLAN: Hybrid CDC — Trigger Bootstrap → Logical Replication Steady-State
 
-**Status:** In Progress (Phases 1–4 implemented)  
+**Status:** Complete (all 6 phases implemented)  
 **Date:** 2026-02-24  
 **Origin:** [REPORT_TRIGGERS_VS_REPLICATION.md](REPORT_TRIGGERS_VS_REPLICATION.md) — Recommendation 6  
 **Effort:** 3–5 weeks (6 phases, incrementally deliverable)
@@ -703,7 +703,7 @@ if config::pg_stream_cdc_mode() != "trigger" {
 
 ---
 
-### Phase 5: Drop & Alter Integration (~2 days)
+### Phase 5: Drop & Alter Integration ✅ (~2 days)
 
 **Goal:** Ensure `drop_stream_table()`, `alter_stream_table()`, and DDL event
 hooks handle WAL-based CDC correctly.
@@ -743,7 +743,7 @@ the decoder can detect this and re-read `resolve_source_column_defs()`.
 
 ---
 
-### Phase 6: Monitoring & Observability (~2 days)
+### Phase 6: Monitoring & Observability ✅ (~2 days)
 
 **Goal:** Expose CDC mode and decoder health in monitoring views.
 

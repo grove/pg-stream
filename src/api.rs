@@ -6,7 +6,7 @@
 use pgrx::prelude::*;
 use std::time::Instant;
 
-use crate::catalog::{DtDependency, StreamTableMeta};
+use crate::catalog::{CdcMode, DtDependency, StreamTableMeta};
 use crate::cdc;
 use crate::config;
 use crate::dag::{DagNode, DtDag, DtStatus, NodeId, RefreshMode};
@@ -14,6 +14,7 @@ use crate::error::PgStreamError;
 use crate::refresh;
 use crate::shmem;
 use crate::version;
+use crate::wal_decoder;
 
 /// Create a new stream table.
 ///
@@ -305,10 +306,11 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     // Delete catalog entries (cascade handles pgs_dependencies)
     StreamTableMeta::delete(dt.pgs_id)?;
 
-    // Clean up CDC slots for sources no longer tracked by any ST
+    // Clean up CDC resources (triggers, WAL slots, publications) for
+    // sources no longer tracked by any ST.
     for dep in &deps {
         if dep.source_type == "TABLE" {
-            cleanup_cdc_for_source(dep.source_relid)?;
+            cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode)?;
         }
     }
 
@@ -643,7 +645,7 @@ fn setup_cdc_for_source(
 ///
 /// If no other STs reference this source, drop the CDC trigger and
 /// change buffer table.
-fn cleanup_cdc_for_source(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> {
+fn cleanup_cdc_for_source(source_oid: pg_sys::Oid, cdc_mode: CdcMode) -> Result<(), PgStreamError> {
     // Check if any other STs still reference this source
     let still_referenced = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS( \
@@ -655,8 +657,31 @@ fn cleanup_cdc_for_source(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> 
     .unwrap_or(false);
 
     if !still_referenced {
-        // Drop the CDC trigger and trigger function
         let change_schema = config::pg_stream_change_buffer_schema();
+
+        // If WAL-based CDC was active (or transitioning), clean up
+        // the replication slot and publication first.
+        if matches!(cdc_mode, CdcMode::Wal | CdcMode::Transitioning) {
+            let slot_name = wal_decoder::slot_name_for_source(source_oid);
+            if let Err(e) = wal_decoder::drop_replication_slot(&slot_name) {
+                pgrx::warning!(
+                    "Failed to drop replication slot {} for oid {}: {}",
+                    slot_name,
+                    source_oid.to_u32(),
+                    e
+                );
+            }
+            if let Err(e) = wal_decoder::drop_publication(source_oid) {
+                pgrx::warning!(
+                    "Failed to drop publication for oid {}: {}",
+                    source_oid.to_u32(),
+                    e
+                );
+            }
+        }
+
+        // Drop the CDC trigger and trigger function (may not exist if
+        // already in WAL mode, but safe to attempt)
         if let Err(e) = cdc::drop_change_trigger(source_oid, &change_schema) {
             pgrx::warning!(
                 "Failed to drop CDC trigger for oid {}: {}",
