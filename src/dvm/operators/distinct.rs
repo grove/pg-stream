@@ -35,10 +35,10 @@ pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
         .collect();
     let row_id_expr = build_hash_expr(&hash_exprs);
 
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .clone()
-        .unwrap_or_else(|| "/* dt_table */".to_string());
+        .unwrap_or_else(|| "/* st_table */".to_string());
 
     // CTE 1: Compute per-row net change (insert_count - delete_count)
     let delta_cte = ctx.next_cte_name("dist_delta");
@@ -60,10 +60,10 @@ pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
         "SELECT d.__pgs_row_id,\n\
          {d_cols},\n\
          d.__net_count,\n\
-         COALESCE(dt.__pgs_count, 0) AS old_count,\n\
-         COALESCE(dt.__pgs_count, 0) + d.__net_count AS new_count\n\
+         COALESCE(st.__pgs_count, 0) AS old_count,\n\
+         COALESCE(st.__pgs_count, 0) + d.__net_count AS new_count\n\
          FROM {delta_cte} d\n\
-         LEFT JOIN {dt_table} dt ON dt.__pgs_row_id = d.__pgs_row_id",
+         LEFT JOIN {st_table} st ON st.__pgs_row_id = d.__pgs_row_id",
         d_cols = cols
             .iter()
             .map(|c| format!("d.{}", quote_ident(c)))
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_diff_distinct_basic() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "t", "public", "t", &["id", "name"]);
         let tree = distinct(child);
         let result = diff_distinct(&mut ctx, &tree).unwrap();
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn test_diff_distinct_hash_row_id() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["a", "b"]);
         let tree = distinct(child);
         let result = diff_distinct(&mut ctx, &tree).unwrap();
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_diff_distinct_boundary_crossings() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["val"]);
         let tree = distinct(child);
         let result = diff_distinct(&mut ctx, &tree).unwrap();
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_diff_distinct_not_deduplicated() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["x"]);
         let tree = distinct(child);
         let result = diff_distinct(&mut ctx, &tree).unwrap();
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_diff_distinct_error_on_non_distinct_node() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_distinct(&mut ctx, &tree);
         assert!(result.is_err());

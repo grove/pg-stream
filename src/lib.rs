@@ -167,15 +167,15 @@ extension_sql!(
     r#"
 -- Status overview view
 CREATE OR REPLACE VIEW pgstream.stream_tables_info AS
-SELECT dt.*,
-       now() - dt.data_timestamp AS staleness,
-       CASE WHEN dt.schedule IS NOT NULL
-                 AND dt.schedule !~ '[\s@]'
-            THEN EXTRACT(EPOCH FROM (now() - dt.data_timestamp)) >
-                 pgstream.parse_duration_seconds(dt.schedule)
+SELECT st.*,
+       now() - st.data_timestamp AS staleness,
+       CASE WHEN st.schedule IS NOT NULL
+                 AND st.schedule !~ '[\s@]'
+            THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+                 pgstream.parse_duration_seconds(st.schedule)
             ELSE NULL::boolean
        END AS stale
-FROM pgstream.pgs_stream_tables dt;
+FROM pgstream.pgs_stream_tables st;
 "#,
     name = "pg_stream_info_view",
     requires = [parse_duration_seconds],
@@ -219,24 +219,24 @@ extension_sql!(
 -- Combines catalog metadata with aggregate refresh statistics.
 CREATE OR REPLACE VIEW pgstream.pg_stat_stream_tables AS
 SELECT
-    dt.pgs_id,
-    dt.pgs_schema,
-    dt.pgs_name,
-    dt.status,
-    dt.refresh_mode,
-    dt.is_populated,
-    dt.data_timestamp,
-    dt.schedule,
-    now() - dt.data_timestamp AS staleness,
-    CASE WHEN dt.schedule IS NOT NULL AND dt.data_timestamp IS NOT NULL
-              AND dt.schedule !~ '[\s@]'
-         THEN EXTRACT(EPOCH FROM (now() - dt.data_timestamp)) >
-              pgstream.parse_duration_seconds(dt.schedule)
+    st.pgs_id,
+    st.pgs_schema,
+    st.pgs_name,
+    st.status,
+    st.refresh_mode,
+    st.is_populated,
+    st.data_timestamp,
+    st.schedule,
+    now() - st.data_timestamp AS staleness,
+    CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
+              AND st.schedule !~ '[\s@]'
+         THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+              pgstream.parse_duration_seconds(st.schedule)
          ELSE NULL::boolean
     END AS stale,
-    dt.consecutive_errors,
-    dt.needs_reinit,
-    dt.last_refresh_at,
+    st.consecutive_errors,
+    st.needs_reinit,
+    st.last_refresh_at,
     COALESCE(stats.total_refreshes, 0) AS total_refreshes,
     COALESCE(stats.successful_refreshes, 0) AS successful_refreshes,
     COALESCE(stats.failed_refreshes, 0) AS failed_refreshes,
@@ -245,7 +245,7 @@ SELECT
     stats.avg_duration_ms,
     stats.last_action,
     stats.last_status
-FROM pgstream.pgs_stream_tables dt
+FROM pgstream.pgs_stream_tables st
 LEFT JOIN LATERAL (
     SELECT
         count(*)::bigint AS total_refreshes,
@@ -259,15 +259,15 @@ LEFT JOIN LATERAL (
              ELSE NULL
         END::float8 AS avg_duration_ms,
         (SELECT h2.action FROM pgstream.pgs_refresh_history h2
-         WHERE h2.pgs_id = dt.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_action,
+         WHERE h2.pgs_id = st.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_action,
         (SELECT h2.status FROM pgstream.pgs_refresh_history h2
-         WHERE h2.pgs_id = dt.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_status,
+         WHERE h2.pgs_id = st.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_status,
         (SELECT h2.initiated_by FROM pgstream.pgs_refresh_history h2
-         WHERE h2.pgs_id = dt.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_initiated_by,
+         WHERE h2.pgs_id = st.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_initiated_by,
         (SELECT h2.freshness_deadline FROM pgstream.pgs_refresh_history h2
-         WHERE h2.pgs_id = dt.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS freshness_deadline
+         WHERE h2.pgs_id = st.pgs_id ORDER BY h2.refresh_id DESC LIMIT 1) AS freshness_deadline
     FROM pgstream.pgs_refresh_history h
-    WHERE h.pgs_id = dt.pgs_id
+    WHERE h.pgs_id = st.pgs_id
 ) stats ON true;
 "#,
     name = "pg_stream_monitoring_views",

@@ -452,7 +452,7 @@ pg_stream detects DDL changes via event triggers and marks affected stream table
 ### How do I see the delta query generated for a stream table?
 
 ```sql
-SELECT pgstream.explain_dt('order_totals');
+SELECT pgstream.explain_st('order_totals');
 ```
 
 This shows the DVM operator tree, source tables, and the generated delta SQL.

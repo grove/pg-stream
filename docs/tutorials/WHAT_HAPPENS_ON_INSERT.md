@@ -194,9 +194,9 @@ The stream table uses reference counting: it tracks `__pgs_count` (how many sour
 The delta is applied to the `customer_totals` storage table using a single SQL `MERGE` statement:
 
 ```sql
-MERGE INTO public.customer_totals AS dt
+MERGE INTO public.customer_totals AS st
 USING (<delta_query>) AS d
-ON dt.__pgs_row_id = d.__pgs_row_id
+ON st.__pgs_row_id = d.__pgs_row_id
 WHEN MATCHED AND d.__pgs_action = 'D' THEN DELETE
 WHEN MATCHED AND d.__pgs_action = 'I' THEN
     UPDATE SET customer = d.customer, total = d.total, order_count = d.order_count

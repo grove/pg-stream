@@ -22,8 +22,8 @@ async fn test_full_lifecycle_create_mutate_refresh_drop() {
     db.execute("INSERT INTO lc_src VALUES (1, 'Alice', 100), (2, 'Bob', 200)")
         .await;
 
-    db.create_dt(
-        "lc_dt",
+    db.create_st(
+        "lc_st",
         "SELECT id, name, amount FROM lc_src",
         "1m",
         "DIFFERENTIAL",
@@ -31,7 +31,7 @@ async fn test_full_lifecycle_create_mutate_refresh_drop() {
     .await;
 
     // Verify initial data
-    assert_eq!(db.count("public.lc_dt").await, 2);
+    assert_eq!(db.count("public.lc_st").await, 2);
 
     // Mutate source
     db.execute("INSERT INTO lc_src VALUES (3, 'Charlie', 300)")
@@ -41,20 +41,20 @@ async fn test_full_lifecycle_create_mutate_refresh_drop() {
     db.execute("DELETE FROM lc_src WHERE id = 1").await;
 
     // Refresh
-    db.refresh_dt("lc_dt").await;
+    db.refresh_st("lc_st").await;
 
     // Verify updated data
-    assert_eq!(db.count("public.lc_dt").await, 2);
-    db.assert_dt_matches_query("public.lc_dt", "SELECT id, name, amount FROM lc_src")
+    assert_eq!(db.count("public.lc_st").await, 2);
+    db.assert_st_matches_query("public.lc_st", "SELECT id, name, amount FROM lc_src")
         .await;
 
     // Drop
-    db.drop_dt("lc_dt").await;
+    db.drop_st("lc_st").await;
 
     // Verify cleanup
-    assert!(!db.table_exists("public", "lc_dt").await);
+    assert!(!db.table_exists("public", "lc_st").await);
     let cat_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'lc_dt'")
+        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'lc_st'")
         .await;
     assert_eq!(cat_count, 0);
 }
@@ -72,14 +72,14 @@ async fn test_multiple_dt_on_same_source() {
     .await;
 
     // Two STs on same source with different queries
-    db.create_dt(
+    db.create_st(
         "ms_all",
         "SELECT id, region, amount FROM ms_src",
         "1m",
         "DIFFERENTIAL",
     )
     .await;
-    db.create_dt(
+    db.create_st(
         "ms_us_only",
         "SELECT id, amount FROM ms_src WHERE region = 'US'",
         "1m",
@@ -95,19 +95,19 @@ async fn test_multiple_dt_on_same_source() {
     db.execute("INSERT INTO ms_src VALUES (5, 'US', 500)").await;
 
     // Refresh both
-    db.refresh_dt("ms_all").await;
-    db.refresh_dt("ms_us_only").await;
+    db.refresh_st("ms_all").await;
+    db.refresh_st("ms_us_only").await;
 
     assert_eq!(db.count("public.ms_all").await, 5);
     assert_eq!(db.count("public.ms_us_only").await, 3);
 
     // Drop one, verify the other still works
-    db.drop_dt("ms_all").await;
+    db.drop_st("ms_all").await;
     assert!(!db.table_exists("public", "ms_all").await);
 
     // ms_us_only should still work fine
     db.execute("INSERT INTO ms_src VALUES (6, 'US', 600)").await;
-    db.refresh_dt("ms_us_only").await;
+    db.refresh_st("ms_us_only").await;
     assert_eq!(db.count("public.ms_us_only").await, 4);
 }
 
@@ -121,7 +121,7 @@ async fn test_chained_stream_tables() {
     db.execute("INSERT INTO chain_base VALUES (1, 10), (2, 20), (3, 30)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "chain_dt1",
         "SELECT id, val FROM chain_base WHERE val >= 20",
         "1m",
@@ -132,7 +132,7 @@ async fn test_chained_stream_tables() {
     assert_eq!(db.count("public.chain_dt1").await, 2);
 
     // ST on top of ST (chained)
-    db.create_dt(
+    db.create_st(
         "chain_dt2",
         "SELECT id, val FROM public.chain_dt1 WHERE val >= 30",
         "1m",
@@ -146,8 +146,8 @@ async fn test_chained_stream_tables() {
     db.execute("INSERT INTO chain_base VALUES (4, 40)").await;
 
     // Refresh chain
-    db.refresh_dt("chain_dt1").await;
-    db.refresh_dt("chain_dt2").await;
+    db.refresh_st("chain_dt1").await;
+    db.refresh_st("chain_dt2").await;
 
     assert_eq!(db.count("public.chain_dt1").await, 3); // val >= 20: 20, 30, 40
     assert_eq!(db.count("public.chain_dt2").await, 2); // val >= 30: 30, 40
@@ -160,19 +160,19 @@ async fn test_recreate_after_drop() {
     db.execute("CREATE TABLE rc_src (id INT PRIMARY KEY)").await;
     db.execute("INSERT INTO rc_src VALUES (1), (2)").await;
 
-    db.create_dt("rc_dt", "SELECT id FROM rc_src", "1m", "FULL")
+    db.create_st("rc_st", "SELECT id FROM rc_src", "1m", "FULL")
         .await;
-    assert_eq!(db.count("public.rc_dt").await, 2);
+    assert_eq!(db.count("public.rc_st").await, 2);
 
-    db.drop_dt("rc_dt").await;
-    assert!(!db.table_exists("public", "rc_dt").await);
+    db.drop_st("rc_st").await;
+    assert!(!db.table_exists("public", "rc_st").await);
 
     // Recreate with same name
     db.execute("INSERT INTO rc_src VALUES (3)").await;
-    db.create_dt("rc_dt", "SELECT id FROM rc_src", "1m", "FULL")
+    db.create_st("rc_st", "SELECT id FROM rc_src", "1m", "FULL")
         .await;
 
-    assert_eq!(db.count("public.rc_dt").await, 3);
+    assert_eq!(db.count("public.rc_st").await, 3);
 }
 
 #[tokio::test]
@@ -183,8 +183,8 @@ async fn test_high_frequency_mutations() {
         .await;
     db.execute("INSERT INTO hf_src VALUES (1, 0)").await;
 
-    db.create_dt(
-        "hf_dt",
+    db.create_st(
+        "hf_st",
         "SELECT id, counter FROM hf_src",
         "1m",
         "DIFFERENTIAL",
@@ -197,11 +197,11 @@ async fn test_high_frequency_mutations() {
             .await;
     }
 
-    db.refresh_dt("hf_dt").await;
+    db.refresh_st("hf_st").await;
 
     // Final state should match
     let counter: i32 = db
-        .query_scalar("SELECT counter FROM public.hf_dt WHERE id = 1")
+        .query_scalar("SELECT counter FROM public.hf_st WHERE id = 1")
         .await;
     assert_eq!(counter, 100, "Should reflect the final mutation value");
 }
@@ -214,12 +214,12 @@ async fn test_empty_source_table() {
         .await;
     // No inserts — source table is empty
 
-    db.create_dt("empty_dt", "SELECT id, val FROM empty_src", "1m", "FULL")
+    db.create_st("empty_st", "SELECT id, val FROM empty_src", "1m", "FULL")
         .await;
 
-    assert_eq!(db.count("public.empty_dt").await, 0);
+    assert_eq!(db.count("public.empty_st").await, 0);
 
-    let (status, _, populated, _) = db.pgs_status("empty_dt").await;
+    let (status, _, populated, _) = db.pgs_status("empty_st").await;
     assert_eq!(status, "ACTIVE");
     assert!(populated, "is_populated should be true even with 0 rows");
 }
@@ -238,29 +238,29 @@ async fn test_source_with_nulls() {
     )
     .await;
 
-    db.create_dt(
-        "null_dt",
+    db.create_st(
+        "null_st",
         "SELECT id, name, score, notes FROM null_src",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.null_dt").await, 3);
+    assert_eq!(db.count("public.null_st").await, 3);
 
     // Verify NULLs are preserved
     let name_null: bool = db
-        .query_scalar("SELECT name IS NULL FROM public.null_dt WHERE id = 2")
+        .query_scalar("SELECT name IS NULL FROM public.null_st WHERE id = 2")
         .await;
     assert!(name_null, "NULL name should be preserved");
 
     let score_null: bool = db
-        .query_scalar("SELECT score IS NULL FROM public.null_dt WHERE id = 2")
+        .query_scalar("SELECT score IS NULL FROM public.null_st WHERE id = 2")
         .await;
     assert!(score_null, "NULL score should be preserved");
 
     let notes_null: bool = db
-        .query_scalar("SELECT notes IS NULL FROM public.null_dt WHERE id = 3")
+        .query_scalar("SELECT notes IS NULL FROM public.null_st WHERE id = 3")
         .await;
     assert!(notes_null, "NULL notes should be preserved");
 }
@@ -289,24 +289,24 @@ async fn test_wide_table() {
     db.execute(&insert_sql).await;
 
     let select_cols = format!("id, {}", col_names.join(", "));
-    db.create_dt(
-        "wide_dt",
+    db.create_st(
+        "wide_st",
         &format!("SELECT {} FROM wide_src", select_cols),
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.wide_dt").await, 1);
+    assert_eq!(db.count("public.wide_st").await, 1);
 
     // Verify a few columns
     let col_1: i32 = db
-        .query_scalar("SELECT col_1 FROM public.wide_dt WHERE id = 1")
+        .query_scalar("SELECT col_1 FROM public.wide_st WHERE id = 1")
         .await;
     assert_eq!(col_1, 1);
 
     let col_50: i32 = db
-        .query_scalar("SELECT col_50 FROM public.wide_dt WHERE id = 1")
+        .query_scalar("SELECT col_50 FROM public.wide_st WHERE id = 1")
         .await;
     assert_eq!(col_50, 50);
 }
@@ -343,39 +343,39 @@ async fn test_various_data_types() {
     )
     .await;
 
-    db.create_dt(
-        "types_dt",
+    db.create_st(
+        "types_st",
         "SELECT id, big, num, txt, flag, ts, j, uid, raw, arr FROM types_src",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.types_dt").await, 1);
+    assert_eq!(db.count("public.types_st").await, 1);
 
     // Spot checks on types
     let big: i64 = db
-        .query_scalar("SELECT big FROM public.types_dt WHERE id = 1")
+        .query_scalar("SELECT big FROM public.types_st WHERE id = 1")
         .await;
     assert_eq!(big, 9999999999i64);
 
     let txt: String = db
-        .query_scalar("SELECT txt FROM public.types_dt WHERE id = 1")
+        .query_scalar("SELECT txt FROM public.types_st WHERE id = 1")
         .await;
     assert_eq!(txt, "hello world");
 
     let flag: bool = db
-        .query_scalar("SELECT flag FROM public.types_dt WHERE id = 1")
+        .query_scalar("SELECT flag FROM public.types_st WHERE id = 1")
         .await;
     assert!(flag);
 
     let json_val: String = db
-        .query_scalar("SELECT j->>'key' FROM public.types_dt WHERE id = 1")
+        .query_scalar("SELECT j->>'key' FROM public.types_st WHERE id = 1")
         .await;
     assert_eq!(json_val, "value");
 
     let uid: String = db
-        .query_scalar("SELECT uid::text FROM public.types_dt WHERE id = 1")
+        .query_scalar("SELECT uid::text FROM public.types_st WHERE id = 1")
         .await;
     assert_eq!(uid, "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
 }

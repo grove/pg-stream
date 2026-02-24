@@ -41,7 +41,7 @@ async fn test_lateral_subquery_top_n_full() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_top_item",
         "SELECT o.id, o.customer, latest.amount \
          FROM lsq_orders o, \
@@ -82,7 +82,7 @@ async fn test_lateral_subquery_left_join_full() {
         .await;
 
     // LEFT JOIN LATERAL: 'Empty' dept should appear with NULLs
-    db.create_dt(
+    db.create_st(
         "lsq_dept_stats",
         "SELECT d.id, d.name, stats.total, stats.cnt \
          FROM lsq_depts d \
@@ -124,7 +124,7 @@ async fn test_lateral_subquery_correlated_agg_full() {
     db.execute("INSERT INTO lsq_child VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_parent_totals",
         "SELECT p.id, p.name, agg.total \
          FROM lsq_parent p, \
@@ -157,7 +157,7 @@ async fn test_lateral_subquery_full_mode_refresh() {
     db.execute("INSERT INTO lsq_rf_items VALUES (1, 1, 100)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_rf_top",
         "SELECT o.id, o.customer, sub.amount \
          FROM lsq_rf_orders o, \
@@ -175,7 +175,7 @@ async fn test_lateral_subquery_full_mode_refresh() {
         .await;
     db.execute("INSERT INTO lsq_rf_items VALUES (2, 2, 250)")
         .await;
-    db.refresh_dt("lsq_rf_top").await;
+    db.refresh_st("lsq_rf_top").await;
 
     assert_eq!(db.count("public.lsq_rf_top").await, 2);
 }
@@ -197,7 +197,7 @@ async fn test_lateral_subquery_differential_initial() {
     db.execute("INSERT INTO lsq_di_items VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_di_top",
         "SELECT o.id, o.customer, sub.amount \
          FROM lsq_di_orders o, \
@@ -225,7 +225,7 @@ async fn test_lateral_subquery_differential_outer_insert() {
     db.execute("INSERT INTO lsq_oi_items VALUES (1, 1, 100), (10, 2, 250)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_oi_top",
         "SELECT o.id, o.customer, sub.amount \
          FROM lsq_oi_orders o, \
@@ -240,7 +240,7 @@ async fn test_lateral_subquery_differential_outer_insert() {
     // Insert new outer row → subquery runs for new row → expanded rows added
     db.execute("INSERT INTO lsq_oi_orders VALUES (2, 'Bob')")
         .await;
-    db.refresh_dt("lsq_oi_top").await;
+    db.refresh_st("lsq_oi_top").await;
 
     assert_eq!(db.count("public.lsq_oi_top").await, 2);
 
@@ -263,7 +263,7 @@ async fn test_lateral_subquery_differential_outer_delete() {
     db.execute("INSERT INTO lsq_od_items VALUES (1, 1, 100), (2, 2, 200)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_od_top",
         "SELECT o.id, o.customer, sub.amount \
          FROM lsq_od_orders o, \
@@ -277,7 +277,7 @@ async fn test_lateral_subquery_differential_outer_delete() {
 
     // Delete outer row → all expanded rows for that outer row removed
     db.execute("DELETE FROM lsq_od_orders WHERE id = 1").await;
-    db.refresh_dt("lsq_od_top").await;
+    db.refresh_st("lsq_od_top").await;
 
     assert_eq!(db.count("public.lsq_od_top").await, 1);
 
@@ -300,7 +300,7 @@ async fn test_lateral_subquery_left_join_differential() {
     db.execute("INSERT INTO lsq_lj_emps VALUES (1, 1, 100)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_lj_stats",
         "SELECT d.id, d.name, stats.total \
          FROM lsq_lj_depts d \
@@ -329,7 +329,7 @@ async fn test_lateral_subquery_left_join_differential() {
     // Add new dept → should appear in ST after refresh
     db.execute("INSERT INTO lsq_lj_depts VALUES (3, 'Marketing')")
         .await;
-    db.refresh_dt("lsq_lj_stats").await;
+    db.refresh_st("lsq_lj_stats").await;
 
     assert_eq!(db.count("public.lsq_lj_stats").await, 3);
 }
@@ -347,7 +347,7 @@ async fn test_lateral_subquery_differential_mixed_dml() {
     db.execute("INSERT INTO lsq_mx_items VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_mx_top",
         "SELECT o.id, o.customer, sub.amount \
          FROM lsq_mx_orders o, \
@@ -367,7 +367,7 @@ async fn test_lateral_subquery_differential_mixed_dml() {
     db.execute("UPDATE lsq_mx_orders SET customer = 'Bobby' WHERE id = 2")
         .await;
     db.execute("DELETE FROM lsq_mx_orders WHERE id = 1").await;
-    db.refresh_dt("lsq_mx_top").await;
+    db.refresh_st("lsq_mx_top").await;
 
     assert_eq!(db.count("public.lsq_mx_top").await, 3);
 
@@ -398,7 +398,7 @@ async fn test_lateral_subquery_multi_row_result() {
     db.execute("INSERT INTO lsq_mr_child VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c')")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_mr_expanded",
         "SELECT p.id, p.name, sub.val \
          FROM lsq_mr_parent p, \
@@ -427,8 +427,8 @@ async fn test_lateral_subquery_empty_result_cross_join() {
     db.execute("INSERT INTO lsq_empty_child VALUES (1, 1, 'x')")
         .await;
 
-    db.create_dt(
-        "lsq_empty_dt",
+    db.create_st(
+        "lsq_empty_st",
         "SELECT p.id, p.name, sub.val \
          FROM lsq_empty_parent p, \
          LATERAL (SELECT c.val FROM lsq_empty_child c \
@@ -439,10 +439,10 @@ async fn test_lateral_subquery_empty_result_cross_join() {
     .await;
 
     // Only 'HasChild' should appear (CROSS JOIN excludes empty results)
-    assert_eq!(db.count("public.lsq_empty_dt").await, 1);
+    assert_eq!(db.count("public.lsq_empty_st").await, 1);
 
     let name: String = db
-        .query_scalar("SELECT name FROM public.lsq_empty_dt")
+        .query_scalar("SELECT name FROM public.lsq_empty_st")
         .await;
     assert_eq!(name, "HasChild");
 }
@@ -467,7 +467,7 @@ async fn test_lateral_subquery_with_group_by() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "lsq_gb_summary",
         "SELECT o.id, o.customer, sub.category, sub.total \
          FROM lsq_gb_orders o, \

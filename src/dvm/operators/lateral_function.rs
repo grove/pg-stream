@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_basic() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "parent", "public", "p", &["id", "data"]);
         let tree = lateral_func(
             "jsonb_array_elements(p.data->'children')",
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_with_ordinality() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "arr"]);
         let tree = lateral_func(
             "jsonb_array_elements(t.arr)",
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_no_column_aliases() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "tags"]);
         let tree = lateral_func("unnest(t.tags)", "tag", vec![], false, child);
         let result = diff_lateral_function(&mut ctx, &tree).unwrap();
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_multi_column_srf() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "props"]);
         let tree = lateral_func(
             "jsonb_each(t.props)",
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_old_rows_reexpands_with_delete_action() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "parent", "public", "p", &["id", "data"]);
         let tree = lateral_func(
             "jsonb_array_elements(p.data)",
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_expand_filters_inserts() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "data"]);
         let tree = lateral_func(
             "jsonb_array_elements(t.data)",
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_uses_lateral_keyword() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "data"]);
         let tree = lateral_func(
             "jsonb_array_elements(t.data)",
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_not_deduplicated() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "arr"]);
         let tree = lateral_func(
             "jsonb_array_elements(t.arr)",
@@ -380,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_error_on_non_lateral_node() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_lateral_function(&mut ctx, &tree);
         assert!(result.is_err());
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_function_hash_includes_all_columns() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "data"]);
         let tree = lateral_func(
             "jsonb_array_elements(t.data)",

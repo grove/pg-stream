@@ -8,7 +8,7 @@
 //! `cargo bench --no-default-features --features pg18` or just unit benchmarks).
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use pg_stream::dag::{DagNode, DtDag, DtStatus, NodeId};
+use pg_stream::dag::{DagNode, NodeId, StDag, StStatus};
 use pg_stream::dvm::diff::{col_list, prefixed_col_list, quote_ident};
 use pg_stream::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree};
 use pg_stream::version::{Frontier, lsn_gt, select_canonical_period_secs};
@@ -302,14 +302,14 @@ fn bench_dag_operations(c: &mut Criterion) {
             &n_nodes,
             |b, &n| {
                 b.iter(|| {
-                    let mut dag = DtDag::new();
+                    let mut dag = StDag::new();
                     for id in 1..=n as i64 {
                         dag.add_dt_node(DagNode {
                             id: NodeId::StreamTable(id),
                             schedule: Some(Duration::from_secs(60)),
                             effective_schedule: Duration::from_secs(60),
-                            name: format!("dt_{id}"),
-                            status: DtStatus::Active,
+                            name: format!("st_{id}"),
+                            status: StStatus::Active,
                             schedule_raw: None,
                         });
                     }

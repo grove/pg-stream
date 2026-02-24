@@ -234,7 +234,7 @@ WITH __pgs_changed_groups AS (
     SELECT * FROM __pgs_cte_agg_final_N
     WHERE __pgs_action IN ('I', 'D')  -- already done
 )
-MERGE INTO dt USING __pgs_changed_groups ...
+MERGE INTO st USING __pgs_changed_groups ...
 ```
 
 This is already present (the `WHERE ... IS DISTINCT FROM` guard). The issue may be that PostgreSQL MERGE evaluates all matched rows even when the WHEN clause filters them. Consider splitting to `DELETE + INSERT` with pre-filtered CTEs instead of MERGE.
@@ -249,8 +249,8 @@ This is already present (the `WHERE ... IS DISTINCT FROM` guard). The issue may 
 
 ```sql
 -- Instead of one MERGE with 10K rows:
-MERGE INTO dt USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 0) ...
-MERGE INTO dt USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 1) ...
+MERGE INTO st USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 0) ...
+MERGE INTO st USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 1) ...
 -- etc.
 ```
 
@@ -264,8 +264,8 @@ MERGE INTO dt USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 1) ...
 
 **Fix**: When delta covers >25% of stream table rows, use:
 ```sql
-DELETE FROM dt WHERE (key_cols) IN (SELECT key_cols FROM delta);
-INSERT INTO dt SELECT ... FROM delta WHERE __pgs_action = 'I';
+DELETE FROM st WHERE (key_cols) IN (SELECT key_cols FROM delta);
+INSERT INTO st SELECT ... FROM delta WHERE __pgs_action = 'I';
 ```
 
 **Effort**: 2 hours. **Impact**: Potentially significant at 50% — eliminates MERGE planning overhead. Risk: two statements vs one.
@@ -383,7 +383,7 @@ SPI prepared statements (Session 5, D-2).
 **A-3: Adaptive threshold bug** — ✅ FIXED. `last_full_ms` was never set during
 initial materialization, keeping it NULL forever for STs whose change rate
 never exceeded the 15% fallback threshold. The auto-tuner code (`if let
-Some(last_full) = dt.last_full_ms`) was dead code for these STs. Fixed by
+Some(last_full) = st.last_full_ms`) was dead code for these STs. Fixed by
 recording the initial materialization time as `last_full_ms` during
 `create_stream_table`. This enables the auto-tuner from the first differential
 refresh onward, which will correctly lower the threshold for scenarios like
@@ -432,7 +432,7 @@ Also added debug logging when the auto-tuner adjusts the threshold.
 **B-1: IS DISTINCT FROM guard to skip no-op UPDATEs**
 - Added `IS DISTINCT FROM` check on the MERGE `WHEN MATCHED ... THEN UPDATE`
   clause so unchanged rows are skipped entirely (no heap write)
-- The guard is: `AND (dt.col1 IS DISTINCT FROM d.col1 OR dt.col2 IS DISTINCT FROM d.col2 OR ...)`
+- The guard is: `AND (st.col1 IS DISTINCT FROM d.col1 OR st.col2 IS DISTINCT FROM d.col2 OR ...)`
 - Applied in both the `prewarm_merge_cache` path and the cache-miss build path
 - **Expected outcome**: Eliminates unnecessary I/O for aggregate groups whose
   recomputed values are identical to the current values
@@ -442,8 +442,8 @@ Also added debug logging when the auto-tuner adjusts the threshold.
 - In `auto` mode (default), switches to DELETE+INSERT when the estimated delta
   exceeds 25% of the source table row count (`MERGE_STRATEGY_AUTO_THRESHOLD`)
 - DELETE+INSERT is two statements:
-  1. `DELETE FROM dt WHERE __pgs_row_id IN (SELECT __pgs_row_id FROM delta)`
-  2. `INSERT INTO dt SELECT ... FROM delta WHERE __pgs_action = 'I'`
+  1. `DELETE FROM st WHERE __pgs_row_id IN (SELECT __pgs_row_id FROM delta)`
+  2. `INSERT INTO st SELECT ... FROM delta WHERE __pgs_action = 'I'`
 - Both MERGE and DELETE+INSERT templates are cached alongside each other in
   `CachedMergeTemplate`, with strategy selection at execution time
 - Profiling line now includes `strategy=merge|delete_insert` field

@@ -18,8 +18,8 @@ async fn test_drop_source_fires_event_trigger() {
     db.execute("INSERT INTO evt_drop_src VALUES (1, 'data')")
         .await;
 
-    db.create_dt(
-        "evt_drop_dt",
+    db.create_st(
+        "evt_drop_st",
         "SELECT id, val FROM evt_drop_src",
         "1m",
         "FULL",
@@ -53,16 +53,16 @@ async fn test_drop_source_fires_event_trigger() {
     if result.is_ok() {
         // If allowed, the ST catalog entry may still exist with status=ERROR,
         // or the storage table may have been cascade-dropped too (cleaning up the catalog).
-        let dt_count: i64 = db
+        let st_count: i64 = db
             .query_scalar(
-                "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_drop_dt'",
+                "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_drop_st'",
             )
             .await;
-        if dt_count > 0 {
+        if st_count > 0 {
             // The event trigger sets status to ERROR when a source is dropped
             let status: String = db
                 .query_scalar(
-                    "SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_drop_dt'",
+                    "SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_drop_st'",
                 )
                 .await;
             assert_eq!(
@@ -70,7 +70,7 @@ async fn test_drop_source_fires_event_trigger() {
                 "ST should be set to ERROR after source drop"
             );
         }
-        // If dt_count == 0, CASCADE dropped the storage table too,
+        // If st_count == 0, CASCADE dropped the storage table too,
         // and the drop event trigger cleaned up the catalog — also valid.
     }
     // If result is Err, the extension prevented the drop — that's valid too
@@ -85,8 +85,8 @@ async fn test_alter_source_fires_event_trigger() {
     db.execute("INSERT INTO evt_alter_src VALUES (1, 'data')")
         .await;
 
-    db.create_dt(
-        "evt_alter_dt",
+    db.create_st(
+        "evt_alter_st",
         "SELECT id, val FROM evt_alter_src",
         "1m",
         "FULL",
@@ -98,7 +98,7 @@ async fn test_alter_source_fires_event_trigger() {
         .await;
 
     // ST should still be queryable (the added column isn't part of the defining query)
-    let count = db.count("public.evt_alter_dt").await;
+    let count = db.count("public.evt_alter_st").await;
     assert_eq!(count, 1, "ST should still be valid after compatible ALTER");
 }
 
@@ -110,8 +110,8 @@ async fn test_drop_dt_storage_by_sql() {
         .await;
     db.execute("INSERT INTO evt_storage_src VALUES (1)").await;
 
-    db.create_dt(
-        "evt_storage_dt",
+    db.create_st(
+        "evt_storage_st",
         "SELECT id FROM evt_storage_src",
         "1m",
         "FULL",
@@ -120,7 +120,7 @@ async fn test_drop_dt_storage_by_sql() {
 
     // Drop the ST storage table directly (bypassing pgstream.drop_stream_table)
     let result = db
-        .try_execute("DROP TABLE public.evt_storage_dt CASCADE")
+        .try_execute("DROP TABLE public.evt_storage_st CASCADE")
         .await;
 
     if result.is_ok() {
@@ -130,7 +130,7 @@ async fn test_drop_dt_storage_by_sql() {
 
         let cat_count: i64 = db
             .query_scalar(
-                "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_storage_dt'",
+                "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_storage_st'",
             )
             .await;
         assert_eq!(
@@ -150,8 +150,8 @@ async fn test_rename_source_table() {
     db.execute("INSERT INTO evt_rename_src VALUES (1, 'data')")
         .await;
 
-    db.create_dt(
-        "evt_rename_dt",
+    db.create_st(
+        "evt_rename_st",
         "SELECT id, val FROM evt_rename_src",
         "1m",
         "FULL",
@@ -166,7 +166,7 @@ async fn test_rename_source_table() {
     // The defining query still references 'evt_rename_src' which is now gone.
     // Refresh should reveal the problem.
     let result = db
-        .try_execute("SELECT pgstream.refresh_stream_table('evt_rename_dt')")
+        .try_execute("SELECT pgstream.refresh_stream_table('evt_rename_st')")
         .await;
 
     // After renaming source, refresh with old name should fail

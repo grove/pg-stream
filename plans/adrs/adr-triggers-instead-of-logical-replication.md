@@ -31,7 +31,7 @@ The `create_stream_table()` function must atomically perform these operations in
 
 1. Validate the defining query
 2. Create the materialised storage table
-3. Create catalog entries in `pg_stream.dt_catalog`, `pg_stream.pgs_dependencies`, `pg_stream.pgs_change_tracking`
+3. Create catalog entries in `pg_stream.st_catalog`, `pg_stream.pgs_dependencies`, `pg_stream.pgs_change_tracking`
 4. Create change buffer tables
 5. **Set up CDC** on each source table
 6. Perform the initial full refresh
@@ -263,7 +263,7 @@ This produces ~6000 buffer rows per interval — trivial for PostgreSQL. The `DE
 ### Neutral
 
 1. **Buffer table disk usage**: Proportional to change rate × refresh interval. Automatically cleaned after each refresh.
-2. **Monitoring changes**: The `pg_stream.dt_slot_health` view was updated to report trigger health instead of replication slot health. The monitoring abstraction remains the same.
+2. **Monitoring changes**: The `pg_stream.st_slot_health` view was updated to report trigger health instead of replication slot health. The monitoring abstraction remains the same.
 
 ---
 

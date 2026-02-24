@@ -20,11 +20,11 @@ async fn test_crash_recovery_marks_running_as_failed() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status)
          VALUES
-            ((SELECT 'src_crash'::regclass::oid), 'crash_dt', 'public', 'SELECT 1', 'FULL', 'ACTIVE')"
+            ((SELECT 'src_crash'::regclass::oid), 'crash_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE')"
     ).await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'crash_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'crash_st'")
         .await;
 
     // Simulate interrupted refreshes by inserting RUNNING records
@@ -123,11 +123,11 @@ async fn test_error_escalation_to_suspension() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status, consecutive_errors)
          VALUES
-            ((SELECT 'src_err'::regclass::oid), 'err_dt', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 0)"
+            ((SELECT 'src_err'::regclass::oid), 'err_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 0)"
     ).await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'err_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'err_st'")
         .await;
 
     // Simulate incrementing consecutive errors (like increment_errors does)
@@ -172,11 +172,11 @@ async fn test_error_count_resets_on_success() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status, consecutive_errors)
          VALUES
-            ((SELECT 'src_reset'::regclass::oid), 'reset_dt', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 2)"
+            ((SELECT 'src_reset'::regclass::oid), 'reset_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 2)"
     ).await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'reset_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'reset_st'")
         .await;
 
     // Simulate successful refresh — reset errors
@@ -206,11 +206,11 @@ async fn test_needs_reinit_lifecycle() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status, needs_reinit)
          VALUES
-            ((SELECT 'src_reinit'::regclass::oid), 'reinit_dt', 'public', 'SELECT 1', 'FULL', 'ACTIVE', FALSE)"
+            ((SELECT 'src_reinit'::regclass::oid), 'reinit_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE', FALSE)"
     ).await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'reinit_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'reinit_st'")
         .await;
 
     // Mark for reinitialize (simulating upstream schema change)
@@ -259,11 +259,11 @@ async fn test_refresh_history_status_transitions() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status)
          VALUES
-            ((SELECT 'src_trans'::regclass::oid), 'trans_dt', 'public', 'SELECT 1', 'FULL', 'ACTIVE')"
+            ((SELECT 'src_trans'::regclass::oid), 'trans_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE')"
     ).await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'trans_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'trans_st'")
         .await;
 
     // Insert a RUNNING record
@@ -306,7 +306,7 @@ async fn test_refresh_history_status_transitions() {
 
 /// Test that error handling for one ST doesn't affect others.
 #[tokio::test]
-async fn test_error_handling_independent_per_dt() {
+async fn test_error_handling_independent_per_st() {
     let db = TestDb::with_catalog().await;
     db.execute("CREATE TABLE src_ind1 (id int)").await;
     db.execute("CREATE TABLE src_ind2 (id int)").await;
@@ -315,8 +315,8 @@ async fn test_error_handling_independent_per_dt() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status, consecutive_errors)
          VALUES
-            ((SELECT 'src_ind1'::regclass::oid), 'dt_ok', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 0),
-            ((SELECT 'src_ind2'::regclass::oid), 'dt_bad', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 3)"
+            ((SELECT 'src_ind1'::regclass::oid), 'st_ok', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 0),
+            ((SELECT 'src_ind2'::regclass::oid), 'st_bad', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 3)"
     ).await;
 
     // Suspend only the one with max errors
@@ -327,12 +327,12 @@ async fn test_error_handling_independent_per_dt() {
     .await;
 
     let ok_status: String = db
-        .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_ok'")
+        .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_ok'")
         .await;
     assert_eq!(ok_status, "ACTIVE");
 
     let bad_status: String = db
-        .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_bad'")
+        .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_bad'")
         .await;
     assert_eq!(bad_status, "SUSPENDED");
 }

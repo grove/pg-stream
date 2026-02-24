@@ -40,10 +40,10 @@ pub fn diff_intersect(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .collect();
     let row_id_expr = build_hash_expr(&hash_exprs);
 
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .clone()
-        .unwrap_or_else(|| "/* dt_table */".to_string());
+        .unwrap_or_else(|| "/* st_table */".to_string());
 
     // CTE 1: Combine deltas from both branches, tagged with branch indicator
     let delta_cte = ctx.next_cte_name("isect_delta");
@@ -83,7 +83,7 @@ pub fn diff_intersect(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
          COALESCE(st.__pgs_count_l, 0) AS old_count_l,\n\
          COALESCE(st.__pgs_count_r, 0) AS old_count_r\n\
          FROM {delta_cte} d\n\
-         LEFT JOIN {dt_table} st ON st.__pgs_row_id = d.__pgs_row_id\n\
+         LEFT JOIN {st_table} st ON st.__pgs_row_id = d.__pgs_row_id\n\
          GROUP BY d.__pgs_row_id, {d_cols}, st.__pgs_count_l, st.__pgs_count_r",
     );
     ctx.add_cte(merge_cte.clone(), merge_sql);
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_basic() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let left = scan(1, "a", "public", "a", &["name"]);
         let right = scan(2, "b", "public", "b", &["name"]);
         let tree = intersect(left, right, false);
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_boundary_crossings() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["val"]);
         let right = scan(2, "b", "public", "b", &["val"]);
         let tree = intersect(left, right, false);
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_all_basic() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = intersect(left, right, true);
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_output_columns_include_dual_counts() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["id", "name"]);
         let right = scan(2, "b", "public", "b", &["id", "name"]);
         let tree = intersect(left, right, false);
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_hash_row_id() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = intersect(left, right, false);
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_not_deduplicated() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = intersect(left, right, false);
@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_error_on_non_intersect_node() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_intersect(&mut ctx, &tree);
         assert!(result.is_err());
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_branch_tagging() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["val"]);
         let right = scan(2, "b", "public", "b", &["val"]);
         let tree = intersect(left, right, false);
@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_multi_column() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["id", "name", "status"]);
         let right = scan(2, "b", "public", "b", &["id", "name", "status"]);
         let tree = intersect(left, right, false);
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_storage_table_join() {
-        let mut ctx = test_ctx_with_dt("myschema", "my_stream");
+        let mut ctx = test_ctx_with_st("myschema", "my_stream");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = intersect(left, right, false);
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_delete_action_zeros_counts() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = intersect(left, right, false);
@@ -331,7 +331,7 @@ mod tests {
     fn test_diff_intersect_all_update_on_count_change() {
         // INTERSECT ALL should emit an update (as INSERT) when counts change
         // but the row is still present in both branches
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = intersect(left, right, true);
@@ -347,7 +347,7 @@ mod tests {
 
     #[test]
     fn test_diff_intersect_net_count_aggregation() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = intersect(left, right, false);
@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn test_diff_intersect_set_and_all_produce_same_structure() {
         // Both INTERSECT and INTERSECT ALL use LEAST-based boundary detection
-        let mut ctx_set = test_ctx_with_dt("public", "dt");
+        let mut ctx_set = test_ctx_with_st("public", "st");
         let tree_set = intersect(
             scan(1, "a", "public", "a", &["x"]),
             scan(2, "b", "public", "b", &["x"]),
@@ -373,7 +373,7 @@ mod tests {
         let r_set = diff_intersect(&mut ctx_set, &tree_set).unwrap();
         let sql_set = ctx_set.build_with_query(&r_set.cte_name);
 
-        let mut ctx_all = test_ctx_with_dt("public", "dt");
+        let mut ctx_all = test_ctx_with_st("public", "st");
         let tree_all = intersect(
             scan(1, "a", "public", "a", &["x"]),
             scan(2, "b", "public", "b", &["x"]),

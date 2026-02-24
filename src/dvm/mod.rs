@@ -43,7 +43,7 @@
 //!     &prev_frontier,
 //!     &new_frontier,
 //!     "myschema",
-//!     "my_dt",
+//!     "my_st",
 //! )?;
 //! let delta_sql = result.delta_sql;
 //! let columns = result.output_columns;
@@ -237,13 +237,13 @@ pub fn generate_delta_query(
     // Step 3: Generate the delta query.
     // Use differentiate_with_columns() to get the diff result's column list,
     // which includes auxiliary columns (e.g. __pgs_count) for aggregate/distinct.
-    let dt_user_cols = result.tree.output_columns();
+    let st_user_cols = result.tree.output_columns();
     let is_scan_chain = is_scan_chain_tree(&result.tree);
     let mut ctx = DiffContext::new(prev_frontier.clone(), new_frontier.clone())
         .with_pgs_name(pgs_schema, pgs_name)
         .with_cte_registry(result.cte_registry)
         .with_defining_query(defining_query);
-    ctx.dt_user_columns = Some(dt_user_cols);
+    ctx.st_user_columns = Some(st_user_cols);
     ctx.merge_safe_dedup = is_scan_chain;
     let (delta_sql, output_columns, diff_dedup) = ctx.differentiate_with_columns(&result.tree)?;
 
@@ -313,13 +313,13 @@ pub fn generate_delta_query_cached(
     // Generate template with placeholder tokens instead of literal LSNs.
     // Use dummy frontiers — the actual LSN values come from placeholders.
     let is_scan_chain = is_scan_chain_tree(&result.tree);
-    let dt_user_cols = result.tree.output_columns();
+    let st_user_cols = result.tree.output_columns();
     let mut ctx = DiffContext::new(Frontier::new(), Frontier::new())
         .with_placeholders()
         .with_pgs_name(pgs_schema, pgs_name)
         .with_cte_registry(result.cte_registry)
         .with_defining_query(defining_query);
-    ctx.dt_user_columns = Some(dt_user_cols);
+    ctx.st_user_columns = Some(st_user_cols);
     ctx.merge_safe_dedup = is_scan_chain;
     let (template_sql, output_columns, diff_dedup) =
         ctx.differentiate_with_columns(&result.tree)?;

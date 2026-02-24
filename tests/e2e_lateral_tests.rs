@@ -27,7 +27,7 @@ async fn test_lateral_jsonb_array_elements_full_mode() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "lat_flat_full",
         "SELECT p.id, child.value AS val \
          FROM lat_parent p, \
@@ -60,7 +60,7 @@ async fn test_lateral_jsonb_each_full_mode() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "lat_kv_full",
         "SELECT d.id, kv.key, kv.value \
          FROM lat_kv d, \
@@ -87,7 +87,7 @@ async fn test_lateral_unnest_full_mode() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "lat_tags_full",
         "SELECT t.id, tag.tag \
          FROM lat_tags t, \
@@ -110,7 +110,7 @@ async fn test_lateral_with_where_clause_full() {
     db.execute("INSERT INTO lat_arr VALUES (1, '[10, 20, 30, 5]')")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "lat_filtered_full",
         "SELECT a.id, (e.value)::int AS val \
          FROM lat_arr a, \
@@ -133,8 +133,8 @@ async fn test_lateral_full_refresh_picks_up_changes() {
         .await;
     db.execute("INSERT INTO lat_fr VALUES (1, '[1, 2]')").await;
 
-    db.create_dt(
-        "lat_fr_dt",
+    db.create_st(
+        "lat_fr_st",
         "SELECT f.id, e.value AS val \
          FROM lat_fr f, \
          jsonb_array_elements(f.data) AS e",
@@ -142,14 +142,14 @@ async fn test_lateral_full_refresh_picks_up_changes() {
         "FULL",
     )
     .await;
-    assert_eq!(db.count("public.lat_fr_dt").await, 2);
+    assert_eq!(db.count("public.lat_fr_st").await, 2);
 
     // Add more elements
     db.execute("UPDATE lat_fr SET data = '[1, 2, 3, 4]' WHERE id = 1")
         .await;
-    db.refresh_dt("lat_fr_dt").await;
+    db.refresh_st("lat_fr_st").await;
 
-    assert_eq!(db.count("public.lat_fr_dt").await, 4);
+    assert_eq!(db.count("public.lat_fr_st").await, 4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -169,8 +169,8 @@ async fn test_lateral_jsonb_array_elements_differential() {
     )
     .await;
 
-    db.create_dt(
-        "lat_diff_dt",
+    db.create_st(
+        "lat_diff_st",
         "SELECT d.id, e.value AS val \
          FROM lat_diff d, \
          jsonb_array_elements(d.data) AS e",
@@ -179,14 +179,14 @@ async fn test_lateral_jsonb_array_elements_differential() {
     )
     .await;
 
-    let (status, mode, populated, errors) = db.pgs_status("lat_diff_dt").await;
+    let (status, mode, populated, errors) = db.pgs_status("lat_diff_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "DIFFERENTIAL");
     assert!(populated);
     assert_eq!(errors, 0);
 
     // 2 elements for id=1 + 1 for id=2 = 3 rows
-    assert_eq!(db.count("public.lat_diff_dt").await, 3);
+    assert_eq!(db.count("public.lat_diff_st").await, 3);
 }
 
 #[tokio::test]
@@ -198,8 +198,8 @@ async fn test_lateral_differential_insert() {
     db.execute("INSERT INTO lat_dins VALUES (1, '[1, 2]')")
         .await;
 
-    db.create_dt(
-        "lat_dins_dt",
+    db.create_st(
+        "lat_dins_st",
         "SELECT d.id, e.value AS val \
          FROM lat_dins d, \
          jsonb_array_elements(d.data) AS e",
@@ -207,19 +207,19 @@ async fn test_lateral_differential_insert() {
         "DIFFERENTIAL",
     )
     .await;
-    assert_eq!(db.count("public.lat_dins_dt").await, 2);
+    assert_eq!(db.count("public.lat_dins_st").await, 2);
 
     // Insert a new source row with 3 elements
     db.execute("INSERT INTO lat_dins VALUES (2, '[10, 20, 30]')")
         .await;
-    db.refresh_dt("lat_dins_dt").await;
+    db.refresh_st("lat_dins_st").await;
 
     // Should now have 2 + 3 = 5 rows
-    assert_eq!(db.count("public.lat_dins_dt").await, 5);
+    assert_eq!(db.count("public.lat_dins_st").await, 5);
 
     // Verify data matches the defining query
-    db.assert_dt_matches_query(
-        "public.lat_dins_dt",
+    db.assert_st_matches_query(
+        "public.lat_dins_st",
         "SELECT d.id, e.value AS val FROM lat_dins d, jsonb_array_elements(d.data) AS e",
     )
     .await;
@@ -238,8 +238,8 @@ async fn test_lateral_differential_delete() {
     )
     .await;
 
-    db.create_dt(
-        "lat_ddel_dt",
+    db.create_st(
+        "lat_ddel_st",
         "SELECT d.id, e.value AS val \
          FROM lat_ddel d, \
          jsonb_array_elements(d.data) AS e",
@@ -247,16 +247,16 @@ async fn test_lateral_differential_delete() {
         "DIFFERENTIAL",
     )
     .await;
-    assert_eq!(db.count("public.lat_ddel_dt").await, 5);
+    assert_eq!(db.count("public.lat_ddel_st").await, 5);
 
     // Delete source row id=2 → its 3 expanded rows should disappear
     db.execute("DELETE FROM lat_ddel WHERE id = 2").await;
-    db.refresh_dt("lat_ddel_dt").await;
+    db.refresh_st("lat_ddel_st").await;
 
-    assert_eq!(db.count("public.lat_ddel_dt").await, 2);
+    assert_eq!(db.count("public.lat_ddel_st").await, 2);
 
-    db.assert_dt_matches_query(
-        "public.lat_ddel_dt",
+    db.assert_st_matches_query(
+        "public.lat_ddel_st",
         "SELECT d.id, e.value AS val FROM lat_ddel d, jsonb_array_elements(d.data) AS e",
     )
     .await;
@@ -271,8 +271,8 @@ async fn test_lateral_differential_update_array() {
     db.execute("INSERT INTO lat_dupd VALUES (1, '[1, 2, 3]')")
         .await;
 
-    db.create_dt(
-        "lat_dupd_dt",
+    db.create_st(
+        "lat_dupd_st",
         "SELECT d.id, e.value AS val \
          FROM lat_dupd d, \
          jsonb_array_elements(d.data) AS e",
@@ -280,18 +280,18 @@ async fn test_lateral_differential_update_array() {
         "DIFFERENTIAL",
     )
     .await;
-    assert_eq!(db.count("public.lat_dupd_dt").await, 3);
+    assert_eq!(db.count("public.lat_dupd_st").await, 3);
 
     // Update the array: old [1,2,3] → new [10, 20]
     db.execute("UPDATE lat_dupd SET data = '[10, 20]' WHERE id = 1")
         .await;
-    db.refresh_dt("lat_dupd_dt").await;
+    db.refresh_st("lat_dupd_st").await;
 
     // Should now have 2 rows instead of 3
-    assert_eq!(db.count("public.lat_dupd_dt").await, 2);
+    assert_eq!(db.count("public.lat_dupd_st").await, 2);
 
-    db.assert_dt_matches_query(
-        "public.lat_dupd_dt",
+    db.assert_st_matches_query(
+        "public.lat_dupd_st",
         "SELECT d.id, e.value AS val FROM lat_dupd d, jsonb_array_elements(d.data) AS e",
     )
     .await;
@@ -311,8 +311,8 @@ async fn test_lateral_differential_mixed_dml() {
     )
     .await;
 
-    db.create_dt(
-        "lat_dmix_dt",
+    db.create_st(
+        "lat_dmix_st",
         "SELECT d.id, e.value AS val \
          FROM lat_dmix d, \
          jsonb_array_elements(d.data) AS e",
@@ -320,7 +320,7 @@ async fn test_lateral_differential_mixed_dml() {
         "DIFFERENTIAL",
     )
     .await;
-    assert_eq!(db.count("public.lat_dmix_dt").await, 6);
+    assert_eq!(db.count("public.lat_dmix_st").await, 6);
 
     // Mixed DML in one batch
     db.execute("INSERT INTO lat_dmix VALUES (4, '[7, 8]')")
@@ -329,17 +329,17 @@ async fn test_lateral_differential_mixed_dml() {
         .await;
     db.execute("DELETE FROM lat_dmix WHERE id = 2").await;
 
-    db.refresh_dt("lat_dmix_dt").await;
+    db.refresh_st("lat_dmix_st").await;
 
     // id=1: was 2 elements → now 1 element (10)
     // id=2: deleted → 0 elements
     // id=3: unchanged → 3 elements
     // id=4: new → 2 elements (7, 8)
     // Total: 1 + 0 + 3 + 2 = 6
-    assert_eq!(db.count("public.lat_dmix_dt").await, 6);
+    assert_eq!(db.count("public.lat_dmix_st").await, 6);
 
-    db.assert_dt_matches_query(
-        "public.lat_dmix_dt",
+    db.assert_st_matches_query(
+        "public.lat_dmix_st",
         "SELECT d.id, e.value AS val FROM lat_dmix d, jsonb_array_elements(d.data) AS e",
     )
     .await;
@@ -358,8 +358,8 @@ async fn test_lateral_differential_empty_array() {
     )
     .await;
 
-    db.create_dt(
-        "lat_empty_dt",
+    db.create_st(
+        "lat_empty_st",
         "SELECT d.id, e.value AS val \
          FROM lat_empty d, \
          jsonb_array_elements(d.data) AS e",
@@ -369,17 +369,17 @@ async fn test_lateral_differential_empty_array() {
     .await;
 
     // id=2 has empty array → produces no rows
-    assert_eq!(db.count("public.lat_empty_dt").await, 2);
+    assert_eq!(db.count("public.lat_empty_st").await, 2);
 
     // Update id=2 to have elements
     db.execute("UPDATE lat_empty SET data = '[3, 4]' WHERE id = 2")
         .await;
-    db.refresh_dt("lat_empty_dt").await;
+    db.refresh_st("lat_empty_st").await;
 
-    assert_eq!(db.count("public.lat_empty_dt").await, 4);
+    assert_eq!(db.count("public.lat_empty_st").await, 4);
 
-    db.assert_dt_matches_query(
-        "public.lat_empty_dt",
+    db.assert_st_matches_query(
+        "public.lat_empty_st",
         "SELECT d.id, e.value AS val FROM lat_empty d, jsonb_array_elements(d.data) AS e",
     )
     .await;
@@ -398,8 +398,8 @@ async fn test_lateral_unnest_differential() {
     )
     .await;
 
-    db.create_dt(
-        "lat_utags_dt",
+    db.create_st(
+        "lat_utags_st",
         "SELECT t.id, tag.tag \
          FROM lat_utags t, \
          unnest(t.tags) AS tag(tag)",
@@ -407,17 +407,17 @@ async fn test_lateral_unnest_differential() {
         "DIFFERENTIAL",
     )
     .await;
-    assert_eq!(db.count("public.lat_utags_dt").await, 3);
+    assert_eq!(db.count("public.lat_utags_st").await, 3);
 
     // Add more tags
     db.execute("UPDATE lat_utags SET tags = ARRAY['rust', 'postgres', 'pgrx'] WHERE id = 1")
         .await;
-    db.refresh_dt("lat_utags_dt").await;
+    db.refresh_st("lat_utags_st").await;
 
-    assert_eq!(db.count("public.lat_utags_dt").await, 4);
+    assert_eq!(db.count("public.lat_utags_st").await, 4);
 
-    db.assert_dt_matches_query(
-        "public.lat_utags_dt",
+    db.assert_st_matches_query(
+        "public.lat_utags_st",
         "SELECT t.id, tag.tag FROM lat_utags t, unnest(t.tags) AS tag(tag)",
     )
     .await;
@@ -436,8 +436,8 @@ async fn test_lateral_jsonb_each_differential() {
     )
     .await;
 
-    db.create_dt(
-        "lat_dkv_dt",
+    db.create_st(
+        "lat_dkv_st",
         "SELECT d.id, kv.key, kv.value \
          FROM lat_dkv d, \
          jsonb_each(d.props) AS kv",
@@ -445,19 +445,19 @@ async fn test_lateral_jsonb_each_differential() {
         "DIFFERENTIAL",
     )
     .await;
-    assert_eq!(db.count("public.lat_dkv_dt").await, 3);
+    assert_eq!(db.count("public.lat_dkv_st").await, 3);
 
     // Add a property to id=2
     db.execute(
         "UPDATE lat_dkv SET props = '{\"shape\": \"round\", \"weight\": \"heavy\"}' WHERE id = 2",
     )
     .await;
-    db.refresh_dt("lat_dkv_dt").await;
+    db.refresh_st("lat_dkv_st").await;
 
-    assert_eq!(db.count("public.lat_dkv_dt").await, 4);
+    assert_eq!(db.count("public.lat_dkv_st").await, 4);
 
-    db.assert_dt_matches_query(
-        "public.lat_dkv_dt",
+    db.assert_st_matches_query(
+        "public.lat_dkv_st",
         "SELECT d.id, kv.key, kv.value FROM lat_dkv d, jsonb_each(d.props) AS kv",
     )
     .await;
@@ -472,8 +472,8 @@ async fn test_lateral_with_where_clause_differential() {
     db.execute("INSERT INTO lat_filt VALUES (1, '[5, 15, 25]'), (2, '[10, 30]')")
         .await;
 
-    db.create_dt(
-        "lat_filt_dt",
+    db.create_st(
+        "lat_filt_st",
         "SELECT f.id, (e.value)::int AS val \
          FROM lat_filt f, \
          jsonb_array_elements(f.data) AS e \
@@ -484,18 +484,18 @@ async fn test_lateral_with_where_clause_differential() {
     .await;
 
     // id=1: 15, 25 pass filter → 2 rows; id=2: 30 passes → 1 row; total 3
-    assert_eq!(db.count("public.lat_filt_dt").await, 3);
+    assert_eq!(db.count("public.lat_filt_st").await, 3);
 
     // Update id=1 to have higher values
     db.execute("UPDATE lat_filt SET data = '[20, 30, 40]' WHERE id = 1")
         .await;
-    db.refresh_dt("lat_filt_dt").await;
+    db.refresh_st("lat_filt_st").await;
 
     // id=1: all pass → 3 rows; id=2: unchanged → 1 row; total 4
-    assert_eq!(db.count("public.lat_filt_dt").await, 4);
+    assert_eq!(db.count("public.lat_filt_st").await, 4);
 
-    db.assert_dt_matches_query(
-        "public.lat_filt_dt",
+    db.assert_st_matches_query(
+        "public.lat_filt_st",
         "SELECT f.id, (e.value)::int AS val FROM lat_filt f, jsonb_array_elements(f.data) AS e WHERE (e.value)::int > 12",
     )
     .await;
@@ -515,8 +515,8 @@ async fn test_lateral_with_aggregation_full() {
     .await;
 
     // SRF expansion + aggregation: count elements per parent
-    db.create_dt(
-        "lat_agg_dt",
+    db.create_st(
+        "lat_agg_st",
         "SELECT a.id, count(*) AS elem_count \
          FROM lat_agg a, \
          jsonb_array_elements(a.data) AS e \
@@ -526,15 +526,15 @@ async fn test_lateral_with_aggregation_full() {
     )
     .await;
 
-    assert_eq!(db.count("public.lat_agg_dt").await, 2);
+    assert_eq!(db.count("public.lat_agg_st").await, 2);
 
     let count_1: i64 = db
-        .query_scalar("SELECT elem_count FROM public.lat_agg_dt WHERE id = 1")
+        .query_scalar("SELECT elem_count FROM public.lat_agg_st WHERE id = 1")
         .await;
     assert_eq!(count_1, 3);
 
     let count_2: i64 = db
-        .query_scalar("SELECT elem_count FROM public.lat_agg_dt WHERE id = 2")
+        .query_scalar("SELECT elem_count FROM public.lat_agg_st WHERE id = 2")
         .await;
     assert_eq!(count_2, 2);
 }
@@ -547,8 +547,8 @@ async fn test_lateral_multiple_refreshes_converge() {
         .await;
     db.execute("INSERT INTO lat_conv VALUES (1, '[1]')").await;
 
-    db.create_dt(
-        "lat_conv_dt",
+    db.create_st(
+        "lat_conv_st",
         "SELECT d.id, e.value AS val \
          FROM lat_conv d, \
          jsonb_array_elements(d.data) AS e",
@@ -556,25 +556,25 @@ async fn test_lateral_multiple_refreshes_converge() {
         "DIFFERENTIAL",
     )
     .await;
-    assert_eq!(db.count("public.lat_conv_dt").await, 1);
+    assert_eq!(db.count("public.lat_conv_st").await, 1);
 
     // Multiple mutations + refreshes
     db.execute("UPDATE lat_conv SET data = '[1, 2]' WHERE id = 1")
         .await;
-    db.refresh_dt("lat_conv_dt").await;
-    assert_eq!(db.count("public.lat_conv_dt").await, 2);
+    db.refresh_st("lat_conv_st").await;
+    assert_eq!(db.count("public.lat_conv_st").await, 2);
 
     db.execute("INSERT INTO lat_conv VALUES (2, '[3, 4, 5]')")
         .await;
-    db.refresh_dt("lat_conv_dt").await;
-    assert_eq!(db.count("public.lat_conv_dt").await, 5);
+    db.refresh_st("lat_conv_st").await;
+    assert_eq!(db.count("public.lat_conv_st").await, 5);
 
     db.execute("DELETE FROM lat_conv WHERE id = 1").await;
-    db.refresh_dt("lat_conv_dt").await;
-    assert_eq!(db.count("public.lat_conv_dt").await, 3);
+    db.refresh_st("lat_conv_st").await;
+    assert_eq!(db.count("public.lat_conv_st").await, 3);
 
-    db.assert_dt_matches_query(
-        "public.lat_conv_dt",
+    db.assert_st_matches_query(
+        "public.lat_conv_st",
         "SELECT d.id, e.value AS val FROM lat_conv d, jsonb_array_elements(d.data) AS e",
     )
     .await;

@@ -488,7 +488,7 @@ async fn test_lateral_subquery_top_n_full_mode() {
     db.execute("INSERT INTO lat_orders VALUES (1, 'Alice'), (2, 'Bob')").await;
     db.execute("INSERT INTO lat_items VALUES (1, 1, 100, '2024-01-01'), (2, 1, 200, '2024-01-02'), (3, 2, 50, '2024-01-01')").await;
 
-    db.create_dt(
+    db.create_st(
         "lat_top_item",
         "SELECT o.id, o.customer, latest.amount \
          FROM lat_orders o, \
@@ -568,12 +568,12 @@ WITH lat_sq_changed AS (
 
 -- CTE 2: Old ST rows matching changed outer rows (to be deleted)
 lat_sq_old AS (
-    SELECT dt."__pgs_row_id", dt.<all_output_cols>
-    FROM <dt_table> dt
+    SELECT st."__pgs_row_id", st.<all_output_cols>
+    FROM <st_table> st
     WHERE EXISTS (
         SELECT 1 FROM lat_sq_changed cs
-        WHERE dt.<child_col1> IS NOT DISTINCT FROM cs.<child_col1>
-          AND dt.<child_col2> IS NOT DISTINCT FROM cs.<child_col2>
+        WHERE st.<child_col1> IS NOT DISTINCT FROM cs.<child_col1>
+          AND st.<child_col2> IS NOT DISTINCT FROM cs.<child_col2>
     )
 ),
 

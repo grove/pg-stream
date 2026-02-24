@@ -125,7 +125,7 @@ impl TrackedIds {
 /// Compares only user-visible columns (excludes all `__pgs_*` internal
 /// columns) using `EXCEPT ALL` for correct multiset (bag) comparison.
 async fn assert_invariant(db: &E2eDb, pgs_name: &str, query: &str, seed: u64, cycle: usize) {
-    let dt_table = format!("public.{pgs_name}");
+    let st_table = format!("public.{pgs_name}");
 
     // User-visible columns (exclude all __pgs_* internal columns)
     let cols: String = db
@@ -141,16 +141,16 @@ async fn assert_invariant(db: &E2eDb, pgs_name: &str, query: &str, seed: u64, cy
     let matches: bool = db
         .query_scalar(&format!(
             "SELECT NOT EXISTS ( \
-                (SELECT {cols} FROM {dt_table} EXCEPT ALL ({query})) \
+                (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) \
                 UNION ALL \
-                (({query}) EXCEPT ALL SELECT {cols} FROM {dt_table}) \
+                (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) \
             )"
         ))
         .await;
 
     if !matches {
-        let dt_count: i64 = db
-            .query_scalar(&format!("SELECT count(*) FROM {dt_table}"))
+        let st_count: i64 = db
+            .query_scalar(&format!("SELECT count(*) FROM {st_table}"))
             .await;
         let q_count: i64 = db
             .query_scalar(&format!("SELECT count(*) FROM ({query}) _q"))
@@ -158,13 +158,13 @@ async fn assert_invariant(db: &E2eDb, pgs_name: &str, query: &str, seed: u64, cy
         let extra: i64 = db
             .query_scalar(&format!(
                 "SELECT count(*) FROM \
-                 (SELECT {cols} FROM {dt_table} EXCEPT ALL ({query})) _x"
+                 (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) _x"
             ))
             .await;
         let missing: i64 = db
             .query_scalar(&format!(
                 "SELECT count(*) FROM \
-                 (({query}) EXCEPT ALL SELECT {cols} FROM {dt_table}) _x"
+                 (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) _x"
             ))
             .await;
 
@@ -173,7 +173,7 @@ async fn assert_invariant(db: &E2eDb, pgs_name: &str, query: &str, seed: u64, cy
              ST: {}, Query: {}\n\
              ST rows: {}, Query rows: {}\n\
              Extra in ST: {}, Missing from ST: {}",
-            cycle, seed, pgs_name, query, dt_count, q_count, extra, missing,
+            cycle, seed, pgs_name, query, st_count, q_count, extra, missing,
         );
     }
 }
@@ -203,8 +203,8 @@ async fn test_property_scan_differential() {
     }
 
     let query = "SELECT id, val, label FROM prop_s";
-    db.create_dt("prop_s_dt", query, "1m", "DIFFERENTIAL").await;
-    assert_invariant(&db, "prop_s_dt", query, seed, 0).await;
+    db.create_st("prop_s_st", query, "1m", "DIFFERENTIAL").await;
+    assert_invariant(&db, "prop_s_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         // Inserts
@@ -241,8 +241,8 @@ async fn test_property_scan_differential() {
             }
         }
 
-        db.refresh_dt("prop_s_dt").await;
-        assert_invariant(&db, "prop_s_dt", query, seed, cycle).await;
+        db.refresh_st("prop_s_st").await;
+        assert_invariant(&db, "prop_s_st", query, seed, cycle).await;
     }
 }
 
@@ -271,8 +271,8 @@ async fn test_property_filter_differential() {
     }
 
     let query = "SELECT id, score, tag FROM prop_f WHERE score > 50";
-    db.create_dt("prop_f_dt", query, "1m", "DIFFERENTIAL").await;
-    assert_invariant(&db, "prop_f_dt", query, seed, 0).await;
+    db.create_st("prop_f_st", query, "1m", "DIFFERENTIAL").await;
+    assert_invariant(&db, "prop_f_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         let n_ins = rng.usize_range(2, 5);
@@ -306,8 +306,8 @@ async fn test_property_filter_differential() {
             }
         }
 
-        db.refresh_dt("prop_f_dt").await;
-        assert_invariant(&db, "prop_f_dt", query, seed, cycle).await;
+        db.refresh_st("prop_f_st").await;
+        assert_invariant(&db, "prop_f_st", query, seed, cycle).await;
     }
 }
 
@@ -346,8 +346,8 @@ async fn test_property_join_differential() {
 
     let query = "SELECT l.id AS lid, l.val AS lval, r.id AS rid, r.val AS rval \
                  FROM prop_jl l JOIN prop_jr r ON l.key = r.key";
-    db.create_dt("prop_j_dt", query, "1m", "DIFFERENTIAL").await;
-    assert_invariant(&db, "prop_j_dt", query, seed, 0).await;
+    db.create_st("prop_j_st", query, "1m", "DIFFERENTIAL").await;
+    assert_invariant(&db, "prop_j_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         // DML on left table
@@ -384,8 +384,8 @@ async fn test_property_join_differential() {
             }
         }
 
-        db.refresh_dt("prop_j_dt").await;
-        assert_invariant(&db, "prop_j_dt", query, seed, cycle).await;
+        db.refresh_st("prop_j_st").await;
+        assert_invariant(&db, "prop_j_st", query, seed, cycle).await;
     }
 }
 
@@ -416,9 +416,9 @@ async fn test_property_aggregate_differential() {
 
     let query = "SELECT region, COUNT(*) AS cnt, SUM(amount) AS total \
                  FROM prop_agg GROUP BY region";
-    db.create_dt("prop_agg_dt", query, "1m", "DIFFERENTIAL")
+    db.create_st("prop_agg_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_agg_dt", query, seed, 0).await;
+    assert_invariant(&db, "prop_agg_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         let n_ins = rng.usize_range(2, 5);
@@ -451,8 +451,8 @@ async fn test_property_aggregate_differential() {
             }
         }
 
-        db.refresh_dt("prop_agg_dt").await;
-        assert_invariant(&db, "prop_agg_dt", query, seed, cycle).await;
+        db.refresh_st("prop_agg_st").await;
+        assert_invariant(&db, "prop_agg_st", query, seed, cycle).await;
     }
 }
 
@@ -483,9 +483,9 @@ async fn test_property_distinct_differential() {
     }
 
     let query = "SELECT DISTINCT color, size FROM prop_dist";
-    db.create_dt("prop_dist_dt", query, "1m", "DIFFERENTIAL")
+    db.create_st("prop_dist_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_dist_dt", query, seed, 0).await;
+    assert_invariant(&db, "prop_dist_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         let n_ins = rng.usize_range(2, 4);
@@ -519,8 +519,8 @@ async fn test_property_distinct_differential() {
             }
         }
 
-        db.refresh_dt("prop_dist_dt").await;
-        assert_invariant(&db, "prop_dist_dt", query, seed, cycle).await;
+        db.refresh_st("prop_dist_st").await;
+        assert_invariant(&db, "prop_dist_st", query, seed, cycle).await;
     }
 }
 
@@ -561,9 +561,9 @@ async fn test_property_left_join_differential() {
 
     let query = "SELECT l.id AS lid, l.val, r.detail \
                  FROM prop_ljl l LEFT JOIN prop_ljr r ON l.id = r.left_id";
-    db.create_dt("prop_lj_dt", query, "1m", "DIFFERENTIAL")
+    db.create_st("prop_lj_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_lj_dt", query, seed, 0).await;
+    assert_invariant(&db, "prop_lj_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         // DML on left
@@ -599,8 +599,8 @@ async fn test_property_left_join_differential() {
                 .await;
         }
 
-        db.refresh_dt("prop_lj_dt").await;
-        assert_invariant(&db, "prop_lj_dt", query, seed, cycle).await;
+        db.refresh_st("prop_lj_st").await;
+        assert_invariant(&db, "prop_lj_st", query, seed, cycle).await;
     }
 }
 
@@ -636,9 +636,9 @@ async fn test_property_union_all_differential() {
     }
 
     let query = "SELECT id, val FROM prop_ua1 UNION ALL SELECT id, val FROM prop_ua2";
-    db.create_dt("prop_ua_dt", query, "1m", "DIFFERENTIAL")
+    db.create_st("prop_ua_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_ua_dt", query, seed, 0).await;
+    assert_invariant(&db, "prop_ua_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         // DML on source 1
@@ -673,8 +673,8 @@ async fn test_property_union_all_differential() {
             }
         }
 
-        db.refresh_dt("prop_ua_dt").await;
-        assert_invariant(&db, "prop_ua_dt", query, seed, cycle).await;
+        db.refresh_st("prop_ua_st").await;
+        assert_invariant(&db, "prop_ua_st", query, seed, cycle).await;
     }
 }
 
@@ -703,9 +703,9 @@ async fn test_property_filter_aggregate_differential() {
 
     let query = "SELECT grp, COUNT(*) AS cnt, SUM(val) AS total \
                  FROM prop_fa WHERE val > 0 GROUP BY grp";
-    db.create_dt("prop_fa_dt", query, "1m", "DIFFERENTIAL")
+    db.create_st("prop_fa_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_fa_dt", query, seed, 0).await;
+    assert_invariant(&db, "prop_fa_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         let n_ins = rng.usize_range(2, 5);
@@ -735,8 +735,8 @@ async fn test_property_filter_aggregate_differential() {
             }
         }
 
-        db.refresh_dt("prop_fa_dt").await;
-        assert_invariant(&db, "prop_fa_dt", query, seed, cycle).await;
+        db.refresh_st("prop_fa_st").await;
+        assert_invariant(&db, "prop_fa_st", query, seed, cycle).await;
     }
 }
 
@@ -783,9 +783,9 @@ async fn test_property_join_aggregate_differential() {
     let query = "SELECT c.region, COUNT(*) AS cnt, SUM(o.amount) AS total \
                  FROM prop_ja_ord o JOIN prop_ja_cust c ON o.cust_id = c.id \
                  GROUP BY c.region";
-    db.create_dt("prop_ja_dt", query, "1m", "DIFFERENTIAL")
+    db.create_st("prop_ja_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_ja_dt", query, seed, 0).await;
+    assert_invariant(&db, "prop_ja_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         // New orders
@@ -830,8 +830,8 @@ async fn test_property_join_aggregate_differential() {
             .await;
         }
 
-        db.refresh_dt("prop_ja_dt").await;
-        assert_invariant(&db, "prop_ja_dt", query, seed, cycle).await;
+        db.refresh_st("prop_ja_st").await;
+        assert_invariant(&db, "prop_ja_st", query, seed, cycle).await;
     }
 }
 
@@ -863,9 +863,9 @@ async fn test_property_cte_differential() {
     let query = "WITH positive AS (SELECT id, grp, val FROM prop_cte WHERE val > 0) \
                  SELECT grp, COUNT(*) AS cnt, SUM(val) AS total \
                  FROM positive GROUP BY grp";
-    db.create_dt("prop_cte_dt", query, "1m", "DIFFERENTIAL")
+    db.create_st("prop_cte_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_cte_dt", query, seed, 0).await;
+    assert_invariant(&db, "prop_cte_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         let n_ins = rng.usize_range(2, 5);
@@ -895,8 +895,8 @@ async fn test_property_cte_differential() {
                 .await;
         }
 
-        db.refresh_dt("prop_cte_dt").await;
-        assert_invariant(&db, "prop_cte_dt", query, seed, cycle).await;
+        db.refresh_st("prop_cte_st").await;
+        assert_invariant(&db, "prop_cte_st", query, seed, cycle).await;
     }
 }
 
@@ -932,9 +932,9 @@ async fn test_property_full_mode() {
                  FROM prop_full GROUP BY grp";
     let q_filt = "SELECT id, val FROM prop_full WHERE val > 50";
 
-    db.create_dt("propf_scan", q_scan, "1m", "FULL").await;
-    db.create_dt("propf_agg", q_agg, "1m", "FULL").await;
-    db.create_dt("propf_filt", q_filt, "1m", "FULL").await;
+    db.create_st("propf_scan", q_scan, "1m", "FULL").await;
+    db.create_st("propf_agg", q_agg, "1m", "FULL").await;
+    db.create_st("propf_filt", q_filt, "1m", "FULL").await;
 
     assert_invariant(&db, "propf_scan", q_scan, seed, 0).await;
     assert_invariant(&db, "propf_agg", q_agg, seed, 0).await;
@@ -972,9 +972,9 @@ async fn test_property_full_mode() {
             }
         }
 
-        db.refresh_dt("propf_scan").await;
-        db.refresh_dt("propf_agg").await;
-        db.refresh_dt("propf_filt").await;
+        db.refresh_st("propf_scan").await;
+        db.refresh_st("propf_agg").await;
+        db.refresh_st("propf_filt").await;
 
         assert_invariant(&db, "propf_scan", q_scan, seed, cycle).await;
         assert_invariant(&db, "propf_agg", q_agg, seed, cycle).await;

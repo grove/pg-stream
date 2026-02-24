@@ -24,7 +24,7 @@ pgstream.create_stream_table(
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `name` | `text` | — | Name of the stream table. May be schema-qualified (`myschema.my_dt`). Defaults to `public` schema. |
+| `name` | `text` | — | Name of the stream table. May be schema-qualified (`myschema.my_st`). Defaults to `public` schema. |
 | `query` | `text` | — | The defining SQL query. Must be a valid SELECT statement using supported operators. |
 | `schedule` | `text` | `'1m'` | Refresh schedule as a Prometheus/GNU-style duration string (e.g., `'30s'`, `'5m'`, `'1h'`, `'1h30m'`, `'1d'`) **or** a cron expression (e.g., `'*/5 * * * *'`, `'@hourly'`). Set to `NULL` for CALCULATED mode (inherits schedule from downstream dependents). |
 | `refresh_mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` (truncate and reload) or `'DIFFERENTIAL'` (apply delta only). |
@@ -630,12 +630,12 @@ SELECT * FROM pgstream.pgs_status();
 
 ---
 
-### pgstream.dt_refresh_stats
+### pgstream.st_refresh_stats
 
 Return per-ST refresh statistics aggregated from the refresh history.
 
 ```sql
-pgstream.dt_refresh_stats() → SETOF record(
+pgstream.st_refresh_stats() → SETOF record(
     pgs_name                text,
     pgs_schema              text,
     status                 text,
@@ -659,7 +659,7 @@ pgstream.dt_refresh_stats() → SETOF record(
 
 ```sql
 SELECT pgs_name, status, total_refreshes, avg_duration_ms, stale
-FROM pgstream.dt_refresh_stats();
+FROM pgstream.st_refresh_stats();
 ```
 
 ---
@@ -781,12 +781,12 @@ SELECT * FROM pgstream.check_cdc_health();
 
 ---
 
-### pgstream.explain_dt
+### pgstream.explain_st
 
 Explain the DVM plan for a stream table's defining query.
 
 ```sql
-pgstream.explain_dt(name text) → SETOF record(
+pgstream.explain_st(name text) → SETOF record(
     property  text,
     value     text
 )
@@ -795,7 +795,7 @@ pgstream.explain_dt(name text) → SETOF record(
 **Example:**
 
 ```sql
-SELECT * FROM pgstream.explain_dt('order_totals');
+SELECT * FROM pgstream.explain_st('order_totals');
 ```
 
 | property | value |

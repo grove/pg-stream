@@ -95,7 +95,7 @@ async fn test_create_and_query_stream_table() {
     .await;
 
     // Create a stream table with aggregation
-    db.create_dt(
+    db.create_st(
         "order_totals",
         "SELECT customer_id, sum(amount) as total_amount FROM orders GROUP BY customer_id",
         "1m",
@@ -141,7 +141,7 @@ async fn test_refresh_picks_up_new_data() {
     db.execute("INSERT INTO items VALUES (1, 10), (2, 20)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "item_mirror",
         "SELECT id, qty FROM items",
         "1m",
@@ -157,7 +157,7 @@ async fn test_refresh_picks_up_new_data() {
         .await;
 
     // Refresh the ST
-    db.refresh_dt("item_mirror").await;
+    db.refresh_st("item_mirror").await;
 
     let refreshed_count = db.count("public.item_mirror").await;
     assert_eq!(refreshed_count, 4);
@@ -171,22 +171,22 @@ async fn test_drop_cleans_up() {
         .await;
     db.execute("INSERT INTO src VALUES (1, 'hello')").await;
 
-    db.create_dt("temp_dt", "SELECT id, val FROM src", "1m", "FULL")
+    db.create_st("temp_st", "SELECT id, val FROM src", "1m", "FULL")
         .await;
 
     // Verify it exists
-    let exists = db.table_exists("public", "temp_dt").await;
+    let exists = db.table_exists("public", "temp_st").await;
     assert!(exists, "ST storage table should exist before drop");
 
     // Drop it
-    db.drop_dt("temp_dt").await;
+    db.drop_st("temp_st").await;
 
     // Verify cleanup
-    let exists = db.table_exists("public", "temp_dt").await;
+    let exists = db.table_exists("public", "temp_st").await;
     assert!(!exists, "ST storage table should be gone after drop");
 
     let catalog_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'temp_dt'")
+        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'temp_st'")
         .await;
     assert_eq!(catalog_count, 0, "Catalog entry should be removed");
 }

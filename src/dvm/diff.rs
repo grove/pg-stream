@@ -41,7 +41,7 @@ pub struct DiffContext {
     /// Schema for change buffer tables.
     pub change_buffer_schema: String,
     /// The target stream table's schema.qualified name (for aggregate merge).
-    pub dt_qualified_name: Option<String>,
+    pub st_qualified_name: Option<String>,
     /// Registry of parsed CTE bodies (populated by the parser).
     pub cte_registry: CteRegistry,
     /// Cache of already-differentiated CTE deltas, keyed by `cte_id`.
@@ -60,7 +60,7 @@ pub struct DiffContext {
     pub defining_query: Option<String>,
     /// Columns that the ST storage table has (outer projection columns),
     /// used by recursive CTE recomputation to match the storage schema.
-    pub dt_user_columns: Option<Vec<String>>,
+    pub st_user_columns: Option<Vec<String>>,
     /// When true, the top-level scan delta should produce at most one row
     /// per PK (merge D+I pairs for updates into a single I). This allows
     /// the MERGE to skip the outer DISTINCT ON + ORDER BY sort.
@@ -79,12 +79,12 @@ impl DiffContext {
             cte_counter: 0,
             ctes: Vec::new(),
             change_buffer_schema: pg_stream_change_buffer_schema(),
-            dt_qualified_name: None,
+            st_qualified_name: None,
             cte_registry: CteRegistry::default(),
             cte_delta_cache: HashMap::new(),
             use_placeholders: false,
             defining_query: None,
-            dt_user_columns: None,
+            st_user_columns: None,
             merge_safe_dedup: false,
         }
     }
@@ -100,12 +100,12 @@ impl DiffContext {
             cte_counter: 0,
             ctes: Vec::new(),
             change_buffer_schema: "pgstream_changes".to_string(),
-            dt_qualified_name: None,
+            st_qualified_name: None,
             cte_registry: CteRegistry::default(),
             cte_delta_cache: HashMap::new(),
             use_placeholders: false,
             defining_query: None,
-            dt_user_columns: None,
+            st_user_columns: None,
             merge_safe_dedup: false,
         }
     }
@@ -138,7 +138,7 @@ impl DiffContext {
 
     /// Set the stream table name for aggregate merge queries.
     pub fn with_pgs_name(mut self, schema: &str, name: &str) -> Self {
-        self.dt_qualified_name = Some(format!(
+        self.st_qualified_name = Some(format!(
             "\"{}\".\"{}\"",
             schema.replace('"', "\"\""),
             name.replace('"', "\"\""),
@@ -374,11 +374,11 @@ mod tests {
     fn test_diff_context_defaults() {
         let ctx = DiffContext::new_standalone(Frontier::new(), Frontier::new());
         assert_eq!(ctx.change_buffer_schema, "pgstream_changes");
-        assert!(ctx.dt_qualified_name.is_none());
+        assert!(ctx.st_qualified_name.is_none());
         assert!(!ctx.use_placeholders);
         assert!(!ctx.merge_safe_dedup);
         assert!(ctx.defining_query.is_none());
-        assert!(ctx.dt_user_columns.is_none());
+        assert!(ctx.st_user_columns.is_none());
     }
 
     #[test]
@@ -511,10 +511,10 @@ mod tests {
     #[test]
     fn test_with_pgs_name_sets_qualified_name() {
         let ctx = DiffContext::new_standalone(Frontier::new(), Frontier::new())
-            .with_pgs_name("myschema", "my_dt");
+            .with_pgs_name("myschema", "my_st");
         assert_eq!(
-            ctx.dt_qualified_name.as_deref(),
-            Some("\"myschema\".\"my_dt\""),
+            ctx.st_qualified_name.as_deref(),
+            Some("\"myschema\".\"my_st\""),
         );
     }
 
@@ -523,7 +523,7 @@ mod tests {
         let ctx = DiffContext::new_standalone(Frontier::new(), Frontier::new())
             .with_pgs_name("sch\"ema", "ta\"ble");
         assert_eq!(
-            ctx.dt_qualified_name.as_deref(),
+            ctx.st_qualified_name.as_deref(),
             Some("\"sch\"\"ema\".\"ta\"\"ble\""),
         );
     }

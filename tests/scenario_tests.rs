@@ -133,33 +133,33 @@ async fn test_scenario_refresh_after_update() {
     db.execute("INSERT INTO items VALUES (1, 10), (2, 20), (3, 30)")
         .await;
 
-    db.execute("CREATE TABLE public.item_dt (__pgs_row_id BIGINT, id INT, qty INT)")
+    db.execute("CREATE TABLE public.item_st (__pgs_row_id BIGINT, id INT, qty INT)")
         .await;
     let oid: i32 = db
-        .query_scalar("SELECT 'item_dt'::regclass::oid::int")
+        .query_scalar("SELECT 'item_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({oid}, 'item_dt', 'public', 'SELECT id, qty FROM items', '1m', 'FULL')"
+         VALUES ({oid}, 'item_st', 'public', 'SELECT id, qty FROM items', '1m', 'FULL')"
     )).await;
 
     // Initial full refresh
-    db.execute("TRUNCATE item_dt").await;
-    db.execute("INSERT INTO item_dt (__pgs_row_id, id, qty) SELECT 0, id, qty FROM items")
+    db.execute("TRUNCATE item_st").await;
+    db.execute("INSERT INTO item_st (__pgs_row_id, id, qty) SELECT 0, id, qty FROM items")
         .await;
 
     // Update source
     db.execute("UPDATE items SET qty = 999 WHERE id = 2").await;
 
     // Re-refresh
-    db.execute("TRUNCATE item_dt").await;
-    db.execute("INSERT INTO item_dt (__pgs_row_id, id, qty) SELECT 0, id, qty FROM items")
+    db.execute("TRUNCATE item_st").await;
+    db.execute("INSERT INTO item_st (__pgs_row_id, id, qty) SELECT 0, id, qty FROM items")
         .await;
 
     // Verify updated value is reflected
     let qty: i32 = db
-        .query_scalar("SELECT qty FROM item_dt WHERE id = 2")
+        .query_scalar("SELECT qty FROM item_st WHERE id = 2")
         .await;
     assert_eq!(qty, 999);
 
@@ -167,9 +167,9 @@ async fn test_scenario_refresh_after_update() {
     let matches: bool = db
         .query_scalar(
             "SELECT NOT EXISTS (
-            (SELECT id, qty FROM item_dt EXCEPT SELECT id, qty FROM items)
+            (SELECT id, qty FROM item_st EXCEPT SELECT id, qty FROM items)
             UNION ALL
-            (SELECT id, qty FROM items EXCEPT SELECT id, qty FROM item_dt)
+            (SELECT id, qty FROM items EXCEPT SELECT id, qty FROM item_st)
         )",
         )
         .await;
@@ -187,37 +187,37 @@ async fn test_scenario_refresh_after_delete() {
     db.execute("INSERT INTO records VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
         .await;
 
-    db.execute("CREATE TABLE public.records_dt (__pgs_row_id BIGINT, id INT, val TEXT)")
+    db.execute("CREATE TABLE public.records_st (__pgs_row_id BIGINT, id INT, val TEXT)")
         .await;
     let oid: i32 = db
-        .query_scalar("SELECT 'records_dt'::regclass::oid::int")
+        .query_scalar("SELECT 'records_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({oid}, 'records_dt', 'public', 'SELECT id, val FROM records', '1m', 'FULL')"
+         VALUES ({oid}, 'records_st', 'public', 'SELECT id, val FROM records', '1m', 'FULL')"
     )).await;
 
     // Initial refresh
-    db.execute("INSERT INTO records_dt (__pgs_row_id, id, val) SELECT 0, id, val FROM records")
+    db.execute("INSERT INTO records_st (__pgs_row_id, id, val) SELECT 0, id, val FROM records")
         .await;
-    assert_eq!(db.count("records_dt").await, 4);
+    assert_eq!(db.count("records_st").await, 4);
 
     // Delete from source
     db.execute("DELETE FROM records WHERE id IN (2, 4)").await;
 
     // Re-refresh
-    db.execute("TRUNCATE records_dt").await;
-    db.execute("INSERT INTO records_dt (__pgs_row_id, id, val) SELECT 0, id, val FROM records")
+    db.execute("TRUNCATE records_st").await;
+    db.execute("INSERT INTO records_st (__pgs_row_id, id, val) SELECT 0, id, val FROM records")
         .await;
-    assert_eq!(db.count("records_dt").await, 2);
+    assert_eq!(db.count("records_st").await, 2);
 
     let matches: bool = db
         .query_scalar(
             "SELECT NOT EXISTS (
-            (SELECT id, val FROM records_dt EXCEPT SELECT id, val FROM records)
+            (SELECT id, val FROM records_st EXCEPT SELECT id, val FROM records)
             UNION ALL
-            (SELECT id, val FROM records EXCEPT SELECT id, val FROM records_dt)
+            (SELECT id, val FROM records EXCEPT SELECT id, val FROM records_st)
         )",
         )
         .await;
@@ -227,7 +227,7 @@ async fn test_scenario_refresh_after_delete() {
 // ── Scenario 5: ST with filter (WHERE clause) ─────────────────────────────
 
 #[tokio::test]
-async fn test_scenario_filtered_dt() {
+async fn test_scenario_filtered_st() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE sales (id INT PRIMARY KEY, region TEXT, amount NUMERIC)")
@@ -237,17 +237,17 @@ async fn test_scenario_filtered_dt() {
     )
     .await;
 
-    db.execute("CREATE TABLE public.us_sales_dt (__pgs_row_id BIGINT, id INT, region TEXT, amount NUMERIC)")
+    db.execute("CREATE TABLE public.us_sales_st (__pgs_row_id BIGINT, id INT, region TEXT, amount NUMERIC)")
         .await;
     let oid: i32 = db
-        .query_scalar("SELECT 'us_sales_dt'::regclass::oid::int")
+        .query_scalar("SELECT 'us_sales_st'::regclass::oid::int")
         .await;
 
     let defining_query = "SELECT id, region, amount FROM sales WHERE region = ''US''";
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({oid}, 'us_sales_dt', 'public', $${defining_query}$$, '1m', 'FULL')"
+         VALUES ({oid}, 'us_sales_st', 'public', $${defining_query}$$, '1m', 'FULL')"
     )).await;
 
     // For actual SQL execution, use the proper single-quote version
@@ -255,19 +255,19 @@ async fn test_scenario_filtered_dt() {
 
     // Full refresh with filter
     db.execute(&format!(
-        "INSERT INTO us_sales_dt (__pgs_row_id, id, region, amount) SELECT 0, id, region, amount FROM ({exec_query}) sub"
+        "INSERT INTO us_sales_st (__pgs_row_id, id, region, amount) SELECT 0, id, region, amount FROM ({exec_query}) sub"
     )).await;
 
     // Only US rows
-    assert_eq!(db.count("us_sales_dt").await, 2);
+    assert_eq!(db.count("us_sales_st").await, 2);
 
     // Verify correctness against defining query
     let matches: bool = db
         .query_scalar(&format!(
             "SELECT NOT EXISTS (
-            (SELECT id, region, amount FROM us_sales_dt EXCEPT {exec_query})
+            (SELECT id, region, amount FROM us_sales_st EXCEPT {exec_query})
             UNION ALL
-            ({exec_query} EXCEPT SELECT id, region, amount FROM us_sales_dt)
+            ({exec_query} EXCEPT SELECT id, region, amount FROM us_sales_st)
         )"
         ))
         .await;
@@ -277,7 +277,7 @@ async fn test_scenario_filtered_dt() {
 // ── Scenario 6: ST with JOIN ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_scenario_join_dt() {
+async fn test_scenario_join_st() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
@@ -295,32 +295,32 @@ async fn test_scenario_join_dt() {
     let defining_query =
         "SELECT c.name, p.item FROM customers c JOIN purchases p ON c.id = p.cust_id";
 
-    db.execute("CREATE TABLE public.cust_purchases_dt (__pgs_row_id BIGINT, name TEXT, item TEXT)")
+    db.execute("CREATE TABLE public.cust_purchases_st (__pgs_row_id BIGINT, name TEXT, item TEXT)")
         .await;
     let oid: i32 = db
-        .query_scalar("SELECT 'cust_purchases_dt'::regclass::oid::int")
+        .query_scalar("SELECT 'cust_purchases_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({oid}, 'cust_purchases_dt', 'public', $${defining_query}$$, '1m', 'FULL')"
+         VALUES ({oid}, 'cust_purchases_st', 'public', $${defining_query}$$, '1m', 'FULL')"
     )).await;
 
     // Full refresh
     db.execute(&format!(
-        "INSERT INTO cust_purchases_dt (__pgs_row_id, name, item) \
+        "INSERT INTO cust_purchases_st (__pgs_row_id, name, item) \
          SELECT 0, sub.name, sub.item FROM ({defining_query}) sub"
     ))
     .await;
 
-    assert_eq!(db.count("cust_purchases_dt").await, 3);
+    assert_eq!(db.count("cust_purchases_st").await, 3);
 
     let matches: bool = db
         .query_scalar(&format!(
             "SELECT NOT EXISTS (
-            (SELECT name, item FROM cust_purchases_dt EXCEPT {defining_query})
+            (SELECT name, item FROM cust_purchases_st EXCEPT {defining_query})
             UNION ALL
-            ({defining_query} EXCEPT SELECT name, item FROM cust_purchases_dt)
+            ({defining_query} EXCEPT SELECT name, item FROM cust_purchases_st)
         )"
         ))
         .await;
@@ -330,7 +330,7 @@ async fn test_scenario_join_dt() {
 // ── Scenario 7: ST with aggregate ─────────────────────────────────────────
 
 #[tokio::test]
-async fn test_scenario_aggregate_dt() {
+async fn test_scenario_aggregate_st() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE inventory (id INT PRIMARY KEY, category TEXT, qty INT)")
@@ -340,34 +340,34 @@ async fn test_scenario_aggregate_dt() {
 
     let defining_query = "SELECT category, SUM(qty) AS total_qty, COUNT(*) AS item_count FROM inventory GROUP BY category";
 
-    db.execute("CREATE TABLE public.inv_summary_dt (__pgs_row_id BIGINT, category TEXT, total_qty BIGINT, item_count BIGINT)")
+    db.execute("CREATE TABLE public.inv_summary_st (__pgs_row_id BIGINT, category TEXT, total_qty BIGINT, item_count BIGINT)")
         .await;
     let oid: i32 = db
-        .query_scalar("SELECT 'inv_summary_dt'::regclass::oid::int")
+        .query_scalar("SELECT 'inv_summary_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({oid}, 'inv_summary_dt', 'public', $${defining_query}$$, '1m', 'FULL')"
+         VALUES ({oid}, 'inv_summary_st', 'public', $${defining_query}$$, '1m', 'FULL')"
     )).await;
 
     // Full refresh
     db.execute(&format!(
-        "INSERT INTO inv_summary_dt (__pgs_row_id, category, total_qty, item_count) \
+        "INSERT INTO inv_summary_st (__pgs_row_id, category, total_qty, item_count) \
          SELECT 0, sub.category, sub.total_qty, sub.item_count FROM ({defining_query}) sub"
     ))
     .await;
 
-    assert_eq!(db.count("inv_summary_dt").await, 3);
+    assert_eq!(db.count("inv_summary_st").await, 3);
 
     // Verify specific aggregates
     let a_total: i64 = db
-        .query_scalar("SELECT total_qty FROM inv_summary_dt WHERE category = 'A'")
+        .query_scalar("SELECT total_qty FROM inv_summary_st WHERE category = 'A'")
         .await;
     assert_eq!(a_total, 40); // 10 + 30
 
     let b_count: i64 = db
-        .query_scalar("SELECT item_count FROM inv_summary_dt WHERE category = 'B'")
+        .query_scalar("SELECT item_count FROM inv_summary_st WHERE category = 'B'")
         .await;
     assert_eq!(b_count, 2);
 
@@ -375,9 +375,9 @@ async fn test_scenario_aggregate_dt() {
     let matches: bool = db
         .query_scalar(&format!(
             "SELECT NOT EXISTS (
-            (SELECT category, total_qty, item_count FROM inv_summary_dt EXCEPT {defining_query})
+            (SELECT category, total_qty, item_count FROM inv_summary_st EXCEPT {defining_query})
             UNION ALL
-            ({defining_query} EXCEPT SELECT category, total_qty, item_count FROM inv_summary_dt)
+            ({defining_query} EXCEPT SELECT category, total_qty, item_count FROM inv_summary_st)
         )"
         ))
         .await;
@@ -394,13 +394,13 @@ async fn test_scenario_refresh_history() {
         .await;
     db.execute("INSERT INTO src VALUES (1, 10)").await;
 
-    db.execute("CREATE TABLE public.src_dt (__pgs_row_id BIGINT, id INT, val INT)")
+    db.execute("CREATE TABLE public.src_st (__pgs_row_id BIGINT, id INT, val INT)")
         .await;
-    let oid: i32 = db.query_scalar("SELECT 'src_dt'::regclass::oid::int").await;
+    let oid: i32 = db.query_scalar("SELECT 'src_st'::regclass::oid::int").await;
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({oid}, 'src_dt', 'public', 'SELECT id, val FROM src', '1m', 'FULL')"
+         VALUES ({oid}, 'src_st', 'public', 'SELECT id, val FROM src', '1m', 'FULL')"
     )).await;
 
     // Record first refresh in history
@@ -434,21 +434,21 @@ async fn test_scenario_dt_info_view() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE base (id INT PRIMARY KEY)").await;
-    db.execute("CREATE TABLE public.dt_test (__pgs_row_id BIGINT, id INT)")
+    db.execute("CREATE TABLE public.st_test (__pgs_row_id BIGINT, id INT)")
         .await;
     let oid: i32 = db
-        .query_scalar("SELECT 'dt_test'::regclass::oid::int")
+        .query_scalar("SELECT 'st_test'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp) \
-         VALUES ({oid}, 'dt_test', 'public', 'SELECT id FROM base', '1m', 'FULL', 'ACTIVE', now() - interval '2 minutes')"
+         VALUES ({oid}, 'st_test', 'public', 'SELECT id FROM base', '1m', 'FULL', 'ACTIVE', now() - interval '2 minutes')"
     )).await;
 
     // Check info view shows stale flag
     let exceeded: bool = db
-        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'dt_test'")
+        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'st_test'")
         .await;
     assert!(exceeded, "Lag should be exceeded (2 min > 1 min target)");
 }

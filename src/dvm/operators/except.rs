@@ -40,10 +40,10 @@ pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         .collect();
     let row_id_expr = build_hash_expr(&hash_exprs);
 
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .clone()
-        .unwrap_or_else(|| "/* dt_table */".to_string());
+        .unwrap_or_else(|| "/* st_table */".to_string());
 
     // CTE 1: Combine deltas from both branches, tagged with branch indicator
     let delta_cte = ctx.next_cte_name("exct_delta");
@@ -83,7 +83,7 @@ pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
          COALESCE(st.__pgs_count_l, 0) AS old_count_l,\n\
          COALESCE(st.__pgs_count_r, 0) AS old_count_r\n\
          FROM {delta_cte} d\n\
-         LEFT JOIN {dt_table} st ON st.__pgs_row_id = d.__pgs_row_id\n\
+         LEFT JOIN {st_table} st ON st.__pgs_row_id = d.__pgs_row_id\n\
          GROUP BY d.__pgs_row_id, {d_cols}, st.__pgs_count_l, st.__pgs_count_r",
     );
     ctx.add_cte(merge_cte.clone(), merge_sql);
@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_basic() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let left = scan(1, "a", "public", "a", &["name"]);
         let right = scan(2, "b", "public", "b", &["name"]);
         let tree = except(left, right, false);
@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_boundary_crossings() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["val"]);
         let right = scan(2, "b", "public", "b", &["val"]);
         let tree = except(left, right, false);
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_all_basic() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = except(left, right, true);
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_output_columns_include_dual_counts() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["id", "name"]);
         let right = scan(2, "b", "public", "b", &["id", "name"]);
         let tree = except(left, right, false);
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn test_diff_except_is_not_commutative() {
         // EXCEPT is L - R, so swapping branches should produce different SQL
-        let mut ctx1 = test_ctx_with_dt("public", "dt");
+        let mut ctx1 = test_ctx_with_st("public", "st");
         let tree1 = except(
             scan(1, "a", "public", "a", &["x"]),
             scan(2, "b", "public", "b", &["x"]),
@@ -245,7 +245,7 @@ mod tests {
         let r1 = diff_except(&mut ctx1, &tree1).unwrap();
         let sql1 = ctx1.build_with_query(&r1.cte_name);
 
-        let mut ctx2 = test_ctx_with_dt("public", "dt");
+        let mut ctx2 = test_ctx_with_st("public", "st");
         let tree2 = except(
             scan(2, "b", "public", "b", &["x"]),
             scan(1, "a", "public", "a", &["x"]),
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_hash_row_id() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = except(left, right, false);
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_not_deduplicated() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = except(left, right, false);
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_error_on_non_except_node() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_except(&mut ctx, &tree);
         assert!(result.is_err());
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_branch_tagging() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["val"]);
         let right = scan(2, "b", "public", "b", &["val"]);
         let tree = except(left, right, false);
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_multi_column() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["id", "name", "status"]);
         let right = scan(2, "b", "public", "b", &["id", "name", "status"]);
         let tree = except(left, right, false);
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_storage_table_join() {
-        let mut ctx = test_ctx_with_dt("myschema", "my_stream");
+        let mut ctx = test_ctx_with_st("myschema", "my_stream");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = except(left, right, false);
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_delete_action_zeros_counts() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = except(left, right, false);
@@ -357,7 +357,7 @@ mod tests {
     fn test_diff_except_all_update_on_count_change() {
         // EXCEPT ALL should emit an update (as INSERT) when counts change
         // but the row is still in the effective result
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = except(left, right, true);
@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_diff_except_net_count_aggregation() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
         let tree = except(left, right, false);
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn test_diff_except_set_and_all_both_use_greatest() {
         // Both EXCEPT and EXCEPT ALL use GREATEST(0, L-R) boundary detection
-        let mut ctx_set = test_ctx_with_dt("public", "dt");
+        let mut ctx_set = test_ctx_with_st("public", "st");
         let tree_set = except(
             scan(1, "a", "public", "a", &["x"]),
             scan(2, "b", "public", "b", &["x"]),
@@ -398,7 +398,7 @@ mod tests {
         let r_set = diff_except(&mut ctx_set, &tree_set).unwrap();
         let sql_set = ctx_set.build_with_query(&r_set.cte_name);
 
-        let mut ctx_all = test_ctx_with_dt("public", "dt");
+        let mut ctx_all = test_ctx_with_st("public", "st");
         let tree_all = except(
             scan(1, "a", "public", "a", &["x"]),
             scan(2, "b", "public", "b", &["x"]),
@@ -421,7 +421,7 @@ mod tests {
     fn test_diff_except_left_branch_is_positive() {
         // Verify the left branch contributes positively (L count increases
         // the effective result) and right branch contributes negatively
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "orders", "public", "orders", &["id"]);
         let right = scan(2, "cancelled", "public", "cancelled", &["id"]);
         let tree = except(left, right, false);

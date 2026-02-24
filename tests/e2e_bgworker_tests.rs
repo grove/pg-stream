@@ -85,10 +85,10 @@ async fn test_extension_loads_with_shared_preload() {
     assert!(ext_exists, "Extension should be installed");
 
     // Verify no ERROR-level messages — check that we can use the API
-    let dt_count: i64 = db
+    let st_count: i64 = db
         .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables")
         .await;
-    assert_eq!(dt_count, 0, "Fresh install should have 0 STs");
+    assert_eq!(st_count, 0, "Fresh install should have 0 STs");
 }
 
 /// Verify all GUC parameters are registered and return expected defaults.
@@ -204,11 +204,11 @@ async fn test_auto_refresh_within_schedule() {
     db.execute("INSERT INTO auto_src VALUES (1, 'initial')")
         .await;
 
-    db.create_dt("auto_dt", "SELECT id, val FROM auto_src", "1s", "FULL")
+    db.create_st("auto_st", "SELECT id, val FROM auto_src", "1s", "FULL")
         .await;
 
     // Verify initial population
-    let count = db.count("public.auto_dt").await;
+    let count = db.count("public.auto_st").await;
     assert_eq!(count, 1, "ST should be populated initially");
 
     // Insert new data into source — this should trigger CDC
@@ -219,12 +219,12 @@ async fn test_auto_refresh_within_schedule() {
     // The scheduler detects: (now() - data_timestamp) > schedule (1s)
     // With 100ms interval, this should happen within a few seconds
     let refreshed = db
-        .wait_for_auto_refresh("auto_dt", Duration::from_secs(30))
+        .wait_for_auto_refresh("auto_st", Duration::from_secs(30))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh the ST");
 
     // Verify the new data is materialized
-    let count = db.count("public.auto_dt").await;
+    let count = db.count("public.auto_st").await;
     assert_eq!(count, 2, "ST should contain 2 rows after auto-refresh");
 
     // Verify refresh history was written by the scheduler
@@ -232,7 +232,7 @@ async fn test_auto_refresh_within_schedule() {
         .query_scalar(
             "SELECT count(*) FROM pgstream.pgs_refresh_history h \
              JOIN pgstream.pgs_stream_tables d ON h.pgs_id = d.pgs_id \
-             WHERE d.pgs_name = 'auto_dt' AND h.status = 'COMPLETED'",
+             WHERE d.pgs_name = 'auto_st' AND h.status = 'COMPLETED'",
         )
         .await;
     assert!(
@@ -253,32 +253,32 @@ async fn test_auto_refresh_differential_mode() {
     db.execute("INSERT INTO inc_src VALUES (1, 100), (2, 200)")
         .await;
 
-    db.create_dt(
-        "inc_dt",
+    db.create_st(
+        "inc_st",
         "SELECT id, val FROM inc_src",
         "1s",
         "DIFFERENTIAL",
     )
     .await;
 
-    assert_eq!(db.count("public.inc_dt").await, 2);
+    assert_eq!(db.count("public.inc_st").await, 2);
 
     // Insert more data
     db.execute("INSERT INTO inc_src VALUES (3, 300)").await;
 
     let refreshed = db
-        .wait_for_auto_refresh("inc_dt", Duration::from_secs(30))
+        .wait_for_auto_refresh("inc_st", Duration::from_secs(30))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh differential ST");
 
     assert_eq!(
-        db.count("public.inc_dt").await,
+        db.count("public.inc_st").await,
         3,
         "Differential ST should have 3 rows after auto-refresh"
     );
 
     // Verify data correctness
-    db.assert_dt_matches_query("public.inc_dt", "SELECT id, val FROM inc_src")
+    db.assert_st_matches_query("public.inc_st", "SELECT id, val FROM inc_src")
         .await;
 }
 
@@ -293,7 +293,7 @@ async fn test_scheduler_writes_refresh_history() {
         .await;
     db.execute("INSERT INTO hist_src VALUES (1, 'init')").await;
 
-    db.create_dt("hist_dt", "SELECT id, val FROM hist_src", "1s", "FULL")
+    db.create_st("hist_st", "SELECT id, val FROM hist_src", "1s", "FULL")
         .await;
 
     // Initial population does NOT write to history (done by create_stream_table)
@@ -301,7 +301,7 @@ async fn test_scheduler_writes_refresh_history() {
         .query_scalar(
             "SELECT count(*) FROM pgstream.pgs_refresh_history h \
              JOIN pgstream.pgs_stream_tables d ON h.pgs_id = d.pgs_id \
-             WHERE d.pgs_name = 'hist_dt'",
+             WHERE d.pgs_name = 'hist_st'",
         )
         .await;
 
@@ -310,7 +310,7 @@ async fn test_scheduler_writes_refresh_history() {
 
     // Wait for the scheduler to refresh
     let refreshed = db
-        .wait_for_auto_refresh("hist_dt", Duration::from_secs(30))
+        .wait_for_auto_refresh("hist_st", Duration::from_secs(30))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh");
 
@@ -319,7 +319,7 @@ async fn test_scheduler_writes_refresh_history() {
         .query_scalar(
             "SELECT count(*) FROM pgstream.pgs_refresh_history h \
              JOIN pgstream.pgs_stream_tables d ON h.pgs_id = d.pgs_id \
-             WHERE d.pgs_name = 'hist_dt' AND h.status = 'COMPLETED'",
+             WHERE d.pgs_name = 'hist_st' AND h.status = 'COMPLETED'",
         )
         .await;
     assert!(
@@ -342,15 +342,15 @@ async fn test_auto_refresh_differential_with_cdc() {
         .await;
     db.execute("INSERT INTO buf_src VALUES (1, 'a')").await;
 
-    db.create_dt(
-        "buf_dt",
+    db.create_st(
+        "buf_st",
         "SELECT id, val FROM buf_src",
         "1s",
         "DIFFERENTIAL",
     )
     .await;
 
-    assert_eq!(db.count("public.buf_dt").await, 1);
+    assert_eq!(db.count("public.buf_st").await, 1);
 
     // Insert multiple rows to trigger CDC and differential refresh
     db.execute("INSERT INTO buf_src VALUES (2, 'b')").await;
@@ -364,19 +364,19 @@ async fn test_auto_refresh_differential_with_cdc() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if db.count("public.buf_dt").await >= 3 {
+        if db.count("public.buf_st").await >= 3 {
             break;
         }
     }
 
     assert_eq!(
-        db.count("public.buf_dt").await,
+        db.count("public.buf_st").await,
         3,
         "Differential auto-refresh should pick up all new rows"
     );
 
     // Verify data correctness between source and ST
-    db.assert_dt_matches_query("public.buf_dt", "SELECT id, val FROM buf_src")
+    db.assert_st_matches_query("public.buf_st", "SELECT id, val FROM buf_src")
         .await;
 }
 
@@ -396,10 +396,10 @@ async fn test_scheduler_refreshes_multiple_healthy_dts() {
         .await;
     db.execute("INSERT INTO h_src2 VALUES (1, 20)").await;
 
-    db.create_dt("h_dt1", "SELECT id, val FROM h_src1", "1s", "FULL")
+    db.create_st("h_dt1", "SELECT id, val FROM h_src1", "1s", "FULL")
         .await;
 
-    db.create_dt("h_dt2", "SELECT id, val FROM h_src2", "1s", "DIFFERENTIAL")
+    db.create_st("h_dt2", "SELECT id, val FROM h_src2", "1s", "DIFFERENTIAL")
         .await;
 
     assert_eq!(db.count("public.h_dt1").await, 1);
@@ -447,18 +447,18 @@ async fn test_auto_refresh_updates_catalog_metadata() {
         .await;
     db.execute("INSERT INTO meta_src VALUES (1)").await;
 
-    db.create_dt("meta_dt", "SELECT id FROM meta_src", "1s", "FULL")
+    db.create_st("meta_st", "SELECT id FROM meta_src", "1s", "FULL")
         .await;
 
     // Record initial timestamps
     let _initial_refresh_at: Option<String> = db
         .query_scalar_opt(
-            "SELECT last_refresh_at::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_dt'",
+            "SELECT last_refresh_at::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
         )
         .await;
     let initial_data_ts: Option<String> = db
         .query_scalar_opt(
-            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_dt'",
+            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
         )
         .await;
 
@@ -466,19 +466,19 @@ async fn test_auto_refresh_updates_catalog_metadata() {
     db.execute("INSERT INTO meta_src VALUES (2)").await;
 
     let refreshed = db
-        .wait_for_auto_refresh("meta_dt", Duration::from_secs(30))
+        .wait_for_auto_refresh("meta_st", Duration::from_secs(30))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh");
 
     // Verify timestamps advanced
     let new_refresh_at: Option<String> = db
         .query_scalar_opt(
-            "SELECT last_refresh_at::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_dt'",
+            "SELECT last_refresh_at::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
         )
         .await;
     let new_data_ts: Option<String> = db
         .query_scalar_opt(
-            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_dt'",
+            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
         )
         .await;
 
@@ -494,6 +494,6 @@ async fn test_auto_refresh_updates_catalog_metadata() {
     );
 
     // consecutive_errors should be 0
-    let (_, _, _, errors) = db.pgs_status("meta_dt").await;
+    let (_, _, _, errors) = db.pgs_status("meta_st").await;
     assert_eq!(errors, 0, "consecutive_errors should be 0 after success");
 }

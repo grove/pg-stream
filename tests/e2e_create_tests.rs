@@ -20,7 +20,7 @@ async fn test_create_simple_select() {
     db.execute("INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Charlie', 300)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "order_snapshot",
         "SELECT id, customer, amount FROM orders",
         "1m",
@@ -69,7 +69,7 @@ async fn test_create_with_aggregation() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "customer_totals",
         "SELECT customer_id, SUM(amount) AS total_amount FROM sales GROUP BY customer_id",
         "1m",
@@ -108,7 +108,7 @@ async fn test_create_with_join() {
     db.execute("INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "customer_orders",
         "SELECT c.name, o.amount FROM customers c JOIN orders o ON c.id = o.cust_id",
         "1m",
@@ -136,7 +136,7 @@ async fn test_create_with_filter() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "us_revenue",
         "SELECT id, revenue FROM regions WHERE region = 'US'",
         "1m",
@@ -158,10 +158,10 @@ async fn test_create_full_mode() {
         .await;
     db.execute("INSERT INTO src_full VALUES (1, 'a')").await;
 
-    db.create_dt("dt_full", "SELECT id, val FROM src_full", "1m", "FULL")
+    db.create_st("st_full", "SELECT id, val FROM src_full", "1m", "FULL")
         .await;
 
-    let (_, mode, _, _) = db.pgs_status("dt_full").await;
+    let (_, mode, _, _) = db.pgs_status("st_full").await;
     assert_eq!(mode, "FULL");
 }
 
@@ -173,15 +173,15 @@ async fn test_create_differential_mode() {
         .await;
     db.execute("INSERT INTO src_inc VALUES (1, 'a')").await;
 
-    db.create_dt(
-        "dt_inc",
+    db.create_st(
+        "st_inc",
         "SELECT id, val FROM src_inc",
         "1m",
         "DIFFERENTIAL",
     )
     .await;
 
-    let (_, mode, _, _) = db.pgs_status("dt_inc").await;
+    let (_, mode, _, _) = db.pgs_status("st_inc").await;
     assert_eq!(mode, "DIFFERENTIAL");
 }
 
@@ -195,13 +195,13 @@ async fn test_create_custom_schedule() {
         .await;
     db.execute("INSERT INTO src_sched VALUES (1)").await;
 
-    db.create_dt("dt_custom_sched", "SELECT id FROM src_sched", "5m", "FULL")
+    db.create_st("st_custom_sched", "SELECT id FROM src_sched", "5m", "FULL")
         .await;
 
     // Verify stored in catalog (text)
     let sched: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_custom_sched'",
+            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_custom_sched'",
         )
         .await;
     assert_eq!(sched, "5m", "Schedule should be '5m'");
@@ -217,14 +217,14 @@ async fn test_create_null_schedule() {
 
     // Pass NULL schedule directly (CALCULATED mode)
     db.execute(
-        "SELECT pgstream.create_stream_table('dt_calc', \
+        "SELECT pgstream.create_stream_table('st_calc', \
          $$ SELECT id FROM src_calc $$, NULL::text, 'FULL')",
     )
     .await;
 
     let is_null: bool = db
         .query_scalar(
-            "SELECT schedule IS NULL FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_calc'",
+            "SELECT schedule IS NULL FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_calc'",
         )
         .await;
     assert!(is_null, "schedule should be NULL for CALCULATED");
@@ -241,8 +241,8 @@ async fn test_create_no_initialize() {
     db.execute("INSERT INTO src_noinit VALUES (1, 'a'), (2, 'b')")
         .await;
 
-    db.create_dt_with_init(
-        "dt_noinit",
+    db.create_st_with_init(
+        "st_noinit",
         "SELECT id, val FROM src_noinit",
         "1m",
         "DIFFERENTIAL",
@@ -251,14 +251,14 @@ async fn test_create_no_initialize() {
     .await;
 
     // Storage table should exist but be empty
-    let exists = db.table_exists("public", "dt_noinit").await;
+    let exists = db.table_exists("public", "st_noinit").await;
     assert!(exists, "Storage table should exist");
 
-    let count = db.count("public.dt_noinit").await;
+    let count = db.count("public.st_noinit").await;
     assert_eq!(count, 0, "Table should be empty when initialize=false");
 
     // is_populated should be false
-    let (_, _, populated, _) = db.pgs_status("dt_noinit").await;
+    let (_, _, populated, _) = db.pgs_status("st_noinit").await;
     assert!(!populated, "is_populated should be false");
 }
 
@@ -273,19 +273,19 @@ async fn test_create_schema_qualified() {
         .await;
     db.execute("INSERT INTO src_sq VALUES (1, 'x')").await;
 
-    db.create_dt("myschema.my_dt", "SELECT id, val FROM src_sq", "1m", "FULL")
+    db.create_st("myschema.my_st", "SELECT id, val FROM src_sq", "1m", "FULL")
         .await;
 
     // Verify created in the right schema
-    let exists = db.table_exists("myschema", "my_dt").await;
+    let exists = db.table_exists("myschema", "my_st").await;
     assert!(exists, "ST should be created in myschema");
 
-    let count = db.count("myschema.my_dt").await;
+    let count = db.count("myschema.my_st").await;
     assert_eq!(count, 1);
 
     // Verify catalog entry has correct schema
     let cat_schema: String = db
-        .query_scalar("SELECT pgs_schema FROM pgstream.pgs_stream_tables WHERE pgs_name = 'my_dt'")
+        .query_scalar("SELECT pgs_schema FROM pgstream.pgs_stream_tables WHERE pgs_name = 'my_st'")
         .await;
     assert_eq!(cat_schema, "myschema");
 }
@@ -300,12 +300,12 @@ async fn test_create_duplicate_name_fails() {
         .await;
     db.execute("INSERT INTO src_dup VALUES (1)").await;
 
-    db.create_dt("dup_dt", "SELECT id FROM src_dup", "1m", "FULL")
+    db.create_st("dup_st", "SELECT id FROM src_dup", "1m", "FULL")
         .await;
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('dup_dt', \
+            "SELECT pgstream.create_stream_table('dup_st', \
              $$ SELECT id FROM src_dup $$, '1m', 'FULL')",
         )
         .await;
@@ -318,7 +318,7 @@ async fn test_create_invalid_query_fails() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('bad_dt', \
+            "SELECT pgstream.create_stream_table('bad_st', \
              $$ SELECT * FROM nonexistent_table $$, '1m', 'FULL')",
         )
         .await;
@@ -335,7 +335,7 @@ async fn test_create_invalid_refresh_mode_fails() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('bogus_dt', \
+            "SELECT pgstream.create_stream_table('bogus_st', \
              $$ SELECT id FROM src_bogus $$, '1m', 'BOGUS')",
         )
         .await;
@@ -353,8 +353,8 @@ async fn test_create_cdc_trigger_installed() {
     db.execute("INSERT INTO products VALUES (1, 'Widget')")
         .await;
 
-    db.create_dt(
-        "product_dt",
+    db.create_st(
+        "product_st",
         "SELECT id, name FROM products",
         "1m",
         "DIFFERENTIAL",
@@ -375,7 +375,7 @@ async fn test_create_change_buffer_exists() {
         .await;
     db.execute("INSERT INTO items VALUES (1, 10)").await;
 
-    db.create_dt("item_dt", "SELECT id, qty FROM items", "1m", "DIFFERENTIAL")
+    db.create_st("item_st", "SELECT id, qty FROM items", "1m", "DIFFERENTIAL")
         .await;
 
     let source_oid = db.table_oid("items").await;
@@ -393,8 +393,8 @@ async fn test_create_dependencies_recorded() {
         .await;
     db.execute("INSERT INTO dep_src VALUES (1, 'a')").await;
 
-    db.create_dt(
-        "dep_dt",
+    db.create_st(
+        "dep_st",
         "SELECT id, val FROM dep_src",
         "1m",
         "DIFFERENTIAL",
@@ -431,7 +431,7 @@ async fn test_create_change_tracking_recorded() {
     db.execute("CREATE TABLE ct_src (id INT PRIMARY KEY)").await;
     db.execute("INSERT INTO ct_src VALUES (1)").await;
 
-    db.create_dt("ct_dt", "SELECT id FROM ct_src", "1m", "DIFFERENTIAL")
+    db.create_st("ct_st", "SELECT id FROM ct_src", "1m", "DIFFERENTIAL")
         .await;
 
     let source_oid = db.table_oid("ct_src").await;
@@ -467,8 +467,8 @@ async fn test_create_with_compound_duration() {
         .await;
     db.execute("INSERT INTO src_compound VALUES (1)").await;
 
-    db.create_dt(
-        "dt_compound",
+    db.create_st(
+        "st_compound",
         "SELECT id FROM src_compound",
         "1h30m",
         "FULL",
@@ -477,13 +477,13 @@ async fn test_create_with_compound_duration() {
 
     let sched: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_compound'",
+            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_compound'",
         )
         .await;
     assert_eq!(sched, "1h30m", "Compound duration should be stored as-is");
 
     // Verify ST is functional
-    assert_eq!(db.count("public.dt_compound").await, 1);
+    assert_eq!(db.count("public.st_compound").await, 1);
 }
 
 #[tokio::test]
@@ -494,11 +494,11 @@ async fn test_create_with_seconds_duration() {
         .await;
     db.execute("INSERT INTO src_secs VALUES (1)").await;
 
-    db.create_dt("dt_secs", "SELECT id FROM src_secs", "90s", "FULL")
+    db.create_st("st_secs", "SELECT id FROM src_secs", "90s", "FULL")
         .await;
 
     let sched: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_secs'")
+        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_secs'")
         .await;
     assert_eq!(sched, "90s");
 }
@@ -511,11 +511,11 @@ async fn test_create_with_hours_duration() {
         .await;
     db.execute("INSERT INTO src_hours VALUES (1)").await;
 
-    db.create_dt("dt_hours", "SELECT id FROM src_hours", "2h", "FULL")
+    db.create_st("st_hours", "SELECT id FROM src_hours", "2h", "FULL")
         .await;
 
     let sched: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_hours'")
+        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_hours'")
         .await;
     assert_eq!(sched, "2h");
 }
@@ -528,11 +528,11 @@ async fn test_create_with_days_duration() {
         .await;
     db.execute("INSERT INTO src_days VALUES (1)").await;
 
-    db.create_dt("dt_days", "SELECT id FROM src_days", "1d", "FULL")
+    db.create_st("st_days", "SELECT id FROM src_days", "1d", "FULL")
         .await;
 
     let sched: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_days'")
+        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_days'")
         .await;
     assert_eq!(sched, "1d");
 }
@@ -547,18 +547,18 @@ async fn test_create_with_cron_expression() {
 
     // Use cron expression: every 5 minutes
     db.execute(
-        "SELECT pgstream.create_stream_table('dt_cron', \
+        "SELECT pgstream.create_stream_table('st_cron', \
          $$ SELECT id FROM src_cron $$, '*/5 * * * *', 'FULL')",
     )
     .await;
 
     let schedule: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_cron'")
+        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_cron'")
         .await;
     assert_eq!(schedule, "*/5 * * * *");
 
     // Should still be functional
-    assert_eq!(db.count("public.dt_cron").await, 1);
+    assert_eq!(db.count("public.st_cron").await, 1);
 }
 
 #[tokio::test]
@@ -570,14 +570,14 @@ async fn test_create_with_cron_alias() {
     db.execute("INSERT INTO src_cron_alias VALUES (1)").await;
 
     db.execute(
-        "SELECT pgstream.create_stream_table('dt_cron_alias', \
+        "SELECT pgstream.create_stream_table('st_cron_alias', \
          $$ SELECT id FROM src_cron_alias $$, '@hourly', 'FULL')",
     )
     .await;
 
     let schedule: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dt_cron_alias'",
+            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_cron_alias'",
         )
         .await;
     assert_eq!(schedule, "@hourly");
@@ -594,7 +594,7 @@ async fn test_create_with_invalid_cron_fails() {
     // Invalid cron: only 3 fields
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('dt_badcron', \
+            "SELECT pgstream.create_stream_table('st_badcron', \
              $$ SELECT id FROM src_badcron $$, '* * *', 'FULL')",
         )
         .await;
@@ -615,7 +615,7 @@ async fn test_create_with_invalid_duration_fails() {
     // Invalid duration: unknown unit
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('dt_baddur', \
+            "SELECT pgstream.create_stream_table('st_baddur', \
              $$ SELECT id FROM src_baddur $$, '5x', 'FULL')",
         )
         .await;
@@ -637,7 +637,7 @@ async fn test_cross_join_full_mode() {
     db.execute("INSERT INTO cj_b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3')")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "cj_full",
         "SELECT cj_a.x, cj_b.y FROM cj_a CROSS JOIN cj_b",
         "1m",
@@ -662,8 +662,8 @@ async fn test_cross_join_differential_mode() {
     db.execute("INSERT INTO cjd_b VALUES (1, 'b1'), (2, 'b2')")
         .await;
 
-    db.create_dt(
-        "cjd_dt",
+    db.create_st(
+        "cjd_st",
         "SELECT cjd_a.x, cjd_b.y FROM cjd_a CROSS JOIN cjd_b",
         "1m",
         "DIFFERENTIAL",
@@ -671,13 +671,13 @@ async fn test_cross_join_differential_mode() {
     .await;
 
     // Initial: 1 × 2 = 2
-    assert_eq!(db.count("public.cjd_dt").await, 2);
+    assert_eq!(db.count("public.cjd_st").await, 2);
 
     // Insert another row in cjd_a → should add 2 more rows (1 × 2)
     db.execute("INSERT INTO cjd_a VALUES (2, 'a2')").await;
-    db.refresh_dt("cjd_dt").await;
+    db.refresh_st("cjd_st").await;
     assert_eq!(
-        db.count("public.cjd_dt").await,
+        db.count("public.cjd_st").await,
         4,
         "After inserting 1 row into left, cross join should add 2 rows"
     );
@@ -699,8 +699,8 @@ async fn test_nested_cross_join() {
     db.execute("INSERT INTO ncj_c VALUES (1, 'c'), (2, 'C'), (3, 'c3')")
         .await;
 
-    db.create_dt(
-        "ncj_dt",
+    db.create_st(
+        "ncj_st",
         "SELECT ncj_a.x, ncj_b.y, ncj_c.z FROM ncj_a CROSS JOIN ncj_b CROSS JOIN ncj_c",
         "1m",
         "FULL",
@@ -709,7 +709,7 @@ async fn test_nested_cross_join() {
 
     // 1 × 2 × 3 = 6 rows
     assert_eq!(
-        db.count("public.ncj_dt").await,
+        db.count("public.ncj_st").await,
         6,
         "Nested CROSS JOIN should produce full cartesian product"
     );
@@ -728,8 +728,8 @@ async fn test_cross_join_with_where_clause() {
     db.execute("INSERT INTO cjw_b VALUES (1, 15), (2, 25)")
         .await;
 
-    db.create_dt(
-        "cjw_dt",
+    db.create_st(
+        "cjw_st",
         "SELECT cjw_a.x, cjw_b.y FROM cjw_a CROSS JOIN cjw_b WHERE cjw_a.x < cjw_b.y",
         "1m",
         "FULL",
@@ -738,7 +738,7 @@ async fn test_cross_join_with_where_clause() {
 
     // Cartesian product: (10,15),(10,25),(20,25) — only 3 rows where x < y
     assert_eq!(
-        db.count("public.cjw_dt").await,
+        db.count("public.cjw_st").await,
         3,
         "CROSS JOIN with WHERE should filter the cartesian product"
     );

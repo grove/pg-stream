@@ -279,7 +279,7 @@ async fn bench_trigger_overhead(
     create_table_sql: &str,
     populate_sql: &str,
     dml_fn: fn(usize) -> Vec<String>,
-    dt_query: &str,
+    st_query: &str,
     batch_size: usize,
 ) -> TriggerOverheadResult {
     // ── Phase 1: Baseline (no trigger) ──
@@ -303,13 +303,13 @@ async fn bench_trigger_overhead(
 
     // Creating the ST installs the CDC trigger automatically
     db.execute(&format!(
-        "SELECT pg_stream.create_stream_table('overhead_dt', $q${}$q$, '1 hour', 'INCREMENTAL')",
-        dt_query
+        "SELECT pg_stream.create_stream_table('overhead_st', $q${}$q$, '1 hour', 'INCREMENTAL')",
+        st_query
     )).await;
 
     // Full initial refresh so the ST is populated
     db.execute(
-        "SELECT pg_stream.refresh_stream_table('overhead_dt', force_full => true)"
+        "SELECT pg_stream.refresh_stream_table('overhead_st', force_full => true)"
     ).await;
 
     // Discover the change buffer table name

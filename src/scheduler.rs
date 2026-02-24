@@ -26,7 +26,7 @@ use std::panic::AssertUnwindSafe;
 use crate::catalog::{RefreshRecord, StreamTableMeta};
 use crate::cdc;
 use crate::config;
-use crate::dag::{DtDag, DtStatus, NodeId};
+use crate::dag::{NodeId, StDag, StStatus};
 use crate::error::{RetryPolicy, RetryState};
 use crate::monitor;
 use crate::refresh::{self, RefreshAction};
@@ -64,7 +64,7 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
     );
 
     let mut dag_version: u64 = 0;
-    let mut dag: Option<DtDag> = None;
+    let mut dag: Option<StDag> = None;
 
     // Per-ST retry state (in-memory only, reset on scheduler restart)
     let mut retry_states: HashMap<i64, RetryState> = HashMap::new();
@@ -98,7 +98,7 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
             // Step A: Check if DAG needs rebuild
             let current_version = shmem::current_dag_version();
             if current_version != dag_version || dag.is_none() {
-                match DtDag::build_from_catalog(config::pg_stream_min_schedule_seconds()) {
+                match StDag::build_from_catalog(config::pg_stream_min_schedule_seconds()) {
                     Ok(new_dag) => {
                         dag = Some(new_dag);
                         dag_version = current_version;
@@ -133,13 +133,13 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
                 };
 
                 // Load fresh ST metadata
-                let dt = match load_dt_by_id(pgs_id) {
-                    Some(dt) => dt,
+                let st = match load_st_by_id(pgs_id) {
+                    Some(st) => st,
                     None => continue,
                 };
 
                 // Skip non-active STs
-                if dt.status != DtStatus::Active && dt.status != DtStatus::Initializing {
+                if st.status != StStatus::Active && st.status != StStatus::Initializing {
                     continue;
                 }
 
@@ -150,27 +150,27 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
                 }
 
                 // Check if ST exceeds its effective schedule
-                let needs_refresh = check_schedule(&dt, dag_ref);
-                if !needs_refresh && !dt.needs_reinit {
+                let needs_refresh = check_schedule(&st, dag_ref);
+                if !needs_refresh && !st.needs_reinit {
                     continue;
                 }
 
                 // Phase 10: Skip mechanism — check advisory lock
-                if check_skip_needed(&dt) {
+                if check_skip_needed(&st) {
                     log!(
                         "pg_stream: skipping {}.{} — previous refresh still running",
-                        dt.pgs_schema,
-                        dt.pgs_name,
+                        st.pgs_schema,
+                        st.pgs_name,
                     );
                     continue;
                 }
 
                 // Determine the refresh action
-                let has_changes = check_upstream_changes(&dt);
-                let action = refresh::determine_refresh_action(&dt, has_changes);
+                let has_changes = check_upstream_changes(&st);
+                let action = refresh::determine_refresh_action(&st, has_changes);
 
                 // Execute refresh with retry-aware error handling
-                let result = execute_scheduled_refresh(&dt, action);
+                let result = execute_scheduled_refresh(&st, action);
 
                 // Update retry state based on result
                 let retry = retry_states.entry(pgs_id).or_default();
@@ -183,8 +183,8 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
                         if will_retry {
                             log!(
                                 "pg_stream: {}.{} will retry in {}ms (attempt {}/{})",
-                                dt.pgs_schema,
-                                dt.pgs_name,
+                                st.pgs_schema,
+                                st.pgs_name,
                                 retry_policy.backoff_ms(retry.attempts - 1),
                                 retry.attempts,
                                 retry_policy.max_attempts,
@@ -289,9 +289,9 @@ fn recover_from_crash() {
 /// The lock is NOT held — we just probe to detect if another session holds it.
 ///
 /// Returns `true` if the refresh should be skipped.
-fn check_skip_needed(dt: &StreamTableMeta) -> bool {
+fn check_skip_needed(st: &StreamTableMeta) -> bool {
     // Use pgs_id as the advisory lock key (guaranteed unique)
-    let lock_key = dt.pgs_id;
+    let lock_key = st.pgs_id;
 
     // Try to acquire a non-blocking advisory lock
     let got_lock =
@@ -320,7 +320,7 @@ fn current_epoch_ms() -> u64 {
 }
 
 /// Load a stream table by its pgs_id, or return None if not found.
-fn load_dt_by_id(pgs_id: i64) -> Option<StreamTableMeta> {
+fn load_st_by_id(pgs_id: i64) -> Option<StreamTableMeta> {
     Spi::connect(|client| {
         let table = client
             .select(
@@ -346,26 +346,26 @@ fn load_dt_by_id(pgs_id: i64) -> Option<StreamTableMeta> {
         StreamTableMeta::get_all_active()
             .ok()?
             .into_iter()
-            .find(|dt| dt.pgs_id == pgs_id)
+            .find(|st| st.pgs_id == pgs_id)
     })
 }
 
 /// Check if a ST is stale (staleness exceeds effective schedule or cron is due).
-fn check_schedule(dt: &StreamTableMeta, _dag: &DtDag) -> bool {
+fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
     // If not yet populated, always needs refresh
-    if !dt.is_populated {
+    if !st.is_populated {
         return true;
     }
 
     // Check staleness vs schedule
-    if let Some(ref schedule_str) = dt.schedule {
+    if let Some(ref schedule_str) = st.schedule {
         // Determine if this is a cron expression or a duration
         let trimmed = schedule_str.trim();
         if trimmed.starts_with('@') || trimmed.contains(' ') {
             // Cron-based: check if the cron schedule says we're due
             let last_refresh_epoch = Spi::get_one_with_args::<f64>(
                 "SELECT EXTRACT(EPOCH FROM last_refresh_at) FROM pgstream.pgs_stream_tables WHERE pgs_id = $1",
-                &[dt.pgs_id.into()],
+                &[st.pgs_id.into()],
             )
             .unwrap_or(None)
             .map(|e| e as i64);
@@ -379,7 +379,7 @@ fn check_schedule(dt: &StreamTableMeta, _dag: &DtDag) -> bool {
                 "SELECT CASE WHEN data_timestamp IS NULL THEN true \
                  ELSE EXTRACT(EPOCH FROM (now() - data_timestamp)) > $2 END \
                  FROM pgstream.pgs_stream_tables WHERE pgs_id = $1",
-                &[dt.pgs_id.into(), max_secs.into()],
+                &[st.pgs_id.into(), max_secs.into()],
             )
             .unwrap_or(Some(false))
             .unwrap_or(false);
@@ -391,7 +391,7 @@ fn check_schedule(dt: &StreamTableMeta, _dag: &DtDag) -> bool {
         pgrx::warning!(
             "pg_stream: could not parse schedule '{}' for pgs_id={}; skipping schedule check",
             schedule_str,
-            dt.pgs_id
+            st.pgs_id
         );
         return false;
     }
@@ -401,13 +401,13 @@ fn check_schedule(dt: &StreamTableMeta, _dag: &DtDag) -> bool {
 }
 
 /// Check if any upstream source has pending changes.
-fn check_upstream_changes(dt: &StreamTableMeta) -> bool {
+fn check_upstream_changes(st: &StreamTableMeta) -> bool {
     // With trigger-based CDC, changes are written directly to buffer tables.
     // Check if any buffer table for this ST's sources has pending rows.
     let change_schema = config::pg_stream_change_buffer_schema();
 
     // Get source OIDs for this ST
-    let source_oids = get_source_oids_for_dt(dt.pgs_id);
+    let source_oids = get_source_oids_for_st(st.pgs_id);
 
     for oid in &source_oids {
         // Check if the buffer table has any rows
@@ -425,7 +425,7 @@ fn check_upstream_changes(dt: &StreamTableMeta) -> bool {
     }
 
     // If no CDC tracking yet, assume changes exist (conservative)
-    if !dt.is_populated {
+    if !st.is_populated {
         return true;
     }
 
@@ -446,7 +446,7 @@ fn check_upstream_changes(dt: &StreamTableMeta) -> bool {
 /// - Retryable errors (SPI, lock, slot): backoff and retry on next cycle
 /// - Schema errors: flag for reinitialize, count toward suspension
 /// - User/internal errors: permanent failure, count toward suspension
-fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> RefreshOutcome {
+fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> RefreshOutcome {
     let start_instant = std::time::Instant::now();
 
     let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
@@ -457,7 +457,7 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
         });
 
     // Acquire advisory lock for this ST (held during refresh execution)
-    let lock_key = dt.pgs_id;
+    let lock_key = st.pgs_id;
     let got_lock =
         Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_lock($1)", &[lock_key.into()])
             .unwrap_or(Some(false))
@@ -467,8 +467,8 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
         // Another session is refreshing this ST — skip
         log!(
             "pg_stream: skipping {}.{} — advisory lock held by another session",
-            dt.pgs_schema,
-            dt.pgs_name,
+            st.pgs_schema,
+            st.pgs_name,
         );
         return RefreshOutcome::RetryableFailure;
     }
@@ -476,9 +476,9 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
     // Record refresh start
     // Compute freshness_deadline for duration-based schedules:
     // deadline = data_timestamp + schedule_seconds (when data becomes stale)
-    let freshness_deadline = compute_freshness_deadline(dt);
+    let freshness_deadline = compute_freshness_deadline(st);
     let refresh_id = RefreshRecord::insert(
-        dt.pgs_id,
+        st.pgs_id,
         now,
         action.as_str(),
         "RUNNING",
@@ -494,8 +494,8 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
         Err(e) => {
             log!(
                 "pg_stream: failed to record refresh start for {}.{}: {}",
-                dt.pgs_schema,
-                dt.pgs_name,
+                st.pgs_schema,
+                st.pgs_name,
                 e
             );
             release_advisory_lock(lock_key);
@@ -504,14 +504,14 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
     };
 
     // Compute frontier information for this refresh
-    let source_oids = get_source_oids_for_dt(dt.pgs_id);
+    let source_oids = get_source_oids_for_st(st.pgs_id);
     let slot_positions = match cdc::get_slot_positions(&source_oids) {
         Ok(pos) => pos,
         Err(e) => {
             log!(
                 "pg_stream: failed to get slot positions for {}.{}: {}",
-                dt.pgs_schema,
-                dt.pgs_name,
+                st.pgs_schema,
+                st.pgs_name,
                 e
             );
             std::collections::HashMap::new()
@@ -519,7 +519,7 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
     };
 
     // Select target data timestamp
-    let schedule_secs = dt
+    let schedule_secs = st
         .schedule
         .as_ref()
         .and_then(|s| crate::api::parse_duration(s).ok())
@@ -538,17 +538,17 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
 
     // Execute the refresh
     let result = match action {
-        RefreshAction::NoData => refresh::execute_no_data_refresh(dt).map(|_| (0i64, 0i64)),
+        RefreshAction::NoData => refresh::execute_no_data_refresh(st).map(|_| (0i64, 0i64)),
         RefreshAction::Full => {
             let new_frontier =
                 version::compute_initial_frontier(&slot_positions, &data_ts_frontier);
-            match refresh::execute_full_refresh(dt) {
+            match refresh::execute_full_refresh(st) {
                 Ok((ins, del)) => {
-                    if let Err(e) = StreamTableMeta::store_frontier(dt.pgs_id, &new_frontier) {
+                    if let Err(e) = StreamTableMeta::store_frontier(st.pgs_id, &new_frontier) {
                         log!(
                             "pg_stream: failed to store frontier for {}.{}: {}",
-                            dt.pgs_schema,
-                            dt.pgs_name,
+                            st.pgs_schema,
+                            st.pgs_name,
                             e
                         );
                     }
@@ -560,13 +560,13 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
         RefreshAction::Reinitialize => {
             let new_frontier =
                 version::compute_initial_frontier(&slot_positions, &data_ts_frontier);
-            match refresh::execute_reinitialize_refresh(dt) {
+            match refresh::execute_reinitialize_refresh(st) {
                 Ok((ins, del)) => {
-                    if let Err(e) = StreamTableMeta::store_frontier(dt.pgs_id, &new_frontier) {
+                    if let Err(e) = StreamTableMeta::store_frontier(st.pgs_id, &new_frontier) {
                         log!(
                             "pg_stream: failed to store frontier for {}.{}: {}",
-                            dt.pgs_schema,
-                            dt.pgs_name,
+                            st.pgs_schema,
+                            st.pgs_name,
                             e
                         );
                     }
@@ -576,19 +576,19 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
             }
         }
         RefreshAction::Differential => {
-            let prev_frontier = dt.frontier.clone().unwrap_or_default();
+            let prev_frontier = st.frontier.clone().unwrap_or_default();
 
             if prev_frontier.is_empty() {
                 log!(
                     "pg_stream: no previous frontier for {}.{}, doing FULL refresh",
-                    dt.pgs_schema,
-                    dt.pgs_name
+                    st.pgs_schema,
+                    st.pgs_name
                 );
                 let new_frontier =
                     version::compute_initial_frontier(&slot_positions, &data_ts_frontier);
-                match refresh::execute_full_refresh(dt) {
+                match refresh::execute_full_refresh(st) {
                     Ok((ins, del)) => {
-                        if let Err(e) = StreamTableMeta::store_frontier(dt.pgs_id, &new_frontier) {
+                        if let Err(e) = StreamTableMeta::store_frontier(st.pgs_id, &new_frontier) {
                             log!("pg_stream: failed to store frontier: {}", e);
                         }
                         Ok((ins, del))
@@ -599,9 +599,9 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
                 let new_frontier =
                     version::compute_new_frontier(&slot_positions, &data_ts_frontier);
 
-                match refresh::execute_differential_refresh(dt, &prev_frontier, &new_frontier) {
+                match refresh::execute_differential_refresh(st, &prev_frontier, &new_frontier) {
                     Ok((ins, del)) => {
-                        if let Err(e) = StreamTableMeta::store_frontier(dt.pgs_id, &new_frontier) {
+                        if let Err(e) = StreamTableMeta::store_frontier(st.pgs_id, &new_frontier) {
                             log!("pg_stream: failed to store frontier: {}", e);
                         }
                         Ok((ins, del))
@@ -609,11 +609,11 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
                     Err(e) => {
                         log!(
                             "pg_stream: differential refresh failed for {}.{}: {}, will reinitialize on next cycle",
-                            dt.pgs_schema,
-                            dt.pgs_name,
+                            st.pgs_schema,
+                            st.pgs_name,
                             e
                         );
-                        let _ = StreamTableMeta::mark_for_reinitialize(dt.pgs_id);
+                        let _ = StreamTableMeta::mark_for_reinitialize(st.pgs_id);
                         Err(e)
                     }
                 }
@@ -632,11 +632,11 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
             let _ =
                 RefreshRecord::complete(refresh_id, "COMPLETED", rows_inserted, rows_deleted, None);
 
-            let _ = StreamTableMeta::update_after_refresh(dt.pgs_id, now, rows_inserted);
+            let _ = StreamTableMeta::update_after_refresh(st.pgs_id, now, rows_inserted);
 
             monitor::alert_refresh_completed(
-                &dt.pgs_schema,
-                &dt.pgs_name,
+                &st.pgs_schema,
+                &st.pgs_name,
                 action.as_str(),
                 rows_inserted,
                 rows_deleted,
@@ -645,8 +645,8 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
 
             log!(
                 "pg_stream: refreshed {}.{} ({}, +{} -{} rows, {}ms)",
-                dt.pgs_schema,
-                dt.pgs_name,
+                st.pgs_schema,
+                st.pgs_name,
                 action.as_str(),
                 rows_inserted,
                 rows_deleted,
@@ -659,8 +659,8 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
             let _ = RefreshRecord::complete(refresh_id, "FAILED", 0, 0, Some(&e.to_string()));
 
             monitor::alert_refresh_failed(
-                &dt.pgs_schema,
-                &dt.pgs_name,
+                &st.pgs_schema,
+                &st.pgs_name,
                 action.as_str(),
                 &e.to_string(),
             );
@@ -670,30 +670,30 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
 
             // Handle schema errors: mark for reinitialize
             if e.requires_reinitialize() {
-                let _ = StreamTableMeta::mark_for_reinitialize(dt.pgs_id);
-                monitor::alert_reinitialize_needed(&dt.pgs_schema, &dt.pgs_name, &e.to_string());
+                let _ = StreamTableMeta::mark_for_reinitialize(st.pgs_id);
+                monitor::alert_reinitialize_needed(&st.pgs_schema, &st.pgs_name, &e.to_string());
             }
 
             // Increment error count only for errors that should count
             if counts {
-                match StreamTableMeta::increment_errors(dt.pgs_id) {
+                match StreamTableMeta::increment_errors(st.pgs_id) {
                     Ok(count) if count >= config::pg_stream_max_consecutive_errors() => {
-                        let _ = StreamTableMeta::update_status(dt.pgs_id, DtStatus::Suspended);
+                        let _ = StreamTableMeta::update_status(st.pgs_id, StStatus::Suspended);
 
-                        monitor::alert_auto_suspended(&dt.pgs_schema, &dt.pgs_name, count);
+                        monitor::alert_auto_suspended(&st.pgs_schema, &st.pgs_name, count);
 
                         log!(
                             "pg_stream: suspended {}.{} after {} consecutive errors",
-                            dt.pgs_schema,
-                            dt.pgs_name,
+                            st.pgs_schema,
+                            st.pgs_name,
                             count,
                         );
                     }
                     _ => {
                         log!(
                             "pg_stream: refresh failed for {}.{} ({}): {} [{}]",
-                            dt.pgs_schema,
-                            dt.pgs_name,
+                            st.pgs_schema,
+                            st.pgs_name,
                             action.as_str(),
                             e,
                             if is_retryable {
@@ -707,8 +707,8 @@ fn execute_scheduled_refresh(dt: &StreamTableMeta, action: RefreshAction) -> Ref
             } else {
                 log!(
                     "pg_stream: refresh skipped for {}.{}: {}",
-                    dt.pgs_schema,
-                    dt.pgs_name,
+                    st.pgs_schema,
+                    st.pgs_name,
                     e,
                 );
             }
@@ -728,10 +728,10 @@ fn release_advisory_lock(lock_key: i64) {
 }
 
 /// Get the source OIDs (base table OIDs) for a given ST.
-fn get_source_oids_for_dt(pgs_id: i64) -> Vec<pg_sys::Oid> {
-    use crate::catalog::DtDependency;
+fn get_source_oids_for_st(pgs_id: i64) -> Vec<pg_sys::Oid> {
+    use crate::catalog::StDependency;
 
-    DtDependency::get_for_dt(pgs_id)
+    StDependency::get_for_st(pgs_id)
         .unwrap_or_default()
         .into_iter()
         .filter(|dep| dep.source_type == "TABLE")
@@ -744,8 +744,8 @@ fn get_source_oids_for_dt(pgs_id: i64) -> Vec<pg_sys::Oid> {
 /// Returns `data_timestamp + schedule_seconds` (the moment the data becomes
 /// stale). For cron-based schedules, returns `None` because cron doesn't
 /// define a continuous freshness SLA.
-fn compute_freshness_deadline(dt: &StreamTableMeta) -> Option<TimestampWithTimeZone> {
-    let schedule_str = dt.schedule.as_deref()?;
+fn compute_freshness_deadline(st: &StreamTableMeta) -> Option<TimestampWithTimeZone> {
+    let schedule_str = st.schedule.as_deref()?;
 
     // Cron expressions contain spaces or start with '@' — no deadline for those.
     if schedule_str.contains(' ') || schedule_str.starts_with('@') {
@@ -764,7 +764,7 @@ fn compute_freshness_deadline(dt: &StreamTableMeta) -> Option<TimestampWithTimeZ
         "SELECT COALESCE(data_timestamp, now()) + interval '{secs} seconds' \
          FROM pgstream.pgs_stream_tables WHERE pgs_id = $1"
     );
-    Spi::get_one_with_args::<TimestampWithTimeZone>(&deadline_sql, &[dt.pgs_id.into()])
+    Spi::get_one_with_args::<TimestampWithTimeZone>(&deadline_sql, &[st.pgs_id.into()])
         .unwrap_or(None)
 }
 

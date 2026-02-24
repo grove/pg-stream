@@ -41,30 +41,30 @@ pub enum NodeId {
 
 /// Status of a stream table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DtStatus {
+pub enum StStatus {
     Initializing,
     Active,
     Suspended,
     Error,
 }
 
-impl DtStatus {
+impl StStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
-            DtStatus::Initializing => "INITIALIZING",
-            DtStatus::Active => "ACTIVE",
-            DtStatus::Suspended => "SUSPENDED",
-            DtStatus::Error => "ERROR",
+            StStatus::Initializing => "INITIALIZING",
+            StStatus::Active => "ACTIVE",
+            StStatus::Suspended => "SUSPENDED",
+            StStatus::Error => "ERROR",
         }
     }
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, PgStreamError> {
         match s {
-            "INITIALIZING" => Ok(DtStatus::Initializing),
-            "ACTIVE" => Ok(DtStatus::Active),
-            "SUSPENDED" => Ok(DtStatus::Suspended),
-            "ERROR" => Ok(DtStatus::Error),
+            "INITIALIZING" => Ok(StStatus::Initializing),
+            "ACTIVE" => Ok(StStatus::Active),
+            "SUSPENDED" => Ok(StStatus::Suspended),
+            "ERROR" => Ok(StStatus::Error),
             other => Err(PgStreamError::InvalidArgument(format!(
                 "unknown status: {other}"
             ))),
@@ -112,14 +112,14 @@ pub struct DagNode {
     /// Name for display and error messages.
     pub name: String,
     /// Status of this ST (only meaningful for ST nodes).
-    pub status: DtStatus,
+    pub status: StStatus,
     /// Raw schedule string from the catalog (e.g. "5m" or "*/5 * * * *").
     /// `None` for CALCULATED.
     pub schedule_raw: Option<String>,
 }
 
 /// In-memory dependency graph of stream tables and their sources.
-pub struct DtDag {
+pub struct StDag {
     /// Forward edges: source → list of downstream ST node IDs.
     edges: HashMap<NodeId, Vec<NodeId>>,
     /// Reverse edges: ST node → list of upstream source node IDs.
@@ -130,10 +130,10 @@ pub struct DtDag {
     all_nodes: HashSet<NodeId>,
 }
 
-impl DtDag {
+impl StDag {
     /// Create an empty DAG.
     pub fn new() -> Self {
-        DtDag {
+        StDag {
             edges: HashMap::new(),
             reverse_edges: HashMap::new(),
             nodes: HashMap::new(),
@@ -147,11 +147,11 @@ impl DtDag {
     /// and resolves CALCULATED schedules.
     #[cfg(feature = "pg18")]
     pub fn build_from_catalog(fallback_schedule_secs: i32) -> Result<Self, PgStreamError> {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
 
         Spi::connect(|client| {
             // Load all stream tables
-            let dt_table = client
+            let st_table = client
                 .select(
                     "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, \
                      schedule AS schedule_secs, \
@@ -162,7 +162,7 @@ impl DtDag {
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
 
-            for row in dt_table {
+            for row in st_table {
                 let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
 
                 let pgs_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
@@ -181,7 +181,7 @@ impl DtDag {
                         .ok()
                         .map(|secs| Duration::from_secs(secs.max(0) as u64))
                 });
-                let status = DtStatus::from_str(&status_str).unwrap_or(DtStatus::Error);
+                let status = StStatus::from_str(&status_str).unwrap_or(StStatus::Error);
                 let effective_schedule = schedule.unwrap_or(Duration::ZERO);
 
                 dag.add_dt_node(DagNode {
@@ -399,7 +399,7 @@ impl DtDag {
     }
 }
 
-impl Default for DtDag {
+impl Default for StDag {
     fn default() -> Self {
         Self::new()
     }
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn test_topological_sort_simple_chain() {
         // base_table -> dt1 -> dt2
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
@@ -424,7 +424,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -432,7 +432,7 @@ mod tests {
             schedule: Some(Duration::from_secs(120)),
             effective_schedule: Duration::from_secs(120),
             name: "dt2".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_cycle_detection_detects_cycle() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
 
@@ -454,7 +454,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -462,7 +462,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt2".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_no_cycle_in_valid_dag() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base1 = NodeId::BaseTable(1);
         let base2 = NodeId::BaseTable(2);
         let dt1 = NodeId::StreamTable(1);
@@ -491,7 +491,7 @@ mod tests {
                 schedule: Some(Duration::from_secs(60)),
                 effective_schedule: Duration::from_secs(60),
                 name: name.to_string(),
-                status: DtStatus::Active,
+                status: StStatus::Active,
                 schedule_raw: None,
             });
         }
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_calculated_schedule_resolution() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
@@ -525,7 +525,7 @@ mod tests {
             schedule: None,
             effective_schedule: Duration::ZERO,
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -533,7 +533,7 @@ mod tests {
             schedule: Some(Duration::from_secs(120)),
             effective_schedule: Duration::from_secs(120),
             name: "dt2".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -549,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_calculated_schedule_no_dependents_uses_fallback() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
         let dt1 = NodeId::StreamTable(1);
 
@@ -558,7 +558,7 @@ mod tests {
             schedule: None,
             effective_schedule: Duration::ZERO,
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_empty_dag() {
-        let dag = DtDag::new();
+        let dag = StDag::new();
         assert!(dag.detect_cycles().is_ok());
         assert!(dag.topological_order().unwrap().is_empty());
     }
@@ -582,25 +582,25 @@ mod tests {
 
     #[test]
     fn test_single_node_no_edges() {
-        let mut dag = DtDag::new();
-        let dt = NodeId::StreamTable(1);
+        let mut dag = StDag::new();
+        let st = NodeId::StreamTable(1);
         dag.add_dt_node(DagNode {
-            id: dt,
+            id: st,
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
         assert!(dag.detect_cycles().is_ok());
         let order = dag.topological_order().unwrap();
-        assert_eq!(order, vec![dt]);
+        assert_eq!(order, vec![st]);
     }
 
     #[test]
     fn test_get_upstream_and_downstream() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
@@ -610,7 +610,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -618,7 +618,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt2".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -634,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_get_all_dt_nodes() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
 
@@ -643,7 +643,7 @@ mod tests {
             schedule: Some(Duration::from_secs(30)),
             effective_schedule: Duration::from_secs(30),
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -651,7 +651,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt2".to_string(),
-            status: DtStatus::Suspended,
+            status: StStatus::Suspended,
             schedule_raw: None,
         });
 
@@ -661,19 +661,19 @@ mod tests {
 
     #[test]
     fn test_node_name_for_known_and_unknown_nodes() {
-        let mut dag = DtDag::new();
-        let dt = NodeId::StreamTable(42);
+        let mut dag = StDag::new();
+        let st = NodeId::StreamTable(42);
         dag.add_dt_node(DagNode {
-            id: dt,
+            id: st,
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
-            name: "my_dt".to_string(),
-            status: DtStatus::Active,
+            name: "my_st".to_string(),
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
         // Known node returns its name
-        assert_eq!(dag.node_name(&dt), "my_dt");
+        assert_eq!(dag.node_name(&st), "my_st");
 
         // Unknown ST returns formatted string
         let unknown_dt = NodeId::StreamTable(999);
@@ -688,7 +688,7 @@ mod tests {
     fn test_diamond_dependency_pattern() {
         // base1 → dt1 → dt3
         // base2 → dt2 → dt3
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base1 = NodeId::BaseTable(1);
         let base2 = NodeId::BaseTable(2);
         let dt1 = NodeId::StreamTable(1);
@@ -701,7 +701,7 @@ mod tests {
                 schedule: Some(Duration::from_secs(60)),
                 effective_schedule: Duration::from_secs(60),
                 name: name.to_string(),
-                status: DtStatus::Active,
+                status: StStatus::Active,
                 schedule_raw: None,
             });
         }
@@ -724,20 +724,20 @@ mod tests {
     #[test]
     fn test_pgs_status_as_str_and_from_str_roundtrip() {
         for status in [
-            DtStatus::Initializing,
-            DtStatus::Active,
-            DtStatus::Suspended,
-            DtStatus::Error,
+            StStatus::Initializing,
+            StStatus::Active,
+            StStatus::Suspended,
+            StStatus::Error,
         ] {
             let s = status.as_str();
-            let parsed = DtStatus::from_str(s).unwrap();
+            let parsed = StStatus::from_str(s).unwrap();
             assert_eq!(parsed, status);
         }
     }
 
     #[test]
     fn test_pgs_status_from_str_unknown_returns_error() {
-        let result = DtStatus::from_str("UNKNOWN");
+        let result = StStatus::from_str("UNKNOWN");
         assert!(result.is_err());
         if let Err(PgStreamError::InvalidArgument(msg)) = result {
             assert!(msg.contains("unknown status"));
@@ -775,52 +775,52 @@ mod tests {
 
     #[test]
     fn test_downstream_schedule_multiple_downstream_uses_minimum() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
-        let dt_downstream = NodeId::StreamTable(1);
-        let dt_fast = NodeId::StreamTable(2);
-        let dt_slow = NodeId::StreamTable(3);
+        let st_downstream = NodeId::StreamTable(1);
+        let st_fast = NodeId::StreamTable(2);
+        let st_slow = NodeId::StreamTable(3);
 
-        // dt_downstream (DOWNSTREAM) → dt_fast (30s), dt_slow (120s)
+        // st_downstream (DOWNSTREAM) → st_fast (30s), st_slow (120s)
         dag.add_dt_node(DagNode {
-            id: dt_downstream,
+            id: st_downstream,
             schedule: None,
             effective_schedule: Duration::ZERO,
-            name: "dt_downstream".to_string(),
-            status: DtStatus::Active,
+            name: "st_downstream".to_string(),
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
-            id: dt_fast,
+            id: st_fast,
             schedule: Some(Duration::from_secs(30)),
             effective_schedule: Duration::from_secs(30),
-            name: "dt_fast".to_string(),
-            status: DtStatus::Active,
+            name: "st_fast".to_string(),
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
-            id: dt_slow,
+            id: st_slow,
             schedule: Some(Duration::from_secs(120)),
             effective_schedule: Duration::from_secs(120),
-            name: "dt_slow".to_string(),
-            status: DtStatus::Active,
+            name: "st_slow".to_string(),
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
-        dag.add_edge(base, dt_downstream);
-        dag.add_edge(dt_downstream, dt_fast);
-        dag.add_edge(dt_downstream, dt_slow);
+        dag.add_edge(base, st_downstream);
+        dag.add_edge(st_downstream, st_fast);
+        dag.add_edge(st_downstream, st_slow);
 
         dag.resolve_calculated_schedule(60);
 
         // Should use MIN(30, 120) = 30
-        let node = dag.nodes.get(&dt_downstream).unwrap();
+        let node = dag.nodes.get(&st_downstream).unwrap();
         assert_eq!(node.effective_schedule, Duration::from_secs(30));
     }
 
     #[test]
     fn test_default_trait_for_dtdag() {
-        let dag = DtDag::default();
+        let dag = StDag::default();
         assert!(dag.detect_cycles().is_ok());
         assert!(dag.topological_order().unwrap().is_empty());
     }
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn test_cycle_detection_three_node_cycle() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
         let dt3 = NodeId::StreamTable(3);
@@ -854,7 +854,7 @@ mod tests {
                 schedule: Some(Duration::from_secs(60)),
                 effective_schedule: Duration::from_secs(60),
                 name: name.to_string(),
-                status: DtStatus::Active,
+                status: StStatus::Active,
                 schedule_raw: None,
             });
         }
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_topological_order_excludes_base_tables() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base1 = NodeId::BaseTable(1);
         let base2 = NodeId::BaseTable(2);
         let dt1 = NodeId::StreamTable(1);
@@ -882,7 +882,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn test_explicit_schedule_overrides_downstream_resolution() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
@@ -906,7 +906,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::ZERO, // will be set to 60
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -914,7 +914,7 @@ mod tests {
             schedule: Some(Duration::from_secs(120)),
             effective_schedule: Duration::ZERO, // will be set to 120
             name: "dt2".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -936,7 +936,7 @@ mod tests {
     #[test]
     fn test_resolve_downstream_schedule_chain_three_levels() {
         // base -> dt1 (downstream) -> dt2 (downstream) -> dt3 (60s)
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
@@ -947,7 +947,7 @@ mod tests {
             schedule: None, // downstream
             effective_schedule: Duration::ZERO,
             name: "dt1".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -955,7 +955,7 @@ mod tests {
             schedule: None, // downstream
             effective_schedule: Duration::ZERO,
             name: "dt2".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -963,7 +963,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
             name: "dt3".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_node_name_unknown_base_table() {
-        let dag = DtDag::new();
+        let dag = StDag::new();
         // Node not in the graph → should produce a fallback name
         let name = dag.node_name(&NodeId::BaseTable(99999));
         assert!(name.contains("99999"), "expected OID in name: {}", name);
@@ -999,7 +999,7 @@ mod tests {
 
     #[test]
     fn test_node_name_unknown_stream_table() {
-        let dag = DtDag::new();
+        let dag = StDag::new();
         let name = dag.node_name(&NodeId::StreamTable(42));
         assert!(name.contains("42"), "expected ID in name: {}", name);
         assert!(
@@ -1011,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_cycle_detection_error_message_contains_node_names() {
-        let mut dag = DtDag::new();
+        let mut dag = StDag::new();
         let dt1 = NodeId::StreamTable(1);
         let dt2 = NodeId::StreamTable(2);
 
@@ -1020,7 +1020,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::ZERO,
             name: "my_view_a".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
         dag.add_dt_node(DagNode {
@@ -1028,7 +1028,7 @@ mod tests {
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::ZERO,
             name: "my_view_b".to_string(),
-            status: DtStatus::Active,
+            status: StStatus::Active,
             schedule_raw: None,
         });
 

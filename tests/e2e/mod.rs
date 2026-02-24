@@ -18,7 +18,7 @@
 //! #[tokio::test]
 //! async fn test_something() {
 //!     let db = E2eDb::new().await.with_extension().await;
-//!     db.create_dt("my_dt", "SELECT * FROM src", "1m", "FULL").await;
+//!     db.create_st("my_st", "SELECT * FROM src", "1m", "FULL").await;
 //! }
 //! ```
 
@@ -309,7 +309,7 @@ impl E2eDb {
     // ── Extension API Helpers ──────────────────────────────────────────
 
     /// Create a stream table via `pgstream.create_stream_table()`.
-    pub async fn create_dt(&self, name: &str, query: &str, schedule: &str, refresh_mode: &str) {
+    pub async fn create_st(&self, name: &str, query: &str, schedule: &str, refresh_mode: &str) {
         let sql = format!(
             "SELECT pgstream.create_stream_table('{name}', $${query}$$, \
              '{schedule}', '{refresh_mode}')"
@@ -318,7 +318,7 @@ impl E2eDb {
     }
 
     /// Create a stream table with explicit `initialize` parameter.
-    pub async fn create_dt_with_init(
+    pub async fn create_st_with_init(
         &self,
         name: &str,
         query: &str,
@@ -334,13 +334,13 @@ impl E2eDb {
     }
 
     /// Refresh a stream table via `pgstream.refresh_stream_table()`.
-    pub async fn refresh_dt(&self, name: &str) {
+    pub async fn refresh_st(&self, name: &str) {
         self.execute(&format!("SELECT pgstream.refresh_stream_table('{name}')"))
             .await;
     }
 
     /// Drop a stream table via `pgstream.drop_stream_table()`.
-    pub async fn drop_dt(&self, name: &str) {
+    pub async fn drop_st(&self, name: &str) {
         self.execute(&format!("SELECT pgstream.drop_stream_table('{name}')"))
             .await;
     }
@@ -350,7 +350,7 @@ impl E2eDb {
     /// `args` should be the named arguments after the name, e.g.:
     /// `"schedule => '5m'"` or
     /// `"status => 'SUSPENDED'"`.
-    pub async fn alter_dt(&self, name: &str, args: &str) {
+    pub async fn alter_st(&self, name: &str, args: &str) {
         self.execute(&format!(
             "SELECT pgstream.alter_stream_table('{name}', {args})"
         ))
@@ -381,7 +381,7 @@ impl E2eDb {
     ///
     /// Columns of type `json` are cast to `text` because the `json` type
     /// does not have an equality operator (needed by `EXCEPT`).
-    pub async fn assert_dt_matches_query(&self, dt_table: &str, defining_query: &str) {
+    pub async fn assert_st_matches_query(&self, st_table: &str, defining_query: &str) {
         // Get column names from the ST, excluding internal columns.
         // Also get the cast expressions (json → text) for EXCEPT compatibility.
         let cols_sql = format!(
@@ -392,8 +392,8 @@ impl E2eDb {
                              ELSE column_name END, \
                         ', ' ORDER BY ordinal_position) \
              FROM information_schema.columns \
-             WHERE (table_schema || '.' || table_name = '{dt_table}' \
-                OR table_name = '{dt_table}') \
+             WHERE (table_schema || '.' || table_name = '{st_table}' \
+                OR table_name = '{st_table}') \
              AND column_name NOT IN ('__pgs_row_id', '__pgs_count')"
         );
         let (raw_cols, cast_cols): (Option<String>, Option<String>) = sqlx::query_as(&cols_sql)
@@ -409,21 +409,21 @@ impl E2eDb {
             // json columns present: cast them on both sides of EXCEPT
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {cast_cols} FROM {dt_table} \
+                    (SELECT {cast_cols} FROM {st_table} \
                      EXCEPT \
                      SELECT {cast_cols} FROM ({defining_query}) __pgs_dq) \
                     UNION ALL \
                     (SELECT {cast_cols} FROM ({defining_query}) __pgs_dq2 \
                      EXCEPT \
-                     SELECT {cast_cols} FROM {dt_table}) \
+                     SELECT {cast_cols} FROM {st_table}) \
                 )"
             )
         } else {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {raw_cols} FROM {dt_table} EXCEPT ({defining_query})) \
+                    (SELECT {raw_cols} FROM {st_table} EXCEPT ({defining_query})) \
                     UNION ALL \
-                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {dt_table}) \
+                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}) \
                 )"
             )
         };
@@ -431,7 +431,7 @@ impl E2eDb {
         assert!(
             matches,
             "ST '{}' contents do not match defining query:\n  {}",
-            dt_table, defining_query,
+            st_table, defining_query,
         );
     }
 

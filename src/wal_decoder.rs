@@ -35,7 +35,7 @@
 
 use pgrx::prelude::*;
 
-use crate::catalog::{CdcMode, DtDependency};
+use crate::catalog::{CdcMode, StDependency};
 use crate::cdc;
 use crate::config;
 use crate::error::PgStreamError;
@@ -561,7 +561,7 @@ pub fn start_wal_transition(
     let slot_lsn = create_replication_slot(&slot_name)?;
 
     // Step 4: Update catalog — mark as TRANSITIONING
-    DtDependency::update_cdc_mode(
+    StDependency::update_cdc_mode(
         pgs_id,
         source_oid,
         CdcMode::Transitioning,
@@ -596,7 +596,7 @@ pub fn start_wal_transition(
 pub fn check_and_complete_transition(
     source_oid: pg_sys::Oid,
     pgs_id: i64,
-    dep: &DtDependency,
+    dep: &StDependency,
     change_schema: &str,
 ) -> Result<(), PgStreamError> {
     let default_slot = slot_name_for_source(source_oid);
@@ -655,7 +655,7 @@ fn complete_wal_transition(
     cdc::drop_change_trigger(source_oid, change_schema)?;
 
     // Step 2: Update catalog to WAL mode
-    DtDependency::update_cdc_mode(pgs_id, source_oid, CdcMode::Wal, None, None)?;
+    StDependency::update_cdc_mode(pgs_id, source_oid, CdcMode::Wal, None, None)?;
 
     info!(
         "pg_stream: completed WAL transition for source OID {} — trigger dropped, WAL active",
@@ -705,7 +705,7 @@ pub fn abort_wal_transition(
     }
 
     // Step 3: Revert catalog to trigger mode
-    DtDependency::update_cdc_mode(pgs_id, source_oid, CdcMode::Trigger, None, None)?;
+    StDependency::update_cdc_mode(pgs_id, source_oid, CdcMode::Trigger, None, None)?;
 
     // Step 4: Verify the trigger still exists — recreate if lost
     if !cdc::trigger_exists(source_oid)? {
@@ -747,7 +747,7 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgStreamError>
     }
 
     // Get all dependencies to check their CDC mode
-    let all_deps = DtDependency::get_all()?;
+    let all_deps = StDependency::get_all()?;
 
     // Group by source_relid to avoid processing the same source multiple times
     let mut processed_sources = std::collections::HashSet::new();
@@ -815,7 +815,7 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgStreamError>
 }
 
 /// Try to start a WAL transition for a source currently using triggers.
-fn try_start_transition(dep: &DtDependency, change_schema: &str) -> Result<(), PgStreamError> {
+fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), PgStreamError> {
     // Check prerequisites
     if !cdc::can_use_logical_replication()? {
         return Ok(()); // WAL not available, stay on triggers
@@ -836,7 +836,7 @@ fn try_start_transition(dep: &DtDependency, change_schema: &str) -> Result<(), P
 }
 
 /// Poll WAL changes for a source that's in TRANSITIONING or WAL mode.
-fn poll_source_changes(dep: &DtDependency, change_schema: &str) -> Result<(), PgStreamError> {
+fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), PgStreamError> {
     let slot_name = match &dep.slot_name {
         Some(name) => name.clone(),
         None => slot_name_for_source(dep.source_relid),
@@ -857,7 +857,7 @@ fn poll_source_changes(dep: &DtDependency, change_schema: &str) -> Result<(), Pg
 
     // Update the decoder confirmed LSN in the catalog
     if let Some(ref lsn) = last_lsn {
-        DtDependency::update_cdc_mode(
+        StDependency::update_cdc_mode(
             dep.pgs_id,
             dep.source_relid,
             dep.cdc_mode,

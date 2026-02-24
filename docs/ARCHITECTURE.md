@@ -44,8 +44,8 @@ This document describes the internal architecture of pg_stream — a PostgreSQL 
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────┐       │
 │  │                  Monitoring Layer                    │       │
-│  │  dt_refresh_stats │ slot_health │ check_cdc_health    │       │
-│  │  explain_dt │ views │ NOTIFY alerting               │       │
+│  │  st_refresh_stats │ slot_health │ check_cdc_health    │       │
+│  │  explain_st │ views │ NOTIFY alerting               │       │
 │  └──────────────────────────────────────────────────────┘       │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -321,12 +321,12 @@ Centralized error types using `thiserror`:
 
 Provides observability functions:
 
-- **dt_refresh_stats** — Aggregate statistics (total/successful/failed refreshes, avg duration, staleness status).
+- **st_refresh_stats** — Aggregate statistics (total/successful/failed refreshes, avg duration, staleness status).
 - **get_refresh_history** — Per-ST audit trail.
 - **get_staleness** — Current staleness in seconds.
 - **slot_health** — Checks replication slot state and WAL retention.
 - **check_cdc_health** — Per-source CDC health status including mode, slot lag, confirmed LSN, and alerts.
-- **explain_dt** — Describes the DVM plan for a given ST.
+- **explain_st** — Describes the DVM plan for a given ST.
 - **Views** — `pgstream.stream_tables_info` (computed staleness) and `pgstream.pg_stat_stream_tables` (combined stats).
 
 #### NOTIFY Alerting

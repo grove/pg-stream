@@ -27,7 +27,7 @@ async fn test_case_when_expression_full_mode() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "order_labels",
         "SELECT id, CASE WHEN amount > 150 THEN 'high' WHEN amount > 75 THEN 'medium' ELSE 'low' END AS label FROM orders",
         "1m",
@@ -53,7 +53,7 @@ async fn test_simple_case_expression_full_mode() {
     db.execute("INSERT INTO tickets VALUES (1, 1), (2, 2), (3, 3)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "ticket_labels",
         "SELECT id, CASE priority WHEN 1 THEN 'urgent' WHEN 2 THEN 'normal' ELSE 'low' END AS prio_label FROM tickets",
         "1m",
@@ -78,7 +78,7 @@ async fn test_coalesce_expression_full_mode() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "contact_info",
         "SELECT id, COALESCE(phone, email, 'no-contact') AS best_contact FROM contacts",
         "1m",
@@ -106,7 +106,7 @@ async fn test_nullif_expression_full_mode() {
     db.execute("INSERT INTO vals VALUES (1, 0), (2, 5), (3, 0)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "safe_vals",
         "SELECT id, NULLIF(v, 0) AS safe_v FROM vals",
         "1m",
@@ -138,7 +138,7 @@ async fn test_greatest_least_expression_full_mode() {
     db.execute("INSERT INTO scores VALUES (1, 10, 20, 5), (2, 30, 15, 25)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "score_bounds",
         "SELECT id, GREATEST(a, b, c) AS max_score, LEAST(a, b, c) AS min_score FROM scores",
         "1m",
@@ -166,7 +166,7 @@ async fn test_in_list_expression_full_mode() {
     db.execute("INSERT INTO items VALUES (1, 'books'), (2, 'toys'), (3, 'food'), (4, 'books')")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "filtered_items",
         "SELECT id, category FROM items WHERE category IN ('books', 'food')",
         "1m",
@@ -187,7 +187,7 @@ async fn test_between_expression_full_mode() {
     db.execute("INSERT INTO products VALUES (1, 10), (2, 50), (3, 100), (4, 200)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "mid_priced",
         "SELECT id, price FROM products WHERE price BETWEEN 20 AND 150",
         "1m",
@@ -208,7 +208,7 @@ async fn test_is_distinct_from_expression_full_mode() {
     db.execute("INSERT INTO nulltest VALUES (1, 1, 1), (2, 1, 2), (3, NULL, NULL), (4, 1, NULL)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "distinct_check",
         "SELECT id, a IS DISTINCT FROM b AS is_diff FROM nulltest",
         "1m",
@@ -240,7 +240,7 @@ async fn test_boolean_test_expression_full_mode() {
     db.execute("INSERT INTO flags VALUES (1, true), (2, false), (3, NULL)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "active_items",
         "SELECT id FROM flags WHERE active IS TRUE",
         "1m",
@@ -264,7 +264,7 @@ async fn test_sql_value_function_current_date_full_mode() {
     db.execute("INSERT INTO events VALUES (1, CURRENT_DATE), (2, CURRENT_DATE - 1)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "recent_events",
         "SELECT id, event_date FROM events WHERE event_date >= CURRENT_DATE",
         "1m",
@@ -285,7 +285,7 @@ async fn test_array_expression_full_mode() {
     db.execute("INSERT INTO data VALUES (1, 10), (2, 20), (3, 30)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "array_test",
         "SELECT id, ARRAY[val, val * 2] AS doubled FROM data",
         "1m",
@@ -311,7 +311,7 @@ async fn test_case_when_in_select_differential_mode() {
         .await;
 
     // CASE in WHERE clause with GROUP BY — DIFFERENTIAL mode
-    db.create_dt(
+    db.create_st(
         "dept_summary",
         "SELECT dept, COUNT(*) AS cnt, SUM(salary) AS total FROM emp WHERE CASE WHEN salary > 70000 THEN TRUE ELSE FALSE END GROUP BY dept",
         "1m",
@@ -337,7 +337,7 @@ async fn test_coalesce_in_select_differential_mode() {
     db.execute("INSERT INTO orders2 VALUES (1, 1, 10), (2, 1, NULL), (3, 2, 5), (4, 2, NULL)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "customer_discounts",
         "SELECT customer_id, SUM(COALESCE(discount, 0)) AS total_discount FROM orders2 GROUP BY customer_id",
         "1m",
@@ -375,7 +375,7 @@ async fn test_natural_join_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('nat_join_dt', \
+            "SELECT pgstream.create_stream_table('nat_join_st', \
              $$ SELECT t1.id, t1.val, t2.score FROM t1 NATURAL JOIN t2 $$, '1m', 'FULL')",
         )
         .await;
@@ -396,7 +396,7 @@ async fn test_distinct_on_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('distinct_on_dt', \
+            "SELECT pgstream.create_stream_table('distinct_on_st', \
              $$ SELECT DISTINCT ON (category) id, category, ts FROM logs ORDER BY category, ts DESC $$, '1m', 'FULL')",
         )
         .await;
@@ -419,7 +419,7 @@ async fn test_stddev_aggregate_supported_in_differential_mode() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('stddev_dt', \
+            "SELECT pgstream.create_stream_table('stddev_st', \
              $$ SELECT grp, STDDEV(val) AS std FROM metrics GROUP BY grp $$, '1m', 'DIFFERENTIAL')",
         )
         .await;
@@ -439,8 +439,8 @@ async fn test_filter_clause_supported() {
     db.execute("INSERT INTO sales2 VALUES (1, 200, 'east'), (2, 50, 'east'), (3, 300, 'west')")
         .await;
 
-    db.create_dt(
-        "filter_dt",
+    db.create_st(
+        "filter_st",
         "SELECT region, COUNT(*) FILTER (WHERE amount > 100) AS big_count FROM sales2 GROUP BY region",
         "1m",
         "DIFFERENTIAL",
@@ -448,7 +448,7 @@ async fn test_filter_clause_supported() {
     .await;
 
     let count: i64 = db
-        .query_scalar("SELECT big_count FROM public.filter_dt WHERE region = 'east'")
+        .query_scalar("SELECT big_count FROM public.filter_st WHERE region = 'east'")
         .await;
     // Only 1 row (amount=200) passes the filter for 'east'
     assert_eq!(count, 1);
@@ -464,8 +464,8 @@ async fn test_exists_subquery_in_where() {
         .await;
 
     // EXISTS subquery should now be supported via SemiJoin
-    db.create_dt(
-        "exists_dt",
+    db.create_st(
+        "exists_st",
         "SELECT id, name FROM parent_tbl WHERE EXISTS (SELECT 1 FROM child_tbl WHERE child_tbl.parent_id = parent_tbl.id)",
         "1m",
         "FULL",
@@ -479,12 +479,12 @@ async fn test_exists_subquery_in_where() {
         .await;
 
     // Refresh
-    db.execute("SELECT pgstream.refresh_stream_table('exists_dt')")
+    db.execute("SELECT pgstream.refresh_stream_table('exists_st')")
         .await;
 
     // Only parents with children should appear (1 and 3)
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM public.exists_dt")
+        .query_scalar("SELECT count(*) FROM public.exists_st")
         .await;
     assert_eq!(count, 2, "Only parents with children should appear");
 }
@@ -507,7 +507,7 @@ async fn test_right_join_converted_to_left_join() {
         .await;
 
     // RIGHT JOIN should be silently converted to LEFT JOIN with swapped operands
-    db.create_dt(
+    db.create_st(
         "dept_employees",
         "SELECT d.id AS dept_id, d.name AS dept_name, e.name AS emp_name \
          FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id",
@@ -540,7 +540,7 @@ async fn test_window_frame_rows_between() {
     .await;
 
     // Window function with explicit frame clause
-    db.create_dt(
+    db.create_st(
         "running_avg",
         "SELECT id, ts, val, AVG(val) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_avg FROM timeseries",
         "1m",
@@ -562,15 +562,15 @@ async fn test_three_field_column_ref() {
         .await;
 
     // 3-field column reference: public.schema_test.id
-    db.create_dt(
-        "schema_ref_dt",
+    db.create_st(
+        "schema_ref_st",
         "SELECT public.schema_test.id, public.schema_test.val FROM schema_test",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.schema_ref_dt").await;
+    let count = db.count("public.schema_ref_st").await;
     assert_eq!(count, 2);
 }
 
@@ -590,7 +590,7 @@ async fn test_combined_case_coalesce_between() {
     )
     .await;
 
-    db.create_dt(
+    db.create_st(
         "txn_summary",
         "SELECT id, \
          CASE WHEN amount > 200 THEN 'high' ELSE 'low' END AS tier, \
@@ -624,7 +624,7 @@ async fn test_not_between_expression_full_mode() {
     db.execute("INSERT INTO nums VALUES (1, 5), (2, 50), (3, 100), (4, 200)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "excluded_range",
         "SELECT id, val FROM nums WHERE val NOT BETWEEN 10 AND 150",
         "1m",
@@ -645,7 +645,7 @@ async fn test_not_in_expression_full_mode() {
     db.execute("INSERT INTO colors VALUES (1, 'red'), (2, 'blue'), (3, 'green'), (4, 'yellow')")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "non_primary_colors",
         "SELECT id, name FROM colors WHERE name NOT IN ('red', 'blue', 'yellow')",
         "1m",
@@ -666,7 +666,7 @@ async fn test_is_not_true_and_is_unknown() {
     db.execute("INSERT INTO bool_data VALUES (1, TRUE), (2, FALSE), (3, NULL)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "not_true_items",
         "SELECT id FROM bool_data WHERE flag IS NOT TRUE",
         "1m",
@@ -691,7 +691,7 @@ async fn test_between_filter_differential_with_inserts() {
     db.execute("INSERT INTO sensor VALUES (1, 50), (2, 75)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "sensor_in_range",
         "SELECT id, reading FROM sensor WHERE reading BETWEEN 40 AND 80",
         "1m",
@@ -721,23 +721,23 @@ async fn test_in_list_filter_differential_with_inserts() {
     db.execute("INSERT INTO items2 VALUES (1, 'A'), (2, 'B')")
         .await;
 
-    db.create_dt(
-        "cat_filter_dt",
+    db.create_st(
+        "cat_filter_st",
         "SELECT id, cat FROM items2 WHERE cat IN ('A', 'C')",
         "1m",
         "DIFFERENTIAL",
     )
     .await;
 
-    let count = db.count("public.cat_filter_dt").await;
+    let count = db.count("public.cat_filter_st").await;
     assert_eq!(count, 1);
 
     db.execute("INSERT INTO items2 VALUES (3, 'C'), (4, 'D')")
         .await;
-    db.execute("SELECT pgstream.refresh_stream_table('cat_filter_dt')")
+    db.execute("SELECT pgstream.refresh_stream_table('cat_filter_st')")
         .await;
 
-    let count = db.count("public.cat_filter_dt").await;
+    let count = db.count("public.cat_filter_st").await;
     assert_eq!(count, 2); // A and C
 }
 
@@ -755,7 +755,7 @@ async fn test_plain_distinct_still_works() {
         .await;
 
     // Plain DISTINCT (not DISTINCT ON) should still be accepted
-    db.create_dt(
+    db.create_st(
         "unique_cats",
         "SELECT DISTINCT category FROM dup_data",
         "1m",
@@ -781,7 +781,7 @@ async fn test_unsupported_aggregate_works_in_full_mode() {
         .await;
 
     // string_agg is a recognized but unsupported aggregate — should work in FULL mode
-    db.create_dt(
+    db.create_st(
         "string_concat",
         "SELECT grp, STRING_AGG(val::text, ', ' ORDER BY val) AS vals FROM numbers GROUP BY grp",
         "1m",

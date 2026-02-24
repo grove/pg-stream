@@ -631,12 +631,12 @@ WITH lat_changed AS (
 ),
 -- CTE 2: Old ST rows for changed source rows (to be deleted)
 lat_old AS (
-    SELECT dt."__pgs_row_id", dt.<all_output_cols>
-    FROM <dt_table> dt
+    SELECT st."__pgs_row_id", st.<all_output_cols>
+    FROM <st_table> st
     WHERE EXISTS (
         SELECT 1 FROM lat_changed cs
-        WHERE dt.<col1> IS NOT DISTINCT FROM cs.<col1>
-          AND dt.<col2> IS NOT DISTINCT FROM cs.<col2>
+        WHERE st.<col1> IS NOT DISTINCT FROM cs.<col1>
+          AND st.<col2> IS NOT DISTINCT FROM cs.<col2>
           ...
     )
 ),
@@ -711,12 +711,12 @@ WITH lat_sq_changed AS (
 ),
 -- CTE 2: Old ST rows for changed outer rows (to be deleted)
 lat_sq_old AS (
-    SELECT dt."__pgs_row_id", dt.<all_output_cols>
-    FROM <dt_table> dt
+    SELECT st."__pgs_row_id", st.<all_output_cols>
+    FROM <st_table> st
     WHERE EXISTS (
         SELECT 1 FROM lat_sq_changed cs
-        WHERE dt.<col1> IS NOT DISTINCT FROM cs.<col1>
-          AND dt.<col2> IS NOT DISTINCT FROM cs.<col2>
+        WHERE st.<col1> IS NOT DISTINCT FROM cs.<col1>
+          AND st.<col2> IS NOT DISTINCT FROM cs.<col2>
           ...
     )
 ),
@@ -870,7 +870,7 @@ WITH sq_outer AS (
 -- Part 2a: DELETE all outer rows when scalar changed
 sq_del AS (
     SELECT "__pgs_row_id", 'D' AS "__pgs_action", <cols>
-    FROM <dt_table>
+    FROM <st_table>
     WHERE (<scalar_old>) IS DISTINCT FROM (<scalar_current>)
 ),
 -- Part 2b: INSERT all outer rows with new scalar value

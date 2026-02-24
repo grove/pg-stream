@@ -35,10 +35,10 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
     // ── Differentiate child to get the delta ───────────────────────────
     let child_result = ctx.diff_node(child)?;
 
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .clone()
-        .unwrap_or_else(|| "/* dt_table */".to_string());
+        .unwrap_or_else(|| "/* st_table */".to_string());
 
     // Column lists
     let pt_aliases: Vec<String> = pass_through.iter().map(|(_, a)| a.clone()).collect();
@@ -67,7 +67,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         ctx.add_cte(changed_parts_cte.clone(), parts_sql);
     }
 
-    // ── join condition: dt partition cols = cp partition cols ───────────
+    // ── join condition: st partition cols = cp partition cols ───────────
     let partition_join_dt_cp = if partition_cols.is_empty() {
         "TRUE".to_string()
     } else {
@@ -75,7 +75,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
             .iter()
             .map(|c| {
                 let qc = quote_ident(c);
-                format!("dt.{qc} = cp.{qc}")
+                format!("st.{qc} = cp.{qc}")
             })
             .collect::<Vec<_>>()
             .join(" AND ")
@@ -85,13 +85,13 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
     let old_rows_cte = ctx.next_cte_name("win_old");
     let all_cols_dt = all_output_cols
         .iter()
-        .map(|c| format!("dt.{}", quote_ident(c)))
+        .map(|c| format!("st.{}", quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
 
     let old_rows_sql = format!(
-        "SELECT dt.\"__pgs_row_id\", {all_cols_dt}\n\
-         FROM {dt_table} dt\n\
+        "SELECT st.\"__pgs_row_id\", {all_cols_dt}\n\
+         FROM {st_table} st\n\
          WHERE EXISTS (\n\
          SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_dt_cp}\n\
          )",
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_diff_window_basic() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "orders", "public", "o", &["id", "region", "amount"]);
         let wf = window_expr(
             "ROW_NUMBER",
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_diff_window_changed_partition_detection() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "grp", "val"]);
         let wf = window_expr(
             "SUM",
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_diff_window_unpartitioned() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "val"]);
         let wf = window_expr(
             "ROW_NUMBER",
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_diff_window_not_deduplicated() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "val"]);
         let wf = window_expr(
             "ROW_NUMBER",
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn test_diff_window_error_on_non_window_node() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_window(&mut ctx, &tree);
         assert!(result.is_err());

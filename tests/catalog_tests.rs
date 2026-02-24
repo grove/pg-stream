@@ -81,7 +81,7 @@ async fn test_insert_stream_table() {
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({}, 'test_dt', 'public', 'SELECT * FROM test_source', '1m', 'FULL')",
+         VALUES ({}, 'test_st', 'public', 'SELECT * FROM test_source', '1m', 'FULL')",
         source_oid
     ))
     .await;
@@ -92,7 +92,7 @@ async fn test_insert_stream_table() {
     let name: String = db
         .query_scalar("SELECT pgs_name FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
         .await;
-    assert_eq!(name, "test_dt");
+    assert_eq!(name, "test_st");
 
     let status: String = db
         .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
@@ -113,7 +113,7 @@ async fn test_unique_name_constraint() {
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
-         VALUES ({}, 'dup_dt', 'public', 'SELECT * FROM t1', 'FULL')",
+         VALUES ({}, 'dup_st', 'public', 'SELECT * FROM t1', 'FULL')",
         oid1
     ))
     .await;
@@ -123,7 +123,7 @@ async fn test_unique_name_constraint() {
         .try_execute(&format!(
             "INSERT INTO pgstream.pgs_stream_tables \
              (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
-             VALUES ({}, 'dup_dt', 'public', 'SELECT * FROM t2', 'FULL')",
+             VALUES ({}, 'dup_st', 'public', 'SELECT * FROM t2', 'FULL')",
             oid2
         ))
         .await;
@@ -242,7 +242,7 @@ async fn test_refresh_history_recording() {
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
-         VALUES ({}, 'hist_dt', 'public', 'SELECT * FROM hist_source', 'FULL')",
+         VALUES ({}, 'hist_st', 'public', 'SELECT * FROM hist_source', 'FULL')",
         oid
     ))
     .await;
@@ -305,7 +305,7 @@ async fn test_stream_tables_info_view() {
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, \
           refresh_mode, status, is_populated, data_timestamp) \
-         VALUES ({}, 'view_dt', 'public', 'SELECT * FROM view_source', \
+         VALUES ({}, 'view_st', 'public', 'SELECT * FROM view_source', \
                  '5m', 'FULL', 'ACTIVE', true, now() - interval '10 minutes')",
         oid
     ))
@@ -313,7 +313,7 @@ async fn test_stream_tables_info_view() {
 
     // Query the info view
     let stale: bool = db
-        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'view_dt'")
+        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'view_st'")
         .await;
     assert!(
         stale,
@@ -370,7 +370,7 @@ async fn test_status_transitions() {
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
-         VALUES ({}, 'trans_dt', 'public', 'SELECT * FROM trans_src', 'FULL')",
+         VALUES ({}, 'trans_st', 'public', 'SELECT * FROM trans_src', 'FULL')",
         oid
     ))
     .await;
@@ -462,17 +462,17 @@ async fn test_multiple_dts_sharing_source() {
 
     db.execute("CREATE TABLE shared_source (id INT PRIMARY KEY, val INT)")
         .await;
-    db.execute("CREATE TABLE dt_storage_1 (id INT)").await;
-    db.execute("CREATE TABLE dt_storage_2 (id INT)").await;
+    db.execute("CREATE TABLE st_storage_1 (id INT)").await;
+    db.execute("CREATE TABLE st_storage_2 (id INT)").await;
 
     let src_oid: i32 = db
         .query_scalar("SELECT 'shared_source'::regclass::oid::int")
         .await;
     let s1_oid: i32 = db
-        .query_scalar("SELECT 'dt_storage_1'::regclass::oid::int")
+        .query_scalar("SELECT 'st_storage_1'::regclass::oid::int")
         .await;
     let s2_oid: i32 = db
-        .query_scalar("SELECT 'dt_storage_2'::regclass::oid::int")
+        .query_scalar("SELECT 'st_storage_2'::regclass::oid::int")
         .await;
 
     // Create two STs

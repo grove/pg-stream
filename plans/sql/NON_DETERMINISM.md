@@ -256,7 +256,7 @@ async fn test_volatile_function_rejected_in_differential() {
     db.execute("CREATE TABLE vol_src (id INT PRIMARY KEY)").await;
 
     let result = db.try_execute(
-        "SELECT pgstream.create_stream_table('vol_dt', \
+        "SELECT pgstream.create_stream_table('vol_st', \
          $$ SELECT id, random() AS r FROM vol_src $$, '1m', 'DIFFERENTIAL')"
     ).await;
     assert!(result.is_err());
@@ -271,8 +271,8 @@ async fn test_volatile_function_allowed_in_full_mode() {
     db.execute("INSERT INTO vol_full_src VALUES (1)").await;
 
     // Should succeed (with warning) in FULL mode
-    db.create_dt("vol_full_dt", "SELECT id, random() AS r FROM vol_full_src", "1m", "FULL").await;
-    assert_eq!(db.count("public.vol_full_dt").await, 1);
+    db.create_st("vol_full_st", "SELECT id, random() AS r FROM vol_full_src", "1m", "FULL").await;
+    assert_eq!(db.count("public.vol_full_st").await, 1);
 }
 
 #[tokio::test]
@@ -282,8 +282,8 @@ async fn test_stable_function_allowed_in_differential_with_warning() {
     db.execute("INSERT INTO stable_src VALUES (1)").await;
 
     // now() is STABLE — allowed in DIFFERENTIAL with warning
-    db.create_dt("stable_dt", "SELECT id, now() AS refresh_time FROM stable_src", "1m", "DIFFERENTIAL").await;
-    assert_eq!(db.count("public.stable_dt").await, 1);
+    db.create_st("stable_st", "SELECT id, now() AS refresh_time FROM stable_src", "1m", "DIFFERENTIAL").await;
+    assert_eq!(db.count("public.stable_st").await, 1);
 }
 
 #[tokio::test]
@@ -292,8 +292,8 @@ async fn test_immutable_function_fully_allowed() {
     db.execute("CREATE TABLE imm_src (id INT PRIMARY KEY, name TEXT)").await;
     db.execute("INSERT INTO imm_src VALUES (1, 'HELLO')").await;
 
-    db.create_dt("imm_dt", "SELECT id, lower(name) AS lname FROM imm_src", "1m", "DIFFERENTIAL").await;
-    assert_eq!(db.count("public.imm_dt").await, 1);
+    db.create_st("imm_st", "SELECT id, lower(name) AS lname FROM imm_src", "1m", "DIFFERENTIAL").await;
+    assert_eq!(db.count("public.imm_st").await, 1);
 }
 
 #[tokio::test]
@@ -302,7 +302,7 @@ async fn test_nested_volatile_in_where_clause_rejected() {
     db.execute("CREATE TABLE nest_vol_src (id INT PRIMARY KEY, val FLOAT)").await;
 
     let result = db.try_execute(
-        "SELECT pgstream.create_stream_table('nest_vol_dt', \
+        "SELECT pgstream.create_stream_table('nest_vol_st', \
          $$ SELECT id, val FROM nest_vol_src WHERE val > random() $$, '1m', 'DIFFERENTIAL')"
     ).await;
     assert!(result.is_err());
@@ -314,7 +314,7 @@ async fn test_gen_random_uuid_rejected_in_differential() {
     db.execute("CREATE TABLE uuid_src (id INT PRIMARY KEY)").await;
 
     let result = db.try_execute(
-        "SELECT pgstream.create_stream_table('uuid_dt', \
+        "SELECT pgstream.create_stream_table('uuid_st', \
          $$ SELECT id, gen_random_uuid() AS uid FROM uuid_src $$, '1m', 'DIFFERENTIAL')"
     ).await;
     assert!(result.is_err());

@@ -7,7 +7,7 @@
 use pgrx::prelude::*;
 use pgrx::spi::{SpiHeapTupleData, SpiTupleTable};
 
-use crate::dag::{DtStatus, RefreshMode};
+use crate::dag::{RefreshMode, StStatus};
 use crate::error::PgStreamError;
 use crate::version::Frontier;
 
@@ -21,7 +21,7 @@ pub struct StreamTableMeta {
     pub defining_query: String,
     pub schedule: Option<String>,
     pub refresh_mode: RefreshMode,
-    pub status: DtStatus,
+    pub status: StStatus,
     pub is_populated: bool,
     pub data_timestamp: Option<TimestampWithTimeZone>,
     pub consecutive_errors: i32,
@@ -75,7 +75,7 @@ impl std::fmt::Display for CdcMode {
 
 /// A dependency edge from a stream table to one of its upstream sources.
 #[derive(Debug, Clone)]
-pub struct DtDependency {
+pub struct StDependency {
     pub pgs_id: i64,
     pub source_relid: pg_sys::Oid,
     pub source_type: String,
@@ -222,7 +222,7 @@ impl StreamTableMeta {
     }
 
     /// Update the status of a stream table.
-    pub fn update_status(pgs_id: i64, status: DtStatus) -> Result<(), PgStreamError> {
+    pub fn update_status(pgs_id: i64, status: StStatus) -> Result<(), PgStreamError> {
         Spi::run_with_args(
             "UPDATE pgstream.pgs_stream_tables \
              SET status = $1, updated_at = now() \
@@ -440,7 +440,7 @@ impl StreamTableMeta {
             .get::<String>(8)
             .map_err(map_spi)?
             .unwrap_or_else(|| "INITIALIZING".into());
-        let status = DtStatus::from_str(&status_str)?;
+        let status = StStatus::from_str(&status_str)?;
 
         let is_populated = table.get::<bool>(9).map_err(map_spi)?.unwrap_or(false);
 
@@ -516,7 +516,7 @@ impl StreamTableMeta {
             .get::<String>(8)
             .map_err(map_spi)?
             .unwrap_or_else(|| "INITIALIZING".into());
-        let status = DtStatus::from_str(&status_str)?;
+        let status = StStatus::from_str(&status_str)?;
 
         let is_populated = row.get::<bool>(9).map_err(map_spi)?.unwrap_or(false);
 
@@ -554,7 +554,7 @@ impl StreamTableMeta {
 
 // ── Dependency CRUD ────────────────────────────────────────────────────────
 
-impl DtDependency {
+impl StDependency {
     /// Insert a dependency edge.
     pub fn insert(
         pgs_id: i64,
@@ -603,7 +603,7 @@ impl DtDependency {
     }
 
     /// Get all dependencies for a stream table.
-    pub fn get_for_dt(pgs_id: i64) -> Result<Vec<Self>, PgStreamError> {
+    pub fn get_for_st(pgs_id: i64) -> Result<Vec<Self>, PgStreamError> {
         Spi::connect(|client| {
             let table = client
                 .select(
@@ -629,7 +629,7 @@ impl DtDependency {
                 let slot_name = row.get::<String>(6).map_err(map_spi)?;
                 let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
                 let transition_started_at = row.get::<String>(8).map_err(map_spi)?;
-                result.push(DtDependency {
+                result.push(StDependency {
                     pgs_id,
                     source_relid,
                     source_type,
@@ -671,7 +671,7 @@ impl DtDependency {
                 let slot_name = row.get::<String>(6).map_err(map_spi)?;
                 let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
                 let transition_started_at = row.get::<String>(8).map_err(map_spi)?;
-                result.push(DtDependency {
+                result.push(StDependency {
                     pgs_id,
                     source_relid,
                     source_type,

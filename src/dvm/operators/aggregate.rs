@@ -648,7 +648,7 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // ── CTE 2: Merge with existing ST state to classify actions ────────
     let merge_cte = ctx.next_cte_name("agg_merge");
 
-    let dt_table = ctx.dt_qualified_name.as_deref().unwrap_or("/* dt_table */");
+    let st_table = ctx.st_qualified_name.as_deref().unwrap_or("/* st_table */");
 
     // Row ID from group-by columns (using output names)
     let group_hash_exprs: Vec<String> = group_output
@@ -671,9 +671,9 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     // New count = old + inserts - deletes
     merge_selects.push(
-        "COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count AS new_count".to_string(),
+        "COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count AS new_count".to_string(),
     );
-    merge_selects.push("COALESCE(dt.__pgs_count, 0) AS old_count".to_string());
+    merge_selects.push("COALESCE(st.__pgs_count, 0) AS old_count".to_string());
 
     // Per-aggregate new values + old values for G-S1 change detection
     for agg in aggregates {
@@ -683,10 +683,10 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             quote_ident(&format!("new_{}", agg.alias)),
         ));
         // Keep old value alongside so the final CTE can skip unchanged U rows.
-        // dt.{alias} is NULL for brand-new groups (LEFT JOIN miss), which is
+        // st.{alias} is NULL for brand-new groups (LEFT JOIN miss), which is
         // correct: IS DISTINCT FROM will see old=NULL vs new=<value> → changed.
         merge_selects.push(format!(
-            "dt.{} AS {}",
+            "st.{} AS {}",
             quote_ident(&agg.alias),
             quote_ident(&format!("old_{}", agg.alias)),
         ));
@@ -696,8 +696,8 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     merge_selects.push(
         "\
 CASE
-    WHEN dt.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0 THEN 'I'
-    WHEN COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0 THEN 'D'
+    WHEN st.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0 THEN 'I'
+    WHEN COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0 THEN 'D'
     ELSE 'U'
 END AS __pgs_meta_action"
             .to_string(),
@@ -709,7 +709,7 @@ END AS __pgs_meta_action"
     } else {
         group_output
             .iter()
-            .map(|c| format!("dt.{qc} = d.{qc}", qc = quote_ident(c)))
+            .map(|c| format!("st.{qc} = d.{qc}", qc = quote_ident(c)))
             .collect::<Vec<_>>()
             .join(" AND ")
     };
@@ -731,7 +731,7 @@ END AS __pgs_meta_action"
     };
 
     let merge_sql = format!(
-        "SELECT {selects}\nFROM {delta_cte} d\nLEFT JOIN {dt_table} dt ON {join_cond}{rescan_join}",
+        "SELECT {selects}\nFROM {delta_cte} d\nLEFT JOIN {st_table} st ON {join_cond}{rescan_join}",
         selects = merge_selects.join(",\n       "),
     );
     ctx.add_cte(merge_cte.clone(), merge_sql);
@@ -926,14 +926,14 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
     match &agg.function {
         AggFunc::CountStar | AggFunc::Count => {
             format!(
-                "COALESCE(dt.{qt}, 0) + d.{ins} - d.{del}",
+                "COALESCE(st.{qt}, 0) + d.{ins} - d.{del}",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
             )
         }
         AggFunc::Sum => {
             format!(
-                "COALESCE(dt.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)",
+                "COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
             )
@@ -941,10 +941,10 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
         AggFunc::Avg => {
             // AVG = SUM / COUNT — compute from the sum and count auxiliaries
             format!(
-                "CASE WHEN (COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count) > 0 \
-                 THEN (COALESCE(dt.{qt}, 0) * COALESCE(dt.__pgs_count, 0) \
+                "CASE WHEN (COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count) > 0 \
+                 THEN (COALESCE(st.{qt}, 0) * COALESCE(st.__pgs_count, 0) \
                        + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0))::numeric \
-                       / (COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count) \
+                       / (COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count) \
                  ELSE NULL END",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
@@ -963,7 +963,7 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             //     pair via the __pgs_meta_action = 'U' path.
             //
             // The "was deleted" check: d.__del_{alias} IS NOT NULL AND
-            //   d.__del_{alias} = dt.{alias} (the deleted extremum equals the stored one).
+            //   d.__del_{alias} = st.{alias} (the deleted extremum equals the stored one).
             //
             // When this triggers, we return NULL. The change-detection guard
             // (IS DISTINCT FROM) will see old != NULL, new = NULL → "changed",
@@ -982,9 +982,9 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             let ins = quote_ident(&format!("__ins_{alias}"));
             let del = quote_ident(&format!("__del_{alias}"));
             format!(
-                "CASE WHEN d.{del} IS NOT NULL AND d.{del} = dt.{qt} \
+                "CASE WHEN d.{del} IS NOT NULL AND d.{del} = st.{qt} \
                  THEN d.{ins} \
-                 ELSE {func}(dt.{qt}, d.{ins}) END"
+                 ELSE {func}(st.{qt}, d.{ins}) END"
             )
         }
         // Group-rescan aggregates: use rescan CTE value when available,
@@ -1001,13 +1001,13 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
                 format!(
                     "CASE WHEN COALESCE(d.{ins}, 0) > 0 OR COALESCE(d.{del}, 0) > 0 \
                      THEN r.{qt} \
-                     ELSE dt.{qt} END"
+                     ELSE st.{qt} END"
                 )
             } else {
                 format!(
                     "CASE WHEN COALESCE(d.{ins}, 0) > 0 OR COALESCE(d.{del}, 0) > 0 \
                      THEN NULL \
-                     ELSE dt.{qt} END"
+                     ELSE st.{qt} END"
                 )
             }
         }
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_count_star_with_group_by() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "orders", "public", "o", &["id", "region", "amount"]);
         let tree = aggregate(vec![colref("region")], vec![count_star("cnt")], child);
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_sum_with_group_by() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "orders", "public", "o", &["id", "region", "amount"]);
         let tree = aggregate(
             vec![colref("region")],
@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_no_group_by() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["amount"]);
         let tree = aggregate(
             vec![],
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_standard_path_when_child_is_filter() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = filter(
             binop(">", colref("amount"), lit("0")),
             scan(1, "t", "public", "t", &["id", "region", "amount"]),
@@ -1154,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_is_deduplicated() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "region"]);
         let tree = aggregate(vec![colref("region")], vec![count_star("cnt")], child);
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
@@ -1164,7 +1164,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_error_on_non_aggregate_node() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_aggregate(&mut ctx, &tree);
         assert!(result.is_err());
@@ -1172,7 +1172,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_change_detection_guard() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
             vec![colref("region")],
@@ -1220,7 +1220,7 @@ mod tests {
     fn test_agg_merge_expr_count_star() {
         let agg = count_star("cnt");
         let result = agg_merge_expr(&agg, false);
-        assert!(result.contains("COALESCE(dt.\"cnt\", 0)"));
+        assert!(result.contains("COALESCE(st.\"cnt\", 0)"));
         assert!(result.contains("__ins_cnt"));
         assert!(result.contains("__del_cnt"));
     }
@@ -1229,7 +1229,7 @@ mod tests {
     fn test_agg_merge_expr_sum() {
         let agg = sum_col("amount", "total");
         let result = agg_merge_expr(&agg, false);
-        assert!(result.contains("COALESCE(dt.\"total\", 0)"));
+        assert!(result.contains("COALESCE(st.\"total\", 0)"));
         assert!(result.contains("COALESCE(d.\"__ins_total\", 0)"));
     }
 
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_min_with_group_by() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![AggExpr {
@@ -1388,7 +1388,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_max_with_group_by() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![AggExpr {
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_with_filter() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![with_filter(
@@ -1618,7 +1618,7 @@ mod tests {
             "STRING_AGG merge should return NULL sentinel: {merge}",
         );
         assert!(
-            merge.contains("dt.\"members\""),
+            merge.contains("st.\"members\""),
             "STRING_AGG merge should reference old value: {merge}",
         );
     }
@@ -1646,7 +1646,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_bool_and() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![bool_and_col("active", "all_active")],
@@ -1664,7 +1664,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_string_agg() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![string_agg_col("name", "', '", "members")],
@@ -1685,7 +1685,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_array_agg() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![array_agg_col("val", "vals")],
@@ -1700,7 +1700,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_bool_or() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("region")],
             aggregates: vec![bool_or_col("has_flag", "any_flag")],
@@ -1712,7 +1712,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_mixed_algebraic_and_rescan() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![
@@ -1878,7 +1878,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_bit_and() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![bit_and_col("flags", "all_flags")],
@@ -1896,7 +1896,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_bit_or() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![bit_or_col("flags", "any_flags")],
@@ -1908,7 +1908,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_bit_xor() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![bit_xor_col("flags", "xor_flags")],
@@ -1987,7 +1987,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_json_object_agg() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![json_object_agg_col("name", "value", "obj")],
@@ -2008,7 +2008,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_jsonb_object_agg() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![jsonb_object_agg_col("key", "val", "obj")],
@@ -2040,7 +2040,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_mixed_with_bitwise() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![count_star("cnt"), bit_or_col("perms", "combined_perms")],
@@ -2161,7 +2161,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_stddev_pop() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![stddev_pop_col("amount", "sd_pop")],
@@ -2179,7 +2179,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_stddev_samp() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![stddev_samp_col("amount", "sd_samp")],
@@ -2197,7 +2197,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_var_pop() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![var_pop_col("amount", "v_pop")],
@@ -2215,7 +2215,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_var_samp() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![var_samp_col("amount", "v_samp")],
@@ -2255,7 +2255,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_mixed_with_statistical() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![
@@ -2323,7 +2323,7 @@ mod tests {
             "PERCENTILE_CONT merge should return NULL sentinel on change: {merge}",
         );
         assert!(
-            merge.contains("dt.\"median_amount\""),
+            merge.contains("st.\"median_amount\""),
             "PERCENTILE_CONT merge should reference old value: {merge}",
         );
     }
@@ -2337,7 +2337,7 @@ mod tests {
             "PERCENTILE_DISC merge should return NULL sentinel on change: {merge}",
         );
         assert!(
-            merge.contains("dt.\"p75_score\""),
+            merge.contains("st.\"p75_score\""),
             "PERCENTILE_DISC merge should reference old value: {merge}",
         );
     }
@@ -2378,7 +2378,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_mode() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("region")],
             aggregates: vec![mode_col("category", "most_common")],
@@ -2401,7 +2401,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_percentile_cont() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![percentile_cont_col("0.5", "salary", "median_salary")],
@@ -2427,7 +2427,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_percentile_disc() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![percentile_disc_col("0.75", "score", "p75")],
@@ -2481,7 +2481,7 @@ mod tests {
 
     #[test]
     fn test_diff_aggregate_mixed_with_ordered_set() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let agg = OpTree::Aggregate {
             group_by: vec![colref("dept")],
             aggregates: vec![
@@ -2540,7 +2540,7 @@ mod tests {
 
     #[test]
     fn test_no_rescan_cte_for_sum() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
             vec![colref("region")],
@@ -2554,7 +2554,7 @@ mod tests {
 
     #[test]
     fn test_no_rescan_cte_for_count_star() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "val"]);
         let tree = aggregate(vec![colref("region")], vec![count_star("cnt")], child);
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
@@ -2564,7 +2564,7 @@ mod tests {
 
     #[test]
     fn test_no_rescan_cte_for_avg() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
             vec![colref("region")],
@@ -2578,7 +2578,7 @@ mod tests {
 
     #[test]
     fn test_no_rescan_cte_for_sum_count_avg_combined() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
             vec![colref("region")],
@@ -2596,7 +2596,7 @@ mod tests {
 
     #[test]
     fn test_no_rescan_cte_for_min_max() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
             vec![colref("region")],
@@ -2611,7 +2611,7 @@ mod tests {
     #[test]
     fn test_rescan_cte_only_for_group_rescan_aggregates() {
         // Mixed: SUM (algebraic) + BIT_AND (group-rescan)
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "flags", "amount"]);
         let tree = aggregate(
             vec![colref("region")],

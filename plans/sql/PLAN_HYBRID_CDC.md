@@ -129,12 +129,12 @@ ALTER TABLE pgstream.pgs_dependencies
 - `decoder_confirmed_lsn` — Last LSN confirmed by the WAL decoder
 - `transition_started_at` — When the transition started (for timeout detection)
 
-#### 1.2 Extend `StreamTableMeta` / `DtDependency` structs
+#### 1.2 Extend `StreamTableMeta` / `StDependency` structs
 
 Update [src/catalog.rs](../../src/catalog.rs):
 
 ```rust
-pub struct DtDependency {
+pub struct StDependency {
     pub pgs_id: i64,
     pub source_relid: pg_sys::Oid,
     pub source_type: String,
@@ -183,14 +183,14 @@ pub static PGS_WAL_TRANSITION_TIMEOUT: GucSetting<i32> =
 | File | Changes |
 |---|---|
 | `src/lib.rs` | Add columns to `pgs_dependencies` CREATE TABLE |
-| `src/catalog.rs` | Extend `DtDependency` struct, add `CdcMode` enum, CRUD for new columns |
+| `src/catalog.rs` | Extend `StDependency` struct, add `CdcMode` enum, CRUD for new columns |
 | `src/config.rs` | Add `PGS_CDC_MODE` and `PGS_WAL_TRANSITION_TIMEOUT` GUCs |
 | `src/error.rs` | Add `WalTransitionError` variant |
 
 #### 1.6 Testing
 
 - Unit test: `CdcMode` serialization/deserialization
-- Unit test: `DtDependency` CRUD with new columns
+- Unit test: `StDependency` CRUD with new columns
 - E2E test: Verify catalog migration adds columns without breaking existing STs
 
 ---

@@ -151,17 +151,17 @@ CREATE TABLE test_source (id INT PRIMARY KEY, val TEXT);
 INSERT INTO test_source VALUES (1, 'hello');
 
 SELECT pgstream.create_stream_table(
-    'test_dt',
+    'test_st',
     'SELECT id, val FROM test_source',
     '1m',
     'FULL'
 );
 
-SELECT * FROM test_dt;
+SELECT * FROM test_st;
 -- Should return: 1 | hello
 
 -- Clean up
-SELECT pgstream.drop_stream_table('test_dt');
+SELECT pgstream.drop_stream_table('test_st');
 DROP TABLE test_source;
 ```
 

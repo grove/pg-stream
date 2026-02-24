@@ -161,12 +161,12 @@ fn generate_recomputation_delta(
     _union_all: bool,
 ) -> Result<DiffResult, PgStreamError> {
     // We need the ST storage table name for the anti-join
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
             PgStreamError::InternalError(
-                "dt_qualified_name required for recursive CTE recomputation diff".into(),
+                "st_qualified_name required for recursive CTE recomputation diff".into(),
             )
         })?
         .clone();
@@ -178,7 +178,7 @@ fn generate_recomputation_delta(
     // aren't in the ST storage). Using the defining query is preferred
     // because it exactly matches the ST schema.
     let (recomp_inner_sql, out_cols) = if let (Some(defining_query), Some(dt_cols)) =
-        (&ctx.defining_query, &ctx.dt_user_columns)
+        (&ctx.defining_query, &ctx.st_user_columns)
     {
         // Use the defining query — output matches ST storage columns.
         (defining_query.clone(), dt_cols.clone())
@@ -216,7 +216,7 @@ fn generate_recomputation_delta(
     let ins_sql = format!(
         "SELECT n.__pgs_row_id, 'I'::text AS __pgs_action, {n_cols}\n\
          FROM {recomp_cte} n\n\
-         LEFT JOIN {dt_table} s ON s.__pgs_row_id = n.__pgs_row_id\n\
+         LEFT JOIN {st_table} s ON s.__pgs_row_id = n.__pgs_row_id\n\
          WHERE s.__pgs_row_id IS NULL",
         n_cols = out_cols
             .iter()
@@ -230,7 +230,7 @@ fn generate_recomputation_delta(
     let del_cte = ctx.next_cte_name(&format!("rc_del_{alias}"));
     let del_sql = format!(
         "SELECT s.__pgs_row_id, 'D'::text AS __pgs_action, {s_cols}\n\
-         FROM {dt_table} s\n\
+         FROM {st_table} s\n\
          LEFT JOIN {recomp_cte} n ON n.__pgs_row_id = s.__pgs_row_id\n\
          WHERE n.__pgs_row_id IS NULL",
         s_cols = out_cols
@@ -339,12 +339,12 @@ fn generate_dred_delta(
     recursive: &OpTree,
     union_all: bool,
 ) -> Result<DiffResult, PgStreamError> {
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
             PgStreamError::InternalError(
-                "dt_qualified_name required for recursive CTE DRed diff".into(),
+                "st_qualified_name required for recursive CTE DRed diff".into(),
             )
         })?
         .clone();
@@ -372,7 +372,7 @@ fn generate_dred_delta(
     // We need a recursive CTE: seed = del_seed, recursive term joins
     // ST storage rows whose parent column matches the cascade's key column.
     let del_cascade_cte = ctx.next_cte_name(&format!("dred_dcasc_{alias}"));
-    let cascade_propagation = generate_cascade_propagation(recursive, &del_cascade_cte, &dt_table)?;
+    let cascade_propagation = generate_cascade_propagation(recursive, &del_cascade_cte, &st_table)?;
 
     let del_cascade_sql = format!(
         "SELECT {col_list_str} FROM {del_seed_cte}\n\
@@ -437,7 +437,7 @@ fn generate_dred_delta(
     let del_final_sql = format!(
         "SELECT s.__pgs_row_id, 'D'::text AS __pgs_action, {del_cols}\n\
          FROM {net_del_cte} d\n\
-         JOIN {dt_table} s ON {del_match_cols}",
+         JOIN {st_table} s ON {del_match_cols}",
         del_cols = columns
             .iter()
             .map(|c| format!("s.{}", quote_ident(c)))
@@ -473,12 +473,12 @@ fn generate_semi_naive_ins_only(
     base_delta: &DiffResult,
     recursive: &OpTree,
 ) -> Result<DiffResult, PgStreamError> {
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
             PgStreamError::InternalError(
-                "dt_qualified_name required for DRed insert propagation".into(),
+                "st_qualified_name required for DRed insert propagation".into(),
             )
         })?
         .clone();
@@ -495,7 +495,7 @@ fn generate_semi_naive_ins_only(
     );
 
     // Seed from existing storage (new rows joining ST storage)
-    let seed_from_existing = generate_seed_from_existing(ctx, recursive, &dt_table, columns)?;
+    let seed_from_existing = generate_seed_from_existing(ctx, recursive, &st_table, columns)?;
 
     // Non-linear seeds for multiple self-reference positions
     let self_ref_aliases = collect_self_ref_aliases(recursive);
@@ -503,7 +503,7 @@ fn generate_semi_naive_ins_only(
         recursive,
         &self_ref_aliases,
         &base_delta.cte_name,
-        &dt_table,
+        &st_table,
         columns,
     )?;
 
@@ -548,7 +548,7 @@ fn generate_semi_naive_ins_only(
 fn generate_cascade_propagation(
     recursive: &OpTree,
     cascade_cte: &str,
-    dt_table: &str,
+    st_table: &str,
 ) -> Result<String, PgStreamError> {
     // The recursive term is of the form:
     //   SELECT cols FROM base_table t JOIN <self_ref> r ON t.parent = r.id
@@ -559,7 +559,7 @@ fn generate_cascade_propagation(
     // We walk the OpTree to find the join and replace:
     //   - base table scans → ST storage scan
     //   - self-ref → cascade CTE
-    generate_query_sql_cascade(recursive, cascade_cte, dt_table)
+    generate_query_sql_cascade(recursive, cascade_cte, st_table)
 }
 
 /// Generate SQL for the cascade propagation, replacing base table scans
@@ -567,7 +567,7 @@ fn generate_cascade_propagation(
 fn generate_query_sql_cascade(
     op: &OpTree,
     cascade_cte: &str,
-    dt_table: &str,
+    st_table: &str,
 ) -> Result<String, PgStreamError> {
     match op {
         OpTree::InnerJoin {
@@ -575,8 +575,8 @@ fn generate_query_sql_cascade(
             left,
             right,
         } => {
-            let left_from = generate_cascade_from(left, cascade_cte, dt_table)?;
-            let right_from = generate_cascade_from(right, cascade_cte, dt_table)?;
+            let left_from = generate_cascade_from(left, cascade_cte, st_table)?;
+            let right_from = generate_cascade_from(right, cascade_cte, st_table)?;
             let mut all_cols = Vec::new();
             collect_cascade_cols(left, &mut all_cols);
             collect_cascade_cols(right, &mut all_cols);
@@ -592,8 +592,8 @@ fn generate_query_sql_cascade(
             left,
             right,
         } => {
-            let left_from = generate_cascade_from(left, cascade_cte, dt_table)?;
-            let right_from = generate_cascade_from(right, cascade_cte, dt_table)?;
+            let left_from = generate_cascade_from(left, cascade_cte, st_table)?;
+            let right_from = generate_cascade_from(right, cascade_cte, st_table)?;
             let mut all_cols = Vec::new();
             collect_cascade_cols(left, &mut all_cols);
             collect_cascade_cols(right, &mut all_cols);
@@ -609,7 +609,7 @@ fn generate_query_sql_cascade(
             aliases,
             child,
         } => {
-            let child_sql = generate_query_sql_cascade(child, cascade_cte, dt_table)?;
+            let child_sql = generate_query_sql_cascade(child, cascade_cte, st_table)?;
             let proj_exprs: Vec<String> = expressions
                 .iter()
                 .zip(aliases.iter())
@@ -629,7 +629,7 @@ fn generate_query_sql_cascade(
         }
 
         OpTree::Filter { predicate, child } => {
-            let child_sql = generate_query_sql_cascade(child, cascade_cte, dt_table)?;
+            let child_sql = generate_query_sql_cascade(child, cascade_cte, st_table)?;
             Ok(format!(
                 "SELECT * FROM (\n{child_sql}\n) __f\nWHERE {pred}",
                 pred = predicate.to_sql(),
@@ -652,12 +652,12 @@ fn generate_query_sql_cascade(
 fn generate_cascade_from(
     op: &OpTree,
     cascade_cte: &str,
-    dt_table: &str,
+    st_table: &str,
 ) -> Result<String, PgStreamError> {
     match op {
         // Base table scan → ST storage (we're finding existing derived rows)
         OpTree::Scan { alias, .. } => Ok(format!(
-            "{dt_table} AS {alias_q}",
+            "{st_table} AS {alias_q}",
             alias_q = quote_ident(alias),
         )),
 
@@ -668,7 +668,7 @@ fn generate_cascade_from(
         )),
 
         OpTree::Subquery { alias, child, .. } => {
-            let child_sql = generate_query_sql_cascade(child, cascade_cte, dt_table)?;
+            let child_sql = generate_query_sql_cascade(child, cascade_cte, st_table)?;
             Ok(format!(
                 "(\n{child_sql}\n) AS {alias_q}",
                 alias_q = quote_ident(alias),
@@ -676,7 +676,7 @@ fn generate_cascade_from(
         }
 
         _ => {
-            let sql = generate_query_sql_cascade(op, cascade_cte, dt_table)?;
+            let sql = generate_query_sql_cascade(op, cascade_cte, st_table)?;
             Ok(format!("(\n{sql}\n) AS __sub"))
         }
     }
@@ -714,12 +714,12 @@ fn generate_semi_naive_delta(
     _union_all: bool,
 ) -> Result<DiffResult, PgStreamError> {
     // We need the ST storage table name
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
             PgStreamError::InternalError(
-                "dt_qualified_name required for recursive CTE semi-naive diff".into(),
+                "st_qualified_name required for recursive CTE semi-naive diff".into(),
             )
         })?
         .clone();
@@ -739,7 +739,7 @@ fn generate_semi_naive_delta(
     // This handles the case where newly inserted base table rows join
     // with already-existing rows in the ST storage (e.g., a new child
     // node whose parent is already in the tree).
-    let seed_from_existing = generate_seed_from_existing(ctx, recursive, &dt_table, columns)?;
+    let seed_from_existing = generate_seed_from_existing(ctx, recursive, &st_table, columns)?;
 
     // For non-linear recursion (multiple self-references), generate
     // per-position seeds where each self-ref position alternately reads
@@ -749,7 +749,7 @@ fn generate_semi_naive_delta(
         recursive,
         &self_ref_aliases,
         &base_delta.cte_name,
-        &dt_table,
+        &st_table,
         columns,
     )?;
 
@@ -801,13 +801,13 @@ fn generate_semi_naive_delta(
 fn generate_seed_from_existing(
     ctx: &DiffContext,
     recursive: &OpTree,
-    dt_table: &str,
+    st_table: &str,
     _columns: &[String],
 ) -> Result<Option<String>, PgStreamError> {
     // Generate the recursive term SQL with the self-reference replaced
     // by the existing ST storage table, and base table scans replaced
     // by their change buffer deltas (INSERT rows only).
-    let sql = generate_query_sql_with_change_buffers(ctx, recursive, dt_table)?;
+    let sql = generate_query_sql_with_change_buffers(ctx, recursive, st_table)?;
 
     match sql {
         Some(s) => Ok(Some(s)),
@@ -1050,7 +1050,7 @@ fn collect_select_cols(op: &OpTree, out: &mut Vec<String>) {
     }
 }
 
-/// Generate the recursive term SQL with self-ref replaced by `dt_table`
+/// Generate the recursive term SQL with self-ref replaced by `st_table`
 /// (existing storage) and base table scans reading from change buffers
 /// (INSERT rows only). Used for the "new rows joining existing results"
 /// seed in semi-naive evaluation.
@@ -1060,7 +1060,7 @@ fn collect_select_cols(op: &OpTree, out: &mut Vec<String>) {
 fn generate_query_sql_with_change_buffers(
     ctx: &DiffContext,
     op: &OpTree,
-    dt_table: &str,
+    st_table: &str,
 ) -> Result<Option<String>, PgStreamError> {
     match op {
         OpTree::InnerJoin {
@@ -1070,10 +1070,10 @@ fn generate_query_sql_with_change_buffers(
         } => {
             // The recursive term is typically a JOIN between a base table
             // scan and the self-reference. We need to:
-            // - Replace self-ref with dt_table (existing storage)
+            // - Replace self-ref with st_table (existing storage)
             // - Replace base table with change buffer (INSERT rows only)
-            let left_from = generate_change_buffer_from(ctx, left, dt_table)?;
-            let right_from = generate_change_buffer_from(ctx, right, dt_table)?;
+            let left_from = generate_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_change_buffer_from(ctx, right, st_table)?;
 
             let mut all_cols = Vec::new();
             collect_select_cols(left, &mut all_cols);
@@ -1091,7 +1091,7 @@ fn generate_query_sql_with_change_buffers(
             aliases,
             child,
         } => {
-            let child_sql = generate_query_sql_with_change_buffers(ctx, child, dt_table)?;
+            let child_sql = generate_query_sql_with_change_buffers(ctx, child, st_table)?;
             match child_sql {
                 Some(inner) => {
                     let proj_exprs: Vec<String> = expressions
@@ -1116,7 +1116,7 @@ fn generate_query_sql_with_change_buffers(
         }
 
         OpTree::Filter { predicate, child } => {
-            let child_sql = generate_query_sql_with_change_buffers(ctx, child, dt_table)?;
+            let child_sql = generate_query_sql_with_change_buffers(ctx, child, st_table)?;
             match child_sql {
                 Some(inner) => Ok(Some(format!(
                     "SELECT * FROM (\n{inner}\n) __f\nWHERE {pred}",
@@ -1131,11 +1131,11 @@ fn generate_query_sql_with_change_buffers(
 }
 
 /// Generate a FROM-clause fragment that reads INSERTs from the change
-/// buffer for Scan nodes, or references dt_table for RecursiveSelfRef.
+/// buffer for Scan nodes, or references st_table for RecursiveSelfRef.
 fn generate_change_buffer_from(
     ctx: &DiffContext,
     op: &OpTree,
-    dt_table: &str,
+    st_table: &str,
 ) -> Result<String, PgStreamError> {
     match op {
         OpTree::Scan {
@@ -1176,14 +1176,14 @@ fn generate_change_buffer_from(
         OpTree::RecursiveSelfRef { alias, .. } => {
             // Use existing ST storage for the self-reference
             Ok(format!(
-                "{dt_table} AS {alias_q}",
+                "{st_table} AS {alias_q}",
                 alias_q = quote_ident(alias),
             ))
         }
 
         _ => {
             // For other node types, fall back to normal SQL generation
-            let sql = generate_query_sql(op, Some(dt_table))?;
+            let sql = generate_query_sql(op, Some(st_table))?;
             Ok(format!("(\n{sql}\n) AS __sub"))
         }
     }
@@ -1429,7 +1429,7 @@ fn generate_nonlinear_seeds(
     recursive: &OpTree,
     self_ref_aliases: &[String],
     base_delta_cte: &str,
-    dt_table: &str,
+    st_table: &str,
     columns: &[String],
 ) -> Result<Vec<String>, PgStreamError> {
     if self_ref_aliases.len() <= 1 {
@@ -1450,7 +1450,7 @@ fn generate_nonlinear_seeds(
                 replacements.insert(alias.clone(), delta_ref);
             } else {
                 // Other positions read from existing ST storage
-                replacements.insert(alias.clone(), dt_table.to_string());
+                replacements.insert(alias.clone(), st_table.to_string());
             }
         }
 
@@ -1613,16 +1613,16 @@ mod tests {
     // ── DRed: generate_cascade_from tests ───────────────────────────
 
     #[test]
-    fn test_generate_cascade_from_scan_uses_dt_table() {
+    fn test_generate_cascade_from_scan_uses_st_table() {
         let scan = make_scan(100, "categories", "public", "c", &["id", "parent_id"]);
-        let sql = generate_cascade_from(&scan, "__cascade", "\"public\".\"my_dt\"").unwrap();
-        assert_eq!(sql, "\"public\".\"my_dt\" AS \"c\"");
+        let sql = generate_cascade_from(&scan, "__cascade", "\"public\".\"my_st\"").unwrap();
+        assert_eq!(sql, "\"public\".\"my_st\" AS \"c\"");
     }
 
     #[test]
     fn test_generate_cascade_from_self_ref_uses_cascade_cte() {
         let self_ref = make_self_ref("tree", "t", &["id", "depth"]);
-        let sql = generate_cascade_from(&self_ref, "__cascade", "\"public\".\"my_dt\"").unwrap();
+        let sql = generate_cascade_from(&self_ref, "__cascade", "\"public\".\"my_st\"").unwrap();
         assert_eq!(sql, "__cascade AS \"t\"");
     }
 
@@ -1649,11 +1649,11 @@ mod tests {
             right: Box::new(right),
         };
 
-        let sql = generate_query_sql_cascade(&join, "__del_cascade", "\"public\".\"dt\"").unwrap();
+        let sql = generate_query_sql_cascade(&join, "__del_cascade", "\"public\".\"st\"").unwrap();
         // Self-ref should be replaced with cascade CTE
         assert!(sql.contains("__del_cascade AS \"t\""));
         // Base table should be replaced with ST storage
-        assert!(sql.contains("\"public\".\"dt\" AS \"c\""));
+        assert!(sql.contains("\"public\".\"st\" AS \"c\""));
         // Join condition should be preserved (BinaryOp wraps in parens)
         assert!(sql.contains("(c.parent_id = t.id)"));
     }
@@ -1682,10 +1682,10 @@ mod tests {
             child: Box::new(join),
         };
 
-        let sql = generate_query_sql_cascade(&filtered, "__casc", "\"public\".\"dt\"").unwrap();
+        let sql = generate_query_sql_cascade(&filtered, "__casc", "\"public\".\"st\"").unwrap();
         assert!(sql.contains("WHERE r.hops < 10"));
         assert!(sql.contains("__casc AS \"r\""));
-        assert!(sql.contains("\"public\".\"dt\" AS \"e\""));
+        assert!(sql.contains("\"public\".\"st\" AS \"e\""));
     }
 
     #[test]
@@ -1719,7 +1719,7 @@ mod tests {
             child: Box::new(join),
         };
 
-        let sql = generate_query_sql_cascade(&projected, "__casc", "\"public\".\"dt\"").unwrap();
+        let sql = generate_query_sql_cascade(&projected, "__casc", "\"public\".\"st\"").unwrap();
         assert!(sql.contains("t.depth + 1 AS \"depth\""));
         assert!(sql.contains("__casc AS \"t\""));
     }
@@ -1837,7 +1837,7 @@ mod tests {
             "r1".to_string(),
             "(SELECT \"src\", \"dst\" FROM __delta WHERE __pgs_action = 'I')".to_string(),
         );
-        map.insert("r2".to_string(), "\"public\".\"dt\"".to_string());
+        map.insert("r2".to_string(), "\"public\".\"st\"".to_string());
 
         let sql = generate_query_sql_targeted(&join, &map).unwrap();
         assert!(
@@ -1845,7 +1845,7 @@ mod tests {
                 "(SELECT \"src\", \"dst\" FROM __delta WHERE __pgs_action = 'I') AS \"r1\""
             )
         );
-        assert!(sql.contains("\"public\".\"dt\" AS \"r2\""));
+        assert!(sql.contains("\"public\".\"st\" AS \"r2\""));
         assert!(sql.contains("(r1.dst = r2.src)"));
     }
 
@@ -1864,7 +1864,7 @@ mod tests {
             &join,
             &aliases,
             "__base_delta",
-            "\"public\".\"dt\"",
+            "\"public\".\"st\"",
             &["id".to_string(), "pid".to_string()],
         )
         .unwrap();
@@ -1898,7 +1898,7 @@ mod tests {
             &join,
             &aliases,
             "__base_delta",
-            "\"public\".\"dt\"",
+            "\"public\".\"st\"",
             &columns,
         )
         .unwrap();
@@ -1911,13 +1911,13 @@ mod tests {
             "Seed 0 should reference base delta inserts"
         );
         assert!(
-            seeds[0].contains("\"public\".\"dt\" AS \"r2\""),
+            seeds[0].contains("\"public\".\"st\" AS \"r2\""),
             "Seed 0 should use ST storage for r2"
         );
 
         // Seed 1: r1 = ST storage, r2 = delta
         assert!(
-            seeds[1].contains("\"public\".\"dt\" AS \"r1\""),
+            seeds[1].contains("\"public\".\"st\" AS \"r1\""),
             "Seed 1 should use ST storage for r1"
         );
         assert!(
@@ -2126,10 +2126,10 @@ mod tests {
             right: Box::new(right),
         };
 
-        let sql = generate_query_sql_cascade(&join, "__casc", "\"public\".\"dt\"").unwrap();
+        let sql = generate_query_sql_cascade(&join, "__casc", "\"public\".\"st\"").unwrap();
         assert!(sql.contains("LEFT JOIN"));
         assert!(sql.contains("__casc AS \"t\""));
-        assert!(sql.contains("\"public\".\"dt\" AS \"c\""));
+        assert!(sql.contains("\"public\".\"st\" AS \"c\""));
     }
 
     // ── generate_query_sql_cascade: unsupported variant ─────────────
@@ -2141,7 +2141,7 @@ mod tests {
             aggregates: vec![],
             child: Box::new(make_scan(1, "t", "public", "t", &["id"])),
         };
-        let result = generate_query_sql_cascade(&agg, "__casc", "dt");
+        let result = generate_query_sql_cascade(&agg, "__casc", "st");
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("generate_query_sql_cascade"));
@@ -2174,7 +2174,7 @@ mod tests {
             column_aliases: vec![],
             child: Box::new(join),
         };
-        let sql = generate_cascade_from(&subquery, "__casc", "\"public\".\"dt\"").unwrap();
+        let sql = generate_cascade_from(&subquery, "__casc", "\"public\".\"st\"").unwrap();
         assert!(sql.contains("AS \"sub\""));
     }
 
@@ -2205,7 +2205,7 @@ mod tests {
             predicate: Expr::Literal("id > 0".to_string()),
             child: Box::new(join),
         };
-        let sql = generate_cascade_from(&filter, "__casc", "\"public\".\"dt\"").unwrap();
+        let sql = generate_cascade_from(&filter, "__casc", "\"public\".\"st\"").unwrap();
         assert!(sql.contains("AS __sub"));
     }
 

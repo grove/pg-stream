@@ -5,14 +5,14 @@
 //! - Frontier JSON serialization roundtrips
 //! - DAG cycle detection correctness
 //! - Topological sort ordering respects edges
-//! - DtStatus/RefreshMode enum roundtrips
+//! - StStatus/RefreshMode enum roundtrips
 //! - Canonical period selection bounds
 //! - Hash determinism and collision resistance
 
 // These tests exercise pure functions from the library.
 // We use `pg_stream` as a lib crate (cdylib + lib).
 
-use pg_stream::dag::{DagNode, DtDag, DtStatus, NodeId, RefreshMode};
+use pg_stream::dag::{DagNode, NodeId, RefreshMode, StDag, StStatus};
 use pg_stream::dvm::diff::{col_list, prefixed_col_list, quote_ident};
 use pg_stream::dvm::parser::{AggFunc, Expr};
 use pg_stream::version::{Frontier, lsn_gt, lsn_gte, select_canonical_period_secs};
@@ -225,18 +225,18 @@ proptest! {
         prop_assert_eq!(name, name.to_uppercase());
     }
 
-    // ── DtStatus/RefreshMode roundtrip ─────────────────────────────
+    // ── StStatus/RefreshMode roundtrip ─────────────────────────────
 
     #[test]
     fn prop_pgs_status_roundtrip(idx in 0u8..4) {
         let status = match idx {
-            0 => DtStatus::Initializing,
-            1 => DtStatus::Active,
-            2 => DtStatus::Suspended,
-            _ => DtStatus::Error,
+            0 => StStatus::Initializing,
+            1 => StStatus::Active,
+            2 => StStatus::Suspended,
+            _ => StStatus::Error,
         };
         let s = status.as_str();
-        let parsed = DtStatus::from_str(s).unwrap();
+        let parsed = StStatus::from_str(s).unwrap();
         prop_assert_eq!(status, parsed);
     }
 
@@ -259,14 +259,14 @@ proptest! {
 #[test]
 fn prop_dag_acyclic_topological_order_respects_edges() {
     // Build a DAG: 1→2, 1→3, 2→4, 3→4
-    let mut dag = DtDag::new();
+    let mut dag = StDag::new();
     for &id in &[1i64, 2, 3, 4] {
         dag.add_dt_node(DagNode {
             id: NodeId::StreamTable(id),
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
-            name: format!("dt_{id}"),
-            status: DtStatus::Active,
+            name: format!("st_{id}"),
+            status: StStatus::Active,
             schedule_raw: None,
         });
     }
@@ -291,14 +291,14 @@ fn prop_dag_acyclic_topological_order_respects_edges() {
 #[test]
 fn prop_dag_cycle_detected() {
     // Build a cyclic graph: 1→2, 2→3, 3→1
-    let mut dag = DtDag::new();
+    let mut dag = StDag::new();
     for &id in &[1i64, 2, 3] {
         dag.add_dt_node(DagNode {
             id: NodeId::StreamTable(id),
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
-            name: format!("dt_{id}"),
-            status: DtStatus::Active,
+            name: format!("st_{id}"),
+            status: StStatus::Active,
             schedule_raw: None,
         });
     }
@@ -312,14 +312,14 @@ fn prop_dag_cycle_detected() {
 #[test]
 fn prop_dag_linear_chain_order() {
     // 1→2→3→4→5
-    let mut dag = DtDag::new();
+    let mut dag = StDag::new();
     for id in 1i64..=5 {
         dag.add_dt_node(DagNode {
             id: NodeId::StreamTable(id),
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
-            name: format!("dt_{id}"),
-            status: DtStatus::Active,
+            name: format!("st_{id}"),
+            status: StStatus::Active,
             schedule_raw: None,
         });
     }
@@ -343,29 +343,29 @@ fn prop_dag_linear_chain_order() {
 #[test]
 fn prop_dag_calculated_schedule_resolution() {
     // dt1 (schedule=60) ← dt2 (CALCULATED)
-    let mut dag = DtDag::new();
+    let mut dag = StDag::new();
     dag.add_dt_node(DagNode {
         id: NodeId::StreamTable(1),
         schedule: Some(Duration::from_secs(60)),
         effective_schedule: Duration::from_secs(60),
-        name: "dt_1".into(),
-        status: DtStatus::Active,
+        name: "st_1".into(),
+        status: StStatus::Active,
         schedule_raw: None,
     });
     dag.add_dt_node(DagNode {
         id: NodeId::StreamTable(2),
         schedule: None, // CALCULATED
         effective_schedule: Duration::ZERO,
-        name: "dt_2".into(),
-        status: DtStatus::Active,
+        name: "st_2".into(),
+        status: StStatus::Active,
         schedule_raw: None,
     });
-    // dt_2 depends on dt_1: so dt_1 is upstream of dt_2
-    // edge: dt_1 → dt_2 (dt_1 is source, dt_2 is downstream)
+    // st_2 depends on st_1: so st_1 is upstream of st_2
+    // edge: st_1 → st_2 (st_1 is source, st_2 is downstream)
     dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
 
-    // CALCULATED means: look at dt_2's downstream dependents.
-    // dt_2 has no dependents, so fallback applies.
+    // CALCULATED means: look at st_2's downstream dependents.
+    // st_2 has no dependents, so fallback applies.
     dag.resolve_calculated_schedule(30); // fallback = 30s
 
     let nodes = dag.get_all_dt_nodes();
@@ -379,20 +379,20 @@ fn prop_dag_calculated_schedule_resolution() {
 
 #[test]
 fn prop_dag_empty_is_acyclic() {
-    let dag = DtDag::new();
+    let dag = StDag::new();
     assert!(dag.detect_cycles().is_ok());
     assert!(dag.topological_order().unwrap().is_empty());
 }
 
 #[test]
 fn prop_dag_single_node_no_cycle() {
-    let mut dag = DtDag::new();
+    let mut dag = StDag::new();
     dag.add_dt_node(DagNode {
         id: NodeId::StreamTable(1),
         schedule: Some(Duration::from_secs(60)),
         effective_schedule: Duration::from_secs(60),
-        name: "dt_1".into(),
-        status: DtStatus::Active,
+        name: "st_1".into(),
+        status: StStatus::Active,
         schedule_raw: None,
     });
     assert!(dag.detect_cycles().is_ok());
@@ -401,14 +401,14 @@ fn prop_dag_single_node_no_cycle() {
 
 #[test]
 fn prop_dag_base_table_edges() {
-    // base table → dt is valid, no cycle possible with a single ST
-    let mut dag = DtDag::new();
+    // base table → st is valid, no cycle possible with a single ST
+    let mut dag = StDag::new();
     dag.add_dt_node(DagNode {
         id: NodeId::StreamTable(1),
         schedule: Some(Duration::from_secs(60)),
         effective_schedule: Duration::from_secs(60),
-        name: "dt_1".into(),
-        status: DtStatus::Active,
+        name: "st_1".into(),
+        status: StStatus::Active,
         schedule_raw: None,
     });
     dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));

@@ -25,8 +25,8 @@ async fn test_aggregate_with_having_full_mode() {
     )
     .await;
 
-    db.create_dt(
-        "having_dt",
+    db.create_st(
+        "having_st",
         "SELECT region, SUM(amount) AS total FROM having_src GROUP BY region HAVING SUM(amount) > 100",
         "1m",
         "FULL",
@@ -34,17 +34,17 @@ async fn test_aggregate_with_having_full_mode() {
     .await;
 
     // east=300 (>100), west=125 (>100), north=300 (>100) → 3 rows
-    let count = db.count("public.having_dt").await;
+    let count = db.count("public.having_st").await;
     assert_eq!(count, 3, "All three regions exceed 100");
 
     // Insert data to make north drop below threshold via update-by-delete
     db.execute("DELETE FROM having_src WHERE id = 3").await; // west now 75 (<= 100? no, 75)
     db.execute("DELETE FROM having_src WHERE id = 4").await; // west now 0
 
-    db.refresh_dt("having_dt").await;
+    db.refresh_st("having_st").await;
 
     // west is gone (0 total), east=300, north=300 → 2 rows
-    let count = db.count("public.having_dt").await;
+    let count = db.count("public.having_st").await;
     assert_eq!(
         count, 2,
         "West should be filtered out by HAVING after delete"
@@ -63,8 +63,8 @@ async fn test_aggregate_with_having_differential_mode() {
     )
     .await;
 
-    db.create_dt(
-        "having_inc_dt",
+    db.create_st(
+        "having_inc_st",
         "SELECT category, SUM(score) AS total_score FROM having_inc_src GROUP BY category HAVING SUM(score) > 5",
         "1m",
         "DIFFERENTIAL",
@@ -72,15 +72,15 @@ async fn test_aggregate_with_having_differential_mode() {
     .await;
 
     // A=30 (>5), B=8 (>5) → 2 rows
-    let count = db.count("public.having_inc_dt").await;
+    let count = db.count("public.having_inc_st").await;
     assert_eq!(count, 2);
 
     // Add more data and refresh
     db.execute("INSERT INTO having_inc_src VALUES (5, 'C', 100)")
         .await;
-    db.refresh_dt("having_inc_dt").await;
+    db.refresh_st("having_inc_st").await;
 
-    let count = db.count("public.having_inc_dt").await;
+    let count = db.count("public.having_inc_st").await;
     assert_eq!(count, 3, "Category C should appear after insert + refresh");
 }
 
@@ -95,25 +95,25 @@ async fn test_case_expression_in_defining_query() {
     db.execute("INSERT INTO case_src VALUES (1, 10), (2, 50), (3, 100)")
         .await;
 
-    db.create_dt(
-        "case_dt",
+    db.create_st(
+        "case_st",
         "SELECT id, CASE WHEN val < 25 THEN 'low' WHEN val < 75 THEN 'mid' ELSE 'high' END AS bucket FROM case_src",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.case_dt").await;
+    let count = db.count("public.case_st").await;
     assert_eq!(count, 3);
 
     // Verify values
     let low_count: i64 = db
-        .query_scalar("SELECT count(*) FROM public.case_dt WHERE bucket = 'low'")
+        .query_scalar("SELECT count(*) FROM public.case_st WHERE bucket = 'low'")
         .await;
     assert_eq!(low_count, 1);
 
     let high_count: i64 = db
-        .query_scalar("SELECT count(*) FROM public.case_dt WHERE bucket = 'high'")
+        .query_scalar("SELECT count(*) FROM public.case_st WHERE bucket = 'high'")
         .await;
     assert_eq!(high_count, 1);
 }
@@ -130,20 +130,20 @@ async fn test_case_expression_in_aggregate() {
     )
     .await;
 
-    db.create_dt(
-        "case_agg_dt",
+    db.create_st(
+        "case_agg_st",
         "SELECT status, SUM(CASE WHEN amount > 60 THEN amount ELSE 0 END) AS big_total FROM case_agg_src GROUP BY status",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.case_agg_dt").await;
+    let count = db.count("public.case_agg_st").await;
     assert_eq!(count, 2, "Two status groups");
 
     // active: 100+200=300 (both > 60), inactive: 0+75=75 (only 75 > 60)
     let active_total: i64 = db
-        .query_scalar("SELECT big_total::bigint FROM public.case_agg_dt WHERE status = 'active'")
+        .query_scalar("SELECT big_total::bigint FROM public.case_agg_st WHERE status = 'active'")
         .await;
     assert_eq!(active_total, 300);
 }
@@ -170,8 +170,8 @@ async fn test_multi_condition_join() {
     .await;
 
     // Join on both customer_id and region (multi-condition ON)
-    db.create_dt(
-        "mc_join_dt",
+    db.create_st(
+        "mc_join_st",
         "SELECT o.id, c.name, o.amount FROM mc_orders o JOIN mc_customers c ON o.customer_id = c.id AND o.region = c.region",
         "1m",
         "FULL",
@@ -180,7 +180,7 @@ async fn test_multi_condition_join() {
 
     // Only orders where customer_id AND region match: order 1 (Alice, east) and order 2 (Bob, west)
     // Order 3 (customer_id=1=Alice, region=west) doesn't match Alice's region (east)
-    let count = db.count("public.mc_join_dt").await;
+    let count = db.count("public.mc_join_st").await;
     assert_eq!(count, 2, "Multi-condition join should match 2 rows");
 }
 
@@ -198,20 +198,20 @@ async fn test_left_join_with_null_handling() {
     db.execute("INSERT INTO lj_reviews VALUES (1, 1, 5), (2, 1, 4), (3, 2, 3)")
         .await;
 
-    db.create_dt(
-        "lj_dt",
+    db.create_st(
+        "lj_st",
         "SELECT p.id, p.name, COALESCE(AVG(r.rating), 0) AS avg_rating FROM lj_products p LEFT JOIN lj_reviews r ON p.id = r.product_id GROUP BY p.id, p.name",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.lj_dt").await;
+    let count = db.count("public.lj_st").await;
     assert_eq!(count, 3, "LEFT JOIN should include all products");
 
     // Doohickey has no reviews, COALESCE should give 0
     let doohickey_rating: i64 = db
-        .query_scalar("SELECT avg_rating::bigint FROM public.lj_dt WHERE name = 'Doohickey'")
+        .query_scalar("SELECT avg_rating::bigint FROM public.lj_st WHERE name = 'Doohickey'")
         .await;
     assert_eq!(doohickey_rating, 0);
 }
@@ -230,8 +230,8 @@ async fn test_subquery_in_from_clause() {
     )
     .await;
 
-    db.create_dt(
-        "sub_dt",
+    db.create_st(
+        "sub_st",
         "SELECT category, total FROM (SELECT category, SUM(val) AS total FROM sub_src GROUP BY category) sub WHERE total > 25",
         "1m",
         "FULL",
@@ -239,7 +239,7 @@ async fn test_subquery_in_from_clause() {
     .await;
 
     // A=30 (>25), B=70 (>25) → 2 rows
-    let count = db.count("public.sub_dt").await;
+    let count = db.count("public.sub_st").await;
     assert_eq!(count, 2);
 }
 
@@ -257,19 +257,19 @@ async fn test_subquery_in_from_with_join() {
     db.execute("INSERT INTO sub_join_facts VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)")
         .await;
 
-    db.create_dt(
-        "sub_join_dt",
+    db.create_st(
+        "sub_join_st",
         "SELECT d.label, f.total FROM sub_join_dims d JOIN (SELECT dim_id, SUM(measure) AS total FROM sub_join_facts GROUP BY dim_id) f ON d.id = f.dim_id",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.sub_join_dt").await;
+    let count = db.count("public.sub_join_st").await;
     assert_eq!(count, 2, "Should have one row per dimension");
 
     let alpha_total: i64 = db
-        .query_scalar("SELECT total::bigint FROM public.sub_join_dt WHERE label = 'Alpha'")
+        .query_scalar("SELECT total::bigint FROM public.sub_join_st WHERE label = 'Alpha'")
         .await;
     assert_eq!(alpha_total, 300);
 }
@@ -291,20 +291,20 @@ async fn test_window_rows_between_frame() {
     .await;
 
     // 3-day moving average using ROWS BETWEEN
-    db.create_dt(
-        "win_frame_dt",
+    db.create_st(
+        "win_frame_st",
         "SELECT id, ts, val, AVG(val) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_avg FROM win_frame_src",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.win_frame_dt").await;
+    let count = db.count("public.win_frame_st").await;
     assert_eq!(count, 5);
 
     // Middle row (id=3): avg of 20,30,40 = 30
     let mid_avg: i64 = db
-        .query_scalar("SELECT moving_avg::bigint FROM public.win_frame_dt WHERE id = 3")
+        .query_scalar("SELECT moving_avg::bigint FROM public.win_frame_st WHERE id = 3")
         .await;
     assert_eq!(mid_avg, 30, "Moving average of 20,30,40 should be 30");
 }
@@ -323,20 +323,20 @@ async fn test_window_range_frame() {
     .await;
 
     // Cumulative sum with RANGE
-    db.create_dt(
-        "win_range_dt",
+    db.create_st(
+        "win_range_st",
         "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumsum FROM win_range_src",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.win_range_dt").await;
+    let count = db.count("public.win_range_st").await;
     assert_eq!(count, 5);
 
     // A group: 10, 30 (10+20), 60 (10+20+30)
     let a_last: i64 = db
-        .query_scalar("SELECT cumsum::bigint FROM public.win_range_dt WHERE id = 3")
+        .query_scalar("SELECT cumsum::bigint FROM public.win_range_st WHERE id = 3")
         .await;
     assert_eq!(a_last, 60, "Cumulative sum for A group should be 60");
 }
@@ -354,21 +354,21 @@ async fn test_window_nth_value() {
     )
     .await;
 
-    db.create_dt(
-        "win_nth_dt",
+    db.create_st(
+        "win_nth_st",
         "SELECT id, dept, salary, NTH_VALUE(salary, 2) OVER (PARTITION BY dept ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS second_highest FROM win_nth_src",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.win_nth_dt").await;
+    let count = db.count("public.win_nth_st").await;
     assert_eq!(count, 5);
 
     // eng: sorted desc = 120, 100, 90 → 2nd = 100
     let eng_second: i64 = db
         .query_scalar(
-            "SELECT DISTINCT second_highest::bigint FROM public.win_nth_dt WHERE dept = 'eng'",
+            "SELECT DISTINCT second_highest::bigint FROM public.win_nth_st WHERE dept = 'eng'",
         )
         .await;
     assert_eq!(eng_second, 100);

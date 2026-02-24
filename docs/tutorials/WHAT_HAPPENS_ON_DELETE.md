@@ -125,9 +125,9 @@ Note: the 'U' meta-action is emitted as `__pgs_action = 'I'` because the MERGE t
 The MERGE statement matches alice's existing row and updates it:
 
 ```sql
-MERGE INTO customer_totals AS dt
+MERGE INTO customer_totals AS st
 USING (...delta...) AS d
-ON dt.__pgs_row_id = d.__pgs_row_id
+ON st.__pgs_row_id = d.__pgs_row_id
 WHEN MATCHED AND d.__pgs_action = 'I' THEN
   UPDATE SET customer = d.customer, total = d.total, order_count = d.order_count, ...
 ```

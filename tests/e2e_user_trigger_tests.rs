@@ -72,7 +72,7 @@ async fn test_explicit_dml_insert() {
     db.execute("INSERT INTO src_ins VALUES (1, 'a')").await;
 
     // Create stream table (DIFFERENTIAL)
-    db.create_dt(
+    db.create_st(
         "st_ins",
         "SELECT id, val FROM src_ins",
         "1m",
@@ -81,9 +81,9 @@ async fn test_explicit_dml_insert() {
     .await;
 
     // Establish frontier so subsequent refreshes use DIFFERENTIAL (not FULL
-    // fallback). Without this, the first refresh_dt falls back to FULL which
+    // fallback). Without this, the first refresh_st falls back to FULL which
     // suppresses user triggers.
-    db.refresh_dt("st_ins").await;
+    db.refresh_st("st_ins").await;
 
     // Attach audit trigger on the stream table
     for sql in audit_trigger_sql("st_ins") {
@@ -96,7 +96,7 @@ async fn test_explicit_dml_insert() {
 
     // Insert a new source row and refresh
     db.execute("INSERT INTO src_ins VALUES (2, 'b')").await;
-    db.refresh_dt("st_ins").await;
+    db.refresh_st("st_ins").await;
 
     // Verify the ST has both rows
     let st_count: i64 = db.count("st_ins").await;
@@ -134,7 +134,7 @@ async fn test_explicit_dml_update() {
         .await;
     db.execute("INSERT INTO src_upd VALUES (1, 'old')").await;
 
-    db.create_dt(
+    db.create_st(
         "st_upd",
         "SELECT id, val FROM src_upd",
         "1m",
@@ -143,7 +143,7 @@ async fn test_explicit_dml_update() {
     .await;
 
     // Initial refresh to populate
-    db.refresh_dt("st_upd").await;
+    db.refresh_st("st_upd").await;
 
     // Attach audit trigger and clear log
     for sql in audit_trigger_sql("st_upd") {
@@ -154,7 +154,7 @@ async fn test_explicit_dml_update() {
     // Update source and refresh
     db.execute("UPDATE src_upd SET val = 'new' WHERE id = 1")
         .await;
-    db.refresh_dt("st_upd").await;
+    db.refresh_st("st_upd").await;
 
     // ST should still have 1 row with updated value
     let val: String = db.query_scalar("SELECT val FROM st_upd WHERE id = 1").await;
@@ -191,7 +191,7 @@ async fn test_explicit_dml_delete() {
         .await;
     db.execute("INSERT INTO src_del VALUES (1, 'bye')").await;
 
-    db.create_dt(
+    db.create_st(
         "st_del",
         "SELECT id, val FROM src_del",
         "1m",
@@ -200,7 +200,7 @@ async fn test_explicit_dml_delete() {
     .await;
 
     // Initial refresh
-    db.refresh_dt("st_del").await;
+    db.refresh_st("st_del").await;
 
     // Attach audit trigger and clear
     for sql in audit_trigger_sql("st_del") {
@@ -210,7 +210,7 @@ async fn test_explicit_dml_delete() {
 
     // Delete source row and refresh
     db.execute("DELETE FROM src_del WHERE id = 1").await;
-    db.refresh_dt("st_del").await;
+    db.refresh_st("st_del").await;
 
     // ST should be empty
     let st_count: i64 = db.count("st_del").await;
@@ -249,7 +249,7 @@ async fn test_explicit_dml_no_op_skip() {
     db.execute("INSERT INTO src_agg VALUES (1, 'A', 10), (2, 'A', 20)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "st_agg",
         "SELECT grp, sum(amount) AS total FROM src_agg GROUP BY grp",
         "1m",
@@ -258,7 +258,7 @@ async fn test_explicit_dml_no_op_skip() {
     .await;
 
     // Initial refresh
-    db.refresh_dt("st_agg").await;
+    db.refresh_st("st_agg").await;
 
     // Attach audit trigger on the aggregate ST
     // The ST has columns (grp TEXT, total BIGINT) — adapt the trigger
@@ -310,7 +310,7 @@ async fn test_explicit_dml_no_op_skip() {
         .await;
     db.execute("UPDATE src_agg SET amount = 15 WHERE id = 2")
         .await;
-    db.refresh_dt("st_agg").await;
+    db.refresh_st("st_agg").await;
 
     // The IS DISTINCT FROM guard should have prevented an UPDATE trigger
     // because the aggregate result (grp='A', total=30) is unchanged.
@@ -333,7 +333,7 @@ async fn test_no_trigger_uses_merge() {
     db.execute("INSERT INTO src_merge VALUES (1, 'x')").await;
 
     // Create ST without any user triggers
-    db.create_dt(
+    db.create_st(
         "st_merge",
         "SELECT id, val FROM src_merge",
         "1m",
@@ -343,13 +343,13 @@ async fn test_no_trigger_uses_merge() {
 
     // Insert new row
     db.execute("INSERT INTO src_merge VALUES (2, 'y')").await;
-    db.refresh_dt("st_merge").await;
+    db.refresh_st("st_merge").await;
 
     // Verify data is correct (MERGE path should work normally)
     let count: i64 = db.count("st_merge").await;
     assert_eq!(count, 2, "ST should have 2 rows after MERGE refresh");
 
-    db.assert_dt_matches_query("st_merge", "SELECT id, val FROM src_merge")
+    db.assert_st_matches_query("st_merge", "SELECT id, val FROM src_merge")
         .await;
 }
 
@@ -364,7 +364,7 @@ async fn test_trigger_audit_trail() {
     db.execute("INSERT INTO src_audit VALUES (1, 'first'), (2, 'second')")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "st_audit",
         "SELECT id, val FROM src_audit",
         "1m",
@@ -373,7 +373,7 @@ async fn test_trigger_audit_trail() {
     .await;
 
     // Initial refresh
-    db.refresh_dt("st_audit").await;
+    db.refresh_st("st_audit").await;
 
     // Attach audit trigger
     for sql in audit_trigger_sql("st_audit") {
@@ -387,10 +387,10 @@ async fn test_trigger_audit_trail() {
     db.execute("UPDATE src_audit SET val = 'updated' WHERE id = 1")
         .await;
     db.execute("DELETE FROM src_audit WHERE id = 2").await;
-    db.refresh_dt("st_audit").await;
+    db.refresh_st("st_audit").await;
 
     // Verify ST matches expected state
-    db.assert_dt_matches_query("st_audit", "SELECT id, val FROM src_audit")
+    db.assert_st_matches_query("st_audit", "SELECT id, val FROM src_audit")
         .await;
 
     // Verify audit trail: should have INSERT(3), UPDATE(1), DELETE(2)
@@ -420,7 +420,7 @@ async fn test_guc_off_suppresses_triggers() {
         .await;
     db.execute("INSERT INTO src_guc_off VALUES (1, 'a')").await;
 
-    db.create_dt(
+    db.create_st(
         "st_guc_off",
         "SELECT id, val FROM src_guc_off",
         "1m",
@@ -429,7 +429,7 @@ async fn test_guc_off_suppresses_triggers() {
     .await;
 
     // Initial refresh
-    db.refresh_dt("st_guc_off").await;
+    db.refresh_st("st_guc_off").await;
 
     // Attach trigger
     for sql in audit_trigger_sql("st_guc_off") {
@@ -442,7 +442,7 @@ async fn test_guc_off_suppresses_triggers() {
 
     // Modify source and refresh
     db.execute("INSERT INTO src_guc_off VALUES (2, 'b')").await;
-    db.refresh_dt("st_guc_off").await;
+    db.refresh_st("st_guc_off").await;
 
     // ST should have the data
     let count: i64 = db.count("st_guc_off").await;
@@ -467,7 +467,7 @@ async fn test_guc_auto_detects_triggers() {
         .await;
     db.execute("INSERT INTO src_guc_auto VALUES (1, 'a')").await;
 
-    db.create_dt(
+    db.create_st(
         "st_guc_auto",
         "SELECT id, val FROM src_guc_auto",
         "1m",
@@ -476,7 +476,7 @@ async fn test_guc_auto_detects_triggers() {
     .await;
 
     // Initial refresh
-    db.refresh_dt("st_guc_auto").await;
+    db.refresh_st("st_guc_auto").await;
 
     // GUC should default to 'auto'
     let guc_val: String = db.query_scalar("SHOW pg_stream.user_triggers").await;
@@ -490,7 +490,7 @@ async fn test_guc_auto_detects_triggers() {
 
     // Modify source and refresh
     db.execute("INSERT INTO src_guc_auto VALUES (2, 'b')").await;
-    db.refresh_dt("st_guc_auto").await;
+    db.refresh_st("st_guc_auto").await;
 
     // Auto mode should have detected the trigger and used explicit DML
     let insert_count: i64 = db
@@ -515,7 +515,7 @@ async fn test_full_refresh_suppresses_triggers() {
         .await;
 
     // Create a FULL mode stream table
-    db.create_dt("st_full", "SELECT id, val FROM src_full", "1m", "FULL")
+    db.create_st("st_full", "SELECT id, val FROM src_full", "1m", "FULL")
         .await;
 
     // Attach audit trigger
@@ -526,7 +526,7 @@ async fn test_full_refresh_suppresses_triggers() {
 
     // Modify source and do a FULL refresh
     db.execute("INSERT INTO src_full VALUES (3, 'c')").await;
-    db.refresh_dt("st_full").await;
+    db.refresh_st("st_full").await;
 
     // ST should have all 3 rows
     let count: i64 = db.count("st_full").await;
@@ -552,7 +552,7 @@ async fn test_before_trigger_modifies_new() {
     db.execute("INSERT INTO src_before VALUES (1, 'hello')")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "st_before",
         "SELECT id, val FROM src_before",
         "1m",
@@ -561,7 +561,7 @@ async fn test_before_trigger_modifies_new() {
     .await;
 
     // Initial refresh
-    db.refresh_dt("st_before").await;
+    db.refresh_st("st_before").await;
 
     // Attach a BEFORE UPDATE trigger that uppercases val
     db.execute(
@@ -584,7 +584,7 @@ async fn test_before_trigger_modifies_new() {
     // Update source and refresh
     db.execute("UPDATE src_before SET val = 'world' WHERE id = 1")
         .await;
-    db.refresh_dt("st_before").await;
+    db.refresh_st("st_before").await;
 
     // The BEFORE trigger should have uppercased the value
     let val: String = db

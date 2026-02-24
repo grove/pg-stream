@@ -28,8 +28,8 @@
 
 use pgrx::prelude::*;
 
-use crate::catalog::{CdcMode, DtDependency, StreamTableMeta};
-use crate::dag::DtStatus;
+use crate::catalog::{CdcMode, StDependency, StreamTableMeta};
+use crate::dag::StStatus;
 use crate::error::PgStreamError;
 use crate::shmem;
 use crate::{cdc, config, wal_decoder};
@@ -177,7 +177,7 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
     }
 
     // Cascade: find STs that depend on the affected STs (transitive).
-    let cascade_ids = match find_transitive_downstream_dts(&affected_pgs_ids) {
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!("pg_stream_ddl_tracker: failed to cascade reinit: {}", e);
@@ -234,7 +234,7 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
 /// back to triggers, reinitialize the downstream STs, and let the transition
 /// restart once the reinitialize completes.
 fn handle_alter_table_wal_fallback(source_oid: pg_sys::Oid, identity: &str, change_schema: &str) {
-    let deps = match DtDependency::get_all() {
+    let deps = match StDependency::get_all() {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -418,7 +418,7 @@ fn handle_dropped_table(obj: &DroppedObject) {
 
     // Mark affected STs as ERROR — their source is gone.
     for pgs_id in &affected_pgs_ids {
-        if let Err(e) = StreamTableMeta::update_status(*pgs_id, DtStatus::Error) {
+        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
             pgrx::warning!(
                 "pg_stream_ddl_tracker: failed to set ST {} to ERROR: {}",
                 pgs_id,
@@ -428,7 +428,7 @@ fn handle_dropped_table(obj: &DroppedObject) {
     }
 
     // Cascade: STs depending on now-errored STs also go to ERROR.
-    let cascade_ids = match find_transitive_downstream_dts(&affected_pgs_ids) {
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!("pg_stream_ddl_tracker: failed to cascade error: {}", e);
@@ -437,7 +437,7 @@ fn handle_dropped_table(obj: &DroppedObject) {
     };
 
     for pgs_id in &cascade_ids {
-        if let Err(e) = StreamTableMeta::update_status(*pgs_id, DtStatus::Error) {
+        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
             pgrx::warning!(
                 "pg_stream_ddl_tracker: failed to cascade ERROR to ST {}: {}",
                 pgs_id,
@@ -459,12 +459,12 @@ fn handle_dropped_table(obj: &DroppedObject) {
 /// Clean up the catalog entry and signal a DAG rebuild.
 fn handle_dt_storage_dropped(relid: pg_sys::Oid, identity: &str) {
     // Find and delete the ST catalog entry.
-    let dt = match StreamTableMeta::get_by_relid(relid) {
-        Ok(dt) => dt,
+    let st = match StreamTableMeta::get_by_relid(relid) {
+        Ok(st) => st,
         Err(_) => return, // Already cleaned up or not found
     };
 
-    if let Err(e) = StreamTableMeta::delete(dt.pgs_id) {
+    if let Err(e) = StreamTableMeta::delete(st.pgs_id) {
         pgrx::warning!(
             "pg_stream_ddl_tracker: failed to clean up catalog for dropped ST {}: {}",
             identity,
@@ -509,7 +509,7 @@ fn find_downstream_pgs_ids(source_oid: pg_sys::Oid) -> Result<Vec<i64>, PgStream
 /// ST IDs, walk the dependency graph to find STs that depend on them.
 ///
 /// Returns only the *additional* ST IDs (not the input set).
-fn find_transitive_downstream_dts(initial_pgs_ids: &[i64]) -> Result<Vec<i64>, PgStreamError> {
+fn find_transitive_downstream_sts(initial_pgs_ids: &[i64]) -> Result<Vec<i64>, PgStreamError> {
     if initial_pgs_ids.is_empty() {
         return Ok(Vec::new());
     }

@@ -3,7 +3,7 @@
 //! # Statistics
 //!
 //! Per-ST statistics are tracked in shared memory via atomic counters and
-//! exposed through the `pgstream.dt_refresh_stats()` table-returning function
+//! exposed through the `pgstream.st_refresh_stats()` table-returning function
 //! which aggregates from `pgstream.pgs_refresh_history`.
 //!
 //! The `pgstream.pg_stat_stream_tables` view combines catalog metadata with
@@ -21,7 +21,7 @@
 
 use pgrx::prelude::*;
 
-use crate::catalog::{CdcMode, DtDependency};
+use crate::catalog::{CdcMode, StDependency};
 use crate::config;
 use crate::error::PgStreamError;
 use crate::wal_decoder;
@@ -64,7 +64,7 @@ impl AlertEvent {
 /// Callers can add arbitrary key-value pairs for context.
 pub fn emit_alert(event: AlertEvent, pgs_schema: &str, pgs_name: &str, extra: &str) {
     let payload = format!(
-        r#"{{"event":"{}","pgs_schema":"{}","pgs_name":"{}","dt":"{}",{}}}"#,
+        r#"{{"event":"{}","pgs_schema":"{}","pgs_name":"{}","st":"{}",{}}}"#,
         event.as_str(),
         pgs_schema.replace('"', r#"\""#),
         pgs_name.replace('"', r#"\""#),
@@ -179,10 +179,10 @@ pub fn alert_refresh_failed(pgs_schema: &str, pgs_name: &str, action: &str, erro
 
 /// Return per-ST refresh statistics aggregated from the refresh history table.
 ///
-/// This is the primary monitoring function, exposed as `pgstream.dt_refresh_stats()`.
-#[pg_extern(schema = "pgstream", name = "dt_refresh_stats")]
+/// This is the primary monitoring function, exposed as `pgstream.st_refresh_stats()`.
+#[pg_extern(schema = "pgstream", name = "st_refresh_stats")]
 #[allow(clippy::type_complexity)]
-fn dt_refresh_stats() -> TableIterator<
+fn st_refresh_stats() -> TableIterator<
     'static,
     (
         name!(pgs_name, String),
@@ -207,11 +207,11 @@ fn dt_refresh_stats() -> TableIterator<
         let result = client
             .select(
                 "SELECT
-                    dt.pgs_name,
-                    dt.pgs_schema,
-                    dt.status,
-                    dt.refresh_mode,
-                    dt.is_populated,
+                    st.pgs_name,
+                    st.pgs_schema,
+                    st.status,
+                    st.refresh_mode,
+                    st.is_populated,
                     COALESCE(stats.total_refreshes, 0)::bigint,
                     COALESCE(stats.successful_refreshes, 0)::bigint,
                     COALESCE(stats.failed_refreshes, 0)::bigint,
@@ -220,17 +220,17 @@ fn dt_refresh_stats() -> TableIterator<
                     COALESCE(stats.avg_duration_ms, 0)::float8,
                     last_hist.action,
                     last_hist.status,
-                    dt.last_refresh_at,
-                    EXTRACT(EPOCH FROM (now() - dt.data_timestamp))::float8,
+                    st.last_refresh_at,
+                    EXTRACT(EPOCH FROM (now() - st.data_timestamp))::float8,
                     COALESCE(
-                        CASE WHEN dt.schedule IS NOT NULL AND dt.data_timestamp IS NOT NULL
-                                  AND dt.schedule NOT LIKE '% %'
-                                  AND dt.schedule NOT LIKE '@%'
-                             THEN EXTRACT(EPOCH FROM (now() - dt.data_timestamp)) >
-                                  pgstream.parse_duration_seconds(dt.schedule)
+                        CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
+                                  AND st.schedule NOT LIKE '% %'
+                                  AND st.schedule NOT LIKE '@%'
+                             THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+                                  pgstream.parse_duration_seconds(st.schedule)
                         END,
                     false)
-                FROM pgstream.pgs_stream_tables dt
+                FROM pgstream.pgs_stream_tables st
                 LEFT JOIN LATERAL (
                     SELECT
                         count(*) AS total_refreshes,
@@ -244,16 +244,16 @@ fn dt_refresh_stats() -> TableIterator<
                              ELSE 0
                         END AS avg_duration_ms
                     FROM pgstream.pgs_refresh_history h
-                    WHERE h.pgs_id = dt.pgs_id
+                    WHERE h.pgs_id = st.pgs_id
                 ) stats ON true
                 LEFT JOIN LATERAL (
                     SELECT h2.action, h2.status
                     FROM pgstream.pgs_refresh_history h2
-                    WHERE h2.pgs_id = dt.pgs_id
+                    WHERE h2.pgs_id = st.pgs_id
                     ORDER BY h2.refresh_id DESC
                     LIMIT 1
                 ) last_hist ON true
-                ORDER BY dt.pgs_schema, dt.pgs_name",
+                ORDER BY st.pgs_schema, st.pgs_name",
                 None,
                 &[],
             )
@@ -351,8 +351,8 @@ fn get_refresh_history(
                     END::float8,
                     h.error_message
                 FROM pgstream.pgs_refresh_history h
-                JOIN pgstream.pgs_stream_tables dt ON dt.pgs_id = h.pgs_id
-                WHERE dt.pgs_schema = $1 AND dt.pgs_name = $2
+                JOIN pgstream.pgs_stream_tables st ON st.pgs_id = h.pgs_id
+                WHERE st.pgs_schema = $1 AND st.pgs_name = $2
                 ORDER BY h.refresh_id DESC
                 LIMIT $3",
                 None,
@@ -452,7 +452,7 @@ fn slot_health() -> TableIterator<
     });
 
     // Collect source OIDs that have WAL-mode deps (to avoid duplicating)
-    let all_deps = DtDependency::get_all().unwrap_or_default();
+    let all_deps = StDependency::get_all().unwrap_or_default();
     let mut wal_sources = std::collections::HashMap::new();
     for dep in &all_deps {
         if matches!(dep.cdc_mode, CdcMode::Wal | CdcMode::Transitioning) {
@@ -497,9 +497,9 @@ fn slot_health() -> TableIterator<
 ///
 /// Returns whether the query supports differential refresh,
 /// lists the operators found, and shows the generated delta query.
-/// Exposed as `pgstream.explain_dt(name)`.
-#[pg_extern(schema = "pgstream", name = "explain_dt")]
-fn explain_dt(
+/// Exposed as `pgstream.explain_st(name)`.
+#[pg_extern(schema = "pgstream", name = "explain_st")]
+fn explain_st(
     name: &str,
 ) -> TableIterator<'static, (name!(property, String), name!(value, String))> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
@@ -509,34 +509,34 @@ fn explain_dt(
         ("public", parts[0])
     };
 
-    let rows = explain_dt_impl(schema, table_name)
+    let rows = explain_st_impl(schema, table_name)
         .unwrap_or_else(|e| vec![("error".to_string(), e.to_string())]);
 
     TableIterator::new(rows)
 }
 
-fn explain_dt_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String)>, PgStreamError> {
+fn explain_st_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String)>, PgStreamError> {
     use crate::catalog::StreamTableMeta;
     use crate::dvm;
 
-    let dt = StreamTableMeta::get_by_name(schema, table_name)?;
+    let st = StreamTableMeta::get_by_name(schema, table_name)?;
 
     let mut props = Vec::new();
 
     props.push((
         "pgs_name".to_string(),
-        format!("{}.{}", dt.pgs_schema, dt.pgs_name),
+        format!("{}.{}", st.pgs_schema, st.pgs_name),
     ));
-    props.push(("defining_query".to_string(), dt.defining_query.clone()));
+    props.push(("defining_query".to_string(), st.defining_query.clone()));
     props.push((
         "refresh_mode".to_string(),
-        dt.refresh_mode.as_str().to_string(),
+        st.refresh_mode.as_str().to_string(),
     ));
-    props.push(("status".to_string(), dt.status.as_str().to_string()));
-    props.push(("is_populated".to_string(), dt.is_populated.to_string()));
+    props.push(("status".to_string(), st.status.as_str().to_string()));
+    props.push(("is_populated".to_string(), st.is_populated.to_string()));
 
     // Parse the defining query to check DVM support
-    match dvm::parse_defining_query(&dt.defining_query) {
+    match dvm::parse_defining_query(&st.defining_query) {
         Ok(op_tree) => {
             props.push(("dvm_supported".to_string(), "true".to_string()));
             props.push(("operator_tree".to_string(), format!("{:?}", op_tree)));
@@ -558,11 +558,11 @@ fn explain_dt_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String
             let prev_frontier = crate::version::Frontier::new();
             let new_frontier = crate::version::Frontier::new();
             match dvm::generate_delta_query(
-                &dt.defining_query,
+                &st.defining_query,
                 &prev_frontier,
                 &new_frontier,
-                &dt.pgs_schema,
-                &dt.pgs_name,
+                &st.pgs_schema,
+                &st.pgs_name,
             ) {
                 Ok(result) => {
                     props.push(("delta_query".to_string(), result.delta_sql));
@@ -579,7 +579,7 @@ fn explain_dt_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String
     }
 
     // Frontier info
-    if let Some(ref frontier) = dt.frontier {
+    if let Some(ref frontier) = st.frontier {
         if let Ok(json) = frontier.to_json() {
             props.push(("frontier".to_string(), json));
         }
@@ -612,7 +612,7 @@ fn check_cdc_health() -> TableIterator<
         name!(alert, Option<String>),
     ),
 > {
-    let all_deps = DtDependency::get_all().unwrap_or_default();
+    let all_deps = StDependency::get_all().unwrap_or_default();
     let mut rows = Vec::new();
     let mut seen_sources = std::collections::HashSet::new();
 

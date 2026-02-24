@@ -276,7 +276,7 @@ async fn test_error_escalation_and_suspension() {
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status) \
-         VALUES ({}, 'err_dt', 'public', 'SELECT * FROM err_src', 'FULL', 'ACTIVE')",
+         VALUES ({}, 'err_st', 'public', 'SELECT * FROM err_src', 'FULL', 'ACTIVE')",
         oid
     ))
     .await;

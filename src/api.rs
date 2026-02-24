@@ -6,10 +6,10 @@
 use pgrx::prelude::*;
 use std::time::Instant;
 
-use crate::catalog::{CdcMode, DtDependency, StreamTableMeta};
+use crate::catalog::{CdcMode, StDependency, StreamTableMeta};
 use crate::cdc;
 use crate::config;
-use crate::dag::{DagNode, DtDag, DtStatus, NodeId, RefreshMode};
+use crate::dag::{DagNode, NodeId, RefreshMode, StDag, StStatus};
 use crate::error::PgStreamError;
 use crate::refresh;
 use crate::shmem;
@@ -165,7 +165,7 @@ fn create_stream_table_impl(
 
     // Insert dependency edges
     for (source_oid, source_type) in &source_relids {
-        DtDependency::insert(pgs_id, *source_oid, source_type)?;
+        StDependency::insert(pgs_id, *source_oid, source_type)?;
     }
 
     // ── Phase 2: CDC setup (change buffer tables + triggers + tracking) ──
@@ -196,8 +196,8 @@ fn create_stream_table_impl(
     // Pre-warm delta SQL + MERGE template cache for DIFFERENTIAL mode,
     // so the first refresh avoids the cold-start parsing penalty.
     if refresh_mode == RefreshMode::Differential && initialize {
-        let dt = StreamTableMeta::get_by_name(&schema, &table_name)?;
-        refresh::prewarm_merge_cache(&dt);
+        let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+        refresh::prewarm_merge_cache(&st);
     }
 
     // Signal scheduler to rebuild DAG
@@ -236,14 +236,14 @@ fn alter_stream_table_impl(
     status: Option<&str>,
 ) -> Result<(), PgStreamError> {
     let (schema, table_name) = parse_qualified_name(name)?;
-    let dt = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
     if let Some(val) = schedule {
         let _schedule = parse_schedule(val)?;
         let trimmed = val.trim();
         Spi::run_with_args(
             "UPDATE pgstream.pgs_stream_tables SET schedule = $1, updated_at = now() WHERE pgs_id = $2",
-            &[trimmed.into(), dt.pgs_id.into()],
+            &[trimmed.into(), st.pgs_id.into()],
         )
         .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
     }
@@ -256,19 +256,19 @@ fn alter_stream_table_impl(
 
         Spi::run_with_args(
             "UPDATE pgstream.pgs_stream_tables SET refresh_mode = $1, updated_at = now() WHERE pgs_id = $2",
-            &[mode_str.to_uppercase().into(), dt.pgs_id.into()],
+            &[mode_str.to_uppercase().into(), st.pgs_id.into()],
         )
         .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
     }
 
     if let Some(status_str) = status {
-        let new_status = DtStatus::from_str(&status_str.to_uppercase())?;
-        StreamTableMeta::update_status(dt.pgs_id, new_status)?;
-        if new_status == DtStatus::Active {
+        let new_status = StStatus::from_str(&status_str.to_uppercase())?;
+        StreamTableMeta::update_status(st.pgs_id, new_status)?;
+        if new_status == StStatus::Active {
             // Reset errors when resuming
             Spi::run_with_args(
                 "UPDATE pgstream.pgs_stream_tables SET consecutive_errors = 0, updated_at = now() WHERE pgs_id = $1",
-                &[dt.pgs_id.into()],
+                &[st.pgs_id.into()],
             )
             .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
         }
@@ -289,10 +289,10 @@ fn drop_stream_table(name: &str) {
 
 fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     let (schema, table_name) = parse_qualified_name(name)?;
-    let dt = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
     // Get dependencies before deleting catalog entries
-    let deps = DtDependency::get_for_dt(dt.pgs_id).unwrap_or_default();
+    let deps = StDependency::get_for_st(st.pgs_id).unwrap_or_default();
 
     // Drop the storage table
     let drop_sql = format!(
@@ -304,7 +304,7 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
         .map_err(|e| PgStreamError::SpiError(format!("Failed to drop storage table: {}", e)))?;
 
     // Delete catalog entries (cascade handles pgs_dependencies)
-    StreamTableMeta::delete(dt.pgs_id)?;
+    StreamTableMeta::delete(st.pgs_id)?;
 
     // Clean up CDC resources (triggers, WAL slots, publications) for
     // sources no longer tracked by any ST.
@@ -321,7 +321,7 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
         "Stream table {}.{} dropped (pgs_id={})",
         schema,
         table_name,
-        dt.pgs_id
+        st.pgs_id
     );
     Ok(())
 }
@@ -337,10 +337,10 @@ fn refresh_stream_table(name: &str) {
 
 fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     let (schema, table_name) = parse_qualified_name(name)?;
-    let dt = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
     // Phase 10: Check if ST is suspended — refuse manual refresh
-    if dt.status == DtStatus::Suspended {
+    if st.status == StStatus::Suspended {
         return Err(PgStreamError::InvalidArgument(format!(
             "stream table {}.{} is suspended; use pgstream.resume_stream_table() first",
             schema, table_name,
@@ -353,11 +353,11 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     // frontier computation, DVM, cleanup) — just update the timestamp.
     //
     // G-N3 optimization: source OIDs are fetched once and reused.
-    let source_oids = get_source_oids_for_manual_refresh(dt.pgs_id)?;
+    let source_oids = get_source_oids_for_manual_refresh(st.pgs_id)?;
 
     // Phase 10: Advisory lock to prevent concurrent refresh
     let got_lock =
-        Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_lock($1)", &[dt.pgs_id.into()])
+        Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_lock($1)", &[st.pgs_id.into()])
             .map_err(|e| PgStreamError::SpiError(e.to_string()))?
             .unwrap_or(false);
 
@@ -369,10 +369,10 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     }
 
     // Ensure advisory lock is released even on error
-    let result = execute_manual_refresh(&dt, &schema, &table_name, &source_oids);
+    let result = execute_manual_refresh(&st, &schema, &table_name, &source_oids);
 
     // Release the lock
-    let _ = Spi::get_one_with_args::<bool>("SELECT pg_advisory_unlock($1)", &[dt.pgs_id.into()]);
+    let _ = Spi::get_one_with_args::<bool>("SELECT pg_advisory_unlock($1)", &[st.pgs_id.into()]);
 
     result
 }
@@ -382,15 +382,15 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
 /// Dispatches to FULL or DIFFERENTIAL depending on the ST's refresh mode.
 /// `source_oids` are pre-fetched to avoid redundant SPI calls (G-N3).
 fn execute_manual_refresh(
-    dt: &StreamTableMeta,
+    st: &StreamTableMeta,
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<(), PgStreamError> {
-    match dt.refresh_mode {
-        RefreshMode::Full => execute_manual_full_refresh(dt, schema, table_name, source_oids),
+    match st.refresh_mode {
+        RefreshMode::Full => execute_manual_full_refresh(st, schema, table_name, source_oids),
         RefreshMode::Differential => {
-            execute_manual_differential_refresh(dt, schema, table_name, source_oids)
+            execute_manual_differential_refresh(st, schema, table_name, source_oids)
         }
     }
 }
@@ -402,7 +402,7 @@ fn execute_manual_refresh(
 /// `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so
 /// listeners know a FULL refresh occurred.
 fn execute_manual_full_refresh(
-    dt: &StreamTableMeta,
+    st: &StreamTableMeta,
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
@@ -418,7 +418,7 @@ fn execute_manual_full_refresh(
     let has_triggers = match user_triggers_mode.as_str() {
         "on" => true,
         "off" => false,
-        _ => crate::cdc::has_user_triggers(dt.pgs_relid)?,
+        _ => crate::cdc::has_user_triggers(st.pgs_relid)?,
     };
 
     // Suppress user triggers during TRUNCATE + INSERT to prevent
@@ -434,12 +434,12 @@ fn execute_manual_full_refresh(
     // For aggregate/distinct STs in DIFFERENTIAL mode, inject COUNT(*)
     // into the defining query so __pgs_count is populated for subsequent
     // differential refreshes.
-    let effective_query = if dt.refresh_mode == RefreshMode::Differential
-        && crate::dvm::query_needs_pgs_count(&dt.defining_query)
+    let effective_query = if st.refresh_mode == RefreshMode::Differential
+        && crate::dvm::query_needs_pgs_count(&st.defining_query)
     {
-        inject_pgs_count(&dt.defining_query)
+        inject_pgs_count(&st.defining_query)
     } else {
-        dt.defining_query.clone()
+        st.defining_query.clone()
     };
 
     // Compute row_id using the same hash formula as the delta query so
@@ -447,10 +447,10 @@ fn execute_manual_full_refresh(
     // For UNION ALL queries, decompose into per-branch subqueries with
     // child-prefixed row IDs matching diff_union_all's formula.
     let insert_body =
-        if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(&dt.defining_query) {
+        if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(&st.defining_query) {
             ua_sql
         } else {
-            let row_id_expr = crate::dvm::row_id_expr_for_query(&dt.defining_query);
+            let row_id_expr = crate::dvm::row_id_expr_for_query(&st.defining_query);
             format!("SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({effective_query}) sub",)
         };
 
@@ -484,7 +484,7 @@ fn execute_manual_full_refresh(
     let slot_positions = cdc::get_slot_positions(source_oids)?;
     let data_ts = get_data_timestamp_str();
     let frontier = version::compute_initial_frontier(&slot_positions, &data_ts);
-    StreamTableMeta::store_frontier_and_complete_refresh(dt.pgs_id, &frontier, 0)?;
+    StreamTableMeta::store_frontier_and_complete_refresh(st.pgs_id, &frontier, 0)?;
 
     pgrx::info!("Stream table {}.{} refreshed (FULL)", schema, table_name);
     Ok(())
@@ -494,12 +494,12 @@ fn execute_manual_full_refresh(
 ///
 /// If no previous frontier exists (first refresh), falls back to FULL.
 fn execute_manual_differential_refresh(
-    dt: &StreamTableMeta,
+    st: &StreamTableMeta,
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<(), PgStreamError> {
-    let prev_frontier = dt.frontier.clone().unwrap_or_default();
+    let prev_frontier = st.frontier.clone().unwrap_or_default();
 
     // If no previous frontier, the ST has never been refreshed or was
     // reinitialized — do a full refresh to establish the baseline.
@@ -509,7 +509,7 @@ fn execute_manual_differential_refresh(
             schema,
             table_name
         );
-        return execute_manual_full_refresh(dt, schema, table_name, source_oids);
+        return execute_manual_full_refresh(st, schema, table_name, source_oids);
     }
 
     // Get current WAL positions (reuses source_oids from caller — G-N3)
@@ -519,10 +519,10 @@ fn execute_manual_differential_refresh(
 
     // Execute the differential refresh via the DVM engine
     let (rows_inserted, rows_deleted) =
-        refresh::execute_differential_refresh(dt, &prev_frontier, &new_frontier)?;
+        refresh::execute_differential_refresh(st, &prev_frontier, &new_frontier)?;
 
     // Store the new frontier and mark refresh complete in a single SPI call (S3).
-    StreamTableMeta::store_frontier_and_complete_refresh(dt.pgs_id, &new_frontier, rows_inserted)?;
+    StreamTableMeta::store_frontier_and_complete_refresh(st.pgs_id, &new_frontier, rows_inserted)?;
 
     pgrx::info!(
         "Stream table {}.{} refreshed (DIFFERENTIAL: +{} -{})",
@@ -536,7 +536,7 @@ fn execute_manual_differential_refresh(
 
 /// Get source table OIDs for a stream table (used by manual refresh path).
 fn get_source_oids_for_manual_refresh(pgs_id: i64) -> Result<Vec<pg_sys::Oid>, PgStreamError> {
-    let deps = DtDependency::get_for_dt(pgs_id)?;
+    let deps = StDependency::get_for_st(pgs_id)?;
     Ok(deps
         .into_iter()
         .filter(|dep| dep.source_type == "TABLE")
@@ -980,7 +980,7 @@ pub(crate) fn cron_is_due(cron_expr: &str, last_refresh_epoch: Option<i64>) -> b
         None => true, // never refreshed → always due
         Some(epoch) => {
             let last = match chrono::DateTime::from_timestamp(epoch, 0) {
-                Some(dt) => dt,
+                Some(st) => st,
                 None => return true,
             };
             // Find the next occurrence after the last refresh
@@ -1166,7 +1166,7 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgStr
     }
 
     // Build the DAG from catalog and add proposed edges
-    let mut dag = DtDag::build_from_catalog(config::pg_stream_min_schedule_seconds())?;
+    let mut dag = StDag::build_from_catalog(config::pg_stream_min_schedule_seconds())?;
 
     // Create a temporary node for the proposed ST (use a sentinel pgs_id)
     let proposed_id = NodeId::StreamTable(i64::MAX);
@@ -1175,7 +1175,7 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgStr
         schedule: Some(std::time::Duration::from_secs(60)),
         effective_schedule: std::time::Duration::from_secs(60),
         name: "<proposed>".to_string(),
-        status: DtStatus::Initializing,
+        status: StStatus::Initializing,
         schedule_raw: None,
     });
 

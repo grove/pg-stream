@@ -180,7 +180,7 @@ async fn test_frontier_jsonb_column() {
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, frontier) \
-         VALUES ({}, 'frontier_dt', 'public', 'SELECT 1', 'FULL', '{}'::jsonb)",
+         VALUES ({}, 'frontier_st', 'public', 'SELECT 1', 'FULL', '{}'::jsonb)",
         oid,
         frontier_json.replace('\'', "''")
     ))
@@ -189,7 +189,7 @@ async fn test_frontier_jsonb_column() {
     // Read it back
     let stored: serde_json::Value = db
         .query_scalar(
-            "SELECT frontier FROM pgstream.pgs_stream_tables WHERE pgs_name = 'frontier_dt'",
+            "SELECT frontier FROM pgstream.pgs_stream_tables WHERE pgs_name = 'frontier_st'",
         )
         .await;
 
@@ -202,14 +202,14 @@ async fn test_frontier_jsonb_column() {
     // Update the frontier
     let new_frontier = r#"{"sources":{"12345":{"lsn":"0/3C4D","snapshot_ts":"2026-02-17T11:00:00Z"}},"data_timestamp":"2026-02-17T11:00:00Z"}"#;
     db.execute(&format!(
-        "UPDATE pgstream.pgs_stream_tables SET frontier = '{}'::jsonb WHERE pgs_name = 'frontier_dt'",
+        "UPDATE pgstream.pgs_stream_tables SET frontier = '{}'::jsonb WHERE pgs_name = 'frontier_st'",
         new_frontier.replace('\'', "''")
     ))
     .await;
 
     let updated: serde_json::Value = db
         .query_scalar(
-            "SELECT frontier FROM pgstream.pgs_stream_tables WHERE pgs_name = 'frontier_dt'",
+            "SELECT frontier FROM pgstream.pgs_stream_tables WHERE pgs_name = 'frontier_st'",
         )
         .await;
     assert_eq!(updated["sources"]["12345"]["lsn"].as_str(), Some("0/3C4D"));

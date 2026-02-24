@@ -7,11 +7,11 @@ mod common;
 
 use common::TestDb;
 
-// ── dt_refresh_stats aggregate query ───────────────────────────────────────
+// ── st_refresh_stats aggregate query ───────────────────────────────────────
 
 /// Test that the refresh stats aggregation query works against real catalog data.
 /// We insert STs and refresh history rows manually, then run the same aggregation
-/// query that monitor.rs's dt_refresh_stats() uses.
+/// query that monitor.rs's st_refresh_stats() uses.
 #[tokio::test]
 async fn test_refresh_stats_aggregation() {
     let db = TestDb::with_catalog().await;
@@ -24,7 +24,7 @@ async fn test_refresh_stats_aggregation() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, is_populated, data_timestamp)
          VALUES
-            ((SELECT 'source_a'::regclass::oid), 'my_dt', 'public', 'SELECT 1', '1m', 'FULL', 'ACTIVE', true, now() - interval '30 seconds')"
+            ((SELECT 'source_a'::regclass::oid), 'my_st', 'public', 'SELECT 1', '1m', 'FULL', 'ACTIVE', true, now() - interval '30 seconds')"
     ).await;
 
     // Insert some refresh history
@@ -40,7 +40,7 @@ async fn test_refresh_stats_aggregation() {
             ({pgs_id}, now() - interval '1 min', now() - interval '1 min', now() - interval '59 sec', 'DIFFERENTIAL', 'FAILED', 0, 0)"
     )).await;
 
-    // Run the aggregation query (same as dt_refresh_stats in monitor.rs)
+    // Run the aggregation query (same as st_refresh_stats in monitor.rs)
     let total: i64 = db
         .query_scalar(&format!(
             "SELECT count(*) FROM pgstream.pgs_refresh_history WHERE pgs_id = {pgs_id}"
@@ -76,11 +76,11 @@ async fn test_refresh_history_by_name() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status)
          VALUES
-            ((SELECT 'src_hist'::regclass::oid), 'hist_dt', 'public', 'SELECT 1', 'FULL', 'ACTIVE')"
+            ((SELECT 'src_hist'::regclass::oid), 'hist_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE')"
     ).await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'hist_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'hist_st'")
         .await;
 
     // Insert 5 history rows
@@ -97,8 +97,8 @@ async fn test_refresh_history_by_name() {
         .query_scalar(
             "SELECT COALESCE(h.rows_inserted, 0)::bigint
          FROM pgstream.pgs_refresh_history h
-         JOIN pgstream.pgs_stream_tables dt ON dt.pgs_id = h.pgs_id
-         WHERE dt.pgs_schema = 'public' AND dt.pgs_name = 'hist_dt'
+         JOIN pgstream.pgs_stream_tables st ON st.pgs_id = h.pgs_id
+         WHERE st.pgs_schema = 'public' AND st.pgs_name = 'hist_st'
          ORDER BY h.refresh_id DESC
          LIMIT 1",
         )
@@ -114,8 +114,8 @@ async fn test_refresh_history_by_name() {
             "SELECT count(*) FROM (
             SELECT h.refresh_id
             FROM pgstream.pgs_refresh_history h
-            JOIN pgstream.pgs_stream_tables dt ON dt.pgs_id = h.pgs_id
-            WHERE dt.pgs_schema = 'public' AND dt.pgs_name = 'hist_dt'
+            JOIN pgstream.pgs_stream_tables st ON st.pgs_id = h.pgs_id
+            WHERE st.pgs_schema = 'public' AND st.pgs_name = 'hist_st'
             ORDER BY h.refresh_id DESC
             LIMIT 3
         ) sub",
@@ -137,14 +137,14 @@ async fn test_staleness_calculation() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status, data_timestamp)
          VALUES
-            ((SELECT 'src_sched'::regclass::oid), 'sched_dt', 'public', 'SELECT 1', 'FULL', 'ACTIVE', now() - interval '60 seconds')"
+            ((SELECT 'src_sched'::regclass::oid), 'sched_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE', now() - interval '60 seconds')"
     ).await;
 
     let staleness: f64 = db
         .query_scalar(
             "SELECT EXTRACT(EPOCH FROM (now() - data_timestamp))::float8
          FROM pgstream.pgs_stream_tables
-         WHERE pgs_schema = 'public' AND pgs_name = 'sched_dt' AND data_timestamp IS NOT NULL",
+         WHERE pgs_schema = 'public' AND pgs_name = 'sched_st' AND data_timestamp IS NOT NULL",
         )
         .await;
 
@@ -160,14 +160,14 @@ async fn test_staleness_calculation() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status)
          VALUES
-            ((SELECT 'src_sched2'::regclass::oid), 'no_sched_dt', 'public', 'SELECT 1', 'FULL', 'INITIALIZING')"
+            ((SELECT 'src_sched2'::regclass::oid), 'no_sched_st', 'public', 'SELECT 1', 'FULL', 'INITIALIZING')"
     ).await;
 
     let staleness_opt: Option<f64> = db
         .query_scalar_opt(
             "SELECT EXTRACT(EPOCH FROM (now() - data_timestamp))::float8
          FROM pgstream.pgs_stream_tables
-         WHERE pgs_schema = 'public' AND pgs_name = 'no_sched_dt' AND data_timestamp IS NOT NULL",
+         WHERE pgs_schema = 'public' AND pgs_name = 'no_sched_st' AND data_timestamp IS NOT NULL",
         )
         .await;
     assert!(
@@ -189,18 +189,18 @@ async fn test_stale_flag() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
          VALUES
-            ((SELECT 'src_exceed'::regclass::oid), 'exceed_dt', 'public', 'SELECT 1', '30s', 'FULL', 'ACTIVE', now() - interval '120 seconds')"
+            ((SELECT 'src_exceed'::regclass::oid), 'exceed_st', 'public', 'SELECT 1', '30s', 'FULL', 'ACTIVE', now() - interval '120 seconds')"
     ).await;
 
     let exceeded: bool = db
         .query_scalar(
-            "SELECT CASE WHEN dt.schedule IS NOT NULL AND dt.data_timestamp IS NOT NULL
-                     THEN EXTRACT(EPOCH FROM (now() - dt.data_timestamp)) >
-                          pgstream.parse_duration_seconds(dt.schedule)
+            "SELECT CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
+                     THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+                          pgstream.parse_duration_seconds(st.schedule)
                      ELSE false
                 END
-         FROM pgstream.pgs_stream_tables dt
-         WHERE pgs_name = 'exceed_dt'",
+         FROM pgstream.pgs_stream_tables st
+         WHERE pgs_name = 'exceed_st'",
         )
         .await;
     assert!(exceeded, "data should be stale (120s > 30s target)");
@@ -211,18 +211,18 @@ async fn test_stale_flag() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
          VALUES
-            ((SELECT 'src_ok'::regclass::oid), 'ok_dt', 'public', 'SELECT 1', '5m', 'FULL', 'ACTIVE', now() - interval '10 seconds')"
+            ((SELECT 'src_ok'::regclass::oid), 'ok_st', 'public', 'SELECT 1', '5m', 'FULL', 'ACTIVE', now() - interval '10 seconds')"
     ).await;
 
     let not_exceeded: bool = db
         .query_scalar(
-            "SELECT CASE WHEN dt.schedule IS NOT NULL AND dt.data_timestamp IS NOT NULL
-                     THEN EXTRACT(EPOCH FROM (now() - dt.data_timestamp)) >
-                          pgstream.parse_duration_seconds(dt.schedule)
+            "SELECT CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
+                     THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+                          pgstream.parse_duration_seconds(st.schedule)
                      ELSE false
                 END
-         FROM pgstream.pgs_stream_tables dt
-         WHERE pgs_name = 'ok_dt'",
+         FROM pgstream.pgs_stream_tables st
+         WHERE pgs_name = 'ok_st'",
         )
         .await;
     assert!(
@@ -243,18 +243,18 @@ async fn test_stream_tables_info_view() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
          VALUES
-            ((SELECT 'src_info'::regclass::oid), 'info_dt', 'public', 'SELECT 1', '1m', 'FULL', 'ACTIVE', now() - interval '30 seconds')"
+            ((SELECT 'src_info'::regclass::oid), 'info_st', 'public', 'SELECT 1', '1m', 'FULL', 'ACTIVE', now() - interval '30 seconds')"
     ).await;
 
     // Check the view exists and returns data
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.stream_tables_info WHERE pgs_name = 'info_dt'")
+        .query_scalar("SELECT count(*) FROM pgstream.stream_tables_info WHERE pgs_name = 'info_st'")
         .await;
     assert_eq!(count, 1);
 
     // Check stale is false (30s < 1 minute)
     let stale: bool = db
-        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'info_dt'")
+        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'info_st'")
         .await;
     assert!(!stale);
 }
@@ -274,7 +274,7 @@ async fn test_notify_pg_stream_alert() {
     assert_eq!(port, 1);
 
     // Verify NOTIFY doesn't error
-    db.execute("NOTIFY pg_stream_alert, '{\"event\":\"test\",\"dt\":\"public.test\"}'")
+    db.execute("NOTIFY pg_stream_alert, '{\"event\":\"test\",\"st\":\"public.test\"}'")
         .await;
 
     // Verify LISTEN + NOTIFY round-trip via a second connection
@@ -303,7 +303,7 @@ async fn test_notify_pg_stream_alert() {
 
 // ── Full stats lateral join query ────────────────────────────────────────
 
-/// Test the full LATERAL JOIN aggregation query used by dt_refresh_stats().
+/// Test the full LATERAL JOIN aggregation query used by st_refresh_stats().
 #[tokio::test]
 async fn test_full_stats_lateral_join() {
     let db = TestDb::with_catalog().await;
@@ -313,11 +313,11 @@ async fn test_full_stats_lateral_join() {
         "INSERT INTO pgstream.pgs_stream_tables
             (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, is_populated, data_timestamp)
          VALUES
-            ((SELECT 'src_stats'::regclass::oid), 'stats_dt', 'public', 'SELECT 1', '1m', 'DIFFERENTIAL', 'ACTIVE', true, now() - interval '10 seconds')"
+            ((SELECT 'src_stats'::regclass::oid), 'stats_st', 'public', 'SELECT 1', '1m', 'DIFFERENTIAL', 'ACTIVE', true, now() - interval '10 seconds')"
     ).await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'stats_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'stats_st'")
         .await;
 
     // Insert 2 completed + 1 failed refresh
@@ -329,7 +329,7 @@ async fn test_full_stats_lateral_join() {
             ({pgs_id}, now() - interval '1 min', now() - interval '1 min', NULL, 'DIFFERENTIAL', 'FAILED', 0, 0)"
     )).await;
 
-    // Run the full LATERAL JOIN query from dt_refresh_stats
+    // Run the full LATERAL JOIN query from st_refresh_stats
     let row = sqlx::query_as::<
         _,
         (
@@ -347,22 +347,22 @@ async fn test_full_stats_lateral_join() {
         ),
     >(
         "SELECT
-            dt.pgs_name,
-            dt.pgs_schema,
-            dt.status,
-            dt.refresh_mode,
-            dt.is_populated,
+            st.pgs_name,
+            st.pgs_schema,
+            st.status,
+            st.refresh_mode,
+            st.is_populated,
             COALESCE(stats.total_refreshes, 0)::bigint,
             COALESCE(stats.successful_refreshes, 0)::bigint,
             COALESCE(stats.failed_refreshes, 0)::bigint,
             COALESCE(stats.total_rows_inserted, 0)::bigint,
             COALESCE(stats.total_rows_deleted, 0)::bigint,
-            CASE WHEN dt.schedule IS NOT NULL AND dt.data_timestamp IS NOT NULL
-                 THEN EXTRACT(EPOCH FROM (now() - dt.data_timestamp)) >
-                      pgstream.parse_duration_seconds(dt.schedule)
+            CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
+                 THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+                      pgstream.parse_duration_seconds(st.schedule)
                  ELSE false
             END
-        FROM pgstream.pgs_stream_tables dt
+        FROM pgstream.pgs_stream_tables st
         LEFT JOIN LATERAL (
             SELECT
                 count(*) AS total_refreshes,
@@ -371,15 +371,15 @@ async fn test_full_stats_lateral_join() {
                 COALESCE(sum(h.rows_inserted), 0) AS total_rows_inserted,
                 COALESCE(sum(h.rows_deleted), 0) AS total_rows_deleted
             FROM pgstream.pgs_refresh_history h
-            WHERE h.pgs_id = dt.pgs_id
+            WHERE h.pgs_id = st.pgs_id
         ) stats ON true
-        WHERE dt.pgs_name = 'stats_dt'",
+        WHERE st.pgs_name = 'stats_st'",
     )
     .fetch_one(&db.pool)
     .await
     .expect("LATERAL JOIN query failed");
 
-    assert_eq!(row.0, "stats_dt");
+    assert_eq!(row.0, "stats_st");
     assert_eq!(row.1, "public");
     assert_eq!(row.2, "ACTIVE");
     assert_eq!(row.3, "DIFFERENTIAL");

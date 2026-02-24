@@ -17,7 +17,7 @@ async fn test_pgs_status_returns_rows() {
         .await;
     db.execute("INSERT INTO mon_src VALUES (1)").await;
 
-    db.create_dt("mon_dt", "SELECT id FROM mon_src", "1m", "FULL")
+    db.create_st("mon_st", "SELECT id FROM mon_src", "1m", "FULL")
         .await;
 
     let count: i64 = db
@@ -26,7 +26,7 @@ async fn test_pgs_status_returns_rows() {
     assert!(count >= 1, "pgs_status() should return at least 1 row");
 
     // Verify the row contents
-    let (status, mode, populated, errors) = db.pgs_status("mon_dt").await;
+    let (status, mode, populated, errors) = db.pgs_status("mon_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "FULL");
     assert!(populated);
@@ -45,7 +45,7 @@ async fn test_pgs_status_multiple_dts() {
         .await;
         db.execute(&format!("INSERT INTO mon_multi_{} VALUES (1)", i))
             .await;
-        db.create_dt(
+        db.create_st(
             &format!("mon_multi_dt_{}", i),
             &format!("SELECT id FROM mon_multi_{}", i),
             "1m",
@@ -68,19 +68,19 @@ async fn test_stream_tables_info_view() {
         .await;
     db.execute("INSERT INTO mon_info VALUES (1)").await;
 
-    db.create_dt("mon_info_dt", "SELECT id FROM mon_info", "1m", "FULL")
+    db.create_st("mon_info_st", "SELECT id FROM mon_info", "1m", "FULL")
         .await;
 
     // Refresh to populate data_timestamp
     db.execute("INSERT INTO mon_info VALUES (2)").await;
-    db.refresh_dt("mon_info_dt").await;
+    db.refresh_st("mon_info_st").await;
 
     // Verify stream_tables_info view has our ST with staleness columns
     let has_row: bool = db
         .query_scalar(
             "SELECT EXISTS( \
                 SELECT 1 FROM pgstream.stream_tables_info \
-                WHERE pgs_name = 'mon_info_dt' \
+                WHERE pgs_name = 'mon_info_st' \
             )",
         )
         .await;
@@ -90,7 +90,7 @@ async fn test_stream_tables_info_view() {
     let stale: bool = db
         .query_scalar(
             "SELECT COALESCE(stale, false) FROM pgstream.stream_tables_info \
-             WHERE pgs_name = 'mon_info_dt'",
+             WHERE pgs_name = 'mon_info_st'",
         )
         .await;
     // Just after refresh, staleness should not exceed schedule
@@ -105,19 +105,19 @@ async fn test_pg_stat_stream_tables_view() {
         .await;
     db.execute("INSERT INTO mon_stat VALUES (1)").await;
 
-    db.create_dt("mon_stat_dt", "SELECT id FROM mon_stat", "1m", "FULL")
+    db.create_st("mon_stat_st", "SELECT id FROM mon_stat", "1m", "FULL")
         .await;
 
     // Do a manual refresh
     db.execute("INSERT INTO mon_stat VALUES (2)").await;
-    db.refresh_dt("mon_stat_dt").await;
+    db.refresh_st("mon_stat_st").await;
 
     // Verify pg_stat_stream_tables view exists and has our ST
     let has_row: bool = db
         .query_scalar(
             "SELECT EXISTS( \
                 SELECT 1 FROM pgstream.pg_stat_stream_tables \
-                WHERE pgs_name = 'mon_stat_dt' \
+                WHERE pgs_name = 'mon_stat_st' \
             )",
         )
         .await;
@@ -126,7 +126,7 @@ async fn test_pg_stat_stream_tables_view() {
     // Verify key columns exist and are queryable
     let status: String = db
         .query_scalar(
-            "SELECT status FROM pgstream.pg_stat_stream_tables WHERE pgs_name = 'mon_stat_dt'",
+            "SELECT status FROM pgstream.pg_stat_stream_tables WHERE pgs_name = 'mon_stat_st'",
         )
         .await;
     assert_eq!(status, "ACTIVE");
@@ -135,7 +135,7 @@ async fn test_pg_stat_stream_tables_view() {
     // only the scheduler does. Verify the column is queryable.
     let total: i64 = db
         .query_scalar(
-            "SELECT total_refreshes FROM pgstream.pg_stat_stream_tables WHERE pgs_name = 'mon_stat_dt'",
+            "SELECT total_refreshes FROM pgstream.pg_stat_stream_tables WHERE pgs_name = 'mon_stat_st'",
         )
         .await;
     assert!(
@@ -153,7 +153,7 @@ async fn test_stale_detection() {
     db.execute("INSERT INTO mon_sched VALUES (1)").await;
 
     // Create ST with minimum schedule (60 seconds)
-    db.create_dt("mon_sched_dt", "SELECT id FROM mon_sched", "1m", "FULL")
+    db.create_st("mon_sched_st", "SELECT id FROM mon_sched", "1m", "FULL")
         .await;
 
     // The view should show staleness which grows over time.
@@ -161,7 +161,7 @@ async fn test_stale_detection() {
     let has_staleness: bool = db
         .query_scalar(
             "SELECT staleness IS NOT NULL FROM pgstream.stream_tables_info \
-             WHERE pgs_name = 'mon_sched_dt'",
+             WHERE pgs_name = 'mon_sched_st'",
         )
         .await;
     assert!(
@@ -173,7 +173,7 @@ async fn test_stale_detection() {
     let stale: bool = db
         .query_scalar(
             "SELECT COALESCE(stale, false) FROM pgstream.stream_tables_info \
-             WHERE pgs_name = 'mon_sched_dt'",
+             WHERE pgs_name = 'mon_sched_st'",
         )
         .await;
     assert!(!stale, "stale should be false immediately after creation");
@@ -187,14 +187,14 @@ async fn test_refresh_history_records() {
         .await;
     db.execute("INSERT INTO mon_hist VALUES (1)").await;
 
-    db.create_dt("mon_hist_dt", "SELECT id FROM mon_hist", "1m", "FULL")
+    db.create_st("mon_hist_st", "SELECT id FROM mon_hist", "1m", "FULL")
         .await;
 
     // Multiple manual refreshes
     for i in 2..=4 {
         db.execute(&format!("INSERT INTO mon_hist VALUES ({})", i))
             .await;
-        db.refresh_dt("mon_hist_dt").await;
+        db.refresh_st("mon_hist_st").await;
     }
 
     // Manual refresh doesn't write to pgs_refresh_history (only scheduler does).
@@ -216,6 +216,6 @@ async fn test_refresh_history_records() {
     );
 
     // Verify the ST's catalog was correctly updated by manual refresh
-    let count = db.count("public.mon_hist_dt").await;
+    let count = db.count("public.mon_hist_st").await;
     assert_eq!(count, 4, "ST should have all 4 rows after refreshes");
 }

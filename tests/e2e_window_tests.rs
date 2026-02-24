@@ -25,25 +25,25 @@ async fn test_window_row_number_full_refresh() {
     )
     .await;
 
-    db.create_dt(
-        "wf_rn_dt",
+    db.create_st(
+        "wf_rn_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_rn",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.wf_rn_dt").await, 4);
+    assert_eq!(db.count("public.wf_rn_st").await, 4);
 
     // Verify correctness: in eng partition, salary=100 gets rn=1
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_rn_dt WHERE dept = 'eng' AND salary = 100")
+        .query_scalar("SELECT rn FROM public.wf_rn_st WHERE dept = 'eng' AND salary = 100")
         .await;
     assert_eq!(rn, 1);
 
     // In sales partition, salary=90 gets rn=1
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_rn_dt WHERE dept = 'sales' AND salary = 90")
+        .query_scalar("SELECT rn FROM public.wf_rn_st WHERE dept = 'sales' AND salary = 90")
         .await;
     assert_eq!(rn, 1);
 }
@@ -62,25 +62,25 @@ async fn test_window_sum_over_full_refresh() {
     )
     .await;
 
-    db.create_dt(
-        "wf_sum_dt",
+    db.create_st(
+        "wf_sum_st",
         "SELECT dept, salary, SUM(salary) OVER (PARTITION BY dept) AS dept_total FROM wf_sum",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.wf_sum_dt").await, 3);
+    assert_eq!(db.count("public.wf_sum_st").await, 3);
 
     // eng total = 100 + 80 = 180
     let total: i64 = db
-        .query_scalar("SELECT dept_total FROM public.wf_sum_dt WHERE dept = 'eng' LIMIT 1")
+        .query_scalar("SELECT dept_total FROM public.wf_sum_st WHERE dept = 'eng' LIMIT 1")
         .await;
     assert_eq!(total, 180);
 
     // sales total = 90
     let total: i64 = db
-        .query_scalar("SELECT dept_total FROM public.wf_sum_dt WHERE dept = 'sales' LIMIT 1")
+        .query_scalar("SELECT dept_total FROM public.wf_sum_st WHERE dept = 'sales' LIMIT 1")
         .await;
     assert_eq!(total, 90);
 }
@@ -99,25 +99,25 @@ async fn test_window_rank_full_refresh() {
     )
     .await;
 
-    db.create_dt(
-        "wf_rank_dt",
+    db.create_st(
+        "wf_rank_st",
         "SELECT dept, salary, RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rnk FROM wf_rank",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.wf_rank_dt").await, 3);
+    assert_eq!(db.count("public.wf_rank_st").await, 3);
 
     // Two rows with salary=100 get rank=1
     let cnt: i64 = db
-        .query_scalar("SELECT count(*) FROM public.wf_rank_dt WHERE rnk = 1")
+        .query_scalar("SELECT count(*) FROM public.wf_rank_st WHERE rnk = 1")
         .await;
     assert_eq!(cnt, 2);
 
     // Row with salary=80 gets rank=3 (not 2, because RANK skips)
     let rnk: i64 = db
-        .query_scalar("SELECT rnk FROM public.wf_rank_dt WHERE salary = 80")
+        .query_scalar("SELECT rnk FROM public.wf_rank_st WHERE salary = 80")
         .await;
     assert_eq!(rnk, 3);
 }
@@ -135,31 +135,31 @@ async fn test_window_full_refresh_after_insert() {
     db.execute("INSERT INTO wf_fi (dept, salary) VALUES ('eng', 100), ('eng', 80)")
         .await;
 
-    db.create_dt(
-        "wf_fi_dt",
+    db.create_st(
+        "wf_fi_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_fi",
         "1m",
         "FULL",
     )
     .await;
-    assert_eq!(db.count("public.wf_fi_dt").await, 2);
+    assert_eq!(db.count("public.wf_fi_st").await, 2);
 
     // Insert a new highest salary
     db.execute("INSERT INTO wf_fi (dept, salary) VALUES ('eng', 120)")
         .await;
-    db.refresh_dt("wf_fi_dt").await;
+    db.refresh_st("wf_fi_st").await;
 
-    assert_eq!(db.count("public.wf_fi_dt").await, 3);
+    assert_eq!(db.count("public.wf_fi_st").await, 3);
 
     // New row should be rn=1
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_fi_dt WHERE salary = 120")
+        .query_scalar("SELECT rn FROM public.wf_fi_st WHERE salary = 120")
         .await;
     assert_eq!(rn, 1);
 
     // Old top row should be rn=2 now
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_fi_dt WHERE salary = 100")
+        .query_scalar("SELECT rn FROM public.wf_fi_st WHERE salary = 100")
         .await;
     assert_eq!(rn, 2);
 }
@@ -178,8 +178,8 @@ async fn test_window_full_refresh_after_delete() {
     )
     .await;
 
-    db.create_dt(
-        "wf_fd_dt",
+    db.create_st(
+        "wf_fd_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_fd",
         "1m",
         "FULL",
@@ -188,13 +188,13 @@ async fn test_window_full_refresh_after_delete() {
 
     // Delete top salary
     db.execute("DELETE FROM wf_fd WHERE salary = 100").await;
-    db.refresh_dt("wf_fd_dt").await;
+    db.refresh_st("wf_fd_st").await;
 
-    assert_eq!(db.count("public.wf_fd_dt").await, 2);
+    assert_eq!(db.count("public.wf_fd_st").await, 2);
 
     // salary=80 should now be rn=1
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_fd_dt WHERE salary = 80")
+        .query_scalar("SELECT rn FROM public.wf_fd_st WHERE salary = 80")
         .await;
     assert_eq!(rn, 1);
 }
@@ -215,42 +215,42 @@ async fn test_window_differential_insert() {
     )
     .await;
 
-    db.create_dt(
-        "wf_ii_dt",
+    db.create_st(
+        "wf_ii_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_ii",
         "1m",
         "DIFFERENTIAL",
     )
     .await;
 
-    assert_eq!(db.count("public.wf_ii_dt").await, 3);
+    assert_eq!(db.count("public.wf_ii_st").await, 3);
 
     // Insert into eng department — should trigger recomputation of eng partition
     db.execute("INSERT INTO wf_ii (dept, salary) VALUES ('eng', 95)")
         .await;
-    db.refresh_dt("wf_ii_dt").await;
+    db.refresh_st("wf_ii_st").await;
 
-    assert_eq!(db.count("public.wf_ii_dt").await, 4);
+    assert_eq!(db.count("public.wf_ii_st").await, 4);
 
     // Verify eng partition is correctly recomputed
     let rn_100: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_ii_dt WHERE dept = 'eng' AND salary = 100")
+        .query_scalar("SELECT rn FROM public.wf_ii_st WHERE dept = 'eng' AND salary = 100")
         .await;
     assert_eq!(rn_100, 1, "salary=100 should be rn=1");
 
     let rn_95: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_ii_dt WHERE dept = 'eng' AND salary = 95")
+        .query_scalar("SELECT rn FROM public.wf_ii_st WHERE dept = 'eng' AND salary = 95")
         .await;
     assert_eq!(rn_95, 2, "salary=95 should be rn=2");
 
     let rn_80: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_ii_dt WHERE dept = 'eng' AND salary = 80")
+        .query_scalar("SELECT rn FROM public.wf_ii_st WHERE dept = 'eng' AND salary = 80")
         .await;
     assert_eq!(rn_80, 3, "salary=80 should be rn=3");
 
     // Sales partition should be unchanged
     let rn_sales: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_ii_dt WHERE dept = 'sales' AND salary = 90")
+        .query_scalar("SELECT rn FROM public.wf_ii_st WHERE dept = 'sales' AND salary = 90")
         .await;
     assert_eq!(rn_sales, 1, "sales partition should be unaffected");
 }
@@ -269,26 +269,26 @@ async fn test_window_differential_delete() {
     )
     .await;
 
-    db.create_dt(
-        "wf_id_dt",
+    db.create_st(
+        "wf_id_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_id",
         "1m",
         "DIFFERENTIAL",
     )
     .await;
 
-    assert_eq!(db.count("public.wf_id_dt").await, 4);
+    assert_eq!(db.count("public.wf_id_st").await, 4);
 
     // Delete middle row from eng partition
     db.execute("DELETE FROM wf_id WHERE dept = 'eng' AND salary = 80")
         .await;
-    db.refresh_dt("wf_id_dt").await;
+    db.refresh_st("wf_id_st").await;
 
-    assert_eq!(db.count("public.wf_id_dt").await, 3);
+    assert_eq!(db.count("public.wf_id_st").await, 3);
 
     // salary=60 should now be rn=2 (was rn=3)
     let rn_60: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_id_dt WHERE dept = 'eng' AND salary = 60")
+        .query_scalar("SELECT rn FROM public.wf_id_st WHERE dept = 'eng' AND salary = 60")
         .await;
     assert_eq!(rn_60, 2, "salary=60 should be rn=2 after delete");
 }
@@ -307,8 +307,8 @@ async fn test_window_differential_update() {
     )
     .await;
 
-    db.create_dt(
-        "wf_iu_dt",
+    db.create_st(
+        "wf_iu_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_iu",
         "1m",
         "DIFFERENTIAL",
@@ -318,15 +318,15 @@ async fn test_window_differential_update() {
     // Update salary=60 to 110, making it the new top
     db.execute("UPDATE wf_iu SET salary = 110 WHERE salary = 60")
         .await;
-    db.refresh_dt("wf_iu_dt").await;
+    db.refresh_st("wf_iu_st").await;
 
     let rn_110: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_iu_dt WHERE salary = 110")
+        .query_scalar("SELECT rn FROM public.wf_iu_st WHERE salary = 110")
         .await;
     assert_eq!(rn_110, 1, "salary=110 should be rn=1 after update");
 
     let rn_100: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_iu_dt WHERE salary = 100")
+        .query_scalar("SELECT rn FROM public.wf_iu_st WHERE salary = 100")
         .await;
     assert_eq!(rn_100, 2, "salary=100 should be rn=2 after update");
 }
@@ -346,8 +346,8 @@ async fn test_window_differential_multiple_partitions_changed() {
     )
     .await;
 
-    db.create_dt(
-        "wf_mp_dt",
+    db.create_st(
+        "wf_mp_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_mp",
         "1m",
         "DIFFERENTIAL",
@@ -357,13 +357,13 @@ async fn test_window_differential_multiple_partitions_changed() {
     // Insert into both partitions
     db.execute("INSERT INTO wf_mp (dept, salary) VALUES ('eng', 95), ('sales', 85)")
         .await;
-    db.refresh_dt("wf_mp_dt").await;
+    db.refresh_st("wf_mp_st").await;
 
-    assert_eq!(db.count("public.wf_mp_dt").await, 6);
+    assert_eq!(db.count("public.wf_mp_st").await, 6);
 
     // Verify both partitions recomputed
-    db.assert_dt_matches_query(
-        "public.wf_mp_dt",
+    db.assert_st_matches_query(
+        "public.wf_mp_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_mp",
     )
     .await;
@@ -383,8 +383,8 @@ async fn test_window_differential_sum_over() {
     )
     .await;
 
-    db.create_dt(
-        "wf_is_dt",
+    db.create_st(
+        "wf_is_st",
         "SELECT dept, salary, SUM(salary) OVER (PARTITION BY dept) AS dept_total FROM wf_is",
         "1m",
         "DIFFERENTIAL",
@@ -394,17 +394,17 @@ async fn test_window_differential_sum_over() {
     // Insert new eng row
     db.execute("INSERT INTO wf_is (dept, salary) VALUES ('eng', 50)")
         .await;
-    db.refresh_dt("wf_is_dt").await;
+    db.refresh_st("wf_is_st").await;
 
     // eng total should now be 100+80+50=230
     let total: i64 = db
-        .query_scalar("SELECT dept_total FROM public.wf_is_dt WHERE dept = 'eng' LIMIT 1")
+        .query_scalar("SELECT dept_total FROM public.wf_is_st WHERE dept = 'eng' LIMIT 1")
         .await;
     assert_eq!(total, 230);
 
     // sales should be unchanged at 90
     let total: i64 = db
-        .query_scalar("SELECT dept_total FROM public.wf_is_dt WHERE dept = 'sales' LIMIT 1")
+        .query_scalar("SELECT dept_total FROM public.wf_is_st WHERE dept = 'sales' LIMIT 1")
         .await;
     assert_eq!(total, 90);
 }
@@ -425,8 +425,8 @@ async fn test_window_with_where_clause() {
     )
     .await;
 
-    db.create_dt(
-        "wf_wh_dt",
+    db.create_st(
+        "wf_wh_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_wh WHERE active = true",
         "1m",
         "FULL",
@@ -434,15 +434,15 @@ async fn test_window_with_where_clause() {
     .await;
 
     // eng: only 100 and 60 are active → rn 1 and 2
-    assert_eq!(db.count("public.wf_wh_dt").await, 3);
+    assert_eq!(db.count("public.wf_wh_st").await, 3);
 
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_wh_dt WHERE dept = 'eng' AND salary = 100")
+        .query_scalar("SELECT rn FROM public.wf_wh_st WHERE dept = 'eng' AND salary = 100")
         .await;
     assert_eq!(rn, 1);
 
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_wh_dt WHERE dept = 'eng' AND salary = 60")
+        .query_scalar("SELECT rn FROM public.wf_wh_st WHERE dept = 'eng' AND salary = 60")
         .await;
     assert_eq!(rn, 2);
 }
@@ -463,8 +463,8 @@ async fn test_window_dense_rank() {
     )
     .await;
 
-    db.create_dt(
-        "wf_dr_dt",
+    db.create_st(
+        "wf_dr_st",
         "SELECT dept, salary, DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS drnk FROM wf_dr",
         "1m",
         "FULL",
@@ -473,7 +473,7 @@ async fn test_window_dense_rank() {
 
     // salary=80 should get dense_rank=2 (not 3 like RANK)
     let drnk: i64 = db
-        .query_scalar("SELECT drnk FROM public.wf_dr_dt WHERE salary = 80")
+        .query_scalar("SELECT drnk FROM public.wf_dr_st WHERE salary = 80")
         .await;
     assert_eq!(drnk, 2);
 }
@@ -495,7 +495,7 @@ async fn test_window_in_case_expression_rejected() {
     // Window function inside CASE should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_nested_dt', \
+            "SELECT pgstream.create_stream_table('wf_nested_st', \
              $$ SELECT CASE WHEN ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) <= 3 \
              THEN 'top' ELSE 'other' END AS tier FROM wf_nested $$, '1m', 'DIFFERENTIAL')",
         )
@@ -522,7 +522,7 @@ async fn test_window_in_coalesce_rejected() {
     // Window function inside COALESCE should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_coal_dt', \
+            "SELECT pgstream.create_stream_table('wf_coal_st', \
              $$ SELECT COALESCE(SUM(val) OVER (PARTITION BY dept), 0) AS total FROM wf_coal $$, '1m', 'DIFFERENTIAL')",
         )
         .await;
@@ -550,7 +550,7 @@ async fn test_window_in_arithmetic_rejected() {
     // Window function inside arithmetic should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_arith_dt', \
+            "SELECT pgstream.create_stream_table('wf_arith_st', \
              $$ SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) * 10 AS scaled_rank \
              FROM wf_arith $$, '1m', 'DIFFERENTIAL')",
         )
@@ -579,7 +579,7 @@ async fn test_window_in_cast_rejected() {
     // Window function inside CAST should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_cast_dt', \
+            "SELECT pgstream.create_stream_table('wf_cast_st', \
              $$ SELECT CAST(ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS TEXT) AS rn_text \
              FROM wf_cast $$, '1m', 'DIFFERENTIAL')",
         )
@@ -608,7 +608,7 @@ async fn test_window_deeply_nested_rejected() {
     // Window function deeply nested: CASE → COALESCE → window (DIFFERENTIAL mode)
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_deep_dt', \
+            "SELECT pgstream.create_stream_table('wf_deep_st', \
              $$ SELECT CASE WHEN COALESCE(ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC), 0) <= 3 \
              THEN 'top' ELSE 'other' END AS tier FROM wf_deep $$, '1m', 'DIFFERENTIAL')"
         )
@@ -637,8 +637,8 @@ async fn test_top_level_window_still_works() {
     db.execute("INSERT INTO wf_ok (dept, salary) VALUES ('eng', 100), ('eng', 80), ('hr', 90)")
         .await;
 
-    db.create_dt(
-        "wf_ok_dt",
+    db.create_st(
+        "wf_ok_st",
         "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_ok",
         "1m",
         "FULL",
@@ -646,7 +646,7 @@ async fn test_top_level_window_still_works() {
     .await;
 
     let rn: i64 = db
-        .query_scalar("SELECT rn FROM public.wf_ok_dt WHERE dept = 'eng' AND salary = 100")
+        .query_scalar("SELECT rn FROM public.wf_ok_st WHERE dept = 'eng' AND salary = 100")
         .await;
     assert_eq!(rn, 1);
 }

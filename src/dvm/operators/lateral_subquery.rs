@@ -47,10 +47,10 @@ pub fn diff_lateral_subquery(
     // ── Differentiate child to get the source delta ────────────────────
     let child_result = ctx.diff_node(child)?;
 
-    let dt_table = ctx
-        .dt_qualified_name
+    let st_table = ctx
+        .st_qualified_name
         .clone()
-        .unwrap_or_else(|| "/* dt_table */".to_string());
+        .unwrap_or_else(|| "/* st_table */".to_string());
 
     // Column names from the child (source table columns)
     let child_cols = &child_result.columns;
@@ -79,25 +79,25 @@ pub fn diff_lateral_subquery(
     // ── CTE 2: Old ST rows for changed source rows (DELETE actions) ────
     let old_rows_cte = ctx.next_cte_name("lat_sq_old");
 
-    // Build a join condition: for each child column, match dt.col = cs.col
+    // Build a join condition: for each child column, match st.col = cs.col
     let join_on_child_cols = child_cols
         .iter()
         .map(|c| {
             let qc = quote_ident(c);
-            format!("dt.{qc} IS NOT DISTINCT FROM cs.{qc}")
+            format!("st.{qc} IS NOT DISTINCT FROM cs.{qc}")
         })
         .collect::<Vec<_>>()
         .join(" AND ");
 
     let all_cols_dt = all_output_cols
         .iter()
-        .map(|c| format!("dt.{}", quote_ident(c)))
+        .map(|c| format!("st.{}", quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
 
     let old_rows_sql = format!(
-        "SELECT dt.\"__pgs_row_id\", {all_cols_dt}\n\
-         FROM {dt_table} dt\n\
+        "SELECT st.\"__pgs_row_id\", {all_cols_dt}\n\
+         FROM {st_table} st\n\
          WHERE EXISTS (\n\
              SELECT 1 FROM {changed_sources_cte} cs\n\
              WHERE {join_on_child_cols}\n\
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_basic() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "orders", "public", "o", &["id", "customer"]);
         let tree = lateral_subquery(
             "SELECT amount, created_at FROM line_items li WHERE li.order_id = o.id ORDER BY created_at DESC LIMIT 1",
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_left_join() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "departments", "public", "d", &["id", "name"]);
         let tree = lateral_subquery(
             "SELECT SUM(salary) AS total, COUNT(*) AS cnt FROM employees e WHERE e.dept_id = d.id",
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_uses_original_alias() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "orders", "public", "o", &["id", "customer"]);
         let tree = lateral_subquery(
             "SELECT amount FROM line_items li WHERE li.order_id = o.id LIMIT 1",
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_old_rows_join_condition() {
-        let mut ctx = test_ctx_with_dt("public", "my_dt");
+        let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "parent", "public", "p", &["id", "data"]);
         let tree = lateral_subquery(
             "SELECT val FROM child_table c WHERE c.parent_id = p.id",
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_expand_filters_inserts() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "val"]);
         let tree = lateral_subquery(
             "SELECT x FROM other o WHERE o.fk = t.id",
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_hash_includes_all_columns() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "data"]);
         let tree = lateral_subquery(
             "SELECT val FROM sub_t s WHERE s.fk = t.id",
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_output_columns() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "data"]);
         let tree = lateral_subquery(
             "SELECT val FROM sub_t s WHERE s.fk = t.id",
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_not_deduplicated() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id"]);
         let tree = lateral_subquery(
             "SELECT x FROM sub_t WHERE fk = t.id",
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_error_on_wrong_node() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_lateral_subquery(&mut ctx, &tree);
         assert!(result.is_err());
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_with_column_aliases() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id"]);
         let tree = lateral_subquery(
             "SELECT SUM(x) AS total FROM sub_t WHERE fk = t.id",
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_left_join_coalesce_hash() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id"]);
         let tree = lateral_subquery(
             "SELECT val FROM sub_t WHERE fk = t.id",
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_diff_lateral_subquery_contains_lateral_keyword() {
-        let mut ctx = test_ctx_with_dt("public", "dt");
+        let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id", "data"]);
         let tree = lateral_subquery(
             "SELECT val FROM sub_t s WHERE s.fk = t.id",

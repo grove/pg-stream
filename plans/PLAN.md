@@ -52,9 +52,9 @@ A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declar
 │                │ │                │ │                        │
 │  pg_stream.stream_ │ │  Topological   │ │  Track ALTER/DROP on   │
 │  tables        │ │  sort, cycle   │ │  upstream tables →     │
-│  pg_stream.dt_deps  │ │  detection,    │ │  mark REINITIALIZE     │
-│  pg_stream.dt_hist  │ │  DOWNSTREAM    │ │                        │
-│  pg_stream.dt_cdc   │ │  resolution    │ │                        │
+│  pg_stream.st_deps  │ │  detection,    │ │  mark REINITIALIZE     │
+│  pg_stream.st_hist  │ │  DOWNSTREAM    │ │                        │
+│  pg_stream.st_cdc   │ │  resolution    │ │                        │
 └────────────────┘ └───────┬────────┘ └────────────────────────┘
                            │
                            ▼
@@ -297,7 +297,7 @@ pub struct StreamTableMeta {
     pub defining_query: String,
     pub target_lag: Option<Interval>,
     pub refresh_mode: RefreshMode,
-    pub status: DtStatus,
+    pub status: StStatus,
     pub is_populated: bool,
     pub data_timestamp: Option<TimestampWithTimeZone>,
     pub frontier: Option<JsonB>,
@@ -305,21 +305,21 @@ pub struct StreamTableMeta {
 }
 
 pub enum RefreshMode { Full, Incremental }
-pub enum DtStatus { Initializing, Active, Suspended, Error }
+pub enum StStatus { Initializing, Active, Suspended, Error }
 
 impl StreamTableMeta {
     pub fn insert(meta: &StreamTableMeta) -> Result<i64, PgStreamError> { ... }
     pub fn get_by_name(schema: &str, name: &str) -> Result<Self, PgStreamError> { ... }
     pub fn get_by_relid(relid: Oid) -> Result<Self, PgStreamError> { ... }
     pub fn get_all_active() -> Result<Vec<Self>, PgStreamError> { ... }
-    pub fn update_status(pgs_id: i64, status: DtStatus) -> Result<(), PgStreamError> { ... }
+    pub fn update_status(pgs_id: i64, status: StStatus) -> Result<(), PgStreamError> { ... }
     pub fn update_after_refresh(pgs_id: i64, data_ts: TimestampWithTimeZone,
                                 frontier: JsonB) -> Result<(), PgStreamError> { ... }
     pub fn increment_errors(pgs_id: i64) -> Result<i32, PgStreamError> { ... }
     pub fn delete(pgs_id: i64) -> Result<(), PgStreamError> { ... }
 }
 
-pub struct DtDependency { ... }
+pub struct StDependency { ... }
 pub struct RefreshRecord { ... }
 // Similar CRUD implementations for dependencies and refresh history.
 ```
@@ -443,13 +443,13 @@ pg_stream.refresh_stream_table(name TEXT) RETURNS VOID
 ```sql
 -- Computed view with current lag
 CREATE VIEW pg_stream.stream_tables_info AS
-SELECT dt.*,
-       now() - dt.data_timestamp AS current_lag,
-       CASE WHEN dt.target_lag IS NOT NULL
-            THEN (now() - dt.data_timestamp) > dt.target_lag
+SELECT st.*,
+       now() - st.data_timestamp AS current_lag,
+       CASE WHEN st.target_lag IS NOT NULL
+            THEN (now() - st.data_timestamp) > st.target_lag
             ELSE FALSE
        END AS lag_exceeded
-FROM pg_stream.pgs_stream_tables dt;
+FROM pg_stream.pgs_stream_tables st;
 
 -- Recent refresh history
 CREATE FUNCTION pg_stream.refresh_history(
@@ -457,7 +457,7 @@ CREATE FUNCTION pg_stream.refresh_history(
 ) RETURNS SETOF pg_stream.pgs_refresh_history ...;
 
 -- DAG visualization
-CREATE FUNCTION pg_stream.dt_graph()
+CREATE FUNCTION pg_stream.st_graph()
 RETURNS TABLE(pgs_name TEXT, source_name TEXT, source_type TEXT) ...;
 
 -- Compact status overview
@@ -588,7 +588,7 @@ DELETE FROM pg_stream_changes.changes_<oid> WHERE lsn <= $1
 ### Step 4.1 — DAG construction (`dag.rs`)
 
 ```rust
-pub struct DtDag {
+pub struct StDag {
     /// Adjacency list: node_id -> list of downstream node_ids
     edges: HashMap<NodeId, Vec<NodeId>>,
     /// Reverse adjacency: node_id -> list of upstream node_ids
@@ -607,19 +607,19 @@ pub struct DagNode {
     pub target_lag: Option<Duration>,  // None = DOWNSTREAM
     pub effective_lag: Duration,       // Resolved (including DOWNSTREAM)
     pub data_timestamp: Option<SystemTime>,
-    pub status: DtStatus,
+    pub status: StStatus,
 }
 ```
 
 **Operations:**
 
-- `DtDag::build_from_catalog()` — load `pg_stream.pgs_stream_tables` and `pg_stream.pgs_dependencies` via SPI, construct in-memory graph.
-- `DtDag::add_dt(pgs_id, sources)` — add a ST node with edges.
-- `DtDag::detect_cycles() -> Result<(), CycleError>` — Kahn's algorithm (BFS topological sort). If any nodes remain after processing all zero-indegree nodes, a cycle exists.
-- `DtDag::topological_order() -> Vec<NodeId>` — return STs in refresh order (upstream first).
-- `DtDag::resolve_downstream_lags()` — for STs with `target_lag = NULL`, compute effective lag as `MIN(target_lag)` across all immediate downstream dependents. Repeat until convergence. If no downstream, use `pg_stream.min_target_lag_seconds`.
-- `DtDag::get_upstream(pgs_id) -> Vec<NodeId>` — all transitive upstream nodes.
-- `DtDag::get_downstream(pgs_id) -> Vec<NodeId>` — all transitive downstream nodes.
+- `StDag::build_from_catalog()` — load `pg_stream.pgs_stream_tables` and `pg_stream.pgs_dependencies` via SPI, construct in-memory graph.
+- `StDag::add_st(pgs_id, sources)` — add a ST node with edges.
+- `StDag::detect_cycles() -> Result<(), CycleError>` — Kahn's algorithm (BFS topological sort). If any nodes remain after processing all zero-indegree nodes, a cycle exists.
+- `StDag::topological_order() -> Vec<NodeId>` — return STs in refresh order (upstream first).
+- `StDag::resolve_downstream_lags()` — for STs with `target_lag = NULL`, compute effective lag as `MIN(target_lag)` across all immediate downstream dependents. Repeat until convergence. If no downstream, use `pg_stream.min_target_lag_seconds`.
+- `StDag::get_upstream(pgs_id) -> Vec<NodeId>` — all transitive upstream nodes.
+- `StDag::get_downstream(pgs_id) -> Vec<NodeId>` — all transitive downstream nodes.
 
 **Cycle detection algorithm (Kahn's):**
 
@@ -692,7 +692,7 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
     );
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
-    let mut dag = DtDag::new();
+    let mut dag = StDag::new();
     let mut dag_version: u64 = 0;
 
     loop {
@@ -711,7 +711,7 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
             // Step A: Check if DAG needs rebuild
             let current_version = DAG_REBUILD_SIGNAL.load(Ordering::Relaxed);
             if current_version != dag_version {
-                dag = DtDag::build_from_catalog();
+                dag = StDag::build_from_catalog();
                 dag.resolve_downstream_lags();
                 dag_version = current_version;
             }
@@ -721,15 +721,15 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
 
             // Step C: Determine which STs need refresh
             let now = SystemTime::now();
-            let mut needs_refresh: Vec<DtToRefresh> = Vec::new();
+            let mut needs_refresh: Vec<StToRefresh> = Vec::new();
 
-            for dt in dag.get_all_stream_tables() {
-                if dt.status != DtStatus::Active { continue; }
-                let current_lag = now.duration_since(dt.data_timestamp.unwrap_or(UNIX_EPOCH));
-                if current_lag > dt.effective_lag {
-                    let period = select_canonical_period(dt.effective_lag);
+            for st in dag.get_all_stream_tables() {
+                if st.status != StStatus::Active { continue; }
+                let current_lag = now.duration_since(st.data_timestamp.unwrap_or(UNIX_EPOCH));
+                if current_lag > st.effective_lag {
+                    let period = select_canonical_period(st.effective_lag);
                     let target_ts = canonical_data_timestamp(period);
-                    needs_refresh.push(DtToRefresh { pgs_id: dt.id, target_ts });
+                    needs_refresh.push(StToRefresh { pgs_id: st.id, target_ts });
                 }
             }
 
@@ -776,7 +776,7 @@ pub enum RefreshAction {
 }
 
 pub fn determine_refresh_action(
-    dt: &StreamTableMeta,
+    st: &StreamTableMeta,
     has_upstream_changes: bool,
     needs_reinit: bool,
 ) -> RefreshAction {
@@ -786,7 +786,7 @@ pub fn determine_refresh_action(
     if !has_upstream_changes {
         return RefreshAction::NoData;
     }
-    match dt.refresh_mode {
+    match st.refresh_mode {
         RefreshMode::Full => RefreshAction::Full,
         RefreshMode::Incremental => RefreshAction::Incremental,
     }
@@ -812,13 +812,13 @@ Maintained by the DDL event trigger (Phase 7). If any upstream table has had a s
 ### Step 5.2 — NO_DATA refresh
 
 ```rust
-fn execute_no_data_refresh(dt: &StreamTableMeta, target_ts: SystemTime) {
+fn execute_no_data_refresh(st: &StreamTableMeta, target_ts: SystemTime) {
     Spi::run(&format!(
         "UPDATE pg_stream.pgs_stream_tables SET data_timestamp = $1, last_refresh_at = now(),
          updated_at = now() WHERE pgs_id = $2"
-    ), /* target_ts, dt.pgs_id */);
+    ), /* target_ts, st.pgs_id */);
 
-    insert_refresh_history(dt.pgs_id, target_ts, "NO_DATA", "COMPLETED", 0, 0);
+    insert_refresh_history(st.pgs_id, target_ts, "NO_DATA", "COMPLETED", 0, 0);
 }
 ```
 
@@ -869,9 +869,9 @@ CREATE TEMP TABLE __pgs_delta ON COMMIT DROP AS
 --                     [__pgs_count, __pgs_sum_*, ...] (auxiliary cols for aggregates)
 
 -- Step 2: Delete removed/updated rows
-DELETE FROM <schema>.<name> dt
+DELETE FROM <schema>.<name> st
 USING __pgs_delta d
-WHERE dt.__pgs_row_id = d.__pgs_row_id
+WHERE st.__pgs_row_id = d.__pgs_row_id
   AND d.__pgs_action = 'D';
 
 -- Step 3: Insert new/updated rows
@@ -1266,26 +1266,26 @@ __pgs_cte_agg_merge AS (
         <group_by_cols>,
 
         -- New auxiliary values
-        COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count
+        COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count
             AS new_count,
-        COALESCE(dt.__pgs_sum_col, 0) + d.__ins_sum - d.__del_sum
+        COALESCE(st.__pgs_sum_col, 0) + d.__ins_sum - d.__del_sum
             AS new_sum,
 
         -- Determine action
         CASE
-            WHEN dt.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0
+            WHEN st.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0
                 THEN 'I'   -- New group appears
-            WHEN COALESCE(dt.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0
+            WHEN COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0
                 THEN 'D'   -- Group vanishes
             ELSE 'U'       -- Group value changes (emit D+I pair)
         END AS __pgs_meta_action,
 
-        dt.__pgs_count AS old_count
+        st.__pgs_count AS old_count
 
     FROM __pgs_cte_agg_delta d
-    LEFT JOIN <dt_table> dt
-        ON dt.<group_key_1> = d.<group_key_1>
-       AND dt.<group_key_2> = d.<group_key_2>
+    LEFT JOIN <st_table> st
+        ON st.<group_key_1> = d.<group_key_1>
+       AND st.<group_key_2> = d.<group_key_2>
        -- (for each group-by column)
 ),
 
@@ -1434,10 +1434,10 @@ __pgs_changed_partitions AS (
 -- Step 2: Delete old window results for changed partitions
 -- (emit as 'D' actions)
 __pgs_window_deletes AS (
-    SELECT dt.__pgs_row_id, 'D' AS __pgs_action, <cols>
-    FROM <dt_table> dt
+    SELECT st.__pgs_row_id, 'D' AS __pgs_action, <cols>
+    FROM <st_table> st
     SEMI JOIN __pgs_changed_partitions cp
-        ON dt.<pk1> = cp.<pk1> AND ...
+        ON st.<pk1> = cp.<pk1> AND ...
 ),
 
 -- Step 3: Recompute window function for changed partitions
@@ -1500,29 +1500,29 @@ fn handle_ddl_end() {
         let command_tag: String = cmd.get("command_tag");
 
         // Check if this object is an upstream dependency of any ST
-        let affected_dts = Spi::connect(|client| {
+        let affected_sts = Spi::connect(|client| {
             client.select(
                 "SELECT pgs_id FROM pg_stream.pgs_dependencies WHERE source_relid = $1",
                 None, Some(vec![(PgBuiltInOids::OIDOID.oid(), objid.into_datum())])
             )
         });
 
-        if affected_dts.is_empty() { continue; }
+        if affected_sts.is_empty() { continue; }
 
         match command_tag.as_str() {
             "ALTER TABLE" => {
                 // Mark affected STs for REINITIALIZE
-                for dt in affected_dts {
-                    mark_for_reinitialize(dt.pgs_id);
+                for st in affected_sts {
+                    mark_for_reinitialize(st.pgs_id);
                     log!(INFO, "ST {} marked for reinitialize due to ALTER TABLE on {}",
-                         dt.pgs_id, objid);
+                         st.pgs_id, objid);
                 }
             }
             "DROP TABLE" => {
                 // Mark affected STs as ERROR
-                for dt in affected_dts {
-                    set_pgs_status(dt.pgs_id, DtStatus::Error);
-                    log!(WARNING, "ST {} error: upstream table {} dropped", dt.pgs_id, objid);
+                for st in affected_sts {
+                    set_pgs_status(st.pgs_id, StStatus::Error);
+                    log!(WARNING, "ST {} error: upstream table {} dropped", st.pgs_id, objid);
                 }
             }
             _ => {}
@@ -1564,14 +1564,14 @@ extern "C-unwind" fn pg_stream_object_access_hook(
        && class_id == pg_sys::RelationRelationId
     {
         // Check if this OID is a ST storage table
-        let is_dt = Spi::connect(|client| {
+        let is_st = Spi::connect(|client| {
             client.select(
                 "SELECT 1 FROM pg_stream.pgs_stream_tables WHERE pgs_relid = $1",
                 None, Some(vec![(PgBuiltInOids::OIDOID.oid(), object_id.into_datum())])
             ).len() > 0
         });
 
-        if is_dt {
+        if is_st {
             // Clean up catalog entries
             Spi::run_with_args(
                 "DELETE FROM pg_stream.pgs_stream_tables WHERE pgs_relid = $1",
@@ -1695,14 +1695,14 @@ Expose via a view:
 
 ```sql
 CREATE VIEW pg_stream.pg_stat_stream_tables AS
-SELECT dt.pgs_name, dt.pgs_schema,
+SELECT st.pgs_name, st.pgs_schema,
        -- stats from custom cumulative statistics
        s.refresh_count, s.total_refresh_duration_ms,
        s.rows_inserted_total, s.rows_deleted_total,
        s.skip_count, s.error_count,
        s.last_lag_ms, s.max_lag_ms
-FROM pg_stream.pgs_stream_tables dt
-JOIN pg_stream._get_stats() s ON s.pgs_id = dt.pgs_id;
+FROM pg_stream.pgs_stream_tables st
+JOIN pg_stream._get_stats() s ON s.pgs_id = st.pgs_id;
 ```
 
 ### Step 9.2 — Custom EXPLAIN option (PG 18)
@@ -1731,8 +1731,8 @@ fn emit_alert(channel: &str, payload: &str) {
 
 // Usage:
 emit_alert("pg_stream_alert", &format!(
-    "{{\"event\": \"lag_exceeded\", \"dt\": \"{}\", \"lag_seconds\": {}}}",
-    dt.pgs_name, current_lag_secs
+    "{{\"event\": \"lag_exceeded\", \"st\": \"{}\", \"lag_seconds\": {}}}",
+    st.pgs_name, current_lag_secs
 ));
 ```
 
@@ -1777,20 +1777,20 @@ pub enum PgStreamError {
 ### Step 10.2 — Auto-suspend
 
 ```rust
-fn handle_refresh_failure(dt: &StreamTableMeta, error: &PgStreamError) {
-    let new_error_count = StreamTableMeta::increment_errors(dt.pgs_id).unwrap();
+fn handle_refresh_failure(st: &StreamTableMeta, error: &PgStreamError) {
+    let new_error_count = StreamTableMeta::increment_errors(st.pgs_id).unwrap();
 
-    insert_refresh_history(dt.pgs_id, target_ts, action, "FAILED",
+    insert_refresh_history(st.pgs_id, target_ts, action, "FAILED",
                           0, 0, Some(error.to_string()));
 
     if new_error_count >= pg_stream_max_consecutive_errors() {
-        StreamTableMeta::update_status(dt.pgs_id, DtStatus::Suspended);
+        StreamTableMeta::update_status(st.pgs_id, StStatus::Suspended);
         emit_alert("pg_stream_alert", &format!(
-            "{{\"event\": \"auto_suspended\", \"dt\": \"{}\", \"errors\": {}, \"last_error\": \"{}\"}}",
-            dt.pgs_name, new_error_count, error
+            "{{\"event\": \"auto_suspended\", \"st\": \"{}\", \"errors\": {}, \"last_error\": \"{}\"}}",
+            st.pgs_name, new_error_count, error
         ));
         log!(WARNING, "ST {} auto-suspended after {} consecutive errors: {}",
-             dt.pgs_name, new_error_count, error);
+             st.pgs_name, new_error_count, error);
     }
 }
 ```
@@ -1798,20 +1798,20 @@ fn handle_refresh_failure(dt: &StreamTableMeta, error: &PgStreamError) {
 ### Step 10.3 — Skip mechanism
 
 ```rust
-fn check_skip_needed(dt: &StreamTableMeta) -> bool {
+fn check_skip_needed(st: &StreamTableMeta) -> bool {
     // Try to acquire advisory lock (non-blocking)
     let locked = Spi::get_one::<bool>(
-        &format!("SELECT pg_try_advisory_lock({})", dt.pgs_relid as i64)
+        &format!("SELECT pg_try_advisory_lock({})", st.pgs_relid as i64)
     ).unwrap_or(false);
 
     if locked {
         // We got the lock — release it, no skip needed
-        Spi::run(&format!("SELECT pg_advisory_unlock({})", dt.pgs_relid as i64));
+        Spi::run(&format!("SELECT pg_advisory_unlock({})", st.pgs_relid as i64));
         false
     } else {
         // Another refresh is in progress — skip this one
-        insert_refresh_history(dt.pgs_id, target_ts, "SKIP", "SKIPPED", 0, 0, None);
-        log!(INFO, "ST {} refresh skipped — previous refresh still in progress", dt.pgs_name);
+        insert_refresh_history(st.pgs_id, target_ts, "SKIP", "SKIPPED", 0, 0, None);
+        log!(INFO, "ST {} refresh skipped — previous refresh still in progress", st.pgs_name);
         true
     }
 }
@@ -1861,7 +1861,7 @@ Run against a live PostgreSQL 18 instance via pgrx:
 
 ```rust
 #[pg_test]
-fn test_create_and_query_simple_dt() {
+fn test_create_and_query_simple_st() {
     Spi::run("CREATE TABLE orders (id INT PRIMARY KEY, amount NUMERIC)");
     Spi::run("INSERT INTO orders VALUES (1, 100), (2, 200)");
     Spi::run("SELECT pg_stream.create_stream_table(
@@ -1900,9 +1900,9 @@ fn test_incremental_refresh_update() { /* ... */ }
 #[pg_test]
 fn test_incremental_refresh_delete() { /* ... */ }
 #[pg_test]
-fn test_join_dt_incremental() { /* ... */ }
+fn test_join_st_incremental() { /* ... */ }
 #[pg_test]
-fn test_aggregate_dt_incremental() { /* ... */ }
+fn test_aggregate_st_incremental() { /* ... */ }
 #[pg_test]
 fn test_dag_cycle_rejection() { /* ... */ }
 #[pg_test]
@@ -1922,7 +1922,7 @@ fn test_no_data_refresh() { /* ... */ }
 **THE KEY INVARIANT**:
 
 > For every ST, at every data timestamp:
-> `SELECT * FROM dt_table ORDER BY 1 = SELECT * FROM (defining_query) sub ORDER BY 1`
+> `SELECT * FROM st_table ORDER BY 1 = SELECT * FROM (defining_query) sub ORDER BY 1`
 
 Test procedure:
 
@@ -1937,17 +1937,17 @@ Use the `proptest` or `quickcheck` Rust crates for randomized inputs.
 
 ```rust
 #[pg_test]
-fn property_test_dt_correctness() {
+fn property_test_st_correctness() {
     for _ in 0..100 {
         let schema = generate_random_schema();
         create_tables(&schema);
         let query = generate_random_query(&schema);
-        create_dt("test_dt", &query);
+        create_st("test_st", &query);
 
         for _ in 0..20 {
             apply_random_dml(&schema);
-            manual_refresh("test_dt");
-            assert_dt_equals_query("test_dt", &query);
+            manual_refresh("test_st");
+            assert_st_equals_query("test_st", &query);
         }
 
         cleanup();

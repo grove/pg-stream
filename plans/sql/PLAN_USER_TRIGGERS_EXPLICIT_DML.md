@@ -137,16 +137,16 @@ the MERGE path). Net overhead vs MERGE: only the temp table DDL.
 
 ```sql
 -- Step 1: DELETE removed rows
-DELETE FROM <st> AS dt
+DELETE FROM <st> AS st
 USING __pgs_delta_<pgs_id> AS d
-WHERE dt.__pgs_row_id = d.__pgs_row_id
+WHERE st.__pgs_row_id = d.__pgs_row_id
   AND d.__pgs_action = 'D';
 
 -- Step 2: UPDATE changed rows (row existed, new value from delta)
-UPDATE <st> AS dt
+UPDATE <st> AS st
 SET col1 = d.col1, col2 = d.col2, ...
 FROM __pgs_delta_<pgs_id> AS d
-WHERE dt.__pgs_row_id = d.__pgs_row_id
+WHERE st.__pgs_row_id = d.__pgs_row_id
   AND d.__pgs_action = 'I';
 
 -- Step 3: INSERT new rows (row did not exist)
@@ -155,8 +155,8 @@ SELECT d.__pgs_row_id, d.col1, d.col2, ...
 FROM __pgs_delta_<pgs_id> AS d
 WHERE d.__pgs_action = 'I'
   AND NOT EXISTS (
-    SELECT 1 FROM <st> AS dt
-    WHERE dt.__pgs_row_id = d.__pgs_row_id
+    SELECT 1 FROM <st> AS st
+    WHERE st.__pgs_row_id = d.__pgs_row_id
   );
 ```
 
@@ -175,13 +175,13 @@ skip no-op updates. In the explicit DML path, the same guard is applied to
 the UPDATE:
 
 ```sql
-UPDATE <st> AS dt
+UPDATE <st> AS st
 SET col1 = d.col1, col2 = d.col2, ...
 FROM __pgs_delta_<pgs_id> AS d
-WHERE dt.__pgs_row_id = d.__pgs_row_id
+WHERE st.__pgs_row_id = d.__pgs_row_id
   AND d.__pgs_action = 'I'
-  AND (dt.col1 IS DISTINCT FROM d.col1
-       OR dt.col2 IS DISTINCT FROM d.col2
+  AND (st.col1 IS DISTINCT FROM d.col1
+       OR st.col2 IS DISTINCT FROM d.col2
        OR ...);
 ```
 
@@ -272,21 +272,21 @@ Extend the MERGE template builder (both the cache-miss path and
 // After building merge_template and delete_insert_template:
 
 let trigger_delete_template = format!(
-    "DELETE FROM {quoted_table} AS dt \
+    "DELETE FROM {quoted_table} AS st \
      USING __pgs_delta_{pgs_id} AS d \
-     WHERE dt.__pgs_row_id = d.__pgs_row_id \
+     WHERE st.__pgs_row_id = d.__pgs_row_id \
        AND d.__pgs_action = 'D'",
-    pgs_id = dt.pgs_id,
+    pgs_id = st.pgs_id,
 );
 
 let trigger_update_template = format!(
-    "UPDATE {quoted_table} AS dt \
+    "UPDATE {quoted_table} AS st \
      SET {update_set_clause} \
      FROM __pgs_delta_{pgs_id} AS d \
-     WHERE dt.__pgs_row_id = d.__pgs_row_id \
+     WHERE st.__pgs_row_id = d.__pgs_row_id \
        AND d.__pgs_action = 'I' \
        AND ({is_distinct_clause})",
-    pgs_id = dt.pgs_id,
+    pgs_id = st.pgs_id,
 );
 
 let trigger_insert_template = format!(
@@ -295,10 +295,10 @@ let trigger_insert_template = format!(
      FROM __pgs_delta_{pgs_id} AS d \
      WHERE d.__pgs_action = 'I' \
        AND NOT EXISTS (\
-         SELECT 1 FROM {quoted_table} AS dt \
-         WHERE dt.__pgs_row_id = d.__pgs_row_id\
+         SELECT 1 FROM {quoted_table} AS st \
+         WHERE st.__pgs_row_id = d.__pgs_row_id\
        )",
-    pgs_id = dt.pgs_id,
+    pgs_id = st.pgs_id,
 );
 ```
 
@@ -308,7 +308,7 @@ After the strategy selection block (`use_delete_insert` / `use_prepared` /
 MERGE), add a new branch:
 
 ```rust
-let has_triggers = crate::cdc::has_user_triggers(dt.pgs_relid)?;
+let has_triggers = crate::cdc::has_user_triggers(st.pgs_relid)?;
 
 let (merge_count, strategy_label) = if has_triggers {
     // ── User-trigger path: explicit DML ─────────────────────────
@@ -317,7 +317,7 @@ let (merge_count, strategy_label) = if has_triggers {
     let materialize_sql = format!(
         "CREATE TEMP TABLE __pgs_delta_{pgs_id} ON COMMIT DROP AS \
          SELECT * FROM {using_clause} AS d",
-        pgs_id = dt.pgs_id,
+        pgs_id = st.pgs_id,
     );
     Spi::run(&materialize_sql)?;
 
@@ -393,38 +393,38 @@ For FULL refresh when user triggers exist:
 
 ```rust
 fn execute_full_refresh_with_triggers(
-    dt: &StreamTableMeta,
+    st: &StreamTableMeta,
 ) -> Result<(i64, i64), PgStreamError> {
     // Step 1: Snapshot current ST row IDs + content hash
     let snapshot_sql = format!(
         "CREATE TEMP TABLE __pgs_pre_{pgs_id} ON COMMIT DROP AS \
          SELECT __pgs_row_id, {user_col_list} \
          FROM \"{schema}\".\"{name}\"",
-        pgs_id = dt.pgs_id,
-        schema = dt.pgs_schema,
-        name = dt.pgs_name,
+        pgs_id = st.pgs_id,
+        schema = st.pgs_schema,
+        name = st.pgs_name,
     );
     Spi::run(&snapshot_sql)?;
 
     // Step 2: TRUNCATE + INSERT with triggers DISABLED
     Spi::run(&format!(
         "ALTER TABLE \"{}\".\"{}\" DISABLE TRIGGER USER",
-        dt.pgs_schema, dt.pgs_name,
+        st.pgs_schema, st.pgs_name,
     ))?;
 
-    let (rows, _) = execute_full_refresh(dt)?;
+    let (rows, _) = execute_full_refresh(st)?;
 
     Spi::run(&format!(
         "ALTER TABLE \"{}\".\"{}\" ENABLE TRIGGER USER",
-        dt.pgs_schema, dt.pgs_name,
+        st.pgs_schema, st.pgs_name,
     ))?;
 
     // Step 3: Compute diff against pre-snapshot
     // DELETE: rows in pre but not in post
     let del_sql = format!(
-        "DELETE FROM \"{schema}\".\"{name}\" AS dt \
+        "DELETE FROM \"{schema}\".\"{name}\" AS st \
          USING __pgs_pre_{pgs_id} AS old \
-         WHERE dt.__pgs_row_id = old.__pgs_row_id \
+         WHERE st.__pgs_row_id = old.__pgs_row_id \
            AND NOT EXISTS (\
              SELECT 1 FROM \"{schema}\".\"{name}\" AS curr \
              WHERE curr.__pgs_row_id = old.__pgs_row_id\
@@ -511,8 +511,8 @@ if has_user_triggers {
            \"mode\": \"FULL\", \
            \"rows\": {rows}\
          }}'",
-        name = dt.pgs_name,
-        schema = dt.pgs_schema,
+        name = st.pgs_name,
+        schema = st.pgs_schema,
         rows = rows_inserted,
     ))?;
 }

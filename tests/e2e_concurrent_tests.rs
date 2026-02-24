@@ -18,9 +18,9 @@ async fn test_concurrent_inserts_during_refresh() {
     db.execute("INSERT INTO cc_src SELECT g, g FROM generate_series(1, 100) g")
         .await;
 
-    db.create_dt("cc_dt", "SELECT id, val FROM cc_src", "1m", "FULL")
+    db.create_st("cc_st", "SELECT id, val FROM cc_src", "1m", "FULL")
         .await;
-    assert_eq!(db.count("public.cc_dt").await, 100);
+    assert_eq!(db.count("public.cc_st").await, 100);
 
     // Insert more data while refresh is happening
     let pool_refresh = db.pool.clone();
@@ -31,7 +31,7 @@ async fn test_concurrent_inserts_during_refresh() {
         .await;
 
     let refresh_handle = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('cc_dt')")
+        sqlx::query("SELECT pgstream.refresh_stream_table('cc_st')")
             .execute(&pool_refresh)
             .await
     });
@@ -52,9 +52,9 @@ async fn test_concurrent_inserts_during_refresh() {
         .expect("insert failed");
 
     // After another refresh, all data should be visible
-    db.refresh_dt("cc_dt").await;
+    db.refresh_st("cc_st").await;
 
-    let count = db.count("public.cc_dt").await;
+    let count = db.count("public.cc_st").await;
     assert_eq!(
         count, 250,
         "All rows should be present after concurrent ops + refresh"
@@ -96,8 +96,8 @@ async fn test_create_two_dts_simultaneously() {
     });
 
     let (r1, r2) = tokio::join!(h1, h2);
-    r1.expect("task a panicked").expect("create dt_a failed");
-    r2.expect("task b panicked").expect("create dt_b failed");
+    r1.expect("task a panicked").expect("create st_a failed");
+    r2.expect("task b panicked").expect("create st_b failed");
 
     // Both STs should exist
     assert!(db.table_exists("public", "cc_dt_a").await);
@@ -118,7 +118,7 @@ async fn test_refresh_and_drop_race() {
     db.execute("INSERT INTO cc_race SELECT g, g FROM generate_series(1, 50) g")
         .await;
 
-    db.create_dt("cc_race_dt", "SELECT id, val FROM cc_race", "1m", "FULL")
+    db.create_st("cc_race_st", "SELECT id, val FROM cc_race", "1m", "FULL")
         .await;
 
     // Add data to trigger refresh
@@ -129,7 +129,7 @@ async fn test_refresh_and_drop_race() {
     let pool_drop = db.pool.clone();
 
     let h_refresh = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('cc_race_dt')")
+        sqlx::query("SELECT pgstream.refresh_stream_table('cc_race_st')")
             .execute(&pool_refresh)
             .await
     });
@@ -137,7 +137,7 @@ async fn test_refresh_and_drop_race() {
     let h_drop = tokio::spawn(async move {
         // Slight delay to let refresh start
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        sqlx::query("SELECT pgstream.drop_stream_table('cc_race_dt')")
+        sqlx::query("SELECT pgstream.drop_stream_table('cc_race_st')")
             .execute(&pool_drop)
             .await
     });
@@ -157,7 +157,7 @@ async fn test_refresh_and_drop_race() {
     if drop_ok {
         let exists: bool = db
             .query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_name = 'cc_race_dt')",
+                "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_name = 'cc_race_st')",
             )
             .await;
         // It might or might not exist depending on ordering

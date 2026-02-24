@@ -100,15 +100,15 @@ BEGIN
 END; $$;
 
 CREATE OR REPLACE VIEW pgstream.stream_tables_info AS
-SELECT dt.*,
-       now() - dt.data_timestamp AS staleness,
-       CASE WHEN dt.schedule IS NOT NULL
-                 AND dt.schedule !~ '[\s@]'
-            THEN EXTRACT(EPOCH FROM (now() - dt.data_timestamp)) >
-                 pgstream.parse_duration_seconds(dt.schedule)
+SELECT st.*,
+       now() - st.data_timestamp AS staleness,
+       CASE WHEN st.schedule IS NOT NULL
+                 AND st.schedule !~ '[\s@]'
+            THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
+                 pgstream.parse_duration_seconds(st.schedule)
             ELSE NULL::boolean
        END AS stale
-FROM pgstream.pgs_stream_tables dt;
+FROM pgstream.pgs_stream_tables st;
 "#;
 
 /// A test database backed by a Testcontainers PostgreSQL 18.1 instance.

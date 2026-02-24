@@ -20,8 +20,8 @@ async fn test_trigger_captures_insert() {
     db.execute("INSERT INTO cdc_src VALUES (1, 'initial')")
         .await;
 
-    db.create_dt(
-        "cdc_dt",
+    db.create_st(
+        "cdc_st",
         "SELECT id, val FROM cdc_src",
         "1m",
         "DIFFERENTIAL",
@@ -32,7 +32,7 @@ async fn test_trigger_captures_insert() {
     let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
 
     // Consume any existing changes from create
-    db.refresh_dt("cdc_dt").await;
+    db.refresh_st("cdc_st").await;
 
     // Insert new rows
     db.execute("INSERT INTO cdc_src VALUES (2, 'new_row')")
@@ -63,8 +63,8 @@ async fn test_trigger_captures_update() {
     db.execute("INSERT INTO cdc_upd VALUES (1, 'old_val')")
         .await;
 
-    db.create_dt(
-        "cdc_upd_dt",
+    db.create_st(
+        "cdc_upd_st",
         "SELECT id, val FROM cdc_upd",
         "1m",
         "DIFFERENTIAL",
@@ -75,7 +75,7 @@ async fn test_trigger_captures_update() {
     let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
 
     // Consume existing changes
-    db.refresh_dt("cdc_upd_dt").await;
+    db.refresh_st("cdc_upd_st").await;
 
     // Update a row
     db.execute("UPDATE cdc_upd SET val = 'new_val' WHERE id = 1")
@@ -111,8 +111,8 @@ async fn test_trigger_captures_delete() {
     db.execute("INSERT INTO cdc_del VALUES (1, 'to_delete')")
         .await;
 
-    db.create_dt(
-        "cdc_del_dt",
+    db.create_st(
+        "cdc_del_st",
         "SELECT id, val FROM cdc_del",
         "1m",
         "DIFFERENTIAL",
@@ -123,7 +123,7 @@ async fn test_trigger_captures_delete() {
     let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
 
     // Consume existing changes
-    db.refresh_dt("cdc_del_dt").await;
+    db.refresh_st("cdc_del_st").await;
 
     // Delete the row
     db.execute("DELETE FROM cdc_del WHERE id = 1").await;
@@ -157,8 +157,8 @@ async fn test_trigger_captures_bulk_insert() {
         .await;
     db.execute("INSERT INTO cdc_bulk VALUES (1, 0)").await;
 
-    db.create_dt(
-        "cdc_bulk_dt",
+    db.create_st(
+        "cdc_bulk_st",
         "SELECT id, val FROM cdc_bulk",
         "1m",
         "DIFFERENTIAL",
@@ -169,7 +169,7 @@ async fn test_trigger_captures_bulk_insert() {
     let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
 
     // Consume existing changes
-    db.refresh_dt("cdc_bulk_dt").await;
+    db.refresh_st("cdc_bulk_st").await;
 
     // Bulk insert via INSERT ... SELECT
     db.execute("INSERT INTO cdc_bulk SELECT g, g FROM generate_series(2, 51) g")
@@ -190,8 +190,8 @@ async fn test_trigger_lsn_ordering() {
         .await;
     db.execute("INSERT INTO cdc_lsn VALUES (1, 'a')").await;
 
-    db.create_dt(
-        "cdc_lsn_dt",
+    db.create_st(
+        "cdc_lsn_st",
         "SELECT id, val FROM cdc_lsn",
         "1m",
         "DIFFERENTIAL",
@@ -202,7 +202,7 @@ async fn test_trigger_lsn_ordering() {
     let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
 
     // Consume existing
-    db.refresh_dt("cdc_lsn_dt").await;
+    db.refresh_st("cdc_lsn_st").await;
 
     // Multiple DML ops
     db.execute("INSERT INTO cdc_lsn VALUES (2, 'b')").await;
@@ -233,8 +233,8 @@ async fn test_trigger_typed_columns_captured() {
     db.execute("INSERT INTO cdc_typed VALUES (1, 'hello')")
         .await;
 
-    db.create_dt(
-        "cdc_typed_dt",
+    db.create_st(
+        "cdc_typed_st",
         "SELECT id, val FROM cdc_typed",
         "1m",
         "DIFFERENTIAL",
@@ -245,7 +245,7 @@ async fn test_trigger_typed_columns_captured() {
     let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
 
     // Consume existing
-    db.refresh_dt("cdc_typed_dt").await;
+    db.refresh_st("cdc_typed_st").await;
 
     db.execute("INSERT INTO cdc_typed VALUES (2, 'world')")
         .await;
@@ -276,8 +276,8 @@ async fn test_buffer_cleanup_after_refresh() {
         .await;
     db.execute("INSERT INTO cdc_cleanup VALUES (1, 'a')").await;
 
-    db.create_dt(
-        "cdc_cleanup_dt",
+    db.create_st(
+        "cdc_cleanup_st",
         "SELECT id, val FROM cdc_cleanup",
         "1m",
         "DIFFERENTIAL",
@@ -296,11 +296,11 @@ async fn test_buffer_cleanup_after_refresh() {
 
     // Manual refresh does TRUNCATE+INSERT (full) and doesn't clear the buffer.
     // The data should still be correct after refresh though.
-    db.refresh_dt("cdc_cleanup_dt").await;
+    db.refresh_st("cdc_cleanup_st").await;
 
     // Verify refresh produced correct data even with changes in buffer
-    let dt_count = db.count("public.cdc_cleanup_dt").await;
-    assert_eq!(dt_count, 3, "ST should have all 3 rows after refresh");
+    let st_count = db.count("public.cdc_cleanup_st").await;
+    assert_eq!(st_count, 3, "ST should have all 3 rows after refresh");
 }
 
 #[tokio::test]
@@ -314,8 +314,8 @@ async fn test_multiple_sources_independent_buffers() {
     db.execute("INSERT INTO src_a VALUES (1, 'alpha')").await;
     db.execute("INSERT INTO src_b VALUES (1, 1, 'extra')").await;
 
-    db.create_dt(
-        "joined_dt",
+    db.create_st(
+        "joined_st",
         "SELECT a.id, a.val, b.info FROM src_a a JOIN src_b b ON a.id = b.ref_id",
         "1m",
         "FULL",
@@ -347,8 +347,8 @@ async fn test_trigger_survives_source_insert_delete_cycle() {
     db.execute("INSERT INTO cdc_cycle VALUES (1, 'original')")
         .await;
 
-    db.create_dt(
-        "cdc_cycle_dt",
+    db.create_st(
+        "cdc_cycle_st",
         "SELECT id, val FROM cdc_cycle",
         "1m",
         "DIFFERENTIAL",
@@ -363,12 +363,12 @@ async fn test_trigger_survives_source_insert_delete_cycle() {
         .await;
 
     // Refresh and verify correctness
-    db.refresh_dt("cdc_cycle_dt").await;
+    db.refresh_st("cdc_cycle_st").await;
 
-    let count = db.count("public.cdc_cycle_dt").await;
+    let count = db.count("public.cdc_cycle_st").await;
     assert_eq!(count, 2, "Should have rows 1 and 3");
 
     // Verify exact data matches the source
-    db.assert_dt_matches_query("public.cdc_cycle_dt", "SELECT id, val FROM cdc_cycle")
+    db.assert_st_matches_query("public.cdc_cycle_st", "SELECT id, val FROM cdc_cycle")
         .await;
 }

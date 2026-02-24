@@ -88,11 +88,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   WITHIN GROUP (ORDER BY).
 
 #### Monitoring & Observability
-- **Refresh statistics** — `dt_refresh_stats()`, `get_refresh_history()`,
+- **Refresh statistics** — `st_refresh_stats()`, `get_refresh_history()`,
   `get_staleness()`.
 - **Slot health** — `slot_health()` checks replication slot state and WAL
   retention.
-- **DVM plan inspection** — `explain_dt()` describes the operator tree.
+- **DVM plan inspection** — `explain_st()` describes the operator tree.
 - **Monitoring views** — `pgstream.stream_tables_info` and
   `pgstream.pg_stat_stream_tables`.
 - **NOTIFY alerting** — `pg_stream_alert` channel broadcasts stale, suspended,

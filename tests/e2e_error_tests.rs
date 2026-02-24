@@ -18,7 +18,7 @@ async fn test_invalid_sql_in_defining_query() {
     // Typo: FORM instead of FROM
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('bad_sql_dt', \
+            "SELECT pgstream.create_stream_table('bad_sql_st', \
              $$ SELECT * FORM orders $$, '1m', 'FULL')",
         )
         .await;
@@ -33,8 +33,8 @@ async fn test_self_referencing_query_fails() {
     // Note: the table doesn't exist yet when create is called, so this should fail
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('self_ref_dt', \
-             $$ SELECT * FROM self_ref_dt $$, '1m', 'FULL')",
+            "SELECT pgstream.create_stream_table('self_ref_st', \
+             $$ SELECT * FROM self_ref_st $$, '1m', 'FULL')",
         )
         .await;
     assert!(
@@ -56,15 +56,15 @@ async fn test_subquery_in_defining_query() {
 
     // Subqueries in FROM are supported since CTE Tier 1 implementation.
     // FULL mode should work — the raw SQL is valid PostgreSQL.
-    db.create_dt(
-        "subq_dt",
+    db.create_st(
+        "subq_st",
         "SELECT * FROM (SELECT id, val FROM sub_src WHERE val > 10) sub",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.subq_dt").await;
+    let count = db.count("public.subq_st").await;
     assert_eq!(count, 2, "Subquery should return rows where val > 10");
 }
 
@@ -79,15 +79,15 @@ async fn test_cte_with_window_function_full_mode() {
 
     // CTEs are now supported. Window functions (ROW_NUMBER) are valid SQL
     // so FULL mode should work — the raw query is executed as-is.
-    db.create_dt(
-        "cte_dt",
+    db.create_st(
+        "cte_st",
         "WITH ranked AS (SELECT id, val, ROW_NUMBER() OVER (ORDER BY val DESC) AS rn FROM cte_src) SELECT id, val FROM ranked WHERE rn <= 2",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.cte_dt").await;
+    let count = db.count("public.cte_st").await;
     assert_eq!(count, 2, "Should return top 2 rows by val DESC");
 }
 
@@ -104,7 +104,7 @@ async fn test_create_with_zero_schedule() {
     // Zero schedule — might succeed or be rejected, depending on implementation
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('zero_sched_dt', \
+            "SELECT pgstream.create_stream_table('zero_sched_st', \
              $$ SELECT id FROM zero_sched_src $$, '0s', 'FULL')",
         )
         .await;
@@ -114,7 +114,7 @@ async fn test_create_with_zero_schedule() {
     if result.is_ok() {
         let sched: String = db
             .query_scalar(
-                "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'zero_sched_dt'",
+                "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'zero_sched_st'",
             )
             .await;
         assert_eq!(sched, "0s");
@@ -132,7 +132,7 @@ async fn test_create_with_negative_schedule() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('neg_sched_dt', \
+            "SELECT pgstream.create_stream_table('neg_sched_st', \
              $$ SELECT id FROM neg_sched_src $$, '-1m', 'FULL')",
         )
         .await;
@@ -145,7 +145,7 @@ async fn test_create_with_negative_schedule() {
 // ── Source Table DDL ───────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_drop_source_table_with_active_dt() {
+async fn test_drop_source_table_with_active_st() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE drop_me_src (id INT PRIMARY KEY, val TEXT)")
@@ -153,7 +153,7 @@ async fn test_drop_source_table_with_active_dt() {
     db.execute("INSERT INTO drop_me_src VALUES (1, 'data')")
         .await;
 
-    db.create_dt("orphan_dt", "SELECT id, val FROM drop_me_src", "1m", "FULL")
+    db.create_st("orphan_st", "SELECT id, val FROM drop_me_src", "1m", "FULL")
         .await;
 
     // Drop the source table while ST exists
@@ -165,14 +165,14 @@ async fn test_drop_source_table_with_active_dt() {
     // If it fails, the extension prevents orphaning.
     if result.is_ok() {
         // Check if ST was cleaned up or marked for reinit
-        let dt_exists: bool = db
+        let st_exists: bool = db
             .query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_name = 'orphan_dt')",
+                "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_name = 'orphan_st')",
             )
             .await;
         // Either the ST was cleaned up, or it may still exist in error state
-        if dt_exists {
-            let (status, _, _, _) = db.pgs_status("orphan_dt").await;
+        if st_exists {
+            let (status, _, _, _) = db.pgs_status("orphan_st").await;
             // The ST should be in some error/invalid state
             assert!(
                 status == "ERROR" || status == "SUSPENDED" || status == "ACTIVE",
@@ -192,15 +192,15 @@ async fn test_alter_source_table_add_column() {
     db.execute("INSERT INTO alter_src VALUES (1, 'hello')")
         .await;
 
-    db.create_dt(
-        "alter_src_dt",
+    db.create_st(
+        "alter_src_st",
         "SELECT id, val FROM alter_src",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.alter_src_dt").await, 1);
+    assert_eq!(db.count("public.alter_src_st").await, 1);
 
     // Add a column to the source table
     db.execute("ALTER TABLE alter_src ADD COLUMN new_col INT DEFAULT 42")
@@ -211,9 +211,9 @@ async fn test_alter_source_table_add_column() {
         .await;
 
     // Refresh should still work (defining query only selects id, val)
-    db.refresh_dt("alter_src_dt").await;
+    db.refresh_st("alter_src_st").await;
 
-    assert_eq!(db.count("public.alter_src_dt").await, 2);
+    assert_eq!(db.count("public.alter_src_st").await, 2);
 }
 
 // ── ORDER BY / LIMIT / OFFSET ──────────────────────────────────────────
@@ -229,15 +229,15 @@ async fn test_order_by_without_limit_is_accepted() {
         .await;
 
     // Should succeed — ORDER BY is accepted and discarded
-    db.create_dt(
-        "orderby_dt",
+    db.create_st(
+        "orderby_st",
         "SELECT id, val FROM orderby_src ORDER BY id",
         "1m",
         "FULL",
     )
     .await;
 
-    let count = db.count("public.orderby_dt").await;
+    let count = db.count("public.orderby_st").await;
     assert_eq!(count, 2, "ORDER BY query should create ST with all rows");
 }
 
@@ -252,7 +252,7 @@ async fn test_limit_returns_unsupported_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('limit_dt', \
+            "SELECT pgstream.create_stream_table('limit_st', \
              $$ SELECT id, val FROM limit_src LIMIT 5 $$, '1m', 'FULL')",
         )
         .await;
@@ -273,7 +273,7 @@ async fn test_offset_returns_unsupported_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('offset_dt', \
+            "SELECT pgstream.create_stream_table('offset_st', \
              $$ SELECT id, val FROM offset_src OFFSET 5 $$, '1m', 'FULL')",
         )
         .await;
@@ -294,7 +294,7 @@ async fn test_order_by_with_limit_returns_unsupported_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('orderlimit_dt', \
+            "SELECT pgstream.create_stream_table('orderlimit_st', \
              $$ SELECT id, val FROM orderlimit_src ORDER BY id LIMIT 10 $$, '1m', 'FULL')",
         )
         .await;
@@ -315,7 +315,7 @@ async fn test_limit_offset_combined_returns_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('limoff_dt', \
+            "SELECT pgstream.create_stream_table('limoff_st', \
              $$ SELECT id, val FROM limoff_src LIMIT 10 OFFSET 5 $$, '1m', 'FULL')",
         )
         .await;
@@ -337,7 +337,7 @@ async fn test_for_update_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('forupd_dt', \
+            "SELECT pgstream.create_stream_table('forupd_st', \
              $$ SELECT id, val FROM forupd_src FOR UPDATE $$, '1m', 'FULL')",
         )
         .await;
@@ -362,7 +362,7 @@ async fn test_for_share_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('forshr_dt', \
+            "SELECT pgstream.create_stream_table('forshr_st', \
              $$ SELECT id, val FROM forshr_src FOR SHARE $$, '1m', 'FULL')",
         )
         .await;
@@ -383,7 +383,7 @@ async fn test_for_no_key_update_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('fornku_dt', \
+            "SELECT pgstream.create_stream_table('fornku_st', \
              $$ SELECT id, val FROM fornku_src FOR NO KEY UPDATE $$, '1m', 'FULL')",
         )
         .await;
@@ -399,7 +399,7 @@ async fn test_for_key_share_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('forks_dt', \
+            "SELECT pgstream.create_stream_table('forks_st', \
              $$ SELECT id, val FROM forks_src FOR KEY SHARE $$, '1m', 'FULL')",
         )
         .await;
@@ -416,15 +416,15 @@ async fn test_order_by_in_differential_mode_is_accepted() {
     db.execute("INSERT INTO orderby_diff_src VALUES (1, 10), (2, 20)")
         .await;
 
-    db.create_dt(
-        "orderby_diff_dt",
+    db.create_st(
+        "orderby_diff_st",
         "SELECT id, val FROM orderby_diff_src ORDER BY val DESC",
         "1m",
         "DIFFERENTIAL",
     )
     .await;
 
-    let count = db.count("public.orderby_diff_dt").await;
+    let count = db.count("public.orderby_diff_st").await;
     assert_eq!(count, 2, "ORDER BY in DIFFERENTIAL mode should be accepted");
 }
 
@@ -439,7 +439,7 @@ async fn test_concurrent_refresh_safety() {
     db.execute("INSERT INTO conc_src SELECT g, g FROM generate_series(1, 100) g")
         .await;
 
-    db.create_dt("conc_dt", "SELECT id, val FROM conc_src", "1m", "FULL")
+    db.create_st("conc_st", "SELECT id, val FROM conc_src", "1m", "FULL")
         .await;
 
     // Insert more data
@@ -451,12 +451,12 @@ async fn test_concurrent_refresh_safety() {
     let pool2 = db.pool.clone();
 
     let h1 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('conc_dt')")
+        sqlx::query("SELECT pgstream.refresh_stream_table('conc_st')")
             .execute(&pool)
             .await
     });
     let h2 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('conc_dt')")
+        sqlx::query("SELECT pgstream.refresh_stream_table('conc_st')")
             .execute(&pool2)
             .await
     });
@@ -475,7 +475,7 @@ async fn test_concurrent_refresh_safety() {
     );
 
     // Verify data integrity
-    let count = db.count("public.conc_dt").await;
+    let count = db.count("public.conc_st").await;
     assert_eq!(count, 200, "All 200 rows should be present after refresh");
 }
 
@@ -490,7 +490,7 @@ async fn test_grouping_sets_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('gs_dt', \
+            "SELECT pgstream.create_stream_table('gs_st', \
              $$ SELECT dept, SUM(amount) FROM gs_src \
              GROUP BY GROUPING SETS ((dept), (region)) $$, '1m', 'FULL')",
         )
@@ -516,7 +516,7 @@ async fn test_rollup_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('rollup_dt', \
+            "SELECT pgstream.create_stream_table('rollup_st', \
              $$ SELECT dept, region, SUM(amount) FROM rollup_src \
              GROUP BY ROLLUP (dept, region) $$, '1m', 'FULL')",
         )
@@ -538,7 +538,7 @@ async fn test_cube_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('cube_dt', \
+            "SELECT pgstream.create_stream_table('cube_st', \
              $$ SELECT dept, region, SUM(amount) FROM cube_src \
              GROUP BY CUBE (dept, region) $$, '1m', 'FULL')",
         )
@@ -561,7 +561,7 @@ async fn test_grouping_sets_differential_mode_also_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('gsd_dt', \
+            "SELECT pgstream.create_stream_table('gsd_st', \
              $$ SELECT dept, SUM(amount) FROM gsd_src \
              GROUP BY GROUPING SETS ((dept), ()) $$, '1m', 'DIFFERENTIAL')",
         )
@@ -590,7 +590,7 @@ async fn test_tablesample_bernoulli_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('ts_dt', \
+            "SELECT pgstream.create_stream_table('ts_st', \
              $$ SELECT id, val FROM ts_src TABLESAMPLE BERNOULLI(10) $$, '1m', 'FULL')",
         )
         .await;
@@ -615,7 +615,7 @@ async fn test_tablesample_system_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('tss_dt', \
+            "SELECT pgstream.create_stream_table('tss_st', \
              $$ SELECT id, val FROM tss_src TABLESAMPLE SYSTEM(50) $$, '1m', 'FULL')",
         )
         .await;
@@ -640,7 +640,7 @@ async fn test_percentile_cont_now_supported_in_differential_mode() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('pct_dt', \
+            "SELECT pgstream.create_stream_table('pct_st', \
              $$ SELECT dept, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) AS median \
              FROM pct_src GROUP BY dept $$, '1m', 'DIFFERENTIAL')",
         )

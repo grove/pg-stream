@@ -13,20 +13,20 @@ use e2e::E2eDb;
 // ── Cycle Detection via SQL ────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_cycle_detection_dt_depending_on_dt() {
+async fn test_cycle_detection_dt_depending_on_st() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE cycle_src (id INT PRIMARY KEY, val INT)")
         .await;
     db.execute("INSERT INTO cycle_src VALUES (1, 10)").await;
 
-    // Create dt_a sourcing from cycle_src
-    db.create_dt("cycle_dt_a", "SELECT id, val FROM cycle_src", "1m", "FULL")
+    // Create st_a sourcing from cycle_src
+    db.create_st("cycle_dt_a", "SELECT id, val FROM cycle_src", "1m", "FULL")
         .await;
 
-    // Try to create dt_b that depends on dt_a, and then alter dt_a to depend on dt_b
-    // Actually: create dt_b from dt_a, then create dt_c from dt_b, then try dt_a from dt_c → cycle
-    db.create_dt(
+    // Try to create st_b that depends on st_a, and then alter st_a to depend on st_b
+    // Actually: create st_b from st_a, then create st_c from st_b, then try st_a from st_c → cycle
+    db.create_st(
         "cycle_dt_b",
         "SELECT id, val FROM public.cycle_dt_a",
         "1m",
@@ -38,9 +38,9 @@ async fn test_cycle_detection_dt_depending_on_dt() {
     // where cycle_dt_a → cycle_dt_b already exists and cycle_dt_b → cycle_dt_c
     // This depends on whether the extension detects the proposed cycle.
     // For a direct self-reference, we already know it fails.
-    // Let's test the two-hop cycle: create dt_c from dt_b, then try to redefine dt_a from dt_c.
-    // Since we can't redefine, create a new ST from dt_b to exercise the cycle check path.
-    db.create_dt(
+    // Let's test the two-hop cycle: create st_c from st_b, then try to redefine st_a from st_c.
+    // Since we can't redefine, create a new ST from st_b to exercise the cycle check path.
+    db.create_st(
         "cycle_dt_c",
         "SELECT id, val FROM public.cycle_dt_b",
         "1m",
@@ -70,7 +70,7 @@ async fn test_invalid_schedule_below_minimum() {
     // Try to create with a schedule below that minimum.
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('tiny_sched_dt', \
+            "SELECT pgstream.create_stream_table('tiny_sched_st', \
              $$ SELECT id FROM sched_src $$, '1s', 'FULL')",
         )
         .await;
@@ -88,7 +88,7 @@ async fn test_explain_dt_returns_properties() {
     db.execute("INSERT INTO explain_src VALUES (1, 'a', 100)")
         .await;
 
-    db.create_dt(
+    db.create_st(
         "explain_target",
         "SELECT id, val, amount FROM explain_src",
         "1m",
@@ -96,20 +96,20 @@ async fn test_explain_dt_returns_properties() {
     )
     .await;
 
-    // Call explain_dt and verify it returns structured properties
+    // Call explain_st and verify it returns structured properties
     let row_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.explain_dt('explain_target')")
+        .query_scalar("SELECT count(*) FROM pgstream.explain_st('explain_target')")
         .await;
     assert!(
         row_count >= 3,
-        "explain_dt should return multiple property rows, got {}",
+        "explain_st should return multiple property rows, got {}",
         row_count
     );
 
     // Check specific properties exist
     let pgs_name: String = db
         .query_scalar(
-            "SELECT value FROM pgstream.explain_dt('explain_target') \
+            "SELECT value FROM pgstream.explain_st('explain_target') \
              WHERE property = 'pgs_name'",
         )
         .await;
@@ -121,7 +121,7 @@ async fn test_explain_dt_returns_properties() {
 
     let mode: String = db
         .query_scalar(
-            "SELECT value FROM pgstream.explain_dt('explain_target') \
+            "SELECT value FROM pgstream.explain_st('explain_target') \
              WHERE property = 'refresh_mode'",
         )
         .await;
@@ -137,8 +137,8 @@ async fn test_explain_dt_differential_shows_dvm_info() {
     db.execute("INSERT INTO explain_inc_src VALUES (1, 'east', 100)")
         .await;
 
-    db.create_dt(
-        "explain_inc_dt",
+    db.create_st(
+        "explain_inc_st",
         "SELECT region, SUM(amount) AS total FROM explain_inc_src GROUP BY region",
         "1m",
         "DIFFERENTIAL",
@@ -148,7 +148,7 @@ async fn test_explain_dt_differential_shows_dvm_info() {
     // DVM-supported query should include dvm_supported property
     let dvm_supported: Option<String> = db
         .query_scalar_opt(
-            "SELECT value FROM pgstream.explain_dt('explain_inc_dt') \
+            "SELECT value FROM pgstream.explain_st('explain_inc_st') \
              WHERE property = 'dvm_supported'",
         )
         .await;
@@ -168,8 +168,8 @@ async fn test_slot_health_returns_rows() {
     db.execute("INSERT INTO health_src VALUES (1, 'data')")
         .await;
 
-    db.create_dt(
-        "health_dt",
+    db.create_st(
+        "health_st",
         "SELECT id, val FROM health_src",
         "1m",
         "DIFFERENTIAL",
@@ -210,15 +210,15 @@ async fn test_alter_source_drop_column_not_in_query() {
         .await;
 
     // ST only uses id and val — not extra
-    db.create_dt(
-        "drop_col_dt",
+    db.create_st(
+        "drop_col_st",
         "SELECT id, val FROM drop_col_src",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.drop_col_dt").await, 1);
+    assert_eq!(db.count("public.drop_col_st").await, 1);
 
     // Drop the unused column
     db.execute("ALTER TABLE drop_col_src DROP COLUMN extra")
@@ -227,9 +227,9 @@ async fn test_alter_source_drop_column_not_in_query() {
     // Insert a new row and refresh — should still work
     db.execute("INSERT INTO drop_col_src (id, val) VALUES (2, 'world')")
         .await;
-    db.refresh_dt("drop_col_dt").await;
+    db.refresh_st("drop_col_st").await;
 
-    assert_eq!(db.count("public.drop_col_dt").await, 2);
+    assert_eq!(db.count("public.drop_col_st").await, 2);
 }
 
 #[tokio::test]
@@ -242,8 +242,8 @@ async fn test_alter_source_drop_column_in_query() {
         .await;
 
     // ST uses all columns including 'amount'
-    db.create_dt(
-        "drop_used_dt",
+    db.create_st(
+        "drop_used_st",
         "SELECT id, val, amount FROM drop_used_src",
         "1m",
         "FULL",
@@ -256,7 +256,7 @@ async fn test_alter_source_drop_column_in_query() {
 
     // Refresh should fail since the defining query references a dropped column
     let result = db
-        .try_execute("SELECT pgstream.refresh_stream_table('drop_used_dt')")
+        .try_execute("SELECT pgstream.refresh_stream_table('drop_used_st')")
         .await;
     assert!(
         result.is_err(),
@@ -272,10 +272,10 @@ async fn test_alter_source_change_column_type() {
         .await;
     db.execute("INSERT INTO type_src VALUES (1, '100')").await;
 
-    db.create_dt("type_dt", "SELECT id, val FROM type_src", "1m", "FULL")
+    db.create_st("type_st", "SELECT id, val FROM type_src", "1m", "FULL")
         .await;
 
-    assert_eq!(db.count("public.type_dt").await, 1);
+    assert_eq!(db.count("public.type_st").await, 1);
 
     // Change column type (TEXT → VARCHAR)
     db.execute("ALTER TABLE type_src ALTER COLUMN val TYPE VARCHAR(255)")
@@ -283,9 +283,9 @@ async fn test_alter_source_change_column_type() {
 
     // Refresh should still work since VARCHAR is compatible with TEXT
     db.execute("INSERT INTO type_src VALUES (2, 'hello')").await;
-    db.refresh_dt("type_dt").await;
+    db.refresh_st("type_st").await;
 
-    assert_eq!(db.count("public.type_dt").await, 2);
+    assert_eq!(db.count("public.type_st").await, 2);
 }
 
 // ── Concurrent Refresh / Advisory Lock Path ────────────────────────────
@@ -299,7 +299,7 @@ async fn test_advisory_lock_blocks_concurrent_refresh() {
     db.execute("INSERT INTO lock_src SELECT g, g FROM generate_series(1, 50) g")
         .await;
 
-    db.create_dt("lock_dt", "SELECT id, val FROM lock_src", "1m", "FULL")
+    db.create_st("lock_st", "SELECT id, val FROM lock_src", "1m", "FULL")
         .await;
 
     db.execute("INSERT INTO lock_src SELECT g, g FROM generate_series(51, 100) g")
@@ -311,17 +311,17 @@ async fn test_advisory_lock_blocks_concurrent_refresh() {
     let pool3 = db.pool.clone();
 
     let h1 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('lock_dt')")
+        sqlx::query("SELECT pgstream.refresh_stream_table('lock_st')")
             .execute(&pool1)
             .await
     });
     let h2 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('lock_dt')")
+        sqlx::query("SELECT pgstream.refresh_stream_table('lock_st')")
             .execute(&pool2)
             .await
     });
     let h3 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('lock_dt')")
+        sqlx::query("SELECT pgstream.refresh_stream_table('lock_st')")
             .execute(&pool3)
             .await
     });
@@ -339,6 +339,6 @@ async fn test_advisory_lock_blocks_concurrent_refresh() {
     );
 
     // Data integrity check
-    let count = db.count("public.lock_dt").await;
+    let count = db.count("public.lock_st").await;
     assert_eq!(count, 100, "All rows should be present after refresh");
 }

@@ -20,15 +20,15 @@ async fn test_drop_removes_storage_table() {
         .await;
     db.execute("INSERT INTO dr_src VALUES (1, 'a')").await;
 
-    db.create_dt("dr_dt", "SELECT id, val FROM dr_src", "1m", "FULL")
+    db.create_st("dr_st", "SELECT id, val FROM dr_src", "1m", "FULL")
         .await;
 
-    assert!(db.table_exists("public", "dr_dt").await);
+    assert!(db.table_exists("public", "dr_st").await);
 
-    db.drop_dt("dr_dt").await;
+    db.drop_st("dr_st").await;
 
     // Storage table should be gone
-    let result = db.try_execute("SELECT * FROM public.dr_dt").await;
+    let result = db.try_execute("SELECT * FROM public.dr_st").await;
     assert!(result.is_err(), "Querying dropped ST storage should fail");
 }
 
@@ -39,21 +39,21 @@ async fn test_drop_removes_catalog_entry() {
     db.execute("CREATE TABLE dr_cat (id INT PRIMARY KEY)").await;
     db.execute("INSERT INTO dr_cat VALUES (1)").await;
 
-    db.create_dt("dr_cat_dt", "SELECT id FROM dr_cat", "1m", "FULL")
+    db.create_st("dr_cat_st", "SELECT id FROM dr_cat", "1m", "FULL")
         .await;
 
     let before: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_cat_dt'",
+            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_cat_st'",
         )
         .await;
     assert_eq!(before, 1);
 
-    db.drop_dt("dr_cat_dt").await;
+    db.drop_st("dr_cat_st").await;
 
     let after: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_cat_dt'",
+            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_cat_st'",
         )
         .await;
     assert_eq!(after, 0, "Catalog entry should be removed");
@@ -66,11 +66,11 @@ async fn test_drop_removes_dependencies() {
     db.execute("CREATE TABLE dr_dep (id INT PRIMARY KEY)").await;
     db.execute("INSERT INTO dr_dep VALUES (1)").await;
 
-    db.create_dt("dr_dep_dt", "SELECT id FROM dr_dep", "1m", "FULL")
+    db.create_st("dr_dep_st", "SELECT id FROM dr_dep", "1m", "FULL")
         .await;
 
     let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_dep_dt'")
+        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_dep_st'")
         .await;
 
     let deps_before: i64 = db
@@ -84,7 +84,7 @@ async fn test_drop_removes_dependencies() {
         "Should have dependency entries before drop"
     );
 
-    db.drop_dt("dr_dep_dt").await;
+    db.drop_st("dr_dep_st").await;
 
     let deps_after: i64 = db
         .query_scalar(&format!(
@@ -103,7 +103,7 @@ async fn test_drop_removes_cdc_trigger() {
         .await;
     db.execute("INSERT INTO dr_trig VALUES (1)").await;
 
-    db.create_dt("dr_trig_dt", "SELECT id FROM dr_trig", "1m", "DIFFERENTIAL")
+    db.create_st("dr_trig_st", "SELECT id FROM dr_trig", "1m", "DIFFERENTIAL")
         .await;
 
     let source_oid = db.table_oid("dr_trig").await;
@@ -114,7 +114,7 @@ async fn test_drop_removes_cdc_trigger() {
         "Trigger should exist before drop"
     );
 
-    db.drop_dt("dr_trig_dt").await;
+    db.drop_st("dr_trig_st").await;
 
     assert!(
         !db.trigger_exists(&trigger_name, "dr_trig").await,
@@ -123,7 +123,7 @@ async fn test_drop_removes_cdc_trigger() {
 }
 
 #[tokio::test]
-async fn test_drop_preserves_trigger_for_other_dt() {
+async fn test_drop_preserves_trigger_for_other_st() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE dr_shared (id INT PRIMARY KEY, val TEXT)")
@@ -132,15 +132,15 @@ async fn test_drop_preserves_trigger_for_other_dt() {
         .await;
 
     // Create two STs on the same source
-    db.create_dt(
-        "dt_shared_1",
+    db.create_st(
+        "st_shared_1",
         "SELECT id, val FROM dr_shared",
         "1m",
         "DIFFERENTIAL",
     )
     .await;
-    db.create_dt(
-        "dt_shared_2",
+    db.create_st(
+        "st_shared_2",
         "SELECT id FROM dr_shared",
         "1m",
         "DIFFERENTIAL",
@@ -151,7 +151,7 @@ async fn test_drop_preserves_trigger_for_other_dt() {
     let trigger_name = format!("pg_stream_cdc_{}", source_oid);
 
     // Drop one ST
-    db.drop_dt("dt_shared_1").await;
+    db.drop_st("st_shared_1").await;
 
     // Trigger should still exist for the other ST
     assert!(
@@ -160,7 +160,7 @@ async fn test_drop_preserves_trigger_for_other_dt() {
     );
 
     // The other ST should still work
-    let count = db.count("public.dt_shared_2").await;
+    let count = db.count("public.st_shared_2").await;
     assert_eq!(count, 2);
 }
 
@@ -171,7 +171,7 @@ async fn test_drop_removes_change_tracking() {
     db.execute("CREATE TABLE dr_ct (id INT PRIMARY KEY)").await;
     db.execute("INSERT INTO dr_ct VALUES (1)").await;
 
-    db.create_dt("dr_ct_dt", "SELECT id FROM dr_ct", "1m", "DIFFERENTIAL")
+    db.create_st("dr_ct_st", "SELECT id FROM dr_ct", "1m", "DIFFERENTIAL")
         .await;
 
     let source_oid = db.table_oid("dr_ct").await;
@@ -184,7 +184,7 @@ async fn test_drop_removes_change_tracking() {
         .await;
     assert!(ct_before >= 1, "Change tracking should exist before drop");
 
-    db.drop_dt("dr_ct_dt").await;
+    db.drop_st("dr_ct_st").await;
 
     let ct_after: i64 = db
         .query_scalar(&format!(
@@ -205,7 +205,7 @@ async fn test_drop_nonexistent_fails() {
     let db = E2eDb::new().await.with_extension().await;
 
     let result = db
-        .try_execute("SELECT pgstream.drop_stream_table('no_such_dt')")
+        .try_execute("SELECT pgstream.drop_stream_table('no_such_st')")
         .await;
     assert!(result.is_err(), "Dropping a nonexistent ST should fail");
 }
@@ -221,15 +221,15 @@ async fn test_drop_preserves_source_table() {
     db.execute("INSERT INTO dr_preserved VALUES (1, 'keep_me')")
         .await;
 
-    db.create_dt(
-        "dt_to_drop",
+    db.create_st(
+        "st_to_drop",
         "SELECT id, val FROM dr_preserved",
         "1m",
         "FULL",
     )
     .await;
 
-    db.drop_dt("dt_to_drop").await;
+    db.drop_st("st_to_drop").await;
 
     // Source table should be untouched
     let count = db.count("public.dr_preserved").await;

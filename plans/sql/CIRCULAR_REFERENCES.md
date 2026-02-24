@@ -111,7 +111,7 @@ The maximum number of iterations is bounded by the output cardinality, but in pr
 
 Replace or augment Kahn's algorithm with Tarjan's algorithm to decompose the graph into SCCs.
 
-#### New Method: `DtDag::compute_sccs()`
+#### New Method: `StDag::compute_sccs()`
 
 ```rust
 /// A strongly connected component of the dependency graph.
@@ -131,7 +131,7 @@ pub fn compute_sccs(&self) -> Vec<Scc> { ... }
 
 Tarjan's algorithm runs in O(V + E) time, same as Kahn's.
 
-#### New Method: `DtDag::condensation_order()`
+#### New Method: `StDag::condensation_order()`
 
 Replaces `topological_order()` for the scheduler:
 
@@ -389,7 +389,7 @@ DAG → condensation_order() → for each SCC:
 ```rust
 fn iterate_to_fixpoint(
     scc: &Scc,
-    dag: &DtDag,
+    dag: &StDag,
     retry_states: &mut HashMap<i64, RetryState>,
     retry_policy: &RetryPolicy,
     now_ms: u64,
@@ -405,24 +405,24 @@ fn iterate_to_fixpoint(
                 _ => continue,
             };
             
-            let dt = match load_dt_by_id(pgs_id) {
-                Some(dt) => dt,
+            let st = match load_st_by_id(pgs_id) {
+                Some(st) => st,
                 None => continue,
             };
             
-            if dt.status != DtStatus::Active {
+            if st.status != StStatus::Active {
                 continue;
             }
             
-            let has_changes = check_upstream_changes(&dt);
-            let action = refresh::determine_refresh_action(&dt, has_changes);
+            let has_changes = check_upstream_changes(&st);
+            let action = refresh::determine_refresh_action(&st, has_changes);
             
             match action {
                 RefreshAction::NoData if iteration > 0 => {
                     // This member has converged — no changes from upstream
                 }
                 _ => {
-                    let result = execute_scheduled_refresh_with_iteration(&dt, action, iteration);
+                    let result = execute_scheduled_refresh_with_iteration(&st, action, iteration);
                     match result {
                         RefreshOutcome::Success(inserted, deleted) => {
                             total_changes += inserted + deleted;
@@ -432,7 +432,7 @@ fn iterate_to_fixpoint(
                             // if a member fails
                             log!(
                                 "pg_stream: SCC fixpoint aborted — {}.{} failed",
-                                dt.pgs_schema, dt.pgs_name,
+                                st.pgs_schema, st.pgs_name,
                             );
                             return;
                         }
