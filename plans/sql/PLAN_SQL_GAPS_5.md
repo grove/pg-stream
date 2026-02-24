@@ -1,10 +1,19 @@
 # PLAN: SQL Gaps — Phase 5
 
-**Status:** Proposed  
+**Status:** In Progress  
 **Date:** 2026-02-24  
 **Branch:** `main`  
 **Scope:** Next priorities for SQL feature coverage — both new implementations and revisiting rejected constructs.  
 **Current state:** 872 unit tests, 22 E2E test suites, 25 AggFunc variants, 21 OpTree variants, 20 diff operators. Zero P0 or P1 issues. All remaining gaps are P2+ with clear error messages.
+
+### Completed Steps
+
+- [x] **C-1: Populate `columns_used` + wire `detect_schema_change_kind()`** — Done 2026-02-24
+  - `OpTree::source_columns_used()` + `ParseResult::source_columns_used()` collect per-source column names from Scan nodes
+  - `StDependency::insert()` accepts and writes `columns_used` to `pgs_dependencies`
+  - `get_for_st()` / `get_all()` read `columns_used` from DB (no longer hardcoded `None`)
+  - `api.rs`: extracts column map from `ParseResult` during creation, passes to dependency insert
+  - `handle_alter_table()` calls `detect_schema_change_kind()` — benign DDL skips reinit, only column changes trigger reinit + cascade
 
 ---
 
@@ -455,8 +464,14 @@ is better practice.
 
 ### Recommended Execution Order
 
+> **Note:** Session C-1 is complete. The table below reflects only remaining
+> work. Items are ordered by impact-to-effort ratio, with correctness gaps
+> first, then high-value features, then schema infrastructure, then
+> diminishing-returns items.
+
 | Session | Items | Total Effort | Cumulative Value |
 |---------|-------|-------------|------------------|
+| ~~**C-1**~~ | ~~Populate `columns_used` + wire `detect_schema_change_kind()`~~ | ~~4–5h~~ | ~~✅ DONE — benign DDL skips reinit~~ |
 | **1** | A1 (volatile functions) + A3 (ALL subquery) | 5–8 hours | Closes last silent correctness gap + completes subquery coverage |
 | **2** | A2 (DISTINCT ON) | 6–8 hours | Unlocks common PG idiom |
 | **3** | A4 (regression aggregates) + A5 (mixed UNION) | 8–12 hours | Covers 12 gap items in one session |
@@ -470,7 +485,7 @@ These items are best left rejected with their current error messages:
 
 | Item | Reason |
 |------|--------|
-| **NATURAL JOIN** | Fragile, poor practice, explicit JOINs are better |
+| **NATURAL JOIN** | ~~Fragile, poor practice~~ → **Moved to S9** (implementable under schema policy, see Part C) |
 | **LIMIT / OFFSET** | Fundamental design (stream tables are full result sets) |
 | **FOR UPDATE / FOR SHARE** | No row-level locking on stream tables |
 | **TABLESAMPLE** | Stream tables materialize complete result sets |
@@ -482,17 +497,17 @@ These items are best left rejected with their current error messages:
 
 ---
 
-## Success Criteria
+## Success Criteria (Parts A + B)
 
-After Sessions 1–4 (most impactful work):
+After Steps S1–S6 (highest-impact work):
 
-- [ ] Volatile functions rejected in DIFFERENTIAL mode with clear error
-- [ ] Stable functions produce a warning in DIFFERENTIAL mode
-- [ ] `DISTINCT ON` auto-rewritten to ROW_NUMBER() window function
-- [ ] `ALL (subquery)` supported via AntiJoin rewrite
-- [ ] 11 regression aggregates supported in DIFFERENTIAL mode
-- [ ] Mixed UNION / UNION ALL works correctly
-- [ ] TRUNCATE on source tables triggers reinitialization
+- [ ] Volatile functions rejected in DIFFERENTIAL mode with clear error (S1)
+- [ ] Stable functions produce a warning in DIFFERENTIAL mode (S1)
+- [ ] `DISTINCT ON` auto-rewritten to ROW_NUMBER() window function (S4)
+- [ ] `ALL (subquery)` supported via AntiJoin rewrite (S3)
+- [ ] 11 regression aggregates supported in DIFFERENTIAL mode (S5)
+- [ ] Mixed UNION / UNION ALL works correctly (S6)
+- [ ] TRUNCATE on source tables triggers reinitialization (S2)
 - [ ] 36+ AggFunc variants (up from 25)
 - [ ] 900+ unit tests (estimated, up from 872)
 - [ ] Documentation updated across SQL_REFERENCE, DVM_OPERATORS, README
@@ -508,7 +523,8 @@ After Sessions 1–4 (most impactful work):
 | PLAN_SQL_GAPS_3 | ~5 | 5 new aggregates + 3 subquery operators | 750 → 809 |
 | PLAN_SQL_GAPS_4 | 1 | Report accuracy + 3 ordered-set aggregates | 809 → 826 |
 | Hybrid CDC + user triggers + pgs_ rename | ~3 | Hybrid CDC, user triggers, 72-file rename | 826 → 872 |
-| **PLAN_SQL_GAPS_5** | **~6** | **Target: volatile detection, DISTINCT ON, ALL subquery, 11 regression aggs, mixed UNION, TRUNCATE** | **872 → 900+** |
+| **PLAN_SQL_GAPS_5 C-1** | **1** | **columns_used population + smart schema change detection** | **872 (no new tests yet)** |
+| **PLAN_SQL_GAPS_5** | **~10** | **Target: volatile detection, DISTINCT ON, ALL subquery, 11 regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables** | **872 → 920+** |
 
 ---
 
@@ -529,35 +545,33 @@ in the codebase.
 
 ### C0. Current Infrastructure Audit
 
-Three mechanisms are **already built but not wired in**:
+Three mechanisms were identified. **C0-a and C0-b are now complete** (session
+C-1). C0-c remains for future work (session C-2).
 
-#### C0-a. `columns_used TEXT[]` in `pgs_dependencies`
+> **Status after C-1:** `columns_used` is populated at creation time for
+> DIFFERENTIAL-mode STs. `detect_schema_change_kind()` is wired into
+> `handle_alter_table()`. Benign DDL (indexes, comments, statistics) and
+> constraint-only changes no longer trigger unnecessary reinitialization.
+
+#### C0-a. `columns_used TEXT[]` in `pgs_dependencies` — ✅ DONE
 
 | Field | Value |
 |-------|-------|
 | **Schema column** | `pgs_dependencies.columns_used TEXT[]` ([src/lib.rs](../../src/lib.rs) table DDL) |
 | **Rust struct** | `StDependency.columns_used: Option<Vec<String>>` ([src/catalog.rs L82](../../src/catalog.rs#L82)) |
-| **Insert** | `StDependency::insert()` at [src/catalog.rs L559](../../src/catalog.rs#L559) **never sets it** — always NULL |
-| **Read** | `get_for_st()` at [L636](../../src/catalog.rs#L636) and `get_all()` at [L678](../../src/catalog.rs#L678) **hardcode `columns_used: None`** — don't read the DB column |
-| **Consumer** | `get_tracked_columns()` at [src/hooks.rs L625](../../src/hooks.rs#L625) reads it, but since it's always NULL, `detect_schema_change_kind()` always falls through to the conservative `ColumnChange` path |
+| **Insert** | `StDependency::insert()` now accepts `Option<Vec<String>>` and writes to DB |
+| **Read** | `get_for_st()` and `get_all()` now read `columns_used` from query results |
+| **Source** | `ParseResult::source_columns_used()` + `OpTree::source_columns_used()` collect per-source column names from Scan nodes |
+| **API** | `create_stream_table_impl()` extracts column map from `ParseResult` and passes to dependency insert |
 
-**Gap:** The parser already resolves column lists per source table via
-`resolve_columns()` at [src/dvm/parser.rs L3413](../../src/dvm/parser.rs#L3413).
-This data is used to build the OpTree but is discarded afterward — never passed
-back to the API layer for catalog storage.
-
-#### C0-b. `detect_schema_change_kind()` — Dead Code
+#### C0-b. `detect_schema_change_kind()` — ✅ DONE
 
 | Field | Value |
 |-------|-------|
 | **Location** | [src/hooks.rs L590](../../src/hooks.rs#L590) |
 | **Purpose** | Classifies ALTER TABLE changes as `ColumnChange`, `ConstraintChange`, or `Benign` |
 | **Mechanism** | Compares `columns_used` (from `pgs_dependencies`) against current `pg_attribute` |
-| **Tests** | Has unit tests at [hooks.rs L650+](../../src/hooks.rs#L650) |
-| **Status** | **Not called.** `handle_alter_table()` at [L148](../../src/hooks.rs#L148) unconditionally marks all downstream STs for reinit regardless of change type |
-
-**Consequence:** Every `ALTER TABLE` — even adding a comment or index —
-triggers full reinitialization of all dependent stream tables.
+| **Status** | **Wired in.** `handle_alter_table()` calls `detect_schema_change_kind()` per-ST and only reinits on `ColumnChange`. `Benign` and `ConstraintChange` skip reinit. |
 
 #### C0-c. No Column Snapshot at Creation Time
 
@@ -614,54 +628,34 @@ Wire in the existing infrastructure and add column snapshots so the system can
 **detect** what changed and respond intelligently (targeted reinit, warning, or
 error depending on the feature).
 
-#### Step 1: Populate `columns_used` (2–3 hours)
+#### Step 1: Populate `columns_used` — ✅ DONE
 
 During stream table creation (`pgstream.create()` → `StDependency::insert()`),
-pass the column names from `resolve_columns()` results through the API layer
+column names from `resolve_columns()` results are passed through the API layer
 into catalog storage.
 
-- In `src/dvm/parser.rs`: after calling `resolve_columns()` at
-  [L2874](../../src/dvm/parser.rs#L2874), return the column names alongside the
-  OpTree (e.g., in a `ParseResult` struct)
-- In `src/api.rs`: pass the per-source column lists to `StDependency::insert()`
-- In `src/catalog.rs`: update `insert()` at [L559](../../src/catalog.rs#L559)
-  to write `columns_used` into the SQL INSERT
-- In `src/catalog.rs`: update `get_for_st()` at [L636](../../src/catalog.rs#L636)
-  and `get_all()` at [L678](../../src/catalog.rs#L678) to actually read the
-  column from the query result
+- `ParseResult::source_columns_used()` collects `(table_oid, Vec<column_name>)`
+  from all Scan nodes in the OpTree and CTE registry
+- `create_stream_table_impl()` extracts this map and passes to
+  `StDependency::insert()` per source dependency
+- `StDependency::insert()` writes `columns_used` into the SQL INSERT
+- `get_for_st()` and `get_all()` read the column from query results
 
-**Immediate benefit:** `detect_schema_change_kind()` starts producing accurate
-classifications instead of always returning `ColumnChange`.
+**Benefit:** `detect_schema_change_kind()` now produces accurate classifications
+instead of always returning `ColumnChange`.
 
-#### Step 2: Wire `detect_schema_change_kind()` (2 hours)
+#### Step 2: Wire `detect_schema_change_kind()` — ✅ DONE
 
-In `handle_alter_table()` at [src/hooks.rs L148](../../src/hooks.rs#L148):
+`handle_alter_table()` now calls `detect_schema_change_kind()` per affected ST:
 
-```
-fn handle_alter_table(objid: Oid, identity: &str) {
-    let deps = StDependency::get_downstream(objid);
-    for dep in deps {
-        let kind = detect_schema_change_kind(dep.pgs_id, objid)?;
-        match kind {
-            Benign => { /* skip — no reinit needed */ }
-            ConstraintChange => {
-                // PK changed — reinit only if row_id strategy depends on PK
-                if dep.uses_pk_row_id() {
-                    mark_needs_reinit(dep.pgs_id);
-                }
-            }
-            ColumnChange => {
-                rebuild_cdc_trigger_function(objid);
-                mark_needs_reinit(dep.pgs_id);
-                cascade_to_downstream(dep.pgs_id);
-            }
-        }
-    }
-}
-```
+- `Benign` → skip reinit (log at debug level)
+- `ConstraintChange` → skip reinit (future S10 may reinit for PK changes)
+- `ColumnChange` → reinit + rebuild CDC trigger + cascade to downstream STs
+- WAL fallback only triggered on column changes
+- Falls back to conservative `ColumnChange` on detection errors
 
-**Immediate benefit:** Benign DDL (adding indexes, comments, statistics) no
-longer triggers unnecessary reinitialization.
+**Benefit:** Benign DDL (adding indexes, comments, statistics) no longer
+triggers unnecessary reinitialization.
 
 #### Step 3: Store Column Snapshot (3–4 hours)
 
@@ -742,27 +736,64 @@ state:
 
 ---
 
-### C4. Combined Priority: Parts A + B + C
+### C4. Master Implementation Order (All Remaining Steps)
 
-With the schema-safety infrastructure in place, the recommended execution order
-expands to include previously-rejected schema-dependent features:
+With C-1 complete, the full implementation order for all remaining work across
+Parts A, B, and C. Each step is self-contained and can be committed
+independently. Steps are numbered sequentially for easy reference.
 
-| Session | Items | Effort | What It Delivers |
-|---------|-------|--------|------------------|
-| **1** | A1 (volatile functions) + A3 (ALL subquery) | 5–8h | Closes last silent correctness gap + completes subquery coverage |
-| **2** | A2 (DISTINCT ON) | 6–8h | Unlocks common PG idiom |
-| **3** | A4 (regression aggs) + A5 (mixed UNION) | 8–12h | Covers 12 gap items in one session |
-| **4** | A6 (TRUNCATE capture) | 4–6h | Closes second correctness gap |
-| **C-1** | Populate `columns_used` + wire `detect_schema_change_kind()` | 4–5h | Reduces unnecessary reinits; enables all schema-dependent features |
-| **C-2** | Column snapshot + schema fingerprint | 3–4h | Precise change detection |
-| **C-3** | `pg_stream.block_source_ddl` GUC | 3–4h | Optional strict mode for production |
-| **C-4** | NATURAL JOIN (B9) with column snapshot | 6–8h | Previously rejected — now safe under policy |
-| **C-5** | Keyless table support (ADR-072) | 4–6h | PK-aware row identity with fallback |
-| **5** | A7 (GROUPING SETS) | 10–15h | Major OLAP feature |
-| **6+** | A8–A10 (multi-PARTITION, recursive CTE, scalar WHERE) | 29–38h | Diminishing returns |
+#### Tier 1 — Correctness Gaps (must-fix)
 
-Sessions 1–4 remain unchanged from Part A. Sessions C-1 through C-5 can be
-interleaved — C-1 is a prerequisite for C-2 and C-4, but C-3 is independent.
+| Step | Item(s) | Effort | Delivers | Prereqs |
+|------|---------|--------|----------|----------|
+| ~~C-1~~ | ~~Populate `columns_used` + wire `detect_schema_change_kind()`~~ | ~~4–5h~~ | ~~✅ DONE~~ | — |
+| **S1** | A1: Volatile function detection | 1–2h | Closes last silent correctness gap — rejects volatile in DIFF, warns stable | — |
+| **S2** | A6: TRUNCATE capture in CDC | 4–6h | Closes second silent correctness gap — TRUNCATE triggers reinit | — |
+
+#### Tier 2 — High-Value SQL Features (best ROI)
+
+| Step | Item(s) | Effort | Delivers | Prereqs |
+|------|---------|--------|----------|----------|
+| **S3** | A3: ALL (subquery) → AntiJoin rewrite | 4–6h | Completes subquery expression coverage (IN/NOT IN/ANY/ALL) | — |
+| **S4** | A2: DISTINCT ON → ROW_NUMBER() auto-rewrite | 6–8h | Unlocks most-requested PostgreSQL idiom | — |
+| **S5** | A4: Regression aggregates (11 functions) | 4–6h | Covers 11 gap items — CORR, COVAR_*, REGR_* | — |
+| **S6** | A5: Mixed UNION / UNION ALL | 4–6h | Respects nested SetOperationStmt tree | — |
+
+#### Tier 3 — Schema Infrastructure (enables Tier 4)
+
+| Step | Item(s) | Effort | Delivers | Prereqs |
+|------|---------|--------|----------|----------|
+| **S7** | C-2: Column snapshot + schema fingerprint | 3–4h | Precise change detection (column added/dropped/renamed/retyped) | C-1 ✅ |
+| **S8** | C-3: `pg_stream.block_source_ddl` GUC | 3–4h | Optional strict mode for production deployments | — |
+
+#### Tier 4 — Schema-Dependent Features (newly unlocked)
+
+| Step | Item(s) | Effort | Delivers | Prereqs |
+|------|---------|--------|----------|----------|
+| **S9** | C-4: NATURAL JOIN with column snapshot | 6–8h | Previously rejected → now safe with drift detection on reinit | S7 |
+| **S10** | C-5: Keyless table support (ADR-072) | 4–6h | All-column content hash for `__pgs_row_id` when no PK exists | C-1 ✅ |
+
+#### Tier 5 — OLAP & Advanced Features (diminishing returns)
+
+| Step | Item(s) | Effort | Delivers | Prereqs |
+|------|---------|--------|----------|----------|
+| **S11** | A7: GROUPING SETS / CUBE / ROLLUP | 10–15h | Major OLAP feature via UNION ALL decomposition | — |
+| **S12** | A10: Scalar subquery in WHERE | 6–8h | CROSS JOIN auto-rewrite | — |
+| **S13** | B6: SubLinks inside OR | 8–10h | OR-to-UNION rewrite | — |
+| **S14** | A8: Multiple PARTITION BY in windows | 8–10h | Multi-pass recomputation | — |
+| **S15** | A9: Recursive CTE in DIFFERENTIAL mode | 15–20h | Incremental fixpoint (semi-naive + DRed) | — |
+
+#### Summary
+
+| Tier | Steps | Total Effort | Cumulative Items Resolved |
+|------|-------|-------------|---------------------------|
+| ✅ Done | C-1 | 4–5h | Smart schema change detection |
+| 1 — Correctness | S1–S2 | 5–8h | 2 silent correctness gaps closed |
+| 2 — High-Value | S3–S6 | 18–26h | 14 SQL gap items (11 aggs + 3 features) |
+| 3 — Schema Infra | S7–S8 | 6–8h | Column snapshots + DDL blocking GUC |
+| 4 — Unlocked | S9–S10 | 10–14h | NATURAL JOIN + keyless tables |
+| 5 — Advanced | S11–S15 | 47–63h | GROUPING SETS, scalar WHERE, OR sublinks, multi-PARTITION, recursive CTE |
+| **Total remaining** | **S1–S15** | **~86–119h** | **All planned items** |
 
 ---
 
@@ -828,18 +859,36 @@ design reasons that no schema policy can address:
 
 ---
 
-### C7. Success Criteria (Part C)
+### C7. Success Criteria
 
-After Sessions C-1 through C-5:
+#### Completed (C-1)
 
-- [ ] `columns_used` populated for all source dependencies at creation time
-- [ ] `detect_schema_change_kind()` wired into `handle_alter_table()` — benign
+- [x] `columns_used` populated for all source dependencies at creation time
+      (DIFFERENTIAL mode STs)
+- [x] `detect_schema_change_kind()` wired into `handle_alter_table()` — benign
       DDL no longer triggers reinit
-- [ ] Column snapshot stored per source dependency with schema fingerprint
-- [ ] `pg_stream.block_source_ddl` GUC available (default false)
-- [ ] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot
-- [ ] Keyless tables supported with all-column content hash for `__pgs_row_id`
-- [ ] Semantic drift warning emitted when NATURAL JOIN columns change on reinit
+- [x] `get_for_st()` / `get_all()` read `columns_used` from DB
+
+#### Remaining (S1–S15)
+
+- [ ] Volatile functions rejected in DIFFERENTIAL mode with clear error (S1)
+- [ ] Stable functions produce a warning in DIFFERENTIAL mode (S1)
+- [ ] TRUNCATE on source tables triggers reinitialization (S2)
+- [ ] `ALL (subquery)` supported via AntiJoin rewrite (S3)
+- [ ] `DISTINCT ON` auto-rewritten to ROW_NUMBER() window function (S4)
+- [ ] 11 regression aggregates supported in DIFFERENTIAL mode (S5)
+- [ ] Mixed UNION / UNION ALL works correctly (S6)
+- [ ] Column snapshot stored per source dependency with schema fingerprint (S7)
+- [ ] `pg_stream.block_source_ddl` GUC available, default false (S8)
+- [ ] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot (S9)
+- [ ] Keyless tables supported with all-column content hash for `__pgs_row_id` (S10)
+- [ ] GROUPING SETS / CUBE / ROLLUP via UNION ALL decomposition (S11)
+- [ ] Scalar subquery in WHERE via CROSS JOIN rewrite (S12)
+- [ ] SubLinks inside OR via OR-to-UNION rewrite (S13)
+- [ ] Multiple PARTITION BY via multi-pass recomputation (S14)
+- [ ] Recursive CTE in DIFFERENTIAL mode via incremental fixpoint (S15)
+- [ ] 36+ AggFunc variants (up from 25)
+- [ ] 920+ unit tests (estimated, up from 872)
 - [ ] E2E tests for: benign DDL skips reinit, column DDL triggers reinit,
       blocked DDL errors, NATURAL JOIN creation + reinit + column change
-- [ ] Documentation updated in SQL_REFERENCE.md and CONFIGURATION.md
+- [ ] Documentation updated across SQL_REFERENCE, DVM_OPERATORS, CONFIGURATION, README
