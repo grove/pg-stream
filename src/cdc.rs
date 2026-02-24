@@ -72,27 +72,15 @@ pub fn create_change_trigger(
     // Build PK hash computation expressions for each DML operation.
     // Uses the same hash functions as the scan delta so pk_hash values
     // match the window PARTITION BY grouping.
-    let (pk_hash_new, pk_hash_old) = build_pk_hash_trigger_exprs(pk_columns);
+    let (pk_hash_new, pk_hash_old) = build_pk_hash_trigger_exprs(pk_columns, columns);
 
-    // Build INSERT column list and value lists depending on whether pk_hash is available.
-    let has_pk = !pk_columns.is_empty();
-    let pk_col_decl = if has_pk { ", pk_hash" } else { "" };
+    // Build INSERT column list and value lists.
+    // pk_hash is always populated (from PK columns or all-column content hash).
+    let pk_col_decl = ", pk_hash";
 
-    let ins_pk = if has_pk {
-        format!(", {pk_hash_new}")
-    } else {
-        String::new()
-    };
-    let upd_pk = if has_pk {
-        format!(", {pk_hash_new}")
-    } else {
-        String::new()
-    };
-    let del_pk = if has_pk {
-        format!(", {pk_hash_old}")
-    } else {
-        String::new()
-    };
+    let ins_pk = format!(", {pk_hash_new}");
+    let upd_pk = format!(", {pk_hash_new}");
+    let del_pk = format!(", {pk_hash_old}");
 
     // Build per-column typed INSERT components.
     // Instead of `to_jsonb(NEW)` / `to_jsonb(OLD)`, we write each column
@@ -267,18 +255,19 @@ pub fn drop_change_trigger(
 /// Uses **typed columns** (`new_col TYPE`, `old_col TYPE`) instead of
 /// JSONB blobs, eliminating `to_jsonb()`/`jsonb_populate_record()` overhead.
 ///
-/// The buffer includes an optional `pk_hash BIGINT` column that is
-/// populated by the CDC trigger when the source table has a primary key.
+/// The buffer always includes a `pk_hash BIGINT` column. When the source has
+/// a primary key, pk_hash is the PK hash; for keyless tables (S10), it is
+/// an all-column content hash computed by the CDC trigger.
 ///
 /// `columns` contains the source table column definitions as
 /// `(column_name, sql_type_name)` pairs from `resolve_source_column_defs()`.
 pub fn create_change_buffer_table(
     source_oid: pg_sys::Oid,
     change_schema: &str,
-    has_pk: bool,
     columns: &[(String, String)],
 ) -> Result<(), PgStreamError> {
-    let pk_col = if has_pk { ",pk_hash BIGINT" } else { "" };
+    // pk_hash is always present (PK hash or all-column content hash).
+    let pk_col = ",pk_hash BIGINT";
 
     // Build typed column definitions: "new_col" TYPE, "old_col" TYPE
     let typed_col_defs: String = columns
@@ -323,28 +312,16 @@ pub fn create_change_buffer_table(
     //
     // Reduces from 2 B-tree updates per trigger INSERT to 1, giving ~20%
     // trigger overhead reduction.
-    if has_pk {
-        let idx_sql = format!(
-            "CREATE INDEX IF NOT EXISTS idx_changes_{oid}_lsn_pk_cid \
-             ON {schema}.changes_{oid} (lsn, pk_hash, change_id) INCLUDE (action)",
-            schema = change_schema,
-            oid = source_oid.to_u32(),
-        );
-        Spi::run(&idx_sql).map_err(|e| {
-            PgStreamError::SpiError(format!("Failed to create change buffer index: {}", e))
-        })?;
-    } else {
-        // Without pk_hash, fall back to a simple lsn index for range scans.
-        let idx_sql = format!(
-            "CREATE INDEX IF NOT EXISTS idx_changes_{oid}_lsn \
-             ON {schema}.changes_{oid} (lsn) INCLUDE (action)",
-            schema = change_schema,
-            oid = source_oid.to_u32(),
-        );
-        Spi::run(&idx_sql).map_err(|e| {
-            PgStreamError::SpiError(format!("Failed to create change buffer index: {}", e))
-        })?;
-    }
+    // pk_hash is always present (PK hash or all-column content hash for keyless tables).
+    let idx_sql = format!(
+        "CREATE INDEX IF NOT EXISTS idx_changes_{oid}_lsn_pk_cid \
+         ON {schema}.changes_{oid} (lsn, pk_hash, change_id) INCLUDE (action)",
+        schema = change_schema,
+        oid = source_oid.to_u32(),
+    );
+    Spi::run(&idx_sql).map_err(|e| {
+        PgStreamError::SpiError(format!("Failed to create change buffer index: {}", e))
+    })?;
 
     Ok(())
 }
@@ -429,23 +406,38 @@ pub fn resolve_pk_columns(source_oid: pg_sys::Oid) -> Result<Vec<String>, PgStre
 ///
 /// For a composite PK `(a, b)`:
 ///   `pgstream.pg_stream_hash_multi(ARRAY[NEW."a"::text, NEW."b"::text])`, ...
-fn build_pk_hash_trigger_exprs(pk_columns: &[String]) -> (String, String) {
-    if pk_columns.is_empty() {
+///
+/// **S10 — Keyless tables:** When `pk_columns` is empty, computes an
+/// all-column content hash from `all_columns` so that every row gets a
+/// meaningful `pk_hash` even without a primary key.
+fn build_pk_hash_trigger_exprs(
+    pk_columns: &[String],
+    all_columns: &[(String, String)],
+) -> (String, String) {
+    // Determine effective hash columns: PK if available, otherwise all columns.
+    let hash_cols: Vec<String> = if pk_columns.is_empty() {
+        all_columns.iter().map(|(name, _)| name.clone()).collect()
+    } else {
+        pk_columns.to_vec()
+    };
+
+    if hash_cols.is_empty() {
+        // Degenerate case: table with zero columns (shouldn't happen).
         return ("0".to_string(), "0".to_string());
     }
 
-    if pk_columns.len() == 1 {
-        let col = format!("\"{}\"", pk_columns[0].replace('"', "\"\""));
+    if hash_cols.len() == 1 {
+        let col = format!("\"{}\"", hash_cols[0].replace('"', "\"\""));
         (
             format!("pgstream.pg_stream_hash(NEW.{col}::text)"),
             format!("pgstream.pg_stream_hash(OLD.{col}::text)"),
         )
     } else {
-        let new_items: Vec<String> = pk_columns
+        let new_items: Vec<String> = hash_cols
             .iter()
             .map(|c| format!("NEW.\"{}\"::text", c.replace('"', "\"\"")))
             .collect();
-        let old_items: Vec<String> = pk_columns
+        let old_items: Vec<String> = hash_cols
             .iter()
             .map(|c| format!("OLD.\"{}\"::text", c.replace('"', "\"\"")))
             .collect();
@@ -570,25 +562,13 @@ pub fn rebuild_cdc_trigger_function(
     }
 
     let oid_u32 = source_oid.to_u32();
-    let (pk_hash_new, pk_hash_old) = build_pk_hash_trigger_exprs(&pk_columns);
+    let (pk_hash_new, pk_hash_old) = build_pk_hash_trigger_exprs(&pk_columns, &columns);
 
-    let has_pk = !pk_columns.is_empty();
-    let pk_col_decl = if has_pk { ", pk_hash" } else { "" };
-    let ins_pk = if has_pk {
-        format!(", {pk_hash_new}")
-    } else {
-        String::new()
-    };
-    let upd_pk = if has_pk {
-        format!(", {pk_hash_new}")
-    } else {
-        String::new()
-    };
-    let del_pk = if has_pk {
-        format!(", {pk_hash_old}")
-    } else {
-        String::new()
-    };
+    // pk_hash is always populated (from PK columns or all-column content hash).
+    let pk_col_decl = ", pk_hash";
+    let ins_pk = format!(", {pk_hash_new}");
+    let upd_pk = format!(", {pk_hash_new}");
+    let del_pk = format!(", {pk_hash_old}");
 
     let new_col_names: String = columns
         .iter()
@@ -879,7 +859,8 @@ mod tests {
     #[test]
     fn test_build_pk_hash_single_column() {
         let pk = vec!["id".to_string()];
-        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk);
+        let all = vec![("id".to_string(), "integer".to_string())];
+        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
         assert_eq!(new_expr, r#"pgstream.pg_stream_hash(NEW."id"::text)"#);
         assert_eq!(old_expr, r#"pgstream.pg_stream_hash(OLD."id"::text)"#);
     }
@@ -887,7 +868,11 @@ mod tests {
     #[test]
     fn test_build_pk_hash_composite_key() {
         let pk = vec!["a".to_string(), "b".to_string()];
-        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk);
+        let all = vec![
+            ("a".to_string(), "integer".to_string()),
+            ("b".to_string(), "text".to_string()),
+        ];
+        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
         assert!(new_expr.contains("pgstream.pg_stream_hash_multi"));
         assert!(new_expr.contains(r#"NEW."a"::text"#));
         assert!(new_expr.contains(r#"NEW."b"::text"#));
@@ -896,17 +881,39 @@ mod tests {
     }
 
     #[test]
-    fn test_build_pk_hash_empty_pk() {
+    fn test_build_pk_hash_empty_pk_falls_back_to_all_columns() {
+        // S10: Keyless table — should hash all columns, not return "0".
         let pk: Vec<String> = vec![];
-        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk);
-        assert_eq!(new_expr, "0");
-        assert_eq!(old_expr, "0");
+        let all = vec![
+            ("name".to_string(), "text".to_string()),
+            ("value".to_string(), "integer".to_string()),
+        ];
+        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
+        assert!(
+            new_expr.contains("pgstream.pg_stream_hash_multi"),
+            "Got: {new_expr}",
+        );
+        assert!(new_expr.contains(r#"NEW."name"::text"#), "Got: {new_expr}");
+        assert!(new_expr.contains(r#"NEW."value"::text"#), "Got: {new_expr}",);
+        assert!(old_expr.contains(r#"OLD."name"::text"#), "Got: {old_expr}");
+        assert!(old_expr.contains(r#"OLD."value"::text"#), "Got: {old_expr}",);
+    }
+
+    #[test]
+    fn test_build_pk_hash_empty_pk_single_all_column() {
+        // Keyless table with a single column — uses hash() not hash_multi().
+        let pk: Vec<String> = vec![];
+        let all = vec![("val".to_string(), "text".to_string())];
+        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
+        assert_eq!(new_expr, r#"pgstream.pg_stream_hash(NEW."val"::text)"#);
+        assert_eq!(old_expr, r#"pgstream.pg_stream_hash(OLD."val"::text)"#);
     }
 
     #[test]
     fn test_build_pk_hash_special_chars() {
         let pk = vec![r#"col"name"#.to_string()];
-        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk);
+        let all = vec![(r#"col"name"#.to_string(), "text".to_string())];
+        let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
         // The embedded quote should be doubled
         assert!(new_expr.contains(r#"col""name"#), "Got: {new_expr}");
         assert!(old_expr.contains(r#"col""name"#), "Got: {old_expr}");

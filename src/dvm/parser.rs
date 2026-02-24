@@ -820,17 +820,18 @@ impl OpTree {
     /// two sub-hashes).  Callers should fall back to a generic hash.
     pub fn row_id_key_columns(&self) -> Option<Vec<String>> {
         match self {
-            OpTree::Scan { columns, .. } => {
-                let non_nullable: Vec<String> = columns
-                    .iter()
-                    .filter(|c| !c.is_nullable)
-                    .map(|c| c.name.clone())
-                    .collect();
-                if non_nullable.is_empty() {
-                    Some(columns.iter().map(|c| c.name.clone()).collect())
-                } else {
-                    Some(non_nullable)
+            OpTree::Scan {
+                columns,
+                pk_columns,
+                ..
+            } => {
+                // Use PK columns if available (matches CDC trigger pk_hash).
+                if !pk_columns.is_empty() {
+                    return Some(pk_columns.clone());
                 }
+                // Keyless table (S10): use all columns as content hash key,
+                // matching the all-column pk_hash computed by the CDC trigger.
+                Some(columns.iter().map(|c| c.name.clone()).collect())
             }
             OpTree::Filter { child, .. } => child.row_id_key_columns(),
             OpTree::Project {
@@ -2335,24 +2336,17 @@ unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), Pg
 /// Recursively check FROM clause items for unsupported features.
 ///
 /// Currently rejects:
-/// - `NATURAL JOIN` — PostgreSQL does not resolve natural-join column lists
-///   in the raw parse tree (the `quals` field is NULL), which would silently
-///   produce a cross join.
 /// - `TABLESAMPLE` — Stream tables materialize complete result sets;
 ///   non-deterministic sampling is not meaningful.
+///
+/// Note: NATURAL JOIN is now supported (S9) — common columns are resolved
+/// from the parsed OpTree and an explicit equi-join condition is synthesized.
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
 unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgStreamError> {
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
         let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        if join.isNatural {
-            return Err(PgStreamError::UnsupportedOperator(
-                "NATURAL JOIN is not supported in defining queries. \
-                 Use explicit JOIN ... ON conditions instead."
-                    .into(),
-            ));
-        }
         // Recursively check join children
         if !join.larg.is_null() {
             // SAFETY: larg is valid from JoinExpr
@@ -3767,14 +3761,78 @@ unsafe fn parse_from_item(
             }
         }
 
-        // Reject NATURAL JOIN — PostgreSQL doesn't resolve natural join columns
-        // in the raw parse tree, so quals is NULL and we'd get a cross join.
+        // ── NATURAL JOIN: resolve common columns and synthesize equi-join ──
+        // PostgreSQL's raw parse tree leaves `quals` NULL for NATURAL JOIN.
+        // We resolve common column names from the already-parsed left/right
+        // OpTree nodes and build an explicit equi-join condition.
         if join.isNatural {
-            return Err(PgStreamError::UnsupportedOperator(
-                "NATURAL JOIN is not supported in defining queries. \
-                 Use explicit JOIN ... ON conditions instead."
-                    .into(),
-            ));
+            let left_cols = left.output_columns();
+            let right_cols = right.output_columns();
+
+            // Find common columns (order follows left side for determinism).
+            let right_set: std::collections::HashSet<String> = right_cols.iter().cloned().collect();
+            let common: Vec<String> = left_cols
+                .iter()
+                .filter(|c| right_set.contains(c.as_str()))
+                .cloned()
+                .collect();
+
+            if common.is_empty() {
+                return Err(PgStreamError::QueryParseError(
+                    "NATURAL JOIN has no common columns between left and right sides. \
+                     Use an explicit JOIN ... ON condition instead."
+                        .into(),
+                ));
+            }
+
+            // Build condition: left.col1 = right.col1 AND left.col2 = right.col2 ...
+            let left_alias = left.alias();
+            let right_alias = right.alias();
+
+            let parts: Vec<String> = common
+                .iter()
+                .map(|col| {
+                    let lq = format!(
+                        "\"{}\".\"{}\"",
+                        left_alias.replace('"', "\"\""),
+                        col.replace('"', "\"\""),
+                    );
+                    let rq = format!(
+                        "\"{}\".\"{}\"",
+                        right_alias.replace('"', "\"\""),
+                        col.replace('"', "\"\""),
+                    );
+                    format!("{lq} = {rq}")
+                })
+                .collect();
+
+            let condition = Expr::Raw(parts.join(" AND "));
+
+            return match join.jointype {
+                pg_sys::JoinType::JOIN_INNER => Ok(OpTree::InnerJoin {
+                    condition,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }),
+                pg_sys::JoinType::JOIN_LEFT => Ok(OpTree::LeftJoin {
+                    condition,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }),
+                pg_sys::JoinType::JOIN_RIGHT => Ok(OpTree::LeftJoin {
+                    condition,
+                    left: Box::new(right),
+                    right: Box::new(left),
+                }),
+                pg_sys::JoinType::JOIN_FULL => Ok(OpTree::FullJoin {
+                    condition,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }),
+                other => Err(PgStreamError::UnsupportedOperator(format!(
+                    "NATURAL JOIN type {other:?} not supported",
+                ))),
+            };
         }
 
         let condition = if join.quals.is_null() {
@@ -8118,6 +8176,7 @@ mod tests {
 
     #[test]
     fn test_row_id_key_columns_scan_with_non_nullable() {
+        // S10: Scans WITHOUT pk_columns return ALL columns (not just non-nullable).
         let tree = OpTree::Scan {
             table_oid: 1,
             table_name: "t".to_string(),
@@ -8137,7 +8196,35 @@ mod tests {
             pk_columns: Vec::new(),
             alias: "t".to_string(),
         };
-        assert_eq!(tree.row_id_key_columns(), Some(vec!["id".to_string()]));
+        assert_eq!(
+            tree.row_id_key_columns(),
+            Some(vec!["id".to_string(), "name".to_string()]),
+        );
+    }
+
+    #[test]
+    fn test_row_id_key_columns_scan_with_pk_columns() {
+        // When pk_columns are present, those are used (not non-nullable columns).
+        let tree = OpTree::Scan {
+            table_oid: 1,
+            table_name: "t".to_string(),
+            schema: "public".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    type_oid: 23,
+                    is_nullable: false,
+                },
+                Column {
+                    name: "name".to_string(),
+                    type_oid: 25,
+                    is_nullable: false,
+                },
+            ],
+            pk_columns: vec!["id".to_string()],
+            alias: "t".to_string(),
+        };
+        assert_eq!(tree.row_id_key_columns(), Some(vec!["id".to_string()]),);
     }
 
     #[test]

@@ -38,7 +38,7 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStr
     let OpTree::Scan {
         table_oid,
         columns,
-        pk_columns,
+        pk_columns: _,
         alias,
         ..
     } = op
@@ -59,34 +59,10 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStr
 
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
-    // Determine PK columns and whether pre-computed pk_hash is available.
-    let pk_cols = find_pk_columns(pk_columns, columns);
-    let has_precomputed_pk_hash = !pk_columns.is_empty();
-
-    let pk_hash_expr = if has_precomputed_pk_hash {
-        // Use the pre-computed pk_hash from the trigger (G-J1 optimization)
-        "c.pk_hash".to_string()
-    } else {
-        // Fallback: compute PK hash from typed columns
-        let pk_typed_exprs: Vec<String> = pk_cols
-            .iter()
-            .map(|c| {
-                format!(
-                    "COALESCE(c.{new}, c.{old})::text",
-                    new = quote_ident(&format!("new_{c}")),
-                    old = quote_ident(&format!("old_{c}")),
-                )
-            })
-            .collect();
-        if pk_typed_exprs.len() == 1 {
-            format!("pgstream.pg_stream_hash({})", pk_typed_exprs[0])
-        } else {
-            format!(
-                "pgstream.pg_stream_hash_multi(ARRAY[{}])",
-                pk_typed_exprs.join(", "),
-            )
-        }
-    };
+    // pk_hash is always pre-computed in the change buffer (from PK columns
+    // or all-column content hash for keyless tables — S10).
+    // Always use the pre-computed pk_hash from the trigger (G-J1 optimization).
+    let pk_hash_expr = "c.pk_hash".to_string();
 
     // Build typed column references for the raw CTE
     let mut typed_col_refs = Vec::new();
@@ -312,27 +288,18 @@ FROM (
     })
 }
 
-/// Find primary key columns for a table.
+/// Find effective hash columns for a table (used in tests and for reference).
 ///
 /// Uses real PK columns from `pg_constraint` if available (populated during
-/// parsing). Falls back to non-nullable columns as a heuristic, then all
-/// columns.
+/// parsing). Falls back to all columns for keyless tables (S10), which
+/// matches the all-column content hash stored as pk_hash in the CDC trigger.
+#[cfg(test)]
 fn find_pk_columns(pk_columns: &[String], columns: &[crate::dvm::parser::Column]) -> Vec<String> {
     if !pk_columns.is_empty() {
         return pk_columns.to_vec();
     }
-    // Fallback: non-nullable columns heuristic
-    let non_nullable: Vec<String> = columns
-        .iter()
-        .filter(|c| !c.is_nullable)
-        .map(|c| c.name.clone())
-        .collect();
-
-    if non_nullable.is_empty() {
-        columns.iter().map(|c| c.name.clone()).collect()
-    } else {
-        non_nullable
-    }
+    // Keyless table: use all columns (matches CDC trigger all-column hash).
+    columns.iter().map(|c| c.name.clone()).collect()
 }
 
 /// Build a hash expression from a list of SQL expressions.
@@ -412,14 +379,14 @@ mod tests {
     #[test]
     fn test_diff_scan_without_pk_fallback() {
         let mut ctx = test_ctx();
-        // No PK but non-nullable columns → fallback to non-nullable cols for hash
+        // S10: Even tables without PK now use c.pk_hash (the CDC trigger computes
+        // an all-column content hash, stored in the change buffer's pk_hash column).
         let tree = scan_not_null(100, "orders", "public", "o", &["id", "amount"]);
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should use computed hash, not pk_hash
-        assert_sql_contains(&sql, "pgstream.pg_stream_hash");
-        assert_sql_not_contains(&sql, "c.pk_hash");
+        // Should always use pre-computed c.pk_hash (keyless or not).
+        assert_sql_contains(&sql, "c.pk_hash");
     }
 
     #[test]
@@ -511,10 +478,11 @@ mod tests {
     }
 
     #[test]
-    fn test_find_pk_columns_fallback_non_nullable() {
+    fn test_find_pk_columns_fallback_all_columns() {
+        // S10: Keyless table — falls back to all columns (no non-nullable heuristic).
         let pk: Vec<String> = vec![];
         let cols = vec![col_not_null("id"), col("name")];
-        assert_eq!(find_pk_columns(&pk, &cols), vec!["id"]);
+        assert_eq!(find_pk_columns(&pk, &cols), vec!["id", "name"]);
     }
 
     #[test]
