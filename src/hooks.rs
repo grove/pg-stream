@@ -165,23 +165,70 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
         return;
     }
 
-    // Mark all directly-affected STs for reinitialize.
+    // Classify the schema change and only reinitialize for column-affecting
+    // changes.  Benign DDL (adding indexes, comments, statistics) and
+    // constraint-only changes skip reinit when column tracking is populated.
+    let mut reinit_pgs_ids = Vec::new();
     for pgs_id in &affected_pgs_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
-            pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to mark ST {} for reinit: {}",
-                pgs_id,
-                e,
-            );
+        let kind = match detect_schema_change_kind(objid, *pgs_id) {
+            Ok(k) => k,
+            Err(e) => {
+                // On error, fall back to conservative reinit.
+                pgrx::debug1!(
+                    "pg_stream_ddl_tracker: schema change detection failed for ST {}: {}, \
+                     falling back to reinit",
+                    pgs_id,
+                    e,
+                );
+                SchemaChangeKind::ColumnChange
+            }
+        };
+
+        match kind {
+            SchemaChangeKind::Benign => {
+                pgrx::debug1!(
+                    "pg_stream_ddl_tracker: ALTER TABLE on {} is benign for ST {} — skipping reinit",
+                    identity,
+                    pgs_id,
+                );
+            }
+            SchemaChangeKind::ConstraintChange => {
+                // Constraint-only change (e.g., adding/dropping a PK or unique
+                // constraint). Currently treat same as benign — the row_id
+                // strategy was chosen at creation time based on the PK that
+                // existed then. A future enhancement (C-5 keyless tables)
+                // could reinit here if the row_id strategy depends on PK.
+                pgrx::debug1!(
+                    "pg_stream_ddl_tracker: ALTER TABLE on {} is constraint-only for ST {} \
+                     — skipping reinit",
+                    identity,
+                    pgs_id,
+                );
+            }
+            SchemaChangeKind::ColumnChange => {
+                if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+                    pgrx::warning!(
+                        "pg_stream_ddl_tracker: failed to mark ST {} for reinit: {}",
+                        pgs_id,
+                        e,
+                    );
+                }
+                reinit_pgs_ids.push(*pgs_id);
+            }
         }
     }
 
     // Cascade: find STs that depend on the affected STs (transitive).
-    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
-        Ok(ids) => ids,
-        Err(e) => {
-            pgrx::warning!("pg_stream_ddl_tracker: failed to cascade reinit: {}", e);
-            Vec::new()
+    // Only cascade from STs that were actually marked for reinit.
+    let cascade_ids = if reinit_pgs_ids.is_empty() {
+        Vec::new()
+    } else {
+        match find_transitive_downstream_sts(&reinit_pgs_ids) {
+            Ok(ids) => ids,
+            Err(e) => {
+                pgrx::warning!("pg_stream_ddl_tracker: failed to cascade reinit: {}", e);
+                Vec::new()
+            }
         }
     };
 
@@ -201,6 +248,9 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
     // will fail with "record 'new' has no field '<dropped_col>'".
     // CREATE OR REPLACE replaces only the function body; the trigger binding and
     // change buffer table are unaffected.
+    //
+    // Always rebuild — even for benign changes — to stay in sync with the
+    // catalog. The cost is negligible (single CREATE OR REPLACE FUNCTION).
     let change_schema = config::pg_stream_change_buffer_schema();
     if let Err(e) = cdc::rebuild_cdc_trigger_function(objid, &change_schema) {
         pgrx::warning!(
@@ -214,14 +264,23 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
     // transition and fall back to triggers. The schema change invalidates
     // the WAL decoder's column mapping — pgoutput will send a new Relation
     // message, but it's safer to reinitialize from triggers.
-    handle_alter_table_wal_fallback(objid, identity, &change_schema);
+    if !reinit_pgs_ids.is_empty() {
+        handle_alter_table_wal_fallback(objid, identity, &change_schema);
+    }
 
-    let total = affected_pgs_ids.len() + cascade_ids.len();
+    let total = reinit_pgs_ids.len() + cascade_ids.len();
     if total > 0 {
         log!(
             "pg_stream_ddl_tracker: ALTER TABLE on {} → {} ST(s) marked for reinitialize",
             identity,
             total,
+        );
+    } else {
+        log!(
+            "pg_stream_ddl_tracker: ALTER TABLE on {} → benign for all {} dependent ST(s), \
+             no reinitialize needed",
+            identity,
+            affected_pgs_ids.len(),
         );
     }
 }

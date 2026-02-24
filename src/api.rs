@@ -163,9 +163,18 @@ fn create_stream_table_impl(
         refresh_mode,
     )?;
 
+    // Build per-source column usage map from the parsed OpTree so that
+    // `detect_schema_change_kind()` can accurately classify DDL events
+    // (benign vs column-affecting) instead of conservatively reinitializing.
+    let columns_used_map = parsed_tree
+        .as_ref()
+        .map(|pr| pr.source_columns_used())
+        .unwrap_or_default();
+
     // Insert dependency edges
     for (source_oid, source_type) in &source_relids {
-        StDependency::insert(pgs_id, *source_oid, source_type)?;
+        let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
+        StDependency::insert(pgs_id, *source_oid, source_type, cols)?;
     }
 
     // ── Phase 2: CDC setup (change buffer tables + triggers + tracking) ──

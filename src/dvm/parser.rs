@@ -633,6 +633,29 @@ pub struct ParseResult {
     pub has_recursion: bool,
 }
 
+impl ParseResult {
+    /// Collect `(table_oid, Vec<column_name>)` for all source tables
+    /// referenced across the main tree and CTE bodies.
+    ///
+    /// Used to populate `pgs_dependencies.columns_used` at creation time
+    /// so `detect_schema_change_kind()` can accurately classify DDL events.
+    pub fn source_columns_used(&self) -> std::collections::HashMap<u32, Vec<String>> {
+        let mut map: std::collections::HashMap<u32, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        self.tree.collect_source_columns(&mut map);
+        for (_, cte_tree) in &self.cte_registry.entries {
+            cte_tree.collect_source_columns(&mut map);
+        }
+        map.into_iter()
+            .map(|(oid, set)| {
+                let mut cols: Vec<String> = set.into_iter().collect();
+                cols.sort();
+                (oid, cols)
+            })
+            .collect()
+    }
+}
+
 impl OpTree {
     /// Get the alias for this node (used in CTE naming).
     pub fn alias(&self) -> &str {
@@ -1034,6 +1057,75 @@ impl OpTree {
                 oids.dedup();
                 oids
             }
+        }
+    }
+
+    /// Collect `(table_oid, Vec<column_name>)` pairs from all Scan nodes.
+    ///
+    /// When the same table appears in multiple Scan nodes (self-join), the
+    /// column lists are merged (union of column names). This is used to
+    /// populate `pgs_dependencies.columns_used` at creation time.
+    pub fn source_columns_used(&self) -> std::collections::HashMap<u32, Vec<String>> {
+        let mut map: std::collections::HashMap<u32, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        self.collect_source_columns(&mut map);
+        map.into_iter()
+            .map(|(oid, set)| {
+                let mut cols: Vec<String> = set.into_iter().collect();
+                cols.sort();
+                (oid, cols)
+            })
+            .collect()
+    }
+
+    /// Recursive helper — collects column names per table OID from Scan nodes.
+    fn collect_source_columns(
+        &self,
+        map: &mut std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    ) {
+        match self {
+            OpTree::Scan {
+                table_oid, columns, ..
+            } => {
+                let entry = map.entry(*table_oid).or_default();
+                for col in columns {
+                    entry.insert(col.name.clone());
+                }
+            }
+            OpTree::Project { child, .. }
+            | OpTree::Filter { child, .. }
+            | OpTree::Distinct { child } => child.collect_source_columns(map),
+            OpTree::Aggregate { child, .. } => child.collect_source_columns(map),
+            OpTree::InnerJoin { left, right, .. }
+            | OpTree::LeftJoin { left, right, .. }
+            | OpTree::FullJoin { left, right, .. }
+            | OpTree::Intersect { left, right, .. }
+            | OpTree::Except { left, right, .. } => {
+                left.collect_source_columns(map);
+                right.collect_source_columns(map);
+            }
+            OpTree::UnionAll { children } => {
+                for c in children {
+                    c.collect_source_columns(map);
+                }
+            }
+            OpTree::Subquery { child, .. } => child.collect_source_columns(map),
+            OpTree::CteScan { .. } => { /* resolved via CteRegistry */ }
+            OpTree::RecursiveCte {
+                base, recursive, ..
+            } => {
+                base.collect_source_columns(map);
+                recursive.collect_source_columns(map);
+            }
+            OpTree::RecursiveSelfRef { .. } => {}
+            OpTree::Window { child, .. } => child.collect_source_columns(map),
+            OpTree::LateralFunction { child, .. } => child.collect_source_columns(map),
+            OpTree::LateralSubquery { child, .. } => child.collect_source_columns(map),
+            OpTree::SemiJoin { left, right, .. } | OpTree::AntiJoin { left, right, .. } => {
+                left.collect_source_columns(map);
+                right.collect_source_columns(map);
+            }
+            OpTree::ScalarSubquery { child, .. } => child.collect_source_columns(map),
         }
     }
 }

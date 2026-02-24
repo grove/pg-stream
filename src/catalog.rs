@@ -560,12 +560,19 @@ impl StDependency {
         pgs_id: i64,
         source_relid: pg_sys::Oid,
         source_type: &str,
+        columns_used: Option<Vec<String>>,
     ) -> Result<(), PgStreamError> {
         Spi::run_with_args(
-            "INSERT INTO pgstream.pgs_dependencies (pgs_id, source_relid, source_type, cdc_mode) \
-             VALUES ($1, $2, $3, 'TRIGGER') \
+            "INSERT INTO pgstream.pgs_dependencies \
+             (pgs_id, source_relid, source_type, cdc_mode, columns_used) \
+             VALUES ($1, $2, $3, 'TRIGGER', $4) \
              ON CONFLICT DO NOTHING",
-            &[pgs_id.into(), source_relid.into(), source_type.into()],
+            &[
+                pgs_id.into(),
+                source_relid.into(),
+                source_type.into(),
+                columns_used.into(),
+            ],
         )
         .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
     }
@@ -625,6 +632,7 @@ impl StDependency {
                     .map_err(map_spi)?
                     .unwrap_or(pg_sys::InvalidOid);
                 let source_type = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
+                let columns_used = row.get::<Vec<String>>(4).map_err(map_spi)?;
                 let cdc_mode_str = row.get::<String>(5).map_err(map_spi)?.unwrap_or_default();
                 let slot_name = row.get::<String>(6).map_err(map_spi)?;
                 let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
@@ -633,7 +641,7 @@ impl StDependency {
                     pgs_id,
                     source_relid,
                     source_type,
-                    columns_used: None,
+                    columns_used,
                     cdc_mode: CdcMode::from_str(&cdc_mode_str),
                     slot_name,
                     decoder_confirmed_lsn,
@@ -667,6 +675,7 @@ impl StDependency {
                     .map_err(map_spi)?
                     .unwrap_or(pg_sys::InvalidOid);
                 let source_type = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
+                let columns_used = row.get::<Vec<String>>(4).map_err(map_spi)?;
                 let cdc_mode_str = row.get::<String>(5).map_err(map_spi)?.unwrap_or_default();
                 let slot_name = row.get::<String>(6).map_err(map_spi)?;
                 let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
@@ -675,7 +684,7 @@ impl StDependency {
                     pgs_id,
                     source_relid,
                     source_type,
-                    columns_used: None,
+                    columns_used,
                     cdc_mode: CdcMode::from_str(&cdc_mode_str),
                     slot_name,
                     decoder_confirmed_lsn,
