@@ -1,11 +1,18 @@
 # Plan: User Trigger Replay via Post-Refresh WAL Decode
 
-**Status:** Proposed  
+**Status:** Superseded by [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)  
 **Date:** 2026-02-24  
 **Depends on:**
 [PLAN_USER_TRIGGERS.md](PLAN_USER_TRIGGERS.md) (Phase 1 — suppress during
 refresh) · [PLAN_HYBRID_CDC.md](PLAN_HYBRID_CDC.md) (Phase 3 — WAL decoder
-infrastructure)  
+infrastructure)
+
+> **⚠️ This plan has been superseded.** The explicit DML approach in
+> [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
+> achieves the same goal with ~half the overhead, better trigger semantics
+> (native PostgreSQL `OLD`/`NEW`), and significantly less implementation
+> complexity (~3–5 days vs ~2–3 weeks). This document is retained for
+> historical reference.  
 **Effort:** ~1–2 weeks (4 phases, incrementally deliverable)
 
 ---
