@@ -797,15 +797,15 @@ independently. Steps are numbered sequentially for easy reference.
 
 | Step | Item(s) | Effort | Delivers | Prereqs |
 |------|---------|--------|----------|----------|
-| **S7** | C-2: Column snapshot + schema fingerprint | 3–4h | Precise change detection (column added/dropped/renamed/retyped) | C-1 ✅ |
-| **S8** | C-3: `pg_stream.block_source_ddl` GUC | 3–4h | Optional strict mode for production deployments | — |
+| ~~**S7**~~ | ~~C-2: Column snapshot + schema fingerprint~~ | ~~3–4h~~ | ~~✅ DONE~~ | C-1 ✅ |
+| ~~**S8**~~ | ~~C-3: `pg_stream.block_source_ddl` GUC~~ | ~~3–4h~~ | ~~✅ DONE~~ | — |
 
 #### Tier 4 — Schema-Dependent Features (newly unlocked)
 
 | Step | Item(s) | Effort | Delivers | Prereqs |
 |------|---------|--------|----------|----------|
-| **S9** | C-4: NATURAL JOIN with column snapshot | 6–8h | Previously rejected → now safe with drift detection on reinit | S7 |
-| **S10** | C-5: Keyless table support (ADR-072) | 4–6h | All-column content hash for `__pgs_row_id` when no PK exists | C-1 ✅ |
+| ~~**S9**~~ | ~~C-4: NATURAL JOIN with column snapshot~~ | ~~6–8h~~ | ~~✅ DONE~~ | S7 ✅ |
+| ~~**S10**~~ | ~~C-5: Keyless table support (ADR-072)~~ | ~~4–6h~~ | ~~✅ DONE~~ | C-1 ✅ |
 
 #### Tier 5 — OLAP & Advanced Features (diminishing returns)
 
@@ -821,13 +821,13 @@ independently. Steps are numbered sequentially for easy reference.
 
 | Tier | Steps | Total Effort | Cumulative Items Resolved |
 |------|-------|-------------|---------------------------|
-| ✅ Done | C-1, S1–S6 | ~28–39h | Smart schema detection + 2 correctness gaps + 15 SQL gap items |
+| ✅ Done | C-1, S1–S10 | ~44–57h | Smart schema detection + 2 correctness + 15 SQL gaps + schema infra + NATURAL JOIN + keyless tables |
 | ~~1 — Correctness~~ | ~~S1–S2~~ | ~~5–8h~~ | ~~✅ DONE~~ |
 | ~~2 — High-Value~~ | ~~S3–S6~~ | ~~18–26h~~ | ~~✅ DONE~~ |
-| 3 — Schema Infra | S7–S8 | 6–8h | Column snapshots + DDL blocking GUC |
-| 4 — Unlocked | S9–S10 | 10–14h | NATURAL JOIN + keyless tables |
+| ~~3 — Schema Infra~~ | ~~S7–S8~~ | ~~6–8h~~ | ~~✅ DONE~~ |
+| ~~4 — Unlocked~~ | ~~S9–S10~~ | ~~10–14h~~ | ~~✅ DONE~~ |
 | 5 — Advanced | S11–S15 | 47–63h | GROUPING SETS, scalar WHERE, OR sublinks, multi-PARTITION, recursive CTE |
-| **Total remaining** | **S1–S15** | **~86–119h** | **All planned items** |
+| **Total remaining** | **S11–S15** | **~47–63h** | **5 advanced items** |
 
 ---
 
@@ -912,10 +912,10 @@ design reasons that no schema policy can address:
 - [ ] `DISTINCT ON` auto-rewritten to ROW_NUMBER() window function (S4)
 - [ ] 11 regression aggregates supported in DIFFERENTIAL mode (S5)
 - [ ] Mixed UNION / UNION ALL works correctly (S6)
-- [ ] Column snapshot stored per source dependency with schema fingerprint (S7)
-- [ ] `pg_stream.block_source_ddl` GUC available, default false (S8)
-- [ ] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot (S9)
-- [ ] Keyless tables supported with all-column content hash for `__pgs_row_id` (S10)
+- [x] Column snapshot stored per source dependency with schema fingerprint (S7)
+- [x] `pg_stream.block_source_ddl` GUC available, default false (S8)
+- [x] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot (S9)
+- [x] Keyless tables supported with all-column content hash for `__pgs_row_id` (S10)
 - [ ] GROUPING SETS / CUBE / ROLLUP via UNION ALL decomposition (S11)
 - [ ] Scalar subquery in WHERE via CROSS JOIN rewrite (S12)
 - [ ] SubLinks inside OR via OR-to-UNION rewrite (S13)
