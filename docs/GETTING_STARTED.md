@@ -117,7 +117,7 @@ Company (1)
 
 ## Step 2: Create the First Stream Table — Recursive Hierarchy
 
-Our first stream table flattens the department tree. For every department, it computes the full path from the root and the depth level. This uses `WITH RECURSIVE` — a SQL construct that can't be differentiated algebraically (the recursion depends on itself), but pg_stream handles it using a **recomputation diff** strategy that we'll explain later.
+Our first stream table flattens the department tree. For every department, it computes the full path from the root and the depth level. This uses `WITH RECURSIVE` — a SQL construct that can't be differentiated with simple algebraic rules (the recursion depends on itself), but pg_stream handles it using **incremental strategies** (semi-naive evaluation for inserts, Delete-and-Rederive for mixed changes) that we'll explain later.
 
 ```sql
 SELECT pgstream.create_stream_table(
@@ -331,14 +331,15 @@ Refresh the recursive tree:
 SELECT pgstream.refresh_stream_table('department_tree');
 ```
 
-**How the recursive CTE refresh works:** Unlike `department_stats` which uses algebraic differentiation, recursive CTEs use a **recomputation diff** strategy. pg_stream:
+**How the recursive CTE refresh works:** Unlike `department_stats` which uses algebraic differentiation, recursive CTEs use **incremental fixpoint strategies**. For this INSERT (adding a new department), pg_stream uses **semi-naive evaluation**:
 
-1. Re-executes the full `WITH RECURSIVE` query to get the new complete result
-2. Compares it against the current `department_tree` storage table using anti-joins
-3. Identifies exactly which rows are new (INSERT), which disappeared (DELETE), and which changed (UPDATE)
-4. Applies only those differences via MERGE
+1. Differentiates the base case to find the new department row
+2. Propagates it through the recursive term using a nested `WITH RECURSIVE` — discovering any new child paths
+3. The result is just the new rows produced by the change, not the entire tree
 
-This is more work than algebraic IVM, but it's the only correct approach for recursive queries — where a single inserted row can cascade through arbitrarily many levels of the recursion.
+For DELETEs or UPDATEs, pg_stream automatically switches to **Delete-and-Rederive (DRed)**, which additionally handles cascading deletions through the recursion while preserving rows that have alternative derivation paths.
+
+This is more efficient than full recomputation — the work is proportional to the rows *affected* by the change, not the full result set.
 
 ```sql
 SELECT * FROM department_tree WHERE name = 'DevOps';

@@ -213,21 +213,29 @@ keep the fast single-MERGE path.
 
 | Field | Value |
 |-------|-------|
-| **Status** | Accepted |
+| **Status** | Accepted (Updated) |
 | **Category** | IVM Engine |
 | **Sources** | `docs/DVM_OPERATORS.md`, `src/dvm/operators/recursive_cte.rs` |
 
-**Decision:** Handle `WITH RECURSIVE` CTEs using semi-naive evaluation for FULL
-mode and recomputation-diff for DIFFERENTIAL mode (full re-execution + anti-join
-against stored state).
+**Decision:** Handle `WITH RECURSIVE` CTEs using three strategies in
+DIFFERENTIAL mode, selected automatically based on column compatibility and
+change type. FULL mode continues to execute the query as-is.
 
 **Key points:**
 - FULL mode: query executes as-is (PostgreSQL handles recursion natively)
-- DIFFERENTIAL mode: recomputation-diff because incremental recursion requires
-  tracking recursive fixpoint iteration across refreshes, which is unsupported
-- Delete-and-Rederive (DRed) considered but rejected for initial implementation
-  due to complexity with non-monotone operators in recursive terms
-- Monotone-only cycles could use incremental fixpoint in the future (see ADR-053)
+- DIFFERENTIAL mode uses three strategies:
+  1. **Semi-naive evaluation** — INSERT-only changes: differentiate the base
+     case, then propagate new rows through the recursive term via a nested
+     `WITH RECURSIVE`
+  2. **Delete-and-Rederive (DRed)** — mixed INSERT/DELETE/UPDATE changes:
+     insert propagation → over-deletion cascade → rederivation → combine
+  3. **Recomputation fallback** — when CTE columns ⊃ ST storage columns
+     (column mismatch), re-execute the full query and diff against storage
+- Strategy selection is automatic: column match + INSERT-only → semi-naive;
+  column match + mixed → DRed; column mismatch → recomputation
+- Non-linear recursion (multiple self-references in the recursive term) is
+  rejected — PostgreSQL restricts the recursive term to reference the CTE
+  at most once
 
 ---
 

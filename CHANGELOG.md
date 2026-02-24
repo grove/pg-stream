@@ -74,6 +74,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (subquery), scalar subqueries in SELECT.
 - **CTE support** — non-recursive CTEs (inline and shared delta), recursive
   CTEs (`WITH RECURSIVE`) in both FULL and DIFFERENTIAL modes.
+- **Recursive CTE incremental maintenance** — DIFFERENTIAL mode now uses
+  semi-naive evaluation for INSERT-only changes, Delete-and-Rederive (DRed)
+  for mixed changes, and recomputation fallback when CTE columns don't match
+  ST storage. Strategy is auto-selected per refresh.
 - **Window functions** — ROW_NUMBER, RANK, SUM OVER, etc. with full frame
   clause support (ROWS, RANGE, GROUPS, BETWEEN, EXCLUDE) and named WINDOW
   clauses.
@@ -117,7 +121,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Deep-dive tutorials: What Happens on INSERT / UPDATE / DELETE / TRUNCATE.
 
 #### Testing
-- 872 unit tests, 22 E2E test suites (Testcontainers + custom Docker image).
+- 878 unit tests, 22 E2E test suites (Testcontainers + custom Docker image).
 - Property-based tests, integration tests, resilience tests.
 
 ### Known Limitations

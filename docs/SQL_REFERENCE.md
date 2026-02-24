@@ -257,7 +257,7 @@ SELECT pgstream.create_stream_table(
     'FULL'  -- FULL mode: standard re-execution
 );
 
--- Recursive CTE with DIFFERENTIAL mode (recomputation diff strategy)
+-- Recursive CTE with DIFFERENTIAL mode (incremental semi-naive / DRed)
 SELECT pgstream.create_stream_table(
     'org_chart',
     'WITH RECURSIVE reports AS (
@@ -268,7 +268,7 @@ SELECT pgstream.create_stream_table(
     )
     SELECT * FROM reports',
     '2m',
-    'DIFFERENTIAL'  -- Uses recomputation diff (re-execute + anti-join)
+    'DIFFERENTIAL'  -- Uses semi-naive, DRed, or recomputation (auto-selected)
 );
 ```
 
@@ -496,7 +496,7 @@ SELECT pgstream.create_stream_table(
 - CDC triggers and change buffer tables are created automatically for each source table.
 - The ST is registered in the dependency DAG; cycles are rejected.
 - Non-recursive CTEs are inlined as subqueries during parsing (Tier 1). Multi-reference CTEs share delta computation (Tier 2).
-- Recursive CTEs in DIFFERENTIAL mode use a recomputation diff strategy: the full query is re-executed and anti-joined against current storage to compute the delta.
+- Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **Delete-and-Rederive (DRed)** for mixed changes, and **recomputation fallback** when CTE columns don't match ST storage columns.
 - LATERAL SRFs in DIFFERENTIAL mode use row-scoped recomputation: when a source row changes, only the SRF expansions for that row are re-evaluated.
 - LATERAL subqueries in DIFFERENTIAL mode also use row-scoped recomputation: when an outer row changes, the correlated subquery is re-executed only for that row.
 - WHERE subqueries (`EXISTS`, `IN`, scalar) are parsed into dedicated semi-join, anti-join, and scalar subquery operators with specialized delta computation.

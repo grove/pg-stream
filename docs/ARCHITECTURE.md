@@ -184,7 +184,7 @@ The parser produces an `OpTree` — a tree of operator nodes. CTE handling follo
 
 1. **Tier 1 (Inline Expansion)** — Non-recursive CTEs referenced once are expanded into `Subquery` nodes, equivalent to subqueries in FROM.
 2. **Tier 2 (Shared Delta)** — Non-recursive CTEs referenced multiple times produce `CteScan` nodes that share a single delta computation via a CTE registry and delta cache.
-3. **Tier 3a/3b (Recursive)** — Recursive CTEs (`WITH RECURSIVE`) are detected via `query_has_recursive_cte()`. In FULL mode, the query executes as-is. In DIFFERENTIAL mode, a recomputation diff strategy re-executes the full query and anti-joins against storage.
+3. **Tier 3a/3b/3c (Recursive)** — Recursive CTEs (`WITH RECURSIVE`) are detected via `query_has_recursive_cte()`. In FULL mode, the query executes as-is. In DIFFERENTIAL mode, the strategy is auto-selected: semi-naive evaluation for INSERT-only changes, Delete-and-Rederive (DRed) for mixed changes, or recomputation fallback when CTE columns don't match ST storage.
 
 #### Operators (`src/dvm/operators/`)
 
@@ -432,7 +432,7 @@ src/
 ├── hooks.rs         # DDL event trigger handlers (_on_ddl_end, _on_sql_drop)
 ├── shmem.rs         # Shared memory state (PgStreamSharedState, DAG_REBUILD_SIGNAL)
 ├── dvm/
-│   ├── mod.rs       # DVM module root + recursive CTE recomputation diff
+│   ├── mod.rs       # DVM module root + recursive CTE orchestration
 │   ├── parser.rs    # Query → OpTree converter (CTE extraction, subquery, window support)
 │   ├── diff.rs      # Delta SQL generation (CTE delta cache)
 │   ├── row_id.rs    # Row ID generation
@@ -450,7 +450,7 @@ src/
 │       ├── except.rs        # EXCEPT / EXCEPT ALL (dual-count GREATEST)
 │       ├── subquery.rs      # Subquery / inlined CTE delegation
 │       ├── cte_scan.rs      # Shared CTE delta (multi-reference)
-│       ├── recursive_cte.rs # Recursive CTE (recomputation diff)
+│       ├── recursive_cte.rs # Recursive CTE (semi-naive + DRed + recomputation)
 │       ├── window.rs        # Window function (partition recomputation)
 │       └── lateral_function.rs # LATERAL SRF (row-scoped recomputation)
 ├── monitor.rs       # Monitoring & observability functions

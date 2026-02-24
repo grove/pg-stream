@@ -483,18 +483,51 @@ Recursive CTEs (`WITH RECURSIVE`) are supported via two strategies depending on 
 
 Recursive CTEs work out-of-the-box with `refresh_mode = 'FULL'`. The defining query is executed as-is via `INSERT INTO ... SELECT ...`, and PostgreSQL handles the iterative evaluation internally.
 
-#### DIFFERENTIAL Mode (Recomputation Diff)
+#### DIFFERENTIAL Mode (Three-Strategy Incremental Maintenance)
 
-Recursive CTEs with `refresh_mode = 'DIFFERENTIAL'` use a **recomputation diff** strategy rather than true algebraic differentiation. This is because the recursive fixpoint iteration cannot be algebraically differentiated — a single base-table change can cascade through arbitrarily many recursive steps.
+Recursive CTEs with `refresh_mode = 'DIFFERENTIAL'` use an automatic three-strategy approach, selected based on column compatibility and change type:
 
-**Strategy:**
+##### Strategy 1: Semi-Naive Evaluation (INSERT-only changes)
 
-1. Re-execute the full defining query to compute the new result set.
-2. Anti-join the new result against the current storage table to find inserts.
-3. Anti-join the current storage against the new result to find deletes.
-4. Apply the diff (inserts + deletes) to the storage table.
+When only INSERT changes are present in the change buffer, pg_stream uses **semi-naive evaluation** — the standard technique for incremental fixpoint computation. The base case is differentiated normally through the DVM operator tree, then the resulting delta is propagated through the recursive term using a nested `WITH RECURSIVE`:
 
-**SQL Pattern:**
+```sql
+WITH RECURSIVE
+  __pgs_base_delta AS (
+    -- Normal DVM differentiation of the base case (INSERT rows only)
+    <differentiated base case>
+  ),
+  __pgs_rec_delta AS (
+    -- Seed: base case delta rows
+    SELECT cols FROM __pgs_base_delta WHERE __pgs_action = 'I'
+    UNION ALL
+    -- Seed: new base rows joining existing ST storage
+    SELECT cols FROM <recursive term with self_ref = ST_storage, base = change_buffer>
+    UNION ALL
+    -- Propagation: recursive term applied to growing delta
+    SELECT cols FROM <recursive term with self_ref = __pgs_rec_delta, base = full>
+  )
+SELECT pgstream.pg_stream_hash(...) AS __pgs_row_id, 'I' AS __pgs_action, cols
+FROM __pgs_rec_delta
+```
+
+The cost is proportional to the number of *new* rows produced by the change, not the full result set.
+
+##### Strategy 2: Delete-and-Rederive / DRed (mixed INSERT/DELETE/UPDATE changes)
+
+When the change buffer contains DELETE or UPDATE changes, simple propagation is insufficient — a deleted base row may have transitively derived many recursive rows, some of which may still be derivable from alternative paths. DRed handles this in four phases:
+
+1. **Insert propagation** — semi-naive evaluation for the INSERT portion (same as Strategy 1)
+2. **Over-deletion cascade** — propagate base-case deletions through the recursive term against ST storage to find all transitively-derived rows that *might* be invalidated
+3. **Rederivation** — re-execute the recursive CTE from the remaining (non-deleted) base rows to restore any over-deleted rows that have alternative derivations
+4. **Combine** — final delta = inserts + (over-deletions − rederived rows)
+
+This avoids full recomputation while correctly handling deletions with alternative derivation paths.
+
+##### Strategy 3: Recomputation Fallback
+
+When the CTE defines more columns than the outer `SELECT` projects (column mismatch), the incremental strategies cannot be used because the ST storage table lacks columns needed for recursive self-joins. In this case, the full defining query is re-executed and anti-joined against current storage:
+
 ```sql
 WITH __pgs_recomp_new AS (
     SELECT pgstream.pg_stream_hash(row_to_json(sub)::text) AS __pgs_row_id, col1, col2, ...
@@ -517,11 +550,20 @@ UNION ALL
 SELECT * FROM __pgs_recomp_del
 ```
 
+The cost is proportional to the full result set size.
+
+##### Strategy Selection
+
+| CTE columns match ST? | Change type | Strategy |
+|---|---|---|
+| ✅ Match | INSERT-only | Semi-naive (Strategy 1) |
+| ✅ Match | Mixed (INSERT+DELETE/UPDATE) | DRed (Strategy 2) |
+| ❌ Mismatch | Any | Recomputation (Strategy 3) |
+
 **Notes:**
-- The cost is proportional to the full result set size, not the delta size. This is a trade-off: correctness is guaranteed for arbitrarily complex recursive structures, but performance is not proportional to the change.
-- For write-heavy workloads on large recursive result sets, `refresh_mode = 'FULL'` may be more efficient since it avoids the anti-join overhead.
-- The `__pgs_row_id` column (xxHash of the JSON-serialized row) is used for row identity across the anti-join.
-- Future work (Tier 3c) may introduce semi-naive evaluation for true differential maintenance of linear recursion.
+- Non-linear recursion (multiple self-references in the recursive term) is rejected — PostgreSQL restricts the recursive term to reference the CTE at most once.
+- The `__pgs_row_id` column (xxHash of the JSON-serialized row) is used for row identity.
+- For write-heavy workloads on very large recursive result sets with frequent mixed changes, `refresh_mode = 'FULL'` may still be more efficient than DRed.
 
 ---
 
@@ -920,7 +962,7 @@ The DVM engine builds the operator tree by analyzing the parsed query:
 11. **ORDER BY** → silently discarded (storage row order is undefined)
 12. **LIMIT / OFFSET** → rejected with a clear error (stream tables materialize the full result set)
 
-For recursive CTEs (`WITH RECURSIVE`), the query is not parsed into an OpTree for differential mode. Instead, the recomputation diff strategy is applied directly to the raw defining query.
+For recursive CTEs (`WITH RECURSIVE`), the query is parsed into an OpTree with `RecursiveCte` operator nodes. In DIFFERENTIAL mode, the strategy (semi-naive, DRed, or recomputation) is selected automatically based on column compatibility and change type — see the Recursive CTEs section above for details.
 
 The tree is then traversed bottom-up during delta generation: each operator's `generate_delta_sql()` method composes its SQL fragment around the output of its child operator(s).
 
