@@ -50,6 +50,22 @@ struct CachedMergeTemplate {
     source_oids: Vec<u32>,
     /// Cleanup template with `__PGS_{PREV,NEW}_LSN_{oid}__` tokens.
     cleanup_sql_template: String,
+
+    // ── User-trigger explicit DML templates ──────────────────────────
+    // These templates reference `__pgs_delta_{pgs_id}` (a temp table
+    // materialized at execution time) and do NOT contain LSN placeholders.
+    /// DELETE statement for the trigger-enabled DML path.
+    /// Deletes rows where the delta action is 'D'.
+    trigger_delete_template: String,
+    /// UPDATE statement for the trigger-enabled DML path.
+    /// Updates existing rows where the delta action is 'I' and values changed.
+    trigger_update_template: String,
+    /// INSERT statement for the trigger-enabled DML path.
+    /// Inserts genuinely new rows where the delta action is 'I'.
+    trigger_insert_template: String,
+    /// USING clause template with LSN placeholders (for materializing delta
+    /// into a temp table in the user-trigger path).
+    trigger_using_template: String,
 }
 
 thread_local! {
@@ -427,6 +443,37 @@ pub fn prewarm_merge_cache(dt: &StreamTableMeta) {
     // D-2: Parameterize MERGE template for prepared-statement execution.
     let parameterized_merge_sql = parameterize_lsn_template(&merge_template, source_oids);
 
+    // ── User-trigger explicit DML templates ──────────────────────────
+    let trigger_delete_template = format!(
+        "DELETE FROM {quoted_table} AS dt \
+         USING __pgs_delta_{pgs_id} AS d \
+         WHERE dt.__pgs_row_id = d.__pgs_row_id \
+           AND d.__pgs_action = 'D'",
+        pgs_id = dt.pgs_id,
+    );
+
+    let trigger_update_template = format!(
+        "UPDATE {quoted_table} AS dt \
+         SET {update_set_clause} \
+         FROM __pgs_delta_{pgs_id} AS d \
+         WHERE dt.__pgs_row_id = d.__pgs_row_id \
+           AND d.__pgs_action = 'I' \
+           AND ({is_distinct_clause})",
+        pgs_id = dt.pgs_id,
+    );
+
+    let trigger_insert_template = format!(
+        "INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
+         SELECT d.__pgs_row_id, {d_user_col_list} \
+         FROM __pgs_delta_{pgs_id} AS d \
+         WHERE d.__pgs_action = 'I' \
+           AND NOT EXISTS (\
+             SELECT 1 FROM {quoted_table} AS dt \
+             WHERE dt.__pgs_row_id = d.__pgs_row_id\
+           )",
+        pgs_id = dt.pgs_id,
+    );
+
     // Cache the MERGE template with LSN placeholder tokens.
     // Each refresh resolves the tokens to concrete LSN values
     // via string substitution, then executes the resolved SQL.
@@ -440,6 +487,10 @@ pub fn prewarm_merge_cache(dt: &StreamTableMeta) {
                 parameterized_merge_sql,
                 source_oids: source_oids.clone(),
                 cleanup_sql_template: cleanup_template,
+                trigger_delete_template,
+                trigger_update_template,
+                trigger_insert_template,
+                trigger_using_template: using_clause.clone(),
             },
         );
     });
@@ -740,7 +791,7 @@ pub fn execute_differential_refresh(
     let was_cache_hit = cached.is_some();
 
     /// Resolved SQL pair: MERGE template + DELETE+INSERT template,
-    /// plus D-2 prepared-statement materials.
+    /// plus D-2 prepared-statement materials and user-trigger DML.
     struct ResolvedSql {
         merge_sql: String,
         delete_insert_sql: String,
@@ -748,6 +799,15 @@ pub fn execute_differential_refresh(
         source_oids: Vec<u32>,
         /// Parameterized MERGE SQL with `$N` params (for PREPARE).
         parameterized_merge_sql: String,
+        /// DELETE template for user-trigger path (no LSN placeholders).
+        trigger_delete_sql: String,
+        /// UPDATE template for user-trigger path (no LSN placeholders).
+        trigger_update_sql: String,
+        /// INSERT template for user-trigger path (no LSN placeholders).
+        trigger_insert_sql: String,
+        /// USING clause with resolved LSN values (for materializing delta
+        /// into a temp table in the user-trigger path).
+        trigger_using_sql: String,
     }
 
     let resolved = if let Some(entry) = cached {
@@ -770,6 +830,15 @@ pub fn execute_differential_refresh(
             ),
             source_oids: entry.source_oids.clone(),
             parameterized_merge_sql: entry.parameterized_merge_sql.clone(),
+            trigger_delete_sql: entry.trigger_delete_template.clone(),
+            trigger_update_sql: entry.trigger_update_template.clone(),
+            trigger_insert_sql: entry.trigger_insert_template.clone(),
+            trigger_using_sql: resolve_lsn_placeholders(
+                &entry.trigger_using_template,
+                &entry.source_oids,
+                prev_frontier,
+                new_frontier,
+            ),
         }
     } else {
         // ── Cache miss: full pipeline + PREPARE + cache ──────────────
@@ -887,6 +956,37 @@ pub fn execute_differential_refresh(
         // ── D-2: Build parameterized MERGE SQL for PREPARE ─────────
         let parameterized_merge_sql = parameterize_lsn_template(&merge_template, &source_oids);
 
+        // ── User-trigger explicit DML templates ──────────────────────
+        let trigger_delete_template = format!(
+            "DELETE FROM {quoted_table} AS dt \
+             USING __pgs_delta_{pgs_id} AS d \
+             WHERE dt.__pgs_row_id = d.__pgs_row_id \
+               AND d.__pgs_action = 'D'",
+            pgs_id = dt.pgs_id,
+        );
+
+        let trigger_update_template = format!(
+            "UPDATE {quoted_table} AS dt \
+             SET {update_set_clause} \
+             FROM __pgs_delta_{pgs_id} AS d \
+             WHERE dt.__pgs_row_id = d.__pgs_row_id \
+               AND d.__pgs_action = 'I' \
+               AND ({is_distinct_clause})",
+            pgs_id = dt.pgs_id,
+        );
+
+        let trigger_insert_template = format!(
+            "INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
+             SELECT d.__pgs_row_id, {d_user_col_list} \
+             FROM __pgs_delta_{pgs_id} AS d \
+             WHERE d.__pgs_action = 'I' \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM {quoted_table} AS dt \
+                 WHERE dt.__pgs_row_id = d.__pgs_row_id\
+               )",
+            pgs_id = dt.pgs_id,
+        );
+
         // Store templates in the cache for subsequent refreshes.
         MERGE_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(
@@ -898,6 +998,10 @@ pub fn execute_differential_refresh(
                     source_oids: source_oids.clone(),
                     cleanup_sql_template: cleanup_template,
                     parameterized_merge_sql: parameterized_merge_sql.clone(),
+                    trigger_delete_template: trigger_delete_template.clone(),
+                    trigger_update_template: trigger_update_template.clone(),
+                    trigger_insert_template: trigger_insert_template.clone(),
+                    trigger_using_template: template_using.clone(),
                 },
             );
         });
@@ -918,6 +1022,15 @@ pub fn execute_differential_refresh(
             ),
             source_oids: source_oids.clone(),
             parameterized_merge_sql,
+            trigger_delete_sql: trigger_delete_template,
+            trigger_update_sql: trigger_update_template,
+            trigger_insert_sql: trigger_insert_template,
+            trigger_using_sql: resolve_lsn_placeholders(
+                &template_using,
+                &source_oids,
+                prev_frontier,
+                new_frontier,
+            ),
         }
     };
 
@@ -1392,6 +1505,10 @@ mod tests {
                     source_oids: vec![100, 200],
                     cleanup_sql_template: "DELETE FROM ...".to_string(),
                     parameterized_merge_sql: String::new(),
+                    trigger_delete_template: String::new(),
+                    trigger_update_template: String::new(),
+                    trigger_insert_template: String::new(),
+                    trigger_using_template: String::new(),
                 },
             );
         });
@@ -1418,6 +1535,10 @@ mod tests {
                     source_oids: vec![],
                     cleanup_sql_template: String::new(),
                     parameterized_merge_sql: String::new(),
+                    trigger_delete_template: String::new(),
+                    trigger_update_template: String::new(),
+                    trigger_insert_template: String::new(),
+                    trigger_using_template: String::new(),
                 },
             );
         });
