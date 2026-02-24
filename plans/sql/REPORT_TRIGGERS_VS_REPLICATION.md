@@ -1,6 +1,6 @@
 # Triggers vs Logical Replication for CDC in pg_stream
 
-**Status:** Evaluation Report  
+**Status:** Evaluation Report (updated with implementation status)  
 **Date:** 2026-02-24  
 **Context:** [ADR — Triggers Instead of Logical Replication](../adrs/adr-triggers-instead-of-logical-replication.md) · [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
 
@@ -15,10 +15,17 @@ and two end-user features — user-defined triggers on stream tables and logical
 replication subscriptions from stream tables.
 
 **Conclusion:** Triggers remain the correct choice for the current scope given
-operational simplicity and zero-config deployment. However, the atomicity
-constraint — the original reason for choosing triggers — is primarily a
-**creation-time inconvenience**, not a steady-state limitation. Once a stream
-table exists, logical replication has three significant runtime advantages:
+operational simplicity and zero-config deployment. The **hybrid approach** —
+trigger bootstrap for creation with automatic WAL transition for steady-state —
+is now **implemented** (`pg_stream.cdc_mode` GUC, `src/wal_decoder.rs`). User-
+defined triggers on stream tables are also **implemented** (`pg_stream.user_triggers`
+GUC, `DISABLE TRIGGER USER` during refresh). These were previously recommendations
+(§6.2, §6.6); both are now shipped.
+
+However, the atomicity constraint — the original reason for choosing triggers —
+is primarily a **creation-time inconvenience**, not a steady-state limitation.
+Once a stream table exists, logical replication has three significant runtime
+advantages:
 
 - **No write-side overhead** — With triggers, every INSERT/UPDATE/DELETE on a
   tracked source table does extra work *before the application's transaction
@@ -146,14 +153,14 @@ triggers on source tables.
 | MERGE firing pattern | DELETE+INSERT (not UPDATE); must be suppressed | Same — refresh mechanism is independent of CDC |
 
 **Key insight:** User trigger support on stream tables is **orthogonal to the
-CDC mechanism**. The solution (`session_replication_role = 'replica'` during
-refresh) works identically regardless of whether changes are captured via
-triggers or logical replication. The existing plan in
-[PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md) is sound.
-
-**Caveat:** `session_replication_role = 'replica'` may interact with logical
-replication **publishing** from stream tables (see §2.5). This needs
-verification before implementation.
+CDC mechanism** and is now **implemented**. The solution uses `ALTER TABLE ...
+DISABLE TRIGGER USER` / `ENABLE TRIGGER USER` around FULL refresh (avoiding
+the `session_replication_role` conflict with logical replication publishing).
+In DIFFERENTIAL mode, explicit per-row DML (INSERT/UPDATE/DELETE) is used
+instead of MERGE so that user-defined AFTER triggers fire correctly. The
+implementation is controlled by the `pg_stream.user_triggers` GUC (`auto`/
+`on`/`off`). See [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
+for the full design.
 
 > **Note:** Sections 2.1–2.5 compare creation-time and operational aspects.
 > For a focused steady-state comparison (what matters once the ST exists),
@@ -365,7 +372,10 @@ Rust function for `on_source_truncated`, cascade logic reuse from `hooks.rs`).
 
 ---
 
-## 5. Migration Path: Trigger → Logical Replication
+## 5. Migration Path: Trigger → Logical Replication (Now Implemented)
+
+> **Status:** Phase A (Hybrid Creation) is now implemented in `src/wal_decoder.rs`.
+> The `pg_stream.cdc_mode` GUC controls the behavior (`trigger`/`auto`/`wal`).
 
 As discussed in §3, the atomicity constraint is a creation-time problem with
 known solutions. The buffer table schema and downstream IVM pipeline are
@@ -413,12 +423,15 @@ ETL patterns become a common pain point, (c) pg_stream targets environments
 where `wal_level = logical` is already the norm. The steady-state advantages of
 logical replication (§3.2) are substantial and should not be dismissed.
 
-### Recommendation 2: Implement User Trigger Suppression
+### Recommendation 2: ✅ IMPLEMENTED — User Trigger Suppression
 
-Follow the [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md) plan with one
-modification: **test `session_replication_role = 'replica'` interaction with
-PUBLICATION before committing to it**. If it blocks publication, use
-`ALTER TABLE ... DISABLE TRIGGER USER` within a SAVEPOINT instead.
+User-defined triggers on stream tables are now fully supported. The
+implementation uses `ALTER TABLE ... DISABLE TRIGGER USER` / `ENABLE TRIGGER
+USER` around FULL refresh, and explicit per-row DML (INSERT/UPDATE/DELETE)
+instead of MERGE during DIFFERENTIAL refresh so user AFTER triggers fire
+correctly. Controlled by `pg_stream.user_triggers` GUC (`auto`/`on`/`off`).
+The `session_replication_role` approach from the original plan was rejected to
+avoid conflict with logical replication publishing (see §2.5).
 
 ### Recommendation 3: Add TRUNCATE Capture Trigger
 
@@ -442,17 +455,22 @@ Execute the benchmark plan in
 data-driven thresholds for the logical replication migration crossover point.
 The results should feed directly into the §3.3 crossover analysis.
 
-### Recommendation 6: Prototype the Hybrid Approach
+### Recommendation 6: ✅ IMPLEMENTED — Hybrid CDC Approach
 
-The "trigger bootstrap → slot transition" pattern from §3.1 deserves a
-prototype. It combines the best of both worlds: zero-config creation (triggers)
-with optimal steady-state performance (logical replication). The migration
-would happen transparently after the first successful refresh, with the trigger
-serving as a temporary safety net.
+The "trigger bootstrap → slot transition" pattern is now implemented in
+`src/wal_decoder.rs` (1152 lines). The implementation includes:
 
-**Effort estimate:** 1–2 weeks for a working prototype (slot creation in
-background worker, buffer table population from WAL decode, trigger teardown,
-fallback to trigger on slot creation failure).
+- **Automatic transition**: After stream table creation with triggers, a
+  background worker creates a logical replication slot and transitions to
+  WAL-based capture.
+- **GUC control**: `pg_stream.cdc_mode` (`trigger`/`auto`/`wal`) and
+  `pg_stream.wal_transition_timeout` control the behavior.
+- **Transition orchestration**: Create slot → wait for catch-up → drop trigger.
+  Automatic fallback to triggers if slot creation fails.
+- **Catalog extension**: `pgs_dependencies` gains `cdc_mode`, `slot_name`,
+  `decoder_confirmed_lsn`, `transition_started_at` columns.
+- **Health monitoring**: `pgstream.check_cdc_health()` function and
+  `NOTIFY pg_stream_cdc_transition` notifications.
 
 ---
 
@@ -467,3 +485,6 @@ fallback to trigger on slot creation failure).
 | D5 | Logical replication FROM STs works today | Regular heap tables; needs documentation, not code |
 | D6 | TRUNCATE gap is closable with statement-level trigger | Low effort, high impact — but logical replication handles it natively |
 | D7 | Hybrid approach is the optimal long-term target | Trigger bootstrap for creation + logical replication for steady-state |
+| D8 | User trigger suppression uses `DISABLE TRIGGER USER` | Avoids `session_replication_role` conflict with logical replication publishing (§2.5) |
+| D9 | Hybrid CDC implemented with auto-transition | `pg_stream.cdc_mode = 'auto'` triggers → WAL transition after creation |
+| D10 | Explicit DML for DIFFERENTIAL refresh with user triggers | INSERT/UPDATE/DELETE instead of MERGE so AFTER triggers fire correctly |

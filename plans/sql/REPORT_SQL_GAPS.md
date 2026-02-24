@@ -2,9 +2,9 @@
 
 **Status:** Reference document (periodically updated)  
 **Date:** 2025-02-21
-**Branch:** `sql-support`
+**Branch:** `main`
 **Scope:** All SQL constructs that produce incorrect results, broken delta SQL, or rejection errors in the pg_stream parser and differential view maintenance engine.
-**Last Updated:** 2026-02-22 — PLAN_SQL_GAPS_4 Session 1 complete. Ordered-set aggregates added (MODE, PERCENTILE_CONT, PERCENTILE_DISC) with WITHIN GROUP (ORDER BY) parsing. 25 aggregate functions now supported in DIFFERENTIAL mode. 826 unit tests passing.
+**Last Updated:** 2026-02-24 — Hybrid CDC (trigger → WAL transition), user-defined trigger support on stream tables, `needs_pgs_count()` fix for HAVING + aggregates. 25 aggregate functions in DIFFERENTIAL mode. 872 unit tests, 22 E2E test suites passing.
 
 ---
 
@@ -35,7 +35,7 @@ pg_stream supports a substantial core of SQL for both FULL and DIFFERENTIAL refr
 
 Remaining gaps: additional aggregate functions (regression: CORR/COVAR_*/REGR_*), structural enhancements (GROUPING SETS full impl, DISTINCT ON full impl, Mixed UNION/UNION ALL), and NATURAL JOIN support (currently rejected with clear error).
 
-**Total identified gaps: 52 distinct items across 9 categories. 49+ items resolved. 826 unit tests passing.**
+**Total identified gaps: 52 distinct items across 9 categories. 49+ items resolved. 872 unit tests, 22 E2E test suites passing.**
 
 ---
 
@@ -880,7 +880,7 @@ Phase A (Joins)  ─────────────┐
 Phase B (Subqueries & Aggs) ──┘
 ```
 
-**All phases are complete.** Phase A (Joins), Phase B (Subqueries & Aggregation), and Phase C (Structural) are fully resolved. 809 unit tests passing.
+**All phases are complete.** Phase A (Joins), Phase B (Subqueries & Aggregation), and Phase C (Structural) are fully resolved. 872 unit tests passing.
 
 ### Recommended Next Step
 
