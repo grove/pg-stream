@@ -1,5 +1,7 @@
 # PLAN: Circular References in the Stream Table Dependency Graph
 
+**Status:** Not started (future work)
+
 ## Objective
 
 Enable stream tables to form mutual dependencies (cycles) in the dependency graph, where stream table A references stream table B and vice versa. The system must refresh such cycles deterministically by iterating to a fixed point, analogous to how recursive CTEs work within a single query.

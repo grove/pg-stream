@@ -21,6 +21,7 @@ pg_stream brings declarative, automatically-refreshing materialized views to Pos
 - **Differential View Maintenance (DVM)** — only processes changed rows, not the entire base table. Delta queries are derived automatically from the defining query's operator tree.
 - **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in both FULL and DIFFERENTIAL modes.
 - **Trigger-based CDC** — lightweight `AFTER` row-level triggers capture changes into buffer tables. No logical replication slots or `wal_level = logical` required. Triggers are created and dropped automatically.
+- **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_stream.cdc_mode` GUC (`trigger` / `auto` / `wal`).
 - **DAG-aware scheduling** — stream tables that depend on other stream tables are refreshed in topological order. `CALCULATED` schedule propagation is supported.
 - **Crash-safe** — advisory locks prevent concurrent refreshes; crash recovery marks in-flight refreshes as failed and resumes normal operation.
 - **Observable** — built-in monitoring views (`pgstream.pg_stat_stream_tables`), refresh history, slot health checks, staleness reporting, and `NOTIFY`-based alerting.
@@ -104,7 +105,7 @@ shared_preload_libraries = 'pg_stream'
 max_worker_processes = 8
 ```
 
-> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required. CDC uses lightweight row-level triggers, not logical replication.
+> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required by default. CDC uses lightweight row-level triggers unless you opt in to WAL-based capture via `pg_stream.cdc_mode = 'auto'` (see [CONFIGURATION.md](docs/CONFIGURATION.md)).
 
 Restart PostgreSQL, then:
 
@@ -206,7 +207,7 @@ Stream tables are regular PostgreSQL heap tables, but their contents are managed
 | Logical replication of STs | ✅ Yes | `__pgs_row_id` column is replicated; subscribers receive materialized data only |
 | Direct DML on STs | ❌ No | Contents managed by the refresh engine |
 | Foreign keys on STs | ❌ No | Bulk `MERGE` during refresh does not respect FK ordering |
-| User triggers on STs | ⚠️ Unsupported | May fire unexpectedly during `MERGE` refresh |
+| User triggers on STs | ✅ Supported | Supported in DIFFERENTIAL mode; suppressed during FULL refresh (see `pg_stream.user_triggers` GUC) |
 
 See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#restrictions--interoperability) for details and examples.
 
@@ -214,7 +215,7 @@ See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#re
 
 1. **Create** — `pgstream.create_stream_table()` parses the defining query into an operator tree, creates a storage table, installs lightweight CDC triggers on source tables, and registers the ST in the catalog.
 
-2. **Capture** — Changes to base tables are captured via `AFTER INSERT/UPDATE/DELETE` row-level triggers that write to per-source change buffer tables in the `pgstream_changes` schema.
+2. **Capture** — Changes to base tables are captured via the hybrid CDC layer. By default, `AFTER INSERT/UPDATE/DELETE` row-level triggers write to per-source change buffer tables in the `pgstream_changes` schema. With `pg_stream.cdc_mode = 'auto'`, the system transitions to WAL-based capture (logical replication) after the first successful refresh for lower write-side overhead.
 
 3. **Schedule** — A background worker wakes periodically (default: 1s) and checks which STs have exceeded their schedule (or whose cron schedule has fired). STs are scheduled for refresh in topological order.
 
@@ -236,8 +237,8 @@ See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#re
 │  └────┬────┘    └──────────┘   └─────────┘  │
 │       │                                     │
 │  ┌────▼─────────────────────────────┐       │
-│  │     Row-Level Triggers (CDC)     │       │
-│  │     AFTER INSERT/UPDATE/DELETE   │       │
+│  │     Hybrid CDC Layer              │       │
+│  │     Triggers (default) or WAL     │       │
 │  └────┬─────────────────────────────┘       │
 │       │                                     │
 │  ┌────▼─────────────────────────────┐       │
@@ -284,7 +285,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** 457 tests (183 unit + 274 E2E/integration), 0 failures.
+**Test counts:** 872 unit tests + 22 E2E test suites, 0 failures.
 
 ### Code Coverage
 

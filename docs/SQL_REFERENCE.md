@@ -740,6 +740,47 @@ SELECT * FROM pgstream.slot_health();
 
 ---
 
+### pgstream.check_cdc_health
+
+Check CDC health for all tracked source tables. Returns per-source health status including the current CDC mode, replication slot details, estimated lag, and any alerts.
+
+```sql
+pgstream.check_cdc_health() → SETOF record(
+    source_relid   bigint,
+    source_table   text,
+    cdc_mode       text,
+    slot_name      text,
+    lag_bytes      bigint,
+    confirmed_lsn  text,
+    alert          text
+)
+```
+
+**Columns:**
+
+| Column | Type | Description |
+|---|---|---|
+| `source_relid` | `bigint` | OID of the tracked source table |
+| `source_table` | `text` | Resolved name of the source table (e.g., `public.orders`) |
+| `cdc_mode` | `text` | Current CDC mode: `TRIGGER`, `TRANSITIONING`, or `WAL` |
+| `slot_name` | `text` | Replication slot name (NULL for TRIGGER mode) |
+| `lag_bytes` | `bigint` | Replication slot lag in bytes (NULL for TRIGGER mode) |
+| `confirmed_lsn` | `text` | Last confirmed WAL position (NULL for TRIGGER mode) |
+| `alert` | `text` | Alert message if unhealthy (e.g., `slot_lag_exceeds_threshold`, `replication_slot_missing`) |
+
+**Example:**
+
+```sql
+SELECT * FROM pgstream.check_cdc_health();
+```
+
+| source_relid | source_table | cdc_mode | slot_name | lag_bytes | confirmed_lsn | alert |
+|---|---|---|---|---|---|---|
+| 16384 | public.orders | TRIGGER | | | | |
+| 16390 | public.events | WAL | pg_stream_slot_16390 | 524288 | 0/1A8B000 | |
+
+---
+
 ### pgstream.explain_dt
 
 Explain the DVM plan for a stream table's defining query.
@@ -1045,7 +1086,7 @@ Core metadata for each stream table.
 
 ### pgstream.pgs_dependencies
 
-DAG edges — records which source tables each ST depends on.
+DAG edges — records which source tables each ST depends on, including CDC mode metadata.
 
 | Column | Type | Description |
 |---|---|---|
@@ -1053,6 +1094,10 @@ DAG edges — records which source tables each ST depends on.
 | `source_relid` | `oid` | OID of the source table |
 | `source_type` | `text` | TABLE, STREAM_TABLE, or VIEW |
 | `columns_used` | `text[]` | Which columns are referenced |
+| `cdc_mode` | `text` | Current CDC mode: TRIGGER, TRANSITIONING, or WAL |
+| `slot_name` | `text` | Replication slot name (WAL/TRANSITIONING modes) |
+| `decoder_confirmed_lsn` | `pg_lsn` | WAL decoder's last confirmed position |
+| `transition_started_at` | `timestamptz` | When the trigger→WAL transition started |
 
 ### pgstream.pgs_refresh_history
 

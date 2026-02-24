@@ -1,5 +1,7 @@
 # PLAN: LATERAL Join Support (Subqueries with LATERAL)
 
+**Status:** Implemented
+
 ## Problem Statement
 
 pg_stream supports set-returning functions in the FROM clause (`jsonb_array_elements`, `unnest`, etc.) via `T_RangeFunction` parsing and the `LateralFunction` operator. However, **explicit LATERAL subqueries** are not supported:

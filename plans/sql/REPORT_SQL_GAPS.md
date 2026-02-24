@@ -1,5 +1,6 @@
 # SQL Support Gap Analysis
 
+**Status:** Reference document (periodically updated)  
 **Date:** 2025-02-21
 **Branch:** `sql-support`
 **Scope:** All SQL constructs that produce incorrect results, broken delta SQL, or rejection errors in the pg_stream parser and differential view maintenance engine.

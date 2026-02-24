@@ -18,8 +18,8 @@ This document describes the internal architecture of pg_stream — a PostgreSQL 
 │  ═════╪══════════════╪══════════════╪══════════════╪════════    │
 │       │              │              │              │            │
 │  ┌────▼──────────────▼────┐   ┌────┴──────────────┴────┐        │
-│  │  Row-Level Triggers    │   │  Delta Application     │        │
-│  │  (CDC via AFTER trigs) │   │  (INSERT/DELETE diffs) │        │
+│  │  Hybrid CDC Layer      │   │  Delta Application     │        │
+│  │  Triggers ──or── WAL   │   │  (INSERT/DELETE diffs) │        │
 │  └────────────┬───────────┘   └────────────▲───────────┘        │
 │               │                            │                    │
 │  ┌────────────▼───────────┐   ┌────────────┴───────────┐        │
@@ -44,7 +44,8 @@ This document describes the internal architecture of pg_stream — a PostgreSQL 
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────┐       │
 │  │                  Monitoring Layer                    │       │
-│  │  dt_refresh_stats │ slot_health │ explain_dt │ views │       │
+│  │  dt_refresh_stats │ slot_health │ check_cdc_health    │       │
+│  │  explain_dt │ views │ NOTIFY alerting               │       │
 │  └──────────────────────────────────────────────────────┘       │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -106,6 +107,10 @@ erDiagram
         oid source_relid PK "OID of source table"
         text source_type "TABLE | STREAM_TABLE | VIEW"
         text_arr columns_used "Column-level lineage"
+        text cdc_mode "TRIGGER | TRANSITIONING | WAL"
+        text slot_name "Replication slot (WAL mode)"
+        pg_lsn decoder_confirmed_lsn "WAL decoder progress"
+        timestamptz transition_started_at "Trigger→WAL transition start"
     }
 
     pgs_refresh_history {
@@ -137,16 +142,29 @@ erDiagram
 
 > **Note:** Change buffer tables (`pgstream_changes.changes_<oid>`) are created dynamically per source table OID and live in the separate `pgstream_changes` schema.
 
-### 3. CDC / Change Data Capture (`src/cdc.rs`)
+### 3. CDC / Change Data Capture (`src/cdc.rs`, `src/wal_decoder.rs`)
 
-Captures row-level changes from source tables using lightweight PostgreSQL triggers:
+pg_stream uses a **hybrid CDC** architecture that starts with triggers and optionally transitions to WAL-based (logical replication) capture for lower write-side overhead.
+
+#### Trigger Mode (default)
 
 1. **Trigger Management** — Creates `AFTER INSERT OR UPDATE OR DELETE` row-level triggers (`pg_stream_cdc_<oid>`) on each tracked source table. Each trigger fires a PL/pgSQL function (`pg_stream_cdc_fn_<oid>()`) that writes changes to the buffer table.
 2. **Change Buffering** — Decoded changes are written to per-source change buffer tables in the `pgstream_changes` schema. Each row captures the LSN (`pg_current_wal_lsn()`), transaction ID, action type (I/U/D), and the new/old row data as JSONB via `to_jsonb()`.
 3. **Cleanup** — Consumed changes are deleted after each successful refresh via `delete_consumed_changes()`, bounded by the upper LSN to prevent unbounded scans.
 4. **Lifecycle** — Triggers and trigger functions are automatically created when a source table is first tracked and dropped when the last stream table referencing a source is removed.
 
-The trigger approach was chosen over logical replication for **transaction safety** (triggers can be created in the same transaction as DDL), **simplicity** (no slot management, no `wal_level = logical` requirement), and **immediate visibility** (changes are visible in buffer tables as soon as the source transaction commits).
+The trigger approach was chosen as the default for **transaction safety** (triggers can be created in the same transaction as DDL), **simplicity** (no slot management, no `wal_level = logical` requirement), and **immediate visibility** (changes are visible in buffer tables as soon as the source transaction commits).
+
+#### WAL Mode (optional, automatic transition)
+
+When `pg_stream.cdc_mode` is set to `'auto'` or `'wal'` and `wal_level = logical` is available, the system transitions from trigger-based to WAL-based CDC after the first successful refresh:
+
+1. **WAL Availability Detection** — At stream table creation, checks whether `wal_level = logical` is configured. If so, the source dependency is marked for WAL transition.
+2. **WAL Decoder Background Worker** — A dedicated background worker (`src/wal_decoder.rs`) polls logical replication slots and writes decoded changes into the same change buffer tables used by triggers, ensuring a uniform format for the DVM engine.
+3. **Transition Orchestration** — The transition is a three-step process: (a) create a replication slot, (b) wait for the decoder to catch up to the trigger's last confirmed LSN, (c) drop the trigger and switch the dependency to WAL mode. If the decoder doesn't catch up within `pg_stream.wal_transition_timeout` (default 300s), the system falls back to triggers.
+4. **CDC Mode Tracking** — Each source dependency in `pgs_dependencies` carries a `cdc_mode` column (TRIGGER / TRANSITIONING / WAL) and WAL-specific metadata (`slot_name`, `decoder_confirmed_lsn`, `transition_started_at`).
+
+See [plans/adrs/adr-triggers-instead-of-logical-replication.md](../plans/adrs/adr-triggers-instead-of-logical-replication.md) for the original design rationale and [plans/sql/PLAN_HYBRID_CDC.md](../plans/sql/PLAN_HYBRID_CDC.md) for the full implementation plan.
 
 ### 4. DVM Engine (`src/dvm/`)
 
@@ -307,6 +325,7 @@ Provides observability functions:
 - **get_refresh_history** — Per-ST audit trail.
 - **get_staleness** — Current staleness in seconds.
 - **slot_health** — Checks replication slot state and WAL retention.
+- **check_cdc_health** — Per-source CDC health status including mode, slot lag, confirmed LSN, and alerts.
 - **explain_dt** — Describes the DVM plan for a given ST.
 - **Views** — `pgstream.stream_tables_info` (computed staleness) and `pgstream.pg_stat_stream_tables` (combined stats).
 
@@ -320,6 +339,8 @@ Operational events are broadcast via PostgreSQL `NOTIFY` on the `pg_stream_alert
 | `auto_suspended` | ST suspended after `pg_stream.max_consecutive_errors` failures |
 | `reinitialize_needed` | Upstream DDL change detected |
 | `slot_lag_warning` | Replication slot WAL retention is growing |
+| `cdc_transition_complete` | Source transitioned from trigger to WAL-based CDC |
+| `cdc_transition_failed` | Trigger→WAL transition failed (fell back to triggers) |
 | `refresh_completed` | Refresh completed successfully |
 | `refresh_failed` | Refresh failed with an error |
 
@@ -334,7 +355,7 @@ Row IDs are written into every stream table's storage as an internal `__pgs_row_
 
 ### 13. Configuration (`src/config.rs`)
 
-Eight GUC (Grand Unified Configuration) variables control runtime behavior. See [CONFIGURATION.md](CONFIGURATION.md) for details.
+Ten GUC (Grand Unified Configuration) variables control runtime behavior. See [CONFIGURATION.md](CONFIGURATION.md) for details.
 
 | GUC | Default | Purpose |
 |---|---|---|
@@ -346,6 +367,9 @@ Eight GUC (Grand Unified Configuration) variables control runtime behavior. See 
 | `pg_stream.max_concurrent_refreshes` | `4` | Maximum parallel refresh workers |
 | `pg_stream.differential_max_change_ratio` | `0.15` | Change-to-table-size ratio above which DIFFERENTIAL falls back to FULL |
 | `pg_stream.cleanup_use_truncate` | `true` | Use `TRUNCATE` instead of `DELETE` for change buffer cleanup when the entire buffer is consumed |
+| `pg_stream.user_triggers` | `'auto'` | User-defined trigger handling: `auto` / `on` / `off` |
+| `pg_stream.cdc_mode` | `'trigger'` | CDC mechanism: `trigger` / `auto` / `wal` |
+| `pg_stream.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
 
 ---
 
@@ -355,7 +379,14 @@ Eight GUC (Grand Unified Configuration) variables control runtime behavior. See 
  Source Table INSERT/UPDATE/DELETE
            │
            ▼
- Row-Level Trigger (pg_stream_cdc_fn_<oid>)
+ Hybrid CDC Layer:
+   ┌─────────────────────────────────────────────┐
+   │ TRIGGER mode: Row-Level AFTER Trigger        │
+   │   pg_stream_cdc_fn_<oid>() → buffer table    │
+   │                                              │
+   │ WAL mode: Logical Replication Slot           │
+   │   wal_decoder bgworker → same buffer table   │
+   └─────────────────────────────────────────────┘
            │
            ▼
  Change Buffer Table (pgstream_changes.changes_<oid>)
@@ -393,7 +424,7 @@ src/
 │   └── pgrx_embed.rs# pgrx SQL entity embedding (generated)
 ├── api.rs           # SQL API functions (create/alter/drop/refresh/status)
 ├── catalog.rs       # Catalog CRUD operations
-├── cdc.rs           # Change data capture via row-level triggers
+├── cdc.rs           # Change data capture (triggers + WAL transition)
 ├── config.rs        # GUC variable registration
 ├── dag.rs           # Dependency graph (cycle detection, topo sort)
 ├── error.rs         # Centralized error types
@@ -425,7 +456,8 @@ src/
 ├── monitor.rs       # Monitoring & observability functions
 ├── refresh.rs       # Refresh orchestration
 ├── scheduler.rs     # Automatic scheduling with canonical periods
-└── version.rs       # Frontier / LSN tracking
+├── version.rs       # Frontier / LSN tracking
+└── wal_decoder.rs   # WAL-based CDC (logical replication slot polling, transitions)
 ```
 
 ### Extension Control File (`pg_stream.control`)

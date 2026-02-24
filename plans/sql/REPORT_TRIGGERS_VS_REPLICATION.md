@@ -2,7 +2,7 @@
 
 **Status:** Evaluation Report  
 **Date:** 2026-02-24  
-**Context:** [ADR — Triggers Instead of Logical Replication](../adrs/adr-triggers-instead-of-logical-replication.md) · [PLAN_USER_TRIGGERS.md](PLAN_USER_TRIGGERS.md)
+**Context:** [ADR — Triggers Instead of Logical Replication](../adrs/adr-triggers-instead-of-logical-replication.md) · [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
 
 ---
 
@@ -149,7 +149,7 @@ triggers on source tables.
 CDC mechanism**. The solution (`session_replication_role = 'replica'` during
 refresh) works identically regardless of whether changes are captured via
 triggers or logical replication. The existing plan in
-[PLAN_USER_TRIGGERS.md](PLAN_USER_TRIGGERS.md) is sound.
+[PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md) is sound.
 
 **Caveat:** `session_replication_role = 'replica'` may interact with logical
 replication **publishing** from stream tables (see §2.5). This needs
@@ -415,7 +415,7 @@ logical replication (§3.2) are substantial and should not be dismissed.
 
 ### Recommendation 2: Implement User Trigger Suppression
 
-Follow the [PLAN_USER_TRIGGERS.md](PLAN_USER_TRIGGERS.md) plan with one
+Follow the [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md) plan with one
 modification: **test `session_replication_role = 'replica'` interaction with
 PUBLICATION before committing to it**. If it blocks publication, use
 `ALTER TABLE ... DISABLE TRIGGER USER` within a SAVEPOINT instead.

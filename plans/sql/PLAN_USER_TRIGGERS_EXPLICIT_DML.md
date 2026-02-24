@@ -3,7 +3,7 @@
 **Status:** Implemented (Phases 1 & 3 complete; Phase 2 deferred)  
 **Date:** 2026-02-24  
 **Supersedes:** [PLAN_USER_TRIGGER_REPLAY.md](PLAN_USER_TRIGGER_REPLAY.md)  
-**Related:** [PLAN_USER_TRIGGERS.md](PLAN_USER_TRIGGERS.md) (Phase 1 only)  
+**Related:** PLAN_USER_TRIGGERS.md (removed — Phase 1 only)  
 **Effort:** ~3–5 days (3 phases)
 
 ### Implementation Status

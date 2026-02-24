@@ -1,5 +1,7 @@
 # PLAN: Non-Deterministic Function Handling
 
+**Status:** Not started (future work)
+
 ## Problem Statement
 
 pg_stream does not check the volatility of functions used in defining queries. This is a **correctness gap** for DIFFERENTIAL mode: volatile functions (e.g., `random()`, `gen_random_uuid()`, `clock_timestamp()`) produce different values on each evaluation, which breaks delta computation because the DVM engine assumes expressions are deterministic across refreshes.

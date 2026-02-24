@@ -6,7 +6,7 @@ Complete reference for all pg_stream GUC (Grand Unified Configuration) variables
 
 ## Overview
 
-pg_stream exposes six configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_stream exposes ten configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -16,7 +16,7 @@ shared_preload_libraries = 'pg_stream'
 
 The extension **must** be loaded via `shared_preload_libraries` because it registers GUC variables and a background worker at startup.
 
-> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required. CDC uses lightweight row-level triggers, not logical replication slots.
+> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required by default. The default CDC mode (`trigger`) uses lightweight row-level triggers. If you set `pg_stream.cdc_mode = 'auto'` or `'wal'`, then `wal_level = logical` is needed for WAL-based capture (see [pg_stream.cdc_mode](#pg_streamcdc_mode)).
 
 ---
 
