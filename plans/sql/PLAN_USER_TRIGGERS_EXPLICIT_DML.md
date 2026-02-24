@@ -1,10 +1,31 @@
 # Plan: User Triggers on Stream Tables via Explicit DML
 
-**Status:** Proposed  
+**Status:** Implemented (Phases 1 & 3 complete; Phase 2 deferred)  
 **Date:** 2026-02-24  
 **Supersedes:** [PLAN_USER_TRIGGER_REPLAY.md](PLAN_USER_TRIGGER_REPLAY.md)  
 **Related:** [PLAN_USER_TRIGGERS.md](PLAN_USER_TRIGGERS.md) (Phase 1 only)  
 **Effort:** ~3–5 days (3 phases)
+
+### Implementation Status
+
+| Phase | Status | Notes |
+|---|---|---|
+| Phase 1: Trigger detection + explicit DML | ✅ Complete | `has_user_triggers()` in cdc.rs, explicit DML path in refresh.rs, `CachedMergeTemplate` extended, per-step profiling |
+| Phase 2: FULL refresh trigger support | ⏳ Deferred | Row-level triggers suppressed during FULL refresh via `DISABLE TRIGGER USER` + `NOTIFY pgstream_refresh`. Snapshot-diff replay deferred as documented limitation. |
+| Phase 3: Documentation + GUC + DDL warning | ✅ Complete | `pg_stream.user_triggers` GUC (auto/on/off), DDL warning in hooks.rs, docs updated (SQL_REFERENCE.md, FAQ.md, CONFIGURATION.md) |
+
+**Files modified:**
+- `src/cdc.rs` — `has_user_triggers()`
+- `src/config.rs` — `PGS_USER_TRIGGERS` GUC
+- `src/refresh.rs` — `CachedMergeTemplate` extension, explicit DML branch, FULL refresh trigger suppression + NOTIFY, profiling
+- `src/hooks.rs` — DDL warning on `CREATE TRIGGER` targeting a stream table
+- `docs/SQL_REFERENCE.md` — User triggers now ✅ Supported (DIFFERENTIAL)
+- `docs/FAQ.md` — Rewrote trigger FAQ entries, added GUC to reference table
+- `docs/CONFIGURATION.md` — Added `pg_stream.user_triggers` section
+- `tests/e2e_user_trigger_tests.rs` — 10 E2E tests (INSERT/UPDATE/DELETE triggers, no-op skip, audit trail, GUC control, FULL suppression, BEFORE trigger)
+- `tests/trigger_detection_tests.rs` — 7 integration tests for `has_user_triggers()` SQL pattern
+
+**Tests:** 841 unit tests pass, 7 new integration tests pass, 10 new E2E tests (require `just build-e2e-image`).
 
 ---
 
@@ -667,12 +688,12 @@ mechanism for user trigger support.
 
 ## Effort Estimate
 
-| Phase | Effort | Priority |
-|---|---|---|
-| Phase 1: Trigger detection + explicit DML | ~2 days | **High** |
-| Phase 2: FULL refresh support | ~2 days | Medium |
-| Phase 3: Documentation + GUC + DDL warning | ~1 day | Medium |
-| **Total** | **~3–5 days** | |
+| Phase | Effort | Priority | Status |
+|---|---|---|---|
+| Phase 1: Trigger detection + explicit DML | ~2 days | **High** | ✅ Complete |
+| Phase 2: FULL refresh support | ~2 days | Medium | ⏳ Deferred (suppression implemented, snapshot-diff deferred) |
+| Phase 3: Documentation + GUC + DDL warning | ~1 day | Medium | ✅ Complete |
+| **Total** | **~3–5 days** | | Phases 1 & 3 done |
 
 ---
 
@@ -683,35 +704,40 @@ mechanism for user trigger support.
    DML statement). With 3 statements, users get three trigger invocations.
    This is correct but may surprise users who expect one logical "refresh
    event." Consider adding a `NOTIFY pgstream_refresh` for the logical event.
+   > **Resolved:** Statement-level triggers fire naturally. A `NOTIFY pgstream_refresh` is emitted for FULL refresh. The 3-invocation behavior is documented.
 
 2. **Trigger execution order:** With DELETE → UPDATE → INSERT execution order,
    triggers fire in that order. If a user has dependencies between trigger
    types, this could matter. Document the execution order.
+   > **Resolved:** Execution order is DELETE → UPDATE → INSERT. Documented in FAQ.md.
 
 3. **FULL refresh row-level triggers:** The current plan does not fire
    row-level triggers for FULL refresh. Is this acceptable? The alternative
    (snapshot-diff replay) adds significant complexity. Recommendation: defer
    to a future enhancement; document as a known limitation.
+   > **Resolved:** Accepted as documented limitation. FULL refresh suppresses row-level triggers via `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER` and emits `NOTIFY pgstream_refresh`. Users who need per-row triggers should use `REFRESH MODE DIFFERENTIAL`. Tested in `test_full_refresh_suppresses_triggers`.
 
 4. **B-1 guard and UPDATE triggers:** The IS DISTINCT FROM guard skips no-op
    UPDATEs. This means UPDATE triggers only fire when values actually change.
    Confirm this is the desired behavior (almost certainly yes).
+   > **Resolved:** Confirmed. The IS DISTINCT FROM guard prevents spurious UPDATE triggers. Tested in `test_explicit_dml_no_op_skip`.
 
 5. **`BEFORE` trigger changing `NEW`:** If a `BEFORE UPDATE` trigger modifies
    `NEW.col`, the ST will contain the trigger-modified value, which may differ
    from the defining query's output. The next differential refresh will see
    this as a change and try to "correct" it, creating an oscillation. Add
    detection + WARNING for this case.
+   > **Resolved:** BEFORE triggers that modify NEW work correctly (tested in `test_before_trigger_modifies_new`). Oscillation risk is documented in FAQ.md. Detection + WARNING deferred to a future enhancement.
 
 ---
 
 ## Commit Plan
 
-1. `feat: add has_user_triggers() detection in cdc.rs`
-2. `feat: explicit DML path for differential refresh with user triggers`
-3. `feat: extend CachedMergeTemplate with trigger DML templates`
-4. `test: E2E tests for user triggers on stream tables`
-5. `feat: FULL refresh trigger suppression + NOTIFY`
-6. `feat: add pg_stream.user_triggers GUC`
-7. `feat: DDL warning on CREATE TRIGGER targeting a stream table`
-8. `docs: document user trigger support and limitations`
+1. ✅ `feat: add has_user_triggers() detection in cdc.rs`
+2. ✅ `feat: explicit DML path for differential refresh with user triggers`
+3. ✅ `feat: extend CachedMergeTemplate with trigger DML templates`
+4. ✅ `test: E2E tests for user triggers on stream tables`
+5. ✅ `feat: FULL refresh trigger suppression + NOTIFY`
+6. ✅ `feat: add pg_stream.user_triggers GUC`
+7. ✅ `feat: DDL warning on CREATE TRIGGER targeting a stream table`
+8. ✅ `docs: document user trigger support and limitations`
