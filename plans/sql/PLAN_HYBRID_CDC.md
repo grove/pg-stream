@@ -925,3 +925,189 @@ Phases 5 and 6 are follow-up work.
 
 5. **Polling interval for WAL decoder** — Match the scheduler interval (1s) or
    use a separate GUC? A separate GUC allows tuning independently.
+
+---
+
+## Appendix A: Performance Gain Estimates
+
+This appendix estimates the concrete performance impact of migrating from
+trigger-based CDC to WAL-based CDC in steady-state.
+
+### A.1 Current Trigger Overhead Breakdown
+
+Every INSERT/UPDATE/DELETE on a tracked source table executes a PL/pgSQL
+trigger function that performs these steps synchronously — the application's
+transaction cannot commit until all of them complete:
+
+| Step | Estimated Cost | Notes |
+|---|---|---|
+| PL/pgSQL function dispatch | ~0.5–1 μs | Function cache lookup, parameter binding |
+| `pg_current_wal_lsn()` | ~0.2 μs | Lightweight syscall to read WAL position |
+| `pg_stream_hash()` / `pg_stream_hash_multi()` | ~0.5–5 μs | Scales with PK width; composite keys are more expensive |
+| Buffer table heap INSERT | ~1–3 μs | Writes OLD+NEW typed columns (row width dependent) |
+| Buffer table index update | ~0.5–2 μs | Single covering B-tree: `(lsn, pk_hash, change_id) INCLUDE (action)` |
+| `BIGSERIAL` sequence increment | ~0.1–0.3 μs | Lightweight lock on `change_id` sequence |
+| WAL write for buffer row + index | ~0.5–1 μs | Buffer table changes are WAL-logged |
+| **Total per row** | **~4–12 μs** | **~4 μs narrow/INSERT, ~12 μs wide/UPDATE** |
+
+With WAL-based CDC, **all of these steps are eliminated from the write path**.
+PostgreSQL already writes every change to WAL as part of normal operation —
+the WAL decoder reads that log asynchronously in a separate process.
+
+### A.2 Estimated Gains by Workload
+
+#### Single-Row OLTP (e.g., web application INSERT/UPDATE)
+
+```
+Typical row write:  ~20–40 μs (lock + heap + index + WAL fsync)
+Trigger overhead:   ~4–8 μs
+─────────────────────────────
+Trigger % of total: 15–25%
+After hybrid:       ~16–32 μs per row
+Improvement:        15–25% faster per write
+```
+
+**Practical impact: Low.** The trigger overhead is a small fraction of total
+write cost. Single-row OLTP is rarely bottlenecked by CDC overhead.
+
+#### Batch INSERT (ETL, bulk loading)
+
+```
+10,000-row batch INSERT:
+  Without triggers: ~200–400 ms
+  Trigger overhead: ~40–120 ms  (4–12 μs × 10,000)
+  With triggers:    ~240–520 ms
+  After hybrid:     ~200–400 ms
+  Improvement:      1.3–1.5× throughput
+
+100,000-row batch INSERT:
+  Without triggers: ~2–4 sec
+  Trigger overhead: ~400 ms – 1.2 sec
+  With triggers:    ~2.4–5.2 sec
+  After hybrid:     ~2–4 sec
+  Improvement:      1.2–1.3× throughput
+```
+
+**Practical impact: Medium.** Batch workloads accumulate trigger overhead
+linearly. A 100K-row ETL job saves 0.4–1.2 seconds per load cycle. Over many
+cycles per day, this adds up.
+
+#### Wide Tables (20+ columns, JSONB, large TEXT)
+
+Wide tables amplify two costs:
+1. **Hash computation** scales with serialized row width
+2. **Buffer row size** includes all `new_<col>` and `old_<col>` columns
+
+```
+Narrow table (3 INT columns):
+  Trigger overhead: ~4 μs/row
+  Buffer row size:  ~60 bytes
+
+Wide table (20 mixed columns, avg 200 bytes/col):
+  Trigger overhead: ~10–15 μs/row  (hash + large buffer INSERT)
+  Buffer row size:  ~4 KB (OLD + NEW for UPDATE)
+  WAL amplification: 2× (source WAL + buffer WAL)
+
+After hybrid (wide table):
+  Write overhead:    0 μs (eliminated)
+  Buffer row:        Written by background decoder, not in application path
+  WAL amplification: 1× (source WAL only; decoder writes are separate)
+  Improvement:       ~2× throughput for UPDATE-heavy wide-table workloads
+```
+
+**Practical impact: High.** Wide tables see the biggest per-row improvement
+because both hash computation and buffer I/O scale with row width.
+
+#### High Concurrency (50+ writers on the same source table)
+
+Under high concurrency, trigger overhead creates three compounding effects:
+
+1. **Lock hold time increases** — The trigger extends the duration of each
+   row lock, increasing contention windows.
+2. **Sequence contention** — The `change_id BIGSERIAL` requires a lightweight
+   lock for each increment. Under 50+ concurrent writers, this becomes
+   measurable (~1–2% of total time).
+3. **Buffer table index page splits** — Concurrent inserts into the buffer
+   table's B-tree index cause page splits and lock waits.
+
+```
+50 concurrent writers, narrow table, INSERT-only:
+  With triggers:    ~3,000–5,000 rows/sec aggregate
+  After hybrid:     ~8,000–15,000 rows/sec aggregate
+  Improvement:      2–3× throughput
+
+50 concurrent writers, wide table, mixed DML:
+  With triggers:    ~1,500–3,000 rows/sec aggregate
+  After hybrid:     ~5,000–10,000 rows/sec aggregate
+  Improvement:      2–3× throughput
+```
+
+**Practical impact: High.** This is where the hybrid approach delivers its
+largest wins. The synchronous overhead compounds under concurrency.
+
+#### TRUNCATE + Bulk Reload (ETL pattern)
+
+| Aspect | Triggers | WAL-based |
+|---|---|---|
+| TRUNCATE captured | ❌ No — stream table goes stale | ✅ Yes — native WAL event |
+| Recovery | Manual: `SELECT pgstream.refresh_stream_table('...')` | Automatic: decoder captures TRUNCATE, marks reinit |
+| Performance | N/A (correctness issue, not perf) | N/A |
+
+**Practical impact: Critical for ETL users.** This is a correctness fix, not
+a performance improvement, but it eliminates a significant operational burden.
+
+### A.3 Write Amplification Comparison
+
+The trigger approach writes every change **twice** — once to the source table
+(normal PostgreSQL behavior) and once to the buffer table. Both writes generate
+WAL. The buffer table also has an index that generates additional WAL.
+
+```
+Trigger-based CDC:
+  Source table:  1× heap write + 1× index write + WAL
+  Buffer table:  1× heap write + 1× index write + WAL
+  Total WAL:     ~2–3× a normal write
+
+WAL-based CDC:
+  Source table:  1× heap write + 1× index write + WAL
+  Buffer table:  Written by background decoder (not in application path)
+  Total application-path WAL: 1× (normal)
+  Total system WAL: ~1.2× (decoder writes are batched, more efficient)
+```
+
+**Disk I/O reduction: ~40–60%** of CDC-related write amplification eliminated
+from the application's write path. The WAL decoder still writes to buffer
+tables, but this happens in a separate process and can be batched.
+
+### A.4 What Hybrid CDC Does NOT Improve
+
+| Aspect | Why Unchanged |
+|---|---|
+| **Refresh time** | The MERGE/DVM pipeline reads from the same buffer tables regardless of how they were populated. Differential and FULL refresh performance is unchanged. |
+| **Read performance** | Stream table query speed depends on the storage table and indexes, not on the CDC mechanism. |
+| **Buffer drain speed** | The scheduler still reads from buffer tables via the same LSN-range queries. |
+| **Zero-change detection** | Both approaches check for empty buffers (~3 ms). No difference. |
+| **Memory usage** | Trigger approach: PL/pgSQL function cache. WAL approach: decoder process memory. Both are modest (<10 MB per source). |
+| **DVM computation** | Delta SQL generation and operator differentiation are independent of CDC. |
+
+### A.5 Summary
+
+| Workload Pattern | Source-Write Improvement | System-Wide Impact |
+|---|---|---|
+| Single-row OLTP (<100 rows/sec) | 15–25% faster writes | **Low** — rarely the bottleneck |
+| Batch INSERT (1K–100K rows) | 1.3–1.5× throughput | **Medium** — saves seconds per ETL cycle |
+| Wide tables (20+ columns) | ~2× throughput | **High** — biggest per-row win |
+| High concurrency (50+ writers) | 2–3× throughput | **High** — biggest aggregate win |
+| TRUNCATE patterns | Correctness fix | **Critical** — eliminates stale-data risk |
+| Low-volume, narrow tables | ~15% faster writes | **Negligible** — not worth the complexity alone |
+
+**Overall estimate for the "average" pg_stream user (moderate writes, <20
+columns, <10 concurrent writers): 20–40% faster source-table writes.**
+
+**For high-throughput users (batch ETL, wide tables, 50+ concurrent writers):
+2–3× faster source-table writes.**
+
+> **Note:** These estimates are analytical, based on per-component cost
+> modeling. The [TRIGGERS_OVERHEAD.md](../performance/TRIGGERS_OVERHEAD.md)
+> benchmark plan will provide empirical measurements to validate or revise
+> these numbers.
