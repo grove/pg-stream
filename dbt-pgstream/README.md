@@ -195,15 +195,52 @@ columns:
 See [AGENTS.md](../AGENTS.md) for development guidelines and the
 [implementation plan](../plans/dbt/PLAN_DBT_MACRO.md) for design rationale.
 
-To run integration tests:
+### Running tests locally
+
+The quickest way (requires Docker and dbt installed):
 
 ```bash
+# Full run — builds Docker image, starts container, runs tests, cleans up
+just test-dbt
+
+# Fast run — reuses existing Docker image (run after first build)
+just test-dbt-fast
+```
+
+Or use the script directly with options:
+
+```bash
+cd dbt-pgstream/integration_tests/scripts
+
+# Default: builds image, runs tests with dbt 1.9, cleans up
+./run_dbt_tests.sh
+
+# Skip image rebuild (faster iteration)
+./run_dbt_tests.sh --skip-build
+
+# Keep the container running after tests (for debugging)
+./run_dbt_tests.sh --skip-build --keep-container
+
+# Use a specific dbt version
+DBT_VERSION=1.6 ./run_dbt_tests.sh --skip-build
+
+# Use a custom port (avoids conflicts with local PostgreSQL)
+PGPORT=25432 ./run_dbt_tests.sh
+```
+
+### Manual testing against an existing pg_stream instance
+
+If you already have PostgreSQL 18 + pg_stream running locally:
+
+```bash
+export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=postgres
 cd dbt-pgstream/integration_tests
 dbt deps
 dbt seed
 dbt run
 ./scripts/wait_for_populated.sh order_totals 30
 dbt test
+dbt run-operation drop_all_stream_tables
 ```
 
 ## License

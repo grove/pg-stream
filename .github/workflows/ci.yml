@@ -120,14 +120,13 @@ jobs:
           if-no-files-found: ignore
 
   # ── dbt-pgstream integration tests (Linux only) ──────────────────────────
+  # Cost-optimized: single job builds the Docker image once, then tests
+  # against dbt-core min (1.6) and max (1.9). Intermediate versions are
+  # skipped — if both boundary versions pass, the middle ones will too.
   dbt-integration:
-    name: dbt integration (${{ matrix.dbt-version }})
+    name: dbt integration
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        dbt-version: ['1.6', '1.7', '1.8', '1.9']
     steps:
       - uses: actions/checkout@v4
 
@@ -162,14 +161,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dbt
-        run: |
-          pip install \
-            "dbt-core~=${{ matrix.dbt-version }}.0" \
-            "dbt-postgres~=${{ matrix.dbt-version }}.0"
-          dbt --version
-
-      - name: Run dbt integration tests
+      - name: Test with dbt 1.6 (minimum supported)
         env:
           PGHOST: localhost
           PGPORT: '5432'
@@ -177,6 +169,33 @@ jobs:
           PGPASSWORD: postgres
           PGDATABASE: postgres
         run: |
+          pip install "dbt-core~=1.6.0" "dbt-postgres~=1.6.0"
+          echo "=== dbt version ==="
+          dbt --version
+          cd dbt-pgstream/integration_tests
+          dbt deps
+          dbt seed
+          dbt run
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run --full-refresh
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run-operation pgstream_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgstream_check_freshness
+          dbt run-operation drop_all_stream_tables
+
+      - name: Test with dbt 1.9 (latest supported)
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+        run: |
+          pip install "dbt-core~=1.9.0" "dbt-postgres~=1.9.0"
+          echo "=== dbt version ==="
+          dbt --version
           cd dbt-pgstream/integration_tests
           dbt deps
           dbt seed

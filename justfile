@@ -78,6 +78,16 @@ test-pgrx:
 # Run all tests (unit + integration + E2E + pgrx)
 test-all: test-unit test-integration test-e2e test-pgrx
 
+# ── dbt Tests ─────────────────────────────────────────────────────────────
+
+# Run dbt-pgstream integration tests locally (builds Docker image)
+test-dbt:
+    ./dbt-pgstream/integration_tests/scripts/run_dbt_tests.sh
+
+# Run dbt tests without rebuilding the Docker image
+test-dbt-fast:
+    ./dbt-pgstream/integration_tests/scripts/run_dbt_tests.sh --skip-build
+
 # ── Benchmarks ────────────────────────────────────────────────────────────
 
 # Run all criterion benchmarks

@@ -123,12 +123,14 @@ Three test tiers, each with its own infrastructure:
 | Unit | `src/**` (`#[cfg(test)]`) | `just test-unit` | No |
 | Integration | `tests/*_tests.rs` (not `e2e_*`) | `just test-integration` | Yes (Testcontainers) |
 | E2E | `tests/e2e_*_tests.rs` | `just test-e2e` | Yes (custom Docker image) |
+| dbt | `dbt-pgstream/integration_tests/` | `just test-dbt` | Yes (Docker + dbt) |
 
 - Shared helpers live in `tests/common/mod.rs`.
 - E2E Docker images are built from `tests/Dockerfile.e2e`.
 - Use `#[tokio::test]` for all integration/E2E tests.
 - Name tests: `test_<component>_<scenario>_<expected>`.
 - Test both success and failure paths.
+- dbt tests use `just test-dbt-fast` to skip Docker image rebuild.
 
 ---
 
