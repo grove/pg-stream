@@ -1130,6 +1130,89 @@ from the change event table (Phase 2), not as real PostgreSQL triggers.
 
 ---
 
+## Performance Consequences of Tier 1 (Change Event Table)
+
+The snapshot-diff mechanism adds overhead at three points in each refresh
+cycle. This cost is **only incurred when `trigger_replay_enabled = true` AND
+the ST has user-defined triggers**. STs without user triggers pay zero cost.
+
+### P-1: Delta query evaluated twice
+
+`get_affected_row_ids()` executes the delta SQL to extract `__pgs_row_id`
+values, then the MERGE re-executes the same delta SQL internally. For a delta
+query that takes 5 ms today, this adds ~5 ms. This is the **dominant cost** —
+the delta involves reading change buffers, joining source tables, and computing
+hashes.
+
+### P-2: Two snapshot reads of the stream table
+
+Pre-MERGE and post-MERGE each execute:
+
+```sql
+SELECT __pgs_row_id, row_to_json(t.*)
+FROM <st> t
+WHERE __pgs_row_id IN (<affected_ids>)
+```
+
+This is an index scan per affected row plus JSON serialization. For a typical
+aggregate ST where a refresh touches 5–50 groups, this is sub-millisecond. For
+a wide ST with 1 000+ changed rows, expect 2–10 ms per snapshot.
+
+### P-3: Change event writes
+
+One `INSERT` per change into `pgstream.st_changes_<pgs_id>` with two JSONB
+columns. For 10 change events: ~0.5 ms. Negligible.
+
+### P-4: FULL refresh amplification
+
+FULL refresh is the worst case. Both snapshots read the **entire** ST
+(`SELECT row_to_json(t.*) FROM st`). A 100K-row ST means ~200K `row_to_json`
+calls — potentially 50–200 ms of added overhead.
+
+### Estimated overhead by scenario
+
+| Scenario | Current refresh | With Tier 1 | Overhead |
+|---|---|---|---|
+| Aggregate ST, 5 groups changed | ~8 ms | ~14 ms | ~75% (P-1 dominates) |
+| Join ST, 200 rows changed | ~15 ms | ~25 ms | ~65% |
+| FULL refresh, 10K-row ST | ~50 ms | ~90 ms | ~80% (P-4, full scan ×2) |
+| No user triggers on ST | unchanged | unchanged | **0%** (skipped entirely) |
+
+### Mitigation: temp-table delta materialization
+
+The double delta evaluation (P-1) can be eliminated by materializing the delta
+into a temporary table and using it for both the row-ID extraction and as the
+MERGE source:
+
+```sql
+CREATE TEMP TABLE __pgs_delta_<pgs_id> AS (<delta_sql>);
+-- Use __pgs_delta_<pgs_id> for both snapshot IDs and MERGE USING clause
+```
+
+This adds temp-table creation/drop overhead (~2–3 ms) but removes the full
+delta re-evaluation. Net win for deltas that take >5 ms to compute. Should be
+added as an optimization when `trigger_replay_enabled = true`.
+
+### Tier 2 (Phase 3) additional cost
+
+Phase 3's DML replay adds further overhead on top of Tier 1:
+
+| Operation | Cost per row | Notes |
+|---|---|---|
+| UPDATE replay (restore old + apply new) | ~0.1–0.3 ms | Two UPDATEs per changed row; fires trigger |
+| INSERT replay (delete + re-insert) | ~0.1–0.2 ms | Wrapped in SAVEPOINT for crash safety |
+| DELETE replay (insert old + delete) | ~0.1–0.2 ms | Wrapped in SAVEPOINT for crash safety |
+| `DISABLE/ENABLE TRIGGER USER` per batch | ~0.5–1 ms | ACCESS EXCLUSIVE lock, taken twice |
+
+For a typical aggregate ST with 5–10 changes per refresh, Phase 3 adds
+~1–3 ms. For large change sets (1 000+ rows), Phase 3 could add 100–300 ms —
+at that scale, Tier 1's change event table is the better choice.
+
+> **Note:** These estimates are analytical. Empirical benchmarks should be
+> added to the test suite once Phase 2 is implemented.
+
+---
+
 ## Risk Assessment
 
 | Risk | Likelihood | Impact | Mitigation |
