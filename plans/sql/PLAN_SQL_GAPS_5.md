@@ -766,25 +766,42 @@ interleaved — C-1 is a prerequisite for C-2 and C-4, but C-3 is independent.
 
 ---
 
-### C5. Recommended Approach: Hybrid
+### C5. Decision: Detection + Smart Reinit (Option 2) — ACCEPTED
 
-1. **Implement Detection + Smart Reinit first** (C-1 + C-2). This benefits the
-   entire system — not just new features — by eliminating unnecessary reinits
-   for benign DDL and enabling precise change classification. The infrastructure
-   is already partially built; completing it is ~7–9 hours.
+**Option 2 is the accepted approach.** Option 1 (DDL Blocking) is available as
+an optional strict mode for conservative deployments, but the primary mechanism
+is Detection + Smart Reinit.
 
-2. **Add DDL Blocking as an optional strict mode** (C-3). Offer
+**Rationale:**
+
+1. **Pragmatic for real-world workflows.** Production databases evolve — columns
+   get added, types get widened, indexes change. Blocking `ALTER TABLE` on any
+   source table used by a stream table would force users to drop all dependent
+   stream tables before any schema migration.
+
+2. **Infrastructure already ~60% built.** `columns_used TEXT[]` exists in the
+   catalog schema, `detect_schema_change_kind()` exists with tests, and
+   `resolve_columns()` already resolves full column metadata. Completing the
+   wiring is ~4–5 hours.
+
+3. **Benefits the entire system.** Today, *any* `ALTER TABLE` on a source (even
+   adding a comment or index) triggers full reinitialization of all dependent
+   stream tables. With smart detection, benign changes skip reinit entirely —
+   a performance win for all users regardless of schema-dependent features.
+
+**Implementation order:**
+
+1. **Detection + Smart Reinit first** (C-1 + C-2). Wire existing infrastructure,
+   add column snapshots. ~7–9 hours total.
+
+2. **DDL Blocking as opt-in strict mode** (C-3). Offer
    `pg_stream.block_source_ddl = true` for production deployments where source
-   schemas are stable and users want guaranteed correctness. Default to `false`
-   so existing behavior is preserved.
+   schemas are stable. Default to `false`.
 
-3. **Then implement NATURAL JOIN and keyless tables** (C-4 + C-5). With the
-   safety net in place, these features can be offered with confidence. NATURAL
-   JOIN gets a reinit-aware column resolution that detects and warns about
-   semantic drift. Keyless tables get a PK-aware row identity strategy that
-   switches automatically on constraint changes.
+3. **Schema-dependent features** (C-4 + C-5). NATURAL JOIN with reinit-aware
+   column resolution, keyless tables with PK-aware row identity.
 
-This hybrid approach gives users a spectrum of safety:
+This gives users a spectrum of safety:
 
 | User Profile | Configuration | Behavior |
 |-------------|---------------|----------|
