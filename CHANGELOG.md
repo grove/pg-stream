@@ -52,14 +52,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Stream table restrictions** — user triggers on stream tables upgraded from
   "⚠️ Unsupported" to "✅ Supported (DIFFERENTIAL mode)".
 
----
-
-## [0.1.0] — 2026-02-23
-
-Initial release of pg_stream.
-
-### Added
-
 #### Core Engine
 - **Declarative stream tables** — define a SQL query and a schedule; the
   extension handles automatic refresh.
