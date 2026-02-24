@@ -105,6 +105,17 @@ pub static PGS_CDC_MODE: GucSetting<Option<std::ffi::CString>> =
 /// transition from triggers to WAL-based CDC before falling back to triggers.
 pub static PGS_WAL_TRANSITION_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(300);
 
+/// When true, schema-altering DDL (column ADD/DROP/RENAME/ALTER TYPE) on
+/// source tables used by stream tables is blocked with an ERROR instead of
+/// triggering reinitialization.
+///
+/// Benign DDL (CREATE INDEX, COMMENT ON, ALTER TABLE SET STATISTICS) and
+/// constraint-only changes are always allowed regardless of this setting.
+///
+/// Useful for production deployments where source schemas are stable and
+/// accidental column changes should be prevented.
+pub static PGS_BLOCK_SOURCE_DDL: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -262,6 +273,18 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        c"pg_stream.block_source_ddl",
+        c"Block column-altering DDL on source tables used by stream tables.",
+        c"When true, ALTER TABLE that adds, drops, renames, or changes the type of a column \
+           on a source table will ERROR instead of triggering reinitialization. \
+           Benign DDL (indexes, comments, statistics) and constraint changes are always allowed. \
+           Useful for production deployments where source schemas should be stable.",
+        &PGS_BLOCK_SOURCE_DDL,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -351,6 +374,11 @@ pub fn pg_stream_cdc_mode() -> String {
 /// Returns the WAL transition timeout in seconds.
 pub fn pg_stream_wal_transition_timeout() -> i32 {
     PGS_WAL_TRANSITION_TIMEOUT.get()
+}
+
+/// Returns whether source DDL blocking is enabled.
+pub fn pg_stream_block_source_ddl() -> bool {
+    PGS_BLOCK_SOURCE_DDL.get()
 }
 
 /// Ratio of delta / stream-table size above which `auto` strategy

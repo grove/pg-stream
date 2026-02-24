@@ -206,6 +206,17 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
                 );
             }
             SchemaChangeKind::ColumnChange => {
+                // S8: When block_source_ddl GUC is enabled, ERROR instead of reinit.
+                if config::pg_stream_block_source_ddl() {
+                    pgrx::error!(
+                        "pg_stream: ALTER TABLE on {} blocked — column-affecting DDL is not \
+                         allowed on source tables tracked by stream tables when \
+                         pg_stream.block_source_ddl = true. Set pg_stream.block_source_ddl = \
+                         false to allow schema changes (triggers reinitialization).",
+                        identity,
+                    );
+                }
+
                 if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
                     pgrx::warning!(
                         "pg_stream_ddl_tracker: failed to mark ST {} for reinit: {}",
@@ -643,14 +654,37 @@ pub enum SchemaChangeKind {
 /// Detect the kind of schema change by comparing stored column metadata
 /// against the current catalog state.
 ///
-/// `source_oid` is the OID of the upstream table that was altered.
-/// Returns `ColumnChange` if columns differ from what the ST was built with,
-/// `Benign` otherwise.
+/// When a column snapshot exists (S7), performs precise comparison:
+/// - Missing columns → `ColumnChange`
+/// - Type OID changed → `ColumnChange`
+/// - New columns added → `ColumnChange` (may affect NATURAL JOIN, SELECT *)
+/// - Same fingerprint → `Benign` (fast path)
+/// - All match → `ConstraintChange` (e.g., PK/unique constraint changes)
+///
+/// Without snapshots, falls back to checking `columns_used` existence.
 pub fn detect_schema_change_kind(
     source_oid: pg_sys::Oid,
     pgs_id: i64,
 ) -> Result<SchemaChangeKind, PgStreamError> {
-    // Get the columns the ST's defining query references from this source.
+    // Fast path: compare schema fingerprints.
+    // If the stored fingerprint matches the current one, nothing column-related changed.
+    if let Ok(Some(stored_fp)) = crate::catalog::get_schema_fingerprint(pgs_id, source_oid)
+        && !stored_fp.is_empty()
+        && let Ok((_, current_fp)) = crate::catalog::build_column_snapshot(source_oid)
+        && stored_fp == current_fp
+    {
+        return Ok(SchemaChangeKind::Benign);
+    }
+
+    // Detailed path: compare stored column snapshot against current pg_attribute.
+    if let Ok(Some(snapshot)) = crate::catalog::get_column_snapshot(pgs_id, source_oid)
+        && let serde_json::Value::Array(ref entries) = snapshot.0
+        && !entries.is_empty()
+    {
+        return detect_from_snapshot(source_oid, entries);
+    }
+
+    // Legacy fallback: no snapshot available — use columns_used presence check.
     let tracked_cols = get_tracked_columns(pgs_id, source_oid)?;
 
     if tracked_cols.is_empty() {
@@ -677,6 +711,70 @@ pub fn detect_schema_change_kind(
     }
 
     // All tracked columns still exist — likely a benign change.
+    Ok(SchemaChangeKind::ConstraintChange)
+}
+
+/// Compare a stored column snapshot against the current `pg_attribute` state.
+///
+/// Detects: columns dropped, columns added, type OID changed.
+fn detect_from_snapshot(
+    source_oid: pg_sys::Oid,
+    stored_entries: &[serde_json::Value],
+) -> Result<SchemaChangeKind, PgStreamError> {
+    // Build a map of current columns: name → type_oid
+    let current_cols: std::collections::HashMap<String, i64> = Spi::connect(|client| {
+        let sql = format!(
+            "SELECT attname::text, atttypid::bigint \
+             FROM pg_attribute \
+             WHERE attrelid = {} AND attnum > 0 AND NOT attisdropped \
+             ORDER BY attnum",
+            source_oid.to_u32(),
+        );
+        let result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        let mut map = std::collections::HashMap::new();
+        for row in result {
+            let name: String = row
+                .get(1)
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .unwrap_or_default();
+            let type_oid: i64 = row
+                .get(2)
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .unwrap_or(0);
+            map.insert(name, type_oid);
+        }
+        Ok(map)
+    })?;
+
+    // Check each stored column still exists with the same type.
+    for entry in stored_entries {
+        let name = entry["name"].as_str().unwrap_or("");
+        let stored_type = entry["type_oid"].as_i64().unwrap_or(0);
+
+        match current_cols.get(name) {
+            None => return Ok(SchemaChangeKind::ColumnChange), // dropped
+            Some(&current_type) if current_type != stored_type => {
+                return Ok(SchemaChangeKind::ColumnChange); // type changed
+            }
+            _ => {} // matches
+        }
+    }
+
+    // Check if new columns were added (may affect NATURAL JOIN, SELECT *).
+    let stored_names: std::collections::HashSet<&str> = stored_entries
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+
+    for name in current_cols.keys() {
+        if !stored_names.contains(name.as_str()) {
+            return Ok(SchemaChangeKind::ColumnChange); // new column added
+        }
+    }
+
+    // Column set is identical — this is a constraint-only change.
     Ok(SchemaChangeKind::ConstraintChange)
 }
 

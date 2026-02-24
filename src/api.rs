@@ -214,10 +214,37 @@ fn create_stream_table_impl(
         .map(|pr| pr.source_columns_used())
         .unwrap_or_default();
 
-    // Insert dependency edges
+    // Insert dependency edges with column snapshots for schema change detection.
     for (source_oid, source_type) in &source_relids {
         let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
-        StDependency::insert(pgs_id, *source_oid, source_type, cols)?;
+
+        // Build column snapshot + fingerprint for TABLE sources.
+        // Views and stream tables don't need snapshots since their schema
+        // is derived from their own defining queries.
+        let (snapshot, fingerprint) = if source_type == "TABLE" {
+            match crate::catalog::build_column_snapshot(*source_oid) {
+                Ok((s, f)) => (Some(s), Some(f)),
+                Err(e) => {
+                    pgrx::debug1!(
+                        "pg_stream: failed to build column snapshot for source {}: {}",
+                        source_oid.to_u32(),
+                        e,
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        StDependency::insert_with_snapshot(
+            pgs_id,
+            *source_oid,
+            source_type,
+            cols,
+            snapshot,
+            fingerprint,
+        )?;
     }
 
     // ── Phase 2: CDC setup (change buffer tables + triggers + tracking) ──
@@ -695,13 +722,8 @@ fn setup_cdc_for_source(
         // Resolve all source columns for typed change buffer
         let col_defs = cdc::resolve_source_column_defs(source_oid)?;
 
-        // Create the change buffer table (with typed columns + pk_hash if PK exists)
-        cdc::create_change_buffer_table(
-            source_oid,
-            change_schema,
-            !pk_columns.is_empty(),
-            &col_defs,
-        )?;
+        // Create the change buffer table (with typed columns + pk_hash always)
+        cdc::create_change_buffer_table(source_oid, change_schema, &col_defs)?;
 
         // Create the CDC trigger on the source table (typed per-column INSERTs)
         let trigger_name =

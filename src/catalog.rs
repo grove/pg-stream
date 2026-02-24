@@ -80,6 +80,12 @@ pub struct StDependency {
     pub source_relid: pg_sys::Oid,
     pub source_type: String,
     pub columns_used: Option<Vec<String>>,
+    /// JSONB snapshot of source columns at creation time.
+    /// Array of `{"name":"col","type_oid":23,"ordinal":1}` objects.
+    /// Stored as `serde_json::Value` since `pgrx::JsonB` does not implement `Clone`.
+    pub column_snapshot: Option<serde_json::Value>,
+    /// SHA-256 fingerprint of the serialized column snapshot for fast equality checks.
+    pub schema_fingerprint: Option<String>,
     /// Current CDC mechanism for this source.
     pub cdc_mode: CdcMode,
     /// Name of the replication slot (NULL when using triggers).
@@ -562,16 +568,31 @@ impl StDependency {
         source_type: &str,
         columns_used: Option<Vec<String>>,
     ) -> Result<(), PgStreamError> {
+        Self::insert_with_snapshot(pgs_id, source_relid, source_type, columns_used, None, None)
+    }
+
+    /// Insert a dependency edge with column snapshot and schema fingerprint.
+    pub fn insert_with_snapshot(
+        pgs_id: i64,
+        source_relid: pg_sys::Oid,
+        source_type: &str,
+        columns_used: Option<Vec<String>>,
+        column_snapshot: Option<pgrx::JsonB>,
+        schema_fingerprint: Option<String>,
+    ) -> Result<(), PgStreamError> {
         Spi::run_with_args(
             "INSERT INTO pgstream.pgs_dependencies \
-             (pgs_id, source_relid, source_type, cdc_mode, columns_used) \
-             VALUES ($1, $2, $3, 'TRIGGER', $4) \
+             (pgs_id, source_relid, source_type, cdc_mode, columns_used, \
+              column_snapshot, schema_fingerprint) \
+             VALUES ($1, $2, $3, 'TRIGGER', $4, $5, $6) \
              ON CONFLICT DO NOTHING",
             &[
                 pgs_id.into(),
                 source_relid.into(),
                 source_type.into(),
                 columns_used.into(),
+                column_snapshot.into(),
+                schema_fingerprint.into(),
             ],
         )
         .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
@@ -616,7 +637,8 @@ impl StDependency {
                 .select(
                     "SELECT pgs_id, source_relid, source_type, columns_used, \
                             cdc_mode, slot_name, decoder_confirmed_lsn::text, \
-                            transition_started_at::text \
+                            transition_started_at::text, column_snapshot, \
+                            schema_fingerprint \
                      FROM pgstream.pgs_dependencies WHERE pgs_id = $1",
                     None,
                     &[pgs_id.into()],
@@ -637,11 +659,15 @@ impl StDependency {
                 let slot_name = row.get::<String>(6).map_err(map_spi)?;
                 let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
                 let transition_started_at = row.get::<String>(8).map_err(map_spi)?;
+                let column_snapshot = row.get::<pgrx::JsonB>(9).map_err(map_spi)?.map(|jb| jb.0);
+                let schema_fingerprint = row.get::<String>(10).map_err(map_spi)?;
                 result.push(StDependency {
                     pgs_id,
                     source_relid,
                     source_type,
                     columns_used,
+                    column_snapshot,
+                    schema_fingerprint,
                     cdc_mode: CdcMode::from_str(&cdc_mode_str),
                     slot_name,
                     decoder_confirmed_lsn,
@@ -659,7 +685,8 @@ impl StDependency {
                 .select(
                     "SELECT pgs_id, source_relid, source_type, columns_used, \
                             cdc_mode, slot_name, decoder_confirmed_lsn::text, \
-                            transition_started_at::text \
+                            transition_started_at::text, column_snapshot, \
+                            schema_fingerprint \
                      FROM pgstream.pgs_dependencies",
                     None,
                     &[],
@@ -680,11 +707,15 @@ impl StDependency {
                 let slot_name = row.get::<String>(6).map_err(map_spi)?;
                 let decoder_confirmed_lsn = row.get::<String>(7).map_err(map_spi)?;
                 let transition_started_at = row.get::<String>(8).map_err(map_spi)?;
+                let column_snapshot = row.get::<pgrx::JsonB>(9).map_err(map_spi)?.map(|jb| jb.0);
+                let schema_fingerprint = row.get::<String>(10).map_err(map_spi)?;
                 result.push(StDependency {
                     pgs_id,
                     source_relid,
                     source_type,
                     columns_used,
+                    column_snapshot,
+                    schema_fingerprint,
                     cdc_mode: CdcMode::from_str(&cdc_mode_str),
                     slot_name,
                     decoder_confirmed_lsn,
@@ -694,6 +725,109 @@ impl StDependency {
             Ok(result)
         })
     }
+}
+
+// ── Column snapshot helpers ────────────────────────────────────────────────
+
+/// Build a JSONB column snapshot and SHA-256 fingerprint for a source table.
+///
+/// Queries `pg_attribute` for the current column set (name, type OID, ordinal
+/// position) and returns `(snapshot_jsonb, sha256_hex)`.
+///
+/// The snapshot is a JSON array of objects:
+/// ```json
+/// [{"name":"id","type_oid":23,"ordinal":1},{"name":"val","type_oid":25,"ordinal":2}]
+/// ```
+///
+/// Used at creation time to record the source schema in `pgs_dependencies`
+/// so `detect_schema_change_kind()` can compare against the current catalog.
+#[cfg(not(test))]
+pub fn build_column_snapshot(
+    source_oid: pg_sys::Oid,
+) -> Result<(pgrx::JsonB, String), PgStreamError> {
+    use sha2::{Digest, Sha256};
+
+    let sql = format!(
+        "SELECT attname::text, atttypid::int, attnum::int \
+         FROM pg_attribute \
+         WHERE attrelid = {} AND attnum > 0 AND NOT attisdropped \
+         ORDER BY attnum",
+        source_oid.to_u32(),
+    );
+
+    let entries: Vec<serde_json::Value> = Spi::connect(|client| {
+        let result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in result {
+            let name: String = row
+                .get(1)
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .unwrap_or_default();
+            let type_oid: i32 = row
+                .get(2)
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .unwrap_or(0);
+            let ordinal: i32 = row
+                .get(3)
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .unwrap_or(0);
+            out.push(serde_json::json!({
+                "name": name,
+                "type_oid": type_oid,
+                "ordinal": ordinal,
+            }));
+        }
+        Ok(out)
+    })?;
+
+    let json_str = serde_json::to_string(&entries)
+        .map_err(|e| PgStreamError::InternalError(format!("JSON serialization failed: {e}")))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(json_str.as_bytes());
+    let fingerprint = format!("{:x}", hasher.finalize());
+
+    let snapshot = pgrx::JsonB(serde_json::Value::Array(entries));
+    Ok((snapshot, fingerprint))
+}
+
+/// Test-only stub: SPI is unavailable in unit tests.
+#[cfg(test)]
+pub fn build_column_snapshot(
+    _source_oid: pg_sys::Oid,
+) -> Result<(pgrx::JsonB, String), PgStreamError> {
+    let empty = serde_json::Value::Array(vec![]);
+    Ok((pgrx::JsonB(empty), String::new()))
+}
+
+/// Get the stored column snapshot for a dependency pair.
+///
+/// Returns `None` if no snapshot is stored.
+pub fn get_column_snapshot(
+    pgs_id: i64,
+    source_oid: pg_sys::Oid,
+) -> Result<Option<pgrx::JsonB>, PgStreamError> {
+    Spi::get_one_with_args::<pgrx::JsonB>(
+        "SELECT column_snapshot FROM pgstream.pgs_dependencies \
+         WHERE pgs_id = $1 AND source_relid = $2",
+        &[pgs_id.into(), source_oid.into()],
+    )
+    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+}
+
+/// Get the stored schema fingerprint for a dependency pair.
+pub fn get_schema_fingerprint(
+    pgs_id: i64,
+    source_oid: pg_sys::Oid,
+) -> Result<Option<String>, PgStreamError> {
+    Spi::get_one_with_args::<String>(
+        "SELECT schema_fingerprint FROM pgstream.pgs_dependencies \
+         WHERE pgs_id = $1 AND source_relid = $2",
+        &[pgs_id.into(), source_oid.into()],
+    )
+    .map_err(|e| PgStreamError::SpiError(e.to_string()))
 }
 
 // ── Refresh history CRUD ───────────────────────────────────────────────────

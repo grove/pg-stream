@@ -117,6 +117,8 @@ CREATE TABLE IF NOT EXISTS pgstream.pgs_dependencies (
     source_relid OID NOT NULL,
     source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW')),
     columns_used TEXT[],
+    column_snapshot JSONB,
+    schema_fingerprint TEXT,
     cdc_mode     TEXT NOT NULL DEFAULT 'TRIGGER'
                   CHECK (cdc_mode IN ('TRIGGER', 'TRANSITIONING', 'WAL')),
     slot_name    TEXT,
