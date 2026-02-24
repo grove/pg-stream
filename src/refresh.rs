@@ -1100,6 +1100,20 @@ pub fn execute_differential_refresh(
         }
     };
 
+    // When user_triggers = 'off' but there ARE user triggers on the ST,
+    // suppress them during the MERGE to prevent spurious firing.
+    let suppress_triggers =
+        user_triggers_mode.as_str() == "off" && crate::cdc::has_user_triggers(dt.pgs_relid)?;
+    if suppress_triggers {
+        let quoted_table = format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\""),
+        );
+        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    }
+
     // ── B-3: Strategy selection ──────────────────────────────────────
     // Choose between MERGE and DELETE+INSERT based on the GUC setting.
     //
@@ -1254,6 +1268,17 @@ pub fn execute_differential_refresh(
         })?;
         (n, "merge")
     };
+
+    // Re-enable user triggers if they were suppressed (GUC = 'off').
+    if suppress_triggers {
+        let quoted_table = format!(
+            "\"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\""),
+        );
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    }
 
     let t2 = Instant::now();
 

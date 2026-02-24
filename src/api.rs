@@ -396,17 +396,39 @@ fn execute_manual_refresh(
 }
 
 /// Execute a FULL manual refresh: truncate + repopulate from the defining query.
+///
+/// When user triggers are detected (and the GUC is not `"off"`), they are
+/// suppressed during the TRUNCATE + INSERT via `DISABLE TRIGGER USER` /
+/// `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so
+/// listeners know a FULL refresh occurred.
 fn execute_manual_full_refresh(
     dt: &StreamTableMeta,
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<(), PgStreamError> {
-    let truncate_sql = format!(
-        "TRUNCATE {}.{}",
+    let quoted_table = format!(
+        "{}.{}",
         quote_identifier(schema),
         quote_identifier(table_name),
     );
+
+    // Check for user triggers to suppress during FULL refresh.
+    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let has_triggers = match user_triggers_mode.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => crate::cdc::has_user_triggers(dt.pgs_relid)?,
+    };
+
+    // Suppress user triggers during TRUNCATE + INSERT to prevent
+    // spurious trigger invocations with wrong semantics.
+    if has_triggers {
+        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    }
+
+    let truncate_sql = format!("TRUNCATE {quoted_table}");
     Spi::run(&truncate_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
 
     // For aggregate/distinct STs in DIFFERENTIAL mode, inject COUNT(*)
@@ -432,12 +454,29 @@ fn execute_manual_full_refresh(
             format!("SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({effective_query}) sub",)
         };
 
-    let insert_sql = format!(
-        "INSERT INTO {schema}.{table} {insert_body}",
-        schema = quote_identifier(schema),
-        table = quote_identifier(table_name),
-    );
+    let insert_sql = format!("INSERT INTO {quoted_table} {insert_body}");
     Spi::run(&insert_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+    // Re-enable user triggers and emit NOTIFY so listeners know a FULL
+    // refresh occurred.
+    if has_triggers {
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+        let escaped_name = table_name.replace('\'', "''");
+        let escaped_schema = schema.replace('\'', "''");
+        Spi::run(&format!(
+            "NOTIFY pgstream_refresh, '{{\"stream_table\": \"{escaped_name}\", \
+             \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\"}}'"
+        ))
+        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+        pgrx::info!(
+            "pg_stream: FULL refresh of {}.{} with user triggers suppressed.",
+            schema,
+            table_name,
+        );
+    }
 
     // Compute and store frontier so differential can start from here.
     // S3 optimization: single SPI call combines frontier storage,

@@ -80,6 +80,11 @@ async fn test_explicit_dml_insert() {
     )
     .await;
 
+    // Establish frontier so subsequent refreshes use DIFFERENTIAL (not FULL
+    // fallback). Without this, the first refresh_dt falls back to FULL which
+    // suppresses user triggers.
+    db.refresh_dt("st_ins").await;
+
     // Attach audit trigger on the stream table
     for sql in audit_trigger_sql("st_ins") {
         db.execute(&sql).await;

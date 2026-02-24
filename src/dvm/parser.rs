@@ -700,17 +700,25 @@ impl OpTree {
         }
     }
 
-    /// Returns `true` if the top-level operator is Aggregate or Distinct,
-    /// meaning the storage table needs a `__pgs_count BIGINT` auxiliary
-    /// column for differential maintenance.
+    /// Returns `true` if the operator tree contains Aggregate, Distinct,
+    /// Intersect, or Except — meaning the storage table needs a
+    /// `__pgs_count BIGINT` auxiliary column for differential maintenance.
+    ///
+    /// Recurses through transparent wrappers (`Filter`, `Project`,
+    /// `Subquery`) that may sit on top (e.g. HAVING adds a `Filter`
+    /// around the `Aggregate`).
     pub fn needs_pgs_count(&self) -> bool {
-        matches!(
-            self,
+        match self {
             OpTree::Aggregate { .. }
-                | OpTree::Distinct { .. }
-                | OpTree::Intersect { .. }
-                | OpTree::Except { .. }
-        )
+            | OpTree::Distinct { .. }
+            | OpTree::Intersect { .. }
+            | OpTree::Except { .. } => true,
+            // Transparent wrappers — delegate to child
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. } => child.needs_pgs_count(),
+            _ => false,
+        }
     }
 
     /// Extract GROUP BY column names from an aggregate operator.
