@@ -14,6 +14,11 @@ as a **dbt package** containing a custom materialization macro (`stream_table`).
 requires no Python adapter code — just Jinja SQL macros that call pg_stream's SQL API functions.
 It works with the standard `dbt-postgres` adapter.
 
+The package lives **inside the pg_stream repository** as the `dbt-pgstream/` subfolder.
+This keeps the macro co-located with the extension source, enables single-PR changes when
+the SQL API evolves, and lets CI test the macros against the actual extension in one pipeline.
+Users install it via a git URL with the `subdirectory` key in their `packages.yml`.
+
 This is the lighter-weight option compared to a full dbt adapter (see
 [PLAN_DBT_ADAPTER.md](PLAN_DBT_ADAPTER.md)). It covers the core workflow (create, update,
 drop, test) and is suitable for teams that want to manage stream tables alongside their
@@ -70,7 +75,7 @@ custom materialization can wrap these calls in Jinja macros and map dbt's lifecy
 
 ## Prerequisites
 
-- dbt Core ≥ 1.7 (custom materializations are stable since 1.0)
+- dbt Core ≥ 1.6 (required for `subdirectory` support in `packages.yml`)
 - `dbt-postgres` adapter (standard; no custom adapter needed)
 - PostgreSQL 18 with pg_stream extension installed
 - The dbt execution role needs permission to call `pgstream.*` functions
@@ -79,52 +84,95 @@ custom materialization can wrap these calls in Jinja macros and map dbt's lifecy
 
 ## Phase 1 — Package Scaffolding
 
-### 1.1 Repository structure
+### 1.1 Location within the pg_stream repo
 
-Create a standalone dbt package repository (`dbt-pgstream`):
+The dbt package lives as a subfolder in the main pg_stream repository. This avoids a
+separate repo, keeps the SQL API and macros in sync, and lets CI test both together.
 
 ```
-dbt-pgstream/
-├── dbt_project.yml
-├── README.md
-├── LICENSE
-├── macros/
-│   ├── materializations/
-│   │   └── stream_table.sql          # Core materialization
-│   ├── adapters/
-│   │   ├── create_stream_table.sql   # Wrapper for pgstream.create_stream_table()
-│   │   ├── alter_stream_table.sql    # Wrapper for pgstream.alter_stream_table()
-│   │   ├── drop_stream_table.sql     # Wrapper for pgstream.drop_stream_table()
-│   │   └── refresh_stream_table.sql  # Wrapper for pgstream.refresh_stream_table()
-│   ├── hooks/
-│   │   └── source_freshness.sql      # Source freshness override macro
-│   └── utils/
-│       ├── stream_table_exists.sql   # Check if ST already exists in catalog
-│       └── get_stream_table_info.sql # Read ST metadata from catalog
-├── integration_tests/
+pg-stream/                            # Main extension repo
+├── src/                              # Rust extension source
+├── tests/                            # Extension tests
+├── docs/
+├── dbt-pgstream/                     # ← dbt macro package (subfolder)
 │   ├── dbt_project.yml
-│   ├── models/
-│   │   ├── staging/
-│   │   │   └── stg_orders.sql        # Example staging model
-│   │   └── marts/
-│   │       └── order_totals.sql      # Example stream table model
-│   ├── seeds/
-│   │   └── raw_orders.csv
-│   └── tests/
-│       └── assert_order_totals.sql
-└── .github/
-    └── workflows/
-        └── ci.yml
+│   ├── README.md
+│   ├── macros/
+│   │   ├── materializations/
+│   │   │   └── stream_table.sql      # Core materialization
+│   │   ├── adapters/
+│   │   │   ├── create_stream_table.sql
+│   │   │   ├── alter_stream_table.sql
+│   │   │   ├── drop_stream_table.sql
+│   │   │   └── refresh_stream_table.sql
+│   │   ├── hooks/
+│   │   │   └── source_freshness.sql
+│   │   ├── operations/
+│   │   │   ├── refresh.sql
+│   │   │   └── drop_all.sql
+│   │   └── utils/
+│   │       ├── stream_table_exists.sql
+│   │       └── get_stream_table_info.sql
+│   └── integration_tests/
+│       ├── dbt_project.yml
+│       ├── profiles.yml
+│       ├── models/
+│       │   └── marts/
+│       │       ├── order_totals.sql
+│       │       └── schema.yml
+│       ├── seeds/
+│       │   └── raw_orders.csv
+│       └── tests/
+│           └── assert_totals_correct.sql
+├── AGENTS.md
+├── Cargo.toml
+└── ...
 ```
 
-### 1.2 dbt_project.yml
+### 1.2 User installation
+
+Users install the package via a git URL with the `subdirectory` key (dbt Core ≥ 1.6):
 
 ```yaml
+# packages.yml (in the user's dbt project)
+packages:
+  - git: "https://github.com/<org>/pg-stream.git"
+    revision: v0.1.0    # git tag, branch, or commit SHA
+    subdirectory: "dbt-pgstream"
+```
+
+Then run:
+
+```bash
+dbt deps   # clones pg-stream repo, installs only dbt-pgstream/ subfolder
+```
+
+> **Note:** `dbt deps` performs a shallow clone by default, so pulling the full Rust
+> source tree adds only a few MB of transfer — acceptable for most users.
+
+### 1.3 Why in-repo, not separate?
+
+| Concern | In-repo subfolder | Separate repo |
+|---------|--------------------|---------------|
+| Single PR for API + macro changes | ✅ Yes | ❌ Two PRs |
+| Shared CI (test macros against extension) | ✅ Same pipeline | ❌ Cross-repo trigger |
+| Version tags track both | ✅ One tag | ❌ Separate tags |
+| Contributor experience | ✅ One clone | ❌ Two repos |
+| `dbt deps` payload | ~few MB extra (shallow clone) | Minimal |
+| dbt Hub publication | Possible with `subdirectory` | Easier (root `dbt_project.yml`) |
+
+If the package later needs dbt Hub publication or grows into a full adapter (Python on
+PyPI), it can be extracted to a separate repo at that point.
+
+### 1.4 dbt_project.yml
+
+```yaml
+# dbt-pgstream/dbt_project.yml
 name: 'dbt_pgstream'
 version: '0.1.0'
 config-version: 2
 
-require-dbt-version: [">=1.7.0", "<2.0.0"]
+require-dbt-version: [">=1.6.0", "<2.0.0"]  # ≥1.6 for subdirectory support
 ```
 
 ---
@@ -520,29 +568,34 @@ Tests require PostgreSQL 18 with pg_stream installed. Use the project's existing
 
 ### 6.2 CI pipeline
 
+Since the macros live in the pg_stream repo, dbt integration tests run as part of the
+main CI pipeline alongside the Rust extension tests:
+
 ```yaml
-# .github/workflows/ci.yml
-name: CI
-on: [push, pull_request]
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pg-stream-e2e:latest  # Custom image with pg_stream
-        ports: ['5432:5432']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install dbt-core dbt-postgres
-      - run: cd integration_tests && dbt seed && dbt run && dbt test
+# In the main .github/workflows/ci.yml (or a dedicated job)
+dbt-integration:
+  runs-on: ubuntu-latest
+  needs: [build]   # Ensure the pg_stream Docker image is built first
+  services:
+    postgres:
+      image: pg-stream-e2e:latest  # Custom image with pg_stream
+      ports: ['5432:5432']
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with: { python-version: '3.11' }
+    - run: pip install dbt-core dbt-postgres
+    - run: cd dbt-pgstream/integration_tests && dbt deps && dbt seed && dbt run && dbt test
+    - run: cd dbt-pgstream/integration_tests && dbt run --full-refresh  # test drop/recreate
 ```
+
+This ensures that any SQL API change in the Rust extension is immediately validated
+against the dbt macros in the same PR.
 
 ### 6.3 Documentation
 
-- **README.md** — Quick start, installation, configuration examples
-- **CHANGELOG.md** — Version history
+- **`dbt-pgstream/README.md`** — Quick start, installation (`subdirectory` git URL), configuration examples
+- **CHANGELOG.md** — Version history (tracked via the main repo's tags)
 - Inline Jinja doc comments on all macros
 
 ---
@@ -556,50 +609,56 @@ jobs:
 | No `dbt snapshot` support | Snapshots use SCD Type-2 logic that doesn't apply to stream tables | Use a separate snapshot on the stream table as a regular table |
 | No cross-database refs | Stream tables live in the same database as sources | Standard PostgreSQL limitation |
 | Concurrent `dbt run` | Multiple `dbt run` invocations could race on create/drop | Use dbt's `--target` or coordinate via CI |
-| `dbt deps` resolution | Package must be published to dbt Hub or installed via git | Use git install initially |
+| `dbt deps` payload | Users clone the full pg_stream repo (shallow, ~few MB) | Use `subdirectory` key; acceptable tradeoff |
 
 ---
 
 ## File Layout
 
+Within the pg_stream repository:
+
 ```
-dbt-pgstream/
-├── dbt_project.yml
-├── README.md
-├── LICENSE
-├── macros/
-│   ├── materializations/
-│   │   └── stream_table.sql           # ~80 lines
-│   ├── adapters/
-│   │   ├── create_stream_table.sql    # ~15 lines
-│   │   ├── alter_stream_table.sql     # ~25 lines
-│   │   ├── drop_stream_table.sql      # ~8 lines
-│   │   └── refresh_stream_table.sql   # ~8 lines
-│   ├── hooks/
-│   │   └── source_freshness.sql       # ~20 lines
-│   ├── operations/
-│   │   ├── refresh.sql                # ~5 lines
-│   │   └── drop_all.sql              # ~15 lines
-│   └── utils/
-│       ├── stream_table_exists.sql    # ~12 lines
-│       └── get_stream_table_info.sql  # ~12 lines
-├── integration_tests/
-│   ├── dbt_project.yml
-│   ├── profiles.yml
-│   ├── models/
-│   │   └── marts/
-│   │       ├── order_totals.sql
-│   │       └── schema.yml
-│   ├── seeds/
-│   │   └── raw_orders.csv
-│   └── tests/
-│       └── assert_totals_correct.sql
-└── .github/
-    └── workflows/
-        └── ci.yml
+pg-stream/
+├── src/                                  # Rust extension source
+├── tests/                                # Extension tests
+├── dbt-pgstream/                         # ← dbt macro package
+│   ├── dbt_project.yml                   # Package manifest
+│   ├── README.md                         # Quick start, installation
+│   ├── macros/
+│   │   ├── materializations/
+│   │   │   └── stream_table.sql          # ~80 lines
+│   │   ├── adapters/
+│   │   │   ├── create_stream_table.sql   # ~15 lines
+│   │   │   ├── alter_stream_table.sql    # ~25 lines
+│   │   │   ├── drop_stream_table.sql     # ~8 lines
+│   │   │   └── refresh_stream_table.sql  # ~8 lines
+│   │   ├── hooks/
+│   │   │   └── source_freshness.sql      # ~20 lines
+│   │   ├── operations/
+│   │   │   ├── refresh.sql               # ~5 lines
+│   │   │   └── drop_all.sql              # ~15 lines
+│   │   └── utils/
+│   │       ├── stream_table_exists.sql   # ~12 lines
+│   │       └── get_stream_table_info.sql # ~12 lines
+│   └── integration_tests/
+│       ├── dbt_project.yml
+│       ├── profiles.yml
+│       ├── models/
+│       │   └── marts/
+│       │       ├── order_totals.sql
+│       │       └── schema.yml
+│       ├── seeds/
+│       │   └── raw_orders.csv
+│       └── tests/
+│           └── assert_totals_correct.sql
+├── Cargo.toml
+└── ...
 ```
 
 **Estimated total code:** ~200 lines of Jinja SQL macros + ~100 lines of test/config YAML.
+
+> No `.github/workflows/` directory inside `dbt-pgstream/` — CI lives in the main repo's
+> workflow files and includes a `dbt-integration` job.
 
 ---
 
@@ -634,6 +693,20 @@ SELECT
     COUNT(*) AS order_count
 FROM {{ source('raw', 'orders') }}
 GROUP BY customer_id
+```
+
+### Install the package
+
+```yaml
+# packages.yml (in the user's dbt project)
+packages:
+  - git: "https://github.com/<org>/pg-stream.git"
+    revision: v0.1.0
+    subdirectory: "dbt-pgstream"
+```
+
+```bash
+dbt deps
 ```
 
 ### dbt commands
