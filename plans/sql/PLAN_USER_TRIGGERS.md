@@ -1,8 +1,18 @@
 # Plan: Support User-Defined Triggers on Stream Tables
 
-**Status:** Proposed  
+**Status:** Superseded by [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)  
 **Author:** GitHub Copilot  
 **Date:** 2026-02-23
+
+> **⚠️ This plan has been superseded.** The explicit DML approach in
+> [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
+> replaces the `session_replication_role` suppression with a more capable
+> solution that actually fires user triggers with correct semantics.
+> Phase 1 (FULL refresh trigger suppression) is implemented using
+> `DISABLE TRIGGER USER` instead of `session_replication_role`. The GUC
+> `pg_stream.suppress_user_triggers` was replaced by
+> `pg_stream.user_triggers` (auto/on/off). This document is retained for
+> historical reference.
 
 ---
 

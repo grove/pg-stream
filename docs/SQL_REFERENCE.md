@@ -965,7 +965,7 @@ CREATE SUBSCRIPTION my_sub
 | Direct DML (`INSERT`, `UPDATE`, `DELETE`) | ❌ Not supported | Stream table contents are managed exclusively by the refresh engine. |
 | Direct DDL (`ALTER TABLE`) | ❌ Not supported | Use `pgstream.alter_stream_table()` to change the defining query or schedule. |
 | Foreign keys referencing or from a stream table | ❌ Not supported | The refresh engine performs bulk `MERGE` operations that do not respect FK ordering. |
-| User-defined triggers on stream tables | ⚠️ Unsupported | Technically possible but not recommended. The `MERGE` during refresh may fire triggers in unexpected ways. |
+| User-defined triggers on stream tables | ✅ Supported (DIFFERENTIAL) | In DIFFERENTIAL mode, the refresh engine decomposes changes into explicit DELETE + UPDATE + INSERT statements so triggers fire with correct `TG_OP`, `OLD`, and `NEW`. Row-level triggers are suppressed during FULL refresh. Controlled by `pg_stream.user_triggers` GUC (default: `auto`). |
 | `TRUNCATE` on a stream table | ❌ Not supported | Use `pgstream.refresh_stream_table()` to reset data. |
 
 > **Tip:** The `__pgs_row_id` column is visible but should be ignored by consuming queries — it is an implementation detail used for delta `MERGE` operations.

@@ -122,26 +122,21 @@ fn collect_ddl_commands() -> Result<Vec<DdlCommand>, PgStreamError> {
 
 /// Process a single DDL command: check for upstream/ST impact and react.
 fn handle_ddl_command(cmd: &DdlCommand) {
-    // We only care about table-level DDL.
-    if cmd.object_type != "table" {
-        return;
-    }
-
-    let objid = cmd.objid;
-    let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
-
-    match cmd.command_tag.as_str() {
-        // ── ALTER TABLE on an upstream source ──────────────────────────
-        "ALTER TABLE" => {
-            handle_alter_table(objid, identity);
+    match (cmd.object_type.as_str(), cmd.command_tag.as_str()) {
+        // ── Table DDL ─────────────────────────────────────────────────
+        ("table", "ALTER TABLE") => {
+            let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
+            handle_alter_table(cmd.objid, identity);
         }
-
-        // ── CREATE TABLE — nothing to do ──────────────────────────────
-        "CREATE TABLE" => {
+        ("table", "CREATE TABLE") => {
             // New tables can't be upstream of any existing ST yet.
         }
 
-        // ── Other DDL (CREATE INDEX, etc.) — ignore ───────────────────
+        // ── CREATE TRIGGER on a stream table → warning ────────────────
+        ("trigger", "CREATE TRIGGER") => {
+            handle_create_trigger(cmd);
+        }
+
         _ => {}
     }
 }
@@ -221,6 +216,50 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
             "pg_stream_ddl_tracker: ALTER TABLE on {} → {} ST(s) marked for reinitialize",
             identity,
             total,
+        );
+    }
+}
+
+// ── CREATE TRIGGER warning ─────────────────────────────────────────────────
+
+/// Handle CREATE TRIGGER: if the trigger is on a stream table, emit a
+/// warning about trigger behavior during refresh.
+fn handle_create_trigger(cmd: &DdlCommand) {
+    // The event trigger's objid is the trigger OID (pg_trigger.oid), not the
+    // table OID. Look up the table via pg_trigger.tgrelid.
+    let tgrelid = match Spi::get_one::<pg_sys::Oid>(&format!(
+        "SELECT tgrelid FROM pg_trigger WHERE oid = {}",
+        cmd.objid.to_u32(),
+    )) {
+        Ok(Some(oid)) => oid,
+        _ => return, // Can't resolve — ignore silently
+    };
+
+    // Check if the table is a stream table.
+    if !is_dt_storage_table(tgrelid) {
+        return;
+    }
+
+    let trigger_identity = cmd
+        .object_identity
+        .as_deref()
+        .unwrap_or("(unknown trigger)");
+    let user_triggers_mode = config::pg_stream_user_triggers();
+
+    if user_triggers_mode == "off" {
+        pgrx::warning!(
+            "pg_stream: trigger {} is on a stream table, but pg_stream.user_triggers = 'off'. \
+             This trigger will NOT fire correctly during refresh. \
+             Set pg_stream.user_triggers = 'auto' or 'on' to enable trigger support.",
+            trigger_identity,
+        );
+    } else {
+        pgrx::notice!(
+            "pg_stream: trigger {} is on a stream table. \
+             It will fire during DIFFERENTIAL refresh with correct TG_OP/OLD/NEW. \
+             Note: row-level triggers do NOT fire during FULL refresh. \
+             Use REFRESH MODE DIFFERENTIAL to ensure triggers fire on every change.",
+            trigger_identity,
         );
     }
 }

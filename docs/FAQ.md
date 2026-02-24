@@ -346,7 +346,14 @@ CREATE PUBLICATION my_pub FOR TABLE pgstream.order_totals;
 
 ### Can I add my own triggers to stream tables?
 
-**Not recommended.** While PostgreSQL will allow it, the `MERGE` statement used during refresh may fire your triggers in unexpected ways (e.g., a differential refresh issues DELETE + INSERT pairs, not UPDATEs).
+**Yes, for DIFFERENTIAL mode stream tables.** When user-defined row-level triggers are detected (or `pg_stream.user_triggers = 'on'`), the refresh engine automatically switches from `MERGE` to explicit `DELETE` + `UPDATE` + `INSERT` statements. This ensures triggers fire with the correct `TG_OP`, `OLD`, and `NEW` values.
+
+**Limitations:**
+- Row-level triggers do **not** fire during FULL refresh (they are automatically suppressed via `DISABLE TRIGGER USER`). Use `REFRESH MODE DIFFERENTIAL` for stream tables with triggers.
+- The `IS DISTINCT FROM` guard prevents no-op `UPDATE` triggers when the aggregate result is unchanged.
+- `BEFORE` triggers that modify `NEW` will affect the stored value — the next refresh may "correct" it back, causing oscillation.
+
+See the `pg_stream.user_triggers` GUC in [CONFIGURATION.md](CONFIGURATION.md) for control options.
 
 ### Can I `ALTER TABLE` a stream table directly?
 
@@ -405,6 +412,7 @@ Retries use exponential backoff (base 1s, max 60s, ±25% jitter, up to 5 retries
 | `pg_stream.max_consecutive_errors` | int | `3` | Failures before auto-suspending (1–100) |
 | `pg_stream.change_buffer_schema` | text | `pgstream_changes` | Schema for CDC buffer tables |
 | `pg_stream.max_concurrent_refreshes` | int | `4` | Max parallel refresh workers (1–32) |
+| `pg_stream.user_triggers` | text | `auto` | User trigger handling: `auto` (detect), `on` (always explicit DML), `off` (suppress) |
 | `pg_stream.differential_max_change_ratio` | float | `0.15` | Change ratio threshold for adaptive FULL fallback (0.0–1.0) |
 | `pg_stream.cleanup_use_truncate` | bool | `true` | Use TRUNCATE instead of DELETE for buffer cleanup |
 
@@ -678,19 +686,26 @@ Foreign key constraints require that referenced/referencing rows exist at the ti
 
 **Workaround:** Enforce referential integrity in the consuming application or use a view that joins the stream tables and validates the relationship.
 
-### Why are user-defined triggers on stream tables unsupported?
+### How do user-defined triggers work on stream tables?
 
-PostgreSQL allows adding triggers to any table, including stream tables. However, the refresh engine's behavior makes triggers unreliable:
+When a DIFFERENTIAL mode stream table has user-defined row-level triggers (or `pg_stream.user_triggers = 'on'`), the refresh engine uses **explicit DML decomposition** instead of `MERGE`:
 
-1. **`MERGE` fires unexpected trigger combinations.** A differential refresh uses `MERGE INTO ... WHEN MATCHED THEN DELETE ... WHEN NOT MATCHED THEN INSERT`. From the trigger system's perspective, this produces `DELETE` and `INSERT` events — not `UPDATE`. If a source row is updated, the stream table sees a DELETE of the old row and an INSERT of the new row, meaning an `ON UPDATE` trigger never fires but `ON DELETE` and `ON INSERT` both do.
+1. **Delta materialized once.** The delta query result is stored in a temporary table (`__pgs_delta_<id>`) to avoid evaluating it three times.
 
-2. **Full refresh fires mass deletes and inserts.** A FULL refresh truncates (or deletes) all existing rows and re-inserts the full result set. Every trigger on the stream table fires for every row — potentially millions of trigger invocations for what is logically a single "refresh" event.
+2. **DELETE removed rows.** Rows in the stream table whose `__pgs_row_id` is absent from the delta are deleted. `AFTER DELETE` triggers fire with correct `OLD` values.
 
-3. **No stable row identity across refreshes.** The `__pgs_row_id` is a content hash, not a surrogate key. If a source row's group-by key changes, the old `__pgs_row_id` is deleted and a new one is inserted. Triggers that track row lifecycle (e.g., audit triggers) would log this as a delete + insert rather than an update.
+3. **UPDATE changed rows.** Rows whose `__pgs_row_id` exists in both the stream table and delta but whose values differ (checked via `IS DISTINCT FROM`) are updated. `AFTER UPDATE` triggers fire with correct `OLD` and `NEW`. No-op updates (where values are identical) are skipped, preventing spurious triggers.
 
-4. **Trigger execution inside refresh transaction.** All trigger logic runs within the refresh transaction. A slow or failing trigger blocks the entire refresh, potentially causing the stream table to become stale or the refresh to be marked as failed.
+4. **INSERT new rows.** Rows in the delta whose `__pgs_row_id` is absent from the stream table are inserted. `AFTER INSERT` triggers fire with correct `NEW` values.
 
-**Workaround:** Use PostgreSQL `LISTEN`/`NOTIFY` on the `pg_stream_alert` channel to react to refresh events, or create a second stream table that applies the transformation you need.
+**FULL refresh behavior:** Row-level user triggers are automatically suppressed during FULL refresh via `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so listeners know a FULL refresh occurred. Use `REFRESH MODE DIFFERENTIAL` for stream tables that need per-row trigger semantics.
+
+**Performance:** The explicit DML path adds ~25–60% overhead compared to MERGE for triggered stream tables. Stream tables without user triggers have zero overhead (only a fast `pg_trigger` check, <0.1 ms).
+
+**Control:** The `pg_stream.user_triggers` GUC controls this behavior:
+- `auto` (default): detect user triggers automatically
+- `on`: always use explicit DML (useful for testing)
+- `off`: always use MERGE, suppressing triggers
 
 ### Why can't I `ALTER TABLE` a stream table directly?
 

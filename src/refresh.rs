@@ -50,6 +50,22 @@ struct CachedMergeTemplate {
     source_oids: Vec<u32>,
     /// Cleanup template with `__PGS_{PREV,NEW}_LSN_{oid}__` tokens.
     cleanup_sql_template: String,
+
+    // ── User-trigger explicit DML templates ──────────────────────────
+    // These templates reference `__pgs_delta_{pgs_id}` (a temp table
+    // materialized at execution time) and do NOT contain LSN placeholders.
+    /// DELETE statement for the trigger-enabled DML path.
+    /// Deletes rows where the delta action is 'D'.
+    trigger_delete_template: String,
+    /// UPDATE statement for the trigger-enabled DML path.
+    /// Updates existing rows where the delta action is 'I' and values changed.
+    trigger_update_template: String,
+    /// INSERT statement for the trigger-enabled DML path.
+    /// Inserts genuinely new rows where the delta action is 'I'.
+    trigger_insert_template: String,
+    /// USING clause template with LSN placeholders (for materializing delta
+    /// into a temp table in the user-trigger path).
+    trigger_using_template: String,
 }
 
 thread_local! {
@@ -427,6 +443,37 @@ pub fn prewarm_merge_cache(dt: &StreamTableMeta) {
     // D-2: Parameterize MERGE template for prepared-statement execution.
     let parameterized_merge_sql = parameterize_lsn_template(&merge_template, source_oids);
 
+    // ── User-trigger explicit DML templates ──────────────────────────
+    let trigger_delete_template = format!(
+        "DELETE FROM {quoted_table} AS dt \
+         USING __pgs_delta_{pgs_id} AS d \
+         WHERE dt.__pgs_row_id = d.__pgs_row_id \
+           AND d.__pgs_action = 'D'",
+        pgs_id = dt.pgs_id,
+    );
+
+    let trigger_update_template = format!(
+        "UPDATE {quoted_table} AS dt \
+         SET {update_set_clause} \
+         FROM __pgs_delta_{pgs_id} AS d \
+         WHERE dt.__pgs_row_id = d.__pgs_row_id \
+           AND d.__pgs_action = 'I' \
+           AND ({is_distinct_clause})",
+        pgs_id = dt.pgs_id,
+    );
+
+    let trigger_insert_template = format!(
+        "INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
+         SELECT d.__pgs_row_id, {d_user_col_list} \
+         FROM __pgs_delta_{pgs_id} AS d \
+         WHERE d.__pgs_action = 'I' \
+           AND NOT EXISTS (\
+             SELECT 1 FROM {quoted_table} AS dt \
+             WHERE dt.__pgs_row_id = d.__pgs_row_id\
+           )",
+        pgs_id = dt.pgs_id,
+    );
+
     // Cache the MERGE template with LSN placeholder tokens.
     // Each refresh resolves the tokens to concrete LSN values
     // via string substitution, then executes the resolved SQL.
@@ -440,6 +487,10 @@ pub fn prewarm_merge_cache(dt: &StreamTableMeta) {
                 parameterized_merge_sql,
                 source_oids: source_oids.clone(),
                 cleanup_sql_template: cleanup_template,
+                trigger_delete_template,
+                trigger_update_template,
+                trigger_insert_template,
+                trigger_using_template: using_clause.clone(),
             },
         );
     });
@@ -490,10 +541,40 @@ pub fn determine_refresh_action(dt: &StreamTableMeta, has_upstream_changes: bool
 }
 
 /// Execute a full refresh: TRUNCATE + INSERT from defining query.
+///
+/// When user triggers are detected (and the GUC is not `"off"`), they are
+/// suppressed during the TRUNCATE + INSERT via `DISABLE TRIGGER USER` /
+/// `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so
+/// listeners know a FULL refresh occurred.
+///
+/// **Note:** Row-level user triggers do NOT fire correctly for FULL refresh.
+/// Users who need per-row trigger semantics should use `REFRESH MODE
+/// DIFFERENTIAL`. See PLAN_USER_TRIGGERS_EXPLICIT_DML.md §2.
 pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStreamError> {
     let schema = &dt.pgs_schema;
     let name = &dt.pgs_name;
     let query = &dt.defining_query;
+
+    let quoted_table = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        name.replace('"', "\"\""),
+    );
+
+    // Check for user triggers to suppress during FULL refresh.
+    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let has_triggers = match user_triggers_mode.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => crate::cdc::has_user_triggers(dt.pgs_relid)?,
+    };
+
+    // Suppress user triggers during TRUNCATE + INSERT to prevent
+    // spurious trigger invocations with wrong semantics.
+    if has_triggers {
+        Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    }
 
     // For aggregate/distinct STs, inject COUNT(*) AS __pgs_count into the
     // defining query so the auxiliary column is populated correctly.
@@ -506,12 +587,8 @@ pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStream
     };
 
     // Truncate
-    let truncate_sql = format!(
-        "TRUNCATE \"{}\".\"{}\"",
-        schema.replace('"', "\"\""),
-        name.replace('"', "\"\""),
-    );
-    Spi::run(&truncate_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    Spi::run(&format!("TRUNCATE {quoted_table}"))
+        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
@@ -524,11 +601,7 @@ pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStream
         format!("SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({effective_query}) sub",)
     };
 
-    let insert_sql = format!(
-        "INSERT INTO \"{schema}\".\"{table}\" {insert_body}",
-        schema = schema.replace('"', "\"\""),
-        table = name.replace('"', "\"\""),
-    );
+    let insert_sql = format!("INSERT INTO {quoted_table} {insert_body}");
 
     let rows_inserted = Spi::connect_mut(|client| {
         let result = client
@@ -536,6 +609,30 @@ pub fn execute_full_refresh(dt: &StreamTableMeta) -> Result<(i64, i64), PgStream
             .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
         Ok::<usize, PgStreamError>(result.len())
     })?;
+
+    // Re-enable user triggers and emit NOTIFY so listeners know a FULL
+    // refresh occurred.
+    if has_triggers {
+        Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+        // Escape single quotes in the JSON payload.
+        let escaped_name = name.replace('\'', "''");
+        let escaped_schema = schema.replace('\'', "''");
+        Spi::run(&format!(
+            "NOTIFY pgstream_refresh, '{{\"stream_table\": \"{escaped_name}\", \
+             \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\", \"rows\": {rows_inserted}}}'"
+        ))
+        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+        pgrx::info!(
+            "pg_stream: FULL refresh of {}.{} with user triggers suppressed ({} rows). \
+             Row-level triggers do NOT fire for FULL refresh; use REFRESH MODE DIFFERENTIAL.",
+            schema,
+            name,
+            rows_inserted,
+        );
+    }
 
     Ok((rows_inserted as i64, 0))
 }
@@ -740,7 +837,7 @@ pub fn execute_differential_refresh(
     let was_cache_hit = cached.is_some();
 
     /// Resolved SQL pair: MERGE template + DELETE+INSERT template,
-    /// plus D-2 prepared-statement materials.
+    /// plus D-2 prepared-statement materials and user-trigger DML.
     struct ResolvedSql {
         merge_sql: String,
         delete_insert_sql: String,
@@ -748,6 +845,15 @@ pub fn execute_differential_refresh(
         source_oids: Vec<u32>,
         /// Parameterized MERGE SQL with `$N` params (for PREPARE).
         parameterized_merge_sql: String,
+        /// DELETE template for user-trigger path (no LSN placeholders).
+        trigger_delete_sql: String,
+        /// UPDATE template for user-trigger path (no LSN placeholders).
+        trigger_update_sql: String,
+        /// INSERT template for user-trigger path (no LSN placeholders).
+        trigger_insert_sql: String,
+        /// USING clause with resolved LSN values (for materializing delta
+        /// into a temp table in the user-trigger path).
+        trigger_using_sql: String,
     }
 
     let resolved = if let Some(entry) = cached {
@@ -770,6 +876,15 @@ pub fn execute_differential_refresh(
             ),
             source_oids: entry.source_oids.clone(),
             parameterized_merge_sql: entry.parameterized_merge_sql.clone(),
+            trigger_delete_sql: entry.trigger_delete_template.clone(),
+            trigger_update_sql: entry.trigger_update_template.clone(),
+            trigger_insert_sql: entry.trigger_insert_template.clone(),
+            trigger_using_sql: resolve_lsn_placeholders(
+                &entry.trigger_using_template,
+                &entry.source_oids,
+                prev_frontier,
+                new_frontier,
+            ),
         }
     } else {
         // ── Cache miss: full pipeline + PREPARE + cache ──────────────
@@ -887,6 +1002,37 @@ pub fn execute_differential_refresh(
         // ── D-2: Build parameterized MERGE SQL for PREPARE ─────────
         let parameterized_merge_sql = parameterize_lsn_template(&merge_template, &source_oids);
 
+        // ── User-trigger explicit DML templates ──────────────────────
+        let trigger_delete_template = format!(
+            "DELETE FROM {quoted_table} AS dt \
+             USING __pgs_delta_{pgs_id} AS d \
+             WHERE dt.__pgs_row_id = d.__pgs_row_id \
+               AND d.__pgs_action = 'D'",
+            pgs_id = dt.pgs_id,
+        );
+
+        let trigger_update_template = format!(
+            "UPDATE {quoted_table} AS dt \
+             SET {update_set_clause} \
+             FROM __pgs_delta_{pgs_id} AS d \
+             WHERE dt.__pgs_row_id = d.__pgs_row_id \
+               AND d.__pgs_action = 'I' \
+               AND ({is_distinct_clause})",
+            pgs_id = dt.pgs_id,
+        );
+
+        let trigger_insert_template = format!(
+            "INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
+             SELECT d.__pgs_row_id, {d_user_col_list} \
+             FROM __pgs_delta_{pgs_id} AS d \
+             WHERE d.__pgs_action = 'I' \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM {quoted_table} AS dt \
+                 WHERE dt.__pgs_row_id = d.__pgs_row_id\
+               )",
+            pgs_id = dt.pgs_id,
+        );
+
         // Store templates in the cache for subsequent refreshes.
         MERGE_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(
@@ -898,6 +1044,10 @@ pub fn execute_differential_refresh(
                     source_oids: source_oids.clone(),
                     cleanup_sql_template: cleanup_template,
                     parameterized_merge_sql: parameterized_merge_sql.clone(),
+                    trigger_delete_template: trigger_delete_template.clone(),
+                    trigger_update_template: trigger_update_template.clone(),
+                    trigger_insert_template: trigger_insert_template.clone(),
+                    trigger_using_template: template_using.clone(),
                 },
             );
         });
@@ -918,6 +1068,15 @@ pub fn execute_differential_refresh(
             ),
             source_oids: source_oids.clone(),
             parameterized_merge_sql,
+            trigger_delete_sql: trigger_delete_template,
+            trigger_update_sql: trigger_update_template,
+            trigger_insert_sql: trigger_insert_template,
+            trigger_using_sql: resolve_lsn_placeholders(
+                &template_using,
+                &source_oids,
+                prev_frontier,
+                new_frontier,
+            ),
         }
     };
 
@@ -927,6 +1086,19 @@ pub fn execute_differential_refresh(
     // Large deltas benefit from hash joins over nested loops. Apply
     // SET LOCAL hints that are automatically reset at transaction end.
     apply_planner_hints(total_change_count);
+
+    // ── User-trigger detection ───────────────────────────────────────
+    // Determine whether to use the explicit DML path based on the GUC
+    // and the presence of user-defined row-level triggers on the ST.
+    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let use_explicit_dml = match user_triggers_mode.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => {
+            // "auto": detect user triggers
+            crate::cdc::has_user_triggers(dt.pgs_relid)?
+        }
+    };
 
     // ── B-3: Strategy selection ──────────────────────────────────────
     // Choose between MERGE and DELETE+INSERT based on the GUC setting.
@@ -948,7 +1120,69 @@ pub fn execute_differential_refresh(
     let use_prepared =
         crate::config::pg_stream_use_prepared_statements() && !use_delete_insert && was_cache_hit;
 
-    let (merge_count, strategy_label) = if use_delete_insert {
+    let (merge_count, strategy_label) = if use_explicit_dml {
+        // ── User-trigger path: explicit DML ─────────────────────────
+        // Decompose the MERGE into DELETE + UPDATE + INSERT so that
+        // user-defined triggers fire with correct TG_OP / OLD / NEW.
+
+        // Step 1: Materialize delta into a temp table (ON COMMIT DROP).
+        // This avoids evaluating the delta query three times.
+        let t_mat_start = Instant::now();
+        let materialize_sql = format!(
+            "CREATE TEMP TABLE __pgs_delta_{pgs_id} ON COMMIT DROP AS \
+             SELECT * FROM {using_clause} AS d",
+            pgs_id = dt.pgs_id,
+            using_clause = resolved.trigger_using_sql,
+        );
+        Spi::run(&materialize_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        let t_mat = t_mat_start.elapsed();
+
+        // Step 2: DELETE removed rows (AFTER DELETE triggers fire)
+        let t_del_start = Instant::now();
+        let del_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_delete_sql, None, &[])
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            Ok::<usize, PgStreamError>(result.len())
+        })?;
+        let t_del = t_del_start.elapsed();
+
+        // Step 3: UPDATE changed existing rows (AFTER UPDATE triggers fire)
+        // The IS DISTINCT FROM guard (B-1) prevents no-op UPDATE triggers.
+        let t_upd_start = Instant::now();
+        let upd_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_update_sql, None, &[])
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            Ok::<usize, PgStreamError>(result.len())
+        })?;
+        let t_upd = t_upd_start.elapsed();
+
+        // Step 4: INSERT genuinely new rows (AFTER INSERT triggers fire)
+        let t_ins_start = Instant::now();
+        let ins_count = Spi::connect_mut(|client| {
+            let result = client
+                .update(&resolved.trigger_insert_sql, None, &[])
+                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            Ok::<usize, PgStreamError>(result.len())
+        })?;
+        let t_ins = t_ins_start.elapsed();
+
+        pgrx::info!(
+            "[PGS_PROFILE] explicit_dml: materialize={:.2}ms delete={:.2}ms({}) update={:.2}ms({}) insert={:.2}ms({}) for {}.{}",
+            t_mat.as_secs_f64() * 1000.0,
+            t_del.as_secs_f64() * 1000.0,
+            del_count,
+            t_upd.as_secs_f64() * 1000.0,
+            upd_count,
+            t_ins.as_secs_f64() * 1000.0,
+            ins_count,
+            schema,
+            name,
+        );
+
+        (del_count + upd_count + ins_count, "explicit_dml")
+    } else if use_delete_insert {
         // ── DELETE + INSERT path ─────────────────────────────────────
         let stmts: Vec<&str> = resolved
             .delete_insert_sql
@@ -1392,6 +1626,10 @@ mod tests {
                     source_oids: vec![100, 200],
                     cleanup_sql_template: "DELETE FROM ...".to_string(),
                     parameterized_merge_sql: String::new(),
+                    trigger_delete_template: String::new(),
+                    trigger_update_template: String::new(),
+                    trigger_insert_template: String::new(),
+                    trigger_using_template: String::new(),
                 },
             );
         });
@@ -1418,6 +1656,10 @@ mod tests {
                     source_oids: vec![],
                     cleanup_sql_template: String::new(),
                     parameterized_merge_sql: String::new(),
+                    trigger_delete_template: String::new(),
+                    trigger_update_template: String::new(),
+                    trigger_insert_template: String::new(),
+                    trigger_using_template: String::new(),
                 },
             );
         });

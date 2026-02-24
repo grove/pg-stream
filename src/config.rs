@@ -83,6 +83,16 @@ pub static PGS_MERGE_STRATEGY: GucSetting<Option<std::ffi::CString>> =
 /// (e.g., highly skewed LSN distributions).
 pub static PGS_USE_PREPARED_STATEMENTS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+/// User-trigger handling mode for stream table refresh.
+///
+/// - `"auto"` (default): Detect user-defined row-level triggers on the
+///   stream table and automatically use explicit DML (DELETE + UPDATE +
+///   INSERT) so triggers fire with correct `TG_OP`, `OLD`, and `NEW`.
+/// - `"on"`: Always use explicit DML, even if no user triggers exist.
+/// - `"off"`: Always use MERGE; user triggers will NOT fire correctly.
+pub static PGS_USER_TRIGGERS: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -205,6 +215,17 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_string_guc(
+        c"pg_stream.user_triggers",
+        c"User-trigger handling: auto, on, or off.",
+        c"'auto' detects row-level user triggers and switches to explicit DML so they fire correctly. \
+           'on' forces explicit DML even without triggers. \
+           'off' always uses MERGE (triggers will NOT fire correctly).",
+        &PGS_USER_TRIGGERS,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -273,6 +294,14 @@ pub fn pg_stream_merge_strategy() -> String {
 /// Returns whether prepared statements are enabled for MERGE.
 pub fn pg_stream_use_prepared_statements() -> bool {
     PGS_USE_PREPARED_STATEMENTS.get()
+}
+
+/// Returns the user-trigger handling mode: `"auto"`, `"on"`, or `"off"`.
+pub fn pg_stream_user_triggers() -> String {
+    PGS_USER_TRIGGERS
+        .get()
+        .map(|cs| cs.to_str().unwrap_or("auto").to_string())
+        .unwrap_or_else(|| "auto".to_string())
 }
 
 /// Ratio of delta / stream-table size above which `auto` strategy

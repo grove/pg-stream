@@ -697,6 +697,28 @@ pub fn trigger_name_for_source(source_oid: pg_sys::Oid) -> String {
     format!("pg_stream_cdc_{}", source_oid.to_u32())
 }
 
+/// Returns true if the relation has any user-defined row-level triggers
+/// (excluding internal triggers and pg_stream's own CDC triggers).
+///
+/// Used by the refresh executor to decide whether to use the explicit DML
+/// path (which fires triggers with correct `TG_OP` / `OLD` / `NEW`) instead
+/// of the single-pass MERGE path.
+///
+/// This is a lightweight query — single index scan on `pg_trigger(tgrelid)`.
+pub fn has_user_triggers(st_relid: pg_sys::Oid) -> Result<bool, PgStreamError> {
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS(\
+           SELECT 1 FROM pg_trigger \
+           WHERE tgrelid = {}::oid \
+             AND tgisinternal = false \
+             AND tgname NOT LIKE 'pgs_%' \
+         )",
+        st_relid.to_u32(),
+    ))
+    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map(|v| v.unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
