@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: order_totals
+    description: "Aggregated order totals per customer (stream table)"
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null

@@ -1,0 +1,2 @@
+packages:
+  - local: ../    # Install the parent dbt-pgstream package
