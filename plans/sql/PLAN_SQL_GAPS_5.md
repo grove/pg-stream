@@ -815,7 +815,7 @@ independently. Steps are numbered sequentially for easy reference.
 | **S12** | A10: Scalar subquery in WHERE | 6–8h | CROSS JOIN auto-rewrite | — |
 | **S13** | B6: SubLinks inside OR | 8–10h | OR-to-UNION rewrite | — |
 | **S14** | A8: Multiple PARTITION BY in windows | 8–10h | Multi-pass recomputation | — |
-| **S15** | A9: Recursive CTE in DIFFERENTIAL mode | 15–20h | Incremental fixpoint (semi-naive + DRed) | — |
+| ~~**S15**~~ | ~~A9: Recursive CTE in DIFFERENTIAL mode~~ | ~~15–20h~~ | ~~✅ DONE~~ | — |
 
 #### Summary
 
@@ -826,8 +826,8 @@ independently. Steps are numbered sequentially for easy reference.
 | ~~2 — High-Value~~ | ~~S3–S6~~ | ~~18–26h~~ | ~~✅ DONE~~ |
 | ~~3 — Schema Infra~~ | ~~S7–S8~~ | ~~6–8h~~ | ~~✅ DONE~~ |
 | ~~4 — Unlocked~~ | ~~S9–S10~~ | ~~10–14h~~ | ~~✅ DONE~~ |
-| 5 — Advanced | S11–S15 | 47–63h | GROUPING SETS, scalar WHERE, OR sublinks, multi-PARTITION, recursive CTE |
-| **Total remaining** | **S11–S15** | **~47–63h** | **5 advanced items** |
+| 5 — Advanced | S11–S14, ~~S15~~ | 32–43h | GROUPING SETS, scalar WHERE, OR sublinks, multi-PARTITION; ~~recursive CTE ✅~~ |
+| **Total remaining** | **S11–S14** | **~32–43h** | **4 advanced items** |
 
 ---
 
@@ -920,7 +920,7 @@ design reasons that no schema policy can address:
 - [ ] Scalar subquery in WHERE via CROSS JOIN rewrite (S12)
 - [ ] SubLinks inside OR via OR-to-UNION rewrite (S13)
 - [ ] Multiple PARTITION BY via multi-pass recomputation (S14)
-- [ ] Recursive CTE in DIFFERENTIAL mode via incremental fixpoint (S15)
+- [x] Recursive CTE in DIFFERENTIAL mode via incremental fixpoint (S15)
 - [ ] 36+ AggFunc variants (up from 25)
 - [ ] 920+ unit tests (estimated, up from 872)
 - [ ] E2E tests for: benign DDL skips reinit, column DDL triggers reinit,

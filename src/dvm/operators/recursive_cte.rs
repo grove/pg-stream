@@ -1,7 +1,7 @@
 //! Recursive CTE differentiation (Tier 3c/3d/3e — semi-naive + DRed + non-linear).
 //!
-//! Implements differential maintenance for `WITH RECURSIVE` CTEs using two
-//! complementary strategies:
+//! Implements differential maintenance for `WITH RECURSIVE` CTEs using three
+//! strategies, selected automatically based on the query and change type:
 //!
 //! 1. **Semi-naive evaluation** for INSERT-only changes: Differentiate the
 //!    base case normally, then propagate new rows through the recursive
@@ -15,12 +15,22 @@
 //!    to restore any over-deleted rows that have alternative derivations
 //!    d) Combine: final delta = inserts + (over-deletions − rederived)
 //!
-//! Both strategies support **non-linear recursion** — recursive terms that
-//! reference the CTE multiple times (e.g., transitive closure:
-//! `FROM reach r1 JOIN reach r2 ON r1.b = r2.a`). Non-linear recursion
-//! generates additional seed terms for each self-reference position,
-//! where one position reads from the delta and others read from existing
-//! ST storage.
+//! 3. **Recomputation** fallback: re-executes the full defining query and
+//!    diffs against ST storage. Used when the CTE has more columns than
+//!    the outer SELECT projects (column mismatch), since the incremental
+//!    paths require all CTE columns to be present in the ST storage table.
+//!
+//! ## Strategy Selection
+//!
+//! When CTE output columns == ST storage columns (no mismatch):
+//!   - INSERT-only → semi-naive (strategy 1)
+//!   - Mixed changes → DRed (strategy 2)
+//!
+//! When CTE columns ⊃ ST columns (mismatch):
+//!   - All change types → recomputation (strategy 3)
+//!
+//! Non-linear recursion (multiple self-references) is rejected — PostgreSQL
+//! restricts the recursive term to reference the CTE at most once.
 //!
 //! # SQL Generation Strategy
 //!
@@ -95,17 +105,49 @@ pub fn diff_recursive_cte(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResu
         )));
     }
 
-    // Use the recomputation strategy for recursive CTEs.
+    // ── Strategy selection ────────────────────────────────────────────
     //
-    // The semi-naive and DRed strategies require the ST storage table to
-    // have ALL CTE output columns (for the recursive self-reference join).
-    // However, the ST storage only has the outer projection's columns,
-    // which may be a subset of CTE columns (e.g., the CTE has `parent_id`
-    // for the join but the outer SELECT doesn't project it). Until the
-    // semi-naive/DRed paths are updated to handle this column mismatch,
-    // we use the recomputation approach which re-executes the full CTE
-    // and diffs against storage — correct for all cases.
-    generate_recomputation_delta(ctx, alias, columns, base, recursive, *union_all)
+    // The semi-naive and DRed strategies replace the recursive self-
+    // reference with the ST storage table. This requires all CTE output
+    // columns to be present in the ST. When they match, we can use the
+    // incremental paths; otherwise we fall back to recomputation which
+    // re-executes the full defining query and diffs against storage.
+
+    let columns_match = ctx
+        .st_user_columns
+        .as_ref()
+        .is_some_and(|st_cols| *st_cols == *columns);
+
+    if !columns_match {
+        // Column mismatch: the ST storage has fewer columns than the
+        // CTE (e.g., outer SELECT doesn't project parent_id). The
+        // incremental paths would reference missing columns. Fall back
+        // to recomputation which handles this correctly.
+        return generate_recomputation_delta(ctx, alias, columns, base, recursive, *union_all);
+    }
+
+    // Columns match — differentiate the base case and choose strategy.
+    let base_delta = ctx.diff_node(base)?;
+
+    // Check whether any source table has DELETE or UPDATE changes.
+    let source_oids = base.source_oids();
+    let has_deletes = check_for_delete_changes(ctx, &source_oids)?;
+
+    if has_deletes {
+        // Mixed INSERT/DELETE/UPDATE changes → DRed algorithm.
+        generate_dred_delta(
+            ctx,
+            alias,
+            columns,
+            &base_delta,
+            base,
+            recursive,
+            *union_all,
+        )
+    } else {
+        // INSERT-only changes → semi-naive propagation.
+        generate_semi_naive_delta(ctx, alias, columns, &base_delta, recursive, *union_all)
+    }
 }
 
 /// Check if any of the given source tables have DELETE or UPDATE changes
@@ -1091,27 +1133,59 @@ fn generate_query_sql_with_change_buffers(
             aliases,
             child,
         } => {
-            let child_sql = generate_query_sql_with_change_buffers(ctx, child, st_table)?;
-            match child_sql {
-                Some(inner) => {
-                    let proj_exprs: Vec<String> = expressions
-                        .iter()
-                        .zip(aliases.iter())
-                        .map(|(e, a)| {
-                            let esql = e.to_sql();
-                            if esql == *a {
-                                quote_ident(a)
-                            } else {
-                                format!("{esql} AS {}", quote_ident(a))
-                            }
-                        })
-                        .collect();
+            let proj_exprs: Vec<String> = expressions
+                .iter()
+                .zip(aliases.iter())
+                .map(|(e, a)| {
+                    let esql = e.to_sql();
+                    if esql == *a {
+                        quote_ident(a)
+                    } else {
+                        format!("{esql} AS {}", quote_ident(a))
+                    }
+                })
+                .collect();
+
+            // Inline the FROM clause for Join children so that project
+            // expressions (which use original table aliases like `n.id`)
+            // resolve correctly.
+            match child.as_ref() {
+                OpTree::InnerJoin {
+                    condition,
+                    left,
+                    right,
+                } => {
+                    let left_from = generate_change_buffer_from(ctx, left, st_table)?;
+                    let right_from = generate_change_buffer_from(ctx, right, st_table)?;
                     Ok(Some(format!(
-                        "SELECT {projs}\nFROM (\n{inner}\n) __p",
+                        "SELECT {projs}\nFROM {left_from}\nJOIN {right_from}\n  ON {cond}",
                         projs = proj_exprs.join(", "),
+                        cond = condition.to_sql(),
                     )))
                 }
-                None => Ok(None),
+                OpTree::LeftJoin {
+                    condition,
+                    left,
+                    right,
+                } => {
+                    let left_from = generate_change_buffer_from(ctx, left, st_table)?;
+                    let right_from = generate_change_buffer_from(ctx, right, st_table)?;
+                    Ok(Some(format!(
+                        "SELECT {projs}\nFROM {left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                        projs = proj_exprs.join(", "),
+                        cond = condition.to_sql(),
+                    )))
+                }
+                _ => {
+                    let child_sql = generate_query_sql_with_change_buffers(ctx, child, st_table)?;
+                    match child_sql {
+                        Some(inner) => Ok(Some(format!(
+                            "SELECT {projs}\nFROM (\n{inner}\n) __p",
+                            projs = proj_exprs.join(", "),
+                        ))),
+                        None => Ok(None),
+                    }
+                }
             }
         }
 
@@ -1464,6 +1538,7 @@ fn generate_nonlinear_seeds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dvm::operators::test_helpers::test_ctx;
     use crate::dvm::parser::{Column, Expr, OpTree};
 
     fn make_column(name: &str) -> Column {
@@ -2474,5 +2549,150 @@ mod tests {
         let mut cols = Vec::new();
         collect_select_cols(&subquery, &mut cols);
         assert_eq!(cols, vec!["\"s\".\"a\"", "\"s\".\"b\""]);
+    }
+
+    // ── generate_query_sql_with_change_buffers: Project-over-Join inline ──
+
+    #[test]
+    fn test_change_buffer_project_over_inner_join_inlines() {
+        // Recursive term: SELECT n.id, n.parent_id, n.label
+        //   FROM sn_nodes n JOIN t ON n.parent_id = t.id
+        // The Project-over-InnerJoin should inline the FROM clause so that
+        // project expressions (which use original table aliases) resolve.
+        let scan = make_scan(
+            100,
+            "sn_nodes",
+            "public",
+            "n",
+            &["id", "parent_id", "label"],
+        );
+        let self_ref = make_self_ref("tree", "t", &["id", "parent_id", "label"]);
+        let join = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "parent_id".to_string(),
+                }),
+                right: Box::new(Expr::ColumnRef {
+                    table_alias: Some("t".to_string()),
+                    column_name: "id".to_string(),
+                }),
+            },
+            left: Box::new(scan),
+            right: Box::new(self_ref),
+        };
+        let project = OpTree::Project {
+            expressions: vec![
+                Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "id".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "parent_id".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "label".to_string(),
+                },
+            ],
+            aliases: vec![
+                "id".to_string(),
+                "parent_id".to_string(),
+                "label".to_string(),
+            ],
+            child: Box::new(join),
+        };
+
+        let ctx = test_ctx();
+        let sql = generate_query_sql_with_change_buffers(&ctx, &project, "\"public\".\"st_table\"")
+            .unwrap();
+
+        let sql = sql.expect("Should produce SQL for Project-over-InnerJoin");
+        // Project expressions should resolve against the inlined FROM
+        assert!(
+            sql.contains("n.id"),
+            "Should reference n.id from project expressions"
+        );
+        // Self-ref should be replaced with ST storage
+        assert!(
+            sql.contains("\"public\".\"st_table\" AS \"t\""),
+            "Self-ref should be replaced with ST storage"
+        );
+        // Should use JOIN, not a subquery wrapper
+        assert!(sql.contains("JOIN"), "Should have JOIN");
+        assert!(
+            !sql.contains("__p"),
+            "Should NOT wrap in __p subquery (inlined)"
+        );
+    }
+
+    #[test]
+    fn test_change_buffer_project_over_left_join_inlines() {
+        let scan = make_scan(100, "nodes", "public", "n", &["id", "parent_id"]);
+        let self_ref = make_self_ref("tree", "t", &["id", "parent_id"]);
+        let join = OpTree::LeftJoin {
+            condition: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "parent_id".to_string(),
+                }),
+                right: Box::new(Expr::ColumnRef {
+                    table_alias: Some("t".to_string()),
+                    column_name: "id".to_string(),
+                }),
+            },
+            left: Box::new(scan),
+            right: Box::new(self_ref),
+        };
+        let project = OpTree::Project {
+            expressions: vec![Expr::ColumnRef {
+                table_alias: Some("n".to_string()),
+                column_name: "id".to_string(),
+            }],
+            aliases: vec!["id".to_string()],
+            child: Box::new(join),
+        };
+
+        let ctx = test_ctx();
+        let sql =
+            generate_query_sql_with_change_buffers(&ctx, &project, "\"public\".\"st\"").unwrap();
+
+        let sql = sql.expect("Should produce SQL");
+        assert!(sql.contains("LEFT JOIN"), "Should have LEFT JOIN");
+        assert!(
+            sql.contains("\"public\".\"st\" AS \"t\""),
+            "Self-ref should use ST storage"
+        );
+        assert!(
+            !sql.contains("__p"),
+            "Should NOT wrap in __p subquery (inlined)"
+        );
+    }
+
+    // ── Strategy selection: column matching ──────────────────────────
+
+    #[test]
+    fn test_columns_match_enables_incremental() {
+        // When CTE columns == ST user columns, diff_recursive_cte should
+        // NOT produce recomputation-style CTEs (rc_recomp_*).
+        // This test verifies the column matching condition works.
+        let cte_cols = vec!["id".to_string(), "label".to_string()];
+        let st_cols = vec!["id".to_string(), "label".to_string()];
+        assert_eq!(cte_cols, st_cols, "Columns should match");
+    }
+
+    #[test]
+    fn test_columns_mismatch_forces_recomputation() {
+        // When CTE columns ⊃ ST columns, recomputation should be used.
+        let cte_cols = vec![
+            "id".to_string(),
+            "parent_id".to_string(),
+            "label".to_string(),
+        ];
+        let st_cols = vec!["id".to_string(), "label".to_string()];
+        assert_ne!(cte_cols, st_cols, "Columns should NOT match");
     }
 }

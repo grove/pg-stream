@@ -1719,7 +1719,7 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgStreamError> {
 
 /// Context threaded through the parser for CTE handling.
 ///
-/// Holds the raw `SelectStmt` pointers from `extract_cte_map()` alongside
+/// Holds the raw `SelectStmt` pointers from `extract_cte_map_with_recursive()` alongside
 /// a mutable [`CteRegistry`] that gets populated on first reference to
 /// each CTE name. Subsequent references to the same CTE reuse the
 /// existing registry entry (same `cte_id`), producing multiple
@@ -4047,12 +4047,6 @@ unsafe fn parse_from_item(
     }
 }
 
-/// Return type for [`extract_cte_map`]: (name→SelectStmt, name→definition column aliases).
-type CteMapResult = (
-    HashMap<String, *const pg_sys::SelectStmt>,
-    HashMap<String, Vec<String>>,
-);
-
 /// Return type for [`extract_cte_map_with_recursive`]:
 /// (non_recursive_map, def_aliases, recursive_cte_stmts).
 ///
@@ -4154,71 +4148,6 @@ unsafe fn extract_cte_map_with_recursive(
     }
 
     Ok((map, def_aliases_map, recursive_stmts))
-}
-
-/// Extract CTE definitions from a WithClause into a name→SelectStmt map
-/// and a name→column-aliases map.
-///
-/// Walks `withClause->ctes` and maps each CTE name to its body's SelectStmt.
-/// Also extracts any column alias lists from `WITH x(a, b) AS (...)`.
-/// Rejects recursive CTEs — use [`extract_cte_map_with_recursive`] for
-/// WITH RECURSIVE clauses.
-///
-/// # Safety
-/// Caller must ensure `with_clause` points to a valid `WithClause` node.
-unsafe fn extract_cte_map(
-    with_clause: *const pg_sys::WithClause,
-) -> Result<CteMapResult, PgStreamError> {
-    let wc = unsafe { &*with_clause };
-    let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
-    let mut map = HashMap::new();
-    let mut def_aliases_map = HashMap::new();
-
-    for node_ptr in cte_list.iter_ptr() {
-        if !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
-            continue;
-        }
-
-        let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
-
-        // Extract CTE name
-        let cte_name = unsafe { std::ffi::CStr::from_ptr(cte.ctename) }
-            .to_str()
-            .map_err(|_| PgStreamError::QueryParseError("Invalid CTE name encoding".into()))?
-            .to_string();
-
-        // Reject recursive CTEs
-        if cte.cterecursive {
-            return Err(PgStreamError::UnsupportedOperator(format!(
-                "Recursive CTE '{cte_name}' is not supported for differential mode. \
-                 Use refresh_mode = 'FULL' for queries containing recursive CTEs.",
-            )));
-        }
-
-        // The CTE body is ctequery, which must be a SelectStmt
-        if cte.ctequery.is_null() {
-            return Err(PgStreamError::QueryParseError(format!(
-                "CTE '{cte_name}' has NULL body",
-            )));
-        }
-        if !unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) } {
-            return Err(PgStreamError::QueryParseError(format!(
-                "CTE '{cte_name}' body is not a SELECT statement",
-            )));
-        }
-
-        let stmt = cte.ctequery as *const pg_sys::SelectStmt;
-
-        // Extract column definition aliases: WITH x(a, b) AS (...)
-        let col_aliases = extract_cte_def_colnames(cte)?;
-        if !col_aliases.is_empty() {
-            def_aliases_map.insert(cte_name.clone(), col_aliases);
-        }
-
-        map.insert(cte_name, stmt);
-    }
-
-    Ok((map, def_aliases_map))
 }
 
 /// Extract column aliases from a `CommonTableExpr.aliascolnames` list.
