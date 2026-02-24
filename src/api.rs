@@ -67,6 +67,13 @@ fn create_stream_table_impl(
     // so all downstream validation and parsing sees the rewritten form.
     let query = &crate::dvm::rewrite_distinct_on(query)?;
 
+    // ── GROUPING SETS / CUBE / ROLLUP auto-rewrite ─────────────────
+    // GROUPING SETS, CUBE, and ROLLUP are decomposed into a UNION ALL of
+    // separate GROUP BY queries.  GROUPING() calls become integer literals.
+    // The rewrite happens before validation so all downstream code sees
+    // only plain GROUP BY + UNION ALL.
+    let query = &crate::dvm::rewrite_grouping_sets(query)?;
+
     // Validate the defining query by running LIMIT 0
     let columns = validate_defining_query(query)?;
 

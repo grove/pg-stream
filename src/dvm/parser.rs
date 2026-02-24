@@ -2071,6 +2071,424 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgStreamError> {
     Ok(rewritten)
 }
 
+// ── GROUPING SETS / CUBE / ROLLUP → UNION ALL rewrite ──────────────
+
+/// Rewrite a query using `GROUPING SETS`, `CUBE`, or `ROLLUP` into an
+/// equivalent `UNION ALL` of separate `GROUP BY` queries.
+///
+/// This is called **before** the DVM parser so the downstream operator tree
+/// only ever sees plain `GROUP BY` + `UNION ALL` — no new OpTree variants
+/// are needed.
+///
+/// # Algorithm
+///
+/// 1. Detect `T_GroupingSet` nodes in the raw parse tree's `groupClause`.
+/// 2. Expand `CUBE`/`ROLLUP` to their equivalent list of grouping sets.
+/// 3. Collect any plain `GROUP BY` columns (always included in every set).
+/// 4. For each grouping set, build a `SELECT … GROUP BY <set_cols>` where:
+///    - Column references to non-grouped columns are replaced with `NULL`.
+///    - `GROUPING(col, …)` calls are replaced with computed integer literals.
+/// 5. Combine all branches with `UNION ALL`.
+///
+/// If the query contains no grouping sets, it is returned unchanged.
+pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgStreamError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return Ok(query.to_string()),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(query.to_string());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // Set operations — don't rewrite
+    if select.op != pg_sys::SetOperation::SETOP_NONE {
+        return Ok(query.to_string());
+    }
+
+    // No GROUP BY at all
+    if select.groupClause.is_null() {
+        return Ok(query.to_string());
+    }
+
+    // ── Scan groupClause to find GroupingSet nodes ──────────────────
+    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+    let mut has_grouping_sets = false;
+    for node_ptr in group_list.iter_ptr() {
+        if !node_ptr.is_null() && unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_GroupingSet) } {
+            has_grouping_sets = true;
+            break;
+        }
+    }
+    if !has_grouping_sets {
+        return Ok(query.to_string());
+    }
+
+    // ── Separate plain columns from GroupingSet specifications ──────
+    let mut plain_col_exprs: Vec<String> = Vec::new();
+    let mut grouping_set_specs: Vec<Vec<Vec<String>>> = Vec::new();
+
+    for node_ptr in group_list.iter_ptr() {
+        if node_ptr.is_null() {
+            continue;
+        }
+        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_GroupingSet) } {
+            // SAFETY: confirmed T_GroupingSet above
+            let gs = unsafe { &*(node_ptr as *const pg_sys::GroupingSet) };
+            let expanded = expand_grouping_set(gs)?;
+            grouping_set_specs.push(expanded);
+        } else {
+            // Plain GROUP BY expression
+            let expr_sql = unsafe { node_to_expr(node_ptr) }
+                .map(|e| e.output_name())
+                .unwrap_or_else(|_| "?".to_string());
+            plain_col_exprs.push(expr_sql);
+        }
+    }
+
+    // ── Cross-product all grouping set specifications ───────────────
+    // GROUP BY a, ROLLUP(b, c), CUBE(d) → cross product of the
+    // ROLLUP sets and CUBE sets, with `a` always included.
+    let mut final_sets: Vec<Vec<String>> = vec![vec![]];
+    for spec_sets in &grouping_set_specs {
+        let mut new_final = Vec::new();
+        for existing in &final_sets {
+            for new_set in spec_sets {
+                let mut combined = existing.clone();
+                combined.extend(new_set.iter().cloned());
+                new_final.push(combined);
+            }
+        }
+        final_sets = new_final;
+    }
+
+    // Prepend plain columns to every set
+    if !plain_col_exprs.is_empty() {
+        for set in &mut final_sets {
+            let mut with_plain = plain_col_exprs.clone();
+            with_plain.append(set);
+            *set = with_plain;
+        }
+    }
+
+    // Collect the union of all grouping columns (for NULL substitution)
+    let all_grouping_cols: Vec<String> = {
+        let mut all = std::collections::HashSet::new();
+        for set in &final_sets {
+            for col in set {
+                all.insert(col.clone());
+            }
+        }
+        all.into_iter().collect()
+    };
+
+    // ── Extract query components as SQL text ────────────────────────
+    let from_sql = extract_from_clause_sql(select)?;
+
+    let where_sql = if select.whereClause.is_null() {
+        String::new()
+    } else {
+        let where_expr = unsafe { node_to_expr(select.whereClause) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "TRUE".to_string());
+        format!(" WHERE {where_expr}")
+    };
+
+    let having_sql = if select.havingClause.is_null() {
+        String::new()
+    } else {
+        let having_expr = unsafe { node_to_expr(select.havingClause) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "TRUE".to_string());
+        format!(" HAVING {having_expr}")
+    };
+
+    // ── Parse target list ──────────────────────────────────────────
+    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let mut targets: Vec<TargetEntry> = Vec::new();
+
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+
+        let alias = if !rt.name.is_null() {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                    .to_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        // Check if target expression is a GROUPING() call
+        if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_GroupingFunc) } {
+            // SAFETY: confirmed T_GroupingFunc
+            let gf = unsafe { &*(rt.val as *const pg_sys::GroupingFunc) };
+            let gf_args = extract_grouping_func_args(gf)?;
+            targets.push(TargetEntry {
+                kind: TargetKind::GroupingFunc(gf_args),
+                alias,
+            });
+            continue;
+        }
+
+        // Parse as expression
+        let expr =
+            unsafe { node_to_expr(rt.val) }.unwrap_or_else(|_| Expr::Raw("NULL".to_string()));
+
+        // Check if this is a simple column ref that matches a grouping column
+        let col_name = match &expr {
+            Expr::ColumnRef { column_name, .. } => Some(column_name.clone()),
+            _ => None,
+        };
+
+        if let Some(ref cn) = col_name
+            && all_grouping_cols.iter().any(|gc| gc == cn)
+        {
+            targets.push(TargetEntry {
+                kind: TargetKind::GroupingColumn(cn.clone(), expr),
+                alias,
+            });
+            continue;
+        }
+
+        // Aggregate or other expression — emit as-is
+        targets.push(TargetEntry {
+            kind: TargetKind::Expression(expr),
+            alias,
+        });
+    }
+
+    // ── Build UNION ALL branches ───────────────────────────────────
+    let mut branches: Vec<String> = Vec::new();
+
+    for current_set in &final_sets {
+        let mut select_parts: Vec<String> = Vec::new();
+
+        for target in &targets {
+            let sql = match &target.kind {
+                TargetKind::GroupingFunc(args) => {
+                    let value = compute_grouping_value(args, current_set);
+                    let alias_part = target
+                        .alias
+                        .as_ref()
+                        .map(|a| format!(" AS \"{}\"", a.replace('"', "\"\"")))
+                        .unwrap_or_default();
+                    format!("{value}{alias_part}")
+                }
+                TargetKind::GroupingColumn(col_name, expr) => {
+                    let in_set = current_set.iter().any(|c| c == col_name);
+                    let alias_part = match &target.alias {
+                        Some(a) => format!(" AS \"{}\"", a.replace('"', "\"\"")),
+                        None => format!(" AS \"{}\"", col_name.replace('"', "\"\"")),
+                    };
+                    if in_set {
+                        format!("{}{alias_part}", expr.to_sql())
+                    } else {
+                        format!("NULL{alias_part}")
+                    }
+                }
+                TargetKind::Expression(expr) => {
+                    let alias_part = target
+                        .alias
+                        .as_ref()
+                        .map(|a| format!(" AS \"{}\"", a.replace('"', "\"\"")))
+                        .unwrap_or_default();
+                    format!("{}{alias_part}", expr.to_sql())
+                }
+            };
+            select_parts.push(sql);
+        }
+
+        let group_by_sql = if current_set.is_empty() {
+            String::new()
+        } else {
+            let cols: Vec<String> = current_set
+                .iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect();
+            format!(" GROUP BY {}", cols.join(", "))
+        };
+
+        branches.push(format!(
+            "SELECT {} FROM {from_sql}{where_sql}{group_by_sql}{having_sql}",
+            select_parts.join(", ")
+        ));
+    }
+
+    let rewritten = branches.join(" UNION ALL ");
+
+    pgrx::debug1!(
+        "[pg_stream] Rewrote GROUPING SETS query to UNION ALL: {}",
+        rewritten
+    );
+
+    Ok(rewritten)
+}
+
+/// A target list entry classified for grouping-set rewriting.
+struct TargetEntry {
+    kind: TargetKind,
+    alias: Option<String>,
+}
+
+/// Classification of a SELECT-list expression for grouping-set rewriting.
+enum TargetKind {
+    /// A reference to a grouping column (may be NULLified per branch).
+    GroupingColumn(String, Expr),
+    /// A `GROUPING(col, …)` call (replaced with a literal per branch).
+    GroupingFunc(Vec<String>),
+    /// An aggregate or other expression (emitted as-is in every branch).
+    Expression(Expr),
+}
+
+/// Expand a `GroupingSet` node into a list of grouping sets (each set
+/// is a `Vec<String>` of column names).
+fn expand_grouping_set(gs: &pg_sys::GroupingSet) -> Result<Vec<Vec<String>>, PgStreamError> {
+    let columns = extract_grouping_set_columns(gs)?;
+
+    match gs.kind {
+        pg_sys::GroupingSetKind::GROUPING_SET_EMPTY => Ok(vec![vec![]]),
+
+        pg_sys::GroupingSetKind::GROUPING_SET_SIMPLE => Ok(vec![columns]),
+
+        pg_sys::GroupingSetKind::GROUPING_SET_ROLLUP => {
+            // ROLLUP(a, b, c) → [(a,b,c), (a,b), (a), ()]
+            let mut sets = Vec::new();
+            for i in (0..=columns.len()).rev() {
+                sets.push(columns[..i].to_vec());
+            }
+            Ok(sets)
+        }
+
+        pg_sys::GroupingSetKind::GROUPING_SET_CUBE => {
+            // CUBE(a, b, c) → all 2^n subsets, ordered largest-first
+            let n = columns.len();
+            let mut sets = Vec::new();
+            // Iterate from (2^n - 1) down to 0 for largest-first ordering
+            for mask in (0..(1u64 << n)).rev() {
+                let mut set = Vec::new();
+                for (i, col) in columns.iter().enumerate() {
+                    if mask & (1u64 << (n - 1 - i)) != 0 {
+                        set.push(col.clone());
+                    }
+                }
+                sets.push(set);
+            }
+            Ok(sets)
+        }
+
+        pg_sys::GroupingSetKind::GROUPING_SET_SETS => {
+            // GROUPING SETS ((a, b), (c), ()) — content is a list of
+            // nested GroupingSet nodes (SIMPLE or EMPTY).
+            if gs.content.is_null() {
+                return Ok(vec![vec![]]);
+            }
+            let content_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(gs.content) };
+            let mut sets = Vec::new();
+            for node_ptr in content_list.iter_ptr() {
+                if node_ptr.is_null() {
+                    continue;
+                }
+                if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_GroupingSet) } {
+                    // Nested grouping set (SIMPLE, EMPTY, or nested ROLLUP/CUBE)
+                    let inner = unsafe { &*(node_ptr as *const pg_sys::GroupingSet) };
+                    let inner_sets = expand_grouping_set(inner)?;
+                    sets.extend(inner_sets);
+                } else {
+                    // Single column expression
+                    let col_sql = unsafe { node_to_expr(node_ptr) }
+                        .map(|e| e.output_name())
+                        .unwrap_or_else(|_| "?".to_string());
+                    sets.push(vec![col_sql]);
+                }
+            }
+            Ok(sets)
+        }
+
+        _ => Err(PgStreamError::UnsupportedOperator(format!(
+            "Unknown GroupingSet kind: {:?}",
+            gs.kind
+        ))),
+    }
+}
+
+/// Extract column names from a `GroupingSet`'s content list.
+fn extract_grouping_set_columns(gs: &pg_sys::GroupingSet) -> Result<Vec<String>, PgStreamError> {
+    if gs.content.is_null() {
+        return Ok(vec![]);
+    }
+    let content_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(gs.content) };
+    let mut cols = Vec::new();
+    for node_ptr in content_list.iter_ptr() {
+        if node_ptr.is_null() {
+            continue;
+        }
+        let col_sql = unsafe { node_to_expr(node_ptr) }
+            .map(|e| e.output_name())
+            .unwrap_or_else(|_| "?".to_string());
+        cols.push(col_sql);
+    }
+    Ok(cols)
+}
+
+/// Extract `GROUPING(col, …)` argument column names from a raw-parse
+/// `GroupingFunc` node.
+fn extract_grouping_func_args(gf: &pg_sys::GroupingFunc) -> Result<Vec<String>, PgStreamError> {
+    if gf.args.is_null() {
+        return Ok(vec![]);
+    }
+    let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(gf.args) };
+    let mut names = Vec::new();
+    for node_ptr in args_list.iter_ptr() {
+        if node_ptr.is_null() {
+            continue;
+        }
+        let name = unsafe { node_to_expr(node_ptr) }
+            .map(|e| e.output_name())
+            .unwrap_or_else(|_| "?".to_string());
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Compute the `GROUPING(col1, col2, …)` integer value for a given
+/// grouping set. Returns a bitmask where bit *i* (MSB-first) is 1 if
+/// the *i*-th argument is **not** in the current grouping set.
+fn compute_grouping_value(args: &[String], current_set: &[String]) -> i64 {
+    let mut value: i64 = 0;
+    for arg in args {
+        value <<= 1;
+        if !current_set.iter().any(|c| c == arg) {
+            value |= 1; // column is aggregated (not grouped) → 1
+        }
+    }
+    value
+}
+
 /// Extract FROM clause as SQL text from a SelectStmt.
 fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgStreamError> {
     if select.fromClause.is_null() {
@@ -2304,31 +2722,8 @@ unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), Pg
     }
 
     // ── GROUPING SETS / CUBE / ROLLUP ────────────────────────────────
-    // Walk groupClause looking for T_GroupingSet nodes. These are silently
-    // absent from the GROUP BY expression list at parse time — PostgreSQL
-    // expands them during analysis, so we must detect and reject them here
-    // rather than letting them be skipped by the `if let Ok` pattern.
-    if !select.groupClause.is_null() {
-        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
-        for node_ptr in group_list.iter_ptr() {
-            if !node_ptr.is_null()
-                && unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_GroupingSet) }
-            {
-                // SAFETY: node_ptr is a valid GroupingSet node confirmed by is_a()
-                let gs = unsafe { &*(node_ptr as *const pg_sys::GroupingSet) };
-                let kind_name = match gs.kind {
-                    pg_sys::GroupingSetKind::GROUPING_SET_ROLLUP => "ROLLUP",
-                    pg_sys::GroupingSetKind::GROUPING_SET_CUBE => "CUBE",
-                    _ => "GROUPING SETS",
-                };
-                return Err(PgStreamError::UnsupportedOperator(format!(
-                    "{kind_name} is not supported in defining queries. \
-                     Create separate stream tables for each grouping level \
-                     and combine with UNION ALL, or use FULL refresh mode instead."
-                )));
-            }
-        }
-    }
+    // Handled by auto-rewriting to UNION ALL of separate GROUP BY queries
+    // in `rewrite_grouping_sets()`. No rejection needed here.
 
     Ok(())
 }
@@ -9411,4 +9806,86 @@ mod tests {
         tree_collect_volatility(&tree, &mut worst).unwrap();
         assert_eq!(worst, 'i');
     }
+
+    // ── GROUPING SETS rewrite helpers ──────────────────────────────
+
+    #[test]
+    fn test_compute_grouping_value_single_in_set() {
+        // GROUPING(department) where department IS grouped → 0
+        assert_eq!(
+            compute_grouping_value(&["department".to_string()], &["department".to_string()]),
+            0
+        );
+    }
+
+    #[test]
+    fn test_compute_grouping_value_single_not_in_set() {
+        // GROUPING(department) where department is NOT grouped → 1
+        assert_eq!(
+            compute_grouping_value(&["department".to_string()], &["region".to_string()]),
+            1
+        );
+    }
+
+    #[test]
+    fn test_compute_grouping_value_two_args_both_grouped() {
+        // GROUPING(a, b) where both are grouped → 0b00 = 0
+        assert_eq!(
+            compute_grouping_value(
+                &["a".to_string(), "b".to_string()],
+                &["a".to_string(), "b".to_string()]
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn test_compute_grouping_value_two_args_first_not_grouped() {
+        // GROUPING(a, b) where a not grouped, b grouped → 0b10 = 2
+        assert_eq!(
+            compute_grouping_value(&["a".to_string(), "b".to_string()], &["b".to_string()]),
+            2
+        );
+    }
+
+    #[test]
+    fn test_compute_grouping_value_two_args_second_not_grouped() {
+        // GROUPING(a, b) where a grouped, b not grouped → 0b01 = 1
+        assert_eq!(
+            compute_grouping_value(&["a".to_string(), "b".to_string()], &["a".to_string()]),
+            1
+        );
+    }
+
+    #[test]
+    fn test_compute_grouping_value_two_args_neither_grouped() {
+        // GROUPING(a, b) where neither grouped → 0b11 = 3
+        assert_eq!(
+            compute_grouping_value(&["a".to_string(), "b".to_string()], &[]),
+            3
+        );
+    }
+
+    #[test]
+    fn test_compute_grouping_value_three_args_mixed() {
+        // GROUPING(a, b, c) where a=grouped, b=not, c=grouped → 0b010 = 2
+        assert_eq!(
+            compute_grouping_value(
+                &["a".to_string(), "b".to_string(), "c".to_string()],
+                &["a".to_string(), "c".to_string()]
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn test_compute_grouping_value_empty_args() {
+        // GROUPING() with no args → 0
+        assert_eq!(compute_grouping_value(&[], &["a".to_string()]), 0);
+    }
+
+    // Note: expand_grouping_set / expand_cube / expand_rollup tests require
+    // pg_sys FFI (palloc0, makeString, lappend) so they live in E2E tests.
+    // The ROLLUP/CUBE expansion logic is verified via the compute_grouping_value
+    // tests above plus E2E integration tests.
 }

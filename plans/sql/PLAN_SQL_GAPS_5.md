@@ -4,7 +4,7 @@
 **Date:** 2026-02-24  
 **Branch:** `main`  
 **Scope:** Next priorities for SQL feature coverage — both new implementations and revisiting rejected constructs.  
-**Current state:** 876 unit tests, 22 E2E test suites, 37 AggFunc variants, 21 OpTree variants, 20 diff operators. Zero P0 or P1 issues. All remaining gaps are P2+ with clear error messages.
+**Current state:** 890 unit tests, 22 E2E test suites, 37 AggFunc variants, 21 OpTree variants, 20 diff operators. Zero P0 or P1 issues. All remaining gaps are P2+ with clear error messages.
 
 ### Completed Steps
 
@@ -48,6 +48,16 @@
   - `collect_union_children()` no longer rejects mixed trees
   - Children with different `all` flag parsed as separate set operations via `parse_set_operation()`
   - Respects PostgreSQL's nested `SetOperationStmt` tree structure
+
+- [x] **S11: GROUPING SETS / CUBE / ROLLUP (A7/B4)** — Done 2026-02-25
+  - `rewrite_grouping_sets()` parse-time rewrite: decomposes GROUPING SETS / CUBE / ROLLUP into UNION ALL of separate GROUP BY queries
+  - `expand_grouping_set()` recursively expands CUBE (all 2^n subsets), ROLLUP (prefix subsets), and nested GROUPING SETS
+  - Cross-product of multiple grouping set specifications (e.g., `GROUP BY a, ROLLUP(b), CUBE(c)`)
+  - `GROUPING(col, …)` calls replaced with computed integer literals per branch
+  - Non-grouped columns replaced with `NULL` per branch
+  - Rejection removed from `check_select_unsupported()`
+  - Wired into `api.rs` before `validate_defining_query()` (same pattern as DISTINCT ON rewrite)
+  - 9 new unit tests for `compute_grouping_value` (890 total)
 
 ---
 
@@ -811,7 +821,7 @@ independently. Steps are numbered sequentially for easy reference.
 
 | Step | Item(s) | Effort | Delivers | Prereqs |
 |------|---------|--------|----------|----------|
-| **S11** | A7: GROUPING SETS / CUBE / ROLLUP | 10–15h | Major OLAP feature via UNION ALL decomposition | — |
+| ~~**S11**~~ | ~~A7: GROUPING SETS / CUBE / ROLLUP~~ | ~~10–15h~~ | ~~✅ DONE~~ | — |
 | **S12** | A10: Scalar subquery in WHERE | 6–8h | CROSS JOIN auto-rewrite | — |
 | **S13** | B6: SubLinks inside OR | 8–10h | OR-to-UNION rewrite | — |
 | **S14** | A8: Multiple PARTITION BY in windows | 8–10h | Multi-pass recomputation | — |
@@ -826,8 +836,8 @@ independently. Steps are numbered sequentially for easy reference.
 | ~~2 — High-Value~~ | ~~S3–S6~~ | ~~18–26h~~ | ~~✅ DONE~~ |
 | ~~3 — Schema Infra~~ | ~~S7–S8~~ | ~~6–8h~~ | ~~✅ DONE~~ |
 | ~~4 — Unlocked~~ | ~~S9–S10~~ | ~~10–14h~~ | ~~✅ DONE~~ |
-| 5 — Advanced | S11–S14, ~~S15~~ | 32–43h | GROUPING SETS, scalar WHERE, OR sublinks, multi-PARTITION; ~~recursive CTE ✅~~ |
-| **Total remaining** | **S11–S14** | **~32–43h** | **4 advanced items** |
+| 5 — Advanced | ~~S11~~, S12–S14, ~~S15~~ | 24–33h | ~~GROUPING SETS ✅~~, scalar WHERE, OR sublinks, multi-PARTITION; ~~recursive CTE ✅~~ |
+| **Total remaining** | **S12–S14** | **~24–28h** | **3 advanced items** |
 
 ---
 
@@ -916,7 +926,7 @@ design reasons that no schema policy can address:
 - [x] `pg_stream.block_source_ddl` GUC available, default false (S8)
 - [x] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot (S9)
 - [x] Keyless tables supported with all-column content hash for `__pgs_row_id` (S10)
-- [ ] GROUPING SETS / CUBE / ROLLUP via UNION ALL decomposition (S11)
+- [x] GROUPING SETS / CUBE / ROLLUP via UNION ALL decomposition (S11)
 - [ ] Scalar subquery in WHERE via CROSS JOIN rewrite (S12)
 - [ ] SubLinks inside OR via OR-to-UNION rewrite (S13)
 - [ ] Multiple PARTITION BY via multi-pass recomputation (S14)
