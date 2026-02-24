@@ -45,6 +45,7 @@ existing dbt models.
 - [File Layout](#file-layout)
 - [Effort Estimate](#effort-estimate)
 - [Appendix: Example Project](#appendix-example-project)
+- [Plan Changelog](#plan-changelog)
 
 ---
 
@@ -267,8 +268,8 @@ the materialization has already fetched the metadata.
       {% set alter_sql %}
         SELECT pgstream.alter_stream_table(
           {{ dbt.string_literal(name) }},
-          schedule => {% if current.schedule != schedule %}{{ dbt.string_literal(schedule) }}{% else %}NULL{% endif %},
-          refresh_mode => {% if current.refresh_mode != refresh_mode %}{{ dbt.string_literal(refresh_mode) }}{% else %}NULL{% endif %},
+          schedule => {% if current.schedule != schedule %}{% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %}{% else %}NULL{% endif %},
+          refresh_mode => {% if current.refresh_mode != refresh_mode %}{% if refresh_mode is none %}NULL{% else %}{{ dbt.string_literal(refresh_mode) }}{% endif %}{% else %}NULL{% endif %},
           status => {% if status is not none and current.status != status %}{{ dbt.string_literal(status) }}{% else %}NULL{% endif %}
         )
       {% endset %}
@@ -328,6 +329,10 @@ Handles both simple names (`order_totals`) and schema-qualified names
 `pgs_schema` and `pgs_name` columns. This avoids ambiguity when two schemas
 have a stream table with the same name.
 
+Unqualified names default to `target.schema` (from the dbt profile), matching
+how the materialization resolves schemas. This avoids a mismatch with the Rust
+API fallback (`current_schema()`).
+
 ```sql
 {% macro pgstream_stream_table_exists(name) %}
   {% if execute %}
@@ -337,7 +342,7 @@ have a stream table with the same name.
       {% set lookup_schema = parts[0] %}
       {% set lookup_name = parts[1] %}
     {% else %}
-      {% set lookup_schema = 'public' %}
+      {% set lookup_schema = target.schema %}
       {% set lookup_name = name %}
     {% endif %}
 
@@ -364,6 +369,7 @@ File: `macros/utils/get_stream_table_info.sql`
 Returns a row dict with `pgs_name`, `pgs_schema`, `defining_query`, `schedule`,
 `refresh_mode`, `status` — or `none` if the stream table does not exist.
 Filters on both `pgs_schema` and `pgs_name` to avoid ambiguity.
+Unqualified names default to `target.schema`.
 
 ```sql
 {% macro pgstream_get_stream_table_info(name) %}
@@ -373,7 +379,7 @@ Filters on both `pgs_schema` and `pgs_name` to avoid ambiguity.
       {% set lookup_schema = parts[0] %}
       {% set lookup_name = parts[1] %}
     {% else %}
-      {% set lookup_schema = 'public' %}
+      {% set lookup_schema = target.schema %}
       {% set lookup_name = name %}
     {% endif %}
 
@@ -600,14 +606,26 @@ Named `pgstream_refresh` (not just `refresh`) to avoid name collisions with othe
 packages or user macros.
 
 ```sql
-{% macro pgstream_refresh(model_name) %}
-  {{ pgstream_refresh_stream_table(model_name) }}
+{% macro pgstream_refresh(model_name, schema=none) %}
+  {# Schema-qualify if not already qualified #}
+  {% if '.' in model_name %}
+    {% set qualified = model_name %}
+  {% elif schema is not none %}
+    {% set qualified = schema ~ '.' ~ model_name %}
+  {% else %}
+    {% set qualified = target.schema ~ '.' ~ model_name %}
+  {% endif %}
+  {{ pgstream_refresh_stream_table(qualified) }}
 {% endmacro %}
 ```
 
 Usage:
 ```bash
+# Uses target.schema from profiles.yml by default
 dbt run-operation pgstream_refresh --args '{"model_name": "order_totals"}'
+
+# Or explicitly schema-qualify
+dbt run-operation pgstream_refresh --args '{"model_name": "analytics.order_totals"}''
 ```
 
 ### 6.3 Drop stream tables
@@ -630,7 +648,7 @@ Safe in shared environments where non-dbt stream tables may exist.
          | selectattr('config.materialized', 'equalto', 'stream_table') %}
     {% for model in models %}
       {% set st_name = model.config.get('stream_table_name', model.name) %}
-      {% set st_schema = model.config.get('stream_table_schema', 'public') %}
+      {% set st_schema = model.config.get('stream_table_schema', target.schema) %}
       {% set qualified = st_schema ~ '.' ~ st_name %}
       {% if pgstream_stream_table_exists(qualified) %}
         {{ pgstream_drop_stream_table(qualified) }}
@@ -667,7 +685,50 @@ created outside dbt. Use with caution in shared environments.
 {% endmacro %}
 ```
 
-### 6.4 `dbt test`
+### 6.4 CDC health check
+
+File: `macros/operations/check_cdc_health.sql`
+
+Wraps pg_stream's `check_cdc_health()` function, which is shown in the architecture
+diagram but not otherwise exposed in the macro package. Useful for CI and debugging
+CDC pipeline issues.
+
+```sql
+{% macro pgstream_check_cdc_health() %}
+  {#
+    Check CDC health for all stream tables. Reports trigger/WAL status,
+    buffer table sizes, and any replication slot issues.
+    Raises an error if any source has problems.
+  #}
+  {% if execute %}
+    {% set query %}
+      SELECT * FROM pgstream.check_cdc_health()
+    {% endset %}
+    {% set results = run_query(query) %}
+    {% set problems = [] %}
+    {% for row in results.rows %}
+      {% set st = row['pgs_schema'] ~ '.' ~ row['pgs_name'] %}
+      {% set source = row['source_schema'] ~ '.' ~ row['source_table'] %}
+      {{ log("CDC: " ~ st ~ " ← " ~ source ~ " [" ~ row['cdc_mode'] ~ "] buffer=" ~ row['buffer_rows'], info=true) }}
+      {% if row['healthy'] == false %}
+        {% do problems.append(st ~ " ← " ~ source ~ ": " ~ row['issue']) %}
+      {% endif %}
+    {% endfor %}
+    {% if problems | length > 0 %}
+      {{ exceptions.raise_compiler_error(
+           "CDC health check failed:\n" ~ problems | join("\n")
+         ) }}
+    {% endif %}
+  {% endif %}
+{% endmacro %}
+```
+
+Usage:
+```bash
+dbt run-operation pgstream_check_cdc_health
+```
+
+### 6.5 `dbt test`
 
 No special handling needed. Stream tables are standard PostgreSQL heap tables. All dbt
 tests (schema tests, data tests, custom tests) work normally by querying the table.
@@ -675,7 +736,18 @@ tests (schema tests, data tests, custom tests) work normally by querying the tab
 The `__pgs_row_id` column is present but does not interfere with tests unless the user
 explicitly selects `*` and checks column counts. Document this in the README.
 
-### 6.5 `dbt docs generate`
+### 6.5 `dbt ls` (listing stream table models)
+
+Users can list all stream table models using dbt's built-in `ls` command:
+
+```bash
+dbt ls --select config.materialized:stream_table
+```
+
+This is useful for scripting and CI — e.g., iterating over stream table models to
+check freshness or refresh them individually.
+
+### 6.6 `dbt docs generate`
 
 dbt introspects tables via `information_schema`. The `__pgs_row_id` column will appear
 in the generated docs. Add a post-hook or custom docs macro to annotate it:
@@ -706,7 +778,12 @@ out of scope for a macro-only package.
 ### 7.2 Workaround: run-operation freshness check
 
 Instead of native `dbt source freshness`, we provide a run-operation that queries
-pg_stream's monitoring view directly.
+pg_stream's `pg_stat_stream_tables` monitoring view. This view already computes
+`staleness` and `stale` — the macro avoids duplicating that logic.
+
+The macro **raises an error** when any stream table exceeds the error threshold,
+causing `dbt run-operation` to exit with a non-zero status. This is essential for
+CI pipelines where a silent log message would be missed.
 
 File: `macros/hooks/source_freshness.sql`
 
@@ -716,6 +793,9 @@ File: `macros/hooks/source_freshness.sql`
     Check freshness of stream tables via pg_stream's monitoring view.
     If model_name is provided, check only that stream table.
     Otherwise, check all stream tables.
+
+    Raises a compiler error if any stream table exceeds error_seconds,
+    causing `dbt run-operation` to exit non-zero (useful for CI).
 
     Args:
       model_name (str|none): Specific stream table to check, or all if none
@@ -728,20 +808,23 @@ File: `macros/hooks/source_freshness.sql`
         pgs_name,
         pgs_schema,
         last_refresh_at,
-        EXTRACT(EPOCH FROM (now() - data_timestamp))::int AS staleness_seconds,
+        EXTRACT(EPOCH FROM staleness)::int AS staleness_seconds,
+        stale,
         consecutive_errors
-      FROM pgstream.pgs_stream_tables
+      FROM pgstream.pg_stat_stream_tables
       WHERE status = 'ACTIVE'
       {% if model_name is not none %}
         AND pgs_name = {{ dbt.string_literal(model_name) }}
       {% endif %}
     {% endset %}
     {% set results = run_query(query) %}
+    {% set errors = [] %}
     {% for row in results.rows %}
       {% set name = row['pgs_schema'] ~ '.' ~ row['pgs_name'] %}
       {% set staleness = row['staleness_seconds'] %}
       {% if staleness is not none and staleness > error_seconds %}
         {{ log("ERROR: stream table '" ~ name ~ "' is stale (" ~ staleness ~ "s > " ~ error_seconds ~ "s)", info=true) }}
+        {% do errors.append(name) %}
       {% elif staleness is not none and staleness > warn_seconds %}
         {{ log("WARN: stream table '" ~ name ~ "' is approaching staleness (" ~ staleness ~ "s > " ~ warn_seconds ~ "s)", info=true) }}
       {% else %}
@@ -751,6 +834,12 @@ File: `macros/hooks/source_freshness.sql`
         {{ log("WARN: stream table '" ~ name ~ "' has " ~ row['consecutive_errors'] ~ " consecutive error(s)", info=true) }}
       {% endif %}
     {% endfor %}
+    {% if errors | length > 0 %}
+      {{ exceptions.raise_compiler_error(
+           "Freshness check failed: " ~ errors | length ~ " stream table(s) exceeded error threshold ("
+           ~ error_seconds ~ "s): " ~ errors | join(", ")
+         ) }}
+    {% endif %}
   {% endif %}
 {% endmacro %}
 ```
@@ -997,10 +1086,41 @@ psql -tAc "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'ord
 > file between runs. This is best done in a shell script wrapper around the dbt
 > commands, not in dbt itself.
 
-### 8.12 Test flow
+### 8.12 Test for query change (automatic drop/recreate)
+
+Verify that changing the model SQL triggers the drop/recreate path (not the alter path).
+This requires modifying the model file between runs:
+
+```bash
+# After initial dbt run, change the model query
+cp models/marts/order_totals.sql models/marts/order_totals.sql.bak
+cat > models/marts/order_totals.sql <<'EOF'
+{{ config(materialized='stream_table', schedule='1m', refresh_mode='DIFFERENTIAL') }}
+SELECT customer_id, SUM(amount) AS total_amount, COUNT(*) AS order_count,
+       MAX(created_at) AS last_order_at
+FROM {{ ref('raw_orders') }}
+GROUP BY customer_id
+EOF
+
+dbt run --select order_totals  # Should log "query changed — dropping and recreating"
+./scripts/wait_for_populated.sh order_totals 30
+
+# Verify the new column exists
+psql -tAc "SELECT column_name FROM information_schema.columns WHERE table_name='order_totals' AND column_name='last_order_at'"
+# Should output: last_order_at
+
+# Restore original
+mv models/marts/order_totals.sql.bak models/marts/order_totals.sql
+```
+
+### 8.13 Test flow
 
 ```bash
 cd dbt-pgstream/integration_tests
+
+# Cleanup trap — ensure stream tables are dropped even if tests fail
+cleanup() { dbt run-operation drop_all_stream_tables 2>/dev/null || true; }
+trap cleanup EXIT
 
 dbt deps                                # Install parent package (local: ../)
 dbt seed                                # Load raw_orders.csv into PostgreSQL
@@ -1110,13 +1230,14 @@ Cover these sections:
 3. **Installation** — `packages.yml` snippet with git URL + `subdirectory`
 4. **Quick Start** — minimal model example (config + SQL)
 5. **Configuration Reference** — table of all config keys with defaults
-6. **Operations** — `pgstream_refresh`, `drop_all_stream_tables`, `drop_all_stream_tables_force`
-7. **Freshness Monitoring** — `pgstream_check_freshness` run-operation (note: native `dbt source freshness` not supported)
-8. **Testing** — how stream tables interact with dbt test
-9. **`__pgs_row_id` Column** — what it is, how to handle it
-10. **Limitations** — known limitations table (link to this plan)
-11. **Contributing** — link to development setup
-12. **License** — Apache 2.0
+6. **Operations** — `pgstream_refresh`, `drop_all_stream_tables`, `drop_all_stream_tables_force`, `pgstream_check_cdc_health`
+7. **Freshness Monitoring** — `pgstream_check_freshness` run-operation (note: native `dbt source freshness` not supported; raises error on threshold breach)
+8. **Useful `dbt` Commands** — `dbt ls --select config.materialized:stream_table`, `dbt build` interactions
+9. **Testing** — how stream tables interact with dbt test
+10. **`__pgs_row_id` Column** — what it is, how to handle it
+11. **Limitations** — known limitations table (link to this plan)
+12. **Contributing** — link to development setup
+13. **License** — Apache 2.0
 
 ### 10.2 CHANGELOG.md
 
@@ -1135,10 +1256,11 @@ All notable changes to the dbt-pgstream package will be documented in this file.
 - Custom `stream_table` materialization
 - SQL API wrapper macros (create, alter, drop, refresh)
 - Utility macros (stream_table_exists, get_stream_table_info)
-- Freshness monitoring via `pgstream_check_freshness` run-operation
+- Freshness monitoring via `pgstream_check_freshness` run-operation (raises error on breach)
+- CDC health check via `pgstream_check_cdc_health` run-operation
 - `pgstream_refresh` and `drop_all_stream_tables` run-operations
 - `drop_all_stream_tables_force` for dropping all stream tables (including non-dbt)
-- Integration test suite with seed data and polling helper
+- Integration test suite with seed data, polling helper, and query-change test
 - CI pipeline (dbt 1.6-1.9 version matrix in main repo workflow)
 ```
 
@@ -1179,6 +1301,7 @@ Functions and catalog objects used by this package (all in `pgstream` schema):
 | `alter_stream_table` | `(name text, schedule text DEFAULT NULL, refresh_mode text DEFAULT NULL, status text DEFAULT NULL) → void` | Materialization (update path) |
 | `drop_stream_table` | `(name text) → void` | Materialization (full-refresh), `drop_all` operation |
 | `refresh_stream_table` | `(name text) → void` | `refresh` run-operation |
+| `check_cdc_health` | `() → SETOF record` | `pgstream_check_cdc_health` run-operation |
 
 ### Catalog Objects
 
@@ -1230,10 +1353,11 @@ pg-stream/
 │   │   │   ├── drop_stream_table.sql     # ~10 lines
 │   │   │   └── refresh_stream_table.sql  # ~10 lines
 │   │   ├── hooks/
-│   │   │   └── source_freshness.sql      # ~40 lines (check_freshness run-op)
+│   │   │   └── source_freshness.sql      # ~50 lines (check_freshness, raises on error)
 │   │   ├── operations/
-│   │   │   ├── refresh.sql               # ~8 lines
-│   │   │   └── drop_all.sql              # ~35 lines (safe + force variants)
+│   │   │   ├── refresh.sql               # ~12 lines (schema-qualifying)
+│   │   │   ├── drop_all.sql              # ~35 lines (safe + force variants)
+│   │   │   └── check_cdc_health.sql      # ~25 lines (CDC pipeline health)
 │   │   └── utils/
 │   │       ├── stream_table_exists.sql   # ~20 lines
 │   │       └── get_stream_table_info.sql # ~20 lines
@@ -1256,7 +1380,7 @@ pg-stream/
 └── ...
 ```
 
-**Estimated total:** ~280 lines Jinja SQL macros + ~120 lines YAML config + ~100 lines test SQL/scripts
+**Estimated total:** ~320 lines Jinja SQL macros + ~120 lines YAML config + ~120 lines test SQL/scripts
 
 > No `.github/workflows/` directory inside `dbt-pgstream/` — CI lives in the main repo's
 > workflow files and includes a `dbt-integration` job.
@@ -1272,12 +1396,12 @@ pg-stream/
 | Phase 3 — Utility macros | 1 hour |
 | Phase 4 — Custom materialization | 3 hours |
 | Phase 5 — Model configuration | 0.5 hours |
-| Phase 6 — Lifecycle operations | 1.5 hours |
+| Phase 6 — Lifecycle operations | 2 hours |
 | Phase 7 — Freshness monitoring | 1.5 hours |
-| Phase 8 — Integration tests | 3 hours |
+| Phase 8 — Integration tests | 3.5 hours |
 | Phase 9 — CI pipeline | 1.5 hours |
 | Phase 10 — Documentation | 2 hours |
-| **Total** | **~17 hours** |
+| **Total** | **~18 hours** |
 
 ---
 
@@ -1344,7 +1468,14 @@ dbt run-operation pgstream_refresh --args '{"model_name": "order_totals"}'
 dbt run --select order_totals --full-refresh
 
 # Check freshness (run-operation, not native dbt source freshness)
+# Exits non-zero if any stream table exceeds error threshold
 dbt run-operation pgstream_check_freshness
+
+# Check CDC pipeline health
+dbt run-operation pgstream_check_cdc_health
+
+# List all stream table models
+dbt ls --select config.materialized:stream_table
 
 # Tear down dbt-managed stream tables
 dbt run-operation drop_all_stream_tables
@@ -1412,3 +1543,46 @@ Fixes and improvements based on critique against the actual pg_stream codebase:
     for private repos.
 20. **profiles.yml filter (Phase 8.4):** Fixed `| int` → `| as_number` (correct dbt Jinja
     filter name).
+
+### 2026-02-24 — Review round 2
+
+Second critique pass, cross-referencing macro code against the Rust API implementations:
+
+**Bugs fixed:**
+1. **Schema defaulting mismatch (Phase 3.1, 3.2):** Utility macros defaulted unqualified
+   names to hardcoded `'public'`, but Rust uses `current_schema()` and dbt uses
+   `target.schema`. Changed default to `target.schema` so unqualified lookups match
+   the schema the materialization uses.
+2. **`alter_stream_table` NULL in alter SQL (Phase 2.2):** When `schedule` or
+   `refresh_mode` is Jinja `none`, the alter SQL rendered `{{ dbt.string_literal(none) }}`
+   which produces the string literal `'None'` — not SQL `NULL`. Added explicit
+   `{% if ... is none %}NULL{% else %}...{% endif %}` guards in the alter SQL generation.
+3. **Freshness check didn't fail CI (Phase 7.2):** `pgstream_check_freshness` only
+   logged warnings/errors but returned exit code 0. `dbt run-operation` would silently
+   pass in CI even with stale data. Now calls `exceptions.raise_compiler_error()` when
+   any stream table exceeds the error threshold.
+
+**Missing coverage added:**
+4. **Freshness macro now uses `pg_stat_stream_tables` view (Phase 7.2):** Replaced
+   manual `EXTRACT(EPOCH FROM (now() - data_timestamp))` with the view's pre-computed
+   `staleness` column. Avoids duplicating staleness logic.
+5. **`pgstream_refresh` now schema-qualifies (Phase 6.2):** Added optional `schema`
+   parameter; defaults to `target.schema` for unqualified names. Consistent with
+   how the materialization schema-qualifies.
+6. **Query-change test (Phase 8.12):** Added test section that modifies the model SQL
+   between runs and verifies the automatic drop/recreate path fires.
+7. **Test flow cleanup trap (Phase 8.13):** Added `trap cleanup EXIT` to ensure stream
+   tables are dropped even if tests fail mid-way. Prevents state leaking between CI runs.
+8. **`check_cdc_health` wrapper (Phase 6.4):** New `pgstream_check_cdc_health`
+   run-operation wrapping `pgstream.check_cdc_health()` — the function was in the
+   architecture diagram but had no macro. Raises error on unhealthy sources.
+9. **`dbt ls` tip (Phase 6.5):** Documented `dbt ls --select config.materialized:stream_table`
+   as a useful command for listing all stream table models.
+
+**Improvements:**
+10. **TOC updated:** Added missing `Plan Changelog` entry to the Table of Contents.
+11. **Phase 10 README outline:** Added `dbt ls` / `dbt build` section, `check_cdc_health`
+    to operations list, freshness note about error-on-breach behavior.
+12. **File layout updated:** Added `check_cdc_health.sql`, updated line estimates for
+    `refresh.sql` (now schema-qualifying) and `source_freshness.sql` (now ~50 lines).
+13. **Effort estimate:** Updated from 17h → 18h (additional operations + tests).
