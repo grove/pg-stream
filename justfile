@@ -54,6 +54,7 @@ test-integration:
         --test smoke_tests \
         --test resilience_tests \
         --test scenario_tests \
+        --test trigger_detection_tests \
         --test workflow_tests \
         --test property_tests \
         -- --test-threads=1

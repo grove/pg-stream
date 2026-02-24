@@ -175,6 +175,43 @@ SET pg_stream.max_concurrent_refreshes = 8;
 
 ---
 
+### pg_stream.user_triggers
+
+Control how user-defined triggers on stream tables are handled during refresh.
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Default | `'auto'` |
+| Values | `'auto'`, `'on'`, `'off'` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When a stream table has user-defined row-level triggers, the refresh engine can decompose the `MERGE` into explicit `DELETE` + `UPDATE` + `INSERT` statements so triggers fire with correct `TG_OP`, `OLD`, and `NEW` values.
+
+**Values:**
+- **`auto`** (default): Automatically detect user triggers on the stream table. If present, use the explicit DML path; otherwise use `MERGE`.
+- **`on`**: Always use the explicit DML path, even without user triggers. Useful for testing.
+- **`off`**: Always use `MERGE`. User triggers are suppressed during refresh. This is the escape hatch if explicit DML causes issues.
+
+**Notes:**
+- Row-level triggers do **not** fire during FULL refresh regardless of this setting. FULL refresh uses `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER` to suppress them.
+- The explicit DML path adds ~25–60% overhead compared to MERGE for affected stream tables.
+- Stream tables without user triggers have zero overhead when using `auto` (only a fast `pg_trigger` check).
+
+```sql
+-- Auto-detect (default)
+SET pg_stream.user_triggers = 'auto';
+
+-- Always use explicit DML (for testing)
+SET pg_stream.user_triggers = 'on';
+
+-- Suppress triggers, use MERGE
+SET pg_stream.user_triggers = 'off';
+```
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -188,6 +225,7 @@ pg_stream.min_schedule_seconds = 60
 pg_stream.max_consecutive_errors = 3
 pg_stream.change_buffer_schema = 'pgstream_changes'
 pg_stream.max_concurrent_refreshes = 4
+pg_stream.user_triggers = 'auto'
 ```
 
 ---
