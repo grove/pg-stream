@@ -4,7 +4,7 @@
 **Date:** 2026-02-24  
 **Branch:** `main`  
 **Scope:** Next priorities for SQL feature coverage — both new implementations and revisiting rejected constructs.  
-**Current state:** 872 unit tests, 22 E2E test suites, 25 AggFunc variants, 21 OpTree variants, 20 diff operators. Zero P0 or P1 issues. All remaining gaps are P2+ with clear error messages.
+**Current state:** 876 unit tests, 22 E2E test suites, 37 AggFunc variants, 21 OpTree variants, 20 diff operators. Zero P0 or P1 issues. All remaining gaps are P2+ with clear error messages.
 
 ### Completed Steps
 
@@ -14,6 +14,40 @@
   - `get_for_st()` / `get_all()` read `columns_used` from DB (no longer hardcoded `None`)
   - `api.rs`: extracts column map from `ParseResult` during creation, passes to dependency insert
   - `handle_alter_table()` calls `detect_schema_change_kind()` — benign DDL skips reinit, only column changes trigger reinit + cascade
+
+- [x] **S1: Volatile function detection (A1)** — Done 2026-02-25
+  - `lookup_function_volatility()` — SPI query to `pg_proc.provolatile` (with `#[cfg(test)]` stub)
+  - `collect_volatilities()` recursive Expr tree scanner
+  - `tree_worst_volatility()` / `tree_worst_volatility_with_registry()` OpTree walkers
+  - Wired into `create_stream_table_impl()`: DIFF+volatile → reject, DIFF+stable → warn, FULL+volatile → skip
+  - 4 new unit tests (876 total, up from 872)
+
+- [x] **S2: TRUNCATE capture in CDC (A6)** — Done 2026-02-25
+  - Statement-level `AFTER TRUNCATE` trigger writes `action='T'` marker row to change buffer
+  - `execute_differential_refresh()` detects 'T' rows in LSN range → falls back to full refresh
+  - `drop_change_trigger()` now also cleans up TRUNCATE trigger + function
+
+- [x] **S3: ALL subquery → AntiJoin (A3)** — Done 2026-02-25
+  - Removed ALL_SUBLINK rejection from `check_where_for_unsupported_sublinks()`
+  - Added `parse_all_sublink()`: `x op ALL (subq)` → `NOT EXISTS (... WHERE NOT (x op col))` → AntiJoin
+  - Operator extracted from `operName` list
+
+- [x] **S4: DISTINCT ON → ROW_NUMBER() (A2)** — Done 2026-02-25
+  - `rewrite_distinct_on()` detects DISTINCT ON via raw parse tree, builds ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) = 1 subquery
+  - Called BEFORE `validate_defining_query()` so all downstream sees rewritten form
+  - Helper functions: `extract_from_clause_sql()`, `from_item_to_sql()`
+
+- [x] **S5: Regression aggregates (A4)** — Done 2026-02-25
+  - 12 new AggFunc variants: Corr, CovarPop, CovarSamp, RegrAvgx, RegrAvgy, RegrCount, RegrIntercept, RegrR2, RegrSlope, RegrSxx, RegrSxy, RegrSyy
+  - All 12 are group-rescan — diff engine's catch-all handles them automatically
+  - Updated `sql_name()`, `is_group_rescan()`, `check_ivm_support_inner()`, `extract_aggregates()`
+  - Added `regression_agg()` test helper
+  - 37 AggFunc variants total (up from 25)
+
+- [x] **S6: Mixed UNION / UNION ALL (A5)** — Done 2026-02-25
+  - `collect_union_children()` no longer rejects mixed trees
+  - Children with different `all` flag parsed as separate set operations via `parse_set_operation()`
+  - Respects PostgreSQL's nested `SetOperationStmt` tree structure
 
 ---
 
@@ -501,15 +535,15 @@ These items are best left rejected with their current error messages:
 
 After Steps S1–S6 (highest-impact work):
 
-- [ ] Volatile functions rejected in DIFFERENTIAL mode with clear error (S1)
-- [ ] Stable functions produce a warning in DIFFERENTIAL mode (S1)
-- [ ] `DISTINCT ON` auto-rewritten to ROW_NUMBER() window function (S4)
-- [ ] `ALL (subquery)` supported via AntiJoin rewrite (S3)
-- [ ] 11 regression aggregates supported in DIFFERENTIAL mode (S5)
-- [ ] Mixed UNION / UNION ALL works correctly (S6)
-- [ ] TRUNCATE on source tables triggers reinitialization (S2)
-- [ ] 36+ AggFunc variants (up from 25)
-- [ ] 900+ unit tests (estimated, up from 872)
+- [x] Volatile functions rejected in DIFFERENTIAL mode with clear error (S1)
+- [x] Stable functions produce a warning in DIFFERENTIAL mode (S1)
+- [x] `DISTINCT ON` auto-rewritten to ROW_NUMBER() window function (S4)
+- [x] `ALL (subquery)` supported via AntiJoin rewrite (S3)
+- [x] 12 regression aggregates supported in DIFFERENTIAL mode (S5)
+- [x] Mixed UNION / UNION ALL works correctly (S6)
+- [x] TRUNCATE on source tables triggers full refresh fallback (S2)
+- [x] 37 AggFunc variants (up from 25)
+- [x] 876 unit tests (up from 872)
 - [ ] Documentation updated across SQL_REFERENCE, DVM_OPERATORS, README
 
 ---
@@ -747,17 +781,17 @@ independently. Steps are numbered sequentially for easy reference.
 | Step | Item(s) | Effort | Delivers | Prereqs |
 |------|---------|--------|----------|----------|
 | ~~C-1~~ | ~~Populate `columns_used` + wire `detect_schema_change_kind()`~~ | ~~4–5h~~ | ~~✅ DONE~~ | — |
-| **S1** | A1: Volatile function detection | 1–2h | Closes last silent correctness gap — rejects volatile in DIFF, warns stable | — |
-| **S2** | A6: TRUNCATE capture in CDC | 4–6h | Closes second silent correctness gap — TRUNCATE triggers reinit | — |
+| ~~S1~~ | ~~A1: Volatile function detection~~ | ~~1–2h~~ | ~~✅ DONE~~ | — |
+| ~~S2~~ | ~~A6: TRUNCATE capture in CDC~~ | ~~4–6h~~ | ~~✅ DONE~~ | — |
 
 #### Tier 2 — High-Value SQL Features (best ROI)
 
 | Step | Item(s) | Effort | Delivers | Prereqs |
 |------|---------|--------|----------|----------|
-| **S3** | A3: ALL (subquery) → AntiJoin rewrite | 4–6h | Completes subquery expression coverage (IN/NOT IN/ANY/ALL) | — |
-| **S4** | A2: DISTINCT ON → ROW_NUMBER() auto-rewrite | 6–8h | Unlocks most-requested PostgreSQL idiom | — |
-| **S5** | A4: Regression aggregates (11 functions) | 4–6h | Covers 11 gap items — CORR, COVAR_*, REGR_* | — |
-| **S6** | A5: Mixed UNION / UNION ALL | 4–6h | Respects nested SetOperationStmt tree | — |
+| ~~S3~~ | ~~A3: ALL (subquery) → AntiJoin rewrite~~ | ~~4–6h~~ | ~~✅ DONE~~ | — |
+| ~~S4~~ | ~~A2: DISTINCT ON → ROW_NUMBER() auto-rewrite~~ | ~~6–8h~~ | ~~✅ DONE~~ | — |
+| ~~S5~~ | ~~A4: Regression aggregates (12 functions)~~ | ~~4–6h~~ | ~~✅ DONE~~ | — |
+| ~~S6~~ | ~~A5: Mixed UNION / UNION ALL~~ | ~~4–6h~~ | ~~✅ DONE~~ | — |
 
 #### Tier 3 — Schema Infrastructure (enables Tier 4)
 
@@ -787,9 +821,9 @@ independently. Steps are numbered sequentially for easy reference.
 
 | Tier | Steps | Total Effort | Cumulative Items Resolved |
 |------|-------|-------------|---------------------------|
-| ✅ Done | C-1 | 4–5h | Smart schema change detection |
-| 1 — Correctness | S1–S2 | 5–8h | 2 silent correctness gaps closed |
-| 2 — High-Value | S3–S6 | 18–26h | 14 SQL gap items (11 aggs + 3 features) |
+| ✅ Done | C-1, S1–S6 | ~28–39h | Smart schema detection + 2 correctness gaps + 15 SQL gap items |
+| ~~1 — Correctness~~ | ~~S1–S2~~ | ~~5–8h~~ | ~~✅ DONE~~ |
+| ~~2 — High-Value~~ | ~~S3–S6~~ | ~~18–26h~~ | ~~✅ DONE~~ |
 | 3 — Schema Infra | S7–S8 | 6–8h | Column snapshots + DDL blocking GUC |
 | 4 — Unlocked | S9–S10 | 10–14h | NATURAL JOIN + keyless tables |
 | 5 — Advanced | S11–S15 | 47–63h | GROUPING SETS, scalar WHERE, OR sublinks, multi-PARTITION, recursive CTE |
