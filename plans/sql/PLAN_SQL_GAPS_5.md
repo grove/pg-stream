@@ -509,3 +509,320 @@ After Sessions 1–4 (most impactful work):
 | PLAN_SQL_GAPS_4 | 1 | Report accuracy + 3 ordered-set aggregates | 809 → 826 |
 | Hybrid CDC + user triggers + pgs_ rename | ~3 | Hybrid CDC, user triggers, 72-file rename | 826 → 872 |
 | **PLAN_SQL_GAPS_5** | **~6** | **Target: volatile detection, DISTINCT ON, ALL subquery, 11 regression aggs, mixed UNION, TRUNCATE** | **872 → 900+** |
+
+---
+
+## Part C: Schema-Dependent Features Under Policy Change
+
+Some features in Part B were rejected because they are fragile when users make
+changes to the database schema (adding/dropping columns, changing types, etc.).
+This section reassesses those features under two policy assumptions:
+
+- **Policy 1 — DDL Blocking:** Prevent schema changes on tracked source tables
+- **Policy 2 — Detection + Smart Reinit:** Capture schema state at creation
+  time and reinitialize intelligently when changes are detected
+
+Both policies build on partially-implemented infrastructure that already exists
+in the codebase.
+
+---
+
+### C0. Current Infrastructure Audit
+
+Three mechanisms are **already built but not wired in**:
+
+#### C0-a. `columns_used TEXT[]` in `pgs_dependencies`
+
+| Field | Value |
+|-------|-------|
+| **Schema column** | `pgs_dependencies.columns_used TEXT[]` ([src/lib.rs](../../src/lib.rs) table DDL) |
+| **Rust struct** | `StDependency.columns_used: Option<Vec<String>>` ([src/catalog.rs L82](../../src/catalog.rs#L82)) |
+| **Insert** | `StDependency::insert()` at [src/catalog.rs L559](../../src/catalog.rs#L559) **never sets it** — always NULL |
+| **Read** | `get_for_st()` at [L636](../../src/catalog.rs#L636) and `get_all()` at [L678](../../src/catalog.rs#L678) **hardcode `columns_used: None`** — don't read the DB column |
+| **Consumer** | `get_tracked_columns()` at [src/hooks.rs L625](../../src/hooks.rs#L625) reads it, but since it's always NULL, `detect_schema_change_kind()` always falls through to the conservative `ColumnChange` path |
+
+**Gap:** The parser already resolves column lists per source table via
+`resolve_columns()` at [src/dvm/parser.rs L3413](../../src/dvm/parser.rs#L3413).
+This data is used to build the OpTree but is discarded afterward — never passed
+back to the API layer for catalog storage.
+
+#### C0-b. `detect_schema_change_kind()` — Dead Code
+
+| Field | Value |
+|-------|-------|
+| **Location** | [src/hooks.rs L590](../../src/hooks.rs#L590) |
+| **Purpose** | Classifies ALTER TABLE changes as `ColumnChange`, `ConstraintChange`, or `Benign` |
+| **Mechanism** | Compares `columns_used` (from `pgs_dependencies`) against current `pg_attribute` |
+| **Tests** | Has unit tests at [hooks.rs L650+](../../src/hooks.rs#L650) |
+| **Status** | **Not called.** `handle_alter_table()` at [L148](../../src/hooks.rs#L148) unconditionally marks all downstream STs for reinit regardless of change type |
+
+**Consequence:** Every `ALTER TABLE` — even adding a comment or index —
+triggers full reinitialization of all dependent stream tables.
+
+#### C0-c. No Column Snapshot at Creation Time
+
+`validate_defining_query()` at [src/api.rs L775](../../src/api.rs#L775) runs
+`SELECT * FROM (query) sub LIMIT 0` to validate syntax and resolve output
+columns, but this metadata is only used to build the storage table DDL — it is
+**not persisted** in the catalog for later comparison.
+
+Similarly, `resolve_columns()` at [src/dvm/parser.rs L3413](../../src/dvm/parser.rs#L3413)
+queries `pg_attribute` for source column names, type OIDs, and nullability, but
+this data is consumed by the OpTree builder and then discarded.
+
+---
+
+### C1. Policy Option 1: DDL Blocking
+
+Add an event trigger that **ERRORs** on schema-altering DDL for any source
+table used by a stream table.
+
+| Field | Value |
+|-------|-------|
+| **Mechanism** | Extend `_on_ddl_end` at [src/hooks.rs L51](../../src/hooks.rs#L51) to `ERROR` instead of reinit when `pg_stream.block_source_ddl` GUC is `true` |
+| **New GUC** | `pg_stream.block_source_ddl` (boolean, default `false`) in [src/config.rs](../../src/config.rs) |
+| **Scope** | ALTER TABLE (ADD/DROP/RENAME/ALTER COLUMN, DROP CONSTRAINT) on tables referenced by any stream table |
+| **Exempt** | CREATE INDEX, COMMENT ON, ALTER TABLE SET STATISTICS — benign ops that don't affect column structure |
+| **Effort** | 3–4 hours |
+
+**Implementation:**
+```
+_on_ddl_end():
+  if cmd == ALTER TABLE && is_source_of_any_st(objid):
+    if guc::block_source_ddl():
+      let kind = detect_schema_change_kind(...)  // already built
+      if kind == ColumnChange:
+        error!("ALTER TABLE blocked: table is a source for stream tables. \
+                Set pg_stream.block_source_ddl = false to allow.")
+      // ConstraintChange and Benign pass through
+```
+
+**What this unlocks:** Any schema-dependent feature becomes safe because the
+source table columns are guaranteed not to change. NATURAL JOIN, `SELECT *`
+expansion, keyless table PK detection — all can rely on creation-time catalog
+state remaining stable.
+
+**Drawback:** Blocks legitimate schema evolution. Users who need to `ALTER TABLE`
+must temporarily disable the GUC, which defeats the protection. Best suited for
+production workloads where source schemas are stable.
+
+---
+
+### C2. Policy Option 2: Detection + Smart Reinit
+
+Wire in the existing infrastructure and add column snapshots so the system can
+**detect** what changed and respond intelligently (targeted reinit, warning, or
+error depending on the feature).
+
+#### Step 1: Populate `columns_used` (2–3 hours)
+
+During stream table creation (`pgstream.create()` → `StDependency::insert()`),
+pass the column names from `resolve_columns()` results through the API layer
+into catalog storage.
+
+- In `src/dvm/parser.rs`: after calling `resolve_columns()` at
+  [L2874](../../src/dvm/parser.rs#L2874), return the column names alongside the
+  OpTree (e.g., in a `ParseResult` struct)
+- In `src/api.rs`: pass the per-source column lists to `StDependency::insert()`
+- In `src/catalog.rs`: update `insert()` at [L559](../../src/catalog.rs#L559)
+  to write `columns_used` into the SQL INSERT
+- In `src/catalog.rs`: update `get_for_st()` at [L636](../../src/catalog.rs#L636)
+  and `get_all()` at [L678](../../src/catalog.rs#L678) to actually read the
+  column from the query result
+
+**Immediate benefit:** `detect_schema_change_kind()` starts producing accurate
+classifications instead of always returning `ColumnChange`.
+
+#### Step 2: Wire `detect_schema_change_kind()` (2 hours)
+
+In `handle_alter_table()` at [src/hooks.rs L148](../../src/hooks.rs#L148):
+
+```
+fn handle_alter_table(objid: Oid, identity: &str) {
+    let deps = StDependency::get_downstream(objid);
+    for dep in deps {
+        let kind = detect_schema_change_kind(dep.pgs_id, objid)?;
+        match kind {
+            Benign => { /* skip — no reinit needed */ }
+            ConstraintChange => {
+                // PK changed — reinit only if row_id strategy depends on PK
+                if dep.uses_pk_row_id() {
+                    mark_needs_reinit(dep.pgs_id);
+                }
+            }
+            ColumnChange => {
+                rebuild_cdc_trigger_function(objid);
+                mark_needs_reinit(dep.pgs_id);
+                cascade_to_downstream(dep.pgs_id);
+            }
+        }
+    }
+}
+```
+
+**Immediate benefit:** Benign DDL (adding indexes, comments, statistics) no
+longer triggers unnecessary reinitialization.
+
+#### Step 3: Store Column Snapshot (3–4 hours)
+
+Add a new catalog table or extend `pgs_dependencies` with:
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `column_snapshot` | `JSONB` | Array of `{name, type_oid, ordinal}` at creation time |
+| `schema_fingerprint` | `TEXT` | SHA-256 of serialized column snapshot — fast equality check |
+
+On each DDL event, compare the current `pg_attribute` state against the stored
+snapshot. This enables precise change detection:
+
+- Column added → warn, reinit (new column may affect NATURAL JOIN, SELECT *)
+- Column dropped → error if column is in `columns_used`, benign otherwise
+- Column type changed → reinit (type coercion paths may differ)
+- Column renamed → reinit if column is in `columns_used`
+
+#### Step 4: NATURAL JOIN Column Resolution Snapshot (2 hours)
+
+For NATURAL JOIN specifically, store the resolved common-column names at
+creation time in `pgs_dependencies` or the column snapshot. On reinit:
+
+1. Re-resolve common columns from current `pg_attribute`
+2. Compare against stored list
+3. If changed: emit `WARNING` explaining semantic drift, then reinit with new
+   column set
+4. Optionally: set stream table to ERROR status instead, requiring user to
+   explicitly `ALTER STREAM TABLE ... REINITIALIZE`
+
+**Total effort for Policy 2:** 9–13 hours across Steps 1–4.
+
+---
+
+### C3. Feature Reassessment Under Policy Change
+
+#### Features with True Schema Dependency
+
+These features were rejected (or not yet implemented) specifically because they
+depend on catalog state that could change after creation.
+
+| Feature | Item | Without Policy | DDL Blocking (C1) | Detection + Reinit (C2) | Recommendation |
+|---------|------|---------------|-------------------|------------------------|----------------|
+| **NATURAL JOIN** | B9 | Fragile — adding a column silently changes join condition | **Safe** — columns can't change | **Safe** — reinit regenerates join condition; warns if semantics changed | **Implement** under either policy |
+| **SELECT \*** | — | Implicit column set changes silently | **Safe** — can't add/drop columns | **Safe** — re-resolve `*` on reinit, propagate to storage table | **Implement** under C2 |
+| **Volatile function detection** | A1 | `pg_proc.provolatile` could change if function is replaced | No impact (orthogonal to DDL) | Store `provolatile` at creation time, compare on reinit | **Implement regardless** — risk is extremely low |
+| **Keyless tables** | ADR-072 | PK addition/removal changes row identity strategy | **Safe** — PK can't be added/dropped | **Safe** — detect PK change as `ConstraintChange`, reinit with new strategy | **Implement** under either policy |
+| **Type coercion** | ADR-071 | Implicit casts from `pg_cast` change if types change | **Safe** | **Safe** — type OIDs in snapshot detect changes | **Implement regardless** — changing column types is already caught by reinit |
+
+**NATURAL JOIN detail:** Implementation would require `pg_attribute` lookup at
+parse time to resolve common column names, then synthesize an explicit equi-join.
+~6–8 hours of parser work. With Policy C2 Step 4, the resolved column names
+are stored, enabling semantic drift detection on reinit.
+
+**Keyless tables detail:** Without a PK, row identity falls back to an
+all-column content hash for `__pgs_row_id`. If a PK is later added, the row
+identity strategy should switch. Under Policy C2 Step 2, `ConstraintChange` is
+detected and triggers reinit. ~4–6 hours for the initial keyless implementation.
+
+#### Features with Low or Zero Schema Dependency
+
+These items from Parts A and B are implementable **regardless of policy choice**
+because they reference only explicit query-level constructs, not implicit catalog
+state:
+
+| Feature | Items | Schema Dependency | Why Safe |
+|---------|-------|-------------------|----------|
+| DISTINCT ON auto-rewrite | A2/B1 | None | PARTITION BY and ORDER BY expressions are explicit in the query |
+| ALL (subquery) | A3/B2 | None | Follows existing AntiJoin pattern — no catalog resolution |
+| Regression aggregates | A4/B10 | None | Mechanical group-rescan pattern — same as existing aggregates |
+| Mixed UNION / UNION ALL | A5/B3 | None | Respects PostgreSQL's nested `SetOperationStmt` tree — no catalog access |
+| TRUNCATE capture | A6 | None | Trigger-based — detects the event, not schema state |
+| GROUPING SETS / CUBE / ROLLUP | A7/B4 | None | GROUP BY columns are explicit in the query |
+| Multiple PARTITION BY | A8/B8 | None | Partition keys are explicit in the query |
+| Recursive CTE (incremental) | A9/B5 | None | Monotonicity analysis is on the OpTree structure, not live catalog |
+| Scalar subquery in WHERE | A10/B7 | None | CROSS JOIN rewrite uses explicit column references |
+| SubLinks inside OR | B6 | None | OR-to-UNION rewrite uses explicit predicate structure |
+
+---
+
+### C4. Combined Priority: Parts A + B + C
+
+With the schema-safety infrastructure in place, the recommended execution order
+expands to include previously-rejected schema-dependent features:
+
+| Session | Items | Effort | What It Delivers |
+|---------|-------|--------|------------------|
+| **1** | A1 (volatile functions) + A3 (ALL subquery) | 5–8h | Closes last silent correctness gap + completes subquery coverage |
+| **2** | A2 (DISTINCT ON) | 6–8h | Unlocks common PG idiom |
+| **3** | A4 (regression aggs) + A5 (mixed UNION) | 8–12h | Covers 12 gap items in one session |
+| **4** | A6 (TRUNCATE capture) | 4–6h | Closes second correctness gap |
+| **C-1** | Populate `columns_used` + wire `detect_schema_change_kind()` | 4–5h | Reduces unnecessary reinits; enables all schema-dependent features |
+| **C-2** | Column snapshot + schema fingerprint | 3–4h | Precise change detection |
+| **C-3** | `pg_stream.block_source_ddl` GUC | 3–4h | Optional strict mode for production |
+| **C-4** | NATURAL JOIN (B9) with column snapshot | 6–8h | Previously rejected — now safe under policy |
+| **C-5** | Keyless table support (ADR-072) | 4–6h | PK-aware row identity with fallback |
+| **5** | A7 (GROUPING SETS) | 10–15h | Major OLAP feature |
+| **6+** | A8–A10 (multi-PARTITION, recursive CTE, scalar WHERE) | 29–38h | Diminishing returns |
+
+Sessions 1–4 remain unchanged from Part A. Sessions C-1 through C-5 can be
+interleaved — C-1 is a prerequisite for C-2 and C-4, but C-3 is independent.
+
+---
+
+### C5. Recommended Approach: Hybrid
+
+1. **Implement Detection + Smart Reinit first** (C-1 + C-2). This benefits the
+   entire system — not just new features — by eliminating unnecessary reinits
+   for benign DDL and enabling precise change classification. The infrastructure
+   is already partially built; completing it is ~7–9 hours.
+
+2. **Add DDL Blocking as an optional strict mode** (C-3). Offer
+   `pg_stream.block_source_ddl = true` for production deployments where source
+   schemas are stable and users want guaranteed correctness. Default to `false`
+   so existing behavior is preserved.
+
+3. **Then implement NATURAL JOIN and keyless tables** (C-4 + C-5). With the
+   safety net in place, these features can be offered with confidence. NATURAL
+   JOIN gets a reinit-aware column resolution that detects and warns about
+   semantic drift. Keyless tables get a PK-aware row identity strategy that
+   switches automatically on constraint changes.
+
+This hybrid approach gives users a spectrum of safety:
+
+| User Profile | Configuration | Behavior |
+|-------------|---------------|----------|
+| Development / experimentation | Default (`block_source_ddl = false`) | Schema changes trigger smart reinit; NATURAL JOIN warns on semantic drift |
+| Production / stable schemas | `block_source_ddl = true` | Schema-altering DDL on tracked sources is blocked; guaranteed correctness |
+
+---
+
+### C6. Items That Remain Rejected Regardless of Policy
+
+These items are **not** schema-dependent — they are rejected for fundamental
+design reasons that no schema policy can address:
+
+| Item | Reason | Policy Relevance |
+|------|--------|-----------------|
+| LIMIT / OFFSET | Stream tables are full result sets by design | None |
+| FOR UPDATE / FOR SHARE | No row-level locking on materialized stream tables | None |
+| TABLESAMPLE | Stream tables materialize complete result sets | None |
+| ROWS FROM() multi-function | Extremely niche; single SRF covers all practical use | None |
+| Hypothetical-set aggregates | Almost always used as window functions, not aggregates | None |
+| XMLAGG | Extremely niche | None |
+| Window functions in expressions | Architectural constraint; separate column is cleaner | None |
+| LATERAL with RIGHT/FULL JOIN | PostgreSQL itself restricts this | None |
+
+---
+
+### C7. Success Criteria (Part C)
+
+After Sessions C-1 through C-5:
+
+- [ ] `columns_used` populated for all source dependencies at creation time
+- [ ] `detect_schema_change_kind()` wired into `handle_alter_table()` — benign
+      DDL no longer triggers reinit
+- [ ] Column snapshot stored per source dependency with schema fingerprint
+- [ ] `pg_stream.block_source_ddl` GUC available (default false)
+- [ ] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot
+- [ ] Keyless tables supported with all-column content hash for `__pgs_row_id`
+- [ ] Semantic drift warning emitted when NATURAL JOIN columns change on reinit
+- [ ] E2E tests for: benign DDL skips reinit, column DDL triggers reinit,
+      blocked DDL errors, NATURAL JOIN creation + reinit + column change
+- [ ] Documentation updated in SQL_REFERENCE.md and CONFIGURATION.md
