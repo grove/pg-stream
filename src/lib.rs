@@ -34,6 +34,7 @@ mod refresh;
 mod scheduler;
 mod shmem;
 pub mod version;
+mod wal_decoder;
 
 ::pgrx::pg_module_magic!();
 

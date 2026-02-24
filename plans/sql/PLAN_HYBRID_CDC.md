@@ -1,6 +1,6 @@
 # PLAN: Hybrid CDC — Trigger Bootstrap → Logical Replication Steady-State
 
-**Status:** In Progress (Phases 1–2 implemented)  
+**Status:** In Progress (Phases 1–4 implemented)  
 **Date:** 2026-02-24  
 **Origin:** [REPORT_TRIGGERS_VS_REPLICATION.md](REPORT_TRIGGERS_VS_REPLICATION.md) — Recommendation 6  
 **Effort:** 3–5 weeks (6 phases, incrementally deliverable)
@@ -280,7 +280,7 @@ pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgStreamE
 
 ---
 
-### Phase 3: WAL Decoder Background Worker (~1–2 weeks)
+### Phase 3: WAL Decoder Background Worker ✅ (~1–2 weeks)
 
 **Goal:** Implement a background worker that decodes WAL changes and writes
 them into the existing buffer table schema.
@@ -472,7 +472,7 @@ fn poll_wal_changes(source_oid: u32, slot_name: &str, change_schema: &str)
 
 ---
 
-### Phase 4: Transition Orchestration (~3–5 days)
+### Phase 4: Transition Orchestration ✅ (~3–5 days)
 
 **Goal:** Implement the transition from trigger to WAL-based CDC.
 

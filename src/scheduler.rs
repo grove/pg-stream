@@ -32,6 +32,7 @@ use crate::monitor;
 use crate::refresh::{self, RefreshAction};
 use crate::shmem;
 use crate::version;
+use crate::wal_decoder;
 
 /// Register the scheduler background worker.
 ///
@@ -200,10 +201,21 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
                 }
             }
 
-            // Step D: Check replication slot health and emit alerts
+            // Step D: Advance WAL transitions (trigger → WAL migration)
+            // Check and progress any CDC mode transitions for source tables.
+            // This polls WAL changes for TRANSITIONING/WAL sources and checks
+            // transition completion or timeout.
+            {
+                let change_schema = config::pg_stream_change_buffer_schema();
+                if let Err(e) = wal_decoder::advance_wal_transitions(&change_schema) {
+                    log!("pg_stream: WAL transition advancement error: {}", e);
+                }
+            }
+
+            // Step E: Check replication slot health and emit alerts
             monitor::check_slot_health_and_alert();
 
-            // Step E: Prune retry states for STs that no longer exist
+            // Step F: Prune retry states for STs that no longer exist
             // (avoid accumulating stale state)
             let active_ids: std::collections::HashSet<i64> = ordered
                 .iter()

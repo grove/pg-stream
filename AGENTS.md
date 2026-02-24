@@ -101,6 +101,7 @@ src/
 ├── scheduler.rs    # Background worker scheduling
 ├── shmem.rs        # Shared memory structures
 ├── version.rs      # Extension version
+├── wal_decoder.rs  # WAL-based CDC (logical replication polling, transitions)
 └── dvm/            # Differential view maintenance engine
     ├── mod.rs
     ├── diff.rs     # Delta application
