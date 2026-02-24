@@ -34,10 +34,10 @@ just test-all          # All of the above + pgrx tests
 > E2E tests require a Docker image. Run `just build-e2e-image` if the image is
 > stale, or use `just test-e2e` which rebuilds automatically.
 
-When done, output a `git commit` command summarising the change.out
-
-When you have edited files always remember to output git commands for staging 
-and committing the changes.
+When you're done and have edited files always remember to output git commands 
+for staging and committing the changes. The git commit message should summarize 
+the changes made. Feel free to put discrete changes into separate git commit 
+commands. Never commit directly to git without asking for permission.
 
 ---
 
