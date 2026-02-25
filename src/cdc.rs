@@ -342,6 +342,7 @@ pub fn resolve_source_column_defs(
         "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
          FROM pg_attribute a \
          WHERE a.attrelid = {} AND a.attnum > 0 AND NOT a.attisdropped \
+           AND a.attgenerated = '' \
          ORDER BY a.attnum",
         source_oid.to_u32(),
     );

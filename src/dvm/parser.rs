@@ -186,6 +186,9 @@ pub enum AggFunc {
     Mode,
     PercentileCont,
     PercentileDisc,
+    /// ANY_VALUE aggregate (PG 16+) — group-rescan strategy.
+    /// Returns an arbitrary non-null value from the group.
+    AnyValue,
     /// Regression/correlation aggregates — group-rescan strategy.
     /// These are two-argument aggregates: `func(Y, X)`.
     Corr,
@@ -226,6 +229,7 @@ impl AggFunc {
             AggFunc::StddevSamp => "STDDEV_SAMP",
             AggFunc::VarPop => "VAR_POP",
             AggFunc::VarSamp => "VAR_SAMP",
+            AggFunc::AnyValue => "ANY_VALUE",
             AggFunc::Mode => "MODE",
             AggFunc::PercentileCont => "PERCENTILE_CONT",
             AggFunc::PercentileDisc => "PERCENTILE_DISC",
@@ -264,6 +268,7 @@ impl AggFunc {
                 | AggFunc::StddevSamp
                 | AggFunc::VarPop
                 | AggFunc::VarSamp
+                | AggFunc::AnyValue
                 | AggFunc::Mode
                 | AggFunc::PercentileCont
                 | AggFunc::PercentileDisc
@@ -1369,6 +1374,11 @@ pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgStreamErro
 
 /// Recursively scan an `Expr` tree and update `worst` with the volatility
 /// of any `FuncCall` nodes found.
+///
+/// For `Expr::Raw` nodes, re-parses the SQL fragment via `raw_parser()` and
+/// walks the parse tree to detect function calls that may be volatile. This
+/// closes the G7.1 gap where expressions like `CASE WHEN now() > x THEN ...`
+/// deparsed to `Expr::Raw` would bypass volatility checking.
 pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStreamError> {
     match expr {
         Expr::FuncCall { func_name, args } => {
@@ -1382,9 +1392,183 @@ pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStrea
             collect_volatilities(left, worst)?;
             collect_volatilities(right, worst)?;
         }
-        // ColumnRef, Literal, Star, Raw: no function calls.
+        Expr::Raw(sql) => {
+            // Re-parse the raw SQL fragment to find any embedded function calls.
+            collect_raw_expr_volatility(sql, worst)?;
+        }
+        // ColumnRef, Literal, Star: no function calls.
         _ => {}
     }
+    Ok(())
+}
+
+/// Re-parse a raw SQL expression string and walk the parse tree for function
+/// calls, updating `worst` with the volatility of each function found.
+///
+/// Wraps the expression in `SELECT (expr)` to make it a valid top-level
+/// statement, then uses `raw_parser()` to parse and recursively walks the
+/// resulting parse tree nodes.
+#[cfg(not(test))]
+fn collect_raw_expr_volatility(raw_sql: &str, worst: &mut char) -> Result<(), PgStreamError> {
+    // Skip simple literals and column references — no function calls possible.
+    if raw_sql.is_empty()
+        || raw_sql == "NULL"
+        || raw_sql.starts_with('\'')
+        || raw_sql.parse::<f64>().is_ok()
+    {
+        return Ok(());
+    }
+
+    let wrapper = format!("SELECT ({})", raw_sql);
+    let c_query = match std::ffi::CString::new(wrapper.as_str()) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // NUL byte in SQL — can't parse, assume safe
+    };
+
+    // SAFETY: raw_parser is safe when called within a PostgreSQL backend
+    // with a valid memory context.
+    let parse_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+
+    if parse_list.is_null() {
+        // Parsing failed — conservatively assume volatile.
+        *worst = max_volatility(*worst, 'v');
+        return Ok(());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(parse_list) };
+    for node in list.iter_ptr() {
+        if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RawStmt) } {
+            let raw_stmt = unsafe { &*(node as *const pg_sys::RawStmt) };
+            if !raw_stmt.stmt.is_null() {
+                walk_node_for_volatility(raw_stmt.stmt, worst)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Test-only stub: assume volatile for any Expr::Raw (safe default).
+#[cfg(test)]
+fn collect_raw_expr_volatility(_raw_sql: &str, worst: &mut char) -> Result<(), PgStreamError> {
+    // In tests, conservatively assume volatile for raw expressions.
+    *worst = max_volatility(*worst, 'v');
+    Ok(())
+}
+
+/// Recursively walk a pg_sys::Node tree looking for FuncCall nodes and
+/// update `worst` with the volatility of each function found.
+#[cfg(not(test))]
+fn walk_node_for_volatility(
+    node: *mut pg_sys::Node,
+    worst: &mut char,
+) -> Result<(), PgStreamError> {
+    if node.is_null() {
+        return Ok(());
+    }
+
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
+        let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
+        if let Ok(func_name) = unsafe { extract_func_name(fcall.funcname) } {
+            let vol = lookup_function_volatility(&func_name)?;
+            *worst = max_volatility(*worst, vol);
+        }
+        // Also walk function arguments
+        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+        for n in args_list.iter_ptr() {
+            walk_node_for_volatility(n, worst)?;
+        }
+        // Walk FILTER clause
+        if !fcall.agg_filter.is_null() {
+            walk_node_for_volatility(fcall.agg_filter, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        let stmt = unsafe { &*(node as *const pg_sys::SelectStmt) };
+        // Walk target list
+        let tlist = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(stmt.targetList) };
+        for n in tlist.iter_ptr() {
+            walk_node_for_volatility(n, worst)?;
+        }
+        // Walk WHERE clause
+        if !stmt.whereClause.is_null() {
+            walk_node_for_volatility(stmt.whereClause, worst)?;
+        }
+        // Walk HAVING clause
+        if !stmt.havingClause.is_null() {
+            walk_node_for_volatility(stmt.havingClause, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_ResTarget) } {
+        let rt = unsafe { &*(node as *const pg_sys::ResTarget) };
+        if !rt.val.is_null() {
+            walk_node_for_volatility(rt.val, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
+        let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+        if !aexpr.lexpr.is_null() {
+            walk_node_for_volatility(aexpr.lexpr, worst)?;
+        }
+        if !aexpr.rexpr.is_null() {
+            walk_node_for_volatility(aexpr.rexpr, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        let bexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
+        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(bexpr.args) };
+        for n in args_list.iter_ptr() {
+            walk_node_for_volatility(n, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
+        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
+        if !tc.arg.is_null() {
+            walk_node_for_volatility(tc.arg, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseExpr) } {
+        let ce = unsafe { &*(node as *const pg_sys::CaseExpr) };
+        if !ce.arg.is_null() {
+            walk_node_for_volatility(ce.arg as *mut pg_sys::Node, worst)?;
+        }
+        let whens = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(ce.args) };
+        for w in whens.iter_ptr() {
+            walk_node_for_volatility(w, worst)?;
+        }
+        if !ce.defresult.is_null() {
+            walk_node_for_volatility(ce.defresult as *mut pg_sys::Node, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseWhen) } {
+        let cw = unsafe { &*(node as *const pg_sys::CaseWhen) };
+        if !cw.expr.is_null() {
+            walk_node_for_volatility(cw.expr as *mut pg_sys::Node, worst)?;
+        }
+        if !cw.result.is_null() {
+            walk_node_for_volatility(cw.result as *mut pg_sys::Node, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CoalesceExpr) } {
+        let ce = unsafe { &*(node as *const pg_sys::CoalesceExpr) };
+        let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(ce.args) };
+        for n in args.iter_ptr() {
+            walk_node_for_volatility(n, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullTest) } {
+        let nt = unsafe { &*(node as *const pg_sys::NullTest) };
+        if !nt.arg.is_null() {
+            walk_node_for_volatility(nt.arg as *mut pg_sys::Node, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CollateClause) } {
+        let cc = unsafe { &*(node as *const pg_sys::CollateClause) };
+        if !cc.arg.is_null() {
+            walk_node_for_volatility(cc.arg, worst)?;
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
+        let sl = unsafe { &*(node as *const pg_sys::SubLink) };
+        if !sl.testexpr.is_null() {
+            walk_node_for_volatility(sl.testexpr, worst)?;
+        }
+        if !sl.subselect.is_null() {
+            walk_node_for_volatility(sl.subselect, worst)?;
+        }
+    }
+    // Other node types (ColumnRef, A_Const, etc.) contain no functions.
+
     Ok(())
 }
 
@@ -1650,6 +1834,7 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgStreamError> {
                     | AggFunc::StddevSamp
                     | AggFunc::VarPop
                     | AggFunc::VarSamp
+                    | AggFunc::AnyValue
                     | AggFunc::Mode
                     | AggFunc::PercentileCont
                     | AggFunc::PercentileDisc
@@ -7029,6 +7214,30 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
             }
         }
         Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CollateClause) } {
+        // COLLATE clause: expr COLLATE "collation_name"
+        let cc = unsafe { &*(node as *const pg_sys::CollateClause) };
+        let arg = unsafe { node_to_expr(cc.arg)? };
+        // Extract collation name from the name list
+        let coll_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(cc.collname) };
+        let mut coll_parts = Vec::new();
+        for n in coll_list.iter_ptr() {
+            if let Ok(s) = unsafe { node_to_string(n) } {
+                coll_parts.push(s);
+            }
+        }
+        let coll_name = if coll_parts.is_empty() {
+            "\"C\"".to_string()
+        } else {
+            coll_parts
+                .iter()
+                .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        Ok(Expr::Raw(
+            format!("{} COLLATE {}", arg.to_sql(), coll_name,),
+        ))
     } else {
         // Catch-all: reject with clear error instead of silently producing broken SQL
         let tag = unsafe { (*node).type_ };
@@ -8091,6 +8300,35 @@ unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
     false
 }
 
+/// Check if a function name is a user-defined aggregate via `pg_proc.prokind`.
+///
+/// Returns `true` if the function exists in `pg_proc` with `prokind = 'a'`
+/// (aggregate function) but is NOT in our hardcoded `is_known_aggregate` list.
+/// This detects custom aggregates created with `CREATE AGGREGATE`.
+#[cfg(not(test))]
+fn is_user_defined_aggregate(name: &str) -> bool {
+    // Strip schema qualification if present (e.g., "myschema.my_agg" → "my_agg").
+    let bare_name = name.rsplit('.').next().unwrap_or(name);
+
+    Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT 1 FROM pg_catalog.pg_proc WHERE proname = $1 AND prokind = 'a'",
+                None,
+                &[bare_name.into()],
+            )
+            .ok()?;
+        if !result.is_empty() { Some(true) } else { None }
+    })
+    .unwrap_or(false)
+}
+
+/// Test-only stub: SPI is unavailable in unit tests.
+#[cfg(test)]
+fn is_user_defined_aggregate(_name: &str) -> bool {
+    false
+}
+
 /// Check if a function name is a known aggregate (built-in or common).
 fn is_known_aggregate(name: &str) -> bool {
     matches!(
@@ -8134,6 +8372,7 @@ fn is_known_aggregate(name: &str) -> bool {
             | "percentile_cont"
             | "percentile_disc"
             | "mode"
+            | "any_value"
             | "rank"
             | "dense_rank"
             | "percent_rank"
@@ -8193,6 +8432,7 @@ unsafe fn extract_aggregates(
                 "stddev_pop" => Some(AggFunc::StddevPop),
                 "variance" | "var_samp" => Some(AggFunc::VarSamp),
                 "var_pop" => Some(AggFunc::VarPop),
+                "any_value" => Some(AggFunc::AnyValue),
                 "mode" => Some(AggFunc::Mode),
                 "percentile_cont" => Some(AggFunc::PercentileCont),
                 "percentile_disc" => Some(AggFunc::PercentileDisc),
@@ -8275,10 +8515,17 @@ unsafe fn extract_aggregates(
                      Supported aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, \
                      STRING_AGG, ARRAY_AGG, JSON_AGG, JSONB_AGG, BIT_AND, BIT_OR, BIT_XOR, \
                      JSON_OBJECT_AGG, JSONB_OBJECT_AGG, STDDEV, STDDEV_POP, STDDEV_SAMP, \
-                     VARIANCE, VAR_POP, VAR_SAMP, MODE, PERCENTILE_CONT, PERCENTILE_DISC, \
-                     CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY, REGR_COUNT, \
-                     REGR_INTERCEPT, REGR_R2, REGR_SLOPE, REGR_SXX, REGR_SXY, REGR_SYY. \
-                     Use FULL refresh mode instead.",
+                     VARIANCE, VAR_POP, VAR_SAMP, ANY_VALUE, MODE, PERCENTILE_CONT, \
+                     PERCENTILE_DISC, CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY, \
+                     REGR_COUNT, REGR_INTERCEPT, REGR_R2, REGR_SLOPE, REGR_SXX, REGR_SXY, \
+                     REGR_SYY. Use FULL refresh mode instead.",
+                )));
+            } else if is_user_defined_aggregate(&name_lower) {
+                // User-defined aggregate (CREATE AGGREGATE) — not supported
+                return Err(PgStreamError::UnsupportedOperator(format!(
+                    "User-defined aggregate function {func_name}() is not supported \
+                     in DIFFERENTIAL mode. Only built-in PostgreSQL aggregates are \
+                     supported. Use FULL refresh mode instead.",
                 )));
             } else {
                 let expr = unsafe { node_to_expr(rt.val)? };
