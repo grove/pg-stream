@@ -2,7 +2,7 @@
 
 This tutorial explains what happens when a `TRUNCATE` statement hits a base table that is referenced by a stream table. Unlike INSERT, UPDATE, and DELETE — which are fully tracked by the CDC trigger — TRUNCATE is a special case that **bypasses row-level triggers entirely**. Understanding this gap is essential for operating pg_stream correctly.
 
-> **Prerequisite:** Read [TUTORIAL_WHAT_HAPPENS_ON_INSERT.md](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md) first — it introduces the 7-phase lifecycle. This tutorial explains why TRUNCATE breaks that lifecycle and how to recover.
+> **Prerequisite:** Read [WHAT_HAPPENS_ON_INSERT.md](WHAT_HAPPENS_ON_INSERT.md) first — it introduces the 7-phase lifecycle. This tutorial explains why TRUNCATE breaks that lifecycle and how to recover.
 
 ## Setup
 
@@ -384,6 +384,6 @@ The key takeaways:
 
 ## Next in This Series
 
-- **[What Happens When You INSERT a Row?](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
-- **[What Happens When You UPDATE a Row?](TUTORIAL_WHAT_HAPPENS_ON_UPDATE.md)** — D+I split, group key changes, net-effect for multiple UPDATEs
-- **[What Happens When You DELETE a Row?](TUTORIAL_WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, INSERT+DELETE cancellation
+- **[What Happens When You INSERT a Row?](WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
+- **[What Happens When You UPDATE a Row?](WHAT_HAPPENS_ON_UPDATE.md)** — D+I split, group key changes, net-effect for multiple UPDATEs
+- **[What Happens When You DELETE a Row?](WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, INSERT+DELETE cancellation

@@ -2,7 +2,7 @@
 
 This tutorial traces what happens when a `DELETE` statement hits a base table that is referenced by a stream table. It covers the trigger capture, how the scan delta emits a single DELETE event, and how each DVM operator propagates the removal — including group deletion, partial group reduction, JOINs, cascading deletes within a single refresh window, and the important edge case where a DELETE cancels a prior INSERT.
 
-> **Prerequisite:** Read [TUTORIAL_WHAT_HAPPENS_ON_INSERT.md](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md) first — it introduces the full 7-phase lifecycle (trigger → scheduler → frontier → change detection → DVM delta → MERGE → cleanup). This tutorial focuses on how DELETE differs.
+> **Prerequisite:** Read [WHAT_HAPPENS_ON_INSERT.md](WHAT_HAPPENS_ON_INSERT.md) first — it introduces the full 7-phase lifecycle (trigger → scheduler → frontier → change detection → DVM delta → MERGE → cleanup). This tutorial focuses on how DELETE differs.
 
 ## Setup
 
@@ -587,6 +587,6 @@ In all cases, the work is proportional to the number of **changed rows**, not th
 
 ## Next in This Series
 
-- **[What Happens When You INSERT a Row?](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
-- **[What Happens When You UPDATE a Row?](TUTORIAL_WHAT_HAPPENS_ON_UPDATE.md)** — D+I split, group key changes, net-effect for multiple UPDATEs
-- **[What Happens When You TRUNCATE a Table?](TUTORIAL_WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover
+- **[What Happens When You INSERT a Row?](WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
+- **[What Happens When You UPDATE a Row?](WHAT_HAPPENS_ON_UPDATE.md)** — D+I split, group key changes, net-effect for multiple UPDATEs
+- **[What Happens When You TRUNCATE a Table?](WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover

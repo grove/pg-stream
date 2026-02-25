@@ -567,8 +567,8 @@ After Steps S1–S6 (highest-impact work):
 | PLAN_SQL_GAPS_3 | ~5 | 5 new aggregates + 3 subquery operators | 750 → 809 |
 | PLAN_SQL_GAPS_4 | 1 | Report accuracy + 3 ordered-set aggregates | 809 → 826 |
 | Hybrid CDC + user triggers + pgs_ rename | ~3 | Hybrid CDC, user triggers, 72-file rename | 826 → 872 |
-| **PLAN_SQL_GAPS_5 C-1** | **1** | **columns_used population + smart schema change detection** | **872 (no new tests yet)** |
-| **PLAN_SQL_GAPS_5** | **~10** | **Target: volatile detection, DISTINCT ON, ALL subquery, 11 regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables** | **872 → 920+** |
+| **SQL_GAPS_5 C-1** | **1** | **columns_used population + smart schema change detection** | **872 (no new tests yet)** |
+| **SQL_GAPS_5** | **~10** | **Target: volatile detection, DISTINCT ON, ALL subquery, 11 regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables** | **872 → 920+** |
 
 ---
 

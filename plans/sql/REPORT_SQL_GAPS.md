@@ -58,7 +58,7 @@ Remaining gaps: additional aggregate functions (regression: CORR/COVAR_*/REGR_*)
 
 ### Root Cause
 
-`node_to_expr()` ([parser.rs line 2226](src/dvm/parser.rs#L2226)) handles 7 node types with structured `Expr` variants:
+`node_to_expr()` ([parser.rs line 2226](../../src/dvm/parser.rs#L2226)) handles 7 node types with structured `Expr` variants:
 
 | Node Type | Handled As |
 |-----------|-----------|
@@ -70,7 +70,7 @@ Remaining gaps: additional aggregate functions (regression: CORR/COVAR_*/REGR_*)
 | `T_TypeCast` | `Expr::Raw` (`CAST(x AS type)`) |
 | `T_NullTest` | `Expr::Raw` (`x IS [NOT] NULL`) |
 
-**All other node types** fall through to `Expr::Raw(deparse_node(node))`. The `deparse_node()` function ([parser.rs line 2431](src/dvm/parser.rs#L2431)) only handles `T_A_Const` and `T_ColumnRef` — everything else emits:
+**All other node types** fall through to `Expr::Raw(deparse_node(node))`. The `deparse_node()` function ([parser.rs line 2431](../../src/dvm/parser.rs#L2431)) only handles `T_A_Const` and `T_ColumnRef` — everything else emits:
 
 ```
 /* node T_CaseExpr */
@@ -246,7 +246,7 @@ WHERE status IN ('active', 'pending')
 SELECT * FROM a RIGHT JOIN b ON a.id = b.id
 ```
 
-**Location:** [parser.rs line 1787](src/dvm/parser.rs#L1787)
+**Location:** [parser.rs line 1787](../../src/dvm/parser.rs#L1787)
 
 **Fix complexity: Low.** A RIGHT JOIN is semantically equivalent to a LEFT JOIN with operands swapped. The parser can rewrite `RIGHT JOIN(A, B)` → `LeftJoin { left: B, right: A }`.
 
@@ -490,7 +490,7 @@ FROM orders o,
      ) AS latest
 ```
 
-**Location:** [parser.rs line 1791](src/dvm/parser.rs#L1791) — the `T_RangeSubselect` handler reads `sub.lateral` but does not use it.
+**Location:** [parser.rs line 1791](../../src/dvm/parser.rs#L1791) — the `T_RangeSubselect` handler reads `sub.lateral` but does not use it.
 
 The subquery is wrapped in `OpTree::Subquery` and its internal column references to the outer table (`o.id`) will fail to resolve during delta computation.
 
@@ -509,7 +509,7 @@ The subquery is wrapped in `OpTree::Subquery` and its internal column references
 SELECT * FROM orders ORDER BY created_at LIMIT 100
 ```
 
-**Location:** [parser.rs line 1639](src/dvm/parser.rs#L1639)
+**Location:** [parser.rs line 1639](../../src/dvm/parser.rs#L1639)
 
 This is an intentional design decision — stream tables materialize the full result set. The error message is clear.
 
@@ -545,7 +545,7 @@ FROM orders
 ORDER BY customer_id, created_at DESC
 ```
 
-**Location:** [parser.rs ~line 1631](src/dvm/parser.rs#L1631) — checks if `distinctClause` is non-null but does not distinguish between `DISTINCT` (empty list) and `DISTINCT ON (expr, ...)` (non-empty list with specific expressions).
+**Location:** [parser.rs ~line 1631](../../src/dvm/parser.rs#L1631) — checks if `distinctClause` is non-null but does not distinguish between `DISTINCT` (empty list) and `DISTINCT ON (expr, ...)` (non-empty list with specific expressions).
 
 With plain `DISTINCT`, any duplicate row is removed. With `DISTINCT ON`, only duplicates on the specified columns are removed (keeping the first per ORDER BY). The current implementation treats both the same, which produces **more deduplication than intended**.
 
@@ -560,7 +560,7 @@ With plain `DISTINCT`, any duplicate row is removed. With `DISTINCT ON`, only du
 SELECT * FROM a UNION SELECT * FROM b UNION ALL SELECT * FROM c
 ```
 
-**Location:** [parser.rs line 1424](src/dvm/parser.rs#L1424)
+**Location:** [parser.rs line 1424](../../src/dvm/parser.rs#L1424)
 
 All set operation arms must use the same dedup/non-dedup mode. This is a genuine implementation limitation documented with a clear error.
 
@@ -611,7 +611,7 @@ SELECT * FROM orders TABLESAMPLE SYSTEM(50)
 SELECT * FROM ROWS FROM(generate_series(1,3), generate_series(1,5))
 ```
 
-**Location:** [parser.rs line 1854](src/dvm/parser.rs#L1854)
+**Location:** [parser.rs line 1854](../../src/dvm/parser.rs#L1854)
 
 Single-function ROWS FROM works fine; only the multi-function variant is rejected.
 
@@ -636,7 +636,7 @@ SELECT
 FROM orders
 ```
 
-The `WindowDef.frameOptions` field is never read in `parse_window_func_call()` ([parser.rs line 2553](src/dvm/parser.rs#L2553)). The `WindowExpr` struct has no frame representation. The delta computation uses the default frame (unbounded preceding to current row for range, or the entire partition for rows without ORDER BY).
+The `WindowDef.frameOptions` field is never read in `parse_window_func_call()` ([parser.rs line 2553](../../src/dvm/parser.rs#L2553)). The `WindowExpr` struct has no frame representation. The delta computation uses the default frame (unbounded preceding to current row for range, or the entire partition for rows without ORDER BY).
 
 **Affected frame types:**
 - `ROWS BETWEEN N PRECEDING AND M FOLLOWING`
@@ -660,7 +660,7 @@ SELECT
 FROM employees
 ```
 
-**Location:** [parser.rs line 1548](src/dvm/parser.rs#L1548)
+**Location:** [parser.rs line 1548](../../src/dvm/parser.rs#L1548)
 
 The current partition-based recomputation strategy requires a single partition key. Using multiple different partitions would need multiple recomputation passes.
 
@@ -721,7 +721,7 @@ SELECT ROW(1, 'a', NULL) AS r FROM t
 SELECT public.orders.amount FROM public.orders
 ```
 
-**Location:** [parser.rs line 2263](src/dvm/parser.rs#L2263) — `node_to_expr()` for `T_ColumnRef` only handles 1-field and 2-field references. 3-field (schema.table.column) is rejected.
+**Location:** [parser.rs line 2263](../../src/dvm/parser.rs#L2263) — `node_to_expr()` for `T_ColumnRef` only handles 1-field and 2-field references. 3-field (schema.table.column) is rejected.
 
 **Fix complexity: Low.** Add a `3` arm that extracts schema + table + column and uses `table.column` (dropping schema, since it's resolved during analysis).
 
@@ -746,14 +746,14 @@ Standard JSONB operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`)
 
 ### 9.1 — README Claims RIGHT/FULL OUTER JOIN Support (P3) ✅ FIXED
 
-The [README.md](README.md) SQL Support table now splits outer join types into separate rows:
+The [README.md](../../README.md) SQL Support table now splits outer join types into separate rows:
 - `LEFT OUTER JOIN` — ✅ Full
 - `RIGHT OUTER JOIN` — ✅ Full (automatically converted to LEFT JOIN with swapped operands)
 - `FULL OUTER JOIN` — ✅ Full
 
 ### 9.2 — No Mention of Expression Limitations (P3) ✅ FIXED
 
-Added comprehensive "Expression Support" section to [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) documenting all supported and unsupported expression types, and added "Known Limitations" section to README.
+Added comprehensive "Expression Support" section to [docs/SQL_REFERENCE.md](../../docs/SQL_REFERENCE.md) documenting all supported and unsupported expression types, and added "Known Limitations" section to README.
 
 ### 9.3 — ORDER BY Documentation (P3)
 

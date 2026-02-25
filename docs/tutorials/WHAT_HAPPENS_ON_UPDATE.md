@@ -2,7 +2,7 @@
 
 This tutorial traces what happens when an `UPDATE` statement hits a base table that is referenced by a stream table. It covers the trigger capture, the scan-level decomposition into DELETE + INSERT, and how each DVM operator propagates the change — including cases where the group key changes, where JOINs are involved, and where multiple UPDATEs happen within a single refresh window.
 
-> **Prerequisite:** Read [TUTORIAL_WHAT_HAPPENS_ON_INSERT.md](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md) first — it introduces the full 7-phase lifecycle. This tutorial focuses on how UPDATE differs.
+> **Prerequisite:** Read [WHAT_HAPPENS_ON_INSERT.md](WHAT_HAPPENS_ON_INSERT.md) first — it introduces the full 7-phase lifecycle. This tutorial focuses on how UPDATE differs.
 
 ## Setup
 
@@ -404,6 +404,6 @@ In all cases, the work is proportional to the number of **changed rows**, not th
 
 ## Next in This Series
 
-- **[What Happens When You INSERT a Row?](TUTORIAL_WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
-- **[What Happens When You DELETE a Row?](TUTORIAL_WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, INSERT+DELETE cancellation
-- **[What Happens When You TRUNCATE a Table?](TUTORIAL_WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover
+- **[What Happens When You INSERT a Row?](WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
+- **[What Happens When You DELETE a Row?](WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, INSERT+DELETE cancellation
+- **[What Happens When You TRUNCATE a Table?](WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover

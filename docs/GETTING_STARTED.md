@@ -44,7 +44,7 @@ By the end you will have:
 
 ## Prerequisites
 
-- PostgreSQL 18.x with pg_stream installed (see [INSTALL.md](INSTALL.md))
+- PostgreSQL 18.x with pg_stream installed (see [INSTALL.md](../INSTALL.md))
 - `shared_preload_libraries = 'pg_stream'` in `postgresql.conf`
 - `psql` or any SQL client
 

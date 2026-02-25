@@ -286,6 +286,6 @@ For a table with 10 million rows and 100 changed rows, a DIFFERENTIAL refresh pr
 
 ## Next in This Series
 
-- **[What Happens When You UPDATE a Row?](TUTORIAL_WHAT_HAPPENS_ON_UPDATE.md)** — D+I split, group key changes, net-effect for multiple UPDATEs
-- **[What Happens When You DELETE a Row?](TUTORIAL_WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, INSERT+DELETE cancellation
-- **[What Happens When You TRUNCATE a Table?](TUTORIAL_WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover
+- **[What Happens When You UPDATE a Row?](WHAT_HAPPENS_ON_UPDATE.md)** — D+I split, group key changes, net-effect for multiple UPDATEs
+- **[What Happens When You DELETE a Row?](WHAT_HAPPENS_ON_DELETE.md)** — Reference counting, group deletion, INSERT+DELETE cancellation
+- **[What Happens When You TRUNCATE a Table?](WHAT_HAPPENS_ON_TRUNCATE.md)** — Why TRUNCATE bypasses triggers and how to recover
