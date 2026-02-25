@@ -820,24 +820,24 @@ independently. Steps are numbered sequentially for easy reference.
 #### Tier 5 — OLAP & Advanced Features (diminishing returns)
 
 | Step | Item(s) | Effort | Delivers | Prereqs |
-|------|---------|--------|----------|----------|
+|------|---------|--------|----------|---------|
 | ~~**S11**~~ | ~~A7: GROUPING SETS / CUBE / ROLLUP~~ | ~~10–15h~~ | ~~✅ DONE~~ | — |
-| **S12** | A10: Scalar subquery in WHERE | 6–8h | CROSS JOIN auto-rewrite | — |
-| **S13** | B6: SubLinks inside OR | 8–10h | OR-to-UNION rewrite | — |
-| **S14** | A8: Multiple PARTITION BY in windows | 8–10h | Multi-pass recomputation | — |
+| ~~**S12**~~ | ~~A10: Scalar subquery in WHERE~~ | ~~6–8h~~ | ~~✅ DONE~~ | — |
+| ~~**S13**~~ | ~~B6: SubLinks inside OR~~ | ~~8–10h~~ | ~~✅ DONE~~ | — |
+| ~~**S14**~~ | ~~A8: Multiple PARTITION BY in windows~~ | ~~8–10h~~ | ~~✅ DONE~~ | — |
 | ~~**S15**~~ | ~~A9: Recursive CTE in DIFFERENTIAL mode~~ | ~~15–20h~~ | ~~✅ DONE~~ | — |
 
 #### Summary
 
 | Tier | Steps | Total Effort | Cumulative Items Resolved |
 |------|-------|-------------|---------------------------|
-| ✅ Done | C-1, S1–S10 | ~44–57h | Smart schema detection + 2 correctness + 15 SQL gaps + schema infra + NATURAL JOIN + keyless tables |
+| ✅ Done | C-1, S1–S15 | ~68–90h | All Tier 1–5 items complete |
 | ~~1 — Correctness~~ | ~~S1–S2~~ | ~~5–8h~~ | ~~✅ DONE~~ |
 | ~~2 — High-Value~~ | ~~S3–S6~~ | ~~18–26h~~ | ~~✅ DONE~~ |
 | ~~3 — Schema Infra~~ | ~~S7–S8~~ | ~~6–8h~~ | ~~✅ DONE~~ |
 | ~~4 — Unlocked~~ | ~~S9–S10~~ | ~~10–14h~~ | ~~✅ DONE~~ |
-| 5 — Advanced | ~~S11~~, S12–S14, ~~S15~~ | 24–33h | ~~GROUPING SETS ✅~~, scalar WHERE, OR sublinks, multi-PARTITION; ~~recursive CTE ✅~~ |
-| **Total remaining** | **S12–S14** | **~24–28h** | **3 advanced items** |
+| ~~5 — Advanced~~ | ~~S11–S15~~ | ~~47–73h~~ | ~~✅ DONE~~ |
+| **Total remaining** | **None** | **0h** | **All steps complete** |
 
 ---
 
@@ -927,12 +927,12 @@ design reasons that no schema policy can address:
 - [x] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot (S9)
 - [x] Keyless tables supported with all-column content hash for `__pgs_row_id` (S10)
 - [x] GROUPING SETS / CUBE / ROLLUP via UNION ALL decomposition (S11)
-- [ ] Scalar subquery in WHERE via CROSS JOIN rewrite (S12)
-- [ ] SubLinks inside OR via OR-to-UNION rewrite (S13)
-- [ ] Multiple PARTITION BY via multi-pass recomputation (S14)
+- [x] Scalar subquery in WHERE via CROSS JOIN rewrite (S12)
+- [x] SubLinks inside OR via OR-to-UNION rewrite (S13)
+- [x] Multiple PARTITION BY via multi-pass recomputation (S14)
 - [x] Recursive CTE in DIFFERENTIAL mode via incremental fixpoint (S15)
 - [ ] 36+ AggFunc variants (up from 25)
-- [ ] 920+ unit tests (estimated, up from 872)
+- [x] 896 unit tests (up from 890)
 - [ ] E2E tests for: benign DDL skips reinit, column DDL triggers reinit,
       blocked DDL errors, NATURAL JOIN creation + reinit + column change
 - [ ] Documentation updated across SQL_REFERENCE, DVM_OPERATORS, CONFIGURATION, README

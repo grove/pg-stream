@@ -74,6 +74,21 @@ fn create_stream_table_impl(
     // only plain GROUP BY + UNION ALL.
     let query = &crate::dvm::rewrite_grouping_sets(query)?;
 
+    // ── Scalar subquery in WHERE → CROSS JOIN auto-rewrite ─────────
+    // WHERE col > (SELECT avg(x) FROM t) is rewritten to a CROSS JOIN
+    // with the scalar subquery, replacing the subquery reference.
+    let query = &crate::dvm::rewrite_scalar_subquery_in_where(query)?;
+
+    // ── SubLinks inside OR → UNION auto-rewrite ────────────────────
+    // WHERE a OR EXISTS (...) is decomposed into UNION branches, one
+    // per OR arm, so the DVM parser only sees non-OR sublinks.
+    let query = &crate::dvm::rewrite_sublinks_in_or(query)?;
+
+    // ── Multiple PARTITION BY → multi-pass window rewrite ──────────
+    // Window functions with different PARTITION BY clauses are split
+    // into separate subqueries joined by a row marker.
+    let query = &crate::dvm::rewrite_multi_partition_windows(query)?;
+
     // Validate the defining query by running LIMIT 0
     let columns = validate_defining_query(query)?;
 
