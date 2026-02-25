@@ -321,12 +321,15 @@ The scheduler background worker and user sessions share a `PgStreamSharedState` 
 
 A separate `PgAtomic<AtomicU64>` named `DAG_REBUILD_SIGNAL` is incremented by API functions (`create`, `alter`, `drop`) after catalog mutations. The scheduler compares its local copy against the atomic counter to detect when to rebuild its in-memory DAG without holding a lock.
 
+A second `PgAtomic<AtomicU64>` named `CACHE_GENERATION` tracks DDL events that may invalidate cached delta or MERGE templates across backends. When DDL hooks fire (view change, ALTER TABLE, function change) or API functions mutate the catalog, `CACHE_GENERATION` is bumped. Each backend maintains a thread-local generation counter; on the next refresh, if the shared generation has advanced, the backend flushes its delta template cache, MERGE template cache, and prepared statements.
+
 ### 9. DDL Tracking (`src/hooks.rs`)
 
-Event triggers monitor DDL changes to source tables:
+Event triggers monitor DDL changes to source tables and functions:
 
-- **`_on_ddl_end`** — Fires on `ALTER TABLE` to detect column adds/drops/type changes. If a source table used by a ST is altered, the ST's `needs_reinit` flag is set.
-- **`_on_sql_drop`** — Fires on `DROP TABLE` to set `needs_reinit` for affected STs.
+- **`_on_ddl_end`** — Fires on `ALTER TABLE` to detect column adds/drops/type changes. If a source table used by a ST is altered, the ST's `needs_reinit` flag is set. Also detects `CREATE OR REPLACE FUNCTION` / `ALTER FUNCTION` — if the function appears in a ST's `functions_used` catalog column, the ST is marked for reinit.
+- **`_on_sql_drop`** — Fires on `DROP TABLE` to set `needs_reinit` for affected STs. Also detects `DROP FUNCTION` and marks affected STs for reinit.
+- **Function name extraction** — `object_identity` strings (e.g., `public.my_func(integer, text)`) are parsed to extract the bare function name, which is matched against the `functions_used TEXT[]` column in `pgs_stream_tables`.
 
 Reinitialization is deferred until the next refresh cycle, which then performs a `REINITIALIZE` action (drop and recreate the storage table from the updated query).
 
@@ -457,7 +460,7 @@ src/
 ├── error.rs         # Centralized error types
 ├── hash.rs          # xxHash row ID generation (pg_stream_hash / pg_stream_hash_multi)
 ├── hooks.rs         # DDL event trigger handlers (_on_ddl_end, _on_sql_drop)
-├── shmem.rs         # Shared memory state (PgStreamSharedState, DAG_REBUILD_SIGNAL)
+├── shmem.rs         # Shared memory state (PgStreamSharedState, DAG_REBUILD_SIGNAL, CACHE_GENERATION)
 ├── dvm/
 │   ├── mod.rs       # DVM module root + recursive CTE orchestration
 │   ├── parser.rs    # Query → OpTree converter (CTE extraction, subquery, window support)
@@ -472,7 +475,7 @@ src/
 │       ├── join_common.rs   # Shared join utilities (snapshot subqueries, column disambiguation)
 │       ├── outer_join.rs    # LEFT/RIGHT outer join
 │       ├── full_join.rs     # FULL OUTER JOIN (8-part delta)
-│       ├── aggregate.rs     # GROUP BY + aggregate functions (37 AggFunc variants)
+│       ├── aggregate.rs     # GROUP BY + aggregate functions (39 AggFunc variants)
 │       ├── distinct.rs      # DISTINCT deduplication
 │       ├── union_all.rs     # UNION ALL merging
 │       ├── intersect.rs     # INTERSECT / INTERSECT ALL (dual-count LEAST)

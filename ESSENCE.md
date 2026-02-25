@@ -16,6 +16,6 @@ The approach is grounded in the DBSP differential dataflow framework (Budiu et a
 
 Other things we care about: crash-safe advisory locking, built-in monitoring views, NOTIFY-based alerting, and a dbt integration.
 
-Written in Rust using pgrx. Targets PostgreSQL 18. Apache 2.0 licensed. Early stage — 700+ unit tests and 290+ e2e tests, but not yet production-hardened.
+Written in Rust using pgrx. Targets PostgreSQL 18. Apache 2.0 licensed. Early stage — 1,100+ unit tests and 380+ e2e tests, but not yet production-hardened.
 
 GitHub: https://github.com/grove/pg-stream

@@ -54,6 +54,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Aggregation** | `MODE() WITHIN GROUP (ORDER BY …)` | ✅ Full | Ordered-set aggregate — group-rescan strategy |
 | **Aggregation** | `PERCENTILE_CONT` / `PERCENTILE_DISC` `WITHIN GROUP (ORDER BY …)` | ✅ Full | Ordered-set aggregate — group-rescan strategy |
 | **Aggregation** | `CORR`, `COVAR_*`, `REGR_*` (12 regression aggregates) | ✅ Full | Group-rescan strategy |
+| **Aggregation** | `JSON_ARRAYAGG`, `JSON_OBJECTAGG` (SQL standard) | ✅ Full | Group-rescan strategy; PostgreSQL 16+ |
 | **Aggregation** | `FILTER (WHERE …)` on aggregates | ✅ Full | Filter predicate applied within delta computation |
 | **Deduplication** | `DISTINCT` | ✅ Full | Reference-counted multiplicity tracking |
 | **Deduplication** | `DISTINCT ON (…)` | ✅ Full | Auto-rewritten to `ROW_NUMBER()` window subquery |
@@ -73,6 +74,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Window functions** | Named `WINDOW` clauses | ✅ Full | `WINDOW w AS (...)` resolved from query-level window definitions |
 | **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Auto-split into joined subqueries |
 | **LATERAL SRFs** | `jsonb_array_elements`, `unnest`, `jsonb_each`, etc. | ✅ Full | Row-scoped recomputation in DIFFERENTIAL mode |
+| **JSON_TABLE** | `JSON_TABLE(expr, path COLUMNS (...))` | ✅ Full | PostgreSQL 17+; modeled as lateral function |
 | **Expressions** | `CASE WHEN … THEN … ELSE … END` | ✅ Full | Both searched and simple CASE |
 | **Expressions** | `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` | ✅ Full | |
 | **Expressions** | `IN (list)`, `BETWEEN`, `IS DISTINCT FROM` | ✅ Full | Including `NOT IN`, `NOT BETWEEN`, `IS NOT DISTINCT FROM` |
@@ -82,7 +84,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Expressions** | `CURRENT_DATE`, `CURRENT_TIMESTAMP`, etc. | ✅ Full | All SQL value functions |
 | **Expressions** | Array subscript, field access | ✅ Full | `arr[1]`, `(rec).field`, `(data).*` |
 | **Grouping** | `GROUPING SETS` / `CUBE` / `ROLLUP` | ✅ Full | Auto-rewritten to `UNION ALL` of `GROUP BY` queries |
-| **Safety** | Volatile function detection | ✅ Full | Rejected in DIFFERENTIAL; warned for STABLE functions |
+| **Safety** | Volatile function/operator detection | ✅ Full | Rejected in DIFFERENTIAL; warned for STABLE functions |
 | **Source tables** | Tables without primary key | ✅ Full | Content-hash row identity via all columns |
 | **Source tables** | Views as sources | ✅ Full | Auto-inlined as subqueries; CDC triggers land on base tables |
 | **Source tables** | Materialized views | ❌ DIFF / ✅ FULL | Rejected in DIFFERENTIAL (stale snapshot); allowed in FULL |
@@ -299,7 +301,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** 896 unit tests + 22 E2E test suites, 0 failures.
+**Test counts:** ~1,138 unit tests + 22 E2E test suites (~384 E2E tests), 0 failures.
 
 ### Code Coverage
 

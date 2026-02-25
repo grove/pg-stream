@@ -10,6 +10,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+#### JSON_ARRAYAGG / JSON_OBJECTAGG Aggregate Recognition (F11)
+- **SQL-standard JSON aggregate recognition** — `JSON_ARRAYAGG(expr ...)` and
+  `JSON_OBJECTAGG(key: value ...)` are now recognized as first-class DVM
+  aggregates with the group-rescan strategy. Previously treated as opaque raw
+  expressions, they now work correctly in DIFFERENTIAL mode.
+- Two new `AggFunc` variants: `JsonObjectAggStd(String)`, `JsonArrayAggStd(String)`.
+  The carried String preserves the full deparsed SQL since the special `key: value`,
+  `ABSENT ON NULL`, `ORDER BY`, and `RETURNING` clauses differ from regular
+  function syntax.
+- 4 E2E tests covering both FULL and DIFFERENTIAL modes.
+
+#### JSON_TABLE Support (F12)
+- **`JSON_TABLE()` in FROM clause** — PostgreSQL 17+ `JSON_TABLE(expr, path
+  COLUMNS (...))` is now supported. Deparsed with full syntax including
+  `PASSING` clauses, regular/EXISTS/formatted/nested columns, and
+  `ON ERROR`/`ON EMPTY` behaviors. Modeled internally as `LateralFunction`.
+- 2 E2E tests (FULL and DIFFERENTIAL modes).
+
+#### Operator Volatility Checking (F16)
+- **Operator volatility checking** — custom operators backed by volatile
+  functions are now detected and rejected in DIFFERENTIAL mode. The check
+  queries `pg_operator` → `pg_proc` to resolve operator function volatility.
+  This completes the volatility coverage (G7.2) started with function
+  volatility detection.
+- 3 unit tests and 2 E2E tests.
+
+#### Cross-Session Cache Invalidation (F17)
+- **Cross-session cache invalidation** — a shared-memory atomic counter
+  (`CACHE_GENERATION`) ensures that when one backend alters a stream table,
+  drops a stream table, or triggers a DDL hook, all other backends
+  automatically flush their delta template and MERGE template caches on the
+  next refresh cycle. Previously, cached templates could become stale in
+  multi-backend deployments.
+- Thread-local generation tracking in both `dvm/mod.rs` (delta cache) and
+  `refresh.rs` (MERGE cache + prepared statements).
+
+#### Function/Operator DDL Tracking (F18)
+- **Function DDL tracking** — `CREATE OR REPLACE FUNCTION` and `ALTER FUNCTION`
+  on functions referenced by stream table defining queries now trigger reinit
+  of affected STs. `DROP FUNCTION` also marks affected STs for reinit.
+- **`functions_used` catalog column** — new `TEXT[]` column in
+  `pgstream.pgs_stream_tables` stores all function names used by the defining
+  query (extracted from the parsed OpTree at creation time). DDL hooks query
+  this column to find affected STs.
+- 2 E2E tests and 5 unit tests for function name extraction.
+
 #### View Inlining (G2.1)
 - **View inlining auto-rewrite** — views referenced in defining queries are
   transparently replaced with their underlying SELECT definition as inline
@@ -47,7 +93,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **12 regression aggregates (S5)** — `CORR`, `COVAR_POP`, `COVAR_SAMP`,
   `REGR_AVGX`, `REGR_AVGY`, `REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`,
   `REGR_SLOPE`, `REGR_SXX`, `REGR_SXY`, `REGR_SYY` — all use group-rescan
-  strategy. 37 aggregate function variants total (up from 25).
+  strategy. 39 aggregate function variants total (up from 25).
 - **Mixed `UNION` / `UNION ALL` (S6)** — nested set operations with different
   `ALL` flags are now parsed correctly.
 - **Column snapshot + schema fingerprint (S7)** — `pgs_dependencies` stores a
@@ -166,8 +212,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **SubLinks in OR** — decomposed into UNION branches.
 - **Multi-PARTITION BY windows** — split into joined subqueries.
 - **Regression aggregates** — CORR, COVAR_POP, COVAR_SAMP, REGR_* (12 new).
+- **JSON_ARRAYAGG / JSON_OBJECTAGG** — SQL-standard JSON aggregates recognized
+  as first-class DVM aggregates in DIFFERENTIAL mode.
+- **JSON_TABLE** — PostgreSQL 17+ JSON_TABLE() in FROM clause.
 - **Keyless table support** — tables without primary keys use content hashing.
-- **Volatile function detection** — rejected in DIFFERENTIAL, warned for stable.
+- **Volatile function and operator detection** — rejected in DIFFERENTIAL,
+  warned for stable. Custom operators backed by volatile functions are also
+  detected.
 - **TRUNCATE capture in CDC** — triggers fall back to full refresh.
 - **Window functions** — ROW_NUMBER, RANK, SUM OVER, etc. with full frame
   clause support (ROWS, RANGE, GROUPS, BETWEEN, EXCLUDE) and named WINDOW
@@ -197,7 +248,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Row ID hashing** — `pg_stream_hash()` and `pg_stream_hash_multi()` using
   xxHash (xxh64) for deterministic row identity.
 - **DDL event tracking** — `ALTER TABLE` and `DROP TABLE` on source tables
-  automatically set `needs_reinit` on affected stream tables.
+  automatically set `needs_reinit` on affected stream tables. `CREATE OR
+  REPLACE FUNCTION` / `ALTER FUNCTION` / `DROP FUNCTION` on functions used
+  by defining queries also triggers reinit.
+- **Cross-session cache coherence** — shared-memory `CACHE_GENERATION` atomic
+  counter ensures all backends flush delta/MERGE template caches when DDL
+  changes occur.
 - **Version / frontier tracking** — per-source JSONB frontier for consistent
   snapshots and Delayed View Semantics (DVS) guarantee.
 - **12 GUC variables** — `enabled`, `scheduler_interval_ms`,
@@ -212,7 +268,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Deep-dive tutorials: What Happens on INSERT / UPDATE / DELETE / TRUNCATE.
 
 #### Testing
-- 896 unit tests, 22 E2E test suites (Testcontainers + custom Docker image).
+- ~1,138 unit tests, 22 E2E test suites (Testcontainers + custom Docker image).
 - Property-based tests, integration tests, resilience tests.
 - Column snapshot and schema fingerprint-based DDL change detection.
 

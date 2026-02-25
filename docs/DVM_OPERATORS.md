@@ -224,7 +224,7 @@ JOIN products p ON o.prod_id = p.id
 
 **Module:** `src/dvm/operators/aggregate.rs`
 
-Handles GROUP BY with aggregate functions (COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG, JSON_AGG, JSONB_AGG, BIT_AND, BIT_OR, BIT_XOR, JSON_OBJECT_AGG, JSONB_OBJECT_AGG, STDDEV_POP, STDDEV_SAMP, VAR_POP, VAR_SAMP, MODE, PERCENTILE_CONT, PERCENTILE_DISC) and the `FILTER (WHERE …)` and `WITHIN GROUP (ORDER BY …)` clauses.
+Handles GROUP BY with aggregate functions (COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG, JSON_AGG, JSONB_AGG, BIT_AND, BIT_OR, BIT_XOR, JSON_OBJECT_AGG, JSONB_OBJECT_AGG, STDDEV_POP, STDDEV_SAMP, VAR_POP, VAR_SAMP, MODE, PERCENTILE_CONT, PERCENTILE_DISC, JSON_ARRAYAGG, JSON_OBJECTAGG) and the `FILTER (WHERE …)` and `WITHIN GROUP (ORDER BY …)` clauses.
 
 **Delta Rule:**
 
@@ -286,6 +286,8 @@ Where:
 | `REGR_SXY(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
 | `REGR_SYY(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
 | `ANY_VALUE(expr)` | Group-rescan | PostgreSQL 16+; affected groups re-aggregated |
+| `JSON_ARRAYAGG(expr ...)` | Group-rescan | SQL-standard JSON aggregation (PostgreSQL 16+); full deparsed SQL preserved |
+| `JSON_OBJECTAGG(key: value ...)` | Group-rescan | SQL-standard JSON aggregation (PostgreSQL 16+); full deparsed SQL preserved |
 
 **FILTER Clause:**
 
@@ -731,6 +733,7 @@ Content-based: `hash(child_columns || srf_result_columns)`. This is stable as lo
 - `WITH ORDINALITY` is supported — adds a `bigint` ordinality column to the output.
 - `ROWS FROM()` with multiple functions is not supported (rejected at parse time).
 - Column aliases (e.g., `AS child(value)`) are used to determine output column names; for known SRFs without aliases, the alias name becomes the column name.
+- **JSON_TABLE** (PostgreSQL 17+) — `JSON_TABLE(expr, path COLUMNS (...))` is modeled as a `LateralFunction` and uses the same row-scoped recomputation strategy. Supported column types: regular, EXISTS, formatted, and nested columns with `ON ERROR`/`ON EMPTY` behaviors and `PASSING` clauses.
 
 ---
 
@@ -959,7 +962,7 @@ UNION ALL SELECT * FROM sq_ins
 The DVM engine builds the operator tree by analyzing the parsed query:
 
 1. **WITH clause** → CTE definitions extracted into a name→body map (non-recursive) or CTE registry (multi-reference)
-2. **FROM clause** → `Scan` nodes for physical tables; `Subquery` nodes for inlined CTEs and subqueries in FROM; `CteScan` nodes for multi-reference CTEs; `LateralFunction` nodes for SRFs in FROM; `LateralSubquery` nodes for correlated subqueries in FROM
+2. **FROM clause** → `Scan` nodes for physical tables; `Subquery` nodes for inlined CTEs and subqueries in FROM; `CteScan` nodes for multi-reference CTEs; `LateralFunction` nodes for SRFs and JSON_TABLE in FROM; `LateralSubquery` nodes for correlated subqueries in FROM
 3. **JOIN** → `Join` or `OuterJoin` wrapping two sub-trees
 4. **LATERAL SRFs** → `LateralFunction` wrapping the left-hand FROM item as its child
 5. **LATERAL subqueries** → `LateralSubquery` wrapping the left-hand FROM item as its child (comma syntax or JOIN LATERAL)

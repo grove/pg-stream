@@ -995,9 +995,10 @@ SELECT pgstream.create_stream_table('event_summary',
 
 ### Volatile Function Detection
 
-pg_stream checks all functions in the defining query against `pg_proc.provolatile`:
+pg_stream checks all functions and operators in the defining query against `pg_proc.provolatile`:
 
 - **VOLATILE** functions (e.g., `random()`, `now()`, `gen_random_uuid()`) are **rejected** in DIFFERENTIAL mode because they produce different results on each evaluation, breaking delta correctness.
+- **VOLATILE operators** — custom operators backed by volatile functions are also detected. The check resolves the operator’s implementation function via `pg_operator.oprcode` and checks its volatility in `pg_proc`.
 - **STABLE** functions (e.g., `current_setting()`) produce a **warning** — they are consistent within a single transaction but may differ between refreshes.
 - **IMMUTABLE** functions are always safe and produce no warnings.
 
@@ -1054,7 +1055,33 @@ SELECT pgstream.create_stream_table('value_arrays',
 -- JSON_SERIALIZE(): serialize a JSON value to text
 ```
 
-> **Note:** `JSON_ARRAYAGG()` and `JSON_OBJECTAGG()` are aggregate functions and are deparsed as raw SQL expressions. They work correctly in FULL mode. In DIFFERENTIAL mode, they are treated as opaque expressions rather than recognized DVM aggregates — use FULL mode for correctness with these aggregate constructors.
+> **Note:** `JSON_ARRAYAGG()` and `JSON_OBJECTAGG()` are SQL-standard aggregate functions fully recognized by the DVM engine. In DIFFERENTIAL mode, they use the group-rescan strategy (affected groups are re-aggregated from source data). The full deparsed SQL is preserved to handle the special `key: value`, `ABSENT ON NULL`, `ORDER BY`, and `RETURNING` clause syntax.
+
+### JSON_TABLE (PostgreSQL 17+)
+
+`JSON_TABLE()` generates a relational table from JSON data. It is supported in the FROM clause in both FULL and DIFFERENTIAL modes. Internally, it is modeled as a `LateralFunction`.
+
+```sql
+-- Extract structured data from a JSON column
+SELECT pgstream.create_stream_table('user_phones',
+  $$SELECT u.id, j.phone_type, j.phone_number
+    FROM users u,
+         JSON_TABLE(u.contact_info, '$.phones[*]'
+           COLUMNS (
+             phone_type TEXT PATH '$.type',
+             phone_number TEXT PATH '$.number'
+           )
+         ) AS j$$,
+  '1m', 'DIFFERENTIAL');
+```
+
+Supported column types:
+- **Regular columns** — `name TYPE PATH '$.path'` (with optional `ON ERROR`/`ON EMPTY` behaviors)
+- **EXISTS columns** — `name TYPE EXISTS PATH '$.path'`
+- **Formatted columns** — `name TYPE FORMAT JSON PATH '$.path'`
+- **Nested columns** — `NESTED PATH '$.path' COLUMNS (...)`
+
+The `PASSING` clause is also supported for passing named variables to path expressions.
 
 ### Unsupported Expression Types
 
@@ -1263,6 +1290,7 @@ Core metadata for each stream table.
 | `last_refresh_at` | `timestamptz` | When last refreshed |
 | `consecutive_errors` | `int` | Current error streak count |
 | `needs_reinit` | `bool` | Whether upstream DDL requires reinitialization |
+| `functions_used` | `text[]` | Function names used in the defining query (for DDL tracking) |
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last modification timestamp |
 
