@@ -1827,6 +1827,865 @@ unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgStreamErr
     Ok(wc.recursive)
 }
 
+// ── View inlining auto-rewrite ──────────────────────────────────────────
+
+/// Auto-rewrite pass #0: Replace view references with inline subqueries.
+///
+/// For each `RangeVar` in the FROM clause that resolves to a PostgreSQL
+/// view (`relkind = 'v'`), replaces it with `(view_definition) AS alias`.
+/// Handles nested views by iterating until no views remain (fixpoint).
+///
+/// Materialized views (`relkind = 'm'`) are **not** inlined — their
+/// semantics differ (stale snapshot vs live query). They are left as-is
+/// for later rejection or acceptance depending on refresh mode.
+///
+/// Foreign tables (`relkind = 'f'`) are also left as-is.
+///
+/// Returns the original query unchanged if no views are found.
+pub fn rewrite_views_inline(query: &str) -> Result<String, PgStreamError> {
+    let max_depth = 10;
+    let mut current = query.to_string();
+
+    for _depth in 0..max_depth {
+        let rewritten = rewrite_views_inline_once(&current)?;
+        if rewritten == current {
+            return Ok(current); // Fixpoint reached — no more views
+        }
+        current = rewritten;
+    }
+
+    Err(PgStreamError::QueryParseError(format!(
+        "View inlining exceeded maximum nesting depth of {max_depth}. \
+         This may indicate circular view dependencies."
+    )))
+}
+
+/// Single-pass view inlining: parse the query, walk FROM items, replace
+/// any view RangeVars with `(pg_get_viewdef(oid, true)) AS alias`.
+///
+/// Returns the original string unchanged if no views are found.
+fn rewrite_views_inline_once(query: &str) -> Result<String, PgStreamError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return Ok(query.to_string()),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(query.to_string());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // Build a substitution map: views found in FROM → their definitions
+    let mut subs = Vec::new();
+    let mut found_view = false;
+
+    // Walk the FROM clause to find views. Also walk set-operation arms and CTEs.
+    unsafe { collect_view_substitutions(select, &mut subs, &mut found_view)? };
+
+    if !found_view {
+        return Ok(query.to_string());
+    }
+
+    // Deparse the full query with view substitutions applied
+    unsafe { deparse_select_stmt_with_view_subs(select, &subs) }
+}
+
+/// Information about a view found in the FROM clause that should be
+/// replaced with an inline subquery.
+struct ViewSubstitution {
+    /// Schema name of the view (or empty if unqualified).
+    schema: String,
+    /// Relation name of the view.
+    relname: String,
+    /// The view's SQL definition from `pg_get_viewdef()`.
+    view_sql: String,
+    /// Alias to use for the inline subquery.
+    alias: String,
+}
+
+/// Resolve `relkind` for a relation given schema and name.
+///
+/// Returns: `'r'` (table), `'v'` (view), `'m'` (matview), `'f'` (foreign),
+/// `'p'` (partitioned table), etc.
+fn resolve_relkind(schema: &str, relname: &str) -> Result<Option<String>, PgStreamError> {
+    let sql = format!(
+        "SELECT c.relkind::text FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = '{}' AND c.relname = '{}'",
+        schema.replace('\'', "''"),
+        relname.replace('\'', "''"),
+    );
+    Spi::connect(|client| {
+        let result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        result
+            .first()
+            .get::<String>(1)
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    })
+}
+
+/// Get the SQL definition of a view using `pg_get_viewdef(oid, true)`.
+fn get_view_definition(schema: &str, relname: &str) -> Result<String, PgStreamError> {
+    let sql = format!(
+        "SELECT pg_get_viewdef(c.oid, true) FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = '{}' AND c.relname = '{}'",
+        schema.replace('\'', "''"),
+        relname.replace('\'', "''"),
+    );
+    Spi::connect(|client| {
+        let result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        result
+            .first()
+            .get::<String>(1)
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+            .ok_or_else(|| {
+                PgStreamError::QueryParseError(format!(
+                    "Could not retrieve view definition for {schema}.{relname}"
+                ))
+            })
+    })
+}
+
+/// Resolve schema for a RangeVar. If schemaname is NULL, resolve via search_path.
+fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<String, PgStreamError> {
+    if !rv.schemaname.is_null() {
+        let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
+            .to_str()
+            .map_err(|_| PgStreamError::QueryParseError("Invalid schema name encoding".into()))?;
+        return Ok(schema.to_string());
+    }
+
+    // Resolve from search_path
+    if rv.relname.is_null() {
+        return Err(PgStreamError::QueryParseError(
+            "RangeVar with NULL relname".into(),
+        ));
+    }
+    let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
+        .to_str()
+        .map_err(|_| PgStreamError::QueryParseError("Invalid relation name encoding".into()))?;
+
+    let sql = format!(
+        "SELECT n.nspname FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = '{}' \
+         AND n.nspname = ANY(string_to_array(current_setting('search_path'), ', ')::text[] || 'public'::text) \
+         ORDER BY array_position(string_to_array(current_setting('search_path'), ', ')::text[] || 'public'::text, n.nspname) \
+         LIMIT 1",
+        relname.replace('\'', "''"),
+    );
+    Spi::connect(|client| {
+        let result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        result
+            .first()
+            .get::<String>(1)
+            .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+            .ok_or_else(|| {
+                PgStreamError::NotFound(format!("relation '{relname}' not found in search_path"))
+            })
+    })
+}
+
+/// Walk a SelectStmt's FROM clause (and set-operation arms, CTEs) to find
+/// view references and build the substitution list.
+///
+/// # Safety
+/// Caller must ensure `select` points to a valid `SelectStmt`.
+unsafe fn collect_view_substitutions(
+    select: *const pg_sys::SelectStmt,
+    subs: &mut Vec<ViewSubstitution>,
+    found_view: &mut bool,
+) -> Result<(), PgStreamError> {
+    let s = unsafe { &*select };
+
+    // Handle set operations: recurse into larg/rarg
+    if s.op != pg_sys::SetOperation::SETOP_NONE {
+        if !s.larg.is_null() {
+            unsafe { collect_view_substitutions(s.larg, subs, found_view)? };
+        }
+        if !s.rarg.is_null() {
+            unsafe { collect_view_substitutions(s.rarg, subs, found_view)? };
+        }
+        return Ok(());
+    }
+
+    // Walk the FROM clause
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    for node_ptr in from_list.iter_ptr() {
+        unsafe { collect_view_subs_from_item(node_ptr, subs, found_view)? };
+    }
+
+    // Walk CTE bodies if present
+    if !s.withClause.is_null() {
+        let wc = unsafe { &*s.withClause };
+        let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
+        for node_ptr in cte_list.iter_ptr() {
+            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
+                let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
+                if !cte.ctequery.is_null()
+                    && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
+                {
+                    unsafe {
+                        collect_view_substitutions(
+                            cte.ctequery as *const pg_sys::SelectStmt,
+                            subs,
+                            found_view,
+                        )?
+                    };
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Walk a single FROM item looking for view references.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree node.
+unsafe fn collect_view_subs_from_item(
+    node: *mut pg_sys::Node,
+    subs: &mut Vec<ViewSubstitution>,
+    found_view: &mut bool,
+) -> Result<(), PgStreamError> {
+    if node.is_null() {
+        return Ok(());
+    }
+
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
+        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+
+        // Get relname
+        if rv.relname.is_null() {
+            return Ok(());
+        }
+        let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
+            .to_str()
+            .map_err(|_| PgStreamError::QueryParseError("Invalid relation name encoding".into()))?
+            .to_string();
+
+        // Resolve schema
+        let schema = resolve_rangevar_schema(rv)?;
+
+        // Check relkind
+        let relkind = resolve_relkind(&schema, &relname)?;
+        match relkind.as_deref() {
+            Some("v") => {
+                // It's a view — get definition and record substitution
+                let view_sql = get_view_definition(&schema, &relname)?;
+
+                // Determine alias: explicit alias or view name
+                let alias = if !rv.alias.is_null() {
+                    let a = unsafe { &*(rv.alias) };
+                    unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                        .to_str()
+                        .unwrap_or(&relname)
+                        .to_string()
+                } else {
+                    relname.clone()
+                };
+
+                subs.push(ViewSubstitution {
+                    schema: schema.clone(),
+                    relname: relname.clone(),
+                    view_sql,
+                    alias,
+                });
+                *found_view = true;
+            }
+            _ => {
+                // Not a view — leave as-is
+            }
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        unsafe { collect_view_subs_from_item(join.larg, subs, found_view)? };
+        unsafe { collect_view_subs_from_item(join.rarg, subs, found_view)? };
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if !sub.subquery.is_null()
+            && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            unsafe {
+                collect_view_substitutions(
+                    sub.subquery as *const pg_sys::SelectStmt,
+                    subs,
+                    found_view,
+                )?
+            };
+        }
+    }
+
+    Ok(())
+}
+
+/// Deparse a SelectStmt back to SQL, replacing view RangeVars with inline
+/// subqueries according to the substitution list.
+///
+/// # Safety
+/// Caller must ensure `stmt` points to a valid `SelectStmt`.
+unsafe fn deparse_select_stmt_with_view_subs(
+    stmt: *const pg_sys::SelectStmt,
+    subs: &[ViewSubstitution],
+) -> Result<String, PgStreamError> {
+    let s = unsafe { &*stmt };
+
+    // Handle set operations: deparse each arm separately
+    if s.op != pg_sys::SetOperation::SETOP_NONE {
+        let op_str = match s.op {
+            pg_sys::SetOperation::SETOP_UNION => {
+                if s.all {
+                    "UNION ALL"
+                } else {
+                    "UNION"
+                }
+            }
+            pg_sys::SetOperation::SETOP_INTERSECT => {
+                if s.all {
+                    "INTERSECT ALL"
+                } else {
+                    "INTERSECT"
+                }
+            }
+            pg_sys::SetOperation::SETOP_EXCEPT => {
+                if s.all {
+                    "EXCEPT ALL"
+                } else {
+                    "EXCEPT"
+                }
+            }
+            _ => "UNION",
+        };
+
+        let left = if !s.larg.is_null() {
+            unsafe { deparse_select_stmt_with_view_subs(s.larg, subs)? }
+        } else {
+            String::new()
+        };
+        let right = if !s.rarg.is_null() {
+            unsafe { deparse_select_stmt_with_view_subs(s.rarg, subs)? }
+        } else {
+            String::new()
+        };
+
+        let mut result = format!("{left} {op_str} {right}");
+
+        // Top-level ORDER BY / LIMIT / OFFSET on set operations
+        let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.sortClause) };
+        if !sort_list.is_empty() {
+            let sorts = unsafe { deparse_sort_clause(&sort_list)? };
+            result.push_str(&format!(" ORDER BY {sorts}"));
+        }
+        if !s.limitCount.is_null() {
+            let expr = unsafe { node_to_expr(s.limitCount)? };
+            result.push_str(&format!(" LIMIT {}", expr.to_sql()));
+        }
+        if !s.limitOffset.is_null() {
+            let expr = unsafe { node_to_expr(s.limitOffset)? };
+            result.push_str(&format!(" OFFSET {}", expr.to_sql()));
+        }
+
+        return Ok(result);
+    }
+
+    // Regular SELECT — deparse with substitutions
+    let mut parts = Vec::new();
+
+    // WITH clause (CTEs) — deparse CTE bodies with view subs too
+    if !s.withClause.is_null() {
+        let with_sql = unsafe { deparse_with_clause_with_view_subs(s.withClause, subs)? };
+        parts.push(with_sql);
+    }
+
+    // DISTINCT
+    let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.distinctClause) };
+    let select_kw = if !distinct_list.is_empty() {
+        // Check if it's DISTINCT ON or plain DISTINCT
+        let has_real_exprs = distinct_list.iter_ptr().any(|ptr| !ptr.is_null());
+        if has_real_exprs {
+            // DISTINCT ON (expr, expr, ...)
+            let mut exprs = Vec::new();
+            for node_ptr in distinct_list.iter_ptr() {
+                if !node_ptr.is_null() {
+                    let expr = unsafe { node_to_expr(node_ptr)? };
+                    exprs.push(expr.to_sql());
+                }
+            }
+            format!("SELECT DISTINCT ON ({})", exprs.join(", "))
+        } else {
+            "SELECT DISTINCT".to_string()
+        }
+    } else {
+        "SELECT".to_string()
+    };
+
+    // Target list
+    let targets = unsafe { deparse_target_list(s.targetList)? };
+    parts.push(format!("{select_kw} {targets}"));
+
+    // FROM clause with view substitutions
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    if !from_list.is_empty() {
+        let mut from_items = Vec::new();
+        for node_ptr in from_list.iter_ptr() {
+            let item = unsafe { deparse_from_item_with_view_subs(node_ptr, subs)? };
+            from_items.push(item);
+        }
+        parts.push(format!("FROM {}", from_items.join(", ")));
+    }
+
+    // WHERE
+    if !s.whereClause.is_null() {
+        let expr = unsafe { node_to_expr(s.whereClause)? };
+        parts.push(format!("WHERE {}", expr.to_sql()));
+    }
+
+    // GROUP BY
+    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.groupClause) };
+    if !group_list.is_empty() {
+        let mut groups = Vec::new();
+        for node_ptr in group_list.iter_ptr() {
+            let expr = unsafe { node_to_expr(node_ptr)? };
+            groups.push(expr.to_sql());
+        }
+        parts.push(format!("GROUP BY {}", groups.join(", ")));
+    }
+
+    // HAVING
+    if !s.havingClause.is_null() {
+        let expr = unsafe { node_to_expr(s.havingClause)? };
+        parts.push(format!("HAVING {}", expr.to_sql()));
+    }
+
+    // WINDOW clause
+    let window_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.windowClause) };
+    if !window_list.is_empty() {
+        let mut window_parts = Vec::new();
+        for node_ptr in window_list.iter_ptr() {
+            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_WindowDef) } {
+                let wdef = unsafe { &*(node_ptr as *const pg_sys::WindowDef) };
+                let wname = if !wdef.name.is_null() {
+                    unsafe { std::ffi::CStr::from_ptr(wdef.name) }
+                        .to_str()
+                        .unwrap_or("w")
+                        .to_string()
+                } else {
+                    continue;
+                };
+                let wspec = unsafe { deparse_window_def(wdef)? };
+                window_parts.push(format!("{wname} AS ({wspec})"));
+            }
+        }
+        if !window_parts.is_empty() {
+            parts.push(format!("WINDOW {}", window_parts.join(", ")));
+        }
+    }
+
+    // ORDER BY
+    let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.sortClause) };
+    if !sort_list.is_empty() {
+        let sorts = unsafe { deparse_sort_clause(&sort_list)? };
+        parts.push(format!("ORDER BY {sorts}"));
+    }
+
+    // LIMIT
+    if !s.limitCount.is_null() {
+        let expr = unsafe { node_to_expr(s.limitCount)? };
+        parts.push(format!("LIMIT {}", expr.to_sql()));
+    }
+
+    // OFFSET
+    if !s.limitOffset.is_null() {
+        let expr = unsafe { node_to_expr(s.limitOffset)? };
+        parts.push(format!("OFFSET {}", expr.to_sql()));
+    }
+
+    Ok(parts.join(" "))
+}
+
+/// Deparse a WITH clause, applying view substitutions to CTE bodies.
+///
+/// # Safety
+/// Caller must ensure `with_clause` points to a valid `WithClause`.
+unsafe fn deparse_with_clause_with_view_subs(
+    with_clause: *mut pg_sys::WithClause,
+    subs: &[ViewSubstitution],
+) -> Result<String, PgStreamError> {
+    let wc = unsafe { &*with_clause };
+    let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
+    let mut cte_parts = Vec::new();
+
+    for node_ptr in cte_list.iter_ptr() {
+        if !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
+            continue;
+        }
+        let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
+        let cte_name = unsafe { std::ffi::CStr::from_ptr(cte.ctename) }
+            .to_str()
+            .unwrap_or("cte")
+            .to_string();
+
+        // Column aliases
+        let col_aliases = extract_cte_def_colnames(cte)?;
+        let alias_part = if col_aliases.is_empty() {
+            String::new()
+        } else {
+            format!("({})", col_aliases.join(", "))
+        };
+
+        // CTE body
+        let body_sql = if !cte.ctequery.is_null()
+            && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            unsafe {
+                deparse_select_stmt_with_view_subs(cte.ctequery as *const pg_sys::SelectStmt, subs)?
+            }
+        } else {
+            // Fallback: shouldn't happen for valid queries
+            "SELECT 1".to_string()
+        };
+
+        cte_parts.push(format!("{cte_name}{alias_part} AS ({body_sql})"));
+    }
+
+    let recursive = if wc.recursive { "RECURSIVE " } else { "" };
+    Ok(format!("WITH {recursive}{}", cte_parts.join(", ")))
+}
+
+/// Deparse a single FROM item, replacing view RangeVars with inline subqueries.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree node.
+unsafe fn deparse_from_item_with_view_subs(
+    node: *mut pg_sys::Node,
+    subs: &[ViewSubstitution],
+) -> Result<String, PgStreamError> {
+    if node.is_null() {
+        return Err(PgStreamError::QueryParseError("NULL FROM item node".into()));
+    }
+
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
+        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+
+        // Get relname
+        let relname = if !rv.relname.is_null() {
+            unsafe { std::ffi::CStr::from_ptr(rv.relname) }
+                .to_str()
+                .unwrap_or("")
+                .to_string()
+        } else {
+            return Ok("?".to_string());
+        };
+
+        // Get schema (may be NULL for unqualified names)
+        let schema = if !rv.schemaname.is_null() {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
+                    .to_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        // Get explicit alias
+        let explicit_alias = if !rv.alias.is_null() {
+            let a = unsafe { &*(rv.alias) };
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                    .to_str()
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        // Check if this RangeVar matches a view substitution
+        if let Some(sub) = subs.iter().find(|s| {
+            s.relname == relname
+                && (schema.as_deref() == Some(&s.schema)
+                    || (schema.is_none() && !s.schema.is_empty()))
+        }) {
+            // Replace with inline subquery
+            return Ok(format!("({}) AS {}", sub.view_sql, sub.alias));
+        }
+
+        // Not a view — deparse normally
+        let mut name = String::new();
+        if let Some(ref s) = schema {
+            name.push_str(s);
+            name.push('.');
+        }
+        name.push_str(&relname);
+        if let Some(ref a) = explicit_alias
+            && a != &relname
+        {
+            name.push(' ');
+            name.push_str(a);
+        }
+        Ok(name)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        let left = unsafe { deparse_from_item_with_view_subs(join.larg, subs)? };
+        let right = unsafe { deparse_from_item_with_view_subs(join.rarg, subs)? };
+
+        let join_type = match join.jointype {
+            pg_sys::JoinType::JOIN_INNER => {
+                if join.isNatural {
+                    "NATURAL JOIN"
+                } else {
+                    "JOIN"
+                }
+            }
+            pg_sys::JoinType::JOIN_LEFT => {
+                if join.isNatural {
+                    "NATURAL LEFT JOIN"
+                } else {
+                    "LEFT JOIN"
+                }
+            }
+            pg_sys::JoinType::JOIN_FULL => {
+                if join.isNatural {
+                    "NATURAL FULL JOIN"
+                } else {
+                    "FULL JOIN"
+                }
+            }
+            pg_sys::JoinType::JOIN_RIGHT => {
+                if join.isNatural {
+                    "NATURAL RIGHT JOIN"
+                } else {
+                    "RIGHT JOIN"
+                }
+            }
+            _ => "JOIN",
+        };
+
+        if join.isNatural || join.quals.is_null() {
+            Ok(format!("{left} {join_type} {right}"))
+        } else {
+            let condition = unsafe { node_to_expr(join.quals)? };
+            Ok(format!(
+                "{left} {join_type} {right} ON {}",
+                condition.to_sql()
+            ))
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if sub.subquery.is_null()
+            || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            return Err(PgStreamError::QueryParseError(
+                "RangeSubselect without valid SelectStmt".into(),
+            ));
+        }
+        let sub_stmt = sub.subquery as *const pg_sys::SelectStmt;
+        // Recurse into the subquery to replace any view references there too
+        let inner_sql = unsafe { deparse_select_stmt_with_view_subs(sub_stmt, subs)? };
+
+        let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
+        let mut result = format!("{lateral_kw}({inner_sql})");
+        if !sub.alias.is_null() {
+            let a = unsafe { &*(sub.alias) };
+            let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                .to_str()
+                .unwrap_or("");
+            result.push_str(&format!(" AS {alias_name}"));
+        }
+        Ok(result)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
+        // Function in FROM — deparse as-is using existing infrastructure
+        unsafe { deparse_from_item_to_sql(node) }
+    } else {
+        // Fallback
+        unsafe { deparse_from_item_to_sql(node) }
+    }
+}
+
+/// Deparse a WindowDef to the window specification string (inside parentheses).
+///
+/// # Safety
+/// Caller must ensure `wdef` points to a valid `WindowDef`.
+unsafe fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgStreamError> {
+    let mut parts = Vec::new();
+
+    // PARTITION BY
+    let part_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wdef.partitionClause) };
+    if !part_list.is_empty() {
+        let mut exprs = Vec::new();
+        for node_ptr in part_list.iter_ptr() {
+            let expr = unsafe { node_to_expr(node_ptr)? };
+            exprs.push(expr.to_sql());
+        }
+        parts.push(format!("PARTITION BY {}", exprs.join(", ")));
+    }
+
+    // ORDER BY
+    let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wdef.orderClause) };
+    if !sort_list.is_empty() {
+        let sorts = unsafe { deparse_sort_clause(&sort_list)? };
+        parts.push(format!("ORDER BY {sorts}"));
+    }
+
+    Ok(parts.join(" "))
+}
+
+/// Reject materialized views in the defining query for DIFFERENTIAL mode.
+///
+/// Materialized views are stale snapshots — CDC triggers cannot track
+/// `REFRESH MATERIALIZED VIEW`. The user should use the underlying query
+/// directly or switch to FULL refresh mode.
+pub fn reject_materialized_views(query: &str) -> Result<(), PgStreamError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return Ok(()),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    unsafe { check_for_matviews_or_foreign(select) }
+}
+
+/// Reject foreign tables in the defining query for DIFFERENTIAL mode.
+///
+/// Foreign tables do not support row-level triggers, so CDC cannot track them.
+pub fn reject_foreign_tables(query: &str) -> Result<(), PgStreamError> {
+    // Uses the same implementation as reject_materialized_views;
+    // the check function handles both.
+    reject_materialized_views(query)
+}
+
+/// Recursively check a SelectStmt for materialized view or foreign table
+/// references in the FROM clause.
+///
+/// # Safety
+/// Caller must ensure `select` points to a valid `SelectStmt`.
+unsafe fn check_for_matviews_or_foreign(
+    select: *const pg_sys::SelectStmt,
+) -> Result<(), PgStreamError> {
+    let s = unsafe { &*select };
+
+    // Handle set operations
+    if s.op != pg_sys::SetOperation::SETOP_NONE {
+        if !s.larg.is_null() {
+            unsafe { check_for_matviews_or_foreign(s.larg)? };
+        }
+        if !s.rarg.is_null() {
+            unsafe { check_for_matviews_or_foreign(s.rarg)? };
+        }
+        return Ok(());
+    }
+
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    for node_ptr in from_list.iter_ptr() {
+        unsafe { check_from_item_for_matview_or_foreign(node_ptr)? };
+    }
+
+    Ok(())
+}
+
+/// Check a single FROM item for materialized view or foreign table references.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree node.
+unsafe fn check_from_item_for_matview_or_foreign(
+    node: *mut pg_sys::Node,
+) -> Result<(), PgStreamError> {
+    if node.is_null() {
+        return Ok(());
+    }
+
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
+        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+        if rv.relname.is_null() {
+            return Ok(());
+        }
+        let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
+            .to_str()
+            .unwrap_or("")
+            .to_string();
+
+        let schema = resolve_rangevar_schema(rv)?;
+        let relkind = resolve_relkind(&schema, &relname)?;
+
+        match relkind.as_deref() {
+            Some("m") => {
+                return Err(PgStreamError::UnsupportedOperator(format!(
+                    "Materialized view '{schema}.{relname}' cannot be used as a source in \
+                     DIFFERENTIAL mode. Materialized views are stale snapshots — CDC triggers \
+                     cannot track REFRESH MATERIALIZED VIEW. Use the underlying query directly, \
+                     or switch to FULL refresh mode."
+                )));
+            }
+            Some("f") => {
+                return Err(PgStreamError::UnsupportedOperator(format!(
+                    "Foreign table '{schema}.{relname}' cannot be used as a source in \
+                     DIFFERENTIAL mode. Row-level triggers cannot be created on foreign tables. \
+                     Use FULL refresh mode instead."
+                )));
+            }
+            _ => {}
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        unsafe { check_from_item_for_matview_or_foreign(join.larg)? };
+        unsafe { check_from_item_for_matview_or_foreign(join.rarg)? };
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if !sub.subquery.is_null()
+            && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            unsafe {
+                check_for_matviews_or_foreign(sub.subquery as *const pg_sys::SelectStmt)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Lightweight check that rejects LIMIT / OFFSET in a defining query.
 ///
 /// Uses `raw_parser()` to parse the query and inspects the top-level

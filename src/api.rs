@@ -61,6 +61,15 @@ fn create_stream_table_impl(
         None => None,
     };
 
+    // ── View inlining auto-rewrite ─────────────────────────────────
+    // Views in the FROM clause are replaced with their underlying SELECT
+    // definition as inline subqueries. This ensures CDC triggers land on base
+    // tables and the DVM parser sees real table scans with PKs. Must run
+    // first so view definitions containing DISTINCT ON, GROUPING SETS, etc.
+    // get further rewritten by the downstream passes.
+    let original_query = query.to_string();
+    let query = &crate::dvm::rewrite_views_inline(query)?;
+
     // ── DISTINCT ON auto-rewrite ───────────────────────────────────
     // DISTINCT ON (e1, e2) is rewritten to a ROW_NUMBER() window function
     // subquery before further parsing. The original query string is replaced
@@ -101,6 +110,15 @@ fn create_stream_table_impl(
     // This is a lightweight check that inspects the raw parse tree without
     // doing full DVM tree construction.
     crate::dvm::reject_unsupported_constructs(query)?;
+
+    // ── Reject materialized views / foreign tables in DIFFERENTIAL ────
+    // After view inlining, any remaining RangeVars are base tables,
+    // stream tables, matviews, or foreign tables. Matviews and foreign
+    // tables don't support row-level triggers, so they can't be used
+    // as DIFFERENTIAL sources.
+    if refresh_mode == RefreshMode::Differential {
+        crate::dvm::reject_materialized_views(query)?;
+    }
 
     // For DIFFERENTIAL mode, run the full DVM parser to catch unsupported
     // aggregates, FILTER clauses, etc. that are specifically problematic
@@ -218,12 +236,20 @@ fn create_stream_table_impl(
         })?;
     }
 
-    // Insert catalog entry
+    // Insert catalog entry.
+    // Store the original (pre-inlining) query so that reinit after view
+    // definition changes can re-run the full rewrite pipeline.
+    let original_query_opt = if original_query != *query {
+        Some(original_query.as_str())
+    } else {
+        None
+    };
     let pgs_id = StreamTableMeta::insert(
         pgs_relid,
         &table_name,
         &schema,
         query,
+        original_query_opt,
         schedule_str,
         refresh_mode,
     )?;
@@ -273,6 +299,26 @@ fn create_stream_table_impl(
     for (source_oid, source_type) in &source_relids {
         if source_type == "TABLE" {
             setup_cdc_for_source(*source_oid, pgs_id, &change_schema)?;
+        }
+    }
+
+    // ── Phase 2b: Register view soft-dependencies for DDL tracking ──
+    // If views were inlined, the rewritten query only references base tables.
+    // We also need to register the original view OIDs so that DDL hooks
+    // (CREATE OR REPLACE VIEW, DROP VIEW) can find affected stream tables.
+    if original_query_opt.is_some()
+        && let Ok(original_sources) = extract_source_relations(&original_query)
+    {
+        for (src_oid, src_type) in &original_sources {
+            if src_type == "VIEW" {
+                // Only register if not already in the base-table deps
+                let already_registered = source_relids.iter().any(|(o, _)| o == src_oid);
+                if !already_registered {
+                    StDependency::insert_with_snapshot(
+                        pgs_id, *src_oid, src_type, None, None, None,
+                    )?;
+                }
+            }
         }
     }
 
