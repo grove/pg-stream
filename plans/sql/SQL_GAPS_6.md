@@ -777,8 +777,8 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 | Step | Gap | Description | Effort | Impact |
 |------|-----|-------------|--------|--------|
 | ~~**F1**~~ | ~~G2.1~~ | ~~Views as sources: view inlining auto-rewrite~~ | ~~Done~~ | ~~✅ Implemented~~ |
-| **F2** | G7.1 | Volatile expressions in `Expr::Raw`: re-parse for volatility checking | 6–8 hours | Closes last silent correctness gap |
-| **F3** | G3.1 | User-defined aggregates: detect via `pg_proc.prokind` and reject | 4–6 hours | Prevents silent misclassification |
+| ~~**F2**~~ | ~~G7.1~~ | ~~Volatile expressions in `Expr::Raw`: re-parse for volatility checking~~ | ~~Done~~ | ~~✅ Implemented~~ |
+| ~~**F3**~~ | ~~G3.1~~ | ~~User-defined aggregates: detect via `pg_proc.prokind` and reject~~ | ~~Done~~ | ~~✅ Implemented~~ |
 
 **Estimated effort:** 12–16 hours  
 **Value:** Closes all remaining P0 and P1 silent correctness gaps.
@@ -787,11 +787,11 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 
 | Step | Gap | Description | Effort | Impact |
 |------|-----|-------------|--------|--------|
-| **F4** | G1.1 | COLLATE expression support | 1–2 hours | Unblocks i18n queries |
+| ~~**F4**~~ | ~~G1.1~~ | ~~COLLATE expression support~~ | ~~Done~~ | ~~✅ Implemented~~ |
 | **F5** | G1.4 | `IS JSON` predicate (PG 16+) | 2–3 hours | Enables JSON validation |
-| **F6** | G3.2 | `ANY_VALUE` aggregate (PG 16+) | 1 hour | Standard GROUP BY convenience |
-| **F7** | G5.4 | Virtual generated columns (PG 18) | 2–3 hours | Prevents wrong CDC data |
-| **F8** | G2.3 | Foreign tables: detect and reject clearly | 1 hour | Better error message |
+| ~~**F6**~~ | ~~G3.2~~ | ~~`ANY_VALUE` aggregate (PG 16+)~~ | ~~Done~~ | ~~✅ Implemented~~ |
+| ~~**F7**~~ | ~~G5.4~~ | ~~Virtual generated columns (PG 18)~~ | ~~Done~~ | ~~✅ Implemented~~ |
+| ~~**F8**~~ | ~~G2.3~~ | ~~Foreign tables: detect and reject clearly~~ | ~~Done~~ | ~~✅ Implemented~~ |
 | ~~**F9**~~ | ~~G2.2~~ | ~~Materialized views: reject in DIFFERENTIAL~~ | ~~Incl. in F1~~ | ~~✅ Implemented~~ |
 
 **Estimated effort:** 7–12 hours  
@@ -850,9 +850,9 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 ### Recommended Execution Order
 
 ```
-Session 1:  F1 (views) + F3 (user-defined aggs) + F8 (foreign tables)    ~7h
-Session 2:  F7 (virtual gen cols) + F4 (COLLATE) + F6 (ANY_VALUE)        ~5h
-Session 3:  F2 (volatile in Expr::Raw)                                    ~7h
+Session 1:  F1 (views) + F3 (user-defined aggs) + F8 (foreign tables)    ✅ Done
+Session 2:  F7 (virtual gen cols) + F4 (COLLATE) + F6 (ANY_VALUE)        ✅ Done
+Session 3:  F2 (volatile in Expr::Raw)                                    ✅ Done
 Session 4:  F19–F24 (all documentation)                                   ~7h
 Session 5:  F13 (partitioned tables) + F14 (replication targets)          ~5h
 Session 6:  F5 (IS JSON) + F10 (SQL/JSON constructors)                   ~8h
@@ -878,16 +878,16 @@ Session 8+: F15–F18 (operational hardening)                              ~16h
 
 | Metric | SQL_GAPS_1 | SQL_GAPS_3 | SQL_GAPS_5 End | SQL_GAPS_6 (Now) |
 |--------|-----------|-----------|----------------|-----------------|
-| AggFunc variants | 5 | 10 | 36 | 36 |
+| AggFunc variants | 5 | 10 | 36 | 37 |
 | OpTree variants | 12 | 18 | 21 | 21 |
 | Diff operators | 10 | 16 | 21 | 21 |
 | Auto-rewrite passes | 0 | 0 | 5 | 5 |
 | Unit tests | 745 | 809 | 896 | 896 |
 | E2E tests | ~100 | ~200 | 350 | 350 |
 | E2E test files | ~15 | ~18 | 22 | 22 |
-| P0 issues | 14 | 0 | 0 | 3 (new class) |
-| P1 issues | 5 | 0 | 0 | 5 (new class) |
-| Expression types | 7 | 15 | 30+ | 30+ |
+| P0 issues | 14 | 0 | 0 | 0 |
+| P1 issues | 5 | 0 | 0 | 0 |
+| Expression types | 7 | 15 | 30+ | 31+ |
 | GUCs | ~6 | ~8 | 17 | 17 |
 
 ### What Changed Between SQL_GAPS_5 and SQL_GAPS_6
