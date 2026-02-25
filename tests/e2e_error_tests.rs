@@ -651,3 +651,74 @@ async fn test_percentile_cont_now_supported_in_differential_mode() {
         result.err()
     );
 }
+
+// ── Volatile operator detection (G7.2) ──────────────────────────────────
+
+/// Verify that a custom volatile operator is detected and rejected in
+/// DIFFERENTIAL mode (Gap G7.2).
+#[tokio::test]
+async fn test_volatile_operator_rejected_in_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Create a volatile function and a custom operator that uses it.
+    db.execute(
+        "CREATE FUNCTION volatile_add(int, int) RETURNS int AS $$ \
+         SELECT ($1 + $2 + (random() * 0)::int) $$ LANGUAGE SQL VOLATILE",
+    )
+    .await;
+    db.execute("CREATE OPERATOR |+| (LEFTARG = int, RIGHTARG = int, FUNCTION = volatile_add)")
+        .await;
+
+    db.execute("CREATE TABLE volop_src (id INT PRIMARY KEY, a INT, b INT)")
+        .await;
+    db.execute("INSERT INTO volop_src VALUES (1, 10, 20), (2, 30, 40)")
+        .await;
+
+    // DIFFERENTIAL mode should reject the volatile operator.
+    let result = db
+        .try_execute(
+            "SELECT pgstream.create_stream_table('volop_st', \
+             $$ SELECT id, a |+| b AS result FROM volop_src $$, '1m', 'DIFFERENTIAL')",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "Volatile operator in DIFFERENTIAL mode should be rejected"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("volatile"),
+        "Error should mention volatile, got: {err_msg}"
+    );
+}
+
+/// Verify that a custom volatile operator works in FULL mode.
+#[tokio::test]
+async fn test_volatile_operator_allowed_in_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE FUNCTION volatile_mul(int, int) RETURNS int AS $$ \
+         SELECT ($1 * $2 + (random() * 0)::int) $$ LANGUAGE SQL VOLATILE",
+    )
+    .await;
+    db.execute("CREATE OPERATOR |*| (LEFTARG = int, RIGHTARG = int, FUNCTION = volatile_mul)")
+        .await;
+
+    db.execute("CREATE TABLE volop2_src (id INT PRIMARY KEY, a INT, b INT)")
+        .await;
+    db.execute("INSERT INTO volop2_src VALUES (1, 5, 3), (2, 7, 4)")
+        .await;
+
+    // FULL mode should allow volatile operators.
+    db.create_st(
+        "volop2_st",
+        "SELECT id, a |*| b AS result FROM volop2_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let count = db.count("public.volop2_st").await;
+    assert_eq!(count, 2);
+}

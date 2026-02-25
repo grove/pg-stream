@@ -138,12 +138,12 @@ fn create_stream_table_impl(
         match vol {
             'v' => {
                 return Err(PgStreamError::UnsupportedOperator(
-                    "Defining query contains volatile functions (e.g., random(), \
-                     clock_timestamp()). Volatile functions are not supported in \
-                     DIFFERENTIAL mode because they produce different values on \
-                     each evaluation, breaking delta computation. \
-                     Use FULL refresh mode instead, or replace with a \
-                     deterministic alternative."
+                    "Defining query contains volatile expressions (e.g., random(), \
+                     clock_timestamp(), or custom volatile operators). Volatile \
+                     functions and operators are not supported in DIFFERENTIAL mode \
+                     because they produce different values on each evaluation, \
+                     breaking delta computation. Use FULL refresh mode instead, \
+                     or replace with a deterministic alternative."
                         .into(),
                 ));
             }
@@ -255,6 +255,7 @@ fn create_stream_table_impl(
         original_query_opt,
         schedule_str,
         refresh_mode,
+        parsed_tree.as_ref().map(|pr| pr.functions_used()),
     )?;
 
     // Build per-source column usage map from the parsed OpTree so that
@@ -425,6 +426,8 @@ fn alter_stream_table_impl(
     }
 
     shmem::signal_dag_rebuild();
+    // G8.1: Notify other backends to flush delta/MERGE template caches.
+    shmem::bump_cache_generation();
     Ok(())
 }
 
@@ -466,6 +469,8 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
 
     // Signal scheduler
     shmem::signal_dag_rebuild();
+    // G8.1: Notify other backends to flush delta/MERGE template caches.
+    shmem::bump_cache_generation();
 
     pgrx::info!(
         "Stream table {}.{} dropped (pgs_id={})",
