@@ -273,6 +273,19 @@ Where:
 | `MODE() WITHIN GROUP (ORDER BY expr)` | Group-rescan | Ordered-set aggregate; affected groups re-aggregated |
 | `PERCENTILE_CONT(frac) WITHIN GROUP (ORDER BY expr)` | Group-rescan | Ordered-set aggregate; affected groups re-aggregated |
 | `PERCENTILE_DISC(frac) WITHIN GROUP (ORDER BY expr)` | Group-rescan | Ordered-set aggregate; affected groups re-aggregated |
+| `CORR(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `COVAR_POP(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `COVAR_SAMP(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_AVGX(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_AVGY(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_COUNT(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_INTERCEPT(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_R2(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_SLOPE(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_SXX(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_SXY(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `REGR_SYY(Y, X)` | Group-rescan | Regression aggregate; affected groups re-aggregated |
+| `ANY_VALUE(expr)` | Group-rescan | PostgreSQL 16+; affected groups re-aggregated |
 
 **FILTER Clause:**
 

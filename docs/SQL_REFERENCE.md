@@ -111,7 +111,10 @@ SELECT pgstream.create_stream_table(
 -- Group-rescan aggregates (BOOL_AND/OR, STRING_AGG, ARRAY_AGG, JSON_AGG, JSONB_AGG,
 --                          BIT_AND, BIT_OR, BIT_XOR, JSON_OBJECT_AGG, JSONB_OBJECT_AGG,
 --                          STDDEV, STDDEV_POP, STDDEV_SAMP, VARIANCE, VAR_POP, VAR_SAMP,
---                          MODE, PERCENTILE_CONT, PERCENTILE_DISC)
+--                          MODE, PERCENTILE_CONT, PERCENTILE_DISC,
+--                          CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY,
+--                          REGR_COUNT, REGR_INTERCEPT, REGR_R2, REGR_SLOPE,
+--                          REGR_SXX, REGR_SXY, REGR_SYY, ANY_VALUE)
 SELECT pgstream.create_stream_table(
     'team_members',
     'SELECT department,
@@ -173,6 +176,32 @@ SELECT pgstream.create_stream_table(
             PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY salary) AS p90_salary
      FROM employees
      GROUP BY department',
+    '1m',
+    'DIFFERENTIAL'
+);
+
+-- Regression / correlation aggregates (CORR, COVAR_*, REGR_*)
+SELECT pgstream.create_stream_table(
+    'regression_stats',
+    'SELECT department,
+            CORR(salary, experience) AS sal_exp_corr,
+            COVAR_POP(salary, experience) AS covar_pop,
+            COVAR_SAMP(salary, experience) AS covar_samp,
+            REGR_SLOPE(salary, experience) AS slope,
+            REGR_INTERCEPT(salary, experience) AS intercept,
+            REGR_R2(salary, experience) AS r_squared,
+            REGR_COUNT(salary, experience) AS regr_n
+     FROM employees
+     GROUP BY department',
+    '1m',
+    'DIFFERENTIAL'
+);
+
+-- ANY_VALUE aggregate (PostgreSQL 16+)
+SELECT pgstream.create_stream_table(
+    'dept_sample',
+    'SELECT department, ANY_VALUE(office_location) AS sample_office
+     FROM employees GROUP BY department',
     '1m',
     'DIFFERENTIAL'
 );
@@ -923,9 +952,109 @@ Subqueries are supported in the `WHERE` clause and `SELECT` list. They are parse
 
 **Notes:**
 - `EXISTS` and `IN (subquery)` in the `WHERE` clause are transformed into semi-join operators. `NOT EXISTS` and `NOT IN (subquery)` become anti-join operators.
-- Multiple subqueries in the same `WHERE` clause are supported when combined with `AND`. Subqueries combined with `OR` are rejected.
+- Multiple subqueries in the same `WHERE` clause are supported when combined with `AND`. Subqueries combined with `OR` are also supported — they are automatically rewritten into `UNION` of separate filtered queries.
 - Scalar subqueries in the `SELECT` list are supported as long as they return exactly one row and one column.
-- `ALL (subquery)` is rejected — rewrite using `NOT EXISTS` with the negated condition.
+- `ALL (subquery)` is supported — it is automatically rewritten to an anti-join via `NOT EXISTS` with the negated condition.
+
+### Auto-Rewrite Pipeline
+
+pg_stream transparently rewrites certain SQL constructs before parsing. These rewrites are applied automatically and require no user action:
+
+| Order | Trigger | Rewrite |
+|-------|---------|--------|
+| #0 | View references in FROM | Inline view body as subquery |
+| #1 | `DISTINCT ON (expr)` | Convert to `ROW_NUMBER() OVER (PARTITION BY expr ORDER BY ...) = 1` subquery |
+| #2 | `GROUPING SETS` / `CUBE` / `ROLLUP` | Decompose into `UNION ALL` of separate `GROUP BY` queries |
+| #3 | Scalar subquery in `WHERE` | Convert to `CROSS JOIN` with inline view |
+| #4 | `EXISTS`/`IN` inside `OR` | Split into `UNION` of separate filtered queries |
+| #5 | Multiple `PARTITION BY` clauses | Split into joined subqueries, one per distinct partitioning |
+
+### HAVING Clause
+
+`HAVING` is fully supported. The filter predicate is applied on top of the aggregate delta computation — groups that pass the HAVING condition are included in the stream table.
+
+```sql
+SELECT pgstream.create_stream_table('big_departments',
+  'SELECT department, COUNT(*) AS cnt FROM employees GROUP BY department HAVING COUNT(*) > 10',
+  '1m', 'DIFFERENTIAL');
+```
+
+### Tables Without Primary Keys (Keyless Tables)
+
+Tables without a primary key can be used as sources. pg_stream generates a content-based row identity
+by hashing all column values using `pg_stream_hash_multi()`. This allows DIFFERENTIAL mode to work,
+though at the cost of being unable to distinguish truly duplicate rows (rows with identical values in all columns).
+
+```sql
+-- No primary key — pg_stream uses content hashing for row identity
+CREATE TABLE events (ts TIMESTAMPTZ, payload JSONB);
+SELECT pgstream.create_stream_table('event_summary',
+  'SELECT payload->>''type'' AS event_type, COUNT(*) FROM events GROUP BY 1',
+  '1m', 'DIFFERENTIAL');
+```
+
+### Volatile Function Detection
+
+pg_stream checks all functions in the defining query against `pg_proc.provolatile`:
+
+- **VOLATILE** functions (e.g., `random()`, `now()`, `gen_random_uuid()`) are **rejected** in DIFFERENTIAL mode because they produce different results on each evaluation, breaking delta correctness.
+- **STABLE** functions (e.g., `current_setting()`) produce a **warning** — they are consistent within a single transaction but may differ between refreshes.
+- **IMMUTABLE** functions are always safe and produce no warnings.
+
+FULL mode accepts all volatility classes since it re-evaluates the entire query each time.
+
+### COLLATE Expressions
+
+`COLLATE` clauses on expressions are supported:
+
+```sql
+SELECT pgstream.create_stream_table('sorted_names',
+  'SELECT name COLLATE "C" AS c_name FROM users',
+  '1m', 'DIFFERENTIAL');
+```
+
+### IS JSON Predicate (PostgreSQL 16+)
+
+The `IS JSON` predicate validates whether a value is valid JSON. All variants are supported:
+
+```sql
+-- Filter rows with valid JSON
+SELECT pgstream.create_stream_table('valid_json_events',
+  'SELECT id, payload FROM events WHERE payload::text IS JSON',
+  '1m', 'DIFFERENTIAL');
+
+-- Type-specific checks
+SELECT pgstream.create_stream_table('json_objects_only',
+  'SELECT id, data IS JSON OBJECT AS is_obj,
+          data IS JSON ARRAY AS is_arr,
+          data IS JSON SCALAR AS is_scalar
+   FROM json_data',
+  '1m', 'FULL');
+```
+
+Supported variants: `IS JSON`, `IS JSON OBJECT`, `IS JSON ARRAY`, `IS JSON SCALAR`, `IS NOT JSON` (all forms), `WITH UNIQUE KEYS`.
+
+### SQL/JSON Constructors (PostgreSQL 16+)
+
+SQL-standard JSON constructor functions are supported in both FULL and DIFFERENTIAL modes:
+
+```sql
+-- JSON_OBJECT: construct a JSON object from key-value pairs
+SELECT pgstream.create_stream_table('user_json',
+  'SELECT id, JSON_OBJECT(''name'' : name, ''age'' : age) AS data FROM users',
+  '1m', 'DIFFERENTIAL');
+
+-- JSON_ARRAY: construct a JSON array from values
+SELECT pgstream.create_stream_table('value_arrays',
+  'SELECT id, JSON_ARRAY(a, b, c) AS arr FROM measurements',
+  '1m', 'FULL');
+
+-- JSON(): parse a text value as JSON
+-- JSON_SCALAR(): wrap a scalar value as JSON
+-- JSON_SERIALIZE(): serialize a JSON value to text
+```
+
+> **Note:** `JSON_ARRAYAGG()` and `JSON_OBJECTAGG()` are aggregate functions and are deparsed as raw SQL expressions. They work correctly in FULL mode. In DIFFERENTIAL mode, they are treated as opaque expressions rather than recognized DVM aggregates — use FULL mode for correctness with these aggregate constructors.
 
 ### Unsupported Expression Types
 
@@ -933,11 +1062,7 @@ The following are **rejected with clear error messages** rather than producing b
 
 | Expression | Error Behavior | Suggested Rewrite |
 |---|---|---|
-| `ALL (subquery)` | Rejected with rewrite suggestion | Use `NOT EXISTS` with negated condition |
-| `DISTINCT ON (…)` | Rejected with rewrite suggestion | Use `DISTINCT` or `ROW_NUMBER()` window function |
-| `GROUPING SETS` / `CUBE` / `ROLLUP` | Rejected with rewrite suggestion | Use separate stream tables or `UNION ALL` |
 | `TABLESAMPLE` | Rejected — stream tables materialize the complete result set | Use `WHERE random() < 0.1` if sampling is needed |
-| `NATURAL JOIN` | Rejected with rewrite suggestion | Use explicit `JOIN ... ON` conditions |
 | Window functions in expressions | Rejected — e.g., `CASE WHEN ROW_NUMBER() OVER (...) ...` | Move window function to a separate column |
 | `FOR UPDATE` / `FOR SHARE` | Rejected — stream tables do not support row-level locking | Remove the locking clause |
 | Unknown node types | Rejected with type information | — |
@@ -989,6 +1114,36 @@ When a view is inlined, the user's original SQL is stored in the `original_query
 **Materialized views** are **rejected** in DIFFERENTIAL mode — their stale-snapshot semantics prevent CDC triggers from tracking changes.  Use the underlying query directly, or switch to FULL mode. In FULL mode, materialized views are allowed (no CDC needed).
 
 **Foreign tables** are **rejected** in DIFFERENTIAL mode — row-level triggers cannot be created on foreign tables. Use FULL mode instead.
+
+### Partitioned Tables as Sources
+
+**Partitioned tables are fully supported** as source tables in both FULL and DIFFERENTIAL modes. CDC triggers are installed on the partitioned parent table, and PostgreSQL 13+ ensures the trigger fires for all DML routed to child partitions. The change buffer uses the parent table's OID (`pgstream_changes.changes_<parent_oid>`).
+
+```sql
+CREATE TABLE orders (
+    id INT, region TEXT, amount NUMERIC
+) PARTITION BY LIST (region);
+CREATE TABLE orders_us PARTITION OF orders FOR VALUES IN ('US');
+CREATE TABLE orders_eu PARTITION OF orders FOR VALUES IN ('EU');
+
+-- Works — inserts into any partition are captured:
+SELECT pgstream.create_stream_table('order_summary',
+  'SELECT region, SUM(amount) FROM orders GROUP BY region',
+  '1m', 'DIFFERENTIAL');
+```
+
+> **Note:** pg_stream targets PostgreSQL 18. On PostgreSQL 12 or earlier (not supported), parent triggers do **not** fire for partition-routed rows, which would cause silent data loss.
+
+### Logical Replication Targets
+
+Tables that receive data via **logical replication** require special consideration. Changes arriving via replication do **not** fire normal row-level triggers, which means CDC triggers will miss those changes.
+
+pg_stream emits a **WARNING** at stream table creation time if any source table is detected as a logical replication target (via `pg_subscription_rel`).
+
+**Workarounds:**
+- Use `cdc_mode = 'wal'` for WAL-based CDC that captures all changes regardless of origin.
+- Use `FULL` refresh mode, which recomputes entirely from the current table state.
+- Set a frequent refresh schedule with FULL mode to limit staleness.
 
 ### Views on Stream Tables
 

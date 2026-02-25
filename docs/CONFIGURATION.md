@@ -6,7 +6,7 @@ Complete reference for all pg_stream GUC (Grand Unified Configuration) variables
 
 ## Overview
 
-pg_stream exposes twelve configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_stream exposes sixteen configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -175,6 +175,173 @@ SET pg_stream.max_concurrent_refreshes = 8;
 
 ---
 
+### pg_stream.differential_max_change_ratio
+
+Maximum change-to-table ratio before DIFFERENTIAL refresh falls back to FULL refresh.
+
+| Property | Value |
+|---|---|
+| Type | `float` |
+| Default | `0.15` (15%) |
+| Range | `0.0` – `1.0` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When the number of pending change buffer rows exceeds this fraction of the source table's estimated row count, the refresh engine switches from DIFFERENTIAL (which uses JSONB parsing and window functions) to FULL refresh. At high change rates FULL refresh is cheaper because it avoids the per-row JSONB overhead.
+
+**Special Values:**
+- **`0.0`**: Disable adaptive fallback — always use DIFFERENTIAL.
+- **`1.0`**: Always fall back to FULL (effectively forces FULL mode).
+
+**Tuning Guidance:**
+- **OLTP with low change rates** (< 5%): Default `0.15` is appropriate.
+- **Batch-load workloads** (bulk inserts): Lower to `0.05`–`0.10` so large batches trigger FULL refresh sooner.
+- **Latency-sensitive** (want deterministic refresh time): Set to `0.0` to always use DIFFERENTIAL.
+
+```sql
+-- Lower threshold for batch-heavy workloads
+SET pg_stream.differential_max_change_ratio = 0.10;
+
+-- Disable adaptive fallback
+SET pg_stream.differential_max_change_ratio = 0.0;
+```
+
+---
+
+### pg_stream.cleanup_use_truncate
+
+Use `TRUNCATE` instead of per-row `DELETE` for change buffer cleanup when the entire buffer is consumed by a refresh.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `true` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+After a differential refresh consumes all rows from the change buffer, the engine must clean up the buffer table. `TRUNCATE` is O(1) regardless of row count, versus `DELETE` which must update indexes row-by-row. This saves 3–5 ms per refresh at 10%+ change rates.
+
+**Trade-off:** `TRUNCATE` acquires an `AccessExclusiveLock` on the change buffer table. If concurrent DML on the source table is actively inserting into the same change buffer via triggers, this lock can cause brief contention.
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `true` — the performance benefit outweighs the brief lock.
+- **High-concurrency OLTP** with continuous writes during refresh: Set to `false` if you observe lock-wait timeouts on the change buffer.
+
+```sql
+-- Use per-row DELETE for change buffer cleanup
+SET pg_stream.cleanup_use_truncate = false;
+```
+
+---
+
+### pg_stream.merge_planner_hints
+
+Inject `SET LOCAL` planner hints before MERGE execution during differential refresh.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `true` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, the refresh executor estimates the delta size and applies optimizer hints within the transaction:
+- **Delta ≥ 100 rows**: `SET LOCAL enable_nestloop = off` — forces hash joins instead of nested-loop joins.
+- **Delta ≥ 10,000 rows**: additionally `SET LOCAL work_mem = '<N>MB'` (see [pg_stream.merge_work_mem_mb](#pg_streammerge_work_mem_mb)).
+
+This reduces P95 latency spikes caused by PostgreSQL choosing nested-loop plans for medium/large delta sizes.
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `true` — the hints improve tail latency without affecting small deltas.
+- **Custom plan overrides**: Set to `false` if you manage planner settings yourself or if the hints conflict with your `pg_hint_plan` configuration.
+
+```sql
+-- Disable planner hints
+SET pg_stream.merge_planner_hints = false;
+```
+
+---
+
+### pg_stream.merge_work_mem_mb
+
+`work_mem` value (in MB) applied via `SET LOCAL` when the delta exceeds 10,000 rows and [planner hints](#pg_streammerge_planner_hints) are enabled.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `64` (64 MB) |
+| Range | `8` – `4096` (8 MB to 4 GB) |
+| Context | `SUSET` |
+| Restart Required | No |
+
+A higher value lets PostgreSQL use larger in-memory hash tables for the MERGE join, avoiding disk-spilling sort/merge strategies on large deltas. This setting is only applied when both `merge_planner_hints = true` and the delta exceeds 10,000 rows.
+
+**Tuning Guidance:**
+- **Servers with ample RAM** (32+ GB): Increase to `128`–`256` for faster large-delta refreshes.
+- **Memory-constrained**: Lower to `16`–`32` or disable planner hints entirely.
+- **Very large deltas** (100K+ rows): Consider `256`–`512` if refresh latency matters.
+
+```sql
+SET pg_stream.merge_work_mem_mb = 128;
+```
+
+---
+
+### pg_stream.merge_strategy
+
+Strategy for applying delta changes to the stream table during differential refresh.
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Default | `'auto'` |
+| Values | `'auto'`, `'merge'`, `'delete_insert'` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+**Values:**
+- **`auto`** (default): Use `MERGE` for small deltas; switch to `DELETE` + `INSERT` when the delta exceeds 25% of the stream table row count.
+- **`merge`**: Always use a single `MERGE` statement. Best for correctness and simplicity.
+- **`delete_insert`**: Always use `DELETE` + `INSERT`. May be faster for very large deltas but has known limitations with aggregate/DISTINCT queries.
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `'auto'` or `'merge'`.
+- **Batch-heavy ETL**: Try `'delete_insert'` if MERGE performance degrades on large deltas, but test thoroughly with your specific queries.
+
+```sql
+-- Always use MERGE
+SET pg_stream.merge_strategy = 'merge';
+
+-- Always use DELETE + INSERT
+SET pg_stream.merge_strategy = 'delete_insert';
+```
+
+---
+
+### pg_stream.use_prepared_statements
+
+Use SQL `PREPARE` / `EXECUTE` for MERGE statements during differential refresh.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `true` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, the refresh executor issues `PREPARE __pgs_merge_{id}` on the first cache-hit cycle, then uses `EXECUTE` on subsequent cycles. After approximately 5 executions, PostgreSQL switches from a custom plan to a generic plan, saving 1–2 ms of parse/plan overhead per refresh.
+
+**Tuning Guidance:**
+- **Most workloads**: Leave at `true` — the cumulative parse/plan savings are significant for frequently-refreshed stream tables.
+- **Highly skewed data**: Set to `false` if prepared-statement parameter sniffing produces poor plans (e.g., highly skewed LSN distributions causing bad join estimates).
+
+```sql
+-- Disable prepared statements
+SET pg_stream.use_prepared_statements = false;
+```
+
+---
+
 ### pg_stream.user_triggers
 
 Control how user-defined triggers on stream tables are handled during refresh.
@@ -292,6 +459,12 @@ pg_stream.min_schedule_seconds = 60
 pg_stream.max_consecutive_errors = 3
 pg_stream.change_buffer_schema = 'pgstream_changes'
 pg_stream.max_concurrent_refreshes = 4
+pg_stream.differential_max_change_ratio = 0.15
+pg_stream.cleanup_use_truncate = true
+pg_stream.merge_planner_hints = true
+pg_stream.merge_work_mem_mb = 64
+pg_stream.merge_strategy = 'auto'
+pg_stream.use_prepared_statements = true
 pg_stream.user_triggers = 'auto'
 pg_stream.block_source_ddl = false
 pg_stream.cdc_mode = 'trigger'

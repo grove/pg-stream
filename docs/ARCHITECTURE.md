@@ -212,7 +212,8 @@ Each operator knows how to generate a **delta query** — given a set of changes
 | **Filter** | Apply WHERE predicate to deltas |
 | **Project** | Apply column projection to deltas |
 | **Join** | Join deltas against the other side's current state |
-| **OuterJoin** | LEFT/RIGHT/FULL outer join with NULL padding |
+| **OuterJoin** | LEFT/RIGHT outer join with NULL padding |
+| **FullJoin** | FULL OUTER JOIN with 8-part delta (both sides may produce NULLs) |
 | **Aggregate** | Recompute group values where affected keys changed |
 | **Distinct** | COUNT-based duplicate tracking |
 | **UnionAll** | Merge deltas from both branches |
@@ -220,8 +221,13 @@ Each operator knows how to generate a **delta query** — given a set of changes
 | **Except** | Dual-count multiplicity with GREATEST(0, L-R) boundary crossing |
 | **Subquery** | Transparent delegation + optional column renaming (CTEs, subselects) |
 | **CteScan** | Shared delta lookup from CTE cache (multi-reference CTEs) |
+| **RecursiveCte** | Semi-naive / DRed / recomputation for `WITH RECURSIVE` |
 | **Window** | Partition-based recomputation for window functions |
 | **LateralFunction** | Row-scoped recomputation for SRFs in FROM (jsonb_array_elements, unnest, etc.) |
+| **LateralSubquery** | Row-scoped recomputation for correlated subqueries in LATERAL FROM |
+| **SemiJoin** | EXISTS / IN subquery delta via semi-join |
+| **AntiJoin** | NOT EXISTS / NOT IN subquery delta via anti-join |
+| **ScalarSubquery** | Correlated scalar subquery in SELECT list |
 
 See [DVM_OPERATORS.md](DVM_OPERATORS.md) for detailed descriptions.
 
@@ -371,7 +377,7 @@ Row IDs are written into every stream table's storage as an internal `__pgs_row_
 
 ### 13. Configuration (`src/config.rs`)
 
-Twelve GUC (Grand Unified Configuration) variables control runtime behavior. See [CONFIGURATION.md](CONFIGURATION.md) for details.
+Twelve GUC (Grand Unified Configuration) variables control runtime behavior, plus five performance-tuning GUCs. See [CONFIGURATION.md](CONFIGURATION.md) for details.
 
 | GUC | Default | Purpose |
 |---|---|---|
@@ -387,6 +393,10 @@ Twelve GUC (Grand Unified Configuration) variables control runtime behavior. See
 | `pg_stream.block_source_ddl` | `false` | Block column-affecting DDL on tracked source tables instead of reinit |
 | `pg_stream.cdc_mode` | `'trigger'` | CDC mechanism: `trigger` / `auto` / `wal` |
 | `pg_stream.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
+| `pg_stream.merge_planner_hints` | `true` | Inject `SET LOCAL` planner hints (disable nestloop, raise work_mem) before MERGE |
+| `pg_stream.merge_work_mem_mb` | `64` | `work_mem` (MB) applied when delta exceeds 10 000 rows and planner hints enabled |
+| `pg_stream.merge_strategy` | `'auto'` | Delta application strategy: `auto` / `merge` / `delete_insert` |
+| `pg_stream.use_prepared_statements` | `true` | Use SQL PREPARE/EXECUTE for cached MERGE templates |
 
 ---
 
@@ -459,8 +469,10 @@ src/
 │       ├── filter.rs        # WHERE clause filtering
 │       ├── project.rs       # Column projection
 │       ├── join.rs          # Inner join
-│       ├── outer_join.rs    # LEFT/RIGHT/FULL outer join
-│       ├── aggregate.rs     # GROUP BY + aggregate functions
+│       ├── join_common.rs   # Shared join utilities (snapshot subqueries, column disambiguation)
+│       ├── outer_join.rs    # LEFT/RIGHT outer join
+│       ├── full_join.rs     # FULL OUTER JOIN (8-part delta)
+│       ├── aggregate.rs     # GROUP BY + aggregate functions (37 AggFunc variants)
 │       ├── distinct.rs      # DISTINCT deduplication
 │       ├── union_all.rs     # UNION ALL merging
 │       ├── intersect.rs     # INTERSECT / INTERSECT ALL (dual-count LEAST)
@@ -469,7 +481,11 @@ src/
 │       ├── cte_scan.rs      # Shared CTE delta (multi-reference)
 │       ├── recursive_cte.rs # Recursive CTE (semi-naive + DRed + recomputation)
 │       ├── window.rs        # Window function (partition recomputation)
-│       └── lateral_function.rs # LATERAL SRF (row-scoped recomputation)
+│       ├── lateral_function.rs  # LATERAL SRF (row-scoped recomputation)
+│       ├── lateral_subquery.rs  # LATERAL correlated subquery
+│       ├── semi_join.rs     # EXISTS / IN subquery (semi-join delta)
+│       ├── anti_join.rs     # NOT EXISTS / NOT IN subquery (anti-join delta)
+│       └── scalar_subquery.rs   # Correlated scalar subquery in SELECT
 ├── monitor.rs       # Monitoring & observability functions
 ├── refresh.rs       # Refresh orchestration
 ├── scheduler.rs     # Automatic scheduling with canonical periods
