@@ -2083,6 +2083,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "testcontainers",
  "testcontainers-modules",
