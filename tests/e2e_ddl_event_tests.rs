@@ -208,7 +208,7 @@ async fn test_function_change_marks_st_for_reinit() {
     // Verify functions_used was populated
     let func_count: i64 = db
         .query_scalar(
-            "SELECT coalesce(array_length(functions_used, 1), 0) \
+            "SELECT coalesce(array_length(functions_used, 1), 0)::bigint \
              FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_func_st'",
         )
         .await;

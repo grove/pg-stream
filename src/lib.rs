@@ -117,7 +117,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pgs_name ON pgstream.pgs_stream_tables (pg
 CREATE TABLE IF NOT EXISTS pgstream.pgs_dependencies (
     pgs_id        BIGINT NOT NULL REFERENCES pgstream.pgs_stream_tables(pgs_id) ON DELETE CASCADE,
     source_relid OID NOT NULL,
-    source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW')),
+    source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW', 'MATVIEW', 'FOREIGN_TABLE')),
     columns_used TEXT[],
     column_snapshot JSONB,
     schema_fingerprint TEXT,

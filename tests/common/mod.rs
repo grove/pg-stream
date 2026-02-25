@@ -39,7 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_pgs_status ON pgstream.pgs_stream_tables (status)
 CREATE TABLE IF NOT EXISTS pgstream.pgs_dependencies (
     pgs_id        BIGINT NOT NULL REFERENCES pgstream.pgs_stream_tables(pgs_id) ON DELETE CASCADE,
     source_relid OID NOT NULL,
-    source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW')),
+    source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW', 'MATVIEW', 'FOREIGN_TABLE')),
     columns_used TEXT[],
     PRIMARY KEY (pgs_id, source_relid)
 );

@@ -365,7 +365,8 @@ async fn test_coalesce_in_select_differential_mode() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn test_natural_join_rejected_with_clear_error() {
+async fn test_natural_join_accepted_via_rewrite() {
+    // NATURAL JOIN is auto-rewritten to INNER JOIN on shared columns.
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT)")
@@ -379,16 +380,16 @@ async fn test_natural_join_rejected_with_clear_error() {
              $$ SELECT t1.id, t1.val, t2.score FROM t1 NATURAL JOIN t2 $$, '1m', 'FULL')",
         )
         .await;
-    assert!(result.is_err(), "NATURAL JOIN should be rejected");
-    let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("NATURAL JOIN"),
-        "Error should mention NATURAL JOIN, got: {err}"
+        result.is_ok(),
+        "NATURAL JOIN should be accepted via auto-rewrite, got: {:?}",
+        result.err()
     );
 }
 
 #[tokio::test]
-async fn test_distinct_on_rejected_with_clear_error() {
+async fn test_distinct_on_accepted_via_rewrite() {
+    // DISTINCT ON is auto-rewritten to ROW_NUMBER() window subquery.
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE logs (id INT PRIMARY KEY, category TEXT, ts TIMESTAMPTZ)")
@@ -400,11 +401,10 @@ async fn test_distinct_on_rejected_with_clear_error() {
              $$ SELECT DISTINCT ON (category) id, category, ts FROM logs ORDER BY category, ts DESC $$, '1m', 'FULL')",
         )
         .await;
-    assert!(result.is_err(), "DISTINCT ON should be rejected");
-    let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("DISTINCT ON"),
-        "Error should mention DISTINCT ON, got: {err}"
+        result.is_ok(),
+        "DISTINCT ON should be accepted via auto-rewrite, got: {:?}",
+        result.err()
     );
 }
 

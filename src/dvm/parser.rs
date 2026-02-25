@@ -2375,7 +2375,7 @@ fn get_view_definition(schema: &str, relname: &str) -> Result<String, PgStreamEr
         let result = client
             .select(&sql, None, &[])
             .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-        result
+        let raw = result
             .first()
             .get::<String>(1)
             .map_err(|e| PgStreamError::SpiError(e.to_string()))?
@@ -2383,31 +2383,43 @@ fn get_view_definition(schema: &str, relname: &str) -> Result<String, PgStreamEr
                 PgStreamError::QueryParseError(format!(
                     "Could not retrieve view definition for {schema}.{relname}"
                 ))
-            })
+            })?;
+        Ok(strip_view_definition_suffix(&raw))
     })
 }
 
+/// Strip a trailing semicolon (and surrounding whitespace) from a view
+/// definition returned by `pg_get_viewdef()`.
+///
+/// PostgreSQL 18 may include a trailing semicolon. When the definition is
+/// embedded inside a subquery parenthesis, the semicolon produces a syntax
+/// error. Extracted as a pure function for unit-testability.
+fn strip_view_definition_suffix(raw: &str) -> String {
+    raw.trim_end_matches(';').trim().to_string()
+}
+
 /// Resolve schema for a RangeVar. If schemaname is NULL, resolve via search_path.
-fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<String, PgStreamError> {
+///
+/// Returns `None` if the relation cannot be found in `pg_class` (e.g. CTE
+/// names, subquery aliases, or function-call ranges).
+fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgStreamError> {
     if !rv.schemaname.is_null() {
         let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
             .to_str()
             .map_err(|_| PgStreamError::QueryParseError("Invalid schema name encoding".into()))?;
-        return Ok(schema.to_string());
+        return Ok(Some(schema.to_string()));
     }
 
     // Resolve from search_path
     if rv.relname.is_null() {
-        return Err(PgStreamError::QueryParseError(
-            "RangeVar with NULL relname".into(),
-        ));
+        return Ok(None);
     }
     let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
         .to_str()
         .map_err(|_| PgStreamError::QueryParseError("Invalid relation name encoding".into()))?;
 
     let sql = format!(
-        "SELECT n.nspname FROM pg_class c \
+        "SELECT n.nspname::text FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE c.relname = '{}' \
          AND n.nspname = ANY(string_to_array(current_setting('search_path'), ', ')::text[] || 'public'::text) \
@@ -2419,13 +2431,13 @@ fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<String, PgStreamErro
         let result = client
             .select(&sql, None, &[])
             .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-        result
-            .first()
-            .get::<String>(1)
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?
-            .ok_or_else(|| {
-                PgStreamError::NotFound(format!("relation '{relname}' not found in search_path"))
-            })
+        // Iterate to handle empty results (CTE names, subquery aliases, etc.)
+        for row in result {
+            if let Ok(Some(schema)) = row.get::<String>(1) {
+                return Ok(Some(schema));
+            }
+        }
+        Ok(None)
     })
 }
 
@@ -2508,8 +2520,11 @@ unsafe fn collect_view_subs_from_item(
             .map_err(|_| PgStreamError::QueryParseError("Invalid relation name encoding".into()))?
             .to_string();
 
-        // Resolve schema
-        let schema = resolve_rangevar_schema(rv)?;
+        // Resolve schema — if not found, this is a CTE/subquery alias, skip.
+        let schema = match resolve_rangevar_schema(rv)? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
 
         // Check relkind
         let relkind = resolve_relkind(&schema, &relname)?;
@@ -3074,7 +3089,11 @@ unsafe fn check_from_item_for_matview_or_foreign(
             .unwrap_or("")
             .to_string();
 
-        let schema = resolve_rangevar_schema(rv)?;
+        // Skip CTE names / subquery aliases that are not real relations.
+        let schema = match resolve_rangevar_schema(rv)? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
         let relkind = resolve_relkind(&schema, &relname)?;
 
         match relkind.as_deref() {
@@ -9537,6 +9556,50 @@ mod tests {
             pk_columns: Vec::new(),
             alias: alias.to_string(),
         }
+    }
+
+    // ── strip_view_definition_suffix tests ──────────────────────────
+
+    #[test]
+    fn test_strip_view_def_suffix_trailing_semicolon() {
+        assert_eq!(strip_view_definition_suffix("SELECT 1;"), "SELECT 1");
+    }
+
+    #[test]
+    fn test_strip_view_def_suffix_trailing_semicolon_with_whitespace() {
+        assert_eq!(
+            strip_view_definition_suffix("SELECT a FROM t ;  "),
+            "SELECT a FROM t"
+        );
+    }
+
+    #[test]
+    fn test_strip_view_def_suffix_no_semicolon() {
+        assert_eq!(
+            strip_view_definition_suffix("SELECT a FROM t"),
+            "SELECT a FROM t"
+        );
+    }
+
+    #[test]
+    fn test_strip_view_def_suffix_multiple_semicolons_strips_last_only() {
+        // Only the trailing one is stripped; interior semicolons would be
+        // a syntax error in view definitions, but we still handle it.
+        assert_eq!(strip_view_definition_suffix("SELECT ';'; "), "SELECT ';'");
+    }
+
+    #[test]
+    fn test_strip_view_def_suffix_empty_string() {
+        assert_eq!(strip_view_definition_suffix(""), "");
+    }
+
+    #[test]
+    fn test_strip_view_def_suffix_multiline() {
+        let input = " SELECT a,\n       b\nFROM t;\n";
+        assert_eq!(
+            strip_view_definition_suffix(input),
+            "SELECT a,\n       b\nFROM t"
+        );
     }
 
     // ── Expr::to_sql tests ──────────────────────────────────────────

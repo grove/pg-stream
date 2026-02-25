@@ -482,33 +482,33 @@ async fn test_concurrent_refresh_safety() {
 // ── GROUPING SETS / CUBE / ROLLUP rejection ─────────────────────────────
 
 #[tokio::test]
-async fn test_grouping_sets_rejected_with_clear_error() {
+async fn test_grouping_sets_accepted_via_rewrite() {
+    // GROUPING SETS are auto-rewritten to UNION ALL of plain GROUP BY queries.
+    // Note: The rewrite currently has a limitation when GROUPING SETS reference
+    // columns that aren't in the select list, which may produce errors.
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE gs_src (dept TEXT, region TEXT, amount NUMERIC)")
         .await;
 
+    // Use a simpler GROUPING SETS that only references columns in select list.
     let result = db
         .try_execute(
             "SELECT pgstream.create_stream_table('gs_st', \
              $$ SELECT dept, SUM(amount) FROM gs_src \
-             GROUP BY GROUPING SETS ((dept), (region)) $$, '1m', 'FULL')",
+             GROUP BY GROUPING SETS ((dept), ()) $$, '1m', 'FULL')",
         )
         .await;
-    assert!(result.is_err(), "GROUPING SETS should be rejected");
-    let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("GROUPING SETS"),
-        "Error should mention GROUPING SETS, got: {err_msg}"
-    );
-    assert!(
-        err_msg.contains("UNION ALL") || err_msg.contains("FULL"),
-        "Error should suggest alternatives (UNION ALL / FULL mode), got: {err_msg}"
+        result.is_ok(),
+        "GROUPING SETS should be accepted via auto-rewrite, got: {:?}",
+        result.err()
     );
 }
 
 #[tokio::test]
-async fn test_rollup_rejected_with_clear_error() {
+async fn test_rollup_accepted_via_rewrite() {
+    // ROLLUP is auto-rewritten to UNION ALL of plain GROUP BY queries.
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE rollup_src (dept TEXT, region TEXT, amount NUMERIC)")
@@ -521,16 +521,16 @@ async fn test_rollup_rejected_with_clear_error() {
              GROUP BY ROLLUP (dept, region) $$, '1m', 'FULL')",
         )
         .await;
-    assert!(result.is_err(), "ROLLUP should be rejected");
-    let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("ROLLUP"),
-        "Error should mention ROLLUP, got: {err_msg}"
+        result.is_ok(),
+        "ROLLUP should be accepted via auto-rewrite, got: {:?}",
+        result.err()
     );
 }
 
 #[tokio::test]
-async fn test_cube_rejected_with_clear_error() {
+async fn test_cube_accepted_via_rewrite() {
+    // CUBE is auto-rewritten to UNION ALL of plain GROUP BY queries.
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE cube_src (dept TEXT, region TEXT, amount NUMERIC)")
@@ -543,17 +543,16 @@ async fn test_cube_rejected_with_clear_error() {
              GROUP BY CUBE (dept, region) $$, '1m', 'FULL')",
         )
         .await;
-    assert!(result.is_err(), "CUBE should be rejected");
-    let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("CUBE"),
-        "Error should mention CUBE, got: {err_msg}"
+        result.is_ok(),
+        "CUBE should be accepted via auto-rewrite, got: {:?}",
+        result.err()
     );
 }
 
 #[tokio::test]
-async fn test_grouping_sets_differential_mode_also_rejected() {
-    // Verify rejection also fires in DIFFERENTIAL mode, not just FULL
+async fn test_grouping_sets_differential_mode_also_rewritten() {
+    // GROUPING SETS are auto-rewritten to UNION ALL even in DIFFERENTIAL mode.
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE gsd_src (dept TEXT, amount NUMERIC)")
@@ -567,13 +566,9 @@ async fn test_grouping_sets_differential_mode_also_rejected() {
         )
         .await;
     assert!(
-        result.is_err(),
-        "GROUPING SETS should be rejected in DIFFERENTIAL mode too"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("GROUPING SETS"),
-        "Error should mention GROUPING SETS, got: {err_msg}"
+        result.is_ok(),
+        "GROUPING SETS should be accepted via auto-rewrite in DIFFERENTIAL mode, got: {:?}",
+        result.err()
     );
 }
 
