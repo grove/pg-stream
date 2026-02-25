@@ -853,9 +853,9 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 Session 1:  F1 (views) + F3 (user-defined aggs) + F8 (foreign tables)    ✅ Done
 Session 2:  F7 (virtual gen cols) + F4 (COLLATE) + F6 (ANY_VALUE)        ✅ Done
 Session 3:  F2 (volatile in Expr::Raw)                                    ✅ Done
-Session 4:  F19–F24 (all documentation)                                   ~7h
-Session 5:  F13 (partitioned tables) + F14 (replication targets)          ~5h
-Session 6:  F5 (IS JSON) + F10 (SQL/JSON constructors)                   ~8h
+Session 4:  F19–F24 (all documentation)                                   ✅ Done
+Session 5:  F13 (partitioned tables) + F14 (replication targets)          ✅ Done
+Session 6:  F5 (IS JSON) + F10 (SQL/JSON constructors)                   ✅ Done
 Session 7:  F11 (JSON agg standard) + F12 (JSON_TABLE)                   ~14h
 Session 8+: F15–F18 (operational hardening)                              ~16h
 ```
@@ -883,11 +883,11 @@ Session 8+: F15–F18 (operational hardening)                              ~16h
 | Diff operators | 10 | 16 | 21 | 21 |
 | Auto-rewrite passes | 0 | 0 | 5 | 5 |
 | Unit tests | 745 | 809 | 896 | 896 |
-| E2E tests | ~100 | ~200 | 350 | 350 |
+| E2E tests | ~100 | ~200 | 350 | 361 |
 | E2E test files | ~15 | ~18 | 22 | 22 |
 | P0 issues | 14 | 0 | 0 | 0 |
 | P1 issues | 5 | 0 | 0 | 0 |
-| Expression types | 7 | 15 | 30+ | 31+ |
+| Expression types | 7 | 15 | 30+ | 40+ |
 | GUCs | ~6 | ~8 | 17 | 17 |
 
 ### What Changed Between SQL_GAPS_5 and SQL_GAPS_6
