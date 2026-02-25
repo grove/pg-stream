@@ -132,6 +132,14 @@ fn handle_ddl_command(cmd: &DdlCommand) {
             // New tables can't be upstream of any existing ST yet.
         }
 
+        // ── View DDL ──────────────────────────────────────────────────
+        // CREATE OR REPLACE VIEW changes a view definition. If any stream
+        // table inlined this view, the stored defining_query is now stale
+        // and the ST needs reinit.
+        ("view", "CREATE VIEW") | ("view", "ALTER VIEW") => {
+            handle_view_change(cmd);
+        }
+
         // ── CREATE TRIGGER on a stream table → warning ────────────────
         ("trigger", "CREATE TRIGGER") => {
             handle_create_trigger(cmd);
@@ -139,6 +147,82 @@ fn handle_ddl_command(cmd: &DdlCommand) {
 
         _ => {}
     }
+}
+
+// ── View DDL handling ──────────────────────────────────────────────────────
+
+/// Handle CREATE OR REPLACE VIEW / ALTER VIEW on a view that may be an
+/// upstream (inlined) dependency of a stream table.
+///
+/// When a view definition changes, any stream table that inlined it has a
+/// stale `defining_query` and needs reinitialising to re-run the view
+/// inlining rewrite with the new definition.
+fn handle_view_change(cmd: &DdlCommand) {
+    let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
+
+    // Check if any ST depends on this view OID via pgs_dependencies.
+    let affected_pgs_ids = match find_downstream_pgs_ids(cmd.objid) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to query deps for view {}: {}",
+                identity,
+                e,
+            );
+            return;
+        }
+    };
+
+    if affected_pgs_ids.is_empty() {
+        return;
+    }
+
+    pgrx::info!(
+        "pg_stream: view {} changed, marking {} stream table(s) for reinit",
+        identity,
+        affected_pgs_ids.len(),
+    );
+
+    for pgs_id in &affected_pgs_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to mark ST {} for reinit after view change: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    // Cascade: STs depending on affected STs also need reinit.
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade view reinit: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for pgs_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade view reinit to ST {}: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    let total = affected_pgs_ids.len() + cascade_ids.len();
+    log!(
+        "pg_stream_ddl_tracker: view {} changed → {} ST(s) marked for reinitialize",
+        identity,
+        total,
+    );
+
+    shmem::signal_dag_rebuild();
 }
 
 // ── ALTER TABLE handling ───────────────────────────────────────────────────
@@ -404,10 +488,11 @@ fn pg_stream_on_sql_drop() {
     };
 
     for obj in &dropped {
-        if obj.object_type != "table" {
-            continue;
+        match obj.object_type.as_str() {
+            "table" => handle_dropped_table(obj),
+            "view" => handle_dropped_view(obj),
+            _ => {}
         }
-        handle_dropped_table(obj);
     }
 }
 
@@ -549,6 +634,69 @@ fn handle_dt_storage_dropped(relid: pg_sys::Oid, identity: &str) {
     log!(
         "pg_stream_ddl_tracker: ST storage table {} dropped → catalog cleaned, DAG rebuild signaled",
         identity,
+    );
+}
+
+/// Handle a dropped view: if the view was inlined into any ST, mark those
+/// STs as ERROR since the original query can no longer be re-expanded.
+fn handle_dropped_view(obj: &DroppedObject) {
+    let identity = obj.object_identity.as_deref().unwrap_or("unknown");
+
+    let affected_pgs_ids = match find_downstream_pgs_ids(obj.objid) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to query deps for dropped view {}: {}",
+                identity,
+                e,
+            );
+            return;
+        }
+    };
+
+    if affected_pgs_ids.is_empty() {
+        return;
+    }
+
+    // Mark affected STs as ERROR — the inlined view no longer exists,
+    // so reinit would fail.
+    for pgs_id in &affected_pgs_ids {
+        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to set ST {} to ERROR after view drop: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    // Cascade: STs depending on now-errored STs also go to ERROR.
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade view drop error: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for pgs_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade view drop ERROR to ST {}: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    let total = affected_pgs_ids.len() + cascade_ids.len();
+    log!(
+        "pg_stream_ddl_tracker: DROP VIEW {} → {} ST(s) set to ERROR",
+        identity,
+        total,
     );
 }
 
