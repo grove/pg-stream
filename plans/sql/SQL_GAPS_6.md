@@ -801,9 +801,9 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 
 | Step | Gap | Description | Effort | Impact |
 |------|-----|-------------|--------|--------|
-| **F10** | G1.5 | SQL/JSON constructors (JSON(), JSON_ARRAY(), etc.) | 4–6 hours | SQL-standard JSON |
-| **F11** | G3.4 | JSON_ARRAYAGG / JSON_OBJECTAGG (SQL standard) | 4–6 hours | SQL-standard JSON aggregation |
-| **F12** | G5.1 | JSON_TABLE() in FROM | 8–12 hours | Row-generating JSON processing |
+| **F10** | G1.5 | SQL/JSON constructors (JSON(), JSON_ARRAY(), etc.) | 4–6 hours | ~~✅ Implemented~~ |
+| **F11** | G3.4 | JSON_ARRAYAGG / JSON_OBJECTAGG (SQL standard) | 4–6 hours | ~~✅ Implemented~~ |
+| **F12** | G5.1 | JSON_TABLE() in FROM | 8–12 hours | ~~✅ Implemented~~ |
 
 **Estimated effort:** 16–24 hours  
 **Value:** Full SQL/JSON standard compliance (PostgreSQL 16+).
@@ -812,12 +812,12 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 
 | Step | Gap | Description | Effort | Impact |
 |------|-----|-------------|--------|--------|
-| **F13** | G6.1 | Verify partitioned table CDC on PG 18 | 3–4 hours | Prevents potential silent data loss |
-| **F14** | G6.2 | Detect logical replication targets | 2 hours | Warning for replication setups |
-| **F15** | G6.3 | Selective CDC column capture | 4–6 hours | Reduces buffer bloat |
-| **F16** | G7.2 | Operator volatility checking | 3–4 hours | Completes volatility coverage |
-| **F17** | G8.1 | Cross-session cache invalidation | 4–6 hours | Multi-backend correctness |
-| **F18** | G8.2 | Function/operator DDL tracking | 4–6 hours | Prevents silent semantic drift |
+| **F13** | G6.1 | Verify partitioned table CDC on PG 18 | 3–4 hours | ~~✅ Implemented~~ |
+| **F14** | G6.2 | Detect logical replication targets | 2 hours | ~~✅ Implemented~~ |
+| **F15** | G6.3 | Selective CDC column capture | 4–6 hours | Deferred (needs column lineage) |
+| **F16** | G7.2 | Operator volatility checking | 3–4 hours | ~~✅ Implemented~~ |
+| **F17** | G8.1 | Cross-session cache invalidation | 4–6 hours | ~~✅ Implemented~~ |
+| **F18** | G8.2 | Function/operator DDL tracking | 4–6 hours | ~~✅ Implemented~~ |
 
 **Estimated effort:** 20–28 hours  
 **Value:** Production hardening for complex deployments.
@@ -856,9 +856,16 @@ Session 3:  F2 (volatile in Expr::Raw)                                    ✅ Do
 Session 4:  F19–F24 (all documentation)                                   ✅ Done
 Session 5:  F13 (partitioned tables) + F14 (replication targets)          ✅ Done
 Session 6:  F5 (IS JSON) + F10 (SQL/JSON constructors)                   ✅ Done
-Session 7:  F11 (JSON agg standard) + F12 (JSON_TABLE)                   ~14h
-Session 8+: F15–F18 (operational hardening)                              ~16h
+Session 7:  F11 (JSON agg standard) + F12 (JSON_TABLE)                   ✅ Done
+Session 8+: F15–F18 (operational hardening)                               ✅ Done (F15 deferred)
 ```
+
+**F15 note:** Deferred to future work. Selective CDC column capture requires
+full column lineage tracking (walking all expression nodes for ColumnRef
+references with alias resolution). Currently `source_columns_used()` returns
+all table columns. This is a performance optimization, not a correctness
+issue — the current approach captures all columns which is safe but less
+efficient for wide tables.
 
 ---
 
@@ -872,18 +879,18 @@ Session 8+: F15–F18 (operational hardening)                              ~16h
 | SQL_GAPS_4 | Report accuracy, ordered-set aggregates (MODE, PERCENTILE) | 1 | 7 | 809 → 826 |
 | Hybrid CDC | Trigger→WAL transition, user triggers, pgs_ rename | ~3 | 12+ | 826 → 872 |
 | SQL_GAPS_5 | 15 steps: volatile detection, DISTINCT ON, GROUPING SETS, ALL subquery, regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables, scalar WHERE, SubLinks-OR, multi-PARTITION, recursive CTE DIFF | ~10 | 15 | 872 → 896 |
-| **SQL_GAPS_6** | **This plan: 38 new gaps identified, 24 steps proposed** | **~8 est.** | — | 896 → ? |
+| **SQL_GAPS_6** | **This plan: 38 new gaps identified, 24 steps proposed** | **8** | **23/24 done (F15 deferred)** | 896 → 1,138+ |
 
 ### Cumulative Scorecard
 
 | Metric | SQL_GAPS_1 | SQL_GAPS_3 | SQL_GAPS_5 End | SQL_GAPS_6 (Now) |
 |--------|-----------|-----------|----------------|-----------------|
-| AggFunc variants | 5 | 10 | 36 | 37 |
+| AggFunc variants | 5 | 10 | 36 | 39 |
 | OpTree variants | 12 | 18 | 21 | 21 |
 | Diff operators | 10 | 16 | 21 | 21 |
 | Auto-rewrite passes | 0 | 0 | 5 | 5 |
-| Unit tests | 745 | 809 | 896 | 896 |
-| E2E tests | ~100 | ~200 | 350 | 361 |
+| Unit tests | 745 | 809 | 896 | ~1,138 |
+| E2E tests | ~100 | ~200 | 350 | 384 |
 | E2E test files | ~15 | ~18 | 22 | 22 |
 | P0 issues | 14 | 0 | 0 | 0 |
 | P1 issues | 5 | 0 | 0 | 0 |
