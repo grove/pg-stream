@@ -134,7 +134,24 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
 /// Handles regular aggregates (`BIT_AND(flags)`), aggregates with DISTINCT,
 /// FILTER clauses, second arguments (`STRING_AGG(name, ', ')`), and
 /// ordered-set aggregates (`MODE() WITHIN GROUP (ORDER BY amount)`).
+///
+/// SQL/JSON standard aggregates (`JSON_OBJECTAGG`, `JSON_ARRAYAGG`) carry
+/// their full deparsed SQL in the `AggFunc` variant and are returned directly.
 fn agg_to_rescan_sql(agg: &AggExpr) -> String {
+    // SQL/JSON standard aggregates: use the stored raw SQL directly since
+    // their special syntax (key: value, ABSENT ON NULL, etc.) cannot be
+    // reconstructed from function name + arguments.
+    match &agg.function {
+        AggFunc::JsonObjectAggStd(raw) | AggFunc::JsonArrayAggStd(raw) => {
+            let filter = match &agg.filter {
+                Some(f) => format!(" FILTER (WHERE {})", f.to_sql()),
+                None => String::new(),
+            };
+            return format!("{raw}{filter}");
+        }
+        _ => {}
+    }
+
     let func_name = agg.function.sql_name();
     let distinct_str = if agg.is_distinct { "DISTINCT " } else { "" };
 
@@ -1542,6 +1559,8 @@ mod tests {
         assert!(AggFunc::BitXor.is_group_rescan());
         assert!(AggFunc::JsonObjectAgg.is_group_rescan());
         assert!(AggFunc::JsonbObjectAgg.is_group_rescan());
+        assert!(AggFunc::JsonObjectAggStd("JSON_OBJECTAGG(k : v)".into()).is_group_rescan());
+        assert!(AggFunc::JsonArrayAggStd("JSON_ARRAYAGG(x)".into()).is_group_rescan());
         assert!(AggFunc::StddevPop.is_group_rescan());
         assert!(AggFunc::StddevSamp.is_group_rescan());
         assert!(AggFunc::VarPop.is_group_rescan());
@@ -1549,6 +1568,56 @@ mod tests {
         assert!(AggFunc::Mode.is_group_rescan());
         assert!(AggFunc::PercentileCont.is_group_rescan());
         assert!(AggFunc::PercentileDisc.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_to_rescan_sql_json_objectagg_std() {
+        let agg = AggExpr {
+            function: AggFunc::JsonObjectAggStd(
+                "JSON_OBJECTAGG(name : value ABSENT ON NULL)".into(),
+            ),
+            argument: None,
+            alias: "obj".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        };
+        assert_eq!(
+            agg_to_rescan_sql(&agg),
+            "JSON_OBJECTAGG(name : value ABSENT ON NULL)"
+        );
+    }
+
+    #[test]
+    fn test_agg_to_rescan_sql_json_arrayagg_std() {
+        let agg = AggExpr {
+            function: AggFunc::JsonArrayAggStd("JSON_ARRAYAGG(x ORDER BY x)".into()),
+            argument: None,
+            alias: "arr".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        };
+        assert_eq!(agg_to_rescan_sql(&agg), "JSON_ARRAYAGG(x ORDER BY x)");
+    }
+
+    #[test]
+    fn test_agg_to_rescan_sql_json_arrayagg_std_with_filter() {
+        let agg = AggExpr {
+            function: AggFunc::JsonArrayAggStd("JSON_ARRAYAGG(x)".into()),
+            argument: None,
+            alias: "arr".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: Some(Expr::Raw("x > 0".into())),
+            order_within_group: None,
+        };
+        assert_eq!(
+            agg_to_rescan_sql(&agg),
+            "JSON_ARRAYAGG(x) FILTER (WHERE x > 0)"
+        );
     }
 
     #[test]

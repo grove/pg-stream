@@ -189,6 +189,16 @@ pub enum AggFunc {
     /// ANY_VALUE aggregate (PG 16+) — group-rescan strategy.
     /// Returns an arbitrary non-null value from the group.
     AnyValue,
+    /// SQL/JSON standard aggregate: JSON_OBJECTAGG(key: value ...)
+    /// Carries the fully deparsed SQL since the special `key: value` syntax
+    /// cannot be reconstructed from function name + arguments alone.
+    /// Group-rescan strategy.
+    JsonObjectAggStd(String),
+    /// SQL/JSON standard aggregate: JSON_ARRAYAGG(expr ...)
+    /// Carries the fully deparsed SQL since the inline `ABSENT ON NULL`,
+    /// `ORDER BY`, and `RETURNING` clauses differ from regular function syntax.
+    /// Group-rescan strategy.
+    JsonArrayAggStd(String),
     /// Regression/correlation aggregates — group-rescan strategy.
     /// These are two-argument aggregates: `func(Y, X)`.
     Corr,
@@ -225,6 +235,8 @@ impl AggFunc {
             AggFunc::BitXor => "BIT_XOR",
             AggFunc::JsonObjectAgg => "JSON_OBJECT_AGG",
             AggFunc::JsonbObjectAgg => "JSONB_OBJECT_AGG",
+            AggFunc::JsonObjectAggStd(_) => "JSON_OBJECTAGG",
+            AggFunc::JsonArrayAggStd(_) => "JSON_ARRAYAGG",
             AggFunc::StddevPop => "STDDEV_POP",
             AggFunc::StddevSamp => "STDDEV_SAMP",
             AggFunc::VarPop => "VAR_POP",
@@ -264,6 +276,8 @@ impl AggFunc {
                 | AggFunc::BitXor
                 | AggFunc::JsonObjectAgg
                 | AggFunc::JsonbObjectAgg
+                | AggFunc::JsonObjectAggStd(_)
+                | AggFunc::JsonArrayAggStd(_)
                 | AggFunc::StddevPop
                 | AggFunc::StddevSamp
                 | AggFunc::VarPop
@@ -696,6 +710,161 @@ impl ParseResult {
                 (oid, cols)
             })
             .collect()
+    }
+
+    /// Collect all function names referenced in the defining query (G8.2).
+    ///
+    /// Used to populate `pgs_stream_tables.functions_used` at creation time
+    /// so that DDL hooks can detect `CREATE OR REPLACE FUNCTION` /
+    /// `DROP FUNCTION` events that affect this stream table.
+    ///
+    /// Returns a sorted, deduplicated list of function names (lowercase).
+    pub fn functions_used(&self) -> Vec<String> {
+        let mut names = std::collections::HashSet::new();
+        Self::collect_expr_funcs(&self.tree, &mut names);
+        for (_, cte_tree) in &self.cte_registry.entries {
+            Self::collect_expr_funcs(cte_tree, &mut names);
+        }
+        let mut result: Vec<String> = names.into_iter().collect();
+        result.sort();
+        result
+    }
+
+    /// Walk an OpTree recursively collecting function names from Expr nodes.
+    fn collect_expr_funcs(tree: &OpTree, names: &mut std::collections::HashSet<String>) {
+        match tree {
+            OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+            OpTree::Project {
+                expressions, child, ..
+            } => {
+                for expr in expressions {
+                    Self::collect_funcs_from_expr(expr, names);
+                }
+                Self::collect_expr_funcs(child, names);
+            }
+            OpTree::Filter { predicate, child } => {
+                Self::collect_funcs_from_expr(predicate, names);
+                Self::collect_expr_funcs(child, names);
+            }
+            OpTree::InnerJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::LeftJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::FullJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::SemiJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::AntiJoin {
+                condition,
+                left,
+                right,
+            } => {
+                Self::collect_funcs_from_expr(condition, names);
+                Self::collect_expr_funcs(left, names);
+                Self::collect_expr_funcs(right, names);
+            }
+            OpTree::Aggregate {
+                group_by,
+                aggregates,
+                child,
+            } => {
+                for expr in group_by {
+                    Self::collect_funcs_from_expr(expr, names);
+                }
+                for agg in aggregates {
+                    // The aggregate function itself
+                    names.insert(agg.function.sql_name().to_lowercase());
+                    if let Some(arg) = &agg.argument {
+                        Self::collect_funcs_from_expr(arg, names);
+                    }
+                    if let Some(filter) = &agg.filter {
+                        Self::collect_funcs_from_expr(filter, names);
+                    }
+                    if let Some(second) = &agg.second_arg {
+                        Self::collect_funcs_from_expr(second, names);
+                    }
+                }
+                Self::collect_expr_funcs(child, names);
+            }
+            OpTree::Distinct { child }
+            | OpTree::Subquery { child, .. }
+            | OpTree::LateralFunction { child, .. }
+            | OpTree::LateralSubquery { child, .. }
+            | OpTree::ScalarSubquery { child, .. } => {
+                Self::collect_expr_funcs(child, names);
+            }
+            OpTree::UnionAll { children } => {
+                for c in children {
+                    Self::collect_expr_funcs(c, names);
+                }
+            }
+            OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+                Self::collect_expr_funcs(left, names);
+                Self::collect_expr_funcs(right, names);
+            }
+            OpTree::RecursiveCte {
+                base, recursive, ..
+            } => {
+                Self::collect_expr_funcs(base, names);
+                Self::collect_expr_funcs(recursive, names);
+            }
+            OpTree::Window {
+                window_exprs,
+                partition_by,
+                child,
+                ..
+            } => {
+                for we in window_exprs {
+                    // Window function name
+                    names.insert(we.func_name.to_lowercase());
+                    for arg in &we.args {
+                        Self::collect_funcs_from_expr(arg, names);
+                    }
+                    for pb in &we.partition_by {
+                        Self::collect_funcs_from_expr(pb, names);
+                    }
+                    for ob in &we.order_by {
+                        Self::collect_funcs_from_expr(&ob.expr, names);
+                    }
+                }
+                for pb in partition_by {
+                    Self::collect_funcs_from_expr(pb, names);
+                }
+                Self::collect_expr_funcs(child, names);
+            }
+        }
+    }
+
+    /// Extract function names from an Expr recursively.
+    fn collect_funcs_from_expr(expr: &Expr, names: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::FuncCall { func_name, args } => {
+                names.insert(func_name.to_lowercase());
+                for arg in args {
+                    Self::collect_funcs_from_expr(arg, names);
+                }
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::collect_funcs_from_expr(left, names);
+                Self::collect_funcs_from_expr(right, names);
+            }
+            // ColumnRef, Literal, Star, Raw: no function calls
+            // (Raw may contain functions, but we don't parse them here —
+            // the volatility checker handles those separately.)
+            _ => {}
+        }
     }
 }
 
@@ -1372,13 +1541,68 @@ pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgStreamErro
     Ok('v')
 }
 
+/// Look up the volatility category of a PostgreSQL operator by name.
+///
+/// Joins `pg_operator` → `pg_proc` via `oprcode` to get the implementing
+/// function's `provolatile`. Returns the worst volatility across all
+/// overloads of the operator name (e.g., `+` for int, float, numeric).
+///
+/// Returns `'i'` if the operator is not found — all built-in operators
+/// (arithmetic, comparison, logical) are immutable. Unknown operators
+/// default to 'i' because operator-not-found typically means the query
+/// would fail anyway; the volatile/stable cases arise only with custom
+/// operators that DO exist in `pg_operator`.
+///
+/// Closes Gap G7.2: custom operators with volatile `oprcode` functions
+/// (e.g., PostGIS `&&` or user-defined operators) are now detected.
+#[cfg(not(test))]
+pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgStreamError> {
+    Spi::connect(|client| {
+        let result = client.select(
+            "SELECT p.provolatile::text \
+             FROM pg_catalog.pg_operator o \
+             JOIN pg_catalog.pg_proc p ON o.oprcode = p.oid \
+             WHERE o.oprname = $1",
+            None,
+            &[op_name.into()],
+        )?;
+
+        let mut worst = 'i';
+        for row in result {
+            let vol: String = row
+                .get_by_name::<String, _>("provolatile")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "i".to_string());
+            let ch = vol.chars().next().unwrap_or('i');
+            worst = max_volatility(worst, ch);
+        }
+        Ok(worst)
+    })
+    .map_err(|e: pgrx::spi::SpiError| {
+        PgStreamError::SpiError(format!("operator volatility lookup failed: {e}"))
+    })
+}
+
+/// Test-only stub: SPI is unavailable in unit tests, so assume immutable
+/// for operators (most built-in operators are immutable).
+#[cfg(test)]
+pub fn lookup_operator_volatility(_op_name: &str) -> Result<char, PgStreamError> {
+    Ok('i')
+}
+
 /// Recursively scan an `Expr` tree and update `worst` with the volatility
-/// of any `FuncCall` nodes found.
+/// of any `FuncCall` or `BinaryOp` operator nodes found.
+///
+/// For `Expr::BinaryOp`, looks up the operator's implementing function in
+/// `pg_operator` → `pg_proc.provolatile` to detect custom volatile operators
+/// (Gap G7.2).
 ///
 /// For `Expr::Raw` nodes, re-parses the SQL fragment via `raw_parser()` and
-/// walks the parse tree to detect function calls that may be volatile. This
-/// closes the G7.1 gap where expressions like `CASE WHEN now() > x THEN ...`
-/// deparsed to `Expr::Raw` would bypass volatility checking.
+/// walks the parse tree to detect function calls or operators that may be
+/// volatile. This closes the G7.1 gap where expressions like
+/// `CASE WHEN now() > x THEN ...` deparsed to `Expr::Raw` would bypass
+/// volatility checking.
 pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStreamError> {
     match expr {
         Expr::FuncCall { func_name, args } => {
@@ -1388,7 +1612,10 @@ pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStrea
                 collect_volatilities(arg, worst)?;
             }
         }
-        Expr::BinaryOp { left, right, .. } => {
+        Expr::BinaryOp { op, left, right } => {
+            // G7.2: Check the operator's implementing function volatility.
+            let vol = lookup_operator_volatility(op)?;
+            *worst = max_volatility(*worst, vol);
             collect_volatilities(left, worst)?;
             collect_volatilities(right, worst)?;
         }
@@ -1505,6 +1732,13 @@ fn walk_node_for_volatility(
         }
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
         let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+        // G7.2: Check the operator's implementing function volatility.
+        if !aexpr.name.is_null()
+            && let Ok(op_name) = unsafe { extract_operator_name(aexpr.name) }
+        {
+            let vol = lookup_operator_volatility(&op_name)?;
+            *worst = max_volatility(*worst, vol);
+        }
         if !aexpr.lexpr.is_null() {
             walk_node_for_volatility(aexpr.lexpr, worst)?;
         }
@@ -1830,6 +2064,8 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgStreamError> {
                     | AggFunc::BitXor
                     | AggFunc::JsonObjectAgg
                     | AggFunc::JsonbObjectAgg
+                    | AggFunc::JsonObjectAggStd(_)
+                    | AggFunc::JsonArrayAggStd(_)
                     | AggFunc::StddevPop
                     | AggFunc::StddevSamp
                     | AggFunc::VarPop
@@ -2323,6 +2559,9 @@ unsafe fn collect_view_subs_from_item(
             };
         }
     }
+    // JSON_TABLE: skip — it doesn't reference tables that could be views.
+    // The context item expression references the left-hand table which is
+    // already traversed via the FROM list iteration.
 
     Ok(())
 }
@@ -2705,6 +2944,9 @@ unsafe fn deparse_from_item_with_view_subs(
         Ok(result)
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
         // Function in FROM — deparse as-is using existing infrastructure
+        unsafe { deparse_from_item_to_sql(node) }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonTable) } {
+        // JSON_TABLE — deparse using dedicated deparser
         unsafe { deparse_from_item_to_sql(node) }
     } else {
         // Fallback
@@ -6485,6 +6727,50 @@ unsafe fn parse_from_item(
                 alias: String::new(),
             }),
         })
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonTable) } {
+        // ── F12: JSON_TABLE() in FROM clause ──────────────────────────
+        // JSON_TABLE is a row-generating FROM item similar to LATERAL SRFs.
+        // We deparse it to SQL and model it as a LateralFunction so the
+        // diff engine can apply row-scoped recomputation.
+        let jt = unsafe { &*(node as *const pg_sys::JsonTable) };
+        let func_sql = unsafe { deparse_json_table(jt as *const pg_sys::JsonTable)? };
+
+        // Extract alias
+        let alias = if !jt.alias.is_null() {
+            let a = unsafe { &*(jt.alias) };
+            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                .to_str()
+                .unwrap_or("jt")
+                .to_string()
+        } else {
+            "jt".to_string()
+        };
+
+        // Extract column aliases from the alias node
+        let column_aliases = if !jt.alias.is_null() {
+            let a = unsafe { &*(jt.alias) };
+            extract_alias_colnames(a)?
+        } else {
+            Vec::new()
+        };
+
+        // JSON_TABLE is inherently lateral (references the left-hand table).
+        // Model it as LateralFunction with a placeholder child that gets
+        // replaced in the FROM-list loop of parse_select_stmt().
+        Ok(OpTree::LateralFunction {
+            func_sql,
+            alias,
+            column_aliases,
+            with_ordinality: false,
+            child: Box::new(OpTree::Scan {
+                table_oid: 0,
+                table_name: String::new(),
+                schema: String::new(),
+                columns: vec![],
+                pk_columns: vec![],
+                alias: String::new(),
+            }),
+        })
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeTableSample) } {
         // TABLESAMPLE: SELECT * FROM t TABLESAMPLE BERNOULLI(10)
         // Stream tables materialize complete result sets; sampling at parse
@@ -7343,12 +7629,11 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
         unsafe { append_json_output(&mut sql, jse.output) };
         Ok(Expr::Raw(sql))
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectAgg) } {
-        // ── F10: JSON_OBJECTAGG(key: value) ──
-        // Note: This is an aggregate function in the raw parse tree.
-        // It bypasses T_FuncCall, so the DVM aggregate recognizer won't
-        // see it. Deparsed as Expr::Raw — works in FULL mode and as a
-        // passthrough expression. For correct DIFFERENTIAL aggregate
-        // handling, a dedicated AggFunc variant would be needed.
+        // ── F10/F11: JSON_OBJECTAGG(key: value) ──
+        // An aggregate function in the raw parse tree that bypasses T_FuncCall.
+        // In aggregate context (GROUP BY), extract_aggregates() handles this via
+        // AggFunc::JsonObjectAggStd. This Expr::Raw fallback is used in
+        // non-aggregate context (e.g., FULL mode, nested expressions).
         let joa = unsafe { &*(node as *const pg_sys::JsonObjectAgg) };
         let mut parts = Vec::new();
         if !joa.arg.is_null() {
@@ -7372,8 +7657,9 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
         unsafe { append_json_agg_clauses(&mut sql, joa.constructor) };
         Ok(Expr::Raw(sql))
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayAgg) } {
-        // ── F10: JSON_ARRAYAGG(expr [ORDER BY ...]) ──
-        // Same aggregate caveat as JSON_OBJECTAGG above.
+        // ── F10/F11: JSON_ARRAYAGG(expr [ORDER BY ...]) ──
+        // Same aggregate caveat as JSON_OBJECTAGG above: in GROUP BY context,
+        // extract_aggregates() handles this via AggFunc::JsonArrayAggStd.
         let jaa = unsafe { &*(node as *const pg_sys::JsonArrayAgg) };
         let arg = if !jaa.arg.is_null() {
             let jve = unsafe { &*jaa.arg };
@@ -7455,6 +7741,279 @@ unsafe fn append_json_agg_clauses(
 
     // RETURNING
     unsafe { append_json_output(sql, ctor.output) };
+}
+
+/// Deparse a `T_JsonTable` FROM item to SQL text.
+///
+/// Produces: `JSON_TABLE(expr, 'path' COLUMNS (col_defs))`.
+/// Does not include the alias — callers append `AS alias` as needed.
+///
+/// # Safety
+/// `jt` must point to a valid `pg_sys::JsonTable` node.
+unsafe fn deparse_json_table(jt: *const pg_sys::JsonTable) -> Result<String, PgStreamError> {
+    let jt_ref = unsafe { &*jt };
+
+    // Context item (the input expression)
+    let context_sql = if !jt_ref.context_item.is_null() {
+        let jve = unsafe { &*jt_ref.context_item };
+        if !jve.raw_expr.is_null() {
+            let expr = unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? };
+            expr.to_sql()
+        } else {
+            "NULL".to_string()
+        }
+    } else {
+        "NULL".to_string()
+    };
+
+    // Path specification
+    let path_sql = if !jt_ref.pathspec.is_null() {
+        let ps = unsafe { &*jt_ref.pathspec };
+        if !ps.string.is_null() {
+            let expr = unsafe { node_to_expr(ps.string)? };
+            expr.to_sql()
+        } else {
+            "'$'".to_string()
+        }
+    } else {
+        "'$'".to_string()
+    };
+
+    // PASSING clause
+    let passing_sql = unsafe { deparse_json_table_passing(jt_ref.passing)? };
+
+    // COLUMNS clause
+    let columns_sql = unsafe { deparse_json_table_columns(jt_ref.columns)? };
+
+    // ON ERROR behavior
+    let on_error_sql = unsafe { deparse_json_behavior(jt_ref.on_error, "ON ERROR") };
+
+    let mut sql = format!("JSON_TABLE({context_sql}, {path_sql}");
+    if !passing_sql.is_empty() {
+        sql.push_str(&format!(" PASSING {passing_sql}"));
+    }
+    sql.push_str(&format!(" COLUMNS ({columns_sql})"));
+    if !on_error_sql.is_empty() {
+        sql.push_str(&format!(" {on_error_sql}"));
+    }
+    sql.push(')');
+
+    Ok(sql)
+}
+
+/// Deparse the PASSING clause of JSON_TABLE.
+///
+/// # Safety
+/// `passing` must be null or a valid pg_sys::List.
+unsafe fn deparse_json_table_passing(passing: *mut pg_sys::List) -> Result<String, PgStreamError> {
+    if passing.is_null() {
+        return Ok(String::new());
+    }
+    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(passing) };
+    if list.is_empty() {
+        return Ok(String::new());
+    }
+    // PASSING items are JsonArgument nodes: (val, name)
+    // In the raw parse tree they appear as ResTarget-like structures.
+    // Deparse each as "expr AS name".
+    let mut parts = Vec::new();
+    for node_ptr in list.iter_ptr() {
+        let expr = unsafe { node_to_expr(node_ptr)? };
+        parts.push(expr.to_sql());
+    }
+    Ok(parts.join(", "))
+}
+
+/// Deparse the COLUMNS clause of JSON_TABLE.
+///
+/// # Safety
+/// `columns` must be null or a valid pg_sys::List of JsonTableColumn nodes.
+unsafe fn deparse_json_table_columns(columns: *mut pg_sys::List) -> Result<String, PgStreamError> {
+    if columns.is_null() {
+        return Ok(String::new());
+    }
+    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(columns) };
+    let mut parts = Vec::new();
+    for node_ptr in list.iter_ptr() {
+        let col_sql = unsafe { deparse_json_table_column(node_ptr)? };
+        parts.push(col_sql);
+    }
+    Ok(parts.join(", "))
+}
+
+/// Deparse a single JSON_TABLE column definition.
+///
+/// # Safety
+/// `node` must point to a valid `pg_sys::JsonTableColumn`.
+unsafe fn deparse_json_table_column(node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonTableColumn) } {
+        return Err(PgStreamError::QueryParseError(
+            "Expected JsonTableColumn node".into(),
+        ));
+    }
+    let col = unsafe { &*(node as *const pg_sys::JsonTableColumn) };
+
+    let name = if !col.name.is_null() {
+        unsafe { std::ffi::CStr::from_ptr(col.name) }
+            .to_str()
+            .unwrap_or("col")
+            .to_string()
+    } else {
+        "col".to_string()
+    };
+
+    match col.coltype {
+        pg_sys::JsonTableColumnType::JTC_FOR_ORDINALITY => Ok(format!("{name} FOR ORDINALITY")),
+        pg_sys::JsonTableColumnType::JTC_REGULAR => {
+            let type_name = unsafe { deparse_typename(col.typeName) };
+            let mut s = format!("{name} {type_name}");
+
+            // FORMAT JSON
+            if !col.format.is_null() {
+                let fmt = unsafe { &*col.format };
+                if fmt.format_type == pg_sys::JsonFormatType::JS_FORMAT_JSON {
+                    s.push_str(" FORMAT JSON");
+                }
+            }
+
+            // PATH 'spec'
+            if !col.pathspec.is_null() {
+                let ps = unsafe { &*col.pathspec };
+                if !ps.string.is_null() {
+                    let path_expr = unsafe { node_to_expr(ps.string)? };
+                    s.push_str(&format!(" PATH {}", path_expr.to_sql()));
+                }
+            }
+
+            // WRAPPER
+            match col.wrapper {
+                pg_sys::JsonWrapper::JSW_CONDITIONAL => {
+                    s.push_str(" WITH CONDITIONAL WRAPPER");
+                }
+                pg_sys::JsonWrapper::JSW_UNCONDITIONAL => {
+                    s.push_str(" WITH UNCONDITIONAL WRAPPER");
+                }
+                _ => {}
+            }
+
+            // QUOTES
+            if col.quotes == pg_sys::JsonQuotes::JS_QUOTES_OMIT {
+                s.push_str(" OMIT QUOTES");
+            }
+
+            // ON EMPTY / ON ERROR
+            let empty = unsafe { deparse_json_behavior(col.on_empty, "ON EMPTY") };
+            if !empty.is_empty() {
+                s.push_str(&format!(" {empty}"));
+            }
+            let error = unsafe { deparse_json_behavior(col.on_error, "ON ERROR") };
+            if !error.is_empty() {
+                s.push_str(&format!(" {error}"));
+            }
+
+            Ok(s)
+        }
+        pg_sys::JsonTableColumnType::JTC_EXISTS => {
+            let type_name = unsafe { deparse_typename(col.typeName) };
+            let mut s = format!("{name} {type_name} EXISTS");
+
+            if !col.pathspec.is_null() {
+                let ps = unsafe { &*col.pathspec };
+                if !ps.string.is_null() {
+                    let path_expr = unsafe { node_to_expr(ps.string)? };
+                    s.push_str(&format!(" PATH {}", path_expr.to_sql()));
+                }
+            }
+
+            let error = unsafe { deparse_json_behavior(col.on_error, "ON ERROR") };
+            if !error.is_empty() {
+                s.push_str(&format!(" {error}"));
+            }
+
+            Ok(s)
+        }
+        pg_sys::JsonTableColumnType::JTC_FORMATTED => {
+            // Formatted column: like regular but with FORMAT JSON
+            let type_name = unsafe { deparse_typename(col.typeName) };
+            let mut s = format!("{name} {type_name} FORMAT JSON");
+
+            if !col.pathspec.is_null() {
+                let ps = unsafe { &*col.pathspec };
+                if !ps.string.is_null() {
+                    let path_expr = unsafe { node_to_expr(ps.string)? };
+                    s.push_str(&format!(" PATH {}", path_expr.to_sql()));
+                }
+            }
+
+            let empty = unsafe { deparse_json_behavior(col.on_empty, "ON EMPTY") };
+            if !empty.is_empty() {
+                s.push_str(&format!(" {empty}"));
+            }
+            let error = unsafe { deparse_json_behavior(col.on_error, "ON ERROR") };
+            if !error.is_empty() {
+                s.push_str(&format!(" {error}"));
+            }
+
+            Ok(s)
+        }
+        pg_sys::JsonTableColumnType::JTC_NESTED => {
+            // NESTED PATH 'path' COLUMNS (...)
+            let mut s = String::from("NESTED");
+            if !col.pathspec.is_null() {
+                let ps = unsafe { &*col.pathspec };
+                if !ps.string.is_null() {
+                    let path_expr = unsafe { node_to_expr(ps.string)? };
+                    s.push_str(&format!(" PATH {}", path_expr.to_sql()));
+                }
+            }
+            let nested_cols = unsafe { deparse_json_table_columns(col.columns)? };
+            s.push_str(&format!(" COLUMNS ({nested_cols})"));
+            Ok(s)
+        }
+        _ => Err(PgStreamError::QueryParseError(format!(
+            "Unknown JSON_TABLE column type: {}",
+            col.coltype,
+        ))),
+    }
+}
+
+/// Deparse a JSON behavior clause (ON EMPTY / ON ERROR).
+///
+/// Returns empty string if behavior is null or default.
+///
+/// # Safety
+/// `behavior` must be null or point to a valid `pg_sys::JsonBehavior`.
+unsafe fn deparse_json_behavior(behavior: *const pg_sys::JsonBehavior, suffix: &str) -> String {
+    if behavior.is_null() {
+        return String::new();
+    }
+    let beh = unsafe { &*behavior };
+    match beh.btype {
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_NULL => format!("NULL {suffix}"),
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_ERROR => format!("ERROR {suffix}"),
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_EMPTY => format!("EMPTY {suffix}"),
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_EMPTY_ARRAY => {
+            format!("EMPTY ARRAY {suffix}")
+        }
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_EMPTY_OBJECT => {
+            format!("EMPTY OBJECT {suffix}")
+        }
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_DEFAULT => {
+            if !beh.expr.is_null() {
+                if let Ok(expr) = unsafe { node_to_expr(beh.expr) } {
+                    format!("DEFAULT {} {suffix}", expr.to_sql())
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        }
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_TRUE => format!("TRUE {suffix}"),
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_FALSE => format!("FALSE {suffix}"),
+        pg_sys::JsonBehaviorType::JSON_BEHAVIOR_UNKNOWN => format!("UNKNOWN {suffix}"),
+        _ => String::new(),
+    }
 }
 
 /// Extract operator name from an A_Expr name list.
@@ -7722,6 +8281,18 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
         let mut result = func_sql;
         if !rf.alias.is_null() {
             let a = unsafe { &*(rf.alias) };
+            let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                .to_str()
+                .unwrap_or("");
+            result.push_str(&format!(" AS {alias_name}"));
+        }
+        Ok(result)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonTable) } {
+        // ── F12: JSON_TABLE deparse ──
+        let jt = unsafe { &*(node as *const pg_sys::JsonTable) };
+        let mut result = unsafe { deparse_json_table(jt as *const pg_sys::JsonTable)? };
+        if !jt.alias.is_null() {
+            let a = unsafe { &*(jt.alias) };
             let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
                 .to_str()
                 .unwrap_or("");
@@ -8485,6 +9056,13 @@ unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
     }
+    // SQL/JSON standard aggregates: T_JsonObjectAgg and T_JsonArrayAgg
+    // are always aggregate expressions (they aggregate rows).
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectAgg) }
+        || unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayAgg) }
+    {
+        return true;
+    }
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
         let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
         if fcall.agg_within_group
@@ -8554,6 +9132,8 @@ fn is_known_aggregate(name: &str) -> bool {
             | "jsonb_agg"
             | "json_object_agg"
             | "jsonb_object_agg"
+            | "json_objectagg"
+            | "json_arrayagg"
             | "bool_and"
             | "bool_or"
             | "every"
@@ -8741,6 +9321,80 @@ unsafe fn extract_aggregates(
                 let expr = unsafe { node_to_expr(rt.val)? };
                 non_aggs.push(expr);
             }
+        } else if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_JsonObjectAgg) } {
+            // ── F11: SQL/JSON standard JSON_OBJECTAGG(key: value ...) ──
+            // This node type is separate from T_FuncCall, so we handle it
+            // explicitly. Deparse to SQL and store as AggFunc::JsonObjectAggStd.
+            let raw_expr = unsafe { node_to_expr(rt.val)? };
+            let raw_sql = raw_expr.to_sql();
+
+            let joa = unsafe { &*(rt.val as *const pg_sys::JsonObjectAgg) };
+            let alias = if !rt.name.is_null() {
+                unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                    .to_str()
+                    .unwrap_or("json_objectagg")
+                    .to_string()
+            } else {
+                "json_objectagg".to_string()
+            };
+
+            // Extract FILTER clause from the constructor (stored separately
+            // so agg_delta_exprs can apply the filter to change tracking).
+            let filter = if !joa.constructor.is_null() {
+                let ctor = unsafe { &*joa.constructor };
+                if !ctor.agg_filter.is_null() {
+                    Some(unsafe { node_to_expr(ctor.agg_filter)? })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            aggs.push(AggExpr {
+                function: AggFunc::JsonObjectAggStd(raw_sql),
+                argument: None,
+                alias,
+                is_distinct: false,
+                second_arg: None,
+                filter,
+                order_within_group: None,
+            });
+        } else if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_JsonArrayAgg) } {
+            // ── F11: SQL/JSON standard JSON_ARRAYAGG(expr ...) ──
+            let raw_expr = unsafe { node_to_expr(rt.val)? };
+            let raw_sql = raw_expr.to_sql();
+
+            let jaa = unsafe { &*(rt.val as *const pg_sys::JsonArrayAgg) };
+            let alias = if !rt.name.is_null() {
+                unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                    .to_str()
+                    .unwrap_or("json_arrayagg")
+                    .to_string()
+            } else {
+                "json_arrayagg".to_string()
+            };
+
+            let filter = if !jaa.constructor.is_null() {
+                let ctor = unsafe { &*jaa.constructor };
+                if !ctor.agg_filter.is_null() {
+                    Some(unsafe { node_to_expr(ctor.agg_filter)? })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            aggs.push(AggExpr {
+                function: AggFunc::JsonArrayAggStd(raw_sql),
+                argument: None,
+                alias,
+                is_distinct: false,
+                second_arg: None,
+                filter,
+                order_within_group: None,
+            });
         } else {
             let expr = unsafe { node_to_expr(rt.val)? };
             non_aggs.push(expr);
@@ -8991,6 +9645,14 @@ mod tests {
         assert_eq!(AggFunc::JsonbAgg.sql_name(), "JSONB_AGG");
         assert_eq!(AggFunc::BitAnd.sql_name(), "BIT_AND");
         assert_eq!(AggFunc::BitOr.sql_name(), "BIT_OR");
+        assert_eq!(
+            AggFunc::JsonObjectAggStd("JSON_OBJECTAGG(k : v)".into()).sql_name(),
+            "JSON_OBJECTAGG"
+        );
+        assert_eq!(
+            AggFunc::JsonArrayAggStd("JSON_ARRAYAGG(x)".into()).sql_name(),
+            "JSON_ARRAYAGG"
+        );
         assert_eq!(AggFunc::BitXor.sql_name(), "BIT_XOR");
         assert_eq!(AggFunc::JsonObjectAgg.sql_name(), "JSON_OBJECT_AGG");
         assert_eq!(AggFunc::JsonbObjectAgg.sql_name(), "JSONB_OBJECT_AGG");
@@ -12137,6 +12799,50 @@ mod tests {
         };
         let mut worst = 'i';
         tree_collect_volatility(&tree, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
+    }
+
+    #[test]
+    fn test_lookup_operator_volatility_stub_returns_immutable() {
+        // In test mode, operators default to immutable (most built-in are).
+        let vol = lookup_operator_volatility("+").unwrap();
+        assert_eq!(vol, 'i');
+        let vol2 = lookup_operator_volatility("&&").unwrap();
+        assert_eq!(vol2, 'i');
+    }
+
+    #[test]
+    fn test_collect_volatilities_binary_op_with_func_operand() {
+        // BinaryOp where one operand is a FuncCall should detect volatile
+        // from the FuncCall (test stub returns 'v' for all functions).
+        let expr = Expr::BinaryOp {
+            op: ">".to_string(),
+            left: Box::new(Expr::FuncCall {
+                func_name: "random".to_string(),
+                args: vec![],
+            }),
+            right: Box::new(Expr::Literal("0.5".to_string())),
+        };
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
+        // random() is volatile (test stub returns 'v' for all functions)
+        assert_eq!(worst, 'v');
+    }
+
+    #[test]
+    fn test_collect_volatilities_nested_binary_ops_immutable() {
+        // Nested BinaryOps with only ColumnRef/Literal → stays immutable.
+        let expr = Expr::BinaryOp {
+            op: "+".to_string(),
+            left: Box::new(Expr::BinaryOp {
+                op: "*".to_string(),
+                left: Box::new(col("a")),
+                right: Box::new(Expr::Literal("2".to_string())),
+            }),
+            right: Box::new(col("b")),
+        };
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
         assert_eq!(worst, 'i');
     }
 

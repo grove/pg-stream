@@ -977,3 +977,207 @@ async fn test_json_constructors_in_differential_mode() {
     let count = db.count("public.product_json").await;
     assert_eq!(count, 3);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// F11: SQL/JSON Standard Aggregates — JSON_OBJECTAGG / JSON_ARRAYAGG
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Test JSON_OBJECTAGG(key: value) in FULL mode.
+#[tokio::test]
+async fn test_json_objectagg_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE kvs (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, key TEXT NOT NULL, val TEXT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO kvs (grp, key, val) VALUES
+         ('a', 'color', 'red'), ('a', 'size', 'large'),
+         ('b', 'color', 'blue')",
+    )
+    .await;
+
+    db.create_st(
+        "kv_obj",
+        "SELECT grp, JSON_OBJECTAGG(key : val) AS obj FROM kvs GROUP BY grp",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let count = db.count("public.kv_obj").await;
+    assert_eq!(count, 2, "Should have 2 groups");
+}
+
+/// Test JSON_ARRAYAGG(expr) in FULL mode.
+#[tokio::test]
+async fn test_json_arrayagg_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE tags (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, tag TEXT NOT NULL)")
+        .await;
+    db.execute(
+        "INSERT INTO tags (grp, tag) VALUES
+         ('a', 'fast'), ('a', 'cheap'),
+         ('b', 'durable')",
+    )
+    .await;
+
+    db.create_st(
+        "tag_arr",
+        "SELECT grp, JSON_ARRAYAGG(tag) AS tags FROM tags GROUP BY grp",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let count = db.count("public.tag_arr").await;
+    assert_eq!(count, 2, "Should have 2 groups");
+}
+
+/// Test JSON_OBJECTAGG(key: value) in DIFFERENTIAL mode with group rescan.
+#[tokio::test]
+async fn test_json_objectagg_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE jobj_std (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, prop TEXT NOT NULL, val TEXT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO jobj_std (dept, prop, val) VALUES
+         ('eng', 'lang', 'rust'), ('eng', 'os', 'linux'),
+         ('sales', 'tool', 'crm')",
+    )
+    .await;
+
+    // Create with DIFFERENTIAL mode — should now be recognized as an aggregate
+    db.create_st(
+        "dept_props_std",
+        "SELECT dept, JSON_OBJECTAGG(prop : val) AS props FROM jobj_std GROUP BY dept",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count = db.count("public.dept_props_std").await;
+    assert_eq!(count, 2, "Should have 2 departments after initial load");
+
+    // Insert a new property and refresh
+    db.execute("INSERT INTO jobj_std (dept, prop, val) VALUES ('eng', 'db', 'postgres')")
+        .await;
+    db.refresh_st("dept_props_std").await;
+
+    let count = db.count("public.dept_props_std").await;
+    assert_eq!(count, 2, "Should still have 2 departments after insert");
+}
+
+/// Test JSON_ARRAYAGG(expr) in DIFFERENTIAL mode with group rescan.
+#[tokio::test]
+async fn test_json_arrayagg_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE jarr_std (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, skill TEXT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO jarr_std (dept, skill) VALUES
+         ('eng', 'coding'), ('eng', 'testing'),
+         ('sales', 'pitching')",
+    )
+    .await;
+
+    db.create_st(
+        "dept_skills_std",
+        "SELECT dept, JSON_ARRAYAGG(skill) AS skills FROM jarr_std GROUP BY dept",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count = db.count("public.dept_skills_std").await;
+    assert_eq!(count, 2, "Should have 2 departments after initial load");
+
+    // Insert a new skill and refresh
+    db.execute("INSERT INTO jarr_std (dept, skill) VALUES ('eng', 'debugging')")
+        .await;
+    db.refresh_st("dept_skills_std").await;
+
+    let count = db.count("public.dept_skills_std").await;
+    assert_eq!(count, 2, "Should still have 2 departments after insert");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// F12: JSON_TABLE() in FROM clause
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Test JSON_TABLE in FULL mode — basic column extraction.
+#[tokio::test]
+async fn test_json_table_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE api_data (id INT PRIMARY KEY, payload JSONB NOT NULL)")
+        .await;
+    db.execute(
+        "INSERT INTO api_data VALUES
+         (1, '{\"items\": [{\"name\": \"alpha\", \"score\": 10}, {\"name\": \"beta\", \"score\": 20}]}'),
+         (2, '{\"items\": [{\"name\": \"gamma\", \"score\": 30}]}')",
+    )
+    .await;
+
+    db.create_st(
+        "api_items",
+        "SELECT d.id, jt.name, jt.score
+         FROM api_data d,
+              JSON_TABLE(d.payload, '$.items[*]'
+                COLUMNS (
+                  name TEXT PATH '$.name',
+                  score INT PATH '$.score'
+                )) AS jt",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let count = db.count("public.api_items").await;
+    assert_eq!(count, 3, "Should expand to 3 rows (2 + 1)");
+}
+
+/// Test JSON_TABLE in DIFFERENTIAL mode.
+#[tokio::test]
+async fn test_json_table_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE events (id SERIAL PRIMARY KEY, data JSONB NOT NULL)")
+        .await;
+    db.execute(
+        "INSERT INTO events (data) VALUES
+         ('{\"tags\": [\"a\", \"b\"]}'),
+         ('{\"tags\": [\"c\"]}')",
+    )
+    .await;
+
+    db.create_st(
+        "event_tags",
+        "SELECT e.id, jt.tag
+         FROM events e,
+              JSON_TABLE(e.data, '$.tags[*]'
+                COLUMNS (tag TEXT PATH '$')) AS jt",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count = db.count("public.event_tags").await;
+    assert_eq!(count, 3, "Should expand to 3 tag rows");
+
+    // Insert new event with tags and refresh
+    db.execute("INSERT INTO events (data) VALUES ('{\"tags\": [\"d\", \"e\"]}')")
+        .await;
+    db.refresh_st("event_tags").await;
+
+    let count = db.count("public.event_tags").await;
+    assert_eq!(count, 5, "Should have 5 tags after insert");
+}
