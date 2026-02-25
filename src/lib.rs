@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS pgstream.pgs_stream_tables (
     pgs_name         TEXT NOT NULL,
     pgs_schema       TEXT NOT NULL,
     defining_query  TEXT NOT NULL,
+    original_query  TEXT,
     schedule      TEXT,
     refresh_mode    TEXT NOT NULL DEFAULT 'DIFFERENTIAL'
                      CHECK (refresh_mode IN ('FULL', 'DIFFERENTIAL', 'DIFFERENTIAL')),

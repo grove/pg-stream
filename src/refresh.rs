@@ -1464,6 +1464,7 @@ mod tests {
             pgs_name: "test_st".to_string(),
             pgs_schema: "public".to_string(),
             defining_query: "SELECT 1".to_string(),
+            original_query: None,
             schedule: None,
             refresh_mode,
             status: StStatus::Active,

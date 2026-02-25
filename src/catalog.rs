@@ -19,6 +19,7 @@ pub struct StreamTableMeta {
     pub pgs_name: String,
     pub pgs_schema: String,
     pub defining_query: String,
+    pub original_query: Option<String>,
     pub schedule: Option<String>,
     pub refresh_mode: RefreshMode,
     pub status: StStatus,
@@ -124,6 +125,7 @@ impl StreamTableMeta {
         pgs_name: &str,
         pgs_schema: &str,
         defining_query: &str,
+        original_query: Option<&str>,
         schedule: Option<String>,
         refresh_mode: RefreshMode,
     ) -> Result<i64, PgStreamError> {
@@ -131,8 +133,8 @@ impl StreamTableMeta {
             let row = client
                 .update(
                     "INSERT INTO pgstream.pgs_stream_tables \
-                     (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-                     VALUES ($1, $2, $3, $4, $5, $6) \
+                     (pgs_relid, pgs_name, pgs_schema, defining_query, original_query, schedule, refresh_mode) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
                      RETURNING pgs_id",
                     None,
                     &[
@@ -140,6 +142,7 @@ impl StreamTableMeta {
                         pgs_name.into(),
                         pgs_schema.into(),
                         defining_query.into(),
+                        original_query.into(),
                         schedule.into(),
                         refresh_mode.as_str().into(),
                     ],
@@ -159,8 +162,9 @@ impl StreamTableMeta {
             let table = client
                 .select(
                     "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
-                     schedule, refresh_mode, status, is_populated, data_timestamp, \
-                     consecutive_errors, needs_reinit, frontier, auto_threshold, last_full_ms \
+                     original_query, schedule, refresh_mode, status, is_populated, \
+                     data_timestamp, consecutive_errors, needs_reinit, frontier, \
+                     auto_threshold, last_full_ms \
                      FROM pgstream.pgs_stream_tables \
                      WHERE pgs_schema = $1 AND pgs_name = $2",
                     None,
@@ -182,8 +186,9 @@ impl StreamTableMeta {
             let table = client
                 .select(
                     "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
-                     schedule, refresh_mode, status, is_populated, data_timestamp, \
-                     consecutive_errors, needs_reinit, frontier, auto_threshold, last_full_ms \
+                     original_query, schedule, refresh_mode, status, is_populated, \
+                     data_timestamp, consecutive_errors, needs_reinit, frontier, \
+                     auto_threshold, last_full_ms \
                      FROM pgstream.pgs_stream_tables \
                      WHERE pgs_relid = $1",
                     None,
@@ -205,8 +210,9 @@ impl StreamTableMeta {
             let table = client
                 .select(
                     "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
-                     schedule, refresh_mode, status, is_populated, data_timestamp, \
-                     consecutive_errors, needs_reinit, frontier, auto_threshold, last_full_ms \
+                     original_query, schedule, refresh_mode, status, is_populated, \
+                     data_timestamp, consecutive_errors, needs_reinit, frontier, \
+                     auto_threshold, last_full_ms \
                      FROM pgstream.pgs_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -434,33 +440,35 @@ impl StreamTableMeta {
             .map_err(map_spi)?
             .ok_or_else(|| PgStreamError::InternalError("defining_query is NULL".into()))?;
 
-        let schedule = table.get::<String>(6).map_err(map_spi)?;
+        let original_query = table.get::<String>(6).map_err(map_spi)?;
+
+        let schedule = table.get::<String>(7).map_err(map_spi)?;
 
         let refresh_mode_str = table
-            .get::<String>(7)
+            .get::<String>(8)
             .map_err(map_spi)?
             .unwrap_or_else(|| "DIFFERENTIAL".into());
         let refresh_mode = RefreshMode::from_str(&refresh_mode_str)?;
 
         let status_str = table
-            .get::<String>(8)
+            .get::<String>(9)
             .map_err(map_spi)?
             .unwrap_or_else(|| "INITIALIZING".into());
         let status = StStatus::from_str(&status_str)?;
 
-        let is_populated = table.get::<bool>(9).map_err(map_spi)?.unwrap_or(false);
+        let is_populated = table.get::<bool>(10).map_err(map_spi)?.unwrap_or(false);
 
-        let data_timestamp = table.get::<TimestampWithTimeZone>(10).map_err(map_spi)?;
+        let data_timestamp = table.get::<TimestampWithTimeZone>(11).map_err(map_spi)?;
 
-        let consecutive_errors = table.get::<i32>(11).map_err(map_spi)?.unwrap_or(0);
+        let consecutive_errors = table.get::<i32>(12).map_err(map_spi)?.unwrap_or(0);
 
-        let needs_reinit = table.get::<bool>(12).map_err(map_spi)?.unwrap_or(false);
+        let needs_reinit = table.get::<bool>(13).map_err(map_spi)?.unwrap_or(false);
 
-        let frontier_json = table.get::<pgrx::JsonB>(13).map_err(map_spi)?;
+        let frontier_json = table.get::<pgrx::JsonB>(14).map_err(map_spi)?;
         let frontier = frontier_json.and_then(|j| serde_json::from_value(j.0).ok());
 
-        let auto_threshold = table.get::<f64>(14).map_err(map_spi)?;
-        let last_full_ms = table.get::<f64>(15).map_err(map_spi)?;
+        let auto_threshold = table.get::<f64>(15).map_err(map_spi)?;
+        let last_full_ms = table.get::<f64>(16).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgs_id,
@@ -468,6 +476,7 @@ impl StreamTableMeta {
             pgs_name,
             pgs_schema,
             defining_query,
+            original_query,
             schedule,
             refresh_mode,
             status,
@@ -510,33 +519,35 @@ impl StreamTableMeta {
             .map_err(map_spi)?
             .ok_or_else(|| PgStreamError::InternalError("defining_query is NULL".into()))?;
 
-        let schedule = row.get::<String>(6).map_err(map_spi)?;
+        let original_query = row.get::<String>(6).map_err(map_spi)?;
+
+        let schedule = row.get::<String>(7).map_err(map_spi)?;
 
         let refresh_mode_str = row
-            .get::<String>(7)
+            .get::<String>(8)
             .map_err(map_spi)?
             .unwrap_or_else(|| "DIFFERENTIAL".into());
         let refresh_mode = RefreshMode::from_str(&refresh_mode_str)?;
 
         let status_str = row
-            .get::<String>(8)
+            .get::<String>(9)
             .map_err(map_spi)?
             .unwrap_or_else(|| "INITIALIZING".into());
         let status = StStatus::from_str(&status_str)?;
 
-        let is_populated = row.get::<bool>(9).map_err(map_spi)?.unwrap_or(false);
+        let is_populated = row.get::<bool>(10).map_err(map_spi)?.unwrap_or(false);
 
-        let data_timestamp = row.get::<TimestampWithTimeZone>(10).map_err(map_spi)?;
+        let data_timestamp = row.get::<TimestampWithTimeZone>(11).map_err(map_spi)?;
 
-        let consecutive_errors = row.get::<i32>(11).map_err(map_spi)?.unwrap_or(0);
+        let consecutive_errors = row.get::<i32>(12).map_err(map_spi)?.unwrap_or(0);
 
-        let needs_reinit = row.get::<bool>(12).map_err(map_spi)?.unwrap_or(false);
+        let needs_reinit = row.get::<bool>(13).map_err(map_spi)?.unwrap_or(false);
 
-        let frontier_json = row.get::<pgrx::JsonB>(13).map_err(map_spi)?;
+        let frontier_json = row.get::<pgrx::JsonB>(14).map_err(map_spi)?;
         let frontier = frontier_json.and_then(|j| serde_json::from_value(j.0).ok());
 
-        let auto_threshold = row.get::<f64>(14).map_err(map_spi)?;
-        let last_full_ms = row.get::<f64>(15).map_err(map_spi)?;
+        let auto_threshold = row.get::<f64>(15).map_err(map_spi)?;
+        let last_full_ms = row.get::<f64>(16).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgs_id,
@@ -544,6 +555,7 @@ impl StreamTableMeta {
             pgs_name,
             pgs_schema,
             defining_query,
+            original_query,
             schedule,
             refresh_mode,
             status,
