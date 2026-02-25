@@ -355,7 +355,7 @@ Row IDs are written into every stream table's storage as an internal `__pgs_row_
 
 ### 13. Configuration (`src/config.rs`)
 
-Ten GUC (Grand Unified Configuration) variables control runtime behavior. See [CONFIGURATION.md](CONFIGURATION.md) for details.
+Twelve GUC (Grand Unified Configuration) variables control runtime behavior. See [CONFIGURATION.md](CONFIGURATION.md) for details.
 
 | GUC | Default | Purpose |
 |---|---|---|
@@ -368,6 +368,7 @@ Ten GUC (Grand Unified Configuration) variables control runtime behavior. See [C
 | `pg_stream.differential_max_change_ratio` | `0.15` | Change-to-table-size ratio above which DIFFERENTIAL falls back to FULL |
 | `pg_stream.cleanup_use_truncate` | `true` | Use `TRUNCATE` instead of `DELETE` for change buffer cleanup when the entire buffer is consumed |
 | `pg_stream.user_triggers` | `'auto'` | User-defined trigger handling: `auto` / `on` / `off` |
+| `pg_stream.block_source_ddl` | `false` | Block column-affecting DDL on tracked source tables instead of reinit |
 | `pg_stream.cdc_mode` | `'trigger'` | CDC mechanism: `trigger` / `auto` / `wal` |
 | `pg_stream.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
 

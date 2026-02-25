@@ -40,7 +40,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Joins** | `LEFT OUTER JOIN` | ✅ Full | |
 | **Joins** | `RIGHT OUTER JOIN` | ✅ Full | Automatically converted to `LEFT JOIN` with swapped operands |
 | **Joins** | `FULL OUTER JOIN` | ✅ Full | 8-part delta; may be slower than inner joins on high-churn data |
-| **Joins** | `NATURAL JOIN` | ⚠️ Rejected | Use explicit `JOIN ... ON` conditions instead |
+| **Joins** | `NATURAL JOIN` | ✅ Full | Resolved at parse time; explicit equi-join synthesized |
 | **Joins** | Nested joins (3+ tables) | ✅ Full | `a JOIN b JOIN c` — snapshot subqueries with disambiguated columns |
 | **Aggregation** | `GROUP BY` + `COUNT`, `SUM`, `AVG` | ✅ Full | Fully algebraic — no rescan needed |
 | **Aggregation** | `GROUP BY` + `MIN`, `MAX` | ✅ Full | Semi-algebraic — uses `LEAST`/`GREATEST` merge; per-group rescan when extremum is deleted |
@@ -53,21 +53,24 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Aggregation** | `GROUP BY` + `VARIANCE`, `VAR_POP`, `VAR_SAMP` | ✅ Full | Group-rescan — affected groups are re-aggregated from source |
 | **Aggregation** | `MODE() WITHIN GROUP (ORDER BY …)` | ✅ Full | Ordered-set aggregate — group-rescan strategy |
 | **Aggregation** | `PERCENTILE_CONT` / `PERCENTILE_DISC` `WITHIN GROUP (ORDER BY …)` | ✅ Full | Ordered-set aggregate — group-rescan strategy |
+| **Aggregation** | `CORR`, `COVAR_*`, `REGR_*` (12 regression aggregates) | ✅ Full | Group-rescan strategy |
 | **Aggregation** | `FILTER (WHERE …)` on aggregates | ✅ Full | Filter predicate applied within delta computation |
 | **Deduplication** | `DISTINCT` | ✅ Full | Reference-counted multiplicity tracking |
+| **Deduplication** | `DISTINCT ON (…)` | ✅ Full | Auto-rewritten to `ROW_NUMBER()` window subquery |
 | **Set operations** | `UNION ALL` | ✅ Full | |
 | **Set operations** | `UNION` (deduplicated) | ✅ Full | Composed as `UNION ALL` + `DISTINCT` |
 | **Set operations** | `INTERSECT` / `EXCEPT` | ✅ Full | Dual-count multiplicity tracking with LEAST / GREATEST boundary crossing |
 | **Subqueries** | Subquery in `FROM` | ✅ Full | `(SELECT …) AS alias` |
 | **Subqueries** | `EXISTS` / `NOT EXISTS` in `WHERE` | ✅ Full | Semi-join / anti-join delta operators |
 | **Subqueries** | `IN` / `NOT IN` (subquery) in `WHERE` | ✅ Full | Rewritten to semi-join / anti-join |
+| **Subqueries** | `ALL` (subquery) in `WHERE` | ✅ Full | Rewritten to anti-join via `NOT EXISTS` |
 | **Subqueries** | Scalar subquery in `SELECT` | ✅ Full | `(SELECT max(x) FROM t)` in target list |
+| **Subqueries** | Scalar subquery in `WHERE` | ✅ Full | Auto-rewritten to `CROSS JOIN` |
 | **CTEs** | Non-recursive `WITH` | ✅ Full | Single & multi-reference; shared delta computation |
 | **CTEs** | Recursive `WITH RECURSIVE` | ✅ Full | Both `FULL` and `DIFFERENTIAL` modes (semi-naive + DRed) |
 | **Window functions** | `ROW_NUMBER`, `RANK`, `SUM OVER`, etc. | ✅ Full | Partition-based recomputation |
 | **Window functions** | Window frame clauses | ✅ Full | `ROWS`, `RANGE`, `GROUPS` with `BETWEEN` bounds and `EXCLUDE` |
-| **Window functions** | Named `WINDOW` clauses | ✅ Full | `WINDOW w AS (...)` resolved from query-level window definitions |
-| **LATERAL SRFs** | `jsonb_array_elements`, `unnest`, `jsonb_each`, etc. | ✅ Full | Row-scoped recomputation in DIFFERENTIAL mode |
+| **Window functions** | Named `WINDOW` clauses | ✅ Full | `WINDOW w AS (...)` resolved from query-level window definitions || **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Auto-split into joined subqueries || **LATERAL SRFs** | `jsonb_array_elements`, `unnest`, `jsonb_each`, etc. | ✅ Full | Row-scoped recomputation in DIFFERENTIAL mode |
 | **Expressions** | `CASE WHEN … THEN … ELSE … END` | ✅ Full | Both searched and simple CASE |
 | **Expressions** | `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` | ✅ Full | |
 | **Expressions** | `IN (list)`, `BETWEEN`, `IS DISTINCT FROM` | ✅ Full | Including `NOT IN`, `NOT BETWEEN`, `IS NOT DISTINCT FROM` |
@@ -76,6 +79,9 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Expressions** | `ARRAY[…]`, `ROW(…)` | ✅ Full | |
 | **Expressions** | `CURRENT_DATE`, `CURRENT_TIMESTAMP`, etc. | ✅ Full | All SQL value functions |
 | **Expressions** | Array subscript, field access | ✅ Full | `arr[1]`, `(rec).field`, `(data).*` |
+| **Grouping** | `GROUPING SETS` / `CUBE` / `ROLLUP` | ✅ Full | Auto-rewritten to `UNION ALL` of `GROUP BY` queries |
+| **Safety** | Volatile function detection | ✅ Full | Rejected in DIFFERENTIAL; warned for STABLE functions |
+| **Source tables** | Tables without primary key | ✅ Full | Content-hash row identity via all columns |
 | **Ordering** | `ORDER BY` | ⚠️ Ignored | Accepted but silently discarded; storage row order is undefined |
 | **Ordering** | `LIMIT` / `OFFSET` | ❌ Rejected | Not supported — stream tables materialize the full result set |
 
@@ -171,6 +177,13 @@ SELECT pgstream.drop_stream_table('regional_totals');
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
 
+### Research & Plans
+
+| Document | Description |
+|---|---|
+| [plans/sql/PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) | Plan for `CREATE MATERIALIZED VIEW ... WITH (pgstream.stream)` syntax |
+| [docs/research/CUSTOM_SQL_SYNTAX.md](docs/research/CUSTOM_SQL_SYNTAX.md) | Research: PostgreSQL extension syntax mechanisms |
+
 ### Deep-Dive Tutorials
 
 | Tutorial | Description |
@@ -186,14 +199,10 @@ The following SQL features are **rejected with clear error messages** explaining
 
 | Feature | Reason | Suggested Rewrite |
 |---|---|---|
-| `DISTINCT ON (…)` | PostgreSQL-specific; not supported for incremental maintenance | Use `DISTINCT` or window functions with `ROW_NUMBER()` |
-| `GROUPING SETS` / `CUBE` / `ROLLUP` | Multiple grouping levels not supported for incremental maintenance | Use separate stream tables for each grouping level, or `UNION ALL` |
 | `TABLESAMPLE` | Stream tables materialize the complete result set; sampling at define-time is not meaningful | Use `WHERE random() < fraction` in the consuming query |
-| `NATURAL JOIN` | Full implementation reverted; rejected to prevent silent wrong results | Use explicit `JOIN ... ON` conditions |
 | Window functions in expressions | Window functions inside `CASE`, `COALESCE`, arithmetic, etc. cannot be differentially maintained | Move window function to a separate column |
-| Unsupported aggregates in DIFFERENTIAL mode | Only `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `BOOL_AND/OR`, `STRING_AGG`, `ARRAY_AGG`, `JSON/JSONB_AGG`, `BIT_AND/OR/XOR`, `JSON/JSONB_OBJECT_AGG`, `STDDEV/STDDEV_POP/STDDEV_SAMP`, `VARIANCE/VAR_POP/VAR_SAMP`, `MODE`, `PERCENTILE_CONT`, `PERCENTILE_DISC` support incremental delta | Use `FULL` refresh mode for regression aggregates (`CORR`, `COVAR_*`, `REGR_*`), etc. |
-| `LIMIT` / `OFFSET` | Stream tables materialize the full result set | Remove or apply in the consuming query |
-| `FOR UPDATE` / `FOR SHARE` | Stream tables do not support row-level locking | Remove the locking clause |
+| `LIMIT` / `OFFSET` | Stream tables materialize the full result set | Apply when querying the stream table |
+| `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
 
 ### Stream Table Restrictions
 
@@ -285,7 +294,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** 872 unit tests + 22 E2E test suites, 0 failures.
+**Test counts:** 896 unit tests + 22 E2E test suites, 0 failures.
 
 ### Code Coverage
 

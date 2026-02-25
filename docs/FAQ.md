@@ -206,16 +206,21 @@ The following are rejected with clear error messages and suggested rewrites:
 
 | Feature | Reason | Suggested Rewrite |
 |---|---|---|
-| `DISTINCT ON (…)` | Not supported for incremental maintenance | Use `DISTINCT` or `ROW_NUMBER()` |
-| `GROUPING SETS` / `CUBE` / `ROLLUP` | Multiple grouping levels not supported | Separate stream tables or `UNION ALL` |
 | `TABLESAMPLE` | Stream tables materialize the full result set | Use `WHERE random() < fraction` in consuming query |
-| `NATURAL JOIN` | Rejected to prevent silent wrong results | Use explicit `JOIN ... ON` |
 | Window functions in expressions | Cannot be differentially maintained | Move window function to a separate column |
 | `LIMIT` / `OFFSET` | Stream tables materialize the full result set | Apply when querying the stream table |
 | `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
-| `ALL (subquery)` | Not supported | Use `NOT EXISTS` with negated condition |
 
-Each of these is explained in detail in the [Why Are These SQL Features Not Supported?](#why-are-these-sql-features-not-supported) section below.
+The following were previously rejected but are **now supported** via automatic parse-time rewrites:
+
+| Feature | How It Works |
+|---|---|
+| `DISTINCT ON (…)` | Auto-rewritten to `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) = 1` subquery |
+| `GROUPING SETS` / `CUBE` / `ROLLUP` | Auto-rewritten to `UNION ALL` of separate `GROUP BY` queries |
+| `NATURAL JOIN` | Common columns resolved at parse time; explicit equi-join synthesized |
+| `ALL (subquery)` | Rewritten to `NOT EXISTS` with negated condition (AntiJoin) |
+
+Each rejected feature is explained in detail in the [Why Are These SQL Features Not Supported?](#why-are-these-sql-features-not-supported) section below.
 
 ### What happens to `ORDER BY` in defining queries?
 
@@ -227,9 +232,9 @@ Each of these is explained in detail in the [Why Are These SQL Features Not Supp
 
 **Semi-algebraic** (incremental with occasional group rescan): `MIN`, `MAX`
 
-**Group-rescan** (affected groups re-aggregated from source): `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, `JSONB_AGG`, `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `JSON_OBJECT_AGG`, `JSONB_OBJECT_AGG`, `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, `VAR_SAMP`, `MODE`, `PERCENTILE_CONT`, `PERCENTILE_DISC`
+**Group-rescan** (affected groups re-aggregated from source): `STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, `JSONB_AGG`, `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `JSON_OBJECT_AGG`, `JSONB_OBJECT_AGG`, `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, `VAR_SAMP`, `MODE`, `PERCENTILE_CONT`, `PERCENTILE_DISC`, `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_AVGX`, `REGR_AVGY`, `REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_SLOPE`, `REGR_SXX`, `REGR_SXY`, `REGR_SYY`
 
-**Not supported** (use FULL mode): `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*`
+**37 aggregate function variants** are supported in total.
 
 ---
 
@@ -245,12 +250,9 @@ Approximately **20–55 μs per row** (PL/pgSQL dispatch + `row_to_json()` + buf
 
 ### What happens when I `TRUNCATE` a source table?
 
-**TRUNCATE bypasses row-level triggers entirely.** The stream table will become stale without the system detecting it. This is a known PostgreSQL limitation — TRUNCATE does not fire `AFTER DELETE` triggers.
+**TRUNCATE is now captured** via a statement-level `AFTER TRUNCATE` trigger that writes a `T` marker row to the change buffer. When the differential refresh engine detects this marker, it automatically falls back to a full refresh for that cycle, ensuring the stream table stays consistent.
 
-**Recovery options:**
-1. Manually refresh: `SELECT pgstream.refresh_stream_table('my_table');`
-2. Use `DELETE FROM source_table` instead of `TRUNCATE` when CDC matters.
-3. FULL-mode stream tables are immune since they recompute from scratch every cycle.
+Previously, TRUNCATE bypassed row-level triggers entirely. This is no longer a concern — both FULL and DIFFERENTIAL mode stream tables handle TRUNCATE correctly.
 
 ### Are CDC triggers automatically cleaned up?
 
@@ -537,83 +539,53 @@ This shows the DVM operator tree, source tables, and the generated delta SQL.
 
 This section gives detailed technical explanations for each SQL limitation. pg_stream follows the principle of **"fail loudly rather than produce wrong data"** — every unsupported feature is detected at stream-table creation time and rejected with a clear error message and a suggested rewrite.
 
-### Why is `NATURAL JOIN` rejected?
+### How does `NATURAL JOIN` work?
 
-A full `NATURAL JOIN` implementation was prototyped and then **reverted** because it could silently produce wrong results.
+`NATURAL JOIN` is **now fully supported**. At parse time, pg_stream resolves the common columns between the two tables (using `OpTree::output_columns()`) and synthesizes explicit equi-join conditions. This supports `INNER`, `LEFT`, `RIGHT`, and `FULL` NATURAL JOIN variants.
 
-`NATURAL JOIN` implicitly joins on **all columns with matching names** between the two tables. This creates three problems for stream tables:
+Internally, `NATURAL JOIN` is converted to an explicit `JOIN ... ON` before the DVM engine builds its operator tree, so delta computation works identically to a manually specified equi-join.
 
-1. **Hidden `__pgs_row_id` collision.** Every stream table has a `__pgs_row_id BIGINT PRIMARY KEY` column used internally for delta `MERGE` operations. If a stream table references another stream table via `NATURAL JOIN`, PostgreSQL will silently include `__pgs_row_id` in the join condition — producing wrong results without any error or warning.
+**Note:** The internal `__pgs_row_id` column is excluded from common column resolution, so NATURAL JOINs between stream tables work correctly.
 
-2. **Schema-evolution fragility.** If a column is added to a source table that happens to share a name with a column in the other table, the join semantics silently change. In an ad-hoc query you'd notice immediately, but a stream table's defining query is stored and re-executed on every refresh, so the breakage could persist undetected across many refresh cycles.
+### How do `GROUPING SETS`, `CUBE`, and `ROLLUP` work?
 
-3. **Raw parse tree limitation.** PostgreSQL's raw parser sets the `isNatural` flag on `JoinExpr` but does **not** resolve the actual join column list — the `quals` field is `NULL`. Column resolution happens later during query analysis. This means that at parse time, where pg_stream builds its operator tree, the actual join conditions are unknown. Without explicit conditions, the DVM engine cannot generate correct delta queries.
+`GROUPING SETS`, `CUBE`, and `ROLLUP` are **now fully supported** via an automatic parse-time rewrite. pg_stream decomposes these constructs into a `UNION ALL` of separate `GROUP BY` queries before the DVM engine processes the query.
 
-**Rewrite:**
+For example:
 ```sql
--- Instead of:
-SELECT * FROM orders NATURAL JOIN customers
-
--- Use explicit join conditions:
-SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id
-```
-
-### Why are `GROUPING SETS`, `CUBE`, and `ROLLUP` rejected?
-
-These constructs produce **multiple grouping levels in a single query** — for example, `GROUP BY CUBE(dept, region)` yields subtotals for `(dept, region)`, `(dept)`, `(region)`, and `()` (grand total), all interleaved in one result set.
-
-This is fundamentally incompatible with incremental maintenance for two reasons:
-
-1. **Ambiguous row identity.** pg_stream uses a hash of the group-by key columns to identify each row (`__pgs_row_id`). With `GROUPING SETS`, the same column values can appear in multiple grouping levels (a row for `dept='Sales'` appears in both the per-department subtotal and the grand total), making row identity ambiguous. There is no way to distinguish "the subtotal for Sales" from "the grand total" using column values alone.
-
-2. **Delta computation complexity.** Each grouping level is effectively a separate aggregate query with a different `GROUP BY` clause. A single source-row change can affect multiple grouping levels differently. Deriving a correct, efficient delta query that handles all levels simultaneously is an open research problem for incremental view maintenance.
-
-PostgreSQL internally expands `CUBE`/`ROLLUP` during query analysis, but the raw parse tree (where pg_stream detects them) still carries `T_GroupingSet` nodes. These are detected early and rejected before any resources are allocated.
-
-**Rewrite:**
-```sql
--- Instead of:
+-- This defining query:
 SELECT dept, region, SUM(amount) FROM sales GROUP BY CUBE(dept, region)
 
--- Create separate stream tables:
-SELECT dept, region, SUM(amount) FROM sales GROUP BY dept, region  -- detail
-SELECT dept, SUM(amount) FROM sales GROUP BY dept                  -- by dept
-SELECT region, SUM(amount) FROM sales GROUP BY region              -- by region
-SELECT SUM(amount) FROM sales                                      -- grand total
-
--- Or combine them:
+-- Is automatically rewritten to:
 SELECT dept, region, SUM(amount) FROM sales GROUP BY dept, region
 UNION ALL
-SELECT dept, NULL, SUM(amount) FROM sales GROUP BY dept
+SELECT dept, NULL::text, SUM(amount) FROM sales GROUP BY dept
 UNION ALL
-SELECT NULL, region, SUM(amount) FROM sales GROUP BY region
+SELECT NULL::text, region, SUM(amount) FROM sales GROUP BY region
 UNION ALL
-SELECT NULL, NULL, SUM(amount) FROM sales
+SELECT NULL::text, NULL::text, SUM(amount) FROM sales
 ```
 
-### Why is `DISTINCT ON (…)` rejected?
+`GROUPING()` function calls are replaced with integer literal constants corresponding to the grouping level. The rewrite is transparent — the DVM engine sees only standard `GROUP BY` + `UNION ALL` operators and can apply incremental delta computation to each branch independently.
 
-`DISTINCT ON` is a PostgreSQL-specific extension (not in the SQL standard) that returns the first row for each unique combination of the specified expressions, with "first" determined by `ORDER BY`.
+### How does `DISTINCT ON (…)` work?
 
-It cannot be incrementally maintained because:
+`DISTINCT ON` is **now fully supported** via an automatic parse-time rewrite. pg_stream transparently transforms `DISTINCT ON` into a `ROW_NUMBER()` window function subquery:
 
-1. **Non-deterministic row selection.** Which row is "first" depends on the physical ordering at query time. When source data changes, the "winner" for each distinct group can change unpredictably — the delta would need to compare new and old winners for every group, which degrades to a full rescan.
-
-2. **ORDER BY dependency.** `DISTINCT ON` semantics are tightly coupled to `ORDER BY`, but stream tables intentionally discard ordering (row storage order is undefined). This means the `ORDER BY` that `DISTINCT ON` depends on cannot be preserved.
-
-**Rewrite:**
 ```sql
--- Instead of:
+-- This defining query:
 SELECT DISTINCT ON (dept) dept, employee, salary
 FROM employees ORDER BY dept, salary DESC
 
--- Use a window function:
+-- Is automatically rewritten to:
 SELECT dept, employee, salary FROM (
     SELECT dept, employee, salary,
            ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn
     FROM employees
 ) sub WHERE rn = 1
 ```
+
+The rewrite happens before DVM parsing, so the operator tree sees a standard window function query and can apply partition-based recomputation for incremental delta maintenance.
 
 ### Why is `TABLESAMPLE` rejected?
 

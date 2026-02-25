@@ -6,7 +6,7 @@ Complete reference for all pg_stream GUC (Grand Unified Configuration) variables
 
 ## Overview
 
-pg_stream exposes ten configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_stream exposes twelve configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -212,6 +212,33 @@ SET pg_stream.user_triggers = 'off';
 
 ---
 
+### pg_stream.block_source_ddl
+
+When enabled, column-affecting DDL (e.g., `ALTER TABLE ... DROP COLUMN`,
+`ALTER TABLE ... ALTER COLUMN ... TYPE`) on source tables tracked by stream
+tables is **blocked** with an ERROR instead of silently marking stream tables
+for reinitialization.
+
+This is useful in production environments where you want to prevent accidental
+schema changes that would trigger expensive full recomputation of downstream
+stream tables.
+
+**Default:** `false`  
+**Context:** Superuser
+
+```sql
+-- Block column-affecting DDL on tracked source tables
+SET pg_stream.block_source_ddl = true;
+
+-- Allow DDL (stream tables will be marked for reinit instead)
+SET pg_stream.block_source_ddl = false;
+```
+
+> **Note:** Only column-affecting changes are blocked. Benign DDL (adding
+> indexes, comments, constraints) is always allowed regardless of this setting.
+
+---
+
 ### pg_stream.cdc_mode
 
 CDC (Change Data Capture) mechanism selection.
@@ -266,6 +293,7 @@ pg_stream.max_consecutive_errors = 3
 pg_stream.change_buffer_schema = 'pgstream_changes'
 pg_stream.max_concurrent_refreshes = 4
 pg_stream.user_triggers = 'auto'
+pg_stream.block_source_ddl = false
 pg_stream.cdc_mode = 'trigger'
 pg_stream.wal_transition_timeout = 300
 ```

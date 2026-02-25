@@ -10,6 +10,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+#### SQL Feature Gaps (S1–S15)
+- **Volatile function detection (S1)** — defining queries containing volatile
+  functions (e.g., `random()`, `clock_timestamp()`) are rejected in DIFFERENTIAL
+  mode with a clear error. Stable functions (e.g., `now()`) emit a warning.
+- **TRUNCATE capture in CDC (S2)** — statement-level `AFTER TRUNCATE` trigger
+  writes a `T` marker row to the change buffer. Differential refresh detects
+  the marker and automatically falls back to a full refresh.
+- **`ALL (subquery)` support (S3)** — `x op ALL (subquery)` is rewritten to
+  an AntiJoin via `NOT EXISTS` with a negated condition.
+- **`DISTINCT ON` auto-rewrite (S4)** — `DISTINCT ON (col1, col2)` is
+  transparently rewritten to a `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY
+  ...) = 1` subquery before DVM parsing. Previously rejected.
+- **12 regression aggregates (S5)** — `CORR`, `COVAR_POP`, `COVAR_SAMP`,
+  `REGR_AVGX`, `REGR_AVGY`, `REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`,
+  `REGR_SLOPE`, `REGR_SXX`, `REGR_SXY`, `REGR_SYY` — all use group-rescan
+  strategy. 37 aggregate function variants total (up from 25).
+- **Mixed `UNION` / `UNION ALL` (S6)** — nested set operations with different
+  `ALL` flags are now parsed correctly.
+- **Column snapshot + schema fingerprint (S7)** — `pgs_dependencies` stores a
+  JSONB column snapshot and SHA-256 fingerprint for each source table. DDL
+  change detection uses a 3-tier fast path: fingerprint → snapshot → legacy
+  `columns_used` fallback.
+- **`pg_stream.block_source_ddl` GUC (S8)** — when `true`, column-affecting
+  DDL on tracked source tables is blocked with an ERROR instead of marking
+  stream tables for reinit.
+- **`NATURAL JOIN` support (S9)** — common columns are resolved at parse time
+  and an explicit equi-join condition is synthesized. Supports INNER, LEFT,
+  RIGHT, and FULL NATURAL JOIN variants. Previously rejected.
+- **Keyless table support (S10)** — source tables without a primary key now
+  work correctly. CDC triggers compute an all-column content hash for row
+  identity. Consistent `__pgs_row_id` between full and delta refreshes.
+- **`GROUPING SETS` / `CUBE` / `ROLLUP` auto-rewrite (S11)** — decomposed at
+  parse time into a `UNION ALL` of separate `GROUP BY` queries. `GROUPING()`
+  calls become integer literals. Previously rejected.
+- **Scalar subquery in WHERE rewrite (S12)** — `WHERE col > (SELECT avg(x)
+  FROM t)` is rewritten to a `CROSS JOIN` with column reference replacement.
+- **SubLinks in OR rewrite (S13)** — `WHERE a OR EXISTS (...)` is decomposed
+  into `UNION` branches, one per OR arm.
+- **Multi-PARTITION BY window rewrite (S14)** — window functions with different
+  `PARTITION BY` clauses are split into separate subqueries joined by a
+  `ROW_NUMBER() OVER ()` row marker.
+- **Recursive CTE semi-naive + DRed (S15)** — DIFFERENTIAL mode for recursive
+  CTEs now uses semi-naive evaluation for INSERT-only changes, Delete-and-
+  Rederive (DRed) for mixed changes, and recomputation fallback. Strategy is
+  auto-selected per refresh.
+
+#### Native Syntax Planning
+- **Native DDL syntax research** — comprehensive analysis of 15 PostgreSQL
+  extension syntax mechanisms for supporting `CREATE STREAM TABLE`-like syntax.
+  See `docs/research/CUSTOM_SQL_SYNTAX.md`.
+- **Native syntax plan** — tiered strategy: Tier 1 (function API, existing),
+  Tier 1.5 (`CALL` procedure wrappers), Tier 2 (`CREATE MATERIALIZED VIEW ...
+  WITH (pgstream.stream = true)` via `ProcessUtility_hook`). See
+  `plans/sql/PLAN_NATIVE_SYNTAX.md`.
+
 #### Hybrid CDC — Automatic Trigger → WAL Transition
 - **Hybrid CDC architecture** — stream tables now start with lightweight
   row-level triggers for zero-config setup and can automatically transition to
@@ -78,6 +133,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   semi-naive evaluation for INSERT-only changes, Delete-and-Rederive (DRed)
   for mixed changes, and recomputation fallback when CTE columns don't match
   ST storage. Strategy is auto-selected per refresh.
+- **DISTINCT ON auto-rewrite** — transparently rewritten to ROW_NUMBER()
+  window subquery before DVM parsing.
+- **GROUPING SETS / CUBE / ROLLUP auto-rewrite** — decomposed into UNION ALL
+  of separate GROUP BY queries at parse time.
+- **NATURAL JOIN support** — common columns resolved at parse time with
+  explicit equi-join synthesis.
+- **ALL (subquery) support** — rewritten to AntiJoin via NOT EXISTS.
+- **Scalar subquery in WHERE** — rewritten to CROSS JOIN.
+- **SubLinks in OR** — decomposed into UNION branches.
+- **Multi-PARTITION BY windows** — split into joined subqueries.
+- **Regression aggregates** — CORR, COVAR_POP, COVAR_SAMP, REGR_* (12 new).
+- **Keyless table support** — tables without primary keys use content hashing.
+- **Volatile function detection** — rejected in DIFFERENTIAL, warned for stable.
+- **TRUNCATE capture in CDC** — triggers fall back to full refresh.
 - **Window functions** — ROW_NUMBER, RANK, SUM OVER, etc. with full frame
   clause support (ROWS, RANGE, GROUPS, BETWEEN, EXCLUDE) and named WINDOW
   clauses.
@@ -109,11 +178,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   automatically set `needs_reinit` on affected stream tables.
 - **Version / frontier tracking** — per-source JSONB frontier for consistent
   snapshots and Delayed View Semantics (DVS) guarantee.
-- **10 GUC variables** — `enabled`, `scheduler_interval_ms`,
+- **12 GUC variables** — `enabled`, `scheduler_interval_ms`,
   `min_schedule_seconds`, `max_consecutive_errors`, `change_buffer_schema`,
   `max_concurrent_refreshes`, `differential_max_change_ratio`,
   `cleanup_use_truncate`, `user_triggers`, `cdc_mode`,
-  `wal_transition_timeout`.
+  `wal_transition_timeout`, `block_source_ddl`.
 
 #### Documentation
 - Architecture guide, SQL reference, configuration reference, FAQ,
@@ -121,15 +190,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Deep-dive tutorials: What Happens on INSERT / UPDATE / DELETE / TRUNCATE.
 
 #### Testing
-- 878 unit tests, 22 E2E test suites (Testcontainers + custom Docker image).
+- 896 unit tests, 22 E2E test suites (Testcontainers + custom Docker image).
 - Property-based tests, integration tests, resilience tests.
+- Column snapshot and schema fingerprint-based DDL change detection.
 
 ### Known Limitations
 
-- `DISTINCT ON`, `GROUPING SETS` / `CUBE` / `ROLLUP`, `TABLESAMPLE`,
-  `NATURAL JOIN`, `LIMIT` / `OFFSET`, `FOR UPDATE` / `FOR SHARE` — rejected
+- `TABLESAMPLE`, `LIMIT` / `OFFSET`, `FOR UPDATE` / `FOR SHARE` — rejected
   with clear error messages.
 - Window functions inside expressions (CASE, COALESCE, arithmetic) — rejected.
-- Volatile / non-deterministic functions not detected — may produce incorrect
-  results in DIFFERENTIAL mode. Use FULL mode as a workaround.
 - Circular stream table dependencies (cycles) — not yet supported.
