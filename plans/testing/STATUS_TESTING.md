@@ -8,19 +8,19 @@ What we've learned about testing the pg_stream extension, the current state of t
 
 | Category | Tests | Runner | Requires Docker? |
 |----------|------:|--------|:----------------:|
-| **Unit tests** (in `src/`) | 841 | `just test-unit` | No |
-| **Integration tests** (in `tests/`) | 54 | `just test-integration` | Yes (bare PG 18.x containers) |
+| **Unit tests** (in `src/`) | 854 | `just test-unit` | No |
+| **Integration tests** (in `tests/`) | 101 | `just test-integration` | Yes (bare PG 18.x containers) |
 | **E2E tests** (in `tests/e2e_*.rs`) | 340 | `just test-e2e` | Yes (custom Docker image with extension) |
 | **Benchmarks** | 16 | `just test-e2e` (ignored) | Yes |
-| **Total** | **1,251** | `just test-all` | |
+| **Total** | **1,311** | `just test-all` | |
 
 ### Unit Tests by Module
 
 | File | Tests | Focus |
 |------|------:|-------|
-| `src/dvm/parser.rs` | 231 | SQL parsing, OpTree construction, expression handling |
+| `src/dvm/parser.rs` | 237 | SQL parsing, OpTree construction, expression handling, view definition sanitization |
 | `src/dvm/operators/aggregate.rs` | 106 | Aggregate differentiation, merge expressions, delta CTEs |
-| `src/api.rs` | 75 | Pure helper functions (`quote_identifier`, `find_top_level_keyword`, etc.) |
+| `src/api.rs` | 82 | Pure helper functions (`quote_identifier`, `find_top_level_keyword`, `classify_relkind`, etc.) |
 | `src/dvm/operators/recursive_cte.rs` | 59 | Recursive CTE SQL generation, cascade detection |
 | `src/refresh.rs` | 44 | Refresh action resolution, LSN placeholder substitution |
 | `src/dvm/diff.rs` | 34 | DiffContext, CTE name generation, dispatch |
@@ -69,6 +69,7 @@ These run against bare PostgreSQL 18.x containers without the extension loaded, 
 | File | Tests | Focus |
 |------|------:|-------|
 | `catalog_tests.rs` | 15 | Catalog CRUD via SQL |
+| `catalog_compat_tests.rs` | 13 | PG18 catalog behavior: `pg_get_viewdef` semicolons, `nspname::text` cast, `relkind` values, `array_length` types, UNION ALL column consistency |
 | `scenario_tests.rs` | 10 | Multi-step workflow scenarios |
 | `monitoring_tests.rs` | 8 | Monitoring views and functions |
 | `resilience_tests.rs` | 7 | Error recovery, edge cases |
@@ -84,16 +85,17 @@ These run against bare PostgreSQL 18.x containers without the extension loaded, 
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Tier 1: Unit Tests (841 tests)                     │
+│  Tier 1: Unit Tests (854 tests)                     │
 │  - Pure Rust, no database needed                    │
 │  - Tests OpTree construction, SQL generation,       │
 │    differentiation logic, DAG algorithms            │
 │  - Runs in <5 seconds                               │
 │  - cargo test --lib                                 │
 ├─────────────────────────────────────────────────────┤
-│  Tier 2: Integration Tests (54 tests)               │
+│  Tier 2: Integration Tests (101 tests)              │
 │  - Bare PG 18.x containers via Testcontainers       │
-│  - Tests SQL-level data model, catalog schema       │
+│  - Tests SQL-level data model, catalog schema,      │
+│    and PG version-specific catalog behavior          │
 │  - Does NOT load the compiled extension             │
 │  - Runs in ~2-3 minutes                             │
 ├─────────────────────────────────────────────────────┤
@@ -140,7 +142,7 @@ Each test uses a **deterministic SplitMix64 PRNG** seeded per test, applies rand
 |-----------|-----------|--------------|----------|
 | Initial baseline | 189 | 2,888 / 9,139 | **31.6%** |
 | After Coverage Wave 1 (4 phases) | 476 | 7,525 / 12,117 | **62.1%** |
-| Current (post SQL support expansion) | 841 | ~8,500+ / ~13,500 | **~63%** (est.) |
+| Current (post SQL support expansion) | 854 | ~8,500+ / ~13,500 | **~63%** (est.) |
 
 ### The Coverage Ceiling
 
@@ -233,13 +235,67 @@ Building the E2E Docker image (compiling Rust + pgrx inside a container) takes *
 - `just test-e2e-fast` skips the rebuild when iterating on tests
 - CI caches the builder layer
 
-### 4.5 Integration Tests (Tier 2) Have Limited Value
+### 4.5 Integration Tests (Tier 2) Are Valuable for Catalog Assumptions
 
-The 54 integration tests that run against bare PostgreSQL (without the extension) test SQL-level data model and catalog schema by manually creating tables and simulating behavior. Now that we have 340 comprehensive E2E tests with the real extension loaded, these integration tests provide **marginal additional coverage**. They were valuable during early development before the E2E infrastructure existed.
+The integration tests that run against bare PostgreSQL (without the extension) were initially viewed as marginal once E2E tests existed. However, the **catalog compatibility tests** (`catalog_compat_tests.rs`) proved their value by catching PostgreSQL version-specific behavior differences (see §4.7). These tests run fast (~40s), don't require the extension Docker image, and serve as **early-warning canaries** for PG version upgrades.
+
+The original 54 tests that simulate catalog behavior by manually creating schemas still have overlap with E2E tests, but the newer catalog compatibility tests fill a unique niche.
 
 ### 4.6 Benchmark Tests Need Careful Interpretation
 
 Benchmark results show high variance between runs (see [STATUS_PERFORMANCE.md](../performance/STATUS_PERFORMANCE.md)). Cycle 1 is always cold (cache miss, first plan). The "INCR c1" and "INCR 2+" columns in later benchmark snapshots are more informative than simple averages.
+
+### 4.7 E2E Failures Exposed Systemic Gaps (Session 2026-02)
+
+A full E2E test run uncovered **~86 failures** across multiple categories. All were fixable, but the root causes reveal important lessons about what unit tests and integration tests *cannot* catch in a pgrx extension:
+
+#### Root Cause 1: pgrx Type Oid Mismatch (9 tests)
+
+`resolve_rangevar_schema()` queried `pg_namespace.nspname` (PostgreSQL `name` type, Oid 19) and decoded it via `.get::<String>()` which expects `text` (Oid 25). This worked in earlier pgrx versions but broke with stricter type checking.
+
+**Lesson:** Always cast `name`-typed columns to `::text` in SPI queries. This is now documented as a mandatory coding convention in `AGENTS.md`. A dedicated integration test (`test_nspname_text_cast_works`) now verifies this assumption.
+
+#### Root Cause 2: CTE Names Aren't in pg_class (63 tests)
+
+`resolve_rangevar_schema()` assumed every `RangeVar` in a FROM clause references a real `pg_class` entry. CTE names (e.g., `WITH all_people AS ... FROM all_people`) aren't in `pg_class`, causing an empty `SpiTupleTable` iterator panic.
+
+**Lesson:** Catalog lookups must return `Option` rather than panicking on empty results. CTE names, subquery aliases, and function-call ranges are valid FROM sources that don't exist in `pg_class`. The fix changed the return type from `Result<String>` to `Result<Option<String>>` and callers now skip `None` values.
+
+#### Root Cause 3: PostgreSQL 18 Behavior Change (13 tests)
+
+`pg_get_viewdef()` in PostgreSQL 18 returns view definitions **with a trailing semicolon**. When embedded as `(SELECT ... ;)` inside a subquery, this produces a syntax error. This is a pure PG version regression invisible to unit tests.
+
+**Lesson:** Any function that wraps catalog output in SQL (e.g., embedding a view definition in a subquery) must sanitize the output. The fix was extracted as a pure function `strip_view_definition_suffix()` with 6 unit tests. An integration test (`test_pg_get_viewdef_returns_trimmed_definition`) now verifies this behavior on the actual PG version.
+
+#### Root Cause 4: Stale Tests After Feature Implementation (7 tests)
+
+Tests that expected rejection of NATURAL JOIN, DISTINCT ON, and GROUPING SETS/CUBE/ROLLUP were not updated when these features were implemented as auto-rewrites in a prior session.
+
+**Lesson:** When implementing a feature that changes error→success behavior, the corresponding rejection tests must be updated in the same commit. A pre-commit checklist item has been added to `AGENTS.md`.
+
+#### Root Cause 5: Incomplete relkind Handling (1 test)
+
+`classify_source_relation()` mapped materialized views (`relkind='m'`) to `"TABLE"`, causing CDC trigger installation attempts that fail on matviews.
+
+**Lesson:** The `relkind` → source-type mapping was interleaved with SPI calls, making it impossible to unit-test. Extracting the pure function `classify_relkind()` enabled 7 unit tests covering all relkind variants. An integration test (`test_relkind_for_materialized_view`) verifies the actual PG relkind value.
+
+#### Root Cause 6: INT4/INT8 Type Mismatch (1 test)
+
+`array_length()` returns `integer` (INT4), but a test expected `bigint` (INT8) when comparing columns. An integration test (`test_array_length_returns_int4`) now documents this.
+
+#### Impact and Prevention
+
+| Category | Tests Fixed | Prevention Measure |
+|----------|--------:|--------------------|
+| Oid 19/25 type mismatch | 9 | `::text` cast convention in AGENTS.md + integration test |
+| CTE name in pg_class | 63 | `Option` return pattern + integration test |
+| PG18 viewdef semicolons | 13 | `strip_view_definition_suffix()` pure function + 6 unit tests + integration test |
+| Stale rejection tests | 7 | Pre-commit checklist in AGENTS.md |
+| Matview relkind handling | 1 | `classify_relkind()` pure function + 7 unit tests + integration test |
+| INT4/INT8 type mismatch | 1 | Integration test documenting `array_length` return type |
+| **Total** | **~86** (reduced to 4 pre-existing) | 13 new integration tests + 13 new unit tests |
+
+The 4 remaining failures are **pre-existing** (CDC partition data mismatch, CTE multi-ref self-join, recursive CTE `row_data` column, CASE-in-WHERE deparsing) and are tracked separately.
 
 ---
 
@@ -307,17 +363,44 @@ Each new property test would exercise the full pipeline: CDC trigger → change 
 
 **Priority: Low.** A benchmark plan exists in [`TRIGGERS_OVERHEAD.md`](../performance/TRIGGERS_OVERHEAD.md) to measure CDC trigger impact on DML throughput (INSERT/UPDATE/DELETE ops/sec with and without triggers). This would complement the existing refresh benchmarks by quantifying the **write-side cost** of monitoring a source table. Not yet implemented.
 
-### 5.7 Reduce Integration Test Redundancy
+### 5.7 Expand Integration Tests as Version-Compatibility Canaries
 
-**Priority: Low.** The Tier 2 integration tests (54 tests in `catalog_tests.rs`, `scenario_tests.rs`, etc.) overlap significantly with E2E tests. Options:
+**Priority: Medium** (upgraded from Low). The `catalog_compat_tests.rs` file (13 tests) demonstrated that integration tests have a unique role: they run **without building the extension Docker image** (~40s vs ~5-15 min) and catch PostgreSQL version-specific behavior changes early.
 
-1. **Keep as fast smoke tests** — they run without the Docker image build
-2. **Gradually migrate** unique test scenarios into E2E equivalents
-3. **Mark as `#[ignore]`** if they become maintenance burden
+Candidates for new catalog compatibility tests:
 
-### 5.8 Fuzz Testing for the Parser
+| Test | What It Catches |
+|------|-----------------|
+| `pg_get_viewdef` for complex views (CTEs, LATERAL, window functions) | Semicolon/formatting changes per PG version |
+| `pg_catalog.pg_proc` volatility column type | Type changes in system catalogs |
+| `current_setting('search_path')` parsing with `$user` | search_path edge cases |
+| `relkind` for partitioned indexes (`relkind='I'`) | New relkind values in PG18+ |
+| `information_schema` vs `pg_catalog` type name differences | ORM-like assumptions |
 
-**Priority: Low.** The SQL parser (`src/dvm/parser.rs`, 3,261 lines) handles arbitrary SQL from `pg_sys::raw_parser()`. Fuzz testing with `cargo-fuzz` or `proptest` could uncover:
+### 5.8 Systematic "Pure Function Extraction" for SPI Code
+
+**Priority: Medium.** The E2E failure investigation (§4.7) showed that bugs in SPI-dependent code are invisible to unit tests. The pattern that works:
+
+1. **Extract pure decision logic** from SPI-calling functions into standalone functions
+2. **Unit-test the pure function** exhaustively (all branches)
+3. **Keep the SPI glue** thin and tested only via E2E
+
+Examples already done:
+- `classify_relkind(relkind: &str) -> String` — extracted from `classify_source_relation()`
+- `strip_view_definition_suffix(raw: &str) -> String` — extracted from `get_view_definition()`
+
+Candidates for future extraction:
+
+| SPI Function | Extractable Logic |
+|-------------|-------------------|
+| `resolve_rangevar_schema()` | Schema selection from search_path ordering |
+| `check_source_volatility()` | Volatility classification rules |
+| `build_change_buffer_table_sql()` | DDL SQL construction from column metadata |
+| `compute_refresh_action()` | Decision tree for FULL vs DIFFERENTIAL vs SKIP |
+
+### 5.9 Fuzz Testing for the Parser
+
+**Priority: Low.** The SQL parser (`src/dvm/parser.rs`, ~13,000 lines) handles arbitrary SQL from `pg_sys::raw_parser()`. Fuzz testing with `cargo-fuzz` or `proptest` could uncover:
 
 - Panics on unexpected parse tree shapes
 - Incorrect SQL generation for exotic syntax
@@ -331,10 +414,10 @@ This requires a running PostgreSQL instance (for `pg_sys::raw_parser()`), so it 
 
 ```bash
 # ── Unit tests (fast, no Docker) ──
-just test-unit                    # 841 tests, ~5 seconds
+just test-unit                    # 854 tests, ~5 seconds
 
 # ── Integration tests (bare PG containers) ──
-just test-integration             # 54 tests, ~2-3 minutes
+just test-integration             # 101 tests, ~3-4 minutes
 
 # ── E2E tests (requires Docker image) ──
 just build-e2e-image              # Build Docker image (~5-15 min first time)
@@ -364,13 +447,14 @@ just lint                         # Format check + clippy
 
 | Aspect | Status | Notes |
 |--------|--------|-------|
-| Unit tests | **841 tests, ~63% coverage** | Structural ceiling — 86% of remaining uncovered lines need a DB |
-| E2E tests | **340 tests** | Comprehensive, exercising full SQL API |
-| Integration tests | **54 tests** | Partially redundant with E2E |
+| Unit tests | **854 tests, ~63% coverage** | Structural ceiling — 86% of remaining uncovered lines need a DB |
+| E2E tests | **340 tests** | Comprehensive, exercising full SQL API (4 pre-existing failures tracked) |
+| Integration tests | **101 tests** | Now includes 13 catalog compatibility canaries for PG version behavior |
 | Property tests | **11 tests** | Found real correctness bugs; need expansion |
 | Benchmarks | **16 benchmarks** | Refresh performance matrix, trigger overhead planned |
 | E2E coverage infra | **Built, not in CI** | Projected 75-85% combined coverage |
 | CI coverage tracking | **Not started** | Highest-priority improvement |
+| Pure function extraction | **In progress** | `classify_relkind`, `strip_view_definition_suffix` extracted; more candidates identified |
 | Fuzz testing | **Not started** | Parser is the primary target |
 
-The testing strategy is mature for an extension at this stage. The main gaps are: **(1)** CI integration for combined E2E coverage, **(2)** more property tests for recently added SQL features, and **(3)** schema evolution and concurrent stress tests.
+The testing strategy is mature for an extension at this stage. The main gaps are: **(1)** CI integration for combined E2E coverage, **(2)** more property tests for recently added SQL features, **(3)** schema evolution and concurrent stress tests, and **(4)** systematic extraction of pure functions from SPI-dependent code to bring more logic under unit test coverage.
