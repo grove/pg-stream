@@ -13,7 +13,7 @@ use e2e::E2eDb;
 // ── Cycle Detection via SQL ────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_cycle_detection_dt_depending_on_st() {
+async fn test_cycle_detection_st_depending_on_st() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE cycle_src (id INT PRIMARY KEY, val INT)")
@@ -21,28 +21,28 @@ async fn test_cycle_detection_dt_depending_on_st() {
     db.execute("INSERT INTO cycle_src VALUES (1, 10)").await;
 
     // Create st_a sourcing from cycle_src
-    db.create_st("cycle_dt_a", "SELECT id, val FROM cycle_src", "1m", "FULL")
+    db.create_st("cycle_st_a", "SELECT id, val FROM cycle_src", "1m", "FULL")
         .await;
 
     // Try to create st_b that depends on st_a, and then alter st_a to depend on st_b
     // Actually: create st_b from st_a, then create st_c from st_b, then try st_a from st_c → cycle
     db.create_st(
-        "cycle_dt_b",
-        "SELECT id, val FROM public.cycle_dt_a",
+        "cycle_st_b",
+        "SELECT id, val FROM public.cycle_st_a",
         "1m",
         "FULL",
     )
     .await;
 
-    // Attempt to create a ST that would form a cycle: cycle_dt_c → cycle_dt_a
-    // where cycle_dt_a → cycle_dt_b already exists and cycle_dt_b → cycle_dt_c
+    // Attempt to create a ST that would form a cycle: cycle_st_c → cycle_st_a
+    // where cycle_st_a → cycle_st_b already exists and cycle_st_b → cycle_st_c
     // This depends on whether the extension detects the proposed cycle.
     // For a direct self-reference, we already know it fails.
     // Let's test the two-hop cycle: create st_c from st_b, then try to redefine st_a from st_c.
     // Since we can't redefine, create a new ST from st_b to exercise the cycle check path.
     db.create_st(
-        "cycle_dt_c",
-        "SELECT id, val FROM public.cycle_dt_b",
+        "cycle_st_c",
+        "SELECT id, val FROM public.cycle_st_b",
         "1m",
         "FULL",
     )
@@ -52,7 +52,7 @@ async fn test_cycle_detection_dt_depending_on_st() {
     let count: i64 = db
         .query_scalar(
             "SELECT count(*) FROM pgstream.pgs_stream_tables \
-             WHERE pgs_name LIKE 'cycle_dt_%'",
+             WHERE pgs_name LIKE 'cycle_st_%'",
         )
         .await;
     assert_eq!(count, 3, "Three chained STs should exist");
@@ -80,7 +80,7 @@ async fn test_invalid_schedule_below_minimum() {
 // ── Monitoring Functions ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_explain_dt_returns_properties() {
+async fn test_explain_st_returns_properties() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE explain_src (id INT PRIMARY KEY, val TEXT, amount NUMERIC)")
@@ -129,7 +129,7 @@ async fn test_explain_dt_returns_properties() {
 }
 
 #[tokio::test]
-async fn test_explain_dt_differential_shows_dvm_info() {
+async fn test_explain_st_differential_shows_dvm_info() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE explain_inc_src (id INT PRIMARY KEY, region TEXT, amount NUMERIC)")
@@ -188,7 +188,7 @@ async fn test_slot_health_returns_rows() {
 }
 
 #[tokio::test]
-async fn test_slot_health_with_no_dts() {
+async fn test_slot_health_with_no_sts() {
     let db = E2eDb::new().await.with_extension().await;
 
     // With no STs, slot_health() should return 0 rows

@@ -40,7 +40,7 @@ Affected code:
 - `SourceVersion.lsn` in `src/version.rs` (L37-L43)
 - `Frontier.sources` HashMap keyed by OID string in `src/version.rs` (L29-L34)
 - Change detection query: `WHERE lsn > ... AND lsn <=` in `src/refresh.rs` (L375-L393)
-- LSN placeholder generation: `__PGDT_PREV_LSN_{oid}__` in `src/dvm/diff.rs` (L122-L137)
+- LSN placeholder generation: `__PGS_PREV_LSN_{oid}__` in `src/dvm/diff.rs` (L122-L137)
 - LSN resolution: `resolve_lsn_placeholders()` in `src/refresh.rs` (L59-L72)
 
 ### 2.3. Trigger-based CDC on Distributed Tables (HIGH — fundamental)
@@ -199,7 +199,7 @@ Replace `changes_{oid}` with `changes_{stable_hash}` in all locations:
 
 **P2.4: Update LSN placeholder tokens**
 
-- `DiffContext.get_prev_lsn()` / `get_new_lsn()` in `src/dvm/diff.rs` (L122-L137): `__PGDT_PREV_LSN_{stable_name}__`
+- `DiffContext.get_prev_lsn()` / `get_new_lsn()` in `src/dvm/diff.rs` (L122-L137): `__PGS_PREV_LSN_{stable_name}__`
 - `resolve_lsn_placeholders()` in `src/refresh.rs` (L59-L72): Match new placeholder format
 
 **P2.5: Catalog migration**

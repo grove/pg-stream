@@ -103,7 +103,7 @@ async fn test_alter_source_fires_event_trigger() {
 }
 
 #[tokio::test]
-async fn test_drop_dt_storage_by_sql() {
+async fn test_drop_st_storage_by_sql() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE evt_storage_src (id INT PRIMARY KEY)")

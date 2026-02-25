@@ -62,7 +62,7 @@ async fn test_concurrent_inserts_during_refresh() {
 }
 
 #[tokio::test]
-async fn test_create_two_dts_simultaneously() {
+async fn test_create_two_sts_simultaneously() {
     let db = E2eDb::new().await.with_extension().await;
 
     // Create two source tables
@@ -79,7 +79,7 @@ async fn test_create_two_dts_simultaneously() {
 
     let h1 = tokio::spawn(async move {
         sqlx::query(
-            "SELECT pgstream.create_stream_table('cc_dt_a', \
+            "SELECT pgstream.create_stream_table('cc_st_a', \
              $$ SELECT id, val FROM cc_src_a $$, '1m', 'FULL')",
         )
         .execute(&pool_a)
@@ -88,7 +88,7 @@ async fn test_create_two_dts_simultaneously() {
 
     let h2 = tokio::spawn(async move {
         sqlx::query(
-            "SELECT pgstream.create_stream_table('cc_dt_b', \
+            "SELECT pgstream.create_stream_table('cc_st_b', \
              $$ SELECT id, val FROM cc_src_b $$, '1m', 'FULL')",
         )
         .execute(&pool_b)
@@ -100,11 +100,11 @@ async fn test_create_two_dts_simultaneously() {
     r2.expect("task b panicked").expect("create st_b failed");
 
     // Both STs should exist
-    assert!(db.table_exists("public", "cc_dt_a").await);
-    assert!(db.table_exists("public", "cc_dt_b").await);
+    assert!(db.table_exists("public", "cc_st_a").await);
+    assert!(db.table_exists("public", "cc_st_b").await);
 
-    let count_a = db.count("public.cc_dt_a").await;
-    let count_b = db.count("public.cc_dt_b").await;
+    let count_a = db.count("public.cc_st_a").await;
+    let count_b = db.count("public.cc_st_b").await;
     assert_eq!(count_a, 1);
     assert_eq!(count_b, 1);
 }

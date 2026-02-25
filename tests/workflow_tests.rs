@@ -191,61 +191,61 @@ async fn test_source_data_changes_tracked() {
 async fn test_chained_stream_tables() {
     let db = TestDb::with_catalog().await;
 
-    // Base table -> DT1 -> DT2 (chained)
+    // Base table -> ST1 -> ST2 (chained)
     db.execute("CREATE TABLE base_data (id INT PRIMARY KEY, val INT)")
         .await;
-    db.execute("CREATE TABLE dt1_storage (id INT, val INT)")
+    db.execute("CREATE TABLE st1_storage (id INT, val INT)")
         .await;
-    db.execute("CREATE TABLE dt2_storage (total_val BIGINT)")
+    db.execute("CREATE TABLE st2_storage (total_val BIGINT)")
         .await;
 
     let base_oid: i32 = db
         .query_scalar("SELECT 'base_data'::regclass::oid::int")
         .await;
-    let dt1_oid: i32 = db
-        .query_scalar("SELECT 'dt1_storage'::regclass::oid::int")
+    let st1_oid: i32 = db
+        .query_scalar("SELECT 'st1_storage'::regclass::oid::int")
         .await;
-    let dt2_oid: i32 = db
-        .query_scalar("SELECT 'dt2_storage'::regclass::oid::int")
+    let st2_oid: i32 = db
+        .query_scalar("SELECT 'st2_storage'::regclass::oid::int")
         .await;
 
-    // Create DT1: SELECT * FROM base_data
+    // Create ST1: SELECT * FROM base_data
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status) \
-         VALUES ({}, 'dt1', 'public', 'SELECT * FROM base_data', '1m', 'FULL', 'ACTIVE')",
-        dt1_oid
+         VALUES ({}, 'st1', 'public', 'SELECT * FROM base_data', '1m', 'FULL', 'ACTIVE')",
+        st1_oid
     ))
     .await;
 
-    // Create DT2: SELECT SUM(val) FROM dt1 (depends on DT1)
+    // Create ST2: SELECT SUM(val) FROM st1 (depends on ST1)
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status) \
-         VALUES ({}, 'dt2', 'public', 'SELECT SUM(val) FROM dt1_storage', '5m', 'FULL', 'ACTIVE')",
-        dt2_oid
+         VALUES ({}, 'st2', 'public', 'SELECT SUM(val) FROM st1_storage', '5m', 'FULL', 'ACTIVE')",
+        st2_oid
     ))
     .await;
 
     // Dependencies:
-    // DT1 -> base_data (TABLE)
-    // DT2 -> dt1_storage (STREAM_TABLE)
+    // ST1 -> base_data (TABLE)
+    // ST2 -> st1_storage (STREAM_TABLE)
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_dependencies (pgs_id, source_relid, source_type) VALUES \
          (1, {}, 'TABLE'), (2, {}, 'STREAM_TABLE')",
-        base_oid, dt1_oid
+        base_oid, st1_oid
     ))
     .await;
 
     // Verify the dependency chain
-    let dt1_sources: i64 = db
+    let st1_sources: i64 = db
         .query_scalar("SELECT count(*) FROM pgstream.pgs_dependencies WHERE pgs_id = 1")
         .await;
-    let dt2_sources: i64 = db
+    let st2_sources: i64 = db
         .query_scalar("SELECT count(*) FROM pgstream.pgs_dependencies WHERE pgs_id = 2")
         .await;
-    assert_eq!(dt1_sources, 1);
-    assert_eq!(dt2_sources, 1);
+    assert_eq!(st1_sources, 1);
+    assert_eq!(st2_sources, 1);
 
     // Verify we can query the dependency graph
     let graph: Vec<(i64, String)> = sqlx::query_as(

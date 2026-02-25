@@ -304,7 +304,7 @@ fn bench_dag_operations(c: &mut Criterion) {
                 b.iter(|| {
                     let mut dag = StDag::new();
                     for id in 1..=n as i64 {
-                        dag.add_dt_node(DagNode {
+                        dag.add_st_node(DagNode {
                             id: NodeId::StreamTable(id),
                             schedule: Some(Duration::from_secs(60)),
                             effective_schedule: Duration::from_secs(60),

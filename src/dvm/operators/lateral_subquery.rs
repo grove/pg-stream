@@ -89,14 +89,14 @@ pub fn diff_lateral_subquery(
         .collect::<Vec<_>>()
         .join(" AND ");
 
-    let all_cols_dt = all_output_cols
+    let all_cols_st = all_output_cols
         .iter()
         .map(|c| format!("st.{}", quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
 
     let old_rows_sql = format!(
-        "SELECT st.\"__pgs_row_id\", {all_cols_dt}\n\
+        "SELECT st.\"__pgs_row_id\", {all_cols_st}\n\
          FROM {st_table} st\n\
          WHERE EXISTS (\n\
              SELECT 1 FROM {changed_sources_cte} cs\n\

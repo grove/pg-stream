@@ -2372,7 +2372,7 @@ async fn test_cte_with_union_all_outside() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn test_cte_dt_drop_cleans_up() {
+async fn test_cte_st_drop_cleans_up() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE cleanup_src (id INT PRIMARY KEY, val TEXT)")
@@ -2410,7 +2410,7 @@ async fn test_cte_dt_drop_cleans_up() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn test_cte_dt_matches_defining_query_after_refresh() {
+async fn test_cte_st_matches_defining_query_after_refresh() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE verify_src (id INT PRIMARY KEY, val INT)")

@@ -47,7 +47,7 @@
 //!     SELECT cols FROM __pgs_base_delta WHERE __pgs_action = 'I'
 //!     UNION ALL
 //!     -- Seed: new base table rows joining existing ST storage
-//!     SELECT cols FROM <recursive term with self_ref = DT_storage, base_tables = change_buffer>
+//!     SELECT cols FROM <recursive term with self_ref = ST_storage, base_tables = change_buffer>
 //!     UNION ALL
 //!     -- Propagation: recursive term applied to delta
 //!     SELECT cols FROM <recursive term with self_ref = __pgs_rec_delta, base_tables = full>
@@ -219,11 +219,11 @@ fn generate_recomputation_delta(
     // ALL CTE columns (which may include extras like `parent_id` that
     // aren't in the ST storage). Using the defining query is preferred
     // because it exactly matches the ST schema.
-    let (recomp_inner_sql, out_cols) = if let (Some(defining_query), Some(dt_cols)) =
+    let (recomp_inner_sql, out_cols) = if let (Some(defining_query), Some(st_cols)) =
         (&ctx.defining_query, &ctx.st_user_columns)
     {
         // Use the defining query — output matches ST storage columns.
-        (defining_query.clone(), dt_cols.clone())
+        (defining_query.clone(), st_cols.clone())
     } else {
         // Fallback: reconstruct from OpTree. Uses CTE-level columns.
         let base_sql = generate_query_sql(base, None)?;
@@ -344,7 +344,7 @@ fn generate_recomputation_delta(
 ///     SELECT cols FROM __pgs_base_delta WHERE __pgs_action = 'D'
 ///     UNION ALL
 ///     -- Propagation: find ST storage rows joining del_cascade
-///     SELECT s.cols FROM DT_storage s JOIN __pgs_del_cascade d ON ...
+///     SELECT s.cols FROM ST_storage s JOIN __pgs_del_cascade d ON ...
 ///   ),
 ///
 ///   -- Phase 3: Rederivation from current base tables
@@ -595,7 +595,7 @@ fn generate_cascade_propagation(
     // The recursive term is of the form:
     //   SELECT cols FROM base_table t JOIN <self_ref> r ON t.parent = r.id
     // For the cascade, we need:
-    //   SELECT s.cols FROM DT_storage s JOIN cascade d ON <join condition>
+    //   SELECT s.cols FROM ST_storage s JOIN cascade d ON <join condition>
     // where the join condition maps child (storage) to parent (cascade).
     //
     // We walk the OpTree to find the join and replace:
@@ -1495,8 +1495,8 @@ fn generate_from_sql_targeted(
 /// of new rows with existing rows in each possible configuration.
 ///
 /// For a non-linear recursive term `R(r1, r2)` with two self-references:
-/// - Seed A: `R(delta_ins, DT_storage)` — new rows in r1 position
-/// - Seed B: `R(DT_storage, delta_ins)` — new rows in r2 position
+/// - Seed A: `R(delta_ins, ST_storage)` — new rows in r1 position
+/// - Seed B: `R(ST_storage, delta_ins)` — new rows in r2 position
 ///
 /// Returns an empty vec for linear recursion (1 or fewer self-refs).
 fn generate_nonlinear_seeds(

@@ -34,7 +34,7 @@ async fn test_pgs_status_returns_rows() {
 }
 
 #[tokio::test]
-async fn test_pgs_status_multiple_dts() {
+async fn test_pgs_status_multiple_sts() {
     let db = E2eDb::new().await.with_extension().await;
 
     for i in 1..=3 {
@@ -46,7 +46,7 @@ async fn test_pgs_status_multiple_dts() {
         db.execute(&format!("INSERT INTO mon_multi_{} VALUES (1)", i))
             .await;
         db.create_st(
-            &format!("mon_multi_dt_{}", i),
+            &format!("mon_multi_st_{}", i),
             &format!("SELECT id FROM mon_multi_{}", i),
             "1m",
             "FULL",

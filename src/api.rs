@@ -325,7 +325,7 @@ fn create_stream_table_impl(
     // Initialize if requested
     if initialize {
         let t_init = Instant::now();
-        initialize_dt(&schema, &table_name, query, pgs_id, &columns, needs_count)?;
+        initialize_st(&schema, &table_name, query, pgs_id, &columns, needs_count)?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
 
         // Record initial full materialization time so the adaptive
@@ -1263,14 +1263,14 @@ unsafe fn collect_relation_oids(
 /// Classify a source relation as TABLE, STREAM_TABLE, or VIEW.
 fn classify_source_relation(oid: pg_sys::Oid) -> String {
     // Check if this OID is a stream table
-    let is_dt = Spi::get_one_with_args::<bool>(
+    let is_st = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_relid = $1)",
         &[oid.into()],
     )
     .unwrap_or(Some(false))
     .unwrap_or(false);
 
-    if is_dt {
+    if is_st {
         return "STREAM_TABLE".to_string();
     }
 
@@ -1298,11 +1298,11 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgStr
     }
 
     // Check if any source is itself a stream table — only then can cycles exist
-    let has_dt_source = source_relids
+    let has_st_source = source_relids
         .iter()
         .any(|(_, stype)| stype == "STREAM_TABLE");
 
-    if !has_dt_source {
+    if !has_st_source {
         // No stream table sources → no possible cycle
         return Ok(());
     }
@@ -1312,7 +1312,7 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgStr
 
     // Create a temporary node for the proposed ST (use a sentinel pgs_id)
     let proposed_id = NodeId::StreamTable(i64::MAX);
-    dag.add_dt_node(DagNode {
+    dag.add_st_node(DagNode {
         id: proposed_id,
         schedule: Some(std::time::Duration::from_secs(60)),
         effective_schedule: std::time::Duration::from_secs(60),
@@ -1399,7 +1399,7 @@ fn get_table_oid(schema: &str, name: &str) -> Result<pg_sys::Oid, PgStreamError>
 }
 
 /// Initialize a stream table by populating it from its defining query.
-fn initialize_dt(
+fn initialize_st(
     schema: &str,
     name: &str,
     query: &str,

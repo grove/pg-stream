@@ -202,7 +202,7 @@ The pipeline overhead (Decision + Gen+Build) is <1ms — essentially zero. **Any
 **Goal**: Compare the generated MERGE SQL from Part 6 vs now.
 
 **Steps**:
-1. Add `[PGDT_DEBUG]` SQL logging for join queries
+1. Add `[PGS_DEBUG]` SQL logging for join queries
 2. Run benchmark, capture the full delta SQL
 3. Compare CTE structure with `/target/criterion/` historical baselines
 4. Check if any new CTEs were introduced
@@ -214,7 +214,7 @@ The pipeline overhead (Decision + Gen+Build) is <1ms — essentially zero. **Any
 **Goal**: Verify `auto_threshold` triggers FULL fallback for join_agg 10K/10% and scan 100K/50%.
 
 **Steps**:
-1. Add `[PGDT_PROFILE]` logging showing threshold decisions
+1. Add `[PGS_PROFILE]` logging showing threshold decisions
 2. Verify that after 2-3 cycles of INCR being slower, the threshold auto-adjusts
 3. If not triggering, lower the default threshold or fix the calculation
 

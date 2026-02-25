@@ -351,7 +351,7 @@ async fn test_refresh_records_history() {
 // ── Suspended ST Refresh ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_refresh_suspended_dt_fails() {
+async fn test_refresh_suspended_st_fails() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE rf_susp (id INT PRIMARY KEY)")

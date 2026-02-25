@@ -457,7 +457,7 @@ async fn test_change_buffer_table_schema() {
 // ── Multiple STs with Shared Sources ───────────────────────────────────────
 
 #[tokio::test]
-async fn test_multiple_dts_sharing_source() {
+async fn test_multiple_sts_sharing_source() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE shared_source (id INT PRIMARY KEY, val INT)")
@@ -480,8 +480,8 @@ async fn test_multiple_dts_sharing_source() {
         "INSERT INTO pgstream.pgs_stream_tables \
          (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status) \
          VALUES \
-         ({}, 'dt1', 'public', 'SELECT * FROM shared_source', '1m', 'FULL', 'ACTIVE'), \
-         ({}, 'dt2', 'public', 'SELECT id FROM shared_source WHERE val > 10', '5m', 'DIFFERENTIAL', 'ACTIVE')",
+         ({}, 'st1', 'public', 'SELECT * FROM shared_source', '1m', 'FULL', 'ACTIVE'), \
+         ({}, 'st2', 'public', 'SELECT id FROM shared_source WHERE val > 10', '5m', 'DIFFERENTIAL', 'ACTIVE')",
         s1_oid, s2_oid
     ))
     .await;
@@ -497,14 +497,14 @@ async fn test_multiple_dts_sharing_source() {
     let dep_count = db.count("pgstream.pgs_dependencies").await;
     assert_eq!(dep_count, 2);
 
-    // Drop dt1 — dependencies for dt1 cascade, but dt2's remain
+    // Drop st1 — dependencies for st1 cascade, but st2's remain
     db.execute("DELETE FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
         .await;
 
     let remaining_deps = db.count("pgstream.pgs_dependencies").await;
-    assert_eq!(remaining_deps, 1, "Only dt2's dependency should remain");
+    assert_eq!(remaining_deps, 1, "Only st2's dependency should remain");
 
-    // Verify remaining dependency belongs to dt2
+    // Verify remaining dependency belongs to st2
     let remaining_pgs_id: i64 = db
         .query_scalar("SELECT pgs_id FROM pgstream.pgs_dependencies LIMIT 1")
         .await;

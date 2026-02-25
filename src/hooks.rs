@@ -440,7 +440,7 @@ fn handle_create_trigger(cmd: &DdlCommand) {
     };
 
     // Check if the table is a stream table.
-    if !is_dt_storage_table(tgrelid) {
+    if !is_st_storage_table(tgrelid) {
         return;
     }
 
@@ -548,9 +548,9 @@ fn handle_dropped_table(obj: &DroppedObject) {
     let identity = obj.object_identity.as_deref().unwrap_or("unknown");
 
     // Case 1: Check if the dropped table is a ST storage table.
-    let is_dt = is_dt_storage_table(obj.objid);
-    if is_dt {
-        handle_dt_storage_dropped(obj.objid, identity);
+    let is_st = is_st_storage_table(obj.objid);
+    if is_st {
+        handle_st_storage_dropped(obj.objid, identity);
         return;
     }
 
@@ -612,7 +612,7 @@ fn handle_dropped_table(obj: &DroppedObject) {
 /// Handle the case where a ST's own storage table was dropped.
 ///
 /// Clean up the catalog entry and signal a DAG rebuild.
-fn handle_dt_storage_dropped(relid: pg_sys::Oid, identity: &str) {
+fn handle_st_storage_dropped(relid: pg_sys::Oid, identity: &str) {
     // Find and delete the ST catalog entry.
     let st = match StreamTableMeta::get_by_relid(relid) {
         Ok(st) => st,
@@ -773,7 +773,7 @@ fn get_pgs_relid(pgs_id: i64) -> Result<Option<pg_sys::Oid>, PgStreamError> {
 }
 
 /// Check if a given OID is a ST storage table.
-fn is_dt_storage_table(relid: pg_sys::Oid) -> bool {
+fn is_st_storage_table(relid: pg_sys::Oid) -> bool {
     Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_relid = $1)",
         &[relid.into()],

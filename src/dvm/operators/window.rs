@@ -68,7 +68,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
     }
 
     // ── join condition: st partition cols = cp partition cols ───────────
-    let partition_join_dt_cp = if partition_cols.is_empty() {
+    let partition_join_st_cp = if partition_cols.is_empty() {
         "TRUE".to_string()
     } else {
         partition_cols
@@ -83,17 +83,17 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
 
     // ── CTE 2: Old ST rows for changed partitions (DELETE actions) ─────
     let old_rows_cte = ctx.next_cte_name("win_old");
-    let all_cols_dt = all_output_cols
+    let all_cols_st = all_output_cols
         .iter()
         .map(|c| format!("st.{}", quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
 
     let old_rows_sql = format!(
-        "SELECT st.\"__pgs_row_id\", {all_cols_dt}\n\
+        "SELECT st.\"__pgs_row_id\", {all_cols_st}\n\
          FROM {st_table} st\n\
          WHERE EXISTS (\n\
-         SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_dt_cp}\n\
+         SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_st_cp}\n\
          )",
     );
     ctx.add_cte(old_rows_cte.clone(), old_rows_sql);

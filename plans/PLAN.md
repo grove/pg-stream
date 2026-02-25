@@ -1675,8 +1675,8 @@ Register custom statistics via `pg_sys` FFI:
 // In _PG_init(), register custom stats kind
 unsafe {
     let stats_kind = pg_sys::pgstat_register_kind(
-        PGDT_STATS_KIND_ID,  // custom kind ID
-        &PGDT_STATS_KIND_INFO,
+        PGS_STATS_KIND_ID,  // custom kind ID
+        &PGS_STATS_KIND_INFO,
     );
 }
 ```

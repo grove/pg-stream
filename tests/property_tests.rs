@@ -261,7 +261,7 @@ fn prop_dag_acyclic_topological_order_respects_edges() {
     // Build a DAG: 1→2, 1→3, 2→4, 3→4
     let mut dag = StDag::new();
     for &id in &[1i64, 2, 3, 4] {
-        dag.add_dt_node(DagNode {
+        dag.add_st_node(DagNode {
             id: NodeId::StreamTable(id),
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
@@ -293,7 +293,7 @@ fn prop_dag_cycle_detected() {
     // Build a cyclic graph: 1→2, 2→3, 3→1
     let mut dag = StDag::new();
     for &id in &[1i64, 2, 3] {
-        dag.add_dt_node(DagNode {
+        dag.add_st_node(DagNode {
             id: NodeId::StreamTable(id),
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
@@ -314,7 +314,7 @@ fn prop_dag_linear_chain_order() {
     // 1→2→3→4→5
     let mut dag = StDag::new();
     for id in 1i64..=5 {
-        dag.add_dt_node(DagNode {
+        dag.add_st_node(DagNode {
             id: NodeId::StreamTable(id),
             schedule: Some(Duration::from_secs(60)),
             effective_schedule: Duration::from_secs(60),
@@ -342,9 +342,9 @@ fn prop_dag_linear_chain_order() {
 
 #[test]
 fn prop_dag_calculated_schedule_resolution() {
-    // dt1 (schedule=60) ← dt2 (CALCULATED)
+    // st1 (schedule=60) ← st2 (CALCULATED)
     let mut dag = StDag::new();
-    dag.add_dt_node(DagNode {
+    dag.add_st_node(DagNode {
         id: NodeId::StreamTable(1),
         schedule: Some(Duration::from_secs(60)),
         effective_schedule: Duration::from_secs(60),
@@ -352,7 +352,7 @@ fn prop_dag_calculated_schedule_resolution() {
         status: StStatus::Active,
         schedule_raw: None,
     });
-    dag.add_dt_node(DagNode {
+    dag.add_st_node(DagNode {
         id: NodeId::StreamTable(2),
         schedule: None, // CALCULATED
         effective_schedule: Duration::ZERO,
@@ -368,7 +368,7 @@ fn prop_dag_calculated_schedule_resolution() {
     // st_2 has no dependents, so fallback applies.
     dag.resolve_calculated_schedule(30); // fallback = 30s
 
-    let nodes = dag.get_all_dt_nodes();
+    let nodes = dag.get_all_st_nodes();
     for node in &nodes {
         if let NodeId::StreamTable(2) = node.id {
             // With no downstream dependents, CALCULATED gets fallback
@@ -387,7 +387,7 @@ fn prop_dag_empty_is_acyclic() {
 #[test]
 fn prop_dag_single_node_no_cycle() {
     let mut dag = StDag::new();
-    dag.add_dt_node(DagNode {
+    dag.add_st_node(DagNode {
         id: NodeId::StreamTable(1),
         schedule: Some(Duration::from_secs(60)),
         effective_schedule: Duration::from_secs(60),
@@ -403,7 +403,7 @@ fn prop_dag_single_node_no_cycle() {
 fn prop_dag_base_table_edges() {
     // base table → st is valid, no cycle possible with a single ST
     let mut dag = StDag::new();
-    dag.add_dt_node(DagNode {
+    dag.add_st_node(DagNode {
         id: NodeId::StreamTable(1),
         schedule: Some(Duration::from_secs(60)),
         effective_schedule: Duration::from_secs(60),

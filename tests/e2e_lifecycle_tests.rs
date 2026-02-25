@@ -60,7 +60,7 @@ async fn test_full_lifecycle_create_mutate_refresh_drop() {
 }
 
 #[tokio::test]
-async fn test_multiple_dt_on_same_source() {
+async fn test_multiple_st_on_same_source() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE ms_src (id INT PRIMARY KEY, region TEXT, amount INT)")
@@ -115,42 +115,42 @@ async fn test_multiple_dt_on_same_source() {
 async fn test_chained_stream_tables() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Base table → DT1 → DT2
+    // Base table → ST1 → ST2
     db.execute("CREATE TABLE chain_base (id INT PRIMARY KEY, val INT)")
         .await;
     db.execute("INSERT INTO chain_base VALUES (1, 10), (2, 20), (3, 30)")
         .await;
 
     db.create_st(
-        "chain_dt1",
+        "chain_st1",
         "SELECT id, val FROM chain_base WHERE val >= 20",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.chain_dt1").await, 2);
+    assert_eq!(db.count("public.chain_st1").await, 2);
 
     // ST on top of ST (chained)
     db.create_st(
-        "chain_dt2",
-        "SELECT id, val FROM public.chain_dt1 WHERE val >= 30",
+        "chain_st2",
+        "SELECT id, val FROM public.chain_st1 WHERE val >= 30",
         "1m",
         "FULL",
     )
     .await;
 
-    assert_eq!(db.count("public.chain_dt2").await, 1);
+    assert_eq!(db.count("public.chain_st2").await, 1);
 
     // Insert into base
     db.execute("INSERT INTO chain_base VALUES (4, 40)").await;
 
     // Refresh chain
-    db.refresh_st("chain_dt1").await;
-    db.refresh_st("chain_dt2").await;
+    db.refresh_st("chain_st1").await;
+    db.refresh_st("chain_st2").await;
 
-    assert_eq!(db.count("public.chain_dt1").await, 3); // val >= 20: 20, 30, 40
-    assert_eq!(db.count("public.chain_dt2").await, 2); // val >= 30: 30, 40
+    assert_eq!(db.count("public.chain_st1").await, 3); // val >= 20: 20, 30, 40
+    assert_eq!(db.count("public.chain_st2").await, 2); // val >= 30: 30, 40
 }
 
 #[tokio::test]

@@ -383,7 +383,7 @@ async fn test_auto_refresh_differential_with_cdc() {
 /// Verify the scheduler correctly handles two healthy STs, refreshing both.
 /// The scheduler processes all STs in a single transaction per tick.
 #[tokio::test]
-async fn test_scheduler_refreshes_multiple_healthy_dts() {
+async fn test_scheduler_refreshes_multiple_healthy_sts() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
     configure_fast_scheduler(&db).await;
 
@@ -396,14 +396,14 @@ async fn test_scheduler_refreshes_multiple_healthy_dts() {
         .await;
     db.execute("INSERT INTO h_src2 VALUES (1, 20)").await;
 
-    db.create_st("h_dt1", "SELECT id, val FROM h_src1", "1s", "FULL")
+    db.create_st("h_st1", "SELECT id, val FROM h_src1", "1s", "FULL")
         .await;
 
-    db.create_st("h_dt2", "SELECT id, val FROM h_src2", "1s", "DIFFERENTIAL")
+    db.create_st("h_st2", "SELECT id, val FROM h_src2", "1s", "DIFFERENTIAL")
         .await;
 
-    assert_eq!(db.count("public.h_dt1").await, 1);
-    assert_eq!(db.count("public.h_dt2").await, 1);
+    assert_eq!(db.count("public.h_st1").await, 1);
+    assert_eq!(db.count("public.h_st2").await, 1);
 
     // Insert data into both sources
     db.execute("INSERT INTO h_src1 VALUES (2, 11)").await;
@@ -417,20 +417,20 @@ async fn test_scheduler_refreshes_multiple_healthy_dts() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let c1 = db.count("public.h_dt1").await;
-        let c2 = db.count("public.h_dt2").await;
+        let c1 = db.count("public.h_st1").await;
+        let c2 = db.count("public.h_st2").await;
         if c1 == 2 && c2 == 2 {
             break;
         }
     }
 
     assert_eq!(
-        db.count("public.h_dt1").await,
+        db.count("public.h_st1").await,
         2,
         "First ST should have 2 rows after auto-refresh"
     );
     assert_eq!(
-        db.count("public.h_dt2").await,
+        db.count("public.h_st2").await,
         2,
         "Second ST should have 2 rows after auto-refresh"
     );

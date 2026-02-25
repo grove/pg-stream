@@ -430,7 +430,7 @@ async fn test_scenario_refresh_history() {
 // ── Scenario 9: Stream tables info view ───────────────────────────────────
 
 #[tokio::test]
-async fn test_scenario_dt_info_view() {
+async fn test_scenario_st_info_view() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE base (id INT PRIMARY KEY)").await;
@@ -463,13 +463,13 @@ async fn test_scenario_no_data_refresh() {
         .await;
     db.execute("INSERT INTO src10 VALUES (1, 'hello')").await;
 
-    db.execute("CREATE TABLE public.dt10 (__pgs_row_id BIGINT, id INT, val TEXT)")
+    db.execute("CREATE TABLE public.st10 (__pgs_row_id BIGINT, id INT, val TEXT)")
         .await;
-    let oid: i32 = db.query_scalar("SELECT 'dt10'::regclass::oid::int").await;
+    let oid: i32 = db.query_scalar("SELECT 'st10'::regclass::oid::int").await;
 
     db.execute(&format!(
         "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
-         VALUES ({oid}, 'dt10', 'public', 'SELECT id, val FROM src10', '1m', 'FULL')"
+         VALUES ({oid}, 'st10', 'public', 'SELECT id, val FROM src10', '1m', 'FULL')"
     )).await;
 
     // Record a NO_DATA refresh
@@ -479,7 +479,7 @@ async fn test_scenario_no_data_refresh() {
     ).await;
 
     // Table should remain empty (no data was loaded)
-    assert_eq!(db.count("dt10").await, 0);
+    assert_eq!(db.count("st10").await, 0);
 
     // But history shows it
     let action: String = db
