@@ -145,6 +145,14 @@ fn handle_ddl_command(cmd: &DdlCommand) {
             handle_create_trigger(cmd);
         }
 
+        // ── Function DDL ──────────────────────────────────────────────
+        // CREATE OR REPLACE FUNCTION / ALTER FUNCTION / DROP FUNCTION
+        // may change the behaviour of functions referenced in stream
+        // table defining queries. Mark affected STs for reinit.
+        ("function", "CREATE FUNCTION") | ("function", "ALTER FUNCTION") => {
+            handle_function_change(cmd);
+        }
+
         _ => {}
     }
 }
@@ -223,6 +231,110 @@ fn handle_view_change(cmd: &DdlCommand) {
     );
 
     shmem::signal_dag_rebuild();
+    // G8.1: Notify other backends to flush their delta/MERGE template caches.
+    shmem::bump_cache_generation();
+}
+
+// ── Function DDL handling ──────────────────────────────────────────────────
+
+/// Handle CREATE OR REPLACE FUNCTION / ALTER FUNCTION on a function that
+/// may be referenced in one or more stream table defining queries.
+///
+/// The `functions_used` TEXT[] column in `pgs_stream_tables` tracks every
+/// function name used by the defining query (populated at creation time).
+/// When a function definition changes, we look up affected STs via
+/// `StreamTableMeta::find_by_function_name()` and mark them for reinit.
+fn handle_function_change(cmd: &DdlCommand) {
+    let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
+
+    // object_identity is e.g. "public.my_func(integer, text)" — extract
+    // the bare function name (without schema or argument types).
+    let func_name = extract_function_name(identity);
+
+    let affected_pgs_ids = match StreamTableMeta::find_by_function_name(&func_name) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to query STs for function {}: {}",
+                identity,
+                e,
+            );
+            return;
+        }
+    };
+
+    if affected_pgs_ids.is_empty() {
+        return;
+    }
+
+    pgrx::info!(
+        "pg_stream: function {} changed, marking {} stream table(s) for reinit",
+        identity,
+        affected_pgs_ids.len(),
+    );
+
+    for pgs_id in &affected_pgs_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to mark ST {} for reinit after function change: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    // Cascade: STs depending on affected STs also need reinit.
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade function reinit: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for pgs_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade function reinit to ST {}: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    let total = affected_pgs_ids.len() + cascade_ids.len();
+    log!(
+        "pg_stream_ddl_tracker: function {} changed → {} ST(s) marked for reinitialize",
+        identity,
+        total,
+    );
+
+    shmem::signal_dag_rebuild();
+    shmem::bump_cache_generation();
+}
+
+/// Extract the bare function name from an `object_identity` string.
+///
+/// PostgreSQL reports function identity as `schema.name(arg_types)`.
+/// We strip the schema prefix and the argument-type parenthesised suffix
+/// to get the plain name used in `functions_used`.
+fn extract_function_name(identity: &str) -> String {
+    // Strip argument types: "public.my_func(integer, text)" → "public.my_func"
+    let without_args = identity
+        .find('(')
+        .map(|i| &identity[..i])
+        .unwrap_or(identity);
+
+    // Strip schema prefix: "public.my_func" → "my_func"
+    let name = without_args
+        .rfind('.')
+        .map(|i| &without_args[i + 1..])
+        .unwrap_or(without_args);
+
+    name.to_lowercase()
 }
 
 // ── ALTER TABLE handling ───────────────────────────────────────────────────
@@ -370,6 +482,8 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
             identity,
             total,
         );
+        // G8.1: Notify other backends to flush their delta/MERGE template caches.
+        shmem::bump_cache_generation();
     } else {
         log!(
             "pg_stream_ddl_tracker: ALTER TABLE on {} → benign for all {} dependent ST(s), \
@@ -491,6 +605,7 @@ fn pg_stream_on_sql_drop() {
         match obj.object_type.as_str() {
             "table" => handle_dropped_table(obj),
             "view" => handle_dropped_view(obj),
+            "function" => handle_dropped_function(obj),
             _ => {}
         }
     }
@@ -698,6 +813,79 @@ fn handle_dropped_view(obj: &DroppedObject) {
         identity,
         total,
     );
+}
+
+/// Handle a dropped function: look up STs that reference it via
+/// `functions_used` and mark them for reinit (the function may be
+/// recreated under the same name, so reinit is appropriate rather
+/// than ERROR).
+fn handle_dropped_function(obj: &DroppedObject) {
+    let identity = obj.object_identity.as_deref().unwrap_or("unknown");
+    let func_name = extract_function_name(identity);
+
+    let affected_pgs_ids = match StreamTableMeta::find_by_function_name(&func_name) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to query STs for dropped function {}: {}",
+                identity,
+                e,
+            );
+            return;
+        }
+    };
+
+    if affected_pgs_ids.is_empty() {
+        return;
+    }
+
+    pgrx::info!(
+        "pg_stream: function {} dropped, marking {} stream table(s) for reinit",
+        identity,
+        affected_pgs_ids.len(),
+    );
+
+    for pgs_id in &affected_pgs_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to mark ST {} for reinit after function drop: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    // Cascade
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade function drop reinit: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for pgs_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+            pgrx::warning!(
+                "pg_stream_ddl_tracker: failed to cascade function drop reinit to ST {}: {}",
+                pgs_id,
+                e,
+            );
+        }
+    }
+
+    let total = affected_pgs_ids.len() + cascade_ids.len();
+    log!(
+        "pg_stream_ddl_tracker: DROP FUNCTION {} → {} ST(s) marked for reinitialize",
+        identity,
+        total,
+    );
+
+    shmem::signal_dag_rebuild();
+    shmem::bump_cache_generation();
 }
 
 // ── Dependency queries ─────────────────────────────────────────────────────
@@ -980,5 +1168,36 @@ mod tests {
         };
         let debug = format!("{:?}", obj);
         assert!(debug.contains("public.orders"));
+    }
+
+    #[test]
+    fn test_extract_function_name_with_schema_and_args() {
+        assert_eq!(
+            extract_function_name("public.my_func(integer, text)"),
+            "my_func"
+        );
+    }
+
+    #[test]
+    fn test_extract_function_name_no_schema() {
+        assert_eq!(extract_function_name("my_func(integer)"), "my_func");
+    }
+
+    #[test]
+    fn test_extract_function_name_no_args() {
+        assert_eq!(extract_function_name("public.my_func"), "my_func");
+    }
+
+    #[test]
+    fn test_extract_function_name_bare() {
+        assert_eq!(extract_function_name("my_func"), "my_func");
+    }
+
+    #[test]
+    fn test_extract_function_name_case_insensitive() {
+        assert_eq!(
+            extract_function_name("public.MyMixedCase(INT)"),
+            "mymixedcase"
+        );
     }
 }

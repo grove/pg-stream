@@ -67,7 +67,7 @@ pub use parser::{
 use crate::error::PgStreamError;
 use crate::version::Frontier;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
@@ -97,8 +97,15 @@ thread_local! {
     /// The template is invalidated when the defining query hash changes
     /// (e.g. after `ALTER STREAM TABLE`). Stale entries for dropped STs
     /// are harmless — they'll be evicted on the next cache miss.
+    ///
+    /// Cross-session invalidation (G8.1): flushed when the shared
+    /// `CACHE_GENERATION` counter advances.
     static DELTA_TEMPLATE_CACHE: RefCell<HashMap<i64, CachedDeltaTemplate>> =
         RefCell::new(HashMap::new());
+
+    /// Local snapshot of the shared `CACHE_GENERATION` counter.
+    /// When the shared value advances past this, the entire cache is flushed.
+    static LOCAL_DELTA_CACHE_GEN: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Hash a string using the default hasher (for cache invalidation).
@@ -277,6 +284,16 @@ pub fn generate_delta_query_cached(
     pgs_name: &str,
 ) -> Result<DeltaQueryResult, PgStreamError> {
     let query_hash = hash_string(defining_query);
+
+    // G8.1: Cross-session cache invalidation — flush if the shared
+    // generation counter has advanced past our local snapshot.
+    let shared_gen = crate::shmem::current_cache_generation();
+    LOCAL_DELTA_CACHE_GEN.with(|local| {
+        if local.get() < shared_gen {
+            DELTA_TEMPLATE_CACHE.with(|cache| cache.borrow_mut().clear());
+            local.set(shared_gen);
+        }
+    });
 
     // Check the thread-local cache.
     let cached = DELTA_TEMPLATE_CACHE.with(|cache| {

@@ -37,10 +37,21 @@ pub static PGS_STATE: PgLwLock<PgStreamSharedState> = unsafe { PgLwLock::new(c"p
 pub static DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pg_stream_dag_signal") };
 
+/// Atomic generation counter for cross-session cache invalidation (G8.1).
+///
+/// Incremented by any backend that modifies stream table metadata in a way
+/// that would invalidate delta/MERGE template caches (e.g., DDL on source
+/// tables that triggers reinitialize). Each backend tracks its last-seen
+/// generation and flushes its thread-local caches when the shared value
+/// advances.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static CACHE_GENERATION: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"pg_stream_cache_gen") };
+
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
     pg_shmem_init!(DAG_REBUILD_SIGNAL);
+    pg_shmem_init!(CACHE_GENERATION);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -67,6 +78,35 @@ pub fn current_dag_version() -> u64 {
         return 0;
     }
     DAG_REBUILD_SIGNAL
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bump the shared cache generation counter.
+///
+/// Called by DDL paths that invalidate delta/MERGE template caches:
+/// - Source table DDL causing stream table reinitialize
+/// - Stream table drop
+///
+/// No-op if shared memory is not initialized.
+pub fn bump_cache_generation() {
+    if !is_shmem_available() {
+        return;
+    }
+    CACHE_GENERATION
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current shared cache generation value.
+///
+/// Backends compare this against their local generation to detect if
+/// caches need flushing.
+pub fn current_cache_generation() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    CACHE_GENERATION
         .get()
         .load(std::sync::atomic::Ordering::Relaxed)
 }

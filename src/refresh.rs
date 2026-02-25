@@ -13,7 +13,7 @@
 //! (29.6ms planning + 15ms generate_delta).
 
 use pgrx::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::time::Instant;
@@ -70,8 +70,14 @@ struct CachedMergeTemplate {
 
 thread_local! {
     /// Per-session cache of MERGE SQL templates, keyed by `pgs_id`.
+    ///
+    /// Cross-session invalidation (G8.1): flushed when the shared
+    /// `CACHE_GENERATION` counter advances.
     static MERGE_TEMPLATE_CACHE: RefCell<HashMap<i64, CachedMergeTemplate>> =
         RefCell::new(HashMap::new());
+
+    /// Local snapshot of the shared `CACHE_GENERATION` counter.
+    static LOCAL_MERGE_CACHE_GEN: Cell<u64> = const { Cell::new(0) };
 }
 
 // ── D-2: Prepared statement tracking ────────────────────────────────
@@ -848,6 +854,16 @@ pub fn execute_differential_refresh(
     let t_decision = t_decision_start.elapsed();
     let t0 = Instant::now();
 
+    // ── G8.1: Cross-session cache invalidation ──────────────────────
+    let shared_gen = crate::shmem::current_cache_generation();
+    LOCAL_MERGE_CACHE_GEN.with(|local| {
+        if local.get() < shared_gen {
+            MERGE_TEMPLATE_CACHE.with(|cache| cache.borrow_mut().clear());
+            PREPARED_MERGE_STMTS.with(|stmts| stmts.borrow_mut().clear());
+            local.set(shared_gen);
+        }
+    });
+
     // ── Try the MERGE template cache first ──────────────────────────
     let query_hash = {
         use std::hash::{Hash, Hasher};
@@ -1474,6 +1490,7 @@ mod tests {
             needs_reinit,
             auto_threshold: None,
             last_full_ms: None,
+            functions_used: None,
             frontier: None,
         }
     }
