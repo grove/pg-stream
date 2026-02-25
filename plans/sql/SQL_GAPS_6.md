@@ -223,7 +223,11 @@ the regular aggregate recognition path entirely.
 
 ## 5. Gap Category 2: Source Object Types
 
-### G2.1 — Views as Sources in DIFFERENTIAL Mode
+### G2.1 — Views as Sources in DIFFERENTIAL Mode ✅ RESOLVED
+
+> **Resolved by:** View inlining auto-rewrite (PLAN_VIEW_INLINING.md). Views are
+> transparently replaced with inline subqueries so CDC triggers land on base
+> tables. Nested views fully expanded. Original query preserved for reinit.
 
 | Field | Value |
 |-------|-------|
@@ -256,7 +260,11 @@ SELECT pgstream.create('order_summary', 'DIFFERENTIAL',
 
 ---
 
-### G2.2 — Materialized Views as Sources
+### G2.2 — Materialized Views as Sources ✅ RESOLVED
+
+> **Resolved by:** View inlining auto-rewrite (PLAN_VIEW_INLINING.md).
+> Materialized views are rejected in DIFFERENTIAL mode with a clear error.
+> Allowed in FULL mode.
 
 | Field | Value |
 |-------|-------|
@@ -768,7 +776,7 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 
 | Step | Gap | Description | Effort | Impact |
 |------|-----|-------------|--------|--------|
-| **F1** | G2.1 | Views as sources: reject views in DIFFERENTIAL with clear error | 2 hours | Prevents silent staleness |
+| ~~**F1**~~ | ~~G2.1~~ | ~~Views as sources: view inlining auto-rewrite~~ | ~~Done~~ | ~~✅ Implemented~~ |
 | **F2** | G7.1 | Volatile expressions in `Expr::Raw`: re-parse for volatility checking | 6–8 hours | Closes last silent correctness gap |
 | **F3** | G3.1 | User-defined aggregates: detect via `pg_proc.prokind` and reject | 4–6 hours | Prevents silent misclassification |
 
@@ -784,7 +792,7 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 | **F6** | G3.2 | `ANY_VALUE` aggregate (PG 16+) | 1 hour | Standard GROUP BY convenience |
 | **F7** | G5.4 | Virtual generated columns (PG 18) | 2–3 hours | Prevents wrong CDC data |
 | **F8** | G2.3 | Foreign tables: detect and reject clearly | 1 hour | Better error message |
-| **F9** | G2.2 | Materialized views: detect and reject clearly | Incl. in F1 | Better error message |
+| ~~**F9**~~ | ~~G2.2~~ | ~~Materialized views: reject in DIFFERENTIAL~~ | ~~Incl. in F1~~ | ~~✅ Implemented~~ |
 
 **Estimated effort:** 7–12 hours  
 **Value:** Covers PostgreSQL 16–18 new features and improves error clarity.

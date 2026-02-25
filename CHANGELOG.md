@@ -10,6 +10,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+#### View Inlining (G2.1)
+- **View inlining auto-rewrite** — views referenced in defining queries are
+  transparently replaced with their underlying SELECT definition as inline
+  subqueries. CDC triggers land on base tables, so DIFFERENTIAL mode works
+  correctly with views. Nested views (view → view → table) are fully expanded
+  via a fixpoint loop (max depth 10).
+- **Materialized view rejection** — materialized views (`relkind = 'm'`) are
+  rejected with a clear error in DIFFERENTIAL mode. FULL mode allows them.
+- **Foreign table rejection** — foreign tables (`relkind = 'f'`) are rejected
+  in DIFFERENTIAL mode (row-level triggers cannot be created on foreign tables).
+- **Original query preservation** — the user's original SQL (pre-inlining) is
+  stored in `pgstream.pgs_stream_tables.original_query` for reinit after view
+  changes and user introspection.
+- **View DDL hooks** — `CREATE OR REPLACE VIEW` triggers reinit of affected
+  stream tables. `DROP VIEW` sets affected stream tables to ERROR status.
+- **View dependency tracking** — views are registered as soft dependencies in
+  `pgstream.pgs_dependencies` (source_type = 'VIEW') for DDL hook lookups.
+- **E2E test suite** — 16 E2E tests covering basic view inlining, UPDATE/DELETE
+  through views, filtered views, aggregation, joins, nested views, FULL mode,
+  materialized view rejection/allowance, view replacement/drop hooks, TRUNCATE
+  propagation, column renaming, catalog verification, and dependency registration.
+
 #### SQL Feature Gaps (S1–S15)
 - **Volatile function detection (S1)** — defining queries containing volatile
   functions (e.g., `random()`, `clock_timestamp()`) are rejected in DIFFERENTIAL

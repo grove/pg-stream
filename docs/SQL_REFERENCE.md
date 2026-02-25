@@ -493,6 +493,7 @@ SELECT pgstream.create_stream_table(
 
 **Notes:**
 - The defining query is parsed into an operator tree and validated for DVM support.
+- **Views as sources** — views referenced in the defining query are automatically inlined as subqueries (auto-rewrite pass #0). CDC triggers are created on the underlying base tables. Nested views (view → view → table) are fully expanded. The user's original query is preserved in `original_query` for reinit and introspection. Materialized views are rejected in DIFFERENTIAL mode (use FULL mode or the underlying query directly). Foreign tables are also rejected in DIFFERENTIAL mode.
 - CDC triggers and change buffer tables are created automatically for each source table.
 - The ST is registered in the dependency DAG; cycles are rejected.
 - Non-recursive CTEs are inlined as subqueries during parsing (Tier 1). Multi-reference CTEs share delta computation (Tier 2).
@@ -962,6 +963,32 @@ SELECT pgstream.create_stream_table('big_customers',
   'SELECT customer_id, total FROM pgstream.order_totals WHERE total > 1000',
   '1m', 'DIFFERENTIAL');
 ```
+
+### Views as Sources in Defining Queries
+
+PostgreSQL views **can** be used as source tables in a stream table's defining query. Views are automatically **inlined** — replaced with their underlying SELECT definition as subqueries — so CDC triggers land on the actual base tables.
+
+```sql
+CREATE VIEW active_orders AS
+  SELECT * FROM orders WHERE status = 'active';
+
+-- This works in DIFFERENTIAL mode:
+SELECT pgstream.create_stream_table('order_summary',
+  'SELECT customer_id, COUNT(*) FROM active_orders GROUP BY customer_id',
+  '1m', 'DIFFERENTIAL');
+-- Internally, 'active_orders' is replaced with:
+--   (SELECT ... FROM orders WHERE status = 'active') AS active_orders
+```
+
+**Nested views** (view → view → table) are fully expanded via a fixpoint loop. **Column-renaming views** (`CREATE VIEW v(a, b) AS ...`) work correctly — `pg_get_viewdef()` produces the proper column aliases.
+
+When a view is inlined, the user's original SQL is stored in the `original_query` catalog column for reinit and introspection. The `defining_query` column contains the expanded (post-inlining) form.
+
+**DDL hooks:** `CREATE OR REPLACE VIEW` on a view that was inlined into a stream table marks that ST for reinit. `DROP VIEW` sets affected STs to ERROR status.
+
+**Materialized views** are **rejected** in DIFFERENTIAL mode — their stale-snapshot semantics prevent CDC triggers from tracking changes.  Use the underlying query directly, or switch to FULL mode. In FULL mode, materialized views are allowed (no CDC needed).
+
+**Foreign tables** are **rejected** in DIFFERENTIAL mode — row-level triggers cannot be created on foreign tables. Use FULL mode instead.
 
 ### Views on Stream Tables
 

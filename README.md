@@ -84,6 +84,8 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Grouping** | `GROUPING SETS` / `CUBE` / `ROLLUP` | ✅ Full | Auto-rewritten to `UNION ALL` of `GROUP BY` queries |
 | **Safety** | Volatile function detection | ✅ Full | Rejected in DIFFERENTIAL; warned for STABLE functions |
 | **Source tables** | Tables without primary key | ✅ Full | Content-hash row identity via all columns |
+| **Source tables** | Views as sources | ✅ Full | Auto-inlined as subqueries; CDC triggers land on base tables |
+| **Source tables** | Materialized views | ❌ DIFF / ✅ FULL | Rejected in DIFFERENTIAL (stale snapshot); allowed in FULL |
 | **Ordering** | `ORDER BY` | ⚠️ Ignored | Accepted but silently discarded; storage row order is undefined |
 | **Ordering** | `LIMIT` / `OFFSET` | ❌ Rejected | Not supported — stream tables materialize the full result set |
 
@@ -201,6 +203,7 @@ The following SQL features are **rejected with clear error messages** explaining
 
 | Feature | Reason | Suggested Rewrite |
 |---|---|---|
+| Materialized views in DIFFERENTIAL | CDC triggers cannot track `REFRESH MATERIALIZED VIEW` | Use the underlying query directly, or use FULL mode |
 | `TABLESAMPLE` | Stream tables materialize the complete result set; sampling at define-time is not meaningful | Use `WHERE random() < fraction` in the consuming query |
 | Window functions in expressions | Window functions inside `CASE`, `COALESCE`, arithmetic, etc. cannot be differentially maintained | Move window function to a separate column |
 | `LIMIT` / `OFFSET` | Stream tables materialize the full result set | Apply when querying the stream table |

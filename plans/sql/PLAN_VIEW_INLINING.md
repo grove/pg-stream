@@ -1,6 +1,6 @@
 # PLAN: View Inlining for Stream Tables
 
-**Status:** Proposed  
+**Status:** Implemented  
 **Date:** 2026-02-25  
 **Branch:** `main`  
 **Resolves:** SQL_GAPS_6 G2.1 (P0 — views as sources in DIFFERENTIAL mode)  

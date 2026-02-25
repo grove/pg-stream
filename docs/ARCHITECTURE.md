@@ -58,7 +58,7 @@ This document describes the internal architecture of pg_stream — a PostgreSQL 
 
 The public entry point for users. All operations are exposed as `#[pg_extern]` functions in the `pgstream` schema:
 
-- **create_stream_table** — Parses the defining query, builds an operator tree, creates the storage table, registers CDC slots, populates the catalog, and optionally performs an initial full refresh.
+- **create_stream_table** — Applies a chain of auto-rewrite passes (view inlining → DISTINCT ON → GROUPING SETS → scalar subquery → SubLinks in OR → multi-PARTITION BY windows), parses the defining query, builds an operator tree, creates the storage table, registers CDC slots, populates the catalog, and optionally performs an initial full refresh.
 - **alter_stream_table** — Modifies schedule, refresh mode, or status (ACTIVE/SUSPENDED).
 - **drop_stream_table** — Removes the storage table, catalog entries, and cleans up CDC slots.
 - **refresh_stream_table** — Triggers a manual refresh (same path as automatic scheduling).
@@ -87,6 +87,7 @@ erDiagram
         text pgs_name
         text pgs_schema
         text defining_query
+        text original_query "User's original SQL (pre-inlining)"
         text schedule "Duration or cron expression"
         text refresh_mode "FULL | DIFFERENTIAL"
         text status "INITIALIZING | ACTIVE | SUSPENDED | ERROR"
@@ -169,6 +170,21 @@ See ADR-001 and ADR-002 in [plans/adrs/PLAN_ADRS.md](../plans/adrs/PLAN_ADRS.md)
 ### 4. DVM Engine (`src/dvm/`)
 
 The Differential View Maintenance engine is the core of the system. It transforms the defining SQL query into an executable operator tree that can compute deltas efficiently.
+
+#### Auto-Rewrite Pipeline (`src/dvm/parser.rs`)
+
+Before the defining query is parsed into an operator tree, it passes through a chain of auto-rewrite passes that normalize SQL constructs the DVM parser doesn't handle directly:
+
+| Pass | Function | Purpose |
+|------|----------|---------|
+| #0 | `rewrite_views_inline()` | Replace view references with `(view_definition) AS alias` subqueries |
+| #1 | `rewrite_distinct_on()` | Convert `DISTINCT ON` to `ROW_NUMBER() OVER (…) = 1` window subquery |
+| #2 | `rewrite_grouping_sets()` | Decompose `GROUPING SETS` / `CUBE` / `ROLLUP` into `UNION ALL` of `GROUP BY` |
+| #3 | `rewrite_scalar_subquery_in_where()` | Convert `WHERE col > (SELECT …)` to `CROSS JOIN` |
+| #4 | `rewrite_sublinks_in_or()` | Split `WHERE a OR EXISTS (…)` into `UNION` branches |
+| #5 | `rewrite_multi_partition_windows()` | Split multiple `PARTITION BY` clauses into joined subqueries |
+
+The view inlining pass (#0) runs first so that view definitions containing DISTINCT ON, GROUPING SETS, etc. are further rewritten by downstream passes. Nested views are expanded via a fixpoint loop (max depth 10).
 
 #### Query Parser (`src/dvm/parser.rs`)
 
