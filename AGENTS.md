@@ -54,6 +54,15 @@ commands. Never commit directly to git without asking for permission.
 
 - All catalog access via `Spi::connect()`.
 - Keep SPI blocks short — no long operations while holding a connection.
+- **Always cast `name`-typed columns to `text`** when fetching into Rust
+  `String` (e.g. `n.nspname::text`). The PostgreSQL `name` type (Oid 19)
+  is not compatible with pgrx `.get::<String>()` (Oid 25).
+- Catalog lookups must handle "not found" gracefully — CTEs, subquery aliases,
+  and function-call ranges do not exist in `pg_class`. Return `Option` rather
+  than `.first().get()` which panics on empty results.
+- **Separate pure logic from SPI calls** so the decision logic can be
+  unit-tested without a PostgreSQL backend (see `classify_relkind`,
+  `strip_view_definition_suffix` for examples).
 
 ### Unsafe Code
 

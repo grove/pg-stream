@@ -49,6 +49,7 @@ test-unit:
 test-integration:
     cargo test \
         --test catalog_tests \
+        --test catalog_compat_tests \
         --test extension_tests \
         --test monitoring_tests \
         --test smoke_tests \
