@@ -188,6 +188,9 @@ fn create_stream_table_impl(
     // Extract source dependencies from the query
     let source_relids = extract_source_relations(query)?;
 
+    // F13/F14: Warn about source table edge cases
+    warn_source_table_properties(&source_relids);
+
     // Cycle detection
     check_for_cycles(&source_relids)?;
 
@@ -1256,6 +1259,73 @@ unsafe fn collect_relation_oids(
                     collect_relation_oids(cte.ctequery as *mut pg_sys::Query, relations, seen_oids);
                 }
             }
+        }
+    }
+}
+
+/// Emit warnings/info for source table edge cases (F13, F14).
+///
+/// - **Partitioned tables** (F13): Log an info message confirming that CDC
+///   triggers on the parent fire for partition-routed DML (PG 13+).
+/// - **Logical replication targets** (F14): Emit a WARNING because changes
+///   arriving via logical replication do **not** fire normal triggers, which
+///   means CDC will miss those changes.
+fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String)]) {
+    for (oid, source_type) in source_relids {
+        if source_type != "TABLE" {
+            continue;
+        }
+
+        // Resolve relkind and qualified name.
+        let relkind = Spi::get_one_with_args::<String>(
+            "SELECT relkind::text FROM pg_class WHERE oid = $1",
+            &[(*oid).into()],
+        )
+        .unwrap_or(None);
+
+        let relkind = match relkind {
+            Some(rk) => rk,
+            None => continue,
+        };
+
+        let table_name = Spi::get_one_with_args::<String>(
+            "SELECT format('%I.%I', n.nspname, c.relname) \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.oid = $1",
+            &[(*oid).into()],
+        )
+        .unwrap_or(None)
+        .unwrap_or_else(|| format!("OID {}", oid.to_u32()));
+
+        // F13: Partitioned table info
+        if relkind == "p" {
+            pgrx::info!(
+                "pg_stream: source table {} is a partitioned table. \
+                 CDC triggers on the parent fire for all DML routed to \
+                 child partitions (PostgreSQL 13+).",
+                table_name,
+            );
+        }
+
+        // F14: Logical replication target warning
+        let is_sub_target = Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(\
+                SELECT 1 FROM pg_subscription_rel WHERE srrelid = $1\
+             )",
+            &[(*oid).into()],
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        if is_sub_target {
+            pgrx::warning!(
+                "pg_stream: source table {} is a logical replication target. \
+                 Changes arriving via replication will NOT fire CDC triggers — \
+                 the stream table may become stale. Consider using \
+                 cdc_mode = 'wal' or a FULL refresh schedule.",
+                table_name,
+            );
         }
     }
 }

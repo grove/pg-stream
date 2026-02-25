@@ -372,3 +372,122 @@ async fn test_trigger_survives_source_insert_delete_cycle() {
     db.assert_st_matches_query("public.cdc_cycle_st", "SELECT id, val FROM cdc_cycle")
         .await;
 }
+
+// ── F13: Partitioned Table CDC ─────────────────────────────────────────
+
+/// Verify that CDC triggers on a partitioned parent table correctly capture
+/// DML routed to child partitions (PostgreSQL 13+).
+#[tokio::test]
+async fn test_trigger_captures_partitioned_table_dml() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Create a RANGE-partitioned table with two child partitions
+    db.execute(
+        "CREATE TABLE orders (
+            id INT NOT NULL,
+            region TEXT NOT NULL,
+            amount NUMERIC
+        ) PARTITION BY LIST (region)",
+    )
+    .await;
+    db.execute("CREATE TABLE orders_us PARTITION OF orders FOR VALUES IN ('US')")
+        .await;
+    db.execute("CREATE TABLE orders_eu PARTITION OF orders FOR VALUES IN ('EU')")
+        .await;
+
+    // Seed data into both partitions
+    db.execute("INSERT INTO orders VALUES (1, 'US', 100.00)")
+        .await;
+    db.execute("INSERT INTO orders VALUES (2, 'EU', 200.00)")
+        .await;
+
+    // Create a stream table on the partitioned parent
+    db.create_st(
+        "orders_st",
+        "SELECT id, region, amount FROM orders",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Consume initial changes
+    db.refresh_st("orders_st").await;
+
+    // Verify initial data
+    let count = db.count("public.orders_st").await;
+    assert_eq!(count, 2, "Should have 2 initial rows");
+
+    // Insert into both partitions via the parent
+    db.execute("INSERT INTO orders VALUES (3, 'US', 300.00)")
+        .await;
+    db.execute("INSERT INTO orders VALUES (4, 'EU', 400.00)")
+        .await;
+
+    // Verify changes are captured in the change buffer
+    let source_oid = db.table_oid("orders").await;
+    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let change_count: i64 = db.count(&buffer_table).await;
+    assert!(
+        change_count >= 2,
+        "Both partition-routed inserts should be captured: got {}",
+        change_count,
+    );
+
+    // Refresh and verify all 4 rows appear
+    db.refresh_st("orders_st").await;
+    let count = db.count("public.orders_st").await;
+    assert_eq!(count, 4, "Should have 4 rows after insert + refresh");
+
+    // Update a row (routed to US partition)
+    db.execute("UPDATE orders SET amount = 150.00 WHERE id = 1")
+        .await;
+    db.refresh_st("orders_st").await;
+
+    db.assert_st_matches_query("public.orders_st", "SELECT id, region, amount FROM orders")
+        .await;
+
+    // Delete from EU partition
+    db.execute("DELETE FROM orders WHERE id = 2").await;
+    db.refresh_st("orders_st").await;
+
+    let count = db.count("public.orders_st").await;
+    assert_eq!(count, 3, "Should have 3 rows after delete + refresh");
+
+    db.assert_st_matches_query("public.orders_st", "SELECT id, region, amount FROM orders")
+        .await;
+}
+
+/// Verify that FULL refresh also works with partitioned source tables.
+#[tokio::test]
+async fn test_full_refresh_partitioned_table() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE pt_full (
+            id INT NOT NULL,
+            cat TEXT NOT NULL
+        ) PARTITION BY LIST (cat)",
+    )
+    .await;
+    db.execute("CREATE TABLE pt_full_a PARTITION OF pt_full FOR VALUES IN ('A')")
+        .await;
+    db.execute("CREATE TABLE pt_full_b PARTITION OF pt_full FOR VALUES IN ('B')")
+        .await;
+
+    db.execute("INSERT INTO pt_full VALUES (1, 'A'), (2, 'B')")
+        .await;
+
+    db.create_st("pt_full_st", "SELECT id, cat FROM pt_full", "1m", "FULL")
+        .await;
+
+    db.refresh_st("pt_full_st").await;
+    let count = db.count("public.pt_full_st").await;
+    assert_eq!(count, 2, "Should have 2 rows after FULL refresh");
+
+    db.execute("INSERT INTO pt_full VALUES (3, 'A'), (4, 'B')")
+        .await;
+
+    db.refresh_st("pt_full_st").await;
+    db.assert_st_matches_query("public.pt_full_st", "SELECT id, cat FROM pt_full")
+        .await;
+}
