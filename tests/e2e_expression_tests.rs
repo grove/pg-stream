@@ -792,3 +792,188 @@ async fn test_unsupported_aggregate_works_in_full_mode() {
     let count = db.count("public.string_concat").await;
     assert_eq!(count, 2);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// F5: IS JSON Predicate (PostgreSQL 16+)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_is_json_predicate_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE json_data (id INT PRIMARY KEY, payload TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO json_data VALUES
+         (1, '{\"key\": \"value\"}'),
+         (2, 'not json'),
+         (3, '[1, 2, 3]'),
+         (4, '\"hello\"')",
+    )
+    .await;
+
+    db.create_st(
+        "json_check",
+        "SELECT id, payload, payload IS JSON AS is_json FROM json_data",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let count = db.count("public.json_check").await;
+    assert_eq!(count, 4);
+
+    // Row 1 is valid JSON
+    let is_json: bool = db
+        .query_scalar("SELECT is_json FROM public.json_check WHERE id = 1")
+        .await;
+    assert!(is_json, "JSON object string should be valid JSON");
+
+    // Row 2 is not valid JSON
+    let is_json: bool = db
+        .query_scalar("SELECT is_json FROM public.json_check WHERE id = 2")
+        .await;
+    assert!(!is_json, "'not json' should not be valid JSON");
+}
+
+#[tokio::test]
+async fn test_is_json_type_variants_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE json_types (id INT PRIMARY KEY, payload TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO json_types VALUES
+         (1, '{\"a\": 1}'),
+         (2, '[1, 2]'),
+         (3, '\"scalar\"'),
+         (4, 'bad')",
+    )
+    .await;
+
+    // IS JSON OBJECT
+    db.create_st(
+        "json_obj_test",
+        "SELECT id, payload IS JSON OBJECT AS is_obj FROM json_types",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let is_obj: bool = db
+        .query_scalar("SELECT is_obj FROM public.json_obj_test WHERE id = 1")
+        .await;
+    assert!(is_obj, "JSON object should be IS JSON OBJECT");
+    let is_obj: bool = db
+        .query_scalar("SELECT is_obj FROM public.json_obj_test WHERE id = 2")
+        .await;
+    assert!(!is_obj, "JSON array should not be IS JSON OBJECT");
+}
+
+#[tokio::test]
+async fn test_is_json_in_where_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE json_filter (id INT PRIMARY KEY, data TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO json_filter VALUES
+         (1, '{\"valid\": true}'),
+         (2, 'not json'),
+         (3, '{\"also\": \"valid\"}')",
+    )
+    .await;
+
+    db.create_st(
+        "valid_json_only",
+        "SELECT id, data FROM json_filter WHERE data IS JSON",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count = db.count("public.valid_json_only").await;
+    assert_eq!(count, 2, "Only 2 rows have valid JSON data");
+
+    // Insert new valid + invalid rows
+    db.execute("INSERT INTO json_filter VALUES (4, '{\"new\": true}'), (5, 'nope')")
+        .await;
+    db.refresh_st("valid_json_only").await;
+
+    let count = db.count("public.valid_json_only").await;
+    assert_eq!(count, 3, "Should have 3 valid JSON rows after insert");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// F10: SQL/JSON Constructors (PostgreSQL 16+)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_json_object_constructor_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
+        .await;
+    db.execute("INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25)")
+        .await;
+
+    db.create_st(
+        "user_json",
+        "SELECT id, JSON_OBJECT('name' : name, 'age' : age) AS data FROM users",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let count = db.count("public.user_json").await;
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn test_json_array_constructor_full_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE vals (id INT PRIMARY KEY, a INT, b INT, c INT)")
+        .await;
+    db.execute("INSERT INTO vals VALUES (1, 10, 20, 30)").await;
+
+    db.create_st(
+        "val_arrays",
+        "SELECT id, JSON_ARRAY(a, b, c) AS arr FROM vals",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let count = db.count("public.val_arrays").await;
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn test_json_constructors_in_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE products (id INT PRIMARY KEY, name TEXT, price NUMERIC)")
+        .await;
+    db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)")
+        .await;
+
+    db.create_st(
+        "product_json",
+        "SELECT id, JSON_OBJECT('name' : name, 'price' : price) AS data FROM products",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count = db.count("public.product_json").await;
+    assert_eq!(count, 2);
+
+    // Insert and verify differential update works
+    db.execute("INSERT INTO products VALUES (3, 'Doohickey', 29.99)")
+        .await;
+    db.refresh_st("product_json").await;
+
+    let count = db.count("public.product_json").await;
+    assert_eq!(count, 3);
+}

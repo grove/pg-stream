@@ -7238,6 +7238,155 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
         Ok(Expr::Raw(
             format!("{} COLLATE {}", arg.to_sql(), coll_name,),
         ))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonIsPredicate) } {
+        // ── F5: IS JSON predicate (PostgreSQL 16+) ──
+        // expr IS [NOT] JSON [SCALAR|ARRAY|OBJECT] [WITH UNIQUE KEYS]
+        // Note: IS NOT JSON is represented as BoolExpr(NOT) wrapping this node.
+        let jip = unsafe { &*(node as *const pg_sys::JsonIsPredicate) };
+        let arg = unsafe { node_to_expr(jip.expr)? };
+        let type_str = match jip.item_type {
+            pg_sys::JsonValueType::JS_TYPE_OBJECT => "JSON OBJECT",
+            pg_sys::JsonValueType::JS_TYPE_ARRAY => "JSON ARRAY",
+            pg_sys::JsonValueType::JS_TYPE_SCALAR => "JSON SCALAR",
+            _ => "JSON", // JS_TYPE_ANY
+        };
+        let unique = if jip.unique_keys {
+            " WITH UNIQUE KEYS"
+        } else {
+            ""
+        };
+        Ok(Expr::Raw(format!("{} IS {type_str}{unique}", arg.to_sql())))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectConstructor) } {
+        // ── F10: JSON_OBJECT('key': value, ...) ──
+        let joc = unsafe { &*(node as *const pg_sys::JsonObjectConstructor) };
+        let exprs = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(joc.exprs) };
+        let mut pairs = Vec::new();
+        for n in exprs.iter_ptr() {
+            if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_JsonKeyValue) } {
+                let kv = unsafe { &*(n as *const pg_sys::JsonKeyValue) };
+                let key = unsafe { node_to_expr(kv.key as *mut pg_sys::Node)? };
+                let val = if !kv.value.is_null() {
+                    let jve = unsafe { &*kv.value };
+                    unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
+                } else {
+                    Expr::Raw("NULL".to_string())
+                };
+                pairs.push(format!("{} : {}", key.to_sql(), val.to_sql()));
+            }
+        }
+        let mut sql = format!("JSON_OBJECT({})", pairs.join(", "));
+        if joc.absent_on_null {
+            sql.push_str(" ABSENT ON NULL");
+        }
+        unsafe { append_json_output(&mut sql, joc.output) };
+        Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayConstructor) } {
+        // ── F10: JSON_ARRAY(expr, ...) ──
+        let jac = unsafe { &*(node as *const pg_sys::JsonArrayConstructor) };
+        let exprs = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(jac.exprs) };
+        let mut elems = Vec::new();
+        for n in exprs.iter_ptr() {
+            // Elements may be JsonValueExpr or plain exprs
+            if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_JsonValueExpr) } {
+                let jve = unsafe { &*(n as *const pg_sys::JsonValueExpr) };
+                elems.push(unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }.to_sql());
+            } else {
+                elems.push(unsafe { node_to_expr(n)? }.to_sql());
+            }
+        }
+        let mut sql = format!("JSON_ARRAY({})", elems.join(", "));
+        if jac.absent_on_null {
+            sql.push_str(" ABSENT ON NULL");
+        }
+        unsafe { append_json_output(&mut sql, jac.output) };
+        Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayQueryConstructor) } {
+        // ── F10: JSON_ARRAY(SELECT ...) ──
+        let jaqc = unsafe { &*(node as *const pg_sys::JsonArrayQueryConstructor) };
+        let inner_sql = if !jaqc.query.is_null() {
+            unsafe { deparse_select_to_sql(jaqc.query)? }
+        } else {
+            "SELECT NULL".to_string()
+        };
+        let mut sql = format!("JSON_ARRAY({inner_sql})");
+        unsafe { append_json_output(&mut sql, jaqc.output) };
+        Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonParseExpr) } {
+        // ── F10: JSON('text') ──
+        let jpe = unsafe { &*(node as *const pg_sys::JsonParseExpr) };
+        let arg = if !jpe.expr.is_null() {
+            let jve = unsafe { &*jpe.expr };
+            unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
+        } else {
+            Expr::Raw("NULL".to_string())
+        };
+        let mut sql = format!("JSON({})", arg.to_sql());
+        unsafe { append_json_output(&mut sql, jpe.output) };
+        Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonScalarExpr) } {
+        // ── F10: JSON_SCALAR(value) ──
+        let jse = unsafe { &*(node as *const pg_sys::JsonScalarExpr) };
+        let arg = unsafe { node_to_expr(jse.expr as *mut pg_sys::Node)? };
+        let mut sql = format!("JSON_SCALAR({})", arg.to_sql());
+        unsafe { append_json_output(&mut sql, jse.output) };
+        Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonSerializeExpr) } {
+        // ── F10: JSON_SERIALIZE(value) ──
+        let jse = unsafe { &*(node as *const pg_sys::JsonSerializeExpr) };
+        let arg = if !jse.expr.is_null() {
+            let jve = unsafe { &*jse.expr };
+            unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
+        } else {
+            Expr::Raw("NULL".to_string())
+        };
+        let mut sql = format!("JSON_SERIALIZE({})", arg.to_sql());
+        unsafe { append_json_output(&mut sql, jse.output) };
+        Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectAgg) } {
+        // ── F10: JSON_OBJECTAGG(key: value) ──
+        // Note: This is an aggregate function in the raw parse tree.
+        // It bypasses T_FuncCall, so the DVM aggregate recognizer won't
+        // see it. Deparsed as Expr::Raw — works in FULL mode and as a
+        // passthrough expression. For correct DIFFERENTIAL aggregate
+        // handling, a dedicated AggFunc variant would be needed.
+        let joa = unsafe { &*(node as *const pg_sys::JsonObjectAgg) };
+        let mut parts = Vec::new();
+        if !joa.arg.is_null() {
+            let kv = unsafe { &*joa.arg };
+            let key = unsafe { node_to_expr(kv.key as *mut pg_sys::Node)? };
+            let val = if !kv.value.is_null() {
+                let jve = unsafe { &*kv.value };
+                unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
+            } else {
+                Expr::Raw("NULL".to_string())
+            };
+            parts.push(format!("{} : {}", key.to_sql(), val.to_sql()));
+        }
+        let mut sql = format!("JSON_OBJECTAGG({})", parts.join(", "));
+        if joa.absent_on_null {
+            sql.push_str(" ABSENT ON NULL");
+        }
+        if joa.unique {
+            sql.push_str(" WITH UNIQUE KEYS");
+        }
+        unsafe { append_json_agg_clauses(&mut sql, joa.constructor) };
+        Ok(Expr::Raw(sql))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayAgg) } {
+        // ── F10: JSON_ARRAYAGG(expr [ORDER BY ...]) ──
+        // Same aggregate caveat as JSON_OBJECTAGG above.
+        let jaa = unsafe { &*(node as *const pg_sys::JsonArrayAgg) };
+        let arg = if !jaa.arg.is_null() {
+            let jve = unsafe { &*jaa.arg };
+            unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
+        } else {
+            Expr::Raw("NULL".to_string())
+        };
+        let mut sql = format!("JSON_ARRAYAGG({})", arg.to_sql());
+        if jaa.absent_on_null {
+            sql.push_str(" ABSENT ON NULL");
+        }
+        unsafe { append_json_agg_clauses(&mut sql, jaa.constructor) };
+        Ok(Expr::Raw(sql))
     } else {
         // Catch-all: reject with clear error instead of silently producing broken SQL
         let tag = unsafe { (*node).type_ };
@@ -7245,6 +7394,67 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
             "Expression type {tag:?} is not supported in defining queries",
         )))
     }
+}
+
+/// Append a `RETURNING <type>` clause from a `JsonOutput` node to a SQL string.
+///
+/// # Safety
+/// `output` must be null or point to a valid `JsonOutput` node.
+unsafe fn append_json_output(sql: &mut String, output: *const pg_sys::JsonOutput) {
+    if output.is_null() {
+        return;
+    }
+    let out = unsafe { &*output };
+    if !out.typeName.is_null() {
+        let type_name = unsafe { deparse_typename(out.typeName) };
+        if !type_name.is_empty() && type_name != "json" && type_name != "jsonb" {
+            sql.push_str(&format!(" RETURNING {type_name}"));
+        }
+    }
+}
+
+/// Append ORDER BY and FILTER clauses from a `JsonAggConstructor` to a SQL string.
+///
+/// # Safety
+/// `constructor` must be null or point to a valid `JsonAggConstructor`.
+unsafe fn append_json_agg_clauses(
+    sql: &mut String,
+    constructor: *const pg_sys::JsonAggConstructor,
+) {
+    if constructor.is_null() {
+        return;
+    }
+    let ctor = unsafe { &*constructor };
+
+    // ORDER BY
+    let order_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(ctor.agg_order) };
+    if !order_list.is_empty() {
+        let mut order_parts = Vec::new();
+        for n in order_list.iter_ptr() {
+            if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_SortBy) } {
+                let sb = unsafe { &*(n as *const pg_sys::SortBy) };
+                if let Ok(expr) = unsafe { node_to_expr(sb.node) } {
+                    let dir = match sb.sortby_dir {
+                        pg_sys::SortByDir::SORTBY_DESC => " DESC",
+                        pg_sys::SortByDir::SORTBY_ASC => " ASC",
+                        _ => "",
+                    };
+                    let nulls = match sb.sortby_nulls {
+                        pg_sys::SortByNulls::SORTBY_NULLS_FIRST => " NULLS FIRST",
+                        pg_sys::SortByNulls::SORTBY_NULLS_LAST => " NULLS LAST",
+                        _ => "",
+                    };
+                    order_parts.push(format!("{}{dir}{nulls}", expr.to_sql()));
+                }
+            }
+        }
+        if !order_parts.is_empty() {
+            sql.push_str(&format!(" ORDER BY {}", order_parts.join(", ")));
+        }
+    }
+
+    // RETURNING
+    unsafe { append_json_output(sql, ctor.output) };
 }
 
 /// Extract operator name from an A_Expr name list.
