@@ -70,7 +70,9 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **CTEs** | Recursive `WITH RECURSIVE` | ✅ Full | Both `FULL` and `DIFFERENTIAL` modes (semi-naive + DRed) |
 | **Window functions** | `ROW_NUMBER`, `RANK`, `SUM OVER`, etc. | ✅ Full | Partition-based recomputation |
 | **Window functions** | Window frame clauses | ✅ Full | `ROWS`, `RANGE`, `GROUPS` with `BETWEEN` bounds and `EXCLUDE` |
-| **Window functions** | Named `WINDOW` clauses | ✅ Full | `WINDOW w AS (...)` resolved from query-level window definitions || **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Auto-split into joined subqueries || **LATERAL SRFs** | `jsonb_array_elements`, `unnest`, `jsonb_each`, etc. | ✅ Full | Row-scoped recomputation in DIFFERENTIAL mode |
+| **Window functions** | Named `WINDOW` clauses | ✅ Full | `WINDOW w AS (...)` resolved from query-level window definitions |
+| **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Auto-split into joined subqueries |
+| **LATERAL SRFs** | `jsonb_array_elements`, `unnest`, `jsonb_each`, etc. | ✅ Full | Row-scoped recomputation in DIFFERENTIAL mode |
 | **Expressions** | `CASE WHEN … THEN … ELSE … END` | ✅ Full | Both searched and simple CASE |
 | **Expressions** | `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` | ✅ Full | |
 | **Expressions** | `IN (list)`, `BETWEEN`, `IS DISTINCT FROM` | ✅ Full | Including `NOT IN`, `NOT BETWEEN`, `IS NOT DISTINCT FROM` |
