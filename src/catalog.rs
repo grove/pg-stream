@@ -31,6 +31,10 @@ pub struct StreamTableMeta {
     pub auto_threshold: Option<f64>,
     /// Last observed FULL refresh execution time in milliseconds.
     pub last_full_ms: Option<f64>,
+    /// Function/operator names referenced in the defining query (G8.2).
+    /// Used by DDL hooks to detect `CREATE OR REPLACE FUNCTION` / `DROP FUNCTION`
+    /// that may change the semantics of this stream table.
+    pub functions_used: Option<Vec<String>>,
     /// Serialized frontier (JSONB). None means never refreshed.
     pub frontier: Option<Frontier>,
 }
@@ -120,6 +124,7 @@ pub struct RefreshRecord {
 
 impl StreamTableMeta {
     /// Insert a new stream table record. Returns the assigned `pgs_id`.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         pgs_relid: pg_sys::Oid,
         pgs_name: &str,
@@ -128,13 +133,14 @@ impl StreamTableMeta {
         original_query: Option<&str>,
         schedule: Option<String>,
         refresh_mode: RefreshMode,
+        functions_used: Option<Vec<String>>,
     ) -> Result<i64, PgStreamError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
                     "INSERT INTO pgstream.pgs_stream_tables \
-                     (pgs_relid, pgs_name, pgs_schema, defining_query, original_query, schedule, refresh_mode) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     (pgs_relid, pgs_name, pgs_schema, defining_query, original_query, schedule, refresh_mode, functions_used) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
                      RETURNING pgs_id",
                     None,
                     &[
@@ -145,6 +151,7 @@ impl StreamTableMeta {
                         original_query.into(),
                         schedule.into(),
                         refresh_mode.as_str().into(),
+                        functions_used.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?
@@ -164,7 +171,7 @@ impl StreamTableMeta {
                     "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
-                     auto_threshold, last_full_ms \
+                     auto_threshold, last_full_ms, functions_used \
                      FROM pgstream.pgs_stream_tables \
                      WHERE pgs_schema = $1 AND pgs_name = $2",
                     None,
@@ -188,7 +195,7 @@ impl StreamTableMeta {
                     "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
-                     auto_threshold, last_full_ms \
+                     auto_threshold, last_full_ms, functions_used \
                      FROM pgstream.pgs_stream_tables \
                      WHERE pgs_relid = $1",
                     None,
@@ -212,7 +219,7 @@ impl StreamTableMeta {
                     "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
-                     auto_threshold, last_full_ms \
+                     auto_threshold, last_full_ms, functions_used \
                      FROM pgstream.pgs_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -230,6 +237,32 @@ impl StreamTableMeta {
                 }
             }
             Ok(result)
+        })
+    }
+
+    /// Find pgs_ids of stream tables whose `functions_used` array contains
+    /// the given function name (case-insensitive match via `@>`).
+    /// Used by DDL hooks to detect which STs are affected when a function
+    /// is CREATEd OR REPLACEd / ALTERed / DROPped.
+    pub fn find_by_function_name(func_name: &str) -> Result<Vec<i64>, PgStreamError> {
+        let lower = func_name.to_lowercase();
+        Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT pgs_id FROM pgstream.pgs_stream_tables \
+                     WHERE functions_used @> ARRAY[$1]::text[]",
+                    None,
+                    &[lower.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+
+            let mut ids = Vec::new();
+            for row in table {
+                if let Ok(Some(id)) = row.get::<i64>(1) {
+                    ids.push(id);
+                }
+            }
+            Ok(ids)
         })
     }
 
@@ -469,6 +502,7 @@ impl StreamTableMeta {
 
         let auto_threshold = table.get::<f64>(15).map_err(map_spi)?;
         let last_full_ms = table.get::<f64>(16).map_err(map_spi)?;
+        let functions_used = table.get::<Vec<String>>(17).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgs_id,
@@ -486,6 +520,7 @@ impl StreamTableMeta {
             needs_reinit,
             auto_threshold,
             last_full_ms,
+            functions_used,
             frontier,
         })
     }
@@ -548,6 +583,7 @@ impl StreamTableMeta {
 
         let auto_threshold = row.get::<f64>(15).map_err(map_spi)?;
         let last_full_ms = row.get::<f64>(16).map_err(map_spi)?;
+        let functions_used = row.get::<Vec<String>>(17).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgs_id,
@@ -565,6 +601,7 @@ impl StreamTableMeta {
             needs_reinit,
             auto_threshold,
             last_full_ms,
+            functions_used,
             frontier,
         })
     }

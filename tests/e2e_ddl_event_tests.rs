@@ -175,3 +175,114 @@ async fn test_rename_source_table() {
         "Refresh should fail after source table rename since defining query references old name"
     );
 }
+
+/// F18: CREATE OR REPLACE FUNCTION on a function used by a DIFFERENTIAL
+/// stream table should mark the ST for reinitialize.
+#[tokio::test]
+async fn test_function_change_marks_st_for_reinit() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Create a custom function
+    db.execute(
+        "CREATE FUNCTION evt_double(x INT) RETURNS INT AS $$ SELECT x * 2 $$ LANGUAGE SQL IMMUTABLE",
+    )
+    .await;
+
+    db.execute("CREATE TABLE evt_func_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO evt_func_src VALUES (1, 10), (2, 20)")
+        .await;
+
+    db.create_st(
+        "evt_func_st",
+        "SELECT id, evt_double(val) AS doubled FROM evt_func_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Verify initial data
+    let count = db.count("public.evt_func_st").await;
+    assert_eq!(count, 2);
+
+    // Verify functions_used was populated
+    let func_count: i64 = db
+        .query_scalar(
+            "SELECT coalesce(array_length(functions_used, 1), 0) \
+             FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_func_st'",
+        )
+        .await;
+    assert!(
+        func_count > 0,
+        "functions_used should be populated for DIFFERENTIAL STs"
+    );
+
+    // Check that evt_double is in the list
+    let has_func: bool = db
+        .query_scalar(
+            "SELECT functions_used @> ARRAY['evt_double']::text[] \
+             FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_func_st'",
+        )
+        .await;
+    assert!(has_func, "functions_used should contain 'evt_double'");
+
+    // Replace the function with a different implementation
+    db.execute(
+        "CREATE OR REPLACE FUNCTION evt_double(x INT) RETURNS INT AS $$ SELECT x * 3 $$ LANGUAGE SQL IMMUTABLE",
+    )
+    .await;
+
+    // The DDL hook should have marked the ST for reinit
+    let needs_reinit: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_func_st'",
+        )
+        .await;
+    assert!(
+        needs_reinit,
+        "ST should be marked for reinit after function replacement"
+    );
+}
+
+/// F18: DROP FUNCTION on a function used by a stream table should mark
+/// the ST for reinit.
+#[tokio::test]
+async fn test_drop_function_marks_st_for_reinit() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE FUNCTION evt_triple(x INT) RETURNS INT AS $$ SELECT x * 3 $$ LANGUAGE SQL IMMUTABLE",
+    )
+    .await;
+
+    db.execute("CREATE TABLE evt_dfunc_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO evt_dfunc_src VALUES (1, 5)").await;
+
+    db.create_st(
+        "evt_dfunc_st",
+        "SELECT id, evt_triple(val) AS tripled FROM evt_dfunc_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count = db.count("public.evt_dfunc_st").await;
+    assert_eq!(count, 1);
+
+    // Drop the function (CASCADE to avoid dependency errors)
+    let _ = db
+        .try_execute("DROP FUNCTION evt_triple(INT) CASCADE")
+        .await;
+
+    // The drop hook should have marked the ST for reinit
+    let needs_reinit: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_dfunc_st'",
+        )
+        .await;
+    assert!(
+        needs_reinit,
+        "ST should be marked for reinit after function drop"
+    );
+}

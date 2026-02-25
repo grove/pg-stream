@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS pgstream.pgs_stream_tables (
     needs_reinit    BOOLEAN NOT NULL DEFAULT FALSE,
     auto_threshold  DOUBLE PRECISION,
     last_full_ms    DOUBLE PRECISION,
+    functions_used  TEXT[],
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
