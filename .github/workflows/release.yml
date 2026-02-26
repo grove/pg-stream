@@ -178,32 +178,67 @@ jobs:
 
       - name: Configure and start PostgreSQL
         run: |
-          # Find the actual PostgreSQL config directory (handles both
-          # Debian-style /etc/postgresql/18/main and any other layout)
-          PG_CONF=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
-          if [ -z "$PG_CONF" ]; then
-            # No existing cluster — create one
-            sudo pg_createcluster ${{ env.PG_VERSION }} main --start
+          set -euo pipefail
+
+          # Ensure a cluster exists
+          if ! sudo pg_lsclusters -h 2>/dev/null | grep -q "${{ env.PG_VERSION }}"; then
+            echo "No PG ${{ env.PG_VERSION }} cluster found — creating one..."
+            sudo pg_createcluster ${{ env.PG_VERSION }} main
+          fi
+
+          # Find the config file
+          PG_CONF=$(sudo pg_conftool ${{ env.PG_VERSION }} main show data_directory 2>/dev/null | head -1 || true)
+          if [ -n "$PG_CONF" ]; then
+            PG_CONF="${PG_CONF}/postgresql.conf"
+          else
             PG_CONF=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
           fi
-          if [ -z "$PG_CONF" ]; then
-            echo "ERROR: Cannot find postgresql.conf after cluster creation"
+          if [ -z "$PG_CONF" ] || [ ! -f "$PG_CONF" ]; then
+            echo "ERROR: Cannot find postgresql.conf"
+            sudo pg_lsclusters
             exit 1
           fi
           echo "Using config: ${PG_CONF}"
+
+          # Verify the .so is installed where this cluster expects it
+          PKGLIBDIR=$(pg_config --pkglibdir)
+          echo "Extension .so files in pkglibdir:"
+          ls -la "${PKGLIBDIR}"/pg_stream* || echo "WARNING: no pg_stream .so found!"
 
           # Add shared_preload_libraries
           echo "shared_preload_libraries = 'pg_stream'" \
             | sudo tee -a "${PG_CONF}"
 
-          sudo systemctl restart postgresql@${{ env.PG_VERSION }}-main || \
-            sudo systemctl restart postgresql
+          # Start the cluster (pg_ctlcluster is more reliable than systemctl in CI)
+          sudo pg_ctlcluster ${{ env.PG_VERSION }} main start || {
+            echo "pg_ctlcluster start failed — trying systemctl..."
+            sudo systemctl start postgresql@${{ env.PG_VERSION }}-main || \
+              sudo systemctl start postgresql || true
+          }
 
-          # Wait for PostgreSQL to be ready
+          # Wait for PostgreSQL to be ready (fail if it never starts)
+          echo "Waiting for PostgreSQL to accept connections..."
+          READY=false
           for i in $(seq 1 30); do
-            if pg_isready -p 5432 2>/dev/null; then break; fi
+            if pg_isready -p 5432 2>/dev/null; then
+              READY=true
+              break
+            fi
             sleep 1
           done
+
+          if [ "$READY" != "true" ]; then
+            echo "ERROR: PostgreSQL did not become ready within 30 seconds"
+            sudo pg_lsclusters
+            # Show the log for debugging
+            PG_LOG_DIR="/var/log/postgresql"
+            if [ -d "$PG_LOG_DIR" ]; then
+              echo "=== PostgreSQL log ==="
+              sudo tail -50 "${PG_LOG_DIR}"/*.log 2>/dev/null || true
+            fi
+            exit 1
+          fi
+          echo "PostgreSQL is ready."
 
       - name: Run release smoke test
         run: |
