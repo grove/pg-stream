@@ -136,17 +136,49 @@ This creates:
 After installation, verify everything is working:
 
 ```sql
--- Check the extension is loaded
-SELECT * FROM pg_extension WHERE extname = 'pg_stream';
+-- Check the extension version
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';
 
--- Check the pgstream schema exists
-SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'pgstream';
+-- Or get a full status overview (includes version, scheduler state, stream table count)
+SELECT * FROM pgstream.pgs_status();
+```
 
--- Check GUC variables are registered
+### Inspecting the installation
+
+```sql
+-- Check the installed version
+SELECT extversion FROM pg_extension WHERE extname = 'pg_stream';
+
+-- Check which schemas were created
+SELECT schema_name
+FROM information_schema.schemata
+WHERE schema_name IN ('pgstream', 'pgstream_changes');
+
+-- Check all registered GUC variables
 SHOW pg_stream.enabled;
 SHOW pg_stream.scheduler_interval_ms;
+SHOW pg_stream.max_concurrent_refreshes;
 
--- Quick functional test
+-- Check the scheduler background worker is running
+SELECT * FROM pgstream.pgs_status();
+
+-- List all stream tables
+SELECT pgs_schema, pgs_name, status, refresh_mode, is_populated
+FROM pgstream.pgs_stream_tables;
+
+-- Check that the shared library loaded correctly
+SELECT * FROM pg_extension WHERE extname = 'pg_stream';
+
+-- Verify the catalog tables exist
+SELECT tablename
+FROM pg_tables
+WHERE schemaname = 'pgstream'
+ORDER BY tablename;
+```
+
+### Quick functional test
+
+```sql
 CREATE TABLE test_source (id INT PRIMARY KEY, val TEXT);
 INSERT INTO test_source VALUES (1, 'hello');
 
