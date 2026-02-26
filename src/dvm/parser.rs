@@ -4155,8 +4155,13 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgStreamError> {
 
     // Only handle top-level OR, or AND where one of the conjuncts is an OR with sublinks
     if boolexpr.boolop != pg_sys::BoolExprType::OR_EXPR {
-        // Check for AND with an inner OR containing sublinks
-        if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR {
+        // Check for AND with an inner OR containing sublinks.
+        // Guard: only enter the AND rewriter if the WHERE actually
+        // contains SubLink nodes, otherwise the deparse fallback
+        // drops WITH clauses and other top-level syntax.
+        if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR
+            && unsafe { node_tree_contains_sublink(select.whereClause) }
+        {
             return rewrite_and_with_or_sublinks(select, boolexpr);
         }
         return Ok(query.to_string());
