@@ -38,7 +38,7 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStr
     let OpTree::Scan {
         table_oid,
         columns,
-        pk_columns: _,
+        pk_columns,
         alias,
         ..
     } = op
@@ -63,6 +63,32 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStr
     // or all-column content hash for keyless tables — S10).
     // Always use the pre-computed pk_hash from the trigger (G-J1 optimization).
     let pk_hash_expr = "c.pk_hash".to_string();
+
+    // For the DELETE part of an UPDATE split, the __pgs_row_id must match
+    // the existing ST row, which was computed from the OLD column values.
+    // The trigger stores pk_hash from NEW values for UPDATEs, so we
+    // recompute an old-value-based hash for the DELETE branch.
+    //
+    // For PK-based tables, this is equivalent to c.pk_hash because PK
+    // columns don't typically change on UPDATE. For keyless tables, the
+    // hash includes ALL columns, which differ between OLD and NEW.
+    let hash_cols: Vec<&str> = if pk_columns.is_empty() {
+        columns.iter().map(|c| c.name.as_str()).collect()
+    } else {
+        pk_columns.iter().map(|s| s.as_str()).collect()
+    };
+    let old_hash_args: Vec<String> = hash_cols
+        .iter()
+        .map(|c| format!("c.{}::TEXT", quote_ident(&format!("old_{c}"))))
+        .collect();
+    let old_pk_hash_expr = if old_hash_args.len() == 1 {
+        format!("pgstream.pg_stream_hash({})", old_hash_args[0])
+    } else {
+        format!(
+            "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+            old_hash_args.join(", "),
+        )
+    };
 
     // Build typed column references for the raw CTE
     let mut typed_col_refs = Vec::new();
@@ -157,6 +183,7 @@ GROUP BY {pk_hash_expr}",
     let single_sql = format!(
         "\
 SELECT {pk_hash_expr} AS __pk_hash,
+       {old_pk_hash_expr} AS __pk_hash_old,
        c.action,
        c.change_id,
        {typed_col_refs_str},
@@ -176,6 +203,7 @@ WHERE {lsn_filter}",
     let multi_sql = format!(
         "\
 SELECT {pk_hash_expr} AS __pk_hash,
+       {old_pk_hash_expr} AS __pk_hash_old,
        c.action,
        c.change_id,
        {typed_col_refs_str},
@@ -206,23 +234,33 @@ SELECT * FROM {multi_cte}",
     let cte_name = ctx.next_cte_name(&format!("scan_{alias}"));
     let is_deduplicated;
 
+    // DELETE __pgs_row_id uses __pk_hash_old (computed from OLD column
+    // values) so it matches the existing ST row — critical for keyless
+    // tables where UPDATE changes ALL columns and thus the hash.
+    // INSERT __pgs_row_id uses __pk_hash (from NEW column values).
+
     let sql = if ctx.merge_safe_dedup {
         // ── Merge-safe dedup mode ──────────────────────────────────────
-        // Emit at most ONE row per PK: DELETE only for true deletes,
-        // INSERT for any row that exists after the cycle (incl. updates).
+        // Emit at most ONE row per PK: DELETE only for true deletes OR
+        // when the row ID changed (keyless table UPDATE). INSERT for any
+        // row that exists after the cycle (incl. updates).
         is_deduplicated = true;
         format!(
             "\
--- DELETE events: row existed before AND was truly deleted (not just updated)
-SELECT c.__pk_hash AS __pgs_row_id,
+-- DELETE events: row existed before AND was truly deleted, OR
+-- the row hash changed (keyless table update — old row must be removed).
+-- For PK-based tables __pk_hash_old == __pk_hash always, so the OR
+-- clause never fires → no regression.
+SELECT c.__pk_hash_old AS __pgs_row_id,
        'D'::TEXT AS __pgs_action,
        {old_col_refs}
 FROM (
-  SELECT DISTINCT ON (s.__pk_hash)
+  SELECT DISTINCT ON (s.__pk_hash_old)
          s.*
   FROM {raw_cte_name} s
-  WHERE s.__first_action != 'I' AND s.__last_action = 'D'
-  ORDER BY s.__pk_hash, s.change_id
+  WHERE s.__first_action != 'I'
+    AND (s.__last_action = 'D' OR s.__pk_hash_old != s.__pk_hash)
+  ORDER BY s.__pk_hash_old, s.change_id
 ) c
 
 UNION ALL
@@ -249,7 +287,9 @@ FROM (
             "\
 -- DELETE events: row existed before (first_action != 'I')
 -- Uses old_* columns from the earliest non-INSERT change per PK.
-SELECT c.__pk_hash AS __pgs_row_id,
+-- __pk_hash_old ensures the row_id matches the existing ST row,
+-- which is critical for keyless tables where all-column hash changes.
+SELECT c.__pk_hash_old AS __pgs_row_id,
        'D'::TEXT AS __pgs_action,
        {old_col_refs}
 FROM (
