@@ -3481,6 +3481,19 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgStreamError> {
             }
         }
         final_sets = new_final;
+
+        // Guard against combinatorial explosion: CUBE(n) produces 2^n branches,
+        // ROLLUP(n) produces n+1, combined CUBE+ROLLUP can easily exceed memory.
+        // Reject early rather than building a query too large for PG to parse (G5.2).
+        const MAX_GROUPING_BRANCHES: usize = 64;
+        if final_sets.len() > MAX_GROUPING_BRANCHES {
+            return Err(PgStreamError::QueryParseError(format!(
+                "CUBE/ROLLUP generates {} grouping set branches which exceeds the limit of {}. \
+                 Use explicit GROUPING SETS(...) to enumerate only the required combinations.",
+                final_sets.len(),
+                MAX_GROUPING_BRANCHES
+            )));
+        }
     }
 
     // Prepend plain columns to every set

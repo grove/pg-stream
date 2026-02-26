@@ -319,17 +319,23 @@ pub fn poll_wal_changes(
 /// - `table public.users: TRUNCATE: (no column data)`
 ///
 /// Returns the action character ('I', 'U', 'D', 'T') or None if not a DML line.
+///
+/// Parses the action **positionally** rather than with `contains()` to avoid
+/// false matches when a schema/table name or column value happens to contain
+/// an action keyword (G2.3).
 fn parse_pgoutput_action(data: &str) -> Option<char> {
-    if data.contains("INSERT:") {
-        Some('I')
-    } else if data.contains("UPDATE:") {
-        Some('U')
-    } else if data.contains("DELETE:") {
-        Some('D')
-    } else if data.contains("TRUNCATE:") {
-        Some('T')
-    } else {
-        None
+    // Strip the fixed "table " prefix that prefixes all DML lines.
+    let rest = data.strip_prefix("table ")?;
+    // Skip over "schema.tablename" to the first ": " separator.
+    let after_table_colon = rest.split_once(": ")?.1;
+    // The action keyword is the next token up to the next ':'.
+    let action = after_table_colon.split_once(':')?.0.trim();
+    match action {
+        "INSERT" => Some('I'),
+        "UPDATE" => Some('U'),
+        "DELETE" => Some('D'),
+        "TRUNCATE" => Some('T'),
+        _ => None,
     }
 }
 
@@ -1037,6 +1043,27 @@ mod tests {
     fn test_parse_pgoutput_commit() {
         let data = "COMMIT 12345";
         assert_eq!(parse_pgoutput_action(data), None);
+    }
+
+    #[test]
+    fn test_parse_pgoutput_table_named_insert_log() {
+        // Table named INSERT_LOG must not be misclassified (G2.3 edge case).
+        let data = "table public.INSERT_LOG: UPDATE: id[integer]:1 msg[text]:'hello'";
+        assert_eq!(parse_pgoutput_action(data), Some('U'));
+    }
+
+    #[test]
+    fn test_parse_pgoutput_column_value_contains_delete() {
+        // Column value containing "DELETE:" must not be misclassified (G2.3 edge case).
+        let data = "table audit.log: UPDATE: op[text]:'DELETE: old row' id[integer]:42";
+        assert_eq!(parse_pgoutput_action(data), Some('U'));
+    }
+
+    #[test]
+    fn test_parse_pgoutput_schema_named_insert() {
+        // Schema named "insert" must not affect action classification.
+        let data = "table insert.orders: DELETE: id[integer]:7";
+        assert_eq!(parse_pgoutput_action(data), Some('D'));
     }
 
     // ── parse_pgoutput_columns tests ───────────────────────────────

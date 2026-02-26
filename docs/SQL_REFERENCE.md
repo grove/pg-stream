@@ -1208,6 +1208,59 @@ CREATE SUBSCRIPTION my_sub
 - Do **not** install pg_stream on the subscriber and attempt to refresh the replicated table — it will have no CDC triggers or catalog entries.
 - The internal change buffer tables (`pgstream_changes.changes_<oid>`) and catalog tables are **not** published by default; subscribers only receive the final output.
 
+### Known Delta Computation Limitations
+
+The following edge cases produce incorrect delta results in DIFFERENTIAL mode under specific
+data mutation patterns. They have no effect on FULL mode.
+
+#### JOIN Key Column Change + Simultaneous Right-Side Delete
+
+When a row's join key column is updated **in the same refresh cycle** as the joined-side row is deleted,
+the delta query may fail to emit the required DELETE from the stream table:
+
+```sql
+-- Stream table joining orders with customers
+SELECT pgstream.create_stream_table('order_details',
+  'SELECT o.id, c.name FROM orders o JOIN customers c ON o.cust_id = c.id',
+  '1m', 'DIFFERENTIAL');
+
+-- Scenario that exposes the limitation:
+-- In the same transaction (or same refresh interval):
+UPDATE orders SET cust_id = 5 WHERE cust_id = 3;  -- key change
+DELETE FROM customers WHERE id = 3;               -- old join partner deleted
+-- The delta for the now-stale (orders.cust_id=3, customers.id=3) join result
+-- may not be emitted as a DELETE, leaving a stale row in the stream table
+-- until the next full refresh cycle.
+```
+
+**Root cause:** The JOIN delta query reads `current_right` (customers) after all changes are applied.
+When customer 3 is deleted before the delta runs, the DELETE half of the join cannot find its join
+partner and is silently dropped.
+
+**Mitigations:**
+- **Adaptive FULL fallback** (default): when the scheduler detects a high change volume, it switches
+  to a full recompute, which will correct any stale rows. The threshold is configurable via
+  `pg_stream.adaptive_full_threshold`.
+- **Avoid co-locating key-changing UPDATEs and DELETEs** in the same refresh interval. Stagger
+  changes across multiple refresh cycles.
+- **FULL mode** for stream tables where join key changes and right-side deletes are expected to
+  co-occur frequently.
+
+#### CUBE/ROLLUP Expansion Limit
+
+`CUBE(a, b, c...n)` on **N** columns generates $2^N$ grouping set branches (a UNION ALL of N queries).
+pg_stream rejects CUBE/ROLLUP that would produce more than **64 branches** to prevent runaway
+memory usage during query generation. Use explicit `GROUPING SETS(...)` instead:
+
+```sql
+-- Rejected: CUBE(a, b, c, d, e, f, g) would generate 128 branches
+-- Use instead:
+SELECT pgstream.create_stream_table('multi_dim',
+  'SELECT a, b, c, SUM(v) FROM t
+   GROUP BY GROUPING SETS ((a, b, c), (a, b), (a), ())',
+  '5m', 'DIFFERENTIAL');
+```
+
 ### What Is NOT Allowed
 
 | Operation | Restriction | Reason |
