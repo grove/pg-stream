@@ -299,14 +299,99 @@ Orchestrates the complete refresh cycle:
  └──────────────────────┘
 ```
 
-### 8. Scheduling (`src/scheduler.rs`)
+### 8. Background Worker & Scheduling (`src/scheduler.rs`)
+
+#### Registration & Lifecycle
+
+pg_stream registers **one PostgreSQL background worker** — the *scheduler* — during `_PG_init()` (extension load). Because it is registered at startup, `pg_stream` **must** appear in `shared_preload_libraries`, which requires a server restart.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                  PostgreSQL postmaster                           │
+│                                                                  │
+│  shared_preload_libraries = 'pg_stream'                          │
+│       │                                                          │
+│       ▼                                                          │
+│  _PG_init()                                                      │
+│    ├─ Register GUCs (pg_stream.enabled, scheduler_interval_ms …) │
+│    ├─ Register shared memory (PgStreamSharedState, atomics)      │
+│    └─ BackgroundWorkerBuilder::new("pg_stream scheduler")        │
+│         .set_start_time(RecoveryFinished)                        │
+│         .set_restart_time(5s)       ← auto-restart on crash      │
+│         .load()                                                  │
+│                                                                  │
+│  After recovery finishes:                                        │
+│       │                                                          │
+│       ▼                                                          │
+│  pg_stream_scheduler_main()         ← background worker starts   │
+│    ├─ Attach SIGHUP + SIGTERM handlers                           │
+│    ├─ Connect to SPI (database = "postgres")                     │
+│    ├─ Crash recovery: mark stale RUNNING records as FAILED       │
+│    └─ Enter main loop ─────────────────────────┐                 │
+│         │                                      │                 │
+│         ▼                                      │                 │
+│     wait_latch(scheduler_interval_ms)          │                 │
+│         │                                      │                 │
+│     ┌───▼───────────────────────────────┐      │                 │
+│     │ SIGTERM? → log + break            │      │                 │
+│     │ pg_stream.enabled = false? → skip │      │                 │
+│     │ Otherwise → scheduler tick        │      │                 │
+│     └───┬───────────────────────────────┘      │                 │
+│         │                                      │                 │
+│         └──────────── loop ────────────────────┘                 │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Key lifecycle properties:
+
+| Property | Behaviour |
+|---|---|
+| **Start condition** | After PostgreSQL recovery finishes (`RecoveryFinished`) |
+| **Auto-restart** | 5-second delay after an unexpected crash |
+| **Graceful shutdown** | Handles `SIGTERM` — breaks the main loop and exits cleanly |
+| **Config reload** | Handles `SIGHUP` — re-reads GUC values on the next latch wake |
+| **Crash recovery** | On startup, any `pgs_refresh_history` rows stuck in `RUNNING` status are marked `FAILED` (the transaction that wrote them was rolled back by PostgreSQL, but the status row may have been committed in a prior transaction) |
+| **Database** | Connects to the `postgres` database via SPI |
+
+#### Scheduler Tick
+
+Each tick of the main loop performs the following steps inside a single transaction:
+
+1. **DAG rebuild** — Compare the shared-memory `DAG_REBUILD_SIGNAL` counter against the local copy. If it advanced (a `CREATE`, `ALTER`, or `DROP` stream table occurred), rebuild the in-memory dependency graph (`StDag`) from the catalog.
+2. **Topological traversal** — Walk stream tables in dependency order (upstream before downstream). This ensures that when ST B references ST A, A is refreshed first.
+3. **Per-ST evaluation** — For each active ST:
+   - Skip if in retry backoff (exponential, per-ST).
+   - Skip if schedule/cron says not yet due.
+   - Skip if an advisory lock indicates a concurrent refresh.
+   - Check upstream change buffers for pending rows.
+4. **Execute refresh** — Acquire an advisory lock → record `RUNNING` in history → run `FULL` / `DIFFERENTIAL` / `REINITIALIZE` → store new frontier → release lock → record completion.
+5. **WAL transitions** — Advance any trigger→WAL CDC mode transitions (`src/wal_decoder.rs`).
+6. **Slot health** — Check replication slot health and emit `NOTIFY` alerts.
+7. **Prune retry state** — Remove backoff entries for STs that no longer exist.
+
+#### Sequential Processing
+
+**The scheduler processes stream tables sequentially within a single background worker.** Although `pg_stream.max_concurrent_refreshes` (default 4) exists as a GUC, it currently only prevents a manual `pgstream.refresh_stream_table()` call from overlapping with the scheduler on the *same* ST — it does not spawn additional workers. All STs are refreshed one at a time in topological order.
+
+The PostgreSQL GUC `max_worker_processes` (default 8) sets the server-wide budget for *all* background workers (autovacuum, parallel query, logical replication, extensions). pg_stream consumes **one** slot from that budget.
+
+#### Retry & Error Handling
+
+Each ST maintains an in-memory `RetryState` (reset on scheduler restart):
+
+- **Retryable errors** (SPI failures, lock contention, slot issues) trigger exponential backoff.
+- **Permanent errors** (schema mismatch, user errors) skip backoff but increment `consecutive_errors`.
+- When `consecutive_errors` reaches `pg_stream.max_consecutive_errors` (default 3), the ST is auto-suspended and a `NOTIFY` alert is emitted.
+- Schema errors additionally set `needs_reinit`, triggering a `REINITIALIZE` on the next successful cycle.
+
+#### Scheduling Policy
 
 Automatic refresh scheduling uses **canonical periods** (48·2ⁿ seconds, n = 0, 1, 2, …) snapped to the user's `schedule`:
 
 - Picks the smallest canonical period ≤ `schedule`.
 - For **DOWNSTREAM** schedule (NULL schedule), the ST refreshes only when explicitly triggered or when a downstream ST needs it.
 - Advisory locks prevent concurrent refreshes of the same ST.
-- The scheduler is driven by a background worker polling at the `pg_stream.scheduler_interval_ms` GUC interval.
+- The scheduler is driven by the background worker polling at the `pg_stream.scheduler_interval_ms` GUC interval.
 
 #### Shared Memory (`src/shmem.rs`)
 
