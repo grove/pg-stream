@@ -146,107 +146,68 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup pgrx environment
-        uses: ./.github/actions/setup-pgrx
-
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
           name: release-linux-amd64
           path: dist/
 
-      - name: Extract and install artifact
+      - name: Extract artifact
         run: |
           cd dist
           tar xzf *.tar.gz
           ARCHIVE_DIR=$(ls -d pg_stream-*-linux-amd64)
+          echo "ARCHIVE_DIR=${ARCHIVE_DIR}" >> "$GITHUB_ENV"
+          ls -la "${ARCHIVE_DIR}"/lib/ "${ARCHIVE_DIR}"/extension/
 
-          # Find PostgreSQL paths
-          SHAREDIR=$(pg_config --sharedir)
-          PKGLIBDIR=$(pg_config --pkglibdir)
-
-          # Install extension files
-          sudo cp "${ARCHIVE_DIR}"/lib/*.so "${PKGLIBDIR}/"
-          sudo cp "${ARCHIVE_DIR}"/extension/*.control "${SHAREDIR}/extension/"
-          sudo cp "${ARCHIVE_DIR}"/extension/*.sql "${SHAREDIR}/extension/"
-
-          echo "Extension files installed to:"
-          ls -la "${PKGLIBDIR}"/pg_stream*
-          ls -la "${SHAREDIR}/extension"/pg_stream*
-
-      - name: Configure and start PostgreSQL
+      - name: Build smoke-test Docker image
         run: |
-          set -euo pipefail
+          cat > dist/Dockerfile.smoketest <<'DOCKERFILE'
+          FROM postgres:18.1
+          COPY pg_stream-*/lib/*.so /usr/lib/postgresql/18/lib/
+          COPY pg_stream-*/extension/*.control /usr/share/postgresql/18/extension/
+          COPY pg_stream-*/extension/*.sql /usr/share/postgresql/18/extension/
+          DOCKERFILE
+          docker build -t pg_stream_smoketest -f dist/Dockerfile.smoketest dist/
 
-          # Ensure a cluster exists
-          if ! sudo pg_lsclusters -h 2>/dev/null | grep -q "${{ env.PG_VERSION }}"; then
-            echo "No PG ${{ env.PG_VERSION }} cluster found — creating one..."
-            sudo pg_createcluster ${{ env.PG_VERSION }} main
-          fi
+      - name: Run release smoke test
+        run: |
+          # Start PostgreSQL with the extension preloaded
+          docker run -d --name smoketest \
+            -e POSTGRES_PASSWORD=test \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            pg_stream_smoketest \
+            postgres -c "shared_preload_libraries=pg_stream"
 
-          # Find the config file
-          PG_CONF=$(sudo pg_conftool ${{ env.PG_VERSION }} main show data_directory 2>/dev/null | head -1 || true)
-          if [ -n "$PG_CONF" ]; then
-            PG_CONF="${PG_CONF}/postgresql.conf"
-          else
-            PG_CONF=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
-          fi
-          if [ -z "$PG_CONF" ] || [ ! -f "$PG_CONF" ]; then
-            echo "ERROR: Cannot find postgresql.conf"
-            sudo pg_lsclusters
-            exit 1
-          fi
-          echo "Using config: ${PG_CONF}"
-
-          # Verify the .so is installed where this cluster expects it
-          PKGLIBDIR=$(pg_config --pkglibdir)
-          echo "Extension .so files in pkglibdir:"
-          ls -la "${PKGLIBDIR}"/pg_stream* || echo "WARNING: no pg_stream .so found!"
-
-          # Add shared_preload_libraries
-          echo "shared_preload_libraries = 'pg_stream'" \
-            | sudo tee -a "${PG_CONF}"
-
-          # Start the cluster (pg_ctlcluster is more reliable than systemctl in CI)
-          sudo pg_ctlcluster ${{ env.PG_VERSION }} main start || {
-            echo "pg_ctlcluster start failed — trying systemctl..."
-            sudo systemctl start postgresql@${{ env.PG_VERSION }}-main || \
-              sudo systemctl start postgresql || true
-          }
-
-          # Wait for PostgreSQL to be ready (fail if it never starts)
-          echo "Waiting for PostgreSQL to accept connections..."
-          READY=false
+          # Wait for PostgreSQL to be ready
+          echo "Waiting for PostgreSQL..."
           for i in $(seq 1 30); do
-            if pg_isready -p 5432 2>/dev/null; then
-              READY=true
+            if docker exec smoketest pg_isready -U postgres 2>/dev/null; then
               break
             fi
             sleep 1
           done
 
-          if [ "$READY" != "true" ]; then
-            echo "ERROR: PostgreSQL did not become ready within 30 seconds"
-            sudo pg_lsclusters
-            # Show the log for debugging
-            PG_LOG_DIR="/var/log/postgresql"
-            if [ -d "$PG_LOG_DIR" ]; then
-              echo "=== PostgreSQL log ==="
-              sudo tail -50 "${PG_LOG_DIR}"/*.log 2>/dev/null || true
-            fi
+          # Verify the server started properly
+          if ! docker exec smoketest pg_isready -U postgres; then
+            echo "ERROR: PostgreSQL did not become ready"
+            docker logs smoketest
             exit 1
           fi
-          echo "PostgreSQL is ready."
 
-      - name: Run release smoke test
-        run: |
-          sudo -u postgres psql -c "CREATE EXTENSION pg_stream;"
-          sudo -u postgres psql -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';"
-          sudo -u postgres psql -c "SHOW pg_stream.enabled;"
-          sudo -u postgres psql -c "SELECT * FROM pgstream.pgs_status();"
+          # Run smoke tests
+          docker exec smoketest psql -U postgres -c "CREATE EXTENSION pg_stream;"
+          docker exec smoketest psql -U postgres -c \
+            "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';"
+          docker exec smoketest psql -U postgres -c "SHOW pg_stream.enabled;"
+          docker exec smoketest psql -U postgres -c "SELECT * FROM pgstream.pgs_status();"
+
           echo "Release smoke test passed!"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoketest 2>/dev/null || true
 
   # ── Publish GitHub Release ──────────────────────────────────────────────
   publish-release:
