@@ -178,11 +178,26 @@ jobs:
 
       - name: Configure and start PostgreSQL
         run: |
+          # Find the actual PostgreSQL config directory (handles both
+          # Debian-style /etc/postgresql/18/main and any other layout)
+          PG_CONF=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
+          if [ -z "$PG_CONF" ]; then
+            # No existing cluster — create one
+            sudo pg_createcluster ${{ env.PG_VERSION }} main --start
+            PG_CONF=$(find /etc/postgresql -name postgresql.conf 2>/dev/null | head -1)
+          fi
+          if [ -z "$PG_CONF" ]; then
+            echo "ERROR: Cannot find postgresql.conf after cluster creation"
+            exit 1
+          fi
+          echo "Using config: ${PG_CONF}"
+
           # Add shared_preload_libraries
           echo "shared_preload_libraries = 'pg_stream'" \
-            | sudo tee -a /etc/postgresql/${{ env.PG_VERSION }}/main/postgresql.conf
+            | sudo tee -a "${PG_CONF}"
 
-          sudo systemctl restart postgresql@${{ env.PG_VERSION }}-main
+          sudo systemctl restart postgresql@${{ env.PG_VERSION }}-main || \
+            sudo systemctl restart postgresql
 
           # Wait for PostgreSQL to be ready
           for i in $(seq 1 30); do
