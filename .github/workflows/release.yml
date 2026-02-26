@@ -38,6 +38,9 @@ jobs:
           - os: ubuntu-latest
             artifact_suffix: linux-amd64
             archive_ext: tar.gz
+          - os: ubuntu-24.04-arm
+            artifact_suffix: linux-arm64
+            archive_ext: tar.gz
           - os: macos-14
             artifact_suffix: macos-arm64
             archive_ext: tar.gz
@@ -146,6 +149,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
@@ -156,19 +161,18 @@ jobs:
         run: |
           cd dist
           tar xzf *.tar.gz
-          ARCHIVE_DIR=$(ls -d pg_stream-*-linux-amd64)
-          echo "ARCHIVE_DIR=${ARCHIVE_DIR}" >> "$GITHUB_ENV"
-          ls -la "${ARCHIVE_DIR}"/lib/ "${ARCHIVE_DIR}"/extension/
+          # Rename to fixed path so Dockerfile.release can reference it
+          mv pg_stream-*-linux-amd64 artifact
+          ls -la artifact/lib/ artifact/extension/
 
       - name: Build smoke-test Docker image
         run: |
-          cat > dist/Dockerfile.smoketest <<'DOCKERFILE'
-          FROM postgres:18.1
-          COPY pg_stream-*/lib/*.so /usr/lib/postgresql/18/lib/
-          COPY pg_stream-*/extension/*.control /usr/share/postgresql/18/extension/
-          COPY pg_stream-*/extension/*.sql /usr/share/postgresql/18/extension/
-          DOCKERFILE
-          docker build -t pg_stream_smoketest -f dist/Dockerfile.smoketest dist/
+          # Reuse Dockerfile.release (context = dist/, artifact/ is fixed path)
+          docker build \
+            --build-arg REPO_URL=${{ github.server_url }}/${{ github.repository }} \
+            -t pg_stream_smoketest \
+            -f cnpg/Dockerfile.release \
+            dist/
 
       - name: Run release smoke test
         run: |
@@ -247,14 +251,41 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
 
-  # ── Publish Docker image to GHCR ───────────────────────────────────────
-  publish-docker:
-    name: Publish Docker image
+  # ── Publish Docker image to GHCR (per-arch, parallel) ─────────────────
+  # Builds each arch image from the pre-built .so artifact — no Rust
+  # recompilation. amd64 and arm64 run in parallel, then a manifest is merged.
+  publish-docker-arch:
+    name: Docker image (${{ matrix.arch }})
     needs: [build-release, test-release]
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            artifact_suffix: linux-amd64
+            platform_tag: amd64
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact_suffix: linux-arm64
+            platform_tag: arm64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Download ${{ matrix.artifact_suffix }} artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ matrix.artifact_suffix }}
+          path: dist/
+
+      - name: Extract artifact
+        run: |
+          cd dist && tar xzf *.tar.gz
+          # Rename extracted dir to a fixed path for Dockerfile.release
+          mv pg_stream-*-${{ matrix.artifact_suffix }} artifact
+          ls -la artifact/lib/ artifact/extension/
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -263,42 +294,76 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.arch }} image
+        uses: docker/build-push-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # semver tags: 0.2.0 + 0.2; latest only for non-prerelease (no '-' in tag)
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          context: dist/
+          file: cnpg/Dockerfile.release
+          push: true
+          platforms: ${{ matrix.arch }}
+          build-args: |
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.platform_tag }}
           labels: |
             org.opencontainers.image.title=pg_stream
             org.opencontainers.image.description=PostgreSQL 18 with pg_stream extension (CloudNativePG-ready)
             org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Set up QEMU (for multi-arch)
-        uses: docker/setup-qemu-action@v3
+  # ── Merge per-arch images into a single multi-arch manifest ─────────────
+  publish-docker:
+    name: Publish Docker manifest
+    needs: publish-docker-arch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push multi-arch image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: cnpg/Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          build-args: |
-            REPO_URL=${{ github.server_url }}/${{ github.repository }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # annotation-index sets the OCI annotation on the multi-arch manifest
-          # index itself — this is what GHCR reads for the package page description
-          # and what links the package to the public repository (open-source advantage:
-          # free storage/bandwidth, public pull without auth, README shown on pkg page).
-          outputs: type=image,annotation-index.org.opencontainers.image.description=PostgreSQL 18 with pg_stream extension (CloudNativePG-ready)
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push multi-arch manifest
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          # Create versioned manifest (e.g. 0.1.0)
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          # Also tag major.minor (e.g. 0.1)
+          MINOR="$(echo "${VERSION}" | cut -d. -f1-2)"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${MINOR}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          # Tag latest for non-prerelease
+          if [[ "${GITHUB_REF_NAME}" != *"-"* ]]; then
+            docker buildx imagetools create \
+              --tag "${IMAGE}:latest" \
+              "${IMAGE}:${VERSION}-amd64" \
+              "${IMAGE}:${VERSION}-arm64"
+          fi
+
+          echo "Multi-arch manifest created for ${IMAGE}:${VERSION}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
