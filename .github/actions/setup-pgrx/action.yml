@@ -30,13 +30,6 @@ runs:
         # Include pgrx version in key so cache is invalidated on pgrx upgrade
         prefix-key: v0-rust-pgrx0.17
 
-    - name: Cache cargo-pgrx binary
-      id: cache-pgrx-bin
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/cargo-pgrx
-        key: cargo-pgrx-${{ runner.os }}-0.17.0
-
     - name: Cache pgrx home directory (~/.pgrx)
       id: cache-pgrx-home
       uses: actions/cache@v4
@@ -83,7 +76,6 @@ runs:
 
     # ── cargo-pgrx ────────────────────────────────────────────────────────
     - name: Install cargo-pgrx
-      if: steps.cache-pgrx-bin.outputs.cache-hit != 'true'
       shell: bash
       run: cargo install --locked cargo-pgrx --version 0.17.0
 
