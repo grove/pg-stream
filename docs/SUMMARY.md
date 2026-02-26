@@ -9,7 +9,7 @@
 - [Getting Started](GETTING_STARTED.md)
 - [SQL Reference](SQL_REFERENCE.md)
 - [Configuration](CONFIGURATION.md)
-- [Installation](../INSTALL.md)
+- [Installation](installation.md)
 
 ---
 
@@ -33,8 +33,8 @@
 # Reference
 
 - [FAQ](FAQ.md)
-- [Changelog](../CHANGELOG.md)
-- [Roadmap](../ROADMAP.md)
+- [Changelog](changelog.md)
+- [Roadmap](roadmap.md)
 
 ---
 

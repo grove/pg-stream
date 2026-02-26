@@ -42,6 +42,6 @@ SELECT count(*) FROM active_orders;  -- 1
 ## Source & releases
 
 - Repository: [github.com/grove/pg-stream](https://github.com/grove/pg-stream)
-- Install instructions: [INSTALL.md](https://github.com/grove/pg-stream/blob/main/INSTALL.md)
-- Changelog: [CHANGELOG.md](https://github.com/grove/pg-stream/blob/main/CHANGELOG.md)
-- Roadmap: [ROADMAP.md](https://github.com/grove/pg-stream/blob/main/ROADMAP.md)
+- Install instructions: [Installation](installation.md)
+- Changelog: [Changelog](changelog.md)
+- Roadmap: [Roadmap](roadmap.md)
