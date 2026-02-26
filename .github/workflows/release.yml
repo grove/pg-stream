@@ -48,7 +48,7 @@ jobs:
             artifact_suffix: windows-amd64
             archive_ext: zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup pgrx environment
         uses: ./.github/actions/setup-pgrx
@@ -149,7 +149,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
@@ -258,7 +258,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
@@ -311,7 +311,7 @@ jobs:
             artifact_suffix: linux-arm64
             platform_tag: arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download ${{ matrix.artifact_suffix }} artifact
         uses: actions/download-artifact@v4
