@@ -1,18 +1,20 @@
 # =============================================================================
 # Code Coverage Workflow
 #
-# Generates code coverage for unit tests and uploads to Codecov.
-# Manual-only. Trigger from the Actions tab.
+# Generates unit-test coverage and uploads to Codecov.
+#   push → main : automatic (src/Cargo changes only)
+#   manual       : workflow_dispatch
 # =============================================================================
 name: Coverage
 
 on:
-  workflow_dispatch:  # Manual trigger only — run from Actions tab
-  # To re-enable automatic runs, uncomment:
-  # push:
-  #   branches: [main]
-  # pull_request:
-  #   branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

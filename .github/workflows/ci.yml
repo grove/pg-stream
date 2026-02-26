@@ -1,24 +1,36 @@
 # =============================================================================
 # CI Workflow — Run the full test matrix
 #
-# Manual-only. Trigger from the Actions tab. Exercises:
-#   - Unit tests on all platforms (Linux, macOS x2, Windows)
-#   - Integration tests (testcontainers) on Linux
-#   - E2E tests (full extension in Docker) on Linux
-#   - pgrx-managed tests on Linux
-#   - Benchmarks (non-blocking) on Linux
-#   - dbt-pgstream integration tests (dbt 1.6-1.9 matrix) on Linux
-#   - CNPG smoke test (non-blocking) on Linux
+# Automatic triggers (with path filters on Rust/test files):
+#   push/PR → main : unit (Linux) + integration tests (~15 min gate)
+#   push → main    : + E2E tests, + coverage upload
+#   Weekly (Mon)   : full unit matrix (Linux + macOS), dbt, CNPG smoke
+#   Manual         : all jobs, all platforms (including Windows + benchmarks)
 # =============================================================================
 name: CI
 
 on:
-  workflow_dispatch:  # Manual trigger only — run from Actions tab
-  # To re-enable automatic runs, uncomment:
-  # push:
-  #   branches: [main]
-  # pull_request:
-  #   branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+      - '.github/actions/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+      - '.github/actions/**'
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 06:00 UTC — full matrix
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -30,9 +42,11 @@ env:
 
 jobs:
   # ── Unit tests (cross-platform) ─────────────────────────────────────────
+  # push/PR: Linux only for speed. Schedule/manual: full matrix.
   unit-tests:
     name: Unit tests (${{ matrix.artifact_suffix }})
     runs-on: ${{ matrix.os }}
+    if: matrix.os == 'ubuntu-latest' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 15
     continue-on-error: ${{ matrix.os == 'windows-2022' }}
     strategy:
@@ -79,9 +93,12 @@ jobs:
             -- --test-threads=1
 
   # ── E2E tests (full extension in Docker, Linux only) ────────────────────
+  # Skipped on PRs (takes ~20 min to build the Docker image). Runs on
+  # every push to main so a merge never goes unvalidated end-to-end.
   e2e-tests:
     name: E2E tests
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
@@ -96,9 +113,11 @@ jobs:
         run: cargo test --test 'e2e_*' -- --test-threads=1
 
   # ── Benchmarks (non-blocking, Linux only) ───────────────────────────────
+  # Expensive; run on weekly schedule and manual dispatch only.
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 20
     continue-on-error: true
     steps:
@@ -123,9 +142,11 @@ jobs:
   # Cost-optimized: single job builds the Docker image once, then tests
   # against dbt-core min (1.6) and max (1.9). Intermediate versions are
   # skipped — if both boundary versions pass, the middle ones will too.
+  # Runs on weekly schedule and manual dispatch only (slow Docker build).
   dbt-integration:
     name: dbt integration
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -214,9 +235,11 @@ jobs:
         run: docker rm -f pgstream-dbt-test 2>/dev/null || true
 
   # ── CloudNativePG smoke test (non-blocking, Linux only) ─────────────────
+  # Runs on weekly schedule and manual dispatch only (requires kind cluster).
   cnpg-smoke-test:
     name: CNPG smoke test
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 15
     continue-on-error: true
     steps:
