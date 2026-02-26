@@ -498,6 +498,29 @@ All GUCs are `SUSET` context (superuser SET) and take effect without restart, ex
 
 ## Troubleshooting
 
+### Unit tests crash with `symbol not found in flat namespace` on macOS 26+
+
+macOS 26 (Tahoe) changed the dynamic linker (`dyld`) to eagerly resolve all
+flat-namespace symbols at binary load time. pgrx extensions link PostgreSQL
+server symbols (e.g. `CacheMemoryContext`, `SPI_connect`) with
+`-Wl,-undefined,dynamic_lookup`, which previously resolved lazily. Since
+`cargo test --lib` runs outside the postgres process, those symbols are
+missing and the test binary aborts:
+
+```
+dyld[66617]: symbol not found in flat namespace '_CacheMemoryContext'
+```
+
+**Use `just test-unit`** — it automatically detects macOS 26+ and injects a
+stub library (`libpg_stub.dylib`) via `DYLD_INSERT_LIBRARIES`. The stub
+provides NULL/no-op definitions for the ~28 PostgreSQL symbols; they are never
+called during unit tests (pure Rust logic only).
+
+This does **not** affect integration tests, E2E tests, `just lint`,
+`just build`, or the extension running inside PostgreSQL.
+
+See the [Installation Guide](../INSTALL.md#unit-tests-crash-on-macos-26-symbol-not-found-in-flat-namespace) for details and manual usage.
+
 ### My stream table is stuck in INITIALIZING status
 
 The initial full refresh may have failed. Check:

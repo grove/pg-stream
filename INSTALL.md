@@ -180,6 +180,47 @@ Remove `pg_stream` from `shared_preload_libraries` in `postgresql.conf` and rest
 
 ## Troubleshooting
 
+### Unit tests crash on macOS 26+ (`symbol not found in flat namespace`)
+
+macOS 26 (Tahoe) changed `dyld` to eagerly resolve all flat-namespace symbols
+at binary load time. pgrx extensions reference PostgreSQL server-internal
+symbols (e.g. `CacheMemoryContext`, `SPI_connect`) via the
+`-Wl,-undefined,dynamic_lookup` linker flag. These symbols are normally
+provided by the `postgres` executable when the extension is loaded as a shared
+library — but for `cargo test --lib` there is no postgres process, so the test
+binary aborts immediately:
+
+```
+dyld[66617]: symbol not found in flat namespace '_CacheMemoryContext'
+```
+
+**This affects local development only** — integration tests, E2E tests, and the
+extension itself running inside PostgreSQL are unaffected.
+
+The fix is built into the `just test-unit` recipe. It automatically:
+
+1. Compiles a tiny C stub library (`scripts/pg_stub.c` → `target/libpg_stub.dylib`)
+   that provides NULL/no-op definitions for the ~28 PostgreSQL symbols.
+2. Compiles the test binary with `--no-run`.
+3. Runs the binary with `DYLD_INSERT_LIBRARIES` pointing to the stub.
+
+The stub is only built on macOS 26+. On Linux or older macOS, `just test-unit`
+runs `cargo test --lib` directly with no changes.
+
+> **Note:** The stub symbols are never called — unit tests exercise pure Rust
+> logic only. If a test accidentally calls a PostgreSQL function it will crash
+> with a NULL dereference (the desired fail-fast behavior).
+
+If you run unit tests without `just` (e.g. directly via `cargo test --lib`),
+you can use the wrapper script instead:
+
+```bash
+./scripts/run_unit_tests.sh pg18
+
+# With test name filter:
+./scripts/run_unit_tests.sh pg18 -- test_parse_basic
+```
+
 ### Extension fails to load
 
 Ensure `shared_preload_libraries = 'pg_stream'` is set and PostgreSQL has been **restarted** (not just reloaded). The extension requires shared memory initialization at startup.
