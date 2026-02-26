@@ -3,6 +3,12 @@
 > **Last updated:** 2026-02-26
 > **Current version:** 0.1.0 (pre-release)
 
+For a concise description of what pg_stream is and why it exists, read
+[ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
+MATERIALIZED VIEW` recomputation), how the differential dataflow approach
+solves it, the hybrid trigger→WAL CDC architecture, and the broad SQL
+coverage, all in plain language.
+
 ---
 
 ## Overview
@@ -34,6 +40,17 @@ scheduling, monitoring, dbt macro package, and 1,300+ tests.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full feature list.
 
+### Late additions (pre-March 1st)
+
+Low-risk, high-value items pulled forward from v0.2.0:
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| F4 | WAL decoder: pgoutput message parsing edge cases | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.3 |
+| F7 | Document JOIN key column change limitations | 1–2h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.2 |
+| F11 | Keyless table duplicate-rows: document known behavior | 1h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G7.1 |
+| F14 | CUBE explosion guard (reject oversized CUBE grouping sets) | 1h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G5.2 |
+
 ---
 
 ## v0.2.0 — Correctness & Stability
@@ -49,24 +66,26 @@ coverage.
 | F1 | DELETE+INSERT merge strategy double-evaluation guard | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G1.1 (P0) |
 | F2 | WAL decoder: keyless-table pk_hash computation | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.1 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | F3 | WAL decoder: old_* column population for UPDATEs | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.2 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| F4 | WAL decoder: pgoutput message parsing edge cases | 3–5h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.3 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | F5 | JOIN key column change detection in delta SQL | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.1 (P1) |
 | F6 | ALTER TYPE / ALTER POLICY DDL tracking | 3–5h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G9.1 (P1) |
-| F7 | Document JOIN key change limitations | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.2 (P1) |
 
-> **Subtotal: 22–33 hours**
+> **Subtotal: 17–25 hours** (F4 and F7 moved to v0.1.0)
 
 ### Tier 1 — Verification
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| F8–F12 | Window partition key E2E, recursive CTE monotonicity audit, PgBouncer compatibility docs, CDC edge cases | 17–24h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G5–G9 |
+| F8–F10, F12 | Window partition key E2E, recursive CTE monotonicity audit, ALTER DOMAIN tracking, PgBouncer compatibility docs | 16–23h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G5–G9 |
+
+> F11 (keyless table duplicate-rows documentation) moved to v0.1.0.
 
 ### Tier 2 — Robustness
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| F13–F16 | LIMIT-in-subquery warning, CUBE explosion guard, read replica detection, SPI error classification | 7–9h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G2, G6, G8 |
+| F13, F15–F16 | LIMIT-in-subquery warning, RANGE_AGG recognition, read replica detection, SPI error classification | 6–8h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G2, G5, G6, G8 |
+
+> F14 (CUBE explosion guard) moved to v0.1.0.
 
 ### Tier 3 — Test coverage
 
@@ -74,7 +93,7 @@ coverage.
 |------|-------------|--------|-----|
 | F17–F26 | 21 aggregate differential E2E, FULL JOIN E2E, INTERSECT/EXCEPT pairs, GUC variation tests, CI combined coverage | 29–38h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G7 · [STATUS_TESTING.md](plans/testing/STATUS_TESTING.md) |
 
-> **v0.2.0 total: ~75–104 hours**
+> **v0.2.0 total: ~68–94 hours** (F4, F7, F11, F14 moved to v0.1.0)
 
 **Exit criteria:**
 - [ ] Zero P0 gaps
