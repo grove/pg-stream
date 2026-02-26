@@ -22,11 +22,11 @@ and beyond.
  We are here
      │
      ▼
- ┌─────────┐   ┌─────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
- │  0.1.0  │──▶│  0.2.0  │──▶│  0.3.0   │──▶│  1.0.0   │──▶│  1.x+    │
- │ Pre-    │   │ Correct-│   │ Prod-    │   │ Stable   │   │ Scale &  │
- │ release │   │ ness    │   │ ready    │   │ Release  │   │ Ecosystem│
- └─────────┘   └─────────┘   └──────────┘   └──────────┘   └──────────┘
+ ┌─────────┐   ┌─────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+ │  0.1.0  │──▶│  0.2.0  │──▶│  0.3.0   │──▶│  0.4.0   │──▶│  1.0.0   │──▶│  1.x+    │
+ │ Pre-    │   │ Correct-│   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
+ │ release │   │ ness    │   │ ready    │   │ ability  │   │ Release  │   │ Ecosystem│
+ └─────────┘   └─────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
 ```
 
 ---
@@ -146,10 +146,42 @@ milestone.
 
 ---
 
+## v0.4.0 — Observability & Integration
+
+**Goal:** Prometheus/Grafana observability, dbt-pgstream formal release,
+complete documentation review, and validated upgrade path. After this
+milestone the product is externally visible and monitored.
+
+### Observability
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
+| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+
+### Integration & Release prep
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| R5 | dbt-pgstream 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgstream/](dbt-pgstream/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
+| R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
+| O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 · [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
+
+> **v0.4.0 total: ~18–27 hours**
+
+**Exit criteria:**
+- [ ] Grafana dashboard published
+- [ ] dbt-pgstream 0.1.0 on PyPI
+- [ ] `ALTER EXTENSION pg_stream UPDATE` tested (`0.3.0 → 0.4.0`)
+- [ ] All public documentation current and reviewed
+
+---
+
 ## v1.0.0 — Stable Release
 
-**Goal:** First officially supported release. Semantic versioning begins.
-API and catalog schema are considered stable.
+**Goal:** First officially supported release. Semantic versioning locks in.
+API, catalog schema, and GUC names are considered stable. Focus is
+distribution — getting pg_stream onto package registries.
 
 ### Release engineering
 
@@ -159,25 +191,14 @@ API and catalog schema are considered stable.
 | R2 | PGXN / apt / rpm packaging | 8–12h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
 | R3 | Docker Hub official image (PostgreSQL 18 + pg_stream) | 4–6h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
 | R4 | CNPG operator hardening | 4–6h | [cnpg/](cnpg/) |
-| R5 | dbt-pgstream 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgstream/](dbt-pgstream/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
-| R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
 
-### Observability
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
-| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
-
-> **v1.0.0 total: ~32–48 hours**
+> **v1.0.0 total: ~18–27 hours**
 
 **Exit criteria:**
 - [ ] Published on PGXN and Docker Hub
-- [ ] dbt-pgstream 0.1.0 on PyPI
-- [ ] Grafana dashboard available
 - [ ] CNPG cluster-example.yaml validated
-- [ ] Upgrade path from v0.3.0 tested
-- [ ] All documentation current
+- [ ] Upgrade path from v0.4.0 tested
+- [ ] Semantic versioning policy in effect
 
 ---
 
@@ -217,10 +238,11 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 | Milestone | Effort estimate | Cumulative |
 |-----------|-----------------|------------|
-| v0.2.0 — Correctness | 75–104h | 75–104h |
-| v0.3.0 — Production ready | 40–58h | 115–162h |
-| v1.0.0 — Stable release | 32–48h | 147–210h |
-| Post-1.0 (ecosystem) | 88–134h | 235–344h |
+| v0.2.0 — Correctness | 68–94h | 68–94h |
+| v0.3.0 — Production ready | 40–58h | 108–152h |
+| v0.4.0 — Observability & Integration | 18–27h | 126–179h |
+| v1.0.0 — Stable release | 18–27h | 144–206h |
+| Post-1.0 (ecosystem) | 88–134h | 232–340h |
 | Post-1.0 (scale) | 6+ months | — |
 
 ---

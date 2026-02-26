@@ -8,9 +8,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+#### WAL Decoder pgoutput Action Parsing (F4 / G2.3)
+- **Positional action parsing** — `parse_pgoutput_action()` previously used
+  `data.contains("INSERT:")` etc., which would misclassify events when a
+  schema name, table name, or column value contained an action keyword (e.g.,
+  a table named `INSERT_LOG` or a text value `"DELETE: old row"`).
+  Replaced with positional parsing: strip `"table "` prefix, skip
+  `schema.table: `, then match the action keyword before the next `:`.
+- 3 new unit tests covering the edge cases.
+
 ### Added
 
-#### JSON_ARRAYAGG / JSON_OBJECTAGG Aggregate Recognition (F11)
+#### CUBE / ROLLUP Combinatorial Explosion Guard (F14 / G5.2)
+- **Branch limit guard** — `CUBE(n)` on *N* columns generates $2^N$ `UNION ALL`
+  branches. Large CUBEs would silently produce memory-exhausting query trees.
+  `rewrite_grouping_sets()` now rejects CUBE/ROLLUP combinations that would
+  expand beyond **64 branches**, emitting a clear error that directs users to
+  explicit `GROUPING SETS(...)`.
+
+#### Documentation: Known Delta Computation Limitations (F7 / F11)
+- **JOIN key change + simultaneous right-side delete** — documented in
+  `docs/SQL_REFERENCE.md` § "Known Delta Computation Limitations" with a
+  concrete SQL example, root-cause explanation, and three mitigations
+  (adaptive FULL fallback, staggered changes, FULL mode).
+- **Keyless table duplicate-row limitation** — the "Tables Without Primary
+  Keys" section now includes a `> Limitation` callout explaining that rows
+  with identical content produce the same content hash, causing INSERT
+  deduplication and ambiguous DELETE matching. Recommends adding a surrogate
+  PK or UNIQUE constraint.
 - **SQL-standard JSON aggregate recognition** — `JSON_ARRAYAGG(expr ...)` and
   `JSON_OBJECTAGG(key: value ...)` are now recognized as first-class DVM
   aggregates with the group-rescan strategy. Previously treated as opaque raw

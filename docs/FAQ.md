@@ -574,6 +574,10 @@ Internally, `NATURAL JOIN` is converted to an explicit `JOIN ... ON` before the 
 
 `GROUPING SETS`, `CUBE`, and `ROLLUP` are **now fully supported** via an automatic parse-time rewrite. pg_stream decomposes these constructs into a `UNION ALL` of separate `GROUP BY` queries before the DVM engine processes the query.
 
+> **Explosion guard:** `CUBE(N)` generates $2^N$ branches. pg_stream rejects
+> CUBE/ROLLUP combinations that would produce more than **64 branches** to
+> prevent runaway memory usage. Use explicit `GROUPING SETS(...)` instead.
+
 For example:
 ```sql
 -- This defining query:
