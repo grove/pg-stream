@@ -245,18 +245,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract version from tag
-        id: version
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # semver tags: 0.2.0 + 0.2; latest only for non-prerelease (no '-' in tag)
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=pg_stream
+            org.opencontainers.image.description=PostgreSQL 18 with pg_stream extension (CloudNativePG-ready)
+            org.opencontainers.image.licenses=Apache-2.0
 
       - name: Set up QEMU (for multi-arch)
         uses: docker/setup-qemu-action@v3
@@ -273,14 +282,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             REPO_URL=${{ github.server_url }}/${{ github.repository }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          labels: |
-            org.opencontainers.image.title=pg_stream
-            org.opencontainers.image.description=PostgreSQL 18 with pg_stream extension
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # annotation-index sets the OCI annotation on the multi-arch manifest
+          # index itself — this is what GHCR reads for the package page description
+          # and what links the package to the public repository (open-source advantage:
+          # free storage/bandwidth, public pull without auth, README shown on pkg page).
+          outputs: type=image,annotation-index.org.opencontainers.image.description=PostgreSQL 18 with pg_stream extension (CloudNativePG-ready)
           cache-from: type=gha
           cache-to: type=gha,mode=max

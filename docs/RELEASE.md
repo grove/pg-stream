@@ -75,7 +75,25 @@ build-release (linux, macos, windows)  ──►  test-release  ──►  publi
                                                            ──►  publish-docker
 ```
 
-### 7. Verify the release
+### 7. Make the GHCR package public (first release only)
+
+When a package is pushed to GHCR for the first time it is **private** by
+default. Because this is an open-source project, packages linked to the
+public repository inherit public visibility — but you must make the package
+public once to unlock that:
+
+1. Go to **github.com/⟨owner⟩ → Packages → pg_stream**
+2. Click **Package settings**
+3. Scroll to **Danger Zone** → **Change package visibility** → set to **Public**
+
+After that first change:
+- All future pushes keep the package public automatically
+- Unauthenticated `docker pull ghcr.io/grove/pg_stream:...` works
+- Storage and bandwidth are free (GHCR open-source advantage)
+- The package page shows the README, linked repository, license, and
+  description from the OCI labels
+
+### 8. Verify the release
 
 Once the workflow completes:
 
