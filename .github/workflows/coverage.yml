@@ -41,7 +41,13 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      - name: Build pg_stub for LD_PRELOAD
+        run: |
+          cc -shared -fPIC -o target/libpg_stub.so scripts/pg_stub.c
+
       - name: Generate coverage (unit tests)
+        env:
+          LD_PRELOAD: ${{ github.workspace }}/target/libpg_stub.so
         run: |
           mkdir -p coverage
           cargo llvm-cov clean --workspace

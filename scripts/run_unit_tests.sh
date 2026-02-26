@@ -1,87 +1,95 @@
 #!/usr/bin/env bash
-# scripts/run_unit_tests.sh — Run unit tests on macOS 26+ with pg_stub
+# scripts/run_unit_tests.sh — Run unit tests with pg_stub preloaded
 #
-# macOS 26 (Tahoe) changed dyld to eagerly resolve all flat-namespace symbols
-# at binary load time.  pgrx extensions reference PostgreSQL server symbols
-# (e.g. CacheMemoryContext, SPI_connect) that are only available inside the
+# pgrx extensions reference PostgreSQL server symbols (e.g.
+# CurrentMemoryContext, SPI_connect) that are only available inside the
 # postgres process.  Pure-Rust unit tests never call those symbols, but the
-# test binary still links them — which crashes on load.
+# test binary still links them.
 #
-# Workaround:
-#   1. Compile a tiny C stub library (libpg_stub.dylib) that provides
-#      NULL/no-op definitions for every PostgreSQL symbol.
+# On macOS 26+ (Tahoe) dyld eagerly resolves all flat-namespace symbols at
+# load time, causing an immediate crash.  On newer Linux toolchains the
+# linker may use --no-as-needed / -z now, which has the same effect.
+#
+# Workaround (all platforms):
+#   1. Compile a tiny C stub library that provides NULL/no-op definitions
+#      for every PostgreSQL symbol the binary references.
 #   2. Compile the test binary with `--no-run`.
-#   3. Run the binary with DYLD_INSERT_LIBRARIES pointing to the stub.
-#
-# On Linux (or older macOS where the original lazy binding still works),
-# we skip the stub and run `cargo test` directly.
+#   3. Run the binary with LD_PRELOAD (Linux) or DYLD_INSERT_LIBRARIES
+#      (macOS) pointing to the stub.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 STUB_SRC="$SCRIPT_DIR/pg_stub.c"
-STUB_LIB="$PROJECT_DIR/target/libpg_stub.dylib"
 FEATURES="${1:-pg18}"
 
-# ── Helper: needs_stub ────────────────────────────────────────────────────
-needs_stub() {
-    [[ "$(uname)" == "Darwin" ]] || return 1
-
-    # Detect macOS major version (26 = Tahoe).  Versions ≥ 26 need the stub.
-    local macos_ver
-    macos_ver="$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)"
-    [[ "${macos_ver:-0}" -ge 26 ]]
-}
+OS="$(uname)"
+case "$OS" in
+    Darwin)
+        STUB_LIB="$PROJECT_DIR/target/libpg_stub.dylib"
+        STUB_CC_FLAGS="-shared -install_name @rpath/libpg_stub.dylib"
+        PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
+        ;;
+    *)
+        STUB_LIB="$PROJECT_DIR/target/libpg_stub.so"
+        STUB_CC_FLAGS="-shared -fPIC"
+        PRELOAD_VAR="LD_PRELOAD"
+        ;;
+esac
 
 # ── Helper: ensure_stub ───────────────────────────────────────────────────
 ensure_stub() {
     if [[ ! -f "$STUB_LIB" ]] || [[ "$STUB_SRC" -nt "$STUB_LIB" ]]; then
-        echo "Building libpg_stub.dylib ..."
+        echo "Building $(basename "$STUB_LIB") ..."
         mkdir -p "$(dirname "$STUB_LIB")"
-        cc -shared -o "$STUB_LIB" "$STUB_SRC" \
-           -install_name @rpath/libpg_stub.dylib 2>&1
+        # shellcheck disable=SC2086
+        cc $STUB_CC_FLAGS -o "$STUB_LIB" "$STUB_SRC" 2>&1
     fi
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────
 cd "$PROJECT_DIR"
 
-if needs_stub; then
-    ensure_stub
+ensure_stub
 
-    # Compile test binary without running it and capture the executable path.
-    # cargo prints: "Executable unittests src/lib.rs (target/debug/deps/pg_stream-HASH)"
-    echo "Compiling unit tests ..."
-    CARGO_OUTPUT=$(cargo test --lib --features "$FEATURES" --no-run 2>&1)
-    echo "$CARGO_OUTPUT"
+# Compile test binary without running it and capture the executable path.
+echo "Compiling unit tests ..."
+CARGO_OUTPUT=$(cargo test --lib --features "$FEATURES" --no-run 2>&1)
+echo "$CARGO_OUTPUT"
 
-    # Extract the binary path from cargo output
-    TEST_BIN=$(echo "$CARGO_OUTPUT" \
-               | grep -oE 'target/debug/deps/pg_stream-[a-f0-9]+' \
-               | head -1)
+# Extract the binary path from cargo output.
+# cargo prints: "Executable unittests src/lib.rs (target/debug/deps/pg_stream-HASH)"
+TEST_BIN=$(echo "$CARGO_OUTPUT" \
+           | grep -oE 'target/debug/deps/pg_stream-[a-f0-9]+' \
+           | head -1)
 
-    if [[ -n "$TEST_BIN" ]]; then
-        TEST_BIN="$PROJECT_DIR/$TEST_BIN"
-    fi
+if [[ -n "$TEST_BIN" ]]; then
+    TEST_BIN="$PROJECT_DIR/$TEST_BIN"
+fi
 
-    if [[ -z "$TEST_BIN" ]] || [[ ! -x "$TEST_BIN" ]]; then
-        # Fallback: pick the newest executable pg_stream- binary
+if [[ -z "${TEST_BIN:-}" ]] || [[ ! -x "$TEST_BIN" ]]; then
+    # Fallback: pick the newest executable pg_stream- binary
+    if [[ "$OS" == "Darwin" ]]; then
         TEST_BIN=$(find "$PROJECT_DIR/target/debug/deps" \
                         -maxdepth 1 -name 'pg_stream-*' -type f -perm +111 \
                         2>/dev/null \
                    | xargs ls -t 2>/dev/null \
                    | head -1)
+    else
+        TEST_BIN=$(find "$PROJECT_DIR/target/debug/deps" \
+                        -maxdepth 1 -name 'pg_stream-*' -type f -executable \
+                        2>/dev/null \
+                   | xargs ls -t 2>/dev/null \
+                   | head -1)
     fi
-
-    if [[ -z "$TEST_BIN" ]]; then
-        echo "ERROR: Could not find the test binary in target/debug/deps/" >&2
-        exit 1
-    fi
-
-    echo "Running: $(basename "$TEST_BIN") (with libpg_stub.dylib)"
-    DYLD_INSERT_LIBRARIES="$STUB_LIB" "$TEST_BIN" "${@:2}"
-else
-    # Linux or older macOS — standard path
-    cargo test --lib --features "$FEATURES" "${@:2}"
 fi
+
+if [[ -z "${TEST_BIN:-}" ]]; then
+    echo "ERROR: Could not find the test binary in target/debug/deps/" >&2
+    exit 1
+fi
+
+echo "Running: $(basename "$TEST_BIN") (with $(basename "$STUB_LIB"))"
+export "$PRELOAD_VAR"="$STUB_LIB"
+"$TEST_BIN" "${@:2}"

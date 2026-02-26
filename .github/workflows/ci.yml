@@ -63,7 +63,12 @@ jobs:
       - name: Setup pgrx environment
         uses: ./.github/actions/setup-pgrx
 
-      - name: Run unit tests
+      - name: Run unit tests (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: ./scripts/run_unit_tests.sh pg18
+
+      - name: Run unit tests (Windows)
+        if: runner.os == 'Windows'
         run: cargo test --lib --features pg18
 
   # ── Integration tests (testcontainers, Linux only) ──────────────────────
