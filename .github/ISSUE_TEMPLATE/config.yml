@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question / discussion
+    url: https://github.com/grove/pg-stream/discussions
+    about: Ask questions, share ideas, or discuss pg_stream use-cases
+  - name: Security vulnerability
+    url: https://github.com/grove/pg-stream/security/advisories/new
+    about: Report a security issue privately (do not use public issues)

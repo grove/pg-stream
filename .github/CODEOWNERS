@@ -1,0 +1,24 @@
+# CODEOWNERS — auto-assign reviewers to pull requests.
+#
+# Syntax: <pattern> <@user> [<@user> ...]
+# The last matching pattern takes precedence.
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: all files require review from a core maintainer
+*                           @grove @BaardBouvet
+
+# Core Rust extension
+src/                        @grove @BaardBouvet
+Cargo.toml                  @grove @BaardBouvet
+
+# CI / release infrastructure
+.github/                    @grove @BaardBouvet
+justfile                    @grove @BaardBouvet
+
+# dbt macro package
+dbt-pgstream/               @grove @BaardBouvet
+
+# Documentation — lighter touch, any maintainer can approve
+docs/                       @grove
+*.md                        @grove
+plans/                      @grove

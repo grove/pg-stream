@@ -1,0 +1,51 @@
+# =============================================================================
+# Security Audit — free for public repositories.
+#
+# Runs cargo-audit to check all Cargo dependencies against the RustSec
+# Advisory Database (https://rustsec.org/) for known CVEs.
+#
+# Results are uploaded as SARIF so they appear in Security > Code scanning.
+#
+# Runs on: pushes to main that touch dependencies, every PR, and weekly.
+# =============================================================================
+name: Security audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+  schedule:
+    # Weekly on Monday at 08:00 UTC — catches newly published advisories
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+  security-events: write  # upload SARIF to Code scanning tab
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --features sarif
+
+      - name: Run cargo audit
+        run: cargo audit --file Cargo.lock --json | cargo-audit sarif > audit.sarif
+        continue-on-error: true  # upload SARIF even on findings
+
+      - name: Upload SARIF to Code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: audit.sarif
+          category: cargo-audit
