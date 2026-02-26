@@ -1,3 +1,10 @@
 [target.'cfg(target_os="macos")']
 # Postgres symbols won't be available until runtime
 rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
+
+[target.'cfg(target_os="linux")']
+# Postgres symbols (SPI_connect, CurrentMemoryContext, etc.) are provided by
+# the postgres executable at runtime when the .so is loaded. For cargo test
+# --lib (which builds a standalone executable), lld rejects undefined symbols
+# at link time. Tell lld to defer resolution, mirroring macOS dynamic_lookup.
+rustflags = ["-Clink-arg=-Wl,--unresolved-symbols=ignore-all"]
