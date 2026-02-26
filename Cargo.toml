@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "Streaming Stream Tables for PostgreSQL 18 with differential view maintenance"
 license = "Apache-2.0"
+repository = "https://github.com/grove/pg-stream"
+homepage = "https://github.com/grove/pg-stream"
+readme = "README.md"
+keywords = ["postgresql", "streaming", "materialized-view", "incremental", "pgrx"]
+categories = ["database"]
 
 # Allow pgrx internal cfg values used by pg_shmem_init! macro
 [lints.rust]

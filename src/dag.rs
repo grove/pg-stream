@@ -323,8 +323,10 @@ impl StDag {
                 let node = &self.nodes[&id];
                 if let Some(tl) = node.schedule {
                     // Explicit schedule — effective_schedule = schedule.
-                    if self.nodes[&id].effective_schedule != tl {
-                        self.nodes.get_mut(&id).unwrap().effective_schedule = tl;
+                    if self.nodes[&id].effective_schedule != tl
+                        && let Some(node) = self.nodes.get_mut(&id)
+                    {
+                        node.effective_schedule = tl;
                         changed = true;
                     }
                     continue;
@@ -339,8 +341,10 @@ impl StDag {
                     .min()
                     .unwrap_or(fallback);
 
-                if self.nodes[&id].effective_schedule != min_schedule {
-                    self.nodes.get_mut(&id).unwrap().effective_schedule = min_schedule;
+                if self.nodes[&id].effective_schedule != min_schedule
+                    && let Some(node) = self.nodes.get_mut(&id)
+                {
+                    node.effective_schedule = min_schedule;
                     changed = true;
                 }
             }
@@ -375,10 +379,11 @@ impl StDag {
             result.push(node);
             if let Some(downstream) = self.edges.get(&node) {
                 for &d in downstream {
-                    let deg = in_degree.get_mut(&d).unwrap();
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push_back(d);
+                    if let Some(deg) = in_degree.get_mut(&d) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            queue.push_back(d);
+                        }
                     }
                 }
             }

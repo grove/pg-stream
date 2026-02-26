@@ -257,26 +257,27 @@ fn st_refresh_stats() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap();
+            .map_err(|e| pgrx::error!("st_refresh_stats: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
 
         let mut out = Vec::new();
         for row in result {
-            let pgs_name = row.get::<String>(1).unwrap().unwrap_or_default();
-            let pgs_schema = row.get::<String>(2).unwrap().unwrap_or_default();
-            let status = row.get::<String>(3).unwrap().unwrap_or_default();
-            let refresh_mode = row.get::<String>(4).unwrap().unwrap_or_default();
-            let is_populated = row.get::<bool>(5).unwrap().unwrap_or(false);
-            let total_refreshes = row.get::<i64>(6).unwrap().unwrap_or(0);
-            let successful = row.get::<i64>(7).unwrap().unwrap_or(0);
-            let failed = row.get::<i64>(8).unwrap().unwrap_or(0);
-            let rows_inserted = row.get::<i64>(9).unwrap().unwrap_or(0);
-            let rows_deleted = row.get::<i64>(10).unwrap().unwrap_or(0);
-            let avg_duration = row.get::<f64>(11).unwrap().unwrap_or(0.0);
-            let last_action = row.get::<String>(12).unwrap();
-            let last_status = row.get::<String>(13).unwrap();
-            let last_refresh_at = row.get::<TimestampWithTimeZone>(14).unwrap();
-            let staleness = row.get::<f64>(15).unwrap();
-            let stale = row.get::<bool>(16).unwrap().unwrap_or(false);
+            let pgs_name = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let pgs_schema = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+            let status = row.get::<String>(3).unwrap_or(None).unwrap_or_default();
+            let refresh_mode = row.get::<String>(4).unwrap_or(None).unwrap_or_default();
+            let is_populated = row.get::<bool>(5).unwrap_or(None).unwrap_or(false);
+            let total_refreshes = row.get::<i64>(6).unwrap_or(None).unwrap_or(0);
+            let successful = row.get::<i64>(7).unwrap_or(None).unwrap_or(0);
+            let failed = row.get::<i64>(8).unwrap_or(None).unwrap_or(0);
+            let rows_inserted = row.get::<i64>(9).unwrap_or(None).unwrap_or(0);
+            let rows_deleted = row.get::<i64>(10).unwrap_or(None).unwrap_or(0);
+            let avg_duration = row.get::<f64>(11).unwrap_or(None).unwrap_or(0.0);
+            let last_action = row.get::<String>(12).unwrap_or(None);
+            let last_status = row.get::<String>(13).unwrap_or(None);
+            let last_refresh_at = row.get::<TimestampWithTimeZone>(14).unwrap_or(None);
+            let staleness = row.get::<f64>(15).unwrap_or(None);
+            let stale = row.get::<bool>(16).unwrap_or(None).unwrap_or(false);
 
             out.push((
                 pgs_name,
@@ -358,26 +359,31 @@ fn get_refresh_history(
                 None,
                 &[schema.into(), table_name.into(), max_rows.into()],
             )
-            .unwrap();
+            .map_err(|e| pgrx::error!("get_refresh_history: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
 
         let mut out = Vec::new();
+        let epoch_zero = TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
+            // This should never fail, but if it does, fall through gracefully.
+            pgrx::error!("get_refresh_history: failed to construct epoch timestamp")
+        });
         for row in result {
-            let refresh_id = row.get::<i64>(1).unwrap().unwrap_or(0);
+            let refresh_id = row.get::<i64>(1).unwrap_or(None).unwrap_or(0);
             let data_ts = row
                 .get::<TimestampWithTimeZone>(2)
-                .unwrap()
-                .unwrap_or_else(|| TimestampWithTimeZone::try_from(0i64).unwrap());
+                .unwrap_or(None)
+                .unwrap_or(epoch_zero);
             let start = row
                 .get::<TimestampWithTimeZone>(3)
-                .unwrap()
-                .unwrap_or_else(|| TimestampWithTimeZone::try_from(0i64).unwrap());
-            let end = row.get::<TimestampWithTimeZone>(4).unwrap();
-            let action = row.get::<String>(5).unwrap().unwrap_or_default();
-            let status = row.get::<String>(6).unwrap().unwrap_or_default();
-            let ins = row.get::<i64>(7).unwrap().unwrap_or(0);
-            let del = row.get::<i64>(8).unwrap().unwrap_or(0);
-            let dur = row.get::<f64>(9).unwrap();
-            let err = row.get::<String>(10).unwrap();
+                .unwrap_or(None)
+                .unwrap_or(epoch_zero);
+            let end = row.get::<TimestampWithTimeZone>(4).unwrap_or(None);
+            let action = row.get::<String>(5).unwrap_or(None).unwrap_or_default();
+            let status = row.get::<String>(6).unwrap_or(None).unwrap_or_default();
+            let ins = row.get::<i64>(7).unwrap_or(None).unwrap_or(0);
+            let del = row.get::<i64>(8).unwrap_or(None).unwrap_or(0);
+            let dur = row.get::<f64>(9).unwrap_or(None);
+            let err = row.get::<String>(10).unwrap_or(None);
 
             out.push((
                 refresh_id, data_ts, start, end, action, status, ins, del, dur, err,
@@ -440,12 +446,13 @@ fn slot_health() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap();
+            .map_err(|e| pgrx::error!("slot_health: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
 
         let mut out = Vec::new();
         for row in result {
-            let slot = row.get::<String>(1).unwrap().unwrap_or_default();
-            let relid = row.get::<i64>(2).unwrap().unwrap_or(0);
+            let slot = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let relid = row.get::<i64>(2).unwrap_or(None).unwrap_or(0);
             out.push((slot, relid));
         }
         out
@@ -746,12 +753,13 @@ pub fn check_slot_health_and_alert() {
                 None,
                 &[],
             )
-            .unwrap();
+            .map_err(|e| pgrx::error!("slot_health: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
 
         let mut out = Vec::new();
         for row in result {
-            let trigger = row.get::<String>(1).unwrap().unwrap_or_default();
-            let relid = row.get::<i64>(2).unwrap().unwrap_or(0);
+            let trigger = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let relid = row.get::<i64>(2).unwrap_or(None).unwrap_or(0);
             out.push((trigger, relid));
         }
         out
