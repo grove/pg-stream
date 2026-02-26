@@ -1,0 +1,21 @@
+[book]
+title       = "pg_stream Documentation"
+authors     = ["The pg_stream Contributors"]
+src         = "docs"
+language    = "en"
+
+[output.html]
+default-theme       = "navy"
+git-repository-url  = "https://github.com/grove/pg-stream"
+edit-url-template   = "https://github.com/grove/pg-stream/edit/main/docs/{path}"
+site-url            = "/pg-stream/"
+
+[output.html.search]
+enable              = true
+limit-results       = 30
+use-boolean-and     = true
+boost-title         = 2
+boost-hierarchy     = 1
+boost-paragraph     = 1
+expand              = true
+heading-split-level = 3

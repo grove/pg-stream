@@ -11,3 +11,6 @@ tests/pg_regress/regression.out
 coverage/
 *.profraw
 *.profdata
+
+# mdBook build output
+book/

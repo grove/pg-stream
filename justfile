@@ -149,7 +149,15 @@ docker-build:
 # Build the E2E test Docker image
 docker-build-e2e:
     ./tests/build_e2e_image.sh
+# ── Documentation ────────────────────────────────────────────────────────────
 
+# Build the mdBook documentation site (output: book/)
+docs-build:
+    mdbook build
+
+# Serve the documentation locally with live-reload (http://localhost:3000)
+docs-serve:
+    mdbook serve --open
 # ── Housekeeping ──────────────────────────────────────────────────────────
 
 # Remove build artifacts
