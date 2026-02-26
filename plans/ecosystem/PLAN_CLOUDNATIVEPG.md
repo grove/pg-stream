@@ -333,7 +333,7 @@ Changes:
    (extract tar, check file tree), then validate the Docker image layout:
    ```bash
    docker build -t pg_stream-ext:test -f cnpg/Dockerfile.ext dist/
-   ID=$(docker create pg_stream-ext:test)
+   ID=$(docker create pg_stream-ext:test true)
    docker cp "$ID:/lib/" /tmp/ext-lib/
    docker cp "$ID:/share/" /tmp/ext-share/
    docker rm "$ID"
@@ -583,7 +583,7 @@ docker build -t pg_stream-ext:test -f cnpg/Dockerfile.ext-build .
 docker images pg_stream-ext:test
 
 # Verify file layout
-ID=$(docker create pg_stream-ext:test)
+ID=$(docker create pg_stream-ext:test true)
 docker cp "$ID:/lib/" /tmp/ext-lib/
 docker cp "$ID:/share/" /tmp/ext-share/
 docker rm "$ID"

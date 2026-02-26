@@ -269,7 +269,7 @@ jobs:
 
       - name: Verify extension image layout
         run: |
-          ID=$(docker create pg_stream-ext:ci)
+          ID=$(docker create pg_stream-ext:ci true)
           mkdir -p /tmp/ext-verify
           docker cp "$ID:/lib/" /tmp/ext-verify/lib/
           docker cp "$ID:/share/" /tmp/ext-verify/share/
