@@ -8532,6 +8532,14 @@ unsafe fn deparse_node(node: *mut pg_sys::Node) -> String {
             let cstr = unsafe { std::ffi::CStr::from_ptr(f.fval) };
             return cstr.to_str().unwrap_or("0").to_string();
         }
+        if unsafe { pgrx::is_a(val_ptr as *mut _, pg_sys::NodeTag::T_Boolean) } {
+            let b = unsafe { &*(val_ptr as *const pg_sys::Boolean) };
+            return if b.boolval {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            };
+        }
         "?".to_string()
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_ColumnRef) } {
         if let Ok(e) = unsafe { node_to_expr(node) } {
