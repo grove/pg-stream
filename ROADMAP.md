@@ -46,13 +46,13 @@ coverage.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| F1 | DELETE+INSERT merge strategy double-evaluation guard | 3–4h | G1.1 (P0) |
-| F2 | WAL decoder: keyless-table pk_hash computation | 4–6h | G3.1 (P1) |
-| F3 | WAL decoder: old_* column population for UPDATEs | 4–6h | G3.2 (P1) |
-| F4 | WAL decoder: pgoutput message parsing edge cases | 3–5h | G3.3 (P1) |
-| F5 | JOIN key column change detection in delta SQL | 3–4h | G4.1 (P1) |
-| F6 | ALTER TYPE / ALTER POLICY DDL tracking | 3–5h | G9.1 (P1) |
-| F7 | Document JOIN key change limitations | 2–3h | G4.2 (P1) |
+| F1 | DELETE+INSERT merge strategy double-evaluation guard | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G1.1 (P0) |
+| F2 | WAL decoder: keyless-table pk_hash computation | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.1 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| F3 | WAL decoder: old_* column population for UPDATEs | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.2 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| F4 | WAL decoder: pgoutput message parsing edge cases | 3–5h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.3 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| F5 | JOIN key column change detection in delta SQL | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.1 (P1) |
+| F6 | ALTER TYPE / ALTER POLICY DDL tracking | 3–5h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G9.1 (P1) |
+| F7 | Document JOIN key change limitations | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.2 (P1) |
 
 > **Subtotal: 22–33 hours**
 
@@ -60,19 +60,19 @@ coverage.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| F8–F12 | Window partition key E2E, recursive CTE monotonicity audit, PgBouncer compatibility docs, CDC edge cases | 17–24h | G5–G9 |
+| F8–F12 | Window partition key E2E, recursive CTE monotonicity audit, PgBouncer compatibility docs, CDC edge cases | 17–24h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G5–G9 |
 
 ### Tier 2 — Robustness
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| F13–F16 | LIMIT-in-subquery warning, CUBE explosion guard, read replica detection, SPI error classification | 7–9h | G2, G6, G8 |
+| F13–F16 | LIMIT-in-subquery warning, CUBE explosion guard, read replica detection, SPI error classification | 7–9h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G2, G6, G8 |
 
 ### Tier 3 — Test coverage
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| F17–F26 | 21 aggregate differential E2E, FULL JOIN E2E, INTERSECT/EXCEPT pairs, GUC variation tests, CI combined coverage | 29–38h | G7 |
+| F17–F26 | 21 aggregate differential E2E, FULL JOIN E2E, INTERSECT/EXCEPT pairs, GUC variation tests, CI combined coverage | 29–38h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G7 · [STATUS_TESTING.md](plans/testing/STATUS_TESTING.md) |
 
 > **v0.2.0 total: ~75–104 hours**
 
@@ -95,27 +95,27 @@ milestone.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | P1 | Verify PostgreSQL parallel query for delta SQL | 0h | [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md) §E |
-| P2 | DAG level extraction (`topological_levels()`) | 2–4h | §B |
-| P3 | Dynamic background worker dispatch per level | 12–16h | §A+B |
+| P2 | DAG level extraction (`topological_levels()`) | 2–4h | [REPORT_PARALLELIZATION.md §B](plans/performance/REPORT_PARALLELIZATION.md) |
+| P3 | Dynamic background worker dispatch per level | 12–16h | [REPORT_PARALLELIZATION.md §A+B](plans/performance/REPORT_PARALLELIZATION.md) |
 
 ### Operational
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | G8.2 |
-| O2 | Prepared statement cleanup on cache invalidation | 3–4h | G8.3 |
-| O3 | Adaptive fallback threshold exposure via monitoring | 2–3h | G8.4 |
-| O4 | SPI SQLSTATE error classification for retry | 3–4h | G8.6 |
-| O5 | Slot lag alerting thresholds (configurable) | 2–3h | G10 |
+| O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 |
+| O2 | Prepared statement cleanup on cache invalidation | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.3 |
+| O3 | Adaptive fallback threshold exposure via monitoring | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.4 |
+| O4 | SPI SQLSTATE error classification for retry | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.6 |
+| O5 | Slot lag alerting thresholds (configurable) | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G10 |
 
 ### WAL CDC Hardening
 
-| Item | Description | Effort |
-|------|-------------|--------|
-| W1 | WAL decoder fixes (F2–F4 prerequisite from v0.2.0) | Done in v0.2.0 |
-| W2 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h |
-| W3 | WAL→trigger automatic fallback hardening | 4–6h |
-| W4 | Promote `pg_stream.cdc_mode = 'auto'` to recommended | Documentation |
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| W1 | WAL decoder fixes (F2–F4 prerequisite from v0.2.0) | Done in v0.2.0 | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W2 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W3 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W4 | Promote `pg_stream.cdc_mode = 'auto'` to recommended | Documentation | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 
 > **v0.3.0 total: ~40–58 hours** (excluding v0.2.0 prerequisites)
 
@@ -134,21 +134,21 @@ API and catalog schema are considered stable.
 
 ### Release engineering
 
-| Item | Description | Effort |
-|------|-------------|--------|
-| R1 | Semantic versioning policy + compatibility guarantees | 2–3h |
-| R2 | PGXN / apt / rpm packaging | 8–12h |
-| R3 | Docker Hub official image (PostgreSQL 18 + pg_stream) | 4–6h |
-| R4 | CNPG operator hardening | 4–6h |
-| R5 | dbt-pgstream 0.1.0 formal release (PyPI) | 2–3h |
-| R6 | Complete documentation review & polish | 4–6h |
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| R1 | Semantic versioning policy + compatibility guarantees | 2–3h | |
+| R2 | PGXN / apt / rpm packaging | 8–12h | |
+| R3 | Docker Hub official image (PostgreSQL 18 + pg_stream) | 4–6h | |
+| R4 | CNPG operator hardening | 4–6h | [cnpg/](cnpg/) |
+| R5 | dbt-pgstream 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgstream/](dbt-pgstream/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
+| R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
 
 ### Observability
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
-| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | §1 |
+| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 
 > **v1.0.0 total: ~32–48 hours**
 
@@ -171,10 +171,10 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | E1 | dbt full adapter (`dbt-pgstream` extending `dbt-postgres`) | 20–30h | [PLAN_DBT_ADAPTER.md](plans/dbt/PLAN_DBT_ADAPTER.md) |
-| E2 | Airflow provider (`apache-airflow-providers-pgstream`) | 16–20h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §4 |
-| E3 | CLI tool (`pgstream`) for management outside SQL | 16–20h | §4 |
-| E4 | Flyway / Liquibase migration support | 8–12h | §5 |
-| E5 | ORM integrations guide (SQLAlchemy, Django, etc.) | 8–12h | §5 |
+| E2 | Airflow provider (`apache-airflow-providers-pgstream`) | 16–20h | [PLAN_ECO_SYSTEM.md §4](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| E3 | CLI tool (`pgstream`) for management outside SQL | 16–20h | [PLAN_ECO_SYSTEM.md §4](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| E4 | Flyway / Liquibase migration support | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| E5 | ORM integrations guide (SQLAlchemy, Django, etc.) | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 
 ### Scale
 
@@ -186,11 +186,11 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 ### Advanced SQL
 
-| Item | Description | Effort |
-|------|-------------|--------|
-| A1 | Circular dependency support (SCC fixpoint iteration) | ~40h |
-| A2 | Streaming aggregation (sub-second latency path) | TBD |
-| A3 | PostgreSQL 19 forward-compatibility | TBD |
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
+| A2 | Streaming aggregation (sub-second latency path) | TBD | |
+| A3 | PostgreSQL 19 forward-compatibility | TBD | |
 
 ---
 
@@ -220,6 +220,3 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | [plans/infra/CITUS.md](plans/infra/CITUS.md) | Citus compatibility plan |
 | [plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) | Architectural decisions |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture |
-incremental view maintenance (IVM) via differential dataflow. All 13 design
-phases are complete. This roadmap tracks the path from pre-release to 1.0
-and beyond.
