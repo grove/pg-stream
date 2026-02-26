@@ -24,6 +24,7 @@ on:
   schedule:
     # Weekly on Monday at 08:00 UTC — catches newly published advisories
     - cron: "0 8 * * 1"
+  workflow_dispatch:  # Allow manual runs from the Actions tab
 
 permissions:
   contents: read
