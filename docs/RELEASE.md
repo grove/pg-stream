@@ -192,18 +192,60 @@ Every release requires manual updates to the files below. Missing any of them le
 
 ### Release workflow failed
 
-1. Check the failed job in the [Actions tab](../../actions/workflows/release.yml)
-2. Common issues:
-   - **Version mismatch**: `Cargo.toml` version doesn't match the tag — update and re-tag
-   - **Build failure**: Fix the issue on `main`, delete the tag, and re-tag:
-     ```bash
-     git tag -d v0.2.0
-     git push origin :refs/tags/v0.2.0
-     # After fixing:
-     git tag -a v0.2.0 -m "Release v0.2.0"
-     git push origin v0.2.0
-     ```
-   - **Docker push failed**: Check that `packages: write` permission is enabled and `GITHUB_TOKEN` has GHCR access
+Go to the [Actions tab](../../actions/workflows/release.yml) and identify
+which job failed. Then follow the appropriate recovery path below.
+
+#### Option A: Re-run (transient failure)
+
+If the failure is transient — network timeout, registry hiccup, runner
+issue — you can re-run without changing anything:
+
+1. Open the failed workflow run in the **Actions** tab
+2. Click **Re-run all jobs** (or re-run just the failed job)
+
+This works because the `v*` tag still points to the same commit, and the
+workflow uses `cancel-in-progress: false` so a re-run won't be cancelled.
+
+#### Option B: Fix code and re-tag
+
+If the failure is a real build or code issue:
+
+```bash
+# 1. Delete the remote tag
+git push origin :refs/tags/v0.2.0
+
+# 2. Delete the local tag
+git tag -d v0.2.0
+
+# 3. Fix the issue, commit, and push
+git add <files>
+git commit -m "fix: ..."
+git push origin main
+
+# 4. Re-tag on the new commit and push
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin v0.2.0
+```
+
+This triggers a fresh release workflow run.
+
+#### Option C: Clean up a partial GitHub Release
+
+If the workflow created a draft or partial Release before failing:
+
+1. Go to **Releases** in the repository
+2. Delete the broken release (this does **not** delete the tag)
+3. Then follow Option A or Option B above
+
+#### Common failure causes
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Version mismatch error | `Cargo.toml` version doesn't match the git tag | Update `Cargo.toml`, commit, delete tag, re-tag (Option B) |
+| Build failure | Compilation error in release profile | Fix on `main`, re-tag (Option B) |
+| Docker push failed | Missing permissions | Verify `packages: write` is in the workflow and `GITHUB_TOKEN` has GHCR access, then re-run (Option A) |
+| Smoke test failed | Extension doesn't load in PostgreSQL | Fix the issue, re-tag (Option B) |
+| Rate limited | GitHub API or GHCR throttling | Wait a few minutes, then re-run (Option A) |
 
 ### Yanking a release
 
