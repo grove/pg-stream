@@ -42,8 +42,9 @@ lint: fmt-check clippy
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 # Run unit tests (lib only, no containers needed)
+# On macOS 26+ the pg_stub workaround is applied automatically.
 test-unit:
-    cargo test --lib --features pg{{pg}}
+    ./scripts/run_unit_tests.sh pg{{pg}}
 
 # Run integration tests (requires Docker for testcontainers)
 test-integration:
