@@ -35,8 +35,8 @@ sha256sum -c SHA256SUMS.txt
 **Linux / macOS:**
 
 ```bash
-tar xzf pg_stream-0.1.0-pg18-linux-amd64.tar.gz
-cd pg_stream-0.1.0-pg18-linux-amd64
+tar xzf pg_stream-0.1.1-pg18-linux-amd64.tar.gz
+cd pg_stream-0.1.1-pg18-linux-amd64
 
 sudo cp lib/*.so  "$(pg_config --pkglibdir)/"
 sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
@@ -45,8 +45,8 @@ sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
 **Windows (PowerShell):**
 
 ```powershell
-Expand-Archive pg_stream-0.1.0-pg18-windows-amd64.zip -DestinationPath .
-cd pg_stream-0.1.0-pg18-windows-amd64
+Expand-Archive pg_stream-0.1.1-pg18-windows-amd64.zip -DestinationPath .
+cd pg_stream-0.1.1-pg18-windows-amd64
 
 Copy-Item lib\*.dll  "$(pg_config --pkglibdir)\"
 Copy-Item extension\* "$(pg_config --sharedir)\extension\"
@@ -61,7 +61,7 @@ pg_stream is distributed as an OCI extension image for use with
 
 ```bash
 # Pull the extension image
-docker pull ghcr.io/grove/pg_stream-ext:0.1.0
+docker pull ghcr.io/grove/pg_stream-ext:0.1.1
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and
@@ -75,8 +75,8 @@ into a standard PostgreSQL container from a release archive:
 
 ```bash
 # Extract extension files from the release archive
-tar xzf pg_stream-0.1.0-pg18-linux-amd64.tar.gz
-cd pg_stream-0.1.0-pg18-linux-amd64
+tar xzf pg_stream-0.1.1-pg18-linux-amd64.tar.gz
+cd pg_stream-0.1.1-pg18-linux-amd64
 
 # Run PostgreSQL with the extension mounted
 docker run --rm \

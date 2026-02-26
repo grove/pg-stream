@@ -9,6 +9,10 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+---
+
+## [0.1.1] — 2026-02-26
+
 ### Changed
 
 #### CloudNativePG Image Volume Extension Distribution
