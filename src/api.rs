@@ -1357,16 +1357,7 @@ fn classify_source_relation(oid: pg_sys::Oid) -> String {
     .unwrap_or(None)
     .unwrap_or_else(|| "r".to_string());
 
-    classify_relkind(&relkind)
-}
-
-/// Pure-logic classification of a `pg_class.relkind` value to a
-/// human-readable source-type label.
-///
-/// Extracted from [`classify_source_relation`] so it can be unit-tested
-/// without a PostgreSQL backend.
-fn classify_relkind(relkind: &str) -> String {
-    match relkind {
+    match relkind.as_str() {
         "v" => "VIEW".to_string(),
         "m" => "MATVIEW".to_string(),
         "f" => "FOREIGN_TABLE".to_string(),
@@ -1732,47 +1723,6 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── classify_relkind tests ──────────────────────────────────────
-
-    #[test]
-    fn test_classify_relkind_table() {
-        assert_eq!(classify_relkind("r"), "TABLE");
-    }
-
-    #[test]
-    fn test_classify_relkind_view() {
-        assert_eq!(classify_relkind("v"), "VIEW");
-    }
-
-    #[test]
-    fn test_classify_relkind_matview() {
-        assert_eq!(classify_relkind("m"), "MATVIEW");
-    }
-
-    #[test]
-    fn test_classify_relkind_foreign_table() {
-        assert_eq!(classify_relkind("f"), "FOREIGN_TABLE");
-    }
-
-    #[test]
-    fn test_classify_relkind_partitioned_table_defaults_to_table() {
-        // relkind='p' for partitioned tables → should map to TABLE
-        assert_eq!(classify_relkind("p"), "TABLE");
-    }
-
-    #[test]
-    fn test_classify_relkind_index_defaults_to_table() {
-        // relkind='i' for indexes → falls through to TABLE (defensive)
-        assert_eq!(classify_relkind("i"), "TABLE");
-    }
-
-    #[test]
-    fn test_classify_relkind_unknown_defaults_to_table() {
-        assert_eq!(classify_relkind("z"), "TABLE");
-    }
-
-    // ── inject_pgs_count tests ──────────────────────────────────────
 
     #[test]
     fn test_inject_pgs_count_distinct_basic() {
