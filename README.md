@@ -5,6 +5,7 @@
 [![Release](https://github.com/grove/pg-stream/actions/workflows/release.yml/badge.svg)](https://github.com/grove/pg-stream/actions/workflows/release.yml)
 [![Coverage](https://codecov.io/gh/grove/pg-stream/branch/main/graph/badge.svg)](https://codecov.io/gh/grove/pg-stream)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-view-blue)](docs/BENCHMARK.md)
+[![Roadmap](https://img.shields.io/badge/Roadmap-view-informational)](ROADMAP.md)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![PostgreSQL 18](https://img.shields.io/badge/PostgreSQL-18-blue?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![pgrx 0.17](https://img.shields.io/badge/pgrx-0.17-orange)](https://github.com/pgcentralfoundation/pgrx)
@@ -184,6 +185,7 @@ SELECT pgstream.drop_stream_table('regional_totals');
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
+| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (v0.2.0 → v1.0.0 → post-1.0) |
 
 ### Research & Plans
 

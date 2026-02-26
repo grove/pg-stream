@@ -1,6 +1,7 @@
 # Architecture
 
 This document describes the internal architecture of pg_stream — a PostgreSQL 18 extension that implements stream tables with differential view maintenance.
+For a high-level description of what pg_stream does and why, read [ESSENCE.md](../ESSENCE.md). For release milestones and future plans, see [ROADMAP.md](../ROADMAP.md).
 
 ---
 

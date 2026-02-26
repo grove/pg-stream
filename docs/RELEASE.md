@@ -144,6 +144,32 @@ git tag -a v0.2.1 -m "Release v0.2.1"
 git push origin v0.2.1
 ```
 
+## Files to Update for Each Release
+
+Every release requires manual updates to the files below. Missing any of them leads to version skew between the code, the docs, and the packages.
+
+| File | What to change | Why |
+|------|----------------|-----|
+| `Cargo.toml` | `version = "x.y.z"` field | The canonical version source. pgrx reads this at build time and substitutes it into `pg_stream.control` via `@CARGO_VERSION@`. The git tag must match. |
+| `CHANGELOG.md` | Rename `## [Unreleased]` → `## [x.y.z] — YYYY-MM-DD`; add a new empty `## [Unreleased]` at the top | Keeps the public changelog accurate and gives downstream users a dated record of changes. |
+| `ROADMAP.md` | Update `**Current version:**` in the preamble; move the released milestone to a collapsed "Released" section or delete it; advance the "We are here" pointer to the next milestone | Keeps the forward-looking plan aligned with reality. Leaves no confusion about which milestone is current. |
+| `README.md` | Update test-count line (`~N unit tests + M E2E tests`) if test counts changed significantly | The README is the first thing users read; stale numbers erode trust. |
+| `INSTALL.md` | Update any version numbers in install commands or example URLs | Users copy-paste installation commands; stale versions cause failures. |
+| `pg_stream.control` | **No manual edit needed** — `default_version` is set to `'@CARGO_VERSION@'` and pgrx substitutes it at build time. Verify the substitution in the built artifact. | Ensures the SQL `CREATE EXTENSION` command installs the right version. |
+
+### Checklist summary
+
+```
+[ ] Cargo.toml — version bumped
+[ ] CHANGELOG.md — [Unreleased] renamed to [x.y.z] with date; new empty [Unreleased] added
+[ ] ROADMAP.md — current version updated; released milestone marked done
+[ ] README.md — test counts current (if materially changed)
+[ ] INSTALL.md — version references current
+[ ] git tag matches Cargo.toml version
+```
+
+---
+
 ## Troubleshooting
 
 ### Release workflow failed

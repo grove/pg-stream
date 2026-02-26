@@ -18,4 +18,6 @@ Other things we care about: crash-safe advisory locking, built-in monitoring vie
 
 Written in Rust using pgrx. Targets PostgreSQL 18. Apache 2.0 licensed. Early stage — 1,100+ unit tests and 380+ e2e tests, but not yet production-hardened.
 
+See [ROADMAP.md](ROADMAP.md) for the release milestone plan (v0.2.0 through v1.0.0 and beyond).
+
 GitHub: https://github.com/grove/pg-stream
