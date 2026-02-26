@@ -746,18 +746,19 @@ fn pgs_status() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap();
+            .map_err(|e| pgrx::error!("st_list: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
 
         let mut out = Vec::new();
         for row in result {
-            let name = row.get::<String>(1).unwrap().unwrap_or_default();
-            let status = row.get::<String>(2).unwrap().unwrap_or_default();
-            let mode = row.get::<String>(3).unwrap().unwrap_or_default();
-            let populated = row.get::<bool>(4).unwrap().unwrap_or(false);
-            let errors = row.get::<i32>(5).unwrap().unwrap_or(0);
-            let schedule = row.get::<String>(6).unwrap();
-            let data_ts = row.get::<TimestampWithTimeZone>(7).unwrap();
-            let staleness = row.get::<pgrx::datum::Interval>(8).unwrap();
+            let name = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let status = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+            let mode = row.get::<String>(3).unwrap_or(None).unwrap_or_default();
+            let populated = row.get::<bool>(4).unwrap_or(None).unwrap_or(false);
+            let errors = row.get::<i32>(5).unwrap_or(None).unwrap_or(0);
+            let schedule = row.get::<String>(6).unwrap_or(None);
+            let data_ts = row.get::<TimestampWithTimeZone>(7).unwrap_or(None);
+            let staleness = row.get::<pgrx::datum::Interval>(8).unwrap_or(None);
             out.push((
                 name, status, mode, populated, errors, schedule, data_ts, staleness,
             ));

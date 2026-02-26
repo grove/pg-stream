@@ -162,7 +162,7 @@ pub fn select_canonical_period_secs(schedule_secs: u64) -> u64 {
 pub fn canonical_data_timestamp_secs(period_secs: u64) -> u64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
 
     if period_secs == 0 {
@@ -233,7 +233,7 @@ pub fn select_target_data_timestamp(
     // Fallback: use current time
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
     chrono_from_unix_secs(now_secs)
 }

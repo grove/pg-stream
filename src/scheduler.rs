@@ -453,7 +453,9 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
         .unwrap_or(None)
         .unwrap_or_else(|| {
             pgrx::warning!("now() returned NULL in scheduler");
-            TimestampWithTimeZone::try_from(0i64).unwrap()
+            TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
+                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone")
+            })
         });
 
     // Acquire advisory lock for this ST (held during refresh execution)
@@ -532,7 +534,7 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
 
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
     let data_ts_frontier = format!("{}Z", now_secs);
 
