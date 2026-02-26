@@ -152,7 +152,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: release-linux-amd64
           path: dist/
@@ -223,7 +223,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download all release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: artifacts/
           pattern: release-*
@@ -275,7 +275,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download ${{ matrix.artifact_suffix }} artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: release-${{ matrix.artifact_suffix }}
           path: dist/
