@@ -102,7 +102,7 @@ milestone.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 |
+| O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 · [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
 | O2 | Prepared statement cleanup on cache invalidation | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.3 |
 | O3 | Adaptive fallback threshold exposure via monitoring | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.4 |
 | O4 | SPI SQLSTATE error classification for retry | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.6 |
@@ -136,9 +136,9 @@ API and catalog schema are considered stable.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| R1 | Semantic versioning policy + compatibility guarantees | 2–3h | |
-| R2 | PGXN / apt / rpm packaging | 8–12h | |
-| R3 | Docker Hub official image (PostgreSQL 18 + pg_stream) | 4–6h | |
+| R1 | Semantic versioning policy + compatibility guarantees | 2–3h | [PLAN_VERSIONING.md](plans/infra/PLAN_VERSIONING.md) |
+| R2 | PGXN / apt / rpm packaging | 8–12h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| R3 | Docker Hub official image (PostgreSQL 18 + pg_stream) | 4–6h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
 | R4 | CNPG operator hardening | 4–6h | [cnpg/](cnpg/) |
 | R5 | dbt-pgstream 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgstream/](dbt-pgstream/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
 | R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
@@ -182,15 +182,15 @@ These are not gated on 1.0 but represent the longer-term horizon.
 |------|-------------|--------|-----|
 | S1 | External orchestrator sidecar for 100+ STs | 20–40h | [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md) §D |
 | S2 | Citus / distributed PostgreSQL compatibility | ~6 months | [plans/infra/CITUS.md](plans/infra/CITUS.md) |
-| S3 | Multi-database support (beyond `postgres` DB) | TBD | |
+| S3 | Multi-database support (beyond `postgres` DB) | TBD | [PLAN_MULTI_DATABASE.md](plans/infra/PLAN_MULTI_DATABASE.md) |
 
 ### Advanced SQL
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
-| A2 | Streaming aggregation (sub-second latency path) | TBD | |
-| A3 | PostgreSQL 19 forward-compatibility | TBD | |
+| A2 | Streaming aggregation (sub-second latency path) | TBD | [PLAN_STREAMING_AGGREGATION.md](plans/sql/PLAN_STREAMING_AGGREGATION.md) |
+| A3 | PostgreSQL 19 forward-compatibility | TBD | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 
 ---
 
@@ -218,5 +218,12 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | [plans/ecosystem/PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) | Ecosystem project catalog |
 | [plans/dbt/PLAN_DBT_ADAPTER.md](plans/dbt/PLAN_DBT_ADAPTER.md) | Full dbt adapter plan |
 | [plans/infra/CITUS.md](plans/infra/CITUS.md) | Citus compatibility plan |
+| [plans/infra/PLAN_VERSIONING.md](plans/infra/PLAN_VERSIONING.md) | Versioning & compatibility policy |
+| [plans/infra/PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) | PGXN / deb / rpm packaging |
+| [plans/infra/PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) | Official Docker image |
+| [plans/infra/PLAN_MULTI_DATABASE.md](plans/infra/PLAN_MULTI_DATABASE.md) | Multi-database support |
+| [plans/infra/PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) | PostgreSQL 19 forward-compatibility |
+| [plans/sql/PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) | Extension upgrade migrations |
+| [plans/sql/PLAN_STREAMING_AGGREGATION.md](plans/sql/PLAN_STREAMING_AGGREGATION.md) | Sub-second streaming aggregation |
 | [plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) | Architectural decisions |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture |
