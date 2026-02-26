@@ -1214,8 +1214,6 @@ fn generate_change_buffer_from(
     match op {
         OpTree::Scan {
             table_oid,
-            schema,
-            table_name,
             alias,
             columns,
             ..
@@ -1227,20 +1225,22 @@ fn generate_change_buffer_from(
             );
             let prev_lsn = ctx.get_prev_lsn(*table_oid);
 
-            // Use jsonb_populate_record to extract columns with proper
-            // PostgreSQL types (not text) from the JSONB row_data.
-            // This prevents "operator does not exist: text = integer"
-            // errors when comparing extracted columns against typed table
-            // columns in join conditions.
-            let record_type = format!("NULL::{}.{}", quote_ident(schema), quote_ident(table_name),);
+            // Use typed columns from the change buffer (new_* for INSERT
+            // events). The CDC trigger writes each column individually as
+            // c."new_{col}" with proper PostgreSQL types.
             let col_refs: Vec<String> = columns
                 .iter()
-                .map(|c| format!("r.{}", quote_ident(&c.name)))
+                .map(|c| {
+                    format!(
+                        "c.{} AS {}",
+                        quote_ident(&format!("new_{}", c.name)),
+                        quote_ident(&c.name),
+                    )
+                })
                 .collect();
 
             Ok(format!(
-                "(SELECT {cols} FROM {change_table} c, \
-                 LATERAL jsonb_populate_record({record_type}, c.row_data) r \
+                "(SELECT {cols} FROM {change_table} c \
                  WHERE c.action = 'I' AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
                 cols = col_refs.join(", "),
                 alias_q = quote_ident(alias),
