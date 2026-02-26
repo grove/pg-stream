@@ -1,7 +1,7 @@
 # CloudNativePG Image Volume Extension — Implementation Plan
 
 Date: 2026-02-26
-Status: PROPOSED
+Status: IMPLEMENTED
 Supersedes: Project 5 in [PLAN_ECO_SYSTEM.md](PLAN_ECO_SYSTEM.md)
 
 ---

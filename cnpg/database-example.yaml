@@ -1,0 +1,26 @@
+# =============================================================================
+# Example CloudNativePG Database resource with declarative extension management.
+#
+# This resource tells the CNPG operator to automatically run
+# CREATE EXTENSION pg_stream in the specified database. It replaces the
+# old postInitSQL approach.
+#
+# Prerequisites:
+#   The Cluster resource (cluster-example.yaml) must be deployed first.
+#
+# Deploy:
+#   kubectl apply -f cnpg/database-example.yaml
+#
+# See: https://cloudnative-pg.io/docs/1.28/declarative_database_management/
+# =============================================================================
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: pg-stream-app
+spec:
+  name: app
+  owner: app
+  cluster:
+    name: pg-stream-demo
+  extensions:
+    - name: pg_stream
