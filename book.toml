@@ -7,7 +7,7 @@ language    = "en"
 [output.html]
 default-theme       = "navy"
 git-repository-url  = "https://github.com/grove/pg-stream"
-edit-url-template   = "https://github.com/grove/pg-stream/edit/main/docs/{path}"
+edit-url-template   = "https://github.com/grove/pg-stream/edit/main/{path}"
 site-url            = "/pg-stream/"
 
 [output.html.search]
