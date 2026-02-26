@@ -28,7 +28,7 @@ on:
 
 permissions:
   contents: read
-  issues: write  # rustsec/audit-check posts PR annotations
+  checks: write  # rustsec/audit-check posts results as a GitHub Check Run
 
 jobs:
   audit:
