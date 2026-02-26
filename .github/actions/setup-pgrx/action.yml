@@ -27,15 +27,17 @@ runs:
       with:
         cache-on-failure: true
         save-always: true
-        # Include pgrx version in key so cache is invalidated on pgrx upgrade
-        prefix-key: v0-rust-pgrx0.17
+        # Include pgrx version in key so cache is invalidated on pgrx upgrade.
+        # ImageOS (e.g. ubuntu22, ubuntu24) prevents cross-image GLIBC mismatches
+        # when ubuntu-latest shifts to a newer image.
+        prefix-key: v1-rust-pgrx0.17-${{ env.ImageOS || 'unknown' }}
 
     - name: Cache pgrx home directory (~/.pgrx)
       id: cache-pgrx-home
       uses: actions/cache@v4
       with:
         path: ~/.pgrx
-        key: pgrx-home-${{ runner.os }}-pg${{ inputs.pg-version }}-pgrx0.17.0
+        key: pgrx-home-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-pg${{ inputs.pg-version }}-pgrx0.17.0
 
     # ── PostgreSQL headers (Linux) ────────────────────────────────────────
     - name: Install PostgreSQL ${{ inputs.pg-version }} (Linux)
