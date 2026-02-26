@@ -1,0 +1,37 @@
+# Codecov configuration
+# https://docs.codecov.com/docs/codecov-yaml
+#
+# pg_stream is a pgrx extension. Functions annotated #[pg_extern] and all SPI/
+# trigger/WAL/background-worker code execute inside the PostgreSQL server
+# process and cannot be instrumented by cargo-llvm-cov. Coverage is collected
+# from unit tests only (src/dvm/**, src/dag.rs, src/hash.rs, etc.).
+#
+# Consequence: overall project coverage will appear low (~25–35%) for
+# structural reasons unrelated to test quality. We therefore:
+#   - Never fail CI on overall project coverage
+#   - Enforce patch coverage only on the pure-Rust DVM engine
+
+coverage:
+  status:
+    project:
+      default:
+        informational: true        # never fail CI on overall %
+    patch:
+      dvm-engine:
+        target: 70%
+        paths:
+          - "src/dvm/**"
+          - "src/dag.rs"
+          - "src/hash.rs"
+
+# Exclude uninstrumentable pgrx boundary modules and non-source paths
+ignore:
+  - "src/api.rs"
+  - "src/cdc.rs"
+  - "src/wal_decoder.rs"
+  - "src/scheduler.rs"
+  - "src/hooks.rs"
+  - "src/shmem.rs"
+  - "src/bin/**"
+  - "tests/**"
+  - "benches/**"
