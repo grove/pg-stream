@@ -183,7 +183,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build E2E Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: tests/Dockerfile.e2e
