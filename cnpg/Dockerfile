@@ -73,6 +73,11 @@ RUN echo "=== Package artifacts ===" && \
 # ── Stage 2: Production runtime image ──────────────────────────────────────
 FROM postgres:18.1
 
+# OCI image labels — REPO_URL is injected by the release workflow so the image
+# is linked to the exact GitHub repository. Override at build time for forks:
+#   docker build --build-arg REPO_URL=https://github.com/you/pg-stream ...
+ARG REPO_URL=https://github.com/grove/pg-stream
+
 # CloudNativePG's operator always runs initdb (and the postgres process) as
 # UID 26 — the RHEL/CentOS convention for the 'postgres' system account.
 # The official postgres:18.1 Debian image uses UID/GID 999, so UID 26 does not
@@ -112,7 +117,8 @@ RUN set -eux; \
 LABEL org.opencontainers.image.title="pg_stream"
 LABEL org.opencontainers.image.description="PostgreSQL 18 with pg_stream extension for CloudNativePG"
 LABEL org.opencontainers.image.vendor="pg_stream"
-LABEL org.opencontainers.image.source="https://github.com/pg-stream/pg-stream"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+LABEL org.opencontainers.image.source="${REPO_URL}"
 
 # Copy extension shared library
 COPY --from=builder \

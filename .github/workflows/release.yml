@@ -271,6 +271,8 @@ jobs:
           file: cnpg/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
