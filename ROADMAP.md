@@ -1,7 +1,7 @@
 # pg_stream — Project Roadmap
 
 > **Last updated:** 2026-02-26
-> **Current version:** 0.1.0
+> **Current version:** 0.1.1
 
 For a concise description of what pg_stream is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH

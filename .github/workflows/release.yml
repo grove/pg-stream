@@ -280,10 +280,26 @@ jobs:
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Extract text between this version's header and the next version header
+          NOTES=$(awk -v ver="$VERSION" '
+            /^## \[/ { if (found) exit; if (index($0, ver)) { found=1; next } }
+            found { print }
+          ' CHANGELOG.md)
+          # Write to step output (multi-line safe)
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.notes }}
           files: |
             release-files/*
           draft: false
