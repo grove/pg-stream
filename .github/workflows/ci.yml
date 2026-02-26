@@ -42,11 +42,9 @@ env:
 
 jobs:
   # ── Unit tests (cross-platform) ─────────────────────────────────────────
-  # push/PR: Linux only for speed. Schedule/manual: full matrix.
   unit-tests:
     name: Unit tests (${{ matrix.artifact_suffix }})
     runs-on: ${{ matrix.os }}
-    if: matrix.os == 'ubuntu-latest' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 15
     continue-on-error: ${{ matrix.os == 'windows-2022' }}
     strategy:
