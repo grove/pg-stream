@@ -142,9 +142,9 @@ package:
 
 # ── Docker ────────────────────────────────────────────────────────────────
 
-# Build the CNPG production Docker image
+# Build the CNPG extension image from source (scratch-based, for Image Volumes)
 docker-build:
-    docker build -t pg_stream:latest -f cnpg/Dockerfile .
+    docker build -t pg_stream-ext:latest -f cnpg/Dockerfile.ext-build .
 
 # Build the E2E test Docker image
 docker-build-e2e:

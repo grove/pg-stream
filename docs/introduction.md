@@ -49,7 +49,7 @@ through unchanged.
 | **Hybrid CDC** | Starts with lightweight row-level triggers; seamlessly transitions to WAL-based logical replication once available |
 | **Broad SQL support** | JOINs, GROUP BY, DISTINCT, UNION/INTERSECT/EXCEPT, subqueries, CTEs (including WITH RECURSIVE), window functions, LATERAL, and more |
 | **Built-in observability** | Monitoring views, refresh history, NOTIFY-based alerting |
-| **CloudNativePG-ready** | Ships as a Docker image for Kubernetes deployments |
+| **CloudNativePG-ready** | Ships as an Image Volume extension image for Kubernetes deployments |
 
 ## Demand-driven scheduling
 

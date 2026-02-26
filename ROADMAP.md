@@ -189,14 +189,15 @@ distribution — getting pg_stream onto package registries.
 |------|-------------|--------|-----|
 | R1 | Semantic versioning policy + compatibility guarantees | 2–3h | [PLAN_VERSIONING.md](plans/infra/PLAN_VERSIONING.md) |
 | R2 | PGXN / apt / rpm packaging | 8–12h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
-| R3 | Docker Hub official image (PostgreSQL 18 + pg_stream) | 4–6h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
-| R4 | CNPG operator hardening | 4–6h | [cnpg/](cnpg/) |
+| R3 | ~~Docker Hub official image~~ → CNPG extension image | ✅ Done | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+| R4 | CNPG operator hardening (K8s 1.33+ native ImageVolume) | 4–6h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
 
 > **v1.0.0 total: ~18–27 hours**
 
 **Exit criteria:**
 - [ ] Published on PGXN and Docker Hub
-- [ ] CNPG cluster-example.yaml validated
+- [x] CNPG extension image published to GHCR (`pg_stream-ext`)
+- [x] CNPG cluster-example.yaml validated (Image Volume approach)
 - [ ] Upgrade path from v0.4.0 tested
 - [ ] Semantic versioning policy in effect
 
@@ -261,7 +262,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | [plans/infra/CITUS.md](plans/infra/CITUS.md) | Citus compatibility plan |
 | [plans/infra/PLAN_VERSIONING.md](plans/infra/PLAN_VERSIONING.md) | Versioning & compatibility policy |
 | [plans/infra/PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) | PGXN / deb / rpm packaging |
-| [plans/infra/PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) | Official Docker image |
+| [plans/infra/PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) | Official Docker image (superseded by CNPG extension image) |
+| [plans/ecosystem/PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) | CNPG Image Volume extension image |
 | [plans/infra/PLAN_MULTI_DATABASE.md](plans/infra/PLAN_MULTI_DATABASE.md) | Multi-database support |
 | [plans/infra/PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) | PostgreSQL 19 forward-compatibility |
 | [plans/sql/PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) | Extension upgrade migrations |

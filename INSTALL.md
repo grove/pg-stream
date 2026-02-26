@@ -52,16 +52,40 @@ Copy-Item lib\*.dll  "$(pg_config --pkglibdir)\"
 Copy-Item extension\* "$(pg_config --sharedir)\extension\"
 ```
 
-### 3. Using the Docker image
+### 3. Using with CloudNativePG (Kubernetes)
 
-Alternatively, skip the manual install and use the CNPG-ready Docker image:
+pg_stream is distributed as an OCI extension image for use with
+[CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/).
+
+**Requirements:** Kubernetes 1.33+, CNPG 1.28+, PostgreSQL 18.
 
 ```bash
-docker pull ghcr.io/grove/pg_stream:0.1.0
+# Pull the extension image
+docker pull ghcr.io/grove/pg_stream-ext:0.1.0
+```
 
-docker run --rm -e POSTGRES_PASSWORD=postgres \
-  ghcr.io/grove/pg_stream:0.1.0 \
-  postgres -c "shared_preload_libraries=pg_stream"
+See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and
+[cnpg/database-example.yaml](cnpg/database-example.yaml) for complete
+Cluster and Database deployment examples.
+
+### 4. Local Docker development (without Kubernetes)
+
+For local development without Kubernetes, install the extension files manually
+into a standard PostgreSQL container from a release archive:
+
+```bash
+# Extract extension files from the release archive
+tar xzf pg_stream-0.1.0-pg18-linux-amd64.tar.gz
+cd pg_stream-0.1.0-pg18-linux-amd64
+
+# Run PostgreSQL with the extension mounted
+docker run --rm \
+  -v $PWD/lib/pg_stream.so:/usr/lib/postgresql/18/lib/pg_stream.so:ro \
+  -v $PWD/extension/:/tmp/ext/:ro \
+  -e POSTGRES_PASSWORD=postgres \
+  postgres:18.1 \
+  sh -c 'cp /tmp/ext/* /usr/share/postgresql/18/extension/ && \
+         exec postgres -c shared_preload_libraries=pg_stream'
 ```
 
 ---

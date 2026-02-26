@@ -10,7 +10,7 @@ triggers the [Release workflow](../.github/workflows/release.yml), which:
 1. Builds extension packages for Linux (amd64), macOS (arm64), and Windows (amd64)
 2. Smoke-tests the Linux artifact against a live PostgreSQL 18 instance
 3. Creates a GitHub Release with archives and SHA256 checksums
-4. Builds and pushes a multi-arch Docker image to GHCR
+4. Builds and pushes a multi-arch extension image to GHCR (for CNPG Image Volumes)
 
 ## Prerequisites
 
@@ -82,13 +82,13 @@ default. Because this is an open-source project, packages linked to the
 public repository inherit public visibility — but you must make the package
 public once to unlock that:
 
-1. Go to **github.com/⟨owner⟩ → Packages → pg_stream**
+1. Go to **github.com/⟨owner⟩ → Packages → pg_stream-ext**
 2. Click **Package settings**
 3. Scroll to **Danger Zone** → **Change package visibility** → set to **Public**
 
 After that first change:
 - All future pushes keep the package public automatically
-- Unauthenticated `docker pull ghcr.io/grove/pg_stream:...` works
+- Unauthenticated `docker pull ghcr.io/grove/pg_stream-ext:...` works
 - Storage and bandwidth are free (GHCR open-source advantage)
 - The package page shows the README, linked repository, license, and
   description from the OCI labels
@@ -100,13 +100,16 @@ Once the workflow completes:
 - [ ] Check the [GitHub Releases](../../releases) page for the new release
 - [ ] Verify all three platform archives are attached (`.tar.gz` for Linux/macOS, `.zip` for Windows)
 - [ ] Verify `SHA256SUMS.txt` is present
-- [ ] Verify the Docker image is available at `ghcr.io/grove/pg_stream:<version>`
-- [ ] Optionally pull and test the Docker image:
+- [ ] Verify the extension image is available at `ghcr.io/grove/pg_stream-ext:<version>`
+- [ ] Optionally verify the extension image layout:
 
 ```bash
-docker pull ghcr.io/grove/pg_stream:0.2.0
-docker run --rm -e POSTGRES_PASSWORD=test ghcr.io/grove/pg_stream:0.2.0 \
-  postgres -c "shared_preload_libraries=pg_stream"
+docker pull ghcr.io/grove/pg_stream-ext:0.2.0
+ID=$(docker create ghcr.io/grove/pg_stream-ext:0.2.0)
+docker cp "$ID:/lib/" /tmp/ext-lib/
+docker cp "$ID:/share/" /tmp/ext-share/
+docker rm "$ID"
+ls -la /tmp/ext-lib/ /tmp/ext-share/extension/
 ```
 
 ## Release Artifacts
@@ -119,7 +122,7 @@ Each release produces:
 | `pg_stream-<ver>-pg18-macos-arm64.tar.gz` | Extension files for macOS Apple Silicon |
 | `pg_stream-<ver>-pg18-windows-amd64.zip`  | Extension files for Windows x64 |
 | `SHA256SUMS.txt` | SHA-256 checksums for all archives |
-| `ghcr.io/grove/pg_stream:<ver>` | CNPG-ready Docker image (amd64 + arm64) |
+| `ghcr.io/grove/pg_stream-ext:<ver>` | CNPG extension image for Image Volumes (amd64 + arm64) |
 
 ### Installing from an archive
 
@@ -142,7 +145,7 @@ See [INSTALL.md](../INSTALL.md) for full installation details.
 ## Pre-releases
 
 Tags containing `-rc`, `-beta`, or `-alpha` (e.g., `v0.3.0-rc.1`) are
-automatically marked as pre-releases on GitHub. Pre-release Docker images are
+automatically marked as pre-releases on GitHub. Pre-release extension images are
 tagged but do **not** update the `latest` tag.
 
 ## Hotfix Releases

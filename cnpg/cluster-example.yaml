@@ -1,16 +1,23 @@
 # =============================================================================
-# Example CloudNativePG Cluster with pg_stream extension.
+# Example CloudNativePG Cluster with pg_stream via Image Volume Extensions.
+#
+# This uses the official CNPG minimal PostgreSQL 18 operand image with the
+# pg_stream extension mounted as an ImageVolume. The extension image is a
+# scratch-based OCI image containing only the .so, .control, and .sql files.
 #
 # Prerequisites:
-#   1. A Kubernetes cluster with the CNPG operator installed
-#   2. The pg_stream Docker image available in the cluster
-#      (either from GHCR or loaded locally with `kind load docker-image`)
+#   1. Kubernetes 1.33+ with ImageVolume feature gate enabled
+#   2. CNPG operator 1.28+ installed
+#   3. pg_stream-ext image available in the cluster registry
 #
 # Deploy:
 #   kubectl apply -f cnpg/cluster-example.yaml
+#   kubectl apply -f cnpg/database-example.yaml
 #
 # Connect:
 #   kubectl exec -it pg-stream-demo-1 -- psql -U postgres -d app
+#
+# See: https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/
 # =============================================================================
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -23,23 +30,26 @@ spec:
   # Number of PostgreSQL instances (1 primary + N-1 replicas)
   instances: 3
 
-  # Docker image with pg_stream pre-installed.
-  # Replace <owner> and <version> with your GHCR coordinates.
-  imageName: ghcr.io/<owner>/pg_stream:<version>
+  # Use the official CNPG minimal PostgreSQL 18 operand image.
+  # The pg_stream extension is loaded via Image Volumes below —
+  # no custom PostgreSQL image is needed.
+  imageName: ghcr.io/cloudnative-pg/postgresql:18
 
   postgresql:
     # Required: load the extension shared library at server start
     shared_preload_libraries:
       - pg_stream
 
+    # Extension image — mounted at /extensions/pg-stream/
+    # CNPG automatically configures:
+    #   extension_control_path → /extensions/pg-stream/share
+    #   dynamic_library_path   → /extensions/pg-stream/lib
+    extensions:
+      - name: pg-stream
+        image:
+          reference: ghcr.io/<owner>/pg_stream-ext:<version>
+
     parameters:
-      # Not required for trigger-based CDC, but needed if migrating
-      # to logical-replication CDC in the future.
-      # wal_level: logical
-
-      # Recommended if using logical replication CDC (not needed for triggers)
-      # max_replication_slots: "10"
-
       # Recommended: scheduler bgworker + refresh workers
       max_worker_processes: "8"
 
@@ -53,9 +63,8 @@ spec:
     initdb:
       database: app
       owner: app
-      # Automatically create the extension on database initialization
-      postInitSQL:
-        - CREATE EXTENSION pg_stream
+      # Extension creation is handled declaratively by the Database resource
+      # (see cnpg/database-example.yaml). No postInitSQL needed.
 
   storage:
     size: 10Gi

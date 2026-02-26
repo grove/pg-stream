@@ -239,11 +239,20 @@ jobs:
 
   # ── CloudNativePG smoke test (non-blocking, Linux only) ─────────────────
   # Runs on weekly schedule and manual dispatch only (requires kind cluster).
+  #
+  # Uses a transitional approach: builds the scratch-based extension image
+  # (cnpg/Dockerfile.ext-build), then creates a composite image combining
+  # the extension with postgres:18.1 for the smoke test. This validates
+  # that the extension image layout is correct and the extension works.
+  #
+  # Once kind supports Kubernetes 1.33 with ImageVolume feature gate, this
+  # should be updated to use .spec.postgresql.extensions directly with the
+  # official CNPG operand image.
   cnpg-smoke-test:
     name: CNPG smoke test
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 15
+    timeout-minutes: 20
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -253,10 +262,42 @@ jobs:
         with:
           cluster_name: cnpg-test
 
-      - name: Build extension Docker image
+      - name: Build extension image (scratch-based)
         run: |
-          docker build -t pg_stream:18.1 \
-            -f cnpg/Dockerfile .
+          docker build -t pg_stream-ext:ci \
+            -f cnpg/Dockerfile.ext-build .
+
+      - name: Verify extension image layout
+        run: |
+          ID=$(docker create pg_stream-ext:ci)
+          mkdir -p /tmp/ext-verify
+          docker cp "$ID:/lib/" /tmp/ext-verify/lib/
+          docker cp "$ID:/share/" /tmp/ext-verify/share/
+          docker rm "$ID"
+
+          echo "=== Extension image contents ==="
+          find /tmp/ext-verify -type f
+          echo "==============================="
+
+          test -f /tmp/ext-verify/lib/pg_stream.so
+          test -f /tmp/ext-verify/share/extension/pg_stream.control
+          ls /tmp/ext-verify/share/extension/pg_stream--*.sql
+
+          echo "Extension image layout OK"
+
+      - name: Build composite image for smoke test
+        run: |
+          # Transitional: combine extension image with postgres:18.1
+          # until kind supports K8s 1.33 ImageVolume feature gate.
+          # This image is NOT shipped — only used for CI validation.
+          cat > /tmp/Dockerfile.cnpg-smoke <<'DOCKERFILE'
+          FROM pg_stream-ext:ci AS ext
+          FROM postgres:18.1
+          COPY --from=ext /lib/ /usr/lib/postgresql/18/lib/
+          COPY --from=ext /share/extension/ /usr/share/postgresql/18/extension/
+          DOCKERFILE
+
+          docker build -t pg_stream:18.1 -f /tmp/Dockerfile.cnpg-smoke .
 
       - name: Load image into kind
         run: kind load docker-image pg_stream:18.1 --name cnpg-test
