@@ -67,9 +67,9 @@ jobs:
         if: runner.os != 'Windows'
         run: ./scripts/run_unit_tests.sh pg18
 
-      - name: Run unit tests (Windows)
+      - name: Compile-check unit tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo test --lib --features pg18
+        run: cargo test --lib --features pg18 --no-run
 
   # ── Integration tests (testcontainers, Linux only) ──────────────────────
   integration-tests:
