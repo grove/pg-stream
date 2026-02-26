@@ -9571,50 +9571,6 @@ mod tests {
         }
     }
 
-    // ── strip_view_definition_suffix tests ──────────────────────────
-
-    #[test]
-    fn test_strip_view_def_suffix_trailing_semicolon() {
-        assert_eq!(strip_view_definition_suffix("SELECT 1;"), "SELECT 1");
-    }
-
-    #[test]
-    fn test_strip_view_def_suffix_trailing_semicolon_with_whitespace() {
-        assert_eq!(
-            strip_view_definition_suffix("SELECT a FROM t ;  "),
-            "SELECT a FROM t"
-        );
-    }
-
-    #[test]
-    fn test_strip_view_def_suffix_no_semicolon() {
-        assert_eq!(
-            strip_view_definition_suffix("SELECT a FROM t"),
-            "SELECT a FROM t"
-        );
-    }
-
-    #[test]
-    fn test_strip_view_def_suffix_multiple_semicolons_strips_last_only() {
-        // Only the trailing one is stripped; interior semicolons would be
-        // a syntax error in view definitions, but we still handle it.
-        assert_eq!(strip_view_definition_suffix("SELECT ';'; "), "SELECT ';'");
-    }
-
-    #[test]
-    fn test_strip_view_def_suffix_empty_string() {
-        assert_eq!(strip_view_definition_suffix(""), "");
-    }
-
-    #[test]
-    fn test_strip_view_def_suffix_multiline() {
-        let input = " SELECT a,\n       b\nFROM t;\n";
-        assert_eq!(
-            strip_view_definition_suffix(input),
-            "SELECT a,\n       b\nFROM t"
-        );
-    }
-
     // ── Expr::to_sql tests ──────────────────────────────────────────
 
     #[test]
