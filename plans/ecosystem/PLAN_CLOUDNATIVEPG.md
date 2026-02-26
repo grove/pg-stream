@@ -3,6 +3,39 @@
 Date: 2026-02-26
 Status: IMPLEMENTED
 Supersedes: Project 5 in [PLAN_ECO_SYSTEM.md](PLAN_ECO_SYSTEM.md)
+PR: [#15](https://github.com/grove/pg-stream/pull/15)
+Branch: `cloudnative-pg-image-volume`
+
+---
+
+## Implementation Summary
+
+All 9 tasks were implemented in PR #15. Key decisions made during
+implementation:
+
+| Decision | Chosen Approach |
+|---|---|
+| Release smoke test | **Both Option A + B** — layout verification via `docker create`/`docker cp`, plus a composite-image SQL smoke test |
+| CI CNPG smoke test | **Strategy A (transitional)** — composite image (`scratch` ext + `postgres:18.1`) until `kind` supports K8s 1.33 |
+| CNPG operator version in CI | Remains at **1.25.0** (latest stable at time of implementation) |
+| Base `INSTALL.md` version | Uses `0.1.0` (current release) rather than `0.2.0` |
+
+Files changed:
+
+| Action | File |
+|--------|------|
+| Created | `cnpg/Dockerfile.ext` |
+| Created | `cnpg/Dockerfile.ext-build` |
+| Created | `cnpg/database-example.yaml` |
+| Deleted | `cnpg/Dockerfile` |
+| Deleted | `cnpg/Dockerfile.release` |
+| Modified | `cnpg/cluster-example.yaml` |
+| Modified | `.github/workflows/release.yml` |
+| Modified | `.github/workflows/ci.yml` |
+| Modified | `justfile` |
+| Modified | `INSTALL.md` |
+| Modified | `docs/RELEASE.md` |
+| Modified | `docs/introduction.md` |
 
 ---
 
@@ -156,7 +189,7 @@ with a Debian-compiled extension will fail at runtime.
 ### Task 1 — Extension-Only Dockerfile (scratch)
 
 **File:** `cnpg/Dockerfile.ext`
-**Effort:** ~30 minutes
+**Status:** ✅ Completed
 
 This Dockerfile is used by the **release workflow** to package pre-built
 artifacts (already compiled in the `build-release` job) into the extension
@@ -194,10 +227,15 @@ LABEL org.opencontainers.image.title="pg_stream-ext" \
 ### Task 2 — From-Source Build Dockerfile
 
 **File:** `cnpg/Dockerfile.ext-build`
-**Effort:** ~1 hour
+**Status:** ✅ Completed
 
 Multi-stage Dockerfile for local development and CI. Stage 1 compiles the
 extension from source; Stage 2 copies only the extension files into `scratch`.
+
+> **Note:** The dependency-caching layer creates stub `src/ivm/` directories.
+> The actual source tree uses `src/dvm/`. This doesn't break the build (the
+> `COPY src/ src/` layer overwrites the stubs), but reduces cache hit rate.
+> A follow-up PR should rename the stubs to `src/dvm/`.
 
 ```dockerfile
 # =============================================================================
@@ -266,11 +304,11 @@ LABEL org.opencontainers.image.title="pg_stream-ext" \
 
 ### Task 3 — Remove Old Full-Image Dockerfiles
 
-**Files to delete:**
+**Files deleted:**
 - `cnpg/Dockerfile` — full PostgreSQL image with UID remapping
 - `cnpg/Dockerfile.release` — full PostgreSQL image from pre-built artifacts
 
-**Effort:** ~10 minutes
+**Status:** ✅ Completed
 
 These are fully replaced by `Dockerfile.ext` and `Dockerfile.ext-build`. The
 UID 26 remapping, the `postgres:18.1` base, and the extension file placement
@@ -279,7 +317,7 @@ into `/usr/lib/postgresql/18/lib/` are all unnecessary when using Image Volumes.
 ### Task 4 — Update Release Workflow
 
 **File:** `.github/workflows/release.yml`
-**Effort:** ~2 hours
+**Status:** ✅ Completed — Both Option A and Option B were implemented.
 
 Changes:
 
@@ -291,7 +329,7 @@ Changes:
    `scratch`-based (no shell, no PostgreSQL), the Docker-based SQL smoke test
    must use a different strategy:
 
-   **Option A (recommended):** Keep the existing artifact-level verification
+   **Option A (implemented):** Keep the existing artifact-level verification
    (extract tar, check file tree), then validate the Docker image layout:
    ```bash
    docker build -t pg_stream-ext:test -f cnpg/Dockerfile.ext dist/
@@ -304,17 +342,16 @@ Changes:
    test -f /tmp/ext-share/extension/pg_stream.control
    ls /tmp/ext-share/extension/pg_stream--*.sql
    ```
-   The SQL-level smoke test (`CREATE EXTENSION`) is covered separately by the
-   CNPG smoke test in `ci.yml`.
-
-   **Option B:** Build a temporary composite image for testing:
+   **Option B (also implemented):** A composite image is also built in the
+   same job for a SQL-level `CREATE EXTENSION` smoke test:
    ```dockerfile
    FROM postgres:18.1
    COPY --from=pg_stream-ext:test /lib/ /usr/lib/postgresql/18/lib/
    COPY --from=pg_stream-ext:test /share/extension/ /usr/share/postgresql/18/extension/
    ```
-   This adds complexity but retains the existing SQL-level verification in the
-   release pipeline itself.
+   Both options were implemented: Option A validates the image layout, then
+   Option B runs a full `CREATE EXTENSION` + `SELECT` smoke test using the
+   composite image.
 
 3. **`publish-docker-arch` job** — Change:
    - `file: cnpg/Dockerfile.release` → `file: cnpg/Dockerfile.ext`
@@ -326,11 +363,11 @@ Changes:
 
 ### Task 5 — Update CI CNPG Smoke Test
 
-**File:** `.github/workflows/ci.yml` (lines ~252–378)
-**Effort:** ~3 hours
+**File:** `.github/workflows/ci.yml` (lines ~252–420)
+**Status:** ✅ Completed — Strategy A (transitional composite image)
 
-The current smoke test builds the full Docker image, loads it into kind, and
-deploys a `Cluster` with `imageName`. The new approach:
+The old smoke test built the full Docker image, loaded it into kind, and
+deployed a `Cluster` with `imageName`. The new approach:
 
 1. Build the extension image from source: `docker build -f cnpg/Dockerfile.ext-build`
 2. Load the extension image into kind
@@ -342,10 +379,10 @@ deploys a `Cluster` with `imageName`. The new approach:
 required. As of this writing, `kind` may not yet support K8s 1.33. Two
 mitigation strategies:
 
-- **Strategy A (transitional):** Keep a CI-only composite Dockerfile that
-  copies extension files from the `scratch` image into `postgres:18.1`, used
-  only for the smoke test. This validates the extension works but does not
-  exercise the Image Volume path end-to-end.
+- **Strategy A (implemented — transitional):** Keep a CI-only composite
+  Dockerfile that copies extension files from the `scratch` image into
+  `postgres:18.1`, used only for the smoke test. This validates the extension
+  works but does not exercise the Image Volume path end-to-end.
   ```dockerfile
   # tests/Dockerfile.cnpg-smoke (CI-only, not shipped)
   FROM pg_stream-ext:ci AS ext
@@ -356,15 +393,20 @@ mitigation strategies:
 - **Strategy B (deferred):** Skip the CNPG smoke test until kind supports K8s
   1.33. The release pipeline still validates the image layout (Task 4).
 
-Update the CNPG operator version from `1.25.0` to `1.28.x` when kind support
-is available.
+The CI workflow additionally verifies the extension image layout before
+creating the composite image (same `docker create`/`docker cp` approach as
+the release workflow). Timeout was increased to 20 minutes.
+
+> **TODO:** Update the CNPG operator version from `1.25.0` to `1.28.x` and
+> switch to native `.spec.postgresql.extensions` once `kind` supports K8s 1.33
+> with the `ImageVolume` feature gate.
 
 ### Task 6 — Rewrite Cluster Example Manifests
 
-**File:** `cnpg/cluster-example.yaml`
-**Effort:** ~1 hour
+**Files:** `cnpg/cluster-example.yaml`, `cnpg/database-example.yaml`
+**Status:** ✅ Completed
 
-Replace the current monolithic example with an Image Volume-based deployment.
+Replaced the current monolithic example with an Image Volume-based deployment.
 The new manifest uses the official CNPG operand image as the base and
 references the extension image via `.spec.postgresql.extensions`.
 
@@ -441,7 +483,7 @@ spec:
 ### Task 7 — Update Justfile
 
 **File:** `justfile`
-**Effort:** ~10 minutes
+**Status:** ✅ Completed
 
 ```just
 # ── Docker ────────────────────────────────────────────────────────────────
@@ -453,7 +495,7 @@ docker-build:
 
 ### Task 8 — Update Documentation
 
-**Effort:** ~2 hours
+**Status:** ✅ Completed — updated INSTALL.md, docs/RELEASE.md, docs/introduction.md
 
 #### INSTALL.md (lines 57–65)
 
@@ -469,19 +511,20 @@ pg_stream is distributed as an OCI extension image for use with
 
 ```bash
 # Pull the extension image
-docker pull ghcr.io/grove/pg_stream-ext:0.2.0
+docker pull ghcr.io/grove/pg_stream-ext:0.1.0
 ```
 
-See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) for a complete
-Cluster deployment example.
+See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and
+[cnpg/database-example.yaml](cnpg/database-example.yaml) for complete
+Cluster and Database deployment examples.
 
 For local Docker development without Kubernetes, install the extension files
 manually into a standard PostgreSQL container:
 
 ```bash
 # Extract extension files from the release archive
-tar xzf pg_stream-0.2.0-pg18-linux-amd64.tar.gz
-cd pg_stream-0.2.0-pg18-linux-amd64
+tar xzf pg_stream-0.1.0-pg18-linux-amd64.tar.gz
+cd pg_stream-0.1.0-pg18-linux-amd64
 
 # Run PostgreSQL with the extension mounted
 docker run --rm \

@@ -9,6 +9,30 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Changed
+
+#### CloudNativePG Image Volume Extension Distribution
+- **Extension-only OCI image** — replaced the full PostgreSQL Docker image
+  (`ghcr.io/<owner>/pg_stream`) with a minimal `scratch`-based extension image
+  (`ghcr.io/<owner>/pg_stream-ext`) following the
+  [CNPG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/)
+  specification. The image contains only `.so`, `.control`, and `.sql` files
+  (< 10 MB vs ~400 MB for the old full image).
+- **New `cnpg/Dockerfile.ext`** — release Dockerfile for packaging pre-built
+  artifacts into the scratch-based extension image.
+- **New `cnpg/Dockerfile.ext-build`** — multi-stage from-source build for
+  local development and CI.
+- **New `cnpg/database-example.yaml`** — CNPG `Database` resource for
+  declarative `CREATE EXTENSION pg_stream` (replaces `postInitSQL`).
+- **Updated `cnpg/cluster-example.yaml`** — uses official CNPG PostgreSQL 18
+  operand image with `.spec.postgresql.extensions` for Image Volume mounting.
+- **Removed `cnpg/Dockerfile` and `cnpg/Dockerfile.release`** — the old full
+  PostgreSQL images are no longer built or published.
+- **Updated release workflow** — publishes multi-arch (amd64/arm64) extension
+  image to GHCR with layout verification and SQL smoke test.
+- **Updated CI CNPG smoke test** — uses transitional composite image approach
+  until `kind` supports Kubernetes 1.33 with `ImageVolume` feature gate.
+
 ---
 
 ## [0.1.0] — 2026-02-26
