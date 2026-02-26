@@ -22,15 +22,29 @@ runs:
         components: clippy, rustfmt
 
     # ── Caching ───────────────────────────────────────────────────────────
-    - name: Cache Rust build artifacts
-      uses: Swatinem/rust-cache@v2
+    # Note: Swatinem/rust-cache@v2 is NOT used here because it references
+    # the 'matrix' context internally, which is unavailable in composite
+    # actions and causes GitHub Actions workflow validation to fail.
+    - name: Cache cargo registry
+      uses: actions/cache@v4
       with:
-        cache-on-failure: true
-        save-always: true
-        # Include pgrx version in key so cache is invalidated on pgrx upgrade.
-        # ImageOS (e.g. ubuntu22, ubuntu24) prevents cross-image GLIBC mismatches
-        # when ubuntu-latest shifts to a newer image.
-        prefix-key: v1-rust-pgrx0.17-${{ env.ImageOS || 'unknown' }}
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: v1-cargo-registry-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          v1-cargo-registry-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-
+          v1-cargo-registry-${{ runner.os }}-
+
+    - name: Cache cargo build artifacts
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: v1-cargo-build-pgrx0.17-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          v1-cargo-build-pgrx0.17-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-
+          v1-cargo-build-pgrx0.17-${{ runner.os }}-
 
     - name: Cache pgrx home directory (~/.pgrx)
       id: cache-pgrx-home
