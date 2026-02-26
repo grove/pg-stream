@@ -4,7 +4,7 @@
 # Runs cargo-audit to check all Cargo dependencies against the RustSec
 # Advisory Database (https://rustsec.org/) for known CVEs.
 #
-# Results are uploaded as SARIF so they appear in Security > Code scanning.
+# Results are posted as PR check annotations via rustsec/audit-check.
 #
 # Runs on: pushes to main that touch dependencies, every PR, and weekly.
 # =============================================================================
@@ -27,7 +27,7 @@ on:
 
 permissions:
   contents: read
-  security-events: write  # upload SARIF to Code scanning tab
+  issues: write  # rustsec/audit-check posts PR annotations
 
 jobs:
   audit:
@@ -37,15 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --features sarif
-
       - name: Run cargo audit
-        run: cargo audit --file Cargo.lock --json | cargo-audit sarif > audit.sarif
-        continue-on-error: true  # upload SARIF even on findings
-
-      - name: Upload SARIF to Code scanning
-        uses: github/codeql-action/upload-sarif@v3
+        uses: rustsec/audit-check@v2
         with:
-          sarif_file: audit.sarif
-          category: cargo-audit
+          token: ${{ secrets.GITHUB_TOKEN }}
