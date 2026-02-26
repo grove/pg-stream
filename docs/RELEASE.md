@@ -100,12 +100,12 @@ Once the workflow completes:
 - [ ] Check the [GitHub Releases](../../releases) page for the new release
 - [ ] Verify all three platform archives are attached (`.tar.gz` for Linux/macOS, `.zip` for Windows)
 - [ ] Verify `SHA256SUMS.txt` is present
-- [ ] Verify the Docker image is available at `ghcr.io/<owner>/pg_stream:<version>`
+- [ ] Verify the Docker image is available at `ghcr.io/grove/pg_stream:<version>`
 - [ ] Optionally pull and test the Docker image:
 
 ```bash
-docker pull ghcr.io/<owner>/pg_stream:0.2.0
-docker run --rm -e POSTGRES_PASSWORD=test ghcr.io/<owner>/pg_stream:0.2.0 \
+docker pull ghcr.io/grove/pg_stream:0.2.0
+docker run --rm -e POSTGRES_PASSWORD=test ghcr.io/grove/pg_stream:0.2.0 \
   postgres -c "shared_preload_libraries=pg_stream"
 ```
 
@@ -119,7 +119,7 @@ Each release produces:
 | `pg_stream-<ver>-pg18-macos-arm64.tar.gz` | Extension files for macOS Apple Silicon |
 | `pg_stream-<ver>-pg18-windows-amd64.zip`  | Extension files for Windows x64 |
 | `SHA256SUMS.txt` | SHA-256 checksums for all archives |
-| `ghcr.io/<owner>/pg_stream:<ver>` | CNPG-ready Docker image (amd64 + arm64) |
+| `ghcr.io/grove/pg_stream:<ver>` | CNPG-ready Docker image (amd64 + arm64) |
 
 ### Installing from an archive
 

@@ -9,6 +9,10 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+---
+
+## [0.1.0] — 2026-02-26
+
 ### Fixed
 
 #### WAL Decoder pgoutput Action Parsing (F4 / G2.3)

@@ -1,7 +1,7 @@
 # pg_stream — Project Roadmap
 
 > **Last updated:** 2026-02-26
-> **Current version:** 0.1.0 (pre-release)
+> **Current version:** 0.1.0
 
 For a concise description of what pg_stream is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -31,9 +31,9 @@ and beyond.
 
 ---
 
-## v0.1.0 — Pre-release (current)
+## v0.1.0 — Released (2026-02-26)
 
-**Status: Complete — all 13 design phases implemented.**
+**Status: Released — all 13 design phases implemented.**
 
 Core engine, DVM with 21 OpTree operators, trigger-based CDC, DAG-aware
 scheduling, monitoring, dbt macro package, and 1,300+ tests.

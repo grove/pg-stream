@@ -35,8 +35,8 @@ sha256sum -c SHA256SUMS.txt
 **Linux / macOS:**
 
 ```bash
-tar xzf pg_stream-0.2.0-pg18-linux-amd64.tar.gz
-cd pg_stream-0.2.0-pg18-linux-amd64
+tar xzf pg_stream-0.1.0-pg18-linux-amd64.tar.gz
+cd pg_stream-0.1.0-pg18-linux-amd64
 
 sudo cp lib/*.so  "$(pg_config --pkglibdir)/"
 sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
@@ -45,8 +45,8 @@ sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
 **Windows (PowerShell):**
 
 ```powershell
-Expand-Archive pg_stream-0.2.0-pg18-windows-amd64.zip -DestinationPath .
-cd pg_stream-0.2.0-pg18-windows-amd64
+Expand-Archive pg_stream-0.1.0-pg18-windows-amd64.zip -DestinationPath .
+cd pg_stream-0.1.0-pg18-windows-amd64
 
 Copy-Item lib\*.dll  "$(pg_config --pkglibdir)\"
 Copy-Item extension\* "$(pg_config --sharedir)\extension\"
@@ -57,10 +57,10 @@ Copy-Item extension\* "$(pg_config --sharedir)\extension\"
 Alternatively, skip the manual install and use the CNPG-ready Docker image:
 
 ```bash
-docker pull ghcr.io/<owner>/pg_stream:0.2.0
+docker pull ghcr.io/grove/pg_stream:0.1.0
 
 docker run --rm -e POSTGRES_PASSWORD=postgres \
-  ghcr.io/<owner>/pg_stream:0.2.0 \
+  ghcr.io/grove/pg_stream:0.1.0 \
   postgres -c "shared_preload_libraries=pg_stream"
 ```
 
