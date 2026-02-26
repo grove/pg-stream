@@ -8,22 +8,42 @@ Traditional materialized views force a choice: either re-run the full query (exp
 
 ### How data flows
 
-The key concept is that **data flows** from your base tables into stream tables automatically:
+The key concept is that **data flows downstream automatically** — from your base tables through any chain of stream tables, without you writing a single line of orchestration code:
 
 ```
-┌──────────────┐     CDC          ┌────────────────┐     Delta Query     ┌──────────────┐
-│  Base Tables │ ──triggers──▶    │ Change Buffers │ ────(ΔQ)──────▶     │ Stream Table │
-│  (you write) │                  │ (captured rows)│                     │ (auto-updated)│
-└──────────────┘                  └────────────────┘                     └──────────────┘
+  You write to base tables
+         │
+         ▼
+  ┌─────────────┐   triggers (or WAL)   ┌─────────────────────┐
+  │ Base Tables │ ─────────────────────▶ │   Change Buffers    │
+  │ (you write) │                        │ (pgstream_changes.*) │
+  └─────────────┘                        └──────────┬──────────┘
+                                                     │
+                                           delta query (ΔQ) on refresh
+                                                     │
+                                                     ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Stream Table A  ◀── depends on base tables                  │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │  change captured, buffer written
+                             ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Stream Table B  ◀── depends on Stream Table A               │
+  └──────────────────────────────────────────────────────────────┘
 ```
+
+One write to a base table can ripple through an entire DAG of stream tables —
+each layer refreshed in the correct topological order, each doing only the work
+proportional to what actually changed.
 
 1. You write to your base tables normally — `INSERT`, `UPDATE`, `DELETE`
-2. Lightweight triggers capture each change into a buffer (no polling, no logical replication)
-3. On refresh, pg_stream derives a **delta query** that reads only the buffered changes
-4. The delta is merged into the stream table — touched rows are updated, untouched rows are left alone
-5. The change buffer is cleaned up
+2. Lightweight `AFTER` row-level triggers capture each change into a buffer, atomically in the same transaction. No polling, no logical replication slots required by default.
+3. On each refresh cycle, pg_stream derives a **delta query (ΔQ)** that reads only the buffered changes since the last refresh frontier
+4. The delta is merged into the stream table — only the affected rows are written
+5. If other stream tables depend on this one, they are scheduled next (topological order)
+6. Optionally: once `wal_level = logical` is available and the first refresh succeeds, pg_stream automatically transitions from triggers to **WAL-based CDC** (~2–15 μs write overhead vs triggers). The transition is seamless and transparent.
 
-This tutorial walks through a concrete example so you can see this flow in action.
+This tutorial walks through a concrete org-chart example so you can see this flow end to end, including a chain of stream tables that propagates changes automatically.
 
 ---
 
@@ -32,13 +52,16 @@ This tutorial walks through a concrete example so you can see this flow in actio
 An **employee org-chart** system with two stream tables:
 
 - **`department_tree`** — a recursive CTE that flattens a department hierarchy into paths like `Company > Engineering > Backend`
-- **`department_stats`** — a join + aggregation that computes headcount and salary budget per department
+- **`department_stats`** — a join + aggregation over `department_tree` (a stream table!) that computes headcount and salary budget, with the full path included
+- **`department_report`** — a further aggregation that rolls up stats to top-level departments
+
+The chain `departments` → `department_tree` → `department_stats` → `department_report` demonstrates **automatic downstream propagation**: modify a department name in the base table and all three stream tables update automatically, in the right order, without any manual orchestration.
 
 By the end you will have:
 
 - Seen how stream tables are created, queried, and refreshed
-- Watched INSERTs, UPDATEs, and DELETEs flow through to both stream tables automatically
-- Understood what happens under the hood at each step
+- Watched a single `UPDATE` in a base table cascade through three layers of stream tables automatically
+- Understood the two IVM strategies and when each applies
 
 ---
 
@@ -133,7 +156,7 @@ SELECT pgstream.create_stream_table(
 
         -- Recursive step: children join back to the tree
         SELECT d.id, d.name, d.parent_id,
-               tree.path || '' > '' || d.name AS path,
+               tree.path || ' > ' || d.name AS path,
                tree.depth + 1
         FROM departments d
         JOIN tree ON d.parent_id = tree.id
@@ -182,208 +205,289 @@ This is a **real PostgreSQL table** — you can create indexes on it, join it in
 
 ---
 
-## Step 3: Create the Second Stream Table — Aggregation with Joins
+## Step 3: Chain Stream Tables — Build the Downstream Layers
 
-Now create a stream table that joins employees to departments and computes per-department statistics. This demonstrates **algebraic incremental view maintenance** — the most powerful mode, where pg_stream derives a delta formula mathematically from the query structure.
+Now create `department_stats`. The twist: instead of joining directly against `departments`, it joins against `department_tree` — the stream table we just created. This creates a **chain**: changes to `departments` update `department_tree`, whose changes then trigger `department_stats` to update.
+
+This demonstrates how pg_stream builds a **DAG** — a directed acyclic graph of stream tables — and automatically schedules refreshes in topological order.
 
 ```sql
 SELECT pgstream.create_stream_table(
     'department_stats',
     $$
     SELECT
-        d.id AS department_id,
-        d.name AS department_name,
-        COUNT(e.id) AS headcount,
-        COALESCE(SUM(e.salary), 0) AS total_salary,
-        COALESCE(AVG(e.salary), 0) AS avg_salary
-    FROM departments d
-    LEFT JOIN employees e ON e.department_id = d.id
-    GROUP BY d.id, d.name
+        t.id          AS department_id,
+        t.name        AS department_name,
+        t.path        AS full_path,
+        t.depth,
+        COUNT(e.id)                    AS headcount,
+        COALESCE(SUM(e.salary), 0)     AS total_salary,
+        COALESCE(AVG(e.salary), 0)     AS avg_salary
+    FROM department_tree t
+    LEFT JOIN employees e ON e.department_id = t.id
+    GROUP BY t.id, t.name, t.path, t.depth
     $$,
-    '30s',
+    'CALCULATED',       -- inherit schedule from downstream; see explanation below
     'DIFFERENTIAL'
 );
 ```
 
 ### What just happened — and why this one is different?
 
-Like before, pg_stream parsed the query, created a storage table, and installed CDC triggers. But this time the query has no recursive CTE, so pg_stream can use **algebraic differentiation**:
+Like before, pg_stream parsed the query, created a storage table, and set up CDC. But `department_stats` depends on `department_tree`, not a base table — so *no new triggers were installed*. Instead, pg_stream registered `department_tree` as an upstream dependency in the DAG.
 
-1. It decomposed the query into operators: `Scan(departments)` → `LEFT JOIN` → `Scan(employees)` → `Aggregate(GROUP BY + COUNT/SUM/AVG)` → `Project`
-2. For each operator, it derived a **differentiation rule** (the math of IVM):
-   - `Δ(Scan)` = read only changed rows from the change buffer
-   - `Δ(LEFT JOIN)` = join changed rows from one side against the full other side (a "half-join")
-   - `Δ(Aggregate)` = for algebraic aggregates like COUNT and SUM, add/subtract the delta without re-scanning the group
-3. It composed these rules into a single **delta query** (ΔQ) — a SQL statement that computes the exact effect of the changes, never touching unchanged rows
+The schedule is `'CALCULATED'`, which means: "don't give this table its own schedule — inherit the tightest schedule of any downstream table that queries it". Since no other stream table has been created yet, PostgreSQL will prompt a full refresh on demand for now.
 
-This means that when you insert one employee, the refresh doesn't re-scan all 7 employees or all 7 departments. It reads one change buffer row, joins it to find the department, and adjusts the count and sum for that one group.
+The query has no recursive CTE, so pg_stream uses **algebraic differentiation**:
+
+1. Decomposed into operators: `Scan(department_tree)` → `LEFT JOIN` → `Scan(employees)` → `Aggregate(GROUP BY + COUNT/SUM/AVG)` → `Project`
+2. Derived a differentiation rule for each:
+   - `Δ(Scan)` = read only change buffer rows (not the full table)
+   - `Δ(LEFT JOIN)` = join change rows from one side against the full other side
+   - `Δ(Aggregate)` = for COUNT/SUM/AVG, add or subtract per group — no rescan needed
+3. Composed these into a single **delta query (ΔQ)** that never touches unchanged rows
+
+When one employee is inserted, the refresh reads one change buffer row, joins to find the department, and adjusts only that group's count and sum.
 
 Query it:
 
 ```sql
-SELECT * FROM department_stats ORDER BY department_name;
+SELECT department_name, full_path, headcount, total_salary
+FROM department_stats
+ORDER BY full_path;
 ```
 
 Expected output:
 
 ```
- department_id | department_name | headcount | total_salary | avg_salary
----------------+-----------------+-----------+--------------+------------
-             5 | Backend         |         2 |    235000.00 |  117500.00
-             1 | Company         |         0 |         0.00 |       0.00
-             2 | Engineering     |         0 |         0.00 |       0.00
-             6 | Frontend        |         1 |    110000.00 |  110000.00
-             4 | Operations      |         1 |    100000.00 |  100000.00
-             7 | Platform        |         1 |    130000.00 |  130000.00
-             3 | Sales           |         2 |    185000.00 |   92500.00
+ department_name |                 full_path                  | headcount | total_salary
+-----------------+--------------------------------------------+-----------+--------------
+ Backend         | Company > Engineering > Backend            |         2 |    235000.00
+ Frontend        | Company > Engineering > Frontend           |         1 |    110000.00
+ Platform        | Company > Engineering > Platform           |         1 |    130000.00
+ Engineering     | Company > Engineering                      |         0 |         0.00
+ Operations      | Company > Operations                       |         1 |    100000.00
+ Sales           | Company > Sales                            |         2 |    185000.00
+ Company         | Company                                    |         0 |         0.00
+```
+
+Notice that the `full_path` column comes from `department_tree` — this data already went through one layer of incremental maintenance before landing here.
+
+### Add a third layer: `department_report`
+
+Now add a rollup that aggregates `department_stats` by top-level group (depth = 1):
+
+```sql
+SELECT pgstream.create_stream_table(
+    'department_report',
+    $$
+    SELECT
+        split_part(full_path, ' > ', 2) AS division,
+        SUM(headcount)                  AS total_headcount,
+        SUM(total_salary)               AS total_payroll
+    FROM department_stats
+    WHERE depth >= 1
+    GROUP BY 1
+    $$,
+    '30s',            -- this is the only explicit schedule; CALCULATED tables above inherit it
+    'DIFFERENTIAL'
+);
+```
+
+The DAG is now:
+
+```
+departments (base)  employees (base)
+      │                   │
+      ▼                   │
+department_tree ──────────┤
+   (DIFF, CALCULATED)     │
+      │                   ▼
+      └──────▶ department_stats
+                 (DIFF, CALCULATED)
+                      │
+                      ▼
+               department_report
+                  (DIFF, 30s)  ◀── only explicit schedule
+```
+
+`department_report` drives the whole pipeline. Because it has a 30-second schedule, pg_stream automatically propagates that cadence upstream: `department_stats` and `department_tree` will also be refreshed within 30 seconds of a base table change, in topological order, with no manual configuration.
+
+Query the report:
+
+```sql
+SELECT * FROM department_report ORDER BY division;
+```
+
+```
+  division   | total_headcount | total_payroll
+-------------+-----------------+---------------
+ Engineering |               4 |    475000.00
+ Operations  |               1 |    100000.00
+ Sales       |               2 |    185000.00
 ```
 
 ---
 
-## Step 4: Watch Data Flow Through
+## Step 4: Watch a Change Cascade Through All Three Layers
 
-This is the heart of incremental view maintenance. We'll make four changes to the base tables and observe how each change flows through the pipeline to update the stream tables — processing only the affected rows.
+This is the heart of pg_stream. We'll make four changes to the base tables and watch changes propagate automatically through the three-layer DAG — each layer doing only the minimum work.
 
-### The data flow pipeline
-
-For every change you'll see these steps happen:
+### The data flow pipeline (three layers)
 
 ```
   Your SQL statement
        │
        ▼
   CDC trigger fires (same transaction)
-       │
-       ▼
   Change buffer receives one row
        │
        ▼
-  Refresh triggered (manual or scheduled)
+  Background scheduler fires (or manual refresh_stream_table)
        │
-       ▼
-  Delta query (ΔQ) reads only the buffered changes
+       ├──▶ [Layer 1] Refresh department_tree
+       │         delta query reads change buffer
+       │         MERGE touches only affected rows in department_tree
+       │         department_tree's own change buffer is updated
        │
-       ▼
-  MERGE applies the delta to the stream table
+       ├──▶ [Layer 2] Refresh department_stats
+       │         delta query reads department_tree's change buffer
+       │         MERGE touches only affected department groups
        │
-       ▼
-  Stream table is up to date ✓
+       └──▶ [Layer 3] Refresh department_report
+                 delta query reads department_stats' change buffer
+                 MERGE touches only affected division rows
+                 All change buffers cleaned up ✓
 ```
 
-### 4a: INSERT — Hire a new employee
+All three layers run in a single scheduled pass, in topological order.
+
+### 4a: A single INSERT ripples through all three layers
 
 ```sql
 INSERT INTO employees (name, department_id, salary) VALUES
     ('Heidi', 6, 105000);  -- New Frontend engineer
 ```
 
-**What happened behind the scenes:** The `AFTER INSERT` trigger on `employees` fired and wrote one row to the change buffer table `pgstream_changes.changes_<employees_oid>`. This row contains the new values (`name='Heidi'`, `department_id=6`, `salary=105000`), the action type (`I` for insert), and the WAL LSN position at the time of the insert.
+**What happened immediately (in your transaction):** The `AFTER INSERT` trigger on `employees` fired and wrote one row to `pgstream_changes.changes_<employees_oid>`. The row contains the new values, action type `I`, and the LSN at the time of insert. Your transaction committed normally — no blocking.
 
-The stream tables don't know about this change yet — the change is sitting in the buffer, waiting for the next refresh.
+The stream tables don't know about Heidi yet. The change is in the buffer, waiting for the next refresh.
 
-Trigger a refresh (or wait for the 30-second schedule to fire automatically):
+Refresh the whole pipeline in one call (or wait for the 30-second schedule):
 
 ```sql
-SELECT pgstream.refresh_stream_table('department_stats');
+-- refresh_stream_table cascades to dependent tables automatically
+SELECT pgstream.refresh_stream_table('department_report');
 ```
 
-**What happened during refresh:**
+**What happened across the three layers:**
 
-1. pg_stream checked the change buffer and found 1 new row since the last refresh frontier
-2. The **delta query** was executed. For this `LEFT JOIN + GROUP BY` query, the delta does:
-   - Read the 1 change buffer row (Heidi, department 6)
-   - Join it against `departments` to get the department name ("Frontend")
-   - Compute the aggregate delta: COUNT += 1, SUM += 105000
-3. The result was a single delta row: `(department_id=6, 'Frontend', +1, +105000, recalculated_avg)`
-4. This was **MERGE**d into the `department_stats` storage table — only the Frontend row was touched
-5. The change buffer row was cleaned up
+| Layer | What ran | Rows touched |
+|-------|----------|--------------|
+| `department_tree` | No change — `employees` is not a source for this ST | 0 |
+| `department_stats` | Delta query: read 1 buffer row, join to Frontend, COUNT+1, SUM+105000 | 1 (Frontend group only) |
+| `department_report` | Delta query: read 1 change from dept_stats, SUM += 1 headcount, += 105000 | 1 (Engineering row only) |
 
 Check the result:
 
 ```sql
-SELECT * FROM department_stats WHERE department_name = 'Frontend';
+SELECT department_name, headcount, total_salary FROM department_stats
+WHERE department_name = 'Frontend';
 ```
 
 ```
- department_id | department_name | headcount | total_salary | avg_salary
----------------+-----------------+-----------+--------------+------------
-             6 | Frontend        |         2 |    215000.00 |  107500.00
+ department_name | headcount | total_salary
+-----------------+-----------+--------------
+ Frontend        |         2 |    215000.00
 ```
 
-Headcount went from 1 → 2, total salary updated. The 6 other department rows in `department_stats` were **not touched at all** — only the one affected group was updated. That's the power of incremental maintenance.
+The 6 other groups in `department_stats` were **not touched at all**.
 
-> **Contrast with a standard materialized view:** `REFRESH MATERIALIZED VIEW` would have re-scanned all 8 employees, re-joined them with all 7 departments, and re-aggregated everything. With pg_stream, the work was proportional to the number of *changes* (1), not the size of the tables.
+> **Contrast with a standard materialized view:** `REFRESH MATERIALIZED VIEW` would re-scan all 8 employees, re-join with all 7 departments, re-aggregate, and update all 7 rows. With pg_stream, the work was proportional to the 1 changed row — across all three layers.
 
-### 4b: INSERT into a different table — Add a new department
+### 4b: A department change cascades through the whole DAG
 
-Now let's change the `departments` table instead of `employees`:
+Now change the `departments` table — the root of the entire chain:
 
 ```sql
 INSERT INTO departments (id, name, parent_id) VALUES
     (8, 'DevOps', 2);  -- New team under Engineering
 ```
 
-**What happened:** The CDC trigger on *departments* fired (pg_stream installed triggers on both source tables when we created `department_tree`). The change buffer for `departments` now has one new row.
+**What happened:** The CDC trigger on `departments` fired. The change buffer for `departments` has one new row. None of the stream tables know about it yet.
 
-Refresh the recursive tree:
-
-```sql
-SELECT pgstream.refresh_stream_table('department_tree');
-```
-
-**How the recursive CTE refresh works:** Unlike `department_stats` which uses algebraic differentiation, recursive CTEs use **incremental fixpoint strategies**. For this INSERT (adding a new department), pg_stream uses **semi-naive evaluation**:
-
-1. Differentiates the base case to find the new department row
-2. Propagates it through the recursive term using a nested `WITH RECURSIVE` — discovering any new child paths
-3. The result is just the new rows produced by the change, not the entire tree
-
-For DELETEs or UPDATEs, pg_stream automatically switches to **Delete-and-Rederive (DRed)**, which additionally handles cascading deletions through the recursion while preserving rows that have alternative derivation paths.
-
-This is more efficient than full recomputation — the work is proportional to the rows *affected* by the change, not the full result set.
+Refresh the whole pipeline:
 
 ```sql
-SELECT * FROM department_tree WHERE name = 'DevOps';
+SELECT pgstream.refresh_stream_table('department_report');
+```
+
+**What happened across all three layers:**
+
+| Layer | What ran | Rows touched |
+|-------|----------|--------------|
+| `department_tree` | Semi-naive evaluation: base case finds new dept, recursive term computes its path. Result: 1 new row | 1 inserted |
+| `department_stats` | Delta query reads new row from dept_tree's change buffer; DevOps has 0 employees so delta is minimal | 1 inserted (headcount=0) |
+| `department_report` | Delta on Engineering row: headcount stays the same (DevOps has 0 employees) | 0 effective changes |
+
+**How the recursive CTE refresh works** — unlike `department_stats`, recursive CTEs can't be algebraically differentiated (the recursion references itself). pg_stream uses **incremental fixpoint strategies**:
+
+- **INSERT** → semi-naive evaluation: differentiate the base case, propagate the delta through the recursive term, stopping when no new rows are produced. Only new rows inserted.
+- **DELETE or UPDATE** → Delete-and-Rederive (DRed): remove rows derived from deleted facts, re-derive rows that may have alternative derivation paths, handle cascades cleanly.
+
+```sql
+SELECT id, name, depth, path FROM department_tree WHERE name = 'DevOps';
 ```
 
 ```
- id |  name  | parent_id |           path                | depth
-----+--------+-----------+-------------------------------+-------
+ id |  name  | depth |           path                |
+----+--------+-------+-------------------------------+
   8 | DevOps |         2 | Company > Engineering > DevOps |    2
 ```
 
 The recursive CTE automatically expanded to include the new department at the correct depth and path. One inserted row in `departments` produced one new row in the stream table.
 
-### 4c: UPDATE — Reorganize the company
+### 4c: UPDATE — A single rename that cascades everywhere
 
-This is where things get interesting. An UPDATE changes existing data, and the stream tables must reflect both the removal of old values and the addition of new ones.
-
-Suppose Platform is moved from Engineering to Operations:
+Rename "Engineering" to "R&D":
 
 ```sql
-UPDATE departments SET parent_id = 4 WHERE id = 7;  -- Platform → Operations
+UPDATE departments SET name = 'R&D' WHERE id = 2;
 ```
 
-**What happened in the change buffer:** The CDC trigger captured both the **old** row values (`parent_id=2`) and the **new** row values (`parent_id=4`). The change buffer stores the before-and-after state so the delta query can compute both what to remove and what to add.
+**What happened in the change buffer:** The CDC trigger captured the **old** row (`name='Engineering'`) and the **new** row (`name='R&D'`). Both old and new values are stored so the delta can compute what to remove and what to add.
 
 Refresh:
 
 ```sql
-SELECT pgstream.refresh_stream_table('department_tree');
+SELECT pgstream.refresh_stream_table('department_report');
 ```
 
-**What happened during refresh:** The recomputation diff re-ran the recursive CTE. Platform's path changed from `Company > Engineering > Platform` to `Company > Operations > Platform`. The MERGE updated that one row in the storage table — all other rows remained untouched.
+**What happened:**
+
+| Layer | Work done | Result |
+|-------|-----------|--------|
+| `department_tree` | DRed strategy: delete rows derived with old name, re-derive with new name. 5 rows updated (Engineering + 4 sub-teams) | Paths now say `Company > R&D > …` |
+| `department_stats` | Delta reads 5 changed rows from dept_tree's buffer; updates `full_path` column for those 5 departments | 5 rows updated |
+| `department_report` | Division name changed: "Engineering" row replaced by "R&D" row | 1 DELETE + 1 INSERT |
+
+Query to verify the cascade:
 
 ```sql
-SELECT * FROM department_tree WHERE name = 'Platform';
+SELECT name, path FROM department_tree WHERE path LIKE '%R&D%' ORDER BY depth;
 ```
 
 ```
- id |   name   | parent_id |            path             | depth
-----+----------+-----------+-----------------------------+-------
-  7 | Platform |         4 | Company > Operations > Platform |   2
+  name   |              path
+---------+----------------------------------
+ R&D     | Company > R&D
+ Backend  | Company > R&D > Backend
+ DevOps  | Company > R&D > DevOps
+ Frontend | Company > R&D > Frontend
+ Platform | Company > R&D > Platform
 ```
 
-The path and depth updated correctly — Platform is now under Operations. If Platform had sub-departments, they would have moved too — the recursive CTE recomputation handles arbitrarily deep cascades.
+One `UPDATE` to a department name flowed through all three layers automatically — updating 5 + 5 + 2 rows across the chain.
 
 ### 4d: DELETE — Remove an employee
 
@@ -408,31 +512,63 @@ Headcount dropped from 2 → 1 and the salary aggregates updated. Again, only th
 
 ---
 
-## Step 5: Automatic Scheduling — Let Data Flow Hands-Free
+## Step 5: Automatic Scheduling — Let the DAG Drive Itself
 
-In the examples above, we called `refresh_stream_table()` manually. In production, you don't need to do this. pg_stream runs a **background scheduler** that automatically refreshes stream tables when they become stale.
+In the examples above, we called `refresh_stream_table()` manually. In production you never need to do this. pg_stream runs a **background scheduler** that automatically refreshes stale tables — in topological order.
 
-When we created our stream tables with `'30s'`, we told pg_stream: "refresh this table whenever its data is more than 30 seconds out of date." The background worker checks for stale tables every second and triggers refreshes as needed.
+### How schedules propagate
 
-Check the current status of your stream tables:
+We gave `department_report` a `'30s'` schedule and the two upstream tables a `'CALCULATED'` schedule. This is the recommended pattern:
 
-```sql
-SELECT * FROM pgstream.pgs_status();
+```
+ department_tree    (CALCULATED → inherits 30s from downstream)
+       │
+ department_stats   (CALCULATED → inherits 30s from downstream)
+       │
+ department_report  (30s — the only explicit schedule)
 ```
 
-This shows each stream table with its:
-- **Schedule** — the staleness bound (e.g., 30s) or cron expression
-- **Last refresh time** — when data was last synchronized
-- **Refresh mode** — DIFFERENTIAL (incremental) or FULL
-- **Stale** — whether the table has un-processed changes older than the schedule bound
+`CALCULATED` means: compute the tightest schedule across all downstream dependents. You declare freshness requirements at the tables your application queries — the system figures out how often each upstream table needs to refresh.
 
-For detailed performance statistics:
+### What the scheduler does every second
+
+1. Queries the catalog for stream tables past their freshness bound
+2. Sorts them topologically (upstream first) — `department_tree` refreshes before `department_stats`, which refreshes before `department_report`
+3. Runs each refresh (respecting `pg_stream.max_concurrent_refreshes`)
+4. Updates the last-refresh frontier
+
+### Monitoring
 
 ```sql
-SELECT * FROM pgstream.pg_stat_stream_tables;
+-- Current status of all stream tables
+SELECT table_name, schedule, last_refresh_at, stale, refresh_mode
+FROM pgstream.pgs_status();
 ```
 
-This shows refresh counts, timing (average/min/max refresh duration), row counts affected, and error history.
+```
+    table_name      | schedule  | last_refresh_at         | stale | refresh_mode
+--------------------+-----------+-------------------------+-------+--------------
+ department_tree    | 30s       | 2026-02-26 10:30:00.123 | f     | DIFFERENTIAL
+ department_stats   | 30s       | 2026-02-26 10:30:00.456 | f     | DIFFERENTIAL
+ department_report  | 30s       | 2026-02-26 10:30:00.789 | f     | DIFFERENTIAL
+```
+
+```sql
+-- Detailed performance stats
+SELECT table_name, refresh_count, avg_refresh_ms, rows_affected_last
+FROM pgstream.pg_stat_stream_tables;
+```
+
+### Optional: WAL-based CDC
+
+By default pg_stream uses triggers. If `wal_level = logical` is configured, set:
+
+```sql
+ALTER SYSTEM SET pg_stream.cdc_mode = 'auto';
+SELECT pg_reload_conf();
+```
+
+pg_stream will automatically transition each stream table from trigger-based to WAL-based capture after the first successful refresh — reducing per-write overhead from ~50–200 μs to ~2–15 μs. The transition is transparent; your queries and the refresh schedule are unaffected.
 
 ---
 
@@ -454,17 +590,21 @@ For queries composed of scans, filters, joins, and algebraic aggregates (COUNT, 
 
 The total cost is proportional to the number of **changes**, not the table size. For a million-row table with 10 changes, the delta query touches ~10 rows.
 
-### Recomputation Diff (used by `department_tree`)
+### Incremental Strategies for Recursive CTEs (used by `department_tree`)
 
-For recursive CTEs, pg_stream can't differentiate algebraically because the recursion references itself. Instead, it uses a smart **recomputation** strategy:
+For recursive CTEs, pg_stream can't derive an algebraic delta because the recursion references itself. Instead it uses two complementary strategies, chosen automatically based on what changed:
 
-1. Re-execute the full recursive query → new result set
-2. Anti-join the new result against the current storage → find INSERTs (rows in new but not old)
-3. Anti-join the current storage against the new result → find DELETEs (rows in old but not new)
-4. Join both sides on row ID where values differ → find UPDATEs
-5. Apply the minimal set of INSERT/DELETE/UPDATE via MERGE
+**Semi-naive evaluation** (for INSERT-only changes):
+1. Differentiate the base case — find the new seed rows
+2. Propagate the delta through the recursive term, iterating until no new rows are produced
+3. The result is only the *new* rows created by the change — not the whole tree
 
-This is more expensive than algebraic IVM, but still better than a full `TRUNCATE + INSERT` because the MERGE only modifies changed rows — indexes and dead tuples are minimized.
+**Delete-and-Rederive (DRed)** (for DELETE or UPDATE):
+1. Remove all rows derived from the old fact
+2. Re-derive rows that had the old fact as *one of their derivation paths* (they may still be reachable via other paths)
+3. Insert the newly derived rows under the new fact
+
+Both strategies are more efficient than full recomputation — they work on the *affected portion of the result set*, not the entire recursive query. The MERGE only modifies rows that actually changed.
 
 ### When to use which?
 
@@ -472,18 +612,23 @@ You don't choose — pg_stream detects the strategy automatically based on the q
 
 | Query Pattern | Strategy | Performance |
 |---------------|----------|-------------|
-| Scan + Filter + Join + Aggregate | Algebraic | Excellent — O(changes) |
-| Non-recursive CTEs | Algebraic | The CTE body is differentiated inline |
-| Recursive CTEs (`WITH RECURSIVE`) | Recomputation diff | Good — full re-execute but minimal MERGE |
-| Window functions | Partition recompute | Good — only affected partitions recomputed |
+| Scan + Filter + Join + algebraic Aggregate (COUNT/SUM/AVG) | Algebraic | Excellent — O(changes) |
+| Non-recursive CTEs | Algebraic (inlined) | CTE body is differentiated inline |
+| `MIN` / `MAX` aggregates | Semi-algebraic | Uses LEAST/GREATEST merge; per-group rescan only when an extremum is deleted |
+| `STRING_AGG`, `ARRAY_AGG`, ordered-set aggregates | Group-rescan | Affected groups fully re-aggregated from source |
+| `GROUPING SETS` / `CUBE` / `ROLLUP` | Algebraic (rewritten) | Auto-expanded to `UNION ALL` of `GROUP BY` queries; CUBE capped at 64 branches |
+| Recursive CTEs (`WITH RECURSIVE`) INSERT | Semi-naive evaluation | O(new rows derived from the change) |
+| Recursive CTEs (`WITH RECURSIVE`) DELETE/UPDATE | Delete-and-Rederive | Re-derives rows with alternative paths; O(affected subgraph) |
+| Window functions | Partition recompute | Only affected partitions recomputed |
 
 ---
 
 ## Step 7: Clean Up
 
-When you're done experimenting, drop the stream tables:
+When you're done experimenting, drop the stream tables. Drop dependents before their sources:
 
 ```sql
+SELECT pgstream.drop_stream_table('department_report');
 SELECT pgstream.drop_stream_table('department_stats');
 SELECT pgstream.drop_stream_table('department_tree');
 
@@ -503,15 +648,16 @@ DROP TABLE departments;
 
 | Concept | What you saw |
 |---------|-------------|
-| **Stream tables** | Tables defined by a query that stay automatically up to date |
-| **CDC triggers** | Lightweight change capture — no logical replication, no polling |
-| **Algebraic IVM** | Delta queries that process only changed rows (for joins, aggregates, filters) |
-| **Recomputation diff** | Smart re-execute + anti-join for recursive CTEs |
-| **Data flow** | INSERT/UPDATE/DELETE → trigger → buffer → delta query → MERGE → stream table updated |
-| **Scheduling** | Background worker automatically refreshes stale tables within the bound |
-| **Monitoring** | `pgs_status()` and `pg_stat_stream_tables` for observability |
+| **Stream tables** | Tables defined by a SQL query that stay automatically up to date |
+| **CDC triggers** | Lightweight change capture in the same transaction — no logical replication or polling required |
+| **DAG scheduling** | Stream tables can depend on other stream tables; refreshes run in topological order, schedules propagate upstream via `CALCULATED` mode |
+| **Algebraic IVM** | Delta queries that process only changed rows — O(changes) regardless of table size |
+| **Semi-naive / DRed** | Incremental strategies for `WITH RECURSIVE` — INSERT uses semi-naive, DELETE/UPDATE uses Delete-and-Rederive |
+| **Downstream propagation** | A single base table write cascades through an entire chain of stream tables, automatically, in the right order |
+| **Hybrid CDC** | Triggers by default; optional automatic transition to WAL-based capture for lower write-side overhead |
+| **Monitoring** | `pgs_status()` and `pg_stat_stream_tables` for freshness, timing, and error history |
 
-The key takeaway: **data flows** from your base tables to your stream tables automatically, and pg_stream does the minimum possible work to keep them in sync.
+The key takeaway: you write to base tables — **pg_stream does the rest**. Data flows downstream automatically, each layer doing the minimum work proportional to what changed, in dependency order.
 
 ---
 
