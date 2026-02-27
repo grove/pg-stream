@@ -1215,13 +1215,24 @@ pub(crate) fn extract_source_relations(
     }
 }
 
+/// Context for [`relation_oid_walker`] — collects `(Oid, source_type)` pairs.
+struct RelationCollectorCtx {
+    relations: *mut Vec<(pg_sys::Oid, String)>,
+    seen_oids: *mut std::collections::HashSet<pg_sys::Oid>,
+}
+
 /// Recursively collect `RTE_RELATION` OIDs from an analyzed `Query` node.
 ///
-/// Walks:
-/// 1. The top-level `rtable` for `RTE_RELATION` entries (base tables)
-/// 2. `RTE_SUBQUERY` entries — recurse into their `subquery` Query node
-/// 3. `Query.cteList` — each CTE's `ctequery` is an analyzed `Query`
-///    node after `parse_analyze_fixedparams()`
+/// Uses PostgreSQL's `query_tree_walker_impl` with the
+/// `QTW_EXAMINE_RTES_BEFORE` flag so that the callback visits every
+/// `RangeTblEntry` in every (sub-)query. This covers:
+///
+/// 1. Base tables in FROM clauses (`RTE_RELATION`)
+/// 2. Subqueries in FROM (`RTE_SUBQUERY` → walker recurses automatically)
+/// 3. CTEs (`Query.cteList` → walker recurses automatically)
+/// 4. EXISTS / IN / ANY subqueries in WHERE / HAVING / SELECT
+///    (`SubLink.subselect` → `expression_tree_walker` recurses,
+///    callback handles the resulting `T_Query` node)
 ///
 /// # Safety
 /// Caller must ensure `query_node` points to a valid analyzed `Query`.
@@ -1230,54 +1241,82 @@ unsafe fn collect_relation_oids(
     relations: &mut Vec<(pg_sys::Oid, String)>,
     seen_oids: &mut std::collections::HashSet<pg_sys::Oid>,
 ) {
-    use pgrx::PgList;
-
     if query_node.is_null() {
         return;
     }
 
-    let query = unsafe { &*query_node };
+    let mut ctx = RelationCollectorCtx {
+        relations: relations as *mut _,
+        seen_oids: seen_oids as *mut _,
+    };
 
-    // Walk the range table
-    let rtable = unsafe { PgList::<pg_sys::RangeTblEntry>::from_pg(query.rtable) };
-    for rte_ptr in rtable.iter_ptr() {
-        // SAFETY: rte_ptr is a valid pointer from a PgList iteration.
-        let rte = unsafe { &*rte_ptr };
-        match rte.rtekind {
-            pg_sys::RTEKind::RTE_RELATION => {
-                let oid = rte.relid;
-                if seen_oids.insert(oid) {
-                    let source_type = classify_source_relation(oid);
-                    relations.push((oid, source_type));
-                }
-            }
-            pg_sys::RTEKind::RTE_SUBQUERY => {
-                // Subquery in FROM — recurse into its own Query node
-                if !rte.subquery.is_null() {
-                    unsafe {
-                        collect_relation_oids(rte.subquery, relations, seen_oids);
-                    }
-                }
-            }
-            _ => {}
-        }
+    // SAFETY: query_node is a valid analyzed Query; the walker callback
+    // only reads RTE fields and calls classify_source_relation (SPI).
+    // QTW_EXAMINE_RTES_BEFORE = 16: the walker calls our callback for
+    // each RangeTblEntry *before* recursing into subqueries / CTEs.
+    unsafe {
+        pg_sys::query_tree_walker_impl(
+            query_node,
+            Some(relation_oid_walker),
+            &mut ctx as *mut RelationCollectorCtx as *mut std::ffi::c_void,
+            pg_sys::QTW_EXAMINE_RTES_BEFORE as i32,
+        );
+    }
+}
+
+/// Walker callback for [`collect_relation_oids`].
+///
+/// Called by `query_tree_walker_impl` / `expression_tree_walker_impl` for
+/// every node in the analyzed query tree.
+///
+/// - `T_RangeTblEntry` with `RTE_RELATION` → extract OID
+/// - `T_Query` (from SubLink subselects) → recurse via `query_tree_walker`
+/// - Everything else → recurse via `expression_tree_walker`
+///
+/// # Safety
+/// `node` and `context` must be valid pointers provided by the PG walker.
+unsafe extern "C-unwind" fn relation_oid_walker(
+    node: *mut pg_sys::Node,
+    context: *mut std::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
     }
 
-    // Walk CTE list — each CommonTableExpr.ctequery is an analyzed Query
-    // node (tagged T_Query) after parse_analyze_fixedparams().
-    let cte_list = unsafe { PgList::<pg_sys::Node>::from_pg(query.cteList) };
-    for node_ptr in cte_list.iter_ptr() {
-        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
-            let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
-            if !cte.ctequery.is_null()
-                && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_Query) }
-            {
-                unsafe {
-                    collect_relation_oids(cte.ctequery as *mut pg_sys::Query, relations, seen_oids);
-                }
+    // RTE_RELATION → record the OID
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeTblEntry) } {
+        // SAFETY: node tag verified as T_RangeTblEntry.
+        let rte = unsafe { &*(node as *const pg_sys::RangeTblEntry) };
+        if rte.rtekind == pg_sys::RTEKind::RTE_RELATION {
+            // SAFETY: context is our RelationCollectorCtx.
+            let ctx = unsafe { &mut *(context as *mut RelationCollectorCtx) };
+            let seen = unsafe { &mut *ctx.seen_oids };
+            if seen.insert(rte.relid) {
+                let source_type = classify_source_relation(rte.relid);
+                let rels = unsafe { &mut *ctx.relations };
+                rels.push((rte.relid, source_type));
             }
         }
+        return false; // continue walking
     }
+
+    // T_Query → use query_tree_walker to handle rtable + expressions
+    // (expression_tree_walker does NOT recurse into Query nodes)
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_Query) } {
+        // SAFETY: node tag verified as T_Query.
+        return unsafe {
+            pg_sys::query_tree_walker_impl(
+                node as *mut pg_sys::Query,
+                Some(relation_oid_walker),
+                context,
+                pg_sys::QTW_EXAMINE_RTES_BEFORE as i32,
+            )
+        };
+    }
+
+    // All other node types → recurse into children
+    // SAFETY: expression_tree_walker handles all standard node types.
+    unsafe { pg_sys::expression_tree_walker_impl(node, Some(relation_oid_walker), context) }
 }
 
 /// Emit warnings/info for source table edge cases (F13, F14).

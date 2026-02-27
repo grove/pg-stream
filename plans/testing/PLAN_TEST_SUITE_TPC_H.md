@@ -36,27 +36,25 @@ query that pg_stream can currently handle:
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
 ```
 
-**Deterministically passing (9):** Q05, Q07, Q08, Q09, Q10, Q11, Q16, Q20,
-Q22 — pass all 3 cycles consistently across multiple runs.
+**Deterministically passing (11):** Q05, Q07, Q08, Q09, Q10, Q11, Q12, Q14,
+Q16, Q19, Q22 — pass all 3 cycles consistently across multiple runs.
 
-**Phase 3 (FULL vs DIFF): 9/22** — deterministic and stable.
+**Phase 3 (FULL vs DIFF): 11/22** — deterministic and stable.
 
 **Cross-query consistency: 13/20** STs survive all 3 cycles.
 
-**Queries failing cycle 2+ deterministically (11):**
+**Queries failing cycle 2+ deterministically (9):**
 
 | Query | Cycle 2 Error | Category |
 |-------|---------------|----------|
 | Q01 | Data mismatch: FULL(6) != DIFF(6) — same row count, different values | Aggregate drift |
 | Q03 | Data mismatch: FULL(46) != DIFF(46) — values differ | Aggregate drift |
-| Q04 | `OID MISMATCH (source_oids)` — EXISTS subquery delta references OIDs not in catalog deps | Subquery OID leak |
-| Q06 | `null value in column "__pgs_count"` — not-null violation | Aggregate count |
-| Q12 | Data mismatch: FULL(2) != DIFF(2) | Aggregate drift |
+| Q04 | Data mismatch: FULL(5) != DIFF(5) — SemiJoin delta values differ | SemiJoin drift |
+| Q06 | Data mismatch cycle 3: FULL(1) != DIFF(1) — SUM drift accumulates | Aggregate drift |
 | Q13 | `column st.c_custkey does not exist` | MERGE column ref |
-| Q14 | `"__pgs_cte_filter_12.__pgs_row_id" must appear in GROUP BY` | Aggregate GROUP BY |
 | Q15 | `column st.l_suppkey does not exist` | MERGE column ref |
 | Q18 | `column "o_orderkey" does not exist` | Raw expr scope |
-| Q19 | `null value in column "__pgs_count"` — not-null violation | Aggregate count |
+| Q20 | `column "s_suppkey" does not exist` | SemiJoin column ref |
 | Q21 | `column dl.l1__l_orderkey does not exist` | Join alias scope |
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
@@ -67,13 +65,15 @@ Q22 — pass all 3 cycles consistently across multiple runs.
 | Category | Queries | Root Cause |
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_stream DVM does not support correlated scalar subqueries in WHERE |
-| **Cycle 2 — aggregate delta drift** | Q01, Q03, Q12 | Refresh succeeds but ST contents ≠ full query results (aggregate accumulation / expression evaluation error) |
-| **Cycle 2 — null `__pgs_count` violation** | Q06, Q19 | Aggregate delta produces NULL count for groups that should still exist |
-| **Cycle 2 — aggregate GROUP BY** | Q14 | `"__pgs_cte_filter_12.__pgs_row_id"` leaks into aggregate context |
-| **Cycle 2 — subquery OID leak** | Q04 | EXISTS subquery delta includes source OIDs from the subquery that are not in the ST's catalog deps; OID mismatch check catches it |
+| **Cycle 2 — aggregate delta drift** | Q01, Q03, Q06 | Refresh succeeds but ST contents ≠ full query results (aggregate accumulation error — exact NUMERIC arithmetic, not floating point) |
+| **Cycle 2 — SemiJoin delta drift/error** | Q04, Q20 | SemiJoin delta produces incorrect values (Q04) or references non-existent columns (Q20: `s_suppkey` not resolved against CTE columns) |
 | **Cycle 2 — MERGE column ref** | Q13, Q15 | `column st.X does not exist` — MERGE template references unresolved column names for views with subqueries/CTEs |
 | **Cycle 2 — `Expr::Raw` column scope** | Q18 | `column "o_orderkey" does not exist` — `Expr::Raw` best-effort replacement doesn't resolve columns in filter predicates from comma-join WHERE |
 | **Cycle 2 — join alias in subquery** | Q21 | `column dl.l1__l_orderkey does not exist` — nested join child alias (`l1`) not resolved in EXISTS subquery delta |
+| ~~**Cycle 2 — null `__pgs_count` violation**~~ | ~~Q06, Q19~~ | ~~FIXED~~ — COALESCE guards on `d.__ins_count`/`d.__del_count` in merge CTE |
+| ~~**Cycle 2 — aggregate GROUP BY leak**~~ | ~~Q14~~ | ~~FIXED~~ — `AggFunc::ComplexExpression` for nested-aggregate target expressions |
+| ~~**Cycle 2 — subquery OID leak**~~ | ~~Q04~~ | ~~FIXED~~ — `query_tree_walker_impl` for complete OID extraction (Q04 now reaches data mismatch) |
+| ~~**Cycle 2 — aggregate conditional SUM drift**~~ | ~~Q12~~ | ~~FIXED~~ — COALESCE fix resolved the conditional `SUM(CASE … END)` drift |
 | ~~**Cycle 2 — CDC relation lifecycle**~~ | ~~Q04, Q05†, Q07†, Q12†, Q16†, Q22†~~ | ~~FIXED~~ — see "Resolved" section below |
 | ~~**Cycle 2 — column qualification**~~ | ~~Q03–Q15, Q18–Q21~~ | ~~FIXED (P1)~~ — see "Resolved" section below |
 | ~~**CREATE fails — EXISTS/NOT EXISTS**~~ | ~~Q04, Q21~~ | ~~FIXED~~ — `node_to_expr` agg_star + `and_contains_or_with_sublink()` guard |
@@ -99,29 +99,35 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-#### Priority 1: Fix aggregate delta drift / `__pgs_count` null (5 queries)
+#### Priority 1: Fix aggregate delta drift (3 queries)
 
-Q01, Q03, Q06, Q12, Q19 show aggregate correctness issues:
-- **Q01, Q03, Q12**: data mismatch — ST rows differ from full query after
-  cycle 2. Same row count but different values (Q01, Q12) or missing rows (Q03).
-- **Q06, Q19**: `NULL value in column "__pgs_count"` not-null violation —
-  aggregate delta produces NULL count for groups that should still exist.
+Q01, Q03, Q06 show aggregate value drift after UPDATE mutations (RF3):
+- **Q01**: 6 rows, 3 differ — AVG aggregates drift after price/discount updates
+- **Q03**: 46 rows, 2 differ — SUM(l_extendedprice * (1 - l_discount)) drift after updates
+- **Q06**: 1 row, cycles 1-2 pass, cycle 3 drifts — global SUM accumulates error across mutation cycles
 
-**Files to fix:** `src/dvm/operators/aggregate.rs`, `src/dvm/diff.rs`  
-**Impact:** Would fix up to 5 queries
+The COALESCE fix resolved the NULL propagation bug, but drift persists for
+queries where the aggregate SUM/AVG formula produces different results from
+the full query. Arithmetic is exact (NUMERIC), so this is not a precision
+issue. Most likely cause: a subtle edge case in how the scan delta's
+net-effect logic interacts with the aggregate delta's SUM(CASE …) formula,
+particularly when UPDATE mutations (D+I pairs) flow through a Filter node
+that sits between Scan and Aggregate.
 
-#### Priority 2: Fix subquery OID leak (1 query) + aggregate GROUP BY leak (1 query)
+**Files to investigate:** `src/dvm/operators/scan.rs`, `src/dvm/operators/aggregate.rs`, `src/dvm/operators/filter.rs`
+**Impact:** Would fix Q01, Q03, Q06. Q04 (SemiJoin drift) may also benefit.
 
-- **Q04**: `OID MISMATCH (source_oids)` — the EXISTS subquery delta includes
-  source OIDs from the correlated subquery (lineitem) that are not in the
-  parent ST's catalog deps (only orders). The delta template references
-  `changes_16587` (lineitem) but catalog deps list only `changes_16572`
-  (orders). Need to ensure subquery source OIDs are included in catalog deps.
-- **Q14**: `"__pgs_cte_filter_12.__pgs_row_id" must appear in GROUP BY` —
-  row-id column leaks into aggregate context when filter sits below aggregate.
+#### Priority 2: Fix SemiJoin delta errors (2 queries)
 
-**Files to fix:** `src/api.rs` (OID dep collection), `src/dvm/operators/aggregate.rs`  
-**Impact:** Would fix Q04, Q14
+- **Q04**: SemiJoin delta passes cycle 1 but data mismatch in cycle 2 — the
+  OID extraction is fixed (lineitem now registered), but the SemiJoin delta
+  formula produces incorrect results after mutations.
+- **Q20**: `column "s_suppkey" does not exist` — SemiJoin delta references
+  `s_suppkey` which doesn't exist in the CTE column namespace. Column
+  resolution for SemiJoin delta's left-side snapshot is broken.
+
+**Files to fix:** `src/dvm/operators/semi_join.rs`
+**Impact:** Would fix Q04, Q20
 
 #### Priority 3: Fix MERGE column references (2 queries)
 
@@ -130,7 +136,7 @@ does not exist`. The MERGE template's `st.{col}` references use the
 stream table's physical column names, but the view definition has subquery
 aliases or CTE aliases that produce different column names in the delta.
 
-**Files to fix:** `src/refresh.rs` (MERGE template generation)  
+**Files to fix:** `src/refresh.rs` (MERGE template generation)
 **Impact:** Would fix Q13, Q15
 
 #### Priority 4: Fix `Expr::Raw` / join alias column resolution (2 queries)
@@ -143,7 +149,7 @@ aliases or CTE aliases that produce different column names in the delta.
   delta references `dl.l1__l_orderkey` but the actual delta CTE column uses a
   different disambiguation prefix.
 
-**Files to fix:** `src/dvm/operators/filter.rs`, `src/dvm/parser.rs`  
+**Files to fix:** `src/dvm/operators/filter.rs`, `src/dvm/parser.rs`
 **Impact:** Would fix Q18, Q21
 
 #### Priority 5: Fix correlated scalar subquery support (2 queries)
@@ -153,13 +159,17 @@ cannot safely detect when a scalar subquery references outer columns via bare
 column names (no `table.` prefix), so it cannot apply the CROSS JOIN rewrite.
 Deeper DVM support (named correlation context) is needed.
 
-**Files to fix:** `src/dvm/parser.rs::rewrite_scalar_subquery_in_where`  
+**Files to fix:** `src/dvm/parser.rs::rewrite_scalar_subquery_in_where`
 **Impact:** Would unblock Q02 and Q17 (2/22 CREATE failures)
 
 #### Resolved
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| P1 — `__pgs_count` NULL | Global aggregates (no GROUP BY): `SUM(CASE … THEN 1 ELSE 0 END)` over empty delta returns NULL, propagating through `new_count = old + NULL - NULL = NULL` → NOT NULL violation | COALESCE guards: wrapped `d.__ins_count` and `d.__del_count` in `COALESCE(…, 0)` in merge CTE `new_count`, action classification, Count/CountStar merge, and AVG denominator | Q06 (partial: cycles 1-2 pass, drift cycle 3), Q19 (all 3 cycles) |
+| P1 — Conditional SUM drift | Aggregate delta `SUM(CASE WHEN … THEN 1 ELSE 0 END)` produced wrong Count merge due to missing COALESCE on `d.__ins_*`/`d.__del_*` delta columns | Same COALESCE fix as above — Count/CountStar merge expression now wraps delta columns | Q12 (all 3 cycles pass) |
+| P2 — Subquery OID leak | `extract_source_relations` only walked the outer query's rtable; EXISTS/IN subqueries in WHERE/HAVING are SubLink nodes in the expression tree, NOT RTE_SUBQUERY entries | Replaced manual `collect_relation_oids` with PostgreSQL's `query_tree_walker_impl` using `QTW_EXAMINE_RTES_BEFORE` flag + `expression_tree_walker_impl` for SubLink recursion | Q04 (OID check passes, now reaches data mismatch — separate SemiJoin drift bug) |
+| P2 — Aggregate GROUP BY leak | `expr_contains_agg` didn't recurse into A_Expr/CaseExpr; `extract_aggregates` only recognized top-level FuncCall. Q14's `100 * SUM(…) / CASE WHEN SUM(…) = 0 THEN NULL ELSE SUM(…) END` was not detected as an aggregate expression | Two fixes: (1) `expr_contains_agg` now uses `raw_expression_tree_walker_impl` for full recursion; (2) `extract_aggregates` creates `AggFunc::ComplexExpression(raw_sql)` for complex expressions wrapping nested aggregates — uses group-rescan strategy (re-evaluates from source on change) | Q14 (all 3 cycles pass) |
 | P1 — CDC lifecycle | Stale pending cleanup entries in thread-local `PENDING_CLEANUP` queue referenced change buffer tables dropped by a previous ST's cleanup; `Spi::run(DELETE ...)` on non-existent table longjmps past all Rust error handling | Three-part fix: (1) `refresh.rs`: added pg_class existence check in `drain_pending_cleanups` before DELETE/TRUNCATE; (2) `refresh.rs`: added `flush_pending_cleanups_for_oids` to remove stale entries; (3) `api.rs`: call `flush_pending_cleanups_for_oids` in `drop_stream_table_impl` before cleanup; also added OID mismatch diagnostic check in `execute_differential_refresh` | Q05, Q07, Q16, Q22 (4 queries stabilized from intermittent → pass) |
 | P1 (old) — column qualification | Multiple resolution functions returned bare column names instead of disambiguated CTE column names | Three-part fix: (1) `filter.rs`: added `resolve_predicate_for_child` with suffix matching and `Expr::Raw` best-effort replacement; (2) `join_common.rs`: added `snapshot_output_columns` to fix `build_join_snapshot` using raw names instead of disambiguated names, extended `rewrite_expr_for_join` for `Star`/`Literal`/`Raw`; (3) `aggregate.rs` + `project.rs`: added suffix matching for unqualified ColumnRef, switched agg arguments from `resolve_col_for_child` to `resolve_expr_for_child`, added `Expr::Raw` handling | Q05, Q07, Q08, Q09, Q10 (5 queries) |
 | P2 — EXISTS/COUNT* | `node_to_expr` dropped `agg_star`; `rewrite_sublinks_in_or` triggered on AND+EXISTS (no OR) | `agg_star` check + `and_contains_or_with_sublink()` guard | Q04, Q21 |

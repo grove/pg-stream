@@ -213,6 +213,16 @@ pub enum AggFunc {
     RegrSxx,
     RegrSxy,
     RegrSyy,
+    /// Complex expression wrapping multiple aggregate calls.
+    ///
+    /// Created when a SELECT target is an arithmetic or conditional expression
+    /// containing nested aggregate function calls, e.g.:
+    ///   `100 * SUM(a) / CASE WHEN SUM(b) = 0 THEN NULL ELSE SUM(b) END`
+    ///
+    /// Stores the fully deparsed SQL of the entire expression (including the
+    /// nested aggregate calls). Uses the group-rescan strategy: any change in
+    /// the group triggers full re-evaluation of the expression from source data.
+    ComplexExpression(String),
 }
 
 impl AggFunc {
@@ -257,6 +267,7 @@ impl AggFunc {
             AggFunc::RegrSxx => "REGR_SXX",
             AggFunc::RegrSxy => "REGR_SXY",
             AggFunc::RegrSyy => "REGR_SYY",
+            AggFunc::ComplexExpression(_) => "COMPLEX_EXPRESSION",
         }
     }
 
@@ -298,6 +309,7 @@ impl AggFunc {
                 | AggFunc::RegrSxx
                 | AggFunc::RegrSxy
                 | AggFunc::RegrSyy
+                | AggFunc::ComplexExpression(_)
         )
     }
 }
@@ -2085,7 +2097,8 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgStreamError> {
                     | AggFunc::RegrSlope
                     | AggFunc::RegrSxx
                     | AggFunc::RegrSxy
-                    | AggFunc::RegrSyy => {}
+                    | AggFunc::RegrSyy
+                    | AggFunc::ComplexExpression(_) => {}
                 }
             }
             check_ivm_support(child)
@@ -9329,13 +9342,14 @@ unsafe fn target_list_has_aggregates(target_list: &pgrx::PgList<pg_sys::Node>) -
     false
 }
 
-/// Recursively check if a node contains an aggregate function call.
-unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
+/// Check if a single raw-parse-tree node is an aggregate function call.
+///
+/// Does NOT recurse — only checks the immediate node.
+unsafe fn is_agg_node(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
     }
-    // SQL/JSON standard aggregates: T_JsonObjectAgg and T_JsonArrayAgg
-    // are always aggregate expressions (they aggregate rows).
+    // SQL/JSON standard aggregates
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectAgg) }
         || unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayAgg) }
     {
@@ -9358,12 +9372,53 @@ unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
             }
         }
     }
-    // Check inside TypeCast: CAST(SUM(x) AS int)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
-        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
-        return unsafe { expr_contains_agg(tc.arg) };
-    }
     false
+}
+
+/// Walker callback for [`expr_contains_agg`].
+///
+/// Returns `true` (stop walking) when a node is detected as an aggregate,
+/// `false` to continue. Recursion into children is handled by
+/// `raw_expression_tree_walker_impl`.
+///
+/// # Safety
+/// Called by PostgreSQL's `raw_expression_tree_walker_impl` with valid
+/// raw parse tree node pointers.
+unsafe extern "C-unwind" fn agg_check_walker(
+    node: *mut pg_sys::Node,
+    _context: *mut std::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if unsafe { is_agg_node(node) } {
+        return true; // found aggregate — stop walking
+    }
+    // Continue recursion into children.
+    // SAFETY: raw_expression_tree_walker_impl handles all raw parse tree
+    // node types (A_Expr, CaseExpr, BoolExpr, FuncCall, TypeCast, etc.).
+    unsafe {
+        pg_sys::raw_expression_tree_walker_impl(node, Some(agg_check_walker), std::ptr::null_mut())
+    }
+}
+
+/// Recursively check if a raw parse tree node contains an aggregate
+/// function call, anywhere in its expression subtree.
+///
+/// Uses PostgreSQL's `raw_expression_tree_walker_impl` for correct
+/// recursion into all node types (A_Expr, CaseExpr, BoolExpr, etc.).
+unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    // Check the node itself first.
+    if unsafe { is_agg_node(node) } {
+        return true;
+    }
+    // Recurse into children.
+    unsafe {
+        pg_sys::raw_expression_tree_walker_impl(node, Some(agg_check_walker), std::ptr::null_mut())
+    }
 }
 
 /// Check if a function name is a user-defined aggregate via `pg_proc.prokind`.
@@ -9674,8 +9729,36 @@ unsafe fn extract_aggregates(
                 order_within_group: None,
             });
         } else {
-            let expr = unsafe { node_to_expr(rt.val)? };
-            non_aggs.push(expr);
+            // Not a top-level aggregate function call.
+            // Check if the expression CONTAINS nested aggregate calls
+            // (e.g., `100 * SUM(a) / NULLIF(SUM(b), 0)`).
+            if unsafe { expr_contains_agg(rt.val) } {
+                // Deparse the entire expression to SQL for the rescan CTE.
+                let raw_expr = unsafe { node_to_expr(rt.val)? };
+                let raw_sql = raw_expr.to_sql();
+
+                let alias = if !rt.name.is_null() {
+                    unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                        .to_str()
+                        .unwrap_or("complex_agg")
+                        .to_string()
+                } else {
+                    format!("complex_agg_{}", aggs.len())
+                };
+
+                aggs.push(AggExpr {
+                    function: AggFunc::ComplexExpression(raw_sql),
+                    argument: None,
+                    alias,
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                });
+            } else {
+                let expr = unsafe { node_to_expr(rt.val)? };
+                non_aggs.push(expr);
+            }
         }
     }
 

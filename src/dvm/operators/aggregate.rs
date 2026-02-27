@@ -177,6 +177,12 @@ fn agg_to_rescan_sql(agg: &AggExpr) -> String {
             };
             return format!("{raw}{filter}");
         }
+        AggFunc::ComplexExpression(raw) => {
+            // Complex expression with nested aggregates: the stored raw SQL
+            // already contains the full expression (including aggregate calls).
+            // The rescan CTE evaluates it against source data directly.
+            return raw.clone();
+        }
         _ => {}
     }
 
@@ -715,8 +721,13 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     }
 
     // New count = old + inserts - deletes
+    // COALESCE guards: for global aggregates (no GROUP BY) the agg_delta
+    // CTE always produces exactly one row.  When **all** child-delta rows
+    // are filtered out the SUM(CASE …) expressions evaluate over an empty
+    // set and return NULL, not 0.  Wrapping in COALESCE(…, 0) keeps the
+    // arithmetic safe.
     merge_selects.push(
-        "COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count AS new_count".to_string(),
+        "COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) AS new_count".to_string(),
     );
     merge_selects.push("COALESCE(st.__pgs_count, 0) AS old_count".to_string());
 
@@ -737,12 +748,12 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         ));
     }
 
-    // Action classification
+    // Action classification (same COALESCE guards as new_count)
     merge_selects.push(
         "\
 CASE
-    WHEN st.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0 THEN 'I'
-    WHEN COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0 THEN 'D'
+    WHEN st.__pgs_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
+    WHEN COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) <= 0 THEN 'D'
     ELSE 'U'
 END AS __pgs_meta_action"
             .to_string(),
@@ -971,7 +982,7 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
     match &agg.function {
         AggFunc::CountStar | AggFunc::Count => {
             format!(
-                "COALESCE(st.{qt}, 0) + d.{ins} - d.{del}",
+                "COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
             )
@@ -984,12 +995,14 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             )
         }
         AggFunc::Avg => {
-            // AVG = SUM / COUNT — compute from the sum and count auxiliaries
+            // AVG = SUM / COUNT — compute from the sum and count auxiliaries.
+            // COALESCE guards on d.__ins_count / d.__del_count protect against
+            // NULL when the delta set is empty (no GROUP BY, all rows filtered).
             format!(
-                "CASE WHEN (COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count) > 0 \
+                "CASE WHEN (COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 \
                  THEN (COALESCE(st.{qt}, 0) * COALESCE(st.__pgs_count, 0) \
                        + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0))::numeric \
-                       / (COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count) \
+                       / (COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) \
                  ELSE NULL END",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
@@ -1834,7 +1847,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // Algebraic aggregates use addition
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // Rescan aggregates use NULL sentinel
@@ -2152,7 +2165,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // COUNT uses algebraic merge
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // BIT_OR uses rescan sentinel
@@ -2371,7 +2384,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // COUNT uses algebraic merge
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // STDDEV_POP uses rescan sentinel
@@ -2597,7 +2610,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // COUNT uses algebraic merge
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // PERCENTILE_CONT uses rescan sentinel
