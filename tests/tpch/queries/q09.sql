@@ -1,5 +1,5 @@
 -- Q9: Product Type Profit Measure
--- Operators: 6-table Join → Expressions → Aggregate
+-- Operators: 6-table Join -> Expressions -> Aggregate
 SELECT
     nation,
     o_year,
@@ -16,6 +16,6 @@ FROM (
       AND p_partkey = l_partkey
       AND o_orderkey = l_orderkey
       AND s_nationkey = n_nationkey
-      AND p_name LIKE '%green%'
+      AND strpos(p_name, 'green') > 0
 ) AS profit
 GROUP BY nation, o_year

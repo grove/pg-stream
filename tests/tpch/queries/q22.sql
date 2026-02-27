@@ -1,5 +1,5 @@
 -- Q22: Global Sales Opportunity
--- Operators: NOT EXISTS → Scalar Subquery → SUBSTRING → Aggregate
+-- Operators: NOT EXISTS -> Scalar Subquery -> SUBSTRING -> Aggregate
 SELECT
     cntrycode,
     COUNT(*) AS numcust,

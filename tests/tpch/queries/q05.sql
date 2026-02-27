@@ -1,5 +1,5 @@
 -- Q5: Local Supplier Volume
--- Operators: 6-table Join → Filter → Aggregate
+-- Operators: 6-table Join -> Filter -> Aggregate
 SELECT
     n_name,
     SUM(l_extendedprice * (1 - l_discount)) AS revenue

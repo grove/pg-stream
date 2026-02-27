@@ -1,5 +1,5 @@
 -- Q20: Potential Part Promotion
--- Operators: Semi-Join (IN, nested 2 levels) → Filter
+-- Operators: Semi-Join (IN, nested 2 levels) -> Filter
 SELECT
     s_name,
     s_address

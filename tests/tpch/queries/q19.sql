@@ -1,5 +1,5 @@
 -- Q19: Discounted Revenue
--- Operators: 2-table Join → Complex OR/AND Filter → SUM
+-- Operators: 2-table Join -> Complex OR/AND Filter -> SUM
 SELECT
     SUM(l_extendedprice * (1 - l_discount)) AS revenue
 FROM lineitem, part

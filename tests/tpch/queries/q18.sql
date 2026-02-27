@@ -1,5 +1,5 @@
 -- Q18: Large Volume Customer
--- Operators: 3-table Join → IN subquery with HAVING → Aggregate
+-- Operators: 3-table Join -> IN subquery with HAVING -> Aggregate
 -- LIMIT removed (unsupported by pg_stream)
 SELECT
     c_name,

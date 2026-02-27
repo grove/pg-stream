@@ -1,5 +1,5 @@
 -- Q4: Order Priority Checking
--- Operators: Semi-Join (EXISTS) → Aggregate
+-- Operators: Semi-Join (EXISTS) -> Aggregate
 SELECT
     o_orderpriority,
     COUNT(*) AS order_count

@@ -1,5 +1,5 @@
 -- Q6: Forecasting Revenue Change
--- Operators: Scan → Filter → Aggregate (single SUM)
+-- Operators: Scan -> Filter -> Aggregate (single SUM)
 SELECT
     SUM(l_extendedprice * l_discount) AS revenue
 FROM lineitem

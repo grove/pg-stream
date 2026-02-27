@@ -1,5 +1,5 @@
 -- Q7: Volume Shipping
--- Operators: 6-table Join → CASE WHEN → Aggregate
+-- Operators: 6-table Join -> CASE WHEN -> Aggregate
 SELECT
     supp_nation,
     cust_nation,

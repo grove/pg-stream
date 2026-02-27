@@ -1,5 +1,5 @@
 -- Q13: Customer Distribution
--- Operators: LEFT JOIN → Subquery-in-FROM → Aggregate
+-- Operators: LEFT JOIN -> Subquery-in-FROM -> Aggregate
 SELECT
     c_count,
     COUNT(*) AS custdist

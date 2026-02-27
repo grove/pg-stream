@@ -1,5 +1,5 @@
 -- Q21: Suppliers Who Kept Orders Waiting
--- Operators: 4-table Join → EXISTS + NOT EXISTS (anti-join)
+-- Operators: 4-table Join -> EXISTS + NOT EXISTS (anti-join)
 -- LIMIT removed (unsupported by pg_stream)
 SELECT
     s_name,

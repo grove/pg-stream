@@ -1,11 +1,15 @@
 -- Q14: Promotion Effect
--- Operators: 2-table Join → Conditional SUM ratio
+-- Operators: 2-table Join -> Conditional SUM ratio
 SELECT
     100.00 * SUM(CASE
-        WHEN p_type LIKE 'PROMO%'
+        WHEN left(p_type, 5) = 'PROMO'
         THEN l_extendedprice * (1 - l_discount)
         ELSE 0
-    END) / NULLIF(SUM(l_extendedprice * (1 - l_discount)), 0) AS promo_revenue
+    END) /
+    CASE WHEN SUM(l_extendedprice * (1 - l_discount)) = 0
+         THEN NULL
+         ELSE SUM(l_extendedprice * (1 - l_discount))
+    END AS promo_revenue
 FROM lineitem, part
 WHERE l_partkey = p_partkey
   AND l_shipdate >= DATE '1995-09-01'

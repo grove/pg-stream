@@ -1,5 +1,5 @@
 -- Q3: Shipping Priority
--- Operators: 3-table Join → Filter → Aggregate
+-- Operators: 3-table Join -> Filter -> Aggregate
 -- LIMIT removed (unsupported by pg_stream)
 SELECT
     l_orderkey,

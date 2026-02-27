@@ -1,5 +1,5 @@
 -- Q11: Important Stock Identification
--- Operators: 3-table Join → Aggregate → HAVING (scalar subquery)
+-- Operators: 3-table Join -> Aggregate -> HAVING (scalar subquery)
 SELECT
     ps_partkey,
     SUM(ps_supplycost * ps_availqty) AS value

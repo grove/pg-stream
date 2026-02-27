@@ -1,5 +1,5 @@
 -- Q1: Pricing Summary Report
--- Operators: Scan → Filter → Aggregate (6 aggregates: SUM, AVG, COUNT)
+-- Operators: Scan -> Filter -> Aggregate (6 aggregates: SUM, AVG, COUNT)
 SELECT
     l_returnflag,
     l_linestatus,

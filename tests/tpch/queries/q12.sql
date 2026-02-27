@@ -1,5 +1,5 @@
 -- Q12: Shipping Modes and Order Priority
--- Operators: Scan → Filter (IN, BETWEEN) → CASE WHEN → Aggregate
+-- Operators: Scan -> Filter (IN, BETWEEN) -> CASE WHEN -> Aggregate
 SELECT
     l_shipmode,
     SUM(CASE
