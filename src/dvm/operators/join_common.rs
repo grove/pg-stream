@@ -18,6 +18,7 @@
 //!    translated to disambiguated column names (e.g., `l."o__prod_id"`).
 
 use crate::dvm::diff::quote_ident;
+use crate::dvm::operators::aggregate::agg_to_rescan_sql;
 use crate::dvm::parser::{Expr, OpTree};
 
 // ── Snapshot SQL generation ─────────────────────────────────────────────
@@ -74,6 +75,38 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
             }
         }
         OpTree::Project { child, .. } | OpTree::Subquery { child, .. } => build_snapshot_sql(child),
+        OpTree::Aggregate {
+            group_by,
+            aggregates,
+            child,
+        } => {
+            let inner = build_snapshot_sql(child);
+            let child_alias = child.alias();
+            let mut selects = Vec::new();
+            for expr in group_by {
+                selects.push(expr.to_sql());
+            }
+            for agg in aggregates {
+                selects.push(format!(
+                    "{} AS {}",
+                    agg_to_rescan_sql(agg),
+                    quote_ident(&agg.alias),
+                ));
+            }
+            let gb = if group_by.is_empty() {
+                String::new()
+            } else {
+                let cols: Vec<String> = group_by.iter().map(|e| e.to_sql()).collect();
+                format!(" GROUP BY {}", cols.join(", "))
+            };
+            format!(
+                "(SELECT {} FROM {} {}{})",
+                selects.join(", "),
+                inner,
+                quote_ident(child_alias),
+                gb,
+            )
+        }
         _ => {
             // Fallback for unsupported node types.
             format!("/* unsupported snapshot for {} */", op.node_kind())
@@ -208,8 +241,16 @@ fn rewrite_expr_for_join(
                         table_alias: Some(new_left.to_string()),
                         column_name: column_name.clone(),
                     }
+                } else if let Some(disambiguated) =
+                    resolve_disambiguated_column(left, alias, column_name)
+                {
+                    // Deep disambiguation: trace through nested joins
+                    Expr::ColumnRef {
+                        table_alias: Some(new_left.to_string()),
+                        column_name: disambiguated,
+                    }
                 } else {
-                    // Table is inside a nested join — column is disambiguated
+                    // Fallback: single-level disambiguation
                     Expr::ColumnRef {
                         table_alias: Some(new_left.to_string()),
                         column_name: format!("{alias}__{column_name}"),
@@ -220,6 +261,13 @@ fn rewrite_expr_for_join(
                     Expr::ColumnRef {
                         table_alias: Some(new_right.to_string()),
                         column_name: column_name.clone(),
+                    }
+                } else if let Some(disambiguated) =
+                    resolve_disambiguated_column(right, alias, column_name)
+                {
+                    Expr::ColumnRef {
+                        table_alias: Some(new_right.to_string()),
+                        column_name: disambiguated,
                     }
                 } else {
                     Expr::ColumnRef {
@@ -233,11 +281,47 @@ fn rewrite_expr_for_join(
             }
         }
         Expr::ColumnRef {
-            table_alias: None, ..
+            table_alias: None,
+            column_name,
         } => {
-            // Unqualified column ref — pass through. The join CTE's
-            // column list will make it accessible if it exists.
-            expr.clone()
+            // Unqualified column ref — resolve against left/right children
+            // to find the source Scan and disambiguate correctly.
+            if let Some(source_alias) = find_column_source(left, column_name) {
+                if is_simple_source(left, &source_alias) {
+                    Expr::ColumnRef {
+                        table_alias: Some(new_left.to_string()),
+                        column_name: column_name.clone(),
+                    }
+                } else if let Some(disambiguated) =
+                    resolve_disambiguated_column(left, &source_alias, column_name)
+                {
+                    Expr::ColumnRef {
+                        table_alias: Some(new_left.to_string()),
+                        column_name: disambiguated,
+                    }
+                } else {
+                    expr.clone()
+                }
+            } else if let Some(source_alias) = find_column_source(right, column_name) {
+                if is_simple_source(right, &source_alias) {
+                    Expr::ColumnRef {
+                        table_alias: Some(new_right.to_string()),
+                        column_name: column_name.clone(),
+                    }
+                } else if let Some(disambiguated) =
+                    resolve_disambiguated_column(right, &source_alias, column_name)
+                {
+                    Expr::ColumnRef {
+                        table_alias: Some(new_right.to_string()),
+                        column_name: disambiguated,
+                    }
+                } else {
+                    expr.clone()
+                }
+            } else {
+                // Column not found in either child — pass through
+                expr.clone()
+            }
         }
         Expr::BinaryOp {
             op,
@@ -321,7 +405,9 @@ fn collect_source_aliases(op: &OpTree) -> Vec<String> {
         OpTree::CteScan { alias, .. } => vec![alias.clone()],
         OpTree::InnerJoin { left, right, .. }
         | OpTree::LeftJoin { left, right, .. }
-        | OpTree::FullJoin { left, right, .. } => {
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => {
             let mut aliases = collect_source_aliases(left);
             aliases.extend(collect_source_aliases(right));
             aliases
@@ -405,13 +491,98 @@ pub fn has_source_alias(op: &OpTree, alias: &str) -> bool {
         OpTree::Scan { alias: a, .. } => a == alias,
         OpTree::InnerJoin { left, right, .. }
         | OpTree::LeftJoin { left, right, .. }
-        | OpTree::FullJoin { left, right, .. } => {
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => {
             has_source_alias(left, alias) || has_source_alias(right, alias)
         }
         OpTree::Filter { child, .. }
         | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. } => has_source_alias(child, alias),
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => has_source_alias(child, alias),
         _ => false,
+    }
+}
+
+/// Find which source Scan a bare (unqualified) column name belongs to.
+///
+/// Searches the OpTree for Scan nodes whose columns include `column_name`.
+/// Returns the alias of the first matching Scan, or `None` if no Scan has
+/// that column.
+fn find_column_source(op: &OpTree, column_name: &str) -> Option<String> {
+    match op {
+        OpTree::Scan { alias, columns, .. } => {
+            if columns.iter().any(|c| c.name == column_name) {
+                Some(alias.clone())
+            } else {
+                None
+            }
+        }
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => {
+            find_column_source(left, column_name).or_else(|| find_column_source(right, column_name))
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => find_column_source(child, column_name),
+        _ => None,
+    }
+}
+
+/// Resolve a table-qualified column reference to its fully disambiguated
+/// name in the context of a specific OpTree.
+///
+/// For deeply nested joins (e.g., `((supplier ⋈ l1) ⋈ orders) ⋈ nation`),
+/// a column like `l1.l_orderkey` is disambiguated through multiple levels:
+/// `l1__l_orderkey` → `join__l1__l_orderkey` → `join__join__l1__l_orderkey`.
+///
+/// This function recursively traces the nesting to produce the correct
+/// fully-qualified column name.
+fn resolve_disambiguated_column(
+    op: &OpTree,
+    table_alias: &str,
+    column_name: &str,
+) -> Option<String> {
+    match op {
+        OpTree::Scan { alias, .. } if alias == table_alias => {
+            // Found the target scan — return alias__column_name
+            Some(format!("{alias}__{column_name}"))
+        }
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            if has_source_alias(left, table_alias) {
+                if is_simple_source(left, table_alias) {
+                    // The table IS the left child scan — single level
+                    Some(format!("{table_alias}__{column_name}"))
+                } else {
+                    // Nested — recurse and add the left child's alias prefix
+                    let inner = resolve_disambiguated_column(left, table_alias, column_name)?;
+                    Some(format!("{}__{inner}", left.alias()))
+                }
+            } else if has_source_alias(right, table_alias) {
+                if is_simple_source(right, table_alias) {
+                    Some(format!("{table_alias}__{column_name}"))
+                } else {
+                    let inner = resolve_disambiguated_column(right, table_alias, column_name)?;
+                    Some(format!("{}__{inner}", right.alias()))
+                }
+            } else {
+                None
+            }
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => {
+            resolve_disambiguated_column(child, table_alias, column_name)
+        }
+        _ => None,
     }
 }
 
