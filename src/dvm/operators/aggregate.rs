@@ -153,7 +153,11 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             Some(format!("{l} FULL JOIN {r} ON {}", condition.to_sql()))
         }
         OpTree::Project { child, .. } => child_to_from_sql(child),
-        OpTree::Subquery { child, alias, .. } => {
+        OpTree::Subquery {
+            child,
+            alias,
+            column_aliases,
+        } => {
             // Only recurse into Subquery when the child is an Aggregate.
             // An Aggregate child produces a complete subquery expression
             // (SELECT ... GROUP BY ...) that can be aliased and used as FROM.
@@ -166,7 +170,20 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             match child.as_ref() {
                 OpTree::Aggregate { .. } => {
                     let inner = child_to_from_sql(child)?;
-                    Some(format!("{inner} AS {}", quote_ident(alias)))
+                    if column_aliases.is_empty() {
+                        Some(format!("{inner} AS {}", quote_ident(alias)))
+                    } else {
+                        // Apply positional column aliases using PostgreSQL's
+                        // AS alias(col1, col2) syntax to match the delta's
+                        // renamed columns from diff_subquery.
+                        let col_list: Vec<String> =
+                            column_aliases.iter().map(|a| quote_ident(a)).collect();
+                        Some(format!(
+                            "{inner} AS {}({})",
+                            quote_ident(alias),
+                            col_list.join(", ")
+                        ))
+                    }
                 }
                 _ => None,
             }
@@ -182,9 +199,11 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             for expr in group_by {
                 selects.push(expr.to_sql());
             }
-            // Include COUNT(*) AS __pgs_count so the column count matches
-            // the intermediate aggregate delta output.
-            selects.push("COUNT(*) AS __pgs_count".to_string());
+            // NOTE: do NOT include COUNT(*) AS __pgs_count here.
+            // The intermediate aggregate delta output_cols excludes __pgs_count
+            // (it's internal bookkeeping), so the child_to_from_sql must match.
+            // Including it here would cause column count mismatches in the
+            // EXCEPT ALL between SELECT * FROM this subquery and the delta CTE.
             for agg in aggregates {
                 selects.push(format!(
                     "{} AS {}",
@@ -444,10 +463,14 @@ fn build_intermediate_agg_delta(
     // ── Final CTE: emit D/I pairs ───────────────────────────────────
     let final_cte = ctx.next_cte_name("agg_final");
 
-    // Build output columns
+    // Build output columns — exclude __pgs_count since this is an intermediate
+    // aggregate. __pgs_count is internal bookkeeping for the top-level aggregate's
+    // MERGE with the stream table. Including it in intermediate output causes
+    // parent operators (e.g., InnerJoin) to propagate it into column references
+    // against snapshots that don't have it (leading to "column __pgs_count
+    // does not exist" errors).
     let mut output_cols = Vec::new();
     output_cols.extend(group_output.iter().cloned());
-    output_cols.push("__pgs_count".to_string());
     for agg in aggregates {
         output_cols.push(agg.alias.clone());
     }

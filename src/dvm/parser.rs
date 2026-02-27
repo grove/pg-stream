@@ -5785,6 +5785,13 @@ unsafe fn parse_exists_sublink(
 /// is equivalent to:
 /// `EXISTS (SELECT 1 FROM inner_table WHERE inner_table.col = x AND filter)`
 ///
+/// When the inner SELECT has GROUP BY / HAVING, the inner tree is wrapped
+/// in an Aggregate (+ HAVING Filter) so the SemiJoin only matches qualifying
+/// groups:
+/// `x IN (SELECT col FROM T GROUP BY col HAVING agg > threshold)`
+/// → SemiJoin(cond = x = sub.col,
+///            inner = Subquery(Filter(HAVING, Aggregate(GROUP BY col, child=T))))
+///
 /// # Safety
 /// Caller must ensure `sublink` points to a valid `pg_sys::SubLink`.
 unsafe fn parse_any_sublink(
@@ -5852,6 +5859,98 @@ unsafe fn parse_any_sublink(
         ));
     };
 
+    // ── GROUP BY / HAVING handling ──────────────────────────────────
+    //
+    // When the inner SELECT has GROUP BY or HAVING, the flat SemiJoin
+    // rewrite would lose the grouping semantics. Instead, wrap the inner
+    // tree in Aggregate + Filter(HAVING) so only qualifying groups are
+    // considered for the semi-join match.
+    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.groupClause) };
+    let has_group_by = !group_list.is_empty();
+    let has_having = !inner_select.havingClause.is_null();
+
+    if has_group_by || has_having {
+        // Apply inner WHERE as a Filter on the FROM tree
+        if !inner_select.whereClause.is_null() {
+            let inner_where = unsafe { node_to_expr(inner_select.whereClause)? };
+            inner_tree = OpTree::Filter {
+                predicate: inner_where,
+                child: Box::new(inner_tree),
+            };
+        }
+
+        // Parse GROUP BY expressions
+        let mut group_by = Vec::new();
+        for node_ptr in group_list.iter_ptr() {
+            let expr = unsafe { node_to_expr(node_ptr)? };
+            group_by.push(expr);
+        }
+
+        // Extract aggregates from the target list
+        let (mut aggregates, _non_agg_exprs) = unsafe { extract_aggregates(&target_list)? };
+
+        // Extract additional aggregates from HAVING expression.
+        // The HAVING clause may reference aggregates not present in the
+        // SELECT list (e.g., `SELECT col FROM T GROUP BY col HAVING SUM(x) > 0`).
+        if has_having {
+            let having_expr = unsafe { node_to_expr(inner_select.havingClause)? };
+            let having_aggs = extract_aggregates_from_expr(&having_expr, aggregates.len());
+            for ha in &having_aggs {
+                // Avoid duplicates: only add if no existing aggregate matches
+                let already_present = aggregates.iter().any(|a| {
+                    a.function.sql_name() == ha.function.sql_name()
+                        && a.argument.as_ref().map(|e| e.to_sql())
+                            == ha.argument.as_ref().map(|e| e.to_sql())
+                });
+                if !already_present {
+                    aggregates.push(ha.clone());
+                }
+            }
+        }
+
+        // Build Aggregate node
+        inner_tree = OpTree::Aggregate {
+            group_by,
+            aggregates: aggregates.clone(),
+            child: Box::new(inner_tree),
+        };
+
+        // Apply HAVING as Filter on top of Aggregate
+        if has_having {
+            let having_expr = unsafe { node_to_expr(inner_select.havingClause)? };
+            let rewritten = rewrite_having_expr(&having_expr, &aggregates);
+            inner_tree = OpTree::Filter {
+                predicate: rewritten,
+                child: Box::new(inner_tree),
+            };
+        }
+
+        // Wrap in Subquery so the SemiJoin treats it as a derived table
+        let sub_alias = format!("__pgs_in_sub_{}", inner_tree.alias());
+        inner_tree = OpTree::Subquery {
+            alias: sub_alias,
+            column_aliases: Vec::new(),
+            child: Box::new(inner_tree),
+        };
+
+        // Build the equality condition using the output column name.
+        // The inner_col_expr (from the SELECT list) is a group-by column
+        // that passes through Aggregate → Filter → Subquery.
+        let equality = Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(test_expr),
+            right: Box::new(inner_col_expr),
+        };
+
+        return Ok(SublinkWrapper {
+            negated,
+            condition: equality,
+            inner_tree,
+        });
+    }
+
+    // ── Simple case: no GROUP BY / HAVING ───────────────────────────
+
     // Build the equality condition: test_expr = inner_col_expr
     let equality = Expr::BinaryOp {
         op: "=".to_string(),
@@ -5876,6 +5975,62 @@ unsafe fn parse_any_sublink(
         condition,
         inner_tree,
     })
+}
+
+/// Extract aggregate function calls from an expression tree.
+///
+/// Used to find aggregates in HAVING clauses that may not appear in the
+/// SELECT target list. Each discovered aggregate is assigned a unique alias
+/// `__pgs_having_{N}` where N starts from `start_idx`.
+fn extract_aggregates_from_expr(expr: &Expr, start_idx: usize) -> Vec<AggExpr> {
+    let mut result = Vec::new();
+    extract_aggregates_from_expr_inner(expr, start_idx, &mut result);
+    result
+}
+
+fn extract_aggregates_from_expr_inner(expr: &Expr, start_idx: usize, out: &mut Vec<AggExpr>) {
+    match expr {
+        Expr::FuncCall { func_name, args } => {
+            let name_lower = func_name.to_lowercase();
+            let agg_func = match name_lower.as_str() {
+                "count" => {
+                    if args.is_empty() {
+                        Some(AggFunc::CountStar)
+                    } else {
+                        Some(AggFunc::Count)
+                    }
+                }
+                "sum" => Some(AggFunc::Sum),
+                "avg" => Some(AggFunc::Avg),
+                "min" => Some(AggFunc::Min),
+                "max" => Some(AggFunc::Max),
+                _ => None,
+            };
+            if let Some(func) = agg_func {
+                let argument = args.first().cloned();
+                let alias = format!("__pgs_having_{}", start_idx + out.len());
+                out.push(AggExpr {
+                    function: func,
+                    argument,
+                    alias,
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                });
+            } else {
+                // Non-aggregate FuncCall: recurse into arguments
+                for arg in args {
+                    extract_aggregates_from_expr_inner(arg, start_idx, out);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_aggregates_from_expr_inner(left, start_idx, out);
+            extract_aggregates_from_expr_inner(right, start_idx, out);
+        }
+        _ => {}
+    }
 }
 
 /// Parse an ALL SubLink (`x op ALL (SELECT col FROM ...)`) into a SublinkWrapper.
@@ -6465,11 +6620,52 @@ unsafe fn parse_select_stmt(
         let (aggregates, non_agg_exprs) = unsafe { extract_aggregates(&target_list)? };
         let _ = non_agg_exprs;
 
+        // ── Step 3a2: Check for SELECT alias renames on GROUP BY cols ───
+        // When the SELECT list renames a GROUP BY column (e.g.,
+        // `SELECT l_suppkey AS supplier_no, SUM(...) AS total_revenue
+        //  GROUP BY l_suppkey`), the Aggregate's output uses the raw
+        // expression name (l_suppkey), losing the alias. Detect renames
+        // BEFORE moving group_by into the Aggregate.
+        let (target_exprs, target_aliases) = unsafe { parse_target_list(&target_list)? };
+        let mut rename_map = std::collections::HashMap::<usize, String>::new();
+        for (i, gb_expr) in group_by.iter().enumerate() {
+            let gb_sql = gb_expr.to_sql();
+            let gb_output = gb_expr.output_name();
+            for (te, ta) in target_exprs.iter().zip(target_aliases.iter()) {
+                if te.to_sql() == gb_sql && ta != &gb_output {
+                    rename_map.insert(i, ta.clone());
+                    break;
+                }
+            }
+        }
+
         tree = OpTree::Aggregate {
             group_by,
             aggregates: aggregates.clone(),
             child: Box::new(tree),
         };
+
+        // Add a Project wrapper if any GROUP BY column needs renaming.
+        if !rename_map.is_empty() {
+            let agg_output = tree.output_columns();
+            let proj_exprs: Vec<Expr> = agg_output
+                .iter()
+                .map(|name| Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: name.clone(),
+                })
+                .collect();
+            let proj_aliases: Vec<String> = agg_output
+                .iter()
+                .enumerate()
+                .map(|(i, name)| rename_map.get(&i).cloned().unwrap_or_else(|| name.clone()))
+                .collect();
+            tree = OpTree::Project {
+                expressions: proj_exprs,
+                aliases: proj_aliases,
+                child: Box::new(tree),
+            };
+        }
 
         // ── Step 3b: Parse HAVING clause as Filter on top of Aggregate ──
         if !select.havingClause.is_null() {

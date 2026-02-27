@@ -67,6 +67,15 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                     quote_ident(alias),
                     predicate.to_sql()
                 )
+            } else if matches!(child.as_ref(), OpTree::Aggregate { .. }) {
+                // Filter on top of Aggregate = HAVING clause.
+                // The child_snap is a `(SELECT ... GROUP BY ...)` subquery.
+                // Wrap in an outer SELECT to apply the HAVING predicate.
+                format!(
+                    "(SELECT * FROM {} __having_sub WHERE {})",
+                    child_snap,
+                    predicate.to_sql()
+                )
             } else {
                 // For non-Scan children (e.g. Filter over Join), the filter
                 // is applied by diff_filter in the diff pipeline. The
@@ -74,7 +83,76 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                 child_snap
             }
         }
-        OpTree::Project { child, .. } | OpTree::Subquery { child, .. } => build_snapshot_sql(child),
+        OpTree::Project {
+            expressions,
+            aliases,
+            child,
+        } => {
+            // A Project renames/transforms columns. The snapshot must preserve
+            // these aliases so that downstream join conditions can reference
+            // the projected column names (e.g., `__pgs_scalar_1` from a
+            // scalar subquery CROSS JOIN rewrite).
+            let inner = build_snapshot_sql(child);
+            let child_alias = child.alias();
+            let selects: Vec<String> = expressions
+                .iter()
+                .zip(aliases.iter())
+                .map(|(expr, alias)| {
+                    let expr_sql = expr.to_sql();
+                    let alias_ident = quote_ident(alias);
+                    if expr_sql == *alias {
+                        alias_ident
+                    } else {
+                        format!("{expr_sql} AS {alias_ident}")
+                    }
+                })
+                .collect();
+            format!(
+                "(SELECT {} FROM {} {})",
+                selects.join(", "),
+                inner,
+                quote_ident(child_alias),
+            )
+        }
+        OpTree::Subquery {
+            column_aliases,
+            child,
+            ..
+        } => {
+            if column_aliases.is_empty() {
+                build_snapshot_sql(child)
+            } else {
+                // Subquery with column aliases (e.g., `(...) AS v("c1", "c2")`).
+                // Wrap the child snapshot in a SELECT that renames columns
+                // positionally to match the aliases.
+                let inner = build_snapshot_sql(child);
+                let child_alias = child.alias();
+                // Use positional references (ordinal) to rename
+                let selects: Vec<String> = column_aliases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, alias)| {
+                        // Reference by position: column number i+1
+                        // We use a subquery wrapper so we can rename by ordinal
+                        format!("__sub.col{} AS {}", i + 1, quote_ident(alias))
+                    })
+                    .collect();
+                // Wrap inner snapshot with ordinal column names
+                let child_cols = child.output_columns();
+                let inner_selects: Vec<String> = child_cols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{} AS col{}", quote_ident(c), i + 1))
+                    .collect();
+                format!(
+                    "(SELECT {} FROM (SELECT {} FROM {} {}) __sub)",
+                    selects.join(", "),
+                    inner_selects.join(", "),
+                    inner,
+                    quote_ident(child_alias),
+                )
+            }
+        }
         OpTree::Aggregate {
             group_by,
             aggregates,
@@ -105,6 +183,42 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                 inner,
                 quote_ident(child_alias),
                 gb,
+            )
+        }
+        OpTree::SemiJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_snap = build_snapshot_sql(left);
+            let right_snap = build_snapshot_sql(right);
+            // Use safe non-reserved aliases to avoid Expr::to_sql() emitting
+            // unquoted reserved words like "join" (from InnerJoin.alias()).
+            let left_alias = "__pgs_sl";
+            let right_alias = "__pgs_sr";
+            let cond = rewrite_join_condition(condition, left, left_alias, right, right_alias);
+            format!(
+                "(SELECT {la}.* FROM {left_snap} {la} WHERE EXISTS \
+                 (SELECT 1 FROM {right_snap} {ra} WHERE {cond}))",
+                la = quote_ident(left_alias),
+                ra = quote_ident(right_alias),
+            )
+        }
+        OpTree::AntiJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_snap = build_snapshot_sql(left);
+            let right_snap = build_snapshot_sql(right);
+            let left_alias = "__pgs_al";
+            let right_alias = "__pgs_ar";
+            let cond = rewrite_join_condition(condition, left, left_alias, right, right_alias);
+            format!(
+                "(SELECT {la}.* FROM {left_snap} {la} WHERE NOT EXISTS \
+                 (SELECT 1 FROM {right_snap} {ra} WHERE {cond}))",
+                la = quote_ident(left_alias),
+                ra = quote_ident(right_alias),
             )
         }
         _ => {
@@ -194,9 +308,22 @@ fn snapshot_output_columns(op: &OpTree) -> Vec<String> {
             }
             cols
         }
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. } => snapshot_output_columns(child),
+        OpTree::Filter { child, .. } => snapshot_output_columns(child),
+        OpTree::Project { aliases, .. } => {
+            // Project snapshot uses the project's alias names
+            aliases.clone()
+        }
+        OpTree::Subquery {
+            column_aliases,
+            child,
+            ..
+        } => {
+            if column_aliases.is_empty() {
+                snapshot_output_columns(child)
+            } else {
+                column_aliases.clone()
+            }
+        }
         _ => op.output_columns(),
     }
 }
@@ -498,9 +625,17 @@ pub fn has_source_alias(op: &OpTree, alias: &str) -> bool {
         }
         OpTree::Filter { child, .. }
         | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. }
         | OpTree::Aggregate { child, .. }
         | OpTree::Distinct { child, .. } => has_source_alias(child, alias),
+        OpTree::Subquery {
+            alias: sub_alias,
+            child,
+            ..
+        } => {
+            // A Subquery introduces a named scope (e.g., `(SELECT ...) AS revenue0`).
+            // Its own alias is a valid source alias for column references.
+            sub_alias == alias || has_source_alias(child, alias)
+        }
         _ => false,
     }
 }
@@ -582,6 +717,12 @@ fn resolve_disambiguated_column(
         | OpTree::Subquery { child, .. } => {
             resolve_disambiguated_column(child, table_alias, column_name)
         }
+        // SemiJoin/AntiJoin output only left-side columns. The right
+        // side is used for the EXISTS check and doesn't contribute to
+        // the output. Recurse into the left child only.
+        OpTree::SemiJoin { left, .. } | OpTree::AntiJoin { left, .. } => {
+            resolve_disambiguated_column(left, table_alias, column_name)
+        }
         _ => None,
     }
 }
@@ -595,9 +736,28 @@ fn resolve_disambiguated_column(
 pub fn is_simple_source(op: &OpTree, alias: &str) -> bool {
     match op {
         OpTree::Scan { alias: a, .. } => a == alias,
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. } => is_simple_source(child, alias),
+        OpTree::Filter { child, .. } | OpTree::Project { child, .. } => {
+            is_simple_source(child, alias)
+        }
+        OpTree::Subquery {
+            alias: sub_alias,
+            child,
+            ..
+        } => {
+            // If the subquery's own alias matches, this IS the atomic source.
+            // Columns are directly accessible without disambiguation (e.g.,
+            // a derived table `(SELECT ...) AS revenue0` — columns are
+            // accessed as `revenue0.col`, not `revenue0__col`).
+            if sub_alias == alias {
+                true
+            } else {
+                is_simple_source(child, alias)
+            }
+        }
+        // SemiJoin/AntiJoin pass through the left child's columns
+        OpTree::SemiJoin { left, .. } | OpTree::AntiJoin { left, .. } => {
+            is_simple_source(left, alias)
+        }
         // For joins, the alias is inside the join — needs disambiguation
         _ => false,
     }

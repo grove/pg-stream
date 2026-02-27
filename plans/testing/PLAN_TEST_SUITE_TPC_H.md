@@ -26,35 +26,34 @@ query that pg_stream can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 9/22 pass, 13 soft-skip |
-| Phase 2: Cross-Query Consistency | Done — 13/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 9/22 pass |
+| Phase 1: Differential Correctness | Done — 14/22 pass, 8 soft-skip |
+| Phase 2: Cross-Query Consistency | Done — 14/20 STs survive all cycles |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 14/22 pass |
 
-### Latest Test Run (2026-02-28, SF=0.01, 3 cycles)
+### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
 
 ```
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
 ```
 
-**Deterministically passing (12):** Q05, Q07, Q08, Q09, Q10, Q11, Q12, Q14,
-Q16, Q19, Q20, Q22 — pass all 3 cycles consistently across multiple runs.
+**Deterministically passing (14):** Q04, Q05, Q07, Q08, Q09, Q10, Q11, Q14,
+Q16, Q18, Q19, Q20, Q21, Q22 — pass all 3 cycles consistently across
+multiple runs.
 
-**Phase 3 (FULL vs DIFF): 12/22** — deterministic and stable.
+**Phase 3 (FULL vs DIFF): 14/22** — deterministic and stable.
 
 **Cross-query consistency: 14/20** STs survive all 3 cycles.
 
-**Queries failing cycle 2+ deterministically (8):**
+**Queries failing cycle 2+ (6):**
 
-| Query | Cycle 2 Error | Category |
-|-------|---------------|----------|
+| Query | Cycle 2+ Error | Category |
+|-------|----------------|----------|
 | Q01 | Data mismatch: FULL(6) != DIFF(6) — same row count, different values | Aggregate drift |
 | Q03 | Data mismatch: FULL(46) != DIFF(46) — values differ | Aggregate drift |
-| Q04 | Data mismatch: FULL(5) != DIFF(5) — SemiJoin delta values differ | SemiJoin drift |
 | Q06 | Data mismatch cycle 3: FULL(1) != DIFF(1) — SUM drift accumulates | Aggregate drift |
+| Q12 | Data mismatch cycle 3 (flaky): FULL(2) != DIFF(2) — conditional aggregate drift | Aggregate drift (intermittent) |
 | Q13 | Data mismatch: FULL(3) != DIFF(2) — intermediate agg row count wrong | Intermediate agg |
-| Q15 | `column r.__pgs_scalar_1 does not exist` – scalar subquery snapshot missing column | Scalar subquery snapshot |
-| Q18 | Data mismatch: FULL(0) != DIFF(15) — SemiJoin IN loses GROUP BY/HAVING | SemiJoin parser |
-| Q21 | `column dl.l1__l_orderkey does not exist` — deep nested join disambiguation | Join alias scope |
+| Q15 | Data mismatch: FULL(1) != DIFF(2) — scalar subquery MAX filter accuracy | Scalar subquery delta |
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
 (`column "p_partkey" does not exist`).
@@ -65,13 +64,14 @@ Q16, Q19, Q20, Q22 — pass all 3 cycles consistently across multiple runs.
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_stream DVM does not support correlated scalar subqueries in WHERE |
 | **Cycle 2 — aggregate delta drift** | Q01, Q03, Q06 | Refresh succeeds but ST contents ≠ full query results (aggregate accumulation error — exact NUMERIC arithmetic, not floating point) |
-| **Cycle 2 — SemiJoin delta drift** | Q04 | SemiJoin delta passes cycle 1 but data mismatch in cycle 2 — OID extraction fixed, but SemiJoin delta formula produces incorrect results after mutations |
+| **Cycle 3 — conditional aggregate drift (flaky)** | Q12 | Conditional aggregate `SUM(CASE WHEN … END)` occasionally produces data mismatch on cycle 3 — sensitive to random RF data; intermittent between runs |
 | **Cycle 2 — intermediate aggregate drift** | Q13 | Intermediate aggregate (subquery-in-FROM + GROUP BY) produces incorrect row count after mutations. `build_intermediate_agg_delta` old/new rescan approach generates correct column names but the delta values diverge |
-| **Cycle 2 — scalar subquery snapshot** | Q15 | `column r.__pgs_scalar_1 does not exist` — the scalar subquery's CROSS JOIN rewrite places the scalar subquery as an InnerJoin child. `build_snapshot_sql` doesn't propagate the Project renaming through the snapshot, so the join delta references a non-existent column |
-| **Cycle 2 — SemiJoin IN parser limitation** | Q18 | `parse_any_sublink` doesn't preserve GROUP BY/HAVING from the inner SELECT of `o_orderkey IN (SELECT l_orderkey ... GROUP BY ... HAVING ...)`, making the SemiJoin match all rows instead of only qualifying groups |
-| **Cycle 2 — deep join alias disambiguation** | Q21 | `column dl.l1__l_orderkey does not exist` — the SemiJoin condition references a column (`l1.l_orderkey`) through deeply nested joins where disambiguation produces multi-level prefixes. `resolve_disambiguated_column` exists but doesn't activate for Q21's specific SemiJoin path |
+| **Cycle 2 — scalar subquery delta accuracy** | Q15 | All SQL structural errors resolved (snapshot columns, EXCEPT alignment, GROUP BY alias renaming). Remaining issue: differential delta produces 2 rows where full query produces 1 — the MAX filter over the derived table doesn't correctly recompute after mutations |
+| ~~**Cycle 2 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin snapshot with EXISTS/NOT EXISTS subqueries + `__pgs_count` filtering |
+| ~~**Cycle 2 — SemiJoin IN parser limitation**~~ | ~~Q18~~ | ~~FIXED~~ — `parse_any_sublink` now preserves GROUP BY/HAVING; `__pgs_count` filtered from SemiJoin `r_old_snapshot` |
+| ~~**Cycle 2 — deep join alias disambiguation**~~ | ~~Q21~~ | ~~FIXED~~ — Safe aliases (`__pgs_sl`/`__pgs_sr`/`__pgs_al`/`__pgs_ar`) for SemiJoin/AntiJoin snapshot; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths |
 | ~~**Cycle 2 — SemiJoin column ref**~~ | ~~Q20~~ | ~~FIXED~~ — see "Resolved" section |
-| ~~**Cycle 2 — MERGE column ref**~~ | ~~Q13, Q15~~ | ~~PARTIALLY FIXED~~ — intermediate aggregate detection now bypasses stream table LEFT JOIN; Q13 progressed to data mismatch; Q15 progressed to scalar subquery snapshot error |
+| ~~**Cycle 2 — MERGE column ref**~~ | ~~Q13, Q15~~ | ~~PARTIALLY FIXED~~ — intermediate aggregate detection now bypasses stream table LEFT JOIN; Q13 progressed to data mismatch; Q15 progressed to data mismatch |
 | ~~**Cycle 2 — null `__pgs_count` violation**~~ | ~~Q06, Q19~~ | ~~FIXED~~ — COALESCE guards on `d.__ins_count`/`d.__del_count` in merge CTE |
 | ~~**Cycle 2 — aggregate GROUP BY leak**~~ | ~~Q14~~ | ~~FIXED~~ — `AggFunc::ComplexExpression` for nested-aggregate target expressions |
 | ~~**Cycle 2 — subquery OID leak**~~ | ~~Q04~~ | ~~FIXED~~ — `query_tree_walker_impl` for complete OID extraction (Q04 now reaches data mismatch) |
@@ -90,7 +90,7 @@ Several queries were rewritten to avoid unsupported SQL features:
 | Q08 | `NULLIF(...)` → `CASE WHEN ... THEN ... END`; `BETWEEN` → explicit `>= AND <=` | A_Expr kind 5 unsupported |
 | Q09 | `LIKE '%green%'` → `strpos(p_name, 'green') > 0` | A_Expr kind 7 unsupported |
 | Q14 | `NULLIF(...)` → `CASE`; `LIKE 'PROMO%'` → `left(p_type, 5) = 'PROMO'` | A_Expr kind 5 & 7 |
-| Q15 | CTE `WITH revenue0 AS (...)` → inline derived table | CTEs unsupported (still fails with "?") |
+| Q15 | CTE `WITH revenue0 AS (...)` → inline derived table | CTEs unsupported (creates successfully; data mismatch on cycle 2) |
 | Q16 | `COUNT(DISTINCT ps_suppkey)` → DISTINCT subquery + `COUNT(*)`; `NOT LIKE` → `left()`; `LIKE` → `strpos()` | COUNT(DISTINCT) + A_Expr kind 7 |
 | All | `→` replaced with `->` in comments | UTF-8 byte boundary panic in parser |
 
@@ -101,12 +101,14 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-#### Priority 1: Fix aggregate delta drift (3 queries)
+#### Priority 1: Fix aggregate delta drift (3+ queries)
 
-Q01, Q03, Q06 show aggregate value drift after UPDATE mutations (RF3):
+Q01, Q03, Q06 show aggregate value drift after UPDATE mutations (RF3).
+Q12 shows intermittent drift on cycle 3 (flaky — same root cause family):
 - **Q01**: 6 rows, 3 differ — AVG aggregates drift after price/discount updates
 - **Q03**: 46 rows, 2 differ — SUM(l_extendedprice * (1 - l_discount)) drift after updates
 - **Q06**: 1 row, cycles 1-2 pass, cycle 3 drifts — global SUM accumulates error across mutation cycles
+- **Q12**: Flaky cycle 3 — conditional `SUM(CASE WHEN … END)` sometimes produces wrong values depending on random RF data
 
 The COALESCE fix resolved the NULL propagation bug, but drift persists for
 queries where the aggregate SUM/AVG formula produces different results from
@@ -117,23 +119,24 @@ particularly when UPDATE mutations (D+I pairs) flow through a Filter node
 that sits between Scan and Aggregate.
 
 **Files to investigate:** `src/dvm/operators/scan.rs`, `src/dvm/operators/aggregate.rs`, `src/dvm/operators/filter.rs`
-**Impact:** Would fix Q01, Q03, Q06.
+**Impact:** Would fix Q01, Q03, Q06, Q12 (flaky).
 
-#### Priority 2: Fix scalar subquery snapshot (Q15)
+#### Priority 2: Fix scalar subquery delta accuracy (Q15)
 
-Q15 creates and passes cycle 1 (FULL) but fails cycle 2 (DIFF) with
-`column r.__pgs_scalar_1 does not exist`. Root cause: the scalar subquery
-rewrite places the scalar subquery wrapper as a CROSS JOIN (InnerJoin) child.
-`build_snapshot_sql` for this subtree recurses through Project and Subquery
-nodes but loses the column renaming — the snapshot doesn't include the
-`__pgs_scalar_1` alias column.
+Q15's structural issues are all resolved — snapshot columns, EXCEPT column
+alignment, GROUP BY alias renaming (parser Project wrapper), `has_source_alias`
+for Subquery own-alias, `is_simple_source` for Subquery. The query now
+creates successfully, passes cycle 1 (FULL), and generates valid SQL for
+DIFFERENTIAL. However, the differential delta produces 2 rows where the full
+query produces 1 (FULL=1, DIFF=2).
 
-Intermediate aggregate detection (`is_intermediate`) and
-`build_intermediate_agg_delta` work correctly for Q15's inner aggregates.
-The remaining issue is specifically in the snapshot column naming for the
-scalar subquery's CROSS JOIN child.
+Root cause: Q15 uses `WHERE total_revenue = (SELECT MAX(total_revenue) FROM
+revenue0)` — a scalar subquery that computes MAX over a derived table. When
+the derived table's data changes, the MAX value changes, and the filter
+condition selects different suppliers. The delta engine doesn't correctly
+handle this cascading change through the scalar subquery → CROSS JOIN rewrite.
 
-**Files to fix:** `src/dvm/operators/join_common.rs` (build_snapshot_sql for Project), `src/dvm/operators/scalar_subquery.rs`
+**Files to investigate:** `src/dvm/operators/aggregate.rs` (intermediate agg delta for MAX), `src/dvm/operators/join_common.rs` (CROSS JOIN delta with scalar subquery child)
 **Impact:** Would fix Q15
 
 #### Priority 3: Fix intermediate aggregate data mismatch (Q13)
@@ -152,28 +155,7 @@ NULL padding) that affect the aggregate result.
 **Files to investigate:** `src/dvm/operators/aggregate.rs` (build_intermediate_agg_delta)
 **Impact:** Would fix Q13
 
-#### Priority 4: Fix SemiJoin IN parser for GROUP BY/HAVING (Q18)
-
-Q18 has `o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey
-HAVING SUM(l_quantity) > 300)`. `parse_any_sublink` extracts the inner SELECT
-but discards GROUP BY/HAVING, making the SemiJoin match all lineitem rows
-instead of only qualifying l_orderkey groups.
-
-**Files to fix:** `src/dvm/parser.rs` (parse_any_sublink)
-**Impact:** Would fix Q18
-
-#### Priority 5: Fix deep join alias disambiguation (Q21)
-
-Q21 fails with `column dl.l1__l_orderkey does not exist`. The SemiJoin
-condition references `l1.l_orderkey` through a deeply nested join tree
-`((supplier ⋈ l1) ⋈ orders) ⋈ nation`. The `resolve_disambiguated_column`
-function exists but doesn't activate for Q21's specific SemiJoin condition
-rewriting path.
-
-**Files to fix:** `src/dvm/operators/join_common.rs`, `src/dvm/operators/semi_join.rs`
-**Impact:** Would fix Q21
-
-#### Priority 6: Fix correlated scalar subquery support (2 queries)
+#### Priority 4: Fix correlated scalar subquery support (2 queries)
 
 Q02 and Q17 use correlated scalar subqueries in WHERE clauses. The rewriter
 cannot safely detect when a scalar subquery references outer columns via bare
@@ -187,8 +169,12 @@ Deeper DVM support (named correlation context) is needed.
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| P4 — SemiJoin IN parser | `parse_any_sublink` discarded GROUP BY/HAVING from inner SELECT of `IN (SELECT … GROUP BY … HAVING …)` | `parse_any_sublink` now preserves GROUP BY/HAVING; `extract_aggregates_from_expr` helper for HAVING aggregate extraction; `build_snapshot_sql` Filter-on-Aggregate support; `__pgs_count` filtered from SemiJoin `right_col_list` in `r_old_snapshot` | Q18 (all 3 cycles pass) |
+| P5 — SemiJoin/AntiJoin alias | `build_snapshot_sql` didn't handle SemiJoin/AntiJoin (produced comment placeholder); `InnerJoin.alias()` returns `"join"` (SQL reserved keyword) causing syntax errors | SemiJoin snapshot: `EXISTS (SELECT 1 FROM … WHERE …)` with safe aliases `__pgs_sl`/`__pgs_sr`; AntiJoin snapshot: `NOT EXISTS` with `__pgs_al`/`__pgs_ar`; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths | Q21 (all 3 cycles pass) |
+| P2+P4+P5 — SemiJoin snapshot | SemiJoin delta produced data mismatch because `build_snapshot_sql` couldn't produce correct snapshot SQL for SemiJoin subtrees | Combined effect of SemiJoin/AntiJoin EXISTS snapshot, `__pgs_count` filtering, and SemiJoin IN parser fixes | Q04 (all 3 cycles pass) |
+| P2 — Q15 structural (multi-part) | Five cascading errors: (1) `column r.__pgs_scalar_1 does not exist` — Project/Subquery not in snapshot; (2) EXCEPT column count mismatch — `__pgs_count` in `child_to_from_sql` but not intermediate `output_cols`; (3) `column "supplier_no" does not exist` — GROUP BY alias lost by parser; (4) `has_source_alias` didn't recognize Subquery own-alias; (5) `is_simple_source` didn't treat Subquery as atomic source | Five fixes: (1) `build_snapshot_sql` for Project + Subquery-with-aliases; (2) removed `__pgs_count` from `child_to_from_sql` Aggregate + intermediate `output_cols`; (3) parser Step 3a2 — semantic match GROUP BY expressions vs target aliases, wrap in Project when aliases differ; (4) `has_source_alias` checks `sub_alias == alias`; (5) `is_simple_source` returns true for Subquery alias match | Q15 (structural → data mismatch; SQL errors resolved, accuracy remains) |
 | P1 — `__pgs_count` NULL | Global aggregates (no GROUP BY): `SUM(CASE … THEN 1 ELSE 0 END)` over empty delta returns NULL, propagating through `new_count = old + NULL - NULL = NULL` → NOT NULL violation | COALESCE guards: wrapped `d.__ins_count` and `d.__del_count` in `COALESCE(…, 0)` in merge CTE `new_count`, action classification, Count/CountStar merge, and AVG denominator | Q06 (partial: cycles 1-2 pass, drift cycle 3), Q19 (all 3 cycles) |
-| P1 — Conditional SUM drift | Aggregate delta `SUM(CASE WHEN … THEN 1 ELSE 0 END)` produced wrong Count merge due to missing COALESCE on `d.__ins_*`/`d.__del_*` delta columns | Same COALESCE fix as above — Count/CountStar merge expression now wraps delta columns | Q12 (all 3 cycles pass) |
+| P1 — Conditional SUM drift | Aggregate delta `SUM(CASE WHEN … THEN 1 ELSE 0 END)` produced wrong Count merge due to missing COALESCE on `d.__ins_*`/`d.__del_*` delta columns | Same COALESCE fix as above — Count/CountStar merge expression now wraps delta columns | Q12 (was all 3 cycles; now flaky cycle 3 — likely pre-existing issue masked by data) |
 | P2 — Subquery OID leak | `extract_source_relations` only walked the outer query's rtable; EXISTS/IN subqueries in WHERE/HAVING are SubLink nodes in the expression tree, NOT RTE_SUBQUERY entries | Replaced manual `collect_relation_oids` with PostgreSQL's `query_tree_walker_impl` using `QTW_EXAMINE_RTES_BEFORE` flag + `expression_tree_walker_impl` for SubLink recursion | Q04 (OID check passes, now reaches data mismatch — separate SemiJoin drift bug) |
 | P2 — Aggregate GROUP BY leak | `expr_contains_agg` didn't recurse into A_Expr/CaseExpr; `extract_aggregates` only recognized top-level FuncCall. Q14's `100 * SUM(…) / CASE WHEN SUM(…) = 0 THEN NULL ELSE SUM(…) END` was not detected as an aggregate expression | Two fixes: (1) `expr_contains_agg` now uses `raw_expression_tree_walker_impl` for full recursion; (2) `extract_aggregates` creates `AggFunc::ComplexExpression(raw_sql)` for complex expressions wrapping nested aggregates — uses group-rescan strategy (re-evaluates from source on change) | Q14 (all 3 cycles pass) |
 | P1 — CDC lifecycle | Stale pending cleanup entries in thread-local `PENDING_CLEANUP` queue referenced change buffer tables dropped by a previous ST's cleanup; `Spi::run(DELETE ...)` on non-existent table longjmps past all Rust error handling | Three-part fix: (1) `refresh.rs`: added pg_class existence check in `drain_pending_cleanups` before DELETE/TRUNCATE; (2) `refresh.rs`: added `flush_pending_cleanups_for_oids` to remove stale entries; (3) `api.rs`: call `flush_pending_cleanups_for_oids` in `drop_stream_table_impl` before cleanup; also added OID mismatch diagnostic check in `execute_differential_refresh` | Q05, Q07, Q16, Q22 (4 queries stabilized from intermittent → pass) |
@@ -481,16 +467,16 @@ pg_stream and would slow down RF1/RF2 operations.
 
 ## Query Compatibility
 
-Of the 22 TPC-H queries, **17 can be created** as stream tables (with SQL
-workarounds for NULLIF, LIKE, COUNT(DISTINCT), and CTE). Of those 17,
-**4 pass all mutation cycles** and **13 pass cycle 1 only** (failing on
-cycle 2+ due to DVM bugs).
+Of the 22 TPC-H queries, **20 can be created** as stream tables (with SQL
+workarounds for NULLIF, LIKE, COUNT(DISTINCT), and CTE). Of those 20,
+**14 pass all mutation cycles**, **6 fail with data mismatch** (cycle 2+),
+and **2 cannot be created** (correlated scalar subquery).
 
 | Status | Count | Queries |
 |--------|-------|---------|
-| All cycles pass | 4 | Q11, Q16, Q20, Q22 |
-| Cycle 1 only | 13 | Q01, Q03, Q05, Q06, Q07, Q08, Q09, Q10, Q12, Q13, Q14, Q18, Q19 |
-| CREATE blocked | 5 | Q02, Q04, Q15, Q17, Q21 |
+| All cycles pass | 14 | Q04, Q05, Q07, Q08, Q09, Q10, Q11, Q14, Q16, Q18, Q19, Q20, Q21, Q22 |
+| Data mismatch (cycle 2+) | 6 | Q01, Q03, Q06, Q12 (flaky), Q13, Q15 |
+| CREATE blocked | 2 | Q02, Q17 |
 
 ### Modifications Applied
 
