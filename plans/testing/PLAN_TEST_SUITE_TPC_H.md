@@ -38,22 +38,22 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
 
 **Queries passing all cycles (4):** Q11, Q16, Q20, Q22
 
-**Queries passing cycle 1 only (13):** Q01, Q03, Q05, Q06, Q07, Q08, Q09,
-Q10, Q12, Q13, Q14, Q18, Q19 — all fail on cycle 2 with DVM column
-qualification bugs or invariant violations.
+**Queries passing cycle 1 only (16):** Q01, Q03, Q04, Q05, Q06, Q07, Q08,
+Q09, Q10, Q12, Q13, Q14, Q15, Q18, Q19, Q21 — all fail on cycle 2 with DVM
+column qualification bugs or invariant violations.
 
-**Queries that cannot be created (5):** Q02, Q04, Q15, Q17, Q21 — blocked
-by parser/DVM limitations.
+**Queries that cannot be created (2):** Q02, Q17 — blocked by correlated
+scalar subquery support gap in the DVM parser.
 
 ### Query Failure Classification
 
 | Category | Queries | Root Cause |
 |----------|---------|------------|
-| **CREATE fails — correlated scalar subquery** | Q02, Q17 | `syntax error at or near "AS"` — pg_stream DVM does not support correlated scalar subqueries in WHERE |
-| **CREATE fails — EXISTS/NOT EXISTS** | Q04, Q21 | `count(*) must be used to call a parameterless aggregate function` — EXISTS rewrite generates `COUNT()` without `*` |
-| **CREATE fails — nested derived table** | Q15 | `syntax error at or near "?"` — CTE rewritten as derived table but still fails in DVM |
-| **Cycle 2 — `rewrite_expr_for_join` column loss** | Q03, Q05, Q07, Q08, Q09, Q10, Q12, Q13, Q14, Q18, Q19 | `column "X" does not exist` or `column join.X does not exist` — the DVM `rewrite_expr_for_join` drops column qualification on 2nd+ delta when join conditions involve certain expression types |
-| **Cycle 2 — silent invariant violation** | Q01, Q06 | Refresh succeeds but ST contents ≠ query results (aggregate drift) |
+| **CREATE fails — correlated scalar subquery** | Q02, Q17 | `syntax error at or near "AS"` — pg_stream DVM does not support correlated scalar subqueries in WHERE; outer-table column references cannot be detected and cross-joined safely |
+| **Cycle 2 — `rewrite_expr_for_join` column loss** | Q03, Q04, Q05, Q07, Q08, Q09, Q10, Q12, Q13, Q14, Q15, Q18, Q19, Q21 | `column "X" does not exist` or `column join.X does not exist` — the DVM `rewrite_expr_for_join` drops column qualification on 2nd+ delta when join conditions involve certain expression types (`_ => expr.clone()` fallback in `join_common.rs`) |
+| **Cycle 2 — silent invariant violation** | Q01, Q06 | Refresh succeeds but ST contents ≠ query results (aggregate delta drift) |
+| ~~**CREATE fails — EXISTS/NOT EXISTS**~~ | ~~Q04, Q21~~ | ~~FIXED~~ — `node_to_expr` agg_star + `and_contains_or_with_sublink()` guard |
+| ~~**CREATE fails — nested derived table**~~ | ~~Q15~~ | ~~FIXED~~ — `from_item_to_sql` / `deparse_from_item` now handle `T_RangeSubselect` |
 
 ### SQL Workarounds Applied
 
@@ -75,29 +75,20 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-#### Priority 1: Fix `rewrite_expr_for_join` column qualification (11 queries)
+#### Priority 1: Fix `rewrite_expr_for_join` column qualification (16 queries) ← single biggest gap
 
-This single DVM bug class blocks 11 of 22 queries from passing cycle 2+.
+This DVM bug class blocks 16 of 22 queries from passing cycle 2+.
 The root cause is in `src/dvm/operators/join_common.rs`: the
 `rewrite_expr_for_join` function has a `_ => expr.clone()` fallback that
-passes unrecognized expression types (LIKE, certain A_Expr variants)
-through without rewriting column references. On cycle 2+, the delta SQL
-generator emits column names that reference the original table aliases
-instead of the CTE-qualified names used in the delta query.
+passes unrecognized expression types (CASE WHEN, LIKE, certain A_Expr
+variants) through without rewriting their embedded column references. On
+cycle 2+, the delta SQL generator emits bare column names instead of the
+CTE-qualified names (`"__pgs_delta_R"."col"`) required in delta queries.
 
 **Files to fix:** `src/dvm/operators/join_common.rs`  
-**Impact:** Would move 11 queries from "cycle 1 only" to "all cycles pass"
+**Impact:** Would move up to 14 queries from "cycle 1 only" to "all cycles pass" (Q01/Q06 have a separate aggregate issue; Q02/Q17 have a separate CREATE issue)
 
-#### Priority 2: Fix EXISTS/NOT EXISTS rewrite (2 queries)
-
-Q04 and Q21 fail with `count(*) must be used to call a parameterless
-aggregate function`. The EXISTS-to-aggregate rewrite generates `COUNT()`
-instead of `COUNT(*)`.
-
-**Files to fix:** `src/dvm/operators/` (EXISTS handling)  
-**Impact:** Would unblock Q04 and Q21
-
-#### Priority 3: Fix aggregate delta drift (2 queries)
+#### Priority 2: Fix aggregate delta drift (2 queries)
 
 Q01 and Q06 pass cycle 1 but produce silently incorrect results on cycle 2.
 Both are aggregate-only queries (no joins), suggesting a bug in the
@@ -105,19 +96,22 @@ aggregate delta accumulation or change buffer cleanup between cycles.
 
 **Impact:** Would fix the 2 queries showing silent data corruption
 
-#### Priority 4: Fix correlated scalar subquery support (2 queries)
+#### Priority 3: Fix correlated scalar subquery support (2 queries)
 
-Q02 and Q17 use correlated scalar subqueries in WHERE clauses, which
-pg_stream cannot currently differentiate.
+Q02 and Q17 use correlated scalar subqueries in WHERE clauses.  The rewriter
+cannot safely detect when a scalar subquery references outer columns via bare
+column names (no `table.` prefix), so it cannot apply the CROSS JOIN rewrite.
+Deeper DVM support (named correlation context) is needed.
 
-**Impact:** Would unblock Q02 and Q17
+**Files to fix:** `src/dvm/parser.rs::rewrite_scalar_subquery_in_where`  
+**Impact:** Would unblock Q02 and Q17 (2/22 CREATE failures)
 
-#### Priority 5: Fix nested derived table / CTE support (1 query)
+#### Resolved (this session)
 
-Q15's CTE (rewritten as nested derived table) still fails with a syntax
-error in the DVM parser.
-
-**Impact:** Would unblock Q15
+| Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
+|----------------|-----------|-------------|-------------------|
+| P2 — EXISTS/COUNT* | `node_to_expr` dropped `agg_star`; `rewrite_sublinks_in_or` triggered on AND+EXISTS (no OR) | `agg_star` check + `and_contains_or_with_sublink()` guard | Q04, Q21 |
+| P5 — nested derived table | `from_item_to_sql` / `deparse_from_item` fell to `"?"` for `T_RangeSubselect` | Handle `T_RangeSubselect` in both deparse paths | Q15 |
 
 ---
 
