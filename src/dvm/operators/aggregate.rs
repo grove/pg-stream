@@ -27,17 +27,41 @@ fn resolve_col_for_child(expr: &Expr, child_cols: &[String]) -> String {
             table_alias: Some(tbl),
             column_name,
         } => {
+            // Direct disambiguated: tbl__col
             let disambiguated = format!("{tbl}__{column_name}");
             if child_cols.contains(&disambiguated) {
-                disambiguated
-            } else {
-                column_name.clone()
+                return disambiguated;
             }
+            // Nested join prefix: *__tbl__col
+            let nested_suffix = format!("__{tbl}__{column_name}");
+            for c in child_cols {
+                if c.ends_with(&nested_suffix) {
+                    return c.clone();
+                }
+            }
+            // Exact match on column name alone
+            if child_cols.contains(column_name) {
+                return column_name.clone();
+            }
+            column_name.clone()
         }
         Expr::ColumnRef {
             table_alias: None,
             column_name,
-        } => column_name.clone(),
+        } => {
+            // Exact match
+            if child_cols.contains(column_name) {
+                return column_name.clone();
+            }
+            // Suffix match: find column ending in __column_name
+            let suffix = format!("__{column_name}");
+            let matches: Vec<&String> =
+                child_cols.iter().filter(|c| c.ends_with(&suffix)).collect();
+            if matches.len() == 1 {
+                return matches[0].clone();
+            }
+            column_name.clone()
+        }
         _ => expr.strip_qualifier().to_sql(),
     }
 }
@@ -68,6 +92,10 @@ fn resolve_expr_for_child(expr: &Expr, child_cols: &[String]) -> String {
                 .map(|a| resolve_expr_for_child(a, child_cols))
                 .collect();
             format!("{func_name}({})", resolved_args.join(", "))
+        }
+        Expr::Raw(sql) => {
+            // Best-effort: replace column refs in raw SQL
+            crate::dvm::operators::filter::replace_column_refs_in_raw(sql, child_cols)
         }
         _ => expr.to_sql(),
     }
@@ -875,7 +903,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("*".into());
             (
                 format!(
@@ -890,7 +918,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("0".into());
             (
                 format!("SUM(CASE WHEN __pgs_action = 'I'{filter_and} THEN {col} ELSE 0 END)"),
@@ -901,7 +929,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("NULL".into());
             let func = agg.function.sql_name();
             (
@@ -916,7 +944,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("1".into());
             // We only need to detect "any change happened" — counting suffices.
             (

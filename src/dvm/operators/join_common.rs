@@ -94,8 +94,13 @@ fn build_join_snapshot(join_type: &str, condition: &Expr, left: &OpTree, right: 
     let left_alias = left.alias();
     let right_alias = right.alias();
 
-    let left_cols = left.output_columns();
-    let right_cols = right.output_columns();
+    // Use snapshot_output_columns instead of output_columns to get the
+    // correct disambiguated names that nested join snapshots produce.
+    // For Scan children, these are the same as output_columns().
+    // For join children, output_columns() returns raw names (c_custkey)
+    // but the snapshot subquery aliases them as customer__c_custkey.
+    let left_cols = snapshot_output_columns(left);
+    let right_cols = snapshot_output_columns(right);
 
     let mut select_parts = Vec::new();
     for c in &left_cols {
@@ -128,6 +133,39 @@ fn build_join_snapshot(join_type: &str, condition: &Expr, left: &OpTree, right: 
         quote_ident(right_alias),
         cond_sql
     )
+}
+
+/// Return the column names as they appear in a snapshot subquery built by
+/// [`build_snapshot_sql`].
+///
+/// For `Scan` nodes, snapshot columns are the same as `output_columns()`.
+/// For join nodes, the snapshot subquery disambiguates names with the child
+/// alias prefix (e.g., `customer__c_custkey`), so the returned names must
+/// match that format. Using `output_columns()` directly for joins would
+/// return the raw un-prefixed names, causing "column X does not exist"
+/// errors when a higher-level join references the inner snapshot.
+fn snapshot_output_columns(op: &OpTree) -> Vec<String> {
+    match op {
+        OpTree::Scan { .. } => op.output_columns(),
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            let left_prefix = left.alias();
+            let right_prefix = right.alias();
+            let mut cols = Vec::new();
+            for c in snapshot_output_columns(left) {
+                cols.push(format!("{left_prefix}__{c}"));
+            }
+            for c in snapshot_output_columns(right) {
+                cols.push(format!("{right_prefix}__{c}"));
+            }
+            cols
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => snapshot_output_columns(child),
+        _ => op.output_columns(),
+    }
 }
 
 // ── Condition rewriting ─────────────────────────────────────────────────
@@ -194,6 +232,13 @@ fn rewrite_expr_for_join(
                 expr.clone()
             }
         }
+        Expr::ColumnRef {
+            table_alias: None, ..
+        } => {
+            // Unqualified column ref — pass through. The join CTE's
+            // column list will make it accessible if it exists.
+            expr.clone()
+        }
         Expr::BinaryOp {
             op,
             left: l,
@@ -210,8 +255,145 @@ fn rewrite_expr_for_join(
                 .map(|a| rewrite_expr_for_join(a, left, new_left, right, new_right))
                 .collect(),
         },
-        _ => expr.clone(),
+        Expr::Star { table_alias } => {
+            // Rewrite star expressions: table.* → new_alias.*
+            if let Some(alias) = table_alias {
+                if has_source_alias(left, alias) {
+                    Expr::Star {
+                        table_alias: Some(new_left.to_string()),
+                    }
+                } else if has_source_alias(right, alias) {
+                    Expr::Star {
+                        table_alias: Some(new_right.to_string()),
+                    }
+                } else {
+                    expr.clone()
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        // Literals and Raw SQL without column references — pass through
+        Expr::Literal(_) => expr.clone(),
+        Expr::Raw(sql) => {
+            // Best-effort: rewrite qualified column references in raw SQL
+            // text. For each source alias in left/right children, replace
+            // `alias."col"` and `alias.col` patterns with the new alias.
+            let mut result = sql.clone();
+            let all_aliases = collect_source_aliases(left)
+                .into_iter()
+                .chain(collect_source_aliases(right));
+            for alias in all_aliases {
+                let (new_alias, is_simple) = if has_source_alias(left, &alias) {
+                    (new_left, is_simple_source(left, &alias))
+                } else {
+                    (new_right, is_simple_source(right, &alias))
+                };
+
+                if is_simple {
+                    // Simple: replace alias.col → new_alias.col
+                    // Match both alias."col" and alias.col patterns
+                    let pattern = format!("{}.", alias);
+                    let replacement = format!("{}.", new_alias);
+                    result = result.replace(&pattern, &replacement);
+                } else {
+                    // Nested: alias.col → new_alias."alias__col"
+                    // This is harder in raw SQL — we do a conservative
+                    // pattern replacement for alias."col" → new_alias."alias__col"
+                    // and alias.col → new_alias."alias__col"
+                    let dot_prefix = format!("{}.", alias);
+                    if result.contains(&dot_prefix) {
+                        // Replace qualified references carefully
+                        result = rewrite_raw_alias_refs(&result, &alias, new_alias);
+                    }
+                }
+            }
+            Expr::Raw(result)
+        }
     }
+}
+
+/// Collect all source table aliases from an OpTree.
+fn collect_source_aliases(op: &OpTree) -> Vec<String> {
+    match op {
+        OpTree::Scan { alias, .. } => vec![alias.clone()],
+        OpTree::Subquery { alias, .. } => vec![alias.clone()],
+        OpTree::CteScan { alias, .. } => vec![alias.clone()],
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            let mut aliases = collect_source_aliases(left);
+            aliases.extend(collect_source_aliases(right));
+            aliases
+        }
+        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+            let mut aliases = collect_source_aliases(left);
+            aliases.extend(collect_source_aliases(right));
+            aliases
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => collect_source_aliases(child),
+        OpTree::UnionAll { children } => children.iter().flat_map(collect_source_aliases).collect(),
+        // Window, LateralFunction, LateralSubquery, RecursiveCte,
+        // RecursiveSelfRef, etc. — these rarely appear as direct join
+        // children, but return empty to be safe.
+        _ => vec![],
+    }
+}
+
+/// Rewrite `alias.col` and `alias."col"` patterns in raw SQL text
+/// to `new_alias."alias__col"` for nested join disambiguation.
+fn rewrite_raw_alias_refs(sql: &str, old_alias: &str, new_alias: &str) -> String {
+    let prefix = format!("{}.", old_alias);
+    let mut result = String::with_capacity(sql.len());
+    let mut remaining = sql;
+
+    while let Some(pos) = remaining.find(&prefix) {
+        // Copy everything before the match
+        result.push_str(&remaining[..pos]);
+        remaining = &remaining[pos + prefix.len()..];
+
+        // Extract the column name after the dot
+        let col_name = if remaining.starts_with('"') {
+            // Quoted identifier: alias."col_name"
+            if let Some(end) = remaining[1..].find('"') {
+                let name = &remaining[1..1 + end];
+                remaining = &remaining[2 + end..];
+                name.to_string()
+            } else {
+                // Unterminated quote — pass through as-is
+                result.push_str(&prefix);
+                continue;
+            }
+        } else {
+            // Unquoted identifier: read until non-identifier char
+            let end = remaining
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(remaining.len());
+            if end == 0 {
+                // Nothing after the dot — pass through
+                result.push_str(&prefix);
+                continue;
+            }
+            let name = &remaining[..end];
+            remaining = &remaining[end..];
+            name.to_string()
+        };
+
+        // Emit the disambiguated reference: new_alias."old_alias__col"
+        result.push_str(&format!(
+            "{}.\"{}__{}\"",
+            new_alias,
+            old_alias.replace('"', "\"\""),
+            col_name.replace('"', "\"\""),
+        ));
+    }
+
+    // Append the rest
+    result.push_str(remaining);
+    result
 }
 
 /// Check if an OpTree contains a source table with the given alias.

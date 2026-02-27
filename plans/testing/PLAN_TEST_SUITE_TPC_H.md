@@ -26,21 +26,24 @@ query that pg_stream can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 4/22 pass all cycles, 18 soft-skip |
-| Phase 2: Cross-Query Consistency | Done — 4/17 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 4/22 pass all cycles, 18 soft-skip |
+| Phase 1: Differential Correctness | Done — 9/22 pass all cycles, 13 soft-skip |
+| Phase 2: Cross-Query Consistency | Done — 9/17 STs survive all cycles |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 9/22 pass all cycles, 13 soft-skip |
 
-### Latest Test Run (2026-02-27, SF=0.01, 3 cycles)
+### Latest Test Run (2026-02-28, SF=0.01, 3 cycles)
 
 ```
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
 ```
 
-**Queries passing all cycles (4):** Q11, Q16, Q20, Q22
+**Queries passing all cycles (9):** Q05, Q07, Q08, Q09, Q10, Q11, Q16, Q20, Q22
 
-**Queries passing cycle 1 only (16):** Q01, Q03, Q04, Q05, Q06, Q07, Q08,
-Q09, Q10, Q12, Q13, Q14, Q15, Q18, Q19, Q21 — all fail on cycle 2 with DVM
-column qualification bugs or invariant violations.
+**Queries passing cycle 1 only (9):** Q01, Q03, Q04, Q06, Q12, Q13, Q14, Q15,
+Q18 — fail on cycle 2 with remaining DVM bugs (data mismatches, MERGE column
+refs, subquery scope in `Expr::Raw`, CDC table lifecycle, aggregate `__pgs_count`).
+
+**Queries blocked by other issues (2):** Q19 (`__pgs_count` null violation),
+Q21 (nested join alias in subquery).
 
 **Queries that cannot be created (2):** Q02, Q17 — blocked by correlated
 scalar subquery support gap in the DVM parser.
@@ -49,9 +52,13 @@ scalar subquery support gap in the DVM parser.
 
 | Category | Queries | Root Cause |
 |----------|---------|------------|
-| **CREATE fails — correlated scalar subquery** | Q02, Q17 | `syntax error at or near "AS"` — pg_stream DVM does not support correlated scalar subqueries in WHERE; outer-table column references cannot be detected and cross-joined safely |
-| **Cycle 2 — `rewrite_expr_for_join` column loss** | Q03, Q04, Q05, Q07, Q08, Q09, Q10, Q12, Q13, Q14, Q15, Q18, Q19, Q21 | `column "X" does not exist` or `column join.X does not exist` — the DVM `rewrite_expr_for_join` drops column qualification on 2nd+ delta when join conditions involve certain expression types (`_ => expr.clone()` fallback in `join_common.rs`) |
-| **Cycle 2 — silent invariant violation** | Q01, Q06 | Refresh succeeds but ST contents ≠ query results (aggregate delta drift) |
+| **CREATE fails — correlated scalar subquery** | Q02, Q17 | `syntax error at or near "AS"` — pg_stream DVM does not support correlated scalar subqueries in WHERE |
+| **Cycle 2 — data mismatch** | Q01, Q03, Q12 | Refresh succeeds but ST contents ≠ full query results (aggregate delta drift or expression evaluation) |
+| **Cycle 2 — null `__pgs_count` violation** | Q06, Q19 | Aggregate delta produces NULL count for certain groups |
+| **Cycle 2 — CDC relation dropped** | Q04, Q14 | `relation "pgstream_changes.changes_NNNNN" does not exist` — CDC change buffer table lifecycle issue |
+| **Cycle 2 — MERGE column ref** | Q13, Q15 | `column st.X does not exist` — MERGE template references unresolved column names |
+| **Cycle 2 — subquery scope in `Expr::Raw`** | Q18, Q21 | `column "X" does not exist` or `column dl.X` — `Expr::Raw` string replacement can't scope column refs in nested subqueries |
+| ~~**Cycle 2 — column qualification**~~ | ~~Q03–Q15, Q18–Q21~~ | ~~FIXED (P1)~~ — see "Resolved" section below |
 | ~~**CREATE fails — EXISTS/NOT EXISTS**~~ | ~~Q04, Q21~~ | ~~FIXED~~ — `node_to_expr` agg_star + `and_contains_or_with_sublink()` guard |
 | ~~**CREATE fails — nested derived table**~~ | ~~Q15~~ | ~~FIXED~~ — `from_item_to_sql` / `deparse_from_item` now handle `T_RangeSubselect` |
 
@@ -75,28 +82,43 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-#### Priority 1: Fix `rewrite_expr_for_join` column qualification (16 queries) ← single biggest gap
+#### Priority 1: Fix `Expr::Raw` subquery scoping (2 queries)
 
-This DVM bug class blocks 16 of 22 queries from passing cycle 2+.
-The root cause is in `src/dvm/operators/join_common.rs`: the
-`rewrite_expr_for_join` function has a `_ => expr.clone()` fallback that
-passes unrecognized expression types (CASE WHEN, LIKE, certain A_Expr
-variants) through without rewriting their embedded column references. On
-cycle 2+, the delta SQL generator emits bare column names instead of the
-CTE-qualified names (`"__pgs_delta_R"."col"`) required in delta queries.
+Q18 and Q21 have `IN (SELECT ...)` subqueries that embed column references
+in `Expr::Raw` strings. The best-effort `replace_column_refs_in_raw`
+function cannot scope replacements to the outer query — it also replaces
+column names inside the subquery, breaking the inner query's column
+resolution. Needs structured `Expr::Compound` or subquery-aware replacement.
 
-**Files to fix:** `src/dvm/operators/join_common.rs`  
-**Impact:** Would move up to 14 queries from "cycle 1 only" to "all cycles pass" (Q01/Q06 have a separate aggregate issue; Q02/Q17 have a separate CREATE issue)
+**Files to fix:** `src/dvm/parser.rs` (add `Expr::Compound` variant),
+`src/dvm/operators/filter.rs`  
+**Impact:** Would fix Q18, Q21 (2/22)
 
-#### Priority 2: Fix aggregate delta drift (2 queries)
+#### Priority 2: Fix aggregate delta drift / `__pgs_count` null (5 queries)
 
-Q01 and Q06 pass cycle 1 but produce silently incorrect results on cycle 2.
-Both are aggregate-only queries (no joins), suggesting a bug in the
-aggregate delta accumulation or change buffer cleanup between cycles.
+Q01, Q03, Q06, Q12, Q19 show aggregate correctness issues:
+- Q01, Q03, Q12: data mismatch (ST rows differ from fresh query)
+- Q06, Q19: `NULL value in column "__pgs_count"` not-null violation
 
-**Impact:** Would fix the 2 queries showing silent data corruption
+**Impact:** Would fix 5 queries with aggregate/count issues
 
-#### Priority 3: Fix correlated scalar subquery support (2 queries)
+#### Priority 3: Fix CDC relation lifecycle (2 queries)
+
+Q04, Q14 fail with `relation "pgstream_changes.changes_NNNNN" does not exist`.
+The change buffer table OID changes between cycles, or the table is dropped
+and recreated by DDL hooks during the test.
+
+**Impact:** Would fix Q04, Q14
+
+#### Priority 4: Fix MERGE column references (2 queries)
+
+Q13, Q15 fail with `column st.X does not exist` in the MERGE statement.
+The MERGE template references column names that don't match the stream
+table's actual columns.
+
+**Impact:** Would fix Q13, Q15
+
+#### Priority 5: Fix correlated scalar subquery support (2 queries)
 
 Q02 and Q17 use correlated scalar subqueries in WHERE clauses.  The rewriter
 cannot safely detect when a scalar subquery references outer columns via bare
@@ -106,10 +128,11 @@ Deeper DVM support (named correlation context) is needed.
 **Files to fix:** `src/dvm/parser.rs::rewrite_scalar_subquery_in_where`  
 **Impact:** Would unblock Q02 and Q17 (2/22 CREATE failures)
 
-#### Resolved (this session)
+#### Resolved
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| P1 — column qualification | Multiple resolution functions returned bare column names instead of disambiguated CTE column names | Three-part fix: (1) `filter.rs`: added `resolve_predicate_for_child` with suffix matching and `Expr::Raw` best-effort replacement; (2) `join_common.rs`: added `snapshot_output_columns` to fix `build_join_snapshot` using raw names instead of disambiguated names, extended `rewrite_expr_for_join` for `Star`/`Literal`/`Raw`; (3) `aggregate.rs` + `project.rs`: added suffix matching for unqualified ColumnRef, switched agg arguments from `resolve_col_for_child` to `resolve_expr_for_child`, added `Expr::Raw` handling | Q05, Q07, Q08, Q09, Q10 (5 queries) |
 | P2 — EXISTS/COUNT* | `node_to_expr` dropped `agg_star`; `rewrite_sublinks_in_or` triggered on AND+EXISTS (no OR) | `agg_star` check + `and_contains_or_with_sublink()` guard | Q04, Q21 |
 | P5 — nested derived table | `from_item_to_sql` / `deparse_from_item` fell to `"?"` for `T_RangeSubselect` | Handle `T_RangeSubselect` in both deparse paths | Q15 |
 
