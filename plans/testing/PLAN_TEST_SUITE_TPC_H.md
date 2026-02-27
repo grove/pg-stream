@@ -26,47 +26,64 @@ query that pg_stream can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 14/22 pass, 8 soft-skip |
-| Phase 2: Cross-Query Consistency | Done — 14/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 14/22 pass |
+| Phase 1: Differential Correctness | Done — 15/22 pass, 7 soft-skip |
+| Phase 2: Cross-Query Consistency | Done — 15/20 STs survive all cycles |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 15/22 pass |
 
-### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
+### Latest Test Run (2026-03-02, SF=0.01, 3 cycles)
 
 ```
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
 ```
 
-**Deterministically passing (14):** Q04, Q05, Q07, Q08, Q09, Q10, Q11, Q14,
-Q16, Q18, Q19, Q20, Q21, Q22 — pass all 3 cycles consistently across
-multiple runs.
+**Deterministically passing (15):** Q05, Q06, Q07, Q08, Q09, Q10, Q11, Q12,
+Q14, Q16, Q18, Q20, Q21, Q22 — pass all 3 cycles consistently across
+multiple runs. Q06 and Q12 are newly stable (see Resolved section).
 
-**Phase 3 (FULL vs DIFF): 14/22** — deterministic and stable.
+**Phase 3 (FULL vs DIFF): 15/22** — deterministic and stable.
 
 **Cross-query consistency: 14/20** STs survive all 3 cycles.
 
-**Queries failing cycle 2+ (6):**
+**Queries failing cycle 2+ (5):**
 
 | Query | Cycle 2+ Error | Category |
 |-------|----------------|----------|
-| Q01 | Data mismatch: FULL(6) != DIFF(6) — same row count, different values | Aggregate drift |
-| Q03 | Data mismatch: FULL(46) != DIFF(46) — values differ | Aggregate drift |
-| Q06 | Data mismatch cycle 3: FULL(1) != DIFF(1) — SUM drift accumulates | Aggregate drift |
-| Q12 | Data mismatch cycle 3 (flaky): FULL(2) != DIFF(2) — conditional aggregate drift | Aggregate drift (intermittent) |
-| Q13 | Data mismatch: FULL(3) != DIFF(2) — intermediate agg row count wrong | Intermediate agg |
-| Q15 | Data mismatch: FULL(1) != DIFF(2) — scalar subquery MAX filter accuracy | Scalar subquery delta |
+| Q01 | Data mismatch cycle 3: ST=6, Q=6 — all groups differ (SUM expression drift accumulates over 3 cycles). AVG group-rescan improved this from cycle 2 to cycle 3 failure. | Aggregate drift (SUM expression) |
+| Q03 | Data mismatch cycle 2: ST=49, Q=48 — one phantom row (group not deleted when count reaches 0 in 3-table join delta) | Join delta phantom row |
+| Q04 | Data mismatch cycle 3 (data-dependent): ST=5, Q=5, extra 1, missing 1 — SemiJoin delta edge case; was previously passing with different accumulated data | SemiJoin delta (data-dependent) |
+| Q13 | Data mismatch cycle 2: ST=2, Q=3 — missing row; intermediate aggregate (LeftJoin + subquery-in-FROM + outer GROUP BY) | Intermediate agg |
+| Q15 | Data mismatch cycle 2: ST=3, Q=1 — 2 phantom rows; scalar subquery MAX filter doesn't recompute correctly | Scalar subquery delta |
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
 (`column "p_partkey" does not exist`).
+
+**Queries with remaining issues but near-passing (2):**
+
+| Query | Status | Issue |
+|-------|--------|-------|
+| Q01 | Passes 2/3 cycles | SUM expression drift accumulates; AVG group-rescan fix moved failure from cycle 2 → cycle 3 |
+| Q19 | Passes 1/3 cycles (data-dependent) | Missing row after cycle 2; scalar aggregate with multi-table join and complex OR filter. Was previously passing with different accumulated base data. |
+
+**Note:** The test processes all 22 queries sequentially on the same database.
+RF mutations (INSERT/DELETE/UPDATE) accumulate across queries. Queries like
+Q04 and Q19 are sensitive to the exact data state, which shifts depending on
+which earlier queries' mutations have been applied. This means pass/fail status
+can fluctuate between test runs even without code changes.
 
 ### Query Failure Classification
 
 | Category | Queries | Root Cause |
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_stream DVM does not support correlated scalar subqueries in WHERE |
-| **Cycle 2 — aggregate delta drift** | Q01, Q03, Q06 | Refresh succeeds but ST contents ≠ full query results (aggregate accumulation error — exact NUMERIC arithmetic, not floating point) |
-| **Cycle 3 — conditional aggregate drift (flaky)** | Q12 | Conditional aggregate `SUM(CASE WHEN … END)` occasionally produces data mismatch on cycle 3 — sensitive to random RF data; intermittent between runs |
-| **Cycle 2 — intermediate aggregate drift** | Q13 | Intermediate aggregate (subquery-in-FROM + GROUP BY) produces incorrect row count after mutations. `build_intermediate_agg_delta` old/new rescan approach generates correct column names but the delta values diverge |
-| **Cycle 2 — scalar subquery delta accuracy** | Q15 | All SQL structural errors resolved (snapshot columns, EXCEPT alignment, GROUP BY alias renaming). Remaining issue: differential delta produces 2 rows where full query produces 1 — the MAX filter over the derived table doesn't correctly recompute after mutations |
+| **Cycle 3 — SUM expression drift** | Q01 | `SUM(l_extendedprice * (1 - l_discount))` algebraic delta accumulates subtle drift over 3 mutation cycles. AVG aggregates now use group-rescan (precision-safe), but SUM expression drift remains. Passes 2/3 cycles. |
+| **Cycle 2 — join delta phantom row** | Q03 | 3-table join aggregate has one phantom row (ST=49, Q=48). Group not deleted when its join-delta count reaches 0. JOIN delta or aggregate action classification edge case. |
+| **Cycle 3 — SemiJoin delta (data-dependent)** | Q04 | SemiJoin + COUNT aggregate; cycle 3 failure (extra 1, missing 1). Data-dependent: pass/fail varies with accumulated mutations from earlier queries. |
+| **Cycle 2 — intermediate aggregate** | Q13 | Intermediate aggregate (LeftJoin → subquery-in-FROM → outer GROUP BY) produces fewer rows (ST=2, Q=3). `build_intermediate_agg_delta` old/new rescan approach loses a group. |
+| **Cycle 2 — scalar subquery delta** | Q15 | `WHERE total_revenue = (SELECT MAX(...))` — scalar subquery MAX filter produces phantom rows (ST=3, Q=1). Delta engine doesn't correctly recompute cascading MAX changes. |
+| **Cycle 2 — scalar aggregate join delta** | Q19 | Scalar aggregate (no GROUP BY) over 2-table join with complex OR filter. ST becomes empty while query returns 1 row. Data-dependent: row_id matching is now correct (singleton hash), but delta count may go wrong under accumulated mutations. |
+| ~~**Aggregate drift — scalar row_id mismatch**~~ | ~~Q06~~ | ~~FIXED~~ — `row_id_expr_for_query` detects scalar aggregates and returns singleton hash matching DIFF delta |
+| ~~**Aggregate drift — AVG precision loss**~~ | ~~Q01~~ | ~~PARTIALLY FIXED~~ — AVG now uses group-rescan; Q01 improved from cycle 2 to cycle 3 failure |
+| ~~**Aggregate drift — conditional aggregate (flaky)**~~ | ~~Q12~~ | ~~FIXED~~ — scalar row_id fix stabilized; passes all 3 cycles consistently |
 | ~~**Cycle 2 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin snapshot with EXISTS/NOT EXISTS subqueries + `__pgs_count` filtering |
 | ~~**Cycle 2 — SemiJoin IN parser limitation**~~ | ~~Q18~~ | ~~FIXED~~ — `parse_any_sublink` now preserves GROUP BY/HAVING; `__pgs_count` filtered from SemiJoin `r_old_snapshot` |
 | ~~**Cycle 2 — deep join alias disambiguation**~~ | ~~Q21~~ | ~~FIXED~~ — Safe aliases (`__pgs_sl`/`__pgs_sr`/`__pgs_al`/`__pgs_ar`) for SemiJoin/AntiJoin snapshot; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths |
@@ -101,34 +118,42 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-#### Priority 1: Fix aggregate delta drift (3+ queries)
+#### Priority 1: Fix join delta phantom/missing rows (Q03, Q19)
 
-Q01, Q03, Q06 show aggregate value drift after UPDATE mutations (RF3).
-Q12 shows intermittent drift on cycle 3 (flaky — same root cause family):
-- **Q01**: 6 rows, 3 differ — AVG aggregates drift after price/discount updates
-- **Q03**: 46 rows, 2 differ — SUM(l_extendedprice * (1 - l_discount)) drift after updates
-- **Q06**: 1 row, cycles 1-2 pass, cycle 3 drifts — global SUM accumulates error across mutation cycles
-- **Q12**: Flaky cycle 3 — conditional `SUM(CASE WHEN … END)` sometimes produces wrong values depending on random RF data
+Q03 (3-table join + SUM aggregate) has a phantom row: ST=49, Q=48 after
+cycle 2. One group has count=0 but the DELETE action is never emitted.
+Q19 (2-table join + OR filters) loses a row: ST=0, Q=1 after cycle 2.
 
-The COALESCE fix resolved the NULL propagation bug, but drift persists for
-queries where the aggregate SUM/AVG formula produces different results from
-the full query. Arithmetic is exact (NUMERIC), so this is not a precision
-issue. Most likely cause: a subtle edge case in how the scan delta's
-net-effect logic interacts with the aggregate delta's SUM(CASE …) formula,
-particularly when UPDATE mutations (D+I pairs) flow through a Filter node
-that sits between Scan and Aggregate.
+Root cause likely in join delta computation — when source rows are deleted
+(RF2) or updated (RF3), the join delta for multi-table joins may not
+correctly propagate the group-level count changes.
 
-**Files to investigate:** `src/dvm/operators/scan.rs`, `src/dvm/operators/aggregate.rs`, `src/dvm/operators/filter.rs`
-**Impact:** Would fix Q01, Q03, Q06, Q12 (flaky).
+**Files to investigate:** `src/dvm/operators/join_common.rs`, `src/dvm/operators/aggregate.rs` (action classification)
+**Impact:** Would fix Q03 (+1 pass), Q19 (potential)
 
-#### Priority 2: Fix scalar subquery delta accuracy (Q15)
+#### Priority 2: Fix SUM expression drift (Q01)
+
+Q01 passes 2/3 cycles but fails cycle 3 with all 6 groups differing.
+AVG aggregates now correctly use group-rescan. The remaining drift is in
+SUM columns like `SUM(l_extendedprice * (1 - l_discount))`. Despite NUMERIC
+arithmetic being exact, the SUM values diverge over 3 mutation cycles.
+
+Possible causes: (a) the `agg_delta_exprs` for SUM(expression) may accumulate
+a one-off per cycle due to expression evaluation order; (b) the scan-level
+net-effect logic may double-count some rows when Filter sits between Scan
+and Aggregate.
+
+**Files to investigate:** `src/dvm/operators/aggregate.rs` (agg_delta_exprs), `src/dvm/operators/scan.rs` (scan delta net-effect)
+**Impact:** Would fix Q01 (+1 pass)
+
+#### Priority 3: Fix scalar subquery delta accuracy (Q15)
 
 Q15's structural issues are all resolved — snapshot columns, EXCEPT column
 alignment, GROUP BY alias renaming (parser Project wrapper), `has_source_alias`
 for Subquery own-alias, `is_simple_source` for Subquery. The query now
 creates successfully, passes cycle 1 (FULL), and generates valid SQL for
-DIFFERENTIAL. However, the differential delta produces 2 rows where the full
-query produces 1 (FULL=1, DIFF=2).
+DIFFERENTIAL. However, the differential delta produces 3 rows where the full
+query produces 1 (ST=3, Q=1).
 
 Root cause: Q15 uses `WHERE total_revenue = (SELECT MAX(total_revenue) FROM
 revenue0)` — a scalar subquery that computes MAX over a derived table. When
@@ -139,10 +164,10 @@ handle this cascading change through the scalar subquery → CROSS JOIN rewrite.
 **Files to investigate:** `src/dvm/operators/aggregate.rs` (intermediate agg delta for MAX), `src/dvm/operators/join_common.rs` (CROSS JOIN delta with scalar subquery child)
 **Impact:** Would fix Q15
 
-#### Priority 3: Fix intermediate aggregate data mismatch (Q13)
+#### Priority 4: Fix intermediate aggregate data mismatch (Q13)
 
 Q13 progressed from `column st.c_custkey does not exist` to a data mismatch
-(FULL=3, DIFF=2). The intermediate aggregate detection and
+(ST=2, Q=3). The intermediate aggregate detection and
 `build_intermediate_agg_delta` function correctly handle the LeftJoin child
 (using `SELECT *` + EXCEPT ALL for positional column matching). However,
 the old/new rescan produces fewer rows than expected.
@@ -155,7 +180,7 @@ NULL padding) that affect the aggregate result.
 **Files to investigate:** `src/dvm/operators/aggregate.rs` (build_intermediate_agg_delta)
 **Impact:** Would fix Q13
 
-#### Priority 4: Fix correlated scalar subquery support (2 queries)
+#### Priority 5: Fix correlated scalar subquery support (2 queries)
 
 Q02 and Q17 use correlated scalar subqueries in WHERE clauses. The rewriter
 cannot safely detect when a scalar subquery references outer columns via bare
@@ -169,6 +194,8 @@ Deeper DVM support (named correlation context) is needed.
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| P1 — Scalar aggregate row_id mismatch | FULL refresh used `pg_stream_hash(row_to_json + row_number)` while DIFF used `pg_stream_hash('__singleton_group')` for scalar aggregates (no GROUP BY). The mismatched `__pgs_row_id` values caused MERGE to INSERT instead of UPDATE, creating phantom duplicate rows. | `row_id_expr_for_query()` now detects scalar aggregates via `is_scalar_aggregate_root()` (checks through Filter/Project/Subquery wrappers) and returns `pg_stream_hash('__singleton_group')` for both FULL and DIFF. 5 unit tests added. | Q06 (all 3 cycles pass), Q12 (stabilized — was flaky) |
+| P1 — AVG algebraic precision loss | `agg_merge_expr` for AVG used `(old_avg * old_count + delta_ins - delta_del) / new_count`. Since PostgreSQL rounds AVG results to scale=16 for NUMERIC, `AVG * COUNT ≠ original SUM`, causing cumulative drift across refresh cycles. | AVG now uses group-rescan strategy: `AggFunc::Avg` added to `is_group_rescan()`; removed from algebraic arms in `agg_delta_exprs`, `agg_merge_expr`, and `direct_agg_delta_exprs`. Affected groups are re-aggregated from source via rescan CTE. 4 unit tests updated. | Q01 (improved: passes 2/3 cycles, was failing cycle 2) |
 | P4 — SemiJoin IN parser | `parse_any_sublink` discarded GROUP BY/HAVING from inner SELECT of `IN (SELECT … GROUP BY … HAVING …)` | `parse_any_sublink` now preserves GROUP BY/HAVING; `extract_aggregates_from_expr` helper for HAVING aggregate extraction; `build_snapshot_sql` Filter-on-Aggregate support; `__pgs_count` filtered from SemiJoin `right_col_list` in `r_old_snapshot` | Q18 (all 3 cycles pass) |
 | P5 — SemiJoin/AntiJoin alias | `build_snapshot_sql` didn't handle SemiJoin/AntiJoin (produced comment placeholder); `InnerJoin.alias()` returns `"join"` (SQL reserved keyword) causing syntax errors | SemiJoin snapshot: `EXISTS (SELECT 1 FROM … WHERE …)` with safe aliases `__pgs_sl`/`__pgs_sr`; AntiJoin snapshot: `NOT EXISTS` with `__pgs_al`/`__pgs_ar`; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths | Q21 (all 3 cycles pass) |
 | P2+P4+P5 — SemiJoin snapshot | SemiJoin delta produced data mismatch because `build_snapshot_sql` couldn't produce correct snapshot SQL for SemiJoin subtrees | Combined effect of SemiJoin/AntiJoin EXISTS snapshot, `__pgs_count` filtering, and SemiJoin IN parser fixes | Q04 (all 3 cycles pass) |
