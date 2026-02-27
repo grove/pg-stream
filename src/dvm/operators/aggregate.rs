@@ -919,7 +919,7 @@ fn direct_agg_delta_exprs(agg: &AggExpr) -> (String, String) {
                 ),
             )
         }
-        AggFunc::Sum | AggFunc::Avg => {
+        AggFunc::Sum => {
             let col = agg
                 .argument
                 .as_ref()
@@ -1292,7 +1292,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
                 ),
             )
         }
-        AggFunc::Sum | AggFunc::Avg => {
+        AggFunc::Sum => {
             let col = agg
                 .argument
                 .as_ref()
@@ -1357,20 +1357,6 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
         AggFunc::Sum => {
             format!(
                 "COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)",
-                ins = quote_ident(&format!("__ins_{alias}")),
-                del = quote_ident(&format!("__del_{alias}")),
-            )
-        }
-        AggFunc::Avg => {
-            // AVG = SUM / COUNT — compute from the sum and count auxiliaries.
-            // COALESCE guards on d.__ins_count / d.__del_count protect against
-            // NULL when the delta set is empty (no GROUP BY, all rows filtered).
-            format!(
-                "CASE WHEN (COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 \
-                 THEN (COALESCE(st.{qt}, 0) * COALESCE(st.__pgs_count, 0) \
-                       + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0))::numeric \
-                       / (COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) \
-                 ELSE NULL END",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
             )
@@ -1660,10 +1646,25 @@ mod tests {
 
     #[test]
     fn test_agg_merge_expr_avg() {
+        // AVG uses group-rescan: merge expression should use NULL sentinel
+        // (no rescan CTE available in this test)
         let agg = avg_col("score", "avg_score");
         let result = agg_merge_expr(&agg, false);
-        assert!(result.contains("::numeric"));
-        assert!(result.contains("__pgs_count"));
+        assert!(
+            result.contains("THEN NULL"),
+            "AVG without rescan should use NULL sentinel: {result}"
+        );
+    }
+
+    #[test]
+    fn test_agg_merge_expr_avg_with_rescan() {
+        // AVG uses group-rescan: with rescan CTE, should reference r.{alias}
+        let agg = avg_col("score", "avg_score");
+        let result = agg_merge_expr(&agg, true);
+        assert!(
+            result.contains("r."),
+            "AVG with rescan should reference rescan CTE: {result}"
+        );
     }
 
     // ── MIN/MAX merge expression tests ──────────────────────────────
@@ -1953,7 +1954,7 @@ mod tests {
     fn test_is_group_rescan() {
         assert!(!AggFunc::Count.is_group_rescan());
         assert!(!AggFunc::Sum.is_group_rescan());
-        assert!(!AggFunc::Avg.is_group_rescan());
+        assert!(AggFunc::Avg.is_group_rescan());
         assert!(!AggFunc::Min.is_group_rescan());
         assert!(!AggFunc::Max.is_group_rescan());
         assert!(AggFunc::BoolAnd.is_group_rescan());
@@ -3040,7 +3041,8 @@ mod tests {
     }
 
     #[test]
-    fn test_no_rescan_cte_for_avg() {
+    fn test_rescan_cte_for_avg() {
+        // AVG now uses group-rescan for precision
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
@@ -3050,11 +3052,12 @@ mod tests {
         );
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        assert_sql_not_contains(&sql, "agg_rescan");
+        assert_sql_contains(&sql, "agg_rescan");
     }
 
     #[test]
-    fn test_no_rescan_cte_for_sum_count_avg_combined() {
+    fn test_rescan_cte_for_sum_count_avg_combined() {
+        // AVG triggers rescan even when mixed with algebraic SUM/COUNT
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
@@ -3068,7 +3071,7 @@ mod tests {
         );
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        assert_sql_not_contains(&sql, "agg_rescan");
+        assert_sql_contains(&sql, "agg_rescan");
     }
 
     #[test]

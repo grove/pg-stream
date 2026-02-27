@@ -273,10 +273,16 @@ impl AggFunc {
 
     /// Returns true for aggregates that use the group-rescan strategy:
     /// any change in a group triggers full re-aggregation from source data.
+    ///
+    /// AVG uses group-rescan because the algebraic formula
+    /// `old_avg * old_count + delta_sum` loses precision: NUMERIC division
+    /// in PostgreSQL rounds AVG results, so reconstructing the original SUM
+    /// from `AVG * COUNT` is lossy, causing drift across refresh cycles.
     pub fn is_group_rescan(&self) -> bool {
         matches!(
             self,
-            AggFunc::BoolAnd
+            AggFunc::Avg
+                | AggFunc::BoolAnd
                 | AggFunc::BoolOr
                 | AggFunc::StringAgg
                 | AggFunc::ArrayAgg
