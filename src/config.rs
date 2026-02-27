@@ -62,16 +62,6 @@ pub static PGS_MERGE_PLANNER_HINTS: GucSetting<bool> = GucSetting::<bool>::new(t
 /// join, avoiding disk-spilling sort/merge strategies on large deltas.
 pub static PGS_MERGE_WORK_MEM_MB: GucSetting<i32> = GucSetting::<i32>::new(64);
 
-/// Strategy for applying delta changes to the stream table.
-///
-/// - `"auto"` (default): Use MERGE for small deltas; switch to
-///   DELETE + INSERT when the estimated delta exceeds 25% of the stream
-///   table row count.
-/// - `"merge"`: Always use a single MERGE statement.
-/// - `"delete_insert"`: Always use DELETE + INSERT.
-pub static PGS_MERGE_STRATEGY: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
-
 /// Whether to use SQL PREPARE / EXECUTE for MERGE statements.
 ///
 /// When enabled, the refresh executor issues `PREPARE __pgs_merge_{id}`
@@ -171,8 +161,10 @@ pub fn register_gucs() {
 
     GucRegistry::define_int_guc(
         c"pg_stream.max_concurrent_refreshes",
-        c"Maximum number of concurrent refresh workers.",
-        c"Controls the maximum number of stream tables that can be refreshed in parallel.",
+        c"Reserved for future use — parallel refresh is not yet implemented.",
+        c"This setting is reserved for v0.3.0 parallel refresh. \
+           It is accepted and stored but has no effect on behaviour in v0.2.0. \
+           The scheduler processes stream tables sequentially.",
         &PGS_MAX_CONCURRENT_REFRESHES,
         1,  // min
         32, // max
@@ -220,16 +212,6 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_string_guc(
-        c"pg_stream.merge_strategy",
-        c"Delta apply strategy: auto, merge, or delete_insert.",
-        c"'auto' uses MERGE for small deltas and DELETE+INSERT for large ones. \
-           'merge' always uses MERGE. 'delete_insert' always uses DELETE+INSERT.",
-        &PGS_MERGE_STRATEGY,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
     GucRegistry::define_bool_guc(
         c"pg_stream.use_prepared_statements",
         c"Use SQL PREPARE/EXECUTE for MERGE during differential refresh.",
@@ -266,7 +248,8 @@ pub fn register_gucs() {
         c"Max seconds for WAL decoder catch-up during CDC transition.",
         c"When transitioning from trigger-based to WAL-based CDC, the WAL decoder must catch up \
            past the trigger's last captured LSN. If it hasn't caught up within this timeout, \
-           the system falls back to trigger-based CDC.",
+           the system falls back to trigger-based CDC. \
+           NOTE: WAL-based CDC is pre-production in v0.2.0 and not recommended for production use.",
         &PGS_WAL_TRANSITION_TIMEOUT,
         10,    // min: 10 seconds
         3_600, // max: 1 hour
@@ -342,14 +325,6 @@ pub fn pg_stream_merge_work_mem_mb() -> i32 {
     PGS_MERGE_WORK_MEM_MB.get()
 }
 
-/// Returns the merge strategy: "auto", "merge", or "delete_insert".
-pub fn pg_stream_merge_strategy() -> String {
-    PGS_MERGE_STRATEGY
-        .get()
-        .map(|cs| cs.to_str().unwrap_or("auto").to_string())
-        .unwrap_or_else(|| "auto".to_string())
-}
-
 /// Returns whether prepared statements are enabled for MERGE.
 pub fn pg_stream_use_prepared_statements() -> bool {
     PGS_USE_PREPARED_STATEMENTS.get()
@@ -380,13 +355,3 @@ pub fn pg_stream_wal_transition_timeout() -> i32 {
 pub fn pg_stream_block_source_ddl() -> bool {
     PGS_BLOCK_SOURCE_DDL.get()
 }
-
-/// Ratio of delta / stream-table size above which `auto` strategy
-/// would switch from MERGE to DELETE + INSERT.
-///
-/// Currently unused: the "auto" strategy always uses MERGE for
-/// correctness. DELETE+INSERT has known issues with aggregate/DISTINCT
-/// delta queries that LEFT JOIN back to the stream table.
-/// Kept for future use once the DELETE+INSERT path is fixed.
-#[allow(dead_code)]
-pub const MERGE_STRATEGY_AUTO_THRESHOLD: f64 = 0.25;

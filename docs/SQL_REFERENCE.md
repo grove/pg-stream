@@ -571,6 +571,8 @@ SELECT pgstream.alter_stream_table('order_totals', refresh_mode => 'FULL');
 SELECT pgstream.alter_stream_table('order_totals', status => 'SUSPENDED');
 
 -- Resume a suspended stream table
+SELECT pgstream.resume_stream_table('order_totals');
+-- Or via alter_stream_table
 SELECT pgstream.alter_stream_table('order_totals', status => 'ACTIVE');
 ```
 
@@ -603,6 +605,36 @@ SELECT pgstream.drop_stream_table('order_totals');
 
 ---
 
+### pgstream.resume_stream_table
+
+Resume a suspended stream table, clearing its consecutive error count and
+re-enabling automated and manual refreshes.
+
+```sql
+pgstream.resume_stream_table(name text) → void
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `name` | `text` | Name of the stream table to resume (schema-qualified or unqualified). |
+
+**Example:**
+
+```sql
+-- Resume a stream table that was auto-suspended due to repeated errors
+SELECT pgstream.resume_stream_table('order_totals');
+```
+
+**Notes:**
+- Errors if the ST is not in `SUSPENDED` state.
+- Resets `consecutive_errors` to `0` and sets `status = 'ACTIVE'`.
+- Emits a `resumed` event on the `pg_stream_alert` NOTIFY channel.
+- After resuming, the scheduler will include the ST in its next cycle.
+
+---
+
 ### pgstream.refresh_stream_table
 
 Manually trigger a synchronous refresh of a stream table.
@@ -624,7 +656,7 @@ SELECT pgstream.refresh_stream_table('order_totals');
 ```
 
 **Notes:**
-- Blocked if the ST is `SUSPENDED` — use `pgstream.alter_stream_table(... status => 'ACTIVE')` first.
+- Blocked if the ST is `SUSPENDED` — use `pgstream.resume_stream_table(name)` first.
 - Uses an advisory lock to prevent concurrent refreshes of the same ST.
 - For `DIFFERENTIAL` mode, generates and applies a delta query. For `FULL` mode, truncates and reloads.
 - Records the refresh in `pgstream.pgs_refresh_history`.

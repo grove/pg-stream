@@ -39,9 +39,6 @@ struct CachedMergeTemplate {
     /// MERGE SQL template with `__PGS_PREV_LSN_{oid}__` / `__PGS_NEW_LSN_{oid}__`
     /// placeholder tokens. Resolved to concrete LSN values before each execution.
     merge_sql_template: String,
-    /// DELETE + INSERT SQL template (B-3 alternative for large deltas).
-    /// Two statements separated by `';'`.
-    delete_insert_template: String,
     /// Parameterized MERGE SQL with `$1`, `$2`, … for LSN values (D-2).
     /// Parameter order: for each source OID (in `source_oids` order),
     /// `$2i-1` = prev_lsn, `$2i` = new_lsn.
@@ -409,25 +406,6 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
            VALUES (d.__pgs_row_id, {d_user_col_list})",
     );
 
-    // B-3: Build DELETE + INSERT template.
-    //
-    // WARNING: This path has known correctness issues with aggregate and
-    // DISTINCT queries whose delta LEFT JOINs back to the stream table.
-    // The delta is evaluated twice (once for DELETE, once for INSERT),
-    // and the DELETE modifies the table before the INSERT's evaluation.
-    // Only used when pg_stream.merge_strategy = 'delete_insert' is set
-    // explicitly.  The "auto" mode always uses MERGE.
-    let delete_insert_template = format!(
-        "DELETE FROM {quoted_table} \
-         WHERE __pgs_row_id IN (\
-           SELECT __pgs_row_id FROM {using_clause} AS d\
-         );\
-         INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
-         SELECT __pgs_row_id, {user_col_list} \
-         FROM {using_clause} AS d \
-         WHERE d.__pgs_action = 'I'",
-    );
-
     // Build cleanup template.
     let cleanup_schema = crate::config::pg_stream_change_buffer_schema().replace('"', "\"\"");
     let cleanup_stmts: Vec<String> = source_oids
@@ -489,7 +467,6 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
             CachedMergeTemplate {
                 defining_query_hash: query_hash,
                 merge_sql_template: merge_template,
-                delete_insert_template,
                 parameterized_merge_sql,
                 source_oids: source_oids.clone(),
                 cleanup_sql_template: cleanup_template,
@@ -881,11 +858,10 @@ pub fn execute_differential_refresh(
 
     let was_cache_hit = cached.is_some();
 
-    /// Resolved SQL pair: MERGE template + DELETE+INSERT template,
-    /// plus D-2 prepared-statement materials and user-trigger DML.
+    /// Resolved SQL pair: MERGE template, plus D-2 prepared-statement materials
+    /// and user-trigger DML.
     struct ResolvedSql {
         merge_sql: String,
-        delete_insert_sql: String,
         /// Source OIDs (needed for D-2 EXECUTE parameter building).
         source_oids: Vec<u32>,
         /// Parameterized MERGE SQL with `$N` params (for PREPARE).
@@ -909,12 +885,6 @@ pub fn execute_differential_refresh(
         ResolvedSql {
             merge_sql: resolve_lsn_placeholders(
                 &entry.merge_sql_template,
-                &entry.source_oids,
-                prev_frontier,
-                new_frontier,
-            ),
-            delete_insert_sql: resolve_lsn_placeholders(
-                &entry.delete_insert_template,
                 &entry.source_oids,
                 prev_frontier,
                 new_frontier,
@@ -1030,20 +1000,7 @@ pub fn execute_differential_refresh(
                VALUES (d.__pgs_row_id, {d_user_col_list})",
         );
 
-        // ── B-3: DELETE + INSERT template (large-delta alternative) ──
-        // For large deltas, DELETE matching rows then INSERT updated
-        // values is cheaper than MERGE's branching + visibility checks.
-        let delete_insert_template = format!(
-            "DELETE FROM {quoted_table} \
-             WHERE __pgs_row_id IN (\
-               SELECT __pgs_row_id FROM {template_using} AS d\
-             );\
-             INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
-             SELECT __pgs_row_id, {user_col_list} \
-             FROM {template_using} AS d \
-             WHERE d.__pgs_action = 'I'",
-        );
-
+        // ── B-3: DELETE + INSERT template removed (always use MERGE) ─
         // ── D-2: Build parameterized MERGE SQL for PREPARE ─────────
         let parameterized_merge_sql = parameterize_lsn_template(&merge_template, &source_oids);
 
@@ -1085,7 +1042,6 @@ pub fn execute_differential_refresh(
                 CachedMergeTemplate {
                     defining_query_hash: query_hash,
                     merge_sql_template: merge_template.clone(),
-                    delete_insert_template: delete_insert_template.clone(),
                     source_oids: source_oids.clone(),
                     cleanup_sql_template: cleanup_template,
                     parameterized_merge_sql: parameterized_merge_sql.clone(),
@@ -1101,12 +1057,6 @@ pub fn execute_differential_refresh(
         ResolvedSql {
             merge_sql: resolve_lsn_placeholders(
                 &merge_template,
-                &source_oids,
-                prev_frontier,
-                new_frontier,
-            ),
-            delete_insert_sql: resolve_lsn_placeholders(
-                &delete_insert_template,
                 &source_oids,
                 prev_frontier,
                 new_frontier,
@@ -1160,24 +1110,11 @@ pub fn execute_differential_refresh(
     }
 
     // ── B-3: Strategy selection ──────────────────────────────────────
-    // Choose between MERGE and DELETE+INSERT based on the GUC setting.
-    //
-    // The "auto" strategy defaults to MERGE for correctness.
-    // DELETE+INSERT has a known correctness issue: aggregate and DISTINCT
-    // delta queries LEFT JOIN back to the stream table to read auxiliary
-    // columns (__pgs_count). Evaluating the delta query twice (once for
-    // DELETE, once for INSERT) causes the INSERT to see a modified table
-    // and compute wrong results.
-    //
-    // Users may explicitly set pg_stream.merge_strategy = 'delete_insert'
-    // for workloads where the defining query is a simple scan/join with
-    // no aggregates or DISTINCT, after validating correctness.
-    let strategy = crate::config::pg_stream_merge_strategy();
-    let use_delete_insert = strategy.as_str() == "delete_insert";
+    // Always use MERGE. The delete_insert path was removed in v0.2.0
+    // (pg_stream.merge_strategy GUC removed — C1 cleanup).
 
     // ── D-2: Prepared-statement flag ─────────────────────────────────
-    let use_prepared =
-        crate::config::pg_stream_use_prepared_statements() && !use_delete_insert && was_cache_hit;
+    let use_prepared = crate::config::pg_stream_use_prepared_statements() && was_cache_hit;
 
     let (merge_count, strategy_label) = if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
@@ -1241,25 +1178,6 @@ pub fn execute_differential_refresh(
         );
 
         (del_count + upd_count + ins_count, "explicit_dml")
-    } else if use_delete_insert {
-        // ── DELETE + INSERT path ─────────────────────────────────────
-        let stmts: Vec<&str> = resolved
-            .delete_insert_sql
-            .split(';')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let mut total = 0usize;
-        for stmt in stmts {
-            let n = Spi::connect_mut(|client| {
-                let result = client
-                    .update(stmt, None, &[])
-                    .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-                Ok::<usize, PgStreamError>(result.len())
-            })?;
-            total += n;
-        }
-        (total, "delete_insert")
     } else if use_prepared {
         // ── D-2: MERGE via prepared statement ────────────────────────
         // After ~5 executions PostgreSQL switches from custom to generic
@@ -1694,7 +1612,6 @@ mod tests {
                 CachedMergeTemplate {
                     defining_query_hash: 12345,
                     merge_sql_template: "MERGE INTO t ...".to_string(),
-                    delete_insert_template: "DELETE FROM t ...; INSERT INTO t ...".to_string(),
                     source_oids: vec![100, 200],
                     cleanup_sql_template: "DELETE FROM ...".to_string(),
                     parameterized_merge_sql: String::new(),
@@ -1724,7 +1641,6 @@ mod tests {
                 CachedMergeTemplate {
                     defining_query_hash: 0,
                     merge_sql_template: String::new(),
-                    delete_insert_template: String::new(),
                     source_oids: vec![],
                     cleanup_sql_template: String::new(),
                     parameterized_merge_sql: String::new(),

@@ -35,6 +35,8 @@ pub enum AlertEvent {
     StaleData,
     /// ST suspended after consecutive errors.
     AutoSuspended,
+    /// ST resumed after suspension.
+    Resumed,
     /// Upstream DDL change requires reinitialize.
     ReinitializeNeeded,
     /// Replication slot WAL retention is growing.
@@ -50,6 +52,7 @@ impl AlertEvent {
         match self {
             AlertEvent::StaleData => "stale_data",
             AlertEvent::AutoSuspended => "auto_suspended",
+            AlertEvent::Resumed => "resumed",
             AlertEvent::ReinitializeNeeded => "reinitialize_needed",
             AlertEvent::BufferGrowthWarning => "buffer_growth_warning",
             AlertEvent::RefreshCompleted => "refresh_completed",
@@ -114,6 +117,16 @@ pub fn alert_auto_suspended(pgs_schema: &str, pgs_name: &str, error_count: i32) 
         pgs_schema,
         pgs_name,
         &format!(r#""consecutive_errors":{}"#, error_count),
+    );
+}
+
+/// Emit a resumed alert (ST cleared from SUSPENDED back to ACTIVE).
+pub fn alert_resumed(pgs_schema: &str, pgs_name: &str) {
+    emit_alert(
+        AlertEvent::Resumed,
+        pgs_schema,
+        pgs_name,
+        r#""previous_status":"SUSPENDED""#,
     );
 }
 

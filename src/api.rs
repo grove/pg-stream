@@ -481,6 +481,48 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     Ok(())
 }
 
+/// Resume a suspended stream table, clearing its consecutive error count and
+/// re-enabling automated and manual refreshes.
+#[pg_extern(schema = "pgstream")]
+fn resume_stream_table(name: &str) {
+    let result = resume_stream_table_impl(name);
+    if let Err(e) = result {
+        pgrx::error!("{}", e);
+    }
+}
+
+fn resume_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
+    let (schema, table_name) = parse_qualified_name(name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
+    if st.status != StStatus::Suspended {
+        return Err(PgStreamError::InvalidArgument(format!(
+            "stream table {}.{} is not suspended (current status: {})",
+            schema,
+            table_name,
+            st.status.as_str(),
+        )));
+    }
+
+    Spi::run_with_args(
+        "UPDATE pgstream.pgs_stream_tables \
+         SET status = 'ACTIVE', consecutive_errors = 0, updated_at = now() \
+         WHERE pgs_id = $1",
+        &[st.pgs_id.into()],
+    )
+    .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+
+    crate::monitor::alert_resumed(&schema, &table_name);
+
+    pgrx::info!(
+        "Stream table {}.{} resumed (pgs_id={})",
+        schema,
+        table_name,
+        st.pgs_id
+    );
+    Ok(())
+}
+
 /// Manually trigger a synchronous refresh of a stream table.
 #[pg_extern(schema = "pgstream")]
 fn refresh_stream_table(name: &str) {
@@ -497,8 +539,14 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     // Phase 10: Check if ST is suspended — refuse manual refresh
     if st.status == StStatus::Suspended {
         return Err(PgStreamError::InvalidArgument(format!(
-            "stream table {}.{} is suspended; use pgstream.resume_stream_table() first",
-            schema, table_name,
+            "stream table {}.{} is suspended; use pgstream.resume_stream_table('{}') first",
+            schema,
+            table_name,
+            if schema == "public" {
+                table_name.clone()
+            } else {
+                format!("{}.{}", schema, table_name)
+            },
         )));
     }
 
