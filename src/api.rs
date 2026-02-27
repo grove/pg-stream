@@ -447,6 +447,17 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     // Get dependencies before deleting catalog entries
     let deps = StDependency::get_for_st(st.pgs_id).unwrap_or_default();
 
+    // Flush any deferred change-buffer cleanup entries that reference
+    // source OIDs about to be cleaned up.  This prevents
+    // `drain_pending_cleanups` on the next refresh from attempting to
+    // access change-buffer tables that no longer exist.
+    let dep_oids: Vec<u32> = deps
+        .iter()
+        .filter(|d| d.source_type == "TABLE")
+        .map(|d| d.source_relid.to_u32())
+        .collect();
+    crate::refresh::flush_pending_cleanups_for_oids(&dep_oids);
+
     // Drop the storage table
     let drop_sql = format!(
         "DROP TABLE IF EXISTS {}.{} CASCADE",
