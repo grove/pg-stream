@@ -162,9 +162,9 @@ effect on behaviour.
 **C. Hard-code to 1 and remove the GUC**
 - Same as B, just more explicit about the current behaviour
 
-**Decision:** Option B — remove `max_concurrent_refreshes` from `config.rs`
-and any references in `scheduler.rs`. Reintroduce when parallel refresh is
-implemented in v0.3.0 (ROADMAP.md item P3).
+**Decision:** Option A — document `max_concurrent_refreshes` as "reserved for
+future use" in the GUC description. No code change; update the description
+string in `config.rs` to make it clear the value is not yet honoured.
 
 ---
 
@@ -209,9 +209,9 @@ solution is correct but exposes two internal tuning knobs.
   specific PostgreSQL minor versions or hardware configurations
 - ❌ More risk than benefit
 
-**Decision:** Option B — remove `pg_stream.merge_work_mem_mb`, keep
-`pg_stream.merge_planner_hints`. Hard-code the 64 MB threshold in
-`refresh.rs` as a named constant.
+**Decision:** Option A — keep both `pg_stream.merge_work_mem_mb` and
+`pg_stream.merge_planner_hints` as-is. Maximum operator control is preserved
+for users who need to tune MERGE performance on large deltas.
 
 ---
 
