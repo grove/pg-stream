@@ -3875,26 +3875,42 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamE
 
     // Check for correlated subqueries — skip rewriting those (they reference
     // outer columns and can't be trivially cross-joined).
-    // For simplicity, we check if the subquery's FROM clause references tables
-    // that are also in the outer FROM clause. A more precise check would be
-    // to look for column references to outer tables, but this is a good heuristic.
-    // Actually, we'll just always rewrite — uncorrelated scalar subqueries are
-    // the common case, and correlated ones will produce valid SQL that the
-    // DVM parser can further reject if needed.
+    // Detect correlation by checking if the subquery's WHERE references
+    // column names from tables in the outer FROM clause.
+    let outer_tables = unsafe { collect_from_clause_table_names(select) };
+    let non_correlated: Vec<&ScalarSubqueryExtract> = scalar_subqueries
+        .iter()
+        .filter(|sq| !sq.is_correlated(&outer_tables))
+        .collect();
+
+    if non_correlated.is_empty() {
+        return Ok(query.to_string());
+    }
 
     // ── Build rewritten query components ─────────────────────────────
 
     // FROM clause
     let from_sql = extract_from_clause_sql(select)?;
 
-    // Build CROSS JOIN additions for each scalar subquery
+    // Build CROSS JOIN additions for each non-correlated scalar subquery.
+    // The wrapper SELECT uses the original scalar subquery as a derived table
+    // in its FROM clause, so the DVM parser (which requires FROM) can handle it.
+    //
+    // Format: CROSS JOIN (SELECT v."c" AS "scalar_alias"
+    //                      FROM (inner_sql) AS v("c")) AS "sq_alias"
     let mut cross_joins: Vec<String> = Vec::new();
-    for (i, sq) in scalar_subqueries.iter().enumerate() {
+    for (i, sq) in non_correlated.iter().enumerate() {
         let idx = i + 1;
         let sq_alias = format!("__pgs_sq_{idx}");
         let scalar_alias = format!("__pgs_scalar_{idx}");
+        let inner_alias = format!("__pgs_v_{idx}");
+        let inner_col = format!("__pgs_c_{idx}");
+        // The inner scalar subquery returns exactly 1 column and 1 row.
+        // We wrap it so the DVM parser sees a subquery with a valid FROM clause:
+        //   (SELECT v."c" AS "scalar" FROM (original_subquery) AS v("c")) AS "sq"
         cross_joins.push(format!(
-            "CROSS JOIN ({sq_sql} AS \"{scalar_alias}\") AS \"{sq_alias}\"",
+            "CROSS JOIN (SELECT \"{inner_alias}\".\"{inner_col}\" AS \"{scalar_alias}\" \
+             FROM ({sq_sql}) AS \"{inner_alias}\"(\"{inner_col}\")) AS \"{sq_alias}\"",
             sq_sql = sq.subquery_sql,
         ));
     }
@@ -3906,7 +3922,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamE
         .unwrap_or_else(|_| "TRUE".to_string());
 
     let mut rewritten_where = where_expr;
-    for (i, sq) in scalar_subqueries.iter().enumerate() {
+    for (i, sq) in non_correlated.iter().enumerate() {
         let idx = i + 1;
         let sq_alias = format!("__pgs_sq_{idx}");
         let scalar_alias = format!("__pgs_scalar_{idx}");
@@ -4040,6 +4056,114 @@ struct ScalarSubqueryExtract {
     /// The expression as rendered by `node_to_expr().to_sql()` for text replacement.
     /// e.g. `(SELECT avg("amount") FROM "orders")`
     expr_sql: String,
+    /// Table names referenced in the subquery's FROM clause (lowercase).
+    inner_tables: Vec<String>,
+}
+
+impl ScalarSubqueryExtract {
+    /// Check if this scalar subquery is correlated with the outer query.
+    ///
+    /// A subquery is considered correlated if its SQL text references any
+    /// column that could come from an outer table. We use a heuristic:
+    /// if the subquery SQL contains a table name from the outer FROM clause
+    /// (as part of a column reference like `t.col` or a bare column matching
+    /// the outer table names), we treat it as potentially correlated.
+    fn is_correlated(&self, outer_tables: &[String]) -> bool {
+        let sq_lower = self.subquery_sql.to_lowercase();
+        for outer_table in outer_tables {
+            // Skip tables that also appear in the inner FROM clause —
+            // those are legitimate inner references, not correlations.
+            if self.inner_tables.contains(outer_table) {
+                continue;
+            }
+            // Check if the outer table name appears as a qualified column
+            // reference prefix (e.g., "p_partkey" where "p" is from the
+            // subquery text referencing an outer table alias like "part").
+            // Heuristic: if any word in the subquery text matches an outer
+            // table/alias name in a dot-qualified position, it's correlated.
+            //
+            // Simpler heuristic: subqueries that share table names with
+            // the outer FROM clause are very likely correlated if the
+            // shared table is NOT in the inner FROM clause.
+            // For now, just check if the outer table name appears as a
+            // word boundary in the subquery SQL.
+            let pattern = format!("{}.", outer_table);
+            if sq_lower.contains(&pattern) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Collect table names (and aliases) from a SelectStmt's FROM clause.
+///
+/// Returns lowercased table names and alias names for correlation detection.
+///
+/// # Safety
+/// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
+unsafe fn collect_from_clause_table_names(select: &pg_sys::SelectStmt) -> Vec<String> {
+    let mut names = Vec::new();
+    if select.fromClause.is_null() {
+        return names;
+    }
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    for node_ptr in from_list.iter_ptr() {
+        if !node_ptr.is_null() {
+            unsafe { collect_table_names_from_node(node_ptr, &mut names) };
+        }
+    }
+    names
+}
+
+/// Recursively collect table names and aliases from a FROM item node.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn collect_table_names_from_node(node: *mut pg_sys::Node, out: &mut Vec<String>) {
+    if node.is_null() {
+        return;
+    }
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
+        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+        if !rv.relname.is_null()
+            && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(rv.relname) }.to_str()
+        {
+            out.push(s.to_lowercase());
+        }
+        if !rv.alias.is_null() {
+            let a = unsafe { &*(rv.alias) };
+            if !a.aliasname.is_null()
+                && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }.to_str()
+            {
+                let lower = s.to_lowercase();
+                if !out.contains(&lower) {
+                    out.push(lower);
+                }
+            }
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        if !join.larg.is_null() {
+            unsafe { collect_table_names_from_node(join.larg, out) };
+        }
+        if !join.rarg.is_null() {
+            unsafe { collect_table_names_from_node(join.rarg, out) };
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if !sub.alias.is_null() {
+            let a = unsafe { &*(sub.alias) };
+            if !a.aliasname.is_null()
+                && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }.to_str()
+            {
+                let lower = s.to_lowercase();
+                if !out.contains(&lower) {
+                    out.push(lower);
+                }
+            }
+        }
+    }
 }
 
 /// Recursively collect EXPR_SUBLINK nodes from a WHERE clause tree.
@@ -4061,9 +4185,22 @@ unsafe fn collect_scalar_sublinks_in_where(
             if !sublink.subselect.is_null() {
                 let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
                 let expr_sql = format!("({inner_sql})");
+
+                // Collect table names from the subquery's FROM clause
+                // for correlation detection.
+                let inner_tables =
+                    if unsafe { pgrx::is_a(sublink.subselect, pg_sys::NodeTag::T_SelectStmt) } {
+                        let inner_select =
+                            unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
+                        unsafe { collect_from_clause_table_names(inner_select) }
+                    } else {
+                        Vec::new()
+                    };
+
                 out.push(ScalarSubqueryExtract {
                     subquery_sql: inner_sql,
                     expr_sql,
+                    inner_tables,
                 });
             }
         }
@@ -4169,11 +4306,13 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgStreamError> {
     // Only handle top-level OR, or AND where one of the conjuncts is an OR with sublinks
     if boolexpr.boolop != pg_sys::BoolExprType::OR_EXPR {
         // Check for AND with an inner OR containing sublinks.
-        // Guard: only enter the AND rewriter if the WHERE actually
-        // contains SubLink nodes, otherwise the deparse fallback
-        // drops WITH clauses and other top-level syntax.
+        // Guard: only enter the AND rewriter if there is actually an
+        // OR conjunct containing SubLink nodes. Without this check,
+        // queries like Q04 (AND + EXISTS, no OR) would be unnecessarily
+        // deparsed and round-tripped through node_to_expr, losing
+        // information like agg_star on COUNT(*).
         if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR
-            && unsafe { node_tree_contains_sublink(select.whereClause) }
+            && unsafe { and_contains_or_with_sublink(select.whereClause) }
         {
             return rewrite_and_with_or_sublinks(select, boolexpr);
         }
@@ -4902,9 +5041,33 @@ unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgStreamEr
             format!(" ON {}", cond.to_sql())
         };
         Ok(format!("{left} {join_type} {right}{on_clause}"))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        // Derived table / inline subquery in FROM: (SELECT ...) AS alias
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if sub.subquery.is_null()
+            || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            return Ok("?".to_string());
+        }
+        let inner_sql = unsafe { deparse_select_to_sql(sub.subquery)? };
+        let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
+        let mut result = format!("{lateral_kw}({inner_sql})");
+        if !sub.alias.is_null() {
+            let a = unsafe { &*(sub.alias) };
+            if !a.aliasname.is_null() {
+                let alias = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                    .to_str()
+                    .unwrap_or("?");
+                result.push_str(&format!(" AS \"{}\"", alias.replace('"', "\"\"")));
+            }
+        }
+        Ok(result)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
+        // Function in FROM — use fallback deparser
+        unsafe { deparse_from_item_to_sql(node) }
     } else {
-        // Fallback for subselects and other FROM items
-        Ok("?".to_string())
+        // Fallback for other FROM items
+        unsafe { deparse_from_item_to_sql(node) }
     }
 }
 
@@ -5292,6 +5455,44 @@ unsafe fn node_tree_contains_sublink(node: *mut pg_sys::Node) -> bool {
     false
 }
 
+/// Check if an AND expression contains at least one OR conjunct that itself
+/// contains SubLink nodes. This is stricter than `node_tree_contains_sublink`
+/// which returns true for AND + EXISTS (no OR), causing unnecessary deparsing.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        return false;
+    }
+    let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
+    if boolexpr.boolop != pg_sys::BoolExprType::AND_EXPR {
+        return false;
+    }
+    if boolexpr.args.is_null() {
+        return false;
+    }
+    let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
+    for arg_ptr in args.iter_ptr() {
+        if arg_ptr.is_null() {
+            continue;
+        }
+        // We're looking for an OR conjunct that contains SubLink nodes
+        if unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_BoolExpr) } {
+            let inner = unsafe { &*(arg_ptr as *const pg_sys::BoolExpr) };
+            if inner.boolop == pg_sys::BoolExprType::OR_EXPR
+                && unsafe { node_tree_contains_sublink(arg_ptr) }
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Deparse a SelectStmt (or Node) back to SQL text.
 ///
 /// Uses PostgreSQL's `nodeToString()` for a basic representation, then
@@ -5434,6 +5635,27 @@ unsafe fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgStreamE
             sql.push_str(&format!(" ON {}", quals.to_sql()));
         }
         Ok(sql)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        // Derived table / inline subquery in FROM: (SELECT ...) AS alias
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if sub.subquery.is_null()
+            || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            return Ok("/* unsupported RangeSubselect */".to_string());
+        }
+        let inner_sql = unsafe { deparse_select_to_sql(sub.subquery)? };
+        let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
+        let mut result = format!("{lateral_kw}({inner_sql})");
+        if !sub.alias.is_null() {
+            let a = unsafe { &*(sub.alias) };
+            if !a.aliasname.is_null() {
+                let alias = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                    .to_str()
+                    .unwrap_or("?");
+                result.push_str(&format!(" \"{}\"", alias.replace('"', "\"\"")));
+            }
+        }
+        Ok(result)
     } else {
         // Fallback: use a placeholder
         Ok("/* unsupported FROM item */".to_string())
@@ -7321,6 +7543,17 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
         let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
         let func_name = unsafe { extract_func_name(fcall.funcname)? };
+
+        // Handle COUNT(*) and other agg_star calls.
+        // PostgreSQL represents COUNT(*) as FuncCall { agg_star: true, args: [] }.
+        // We must emit the "*" explicitly so to_sql() produces COUNT(*) not COUNT().
+        if fcall.agg_star {
+            return Ok(Expr::FuncCall {
+                func_name,
+                args: vec![Expr::Raw("*".to_string())],
+            });
+        }
+
         let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
         let mut args = Vec::new();
         for n in args_list.iter_ptr() {
@@ -13022,6 +13255,7 @@ mod tests {
         let extract = ScalarSubqueryExtract {
             subquery_sql: "SELECT avg(amount) FROM orders".to_string(),
             expr_sql: "(SELECT avg(\"amount\") FROM \"orders\")".to_string(),
+            inner_tables: vec!["orders".to_string()],
         };
         assert!(extract.subquery_sql.contains("avg"));
         assert!(extract.expr_sql.starts_with('('));
