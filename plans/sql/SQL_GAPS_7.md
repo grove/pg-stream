@@ -55,12 +55,12 @@ tracking, and production deployment:
 | **Total new gaps** | **1** | **11** | **4** | **27** | **10** | **53** |
 
 The single P0 item is:
-1. **DELETE+INSERT merge strategy double-evaluation** — the delta query is
-   evaluated twice (once for DELETE, once for INSERT), and the DELETE mutates the
-   stream table before the INSERT's delta evaluation, causing stale reads for
-   aggregate/DISTINCT queries. This is gated behind an explicit GUC
-   (`pg_stream.merge_strategy = 'delete_insert'`) with the default `auto`
-   always using MERGE.
+1. **Remove `delete_insert` merge strategy** — the strategy is unsafe for
+   aggregate/DISTINCT queries (double-evaluation against mutated state), slower
+   than `MERGE` for small deltas, and incompatible with prepared statements.
+   The `auto` strategy already covers the only legitimate use case (large-delta
+   bulk apply). Decision: remove `delete_insert` as a valid GUC value and emit
+   an error if it is set.
 
 The 11 P1 items cluster in three areas:
 - **WAL decoder** (3): pk_hash=0 for keyless tables, `old_*` columns always NULL
@@ -462,20 +462,15 @@ to exclude `attgenerated != ''` columns.
 
 ## 7. Gap Category 4: Refresh Engine Edge Cases
 
-### G4.1 — DELETE+INSERT Strategy Double-Evaluation
+### G4.1 — DELETE+INSERT Strategy: Remove
 
 | Field | Value |
 |-------|-------|
-| **Location** | `refresh.rs` — DELETE+INSERT merge strategy |
-| **Problem** | The delta query is evaluated twice: once for DELETE, then for INSERT. The DELETE mutates the stream table before the INSERT's delta is evaluated. For aggregate/DISTINCT queries where the delta LEFT JOINs back to the stream table (to read `__pgs_count` or existing values), the INSERT phase sees stale data modified by the DELETE phase. |
-| **Severity** | **P0 — Silent wrong results (gated behind explicit GUC)** |
-| **Impact** | Only affects users who explicitly set `pg_stream.merge_strategy = 'delete_insert'` (default is `auto` which uses MERGE) |
-| **Effort** | 2–4 hours |
-
-**Recommendation:** Either (a) reject `delete_insert` for queries with
-`needs_pgs_count() == true` at strategy selection time, or (b) wrap both
-phases in a single-evaluation CTE (`WITH delta AS MATERIALIZED (...)` then
-DELETE using delta, INSERT using delta).
+| **Location** | `refresh.rs`, `config.rs` — DELETE+INSERT merge strategy |
+| **Problem** | The `delete_insert` strategy has three compounding issues: (1) double-evaluation against mutated state causes silent wrong results for aggregate/DISTINCT queries; (2) it is slower than `MERGE` for small deltas; (3) it is incompatible with prepared statements. The `auto` strategy already switches to bulk apply for large deltas — the only scenario where DELETE+INSERT has any advantage. |
+| **Severity** | **P0 — Remove before public release** |
+| **Decision** | Remove `delete_insert` as a valid `pg_stream.merge_strategy` value. Accept only `auto` and `merge`. Emit `ERROR` if `delete_insert` is set. |
+| **Effort** | 1–2 hours |
 
 ---
 
@@ -1020,7 +1015,7 @@ correct in this analysis:
 
 | Step | Gap | Description | Effort | Priority |
 |------|-----|-------------|--------|----------|
-| **F1** | G4.1 | DELETE+INSERT strategy: guard or remove | 2–4h | P0 |
+| **F1** | G4.1 | Remove `delete_insert` strategy | 1–2h | P0 |
 | **F2** | G2.1 | WAL decoder: keyless table pk_hash | 4–6h | P1 |
 | **F3** | G2.2 | WAL decoder: old_* columns for UPDATE | 8–12h | P1 |
 | **F4** | G2.3 | WAL decoder: pgoutput action parsing | 2–3h | P1 |
@@ -1126,13 +1121,13 @@ Catches regressions. May surface P1 bugs in untested operators.
 | 2 — Robustness | F13–F16 | 7–9h | 46–66h |
 | 3 — Test Coverage | F17–F26 | 29–38h | 75–104h |
 | 4 — Operational | F27–F40 | 25–36h | 100–140h |
-| 5 — Nice-to-Have | F41–F51 | 19–30h | 119–170h |
-| **Total** | **51 steps** | **119–170h** | — |
+| 5 — Nice-to-Have | F41–F51 | 19–30h | 117–168h |
+| **Total** | **51 steps** | **117–168h** | — |
 
 ### Recommended Execution Order
 
 ```
-Session 1:  F1 (DELETE+INSERT guard) + F4 (pgoutput parsing)        ~5h
+Session 1:  F1 (remove delete_insert) + F4 (pgoutput parsing)        ~4h
 Session 2:  F6 (ALTER TYPE) + F7 (ALTER POLICY) + F10 (ALTER DOMAIN) ~8h
 Session 3:  F8 (window partition E2E) + F9 (recursive monotonicity)  ~12h
 Session 4:  F13 (LIMIT warning) + F14 (CUBE limit) + F15 (RANGE_AGG) ~5h
@@ -1226,7 +1221,7 @@ and robustly in all edge cases under production conditions?"
 | **CDC (trigger-based)** | ✅ Production-ready | F11: keyless duplicate row limitation documented |
 | **CDC (WAL-based)** | ❌ Not production-ready | F2, F3, F4: three P1 correctness issues |
 | **DDL tracking** | ⚠️ Nearly complete | F6, F7, F10: ALTER TYPE/DOMAIN/POLICY untracked |
-| **Refresh engine** | ⚠️ Mostly solid | F1: DELETE+INSERT guard (P0 but gated) |
+| **Refresh engine** | ⚠️ Mostly solid | F1: remove `delete_insert` strategy (P0) |
 | **Production deployment** | ⚠️ Gaps | F12: PgBouncer; F16: replicas; F40: upgrades |
 | **Test coverage** | ⚠️ Significant gaps | F17–F26: 10 test suite expansion tasks |
 | **Monitoring** | ⚠️ Basic | F27–F31: observability improvements |
