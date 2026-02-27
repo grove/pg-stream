@@ -146,6 +146,9 @@ SET pg_stream.change_buffer_schema = 'my_change_buffers';
 
 ### pg_stream.max_concurrent_refreshes
 
+> **Reserved for future use.** This setting is accepted and stored but has no
+> effect in v0.2.0. Parallel refresh is planned for v0.3.0.
+
 Maximum number of stream tables that can be refreshed simultaneously.
 
 | Property | Value |
@@ -156,20 +159,12 @@ Maximum number of stream tables that can be refreshed simultaneously.
 | Context | `SUSET` |
 | Restart Required | No |
 
-Controls concurrency in the scheduler. Each refresh acquires an advisory lock, and the scheduler skips STs that exceed this limit.
-
-**Tuning Guidance:**
-- **Small databases** (few STs): `1`–`4` is sufficient.
-- **Large deployments** (50+ STs): Increase to `8`–`16` if the server has spare CPU and I/O capacity.
-- **Resource-constrained**: Set to `1` for fully sequential refresh processing.
-
-The optimal setting depends on:
-- Number of CPU cores available
-- I/O throughput (SSD vs HDD)
-- Complexity of the defining queries
-- Amount of concurrent OLTP workload
+The scheduler currently processes stream tables sequentially in topological
+order. This GUC is reserved for v0.3.0 when parallel scheduling is
+implemented. Setting it has no effect in v0.2.0.
 
 ```sql
+-- Accepted but has no effect in v0.2.0
 SET pg_stream.max_concurrent_refreshes = 8;
 ```
 
@@ -283,37 +278,6 @@ A higher value lets PostgreSQL use larger in-memory hash tables for the MERGE jo
 
 ```sql
 SET pg_stream.merge_work_mem_mb = 128;
-```
-
----
-
-### pg_stream.merge_strategy
-
-Strategy for applying delta changes to the stream table during differential refresh.
-
-| Property | Value |
-|---|---|
-| Type | `text` |
-| Default | `'auto'` |
-| Values | `'auto'`, `'merge'`, `'delete_insert'` |
-| Context | `SUSET` |
-| Restart Required | No |
-
-**Values:**
-- **`auto`** (default): Use `MERGE` for small deltas; switch to `DELETE` + `INSERT` when the delta exceeds 25% of the stream table row count.
-- **`merge`**: Always use a single `MERGE` statement. Best for correctness and simplicity.
-- **`delete_insert`**: Always use `DELETE` + `INSERT`. May be faster for very large deltas but has known limitations with aggregate/DISTINCT queries.
-
-**Tuning Guidance:**
-- **Most workloads**: Leave at `'auto'` or `'merge'`.
-- **Batch-heavy ETL**: Try `'delete_insert'` if MERGE performance degrades on large deltas, but test thoroughly with your specific queries.
-
-```sql
--- Always use MERGE
-SET pg_stream.merge_strategy = 'merge';
-
--- Always use DELETE + INSERT
-SET pg_stream.merge_strategy = 'delete_insert';
 ```
 
 ---
@@ -433,6 +397,10 @@ SET pg_stream.cdc_mode = 'wal';
 
 ### pg_stream.wal_transition_timeout
 
+> **Note:** WAL-based CDC is pre-production in v0.2.0. This setting is only
+> relevant when `pg_stream.cdc_mode = 'auto'` or `'wal'`. See
+> [ARCHITECTURE.md](ARCHITECTURE.md) for status.
+
 Maximum time (seconds) to wait for the WAL decoder to catch up during
 the transition from trigger-based to WAL-based CDC. If the decoder has
 not caught up within this timeout, the system falls back to triggers.
@@ -458,12 +426,12 @@ pg_stream.scheduler_interval_ms = 1000
 pg_stream.min_schedule_seconds = 60
 pg_stream.max_consecutive_errors = 3
 pg_stream.change_buffer_schema = 'pgstream_changes'
-pg_stream.max_concurrent_refreshes = 4
+pg_stream.max_concurrent_refreshes = 4   # reserved; no effect in v0.2.0
 pg_stream.differential_max_change_ratio = 0.15
 pg_stream.cleanup_use_truncate = true
 pg_stream.merge_planner_hints = true
 pg_stream.merge_work_mem_mb = 64
-pg_stream.merge_strategy = 'auto'
+# pg_stream.merge_strategy removed in v0.2.0
 pg_stream.use_prepared_statements = true
 pg_stream.user_triggers = 'auto'
 pg_stream.block_source_ddl = false
@@ -483,7 +451,7 @@ SHOW pg_stream.enabled;
 SHOW pg_stream.scheduler_interval_ms;
 
 -- Change for current session
-SET pg_stream.max_concurrent_refreshes = 8;
+SET pg_stream.max_concurrent_refreshes = 8;  -- no effect in v0.2.0
 
 -- Change persistently (requires reload)
 ALTER SYSTEM SET pg_stream.scheduler_interval_ms = 500;

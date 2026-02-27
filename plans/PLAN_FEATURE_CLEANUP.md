@@ -1,6 +1,6 @@
 # PLAN: Feature Cleanup — Remove Low-Value Surface Before Public Release
 
-**Status:** Planned
+**Status:** In Progress
 **Target milestone:** v0.2.0
 **Last updated:** 2026-02-27
 
@@ -62,14 +62,16 @@ stream_table_definition, force_full_refresh — none of these were built).
 
 **Decision:** Option B — remove `merge_strategy` GUC entirely.
 
+**Status: DONE ✅**
+
 #### Implementation
 
-1. Remove `PGS_MERGE_STRATEGY` from `config.rs`
-2. Remove `pg_stream_merge_strategy()` accessor
-3. Remove `use_delete_insert` branch in `refresh.rs`
-4. Remove `delete_insert_template` and `delete_insert_sql` fields from the
-   refresh cache entry struct
-5. Update docs and GUC documentation table
+1. ~~Remove `PGS_MERGE_STRATEGY` from `config.rs`~~ ✅
+2. ~~Remove `pg_stream_merge_strategy()` accessor~~ ✅
+3. ~~Remove `use_delete_insert` branch in `refresh.rs`~~ ✅
+4. ~~Remove `delete_insert_template` and `delete_insert_sql` fields from the
+   refresh cache entry struct~~ ✅
+5. Update docs and GUC documentation table ✅
 
 ---
 
@@ -119,6 +121,8 @@ directly mutating the catalog table.
 **Decision:** Option B — implement `resume_stream_table()`. The function is
 already promised by the error message; this just fulfils that promise.
 
+**Status: DONE ✅**
+
 #### Implementation
 
 ```rust
@@ -166,6 +170,8 @@ effect on behaviour.
 future use" in the GUC description. No code change; update the description
 string in `config.rs` to make it clear the value is not yet honoured.
 
+**Status: DONE ✅**
+
 ---
 
 ### C4 — Consolidate `pg_stream.merge_work_mem_mb` and `pg_stream.merge_planner_hints`
@@ -212,6 +218,8 @@ solution is correct but exposes two internal tuning knobs.
 **Decision:** Option A — keep both `pg_stream.merge_work_mem_mb` and
 `pg_stream.merge_planner_hints` as-is. Maximum operator control is preserved
 for users who need to tune MERGE performance on large deltas.
+
+**Status: No action required ✅**
 
 ---
 
@@ -297,20 +305,22 @@ description strings**
 **Decision:** Option B — update GUC description strings to explicitly state
 WAL CDC is pre-production in v0.2.0. No code change.
 
+**Status: DONE ✅**
+
 ---
 
 ## Summary
 
-| Item | Action | Priority | Effort |
-|------|--------|----------|--------|
-| C1 | Remove `merge_strategy` GUC (entire) | P0 | 1–2h |
-| C2 | Implement missing `resume_stream_table()` | P0 | 1–2h |
-| C3 | Remove `max_concurrent_refreshes` GUC | P1 | 30 min |
-| C4 | Remove `merge_work_mem_mb` GUC | P2 | 1–2h |
-| C5 | Simplify `user_triggers` GUC | P3 | Defer to v0.3.0 |
-| C6 | Document WAL GUCs as pre-production | P3 | 30 min |
+| Item | Action | Priority | Effort | Status |
+|------|--------|----------|--------|--------|
+| C1 | Remove `merge_strategy` GUC (entire) | P0 | 1–2h | ✅ Done |
+| C2 | Implement missing `resume_stream_table()` | P0 | 1–2h | ✅ Done |
+| C3 | Document `max_concurrent_refreshes` as reserved | P1 | 30 min | ✅ Done |
+| C4 | Keep both merge GUCs as-is | P2 | — | ✅ No-op |
+| C5 | Simplify `user_triggers` GUC | P3 | Defer to v0.3.0 | ⏳ Deferred |
+| C6 | Document WAL GUCs as pre-production | P3 | 30 min | ✅ Done |
 
-**Total for v0.2.0 (C1–C4 + C6):** ~5–7 hours
+**Total for v0.2.0 (C1–C3 + C6):** completed.
 
 ---
 
