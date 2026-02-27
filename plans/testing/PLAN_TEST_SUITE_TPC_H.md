@@ -26,55 +26,55 @@ query that pg_stream can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 5–9/22 pass (CDC flaky), 13+ soft-skip |
+| Phase 1: Differential Correctness | Done — 9/22 pass, 13 soft-skip |
 | Phase 2: Cross-Query Consistency | Done — 13/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 5–9/22 pass (CDC flaky), 13+ soft-skip |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 9/22 pass |
 
-### Latest Test Run (2026-02-27, SF=0.01, 3 cycles)
+### Latest Test Run (2026-02-28, SF=0.01, 3 cycles)
 
 ```
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
 ```
 
-**Deterministically passing (5):** Q08, Q09, Q10, Q11, Q20 — pass all 3
-cycles consistently across multiple runs.
+**Deterministically passing (9):** Q05, Q07, Q08, Q09, Q10, Q11, Q16, Q20,
+Q22 — pass all 3 cycles consistently across multiple runs.
 
-**Intermittently passing (4):** Q05, Q07, Q16, Q22 — pass all cycles on some
-runs, but fail on others due to CDC change-buffer table lifecycle issues
-(`relation "pgstream_changes.changes_NNNNN" does not exist`). Not a DVM bug.
+**Phase 3 (FULL vs DIFF): 9/22** — deterministic and stable.
 
-**Phase 3 (FULL vs DIFF) best result: 9/22** — when CDC does not interfere.
+**Cross-query consistency: 13/20** STs survive all 3 cycles.
 
 **Queries failing cycle 2+ deterministically (11):**
 
 | Query | Cycle 2 Error | Category |
 |-------|---------------|----------|
-| Q01 | Data mismatch (same row count, different values) | Aggregate drift |
-| Q03 | Data mismatch (row count or values differ) | Aggregate drift |
-| Q04 | CDC relation does not exist | CDC lifecycle |
-| Q06 | `__pgs_count` null violation or data mismatch | Aggregate count |
-| Q12 | Data mismatch or CDC relation | Aggregate drift |
+| Q01 | Data mismatch: FULL(6) != DIFF(6) — same row count, different values | Aggregate drift |
+| Q03 | Data mismatch: FULL(46) != DIFF(46) — values differ | Aggregate drift |
+| Q04 | `OID MISMATCH (source_oids)` — EXISTS subquery delta references OIDs not in catalog deps | Subquery OID leak |
+| Q06 | `null value in column "__pgs_count"` — not-null violation | Aggregate count |
+| Q12 | Data mismatch: FULL(2) != DIFF(2) | Aggregate drift |
 | Q13 | `column st.c_custkey does not exist` | MERGE column ref |
-| Q14 | `__pgs_row_id must appear in GROUP BY` or CDC | Aggregate GROUP BY |
+| Q14 | `"__pgs_cte_filter_12.__pgs_row_id" must appear in GROUP BY` | Aggregate GROUP BY |
 | Q15 | `column st.l_suppkey does not exist` | MERGE column ref |
 | Q18 | `column "o_orderkey" does not exist` | Raw expr scope |
-| Q19 | `__pgs_count` null violation | Aggregate count |
+| Q19 | `null value in column "__pgs_count"` — not-null violation | Aggregate count |
 | Q21 | `column dl.l1__l_orderkey does not exist` | Join alias scope |
 
-**Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery.
+**Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
+(`column "p_partkey" does not exist`).
 
 ### Query Failure Classification
 
 | Category | Queries | Root Cause |
 |----------|---------|------------|
-| **CREATE fails — correlated scalar subquery** | Q02, Q17 | `syntax error at or near "AS"` — pg_stream DVM does not support correlated scalar subqueries in WHERE |
-| **Cycle 2 — aggregate delta drift** | Q01, Q03, Q07†, Q10†, Q12 | Refresh succeeds but ST contents ≠ full query results (aggregate accumulation / expression evaluation) |
-| **Cycle 2 — null `__pgs_count` violation** | Q06, Q19 | Aggregate delta produces NULL count for certain groups |
-| **Cycle 2 — aggregate GROUP BY** | Q14 | `"__pgs_cte_filter_12.__pgs_row_id" must appear in the GROUP BY clause` — row-id leaks into aggregate context |
-| **Cycle 2 — CDC relation lifecycle** | Q04, Q05†, Q07†, Q12†, Q16†, Q22† | `relation "pgstream_changes.changes_NNNNN" does not exist` — change-buffer table OID changes between cycles (†intermittent) |
+| **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_stream DVM does not support correlated scalar subqueries in WHERE |
+| **Cycle 2 — aggregate delta drift** | Q01, Q03, Q12 | Refresh succeeds but ST contents ≠ full query results (aggregate accumulation / expression evaluation error) |
+| **Cycle 2 — null `__pgs_count` violation** | Q06, Q19 | Aggregate delta produces NULL count for groups that should still exist |
+| **Cycle 2 — aggregate GROUP BY** | Q14 | `"__pgs_cte_filter_12.__pgs_row_id"` leaks into aggregate context |
+| **Cycle 2 — subquery OID leak** | Q04 | EXISTS subquery delta includes source OIDs from the subquery that are not in the ST's catalog deps; OID mismatch check catches it |
 | **Cycle 2 — MERGE column ref** | Q13, Q15 | `column st.X does not exist` — MERGE template references unresolved column names for views with subqueries/CTEs |
 | **Cycle 2 — `Expr::Raw` column scope** | Q18 | `column "o_orderkey" does not exist` — `Expr::Raw` best-effort replacement doesn't resolve columns in filter predicates from comma-join WHERE |
 | **Cycle 2 — join alias in subquery** | Q21 | `column dl.l1__l_orderkey does not exist` — nested join child alias (`l1`) not resolved in EXISTS subquery delta |
+| ~~**Cycle 2 — CDC relation lifecycle**~~ | ~~Q04, Q05†, Q07†, Q12†, Q16†, Q22†~~ | ~~FIXED~~ — see "Resolved" section below |
 | ~~**Cycle 2 — column qualification**~~ | ~~Q03–Q15, Q18–Q21~~ | ~~FIXED (P1)~~ — see "Resolved" section below |
 | ~~**CREATE fails — EXISTS/NOT EXISTS**~~ | ~~Q04, Q21~~ | ~~FIXED~~ — `node_to_expr` agg_star + `and_contains_or_with_sublink()` guard |
 | ~~**CREATE fails — nested derived table**~~ | ~~Q15~~ | ~~FIXED~~ — `from_item_to_sql` / `deparse_from_item` now handle `T_RangeSubselect` |
@@ -99,32 +99,29 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-#### Priority 1: Fix CDC change-buffer table lifecycle (6 queries, 4 intermittent)
+#### Priority 1: Fix aggregate delta drift / `__pgs_count` null (5 queries)
 
-Q04 always fails, Q05/Q07/Q12/Q16/Q22 fail intermittently with
-`relation "pgstream_changes.changes_NNNNN" does not exist`. The OID
-embedded in the delta SQL template becomes stale when the change-buffer
-table is dropped and recreated between refresh cycles (likely triggered by
-DDL event hooks firing during CREATE STREAM TABLE for later queries in the
-same test container). This is NOT a DVM bug — it's a CDC/catalog lifecycle
-issue.
-
-**Files to investigate:** `src/cdc.rs`, `src/hooks.rs`, `src/refresh.rs`  
-**Impact:** Would stabilize 4 intermittent queries (Q05, Q07, Q16, Q22 →
-deterministic pass) and fix 1-2 deterministic failures (Q04, sometimes Q12/Q14).
-
-#### Priority 2: Fix aggregate delta drift / `__pgs_count` null (6 queries)
-
-Q01, Q03, Q06, Q12, Q14, Q19 show aggregate correctness issues:
+Q01, Q03, Q06, Q12, Q19 show aggregate correctness issues:
 - **Q01, Q03, Q12**: data mismatch — ST rows differ from full query after
-  cycle 2. Same row count but different values (Q01) or missing/extra rows (Q03).
+  cycle 2. Same row count but different values (Q01, Q12) or missing rows (Q03).
 - **Q06, Q19**: `NULL value in column "__pgs_count"` not-null violation —
   aggregate delta produces NULL count for groups that should still exist.
-- **Q14**: `"__pgs_cte_filter_12.__pgs_row_id" must appear in the GROUP BY` —
-  row-id column leaks into aggregate context when filter sits below aggregate.
 
 **Files to fix:** `src/dvm/operators/aggregate.rs`, `src/dvm/diff.rs`  
-**Impact:** Would fix up to 6 queries
+**Impact:** Would fix up to 5 queries
+
+#### Priority 2: Fix subquery OID leak (1 query) + aggregate GROUP BY leak (1 query)
+
+- **Q04**: `OID MISMATCH (source_oids)` — the EXISTS subquery delta includes
+  source OIDs from the correlated subquery (lineitem) that are not in the
+  parent ST's catalog deps (only orders). The delta template references
+  `changes_16587` (lineitem) but catalog deps list only `changes_16572`
+  (orders). Need to ensure subquery source OIDs are included in catalog deps.
+- **Q14**: `"__pgs_cte_filter_12.__pgs_row_id" must appear in GROUP BY` —
+  row-id column leaks into aggregate context when filter sits below aggregate.
+
+**Files to fix:** `src/api.rs` (OID dep collection), `src/dvm/operators/aggregate.rs`  
+**Impact:** Would fix Q04, Q14
 
 #### Priority 3: Fix MERGE column references (2 queries)
 
@@ -163,7 +160,8 @@ Deeper DVM support (named correlation context) is needed.
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
-| P1 — column qualification | Multiple resolution functions returned bare column names instead of disambiguated CTE column names | Three-part fix: (1) `filter.rs`: added `resolve_predicate_for_child` with suffix matching and `Expr::Raw` best-effort replacement; (2) `join_common.rs`: added `snapshot_output_columns` to fix `build_join_snapshot` using raw names instead of disambiguated names, extended `rewrite_expr_for_join` for `Star`/`Literal`/`Raw`; (3) `aggregate.rs` + `project.rs`: added suffix matching for unqualified ColumnRef, switched agg arguments from `resolve_col_for_child` to `resolve_expr_for_child`, added `Expr::Raw` handling | Q05, Q07, Q08, Q09, Q10 (5 queries) |
+| P1 — CDC lifecycle | Stale pending cleanup entries in thread-local `PENDING_CLEANUP` queue referenced change buffer tables dropped by a previous ST's cleanup; `Spi::run(DELETE ...)` on non-existent table longjmps past all Rust error handling | Three-part fix: (1) `refresh.rs`: added pg_class existence check in `drain_pending_cleanups` before DELETE/TRUNCATE; (2) `refresh.rs`: added `flush_pending_cleanups_for_oids` to remove stale entries; (3) `api.rs`: call `flush_pending_cleanups_for_oids` in `drop_stream_table_impl` before cleanup; also added OID mismatch diagnostic check in `execute_differential_refresh` | Q05, Q07, Q16, Q22 (4 queries stabilized from intermittent → pass) |
+| P1 (old) — column qualification | Multiple resolution functions returned bare column names instead of disambiguated CTE column names | Three-part fix: (1) `filter.rs`: added `resolve_predicate_for_child` with suffix matching and `Expr::Raw` best-effort replacement; (2) `join_common.rs`: added `snapshot_output_columns` to fix `build_join_snapshot` using raw names instead of disambiguated names, extended `rewrite_expr_for_join` for `Star`/`Literal`/`Raw`; (3) `aggregate.rs` + `project.rs`: added suffix matching for unqualified ColumnRef, switched agg arguments from `resolve_col_for_child` to `resolve_expr_for_child`, added `Expr::Raw` handling | Q05, Q07, Q08, Q09, Q10 (5 queries) |
 | P2 — EXISTS/COUNT* | `node_to_expr` dropped `agg_star`; `rewrite_sublinks_in_or` triggered on AND+EXISTS (no OR) | `agg_star` check + `and_contains_or_with_sublink()` guard | Q04, Q21 |
 | P5 — nested derived table | `from_item_to_sql` / `deparse_from_item` fell to `"?"` for `T_RangeSubselect` | Handle `T_RangeSubselect` in both deparse paths | Q15 |
 

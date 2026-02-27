@@ -236,6 +236,21 @@ async fn load_schema(db: &E2eDb) {
             db.execute(stmt).await;
         }
     }
+
+    // Diagnostic: dump OID → table name mapping for TPC-H tables
+    let oid_map: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT c.relname::text, c.oid::bigint \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind = 'r' \
+         ORDER BY c.oid",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
+    println!("  TPC-H table OIDs:");
+    for (name, oid) in &oid_map {
+        println!("    {name}: {oid}");
+    }
 }
 
 /// Load TPC-H data at the configured scale factor.
@@ -455,6 +470,37 @@ async fn test_tpch_differential_correctness() {
             continue;
         }
 
+        // Diagnostic: show source OIDs from deps and change buffer tables
+        let dep_rows: Vec<(i64, String)> = sqlx::query_as(&format!(
+            "SELECT d.source_relid::bigint, c.relname::text \
+                 FROM pgstream.pgs_dependencies d \
+                 JOIN pgstream.pgs_stream_tables st ON st.pgs_id = d.pgs_id \
+                 LEFT JOIN pg_class c ON c.oid = d.source_relid \
+                 WHERE st.pgs_name = '{st_name}' AND d.source_type = 'TABLE' \
+                 ORDER BY d.source_relid"
+        ))
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+        let dep_info: Vec<String> = dep_rows
+            .iter()
+            .map(|(oid, name)| format!("{name}({oid})"))
+            .collect();
+        println!("  deps: {}", dep_info.join(", "));
+
+        // Check which change buffer tables exist
+        let buf_rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT c.relname::text \
+             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'pgstream_changes' AND c.relkind = 'r' \
+             ORDER BY c.relname",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+        let buf_names: Vec<&str> = buf_rows.iter().map(|(n,)| n.as_str()).collect();
+        println!("  change_buffers: {}", buf_names.join(", "));
+
         // Baseline assertion
         let t = Instant::now();
         if let Err(e) = assert_tpch_invariant(&db, &st_name, q.sql, q.name, 0).await {
@@ -489,8 +535,21 @@ async fn test_tpch_differential_correctness() {
 
             // Differential refresh — soft error for known pg_stream DVM bugs
             if let Err(e) = try_refresh_st(&db, &st_name).await {
+                // Dump change buffer tables on error for diagnosis
+                let buf_rows2: Vec<(String,)> = sqlx::query_as(
+                    "SELECT c.relname::text \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = 'pgstream_changes' AND c.relkind = 'r' \
+                     ORDER BY c.relname",
+                )
+                .fetch_all(&db.pool)
+                .await
+                .unwrap_or_default();
+                let buf_names2: Vec<&str> = buf_rows2.iter().map(|(n,)| n.as_str()).collect();
+
                 let msg = e.lines().next().unwrap_or(&e).to_string();
                 println!("  WARN cycle {cycle} — pg_stream DVM error: {msg}");
+                println!("    change_buffers_at_error: {}", buf_names2.join(", "));
                 skipped.push((q.name, format!("DVM error cycle {cycle}: {msg}")));
                 dvm_ok = false;
                 break 'cycles;
