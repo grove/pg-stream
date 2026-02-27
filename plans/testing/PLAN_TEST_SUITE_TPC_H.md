@@ -36,14 +36,14 @@ query that pg_stream can currently handle:
 test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
 ```
 
-**Deterministically passing (11):** Q05, Q07, Q08, Q09, Q10, Q11, Q12, Q14,
-Q16, Q19, Q22 — pass all 3 cycles consistently across multiple runs.
+**Deterministically passing (12):** Q05, Q07, Q08, Q09, Q10, Q11, Q12, Q14,
+Q16, Q19, Q20, Q22 — pass all 3 cycles consistently across multiple runs.
 
-**Phase 3 (FULL vs DIFF): 11/22** — deterministic and stable.
+**Phase 3 (FULL vs DIFF): 12/22** — deterministic and stable.
 
-**Cross-query consistency: 13/20** STs survive all 3 cycles.
+**Cross-query consistency: 14/20** STs survive all 3 cycles.
 
-**Queries failing cycle 2+ deterministically (9):**
+**Queries failing cycle 2+ deterministically (8):**
 
 | Query | Cycle 2 Error | Category |
 |-------|---------------|----------|
@@ -51,11 +51,10 @@ Q16, Q19, Q22 — pass all 3 cycles consistently across multiple runs.
 | Q03 | Data mismatch: FULL(46) != DIFF(46) — values differ | Aggregate drift |
 | Q04 | Data mismatch: FULL(5) != DIFF(5) — SemiJoin delta values differ | SemiJoin drift |
 | Q06 | Data mismatch cycle 3: FULL(1) != DIFF(1) — SUM drift accumulates | Aggregate drift |
-| Q13 | `column st.c_custkey does not exist` | MERGE column ref |
-| Q15 | `column st.l_suppkey does not exist` | MERGE column ref |
-| Q18 | `column "o_orderkey" does not exist` | Raw expr scope |
-| Q20 | `column "s_suppkey" does not exist` | SemiJoin column ref |
-| Q21 | `column dl.l1__l_orderkey does not exist` | Join alias scope |
+| Q13 | Data mismatch: FULL(3) != DIFF(2) — intermediate agg row count wrong | Intermediate agg |
+| Q15 | `column r.__pgs_scalar_1 does not exist` – scalar subquery snapshot missing column | Scalar subquery snapshot |
+| Q18 | Data mismatch: FULL(0) != DIFF(15) — SemiJoin IN loses GROUP BY/HAVING | SemiJoin parser |
+| Q21 | `column dl.l1__l_orderkey does not exist` — deep nested join disambiguation | Join alias scope |
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
 (`column "p_partkey" does not exist`).
@@ -66,10 +65,13 @@ Q16, Q19, Q22 — pass all 3 cycles consistently across multiple runs.
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_stream DVM does not support correlated scalar subqueries in WHERE |
 | **Cycle 2 — aggregate delta drift** | Q01, Q03, Q06 | Refresh succeeds but ST contents ≠ full query results (aggregate accumulation error — exact NUMERIC arithmetic, not floating point) |
-| **Cycle 2 — SemiJoin delta drift/error** | Q04, Q20 | SemiJoin delta produces incorrect values (Q04) or references non-existent columns (Q20: `s_suppkey` not resolved against CTE columns) |
-| **Cycle 2 — MERGE column ref** | Q13, Q15 | `column st.X does not exist` — MERGE template references unresolved column names for views with subqueries/CTEs |
-| **Cycle 2 — `Expr::Raw` column scope** | Q18 | `column "o_orderkey" does not exist` — `Expr::Raw` best-effort replacement doesn't resolve columns in filter predicates from comma-join WHERE |
-| **Cycle 2 — join alias in subquery** | Q21 | `column dl.l1__l_orderkey does not exist` — nested join child alias (`l1`) not resolved in EXISTS subquery delta |
+| **Cycle 2 — SemiJoin delta drift** | Q04 | SemiJoin delta passes cycle 1 but data mismatch in cycle 2 — OID extraction fixed, but SemiJoin delta formula produces incorrect results after mutations |
+| **Cycle 2 — intermediate aggregate drift** | Q13 | Intermediate aggregate (subquery-in-FROM + GROUP BY) produces incorrect row count after mutations. `build_intermediate_agg_delta` old/new rescan approach generates correct column names but the delta values diverge |
+| **Cycle 2 — scalar subquery snapshot** | Q15 | `column r.__pgs_scalar_1 does not exist` — the scalar subquery's CROSS JOIN rewrite places the scalar subquery as an InnerJoin child. `build_snapshot_sql` doesn't propagate the Project renaming through the snapshot, so the join delta references a non-existent column |
+| **Cycle 2 — SemiJoin IN parser limitation** | Q18 | `parse_any_sublink` doesn't preserve GROUP BY/HAVING from the inner SELECT of `o_orderkey IN (SELECT l_orderkey ... GROUP BY ... HAVING ...)`, making the SemiJoin match all rows instead of only qualifying groups |
+| **Cycle 2 — deep join alias disambiguation** | Q21 | `column dl.l1__l_orderkey does not exist` — the SemiJoin condition references a column (`l1.l_orderkey`) through deeply nested joins where disambiguation produces multi-level prefixes. `resolve_disambiguated_column` exists but doesn't activate for Q21's specific SemiJoin path |
+| ~~**Cycle 2 — SemiJoin column ref**~~ | ~~Q20~~ | ~~FIXED~~ — see "Resolved" section |
+| ~~**Cycle 2 — MERGE column ref**~~ | ~~Q13, Q15~~ | ~~PARTIALLY FIXED~~ — intermediate aggregate detection now bypasses stream table LEFT JOIN; Q13 progressed to data mismatch; Q15 progressed to scalar subquery snapshot error |
 | ~~**Cycle 2 — null `__pgs_count` violation**~~ | ~~Q06, Q19~~ | ~~FIXED~~ — COALESCE guards on `d.__ins_count`/`d.__del_count` in merge CTE |
 | ~~**Cycle 2 — aggregate GROUP BY leak**~~ | ~~Q14~~ | ~~FIXED~~ — `AggFunc::ComplexExpression` for nested-aggregate target expressions |
 | ~~**Cycle 2 — subquery OID leak**~~ | ~~Q04~~ | ~~FIXED~~ — `query_tree_walker_impl` for complete OID extraction (Q04 now reaches data mismatch) |
@@ -115,46 +117,65 @@ particularly when UPDATE mutations (D+I pairs) flow through a Filter node
 that sits between Scan and Aggregate.
 
 **Files to investigate:** `src/dvm/operators/scan.rs`, `src/dvm/operators/aggregate.rs`, `src/dvm/operators/filter.rs`
-**Impact:** Would fix Q01, Q03, Q06. Q04 (SemiJoin drift) may also benefit.
+**Impact:** Would fix Q01, Q03, Q06.
 
-#### Priority 2: Fix SemiJoin delta errors (2 queries)
+#### Priority 2: Fix scalar subquery snapshot (Q15)
 
-- **Q04**: SemiJoin delta passes cycle 1 but data mismatch in cycle 2 — the
-  OID extraction is fixed (lineitem now registered), but the SemiJoin delta
-  formula produces incorrect results after mutations.
-- **Q20**: `column "s_suppkey" does not exist` — SemiJoin delta references
-  `s_suppkey` which doesn't exist in the CTE column namespace. Column
-  resolution for SemiJoin delta's left-side snapshot is broken.
+Q15 creates and passes cycle 1 (FULL) but fails cycle 2 (DIFF) with
+`column r.__pgs_scalar_1 does not exist`. Root cause: the scalar subquery
+rewrite places the scalar subquery wrapper as a CROSS JOIN (InnerJoin) child.
+`build_snapshot_sql` for this subtree recurses through Project and Subquery
+nodes but loses the column renaming — the snapshot doesn't include the
+`__pgs_scalar_1` alias column.
 
-**Files to fix:** `src/dvm/operators/semi_join.rs`
-**Impact:** Would fix Q04, Q20
+Intermediate aggregate detection (`is_intermediate`) and
+`build_intermediate_agg_delta` work correctly for Q15's inner aggregates.
+The remaining issue is specifically in the snapshot column naming for the
+scalar subquery's CROSS JOIN child.
 
-#### Priority 3: Fix MERGE column references (2 queries)
+**Files to fix:** `src/dvm/operators/join_common.rs` (build_snapshot_sql for Project), `src/dvm/operators/scalar_subquery.rs`
+**Impact:** Would fix Q15
 
-Q13, Q15 fail with `column st.c_custkey does not exist` / `column st.l_suppkey
-does not exist`. The MERGE template's `st.{col}` references use the
-stream table's physical column names, but the view definition has subquery
-aliases or CTE aliases that produce different column names in the delta.
+#### Priority 3: Fix intermediate aggregate data mismatch (Q13)
 
-**Files to fix:** `src/refresh.rs` (MERGE template generation)
-**Impact:** Would fix Q13, Q15
+Q13 progressed from `column st.c_custkey does not exist` to a data mismatch
+(FULL=3, DIFF=2). The intermediate aggregate detection and
+`build_intermediate_agg_delta` function correctly handle the LeftJoin child
+(using `SELECT *` + EXCEPT ALL for positional column matching). However,
+the old/new rescan produces fewer rows than expected.
 
-#### Priority 4: Fix `Expr::Raw` / join alias column resolution (2 queries)
+Possible root cause: the EXCEPT ALL positional matching between `SELECT *`
+(raw column names) and delta columns (disambiguated names) produces correct
+SQL, but the LeftJoin delta might have different row semantics (outer join
+NULL padding) that affect the aggregate result.
 
-- **Q18**: `column "o_orderkey" does not exist` — filter predicate from
-  `WHERE o_orderkey IN (SELECT ...)` has `o_orderkey` in an `Expr::Raw` that
-  the best-effort replacement doesn't resolve against disambiguated child CTE
-  columns (the column is something like `orders__o_orderkey`).
-- **Q21**: `column dl.l1__l_orderkey does not exist` — the EXISTS subquery
-  delta references `dl.l1__l_orderkey` but the actual delta CTE column uses a
-  different disambiguation prefix.
+**Files to investigate:** `src/dvm/operators/aggregate.rs` (build_intermediate_agg_delta)
+**Impact:** Would fix Q13
 
-**Files to fix:** `src/dvm/operators/filter.rs`, `src/dvm/parser.rs`
-**Impact:** Would fix Q18, Q21
+#### Priority 4: Fix SemiJoin IN parser for GROUP BY/HAVING (Q18)
 
-#### Priority 5: Fix correlated scalar subquery support (2 queries)
+Q18 has `o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey
+HAVING SUM(l_quantity) > 300)`. `parse_any_sublink` extracts the inner SELECT
+but discards GROUP BY/HAVING, making the SemiJoin match all lineitem rows
+instead of only qualifying l_orderkey groups.
 
-Q02 and Q17 use correlated scalar subqueries in WHERE clauses.  The rewriter
+**Files to fix:** `src/dvm/parser.rs` (parse_any_sublink)
+**Impact:** Would fix Q18
+
+#### Priority 5: Fix deep join alias disambiguation (Q21)
+
+Q21 fails with `column dl.l1__l_orderkey does not exist`. The SemiJoin
+condition references `l1.l_orderkey` through a deeply nested join tree
+`((supplier ⋈ l1) ⋈ orders) ⋈ nation`. The `resolve_disambiguated_column`
+function exists but doesn't activate for Q21's specific SemiJoin condition
+rewriting path.
+
+**Files to fix:** `src/dvm/operators/join_common.rs`, `src/dvm/operators/semi_join.rs`
+**Impact:** Would fix Q21
+
+#### Priority 6: Fix correlated scalar subquery support (2 queries)
+
+Q02 and Q17 use correlated scalar subqueries in WHERE clauses. The rewriter
 cannot safely detect when a scalar subquery references outer columns via bare
 column names (no `table.` prefix), so it cannot apply the CROSS JOIN rewrite.
 Deeper DVM support (named correlation context) is needed.
@@ -171,6 +192,8 @@ Deeper DVM support (named correlation context) is needed.
 | P2 — Subquery OID leak | `extract_source_relations` only walked the outer query's rtable; EXISTS/IN subqueries in WHERE/HAVING are SubLink nodes in the expression tree, NOT RTE_SUBQUERY entries | Replaced manual `collect_relation_oids` with PostgreSQL's `query_tree_walker_impl` using `QTW_EXAMINE_RTES_BEFORE` flag + `expression_tree_walker_impl` for SubLink recursion | Q04 (OID check passes, now reaches data mismatch — separate SemiJoin drift bug) |
 | P2 — Aggregate GROUP BY leak | `expr_contains_agg` didn't recurse into A_Expr/CaseExpr; `extract_aggregates` only recognized top-level FuncCall. Q14's `100 * SUM(…) / CASE WHEN SUM(…) = 0 THEN NULL ELSE SUM(…) END` was not detected as an aggregate expression | Two fixes: (1) `expr_contains_agg` now uses `raw_expression_tree_walker_impl` for full recursion; (2) `extract_aggregates` creates `AggFunc::ComplexExpression(raw_sql)` for complex expressions wrapping nested aggregates — uses group-rescan strategy (re-evaluates from source on change) | Q14 (all 3 cycles pass) |
 | P1 — CDC lifecycle | Stale pending cleanup entries in thread-local `PENDING_CLEANUP` queue referenced change buffer tables dropped by a previous ST's cleanup; `Spi::run(DELETE ...)` on non-existent table longjmps past all Rust error handling | Three-part fix: (1) `refresh.rs`: added pg_class existence check in `drain_pending_cleanups` before DELETE/TRUNCATE; (2) `refresh.rs`: added `flush_pending_cleanups_for_oids` to remove stale entries; (3) `api.rs`: call `flush_pending_cleanups_for_oids` in `drop_stream_table_impl` before cleanup; also added OID mismatch diagnostic check in `execute_differential_refresh` | Q05, Q07, Q16, Q22 (4 queries stabilized from intermittent → pass) |
+| P2 — SemiJoin column ref | `column "s_suppkey" does not exist` — SemiJoin delta references unqualified column that's disambiguated in the join CTE | Added `find_column_source` + `resolve_disambiguated_column` in `rewrite_expr_for_join` for unqualified column refs, plus deep disambiguation for qualified refs through nested joins | Q20 (all 3 cycles pass) |
+| P3 — MERGE column ref (intermediate aggregate) | `column st.c_custkey does not exist` / `column st.l_suppkey does not exist` — intermediate aggregates (subquery-in-FROM) LEFT JOIN to stream table which doesn't have the intermediate columns | Added `is_intermediate` detection (checks group-by cols and aggregate aliases vs `st_user_columns`), `build_intermediate_agg_delta` with dual-rescan approach (old data via EXCEPT ALL/UNION ALL), `child_to_from_sql` for Aggregate/Subquery nodes, `build_snapshot_sql` for Aggregate nodes. Q13: column error → data mismatch; Q15: st column error → scalar subquery snapshot error | Q13 (partial), Q15 (partial) |
 | P1 (old) — column qualification | Multiple resolution functions returned bare column names instead of disambiguated CTE column names | Three-part fix: (1) `filter.rs`: added `resolve_predicate_for_child` with suffix matching and `Expr::Raw` best-effort replacement; (2) `join_common.rs`: added `snapshot_output_columns` to fix `build_join_snapshot` using raw names instead of disambiguated names, extended `rewrite_expr_for_join` for `Star`/`Literal`/`Raw`; (3) `aggregate.rs` + `project.rs`: added suffix matching for unqualified ColumnRef, switched agg arguments from `resolve_col_for_child` to `resolve_expr_for_child`, added `Expr::Raw` handling | Q05, Q07, Q08, Q09, Q10 (5 queries) |
 | P2 — EXISTS/COUNT* | `node_to_expr` dropped `agg_star`; `rewrite_sublinks_in_or` triggered on AND+EXISTS (no OR) | `agg_star` check + `and_contains_or_with_sublink()` guard | Q04, Q21 |
 | P5 — nested derived table | `from_item_to_sql` / `deparse_from_item` fell to `"?"` for `T_RangeSubselect` | Handle `T_RangeSubselect` in both deparse paths | Q15 |
