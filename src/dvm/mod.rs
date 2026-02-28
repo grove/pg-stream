@@ -398,9 +398,8 @@ pub fn extract_group_by_columns(defining_query: &str) -> Option<Vec<String>> {
 /// Falls back to `pgstream.pg_stream_hash(row_to_json(sub)::text)` for queries whose
 /// row-id computation is too complex (joins, union all).
 pub fn row_id_expr_for_query(defining_query: &str) -> String {
-    let key_cols = parse_defining_query(defining_query)
-        .ok()
-        .and_then(|tree| tree.row_id_key_columns());
+    let tree = parse_defining_query(defining_query).ok();
+    let key_cols = tree.as_ref().and_then(|t| t.row_id_key_columns());
 
     match key_cols {
         Some(cols) if cols.len() == 1 => {
@@ -420,13 +419,35 @@ pub fn row_id_expr_for_query(defining_query: &str) -> String {
             )
         }
         _ => {
-            // Fallback for complex queries (joins, union all, scalar aggregates, etc.)
-            // Include row_number() to disambiguate duplicate-content rows
-            // (e.g., recursive CTEs with UNION ALL that reach the same
-            // values via different derivation paths).
-            "pgstream.pg_stream_hash(row_to_json(sub)::text || '/' || row_number() OVER ()::text)"
-                .to_string()
+            // Scalar aggregate (no GROUP BY): use singleton sentinel hash
+            // matching the differential delta's __singleton_group row_id.
+            // Without this, FULL refresh would use row_to_json hashing
+            // while DIFF uses '__singleton_group', causing __pgs_row_id
+            // mismatch and phantom row insertion.
+            if tree.as_ref().is_some_and(is_scalar_aggregate_root) {
+                "pgstream.pg_stream_hash('__singleton_group')".to_string()
+            } else {
+                // Fallback for complex queries (joins, union all, etc.)
+                // Include row_number() to disambiguate duplicate-content rows
+                // (e.g., recursive CTEs with UNION ALL that reach the same
+                // values via different derivation paths).
+                "pgstream.pg_stream_hash(row_to_json(sub)::text || '/' || row_number() OVER ()::text)"
+                    .to_string()
+            }
         }
+    }
+}
+
+/// Check whether the root of an OpTree is a scalar aggregate (GROUP BY
+/// with no columns). Looks through transparent wrappers (Filter, Project,
+/// Subquery) to find the Aggregate node.
+fn is_scalar_aggregate_root(tree: &parser::OpTree) -> bool {
+    match tree {
+        parser::OpTree::Aggregate { group_by, .. } => group_by.is_empty(),
+        parser::OpTree::Filter { child, .. }
+        | parser::OpTree::Project { child, .. }
+        | parser::OpTree::Subquery { child, .. } => is_scalar_aggregate_root(child),
+        _ => false,
     }
 }
 
@@ -854,5 +875,45 @@ mod tests {
     fn test_needs_pgs_count_scan_false() {
         let s = scan(1, "t", "public", "t", &["id"]);
         assert!(!s.needs_pgs_count());
+    }
+
+    // ── is_scalar_aggregate_root() ─────────────────────────────────
+
+    #[test]
+    fn test_scalar_aggregate_root_bare() {
+        let s = scan(1, "t", "public", "t", &["id", "amount"]);
+        let agg = aggregate(vec![], vec![sum_col("amount", "total")], s);
+        assert!(is_scalar_aggregate_root(&agg));
+    }
+
+    #[test]
+    fn test_scalar_aggregate_root_with_filter() {
+        let s = scan(1, "t", "public", "t", &["id", "amount"]);
+        let f = filter(binop(">", colref("amount"), lit("0")), s);
+        let agg = aggregate(vec![], vec![sum_col("amount", "total")], f);
+        // Aggregate is root, Filter is child — scalar agg root should be true
+        assert!(is_scalar_aggregate_root(&agg));
+    }
+
+    #[test]
+    fn test_scalar_aggregate_root_through_project() {
+        let s = scan(1, "t", "public", "t", &["id", "amount"]);
+        let agg = aggregate(vec![], vec![sum_col("amount", "total")], s);
+        let p = project(vec![colref("total")], vec!["revenue"], agg);
+        // Project wraps the Aggregate — should see through
+        assert!(is_scalar_aggregate_root(&p));
+    }
+
+    #[test]
+    fn test_not_scalar_aggregate_with_group_by() {
+        let s = scan(1, "t", "public", "t", &["id", "amount"]);
+        let agg = aggregate(vec![colref("id")], vec![sum_col("amount", "total")], s);
+        assert!(!is_scalar_aggregate_root(&agg));
+    }
+
+    #[test]
+    fn test_not_scalar_aggregate_scan() {
+        let s = scan(1, "t", "public", "t", &["id"]);
+        assert!(!is_scalar_aggregate_root(&s));
     }
 }

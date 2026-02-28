@@ -135,20 +135,27 @@ fn resolve_expr_to_child(expr: &Expr, child_cols: &[String]) -> String {
             let disambiguated = format!("{tbl}__{column_name}");
             if child_cols.contains(&disambiguated) {
                 quote_ident(&disambiguated)
-            } else if child_cols.contains(column_name) {
-                // No disambiguation needed — column name is unique
-                quote_ident(column_name)
-            } else if child_cols.contains(tbl) && !child_cols.contains(column_name) {
-                // The "table" is actually a column in the child CTE — this
-                // happens with LATERAL SRF aliases (e.g., `e.value` where
-                // `e` is a single-column SRF output stored as column "e"
-                // in the child CTE). Resolve to the column name directly;
-                // for SRFs like jsonb_array_elements, `"e"` already holds
-                // the unwrapped value.
-                quote_ident(tbl)
             } else {
-                // Fallback: use original qualified form
-                expr.to_sql()
+                // Try nested join prefix: *__tbl__col
+                let nested_suffix = format!("__{tbl}__{column_name}");
+                let nested_match = child_cols.iter().find(|c| c.ends_with(&nested_suffix));
+                if let Some(found) = nested_match {
+                    quote_ident(found)
+                } else if child_cols.contains(column_name) {
+                    // No disambiguation needed — column name is unique
+                    quote_ident(column_name)
+                } else if child_cols.contains(tbl) && !child_cols.contains(column_name) {
+                    // The "table" is actually a column in the child CTE — this
+                    // happens with LATERAL SRF aliases (e.g., `e.value` where
+                    // `e` is a single-column SRF output stored as column "e"
+                    // in the child CTE). Resolve to the column name directly;
+                    // for SRFs like jsonb_array_elements, `"e"` already holds
+                    // the unwrapped value.
+                    quote_ident(tbl)
+                } else {
+                    // Fallback: use original qualified form
+                    expr.to_sql()
+                }
             }
         }
         Expr::ColumnRef {
@@ -158,7 +165,15 @@ fn resolve_expr_to_child(expr: &Expr, child_cols: &[String]) -> String {
             if child_cols.contains(column_name) {
                 quote_ident(column_name)
             } else {
-                expr.to_sql()
+                // Suffix match: find column ending in __column_name
+                let suffix = format!("__{column_name}");
+                let matches: Vec<&String> =
+                    child_cols.iter().filter(|c| c.ends_with(&suffix)).collect();
+                if matches.len() == 1 {
+                    quote_ident(matches[0])
+                } else {
+                    expr.to_sql()
+                }
             }
         }
         Expr::BinaryOp { op, left, right } => {
@@ -172,6 +187,10 @@ fn resolve_expr_to_child(expr: &Expr, child_cols: &[String]) -> String {
                 .map(|a| resolve_expr_to_child(a, child_cols))
                 .collect();
             format!("{}({})", func_name, resolved_args.join(", "))
+        }
+        Expr::Raw(sql) => {
+            // Best-effort: replace column refs in raw SQL
+            crate::dvm::operators::filter::replace_column_refs_in_raw(sql, child_cols)
         }
         _ => expr.to_sql(),
     }

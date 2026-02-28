@@ -213,6 +213,16 @@ pub enum AggFunc {
     RegrSxx,
     RegrSxy,
     RegrSyy,
+    /// Complex expression wrapping multiple aggregate calls.
+    ///
+    /// Created when a SELECT target is an arithmetic or conditional expression
+    /// containing nested aggregate function calls, e.g.:
+    ///   `100 * SUM(a) / CASE WHEN SUM(b) = 0 THEN NULL ELSE SUM(b) END`
+    ///
+    /// Stores the fully deparsed SQL of the entire expression (including the
+    /// nested aggregate calls). Uses the group-rescan strategy: any change in
+    /// the group triggers full re-evaluation of the expression from source data.
+    ComplexExpression(String),
 }
 
 impl AggFunc {
@@ -257,15 +267,22 @@ impl AggFunc {
             AggFunc::RegrSxx => "REGR_SXX",
             AggFunc::RegrSxy => "REGR_SXY",
             AggFunc::RegrSyy => "REGR_SYY",
+            AggFunc::ComplexExpression(_) => "COMPLEX_EXPRESSION",
         }
     }
 
     /// Returns true for aggregates that use the group-rescan strategy:
     /// any change in a group triggers full re-aggregation from source data.
+    ///
+    /// AVG uses group-rescan because the algebraic formula
+    /// `old_avg * old_count + delta_sum` loses precision: NUMERIC division
+    /// in PostgreSQL rounds AVG results, so reconstructing the original SUM
+    /// from `AVG * COUNT` is lossy, causing drift across refresh cycles.
     pub fn is_group_rescan(&self) -> bool {
         matches!(
             self,
-            AggFunc::BoolAnd
+            AggFunc::Avg
+                | AggFunc::BoolAnd
                 | AggFunc::BoolOr
                 | AggFunc::StringAgg
                 | AggFunc::ArrayAgg
@@ -298,6 +315,7 @@ impl AggFunc {
                 | AggFunc::RegrSxx
                 | AggFunc::RegrSxy
                 | AggFunc::RegrSyy
+                | AggFunc::ComplexExpression(_)
         )
     }
 }
@@ -2085,7 +2103,8 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgStreamError> {
                     | AggFunc::RegrSlope
                     | AggFunc::RegrSxx
                     | AggFunc::RegrSxy
-                    | AggFunc::RegrSyy => {}
+                    | AggFunc::RegrSyy
+                    | AggFunc::ComplexExpression(_) => {}
                 }
             }
             check_ivm_support(child)
@@ -3875,26 +3894,42 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamE
 
     // Check for correlated subqueries — skip rewriting those (they reference
     // outer columns and can't be trivially cross-joined).
-    // For simplicity, we check if the subquery's FROM clause references tables
-    // that are also in the outer FROM clause. A more precise check would be
-    // to look for column references to outer tables, but this is a good heuristic.
-    // Actually, we'll just always rewrite — uncorrelated scalar subqueries are
-    // the common case, and correlated ones will produce valid SQL that the
-    // DVM parser can further reject if needed.
+    // Detect correlation by checking if the subquery's WHERE references
+    // column names from tables in the outer FROM clause.
+    let outer_tables = unsafe { collect_from_clause_table_names(select) };
+    let non_correlated: Vec<&ScalarSubqueryExtract> = scalar_subqueries
+        .iter()
+        .filter(|sq| !sq.is_correlated(&outer_tables))
+        .collect();
+
+    if non_correlated.is_empty() {
+        return Ok(query.to_string());
+    }
 
     // ── Build rewritten query components ─────────────────────────────
 
     // FROM clause
     let from_sql = extract_from_clause_sql(select)?;
 
-    // Build CROSS JOIN additions for each scalar subquery
+    // Build CROSS JOIN additions for each non-correlated scalar subquery.
+    // The wrapper SELECT uses the original scalar subquery as a derived table
+    // in its FROM clause, so the DVM parser (which requires FROM) can handle it.
+    //
+    // Format: CROSS JOIN (SELECT v."c" AS "scalar_alias"
+    //                      FROM (inner_sql) AS v("c")) AS "sq_alias"
     let mut cross_joins: Vec<String> = Vec::new();
-    for (i, sq) in scalar_subqueries.iter().enumerate() {
+    for (i, sq) in non_correlated.iter().enumerate() {
         let idx = i + 1;
         let sq_alias = format!("__pgs_sq_{idx}");
         let scalar_alias = format!("__pgs_scalar_{idx}");
+        let inner_alias = format!("__pgs_v_{idx}");
+        let inner_col = format!("__pgs_c_{idx}");
+        // The inner scalar subquery returns exactly 1 column and 1 row.
+        // We wrap it so the DVM parser sees a subquery with a valid FROM clause:
+        //   (SELECT v."c" AS "scalar" FROM (original_subquery) AS v("c")) AS "sq"
         cross_joins.push(format!(
-            "CROSS JOIN ({sq_sql} AS \"{scalar_alias}\") AS \"{sq_alias}\"",
+            "CROSS JOIN (SELECT \"{inner_alias}\".\"{inner_col}\" AS \"{scalar_alias}\" \
+             FROM ({sq_sql}) AS \"{inner_alias}\"(\"{inner_col}\")) AS \"{sq_alias}\"",
             sq_sql = sq.subquery_sql,
         ));
     }
@@ -3906,7 +3941,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamE
         .unwrap_or_else(|_| "TRUE".to_string());
 
     let mut rewritten_where = where_expr;
-    for (i, sq) in scalar_subqueries.iter().enumerate() {
+    for (i, sq) in non_correlated.iter().enumerate() {
         let idx = i + 1;
         let sq_alias = format!("__pgs_sq_{idx}");
         let scalar_alias = format!("__pgs_scalar_{idx}");
@@ -4040,6 +4075,114 @@ struct ScalarSubqueryExtract {
     /// The expression as rendered by `node_to_expr().to_sql()` for text replacement.
     /// e.g. `(SELECT avg("amount") FROM "orders")`
     expr_sql: String,
+    /// Table names referenced in the subquery's FROM clause (lowercase).
+    inner_tables: Vec<String>,
+}
+
+impl ScalarSubqueryExtract {
+    /// Check if this scalar subquery is correlated with the outer query.
+    ///
+    /// A subquery is considered correlated if its SQL text references any
+    /// column that could come from an outer table. We use a heuristic:
+    /// if the subquery SQL contains a table name from the outer FROM clause
+    /// (as part of a column reference like `t.col` or a bare column matching
+    /// the outer table names), we treat it as potentially correlated.
+    fn is_correlated(&self, outer_tables: &[String]) -> bool {
+        let sq_lower = self.subquery_sql.to_lowercase();
+        for outer_table in outer_tables {
+            // Skip tables that also appear in the inner FROM clause —
+            // those are legitimate inner references, not correlations.
+            if self.inner_tables.contains(outer_table) {
+                continue;
+            }
+            // Check if the outer table name appears as a qualified column
+            // reference prefix (e.g., "p_partkey" where "p" is from the
+            // subquery text referencing an outer table alias like "part").
+            // Heuristic: if any word in the subquery text matches an outer
+            // table/alias name in a dot-qualified position, it's correlated.
+            //
+            // Simpler heuristic: subqueries that share table names with
+            // the outer FROM clause are very likely correlated if the
+            // shared table is NOT in the inner FROM clause.
+            // For now, just check if the outer table name appears as a
+            // word boundary in the subquery SQL.
+            let pattern = format!("{}.", outer_table);
+            if sq_lower.contains(&pattern) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Collect table names (and aliases) from a SelectStmt's FROM clause.
+///
+/// Returns lowercased table names and alias names for correlation detection.
+///
+/// # Safety
+/// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
+unsafe fn collect_from_clause_table_names(select: &pg_sys::SelectStmt) -> Vec<String> {
+    let mut names = Vec::new();
+    if select.fromClause.is_null() {
+        return names;
+    }
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    for node_ptr in from_list.iter_ptr() {
+        if !node_ptr.is_null() {
+            unsafe { collect_table_names_from_node(node_ptr, &mut names) };
+        }
+    }
+    names
+}
+
+/// Recursively collect table names and aliases from a FROM item node.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn collect_table_names_from_node(node: *mut pg_sys::Node, out: &mut Vec<String>) {
+    if node.is_null() {
+        return;
+    }
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
+        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+        if !rv.relname.is_null()
+            && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(rv.relname) }.to_str()
+        {
+            out.push(s.to_lowercase());
+        }
+        if !rv.alias.is_null() {
+            let a = unsafe { &*(rv.alias) };
+            if !a.aliasname.is_null()
+                && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }.to_str()
+            {
+                let lower = s.to_lowercase();
+                if !out.contains(&lower) {
+                    out.push(lower);
+                }
+            }
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        if !join.larg.is_null() {
+            unsafe { collect_table_names_from_node(join.larg, out) };
+        }
+        if !join.rarg.is_null() {
+            unsafe { collect_table_names_from_node(join.rarg, out) };
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if !sub.alias.is_null() {
+            let a = unsafe { &*(sub.alias) };
+            if !a.aliasname.is_null()
+                && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }.to_str()
+            {
+                let lower = s.to_lowercase();
+                if !out.contains(&lower) {
+                    out.push(lower);
+                }
+            }
+        }
+    }
 }
 
 /// Recursively collect EXPR_SUBLINK nodes from a WHERE clause tree.
@@ -4061,9 +4204,22 @@ unsafe fn collect_scalar_sublinks_in_where(
             if !sublink.subselect.is_null() {
                 let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
                 let expr_sql = format!("({inner_sql})");
+
+                // Collect table names from the subquery's FROM clause
+                // for correlation detection.
+                let inner_tables =
+                    if unsafe { pgrx::is_a(sublink.subselect, pg_sys::NodeTag::T_SelectStmt) } {
+                        let inner_select =
+                            unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
+                        unsafe { collect_from_clause_table_names(inner_select) }
+                    } else {
+                        Vec::new()
+                    };
+
                 out.push(ScalarSubqueryExtract {
                     subquery_sql: inner_sql,
                     expr_sql,
+                    inner_tables,
                 });
             }
         }
@@ -4169,11 +4325,13 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgStreamError> {
     // Only handle top-level OR, or AND where one of the conjuncts is an OR with sublinks
     if boolexpr.boolop != pg_sys::BoolExprType::OR_EXPR {
         // Check for AND with an inner OR containing sublinks.
-        // Guard: only enter the AND rewriter if the WHERE actually
-        // contains SubLink nodes, otherwise the deparse fallback
-        // drops WITH clauses and other top-level syntax.
+        // Guard: only enter the AND rewriter if there is actually an
+        // OR conjunct containing SubLink nodes. Without this check,
+        // queries like Q04 (AND + EXISTS, no OR) would be unnecessarily
+        // deparsed and round-tripped through node_to_expr, losing
+        // information like agg_star on COUNT(*).
         if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR
-            && unsafe { node_tree_contains_sublink(select.whereClause) }
+            && unsafe { and_contains_or_with_sublink(select.whereClause) }
         {
             return rewrite_and_with_or_sublinks(select, boolexpr);
         }
@@ -4902,9 +5060,33 @@ unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgStreamEr
             format!(" ON {}", cond.to_sql())
         };
         Ok(format!("{left} {join_type} {right}{on_clause}"))
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        // Derived table / inline subquery in FROM: (SELECT ...) AS alias
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if sub.subquery.is_null()
+            || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            return Ok("?".to_string());
+        }
+        let inner_sql = unsafe { deparse_select_to_sql(sub.subquery)? };
+        let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
+        let mut result = format!("{lateral_kw}({inner_sql})");
+        if !sub.alias.is_null() {
+            let a = unsafe { &*(sub.alias) };
+            if !a.aliasname.is_null() {
+                let alias = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                    .to_str()
+                    .unwrap_or("?");
+                result.push_str(&format!(" AS \"{}\"", alias.replace('"', "\"\"")));
+            }
+        }
+        Ok(result)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
+        // Function in FROM — use fallback deparser
+        unsafe { deparse_from_item_to_sql(node) }
     } else {
-        // Fallback for subselects and other FROM items
-        Ok("?".to_string())
+        // Fallback for other FROM items
+        unsafe { deparse_from_item_to_sql(node) }
     }
 }
 
@@ -5292,6 +5474,44 @@ unsafe fn node_tree_contains_sublink(node: *mut pg_sys::Node) -> bool {
     false
 }
 
+/// Check if an AND expression contains at least one OR conjunct that itself
+/// contains SubLink nodes. This is stricter than `node_tree_contains_sublink`
+/// which returns true for AND + EXISTS (no OR), causing unnecessary deparsing.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        return false;
+    }
+    let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
+    if boolexpr.boolop != pg_sys::BoolExprType::AND_EXPR {
+        return false;
+    }
+    if boolexpr.args.is_null() {
+        return false;
+    }
+    let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
+    for arg_ptr in args.iter_ptr() {
+        if arg_ptr.is_null() {
+            continue;
+        }
+        // We're looking for an OR conjunct that contains SubLink nodes
+        if unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_BoolExpr) } {
+            let inner = unsafe { &*(arg_ptr as *const pg_sys::BoolExpr) };
+            if inner.boolop == pg_sys::BoolExprType::OR_EXPR
+                && unsafe { node_tree_contains_sublink(arg_ptr) }
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Deparse a SelectStmt (or Node) back to SQL text.
 ///
 /// Uses PostgreSQL's `nodeToString()` for a basic representation, then
@@ -5434,6 +5654,27 @@ unsafe fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgStreamE
             sql.push_str(&format!(" ON {}", quals.to_sql()));
         }
         Ok(sql)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        // Derived table / inline subquery in FROM: (SELECT ...) AS alias
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if sub.subquery.is_null()
+            || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            return Ok("/* unsupported RangeSubselect */".to_string());
+        }
+        let inner_sql = unsafe { deparse_select_to_sql(sub.subquery)? };
+        let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
+        let mut result = format!("{lateral_kw}({inner_sql})");
+        if !sub.alias.is_null() {
+            let a = unsafe { &*(sub.alias) };
+            if !a.aliasname.is_null() {
+                let alias = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                    .to_str()
+                    .unwrap_or("?");
+                result.push_str(&format!(" \"{}\"", alias.replace('"', "\"\"")));
+            }
+        }
+        Ok(result)
     } else {
         // Fallback: use a placeholder
         Ok("/* unsupported FROM item */".to_string())
@@ -5550,6 +5791,13 @@ unsafe fn parse_exists_sublink(
 /// is equivalent to:
 /// `EXISTS (SELECT 1 FROM inner_table WHERE inner_table.col = x AND filter)`
 ///
+/// When the inner SELECT has GROUP BY / HAVING, the inner tree is wrapped
+/// in an Aggregate (+ HAVING Filter) so the SemiJoin only matches qualifying
+/// groups:
+/// `x IN (SELECT col FROM T GROUP BY col HAVING agg > threshold)`
+/// → SemiJoin(cond = x = sub.col,
+///            inner = Subquery(Filter(HAVING, Aggregate(GROUP BY col, child=T))))
+///
 /// # Safety
 /// Caller must ensure `sublink` points to a valid `pg_sys::SubLink`.
 unsafe fn parse_any_sublink(
@@ -5617,6 +5865,98 @@ unsafe fn parse_any_sublink(
         ));
     };
 
+    // ── GROUP BY / HAVING handling ──────────────────────────────────
+    //
+    // When the inner SELECT has GROUP BY or HAVING, the flat SemiJoin
+    // rewrite would lose the grouping semantics. Instead, wrap the inner
+    // tree in Aggregate + Filter(HAVING) so only qualifying groups are
+    // considered for the semi-join match.
+    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.groupClause) };
+    let has_group_by = !group_list.is_empty();
+    let has_having = !inner_select.havingClause.is_null();
+
+    if has_group_by || has_having {
+        // Apply inner WHERE as a Filter on the FROM tree
+        if !inner_select.whereClause.is_null() {
+            let inner_where = unsafe { node_to_expr(inner_select.whereClause)? };
+            inner_tree = OpTree::Filter {
+                predicate: inner_where,
+                child: Box::new(inner_tree),
+            };
+        }
+
+        // Parse GROUP BY expressions
+        let mut group_by = Vec::new();
+        for node_ptr in group_list.iter_ptr() {
+            let expr = unsafe { node_to_expr(node_ptr)? };
+            group_by.push(expr);
+        }
+
+        // Extract aggregates from the target list
+        let (mut aggregates, _non_agg_exprs) = unsafe { extract_aggregates(&target_list)? };
+
+        // Extract additional aggregates from HAVING expression.
+        // The HAVING clause may reference aggregates not present in the
+        // SELECT list (e.g., `SELECT col FROM T GROUP BY col HAVING SUM(x) > 0`).
+        if has_having {
+            let having_expr = unsafe { node_to_expr(inner_select.havingClause)? };
+            let having_aggs = extract_aggregates_from_expr(&having_expr, aggregates.len());
+            for ha in &having_aggs {
+                // Avoid duplicates: only add if no existing aggregate matches
+                let already_present = aggregates.iter().any(|a| {
+                    a.function.sql_name() == ha.function.sql_name()
+                        && a.argument.as_ref().map(|e| e.to_sql())
+                            == ha.argument.as_ref().map(|e| e.to_sql())
+                });
+                if !already_present {
+                    aggregates.push(ha.clone());
+                }
+            }
+        }
+
+        // Build Aggregate node
+        inner_tree = OpTree::Aggregate {
+            group_by,
+            aggregates: aggregates.clone(),
+            child: Box::new(inner_tree),
+        };
+
+        // Apply HAVING as Filter on top of Aggregate
+        if has_having {
+            let having_expr = unsafe { node_to_expr(inner_select.havingClause)? };
+            let rewritten = rewrite_having_expr(&having_expr, &aggregates);
+            inner_tree = OpTree::Filter {
+                predicate: rewritten,
+                child: Box::new(inner_tree),
+            };
+        }
+
+        // Wrap in Subquery so the SemiJoin treats it as a derived table
+        let sub_alias = format!("__pgs_in_sub_{}", inner_tree.alias());
+        inner_tree = OpTree::Subquery {
+            alias: sub_alias,
+            column_aliases: Vec::new(),
+            child: Box::new(inner_tree),
+        };
+
+        // Build the equality condition using the output column name.
+        // The inner_col_expr (from the SELECT list) is a group-by column
+        // that passes through Aggregate → Filter → Subquery.
+        let equality = Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(test_expr),
+            right: Box::new(inner_col_expr),
+        };
+
+        return Ok(SublinkWrapper {
+            negated,
+            condition: equality,
+            inner_tree,
+        });
+    }
+
+    // ── Simple case: no GROUP BY / HAVING ───────────────────────────
+
     // Build the equality condition: test_expr = inner_col_expr
     let equality = Expr::BinaryOp {
         op: "=".to_string(),
@@ -5641,6 +5981,62 @@ unsafe fn parse_any_sublink(
         condition,
         inner_tree,
     })
+}
+
+/// Extract aggregate function calls from an expression tree.
+///
+/// Used to find aggregates in HAVING clauses that may not appear in the
+/// SELECT target list. Each discovered aggregate is assigned a unique alias
+/// `__pgs_having_{N}` where N starts from `start_idx`.
+fn extract_aggregates_from_expr(expr: &Expr, start_idx: usize) -> Vec<AggExpr> {
+    let mut result = Vec::new();
+    extract_aggregates_from_expr_inner(expr, start_idx, &mut result);
+    result
+}
+
+fn extract_aggregates_from_expr_inner(expr: &Expr, start_idx: usize, out: &mut Vec<AggExpr>) {
+    match expr {
+        Expr::FuncCall { func_name, args } => {
+            let name_lower = func_name.to_lowercase();
+            let agg_func = match name_lower.as_str() {
+                "count" => {
+                    if args.is_empty() {
+                        Some(AggFunc::CountStar)
+                    } else {
+                        Some(AggFunc::Count)
+                    }
+                }
+                "sum" => Some(AggFunc::Sum),
+                "avg" => Some(AggFunc::Avg),
+                "min" => Some(AggFunc::Min),
+                "max" => Some(AggFunc::Max),
+                _ => None,
+            };
+            if let Some(func) = agg_func {
+                let argument = args.first().cloned();
+                let alias = format!("__pgs_having_{}", start_idx + out.len());
+                out.push(AggExpr {
+                    function: func,
+                    argument,
+                    alias,
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                });
+            } else {
+                // Non-aggregate FuncCall: recurse into arguments
+                for arg in args {
+                    extract_aggregates_from_expr_inner(arg, start_idx, out);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_aggregates_from_expr_inner(left, start_idx, out);
+            extract_aggregates_from_expr_inner(right, start_idx, out);
+        }
+        _ => {}
+    }
 }
 
 /// Parse an ALL SubLink (`x op ALL (SELECT col FROM ...)`) into a SublinkWrapper.
@@ -6230,11 +6626,52 @@ unsafe fn parse_select_stmt(
         let (aggregates, non_agg_exprs) = unsafe { extract_aggregates(&target_list)? };
         let _ = non_agg_exprs;
 
+        // ── Step 3a2: Check for SELECT alias renames on GROUP BY cols ───
+        // When the SELECT list renames a GROUP BY column (e.g.,
+        // `SELECT l_suppkey AS supplier_no, SUM(...) AS total_revenue
+        //  GROUP BY l_suppkey`), the Aggregate's output uses the raw
+        // expression name (l_suppkey), losing the alias. Detect renames
+        // BEFORE moving group_by into the Aggregate.
+        let (target_exprs, target_aliases) = unsafe { parse_target_list(&target_list)? };
+        let mut rename_map = std::collections::HashMap::<usize, String>::new();
+        for (i, gb_expr) in group_by.iter().enumerate() {
+            let gb_sql = gb_expr.to_sql();
+            let gb_output = gb_expr.output_name();
+            for (te, ta) in target_exprs.iter().zip(target_aliases.iter()) {
+                if te.to_sql() == gb_sql && ta != &gb_output {
+                    rename_map.insert(i, ta.clone());
+                    break;
+                }
+            }
+        }
+
         tree = OpTree::Aggregate {
             group_by,
             aggregates: aggregates.clone(),
             child: Box::new(tree),
         };
+
+        // Add a Project wrapper if any GROUP BY column needs renaming.
+        if !rename_map.is_empty() {
+            let agg_output = tree.output_columns();
+            let proj_exprs: Vec<Expr> = agg_output
+                .iter()
+                .map(|name| Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: name.clone(),
+                })
+                .collect();
+            let proj_aliases: Vec<String> = agg_output
+                .iter()
+                .enumerate()
+                .map(|(i, name)| rename_map.get(&i).cloned().unwrap_or_else(|| name.clone()))
+                .collect();
+            tree = OpTree::Project {
+                expressions: proj_exprs,
+                aliases: proj_aliases,
+                child: Box::new(tree),
+            };
+        }
 
         // ── Step 3b: Parse HAVING clause as Filter on top of Aggregate ──
         if !select.havingClause.is_null() {
@@ -7321,6 +7758,17 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
         let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
         let func_name = unsafe { extract_func_name(fcall.funcname)? };
+
+        // Handle COUNT(*) and other agg_star calls.
+        // PostgreSQL represents COUNT(*) as FuncCall { agg_star: true, args: [] }.
+        // We must emit the "*" explicitly so to_sql() produces COUNT(*) not COUNT().
+        if fcall.agg_star {
+            return Ok(Expr::FuncCall {
+                func_name,
+                args: vec![Expr::Raw("*".to_string())],
+            });
+        }
+
         let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
         let mut args = Vec::new();
         for n in args_list.iter_ptr() {
@@ -9096,13 +9544,14 @@ unsafe fn target_list_has_aggregates(target_list: &pgrx::PgList<pg_sys::Node>) -
     false
 }
 
-/// Recursively check if a node contains an aggregate function call.
-unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
+/// Check if a single raw-parse-tree node is an aggregate function call.
+///
+/// Does NOT recurse — only checks the immediate node.
+unsafe fn is_agg_node(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
     }
-    // SQL/JSON standard aggregates: T_JsonObjectAgg and T_JsonArrayAgg
-    // are always aggregate expressions (they aggregate rows).
+    // SQL/JSON standard aggregates
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectAgg) }
         || unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayAgg) }
     {
@@ -9125,12 +9574,53 @@ unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
             }
         }
     }
-    // Check inside TypeCast: CAST(SUM(x) AS int)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
-        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
-        return unsafe { expr_contains_agg(tc.arg) };
-    }
     false
+}
+
+/// Walker callback for [`expr_contains_agg`].
+///
+/// Returns `true` (stop walking) when a node is detected as an aggregate,
+/// `false` to continue. Recursion into children is handled by
+/// `raw_expression_tree_walker_impl`.
+///
+/// # Safety
+/// Called by PostgreSQL's `raw_expression_tree_walker_impl` with valid
+/// raw parse tree node pointers.
+unsafe extern "C-unwind" fn agg_check_walker(
+    node: *mut pg_sys::Node,
+    _context: *mut std::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if unsafe { is_agg_node(node) } {
+        return true; // found aggregate — stop walking
+    }
+    // Continue recursion into children.
+    // SAFETY: raw_expression_tree_walker_impl handles all raw parse tree
+    // node types (A_Expr, CaseExpr, BoolExpr, FuncCall, TypeCast, etc.).
+    unsafe {
+        pg_sys::raw_expression_tree_walker_impl(node, Some(agg_check_walker), std::ptr::null_mut())
+    }
+}
+
+/// Recursively check if a raw parse tree node contains an aggregate
+/// function call, anywhere in its expression subtree.
+///
+/// Uses PostgreSQL's `raw_expression_tree_walker_impl` for correct
+/// recursion into all node types (A_Expr, CaseExpr, BoolExpr, etc.).
+unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    // Check the node itself first.
+    if unsafe { is_agg_node(node) } {
+        return true;
+    }
+    // Recurse into children.
+    unsafe {
+        pg_sys::raw_expression_tree_walker_impl(node, Some(agg_check_walker), std::ptr::null_mut())
+    }
 }
 
 /// Check if a function name is a user-defined aggregate via `pg_proc.prokind`.
@@ -9441,8 +9931,36 @@ unsafe fn extract_aggregates(
                 order_within_group: None,
             });
         } else {
-            let expr = unsafe { node_to_expr(rt.val)? };
-            non_aggs.push(expr);
+            // Not a top-level aggregate function call.
+            // Check if the expression CONTAINS nested aggregate calls
+            // (e.g., `100 * SUM(a) / NULLIF(SUM(b), 0)`).
+            if unsafe { expr_contains_agg(rt.val) } {
+                // Deparse the entire expression to SQL for the rescan CTE.
+                let raw_expr = unsafe { node_to_expr(rt.val)? };
+                let raw_sql = raw_expr.to_sql();
+
+                let alias = if !rt.name.is_null() {
+                    unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                        .to_str()
+                        .unwrap_or("complex_agg")
+                        .to_string()
+                } else {
+                    format!("complex_agg_{}", aggs.len())
+                };
+
+                aggs.push(AggExpr {
+                    function: AggFunc::ComplexExpression(raw_sql),
+                    argument: None,
+                    alias,
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                });
+            } else {
+                let expr = unsafe { node_to_expr(rt.val)? };
+                non_aggs.push(expr);
+            }
         }
     }
 
@@ -13022,6 +13540,7 @@ mod tests {
         let extract = ScalarSubqueryExtract {
             subquery_sql: "SELECT avg(amount) FROM orders".to_string(),
             expr_sql: "(SELECT avg(\"amount\") FROM \"orders\")".to_string(),
+            inner_tables: vec!["orders".to_string()],
         };
         assert!(extract.subquery_sql.contains("avg"));
         assert!(extract.expr_sql.starts_with('('));
