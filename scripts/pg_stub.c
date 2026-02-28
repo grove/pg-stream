@@ -43,6 +43,9 @@ void *TopTransactionContext     = NULL;
 void *error_context_stack       = NULL;
 void *PG_exception_stack        = NULL;
 
+/* ── Memory allocation functions ──────────────────────────────────────── */
+void *palloc0(size_t size)                      { (void)size; return NULL; }
+
 /* ── MemoryContext functions ──────────────────────────────────────────── */
 void *AllocSetContextCreateInternal(void *parent, const char *name,
                                     size_t minContextSize,
@@ -60,6 +63,17 @@ void  pfree(void *ptr)                          { (void)ptr; }
 /* ── Error data ──────────────────────────────────────────────────────── */
 void *CopyErrorData(void)                       { return NULL; }
 void  FreeErrorData(void *edata)                { (void)edata; }
+
+/* ── Error reporting functions ───────────────────────────────────────── */
+int   errcode(int sqlerrcode)                   { (void)sqlerrcode; return 0; }
+int   errmsg(const char *fmt, ...)              { (void)fmt; return 0; }
+int   errdetail(const char *fmt, ...)           { (void)fmt; return 0; }
+int   errhint(const char *fmt, ...)             { (void)fmt; return 0; }
+int   errcontext_msg(const char *fmt, ...)      { (void)fmt; return 0; }
+int   errstart(int elevel, const char *domain)  { (void)elevel; (void)domain; return 0; }
+void  errfinish(const char *filename, int lineno, const char *funcname) {
+    (void)filename; (void)lineno; (void)funcname;
+}
 
 /* ── Transaction / type helpers ───────────────────────────────────────── */
 uint32_t GetCurrentTransactionIdIfAny(void)     { return 0; }
