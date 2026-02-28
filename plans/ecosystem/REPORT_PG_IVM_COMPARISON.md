@@ -33,7 +33,7 @@ independently-scheduled summary layer decoupled from write latency.
 |---|---|---|
 | Repository | [sraoss/pg_ivm](https://github.com/sraoss/pg_ivm) | [grove/pg-trickle](https://github.com/grove/pg-trickle) |
 | Language | C | Rust (pgrx 0.17) |
-| Latest release | 1.13 (2025-10-20) | 0.1.1 (2026-02-26) |
+| Latest release | 1.13 (2025-10-20) | 0.1.2 (2026-02-28) |
 | Stars | ~1,400 | early stage |
 | License | PostgreSQL License | Apache 2.0 |
 | PG versions | 13 – 18 | 18 only |
