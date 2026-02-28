@@ -27,8 +27,8 @@ query that pg_trickle can currently handle:
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
 | Phase 1: Differential Correctness | Done — 17/22 pass, 5 soft-skip |
-| Phase 2: Cross-Query Consistency | Done — 15/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 14/22 pass |
+| Phase 2: Cross-Query Consistency | Done — 16/20 STs survive all cycles |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 17/22 pass |
 
 ### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
 
@@ -57,14 +57,20 @@ TPC-H suite was completed:
    to 0.
 
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 36s)
-Phase 2: TBD (re-run pending)
-Phase 3: TBD (re-run pending)
+Phase 1: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 43s)
+Phase 2: test result: ok. 1 passed; 0 failed  (16/20 STs survive, 42s)
+Phase 3: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 45s)
 ```
 
 **Deterministically passing (17):** Q01, Q04, Q05, Q06, Q07, Q08, Q09,
 Q10, Q11, Q12, Q14, Q16, Q18, Q19, Q20, Q21, Q22 — pass all 3 cycles
 consistently across multiple runs in Phase 1 (individual query mode).
+
+**Phase 2 (cross-query): 16/20** — Q04 now survives cross-query mode
+(was failing before SemiJoin R_old fix). Q03, Q07, Q13, Q15 fail in
+cross-query mode.
+
+**Phase 3 (FULL vs DIFF): 17/22** — matches Phase 1 results.
 
 **Performance observation:** SemiJoin/AntiJoin queries exhibit 30–80×
 slowdown on cycles 2–3 vs cycle 1:
@@ -163,17 +169,24 @@ simultaneously on the same join key. The fix is limited to Scan children
 because computing L₀ for nested join children (via full join snapshot
 EXCEPT ALL) is prohibitively expensive for multi-table chains.
 
-**Q03: IMPROVED** — Error reduced from `extra=1, missing=1` (wrong values)
-to `extra=1, missing=0–1` (non-deterministic). The remaining issue is in the
-outer join of the 3-table chain: `(lineitem ⋈ orders) ⋈ customer`. The
-inner `lineitem ⋈ orders` join correctly uses L₀ for Scan children, but
-the outer join's Part 2 falls back to L₁ (post-change) for the nested
-join child, which can still double-count when both the inner join result
-AND customer change simultaneously. In TPC-H, only orders/lineitem change
-via RF, so customer doesn't change — the remaining extra row may be from
-aggregate handling of the join delta.
+**Q03: STALLED** — Error: `extra=1, missing=0` (one extra row in cycle 2).
+The 3-table chain `(lineitem ⋈ orders) ⋈ customer` uses L₀ for Scan
+children at the inner level, but the outer join's Part 2 falls back to L₁
+(post-change) for the nested join child.
 
-**Files:** `src/dvm/operators/join.rs`
+An L₀ fix for nested join children was **attempted and reverted** because it
+caused a Q21 regression (numwait off by -1). The L₀ nested-child fix
+generates additional correct D rows from the pre-change inner join state,
+but these interact with the SemiJoin Part 1 R_old snapshot to produce
+double-counting through the SemiJoin/aggregate pipeline. The two features
+(L₀ for nested children + SemiJoin R_old) are individually correct but
+require a coordinated design to avoid multiplicative overlap in multi-layer
+delta chains.
+
+**Blocked by:** SemiJoin R_old interaction — needs coordinated L₀ + R_old
+design across join.rs and semi_join.rs.
+
+**Files:** `src/dvm/operators/join.rs`, `src/dvm/operators/semi_join.rs`
 **Impact:** Would fix Q03 (+1 pass → 18/22)
 
 #### P2: Fix intermediate aggregate data mismatch (Q13)
