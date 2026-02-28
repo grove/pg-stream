@@ -378,6 +378,37 @@ async fn assert_tpch_invariant(
             ))
             .await;
 
+        // Detailed column-level diagnostics: show extra/missing rows
+        let extra_rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT row_to_json(x)::text FROM \
+             (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) x \
+             LIMIT 10"
+        ))
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+        let missing_rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT row_to_json(x)::text FROM \
+             (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) x \
+             LIMIT 10"
+        ))
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+
+        if !extra_rows.is_empty() {
+            println!("    EXTRA rows (in ST but not query):");
+            for (row,) in &extra_rows {
+                println!("      {row}");
+            }
+        }
+        if !missing_rows.is_empty() {
+            println!("    MISSING rows (in query but not ST):");
+            for (row,) in &missing_rows {
+                println!("      {row}");
+            }
+        }
+
         return Err(format!(
             "INVARIANT VIOLATION: {qname} cycle {cycle} — \
              ST rows: {st_count}, Q rows: {q_count}, \

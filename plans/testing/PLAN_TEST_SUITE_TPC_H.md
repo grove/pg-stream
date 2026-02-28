@@ -1,8 +1,8 @@
 # PLAN: TPC-H Test Suite for pg_trickle
 
 **Status:** In Progress  
-**Date:** 2026-02-28  
-**Branch:** `test-suite-tpc-h`  
+**Date:** 2026-02-29  
+**Branch:** `test-suite-tpc-h-part-2`  
 **Scope:** Implement TPC-H as a correctness and regression test suite for
 stream tables, run locally via `just test-tpch`.
 
@@ -26,22 +26,29 @@ query that pg_trickle can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 14/22 pass, 8 soft-skip |
+| Phase 1: Differential Correctness | Done — 15/22 pass, 7 soft-skip |
 | Phase 2: Cross-Query Consistency | Done — 15/20 STs survive all cycles |
 | Phase 3: FULL vs DIFFERENTIAL | Done — 14/22 pass |
 
-### Latest Test Run (2026-02-28, SF=0.01, 3 cycles)
+### Latest Test Run (2026-02-29, SF=0.01, 3 cycles)
 
-All three phases run cleanly after resolving Docker disk space constraints.
-No "No space left on device" or connection-reset errors.
+All three phases run cleanly. Two infrastructure fixes applied:
+
+1. **WAL LSN capture** (`pg_current_wal_insert_lsn()`) — CDC triggers and
+   frontier capture now use the WAL insert position instead of the write
+   position. Fixes silent no-op refreshes caused by stale write positions.
+
+2. **Frontier-based change buffer cleanup** — deterministic cleanup at the
+   start of each differential refresh using persisted catalog frontiers,
+   supplementing the deferred thread-local cleanup.
 
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (14/22 queries pass, 34s)
+Phase 1: test result: ok. 1 passed; 0 failed  (15/22 queries pass, 35s)
 Phase 2: test result: ok. 1 passed; 0 failed  (15/20 STs survive, 35s)
 Phase 3: test result: ok. 1 passed; 0 failed  (14/22 queries pass, 35s)
 ```
 
-**Deterministically passing (14):** Q05, Q06, Q07, Q08, Q09, Q10,
+**Deterministically passing (15):** Q01, Q05, Q06, Q07, Q08, Q09, Q10,
 Q11, Q12, Q14, Q16, Q18, Q20, Q21, Q22 — pass all 3 cycles consistently
 across multiple runs in Phase 1 (individual query mode).
 
@@ -70,11 +77,10 @@ snapshot (potentially a multi-table join) and evaluates 3 EXISTS subqueries
 per row, including `r_old_snapshot` (EXCEPT ALL / UNION ALL set operation).
 Not a correctness blocker but impacts cycle time at larger scale factors.
 
-**Queries failing cycle 2+ (6):**
+**Queries failing cycle 2+ (5):**
 
 | Query | Cycle 2+ Error | Category |
 |-------|----------------|----------|
-| Q01 | Data mismatch cycle 3: ST=6, Q=6, extra=6, missing=6 — all 6 groups drift after 3 cycles. Single-table aggregate on lineitem, no joins. Reproducible in both individual and shared container modes. | Aggregate drift (cumulative) |
 | Q03 | Data mismatch cycle 2–3: ST≈49, Q≈48, extra=1, missing=0–1 — one extra/missing row in 3-table join delta. Cycle boundary is non-deterministic (sometimes cycle 2, sometimes cycle 3). | Join delta value drift |
 | Q04 | Data mismatch cycle 3: ST=5, Q=5, extra=1, missing=1 — SemiJoin delta drift after 3 cycles. Passes cycles 1–2. | SemiJoin delta drift |
 | Q13 | Data mismatch cycle 2: ST=2, Q=3, extra=0, missing=1 — missing row; intermediate aggregate (LeftJoin + subquery-in-FROM + outer GROUP BY) | Intermediate agg |
@@ -89,9 +95,9 @@ Not a correctness blocker but impacts cycle time at larger scale factors.
 | Category | Queries | Root Cause |
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_trickle DVM does not support correlated scalar subqueries in WHERE |
-| **Cycle 3 — aggregate drift (cumulative)** | Q01 | Single-table aggregate (lineitem GROUP BY) drifts after 3 mutation cycles. Reproducible in both individual and shared container modes. No joins involved — not caused by join delta changes. All 6 groups have wrong values (extra=6, missing=6). Suggests systematic algebraic SUM/COUNT drift rather than isolated rounding. |
+| ~~**Cycle 3 — aggregate drift (cumulative)**~~ | ~~Q01~~ | ~~FIXED~~ — Root cause was WAL LSN capture using `pg_current_wal_lsn()` (write position) instead of `pg_current_wal_insert_lsn()` (insert position). See "WAL LSN capture fix" in Resolved section. |
 | **Cycle 2 — join delta value drift** | Q03 | 3-table join (lineitem ⋈ orders ⋈ customer) with SUM aggregate. Pre-change snapshot fix reduced error from extra=1,missing=1 to extra=1,missing=0. Remaining issue: extra row in delta (only for nested join children where L₀ fallback to L₁ allows double-counting). |
-| **Cycle 3 — SemiJoin delta drift** | Q04 | SemiJoin (EXISTS subquery) aggregate drifts after 3 cycles when run in shared container. Similar pattern to Q01 — fails only at cycle 3, suggesting cumulative effects. |
+| **Cycle 3 — SemiJoin delta drift** | Q04 | SemiJoin (EXISTS subquery) aggregate drifts after 3 cycles when run in shared container. Fails only at cycle 3 with extra=1, missing=1 — suggests cumulative effects from SemiJoin delta logic. |
 | ~~**Cycle 2 — join delta value drift**~~ | ~~Q07~~ | ~~FIXED~~ — Inner join pre-change snapshot (L₀ via EXCEPT ALL for Scan children) eliminates double-counting of ΔL ⋈ ΔR when both sides change simultaneously |
 | **Cycle 2 — intermediate aggregate** | Q13 | Intermediate aggregate (LeftJoin → subquery-in-FROM → outer GROUP BY) produces fewer rows (ST=2, Q=3). `build_intermediate_agg_delta` old/new rescan approach loses a group. |
 | **Cycle 2 — scalar subquery delta** | Q15 | `WHERE total_revenue = (SELECT MAX(...))` — scalar subquery MAX filter produces phantom rows. Delta engine doesn't correctly handle cascading MAX changes. Was previously masked by change buffer cleanup bug. |
@@ -133,13 +139,13 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-**Scorecard:** 14/22 pass (64%) · 6 data mismatch · 2 CREATE blocked
+**Scorecard:** 15/22 pass (68%) · 5 data mismatch · 2 CREATE blocked
 
 #### Prioritized Remaining Work
 
 | # | Category | Queries | Impact | Difficulty | Files |
 |---|----------|---------|--------|------------|-------|
-| **P1** | Cumulative aggregate drift | Q01, Q04 | +2 pass | Medium | `aggregate.rs` (merge expressions) |
+| **P1** | SemiJoin delta drift | Q04 | +1 pass | Medium | `semi_join.rs` (delta accumulation) |
 | **P2** | Join delta value drift | Q03 | +1 pass | Hard | `join.rs` (nested join L₀) |
 | **P3** | Intermediate aggregate | Q13 | +1 pass | Medium | `aggregate.rs` (`build_intermediate_agg_delta`) |
 | **P4** | Scalar subquery delta | Q15 | +1 pass | Hard | `aggregate.rs`, `join_common.rs` (CROSS JOIN + MAX) |
@@ -148,29 +154,17 @@ patterns are added.
 | **P7** | Cross-query interference | Q07 (Phase 2 only) | stability | Medium | `refresh.rs` (min-frontier edge case) |
 | **P8** | SemiJoin performance | Q21, Q18, Q20, Q04 | perf | Low | `semi_join.rs`, `anti_join.rs` (Part 2 snapshot) |
 
-#### P1: Fix cumulative aggregate drift (Q01, Q04)
+#### P1: Fix SemiJoin delta drift (Q04)
 
-**Q01** (single-table aggregate, lineitem GROUP BY) and **Q04** (SemiJoin +
-aggregate) both pass cycles 1–2 but fail at cycle 3, with all groups showing
-wrong values. The pattern (extra=N, missing=N with same row count) indicates
-systematic value drift rather than row gain/loss. Q01 has 6 aggregates per
-group (SUM, AVG, COUNT) — AVG already uses group-rescan, so the drift is
-in the algebraic SUM/COUNT merge expressions.
+**Q04** (SemiJoin + aggregate) passes cycles 1–2 but fails at cycle 3 with
+extra=1, missing=1. The SemiJoin delta accumulates an error over 3 cycles.
 
-**Hypothesis:** The algebraic merge `new_sum = old_sum + delta_ins_sum -
-delta_del_sum` accumulates errors when UPDATE is decomposed as DELETE+INSERT.
-If the DELETE delta's SUM doesn't exactly cancel the original row's
-contribution (e.g., due to intermediate rounding or `__pgt_count`
-bookkeeping), the error compounds each cycle.
+**Hypothesis:** The SemiJoin Part 2 snapshot logic may not correctly handle
+the third cycle's delta when the EXISTS subquery's data changes. The
+cumulative effect only manifests after 3 cycles.
 
-**Potential fix:** Extend group-rescan to SUM/COUNT for single-table
-aggregates where the source is scannable. This would sacrifice algebraic
-efficiency but guarantee correctness. Alternatively, validate `__pgt_count`
-consistency after each merge and trigger rescan on mismatch.
-
-**Files:** `src/dvm/operators/aggregate.rs` (`agg_merge_expr`,
-`agg_delta_exprs`, `direct_agg_delta_exprs`)
-**Impact:** Would fix Q01 and likely Q04 (+2 pass → 16/22)
+**Files:** `src/dvm/operators/semi_join.rs`
+**Impact:** Would fix Q04 (+1 pass → 16/22)
 
 #### P2: Fix join delta value drift (Q03) — Q07 FIXED
 
@@ -277,6 +271,8 @@ scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| **NEW** — WAL LSN capture (write vs insert position) | CDC trigger and `get_slot_positions()` both used `pg_current_wal_lsn()`, which returns the WAL **write** position (last flushed to kernel). Within a not-yet-committed transaction, the write position can lag behind the actual WAL records being generated. When RF mutations run quickly after a refresh, the trigger captures the **same stale write position** as the previous frontier. The strict `lsn > prev_frontier` scan filter then excludes all new entries, producing a silent no-op refresh. All change buffer entries end up with identical LSN values equal to the frontier. | Changed both the trigger function and `get_current_wal_lsn()` to use `pg_current_wal_insert_lsn()` — the WAL **insert** position, which advances immediately as new WAL records are generated, even within uncommitted transactions. This guarantees each trigger entry gets a unique, monotonically increasing LSN that is always past any prior frontier. | Q01 (all 3 cycles pass — was failing cycle 3) |
+| **NEW** — Frontier-based change buffer cleanup | The deferred cleanup in `drain_pending_cleanups()` stores pending work in thread-local `PENDING_CLEANUP` (`RefCell<Vec<PendingCleanup>>`). When a connection pool dispatches successive `refresh_stream_table()` calls to different PostgreSQL backend processes, the cleanup state from cycle N's backend is invisible to cycle N+1's backend. Change buffer entries accumulate across cycles. | Added `cleanup_change_buffers_by_frontier()` that runs at the start of every differential refresh. Uses persisted frontier data from the catalog (not thread-local) to compute safe cleanup thresholds and delete stale entries. Supplements the existing thread-local drain. | Defense-in-depth for Q01 fix and all multi-cycle refresh scenarios |
 | **P1** — Inner join double-counting (ΔL ⋈ ΔR) | Inner join delta `ΔJ = (ΔL ⋈ R₁) + (L₁ ⋈ ΔR)` uses post-change L₁ in Part 2, double-counting `ΔL ⋈ ΔR` when both sides change on the same join key simultaneously (e.g., RF1 inserts both new orders and lineitems for the same orderkey). For algebraic aggregates (SUM), the double-counted rows directly corrupt the aggregate values. | Part 2 of inner join now uses pre-change snapshot L₀ for Scan children: `L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. For nested join children, falls back to L₁ with semi-join filter (L₀ too expensive). Reverted 3-part correction term approach (regressed Q21 via SemiJoin interaction). | Q07 (all 3 cycles pass). Q03 improved (extra=1→extra=1,missing=1→missing=0). |
 | **NEW** — Change buffer premature cleanup | `drain_pending_cleanups` used per-ST range-based cleanup (`DELETE WHERE lsn > prev AND lsn <= new`). When multiple STs shared the same source table (e.g., lineitem), one ST's deferred cleanup deleted change buffer entries that another ST hadn't yet processed. The second ST's DIFF refresh would see 0 changes and produce stale results. | Replaced range-based cleanup with min-frontier cleanup: compute `MIN(frontier_lsn)` across ALL STs that depend on each source OID via catalog query. Only entries at or below the min frontier (consumed by all consumers) are deleted. TRUNCATE optimization uses same safe threshold. `PendingCleanup` struct simplified (frontier fields removed). | Q01 (all 3 cycles pass), Q06 (all 3 cycles pass), Q14 (all 3 cycles pass). Also unmasked pre-existing DVM bugs in Q15 and Q19 that were hidden by lost change data. |
 | P1 — Scalar aggregate row_id mismatch | FULL refresh used `pg_trickle_hash(row_to_json + row_number)` while DIFF used `pg_trickle_hash('__singleton_group')` for scalar aggregates (no GROUP BY). The mismatched `__pgt_row_id` values caused MERGE to INSERT instead of UPDATE, creating phantom duplicate rows. | `row_id_expr_for_query()` now detects scalar aggregates via `is_scalar_aggregate_root()` (checks through Filter/Project/Subquery wrappers) and returns `pg_trickle_hash('__singleton_group')` for both FULL and DIFF. 5 unit tests added. | Q06 (all 3 cycles pass), Q12 (stabilized — was flaky) |
