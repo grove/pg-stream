@@ -96,13 +96,15 @@ thread_local! {
 ///
 /// Instead of cleaning up consumed change buffer rows synchronously in
 /// the critical path, we defer the cleanup to the start of the next
-/// refresh cycle.  Stale rows are harmless because the delta query uses
-/// strict LSN range predicates (`lsn > prev AND lsn <= new`).
+/// refresh cycle.
+///
+/// **IMPORTANT:** Multiple stream tables may share the same change buffer
+/// (source table).  The cleanup must only delete entries that ALL consumers
+/// have already processed.  We use the minimum frontier across all STs
+/// that depend on each source OID as the safe cleanup threshold.
 struct PendingCleanup {
     change_schema: String,
     source_oids: Vec<u32>,
-    prev_frontier: Frontier,
-    new_frontier: Frontier,
 }
 
 thread_local! {
@@ -116,12 +118,16 @@ thread_local! {
 /// deferred cleanup queue.  Errors are logged but not propagated since
 /// stale change-buffer rows are harmless due to LSN range predicates.
 ///
+/// **Multi-ST safety:** When multiple stream tables depend on the same
+/// source table, each ST may have a different frontier.  We compute the
+/// minimum frontier LSN across all dependent STs for each source OID.
+/// Only change buffer entries at or below this minimum are safe to delete,
+/// because all consumers have already advanced past them.
+///
 /// **Robustness:** Each change buffer table is checked for existence via
 /// `pg_class` before any DML is attempted.  When a stream table is dropped
 /// and its change buffer tables are removed, stale pending-cleanup entries
-/// referencing those tables are silently skipped.  This avoids SPI
-/// subtransaction rollback accumulation that can corrupt the SPI state for
-/// subsequent queries in the same transaction.
+/// referencing those tables are silently skipped.
 fn drain_pending_cleanups() {
     let pending: Vec<PendingCleanup> =
         PENDING_CLEANUP.with(|q| std::mem::take(&mut *q.borrow_mut()));
@@ -130,71 +136,108 @@ fn drain_pending_cleanups() {
         return;
     }
 
+    // Deduplicate source OIDs and collect a consistent change schema.
+    let mut all_oids = std::collections::HashSet::new();
+    let mut change_schema = String::new();
+    for job in &pending {
+        if change_schema.is_empty() {
+            change_schema.clone_from(&job.change_schema);
+        }
+        for &oid in &job.source_oids {
+            all_oids.insert(oid);
+        }
+    }
+
     let use_truncate = crate::config::pg_stream_cleanup_use_truncate();
 
-    for job in pending {
-        for &oid in &job.source_oids {
-            // Check that the change buffer table still exists before
-            // attempting any DML.  When a ST is dropped between refresh
-            // cycles, cleanup_cdc_for_source removes the buffer table but
-            // the thread-local pending queue may still reference it.
-            let table_exists = Spi::get_one::<bool>(&format!(
-                "SELECT EXISTS(\
-                   SELECT 1 FROM pg_class c \
-                   JOIN pg_namespace n ON n.oid = c.relnamespace \
-                   WHERE n.nspname = '{schema}' \
-                     AND c.relname = 'changes_{oid}' \
-                     AND c.relkind = 'r'\
-                 )",
-                schema = job.change_schema,
-            ))
-            .unwrap_or(Some(false))
-            .unwrap_or(false);
+    for oid in all_oids {
+        // Check that the change buffer table still exists before
+        // attempting any DML.  When a ST is dropped between refresh
+        // cycles, cleanup_cdc_for_source removes the buffer table but
+        // the thread-local pending queue may still reference it.
+        let table_exists = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(\
+               SELECT 1 FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = '{schema}' \
+                 AND c.relname = 'changes_{oid}' \
+                 AND c.relkind = 'r'\
+             )",
+            schema = change_schema,
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
 
-            if !table_exists {
+        if !table_exists {
+            pgrx::debug1!(
+                "[pg_stream] Deferred cleanup: skipping changes_{} (table dropped)",
+                oid,
+            );
+            continue;
+        }
+
+        // Compute the minimum frontier LSN across ALL stream tables that
+        // depend on this source OID.  Only entries at or below this LSN
+        // have been consumed by every consumer and are safe to delete.
+        //
+        // We extract each ST's frontier for this source from the JSONB
+        // `frontier->'sources'->'OID'->>'lsn'` path.  STs with NULL
+        // frontiers (never refreshed) are excluded — they need a FULL
+        // refresh first and won't read from the change buffer.
+        let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
+            "SELECT MIN((st.frontier->'sources'->'{oid}'->>'lsn')::pg_lsn)::TEXT \
+             FROM pgstream.pgs_stream_tables st \
+             JOIN pgstream.pgs_dependencies dep ON dep.pgs_id = st.pgs_id \
+             WHERE dep.source_relid = {oid} \
+               AND dep.source_type = 'TABLE' \
+               AND st.frontier IS NOT NULL \
+               AND st.frontier->'sources'->'{oid}'->>'lsn' IS NOT NULL",
+        ))
+        .unwrap_or(None);
+
+        let safe_lsn = match min_lsn {
+            Some(lsn) if lsn != "0/0" => lsn,
+            _ => {
+                // No consumers with a frontier, or all at 0/0 — nothing to clean.
                 pgrx::debug1!(
-                    "[pg_stream] Deferred cleanup: skipping changes_{} (table dropped)",
+                    "[pg_stream] Deferred cleanup: no safe threshold for changes_{}, skipping",
                     oid,
                 );
                 continue;
             }
+        };
 
-            let prev_lsn = job.prev_frontier.get_lsn(oid);
-            let new_lsn = job.new_frontier.get_lsn(oid);
+        let can_truncate = if use_truncate {
+            // Safe to TRUNCATE only if ALL entries are at or below the safe LSN.
+            Spi::get_one::<bool>(&format!(
+                "SELECT NOT EXISTS(\
+                   SELECT 1 FROM \"{schema}\".changes_{oid} \
+                   WHERE lsn > '{safe_lsn}'::pg_lsn \
+                   LIMIT 1\
+                 )",
+                schema = change_schema,
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+        } else {
+            false
+        };
 
-            let can_truncate = if use_truncate {
-                Spi::get_one::<bool>(&format!(
-                    "SELECT NOT EXISTS(\
-                       SELECT 1 FROM \"{schema}\".changes_{oid} \
-                       WHERE lsn <= '{prev_lsn}'::pg_lsn \
-                          OR lsn > '{new_lsn}'::pg_lsn \
-                       LIMIT 1\
-                     )",
-                    schema = job.change_schema,
-                ))
-                .unwrap_or(Some(false))
-                .unwrap_or(false)
-            } else {
-                false
-            };
-
-            if can_truncate {
-                if let Err(e) = Spi::run(&format!(
-                    "TRUNCATE \"{schema}\".changes_{oid}",
-                    schema = job.change_schema,
-                )) {
-                    pgrx::debug1!("[pg_stream] Deferred cleanup TRUNCATE failed: {}", e);
-                }
-            } else {
-                let delete_sql = format!(
-                    "DELETE FROM \"{schema}\".changes_{oid} \
-                     WHERE lsn > '{prev_lsn}'::pg_lsn \
-                     AND lsn <= '{new_lsn}'::pg_lsn",
-                    schema = job.change_schema,
-                );
-                if let Err(e) = Spi::run(&delete_sql) {
-                    pgrx::debug1!("[pg_stream] Deferred cleanup DELETE failed: {}", e);
-                }
+        if can_truncate {
+            if let Err(e) = Spi::run(&format!(
+                "TRUNCATE \"{schema}\".changes_{oid}",
+                schema = change_schema,
+            )) {
+                pgrx::debug1!("[pg_stream] Deferred cleanup TRUNCATE failed: {}", e);
+            }
+        } else {
+            let delete_sql = format!(
+                "DELETE FROM \"{schema}\".changes_{oid} \
+                 WHERE lsn <= '{safe_lsn}'::pg_lsn",
+                schema = change_schema,
+            );
+            if let Err(e) = Spi::run(&delete_sql) {
+                pgrx::debug1!("[pg_stream] Deferred cleanup DELETE failed: {}", e);
             }
         }
     }
@@ -1488,8 +1531,8 @@ pub fn execute_differential_refresh(
     // ── C-1: Defer cleanup to next refresh cycle ────────────────────
     // Instead of deleting consumed change-buffer rows synchronously
     // (which costs 0.5–7ms), we enqueue the cleanup work and execute it
-    // at the start of the NEXT refresh.  The LSN-range predicates in the
-    // delta query ensure stale rows are never re-consumed.
+    // at the start of the NEXT refresh.  The cleanup uses the min-frontier
+    // approach to safely handle shared change buffers across multiple STs.
     let cleanup_source_oids = MERGE_TEMPLATE_CACHE.with(|cache| {
         let map = cache.borrow();
         map.get(&st.pgs_id)
@@ -1502,8 +1545,6 @@ pub fn execute_differential_refresh(
             q.borrow_mut().push(PendingCleanup {
                 change_schema: change_schema.clone(),
                 source_oids: cleanup_source_oids,
-                prev_frontier: prev_frontier.clone(),
-                new_frontier: new_frontier.clone(),
             });
         });
     }
