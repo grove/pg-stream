@@ -641,9 +641,9 @@ pub fn rebuild_cdc_trigger_function(
 /// table yet. This function adds any missing `new_*` / `old_*` columns
 /// using `ALTER TABLE … ADD COLUMN IF NOT EXISTS`.
 ///
-/// Columns that were dropped from the source are NOT removed from the
-/// buffer here; they become harmlessly NULL-populated by the trigger and
-/// are cleaned up when the ST is reinitialized (FULL refresh).
+/// F39: Columns that were dropped from the source are now cleaned up
+/// by dropping the orphaned `new_*` / `old_*` columns from the buffer
+/// table, avoiding unbounded column accumulation over time.
 fn sync_change_buffer_columns(
     source_oid: pg_sys::Oid,
     change_schema: &str,
@@ -675,6 +675,45 @@ fn sync_change_buffer_columns(
         }
         Ok(set)
     })?;
+
+    // Build the set of expected new_* / old_* column names from current source columns.
+    let expected_data_cols: std::collections::HashSet<String> = columns
+        .iter()
+        .flat_map(|(col_name, _)| [format!("new_{}", col_name), format!("old_{}", col_name)])
+        .collect();
+
+    // F39: Drop orphaned buffer columns whose source column was dropped.
+    // System columns (change_id, lsn, action, pk_hash) are preserved.
+    let system_cols: std::collections::HashSet<&str> = ["change_id", "lsn", "action", "pk_hash"]
+        .iter()
+        .copied()
+        .collect();
+
+    for existing in &existing_cols {
+        if system_cols.contains(existing.as_str()) {
+            continue;
+        }
+        if !expected_data_cols.contains(existing) {
+            let sql = format!(
+                "ALTER TABLE {buffer_table} DROP COLUMN IF EXISTS \"{}\"",
+                existing.replace('"', "\"\"")
+            );
+            if let Err(e) = Spi::run(&sql) {
+                pgrx::warning!(
+                    "pg_trickle_cdc: failed to drop orphaned column \"{}\" from {}: {}",
+                    existing,
+                    buffer_table,
+                    e
+                );
+            } else {
+                pgrx::debug1!(
+                    "pg_trickle_cdc: dropped orphaned column \"{}\" from {}",
+                    existing,
+                    buffer_table
+                );
+            }
+        }
+    }
 
     // For each source column, add new_<col> and old_<col> if missing.
     for (col_name, col_type) in columns {
@@ -807,6 +846,26 @@ pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgTrickle
     // 'nothing' doesn't provide OLD values for UPDATE/DELETE
     // 'index' may work but needs further validation in later phases
     Ok(identity == "default" || identity == "full")
+}
+
+/// Return the REPLICA IDENTITY mode as a string for a source table.
+///
+/// Returns one of: `"default"`, `"full"`, `"nothing"`, `"index"`.
+/// Used by the WAL transition guard (G2.2) to require REPLICA IDENTITY FULL.
+pub fn get_replica_identity_mode(source_oid: pg_sys::Oid) -> Result<String, PgTrickleError> {
+    let identity = Spi::get_one_with_args::<String>(
+        "SELECT CASE relreplident \
+           WHEN 'd' THEN 'default' \
+           WHEN 'f' THEN 'full' \
+           WHEN 'n' THEN 'nothing' \
+           WHEN 'i' THEN 'index' \
+         END FROM pg_class WHERE oid = $1",
+        &[source_oid.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or_else(|| "nothing".into());
+
+    Ok(identity)
 }
 
 /// Returns true if the relation has any user-defined row-level triggers

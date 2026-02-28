@@ -301,6 +301,12 @@ SELECT pgtrickle.create_stream_table(
 );
 ```
 
+> **Non-monotone recursive terms:** If the recursive term contains operators
+> like `EXCEPT`, aggregate functions, window functions, `DISTINCT`, `INTERSECT`
+> (set), or anti-joins, the system automatically falls back to recomputation
+> to guarantee correctness. Semi-naive and DRed strategies require monotone
+> recursive terms (JOIN, UNION ALL, filter/project only).
+
 **Set Operation Examples:**
 
 `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL`, `UNION`, and `UNION ALL` are supported:
@@ -526,7 +532,7 @@ SELECT pgtrickle.create_stream_table(
 - CDC triggers and change buffer tables are created automatically for each source table.
 - The ST is registered in the dependency DAG; cycles are rejected.
 - Non-recursive CTEs are inlined as subqueries during parsing (Tier 1). Multi-reference CTEs share delta computation (Tier 2).
-- Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **Delete-and-Rederive (DRed)** for mixed changes, and **recomputation fallback** when CTE columns don't match ST storage columns.
+- Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **Delete-and-Rederive (DRed)** for mixed changes, and **recomputation fallback** when CTE columns don't match ST storage columns. **Non-monotone recursive terms** (containing EXCEPT, Aggregate, Window, DISTINCT, AntiJoin, or INTERSECT SET) automatically fall back to recomputation to ensure correctness.
 - LATERAL SRFs in DIFFERENTIAL mode use row-scoped recomputation: when a source row changes, only the SRF expansions for that row are re-evaluated.
 - LATERAL subqueries in DIFFERENTIAL mode also use row-scoped recomputation: when an outer row changes, the correlated subquery is re-executed only for that row.
 - WHERE subqueries (`EXISTS`, `IN`, scalar) are parsed into dedicated semi-join, anti-join, and scalar subquery operators with specialized delta computation.
@@ -1024,6 +1030,19 @@ SELECT pgtrickle.create_stream_table('event_summary',
   'SELECT payload->>''type'' AS event_type, COUNT(*) FROM events GROUP BY 1',
   '1m', 'DIFFERENTIAL');
 ```
+
+> **Known Limitation — Duplicate Rows in Keyless Tables (G7.1)**
+>
+> When a keyless table contains **exact duplicate rows** (identical values in every column),
+> content-based hashing produces the same `__pgt_row_id` for each copy. Consequences:
+>
+> - **INSERT** of a duplicate row may appear as a no-op (the hash already exists in the stream table).
+> - **DELETE** of one copy may delete all copies (the MERGE matches on `__pgt_row_id`, hitting every duplicate).
+> - **Aggregate counts** over keyless tables with duplicates may drift from the true query result.
+>
+> **Recommendation:** Add a `PRIMARY KEY` or at least a `UNIQUE` constraint to source tables used
+> in DIFFERENTIAL mode. This eliminates the ambiguity entirely. If duplicates are expected and
+> correctness matters, use `FULL` refresh mode, which always recomputes from scratch.
 
 ### Volatile Function Detection
 

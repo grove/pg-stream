@@ -78,6 +78,13 @@ pub enum PgTrickleError {
     #[error("SPI error: {0}")]
     SpiError(String),
 
+    /// An SPI permission error (SQLSTATE 42xxx) — not retryable.
+    ///
+    /// F34 (G3.4): Surfaces clear error message when the background worker's
+    /// role lacks SELECT on a source table or INSERT on the stream table.
+    #[error("SPI permission error: {0}")]
+    SpiPermissionError(String),
+
     // ── Transient errors — always retry ──────────────────────────────────
     /// A refresh was skipped because a previous one is still running.
     #[error("refresh skipped: {0}")]
@@ -95,14 +102,20 @@ impl PgTrickleError {
     /// System errors and skipped refreshes are retryable.
     /// User errors, schema errors, and internal errors are not.
     pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
+        match self {
             PgTrickleError::LockTimeout(_)
-                | PgTrickleError::ReplicationSlotError(_)
-                | PgTrickleError::WalTransitionError(_)
-                | PgTrickleError::SpiError(_)
-                | PgTrickleError::RefreshSkipped(_)
-        )
+            | PgTrickleError::ReplicationSlotError(_)
+            | PgTrickleError::WalTransitionError(_)
+            | PgTrickleError::RefreshSkipped(_) => true,
+            // F29 (G8.6): Classify SPI errors by SQLSTATE for retry decisions.
+            // Only truly transient errors (serialization, lock, connection) are
+            // retryable. Permission errors (42xxx), constraint violations (23xxx),
+            // and division-by-zero are NOT retryable.
+            PgTrickleError::SpiError(msg) => classify_spi_error_retryable(msg),
+            // Permission errors are never retryable.
+            PgTrickleError::SpiPermissionError(_) => false,
+            _ => false,
+        }
     }
 
     /// Whether this error requires the ST to be reinitialized.
@@ -118,8 +131,78 @@ impl PgTrickleError {
     /// Skipped refreshes and some transient errors don't count because the
     /// ST itself isn't broken — the scheduler just couldn't run it this time.
     pub fn counts_toward_suspension(&self) -> bool {
-        !matches!(self, PgTrickleError::RefreshSkipped(_))
+        !matches!(
+            self,
+            PgTrickleError::RefreshSkipped(_) | PgTrickleError::SpiPermissionError(_)
+        )
     }
+}
+
+/// F29 (G8.6): Classify an SPI error message for retry eligibility.
+///
+/// Heuristic: looks for PostgreSQL SQLSTATE patterns in the error string.
+/// Only truly transient errors are retryable:
+/// - Serialization failure (40001)
+/// - Deadlock detected (40P01)
+/// - Lock not available (55P03)
+/// - Connection/statement errors
+///
+/// Non-retryable patterns:
+/// - Permission denied (42501, 42xxx)
+/// - Constraint violation (23xxx)
+/// - Division by zero (22012)
+/// - Undefined table/column (42P01, 42703)
+/// - Syntax error (42601)
+///
+/// If no pattern matches, defaults to retryable (safe for unknown errors).
+fn classify_spi_error_retryable(msg: &str) -> bool {
+    let msg_lower = msg.to_lowercase();
+
+    // Non-retryable patterns (permission, constraint, data errors)
+    let non_retryable_patterns = [
+        "permission denied",
+        "insufficient_privilege",
+        "42501", // insufficient_privilege
+        "42000", // syntax_error_or_access_rule_violation
+        "42601", // syntax_error
+        "42p01", // undefined_table
+        "42703", // undefined_column
+        "23",    // integrity_constraint_violation class
+        "22012", // division_by_zero
+        "22",    // data_exception class
+        "2200",  // data_exception subclass
+        "42p07", // duplicate_table
+        "42710", // duplicate_object
+    ];
+
+    for pat in &non_retryable_patterns {
+        if msg_lower.contains(pat) {
+            return false;
+        }
+    }
+
+    // Explicitly retryable patterns
+    let retryable_patterns = [
+        "serialization",
+        "deadlock",
+        "40001", // serialization_failure
+        "40p01", // deadlock_detected
+        "55p03", // lock_not_available
+        "could not obtain lock",
+        "canceling statement due to lock timeout",
+        "connection",
+        "server closed the connection",
+    ];
+
+    for pat in &retryable_patterns {
+        if msg_lower.contains(pat) {
+            return true;
+        }
+    }
+
+    // Default: retry unknown SPI errors (conservative — better to retry
+    // a non-retryable error once than to permanently fail a retryable one)
+    true
 }
 
 /// Classification of error severity/kind for monitoring.
@@ -163,6 +246,9 @@ impl PgTrickleError {
             | PgTrickleError::WalTransitionError(_)
             | PgTrickleError::SpiError(_)
             | PgTrickleError::RefreshSkipped(_) => PgTrickleErrorKind::System,
+
+            // F34: Permission errors are user-facing, not system-level.
+            PgTrickleError::SpiPermissionError(_) => PgTrickleErrorKind::User,
 
             PgTrickleError::InternalError(_) => PgTrickleErrorKind::Internal,
         }
@@ -297,14 +383,26 @@ mod tests {
             PgTrickleError::RefreshSkipped("x".into()).kind(),
             PgTrickleErrorKind::System
         );
+        // F34: SpiPermissionError is classified as User, not System
+        assert_eq!(
+            PgTrickleError::SpiPermissionError("x".into()).kind(),
+            PgTrickleErrorKind::User
+        );
     }
 
     #[test]
     fn test_retryable_errors() {
         assert!(PgTrickleError::LockTimeout("x".into()).is_retryable());
         assert!(PgTrickleError::ReplicationSlotError("x".into()).is_retryable());
-        assert!(PgTrickleError::SpiError("x".into()).is_retryable());
+        // F29: SpiError is now conditionally retryable based on SQLSTATE
+        assert!(PgTrickleError::SpiError("connection lost".into()).is_retryable());
+        assert!(PgTrickleError::SpiError("serialization failure 40001".into()).is_retryable());
+        assert!(!PgTrickleError::SpiError("permission denied for table foo".into()).is_retryable());
+        assert!(!PgTrickleError::SpiError("23505 unique constraint".into()).is_retryable());
         assert!(PgTrickleError::RefreshSkipped("x".into()).is_retryable());
+
+        // F34: SpiPermissionError is never retryable
+        assert!(!PgTrickleError::SpiPermissionError("x".into()).is_retryable());
 
         assert!(!PgTrickleError::QueryParseError("x".into()).is_retryable());
         assert!(!PgTrickleError::CycleDetected(vec![]).is_retryable());
@@ -323,6 +421,38 @@ mod tests {
         assert!(PgTrickleError::SpiError("x".into()).counts_toward_suspension());
         assert!(PgTrickleError::LockTimeout("x".into()).counts_toward_suspension());
         assert!(!PgTrickleError::RefreshSkipped("x".into()).counts_toward_suspension());
+        // F34: SpiPermissionError does not count toward suspension
+        assert!(!PgTrickleError::SpiPermissionError("x".into()).counts_toward_suspension());
+    }
+
+    #[test]
+    fn test_classify_spi_error_retryable() {
+        // F29: SQLSTATE-based retry classification
+        // Non-retryable patterns
+        assert!(!classify_spi_error_retryable(
+            "permission denied for table orders"
+        ));
+        assert!(!classify_spi_error_retryable(
+            "ERROR: 42501 insufficient_privilege"
+        ));
+        assert!(!classify_spi_error_retryable(
+            "23505: duplicate key value violates unique constraint"
+        ));
+        assert!(!classify_spi_error_retryable("22012 division_by_zero"));
+        assert!(!classify_spi_error_retryable("42P01: undefined_table"));
+
+        // Retryable patterns
+        assert!(classify_spi_error_retryable(
+            "40001: could not serialize access"
+        ));
+        assert!(classify_spi_error_retryable("deadlock detected"));
+        assert!(classify_spi_error_retryable("55P03: lock_not_available"));
+        assert!(classify_spi_error_retryable(
+            "server closed the connection unexpectedly"
+        ));
+
+        // Unknown error: default retryable
+        assert!(classify_spi_error_retryable("something weird happened"));
     }
 
     #[test]

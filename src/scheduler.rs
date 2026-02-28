@@ -58,6 +58,39 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
+    // F16 (G8.2): Detect read replicas — the scheduler cannot write on a
+    // standby. Skip all work and sleep until promotion.
+    let is_replica = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+        Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+    }));
+    if is_replica {
+        log!(
+            "pg_trickle scheduler: running on a read replica (pg_is_in_recovery() = true). \
+             Scheduler will sleep until promotion."
+        );
+        // Sleep in a loop — if the server is promoted, pg_is_in_recovery()
+        // changes to false and we can start working.
+        loop {
+            let should_continue =
+                BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(30)));
+            if !should_continue {
+                log!("pg_trickle scheduler shutting down (replica)");
+                return;
+            }
+            let still_replica = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+                Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+                    .unwrap_or(Some(false))
+                    .unwrap_or(false)
+            }));
+            if !still_replica {
+                log!("pg_trickle scheduler: replica promoted — starting normal operation");
+                break;
+            }
+        }
+    }
+
     log!(
         "pg_trickle scheduler started (interval={}ms)",
         config::pg_trickle_scheduler_interval_ms()
@@ -146,6 +179,8 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 // Phase 10: Check retry backoff — skip if in cooldown
                 let retry = retry_states.entry(pgt_id).or_default();
                 if retry.is_in_backoff(now_ms) {
+                    // F31: Emit StaleData alert when skipping a stale ST due to backoff
+                    emit_stale_alert_if_needed(&st);
                     continue;
                 }
 
@@ -400,6 +435,42 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
     false
 }
 
+/// Emit a StaleData alert if the stream table is currently stale.
+///
+/// Called when a refresh is skipped (due to backoff, advisory lock, etc.)
+/// so that operators are notified via NOTIFY even when the scheduler
+/// cannot perform the refresh (F31: G9.4).
+fn emit_stale_alert_if_needed(st: &StreamTableMeta) {
+    if let Some(ref schedule_str) = st.schedule {
+        let trimmed = schedule_str.trim();
+        // Only for duration-based schedules (not cron)
+        if !trimmed.starts_with('@')
+            && !trimmed.contains(' ')
+            && let Ok(max_secs) = crate::api::parse_duration(trimmed)
+        {
+            let staleness = Spi::get_one_with_args::<f64>(
+                "SELECT EXTRACT(EPOCH FROM (now() - data_timestamp))::float8 \
+                 FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
+                &[st.pgt_id.into()],
+            )
+            .unwrap_or(None);
+
+            if let Some(stale_secs) = staleness {
+                // Alert when staleness exceeds 2× the schedule
+                let schedule_f64 = max_secs as f64;
+                if stale_secs > schedule_f64 * 2.0 {
+                    monitor::alert_stale_data(
+                        &st.pgt_schema,
+                        &st.pgt_name,
+                        stale_secs,
+                        schedule_f64,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Check if any upstream source has pending changes.
 fn check_upstream_changes(st: &StreamTableMeta) -> bool {
     // With trigger-based CDC, changes are written directly to buffer tables.
@@ -489,6 +560,9 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
         None,
         Some("SCHEDULER"),
         freshness_deadline,
+        0,     // delta_row_count — updated on completion
+        None,  // merge_strategy_used — updated on completion
+        false, // was_full_fallback — updated on completion
     );
 
     let refresh_id = match refresh_id {
@@ -629,10 +703,21 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
     let elapsed_ms = start_instant.elapsed().as_millis() as i64;
 
     // Record refresh completion and determine outcome
+    let was_full_fallback = matches!(action, RefreshAction::Reinitialize);
+
     match result {
         Ok((rows_inserted, rows_deleted)) => {
-            let _ =
-                RefreshRecord::complete(refresh_id, "COMPLETED", rows_inserted, rows_deleted, None);
+            let delta_row_count = rows_inserted + rows_deleted;
+            let _ = RefreshRecord::complete(
+                refresh_id,
+                "COMPLETED",
+                rows_inserted,
+                rows_deleted,
+                None,
+                delta_row_count,
+                Some(action.as_str()),
+                was_full_fallback,
+            );
 
             let _ = StreamTableMeta::update_after_refresh(st.pgt_id, now, rows_inserted);
 
@@ -655,10 +740,23 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
                 elapsed_ms,
             );
 
+            // F31: Emit StaleData alert if still stale after refresh
+            // (e.g., refresh took longer than the schedule interval)
+            emit_stale_alert_if_needed(st);
+
             RefreshOutcome::Success
         }
         Err(e) => {
-            let _ = RefreshRecord::complete(refresh_id, "FAILED", 0, 0, Some(&e.to_string()));
+            let _ = RefreshRecord::complete(
+                refresh_id,
+                "FAILED",
+                0,
+                0,
+                Some(&e.to_string()),
+                0,
+                Some(action.as_str()),
+                was_full_fallback,
+            );
 
             monitor::alert_refresh_failed(
                 &st.pgt_schema,

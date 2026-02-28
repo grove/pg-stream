@@ -381,6 +381,50 @@ fn parse_pgoutput_columns(data: &str) -> std::collections::HashMap<String, Strin
     cols
 }
 
+/// Parse old-tuple column values from a pgoutput UPDATE data line.
+///
+/// With `REPLICA IDENTITY FULL`, pgoutput UPDATE messages include an
+/// "old-key:" section before the "new-tuple:" section:
+/// ```text
+/// table public.t: UPDATE: old-key: id[integer]:1 name[text]:'Alice' new-tuple: id[integer]:1 name[text]:'Bob'
+/// ```
+///
+/// This function extracts the "old-key:" portion and parses column values.
+/// Returns an empty map for non-UPDATE messages or messages without an
+/// "old-key:" section (i.e., REPLICA IDENTITY DEFAULT where only PK
+/// columns appear in old-key).
+fn parse_pgoutput_old_columns(data: &str) -> std::collections::HashMap<String, String> {
+    let mut cols = std::collections::HashMap::new();
+
+    // Find the "old-key:" section in UPDATE messages.
+    let old_key_start = match data.find("old-key:") {
+        Some(pos) => pos + 9, // skip past "old-key: "
+        None => return cols,
+    };
+
+    // The old-key section ends at "new-tuple:" (if present) or at end of string.
+    let old_key_end = data[old_key_start..]
+        .find("new-tuple:")
+        .map(|pos| old_key_start + pos)
+        .unwrap_or(data.len());
+
+    let old_section = &data[old_key_start..old_key_end];
+
+    // Parse column_name[type]:value pairs from the old-key section.
+    for segment in old_section.split_whitespace() {
+        if let Some(bracket_pos) = segment.find('[') {
+            let col_name = &segment[..bracket_pos];
+            if let Some(colon_pos) = segment.find("]:") {
+                let value = &segment[colon_pos + 2..];
+                let clean_value = value.trim_matches('\'');
+                cols.insert(col_name.to_string(), clean_value.to_string());
+            }
+        }
+    }
+
+    cols
+}
+
 /// Write a decoded WAL change to the buffer table.
 ///
 /// Maps the parsed pgoutput data into the typed buffer table columns,
@@ -401,6 +445,15 @@ fn write_decoded_change(
     }
 
     let parsed = parse_pgoutput_columns(data);
+
+    // G2.2: Parse old-tuple values for UPDATE events.
+    // With REPLICA IDENTITY FULL, pgoutput includes the old tuple in the
+    // "old-key:" section before the new tuple. Parse both sections.
+    let old_parsed = if *action == 'U' {
+        parse_pgoutput_old_columns(data)
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Build the INSERT statement for the buffer table
     let has_pk = !pk_columns.is_empty();
@@ -441,10 +494,16 @@ fn write_decoded_change(
                 } else {
                     col_values.push("NULL".to_string());
                 }
-                // old values (available with REPLICA IDENTITY FULL or for PK columns)
+                // G2.2: old values from pgoutput old-key section.
+                // With REPLICA IDENTITY FULL (required by try_start_transition),
+                // pgoutput includes the complete old tuple. Parse old values
+                // from the "old-key:" section of the UPDATE message.
                 col_names.push(format!("\"old_{}\"", safe_name));
-                // pgoutput separates old-key and new-tuple; simplified here
-                col_values.push("NULL".to_string());
+                if let Some(val) = old_parsed.get(col_name) {
+                    col_values.push(format!("'{}'", val.replace('\'', "''")));
+                } else {
+                    col_values.push("NULL".to_string());
+                }
             }
             'D' => {
                 col_names.push(format!("\"old_{}\"", safe_name));
@@ -626,27 +685,75 @@ pub fn check_and_complete_transition(
         return Ok(());
     }
 
-    // Not caught up — check for timeout
+    // Not caught up — check for timeout with progressive backoff (F32: G2.4).
+    // We allow up to 3× the configured timeout before aborting, logging
+    // warnings at 1× and 2× to give operators visibility into slow transitions.
     if let Some(ref started_at) = dep.transition_started_at {
-        let timed_out = Spi::get_one_with_args::<bool>(
+        let base_timeout = config::pg_trickle_wal_transition_timeout();
+
+        // Check if we've exceeded the final deadline (3× base timeout)
+        let final_deadline = base_timeout * 3;
+        let exceeded_final = Spi::get_one_with_args::<bool>(
             &format!(
                 "SELECT (now() - $1::timestamptz) > interval '{} seconds'",
-                config::pg_trickle_wal_transition_timeout()
+                final_deadline
             ),
             &[started_at.as_str().into()],
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
         .unwrap_or(false);
 
-        if timed_out {
+        if exceeded_final {
             warning!(
-                "pg_trickle: WAL transition timed out for source OID {} \
-                 (lag: {} bytes after {}s); falling back to triggers",
+                "pg_trickle: WAL transition exhausted all retries for source OID {} \
+                 (lag: {} bytes after {}s, max {}s); falling back to triggers",
                 source_oid.to_u32(),
                 lag_bytes,
-                config::pg_trickle_wal_transition_timeout()
+                final_deadline,
+                final_deadline,
             );
             abort_wal_transition(source_oid, pgt_id, change_schema)?;
+            return Ok(());
+        }
+
+        // Emit warnings at intermediate checkpoints (1× and 2× base timeout)
+        let exceeded_first = Spi::get_one_with_args::<bool>(
+            &format!(
+                "SELECT (now() - $1::timestamptz) > interval '{} seconds'",
+                base_timeout
+            ),
+            &[started_at.as_str().into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .unwrap_or(false);
+
+        if exceeded_first {
+            let exceeded_second = Spi::get_one_with_args::<bool>(
+                &format!(
+                    "SELECT (now() - $1::timestamptz) > interval '{} seconds'",
+                    base_timeout * 2
+                ),
+                &[started_at.as_str().into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .unwrap_or(false);
+
+            if exceeded_second {
+                warning!(
+                    "pg_trickle: WAL transition slow for source OID {} \
+                     (lag: {} bytes, retry 2/3 — will abort after {}s)",
+                    source_oid.to_u32(),
+                    lag_bytes,
+                    final_deadline,
+                );
+            } else {
+                log!(
+                    "pg_trickle: WAL transition slow for source OID {} \
+                     (lag: {} bytes, retry 1/3 — extending deadline)",
+                    source_oid.to_u32(),
+                    lag_bytes,
+                );
+            }
         }
     }
 
@@ -841,6 +948,36 @@ fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), P
         return Ok(());
     }
 
+    // G2.1: Require PRIMARY KEY for WAL mode. Keyless tables use content-based
+    // hashing in trigger mode, which cannot be reproduced from raw WAL bytes.
+    // The pk_hash mismatch between trigger (content hash) and WAL ("0") would
+    // cause duplicate rows during transition.
+    let pk_columns = cdc::resolve_pk_columns(dep.source_relid)?;
+    if pk_columns.is_empty() {
+        log!(
+            "pg_trickle: source OID {} has no PRIMARY KEY — WAL-based CDC requires a PK. \
+             Staying on trigger-based CDC.",
+            dep.source_relid.to_u32()
+        );
+        return Ok(());
+    }
+
+    // G2.2: Require REPLICA IDENTITY FULL for WAL mode. Without it, UPDATE
+    // events only contain PK columns as old values — non-PK old_* columns
+    // would be NULL, breaking filter boundary detection and JOIN delta
+    // computation.
+    let identity = cdc::get_replica_identity_mode(dep.source_relid)?;
+    if identity != "full" {
+        log!(
+            "pg_trickle: source OID {} has REPLICA IDENTITY '{}' (need FULL) — \
+             WAL-based CDC requires REPLICA IDENTITY FULL for correct UPDATE old values. \
+             Run: ALTER TABLE ... REPLICA IDENTITY FULL. Staying on triggers.",
+            dep.source_relid.to_u32(),
+            identity
+        );
+        return Ok(());
+    }
+
     // All prerequisites met — start the transition
     start_wal_transition(dep.source_relid, dep.pgt_id, change_schema)?;
 
@@ -945,13 +1082,16 @@ fn quote_ident(name: &str) -> String {
 /// Detect a schema mismatch between decoded pgoutput columns and the
 /// expected column definitions.
 ///
-/// Returns `true` if the decoded row contains a column that doesn't appear
-/// in the expected set, which indicates the source table's schema changed
-/// (e.g., a column was added via ALTER TABLE ADD COLUMN).
+/// Returns `true` if:
+/// - The decoded row contains a column that doesn't appear in the expected set
+///   (e.g., a column was added via ALTER TABLE ADD COLUMN).
+/// - The decoded row has at least as many columns as expected but some expected
+///   columns are missing (e.g., a column was renamed). F33: G2.5.
+///   The "at least as many" guard avoids false positives on partial-column
+///   messages (DELETE with non-FULL replica identity sends only PK columns).
 ///
-/// This is a conservative check — it only fires when a *new* column appears.
-/// Dropped columns are already handled by the DDL event trigger in hooks.rs
-/// which marks STs for reinitialize.
+/// DDL event triggers in hooks.rs handle the reinitialize; this provides a
+/// safety net for DDL that bypasses event triggers.
 fn detect_schema_mismatch(
     parsed: &std::collections::HashMap<String, String>,
     expected_columns: &[(String, String)],
@@ -963,11 +1103,28 @@ fn detect_schema_mismatch(
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
+
+    // Check for unknown columns (additions)
     for col_name in parsed.keys() {
         if !expected_names.contains(col_name.as_str()) {
             return true;
         }
     }
+
+    // Check for missing expected columns (renames) — F33
+    // Only check when the decoded message has at least as many columns as
+    // expected, to avoid false positives from DELETE messages that only
+    // carry PK columns with non-FULL replica identity.
+    if parsed.len() >= expected_columns.len() {
+        let parsed_names: std::collections::HashSet<&str> =
+            parsed.keys().map(|k| k.as_str()).collect();
+        for expected_name in &expected_names {
+            if !parsed_names.contains(*expected_name) {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -1181,5 +1338,68 @@ mod tests {
         let mut parsed = std::collections::HashMap::new();
         parsed.insert("id".to_string(), "42".to_string());
         assert!(!detect_schema_mismatch(&parsed, &expected));
+    }
+
+    #[test]
+    fn test_schema_mismatch_column_rename() {
+        // F33: Column renamed from "name" to "full_name" — same count, different names
+        let expected = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("id".to_string(), "42".to_string());
+        parsed.insert("full_name".to_string(), "Alice".to_string());
+        assert!(detect_schema_mismatch(&parsed, &expected));
+    }
+
+    // ── parse_pgoutput_old_columns tests (G2.2) ───────────────────
+
+    #[test]
+    fn test_parse_old_columns_update_with_old_key() {
+        let data = "table public.users: UPDATE: old-key: id[integer]:1 name[text]:'Alice' new-tuple: id[integer]:1 name[text]:'Bob'";
+        let old = parse_pgoutput_old_columns(data);
+        assert_eq!(old.get("id").map(|s| s.as_str()), Some("1"));
+        assert_eq!(old.get("name").map(|s| s.as_str()), Some("Alice"));
+    }
+
+    #[test]
+    fn test_parse_old_columns_no_old_key_section() {
+        // UPDATE without REPLICA IDENTITY FULL produces no old-key section
+        let data = "table public.users: UPDATE: id[integer]:1 name[text]:'Bob'";
+        let old = parse_pgoutput_old_columns(data);
+        assert!(old.is_empty());
+    }
+
+    #[test]
+    fn test_parse_old_columns_insert_has_no_old_key() {
+        let data = "table public.users: INSERT: id[integer]:1 name[text]:'Alice'";
+        let old = parse_pgoutput_old_columns(data);
+        assert!(old.is_empty());
+    }
+
+    #[test]
+    fn test_parse_old_columns_delete_has_no_old_key() {
+        let data = "table public.users: DELETE: id[integer]:1";
+        let old = parse_pgoutput_old_columns(data);
+        assert!(old.is_empty());
+    }
+
+    #[test]
+    fn test_parse_old_columns_old_key_at_end() {
+        // Edge case: old-key section without a following new-tuple marker
+        let data = "table public.users: UPDATE: old-key: id[integer]:99 name[text]:'Zara'";
+        let old = parse_pgoutput_old_columns(data);
+        assert_eq!(old.get("id").map(|s| s.as_str()), Some("99"));
+        assert_eq!(old.get("name").map(|s| s.as_str()), Some("Zara"));
+    }
+
+    #[test]
+    fn test_parse_old_columns_composite_pk() {
+        let data = "table public.orders: UPDATE: old-key: customer_id[integer]:5 order_id[integer]:10 new-tuple: customer_id[integer]:5 order_id[integer]:10 status[text]:'shipped'";
+        let old = parse_pgoutput_old_columns(data);
+        assert_eq!(old.get("customer_id").map(|s| s.as_str()), Some("5"));
+        assert_eq!(old.get("order_id").map(|s| s.as_str()), Some("10"));
+        assert_eq!(old.len(), 2);
     }
 }

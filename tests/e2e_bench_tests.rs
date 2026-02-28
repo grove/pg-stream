@@ -817,3 +817,147 @@ async fn bench_no_data_refresh_latency() {
     println!("└──────────────────────────────────────────────┘");
     println!();
 }
+// ═══════════════════════════════════════════════════════════════════════
+// F50 / G7.3 — Covering index overhead benchmark
+//
+// Compares change buffer query performance with and without the INCLUDE
+// (action) clause on the (lsn, pk_hash, change_id) index.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore]
+async fn bench_covering_index_overhead() {
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    // Create a source table and stream table to get the change buffer
+    db.execute("CREATE TABLE ci_src (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
+        .await;
+    db.execute(
+        "INSERT INTO ci_src (grp, val) \
+         SELECT CASE (i % 10) WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' \
+                WHEN 3 THEN 'd' WHEN 4 THEN 'e' ELSE 'f' END, \
+                (i * 17 + 13) % 10000 \
+         FROM generate_series(1, 50000) AS s(i)",
+    )
+    .await;
+
+    let q = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ci_src GROUP BY grp";
+    db.create_st("ci_st", q, "1m", "DIFFERENTIAL").await;
+
+    // Find the change buffer table OID
+    let src_oid: i64 = db
+        .query_scalar(
+            "SELECT oid::bigint FROM pg_class WHERE relname = 'ci_src' AND relnamespace = 'public'::regnamespace",
+        )
+        .await;
+    let buf_table = format!("pgtrickle_changes.changes_{}", src_oid);
+
+    // Generate a significant number of changes in the buffer
+    // (don't refresh — let them accumulate)
+    for _round in 0..3 {
+        db.execute("UPDATE ci_src SET val = val + 1 WHERE id <= 5000")
+            .await;
+    }
+
+    let change_count: i64 = db
+        .query_scalar(&format!("SELECT COUNT(*) FROM {buf_table}"))
+        .await;
+    println!();
+    println!("Change buffer has {} pending rows", change_count);
+
+    // Typical change buffer query pattern (mirrors what refresh does):
+    let bench_query = format!(
+        "SELECT pk_hash, action, change_id \
+         FROM {buf_table} \
+         WHERE lsn > '0/0' \
+         ORDER BY pk_hash, change_id"
+    );
+
+    // ── Phase 1: WITH covering index (default) ───────────────────
+
+    // Warm up
+    for _ in 0..3 {
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+    }
+
+    let mut with_include_ms = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+        with_include_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // ── Phase 2: WITHOUT covering index ──────────────────────────
+
+    // Drop the covering index and create a plain one
+    let idx_name = format!("idx_changes_{}_lsn_pk_cid", src_oid);
+    db.execute(&format!(
+        "DROP INDEX IF EXISTS pgtrickle_changes.{idx_name}"
+    ))
+    .await;
+    db.execute(&format!(
+        "CREATE INDEX {idx_name}_plain ON {buf_table} (lsn, pk_hash, change_id)"
+    ))
+    .await;
+    db.execute("ANALYZE").await;
+
+    // Warm up
+    for _ in 0..3 {
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+    }
+
+    let mut without_include_ms = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+        without_include_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // ── Results ──────────────────────────────────────────────────
+
+    let avg_with = with_include_ms.iter().sum::<f64>() / with_include_ms.len() as f64;
+    let avg_without = without_include_ms.iter().sum::<f64>() / without_include_ms.len() as f64;
+    let p95_with = percentile(&with_include_ms, 0.95);
+    let p95_without = percentile(&without_include_ms, 0.95);
+    let diff_pct = ((avg_with - avg_without) / avg_without) * 100.0;
+
+    println!();
+    println!("┌─────────────────────────────────────────────────────────┐");
+    println!("│ F50: Covering Index (INCLUDE action) Overhead Benchmark │");
+    println!("├─────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Change buffer rows: {:>8}                            │",
+        change_count
+    );
+    println!("│                                                         │");
+    println!("│           WITH INCLUDE    WITHOUT INCLUDE               │");
+    println!(
+        "│  Avg:     {:>8.2} ms     {:>8.2} ms                   │",
+        avg_with, avg_without
+    );
+    println!(
+        "│  P95:     {:>8.2} ms     {:>8.2} ms                   │",
+        p95_with, p95_without
+    );
+    println!("│                                                         │");
+    println!(
+        "│  Overhead: {:>+.1}%                                       │",
+        diff_pct
+    );
+    println!(
+        "│  Verdict:  {}                                      │",
+        if diff_pct.abs() < 15.0 {
+            "✅ Acceptable"
+        } else if diff_pct > 0.0 {
+            "⚠️ Significant overhead"
+        } else {
+            "✅ INCLUDE is faster"
+        }
+    );
+    println!("└─────────────────────────────────────────────────────────┘");
+    println!();
+}
