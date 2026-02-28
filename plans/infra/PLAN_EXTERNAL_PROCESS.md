@@ -374,7 +374,7 @@ The sidecar approach enables multiple deployment topologies:
 | Multi-database support | ❌ (1 DB) | ✅ | Single sidecar can manage multiple databases |
 | Prometheus metrics | ❌ | ✅ | HTTP metrics endpoint |
 | `shared_preload_libraries` required | ✅ | ❌ | **Key advantage** |
-| Transaction-local visibility | ✅ | ❌ | Sidecar sees committed data only |
+| Transaction-local visibility | ✅ | ⚠️ Via compiled triggers | Compiled PL/pgSQL IMMEDIATE triggers run in user's transaction (§12.1). DEFERRED mode sees committed data only. |
 
 ### Key Trade-offs
 
@@ -561,91 +561,180 @@ tables are updated **in the same transaction** as the base table DML, using
 statement-level AFTER triggers with transition tables and in-process SPI
 execution.
 
-#### 12.1.1 IMMEDIATE Mode Is Fundamentally Incompatible with Sidecar
+#### 12.1.1 Initial Assumption: IMMEDIATE Mode Requires the Extension
 
-The core mechanism of IMMEDIATE mode requires:
+At first glance, IMMEDIATE mode looks fundamentally incompatible with a
+sidecar because:
 
-1. **Statement-level AFTER triggers with transition tables** (`REFERENCING
-   NEW TABLE AS ... OLD TABLE AS ...`) — these are PL/pgSQL or C trigger
-   functions that fire **inside the user's transaction**.
-2. **In-process delta computation** — the DVM engine generates delta SQL and
-   executes it via SPI within the same transaction, before the triggering
-   statement returns control to the user.
-3. **Ephemeral Named Relations (ENRs)** — transition table data is accessed
-   via ENRs registered in the query environment, which are only available
-   from within the same backend process.
-4. **ExclusiveLock on the stream table** — acquired from within the trigger,
-   serializing concurrent DML.
-5. **Snapshot management** — `CommandCounterIncrement()` and snapshot push/pop
-   to make just-inserted rows visible within the trigger.
+- Transition tables are only available inside trigger functions.
+- The sidecar cannot participate in the user's transaction.
+- `CommandCounterIncrement()`, snapshot management, and ENR registration
+  are in-process C APIs.
 
-None of these can be performed from an external process. The sidecar connects
-over pgwire and sees only **committed** data. It cannot participate in
-another session's transaction, access its transition tables, or call
-`CommandCounterIncrement()`.
+However, on closer analysis, **the sidecar doesn't need to be involved at
+runtime at all.** The key insight is that the DVM engine's output is a
+**pure SQL string** — the `CachedMergeTemplate` and delta SQL templates
+are entirely self-contained SQL with no Rust runtime logic in the execution
+path. This means the delta logic can be **pre-compiled into PL/pgSQL trigger
+functions** that the sidecar installs at stream table creation time.
 
-**Verdict: IMMEDIATE mode is extension-only.** It cannot be offered in sidecar
-mode. This is a fundamental architectural constraint, not a missing feature.
+#### 12.1.2 The "Compiled Triggers" Approach
 
-#### 12.1.2 Implications for Dual-Mode Strategy
+The sidecar operates as a **compile-and-deploy** tool:
 
-This creates a clear **feature differentiation** between the two modes:
+**At creation time (sidecar connects via pgwire):**
+
+1. Parse the defining query (via `pg_query.rs` — no PG backend needed).
+2. Build the operator tree and generate the delta SQL template.
+3. For each `(source_table, operation)` pair, produce a self-contained
+   delta SQL that references transition table names instead of change
+   buffer tables.
+4. Install PL/pgSQL trigger functions containing the pre-compiled delta SQL.
+5. Install statement-level BEFORE/AFTER triggers on each source table.
+6. Store the templates in the catalog for later regeneration.
+
+**At runtime (pure PostgreSQL, no sidecar involvement):**
+
+```
+User: INSERT INTO orders VALUES (...)
+  │
+  ▼
+PG fires BEFORE statement trigger
+  └─ pgt_ivm_before(): LOCK TABLE st_storage IN EXCLUSIVE MODE
+  │
+  ▼
+PG fires AFTER statement trigger (REFERENCING NEW TABLE AS __pgt_new)
+  └─ pgt_ivm_after():
+       -- Pre-compiled delta SQL (stored in the trigger function body):
+       DELETE FROM st_storage AS st
+         USING (
+           SELECT pgtrickle.pg_trickle_hash(...)  AS __pgt_row_id,
+                  'I' AS __pgt_action, new_a.region, new_a.amount
+           FROM __pgt_new new_a
+           JOIN customers c ON new_a.customer_id = c.id
+         ) AS d
+         WHERE st.__pgt_row_id = d.__pgt_row_id AND d.__pgt_action = 'D';
+
+       INSERT INTO st_storage (__pgt_row_id, region, amount, ...)
+         SELECT d.__pgt_row_id, d.region, d.amount, ...
+         FROM (...same delta subquery...) AS d
+         WHERE d.__pgt_action = 'I'
+           AND NOT EXISTS (SELECT 1 FROM st_storage st
+                           WHERE st.__pgt_row_id = d.__pgt_row_id);
+
+       -- Update catalog metadata
+       UPDATE pgtrickle.pgt_stream_tables
+         SET data_timestamp = now(), last_refresh_at = now()
+         WHERE pgt_id = <st_id>;
+  │
+  ▼
+Transaction commits — user sees updated stream table
+```
+
+This works because:
+
+- **Transition tables are accessible in PL/pgSQL triggers.** When a
+  trigger is declared with `REFERENCING NEW TABLE AS __pgt_new`, that
+  name is available as a regular queryable relation within the trigger
+  function's SPI context. Standard PL/pgSQL `EXECUTE` can reference it.
+
+- **The delta SQL is entirely self-contained.** The DVM operators produce
+  SQL strings — JOINs, aggregates, window functions — that reference
+  source table names. Replacing change-buffer LSN-range scans with
+  transition table names is a straightforward substitution.
+
+- **PL/pgSQL handles command visibility automatically.** Between
+  statements in PL/pgSQL, the command counter advances implicitly.
+  A `DELETE` followed by an `INSERT` in the same function body gives
+  the INSERT visibility of the DELETE's effects — no explicit
+  `CommandCounterIncrement()` needed.
+
+- **Locking is standard SQL.** `LOCK TABLE ... IN EXCLUSIVE MODE` works
+  from PL/pgSQL.
+
+- **Before/after counting uses transaction-local GUCs.** PL/pgSQL can
+  use `set_config('pgtrickle.ivm_count_<oid>', ..., true)` (the `true`
+  parameter scopes it to the current transaction) to coordinate
+  BEFORE/AFTER trigger pairing for multi-source views.
+
+#### 12.1.3 Limitations of the Compiled-Trigger Approach
+
+| Limitation | Severity | Mitigation |
+|-----------|----------|-----------|
+| **Performance** — PL/pgSQL + `EXECUTE` is slower than C/Rust SPI | Medium | The delta SQL execution dominates cost, not trigger dispatch. For most workloads, overhead is <20%. Benchmark to quantify. |
+| **Template staleness** — DDL changes on source tables require regenerating and reinstalling triggers | Medium | Schema fingerprinting detects changes; sidecar reconnects and regenerates. Between detection and regeneration, the old trigger may fail — but this is exactly what `needs_reinit` handles today. |
+| **Complex queries** — Very deep operator trees produce large SQL strings embedded in PL/pgSQL | Low | PostgreSQL has no practical limit on function body size. Even a 50KB delta SQL is fine. |
+| **Cascading IMMEDIATE STs** — If ST B depends on IMMEDIATE ST A, A's update triggers B's triggers | Medium | Works naturally via PostgreSQL's trigger nesting. Same constraint as extension mode: limited by `max_stack_depth`. |
+| **No runtime adaptivity** — The extension can dynamically fall back from DIFFERENTIAL to FULL based on change ratio; a compiled trigger cannot | Medium | The trigger can include a `SELECT count(*)` check on the transition table and fall back to a full refresh if the count exceeds a threshold. This adds a small overhead but preserves adaptivity. |
+| **Hash function dependency** — Delta SQL references `pgtrickle.pg_trickle_hash()` | Low | The sidecar installs this as a PL/pgSQL function using `hashtextextended()`. No C extension needed. |
+| **Sidecar must be available for setup/changes** — Creating, altering, or dropping stream tables requires the sidecar to regenerate triggers | Low | Same as deferred mode — the sidecar must be running for management operations. |
+
+#### 12.1.4 Comparison: Extension vs. Sidecar IMMEDIATE Mode
+
+| Aspect | Extension (Rust triggers) | Sidecar (PL/pgSQL triggers) |
+|--------|--------------------------|---------------------------|
+| **Delta computation** | Rust DVM engine at runtime | Pre-compiled SQL in trigger body |
+| **Trigger overhead** | ~0.1ms (C function call) | ~1-5ms (PL/pgSQL + EXECUTE) |
+| **Delta SQL execution** | Same | Same (identical SQL) |
+| **Read-your-writes** | ✅ | ✅ |
+| **ExclusiveLock** | ✅ | ✅ |
+| **Transition table access** | ✅ (C-level ENR) | ✅ (PL/pgSQL REFERENCING) |
+| **Adaptive fallback** | ✅ (runtime Rust logic) | ⚠️ (embedded SQL threshold check) |
+| **Template regeneration** | Automatic (in-memory cache) | Requires sidecar reconnection |
+| **Requires extension** | Yes | **No** |
+| **Requires sidecar running** | No (after install) | Only for setup/schema changes |
+
+#### 12.1.5 Revised Feature Matrix
 
 | Feature | Extension Mode | Sidecar Mode |
 |---------|---------------|--------------|
 | FULL refresh | ✅ | ✅ |
 | DIFFERENTIAL refresh | ✅ | ✅ |
-| IMMEDIATE refresh | ✅ | ❌ **Not possible** |
-| pg_ivm compatibility layer | ✅ | ❌ **Not possible** |
-| Read-your-writes consistency | ✅ (IMMEDIATE) | ❌ (eventual only) |
+| IMMEDIATE refresh | ✅ (Rust triggers) | ✅ **Compiled PL/pgSQL triggers** |
+| pg_ivm compatibility layer | ✅ | ✅ (via compiled triggers) |
+| Read-your-writes consistency | ✅ | ✅ |
+| Runtime delta adaptivity | ✅ Full | ⚠️ Limited (threshold-based) |
 
-This means:
-- The extension remains the only option for users who need **transactional
-  consistency** (pg_ivm replacement use case).
-- The sidecar serves the **analytics / dashboard / eventual-consistency**
-  use case where sub-second staleness is acceptable.
-- Marketing and documentation must clearly communicate this distinction.
+**Verdict: IMMEDIATE mode IS possible in sidecar mode**, via pre-compiled
+PL/pgSQL triggers. The sidecar acts as a compiler — it generates the delta
+SQL at setup time and embeds it in trigger functions. The extension mode
+remains faster (native Rust vs. PL/pgSQL dispatch) and more flexible
+(runtime adaptivity), but the sidecar can deliver the same correctness
+guarantees.
 
-#### 12.1.3 Shared DVM Code — But Different Delta Sources
+#### 12.1.6 Shared DVM Code — Different Deployment Targets
 
-The TRANSACTIONAL_IVM plan proposes a `DeltaSource` enum:
+The DVM operator tree and diff engine are **fully shared** across all modes.
+The `DeltaSource` abstraction determines how the `Scan` operator emits SQL:
 
 ```rust
 enum DeltaSource {
+    /// Deferred mode: read from change buffer tables with LSN range.
     ChangeBuffer { lsn_range: (Lsn, Lsn) },
-    TransitionTable { old_tuplestore: ..., new_tuplestore: ... },
+    /// Immediate mode (extension): reference ENRs from transition tables.
+    TransitionTableEnr { old_enr: String, new_enr: String },
+    /// Immediate mode (sidecar): reference transition table names in
+    /// PL/pgSQL trigger context (same SQL, different deployment).
+    TransitionTablePlpgsql { old_name: String, new_name: String },
 }
 ```
 
-The sidecar would add a third variant:
+In practice, `TransitionTableEnr` and `TransitionTablePlpgsql` produce
+**identical SQL** — the only difference is the execution context (C SPI
+vs. PL/pgSQL `EXECUTE`). They could be a single variant.
 
-```rust
-enum DeltaSource {
-    ChangeBuffer { lsn_range: (Lsn, Lsn) },      // Deferred (both modes)
-    TransitionTable { old_enr: ..., new_enr: ... }, // Immediate (extension only)
-    // No sidecar-specific variant needed — sidecar uses ChangeBuffer
-}
-```
+The workspace restructuring (Phase S0) should place the `DeltaSource`
+enum and template generation in `pgtrickle-core`. The extension wraps
+templates in Rust trigger functions; the sidecar wraps them in PL/pgSQL.
 
-The DVM operator tree and diff engine are **fully shared** across all three
-modes. Only the `Scan` operator's delta SQL generation differs based on the
-`DeltaSource`. This reinforces the workspace restructuring in Phase S0 —
-the `pgtrickle-core` crate handles all modes, while `pgtrickle-extension`
-adds the ENR/trigger machinery and `pgtrickle-sidecar` adds the pgwire
-client.
+#### 12.1.7 Sequencing Recommendation
 
-#### 12.1.4 Sequencing Recommendation
-
-The crate restructuring (Phase S0) should account for the `DeltaSource`
-abstraction from day one, even if IMMEDIATE mode is implemented later. This
-avoids a second restructuring when Transactional IVM lands.
-
-Suggested order:
 1. Phase S0: Restructure into workspace with `DeltaSource` enum in core
-2. Build sidecar (Phases S1-S6) using `ChangeBuffer` variant
-3. Implement IMMEDIATE mode in `pgtrickle-extension` using `TransitionTable`
-   variant
-4. Both can proceed in parallel after Phase S0
+2. Add a `generate_immediate_trigger_sql()` function that produces the
+   PL/pgSQL trigger function body from a delta template
+3. Sidecar uses this to install compiled triggers for IMMEDIATE mode
+4. Extension continues using Rust-native trigger functions for performance
+5. Both share the same DVM engine, delta SQL, and MERGE templates
 
 ### 12.2 Impact of PLAN_DIAMOND_DEPENDENCY_CONSISTENCY
 
@@ -731,18 +820,19 @@ reads this via a standard SQL query rather than a GUC.
 
 The Diamond plan notes (§8.2) that IMMEDIATE mode **inherently avoids** the
 diamond inconsistency problem because changes propagate within a single
-transaction via trigger nesting. This is correct — and it reinforces the
-feature matrix:
+transaction via trigger nesting. This applies equally to the compiled
+PL/pgSQL triggers used in sidecar mode (§12.1.2) — trigger nesting works
+identically regardless of whether the trigger function is C/Rust or
+PL/pgSQL.
 
 | Scenario | Extension | Sidecar |
-|----------|-----------|---------|
+|----------|-----------|--------|
 | Diamond + DEFERRED | Needs consistency groups | Needs consistency groups |
-| Diamond + IMMEDIATE | No problem (same-transaction) | N/A (IMMEDIATE not available) |
+| Diamond + IMMEDIATE | No problem (trigger nesting) | No problem (trigger nesting) |
 
-Since the sidecar only supports DEFERRED mode, diamond consistency is
-**always relevant** for sidecar deployments with fan-in DAGs. The sidecar
-should implement at least the frontier alignment check (Option 2) from the
-start, with atomic groups as a follow-up.
+Diamond consistency is relevant for DEFERRED mode in **both** deployment
+modes. Sidecar deployments using IMMEDIATE compiled triggers get the same
+intra-transaction consistency as the extension.
 
 #### 12.2.6 Sequencing Recommendation
 
@@ -760,35 +850,41 @@ Suggested order:
 ### 12.3 Combined Impact Summary
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │          Feature Availability            │
-                    ├──────────────────┬──────────────────────┤
-                    │  Extension Mode  │   Sidecar Mode       │
-┌───────────────────┼──────────────────┼──────────────────────┤
-│ DEFERRED refresh  │       ✅         │        ✅            │
-│ FULL refresh      │       ✅         │        ✅            │
-│ IMMEDIATE refresh │       ✅         │        ❌            │
-│ pg_ivm compat     │       ✅         │        ❌            │
-│ Diamond: atomic   │       ✅         │        ✅            │
-│ Diamond: aligned  │       ✅         │        ✅            │
-│ Diamond: none     │       ✅         │        ✅            │
-│ CDC: triggers     │       ✅         │        ✅            │
-│ CDC: WAL          │       ✅         │        ✅            │
-│ DDL event triggers│       ✅         │     ⚠️ Partial       │
-│ Managed PG        │       ❌         │        ✅            │
-└───────────────────┴──────────────────┴──────────────────────┘
+                    ┌─────────────────────────────────────────────┐
+                    │            Feature Availability              │
+                    ├──────────────────┬──────────────────────────┤
+                    │  Extension Mode  │      Sidecar Mode        │
+┌───────────────────┼──────────────────┼──────────────────────────┤
+│ DEFERRED refresh  │       ✅         │        ✅                │
+│ FULL refresh      │       ✅         │        ✅                │
+│ IMMEDIATE refresh │       ✅         │  ✅ Compiled triggers    │
+│ pg_ivm compat     │       ✅         │  ✅ Compiled triggers    │
+│ Diamond: atomic   │       ✅         │        ✅                │
+│ Diamond: aligned  │       ✅         │        ✅                │
+│ Diamond: none     │       ✅         │        ✅                │
+│ CDC: triggers     │       ✅         │        ✅                │
+│ CDC: WAL          │       ✅         │        ✅                │
+│ DDL event triggers│       ✅         │     ⚠️ Partial           │
+│ Managed PG        │       ❌         │        ✅                │
+└───────────────────┴──────────────────┴──────────────────────────┘
 ```
 
-The key takeaway: **IMMEDIATE mode is the one feature that absolutely
-requires the extension.** Everything else — including diamond consistency
-— ports cleanly to the sidecar. This means the dual-mode strategy has a
-clear value proposition for each mode:
+The key takeaway: **There is no fundamental feature gap between extension
+and sidecar mode.** IMMEDIATE mode, previously assumed to require the
+extension, can be delivered via pre-compiled PL/pgSQL triggers (§12.1.2).
+The extension retains a **performance advantage** (native Rust trigger
+dispatch vs. PL/pgSQL + EXECUTE) and **runtime adaptivity** (dynamic
+fallback logic), but the sidecar achieves **correctness parity**.
 
-- **Extension:** Full feature set including IMMEDIATE mode and pg_ivm
-  compatibility. Best for self-hosted PG where maximum consistency matters.
-- **Sidecar:** DEFERRED mode with diamond consistency. Best for managed PG
-  where installation constraints prevent extension loading. Accepts eventual
-  consistency in exchange for zero-install deployment.
+The dual-mode strategy offers:
+
+- **Extension:** Maximum performance — native Rust trigger execution,
+  in-memory caching, zero-overhead IMMEDIATE mode. Best for self-hosted PG
+  where both performance and consistency matter.
+- **Sidecar:** Full feature set via compiled triggers and pgwire management.
+  Best for managed PG where extension loading is impossible. Accepts
+  slightly higher trigger dispatch overhead in exchange for zero-install
+  deployment.
 
 ### 12.4 Impact on Implementation Phases
 
@@ -797,13 +893,13 @@ implementation timeline:
 
 | Phase | Original Estimate | Adjusted | Reason |
 |-------|------------------|----------|--------|
-| S0: Crate restructuring | 2-3 weeks | **3-4 weeks** | Must also design `DeltaSource` abstraction and diamond detection API in core |
+| S0: Crate restructuring | 2-3 weeks | **3-4 weeks** | Must also design `DeltaSource` abstraction, compiled trigger generator, and diamond detection API in core |
 | S1: pg_query parser | 2-4 weeks | 2-4 weeks | No change — parser is mode-independent |
 | S2: Client layer | 2-3 weeks | **3-4 weeks** | Must include transaction/SAVEPOINT abstraction for diamond atomic groups |
 | S3: Sidecar binary | 2-3 weeks | 2-3 weeks | No change |
 | S4: Management | 1-2 weeks | 1-2 weeks | No change |
 | S5: WAL CDC | 1-2 weeks | 1-2 weeks | No change |
-| S6: Testing | 2-3 weeks | **3-4 weeks** | Must test diamond consistency in sidecar mode; IMMEDIATE mode exclusion tests |
+| S6: Testing | 2-3 weeks | **3-4 weeks** | Must test diamond consistency in sidecar mode; compiled trigger IMMEDIATE mode; perf benchmarks |
 | **Total** | **12-18 weeks** | **15-22 weeks** | ~3-4 weeks added for cross-plan concerns |
 
 ---
@@ -825,24 +921,38 @@ implementation timeline:
    traffic and transparently add CDC triggers — no user action needed. This is
    how Epsio works. Adds significant complexity.
 
-5. **Should the sidecar clearly document IMMEDIATE mode as extension-only at
-   setup time?** If a user tries to create an IMMEDIATE stream table via the
-   sidecar, it should fail with a clear error message pointing them to the
-   extension.
+5. **Should the sidecar enable IMMEDIATE mode by default or opt-in?**
+   Compiled PL/pgSQL triggers (§12.1.2) make IMMEDIATE mode possible in
+   sidecar deployments, but the performance profile differs from the
+   extension. Should the sidecar default to DEFERRED and let users opt in
+   to IMMEDIATE, or mirror the extension's defaults?
 
 6. **Should diamond consistency default to `'aligned'` in sidecar mode?**
-   Since sidecar users can't fall back to IMMEDIATE mode for same-transaction
-   consistency, a stricter default for diamond handling may be warranted.
+   Now that IMMEDIATE mode is available in both modes, the urgency is
+   reduced. But aligned defaults may still be warranted for DEFERRED-mode
+   users.
 
 ---
 
 ## 14. Verdict
 
-**Yes, it is feasible** to ship pg_trickle as an external sidecar process. The
-largest technical hurdle is the SQL parser migration (~2-4 weeks), but
-`pg_query.rs` provides a proven, high-fidelity alternative. Most other
-components (catalog, CDC, refresh, DAG, scheduling) migrate mechanically from
-SPI to pgwire client calls.
+**Yes, it is feasible** to ship pg_trickle as an external sidecar process
+**with full feature parity**. The largest technical hurdle is the SQL parser
+migration (~2-4 weeks), but `pg_query.rs` provides a proven, high-fidelity
+alternative. Most other components (catalog, CDC, refresh, DAG, scheduling)
+migrate mechanically from SPI to pgwire client calls.
+
+The critical discovery (§12.1) is that even IMMEDIATE mode — previously
+assumed to require the extension — can be delivered in sidecar mode via
+pre-compiled PL/pgSQL triggers. The DVM engine's output is pure SQL, not
+runtime code, so the sidecar acts as a **compiler** that generates and
+deploys trigger functions. This eliminates the only hard feature gap between
+the two modes.
+
+The extension retains a performance advantage (native Rust triggers vs.
+PL/pgSQL dispatch) and runtime adaptivity (dynamic fallback logic). The
+sidecar offers deployment flexibility (no extension installation, managed
+PG support) with correctness parity.
 
 The recommended approach is:
 
@@ -850,6 +960,7 @@ The recommended approach is:
    cleanly separate pure Rust logic from pgrx-specific code. This benefits
    the extension build regardless.
 2. **Medium-term:** Build a Minimum Viable Sidecar (4-6 weeks) to validate
-   the concept with early adopters on managed PostgreSQL.
-3. **Long-term:** Invest in the full sidecar with WAL CDC, HTTP API, and
+   the concept with early adopters on managed PostgreSQL. Start with DEFERRED
+   mode.
+3. **Long-term:** Add IMMEDIATE compiled triggers, WAL CDC, HTTP API, and
    multi-database support once market fit is validated.
