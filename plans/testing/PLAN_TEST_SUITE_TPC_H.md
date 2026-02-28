@@ -28,31 +28,57 @@ query that pg_trickle can currently handle:
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
 | Phase 1: Differential Correctness | Done — 14/22 pass, 8 soft-skip |
 | Phase 2: Cross-Query Consistency | Done — 15/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 15/22 pass |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 14/22 pass |
 
-### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
+### Latest Test Run (2026-02-28, SF=0.01, 3 cycles)
+
+All three phases run cleanly after resolving Docker disk space constraints.
+No "No space left on device" or connection-reset errors.
 
 ```
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured
+Phase 1: test result: ok. 1 passed; 0 failed  (14/22 queries pass, 34s)
+Phase 2: test result: ok. 1 passed; 0 failed  (15/20 STs survive, 35s)
+Phase 3: test result: ok. 1 passed; 0 failed  (14/22 queries pass, 35s)
 ```
 
 **Deterministically passing (14):** Q05, Q06, Q07, Q08, Q09, Q10,
 Q11, Q12, Q14, Q16, Q18, Q20, Q21, Q22 — pass all 3 cycles consistently
-across multiple runs.
+across multiple runs in Phase 1 (individual query mode).
 
-**Phase 3 (FULL vs DIFF): 15/22** — deterministic and stable.
+**Phase 3 (FULL vs DIFF): 14/22** — deterministic and stable.
 
 **Cross-query consistency: 15/20** STs survive all 3 cycles.
+
+**New finding:** Q07 passes all 3 cycles in Phase 1 (individual) but fails
+cycle 2 in Phase 2 (cross-query: ST=2, Q=2, extra=1, missing=1). This
+suggests cross-query interference when 20 STs share the same source tables
+and are refreshed in rapid succession. Root cause TBD — may be a change
+buffer min-frontier edge case with many consumers.
+
+**Performance observation:** SemiJoin/AntiJoin queries exhibit 30–80×
+slowdown on cycles 2–3 vs cycle 1:
+
+| Query | Cycle 1 | Cycle 2 | Cycle 3 | Slowdown |
+|-------|---------|---------|---------|----------|
+| Q21 | 75ms | 5,422ms | 5,415ms | 72× |
+| Q18 | 64ms | 4,933ms | 5,099ms | 77× |
+| Q20 | 88ms | 2,184ms | 2,270ms | 25× |
+| Q04 | 59ms | 1,771ms | — (fail) | 30× |
+
+Root cause: Part 2 of SemiJoin/AntiJoin delta scans the full left-side
+snapshot (potentially a multi-table join) and evaluates 3 EXISTS subqueries
+per row, including `r_old_snapshot` (EXCEPT ALL / UNION ALL set operation).
+Not a correctness blocker but impacts cycle time at larger scale factors.
 
 **Queries failing cycle 2+ (6):**
 
 | Query | Cycle 2+ Error | Category |
 |-------|----------------|----------|
-| Q01 | Data mismatch cycle 3: ST=6, Q=6, extra=6, missing=6 — all groups drift after 3 cycles (single-table aggregate, no joins). Fails only when run in shared container after many prior mutation rounds. | Aggregate drift (cumulative) |
-| Q03 | Data mismatch cycle 2: ST=49, Q=48, extra=1, missing=0 — one extra row in 3-table join delta (improved from extra=1,missing=1 by pre-change snapshot fix) | Join delta value drift |
-| Q04 | Data mismatch cycle 3: ST=5, Q=5, extra=1, missing=1 — SemiJoin delta drift after 3 cycles | SemiJoin delta drift |
+| Q01 | Data mismatch cycle 3: ST=6, Q=6, extra=6, missing=6 — all 6 groups drift after 3 cycles. Single-table aggregate on lineitem, no joins. Reproducible in both individual and shared container modes. | Aggregate drift (cumulative) |
+| Q03 | Data mismatch cycle 2–3: ST≈49, Q≈48, extra=1, missing=0–1 — one extra/missing row in 3-table join delta. Cycle boundary is non-deterministic (sometimes cycle 2, sometimes cycle 3). | Join delta value drift |
+| Q04 | Data mismatch cycle 3: ST=5, Q=5, extra=1, missing=1 — SemiJoin delta drift after 3 cycles. Passes cycles 1–2. | SemiJoin delta drift |
 | Q13 | Data mismatch cycle 2: ST=2, Q=3, extra=0, missing=1 — missing row; intermediate aggregate (LeftJoin + subquery-in-FROM + outer GROUP BY) | Intermediate agg |
-| Q15 | Data mismatch cycle 2: ST=3, Q=1, extra=2, missing=0 — phantom row; scalar subquery MAX filter doesn't recompute correctly | Scalar subquery delta |
+| Q15 | Data mismatch cycle 2: ST=3, Q=1, extra=2, missing=0 — phantom rows; scalar subquery MAX filter doesn't recompute correctly | Scalar subquery delta |
 | Q19 | Data mismatch cycle 2: ST=0, Q=1, extra=0, missing=1 — entire result missing; scalar aggregate with multi-table join and complex OR filter | Join delta + OR filter |
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
@@ -63,7 +89,7 @@ across multiple runs.
 | Category | Queries | Root Cause |
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_trickle DVM does not support correlated scalar subqueries in WHERE |
-| **Cycle 3 — aggregate drift (cumulative)** | Q01 | Single-table aggregate (lineitem GROUP BY) drifts after 3 mutation cycles when run in shared container following many prior queries' mutation rounds. No joins involved — not caused by join delta changes. Likely pre-existing issue that manifests under mutation accumulation. |
+| **Cycle 3 — aggregate drift (cumulative)** | Q01 | Single-table aggregate (lineitem GROUP BY) drifts after 3 mutation cycles. Reproducible in both individual and shared container modes. No joins involved — not caused by join delta changes. All 6 groups have wrong values (extra=6, missing=6). Suggests systematic algebraic SUM/COUNT drift rather than isolated rounding. |
 | **Cycle 2 — join delta value drift** | Q03 | 3-table join (lineitem ⋈ orders ⋈ customer) with SUM aggregate. Pre-change snapshot fix reduced error from extra=1,missing=1 to extra=1,missing=0. Remaining issue: extra row in delta (only for nested join children where L₀ fallback to L₁ allows double-counting). |
 | **Cycle 3 — SemiJoin delta drift** | Q04 | SemiJoin (EXISTS subquery) aggregate drifts after 3 cycles when run in shared container. Similar pattern to Q01 — fails only at cycle 3, suggesting cumulative effects. |
 | ~~**Cycle 2 — join delta value drift**~~ | ~~Q07~~ | ~~FIXED~~ — Inner join pre-change snapshot (L₀ via EXCEPT ALL for Scan children) eliminates double-counting of ΔL ⋈ ΔR when both sides change simultaneously |
@@ -107,7 +133,46 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-#### Priority 1: Fix join delta value drift (Q03) — Q07 FIXED
+**Scorecard:** 14/22 pass (64%) · 6 data mismatch · 2 CREATE blocked
+
+#### Prioritized Remaining Work
+
+| # | Category | Queries | Impact | Difficulty | Files |
+|---|----------|---------|--------|------------|-------|
+| **P1** | Cumulative aggregate drift | Q01, Q04 | +2 pass | Medium | `aggregate.rs` (merge expressions) |
+| **P2** | Join delta value drift | Q03 | +1 pass | Hard | `join.rs` (nested join L₀) |
+| **P3** | Intermediate aggregate | Q13 | +1 pass | Medium | `aggregate.rs` (`build_intermediate_agg_delta`) |
+| **P4** | Scalar subquery delta | Q15 | +1 pass | Hard | `aggregate.rs`, `join_common.rs` (CROSS JOIN + MAX) |
+| **P5** | Scalar aggregate join | Q19 | +1 pass | Medium | `join.rs`, `filter.rs` (OR filter + scalar SUM) |
+| **P6** | Correlated scalar subquery | Q02, Q17 | +2 create | Hard | `parser.rs` (`rewrite_scalar_subquery_in_where`) |
+| **P7** | Cross-query interference | Q07 (Phase 2 only) | stability | Medium | `refresh.rs` (min-frontier edge case) |
+| **P8** | SemiJoin performance | Q21, Q18, Q20, Q04 | perf | Low | `semi_join.rs`, `anti_join.rs` (Part 2 snapshot) |
+
+#### P1: Fix cumulative aggregate drift (Q01, Q04)
+
+**Q01** (single-table aggregate, lineitem GROUP BY) and **Q04** (SemiJoin +
+aggregate) both pass cycles 1–2 but fail at cycle 3, with all groups showing
+wrong values. The pattern (extra=N, missing=N with same row count) indicates
+systematic value drift rather than row gain/loss. Q01 has 6 aggregates per
+group (SUM, AVG, COUNT) — AVG already uses group-rescan, so the drift is
+in the algebraic SUM/COUNT merge expressions.
+
+**Hypothesis:** The algebraic merge `new_sum = old_sum + delta_ins_sum -
+delta_del_sum` accumulates errors when UPDATE is decomposed as DELETE+INSERT.
+If the DELETE delta's SUM doesn't exactly cancel the original row's
+contribution (e.g., due to intermediate rounding or `__pgt_count`
+bookkeeping), the error compounds each cycle.
+
+**Potential fix:** Extend group-rescan to SUM/COUNT for single-table
+aggregates where the source is scannable. This would sacrifice algebraic
+efficiency but guarantee correctness. Alternatively, validate `__pgt_count`
+consistency after each merge and trigger rescan on mismatch.
+
+**Files:** `src/dvm/operators/aggregate.rs` (`agg_merge_expr`,
+`agg_delta_exprs`, `direct_agg_delta_exprs`)
+**Impact:** Would fix Q01 and likely Q04 (+2 pass → 16/22)
+
+#### P2: Fix join delta value drift (Q03) — Q07 FIXED
 
 **Q07: FIXED** — Inner join Part 2 now uses pre-change snapshot L₀ for Scan
 children: `L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. This
@@ -117,57 +182,96 @@ because computing L₀ for nested join children (via full join snapshot
 EXCEPT ALL) is prohibitively expensive for multi-table chains.
 
 **Q03: IMPROVED** — Error reduced from `extra=1, missing=1` (wrong values)
-to `extra=1, missing=0` (one extra row). The remaining issue is in the
+to `extra=1, missing=0–1` (non-deterministic). The remaining issue is in the
 outer join of the 3-table chain: `(lineitem ⋈ orders) ⋈ customer`. The
 inner `lineitem ⋈ orders` join correctly uses L₀ for Scan children, but
 the outer join's Part 2 falls back to L₁ (post-change) for the nested
 join child, which can still double-count when both the inner join result
 AND customer change simultaneously. In TPC-H, only orders/lineitem change
 via RF, so customer doesn't change — the remaining extra row may be from
-a different source (e.g., SemiJoin interaction or aggregate handling).
+aggregate handling of the join delta.
 
-**Files changed:** `src/dvm/operators/join.rs`
-**Impact:** Q07 fixed (+1 pass). Q03 improved but needs further investigation.
+**Files:** `src/dvm/operators/join.rs`
+**Impact:** Would fix Q03 (+1 pass → 15/22 or 17/22 with P1)
 
-#### Priority 2: Fix scalar aggregate multi-table join delta (Q19)
-
-Q19 (2-table join + complex OR filter + scalar SUM) loses its entire result
-row after cycle 2 (ST=0, Q=1). Previously masked by the change buffer
-cleanup bug — now correctly sees all its changes but produces wrong results.
-
-**Files to investigate:** `src/dvm/operators/join.rs`, `src/dvm/operators/filter.rs`
-**Impact:** Would fix Q19 (+1 pass)
-
-#### Priority 3: Fix scalar subquery delta accuracy (Q15)
-
-Q15 uses `WHERE total_revenue = (SELECT MAX(total_revenue) FROM revenue0)` —
-a scalar subquery that computes MAX over a derived table. When the derived
-table's data changes, the MAX value changes, and the filter condition selects
-different suppliers. The delta produces a phantom row (ST=2, Q=1). Previously
-masked by the change buffer cleanup bug.
-
-**Files to investigate:** `src/dvm/operators/aggregate.rs` (intermediate agg delta for MAX), `src/dvm/operators/join_common.rs` (CROSS JOIN delta with scalar subquery child)
-**Impact:** Would fix Q15 (+1 pass)
-
-#### Priority 4: Fix intermediate aggregate data mismatch (Q13)
+#### P3: Fix intermediate aggregate data mismatch (Q13)
 
 Q13 progressed from `column st.c_custkey does not exist` to a data mismatch
 (ST=2, Q=3). The intermediate aggregate detection and
 `build_intermediate_agg_delta` function correctly handle the LeftJoin child
 but the old/new rescan produces fewer rows than expected.
 
-**Files to investigate:** `src/dvm/operators/aggregate.rs` (build_intermediate_agg_delta)
+**Hypothesis:** The `group_filter` (WHERE clause limiting rescan to affected
+groups) doesn't capture all groups affected by LEFT JOIN delta changes. When
+an order is deleted, the LEFT JOIN delta may not produce a change row for
+the affected customer, so the intermediate aggregate doesn't rescan that
+group.
+
+**Files:** `src/dvm/operators/aggregate.rs` (`build_intermediate_agg_delta`)
 **Impact:** Would fix Q13 (+1 pass)
 
-#### Priority 5: Fix correlated scalar subquery support (2 queries)
+#### P4: Fix scalar subquery delta accuracy (Q15)
+
+Q15 uses `WHERE total_revenue = (SELECT MAX(total_revenue) FROM revenue0)` —
+a scalar subquery that computes MAX over a derived table. When the derived
+table's data changes, the MAX value changes, and the filter condition selects
+different suppliers. The delta produces phantom rows (ST=3, Q=1, extra=2).
+
+**Root cause:** The delta engine applies the MAX filter to the old and new
+states independently but doesn't re-evaluate which supplier matches the
+*new* MAX. The CROSS JOIN rewrite correctly propagates the scalar subquery
+result but the filter delta doesn't handle cascading changes (inner change
+→ new MAX → different outer rows pass the filter).
+
+**Files:** `src/dvm/operators/aggregate.rs` (intermediate agg delta for MAX),
+`src/dvm/operators/join_common.rs` (CROSS JOIN delta with scalar subquery)
+**Impact:** Would fix Q15 (+1 pass)
+
+#### P5: Fix scalar aggregate join delta (Q19)
+
+Q19 (2-table join + complex OR filter + scalar SUM) loses its entire result
+row after cycle 2 (ST=0, Q=1). Previously masked by the change buffer
+cleanup bug — now correctly sees all its changes but produces wrong results.
+
+**Files:** `src/dvm/operators/join.rs`, `src/dvm/operators/filter.rs`
+**Impact:** Would fix Q19 (+1 pass)
+
+#### P6: Fix correlated scalar subquery support (Q02, Q17)
 
 Q02 and Q17 use correlated scalar subqueries in WHERE clauses. The rewriter
 cannot safely detect when a scalar subquery references outer columns via bare
 column names (no `table.` prefix), so it cannot apply the CROSS JOIN rewrite.
 Deeper DVM support (named correlation context) is needed.
 
-**Files to fix:** `src/dvm/parser.rs::rewrite_scalar_subquery_in_where`
-**Impact:** Would unblock Q02 and Q17 (2/22 CREATE failures)
+**Files:** `src/dvm/parser.rs` (`rewrite_scalar_subquery_in_where`)
+**Impact:** Would unblock Q02 and Q17 (+2 CREATE → 16/22 creatable)
+
+#### P7: Investigate cross-query interference (Q07 Phase 2)
+
+Q07 passes all 3 cycles in Phase 1 (individual) but fails cycle 2 in Phase 2
+(cross-query: ST=2, Q=2, extra=1, missing=1). When 20 STs share the same
+source tables and are refreshed sequentially, Q07 gets incorrect join delta
+values. This may be a subtle change buffer min-frontier edge case where the
+frontier advances during sequential refresh, causing some STs to see partial
+change data from the next mutation round.
+
+**Files:** `src/refresh.rs` (min-frontier cleanup, `drain_pending_cleanups`)
+**Impact:** Would stabilize Q07 in Phase 2 (Phase 1 unaffected)
+
+#### P8: SemiJoin/AntiJoin performance optimization
+
+SemiJoin/AntiJoin Part 2 delta queries exhibit 30–80× slowdown on cycles 2–3
+vs cycle 1 (e.g., Q21: 75ms → 5.4s). Root cause: full left-side snapshot
+scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
+(EXCEPT ALL / UNION ALL operation). Not a correctness blocker.
+
+**Potential fixes:**
+- Materialize `r_old_snapshot` as a CTE instead of inline subquery
+- Add an index hint or hash-based filter on the delta join keys
+- Pre-filter left snapshot rows using a hash semi-join against delta keys
+
+**Files:** `src/dvm/operators/semi_join.rs`, `src/dvm/operators/anti_join.rs`
+**Impact:** Performance only — would reduce cycle time for Q21, Q18, Q20, Q04
 
 #### Resolved
 
@@ -477,13 +581,14 @@ pg_trickle and would slow down RF1/RF2 operations.
 
 Of the 22 TPC-H queries, **20 can be created** as stream tables (with SQL
 workarounds for NULLIF, LIKE, COUNT(DISTINCT), and CTE). Of those 20,
-**14 pass all mutation cycles**, **6 fail with data mismatch** (cycle 2+),
-and **2 cannot be created** (correlated scalar subquery).
+**14 pass all mutation cycles** in Phase 1 (individual), **6 fail with
+data mismatch** (cycle 2+), and **2 cannot be created** (correlated scalar
+subquery).
 
 | Status | Count | Queries |
 |--------|-------|---------|
-| All cycles pass | 14 | Q04, Q05, Q07, Q08, Q09, Q10, Q11, Q14, Q16, Q18, Q19, Q20, Q21, Q22 |
-| Data mismatch (cycle 2+) | 6 | Q01, Q03, Q06, Q12 (flaky), Q13, Q15 |
+| All cycles pass | 14 | Q05, Q06, Q07, Q08, Q09, Q10, Q11, Q12, Q14, Q16, Q18, Q20, Q21, Q22 |
+| Data mismatch (cycle 2+) | 6 | Q01 (c3), Q03 (c2–3), Q04 (c3), Q13 (c2), Q15 (c2), Q19 (c2) |
 | CREATE blocked | 2 | Q02, Q17 |
 
 ### Modifications Applied
@@ -715,12 +820,14 @@ test-tpch-fast:                      # SF-0.01 without image rebuild
 test-tpch-large: build-e2e-image     # SF-0.1
 ```
 
-### Step 4: Validation & Iteration ✅ (partial)
+### Step 4: Validation & Iteration ✅
 
-1. ✅ `just test-tpch-fast` runs and all 3 tests pass (exit code 0)
-2. ✅ 18 queries blocked by pg_trickle DVM bugs (documented above)
-3. ✅ Data generator produces sufficient rows for all 22 queries
-4. ⬜ RF3 UPDATEs currently only change lineitem prices — customer
+1. ✅ All 3 test phases run green (exit code 0) — 34–35s each at SF=0.01
+2. ✅ 14/22 queries pass all 3 mutation cycles (Phase 1)
+3. ✅ 15/20 STs survive cross-query consistency (Phase 2)
+4. ✅ 14/22 FULL vs DIFF match (Phase 3)
+5. ✅ Data generator produces sufficient rows for all 22 queries
+6. ⬜ RF3 UPDATEs currently only change lineitem prices — customer
    segment rotation was removed to work around the LEFT JOIN DVM bug.
    Re-add when `rewrite_expr_for_join` is fixed.
 
@@ -782,6 +889,6 @@ Both depend on `build-e2e-image` to ensure the Docker image exists.
    qualification bug (11 queries), aggregate drift in Q01/Q06, and 5
    parser/DVM feature gaps. The suites are complementary.
 
-5. **When to promote to CI** — Currently too slow for PR checks (~23s at
-   SF-0.01). Consider running in CI nightly after DVM bugs are fixed and
-   more queries pass.
+5. **When to promote to CI** — Currently ~35s per phase at SF-0.01. Could
+   run as a nightly job. Consider after fixing P1 (aggregate drift) to
+   reach 16/22+ pass rate.
