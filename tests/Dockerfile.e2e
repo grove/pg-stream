@@ -14,7 +14,7 @@
 # =============================================================================
 
 # ── Stage 1: Build the extension ────────────────────────────────────────────
-FROM postgres:18.1 AS builder
+FROM postgres:18.3 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -78,7 +78,7 @@ RUN echo "=== Package artifacts ===" && \
     echo "========================="
 
 # ── Stage 2: Runtime image with extension installed ─────────────────────────
-FROM postgres:18.1
+FROM postgres:18.3
 
 LABEL org.opencontainers.image.title="pg_trickle E2E test image"
 LABEL org.opencontainers.image.description="PostgreSQL 18.1 with pg_trickle extension for integration testing"

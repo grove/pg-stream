@@ -16,7 +16,7 @@
 # =============================================================================
 
 # ── Stage 1: Build the extension with coverage instrumentation ──────────────
-FROM postgres:18.1 AS builder
+FROM postgres:18.3 AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -86,7 +86,7 @@ RUN SYSROOT="$(rustc --print sysroot)" && \
     fi
 
 # ── Stage 2: Runtime image with instrumented extension ──────────────────────
-FROM postgres:18.1
+FROM postgres:18.3
 
 LABEL org.opencontainers.image.title="pg_trickle E2E coverage image"
 LABEL org.opencontainers.image.description="PostgreSQL 18.1 with coverage-instrumented pg_trickle"
