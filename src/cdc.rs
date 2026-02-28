@@ -809,6 +809,26 @@ pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgTrickle
     Ok(identity == "default" || identity == "full")
 }
 
+/// Return the REPLICA IDENTITY mode as a string for a source table.
+///
+/// Returns one of: `"default"`, `"full"`, `"nothing"`, `"index"`.
+/// Used by the WAL transition guard (G2.2) to require REPLICA IDENTITY FULL.
+pub fn get_replica_identity_mode(source_oid: pg_sys::Oid) -> Result<String, PgTrickleError> {
+    let identity = Spi::get_one_with_args::<String>(
+        "SELECT CASE relreplident \
+           WHEN 'd' THEN 'default' \
+           WHEN 'f' THEN 'full' \
+           WHEN 'n' THEN 'nothing' \
+           WHEN 'i' THEN 'index' \
+         END FROM pg_class WHERE oid = $1",
+        &[source_oid.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or_else(|| "nothing".into());
+
+    Ok(identity)
+}
+
 /// Returns true if the relation has any user-defined row-level triggers
 /// (excluding internal triggers and pg_trickle's own CDC triggers).
 ///

@@ -650,3 +650,125 @@ async fn test_top_level_window_still_works() {
         .await;
     assert_eq!(rn, 1);
 }
+
+// ── G1.2: Partition key change tests ─────────────────────────────────
+
+/// Test that UPDATE on a PARTITION BY key column correctly moves a row
+/// between partitions and recomputes both old and new partitions.
+///
+/// This is the verification test for G1.2 (SQL_GAPS_7). The scan emits
+/// DELETE(old) + INSERT(new); the old partition-key triggers recompute of
+/// partition A, the new partition-key triggers recompute of partition B.
+#[tokio::test]
+async fn test_window_differential_partition_key_change() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE wf_pkc (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO wf_pkc (dept, salary) VALUES
+         ('eng', 100), ('eng', 80), ('eng', 60),
+         ('sales', 90), ('sales', 70)",
+    )
+    .await;
+
+    db.create_st(
+        "wf_pkc_st",
+        "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_pkc",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.wf_pkc_st").await, 5);
+
+    // Move the top eng employee (salary=100) to the sales partition.
+    // This changes the PARTITION BY key (dept), so:
+    // - Old partition (eng): must recompute without salary=100
+    //   → eng now has [80, 60] → rn=[1, 2]
+    // - New partition (sales): must recompute with salary=100
+    //   → sales now has [100, 90, 70] → rn=[1, 2, 3]
+    db.execute("UPDATE wf_pkc SET dept = 'sales' WHERE dept = 'eng' AND salary = 100")
+        .await;
+    db.refresh_st("wf_pkc_st").await;
+
+    // Total row count unchanged — 5 rows
+    assert_eq!(db.count("public.wf_pkc_st").await, 5);
+
+    // Verify the full result matches a from-scratch execution
+    db.assert_st_matches_query(
+        "public.wf_pkc_st",
+        "SELECT dept, salary, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM wf_pkc",
+    )
+    .await;
+
+    // Verify specific partition membership:
+    // salary=100 should now be in sales partition, rn=1
+    let dept_100: String = db
+        .query_scalar("SELECT dept FROM public.wf_pkc_st WHERE salary = 100")
+        .await;
+    assert_eq!(dept_100, "sales", "salary=100 should have moved to sales");
+
+    let rn_100: i64 = db
+        .query_scalar("SELECT rn FROM public.wf_pkc_st WHERE salary = 100")
+        .await;
+    assert_eq!(rn_100, 1, "salary=100 should be rn=1 in sales");
+
+    // Old partition: salary=80 should now be rn=1 in eng
+    let rn_80: i64 = db
+        .query_scalar("SELECT rn FROM public.wf_pkc_st WHERE dept = 'eng' AND salary = 80")
+        .await;
+    assert_eq!(rn_80, 1, "salary=80 should be rn=1 in eng after key change");
+}
+
+/// Test partition key change with SUM() OVER — verifies aggregate
+/// window functions also update correctly when rows move between partitions.
+#[tokio::test]
+async fn test_window_differential_partition_key_change_sum() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE wf_pkcs (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO wf_pkcs (dept, salary) VALUES
+         ('eng', 100), ('eng', 80),
+         ('sales', 90), ('sales', 70)",
+    )
+    .await;
+
+    db.create_st(
+        "wf_pkcs_st",
+        "SELECT dept, salary, SUM(salary) OVER (PARTITION BY dept) AS dept_total FROM wf_pkcs",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Move salary=100 from eng to sales
+    db.execute("UPDATE wf_pkcs SET dept = 'sales' WHERE salary = 100")
+        .await;
+    db.refresh_st("wf_pkcs_st").await;
+
+    // Verify the result matches from-scratch query
+    db.assert_st_matches_query(
+        "public.wf_pkcs_st",
+        "SELECT dept, salary, SUM(salary) OVER (PARTITION BY dept) AS dept_total FROM wf_pkcs",
+    )
+    .await;
+
+    // eng total should now be 80 (only salary=80 remains)
+    let eng_total: i64 = db
+        .query_scalar("SELECT dept_total FROM public.wf_pkcs_st WHERE dept = 'eng' LIMIT 1")
+        .await;
+    assert_eq!(eng_total, 80, "eng total should be 80 after move");
+
+    // sales total should now be 90+70+100=260
+    let sales_total: i64 = db
+        .query_scalar("SELECT dept_total FROM public.wf_pkcs_st WHERE dept = 'sales' LIMIT 1")
+        .await;
+    assert_eq!(sales_total, 260, "sales total should be 260 after move");
+}
