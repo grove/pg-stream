@@ -435,6 +435,24 @@ See the `pg_trickle.user_triggers` GUC in [CONFIGURATION.md](CONFIGURATION.md) f
 
 **No.** Use `pgtrickle.alter_stream_table()` to modify schedule, refresh mode, or status. To change the defining query, drop and recreate the stream table.
 
+### Does pg_trickle work with PgBouncer or other connection poolers?
+
+**It depends on the pooling mode.** pg_trickle's background scheduler uses session-level features that are incompatible with **transaction-mode** connection pooling:
+
+| Feature | Issue with Transaction-Mode Pooling |
+|---|---|
+| `pg_advisory_lock()` | Session-level lock released when connection returns to pool — concurrent refreshes possible |
+| `PREPARE` / `EXECUTE` | Prepared statements are session-scoped — "does not exist" errors on different connections |
+| `LISTEN` / `NOTIFY` | Notifications lost when listeners change connections |
+
+**Recommended configurations:**
+
+- **Session-mode pooling** (`pool_mode = session`): Fully compatible. The scheduler holds a dedicated connection.
+- **Direct connection** (no pooler for the scheduler): Fully compatible. Application queries can still go through a pooler.
+- **Transaction-mode pooling** (`pool_mode = transaction`): **Not supported.** The scheduler requires a persistent session.
+
+**Tip:** If your infrastructure requires transaction-mode pooling (e.g., AWS RDS Proxy, Supabase), route the pg_trickle background worker through a direct connection while keeping application traffic on the pooler. Most connection poolers support per-database or per-user routing rules.
+
 ---
 
 ## Monitoring & Alerting
