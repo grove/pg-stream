@@ -97,7 +97,12 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     //    UNION ALL
     //    SELECT <right_cols> FROM delta_right WHERE __pgs_action = 'D')
     let right_cols = &right_result.columns;
-    let right_col_list: String = right_cols
+    // Filter out internal metadata columns (__pgs_count) from the EXCEPT ALL /
+    // UNION ALL column list. These are aggregate bookkeeping columns that:
+    // (a) don't exist in the snapshot (build_snapshot_sql doesn't produce them)
+    // (b) shouldn't participate in set-difference matching
+    let right_user_cols: Vec<&String> = right_cols.iter().filter(|c| *c != "__pgs_count").collect();
+    let right_col_list: String = right_user_cols
         .iter()
         .map(|c| quote_ident(c))
         .collect::<Vec<_>>()

@@ -27,17 +27,41 @@ fn resolve_col_for_child(expr: &Expr, child_cols: &[String]) -> String {
             table_alias: Some(tbl),
             column_name,
         } => {
+            // Direct disambiguated: tbl__col
             let disambiguated = format!("{tbl}__{column_name}");
             if child_cols.contains(&disambiguated) {
-                disambiguated
-            } else {
-                column_name.clone()
+                return disambiguated;
             }
+            // Nested join prefix: *__tbl__col
+            let nested_suffix = format!("__{tbl}__{column_name}");
+            for c in child_cols {
+                if c.ends_with(&nested_suffix) {
+                    return c.clone();
+                }
+            }
+            // Exact match on column name alone
+            if child_cols.contains(column_name) {
+                return column_name.clone();
+            }
+            column_name.clone()
         }
         Expr::ColumnRef {
             table_alias: None,
             column_name,
-        } => column_name.clone(),
+        } => {
+            // Exact match
+            if child_cols.contains(column_name) {
+                return column_name.clone();
+            }
+            // Suffix match: find column ending in __column_name
+            let suffix = format!("__{column_name}");
+            let matches: Vec<&String> =
+                child_cols.iter().filter(|c| c.ends_with(&suffix)).collect();
+            if matches.len() == 1 {
+                return matches[0].clone();
+            }
+            column_name.clone()
+        }
         _ => expr.strip_qualifier().to_sql(),
     }
 }
@@ -68,6 +92,10 @@ fn resolve_expr_for_child(expr: &Expr, child_cols: &[String]) -> String {
                 .map(|a| resolve_expr_for_child(a, child_cols))
                 .collect();
             format!("{func_name}({})", resolved_args.join(", "))
+        }
+        Expr::Raw(sql) => {
+            // Best-effort: replace column refs in raw SQL
+            crate::dvm::operators::filter::replace_column_refs_in_raw(sql, child_cols)
         }
         _ => expr.to_sql(),
     }
@@ -125,6 +153,76 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             Some(format!("{l} FULL JOIN {r} ON {}", condition.to_sql()))
         }
         OpTree::Project { child, .. } => child_to_from_sql(child),
+        OpTree::Subquery {
+            child,
+            alias,
+            column_aliases,
+        } => {
+            // Only recurse into Subquery when the child is an Aggregate.
+            // An Aggregate child produces a complete subquery expression
+            // (SELECT ... GROUP BY ...) that can be aliased and used as FROM.
+            //
+            // For other child types (Project, Filter over joins, etc.),
+            // return None so callers fall back to the defining-query approach.
+            // This is important because Project nodes rename columns with
+            // aliases (e.g., `extract(year from o_orderdate) AS o_year`)
+            // that are lost when child_to_from_sql recurses through them.
+            match child.as_ref() {
+                OpTree::Aggregate { .. } => {
+                    let inner = child_to_from_sql(child)?;
+                    if column_aliases.is_empty() {
+                        Some(format!("{inner} AS {}", quote_ident(alias)))
+                    } else {
+                        // Apply positional column aliases using PostgreSQL's
+                        // AS alias(col1, col2) syntax to match the delta's
+                        // renamed columns from diff_subquery.
+                        let col_list: Vec<String> =
+                            column_aliases.iter().map(|a| quote_ident(a)).collect();
+                        Some(format!(
+                            "{inner} AS {}({})",
+                            quote_ident(alias),
+                            col_list.join(", ")
+                        ))
+                    }
+                }
+                _ => None,
+            }
+        }
+        OpTree::Aggregate {
+            group_by,
+            aggregates,
+            child,
+            ..
+        } => {
+            let inner_from = child_to_from_sql(child)?;
+            let mut selects = Vec::new();
+            for expr in group_by {
+                selects.push(expr.to_sql());
+            }
+            // NOTE: do NOT include COUNT(*) AS __pgs_count here.
+            // The intermediate aggregate delta output_cols excludes __pgs_count
+            // (it's internal bookkeeping), so the child_to_from_sql must match.
+            // Including it here would cause column count mismatches in the
+            // EXCEPT ALL between SELECT * FROM this subquery and the delta CTE.
+            for agg in aggregates {
+                selects.push(format!(
+                    "{} AS {}",
+                    agg_to_rescan_sql(agg),
+                    quote_ident(&agg.alias),
+                ));
+            }
+            let gb = if group_by.is_empty() {
+                String::new()
+            } else {
+                let cols: Vec<String> = group_by.iter().map(|e| e.to_sql()).collect();
+                format!(" GROUP BY {}", cols.join(", "))
+            };
+            Some(format!(
+                "(SELECT {} FROM {inner_from}{})",
+                selects.join(", "),
+                gb,
+            ))
+        }
         _ => None,
     }
 }
@@ -137,7 +235,7 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
 ///
 /// SQL/JSON standard aggregates (`JSON_OBJECTAGG`, `JSON_ARRAYAGG`) carry
 /// their full deparsed SQL in the `AggFunc` variant and are returned directly.
-fn agg_to_rescan_sql(agg: &AggExpr) -> String {
+pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
     // SQL/JSON standard aggregates: use the stored raw SQL directly since
     // their special syntax (key: value, ABSENT ON NULL, etc.) cannot be
     // reconstructed from function name + arguments.
@@ -148,6 +246,12 @@ fn agg_to_rescan_sql(agg: &AggExpr) -> String {
                 None => String::new(),
             };
             return format!("{raw}{filter}");
+        }
+        AggFunc::ComplexExpression(raw) => {
+            // Complex expression with nested aggregates: the stored raw SQL
+            // already contains the full expression (including aggregate calls).
+            // The rescan CTE evaluates it against source data directly.
+            return raw.clone();
         }
         _ => {}
     }
@@ -198,6 +302,264 @@ fn agg_to_rescan_sql(agg: &AggExpr) -> String {
     };
 
     format!("{base}{within_group}{filter}")
+}
+
+// ── Intermediate aggregate delta (subquery-in-FROM) ─────────────────
+
+/// Build delta CTEs for an intermediate aggregate (one whose group-by
+/// columns do NOT exist in the stream table).
+///
+/// Instead of LEFT JOINing to the stream table (which doesn't have the
+/// intermediate columns), this builds:
+///
+/// 1. A "new rescan" CTE: re-aggregates affected groups from current data.
+/// 2. An "old rescan" CTE: re-aggregates affected groups from old data
+///    (current data minus child delta inserts, plus child delta deletes).
+/// 3. A final CTE: emits 'D' for old rows and 'I' for new rows.
+///
+/// The parent operator receives D/I pairs and processes them as normal
+/// delta events.
+fn build_intermediate_agg_delta(
+    ctx: &mut DiffContext,
+    child: &OpTree,
+    group_by: &[Expr],
+    group_output: &[String],
+    aggregates: &[AggExpr],
+    delta_cte: &str,
+) -> Result<DiffResult, PgStreamError> {
+    let source_from = child_to_from_sql(child);
+
+    // We need the child's source SQL for rescanning. If we can't reconstruct
+    // it, fall back to the defining query approach.
+    let from_sql = match source_from {
+        Some(sql) => sql,
+        None => {
+            // Fallback: if we have the defining query, wrap it. Otherwise error.
+            return Err(PgStreamError::InternalError(
+                "Cannot build intermediate aggregate delta: \
+                 child FROM clause cannot be reconstructed"
+                    .into(),
+            ));
+        }
+    };
+
+    // Build the rescan SELECT list: group columns + all aggregates
+    let mut rescan_selects = Vec::new();
+    for (expr, output) in group_by.iter().zip(group_output.iter()) {
+        let expr_sql = expr.to_sql();
+        let qt_output = quote_ident(output);
+        if expr_sql == *output {
+            rescan_selects.push(qt_output);
+        } else {
+            rescan_selects.push(format!("{expr_sql} AS {qt_output}"));
+        }
+    }
+    // COUNT(*) to track the group's row count (__pgs_count)
+    rescan_selects.push("COUNT(*) AS __pgs_count".to_string());
+    for agg in aggregates {
+        rescan_selects.push(format!(
+            "{} AS {}",
+            agg_to_rescan_sql(agg),
+            quote_ident(&agg.alias),
+        ));
+    }
+
+    // GROUP BY clause
+    let group_by_sql = if group_by.is_empty() {
+        String::new()
+    } else {
+        let gb: Vec<String> = group_by.iter().map(|e| e.to_sql()).collect();
+        format!("\nGROUP BY {}", gb.join(", "))
+    };
+
+    // Group filter: only rescan affected groups
+    let group_filter = if group_output.is_empty() {
+        String::new()
+    } else if group_output.len() == 1 {
+        let col = &group_output[0];
+        format!("{col} IN (SELECT {} FROM {delta_cte})", quote_ident(col),)
+    } else {
+        let corr: Vec<String> = group_output
+            .iter()
+            .map(|c| format!("{c} IS NOT DISTINCT FROM __pgs_d2.{}", quote_ident(c)))
+            .collect();
+        format!(
+            "EXISTS (SELECT 1 FROM {delta_cte} __pgs_d2 WHERE {})",
+            corr.join(" AND "),
+        )
+    };
+
+    // Determine WHERE/AND connector based on existing WHERE in from_sql.
+    // Only check for WHERE at the outer level — if from_sql is a subquery
+    // (starts with '('), any WHERE inside is internal to the subquery.
+    let has_outer_where = from_sql.contains(" WHERE ") && !from_sql.starts_with('(');
+    let where_connector = if group_filter.is_empty() {
+        String::new()
+    } else if has_outer_where {
+        format!("\n  AND {group_filter}")
+    } else {
+        format!("\nWHERE {group_filter}")
+    };
+
+    // ── New rescan CTE: aggregate on current (post-change) data ─────
+    let new_rescan_cte = ctx.next_cte_name("agg_new");
+    let new_rescan_sql = format!(
+        "SELECT {selects}\nFROM {from_sql}{where_connector}{group_by}",
+        selects = rescan_selects.join(",\n       "),
+        group_by = group_by_sql,
+    );
+    ctx.add_cte(new_rescan_cte.clone(), new_rescan_sql);
+
+    // ── Old rescan CTE: aggregate on old (pre-change) data ──────────
+    //
+    // Old data = current data - delta inserts + delta deletes.
+    // We use EXCEPT ALL / UNION ALL which works positionally (by column
+    // position, not by name). The source side uses SELECT * from the original
+    // FROM clause, while the delta side uses the child delta CTE columns.
+    // For join children, the source has raw column names while the delta
+    // has disambiguated names — positional matching handles this correctly.
+
+    // Get the child's delta CTE columns (these are what diff_node produced
+    // for the child). We need the data columns (excluding __pgs_action, __pgs_row_id).
+    let child_result = ctx.diff_node(child)?;
+    let delta_data_cols: Vec<String> = child_result
+        .columns
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect();
+    let delta_col_list = delta_data_cols.join(", ");
+
+    // Use the same alias for the old_rescan wrapper as the original FROM
+    // expression. This ensures that qualified column references in aggregate
+    // expressions (e.g., MAX(q.total_revenue)) resolve correctly against
+    // both the new_rescan and old_rescan CTEs.
+    let old_rescan_alias = if from_sql.starts_with('(') {
+        // Extract alias from "(...) AS alias" pattern
+        if let Some(as_pos) = from_sql.rfind(" AS ") {
+            from_sql[as_pos + 4..].trim_matches('"').to_string()
+        } else {
+            "__pgs_old".to_string()
+        }
+    } else {
+        "__pgs_old".to_string()
+    };
+
+    let old_rescan_cte = ctx.next_cte_name("agg_old");
+    let old_rescan_sql = format!(
+        "SELECT {selects}\nFROM (\
+         SELECT * FROM {from_sql}{where_connector} \
+         EXCEPT ALL \
+         SELECT {delta_col_list} FROM {child_delta} WHERE __pgs_action = 'I' \
+         UNION ALL \
+         SELECT {delta_col_list} FROM {child_delta} WHERE __pgs_action = 'D'\
+         ) {old_alias}{group_by}",
+        selects = rescan_selects.join(",\n       "),
+        child_delta = child_result.cte_name,
+        old_alias = quote_ident(&old_rescan_alias),
+        group_by = group_by_sql,
+    );
+    ctx.add_cte(old_rescan_cte.clone(), old_rescan_sql);
+
+    // ── Final CTE: emit D/I pairs ───────────────────────────────────
+    let final_cte = ctx.next_cte_name("agg_final");
+
+    // Build output columns — exclude __pgs_count since this is an intermediate
+    // aggregate. __pgs_count is internal bookkeeping for the top-level aggregate's
+    // MERGE with the stream table. Including it in intermediate output causes
+    // parent operators (e.g., InnerJoin) to propagate it into column references
+    // against snapshots that don't have it (leading to "column __pgs_count
+    // does not exist" errors).
+    let mut output_cols = Vec::new();
+    output_cols.extend(group_output.iter().cloned());
+    for agg in aggregates {
+        output_cols.push(agg.alias.clone());
+    }
+
+    // Row ID from group-by columns
+    let group_hash_exprs_n: Vec<String> = group_output
+        .iter()
+        .map(|c| format!("n.{}::TEXT", quote_ident(c)))
+        .collect();
+    let group_hash_exprs_o: Vec<String> = group_output
+        .iter()
+        .map(|c| format!("o.{}::TEXT", quote_ident(c)))
+        .collect();
+    let row_id_new = if group_hash_exprs_n.is_empty() {
+        "pgstream.pg_stream_hash('__singleton_group')".to_string()
+    } else {
+        build_hash_expr(&group_hash_exprs_n)
+    };
+    let row_id_old = if group_hash_exprs_o.is_empty() {
+        "pgstream.pg_stream_hash('__singleton_group')".to_string()
+    } else {
+        build_hash_expr(&group_hash_exprs_o)
+    };
+
+    let new_group_refs = group_output
+        .iter()
+        .map(|c| format!("n.{}", quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let old_group_refs = group_output
+        .iter()
+        .map(|c| format!("o.{}", quote_ident(c)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let new_agg_refs: Vec<String> = aggregates
+        .iter()
+        .map(|a| format!("n.{}", quote_ident(&a.alias)))
+        .collect();
+    let old_agg_refs: Vec<String> = aggregates
+        .iter()
+        .map(|a| format!("o.{}", quote_ident(&a.alias)))
+        .collect();
+
+    let extra_new_groups = if new_group_refs.is_empty() {
+        String::new()
+    } else {
+        format!("{new_group_refs}, ")
+    };
+    let extra_old_groups = if old_group_refs.is_empty() {
+        String::new()
+    } else {
+        format!("{old_group_refs}, ")
+    };
+    let extra_new_aggs = if new_agg_refs.is_empty() {
+        String::new()
+    } else {
+        format!(",\n       {}", new_agg_refs.join(",\n       "))
+    };
+    let extra_old_aggs = if old_agg_refs.is_empty() {
+        String::new()
+    } else {
+        format!(",\n       {}", old_agg_refs.join(",\n       "))
+    };
+
+    let final_sql = format!(
+        "\
+-- D events: old state of affected groups
+SELECT {row_id_old} AS __pgs_row_id,
+       'D'::TEXT AS __pgs_action,
+       {extra_old_groups}o.__pgs_count{extra_old_aggs}
+FROM {old_rescan_cte} o
+
+UNION ALL
+
+-- I events: new state of affected groups
+SELECT {row_id_new} AS __pgs_row_id,
+       'I'::TEXT AS __pgs_action,
+       {extra_new_groups}n.__pgs_count{extra_new_aggs}
+FROM {new_rescan_cte} n",
+    );
+
+    ctx.add_cte(final_cte.clone(), final_sql);
+
+    Ok(DiffResult {
+        cte_name: final_cte,
+        columns: output_cols,
+        is_deduplicated: false,
+    })
 }
 
 /// Build a rescan CTE that re-aggregates affected groups from the source
@@ -282,13 +644,16 @@ fn build_rescan_cte(
 
         // If the child is a Filter, the FROM already includes WHERE.
         // We need to use AND instead of WHERE for the group filter.
+        // Only check for WHERE at the outer level — if from_sql is a
+        // subquery (starts with '('), any WHERE inside is internal.
+        let has_outer_where = from_sql.contains(" WHERE ") && !from_sql.starts_with('(');
         if group_filter.is_empty() {
             format!(
                 "SELECT {selects}\nFROM {from_sql}{group_by}",
                 selects = selects.join(",\n       "),
                 group_by = group_by_sql,
             )
-        } else if from_sql.contains(" WHERE ") {
+        } else if has_outer_where {
             format!(
                 "SELECT {selects}\nFROM {from_sql}\n  AND {group_filter}{group_by}",
                 selects = selects.join(",\n       "),
@@ -554,7 +919,7 @@ fn direct_agg_delta_exprs(agg: &AggExpr) -> (String, String) {
                 ),
             )
         }
-        AggFunc::Sum | AggFunc::Avg => {
+        AggFunc::Sum => {
             let col = agg
                 .argument
                 .as_ref()
@@ -658,6 +1023,42 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         (delta_cte, group_output)
     };
 
+    // ── Detect intermediate aggregate ───────────────────────────────
+    //
+    // An intermediate aggregate is one whose output columns do NOT exist
+    // in the stream table (e.g., an inner GROUP BY in a subquery-in-FROM,
+    // or a global aggregate like MAX inside a scalar subquery).
+    // For such aggregates, we cannot LEFT JOIN to the stream table because
+    // the ST doesn't have the intermediate columns.  Instead, we build an
+    // "old snapshot" CTE by re-aggregating the child's old data (current
+    // data minus child delta inserts, plus child delta deletes).
+    let is_intermediate = if let Some(ref st_cols) = ctx.st_user_columns {
+        if !group_output.is_empty() {
+            // Grouped aggregate: check if any group column is missing from ST
+            group_output.iter().any(|g| !st_cols.contains(g))
+        } else if !aggregates.is_empty() {
+            // Global aggregate (no GROUP BY): check if aggregate output
+            // columns exist in the stream table. If not, this is an
+            // intermediate aggregate (e.g., MAX inside a scalar subquery).
+            aggregates.iter().any(|a| !st_cols.contains(&a.alias))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if is_intermediate {
+        return build_intermediate_agg_delta(
+            ctx,
+            child,
+            group_by,
+            &group_output,
+            aggregates,
+            &delta_cte,
+        );
+    }
+
     // ── Rescan CTE: re-aggregate affected groups for group-rescan aggs ──
     let rescan_cte = build_rescan_cte(ctx, child, group_by, &group_output, aggregates, &delta_cte);
     let has_rescan = rescan_cte.is_some();
@@ -687,8 +1088,13 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     }
 
     // New count = old + inserts - deletes
+    // COALESCE guards: for global aggregates (no GROUP BY) the agg_delta
+    // CTE always produces exactly one row.  When **all** child-delta rows
+    // are filtered out the SUM(CASE …) expressions evaluate over an empty
+    // set and return NULL, not 0.  Wrapping in COALESCE(…, 0) keeps the
+    // arithmetic safe.
     merge_selects.push(
-        "COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count AS new_count".to_string(),
+        "COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) AS new_count".to_string(),
     );
     merge_selects.push("COALESCE(st.__pgs_count, 0) AS old_count".to_string());
 
@@ -709,12 +1115,12 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         ));
     }
 
-    // Action classification
+    // Action classification (same COALESCE guards as new_count)
     merge_selects.push(
         "\
 CASE
-    WHEN st.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0 THEN 'I'
-    WHEN COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0 THEN 'D'
+    WHEN st.__pgs_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
+    WHEN COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) <= 0 THEN 'D'
     ELSE 'U'
 END AS __pgs_meta_action"
             .to_string(),
@@ -875,7 +1281,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("*".into());
             (
                 format!(
@@ -886,11 +1292,11 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
                 ),
             )
         }
-        AggFunc::Sum | AggFunc::Avg => {
+        AggFunc::Sum => {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("0".into());
             (
                 format!("SUM(CASE WHEN __pgs_action = 'I'{filter_and} THEN {col} ELSE 0 END)"),
@@ -901,7 +1307,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("NULL".into());
             let func = agg.function.sql_name();
             (
@@ -916,7 +1322,7 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             let col = agg
                 .argument
                 .as_ref()
-                .map(|e| resolve_col_for_child(e, child_cols))
+                .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("1".into());
             // We only need to detect "any change happened" — counting suffices.
             (
@@ -943,7 +1349,7 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
     match &agg.function {
         AggFunc::CountStar | AggFunc::Count => {
             format!(
-                "COALESCE(st.{qt}, 0) + d.{ins} - d.{del}",
+                "COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
             )
@@ -951,18 +1357,6 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
         AggFunc::Sum => {
             format!(
                 "COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)",
-                ins = quote_ident(&format!("__ins_{alias}")),
-                del = quote_ident(&format!("__del_{alias}")),
-            )
-        }
-        AggFunc::Avg => {
-            // AVG = SUM / COUNT — compute from the sum and count auxiliaries
-            format!(
-                "CASE WHEN (COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count) > 0 \
-                 THEN (COALESCE(st.{qt}, 0) * COALESCE(st.__pgs_count, 0) \
-                       + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0))::numeric \
-                       / (COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count) \
-                 ELSE NULL END",
                 ins = quote_ident(&format!("__ins_{alias}")),
                 del = quote_ident(&format!("__del_{alias}")),
             )
@@ -1252,10 +1646,25 @@ mod tests {
 
     #[test]
     fn test_agg_merge_expr_avg() {
+        // AVG uses group-rescan: merge expression should use NULL sentinel
+        // (no rescan CTE available in this test)
         let agg = avg_col("score", "avg_score");
         let result = agg_merge_expr(&agg, false);
-        assert!(result.contains("::numeric"));
-        assert!(result.contains("__pgs_count"));
+        assert!(
+            result.contains("THEN NULL"),
+            "AVG without rescan should use NULL sentinel: {result}"
+        );
+    }
+
+    #[test]
+    fn test_agg_merge_expr_avg_with_rescan() {
+        // AVG uses group-rescan: with rescan CTE, should reference r.{alias}
+        let agg = avg_col("score", "avg_score");
+        let result = agg_merge_expr(&agg, true);
+        assert!(
+            result.contains("r."),
+            "AVG with rescan should reference rescan CTE: {result}"
+        );
     }
 
     // ── MIN/MAX merge expression tests ──────────────────────────────
@@ -1545,7 +1954,7 @@ mod tests {
     fn test_is_group_rescan() {
         assert!(!AggFunc::Count.is_group_rescan());
         assert!(!AggFunc::Sum.is_group_rescan());
-        assert!(!AggFunc::Avg.is_group_rescan());
+        assert!(AggFunc::Avg.is_group_rescan());
         assert!(!AggFunc::Min.is_group_rescan());
         assert!(!AggFunc::Max.is_group_rescan());
         assert!(AggFunc::BoolAnd.is_group_rescan());
@@ -1806,7 +2215,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // Algebraic aggregates use addition
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // Rescan aggregates use NULL sentinel
@@ -2124,7 +2533,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // COUNT uses algebraic merge
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // BIT_OR uses rescan sentinel
@@ -2343,7 +2752,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // COUNT uses algebraic merge
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // STDDEV_POP uses rescan sentinel
@@ -2569,7 +2978,7 @@ mod tests {
         let sql = ctx.build_with_query(&dr.cte_name);
         // COUNT uses algebraic merge
         assert!(
-            sql.contains("d.__ins_count - d.__del_count"),
+            sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
         // PERCENTILE_CONT uses rescan sentinel
@@ -2632,7 +3041,8 @@ mod tests {
     }
 
     #[test]
-    fn test_no_rescan_cte_for_avg() {
+    fn test_rescan_cte_for_avg() {
+        // AVG now uses group-rescan for precision
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
@@ -2642,11 +3052,12 @@ mod tests {
         );
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        assert_sql_not_contains(&sql, "agg_rescan");
+        assert_sql_contains(&sql, "agg_rescan");
     }
 
     #[test]
-    fn test_no_rescan_cte_for_sum_count_avg_combined() {
+    fn test_rescan_cte_for_sum_count_avg_combined() {
+        // AVG triggers rescan even when mixed with algebraic SUM/COUNT
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
@@ -2660,7 +3071,7 @@ mod tests {
         );
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        assert_sql_not_contains(&sql, "agg_rescan");
+        assert_sql_contains(&sql, "agg_rescan");
     }
 
     #[test]

@@ -79,7 +79,9 @@ pub fn diff_anti_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     // Build R_old snapshot (same approach as semi_join)
     let right_cols = &right_result.columns;
-    let right_col_list: String = right_cols
+    // Filter out internal metadata columns (__pgs_count) — see semi_join.rs
+    let right_user_cols: Vec<&String> = right_cols.iter().filter(|c| *c != "__pgs_count").collect();
+    let right_col_list: String = right_user_cols
         .iter()
         .map(|c| quote_ident(c))
         .collect::<Vec<_>>()
