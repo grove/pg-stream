@@ -62,6 +62,7 @@ pub use parser::{
     reject_materialized_views, reject_unsupported_constructs, rewrite_distinct_on,
     rewrite_grouping_sets, rewrite_multi_partition_windows, rewrite_scalar_subquery_in_where,
     rewrite_sublinks_in_or, rewrite_views_inline, tree_worst_volatility_with_registry,
+    warn_limit_without_order_in_subqueries,
 };
 
 use crate::error::PgTrickleError;

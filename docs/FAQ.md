@@ -817,3 +817,49 @@ Use `pgtrickle.alter_stream_table()` to change schedule, refresh mode, or status
 2. **No recovery path for differential mode.** The refresh engine has no way to detect that the stream table was externally truncated. It assumes the current contents match the frontier.
 
 Use `pgtrickle.refresh_stream_table('my_table')` to force a full re-materialization, or drop and recreate the stream table if you need a clean slate.
+
+### What are the memory limits for delta processing?
+
+The differential refresh path executes the delta query as a **single SQL statement**. For large batches (e.g., a bulk UPDATE of 10M rows), PostgreSQL may attempt to materialize the entire delta result set in memory. If the delta exceeds `work_mem`, PostgreSQL will spill to temporary files on disk, which is slower but safe. In extreme cases, OOM (out of memory) can occur if `work_mem` is set very high and the delta is enormous.
+
+**Mitigations:**
+
+1. **Adaptive fallback.** The `pg_trickle.differential_max_change_ratio` GUC (default 0.15) automatically triggers a FULL refresh when the ratio of pending changes to total rows exceeds the threshold. This prevents large deltas from consuming excessive memory.
+
+2. **`work_mem` tuning.** PostgreSQL's `work_mem` setting controls how much memory each sort/hash operation uses before spilling to disk. For pg_trickle workloads, 64–256 MB is typical. Monitor `temp_blks_written` in `pg_stat_statements` to detect spilling.
+
+3. **`pg_trickle.merge_work_mem_mb` GUC.** Sets a session-level `work_mem` override during the MERGE execution (default: 0 = use global `work_mem`). This allows higher memory for refresh without affecting other queries.
+
+4. **Monitoring.** If `pg_stat_statements` is installed, pg_trickle logs a warning when the MERGE query writes temporary blocks to disk.
+
+### Why are refreshes processed sequentially?
+
+The scheduler processes stream tables **sequentially** in topological (dependency) order within a single background worker process. Even though `pg_trickle.max_concurrent_refreshes` can be set up to 32, **parallel refresh of independent branches is not yet implemented**.
+
+**Why sequential?**
+
+- **Correctness.** Topological ordering guarantees that upstream stream tables are refreshed before downstream ones. Parallel execution of independent DAG branches requires careful lock management to avoid read/write conflicts.
+- **Simplicity.** A single-worker model avoids connection pool exhaustion, advisory lock races, and prepared statement conflicts.
+
+**Impact:**
+
+- For most deployments with <100 stream tables, sequential processing adds negligible latency (each differential refresh typically takes 5–50ms).
+- For large deployments with many independent stream tables, total cycle time = sum of all individual refresh times.
+
+**Future:** Parallel refresh via multiple background workers is planned for a future release.
+
+### How many connections does pg_trickle use?
+
+pg_trickle uses the following PostgreSQL connections:
+
+| Component | Connections | When |
+|-----------|-------------|------|
+| Background scheduler | 1 | Always (per database with STs) |
+| WAL decoder polling | 0 (shared) | Uses the scheduler's SPI connection |
+| Manual refresh | 1 | Per-call (uses caller's session) |
+
+**Total**: 1 persistent connection per database. WAL decoder polling shares the scheduler's SPI connection rather than opening separate connections.
+
+**`max_worker_processes`**: pg_trickle registers 1 background worker per database during `_PG_init()`. Ensure `max_worker_processes` (default 8) has room for the pg_trickle worker plus any other extensions.
+
+**Advisory locks**: The scheduler holds a session-level advisory lock per actively-refreshing ST. These are released immediately after each refresh completes.

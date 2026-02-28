@@ -106,6 +106,13 @@ pub static PGS_WAL_TRANSITION_TIMEOUT: GucSetting<i32> = GucSetting::<i32>::new(
 /// accidental column changes should be prevented.
 pub static PGS_BLOCK_SOURCE_DDL: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// F46 (G9.3): Buffer growth alert threshold (number of pending change rows).
+///
+/// When any source table's change buffer exceeds this number of rows,
+/// a `BufferGrowthWarning` alert is emitted. Configurable to accommodate
+/// both high-throughput workloads (raise) and small tables (lower).
+pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -268,6 +275,18 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.buffer_alert_threshold",
+        c"Buffer growth alert threshold (pending change row count).",
+        c"When a source table's change buffer exceeds this many rows, a BufferGrowthWarning \
+           alert is emitted. Raise for high-throughput workloads, lower for small tables.",
+        &PGS_BUFFER_ALERT_THRESHOLD,
+        1_000,       // min: 1000 rows
+        100_000_000, // max: 100M rows
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -354,4 +373,9 @@ pub fn pg_trickle_wal_transition_timeout() -> i32 {
 /// Returns whether source DDL blocking is enabled.
 pub fn pg_trickle_block_source_ddl() -> bool {
     PGS_BLOCK_SOURCE_DDL.get()
+}
+
+/// Returns the buffer alert threshold (row count).
+pub fn pg_trickle_buffer_alert_threshold() -> i64 {
+    PGS_BUFFER_ALERT_THRESHOLD.get() as i64
 }

@@ -105,6 +105,10 @@ fn create_stream_table_impl(
     // materialize the full result set regardless of refresh mode.
     crate::dvm::reject_limit_offset(query)?;
 
+    // F13 (G4.2): Warn when LIMIT appears in a subquery without ORDER BY.
+    // Does not reject — LIMIT with ORDER BY is legitimate and deterministic.
+    crate::dvm::warn_limit_without_order_in_subqueries(query);
+
     // Reject constructs that are unsupported regardless of refresh mode
     // (NATURAL JOIN, subquery expressions like EXISTS/IN).
     // This is a lightweight check that inspects the raw parse tree without
@@ -544,6 +548,19 @@ fn refresh_stream_table(name: &str) {
 }
 
 fn refresh_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
+    // F16 (G8.2): Block manual refresh on read replicas — writes are not possible.
+    let is_replica = Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .unwrap_or(false);
+    if is_replica {
+        return Err(PgTrickleError::InvalidArgument(
+            "Cannot refresh stream tables on a read replica. \
+             The server is in recovery mode (pg_is_in_recovery() = true). \
+             Run refresh on the primary server instead."
+                .into(),
+        ));
+    }
+
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
