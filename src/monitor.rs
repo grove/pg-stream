@@ -412,6 +412,30 @@ fn get_refresh_history(
 ///
 /// Returns NULL if the ST has never been refreshed.
 /// Exposed as `pgtrickle.get_staleness(name)`.
+/// Return the effective adaptive threshold for a stream table.
+///
+/// Returns the per-ST `auto_threshold` if set, otherwise the global
+/// `pg_trickle.differential_max_change_ratio` GUC. Exposed as
+/// `pgtrickle.st_auto_threshold(name)`.
+#[pg_extern(schema = "pgtrickle", name = "st_auto_threshold")]
+fn st_auto_threshold(name: &str) -> Option<f64> {
+    let parts: Vec<&str> = name.splitn(2, '.').collect();
+    let (schema, table_name) = if parts.len() == 2 {
+        (parts[0], parts[1])
+    } else {
+        ("public", parts[0])
+    };
+
+    let per_st = Spi::get_one_with_args::<f64>(
+        "SELECT auto_threshold FROM pgtrickle.pgt_stream_tables \
+         WHERE pgt_schema = $1 AND pgt_name = $2",
+        &[schema.into(), table_name.into()],
+    )
+    .unwrap_or(None);
+
+    per_st.or(Some(config::pg_trickle_differential_max_change_ratio()))
+}
+
 #[pg_extern(schema = "pgtrickle", name = "get_staleness")]
 fn get_staleness(name: &str) -> Option<f64> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
@@ -790,10 +814,60 @@ pub fn check_slot_health_and_alert() {
         .unwrap_or(Some(0))
         .unwrap_or(0);
 
-        // Alert if more than 1 million pending changes
-        if pending > 1_000_000 {
+        // F46 (G9.3): Alert if more than the configured threshold of pending changes
+        let threshold = config::pg_trickle_buffer_alert_threshold();
+        if pending > threshold {
             alert_buffer_growth(&trigger_name, pending);
         }
+    }
+}
+
+// ── Temp File / Memory Usage Tracking (F45: G9.2) ──────────────────────────
+
+/// Query `pg_stat_statements` for the temp-file metrics of a recently executed
+/// MERGE (or delta query) containing the specified table name.
+///
+/// Returns `(temp_blks_read, temp_blks_written)` if `pg_stat_statements` is
+/// available and a matching statement was found. Returns `None` if the
+/// extension is not installed or no match is found.
+///
+/// This provides post-hoc visibility into whether large deltas spilled to
+/// temporary files, which may indicate `work_mem` is too low.
+pub fn query_temp_file_usage(table_name: &str) -> Option<(i64, i64)> {
+    // Check if pg_stat_statements is available
+    let available = Spi::get_one::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')",
+    )
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if !available {
+        return None;
+    }
+
+    // Look for the most recent MERGE statement referencing this table
+    let escaped = table_name.replace('\'', "''");
+    let result = Spi::get_two::<i64, i64>(&format!(
+        "SELECT temp_blks_read::bigint, temp_blks_written::bigint \
+         FROM pg_stat_statements \
+         WHERE query LIKE '%MERGE%{escaped}%' \
+         ORDER BY total_exec_time DESC LIMIT 1",
+    ));
+
+    match result {
+        Ok((Some(read), Some(written))) => {
+            if written > 0 {
+                pgrx::log!(
+                    "pg_trickle: MERGE for {} used {} temp blocks read, {} written \
+                     — consider increasing work_mem or lowering differential_max_change_ratio",
+                    table_name,
+                    read,
+                    written,
+                );
+            }
+            Some((read, written))
+        }
+        _ => None,
     }
 }
 

@@ -84,6 +84,10 @@ extension_sql!(
 CREATE SCHEMA IF NOT EXISTS pgtrickle;
 CREATE SCHEMA IF NOT EXISTS pgtrickle_changes;
 
+-- F51: Restrict change buffer schema access to prevent unauthorized
+-- injection of bogus changes that would be applied on next refresh.
+REVOKE ALL ON SCHEMA pgtrickle_changes FROM PUBLIC;
+
 -- Core ST metadata
 CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     pgt_id           BIGSERIAL PRIMARY KEY,
@@ -142,6 +146,9 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
                      CHECK (action IN ('NO_DATA', 'FULL', 'DIFFERENTIAL', 'DIFFERENTIAL', 'REINITIALIZE', 'SKIP')),
     rows_inserted   BIGINT DEFAULT 0,
     rows_deleted    BIGINT DEFAULT 0,
+    delta_row_count BIGINT DEFAULT 0,
+    merge_strategy_used TEXT,
+    was_full_fallback BOOLEAN NOT NULL DEFAULT FALSE,
     error_message   TEXT,
     status          TEXT NOT NULL
                      CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')),

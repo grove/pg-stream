@@ -786,6 +786,11 @@ impl StDependency {
 /// Queries `pg_attribute` for the current column set (name, type OID, ordinal
 /// position) and returns `(snapshot_jsonb, sha256_hex)`.
 ///
+/// F49: Generated (STORED/VIRTUAL) columns are excluded to align with
+/// `resolve_source_column_defs()` which also filters `attgenerated != ''`.
+/// This ensures the snapshot matches the columns tracked in the change
+/// buffer table, preventing false schema-change alerts.
+///
 /// The snapshot is a JSON array of objects:
 /// ```json
 /// [{"name":"id","type_oid":23,"ordinal":1},{"name":"val","type_oid":25,"ordinal":2}]
@@ -803,6 +808,7 @@ pub fn build_column_snapshot(
         "SELECT attname::text, atttypid::int, attnum::int \
          FROM pg_attribute \
          WHERE attrelid = {} AND attnum > 0 AND NOT attisdropped \
+           AND attgenerated = '' \
          ORDER BY attnum",
         source_oid.to_u32(),
     );
@@ -905,13 +911,17 @@ impl RefreshRecord {
         error_message: Option<&str>,
         initiated_by: Option<&str>,
         freshness_deadline: Option<TimestampWithTimeZone>,
+        delta_row_count: i64,
+        merge_strategy_used: Option<&str>,
+        was_full_fallback: bool,
     ) -> Result<i64, PgTrickleError> {
         Spi::get_one_with_args::<i64>(
             "INSERT INTO pgtrickle.pgt_refresh_history \
              (pgt_id, data_timestamp, start_time, action, status, \
               rows_inserted, rows_deleted, error_message, \
-              initiated_by, freshness_deadline) \
-             VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8, $9) \
+              initiated_by, freshness_deadline, \
+              delta_row_count, merge_strategy_used, was_full_fallback) \
+             VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
              RETURNING refresh_id",
             &[
                 pgt_id.into(),
@@ -923,6 +933,9 @@ impl RefreshRecord {
                 error_message.into(),
                 initiated_by.into(),
                 freshness_deadline.into(),
+                delta_row_count.into(),
+                merge_strategy_used.into(),
+                was_full_fallback.into(),
             ],
         )
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -930,23 +943,32 @@ impl RefreshRecord {
     }
 
     /// Complete a refresh record (set end_time and final status).
+    #[allow(clippy::too_many_arguments)]
     pub fn complete(
         refresh_id: i64,
         status: &str,
         rows_inserted: i64,
         rows_deleted: i64,
         error_message: Option<&str>,
+        delta_row_count: i64,
+        merge_strategy_used: Option<&str>,
+        was_full_fallback: bool,
     ) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
             "UPDATE pgtrickle.pgt_refresh_history \
              SET end_time = now(), status = $1, rows_inserted = $2, \
-             rows_deleted = $3, error_message = $4 \
-             WHERE refresh_id = $5",
+             rows_deleted = $3, error_message = $4, \
+             delta_row_count = $5, merge_strategy_used = $6, \
+             was_full_fallback = $7 \
+             WHERE refresh_id = $8",
             &[
                 status.into(),
                 rows_inserted.into(),
                 rows_deleted.into(),
                 error_message.into(),
+                delta_row_count.into(),
+                merge_strategy_used.into(),
+                was_full_fallback.into(),
                 refresh_id.into(),
             ],
         )

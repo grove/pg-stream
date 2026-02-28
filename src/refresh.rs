@@ -499,6 +499,49 @@ pub fn invalidate_merge_cache(pgt_id: i64) {
     }
 }
 
+/// Wide-table MERGE hash threshold (F41: G4.6).
+///
+/// When a table has more than this many user columns, the MERGE's
+/// `WHEN MATCHED` IS DISTINCT FROM guard uses a hash comparison instead
+/// of per-column checks, reducing SQL text length and planner overhead.
+const WIDE_TABLE_HASH_THRESHOLD: usize = 50;
+
+/// Build the IS DISTINCT FROM clause for the MERGE `WHEN MATCHED` guard.
+///
+/// For tables with ≤ [`WIDE_TABLE_HASH_THRESHOLD`] columns, generates
+/// per-column `st."col" IS DISTINCT FROM d."col"` checks joined with `OR`.
+///
+/// For wider tables (F41), generates a single `md5()` hash comparison:
+/// ```sql
+/// md5(concat(COALESCE(st."c1"::text,''), ...)) IS DISTINCT FROM
+/// md5(concat(COALESCE(d."c1"::text,''), ...))
+/// ```
+fn build_is_distinct_clause(user_cols: &[String]) -> String {
+    if user_cols.len() <= WIDE_TABLE_HASH_THRESHOLD {
+        user_cols
+            .iter()
+            .map(|c| {
+                let qc = format!("\"{}\"", c.replace('"', "\"\""));
+                format!("st.{qc} IS DISTINCT FROM d.{qc}")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    } else {
+        // Hash-based comparison for wide tables
+        let hash_expr = |prefix: &str| -> String {
+            let parts: Vec<String> = user_cols
+                .iter()
+                .map(|c| {
+                    let qc = format!("\"{}\"", c.replace('"', "\"\""));
+                    format!("COALESCE({prefix}.{qc}::text, '')")
+                })
+                .collect();
+            format!("md5(concat({}))", parts.join(", "))
+        };
+        format!("{} IS DISTINCT FROM {}", hash_expr("st"), hash_expr("d"))
+    }
+}
+
 /// Pre-warm the delta SQL + MERGE template caches for a stream table.
 ///
 /// Called after `create_stream_table()` to avoid a cold-start penalty on
@@ -585,14 +628,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     };
 
     // B-1: IS DISTINCT FROM guard to skip no-op UPDATEs.
-    let is_distinct_clause: String = user_cols
-        .iter()
-        .map(|c| {
-            let qc = format!("\"{}\"", c.replace('"', "\"\""));
-            format!("st.{qc} IS DISTINCT FROM d.{qc}")
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let is_distinct_clause: String = build_is_distinct_clause(user_cols);
 
     let merge_template = format!(
         "MERGE INTO {quoted_table} AS st \
@@ -1237,14 +1273,7 @@ pub fn execute_differential_refresh(
         // MERGE would still perform an UPDATE (writing an identical
         // tuple).  Adding an IS DISTINCT FROM check on the WHEN MATCHED
         // clause lets PostgreSQL skip the heap write entirely.
-        let is_distinct_clause: String = user_cols
-            .iter()
-            .map(|c| {
-                let qc = format!("\"{}\"", c.replace('"', "\"\""));
-                format!("st.{qc} IS DISTINCT FROM d.{qc}")
-            })
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let is_distinct_clause: String = build_is_distinct_clause(&user_cols);
 
         let merge_template = format!(
             "MERGE INTO {quoted_table} AS st \

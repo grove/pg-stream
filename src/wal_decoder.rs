@@ -685,27 +685,75 @@ pub fn check_and_complete_transition(
         return Ok(());
     }
 
-    // Not caught up — check for timeout
+    // Not caught up — check for timeout with progressive backoff (F32: G2.4).
+    // We allow up to 3× the configured timeout before aborting, logging
+    // warnings at 1× and 2× to give operators visibility into slow transitions.
     if let Some(ref started_at) = dep.transition_started_at {
-        let timed_out = Spi::get_one_with_args::<bool>(
+        let base_timeout = config::pg_trickle_wal_transition_timeout();
+
+        // Check if we've exceeded the final deadline (3× base timeout)
+        let final_deadline = base_timeout * 3;
+        let exceeded_final = Spi::get_one_with_args::<bool>(
             &format!(
                 "SELECT (now() - $1::timestamptz) > interval '{} seconds'",
-                config::pg_trickle_wal_transition_timeout()
+                final_deadline
             ),
             &[started_at.as_str().into()],
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
         .unwrap_or(false);
 
-        if timed_out {
+        if exceeded_final {
             warning!(
-                "pg_trickle: WAL transition timed out for source OID {} \
-                 (lag: {} bytes after {}s); falling back to triggers",
+                "pg_trickle: WAL transition exhausted all retries for source OID {} \
+                 (lag: {} bytes after {}s, max {}s); falling back to triggers",
                 source_oid.to_u32(),
                 lag_bytes,
-                config::pg_trickle_wal_transition_timeout()
+                final_deadline,
+                final_deadline,
             );
             abort_wal_transition(source_oid, pgt_id, change_schema)?;
+            return Ok(());
+        }
+
+        // Emit warnings at intermediate checkpoints (1× and 2× base timeout)
+        let exceeded_first = Spi::get_one_with_args::<bool>(
+            &format!(
+                "SELECT (now() - $1::timestamptz) > interval '{} seconds'",
+                base_timeout
+            ),
+            &[started_at.as_str().into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .unwrap_or(false);
+
+        if exceeded_first {
+            let exceeded_second = Spi::get_one_with_args::<bool>(
+                &format!(
+                    "SELECT (now() - $1::timestamptz) > interval '{} seconds'",
+                    base_timeout * 2
+                ),
+                &[started_at.as_str().into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .unwrap_or(false);
+
+            if exceeded_second {
+                warning!(
+                    "pg_trickle: WAL transition slow for source OID {} \
+                     (lag: {} bytes, retry 2/3 — will abort after {}s)",
+                    source_oid.to_u32(),
+                    lag_bytes,
+                    final_deadline,
+                );
+            } else {
+                log!(
+                    "pg_trickle: WAL transition slow for source OID {} \
+                     (lag: {} bytes, retry 1/3 — extending deadline)",
+                    source_oid.to_u32(),
+                    lag_bytes,
+                );
+            }
         }
     }
 
@@ -1034,13 +1082,16 @@ fn quote_ident(name: &str) -> String {
 /// Detect a schema mismatch between decoded pgoutput columns and the
 /// expected column definitions.
 ///
-/// Returns `true` if the decoded row contains a column that doesn't appear
-/// in the expected set, which indicates the source table's schema changed
-/// (e.g., a column was added via ALTER TABLE ADD COLUMN).
+/// Returns `true` if:
+/// - The decoded row contains a column that doesn't appear in the expected set
+///   (e.g., a column was added via ALTER TABLE ADD COLUMN).
+/// - The decoded row has at least as many columns as expected but some expected
+///   columns are missing (e.g., a column was renamed). F33: G2.5.
+///   The "at least as many" guard avoids false positives on partial-column
+///   messages (DELETE with non-FULL replica identity sends only PK columns).
 ///
-/// This is a conservative check — it only fires when a *new* column appears.
-/// Dropped columns are already handled by the DDL event trigger in hooks.rs
-/// which marks STs for reinitialize.
+/// DDL event triggers in hooks.rs handle the reinitialize; this provides a
+/// safety net for DDL that bypasses event triggers.
 fn detect_schema_mismatch(
     parsed: &std::collections::HashMap<String, String>,
     expected_columns: &[(String, String)],
@@ -1052,11 +1103,28 @@ fn detect_schema_mismatch(
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
+
+    // Check for unknown columns (additions)
     for col_name in parsed.keys() {
         if !expected_names.contains(col_name.as_str()) {
             return true;
         }
     }
+
+    // Check for missing expected columns (renames) — F33
+    // Only check when the decoded message has at least as many columns as
+    // expected, to avoid false positives from DELETE messages that only
+    // carry PK columns with non-FULL replica identity.
+    if parsed.len() >= expected_columns.len() {
+        let parsed_names: std::collections::HashSet<&str> =
+            parsed.keys().map(|k| k.as_str()).collect();
+        for expected_name in &expected_names {
+            if !parsed_names.contains(*expected_name) {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -1270,6 +1338,19 @@ mod tests {
         let mut parsed = std::collections::HashMap::new();
         parsed.insert("id".to_string(), "42".to_string());
         assert!(!detect_schema_mismatch(&parsed, &expected));
+    }
+
+    #[test]
+    fn test_schema_mismatch_column_rename() {
+        // F33: Column renamed from "name" to "full_name" — same count, different names
+        let expected = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+        let mut parsed = std::collections::HashMap::new();
+        parsed.insert("id".to_string(), "42".to_string());
+        parsed.insert("full_name".to_string(), "Alice".to_string());
+        assert!(detect_schema_mismatch(&parsed, &expected));
     }
 
     // ── parse_pgoutput_old_columns tests (G2.2) ───────────────────

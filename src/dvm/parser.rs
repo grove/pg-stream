@@ -3240,6 +3240,18 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
         return Ok(query.to_string());
     }
 
+    // F37 (G5.1): Warn when DISTINCT ON is used without ORDER BY.
+    // Without ORDER BY, PostgreSQL picks an arbitrary row from each group.
+    // The chosen row may differ between FULL and DIFFERENTIAL refresh,
+    // causing the stream table to non-deterministically switch rows.
+    if select.sortClause.is_null() {
+        pgrx::warning!(
+            "pg_trickle: DISTINCT ON without ORDER BY produces non-deterministic results. \
+             The chosen row per group may differ between FULL and DIFFERENTIAL refresh. \
+             Add ORDER BY to ensure deterministic row selection."
+        );
+    }
+
     // Extract ORDER BY clause as SQL text (if any)
     let order_by_sql = if !select.sortClause.is_null() {
         let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
@@ -5141,6 +5153,138 @@ pub fn reject_limit_offset(query: &str) -> Result<(), PgTrickleError> {
     Ok(())
 }
 
+/// F13 (G4.2): Warn when a FROM-clause subquery or LATERAL uses LIMIT without
+/// ORDER BY.
+///
+/// Without ORDER BY, LIMIT picks an arbitrary subset of rows. The chosen
+/// rows may differ between FULL refresh (fresh plan / statistics) and
+/// DIFFERENTIAL refresh (delta-driven), causing non-deterministic results.
+///
+/// Emits a `pgrx::warning!()` for each such occurrence. Does **not** reject
+/// the query — LIMIT with ORDER BY is a legitimate, deterministic pattern.
+pub fn warn_limit_without_order_in_subqueries(query: &str) {
+    use std::ffi::CString;
+
+    let c_query = match CString::new(query) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return;
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return,
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return;
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    unsafe { walk_from_for_limit_warning(select) };
+}
+
+/// Walk a SelectStmt's FROM clause looking for subqueries with LIMIT but
+/// no ORDER BY.
+///
+/// # Safety
+/// Caller must ensure `select` points to a valid `SelectStmt`.
+unsafe fn walk_from_for_limit_warning(select: *const pg_sys::SelectStmt) {
+    let s = unsafe { &*select };
+
+    // Handle set operations
+    if s.op != pg_sys::SetOperation::SETOP_NONE {
+        if !s.larg.is_null() {
+            unsafe { walk_from_for_limit_warning(s.larg) };
+        }
+        if !s.rarg.is_null() {
+            unsafe { walk_from_for_limit_warning(s.rarg) };
+        }
+        return;
+    }
+
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    for node_ptr in from_list.iter_ptr() {
+        unsafe { check_from_item_limit_warning(node_ptr) };
+    }
+
+    // Also check CTEs
+    if !s.withClause.is_null() {
+        let wc = unsafe { &*s.withClause };
+        let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
+        for node_ptr in cte_list.iter_ptr() {
+            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
+                let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
+                if !cte.ctequery.is_null()
+                    && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
+                {
+                    unsafe {
+                        walk_from_for_limit_warning(cte.ctequery as *const pg_sys::SelectStmt)
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// Check a single FROM-clause item for LIMIT without ORDER BY.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree node.
+unsafe fn check_from_item_limit_warning(node: *mut pg_sys::Node) {
+    if node.is_null() {
+        return;
+    }
+
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
+        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+        if !sub.subquery.is_null()
+            && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            let inner = unsafe { &*(sub.subquery as *const pg_sys::SelectStmt) };
+            // Check: has LIMIT but no ORDER BY
+            if !inner.limitCount.is_null() {
+                let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner.sortClause) };
+                if sort_list.is_empty() {
+                    let alias = if !sub.alias.is_null() {
+                        let a = unsafe { &*(sub.alias) };
+                        if !a.aliasname.is_null() {
+                            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                                .to_str()
+                                .unwrap_or("(subquery)")
+                                .to_string()
+                        } else {
+                            "(subquery)".to_string()
+                        }
+                    } else {
+                        "(subquery)".to_string()
+                    };
+                    pgrx::warning!(
+                        "pg_trickle: subquery '{}' uses LIMIT without ORDER BY. \
+                         This produces non-deterministic results that may differ between \
+                         FULL and DIFFERENTIAL refresh. Add ORDER BY for deterministic behavior.",
+                        alias
+                    );
+                }
+            }
+            // Recurse into the subquery's FROM clause
+            unsafe { walk_from_for_limit_warning(sub.subquery as *const pg_sys::SelectStmt) };
+        }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        unsafe { check_from_item_limit_warning(join.larg) };
+        unsafe { check_from_item_limit_warning(join.rarg) };
+    }
+}
+
 /// Lightweight validation that rejects SQL constructs unsupported in
 /// **any** refresh mode (FULL or DIFFERENTIAL).
 ///
@@ -6961,6 +7105,17 @@ unsafe fn parse_from_item(
                         .into(),
                 ));
             }
+
+            // F38: Warn about NATURAL JOIN column drift risk.
+            // If columns are added to either table that happen to match a column
+            // on the other side, the join semantics change silently. Explicit
+            // JOIN ... ON is recommended for production stream tables.
+            pgrx::warning!(
+                "pg_trickle: NATURAL JOIN resolved on columns [{}]. \
+                 Adding a same-named column to either table will silently change \
+                 join semantics. Consider using explicit JOIN ... ON instead.",
+                common.join(", "),
+            );
 
             // Build condition: left.col1 = right.col1 AND left.col2 = right.col2 ...
             let left_alias = left.alias();
@@ -9708,6 +9863,9 @@ fn is_known_aggregate(name: &str) -> bool {
             | "dense_rank"
             | "percent_rank"
             | "cume_dist"
+            // G5.6: Range aggregates — recognized but rejected for DIFFERENTIAL mode.
+            | "range_agg"
+            | "range_intersect_agg"
     )
 }
 

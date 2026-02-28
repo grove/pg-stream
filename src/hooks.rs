@@ -851,6 +851,27 @@ fn handle_create_trigger(cmd: &DdlCommand) {
         _ => return, // Can't resolve — ignore silently
     };
 
+    // F35 (G3.5): Block triggers on change buffer tables.
+    // User triggers on pgtrickle_changes.changes_<oid> could corrupt CDC data.
+    let change_schema = config::pg_trickle_change_buffer_schema();
+    let is_change_buffer = Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.oid = {} AND n.nspname = '{}')",
+        tgrelid.to_u32(),
+        change_schema.replace('\'', "''"),
+    ))
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if is_change_buffer {
+        pgrx::error!(
+            "pg_trickle: creating triggers on change buffer tables (schema '{}') is not allowed. \
+             These tables are managed internally by pg_trickle for change data capture.",
+            change_schema
+        );
+    }
+
     // Check if the table is a stream table.
     if !is_st_storage_table(tgrelid) {
         return;
