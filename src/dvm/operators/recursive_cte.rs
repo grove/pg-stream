@@ -129,6 +129,26 @@ pub fn diff_recursive_cte(
         return generate_recomputation_delta(ctx, alias, columns, base, recursive, *union_all);
     }
 
+    // Guard: detect non-monotone recursive term.
+    //
+    // Semi-naive and DRed strategies assume the recursive term is
+    // monotone: adding rows to the input can only add rows to the
+    // output, never remove them. Non-monotone operators (EXCEPT,
+    // Aggregate, Window, DISTINCT, Intersect) in the recursive term
+    // break this assumption and can produce incorrect fixpoints.
+    //
+    // When non-monotone operators are detected, fall back to
+    // recomputation which is always correct.
+    if let Some(reason) = recursive_term_is_non_monotone(recursive) {
+        pgrx::info!(
+            "Recursive CTE \"{}\" has non-monotone recursive term ({}). \
+             Using recomputation strategy for correctness.",
+            alias,
+            reason
+        );
+        return generate_recomputation_delta(ctx, alias, columns, base, recursive, *union_all);
+    }
+
     // Columns match — differentiate the base case and choose strategy.
     let base_delta = ctx.diff_node(base)?;
 
@@ -1266,6 +1286,88 @@ fn generate_change_buffer_from(
             let sql = generate_query_sql(op, Some(st_table))?;
             Ok(format!("(\n{sql}\n) AS __sub"))
         }
+    }
+}
+
+// ── Monotonicity analysis ───────────────────────────────────────────
+
+/// Check whether a recursive CTE's recursive term contains non-monotone
+/// operators that would make semi-naive and DRed strategies produce
+/// incorrect fixpoints.
+///
+/// **Monotone** operators: adding rows to the input can only add rows
+/// to the output. Semi-naive propagation and DRed rely on this property.
+///
+/// **Non-monotone** operators: adding rows to the input can remove rows
+/// from the output. Examples: EXCEPT, Aggregate, Window, DISTINCT,
+/// INTERSECT (set semantics).
+///
+/// Returns `Some(reason)` if a non-monotone operator is found, `None`
+/// if the recursive term is safe for incremental strategies.
+///
+/// This function only checks the recursive term — the base case can
+/// contain any operator because it is differentiated normally, not
+/// through the semi-naive/DRed path.
+pub fn recursive_term_is_non_monotone(op: &OpTree) -> Option<String> {
+    match op {
+        // Non-monotone operators: return immediately with reason
+        OpTree::Except { .. } => Some("EXCEPT".into()),
+        OpTree::Aggregate { .. } => Some("GROUP BY / aggregate".into()),
+        OpTree::Window { .. } => Some("window function".into()),
+        OpTree::Distinct { .. } => Some("DISTINCT".into()),
+        OpTree::Intersect { all: false, .. } => Some("INTERSECT (set)".into()),
+
+        // INTERSECT ALL is monotone for positive bags
+        OpTree::Intersect {
+            all: true,
+            left,
+            right,
+        } => recursive_term_is_non_monotone(left).or_else(|| recursive_term_is_non_monotone(right)),
+
+        // Transparent wrappers — recurse into children
+        OpTree::Filter { child, .. } | OpTree::Project { child, .. } => {
+            recursive_term_is_non_monotone(child)
+        }
+        OpTree::Subquery { child, .. } => recursive_term_is_non_monotone(child),
+
+        // Joins: recurse both sides
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. } => {
+            recursive_term_is_non_monotone(left).or_else(|| recursive_term_is_non_monotone(right))
+        }
+
+        // AntiJoin (NOT EXISTS / NOT IN) is inherently non-monotone:
+        // adding a matching row to the right side removes output rows.
+        OpTree::AntiJoin { .. } => Some("NOT EXISTS / NOT IN (anti-join)".into()),
+
+        // UNION ALL: recurse all children
+        OpTree::UnionAll { children } => children.iter().find_map(recursive_term_is_non_monotone),
+
+        // ScalarSubquery: the subquery result is used as a value.
+        // If the subquery contains aggregates, changes can cause
+        // all output rows to change. Check the subquery child.
+        OpTree::ScalarSubquery {
+            subquery, child, ..
+        } => recursive_term_is_non_monotone(subquery)
+            .or_else(|| recursive_term_is_non_monotone(child)),
+
+        // Leaf nodes: safe
+        OpTree::Scan { .. }
+        | OpTree::RecursiveSelfRef { .. }
+        | OpTree::CteScan { .. }
+        | OpTree::RecursiveCte { .. } => None,
+
+        // Lateral subquery / function: treat as opaque.
+        // These are rare in recursive terms; conservative fallback.
+        OpTree::LateralFunction { .. } | OpTree::LateralSubquery { .. } => {
+            Some("LATERAL (opaque)".into())
+        }
+
+        // Catch-all for any future OpTree variants: conservative fallback.
+        #[allow(unreachable_patterns)]
+        _ => Some("unknown operator".into()),
     }
 }
 
@@ -2700,5 +2802,198 @@ mod tests {
         ];
         let st_cols = vec!["id".to_string(), "label".to_string()];
         assert_ne!(cte_cols, st_cols, "Columns should NOT match");
+    }
+
+    // ── Monotonicity analysis tests (F9: G1.3) ──────────────────────
+
+    #[test]
+    fn test_monotone_simple_join() {
+        // JOIN + Scan + RecursiveSelfRef: standard tree traversal — monotone
+        let scan = make_scan(100, "nodes", "public", "n", &["id", "pid"]);
+        let self_ref = make_self_ref("tree", "t", &["id", "pid"]);
+        let join = OpTree::InnerJoin {
+            condition: Expr::Literal("n.pid = t.id".to_string()),
+            left: Box::new(scan),
+            right: Box::new(self_ref),
+        };
+        assert!(
+            recursive_term_is_non_monotone(&join).is_none(),
+            "Simple JOIN should be monotone"
+        );
+    }
+
+    #[test]
+    fn test_monotone_filter_project() {
+        // Filter + Project wrapping a Scan: monotone
+        let scan = make_scan(100, "t", "public", "t", &["id"]);
+        let filtered = OpTree::Filter {
+            predicate: Expr::Literal("id > 0".to_string()),
+            child: Box::new(scan),
+        };
+        let projected = OpTree::Project {
+            expressions: vec![Expr::ColumnRef {
+                table_alias: Some("t".to_string()),
+                column_name: "id".to_string(),
+            }],
+            aliases: vec!["id".to_string()],
+            child: Box::new(filtered),
+        };
+        assert!(
+            recursive_term_is_non_monotone(&projected).is_none(),
+            "Filter + Project should be monotone"
+        );
+    }
+
+    #[test]
+    fn test_non_monotone_except() {
+        let left = make_scan(100, "a", "public", "a", &["id"]);
+        let right = make_scan(200, "b", "public", "b", &["id"]);
+        let except = OpTree::Except {
+            left: Box::new(left),
+            right: Box::new(right),
+            all: false,
+        };
+        let reason = recursive_term_is_non_monotone(&except);
+        assert!(reason.is_some(), "EXCEPT should be non-monotone");
+        assert!(reason.unwrap().contains("EXCEPT"));
+    }
+
+    #[test]
+    fn test_non_monotone_aggregate() {
+        use crate::dvm::parser::{AggExpr, AggFunc};
+        let scan = make_scan(100, "t", "public", "t", &["category", "val"]);
+        let agg = OpTree::Aggregate {
+            group_by: vec![Expr::ColumnRef {
+                table_alias: Some("t".to_string()),
+                column_name: "category".to_string(),
+            }],
+            aggregates: vec![AggExpr {
+                function: AggFunc::Sum,
+                argument: Some(Expr::ColumnRef {
+                    table_alias: Some("t".to_string()),
+                    column_name: "val".to_string(),
+                }),
+                is_distinct: false,
+                second_arg: None,
+                filter: None,
+                alias: "total".to_string(),
+                order_within_group: None,
+            }],
+            child: Box::new(scan),
+        };
+        let reason = recursive_term_is_non_monotone(&agg);
+        assert!(reason.is_some(), "Aggregate should be non-monotone");
+        assert!(reason.unwrap().contains("aggregate"));
+    }
+
+    #[test]
+    fn test_non_monotone_window() {
+        use crate::dvm::parser::WindowExpr;
+        let scan = make_scan(100, "t", "public", "t", &["id", "val"]);
+        let window = OpTree::Window {
+            window_exprs: vec![WindowExpr {
+                func_name: "row_number".to_string(),
+                args: vec![],
+                partition_by: vec![],
+                order_by: vec![],
+                frame_clause: None,
+                alias: "rn".to_string(),
+            }],
+            partition_by: vec![],
+            pass_through: vec![],
+            child: Box::new(scan),
+        };
+        let reason = recursive_term_is_non_monotone(&window);
+        assert!(reason.is_some(), "Window should be non-monotone");
+        assert!(reason.unwrap().contains("window"));
+    }
+
+    #[test]
+    fn test_non_monotone_distinct() {
+        let scan = make_scan(100, "t", "public", "t", &["id"]);
+        let distinct = OpTree::Distinct {
+            child: Box::new(scan),
+        };
+        let reason = recursive_term_is_non_monotone(&distinct);
+        assert!(reason.is_some(), "DISTINCT should be non-monotone");
+        assert!(reason.unwrap().contains("DISTINCT"));
+    }
+
+    #[test]
+    fn test_non_monotone_anti_join() {
+        let left = make_scan(100, "a", "public", "a", &["id"]);
+        let right = make_scan(200, "b", "public", "b", &["id"]);
+        let anti = OpTree::AntiJoin {
+            condition: Expr::Literal("a.id = b.id".to_string()),
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let reason = recursive_term_is_non_monotone(&anti);
+        assert!(reason.is_some(), "AntiJoin should be non-monotone");
+        assert!(reason.unwrap().contains("anti-join"));
+    }
+
+    #[test]
+    fn test_non_monotone_intersect_set() {
+        let left = make_scan(100, "a", "public", "a", &["id"]);
+        let right = make_scan(200, "b", "public", "b", &["id"]);
+        let inter = OpTree::Intersect {
+            left: Box::new(left),
+            right: Box::new(right),
+            all: false,
+        };
+        let reason = recursive_term_is_non_monotone(&inter);
+        assert!(reason.is_some(), "INTERSECT (set) should be non-monotone");
+    }
+
+    #[test]
+    fn test_monotone_intersect_all() {
+        let left = make_scan(100, "a", "public", "a", &["id"]);
+        let right = make_scan(200, "b", "public", "b", &["id"]);
+        let inter = OpTree::Intersect {
+            left: Box::new(left),
+            right: Box::new(right),
+            all: true,
+        };
+        assert!(
+            recursive_term_is_non_monotone(&inter).is_none(),
+            "INTERSECT ALL should be monotone for positive bags"
+        );
+    }
+
+    #[test]
+    fn test_non_monotone_nested_in_join() {
+        // Join where one side contains EXCEPT: non-monotone
+        let scan = make_scan(100, "a", "public", "a", &["id"]);
+        let left = make_scan(200, "b", "public", "b", &["id"]);
+        let right = make_scan(300, "c", "public", "c", &["id"]);
+        let except = OpTree::Except {
+            left: Box::new(left),
+            right: Box::new(right),
+            all: false,
+        };
+        let join = OpTree::InnerJoin {
+            condition: Expr::Literal("a.id = b.id".to_string()),
+            left: Box::new(scan),
+            right: Box::new(except),
+        };
+        let reason = recursive_term_is_non_monotone(&join);
+        assert!(
+            reason.is_some(),
+            "EXCEPT nested in JOIN should be detected as non-monotone"
+        );
+    }
+
+    #[test]
+    fn test_monotone_union_all() {
+        let a = make_scan(100, "a", "public", "a", &["id"]);
+        let b = make_scan(200, "b", "public", "b", &["id"]);
+        let union = OpTree::UnionAll {
+            children: vec![a, b],
+        };
+        assert!(
+            recursive_term_is_non_monotone(&union).is_none(),
+            "UNION ALL should be monotone"
+        );
     }
 }

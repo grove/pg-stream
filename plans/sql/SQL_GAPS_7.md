@@ -1147,7 +1147,7 @@ for promoting WAL CDC to production.
 | Step | Gap | Description | Effort | Priority | Status |
 |------|-----|-------------|--------|----------|--------|
 | **F8** | G1.2 | Window partition key change: E2E test | 4–6h | P1 | ✅ Done (2 E2E tests in e2e_window_tests.rs) |
-| **F9** | G1.3 | Recursive CTE monotonicity audit | 6–8h | P1 | ⬜ Not started (audit-gated) |
+| **F9** | G1.3 | Recursive CTE monotonicity audit | 6–8h | P1 | ✅ Done (recursive_term_is_non_monotone guard + 11 unit tests) |
 | **F10** | G3.2 | Track ALTER DOMAIN events | 2–3h | P1 | ✅ Done (handle_domain_change in hooks.rs) |
 | **F11** | G7.1 | Keyless table duplicate rows: document | 1h | P1 | ✅ Done (SQL_REFERENCE.md expanded with G7.1 warning) |
 | **F12** | G8.1 | PgBouncer: document + fix advisory locks | 4–6h | P1 | ✅ Done (FAQ.md PgBouncer compatibility section) |
@@ -1155,7 +1155,7 @@ for promoting WAL CDC to production.
 **Estimated effort:** 17–24 hours → **Actual: ~4 hours (F9 deferred for audit)**  
 **Value:** Resolves remaining P1 items. F8 and F9 may be downgraded to P4 after
 verification tests pass.  
-**Status: 4/5 COMPLETE (F9 pending audit)**
+**Status: ✅ COMPLETE**
 
 ### Tier 2 — Robustness & P2 Fixes
 
@@ -1173,19 +1173,19 @@ verification tests pass.
 
 | Step | Gap | Description | Effort | Status |
 |------|-----|-------------|--------|--------|
-| **F17** | G6.1 | 21 aggregate E2E differential tests | 6–8h | 📝 Stub created (e2e_aggregate_coverage_tests.rs) |
-| **F18** | G6.2 | FULL JOIN E2E tests | 3–4h | 📝 Stub created (e2e_full_join_tests.rs) |
-| **F19** | G6.3 | INTERSECT/EXCEPT E2E tests | 3–4h | 📝 Stub created (e2e_set_operation_tests.rs) |
-| **F20** | G6.4 | ScalarSubquery E2E tests | 2–3h | 📝 Stub created (e2e_scalar_subquery_tests.rs) |
-| **F21** | G6.5 | SubLinks-in-OR E2E tests | 2–3h | 📝 Stub created (e2e_sublink_or_tests.rs) |
-| **F22** | G6.6 | Multi-partition window E2E tests | 2–3h | 📝 Stub created (e2e_multi_window_tests.rs) |
-| **F23** | G6.7 | GUC variation E2E tests | 4–6h | 📝 Stub created (e2e_guc_variation_tests.rs) |
-| **F24** | G6.8 | Multi-cycle refresh E2E tests | 3–4h | 📝 Stub created (e2e_multi_cycle_tests.rs) |
-| **F25** | G1.4 | HAVING group transition E2E test | 2–3h | 📝 Stub created (e2e_having_transition_tests.rs) |
-| **F26** | G1.6 | FULL JOIN NULL keys E2E test | 2h | 📝 Stub created (e2e_full_join_tests.rs) |
+| **F17** | G6.1 | 21 aggregate E2E differential tests | 6–8h | ✅ Done (18 tests in e2e_aggregate_coverage_tests.rs) |
+| **F18** | G6.2 | FULL JOIN E2E tests | 3–4h | ✅ Done (5 tests in e2e_full_join_tests.rs) |
+| **F19** | G6.3 | INTERSECT/EXCEPT E2E tests | 3–4h | ✅ Done (6 tests in e2e_set_operation_tests.rs) |
+| **F20** | G6.4 | ScalarSubquery E2E tests | 2–3h | ✅ Done (4 tests in e2e_scalar_subquery_tests.rs) |
+| **F21** | G6.5 | SubLinks-in-OR E2E tests | 2–3h | ✅ Done (4 tests in e2e_sublink_or_tests.rs) |
+| **F22** | G6.6 | Multi-partition window E2E tests | 2–3h | ✅ Done (6 tests in e2e_multi_window_tests.rs) |
+| **F23** | G6.7 | GUC variation E2E tests | 4–6h | ✅ Done (7 tests in e2e_guc_variation_tests.rs) |
+| **F24** | G6.8 | Multi-cycle refresh E2E tests | 3–4h | ✅ Done (5 tests in e2e_multi_cycle_tests.rs) |
+| **F25** | G1.4 | HAVING group transition E2E test | 2–3h | ✅ Done (7 tests in e2e_having_transition_tests.rs) |
+| **F26** | G1.6 | FULL JOIN NULL keys E2E test | 2h | ✅ Done (included in e2e_full_join_tests.rs) |
 
 **Estimated effort:** 29–38 hours  
-**Status: 📝 STUBS CREATED (test scenarios documented, implementations pending)**
+**Status: ✅ COMPLETE (62 E2E tests across 10 test files)**
 
 ### Tier 4 — Operational Hardening
 
@@ -1220,32 +1220,35 @@ verification tests pass.
 | **F45** | G9.2 | Memory/temp file usage tracking | 4–6h | ✅ Done (query_temp_file_usage in monitor.rs) |
 | **F46** | G9.3 | Buffer alert threshold GUC | 1h | ✅ Done (pg_trickle.buffer_alert_threshold GUC in config.rs) |
 | **F47** | G9.5 | Expose adaptive threshold function | 1–2h | ✅ Done (pgtrickle.st_auto_threshold SQL function in monitor.rs) |
-| **F48** | G1.5 | Keyless table duplicate rows E2E | 2–3h | 📝 Stub created (e2e_keyless_duplicate_tests.rs) |
+| **F48** | G1.5 | Keyless table duplicate rows E2E | 2–3h | ✅ Done (7 tests in e2e_keyless_duplicate_tests.rs) |
 | **F49** | G3.6 | Generated column snapshot filter alignment | 1–2h | ✅ Done (attgenerated filter in build_column_snapshot) |
-| **F50** | G7.3 | Benchmark covering index overhead | 2h | ⬜ Not started (benchmark only) |
+| **F50** | G7.3 | Benchmark covering index overhead | 2h | ✅ Done (bench_covering_index_overhead in e2e_bench_tests.rs) |
 | **F51** | G7.4 | Change buffer schema permissions | 1–2h | ✅ Done (REVOKE ALL FROM PUBLIC on pgtrickle_changes schema) |
 
 **Estimated effort:** 19–30 hours → **Actual: ~4 hours**  
-**Status: 9/11 COMPLETE (F48 stub, F50 deferred)**
+**Status: ✅ COMPLETE (10/11 done, F40 deferred)**
 
 ### Summary
 
 | Tier | Steps | Effort | Cumulative | Status |
 |------|-------|--------|------------|--------|
 | 0 — Critical | F1–F7 | 22–33h → ~8h | ~8h | ✅ Complete |
-| 1 — Verification | F8–F12 | 17–24h → ~4h | ~12h | 4/5 (F9 pending audit) |
+| 1 — Verification | F8–F12 | 17–24h → ~4h | ~12h | ✅ Complete |
 | 2 — Robustness | F13–F16 | 7–9h → ~2h | ~14h | ✅ Complete |
-| 3 — Test Coverage | F17–F26 | 29–38h | ~52h | 📝 Stubs created |
-| 4 — Operational | F27–F40 | 25–36h → ~6h | ~58h | 13/14 (F40 deferred) |
-| 5 — Nice-to-Have | F41–F51 | 19–30h → ~4h | ~62h | 9/11 (F48 stub, F50 deferred) |
-| **Total** | **51 steps** | **~62h actual** | — | **37/51 done, 10 stubs, 4 deferred** |
+| 3 — Test Coverage | F17–F26 | 29–38h → ~6h | ~20h | ✅ Complete (62 E2E tests) |
+| 4 — Operational | F27–F40 | 25–36h → ~6h | ~26h | 13/14 (F40 deferred) |
+| 5 — Nice-to-Have | F41–F51 | 19–30h → ~4h | ~30h | ✅ Complete (10/11, F40 deferred) |
+| **Total** | **51 steps** | **~30h actual** | — | **50/51 done, 1 deferred (F40)** |
 
 ### Remaining Work (Prioritized)
 
-1. **F9** (Tier 1) — Recursive CTE monotonicity audit — requires manual SQL audit
-2. **F17–F26, F48** (Tier 3) — E2E test implementations — stubs created, need full tests
-3. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to PLAN_DB_SCHEMA_STABILITY.md
-4. **F50** (Tier 5) — Benchmark covering index overhead — benchmark only, no code change
+1. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to PLAN_DB_SCHEMA_STABILITY.md
+
+All other items are complete. F9 (recursive CTE monotonicity audit) was resolved
+with `recursive_term_is_non_monotone()` guard in `recursive_cte.rs` that forces
+recomputation for non-monotone recursive terms (EXCEPT, Aggregate, Window,
+DISTINCT, AntiJoin, etc.). F17–F26+F48 (62 E2E tests across 10 files) and F50
+(covering index benchmark) are complete.
 
 ---
 
@@ -1270,11 +1273,11 @@ verification tests pass.
 | OpTree variants | 12 | 18 | 21 | 22 | 22 |
 | Diff operators | 10 | 16 | 21 | 21 | 21 |
 | Auto-rewrite passes | 0 | 0 | 5 | 5 | 6 |
-| Unit tests | 745 | 809 | ~896 | ~920 | ~920 |
-| E2E tests | ~100 | ~200 | ~350 | ~384 | 384 |
-| E2E test files | ~15 | ~18 | 22 | 23 | 23 |
-| P0 issues | 14 | 0 | 0 | 0 | 1 (gated) |
-| P1 issues | 5 | 0 | 0 | 0 | 11 |
+| Unit tests | 745 | 809 | ~896 | ~920 | 936 |
+| E2E tests | ~100 | ~200 | ~350 | ~384 | 446+ |
+| E2E test files | ~15 | ~18 | 22 | 23 | 33 |
+| P0 issues | 14 | 0 | 0 | 0 | 0 |
+| P1 issues | 5 | 0 | 0 | 0 | 0 |
 | Expression types | 7 | 15 | 30+ | 40+ | 40+ |
 | GUCs | ~6 | ~8 | 17 | 17 | 20 |
 | Total source lines | ~12K | ~18K | ~30K | ~35K | 40,094 |
@@ -1304,9 +1307,9 @@ engine:
   semantics.
 
 - **Test coverage:** 21 aggregate functions, FULL JOIN, INTERSECT/EXCEPT,
-  ScalarSubquery, two auto-rewrite passes, and all GUC variations have zero
-  E2E tests. These are implemented and unit-tested features that lack real
-  PostgreSQL validation.
+  ScalarSubquery, GUC variations, HAVING transitions, multi-cycle refresh,
+  keyless duplicates — now all have comprehensive E2E tests (62 tests across
+  10 new files).
 
 - **Production deployment:** PgBouncer incompatibility, read replica behavior,
   extension upgrade path, and memory bounds are undocumented or unhandled.
@@ -1320,25 +1323,23 @@ and robustly in all edge cases under production conditions?"
 | Area | Status | Blockers |
 |------|--------|----------|
 | **SQL syntax coverage** | ✅ Complete | None — every SELECT construct handled or rejected |
-| **Core delta operators** | ✅ Solid | F5 ✅ documented; F8 ✅ 2 E2E tests added |
-| **Aggregate coverage** | ✅ Complete (39 functions) | F17: 21 variants lack differential E2E tests |
+| **Core delta operators** | ✅ Solid | F5 ✅ documented; F8 ✅ 2 E2E tests; F9 ✅ monotonicity guard |
+| **Aggregate coverage** | ✅ Complete (39 functions) | F17 ✅: 18 E2E tests covering all aggregate families |
 | **CDC (trigger-based)** | ✅ Production-ready | F11 ✅ keyless duplicate row limitation documented |
 | **CDC (WAL-based)** | ⚠️ Improved | F2 ✅, F3 ✅, F4 ✅ — pk guard, old_* columns, positional parsing |
 | **DDL tracking** | ✅ Complete | F6 ✅, F7 ✅, F10 ✅ — ALTER TYPE/DOMAIN/POLICY tracked |
 | **Refresh engine** | ✅ Solid | F1 ✅ `delete_insert` removed in v0.2.0, stale docs cleaned |
-| **Production deployment** | ⚠️ Improved | F12 ✅ PgBouncer documented; F16: replicas; F40: upgrades |
-| **Test coverage** | ⚠️ Significant gaps | F17–F26: 10 test suite expansion tasks |
-| **Monitoring** | ⚠️ Basic | F27–F31: observability improvements |
+| **Production deployment** | ⚠️ Improved | F12 ✅ PgBouncer documented; F16 ✅ replicas; F40: upgrades |
+| **Test coverage** | ✅ Comprehensive | F17–F26+F48: 62 E2E tests across 10 new test files |
+| **Monitoring** | ✅ Complete | F27–F31 ✅: observability improvements |
 
-**Minimum viable 1.0:** Tiers 0 + 1 are now nearly complete (~12 hours actual).
-The remaining F9 (recursive CTE monotonicity audit) is audit-gated.
-Tier 3 (~29–38 hours) provides the E2E test confidence needed for a public
-release. Total remaining for 1.0: ~35–46 hours across ~4–5 sessions.
+**Minimum viable 1.0:** All tiers 0–5 are complete except F40 (extension upgrade
+migration scripts, deferred). 50/51 items done. 936 unit tests + 62 new E2E tests
+provide comprehensive coverage. The only remaining blocker is F40 for seamless
+upgrades, tracked in PLAN_DB_SCHEMA_STABILITY.md.
 
 ### Prioritized Remaining Work
 
-1. **F9** (Tier 1) — Recursive CTE monotonicity audit. Audit `src/dvm/operators/recursive_cte.rs`, add E2E tests for non-monotone queries, decide between fix and rejection. ~6–8h.
-2. **F13–F16** (Tier 2) — LIMIT warning, CUBE rejection, RANGE_AGG, replica detection. ~7–9h.
-3. **F17–F26** (Tier 3) — 10 E2E test suite expansion tasks covering aggregates, FULL JOIN, INTERSECT/EXCEPT, scalar subqueries, GUC variations, multi-cycle refresh, HAVING transitions. ~29–38h.
-4. **F27–F40** (Tier 4) — Operational hardening: adaptive threshold, prepared statement cleanup, SPI retry classification, monitoring, WAL transition backoff, etc. ~25–36h.
-5. **F41–F51** (Tier 5) — Nice-to-have: wide table MERGE optimization, documentation, memory tracking, buffer alerts, permissions. ~19–30h.
+1. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to PLAN_DB_SCHEMA_STABILITY.md
+
+All other items (50/51) are complete. SQL_GAPS_7 is effectively done.
