@@ -1115,16 +1115,32 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         ));
     }
 
+    // ── Scalar-aggregate guard ───────────────────────────────────
+    //
+    // PostgreSQL scalar aggregates (no GROUP BY) always return exactly
+    // one row: `SELECT SUM(x) FROM empty_table` → 1 row (NULL).  The
+    // singleton ST row must **never** be deleted, so we omit the 'D'
+    // classification for scalar aggregates and emit 'U' instead.
+    let is_scalar_agg = group_by.is_empty();
+
     // Action classification (same COALESCE guards as new_count)
-    merge_selects.push(
+    let action_case = if is_scalar_agg {
+        "\
+CASE
+    WHEN st.__pgt_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
+    ELSE 'U'
+END AS __pgt_meta_action"
+            .to_string()
+    } else {
         "\
 CASE
     WHEN st.__pgt_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
     WHEN COALESCE(st.__pgt_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) <= 0 THEN 'D'
     ELSE 'U'
 END AS __pgt_meta_action"
-            .to_string(),
-    );
+            .to_string()
+    };
+    merge_selects.push(action_case);
 
     // Join condition on group-by columns
     let join_cond = if group_output.is_empty() {
@@ -1200,10 +1216,26 @@ END AS __pgt_meta_action"
     for agg in aggregates {
         let new_col = quote_ident(&format!("new_{}", agg.alias));
         let old_col = quote_ident(&format!("old_{}", agg.alias));
-        agg_cases.push(format!(
-            "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} ELSE m.{new_col} END AS {}",
-            quote_ident(&agg.alias),
-        ));
+        // For scalar aggregates, SUM (and similar nullable aggs) must return
+        // NULL — not 0 — when new_count drops to 0, matching PostgreSQL's
+        // `SELECT SUM(x) FROM empty_table` → NULL semantics.  COUNT(*) and
+        // COUNT(col) correctly yield 0 from the count arithmetic, so they
+        // don't need this override.
+        let needs_null_on_empty =
+            is_scalar_agg && matches!(agg.function, AggFunc::Sum | AggFunc::Min | AggFunc::Max);
+        if needs_null_on_empty {
+            agg_cases.push(format!(
+                "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} \
+                 WHEN m.new_count <= 0 THEN NULL \
+                 ELSE m.{new_col} END AS {}",
+                quote_ident(&agg.alias),
+            ));
+        } else {
+            agg_cases.push(format!(
+                "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} ELSE m.{new_col} END AS {}",
+                quote_ident(&agg.alias),
+            ));
+        }
     }
 
     let extra_agg_cases = if agg_cases.is_empty() {

@@ -52,6 +52,7 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     // Rewrite join condition aliases for each part
     let cond_part1 = rewrite_join_condition(condition, left, "dl", right, "r");
+    let cond_part1_old = rewrite_join_condition(condition, left, "dl", right, "r_old");
     let cond_part2_new = rewrite_join_condition(condition, left, "l", right, "r");
     let cond_part2_dr = rewrite_join_condition(condition, left, "l", right, "dr");
     let cond_part2_old = rewrite_join_condition(condition, left, "l", right, "r_old");
@@ -123,12 +124,21 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     let sql = format!(
         "\
--- Part 1: delta_left rows that match current right (semi-join filter)
+-- Part 1: delta_left rows that match right (semi-join filter)
+-- INSERT: new left row has match in R_current  → emit INSERT
+-- DELETE: old left row had match in R_old      → emit DELETE
+-- For INSERTs we check the live right table (post-change state).
+-- For DELETEs we check R_old (pre-change state) because the matching
+-- right rows may also have been deleted in the same mutation cycle
+-- (e.g. RF2 deletes both orders AND their lineitems simultaneously).
 SELECT {hash_part1} AS __pgt_row_id,
        dl.__pgt_action,
        {dl_cols}
 FROM {delta_left} dl
-WHERE EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part1})
+WHERE CASE WHEN dl.__pgt_action = 'D'
+           THEN EXISTS (SELECT 1 FROM {r_old_snapshot} r_old WHERE {cond_part1_old})
+           ELSE EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part1})
+      END
 
 UNION ALL
 
@@ -151,6 +161,7 @@ WHERE EXISTS (SELECT 1 FROM {delta_right} dr WHERE {cond_part2_dr})
         left_snapshot = build_snapshot_sql(left),
         right_table = right_table,
         r_old_snapshot = r_old_snapshot,
+        cond_part1_old = cond_part1_old,
     );
 
     ctx.add_cte(cte_name.clone(), sql);
