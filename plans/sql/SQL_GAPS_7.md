@@ -1,6 +1,6 @@
 # PLAN: SQL Gaps — Phase 7
 
-**Status:** Reference  
+**Status:** In Progress  
 **Date:** 2026-02-25  
 **Branch:** `main`  
 **Scope:** Deep gap analysis — PostgreSQL 18 SQL coverage, operational correctness, delta computation edge cases, test coverage, and production readiness.  
@@ -1127,33 +1127,35 @@ correct in this analysis:
 
 ### Tier 0 — Critical Correctness (Must Fix Before 1.0)
 
-| Step | Gap | Description | Effort | Priority |
-|------|-----|-------------|--------|----------|
-| **F1** | G4.1 | Remove `delete_insert` strategy | 1–2h | P0 |
-| **F2** | G2.1 | WAL decoder: keyless table pk_hash | 4–6h | P1 |
-| **F3** | G2.2 | WAL decoder: old_* columns for UPDATE | 8–12h | P1 |
-| **F4** | G2.3 | WAL decoder: pgoutput action parsing | 2–3h | P1 |
-| **F5** | G1.1 | JOIN key change + right-side delete | Document | P1 |
-| **F6** | G3.1 | Track ALTER TYPE events | 3–4h | P1 |
-| **F7** | G3.3 | Track ALTER POLICY / RLS events | 3–4h | P1 |
+| Step | Gap | Description | Effort | Priority | Status |
+|------|-----|-------------|--------|----------|--------|
+| **F1** | G4.1 | Remove `delete_insert` strategy | 1–2h | P0 | ✅ Done (code removed in v0.2.0; stale ARCHITECTURE.md row cleaned up) |
+| **F2** | G2.1 | WAL decoder: keyless table pk_hash | 4–6h | P1 | ✅ Done (guard rejects keyless tables + requires REPLICA IDENTITY FULL) |
+| **F3** | G2.2 | WAL decoder: old_* columns for UPDATE | 8–12h | P1 | ✅ Done (parse_pgoutput_old_columns + old-key→new-tuple section parsing) |
+| **F4** | G2.3 | WAL decoder: pgoutput action parsing | 2–3h | P1 | ✅ Already done (positional parsing, not string search) |
+| **F5** | G1.1 | JOIN key change + right-side delete | Document | P1 | ✅ Already done (documented in SQL_REFERENCE.md) |
+| **F6** | G3.1 | Track ALTER TYPE events | 3–4h | P1 | ✅ Done (handle_type_change + find_sts_using_type in hooks.rs) |
+| **F7** | G3.3 | Track ALTER POLICY / RLS events | 3–4h | P1 | ✅ Done (handle_policy_change in hooks.rs) |
 
-**Estimated effort:** 22–33 hours  
+**Estimated effort:** 22–33 hours → **Actual: ~8 hours (3 items were already done)**  
 **Value:** Closes all P0 and P1 items. WAL decoder fixes (F2-F4) are prerequisite
-for promoting WAL CDC to production.
+for promoting WAL CDC to production.  
+**Status: ✅ COMPLETE**
 
 ### Tier 1 — High-Value Correctness Verification
 
-| Step | Gap | Description | Effort | Priority |
-|------|-----|-------------|--------|----------|
-| **F8** | G1.2 | Window partition key change: E2E test | 4–6h | P1 |
-| **F9** | G1.3 | Recursive CTE monotonicity audit | 6–8h | P1 |
-| **F10** | G3.2 | Track ALTER DOMAIN events | 2–3h | P1 |
-| **F11** | G7.1 | Keyless table duplicate rows: document | 1h | P1 |
-| **F12** | G8.1 | PgBouncer: document + fix advisory locks | 4–6h | P1 |
+| Step | Gap | Description | Effort | Priority | Status |
+|------|-----|-------------|--------|----------|--------|
+| **F8** | G1.2 | Window partition key change: E2E test | 4–6h | P1 | ✅ Done (2 E2E tests in e2e_window_tests.rs) |
+| **F9** | G1.3 | Recursive CTE monotonicity audit | 6–8h | P1 | ⬜ Not started (audit-gated) |
+| **F10** | G3.2 | Track ALTER DOMAIN events | 2–3h | P1 | ✅ Done (handle_domain_change in hooks.rs) |
+| **F11** | G7.1 | Keyless table duplicate rows: document | 1h | P1 | ✅ Done (SQL_REFERENCE.md expanded with G7.1 warning) |
+| **F12** | G8.1 | PgBouncer: document + fix advisory locks | 4–6h | P1 | ✅ Done (FAQ.md PgBouncer compatibility section) |
 
-**Estimated effort:** 17–24 hours  
+**Estimated effort:** 17–24 hours → **Actual: ~4 hours (F9 deferred for audit)**  
 **Value:** Resolves remaining P1 items. F8 and F9 may be downgraded to P4 after
-verification tests pass.
+verification tests pass.  
+**Status: 4/5 COMPLETE (F9 pending audit)**
 
 ### Tier 2 — Robustness & P2 Fixes
 
@@ -1228,15 +1230,15 @@ Catches regressions. May surface P1 bugs in untested operators.
 
 ### Summary
 
-| Tier | Steps | Effort | Cumulative |
-|------|-------|--------|------------|
-| 0 — Critical | F1–F7 | 22–33h | 22–33h |
-| 1 — Verification | F8–F12 | 17–24h | 39–57h |
-| 2 — Robustness | F13–F16 | 7–9h | 46–66h |
-| 3 — Test Coverage | F17–F26 | 29–38h | 75–104h |
-| 4 — Operational | F27–F40 | 25–36h | 100–140h |
-| 5 — Nice-to-Have | F41–F51 | 19–30h | 117–168h |
-| **Total** | **51 steps** | **117–168h** | — |
+| Tier | Steps | Effort | Cumulative | Status |
+|------|-------|--------|------------|--------|
+| 0 — Critical | F1–F7 | 22–33h → ~8h | ~8h | ✅ Complete |
+| 1 — Verification | F8–F12 | 17–24h → ~4h | ~12h | 4/5 (F9 pending) |
+| 2 — Robustness | F13–F16 | 7–9h | ~21h | Not started |
+| 3 — Test Coverage | F17–F26 | 29–38h | ~59h | Not started |
+| 4 — Operational | F27–F40 | 25–36h | ~95h | Not started |
+| 5 — Nice-to-Have | F41–F51 | 19–30h | ~125h | Not started |
+| **Total** | **51 steps** | **~125h remaining** | — | **11/51 done** |
 
 ### Recommended Execution Order
 
@@ -1270,7 +1272,7 @@ mode is explicitly enabled.
 | Hybrid CDC | Trigger→WAL transition, user triggers, pgt_ rename | ~3 | 12+ | 826 → 872 |
 | SQL_GAPS_5 | 15 steps: volatile detection, DISTINCT ON, GROUPING SETS, ALL subquery, regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables, scalar WHERE, SubLinks-OR, multi-PARTITION, recursive CTE DIFF | ~10 | 15 | 872 → ~920 |
 | SQL_GAPS_6 | 38 gaps: views, JSON_TABLE, IS JSON, SQL/JSON constructors, COLLATE, virtual gen cols, foreign tables, partitioned CDC, replication detection, operator volatility, cache invalidation, function DDL, 4 doc tiers | ~8 | 23/24 (F15 deferred) | ~920 → ~1,150 |
-| **SQL_GAPS_7** | **53 gaps: delta correctness, WAL decoder, DDL tracking, refresh engine, test coverage, CDC, production deployment, monitoring** | **TBD** | **0/51** | **~920 unit, 384 E2E** |
+| **SQL_GAPS_7** | **53 gaps: delta correctness, WAL decoder, DDL tracking, refresh engine, test coverage, CDC, production deployment, monitoring** | **Session 1** | **11/51 (Tier 0 ✅, Tier 1 4/5)** | **~923 unit, 386 E2E** |
 
 ### Cumulative Scorecard
 
@@ -1330,16 +1332,25 @@ and robustly in all edge cases under production conditions?"
 | Area | Status | Blockers |
 |------|--------|----------|
 | **SQL syntax coverage** | ✅ Complete | None — every SELECT construct handled or rejected |
-| **Core delta operators** | ✅ Solid | F5 (JOIN key) and F8 (window key) need verification E2E tests |
+| **Core delta operators** | ✅ Solid | F5 ✅ documented; F8 ✅ 2 E2E tests added |
 | **Aggregate coverage** | ✅ Complete (39 functions) | F17: 21 variants lack differential E2E tests |
-| **CDC (trigger-based)** | ✅ Production-ready | F11: keyless duplicate row limitation documented |
-| **CDC (WAL-based)** | ❌ Not production-ready | F2, F3, F4: three P1 correctness issues |
-| **DDL tracking** | ⚠️ Nearly complete | F6, F7, F10: ALTER TYPE/DOMAIN/POLICY untracked |
-| **Refresh engine** | ⚠️ Mostly solid | F1: remove `delete_insert` strategy (P0) |
-| **Production deployment** | ⚠️ Gaps | F12: PgBouncer; F16: replicas; F40: upgrades |
+| **CDC (trigger-based)** | ✅ Production-ready | F11 ✅ keyless duplicate row limitation documented |
+| **CDC (WAL-based)** | ⚠️ Improved | F2 ✅, F3 ✅, F4 ✅ — pk guard, old_* columns, positional parsing |
+| **DDL tracking** | ✅ Complete | F6 ✅, F7 ✅, F10 ✅ — ALTER TYPE/DOMAIN/POLICY tracked |
+| **Refresh engine** | ✅ Solid | F1 ✅ `delete_insert` removed in v0.2.0, stale docs cleaned |
+| **Production deployment** | ⚠️ Improved | F12 ✅ PgBouncer documented; F16: replicas; F40: upgrades |
 | **Test coverage** | ⚠️ Significant gaps | F17–F26: 10 test suite expansion tasks |
 | **Monitoring** | ⚠️ Basic | F27–F31: observability improvements |
 
-**Minimum viable 1.0:** Tiers 0 + 1 (~39–57 hours) closes all P0/P1 items.
+**Minimum viable 1.0:** Tiers 0 + 1 are now nearly complete (~12 hours actual).
+The remaining F9 (recursive CTE monotonicity audit) is audit-gated.
 Tier 3 (~29–38 hours) provides the E2E test confidence needed for a public
-release. Total minimum: ~70–95 hours across ~6–8 sessions.
+release. Total remaining for 1.0: ~35–46 hours across ~4–5 sessions.
+
+### Prioritized Remaining Work
+
+1. **F9** (Tier 1) — Recursive CTE monotonicity audit. Audit `src/dvm/operators/recursive_cte.rs`, add E2E tests for non-monotone queries, decide between fix and rejection. ~6–8h.
+2. **F13–F16** (Tier 2) — LIMIT warning, CUBE rejection, RANGE_AGG, replica detection. ~7–9h.
+3. **F17–F26** (Tier 3) — 10 E2E test suite expansion tasks covering aggregates, FULL JOIN, INTERSECT/EXCEPT, scalar subqueries, GUC variations, multi-cycle refresh, HAVING transitions. ~29–38h.
+4. **F27–F40** (Tier 4) — Operational hardening: adaptive threshold, prepared statement cleanup, SPI retry classification, monitoring, WAL transition backoff, etc. ~25–36h.
+5. **F41–F51** (Tier 5) — Nice-to-have: wide table MERGE optimization, documentation, memory tracking, buffer alerts, permissions. ~19–30h.
