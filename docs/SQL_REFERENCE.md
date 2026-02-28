@@ -1025,6 +1025,19 @@ SELECT pgtrickle.create_stream_table('event_summary',
   '1m', 'DIFFERENTIAL');
 ```
 
+> **Known Limitation — Duplicate Rows in Keyless Tables (G7.1)**
+>
+> When a keyless table contains **exact duplicate rows** (identical values in every column),
+> content-based hashing produces the same `__pgt_row_id` for each copy. Consequences:
+>
+> - **INSERT** of a duplicate row may appear as a no-op (the hash already exists in the stream table).
+> - **DELETE** of one copy may delete all copies (the MERGE matches on `__pgt_row_id`, hitting every duplicate).
+> - **Aggregate counts** over keyless tables with duplicates may drift from the true query result.
+>
+> **Recommendation:** Add a `PRIMARY KEY` or at least a `UNIQUE` constraint to source tables used
+> in DIFFERENTIAL mode. This eliminates the ambiguity entirely. If duplicates are expected and
+> correctness matters, use `FULL` refresh mode, which always recomputes from scratch.
+
 ### Volatile Function Detection
 
 pg_trickle checks all functions and operators in the defining query against `pg_proc.provolatile`:
