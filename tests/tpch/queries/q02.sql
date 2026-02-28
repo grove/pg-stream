@@ -1,6 +1,6 @@
 -- Q2: Minimum Cost Supplier
 -- Operators: 8-table Join -> Scalar Subquery (correlated MIN) -> Filter
--- LIMIT removed (unsupported by pg_stream)
+-- LIMIT removed (unsupported by pg_trickle)
 SELECT
     s_acctbal,
     s_name,

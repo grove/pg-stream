@@ -37,7 +37,7 @@ async fn test_lateral_jsonb_array_elements_full_mode() {
     )
     .await;
 
-    let (status, mode, populated, errors) = db.pgs_status("lat_flat_full").await;
+    let (status, mode, populated, errors) = db.pgt_status("lat_flat_full").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "FULL");
     assert!(populated);
@@ -179,7 +179,7 @@ async fn test_lateral_jsonb_array_elements_differential() {
     )
     .await;
 
-    let (status, mode, populated, errors) = db.pgs_status("lat_diff_st").await;
+    let (status, mode, populated, errors) = db.pgt_status("lat_diff_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "DIFFERENTIAL");
     assert!(populated);

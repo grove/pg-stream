@@ -1,7 +1,7 @@
 # Prior Art
 
 This document lists the academic papers, PostgreSQL commits, open-source tools,
-and standard algorithms whose techniques are reused in `pg_stream`.
+and standard algorithms whose techniques are reused in `pg_trickle`.
 
 Maintaining this record serves two purposes:
 1. **Attribution** — credit the research and engineering work this project builds upon.
@@ -19,13 +19,13 @@ Maintaining this record serves two purposes:
 > <https://arxiv.org/abs/2203.16684>
 
 The Z-set abstraction (rows annotated with +1/−1 multiplicity) is the
-theoretical foundation for the `__pgs_action` column produced by the delta
+theoretical foundation for the `__pgt_action` column produced by the delta
 operators in `src/dvm/operators/`. The per-operator differentiation rules
 (scan, filter, project, join, aggregate, union) are direct applications of
 the DBSP lifting operator (D) described in this paper.
 
 See [DBSP_COMPARISON.md](DBSP_COMPARISON.md) for a detailed comparison of
-pg_stream's architecture with the DBSP model.
+pg_trickle's architecture with the DBSP model.
 
 ### Gupta & Mumick — Materialized Views Survey
 
@@ -110,7 +110,7 @@ pattern used in `src/cdc.rs` is a well-established PostgreSQL technique:
 > <https://debezium.io/>
 
 Debezium implements trigger-based and WAL-based CDC for PostgreSQL and other
-databases. The change buffer table pattern (`pg_stream_changes.changes_<oid>`)
+databases. The change buffer table pattern (`pg_trickle_changes.changes_<oid>`)
 follows a similar approach, modified for single-process consumption within
 the PostgreSQL backend.
 

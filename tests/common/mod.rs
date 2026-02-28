@@ -4,18 +4,18 @@ use sqlx::PgPool;
 use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 
-/// SQL to create the pgstream catalog schema and tables.
+/// SQL to create the pgtrickle catalog schema and tables.
 /// Mirrors the extension_sql!() in lib.rs, but for standalone testing.
 #[allow(dead_code)]
 pub const CATALOG_DDL: &str = r#"
-CREATE SCHEMA IF NOT EXISTS pgstream;
-CREATE SCHEMA IF NOT EXISTS pgstream_changes;
+CREATE SCHEMA IF NOT EXISTS pgtrickle;
+CREATE SCHEMA IF NOT EXISTS pgtrickle_changes;
 
-CREATE TABLE IF NOT EXISTS pgstream.pgs_stream_tables (
-    pgs_id           BIGSERIAL PRIMARY KEY,
-    pgs_relid        OID NOT NULL UNIQUE,
-    pgs_name         TEXT NOT NULL,
-    pgs_schema       TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
+    pgt_id           BIGSERIAL PRIMARY KEY,
+    pgt_relid        OID NOT NULL UNIQUE,
+    pgt_name         TEXT NOT NULL,
+    pgt_schema       TEXT NOT NULL,
     defining_query  TEXT NOT NULL,
     original_query  TEXT,
     schedule      TEXT,
@@ -33,22 +33,22 @@ CREATE TABLE IF NOT EXISTS pgstream.pgs_stream_tables (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_pgs_name ON pgstream.pgs_stream_tables (pgs_schema, pgs_name);
-CREATE INDEX IF NOT EXISTS idx_pgs_status ON pgstream.pgs_stream_tables (status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pgt_name ON pgtrickle.pgt_stream_tables (pgt_schema, pgt_name);
+CREATE INDEX IF NOT EXISTS idx_pgt_status ON pgtrickle.pgt_stream_tables (status);
 
-CREATE TABLE IF NOT EXISTS pgstream.pgs_dependencies (
-    pgs_id        BIGINT NOT NULL REFERENCES pgstream.pgs_stream_tables(pgs_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_dependencies (
+    pgt_id        BIGINT NOT NULL REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
     source_relid OID NOT NULL,
     source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW', 'MATVIEW', 'FOREIGN_TABLE')),
     columns_used TEXT[],
-    PRIMARY KEY (pgs_id, source_relid)
+    PRIMARY KEY (pgt_id, source_relid)
 );
 
-CREATE INDEX IF NOT EXISTS idx_deps_source ON pgstream.pgs_dependencies (source_relid);
+CREATE INDEX IF NOT EXISTS idx_deps_source ON pgtrickle.pgt_dependencies (source_relid);
 
-CREATE TABLE IF NOT EXISTS pgstream.pgs_refresh_history (
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
     refresh_id      BIGSERIAL PRIMARY KEY,
-    pgs_id           BIGINT NOT NULL,
+    pgt_id           BIGINT NOT NULL,
     data_timestamp  TIMESTAMPTZ NOT NULL,
     start_time      TIMESTAMPTZ NOT NULL,
     end_time        TIMESTAMPTZ,
@@ -64,16 +64,16 @@ CREATE TABLE IF NOT EXISTS pgstream.pgs_refresh_history (
     freshness_deadline TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_hist_pgs_ts ON pgstream.pgs_refresh_history (pgs_id, data_timestamp);
+CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);
 
-CREATE TABLE IF NOT EXISTS pgstream.pgs_change_tracking (
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_change_tracking (
     source_relid        OID PRIMARY KEY,
     slot_name           TEXT NOT NULL,
     last_consumed_lsn   PG_LSN,
-    tracked_by_pgs_ids   BIGINT[]
+    tracked_by_pgt_ids   BIGINT[]
 );
 
-CREATE OR REPLACE FUNCTION pgstream.parse_duration_seconds(input TEXT)
+CREATE OR REPLACE FUNCTION pgtrickle.parse_duration_seconds(input TEXT)
 RETURNS BIGINT LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
     s TEXT := trim(input);
@@ -100,16 +100,16 @@ BEGIN
     RETURN total;
 END; $$;
 
-CREATE OR REPLACE VIEW pgstream.stream_tables_info AS
+CREATE OR REPLACE VIEW pgtrickle.stream_tables_info AS
 SELECT st.*,
        now() - st.data_timestamp AS staleness,
        CASE WHEN st.schedule IS NOT NULL
                  AND st.schedule !~ '[\s@]'
             THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
-                 pgstream.parse_duration_seconds(st.schedule)
+                 pgtrickle.parse_duration_seconds(st.schedule)
             ELSE NULL::boolean
        END AS stale
-FROM pgstream.pgs_stream_tables st;
+FROM pgtrickle.pgt_stream_tables st;
 "#;
 
 /// A test database backed by a Testcontainers PostgreSQL 18.1 instance.
@@ -147,14 +147,14 @@ impl TestDb {
         }
     }
 
-    /// Start a fresh container with the pg_stream catalog schema pre-created.
+    /// Start a fresh container with the pg_trickle catalog schema pre-created.
     pub async fn with_catalog() -> Self {
         let db = Self::new().await;
         // Use raw_sql to execute multiple DDL statements in one call
         sqlx::raw_sql(CATALOG_DDL)
             .execute(&db.pool)
             .await
-            .expect("Failed to create pg_stream catalog schema");
+            .expect("Failed to create pg_trickle catalog schema");
         db
     }
 

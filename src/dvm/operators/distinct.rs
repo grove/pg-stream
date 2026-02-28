@@ -9,15 +9,15 @@
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a Distinct node.
 ///
 /// Strategy: track multiplicity count per unique row. Only emit row when
 /// count transitions through 0.
-pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Distinct { child } = op else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_distinct called on non-Distinct node".into(),
         ));
     };
@@ -43,9 +43,9 @@ pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
     // CTE 1: Compute per-row net change (insert_count - delete_count)
     let delta_cte = ctx.next_cte_name("dist_delta");
     let delta_sql = format!(
-        "SELECT {row_id_expr} AS __pgs_row_id,\n\
+        "SELECT {row_id_expr} AS __pgt_row_id,\n\
          {col_list},\n\
-         SUM(CASE WHEN __pgs_action = 'I' THEN 1 ELSE -1 END) AS __net_count\n\
+         SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) AS __net_count\n\
          FROM {child_cte}\n\
          GROUP BY {col_list}",
         child_cte = child_result.cte_name,
@@ -57,13 +57,13 @@ pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
 
     // Join on row_id to get old count
     let merge_sql = format!(
-        "SELECT d.__pgs_row_id,\n\
+        "SELECT d.__pgt_row_id,\n\
          {d_cols},\n\
          d.__net_count,\n\
-         COALESCE(st.__pgs_count, 0) AS old_count,\n\
-         COALESCE(st.__pgs_count, 0) + d.__net_count AS new_count\n\
+         COALESCE(st.__pgt_count, 0) AS old_count,\n\
+         COALESCE(st.__pgt_count, 0) + d.__net_count AS new_count\n\
          FROM {delta_cte} d\n\
-         LEFT JOIN {st_table} st ON st.__pgs_row_id = d.__pgs_row_id",
+         LEFT JOIN {st_table} st ON st.__pgt_row_id = d.__pgt_row_id",
         d_cols = cols
             .iter()
             .map(|c| format!("d.{}", quote_ident(c)))
@@ -77,32 +77,32 @@ pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
     let final_sql = format!(
         "\
 -- Row appears: was absent, now present
-SELECT __pgs_row_id, 'I' AS __pgs_action,
-       {col_list}, new_count AS __pgs_count
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count AS __pgt_count
 FROM {merge_cte}
 WHERE old_count <= 0 AND new_count > 0
 
 UNION ALL
 
 -- Row vanishes: was present, now absent
-SELECT __pgs_row_id, 'D' AS __pgs_action,
-       {col_list}, 0 AS __pgs_count
+SELECT __pgt_row_id, 'D' AS __pgt_action,
+       {col_list}, 0 AS __pgt_count
 FROM {merge_cte}
 WHERE old_count > 0 AND new_count <= 0
 
 UNION ALL
 
 -- Count changed but row still present: update the stored count
--- (emitted as 'I' so the MERGE applies UPDATE SET __pgs_count = new_count)
-SELECT __pgs_row_id, 'I' AS __pgs_action,
-       {col_list}, new_count AS __pgs_count
+-- (emitted as 'I' so the MERGE applies UPDATE SET __pgt_count = new_count)
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count AS __pgt_count
 FROM {merge_cte}
 WHERE old_count > 0 AND new_count > 0 AND new_count != old_count",
     );
     ctx.add_cte(final_cte.clone(), final_sql);
 
     let mut output_cols = cols.clone();
-    output_cols.push("__pgs_count".to_string());
+    output_cols.push("__pgt_count".to_string());
 
     Ok(DiffResult {
         cte_name: final_cte,
@@ -124,10 +124,10 @@ mod tests {
         let result = diff_distinct(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Output columns should include user cols + __pgs_count
+        // Output columns should include user cols + __pgt_count
         assert!(result.columns.contains(&"id".to_string()));
         assert!(result.columns.contains(&"name".to_string()));
-        assert!(result.columns.contains(&"__pgs_count".to_string()));
+        assert!(result.columns.contains(&"__pgt_count".to_string()));
 
         // Should contain the 3-CTE pattern: delta, merge, final
         assert_sql_contains(&sql, "__net_count");
@@ -144,7 +144,7 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         // Row ID is hash of all columns
-        assert_sql_contains(&sql, "pgstream.pg_stream_hash");
+        assert_sql_contains(&sql, "pgtrickle.pg_trickle_hash");
     }
 
     #[test]

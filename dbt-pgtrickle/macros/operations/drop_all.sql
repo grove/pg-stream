@@ -9,7 +9,7 @@
 
   drop_all_stream_tables_force()
 
-  Drops ALL stream tables from the pg_stream catalog, including those created
+  Drops ALL stream tables from the pg_trickle catalog, including those created
   outside dbt. Use with caution.
 
   Usage:
@@ -25,12 +25,12 @@
       {% set st_name = model.config.get('stream_table_name', model.name) %}
       {% set st_schema = model.config.get('stream_table_schema', target.schema) %}
       {% set qualified = st_schema ~ '.' ~ st_name %}
-      {% if pgstream_stream_table_exists(qualified) %}
-        {{ pgstream_drop_stream_table(qualified) }}
+      {% if pgtrickle_stream_table_exists(qualified) %}
+        {{ pgtrickle_drop_stream_table(qualified) }}
         {% do dropped.append(qualified) %}
       {% endif %}
     {% endfor %}
-    {{ log("pg_stream: dropped " ~ dropped | length ~ " dbt-managed stream table(s)", info=true) }}
+    {{ log("pg_trickle: dropped " ~ dropped | length ~ " dbt-managed stream table(s)", info=true) }}
   {% endif %}
 {% endmacro %}
 
@@ -38,17 +38,17 @@
 {% macro drop_all_stream_tables_force() %}
   {% if execute %}
     {% set query %}
-      SELECT pgs_schema || '.' || pgs_name AS qualified_name
-      FROM pgstream.pgs_stream_tables
+      SELECT pgt_schema || '.' || pgt_name AS qualified_name
+      FROM pgtrickle.pgt_stream_tables
     {% endset %}
     {% set results = run_query(query) %}
     {% if results and results.rows | length > 0 %}
       {% for row in results.rows %}
-        {{ pgstream_drop_stream_table(row['qualified_name']) }}
+        {{ pgtrickle_drop_stream_table(row['qualified_name']) }}
       {% endfor %}
-      {{ log("pg_stream: force-dropped " ~ results.rows | length ~ " stream table(s)", info=true) }}
+      {{ log("pg_trickle: force-dropped " ~ results.rows | length ~ " stream table(s)", info=true) }}
     {% else %}
-      {{ log("pg_stream: no stream tables found to drop", info=true) }}
+      {{ log("pg_trickle: no stream tables found to drop", info=true) }}
     {% endif %}
   {% endif %}
 {% endmacro %}

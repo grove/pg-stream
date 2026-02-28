@@ -25,7 +25,7 @@ stream_table_definition, force_full_refresh — none of these were built).
 
 ---
 
-### C1 — Remove `pg_stream.merge_strategy` GUC entirely
+### C1 — Remove `pg_trickle.merge_strategy` GUC entirely
 
 **Priority:** P0 — remove before public release
 **Effort:** 1–2 hours
@@ -56,7 +56,7 @@ stream_table_definition, force_full_refresh — none of these were built).
 - ✅ Eliminates a GUC that provides zero choice after `delete_insert` removal
 - ✅ Simplifies `refresh.rs`: removes the strategy-selection branch
 - ✅ Simplifies `config.rs`: removes one GUC registration
-- ✅ Users who set `pg_stream.merge_strategy = 'merge'` or `'auto'` get an
+- ✅ Users who set `pg_trickle.merge_strategy = 'merge'` or `'auto'` get an
   unknown-GUC warning (harmless) rather than silent no-op behaviour
 - ❌ Breaking change for any existing configuration — acceptable at pre-1.0
 
@@ -67,7 +67,7 @@ stream_table_definition, force_full_refresh — none of these were built).
 #### Implementation
 
 1. ~~Remove `PGS_MERGE_STRATEGY` from `config.rs`~~ ✅
-2. ~~Remove `pg_stream_merge_strategy()` accessor~~ ✅
+2. ~~Remove `pg_trickle_merge_strategy()` accessor~~ ✅
 3. ~~Remove `use_delete_insert` branch in `refresh.rs`~~ ✅
 4. ~~Remove `delete_insert_template` and `delete_insert_sql` fields from the
    refresh cache entry struct~~ ✅
@@ -83,16 +83,16 @@ stream_table_definition, force_full_refresh — none of these were built).
 
 #### Background
 
-When a stream table accumulates `pg_stream.max_consecutive_errors`
+When a stream table accumulates `pg_trickle.max_consecutive_errors`
 consecutive refresh failures, the scheduler sets its status to `SUSPENDED`
 and fires an `auto_suspended` NOTIFY alert. The error message in
 `refresh_stream_table()` tells the user:
 
 ```
-"stream table {}.{} is suspended; use pgstream.resume_stream_table() first"
+"stream table {}.{} is suspended; use pgtrickle.resume_stream_table() first"
 ```
 
-**`pgstream.resume_stream_table()` does not exist as a `pg_extern`
+**`pgtrickle.resume_stream_table()` does not exist as a `pg_extern`
 function.** The user is told to call a function that doesn't exist.
 
 This is a bug, not a feature to remove. It reveals that the SUSPENDED
@@ -110,7 +110,7 @@ directly mutating the catalog table.
   consuming background worker cycles and filling the log
 - ❌ Users lose NOTIFY alerting for persistent failures
 
-**B. Implement `pgstream.resume_stream_table(name text)` function**
+**B. Implement `pgtrickle.resume_stream_table(name text)` function**
 - ✅ Makes the documented lifecycle complete and consistent
 - ✅ Fixes the dangling error message
 - ✅ Auto-suspension remains as a safety valve for persistent errors
@@ -126,7 +126,7 @@ already promised by the error message; this just fulfils that promise.
 #### Implementation
 
 ```rust
-#[pg_extern(schema = "pgstream")]
+#[pg_extern(schema = "pgtrickle")]
 fn resume_stream_table(name: &str) {
     // Parse schema.name, look up in catalog, assert status == SUSPENDED,
     // reset status = ACTIVE + consecutive_errors = 0, emit NOTIFY.
@@ -135,7 +135,7 @@ fn resume_stream_table(name: &str) {
 
 ---
 
-### C3 — Remove `pg_stream.max_concurrent_refreshes` GUC (or mark as no-op)
+### C3 — Remove `pg_trickle.max_concurrent_refreshes` GUC (or mark as no-op)
 
 **Priority:** P1 — documents a capability that does not exist
 **Effort:** 30 min (document) or 2 hours (remove)
@@ -143,7 +143,7 @@ fn resume_stream_table(name: &str) {
 
 #### Background
 
-`pg_stream.max_concurrent_refreshes` (default: 4, max: 32) implies the
+`pg_trickle.max_concurrent_refreshes` (default: 4, max: 32) implies the
 scheduler runs multiple refreshes in parallel. It does not. The scheduler
 processes stream tables sequentially in topological order within a single
 background worker (G8.5 in SQL_GAPS_7.md). The GUC is read but has no
@@ -174,7 +174,7 @@ string in `config.rs` to make it clear the value is not yet honoured.
 
 ---
 
-### C4 — Consolidate `pg_stream.merge_work_mem_mb` and `pg_stream.merge_planner_hints`
+### C4 — Consolidate `pg_trickle.merge_work_mem_mb` and `pg_trickle.merge_planner_hints`
 
 **Priority:** P2 — low user value, high documentation burden
 **Effort:** 1–2 hours
@@ -184,9 +184,9 @@ string in `config.rs` to make it clear the value is not yet honoured.
 
 Two GUCs control planner hint injection before MERGE execution:
 
-- `pg_stream.merge_planner_hints` (bool, default: true) — enables injection
+- `pg_trickle.merge_planner_hints` (bool, default: true) — enables injection
   of `SET LOCAL enable_nestloop = off` and `SET LOCAL work_mem = '<N>MB'`
-- `pg_stream.merge_work_mem_mb` (int, default: 64) — sets the `work_mem`
+- `pg_trickle.merge_work_mem_mb` (int, default: 64) — sets the `work_mem`
   injected when delta ≥ 10,000 rows
 
 These exist because PostgreSQL's planner sometimes chooses nested-loop
@@ -215,15 +215,15 @@ solution is correct but exposes two internal tuning knobs.
   specific PostgreSQL minor versions or hardware configurations
 - ❌ More risk than benefit
 
-**Decision:** Option A — keep both `pg_stream.merge_work_mem_mb` and
-`pg_stream.merge_planner_hints` as-is. Maximum operator control is preserved
+**Decision:** Option A — keep both `pg_trickle.merge_work_mem_mb` and
+`pg_trickle.merge_planner_hints` as-is. Maximum operator control is preserved
 for users who need to tune MERGE performance on large deltas.
 
 **Status: No action required ✅**
 
 ---
 
-### C5 — Simplify `pg_stream.user_triggers` GUC values
+### C5 — Simplify `pg_trickle.user_triggers` GUC values
 
 **Priority:** P3 — minor API surface simplification
 **Effort:** 1 hour
@@ -231,7 +231,7 @@ for users who need to tune MERGE performance on large deltas.
 
 #### Background
 
-`pg_stream.user_triggers` accepts: `auto` (default), `on`, `off`.
+`pg_trickle.user_triggers` accepts: `auto` (default), `on`, `off`.
 
 - `auto`: detect user-defined row-level triggers on the stream table and
   use explicit DML (DELETE + UPDATE + INSERT) so they fire correctly
@@ -239,7 +239,7 @@ for users who need to tune MERGE performance on large deltas.
 - `off`: always use MERGE; user triggers will NOT fire correctly
 
 The `on` value is only useful if trigger detection is unreliable. If
-detection is reliable (which it is — pg_stream checks `pg_trigger`
+detection is reliable (which it is — pg_trickle checks `pg_trigger`
 directly), `on` is redundant with `auto`.
 
 The `off` value explicitly disables trigger compatibility, which means
@@ -253,7 +253,7 @@ footgun.
 - ❌ `on` is redundant with `auto`; `off` is a footgun
 
 **B. Remove `on` (redundant with `auto`) and rename `off` to
-`pg_stream.user_triggers = false` (boolean GUC)**
+`pg_trickle.user_triggers = false` (boolean GUC)**
 - ✅ Cleaner: a boolean "respect user triggers yes/no" is clearer than
   three string values
 - ✅ Auto-detection is reliable enough that `on` adds no value
@@ -278,7 +278,7 @@ worth the churn before v0.2.0.
 
 #### Background
 
-`pg_stream.wal_transition_timeout` is visible to users, implying that WAL
+`pg_trickle.wal_transition_timeout` is visible to users, implying that WAL
 CDC is a normal operational mode to configure. It is not — WAL CDC has
 three P1 correctness issues (F2, F3, F4 in SQL_GAPS_7.md) and is not
 production-ready until v0.3.0.
@@ -292,13 +292,13 @@ production-ready until v0.3.0.
 **B. Keep GUCs but add prominent warnings in documentation and GUC
 description strings**
 - ✅ No API change
-- ✅ GUC descriptions are shown by `SHOW pgstream.wal_transition_timeout`
+- ✅ GUC descriptions are shown by `SHOW pgtrickle.wal_transition_timeout`
 - ✅ The existing GUC description can say explicitly: "WAL CDC is not
   production-ready in v0.2.0; see docs."
 
 **C. Remove or hide WAL-mode GUCs until v0.3.0**
 - ✅ Cleanest signal of "not ready"
-- ❌ `pg_stream.cdc_mode = 'auto'` (the default) will attempt WAL
+- ❌ `pg_trickle.cdc_mode = 'auto'` (the default) will attempt WAL
   transition after a successful refresh — the GUC is needed to control
   the timeout even in pre-production
 
@@ -332,9 +332,9 @@ codebase and therefore require no removal:
 | Feature | Status |
 |---------|--------|
 | `ON COMMIT REFRESH` clause | Never built |
-| `pgstream.force_full_refresh()` separate function | Never built — full refresh is `refresh_stream_table(name, force := true)` |
+| `pgtrickle.force_full_refresh()` separate function | Never built — full refresh is `refresh_stream_table(name, force := true)` |
 | Per-table `delta_threshold` override | Never built |
-| `pgstream.stream_table_definition()` DDL reconstruction | Never built |
+| `pgtrickle.stream_table_definition()` DDL reconstruction | Never built |
 | Named/reusable refresh schedules | Never built |
-| Separate `pgstream.pause_stream_table()` function | Never built — suspension is automatic only |
+| Separate `pgtrickle.pause_stream_table()` function | Never built — suspension is automatic only |
 | Per-operator timing breakdowns | Never built — `explain_st()` exposes the operator tree but not timings |

@@ -15,7 +15,7 @@ CREATE TABLE orders (
     amount   NUMERIC(10,2) NOT NULL
 );
 
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'customer_totals',
     $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
@@ -56,7 +56,7 @@ Alice's first order changes from 49.99 to 59.99. The customer (group key) stays 
 The AFTER UPDATE trigger fires and writes **one row** to the change buffer with both OLD and NEW values:
 
 ```
-pgstream_changes.changes_16384
+pgtrickle_changes.changes_16384
 ┌───────────┬─────────────┬────────┬──────────┬──────────┬────────────┬──────────┬────────────┐
 │ change_id │ lsn         │ action │ new_cust │ new_amt  │ old_cust   │ old_amt  │ pk_hash    │
 ├───────────┼─────────────┼────────┼──────────┼──────────┼────────────┼──────────┼────────────┤
@@ -75,7 +75,7 @@ Identical to the INSERT flow. The scheduler detects one change row in the LSN wi
 This is where UPDATE handling diverges fundamentally. The scan delta operator **decomposes the UPDATE into two events**:
 
 ```
-__pgs_row_id | __pgs_action | customer | amount
+__pgt_row_id | __pgt_action | customer | amount
 -------------|--------------|----------|-------
 -837291      | D            | alice    | 49.99     ← old values (DELETE)
 -837291      | I            | alice    | 59.99     ← new values (INSERT)
@@ -112,7 +112,7 @@ count delta:  -1 + 1 = 0
 The aggregate emits this as an INSERT (because the group still exists and its value changed):
 
 ```
-customer | total  | order_count | __pgs_row_id | __pgs_action
+customer | total  | order_count | __pgt_row_id | __pgt_action
 ---------|--------|-------------|--------------|-------------
 alice    | +10.00 | 0           | 7283194      | I
 ```
@@ -131,7 +131,7 @@ Wait — that's not right. The MERGE doesn't add deltas; it **replaces** the row
 
 ```sql
 COALESCE(existing.total, 0) + delta.total  → 79.99 + 10.00 = 89.99
-COALESCE(existing.__pgs_count, 0) + delta.__pgs_count → 2 + 0 = 2
+COALESCE(existing.__pgt_count, 0) + delta.__pgt_count → 2 + 0 = 2
 ```
 
 Result:
@@ -166,7 +166,7 @@ The old and new customer values differ.
 ### Scan Delta: D+I Split
 
 ```
-__pgs_row_id | __pgs_action | customer | amount
+__pgt_row_id | __pgt_action | customer | amount
 -------------|--------------|----------|-------
 4521038      | D            | alice    | 30.00    ← removes from alice's group
 4521038      | I            | bob      | 30.00    ← adds to bob's group
@@ -213,17 +213,17 @@ UPDATE orders SET customer = 'bob' WHERE id = 1;
 Group "alice":
   total delta:    -59.99
   count delta:    -1
-  new __pgs_count: 1 - 1 = 0  → group vanishes!
+  new __pgt_count: 1 - 1 = 0  → group vanishes!
 
 Group "bob":
   total delta:    +59.99
   count delta:    +1
 ```
 
-When `__pgs_count` reaches 0, the aggregate emits a **DELETE** for alice's group:
+When `__pgt_count` reaches 0, the aggregate emits a **DELETE** for alice's group:
 
 ```
-customer | total | __pgs_row_id | __pgs_action
+customer | total | __pgt_row_id | __pgt_action
 ---------|-------|--------------|-------------
 alice    | —     | 7283194      | D             ← group removed
 bob      | ...   | 9182734      | I             ← group updated
@@ -275,7 +275,7 @@ Both first and last actions are 'U', so:
 Net delta:
 
 ```
-__pgs_row_id | __pgs_action | amount
+__pgt_row_id | __pgt_action | amount
 -------------|--------------|-------
 pk_hash_3    | D            | 75.00    ← original value before all changes
 pk_hash_3    | I            | 30.00    ← final value after all changes
@@ -348,7 +348,7 @@ CREATE TABLE orders (
     amount      NUMERIC(10,2)
 );
 
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_details',
     $$
       SELECT c.name, c.tier, o.amount

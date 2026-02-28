@@ -90,7 +90,7 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
         } => {
             // A Project renames/transforms columns. The snapshot must preserve
             // these aliases so that downstream join conditions can reference
-            // the projected column names (e.g., `__pgs_scalar_1` from a
+            // the projected column names (e.g., `__pgt_scalar_1` from a
             // scalar subquery CROSS JOIN rewrite).
             let inner = build_snapshot_sql(child);
             let child_alias = child.alias();
@@ -194,8 +194,8 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
             let right_snap = build_snapshot_sql(right);
             // Use safe non-reserved aliases to avoid Expr::to_sql() emitting
             // unquoted reserved words like "join" (from InnerJoin.alias()).
-            let left_alias = "__pgs_sl";
-            let right_alias = "__pgs_sr";
+            let left_alias = "__pgt_sl";
+            let right_alias = "__pgt_sr";
             let cond = rewrite_join_condition(condition, left, left_alias, right, right_alias);
             format!(
                 "(SELECT {la}.* FROM {left_snap} {la} WHERE EXISTS \
@@ -211,8 +211,8 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
         } => {
             let left_snap = build_snapshot_sql(left);
             let right_snap = build_snapshot_sql(right);
-            let left_alias = "__pgs_al";
-            let right_alias = "__pgs_ar";
+            let left_alias = "__pgt_al";
+            let right_alias = "__pgt_ar";
             let cond = rewrite_join_condition(condition, left, left_alias, right, right_alias);
             format!(
                 "(SELECT {la}.* FROM {left_snap} {la} WHERE NOT EXISTS \
@@ -779,7 +779,7 @@ pub fn is_simple_child(op: &OpTree) -> bool {
 
 /// Build per-column `alias."col"::TEXT` expressions for the base-table
 /// side of a join, suitable for inclusion in a flat
-/// `pg_stream_hash_multi(ARRAY[...])` call.
+/// `pg_trickle_hash_multi(ARRAY[...])` call.
 ///
 /// For `Scan` nodes this uses the PK (non-nullable) columns; for
 /// non-Scan children it falls back to `row_to_json(alias)::text`.

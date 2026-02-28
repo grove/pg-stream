@@ -1,4 +1,4 @@
-name: 'dbt_pgstream'
+name: 'dbt_pgtrickle'
 version: '0.1.0'
 config-version: 2
 

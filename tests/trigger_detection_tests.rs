@@ -2,7 +2,7 @@
 //!
 //! Validates the SQL queries used by `has_user_triggers()` and the trigger
 //! detection plumbing against a real PostgreSQL 18.1 container. These tests
-//! do NOT require the pg_stream extension — they exercise the raw SQL
+//! do NOT require the pg_trickle extension — they exercise the raw SQL
 //! patterns used internally.
 //!
 //! Prerequisites: Testcontainers + Docker
@@ -18,7 +18,7 @@ use common::TestDb;
 //     SELECT 1 FROM pg_trigger
 //     WHERE tgrelid = $OID
 //       AND NOT tgisinternal
-//       AND tgname NOT LIKE 'pgs_%'
+//       AND tgname NOT LIKE 'pgt_%'
 //       AND tgtype & 1 = 1  -- ROW-level trigger
 //   )
 
@@ -27,7 +27,7 @@ const HAS_USER_TRIGGERS_SQL: &str = r#"
         SELECT 1 FROM pg_trigger
         WHERE tgrelid = $1::oid
           AND NOT tgisinternal
-          AND tgname NOT LIKE 'pgs_%'
+          AND tgname NOT LIKE 'pgt_%'
           AND tgtype & 1 = 1
     )
 "#;
@@ -86,7 +86,7 @@ async fn test_trigger_detection_with_user_trigger() {
 }
 
 #[tokio::test]
-async fn test_trigger_detection_ignores_pgs_prefix() {
+async fn test_trigger_detection_ignores_pgt_prefix() {
     let db = TestDb::new().await;
 
     db.execute("CREATE TABLE detect_pgs (id INT PRIMARY KEY, val TEXT)")
@@ -96,9 +96,9 @@ async fn test_trigger_detection_ignores_pgs_prefix() {
          BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
     )
     .await;
-    // Trigger with pgs_ prefix should be ignored (internal pg_stream triggers)
+    // Trigger with pgt_ prefix should be ignored (internal pg_trickle triggers)
     db.execute(
-        "CREATE TRIGGER pgs_cdc_trigger AFTER INSERT ON detect_pgs
+        "CREATE TRIGGER pgt_cdc_trigger AFTER INSERT ON detect_pgs
          FOR EACH ROW EXECUTE FUNCTION noop_fn()",
     )
     .await;
@@ -115,7 +115,7 @@ async fn test_trigger_detection_ignores_pgs_prefix() {
 
     assert!(
         !has_triggers,
-        "pgs_-prefixed triggers should be excluded from detection"
+        "pgt_-prefixed triggers should be excluded from detection"
     );
 }
 
@@ -171,9 +171,9 @@ async fn test_trigger_detection_mixed_triggers() {
     )
     .await;
 
-    // Internal pg_stream trigger (should be ignored)
+    // Internal pg_trickle trigger (should be ignored)
     db.execute(
-        "CREATE TRIGGER pgs_internal AFTER INSERT ON detect_mixed
+        "CREATE TRIGGER pgt_internal AFTER INSERT ON detect_mixed
          FOR EACH ROW EXECUTE FUNCTION noop_fn()",
     )
     .await;

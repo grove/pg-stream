@@ -10,7 +10,7 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a CteScan node.
 ///
@@ -18,7 +18,7 @@ use crate::error::PgStreamError;
 /// 2. Otherwise, retrieve the CTE body from the registry, differentiate
 ///    it, cache the result.
 /// 3. If column aliases are present, wrap the result in a renaming CTE.
-pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::CteScan {
         cte_id,
         cte_name,
@@ -28,7 +28,7 @@ pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
         column_aliases,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_cte_scan called on non-CteScan node".into(),
         ));
     };
@@ -42,7 +42,7 @@ pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
             .cte_registry
             .get(*cte_id)
             .ok_or_else(|| {
-                PgStreamError::InternalError(format!(
+                PgTrickleError::InternalError(format!(
                     "CTE '{cte_name}' (id={cte_id}) not found in registry"
                 ))
             })?
@@ -90,7 +90,7 @@ pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
     let cte_name_str = ctx.next_cte_name(&format!("ctescan_{alias}"));
 
     let sql = format!(
-        "SELECT __pgs_row_id, __pgs_action, {cols}\n\
+        "SELECT __pgt_row_id, __pgt_action, {cols}\n\
          FROM {child_cte}",
         cols = rename_exprs.join(", "),
         child_cte = base_result.cte_name,

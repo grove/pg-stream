@@ -9,7 +9,7 @@ ELAPSED=0
 
 while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
   POPULATED=$(psql -tAc \
-    "SELECT is_populated FROM pgstream.pgs_stream_tables WHERE pgs_name = '$NAME'")
+    "SELECT is_populated FROM pgtrickle.pgt_stream_tables WHERE pgt_name = '$NAME'")
   if [ "$POPULATED" = "t" ]; then
     echo "Stream table '$NAME' is populated after ${ELAPSED}s"
     exit 0

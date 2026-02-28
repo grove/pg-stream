@@ -36,7 +36,7 @@ async fn test_view_inline_diff_basic() {
     .await;
 
     // Verify initial population
-    let (status, mode, populated, errors) = db.pgs_status("vi_st_basic").await;
+    let (status, mode, populated, errors) = db.pgt_status("vi_st_basic").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "DIFFERENTIAL");
     assert!(populated, "ST should be populated after create");
@@ -368,7 +368,7 @@ async fn test_view_inline_full_mode() {
     )
     .await;
 
-    let (status, mode, populated, _) = db.pgs_status("vi_st_full").await;
+    let (status, mode, populated, _) = db.pgt_status("vi_st_full").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "FULL");
     assert!(populated);
@@ -402,7 +402,7 @@ async fn test_view_inline_matview_rejected() {
     // DIFFERENTIAL mode should reject materialized views
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('vi_st_mv', \
+            "SELECT pgtrickle.create_stream_table('vi_st_mv', \
              $$SELECT id, val FROM vi_matview$$, '1m', 'DIFFERENTIAL')",
         )
         .await;
@@ -440,7 +440,7 @@ async fn test_view_inline_matview_allowed_in_full() {
     )
     .await;
 
-    let (status, mode, populated, _) = db.pgs_status("vi_st_mv_full").await;
+    let (status, mode, populated, _) = db.pgt_status("vi_st_mv_full").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "FULL");
     assert!(populated);
@@ -483,7 +483,7 @@ async fn test_view_inline_view_replaced() {
     // The ST should be marked for reinit (needs_reinit = true)
     let needs_reinit: bool = db
         .query_scalar(
-            "SELECT needs_reinit FROM pgstream.pgs_stream_tables WHERE pgs_name = 'vi_st_repl'",
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'vi_st_repl'",
         )
         .await;
     assert!(
@@ -523,7 +523,7 @@ async fn test_view_inline_view_dropped() {
 
         let status: String = db
             .query_scalar(
-                "SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'vi_st_drop_view'",
+                "SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'vi_st_drop_view'",
             )
             .await;
         assert_eq!(
@@ -643,7 +643,7 @@ async fn test_view_inline_original_query_stored() {
     // Verify original_query is stored in catalog
     let stored_original: Option<String> = db
         .query_scalar_opt(
-            "SELECT original_query FROM pgstream.pgs_stream_tables WHERE pgs_name = 'vi_st_cat'",
+            "SELECT original_query FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'vi_st_cat'",
         )
         .await;
     assert!(
@@ -664,7 +664,7 @@ async fn test_view_inline_original_query_stored() {
     // carry the original view name — that's fine).
     let defining: String = db
         .query_scalar(
-            "SELECT defining_query FROM pgstream.pgs_stream_tables WHERE pgs_name = 'vi_st_cat'",
+            "SELECT defining_query FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'vi_st_cat'",
         )
         .await;
 
@@ -700,9 +700,9 @@ async fn test_view_inline_dependency_registered() {
     // Check that view is registered as a soft dependency
     let view_dep_count: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_dependencies \
+            "SELECT count(*) FROM pgtrickle.pgt_dependencies \
              WHERE source_type = 'VIEW' \
-             AND pgs_id = (SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'vi_st_dep')",
+             AND pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'vi_st_dep')",
         )
         .await;
     assert!(
@@ -713,9 +713,9 @@ async fn test_view_inline_dependency_registered() {
     // Check that the base table is also registered (from the rewritten query)
     let table_dep_count: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_dependencies \
+            "SELECT count(*) FROM pgtrickle.pgt_dependencies \
              WHERE source_type = 'TABLE' \
-             AND pgs_id = (SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'vi_st_dep')",
+             AND pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'vi_st_dep')",
         )
         .await;
     assert!(

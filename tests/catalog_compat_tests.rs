@@ -1,4 +1,4 @@
-//! Integration tests for PostgreSQL catalog behavior that pg_stream relies on.
+//! Integration tests for PostgreSQL catalog behavior that pg_trickle relies on.
 //!
 //! These tests run against a live PostgreSQL 18 container (via Testcontainers)
 //! and verify assumptions that previously caused E2E failures:
@@ -7,7 +7,7 @@
 //! - `pg_namespace.nspname` type (`name` vs `text`) and cast requirements
 //! - `pg_class.relkind` values for tables, views, matviews, foreign tables
 //!
-//! **No pg_stream extension is required** — these tests use only built-in
+//! **No pg_trickle extension is required** — these tests use only built-in
 //! PostgreSQL catalog functions and system tables.
 
 mod common;

@@ -1,4 +1,4 @@
-//! Benchmark scaffolding for pgstream.
+//! Benchmark scaffolding for pgtrickle.
 //!
 //! These benchmarks measure the performance of pure in-process functions.
 //! Database-level benchmarks (refresh duration, delta query execution)
@@ -8,10 +8,10 @@
 //! `cargo bench --no-default-features --features pg18` or just unit benchmarks).
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use pg_stream::dag::{DagNode, NodeId, StDag, StStatus};
-use pg_stream::dvm::diff::{col_list, prefixed_col_list, quote_ident};
-use pg_stream::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree};
-use pg_stream::version::{Frontier, lsn_gt, select_canonical_period_secs};
+use pg_trickle::dag::{DagNode, NodeId, StDag, StStatus};
+use pg_trickle::dvm::diff::{col_list, prefixed_col_list, quote_ident};
+use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree};
+use pg_trickle::version::{Frontier, lsn_gt, select_canonical_period_secs};
 use std::time::Duration;
 
 // ── quote_ident benchmark ──────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-//! E2E tests for `pgstream.refresh_stream_table()`.
+//! E2E tests for `pgtrickle.refresh_stream_table()`.
 //!
 //! Validates refresh picks up all DML changes (inserts, updates, deletes),
 //! handles edge cases, and correctly updates metadata.
@@ -241,7 +241,7 @@ async fn test_refresh_updates_data_timestamp() {
 
     let ts_before: Option<String> = db
         .query_scalar_opt(
-            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'rf_ts_st'",
+            "SELECT data_timestamp::text FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rf_ts_st'",
         )
         .await;
 
@@ -253,7 +253,7 @@ async fn test_refresh_updates_data_timestamp() {
 
     let ts_after: Option<String> = db
         .query_scalar_opt(
-            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'rf_ts_st'",
+            "SELECT data_timestamp::text FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rf_ts_st'",
         )
         .await;
 
@@ -282,7 +282,7 @@ async fn test_refresh_updates_last_refresh_at() {
 
     let has_refresh_at: bool = db
         .query_scalar(
-            "SELECT last_refresh_at IS NOT NULL FROM pgstream.pgs_stream_tables WHERE pgs_name = 'rf_lr_st'",
+            "SELECT last_refresh_at IS NOT NULL FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rf_lr_st'",
         )
         .await;
     assert!(
@@ -305,7 +305,7 @@ async fn test_refresh_resets_consecutive_errors() {
     db.execute("INSERT INTO rf_err VALUES (2)").await;
     db.refresh_st("rf_err_st").await;
 
-    let (_, _, _, errors) = db.pgs_status("rf_err_st").await;
+    let (_, _, _, errors) = db.pgt_status("rf_err_st").await;
     assert_eq!(errors, 0, "consecutive_errors should be 0 after success");
 }
 
@@ -324,11 +324,11 @@ async fn test_refresh_records_history() {
     db.refresh_st("rf_hist_st").await;
 
     // Manual refresh updates catalog metadata but doesn't write to
-    // pgs_refresh_history (only the scheduler does). Verify the catalog
+    // pgt_refresh_history (only the scheduler does). Verify the catalog
     // was updated correctly instead.
     let has_refresh_at: bool = db
         .query_scalar(
-            "SELECT last_refresh_at IS NOT NULL FROM pgstream.pgs_stream_tables WHERE pgs_name = 'rf_hist_st'",
+            "SELECT last_refresh_at IS NOT NULL FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rf_hist_st'",
         )
         .await;
     assert!(
@@ -338,14 +338,14 @@ async fn test_refresh_records_history() {
 
     let data_ts: bool = db
         .query_scalar(
-            "SELECT data_timestamp IS NOT NULL FROM pgstream.pgs_stream_tables WHERE pgs_name = 'rf_hist_st'",
+            "SELECT data_timestamp IS NOT NULL FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rf_hist_st'",
         )
         .await;
     assert!(data_ts, "data_timestamp should be set after manual refresh");
 
-    // Verify the pgs_refresh_history table exists and is queryable
-    let table_exists = db.table_exists("pgstream", "pgs_refresh_history").await;
-    assert!(table_exists, "pgs_refresh_history table should exist");
+    // Verify the pgt_refresh_history table exists and is queryable
+    let table_exists = db.table_exists("pgtrickle", "pgt_refresh_history").await;
+    assert!(table_exists, "pgt_refresh_history table should exist");
 }
 
 // ── Suspended ST Refresh ───────────────────────────────────────────────
@@ -366,7 +366,7 @@ async fn test_refresh_suspended_st_fails() {
 
     // Refresh should fail
     let result = db
-        .try_execute("SELECT pgstream.refresh_stream_table('rf_susp_st')")
+        .try_execute("SELECT pgtrickle.refresh_stream_table('rf_susp_st')")
         .await;
     assert!(result.is_err(), "Refreshing a SUSPENDED ST should fail");
 }

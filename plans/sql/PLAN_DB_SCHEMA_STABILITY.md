@@ -1,15 +1,15 @@
 # PLAN_DB_SCHEMA_STABILITY.md — Database Schema Stability Assessment
 
-**Author:** pg_stream team  
+**Author:** pg_trickle team  
 **Date:** 2026-02-25  
 **Status:** Assessment / Pre-1.0 Readiness  
-**Scope:** All database objects created by the pg_stream extension
+**Scope:** All database objects created by the pg_trickle extension
 
 ---
 
 ## 1. Executive Summary
 
-Before releasing pg_stream 1.0, we must audit every database object the
+Before releasing pg_trickle 1.0, we must audit every database object the
 extension creates — schemas, tables, views, functions, triggers, event
 triggers, GUCs, naming conventions, and internal column names — and decide
 which surfaces are **public API** (stable after 1.0) and which are
@@ -32,19 +32,19 @@ This document:
 
 | Schema | Purpose | API Level |
 |--------|---------|-----------|
-| `pgstream` | Catalog tables, SQL functions, views | **Public** |
-| `pgstream_changes` | Change buffer tables (configurable via GUC) | **Internal** |
+| `pgtrickle` | Catalog tables, SQL functions, views | **Public** |
+| `pgtrickle_changes` | Change buffer tables (configurable via GUC) | **Internal** |
 
 ### 2.2 Catalog Tables
 
-#### `pgstream.pgs_stream_tables` — Core ST metadata
+#### `pgtrickle.pgt_stream_tables` — Core ST metadata
 
 | Column | Type | Constraints | API |
 |--------|------|-------------|-----|
-| `pgs_id` | BIGSERIAL | PRIMARY KEY | Internal (surrogate) |
-| `pgs_relid` | OID | NOT NULL UNIQUE | Internal |
-| `pgs_name` | TEXT | NOT NULL | Public (via views) |
-| `pgs_schema` | TEXT | NOT NULL | Public (via views) |
+| `pgt_id` | BIGSERIAL | PRIMARY KEY | Internal (surrogate) |
+| `pgt_relid` | OID | NOT NULL UNIQUE | Internal |
+| `pgt_name` | TEXT | NOT NULL | Public (via views) |
+| `pgt_schema` | TEXT | NOT NULL | Public (via views) |
 | `defining_query` | TEXT | NOT NULL | Public (via `explain_st`) |
 | `original_query` | TEXT | | Internal |
 | `schedule` | TEXT | | Public |
@@ -62,11 +62,11 @@ This document:
 | `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT `now()` | Public |
 | `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT `now()` | Public |
 
-#### `pgstream.pgs_dependencies` — Source dependency edges
+#### `pgtrickle.pgt_dependencies` — Source dependency edges
 
 | Column | Type | Constraints | API |
 |--------|------|-------------|-----|
-| `pgs_id` | BIGINT | FK → `pgs_stream_tables`, PK | Internal |
+| `pgt_id` | BIGINT | FK → `pgt_stream_tables`, PK | Internal |
 | `source_relid` | OID | PK | Internal |
 | `source_type` | TEXT | CHECK IN ('TABLE','STREAM_TABLE','VIEW') | Internal |
 | `columns_used` | TEXT[] | | Internal |
@@ -77,12 +77,12 @@ This document:
 | `decoder_confirmed_lsn` | PG_LSN | | Internal |
 | `transition_started_at` | TIMESTAMPTZ | | Internal |
 
-#### `pgstream.pgs_refresh_history` — Audit log
+#### `pgtrickle.pgt_refresh_history` — Audit log
 
 | Column | Type | Constraints | API |
 |--------|------|-------------|-----|
 | `refresh_id` | BIGSERIAL | PRIMARY KEY | Internal |
-| `pgs_id` | BIGINT | NOT NULL | Internal |
+| `pgt_id` | BIGINT | NOT NULL | Internal |
 | `data_timestamp` | TIMESTAMPTZ | NOT NULL | Public (via `get_refresh_history`) |
 | `start_time` | TIMESTAMPTZ | NOT NULL | Public |
 | `end_time` | TIMESTAMPTZ | | Public |
@@ -94,75 +94,75 @@ This document:
 | `initiated_by` | TEXT | CHECK IN (...) | Public |
 | `freshness_deadline` | TIMESTAMPTZ | | Internal |
 
-#### `pgstream.pgs_change_tracking` — Per-source CDC slot tracking
+#### `pgtrickle.pgt_change_tracking` — Per-source CDC slot tracking
 
 | Column | Type | Constraints | API |
 |--------|------|-------------|-----|
 | `source_relid` | OID | PRIMARY KEY | Internal |
 | `slot_name` | TEXT | NOT NULL | Internal |
 | `last_consumed_lsn` | PG_LSN | | Internal |
-| `tracked_by_pgs_ids` | BIGINT[] | | Internal |
+| `tracked_by_pgt_ids` | BIGINT[] | | Internal |
 
 ### 2.3 Views
 
 | View | Schema | API Level |
 |------|--------|-----------|
-| `pgstream.stream_tables_info` | `pgstream` | **Public** |
-| `pgstream.pg_stat_stream_tables` | `pgstream` | **Public** |
+| `pgtrickle.stream_tables_info` | `pgtrickle` | **Public** |
+| `pgtrickle.pg_stat_stream_tables` | `pgtrickle` | **Public** |
 
 ### 2.4 SQL Functions (Public API)
 
 | Function | Signature | Notes |
 |----------|-----------|-------|
-| `pgstream.create_stream_table` | `(name, query, schedule='1m', refresh_mode='DIFFERENTIAL', initialize=true)` | Core API |
-| `pgstream.alter_stream_table` | `(name, schedule=NULL, refresh_mode=NULL, status=NULL)` | Core API |
-| `pgstream.drop_stream_table` | `(name)` | Core API |
-| `pgstream.refresh_stream_table` | `(name)` | Core API |
-| `pgstream.pgs_status` | `()` → SETOF record | Status overview |
-| `pgstream.parse_duration_seconds` | `(input)` → BIGINT | Utility |
-| `pgstream.st_refresh_stats` | `()` → SETOF record | Monitoring |
-| `pgstream.get_refresh_history` | `(name, max_rows=20)` → SETOF record | Monitoring |
-| `pgstream.get_staleness` | `(name)` → FLOAT8 | Monitoring |
-| `pgstream.slot_health` | `()` → SETOF record | Monitoring |
-| `pgstream.explain_st` | `(name)` → SETOF record | Diagnostic |
-| `pgstream.check_cdc_health` | `()` → SETOF record | Monitoring |
+| `pgtrickle.create_stream_table` | `(name, query, schedule='1m', refresh_mode='DIFFERENTIAL', initialize=true)` | Core API |
+| `pgtrickle.alter_stream_table` | `(name, schedule=NULL, refresh_mode=NULL, status=NULL)` | Core API |
+| `pgtrickle.drop_stream_table` | `(name)` | Core API |
+| `pgtrickle.refresh_stream_table` | `(name)` | Core API |
+| `pgtrickle.pgt_status` | `()` → SETOF record | Status overview |
+| `pgtrickle.parse_duration_seconds` | `(input)` → BIGINT | Utility |
+| `pgtrickle.st_refresh_stats` | `()` → SETOF record | Monitoring |
+| `pgtrickle.get_refresh_history` | `(name, max_rows=20)` → SETOF record | Monitoring |
+| `pgtrickle.get_staleness` | `(name)` → FLOAT8 | Monitoring |
+| `pgtrickle.slot_health` | `()` → SETOF record | Monitoring |
+| `pgtrickle.explain_st` | `(name)` → SETOF record | Diagnostic |
+| `pgtrickle.check_cdc_health` | `()` → SETOF record | Monitoring |
 
 ### 2.5 SQL Functions (Internal)
 
 | Function | Purpose |
 |----------|---------|
-| `pgstream.pg_stream_hash(text)` → BIGINT | Row identity hashing |
-| `pgstream.pg_stream_hash_multi(text[])` → BIGINT | Multi-column row hashing |
-| `pgstream._on_ddl_end()` → event_trigger | DDL tracking |
-| `pgstream._on_sql_drop()` → event_trigger | DROP tracking |
+| `pgtrickle.pg_trickle_hash(text)` → BIGINT | Row identity hashing |
+| `pgtrickle.pg_trickle_hash_multi(text[])` → BIGINT | Multi-column row hashing |
+| `pgtrickle._on_ddl_end()` → event_trigger | DDL tracking |
+| `pgtrickle._on_sql_drop()` → event_trigger | DROP tracking |
 
 ### 2.6 Event Triggers
 
 | Name | Event | API Level |
 |------|-------|-----------|
-| `pg_stream_ddl_tracker` | `ddl_command_end` | Internal |
-| `pg_stream_drop_tracker` | `sql_drop` | Internal |
+| `pg_trickle_ddl_tracker` | `ddl_command_end` | Internal |
+| `pg_trickle_drop_tracker` | `sql_drop` | Internal |
 
 ### 2.7 Dynamic Objects (per stream table / source table)
 
 | Object | Naming Pattern | Schema |
 |--------|---------------|--------|
 | Storage table | `<user_schema>.<user_name>` | User-specified |
-| Change buffer table | `changes_<source_oid>` | `pgstream_changes` |
-| CDC row trigger | `pg_stream_cdc_<oid>` | On source table |
-| CDC truncate trigger | `pg_stream_cdc_truncate_<oid>` | On source table |
-| CDC trigger function | `pg_stream_cdc_fn_<oid>()` | `pgstream_changes` |
-| CDC truncate function | `pg_stream_cdc_truncate_fn_<oid>()` | `pgstream_changes` |
-| Change buffer index | `idx_changes_<oid>_lsn_pk_cid` | `pgstream_changes` |
-| Replication slot | `pgstream_<oid>` | Cluster-wide |
-| Publication | `pgstream_cdc_<oid>` | Cluster-wide |
+| Change buffer table | `changes_<source_oid>` | `pgtrickle_changes` |
+| CDC row trigger | `pg_trickle_cdc_<oid>` | On source table |
+| CDC truncate trigger | `pg_trickle_cdc_truncate_<oid>` | On source table |
+| CDC trigger function | `pg_trickle_cdc_fn_<oid>()` | `pgtrickle_changes` |
+| CDC truncate function | `pg_trickle_cdc_truncate_fn_<oid>()` | `pgtrickle_changes` |
+| Change buffer index | `idx_changes_<oid>_lsn_pk_cid` | `pgtrickle_changes` |
+| Replication slot | `pgtrickle_<oid>` | Cluster-wide |
+| Publication | `pgtrickle_cdc_<oid>` | Cluster-wide |
 
 ### 2.8 Hardcoded Column Names (Storage Tables)
 
 | Column | Type | When Created | API Level |
 |--------|------|-------------|-----------|
-| `__pgs_row_id` | BIGINT | Always | **Public** (visible to users who query STs) |
-| `__pgs_count` | BIGINT | Aggregate/DISTINCT queries | Internal (but visible) |
+| `__pgt_row_id` | BIGINT | Always | **Public** (visible to users who query STs) |
+| `__pgt_count` | BIGINT | Aggregate/DISTINCT queries | Internal (but visible) |
 
 ### 2.9 Hardcoded Column Names (Change Buffer Tables)
 
@@ -179,36 +179,36 @@ This document:
 
 | GUC | Type | Default | API Level |
 |-----|------|---------|-----------|
-| `pg_stream.enabled` | BOOL | `true` | **Public** |
-| `pg_stream.scheduler_interval_ms` | INT | `1000` | Public |
-| `pg_stream.min_schedule_seconds` | INT | `60` | Public |
-| `pg_stream.max_consecutive_errors` | INT | `3` | Public |
-| `pg_stream.change_buffer_schema` | STRING | `'pgstream_changes'` | Public |
-| `pg_stream.max_concurrent_refreshes` | INT | `4` | Public |
-| `pg_stream.differential_max_change_ratio` | FLOAT | `0.15` | Public |
-| `pg_stream.cleanup_use_truncate` | BOOL | `true` | Public |
-| `pg_stream.merge_planner_hints` | BOOL | `true` | Public |
-| `pg_stream.merge_work_mem_mb` | INT | `64` | Public |
-| `pg_stream.merge_strategy` | STRING | `'auto'` | Public |
-| `pg_stream.use_prepared_statements` | BOOL | `true` | Public |
-| `pg_stream.user_triggers` | STRING | `'auto'` | Public |
-| `pg_stream.cdc_mode` | STRING | `'trigger'` | Public |
-| `pg_stream.wal_transition_timeout` | INT | `300` | Public |
-| `pg_stream.block_source_ddl` | BOOL | `false` | Public |
+| `pg_trickle.enabled` | BOOL | `true` | **Public** |
+| `pg_trickle.scheduler_interval_ms` | INT | `1000` | Public |
+| `pg_trickle.min_schedule_seconds` | INT | `60` | Public |
+| `pg_trickle.max_consecutive_errors` | INT | `3` | Public |
+| `pg_trickle.change_buffer_schema` | STRING | `'pgtrickle_changes'` | Public |
+| `pg_trickle.max_concurrent_refreshes` | INT | `4` | Public |
+| `pg_trickle.differential_max_change_ratio` | FLOAT | `0.15` | Public |
+| `pg_trickle.cleanup_use_truncate` | BOOL | `true` | Public |
+| `pg_trickle.merge_planner_hints` | BOOL | `true` | Public |
+| `pg_trickle.merge_work_mem_mb` | INT | `64` | Public |
+| `pg_trickle.merge_strategy` | STRING | `'auto'` | Public |
+| `pg_trickle.use_prepared_statements` | BOOL | `true` | Public |
+| `pg_trickle.user_triggers` | STRING | `'auto'` | Public |
+| `pg_trickle.cdc_mode` | STRING | `'trigger'` | Public |
+| `pg_trickle.wal_transition_timeout` | INT | `300` | Public |
+| `pg_trickle.block_source_ddl` | BOOL | `false` | Public |
 
 ### 2.11 NOTIFY Channels
 
 | Channel | API Level |
 |---------|-----------|
-| `pg_stream_alert` | **Public** |
-| `pg_stream_cdc_transition` | Public |
-| `pgstream_refresh` | Public |
+| `pg_trickle_alert` | **Public** |
+| `pg_trickle_cdc_transition` | Public |
+| `pgtrickle_refresh` | Public |
 
 ### 2.12 Advisory Lock Keys
 
 | Key | Purpose |
 |-----|---------|
-| `pgs_id` (BIGINT) | Concurrent refresh prevention |
+| `pgt_id` (BIGINT) | Concurrent refresh prevention |
 
 ---
 
@@ -216,7 +216,7 @@ This document:
 
 ### 3.1 CHECK Constraint Bugs — CRITICAL
 
-**Bug 1:** `pgs_stream_tables.refresh_mode` CHECK constraint lists
+**Bug 1:** `pgt_stream_tables.refresh_mode` CHECK constraint lists
 `'DIFFERENTIAL'` twice:
 
 ```sql
@@ -229,7 +229,7 @@ Should be:
 CHECK (refresh_mode IN ('FULL', 'DIFFERENTIAL'))
 ```
 
-**Bug 2:** `pgs_refresh_history.action` CHECK constraint lists
+**Bug 2:** `pgt_refresh_history.action` CHECK constraint lists
 `'DIFFERENTIAL'` twice:
 
 ```sql
@@ -249,8 +249,8 @@ sloppiness; they would become confusing in documentation or dump output).
 
 ### 3.2 Naming Inconsistency — GUC Prefix vs Schema
 
-The GUC prefix is `pg_stream.*` (with underscore), but the schema is
-`pgstream` (no underscore). This is mildly confusing but changing either
+The GUC prefix is `pg_trickle.*` (with underscore), but the schema is
+`pgtrickle` (no underscore). This is mildly confusing but changing either
 now would be more disruptive than living with the inconsistency—the GUC
 prefix is baked into `postgresql.conf` files and the schema into SQL scripts.
 
@@ -260,36 +260,36 @@ prefix is baked into `postgresql.conf` files and the schema into SQL scripts.
 
 Three channels use inconsistent naming:
 
-- `pg_stream_alert` — underscore style
-- `pg_stream_cdc_transition` — underscore style
-- `pgstream_refresh` — no separator style
+- `pg_trickle_alert` — underscore style
+- `pg_trickle_cdc_transition` — underscore style
+- `pgtrickle_refresh` — no separator style
 
-**Recommendation:** Rename `pgstream_refresh` → `pg_stream_refresh` before
+**Recommendation:** Rename `pgtrickle_refresh` → `pg_trickle_refresh` before
 1.0 for consistency. This is a breaking change for any external listener, but
 since we're pre-1.0, now is the time.
 
-### 3.4 Missing Foreign Key on `pgs_refresh_history`
+### 3.4 Missing Foreign Key on `pgt_refresh_history`
 
-`pgs_refresh_history.pgs_id` references `pgs_stream_tables.pgs_id` logically
+`pgt_refresh_history.pgt_id` references `pgt_stream_tables.pgt_id` logically
 but lacks a formal FK constraint. When a stream table is dropped, orphan
 history rows remain indefinitely.
 
-**Recommendation:** Add `REFERENCES pgstream.pgs_stream_tables(pgs_id)
+**Recommendation:** Add `REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
 ON DELETE CASCADE` or implement periodic cleanup. The CASCADE approach is
 simpler and appropriate since history is meaningless for dropped STs.
 
-### 3.5 `pgs_refresh_history` Unbounded Growth
+### 3.5 `pgt_refresh_history` Unbounded Growth
 
 No built-in retention policy. Production deployments will accumulate millions
 of rows in the refresh history table.
 
-**Recommendation:** Add a GUC `pg_stream.history_retention_days` (default: 30)
+**Recommendation:** Add a GUC `pg_trickle.history_retention_days` (default: 30)
 and a cleanup step in the scheduler that runs daily — `DELETE FROM
-pgstream.pgs_refresh_history WHERE start_time < now() - interval '...'`.
+pgtrickle.pgt_refresh_history WHERE start_time < now() - interval '...'`.
 
-### 3.6 `pgs_change_tracking` — Orphan Risk
+### 3.6 `pgt_change_tracking` — Orphan Risk
 
-The `tracked_by_pgs_ids BIGINT[]` column can contain stale pgs_id values
+The `tracked_by_pgt_ids BIGINT[]` column can contain stale pgt_id values
 after a stream table is dropped if cleanup is interrupted.
 
 **Recommendation:** Consider normalizing to a junction table, or accept
@@ -305,12 +305,12 @@ For 1.0, the current design is acceptable with a cleanup sweep.
 Create a metadata table to enable future migration scripts:
 
 ```sql
-CREATE TABLE IF NOT EXISTS pgstream.pgs_schema_version (
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_schema_version (
     version     TEXT NOT NULL PRIMARY KEY,
     applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     description TEXT
 );
-INSERT INTO pgstream.pgs_schema_version (version, description)
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
 VALUES ('1.0.0', 'Initial 1.0 release');
 ```
 
@@ -371,14 +371,14 @@ append-only; removing values requires recreating the type).
 for migrations — adding a new value just requires `ALTER TABLE ... DROP
 CONSTRAINT ... ADD CONSTRAINT`. ENUMs would create migration headaches.
 
-### 4.6 Add `pgs_id` FK to `pgs_refresh_history`
+### 4.6 Add `pgt_id` FK to `pgt_refresh_history`
 
 As noted in §3.4:
 
 ```sql
-ALTER TABLE pgstream.pgs_refresh_history
-    ADD CONSTRAINT fk_hist_pgs_id
-    FOREIGN KEY (pgs_id) REFERENCES pgstream.pgs_stream_tables(pgs_id)
+ALTER TABLE pgtrickle.pgt_refresh_history
+    ADD CONSTRAINT fk_hist_pgt_id
+    FOREIGN KEY (pgt_id) REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
     ON DELETE CASCADE;
 ```
 
@@ -394,12 +394,12 @@ After 1.0, these surfaces are **stable** and subject to semantic versioning:
 |---------|----------|
 | Function names & parameter order | `create_stream_table(name, query, ...)` |
 | Function parameter defaults | `schedule DEFAULT '1m'` |
-| Function return types | `pgs_status()` column names and types |
+| Function return types | `pgt_status()` column names and types |
 | View column names & types | `stream_tables_info.*`, `pg_stat_stream_tables.*` |
-| GUC names | `pg_stream.enabled`, etc. |
-| Schema names | `pgstream`, `pgstream_changes` |
-| Storage table visible columns | `__pgs_row_id` (always present), user columns |
-| NOTIFY channel names | `pg_stream_alert`, `pg_stream_cdc_transition`, ... |
+| GUC names | `pg_trickle.enabled`, etc. |
+| Schema names | `pgtrickle`, `pgtrickle_changes` |
+| Storage table visible columns | `__pgt_row_id` (always present), user columns |
+| NOTIFY channel names | `pg_trickle_alert`, `pg_trickle_cdc_transition`, ... |
 
 ### 5.2 Tier 2 — Moderate Stability (Can Add, Cannot Remove)
 
@@ -417,12 +417,12 @@ After 1.0, these surfaces are **stable** and subject to semantic versioning:
 |---------|----------|
 | Catalog table internal columns | `frontier`, `functions_used`, `auto_threshold`, etc. |
 | Change buffer table structure | Column types, index layout |
-| Dynamic object naming conventions | `changes_<oid>`, `pg_stream_cdc_<oid>` |
+| Dynamic object naming conventions | `changes_<oid>`, `pg_trickle_cdc_<oid>` |
 | Trigger function body (PL/pgSQL) | Generated code, may change per-version |
-| Hash function implementation | `pg_stream_hash` algorithm |
-| Advisory lock key scheme | Using `pgs_id` as lock key |
+| Hash function implementation | `pg_trickle_hash` algorithm |
+| Advisory lock key scheme | Using `pgt_id` as lock key |
 | Frontier JSONB format | Internal serialization |
-| Background worker name | `pg_stream scheduler` |
+| Background worker name | `pg_trickle scheduler` |
 
 ---
 
@@ -433,10 +433,10 @@ After 1.0, these surfaces are **stable** and subject to semantic versioning:
 PostgreSQL supports versioned extension upgrades via `ALTER EXTENSION`:
 
 ```sql
-ALTER EXTENSION pg_stream UPDATE TO '1.1.0';
+ALTER EXTENSION pg_trickle UPDATE TO '1.1.0';
 ```
 
-This executes a migration script named `pg_stream--1.0.0--1.1.0.sql`
+This executes a migration script named `pg_trickle--1.0.0--1.1.0.sql`
 installed alongside the extension shared library.
 
 ### 6.2 Migration Script Architecture
@@ -451,48 +451,48 @@ Following ADR-063's recommendation (Option 3: Hybrid), we use:
 Migration scripts live in `sql/` and follow the naming convention:
 
 ```
-sql/pg_stream--1.0.0--1.1.0.sql
-sql/pg_stream--1.1.0--1.2.0.sql
-sql/pg_stream--1.2.0--2.0.0.sql
+sql/pg_trickle--1.0.0--1.1.0.sql
+sql/pg_trickle--1.1.0--1.2.0.sql
+sql/pg_trickle--1.2.0--2.0.0.sql
 ```
 
 ### 6.3 Migration Script Template
 
 ```sql
--- pg_stream--1.0.0--1.1.0.sql
+-- pg_trickle--1.0.0--1.1.0.sql
 -- Migration: 1.0.0 → 1.1.0
 
 -- 1. Schema version check (fail-safe)
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pgstream.pgs_schema_version
+        SELECT 1 FROM pgtrickle.pgt_schema_version
         WHERE version = '1.0.0'
     ) THEN
-        RAISE EXCEPTION 'pg_stream: expected schema version 1.0.0, '
+        RAISE EXCEPTION 'pg_trickle: expected schema version 1.0.0, '
                          'run previous migrations first';
     END IF;
 END $$;
 
 -- 2. Catalog table changes (additive only for minor versions)
-ALTER TABLE pgstream.pgs_stream_tables
+ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS new_column TEXT;
 
 -- 3. View updates (CREATE OR REPLACE preserves existing grants)
-CREATE OR REPLACE VIEW pgstream.stream_tables_info AS
+CREATE OR REPLACE VIEW pgtrickle.stream_tables_info AS
 SELECT ... ;
 
 -- 4. Function signature updates (handled by pgrx, typically no manual SQL)
 
 -- 5. Data migrations
--- UPDATE pgstream.pgs_stream_tables SET new_column = ... WHERE ...;
+-- UPDATE pgtrickle.pgt_stream_tables SET new_column = ... WHERE ...;
 
 -- 6. Index changes
 -- CREATE INDEX IF NOT EXISTS ... ;
 
 -- 7. Record schema version
-INSERT INTO pgstream.pgs_schema_version (version, description)
-VALUES ('1.1.0', 'Added new_column to pgs_stream_tables');
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES ('1.1.0', 'Added new_column to pgt_stream_tables');
 ```
 
 ### 6.4 Dynamic Object Migration
@@ -517,7 +517,7 @@ columns). This is transparent but adds code complexity.
 
 **Recommendation:** Option A for major version upgrades. Option B for minor
 version upgrades that only require additive changes to dynamic objects.
-Include a `pgstream.migrate()` utility function that iterates over STs
+Include a `pgtrickle.migrate()` utility function that iterates over STs
 and applies any needed dynamic object changes.
 
 ### 6.5 Breaking Changes Procedure (Major Version)
@@ -530,17 +530,17 @@ functions), the migration script must:
 3. Drop old structures
 4. Update schema version
 
-Example: renaming `pgs_stream_tables.schedule` to `refresh_interval`:
+Example: renaming `pgt_stream_tables.schedule` to `refresh_interval`:
 
 ```sql
 -- Step 1: Add new column
-ALTER TABLE pgstream.pgs_stream_tables ADD COLUMN refresh_interval TEXT;
+ALTER TABLE pgtrickle.pgt_stream_tables ADD COLUMN refresh_interval TEXT;
 
 -- Step 2: Copy data
-UPDATE pgstream.pgs_stream_tables SET refresh_interval = schedule;
+UPDATE pgtrickle.pgt_stream_tables SET refresh_interval = schedule;
 
 -- Step 3: Drop old column (after confirming all code uses new name)
-ALTER TABLE pgstream.pgs_stream_tables DROP COLUMN schedule;
+ALTER TABLE pgtrickle.pgt_stream_tables DROP COLUMN schedule;
 ```
 
 ### 6.6 Rollback Strategy
@@ -549,7 +549,7 @@ PostgreSQL does not support downgrading extensions (`ALTER EXTENSION ... UPDATE
 TO` only goes forward). For rollback:
 
 1. **pg_dump before upgrade** — always take a logical backup
-2. **Version-specific cleanup SQL** — ship a `pg_stream--1.1.0--1.0.0.sql`
+2. **Version-specific cleanup SQL** — ship a `pg_trickle--1.1.0--1.0.0.sql`
    rollback script for emergency use (best-effort)
 3. **Test in staging** — always test upgrades against a production-like
    environment before applying
@@ -563,9 +563,9 @@ TO` only goes forward). For rollback:
 | # | Issue | Section | Effort |
 |---|-------|---------|--------|
 | 1 | Fix duplicate `'DIFFERENTIAL'` in CHECK constraints | §3.1 | 10 min |
-| 2 | Add FK on `pgs_refresh_history.pgs_id` | §3.4 | 10 min |
-| 3 | Add `pgstream.pgs_schema_version` table | §4.1 | 30 min |
-| 4 | Rename `pgstream_refresh` → `pg_stream_refresh` channel | §3.3 | 30 min |
+| 2 | Add FK on `pgt_refresh_history.pgt_id` | §3.4 | 10 min |
+| 3 | Add `pgtrickle.pgt_schema_version` table | §4.1 | 30 min |
+| 4 | Rename `pgtrickle_refresh` → `pg_trickle_refresh` channel | §3.3 | 30 min |
 
 ### 7.2 Should-Fix (Recommended for 1.0)
 
@@ -580,7 +580,7 @@ TO` only goes forward). For rollback:
 
 | # | Issue | Section | Effort |
 |---|-------|---------|--------|
-| 9 | `pgstream.migrate()` utility function | §6.4 | 4–6 hours |
+| 9 | `pgtrickle.migrate()` utility function | §6.4 | 4–6 hours |
 | 10 | Automated migration test infrastructure | §8 | 8–12 hours |
 
 ---
@@ -602,7 +602,7 @@ Each migration script should be tested with:
 
 Add an E2E test file `tests/e2e_migration_tests.rs` that:
 
-1. Creates a container with pg_stream version N-1 installed
+1. Creates a container with pg_trickle version N-1 installed
 2. Creates several stream tables with various configurations
 3. Triggers refreshes to populate history
 4. Upgrades to version N via `ALTER EXTENSION`
@@ -637,14 +637,14 @@ Add an E2E test file `tests/e2e_migration_tests.rs` that:
 | Citus | Version tracking | Elaborate migration framework with rollback |
 | TimescaleDB | `_timescaledb_catalog.metadata` | Loader checks version, runs migrations |
 
-pg_stream should follow the PostGIS/TimescaleDB pattern: a schema version
+pg_trickle should follow the PostGIS/TimescaleDB pattern: a schema version
 table, hand-written migration scripts, and a pre-upgrade version check.
 
 ---
 
 ## 11. Conclusion
 
-The pg_stream database schema is in good shape for a 1.0 release after
+The pg_trickle database schema is in good shape for a 1.0 release after
 addressing the four must-fix items (§7.1). The TEXT-with-CHECK-constraint
 pattern for enum-like columns is the right choice for migration flexibility.
 The separation between public-facing views/functions and internal catalog

@@ -1,6 +1,6 @@
 -- Q15: Top Supplier
 -- Operators: Derived-table Join -> Scalar Subquery (MAX) -> Filter
--- CTE replaced with inline derived table (pg_stream does not support WITH CTEs).
+-- CTE replaced with inline derived table (pg_trickle does not support WITH CTEs).
 SELECT
     s_suppkey,
     s_name,

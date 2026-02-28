@@ -18,7 +18,7 @@ env:
   CARGO_TERM_COLOR: always
   PG_VERSION: "18"
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/pg_stream-ext
+  IMAGE_NAME: ${{ github.repository_owner }}/pg_trickle-ext
 
 permissions:
   contents: write   # create GitHub Releases
@@ -76,11 +76,11 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          ARCHIVE_NAME="pg_stream-${VERSION}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
+          ARCHIVE_NAME="pg_trickle-${VERSION}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
           mkdir -p "dist/${ARCHIVE_NAME}/lib" "dist/${ARCHIVE_NAME}/extension"
 
           # Find pgrx package output
-          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_stream-pg*' -type d | head -1)
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_trickle-pg*' -type d | head -1)
           if [[ -z "$PKG_DIR" ]]; then
             echo "ERROR: cannot find pgrx package output"
             exit 1
@@ -108,11 +108,11 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $archiveName = "pg_stream-${version}-pg${{ env.PG_VERSION }}-${{ matrix.artifact_suffix }}"
+          $archiveName = "pg_trickle-${version}-pg${{ env.PG_VERSION }}-${{ matrix.artifact_suffix }}"
           New-Item -ItemType Directory -Path "dist\${archiveName}\lib" -Force
           New-Item -ItemType Directory -Path "dist\${archiveName}\extension" -Force
 
-          $pkgDir = Get-ChildItem -Path "target\release" -Directory -Filter "pg_stream-pg*" | Select-Object -First 1
+          $pkgDir = Get-ChildItem -Path "target\release" -Directory -Filter "pg_trickle-pg*" | Select-Object -First 1
           if (-not $pkgDir) {
             Write-Error "Cannot find pgrx package output"
             exit 1
@@ -162,7 +162,7 @@ jobs:
           cd dist
           tar xzf *.tar.gz
           # Rename to fixed path so Dockerfile.ext can reference it
-          mv pg_stream-*-linux-amd64 artifact
+          mv pg_trickle-*-linux-amd64 artifact
           ls -la artifact/lib/ artifact/extension/
 
       - name: Build extension image
@@ -170,7 +170,7 @@ jobs:
           docker build \
             --build-arg REPO_URL=${{ github.server_url }}/${{ github.repository }} \
             --build-arg VERSION=${{ needs.build-release.outputs.version || 'dev' }} \
-            -t pg_stream-ext:test \
+            -t pg_trickle-ext:test \
             -f cnpg/Dockerfile.ext \
             dist/
 
@@ -178,10 +178,10 @@ jobs:
         run: |
           # The extension image is scratch-based (no shell, no PostgreSQL).
           # Verify the file layout matches the CNPG Image Volume spec:
-          #   /lib/pg_stream.so
-          #   /share/extension/pg_stream.control
-          #   /share/extension/pg_stream--<ver>.sql
-          ID=$(docker create pg_stream-ext:test true)
+          #   /lib/pg_trickle.so
+          #   /share/extension/pg_trickle.control
+          #   /share/extension/pg_trickle--<ver>.sql
+          ID=$(docker create pg_trickle-ext:test true)
           mkdir -p /tmp/ext-verify
           docker cp "$ID:/lib/" /tmp/ext-verify/lib/
           docker cp "$ID:/share/" /tmp/ext-verify/share/
@@ -192,12 +192,12 @@ jobs:
           echo "==============================="
 
           # Verify required files exist
-          test -f /tmp/ext-verify/lib/pg_stream.so
-          test -f /tmp/ext-verify/share/extension/pg_stream.control
-          ls /tmp/ext-verify/share/extension/pg_stream--*.sql
+          test -f /tmp/ext-verify/lib/pg_trickle.so
+          test -f /tmp/ext-verify/share/extension/pg_trickle.control
+          ls /tmp/ext-verify/share/extension/pg_trickle--*.sql
 
           # Verify image size is reasonable (< 50 MB)
-          SIZE=$(docker image inspect pg_stream-ext:test --format='{{.Size}}')
+          SIZE=$(docker image inspect pg_trickle-ext:test --format='{{.Size}}')
           echo "Image size: ${SIZE} bytes"
           if [[ "$SIZE" -gt 52428800 ]]; then
             echo "WARNING: Extension image is larger than expected (> 50 MB)"
@@ -210,20 +210,20 @@ jobs:
           # Build a temporary composite image to verify the extension
           # actually works with PostgreSQL. This image is NOT shipped.
           cat > /tmp/Dockerfile.smoke <<'DOCKERFILE'
-          FROM pg_stream-ext:test AS ext
+          FROM pg_trickle-ext:test AS ext
           FROM postgres:18.1
           COPY --from=ext /lib/ /usr/lib/postgresql/18/lib/
           COPY --from=ext /share/extension/ /usr/share/postgresql/18/extension/
           DOCKERFILE
 
-          docker build -t pg_stream_smoketest -f /tmp/Dockerfile.smoke .
+          docker build -t pg_trickle_smoketest -f /tmp/Dockerfile.smoke .
 
           docker run -d --name smoketest \
             -e POSTGRES_PASSWORD=test \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
-            pg_stream_smoketest \
-            postgres -c "shared_preload_libraries=pg_stream"
+            pg_trickle_smoketest \
+            postgres -c "shared_preload_libraries=pg_trickle"
 
           echo "Waiting for PostgreSQL..."
           for i in $(seq 1 30); do
@@ -239,11 +239,11 @@ jobs:
             exit 1
           fi
 
-          docker exec smoketest psql -U postgres -c "CREATE EXTENSION pg_stream;"
+          docker exec smoketest psql -U postgres -c "CREATE EXTENSION pg_trickle;"
           docker exec smoketest psql -U postgres -c \
-            "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';"
-          docker exec smoketest psql -U postgres -c "SHOW pg_stream.enabled;"
-          docker exec smoketest psql -U postgres -c "SELECT * FROM pgstream.pgs_status();"
+            "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';"
+          docker exec smoketest psql -U postgres -c "SHOW pg_trickle.enabled;"
+          docker exec smoketest psql -U postgres -c "SELECT * FROM pgtrickle.pgt_status();"
 
           echo "Release smoke test passed!"
 
@@ -339,7 +339,7 @@ jobs:
         run: |
           cd dist && tar xzf *.tar.gz
           # Rename extracted dir to a fixed path for Dockerfile.ext
-          mv pg_stream-*-${{ matrix.artifact_suffix }} artifact
+          mv pg_trickle-*-${{ matrix.artifact_suffix }} artifact
           ls -la artifact/lib/ artifact/extension/
 
       - name: Log in to GHCR
@@ -368,8 +368,8 @@ jobs:
             VERSION=${{ steps.version.outputs.version }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.platform_tag }}
           labels: |
-            org.opencontainers.image.title=pg_stream-ext
-            org.opencontainers.image.description=pg_stream extension for CloudNativePG Image Volume Extensions
+            org.opencontainers.image.title=pg_trickle-ext
+            org.opencontainers.image.description=pg_trickle extension for CloudNativePG Image Volume Extensions
             org.opencontainers.image.licenses=Apache-2.0
           cache-from: type=gha
           cache-to: type=gha,mode=max

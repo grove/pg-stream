@@ -6,9 +6,9 @@
 //! Run with: `cargo bench --bench diff_operators`
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use pg_stream::dvm::diff::DiffContext;
-use pg_stream::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree, SortExpr, WindowExpr};
-use pg_stream::version::Frontier;
+use pg_trickle::dvm::diff::DiffContext;
+use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree, SortExpr, WindowExpr};
+use pg_trickle::version::Frontier;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

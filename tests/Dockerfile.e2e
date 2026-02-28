@@ -1,5 +1,5 @@
 # =============================================================================
-# Multi-stage Dockerfile for pg_stream E2E integration tests.
+# Multi-stage Dockerfile for pg_trickle E2E integration tests.
 #
 # Stage 1 (builder): Compiles the extension from source inside a container
 #   with matching PostgreSQL 18 headers, using cargo-pgrx.
@@ -8,7 +8,7 @@
 #   into a clean postgres:18.1 image ready for CREATE EXTENSION.
 #
 # Usage:
-#   docker build -t pg_stream_e2e:latest -f tests/Dockerfile.e2e .
+#   docker build -t pg_trickle_e2e:latest -f tests/Dockerfile.e2e .
 #
 # The build context must be the project root (parent of tests/).
 # =============================================================================
@@ -63,10 +63,10 @@ RUN mkdir -p src/bin src/ivm/operators benches && \
 # ── Build the real extension ────────────────────────────────────────────────
 # Now copy the actual source. This invalidates the cache only when src/ changes.
 COPY src/ src/
-COPY pg_stream.control ./
+COPY pg_trickle.control ./
 
 # Build the extension package
-# pgrx package outputs to target/release/pg_stream-pg18/ with
+# pgrx package outputs to target/release/pg_trickle-pg18/ with
 # the directory structure mirroring the system pg_config paths:
 #   /usr/share/postgresql/18/extension/*.control, *--version.sql
 #   /usr/lib/postgresql/18/lib/*.so
@@ -74,32 +74,32 @@ RUN cargo pgrx package --pg-config /usr/bin/pg_config
 
 # Verify the artifacts were produced
 RUN echo "=== Package artifacts ===" && \
-    find target/release/pg_stream-pg18 -type f && \
+    find target/release/pg_trickle-pg18 -type f && \
     echo "========================="
 
 # ── Stage 2: Runtime image with extension installed ─────────────────────────
 FROM postgres:18.1
 
-LABEL org.opencontainers.image.title="pg_stream E2E test image"
-LABEL org.opencontainers.image.description="PostgreSQL 18.1 with pg_stream extension for integration testing"
+LABEL org.opencontainers.image.title="pg_trickle E2E test image"
+LABEL org.opencontainers.image.description="PostgreSQL 18.1 with pg_trickle extension for integration testing"
 
 # Copy extension artifacts from the builder stage
 COPY --from=builder \
-    /build/target/release/pg_stream-pg18/usr/share/postgresql/18/extension/ \
+    /build/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/ \
     /usr/share/postgresql/18/extension/
 
 COPY --from=builder \
-    /build/target/release/pg_stream-pg18/usr/lib/postgresql/18/lib/ \
+    /build/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/ \
     /usr/lib/postgresql/18/lib/
 
 # Configure shared_preload_libraries so background worker + shared memory work.
 # Append to postgresql.conf.sample which is the template for new clusters.
 RUN echo "" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "# pg_stream E2E test configuration" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "shared_preload_libraries = 'pg_stream'" >> /usr/share/postgresql/postgresql.conf.sample
+    echo "# pg_trickle E2E test configuration" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "shared_preload_libraries = 'pg_trickle'" >> /usr/share/postgresql/postgresql.conf.sample
 
 # Verify the extension files are in place
-RUN ls -la /usr/share/postgresql/18/extension/pg_stream* && \
-    ls -la /usr/lib/postgresql/18/lib/pg_stream*
+RUN ls -la /usr/share/postgresql/18/extension/pg_trickle* && \
+    ls -la /usr/lib/postgresql/18/lib/pg_trickle*
 
 EXPOSE 5432

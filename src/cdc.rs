@@ -17,13 +17,13 @@
 //! - Various ETL tools using PostgreSQL trigger-based CDC since the 1990s.
 //! - "Trigger-based Change Data Capture in PostgreSQL", PostgreSQL wiki.
 //!
-//! The `pgstream_changes` schema and buffer-table pattern is a standard
+//! The `pgtrickle_changes` schema and buffer-table pattern is a standard
 //! change-capture approach documented in PostgreSQL community literature.
 //!
 //! # Architecture
 //!
 //! - One PL/pgSQL trigger function + trigger per tracked base table
-//! - Changes are written into `pgstream_changes.changes_<oid>` buffer tables
+//! - Changes are written into `pgtrickle_changes.changes_<oid>` buffer tables
 //! - Buffer tables are append-only; consumed changes are deleted after refresh
 //!
 //! # Compared to logical replication slots:
@@ -36,7 +36,7 @@ use pgrx::prelude::*;
 use std::collections::HashMap;
 
 use crate::config;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Create a CDC trigger on a source table.
 ///
@@ -44,7 +44,7 @@ use crate::error::PgStreamError;
 /// INSERT/UPDATE/DELETE into the change buffer table using typed columns.
 ///
 /// When `pk_columns` is non-empty, the trigger pre-computes a `pk_hash`
-/// BIGINT column using `pgstream.pg_stream_hash()` / `pgstream.pg_stream_hash_multi()`.
+/// BIGINT column using `pgtrickle.pg_trickle_hash()` / `pgtrickle.pg_trickle_hash_multi()`.
 /// This avoids expensive JSONB PK extraction during window-function
 /// partitioning in the scan delta query.
 ///
@@ -57,16 +57,16 @@ pub fn create_change_trigger(
     change_schema: &str,
     pk_columns: &[String],
     columns: &[(String, String)],
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
-    let trigger_name = format!("pg_stream_cdc_{}", oid_u32);
+    let trigger_name = format!("pg_trickle_cdc_{}", oid_u32);
 
     // Get the fully-qualified source table name
     let source_table =
         Spi::get_one_with_args::<String>("SELECT $1::oid::regclass::text", &[source_oid.into()])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
             .ok_or_else(|| {
-                PgStreamError::NotFound(format!("Table with OID {} not found", oid_u32))
+                PgTrickleError::NotFound(format!("Table with OID {} not found", oid_u32))
             })?;
 
     // Build PK hash computation expressions for each DML operation.
@@ -109,7 +109,7 @@ pub fn create_change_trigger(
 
     // Create the trigger function
     let create_fn_sql = format!(
-        "CREATE OR REPLACE FUNCTION {change_schema}.pg_stream_cdc_fn_{oid}()
+        "CREATE OR REPLACE FUNCTION {change_schema}.pg_trickle_cdc_fn_{oid}()
          RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
              IF TG_OP = 'INSERT' THEN
@@ -139,14 +139,14 @@ pub fn create_change_trigger(
     );
 
     Spi::run(&create_fn_sql).map_err(|e| {
-        PgStreamError::SpiError(format!("Failed to create CDC trigger function: {}", e))
+        PgTrickleError::SpiError(format!("Failed to create CDC trigger function: {}", e))
     })?;
 
     // Create the row-level trigger on the source table
     let create_trigger_sql = format!(
         "CREATE TRIGGER {trigger}
          AFTER INSERT OR UPDATE OR DELETE ON {table}
-         FOR EACH ROW EXECUTE FUNCTION {change_schema}.pg_stream_cdc_fn_{oid}()",
+         FOR EACH ROW EXECUTE FUNCTION {change_schema}.pg_trickle_cdc_fn_{oid}()",
         trigger = trigger_name,
         table = source_table,
         change_schema = change_schema,
@@ -154,7 +154,7 @@ pub fn create_change_trigger(
     );
 
     Spi::run(&create_trigger_sql).map_err(|e| {
-        PgStreamError::SpiError(format!(
+        PgTrickleError::SpiError(format!(
             "Failed to create CDC trigger on {}: {}",
             source_table, e
         ))
@@ -166,7 +166,7 @@ pub fn create_change_trigger(
     // with action='T' into the change buffer. The refresh engine
     // detects this marker and falls back to a full refresh.
     let truncate_fn_sql = format!(
-        "CREATE OR REPLACE FUNCTION {change_schema}.pg_stream_cdc_truncate_fn_{oid}()
+        "CREATE OR REPLACE FUNCTION {change_schema}.pg_trickle_cdc_truncate_fn_{oid}()
          RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
              INSERT INTO {change_schema}.changes_{oid}
@@ -180,17 +180,17 @@ pub fn create_change_trigger(
     );
 
     Spi::run(&truncate_fn_sql).map_err(|e| {
-        PgStreamError::SpiError(format!(
+        PgTrickleError::SpiError(format!(
             "Failed to create CDC TRUNCATE trigger function: {}",
             e
         ))
     })?;
 
-    let truncate_trigger_name = format!("pg_stream_cdc_truncate_{}", oid_u32);
+    let truncate_trigger_name = format!("pg_trickle_cdc_truncate_{}", oid_u32);
     let create_truncate_trigger_sql = format!(
         "CREATE TRIGGER {trigger}
          AFTER TRUNCATE ON {table}
-         FOR EACH STATEMENT EXECUTE FUNCTION {change_schema}.pg_stream_cdc_truncate_fn_{oid}()",
+         FOR EACH STATEMENT EXECUTE FUNCTION {change_schema}.pg_trickle_cdc_truncate_fn_{oid}()",
         trigger = truncate_trigger_name,
         table = source_table,
         change_schema = change_schema,
@@ -198,7 +198,7 @@ pub fn create_change_trigger(
     );
 
     Spi::run(&create_truncate_trigger_sql).map_err(|e| {
-        PgStreamError::SpiError(format!(
+        PgTrickleError::SpiError(format!(
             "Failed to create CDC TRUNCATE trigger on {}: {}",
             source_table, e
         ))
@@ -211,9 +211,9 @@ pub fn create_change_trigger(
 pub fn drop_change_trigger(
     source_oid: pg_sys::Oid,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
-    let trigger_name = format!("pg_stream_cdc_{}", oid_u32);
+    let trigger_name = format!("pg_trickle_cdc_{}", oid_u32);
 
     // Get the source table name for the trigger drop
     let source_table =
@@ -226,7 +226,7 @@ pub fn drop_change_trigger(
         let _ = Spi::run(&drop_trigger_sql);
 
         // Drop the TRUNCATE trigger as well
-        let truncate_trigger_name = format!("pg_stream_cdc_truncate_{}", oid_u32);
+        let truncate_trigger_name = format!("pg_trickle_cdc_truncate_{}", oid_u32);
         let drop_truncate_sql = format!(
             "DROP TRIGGER IF EXISTS {} ON {}",
             truncate_trigger_name, table,
@@ -236,13 +236,13 @@ pub fn drop_change_trigger(
 
     // Drop the trigger functions (row-level + TRUNCATE)
     let drop_fn_sql = format!(
-        "DROP FUNCTION IF EXISTS {}.pg_stream_cdc_fn_{}() CASCADE",
+        "DROP FUNCTION IF EXISTS {}.pg_trickle_cdc_fn_{}() CASCADE",
         change_schema, oid_u32,
     );
     let _ = Spi::run(&drop_fn_sql);
 
     let drop_truncate_fn_sql = format!(
-        "DROP FUNCTION IF EXISTS {}.pg_stream_cdc_truncate_fn_{}() CASCADE",
+        "DROP FUNCTION IF EXISTS {}.pg_trickle_cdc_truncate_fn_{}() CASCADE",
         change_schema, oid_u32,
     );
     let _ = Spi::run(&drop_truncate_fn_sql);
@@ -265,7 +265,7 @@ pub fn create_change_buffer_table(
     source_oid: pg_sys::Oid,
     change_schema: &str,
     columns: &[(String, String)],
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     // pk_hash is always present (PK hash or all-column content hash).
     let pk_col = ",pk_hash BIGINT";
 
@@ -292,7 +292,7 @@ pub fn create_change_buffer_table(
     );
 
     Spi::run(&sql).map_err(|e| {
-        PgStreamError::SpiError(format!("Failed to create change buffer table: {}", e))
+        PgTrickleError::SpiError(format!("Failed to create change buffer table: {}", e))
     })?;
 
     // AA1: Single covering index replaces the previous dual-index setup.
@@ -320,7 +320,7 @@ pub fn create_change_buffer_table(
         oid = source_oid.to_u32(),
     );
     Spi::run(&idx_sql).map_err(|e| {
-        PgStreamError::SpiError(format!("Failed to create change buffer index: {}", e))
+        PgTrickleError::SpiError(format!("Failed to create change buffer index: {}", e))
     })?;
 
     Ok(())
@@ -337,7 +337,7 @@ pub fn create_change_buffer_table(
 /// to generate typed change buffer columns and per-column trigger INSERTs.
 pub fn resolve_source_column_defs(
     source_oid: pg_sys::Oid,
-) -> Result<Vec<(String, String)>, PgStreamError> {
+) -> Result<Vec<(String, String)>, PgTrickleError> {
     let sql = format!(
         "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
          FROM pg_attribute a \
@@ -350,16 +350,16 @@ pub fn resolve_source_column_defs(
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut cols = Vec::new();
         for row in result {
             let name: String = row
                 .get(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
             let type_name: String = row
                 .get(2)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_else(|| "text".to_string());
             cols.push((name, type_name));
         }
@@ -370,7 +370,7 @@ pub fn resolve_source_column_defs(
 /// Resolve primary key column names for a source table via `pg_constraint`.
 ///
 /// Returns columns in key order. Returns an empty Vec if no PK exists.
-pub fn resolve_pk_columns(source_oid: pg_sys::Oid) -> Result<Vec<String>, PgStreamError> {
+pub fn resolve_pk_columns(source_oid: pg_sys::Oid) -> Result<Vec<String>, PgTrickleError> {
     let sql = format!(
         "SELECT a.attname::text \
          FROM pg_constraint c \
@@ -384,12 +384,12 @@ pub fn resolve_pk_columns(source_oid: pg_sys::Oid) -> Result<Vec<String>, PgStre
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut pk_cols = Vec::new();
         for row in result {
             let name: String = row
                 .get(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
             pk_cols.push(name);
         }
@@ -403,10 +403,10 @@ pub fn resolve_pk_columns(source_oid: pg_sys::Oid) -> Result<Vec<String>, PgStre
 /// and the expression using OLD record keys respectively.
 ///
 /// For a single-column PK `id`:
-///   `pgstream.pg_stream_hash(NEW."id"::text)`, `pgstream.pg_stream_hash(OLD."id"::text)`
+///   `pgtrickle.pg_trickle_hash(NEW."id"::text)`, `pgtrickle.pg_trickle_hash(OLD."id"::text)`
 ///
 /// For a composite PK `(a, b)`:
-///   `pgstream.pg_stream_hash_multi(ARRAY[NEW."a"::text, NEW."b"::text])`, ...
+///   `pgtrickle.pg_trickle_hash_multi(ARRAY[NEW."a"::text, NEW."b"::text])`, ...
 ///
 /// **S10 — Keyless tables:** When `pk_columns` is empty, computes an
 /// all-column content hash from `all_columns` so that every row gets a
@@ -430,8 +430,8 @@ fn build_pk_hash_trigger_exprs(
     if hash_cols.len() == 1 {
         let col = format!("\"{}\"", hash_cols[0].replace('"', "\"\""));
         (
-            format!("pgstream.pg_stream_hash(NEW.{col}::text)"),
-            format!("pgstream.pg_stream_hash(OLD.{col}::text)"),
+            format!("pgtrickle.pg_trickle_hash(NEW.{col}::text)"),
+            format!("pgtrickle.pg_trickle_hash(OLD.{col}::text)"),
         )
     } else {
         let new_items: Vec<String> = hash_cols
@@ -444,11 +444,11 @@ fn build_pk_hash_trigger_exprs(
             .collect();
         (
             format!(
-                "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+                "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
                 new_items.join(", ")
             ),
             format!(
-                "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+                "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
                 old_items.join(", ")
             ),
         )
@@ -461,9 +461,9 @@ fn build_pk_hash_trigger_exprs(
 ///
 /// This represents the "now" position in the WAL and is used as the
 /// upper bound of the new frontier.
-pub fn get_current_wal_lsn() -> Result<String, PgStreamError> {
+pub fn get_current_wal_lsn() -> Result<String, PgTrickleError> {
     let lsn = Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text")
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
     Ok(lsn.unwrap_or_else(|| "0/0".to_string()))
 }
@@ -475,7 +475,7 @@ pub fn get_current_wal_lsn() -> Result<String, PgStreamError> {
 /// Returns a map from source OID to the latest WAL LSN.
 pub fn get_slot_positions(
     source_oids: &[pg_sys::Oid],
-) -> Result<HashMap<u32, String>, PgStreamError> {
+) -> Result<HashMap<u32, String>, PgTrickleError> {
     let mut positions = HashMap::new();
 
     // Get the current WAL position — this is the "now" upper bound
@@ -500,7 +500,7 @@ pub fn get_slot_positions(
 pub fn consume_slot_changes(
     source_oid: pg_sys::Oid,
     change_schema: &str,
-) -> Result<i64, PgStreamError> {
+) -> Result<i64, PgTrickleError> {
     // With triggers, changes are already in the buffer table.
     // Just return how many uncommitted changes exist (informational).
     let count = Spi::get_one::<i64>(&format!(
@@ -508,7 +508,7 @@ pub fn consume_slot_changes(
         schema = change_schema,
         oid = source_oid.to_u32(),
     ))
-    .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
     Ok(count.unwrap_or(0))
 }
@@ -520,7 +520,7 @@ pub fn delete_consumed_changes(
     source_oid: pg_sys::Oid,
     change_schema: &str,
     up_to_lsn: &str,
-) -> Result<i64, PgStreamError> {
+) -> Result<i64, PgTrickleError> {
     let count = Spi::get_one_with_args::<i64>(
         &format!(
             "WITH deleted AS (\
@@ -533,7 +533,7 @@ pub fn delete_consumed_changes(
         ),
         &[up_to_lsn.into()],
     )
-    .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
     Ok(count.unwrap_or(0))
 }
@@ -553,7 +553,7 @@ pub fn delete_consumed_changes(
 pub fn rebuild_cdc_trigger_function(
     source_oid: pg_sys::Oid,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let pk_columns = resolve_pk_columns(source_oid)?;
     let columns = resolve_source_column_defs(source_oid)?;
 
@@ -593,7 +593,7 @@ pub fn rebuild_cdc_trigger_function(
         .join("");
 
     let create_fn_sql = format!(
-        "CREATE OR REPLACE FUNCTION {change_schema}.pg_stream_cdc_fn_{oid}()
+        "CREATE OR REPLACE FUNCTION {change_schema}.pg_trickle_cdc_fn_{oid}()
          RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
              IF TG_OP = 'INSERT' THEN
@@ -623,7 +623,7 @@ pub fn rebuild_cdc_trigger_function(
     );
 
     Spi::run(&create_fn_sql).map_err(|e| {
-        PgStreamError::SpiError(format!("Failed to rebuild CDC trigger function: {}", e))
+        PgTrickleError::SpiError(format!("Failed to rebuild CDC trigger function: {}", e))
     })?;
 
     // Sync change buffer table schema: add any columns that are present in
@@ -648,7 +648,7 @@ fn sync_change_buffer_columns(
     source_oid: pg_sys::Oid,
     change_schema: &str,
     columns: &[(String, String)],
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
     let buffer_table = format!("{}.changes_{}", change_schema, oid_u32);
 
@@ -663,12 +663,12 @@ fn sync_change_buffer_columns(
     let existing_cols: std::collections::HashSet<String> = Spi::connect(|client| {
         let result = client
             .select(&existing_sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut set = std::collections::HashSet::new();
         for row in result {
             if let Some(name) = row
                 .get::<String>(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
             {
                 set.insert(name);
             }
@@ -686,12 +686,12 @@ fn sync_change_buffer_columns(
                 "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{new_col}\" {col_type}"
             );
             Spi::run(&sql).map_err(|e| {
-                PgStreamError::SpiError(format!(
+                PgTrickleError::SpiError(format!(
                     "Failed to add column \"{new_col}\" to change buffer: {e}"
                 ))
             })?;
             pgrx::debug1!(
-                "pg_stream_cdc: added column \"{}\" to {}",
+                "pg_trickle_cdc: added column \"{}\" to {}",
                 new_col,
                 buffer_table
             );
@@ -702,12 +702,12 @@ fn sync_change_buffer_columns(
                 "ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS \"{old_col}\" {col_type}"
             );
             Spi::run(&sql).map_err(|e| {
-                PgStreamError::SpiError(format!(
+                PgTrickleError::SpiError(format!(
                     "Failed to add column \"{old_col}\" to change buffer: {e}"
                 ))
             })?;
             pgrx::debug1!(
-                "pg_stream_cdc: added column \"{}\" to {}",
+                "pg_trickle_cdc: added column \"{}\" to {}",
                 old_col,
                 buffer_table
             );
@@ -718,7 +718,7 @@ fn sync_change_buffer_columns(
 }
 
 /// Check if a CDC trigger exists for a source table.
-pub fn trigger_exists(source_oid: pg_sys::Oid) -> Result<bool, PgStreamError> {
+pub fn trigger_exists(source_oid: pg_sys::Oid) -> Result<bool, PgTrickleError> {
     let trigger_name = trigger_name_for_source(source_oid);
     let exists = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(
@@ -727,14 +727,14 @@ pub fn trigger_exists(source_oid: pg_sys::Oid) -> Result<bool, PgStreamError> {
         )",
         &[trigger_name.as_str().into(), source_oid.into()],
     )
-    .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
     Ok(exists.unwrap_or(false))
 }
 
 /// Get the trigger name for a source OID.
 pub fn trigger_name_for_source(source_oid: pg_sys::Oid) -> String {
-    format!("pg_stream_cdc_{}", source_oid.to_u32())
+    format!("pg_trickle_cdc_{}", source_oid.to_u32())
 }
 
 // ── WAL Availability Detection ─────────────────────────────────────────────
@@ -742,26 +742,26 @@ pub fn trigger_name_for_source(source_oid: pg_sys::Oid) -> String {
 /// Check if the server supports logical replication for CDC.
 ///
 /// Returns `true` if ALL of:
-/// - `pg_stream.cdc_mode` is `"auto"` or `"wal"` (not `"trigger"`)
+/// - `pg_trickle.cdc_mode` is `"auto"` or `"wal"` (not `"trigger"`)
 /// - `wal_level` is `'logical'`
 /// - `max_replication_slots` > currently used slots
 ///
 /// When `cdc_mode = "wal"` and `wal_level != logical`, returns an error
 /// instead of `false` (hard requirement).
-pub fn can_use_logical_replication() -> Result<bool, PgStreamError> {
-    let cdc_mode = config::pg_stream_cdc_mode();
+pub fn can_use_logical_replication() -> Result<bool, PgTrickleError> {
+    let cdc_mode = config::pg_trickle_cdc_mode();
     if cdc_mode == "trigger" {
         return Ok(false);
     }
 
     let wal_level = Spi::get_one::<String>("SELECT current_setting('wal_level')")
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
         .unwrap_or_default();
 
     if wal_level != "logical" {
         if cdc_mode == "wal" {
-            return Err(PgStreamError::InvalidArgument(
-                "pg_stream.cdc_mode = 'wal' requires wal_level = logical".into(),
+            return Err(PgTrickleError::InvalidArgument(
+                "pg_trickle.cdc_mode = 'wal' requires wal_level = logical".into(),
             ));
         }
         return Ok(false);
@@ -772,7 +772,7 @@ pub fn can_use_logical_replication() -> Result<bool, PgStreamError> {
         "SELECT current_setting('max_replication_slots')::bigint \
          - (SELECT count(*) FROM pg_replication_slots)",
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or(0);
 
     Ok(available > 0)
@@ -789,7 +789,7 @@ pub fn can_use_logical_replication() -> Result<bool, PgStreamError> {
 /// - `'f'` → FULL (always includes all columns)
 /// - `'n'` → NOTHING (no old values for UPDATE/DELETE)
 /// - `'i'` → INDEX (uses a specific index; may or may not be sufficient)
-pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgStreamError> {
+pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgTrickleError> {
     let identity = Spi::get_one_with_args::<String>(
         "SELECT CASE relreplident \
            WHEN 'd' THEN 'default' \
@@ -799,10 +799,10 @@ pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgStreamE
          END FROM pg_class WHERE oid = $1",
         &[source_oid.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or_else(|| "nothing".into());
 
-    // 'default' works if the table has a PK (which pg_stream already checks)
+    // 'default' works if the table has a PK (which pg_trickle already checks)
     // 'full' always works
     // 'nothing' doesn't provide OLD values for UPDATE/DELETE
     // 'index' may work but needs further validation in later phases
@@ -810,24 +810,24 @@ pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgStreamE
 }
 
 /// Returns true if the relation has any user-defined row-level triggers
-/// (excluding internal triggers and pg_stream's own CDC triggers).
+/// (excluding internal triggers and pg_trickle's own CDC triggers).
 ///
 /// Used by the refresh executor to decide whether to use the explicit DML
 /// path (which fires triggers with correct `TG_OP` / `OLD` / `NEW`) instead
 /// of the single-pass MERGE path.
 ///
 /// This is a lightweight query — single index scan on `pg_trigger(tgrelid)`.
-pub fn has_user_triggers(st_relid: pg_sys::Oid) -> Result<bool, PgStreamError> {
+pub fn has_user_triggers(st_relid: pg_sys::Oid) -> Result<bool, PgTrickleError> {
     Spi::get_one::<bool>(&format!(
         "SELECT EXISTS(\
            SELECT 1 FROM pg_trigger \
            WHERE tgrelid = {}::oid \
              AND tgisinternal = false \
-             AND tgname NOT LIKE 'pgs_%' \
+             AND tgname NOT LIKE 'pgt_%' \
          )",
         st_relid.to_u32(),
     ))
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
     .map(|v| v.unwrap_or(false))
 }
 
@@ -840,19 +840,19 @@ mod tests {
     #[test]
     fn test_trigger_name_for_source_basic() {
         let oid = pgrx::pg_sys::Oid::from(12345u32);
-        assert_eq!(trigger_name_for_source(oid), "pg_stream_cdc_12345");
+        assert_eq!(trigger_name_for_source(oid), "pg_trickle_cdc_12345");
     }
 
     #[test]
     fn test_trigger_name_for_source_zero() {
         let oid = pgrx::pg_sys::Oid::from(0u32);
-        assert_eq!(trigger_name_for_source(oid), "pg_stream_cdc_0");
+        assert_eq!(trigger_name_for_source(oid), "pg_trickle_cdc_0");
     }
 
     #[test]
     fn test_trigger_name_for_source_large_oid() {
         let oid = pgrx::pg_sys::Oid::from(4294967295u32); // u32::MAX
-        assert_eq!(trigger_name_for_source(oid), "pg_stream_cdc_4294967295");
+        assert_eq!(trigger_name_for_source(oid), "pg_trickle_cdc_4294967295");
     }
 
     // ── build_pk_hash_trigger_exprs tests ────────────────────────────
@@ -862,8 +862,8 @@ mod tests {
         let pk = vec!["id".to_string()];
         let all = vec![("id".to_string(), "integer".to_string())];
         let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
-        assert_eq!(new_expr, r#"pgstream.pg_stream_hash(NEW."id"::text)"#);
-        assert_eq!(old_expr, r#"pgstream.pg_stream_hash(OLD."id"::text)"#);
+        assert_eq!(new_expr, r#"pgtrickle.pg_trickle_hash(NEW."id"::text)"#);
+        assert_eq!(old_expr, r#"pgtrickle.pg_trickle_hash(OLD."id"::text)"#);
     }
 
     #[test]
@@ -874,7 +874,7 @@ mod tests {
             ("b".to_string(), "text".to_string()),
         ];
         let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
-        assert!(new_expr.contains("pgstream.pg_stream_hash_multi"));
+        assert!(new_expr.contains("pgtrickle.pg_trickle_hash_multi"));
         assert!(new_expr.contains(r#"NEW."a"::text"#));
         assert!(new_expr.contains(r#"NEW."b"::text"#));
         assert!(old_expr.contains(r#"OLD."a"::text"#));
@@ -891,7 +891,7 @@ mod tests {
         ];
         let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
         assert!(
-            new_expr.contains("pgstream.pg_stream_hash_multi"),
+            new_expr.contains("pgtrickle.pg_trickle_hash_multi"),
             "Got: {new_expr}",
         );
         assert!(new_expr.contains(r#"NEW."name"::text"#), "Got: {new_expr}");
@@ -906,8 +906,8 @@ mod tests {
         let pk: Vec<String> = vec![];
         let all = vec![("val".to_string(), "text".to_string())];
         let (new_expr, old_expr) = build_pk_hash_trigger_exprs(&pk, &all);
-        assert_eq!(new_expr, r#"pgstream.pg_stream_hash(NEW."val"::text)"#);
-        assert_eq!(old_expr, r#"pgstream.pg_stream_hash(OLD."val"::text)"#);
+        assert_eq!(new_expr, r#"pgtrickle.pg_trickle_hash(NEW."val"::text)"#);
+        assert_eq!(old_expr, r#"pgtrickle.pg_trickle_hash(OLD."val"::text)"#);
     }
 
     #[test]

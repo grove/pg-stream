@@ -2,7 +2,7 @@
 
 > **Status:** Draft  
 > **Target version:** Post-1.0 (Advanced SQL A2)  
-> **Author:** pg_stream project
+> **Author:** pg_trickle project
 
 ---
 
@@ -12,13 +12,13 @@ The current refresh model is **poll-based**:
 
 ```
 Source table INSERT/UPDATE/DELETE
-  └─► CDC trigger writes to pgstream_changes.changes_<oid>
+  └─► CDC trigger writes to pgtrickle_changes.changes_<oid>
         └─► Background worker wakes on tick interval (default: 1s)
               └─► Full differential refresh executed via delta SQL
 ```
 
 Minimum observable latency ≈ scheduler tick interval (configurable, default
-`pg_stream.scheduler_interval_ms = 1000`). Typical p99 ≈ tick × 2
+`pg_trickle.scheduler_interval_ms = 1000`). Typical p99 ≈ tick × 2
 (change arrives just after a tick fires).
 
 For most analytical workloads, 1–2 second latency is acceptable. For
@@ -35,8 +35,8 @@ aggregate shapes:
 
 ```
 INSERT into source table
-  └─► pg_stream CDC trigger (AFTER ROW)
-        ├─► Append row to pgstream_changes (existing)
+  └─► pg_trickle CDC trigger (AFTER ROW)
+        ├─► Append row to pgtrickle_changes (existing)
         └─► [NEW] Atomically update aggregate result table
               ─── SUM(v) += new_v
               ─── COUNT(*) += 1
@@ -86,10 +86,10 @@ applies deltas. The streaming aggregation path is a specialization:
 
 ## 5. Required Catalog Changes
 
-Add a column to `pgstream.pgs_stream_tables`:
+Add a column to `pgtrickle.pgt_stream_tables`:
 
 ```sql
-ALTER TABLE pgstream.pgs_stream_tables
+ALTER TABLE pgtrickle.pgt_stream_tables
   ADD COLUMN fast_path_enabled bool NOT NULL DEFAULT false,
   ADD COLUMN fast_path_sql text;   -- pre-compiled UPDATE statement
 ```

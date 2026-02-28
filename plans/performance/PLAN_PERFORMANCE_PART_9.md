@@ -85,7 +85,7 @@ These benchmarks ran successfully on macOS. Key results:
 ### diff_operators (Requires pgrx/PG linking)
 
 **Could not run locally.** The `diff_operators` benchmark links against
-`pg_stream` library code that references pgrx symbols (`SPI_processed`,
+`pg_trickle` library code that references pgrx symbols (`SPI_processed`,
 etc.). These symbols are only available inside a PostgreSQL backend process
 or when linked against libpq/PG server libraries.
 
@@ -122,7 +122,7 @@ Previous results (from Part 8, likely run inside Docker or with PG installed):
 ## 3. Higher-Level Performance Decisions
 
 These are architectural and strategic decisions that fundamentally affect
-pg_stream's performance ceiling. Each is more impactful than any individual
+pg_trickle's performance ceiling. Each is more impactful than any individual
 code optimization.
 
 ### D1: Where Does Time Actually Go? (The 80/20 Rule)
@@ -168,7 +168,7 @@ PostgreSQL supports **statement-level triggers with transition tables** (PG 10+)
 ```sql
 CREATE TRIGGER cdc_stmt AFTER INSERT OR UPDATE OR DELETE ON src
 REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows
-FOR EACH STATEMENT EXECUTE FUNCTION pg_stream_cdc_stmt_fn();
+FOR EACH STATEMENT EXECUTE FUNCTION pg_trickle_cdc_stmt_fn();
 ```
 
 **Impact:** A single trigger invocation per statement, processing all affected
@@ -193,7 +193,7 @@ No change for single-row DML (which already fires once).
 
 Per REPORT_PARALLELIZATION.md, the scheduler processes STs sequentially even
 though independent DAG branches could run in parallel. The GUC
-`pg_stream.max_concurrent_refreshes` exists but is not enforced for parallel
+`pg_trickle.max_concurrent_refreshes` exists but is not enforced for parallel
 dispatch.
 
 **Impact:** With 50 STs averaging 200ms each, sequential processing takes 10s.
@@ -218,7 +218,7 @@ significant at scale.
 - Already the default recovery mode (crash → reinitialize)
 - Cloud PG providers may not support UNLOGGED tables on replicas
 
-**Decision:** Implement behind a GUC (`pg_stream.change_buffer_unlogged`,
+**Decision:** Implement behind a GUC (`pg_trickle.change_buffer_unlogged`,
 default false). Benchmark with the trigger overhead suite first.
 
 ### D6: Column Pruning in Change Buffers
@@ -234,7 +234,7 @@ trigger cost by 50–80% for wide tables.
 
 **Trade-offs:**
 - Requires knowing which columns the stream table uses at trigger creation time
-  (available from `pgs_dependencies.columns_used`)
+  (available from `pgt_dependencies.columns_used`)
 - Adding a new stream table referencing additional columns would require
   trigger regeneration
 - Columns used by a defining query may include join keys, filter predicates,
@@ -253,7 +253,7 @@ The Part 8 analysis noted that the prepared statement revert (undone in
 P1+P2) is the root cause of the join regression. The join delta query has
 11 CTEs — planning this from scratch every cycle is expensive.
 
-**Current state:** `pg_stream.use_prepared_statements` GUC exists (default
+**Current state:** `pg_trickle.use_prepared_statements` GUC exists (default
 true) and is implemented. Need to verify it's working correctly and that the
 join regression recovers when enabled.
 
@@ -269,7 +269,7 @@ requires zero code changes, only correct GUC settings.
 
 **Decision:** Verify with `EXPLAIN ANALYZE` that parallel plans are being
 chosen for 100K-row refreshes. Document recommended PG settings for
-pg_stream deployments:
+pg_trickle deployments:
 
 ```ini
 max_parallel_workers_per_gather = 2  -- or 4 for large tables
@@ -295,7 +295,7 @@ cycles, the adaptive threshold should switch to FULL by cycle 4–5.
 
 ### A-2: Verify Prepared Statements Recover Join Regression
 
-**Test:** Run `bench_join_100k_1pct` with `pg_stream.use_prepared_statements
+**Test:** Run `bench_join_100k_1pct` with `pg_trickle.use_prepared_statements
 = true` (default). Compare cycle 1 (cold, custom plan) vs cycles 6+
 (generic plan locked in).
 
@@ -338,39 +338,39 @@ Replace the per-row AFTER trigger with a statement-level trigger using
 transition tables:
 
 ```sql
-CREATE TRIGGER pg_stream_cdc_tr_{oid}
+CREATE TRIGGER pg_trickle_cdc_tr_{oid}
 AFTER INSERT OR UPDATE OR DELETE ON {schema}.{table}
-REFERENCING NEW TABLE AS __pgs_new OLD TABLE AS __pgs_old
+REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old
 FOR EACH STATEMENT
-EXECUTE FUNCTION pgstream_changes.pg_stream_cdc_stmt_fn_{oid}();
+EXECUTE FUNCTION pgtrickle_changes.pg_trickle_cdc_stmt_fn_{oid}();
 ```
 
 The trigger function:
 
 ```sql
 -- For INSERT:
-INSERT INTO pgstream_changes.changes_{oid} (lsn, action, pk_hash, new_*)
+INSERT INTO pgtrickle_changes.changes_{oid} (lsn, action, pk_hash, new_*)
 SELECT pg_current_wal_lsn(), 'I',
-       pg_stream.pg_stream_hash(n."pk"::text), n.*
-FROM __pgs_new n;
+       pg_trickle.pg_trickle_hash(n."pk"::text), n.*
+FROM __pgt_new n;
 
 -- For UPDATE:
-INSERT INTO pgstream_changes.changes_{oid} (lsn, action, pk_hash, new_*, old_*)
+INSERT INTO pgtrickle_changes.changes_{oid} (lsn, action, pk_hash, new_*, old_*)
 SELECT pg_current_wal_lsn(), 'U',
-       pg_stream.pg_stream_hash(n."pk"::text), n.*, o.*
-FROM __pgs_new n JOIN __pgs_old o ON n.pk = o.pk;
+       pg_trickle.pg_trickle_hash(n."pk"::text), n.*, o.*
+FROM __pgt_new n JOIN __pgt_old o ON n.pk = o.pk;
 
 -- For DELETE:
-INSERT INTO pgstream_changes.changes_{oid} (lsn, action, pk_hash, old_*)
+INSERT INTO pgtrickle_changes.changes_{oid} (lsn, action, pk_hash, old_*)
 SELECT pg_current_wal_lsn(), 'D',
-       pg_stream.pg_stream_hash(o."pk"::text), o.*
-FROM __pgs_old o;
+       pg_trickle.pg_trickle_hash(o."pk"::text), o.*
+FROM __pgt_old o;
 ```
 
 ### B-2: Backward Compatibility
 
 - Keep the row-level trigger as a fallback behind a GUC
-  (`pg_stream.cdc_trigger_mode = 'statement'|'row'`, default `'statement'`)
+  (`pg_trickle.cdc_trigger_mode = 'statement'|'row'`, default `'statement'`)
 - The row-level trigger handles edge cases: `COPY FROM` with
   `-trigger` options, row-level trigger ordering requirements
 - Migration: on ALTER EXTENSION UPDATE, replace row-level triggers with
@@ -405,10 +405,10 @@ instead of `Vec<NodeId>`. Trivial modification to Kahn's algorithm.
 
 For each level, spawn up to `max_concurrent_refreshes` dynamic background
 workers. Each worker:
-1. Receives `pgs_id` via datum
+1. Receives `pgt_id` via datum
 2. Acquires advisory lock (or `FOR UPDATE SKIP LOCKED` per SQL_GAPS_7 Q7)
 3. Executes `refresh_stream_table()`
-4. Writes result to `pgs_refresh_history`
+4. Writes result to `pgt_refresh_history`
 5. Exits
 
 The coordinator waits for all workers in a level to complete before
@@ -418,7 +418,7 @@ advancing to the next level.
 
 ### C-3: Result Communication
 
-Workers write refresh outcomes to `pgs_refresh_history` (already done by
+Workers write refresh outcomes to `pgt_refresh_history` (already done by
 `refresh_stream_table`). The coordinator reads these after worker completion
 to update retry state and scheduling decisions.
 
@@ -437,9 +437,9 @@ Per SQL_GAPS_7 §G4.6, the MERGE `WHEN MATCHED` arm uses per-column
 single hash comparison:
 
 ```sql
-WHEN MATCHED AND pg_stream.pg_stream_hash(
+WHEN MATCHED AND pg_trickle.pg_trickle_hash(
     row_to_json(st.*)::text
-) IS DISTINCT FROM pg_stream.pg_stream_hash(
+) IS DISTINCT FROM pg_trickle.pg_trickle_hash(
     row_to_json(d.*)::text
 ) THEN UPDATE SET ...
 ```
@@ -475,7 +475,7 @@ estimated_incr_cost = delta_rows × (cte_count × scan_cost + merge_cost)
 estimated_full_cost = table_size × scan_cost + truncate_cost
 ```
 
-Use the historical `pgs_refresh_history` data to calibrate the cost model
+Use the historical `pgt_refresh_history` data to calibrate the cost model
 per stream table.
 
 **Effort:** 6–8 hours.
@@ -499,7 +499,7 @@ This prevents OOM for unexpected large deltas.
 
 ### E-2: work_mem Scaling
 
-The current `pg_stream.merge_work_mem_mb` GUC sets a fixed work_mem for
+The current `pg_trickle.merge_work_mem_mb` GUC sets a fixed work_mem for
 large deltas. A smarter approach: scale work_mem proportional to estimated
 delta size:
 
@@ -507,7 +507,7 @@ delta size:
 work_mem = max(base_work_mem, delta_rows * avg_row_width / 1024)
 ```
 
-Capped at `pg_stream.merge_work_mem_max_mb`.
+Capped at `pg_trickle.merge_work_mem_max_mb`.
 
 **Effort:** 2 hours.
 
@@ -531,7 +531,7 @@ into system performance:
 
 ### I-1: diff_operators Benchmark Cannot Run Locally
 
-**Problem:** The `diff_operators` Criterion bench links against `pg_stream`
+**Problem:** The `diff_operators` Criterion bench links against `pg_trickle`
 library code that uses pgrx symbols (`SPI_processed`, `pg_sys::*`). On
 macOS without PostgreSQL server libraries installed, the dyld loader fails
 with `symbol not found in flat namespace '_SPI_processed'`.
@@ -539,13 +539,13 @@ with `symbol not found in flat namespace '_SPI_processed'`.
 **Fix:** Refactor `diff_operators.rs` to depend only on pure-Rust types
 (`OpTree`, `DiffContext`, `Expr`, `Column`, `Frontier`). The diff operators
 themselves are pure Rust — the issue is that the benchmark binary links
-against the full `pg_stream` crate which includes SPI-using modules.
+against the full `pg_trickle` crate which includes SPI-using modules.
 
 **Options:**
 | Option | Description | Effort |
 |--------|-------------|--------|
 | **(a) Feature-gate pgrx** | Add a `bench` feature that stubs out pgrx dependencies | 2–3 hours |
-| **(b) Extract pure Rust into sub-crate** | Move `dvm/`, `dag.rs`, `version.rs`, `hash.rs` to a `pg_stream_core` crate that doesn't depend on pgrx | 6–8 hours |
+| **(b) Extract pure Rust into sub-crate** | Move `dvm/`, `dag.rs`, `version.rs`, `hash.rs` to a `pg_trickle_core` crate that doesn't depend on pgrx | 6–8 hours |
 | **(c) Run inside Docker** | Run `cargo bench` inside the E2E Docker container where PG libs are available | 1 hour (justfile target) |
 
 **Recommended:** **(c) as quick fix**, **(b) as long-term solution.**

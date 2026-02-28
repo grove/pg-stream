@@ -12,7 +12,7 @@
 //!   Maintenance for Rich Query Languages." PVLDB, 16(7), 1601–1614.
 //!   <https://arxiv.org/abs/2203.16684>
 //!   The `Z-set` abstraction (rows with +1/−1 multiplicity) directly maps to
-//!   the `__pgs_action` column produced by the delta operators.
+//!   the `__pgt_action` column produced by the delta operators.
 //!
 //! - **Gupta & Mumick (1995)**: "Maintenance of Materialized Views: Problems,
 //!   Techniques, and Applications." IEEE Data Engineering Bulletin, 18(2).
@@ -64,7 +64,7 @@ pub use parser::{
     rewrite_sublinks_in_or, rewrite_views_inline, tree_worst_volatility_with_registry,
 };
 
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::version::Frontier;
 
 use std::cell::{Cell, RefCell};
@@ -83,16 +83,16 @@ struct CachedDeltaTemplate {
     /// Delta SQL with `__PGS_PREV_LSN_{oid}__` / `__PGS_NEW_LSN_{oid}__`
     /// placeholder tokens instead of literal LSN values.
     delta_sql_template: String,
-    /// User-facing output column names (excludes __pgs_row_id / __pgs_action).
+    /// User-facing output column names (excludes __pgt_row_id / __pgt_action).
     output_columns: Vec<String>,
     /// Deduplicated source table OIDs.
     source_oids: Vec<u32>,
-    /// Whether the delta output is already deduplicated per __pgs_row_id.
+    /// Whether the delta output is already deduplicated per __pgt_row_id.
     is_deduplicated: bool,
 }
 
 thread_local! {
-    /// Per-session cache of delta SQL templates, keyed by `pgs_id`.
+    /// Per-session cache of delta SQL templates, keyed by `pgt_id`.
     ///
     /// The template is invalidated when the defining query hash changes
     /// (e.g. after `ALTER STREAM TABLE`). Stale entries for dropped STs
@@ -136,9 +136,9 @@ fn resolve_delta_template(
 }
 
 /// Invalidate cached delta templates for a given ST (e.g. after DDL).
-pub fn invalidate_delta_cache(pgs_id: i64) {
+pub fn invalidate_delta_cache(pgt_id: i64) {
     DELTA_TEMPLATE_CACHE.with(|cache| {
-        cache.borrow_mut().remove(&pgs_id);
+        cache.borrow_mut().remove(&pgt_id);
     });
 }
 
@@ -147,22 +147,22 @@ pub fn invalidate_delta_cache(pgs_id: i64) {
 /// Returns `None` if the template has not been generated yet.
 /// The returned template contains `__PGS_PREV_LSN_{oid}__` and
 /// `__PGS_NEW_LSN_{oid}__` tokens that must be resolved before execution.
-pub fn get_delta_sql_template(pgs_id: i64) -> Option<String> {
+pub fn get_delta_sql_template(pgt_id: i64) -> Option<String> {
     DELTA_TEMPLATE_CACHE.with(|cache| {
         cache
             .borrow()
-            .get(&pgs_id)
+            .get(&pgt_id)
             .map(|entry| entry.delta_sql_template.clone())
     })
 }
 
 /// Check whether the cached delta for a ST is deduplicated (at most one
-/// row per `__pgs_row_id`), allowing the MERGE to skip DISTINCT ON.
-pub fn is_delta_deduplicated(pgs_id: i64) -> bool {
+/// row per `__pgt_row_id`), allowing the MERGE to skip DISTINCT ON.
+pub fn is_delta_deduplicated(pgt_id: i64) -> bool {
     DELTA_TEMPLATE_CACHE.with(|cache| {
         cache
             .borrow()
-            .get(&pgs_id)
+            .get(&pgt_id)
             .map(|entry| entry.is_deduplicated)
             .unwrap_or(false)
     })
@@ -200,11 +200,11 @@ fn is_scan_chain_tree(tree: &parser::OpTree) -> bool {
 pub struct DeltaQueryResult {
     /// The complete delta SQL (WITH … SELECT …).
     pub delta_sql: String,
-    /// User-facing output column names (excludes __pgs_row_id / __pgs_action).
+    /// User-facing output column names (excludes __pgt_row_id / __pgt_action).
     pub output_columns: Vec<String>,
     /// Deduplicated source table OIDs (from both main tree and CTE registry).
     pub source_oids: Vec<u32>,
-    /// When true, the delta has at most one row per `__pgs_row_id`,
+    /// When true, the delta has at most one row per `__pgt_row_id`,
     /// so the MERGE can skip the outer DISTINCT ON + ORDER BY.
     pub is_deduplicated: bool,
 }
@@ -226,9 +226,9 @@ pub fn generate_delta_query(
     defining_query: &str,
     prev_frontier: &Frontier,
     new_frontier: &Frontier,
-    pgs_schema: &str,
-    pgs_name: &str,
-) -> Result<DeltaQueryResult, PgStreamError> {
+    pgt_schema: &str,
+    pgt_name: &str,
+) -> Result<DeltaQueryResult, PgTrickleError> {
     // Step 1: Parse the defining query into an operator tree + CTE registry.
     // This now handles recursive CTEs via OpTree::RecursiveCte, so no
     // early bypass is needed.
@@ -245,11 +245,11 @@ pub fn generate_delta_query(
 
     // Step 3: Generate the delta query.
     // Use differentiate_with_columns() to get the diff result's column list,
-    // which includes auxiliary columns (e.g. __pgs_count) for aggregate/distinct.
+    // which includes auxiliary columns (e.g. __pgt_count) for aggregate/distinct.
     let st_user_cols = result.tree.output_columns();
     let is_scan_chain = is_scan_chain_tree(&result.tree);
     let mut ctx = DiffContext::new(prev_frontier.clone(), new_frontier.clone())
-        .with_pgs_name(pgs_schema, pgs_name)
+        .with_pgt_name(pgt_schema, pgt_name)
         .with_cte_registry(result.cte_registry)
         .with_defining_query(defining_query);
     ctx.st_user_columns = Some(st_user_cols);
@@ -267,22 +267,22 @@ pub fn generate_delta_query(
 /// Generate the full delta SQL query, using a per-session cache to avoid
 /// re-parsing and re-differentiating the defining query on every refresh.
 ///
-/// On the first call for a given `pgs_id`, the defining query is parsed,
+/// On the first call for a given `pgt_id`, the defining query is parsed,
 /// validated, and differentiated with LSN placeholders. The resulting SQL
 /// template and metadata are cached. On subsequent calls, the cached
 /// template is resolved with actual frontier LSN values — skipping the
 /// parse, DVM-support check, and differentiation entirely.
 ///
-/// Cache entries are keyed by `pgs_id` and invalidated when the
+/// Cache entries are keyed by `pgt_id` and invalidated when the
 /// `defining_query` hash changes (e.g. after `ALTER STREAM TABLE`).
 pub fn generate_delta_query_cached(
-    pgs_id: i64,
+    pgt_id: i64,
     defining_query: &str,
     prev_frontier: &Frontier,
     new_frontier: &Frontier,
-    pgs_schema: &str,
-    pgs_name: &str,
-) -> Result<DeltaQueryResult, PgStreamError> {
+    pgt_schema: &str,
+    pgt_name: &str,
+) -> Result<DeltaQueryResult, PgTrickleError> {
     let query_hash = hash_string(defining_query);
 
     // G8.1: Cross-session cache invalidation — flush if the shared
@@ -298,7 +298,7 @@ pub fn generate_delta_query_cached(
     // Check the thread-local cache.
     let cached = DELTA_TEMPLATE_CACHE.with(|cache| {
         let map = cache.borrow();
-        map.get(&pgs_id)
+        map.get(&pgt_id)
             .filter(|entry| entry.defining_query_hash == query_hash)
             .cloned()
     });
@@ -335,7 +335,7 @@ pub fn generate_delta_query_cached(
     let st_user_cols = result.tree.output_columns();
     let mut ctx = DiffContext::new(Frontier::new(), Frontier::new())
         .with_placeholders()
-        .with_pgs_name(pgs_schema, pgs_name)
+        .with_pgt_name(pgt_schema, pgt_name)
         .with_cte_registry(result.cte_registry)
         .with_defining_query(defining_query);
     ctx.st_user_columns = Some(st_user_cols);
@@ -352,7 +352,7 @@ pub fn generate_delta_query_cached(
         is_deduplicated: is_scan_chain || diff_dedup,
     };
     DELTA_TEMPLATE_CACHE.with(|cache| {
-        cache.borrow_mut().insert(pgs_id, entry);
+        cache.borrow_mut().insert(pgt_id, entry);
     });
 
     // Resolve placeholders for this invocation.
@@ -367,13 +367,13 @@ pub fn generate_delta_query_cached(
     })
 }
 
-/// Check whether a defining query needs the `__pgs_count` auxiliary column
+/// Check whether a defining query needs the `__pgt_count` auxiliary column
 /// (the top-level operator is Aggregate or Distinct).
 ///
 /// Uses a lightweight parse — no SPI or database access required.
-pub fn query_needs_pgs_count(defining_query: &str) -> bool {
+pub fn query_needs_pgt_count(defining_query: &str) -> bool {
     parse_defining_query(defining_query)
-        .map(|tree| tree.needs_pgs_count())
+        .map(|tree| tree.needs_pgt_count())
         .unwrap_or(false)
 }
 
@@ -389,13 +389,13 @@ pub fn extract_group_by_columns(defining_query: &str) -> Option<Vec<String>> {
         .and_then(|tree| tree.group_by_columns())
 }
 
-/// Generate a SQL expression for computing `__pgs_row_id` from a subquery
+/// Generate a SQL expression for computing `__pgt_row_id` from a subquery
 /// aliased as `sub`, matching the hash formula used by the delta query.
 ///
-/// Returns an expression like `pgstream.pg_stream_hash(sub."id"::text)` for scan PK,
-/// `pgstream.pg_stream_hash(sub."region"::text)` for aggregate GROUP BY, etc.
+/// Returns an expression like `pgtrickle.pg_trickle_hash(sub."id"::text)` for scan PK,
+/// `pgtrickle.pg_trickle_hash(sub."region"::text)` for aggregate GROUP BY, etc.
 ///
-/// Falls back to `pgstream.pg_stream_hash(row_to_json(sub)::text)` for queries whose
+/// Falls back to `pgtrickle.pg_trickle_hash(row_to_json(sub)::text)` for queries whose
 /// row-id computation is too complex (joins, union all).
 pub fn row_id_expr_for_query(defining_query: &str) -> String {
     let tree = parse_defining_query(defining_query).ok();
@@ -404,7 +404,7 @@ pub fn row_id_expr_for_query(defining_query: &str) -> String {
     match key_cols {
         Some(cols) if cols.len() == 1 => {
             format!(
-                "pgstream.pg_stream_hash(sub.{}::text)",
+                "pgtrickle.pg_trickle_hash(sub.{}::text)",
                 diff::quote_ident(&cols[0]),
             )
         }
@@ -414,7 +414,7 @@ pub fn row_id_expr_for_query(defining_query: &str) -> String {
                 .map(|c| format!("sub.{}::TEXT", diff::quote_ident(c)))
                 .collect();
             format!(
-                "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+                "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
                 array_items.join(", ")
             )
         }
@@ -422,16 +422,16 @@ pub fn row_id_expr_for_query(defining_query: &str) -> String {
             // Scalar aggregate (no GROUP BY): use singleton sentinel hash
             // matching the differential delta's __singleton_group row_id.
             // Without this, FULL refresh would use row_to_json hashing
-            // while DIFF uses '__singleton_group', causing __pgs_row_id
+            // while DIFF uses '__singleton_group', causing __pgt_row_id
             // mismatch and phantom row insertion.
             if tree.as_ref().is_some_and(is_scalar_aggregate_root) {
-                "pgstream.pg_stream_hash('__singleton_group')".to_string()
+                "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
             } else {
                 // Fallback for complex queries (joins, union all, etc.)
                 // Include row_number() to disambiguate duplicate-content rows
                 // (e.g., recursive CTEs with UNION ALL that reach the same
                 // values via different derivation paths).
-                "pgstream.pg_stream_hash(row_to_json(sub)::text || '/' || row_number() OVER ()::text)"
+                "pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || row_number() OVER ()::text)"
                     .to_string()
             }
         }
@@ -457,7 +457,7 @@ fn is_scalar_aggregate_root(tree: &parser::OpTree) -> bool {
 /// Returns `None` if the query is not a top-level UNION ALL or the branches
 /// cannot be decomposed (e.g., a branch has no deterministic PK columns).
 ///
-/// The returned SQL is a SELECT producing `__pgs_row_id` plus user columns,
+/// The returned SQL is a SELECT producing `__pgt_row_id` plus user columns,
 /// ready to be prefixed with `INSERT INTO schema.table`.
 pub fn try_union_all_refresh_sql(defining_query: &str) -> Option<String> {
     let branches = split_top_level_union_all(defining_query)?;
@@ -472,7 +472,7 @@ pub fn try_union_all_refresh_sql(defining_query: &str) -> Option<String> {
         // Build the child hash expression (same formula as the scan diff).
         let child_hash = if key_cols.len() == 1 {
             format!(
-                "pgstream.pg_stream_hash(sub.{}::text)",
+                "pgtrickle.pg_trickle_hash(sub.{}::text)",
                 diff::quote_ident(&key_cols[0]),
             )
         } else {
@@ -480,15 +480,18 @@ pub fn try_union_all_refresh_sql(defining_query: &str) -> Option<String> {
                 .iter()
                 .map(|c| format!("sub.{}::TEXT", diff::quote_ident(c)))
                 .collect();
-            format!("pgstream.pg_stream_hash_multi(ARRAY[{}])", items.join(", "))
+            format!(
+                "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+                items.join(", ")
+            )
         };
 
         // Wrap with branch prefix (matching diff_union_all's idx = i + 1).
         let row_id_expr =
-            format!("pgstream.pg_stream_hash_multi(ARRAY['{idx}'::TEXT, ({child_hash})::TEXT])",);
+            format!("pgtrickle.pg_trickle_hash_multi(ARRAY['{idx}'::TEXT, ({child_hash})::TEXT])",);
 
         parts.push(format!(
-            "SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({branch_sql}) sub",
+            "SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({branch_sql}) sub",
         ));
     }
 
@@ -579,22 +582,22 @@ fn split_top_level_union_all(query: &str) -> Option<Vec<String>> {
 ///
 /// This works for all query types including recursive CTEs, since PostgreSQL
 /// handles the full query execution (we just inspect the result metadata).
-pub fn get_defining_query_columns(defining_query: &str) -> Result<Vec<String>, PgStreamError> {
+pub fn get_defining_query_columns(defining_query: &str) -> Result<Vec<String>, PgTrickleError> {
     use pgrx::Spi;
 
-    let probe_sql = format!("SELECT * FROM ({defining_query}) __pgs_probe LIMIT 0");
+    let probe_sql = format!("SELECT * FROM ({defining_query}) __pgt_probe LIMIT 0");
 
     Spi::connect(|client| {
         let result = client
             .select(&probe_sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(format!("Column probe failed: {e}")))?;
+            .map_err(|e| PgTrickleError::SpiError(format!("Column probe failed: {e}")))?;
 
         let ncols = result
             .columns()
-            .map_err(|e| PgStreamError::SpiError(format!("Failed to get column count: {e}")))?;
+            .map_err(|e| PgTrickleError::SpiError(format!("Failed to get column count: {e}")))?;
 
         if ncols == 0 {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "Defining query produces no columns".into(),
             ));
         }
@@ -806,15 +809,15 @@ mod tests {
 
     #[test]
     fn test_cache_empty_returns_none() {
-        let pgs_id = -9999;
-        invalidate_delta_cache(pgs_id); // ensure clean
-        assert!(get_delta_sql_template(pgs_id).is_none());
-        assert!(!is_delta_deduplicated(pgs_id));
+        let pgt_id = -9999;
+        invalidate_delta_cache(pgt_id); // ensure clean
+        assert!(get_delta_sql_template(pgt_id).is_none());
+        assert!(!is_delta_deduplicated(pgt_id));
     }
 
     #[test]
     fn test_cache_insert_and_retrieve() {
-        let pgs_id = -9998;
+        let pgt_id = -9998;
         let entry = CachedDeltaTemplate {
             defining_query_hash: 12345,
             delta_sql_template: "WITH cte AS (SELECT 1) SELECT * FROM cte".to_string(),
@@ -823,21 +826,21 @@ mod tests {
             is_deduplicated: true,
         };
         DELTA_TEMPLATE_CACHE.with(|cache| {
-            cache.borrow_mut().insert(pgs_id, entry);
+            cache.borrow_mut().insert(pgt_id, entry);
         });
 
-        let tmpl = get_delta_sql_template(pgs_id).unwrap();
+        let tmpl = get_delta_sql_template(pgt_id).unwrap();
         assert!(tmpl.contains("SELECT 1"));
-        assert!(is_delta_deduplicated(pgs_id));
+        assert!(is_delta_deduplicated(pgt_id));
 
         // Cleanup
-        invalidate_delta_cache(pgs_id);
-        assert!(get_delta_sql_template(pgs_id).is_none());
+        invalidate_delta_cache(pgt_id);
+        assert!(get_delta_sql_template(pgt_id).is_none());
     }
 
     #[test]
     fn test_cache_invalidate_removes_entry() {
-        let pgs_id = -9997;
+        let pgt_id = -9997;
         let entry = CachedDeltaTemplate {
             defining_query_hash: 0,
             delta_sql_template: "SELECT 1".to_string(),
@@ -846,35 +849,35 @@ mod tests {
             is_deduplicated: false,
         };
         DELTA_TEMPLATE_CACHE.with(|cache| {
-            cache.borrow_mut().insert(pgs_id, entry);
+            cache.borrow_mut().insert(pgt_id, entry);
         });
-        assert!(get_delta_sql_template(pgs_id).is_some());
+        assert!(get_delta_sql_template(pgt_id).is_some());
 
-        invalidate_delta_cache(pgs_id);
-        assert!(get_delta_sql_template(pgs_id).is_none());
-        assert!(!is_delta_deduplicated(pgs_id));
+        invalidate_delta_cache(pgt_id);
+        assert!(get_delta_sql_template(pgt_id).is_none());
+        assert!(!is_delta_deduplicated(pgt_id));
     }
 
-    // ── OpTree::needs_pgs_count() (unit, no PG parse) ──────────────
+    // ── OpTree::needs_pgt_count() (unit, no PG parse) ──────────────
 
     #[test]
-    fn test_needs_pgs_count_aggregate() {
+    fn test_needs_pgt_count_aggregate() {
         let s = scan(1, "t", "public", "t", &["id", "amount"]);
         let agg = aggregate(vec![colref("id")], vec![sum_col("amount", "total")], s);
-        assert!(agg.needs_pgs_count());
+        assert!(agg.needs_pgt_count());
     }
 
     #[test]
-    fn test_needs_pgs_count_distinct() {
+    fn test_needs_pgt_count_distinct() {
         let s = scan(1, "t", "public", "t", &["id"]);
         let d = distinct(s);
-        assert!(d.needs_pgs_count());
+        assert!(d.needs_pgt_count());
     }
 
     #[test]
-    fn test_needs_pgs_count_scan_false() {
+    fn test_needs_pgt_count_scan_false() {
         let s = scan(1, "t", "public", "t", &["id"]);
-        assert!(!s.needs_pgs_count());
+        assert!(!s.needs_pgt_count());
     }
 
     // ── is_scalar_aggregate_root() ─────────────────────────────────

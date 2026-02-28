@@ -1,6 +1,6 @@
 # Release Process
 
-This document describes how to create a release of **pg_stream**.
+This document describes how to create a release of **pg_trickle**.
 
 ## Overview
 
@@ -38,7 +38,7 @@ Follow [Semantic Versioning](https://semver.org/):
 # e.g., version = "0.2.0"
 ```
 
-The extension control file (`pgstream.control`) uses
+The extension control file (`pgtrickle.control`) uses
 `default_version = '@CARGO_VERSION@'`, which pgrx replaces automatically at
 build time — no manual edit needed.
 
@@ -82,13 +82,13 @@ default. Because this is an open-source project, packages linked to the
 public repository inherit public visibility — but you must make the package
 public once to unlock that:
 
-1. Go to **github.com/⟨owner⟩ → Packages → pg_stream-ext**
+1. Go to **github.com/⟨owner⟩ → Packages → pg_trickle-ext**
 2. Click **Package settings**
 3. Scroll to **Danger Zone** → **Change package visibility** → set to **Public**
 
 After that first change:
 - All future pushes keep the package public automatically
-- Unauthenticated `docker pull ghcr.io/grove/pg_stream-ext:...` works
+- Unauthenticated `docker pull ghcr.io/grove/pg_trickle-ext:...` works
 - Storage and bandwidth are free (GHCR open-source advantage)
 - The package page shows the README, linked repository, license, and
   description from the OCI labels
@@ -100,12 +100,12 @@ Once the workflow completes:
 - [ ] Check the [GitHub Releases](../../releases) page for the new release
 - [ ] Verify all three platform archives are attached (`.tar.gz` for Linux/macOS, `.zip` for Windows)
 - [ ] Verify `SHA256SUMS.txt` is present
-- [ ] Verify the extension image is available at `ghcr.io/grove/pg_stream-ext:<version>`
+- [ ] Verify the extension image is available at `ghcr.io/grove/pg_trickle-ext:<version>`
 - [ ] Optionally verify the extension image layout:
 
 ```bash
-docker pull ghcr.io/grove/pg_stream-ext:0.2.0
-ID=$(docker create ghcr.io/grove/pg_stream-ext:0.2.0)
+docker pull ghcr.io/grove/pg_trickle-ext:0.2.0
+ID=$(docker create ghcr.io/grove/pg_trickle-ext:0.2.0)
 docker cp "$ID:/lib/" /tmp/ext-lib/
 docker cp "$ID:/share/" /tmp/ext-share/
 docker rm "$ID"
@@ -118,17 +118,17 @@ Each release produces:
 
 | Artifact | Description |
 |----------|-------------|
-| `pg_stream-<ver>-pg18-linux-amd64.tar.gz` | Extension files for Linux x86_64 |
-| `pg_stream-<ver>-pg18-macos-arm64.tar.gz` | Extension files for macOS Apple Silicon |
-| `pg_stream-<ver>-pg18-windows-amd64.zip`  | Extension files for Windows x64 |
+| `pg_trickle-<ver>-pg18-linux-amd64.tar.gz` | Extension files for Linux x86_64 |
+| `pg_trickle-<ver>-pg18-macos-arm64.tar.gz` | Extension files for macOS Apple Silicon |
+| `pg_trickle-<ver>-pg18-windows-amd64.zip`  | Extension files for Windows x64 |
 | `SHA256SUMS.txt` | SHA-256 checksums for all archives |
-| `ghcr.io/grove/pg_stream-ext:<ver>` | CNPG extension image for Image Volumes (amd64 + arm64) |
+| `ghcr.io/grove/pg_trickle-ext:<ver>` | CNPG extension image for Image Volumes (amd64 + arm64) |
 
 ### Installing from an archive
 
 ```bash
-tar xzf pg_stream-0.2.0-pg18-linux-amd64.tar.gz
-cd pg_stream-0.2.0-pg18-linux-amd64
+tar xzf pg_trickle-0.2.0-pg18-linux-amd64.tar.gz
+cd pg_trickle-0.2.0-pg18-linux-amd64
 
 sudo cp lib/*.so "$(pg_config --pkglibdir)/"
 sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
@@ -137,7 +137,7 @@ sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
 Then add to `postgresql.conf` and restart:
 
 ```
-shared_preload_libraries = 'pg_stream'
+shared_preload_libraries = 'pg_trickle'
 ```
 
 See [INSTALL.md](../INSTALL.md) for full installation details.
@@ -171,12 +171,12 @@ Every release requires manual updates to the files below. Missing any of them le
 
 | File | What to change | Why |
 |------|----------------|-----|
-| `Cargo.toml` | `version = "x.y.z"` field | The canonical version source. pgrx reads this at build time and substitutes it into `pg_stream.control` via `@CARGO_VERSION@`. The git tag must match. |
+| `Cargo.toml` | `version = "x.y.z"` field | The canonical version source. pgrx reads this at build time and substitutes it into `pg_trickle.control` via `@CARGO_VERSION@`. The git tag must match. |
 | `CHANGELOG.md` | Rename `## [Unreleased]` → `## [x.y.z] — YYYY-MM-DD`; add a new empty `## [Unreleased]` at the top | Keeps the public changelog accurate and gives downstream users a dated record of changes. |
 | `ROADMAP.md` | Update `**Current version:**` in the preamble; move the released milestone to a collapsed "Released" section or delete it; advance the "We are here" pointer to the next milestone | Keeps the forward-looking plan aligned with reality. Leaves no confusion about which milestone is current. |
 | `README.md` | Update test-count line (`~N unit tests + M E2E tests`) if test counts changed significantly | The README is the first thing users read; stale numbers erode trust. |
 | `INSTALL.md` | Update any version numbers in install commands or example URLs | Users copy-paste installation commands; stale versions cause failures. |
-| `pg_stream.control` | **No manual edit needed** — `default_version` is set to `'@CARGO_VERSION@'` and pgrx substitutes it at build time. Verify the substitution in the built artifact. | Ensures the SQL `CREATE EXTENSION` command installs the right version. |
+| `pg_trickle.control` | **No manual edit needed** — `default_version` is set to `'@CARGO_VERSION@'` and pgrx substitutes it at build time. Verify the substitution in the built artifact. | Ensures the SQL `CREATE EXTENSION` command installs the right version. |
 
 ### Checklist summary
 

@@ -1,9 +1,9 @@
-# pg_stream
+# pg_trickle
 
-[![Build](https://github.com/grove/pg-stream/actions/workflows/build.yml/badge.svg)](https://github.com/grove/pg-stream/actions/workflows/build.yml)
-[![CI](https://github.com/grove/pg-stream/actions/workflows/ci.yml/badge.svg)](https://github.com/grove/pg-stream/actions/workflows/ci.yml)
-[![Release](https://github.com/grove/pg-stream/actions/workflows/release.yml/badge.svg)](https://github.com/grove/pg-stream/actions/workflows/release.yml)
-[![Coverage](https://codecov.io/gh/grove/pg-stream/branch/main/graph/badge.svg)](https://codecov.io/gh/grove/pg-stream)
+[![Build](https://github.com/grove/pg-trickle/actions/workflows/build.yml/badge.svg)](https://github.com/grove/pg-trickle/actions/workflows/build.yml)
+[![CI](https://github.com/grove/pg-trickle/actions/workflows/ci.yml/badge.svg)](https://github.com/grove/pg-trickle/actions/workflows/ci.yml)
+[![Release](https://github.com/grove/pg-trickle/actions/workflows/release.yml/badge.svg)](https://github.com/grove/pg-trickle/actions/workflows/release.yml)
+[![Coverage](https://codecov.io/gh/grove/pg-trickle/branch/main/graph/badge.svg)](https://codecov.io/gh/grove/pg-trickle)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-view-blue)](docs/BENCHMARK.md)
 [![Roadmap](https://img.shields.io/badge/Roadmap-view-informational)](ROADMAP.md)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
@@ -12,11 +12,11 @@
 
 > **Early Release Notice:** This project is in an early stage of development and is **not yet production ready**. APIs, configuration options, and internal behavior may change without notice. Use at your own risk and please report any issues you encounter.
 
-> For a plain-language description of the problem pg_stream solves, the differential dataflow approach, and the hybrid CDC architecture, read **[ESSENCE.md](ESSENCE.md)**.
+> For a plain-language description of the problem pg_trickle solves, the differential dataflow approach, and the hybrid CDC architecture, read **[ESSENCE.md](ESSENCE.md)**.
 
 **Stream Tables for PostgreSQL 18**
 
-pg_stream brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
+pg_trickle brings declarative, automatically-refreshing materialized views to PostgreSQL, inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework ([comparison](docs/research/DBSP_COMPARISON.md)). Define a SQL query and a schedule bound (or cron schedule); the extension handles the rest.
 
 ## Key Features
 
@@ -24,10 +24,10 @@ pg_stream brings declarative, automatically-refreshing materialized views to Pos
 - **Differential View Maintenance (DVM)** — only processes changed rows, not the entire base table. Delta queries are derived automatically from the defining query's operator tree.
 - **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in both FULL and DIFFERENTIAL modes.
 - **Trigger-based CDC** — lightweight `AFTER` row-level triggers capture changes into buffer tables. No logical replication slots or `wal_level = logical` required. Triggers are created and dropped automatically.
-- **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_stream.cdc_mode` GUC (`trigger` / `auto` / `wal`).
+- **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_trickle.cdc_mode` GUC (`trigger` / `auto` / `wal`).
 - **DAG-aware scheduling** — stream tables that depend on other stream tables are refreshed in topological order. `CALCULATED` schedule propagation is supported.
 - **Crash-safe** — advisory locks prevent concurrent refreshes; crash recovery marks in-flight refreshes as failed and resumes normal operation.
-- **Observable** — built-in monitoring views (`pgstream.pg_stat_stream_tables`), refresh history, slot health checks, staleness reporting, and `NOTIFY`-based alerting.
+- **Observable** — built-in monitoring views (`pgtrickle.pg_stat_stream_tables`), refresh history, slot health checks, staleness reporting, and `NOTIFY`-based alerting.
 
 ## SQL Support
 
@@ -116,24 +116,24 @@ cargo pgrx package --pg-config $(pg_config --bindir)/pg_config
 Add to `postgresql.conf`:
 
 ```ini
-shared_preload_libraries = 'pg_stream'
+shared_preload_libraries = 'pg_trickle'
 max_worker_processes = 8
 ```
 
-> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required by default. CDC uses lightweight row-level triggers unless you opt in to WAL-based capture via `pg_stream.cdc_mode = 'auto'` (see [CONFIGURATION.md](docs/CONFIGURATION.md)).
+> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required by default. CDC uses lightweight row-level triggers unless you opt in to WAL-based capture via `pg_trickle.cdc_mode = 'auto'` (see [CONFIGURATION.md](docs/CONFIGURATION.md)).
 
 Restart PostgreSQL, then:
 
 ```sql
-CREATE EXTENSION pg_stream;
+CREATE EXTENSION pg_trickle;
 ```
 
 ### Kubernetes (CloudNativePG)
 
-pg_stream is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
+pg_trickle is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
 
 ```bash
-docker pull ghcr.io/grove/pg_stream-ext:0.1.1
+docker pull ghcr.io/grove/pg_trickle-ext:0.1.1
 ```
 
 Deploy with the official CNPG PostgreSQL 18 operand image:
@@ -143,11 +143,11 @@ Deploy with the official CNPG PostgreSQL 18 operand image:
 spec:
   imageName: ghcr.io/cloudnative-pg/postgresql:18
   postgresql:
-    shared_preload_libraries: [pg_stream]
+    shared_preload_libraries: [pg_trickle]
     extensions:
-      - name: pg-stream
+      - name: pg-trickle
         image:
-          reference: ghcr.io/grove/pg_stream-ext:0.1.1
+          reference: ghcr.io/grove/pg_trickle-ext:0.1.1
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and [cnpg/database-example.yaml](cnpg/database-example.yaml) for complete examples. Requires Kubernetes 1.33+ and CNPG 1.28+.
@@ -167,7 +167,7 @@ INSERT INTO orders VALUES
     (3, 'US', 300), (4, 'APAC', 50);
 
 -- Create a stream table with 1-minute schedule
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'regional_totals',
     'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
      FROM orders GROUP BY region',
@@ -176,7 +176,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Or use a cron schedule (e.g., every hour)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'hourly_totals',
     'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
     '@hourly',
@@ -187,16 +187,16 @@ SELECT pgstream.create_stream_table(
 SELECT * FROM regional_totals;
 
 -- Manual refresh (scheduler also refreshes automatically)
-SELECT pgstream.refresh_stream_table('regional_totals');
+SELECT pgtrickle.refresh_stream_table('regional_totals');
 
 -- Check status
-SELECT * FROM pgstream.pgs_status();
+SELECT * FROM pgtrickle.pgt_status();
 
 -- View monitoring stats
-SELECT * FROM pgstream.pg_stat_stream_tables;
+SELECT * FROM pgtrickle.pg_stat_stream_tables;
 
 -- Drop when no longer needed
-SELECT pgstream.drop_stream_table('regional_totals');
+SELECT pgtrickle.drop_stream_table('regional_totals');
 ```
 
 ## Documentation
@@ -215,7 +215,7 @@ SELECT pgstream.drop_stream_table('regional_totals');
 
 | Document | Description |
 |---|---|
-| [plans/sql/PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) | Plan for `CREATE MATERIALIZED VIEW ... WITH (pgstream.stream)` syntax |
+| [plans/sql/PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) | Plan for `CREATE MATERIALIZED VIEW ... WITH (pgtrickle.stream)` syntax |
 | [docs/research/CUSTOM_SQL_SYNTAX.md](docs/research/CUSTOM_SQL_SYNTAX.md) | Research: PostgreSQL extension syntax mechanisms |
 
 ### Deep-Dive Tutorials
@@ -248,18 +248,18 @@ Stream tables are regular PostgreSQL heap tables, but their contents are managed
 | ST references other STs | ✅ Yes | DAG-ordered refresh; cycles are rejected |
 | Views reference STs | ✅ Yes | Standard PostgreSQL views work normally |
 | Materialized views reference STs | ✅ Yes | Requires separate `REFRESH MATERIALIZED VIEW` |
-| Logical replication of STs | ✅ Yes | `__pgs_row_id` column is replicated; subscribers receive materialized data only |
+| Logical replication of STs | ✅ Yes | `__pgt_row_id` column is replicated; subscribers receive materialized data only |
 | Direct DML on STs | ❌ No | Contents managed by the refresh engine |
 | Foreign keys on STs | ❌ No | Bulk `MERGE` during refresh does not respect FK ordering |
-| User triggers on STs | ✅ Supported | Supported in DIFFERENTIAL mode; suppressed during FULL refresh (see `pg_stream.user_triggers` GUC) |
+| User triggers on STs | ✅ Supported | Supported in DIFFERENTIAL mode; suppressed during FULL refresh (see `pg_trickle.user_triggers` GUC) |
 
 See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#restrictions--interoperability) for details and examples.
 
 ## How It Works
 
-1. **Create** — `pgstream.create_stream_table()` parses the defining query into an operator tree, creates a storage table, installs lightweight CDC triggers on source tables, and registers the ST in the catalog.
+1. **Create** — `pgtrickle.create_stream_table()` parses the defining query into an operator tree, creates a storage table, installs lightweight CDC triggers on source tables, and registers the ST in the catalog.
 
-2. **Capture** — Changes to base tables are captured via the hybrid CDC layer. By default, `AFTER INSERT/UPDATE/DELETE` row-level triggers write to per-source change buffer tables in the `pgstream_changes` schema. With `pg_stream.cdc_mode = 'auto'`, the system transitions to WAL-based capture (logical replication) after the first successful refresh for lower write-side overhead.
+2. **Capture** — Changes to base tables are captured via the hybrid CDC layer. By default, `AFTER INSERT/UPDATE/DELETE` row-level triggers write to per-source change buffer tables in the `pgtrickle_changes` schema. With `pg_trickle.cdc_mode = 'auto'`, the system transitions to WAL-based capture (logical replication) after the first successful refresh for lower write-side overhead.
 
 3. **Schedule** — A background worker wakes periodically (default: 1s) and checks which STs have exceeded their schedule (or whose cron schedule has fired). STs are scheduled for refresh in topological order.
 
@@ -276,7 +276,7 @@ See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#re
 │              PostgreSQL 18                  │
 │                                             │
 │  ┌─────────┐    ┌──────────┐   ┌─────────┐  │
-│  │  Source │    │  Stream  │   │pg_stream│  │
+│  │  Source │    │  Stream  │   │pg_trickle│  │
 │  │  Tables │───▸│  Tables  │   │ Catalog │  │
 │  └────┬────┘    └──────────┘   └─────────┘  │
 │       │                                     │
@@ -287,7 +287,7 @@ See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#re
 │       │                                     │
 │  ┌────▼─────────────────────────────┐       │
 │  │     Change Buffer Tables         │       │
-│  │     pgstream_changes schema      │       │
+│  │     pgtrickle_changes schema      │       │
 │  └────┬─────────────────────────────┘       │
 │       │                                     │
 │  ┌────▼─────────────────────────────┐       │

@@ -20,7 +20,7 @@ assignees: ""
 
 | Item | Value |
 |------|-------|
-| pg_stream version | |
+| pg_trickle version | |
 | PostgreSQL version | |
 | OS / platform | |
 | Deployment | bare metal / Docker / CNPG / other |

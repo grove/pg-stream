@@ -1,13 +1,13 @@
-# pg_stream
+# pg_trickle
 
-**pg_stream** is a PostgreSQL 18 extension that turns ordinary SQL views into
+**pg_trickle** is a PostgreSQL 18 extension that turns ordinary SQL views into
 self-maintaining stream tables — no external processes, no sidecars, no
-bespoke refresh pipelines. Just `CREATE EXTENSION pg_stream` and your views
+bespoke refresh pipelines. Just `CREATE EXTENSION pg_trickle` and your views
 stay fresh.
 
 ```sql
 -- Declare a stream table — a view that maintains itself
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'active_orders',
     'SELECT * FROM orders WHERE status = ''active''',
     '30s'
@@ -26,12 +26,12 @@ only one row changed in a million-row table. Your choices are: burn CPU on
 full recomputation, or accept stale data. Most teams end up building bespoke
 refresh pipelines just to keep summary tables current.
 
-## What pg_stream does differently
+## What pg_trickle does differently
 
-pg_stream captures changes to your source tables and — on each refresh cycle
+pg_trickle captures changes to your source tables and — on each refresh cycle
 — derives a *delta query* that processes only the changed rows and merges the
 result into the materialized table. One insert into a million-row source table?
-pg_stream touches exactly one row's worth of computation.
+pg_trickle touches exactly one row's worth of computation.
 
 The approach is grounded in the [DBSP differential dataflow framework](https://arxiv.org/abs/2203.16684)
 (Budiu et al., 2022). Delta queries are derived automatically from your SQL's
@@ -62,7 +62,7 @@ the entire pipeline adjusts without manual coordination.
 
 ## Hybrid change capture
 
-pg_stream bootstraps with lightweight row-level triggers — no configuration
+pg_trickle bootstraps with lightweight row-level triggers — no configuration
 needed, works out of the box. Once the first refresh succeeds and
 `wal_level = logical` is available, the system automatically transitions to
 WAL-based logical replication for lower write-side overhead. The transition
@@ -85,7 +85,7 @@ falls back to triggers.
 Written in Rust using [pgrx](https://github.com/pgcentralfoundation/pgrx).
 Targets PostgreSQL 18. Apache 2.0 licensed.
 
-- Repository: [github.com/grove/pg-stream](https://github.com/grove/pg-stream)
+- Repository: [github.com/grove/pg-trickle](https://github.com/grove/pg-trickle)
 - Install instructions: [Installation](installation.md)
 - Changelog: [Changelog](changelog.md)
 - Roadmap: [Roadmap](roadmap.md)

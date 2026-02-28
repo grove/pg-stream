@@ -1,7 +1,7 @@
 //! E2E tests for monitoring views and status functions.
 //!
-//! Validates `pgstream.pgs_status()`, `pgstream.stream_tables_info`,
-//! `pgstream.pg_stat_stream_tables`, and refresh history recording.
+//! Validates `pgtrickle.pgt_status()`, `pgtrickle.stream_tables_info`,
+//! `pgtrickle.pg_stat_stream_tables`, and refresh history recording.
 //!
 //! Prerequisites: `./tests/build_e2e_image.sh`
 
@@ -10,7 +10,7 @@ mod e2e;
 use e2e::E2eDb;
 
 #[tokio::test]
-async fn test_pgs_status_returns_rows() {
+async fn test_pgt_status_returns_rows() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE mon_src (id INT PRIMARY KEY)")
@@ -21,12 +21,12 @@ async fn test_pgs_status_returns_rows() {
         .await;
 
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_status()")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_status()")
         .await;
-    assert!(count >= 1, "pgs_status() should return at least 1 row");
+    assert!(count >= 1, "pgt_status() should return at least 1 row");
 
     // Verify the row contents
-    let (status, mode, populated, errors) = db.pgs_status("mon_st").await;
+    let (status, mode, populated, errors) = db.pgt_status("mon_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "FULL");
     assert!(populated);
@@ -34,7 +34,7 @@ async fn test_pgs_status_returns_rows() {
 }
 
 #[tokio::test]
-async fn test_pgs_status_multiple_sts() {
+async fn test_pgt_status_multiple_sts() {
     let db = E2eDb::new().await.with_extension().await;
 
     for i in 1..=3 {
@@ -55,9 +55,9 @@ async fn test_pgs_status_multiple_sts() {
     }
 
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_status()")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_status()")
         .await;
-    assert_eq!(count, 3, "pgs_status() should return 3 rows");
+    assert_eq!(count, 3, "pgt_status() should return 3 rows");
 }
 
 #[tokio::test]
@@ -79,8 +79,8 @@ async fn test_stream_tables_info_view() {
     let has_row: bool = db
         .query_scalar(
             "SELECT EXISTS( \
-                SELECT 1 FROM pgstream.stream_tables_info \
-                WHERE pgs_name = 'mon_info_st' \
+                SELECT 1 FROM pgtrickle.stream_tables_info \
+                WHERE pgt_name = 'mon_info_st' \
             )",
         )
         .await;
@@ -89,8 +89,8 @@ async fn test_stream_tables_info_view() {
     // Verify staleness and stale columns exist and are queryable
     let stale: bool = db
         .query_scalar(
-            "SELECT COALESCE(stale, false) FROM pgstream.stream_tables_info \
-             WHERE pgs_name = 'mon_info_st'",
+            "SELECT COALESCE(stale, false) FROM pgtrickle.stream_tables_info \
+             WHERE pgt_name = 'mon_info_st'",
         )
         .await;
     // Just after refresh, staleness should not exceed schedule
@@ -116,8 +116,8 @@ async fn test_pg_stat_stream_tables_view() {
     let has_row: bool = db
         .query_scalar(
             "SELECT EXISTS( \
-                SELECT 1 FROM pgstream.pg_stat_stream_tables \
-                WHERE pgs_name = 'mon_stat_st' \
+                SELECT 1 FROM pgtrickle.pg_stat_stream_tables \
+                WHERE pgt_name = 'mon_stat_st' \
             )",
         )
         .await;
@@ -126,7 +126,7 @@ async fn test_pg_stat_stream_tables_view() {
     // Verify key columns exist and are queryable
     let status: String = db
         .query_scalar(
-            "SELECT status FROM pgstream.pg_stat_stream_tables WHERE pgs_name = 'mon_stat_st'",
+            "SELECT status FROM pgtrickle.pg_stat_stream_tables WHERE pgt_name = 'mon_stat_st'",
         )
         .await;
     assert_eq!(status, "ACTIVE");
@@ -135,7 +135,7 @@ async fn test_pg_stat_stream_tables_view() {
     // only the scheduler does. Verify the column is queryable.
     let total: i64 = db
         .query_scalar(
-            "SELECT total_refreshes FROM pgstream.pg_stat_stream_tables WHERE pgs_name = 'mon_stat_st'",
+            "SELECT total_refreshes FROM pgtrickle.pg_stat_stream_tables WHERE pgt_name = 'mon_stat_st'",
         )
         .await;
     assert!(
@@ -160,8 +160,8 @@ async fn test_stale_detection() {
     // Right after initial populate, staleness should be very small.
     let has_staleness: bool = db
         .query_scalar(
-            "SELECT staleness IS NOT NULL FROM pgstream.stream_tables_info \
-             WHERE pgs_name = 'mon_sched_st'",
+            "SELECT staleness IS NOT NULL FROM pgtrickle.stream_tables_info \
+             WHERE pgt_name = 'mon_sched_st'",
         )
         .await;
     assert!(
@@ -172,8 +172,8 @@ async fn test_stale_detection() {
     // stale should be false right after creation (schedule=60s)
     let stale: bool = db
         .query_scalar(
-            "SELECT COALESCE(stale, false) FROM pgstream.stream_tables_info \
-             WHERE pgs_name = 'mon_sched_st'",
+            "SELECT COALESCE(stale, false) FROM pgtrickle.stream_tables_info \
+             WHERE pgt_name = 'mon_sched_st'",
         )
         .await;
     assert!(!stale, "stale should be false immediately after creation");
@@ -197,21 +197,21 @@ async fn test_refresh_history_records() {
         db.refresh_st("mon_hist_st").await;
     }
 
-    // Manual refresh doesn't write to pgs_refresh_history (only scheduler does).
+    // Manual refresh doesn't write to pgt_refresh_history (only scheduler does).
     // Verify the table exists and is queryable.
-    let table_exists = db.table_exists("pgstream", "pgs_refresh_history").await;
-    assert!(table_exists, "pgs_refresh_history table should exist");
+    let table_exists = db.table_exists("pgtrickle", "pgt_refresh_history").await;
+    assert!(table_exists, "pgt_refresh_history table should exist");
 
     // Verify the history table has the expected columns
     let col_count: i64 = db
         .query_scalar(
             "SELECT count(*) FROM information_schema.columns \
-             WHERE table_schema = 'pgstream' AND table_name = 'pgs_refresh_history'",
+             WHERE table_schema = 'pgtrickle' AND table_name = 'pgt_refresh_history'",
         )
         .await;
     assert!(
         col_count >= 5,
-        "pgs_refresh_history should have at least 5 columns, got {}",
+        "pgt_refresh_history should have at least 5 columns, got {}",
         col_count,
     );
 

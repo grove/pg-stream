@@ -1,4 +1,4 @@
-name: 'dbt_pgstream_integration_tests'
+name: 'dbt_pgtrickle_integration_tests'
 version: '0.1.0'
 config-version: 2
 

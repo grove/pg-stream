@@ -35,17 +35,17 @@ use crate::dvm::operators::join_common::{
     build_base_table_key_exprs, build_snapshot_sql, is_simple_child, rewrite_join_condition,
 };
 use crate::dvm::parser::{Expr, OpTree};
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate an InnerJoin node.
-pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::InnerJoin {
         condition,
         left,
         right,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_inner_join called on non-InnerJoin node".into(),
         ));
     };
@@ -127,27 +127,27 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         .join(", ");
 
     // Row ID: hash of both child row IDs.
-    // For the delta side, we use __pgs_row_id from the delta CTE.
+    // For the delta side, we use __pgt_row_id from the delta CTE.
     // For the base table side, we hash its PK/non-nullable columns
     // instead of serializing the entire row with row_to_json().
     //
-    // S1 optimization: flatten into a single pg_stream_hash_multi call with
+    // S1 optimization: flatten into a single pg_trickle_hash_multi call with
     // all key columns inline, avoiding nested hash calls.
     // For nested join children, falls back to row_to_json for the snapshot side.
     let right_key_exprs = build_base_table_key_exprs(right, "r");
     let left_key_exprs = build_base_table_key_exprs(left, "l");
 
-    let mut hash1_args = vec!["dl.__pgs_row_id::TEXT".to_string()];
+    let mut hash1_args = vec!["dl.__pgt_row_id::TEXT".to_string()];
     hash1_args.extend(right_key_exprs);
     let hash_part1 = format!(
-        "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+        "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
         hash1_args.join(", ")
     );
 
     let mut hash2_args = left_key_exprs;
-    hash2_args.push("dr.__pgs_row_id::TEXT".to_string());
+    hash2_args.push("dr.__pgt_row_id::TEXT".to_string());
     let hash_part2 = format!(
-        "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+        "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
         hash2_args.join(", ")
     );
 
@@ -209,9 +209,9 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         let left_pre_change = format!(
             "(SELECT {left_data_cols} FROM {left_table} {la} \
              EXCEPT ALL \
-             SELECT {left_data_cols} FROM {delta_left} WHERE __pgs_action = 'I' \
+             SELECT {left_data_cols} FROM {delta_left} WHERE __pgt_action = 'I' \
              UNION ALL \
-             SELECT {left_data_cols} FROM {delta_left} WHERE __pgs_action = 'D')",
+             SELECT {left_data_cols} FROM {delta_left} WHERE __pgt_action = 'D')",
             la = quote_ident(left_alias),
             delta_left = left_result.cte_name,
         );
@@ -249,8 +249,8 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     let sql = format!(
         "\
 -- Part 1: delta_left JOIN current_right (semi-join filtered)
-SELECT {hash_part1} AS __pgs_row_id,
-       dl.__pgs_action,
+SELECT {hash_part1} AS __pgt_row_id,
+       dl.__pgt_action,
        {all_cols_part1}
 FROM {delta_left} dl
 JOIN {right_table_filtered} r ON {join_cond_part1}
@@ -260,8 +260,8 @@ UNION ALL
 -- Part 2: pre-change_left JOIN delta_right
 -- For Scan children: L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
 -- For nested joins: L₁ = current snapshot (semi-join filtered)
-SELECT {hash_part2} AS __pgs_row_id,
-       dr.__pgs_action,
+SELECT {hash_part2} AS __pgt_row_id,
+       dr.__pgt_action,
        {all_cols_part2}
 FROM {left_part2_source} l
 JOIN {delta_right} dr ON {join_cond_part2}",
@@ -435,8 +435,8 @@ mod tests {
 
         // Part 2 should use L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
         assert_sql_contains(&sql, "EXCEPT ALL");
-        assert_sql_contains(&sql, "__pgs_action = 'I'");
-        assert_sql_contains(&sql, "__pgs_action = 'D'");
+        assert_sql_contains(&sql, "__pgt_action = 'I'");
+        assert_sql_contains(&sql, "__pgt_action = 'D'");
     }
 
     #[test]
@@ -493,7 +493,7 @@ mod tests {
         let result = build_semijoin_subquery(
             "\"public\".\"customers\"",
             &keys,
-            "__pgs_cte_scan_1",
+            "__pgt_cte_scan_1",
             JoinSide::Right,
         );
         assert!(result.contains("SELECT *"));
@@ -506,7 +506,7 @@ mod tests {
         let result = build_semijoin_subquery(
             "\"public\".\"customers\"",
             &[],
-            "__pgs_cte_1",
+            "__pgt_cte_1",
             JoinSide::Right,
         );
         assert_eq!(result, "\"public\".\"customers\"");

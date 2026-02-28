@@ -2,19 +2,19 @@
 
 > **Status:** Draft  
 > **Target version:** v1.0.0  
-> **Author:** pg_stream project
+> **Author:** pg_trickle project
 
 ---
 
 ## 1. Overview
 
 Publish an official Docker image to Docker Hub at
-`pgstream/pg_stream:<tag>` containing PostgreSQL 18 with the pg_stream
+`pgtrickle/pg_trickle:<tag>` containing PostgreSQL 18 with the pg_trickle
 extension pre-installed and pre-configured.
 
 The image is aimed at:
 - Quick local evaluation (`docker run`)
-- CI/CD matrices (replace `postgres:18` with `pgstream/pg_stream:pg18`)
+- CI/CD matrices (replace `postgres:18` with `pgtrickle/pg_trickle:pg18`)
 - Kubernetes deployments (base image for CNPG `additionalPlugins`)
 
 ---
@@ -59,15 +59,15 @@ FROM postgres:${PG_VERSION}-bookworm
 
 ARG PG_VERSION
 
-COPY --from=builder /tmp/pkg/usr/lib/postgresql/${PG_VERSION}/lib/pg_stream.so \
+COPY --from=builder /tmp/pkg/usr/lib/postgresql/${PG_VERSION}/lib/pg_trickle.so \
      /usr/lib/postgresql/${PG_VERSION}/lib/
 
 COPY --from=builder /tmp/pkg/usr/share/postgresql/${PG_VERSION}/extension/ \
      /usr/share/postgresql/${PG_VERSION}/extension/
 
 # Auto-load the extension for convenience in development
-RUN echo "shared_preload_libraries = 'pg_stream'" >> /usr/share/postgresql/postgresql.conf.sample
-RUN echo "pg_stream.enabled = on"                 >> /usr/share/postgresql/postgresql.conf.sample
+RUN echo "shared_preload_libraries = 'pg_trickle'" >> /usr/share/postgresql/postgresql.conf.sample
+RUN echo "pg_trickle.enabled = on"                 >> /usr/share/postgresql/postgresql.conf.sample
 
 COPY docker-entrypoint-initdb.d/ /docker-entrypoint-initdb.d/
 
@@ -75,11 +75,11 @@ HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
   CMD pg_isready -U "${POSTGRES_USER:-postgres}" || exit 1
 ```
 
-### `docker-entrypoint-initdb.d/01-pg_stream.sql`
+### `docker-entrypoint-initdb.d/01-pg_trickle.sql`
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS pg_stream;
-SELECT pgstream.version();
+CREATE EXTENSION IF NOT EXISTS pg_trickle;
+SELECT pgtrickle.version();
 ```
 
 ---
@@ -92,9 +92,9 @@ Use Docker Buildx to produce `linux/amd64` and `linux/arm64` manifests:
 docker buildx create --use --name multi-arch
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  --tag pgstream/pg_stream:1.0.0-pg18 \
-  --tag pgstream/pg_stream:pg18 \
-  --tag pgstream/pg_stream:latest \
+  --tag pgtrickle/pg_trickle:1.0.0-pg18 \
+  --tag pgtrickle/pg_trickle:pg18 \
+  --tag pgtrickle/pg_trickle:latest \
   --push .
 ```
 
@@ -106,7 +106,7 @@ docker buildx build \
 |-----|---------|
 | `latest` | Latest stable + latest supported PG |
 | `pg18` | Latest stable on PostgreSQL 18 |
-| `1.0.0-pg18` | Exact pg_stream version + PG version |
+| `1.0.0-pg18` | Exact pg_trickle version + PG version |
 | `0.2.0-pg18` | Pinned pre-release |
 
 Major releases also get a floating `1-pg18` tag pointing to the latest 1.x.y.
@@ -147,9 +147,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            pgstream/pg_stream:latest
-            pgstream/pg_stream:pg18
-            pgstream/pg_stream:${{ github.ref_name }}-pg18
+            pgtrickle/pg_trickle:latest
+            pgtrickle/pg_trickle:pg18
+            pgtrickle/pg_trickle:${{ github.ref_name }}-pg18
 ```
 
 ---
@@ -171,15 +171,15 @@ The `builder` stage in the official image should be kept in sync with
 
 ```bash
 docker run --rm -e POSTGRES_PASSWORD=test \
-  pgstream/pg_stream:latest \
-  postgres -c "shared_preload_libraries=pg_stream" &
+  pgtrickle/pg_trickle:latest \
+  postgres -c "shared_preload_libraries=pg_trickle" &
 
 sleep 3
 docker exec <cid> psql -U postgres -c "
-  CREATE EXTENSION pg_stream;
+  CREATE EXTENSION pg_trickle;
   CREATE TABLE src (id int primary key, v int);
-  SELECT pgstream.create_stream_table('agg', 'SELECT sum(v) FROM src');
-  SELECT pgstream.version();
+  SELECT pgtrickle.create_stream_table('agg', 'SELECT sum(v) FROM src');
+  SELECT pgtrickle.version();
 "
 ```
 

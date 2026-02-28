@@ -9,17 +9,17 @@
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::{build_snapshot_sql, rewrite_join_condition};
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a LeftJoin node.
-pub fn diff_left_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_left_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::LeftJoin {
         condition,
         left,
         right,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_left_join called on non-LeftJoin node".into(),
         ));
     };
@@ -132,8 +132,8 @@ pub fn diff_left_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     ctx.add_cte(
         flags_cte.clone(),
         format!(
-            "SELECT bool_or(__pgs_action = 'I') AS has_ins,\
-                    bool_or(__pgs_action = 'D') AS has_del \
+            "SELECT bool_or(__pgt_action = 'I') AS has_ins,\
+                    bool_or(__pgt_action = 'D') AS has_del \
              FROM {delta_right}",
             delta_right = right_result.cte_name,
         ),
@@ -144,8 +144,8 @@ pub fn diff_left_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     let sql = format!(
         "\
 -- Part 1: delta_left JOIN current_right (matching rows)
-SELECT pgstream.pg_stream_hash_multi(ARRAY[dl.__pgs_row_id::TEXT, pgstream.pg_stream_hash(row_to_json(r)::text)::TEXT]) AS __pgs_row_id,
-       dl.__pgs_action,
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, pgtrickle.pg_trickle_hash(row_to_json(r)::text)::TEXT]) AS __pgt_row_id,
+       dl.__pgt_action,
        {part1_cols}
 FROM {delta_left} dl
 JOIN {right_table} r ON {join_cond_part1}
@@ -153,8 +153,8 @@ JOIN {right_table} r ON {join_cond_part1}
 UNION ALL
 
 -- Part 2: current_left JOIN delta_right
-SELECT pgstream.pg_stream_hash_multi(ARRAY[pgstream.pg_stream_hash(row_to_json(l)::text)::TEXT, dr.__pgs_row_id::TEXT]) AS __pgs_row_id,
-       dr.__pgs_action,
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[pgtrickle.pg_trickle_hash(row_to_json(l)::text)::TEXT, dr.__pgt_row_id::TEXT]) AS __pgt_row_id,
+       dr.__pgt_action,
        {part2_cols}
 FROM {left_table} l
 JOIN {delta_right} dr ON {join_cond_part2}
@@ -162,8 +162,8 @@ JOIN {delta_right} dr ON {join_cond_part2}
 UNION ALL
 
 -- Part 3: delta_left anti-join right (non-matching left rows get NULL right cols)
-SELECT dl.__pgs_row_id,
-       dl.__pgs_action,
+SELECT dl.__pgt_row_id,
+       dl.__pgt_action,
        {antijoin_cols}
 FROM {delta_left} dl
 WHERE NOT EXISTS (
@@ -177,12 +177,12 @@ UNION ALL
 -- left row, the NULL-padded ST row must be removed. We emit DELETE for
 -- the NULL-padded combination; if it doesn't exist in the ST, the MERGE
 -- ignores it (NOT MATCHED + action='D' → no-op).
-SELECT 0::BIGINT AS __pgs_row_id,
-       'D'::TEXT AS __pgs_action,
+SELECT 0::BIGINT AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
        {l_null_padded_cols}
 FROM {left_table} l
 JOIN {delta_right} dr ON {join_cond_part2}
-WHERE dr.__pgs_action = 'I'
+WHERE dr.__pgt_action = 'I'
   AND (SELECT has_ins FROM {flags_cte})
 
 UNION ALL
@@ -191,12 +191,12 @@ UNION ALL
 -- When a right DELETE removes the last match for an existing left row,
 -- the left row reverts to NULL-padded. Check current right (post-changes)
 -- to verify no remaining matches exist.
-SELECT 0::BIGINT AS __pgs_row_id,
-       'I'::TEXT AS __pgs_action,
+SELECT 0::BIGINT AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
        {l_null_padded_cols}
 FROM {left_table} l
 JOIN {delta_right} dr ON {join_cond_part2}
-WHERE dr.__pgs_action = 'D'
+WHERE dr.__pgt_action = 'D'
   AND (SELECT has_del FROM {flags_cte})
   AND NOT EXISTS (
     SELECT 1 FROM {right_table} r WHERE {not_exists_cond}

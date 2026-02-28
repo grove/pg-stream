@@ -141,7 +141,7 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-  # ── dbt-pgstream integration tests (Linux only) ──────────────────────────
+  # ── dbt-pgtrickle integration tests (Linux only) ──────────────────────────
   # Cost-optimized: single job builds the Docker image once, then tests
   # against dbt-core min (1.6) and max (1.9). Intermediate versions are
   # skipped — if both boundary versions pass, the middle ones will too.
@@ -157,18 +157,18 @@ jobs:
       - name: Build E2E Docker image
         run: ./tests/build_e2e_image.sh
 
-      - name: Start PostgreSQL with pg_stream
+      - name: Start PostgreSQL with pg_trickle
         run: |
           docker run -d \
-            --name pgstream-dbt-test \
+            --name pgtrickle-dbt-test \
             -e POSTGRES_PASSWORD=postgres \
             -p 5432:5432 \
-            pg_stream_e2e:latest
+            pg_trickle_e2e:latest
 
           # Wait for PostgreSQL to accept connections
           echo "Waiting for PostgreSQL to be ready..."
           for i in $(seq 1 30); do
-            if docker exec pgstream-dbt-test \
+            if docker exec pgtrickle-dbt-test \
               pg_isready -U postgres -q 2>/dev/null; then
               echo "PostgreSQL is ready (attempt $i)"
               break
@@ -176,10 +176,10 @@ jobs:
             sleep 1
           done
 
-      - name: Create pg_stream extension
+      - name: Create pg_trickle extension
         run: |
-          docker exec pgstream-dbt-test \
-            psql -U postgres -c "CREATE EXTENSION pg_stream;"
+          docker exec pgtrickle-dbt-test \
+            psql -U postgres -c "CREATE EXTENSION pg_trickle;"
 
       - uses: actions/setup-python@v5
         with:
@@ -196,7 +196,7 @@ jobs:
           pip install "dbt-core~=1.6.0" "dbt-postgres~=1.6.0"
           echo "=== dbt version ==="
           dbt --version
-          cd dbt-pgstream/integration_tests
+          cd dbt-pgtrickle/integration_tests
           dbt deps
           dbt seed
           dbt run
@@ -205,8 +205,8 @@ jobs:
           dbt run --full-refresh
           ./scripts/wait_for_populated.sh order_totals 30
           dbt test
-          dbt run-operation pgstream_refresh --args '{model_name: order_totals}'
-          dbt run-operation pgstream_check_freshness
+          dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgtrickle_check_freshness
           dbt run-operation drop_all_stream_tables
 
       - name: Test with dbt 1.9 (latest supported)
@@ -220,7 +220,7 @@ jobs:
           pip install "dbt-core~=1.9.0" "dbt-postgres~=1.9.0"
           echo "=== dbt version ==="
           dbt --version
-          cd dbt-pgstream/integration_tests
+          cd dbt-pgtrickle/integration_tests
           dbt deps
           dbt seed
           dbt run
@@ -229,13 +229,13 @@ jobs:
           dbt run --full-refresh
           ./scripts/wait_for_populated.sh order_totals 30
           dbt test
-          dbt run-operation pgstream_refresh --args '{model_name: order_totals}'
-          dbt run-operation pgstream_check_freshness
+          dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgtrickle_check_freshness
           dbt run-operation drop_all_stream_tables
 
       - name: Cleanup
         if: always()
-        run: docker rm -f pgstream-dbt-test 2>/dev/null || true
+        run: docker rm -f pgtrickle-dbt-test 2>/dev/null || true
 
   # ── CloudNativePG smoke test (non-blocking, Linux only) ─────────────────
   # Runs on weekly schedule and manual dispatch only (requires kind cluster).
@@ -264,12 +264,12 @@ jobs:
 
       - name: Build extension image (scratch-based)
         run: |
-          docker build -t pg_stream-ext:ci \
+          docker build -t pg_trickle-ext:ci \
             -f cnpg/Dockerfile.ext-build .
 
       - name: Verify extension image layout
         run: |
-          ID=$(docker create pg_stream-ext:ci true)
+          ID=$(docker create pg_trickle-ext:ci true)
           mkdir -p /tmp/ext-verify
           docker cp "$ID:/lib/" /tmp/ext-verify/lib/
           docker cp "$ID:/share/" /tmp/ext-verify/share/
@@ -279,9 +279,9 @@ jobs:
           find /tmp/ext-verify -type f
           echo "==============================="
 
-          test -f /tmp/ext-verify/lib/pg_stream.so
-          test -f /tmp/ext-verify/share/extension/pg_stream.control
-          ls /tmp/ext-verify/share/extension/pg_stream--*.sql
+          test -f /tmp/ext-verify/lib/pg_trickle.so
+          test -f /tmp/ext-verify/share/extension/pg_trickle.control
+          ls /tmp/ext-verify/share/extension/pg_trickle--*.sql
 
           echo "Extension image layout OK"
 
@@ -291,16 +291,16 @@ jobs:
           # until kind supports K8s 1.33 ImageVolume feature gate.
           # This image is NOT shipped — only used for CI validation.
           cat > /tmp/Dockerfile.cnpg-smoke <<'DOCKERFILE'
-          FROM pg_stream-ext:ci AS ext
+          FROM pg_trickle-ext:ci AS ext
           FROM postgres:18.1
           COPY --from=ext /lib/ /usr/lib/postgresql/18/lib/
           COPY --from=ext /share/extension/ /usr/share/postgresql/18/extension/
           DOCKERFILE
 
-          docker build -t pg_stream:18.1 -f /tmp/Dockerfile.cnpg-smoke .
+          docker build -t pg_trickle:18.1 -f /tmp/Dockerfile.cnpg-smoke .
 
       - name: Load image into kind
-        run: kind load docker-image pg_stream:18.1 --name cnpg-test
+        run: kind load docker-image pg_trickle:18.1 --name cnpg-test
 
       - name: Install CNPG operator
         run: |
@@ -327,10 +327,10 @@ jobs:
           apiVersion: postgresql.cnpg.io/v1
           kind: Cluster
           metadata:
-            name: pg-stream-demo
+            name: pg-trickle-demo
           spec:
             instances: 1
-            imageName: pg_stream:18.1
+            imageName: pg_trickle:18.1
             imagePullPolicy: Never
             bootstrap:
               initdb:
@@ -344,16 +344,16 @@ jobs:
       - name: Wait for cluster primary pod
         run: |
           echo "Waiting for CNPG Cluster to be ready (up to 8 min)..."
-          kubectl wait cluster/pg-stream-demo \
+          kubectl wait cluster/pg-trickle-demo \
             --for=condition=Ready \
             --timeout=480s || {
               echo "--- Cluster status ---"
-              kubectl describe cluster/pg-stream-demo | tail -40
+              kubectl describe cluster/pg-trickle-demo | tail -40
               echo "--- Pod status ---"
-              kubectl get pods -l cnpg.io/cluster=pg-stream-demo -o wide
+              kubectl get pods -l cnpg.io/cluster=pg-trickle-demo -o wide
               echo "--- Initdb pod logs (most recent) ---"
               FAILED_POD=$(kubectl get pods \
-                -l cnpg.io/cluster=pg-stream-demo \
+                -l cnpg.io/cluster=pg-trickle-demo \
                 --field-selector=status.phase=Failed \
                 -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || true)
               if [[ -n "$FAILED_POD" ]]; then
@@ -365,20 +365,20 @@ jobs:
 
           echo "Waiting for primary pod to be Ready (up to 3 min)..."
           kubectl wait pods \
-            -l cnpg.io/cluster=pg-stream-demo,role=primary \
+            -l cnpg.io/cluster=pg-trickle-demo,role=primary \
             --for=condition=Ready \
             --timeout=180s
 
       - name: Run CNPG smoke test
         run: |
           PRIMARY=$(kubectl get pods \
-            -l cnpg.io/cluster=pg-stream-demo \
+            -l cnpg.io/cluster=pg-trickle-demo \
             -l role=primary \
             -o jsonpath='{.items[0].metadata.name}')
 
           if [[ -z "$PRIMARY" ]]; then
             echo "ERROR: no primary pod found"
-            kubectl get pods -l cnpg.io/cluster=pg-stream-demo
+            kubectl get pods -l cnpg.io/cluster=pg-trickle-demo
             exit 1
           fi
 
@@ -388,10 +388,10 @@ jobs:
           #
           # Why one session? Without shared_preload_libraries the extension
           # .so is loaded dynamically when CREATE EXTENSION runs. PostgreSQL
-          # only registers GUCs (SHOW pg_stream.*) for the lifetime of the
+          # only registers GUCs (SHOW pg_trickle.*) for the lifetime of the
           # connection that triggered the dynamic load. Separate kubectl exec
           # calls each start a new backend that hasn't loaded the library yet,
-          # so SHOW pg_stream.enabled returns "unrecognized configuration parameter".
+          # so SHOW pg_trickle.enabled returns "unrecognized configuration parameter".
           # Consolidating into one session avoids this limitation entirely.
           #
           # Note: heredoc (<<EOF) is avoided here because GitHub Actions YAML
@@ -399,19 +399,19 @@ jobs:
           # causing a syntax error. Use -c with a multi-line string instead.
           kubectl exec "${PRIMARY}" -- \
             psql -U postgres -d app -v ON_ERROR_STOP=1 -c "
-              CREATE EXTENSION pg_stream;
-              SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';
-              SHOW pg_stream.enabled;
+              CREATE EXTENSION pg_trickle;
+              SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';
+              SHOW pg_trickle.enabled;
               CREATE TABLE cnpg_test_src (id INT PRIMARY KEY, val TEXT);
               INSERT INTO cnpg_test_src VALUES (1, 'hello');
-              SELECT pgstream.create_stream_table(
+              SELECT pgtrickle.create_stream_table(
                   'cnpg_test_dt',
                   'SELECT id, val FROM cnpg_test_src',
                   '1m',
                   'FULL'
               );
               SELECT * FROM cnpg_test_dt;
-              SELECT pgstream.drop_stream_table('cnpg_test_dt');
+              SELECT pgtrickle.drop_stream_table('cnpg_test_dt');
               DROP TABLE cnpg_test_src;
             "
 

@@ -4,7 +4,7 @@
 
 ## Problem Statement
 
-pg_stream supports set-returning functions in the FROM clause (`jsonb_array_elements`, `unnest`, etc.) via `T_RangeFunction` parsing and the `LateralFunction` operator. However, **explicit LATERAL subqueries** are not supported:
+pg_trickle supports set-returning functions in the FROM clause (`jsonb_array_elements`, `unnest`, etc.) via `T_RangeFunction` parsing and the `LateralFunction` operator. However, **explicit LATERAL subqueries** are not supported:
 
 ```sql
 -- ❌ Currently fails or produces incorrect results
@@ -169,7 +169,7 @@ The helper needs to handle:
 /// Caller must ensure `stmt` points to a valid `pg_sys::SelectStmt`.
 unsafe fn deparse_select_stmt_to_sql(
     stmt: *const pg_sys::SelectStmt,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     let s = unsafe { &*stmt };
     let mut parts = Vec::new();
 
@@ -236,7 +236,7 @@ These helpers reuse existing `node_to_expr()` for expressions and `extract_func_
 
 ```rust
 /// Deparse a SortBy node to SQL (e.g., `created_at DESC`).
-unsafe fn deparse_sort_by(node: *const pg_sys::SortBy) -> Result<String, PgStreamError> {
+unsafe fn deparse_sort_by(node: *const pg_sys::SortBy) -> Result<String, PgTrickleError> {
     let sb = unsafe { &*node };
     let expr = unsafe { node_to_expr(sb.node)? };
     let dir = match sb.sortby_dir {
@@ -266,7 +266,7 @@ Determine the subquery's output columns from the `targetList`:
 /// - Otherwise, generate a positional name (`column1`, `column2`, ...)
 unsafe fn extract_select_output_cols(
     target_list: *mut pg_sys::List,
-) -> Result<Vec<String>, PgStreamError> {
+) -> Result<Vec<String>, PgTrickleError> {
     let targets = unsafe { PgList::<pg_sys::Node>::from_pg(target_list) };
     let mut cols = Vec::new();
     for (i, node) in targets.iter_ptr().enumerate() {
@@ -380,7 +380,7 @@ if let OpTree::LateralSubquery { subquery_sql, alias, column_aliases, output_col
             // distinction doesn't matter at parse time. For DIFFERENTIAL,
             // the diff operator needs to know whether to LEFT JOIN or CROSS JOIN.
         }
-        _ => Err(PgStreamError::UnsupportedOperator(
+        _ => Err(PgTrickleError::UnsupportedOperator(
             "Only INNER JOIN LATERAL and LEFT JOIN LATERAL are supported".into(),
         )),
     }
@@ -446,7 +446,7 @@ LateralSubquery {
 In `diff_node()`:
 
 ```rust
-OpTree::LateralSubquery { .. } => Err(PgStreamError::UnsupportedOperator(
+OpTree::LateralSubquery { .. } => Err(PgTrickleError::UnsupportedOperator(
     "LATERAL subqueries are not supported in DIFFERENTIAL mode. \
      Use FULL refresh mode instead."
         .into(),
@@ -552,7 +552,7 @@ Create `src/dvm/operators/lateral_subquery.rs`:
 pub fn diff_lateral_subquery(
     ctx: &mut DiffContext,
     op: &OpTree,
-) -> Result<DiffResult, PgStreamError> { ... }
+) -> Result<DiffResult, PgTrickleError> { ... }
 ```
 
 ### Step 2.2: CTE Chain
@@ -562,13 +562,13 @@ The CTE chain is structurally similar to `diff_lateral_function`, but the re-exp
 ```sql
 -- CTE 1: Changed outer rows from child delta
 WITH lat_sq_changed AS (
-    SELECT DISTINCT "__pgs_row_id", "__pgs_action", <child_cols>
+    SELECT DISTINCT "__pgt_row_id", "__pgt_action", <child_cols>
     FROM <child_delta>
 ),
 
 -- CTE 2: Old ST rows matching changed outer rows (to be deleted)
 lat_sq_old AS (
-    SELECT st."__pgs_row_id", st.<all_output_cols>
+    SELECT st."__pgt_row_id", st.<all_output_cols>
     FROM <st_table> st
     WHERE EXISTS (
         SELECT 1 FROM lat_sq_changed cs
@@ -580,19 +580,19 @@ lat_sq_old AS (
 -- CTE 3: Re-execute subquery for new/updated outer rows
 lat_sq_expand AS (
     SELECT
-        pg_stream_hash(cs.<child_cols>::TEXT || '/' || sub.<sub_cols>::TEXT) AS "__pgs_row_id",
+        pg_trickle_hash(cs.<child_cols>::TEXT || '/' || sub.<sub_cols>::TEXT) AS "__pgt_row_id",
         cs.<child_cols>,
         sub.<subquery_output_cols>
     FROM lat_sq_changed cs,
          LATERAL (<subquery_sql>) AS <alias>(<columns>)
-    WHERE cs."__pgs_action" = 'I'
+    WHERE cs."__pgt_action" = 'I'
 ),
 
 -- CTE 4: Final delta
 lat_sq_final AS (
-    SELECT "__pgs_row_id", 'D' AS "__pgs_action", <all_cols> FROM lat_sq_old
+    SELECT "__pgt_row_id", 'D' AS "__pgt_action", <all_cols> FROM lat_sq_old
     UNION ALL
-    SELECT "__pgs_row_id", 'I' AS "__pgs_action", <all_cols> FROM lat_sq_expand
+    SELECT "__pgt_row_id", 'I' AS "__pgt_action", <all_cols> FROM lat_sq_expand
 )
 ```
 
@@ -604,12 +604,12 @@ For `LEFT JOIN LATERAL`, if the subquery returns no rows for an outer row, a NUL
 -- CTE 3 (LEFT JOIN variant): Use LEFT JOIN LATERAL instead of comma syntax
 lat_sq_expand AS (
     SELECT
-        pg_stream_hash(cs.<child_cols>::TEXT || '/' || COALESCE(sub.<sub_cols>::TEXT, '')) AS "__pgs_row_id",
+        pg_trickle_hash(cs.<child_cols>::TEXT || '/' || COALESCE(sub.<sub_cols>::TEXT, '')) AS "__pgt_row_id",
         cs.<child_cols>,
         sub.<subquery_output_cols>
     FROM lat_sq_changed cs
     LEFT JOIN LATERAL (<subquery_sql>) AS <alias>(<columns>) ON true
-    WHERE cs."__pgs_action" = 'I'
+    WHERE cs."__pgt_action" = 'I'
 )
 ```
 
@@ -627,7 +627,7 @@ lat_sq_expand AS (
     SELECT ...
     FROM lat_sq_changed AS o,     -- Use original outer alias!
          LATERAL (...) AS sub
-    WHERE o."__pgs_action" = 'I'
+    WHERE o."__pgt_action" = 'I'
 )
 ```
 
@@ -808,7 +808,7 @@ lat_sq_expand AS (
     JOIN <source_table_b> b ON b.<pk> = cs.<b_pk_col>
     -- Now the subquery's column refs resolve naturally
     , LATERAL (<subquery_sql>) AS sub
-    WHERE cs."__pgs_action" = 'I'
+    WHERE cs."__pgt_action" = 'I'
 )
 ```
 
@@ -819,7 +819,7 @@ lat_sq_expand AS (
 ```sql
 FROM lat_sq_changed AS <outer_alias>,
      LATERAL (<subquery_sql>) AS <sub_alias>
-WHERE <outer_alias>."__pgs_action" = 'I'
+WHERE <outer_alias>."__pgt_action" = 'I'
 ```
 
 ### 3. CDC for Subquery Source Tables

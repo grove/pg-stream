@@ -42,17 +42,17 @@ Last Updated: 2026-02-25
 ## Executive Summary
 
 This plan proposes a **tiered syntax strategy** for creating and managing
-stream tables in pg_stream, evolving from the current function-call API toward
+stream tables in pg_trickle, evolving from the current function-call API toward
 a more native-feeling DDL experience without forking PostgreSQL.
 
 | Tier | Syntax | Status | Requires |
 |------|--------|--------|----------|
-| **Tier 1** | `SELECT pgstream.create_stream_table(...)` | Existing | Nothing extra |
-| **Tier 1.5** | `CALL pgstream.create_stream_table(...)` | New (trivial) | PG 11+ |
-| **Tier 2** | `CREATE MATERIALIZED VIEW ... WITH (pgstream.stream = true) AS ...` | New | `shared_preload_libraries` |
+| **Tier 1** | `SELECT pgtrickle.create_stream_table(...)` | Existing | Nothing extra |
+| **Tier 1.5** | `CALL pgtrickle.create_stream_table(...)` | New (trivial) | PG 11+ |
+| **Tier 2** | `CREATE MATERIALIZED VIEW ... WITH (pgtrickle.stream = true) AS ...` | New | `shared_preload_libraries` |
 
 All tiers produce identical results — a stream table registered in
-`pgstream.pgs_stream_tables` with CDC, DAG, and scheduling fully configured.
+`pgtrickle.pgt_stream_tables` with CDC, DAG, and scheduling fully configured.
 Tier 1 remains the stable, always-available interface. Tier 2 provides
 native-feeling DDL syntax for users who prefer standard SQL idioms.
 
@@ -67,7 +67,7 @@ native-feeling DDL syntax for users who prefer standard SQL idioms.
 The current API requires function-call syntax:
 
 ```sql
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_totals',
     'SELECT region, SUM(amount) FROM orders GROUP BY region',
     '1m',
@@ -92,7 +92,7 @@ While functional, this has several UX shortcomings:
    backup/restore tooling.
 
 5. **Discoverability** — New users searching for "create materialized view
-   postgres" won't find pg_stream's function-based approach.
+   postgres" won't find pg_trickle's function-based approach.
 
 ### Goal
 
@@ -122,14 +122,14 @@ Provide a syntax that:
    may also set `ProcessUtility_hook`. Our hook MUST chain to the previous hook
    to avoid breaking other extensions.
 
-4. **Backward compatibility** — The existing function API (`pgstream.create_stream_table()`)
+4. **Backward compatibility** — The existing function API (`pgtrickle.create_stream_table()`)
    must continue to work unchanged. The new syntax is an additional path,
    not a replacement.
 
 ### Soft Constraints
 
 5. **pg_dump compatibility** — Desirable but not expected to be perfect. A
-   companion `pgstream.dump_stream_tables()` function is acceptable.
+   companion `pgtrickle.dump_stream_tables()` function is acceptable.
 
 6. **Minimal surface area** — The hook should intercept only the DDL commands
    it needs and pass everything else through without modification.
@@ -171,10 +171,10 @@ Greenplum). Not viable for a loadable extension.
 ### Approach C — Foreign Data Wrapper (Rejected)
 
 **Concept:** Register a custom FDW, use `CREATE FOREIGN TABLE ... SERVER
-pgstream_server OPTIONS (query '...', schedule '1m')`.
+pgtrickle_server OPTIONS (query '...', schedule '1m')`.
 
 **Why rejected:**
-- Foreign tables cannot have indexes — stream tables need `__pgs_row_id` unique index
+- Foreign tables cannot have indexes — stream tables need `__pgt_row_id` unique index
 - Foreign tables cannot have triggers — breaks user-trigger support
 - No MVCC snapshot isolation guarantees
 - "Foreign table" implies external data, confusing the mental model
@@ -182,7 +182,7 @@ pgstream_server OPTIONS (query '...', schedule '1m')`.
 
 ### Approach D — ProcessUtility_hook + CREATE MATERIALIZED VIEW (Recommended)
 
-**Concept:** Intercept `CREATE MATERIALIZED VIEW ... WITH (pgstream.stream = true)
+**Concept:** Intercept `CREATE MATERIALIZED VIEW ... WITH (pgtrickle.stream = true)
 AS SELECT ...` via `ProcessUtility_hook`. When the custom option is detected,
 route to `create_stream_table_impl()` instead of standard matview creation.
 
@@ -214,7 +214,7 @@ route to `create_stream_table_impl()` instead of standard matview creation.
 ### Approach E — CALL Procedure Syntax (Complementary)
 
 **Concept:** Expose `create_stream_table` as a PostgreSQL procedure
-(not just a function), enabling `CALL pgstream.create_stream_table(...)`.
+(not just a function), enabling `CALL pgtrickle.create_stream_table(...)`.
 
 **Why complementary:**
 - Trivial to implement (add `#[pg_extern]` with procedure semantics or create
@@ -232,29 +232,29 @@ route to `create_stream_table_impl()` instead of standard matview creation.
 
 ```sql
 -- Always available, no special requirements
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_totals',
     'SELECT region, SUM(amount) FROM orders GROUP BY region',
     '1m', 'DIFFERENTIAL'
 );
 
-SELECT pgstream.drop_stream_table('order_totals');
-SELECT pgstream.refresh_stream_table('order_totals');
-SELECT pgstream.alter_stream_table('order_totals', schedule => '5m');
+SELECT pgtrickle.drop_stream_table('order_totals');
+SELECT pgtrickle.refresh_stream_table('order_totals');
+SELECT pgtrickle.alter_stream_table('order_totals', schedule => '5m');
 ```
 
 ### Tier 1.5: CALL Procedure Syntax (New — Trivial)
 
 ```sql
 -- Same API but reads as a command, not a query
-CALL pgstream.create_stream_table(
+CALL pgtrickle.create_stream_table(
     'order_totals',
     'SELECT region, SUM(amount) FROM orders GROUP BY region',
     '1m', 'DIFFERENTIAL'
 );
 
-CALL pgstream.drop_stream_table('order_totals');
-CALL pgstream.refresh_stream_table('order_totals');
+CALL pgtrickle.drop_stream_table('order_totals');
+CALL pgtrickle.refresh_stream_table('order_totals');
 ```
 
 ### Tier 2: Native DDL Syntax (New — ProcessUtility_hook)
@@ -263,16 +263,16 @@ CALL pgstream.refresh_stream_table('order_totals');
 -- Create a stream table using familiar matview DDL
 CREATE MATERIALIZED VIEW order_totals
 WITH (
-    pgstream.stream   = true,
-    pgstream.schedule = '1m',
-    pgstream.mode     = 'DIFFERENTIAL'
+    pgtrickle.stream   = true,
+    pgtrickle.schedule = '1m',
+    pgtrickle.mode     = 'DIFFERENTIAL'
 )
 AS SELECT region, SUM(amount) FROM orders GROUP BY region
 WITH NO DATA;
 
 -- Or initialize immediately (WITH DATA is the default):
 CREATE MATERIALIZED VIEW order_totals
-WITH (pgstream.stream = true)
+WITH (pgtrickle.stream = true)
 AS SELECT region, SUM(amount) FROM orders GROUP BY region;
 
 -- Refresh
@@ -284,7 +284,7 @@ DROP MATERIALIZED VIEW IF EXISTS order_totals CASCADE;
 
 -- Alter (still a function call — no standard ALTER MATERIALIZED VIEW
 -- for custom options):
-SELECT pgstream.alter_stream_table('order_totals', schedule => '5m');
+SELECT pgtrickle.alter_stream_table('order_totals', schedule => '5m');
 ```
 
 ---
@@ -298,9 +298,9 @@ SELECT pgstream.alter_stream_table('order_totals', schedule => '5m');
 ```sql
 CREATE MATERIALIZED VIEW [IF NOT EXISTS] [schema.]name
 WITH (
-    pgstream.stream   = true,         -- required: marks this as a stream table
-    pgstream.schedule = '1m',         -- optional: default '1m'
-    pgstream.mode     = 'DIFFERENTIAL' -- optional: default 'DIFFERENTIAL'
+    pgtrickle.stream   = true,         -- required: marks this as a stream table
+    pgtrickle.schedule = '1m',         -- optional: default '1m'
+    pgtrickle.mode     = 'DIFFERENTIAL' -- optional: default 'DIFFERENTIAL'
 )
 AS select_query
 [WITH DATA | WITH NO DATA];
@@ -310,9 +310,9 @@ AS select_query
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `pgstream.stream` | `bool` | — | **Required.** Must be `true` to trigger stream table creation. |
-| `pgstream.schedule` | `text` | `'1m'` | Duration string or cron expression. Set to `'CALCULATED'` for NULL/downstream schedule. |
-| `pgstream.mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` or `'DIFFERENTIAL'`. |
+| `pgtrickle.stream` | `bool` | — | **Required.** Must be `true` to trigger stream table creation. |
+| `pgtrickle.schedule` | `text` | `'1m'` | Duration string or cron expression. Set to `'CALCULATED'` for NULL/downstream schedule. |
+| `pgtrickle.mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` or `'DIFFERENTIAL'`. |
 
 - `WITH DATA` (default) → calls `create_stream_table_impl()` with `initialize = true`
 - `WITH NO DATA` → calls `create_stream_table_impl()` with `initialize = false`
@@ -324,12 +324,12 @@ DROP MATERIALIZED VIEW [IF EXISTS] [schema.]name [CASCADE | RESTRICT];
 ```
 
 The hook checks whether the target is a registered stream table (by OID lookup
-in `pgstream.pgs_stream_tables`). If so, it routes to `drop_stream_table_impl()`
+in `pgtrickle.pgt_stream_tables`). If so, it routes to `drop_stream_table_impl()`
 instead of standard matview drop. If not, it passes through to the standard
 handler.
 
 **CASCADE behavior:** If a stream table depends on another stream table being
-dropped, `CASCADE` propagates via pg_stream's dependency tracking (same as
+dropped, `CASCADE` propagates via pg_trickle's dependency tracking (same as
 `drop_stream_table_impl()` already handles).
 
 #### REFRESH
@@ -350,8 +350,8 @@ that we can meaningfully intercept for custom options. Alter operations remain
 as function calls:
 
 ```sql
-SELECT pgstream.alter_stream_table('order_totals', schedule => '5m');
-SELECT pgstream.alter_stream_table('order_totals', status => 'SUSPENDED');
+SELECT pgtrickle.alter_stream_table('order_totals', schedule => '5m');
+SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');
 ```
 
 Future PostgreSQL versions may add `ALTER MATERIALIZED VIEW ... SET (reloption)`
@@ -374,7 +374,7 @@ static mut PREV_PROCESS_UTILITY_HOOK: pg_sys::ProcessUtility_hook_type = None;
 pub fn register_process_utility_hook() {
     unsafe {
         PREV_PROCESS_UTILITY_HOOK = pg_sys::ProcessUtility_hook;
-        pg_sys::ProcessUtility_hook = Some(pg_stream_process_utility);
+        pg_sys::ProcessUtility_hook = Some(pg_trickle_process_utility);
     }
 }
 ```
@@ -389,7 +389,7 @@ if in_shared_preload {
     // NEW: Register ProcessUtility_hook for native DDL syntax
     hooks::register_process_utility_hook();
 
-    log!("pg_stream: initialized (shared_preload_libraries)");
+    log!("pg_trickle: initialized (shared_preload_libraries)");
 }
 ```
 
@@ -399,20 +399,20 @@ When `ProcessUtility_hook` fires with a `CreateTableAsStmt` node where
 `objtype == OBJECT_MATVIEW`:
 
 ```
-pg_stream_process_utility()
+pg_trickle_process_utility()
   ├── Is it CreateTableAsStmt with OBJECT_MATVIEW?
   │     ├── No → pass through to prev hook / standard_ProcessUtility
   │     └── Yes → extract reloptions from IntoClause
-  │           ├── Has pgstream.stream = true?
+  │           ├── Has pgtrickle.stream = true?
   │           │     ├── No → pass through (normal matview)
   │           │     └── Yes → handle_create_stream_table_ddl()
   │           │           ├── Extract query string from the parse tree
-  │           │           ├── Extract pgstream.schedule, pgstream.mode
+  │           │           ├── Extract pgtrickle.schedule, pgtrickle.mode
   │           │           ├── Determine schema.name from IntoClause->rel
   │           │           ├── Determine WITH DATA / WITH NO DATA
   │           │           ├── Call create_stream_table_impl()
   │           │           └── Set QueryCompletion tag
-  │           └── Has only non-pgstream options?
+  │           └── Has only non-pgtrickle options?
   │                 └── Pass through (normal matview with custom storage params)
   └── Is it something else?
         └── Check other interceptions (DROP, REFRESH)
@@ -444,11 +444,11 @@ When `ProcessUtility_hook` fires with a `DropStmt` node where
 `removeType == OBJECT_MATVIEW`:
 
 ```
-pg_stream_process_utility()
+pg_trickle_process_utility()
   ├── Is it DropStmt with OBJECT_MATVIEW?
   │     └── Yes → for each object in the drop list:
   │           ├── Resolve name to OID
-  │           ├── Is OID in pgstream.pgs_stream_tables?
+  │           ├── Is OID in pgtrickle.pgt_stream_tables?
   │           │     ├── No → pass through (normal matview drop)
   │           │     └── Yes → handle_drop_stream_table_ddl()
   │           │           ├── Call drop_stream_table_impl()
@@ -467,10 +467,10 @@ behavior).
 When `ProcessUtility_hook` fires with a `RefreshMatViewStmt` node:
 
 ```
-pg_stream_process_utility()
+pg_trickle_process_utility()
   ├── Is it RefreshMatViewStmt?
   │     └── Yes → resolve relation name to OID
-  │           ├── Is OID in pgstream.pgs_stream_tables?
+  │           ├── Is OID in pgtrickle.pgt_stream_tables?
   │           │     ├── No → pass through (normal matview refresh)
   │           │     └── Yes → handle_refresh_stream_table_ddl()
   │           │           ├── Call refresh_stream_table_impl()
@@ -490,7 +490,7 @@ proceed with the normal refresh.
 `AT_SetRelOptions`. We could intercept this to support:
 
 ```sql
-ALTER MATERIALIZED VIEW order_totals SET (pgstream.schedule = '5m');
+ALTER MATERIALIZED VIEW order_totals SET (pgtrickle.schedule = '5m');
 ```
 
 However, this interception is complex (must parse subcommands, handle mixed
@@ -512,11 +512,11 @@ they will appear in `\dt` (regular tables) instead.
 
 2. **Create a view alias** — Create a regular view with the same name that
    reads from the storage table. The storage table gets an internal name like
-   `_pgstream_store_<name>`.
+   `_pgtrickle_store_<name>`.
 
 3. **Accept the `\dt` listing** — Stream tables appear as regular tables in
    `\dt`, which is technically accurate (they ARE regular heap tables). The
-   `pgstream.stream_tables_info` view provides the authoritative listing.
+   `pgtrickle.stream_tables_info` view provides the authoritative listing.
 
 4. **Register a custom psql command** — Not possible without modifying psql.
 
@@ -526,7 +526,7 @@ Add `COMMENT ON TABLE` with a descriptive marker so users can identify stream
 tables:
 
 ```sql
-COMMENT ON TABLE schema.name IS 'pgstream: stream table (schedule=1m, mode=DIFFERENTIAL)';
+COMMENT ON TABLE schema.name IS 'pgtrickle: stream table (schedule=1m, mode=DIFFERENTIAL)';
 ```
 
 ### pg_dump / pg_restore Strategy
@@ -538,10 +538,10 @@ This is the most significant challenge with the hook-based approach.
 `pg_dump` dumps objects based on their `relkind` in `pg_class`. Since stream
 tables are stored as regular tables (`relkind = 'r'`), `pg_dump` will emit
 `CREATE TABLE` DDL with the full column list — not the `CREATE MATERIALIZED
-VIEW ... WITH (pgstream.stream = true) AS SELECT ...` that our hook expects.
+VIEW ... WITH (pgtrickle.stream = true) AS SELECT ...` that our hook expects.
 
 The defining query, schedule, and other metadata live in
-`pgstream.pgs_stream_tables`, which `pg_dump` dumps as `INSERT` statements
+`pgtrickle.pgt_stream_tables`, which `pg_dump` dumps as `INSERT` statements
 (since it's an extension catalog table in `extension_sql!`).
 
 #### Strategy: Companion Dump/Restore Functions
@@ -550,34 +550,34 @@ Provide explicit dump and restore functions:
 
 ```sql
 -- Generate SQL to recreate all stream tables
-SELECT pgstream.generate_dump();
+SELECT pgtrickle.generate_dump();
 
 -- Output:
--- SELECT pgstream.create_stream_table('order_totals',
+-- SELECT pgtrickle.create_stream_table('order_totals',
 --     'SELECT region, SUM(amount) FROM orders GROUP BY region',
 --     '1m', 'DIFFERENTIAL', false);
--- SELECT pgstream.create_stream_table('daily_stats', ...);
+-- SELECT pgtrickle.create_stream_table('daily_stats', ...);
 ```
 
 ```sql
 -- Restore: run after pg_restore has created the extension and base tables
--- The function reads pgstream.pgs_stream_tables (restored by pg_dump)
+-- The function reads pgtrickle.pgt_stream_tables (restored by pg_dump)
 -- and recreates the storage tables + CDC + triggers
-SELECT pgstream.restore_stream_tables();
+SELECT pgtrickle.restore_stream_tables();
 ```
 
 #### Strategy: Event Trigger on Extension Load
 
-Register an event trigger that fires on `CREATE EXTENSION pg_stream` and
+Register an event trigger that fires on `CREATE EXTENSION pg_trickle` and
 checks if the catalog tables contain orphaned entries (tables exist in catalog
 but storage tables are missing). If so, automatically recreate them.
 
 #### pg_dump --section Behavior
 
-| pg_dump section | What it dumps | pg_stream impact |
+| pg_dump section | What it dumps | pg_trickle impact |
 |----------------|---------------|------------------|
-| `pre-data` | Schemas, extensions, types | `CREATE EXTENSION pg_stream` → creates catalog tables |
-| `data` | Table contents | Catalog table rows (INSERT INTO pgstream.pgs_stream_tables) + storage table data |
+| `pre-data` | Schemas, extensions, types | `CREATE EXTENSION pg_trickle` → creates catalog tables |
+| `data` | Table contents | Catalog table rows (INSERT INTO pgtrickle.pgt_stream_tables) + storage table data |
 | `post-data` | Indexes, triggers, constraints | Storage table indexes, CDC triggers (but these are extension-managed) |
 
 **Recommended restore workflow:**
@@ -590,7 +590,7 @@ pg_restore --section=pre-data dump.sql
 pg_restore --section=data dump.sql
 
 # 3. Rebuild stream tables from catalog (recreates CDC, triggers, indexes)
-psql -c "SELECT pgstream.restore_stream_tables();"
+psql -c "SELECT pgtrickle.restore_stream_tables();"
 
 # 4. Restore remaining post-data
 pg_restore --section=post-data dump.sql
@@ -606,8 +606,8 @@ Hook errors must be handled carefully to avoid crashing the backend:
    warning and pass through to the standard handler
 3. **Stream table creation errors** — Report via `ereport(ERROR, ...)` as
    usual. The transaction rolls back, leaving no artifacts.
-4. **Unknown options** — If `pgstream.stream = true` is present but other
-   `pgstream.*` options are unrecognized, raise an error listing valid options
+4. **Unknown options** — If `pgtrickle.stream = true` is present but other
+   `pgtrickle.*` options are unrecognized, raise an error listing valid options
 
 ---
 
@@ -616,12 +616,12 @@ Hook errors must be handled carefully to avoid crashing the backend:
 ### Implementation
 
 PostgreSQL 11+ supports `CALL procedure(...)` for procedures. Currently
-pg_stream exposes functions (callable via `SELECT`). To support `CALL` syntax:
+pg_trickle exposes functions (callable via `SELECT`). To support `CALL` syntax:
 
 **Option A: Wrapper Procedures (SQL layer)**
 
 ```sql
-CREATE PROCEDURE pgstream.create_stream_table(
+CREATE PROCEDURE pgtrickle.create_stream_table(
     name          text,
     query         text,
     schedule      text DEFAULT '1m',
@@ -630,7 +630,7 @@ CREATE PROCEDURE pgstream.create_stream_table(
 )
 LANGUAGE sql
 AS $$
-    SELECT pgstream.create_stream_table(name, query, schedule, refresh_mode, initialize);
+    SELECT pgtrickle.create_stream_table(name, query, schedule, refresh_mode, initialize);
 $$;
 ```
 
@@ -642,9 +642,9 @@ tools may be confused.
 **Option B: Distinct Procedure Names**
 
 ```sql
-CALL pgstream.stream_table_create('order_totals', 'SELECT ...', '1m');
-CALL pgstream.stream_table_drop('order_totals');
-CALL pgstream.stream_table_refresh('order_totals');
+CALL pgtrickle.stream_table_create('order_totals', 'SELECT ...', '1m');
+CALL pgtrickle.stream_table_drop('order_totals');
+CALL pgtrickle.stream_table_refresh('order_totals');
 ```
 
 **Option C: pgrx `#[pg_extern]` with Procedure Support**
@@ -679,28 +679,28 @@ adds `CALL` as an alias.
 ### Phase 2: Hook Infrastructure (3–5 days)
 
 **Scope:** Register `ProcessUtility_hook` in `_PG_init()`, implement the
-dispatch logic, and handle passthrough for non-pgstream DDL.
+dispatch logic, and handle passthrough for non-pgtrickle DDL.
 
 **Files changed:**
 - `src/hooks.rs` — Add `register_process_utility_hook()`,
-  `pg_stream_process_utility()` dispatch function, hook chaining
+  `pg_trickle_process_utility()` dispatch function, hook chaining
 - `src/lib.rs` — Call `hooks::register_process_utility_hook()` in `_PG_init()`
 
 **Tests:**
 - Verify hook registration doesn't break existing DDL
-- Verify non-pgstream matviews still work
+- Verify non-pgtrickle matviews still work
 - Verify other extension hooks still chain correctly
 
 ### Phase 3: CREATE Interception (5–7 days)
 
-**Scope:** Intercept `CREATE MATERIALIZED VIEW ... WITH (pgstream.stream = true)`
+**Scope:** Intercept `CREATE MATERIALIZED VIEW ... WITH (pgtrickle.stream = true)`
 and route to `create_stream_table_impl()`.
 
 **Key tasks:**
 1. Parse `CreateTableAsStmt` node to extract reloptions
-2. Detect `pgstream.stream = true` in the option list
+2. Detect `pgtrickle.stream = true` in the option list
 3. Extract schema, name, query text from the parse tree
-4. Extract `pgstream.schedule` and `pgstream.mode` options
+4. Extract `pgtrickle.schedule` and `pgtrickle.mode` options
 5. Determine `WITH DATA` / `WITH NO DATA`
 6. Call `create_stream_table_impl()` with extracted parameters
 7. Set `QueryCompletion` tag to `"CREATE MATERIALIZED VIEW"`
@@ -735,8 +735,8 @@ for registered stream tables.
 
 ### Phase 5: pg_dump / Restore Support (3–4 days)
 
-**Scope:** Implement `pgstream.generate_dump()` and
-`pgstream.restore_stream_tables()` functions.
+**Scope:** Implement `pgtrickle.generate_dump()` and
+`pgtrickle.restore_stream_tables()` functions.
 
 **Files changed:**
 - `src/api.rs` — New functions `generate_dump()`, `restore_stream_tables()`
@@ -767,11 +767,11 @@ src/
 ├── hooks.rs          # Extended: ProcessUtility_hook registration + dispatch
 │   ├── (existing)    # DDL event triggers (_on_ddl_end, _on_sql_drop)
 │   ├── NEW           # register_process_utility_hook()
-│   ├── NEW           # pg_stream_process_utility() — main dispatch
+│   ├── NEW           # pg_trickle_process_utility() — main dispatch
 │   ├── NEW           # handle_create_stream_table_ddl()
 │   ├── NEW           # handle_drop_stream_table_ddl()
 │   ├── NEW           # handle_refresh_stream_table_ddl()
-│   └── NEW           # extract_pgstream_options() — reloption parser
+│   └── NEW           # extract_pgtrickle_options() — reloption parser
 ├── api.rs            # Unchanged (impl functions already exist)
 ├── lib.rs            # Extended: hook registration in _PG_init(), CALL procs
 └── (all other files unchanged)
@@ -787,7 +787,7 @@ src/
 |-------|-------|
 | **Status** | Proposed |
 | **Date** | 2026-02-25 |
-| **Deciders** | pg_stream core team |
+| **Deciders** | pg_trickle core team |
 | **Category** | API & Schema Design |
 
 #### Context
@@ -802,7 +802,7 @@ string literal loses IDE support.
 Implement a tiered syntax strategy:
 - **Tier 1** (existing): Function API — always available, no special requirements
 - **Tier 1.5** (new): `CALL` procedure wrappers — trivial addition
-- **Tier 2** (new): `CREATE MATERIALIZED VIEW ... WITH (pgstream.stream = true)`
+- **Tier 2** (new): `CREATE MATERIALIZED VIEW ... WITH (pgtrickle.stream = true)`
   via `ProcessUtility_hook` — native-feeling DDL when `shared_preload_libraries`
   is configured
 
@@ -838,7 +838,7 @@ Implement a tiered syntax strategy:
 
 ### Unit Tests (src/hooks.rs `#[cfg(test)]`)
 
-- Option parsing: extract `pgstream.stream`, `pgstream.schedule`, `pgstream.mode`
+- Option parsing: extract `pgtrickle.stream`, `pgtrickle.schedule`, `pgtrickle.mode`
   from `DefElem` lists
 - Schema/name parsing from `RangeVar`
 - WITH DATA / WITH NO DATA detection
@@ -847,9 +847,9 @@ Implement a tiered syntax strategy:
 
 | Test | Description |
 |------|-------------|
-| `test_create_via_matview_syntax` | Basic CREATE MATERIALIZED VIEW with pgstream.stream |
+| `test_create_via_matview_syntax` | Basic CREATE MATERIALIZED VIEW with pgtrickle.stream |
 | `test_create_with_all_options` | schedule + mode + WITH NO DATA |
-| `test_create_default_options` | Only pgstream.stream = true, all defaults |
+| `test_create_default_options` | Only pgtrickle.stream = true, all defaults |
 | `test_create_schema_qualified` | `CREATE MATERIALIZED VIEW myschema.my_st ...` |
 | `test_create_if_not_exists` | IF NOT EXISTS handling |
 | `test_drop_via_matview_syntax` | DROP MATERIALIZED VIEW on a stream table |
@@ -857,11 +857,11 @@ Implement a tiered syntax strategy:
 | `test_drop_cascade` | CASCADE propagation |
 | `test_refresh_via_matview_syntax` | REFRESH MATERIALIZED VIEW on a stream table |
 | `test_refresh_concurrently_ignored` | CONCURRENTLY keyword logged but ignored |
-| `test_normal_matview_passthrough` | Regular matview without pgstream.stream works normally |
+| `test_normal_matview_passthrough` | Regular matview without pgtrickle.stream works normally |
 | `test_normal_drop_passthrough` | DROP on non-stream matview works normally |
 | `test_mixed_create_function_and_ddl` | Create via function, drop via DDL and vice versa |
-| `test_invalid_pgstream_options` | Unknown option → error |
-| `test_call_syntax` | CALL pgstream.create_stream_table(...) |
+| `test_invalid_pgtrickle_options` | Unknown option → error |
+| `test_call_syntax` | CALL pgtrickle.create_stream_table(...) |
 | `test_hook_chaining` | Verify pg_stat_statements still works alongside hook |
 | `test_dump_restore_roundtrip` | generate_dump() → restore → verify |
 
@@ -879,19 +879,19 @@ Implement a tiered syntax strategy:
 |------|-----------|--------|------------|
 | ProcessUtility_hook signature changes in PG 19+ | Medium | Medium | Conditional compilation with `#[cfg(any(...))]` for PG version. Hook signature has been stable since PG 15. |
 | Other extension hooks conflict | Low | High | Always chain `prev_ProcessUtility_hook`. Test with pg_stat_statements. Document hook ordering requirements. |
-| pg_dump produces incorrect restore SQL | High | Medium | Provide `pgstream.generate_dump()` and `pgstream.restore_stream_tables()`. Document recommended backup workflow. |
+| pg_dump produces incorrect restore SQL | High | Medium | Provide `pgtrickle.generate_dump()` and `pgtrickle.restore_stream_tables()`. Document recommended backup workflow. |
 | User confusion: "why is my matview in `\dt` not `\dm`?" | Medium | Low | Documentation, COMMENT ON TABLE marker, FAQ entry. |
 | Hook code introduces crashes | Low | High | Extensive `#[pg_guard]` usage, never `unwrap()` in hook path, graceful passthrough on errors. |
 | Deparse of defining query loses fidelity | Medium | Medium | Use raw query string extraction (approach 2) rather than deparsing from parse tree. Preserve user's original SQL. |
-| Extension load order matters | Low | Medium | Document that pg_stream should be listed after pg_stat_statements in `shared_preload_libraries` (or before — test both). |
+| Extension load order matters | Low | Medium | Document that pg_trickle should be listed after pg_stat_statements in `shared_preload_libraries` (or before — test both). |
 
 ---
 
 ## Comparison with Prior Art
 
-| Feature | pg_stream (proposed) | TimescaleDB | pg_ivm | Citus |
+| Feature | pg_trickle (proposed) | TimescaleDB | pg_ivm | Citus |
 |---------|---------------------|-------------|--------|-------|
-| Creation syntax | `CREATE MATVIEW WITH (pgstream.stream)` | `CREATE MATVIEW WITH (timescaledb.continuous)` | `SELECT create_immv(...)` | `SELECT create_distributed_table(...)` |
+| Creation syntax | `CREATE MATVIEW WITH (pgtrickle.stream)` | `CREATE MATVIEW WITH (timescaledb.continuous)` | `SELECT create_immv(...)` | `SELECT create_distributed_table(...)` |
 | Function API | Yes (primary) | Yes (policies) | Yes (primary) | Yes (primary) |
 | ProcessUtility_hook | Yes | Yes (extensive) | No | Yes (extensive) |
 | pg_dump support | Custom functions | Built-in (complex) | No | Built-in |

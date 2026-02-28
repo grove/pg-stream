@@ -1,6 +1,6 @@
-//! User-facing SQL API functions for pgstream.
+//! User-facing SQL API functions for pgtrickle.
 //!
-//! All functions are exposed in the `pg_stream` schema and provide the primary
+//! All functions are exposed in the `pg_trickle` schema and provide the primary
 //! interface for creating, altering, dropping, and refreshing stream tables.
 
 use pgrx::prelude::*;
@@ -10,7 +10,7 @@ use crate::catalog::{CdcMode, StDependency, StreamTableMeta};
 use crate::cdc;
 use crate::config;
 use crate::dag::{DagNode, NodeId, RefreshMode, StDag, StStatus};
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::refresh;
 use crate::shmem;
 use crate::version;
@@ -24,7 +24,7 @@ use crate::wal_decoder;
 /// - `schedule`: Desired maximum schedule. `NULL` for CALCULATED.
 /// - `refresh_mode`: `'FULL'` or `'DIFFERENTIAL'`.
 /// - `initialize`: Whether to populate the table immediately.
-#[pg_extern(schema = "pgstream")]
+#[pg_extern(schema = "pgtrickle")]
 fn create_stream_table(
     name: &str,
     query: &str,
@@ -44,7 +44,7 @@ fn create_stream_table_impl(
     schedule: Option<&str>,
     refresh_mode_str: &str,
     initialize: bool,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
 
     // Parse schema.name
@@ -137,7 +137,7 @@ fn create_stream_table_impl(
         let vol = crate::dvm::tree_worst_volatility_with_registry(pr)?;
         match vol {
             'v' => {
-                return Err(PgStreamError::UnsupportedOperator(
+                return Err(PgTrickleError::UnsupportedOperator(
                     "Defining query contains volatile expressions (e.g., random(), \
                      clock_timestamp(), or custom volatile operators). Volatile \
                      functions and operators are not supported in DIFFERENTIAL mode \
@@ -167,10 +167,10 @@ fn create_stream_table_impl(
         // so volatile is expected-but-surprising behavior.)
     }
 
-    // Detect if the query has aggregate/distinct (needs __pgs_count auxiliary column).
+    // Detect if the query has aggregate/distinct (needs __pgt_count auxiliary column).
     let needs_count = parsed_tree
         .as_ref()
-        .is_some_and(|pr| pr.tree.needs_pgs_count());
+        .is_some_and(|pr| pr.tree.needs_pgt_count());
 
     // Note: recursive CTEs (WITH RECURSIVE) are allowed in both FULL and
     // DIFFERENTIAL modes. For DIFFERENTIAL, the DVM engine uses a
@@ -179,7 +179,7 @@ fn create_stream_table_impl(
 
     // Check for duplicate
     if StreamTableMeta::get_by_name(&schema, &table_name).is_ok() {
-        return Err(PgStreamError::AlreadyExists(format!(
+        return Err(PgTrickleError::AlreadyExists(format!(
             "{}.{}",
             schema, table_name
         )));
@@ -197,24 +197,24 @@ fn create_stream_table_impl(
     // ── Phase 1: DDL and DML (writes) ──
 
     // Get the change buffer schema for CDC setup
-    let change_schema = config::pg_stream_change_buffer_schema();
+    let change_schema = config::pg_trickle_change_buffer_schema();
 
     // Create the underlying storage table
     let storage_ddl = build_create_table_sql(&schema, &table_name, &columns, needs_count);
     Spi::run(&storage_ddl)
-        .map_err(|e| PgStreamError::SpiError(format!("Failed to create storage table: {}", e)))?;
+        .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
 
     // Get the OID of the newly created table
-    let pgs_relid = get_table_oid(&schema, &table_name)?;
+    let pgt_relid = get_table_oid(&schema, &table_name)?;
 
-    // Create unique index on __pgs_row_id
+    // Create unique index on __pgt_row_id
     let index_sql = format!(
-        "CREATE UNIQUE INDEX ON {}.{} (__pgs_row_id)",
+        "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
         quote_identifier(&schema),
         quote_identifier(&table_name),
     );
     Spi::run(&index_sql)
-        .map_err(|e| PgStreamError::SpiError(format!("Failed to create row_id index: {}", e)))?;
+        .map_err(|e| PgTrickleError::SpiError(format!("Failed to create row_id index: {}", e)))?;
 
     // U1/U2: Auto-create composite index on GROUP BY columns for aggregate
     // queries. This accelerates the LEFT JOIN in the agg_merge CTE during
@@ -235,7 +235,7 @@ fn create_stream_table_impl(
             quoted_cols.join(", "),
         );
         Spi::run(&group_index_sql).map_err(|e| {
-            PgStreamError::SpiError(format!("Failed to create group-by index: {}", e))
+            PgTrickleError::SpiError(format!("Failed to create group-by index: {}", e))
         })?;
     }
 
@@ -247,8 +247,8 @@ fn create_stream_table_impl(
     } else {
         None
     };
-    let pgs_id = StreamTableMeta::insert(
-        pgs_relid,
+    let pgt_id = StreamTableMeta::insert(
+        pgt_relid,
         &table_name,
         &schema,
         query,
@@ -278,7 +278,7 @@ fn create_stream_table_impl(
                 Ok((s, f)) => (Some(s), Some(f)),
                 Err(e) => {
                     pgrx::debug1!(
-                        "pg_stream: failed to build column snapshot for source {}: {}",
+                        "pg_trickle: failed to build column snapshot for source {}: {}",
                         source_oid.to_u32(),
                         e,
                     );
@@ -290,7 +290,7 @@ fn create_stream_table_impl(
         };
 
         StDependency::insert_with_snapshot(
-            pgs_id,
+            pgt_id,
             *source_oid,
             source_type,
             cols,
@@ -302,7 +302,7 @@ fn create_stream_table_impl(
     // ── Phase 2: CDC setup (change buffer tables + triggers + tracking) ──
     for (source_oid, source_type) in &source_relids {
         if source_type == "TABLE" {
-            setup_cdc_for_source(*source_oid, pgs_id, &change_schema)?;
+            setup_cdc_for_source(*source_oid, pgt_id, &change_schema)?;
         }
     }
 
@@ -319,7 +319,7 @@ fn create_stream_table_impl(
                 let already_registered = source_relids.iter().any(|(o, _)| o == src_oid);
                 if !already_registered {
                     StDependency::insert_with_snapshot(
-                        pgs_id, *src_oid, src_type, None, None, None,
+                        pgt_id, *src_oid, src_type, None, None, None,
                     )?;
                 }
             }
@@ -329,7 +329,7 @@ fn create_stream_table_impl(
     // Initialize if requested
     if initialize {
         let t_init = Instant::now();
-        initialize_st(&schema, &table_name, query, pgs_id, &columns, needs_count)?;
+        initialize_st(&schema, &table_name, query, pgt_id, &columns, needs_count)?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
 
         // Record initial full materialization time so the adaptive
@@ -338,9 +338,9 @@ fn create_stream_table_impl(
         // and the auto-tuner never activates for STs whose change rate
         // stays below the fallback threshold.
         if refresh_mode == RefreshMode::Differential
-            && let Err(e) = StreamTableMeta::update_adaptive_threshold(pgs_id, None, Some(init_ms))
+            && let Err(e) = StreamTableMeta::update_adaptive_threshold(pgt_id, None, Some(init_ms))
         {
-            pgrx::debug1!("[pg_stream] Failed to record initial last_full_ms: {}", e);
+            pgrx::debug1!("[pg_trickle] Failed to record initial last_full_ms: {}", e);
         }
     }
 
@@ -355,10 +355,10 @@ fn create_stream_table_impl(
     shmem::signal_dag_rebuild();
 
     pgrx::info!(
-        "Stream table {}.{} created (pgs_id={}, mode={}, initialized={})",
+        "Stream table {}.{} created (pgt_id={}, mode={}, initialized={})",
         schema,
         table_name,
-        pgs_id,
+        pgt_id,
         refresh_mode.as_str(),
         initialize
     );
@@ -367,7 +367,7 @@ fn create_stream_table_impl(
 }
 
 /// Alter properties of an existing stream table.
-#[pg_extern(schema = "pgstream")]
+#[pg_extern(schema = "pgtrickle")]
 fn alter_stream_table(
     name: &str,
     schedule: default!(Option<&str>, "NULL"),
@@ -385,7 +385,7 @@ fn alter_stream_table_impl(
     schedule: Option<&str>,
     refresh_mode: Option<&str>,
     status: Option<&str>,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
@@ -393,10 +393,10 @@ fn alter_stream_table_impl(
         let _schedule = parse_schedule(val)?;
         let trimmed = val.trim();
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables SET schedule = $1, updated_at = now() WHERE pgs_id = $2",
-            &[trimmed.into(), st.pgs_id.into()],
+            "UPDATE pgtrickle.pgt_stream_tables SET schedule = $1, updated_at = now() WHERE pgt_id = $2",
+            &[trimmed.into(), st.pgt_id.into()],
         )
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     if let Some(mode_str) = refresh_mode {
@@ -406,22 +406,22 @@ fn alter_stream_table_impl(
         // (the DVM engine uses a recomputation diff strategy).
 
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables SET refresh_mode = $1, updated_at = now() WHERE pgs_id = $2",
-            &[mode_str.to_uppercase().into(), st.pgs_id.into()],
+            "UPDATE pgtrickle.pgt_stream_tables SET refresh_mode = $1, updated_at = now() WHERE pgt_id = $2",
+            &[mode_str.to_uppercase().into(), st.pgt_id.into()],
         )
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     if let Some(status_str) = status {
         let new_status = StStatus::from_str(&status_str.to_uppercase())?;
-        StreamTableMeta::update_status(st.pgs_id, new_status)?;
+        StreamTableMeta::update_status(st.pgt_id, new_status)?;
         if new_status == StStatus::Active {
             // Reset errors when resuming
             Spi::run_with_args(
-                "UPDATE pgstream.pgs_stream_tables SET consecutive_errors = 0, updated_at = now() WHERE pgs_id = $1",
-                &[st.pgs_id.into()],
+                "UPDATE pgtrickle.pgt_stream_tables SET consecutive_errors = 0, updated_at = now() WHERE pgt_id = $1",
+                &[st.pgt_id.into()],
             )
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
     }
 
@@ -432,7 +432,7 @@ fn alter_stream_table_impl(
 }
 
 /// Drop a stream table, removing the storage table and all catalog entries.
-#[pg_extern(schema = "pgstream")]
+#[pg_extern(schema = "pgtrickle")]
 fn drop_stream_table(name: &str) {
     let result = drop_stream_table_impl(name);
     if let Err(e) = result {
@@ -440,12 +440,12 @@ fn drop_stream_table(name: &str) {
     }
 }
 
-fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
+fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
     // Get dependencies before deleting catalog entries
-    let deps = StDependency::get_for_st(st.pgs_id).unwrap_or_default();
+    let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
 
     // Flush any deferred change-buffer cleanup entries that reference
     // source OIDs about to be cleaned up.  This prevents
@@ -465,10 +465,10 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
         quote_identifier(&table_name),
     );
     Spi::run(&drop_sql)
-        .map_err(|e| PgStreamError::SpiError(format!("Failed to drop storage table: {}", e)))?;
+        .map_err(|e| PgTrickleError::SpiError(format!("Failed to drop storage table: {}", e)))?;
 
-    // Delete catalog entries (cascade handles pgs_dependencies)
-    StreamTableMeta::delete(st.pgs_id)?;
+    // Delete catalog entries (cascade handles pgt_dependencies)
+    StreamTableMeta::delete(st.pgt_id)?;
 
     // Clean up CDC resources (triggers, WAL slots, publications) for
     // sources no longer tracked by any ST.
@@ -484,17 +484,17 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     shmem::bump_cache_generation();
 
     pgrx::info!(
-        "Stream table {}.{} dropped (pgs_id={})",
+        "Stream table {}.{} dropped (pgt_id={})",
         schema,
         table_name,
-        st.pgs_id
+        st.pgt_id
     );
     Ok(())
 }
 
 /// Resume a suspended stream table, clearing its consecutive error count and
 /// re-enabling automated and manual refreshes.
-#[pg_extern(schema = "pgstream")]
+#[pg_extern(schema = "pgtrickle")]
 fn resume_stream_table(name: &str) {
     let result = resume_stream_table_impl(name);
     if let Err(e) = result {
@@ -502,12 +502,12 @@ fn resume_stream_table(name: &str) {
     }
 }
 
-fn resume_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
+fn resume_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
     if st.status != StStatus::Suspended {
-        return Err(PgStreamError::InvalidArgument(format!(
+        return Err(PgTrickleError::InvalidArgument(format!(
             "stream table {}.{} is not suspended (current status: {})",
             schema,
             table_name,
@@ -516,26 +516,26 @@ fn resume_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     }
 
     Spi::run_with_args(
-        "UPDATE pgstream.pgs_stream_tables \
+        "UPDATE pgtrickle.pgt_stream_tables \
          SET status = 'ACTIVE', consecutive_errors = 0, updated_at = now() \
-         WHERE pgs_id = $1",
-        &[st.pgs_id.into()],
+         WHERE pgt_id = $1",
+        &[st.pgt_id.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     crate::monitor::alert_resumed(&schema, &table_name);
 
     pgrx::info!(
-        "Stream table {}.{} resumed (pgs_id={})",
+        "Stream table {}.{} resumed (pgt_id={})",
         schema,
         table_name,
-        st.pgs_id
+        st.pgt_id
     );
     Ok(())
 }
 
 /// Manually trigger a synchronous refresh of a stream table.
-#[pg_extern(schema = "pgstream")]
+#[pg_extern(schema = "pgtrickle")]
 fn refresh_stream_table(name: &str) {
     let result = refresh_stream_table_impl(name);
     if let Err(e) = result {
@@ -543,14 +543,14 @@ fn refresh_stream_table(name: &str) {
     }
 }
 
-fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
+fn refresh_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
     // Phase 10: Check if ST is suspended — refuse manual refresh
     if st.status == StStatus::Suspended {
-        return Err(PgStreamError::InvalidArgument(format!(
-            "stream table {}.{} is suspended; use pgstream.resume_stream_table('{}') first",
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "stream table {}.{} is suspended; use pgtrickle.resume_stream_table('{}') first",
             schema,
             table_name,
             if schema == "public" {
@@ -567,16 +567,16 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     // frontier computation, DVM, cleanup) — just update the timestamp.
     //
     // G-N3 optimization: source OIDs are fetched once and reused.
-    let source_oids = get_source_oids_for_manual_refresh(st.pgs_id)?;
+    let source_oids = get_source_oids_for_manual_refresh(st.pgt_id)?;
 
     // Phase 10: Advisory lock to prevent concurrent refresh
     let got_lock =
-        Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_lock($1)", &[st.pgs_id.into()])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+        Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_lock($1)", &[st.pgt_id.into()])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
             .unwrap_or(false);
 
     if !got_lock {
-        return Err(PgStreamError::RefreshSkipped(format!(
+        return Err(PgTrickleError::RefreshSkipped(format!(
             "{}.{} — another refresh is already in progress",
             schema, table_name,
         )));
@@ -586,7 +586,7 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgStreamError> {
     let result = execute_manual_refresh(&st, &schema, &table_name, &source_oids);
 
     // Release the lock
-    let _ = Spi::get_one_with_args::<bool>("SELECT pg_advisory_unlock($1)", &[st.pgs_id.into()]);
+    let _ = Spi::get_one_with_args::<bool>("SELECT pg_advisory_unlock($1)", &[st.pgt_id.into()]);
 
     result
 }
@@ -600,7 +600,7 @@ fn execute_manual_refresh(
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     match st.refresh_mode {
         RefreshMode::Full => execute_manual_full_refresh(st, schema, table_name, source_oids),
         RefreshMode::Differential => {
@@ -613,14 +613,14 @@ fn execute_manual_refresh(
 ///
 /// When user triggers are detected (and the GUC is not `"off"`), they are
 /// suppressed during the TRUNCATE + INSERT via `DISABLE TRIGGER USER` /
-/// `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so
+/// `ENABLE TRIGGER USER`. A `NOTIFY pgtrickle_refresh` is emitted so
 /// listeners know a FULL refresh occurred.
 fn execute_manual_full_refresh(
     st: &StreamTableMeta,
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let quoted_table = format!(
         "{}.{}",
         quote_identifier(schema),
@@ -628,30 +628,30 @@ fn execute_manual_full_refresh(
     );
 
     // Check for user triggers to suppress during FULL refresh.
-    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let user_triggers_mode = crate::config::pg_trickle_user_triggers();
     let has_triggers = match user_triggers_mode.as_str() {
         "on" => true,
         "off" => false,
-        _ => crate::cdc::has_user_triggers(st.pgs_relid)?,
+        _ => crate::cdc::has_user_triggers(st.pgt_relid)?,
     };
 
     // Suppress user triggers during TRUNCATE + INSERT to prevent
     // spurious trigger invocations with wrong semantics.
     if has_triggers {
         Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     let truncate_sql = format!("TRUNCATE {quoted_table}");
-    Spi::run(&truncate_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    Spi::run(&truncate_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     // For aggregate/distinct STs in DIFFERENTIAL mode, inject COUNT(*)
-    // into the defining query so __pgs_count is populated for subsequent
+    // into the defining query so __pgt_count is populated for subsequent
     // differential refreshes.
     let effective_query = if st.refresh_mode == RefreshMode::Differential
-        && crate::dvm::query_needs_pgs_count(&st.defining_query)
+        && crate::dvm::query_needs_pgt_count(&st.defining_query)
     {
-        inject_pgs_count(&st.defining_query)
+        inject_pgt_count(&st.defining_query)
     } else {
         st.defining_query.clone()
     };
@@ -665,28 +665,28 @@ fn execute_manual_full_refresh(
             ua_sql
         } else {
             let row_id_expr = crate::dvm::row_id_expr_for_query(&st.defining_query);
-            format!("SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({effective_query}) sub",)
+            format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
         };
 
     let insert_sql = format!("INSERT INTO {quoted_table} {insert_body}");
-    Spi::run(&insert_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    Spi::run(&insert_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     // Re-enable user triggers and emit NOTIFY so listeners know a FULL
     // refresh occurred.
     if has_triggers {
         Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         let escaped_name = table_name.replace('\'', "''");
         let escaped_schema = schema.replace('\'', "''");
         Spi::run(&format!(
-            "NOTIFY pgstream_refresh, '{{\"stream_table\": \"{escaped_name}\", \
+            "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
              \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\"}}'"
         ))
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         pgrx::info!(
-            "pg_stream: FULL refresh of {}.{} with user triggers suppressed.",
+            "pg_trickle: FULL refresh of {}.{} with user triggers suppressed.",
             schema,
             table_name,
         );
@@ -698,7 +698,7 @@ fn execute_manual_full_refresh(
     let slot_positions = cdc::get_slot_positions(source_oids)?;
     let data_ts = get_data_timestamp_str();
     let frontier = version::compute_initial_frontier(&slot_positions, &data_ts);
-    StreamTableMeta::store_frontier_and_complete_refresh(st.pgs_id, &frontier, 0)?;
+    StreamTableMeta::store_frontier_and_complete_refresh(st.pgt_id, &frontier, 0)?;
 
     pgrx::info!("Stream table {}.{} refreshed (FULL)", schema, table_name);
     Ok(())
@@ -712,7 +712,7 @@ fn execute_manual_differential_refresh(
     schema: &str,
     table_name: &str,
     source_oids: &[pg_sys::Oid],
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let prev_frontier = st.frontier.clone().unwrap_or_default();
 
     // If no previous frontier, the ST has never been refreshed or was
@@ -736,7 +736,7 @@ fn execute_manual_differential_refresh(
         refresh::execute_differential_refresh(st, &prev_frontier, &new_frontier)?;
 
     // Store the new frontier and mark refresh complete in a single SPI call (S3).
-    StreamTableMeta::store_frontier_and_complete_refresh(st.pgs_id, &new_frontier, rows_inserted)?;
+    StreamTableMeta::store_frontier_and_complete_refresh(st.pgt_id, &new_frontier, rows_inserted)?;
 
     pgrx::info!(
         "Stream table {}.{} refreshed (DIFFERENTIAL: +{} -{})",
@@ -749,8 +749,8 @@ fn execute_manual_differential_refresh(
 }
 
 /// Get source table OIDs for a stream table (used by manual refresh path).
-fn get_source_oids_for_manual_refresh(pgs_id: i64) -> Result<Vec<pg_sys::Oid>, PgStreamError> {
-    let deps = StDependency::get_for_st(pgs_id)?;
+fn get_source_oids_for_manual_refresh(pgt_id: i64) -> Result<Vec<pg_sys::Oid>, PgTrickleError> {
+    let deps = StDependency::get_for_st(pgt_id)?;
     Ok(deps
         .into_iter()
         .filter(|dep| dep.source_type == "TABLE")
@@ -771,7 +771,7 @@ fn get_data_timestamp_str() -> String {
 ///
 /// Used by SQL views to compare schedule. Returns NULL for invalid input
 /// (cron expressions should not be passed).
-#[pg_extern(schema = "pgstream", immutable, parallel_safe)]
+#[pg_extern(schema = "pgtrickle", immutable, parallel_safe)]
 fn parse_duration_seconds(input: &str) -> Option<i64> {
     parse_duration(input).ok()
 }
@@ -780,9 +780,9 @@ fn parse_duration_seconds(input: &str) -> Option<i64> {
 ///
 /// Returns a summary row per stream table including schedule configuration,
 /// data timestamp, and computed staleness interval.
-#[pg_extern(schema = "pgstream", name = "pgs_status")]
+#[pg_extern(schema = "pgtrickle", name = "pgt_status")]
 #[allow(clippy::type_complexity)]
-fn pgs_status() -> TableIterator<
+fn pgt_status() -> TableIterator<
     'static,
     (
         name!(name, String),
@@ -798,10 +798,10 @@ fn pgs_status() -> TableIterator<
     let rows: Vec<_> = Spi::connect(|client| {
         let result = client
             .select(
-                "SELECT pgs_schema || '.' || pgs_name, status, refresh_mode, \
+                "SELECT pgt_schema || '.' || pgt_name, status, refresh_mode, \
                  is_populated, consecutive_errors, schedule, data_timestamp, \
                  now() - data_timestamp AS staleness \
-                 FROM pgstream.pgs_stream_tables ORDER BY pgs_schema, pgs_name",
+                 FROM pgtrickle.pgt_stream_tables ORDER BY pgt_schema, pgt_name",
                 None,
                 &[],
             )
@@ -840,12 +840,12 @@ fn pgs_status() -> TableIterator<
 /// scan delta window-function partitioning.
 fn setup_cdc_for_source(
     source_oid: pg_sys::Oid,
-    pgs_id: i64,
+    pgt_id: i64,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     // Check if already tracked
     let already_tracked = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_change_tracking WHERE source_relid = $1)",
+        "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_change_tracking WHERE source_relid = $1)",
         &[source_oid.into()],
     )
     .unwrap_or(Some(false))
@@ -867,24 +867,24 @@ fn setup_cdc_for_source(
 
         // Insert tracking record
         Spi::run_with_args(
-            "INSERT INTO pgstream.pgs_change_tracking (source_relid, slot_name, tracked_by_pgs_ids) \
+            "INSERT INTO pgtrickle.pgt_change_tracking (source_relid, slot_name, tracked_by_pgt_ids) \
              VALUES ($1, $2, ARRAY[$3])",
             &[
                 source_oid.into(),
                 trigger_name.as_str().into(),
-                pgs_id.into(),
+                pgt_id.into(),
             ],
         )
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     } else {
-        // Already tracked — add this pgs_id to the tracking array
+        // Already tracked — add this pgt_id to the tracking array
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_change_tracking \
-             SET tracked_by_pgs_ids = array_append(tracked_by_pgs_ids, $1) \
-             WHERE source_relid = $2 AND NOT ($1 = ANY(tracked_by_pgs_ids))",
-            &[pgs_id.into(), source_oid.into()],
+            "UPDATE pgtrickle.pgt_change_tracking \
+             SET tracked_by_pgt_ids = array_append(tracked_by_pgt_ids, $1) \
+             WHERE source_relid = $2 AND NOT ($1 = ANY(tracked_by_pgt_ids))",
+            &[pgt_id.into(), source_oid.into()],
         )
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     Ok(())
@@ -894,11 +894,14 @@ fn setup_cdc_for_source(
 ///
 /// If no other STs reference this source, drop the CDC trigger and
 /// change buffer table.
-fn cleanup_cdc_for_source(source_oid: pg_sys::Oid, cdc_mode: CdcMode) -> Result<(), PgStreamError> {
+fn cleanup_cdc_for_source(
+    source_oid: pg_sys::Oid,
+    cdc_mode: CdcMode,
+) -> Result<(), PgTrickleError> {
     // Check if any other STs still reference this source
     let still_referenced = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS( \
-            SELECT 1 FROM pgstream.pgs_dependencies WHERE source_relid = $1 \
+            SELECT 1 FROM pgtrickle.pgt_dependencies WHERE source_relid = $1 \
         )",
         &[source_oid.into()],
     )
@@ -906,7 +909,7 @@ fn cleanup_cdc_for_source(source_oid: pg_sys::Oid, cdc_mode: CdcMode) -> Result<
     .unwrap_or(false);
 
     if !still_referenced {
-        let change_schema = config::pg_stream_change_buffer_schema();
+        let change_schema = config::pg_trickle_change_buffer_schema();
 
         // If WAL-based CDC was active (or transitioning), clean up
         // the replication slot and publication first.
@@ -949,7 +952,7 @@ fn cleanup_cdc_for_source(source_oid: pg_sys::Oid, cdc_mode: CdcMode) -> Result<
 
         // Delete tracking record
         let _ = Spi::run_with_args(
-            "DELETE FROM pgstream.pgs_change_tracking WHERE source_relid = $1",
+            "DELETE FROM pgtrickle.pgt_change_tracking WHERE source_relid = $1",
             &[source_oid.into()],
         );
     }
@@ -958,17 +961,17 @@ fn cleanup_cdc_for_source(source_oid: pg_sys::Oid, cdc_mode: CdcMode) -> Result<
 }
 
 /// Parse a possibly schema-qualified name into `(schema, table)`.
-fn parse_qualified_name(name: &str) -> Result<(String, String), PgStreamError> {
+fn parse_qualified_name(name: &str) -> Result<(String, String), PgTrickleError> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
     match parts.len() {
         1 => {
             let schema = Spi::get_one::<String>("SELECT current_schema()::text")
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_else(|| "public".to_string());
             Ok((schema, parts[0].to_string()))
         }
         2 => Ok((parts[0].to_string(), parts[1].to_string())),
-        _ => Err(PgStreamError::InvalidArgument(format!(
+        _ => Err(PgTrickleError::InvalidArgument(format!(
             "invalid table name: {name}"
         ))),
     }
@@ -982,19 +985,19 @@ pub struct ColumnDef {
 }
 
 /// Validate a defining query by executing `SELECT ... LIMIT 0`.
-fn validate_defining_query(query: &str) -> Result<Vec<ColumnDef>, PgStreamError> {
+fn validate_defining_query(query: &str) -> Result<Vec<ColumnDef>, PgTrickleError> {
     let check_sql = format!("SELECT * FROM ({query}) sub LIMIT 0");
 
     // Execute to verify syntax and extract columns
     Spi::connect(|client| {
         let result = client
             .select(&check_sql, None, &[])
-            .map_err(|e| PgStreamError::QueryParseError(format!("{}", e)))?;
+            .map_err(|e| PgTrickleError::QueryParseError(format!("{}", e)))?;
 
         // Extract column info from the result tuple descriptor
         let ncols = result
             .columns()
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut columns = Vec::new();
         for i in 1..=ncols {
             let col_name = result
@@ -1008,7 +1011,7 @@ fn validate_defining_query(query: &str) -> Result<Vec<ColumnDef>, PgStreamError>
         }
 
         if columns.is_empty() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "Defining query returns no columns".into(),
             ));
         }
@@ -1034,10 +1037,10 @@ pub(crate) enum Schedule {
 /// A bare integer (e.g., `"60"`) is treated as seconds.
 ///
 /// Examples: `"30s"`, `"5m"`, `"1h"`, `"1h30m"`, `"1d"`, `"2w"`, `"60"`.
-pub(crate) fn parse_duration(s: &str) -> Result<i64, PgStreamError> {
+pub(crate) fn parse_duration(s: &str) -> Result<i64, PgTrickleError> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(PgStreamError::InvalidArgument(
+        return Err(PgTrickleError::InvalidArgument(
             "schedule cannot be empty".into(),
         ));
     }
@@ -1047,7 +1050,7 @@ pub(crate) fn parse_duration(s: &str) -> Result<i64, PgStreamError> {
         return if secs >= 0 {
             Ok(secs)
         } else {
-            Err(PgStreamError::InvalidArgument(format!(
+            Err(PgTrickleError::InvalidArgument(format!(
                 "schedule cannot be negative: '{s}'"
             )))
         };
@@ -1068,7 +1071,7 @@ pub(crate) fn parse_duration(s: &str) -> Result<i64, PgStreamError> {
                 'd' => 86400,
                 'w' => 604800,
                 _ => {
-                    return Err(PgStreamError::InvalidArgument(format!(
+                    return Err(PgTrickleError::InvalidArgument(format!(
                         "invalid duration unit '{ch}' in '{s}'. \
                          Use s (seconds), m (minutes), h (hours), d (days), w (weeks). \
                          Example: '5m', '1h30m', '2d'"
@@ -1077,13 +1080,13 @@ pub(crate) fn parse_duration(s: &str) -> Result<i64, PgStreamError> {
             };
 
             if num_buf.is_empty() {
-                return Err(PgStreamError::InvalidArgument(format!(
+                return Err(PgTrickleError::InvalidArgument(format!(
                     "expected a number before '{ch}' in duration '{s}'"
                 )));
             }
 
             let n: i64 = num_buf.parse().map_err(|_| {
-                PgStreamError::InvalidArgument(format!(
+                PgTrickleError::InvalidArgument(format!(
                     "invalid number '{num_buf}' in duration '{s}'"
                 ))
             })?;
@@ -1097,19 +1100,19 @@ pub(crate) fn parse_duration(s: &str) -> Result<i64, PgStreamError> {
     // Trailing digits without a unit → error (require explicit unit)
     if !num_buf.is_empty() {
         if found_unit {
-            return Err(PgStreamError::InvalidArgument(format!(
+            return Err(PgTrickleError::InvalidArgument(format!(
                 "trailing digits '{num_buf}' without a unit in duration '{s}'. \
                  Append s, m, h, d, or w. Example: '1h30m'"
             )));
         }
         // Pure digits already handled above; shouldn't reach here
-        return Err(PgStreamError::InvalidArgument(format!(
+        return Err(PgTrickleError::InvalidArgument(format!(
             "invalid duration '{s}'"
         )));
     }
 
     if total_secs < 0 {
-        return Err(PgStreamError::InvalidArgument(format!(
+        return Err(PgTrickleError::InvalidArgument(format!(
             "schedule cannot be negative: '{s}'"
         )));
     }
@@ -1118,11 +1121,11 @@ pub(crate) fn parse_duration(s: &str) -> Result<i64, PgStreamError> {
 }
 
 /// Validate that schedule meets the minimum.
-fn validate_schedule(seconds: i64) -> Result<(), PgStreamError> {
-    let min = config::pg_stream_min_schedule_seconds() as i64;
+fn validate_schedule(seconds: i64) -> Result<(), PgTrickleError> {
+    let min = config::pg_trickle_min_schedule_seconds() as i64;
 
     if seconds < min {
-        return Err(PgStreamError::InvalidArgument(format!(
+        return Err(PgTrickleError::InvalidArgument(format!(
             "schedule must be at least {}s, got {}s",
             min, seconds
         )));
@@ -1141,10 +1144,10 @@ fn validate_schedule(seconds: i64) -> Result<(), PgStreamError> {
 /// prefix.
 ///
 /// Returns a `Schedule` variant.
-pub(crate) fn parse_schedule(s: &str) -> Result<Schedule, PgStreamError> {
+pub(crate) fn parse_schedule(s: &str) -> Result<Schedule, PgTrickleError> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(PgStreamError::InvalidArgument(
+        return Err(PgTrickleError::InvalidArgument(
             "schedule cannot be empty".into(),
         ));
     }
@@ -1162,11 +1165,11 @@ pub(crate) fn parse_schedule(s: &str) -> Result<Schedule, PgStreamError> {
 }
 
 /// Validate a cron expression by parsing it with croner.
-fn validate_cron(expr: &str) -> Result<(), PgStreamError> {
+fn validate_cron(expr: &str) -> Result<(), PgTrickleError> {
     use std::str::FromStr;
 
     croner::Cron::from_str(expr).map_err(|e| {
-        PgStreamError::InvalidArgument(format!("invalid cron expression '{expr}': {e}"))
+        PgTrickleError::InvalidArgument(format!("invalid cron expression '{expr}': {e}"))
     })?;
 
     Ok(())
@@ -1208,12 +1211,12 @@ pub(crate) fn cron_is_due(cron_expr: &str, last_refresh_epoch: Option<i64>) -> b
 /// fully resolved table OIDs from the query's range table entries.
 pub(crate) fn extract_source_relations(
     query: &str,
-) -> Result<Vec<(pg_sys::Oid, String)>, PgStreamError> {
+) -> Result<Vec<(pg_sys::Oid, String)>, PgTrickleError> {
     use pgrx::PgList;
     use std::ffi::CString;
 
     let c_sql = CString::new(query)
-        .map_err(|e| PgStreamError::QueryParseError(format!("Query contains null byte: {}", e)))?;
+        .map_err(|e| PgTrickleError::QueryParseError(format!("Query contains null byte: {}", e)))?;
 
     // SAFETY: We're calling PostgreSQL C parser functions with valid inputs.
     // raw_parser and parse_analyze_fixedparams are safe when called within
@@ -1224,7 +1227,7 @@ pub(crate) fn extract_source_relations(
 
         let stmts = PgList::<pg_sys::RawStmt>::from_pg(raw_list);
         let raw_stmt = stmts.get_ptr(0).ok_or_else(|| {
-            PgStreamError::QueryParseError("Query produced no parse tree nodes".into())
+            PgTrickleError::QueryParseError("Query produced no parse tree nodes".into())
         })?;
 
         // Step 2: Analyze — resolves all table names to OIDs
@@ -1237,7 +1240,7 @@ pub(crate) fn extract_source_relations(
         );
 
         if query_node.is_null() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "Query analysis returned null".into(),
             ));
         }
@@ -1254,7 +1257,7 @@ pub(crate) fn extract_source_relations(
         collect_relation_oids(query_node, &mut relations, &mut seen_oids);
 
         if relations.is_empty() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "Defining query references no tables".into(),
             ));
         }
@@ -1405,7 +1408,7 @@ fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String)]) {
         // F13: Partitioned table info
         if relkind == "p" {
             pgrx::info!(
-                "pg_stream: source table {} is a partitioned table. \
+                "pg_trickle: source table {} is a partitioned table. \
                  CDC triggers on the parent fire for all DML routed to \
                  child partitions (PostgreSQL 13+).",
                 table_name,
@@ -1424,7 +1427,7 @@ fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String)]) {
 
         if is_sub_target {
             pgrx::warning!(
-                "pg_stream: source table {} is a logical replication target. \
+                "pg_trickle: source table {} is a logical replication target. \
                  Changes arriving via replication will NOT fire CDC triggers — \
                  the stream table may become stale. Consider using \
                  cdc_mode = 'wal' or a FULL refresh schedule.",
@@ -1438,7 +1441,7 @@ fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String)]) {
 fn classify_source_relation(oid: pg_sys::Oid) -> String {
     // Check if this OID is a stream table
     let is_st = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_relid = $1)",
+        "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_stream_tables WHERE pgt_relid = $1)",
         &[oid.into()],
     )
     .unwrap_or(Some(false))
@@ -1468,7 +1471,7 @@ fn classify_source_relation(oid: pg_sys::Oid) -> String {
 ///
 /// Loads the existing DAG from the catalog, adds the proposed edges,
 /// and runs Kahn's algorithm for cycle detection.
-fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgStreamError> {
+fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgTrickleError> {
     if source_relids.is_empty() {
         return Ok(());
     }
@@ -1484,9 +1487,9 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgStr
     }
 
     // Build the DAG from catalog and add proposed edges
-    let mut dag = StDag::build_from_catalog(config::pg_stream_min_schedule_seconds())?;
+    let mut dag = StDag::build_from_catalog(config::pg_trickle_min_schedule_seconds())?;
 
-    // Create a temporary node for the proposed ST (use a sentinel pgs_id)
+    // Create a temporary node for the proposed ST (use a sentinel pgt_id)
     let proposed_id = NodeId::StreamTable(i64::MAX);
     dag.add_st_node(DagNode {
         id: proposed_id,
@@ -1500,9 +1503,9 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgStr
     // Add proposed edges
     for (source_oid, source_type) in source_relids {
         let source_node = if source_type == "STREAM_TABLE" {
-            // Find the pgs_id for this source OID
+            // Find the pgt_id for this source OID
             match crate::catalog::StreamTableMeta::get_by_relid(*source_oid) {
-                Ok(meta) => NodeId::StreamTable(meta.pgs_id),
+                Ok(meta) => NodeId::StreamTable(meta.pgt_id),
                 Err(_) => NodeId::BaseTable(source_oid.to_u32()),
             }
         } else {
@@ -1520,7 +1523,7 @@ fn build_create_table_sql(
     schema: &str,
     name: &str,
     columns: &[ColumnDef],
-    needs_pgs_count: bool,
+    needs_pgt_count: bool,
 ) -> String {
     let col_defs: Vec<String> = columns
         .iter()
@@ -1542,15 +1545,15 @@ fn build_create_table_sql(
         })
         .collect();
 
-    // Add __pgs_count auxiliary column for aggregate/distinct STs.
-    let count_col = if needs_pgs_count {
-        ",\n    __pgs_count BIGINT NOT NULL DEFAULT 0"
+    // Add __pgt_count auxiliary column for aggregate/distinct STs.
+    let count_col = if needs_pgt_count {
+        ",\n    __pgt_count BIGINT NOT NULL DEFAULT 0"
     } else {
         ""
     };
 
     format!(
-        "CREATE TABLE {}.{} (\n    __pgs_row_id BIGINT,\n{}{}\n)",
+        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}\n)",
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
@@ -1559,14 +1562,14 @@ fn build_create_table_sql(
 }
 
 /// Get the OID of a table by schema and name.
-fn get_table_oid(schema: &str, name: &str) -> Result<pg_sys::Oid, PgStreamError> {
+fn get_table_oid(schema: &str, name: &str) -> Result<pg_sys::Oid, PgTrickleError> {
     let oid = Spi::get_one_with_args::<pg_sys::Oid>(
         "SELECT ($1 || '.' || $2)::regclass::oid",
         &[schema.into(), name.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .ok_or_else(|| {
-        PgStreamError::NotFound(format!(
+        PgTrickleError::NotFound(format!(
             "table {}.{} not found after creation",
             schema, name
         ))
@@ -1579,14 +1582,14 @@ fn initialize_st(
     schema: &str,
     name: &str,
     query: &str,
-    pgs_id: i64,
+    pgt_id: i64,
     _columns: &[ColumnDef],
-    needs_pgs_count: bool,
-) -> Result<(), PgStreamError> {
-    // For aggregate/distinct STs, inject COUNT(*) AS __pgs_count into the
+    needs_pgt_count: bool,
+) -> Result<(), PgTrickleError> {
+    // For aggregate/distinct STs, inject COUNT(*) AS __pgt_count into the
     // defining query so the auxiliary column is populated correctly.
-    let effective_query = if needs_pgs_count {
-        inject_pgs_count(query)
+    let effective_query = if needs_pgt_count {
+        inject_pgt_count(query)
     } else {
         query.to_string()
     };
@@ -1599,7 +1602,7 @@ fn initialize_st(
         ua_sql
     } else {
         let row_id_expr = crate::dvm::row_id_expr_for_query(query);
-        format!("SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({effective_query}) sub",)
+        format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
     };
 
     let insert_sql = format!(
@@ -1609,14 +1612,14 @@ fn initialize_st(
     );
 
     Spi::run(&insert_sql)
-        .map_err(|e| PgStreamError::SpiError(format!("Failed to initialize ST: {}", e)))?;
+        .map_err(|e| PgTrickleError::SpiError(format!("Failed to initialize ST: {}", e)))?;
 
     // Update catalog
     let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?
-        .ok_or_else(|| PgStreamError::InternalError("now() returned NULL".into()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
 
-    StreamTableMeta::update_after_refresh(pgs_id, now, 0)?;
+    StreamTableMeta::update_after_refresh(pgt_id, now, 0)?;
     Ok(())
 }
 
@@ -1625,15 +1628,15 @@ fn quote_identifier(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
-/// Inject `COUNT(*) AS __pgs_count` into an aggregate/distinct defining query
+/// Inject `COUNT(*) AS __pgt_count` into an aggregate/distinct defining query
 /// so that the full refresh populates the auxiliary count column.
 ///
-/// For aggregate queries, this adds `, COUNT(*) AS __pgs_count` before the
+/// For aggregate queries, this adds `, COUNT(*) AS __pgt_count` before the
 /// first top-level `FROM`.
 ///
 /// For DISTINCT queries, transforms `SELECT DISTINCT cols FROM ...` into
-/// `SELECT cols, COUNT(*) AS __pgs_count FROM ... GROUP BY cols`.
-pub fn inject_pgs_count(query: &str) -> String {
+/// `SELECT cols, COUNT(*) AS __pgt_count FROM ... GROUP BY cols`.
+pub fn inject_pgt_count(query: &str) -> String {
     // Detect SELECT DISTINCT — needs special handling because we must
     // replace DISTINCT with GROUP BY (can't mix DISTINCT with aggregates).
     if let Some(distinct_info) = detect_and_strip_distinct(query) {
@@ -1645,7 +1648,7 @@ pub fn inject_pgs_count(query: &str) -> String {
             let from_part = &distinct_info.stripped[from_pos..];
             let col_list = distinct_info.columns.join(", ");
             return format!(
-                "{select_part}, COUNT(*) AS __pgs_count {from_part} GROUP BY {col_list}",
+                "{select_part}, COUNT(*) AS __pgt_count {from_part} GROUP BY {col_list}",
             );
         }
         // Fallback if FROM not found after stripping DISTINCT
@@ -1655,12 +1658,12 @@ pub fn inject_pgs_count(query: &str) -> String {
     // Non-DISTINCT (aggregate) queries: just inject COUNT(*) before FROM.
     if let Some(pos) = find_top_level_keyword(query, "FROM") {
         format!(
-            "{}, COUNT(*) AS __pgs_count {}",
+            "{}, COUNT(*) AS __pgt_count {}",
             query[..pos].trim_end(),
             &query[pos..],
         )
     } else {
-        // Fallback: can't inject; return as-is (will leave __pgs_count = DEFAULT 0)
+        // Fallback: can't inject; return as-is (will leave __pgt_count = DEFAULT 0)
         query.to_string()
     }
 }
@@ -1824,55 +1827,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_inject_pgs_count_distinct_basic() {
+    fn test_inject_pgt_count_distinct_basic() {
         let query = "SELECT DISTINCT color, size FROM prop_dist";
-        let result = inject_pgs_count(query);
+        let result = inject_pgt_count(query);
         assert_eq!(
             result,
-            "SELECT color, size, COUNT(*) AS __pgs_count FROM prop_dist GROUP BY color, size"
+            "SELECT color, size, COUNT(*) AS __pgt_count FROM prop_dist GROUP BY color, size"
         );
     }
 
     #[test]
-    fn test_inject_pgs_count_distinct_lowercase() {
+    fn test_inject_pgt_count_distinct_lowercase() {
         let query = "select distinct color, size from prop_dist";
-        let result = inject_pgs_count(query);
+        let result = inject_pgt_count(query);
         // Note: "SELECT" is uppercased because detect_and_strip_distinct
         // reconstructs the prefix with literal "SELECT".
         assert_eq!(
             result,
-            "SELECT color, size, COUNT(*) AS __pgs_count from prop_dist GROUP BY color, size"
+            "SELECT color, size, COUNT(*) AS __pgt_count from prop_dist GROUP BY color, size"
         );
     }
 
     #[test]
-    fn test_inject_pgs_count_distinct_with_where() {
+    fn test_inject_pgt_count_distinct_with_where() {
         let query = "SELECT DISTINCT color FROM items WHERE active = true";
-        let result = inject_pgs_count(query);
+        let result = inject_pgt_count(query);
         assert_eq!(
             result,
-            "SELECT color, COUNT(*) AS __pgs_count FROM items WHERE active = true GROUP BY color"
+            "SELECT color, COUNT(*) AS __pgt_count FROM items WHERE active = true GROUP BY color"
         );
     }
 
     #[test]
-    fn test_inject_pgs_count_aggregate_no_distinct() {
+    fn test_inject_pgt_count_aggregate_no_distinct() {
         // Non-DISTINCT aggregate: just adds COUNT(*) before FROM
         let query = "SELECT region, SUM(amount) FROM orders GROUP BY region";
-        let result = inject_pgs_count(query);
+        let result = inject_pgt_count(query);
         assert_eq!(
             result,
-            "SELECT region, SUM(amount), COUNT(*) AS __pgs_count FROM orders GROUP BY region"
+            "SELECT region, SUM(amount), COUNT(*) AS __pgt_count FROM orders GROUP BY region"
         );
     }
 
     #[test]
-    fn test_inject_pgs_count_distinct_three_cols() {
+    fn test_inject_pgt_count_distinct_three_cols() {
         let query = "SELECT DISTINCT a, b, c FROM t1";
-        let result = inject_pgs_count(query);
+        let result = inject_pgt_count(query);
         assert_eq!(
             result,
-            "SELECT a, b, c, COUNT(*) AS __pgs_count FROM t1 GROUP BY a, b, c"
+            "SELECT a, b, c, COUNT(*) AS __pgt_count FROM t1 GROUP BY a, b, c"
         );
     }
 

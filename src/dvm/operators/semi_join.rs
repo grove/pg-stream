@@ -29,17 +29,17 @@
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::{build_snapshot_sql, rewrite_join_condition};
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a SemiJoin node.
-pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::SemiJoin {
         condition,
         left,
         right,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_semi_join called on non-SemiJoin node".into(),
         ));
     };
@@ -73,15 +73,15 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .collect();
 
     // Row ID: passthrough from left side
-    let hash_part1 = "dl.__pgs_row_id".to_string();
-    // For Part 2: hash left row using pg_stream_hash since it comes from snapshot
+    let hash_part1 = "dl.__pgt_row_id".to_string();
+    // For Part 2: hash left row using pg_trickle_hash since it comes from snapshot
     let hash_part2 = {
         let key_exprs: Vec<String> = left_cols
             .iter()
             .map(|c| format!("l.{}::TEXT", quote_ident(c)))
             .collect();
         format!(
-            "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
             key_exprs.join(", ")
         )
     };
@@ -93,15 +93,15 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // Expressed as a subquery:
     //   (SELECT * FROM right_table
     //    EXCEPT ALL
-    //    SELECT <right_cols> FROM delta_right WHERE __pgs_action = 'I'
+    //    SELECT <right_cols> FROM delta_right WHERE __pgt_action = 'I'
     //    UNION ALL
-    //    SELECT <right_cols> FROM delta_right WHERE __pgs_action = 'D')
+    //    SELECT <right_cols> FROM delta_right WHERE __pgt_action = 'D')
     let right_cols = &right_result.columns;
-    // Filter out internal metadata columns (__pgs_count) from the EXCEPT ALL /
+    // Filter out internal metadata columns (__pgt_count) from the EXCEPT ALL /
     // UNION ALL column list. These are aggregate bookkeeping columns that:
     // (a) don't exist in the snapshot (build_snapshot_sql doesn't produce them)
     // (b) shouldn't participate in set-difference matching
-    let right_user_cols: Vec<&String> = right_cols.iter().filter(|c| *c != "__pgs_count").collect();
+    let right_user_cols: Vec<&String> = right_cols.iter().filter(|c| *c != "__pgt_count").collect();
     let right_col_list: String = right_user_cols
         .iter()
         .map(|c| quote_ident(c))
@@ -112,9 +112,9 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     let r_old_snapshot = format!(
         "(SELECT {right_col_list} FROM {right_table} {right_alias} \
          EXCEPT ALL \
-         SELECT {right_col_list} FROM {delta_right} WHERE __pgs_action = 'I' \
+         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'I' \
          UNION ALL \
-         SELECT {right_col_list} FROM {delta_right} WHERE __pgs_action = 'D') ",
+         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'D') ",
         delta_right = right_result.cte_name,
         right_alias = quote_ident(right_alias),
     );
@@ -124,8 +124,8 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     let sql = format!(
         "\
 -- Part 1: delta_left rows that match current right (semi-join filter)
-SELECT {hash_part1} AS __pgs_row_id,
-       dl.__pgs_action,
+SELECT {hash_part1} AS __pgt_row_id,
+       dl.__pgt_action,
        {dl_cols}
 FROM {delta_left} dl
 WHERE EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part1})
@@ -135,10 +135,10 @@ UNION ALL
 -- Part 2: left rows whose semi-join status changed due to right-side delta
 -- Emit 'I' if row now matches R_current but didn't match R_old
 -- Emit 'D' if row matched R_old but no longer matches R_current
-SELECT {hash_part2} AS __pgs_row_id,
+SELECT {hash_part2} AS __pgt_row_id,
        CASE WHEN EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part2_new})
             THEN 'I' ELSE 'D'
-       END AS __pgs_action,
+       END AS __pgt_action,
        {l_cols}
 FROM {left_snapshot} l
 WHERE EXISTS (SELECT 1 FROM {delta_right} dr WHERE {cond_part2_dr})

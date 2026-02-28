@@ -10,8 +10,8 @@ use xxhash_rust::xxh64;
 ///
 /// This function is exposed as a SQL function for use in INSERT statements
 /// and delta query generation.
-#[pg_extern(schema = "pgstream", immutable, parallel_safe)]
-fn pg_stream_hash(input: &str) -> i64 {
+#[pg_extern(schema = "pgtrickle", immutable, parallel_safe)]
+fn pg_trickle_hash(input: &str) -> i64 {
     // Use a fixed seed for deterministic hashing
     const SEED: u64 = 0x517cc1b727220a95;
     let hash = xxh64::xxh64(input.as_bytes(), SEED);
@@ -21,8 +21,8 @@ fn pg_stream_hash(input: &str) -> i64 {
 /// Compute a row ID by hashing multiple text values.
 ///
 /// Used for composite keys (e.g., join row IDs, group-by keys).
-#[pg_extern(schema = "pgstream", immutable, parallel_safe)]
-fn pg_stream_hash_multi(inputs: Vec<Option<String>>) -> i64 {
+#[pg_extern(schema = "pgtrickle", immutable, parallel_safe)]
+fn pg_trickle_hash_multi(inputs: Vec<Option<String>>) -> i64 {
     const SEED: u64 = 0x517cc1b727220a95;
 
     let mut combined = String::new();
@@ -67,10 +67,10 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    // ── pg_stream_hash() tests via raw xxh64 (same logic, avoids pg_extern) ──
+    // ── pg_trickle_hash() tests via raw xxh64 (same logic, avoids pg_extern) ──
 
     #[test]
-    fn test_pg_stream_hash_empty_string() {
+    fn test_pg_trickle_hash_empty_string() {
         const SEED: u64 = 0x517cc1b727220a95;
         let hash = xxh64::xxh64(b"", SEED);
         // Should produce a valid non-zero hash (xxHash of empty with non-zero seed)
@@ -78,14 +78,14 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_stream_hash_i64_range() {
+    fn test_pg_trickle_hash_i64_range() {
         // Verify the cast from u64 to i64 doesn't panic
         const SEED: u64 = 0x517cc1b727220a95;
         let hash = xxh64::xxh64(b"test", SEED);
         let _ = hash as i64; // Should not panic
     }
 
-    // ── pg_stream_hash_multi() separator logic ────────────────────────────
+    // ── pg_trickle_hash_multi() separator logic ────────────────────────────
 
     #[test]
     fn test_multi_hash_separator_prevents_collision() {

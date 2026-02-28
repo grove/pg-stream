@@ -1,4 +1,4 @@
-# pg_stream — Benchmark Guide
+# pg_trickle — Benchmark Guide
 
 This document explains how the database-level refresh benchmarks work and how to interpret their output.
 
@@ -110,7 +110,7 @@ Each change cycle applies a realistic mix of operations:
 
 ```
 1. Start a fresh PostgreSQL 18.x container
-2. Install the pg_stream extension
+2. Install the pg_trickle extension
 3. Create and populate the source table (10K or 100K rows)
 4. Create dimension table if needed (for join scenarios)
 5. ANALYZE for stable query plans
@@ -146,7 +146,7 @@ Both modes start from the same data to ensure a fair comparison. The 3-cycle des
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════════════╗
-║                    pg_stream Refresh Benchmark Results                      ║
+║                    pg_trickle Refresh Benchmark Results                      ║
 ╠════════════╤══════════╤════════╤═════════════╤═══════╤════════════╤═════════════════╣
 ║ Scenario   │ Rows     │ Chg %  │ Mode        │ Cycle │ Refresh ms │ ST Rows         ║
 ╠════════════╪══════════╪════════╪═════════════╪═══════╪════════════╪═════════════════╣
@@ -385,7 +385,7 @@ To enable Bencher for your fork or deployment:
    - Go to **Settings → Secrets and variables → Actions**
    - Add `BENCHER_API_TOKEN` with your Bencher API token
 
-3. **Update the project slug** in `.github/workflows/benchmarks.yml` if your Bencher project name differs from `pg-stream`.
+3. **Update the project slug** in `.github/workflows/benchmarks.yml` if your Bencher project name differs from `pg-trickle`.
 
 The workflow gracefully degrades — if `BENCHER_API_TOKEN` is not set, benchmarks still run and upload artifacts but skip Bencher tracking.
 

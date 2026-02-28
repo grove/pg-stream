@@ -3,11 +3,11 @@
 //! Monitors schema changes on upstream tables and handles direct DROP TABLE
 //! on stream table storage tables.
 //!
-//! ## Event trigger: `pg_stream_ddl_tracker`
+//! ## Event trigger: `pg_trickle_ddl_tracker`
 //!
 //! Installed via `extension_sql!()` as `ON ddl_command_end`. When any DDL
 //! completes, the handler queries `pg_event_trigger_ddl_commands()` to
-//! discover what changed, then checks `pgstream.pgs_dependencies` to find
+//! discover what changed, then checks `pgtrickle.pgt_dependencies` to find
 //! affected stream tables.
 //!
 //! - **ALTER TABLE** on an upstream source → mark downstream STs
@@ -24,13 +24,13 @@
 //!
 //! When ST `A` depends on base table `T`, and ST `B` depends on ST `A`,
 //! an ALTER TABLE on `T` must invalidate both `A` and `B`. The cascade
-//! is resolved by walking transitive dependencies in `pgstream.pgs_dependencies`.
+//! is resolved by walking transitive dependencies in `pgtrickle.pgt_dependencies`.
 
 use pgrx::prelude::*;
 
 use crate::catalog::{CdcMode, StDependency, StreamTableMeta};
 use crate::dag::StStatus;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::shmem;
 use crate::{cdc, config, wal_decoder};
 
@@ -44,12 +44,12 @@ use crate::{cdc, config, wal_decoder};
 ///
 /// Registered via `extension_sql!()` in lib.rs as:
 /// ```sql
-/// CREATE FUNCTION pgstream._on_ddl_end() RETURNS event_trigger ...
-/// CREATE EVENT TRIGGER pg_stream_ddl_tracker ON ddl_command_end
-///     EXECUTE FUNCTION pgstream._on_ddl_end();
+/// CREATE FUNCTION pgtrickle._on_ddl_end() RETURNS event_trigger ...
+/// CREATE EVENT TRIGGER pg_trickle_ddl_tracker ON ddl_command_end
+///     EXECUTE FUNCTION pgtrickle._on_ddl_end();
 /// ```
-#[pg_extern(schema = "pgstream", name = "_on_ddl_end", sql = false)]
-fn pg_stream_on_ddl_end() {
+#[pg_extern(schema = "pgtrickle", name = "_on_ddl_end", sql = false)]
+fn pg_trickle_on_ddl_end() {
     // Query the event trigger context for affected objects.
     // pg_event_trigger_ddl_commands() is only available inside an
     // event trigger context — calling it elsewhere will error.
@@ -58,7 +58,7 @@ fn pg_stream_on_ddl_end() {
         Err(e) => {
             // Not inside an event trigger context, or SPI error.
             // This can happen during CREATE EXTENSION itself — safe to ignore.
-            pgrx::debug1!("pg_stream_ddl_tracker: could not read DDL commands: {}", e);
+            pgrx::debug1!("pg_trickle_ddl_tracker: could not read DDL commands: {}", e);
             return;
         }
     };
@@ -84,7 +84,7 @@ struct DdlCommand {
 }
 
 /// Collect DDL commands from the event trigger context.
-fn collect_ddl_commands() -> Result<Vec<DdlCommand>, PgStreamError> {
+fn collect_ddl_commands() -> Result<Vec<DdlCommand>, PgTrickleError> {
     Spi::connect(|client| {
         let table = client
             .select(
@@ -93,11 +93,11 @@ fn collect_ddl_commands() -> Result<Vec<DdlCommand>, PgStreamError> {
                 None,
                 &[],
             )
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         let mut commands = Vec::new();
         for row in table {
-            let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
+            let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
 
             let objid = row
                 .get::<pg_sys::Oid>(1)
@@ -168,12 +168,12 @@ fn handle_ddl_command(cmd: &DdlCommand) {
 fn handle_view_change(cmd: &DdlCommand) {
     let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
 
-    // Check if any ST depends on this view OID via pgs_dependencies.
-    let affected_pgs_ids = match find_downstream_pgs_ids(cmd.objid) {
+    // Check if any ST depends on this view OID via pgt_dependencies.
+    let affected_pgt_ids = match find_downstream_pgt_ids(cmd.objid) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to query deps for view {}: {}",
+                "pg_trickle_ddl_tracker: failed to query deps for view {}: {}",
                 identity,
                 e,
             );
@@ -181,51 +181,51 @@ fn handle_view_change(cmd: &DdlCommand) {
         }
     };
 
-    if affected_pgs_ids.is_empty() {
+    if affected_pgt_ids.is_empty() {
         return;
     }
 
     pgrx::info!(
-        "pg_stream: view {} changed, marking {} stream table(s) for reinit",
+        "pg_trickle: view {} changed, marking {} stream table(s) for reinit",
         identity,
-        affected_pgs_ids.len(),
+        affected_pgt_ids.len(),
     );
 
-    for pgs_id in &affected_pgs_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to mark ST {} for reinit after view change: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to mark ST {} for reinit after view change: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
     // Cascade: STs depending on affected STs also need reinit.
-    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade view reinit: {}",
+                "pg_trickle_ddl_tracker: failed to cascade view reinit: {}",
                 e
             );
             Vec::new()
         }
     };
 
-    for pgs_id in &cascade_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade view reinit to ST {}: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to cascade view reinit to ST {}: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
-    let total = affected_pgs_ids.len() + cascade_ids.len();
+    let total = affected_pgt_ids.len() + cascade_ids.len();
     log!(
-        "pg_stream_ddl_tracker: view {} changed → {} ST(s) marked for reinitialize",
+        "pg_trickle_ddl_tracker: view {} changed → {} ST(s) marked for reinitialize",
         identity,
         total,
     );
@@ -240,7 +240,7 @@ fn handle_view_change(cmd: &DdlCommand) {
 /// Handle CREATE OR REPLACE FUNCTION / ALTER FUNCTION on a function that
 /// may be referenced in one or more stream table defining queries.
 ///
-/// The `functions_used` TEXT[] column in `pgs_stream_tables` tracks every
+/// The `functions_used` TEXT[] column in `pgt_stream_tables` tracks every
 /// function name used by the defining query (populated at creation time).
 /// When a function definition changes, we look up affected STs via
 /// `StreamTableMeta::find_by_function_name()` and mark them for reinit.
@@ -251,11 +251,11 @@ fn handle_function_change(cmd: &DdlCommand) {
     // the bare function name (without schema or argument types).
     let func_name = extract_function_name(identity);
 
-    let affected_pgs_ids = match StreamTableMeta::find_by_function_name(&func_name) {
+    let affected_pgt_ids = match StreamTableMeta::find_by_function_name(&func_name) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to query STs for function {}: {}",
+                "pg_trickle_ddl_tracker: failed to query STs for function {}: {}",
                 identity,
                 e,
             );
@@ -263,51 +263,51 @@ fn handle_function_change(cmd: &DdlCommand) {
         }
     };
 
-    if affected_pgs_ids.is_empty() {
+    if affected_pgt_ids.is_empty() {
         return;
     }
 
     pgrx::info!(
-        "pg_stream: function {} changed, marking {} stream table(s) for reinit",
+        "pg_trickle: function {} changed, marking {} stream table(s) for reinit",
         identity,
-        affected_pgs_ids.len(),
+        affected_pgt_ids.len(),
     );
 
-    for pgs_id in &affected_pgs_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to mark ST {} for reinit after function change: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to mark ST {} for reinit after function change: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
     // Cascade: STs depending on affected STs also need reinit.
-    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade function reinit: {}",
+                "pg_trickle_ddl_tracker: failed to cascade function reinit: {}",
                 e
             );
             Vec::new()
         }
     };
 
-    for pgs_id in &cascade_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade function reinit to ST {}: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to cascade function reinit to ST {}: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
-    let total = affected_pgs_ids.len() + cascade_ids.len();
+    let total = affected_pgt_ids.len() + cascade_ids.len();
     log!(
-        "pg_stream_ddl_tracker: function {} changed → {} ST(s) marked for reinitialize",
+        "pg_trickle_ddl_tracker: function {} changed → {} ST(s) marked for reinitialize",
         identity,
         total,
     );
@@ -343,11 +343,11 @@ fn extract_function_name(identity: &str) -> String {
 /// a ST storage table itself.
 fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
     // Check if this OID is an upstream source of any ST.
-    let affected_pgs_ids = match find_downstream_pgs_ids(objid) {
+    let affected_pgt_ids = match find_downstream_pgt_ids(objid) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to query dependencies for {}: {}",
+                "pg_trickle_ddl_tracker: failed to query dependencies for {}: {}",
                 identity,
                 e
             );
@@ -355,7 +355,7 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
         }
     };
 
-    if affected_pgs_ids.is_empty() {
+    if affected_pgt_ids.is_empty() {
         // Not an upstream of any ST — might be a ST storage table being altered.
         // That's allowed (e.g., adding indexes), so ignore.
         return;
@@ -364,16 +364,16 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
     // Classify the schema change and only reinitialize for column-affecting
     // changes.  Benign DDL (adding indexes, comments, statistics) and
     // constraint-only changes skip reinit when column tracking is populated.
-    let mut reinit_pgs_ids = Vec::new();
-    for pgs_id in &affected_pgs_ids {
-        let kind = match detect_schema_change_kind(objid, *pgs_id) {
+    let mut reinit_pgt_ids = Vec::new();
+    for pgt_id in &affected_pgt_ids {
+        let kind = match detect_schema_change_kind(objid, *pgt_id) {
             Ok(k) => k,
             Err(e) => {
                 // On error, fall back to conservative reinit.
                 pgrx::debug1!(
-                    "pg_stream_ddl_tracker: schema change detection failed for ST {}: {}, \
+                    "pg_trickle_ddl_tracker: schema change detection failed for ST {}: {}, \
                      falling back to reinit",
-                    pgs_id,
+                    pgt_id,
                     e,
                 );
                 SchemaChangeKind::ColumnChange
@@ -383,9 +383,9 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
         match kind {
             SchemaChangeKind::Benign => {
                 pgrx::debug1!(
-                    "pg_stream_ddl_tracker: ALTER TABLE on {} is benign for ST {} — skipping reinit",
+                    "pg_trickle_ddl_tracker: ALTER TABLE on {} is benign for ST {} — skipping reinit",
                     identity,
-                    pgs_id,
+                    pgt_id,
                 );
             }
             SchemaChangeKind::ConstraintChange => {
@@ -395,55 +395,55 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
                 // existed then. A future enhancement (C-5 keyless tables)
                 // could reinit here if the row_id strategy depends on PK.
                 pgrx::debug1!(
-                    "pg_stream_ddl_tracker: ALTER TABLE on {} is constraint-only for ST {} \
+                    "pg_trickle_ddl_tracker: ALTER TABLE on {} is constraint-only for ST {} \
                      — skipping reinit",
                     identity,
-                    pgs_id,
+                    pgt_id,
                 );
             }
             SchemaChangeKind::ColumnChange => {
                 // S8: When block_source_ddl GUC is enabled, ERROR instead of reinit.
-                if config::pg_stream_block_source_ddl() {
+                if config::pg_trickle_block_source_ddl() {
                     pgrx::error!(
-                        "pg_stream: ALTER TABLE on {} blocked — column-affecting DDL is not \
+                        "pg_trickle: ALTER TABLE on {} blocked — column-affecting DDL is not \
                          allowed on source tables tracked by stream tables when \
-                         pg_stream.block_source_ddl = true. Set pg_stream.block_source_ddl = \
+                         pg_trickle.block_source_ddl = true. Set pg_trickle.block_source_ddl = \
                          false to allow schema changes (triggers reinitialization).",
                         identity,
                     );
                 }
 
-                if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+                if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
                     pgrx::warning!(
-                        "pg_stream_ddl_tracker: failed to mark ST {} for reinit: {}",
-                        pgs_id,
+                        "pg_trickle_ddl_tracker: failed to mark ST {} for reinit: {}",
+                        pgt_id,
                         e,
                     );
                 }
-                reinit_pgs_ids.push(*pgs_id);
+                reinit_pgt_ids.push(*pgt_id);
             }
         }
     }
 
     // Cascade: find STs that depend on the affected STs (transitive).
     // Only cascade from STs that were actually marked for reinit.
-    let cascade_ids = if reinit_pgs_ids.is_empty() {
+    let cascade_ids = if reinit_pgt_ids.is_empty() {
         Vec::new()
     } else {
-        match find_transitive_downstream_sts(&reinit_pgs_ids) {
+        match find_transitive_downstream_sts(&reinit_pgt_ids) {
             Ok(ids) => ids,
             Err(e) => {
-                pgrx::warning!("pg_stream_ddl_tracker: failed to cascade reinit: {}", e);
+                pgrx::warning!("pg_trickle_ddl_tracker: failed to cascade reinit: {}", e);
                 Vec::new()
             }
         }
     };
 
-    for pgs_id in &cascade_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade reinit to ST {}: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to cascade reinit to ST {}: {}",
+                pgt_id,
                 e,
             );
         }
@@ -458,10 +458,10 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
     //
     // Always rebuild — even for benign changes — to stay in sync with the
     // catalog. The cost is negligible (single CREATE OR REPLACE FUNCTION).
-    let change_schema = config::pg_stream_change_buffer_schema();
+    let change_schema = config::pg_trickle_change_buffer_schema();
     if let Err(e) = cdc::rebuild_cdc_trigger_function(objid, &change_schema) {
         pgrx::warning!(
-            "pg_stream_ddl_tracker: failed to rebuild CDC trigger function for {}: {}",
+            "pg_trickle_ddl_tracker: failed to rebuild CDC trigger function for {}: {}",
             identity,
             e,
         );
@@ -471,14 +471,14 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
     // transition and fall back to triggers. The schema change invalidates
     // the WAL decoder's column mapping — pgoutput will send a new Relation
     // message, but it's safer to reinitialize from triggers.
-    if !reinit_pgs_ids.is_empty() {
+    if !reinit_pgt_ids.is_empty() {
         handle_alter_table_wal_fallback(objid, identity, &change_schema);
     }
 
-    let total = reinit_pgs_ids.len() + cascade_ids.len();
+    let total = reinit_pgt_ids.len() + cascade_ids.len();
     if total > 0 {
         log!(
-            "pg_stream_ddl_tracker: ALTER TABLE on {} → {} ST(s) marked for reinitialize",
+            "pg_trickle_ddl_tracker: ALTER TABLE on {} → {} ST(s) marked for reinitialize",
             identity,
             total,
         );
@@ -486,10 +486,10 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
         shmem::bump_cache_generation();
     } else {
         log!(
-            "pg_stream_ddl_tracker: ALTER TABLE on {} → benign for all {} dependent ST(s), \
+            "pg_trickle_ddl_tracker: ALTER TABLE on {} → benign for all {} dependent ST(s), \
              no reinitialize needed",
             identity,
-            affected_pgs_ids.len(),
+            affected_pgt_ids.len(),
         );
     }
 }
@@ -514,20 +514,20 @@ fn handle_alter_table_wal_fallback(source_oid: pg_sys::Oid, identity: &str, chan
         match dep.cdc_mode {
             CdcMode::Wal | CdcMode::Transitioning => {
                 if let Err(e) =
-                    wal_decoder::abort_wal_transition(dep.source_relid, dep.pgs_id, change_schema)
+                    wal_decoder::abort_wal_transition(dep.source_relid, dep.pgt_id, change_schema)
                 {
                     pgrx::warning!(
-                        "pg_stream_ddl_tracker: failed to abort WAL transition for {} (pgs_id={}): {}",
+                        "pg_trickle_ddl_tracker: failed to abort WAL transition for {} (pgt_id={}): {}",
                         identity,
-                        dep.pgs_id,
+                        dep.pgt_id,
                         e,
                     );
                 } else {
                     log!(
-                        "pg_stream_ddl_tracker: ALTER TABLE on {} — \
-                         aborted WAL transition (pgs_id={}), reverted to triggers",
+                        "pg_trickle_ddl_tracker: ALTER TABLE on {} — \
+                         aborted WAL transition (pgt_id={}), reverted to triggers",
                         identity,
-                        dep.pgs_id,
+                        dep.pgt_id,
                     );
                 }
             }
@@ -562,18 +562,18 @@ fn handle_create_trigger(cmd: &DdlCommand) {
         .object_identity
         .as_deref()
         .unwrap_or("(unknown trigger)");
-    let user_triggers_mode = config::pg_stream_user_triggers();
+    let user_triggers_mode = config::pg_trickle_user_triggers();
 
     if user_triggers_mode == "off" {
         pgrx::warning!(
-            "pg_stream: trigger {} is on a stream table, but pg_stream.user_triggers = 'off'. \
+            "pg_trickle: trigger {} is on a stream table, but pg_trickle.user_triggers = 'off'. \
              This trigger will NOT fire correctly during refresh. \
-             Set pg_stream.user_triggers = 'auto' or 'on' to enable trigger support.",
+             Set pg_trickle.user_triggers = 'auto' or 'on' to enable trigger support.",
             trigger_identity,
         );
     } else {
         pgrx::notice!(
-            "pg_stream: trigger {} is on a stream table. \
+            "pg_trickle: trigger {} is on a stream table. \
              It will fire during DIFFERENTIAL refresh with correct TG_OP/OLD/NEW. \
              Note: row-level triggers do NOT fire during FULL refresh. \
              Use REFRESH MODE DIFFERENTIAL to ensure triggers fire on every change.",
@@ -588,13 +588,13 @@ fn handle_create_trigger(cmd: &DdlCommand) {
 ///
 /// Detects when upstream source tables or ST storage tables themselves
 /// are dropped and reacts accordingly.
-#[pg_extern(schema = "pgstream", name = "_on_sql_drop", sql = false)]
-fn pg_stream_on_sql_drop() {
+#[pg_extern(schema = "pgtrickle", name = "_on_sql_drop", sql = false)]
+fn pg_trickle_on_sql_drop() {
     let dropped = match collect_dropped_objects() {
         Ok(objs) => objs,
         Err(e) => {
             pgrx::debug1!(
-                "pg_stream_ddl_tracker: could not read dropped objects: {}",
+                "pg_trickle_ddl_tracker: could not read dropped objects: {}",
                 e
             );
             return;
@@ -622,7 +622,7 @@ struct DroppedObject {
 }
 
 /// Collect dropped objects from the event trigger context.
-fn collect_dropped_objects() -> Result<Vec<DroppedObject>, PgStreamError> {
+fn collect_dropped_objects() -> Result<Vec<DroppedObject>, PgTrickleError> {
     Spi::connect(|client| {
         let table = client
             .select(
@@ -631,11 +631,11 @@ fn collect_dropped_objects() -> Result<Vec<DroppedObject>, PgStreamError> {
                 None,
                 &[],
             )
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         let mut objects = Vec::new();
         for row in table {
-            let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
+            let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
 
             let objid = row
                 .get::<pg_sys::Oid>(1)
@@ -670,11 +670,11 @@ fn handle_dropped_table(obj: &DroppedObject) {
     }
 
     // Case 2: Check if the dropped table is an upstream source of any ST.
-    let affected_pgs_ids = match find_downstream_pgs_ids(obj.objid) {
+    let affected_pgt_ids = match find_downstream_pgt_ids(obj.objid) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to query deps for dropped {}: {}",
+                "pg_trickle_ddl_tracker: failed to query deps for dropped {}: {}",
                 identity,
                 e,
             );
@@ -682,43 +682,43 @@ fn handle_dropped_table(obj: &DroppedObject) {
         }
     };
 
-    if affected_pgs_ids.is_empty() {
+    if affected_pgt_ids.is_empty() {
         return;
     }
 
     // Mark affected STs as ERROR — their source is gone.
-    for pgs_id in &affected_pgs_ids {
-        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::update_status(*pgt_id, StStatus::Error) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to set ST {} to ERROR: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to set ST {} to ERROR: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
     // Cascade: STs depending on now-errored STs also go to ERROR.
-    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
         Ok(ids) => ids,
         Err(e) => {
-            pgrx::warning!("pg_stream_ddl_tracker: failed to cascade error: {}", e);
+            pgrx::warning!("pg_trickle_ddl_tracker: failed to cascade error: {}", e);
             Vec::new()
         }
     };
 
-    for pgs_id in &cascade_ids {
-        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::update_status(*pgt_id, StStatus::Error) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade ERROR to ST {}: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to cascade ERROR to ST {}: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
-    let total = affected_pgs_ids.len() + cascade_ids.len();
+    let total = affected_pgt_ids.len() + cascade_ids.len();
     log!(
-        "pg_stream_ddl_tracker: DROP TABLE {} → {} ST(s) set to ERROR",
+        "pg_trickle_ddl_tracker: DROP TABLE {} → {} ST(s) set to ERROR",
         identity,
         total,
     );
@@ -734,9 +734,9 @@ fn handle_st_storage_dropped(relid: pg_sys::Oid, identity: &str) {
         Err(_) => return, // Already cleaned up or not found
     };
 
-    if let Err(e) = StreamTableMeta::delete(st.pgs_id) {
+    if let Err(e) = StreamTableMeta::delete(st.pgt_id) {
         pgrx::warning!(
-            "pg_stream_ddl_tracker: failed to clean up catalog for dropped ST {}: {}",
+            "pg_trickle_ddl_tracker: failed to clean up catalog for dropped ST {}: {}",
             identity,
             e,
         );
@@ -747,7 +747,7 @@ fn handle_st_storage_dropped(relid: pg_sys::Oid, identity: &str) {
     shmem::signal_dag_rebuild();
 
     log!(
-        "pg_stream_ddl_tracker: ST storage table {} dropped → catalog cleaned, DAG rebuild signaled",
+        "pg_trickle_ddl_tracker: ST storage table {} dropped → catalog cleaned, DAG rebuild signaled",
         identity,
     );
 }
@@ -757,11 +757,11 @@ fn handle_st_storage_dropped(relid: pg_sys::Oid, identity: &str) {
 fn handle_dropped_view(obj: &DroppedObject) {
     let identity = obj.object_identity.as_deref().unwrap_or("unknown");
 
-    let affected_pgs_ids = match find_downstream_pgs_ids(obj.objid) {
+    let affected_pgt_ids = match find_downstream_pgt_ids(obj.objid) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to query deps for dropped view {}: {}",
+                "pg_trickle_ddl_tracker: failed to query deps for dropped view {}: {}",
                 identity,
                 e,
             );
@@ -769,47 +769,47 @@ fn handle_dropped_view(obj: &DroppedObject) {
         }
     };
 
-    if affected_pgs_ids.is_empty() {
+    if affected_pgt_ids.is_empty() {
         return;
     }
 
     // Mark affected STs as ERROR — the inlined view no longer exists,
     // so reinit would fail.
-    for pgs_id in &affected_pgs_ids {
-        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::update_status(*pgt_id, StStatus::Error) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to set ST {} to ERROR after view drop: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to set ST {} to ERROR after view drop: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
     // Cascade: STs depending on now-errored STs also go to ERROR.
-    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade view drop error: {}",
+                "pg_trickle_ddl_tracker: failed to cascade view drop error: {}",
                 e
             );
             Vec::new()
         }
     };
 
-    for pgs_id in &cascade_ids {
-        if let Err(e) = StreamTableMeta::update_status(*pgs_id, StStatus::Error) {
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::update_status(*pgt_id, StStatus::Error) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade view drop ERROR to ST {}: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to cascade view drop ERROR to ST {}: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
-    let total = affected_pgs_ids.len() + cascade_ids.len();
+    let total = affected_pgt_ids.len() + cascade_ids.len();
     log!(
-        "pg_stream_ddl_tracker: DROP VIEW {} → {} ST(s) set to ERROR",
+        "pg_trickle_ddl_tracker: DROP VIEW {} → {} ST(s) set to ERROR",
         identity,
         total,
     );
@@ -823,11 +823,11 @@ fn handle_dropped_function(obj: &DroppedObject) {
     let identity = obj.object_identity.as_deref().unwrap_or("unknown");
     let func_name = extract_function_name(identity);
 
-    let affected_pgs_ids = match StreamTableMeta::find_by_function_name(&func_name) {
+    let affected_pgt_ids = match StreamTableMeta::find_by_function_name(&func_name) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to query STs for dropped function {}: {}",
+                "pg_trickle_ddl_tracker: failed to query STs for dropped function {}: {}",
                 identity,
                 e,
             );
@@ -835,51 +835,51 @@ fn handle_dropped_function(obj: &DroppedObject) {
         }
     };
 
-    if affected_pgs_ids.is_empty() {
+    if affected_pgt_ids.is_empty() {
         return;
     }
 
     pgrx::info!(
-        "pg_stream: function {} dropped, marking {} stream table(s) for reinit",
+        "pg_trickle: function {} dropped, marking {} stream table(s) for reinit",
         identity,
-        affected_pgs_ids.len(),
+        affected_pgt_ids.len(),
     );
 
-    for pgs_id in &affected_pgs_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to mark ST {} for reinit after function drop: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to mark ST {} for reinit after function drop: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
     // Cascade
-    let cascade_ids = match find_transitive_downstream_sts(&affected_pgs_ids) {
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade function drop reinit: {}",
+                "pg_trickle_ddl_tracker: failed to cascade function drop reinit: {}",
                 e
             );
             Vec::new()
         }
     };
 
-    for pgs_id in &cascade_ids {
-        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgs_id) {
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to cascade function drop reinit to ST {}: {}",
-                pgs_id,
+                "pg_trickle_ddl_tracker: failed to cascade function drop reinit to ST {}: {}",
+                pgt_id,
                 e,
             );
         }
     }
 
-    let total = affected_pgs_ids.len() + cascade_ids.len();
+    let total = affected_pgt_ids.len() + cascade_ids.len();
     log!(
-        "pg_stream_ddl_tracker: DROP FUNCTION {} → {} ST(s) marked for reinitialize",
+        "pg_trickle_ddl_tracker: DROP FUNCTION {} → {} ST(s) marked for reinitialize",
         identity,
         total,
     );
@@ -891,15 +891,15 @@ fn handle_dropped_function(obj: &DroppedObject) {
 // ── Dependency queries ─────────────────────────────────────────────────────
 
 /// Find ST IDs that directly depend on a given source OID.
-fn find_downstream_pgs_ids(source_oid: pg_sys::Oid) -> Result<Vec<i64>, PgStreamError> {
+fn find_downstream_pgt_ids(source_oid: pg_sys::Oid) -> Result<Vec<i64>, PgTrickleError> {
     Spi::connect(|client| {
         let table = client
             .select(
-                "SELECT pgs_id FROM pgstream.pgs_dependencies WHERE source_relid = $1",
+                "SELECT pgt_id FROM pgtrickle.pgt_dependencies WHERE source_relid = $1",
                 None,
                 &[source_oid.into()],
             )
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         let mut ids = Vec::new();
         for row in table {
@@ -915,31 +915,31 @@ fn find_downstream_pgs_ids(source_oid: pg_sys::Oid) -> Result<Vec<i64>, PgStream
 /// ST IDs, walk the dependency graph to find STs that depend on them.
 ///
 /// Returns only the *additional* ST IDs (not the input set).
-fn find_transitive_downstream_sts(initial_pgs_ids: &[i64]) -> Result<Vec<i64>, PgStreamError> {
-    if initial_pgs_ids.is_empty() {
+fn find_transitive_downstream_sts(initial_pgt_ids: &[i64]) -> Result<Vec<i64>, PgTrickleError> {
+    if initial_pgt_ids.is_empty() {
         return Ok(Vec::new());
     }
 
     // We need to find which STs have a dependency edge to the storage
-    // table (pgs_relid) of any of the initial STs, and then repeat
+    // table (pgt_relid) of any of the initial STs, and then repeat
     // transitively.
     //
-    // Query: for each affected ST, get its pgs_relid, then find STs
+    // Query: for each affected ST, get its pgt_relid, then find STs
     // that list that relid as a source.
 
-    let mut visited: std::collections::HashSet<i64> = initial_pgs_ids.iter().copied().collect();
-    let mut queue: std::collections::VecDeque<i64> = initial_pgs_ids.iter().copied().collect();
+    let mut visited: std::collections::HashSet<i64> = initial_pgt_ids.iter().copied().collect();
+    let mut queue: std::collections::VecDeque<i64> = initial_pgt_ids.iter().copied().collect();
     let mut cascade_ids = Vec::new();
 
-    while let Some(pgs_id) = queue.pop_front() {
+    while let Some(pgt_id) = queue.pop_front() {
         // Get the storage table OID for this ST.
-        let relid = match get_pgs_relid(pgs_id) {
+        let relid = match get_pgt_relid(pgt_id) {
             Ok(Some(oid)) => oid,
             _ => continue,
         };
 
         // Find STs that depend on this ST's storage table.
-        let downstream = find_downstream_pgs_ids(relid)?;
+        let downstream = find_downstream_pgt_ids(relid)?;
         for child_id in downstream {
             if visited.insert(child_id) {
                 cascade_ids.push(child_id);
@@ -951,19 +951,19 @@ fn find_transitive_downstream_sts(initial_pgs_ids: &[i64]) -> Result<Vec<i64>, P
     Ok(cascade_ids)
 }
 
-/// Get the storage table OID (pgs_relid) for a stream table.
-fn get_pgs_relid(pgs_id: i64) -> Result<Option<pg_sys::Oid>, PgStreamError> {
+/// Get the storage table OID (pgt_relid) for a stream table.
+fn get_pgt_relid(pgt_id: i64) -> Result<Option<pg_sys::Oid>, PgTrickleError> {
     Spi::get_one_with_args::<pg_sys::Oid>(
-        "SELECT pgs_relid FROM pgstream.pgs_stream_tables WHERE pgs_id = $1",
-        &[pgs_id.into()],
+        "SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
+        &[pgt_id.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
 }
 
 /// Check if a given OID is a ST storage table.
 fn is_st_storage_table(relid: pg_sys::Oid) -> bool {
     Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_relid = $1)",
+        "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_stream_tables WHERE pgt_relid = $1)",
         &[relid.into()],
     )
     .unwrap_or(Some(false))
@@ -1000,11 +1000,11 @@ pub enum SchemaChangeKind {
 /// Without snapshots, falls back to checking `columns_used` existence.
 pub fn detect_schema_change_kind(
     source_oid: pg_sys::Oid,
-    pgs_id: i64,
-) -> Result<SchemaChangeKind, PgStreamError> {
+    pgt_id: i64,
+) -> Result<SchemaChangeKind, PgTrickleError> {
     // Fast path: compare schema fingerprints.
     // If the stored fingerprint matches the current one, nothing column-related changed.
-    if let Ok(Some(stored_fp)) = crate::catalog::get_schema_fingerprint(pgs_id, source_oid)
+    if let Ok(Some(stored_fp)) = crate::catalog::get_schema_fingerprint(pgt_id, source_oid)
         && !stored_fp.is_empty()
         && let Ok((_, current_fp)) = crate::catalog::build_column_snapshot(source_oid)
         && stored_fp == current_fp
@@ -1013,7 +1013,7 @@ pub fn detect_schema_change_kind(
     }
 
     // Detailed path: compare stored column snapshot against current pg_attribute.
-    if let Ok(Some(snapshot)) = crate::catalog::get_column_snapshot(pgs_id, source_oid)
+    if let Ok(Some(snapshot)) = crate::catalog::get_column_snapshot(pgt_id, source_oid)
         && let serde_json::Value::Array(ref entries) = snapshot.0
         && !entries.is_empty()
     {
@@ -1021,7 +1021,7 @@ pub fn detect_schema_change_kind(
     }
 
     // Legacy fallback: no snapshot available — use columns_used presence check.
-    let tracked_cols = get_tracked_columns(pgs_id, source_oid)?;
+    let tracked_cols = get_tracked_columns(pgt_id, source_oid)?;
 
     if tracked_cols.is_empty() {
         // No column-level tracking — conservatively assume column change.
@@ -1038,7 +1038,7 @@ pub fn detect_schema_change_kind(
             )",
             &[source_oid.into(), col_name.as_str().into()],
         )
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
         .unwrap_or(false);
 
         if !exists {
@@ -1056,7 +1056,7 @@ pub fn detect_schema_change_kind(
 fn detect_from_snapshot(
     source_oid: pg_sys::Oid,
     stored_entries: &[serde_json::Value],
-) -> Result<SchemaChangeKind, PgStreamError> {
+) -> Result<SchemaChangeKind, PgTrickleError> {
     // Build a map of current columns: name → type_oid
     let current_cols: std::collections::HashMap<String, i64> = Spi::connect(|client| {
         let sql = format!(
@@ -1068,16 +1068,16 @@ fn detect_from_snapshot(
         );
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut map = std::collections::HashMap::new();
         for row in result {
             let name: String = row
                 .get(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
             let type_oid: i64 = row
                 .get(2)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or(0);
             map.insert(name, type_oid);
         }
@@ -1115,14 +1115,17 @@ fn detect_from_snapshot(
 }
 
 /// Get column names tracked for a given ST + source pair.
-fn get_tracked_columns(pgs_id: i64, source_oid: pg_sys::Oid) -> Result<Vec<String>, PgStreamError> {
-    // columns_used is stored as TEXT[] in pgs_dependencies.
+fn get_tracked_columns(
+    pgt_id: i64,
+    source_oid: pg_sys::Oid,
+) -> Result<Vec<String>, PgTrickleError> {
+    // columns_used is stored as TEXT[] in pgt_dependencies.
     let cols = Spi::get_one_with_args::<Vec<String>>(
-        "SELECT columns_used FROM pgstream.pgs_dependencies \
-         WHERE pgs_id = $1 AND source_relid = $2",
-        &[pgs_id.into(), source_oid.into()],
+        "SELECT columns_used FROM pgtrickle.pgt_dependencies \
+         WHERE pgt_id = $1 AND source_relid = $2",
+        &[pgt_id.into(), source_oid.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     Ok(cols.unwrap_or_default())
 }

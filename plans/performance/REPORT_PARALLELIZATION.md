@@ -1,4 +1,4 @@
-# Parallelization Options for pg_stream
+# Parallelization Options for pg_trickle
 
 > **Status:** Planning — no implementation changes proposed yet.
 > **Date:** 2026-02-26
@@ -10,15 +10,15 @@
 
 ## 1. Current Architecture (Baseline)
 
-pg_stream registers **one PostgreSQL background worker** — the *scheduler* —
-during `_PG_init()`. It wakes every `pg_stream.scheduler_interval_ms`
+pg_trickle registers **one PostgreSQL background worker** — the *scheduler* —
+during `_PG_init()`. It wakes every `pg_trickle.scheduler_interval_ms`
 (default 1 000 ms), rebuilds the dependency DAG when the catalog changes, and
 walks stream tables (STs) in topological order, refreshing each one **inline
 and sequentially** within the same process.
 
 ```
                     ┌───────────────────────────────────────┐
-                    │       pg_stream scheduler (1 BGW)     │
+                    │       pg_trickle scheduler (1 BGW)     │
                     │                                       │
                     │  for st in topological_order():       │
                     │      if schedule_due(st):             │
@@ -33,10 +33,10 @@ and sequentially** within the same process.
 
 | Component | Status |
 |---|---|
-| `pg_stream.max_concurrent_refreshes` GUC (default 4, max 32) | **Defined but not enforced for parallel dispatch.** Only prevents a manual `refresh_stream_table()` call from overlapping with the scheduler on the *same* ST via advisory locks. |
+| `pg_trickle.max_concurrent_refreshes` GUC (default 4, max 32) | **Defined but not enforced for parallel dispatch.** Only prevents a manual `refresh_stream_table()` call from overlapping with the scheduler on the *same* ST via advisory locks. |
 | Advisory lock infrastructure (`pg_try_advisory_lock` / `pg_advisory_unlock`) | Fully operational. Each refresh holds a per-ST advisory lock for its duration. Used for collision detection, not parallelism. |
 | DAG topological ordering (Kahn's algorithm) | Produces a flat `Vec<NodeId>` — upstream before downstream. Does not expose parallelism levels. |
-| Shared memory (`PgStreamSharedState`, `DAG_REBUILD_SIGNAL`, `CACHE_GENERATION`) | Atomics for catalog-change signalling and cache invalidation. No worker-coordination primitives. |
+| Shared memory (`PgTrickleSharedState`, `DAG_REBUILD_SIGNAL`, `CACHE_GENERATION`) | Atomics for catalog-change signalling and cache invalidation. No worker-coordination primitives. |
 
 ### Consequence
 
@@ -48,7 +48,7 @@ concurrently.
 
 `max_worker_processes` (default 8) is the server-wide ceiling for **all**
 background workers — autovacuum launchers, parallel query workers, logical
-replication workers, and extension workers. pg_stream currently consumes
+replication workers, and extension workers. pg_trickle currently consumes
 **one** slot. Any parallelization approach that spawns additional workers must
 account for this shared budget.
 
@@ -67,7 +67,7 @@ runtime with `BgWorkerStartTime::ConsistentState`.
 
 ```
                 ┌──────────────────────────────────────────────┐
-                │       pg_stream scheduler (coordinator)      │
+                │       pg_trickle scheduler (coordinator)      │
                 │                                              │
                 │  for st in topological_order():              │
                 │      if schedule_due(st):                    │
@@ -88,13 +88,13 @@ runtime with `BgWorkerStartTime::ConsistentState`.
 #### Implementation sketch
 
 1. **Worker entry point** — A new function
-   `pg_stream_refresh_worker_main(datum)` receives `pgs_id` via the
+   `pg_trickle_refresh_worker_main(datum)` receives `pgt_id` via the
    `Datum` argument, acquires the advisory lock, runs the refresh, stores
    results in shared memory or a catalog table, and exits.
 
 2. **Coordinator dispatch** — In the main loop, instead of calling
    `execute_scheduled_refresh(st)`, the scheduler calls
-   `spawn_refresh_worker(st.pgs_id)`. It tracks active workers in a
+   `spawn_refresh_worker(st.pgt_id)`. It tracks active workers in a
    `HashMap<i64, BackgroundWorkerHandle>`.
 
 3. **Worker completion** — After dispatching all eligible STs in a
@@ -105,7 +105,7 @@ runtime with `BgWorkerStartTime::ConsistentState`.
    level-N workers have finished (see Option B for level extraction).
 
 5. **Respect `max_concurrent_refreshes`** — The coordinator caps the number
-   of simultaneously spawned workers to `pg_stream.max_concurrent_refreshes`.
+   of simultaneously spawned workers to `pg_trickle.max_concurrent_refreshes`.
 
 #### Pros
 
@@ -140,7 +140,7 @@ runtime with `BgWorkerStartTime::ConsistentState`.
 |---|---|
 | `max_worker_processes` exhaustion | Check available slots before spawning; fall back to inline execution if none available. |
 | Worker outlives scheduler | Workers should check their parent PID or use a latch. PostgreSQL terminates orphan workers on postmaster restart. |
-| Shared memory for result reporting | Use an atomic array indexed by slot, or write to `pgs_refresh_history` from within the worker (already done). |
+| Shared memory for result reporting | Use an atomic array indexed by slot, or write to `pgt_refresh_history` from within the worker (already done). |
 
 ---
 
@@ -174,7 +174,7 @@ Level 1:  [st_weekly_rollup, st_dashboard]                   ← parallel
    single list, collect each "wave" of zero-indegree nodes as a level.
 
    ```rust
-   pub fn topological_levels(&self) -> Result<Vec<Vec<NodeId>>, PgStreamError> {
+   pub fn topological_levels(&self) -> Result<Vec<Vec<NodeId>>, PgTrickleError> {
        // ... existing Kahn setup ...
        let mut levels = Vec::new();
        while !queue.is_empty() {
@@ -230,8 +230,8 @@ additional database connections via `dblink` and fires refresh SQL
 asynchronously, polling for completion.
 
 ```
-scheduler ──┬── dblink_send_query(conn_a, 'SELECT pgstream.refresh_stream_table(...)')
-            │   dblink_send_query(conn_b, 'SELECT pgstream.refresh_stream_table(...)')
+scheduler ──┬── dblink_send_query(conn_a, 'SELECT pgtrickle.refresh_stream_table(...)')
+            │   dblink_send_query(conn_b, 'SELECT pgtrickle.refresh_stream_table(...)')
             │
             └── dblink_get_result(conn_a)  ← poll
                 dblink_get_result(conn_b)
@@ -276,9 +276,9 @@ purposes.
 
 Move scheduling entirely outside PostgreSQL. A separate process (Rust
 binary, Python script, or Kubernetes CronJob) maintains a connection pool
-and calls `pgstream.refresh_stream_table(schema, name)` on multiple
+and calls `pgtrickle.refresh_stream_table(schema, name)` on multiple
 connections in parallel. The in-database scheduler is disabled
-(`pg_stream.enabled = false`).
+(`pg_trickle.enabled = false`).
 
 ```
 ┌─────────────────────────────────────────┐
@@ -319,9 +319,9 @@ connections in parallel. The in-database scheduler is disabled
 - **Operational complexity** — a separate process to deploy, monitor, and
   upgrade. Loses the "zero-config extension" appeal.
 - Needs its own DAG awareness. Options:
-  - Query `pgstream.pgs_stream_tables` + `pgstream.pgs_dependencies` to
+  - Query `pgtrickle.pgt_stream_tables` + `pgtrickle.pgt_dependencies` to
     reconstruct the DAG externally.
-  - Expose a SQL function `pgstream.get_refresh_order()` that returns
+  - Expose a SQL function `pgtrickle.get_refresh_order()` that returns
     levels.
 - Connection pool sizing and authentication management.
 - Manual intervention for crash recovery (or needs its own health-check
@@ -344,7 +344,7 @@ processes.
 
 #### Concept
 
-No pg_stream code changes needed. PostgreSQL's parallel query engine can
+No pg_trickle code changes needed. PostgreSQL's parallel query engine can
 parallelize the **individual SQL statements** within a refresh — the delta
 CTE query and the MERGE. This is orthogonal to inter-ST parallelism but
 can dramatically speed up each individual refresh.
@@ -379,7 +379,7 @@ statements are standard SQL and eligible for this optimization.
   parallelism.
 - Planner may choose not to parallelize small tables or complex CTEs.
 - Parallel workers consume `max_worker_processes` slots temporarily.
-- `pg_stream.merge_planner_hints` already sets `SET LOCAL enable_nestloop
+- `pg_trickle.merge_planner_hints` already sets `SET LOCAL enable_nestloop
   = off` and raises `work_mem`, which may interact with parallel plan
   choices.
 
@@ -390,12 +390,12 @@ chosen:
 
 ```sql
 EXPLAIN (ANALYZE, BUFFERS)
-WITH __pgs_scan_o_1 AS (
+WITH __pgt_scan_o_1 AS (
     SELECT ...
-    FROM pgstream_changes.changes_12345 c
+    FROM pgtrickle_changes.changes_12345 c
     ...
 )
-SELECT * FROM __pgs_scan_o_1;
+SELECT * FROM __pgt_scan_o_1;
 ```
 
 Look for `Gather` or `Gather Merge` nodes in the plan output.
@@ -458,7 +458,7 @@ component that doesn't replace the in-database scheduler.
 
 1. **Retry state storage** — Dynamic workers can't share the scheduler's
    in-memory `HashMap<i64, RetryState>`. Should retry state move to the
-   catalog (`pgs_stream_tables.retry_attempts`, `retry_backoff_until`) or
+   catalog (`pgt_stream_tables.retry_attempts`, `retry_backoff_until`) or
    to shared memory?
 
 2. **Worker PID tracking** — How should the coordinator detect worker
@@ -475,6 +475,6 @@ component that doesn't replace the in-database scheduler.
    advance to the next level for STs whose dependencies are already
    satisfied (greedy dispatch)?
 
-5. **Interaction with `pg_stream.merge_planner_hints`** — Each dynamic
+5. **Interaction with `pg_trickle.merge_planner_hints`** — Each dynamic
    worker calls `SET LOCAL` which is scoped to its own transaction. No
    cross-worker interference expected, but should be verified.

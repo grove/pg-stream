@@ -1,7 +1,7 @@
 //! Integration tests for Phase 9 — Monitoring & Observability.
 //!
 //! These tests verify the SQL monitoring views and functions work correctly
-//! against a real PostgreSQL 18 container with the pg_stream catalog schema.
+//! against a real PostgreSQL 18 container with the pg_trickle catalog schema.
 
 mod common;
 
@@ -16,50 +16,50 @@ use common::TestDb;
 async fn test_refresh_stats_aggregation() {
     let db = TestDb::with_catalog().await;
 
-    // Create a source table so we have a valid OID for pgs_relid
+    // Create a source table so we have a valid OID for pgt_relid
     db.execute("CREATE TABLE source_a (id int)").await;
 
     // Insert a ST
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, is_populated, data_timestamp)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status, is_populated, data_timestamp)
          VALUES
             ((SELECT 'source_a'::regclass::oid), 'my_st', 'public', 'SELECT 1', '1m', 'FULL', 'ACTIVE', true, now() - interval '30 seconds')"
     ).await;
 
     // Insert some refresh history
-    let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables LIMIT 1")
+    let pgt_id: i64 = db
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables LIMIT 1")
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_refresh_history (pgs_id, data_timestamp, start_time, end_time, action, status, rows_inserted, rows_deleted)
+        "INSERT INTO pgtrickle.pgt_refresh_history (pgt_id, data_timestamp, start_time, end_time, action, status, rows_inserted, rows_deleted)
          VALUES
-            ({pgs_id}, now() - interval '5 min', now() - interval '5 min', now() - interval '4 min 59 sec', 'FULL', 'COMPLETED', 100, 0),
-            ({pgs_id}, now() - interval '3 min', now() - interval '3 min', now() - interval '2 min 59 sec', 'DIFFERENTIAL', 'COMPLETED', 10, 2),
-            ({pgs_id}, now() - interval '1 min', now() - interval '1 min', now() - interval '59 sec', 'DIFFERENTIAL', 'FAILED', 0, 0)"
+            ({pgt_id}, now() - interval '5 min', now() - interval '5 min', now() - interval '4 min 59 sec', 'FULL', 'COMPLETED', 100, 0),
+            ({pgt_id}, now() - interval '3 min', now() - interval '3 min', now() - interval '2 min 59 sec', 'DIFFERENTIAL', 'COMPLETED', 10, 2),
+            ({pgt_id}, now() - interval '1 min', now() - interval '1 min', now() - interval '59 sec', 'DIFFERENTIAL', 'FAILED', 0, 0)"
     )).await;
 
     // Run the aggregation query (same as st_refresh_stats in monitor.rs)
     let total: i64 = db
         .query_scalar(&format!(
-            "SELECT count(*) FROM pgstream.pgs_refresh_history WHERE pgs_id = {pgs_id}"
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history WHERE pgt_id = {pgt_id}"
         ))
         .await;
     assert_eq!(total, 3, "should have 3 refresh history rows");
 
     let successful: i64 = db.query_scalar(&format!(
-        "SELECT count(*) FROM pgstream.pgs_refresh_history WHERE pgs_id = {pgs_id} AND status = 'COMPLETED'"
+        "SELECT count(*) FROM pgtrickle.pgt_refresh_history WHERE pgt_id = {pgt_id} AND status = 'COMPLETED'"
     )).await;
     assert_eq!(successful, 2);
 
     let failed: i64 = db.query_scalar(&format!(
-        "SELECT count(*) FROM pgstream.pgs_refresh_history WHERE pgs_id = {pgs_id} AND status = 'FAILED'"
+        "SELECT count(*) FROM pgtrickle.pgt_refresh_history WHERE pgt_id = {pgt_id} AND status = 'FAILED'"
     )).await;
     assert_eq!(failed, 1);
 
     let total_rows_inserted: i64 = db.query_scalar(&format!(
-        "SELECT COALESCE(sum(rows_inserted), 0)::bigint FROM pgstream.pgs_refresh_history WHERE pgs_id = {pgs_id}"
+        "SELECT COALESCE(sum(rows_inserted), 0)::bigint FROM pgtrickle.pgt_refresh_history WHERE pgt_id = {pgt_id}"
     )).await;
     assert_eq!(total_rows_inserted, 110);
 }
@@ -73,21 +73,21 @@ async fn test_refresh_history_by_name() {
     db.execute("CREATE TABLE src_hist (id int)").await;
 
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode, status)
          VALUES
             ((SELECT 'src_hist'::regclass::oid), 'hist_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE')"
     ).await;
 
-    let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'hist_st'")
+    let pgt_id: i64 = db
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'hist_st'")
         .await;
 
     // Insert 5 history rows
     for i in 0..5 {
         db.execute(&format!(
-            "INSERT INTO pgstream.pgs_refresh_history (pgs_id, data_timestamp, start_time, end_time, action, status, rows_inserted, rows_deleted)
-             VALUES ({pgs_id}, now() - interval '{} min', now() - interval '{} min', now() - interval '{} min' + interval '1 sec', 'FULL', 'COMPLETED', {}, 0)",
+            "INSERT INTO pgtrickle.pgt_refresh_history (pgt_id, data_timestamp, start_time, end_time, action, status, rows_inserted, rows_deleted)
+             VALUES ({pgt_id}, now() - interval '{} min', now() - interval '{} min', now() - interval '{} min' + interval '1 sec', 'FULL', 'COMPLETED', {}, 0)",
             5 - i, 5 - i, 5 - i, (i + 1) * 10
         )).await;
     }
@@ -96,9 +96,9 @@ async fn test_refresh_history_by_name() {
     let latest_rows_inserted: i64 = db
         .query_scalar(
             "SELECT COALESCE(h.rows_inserted, 0)::bigint
-         FROM pgstream.pgs_refresh_history h
-         JOIN pgstream.pgs_stream_tables st ON st.pgs_id = h.pgs_id
-         WHERE st.pgs_schema = 'public' AND st.pgs_name = 'hist_st'
+         FROM pgtrickle.pgt_refresh_history h
+         JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+         WHERE st.pgt_schema = 'public' AND st.pgt_name = 'hist_st'
          ORDER BY h.refresh_id DESC
          LIMIT 1",
         )
@@ -113,9 +113,9 @@ async fn test_refresh_history_by_name() {
         .query_scalar(
             "SELECT count(*) FROM (
             SELECT h.refresh_id
-            FROM pgstream.pgs_refresh_history h
-            JOIN pgstream.pgs_stream_tables st ON st.pgs_id = h.pgs_id
-            WHERE st.pgs_schema = 'public' AND st.pgs_name = 'hist_st'
+            FROM pgtrickle.pgt_refresh_history h
+            JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+            WHERE st.pgt_schema = 'public' AND st.pgt_name = 'hist_st'
             ORDER BY h.refresh_id DESC
             LIMIT 3
         ) sub",
@@ -134,8 +134,8 @@ async fn test_staleness_calculation() {
 
     // ST with data_timestamp 60 seconds ago → staleness should be ~60s
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status, data_timestamp)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode, status, data_timestamp)
          VALUES
             ((SELECT 'src_sched'::regclass::oid), 'sched_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE', now() - interval '60 seconds')"
     ).await;
@@ -143,8 +143,8 @@ async fn test_staleness_calculation() {
     let staleness: f64 = db
         .query_scalar(
             "SELECT EXTRACT(EPOCH FROM (now() - data_timestamp))::float8
-         FROM pgstream.pgs_stream_tables
-         WHERE pgs_schema = 'public' AND pgs_name = 'sched_st' AND data_timestamp IS NOT NULL",
+         FROM pgtrickle.pgt_stream_tables
+         WHERE pgt_schema = 'public' AND pgt_name = 'sched_st' AND data_timestamp IS NOT NULL",
         )
         .await;
 
@@ -157,8 +157,8 @@ async fn test_staleness_calculation() {
     // ST without data_timestamp → staleness query should return no rows
     db.execute("CREATE TABLE src_sched2 (id int)").await;
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode, status)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode, status)
          VALUES
             ((SELECT 'src_sched2'::regclass::oid), 'no_sched_st', 'public', 'SELECT 1', 'FULL', 'INITIALIZING')"
     ).await;
@@ -166,8 +166,8 @@ async fn test_staleness_calculation() {
     let staleness_opt: Option<f64> = db
         .query_scalar_opt(
             "SELECT EXTRACT(EPOCH FROM (now() - data_timestamp))::float8
-         FROM pgstream.pgs_stream_tables
-         WHERE pgs_schema = 'public' AND pgs_name = 'no_sched_st' AND data_timestamp IS NOT NULL",
+         FROM pgtrickle.pgt_stream_tables
+         WHERE pgt_schema = 'public' AND pgt_name = 'no_sched_st' AND data_timestamp IS NOT NULL",
         )
         .await;
     assert!(
@@ -186,8 +186,8 @@ async fn test_stale_flag() {
 
     // ST with schedule=30s but data_timestamp 120s ago → stale = true
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
          VALUES
             ((SELECT 'src_exceed'::regclass::oid), 'exceed_st', 'public', 'SELECT 1', '30s', 'FULL', 'ACTIVE', now() - interval '120 seconds')"
     ).await;
@@ -196,11 +196,11 @@ async fn test_stale_flag() {
         .query_scalar(
             "SELECT CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
                      THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
-                          pgstream.parse_duration_seconds(st.schedule)
+                          pgtrickle.parse_duration_seconds(st.schedule)
                      ELSE false
                 END
-         FROM pgstream.pgs_stream_tables st
-         WHERE pgs_name = 'exceed_st'",
+         FROM pgtrickle.pgt_stream_tables st
+         WHERE pgt_name = 'exceed_st'",
         )
         .await;
     assert!(exceeded, "data should be stale (120s > 30s target)");
@@ -208,8 +208,8 @@ async fn test_stale_flag() {
     // ST with schedule=5min and data_timestamp 10s ago → stale = false
     db.execute("CREATE TABLE src_ok (id int)").await;
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
          VALUES
             ((SELECT 'src_ok'::regclass::oid), 'ok_st', 'public', 'SELECT 1', '5m', 'FULL', 'ACTIVE', now() - interval '10 seconds')"
     ).await;
@@ -218,11 +218,11 @@ async fn test_stale_flag() {
         .query_scalar(
             "SELECT CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
                      THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
-                          pgstream.parse_duration_seconds(st.schedule)
+                          pgtrickle.parse_duration_seconds(st.schedule)
                      ELSE false
                 END
-         FROM pgstream.pgs_stream_tables st
-         WHERE pgs_name = 'ok_st'",
+         FROM pgtrickle.pgt_stream_tables st
+         WHERE pgt_name = 'ok_st'",
         )
         .await;
     assert!(
@@ -240,30 +240,32 @@ async fn test_stream_tables_info_view() {
     db.execute("CREATE TABLE src_info (id int)").await;
 
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status, data_timestamp)
          VALUES
             ((SELECT 'src_info'::regclass::oid), 'info_st', 'public', 'SELECT 1', '1m', 'FULL', 'ACTIVE', now() - interval '30 seconds')"
     ).await;
 
     // Check the view exists and returns data
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.stream_tables_info WHERE pgs_name = 'info_st'")
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.stream_tables_info WHERE pgt_name = 'info_st'",
+        )
         .await;
     assert_eq!(count, 1);
 
     // Check stale is false (30s < 1 minute)
     let stale: bool = db
-        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'info_st'")
+        .query_scalar("SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'info_st'")
         .await;
     assert!(!stale);
 }
 
 // ── NOTIFY channel test ──────────────────────────────────────────────────
 
-/// Test that NOTIFY on pg_stream_alert channel works and can be received via LISTEN.
+/// Test that NOTIFY on pg_trickle_alert channel works and can be received via LISTEN.
 #[tokio::test]
-async fn test_notify_pg_stream_alert() {
+async fn test_notify_pg_trickle_alert() {
     let db = TestDb::with_catalog().await;
 
     // Use a raw connection for LISTEN/NOTIFY
@@ -274,7 +276,7 @@ async fn test_notify_pg_stream_alert() {
     assert_eq!(port, 1);
 
     // Verify NOTIFY doesn't error
-    db.execute("NOTIFY pg_stream_alert, '{\"event\":\"test\",\"st\":\"public.test\"}'")
+    db.execute("NOTIFY pg_trickle_alert, '{\"event\":\"test\",\"st\":\"public.test\"}'")
         .await;
 
     // Verify LISTEN + NOTIFY round-trip via a second connection
@@ -290,9 +292,9 @@ async fn test_notify_pg_stream_alert() {
     // Basic test: just verify the NOTIFY SQL executes without error
     // Full LISTEN/NOTIFY async testing requires PgListener which is complex
     // in this test context. The important thing is that the SQL doesn't fail.
-    let payload = r#"{"event":"refresh_completed","pgs_schema":"public","pgs_name":"test","action":"FULL","rows_inserted":42}"#;
+    let payload = r#"{"event":"refresh_completed","pgt_schema":"public","pgt_name":"test","action":"FULL","rows_inserted":42}"#;
     db.execute(&format!(
-        "NOTIFY pg_stream_alert, '{}'",
+        "NOTIFY pg_trickle_alert, '{}'",
         payload.replace('\'', "''")
     ))
     .await;
@@ -310,23 +312,23 @@ async fn test_full_stats_lateral_join() {
     db.execute("CREATE TABLE src_stats (id int)").await;
 
     db.execute(
-        "INSERT INTO pgstream.pgs_stream_tables
-            (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, is_populated, data_timestamp)
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status, is_populated, data_timestamp)
          VALUES
             ((SELECT 'src_stats'::regclass::oid), 'stats_st', 'public', 'SELECT 1', '1m', 'DIFFERENTIAL', 'ACTIVE', true, now() - interval '10 seconds')"
     ).await;
 
-    let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'stats_st'")
+    let pgt_id: i64 = db
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'stats_st'")
         .await;
 
     // Insert 2 completed + 1 failed refresh
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_refresh_history (pgs_id, data_timestamp, start_time, end_time, action, status, rows_inserted, rows_deleted)
+        "INSERT INTO pgtrickle.pgt_refresh_history (pgt_id, data_timestamp, start_time, end_time, action, status, rows_inserted, rows_deleted)
          VALUES
-            ({pgs_id}, now() - interval '5 min', now() - interval '5 min', now() - interval '4 min 58 sec', 'FULL', 'COMPLETED', 100, 0),
-            ({pgs_id}, now() - interval '3 min', now() - interval '3 min', now() - interval '2 min 59 sec', 'DIFFERENTIAL', 'COMPLETED', 15, 3),
-            ({pgs_id}, now() - interval '1 min', now() - interval '1 min', NULL, 'DIFFERENTIAL', 'FAILED', 0, 0)"
+            ({pgt_id}, now() - interval '5 min', now() - interval '5 min', now() - interval '4 min 58 sec', 'FULL', 'COMPLETED', 100, 0),
+            ({pgt_id}, now() - interval '3 min', now() - interval '3 min', now() - interval '2 min 59 sec', 'DIFFERENTIAL', 'COMPLETED', 15, 3),
+            ({pgt_id}, now() - interval '1 min', now() - interval '1 min', NULL, 'DIFFERENTIAL', 'FAILED', 0, 0)"
     )).await;
 
     // Run the full LATERAL JOIN query from st_refresh_stats
@@ -347,8 +349,8 @@ async fn test_full_stats_lateral_join() {
         ),
     >(
         "SELECT
-            st.pgs_name,
-            st.pgs_schema,
+            st.pgt_name,
+            st.pgt_schema,
             st.status,
             st.refresh_mode,
             st.is_populated,
@@ -359,10 +361,10 @@ async fn test_full_stats_lateral_join() {
             COALESCE(stats.total_rows_deleted, 0)::bigint,
             CASE WHEN st.schedule IS NOT NULL AND st.data_timestamp IS NOT NULL
                  THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
-                      pgstream.parse_duration_seconds(st.schedule)
+                      pgtrickle.parse_duration_seconds(st.schedule)
                  ELSE false
             END
-        FROM pgstream.pgs_stream_tables st
+        FROM pgtrickle.pgt_stream_tables st
         LEFT JOIN LATERAL (
             SELECT
                 count(*) AS total_refreshes,
@@ -370,10 +372,10 @@ async fn test_full_stats_lateral_join() {
                 count(*) FILTER (WHERE h.status = 'FAILED') AS failed_refreshes,
                 COALESCE(sum(h.rows_inserted), 0) AS total_rows_inserted,
                 COALESCE(sum(h.rows_deleted), 0) AS total_rows_deleted
-            FROM pgstream.pgs_refresh_history h
-            WHERE h.pgs_id = st.pgs_id
+            FROM pgtrickle.pgt_refresh_history h
+            WHERE h.pgt_id = st.pgt_id
         ) stats ON true
-        WHERE st.pgs_name = 'stats_st'",
+        WHERE st.pgt_name = 'stats_st'",
     )
     .fetch_one(&db.pool)
     .await
@@ -401,19 +403,19 @@ async fn test_monitoring_empty_state() {
 
     // No STs at all — count should be 0
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_stream_tables")
         .await;
     assert_eq!(count, 0);
 
     // The info view should return 0 rows
     let info_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.stream_tables_info")
+        .query_scalar("SELECT count(*) FROM pgtrickle.stream_tables_info")
         .await;
     assert_eq!(info_count, 0);
 
     // Refresh history should be empty
     let hist_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_refresh_history")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_refresh_history")
         .await;
     assert_eq!(hist_count, 0);
 }

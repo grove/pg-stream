@@ -1,14 +1,14 @@
 {#
-  pgstream_stream_table_exists(name)
+  pgtrickle_stream_table_exists(name)
 
-  Checks if a stream table exists in the pg_stream catalog.
+  Checks if a stream table exists in the pg_trickle catalog.
   Returns true/false. Handles both schema-qualified and unqualified names.
 
   Args:
     name (str): Stream table name. May be schema-qualified ('analytics.order_totals')
                 or unqualified ('order_totals' — defaults to target.schema).
 #}
-{% macro pgstream_stream_table_exists(name) %}
+{% macro pgtrickle_stream_table_exists(name) %}
   {% if execute %}
     {# Split schema-qualified name if present #}
     {% set parts = name.split('.') %}
@@ -22,9 +22,9 @@
 
     {% set query %}
       SELECT EXISTS(
-        SELECT 1 FROM pgstream.pgs_stream_tables
-        WHERE pgs_schema = {{ dbt.string_literal(lookup_schema) }}
-          AND pgs_name = {{ dbt.string_literal(lookup_name) }}
+        SELECT 1 FROM pgtrickle.pgt_stream_tables
+        WHERE pgt_schema = {{ dbt.string_literal(lookup_schema) }}
+          AND pgt_name = {{ dbt.string_literal(lookup_name) }}
       ) AS st_exists
     {% endset %}
     {% set result = run_query(query) %}

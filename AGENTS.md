@@ -1,4 +1,4 @@
-# AGENTS.md — Development Guidelines for pg_stream
+# AGENTS.md — Development Guidelines for pg_trickle
 
 ## Project Overview
 
@@ -45,9 +45,9 @@ commands. Never commit directly to git without asking for permission.
 
 ### Error Handling
 
-- Define errors in `src/error.rs` as `PgStreamError` enum variants.
+- Define errors in `src/error.rs` as `PgTrickleError` enum variants.
 - Never `unwrap()` or `panic!()` in code reachable from SQL.
-- Propagate via `Result<T, PgStreamError>`; convert at the API boundary with
+- Propagate via `Result<T, PgTrickleError>`; convert at the API boundary with
   `pgrx::error!()` or `ereport!()`.
 
 ### SPI
@@ -77,7 +77,7 @@ commands. Never commit directly to git without asking for permission.
 ### Background Workers
 
 - Register via `BackgroundWorkerBuilder`.
-- Check `pg_stream.enabled` GUC before doing work.
+- Check `pg_trickle.enabled` GUC before doing work.
 - Handle `SIGTERM` gracefully.
 
 ### Logging
@@ -87,8 +87,8 @@ commands. Never commit directly to git without asking for permission.
 
 ### SQL Functions
 
-- Annotate with `#[pg_extern(schema = "pgstream")]`.
-- Catalog tables live in schema `pgstream`, change buffers in `pgstream_changes`.
+- Annotate with `#[pg_extern(schema = "pgtrickle")]`.
+- Catalog tables live in schema `pgtrickle`, change buffers in `pgtrickle_changes`.
 
 ---
 
@@ -98,11 +98,11 @@ commands. Never commit directly to git without asking for permission.
 src/
 ├── lib.rs          # Extension entry point, GUCs, shmem init
 ├── api.rs          # SQL-callable functions (create/alter/drop/refresh)
-├── catalog.rs      # pgstream.pgs_stream_tables CRUD
+├── catalog.rs      # pgtrickle.pgt_stream_tables CRUD
 ├── cdc.rs          # Change-data-capture (trigger-based)
 ├── config.rs       # GUC definitions
 ├── dag.rs          # Dependency graph, topological sort, cycle detection
-├── error.rs        # PgStreamError enum
+├── error.rs        # PgTrickleError enum
 ├── hash.rs         # Content hashing for change detection
 ├── hooks.rs        # DDL event trigger hooks
 ├── monitor.rs      # Monitoring / metrics
@@ -132,7 +132,7 @@ Three test tiers, each with its own infrastructure:
 | Unit | `src/**` (`#[cfg(test)]`) | `just test-unit` | No |
 | Integration | `tests/*_tests.rs` (not `e2e_*`) | `just test-integration` | Yes (Testcontainers) |
 | E2E | `tests/e2e_*_tests.rs` | `just test-e2e` | Yes (custom Docker image) |
-| dbt | `dbt-pgstream/integration_tests/` | `just test-dbt` | Yes (Docker + dbt) |
+| dbt | `dbt-pgtrickle/integration_tests/` | `just test-dbt` | Yes (Docker + dbt) |
 
 - Shared helpers live in `tests/common/mod.rs`.
 - E2E Docker images are built from `tests/Dockerfile.e2e`.
@@ -146,7 +146,7 @@ Three test tiers, each with its own infrastructure:
 ## CDC Architecture
 
 The extension uses **row-level AFTER triggers** (not logical replication) to
-capture changes into buffer tables (`pgstream_changes.changes_<oid>`). This
+capture changes into buffer tables (`pgtrickle_changes.changes_<oid>`). This
 was chosen for single-transaction atomicity — see ADR-001 and ADR-002 in
 [plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) for the full rationale.
 
@@ -157,8 +157,8 @@ was chosen for single-transaction atomicity — see ADR-001 and ADR-002 in
 - [ ] No `unwrap()` / `panic!()` in non-test code
 - [ ] All `unsafe` blocks have `// SAFETY:` comments
 - [ ] SPI connections are short-lived
-- [ ] New SQL functions use `#[pg_extern(schema = "pgstream")]`
+- [ ] New SQL functions use `#[pg_extern(schema = "pgtrickle")]`
 - [ ] Tests use Testcontainers — never a local PG instance
 - [ ] Error messages include context (table name, query fragment)
 - [ ] GUC variables are documented with sensible defaults
-- [ ] Background workers handle `SIGTERM` and check `pg_stream.enabled`
+- [ ] Background workers handle `SIGTERM` and check `pg_trickle.enabled`

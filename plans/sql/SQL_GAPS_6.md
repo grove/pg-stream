@@ -3,7 +3,7 @@
 **Status:** Reference  
 **Date:** 2026-02-25  
 **Branch:** `main`  
-**Scope:** Comprehensive gap analysis — PostgreSQL 18 SQL coverage vs pg_stream implementation.  
+**Scope:** Comprehensive gap analysis — PostgreSQL 18 SQL coverage vs pg_trickle implementation.  
 **Current state:** 896 unit tests, 22 E2E test suites (350 E2E tests), 61 integration tests, 36 AggFunc variants, 21 OpTree variants, 21 diff operators, 5 auto-rewrite passes, 17 GUC variables.
 
 ---
@@ -30,7 +30,7 @@
 
 ## 1. Executive Summary
 
-pg_stream now covers the vast majority of PostgreSQL SELECT syntax. Phases 1–5
+pg_trickle now covers the vast majority of PostgreSQL SELECT syntax. Phases 1–5
 resolved 52+ original gaps, implemented 5 transparent auto-rewrite passes
 (DISTINCT ON, GROUPING SETS/CUBE/ROLLUP, scalar subquery in WHERE, SubLinks in
 OR, multi-PARTITION BY windows), added 21 diff operators, and expanded aggregate
@@ -41,7 +41,7 @@ the core SQL parsing and delta computation.** All unsupported constructs are
 rejected with clear, actionable error messages.
 
 However, deep analysis reveals a new class of gaps — not in SQL syntax coverage
-but in the **operational boundary conditions** where pg_stream intersects with
+but in the **operational boundary conditions** where pg_trickle intersects with
 PostgreSQL's broader feature set:
 
 | Category | P0 | P1 | P2 | P3 | P4 | Total |
@@ -115,18 +115,18 @@ These functions transparently rewrite the raw parse tree before the main DVM par
 | **WAL transition** | Hybrid trigger→WAL migration with configurable timeout |
 | **DDL tracking** | Event trigger on `ddl_command_end`; classifies changes as Benign/ConstraintChange/ColumnChange |
 | **Schema snapshots** | `columns_used` per dependency; `schema_fingerprint` for fast equality |
-| **Block source DDL** | `pg_stream.block_source_ddl` GUC (default: false) |
-| **Keyless tables** | All-column content hash for `__pgs_row_id` |
+| **Block source DDL** | `pg_trickle.block_source_ddl` GUC (default: false) |
+| **Keyless tables** | All-column content hash for `__pgt_row_id` |
 | **Volatile detection** | `pg_proc.provolatile` lookup; rejects volatile in DIFF, warns for stable |
 | **MERGE-based refresh** | Cached MERGE SQL templates, prepared statements, planner hints |
-| **GUC count** | 17 settings in `pg_stream.*` namespace |
+| **GUC count** | 17 settings in `pg_trickle.*` namespace |
 
 ---
 
 ## 4. Gap Category 1: Expression Node Types
 
 These are PostgreSQL raw parse tree node types not handled in `node_to_expr()`.
-The catch-all returns `PgStreamError::UnsupportedOperator` with the node tag
+The catch-all returns `PgTrickleError::UnsupportedOperator` with the node tag
 name, so none are silent — they all surface as clear errors.
 
 ### G1.1 — `T_CollateExpr` (COLLATE clause on expressions)
@@ -254,7 +254,7 @@ suggesting FULL mode. Option C as a follow-up enhancement.
 CREATE VIEW active_orders AS SELECT * FROM orders WHERE status = 'active';
 
 -- This should either reject or warn:
-SELECT pgstream.create('order_summary', 'DIFFERENTIAL',
+SELECT pgtrickle.create('order_summary', 'DIFFERENTIAL',
   'SELECT customer_id, COUNT(*) FROM active_orders GROUP BY customer_id');
 ```
 
@@ -317,7 +317,7 @@ CREATE AGGREGATE my_median(numeric) (
   SFUNC = my_median_sfunc, STYPE = internal, FINALFUNC = my_median_final
 );
 
--- pg_stream silently treats this as a scalar function:
+-- pg_trickle silently treats this as a scalar function:
 SELECT dept, my_median(salary) FROM employees GROUP BY dept;
 -- → Wrong: my_median sees each row individually, not the group
 ```
@@ -376,7 +376,7 @@ syntax introduced in PostgreSQL 16.
 | Field | Value |
 |-------|-------|
 | **Gap** | Content hash for keyless tables uses `col::text` which is lossy for some types |
-| **Current behavior** | Two distinct rows that produce identical `::text` representations get the same `__pgs_row_id` → one row silently overwrites the other in the MERGE |
+| **Current behavior** | Two distinct rows that produce identical `::text` representations get the same `__pgt_row_id` → one row silently overwrites the other in the MERGE |
 | **Severity** | **P1 — Silent data loss** (only for keyless tables) |
 | **Impact** | Low — requires both keyless tables AND problematic types |
 | **Affected types** | `float8` (rounding: `0.1 + 0.2 → '0.30000000000000004'` but intermediate representations may collide), `bytea` (encoding-dependent), `bit varying` (truncation), composite types (may not have unique text output) |
@@ -421,8 +421,8 @@ identity directly.
 | Field | Value |
 |-------|-------|
 | **Gap** | Rows differing only by NULL placement can collide in the content hash |
-| **Current behavior** | `pg_stream_hash_multi(ARRAY[col1::text, col2::text, ...])` converts all values to text. `NULL::text` is `NULL`, and `NULL` in an array may be handled inconsistently depending on the hash implementation. Two rows `(1, NULL, 3)` and `(1, 3, NULL)` could potentially hash to the same value if NULL handling in the array is position-insensitive. |
-| **Severity** | **P4** — theoretical concern; depends on `pg_stream_hash_multi` implementation |
+| **Current behavior** | `pg_trickle_hash_multi(ARRAY[col1::text, col2::text, ...])` converts all values to text. `NULL::text` is `NULL`, and `NULL` in an array may be handled inconsistently depending on the hash implementation. Two rows `(1, NULL, 3)` and `(1, 3, NULL)` could potentially hash to the same value if NULL handling in the array is position-insensitive. |
+| **Severity** | **P4** — theoretical concern; depends on `pg_trickle_hash_multi` implementation |
 | **Impact** | Very low — requires specific NULL patterns in keyless tables |
 | **Effort** | 2 hours — add position-aware NULL sentinel values (e.g., `'__null_N__'` where N is the ordinal) |
 
@@ -479,7 +479,7 @@ FROM api_responses r,
 | **Gap** | `MERGE INTO ... USING ... WHEN MATCHED/NOT MATCHED` cannot be used as a defining query |
 | **Current behavior** | Only `SELECT` statements are accepted as defining queries |
 | **Severity** | **P4** — MERGE is a DML statement, not a query |
-| **Impact** | None — MERGE is used internally by pg_stream for delta application |
+| **Impact** | None — MERGE is used internally by pg_trickle for delta application |
 | **Note** | Not a real gap — defining queries are SELECT statements by design |
 
 ---
@@ -519,14 +519,14 @@ FROM api_responses r,
 | **Severity** | **P0 — Silent data loss** (PostgreSQL 12 and earlier); **P4** in PostgreSQL 13+ |
 | **Impact** | High for PG <13: changes silently missed. Low for PG 13+: likely works correctly. |
 | **Effort** | 3–4 hours |
-| **Target PG version** | pg_stream targets PG 18, so this is likely **not a real problem** in practice |
+| **Target PG version** | pg_trickle targets PG 18, so this is likely **not a real problem** in practice |
 
 **Verification needed:** Confirm that with PG 18 + pgrx 0.17, AFTER triggers on
 partitioned table parents correctly fire for all routed DML. If so, close this
 gap with a documentation note.
 
 **For PG 13+:** The trigger fires correctly, but the change buffer table uses the
-**parent's** OID for its name (`pgstream_changes.changes_<parent_oid>`). This
+**parent's** OID for its name (`pgtrickle_changes.changes_<parent_oid>`). This
 should be correct since the stream table's `source_oid` also references the parent.
 
 ---
@@ -561,8 +561,8 @@ should be correct since the stream table's `source_oid` also references the pare
 
 | Field | Value |
 |-------|-------|
-| **Gap** | If RLS is enabled on the `pgstream_changes` schema, CDC trigger inserts could fail |
-| **Current behavior** | Change buffer tables are owned by the extension installer. RLS is not explicitly disabled on them. If a DBA enables RLS globally or on the `pgstream_changes` schema, trigger-based inserts may be blocked. |
+| **Gap** | If RLS is enabled on the `pgtrickle_changes` schema, CDC trigger inserts could fail |
+| **Current behavior** | Change buffer tables are owned by the extension installer. RLS is not explicitly disabled on them. If a DBA enables RLS globally or on the `pgtrickle_changes` schema, trigger-based inserts may be blocked. |
 | **Severity** | **P4** — extremely unlikely scenario |
 | **Impact** | Very low |
 | **Effort** | 1 hour — add `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` to buffer table creation |
@@ -719,12 +719,12 @@ but documentation inaccuracies that mislead users.
 
 | GUC | Status |
 |-----|--------|
-| `pg_stream.differential_max_change_ratio` | Exists in code; no dedicated section in docs |
-| `pg_stream.cleanup_use_truncate` | Exists in code; no dedicated section in docs |
-| `pg_stream.merge_planner_hints` | Exists in code; no dedicated section in docs |
-| `pg_stream.merge_work_mem_mb` | Exists in code; no dedicated section in docs |
-| `pg_stream.merge_strategy` | Exists in code; no dedicated section in docs |
-| `pg_stream.use_prepared_statements` | Exists in code; no dedicated section in docs |
+| `pg_trickle.differential_max_change_ratio` | Exists in code; no dedicated section in docs |
+| `pg_trickle.cleanup_use_truncate` | Exists in code; no dedicated section in docs |
+| `pg_trickle.merge_planner_hints` | Exists in code; no dedicated section in docs |
+| `pg_trickle.merge_work_mem_mb` | Exists in code; no dedicated section in docs |
+| `pg_trickle.merge_strategy` | Exists in code; no dedicated section in docs |
+| `pg_trickle.use_prepared_statements` | Exists in code; no dedicated section in docs |
 
 **Actual GUC count:** 17 (not the 12 documented).
 
@@ -877,7 +877,7 @@ efficient for wide tables.
 | SQL_GAPS_2 | GROUPING SETS P0, GROUP BY hardening, TABLESAMPLE | 1 | 6 | 745 → 750 |
 | SQL_GAPS_3 | Aggregates (5 new), subquery operators (Semi/Anti/Scalar Join) | ~5 | 10 | 750 → 809 |
 | SQL_GAPS_4 | Report accuracy, ordered-set aggregates (MODE, PERCENTILE) | 1 | 7 | 809 → 826 |
-| Hybrid CDC | Trigger→WAL transition, user triggers, pgs_ rename | ~3 | 12+ | 826 → 872 |
+| Hybrid CDC | Trigger→WAL transition, user triggers, pgt_ rename | ~3 | 12+ | 826 → 872 |
 | SQL_GAPS_5 | 15 steps: volatile detection, DISTINCT ON, GROUPING SETS, ALL subquery, regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables, scalar WHERE, SubLinks-OR, multi-PARTITION, recursive CTE DIFF | ~10 | 15 | 872 → 896 |
 | **SQL_GAPS_6** | **This plan: 38 new gaps identified, 24 steps proposed** | **8** | **23/24 done (F15 deferred)** | 896 → 1,138+ |
 
@@ -900,7 +900,7 @@ efficient for wide tables.
 ### What Changed Between SQL_GAPS_5 and SQL_GAPS_6
 
 SQL_GAPS_5 focused on closing syntax-level gaps — every SQL construct that
-pg_stream could encounter was either handled or rejected with a clear error.
+pg_trickle could encounter was either handled or rejected with a clear error.
 SQL_GAPS_6 shifts focus to **operational boundaries**:
 
 - **Source object types**: Views, materialized views, foreign tables, partitioned tables

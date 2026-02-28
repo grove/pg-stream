@@ -1,7 +1,7 @@
-//! Error types for pgstream.
+//! Error types for pgtrickle.
 //!
-//! All errors that can occur within the extension are represented by [`PgStreamError`].
-//! Errors are propagated via `Result<T, PgStreamError>` throughout the codebase and
+//! All errors that can occur within the extension are represented by [`PgTrickleError`].
+//! Errors are propagated via `Result<T, PgTrickleError>` throughout the codebase and
 //! converted to PostgreSQL errors at the API boundary using `pgrx::error!()`.
 //!
 //! # Error Classification
@@ -22,7 +22,7 @@ use std::fmt;
 
 /// Primary error type for the extension.
 #[derive(Debug, thiserror::Error)]
-pub enum PgStreamError {
+pub enum PgTrickleError {
     // ── User errors — fail, don't retry ──────────────────────────────────
     /// The defining query could not be parsed or validated.
     #[error("query parse error: {0}")]
@@ -89,7 +89,7 @@ pub enum PgStreamError {
     InternalError(String),
 }
 
-impl PgStreamError {
+impl PgTrickleError {
     /// Whether this error is retryable by the scheduler.
     ///
     /// System errors and skipped refreshes are retryable.
@@ -97,11 +97,11 @@ impl PgStreamError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            PgStreamError::LockTimeout(_)
-                | PgStreamError::ReplicationSlotError(_)
-                | PgStreamError::WalTransitionError(_)
-                | PgStreamError::SpiError(_)
-                | PgStreamError::RefreshSkipped(_)
+            PgTrickleError::LockTimeout(_)
+                | PgTrickleError::ReplicationSlotError(_)
+                | PgTrickleError::WalTransitionError(_)
+                | PgTrickleError::SpiError(_)
+                | PgTrickleError::RefreshSkipped(_)
         )
     }
 
@@ -109,7 +109,7 @@ impl PgStreamError {
     pub fn requires_reinitialize(&self) -> bool {
         matches!(
             self,
-            PgStreamError::UpstreamSchemaChanged(_) | PgStreamError::UpstreamTableDropped(_)
+            PgTrickleError::UpstreamSchemaChanged(_) | PgTrickleError::UpstreamTableDropped(_)
         )
     }
 
@@ -118,53 +118,53 @@ impl PgStreamError {
     /// Skipped refreshes and some transient errors don't count because the
     /// ST itself isn't broken — the scheduler just couldn't run it this time.
     pub fn counts_toward_suspension(&self) -> bool {
-        !matches!(self, PgStreamError::RefreshSkipped(_))
+        !matches!(self, PgTrickleError::RefreshSkipped(_))
     }
 }
 
 /// Classification of error severity/kind for monitoring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PgStreamErrorKind {
+pub enum PgTrickleErrorKind {
     User,
     Schema,
     System,
     Internal,
 }
 
-impl fmt::Display for PgStreamErrorKind {
+impl fmt::Display for PgTrickleErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PgStreamErrorKind::User => write!(f, "USER"),
-            PgStreamErrorKind::Schema => write!(f, "SCHEMA"),
-            PgStreamErrorKind::System => write!(f, "SYSTEM"),
-            PgStreamErrorKind::Internal => write!(f, "INTERNAL"),
+            PgTrickleErrorKind::User => write!(f, "USER"),
+            PgTrickleErrorKind::Schema => write!(f, "SCHEMA"),
+            PgTrickleErrorKind::System => write!(f, "SYSTEM"),
+            PgTrickleErrorKind::Internal => write!(f, "INTERNAL"),
         }
     }
 }
 
-impl PgStreamError {
+impl PgTrickleError {
     /// Classify the error for monitoring and alerting.
-    pub fn kind(&self) -> PgStreamErrorKind {
+    pub fn kind(&self) -> PgTrickleErrorKind {
         match self {
-            PgStreamError::QueryParseError(_)
-            | PgStreamError::TypeMismatch(_)
-            | PgStreamError::UnsupportedOperator(_)
-            | PgStreamError::CycleDetected(_)
-            | PgStreamError::NotFound(_)
-            | PgStreamError::AlreadyExists(_)
-            | PgStreamError::InvalidArgument(_) => PgStreamErrorKind::User,
+            PgTrickleError::QueryParseError(_)
+            | PgTrickleError::TypeMismatch(_)
+            | PgTrickleError::UnsupportedOperator(_)
+            | PgTrickleError::CycleDetected(_)
+            | PgTrickleError::NotFound(_)
+            | PgTrickleError::AlreadyExists(_)
+            | PgTrickleError::InvalidArgument(_) => PgTrickleErrorKind::User,
 
-            PgStreamError::UpstreamTableDropped(_) | PgStreamError::UpstreamSchemaChanged(_) => {
-                PgStreamErrorKind::Schema
+            PgTrickleError::UpstreamTableDropped(_) | PgTrickleError::UpstreamSchemaChanged(_) => {
+                PgTrickleErrorKind::Schema
             }
 
-            PgStreamError::LockTimeout(_)
-            | PgStreamError::ReplicationSlotError(_)
-            | PgStreamError::WalTransitionError(_)
-            | PgStreamError::SpiError(_)
-            | PgStreamError::RefreshSkipped(_) => PgStreamErrorKind::System,
+            PgTrickleError::LockTimeout(_)
+            | PgTrickleError::ReplicationSlotError(_)
+            | PgTrickleError::WalTransitionError(_)
+            | PgTrickleError::SpiError(_)
+            | PgTrickleError::RefreshSkipped(_) => PgTrickleErrorKind::System,
 
-            PgStreamError::InternalError(_) => PgStreamErrorKind::Internal,
+            PgTrickleError::InternalError(_) => PgTrickleErrorKind::Internal,
         }
     }
 }
@@ -278,51 +278,51 @@ mod tests {
     #[test]
     fn test_error_classification() {
         assert_eq!(
-            PgStreamError::QueryParseError("x".into()).kind(),
-            PgStreamErrorKind::User
+            PgTrickleError::QueryParseError("x".into()).kind(),
+            PgTrickleErrorKind::User
         );
         assert_eq!(
-            PgStreamError::UpstreamSchemaChanged(1).kind(),
-            PgStreamErrorKind::Schema
+            PgTrickleError::UpstreamSchemaChanged(1).kind(),
+            PgTrickleErrorKind::Schema
         );
         assert_eq!(
-            PgStreamError::LockTimeout("x".into()).kind(),
-            PgStreamErrorKind::System
+            PgTrickleError::LockTimeout("x".into()).kind(),
+            PgTrickleErrorKind::System
         );
         assert_eq!(
-            PgStreamError::InternalError("x".into()).kind(),
-            PgStreamErrorKind::Internal
+            PgTrickleError::InternalError("x".into()).kind(),
+            PgTrickleErrorKind::Internal
         );
         assert_eq!(
-            PgStreamError::RefreshSkipped("x".into()).kind(),
-            PgStreamErrorKind::System
+            PgTrickleError::RefreshSkipped("x".into()).kind(),
+            PgTrickleErrorKind::System
         );
     }
 
     #[test]
     fn test_retryable_errors() {
-        assert!(PgStreamError::LockTimeout("x".into()).is_retryable());
-        assert!(PgStreamError::ReplicationSlotError("x".into()).is_retryable());
-        assert!(PgStreamError::SpiError("x".into()).is_retryable());
-        assert!(PgStreamError::RefreshSkipped("x".into()).is_retryable());
+        assert!(PgTrickleError::LockTimeout("x".into()).is_retryable());
+        assert!(PgTrickleError::ReplicationSlotError("x".into()).is_retryable());
+        assert!(PgTrickleError::SpiError("x".into()).is_retryable());
+        assert!(PgTrickleError::RefreshSkipped("x".into()).is_retryable());
 
-        assert!(!PgStreamError::QueryParseError("x".into()).is_retryable());
-        assert!(!PgStreamError::CycleDetected(vec![]).is_retryable());
-        assert!(!PgStreamError::InternalError("x".into()).is_retryable());
+        assert!(!PgTrickleError::QueryParseError("x".into()).is_retryable());
+        assert!(!PgTrickleError::CycleDetected(vec![]).is_retryable());
+        assert!(!PgTrickleError::InternalError("x".into()).is_retryable());
     }
 
     #[test]
     fn test_requires_reinitialize() {
-        assert!(PgStreamError::UpstreamSchemaChanged(1).requires_reinitialize());
-        assert!(PgStreamError::UpstreamTableDropped(1).requires_reinitialize());
-        assert!(!PgStreamError::SpiError("x".into()).requires_reinitialize());
+        assert!(PgTrickleError::UpstreamSchemaChanged(1).requires_reinitialize());
+        assert!(PgTrickleError::UpstreamTableDropped(1).requires_reinitialize());
+        assert!(!PgTrickleError::SpiError("x".into()).requires_reinitialize());
     }
 
     #[test]
     fn test_counts_toward_suspension() {
-        assert!(PgStreamError::SpiError("x".into()).counts_toward_suspension());
-        assert!(PgStreamError::LockTimeout("x".into()).counts_toward_suspension());
-        assert!(!PgStreamError::RefreshSkipped("x".into()).counts_toward_suspension());
+        assert!(PgTrickleError::SpiError("x".into()).counts_toward_suspension());
+        assert!(PgTrickleError::LockTimeout("x".into()).counts_toward_suspension());
+        assert!(!PgTrickleError::RefreshSkipped("x".into()).counts_toward_suspension());
     }
 
     #[test]

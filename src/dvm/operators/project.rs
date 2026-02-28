@@ -10,17 +10,17 @@
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::{Expr, OpTree, join_pk_expr_indices};
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a Project node.
-pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Project {
         expressions,
         aliases,
         child,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_project called on non-Project node".into(),
         ));
     };
@@ -52,11 +52,11 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
         })
         .collect();
 
-    // For join children, recompute __pgs_row_id from the projected columns.
+    // For join children, recompute __pgt_row_id from the projected columns.
     // The full refresh uses hash of all output columns for join queries,
     // so the delta must produce matching row IDs.
     //
-    // For lateral function/subquery children, also recompute __pgs_row_id
+    // For lateral function/subquery children, also recompute __pgt_row_id
     // from all projected columns. SRF expansions have no natural PK, so
     // the delta's row_id must match the full refresh's hash of the
     // projected output columns.
@@ -88,7 +88,7 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
             .iter()
             .map(|expr| resolve_expr_to_child(expr, child_cols))
             .collect();
-        format!("{} AS __pgs_row_id", build_hash_expr(&hash_cols))
+        format!("{} AS __pgt_row_id", build_hash_expr(&hash_cols))
     } else if is_lateral_child {
         // Hash all projected columns — matches row_id_key_columns()
         // which returns all aliases for lateral children.
@@ -96,13 +96,13 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
             .iter()
             .map(|expr| resolve_expr_to_child(expr, child_cols))
             .collect();
-        format!("{} AS __pgs_row_id", build_hash_expr(&hash_cols))
+        format!("{} AS __pgt_row_id", build_hash_expr(&hash_cols))
     } else {
-        "__pgs_row_id".to_string()
+        "__pgt_row_id".to_string()
     };
 
     let sql = format!(
-        "SELECT {row_id_select}, __pgs_action, {proj_cols}\n\
+        "SELECT {row_id_select}, __pgt_action, {proj_cols}\n\
          FROM {child_cte}",
         proj_cols = proj_cols.join(", "),
         child_cte = child_result.cte_name,
@@ -222,8 +222,8 @@ mod tests {
         let result = diff_project(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Non-join child: __pgs_row_id passed through directly
-        assert_sql_contains(&sql, "__pgs_row_id");
+        // Non-join child: __pgt_row_id passed through directly
+        assert_sql_contains(&sql, "__pgt_row_id");
     }
 
     #[test]

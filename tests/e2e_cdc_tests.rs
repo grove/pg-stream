@@ -29,7 +29,7 @@ async fn test_trigger_captures_insert() {
     .await;
 
     let source_oid = db.table_oid("cdc_src").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
 
     // Consume any existing changes from create
     db.refresh_st("cdc_st").await;
@@ -72,7 +72,7 @@ async fn test_trigger_captures_update() {
     .await;
 
     let source_oid = db.table_oid("cdc_upd").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
 
     // Consume existing changes
     db.refresh_st("cdc_upd_st").await;
@@ -120,7 +120,7 @@ async fn test_trigger_captures_delete() {
     .await;
 
     let source_oid = db.table_oid("cdc_del").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
 
     // Consume existing changes
     db.refresh_st("cdc_del_st").await;
@@ -166,7 +166,7 @@ async fn test_trigger_captures_bulk_insert() {
     .await;
 
     let source_oid = db.table_oid("cdc_bulk").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
 
     // Consume existing changes
     db.refresh_st("cdc_bulk_st").await;
@@ -199,7 +199,7 @@ async fn test_trigger_lsn_ordering() {
     .await;
 
     let source_oid = db.table_oid("cdc_lsn").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
 
     // Consume existing
     db.refresh_st("cdc_lsn_st").await;
@@ -242,7 +242,7 @@ async fn test_trigger_typed_columns_captured() {
     .await;
 
     let source_oid = db.table_oid("cdc_typed").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
 
     // Consume existing
     db.refresh_st("cdc_typed_st").await;
@@ -285,7 +285,7 @@ async fn test_buffer_cleanup_after_refresh() {
     .await;
 
     let source_oid = db.table_oid("cdc_cleanup").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
 
     // Insert data to create changes
     db.execute("INSERT INTO cdc_cleanup VALUES (2, 'b'), (3, 'c')")
@@ -327,10 +327,10 @@ async fn test_multiple_sources_independent_buffers() {
 
     // Each source should have its own buffer table
     let buf_a_exists = db
-        .table_exists("pgstream_changes", &format!("changes_{}", oid_a))
+        .table_exists("pgtrickle_changes", &format!("changes_{}", oid_a))
         .await;
     let buf_b_exists = db
-        .table_exists("pgstream_changes", &format!("changes_{}", oid_b))
+        .table_exists("pgtrickle_changes", &format!("changes_{}", oid_b))
         .await;
 
     assert!(buf_a_exists, "src_a should have its own change buffer");
@@ -425,7 +425,7 @@ async fn test_trigger_captures_partitioned_table_dml() {
 
     // Verify changes are captured in the change buffer
     let source_oid = db.table_oid("orders").await;
-    let buffer_table = format!("pgstream_changes.changes_{}", source_oid);
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
     let change_count: i64 = db.count(&buffer_table).await;
     assert!(
         change_count >= 2,

@@ -1,7 +1,7 @@
 -- Q16: Parts/Supplier Relationship
 -- Operators: 3-table Join -> NOT IN subquery -> COUNT (DISTINCT rewritten as subquery)
 -- COUNT(DISTINCT ps_suppkey) rewritten as DISTINCT subquery + COUNT(*) to avoid
--- pg_stream DIFFERENTIAL limitation with DISTINCT aggregates.
+-- pg_trickle DIFFERENTIAL limitation with DISTINCT aggregates.
 -- NOT LIKE rewritten with left()/strpos to avoid A_Expr kind 7 (LIKE).
 SELECT
     p_brand,

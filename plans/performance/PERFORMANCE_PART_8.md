@@ -230,11 +230,11 @@ The pipeline overhead (Decision + Gen+Build) is <1ms — essentially zero. **Any
 
 ```sql
 -- Before MERGE, filter the final CTE to only groups with actual changes
-WITH __pgs_changed_groups AS (
-    SELECT * FROM __pgs_cte_agg_final_N
-    WHERE __pgs_action IN ('I', 'D')  -- already done
+WITH __pgt_changed_groups AS (
+    SELECT * FROM __pgt_cte_agg_final_N
+    WHERE __pgt_action IN ('I', 'D')  -- already done
 )
-MERGE INTO st USING __pgs_changed_groups ...
+MERGE INTO st USING __pgt_changed_groups ...
 ```
 
 This is already present (the `WHERE ... IS DISTINCT FROM` guard). The issue may be that PostgreSQL MERGE evaluates all matched rows even when the WHEN clause filters them. Consider splitting to `DELETE + INSERT` with pre-filtered CTEs instead of MERGE.
@@ -249,8 +249,8 @@ This is already present (the `WHERE ... IS DISTINCT FROM` guard). The issue may 
 
 ```sql
 -- Instead of one MERGE with 10K rows:
-MERGE INTO st USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 0) ...
-MERGE INTO st USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 1) ...
+MERGE INTO st USING (SELECT * FROM delta WHERE __pgt_row_id % 4 = 0) ...
+MERGE INTO st USING (SELECT * FROM delta WHERE __pgt_row_id % 4 = 1) ...
 -- etc.
 ```
 
@@ -265,12 +265,12 @@ MERGE INTO st USING (SELECT * FROM delta WHERE __pgs_row_id % 4 = 1) ...
 **Fix**: When delta covers >25% of stream table rows, use:
 ```sql
 DELETE FROM st WHERE (key_cols) IN (SELECT key_cols FROM delta);
-INSERT INTO st SELECT ... FROM delta WHERE __pgs_action = 'I';
+INSERT INTO st SELECT ... FROM delta WHERE __pgt_action = 'I';
 ```
 
 **Effort**: 2 hours. **Impact**: Potentially significant at 50% — eliminates MERGE planning overhead. Risk: two statements vs one.
 
-**Decision**: Implement behind a GUC flag (`pg_stream.merge_strategy = 'auto'|'merge'|'delete_insert'`).
+**Decision**: Implement behind a GUC flag (`pg_trickle.merge_strategy = 'auto'|'merge'|'delete_insert'`).
 
 ### Phase C: Cleanup & Buffer Optimization (Priority: MEDIUM)
 
@@ -292,9 +292,9 @@ INSERT INTO st SELECT ... FROM delta WHERE __pgs_action = 'I';
 **Fix**: **Statement-level triggers with transition tables** (PostgreSQL AFTER STATEMENT with referencing OLD/NEW TABLE). This batches all changes from a single statement into one buffer INSERT:
 
 ```sql
-CREATE TRIGGER pg_stream_cdc_tr AFTER INSERT OR UPDATE OR DELETE
+CREATE TRIGGER pg_trickle_cdc_tr AFTER INSERT OR UPDATE OR DELETE
 ON source_table REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows
-FOR EACH STATEMENT EXECUTE FUNCTION pg_stream_cdc_stmt_fn();
+FOR EACH STATEMENT EXECUTE FUNCTION pg_trickle_cdc_stmt_fn();
 ```
 
 **Effort**: 8 hours (requires CDC rewrite). **Impact**: 50-80% reduction in trigger overhead at high write volumes. No change for single-row DML.
@@ -341,7 +341,7 @@ Apply conditionally based on estimated delta size:
 **Fix**: Replace the current `count(*)` decision query with an `EXISTS` check that short-circuits on the first row:
 ```sql
 SELECT EXISTS(
-    SELECT 1 FROM pgstream_changes.changes_OID
+    SELECT 1 FROM pgtrickle_changes.changes_OID
     WHERE lsn > $prev_lsn AND lsn <= $new_lsn
     LIMIT 1
 )
@@ -421,8 +421,8 @@ Also added debug logging when the auto-tuner adjusts the threshold.
 - Accumulated `total_change_count` from the capped-count threshold loop to
   feed the hint tier decision
 - New GUCs:
-  - `pg_stream.merge_planner_hints` (bool, default true) — master switch
-  - `pg_stream.merge_work_mem_mb` (int, default 64) — work_mem for large deltas
+  - `pg_trickle.merge_planner_hints` (bool, default true) — master switch
+  - `pg_trickle.merge_work_mem_mb` (int, default 64) — work_mem for large deltas
 - Profiling line now includes `delta_est=<N>` and `hints=<tier>` fields
 - **Expected outcome**: P95 reduction for join/join_agg scenarios where
   nested-loop plans cause latency spikes
@@ -438,12 +438,12 @@ Also added debug logging when the auto-tuner adjusts the threshold.
   recomputed values are identical to the current values
 
 **B-3: DELETE + INSERT alternative for large deltas (behind GUC)**
-- New GUC: `pg_stream.merge_strategy` (string: `auto`/`merge`/`delete_insert`)
+- New GUC: `pg_trickle.merge_strategy` (string: `auto`/`merge`/`delete_insert`)
 - In `auto` mode (default), switches to DELETE+INSERT when the estimated delta
   exceeds 25% of the source table row count (`MERGE_STRATEGY_AUTO_THRESHOLD`)
 - DELETE+INSERT is two statements:
-  1. `DELETE FROM st WHERE __pgs_row_id IN (SELECT __pgs_row_id FROM delta)`
-  2. `INSERT INTO st SELECT ... FROM delta WHERE __pgs_action = 'I'`
+  1. `DELETE FROM st WHERE __pgt_row_id IN (SELECT __pgt_row_id FROM delta)`
+  2. `INSERT INTO st SELECT ... FROM delta WHERE __pgt_action = 'I'`
 - Both MERGE and DELETE+INSERT templates are cached alongside each other in
   `CachedMergeTemplate`, with strategy selection at execution time
 - Profiling line now includes `strategy=merge|delete_insert` field
@@ -454,7 +454,7 @@ Also added debug logging when the auto-tuner adjusts the threshold.
 
 ### Session 5: Prepared Statements (D-2) ✅ COMPLETED
 - SQL PREPARE / EXECUTE for MERGE (not C-level SPI_prepare)
-- New GUC: `pg_stream.use_prepared_statements` (default true)
+- New GUC: `pg_trickle.use_prepared_statements` (default true)
 - Parameterized MERGE template with `$N` positional params for LSN values
 - PREPARE issued on first cache-hit, EXECUTE on subsequent cycles
 - PostgreSQL switches from custom → generic plan after ~5 executions

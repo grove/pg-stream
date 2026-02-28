@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 #[cfg(feature = "pg18")]
 use pgrx::prelude::*;
@@ -35,7 +35,7 @@ use pgrx::prelude::*;
 pub enum NodeId {
     /// A regular base table or view, identified by PostgreSQL OID.
     BaseTable(u32),
-    /// A stream table, identified by its `pgs_id` from the catalog.
+    /// A stream table, identified by its `pgt_id` from the catalog.
     StreamTable(i64),
 }
 
@@ -59,13 +59,13 @@ impl StStatus {
     }
 
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Result<Self, PgStreamError> {
+    pub fn from_str(s: &str) -> Result<Self, PgTrickleError> {
         match s {
             "INITIALIZING" => Ok(StStatus::Initializing),
             "ACTIVE" => Ok(StStatus::Active),
             "SUSPENDED" => Ok(StStatus::Suspended),
             "ERROR" => Ok(StStatus::Error),
-            other => Err(PgStreamError::InvalidArgument(format!(
+            other => Err(PgTrickleError::InvalidArgument(format!(
                 "unknown status: {other}"
             ))),
         }
@@ -88,13 +88,13 @@ impl RefreshMode {
     }
 
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Result<Self, PgStreamError> {
+    pub fn from_str(s: &str) -> Result<Self, PgTrickleError> {
         match s.to_uppercase().as_str() {
             "FULL" => Ok(RefreshMode::Full),
             "DIFFERENTIAL" => Ok(RefreshMode::Differential),
             // Accept INCREMENTAL as a deprecated alias for backward compatibility.
             "INCREMENTAL" => Ok(RefreshMode::Differential),
-            other => Err(PgStreamError::InvalidArgument(format!(
+            other => Err(PgTrickleError::InvalidArgument(format!(
                 "unknown refresh mode: {other}. Must be 'FULL' or 'DIFFERENTIAL'"
             ))),
         }
@@ -146,29 +146,29 @@ impl StDag {
     /// Loads all stream tables and their dependencies, constructs the graph,
     /// and resolves CALCULATED schedules.
     #[cfg(feature = "pg18")]
-    pub fn build_from_catalog(fallback_schedule_secs: i32) -> Result<Self, PgStreamError> {
+    pub fn build_from_catalog(fallback_schedule_secs: i32) -> Result<Self, PgTrickleError> {
         let mut dag = StDag::new();
 
         Spi::connect(|client| {
             // Load all stream tables
             let st_table = client
                 .select(
-                    "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, \
+                    "SELECT pgt_id, pgt_relid, pgt_name, pgt_schema, \
                      schedule AS schedule_secs, \
                      status, refresh_mode, is_populated, needs_reinit \
-                     FROM pgstream.pgs_stream_tables",
+                     FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             for row in st_table {
-                let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
+                let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
 
-                let pgs_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
-                let _pgs_relid = row.get::<pg_sys::Oid>(2).map_err(map_spi)?;
-                let pgs_name = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
-                let pgs_schema = row.get::<String>(4).map_err(map_spi)?.unwrap_or_default();
+                let pgt_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
+                let _pgt_relid = row.get::<pg_sys::Oid>(2).map_err(map_spi)?;
+                let pgt_name = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
+                let pgt_schema = row.get::<String>(4).map_err(map_spi)?.unwrap_or_default();
                 let schedule_text = row.get::<String>(5).map_err(map_spi)?;
                 let status_str = row.get::<String>(6).map_err(map_spi)?.unwrap_or_default();
                 let _mode_str = row.get::<String>(7).map_err(map_spi)?.unwrap_or_default();
@@ -185,10 +185,10 @@ impl StDag {
                 let effective_schedule = schedule.unwrap_or(Duration::ZERO);
 
                 dag.add_st_node(DagNode {
-                    id: NodeId::StreamTable(pgs_id),
+                    id: NodeId::StreamTable(pgt_id),
                     schedule,
                     effective_schedule,
-                    name: format!("{}.{}", pgs_schema, pgs_name),
+                    name: format!("{}.{}", pgt_schema, pgt_name),
                     status,
                     schedule_raw: schedule_text,
                 });
@@ -197,36 +197,36 @@ impl StDag {
             // Load all dependency edges
             let dep_table = client
                 .select(
-                    "SELECT d.pgs_id, d.source_relid, d.source_type, \
-                     st.pgs_id AS source_pgs_id \
-                     FROM pgstream.pgs_dependencies d \
-                     LEFT JOIN pgstream.pgs_stream_tables st ON st.pgs_relid = d.source_relid",
+                    "SELECT d.pgt_id, d.source_relid, d.source_type, \
+                     st.pgt_id AS source_pgt_id \
+                     FROM pgtrickle.pgt_dependencies d \
+                     LEFT JOIN pgtrickle.pgt_stream_tables st ON st.pgt_relid = d.source_relid",
                     None,
                     &[],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             for row in dep_table {
-                let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
+                let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
 
-                let pgs_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
+                let pgt_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
                 let source_relid = row
                     .get::<pg_sys::Oid>(2)
                     .map_err(map_spi)?
                     .unwrap_or(pg_sys::InvalidOid);
-                let source_pgs_id = row.get::<i64>(4).map_err(map_spi)?;
+                let source_pgt_id = row.get::<i64>(4).map_err(map_spi)?;
 
                 // Determine the source node type
-                let source_node = match source_pgs_id {
-                    Some(src_pgs_id) => NodeId::StreamTable(src_pgs_id),
+                let source_node = match source_pgt_id {
+                    Some(src_pgt_id) => NodeId::StreamTable(src_pgt_id),
                     None => NodeId::BaseTable(source_relid.to_u32()),
                 };
 
-                let downstream_node = NodeId::StreamTable(pgs_id);
+                let downstream_node = NodeId::StreamTable(pgt_id);
                 dag.add_edge(source_node, downstream_node);
             }
 
-            Ok::<(), PgStreamError>(())
+            Ok::<(), PgTrickleError>(())
         })?;
 
         // Resolve CALCULATED schedules
@@ -272,7 +272,7 @@ impl StDag {
     ///
     /// Returns `Ok(())` if the graph is acyclic, or `Err(CycleDetected)` with
     /// the names of nodes involved in the cycle.
-    pub fn detect_cycles(&self) -> Result<(), PgStreamError> {
+    pub fn detect_cycles(&self) -> Result<(), PgTrickleError> {
         let topo = self.topological_sort_inner()?;
         if topo.len() < self.all_nodes.len() {
             // Some nodes were not processed → cycle exists.
@@ -283,7 +283,7 @@ impl StDag {
                 .filter(|n| !processed.contains(n))
                 .map(|n| self.node_name(n))
                 .collect();
-            Err(PgStreamError::CycleDetected(cycle_nodes))
+            Err(PgTrickleError::CycleDetected(cycle_nodes))
         } else {
             Ok(())
         }
@@ -293,7 +293,7 @@ impl StDag {
     ///
     /// Only returns `NodeId::StreamTable` entries; base tables are excluded
     /// from the output since they don't need refreshing.
-    pub fn topological_order(&self) -> Result<Vec<NodeId>, PgStreamError> {
+    pub fn topological_order(&self) -> Result<Vec<NodeId>, PgTrickleError> {
         let all = self.topological_sort_inner()?;
         Ok(all
             .into_iter()
@@ -354,7 +354,7 @@ impl StDag {
     // ── Private helpers ─────────────────────────────────────────────────
 
     /// Kahn's algorithm: BFS topological sort.
-    fn topological_sort_inner(&self) -> Result<Vec<NodeId>, PgStreamError> {
+    fn topological_sort_inner(&self) -> Result<Vec<NodeId>, PgTrickleError> {
         // Compute in-degrees.
         let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
         for &node in &self.all_nodes {
@@ -476,7 +476,7 @@ mod tests {
 
         let result = dag.detect_cycles();
         assert!(result.is_err());
-        if let Err(PgStreamError::CycleDetected(nodes)) = result {
+        if let Err(PgTrickleError::CycleDetected(nodes)) = result {
             assert_eq!(nodes.len(), 2);
         }
     }
@@ -727,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pgs_status_as_str_and_from_str_roundtrip() {
+    fn test_pgt_status_as_str_and_from_str_roundtrip() {
         for status in [
             StStatus::Initializing,
             StStatus::Active,
@@ -741,10 +741,10 @@ mod tests {
     }
 
     #[test]
-    fn test_pgs_status_from_str_unknown_returns_error() {
+    fn test_pgt_status_from_str_unknown_returns_error() {
         let result = StStatus::from_str("UNKNOWN");
         assert!(result.is_err());
-        if let Err(PgStreamError::InvalidArgument(msg)) = result {
+        if let Err(PgTrickleError::InvalidArgument(msg)) = result {
             assert!(msg.contains("unknown status"));
         }
     }
@@ -773,7 +773,7 @@ mod tests {
     fn test_refresh_mode_from_str_unknown_returns_error() {
         let result = RefreshMode::from_str("INVALID");
         assert!(result.is_err());
-        if let Err(PgStreamError::InvalidArgument(msg)) = result {
+        if let Err(PgTrickleError::InvalidArgument(msg)) = result {
             assert!(msg.contains("unknown refresh mode"));
         }
     }
@@ -870,7 +870,7 @@ mod tests {
 
         let result = dag.detect_cycles();
         assert!(result.is_err());
-        if let Err(PgStreamError::CycleDetected(nodes)) = result {
+        if let Err(PgTrickleError::CycleDetected(nodes)) = result {
             assert_eq!(nodes.len(), 3);
         }
     }

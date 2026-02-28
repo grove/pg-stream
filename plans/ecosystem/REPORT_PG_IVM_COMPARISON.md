@@ -1,4 +1,4 @@
-# pg_stream vs pg_ivm — Comparison Report
+# pg_trickle vs pg_ivm — Comparison Report
 
 **Date:** 2026-02-28  
 **Author:** Internal research  
@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary
 
-Both `pg_stream` and `pg_ivm` implement Incremental View Maintenance (IVM) as
+Both `pg_trickle` and `pg_ivm` implement Incremental View Maintenance (IVM) as
 PostgreSQL extensions — the goal of keeping materialized query results up-to-date
 without full recomputation. Despite the shared objective they differ fundamentally
 in design philosophy, maintenance model, SQL coverage, operational model, and
@@ -16,28 +16,28 @@ target audience.
 
 `pg_ivm` is a mature, widely-deployed C extension (1.4k GitHub stars, 17 releases)
 focused on **immediate**, synchronous IVM that runs inside the same transaction as
-the base-table write. `pg_stream` is an early-stage Rust extension targeting
+the base-table write. `pg_trickle` is an early-stage Rust extension targeting
 **deferred, scheduled** IVM with a richer SQL dialect, a dependency DAG, and
 built-in operational tooling.
 
 The two projects are **complementary rather than directly competing**: pg_ivm is
 the right choice when you need sub-millisecond view consistency within a
-transaction; pg_stream is the right choice when you want a declarative,
+transaction; pg_trickle is the right choice when you want a declarative,
 independently-scheduled summary layer decoupled from write latency.
 
 ---
 
 ## 2. Project Overview
 
-| Attribute | pg_ivm | pg_stream |
+| Attribute | pg_ivm | pg_trickle |
 |---|---|---|
-| Repository | [sraoss/pg_ivm](https://github.com/sraoss/pg_ivm) | [grove/pg-stream](https://github.com/grove/pg-stream) |
+| Repository | [sraoss/pg_ivm](https://github.com/sraoss/pg_ivm) | [grove/pg-trickle](https://github.com/grove/pg-trickle) |
 | Language | C | Rust (pgrx 0.17) |
 | Latest release | 1.13 (2025-10-20) | 0.1.1 (2026-02-26) |
 | Stars | ~1,400 | early stage |
 | License | PostgreSQL License | Apache 2.0 |
 | PG versions | 13 – 18 | 18 only |
-| Schema | `pgivm` | `pgstream` / `pgstream_changes` |
+| Schema | `pgivm` | `pgtrickle` / `pgtrickle_changes` |
 | Shared library required | Yes (`shared_preload_libraries` or `session_preload_libraries`) | Yes (`shared_preload_libraries`, required for background worker) |
 | Background worker | No | Yes (scheduler + optional WAL decoder) |
 
@@ -72,9 +72,9 @@ COMMIT;
 - `TRUNCATE` on a base table triggers full IMMV refresh (for most view types).
 - Not compatible with logical replication (subscriber nodes are not updated).
 
-### pg_stream — Deferred, Scheduled Maintenance
+### pg_trickle — Deferred, Scheduled Maintenance
 
-pg_stream updates its stream tables **asynchronously**, driven by a background
+pg_trickle updates its stream tables **asynchronously**, driven by a background
 worker scheduler. Changes are captured by row-level triggers (or optionally by
 WAL decoding) into change-buffer tables and are applied in batch on the next
 refresh cycle.
@@ -82,7 +82,7 @@ refresh cycle.
 ```
 -- Write path: only a trigger INSERT into change buffer
 BEGIN;
-  UPDATE base_table ...;   -- trigger captures delta into pgstream_changes.*
+  UPDATE base_table ...;   -- trigger captures delta into pgtrickle_changes.*
 COMMIT;
 
 -- Separate refresh cycle (background worker):
@@ -95,10 +95,10 @@ COMMIT;
   ~2–50 μs regardless of view complexity.
 - Stream tables are stale between refresh cycles. The staleness bound is
   configurable (e.g. `'30s'`, `'5m'`, `'@hourly'`, or cron expressions).
-- Refresh can be triggered manually: `pgstream.refresh_stream_table(...)`.
+- Refresh can be triggered manually: `pgtrickle.refresh_stream_table(...)`.
 - Multiple stream tables can share a refresh pipeline ordered by dependency
   (topological DAG scheduling).
-- The WAL-based CDC mode (`pg_stream.cdc_mode = 'wal'`) eliminates trigger
+- The WAL-based CDC mode (`pg_trickle.cdc_mode = 'wal'`) eliminates trigger
   overhead entirely when `wal_level = logical` is available.
 
 ---
@@ -137,9 +137,9 @@ COMMIT;
 - GROUP BY expressions must appear in the target list.
 - `pg_dump` / `pg_upgrade` require manual IMMV recreation.
 
-### pg_stream — Supported Features
+### pg_trickle — Supported Features
 
-| Feature | pg_stream |
+| Feature | pg_trickle |
 |---|---|
 | Simple SELECT / projection | ✅ |
 | WHERE | ✅ |
@@ -200,11 +200,11 @@ ALTER TABLE myview RENAME TO myview2;
 pg_ivm IMMVs are standard PostgreSQL tables. They can be dropped with
 `DROP TABLE` and renamed with `ALTER TABLE`.
 
-### pg_stream API
+### pg_trickle API
 
 ```sql
 -- Create a stream table
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_totals',
     'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
     '2m',           -- refresh schedule
@@ -212,32 +212,32 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Manual refresh
-SELECT pgstream.refresh_stream_table('order_totals');
+SELECT pgtrickle.refresh_stream_table('order_totals');
 
 -- Alter schedule or mode
-SELECT pgstream.alter_stream_table('order_totals', schedule => '5m');
+SELECT pgtrickle.alter_stream_table('order_totals', schedule => '5m');
 
 -- Drop
-SELECT pgstream.drop_stream_table('order_totals');
+SELECT pgtrickle.drop_stream_table('order_totals');
 
 -- Status and monitoring
-SELECT * FROM pgstream.pgs_status();
-SELECT * FROM pgstream.pg_stat_stream_tables;
-SELECT * FROM pgstream.pgs_stream_tables;
+SELECT * FROM pgtrickle.pgt_status();
+SELECT * FROM pgtrickle.pg_stat_stream_tables;
+SELECT * FROM pgtrickle.pgt_stream_tables;
 
 -- DAG inspection
-SELECT * FROM pgstream.pgs_dependencies;
+SELECT * FROM pgtrickle.pgt_dependencies;
 ```
 
-pg_stream stream tables are regular PostgreSQL tables but managed through the
-`pgstream` schema's API functions. They cannot be renamed with `ALTER TABLE`
+pg_trickle stream tables are regular PostgreSQL tables but managed through the
+`pgtrickle` schema's API functions. They cannot be renamed with `ALTER TABLE`
 (use `alter_stream_table`).
 
 ---
 
 ## 6. Scheduling and Dependency Management
 
-| Capability | pg_ivm | pg_stream |
+| Capability | pg_ivm | pg_trickle |
 |---|---|---|
 | Automatic scheduling | ❌ (immediate only, no scheduler) | ✅ background worker |
 | Manual refresh | ✅ `refresh_immv()` | ✅ `refresh_stream_table()` |
@@ -247,7 +247,7 @@ pg_stream stream tables are regular PostgreSQL tables but managed through the
 | Topological refresh ordering | ❌ | ✅ (upstream refreshes before downstream) |
 | CALCULATED schedule propagation | ❌ | ✅ (consumers drive upstream schedules) |
 
-pg_stream's DAG scheduling is a significant differentiator: you can build
+pg_trickle's DAG scheduling is a significant differentiator: you can build
 multi-layer pipelines where each downstream stream table is automatically
 refreshed after its upstream dependencies, with the refresh schedule derived
 from the leaf-level freshness requirement rather than manually coordinated.
@@ -256,13 +256,13 @@ from the leaf-level freshness requirement rather than manually coordinated.
 
 ## 7. Change Data Capture
 
-| Attribute | pg_ivm | pg_stream |
+| Attribute | pg_ivm | pg_trickle |
 |---|---|---|
 | Mechanism | AFTER row triggers (inline, same txn) | AFTER row triggers → change buffer |
-| WAL-based CDC | ❌ | ✅ optional (`pg_stream.cdc_mode = 'wal'`) |
+| WAL-based CDC | ❌ | ✅ optional (`pg_trickle.cdc_mode = 'wal'`) |
 | Logical replication slots | Not used | Used in WAL mode only |
 | Write-side overhead | Higher (view maintenance in txn) | Lower (small trigger insert only) |
-| Change buffer tables | None (applied immediately) | `pgstream_changes.changes_<oid>` |
+| Change buffer tables | None (applied immediately) | `pgtrickle_changes.changes_<oid>` |
 | TRUNCATE handling | IMMV truncated/refreshed synchronously | Change buffer cleared; full refresh queued |
 
 ---
@@ -276,11 +276,11 @@ from the leaf-level freshness requirement rather than manually coordinated.
   transaction has already updated the IMMV.
 - Single-table INSERT-only IMMVs use the lighter `RowExclusiveLock`.
 
-### pg_stream
+### pg_trickle
 - Refresh operations acquire an advisory lock per stream table so only one
   refresh can run at a time.
 - Base table writes are never blocked by refresh operations.
-- `pg_stream.max_concurrent_refreshes` controls parallelism across the DAG.
+- `pg_trickle.max_concurrent_refreshes` controls parallelism across the DAG.
 - Crash recovery: in-flight refreshes are marked failed on restart; the
   scheduler retries on the next cycle.
 
@@ -288,21 +288,21 @@ from the leaf-level freshness requirement rather than manually coordinated.
 
 ## 9. Observability
 
-| Feature | pg_ivm | pg_stream |
+| Feature | pg_ivm | pg_trickle |
 |---|---|---|
-| Catalog of managed views | `pgivm.pg_ivm_immv` | `pgstream.pgs_stream_tables` |
-| Per-refresh timing/history | ❌ | ✅ `pgstream.pgs_refresh_history` |
+| Catalog of managed views | `pgivm.pg_ivm_immv` | `pgtrickle.pgt_stream_tables` |
+| Per-refresh timing/history | ❌ | ✅ `pgtrickle.pgt_refresh_history` |
 | Staleness reporting | ❌ | ✅ `stale` column in monitoring views |
-| Scheduler status | ❌ | ✅ `pgstream.pgs_status()` |
-| NOTIFY-based alerting | ❌ | ✅ `pgstream_refresh` channel |
+| Scheduler status | ❌ | ✅ `pgtrickle.pgt_status()` |
+| NOTIFY-based alerting | ❌ | ✅ `pgtrickle_refresh` channel |
 | Error tracking | ❌ | ✅ consecutive error counter, last error message |
-| dbt integration | ❌ | ✅ `dbt-pgstream` macro package |
+| dbt integration | ❌ | ✅ `dbt-pgtrickle` macro package |
 
 ---
 
 ## 10. Installation and Deployment
 
-| Attribute | pg_ivm | pg_stream |
+| Attribute | pg_ivm | pg_trickle |
 |---|---|---|
 | Pre-built packages | RPM via yum.postgresql.org | OCI image, tarball |
 | CNPG / Kubernetes | ❌ (no OCI image) | ✅ OCI extension image |
@@ -325,13 +325,13 @@ from the leaf-level freshness requirement rather than manually coordinated.
 - No scheduler or background worker — refresh is immediate only.
 - On high-churn tables, `min`/`max` aggregates can trigger expensive rescans.
 
-### pg_stream Limitations
+### pg_trickle Limitations
 - Data is stale between refresh cycles — not suitable for applications
   requiring sub-second consistency.
 - `LIMIT` / `OFFSET` not supported in DIFFERENTIAL mode.
 - Volatile SQL functions rejected in DIFFERENTIAL mode.
 - Materialized views as sources not supported in DIFFERENTIAL mode.
-- `ALTER EXTENSION pg_stream UPDATE` migration scripts not yet implemented
+- `ALTER EXTENSION pg_trickle UPDATE` migration scripts not yet implemented
   (planned for v0.2.0+).
 - Targets PostgreSQL 18 only; no backport to PG 13–17.
 - Early release — not yet production-hardened.
@@ -348,7 +348,7 @@ from the leaf-level freshness requirement rather than manually coordinated.
 - **Refresh (full):** comparable to `REFRESH MATERIALIZED VIEW` (~20 seconds
   for a 10M-row join in the example).
 
-### pg_stream
+### pg_trickle
 - **Write path:** minimal overhead — only a small trigger INSERT into the
   change buffer (~2–50 μs per row). In WAL mode, zero trigger overhead.
 - **Read path:** instant from the materialized table (potentially stale).
@@ -366,36 +366,36 @@ from the leaf-level freshness requirement rather than manually coordinated.
 |---|---|
 | Need views consistent within the same transaction | **pg_ivm** |
 | Application cannot tolerate any view staleness | **pg_ivm** |
-| High write throughput, views can be slightly stale | **pg_stream** |
-| Multi-layer summary pipelines with dependencies | **pg_stream** |
-| Time-based or cron-driven refresh schedules | **pg_stream** |
-| Views with complex SQL (window functions, CTEs, UNION) | **pg_stream** |
+| High write throughput, views can be slightly stale | **pg_trickle** |
+| Multi-layer summary pipelines with dependencies | **pg_trickle** |
+| Time-based or cron-driven refresh schedules | **pg_trickle** |
+| Views with complex SQL (window functions, CTEs, UNION) | **pg_trickle** |
 | Simple aggregation with zero-staleness requirement | **pg_ivm** |
-| Kubernetes / CloudNativePG deployment | **pg_stream** |
-| dbt integration | **pg_stream** |
+| Kubernetes / CloudNativePG deployment | **pg_trickle** |
+| dbt integration | **pg_trickle** |
 | PostgreSQL 13–17 | **pg_ivm** |
-| PostgreSQL 18 | Either (pg_stream preferred for new projects) |
+| PostgreSQL 18 | Either (pg_trickle preferred for new projects) |
 | Production-hardened, stable API | **pg_ivm** |
-| Early adopter, rich SQL coverage needed | **pg_stream** |
+| Early adopter, rich SQL coverage needed | **pg_trickle** |
 
 ---
 
 ## 14. Coexistence
 
 The two extensions can be installed in the same database simultaneously — they
-use different schemas (`pgivm` vs `pgstream`/`pgstream_changes`) and do not
+use different schemas (`pgivm` vs `pgtrickle`/`pgtrickle_changes`) and do not
 interfere with each other. A plausible combined deployment:
 
 - Use **pg_ivm** for small, critical lookup tables that must be perfectly
   consistent within transactions (e.g. permission caches, balance totals).
-- Use **pg_stream** for large analytical summary tables, multi-layer
+- Use **pg_trickle** for large analytical summary tables, multi-layer
   aggregation pipelines, or views with complex SQL that pg_ivm cannot handle.
 
 ---
 
 ## 15. Summary Table
 
-| Dimension | pg_ivm | pg_stream |
+| Dimension | pg_ivm | pg_trickle |
 |---|---|---|
 | Maintenance timing | **Immediate** (same transaction) | **Deferred** (scheduled) |
 | Write latency impact | Higher | Minimal |
@@ -421,8 +421,8 @@ interfere with each other. A plausible combined deployment:
 ## References
 
 - pg_ivm repository: https://github.com/sraoss/pg_ivm
-- pg_stream repository: https://github.com/grove/pg-stream
+- pg_trickle repository: https://github.com/grove/pg-trickle
 - DBSP differential dataflow paper: https://arxiv.org/abs/2203.16684
-- pg_stream ESSENCE.md: [../../ESSENCE.md](../../ESSENCE.md)
-- pg_stream DVM operators: [../../docs/DVM_OPERATORS.md](../../docs/DVM_OPERATORS.md)
-- pg_stream architecture: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md)
+- pg_trickle ESSENCE.md: [../../ESSENCE.md](../../ESSENCE.md)
+- pg_trickle DVM operators: [../../docs/DVM_OPERATORS.md](../../docs/DVM_OPERATORS.md)
+- pg_trickle architecture: [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md)

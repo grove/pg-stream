@@ -1,14 +1,14 @@
 [book]
-title       = "pg_stream Documentation"
-authors     = ["The pg_stream Contributors"]
+title       = "pg_trickle Documentation"
+authors     = ["The pg_trickle Contributors"]
 src         = "docs"
 language    = "en"
 
 [output.html]
 default-theme       = "navy"
-git-repository-url  = "https://github.com/grove/pg-stream"
-edit-url-template   = "https://github.com/grove/pg-stream/edit/main/{path}"
-site-url            = "/pg-stream/"
+git-repository-url  = "https://github.com/grove/pg-trickle"
+edit-url-template   = "https://github.com/grove/pg-trickle/edit/main/{path}"
+site-url            = "/pg-trickle/"
 
 [output.html.search]
 enable              = true

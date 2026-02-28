@@ -1,4 +1,4 @@
-# Triggers vs Logical Replication for CDC in pg_stream
+# Triggers vs Logical Replication for CDC in pg_trickle
 
 **Status:** Evaluation Report (updated with implementation status)  
 **Date:** 2026-02-24  
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-pg_stream uses **row-level AFTER triggers** to capture changes on source tables.
+pg_trickle uses **row-level AFTER triggers** to capture changes on source tables.
 This report evaluates the trigger-based approach against **logical replication**
 (WAL-based CDC) across five dimensions: correctness, performance, operations,
 and two end-user features — user-defined triggers on stream tables and logical
@@ -17,8 +17,8 @@ replication subscriptions from stream tables.
 **Conclusion:** Triggers remain the correct choice for the current scope given
 operational simplicity and zero-config deployment. The **hybrid approach** —
 trigger bootstrap for creation with automatic WAL transition for steady-state —
-is now **implemented** (`pg_stream.cdc_mode` GUC, `src/wal_decoder.rs`). User-
-defined triggers on stream tables are also **implemented** (`pg_stream.user_triggers`
+is now **implemented** (`pg_trickle.cdc_mode` GUC, `src/wal_decoder.rs`). User-
+defined triggers on stream tables are also **implemented** (`pg_trickle.user_triggers`
 GUC, `DISABLE TRIGGER USER` during refresh). These were previously recommendations
 (§6.2, §6.6); both are now shipped.
 
@@ -39,7 +39,7 @@ advantages:
   triggers do not fire (TRUNCATE replaces the entire file rather than deleting
   rows one-by-one). This leaves stream tables silently stale until a manual
   refresh. Logical replication captures TRUNCATE natively from the WAL,
-  so pg_stream would know immediately that all rows were removed.
+  so pg_trickle would know immediately that all rows were removed.
 
 - **Change ordering from the transaction log** — With triggers, each trigger
   independently calls `pg_current_wal_lsn()` to timestamp its change. With
@@ -60,7 +60,7 @@ serious consideration. See §3 for the full analysis.
 ### Current Architecture
 
 CDC triggers on each tracked source table write typed per-column rows into
-per-table buffer tables (`pgstream_changes.changes_<oid>`). Each buffer row
+per-table buffer tables (`pgtrickle_changes.changes_<oid>`). Each buffer row
 captures:
 
 | Column | Purpose |
@@ -149,7 +149,7 @@ triggers on source tables.
 |---|---|---|
 | Feasibility | ✅ Achievable via `session_replication_role` | ✅ Same mechanism applies |
 | Refresh suppression | `SET LOCAL session_replication_role = 'replica'` | Same |
-| Post-refresh notification | `NOTIFY pg_stream_refresh` with metadata | Same |
+| Post-refresh notification | `NOTIFY pg_trickle_refresh` with metadata | Same |
 | MERGE firing pattern | DELETE+INSERT (not UPDATE); must be suppressed | Same — refresh mechanism is independent of CDC |
 
 **Key insight:** User trigger support on stream tables is **orthogonal to the
@@ -158,7 +158,7 @@ DISABLE TRIGGER USER` / `ENABLE TRIGGER USER` around FULL refresh (avoiding
 the `session_replication_role` conflict with logical replication publishing).
 In DIFFERENTIAL mode, explicit per-row DML (INSERT/UPDATE/DELETE) is used
 instead of MERGE so that user-defined AFTER triggers fire correctly. The
-implementation is controlled by the `pg_stream.user_triggers` GUC (`auto`/
+implementation is controlled by the `pg_trickle.user_triggers` GUC (`auto`/
 `on`/`off`). See [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](PLAN_USER_TRIGGERS_EXPLICIT_DML.md)
 for the full design.
 
@@ -174,10 +174,10 @@ PostgreSQL's built-in logical replication.
 | Aspect | Status | Notes |
 |---|---|---|
 | Basic publishing | ✅ Works today | STs are regular heap tables; `CREATE PUBLICATION` works |
-| `__pgs_row_id` column | ⚠️ Replicated by default | Use column list in PUBLICATION to exclude, or document as usable PK |
+| `__pgt_row_id` column | ⚠️ Replicated by default | Use column list in PUBLICATION to exclude, or document as usable PK |
 | Differential refresh | ✅ DELETE+INSERT via MERGE are replicated | Subscriber sees individual DELETEs and INSERTs, not UPDATEs |
 | Full refresh | ✅ TRUNCATE + INSERT replicated | Subscriber needs `replica_identity` set; receives TRUNCATE + mass INSERT |
-| `REPLICA IDENTITY` | Needs configuration | `__pgs_row_id` could serve as unique index for identity |
+| `REPLICA IDENTITY` | Needs configuration | `__pgt_row_id` could serve as unique index for identity |
 
 #### The `session_replication_role` Conflict
 
@@ -195,7 +195,7 @@ subscriber's `origin` setting).
 |---|---|---|---|
 | `session_replication_role = 'replica'` | ✅ Yes | ❌ May not be published | Breaks logical replication from STs |
 | `ALTER TABLE ... DISABLE TRIGGER USER` | ✅ Yes | ✅ Yes | Requires `ACCESS EXCLUSIVE` lock |
-| `pg_stream.suppress_user_triggers` GUC → `DISABLE TRIGGER USER` only when needed | ✅ Configurable | ✅ Yes | Lock overhead; crash safety concern (ENABLE on recovery) |
+| `pg_trickle.suppress_user_triggers` GUC → `DISABLE TRIGGER USER` only when needed | ✅ Configurable | ✅ Yes | Lock overhead; crash safety concern (ENABLE on recovery) |
 | `tgisinternal` flag manipulation | ✅ Yes | ✅ Yes | Non-portable; catalog-level hack |
 
 **Recommended resolution:** Use `ALTER TABLE ... DISABLE TRIGGER USER` within
@@ -270,8 +270,8 @@ and never slows down the application.
 | **Operational simplicity** | No external state to manage. Buffer tables are regular heap tables — queryable, monitorable, backed up normally. Drop the trigger and it's gone. | Replication slots are persistent server-side state. A stuck or crashed consumer prevents WAL recycling, potentially filling the disk. Requires monitoring, max_slot_wal_keep_size guards, and orphan-slot cleanup. |
 | **Zero configuration** | Works with any `wal_level` (`minimal`, `replica`, `logical`). No restart required. No `REPLICA IDENTITY` configuration. | Requires `wal_level = logical` (server restart), `max_replication_slots` sizing, and `REPLICA IDENTITY` on every tracked source table. Many managed PostgreSQL providers default to `wal_level = replica`. |
 | **Schema evolution** | DDL event hooks rebuild the trigger function via `CREATE OR REPLACE FUNCTION`. New columns are added to the buffer table with `ADD COLUMN IF NOT EXISTS`. Simple, same-transaction, no coordination. | Schema changes on tracked tables require careful handling. The output plugin must be aware of column additions/removals. Slot may need to be recreated. `ALTER TABLE` during active decoding can cause protocol errors. |
-| **Debugging & visibility** | Change buffers are queryable tables: `SELECT * FROM pgstream_changes.changes_12345 ORDER BY change_id DESC LIMIT 10`. Immediate visibility into what was captured. | WAL is binary and opaque. Inspecting captured changes requires `pg_logical_slot_peek_changes()` which advances or peeks the slot — disruptive in production. |
-| **Crash recovery** | Buffer tables are WAL-logged and survive crashes. No special recovery needed — the refresh engine picks up from the last frontier LSN. | Slots survive crashes, but the decoding position may be ahead of what pg_stream has consumed. Requires careful bookkeeping to avoid replaying or losing changes. |
+| **Debugging & visibility** | Change buffers are queryable tables: `SELECT * FROM pgtrickle_changes.changes_12345 ORDER BY change_id DESC LIMIT 10`. Immediate visibility into what was captured. | WAL is binary and opaque. Inspecting captured changes requires `pg_logical_slot_peek_changes()` which advances or peeks the slot — disruptive in production. |
+| **Crash recovery** | Buffer tables are WAL-logged and survive crashes. No special recovery needed — the refresh engine picks up from the last frontier LSN. | Slots survive crashes, but the decoding position may be ahead of what pg_trickle has consumed. Requires careful bookkeeping to avoid replaying or losing changes. |
 | **Multi-source coordination** | Each source has an independent buffer table. The refresh engine reads from multiple buffers with independent LSN ranges. No coordination between sources. | Multiple sources could share a single slot (decoding all tables) or use per-source slots. Shared slots require demultiplexing; per-source slots multiply the slot management burden. |
 | **Isolation** | Trigger failure (e.g., buffer table full) raises an error in the application transaction — visible and immediate. | Decoding failure is asynchronous. The application commits successfully, but changes may never reach the buffer. Silent data loss is possible unless monitored. |
 
@@ -317,14 +317,14 @@ decision to use triggers rests on three remaining pillars:
 
 However, these advantages are primarily about **developer and operator
 experience**, not about the fundamental capability of the system. A mature
-pg_stream deployment that needs high write throughput, TRUNCATE support, or
+pg_trickle deployment that needs high write throughput, TRUNCATE support, or
 minimal source-table impact would be better served by logical replication in
 steady-state.
 
 **The honest assessment:** Triggers are the right choice *today* for pragmatic
 reasons (simplicity, early-stage adoption, managed PG compatibility). But the
 report should not overstate the atomicity constraint as a fundamental blocker —
-it is a solvable problem. If pg_stream grows to serve high-throughput
+it is a solvable problem. If pg_trickle grows to serve high-throughput
 production workloads, the migration to logical replication for steady-state CDC
 should be treated as a planned evolution, not a theoretical future.
 
@@ -353,10 +353,10 @@ provide no `OLD` row data, they can mark downstream stream tables for
 reinitialization:
 
 ```sql
-CREATE TRIGGER pg_stream_truncate_<oid>
+CREATE TRIGGER pg_trickle_truncate_<oid>
   AFTER TRUNCATE ON <source_table>
   FOR EACH STATEMENT
-  EXECUTE FUNCTION pgstream.on_source_truncated('<source_oid>');
+  EXECUTE FUNCTION pgtrickle.on_source_truncated('<source_oid>');
 ```
 
 The trigger function would:
@@ -375,7 +375,7 @@ Rust function for `on_source_truncated`, cascade logic reuse from `hooks.rs`).
 ## 5. Migration Path: Trigger → Logical Replication (Now Implemented)
 
 > **Status:** Phase A (Hybrid Creation) is now implemented in `src/wal_decoder.rs`.
-> The `pg_stream.cdc_mode` GUC controls the behavior (`trigger`/`auto`/`wal`).
+> The `pg_trickle.cdc_mode` GUC controls the behavior (`trigger`/`auto`/`wal`).
 
 As discussed in §3, the atomicity constraint is a creation-time problem with
 known solutions. The buffer table schema and downstream IVM pipeline are
@@ -419,7 +419,7 @@ for current target use cases. The atomicity constraint, while solvable (see
 
 **However:** This decision should be revisited when any of these triggers are
 hit: (a) users report write-path latency from CDC triggers, (b) TRUNCATE-based
-ETL patterns become a common pain point, (c) pg_stream targets environments
+ETL patterns become a common pain point, (c) pg_trickle targets environments
 where `wal_level = logical` is already the norm. The steady-state advantages of
 logical replication (§3.2) are substantial and should not be dismissed.
 
@@ -429,7 +429,7 @@ User-defined triggers on stream tables are now fully supported. The
 implementation uses `ALTER TABLE ... DISABLE TRIGGER USER` / `ENABLE TRIGGER
 USER` around FULL refresh, and explicit per-row DML (INSERT/UPDATE/DELETE)
 instead of MERGE during DIFFERENTIAL refresh so user AFTER triggers fire
-correctly. Controlled by `pg_stream.user_triggers` GUC (`auto`/`on`/`off`).
+correctly. Controlled by `pg_trickle.user_triggers` GUC (`auto`/`on`/`off`).
 The `session_replication_role` approach from the original plan was rejected to
 avoid conflict with logical replication publishing (see §2.5).
 
@@ -443,8 +443,8 @@ significant usability gap without changing the CDC architecture.
 
 Add documentation and examples for `CREATE PUBLICATION` on stream tables,
 including:
-- Column filtering to exclude `__pgs_row_id`
-- `REPLICA IDENTITY` configuration using `__pgs_row_id` as unique index
+- Column filtering to exclude `__pgt_row_id`
+- `REPLICA IDENTITY` configuration using `__pgt_row_id` as unique index
 - Behavior during FULL vs DIFFERENTIAL refresh
 - Interaction with user trigger suppression
 
@@ -463,14 +463,14 @@ The "trigger bootstrap → slot transition" pattern is now implemented in
 - **Automatic transition**: After stream table creation with triggers, a
   background worker creates a logical replication slot and transitions to
   WAL-based capture.
-- **GUC control**: `pg_stream.cdc_mode` (`trigger`/`auto`/`wal`) and
-  `pg_stream.wal_transition_timeout` control the behavior.
+- **GUC control**: `pg_trickle.cdc_mode` (`trigger`/`auto`/`wal`) and
+  `pg_trickle.wal_transition_timeout` control the behavior.
 - **Transition orchestration**: Create slot → wait for catch-up → drop trigger.
   Automatic fallback to triggers if slot creation fails.
-- **Catalog extension**: `pgs_dependencies` gains `cdc_mode`, `slot_name`,
+- **Catalog extension**: `pgt_dependencies` gains `cdc_mode`, `slot_name`,
   `decoder_confirmed_lsn`, `transition_started_at` columns.
-- **Health monitoring**: `pgstream.check_cdc_health()` function and
-  `NOTIFY pg_stream_cdc_transition` notifications.
+- **Health monitoring**: `pgtrickle.check_cdc_health()` function and
+  `NOTIFY pg_trickle_cdc_transition` notifications.
 
 ---
 
@@ -486,5 +486,5 @@ The "trigger bootstrap → slot transition" pattern is now implemented in
 | D6 | TRUNCATE gap is closable with statement-level trigger | Low effort, high impact — but logical replication handles it natively |
 | D7 | Hybrid approach is the optimal long-term target | Trigger bootstrap for creation + logical replication for steady-state |
 | D8 | User trigger suppression uses `DISABLE TRIGGER USER` | Avoids `session_replication_role` conflict with logical replication publishing (§2.5) |
-| D9 | Hybrid CDC implemented with auto-transition | `pg_stream.cdc_mode = 'auto'` triggers → WAL transition after creation |
+| D9 | Hybrid CDC implemented with auto-transition | `pg_trickle.cdc_mode = 'auto'` triggers → WAL transition after creation |
 | D10 | Explicit DML for DIFFERENTIAL refresh with user triggers | INSERT/UPDATE/DELETE instead of MERGE so AFTER triggers fire correctly |

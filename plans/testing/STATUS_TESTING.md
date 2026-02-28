@@ -1,6 +1,6 @@
-# pg_stream — Testing & Coverage Status
+# pg_trickle — Testing & Coverage Status
 
-What we've learned about testing the pg_stream extension, the current state of tests and coverage, and what can be improved.
+What we've learned about testing the pg_trickle extension, the current state of tests and coverage, and what can be improved.
 
 ---
 
@@ -111,10 +111,10 @@ These run against bare PostgreSQL 18.x containers without the extension loaded, 
 
 ### E2E Infrastructure
 
-The E2E tests use a **custom Docker image** (`pg_stream_e2e:latest`) built via a multi-stage Dockerfile:
+The E2E tests use a **custom Docker image** (`pg_trickle_e2e:latest`) built via a multi-stage Dockerfile:
 
 1. **Stage 1 (builder):** Installs Rust, `cargo-pgrx`, compiles the extension against PG 18 headers
-2. **Stage 2 (runtime):** Copies `.so`, `.control`, `.sql` into a clean `postgres:18.x` image with `shared_preload_libraries = 'pg_stream'`
+2. **Stage 2 (runtime):** Copies `.so`, `.control`, `.sql` into a clean `postgres:18.x` image with `shared_preload_libraries = 'pg_trickle'`
 
 Build the image:
 ```bash
@@ -215,7 +215,7 @@ assert!(result.cte_sql.contains("expected SQL fragment"));
 
 ### 4.2 Property Tests Found Real Bugs
 
-The 11 deterministic property tests in `e2e_property_tests.rs` caught a **correctness bug** in the DELETE+INSERT merge strategy. When the strategy evaluated the delta query twice (once for DELETE, once for INSERT), aggregate/DISTINCT queries that LEFT JOIN back to the stream table to read `__pgs_count` saw modified data between the DELETE and INSERT, causing incorrect results.
+The 11 deterministic property tests in `e2e_property_tests.rs` caught a **correctness bug** in the DELETE+INSERT merge strategy. When the strategy evaluated the delta query twice (once for DELETE, once for INSERT), aggregate/DISTINCT queries that LEFT JOIN back to the stream table to read `__pgt_count` saw modified data between the DELETE and INSERT, causing incorrect results.
 
 This was not caught by hand-written E2E tests because they used known data patterns. The randomized DML from property tests triggered the edge case.
 
@@ -355,7 +355,7 @@ Each new property test would exercise the full pipeline: CDC trigger → change 
 
 - Refresh failure mid-MERGE (simulate disk full / connection drop)
 - Background worker crash and restart
-- Extension upgrade (`ALTER EXTENSION pg_stream UPDATE`)
+- Extension upgrade (`ALTER EXTENSION pg_trickle UPDATE`)
 - Out-of-memory during large delta materialization
 - Transaction abort during `create_stream_table()` → verify cleanup
 

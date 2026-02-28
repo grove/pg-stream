@@ -1,4 +1,4 @@
-# pg_stream — project commands
+# pg_trickle — project commands
 # https://github.com/casey/just
 
 set dotenv-load := false
@@ -96,13 +96,13 @@ test-tpch-large: build-e2e-image
 
 # ── dbt Tests ─────────────────────────────────────────────────────────────
 
-# Run dbt-pgstream integration tests locally (builds Docker image)
+# Run dbt-pgtrickle integration tests locally (builds Docker image)
 test-dbt:
-    ./dbt-pgstream/integration_tests/scripts/run_dbt_tests.sh
+    ./dbt-pgtrickle/integration_tests/scripts/run_dbt_tests.sh
 
 # Run dbt tests without rebuilding the Docker image
 test-dbt-fast:
-    ./dbt-pgstream/integration_tests/scripts/run_dbt_tests.sh --skip-build
+    ./dbt-pgtrickle/integration_tests/scripts/run_dbt_tests.sh --skip-build
 
 # ── Benchmarks ────────────────────────────────────────────────────────────
 
@@ -158,7 +158,7 @@ package:
 
 # Build the CNPG extension image from source (scratch-based, for Image Volumes)
 docker-build:
-    docker build -t pg_stream-ext:latest -f cnpg/Dockerfile.ext-build .
+    docker build -t pg_trickle-ext:latest -f cnpg/Dockerfile.ext-build .
 
 # Build the E2E test Docker image
 docker-build-e2e:

@@ -16,7 +16,7 @@ Cargo.toml                  @grove @BaardBouvet
 justfile                    @grove @BaardBouvet
 
 # dbt macro package
-dbt-pgstream/               @grove @BaardBouvet
+dbt-pgtrickle/               @grove @BaardBouvet
 
 # Documentation — lighter touch, any maintainer can approve
 docs/                       @grove

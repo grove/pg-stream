@@ -12,15 +12,15 @@
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate an Except node.
-pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Except {
         left, right, all, ..
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_except called on non-Except node".into(),
         ));
     };
@@ -48,16 +48,16 @@ pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
     // CTE 1: Combine deltas from both branches, tagged with branch indicator
     let delta_cte = ctx.next_cte_name("exct_delta");
     let delta_sql = format!(
-        "SELECT {row_id_expr} AS __pgs_row_id, {col_list},\n\
-         SUM(CASE WHEN __pgs_action = 'I' THEN 1 ELSE -1 END) AS __net_count,\n\
+        "SELECT {row_id_expr} AS __pgt_row_id, {col_list},\n\
+         SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) AS __net_count,\n\
          'L' AS __branch\n\
          FROM {left_cte}\n\
          GROUP BY {col_list}\n\
          \n\
          UNION ALL\n\
          \n\
-         SELECT {row_id_expr} AS __pgs_row_id, {col_list},\n\
-         SUM(CASE WHEN __pgs_action = 'I' THEN 1 ELSE -1 END) AS __net_count,\n\
+         SELECT {row_id_expr} AS __pgt_row_id, {col_list},\n\
+         SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) AS __net_count,\n\
          'R' AS __branch\n\
          FROM {right_cte}\n\
          GROUP BY {col_list}",
@@ -75,16 +75,16 @@ pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         .join(", ");
 
     let merge_sql = format!(
-        "SELECT d.__pgs_row_id, {d_cols},\n\
-         COALESCE(st.__pgs_count_l, 0)\n\
+        "SELECT d.__pgt_row_id, {d_cols},\n\
+         COALESCE(st.__pgt_count_l, 0)\n\
              + SUM(CASE WHEN d.__branch = 'L' THEN d.__net_count ELSE 0 END) AS new_count_l,\n\
-         COALESCE(st.__pgs_count_r, 0)\n\
+         COALESCE(st.__pgt_count_r, 0)\n\
              + SUM(CASE WHEN d.__branch = 'R' THEN d.__net_count ELSE 0 END) AS new_count_r,\n\
-         COALESCE(st.__pgs_count_l, 0) AS old_count_l,\n\
-         COALESCE(st.__pgs_count_r, 0) AS old_count_r\n\
+         COALESCE(st.__pgt_count_l, 0) AS old_count_l,\n\
+         COALESCE(st.__pgt_count_r, 0) AS old_count_r\n\
          FROM {delta_cte} d\n\
-         LEFT JOIN {st_table} st ON st.__pgs_row_id = d.__pgs_row_id\n\
-         GROUP BY d.__pgs_row_id, {d_cols}, st.__pgs_count_l, st.__pgs_count_r",
+         LEFT JOIN {st_table} st ON st.__pgt_row_id = d.__pgt_row_id\n\
+         GROUP BY d.__pgt_row_id, {d_cols}, st.__pgt_count_l, st.__pgt_count_r",
     );
     ctx.add_cte(merge_cte.clone(), merge_sql);
 
@@ -96,8 +96,8 @@ pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         format!(
             "\
 -- Row appears: effective count was 0, now positive
-SELECT __pgs_row_id, 'I' AS __pgs_action,
-       {col_list}, new_count_l AS __pgs_count_l, new_count_r AS __pgs_count_r
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) <= 0
   AND GREATEST(0, new_count_l - new_count_r) > 0
@@ -105,8 +105,8 @@ WHERE GREATEST(0, old_count_l - old_count_r) <= 0
 UNION ALL
 
 -- Row vanishes: effective count was positive, now 0
-SELECT __pgs_row_id, 'D' AS __pgs_action,
-       {col_list}, 0 AS __pgs_count_l, 0 AS __pgs_count_r
+SELECT __pgt_row_id, 'D' AS __pgt_action,
+       {col_list}, 0 AS __pgt_count_l, 0 AS __pgt_count_r
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) > 0
   AND GREATEST(0, new_count_l - new_count_r) <= 0
@@ -114,8 +114,8 @@ WHERE GREATEST(0, old_count_l - old_count_r) > 0
 UNION ALL
 
 -- Counts changed but row still present
-SELECT __pgs_row_id, 'I' AS __pgs_action,
-       {col_list}, new_count_l AS __pgs_count_l, new_count_r AS __pgs_count_r
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) > 0
   AND GREATEST(0, new_count_l - new_count_r) > 0
@@ -127,8 +127,8 @@ WHERE GREATEST(0, old_count_l - old_count_r) > 0
         format!(
             "\
 -- Row appears: was absent, now present
-SELECT __pgs_row_id, 'I' AS __pgs_action,
-       {col_list}, new_count_l AS __pgs_count_l, new_count_r AS __pgs_count_r
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) <= 0
   AND GREATEST(0, new_count_l - new_count_r) > 0
@@ -136,8 +136,8 @@ WHERE GREATEST(0, old_count_l - old_count_r) <= 0
 UNION ALL
 
 -- Row vanishes: was present, now absent
-SELECT __pgs_row_id, 'D' AS __pgs_action,
-       {col_list}, 0 AS __pgs_count_l, 0 AS __pgs_count_r
+SELECT __pgt_row_id, 'D' AS __pgt_action,
+       {col_list}, 0 AS __pgt_count_l, 0 AS __pgt_count_r
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) > 0
   AND GREATEST(0, new_count_l - new_count_r) <= 0
@@ -145,8 +145,8 @@ WHERE GREATEST(0, old_count_l - old_count_r) > 0
 UNION ALL
 
 -- Counts changed but row still present (update stored counts)
-SELECT __pgs_row_id, 'I' AS __pgs_action,
-       {col_list}, new_count_l AS __pgs_count_l, new_count_r AS __pgs_count_r
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) > 0
   AND GREATEST(0, new_count_l - new_count_r) > 0
@@ -156,8 +156,8 @@ WHERE GREATEST(0, old_count_l - old_count_r) > 0
     ctx.add_cte(final_cte.clone(), final_sql);
 
     let mut output_cols = cols.clone();
-    output_cols.push("__pgs_count_l".to_string());
-    output_cols.push("__pgs_count_r".to_string());
+    output_cols.push("__pgt_count_l".to_string());
+    output_cols.push("__pgt_count_r".to_string());
 
     Ok(DiffResult {
         cte_name: final_cte,
@@ -182,8 +182,8 @@ mod tests {
 
         // Output columns: user cols + dual counts
         assert!(result.columns.contains(&"name".to_string()));
-        assert!(result.columns.contains(&"__pgs_count_l".to_string()));
-        assert!(result.columns.contains(&"__pgs_count_r".to_string()));
+        assert!(result.columns.contains(&"__pgt_count_l".to_string()));
+        assert!(result.columns.contains(&"__pgt_count_r".to_string()));
 
         // Should contain the 3-CTE pattern
         assert_sql_contains(&sql, "exct_delta");
@@ -229,7 +229,7 @@ mod tests {
 
         assert_eq!(
             result.columns,
-            vec!["id", "name", "__pgs_count_l", "__pgs_count_r"]
+            vec!["id", "name", "__pgt_count_l", "__pgt_count_r"]
         );
     }
 
@@ -271,7 +271,7 @@ mod tests {
         let result = diff_except(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        assert_sql_contains(&sql, "pgstream.pg_stream_hash");
+        assert_sql_contains(&sql, "pgtrickle.pg_trickle_hash");
     }
 
     #[test]
@@ -317,7 +317,7 @@ mod tests {
         // All user columns appear in output
         assert_eq!(
             result.columns,
-            vec!["id", "name", "status", "__pgs_count_l", "__pgs_count_r"]
+            vec!["id", "name", "status", "__pgt_count_l", "__pgt_count_r"]
         );
         // All user columns are quoted in GROUP BY
         assert_sql_contains(&sql, "\"id\", \"name\", \"status\"");
@@ -334,8 +334,8 @@ mod tests {
 
         // Merge CTE should join against the storage table
         assert_sql_contains(&sql, "\"myschema\".\"my_stream\"");
-        assert_sql_contains(&sql, "st.__pgs_count_l");
-        assert_sql_contains(&sql, "st.__pgs_count_r");
+        assert_sql_contains(&sql, "st.__pgt_count_l");
+        assert_sql_contains(&sql, "st.__pgt_count_r");
         assert_sql_contains(&sql, "LEFT JOIN");
     }
 
@@ -349,8 +349,8 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         // DELETE rows should emit 0 for both counts
-        assert_sql_contains(&sql, "'D' AS __pgs_action");
-        assert_sql_contains(&sql, "0 AS __pgs_count_l, 0 AS __pgs_count_r");
+        assert_sql_contains(&sql, "'D' AS __pgt_action");
+        assert_sql_contains(&sql, "0 AS __pgt_count_l, 0 AS __pgt_count_r");
     }
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
         // Delta CTE aggregates net counts: INSERT=+1, DELETE=-1
         assert_sql_contains(
             &sql,
-            "SUM(CASE WHEN __pgs_action = 'I' THEN 1 ELSE -1 END) AS __net_count",
+            "SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) AS __net_count",
         );
     }
 

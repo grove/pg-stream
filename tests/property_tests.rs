@@ -10,12 +10,12 @@
 //! - Hash determinism and collision resistance
 
 // These tests exercise pure functions from the library.
-// We use `pg_stream` as a lib crate (cdylib + lib).
+// We use `pg_trickle` as a lib crate (cdylib + lib).
 
-use pg_stream::dag::{DagNode, NodeId, RefreshMode, StDag, StStatus};
-use pg_stream::dvm::diff::{col_list, prefixed_col_list, quote_ident};
-use pg_stream::dvm::parser::{AggFunc, Expr};
-use pg_stream::version::{Frontier, lsn_gt, lsn_gte, select_canonical_period_secs};
+use pg_trickle::dag::{DagNode, NodeId, RefreshMode, StDag, StStatus};
+use pg_trickle::dvm::diff::{col_list, prefixed_col_list, quote_ident};
+use pg_trickle::dvm::parser::{AggFunc, Expr};
+use pg_trickle::version::{Frontier, lsn_gt, lsn_gte, select_canonical_period_secs};
 use proptest::prelude::*;
 use std::time::Duration;
 
@@ -228,7 +228,7 @@ proptest! {
     // ── StStatus/RefreshMode roundtrip ─────────────────────────────
 
     #[test]
-    fn prop_pgs_status_roundtrip(idx in 0u8..4) {
+    fn prop_pgt_status_roundtrip(idx in 0u8..4) {
         let status = match idx {
             0 => StStatus::Initializing,
             1 => StStatus::Active,

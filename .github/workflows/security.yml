@@ -43,7 +43,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # RUSTSEC-2023-0071: rsa Marvin Attack — pulled in transitively via
-          # sqlx -> sqlx-mysql -> rsa, but pg_stream only uses the "postgres"
+          # sqlx -> sqlx-mysql -> rsa, but pg_trickle only uses the "postgres"
           # feature of sqlx. sqlx-mysql is never compiled into the extension.
           # Suppress until an upstream fix is available.
           ignore: RUSTSEC-2023-0071

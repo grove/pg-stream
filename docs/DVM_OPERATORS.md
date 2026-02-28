@@ -1,6 +1,6 @@
 # DVM Operators
 
-This document describes the Differential View Maintenance (DVM) operators implemented by pgstream. Each operator transforms a stream of row-level changes (deltas) propagated from source tables through the operator tree.
+This document describes the Differential View Maintenance (DVM) operators implemented by pgtrickle. Each operator transforms a stream of row-level changes (deltas) propagated from source tables through the operator tree.
 
 ## Prior Art
 
@@ -55,14 +55,14 @@ The scan operator is a direct passthrough — inserts in the source become inser
 
 **SQL Generation:**
 ```sql
-SELECT op, row_data FROM pgstream_changes.changes_<oid>
+SELECT op, row_data FROM pgtrickle_changes.changes_<oid>
 WHERE xid >= <last_consumed_xid>
 ```
 
 **Notes:**
 - Each source table has a dedicated change buffer table created by the CDC module.
 - Row data is stored as JSONB with column names as keys.
-- The `__pgs_row_id` column (xxHash of primary key) is included for deduplication.
+- The `__pgt_row_id` column (xxHash of primary key) is included for deduplication.
 
 ---
 
@@ -303,7 +303,7 @@ The filter predicate is applied within the delta computation — only rows match
 
 The aggregate operator uses a 3-CTE pipeline:
 
-1. **Merge CTE** — Joins affected group keys against old (storage) and new (source) aggregate values, producing `__pgs_meta_action` ('I' for new-only groups, 'D' for disappeared groups, 'U' for changed groups).
+1. **Merge CTE** — Joins affected group keys against old (storage) and new (source) aggregate values, producing `__pgt_meta_action` ('I' for new-only groups, 'D' for disappeared groups, 'U' for changed groups).
 2. **LATERAL VALUES expansion** — A single-pass `LATERAL (VALUES ...)` clause expands each merge row into insert and delete actions, avoiding a 4-branch UNION ALL:
 
 ```sql
@@ -312,9 +312,9 @@ LATERAL (VALUES
     ('I', m.new_count, m.new_total),
     ('D', m.old_count, m.old_total)
 ) v(action, count_val, val_total)
-WHERE (m.__pgs_meta_action = 'I' AND v.action = 'I')
-   OR (m.__pgs_meta_action = 'D' AND v.action = 'D')
-   OR (m.__pgs_meta_action = 'U')
+WHERE (m.__pgt_meta_action = 'I' AND v.action = 'I')
+   OR (m.__pgt_meta_action = 'D' AND v.action = 'D')
+   OR (m.__pgt_meta_action = 'U')
 ```
 
 3. **Final projection** — Emits `('+', row)` and `('-', row)` tuples for the refresh engine.
@@ -345,14 +345,14 @@ In other words:
 
 **Strategy:**
 
-Maintains a hidden `__pgs_dup_count` column in the storage table to track how many times each distinct row appears in the pre-distinct input.
+Maintains a hidden `__pgt_dup_count` column in the storage table to track how many times each distinct row appears in the pre-distinct input.
 
 1. On insert: increment count. If count was 0, emit `('+', row)`.
 2. On delete: decrement count. If count becomes 0, emit `('-', row)`.
 
 **Notes:**
 - The duplicate count is not visible in user queries against the storage table (projected away by the view layer).
-- Duplicate counting uses `__pgs_row_id` (xxHash) for efficient lookups.
+- Duplicate counting uses `__pgt_row_id` (xxHash) for efficient lookups.
 
 ---
 
@@ -398,11 +398,11 @@ $$\Delta(R \cap S): \text{emit rows where } \min(\text{count}_L, \text{count}_R)
 **SQL Generation (3-CTE chain):**
 
 1. **Delta CTE** — tags rows from left/right child deltas with branch indicator (`'L'`/`'R'`) and computes per-row net_count.
-2. **Merge CTE** — joins with the storage table to compute old and new per-branch counts (`__pgs_count_l`, `__pgs_count_r`).
+2. **Merge CTE** — joins with the storage table to compute old and new per-branch counts (`__pgt_count_l`, `__pgt_count_r`).
 3. **Final CTE** — detects boundary crossings using `LEAST(old_count_l, old_count_r)` vs `LEAST(new_count_l, new_count_r)`.
 
 **Notes:**
-- Storage table requires hidden columns `__pgs_count_l` and `__pgs_count_r` for multiplicity tracking.
+- Storage table requires hidden columns `__pgt_count_l` and `__pgt_count_r` for multiplicity tracking.
 - Both set and bag variants use the same 3-CTE structure; only the boundary logic stays the same (both use LEAST).
 
 ---
@@ -428,7 +428,7 @@ $$\Delta(R - S): \text{emit rows where } \max(0, \text{count}_L - \text{count}_R
 
 **Notes:**
 - EXCEPT is **not** commutative — left branch is the positive input, right is subtracted.
-- Storage table requires hidden columns `__pgs_count_l` and `__pgs_count_r`.
+- Storage table requires hidden columns `__pgt_count_l` and `__pgt_count_r`.
 - Same 3-CTE structure as Intersect with different effective-count function.
 
 ---
@@ -448,7 +448,7 @@ A subquery wrapper is transparent for differentiation — it delegates to its ch
 **SQL Generation:**
 ```sql
 -- If column aliases differ from child output columns:
-SELECT __pgs_row_id, __pgs_action, child_col1 AS alias_col1, child_col2 AS alias_col2
+SELECT __pgt_row_id, __pgt_action, child_col1 AS alias_col1, child_col2 AS alias_col2
 FROM (<child_delta>)
 ```
 
@@ -477,8 +477,8 @@ When a CTE is referenced multiple times in a query, each reference produces a `C
 ```sql
 -- First reference: differentiates the CTE body and stores result in cache
 -- Subsequent references: point to the same system CTE name
-SELECT __pgs_row_id, __pgs_action, <columns>
-FROM __pgs_cte_<cte_name>_delta  -- shared across all references
+SELECT __pgt_row_id, __pgt_action, <columns>
+FROM __pgt_cte_<cte_name>_delta  -- shared across all references
 ```
 
 If column aliases are present, a thin renaming CTE is added on top of the cached delta.
@@ -504,26 +504,26 @@ Recursive CTEs with `refresh_mode = 'DIFFERENTIAL'` use an automatic three-strat
 
 ##### Strategy 1: Semi-Naive Evaluation (INSERT-only changes)
 
-When only INSERT changes are present in the change buffer, pg_stream uses **semi-naive evaluation** — the standard technique for incremental fixpoint computation. The base case is differentiated normally through the DVM operator tree, then the resulting delta is propagated through the recursive term using a nested `WITH RECURSIVE`:
+When only INSERT changes are present in the change buffer, pg_trickle uses **semi-naive evaluation** — the standard technique for incremental fixpoint computation. The base case is differentiated normally through the DVM operator tree, then the resulting delta is propagated through the recursive term using a nested `WITH RECURSIVE`:
 
 ```sql
 WITH RECURSIVE
-  __pgs_base_delta AS (
+  __pgt_base_delta AS (
     -- Normal DVM differentiation of the base case (INSERT rows only)
     <differentiated base case>
   ),
-  __pgs_rec_delta AS (
+  __pgt_rec_delta AS (
     -- Seed: base case delta rows
-    SELECT cols FROM __pgs_base_delta WHERE __pgs_action = 'I'
+    SELECT cols FROM __pgt_base_delta WHERE __pgt_action = 'I'
     UNION ALL
     -- Seed: new base rows joining existing ST storage
     SELECT cols FROM <recursive term with self_ref = ST_storage, base = change_buffer>
     UNION ALL
     -- Propagation: recursive term applied to growing delta
-    SELECT cols FROM <recursive term with self_ref = __pgs_rec_delta, base = full>
+    SELECT cols FROM <recursive term with self_ref = __pgt_rec_delta, base = full>
   )
-SELECT pgstream.pg_stream_hash(...) AS __pgs_row_id, 'I' AS __pgs_action, cols
-FROM __pgs_rec_delta
+SELECT pgtrickle.pg_trickle_hash(...) AS __pgt_row_id, 'I' AS __pgt_action, cols
+FROM __pgt_rec_delta
 ```
 
 The cost is proportional to the number of *new* rows produced by the change, not the full result set.
@@ -544,25 +544,25 @@ This avoids full recomputation while correctly handling deletions with alternati
 When the CTE defines more columns than the outer `SELECT` projects (column mismatch), the incremental strategies cannot be used because the ST storage table lacks columns needed for recursive self-joins. In this case, the full defining query is re-executed and anti-joined against current storage:
 
 ```sql
-WITH __pgs_recomp_new AS (
-    SELECT pgstream.pg_stream_hash(row_to_json(sub)::text) AS __pgs_row_id, col1, col2, ...
+WITH __pgt_recomp_new AS (
+    SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text) AS __pgt_row_id, col1, col2, ...
     FROM (<defining_query>) sub
 ),
-__pgs_recomp_ins AS (
-    SELECT n.__pgs_row_id, 'I'::text AS __pgs_action, n.col1, n.col2, ...
-    FROM __pgs_recomp_new n
-    LEFT JOIN <storage_table> s ON s.__pgs_row_id = n.__pgs_row_id
-    WHERE s.__pgs_row_id IS NULL
+__pgt_recomp_ins AS (
+    SELECT n.__pgt_row_id, 'I'::text AS __pgt_action, n.col1, n.col2, ...
+    FROM __pgt_recomp_new n
+    LEFT JOIN <storage_table> s ON s.__pgt_row_id = n.__pgt_row_id
+    WHERE s.__pgt_row_id IS NULL
 ),
-__pgs_recomp_del AS (
-    SELECT s.__pgs_row_id, 'D'::text AS __pgs_action, s.col1, s.col2, ...
+__pgt_recomp_del AS (
+    SELECT s.__pgt_row_id, 'D'::text AS __pgt_action, s.col1, s.col2, ...
     FROM <storage_table> s
-    LEFT JOIN __pgs_recomp_new n ON n.__pgs_row_id = s.__pgs_row_id
-    WHERE n.__pgs_row_id IS NULL
+    LEFT JOIN __pgt_recomp_new n ON n.__pgt_row_id = s.__pgt_row_id
+    WHERE n.__pgt_row_id IS NULL
 )
-SELECT * FROM __pgs_recomp_ins
+SELECT * FROM __pgt_recomp_ins
 UNION ALL
-SELECT * FROM __pgs_recomp_del
+SELECT * FROM __pgt_recomp_del
 ```
 
 The cost is proportional to the full result set size.
@@ -577,7 +577,7 @@ The cost is proportional to the full result set size.
 
 **Notes:**
 - Non-linear recursion (multiple self-references in the recursive term) is rejected — PostgreSQL restricts the recursive term to reference the CTE at most once.
-- The `__pgs_row_id` column (xxHash of the JSON-serialized row) is used for row identity.
+- The `__pgt_row_id` column (xxHash of the JSON-serialized row) is used for row identity.
 - For write-heavy workloads on very large recursive result sets with frequent mixed changes, `refresh_mode = 'FULL'` may still be more efficient than DRed.
 
 ---
@@ -614,7 +614,7 @@ WITH affected_partitions AS (
 surviving AS (
     SELECT * FROM <storage_table>
     WHERE (<partition_cols>) IN (SELECT * FROM affected_partitions)
-    AND __pgs_row_id NOT IN (SELECT __pgs_row_id FROM (<child_delta>) WHERE __pgs_action = 'D')
+    AND __pgt_row_id NOT IN (SELECT __pgt_row_id FROM (<child_delta>) WHERE __pgt_action = 'D')
 ),
 -- CTE 3: Recompute window function
 recomputed AS (
@@ -622,9 +622,9 @@ recomputed AS (
     FROM surviving
 )
 -- Delete old results + insert recomputed results
-SELECT 'D' AS __pgs_action, ...  -- old rows from affected partitions
+SELECT 'D' AS __pgt_action, ...  -- old rows from affected partitions
 UNION ALL
-SELECT 'I' AS __pgs_action, ...  -- recomputed rows
+SELECT 'I' AS __pgt_action, ...  -- recomputed rows
 ```
 
 **Notes:**
@@ -683,12 +683,12 @@ Where $R$ is the source table, $f$ is the SRF, and changed rows are identified v
 ```sql
 -- CTE 1: Changed source rows from child delta
 WITH lat_changed AS (
-    SELECT DISTINCT "__pgs_row_id", "__pgs_action", <child_cols>
+    SELECT DISTINCT "__pgt_row_id", "__pgt_action", <child_cols>
     FROM <child_delta>
 ),
 -- CTE 2: Old ST rows for changed source rows (to be deleted)
 lat_old AS (
-    SELECT st."__pgs_row_id", st.<all_output_cols>
+    SELECT st."__pgt_row_id", st.<all_output_cols>
     FROM <st_table> st
     WHERE EXISTS (
         SELECT 1 FROM lat_changed cs
@@ -699,17 +699,17 @@ lat_old AS (
 ),
 -- CTE 3: Re-expand SRF for inserted/updated source rows
 lat_expand AS (
-    SELECT pg_stream_hash(<all_cols>::text) AS "__pgs_row_id",
+    SELECT pg_trickle_hash(<all_cols>::text) AS "__pgt_row_id",
            cs.<child_cols>, <srf_alias>.<srf_cols>
     FROM lat_changed cs,
          LATERAL <srf_function>(cs.<arg>) AS <srf_alias>
-    WHERE cs."__pgs_action" = 'I'
+    WHERE cs."__pgt_action" = 'I'
 ),
 -- CTE 4: Final delta
 lat_final AS (
-    SELECT "__pgs_row_id", 'D' AS "__pgs_action", <cols> FROM lat_old
+    SELECT "__pgt_row_id", 'D' AS "__pgt_action", <cols> FROM lat_old
     UNION ALL
-    SELECT "__pgs_row_id", 'I' AS "__pgs_action", <cols> FROM lat_expand
+    SELECT "__pgt_row_id", 'I' AS "__pgt_action", <cols> FROM lat_expand
 )
 ```
 
@@ -764,12 +764,12 @@ Where $R$ is the outer table, $Q(R)$ is the correlated subquery, and changed row
 ```sql
 -- CTE 1: Changed outer rows from child delta
 WITH lat_sq_changed AS (
-    SELECT DISTINCT "__pgs_row_id", "__pgs_action", <child_cols>
+    SELECT DISTINCT "__pgt_row_id", "__pgt_action", <child_cols>
     FROM <child_delta>
 ),
 -- CTE 2: Old ST rows for changed outer rows (to be deleted)
 lat_sq_old AS (
-    SELECT st."__pgs_row_id", st.<all_output_cols>
+    SELECT st."__pgt_row_id", st.<all_output_cols>
     FROM <st_table> st
     WHERE EXISTS (
         SELECT 1 FROM lat_sq_changed cs
@@ -780,17 +780,17 @@ lat_sq_old AS (
 ),
 -- CTE 3: Re-execute subquery for inserted/updated outer rows
 lat_sq_expand AS (
-    SELECT pg_stream_hash(<all_cols>::text) AS "__pgs_row_id",
+    SELECT pg_trickle_hash(<all_cols>::text) AS "__pgt_row_id",
            <outer_alias>.<child_cols>, <sub_alias>.<sub_cols>
     FROM lat_sq_changed AS <outer_alias>,      -- Original outer alias!
          LATERAL (<subquery_sql>) AS <sub_alias>
-    WHERE <outer_alias>."__pgs_action" = 'I'
+    WHERE <outer_alias>."__pgt_action" = 'I'
 ),
 -- CTE 4: Final delta
 lat_sq_final AS (
-    SELECT "__pgs_row_id", 'D' AS "__pgs_action", <cols> FROM lat_sq_old
+    SELECT "__pgt_row_id", 'D' AS "__pgt_action", <cols> FROM lat_sq_old
     UNION ALL
-    SELECT "__pgs_row_id", 'I' AS "__pgs_action", <cols> FROM lat_sq_expand
+    SELECT "__pgt_row_id", 'I' AS "__pgt_action", <cols> FROM lat_sq_expand
 )
 ```
 
@@ -800,11 +800,11 @@ For queries using `LEFT JOIN LATERAL (...) ON true`, the expand CTE uses `LEFT J
 
 ```sql
 lat_sq_expand AS (
-    SELECT pg_stream_hash(<outer_cols>::text || '/' || COALESCE(<sub_cols>::text, '')) AS "__pgs_row_id",
+    SELECT pg_trickle_hash(<outer_cols>::text || '/' || COALESCE(<sub_cols>::text, '')) AS "__pgt_row_id",
            <outer_alias>.<child_cols>, <sub_alias>.<sub_cols>
     FROM lat_sq_changed AS <outer_alias>
     LEFT JOIN LATERAL (<subquery_sql>) AS <sub_alias> ON true
-    WHERE <outer_alias>."__pgs_action" = 'I'
+    WHERE <outer_alias>."__pgt_action" = 'I'
 )
 ```
 
@@ -856,8 +856,8 @@ The "old" right-hand state is reconstructed from the current state by reversing 
 
 **Row Identity:**
 
-- Part 1: Uses `__pgs_row_id` from the left delta.
-- Part 2: Content-based hash via `pg_stream_hash_multi` on left-side columns.
+- Part 1: Uses `__pgt_row_id` from the left delta.
+- Part 2: Content-based hash via `pg_trickle_hash_multi` on left-side columns.
 
 **Supported Patterns:**
 
@@ -927,14 +927,14 @@ WITH sq_outer AS (
 ),
 -- Part 2a: DELETE all outer rows when scalar changed
 sq_del AS (
-    SELECT "__pgs_row_id", 'D' AS "__pgs_action", <cols>
+    SELECT "__pgt_row_id", 'D' AS "__pgt_action", <cols>
     FROM <st_table>
     WHERE (<scalar_old>) IS DISTINCT FROM (<scalar_current>)
 ),
 -- Part 2b: INSERT all outer rows with new scalar value
 sq_ins AS (
-    SELECT pg_stream_hash_multi(...) AS "__pgs_row_id",
-           'I' AS "__pgs_action", <cols>, (<scalar_current>) AS "<alias>"
+    SELECT pg_trickle_hash_multi(...) AS "__pgt_row_id",
+           'I' AS "__pgt_action", <cols>, (<scalar_current>) AS "<alias>"
     FROM <source_snapshot>
     WHERE (<scalar_old>) IS DISTINCT FROM (<scalar_current>)
 )
@@ -946,8 +946,8 @@ UNION ALL SELECT * FROM sq_ins
 
 **Row Identity:**
 
-- Part 1: `__pgs_row_id` from the child delta.
-- Part 2: Content-based hash via `pg_stream_hash_multi` on all output columns.
+- Part 1: `__pgt_row_id` from the child delta.
+- Part 2: Content-based hash via `pg_trickle_hash_multi` on all output columns.
 
 **Notes:**
 - The scalar subquery is stored as raw SQL (deparsed from the parse tree).

@@ -1,9 +1,9 @@
-# pg_stream — Project Roadmap
+# pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-02-27
 > **Current version:** 0.1.1
 
-For a concise description of what pg_stream is and why it exists, read
+For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
 MATERIALIZED VIEW` recomputation), how the differential dataflow approach
 solves it, the hybrid trigger→WAL CDC architecture, and the broad SQL
@@ -13,7 +13,7 @@ coverage, all in plain language.
 
 ## Overview
 
-pg_stream is a PostgreSQL 18 extension that implements streaming tables with
+pg_trickle is a PostgreSQL 18 extension that implements streaming tables with
 incremental view maintenance (IVM) via differential dataflow. All 13 design
 phases are complete. This roadmap tracks the path from pre-release to 1.0
 and beyond.
@@ -143,7 +143,7 @@ milestone.
 | W1 | WAL decoder fixes (F2–F4 prerequisite from v0.2.0) | Done in v0.2.0 | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | W2 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | W3 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W4 | Promote `pg_stream.cdc_mode = 'auto'` to recommended | Documentation | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W4 | Promote `pg_trickle.cdc_mode = 'auto'` to recommended | Documentation | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 
 > **v0.3.0 total: ~40–58 hours** (excluding v0.2.0 prerequisites)
 
@@ -157,7 +157,7 @@ milestone.
 
 ## v0.4.0 — Observability & Integration
 
-**Goal:** Prometheus/Grafana observability, dbt-pgstream formal release,
+**Goal:** Prometheus/Grafana observability, dbt-pgtrickle formal release,
 complete documentation review, and validated upgrade path. After this
 milestone the product is externally visible and monitored.
 
@@ -172,7 +172,7 @@ milestone the product is externally visible and monitored.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| R5 | dbt-pgstream 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgstream/](dbt-pgstream/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
+| R5 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
 | R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
 | O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 · [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
 
@@ -180,8 +180,8 @@ milestone the product is externally visible and monitored.
 
 **Exit criteria:**
 - [ ] Grafana dashboard published
-- [ ] dbt-pgstream 0.1.0 on PyPI
-- [ ] `ALTER EXTENSION pg_stream UPDATE` tested (`0.3.0 → 0.4.0`)
+- [ ] dbt-pgtrickle 0.1.0 on PyPI
+- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.3.0 → 0.4.0`)
 - [ ] All public documentation current and reviewed
 
 ---
@@ -190,7 +190,7 @@ milestone the product is externally visible and monitored.
 
 **Goal:** First officially supported release. Semantic versioning locks in.
 API, catalog schema, and GUC names are considered stable. Focus is
-distribution — getting pg_stream onto package registries.
+distribution — getting pg_trickle onto package registries.
 
 ### Release engineering
 
@@ -205,7 +205,7 @@ distribution — getting pg_stream onto package registries.
 
 **Exit criteria:**
 - [ ] Published on PGXN and Docker Hub
-- [x] CNPG extension image published to GHCR (`pg_stream-ext`)
+- [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
 - [ ] Upgrade path from v0.4.0 tested
 - [ ] Semantic versioning policy in effect
@@ -220,9 +220,9 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| E1 | dbt full adapter (`dbt-pgstream` extending `dbt-postgres`) | 20–30h | [PLAN_DBT_ADAPTER.md](plans/dbt/PLAN_DBT_ADAPTER.md) |
-| E2 | Airflow provider (`apache-airflow-providers-pgstream`) | 16–20h | [PLAN_ECO_SYSTEM.md §4](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
-| E3 | CLI tool (`pgstream`) for management outside SQL | 16–20h | [PLAN_ECO_SYSTEM.md §4](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| E1 | dbt full adapter (`dbt-pgtrickle` extending `dbt-postgres`) | 20–30h | [PLAN_DBT_ADAPTER.md](plans/dbt/PLAN_DBT_ADAPTER.md) |
+| E2 | Airflow provider (`apache-airflow-providers-pgtrickle`) | 16–20h | [PLAN_ECO_SYSTEM.md §4](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| E3 | CLI tool (`pgtrickle`) for management outside SQL | 16–20h | [PLAN_ECO_SYSTEM.md §4](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 | E4 | Flyway / Liquibase migration support | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 | E5 | ORM integrations guide (SQLAlchemy, Django, etc.) | 8–12h | [PLAN_ECO_SYSTEM.md §5](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
 

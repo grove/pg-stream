@@ -1,23 +1,23 @@
 //! Catalog layer — metadata tables and CRUD operations for stream tables.
 //!
 //! All catalog access goes through PostgreSQL's SPI interface. This module
-//! provides typed Rust abstractions over the `pgstream.pgs_stream_tables`,
-//! `pgstream.pgs_dependencies`, and `pgstream.pgs_refresh_history` tables.
+//! provides typed Rust abstractions over the `pgtrickle.pgt_stream_tables`,
+//! `pgtrickle.pgt_dependencies`, and `pgtrickle.pgt_refresh_history` tables.
 
 use pgrx::prelude::*;
 use pgrx::spi::{SpiHeapTupleData, SpiTupleTable};
 
 use crate::dag::{RefreshMode, StStatus};
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::version::Frontier;
 
-/// Metadata for a stream table, mirrors `pgstream.pgs_stream_tables`.
+/// Metadata for a stream table, mirrors `pgtrickle.pgt_stream_tables`.
 #[derive(Debug, Clone)]
 pub struct StreamTableMeta {
-    pub pgs_id: i64,
-    pub pgs_relid: pg_sys::Oid,
-    pub pgs_name: String,
-    pub pgs_schema: String,
+    pub pgt_id: i64,
+    pub pgt_relid: pg_sys::Oid,
+    pub pgt_name: String,
+    pub pgt_schema: String,
     pub defining_query: String,
     pub original_query: Option<String>,
     pub schedule: Option<String>,
@@ -81,7 +81,7 @@ impl std::fmt::Display for CdcMode {
 /// A dependency edge from a stream table to one of its upstream sources.
 #[derive(Debug, Clone)]
 pub struct StDependency {
-    pub pgs_id: i64,
+    pub pgt_id: i64,
     pub source_relid: pg_sys::Oid,
     pub source_type: String,
     pub columns_used: Option<Vec<String>>,
@@ -105,7 +105,7 @@ pub struct StDependency {
 #[derive(Debug, Clone)]
 pub struct RefreshRecord {
     pub refresh_id: i64,
-    pub pgs_id: i64,
+    pub pgt_id: i64,
     pub data_timestamp: TimestampWithTimeZone,
     pub start_time: TimestampWithTimeZone,
     pub end_time: Option<TimestampWithTimeZone>,
@@ -123,30 +123,30 @@ pub struct RefreshRecord {
 // ── StreamTableMeta CRUD ──────────────────────────────────────────────────
 
 impl StreamTableMeta {
-    /// Insert a new stream table record. Returns the assigned `pgs_id`.
+    /// Insert a new stream table record. Returns the assigned `pgt_id`.
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
-        pgs_relid: pg_sys::Oid,
-        pgs_name: &str,
-        pgs_schema: &str,
+        pgt_relid: pg_sys::Oid,
+        pgt_name: &str,
+        pgt_schema: &str,
         defining_query: &str,
         original_query: Option<&str>,
         schedule: Option<String>,
         refresh_mode: RefreshMode,
         functions_used: Option<Vec<String>>,
-    ) -> Result<i64, PgStreamError> {
+    ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
-                    "INSERT INTO pgstream.pgs_stream_tables \
-                     (pgs_relid, pgs_name, pgs_schema, defining_query, original_query, schedule, refresh_mode, functions_used) \
+                    "INSERT INTO pgtrickle.pgt_stream_tables \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used) \
                      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                     RETURNING pgs_id",
+                     RETURNING pgt_id",
                     None,
                     &[
-                        pgs_relid.into(),
-                        pgs_name.into(),
-                        pgs_schema.into(),
+                        pgt_relid.into(),
+                        pgt_name.into(),
+                        pgt_schema.into(),
                         defining_query.into(),
                         original_query.into(),
                         schedule.into(),
@@ -154,33 +154,33 @@ impl StreamTableMeta {
                         functions_used.into(),
                     ],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
                 .first();
 
             row.get_one::<i64>()
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?
-                .ok_or_else(|| PgStreamError::InternalError("INSERT did not return pgs_id".into()))
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+                .ok_or_else(|| PgTrickleError::InternalError("INSERT did not return pgt_id".into()))
         })
     }
 
     /// Look up a stream table by schema-qualified name.
-    pub fn get_by_name(schema: &str, name: &str) -> Result<Self, PgStreamError> {
+    pub fn get_by_name(schema: &str, name: &str) -> Result<Self, PgTrickleError> {
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
+                    "SELECT pgt_id, pgt_relid, pgt_name, pgt_schema, defining_query, \
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used \
-                     FROM pgstream.pgs_stream_tables \
-                     WHERE pgs_schema = $1 AND pgs_name = $2",
+                     FROM pgtrickle.pgt_stream_tables \
+                     WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
                     &[schema.into(), name.into()],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             if table.is_empty() {
-                return Err(PgStreamError::NotFound(format!("{}.{}", schema, name)));
+                return Err(PgTrickleError::NotFound(format!("{}.{}", schema, name)));
             }
 
             Self::from_spi_table(&table.first())
@@ -188,23 +188,26 @@ impl StreamTableMeta {
     }
 
     /// Look up a stream table by its storage table OID.
-    pub fn get_by_relid(relid: pg_sys::Oid) -> Result<Self, PgStreamError> {
+    pub fn get_by_relid(relid: pg_sys::Oid) -> Result<Self, PgTrickleError> {
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
+                    "SELECT pgt_id, pgt_relid, pgt_name, pgt_schema, defining_query, \
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used \
-                     FROM pgstream.pgs_stream_tables \
-                     WHERE pgs_relid = $1",
+                     FROM pgtrickle.pgt_stream_tables \
+                     WHERE pgt_relid = $1",
                     None,
                     &[relid.into()],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             if table.is_empty() {
-                return Err(PgStreamError::NotFound(format!("relid={}", relid.to_u32())));
+                return Err(PgTrickleError::NotFound(format!(
+                    "relid={}",
+                    relid.to_u32()
+                )));
             }
 
             Self::from_spi_table(&table.first())
@@ -212,20 +215,20 @@ impl StreamTableMeta {
     }
 
     /// Get all active stream tables.
-    pub fn get_all_active() -> Result<Vec<Self>, PgStreamError> {
+    pub fn get_all_active() -> Result<Vec<Self>, PgTrickleError> {
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id, pgs_relid, pgs_name, pgs_schema, defining_query, \
+                    "SELECT pgt_id, pgt_relid, pgt_name, pgt_schema, defining_query, \
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used \
-                     FROM pgstream.pgs_stream_tables \
+                     FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
                     &[],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             let mut result = Vec::new();
             for row in table {
@@ -240,21 +243,21 @@ impl StreamTableMeta {
         })
     }
 
-    /// Find pgs_ids of stream tables whose `functions_used` array contains
+    /// Find pgt_ids of stream tables whose `functions_used` array contains
     /// the given function name (case-insensitive match via `@>`).
     /// Used by DDL hooks to detect which STs are affected when a function
     /// is CREATEd OR REPLACEd / ALTERed / DROPped.
-    pub fn find_by_function_name(func_name: &str) -> Result<Vec<i64>, PgStreamError> {
+    pub fn find_by_function_name(func_name: &str) -> Result<Vec<i64>, PgTrickleError> {
         let lower = func_name.to_lowercase();
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id FROM pgstream.pgs_stream_tables \
+                    "SELECT pgt_id FROM pgtrickle.pgt_stream_tables \
                      WHERE functions_used @> ARRAY[$1]::text[]",
                     None,
                     &[lower.into()],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             let mut ids = Vec::new();
             for row in table {
@@ -267,58 +270,58 @@ impl StreamTableMeta {
     }
 
     /// Update the status of a stream table.
-    pub fn update_status(pgs_id: i64, status: StStatus) -> Result<(), PgStreamError> {
+    pub fn update_status(pgt_id: i64, status: StStatus) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET status = $1, updated_at = now() \
-             WHERE pgs_id = $2",
-            &[status.as_str().into(), pgs_id.into()],
+             WHERE pgt_id = $2",
+            &[status.as_str().into(), pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Mark a ST as populated with a data timestamp after refresh.
     pub fn update_after_refresh(
-        pgs_id: i64,
+        pgt_id: i64,
         data_ts: TimestampWithTimeZone,
         _rows_affected: i64,
-    ) -> Result<(), PgStreamError> {
+    ) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET data_timestamp = $1, is_populated = true, \
              last_refresh_at = now(), consecutive_errors = 0, \
              status = 'ACTIVE', needs_reinit = false, updated_at = now() \
-             WHERE pgs_id = $2",
-            &[data_ts.into(), pgs_id.into()],
+             WHERE pgt_id = $2",
+            &[data_ts.into(), pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Mark a ST as populated with a data timestamp and store frontier after refresh.
     pub fn update_after_refresh_with_frontier(
-        pgs_id: i64,
+        pgt_id: i64,
         data_ts: TimestampWithTimeZone,
         _rows_affected: i64,
         frontier: &Frontier,
-    ) -> Result<(), PgStreamError> {
+    ) -> Result<(), PgTrickleError> {
         let frontier_json = serde_json::to_value(frontier).map_err(|e| {
-            PgStreamError::InternalError(format!("Failed to serialize frontier: {}", e))
+            PgTrickleError::InternalError(format!("Failed to serialize frontier: {}", e))
         })?;
 
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET data_timestamp = $1, is_populated = true, \
              last_refresh_at = now(), consecutive_errors = 0, \
              status = 'ACTIVE', needs_reinit = false, \
              frontier = $3, updated_at = now() \
-             WHERE pgs_id = $2",
+             WHERE pgt_id = $2",
             &[
                 data_ts.into(),
-                pgs_id.into(),
+                pgt_id.into(),
                 pgrx::JsonB(frontier_json).into(),
             ],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Store frontier + mark refresh complete in a single SPI call (S3 optimization).
@@ -326,59 +329,59 @@ impl StreamTableMeta {
     /// Combines `store_frontier()` + `SELECT now()` + `update_after_refresh()`
     /// into one UPDATE ... RETURNING, saving 2 SPI round-trips.
     pub fn store_frontier_and_complete_refresh(
-        pgs_id: i64,
+        pgt_id: i64,
         frontier: &Frontier,
         rows_affected: i64,
-    ) -> Result<TimestampWithTimeZone, PgStreamError> {
+    ) -> Result<TimestampWithTimeZone, PgTrickleError> {
         let frontier_json = serde_json::to_value(frontier).map_err(|e| {
-            PgStreamError::InternalError(format!("Failed to serialize frontier: {}", e))
+            PgTrickleError::InternalError(format!("Failed to serialize frontier: {}", e))
         })?;
 
         Spi::get_one_with_args::<TimestampWithTimeZone>(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET data_timestamp = now(), is_populated = true, \
              last_refresh_at = now(), consecutive_errors = 0, \
              status = 'ACTIVE', needs_reinit = false, \
              frontier = $3, updated_at = now() \
-             WHERE pgs_id = $1 \
+             WHERE pgt_id = $1 \
              RETURNING data_timestamp",
             &[
-                pgs_id.into(),
+                pgt_id.into(),
                 rows_affected.into(),
                 pgrx::JsonB(frontier_json).into(),
             ],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?
-        .ok_or_else(|| PgStreamError::NotFound(format!("pgs_id={}", pgs_id)))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::NotFound(format!("pgt_id={}", pgt_id)))
     }
 
     /// Store a frontier for a stream table.
-    pub fn store_frontier(pgs_id: i64, frontier: &Frontier) -> Result<(), PgStreamError> {
+    pub fn store_frontier(pgt_id: i64, frontier: &Frontier) -> Result<(), PgTrickleError> {
         let frontier_json = serde_json::to_value(frontier).map_err(|e| {
-            PgStreamError::InternalError(format!("Failed to serialize frontier: {}", e))
+            PgTrickleError::InternalError(format!("Failed to serialize frontier: {}", e))
         })?;
 
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET frontier = $1, updated_at = now() \
-             WHERE pgs_id = $2",
-            &[pgrx::JsonB(frontier_json).into(), pgs_id.into()],
+             WHERE pgt_id = $2",
+            &[pgrx::JsonB(frontier_json).into(), pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Load the frontier for a stream table. Returns None if not yet set.
-    pub fn get_frontier(pgs_id: i64) -> Result<Option<Frontier>, PgStreamError> {
+    pub fn get_frontier(pgt_id: i64) -> Result<Option<Frontier>, PgTrickleError> {
         let json_opt = Spi::get_one_with_args::<pgrx::JsonB>(
-            "SELECT frontier FROM pgstream.pgs_stream_tables WHERE pgs_id = $1",
-            &[pgs_id.into()],
+            "SELECT frontier FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
+            &[pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
         match json_opt {
             Some(jsonb) => {
                 let frontier: Frontier = serde_json::from_value(jsonb.0).map_err(|e| {
-                    PgStreamError::InternalError(format!("Failed to deserialize frontier: {}", e))
+                    PgTrickleError::InternalError(format!("Failed to deserialize frontier: {}", e))
                 })?;
                 Ok(Some(frontier))
             }
@@ -387,36 +390,36 @@ impl StreamTableMeta {
     }
 
     /// Increment the consecutive error count. Returns the new count.
-    pub fn increment_errors(pgs_id: i64) -> Result<i32, PgStreamError> {
+    pub fn increment_errors(pgt_id: i64) -> Result<i32, PgTrickleError> {
         Spi::get_one_with_args::<i32>(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET consecutive_errors = consecutive_errors + 1, updated_at = now() \
-             WHERE pgs_id = $1 \
+             WHERE pgt_id = $1 \
              RETURNING consecutive_errors",
-            &[pgs_id.into()],
+            &[pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?
-        .ok_or_else(|| PgStreamError::NotFound(format!("pgs_id={}", pgs_id)))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::NotFound(format!("pgt_id={}", pgt_id)))
     }
 
     /// Delete a stream table record from the catalog.
-    pub fn delete(pgs_id: i64) -> Result<(), PgStreamError> {
+    pub fn delete(pgt_id: i64) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
-            "DELETE FROM pgstream.pgs_stream_tables WHERE pgs_id = $1",
-            &[pgs_id.into()],
+            "DELETE FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
+            &[pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Mark a ST for reinitialization (e.g., due to upstream DDL change).
-    pub fn mark_for_reinitialize(pgs_id: i64) -> Result<(), PgStreamError> {
+    pub fn mark_for_reinitialize(pgt_id: i64) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET needs_reinit = true, updated_at = now() \
-             WHERE pgs_id = $1",
-            &[pgs_id.into()],
+             WHERE pgt_id = $1",
+            &[pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Update the per-ST adaptive fallback threshold and last FULL refresh time.
@@ -427,51 +430,51 @@ impl StreamTableMeta {
     /// `auto_threshold` — the new threshold (0.0–1.0), or None to reset to GUC default.
     /// `last_full_ms` — the last observed FULL refresh execution time, or None to keep existing.
     pub fn update_adaptive_threshold(
-        pgs_id: i64,
+        pgt_id: i64,
         auto_threshold: Option<f64>,
         last_full_ms: Option<f64>,
-    ) -> Result<(), PgStreamError> {
+    ) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_stream_tables \
+            "UPDATE pgtrickle.pgt_stream_tables \
              SET auto_threshold = $1, \
                  last_full_ms = COALESCE($2, last_full_ms), \
                  updated_at = now() \
-             WHERE pgs_id = $3",
-            &[auto_threshold.into(), last_full_ms.into(), pgs_id.into()],
+             WHERE pgt_id = $3",
+            &[auto_threshold.into(), last_full_ms.into(), pgt_id.into()],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     // ── Private helpers ────────────────────────────────────────────────
 
     /// Extract a StreamTableMeta from a positioned SpiTupleTable (after first()).
-    fn from_spi_table(table: &SpiTupleTable<'_>) -> Result<Self, PgStreamError> {
-        let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
+    fn from_spi_table(table: &SpiTupleTable<'_>) -> Result<Self, PgTrickleError> {
+        let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
 
-        let pgs_id = table
+        let pgt_id = table
             .get::<i64>(1)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_id is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_id is NULL".into()))?;
 
-        let pgs_relid = table
+        let pgt_relid = table
             .get::<pg_sys::Oid>(2)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_relid is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_relid is NULL".into()))?;
 
-        let pgs_name = table
+        let pgt_name = table
             .get::<String>(3)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_name is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_name is NULL".into()))?;
 
-        let pgs_schema = table
+        let pgt_schema = table
             .get::<String>(4)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_schema is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_schema is NULL".into()))?;
 
         let defining_query = table
             .get::<String>(5)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("defining_query is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("defining_query is NULL".into()))?;
 
         let original_query = table.get::<String>(6).map_err(map_spi)?;
 
@@ -505,10 +508,10 @@ impl StreamTableMeta {
         let functions_used = table.get::<Vec<String>>(17).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
-            pgs_id,
-            pgs_relid,
-            pgs_name,
-            pgs_schema,
+            pgt_id,
+            pgt_relid,
+            pgt_name,
+            pgt_schema,
             defining_query,
             original_query,
             schedule,
@@ -526,33 +529,33 @@ impl StreamTableMeta {
     }
 
     /// Extract a StreamTableMeta from an SpiHeapTupleData (from iteration).
-    fn from_spi_heap_tuple(row: &SpiHeapTupleData<'_>) -> Result<Self, PgStreamError> {
-        let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
+    fn from_spi_heap_tuple(row: &SpiHeapTupleData<'_>) -> Result<Self, PgTrickleError> {
+        let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
 
-        let pgs_id = row
+        let pgt_id = row
             .get::<i64>(1)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_id is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_id is NULL".into()))?;
 
-        let pgs_relid = row
+        let pgt_relid = row
             .get::<pg_sys::Oid>(2)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_relid is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_relid is NULL".into()))?;
 
-        let pgs_name = row
+        let pgt_name = row
             .get::<String>(3)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_name is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_name is NULL".into()))?;
 
-        let pgs_schema = row
+        let pgt_schema = row
             .get::<String>(4)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("pgs_schema is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("pgt_schema is NULL".into()))?;
 
         let defining_query = row
             .get::<String>(5)
             .map_err(map_spi)?
-            .ok_or_else(|| PgStreamError::InternalError("defining_query is NULL".into()))?;
+            .ok_or_else(|| PgTrickleError::InternalError("defining_query is NULL".into()))?;
 
         let original_query = row.get::<String>(6).map_err(map_spi)?;
 
@@ -586,10 +589,10 @@ impl StreamTableMeta {
         let functions_used = row.get::<Vec<String>>(17).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
-            pgs_id,
-            pgs_relid,
-            pgs_name,
-            pgs_schema,
+            pgt_id,
+            pgt_relid,
+            pgt_name,
+            pgt_schema,
             defining_query,
             original_query,
             schedule,
@@ -612,31 +615,31 @@ impl StreamTableMeta {
 impl StDependency {
     /// Insert a dependency edge.
     pub fn insert(
-        pgs_id: i64,
+        pgt_id: i64,
         source_relid: pg_sys::Oid,
         source_type: &str,
         columns_used: Option<Vec<String>>,
-    ) -> Result<(), PgStreamError> {
-        Self::insert_with_snapshot(pgs_id, source_relid, source_type, columns_used, None, None)
+    ) -> Result<(), PgTrickleError> {
+        Self::insert_with_snapshot(pgt_id, source_relid, source_type, columns_used, None, None)
     }
 
     /// Insert a dependency edge with column snapshot and schema fingerprint.
     pub fn insert_with_snapshot(
-        pgs_id: i64,
+        pgt_id: i64,
         source_relid: pg_sys::Oid,
         source_type: &str,
         columns_used: Option<Vec<String>>,
         column_snapshot: Option<pgrx::JsonB>,
         schema_fingerprint: Option<String>,
-    ) -> Result<(), PgStreamError> {
+    ) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
-            "INSERT INTO pgstream.pgs_dependencies \
-             (pgs_id, source_relid, source_type, cdc_mode, columns_used, \
+            "INSERT INTO pgtrickle.pgt_dependencies \
+             (pgt_id, source_relid, source_type, cdc_mode, columns_used, \
               column_snapshot, schema_fingerprint) \
              VALUES ($1, $2, $3, 'TRIGGER', $4, $5, $6) \
              ON CONFLICT DO NOTHING",
             &[
-                pgs_id.into(),
+                pgt_id.into(),
                 source_relid.into(),
                 source_type.into(),
                 columns_used.into(),
@@ -644,17 +647,17 @@ impl StDependency {
                 schema_fingerprint.into(),
             ],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Update the CDC mode and related fields for a dependency.
     pub fn update_cdc_mode(
-        pgs_id: i64,
+        pgt_id: i64,
         source_relid: pg_sys::Oid,
         cdc_mode: CdcMode,
         slot_name: Option<&str>,
         decoder_confirmed_lsn: Option<&str>,
-    ) -> Result<(), PgStreamError> {
+    ) -> Result<(), PgTrickleError> {
         let transition_started = if cdc_mode == CdcMode::Transitioning {
             "now()"
         } else {
@@ -662,42 +665,42 @@ impl StDependency {
         };
         Spi::run_with_args(
             &format!(
-                "UPDATE pgstream.pgs_dependencies \
+                "UPDATE pgtrickle.pgt_dependencies \
                  SET cdc_mode = $1, slot_name = $2, decoder_confirmed_lsn = $3::pg_lsn, \
                      transition_started_at = {} \
-                 WHERE pgs_id = $4 AND source_relid = $5",
+                 WHERE pgt_id = $4 AND source_relid = $5",
                 transition_started
             ),
             &[
                 cdc_mode.as_str().into(),
                 slot_name.into(),
                 decoder_confirmed_lsn.into(),
-                pgs_id.into(),
+                pgt_id.into(),
                 source_relid.into(),
             ],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
     /// Get all dependencies for a stream table.
-    pub fn get_for_st(pgs_id: i64) -> Result<Vec<Self>, PgStreamError> {
+    pub fn get_for_st(pgt_id: i64) -> Result<Vec<Self>, PgTrickleError> {
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id, source_relid, source_type, columns_used, \
+                    "SELECT pgt_id, source_relid, source_type, columns_used, \
                             cdc_mode, slot_name, decoder_confirmed_lsn::text, \
                             transition_started_at::text, column_snapshot, \
                             schema_fingerprint \
-                     FROM pgstream.pgs_dependencies WHERE pgs_id = $1",
+                     FROM pgtrickle.pgt_dependencies WHERE pgt_id = $1",
                     None,
-                    &[pgs_id.into()],
+                    &[pgt_id.into()],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             let mut result = Vec::new();
             for row in table {
-                let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
-                let pgs_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
+                let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+                let pgt_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
                 let source_relid = row
                     .get::<pg_sys::Oid>(2)
                     .map_err(map_spi)?
@@ -711,7 +714,7 @@ impl StDependency {
                 let column_snapshot = row.get::<pgrx::JsonB>(9).map_err(map_spi)?.map(|jb| jb.0);
                 let schema_fingerprint = row.get::<String>(10).map_err(map_spi)?;
                 result.push(StDependency {
-                    pgs_id,
+                    pgt_id,
                     source_relid,
                     source_type,
                     columns_used,
@@ -728,24 +731,24 @@ impl StDependency {
     }
 
     /// Get all dependencies across all STs (for building the full DAG).
-    pub fn get_all() -> Result<Vec<Self>, PgStreamError> {
+    pub fn get_all() -> Result<Vec<Self>, PgTrickleError> {
         Spi::connect(|client| {
             let table = client
                 .select(
-                    "SELECT pgs_id, source_relid, source_type, columns_used, \
+                    "SELECT pgt_id, source_relid, source_type, columns_used, \
                             cdc_mode, slot_name, decoder_confirmed_lsn::text, \
                             transition_started_at::text, column_snapshot, \
                             schema_fingerprint \
-                     FROM pgstream.pgs_dependencies",
+                     FROM pgtrickle.pgt_dependencies",
                     None,
                     &[],
                 )
-                .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
 
             let mut result = Vec::new();
             for row in table {
-                let map_spi = |e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string());
-                let pgs_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
+                let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+                let pgt_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
                 let source_relid = row
                     .get::<pg_sys::Oid>(2)
                     .map_err(map_spi)?
@@ -759,7 +762,7 @@ impl StDependency {
                 let column_snapshot = row.get::<pgrx::JsonB>(9).map_err(map_spi)?.map(|jb| jb.0);
                 let schema_fingerprint = row.get::<String>(10).map_err(map_spi)?;
                 result.push(StDependency {
-                    pgs_id,
+                    pgt_id,
                     source_relid,
                     source_type,
                     columns_used,
@@ -788,12 +791,12 @@ impl StDependency {
 /// [{"name":"id","type_oid":23,"ordinal":1},{"name":"val","type_oid":25,"ordinal":2}]
 /// ```
 ///
-/// Used at creation time to record the source schema in `pgs_dependencies`
+/// Used at creation time to record the source schema in `pgt_dependencies`
 /// so `detect_schema_change_kind()` can compare against the current catalog.
 #[cfg(not(test))]
 pub fn build_column_snapshot(
     source_oid: pg_sys::Oid,
-) -> Result<(pgrx::JsonB, String), PgStreamError> {
+) -> Result<(pgrx::JsonB, String), PgTrickleError> {
     use sha2::{Digest, Sha256};
 
     let sql = format!(
@@ -807,20 +810,20 @@ pub fn build_column_snapshot(
     let entries: Vec<serde_json::Value> = Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut out = Vec::new();
         for row in result {
             let name: String = row
                 .get(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
             let type_oid: i32 = row
                 .get(2)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or(0);
             let ordinal: i32 = row
                 .get(3)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or(0);
             out.push(serde_json::json!({
                 "name": name,
@@ -832,7 +835,7 @@ pub fn build_column_snapshot(
     })?;
 
     let json_str = serde_json::to_string(&entries)
-        .map_err(|e| PgStreamError::InternalError(format!("JSON serialization failed: {e}")))?;
+        .map_err(|e| PgTrickleError::InternalError(format!("JSON serialization failed: {e}")))?;
 
     let mut hasher = Sha256::new();
     hasher.update(json_str.as_bytes());
@@ -846,7 +849,7 @@ pub fn build_column_snapshot(
 #[cfg(test)]
 pub fn build_column_snapshot(
     _source_oid: pg_sys::Oid,
-) -> Result<(pgrx::JsonB, String), PgStreamError> {
+) -> Result<(pgrx::JsonB, String), PgTrickleError> {
     let empty = serde_json::Value::Array(vec![]);
     Ok((pgrx::JsonB(empty), String::new()))
 }
@@ -855,28 +858,28 @@ pub fn build_column_snapshot(
 ///
 /// Returns `None` if no snapshot is stored.
 pub fn get_column_snapshot(
-    pgs_id: i64,
+    pgt_id: i64,
     source_oid: pg_sys::Oid,
-) -> Result<Option<pgrx::JsonB>, PgStreamError> {
+) -> Result<Option<pgrx::JsonB>, PgTrickleError> {
     Spi::get_one_with_args::<pgrx::JsonB>(
-        "SELECT column_snapshot FROM pgstream.pgs_dependencies \
-         WHERE pgs_id = $1 AND source_relid = $2",
-        &[pgs_id.into(), source_oid.into()],
+        "SELECT column_snapshot FROM pgtrickle.pgt_dependencies \
+         WHERE pgt_id = $1 AND source_relid = $2",
+        &[pgt_id.into(), source_oid.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
 }
 
 /// Get the stored schema fingerprint for a dependency pair.
 pub fn get_schema_fingerprint(
-    pgs_id: i64,
+    pgt_id: i64,
     source_oid: pg_sys::Oid,
-) -> Result<Option<String>, PgStreamError> {
+) -> Result<Option<String>, PgTrickleError> {
     Spi::get_one_with_args::<String>(
-        "SELECT schema_fingerprint FROM pgstream.pgs_dependencies \
-         WHERE pgs_id = $1 AND source_relid = $2",
-        &[pgs_id.into(), source_oid.into()],
+        "SELECT schema_fingerprint FROM pgtrickle.pgt_dependencies \
+         WHERE pgt_id = $1 AND source_relid = $2",
+        &[pgt_id.into(), source_oid.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
 }
 
 // ── Refresh history CRUD ───────────────────────────────────────────────────
@@ -886,14 +889,14 @@ impl RefreshRecord {
     ///
     /// `initiated_by` indicates what triggered the refresh:
     /// - `"SCHEDULER"` — background scheduler
-    /// - `"MANUAL"` — user-invoked `pgstream.refresh_stream_table()`
+    /// - `"MANUAL"` — user-invoked `pgtrickle.refresh_stream_table()`
     /// - `"INITIAL"` — first refresh after `create_stream_table()`
     ///
     /// `freshness_deadline` is the SLA deadline for duration-based schedules
     /// (NULL for cron-based schedules).
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
-        pgs_id: i64,
+        pgt_id: i64,
         data_timestamp: TimestampWithTimeZone,
         action: &str,
         status: &str,
@@ -902,16 +905,16 @@ impl RefreshRecord {
         error_message: Option<&str>,
         initiated_by: Option<&str>,
         freshness_deadline: Option<TimestampWithTimeZone>,
-    ) -> Result<i64, PgStreamError> {
+    ) -> Result<i64, PgTrickleError> {
         Spi::get_one_with_args::<i64>(
-            "INSERT INTO pgstream.pgs_refresh_history \
-             (pgs_id, data_timestamp, start_time, action, status, \
+            "INSERT INTO pgtrickle.pgt_refresh_history \
+             (pgt_id, data_timestamp, start_time, action, status, \
               rows_inserted, rows_deleted, error_message, \
               initiated_by, freshness_deadline) \
              VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8, $9) \
              RETURNING refresh_id",
             &[
-                pgs_id.into(),
+                pgt_id.into(),
                 data_timestamp.into(),
                 action.into(),
                 status.into(),
@@ -922,8 +925,8 @@ impl RefreshRecord {
                 freshness_deadline.into(),
             ],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))?
-        .ok_or_else(|| PgStreamError::InternalError("INSERT did not return refresh_id".into()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::InternalError("INSERT did not return refresh_id".into()))
     }
 
     /// Complete a refresh record (set end_time and final status).
@@ -933,9 +936,9 @@ impl RefreshRecord {
         rows_inserted: i64,
         rows_deleted: i64,
         error_message: Option<&str>,
-    ) -> Result<(), PgStreamError> {
+    ) -> Result<(), PgTrickleError> {
         Spi::run_with_args(
-            "UPDATE pgstream.pgs_refresh_history \
+            "UPDATE pgtrickle.pgt_refresh_history \
              SET end_time = now(), status = $1, rows_inserted = $2, \
              rows_deleted = $3, error_message = $4 \
              WHERE refresh_id = $5",
@@ -947,7 +950,7 @@ impl RefreshRecord {
                 refresh_id.into(),
             ],
         )
-        .map_err(|e: pgrx::spi::SpiError| PgStreamError::SpiError(e.to_string()))
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 }
 

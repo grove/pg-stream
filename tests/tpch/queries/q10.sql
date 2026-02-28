@@ -1,6 +1,6 @@
 -- Q10: Returned Item Reporting
 -- Operators: 4-table Join -> Filter -> Aggregate
--- LIMIT removed (unsupported by pg_stream)
+-- LIMIT removed (unsupported by pg_trickle)
 SELECT
     c_custkey,
     c_name,

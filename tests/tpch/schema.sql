@@ -1,4 +1,4 @@
--- TPC-H Schema for pg_stream correctness testing.
+-- TPC-H Schema for pg_trickle correctness testing.
 -- Standard 8-table schema with primary keys (required for CDC triggers).
 -- No foreign keys — they are not required and slow down RF1/RF2.
 

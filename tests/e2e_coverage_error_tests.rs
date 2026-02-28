@@ -51,8 +51,8 @@ async fn test_cycle_detection_st_depending_on_st() {
     // Verify all three STs were created (chain, no cycle)
     let count: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_stream_tables \
-             WHERE pgs_name LIKE 'cycle_st_%'",
+            "SELECT count(*) FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name LIKE 'cycle_st_%'",
         )
         .await;
     assert_eq!(count, 3, "Three chained STs should exist");
@@ -66,11 +66,11 @@ async fn test_invalid_schedule_below_minimum() {
         .await;
     db.execute("INSERT INTO sched_src VALUES (1)").await;
 
-    // The minimum schedule is controlled by pg_stream.min_schedule_seconds GUC (default 30).
+    // The minimum schedule is controlled by pg_trickle.min_schedule_seconds GUC (default 30).
     // Try to create with a schedule below that minimum.
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('tiny_sched_st', \
+            "SELECT pgtrickle.create_stream_table('tiny_sched_st', \
              $$ SELECT id FROM sched_src $$, '1s', 'FULL')",
         )
         .await;
@@ -98,7 +98,7 @@ async fn test_explain_st_returns_properties() {
 
     // Call explain_st and verify it returns structured properties
     let row_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.explain_st('explain_target')")
+        .query_scalar("SELECT count(*) FROM pgtrickle.explain_st('explain_target')")
         .await;
     assert!(
         row_count >= 3,
@@ -107,21 +107,21 @@ async fn test_explain_st_returns_properties() {
     );
 
     // Check specific properties exist
-    let pgs_name: String = db
+    let pgt_name: String = db
         .query_scalar(
-            "SELECT value FROM pgstream.explain_st('explain_target') \
-             WHERE property = 'pgs_name'",
+            "SELECT value FROM pgtrickle.explain_st('explain_target') \
+             WHERE property = 'pgt_name'",
         )
         .await;
     assert!(
-        pgs_name.contains("explain_target"),
-        "pgs_name property should contain the ST name, got: {}",
-        pgs_name
+        pgt_name.contains("explain_target"),
+        "pgt_name property should contain the ST name, got: {}",
+        pgt_name
     );
 
     let mode: String = db
         .query_scalar(
-            "SELECT value FROM pgstream.explain_st('explain_target') \
+            "SELECT value FROM pgtrickle.explain_st('explain_target') \
              WHERE property = 'refresh_mode'",
         )
         .await;
@@ -148,7 +148,7 @@ async fn test_explain_st_differential_shows_dvm_info() {
     // DVM-supported query should include dvm_supported property
     let dvm_supported: Option<String> = db
         .query_scalar_opt(
-            "SELECT value FROM pgstream.explain_st('explain_inc_st') \
+            "SELECT value FROM pgtrickle.explain_st('explain_inc_st') \
              WHERE property = 'dvm_supported'",
         )
         .await;
@@ -178,7 +178,7 @@ async fn test_slot_health_returns_rows() {
 
     // slot_health() should return at least one row for the CDC tracking entry
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.slot_health()")
+        .query_scalar("SELECT count(*) FROM pgtrickle.slot_health()")
         .await;
     assert!(
         count >= 1,
@@ -193,7 +193,7 @@ async fn test_slot_health_with_no_sts() {
 
     // With no STs, slot_health() should return 0 rows
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.slot_health()")
+        .query_scalar("SELECT count(*) FROM pgtrickle.slot_health()")
         .await;
     assert_eq!(count, 0, "slot_health() with no STs should return 0 rows");
 }
@@ -256,7 +256,7 @@ async fn test_alter_source_drop_column_in_query() {
 
     // Refresh should fail since the defining query references a dropped column
     let result = db
-        .try_execute("SELECT pgstream.refresh_stream_table('drop_used_st')")
+        .try_execute("SELECT pgtrickle.refresh_stream_table('drop_used_st')")
         .await;
     assert!(
         result.is_err(),
@@ -311,17 +311,17 @@ async fn test_advisory_lock_blocks_concurrent_refresh() {
     let pool3 = db.pool.clone();
 
     let h1 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('lock_st')")
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('lock_st')")
             .execute(&pool1)
             .await
     });
     let h2 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('lock_st')")
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('lock_st')")
             .execute(&pool2)
             .await
     });
     let h3 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('lock_st')")
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('lock_st')")
             .execute(&pool3)
             .await
     });

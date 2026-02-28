@@ -1,17 +1,17 @@
 # SQL Reference
 
-Complete reference for all SQL functions, views, and catalog tables provided by pgstream.
+Complete reference for all SQL functions, views, and catalog tables provided by pgtrickle.
 
 ---
 
 ## Functions
 
-### pgstream.create_stream_table
+### pgtrickle.create_stream_table
 
 Create a new stream table.
 
 ```sql
-pgstream.create_stream_table(
+pgtrickle.create_stream_table(
     name          text,
     query         text,
     schedule text      DEFAULT '1m',
@@ -61,7 +61,7 @@ pgstream.create_stream_table(
 
 ```sql
 -- Duration-based: refresh when data is staler than 2 minutes
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_totals',
     'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
     '2m',
@@ -69,7 +69,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Cron-based: refresh every hour
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'hourly_summary',
     'SELECT date_trunc(''hour'', ts), COUNT(*) FROM events GROUP BY 1',
     '@hourly',
@@ -77,7 +77,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Cron-based: refresh at 6 AM on weekdays
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'daily_report',
     'SELECT region, SUM(revenue) AS total FROM sales GROUP BY region',
     '0 6 * * 1-5',
@@ -91,7 +91,7 @@ All supported aggregate functions work in both FULL and DIFFERENTIAL modes:
 
 ```sql
 -- Algebraic aggregates (fully differential — no rescan needed)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'sales_summary',
     'SELECT region, COUNT(*) AS cnt, SUM(amount) AS total, AVG(amount) AS avg_amount
      FROM orders GROUP BY region',
@@ -100,7 +100,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Semi-algebraic aggregates (MIN/MAX)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'salary_ranges',
     'SELECT department, MIN(salary) AS min_sal, MAX(salary) AS max_sal
      FROM employees GROUP BY department',
@@ -115,7 +115,7 @@ SELECT pgstream.create_stream_table(
 --                          CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY,
 --                          REGR_COUNT, REGR_INTERCEPT, REGR_R2, REGR_SLOPE,
 --                          REGR_SXX, REGR_SXY, REGR_SYY, ANY_VALUE)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'team_members',
     'SELECT department,
             STRING_AGG(name, '', '' ORDER BY name) AS members,
@@ -129,7 +129,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Bitwise aggregates
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'permission_summary',
     'SELECT department,
             BIT_OR(permissions) AS combined_perms,
@@ -142,7 +142,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- JSON object aggregates
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'config_map',
     'SELECT department,
             JSON_OBJECT_AGG(setting_name, setting_value) AS settings,
@@ -154,7 +154,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Statistical aggregates
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'salary_stats',
     'SELECT department,
             STDDEV_POP(salary) AS sd_pop,
@@ -168,7 +168,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Ordered-set aggregates (MODE, PERCENTILE_CONT, PERCENTILE_DISC)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'salary_percentiles',
     'SELECT department,
             MODE() WITHIN GROUP (ORDER BY grade) AS most_common_grade,
@@ -181,7 +181,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Regression / correlation aggregates (CORR, COVAR_*, REGR_*)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'regression_stats',
     'SELECT department,
             CORR(salary, experience) AS sal_exp_corr,
@@ -198,7 +198,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- ANY_VALUE aggregate (PostgreSQL 16+)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'dept_sample',
     'SELECT department, ANY_VALUE(office_location) AS sample_office
      FROM employees GROUP BY department',
@@ -207,7 +207,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- FILTER clause on aggregates
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_metrics',
     'SELECT region,
             COUNT(*) AS total,
@@ -226,7 +226,7 @@ Non-recursive CTEs are fully supported in both FULL and DIFFERENTIAL modes:
 
 ```sql
 -- Simple CTE
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'active_order_totals',
     'WITH active_users AS (
         SELECT id, name FROM users WHERE active = true
@@ -240,7 +240,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Chained CTEs (CTE referencing another CTE)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'top_regions',
     'WITH regional AS (
         SELECT region, SUM(amount) AS total FROM orders GROUP BY region
@@ -254,7 +254,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Multi-reference CTE (referenced twice in FROM — shared delta optimization)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'self_compare',
     'WITH totals AS (
         SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id
@@ -271,7 +271,7 @@ Recursive CTEs work with both FULL and DIFFERENTIAL modes:
 
 ```sql
 -- Recursive CTE (hierarchy traversal)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'category_tree',
     'WITH RECURSIVE cat_tree AS (
         SELECT id, name, parent_id, 0 AS depth
@@ -287,7 +287,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Recursive CTE with DIFFERENTIAL mode (incremental semi-naive / DRed)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'org_chart',
     'WITH RECURSIVE reports AS (
         SELECT id, name, manager_id FROM employees WHERE manager_id IS NULL
@@ -307,7 +307,7 @@ SELECT pgstream.create_stream_table(
 
 ```sql
 -- INTERSECT: customers who placed orders in BOTH regions
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'bi_region_customers',
     'SELECT customer_id FROM orders_east
      INTERSECT
@@ -317,7 +317,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- INTERSECT ALL: preserves duplicates (bag semantics)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'common_items',
     'SELECT item_name FROM warehouse_a
      INTERSECT ALL
@@ -327,7 +327,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- EXCEPT: orders not yet shipped
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'unshipped_orders',
     'SELECT order_id FROM orders
      EXCEPT
@@ -337,7 +337,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- EXCEPT ALL: preserves duplicate counts (bag subtraction)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'excess_inventory',
     'SELECT sku FROM stock_received
      EXCEPT ALL
@@ -347,7 +347,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- UNION: deduplicated merge of two sources
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'all_contacts',
     'SELECT email FROM customers
      UNION
@@ -363,7 +363,7 @@ Set-returning functions (SRFs) in the FROM clause are supported in both FULL and
 
 ```sql
 -- Flatten JSONB arrays into rows
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'flat_children',
     'SELECT p.id, child.value AS val
      FROM parent_data p,
@@ -373,7 +373,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Expand JSONB key-value pairs (multi-column SRF)
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'flat_properties',
     'SELECT d.id, kv.key, kv.value
      FROM documents d,
@@ -383,7 +383,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Unnest arrays
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'flat_tags',
     'SELECT t.id, tag.tag
      FROM tagged_items t,
@@ -393,7 +393,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- SRF with WHERE filter
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'high_value_items',
     'SELECT p.id, (e.value)::int AS amount
      FROM products p,
@@ -404,7 +404,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- SRF combined with aggregation
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'element_counts',
     'SELECT a.id, count(*) AS cnt
      FROM arrays a,
@@ -421,7 +421,7 @@ LATERAL subqueries in the FROM clause are supported in both FULL and DIFFERENTIA
 
 ```sql
 -- Top-N per group: latest item per order
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'latest_items',
     'SELECT o.id, o.customer, latest.amount
      FROM orders o,
@@ -437,7 +437,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Correlated aggregate
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'dept_summaries',
     'SELECT d.id, d.name, stats.total, stats.cnt
      FROM departments d,
@@ -451,7 +451,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- LEFT JOIN LATERAL: preserve outer rows with NULLs when subquery returns no rows
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'dept_stats_all',
     'SELECT d.id, d.name, stats.total
      FROM departments d
@@ -471,7 +471,7 @@ Subqueries in the `WHERE` clause are automatically transformed into semi-join, a
 
 ```sql
 -- EXISTS subquery: customers who have placed orders
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'active_customers',
     'SELECT c.id, c.name
      FROM customers c
@@ -481,7 +481,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- NOT EXISTS: customers with no orders
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'inactive_customers',
     'SELECT c.id, c.name
      FROM customers c
@@ -491,7 +491,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- IN subquery: products that have been ordered
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'ordered_products',
     'SELECT p.id, p.name
      FROM products p
@@ -501,7 +501,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- NOT IN subquery: products never ordered
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'unordered_products',
     'SELECT p.id, p.name
      FROM products p
@@ -511,7 +511,7 @@ SELECT pgstream.create_stream_table(
 );
 
 -- Scalar subquery in SELECT list
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'products_with_max_price',
     'SELECT p.id, p.name, (SELECT max(price) FROM products) AS max_price
      FROM products p',
@@ -536,12 +536,12 @@ SELECT pgstream.create_stream_table(
 
 ---
 
-### pgstream.alter_stream_table
+### pgtrickle.alter_stream_table
 
 Alter properties of an existing stream table.
 
 ```sql
-pgstream.alter_stream_table(
+pgtrickle.alter_stream_table(
     name          text,
     schedule text      DEFAULT NULL,
     refresh_mode  text      DEFAULT NULL,
@@ -562,28 +562,28 @@ pgstream.alter_stream_table(
 
 ```sql
 -- Change schedule
-SELECT pgstream.alter_stream_table('order_totals', schedule => '5m');
+SELECT pgtrickle.alter_stream_table('order_totals', schedule => '5m');
 
 -- Switch to full refresh mode
-SELECT pgstream.alter_stream_table('order_totals', refresh_mode => 'FULL');
+SELECT pgtrickle.alter_stream_table('order_totals', refresh_mode => 'FULL');
 
 -- Suspend a stream table
-SELECT pgstream.alter_stream_table('order_totals', status => 'SUSPENDED');
+SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');
 
 -- Resume a suspended stream table
-SELECT pgstream.resume_stream_table('order_totals');
+SELECT pgtrickle.resume_stream_table('order_totals');
 -- Or via alter_stream_table
-SELECT pgstream.alter_stream_table('order_totals', status => 'ACTIVE');
+SELECT pgtrickle.alter_stream_table('order_totals', status => 'ACTIVE');
 ```
 
 ---
 
-### pgstream.drop_stream_table
+### pgtrickle.drop_stream_table
 
 Drop a stream table, removing the storage table and all catalog entries.
 
 ```sql
-pgstream.drop_stream_table(name text) → void
+pgtrickle.drop_stream_table(name text) → void
 ```
 
 **Parameters:**
@@ -595,7 +595,7 @@ pgstream.drop_stream_table(name text) → void
 **Example:**
 
 ```sql
-SELECT pgstream.drop_stream_table('order_totals');
+SELECT pgtrickle.drop_stream_table('order_totals');
 ```
 
 **Notes:**
@@ -605,13 +605,13 @@ SELECT pgstream.drop_stream_table('order_totals');
 
 ---
 
-### pgstream.resume_stream_table
+### pgtrickle.resume_stream_table
 
 Resume a suspended stream table, clearing its consecutive error count and
 re-enabling automated and manual refreshes.
 
 ```sql
-pgstream.resume_stream_table(name text) → void
+pgtrickle.resume_stream_table(name text) → void
 ```
 
 **Parameters:**
@@ -624,23 +624,23 @@ pgstream.resume_stream_table(name text) → void
 
 ```sql
 -- Resume a stream table that was auto-suspended due to repeated errors
-SELECT pgstream.resume_stream_table('order_totals');
+SELECT pgtrickle.resume_stream_table('order_totals');
 ```
 
 **Notes:**
 - Errors if the ST is not in `SUSPENDED` state.
 - Resets `consecutive_errors` to `0` and sets `status = 'ACTIVE'`.
-- Emits a `resumed` event on the `pg_stream_alert` NOTIFY channel.
+- Emits a `resumed` event on the `pg_trickle_alert` NOTIFY channel.
 - After resuming, the scheduler will include the ST in its next cycle.
 
 ---
 
-### pgstream.refresh_stream_table
+### pgtrickle.refresh_stream_table
 
 Manually trigger a synchronous refresh of a stream table.
 
 ```sql
-pgstream.refresh_stream_table(name text) → void
+pgtrickle.refresh_stream_table(name text) → void
 ```
 
 **Parameters:**
@@ -652,23 +652,23 @@ pgstream.refresh_stream_table(name text) → void
 **Example:**
 
 ```sql
-SELECT pgstream.refresh_stream_table('order_totals');
+SELECT pgtrickle.refresh_stream_table('order_totals');
 ```
 
 **Notes:**
-- Blocked if the ST is `SUSPENDED` — use `pgstream.resume_stream_table(name)` first.
+- Blocked if the ST is `SUSPENDED` — use `pgtrickle.resume_stream_table(name)` first.
 - Uses an advisory lock to prevent concurrent refreshes of the same ST.
 - For `DIFFERENTIAL` mode, generates and applies a delta query. For `FULL` mode, truncates and reloads.
-- Records the refresh in `pgstream.pgs_refresh_history`.
+- Records the refresh in `pgtrickle.pgt_refresh_history`.
 
 ---
 
-### pgstream.pgs_status
+### pgtrickle.pgt_status
 
 Get the status of all stream tables.
 
 ```sql
-pgstream.pgs_status() → SETOF record(
+pgtrickle.pgt_status() → SETOF record(
     name                text,
     status              text,
     refresh_mode        text,
@@ -683,7 +683,7 @@ pgstream.pgs_status() → SETOF record(
 **Example:**
 
 ```sql
-SELECT * FROM pgstream.pgs_status();
+SELECT * FROM pgtrickle.pgt_status();
 ```
 
 | name | status | refresh_mode | is_populated | consecutive_errors | schedule | data_timestamp | staleness |
@@ -692,14 +692,14 @@ SELECT * FROM pgstream.pgs_status();
 
 ---
 
-### pgstream.st_refresh_stats
+### pgtrickle.st_refresh_stats
 
 Return per-ST refresh statistics aggregated from the refresh history.
 
 ```sql
-pgstream.st_refresh_stats() → SETOF record(
-    pgs_name                text,
-    pgs_schema              text,
+pgtrickle.st_refresh_stats() → SETOF record(
+    pgt_name                text,
+    pgt_schema              text,
     status                 text,
     refresh_mode           text,
     is_populated           bool,
@@ -720,18 +720,18 @@ pgstream.st_refresh_stats() → SETOF record(
 **Example:**
 
 ```sql
-SELECT pgs_name, status, total_refreshes, avg_duration_ms, stale
-FROM pgstream.st_refresh_stats();
+SELECT pgt_name, status, total_refreshes, avg_duration_ms, stale
+FROM pgtrickle.st_refresh_stats();
 ```
 
 ---
 
-### pgstream.get_refresh_history
+### pgtrickle.get_refresh_history
 
 Return refresh history for a specific stream table.
 
 ```sql
-pgstream.get_refresh_history(
+pgtrickle.get_refresh_history(
     name      text,
     max_rows  int  DEFAULT 20
 ) → SETOF record(
@@ -752,17 +752,17 @@ pgstream.get_refresh_history(
 
 ```sql
 SELECT action, status, rows_inserted, duration_ms
-FROM pgstream.get_refresh_history('order_totals', 5);
+FROM pgtrickle.get_refresh_history('order_totals', 5);
 ```
 
 ---
 
-### pgstream.get_staleness
+### pgtrickle.get_staleness
 
 Get the current staleness in seconds for a specific stream table.
 
 ```sql
-pgstream.get_staleness(name text) → float8
+pgtrickle.get_staleness(name text) → float8
 ```
 
 Returns `NULL` if the ST has never been refreshed.
@@ -770,18 +770,18 @@ Returns `NULL` if the ST has never been refreshed.
 **Example:**
 
 ```sql
-SELECT pgstream.get_staleness('order_totals');
+SELECT pgtrickle.get_staleness('order_totals');
 -- Returns: 12.345  (seconds since last refresh)
 ```
 
 ---
 
-### pgstream.slot_health
+### pgtrickle.slot_health
 
 Check replication slot health for all tracked CDC slots.
 
 ```sql
-pgstream.slot_health() → SETOF record(
+pgtrickle.slot_health() → SETOF record(
     slot_name          text,
     source_relid       bigint,
     active             bool,
@@ -793,21 +793,21 @@ pgstream.slot_health() → SETOF record(
 **Example:**
 
 ```sql
-SELECT * FROM pgstream.slot_health();
+SELECT * FROM pgtrickle.slot_health();
 ```
 
 | slot_name | source_relid | active | retained_wal_bytes | wal_status |
 |---|---|---|---|---|
-| pg_stream_slot_16384 | 16384 | false | 1048576 | reserved |
+| pg_trickle_slot_16384 | 16384 | false | 1048576 | reserved |
 
 ---
 
-### pgstream.check_cdc_health
+### pgtrickle.check_cdc_health
 
 Check CDC health for all tracked source tables. Returns per-source health status including the current CDC mode, replication slot details, estimated lag, and any alerts.
 
 ```sql
-pgstream.check_cdc_health() → SETOF record(
+pgtrickle.check_cdc_health() → SETOF record(
     source_relid   bigint,
     source_table   text,
     cdc_mode       text,
@@ -833,22 +833,22 @@ pgstream.check_cdc_health() → SETOF record(
 **Example:**
 
 ```sql
-SELECT * FROM pgstream.check_cdc_health();
+SELECT * FROM pgtrickle.check_cdc_health();
 ```
 
 | source_relid | source_table | cdc_mode | slot_name | lag_bytes | confirmed_lsn | alert |
 |---|---|---|---|---|---|---|
 | 16384 | public.orders | TRIGGER | | | | |
-| 16390 | public.events | WAL | pg_stream_slot_16390 | 524288 | 0/1A8B000 | |
+| 16390 | public.events | WAL | pg_trickle_slot_16390 | 524288 | 0/1A8B000 | |
 
 ---
 
-### pgstream.explain_st
+### pgtrickle.explain_st
 
 Explain the DVM plan for a stream table's defining query.
 
 ```sql
-pgstream.explain_st(name text) → SETOF record(
+pgtrickle.explain_st(name text) → SETOF record(
     property  text,
     value     text
 )
@@ -857,7 +857,7 @@ pgstream.explain_st(name text) → SETOF record(
 **Example:**
 
 ```sql
-SELECT * FROM pgstream.explain_st('order_totals');
+SELECT * FROM pgtrickle.explain_st('order_totals');
 ```
 
 | property | value |
@@ -870,12 +870,12 @@ SELECT * FROM pgstream.explain_st('order_totals');
 
 ---
 
-### pgstream.pg_stream_hash
+### pgtrickle.pg_trickle_hash
 
 Compute a 64-bit xxHash row ID from a text value.
 
 ```sql
-pgstream.pg_stream_hash(input text) → bigint
+pgtrickle.pg_trickle_hash(input text) → bigint
 ```
 
 Marked `IMMUTABLE, PARALLEL SAFE`.
@@ -883,18 +883,18 @@ Marked `IMMUTABLE, PARALLEL SAFE`.
 **Example:**
 
 ```sql
-SELECT pgstream.pg_stream_hash('some_key');
+SELECT pgtrickle.pg_trickle_hash('some_key');
 -- Returns: 1234567890123456789
 ```
 
 ---
 
-### pgstream.pg_stream_hash_multi
+### pgtrickle.pg_trickle_hash_multi
 
 Compute a row ID by hashing multiple text values (composite keys).
 
 ```sql
-pgstream.pg_stream_hash_multi(inputs text[]) → bigint
+pgtrickle.pg_trickle_hash_multi(inputs text[]) → bigint
 ```
 
 Marked `IMMUTABLE, PARALLEL SAFE`. Uses `\x1E` (record separator) between values and `\x00NULL\x00` for NULL entries.
@@ -902,14 +902,14 @@ Marked `IMMUTABLE, PARALLEL SAFE`. Uses `\x1E` (record separator) between values
 **Example:**
 
 ```sql
-SELECT pgstream.pg_stream_hash_multi(ARRAY['key1', 'key2']);
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY['key1', 'key2']);
 ```
 
 ---
 
 ## Expression Support
 
-pgstream's DVM parser supports a wide range of SQL expressions in defining queries. All expressions work in both `FULL` and `DIFFERENTIAL` modes.
+pgtrickle's DVM parser supports a wide range of SQL expressions in defining queries. All expressions work in both `FULL` and `DIFFERENTIAL` modes.
 
 ### Conditional Expressions
 
@@ -990,7 +990,7 @@ Subqueries are supported in the `WHERE` clause and `SELECT` list. They are parse
 
 ### Auto-Rewrite Pipeline
 
-pg_stream transparently rewrites certain SQL constructs before parsing. These rewrites are applied automatically and require no user action:
+pg_trickle transparently rewrites certain SQL constructs before parsing. These rewrites are applied automatically and require no user action:
 
 | Order | Trigger | Rewrite |
 |-------|---------|--------|
@@ -1006,28 +1006,28 @@ pg_stream transparently rewrites certain SQL constructs before parsing. These re
 `HAVING` is fully supported. The filter predicate is applied on top of the aggregate delta computation — groups that pass the HAVING condition are included in the stream table.
 
 ```sql
-SELECT pgstream.create_stream_table('big_departments',
+SELECT pgtrickle.create_stream_table('big_departments',
   'SELECT department, COUNT(*) AS cnt FROM employees GROUP BY department HAVING COUNT(*) > 10',
   '1m', 'DIFFERENTIAL');
 ```
 
 ### Tables Without Primary Keys (Keyless Tables)
 
-Tables without a primary key can be used as sources. pg_stream generates a content-based row identity
-by hashing all column values using `pg_stream_hash_multi()`. This allows DIFFERENTIAL mode to work,
+Tables without a primary key can be used as sources. pg_trickle generates a content-based row identity
+by hashing all column values using `pg_trickle_hash_multi()`. This allows DIFFERENTIAL mode to work,
 though at the cost of being unable to distinguish truly duplicate rows (rows with identical values in all columns).
 
 ```sql
--- No primary key — pg_stream uses content hashing for row identity
+-- No primary key — pg_trickle uses content hashing for row identity
 CREATE TABLE events (ts TIMESTAMPTZ, payload JSONB);
-SELECT pgstream.create_stream_table('event_summary',
+SELECT pgtrickle.create_stream_table('event_summary',
   'SELECT payload->>''type'' AS event_type, COUNT(*) FROM events GROUP BY 1',
   '1m', 'DIFFERENTIAL');
 ```
 
 ### Volatile Function Detection
 
-pg_stream checks all functions and operators in the defining query against `pg_proc.provolatile`:
+pg_trickle checks all functions and operators in the defining query against `pg_proc.provolatile`:
 
 - **VOLATILE** functions (e.g., `random()`, `now()`, `gen_random_uuid()`) are **rejected** in DIFFERENTIAL mode because they produce different results on each evaluation, breaking delta correctness.
 - **VOLATILE operators** — custom operators backed by volatile functions are also detected. The check resolves the operator’s implementation function via `pg_operator.oprcode` and checks its volatility in `pg_proc`.
@@ -1041,7 +1041,7 @@ FULL mode accepts all volatility classes since it re-evaluates the entire query 
 `COLLATE` clauses on expressions are supported:
 
 ```sql
-SELECT pgstream.create_stream_table('sorted_names',
+SELECT pgtrickle.create_stream_table('sorted_names',
   'SELECT name COLLATE "C" AS c_name FROM users',
   '1m', 'DIFFERENTIAL');
 ```
@@ -1052,12 +1052,12 @@ The `IS JSON` predicate validates whether a value is valid JSON. All variants ar
 
 ```sql
 -- Filter rows with valid JSON
-SELECT pgstream.create_stream_table('valid_json_events',
+SELECT pgtrickle.create_stream_table('valid_json_events',
   'SELECT id, payload FROM events WHERE payload::text IS JSON',
   '1m', 'DIFFERENTIAL');
 
 -- Type-specific checks
-SELECT pgstream.create_stream_table('json_objects_only',
+SELECT pgtrickle.create_stream_table('json_objects_only',
   'SELECT id, data IS JSON OBJECT AS is_obj,
           data IS JSON ARRAY AS is_arr,
           data IS JSON SCALAR AS is_scalar
@@ -1073,12 +1073,12 @@ SQL-standard JSON constructor functions are supported in both FULL and DIFFERENT
 
 ```sql
 -- JSON_OBJECT: construct a JSON object from key-value pairs
-SELECT pgstream.create_stream_table('user_json',
+SELECT pgtrickle.create_stream_table('user_json',
   'SELECT id, JSON_OBJECT(''name'' : name, ''age'' : age) AS data FROM users',
   '1m', 'DIFFERENTIAL');
 
 -- JSON_ARRAY: construct a JSON array from values
-SELECT pgstream.create_stream_table('value_arrays',
+SELECT pgtrickle.create_stream_table('value_arrays',
   'SELECT id, JSON_ARRAY(a, b, c) AS arr FROM measurements',
   '1m', 'FULL');
 
@@ -1095,7 +1095,7 @@ SELECT pgstream.create_stream_table('value_arrays',
 
 ```sql
 -- Extract structured data from a JSON column
-SELECT pgstream.create_stream_table('user_phones',
+SELECT pgtrickle.create_stream_table('user_phones',
   $$SELECT u.id, j.phone_type, j.phone_number
     FROM users u,
          JSON_TABLE(u.contact_info, '$.phones[*]'
@@ -1130,7 +1130,7 @@ The following are **rejected with clear error messages** rather than producing b
 
 ## Restrictions & Interoperability
 
-Stream tables are standard PostgreSQL heap tables stored in the `pgstream` schema with an additional `__pgs_row_id BIGINT PRIMARY KEY` column managed by the refresh engine. This section describes what you can and cannot do with them.
+Stream tables are standard PostgreSQL heap tables stored in the `pgtrickle` schema with an additional `__pgt_row_id BIGINT PRIMARY KEY` column managed by the refresh engine. This section describes what you can and cannot do with them.
 
 ### Referencing Other Stream Tables
 
@@ -1138,13 +1138,13 @@ Stream tables **can** reference other stream tables in their defining query. Thi
 
 ```sql
 -- ST1 reads from a base table
-SELECT pgstream.create_stream_table('order_totals',
+SELECT pgtrickle.create_stream_table('order_totals',
   'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
   '1m', 'DIFFERENTIAL');
 
 -- ST2 reads from ST1
-SELECT pgstream.create_stream_table('big_customers',
-  'SELECT customer_id, total FROM pgstream.order_totals WHERE total > 1000',
+SELECT pgtrickle.create_stream_table('big_customers',
+  'SELECT customer_id, total FROM pgtrickle.order_totals WHERE total > 1000',
   '1m', 'DIFFERENTIAL');
 ```
 
@@ -1157,7 +1157,7 @@ CREATE VIEW active_orders AS
   SELECT * FROM orders WHERE status = 'active';
 
 -- This works in DIFFERENTIAL mode:
-SELECT pgstream.create_stream_table('order_summary',
+SELECT pgtrickle.create_stream_table('order_summary',
   'SELECT customer_id, COUNT(*) FROM active_orders GROUP BY customer_id',
   '1m', 'DIFFERENTIAL');
 -- Internally, 'active_orders' is replaced with:
@@ -1176,7 +1176,7 @@ When a view is inlined, the user's original SQL is stored in the `original_query
 
 ### Partitioned Tables as Sources
 
-**Partitioned tables are fully supported** as source tables in both FULL and DIFFERENTIAL modes. CDC triggers are installed on the partitioned parent table, and PostgreSQL 13+ ensures the trigger fires for all DML routed to child partitions. The change buffer uses the parent table's OID (`pgstream_changes.changes_<parent_oid>`).
+**Partitioned tables are fully supported** as source tables in both FULL and DIFFERENTIAL modes. CDC triggers are installed on the partitioned parent table, and PostgreSQL 13+ ensures the trigger fires for all DML routed to child partitions. The change buffer uses the parent table's OID (`pgtrickle_changes.changes_<parent_oid>`).
 
 ```sql
 CREATE TABLE orders (
@@ -1186,18 +1186,18 @@ CREATE TABLE orders_us PARTITION OF orders FOR VALUES IN ('US');
 CREATE TABLE orders_eu PARTITION OF orders FOR VALUES IN ('EU');
 
 -- Works — inserts into any partition are captured:
-SELECT pgstream.create_stream_table('order_summary',
+SELECT pgtrickle.create_stream_table('order_summary',
   'SELECT region, SUM(amount) FROM orders GROUP BY region',
   '1m', 'DIFFERENTIAL');
 ```
 
-> **Note:** pg_stream targets PostgreSQL 18. On PostgreSQL 12 or earlier (not supported), parent triggers do **not** fire for partition-routed rows, which would cause silent data loss.
+> **Note:** pg_trickle targets PostgreSQL 18. On PostgreSQL 12 or earlier (not supported), parent triggers do **not** fire for partition-routed rows, which would cause silent data loss.
 
 ### Logical Replication Targets
 
 Tables that receive data via **logical replication** require special consideration. Changes arriving via replication do **not** fire normal row-level triggers, which means CDC triggers will miss those changes.
 
-pg_stream emits a **WARNING** at stream table creation time if any source table is detected as a logical replication target (via `pg_subscription_rel`).
+pg_trickle emits a **WARNING** at stream table creation time if any source table is detected as a logical replication target (via `pg_subscription_rel`).
 
 **Workarounds:**
 - Use `cdc_mode = 'wal'` for WAL-based CDC that captures all changes regardless of origin.
@@ -1211,7 +1211,7 @@ PostgreSQL views **can** reference stream tables. The view reflects the data as 
 ```sql
 CREATE VIEW top_customers AS
 SELECT customer_id, total
-FROM pgstream.order_totals
+FROM pgtrickle.order_totals
 WHERE total > 500
 ORDER BY total DESC;
 ```
@@ -1226,7 +1226,7 @@ Stream tables **can** be published for logical replication like any ordinary tab
 
 ```sql
 -- On publisher
-CREATE PUBLICATION my_pub FOR TABLE pgstream.order_totals;
+CREATE PUBLICATION my_pub FOR TABLE pgtrickle.order_totals;
 
 -- On subscriber
 CREATE SUBSCRIPTION my_sub
@@ -1235,10 +1235,10 @@ CREATE SUBSCRIPTION my_sub
 ```
 
 **Caveats:**
-- The `__pgs_row_id` column is replicated (it is the primary key), which is an internal implementation detail.
+- The `__pgt_row_id` column is replicated (it is the primary key), which is an internal implementation detail.
 - The subscriber receives materialized data, not the defining query. Refreshes on the publisher propagate as normal DML via logical replication.
-- Do **not** install pg_stream on the subscriber and attempt to refresh the replicated table — it will have no CDC triggers or catalog entries.
-- The internal change buffer tables (`pgstream_changes.changes_<oid>`) and catalog tables are **not** published by default; subscribers only receive the final output.
+- Do **not** install pg_trickle on the subscriber and attempt to refresh the replicated table — it will have no CDC triggers or catalog entries.
+- The internal change buffer tables (`pgtrickle_changes.changes_<oid>`) and catalog tables are **not** published by default; subscribers only receive the final output.
 
 ### Known Delta Computation Limitations
 
@@ -1252,7 +1252,7 @@ the delta query may fail to emit the required DELETE from the stream table:
 
 ```sql
 -- Stream table joining orders with customers
-SELECT pgstream.create_stream_table('order_details',
+SELECT pgtrickle.create_stream_table('order_details',
   'SELECT o.id, c.name FROM orders o JOIN customers c ON o.cust_id = c.id',
   '1m', 'DIFFERENTIAL');
 
@@ -1272,7 +1272,7 @@ partner and is silently dropped.
 **Mitigations:**
 - **Adaptive FULL fallback** (default): when the scheduler detects a high change volume, it switches
   to a full recompute, which will correct any stale rows. The threshold is configurable via
-  `pg_stream.adaptive_full_threshold`.
+  `pg_trickle.adaptive_full_threshold`.
 - **Avoid co-locating key-changing UPDATEs and DELETEs** in the same refresh interval. Stagger
   changes across multiple refresh cycles.
 - **FULL mode** for stream tables where join key changes and right-side deletes are expected to
@@ -1281,13 +1281,13 @@ partner and is silently dropped.
 #### CUBE/ROLLUP Expansion Limit
 
 `CUBE(a, b, c...n)` on **N** columns generates $2^N$ grouping set branches (a UNION ALL of N queries).
-pg_stream rejects CUBE/ROLLUP that would produce more than **64 branches** to prevent runaway
+pg_trickle rejects CUBE/ROLLUP that would produce more than **64 branches** to prevent runaway
 memory usage during query generation. Use explicit `GROUPING SETS(...)` instead:
 
 ```sql
 -- Rejected: CUBE(a, b, c, d, e, f, g) would generate 128 branches
 -- Use instead:
-SELECT pgstream.create_stream_table('multi_dim',
+SELECT pgtrickle.create_stream_table('multi_dim',
   'SELECT a, b, c, SUM(v) FROM t
    GROUP BY GROUPING SETS ((a, b, c), (a, b), (a), ())',
   '5m', 'DIFFERENTIAL');
@@ -1298,26 +1298,26 @@ SELECT pgstream.create_stream_table('multi_dim',
 | Operation | Restriction | Reason |
 |---|---|---|
 | Direct DML (`INSERT`, `UPDATE`, `DELETE`) | ❌ Not supported | Stream table contents are managed exclusively by the refresh engine. |
-| Direct DDL (`ALTER TABLE`) | ❌ Not supported | Use `pgstream.alter_stream_table()` to change the defining query or schedule. |
+| Direct DDL (`ALTER TABLE`) | ❌ Not supported | Use `pgtrickle.alter_stream_table()` to change the defining query or schedule. |
 | Foreign keys referencing or from a stream table | ❌ Not supported | The refresh engine performs bulk `MERGE` operations that do not respect FK ordering. |
-| User-defined triggers on stream tables | ✅ Supported (DIFFERENTIAL) | In DIFFERENTIAL mode, the refresh engine decomposes changes into explicit DELETE + UPDATE + INSERT statements so triggers fire with correct `TG_OP`, `OLD`, and `NEW`. Row-level triggers are suppressed during FULL refresh. Controlled by `pg_stream.user_triggers` GUC (default: `auto`). |
-| `TRUNCATE` on a stream table | ❌ Not supported | Use `pgstream.refresh_stream_table()` to reset data. |
+| User-defined triggers on stream tables | ✅ Supported (DIFFERENTIAL) | In DIFFERENTIAL mode, the refresh engine decomposes changes into explicit DELETE + UPDATE + INSERT statements so triggers fire with correct `TG_OP`, `OLD`, and `NEW`. Row-level triggers are suppressed during FULL refresh. Controlled by `pg_trickle.user_triggers` GUC (default: `auto`). |
+| `TRUNCATE` on a stream table | ❌ Not supported | Use `pgtrickle.refresh_stream_table()` to reset data. |
 
-> **Tip:** The `__pgs_row_id` column is visible but should be ignored by consuming queries — it is an implementation detail used for delta `MERGE` operations.
+> **Tip:** The `__pgt_row_id` column is visible but should be ignored by consuming queries — it is an implementation detail used for delta `MERGE` operations.
 
 ---
 
 ## Views
 
-### pgstream.stream_tables_info
+### pgtrickle.stream_tables_info
 
 Status overview with computed staleness information.
 
 ```sql
-SELECT * FROM pgstream.stream_tables_info;
+SELECT * FROM pgtrickle.stream_tables_info;
 ```
 
-Columns include all `pgstream.pgs_stream_tables` columns plus:
+Columns include all `pgtrickle.pgt_stream_tables` columns plus:
 
 | Column | Type | Description |
 |---|---|---|
@@ -1326,20 +1326,20 @@ Columns include all `pgstream.pgs_stream_tables` columns plus:
 
 ---
 
-### pgstream.pg_stat_stream_tables
+### pgtrickle.pg_stat_stream_tables
 
 Comprehensive monitoring view combining catalog metadata with aggregate refresh statistics.
 
 ```sql
-SELECT * FROM pgstream.pg_stat_stream_tables;
+SELECT * FROM pgtrickle.pg_stat_stream_tables;
 ```
 
 Key columns:
 
 | Column | Type | Description |
 |---|---|---|
-| `pgs_id` | `bigint` | Stream table ID |
-| `pgs_schema` / `pgs_name` | `text` | Schema and name |
+| `pgt_id` | `bigint` | Stream table ID |
+| `pgt_schema` / `pgt_name` | `text` | Schema and name |
 | `status` | `text` | INITIALIZING, ACTIVE, SUSPENDED, ERROR |
 | `refresh_mode` | `text` | FULL or DIFFERENTIAL |
 | `data_timestamp` | `timestamptz` | Timestamp of last refresh |
@@ -1355,16 +1355,16 @@ Key columns:
 
 ## Catalog Tables
 
-### pgstream.pgs_stream_tables
+### pgtrickle.pgt_stream_tables
 
 Core metadata for each stream table.
 
 | Column | Type | Description |
 |---|---|---|
-| `pgs_id` | `bigserial` | Primary key |
-| `pgs_relid` | `oid` | OID of the storage table |
-| `pgs_name` | `text` | Table name |
-| `pgs_schema` | `text` | Schema name |
+| `pgt_id` | `bigserial` | Primary key |
+| `pgt_relid` | `oid` | OID of the storage table |
+| `pgt_name` | `text` | Table name |
+| `pgt_schema` | `text` | Schema name |
 | `defining_query` | `text` | The SQL query that defines the ST |
 | `schedule` | `text` | Refresh schedule (duration or cron expression) |
 | `refresh_mode` | `text` | FULL or DIFFERENTIAL |
@@ -1379,13 +1379,13 @@ Core metadata for each stream table.
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last modification timestamp |
 
-### pgstream.pgs_dependencies
+### pgtrickle.pgt_dependencies
 
 DAG edges — records which source tables each ST depends on, including CDC mode metadata.
 
 | Column | Type | Description |
 |---|---|---|
-| `pgs_id` | `bigint` | FK to pgs_stream_tables |
+| `pgt_id` | `bigint` | FK to pgt_stream_tables |
 | `source_relid` | `oid` | OID of the source table |
 | `source_type` | `text` | TABLE, STREAM_TABLE, or VIEW |
 | `columns_used` | `text[]` | Which columns are referenced |
@@ -1394,14 +1394,14 @@ DAG edges — records which source tables each ST depends on, including CDC mode
 | `decoder_confirmed_lsn` | `pg_lsn` | WAL decoder's last confirmed position |
 | `transition_started_at` | `timestamptz` | When the trigger→WAL transition started |
 
-### pgstream.pgs_refresh_history
+### pgtrickle.pgt_refresh_history
 
 Audit log of all refresh operations.
 
 | Column | Type | Description |
 |---|---|---|
 | `refresh_id` | `bigserial` | Primary key |
-| `pgs_id` | `bigint` | FK to pgs_stream_tables |
+| `pgt_id` | `bigint` | FK to pgt_stream_tables |
 | `data_timestamp` | `timestamptz` | Data timestamp of the refresh |
 | `start_time` | `timestamptz` | When the refresh started |
 | `end_time` | `timestamptz` | When it completed |
@@ -1413,7 +1413,7 @@ Audit log of all refresh operations.
 | `initiated_by` | `text` | What triggered: SCHEDULER, MANUAL, or INITIAL |
 | `freshness_deadline` | `timestamptz` | SLA deadline (duration schedules only; NULL for cron) |
 
-### pgstream.pgs_change_tracking
+### pgtrickle.pgt_change_tracking
 
 CDC slot tracking per source table.
 
@@ -1422,4 +1422,4 @@ CDC slot tracking per source table.
 | `source_relid` | `oid` | OID of the tracked source table |
 | `slot_name` | `text` | Logical replication slot name |
 | `last_consumed_lsn` | `pg_lsn` | Last consumed WAL position |
-| `tracked_by_pgs_ids` | `bigint[]` | Array of ST IDs depending on this source |
+| `tracked_by_pgt_ids` | `bigint[]` | Array of ST IDs depending on this source |

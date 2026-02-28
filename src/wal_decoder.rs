@@ -10,7 +10,7 @@
 //! The WAL decoder uses a **polling** approach via SPI:
 //! - Calls `pg_logical_slot_get_changes()` during the scheduler tick
 //! - Decodes `pgoutput` protocol messages into typed buffer table rows
-//! - Writes changes to the same `pgstream_changes.changes_<oid>` tables
+//! - Writes changes to the same `pgtrickle_changes.changes_<oid>` tables
 //!   used by trigger-based CDC
 //!
 //! # Transition Lifecycle
@@ -31,26 +31,26 @@
 //! - `wal_level = logical` in `postgresql.conf`
 //! - Available replication slots (`max_replication_slots`)
 //! - Source table has REPLICA IDENTITY DEFAULT (PK) or FULL
-//! - `pg_stream.cdc_mode` set to `'auto'` or `'wal'`
+//! - `pg_trickle.cdc_mode` set to `'auto'` or `'wal'`
 
 use pgrx::prelude::*;
 
 use crate::catalog::{CdcMode, StDependency};
 use crate::cdc;
 use crate::config;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::monitor;
 
 // ── Naming Conventions ─────────────────────────────────────────────────────
 
-/// Replication slot name for a source table: `pgstream_<oid>`.
+/// Replication slot name for a source table: `pgtrickle_<oid>`.
 pub fn slot_name_for_source(source_oid: pg_sys::Oid) -> String {
-    format!("pgstream_{}", source_oid.to_u32())
+    format!("pgtrickle_{}", source_oid.to_u32())
 }
 
-/// Publication name for a source table: `pgstream_cdc_<oid>`.
+/// Publication name for a source table: `pgtrickle_cdc_<oid>`.
 pub fn publication_name_for_source(source_oid: pg_sys::Oid) -> String {
-    format!("pgstream_cdc_{}", source_oid.to_u32())
+    format!("pgtrickle_cdc_{}", source_oid.to_u32())
 }
 
 // ── Publication Management ─────────────────────────────────────────────────
@@ -60,15 +60,18 @@ pub fn publication_name_for_source(source_oid: pg_sys::Oid) -> String {
 /// Publications tell `pgoutput` which tables to include in the change stream.
 /// Each tracked source gets its own publication for independent lifecycle
 /// management.
-pub fn create_publication(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> {
+pub fn create_publication(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
     let pub_name = publication_name_for_source(source_oid);
 
     // Get the fully-qualified source table name
     let source_table =
         Spi::get_one_with_args::<String>("SELECT $1::oid::regclass::text", &[source_oid.into()])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
             .ok_or_else(|| {
-                PgStreamError::NotFound(format!("Table with OID {} not found", source_oid.to_u32()))
+                PgTrickleError::NotFound(format!(
+                    "Table with OID {} not found",
+                    source_oid.to_u32()
+                ))
             })?;
 
     // Create publication if it doesn't already exist.
@@ -77,7 +80,7 @@ pub fn create_publication(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> 
         "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
         &[pub_name.as_str().into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or(false);
 
     if !exists {
@@ -87,7 +90,7 @@ pub fn create_publication(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> 
             source_table,
         );
         Spi::run(&sql).map_err(|e| {
-            PgStreamError::WalTransitionError(format!(
+            PgTrickleError::WalTransitionError(format!(
                 "Failed to create publication {}: {}",
                 pub_name, e
             ))
@@ -100,11 +103,14 @@ pub fn create_publication(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> 
 /// Drop a publication for a source table.
 ///
 /// Safe to call even if the publication doesn't exist (uses IF EXISTS).
-pub fn drop_publication(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> {
+pub fn drop_publication(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
     let pub_name = publication_name_for_source(source_oid);
     let sql = format!("DROP PUBLICATION IF EXISTS {}", quote_ident(&pub_name));
     Spi::run(&sql).map_err(|e| {
-        PgStreamError::WalTransitionError(format!("Failed to drop publication {}: {}", pub_name, e))
+        PgTrickleError::WalTransitionError(format!(
+            "Failed to drop publication {}: {}",
+            pub_name, e
+        ))
     })?;
     Ok(())
 }
@@ -118,13 +124,13 @@ pub fn drop_publication(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> {
 ///
 /// The slot captures WAL from the moment of creation, ensuring no changes
 /// are missed between slot creation and the first poll.
-pub fn create_replication_slot(slot_name: &str) -> Result<String, PgStreamError> {
+pub fn create_replication_slot(slot_name: &str) -> Result<String, PgTrickleError> {
     // Check if slot already exists
     let exists = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
         &[slot_name.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or(false);
 
     if exists {
@@ -133,7 +139,7 @@ pub fn create_replication_slot(slot_name: &str) -> Result<String, PgStreamError>
             "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
             &[slot_name.into()],
         )
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
         .unwrap_or_else(|| "0/0".to_string());
 
         return Ok(lsn);
@@ -145,7 +151,7 @@ pub fn create_replication_slot(slot_name: &str) -> Result<String, PgStreamError>
         &[slot_name.into()],
     )
     .map_err(|e| {
-        PgStreamError::ReplicationSlotError(format!(
+        PgTrickleError::ReplicationSlotError(format!(
             "Failed to create replication slot '{}': {}",
             slot_name, e
         ))
@@ -158,18 +164,18 @@ pub fn create_replication_slot(slot_name: &str) -> Result<String, PgStreamError>
 /// Drop a logical replication slot.
 ///
 /// Safe to call even if the slot doesn't exist (checks first).
-pub fn drop_replication_slot(slot_name: &str) -> Result<(), PgStreamError> {
+pub fn drop_replication_slot(slot_name: &str) -> Result<(), PgTrickleError> {
     let exists = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
         &[slot_name.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or(false);
 
     if exists {
         Spi::run_with_args("SELECT pg_drop_replication_slot($1)", &[slot_name.into()]).map_err(
             |e| {
-                PgStreamError::ReplicationSlotError(format!(
+                PgTrickleError::ReplicationSlotError(format!(
                     "Failed to drop replication slot '{}': {}",
                     slot_name, e
                 ))
@@ -184,24 +190,24 @@ pub fn drop_replication_slot(slot_name: &str) -> Result<(), PgStreamError> {
 ///
 /// Returns the LSN up to which the slot consumer has confirmed processing.
 /// Returns `None` if the slot doesn't exist.
-pub fn get_slot_confirmed_lsn(slot_name: &str) -> Result<Option<String>, PgStreamError> {
+pub fn get_slot_confirmed_lsn(slot_name: &str) -> Result<Option<String>, PgTrickleError> {
     Spi::get_one_with_args::<String>(
         "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
         &[slot_name.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
 }
 
 /// Get the lag in bytes between a slot's confirmed LSN and the current WAL position.
 ///
 /// A high lag indicates the decoder is falling behind.
-pub fn get_slot_lag_bytes(slot_name: &str) -> Result<i64, PgStreamError> {
+pub fn get_slot_lag_bytes(slot_name: &str) -> Result<i64, PgTrickleError> {
     Spi::get_one_with_args::<i64>(
         "SELECT (pg_current_wal_lsn() - confirmed_flush_lsn)::bigint \
          FROM pg_replication_slots WHERE slot_name = $1",
         &[slot_name.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
     .map(|v| v.unwrap_or(0))
 }
 
@@ -217,7 +223,7 @@ const MAX_CHANGES_PER_POLL: i64 = 10_000;
 ///
 /// Uses `pg_logical_slot_get_changes()` with the `pgoutput` plugin to
 /// retrieve decoded WAL changes. Each change is parsed and inserted into
-/// the appropriate `pgstream_changes.changes_<oid>` buffer table.
+/// the appropriate `pgtrickle_changes.changes_<oid>` buffer table.
 ///
 /// The `pgoutput` data format provides structured output that we parse
 /// to extract action type, column values, and LSN information.
@@ -235,7 +241,7 @@ pub fn poll_wal_changes(
     change_schema: &str,
     pk_columns: &[String],
     columns: &[(String, String)],
-) -> Result<(i64, Option<String>), PgStreamError> {
+) -> Result<(i64, Option<String>), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
     let pub_name = publication_name_for_source(source_oid);
 
@@ -259,16 +265,16 @@ pub fn poll_wal_changes(
     Spi::connect(|client| {
         let result = client
             .select(&poll_sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         for row in result {
             let lsn = row
                 .get::<String>(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
             let data = row
                 .get::<String>(3)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
 
             // Parse the pgoutput data and determine if it's relevant to our source
@@ -280,7 +286,7 @@ pub fn poll_wal_changes(
                 if action != 'T' {
                     let parsed = parse_pgoutput_columns(&data);
                     if detect_schema_mismatch(&parsed, columns) {
-                        return Err(PgStreamError::WalTransitionError(format!(
+                        return Err(PgTrickleError::WalTransitionError(format!(
                             "Schema change detected for source OID {} — \
                              decoded columns don't match expected columns",
                             oid_u32
@@ -304,7 +310,7 @@ pub fn poll_wal_changes(
             last_lsn = Some(lsn);
         }
 
-        Ok::<(), PgStreamError>(())
+        Ok::<(), PgTrickleError>(())
     })?;
 
     Ok((count, last_lsn))
@@ -387,7 +393,7 @@ fn write_decoded_change(
     change_schema: &str,
     pk_columns: &[String],
     columns: &[(String, String)],
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     // Handle TRUNCATE specially — mark downstream STs for reinit
     if *action == 'T' {
         mark_downstream_for_reinit(pg_sys::Oid::from(source_oid))?;
@@ -461,7 +467,7 @@ fn write_decoded_change(
     );
 
     Spi::run(&sql).map_err(|e| {
-        PgStreamError::WalTransitionError(format!(
+        PgTrickleError::WalTransitionError(format!(
             "Failed to write decoded WAL change to buffer: {}",
             e
         ))
@@ -484,7 +490,7 @@ fn build_pk_hash_from_values(
 
     if pk_columns.len() == 1 {
         if let Some(val) = parsed.get(&pk_columns[0]) {
-            format!("pgstream.pg_stream_hash('{}')", val.replace('\'', "''"))
+            format!("pgtrickle.pg_trickle_hash('{}')", val.replace('\'', "''"))
         } else {
             "0".to_string()
         }
@@ -500,7 +506,7 @@ fn build_pk_hash_from_values(
             })
             .collect();
         format!(
-            "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
             array_items.join(", ")
         )
     }
@@ -511,20 +517,20 @@ fn build_pk_hash_from_values(
 /// Called when a TRUNCATE is detected via WAL decoding. Since TRUNCATE
 /// invalidates all existing change tracking, downstream STs need a
 /// full refresh to resync.
-fn mark_downstream_for_reinit(source_oid: pg_sys::Oid) -> Result<(), PgStreamError> {
+fn mark_downstream_for_reinit(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
     Spi::run_with_args(
-        "UPDATE pgstream.pgs_stream_tables \
+        "UPDATE pgtrickle.pgt_stream_tables \
          SET needs_reinit = true, updated_at = now() \
-         WHERE pgs_id IN ( \
-             SELECT pgs_id FROM pgstream.pgs_dependencies \
+         WHERE pgt_id IN ( \
+             SELECT pgt_id FROM pgtrickle.pgt_dependencies \
              WHERE source_relid = $1 \
          )",
         &[source_oid.into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     warning!(
-        "pg_stream: TRUNCATE detected on source OID {} via WAL — downstream STs marked for reinit",
+        "pg_trickle: TRUNCATE detected on source OID {} via WAL — downstream STs marked for reinit",
         source_oid.to_u32()
     );
 
@@ -536,7 +542,7 @@ fn mark_downstream_for_reinit(source_oid: pg_sys::Oid) -> Result<(), PgStreamErr
 /// Start the transition from trigger-based to WAL-based CDC for a source table.
 ///
 /// This is called by the scheduler when it detects that:
-/// - `pg_stream.cdc_mode` is `'auto'` or `'wal'`
+/// - `pg_trickle.cdc_mode` is `'auto'` or `'wal'`
 /// - `wal_level = logical`
 /// - The source has adequate REPLICA IDENTITY
 /// - The source is currently using trigger-based CDC
@@ -548,9 +554,9 @@ fn mark_downstream_for_reinit(source_oid: pg_sys::Oid) -> Result<(), PgStreamErr
 /// 4. Update the dependency catalog to TRANSITIONING mode
 pub fn start_wal_transition(
     source_oid: pg_sys::Oid,
-    pgs_id: i64,
+    pgt_id: i64,
     _change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
     let slot_name = slot_name_for_source(source_oid);
 
@@ -568,7 +574,7 @@ pub fn start_wal_transition(
 
     // Step 4: Update catalog — mark as TRANSITIONING
     StDependency::update_cdc_mode(
-        pgs_id,
+        pgt_id,
         source_oid,
         CdcMode::Transitioning,
         Some(&slot_name),
@@ -576,7 +582,7 @@ pub fn start_wal_transition(
     )?;
 
     info!(
-        "pg_stream: started WAL transition for source OID {} \
+        "pg_trickle: started WAL transition for source OID {} \
          (slot: {}, handoff LSN: {}, slot LSN: {})",
         oid_u32, slot_name, handoff_lsn, slot_lsn
     );
@@ -601,10 +607,10 @@ pub fn start_wal_transition(
 /// If the transition has timed out, falls back to trigger-based CDC.
 pub fn check_and_complete_transition(
     source_oid: pg_sys::Oid,
-    pgs_id: i64,
+    pgt_id: i64,
     dep: &StDependency,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let default_slot = slot_name_for_source(source_oid);
     let slot_name = dep.slot_name.as_deref().unwrap_or(&default_slot);
 
@@ -616,7 +622,7 @@ pub fn check_and_complete_transition(
 
     if lag_bytes <= MAX_LAG_BYTES {
         // Decoder has caught up — complete the transition
-        complete_wal_transition(source_oid, pgs_id, change_schema)?;
+        complete_wal_transition(source_oid, pgt_id, change_schema)?;
         return Ok(());
     }
 
@@ -625,22 +631,22 @@ pub fn check_and_complete_transition(
         let timed_out = Spi::get_one_with_args::<bool>(
             &format!(
                 "SELECT (now() - $1::timestamptz) > interval '{} seconds'",
-                config::pg_stream_wal_transition_timeout()
+                config::pg_trickle_wal_transition_timeout()
             ),
             &[started_at.as_str().into()],
         )
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
         .unwrap_or(false);
 
         if timed_out {
             warning!(
-                "pg_stream: WAL transition timed out for source OID {} \
+                "pg_trickle: WAL transition timed out for source OID {} \
                  (lag: {} bytes after {}s); falling back to triggers",
                 source_oid.to_u32(),
                 lag_bytes,
-                config::pg_stream_wal_transition_timeout()
+                config::pg_trickle_wal_transition_timeout()
             );
-            abort_wal_transition(source_oid, pgs_id, change_schema)?;
+            abort_wal_transition(source_oid, pgt_id, change_schema)?;
         }
     }
 
@@ -652,19 +658,19 @@ pub fn check_and_complete_transition(
 /// Called when the WAL decoder has caught up past the handoff point.
 fn complete_wal_transition(
     source_oid: pg_sys::Oid,
-    pgs_id: i64,
+    pgt_id: i64,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
 
     // Step 1: Drop the CDC trigger (WAL decoder now covers all changes)
     cdc::drop_change_trigger(source_oid, change_schema)?;
 
     // Step 2: Update catalog to WAL mode
-    StDependency::update_cdc_mode(pgs_id, source_oid, CdcMode::Wal, None, None)?;
+    StDependency::update_cdc_mode(pgt_id, source_oid, CdcMode::Wal, None, None)?;
 
     info!(
-        "pg_stream: completed WAL transition for source OID {} — trigger dropped, WAL active",
+        "pg_trickle: completed WAL transition for source OID {} — trigger dropped, WAL active",
         oid_u32
     );
 
@@ -686,16 +692,16 @@ fn complete_wal_transition(
 /// Cleans up WAL decoder resources and reverts to trigger mode.
 pub fn abort_wal_transition(
     source_oid: pg_sys::Oid,
-    pgs_id: i64,
+    pgt_id: i64,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
     let slot_name = slot_name_for_source(source_oid);
 
     // Step 1: Drop the replication slot (stops WAL retention)
     if let Err(e) = drop_replication_slot(&slot_name) {
         warning!(
-            "pg_stream: failed to drop replication slot {} during abort: {}",
+            "pg_trickle: failed to drop replication slot {} during abort: {}",
             slot_name,
             e
         );
@@ -704,14 +710,14 @@ pub fn abort_wal_transition(
     // Step 2: Drop the publication
     if let Err(e) = drop_publication(source_oid) {
         warning!(
-            "pg_stream: failed to drop publication during abort for OID {}: {}",
+            "pg_trickle: failed to drop publication during abort for OID {}: {}",
             oid_u32,
             e
         );
     }
 
     // Step 3: Revert catalog to trigger mode
-    StDependency::update_cdc_mode(pgs_id, source_oid, CdcMode::Trigger, None, None)?;
+    StDependency::update_cdc_mode(pgt_id, source_oid, CdcMode::Trigger, None, None)?;
 
     // Step 4: Verify the trigger still exists — recreate if lost
     if !cdc::trigger_exists(source_oid)? {
@@ -719,13 +725,13 @@ pub fn abort_wal_transition(
         let columns = cdc::resolve_source_column_defs(source_oid)?;
         cdc::create_change_trigger(source_oid, change_schema, &pk_columns, &columns)?;
         warning!(
-            "pg_stream: recreated CDC trigger for source OID {} during abort",
+            "pg_trickle: recreated CDC trigger for source OID {} during abort",
             oid_u32
         );
     }
 
     warning!(
-        "pg_stream: aborted WAL transition for source OID {}; reverted to triggers",
+        "pg_trickle: aborted WAL transition for source OID {}; reverted to triggers",
         oid_u32
     );
 
@@ -739,15 +745,15 @@ pub fn abort_wal_transition(
 
 /// Advance WAL transitions and poll changes for WAL-mode sources.
 ///
-/// Called from the scheduler tick when `pg_stream.cdc_mode != 'trigger'`.
+/// Called from the scheduler tick when `pg_trickle.cdc_mode != 'trigger'`.
 /// Processes all dependency edges and handles each CDC mode:
 ///
 /// - **TRIGGER**: Check if transition should start
 /// - **TRANSITIONING**: Poll WAL changes + check completion/timeout
 /// - **WAL**: Poll WAL changes + check decoder health
-pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgStreamError> {
+pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError> {
     // Only process if CDC mode allows WAL
-    let cdc_mode = config::pg_stream_cdc_mode();
+    let cdc_mode = config::pg_trickle_cdc_mode();
     if cdc_mode == "trigger" {
         return Ok(());
     }
@@ -775,7 +781,7 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgStreamError>
                 // Check if we should start a WAL transition
                 if let Err(e) = try_start_transition(dep, change_schema) {
                     log!(
-                        "pg_stream: failed to start WAL transition for source OID {}: {}",
+                        "pg_trickle: failed to start WAL transition for source OID {}: {}",
                         source_key,
                         e
                     );
@@ -785,17 +791,17 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgStreamError>
                 // Poll WAL changes (both trigger and WAL are active)
                 if let Err(e) = poll_source_changes(dep, change_schema) {
                     log!(
-                        "pg_stream: WAL poll error for transitioning source OID {}: {}",
+                        "pg_trickle: WAL poll error for transitioning source OID {}: {}",
                         source_key,
                         e
                     );
                 }
                 // Check if transition is complete or timed out
                 if let Err(e) =
-                    check_and_complete_transition(dep.source_relid, dep.pgs_id, dep, change_schema)
+                    check_and_complete_transition(dep.source_relid, dep.pgt_id, dep, change_schema)
                 {
                     log!(
-                        "pg_stream: transition check error for source OID {}: {}",
+                        "pg_trickle: transition check error for source OID {}: {}",
                         source_key,
                         e
                     );
@@ -805,7 +811,7 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgStreamError>
                 // Poll WAL changes (steady-state WAL mode)
                 if let Err(e) = poll_source_changes(dep, change_schema) {
                     warning!(
-                        "pg_stream: WAL poll error for source OID {} — may need fallback: {}",
+                        "pg_trickle: WAL poll error for source OID {} — may need fallback: {}",
                         source_key,
                         e
                     );
@@ -821,7 +827,7 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgStreamError>
 }
 
 /// Try to start a WAL transition for a source currently using triggers.
-fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), PgStreamError> {
+fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), PgTrickleError> {
     // Check prerequisites
     if !cdc::can_use_logical_replication()? {
         return Ok(()); // WAL not available, stay on triggers
@@ -829,20 +835,20 @@ fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), P
 
     if !cdc::check_replica_identity(dep.source_relid)? {
         log!(
-            "pg_stream: source OID {} has inadequate REPLICA IDENTITY for WAL CDC — staying on triggers",
+            "pg_trickle: source OID {} has inadequate REPLICA IDENTITY for WAL CDC — staying on triggers",
             dep.source_relid.to_u32()
         );
         return Ok(());
     }
 
     // All prerequisites met — start the transition
-    start_wal_transition(dep.source_relid, dep.pgs_id, change_schema)?;
+    start_wal_transition(dep.source_relid, dep.pgt_id, change_schema)?;
 
     Ok(())
 }
 
 /// Poll WAL changes for a source that's in TRANSITIONING or WAL mode.
-fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), PgStreamError> {
+fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), PgTrickleError> {
     let slot_name = match &dep.slot_name {
         Some(name) => name.clone(),
         None => slot_name_for_source(dep.source_relid),
@@ -864,7 +870,7 @@ fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), Pg
     // Update the decoder confirmed LSN in the catalog
     if let Some(ref lsn) = last_lsn {
         StDependency::update_cdc_mode(
-            dep.pgs_id,
+            dep.pgt_id,
             dep.source_relid,
             dep.cdc_mode,
             dep.slot_name.as_deref(),
@@ -874,7 +880,7 @@ fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), Pg
 
     if count > 0 {
         log!(
-            "pg_stream: polled {} WAL changes for source OID {} (last LSN: {})",
+            "pg_trickle: polled {} WAL changes for source OID {} (last LSN: {})",
             count,
             dep.source_relid.to_u32(),
             last_lsn.as_deref().unwrap_or("none")
@@ -890,9 +896,9 @@ fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), Pg
 /// If the slot is missing or lag is excessive, attempts recovery.
 pub fn check_decoder_health(
     source_oid: pg_sys::Oid,
-    pgs_id: i64,
+    pgt_id: i64,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let slot_name = slot_name_for_source(source_oid);
 
     // Check if the slot still exists
@@ -900,17 +906,17 @@ pub fn check_decoder_health(
         "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
         &[slot_name.as_str().into()],
     )
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or(false);
 
     if !slot_exists {
         warning!(
-            "pg_stream: replication slot '{}' for source OID {} is missing — \
+            "pg_trickle: replication slot '{}' for source OID {} is missing — \
              falling back to triggers",
             slot_name,
             source_oid.to_u32()
         );
-        abort_wal_transition(source_oid, pgs_id, change_schema)?;
+        abort_wal_transition(source_oid, pgt_id, change_schema)?;
         return Ok(());
     }
 
@@ -920,7 +926,7 @@ pub fn check_decoder_health(
 
     if lag_bytes > WARN_LAG_BYTES {
         warning!(
-            "pg_stream: WAL decoder for source OID {} has excessive lag: {} bytes",
+            "pg_trickle: WAL decoder for source OID {} has excessive lag: {} bytes",
             source_oid.to_u32(),
             lag_bytes
         );
@@ -974,25 +980,25 @@ mod tests {
     #[test]
     fn test_slot_name_for_source() {
         let oid = pg_sys::Oid::from(16384u32);
-        assert_eq!(slot_name_for_source(oid), "pgstream_16384");
+        assert_eq!(slot_name_for_source(oid), "pgtrickle_16384");
     }
 
     #[test]
     fn test_slot_name_for_source_zero() {
         let oid = pg_sys::Oid::from(0u32);
-        assert_eq!(slot_name_for_source(oid), "pgstream_0");
+        assert_eq!(slot_name_for_source(oid), "pgtrickle_0");
     }
 
     #[test]
     fn test_publication_name_for_source() {
         let oid = pg_sys::Oid::from(16384u32);
-        assert_eq!(publication_name_for_source(oid), "pgstream_cdc_16384");
+        assert_eq!(publication_name_for_source(oid), "pgtrickle_cdc_16384");
     }
 
     #[test]
     fn test_publication_name_for_source_large_oid() {
         let oid = pg_sys::Oid::from(4294967295u32);
-        assert_eq!(publication_name_for_source(oid), "pgstream_cdc_4294967295");
+        assert_eq!(publication_name_for_source(oid), "pgtrickle_cdc_4294967295");
     }
 
     // ── quote_ident tests ──────────────────────────────────────────
@@ -1098,7 +1104,7 @@ mod tests {
         let mut parsed = std::collections::HashMap::new();
         parsed.insert("id".to_string(), "42".to_string());
         let result = build_pk_hash_from_values(&pk, &parsed);
-        assert!(result.contains("pg_stream_hash"));
+        assert!(result.contains("pg_trickle_hash"));
         assert!(result.contains("42"));
     }
 
@@ -1109,7 +1115,7 @@ mod tests {
         parsed.insert("a".to_string(), "1".to_string());
         parsed.insert("b".to_string(), "2".to_string());
         let result = build_pk_hash_from_values(&pk, &parsed);
-        assert!(result.contains("pg_stream_hash_multi"));
+        assert!(result.contains("pg_trickle_hash_multi"));
         assert!(result.contains("'1'"));
         assert!(result.contains("'2'"));
     }

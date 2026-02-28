@@ -3,8 +3,8 @@
 **Status:** Reference document (periodically updated)  
 **Date:** 2025-02-21
 **Branch:** `main`
-**Scope:** All SQL constructs that produce incorrect results, broken delta SQL, or rejection errors in the pg_stream parser and differential view maintenance engine.
-**Last Updated:** 2026-02-24 — Hybrid CDC (trigger → WAL transition), user-defined trigger support on stream tables, `needs_pgs_count()` fix for HAVING + aggregates. 25 aggregate functions in DIFFERENTIAL mode. 872 unit tests, 22 E2E test suites passing.
+**Scope:** All SQL constructs that produce incorrect results, broken delta SQL, or rejection errors in the pg_trickle parser and differential view maintenance engine.
+**Last Updated:** 2026-02-24 — Hybrid CDC (trigger → WAL transition), user-defined trigger support on stream tables, `needs_pgt_count()` fix for HAVING + aggregates. 25 aggregate functions in DIFFERENTIAL mode. 872 unit tests, 22 E2E test suites passing.
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## Executive Summary
 
-pg_stream supports a substantial core of SQL for both FULL and DIFFERENTIAL refresh modes: table scans, projections, WHERE/HAVING filtering, INNER/LEFT/RIGHT/FULL OUTER JOIN (including nested 3+ table joins), GROUP BY with COUNT/SUM/AVG/MIN/MAX/BOOL_AND/BOOL_OR/STRING_AGG/ARRAY_AGG/JSON_AGG/JSONB_AGG/BIT_AND/BIT_OR/BIT_XOR/JSON_OBJECT_AGG/JSONB_OBJECT_AGG/STDDEV_POP/STDDEV_SAMP/VAR_POP/VAR_SAMP/MODE/PERCENTILE_CONT/PERCENTILE_DISC (including FILTER and WITHIN GROUP clauses), DISTINCT, set operations (UNION ALL/UNION/INTERSECT/EXCEPT), non-recursive and recursive CTEs, window functions (with frame clauses and named windows), LATERAL set-returning functions, and LATERAL subqueries.
+pg_trickle supports a substantial core of SQL for both FULL and DIFFERENTIAL refresh modes: table scans, projections, WHERE/HAVING filtering, INNER/LEFT/RIGHT/FULL OUTER JOIN (including nested 3+ table joins), GROUP BY with COUNT/SUM/AVG/MIN/MAX/BOOL_AND/BOOL_OR/STRING_AGG/ARRAY_AGG/JSON_AGG/JSONB_AGG/BIT_AND/BIT_OR/BIT_XOR/JSON_OBJECT_AGG/JSONB_OBJECT_AGG/STDDEV_POP/STDDEV_SAMP/VAR_POP/VAR_SAMP/MODE/PERCENTILE_CONT/PERCENTILE_DISC (including FILTER and WITHIN GROUP clauses), DISTINCT, set operations (UNION ALL/UNION/INTERSECT/EXCEPT), non-recursive and recursive CTEs, window functions (with frame clauses and named windows), LATERAL set-returning functions, and LATERAL subqueries.
 
 **Priorities 1-4, Phases A, B, and C are fully complete**, resolving all silent data corruption from expression deparsing, semantic error detection gaps, and expanding support for RIGHT JOIN, FULL OUTER JOIN, nested joins (3+ tables), MIN/MAX in DIFFERENTIAL mode, 25 aggregate functions in DIFFERENTIAL mode (including FILTER and WITHIN GROUP clauses), DISTINCT, set operations (UNION ALL/UNION/INTERSECT/EXCEPT), non-recursive and recursive CTEs, window functions (with frame clauses and named windows), LATERAL set-returning functions, LATERAL subqueries, EXISTS/NOT EXISTS subqueries (SemiJoin operator), IN/NOT IN subqueries (SemiJoin/AntiJoin operators), scalar subqueries in SELECT (ScalarSubquery operator), proper rejection of GROUPING SETS/CUBE/ROLLUP, DISTINCT ON, NATURAL JOIN, and detection of window functions nested inside expressions.
 
@@ -765,7 +765,7 @@ The README says `ORDER BY` is "⚠️ Ignored" which is accurate but could be mo
 
 ### Priority 1: Fix Silent Data Corruption (P0) — ✅ COMPLETED
 
-All 14 expression types now produce either valid SQL or clear error messages. The catch-all in `node_to_expr()` returns `Err(PgStreamError::UnsupportedOperator(...))` instead of `Expr::Raw(deparse_node())`.
+All 14 expression types now produce either valid SQL or clear error messages. The catch-all in `node_to_expr()` returns `Err(PgTrickleError::UnsupportedOperator(...))` instead of `Expr::Raw(deparse_node())`.
 
 Implemented expression deparsing:
 - `T_CaseExpr` → `CASE WHEN ... THEN ... ELSE ... END` (both searched and simple CASE)

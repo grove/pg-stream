@@ -26,7 +26,7 @@ async fn test_scenario_create_and_full_refresh() {
         .await;
 
     // Create ST storage table matching the defining query shape
-    db.execute("CREATE TABLE public.product_summary (__pgs_row_id BIGINT, id INT, name TEXT, price NUMERIC)")
+    db.execute("CREATE TABLE public.product_summary (__pgt_row_id BIGINT, id INT, name TEXT, price NUMERIC)")
         .await;
 
     let storage_oid: i32 = db
@@ -34,22 +34,22 @@ async fn test_scenario_create_and_full_refresh() {
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({storage_oid}, 'product_summary', 'public', 'SELECT id, name, price FROM products', '1m', 'FULL')"
     )).await;
 
     // Simulate full refresh: TRUNCATE + INSERT INTO ... SELECT
     db.execute("TRUNCATE product_summary").await;
     db.execute(
-        "INSERT INTO product_summary (__pgs_row_id, id, name, price) \
+        "INSERT INTO product_summary (__pgt_row_id, id, name, price) \
                 SELECT 0, id, name, price FROM products",
     )
     .await;
 
     // Update catalog to mark populated
     db.execute(&format!(
-        "UPDATE pgstream.pgs_stream_tables SET is_populated = true, status = 'ACTIVE', \
-         data_timestamp = now() WHERE pgs_relid = {storage_oid}"
+        "UPDATE pgtrickle.pgt_stream_tables SET is_populated = true, status = 'ACTIVE', \
+         data_timestamp = now() WHERE pgt_relid = {storage_oid}"
     ))
     .await;
 
@@ -78,20 +78,20 @@ async fn test_scenario_refresh_after_insert() {
     db.execute("INSERT INTO orders VALUES (1, 100), (2, 200)")
         .await;
 
-    db.execute("CREATE TABLE public.order_mirror (__pgs_row_id BIGINT, id INT, amount NUMERIC)")
+    db.execute("CREATE TABLE public.order_mirror (__pgt_row_id BIGINT, id INT, amount NUMERIC)")
         .await;
     let oid: i32 = db
         .query_scalar("SELECT 'order_mirror'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'order_mirror', 'public', 'SELECT id, amount FROM orders', '1m', 'FULL')"
     )).await;
 
     // Initial full refresh
     db.execute(
-        "INSERT INTO order_mirror (__pgs_row_id, id, amount) SELECT 0, id, amount FROM orders",
+        "INSERT INTO order_mirror (__pgt_row_id, id, amount) SELECT 0, id, amount FROM orders",
     )
     .await;
     assert_eq!(db.count("order_mirror").await, 2);
@@ -103,7 +103,7 @@ async fn test_scenario_refresh_after_insert() {
     // Re-refresh (full)
     db.execute("TRUNCATE order_mirror").await;
     db.execute(
-        "INSERT INTO order_mirror (__pgs_row_id, id, amount) SELECT 0, id, amount FROM orders",
+        "INSERT INTO order_mirror (__pgt_row_id, id, amount) SELECT 0, id, amount FROM orders",
     )
     .await;
 
@@ -133,20 +133,20 @@ async fn test_scenario_refresh_after_update() {
     db.execute("INSERT INTO items VALUES (1, 10), (2, 20), (3, 30)")
         .await;
 
-    db.execute("CREATE TABLE public.item_st (__pgs_row_id BIGINT, id INT, qty INT)")
+    db.execute("CREATE TABLE public.item_st (__pgt_row_id BIGINT, id INT, qty INT)")
         .await;
     let oid: i32 = db
         .query_scalar("SELECT 'item_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'item_st', 'public', 'SELECT id, qty FROM items', '1m', 'FULL')"
     )).await;
 
     // Initial full refresh
     db.execute("TRUNCATE item_st").await;
-    db.execute("INSERT INTO item_st (__pgs_row_id, id, qty) SELECT 0, id, qty FROM items")
+    db.execute("INSERT INTO item_st (__pgt_row_id, id, qty) SELECT 0, id, qty FROM items")
         .await;
 
     // Update source
@@ -154,7 +154,7 @@ async fn test_scenario_refresh_after_update() {
 
     // Re-refresh
     db.execute("TRUNCATE item_st").await;
-    db.execute("INSERT INTO item_st (__pgs_row_id, id, qty) SELECT 0, id, qty FROM items")
+    db.execute("INSERT INTO item_st (__pgt_row_id, id, qty) SELECT 0, id, qty FROM items")
         .await;
 
     // Verify updated value is reflected
@@ -187,19 +187,19 @@ async fn test_scenario_refresh_after_delete() {
     db.execute("INSERT INTO records VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
         .await;
 
-    db.execute("CREATE TABLE public.records_st (__pgs_row_id BIGINT, id INT, val TEXT)")
+    db.execute("CREATE TABLE public.records_st (__pgt_row_id BIGINT, id INT, val TEXT)")
         .await;
     let oid: i32 = db
         .query_scalar("SELECT 'records_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'records_st', 'public', 'SELECT id, val FROM records', '1m', 'FULL')"
     )).await;
 
     // Initial refresh
-    db.execute("INSERT INTO records_st (__pgs_row_id, id, val) SELECT 0, id, val FROM records")
+    db.execute("INSERT INTO records_st (__pgt_row_id, id, val) SELECT 0, id, val FROM records")
         .await;
     assert_eq!(db.count("records_st").await, 4);
 
@@ -208,7 +208,7 @@ async fn test_scenario_refresh_after_delete() {
 
     // Re-refresh
     db.execute("TRUNCATE records_st").await;
-    db.execute("INSERT INTO records_st (__pgs_row_id, id, val) SELECT 0, id, val FROM records")
+    db.execute("INSERT INTO records_st (__pgt_row_id, id, val) SELECT 0, id, val FROM records")
         .await;
     assert_eq!(db.count("records_st").await, 2);
 
@@ -237,7 +237,7 @@ async fn test_scenario_filtered_st() {
     )
     .await;
 
-    db.execute("CREATE TABLE public.us_sales_st (__pgs_row_id BIGINT, id INT, region TEXT, amount NUMERIC)")
+    db.execute("CREATE TABLE public.us_sales_st (__pgt_row_id BIGINT, id INT, region TEXT, amount NUMERIC)")
         .await;
     let oid: i32 = db
         .query_scalar("SELECT 'us_sales_st'::regclass::oid::int")
@@ -246,7 +246,7 @@ async fn test_scenario_filtered_st() {
     let defining_query = "SELECT id, region, amount FROM sales WHERE region = ''US''";
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'us_sales_st', 'public', $${defining_query}$$, '1m', 'FULL')"
     )).await;
 
@@ -255,7 +255,7 @@ async fn test_scenario_filtered_st() {
 
     // Full refresh with filter
     db.execute(&format!(
-        "INSERT INTO us_sales_st (__pgs_row_id, id, region, amount) SELECT 0, id, region, amount FROM ({exec_query}) sub"
+        "INSERT INTO us_sales_st (__pgt_row_id, id, region, amount) SELECT 0, id, region, amount FROM ({exec_query}) sub"
     )).await;
 
     // Only US rows
@@ -295,20 +295,20 @@ async fn test_scenario_join_st() {
     let defining_query =
         "SELECT c.name, p.item FROM customers c JOIN purchases p ON c.id = p.cust_id";
 
-    db.execute("CREATE TABLE public.cust_purchases_st (__pgs_row_id BIGINT, name TEXT, item TEXT)")
+    db.execute("CREATE TABLE public.cust_purchases_st (__pgt_row_id BIGINT, name TEXT, item TEXT)")
         .await;
     let oid: i32 = db
         .query_scalar("SELECT 'cust_purchases_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'cust_purchases_st', 'public', $${defining_query}$$, '1m', 'FULL')"
     )).await;
 
     // Full refresh
     db.execute(&format!(
-        "INSERT INTO cust_purchases_st (__pgs_row_id, name, item) \
+        "INSERT INTO cust_purchases_st (__pgt_row_id, name, item) \
          SELECT 0, sub.name, sub.item FROM ({defining_query}) sub"
     ))
     .await;
@@ -340,20 +340,20 @@ async fn test_scenario_aggregate_st() {
 
     let defining_query = "SELECT category, SUM(qty) AS total_qty, COUNT(*) AS item_count FROM inventory GROUP BY category";
 
-    db.execute("CREATE TABLE public.inv_summary_st (__pgs_row_id BIGINT, category TEXT, total_qty BIGINT, item_count BIGINT)")
+    db.execute("CREATE TABLE public.inv_summary_st (__pgt_row_id BIGINT, category TEXT, total_qty BIGINT, item_count BIGINT)")
         .await;
     let oid: i32 = db
         .query_scalar("SELECT 'inv_summary_st'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'inv_summary_st', 'public', $${defining_query}$$, '1m', 'FULL')"
     )).await;
 
     // Full refresh
     db.execute(&format!(
-        "INSERT INTO inv_summary_st (__pgs_row_id, category, total_qty, item_count) \
+        "INSERT INTO inv_summary_st (__pgt_row_id, category, total_qty, item_count) \
          SELECT 0, sub.category, sub.total_qty, sub.item_count FROM ({defining_query}) sub"
     ))
     .await;
@@ -394,35 +394,35 @@ async fn test_scenario_refresh_history() {
         .await;
     db.execute("INSERT INTO src VALUES (1, 10)").await;
 
-    db.execute("CREATE TABLE public.src_st (__pgs_row_id BIGINT, id INT, val INT)")
+    db.execute("CREATE TABLE public.src_st (__pgt_row_id BIGINT, id INT, val INT)")
         .await;
     let oid: i32 = db.query_scalar("SELECT 'src_st'::regclass::oid::int").await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'src_st', 'public', 'SELECT id, val FROM src', '1m', 'FULL')"
     )).await;
 
     // Record first refresh in history
     db.execute(
-        "INSERT INTO pgstream.pgs_refresh_history (pgs_id, data_timestamp, start_time, end_time, action, rows_inserted, status) \
+        "INSERT INTO pgtrickle.pgt_refresh_history (pgt_id, data_timestamp, start_time, end_time, action, rows_inserted, status) \
          VALUES (1, now(), now() - interval '1 second', now(), 'FULL', 1, 'COMPLETED')"
     ).await;
 
     // Record second refresh
     db.execute(
-        "INSERT INTO pgstream.pgs_refresh_history (pgs_id, data_timestamp, start_time, end_time, action, rows_inserted, rows_deleted, status) \
+        "INSERT INTO pgtrickle.pgt_refresh_history (pgt_id, data_timestamp, start_time, end_time, action, rows_inserted, rows_deleted, status) \
          VALUES (1, now(), now() - interval '1 second', now(), 'FULL', 2, 1, 'COMPLETED')"
     ).await;
 
     let history_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_refresh_history WHERE pgs_id = 1")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_refresh_history WHERE pgt_id = 1")
         .await;
     assert_eq!(history_count, 2);
 
     // Verify latest refresh
     let latest_action: String = db.query_scalar(
-        "SELECT action FROM pgstream.pgs_refresh_history WHERE pgs_id = 1 ORDER BY refresh_id DESC LIMIT 1"
+        "SELECT action FROM pgtrickle.pgt_refresh_history WHERE pgt_id = 1 ORDER BY refresh_id DESC LIMIT 1"
     ).await;
     assert_eq!(latest_action, "FULL");
 }
@@ -434,21 +434,21 @@ async fn test_scenario_st_info_view() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE base (id INT PRIMARY KEY)").await;
-    db.execute("CREATE TABLE public.st_test (__pgs_row_id BIGINT, id INT)")
+    db.execute("CREATE TABLE public.st_test (__pgt_row_id BIGINT, id INT)")
         .await;
     let oid: i32 = db
         .query_scalar("SELECT 'st_test'::regclass::oid::int")
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status, data_timestamp) \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status, data_timestamp) \
          VALUES ({oid}, 'st_test', 'public', 'SELECT id FROM base', '1m', 'FULL', 'ACTIVE', now() - interval '2 minutes')"
     )).await;
 
     // Check info view shows stale flag
     let exceeded: bool = db
-        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'st_test'")
+        .query_scalar("SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'st_test'")
         .await;
     assert!(exceeded, "Lag should be exceeded (2 min > 1 min target)");
 }
@@ -463,18 +463,18 @@ async fn test_scenario_no_data_refresh() {
         .await;
     db.execute("INSERT INTO src10 VALUES (1, 'hello')").await;
 
-    db.execute("CREATE TABLE public.st10 (__pgs_row_id BIGINT, id INT, val TEXT)")
+    db.execute("CREATE TABLE public.st10 (__pgt_row_id BIGINT, id INT, val TEXT)")
         .await;
     let oid: i32 = db.query_scalar("SELECT 'st10'::regclass::oid::int").await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({oid}, 'st10', 'public', 'SELECT id, val FROM src10', '1m', 'FULL')"
     )).await;
 
     // Record a NO_DATA refresh
     db.execute(
-        "INSERT INTO pgstream.pgs_refresh_history (pgs_id, data_timestamp, start_time, end_time, action, rows_inserted, rows_deleted, status) \
+        "INSERT INTO pgtrickle.pgt_refresh_history (pgt_id, data_timestamp, start_time, end_time, action, rows_inserted, rows_deleted, status) \
          VALUES (1, now(), now(), now(), 'NO_DATA', 0, 0, 'COMPLETED')"
     ).await;
 
@@ -483,7 +483,7 @@ async fn test_scenario_no_data_refresh() {
 
     // But history shows it
     let action: String = db
-        .query_scalar("SELECT action FROM pgstream.pgs_refresh_history WHERE pgs_id = 1 LIMIT 1")
+        .query_scalar("SELECT action FROM pgtrickle.pgt_refresh_history WHERE pgt_id = 1 LIMIT 1")
         .await;
     assert_eq!(action, "NO_DATA");
 }

@@ -1,4 +1,4 @@
-# PLAN: External Test Suites for pg_stream
+# PLAN: External Test Suites for pg_trickle
 
 **Status:** Proposed  
 **Date:** 2026-02-25  
@@ -21,7 +21,7 @@
 
 ## Motivation
 
-pg_stream's existing test suite (878 unit tests, 22 E2E test suites) validates
+pg_trickle's existing test suite (878 unit tests, 22 E2E test suites) validates
 internal correctness. What it does **not** cover:
 
 - **Industry-standard workloads** — are stream tables effective on the
@@ -30,7 +30,7 @@ internal correctness. What it does **not** cover:
   100 GB?
 - **Breadth** — are there SQL patterns we haven't thought to test that produce
   incorrect deltas?
-- **Peer comparison** — how does pg_stream's approach compare to standalone
+- **Peer comparison** — how does pg_trickle's approach compare to standalone
   IVM engines like Feldera on the same workload?
 
 Public test suites address all four gaps.
@@ -43,7 +43,7 @@ Public test suites address all four gaps.
 
 TPC-H is the industry-standard decision-support benchmark. Its 22 queries
 cover joins (up to 8 tables), aggregates, subqueries (scalar, EXISTS, IN),
-HAVING, CASE WHEN, DISTINCT — all operators pg_stream supports in
+HAVING, CASE WHEN, DISTINCT — all operators pg_trickle supports in
 DIFFERENTIAL mode. Its two **refresh functions** (RF1: bulk INSERT, RF2:
 bulk DELETE) directly exercise the CDC → delta refresh pipeline.
 
@@ -52,7 +52,7 @@ bulk DELETE) directly exercise the CDC → delta refresh pipeline.
 
 ### Query Compatibility Analysis
 
-All 22 TPC-H queries are compatible with pg_stream:
+All 22 TPC-H queries are compatible with pg_trickle:
 
 | Category | Queries | Modification |
 |----------|---------|-------------|
@@ -62,7 +62,7 @@ All 22 TPC-H queries are compatible with pg_stream:
 
 - **0 queries are blocked** by unsupported SQL features.
 - **Q15** additionally requires inlining its `CREATE VIEW` as a CTE or
-  subquery (pg_stream requires a single SELECT statement).
+  subquery (pg_trickle requires a single SELECT statement).
 - No TPC-H query uses GROUPING SETS, NATURAL JOIN, or recursive CTEs.
 
 ### Detailed Query Matrix
@@ -94,7 +94,7 @@ All 22 TPC-H queries are compatible with pg_stream:
 
 ### SQL Feature Coverage by TPC-H
 
-| SQL Feature | TPC-H Queries Using It | pg_stream Support |
+| SQL Feature | TPC-H Queries Using It | pg_trickle Support |
 |-------------|------------------------|-------------------|
 | INNER JOIN | Q2,Q3,Q5,Q7–Q12,Q15,Q17–Q21 | ✅ Full |
 | LEFT OUTER JOIN | Q13 | ✅ Full |
@@ -121,7 +121,7 @@ All 22 TPC-H queries are compatible with pg_stream:
 | RF1 | Bulk INSERT into `orders` + `lineitem` | Triggers capture → differential refresh |
 | RF2 | DELETE from `orders` + `lineitem` by key | Triggers capture → differential refresh |
 
-Both RF1 and RF2 exercise pg_stream's core pipeline. No special handling
+Both RF1 and RF2 exercise pg_trickle's core pipeline. No special handling
 needed — INSERTs and DELETEs are the native change types that CDC captures.
 
 ### Proposed Test Plan
@@ -171,7 +171,7 @@ needed — INSERTs and DELETEs are the native change types that CDC captures.
 Originally from SQLite, sqllogictest contains **millions** of SQL statements
 with expected results. CockroachDB, DuckDB, and DataFusion all maintain forks.
 Its value is **breadth** — covering SQL patterns no developer would think to
-write manually. For pg_stream, the key test is: does a stream table in
+write manually. For pg_trickle, the key test is: does a stream table in
 DIFFERENTIAL mode produce the same result as FULL mode for every query?
 
 **URL:** https://www.sqlite.org/sqllogictest/  
@@ -182,7 +182,7 @@ DIFFERENTIAL mode produce the same result as FULL mode for every query?
 We do not need to run the full sqllogictest corpus verbatim. Instead, we use
 it as a **query generator**:
 
-1. **Filter** the corpus for queries that use pg_stream-supported features
+1. **Filter** the corpus for queries that use pg_trickle-supported features
    (joins, aggregates, subqueries, etc.) and exclude unsupported ones
    (LIMIT, GROUPING SETS, etc.).
 2. For each qualifying query Q over tables T₁…Tₙ:
@@ -260,7 +260,7 @@ queries** with trivial modifications.
 
 ### Why Feldera
 
-Since pg_stream is grounded in DBSP theory, comparing against Feldera (the
+Since pg_trickle is grounded in DBSP theory, comparing against Feldera (the
 reference DBSP implementation) on the same workloads provides a meaningful
 performance baseline. Feldera maintains benchmarks for Nexmark (streaming
 auction events) and TPC-H variants.
@@ -270,16 +270,16 @@ auction events) and TPC-H variants.
 ### Approach
 
 This is **not** an apples-to-apples comparison (Feldera is a standalone
-streaming engine; pg_stream runs inside PostgreSQL). The goal is to
+streaming engine; pg_trickle runs inside PostgreSQL). The goal is to
 understand the **overhead of the PostgreSQL execution model** vs. a dedicated
-dataflow runtime, and to identify queries where pg_stream's delta SQL
+dataflow runtime, and to identify queries where pg_trickle's delta SQL
 generation is suboptimal.
 
 ### Nexmark Benchmark
 
 Nexmark models an online auction system with 3 event types (Person, Auction,
 Bid) and 22 queries. Several Nexmark queries use window functions and
-time-based grouping. Relevant subset for pg_stream:
+time-based grouping. Relevant subset for pg_trickle:
 
 | Query | Features | Compatible? |
 |-------|----------|-------------|

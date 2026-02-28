@@ -1,6 +1,6 @@
 -- Q21: Suppliers Who Kept Orders Waiting
 -- Operators: 4-table Join -> EXISTS + NOT EXISTS (anti-join)
--- LIMIT removed (unsupported by pg_stream)
+-- LIMIT removed (unsupported by pg_trickle)
 SELECT
     s_name,
     COUNT(*) AS numwait

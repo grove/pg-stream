@@ -1,30 +1,30 @@
 # Configuration
 
-Complete reference for all pg_stream GUC (Grand Unified Configuration) variables.
+Complete reference for all pg_trickle GUC (Grand Unified Configuration) variables.
 
 ---
 
 ## Overview
 
-pg_stream exposes sixteen configuration variables in the `pg_stream` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_trickle exposes sixteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
 ```ini
-shared_preload_libraries = 'pg_stream'
+shared_preload_libraries = 'pg_trickle'
 ```
 
 The extension **must** be loaded via `shared_preload_libraries` because it registers GUC variables and a background worker at startup.
 
-> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required by default. The default CDC mode (`trigger`) uses lightweight row-level triggers. If you set `pg_stream.cdc_mode = 'auto'` or `'wal'`, then `wal_level = logical` is needed for WAL-based capture (see [pg_stream.cdc_mode](#pg_streamcdc_mode)).
+> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required by default. The default CDC mode (`trigger`) uses lightweight row-level triggers. If you set `pg_trickle.cdc_mode = 'auto'` or `'wal'`, then `wal_level = logical` is needed for WAL-based capture (see [pg_trickle.cdc_mode](#pg_tricklecdc_mode)).
 
 ---
 
 ## GUC Variables
 
-### pg_stream.enabled
+### pg_trickle.enabled
 
-Enable or disable the pg_stream extension.
+Enable or disable the pg_trickle extension.
 
 | Property | Value |
 |---|---|
@@ -33,19 +33,19 @@ Enable or disable the pg_stream extension.
 | Context | `SUSET` (superuser) |
 | Restart Required | No |
 
-When set to `false`, the background scheduler stops processing refreshes. Existing stream tables remain in the catalog but are not refreshed. Manual `pgstream.refresh_stream_table()` calls still work.
+When set to `false`, the background scheduler stops processing refreshes. Existing stream tables remain in the catalog but are not refreshed. Manual `pgtrickle.refresh_stream_table()` calls still work.
 
 ```sql
 -- Disable automatic refreshes
-SET pg_stream.enabled = false;
+SET pg_trickle.enabled = false;
 
 -- Re-enable
-SET pg_stream.enabled = true;
+SET pg_trickle.enabled = true;
 ```
 
 ---
 
-### pg_stream.scheduler_interval_ms
+### pg_trickle.scheduler_interval_ms
 
 How often the background scheduler checks for stream tables that need refreshing.
 
@@ -65,12 +65,12 @@ How often the background scheduler checks for stream tables that need refreshing
 The scheduler interval does **not** determine refresh frequency — it determines how often the scheduler *checks* whether any ST's staleness exceeds its schedule (or whether a cron expression has fired). The actual refresh frequency is governed by `schedule` (duration or cron) and canonical period alignment.
 
 ```sql
-SET pg_stream.scheduler_interval_ms = 500;
+SET pg_trickle.scheduler_interval_ms = 500;
 ```
 
 ---
 
-### pg_stream.min_schedule_seconds
+### pg_trickle.min_schedule_seconds
 
 Minimum allowed `schedule` value (in seconds) when creating or altering a stream table with a duration-based schedule. This limit does **not** apply to cron expressions.
 
@@ -90,12 +90,12 @@ This acts as a safety guardrail to prevent users from setting impractically smal
 
 ```sql
 -- Allow 10-second schedules (for testing)
-SET pg_stream.min_schedule_seconds = 10;
+SET pg_trickle.min_schedule_seconds = 10;
 ```
 
 ---
 
-### pg_stream.max_consecutive_errors
+### pg_trickle.max_consecutive_errors
 
 Maximum consecutive refresh failures before a stream table is moved to `ERROR` status.
 
@@ -110,41 +110,41 @@ Maximum consecutive refresh failures before a stream table is moved to `ERROR` s
 When a ST's `consecutive_errors` reaches this threshold:
 1. The ST status changes to `ERROR`.
 2. Automatic refreshes stop for this ST.
-3. Manual intervention is required: `SELECT pgstream.alter_stream_table('...', status => 'ACTIVE')`.
+3. Manual intervention is required: `SELECT pgtrickle.alter_stream_table('...', status => 'ACTIVE')`.
 
 **Tuning Guidance:**
 - **Strict** (production): `3` — fail fast to surface issues.
 - **Lenient** (development): `10`–`20` — tolerate transient errors.
 
 ```sql
-SET pg_stream.max_consecutive_errors = 5;
+SET pg_trickle.max_consecutive_errors = 5;
 ```
 
 ---
 
-### pg_stream.change_buffer_schema
+### pg_trickle.change_buffer_schema
 
 Schema where CDC change buffer tables are created.
 
 | Property | Value |
 |---|---|
 | Type | `text` |
-| Default | `'pgstream_changes'` |
+| Default | `'pgtrickle_changes'` |
 | Context | `SUSET` |
 | Restart Required | No (but existing change buffers remain in the old schema) |
 
 Change buffer tables are named `<schema>.changes_<oid>` where `<oid>` is the source table's OID. Placing them in a dedicated schema keeps them out of the `public` namespace.
 
 **Tuning Guidance:**
-- Generally leave at the default. Change only if `pgstream_changes` conflicts with an existing schema in your database.
+- Generally leave at the default. Change only if `pgtrickle_changes` conflicts with an existing schema in your database.
 
 ```sql
-SET pg_stream.change_buffer_schema = 'my_change_buffers';
+SET pg_trickle.change_buffer_schema = 'my_change_buffers';
 ```
 
 ---
 
-### pg_stream.max_concurrent_refreshes
+### pg_trickle.max_concurrent_refreshes
 
 > **Reserved for future use.** This setting is accepted and stored but has no
 > effect in v0.2.0. Parallel refresh is planned for v0.3.0.
@@ -165,12 +165,12 @@ implemented. Setting it has no effect in v0.2.0.
 
 ```sql
 -- Accepted but has no effect in v0.2.0
-SET pg_stream.max_concurrent_refreshes = 8;
+SET pg_trickle.max_concurrent_refreshes = 8;
 ```
 
 ---
 
-### pg_stream.differential_max_change_ratio
+### pg_trickle.differential_max_change_ratio
 
 Maximum change-to-table ratio before DIFFERENTIAL refresh falls back to FULL refresh.
 
@@ -195,15 +195,15 @@ When the number of pending change buffer rows exceeds this fraction of the sourc
 
 ```sql
 -- Lower threshold for batch-heavy workloads
-SET pg_stream.differential_max_change_ratio = 0.10;
+SET pg_trickle.differential_max_change_ratio = 0.10;
 
 -- Disable adaptive fallback
-SET pg_stream.differential_max_change_ratio = 0.0;
+SET pg_trickle.differential_max_change_ratio = 0.0;
 ```
 
 ---
 
-### pg_stream.cleanup_use_truncate
+### pg_trickle.cleanup_use_truncate
 
 Use `TRUNCATE` instead of per-row `DELETE` for change buffer cleanup when the entire buffer is consumed by a refresh.
 
@@ -224,12 +224,12 @@ After a differential refresh consumes all rows from the change buffer, the engin
 
 ```sql
 -- Use per-row DELETE for change buffer cleanup
-SET pg_stream.cleanup_use_truncate = false;
+SET pg_trickle.cleanup_use_truncate = false;
 ```
 
 ---
 
-### pg_stream.merge_planner_hints
+### pg_trickle.merge_planner_hints
 
 Inject `SET LOCAL` planner hints before MERGE execution during differential refresh.
 
@@ -242,7 +242,7 @@ Inject `SET LOCAL` planner hints before MERGE execution during differential refr
 
 When enabled, the refresh executor estimates the delta size and applies optimizer hints within the transaction:
 - **Delta ≥ 100 rows**: `SET LOCAL enable_nestloop = off` — forces hash joins instead of nested-loop joins.
-- **Delta ≥ 10,000 rows**: additionally `SET LOCAL work_mem = '<N>MB'` (see [pg_stream.merge_work_mem_mb](#pg_streammerge_work_mem_mb)).
+- **Delta ≥ 10,000 rows**: additionally `SET LOCAL work_mem = '<N>MB'` (see [pg_trickle.merge_work_mem_mb](#pg_tricklemerge_work_mem_mb)).
 
 This reduces P95 latency spikes caused by PostgreSQL choosing nested-loop plans for medium/large delta sizes.
 
@@ -252,14 +252,14 @@ This reduces P95 latency spikes caused by PostgreSQL choosing nested-loop plans 
 
 ```sql
 -- Disable planner hints
-SET pg_stream.merge_planner_hints = false;
+SET pg_trickle.merge_planner_hints = false;
 ```
 
 ---
 
-### pg_stream.merge_work_mem_mb
+### pg_trickle.merge_work_mem_mb
 
-`work_mem` value (in MB) applied via `SET LOCAL` when the delta exceeds 10,000 rows and [planner hints](#pg_streammerge_planner_hints) are enabled.
+`work_mem` value (in MB) applied via `SET LOCAL` when the delta exceeds 10,000 rows and [planner hints](#pg_tricklemerge_planner_hints) are enabled.
 
 | Property | Value |
 |---|---|
@@ -277,12 +277,12 @@ A higher value lets PostgreSQL use larger in-memory hash tables for the MERGE jo
 - **Very large deltas** (100K+ rows): Consider `256`–`512` if refresh latency matters.
 
 ```sql
-SET pg_stream.merge_work_mem_mb = 128;
+SET pg_trickle.merge_work_mem_mb = 128;
 ```
 
 ---
 
-### pg_stream.use_prepared_statements
+### pg_trickle.use_prepared_statements
 
 Use SQL `PREPARE` / `EXECUTE` for MERGE statements during differential refresh.
 
@@ -293,7 +293,7 @@ Use SQL `PREPARE` / `EXECUTE` for MERGE statements during differential refresh.
 | Context | `SUSET` |
 | Restart Required | No |
 
-When enabled, the refresh executor issues `PREPARE __pgs_merge_{id}` on the first cache-hit cycle, then uses `EXECUTE` on subsequent cycles. After approximately 5 executions, PostgreSQL switches from a custom plan to a generic plan, saving 1–2 ms of parse/plan overhead per refresh.
+When enabled, the refresh executor issues `PREPARE __pgt_merge_{id}` on the first cache-hit cycle, then uses `EXECUTE` on subsequent cycles. After approximately 5 executions, PostgreSQL switches from a custom plan to a generic plan, saving 1–2 ms of parse/plan overhead per refresh.
 
 **Tuning Guidance:**
 - **Most workloads**: Leave at `true` — the cumulative parse/plan savings are significant for frequently-refreshed stream tables.
@@ -301,12 +301,12 @@ When enabled, the refresh executor issues `PREPARE __pgs_merge_{id}` on the firs
 
 ```sql
 -- Disable prepared statements
-SET pg_stream.use_prepared_statements = false;
+SET pg_trickle.use_prepared_statements = false;
 ```
 
 ---
 
-### pg_stream.user_triggers
+### pg_trickle.user_triggers
 
 Control how user-defined triggers on stream tables are handled during refresh.
 
@@ -332,18 +332,18 @@ When a stream table has user-defined row-level triggers, the refresh engine can 
 
 ```sql
 -- Auto-detect (default)
-SET pg_stream.user_triggers = 'auto';
+SET pg_trickle.user_triggers = 'auto';
 
 -- Always use explicit DML (for testing)
-SET pg_stream.user_triggers = 'on';
+SET pg_trickle.user_triggers = 'on';
 
 -- Suppress triggers, use MERGE
-SET pg_stream.user_triggers = 'off';
+SET pg_trickle.user_triggers = 'off';
 ```
 
 ---
 
-### pg_stream.block_source_ddl
+### pg_trickle.block_source_ddl
 
 When enabled, column-affecting DDL (e.g., `ALTER TABLE ... DROP COLUMN`,
 `ALTER TABLE ... ALTER COLUMN ... TYPE`) on source tables tracked by stream
@@ -359,10 +359,10 @@ stream tables.
 
 ```sql
 -- Block column-affecting DDL on tracked source tables
-SET pg_stream.block_source_ddl = true;
+SET pg_trickle.block_source_ddl = true;
 
 -- Allow DDL (stream tables will be marked for reinit instead)
-SET pg_stream.block_source_ddl = false;
+SET pg_trickle.block_source_ddl = false;
 ```
 
 > **Note:** Only column-affecting changes are blocked. Benign DDL (adding
@@ -370,7 +370,7 @@ SET pg_stream.block_source_ddl = false;
 
 ---
 
-### pg_stream.cdc_mode
+### pg_trickle.cdc_mode
 
 CDC (Change Data Capture) mechanism selection.
 
@@ -384,21 +384,21 @@ CDC (Change Data Capture) mechanism selection.
 
 ```sql
 -- Always use triggers (default, zero-config)
-SET pg_stream.cdc_mode = 'trigger';
+SET pg_trickle.cdc_mode = 'trigger';
 
 -- Enable automatic trigger → WAL transition
-SET pg_stream.cdc_mode = 'auto';
+SET pg_trickle.cdc_mode = 'auto';
 
 -- Require WAL-based CDC (error if wal_level != logical)
-SET pg_stream.cdc_mode = 'wal';
+SET pg_trickle.cdc_mode = 'wal';
 ```
 
 ---
 
-### pg_stream.wal_transition_timeout
+### pg_trickle.wal_transition_timeout
 
 > **Note:** WAL-based CDC is pre-production in v0.2.0. This setting is only
-> relevant when `pg_stream.cdc_mode = 'auto'` or `'wal'`. See
+> relevant when `pg_trickle.cdc_mode = 'auto'` or `'wal'`. See
 > [ARCHITECTURE.md](ARCHITECTURE.md) for status.
 
 Maximum time (seconds) to wait for the WAL decoder to catch up during
@@ -409,7 +409,7 @@ not caught up within this timeout, the system falls back to triggers.
 **Range:** `10` – `3600`
 
 ```sql
-SET pg_stream.wal_transition_timeout = 300;
+SET pg_trickle.wal_transition_timeout = 300;
 ```
 
 ---
@@ -418,25 +418,25 @@ SET pg_stream.wal_transition_timeout = 300;
 
 ```ini
 # Required
-shared_preload_libraries = 'pg_stream'
+shared_preload_libraries = 'pg_trickle'
 
 # Optional tuning
-pg_stream.enabled = true
-pg_stream.scheduler_interval_ms = 1000
-pg_stream.min_schedule_seconds = 60
-pg_stream.max_consecutive_errors = 3
-pg_stream.change_buffer_schema = 'pgstream_changes'
-pg_stream.max_concurrent_refreshes = 4   # reserved; no effect in v0.2.0
-pg_stream.differential_max_change_ratio = 0.15
-pg_stream.cleanup_use_truncate = true
-pg_stream.merge_planner_hints = true
-pg_stream.merge_work_mem_mb = 64
-# pg_stream.merge_strategy removed in v0.2.0
-pg_stream.use_prepared_statements = true
-pg_stream.user_triggers = 'auto'
-pg_stream.block_source_ddl = false
-pg_stream.cdc_mode = 'trigger'
-pg_stream.wal_transition_timeout = 300
+pg_trickle.enabled = true
+pg_trickle.scheduler_interval_ms = 1000
+pg_trickle.min_schedule_seconds = 60
+pg_trickle.max_consecutive_errors = 3
+pg_trickle.change_buffer_schema = 'pgtrickle_changes'
+pg_trickle.max_concurrent_refreshes = 4   # reserved; no effect in v0.2.0
+pg_trickle.differential_max_change_ratio = 0.15
+pg_trickle.cleanup_use_truncate = true
+pg_trickle.merge_planner_hints = true
+pg_trickle.merge_work_mem_mb = 64
+# pg_trickle.merge_strategy removed in v0.2.0
+pg_trickle.use_prepared_statements = true
+pg_trickle.user_triggers = 'auto'
+pg_trickle.block_source_ddl = false
+pg_trickle.cdc_mode = 'trigger'
+pg_trickle.wal_transition_timeout = 300
 ```
 
 ---
@@ -447,14 +447,14 @@ All GUC variables can be changed at runtime by a superuser:
 
 ```sql
 -- View current settings
-SHOW pg_stream.enabled;
-SHOW pg_stream.scheduler_interval_ms;
+SHOW pg_trickle.enabled;
+SHOW pg_trickle.scheduler_interval_ms;
 
 -- Change for current session
-SET pg_stream.max_concurrent_refreshes = 8;  -- no effect in v0.2.0
+SET pg_trickle.max_concurrent_refreshes = 8;  -- no effect in v0.2.0
 
 -- Change persistently (requires reload)
-ALTER SYSTEM SET pg_stream.scheduler_interval_ms = 500;
+ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 500;
 SELECT pg_reload_conf();
 ```
 

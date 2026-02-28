@@ -12,7 +12,7 @@ Enable stream tables to form mutual dependencies (cycles) in the dependency grap
 
 ### Current Behavior
 
-The dependency graph is enforced as a strict DAG. When `create_stream_table()` is called, `check_for_cycles()` in `src/api.rs` builds the full graph, adds the proposed edges, and runs Kahn's algorithm. If a cycle is detected, the creation is rejected with `PgStreamError::CycleDetected`.
+The dependency graph is enforced as a strict DAG. When `create_stream_table()` is called, `check_for_cycles()` in `src/api.rs` builds the full graph, adds the proposed edges, and runs Kahn's algorithm. If a cycle is detected, the creation is rejected with `PgTrickleError::CycleDetected`.
 
 The scheduler in `src/scheduler.rs` relies on `topological_order()` (Kahn's BFS) to determine refresh order. This algorithm is undefined for graphs with cycles — it simply excludes nodes that are part of cycles.
 
@@ -140,7 +140,7 @@ Replaces `topological_order()` for the scheduler:
 ///
 /// Singleton SCCs (no cycle) are returned as-is. Multi-node SCCs are
 /// returned as groups that must be iterated to fixed point.
-pub fn condensation_order(&self) -> Result<Vec<Scc>, PgStreamError> {
+pub fn condensation_order(&self) -> Result<Vec<Scc>, PgTrickleError> {
     let sccs = self.compute_sccs();
     // SCCs are already in reverse topological order from Tarjan's
     Ok(sccs)
@@ -201,7 +201,7 @@ Add a static analysis pass that determines whether an `OpTree` is monotone (safe
 ///
 /// Returns `Ok(())` if all operators are monotone, or `Err` with the
 /// first non-monotone operator found.
-pub fn check_monotonicity(tree: &OpTree) -> Result<(), PgStreamError> {
+pub fn check_monotonicity(tree: &OpTree) -> Result<(), PgTrickleError> {
     match tree {
         OpTree::Scan { .. } => Ok(()),
         OpTree::Filter { child, .. } => check_monotonicity(child),
@@ -219,13 +219,13 @@ pub fn check_monotonicity(tree: &OpTree) -> Result<(), PgStreamError> {
             for c in children { check_monotonicity(c)?; }
             Ok(())
         }
-        OpTree::Aggregate { .. } => Err(PgStreamError::UnsupportedOperator(
+        OpTree::Aggregate { .. } => Err(PgTrickleError::UnsupportedOperator(
             "Aggregate is not monotone — cannot be part of a cyclic dependency".into()
         )),
-        OpTree::Except { .. } => Err(PgStreamError::UnsupportedOperator(
+        OpTree::Except { .. } => Err(PgTrickleError::UnsupportedOperator(
             "EXCEPT is not monotone — cannot be part of a cyclic dependency".into()
         )),
-        OpTree::Window { .. } => Err(PgStreamError::UnsupportedOperator(
+        OpTree::Window { .. } => Err(PgTrickleError::UnsupportedOperator(
             "Window functions are not monotone — cannot be part of a cyclic dependency".into()
         )),
         // Recurse into subqueries, CTEs, etc.
@@ -294,7 +294,7 @@ Track which stream tables participate in cyclic SCCs so the scheduler and refres
 #### Schema Change
 
 ```sql
-ALTER TABLE pgstream.pgs_stream_tables
+ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN scc_id INT;
 ```
 
@@ -303,7 +303,7 @@ ALTER TABLE pgstream.pgs_stream_tables
 
 When a `create_stream_table()` creates a cycle:
 1. Assign a new `scc_id` to all members of the cycle
-2. Store it in the `pgs_stream_tables` catalog
+2. Store it in the `pgt_stream_tables` catalog
 
 When `drop_stream_table()` removes a member and breaks the cycle:
 1. Recompute SCCs
@@ -312,7 +312,7 @@ When `drop_stream_table()` removes a member and breaks the cycle:
 #### New Refresh History Column
 
 ```sql
-ALTER TABLE pgstream.pgs_refresh_history
+ALTER TABLE pgtrickle.pgt_refresh_history
     ADD COLUMN fixpoint_iteration INT;
 ```
 
@@ -322,7 +322,7 @@ Records which iteration of the fixed-point loop produced this refresh. `NULL` fo
 
 | File | Change |
 |---|---|
-| `src/lib.rs` | Add `scc_id` column to `pgs_stream_tables` DDL, `fixpoint_iteration` to `pgs_refresh_history` |
+| `src/lib.rs` | Add `scc_id` column to `pgt_stream_tables` DDL, `fixpoint_iteration` to `pgt_refresh_history` |
 | `src/catalog.rs` | Add `scc_id` to `StreamTableMeta`, `fixpoint_iteration` to `RefreshRecord` |
 | `tests/common/mod.rs` | Mirror DDL changes |
 | `docs/SQL_REFERENCE.md` | Document new columns |
@@ -347,8 +347,8 @@ pub static PGS_ALLOW_CIRCULAR: GucSetting<bool> = GucSetting::<bool>::new(false)
 
 | GUC | Default | Description |
 |---|---|---|
-| `pg_stream.max_fixpoint_iterations` | `100` | Maximum iterations per SCC before declaring non-convergence and marking members as ERROR |
-| `pg_stream.allow_circular` | `false` | Master switch: must be `true` to create cyclic dependencies. When `false`, cycle detection rejects as today |
+| `pg_trickle.max_fixpoint_iterations` | `100` | Maximum iterations per SCC before declaring non-convergence and marking members as ERROR |
+| `pg_trickle.allow_circular` | `false` | Master switch: must be `true` to create cyclic dependencies. When `false`, cycle detection rejects as today |
 
 #### Files to Change
 
@@ -394,18 +394,18 @@ fn iterate_to_fixpoint(
     retry_policy: &RetryPolicy,
     now_ms: u64,
 ) {
-    let max_iter = config::pg_stream_max_fixpoint_iterations();
+    let max_iter = config::pg_trickle_max_fixpoint_iterations();
     
     for iteration in 0..max_iter {
         let mut total_changes: i64 = 0;
         
         for node_id in &scc.nodes {
-            let pgs_id = match node_id {
+            let pgt_id = match node_id {
                 NodeId::StreamTable(id) => *id,
                 _ => continue,
             };
             
-            let st = match load_st_by_id(pgs_id) {
+            let st = match load_st_by_id(pgt_id) {
                 Some(st) => st,
                 None => continue,
             };
@@ -431,8 +431,8 @@ fn iterate_to_fixpoint(
                             // Abort the entire SCC iteration — can't converge
                             // if a member fails
                             log!(
-                                "pg_stream: SCC fixpoint aborted — {}.{} failed",
-                                st.pgs_schema, st.pgs_name,
+                                "pg_trickle: SCC fixpoint aborted — {}.{} failed",
+                                st.pgt_schema, st.pgt_name,
                             );
                             return;
                         }
@@ -443,7 +443,7 @@ fn iterate_to_fixpoint(
         
         if total_changes == 0 {
             log!(
-                "pg_stream: SCC converged after {} iteration(s)",
+                "pg_trickle: SCC converged after {} iteration(s)",
                 iteration + 1,
             );
             return;
@@ -452,13 +452,13 @@ fn iterate_to_fixpoint(
     
     // Non-convergence: mark all SCC members as ERROR
     warning!(
-        "pg_stream: SCC did not converge after {} iterations — marking members as ERROR",
+        "pg_trickle: SCC did not converge after {} iterations — marking members as ERROR",
         max_iter,
     );
     for node_id in &scc.nodes {
         if let NodeId::StreamTable(id) = node_id {
             if let Err(e) = StreamTableMeta::set_status(*id, "ERROR") {
-                log!("pg_stream: failed to set ERROR status for ST {}: {}", id, e);
+                log!("pg_trickle: failed to set ERROR status for ST {}: {}", id, e);
             }
         }
     }
@@ -501,15 +501,15 @@ Modify `check_for_cycles()` in `src/api.rs` to conditionally allow cycles.
 #### New Flow
 
 ```rust
-fn check_for_cycles(source_relids: &[(Oid, String)]) -> Result<(), PgStreamError> {
+fn check_for_cycles(source_relids: &[(Oid, String)]) -> Result<(), PgTrickleError> {
     // ... existing DAG build ...
     
     match dag.detect_cycles() {
         Ok(()) => Ok(()),  // No cycle — always allowed
-        Err(PgStreamError::CycleDetected(nodes)) => {
+        Err(PgTrickleError::CycleDetected(nodes)) => {
             // Cycle detected — check if allowed
-            if !config::pg_stream_allow_circular() {
-                return Err(PgStreamError::CycleDetected(nodes));
+            if !config::pg_trickle_allow_circular() {
+                return Err(PgTrickleError::CycleDetected(nodes));
             }
             
             // Check monotonicity of all STs in the cycle
@@ -524,7 +524,7 @@ fn check_for_cycles(source_relids: &[(Oid, String)]) -> Result<(), PgStreamError
             for node_name in &nodes {
                 let meta = StreamTableMeta::get_by_name(node_name)?;
                 if meta.refresh_mode != RefreshMode::Differential {
-                    return Err(PgStreamError::InvalidArgument(format!(
+                    return Err(PgTrickleError::InvalidArgument(format!(
                         "stream table '{}' must use DIFFERENTIAL refresh mode \
                          to participate in a circular dependency",
                         node_name,
@@ -563,15 +563,15 @@ Add columns:
 - `scc_id INT` — SCC identifier (NULL if not in a cycle)
 - `last_fixpoint_iterations INT` — number of iterations in the last fixed-point run
 
-#### Update `pgs_status()`
+#### Update `pgt_status()`
 
 Add column:
 - `scc_id INT` — which SCC this ST belongs to (NULL for non-cyclic)
 
-#### New Monitoring Function: `pgstream.pgs_scc_status()`
+#### New Monitoring Function: `pgtrickle.pgt_scc_status()`
 
 ```sql
-pgstream.pgs_scc_status() → SETOF record(
+pgtrickle.pgt_scc_status() → SETOF record(
     scc_id              INT,
     member_count        INT,
     members             TEXT[],
@@ -586,7 +586,7 @@ pgstream.pgs_scc_status() → SETOF record(
 | File | Change |
 |---|---|
 | `src/lib.rs` | Update `pg_stat_stream_tables` view |
-| `src/api.rs` | Update `pgs_status()`, add `pgs_scc_status()` |
+| `src/api.rs` | Update `pgt_status()`, add `pgt_scc_status()` |
 | `docs/SQL_REFERENCE.md` | Document new columns and function |
 | `src/monitor.rs` | Update Prometheus metrics if applicable |
 
@@ -605,17 +605,17 @@ pgstream.pgs_scc_status() → SETOF record(
 CREATE TABLE edges (src INT, dst INT);
 INSERT INTO edges VALUES (1,2), (2,3);
 
-SET pg_stream.allow_circular = true;
+SET pg_trickle.allow_circular = true;
 
 -- reach_a finds paths through reach_b
-SELECT pgstream.create_stream_table('reach_a',
+SELECT pgtrickle.create_stream_table('reach_a',
     'SELECT DISTINCT e.src, rb.dst
      FROM edges e
      INNER JOIN reach_b rb ON e.dst = rb.src',
     '1m', 'DIFFERENTIAL');
 
 -- reach_b starts from edges and extends through reach_a
-SELECT pgstream.create_stream_table('reach_b',
+SELECT pgtrickle.create_stream_table('reach_b',
     'SELECT DISTINCT e.src, e.dst FROM edges e
      UNION ALL
      SELECT ra.src, e.dst
@@ -642,9 +642,9 @@ SELECT pgstream.create_stream_table('reach_b',
 #### Documentation
 
 - Add "Circular Dependencies" section to `docs/ARCHITECTURE.md`
-- Add `pg_stream.max_fixpoint_iterations` and `pg_stream.allow_circular` to `docs/CONFIGURATION.md`
-- Add `pgs_scc_status()` to `docs/SQL_REFERENCE.md`
-- Add note to `README.md` Limitations table: `Circular dependencies | ✅ Supported | Monotone queries only; opt-in via pg_stream.allow_circular`
+- Add `pg_trickle.max_fixpoint_iterations` and `pg_trickle.allow_circular` to `docs/CONFIGURATION.md`
+- Add `pgt_scc_status()` to `docs/SQL_REFERENCE.md`
+- Add note to `README.md` Limitations table: `Circular dependencies | ✅ Supported | Monotone queries only; opt-in via pg_trickle.allow_circular`
 
 #### Files to Change
 
@@ -653,7 +653,7 @@ SELECT pgstream.create_stream_table('reach_b',
 | `tests/e2e_circular_tests.rs` | **New file** — E2E tests for circular dependencies |
 | `docs/ARCHITECTURE.md` | Add circular dependency section |
 | `docs/CONFIGURATION.md` | Document new GUCs |
-| `docs/SQL_REFERENCE.md` | Document `pgs_scc_status()` and new columns |
+| `docs/SQL_REFERENCE.md` | Document `pgt_scc_status()` and new columns |
 | `README.md` | Update Limitations table |
 
 #### Estimated Effort

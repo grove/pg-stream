@@ -4,7 +4,7 @@
 
 ## Problem Statement
 
-pg_stream does not check the volatility of functions used in defining queries. This is a **correctness gap** for DIFFERENTIAL mode: volatile functions (e.g., `random()`, `gen_random_uuid()`, `clock_timestamp()`) produce different values on each evaluation, which breaks delta computation because the DVM engine assumes expressions are deterministic across refreshes.
+pg_trickle does not check the volatility of functions used in defining queries. This is a **correctness gap** for DIFFERENTIAL mode: volatile functions (e.g., `random()`, `gen_random_uuid()`, `clock_timestamp()`) produce different values on each evaluation, which breaks delta computation because the DVM engine assumes expressions are deterministic across refreshes.
 
 ### How it breaks
 
@@ -13,7 +13,7 @@ The DVM engine computes deltas by comparing "what changed in the source" against
 1. A row is inserted into the source table → delta query evaluates `random()` → stores `0.42` in the stream table
 2. On the next refresh, the merge CTE re-evaluates the same expression → gets `0.73`
 3. The engine sees a phantom change (new value ≠ stored value) or misses real changes
-4. The row hash (`__pgs_row_id`) may also differ, breaking row identity entirely
+4. The row hash (`__pgt_row_id`) may also differ, breaking row identity entirely
 
 ### PostgreSQL function volatility categories
 
@@ -45,7 +45,7 @@ Create a utility function that resolves a function name to its volatility class 
 ///
 /// Returns 'i' (immutable), 's' (stable), or 'v' (volatile).
 /// Returns 'v' (volatile) if the function cannot be found (safe default).
-fn lookup_function_volatility(func_name: &str) -> Result<char, PgStreamError> {
+fn lookup_function_volatility(func_name: &str) -> Result<char, PgTrickleError> {
     Spi::connect(|client| {
         let result = client.select(
             "SELECT provolatile::text FROM pg_catalog.pg_proc \
@@ -75,13 +75,13 @@ Walk an `Expr` tree and collect all `FuncCall` nodes, then check each one:
 /// Returns 'i' if all functions are immutable,
 /// 's' if the worst is stable,
 /// 'v' if any function is volatile.
-fn worst_volatility(expr: &Expr) -> Result<char, PgStreamError> {
+fn worst_volatility(expr: &Expr) -> Result<char, PgTrickleError> {
     let mut worst = 'i'; // Start optimistic
     collect_volatilities(expr, &mut worst)?;
     Ok(worst)
 }
 
-fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStreamError> {
+fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgTrickleError> {
     match expr {
         Expr::FuncCall { func_name, args } => {
             let vol = lookup_function_volatility(func_name)?;
@@ -118,7 +118,7 @@ After `parse_query()` produces an `OpTree`, walk the tree and collect the worst 
 
 ```rust
 /// Walk an OpTree and return the worst volatility found in any expression.
-fn tree_worst_volatility(tree: &OpTree) -> Result<char, PgStreamError> {
+fn tree_worst_volatility(tree: &OpTree) -> Result<char, PgTrickleError> {
     let mut worst = 'i';
     match tree {
         OpTree::Filter { predicate, child } => {
@@ -154,7 +154,7 @@ let vol = tree_worst_volatility(&op_tree)?;
 
 match (refresh_mode, vol) {
     (RefreshMode::Differential, 'v') => {
-        return Err(PgStreamError::UnsupportedOperator(
+        return Err(PgTrickleError::UnsupportedOperator(
             "Defining query contains volatile functions (e.g., random(), \
              clock_timestamp()). Volatile functions are not supported in \
              DIFFERENTIAL mode because they produce different values on \
@@ -256,7 +256,7 @@ async fn test_volatile_function_rejected_in_differential() {
     db.execute("CREATE TABLE vol_src (id INT PRIMARY KEY)").await;
 
     let result = db.try_execute(
-        "SELECT pgstream.create_stream_table('vol_st', \
+        "SELECT pgtrickle.create_stream_table('vol_st', \
          $$ SELECT id, random() AS r FROM vol_src $$, '1m', 'DIFFERENTIAL')"
     ).await;
     assert!(result.is_err());
@@ -302,7 +302,7 @@ async fn test_nested_volatile_in_where_clause_rejected() {
     db.execute("CREATE TABLE nest_vol_src (id INT PRIMARY KEY, val FLOAT)").await;
 
     let result = db.try_execute(
-        "SELECT pgstream.create_stream_table('nest_vol_st', \
+        "SELECT pgtrickle.create_stream_table('nest_vol_st', \
          $$ SELECT id, val FROM nest_vol_src WHERE val > random() $$, '1m', 'DIFFERENTIAL')"
     ).await;
     assert!(result.is_err());
@@ -314,7 +314,7 @@ async fn test_gen_random_uuid_rejected_in_differential() {
     db.execute("CREATE TABLE uuid_src (id INT PRIMARY KEY)").await;
 
     let result = db.try_execute(
-        "SELECT pgstream.create_stream_table('uuid_st', \
+        "SELECT pgtrickle.create_stream_table('uuid_st', \
          $$ SELECT id, gen_random_uuid() AS uid FROM uuid_src $$, '1m', 'DIFFERENTIAL')"
     ).await;
     assert!(result.is_err());
@@ -388,14 +388,14 @@ The fundamental distinction is between:
 | **Temporal special-casing** | Reject volatile, rewrite temporal functions to special operators | Materialize |
 | **Reject volatile** | Block non-deterministic functions in incremental modes | ksqlDB |
 | **Capture at trigger** | Evaluate volatile functions once in the CDC trigger | PipelineDB |
-| **SQL re-execution** | Re-executes the defining query; volatile functions produce different results each time | pg_stream (current) |
+| **SQL re-execution** | Re-executes the defining query; volatile functions produce different results each time | pg_trickle (current) |
 
-pg_stream uses SQL re-execution — the delta and merge CTEs re-evaluate expressions on each refresh. This means pg_stream **cannot** adopt the compiled-dataflow approach without a fundamental architecture change. The two viable options are:
+pg_trickle uses SQL re-execution — the delta and merge CTEs re-evaluate expressions on each refresh. This means pg_trickle **cannot** adopt the compiled-dataflow approach without a fundamental architecture change. The two viable options are:
 
 1. **Reject volatile** (chosen approach) — simplest, safest, matches ksqlDB and Materialize's strategy
 2. **Capture at trigger** — evaluate volatile expressions inside the CDC trigger and store the results; technically possible but extremely complex (requires partial evaluation of the defining query inside PL/pgSQL triggers)
 
-The reject-volatile approach is the right choice for pg_stream's current architecture. If a future version introduces a compiled dataflow engine (per DBSP's formal model), volatile functions could be re-evaluated.
+The reject-volatile approach is the right choice for pg_trickle's current architecture. If a future version introduces a compiled dataflow engine (per DBSP's formal model), volatile functions could be re-evaluated.
 
 ---
 

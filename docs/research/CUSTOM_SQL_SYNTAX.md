@@ -3,7 +3,7 @@
 ## Comprehensive Technical Research Report
 
 **Date:** 2026-02-25
-**Context:** pg_stream extension — evaluating approaches to support `CREATE STREAM TABLE` syntax or equivalent native-feeling DDL.
+**Context:** pg_trickle extension — evaluating approaches to support `CREATE STREAM TABLE` syntax or equivalent native-feeling DDL.
 
 ---
 
@@ -25,7 +25,7 @@
 14. [pg_ivm (Incremental View Maintenance) Pattern](#14-pg_ivm-incremental-view-maintenance-pattern)
 15. [CREATE TABLE ... USING (Table Access Methods) Deep Dive](#15-create-table--using-table-access-methods-deep-dive)
 16. [Comparison Matrix](#16-comparison-matrix)
-17. [Recommendations for pg_stream](#17-recommendations-for-pg_stream)
+17. [Recommendations for pg_trickle](#17-recommendations-for-pg_trickle)
 
 ---
 
@@ -34,7 +34,7 @@
 PostgreSQL's parser is **not extensible** — there is no parser hook that allows extensions to add new grammar rules. This is a fundamental design constraint. Every approach to "custom DDL syntax" in extensions falls into one of two categories:
 
 1. **Intercept existing syntax** — Use `ProcessUtility_hook` or event triggers to intercept standard DDL (e.g., `CREATE TABLE`, `CREATE VIEW`) and augment its behavior.
-2. **Use a SQL function as the DDL interface** — Define `SELECT my_extension.create_thing(...)` as the user-facing API (this is what pg_stream currently does).
+2. **Use a SQL function as the DDL interface** — Define `SELECT my_extension.create_thing(...)` as the user-facing API (this is what pg_trickle currently does).
 
 No production PostgreSQL extension ships truly new SQL grammar without forking the PostgreSQL parser. TimescaleDB, Citus, pg_ivm, and others all work within existing syntax boundaries.
 
@@ -263,7 +263,7 @@ Some sources reference a "custom utility command" mechanism. In practice, this d
 #### 5a. Using DO Blocks as Custom Commands
 
 ```sql
-DO $$ BEGIN PERFORM pgstream.create_stream_table('my_st', 'SELECT ...'); END $$;
+DO $$ BEGIN PERFORM pgtrickle.create_stream_table('my_st', 'SELECT ...'); END $$;
 ```
 
 This is just a wrapped function call — not a real custom command.
@@ -290,7 +290,7 @@ SELECT * FROM myext.dispatch('CREATE STREAM TABLE ...');
 Some extensions overload `SELECT` or `CALL`:
 
 ```sql
-CALL pgstream.create_stream_table('my_st', $$SELECT ...$$);
+CALL pgtrickle.create_stream_table('my_st', $$SELECT ...$$);
 ```
 
 `CALL` was introduced in PostgreSQL 11 for stored procedures. Using it makes the DDL feel more "command-like" than `SELECT function()`.
@@ -472,8 +472,8 @@ CREATE TABLE order_totals (region text, total numeric)
 Foreign Data Wrappers (FDW) allow PostgreSQL to access external data sources via `CREATE FOREIGN TABLE`. An extension can register a custom FDW:
 
 ```sql
-CREATE EXTENSION pg_stream;
-CREATE SERVER stream_server FOREIGN DATA WRAPPER pgstream_fdw;
+CREATE EXTENSION pg_trickle;
+CREATE SERVER stream_server FOREIGN DATA WRAPPER pgtrickle_fdw;
 
 CREATE FOREIGN TABLE order_totals (region text, total numeric)
     SERVER stream_server
@@ -497,7 +497,7 @@ The FDW API provides callbacks for:
 
 ### How It Could Work for Stream Tables
 
-1. Define a custom FDW (`pgstream_fdw`)
+1. Define a custom FDW (`pgtrickle_fdw`)
 2. The FDW's scan callbacks read from the underlying storage table
 3. `ProcessUtility_hook` intercepts `CREATE FOREIGN TABLE ... SERVER stream_server` to set up CDC, catalog entries, etc.
 4. A background worker handles refresh scheduling
@@ -570,7 +570,7 @@ $$ LANGUAGE plpgsql;
 1. User creates a table with a special comment or option:
    ```sql
    CREATE TABLE order_totals (region text, total numeric);
-   COMMENT ON TABLE order_totals IS 'pgstream:query=SELECT region...;schedule=1m';
+   COMMENT ON TABLE order_totals IS 'pgtrickle:query=SELECT region...;schedule=1m';
    ```
 2. Event trigger on `ddl_command_end` fires
 3. Handler parses the comment, detects stream table intent
@@ -582,7 +582,7 @@ $$ LANGUAGE plpgsql;
 2. **Cannot prevent DDL** — On `ddl_command_start`, you can raise an error to prevent it, but you can't redirect it.
 3. **Two-step process** — User must `CREATE TABLE` AND then mark it somehow (comment, option, separate function call).
 4. **No custom syntax** — Event triggers watch existing DDL commands.
-5. **pg_stream already uses this** — For DDL tracking on upstream tables (see `hooks.rs`).
+5. **pg_trickle already uses this** — For DDL tracking on upstream tables (see `hooks.rs`).
 
 ### Pros/Cons
 
@@ -593,7 +593,7 @@ $$ LANGUAGE plpgsql;
 | Can transform DDL | **No** — observe only |
 | PG version | PG 9.3+ |
 | Maintenance | Very low |
-| pg_stream usage | Already used for upstream DDL tracking |
+| pg_trickle usage | Already used for upstream DDL tracking |
 
 ---
 
@@ -676,27 +676,27 @@ SELECT add_continuous_aggregate_policy('daily_temps',
     schedule_interval => INTERVAL '1 hour');
 ```
 
-### What pg_stream Could Learn
+### What pg_trickle Could Learn
 
-The TimescaleDB pattern for pg_stream would look like:
+The TimescaleDB pattern for pg_trickle would look like:
 
 ```sql
 -- Option A: CREATE MATERIALIZED VIEW with custom option
 CREATE MATERIALIZED VIEW order_totals
-WITH (pgstream.stream = true, pgstream.schedule = '1m', pgstream.mode = 'DIFFERENTIAL')
+WITH (pgtrickle.stream = true, pgtrickle.schedule = '1m', pgtrickle.mode = 'DIFFERENTIAL')
 AS SELECT region, SUM(amount) FROM orders GROUP BY region;
 
 -- Option B: CREATE TABLE with custom option (less natural)
 CREATE TABLE order_totals (region text, total numeric)
-WITH (pgstream.stream = true);
--- Then separately: SELECT pgstream.set_query('order_totals', 'SELECT ...');
+WITH (pgtrickle.stream = true);
+-- Then separately: SELECT pgtrickle.set_query('order_totals', 'SELECT ...');
 ```
 
 ### Pros/Cons
 
 | Aspect | Assessment |
 |--------|-----------|
-| Native syntax | **Good** — `CREATE MATERIALIZED VIEW ... WITH (pgstream.stream)` looks natural |
+| Native syntax | **Good** — `CREATE MATERIALIZED VIEW ... WITH (pgtrickle.stream)` looks natural |
 | User experience | **Very good** — familiar DDL syntax with extension options |
 | Complexity | **High** — must implement full ProcessUtility_hook chain |
 | pg_dump | **Partial** — matview DDL is dumped, but custom metadata needs `pg_dump` extension or config tables |
@@ -768,7 +768,7 @@ This uses the table AM API (PostgreSQL 12+) — see Section 7.
 
 ### What Citus Teaches Us
 
-- **Function calls for complex operations** — `create_distributed_table()` is analogous to `pgstream.create_stream_table()`.
+- **Function calls for complex operations** — `create_distributed_table()` is analogous to `pgtrickle.create_stream_table()`.
 - **ProcessUtility_hook for DDL propagation** — Intercept standard DDL and add behavior.
 - **Table AM for storage** — Separate concern from distribution logic.
 - **No custom syntax** — Even with Microsoft's resources, Citus doesn't fork the parser.
@@ -777,7 +777,7 @@ This uses the table AM API (PostgreSQL 12+) — see Section 7.
 
 | Aspect | Assessment |
 |--------|-----------|
-| Native syntax | **No** — uses function calls like pg_stream |
+| Native syntax | **No** — uses function calls like pg_trickle |
 | Approach validated | **Yes** — Citus is used at massive scale with this pattern |
 | Complexity | Medium (function API) to High (ProcessUtility_hook) |
 | User adoption | Proven successful |
@@ -845,16 +845,16 @@ Several extensions use table comments or reloptions as a "poor man's metadata" t
 
 ```sql
 CREATE TABLE order_totals (region text, total numeric);
-COMMENT ON TABLE order_totals IS '@pgstream {"query": "SELECT ...", "schedule": "1m"}';
+COMMENT ON TABLE order_totals IS '@pgtrickle {"query": "SELECT ...", "schedule": "1m"}';
 ```
 
-An event trigger or background worker scans `pg_description` for tables with the `@pgstream` prefix and processes them.
+An event trigger or background worker scans `pg_description` for tables with the `@pgtrickle` prefix and processes them.
 
 #### Pattern 2: Reloptions-based
 
 ```sql
 CREATE TABLE order_totals (region text, total numeric)
-    WITH (fillfactor = 70, pgstream.stream = true);
+    WITH (fillfactor = 70, pgtrickle.stream = true);
 ```
 
 **Problem:** PostgreSQL validates reloptions against a known list. You cannot add arbitrary options to `WITH (...)` without registering them. Extensions can register custom reloptions via `add_reloption()` functions, but this is a relatively obscure API.
@@ -863,14 +863,14 @@ CREATE TABLE order_totals (region text, total numeric)
 
 ```sql
 -- Set a GUC that our ProcessUtility_hook reads
-SET pgstream.next_create_is_stream = true;
-SET pgstream.stream_query = 'SELECT region, SUM(amount) FROM orders GROUP BY region';
+SET pgtrickle.next_create_is_stream = true;
+SET pgtrickle.stream_query = 'SELECT region, SUM(amount) FROM orders GROUP BY region';
 
 -- Hook intercepts this CREATE TABLE and registers it
 CREATE TABLE order_totals (region text, total numeric);
 
 -- Reset
-RESET pgstream.next_create_is_stream;
+RESET pgtrickle.next_create_is_stream;
 ```
 
 This is extremely hacky but has been used in practice (some partitioning extensions used similar patterns before native partitioning).
@@ -898,7 +898,7 @@ This is extremely hacky but has been used in practice (some partitioning extensi
 
 ### How It Works
 
-pg_ivm is the most directly comparable extension to pg_stream. It implements incremental view maintenance for PostgreSQL.
+pg_ivm is the most directly comparable extension to pg_trickle. It implements incremental view maintenance for PostgreSQL.
 
 #### API Design
 
@@ -942,9 +942,9 @@ pg_ivm was developed as a proof-of-concept for PostgreSQL core IVM support. The 
 
 There was discussion about upstreaming IVM to PostgreSQL core. If merged, it would get proper syntax (`CREATE INCREMENTAL MATERIALIZED VIEW`). As an extension, it stays with function calls.
 
-### Relevance to pg_stream
+### Relevance to pg_trickle
 
-pg_stream's current API (`pgstream.create_stream_table()`) follows the **exact same pattern** as pg_ivm. This is the established approach for IVM extensions.
+pg_trickle's current API (`pgtrickle.create_stream_table()`) follows the **exact same pattern** as pg_ivm. This is the established approach for IVM extensions.
 
 ### Pros/Cons
 
@@ -1041,15 +1041,15 @@ SET default_table_access_method = 'stream_heap';
 
 -- Step 2: Create with query in options
 CREATE TABLE order_totals ()
-    WITH (pgstream.query = 'SELECT region, SUM(amount) FROM orders GROUP BY region',
-          pgstream.schedule = '1m');
+    WITH (pgtrickle.query = 'SELECT region, SUM(amount) FROM orders GROUP BY region',
+          pgtrickle.schedule = '1m');
 
 -- ProcessUtility_hook would:
 -- 1. Detect USING stream_heap (or detect our custom reloptions)
 -- 2. Parse the query from options
 -- 3. Derive columns from the query
 -- 4. Create the actual table with proper columns using heap AM
--- 5. Register in pgstream catalog
+-- 5. Register in pgtrickle catalog
 -- 6. Set up CDC
 ```
 
@@ -1084,11 +1084,11 @@ CREATE TABLE order_totals ()
 
 ---
 
-## 17. Recommendations for pg_stream
+## 17. Recommendations for pg_trickle
 
 ### Current Approach: Function API (Keep and Enhance)
 
-pg_stream's current approach (`pgstream.create_stream_table('name', 'query', ...)`) is:
+pg_trickle's current approach (`pgtrickle.create_stream_table('name', 'query', ...)`) is:
 
 - **Proven** — Same pattern as pg_ivm, Citus, and many other extensions
 - **Simple** — No `shared_preload_libraries` required for basic usage
@@ -1098,34 +1098,34 @@ pg_stream's current approach (`pgstream.create_stream_table('name', 'query', ...
 **Enhancement opportunities:**
 ```sql
 -- Current
-SELECT pgstream.create_stream_table('order_totals',
+SELECT pgtrickle.create_stream_table('order_totals',
     'SELECT region, SUM(amount) FROM orders GROUP BY region', '1m');
 
 -- Enhanced: CALL syntax for more DDL-like feel (PG 11+)
-CALL pgstream.create_stream_table('order_totals',
+CALL pgtrickle.create_stream_table('order_totals',
     $$SELECT region, SUM(amount) FROM orders GROUP BY region$$, '1m');
 ```
 
 ### Future Option: TimescaleDB-style Materialized View Integration
 
-If user demand justifies the complexity, pg_stream could add a **second creation path** via `ProcessUtility_hook`:
+If user demand justifies the complexity, pg_trickle could add a **second creation path** via `ProcessUtility_hook`:
 
 ```sql
 -- New native-feeling syntax (requires shared_preload_libraries)
 CREATE MATERIALIZED VIEW order_totals
-WITH (pgstream.stream = true, pgstream.schedule = '1m')
+WITH (pgtrickle.stream = true, pgtrickle.schedule = '1m')
 AS SELECT region, SUM(amount) FROM orders GROUP BY region
 WITH NO DATA;
 
 -- Original function API still works (no hook needed)
-SELECT pgstream.create_stream_table('order_totals',
+SELECT pgtrickle.create_stream_table('order_totals',
     'SELECT region, SUM(amount) FROM orders GROUP BY region', '1m');
 ```
 
 **Implementation plan for hook-based approach:**
 
 1. Register `ProcessUtility_hook` in `_PG_init()` (already needed for `shared_preload_libraries`)
-2. Intercept `CREATE MATERIALIZED VIEW` → Check for `pgstream.stream` option
+2. Intercept `CREATE MATERIALIZED VIEW` → Check for `pgtrickle.stream` option
 3. If found: parse options, call `create_stream_table_impl()` internally, create standard storage table instead of matview
 4. Intercept `DROP MATERIALIZED VIEW` → Check if target is a stream table → Clean up
 5. Intercept `REFRESH MATERIALIZED VIEW` → Route to stream table refresh engine
@@ -1144,8 +1144,8 @@ SELECT pgstream.create_stream_table('order_totals',
 
 Regardless of approach, pg_dump is a challenge. Options:
 
-1. **Custom dump/restore functions** — `pgstream.dump_config()` and `pgstream.restore_config()` 
-2. **Migration script generation** — `pgstream.generate_migration()` outputs SQL to recreate all stream tables
+1. **Custom dump/restore functions** — `pgtrickle.dump_config()` and `pgtrickle.restore_config()` 
+2. **Migration script generation** — `pgtrickle.generate_migration()` outputs SQL to recreate all stream tables
 3. **Event trigger on restore** — Detect when tables are restored and re-register them
 4. **Sidecar file** — Generate a companion SQL file alongside pg_dump
 

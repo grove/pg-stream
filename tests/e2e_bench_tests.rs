@@ -265,7 +265,7 @@ fn print_results_table(results: &[BenchResult]) {
     println!(
         "╔══════════════════════════════════════════════════════════════════════════════════════╗"
     );
-    println!("║                    pg_stream Refresh Benchmark Results                      ║");
+    println!("║                    pg_trickle Refresh Benchmark Results                      ║");
     println!(
         "╠════════════╤══════════╤════════╤═════════════╤═══════╤════════════╤═════════════════╣"
     );
@@ -528,15 +528,15 @@ async fn run_benchmark(
     let mut results = Vec::new();
 
     // ── FULL mode benchmark ────────────────────────────────────────
-    let full_pgs_name = format!("bench_{}_full", scenario.name);
-    db.create_st(&full_pgs_name, scenario.query, "1m", "FULL")
+    let full_pgt_name = format!("bench_{}_full", scenario.name);
+    db.create_st(&full_pgt_name, scenario.query, "1m", "FULL")
         .await;
 
     // Warm-up cycles (throw-away, not measured)
     for _ in 0..WARMUP_CYCLES {
         apply_changes(&db, table_size, change_pct).await;
         db.execute("ANALYZE src").await;
-        db.refresh_st(&full_pgs_name).await;
+        db.refresh_st(&full_pgt_name).await;
     }
 
     // Measured cycles
@@ -545,10 +545,10 @@ async fn run_benchmark(
         db.execute("ANALYZE src").await;
 
         let start = Instant::now();
-        db.refresh_st(&full_pgs_name).await;
+        db.refresh_st(&full_pgt_name).await;
         let elapsed = start.elapsed();
 
-        let row_count = db.count(&format!("public.{full_pgs_name}")).await;
+        let row_count = db.count(&format!("public.{full_pgt_name}")).await;
 
         results.push(BenchResult {
             scenario: scenario.name.to_string(),
@@ -562,7 +562,7 @@ async fn run_benchmark(
         });
     }
 
-    db.drop_st(&full_pgs_name).await;
+    db.drop_st(&full_pgt_name).await;
 
     // ── Re-populate source for DIFFERENTIAL (to have same starting point) ──
     db.execute("TRUNCATE src RESTART IDENTITY").await;
@@ -570,15 +570,15 @@ async fn run_benchmark(
     db.execute("ANALYZE src").await;
 
     // ── DIFFERENTIAL mode benchmark ─────────────────────────────────
-    let inc_pgs_name = format!("bench_{}_inc", scenario.name);
-    db.create_st(&inc_pgs_name, scenario.query, "1m", "DIFFERENTIAL")
+    let inc_pgt_name = format!("bench_{}_inc", scenario.name);
+    db.create_st(&inc_pgt_name, scenario.query, "1m", "DIFFERENTIAL")
         .await;
 
     // Warm-up cycles (throw-away, not measured)
     for _ in 0..WARMUP_CYCLES {
         apply_changes(&db, table_size, change_pct).await;
         db.execute("ANALYZE src").await;
-        db.refresh_st(&inc_pgs_name).await;
+        db.refresh_st(&inc_pgt_name).await;
     }
 
     // Measured cycles with profile capture
@@ -587,10 +587,10 @@ async fn run_benchmark(
         db.execute("ANALYZE src").await;
 
         let start = Instant::now();
-        db.refresh_st(&inc_pgs_name).await;
+        db.refresh_st(&inc_pgt_name).await;
         let elapsed = start.elapsed();
 
-        let row_count = db.count(&format!("public.{inc_pgs_name}")).await;
+        let row_count = db.count(&format!("public.{inc_pgt_name}")).await;
 
         // Capture [PGS_PROFILE] from container logs
         let profile = extract_last_profile(&cid).await;

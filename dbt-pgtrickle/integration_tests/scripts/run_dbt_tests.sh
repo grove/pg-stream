@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Run dbt-pgstream integration tests locally.
+# Run dbt-pgtrickle integration tests locally.
 #
-# Starts a pg_stream E2E Docker container, runs the full dbt test flow, and
+# Starts a pg_trickle E2E Docker container, runs the full dbt test flow, and
 # cleans up. Requires Docker and a Python environment with dbt installed.
 #
 # Usage:
-#   ./dbt-pgstream/integration_tests/scripts/run_dbt_tests.sh
-#   ./dbt-pgstream/integration_tests/scripts/run_dbt_tests.sh --skip-build
-#   ./dbt-pgstream/integration_tests/scripts/run_dbt_tests.sh --keep-container
+#   ./dbt-pgtrickle/integration_tests/scripts/run_dbt_tests.sh
+#   ./dbt-pgtrickle/integration_tests/scripts/run_dbt_tests.sh --skip-build
+#   ./dbt-pgtrickle/integration_tests/scripts/run_dbt_tests.sh --keep-container
 #
 # Environment variables:
 #   DBT_VERSION       dbt-core version to install (default: 1.9)
 #   PGPORT            PostgreSQL port (default: 15432, avoids conflicts)
-#   CONTAINER_NAME    Docker container name (default: pgstream-dbt-local)
+#   CONTAINER_NAME    Docker container name (default: pgtrickle-dbt-local)
 #   SKIP_BUILD        Set to "1" to skip Docker image rebuild
 #   KEEP_CONTAINER    Set to "1" to keep the container after tests
 # =============================================================================
@@ -22,7 +22,7 @@ set -euo pipefail
 # ── Configuration ───────────────────────────────────────────────────────────
 DBT_VERSION="${DBT_VERSION:-1.9}"
 PGPORT="${PGPORT:-15432}"
-CONTAINER_NAME="${CONTAINER_NAME:-pgstream-dbt-local}"
+CONTAINER_NAME="${CONTAINER_NAME:-pgtrickle-dbt-local}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 KEEP_CONTAINER="${KEEP_CONTAINER:-0}"
 
@@ -63,7 +63,7 @@ trap cleanup EXIT
 
 # ── Build Docker image (optional) ──────────────────────────────────────────
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  dbt-pgstream integration test runner"
+echo "  dbt-pgtrickle integration test runner"
 echo "  dbt version: ${DBT_VERSION}"
 echo "  Port: ${PGPORT}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -76,8 +76,8 @@ if [ "$SKIP_BUILD" = "0" ]; then
 else
   echo "Skipping Docker image build (--skip-build)"
   # Verify image exists
-  if ! docker image inspect pg_stream_e2e:latest &>/dev/null; then
-    echo "ERROR: pg_stream_e2e:latest not found. Run without --skip-build first." >&2
+  if ! docker image inspect pg_trickle_e2e:latest &>/dev/null; then
+    echo "ERROR: pg_trickle_e2e:latest not found. Run without --skip-build first." >&2
     exit 1
   fi
   echo ""
@@ -87,12 +87,12 @@ fi
 # Remove any stale container with the same name
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-echo "Starting PostgreSQL with pg_stream on port ${PGPORT}..."
+echo "Starting PostgreSQL with pg_trickle on port ${PGPORT}..."
 docker run -d \
   --name "$CONTAINER_NAME" \
   -e POSTGRES_PASSWORD=postgres \
   -p "${PGPORT}:5432" \
-  pg_stream_e2e:latest
+  pg_trickle_e2e:latest
 
 echo "Waiting for PostgreSQL to accept connections..."
 for i in $(seq 1 30); do
@@ -108,9 +108,9 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-echo "Creating pg_stream extension..."
+echo "Creating pg_trickle extension..."
 docker exec "$CONTAINER_NAME" \
-  psql -U postgres -c "CREATE EXTENSION pg_stream;"
+  psql -U postgres -c "CREATE EXTENSION pg_trickle;"
 
 # ── Install dbt (if needed) ────────────────────────────────────────────────
 if ! command -v dbt &>/dev/null; then
@@ -169,12 +169,12 @@ echo "── dbt test (after full-refresh) ──"
 dbt test
 
 echo ""
-echo "── dbt run-operation pgstream_refresh ──"
-dbt run-operation pgstream_refresh --args '{model_name: order_totals}'
+echo "── dbt run-operation pgtrickle_refresh ──"
+dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
 
 echo ""
-echo "── dbt run-operation pgstream_check_freshness ──"
-dbt run-operation pgstream_check_freshness
+echo "── dbt run-operation pgtrickle_check_freshness ──"
+dbt run-operation pgtrickle_check_freshness
 
 echo ""
 echo "── dbt run-operation drop_all_stream_tables ──"

@@ -28,14 +28,14 @@
 ## 1. Problem Statement
 
 When a user creates a stream table whose defining query references a **view**,
-pg_stream silently fails to track changes in DIFFERENTIAL mode:
+pg_trickle silently fails to track changes in DIFFERENTIAL mode:
 
 ```sql
 CREATE VIEW active_orders AS
   SELECT * FROM orders WHERE status = 'active';
 
 -- Stream table referencing the view:
-SELECT pgstream.create('order_summary', 'DIFFERENTIAL',
+SELECT pgtrickle.create('order_summary', 'DIFFERENTIAL',
   'SELECT customer_id, COUNT(*) FROM active_orders GROUP BY customer_id');
 ```
 
@@ -57,7 +57,7 @@ updates. This is **P0 — silent data staleness**.
 // api.rs lines 273-277
 for (source_oid, source_type) in &source_relids {
     if source_type == "TABLE" {
-        setup_cdc_for_source(*source_oid, pgs_id, &change_schema)?;
+        setup_cdc_for_source(*source_oid, pgt_id, &change_schema)?;
     }
 }
 ```
@@ -163,7 +163,7 @@ Follows the exact pattern of the 5 existing rewrites:
 ///
 /// Materialized views (relkind='m') are NOT inlined — their semantics
 /// differ (stale snapshot vs live query). They are rejected later.
-pub fn rewrite_views_inline(query: &str) -> Result<String, PgStreamError> {
+pub fn rewrite_views_inline(query: &str) -> Result<String, PgTrickleError> {
     let mut current = query.to_string();
     let max_depth = 10;  // Guard against pathological nesting
     
@@ -175,7 +175,7 @@ pub fn rewrite_views_inline(query: &str) -> Result<String, PgStreamError> {
         current = rewritten;
     }
     
-    Err(PgStreamError::QueryParseError(format!(
+    Err(PgTrickleError::QueryParseError(format!(
         "View inlining exceeded maximum nesting depth of {}. \
          This may indicate circular view dependencies.",
         max_depth
@@ -260,7 +260,7 @@ subquery becomes `(WITH ... SELECT ... FROM ...) AS alias`, which
 PostgreSQL 14+ supports (CTEs in subqueries).
 
 For PostgreSQL versions before 14 where CTEs in subqueries aren't
-supported: pg_stream targets PG 18, so this is not a concern.
+supported: pg_trickle targets PG 18, so this is not a concern.
 
 ### 4.7 Handling views in JOINs
 
@@ -372,7 +372,7 @@ rewrite should **not** inline it — instead, it should return an error:
 
 ```rust
 if relkind == "m" {
-    return Err(PgStreamError::UnsupportedOperator(format!(
+    return Err(PgTrickleError::UnsupportedOperator(format!(
         "Materialized view '{}' cannot be used as a source in DIFFERENTIAL mode. \
          Materialized views are stale snapshots — CDC triggers cannot track \
          REFRESH MATERIALIZED VIEW. Use the underlying query directly, or \
@@ -408,7 +408,7 @@ Also reject `relkind = 'f'` (foreign tables) with a clear message:
 
 ```rust
 if relkind == "f" {
-    return Err(PgStreamError::UnsupportedOperator(format!(
+    return Err(PgTrickleError::UnsupportedOperator(format!(
         "Foreign table '{}' cannot be used as a source in DIFFERENTIAL mode. \
          Row-level triggers cannot be created on foreign tables. \
          Use FULL refresh mode instead.",
@@ -454,14 +454,14 @@ that view can no longer be re-created. This is handled in Step 8.
 Add an `original_query` column to preserve the user's original SQL:
 
 ```sql
-ALTER TABLE pgstream.pgs_stream_tables
+ALTER TABLE pgtrickle.pgt_stream_tables
   ADD COLUMN original_query TEXT;
 ```
 
 **Schema change in `src/lib.rs`:**
 
 ```sql
-CREATE TABLE IF NOT EXISTS pgstream.pgs_stream_tables (
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     ...
     defining_query  TEXT NOT NULL,    -- Rewritten (post-inlining)
     original_query  TEXT,             -- Original user SQL (pre-inlining)
@@ -474,7 +474,7 @@ the expanded form). The `original_query` is needed for:
 
 1. **Reinit after view definition change:** Re-run the rewrite pipeline
    on the original query to pick up the new view definition
-2. **User introspection:** `pgstream.info()` shows what the user wrote
+2. **User introspection:** `pgtrickle.info()` shows what the user wrote
 3. **ALTER stream table:** If we ever support changing the defining query
 
 **In `api.rs`:**
@@ -482,7 +482,7 @@ the expanded form). The `original_query` is needed for:
 ```rust
 // Store both the original and rewritten query
 StreamTableMeta::insert(
-    pgs_relid, &table_name, &schema,
+    pgt_relid, &table_name, &schema,
     query,             // defining_query (rewritten)
     Some(original),    // original_query (user's input)
     schedule_str, refresh_mode,
@@ -520,12 +520,12 @@ for (source_oid, source_type) in &rewritten_sources { ... }
 // Register view soft-dependencies (for DDL tracking only)
 for (view_oid, _) in &view_sources {
     StDependency::insert_with_snapshot(
-        pgs_id, *view_oid, "VIEW", None, None, None,
+        pgt_id, *view_oid, "VIEW", None, None, None,
     )?;
 }
 ```
 
-The view dependency rows enable `find_downstream_pgs_ids()` to find
+The view dependency rows enable `find_downstream_pgt_ids()` to find
 affected stream tables when a view is modified.
 
 ### Step 9: Write tests
@@ -572,7 +572,7 @@ CREATE VIEW v AS WITH cte AS (SELECT ...) SELECT * FROM cte;
 ```
 
 When inlined: `FROM (WITH cte AS (...) SELECT ...) AS v`. PostgreSQL 14+
-supports CTEs inside subqueries. Since pg_stream targets PG 18, this works.
+supports CTEs inside subqueries. Since pg_trickle targets PG 18, this works.
 
 ### 6.3 Views with set operations
 
@@ -683,7 +683,7 @@ stream table, the stream table's stored `defining_query` becomes stale.
 **Detection mechanism:**
 
 1. Hook fires for `("view", "CREATE VIEW")`
-2. Look up the view OID in `pgs_dependencies` (source_type = 'VIEW')
+2. Look up the view OID in `pgt_dependencies` (source_type = 'VIEW')
 3. If matches found: mark those stream tables as `needs_reinit = true`
 4. On next scheduled refresh, the reinit process:
    - Reads `original_query` from catalog
@@ -697,8 +697,8 @@ When a view is dropped, any stream table that referenced it is broken.
 
 **Detection mechanism:**
 
-1. Extend `pg_stream_on_sql_drop()` to also handle `object_type == "view"`
-2. Look up the dropped OID in `pgs_dependencies`
+1. Extend `pg_trickle_on_sql_drop()` to also handle `object_type == "view"`
+2. Look up the dropped OID in `pgt_dependencies`
 3. If matches found: mark as `needs_reinit = true` with error status
 
 The reinit will fail (view no longer exists) and the stream table enters
@@ -726,11 +726,11 @@ fn handle_view_change(cmd: &DdlCommand) {
     let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
     
     // Find STs that depend on this view
-    let affected = match find_downstream_pgs_ids(cmd.objid) {
+    let affected = match find_downstream_pgt_ids(cmd.objid) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
-                "pg_stream_ddl_tracker: failed to find dependents of view {}: {}",
+                "pg_trickle_ddl_tracker: failed to find dependents of view {}: {}",
                 identity, e
             );
             return;
@@ -742,13 +742,13 @@ fn handle_view_change(cmd: &DdlCommand) {
     }
     
     pgrx::info!(
-        "pg_stream: view {} changed, marking {} stream table(s) for reinit",
+        "pg_trickle: view {} changed, marking {} stream table(s) for reinit",
         identity, affected.len()
     );
     
-    for pgs_id in &affected {
-        if let Err(e) = StreamTableMeta::mark_needs_reinit(*pgs_id) {
-            pgrx::warning!("pg_stream: failed to mark ST {} for reinit: {}", pgs_id, e);
+    for pgt_id in &affected {
+        if let Err(e) = StreamTableMeta::mark_needs_reinit(*pgt_id) {
+            pgrx::warning!("pg_trickle: failed to mark ST {} for reinit: {}", pgt_id, e);
         }
     }
 }
@@ -757,7 +757,7 @@ fn handle_view_change(cmd: &DdlCommand) {
 And in the drop handler:
 
 ```rust
-// hooks.rs — extend pg_stream_on_sql_drop()
+// hooks.rs — extend pg_trickle_on_sql_drop()
 for obj in &dropped {
     match obj.object_type.as_str() {
         "table" => handle_dropped_table(obj),
@@ -777,11 +777,11 @@ Add `original_query` column:
 
 ```sql
 -- Extension upgrade SQL (0.1.x → 0.2.0 or similar)
-ALTER TABLE pgstream.pgs_stream_tables
+ALTER TABLE pgtrickle.pgt_stream_tables
   ADD COLUMN IF NOT EXISTS original_query TEXT;
 
 -- Backfill: for existing STs, original = defining (no views were inlined)
-UPDATE pgstream.pgs_stream_tables
+UPDATE pgtrickle.pgt_stream_tables
 SET original_query = defining_query
 WHERE original_query IS NULL;
 ```
@@ -798,22 +798,22 @@ pub struct StreamTableMeta {
 
 ### 8.3 Dependency table — no schema change needed
 
-The `pgs_dependencies` table already supports `source_type = 'VIEW'`.
+The `pgt_dependencies` table already supports `source_type = 'VIEW'`.
 View soft-dependencies use existing infrastructure.
 
 ### 8.4 Info view update
 
-The `pgstream.stream_tables` view should expose `original_query`:
+The `pgtrickle.stream_tables` view should expose `original_query`:
 
 ```sql
-CREATE OR REPLACE VIEW pgstream.stream_tables AS
+CREATE OR REPLACE VIEW pgtrickle.stream_tables AS
 SELECT
-    st.pgs_id,
-    st.pgs_schema || '.' || st.pgs_name AS name,
+    st.pgt_id,
+    st.pgt_schema || '.' || st.pgt_name AS name,
     st.defining_query,
     st.original_query,  -- NEW
     ...
-FROM pgstream.pgs_stream_tables st;
+FROM pgtrickle.pgt_stream_tables st;
 ```
 
 ---
@@ -892,12 +892,12 @@ A future enhancement could offer `LIVE` mode for materialized views:
 inline the matview's definition like a regular view, ignoring the snapshot
 semantics. This would require a user opt-in flag.
 
-### 11.2 View metadata in pgstream.info()
+### 11.2 View metadata in pgtrickle.info()
 
 Display inlined views and their definitions in the monitoring output:
 
 ```sql
-SELECT * FROM pgstream.info('my_st');
+SELECT * FROM pgtrickle.info('my_st');
 -- Output includes:
 --   original_query: SELECT ... FROM my_view
 --   defining_query: SELECT ... FROM (SELECT ... FROM base_table) AS my_view

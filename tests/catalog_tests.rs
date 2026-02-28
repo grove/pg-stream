@@ -1,6 +1,6 @@
 //! Integration tests for the catalog layer.
 //!
-//! These tests verify that the pg_stream catalog tables enforce constraints
+//! These tests verify that the pg_trickle catalog tables enforce constraints
 //! correctly and that the SQL-level operations work as expected.
 
 mod common;
@@ -13,19 +13,19 @@ use common::TestDb;
 async fn test_catalog_schemas_created() {
     let db = TestDb::with_catalog().await;
 
-    let pg_stream_exists: bool = db
+    let pg_trickle_exists: bool = db
         .query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgstream')",
+            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgtrickle')",
         )
         .await;
-    assert!(pg_stream_exists, "pg_stream schema should exist");
+    assert!(pg_trickle_exists, "pg_trickle schema should exist");
 
     let changes_exists: bool = db
         .query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgstream_changes')",
+            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgtrickle_changes')",
         )
         .await;
-    assert!(changes_exists, "pgstream_changes schema should exist");
+    assert!(changes_exists, "pgtrickle_changes schema should exist");
 }
 
 #[tokio::test]
@@ -33,10 +33,10 @@ async fn test_catalog_tables_exist() {
     let db = TestDb::with_catalog().await;
 
     let tables = [
-        ("pgstream", "pgs_stream_tables"),
-        ("pgstream", "pgs_dependencies"),
-        ("pgstream", "pgs_refresh_history"),
-        ("pgstream", "pgs_change_tracking"),
+        ("pgtrickle", "pgt_stream_tables"),
+        ("pgtrickle", "pgt_dependencies"),
+        ("pgtrickle", "pgt_refresh_history"),
+        ("pgtrickle", "pgt_change_tracking"),
     ];
 
     for (schema, table) in tables {
@@ -58,10 +58,10 @@ async fn test_stream_tables_info_view_exists() {
     let exists: bool = db
         .query_scalar(
             "SELECT EXISTS(SELECT 1 FROM information_schema.views \
-             WHERE table_schema = 'pgstream' AND table_name = 'stream_tables_info')",
+             WHERE table_schema = 'pgtrickle' AND table_name = 'stream_tables_info')",
         )
         .await;
-    assert!(exists, "pgstream.stream_tables_info view should exist");
+    assert!(exists, "pgtrickle.stream_tables_info view should exist");
 }
 
 // ── Catalog CRUD Operations ────────────────────────────────────────────────
@@ -79,23 +79,23 @@ async fn test_insert_stream_table() {
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode) \
          VALUES ({}, 'test_st', 'public', 'SELECT * FROM test_source', '1m', 'FULL')",
         source_oid
     ))
     .await;
 
-    let count = db.count("pgstream.pgs_stream_tables").await;
+    let count = db.count("pgtrickle.pgt_stream_tables").await;
     assert_eq!(count, 1);
 
     let name: String = db
-        .query_scalar("SELECT pgs_name FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+        .query_scalar("SELECT pgt_name FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
     assert_eq!(name, "test_st");
 
     let status: String = db
-        .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+        .query_scalar("SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
     assert_eq!(status, "INITIALIZING");
 }
@@ -111,8 +111,8 @@ async fn test_unique_name_constraint() {
     let oid2: i32 = db.query_scalar("SELECT 't2'::regclass::oid::int").await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode) \
          VALUES ({}, 'dup_st', 'public', 'SELECT * FROM t1', 'FULL')",
         oid1
     ))
@@ -121,8 +121,8 @@ async fn test_unique_name_constraint() {
     // Should fail: same name + schema
     let result = db
         .try_execute(&format!(
-            "INSERT INTO pgstream.pgs_stream_tables \
-             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
+            "INSERT INTO pgtrickle.pgt_stream_tables \
+             (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode) \
              VALUES ({}, 'dup_st', 'public', 'SELECT * FROM t2', 'FULL')",
             oid2
         ))
@@ -145,8 +145,8 @@ async fn test_refresh_mode_check_constraint() {
     // Invalid mode should fail
     let result = db
         .try_execute(&format!(
-            "INSERT INTO pgstream.pgs_stream_tables \
-             (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
+            "INSERT INTO pgtrickle.pgt_stream_tables \
+             (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode) \
              VALUES ({}, 'bad_mode', 'public', 'SELECT 1', 'INVALID_MODE')",
             oid
         ))
@@ -169,8 +169,8 @@ async fn test_status_check_constraint() {
     // Invalid status should fail
     let result = db
         .try_execute(&format!(
-            "INSERT INTO pgstream.pgs_stream_tables \
-             (pgs_relid, pgs_name, pgs_schema, defining_query, status) \
+            "INSERT INTO pgtrickle.pgt_stream_tables \
+             (pgt_relid, pgt_name, pgt_schema, defining_query, status) \
              VALUES ({}, 'bad_status', 'public', 'SELECT 1', 'RUNNING')",
             oid
         ))
@@ -201,8 +201,8 @@ async fn test_dependency_insertion_and_cascade_delete() {
 
     // Insert ST
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode) \
          VALUES ({}, 'dep_test', 'public', 'SELECT * FROM dep_source', 'DIFFERENTIAL')",
         storage_oid
     ))
@@ -210,20 +210,20 @@ async fn test_dependency_insertion_and_cascade_delete() {
 
     // Insert dependency
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_dependencies (pgs_id, source_relid, source_type) \
+        "INSERT INTO pgtrickle.pgt_dependencies (pgt_id, source_relid, source_type) \
          VALUES (1, {}, 'TABLE')",
         src_oid
     ))
     .await;
 
-    let dep_count = db.count("pgstream.pgs_dependencies").await;
+    let dep_count = db.count("pgtrickle.pgt_dependencies").await;
     assert_eq!(dep_count, 1);
 
     // Delete ST — dependencies should cascade
-    db.execute("DELETE FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+    db.execute("DELETE FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
 
-    let dep_count = db.count("pgstream.pgs_dependencies").await;
+    let dep_count = db.count("pgtrickle.pgt_dependencies").await;
     assert_eq!(dep_count, 0, "Dependencies should be cascade deleted");
 }
 
@@ -240,8 +240,8 @@ async fn test_refresh_history_recording() {
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode) \
          VALUES ({}, 'hist_st', 'public', 'SELECT * FROM hist_source', 'FULL')",
         oid
     ))
@@ -249,25 +249,27 @@ async fn test_refresh_history_recording() {
 
     // Record a refresh
     db.execute(
-        "INSERT INTO pgstream.pgs_refresh_history \
-         (pgs_id, data_timestamp, start_time, action, status, rows_inserted, rows_deleted) \
+        "INSERT INTO pgtrickle.pgt_refresh_history \
+         (pgt_id, data_timestamp, start_time, action, status, rows_inserted, rows_deleted) \
          VALUES (1, now(), now(), 'FULL', 'RUNNING', 0, 0)",
     )
     .await;
 
-    let count = db.count("pgstream.pgs_refresh_history").await;
+    let count = db.count("pgtrickle.pgt_refresh_history").await;
     assert_eq!(count, 1);
 
     // Complete the refresh
     db.execute(
-        "UPDATE pgstream.pgs_refresh_history \
+        "UPDATE pgtrickle.pgt_refresh_history \
          SET end_time = now(), status = 'COMPLETED', rows_inserted = 42 \
          WHERE refresh_id = 1",
     )
     .await;
 
     let rows_inserted: i64 = db
-        .query_scalar("SELECT rows_inserted FROM pgstream.pgs_refresh_history WHERE refresh_id = 1")
+        .query_scalar(
+            "SELECT rows_inserted FROM pgtrickle.pgt_refresh_history WHERE refresh_id = 1",
+        )
         .await;
     assert_eq!(rows_inserted, 42);
 }
@@ -278,8 +280,8 @@ async fn test_refresh_history_action_check_constraint() {
 
     let result = db
         .try_execute(
-            "INSERT INTO pgstream.pgs_refresh_history \
-             (pgs_id, data_timestamp, start_time, action, status) \
+            "INSERT INTO pgtrickle.pgt_refresh_history \
+             (pgt_id, data_timestamp, start_time, action, status) \
              VALUES (1, now(), now(), 'INVALID', 'RUNNING')",
         )
         .await;
@@ -302,8 +304,8 @@ async fn test_stream_tables_info_view() {
 
     // Insert with a data timestamp in the past
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, \
           refresh_mode, status, is_populated, data_timestamp) \
          VALUES ({}, 'view_st', 'public', 'SELECT * FROM view_source', \
                  '5m', 'FULL', 'ACTIVE', true, now() - interval '10 minutes')",
@@ -313,7 +315,7 @@ async fn test_stream_tables_info_view() {
 
     // Query the info view
     let stale: bool = db
-        .query_scalar("SELECT stale FROM pgstream.stream_tables_info WHERE pgs_name = 'view_st'")
+        .query_scalar("SELECT stale FROM pgtrickle.stream_tables_info WHERE pgt_name = 'view_st'")
         .await;
     assert!(
         stale,
@@ -328,32 +330,32 @@ async fn test_change_tracking_crud() {
     let db = TestDb::with_catalog().await;
 
     db.execute(
-        "INSERT INTO pgstream.pgs_change_tracking (source_relid, slot_name, tracked_by_pgs_ids) \
-         VALUES (12345, 'pg_stream_slot_12345', ARRAY[1, 2])",
+        "INSERT INTO pgtrickle.pgt_change_tracking (source_relid, slot_name, tracked_by_pgt_ids) \
+         VALUES (12345, 'pg_trickle_slot_12345', ARRAY[1, 2])",
     )
     .await;
 
     let slot_name: String = db
         .query_scalar(
-            "SELECT slot_name FROM pgstream.pgs_change_tracking WHERE source_relid = 12345",
+            "SELECT slot_name FROM pgtrickle.pgt_change_tracking WHERE source_relid = 12345",
         )
         .await;
-    assert_eq!(slot_name, "pg_stream_slot_12345");
+    assert_eq!(slot_name, "pg_trickle_slot_12345");
 
     // Add another ST to tracking
     db.execute(
-        "UPDATE pgstream.pgs_change_tracking \
-         SET tracked_by_pgs_ids = array_append(tracked_by_pgs_ids, 3) \
+        "UPDATE pgtrickle.pgt_change_tracking \
+         SET tracked_by_pgt_ids = array_append(tracked_by_pgt_ids, 3) \
          WHERE source_relid = 12345",
     )
     .await;
 
-    let pgs_ids: Vec<i64> = db
+    let pgt_ids: Vec<i64> = db
         .query_scalar(
-            "SELECT tracked_by_pgs_ids FROM pgstream.pgs_change_tracking WHERE source_relid = 12345",
+            "SELECT tracked_by_pgt_ids FROM pgtrickle.pgt_change_tracking WHERE source_relid = 12345",
         )
         .await;
-    assert_eq!(pgs_ids, vec![1, 2, 3]);
+    assert_eq!(pgt_ids, vec![1, 2, 3]);
 }
 
 // ── Status Transitions ─────────────────────────────────────────────────────
@@ -368,8 +370,8 @@ async fn test_status_transitions() {
         .await;
 
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, refresh_mode) \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode) \
          VALUES ({}, 'trans_st', 'public', 'SELECT * FROM trans_src', 'FULL')",
         oid
     ))
@@ -377,44 +379,44 @@ async fn test_status_transitions() {
 
     // Initial status should be INITIALIZING
     let status: String = db
-        .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+        .query_scalar("SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
     assert_eq!(status, "INITIALIZING");
 
     // Transition to ACTIVE
-    db.execute("UPDATE pgstream.pgs_stream_tables SET status = 'ACTIVE' WHERE pgs_id = 1")
+    db.execute("UPDATE pgtrickle.pgt_stream_tables SET status = 'ACTIVE' WHERE pgt_id = 1")
         .await;
     let status: String = db
-        .query_scalar("SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+        .query_scalar("SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
     assert_eq!(status, "ACTIVE");
 
     // Increment errors — simulate consecutive failures
     for _ in 0..3 {
         db.execute(
-            "UPDATE pgstream.pgs_stream_tables \
-             SET consecutive_errors = consecutive_errors + 1 WHERE pgs_id = 1",
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET consecutive_errors = consecutive_errors + 1 WHERE pgt_id = 1",
         )
         .await;
     }
 
     let errors: i32 = db
-        .query_scalar("SELECT consecutive_errors FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+        .query_scalar("SELECT consecutive_errors FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
     assert_eq!(errors, 3);
 
     // Auto-suspend after errors
-    db.execute("UPDATE pgstream.pgs_stream_tables SET status = 'SUSPENDED' WHERE pgs_id = 1")
+    db.execute("UPDATE pgtrickle.pgt_stream_tables SET status = 'SUSPENDED' WHERE pgt_id = 1")
         .await;
 
     // Resume: set ACTIVE + reset errors
     db.execute(
-        "UPDATE pgstream.pgs_stream_tables \
-         SET status = 'ACTIVE', consecutive_errors = 0 WHERE pgs_id = 1",
+        "UPDATE pgtrickle.pgt_stream_tables \
+         SET status = 'ACTIVE', consecutive_errors = 0 WHERE pgt_id = 1",
     )
     .await;
     let errors: i32 = db
-        .query_scalar("SELECT consecutive_errors FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+        .query_scalar("SELECT consecutive_errors FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
     assert_eq!(errors, 0);
 }
@@ -427,7 +429,7 @@ async fn test_change_buffer_table_schema() {
 
     // Simulate creating a change buffer table like cdc.rs does (typed columns)
     db.execute(
-        "CREATE TABLE pgstream_changes.changes_12345 (\
+        "CREATE TABLE pgtrickle_changes.changes_12345 (\
          change_id   BIGSERIAL,\
          lsn         PG_LSN NOT NULL,\
          action      CHAR(1) NOT NULL,\
@@ -440,16 +442,16 @@ async fn test_change_buffer_table_schema() {
 
     // Insert a sample change
     db.execute(
-        "INSERT INTO pgstream_changes.changes_12345 (lsn, action, \"new_id\", \"new_name\") \
+        "INSERT INTO pgtrickle_changes.changes_12345 (lsn, action, \"new_id\", \"new_name\") \
          VALUES ('0/1234', 'I', 1, 'Alice')",
     )
     .await;
 
-    let count = db.count("pgstream_changes.changes_12345").await;
+    let count = db.count("pgtrickle_changes.changes_12345").await;
     assert_eq!(count, 1);
 
     let action: String = db
-        .query_scalar("SELECT action FROM pgstream_changes.changes_12345 WHERE change_id = 1")
+        .query_scalar("SELECT action FROM pgtrickle_changes.changes_12345 WHERE change_id = 1")
         .await;
     assert_eq!(action, "I");
 }
@@ -477,8 +479,8 @@ async fn test_multiple_sts_sharing_source() {
 
     // Create two STs
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_stream_tables \
-         (pgs_relid, pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status) \
+        "INSERT INTO pgtrickle.pgt_stream_tables \
+         (pgt_relid, pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status) \
          VALUES \
          ({}, 'st1', 'public', 'SELECT * FROM shared_source', '1m', 'FULL', 'ACTIVE'), \
          ({}, 'st2', 'public', 'SELECT id FROM shared_source WHERE val > 10', '5m', 'DIFFERENTIAL', 'ACTIVE')",
@@ -488,25 +490,25 @@ async fn test_multiple_sts_sharing_source() {
 
     // Both depend on the same source
     db.execute(&format!(
-        "INSERT INTO pgstream.pgs_dependencies (pgs_id, source_relid, source_type) VALUES \
+        "INSERT INTO pgtrickle.pgt_dependencies (pgt_id, source_relid, source_type) VALUES \
          (1, {src_oid}, 'TABLE'), (2, {src_oid}, 'TABLE')",
     ))
     .await;
 
     // Verify both are tracked
-    let dep_count = db.count("pgstream.pgs_dependencies").await;
+    let dep_count = db.count("pgtrickle.pgt_dependencies").await;
     assert_eq!(dep_count, 2);
 
     // Drop st1 — dependencies for st1 cascade, but st2's remain
-    db.execute("DELETE FROM pgstream.pgs_stream_tables WHERE pgs_id = 1")
+    db.execute("DELETE FROM pgtrickle.pgt_stream_tables WHERE pgt_id = 1")
         .await;
 
-    let remaining_deps = db.count("pgstream.pgs_dependencies").await;
+    let remaining_deps = db.count("pgtrickle.pgt_dependencies").await;
     assert_eq!(remaining_deps, 1, "Only st2's dependency should remain");
 
     // Verify remaining dependency belongs to st2
-    let remaining_pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_dependencies LIMIT 1")
+    let remaining_pgt_id: i64 = db
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_dependencies LIMIT 1")
         .await;
-    assert_eq!(remaining_pgs_id, 2);
+    assert_eq!(remaining_pgt_id, 2);
 }

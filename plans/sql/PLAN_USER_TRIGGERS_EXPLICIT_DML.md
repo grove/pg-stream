@@ -11,8 +11,8 @@
 | Phase | Status | Notes |
 |---|---|---|
 | Phase 1: Trigger detection + explicit DML | ✅ Complete | `has_user_triggers()` in cdc.rs, explicit DML path in refresh.rs, `CachedMergeTemplate` extended, per-step profiling |
-| Phase 2: FULL refresh trigger support | ❌ Will not implement | Row-level triggers suppressed during FULL refresh via `DISABLE TRIGGER USER` + `NOTIFY pgstream_refresh`. Snapshot-diff replay rejected — see [Phase 2 Decision](#phase-2-decision-will-not-implement). |
-| Phase 3: Documentation + GUC + DDL warning | ✅ Complete | `pg_stream.user_triggers` GUC (auto/on/off), DDL warning in hooks.rs, docs updated (SQL_REFERENCE.md, FAQ.md, CONFIGURATION.md) |
+| Phase 2: FULL refresh trigger support | ❌ Will not implement | Row-level triggers suppressed during FULL refresh via `DISABLE TRIGGER USER` + `NOTIFY pgtrickle_refresh`. Snapshot-diff replay rejected — see [Phase 2 Decision](#phase-2-decision-will-not-implement). |
+| Phase 3: Documentation + GUC + DDL warning | ✅ Complete | `pg_trickle.user_triggers` GUC (auto/on/off), DDL warning in hooks.rs, docs updated (SQL_REFERENCE.md, FAQ.md, CONFIGURATION.md) |
 
 **Files modified:**
 - `src/cdc.rs` — `has_user_triggers()`
@@ -21,7 +21,7 @@
 - `src/hooks.rs` — DDL warning on `CREATE TRIGGER` targeting a stream table
 - `docs/SQL_REFERENCE.md` — User triggers now ✅ Supported (DIFFERENTIAL)
 - `docs/FAQ.md` — Rewrote trigger FAQ entries, added GUC to reference table
-- `docs/CONFIGURATION.md` — Added `pg_stream.user_triggers` section
+- `docs/CONFIGURATION.md` — Added `pg_trickle.user_triggers` section
 - `tests/e2e_user_trigger_tests.rs` — 10 E2E tests (INSERT/UPDATE/DELETE triggers, no-op skip, audit trail, GUC control, FULL suppression, BEFORE trigger)
 - `tests/trigger_detection_tests.rs` — 7 integration tests for `has_user_triggers()` SQL pattern
 
@@ -75,9 +75,9 @@ Differential refresh (no user triggers — unchanged):
 Differential refresh (with user triggers):
   1. Build delta SQL (same cached template)
   2. Materialize delta into a temp table
-  3. DELETE rows where __pgs_action = 'D'
-  4. UPDATE rows where __pgs_action = 'I' AND row exists    ← triggers fire
-  5. INSERT rows where __pgs_action = 'I' AND row is new    ← triggers fire
+  3. DELETE rows where __pgt_action = 'D'
+  4. UPDATE rows where __pgt_action = 'I' AND row exists    ← triggers fire
+  5. INSERT rows where __pgt_action = 'I' AND row is new    ← triggers fire
      (DELETE triggers fire in step 3)
 
 Full refresh (with user triggers):
@@ -110,7 +110,7 @@ The explicit DML path is only used when `has_user_triggers(st_oid)` returns
 true. STs without user triggers continue to use the MERGE path — zero
 overhead, zero behavior change.
 
-The check queries `pg_trigger` for non-internal, non-pg_stream row-level
+The check queries `pg_trigger` for non-internal, non-pg_trickle row-level
 triggers. This is a single index scan on `pg_trigger(tgrelid)`, cached per
 refresh cycle.
 
@@ -119,10 +119,10 @@ refresh cycle.
 The delta query is evaluated once and materialized into a temp table:
 
 ```sql
-CREATE TEMP TABLE __pgs_delta_<pgs_id> ON COMMIT DROP AS (
-    SELECT DISTINCT ON (__pgs_row_id) *
+CREATE TEMP TABLE __pgt_delta_<pgt_id> ON COMMIT DROP AS (
+    SELECT DISTINCT ON (__pgt_row_id) *
     FROM (<delta_sql>) __raw
-    ORDER BY __pgs_row_id, __pgs_action DESC
+    ORDER BY __pgt_row_id, __pgt_action DESC
 );
 ```
 
@@ -138,30 +138,30 @@ the MERGE path). Net overhead vs MERGE: only the temp table DDL.
 ```sql
 -- Step 1: DELETE removed rows
 DELETE FROM <st> AS st
-USING __pgs_delta_<pgs_id> AS d
-WHERE st.__pgs_row_id = d.__pgs_row_id
-  AND d.__pgs_action = 'D';
+USING __pgt_delta_<pgt_id> AS d
+WHERE st.__pgt_row_id = d.__pgt_row_id
+  AND d.__pgt_action = 'D';
 
 -- Step 2: UPDATE changed rows (row existed, new value from delta)
 UPDATE <st> AS st
 SET col1 = d.col1, col2 = d.col2, ...
-FROM __pgs_delta_<pgs_id> AS d
-WHERE st.__pgs_row_id = d.__pgs_row_id
-  AND d.__pgs_action = 'I';
+FROM __pgt_delta_<pgt_id> AS d
+WHERE st.__pgt_row_id = d.__pgt_row_id
+  AND d.__pgt_action = 'I';
 
 -- Step 3: INSERT new rows (row did not exist)
-INSERT INTO <st> (__pgs_row_id, col1, col2, ...)
-SELECT d.__pgs_row_id, d.col1, d.col2, ...
-FROM __pgs_delta_<pgs_id> AS d
-WHERE d.__pgs_action = 'I'
+INSERT INTO <st> (__pgt_row_id, col1, col2, ...)
+SELECT d.__pgt_row_id, d.col1, d.col2, ...
+FROM __pgt_delta_<pgt_id> AS d
+WHERE d.__pgt_action = 'I'
   AND NOT EXISTS (
     SELECT 1 FROM <st> AS st
-    WHERE st.__pgs_row_id = d.__pgs_row_id
+    WHERE st.__pgt_row_id = d.__pgt_row_id
   );
 ```
 
 > **Note on UPDATE vs INSERT distinction:** The delta query produces
-> `__pgs_action = 'I'` for both new rows and changed rows (a changed row
+> `__pgt_action = 'I'` for both new rows and changed rows (a changed row
 > appears as a DELETE of the old version + INSERT of the new version, which
 > `DISTINCT ON` collapses to action `'I'`). Step 2's `UPDATE ... FROM`
 > succeeds only for rows that already exist (the JOIN filters). Step 3's
@@ -177,9 +177,9 @@ the UPDATE:
 ```sql
 UPDATE <st> AS st
 SET col1 = d.col1, col2 = d.col2, ...
-FROM __pgs_delta_<pgs_id> AS d
-WHERE st.__pgs_row_id = d.__pgs_row_id
-  AND d.__pgs_action = 'I'
+FROM __pgt_delta_<pgt_id> AS d
+WHERE st.__pgt_row_id = d.__pgt_row_id
+  AND d.__pgt_action = 'I'
   AND (st.col1 IS DISTINCT FROM d.col1
        OR st.col2 IS DISTINCT FROM d.col2
        OR ...);
@@ -220,7 +220,7 @@ and are resolved identically to the MERGE template.
 ### D-7: Interaction with existing B-3 DELETE+INSERT path
 
 The current codebase has a `delete_insert` strategy (GUC
-`pg_stream.merge_strategy = 'delete_insert'`) that uses two statements instead
+`pg_trickle.merge_strategy = 'delete_insert'`) that uses two statements instead
 of MERGE. The user-trigger path is distinct:
 
 | Path | DELETE | UPDATE | INSERT | Use case |
@@ -244,21 +244,21 @@ UPDATE from INSERT to fire correct trigger types.
 
 ```rust
 /// Returns true if the stream table has any user-defined row-level
-/// triggers (excluding internal pg_stream triggers).
+/// triggers (excluding internal pg_trickle triggers).
 ///
 /// Cached per refresh cycle — the check runs once per ST per scheduler
 /// tick, not once per DML statement.
-pub fn has_user_triggers(st_relid: pg_sys::Oid) -> Result<bool, PgStreamError> {
+pub fn has_user_triggers(st_relid: pg_sys::Oid) -> Result<bool, PgTrickleError> {
     Spi::get_one::<bool>(&format!(
         "SELECT EXISTS(\
            SELECT 1 FROM pg_trigger \
            WHERE tgrelid = {}::oid \
              AND tgisinternal = false \
-             AND tgname NOT LIKE 'pgs_%' \
+             AND tgname NOT LIKE 'pgt_%' \
          )",
         st_relid.as_u32(),
     ))
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
     .map(|v| v.unwrap_or(false))
 }
 ```
@@ -273,32 +273,32 @@ Extend the MERGE template builder (both the cache-miss path and
 
 let trigger_delete_template = format!(
     "DELETE FROM {quoted_table} AS st \
-     USING __pgs_delta_{pgs_id} AS d \
-     WHERE st.__pgs_row_id = d.__pgs_row_id \
-       AND d.__pgs_action = 'D'",
-    pgs_id = st.pgs_id,
+     USING __pgt_delta_{pgt_id} AS d \
+     WHERE st.__pgt_row_id = d.__pgt_row_id \
+       AND d.__pgt_action = 'D'",
+    pgt_id = st.pgt_id,
 );
 
 let trigger_update_template = format!(
     "UPDATE {quoted_table} AS st \
      SET {update_set_clause} \
-     FROM __pgs_delta_{pgs_id} AS d \
-     WHERE st.__pgs_row_id = d.__pgs_row_id \
-       AND d.__pgs_action = 'I' \
+     FROM __pgt_delta_{pgt_id} AS d \
+     WHERE st.__pgt_row_id = d.__pgt_row_id \
+       AND d.__pgt_action = 'I' \
        AND ({is_distinct_clause})",
-    pgs_id = st.pgs_id,
+    pgt_id = st.pgt_id,
 );
 
 let trigger_insert_template = format!(
-    "INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
-     SELECT d.__pgs_row_id, {d_user_col_list} \
-     FROM __pgs_delta_{pgs_id} AS d \
-     WHERE d.__pgs_action = 'I' \
+    "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+     SELECT d.__pgt_row_id, {d_user_col_list} \
+     FROM __pgt_delta_{pgt_id} AS d \
+     WHERE d.__pgt_action = 'I' \
        AND NOT EXISTS (\
          SELECT 1 FROM {quoted_table} AS st \
-         WHERE st.__pgs_row_id = d.__pgs_row_id\
+         WHERE st.__pgt_row_id = d.__pgt_row_id\
        )",
-    pgs_id = st.pgs_id,
+    pgt_id = st.pgt_id,
 );
 ```
 
@@ -308,35 +308,35 @@ After the strategy selection block (`use_delete_insert` / `use_prepared` /
 MERGE), add a new branch:
 
 ```rust
-let has_triggers = crate::cdc::has_user_triggers(st.pgs_relid)?;
+let has_triggers = crate::cdc::has_user_triggers(st.pgt_relid)?;
 
 let (merge_count, strategy_label) = if has_triggers {
     // ── User-trigger path: explicit DML ─────────────────────────
     // Step 1: Materialize delta into temp table
     let delta_sql = &resolved.merge_sql; // Contains USING clause
     let materialize_sql = format!(
-        "CREATE TEMP TABLE __pgs_delta_{pgs_id} ON COMMIT DROP AS \
+        "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
          SELECT * FROM {using_clause} AS d",
-        pgs_id = st.pgs_id,
+        pgt_id = st.pgt_id,
     );
     Spi::run(&materialize_sql)?;
 
     // Step 2: DELETE removed rows (triggers fire)
     let del_count = Spi::connect_mut(|client| {
         let r = client.update(&resolved.trigger_delete_sql, None, &[])?;
-        Ok::<usize, PgStreamError>(r.len())
+        Ok::<usize, PgTrickleError>(r.len())
     })?;
 
     // Step 3: UPDATE changed existing rows (triggers fire)
     let upd_count = Spi::connect_mut(|client| {
         let r = client.update(&resolved.trigger_update_sql, None, &[])?;
-        Ok::<usize, PgStreamError>(r.len())
+        Ok::<usize, PgTrickleError>(r.len())
     })?;
 
     // Step 4: INSERT new rows (triggers fire)
     let ins_count = Spi::connect_mut(|client| {
         let r = client.update(&resolved.trigger_insert_sql, None, &[])?;
-        Ok::<usize, PgStreamError>(r.len())
+        Ok::<usize, PgTrickleError>(r.len())
     })?;
 
     (del_count + upd_count + ins_count, "explicit_dml")
@@ -394,40 +394,40 @@ For FULL refresh when user triggers exist:
 ```rust
 fn execute_full_refresh_with_triggers(
     st: &StreamTableMeta,
-) -> Result<(i64, i64), PgStreamError> {
+) -> Result<(i64, i64), PgTrickleError> {
     // Step 1: Snapshot current ST row IDs + content hash
     let snapshot_sql = format!(
-        "CREATE TEMP TABLE __pgs_pre_{pgs_id} ON COMMIT DROP AS \
-         SELECT __pgs_row_id, {user_col_list} \
+        "CREATE TEMP TABLE __pgt_pre_{pgt_id} ON COMMIT DROP AS \
+         SELECT __pgt_row_id, {user_col_list} \
          FROM \"{schema}\".\"{name}\"",
-        pgs_id = st.pgs_id,
-        schema = st.pgs_schema,
-        name = st.pgs_name,
+        pgt_id = st.pgt_id,
+        schema = st.pgt_schema,
+        name = st.pgt_name,
     );
     Spi::run(&snapshot_sql)?;
 
     // Step 2: TRUNCATE + INSERT with triggers DISABLED
     Spi::run(&format!(
         "ALTER TABLE \"{}\".\"{}\" DISABLE TRIGGER USER",
-        st.pgs_schema, st.pgs_name,
+        st.pgt_schema, st.pgt_name,
     ))?;
 
     let (rows, _) = execute_full_refresh(st)?;
 
     Spi::run(&format!(
         "ALTER TABLE \"{}\".\"{}\" ENABLE TRIGGER USER",
-        st.pgs_schema, st.pgs_name,
+        st.pgt_schema, st.pgt_name,
     ))?;
 
     // Step 3: Compute diff against pre-snapshot
     // DELETE: rows in pre but not in post
     let del_sql = format!(
         "DELETE FROM \"{schema}\".\"{name}\" AS st \
-         USING __pgs_pre_{pgs_id} AS old \
-         WHERE st.__pgs_row_id = old.__pgs_row_id \
+         USING __pgt_pre_{pgt_id} AS old \
+         WHERE st.__pgt_row_id = old.__pgt_row_id \
            AND NOT EXISTS (\
              SELECT 1 FROM \"{schema}\".\"{name}\" AS curr \
-             WHERE curr.__pgs_row_id = old.__pgs_row_id\
+             WHERE curr.__pgt_row_id = old.__pgt_row_id\
            )",
     );
     // ... but the rows were already truncated and replaced. We need a
@@ -443,14 +443,14 @@ fn execute_full_refresh_with_triggers(
     // Simpler: use the same explicit DML approach as differential refresh.
     // Compute a "virtual delta" from the pre-snapshot and new state.
 
-    // DELETES: rows in __pgs_pre that are NOT in the new ST
-    // → re-insert from __pgs_pre (disabled triggers), then delete (enabled)
+    // DELETES: rows in __pgt_pre that are NOT in the new ST
+    // → re-insert from __pgt_pre (disabled triggers), then delete (enabled)
     //
     // UPDATES: rows in both with different values
-    // → restore old values from __pgs_pre (disabled triggers), then
+    // → restore old values from __pgt_pre (disabled triggers), then
     //   update to new values (enabled triggers)
     //
-    // INSERTS: rows in new ST that are NOT in __pgs_pre
+    // INSERTS: rows in new ST that are NOT in __pgt_pre
     // → already inserted. Delete then re-insert (enabled triggers).
     //
     // This is complex. Use the simpler "NOTIFY + change event" approach
@@ -505,14 +505,14 @@ if has_user_triggers {
 
     // Emit NOTIFY with change summary
     Spi::run(&format!(
-        "NOTIFY pgstream_refresh, '{{\
+        "NOTIFY pgtrickle_refresh, '{{\
            \"stream_table\": \"{name}\", \
            \"schema\": \"{schema}\", \
            \"mode\": \"FULL\", \
            \"rows\": {rows}\
          }}'",
-        name = st.pgs_name,
-        schema = st.pgs_schema,
+        name = st.pgt_name,
+        schema = st.pgt_schema,
         rows = rows_inserted,
     ))?;
 }
@@ -542,7 +542,7 @@ row-level triggers.
 
 **Goal:** User-facing documentation and protective warnings.
 
-#### 3.1 GUC: `pg_stream.user_triggers`
+#### 3.1 GUC: `pg_trickle.user_triggers`
 
 ```rust
 /// Enable user-trigger-aware refresh paths.
@@ -562,7 +562,7 @@ Phase 1 behavior). This is the escape hatch if explicit DML causes issues.
 Extend `src/hooks.rs` to detect `CREATE TRIGGER` on a ST:
 
 ```
-WARNING: pg_stream: trigger "my_trigger" on stream table "regional_totals"
+WARNING: pg_trickle: trigger "my_trigger" on stream table "regional_totals"
 will fire during differential refresh with correct TG_OP/OLD/NEW.
 Note: row-level triggers do NOT fire during FULL refresh.
 Use REFRESH MODE DIFFERENTIAL to ensure triggers fire on every change.
@@ -574,7 +574,7 @@ Use REFRESH MODE DIFFERENTIAL to ensure triggers fire on every change.
 |---|---|
 | `README.md` | Update restrictions table: `✅ Yes` for user triggers |
 | `docs/SQL_REFERENCE.md` | Add section on user-trigger behavior |
-| `docs/CONFIGURATION.md` | Add `pg_stream.user_triggers` GUC |
+| `docs/CONFIGURATION.md` | Add `pg_trickle.user_triggers` GUC |
 | `docs/FAQ.md` | Add "Can I add triggers to stream tables?" entry |
 
 #### 3.4 Files modified
@@ -589,7 +589,7 @@ Use REFRESH MODE DIFFERENTIAL to ensure triggers fire on every change.
 
 | Test | Description |
 |---|---|
-| `test_guc_off_suppresses_triggers` | `pg_stream.user_triggers = 'off'` → triggers do not fire |
+| `test_guc_off_suppresses_triggers` | `pg_trickle.user_triggers = 'off'` → triggers do not fire |
 | `test_guc_auto_detects_triggers` | Default GUC + user trigger → explicit DML path used |
 | `test_ddl_warning_on_create_trigger` | CREATE TRIGGER on ST → WARNING emitted |
 
@@ -647,7 +647,7 @@ while providing **better trigger semantics** with **less code**.
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | 3 index scans slower than 1 MERGE pass | Medium | Low | Only ~2–5 ms overhead for typical STs. The temp table avoids re-evaluating the delta. |
-| INSERT `NOT EXISTS` subquery slow on large ST | Low | Medium | `__pgs_row_id` has a unique index; NOT EXISTS uses anti-join. |
+| INSERT `NOT EXISTS` subquery slow on large ST | Low | Medium | `__pgt_row_id` has a unique index; NOT EXISTS uses anti-join. |
 | Temp table creation overhead | Low | Low | ~2–3 ms; `ON COMMIT DROP` avoids cleanup. |
 | User trigger writes to source table (feedback loop) | Medium | High | Document clearly. Add detection + WARNING in scheduler. |
 | `BEFORE` trigger modifies NEW incorrectly | Low | Medium | Valid PostgreSQL behavior; user responsibility. Document that BEFORE triggers can affect ST contents. |
@@ -665,7 +665,7 @@ replacement is:
 
 | PLAN_USER_TRIGGERS.md | This plan |
 |---|---|
-| `pg_stream.suppress_user_triggers` | `pg_stream.user_triggers = 'off'` |
+| `pg_trickle.suppress_user_triggers` | `pg_trickle.user_triggers = 'off'` |
 
 PLAN_USER_TRIGGERS.md Phases 2–3 (NOTIFY, DDL warning) are absorbed into
 Phase 3 of this plan.
@@ -712,7 +712,7 @@ Phase 2 (snapshot-diff trigger replay for FULL refresh) has been evaluated and
 2. **What is already implemented is the pragmatic answer.** The current code:
    - Suppresses row-level triggers during FULL refresh (`DISABLE TRIGGER USER`
      / `ENABLE TRIGGER USER`)
-   - Emits `NOTIFY pgstream_refresh` with a JSON payload so listeners can
+   - Emits `NOTIFY pgtrickle_refresh` with a JSON payload so listeners can
      react
    - Logs an INFO message directing users to DIFFERENTIAL mode
    - Is documented in FAQ.md, SQL_REFERENCE.md, and CONFIGURATION.md
@@ -737,8 +737,8 @@ Phase 2 (snapshot-diff trigger replay for FULL refresh) has been evaluated and
    DELETE` triggers fire? The explicit DML path fires them naturally (one per
    DML statement). With 3 statements, users get three trigger invocations.
    This is correct but may surprise users who expect one logical "refresh
-   event." Consider adding a `NOTIFY pgstream_refresh` for the logical event.
-   > **Resolved:** Statement-level triggers fire naturally. A `NOTIFY pgstream_refresh` is emitted for FULL refresh. The 3-invocation behavior is documented.
+   event." Consider adding a `NOTIFY pgtrickle_refresh` for the logical event.
+   > **Resolved:** Statement-level triggers fire naturally. A `NOTIFY pgtrickle_refresh` is emitted for FULL refresh. The 3-invocation behavior is documented.
 
 2. **Trigger execution order:** With DELETE → UPDATE → INSERT execution order,
    triggers fire in that order. If a user has dependencies between trigger
@@ -749,7 +749,7 @@ Phase 2 (snapshot-diff trigger replay for FULL refresh) has been evaluated and
    row-level triggers for FULL refresh. Is this acceptable? The alternative
    (snapshot-diff replay) adds significant complexity. Recommendation: defer
    to a future enhancement; document as a known limitation.
-   > **Resolved:** Accepted as documented limitation. FULL refresh suppresses row-level triggers via `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER` and emits `NOTIFY pgstream_refresh`. Users who need per-row triggers should use `REFRESH MODE DIFFERENTIAL`. Tested in `test_full_refresh_suppresses_triggers`.
+   > **Resolved:** Accepted as documented limitation. FULL refresh suppresses row-level triggers via `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER` and emits `NOTIFY pgtrickle_refresh`. Users who need per-row triggers should use `REFRESH MODE DIFFERENTIAL`. Tested in `test_full_refresh_suppresses_triggers`.
 
 4. **B-1 guard and UPDATE triggers:** The IS DISTINCT FROM guard skips no-op
    UPDATEs. This means UPDATE triggers only fire when values actually change.
@@ -772,6 +772,6 @@ Phase 2 (snapshot-diff trigger replay for FULL refresh) has been evaluated and
 3. ✅ `feat: extend CachedMergeTemplate with trigger DML templates`
 4. ✅ `test: E2E tests for user triggers on stream tables`
 5. ✅ `feat: FULL refresh trigger suppression + NOTIFY`
-6. ✅ `feat: add pg_stream.user_triggers GUC`
+6. ✅ `feat: add pg_trickle.user_triggers GUC`
 7. ✅ `feat: DDL warning on CREATE TRIGGER targeting a stream table`
 8. ✅ `docs: document user trigger support and limitations`

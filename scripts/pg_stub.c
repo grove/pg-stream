@@ -21,7 +21,7 @@
  * fail the test (the desired behaviour).
  *
  * Regenerate the symbol list with:
- *   nm target/debug/deps/pg_stream-* | grep ' U _' | awk '{print $NF}' \
+ *   nm target/debug/deps/pg_trickle-* | grep ' U _' | awk '{print $NF}' \
  *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|Is|Mem|Message|PG_|pfree|Portal|Postmaster|SPI_|Top)'
  */
 
