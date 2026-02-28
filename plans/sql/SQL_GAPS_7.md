@@ -30,7 +30,7 @@
 
 ## 1. Executive Summary
 
-pg_stream's SQL coverage is now **mature**: every PostgreSQL SELECT
+pg_trickle's SQL coverage is now **mature**: every PostgreSQL SELECT
 construct is either handled correctly or rejected with a clear, actionable
 error message. Phases 1–6 resolved 75+ original gaps, implemented 6
 auto-rewrite passes, 22 OpTree variants, and 39 aggregate functions, all
@@ -75,7 +75,7 @@ The 11 P1 items cluster in three areas:
 - **CDC** (1): keyless table content-hash collision when rows have identical content
 
 **Key observation:** All 3 WAL decoder P1 issues are dormant — they only manifest
-when the WAL CDC path is active (triggered by `pg_stream.wal_enabled = true` and
+when the WAL CDC path is active (triggered by `pg_trickle.wal_enabled = true` and
 a successful transition from triggers). The default trigger-based CDC is not
 affected. However, these must be fixed before the WAL path is promoted to
 production-ready.
@@ -294,8 +294,8 @@ disappears.
 | Field | Value |
 |-------|-------|
 | **Operator** | `diff_scan` (keyless table path) |
-| **Scenario** | Table without PRIMARY KEY has two identical rows. Content-hash `__pgs_row_id` is the same for both. |
-| **Delta behavior** | Both rows hash to the same `__pgs_row_id`. The MERGE treats them as one row. Inserting a duplicate appears as no change. Deleting one of two duplicates may delete both (the DELETE delta matches on `__pgs_row_id` which hits both). |
+| **Scenario** | Table without PRIMARY KEY has two identical rows. Content-hash `__pgt_row_id` is the same for both. |
+| **Delta behavior** | Both rows hash to the same `__pgt_row_id`. The MERGE treats them as one row. Inserting a duplicate appears as no change. Deleting one of two duplicates may delete both (the DELETE delta matches on `__pgt_row_id` which hits both). |
 | **Severity** | **P4 — Edge case for keyless tables with duplicates** |
 | **Impact** | Very low — keyless tables + exact duplicate rows is unusual |
 | **Effort** | 2–3 hours (document + E2E test) |
@@ -324,14 +324,14 @@ correctness.
 ## 5. Gap Category 2: WAL Decoder Correctness
 
 These gaps only manifest when the WAL CDC path is active
-(`pg_stream.wal_enabled = true`). The default trigger-based CDC is unaffected.
+(`pg_trickle.wal_enabled = true`). The default trigger-based CDC is unaffected.
 
 ### G2.1 — pk_hash Returns "0" for Keyless Tables
 
 | Field | Value |
 |-------|-------|
 | **Location** | `wal_decoder.rs:build_pk_hash_from_values()` |
-| **Problem** | When `pk_columns` is empty (keyless table), the WAL decoder returns literal `"0"` for pk_hash. The trigger-based CDC path computes `pg_stream_hash(row_to_json(NEW)::text)`. This mismatch means the same physical row gets different `pk_hash` values depending on CDC mode. |
+| **Problem** | When `pk_columns` is empty (keyless table), the WAL decoder returns literal `"0"` for pk_hash. The trigger-based CDC path computes `pg_trickle_hash(row_to_json(NEW)::text)`. This mismatch means the same physical row gets different `pk_hash` values depending on CDC mode. |
 | **Impact** | During TRIGGER→WAL transition, WAL-mode rows have `pk_hash = 0` while existing rows have content-based hashes. The MERGE fails to match, causing duplicate rows in the stream table. |
 | **Severity** | **P1 — Silent duplicates** |
 | **Effort** | 4–6 hours |
@@ -499,13 +499,13 @@ message suggesting privilege check. Optionally track `GRANT`/`REVOKE` events.
 | Field | Value |
 |-------|-------|
 | **Location** | `hooks.rs` |
-| **Problem** | A user trigger on `pgstream_changes.changes_<oid>` could corrupt CDC data. The event trigger warns about triggers on source tables but doesn't protect change buffer tables. |
+| **Problem** | A user trigger on `pgtrickle_changes.changes_<oid>` could corrupt CDC data. The event trigger warns about triggers on source tables but doesn't protect change buffer tables. |
 | **Severity** | **P3** |
 | **Impact** | Very low — creating triggers on internal tables requires deliberate intent |
 | **Effort** | 1 hour |
 
 **Recommendation:** Extend the event trigger to `ERROR` on trigger creation
-directed at tables in the `pgstream_changes` schema.
+directed at tables in the `pgtrickle_changes` schema.
 
 ---
 
@@ -533,7 +533,7 @@ to exclude `attgenerated != ''` columns.
 | **Location** | `refresh.rs`, `config.rs` — DELETE+INSERT merge strategy |
 | **Problem** | The `delete_insert` strategy has three compounding issues: (1) double-evaluation against mutated state causes silent wrong results for aggregate/DISTINCT queries; (2) it is slower than `MERGE` for small deltas; (3) it is incompatible with prepared statements. The `auto` strategy already switches to bulk apply for large deltas — the only scenario where DELETE+INSERT has any advantage. |
 | **Severity** | **P0 — Remove before public release** |
-| **Decision** | Remove `delete_insert` as a valid `pg_stream.merge_strategy` value. Accept only `auto` and `merge`. Emit `ERROR` if `delete_insert` is set. |
+| **Decision** | Remove `delete_insert` as a valid `pg_trickle.merge_strategy` value. Accept only `auto` and `merge`. Emit `ERROR` if `delete_insert` is set. |
 | **Effort** | 1–2 hours |
 
 ---
@@ -574,7 +574,7 @@ to exclude `attgenerated != ''` columns.
 | **Effort** | 2–3 hours |
 
 **Recommendation:** Log threshold adjustments at DEBUG level. Add a
-`pgstream.st_auto_threshold(st_name)` function or column to the monitoring view.
+`pgtrickle.st_auto_threshold(st_name)` function or column to the monitoring view.
 
 ---
 
@@ -583,12 +583,12 @@ to exclude `attgenerated != ''` columns.
 | Field | Value |
 |-------|-------|
 | **Location** | `refresh.rs` prepared statements, DDL hooks |
-| **Problem** | When `pg_stream.use_prepared_statements = true`, the extension creates `PREPARE __pgs_merge_{id}`. On DDL events (e.g., adding an index to the stream table), the delta template cache is invalidated, but the PostgreSQL-side prepared statement plan is not `DEALLOCATE`-d. The cached plan may become suboptimal. |
+| **Problem** | When `pg_trickle.use_prepared_statements = true`, the extension creates `PREPARE __pgt_merge_{id}`. On DDL events (e.g., adding an index to the stream table), the delta template cache is invalidated, but the PostgreSQL-side prepared statement plan is not `DEALLOCATE`-d. The cached plan may become suboptimal. |
 | **Severity** | **P3** |
 | **Effort** | 1–2 hours |
 
 **Recommendation:** On DDL-triggered cache invalidation, also execute
-`DEALLOCATE __pgs_merge_{id}` via SPI.
+`DEALLOCATE __pgt_merge_{id}` via SPI.
 
 ---
 
@@ -687,7 +687,7 @@ explicit GROUPING SETS.
 | **Effort** | 2–3 hours |
 
 **Recommendation:** Store the resolved NATURAL JOIN column names in
-`pgs_dependencies.columns_used` or a separate field. On schema change detection,
+`pgt_dependencies.columns_used` or a separate field. On schema change detection,
 re-resolve and compare.
 
 ---
@@ -812,11 +812,11 @@ No E2E test exercises non-default GUC settings:
 
 | GUC | Default | Untested Setting |
 |-----|---------|-----------------|
-| `pg_stream.block_source_ddl` | `false` | `true` — should block `ALTER TABLE` |
-| `pg_stream.merge_strategy` | `'auto'` | `'delete_insert'` |
-| `pg_stream.use_prepared_statements` | `false` | `true` |
-| `pg_stream.merge_planner_hints` | `true` | `false` |
-| `pg_stream.cleanup_use_truncate` | `false` | `true` |
+| `pg_trickle.block_source_ddl` | `false` | `true` — should block `ALTER TABLE` |
+| `pg_trickle.merge_strategy` | `'auto'` | `'delete_insert'` |
+| `pg_trickle.use_prepared_statements` | `false` | `true` |
+| `pg_trickle.merge_planner_hints` | `true` | `false` |
+| `pg_trickle.cleanup_use_truncate` | `false` | `true` |
 
 | **Severity** | **P3** |
 |-------|-------|
@@ -846,7 +846,7 @@ the most important operators (aggregate, join, window).
 | Field | Value |
 |-------|-------|
 | **Location** | `cdc.rs` trigger function, `hash.rs` |
-| **Problem** | For tables without a PRIMARY KEY, `pk_hash` = `pg_stream_hash(row_to_json(NEW)::text)`. Two rows with identical content produce the same hash. The MERGE's `WHEN MATCHED` arm sees them as one row. Inserting a duplicate looks like no change; deleting one of two identical rows may delete both. |
+| **Problem** | For tables without a PRIMARY KEY, `pk_hash` = `pg_trickle_hash(row_to_json(NEW)::text)`. Two rows with identical content produce the same hash. The MERGE's `WHEN MATCHED` arm sees them as one row. Inserting a duplicate looks like no change; deleting one of two identical rows may delete both. |
 | **Severity** | **P1 — Incorrect delta for tables with duplicate rows and no PK** |
 | **Impact** | Low — requires keyless tables + exact duplicates |
 | **Effort** | 4–6 hours |
@@ -900,12 +900,12 @@ the most important operators (aggregate, join, window).
 | Field | Value |
 |-------|-------|
 | **Location** | `config.rs:PGS_CHANGE_BUFFER_SCHEMA`, `cdc.rs` |
-| **Problem** | The `pgstream_changes` schema is created with default permissions. Any user with database access can INSERT/UPDATE/DELETE rows in change buffer tables, injecting bogus changes that get applied on next refresh. |
+| **Problem** | The `pgtrickle_changes` schema is created with default permissions. Any user with database access can INSERT/UPDATE/DELETE rows in change buffer tables, injecting bogus changes that get applied on next refresh. |
 | **Severity** | **P4 — Security concern in shared-database environments** |
 | **Impact** | Production systems with shared access |
 | **Effort** | 1–2 hours |
 
-**Recommendation:** `REVOKE ALL ON SCHEMA pgstream_changes FROM PUBLIC` during
+**Recommendation:** `REVOKE ALL ON SCHEMA pgtrickle_changes FROM PUBLIC` during
 extension creation. Grant access only to the extension owner.
 
 ---
@@ -933,7 +933,7 @@ extension creation. Grant access only to the extension owner.
 - ✅ Makes transaction-mode pooling work — `pg_advisory_xact_lock()` and `FOR UPDATE SKIP LOCKED` are transaction-scoped
 - ✅ Removes all session-state dependencies — fully cloud-native
 - ❌ Large refactor: advisory locks are used in refresh, CDC, and scheduling coordination throughout the codebase
-- ❌ Must also eliminate or rework prepared statements (`PREPARE __pgs_merge_*`) which are also session-scoped
+- ❌ Must also eliminate or rework prepared statements (`PREPARE __pgt_merge_*`) which are also session-scoped
 - ❌ Scope is v0.3.0+ — not appropriate as a v0.2.0 correctness fix
 
 **Decision:** Option A for v0.2.0 — document clearly. Option B is architecturally desirable but must be paired with eliminating prepared statements; it belongs in v0.3.0 operational hardening.
@@ -969,7 +969,7 @@ extension creation. Grant access only to the extension owner.
 
 | Field | Value |
 |-------|-------|
-| **Problem** | No `ALTER EXTENSION pg_stream UPDATE` migration SQL files exist. Upgrading the extension binary without a migration path strands the catalog at the old schema version. |
+| **Problem** | No `ALTER EXTENSION pg_trickle UPDATE` migration SQL files exist. Upgrading the extension binary without a migration path strands the catalog at the old schema version. |
 | **Severity** | **P3** |
 | **Effort** | See `plans/sql/PLAN_DB_SCHEMA_STABILITY.md` for full analysis |
 
@@ -986,7 +986,7 @@ extension creation. Grant access only to the extension owner.
 | **Effort** | 8–12 hours (chunked delta processing) |
 
 **Recommendation:** Short-term: document the risk and recommend the GUC
-`pg_stream.differential_max_change_ratio` to trigger FULL fallback for large
+`pg_trickle.differential_max_change_ratio` to trigger FULL fallback for large
 batches. Long-term: implement batched delta processing.
 
 ---
@@ -996,7 +996,7 @@ batches. Long-term: implement batched delta processing.
 | Field | Value |
 |-------|-------|
 | **Location** | `scheduler.rs` main loop |
-| **Problem** | `pg_stream.max_concurrent_refreshes` is configurable up to 32, but the scheduler processes STs sequentially in topological order within a single background worker. Parallel refresh is not implemented. |
+| **Problem** | `pg_trickle.max_concurrent_refreshes` is configurable up to 32, but the scheduler processes STs sequentially in topological order within a single background worker. Parallel refresh is not implemented. |
 | **Severity** | **P3** |
 | **Effort** | 12–16 hours (parallel refresh implementation) |
 
@@ -1024,7 +1024,7 @@ constraint violations → non-retryable.
 
 | Field | Value |
 |-------|-------|
-| **Problem** | Each database with pg_stream enabled consumes at least 1 background worker connection. WAL decoder uses additional connections. No documentation quantifies this overhead. |
+| **Problem** | Each database with pg_trickle enabled consumes at least 1 background worker connection. WAL decoder uses additional connections. No documentation quantifies this overhead. |
 | **Severity** | **P4** |
 | **Effort** | 1 hour (documentation) |
 
@@ -1036,12 +1036,12 @@ constraint violations → non-retryable.
 
 | Field | Value |
 |-------|-------|
-| **Problem** | `pgs_refresh_history` records total execution time but not the number of rows processed in the delta, the merge strategy used, or whether a FULL fallback occurred. Operators cannot distinguish between a fast no-op refresh and a fast small-delta refresh. |
+| **Problem** | `pgt_refresh_history` records total execution time but not the number of rows processed in the delta, the merge strategy used, or whether a FULL fallback occurred. Operators cannot distinguish between a fast no-op refresh and a fast small-delta refresh. |
 | **Severity** | **P3** |
 | **Effort** | 3–4 hours |
 
 **Recommendation:** Add `delta_row_count`, `merge_strategy_used`, and
-`was_full_fallback` columns to `pgs_refresh_history`.
+`was_full_fallback` columns to `pgt_refresh_history`.
 
 ---
 
@@ -1068,7 +1068,7 @@ for the delta query's `temp_blks_written` metric. Expose via monitoring view.
 | **Effort** | 1 hour |
 
 **Recommendation:** Make configurable via a GUC (e.g.,
-`pg_stream.buffer_alert_threshold`).
+`pg_trickle.buffer_alert_threshold`).
 
 ---
 
@@ -1094,7 +1094,7 @@ for the delta query's `temp_blks_written` metric. Expose via monitoring view.
 | **Effort** | 1–2 hours |
 
 **Recommendation:** Add to `stream_tables_info` view or expose via
-`pgstream.st_auto_threshold(name)` function.
+`pgtrickle.st_auto_threshold(name)` function.
 
 ---
 
@@ -1267,7 +1267,7 @@ mode is explicitly enabled.
 | SQL_GAPS_2 | GROUPING SETS P0, GROUP BY hardening, TABLESAMPLE | 1 | 6 | 745 → 750 |
 | SQL_GAPS_3 | Aggregates (5 new), subquery operators (Semi/Anti/Scalar Join) | ~5 | 10 | 750 → 809 |
 | SQL_GAPS_4 | Report accuracy, ordered-set aggregates (MODE, PERCENTILE) | 1 | 7 | 809 → 826 |
-| Hybrid CDC | Trigger→WAL transition, user triggers, pgs_ rename | ~3 | 12+ | 826 → 872 |
+| Hybrid CDC | Trigger→WAL transition, user triggers, pgt_ rename | ~3 | 12+ | 826 → 872 |
 | SQL_GAPS_5 | 15 steps: volatile detection, DISTINCT ON, GROUPING SETS, ALL subquery, regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables, scalar WHERE, SubLinks-OR, multi-PARTITION, recursive CTE DIFF | ~10 | 15 | 872 → ~920 |
 | SQL_GAPS_6 | 38 gaps: views, JSON_TABLE, IS JSON, SQL/JSON constructors, COLLATE, virtual gen cols, foreign tables, partitioned CDC, replication detection, operator volatility, cache invalidation, function DDL, 4 doc tiers | ~8 | 23/24 (F15 deferred) | ~920 → ~1,150 |
 | **SQL_GAPS_7** | **53 gaps: delta correctness, WAL decoder, DDL tracking, refresh engine, test coverage, CDC, production deployment, monitoring** | **TBD** | **0/51** | **~920 unit, 384 E2E** |
@@ -1293,7 +1293,7 @@ mode is explicitly enabled.
 ### What Changed Between SQL_GAPS_6 and SQL_GAPS_7
 
 SQL_GAPS_6 focused on **SQL syntax coverage** and **operational boundary
-conditions** — does pg_stream handle every PostgreSQL SELECT construct, and does
+conditions** — does pg_trickle handle every PostgreSQL SELECT construct, and does
 it interact correctly with views, foreign tables, partitioned tables, JSON_TABLE,
 virtual generated columns, etc.? All P0 and P1 syntax items were resolved.
 

@@ -38,30 +38,30 @@
 //!
 //! ```sql
 //! WITH RECURSIVE
-//!   __pgs_base_delta AS (
+//!   __pgt_base_delta AS (
 //!     -- Normal DVM differentiation of the base case (INSERT rows only)
 //!     <differentiated base case>
 //!   ),
-//!   __pgs_rec_delta AS (
+//!   __pgt_rec_delta AS (
 //!     -- Seed: base case delta
-//!     SELECT cols FROM __pgs_base_delta WHERE __pgs_action = 'I'
+//!     SELECT cols FROM __pgt_base_delta WHERE __pgt_action = 'I'
 //!     UNION ALL
 //!     -- Seed: new base table rows joining existing ST storage
 //!     SELECT cols FROM <recursive term with self_ref = ST_storage, base_tables = change_buffer>
 //!     UNION ALL
 //!     -- Propagation: recursive term applied to delta
-//!     SELECT cols FROM <recursive term with self_ref = __pgs_rec_delta, base_tables = full>
+//!     SELECT cols FROM <recursive term with self_ref = __pgt_rec_delta, base_tables = full>
 //!   ),
-//!   __pgs_final AS (
-//!     SELECT pgstream.pg_stream_hash(...) AS __pgs_row_id, 'I' AS __pgs_action, cols
-//!     FROM __pgs_rec_delta
+//!   __pgt_final AS (
+//!     SELECT pgtrickle.pg_trickle_hash(...) AS __pgt_row_id, 'I' AS __pgt_action, cols
+//!     FROM __pgt_rec_delta
 //!   )
-//! SELECT * FROM __pgs_final
+//! SELECT * FROM __pgt_final
 //! ```
 
 use crate::dvm::diff::{DiffContext, DiffResult, col_list, quote_ident};
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a `RecursiveCte` node.
 ///
@@ -75,7 +75,10 @@ use crate::error::PgStreamError;
 /// **Non-linear recursion** (multiple self-references in the recursive
 /// term) is detected and rejected, since PostgreSQL restricts the
 /// recursive term to reference the CTE at most once.
-pub fn diff_recursive_cte(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_recursive_cte(
+    ctx: &mut DiffContext,
+    op: &OpTree,
+) -> Result<DiffResult, PgTrickleError> {
     let OpTree::RecursiveCte {
         alias,
         columns,
@@ -84,7 +87,7 @@ pub fn diff_recursive_cte(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResu
         union_all,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_recursive_cte called on non-RecursiveCte node".into(),
         ));
     };
@@ -96,7 +99,7 @@ pub fn diff_recursive_cte(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResu
     let self_ref_count = count_self_refs(recursive);
     if self_ref_count > 1 {
         let aliases = collect_self_ref_aliases(recursive);
-        return Err(PgStreamError::UnsupportedOperator(format!(
+        return Err(PgTrickleError::UnsupportedOperator(format!(
             "Non-linear recursive CTE \"{alias}\" has {self_ref_count} \
              self-references ({aliases}). PostgreSQL restricts the recursive \
              term to reference the CTE at most once. Rewrite using a linear \
@@ -152,7 +155,10 @@ pub fn diff_recursive_cte(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResu
 
 /// Check if any of the given source tables have DELETE or UPDATE changes
 /// in the change buffer within the current frontier interval.
-fn check_for_delete_changes(ctx: &DiffContext, source_oids: &[u32]) -> Result<bool, PgStreamError> {
+fn check_for_delete_changes(
+    ctx: &DiffContext,
+    source_oids: &[u32],
+) -> Result<bool, PgTrickleError> {
     use pgrx::Spi;
 
     for &oid in source_oids {
@@ -170,10 +176,10 @@ fn check_for_delete_changes(ctx: &DiffContext, source_oids: &[u32]) -> Result<bo
         let has_del: Option<bool> = Spi::connect(|client| {
             client
                 .select(&check_sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .first()
                 .get::<bool>(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))
         })?;
 
         if has_del == Some(true) {
@@ -201,13 +207,13 @@ fn generate_recomputation_delta(
     base: &OpTree,
     recursive: &OpTree,
     _union_all: bool,
-) -> Result<DiffResult, PgStreamError> {
+) -> Result<DiffResult, PgTrickleError> {
     // We need the ST storage table name for the anti-join
     let st_table = ctx
         .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
-            PgStreamError::InternalError(
+            PgTrickleError::InternalError(
                 "st_qualified_name required for recursive CTE recomputation diff".into(),
             )
         })?
@@ -247,8 +253,8 @@ fn generate_recomputation_delta(
     // may not exist in the recomputed result. Use sub.* to be safe.
     let recomp_cte = ctx.next_cte_name(&format!("rc_recomp_{alias}"));
     let recomp_sql = format!(
-        "SELECT pgstream.pg_stream_hash(row_to_json(sub)::text || '/' || \
-               row_number() OVER ()::text) AS __pgs_row_id, sub.*\n\
+        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
+               row_number() OVER ()::text) AS __pgt_row_id, sub.*\n\
          FROM ({recomp_inner_sql}) sub",
     );
     ctx.add_cte(recomp_cte.clone(), recomp_sql);
@@ -256,10 +262,10 @@ fn generate_recomputation_delta(
     // CTE 2: find INSERTs (in recomputed but not in storage)
     let ins_cte = ctx.next_cte_name(&format!("rc_ins_{alias}"));
     let ins_sql = format!(
-        "SELECT n.__pgs_row_id, 'I'::text AS __pgs_action, {n_cols}\n\
+        "SELECT n.__pgt_row_id, 'I'::text AS __pgt_action, {n_cols}\n\
          FROM {recomp_cte} n\n\
-         LEFT JOIN {st_table} s ON s.__pgs_row_id = n.__pgs_row_id\n\
-         WHERE s.__pgs_row_id IS NULL",
+         LEFT JOIN {st_table} s ON s.__pgt_row_id = n.__pgt_row_id\n\
+         WHERE s.__pgt_row_id IS NULL",
         n_cols = out_cols
             .iter()
             .map(|c| format!("n.{}", quote_ident(c)))
@@ -271,10 +277,10 @@ fn generate_recomputation_delta(
     // CTE 3: find DELETEs (in storage but not in recomputed)
     let del_cte = ctx.next_cte_name(&format!("rc_del_{alias}"));
     let del_sql = format!(
-        "SELECT s.__pgs_row_id, 'D'::text AS __pgs_action, {s_cols}\n\
+        "SELECT s.__pgt_row_id, 'D'::text AS __pgt_action, {s_cols}\n\
          FROM {st_table} s\n\
-         LEFT JOIN {recomp_cte} n ON n.__pgs_row_id = s.__pgs_row_id\n\
-         WHERE n.__pgs_row_id IS NULL",
+         LEFT JOIN {recomp_cte} n ON n.__pgt_row_id = s.__pgt_row_id\n\
+         WHERE n.__pgt_row_id IS NULL",
         s_cols = out_cols
             .iter()
             .map(|c| format!("s.{}", quote_ident(c)))
@@ -323,54 +329,54 @@ fn generate_recomputation_delta(
 ///
 /// ```sql
 /// WITH RECURSIVE
-///   __pgs_base_delta AS (<differentiated base case>),
+///   __pgt_base_delta AS (<differentiated base case>),
 ///
 ///   -- Phase 1: INSERT propagation (semi-naive)
-///   __pgs_ins_delta AS (
-///     SELECT cols FROM __pgs_base_delta WHERE __pgs_action = 'I'
+///   __pgt_ins_delta AS (
+///     SELECT cols FROM __pgt_base_delta WHERE __pgt_action = 'I'
 ///     UNION ALL
 ///     <seed from existing storage>
 ///     UNION ALL
 ///     <propagation through recursive term>
 ///   ),
-///   __pgs_ins_final AS (
-///     SELECT hash AS __pgs_row_id, 'I' AS __pgs_action, cols
-///     FROM __pgs_ins_delta
+///   __pgt_ins_final AS (
+///     SELECT hash AS __pgt_row_id, 'I' AS __pgt_action, cols
+///     FROM __pgt_ins_delta
 ///   ),
 ///
 ///   -- Phase 2: Over-deletion
-///   __pgs_del_cascade AS (
+///   __pgt_del_cascade AS (
 ///     -- Seed: base case DELETE rows
-///     SELECT cols FROM __pgs_base_delta WHERE __pgs_action = 'D'
+///     SELECT cols FROM __pgt_base_delta WHERE __pgt_action = 'D'
 ///     UNION ALL
 ///     -- Propagation: find ST storage rows joining del_cascade
-///     SELECT s.cols FROM ST_storage s JOIN __pgs_del_cascade d ON ...
+///     SELECT s.cols FROM ST_storage s JOIN __pgt_del_cascade d ON ...
 ///   ),
 ///
 ///   -- Phase 3: Rederivation from current base tables
-///   __pgs_rederived AS (
+///   __pgt_rederived AS (
 ///     WITH RECURSIVE full_cte AS (base UNION ALL rec)
 ///     SELECT cols FROM full_cte
-///     WHERE (cols) IN (SELECT cols FROM __pgs_del_cascade)
+///     WHERE (cols) IN (SELECT cols FROM __pgt_del_cascade)
 ///   ),
 ///
 ///   -- Phase 4: Combine
 ///   -- Net deletions = over-deleted EXCEPT rederived
-///   __pgs_net_del AS (
-///     SELECT cols FROM __pgs_del_cascade
+///   __pgt_net_del AS (
+///     SELECT cols FROM __pgt_del_cascade
 ///     EXCEPT
-///     SELECT cols FROM __pgs_rederived
+///     SELECT cols FROM __pgt_rederived
 ///   ),
-///   __pgs_del_final AS (
-///     SELECT hash AS __pgs_row_id, 'D' AS __pgs_action, cols
-///     FROM __pgs_net_del
+///   __pgt_del_final AS (
+///     SELECT hash AS __pgt_row_id, 'D' AS __pgt_action, cols
+///     FROM __pgt_net_del
 ///   ),
-///   __pgs_combined AS (
-///     SELECT * FROM __pgs_ins_final
+///   __pgt_combined AS (
+///     SELECT * FROM __pgt_ins_final
 ///     UNION ALL
-///     SELECT * FROM __pgs_del_final
+///     SELECT * FROM __pgt_del_final
 ///   )
-/// SELECT * FROM __pgs_combined
+/// SELECT * FROM __pgt_combined
 /// ```
 fn generate_dred_delta(
     ctx: &mut DiffContext,
@@ -380,12 +386,12 @@ fn generate_dred_delta(
     base: &OpTree,
     recursive: &OpTree,
     union_all: bool,
-) -> Result<DiffResult, PgStreamError> {
+) -> Result<DiffResult, PgTrickleError> {
     let st_table = ctx
         .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
-            PgStreamError::InternalError(
+            PgTrickleError::InternalError(
                 "st_qualified_name required for recursive CTE DRed diff".into(),
             )
         })?
@@ -405,7 +411,7 @@ fn generate_dred_delta(
 
     let del_seed_cte = ctx.next_cte_name(&format!("dred_dseed_{alias}"));
     let del_seed_sql = format!(
-        "SELECT {col_list_str} FROM {base_cte} WHERE __pgs_action = 'D'",
+        "SELECT {col_list_str} FROM {base_cte} WHERE __pgt_action = 'D'",
         base_cte = base_delta.cte_name,
     );
     ctx.add_cte(del_seed_cte.clone(), del_seed_sql);
@@ -468,8 +474,8 @@ fn generate_dred_delta(
     );
     ctx.add_cte(net_del_cte.clone(), net_del_sql);
 
-    // Wrap net deletions with __pgs_row_id and __pgs_action = 'D'
-    // We need to match __pgs_row_id from ST storage.
+    // Wrap net deletions with __pgt_row_id and __pgt_action = 'D'
+    // We need to match __pgt_row_id from ST storage.
     let del_final_cte = ctx.next_cte_name(&format!("dred_dfin_{alias}"));
     let del_match_cols = columns
         .iter()
@@ -477,7 +483,7 @@ fn generate_dred_delta(
         .collect::<Vec<_>>()
         .join(" AND ");
     let del_final_sql = format!(
-        "SELECT s.__pgs_row_id, 'D'::text AS __pgs_action, {del_cols}\n\
+        "SELECT s.__pgt_row_id, 'D'::text AS __pgt_action, {del_cols}\n\
          FROM {net_del_cte} d\n\
          JOIN {st_table} s ON {del_match_cols}",
         del_cols = columns
@@ -514,12 +520,12 @@ fn generate_semi_naive_ins_only(
     columns: &[String],
     base_delta: &DiffResult,
     recursive: &OpTree,
-) -> Result<DiffResult, PgStreamError> {
+) -> Result<DiffResult, PgTrickleError> {
     let st_table = ctx
         .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
-            PgStreamError::InternalError(
+            PgTrickleError::InternalError(
                 "st_qualified_name required for DRed insert propagation".into(),
             )
         })?
@@ -532,7 +538,7 @@ fn generate_semi_naive_ins_only(
 
     // Seed: base case delta INSERT rows only
     let seed_from_base = format!(
-        "SELECT {col_list_str} FROM {base_cte} WHERE __pgs_action = 'I'",
+        "SELECT {col_list_str} FROM {base_cte} WHERE __pgt_action = 'I'",
         base_cte = base_delta.cte_name,
     );
 
@@ -562,12 +568,12 @@ fn generate_semi_naive_ins_only(
 
     ctx.add_recursive_cte(delta_cte.clone(), recursive_sql);
 
-    // Wrap with __pgs_row_id and __pgs_action = 'I'
+    // Wrap with __pgt_row_id and __pgt_action = 'I'
     let ins_final_cte = ctx.next_cte_name(&format!("dred_ifin_{alias}"));
     let ins_final_sql = format!(
-        "SELECT pgstream.pg_stream_hash(row_to_json(sub)::text || '/' || \
-                row_number() OVER ()::text) AS __pgs_row_id,\n\
-               'I'::text AS __pgs_action,\n\
+        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
+                row_number() OVER ()::text) AS __pgt_row_id,\n\
+               'I'::text AS __pgt_action,\n\
                {col_list_str}\n\
          FROM {delta_cte} sub",
     );
@@ -591,7 +597,7 @@ fn generate_cascade_propagation(
     recursive: &OpTree,
     cascade_cte: &str,
     st_table: &str,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     // The recursive term is of the form:
     //   SELECT cols FROM base_table t JOIN <self_ref> r ON t.parent = r.id
     // For the cascade, we need:
@@ -610,7 +616,7 @@ fn generate_query_sql_cascade(
     op: &OpTree,
     cascade_cte: &str,
     st_table: &str,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     match op {
         OpTree::InnerJoin {
             condition,
@@ -678,7 +684,7 @@ fn generate_query_sql_cascade(
             ))
         }
 
-        _ => Err(PgStreamError::InternalError(format!(
+        _ => Err(PgTrickleError::InternalError(format!(
             "generate_query_sql_cascade: unsupported OpTree variant {:?}",
             op.alias(),
         ))),
@@ -695,7 +701,7 @@ fn generate_cascade_from(
     op: &OpTree,
     cascade_cte: &str,
     st_table: &str,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     match op {
         // Base table scan → ST storage (we're finding existing derived rows)
         OpTree::Scan { alias, .. } => Ok(format!(
@@ -754,13 +760,13 @@ fn generate_semi_naive_delta(
     base_delta: &DiffResult,
     recursive: &OpTree,
     _union_all: bool,
-) -> Result<DiffResult, PgStreamError> {
+) -> Result<DiffResult, PgTrickleError> {
     // We need the ST storage table name
     let st_table = ctx
         .st_qualified_name
         .as_ref()
         .ok_or_else(|| {
-            PgStreamError::InternalError(
+            PgTrickleError::InternalError(
                 "st_qualified_name required for recursive CTE semi-naive diff".into(),
             )
         })?
@@ -773,7 +779,7 @@ fn generate_semi_naive_delta(
 
     // Generate the seed SQL: base case delta (INSERT rows only)
     let seed_from_base = format!(
-        "SELECT {col_list_str} FROM {base_cte} WHERE __pgs_action = 'I'",
+        "SELECT {col_list_str} FROM {base_cte} WHERE __pgt_action = 'I'",
         base_cte = base_delta.cte_name,
     );
 
@@ -813,12 +819,12 @@ fn generate_semi_naive_delta(
     // the WITH RECURSIVE keyword. We'll mark it specially.
     ctx.add_recursive_cte(delta_cte.clone(), recursive_sql);
 
-    // Wrap with __pgs_row_id and __pgs_action
+    // Wrap with __pgt_row_id and __pgt_action
     let final_cte = ctx.next_cte_name(&format!("rc_final_{alias}"));
     let final_sql = format!(
-        "SELECT pgstream.pg_stream_hash(row_to_json(sub)::text || '/' || \
-                row_number() OVER ()::text) AS __pgs_row_id,\n\
-               'I'::text AS __pgs_action,\n\
+        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
+                row_number() OVER ()::text) AS __pgt_row_id,\n\
+               'I'::text AS __pgt_action,\n\
                {col_list_str}\n\
          FROM {delta_cte} sub",
     );
@@ -845,7 +851,7 @@ fn generate_seed_from_existing(
     recursive: &OpTree,
     st_table: &str,
     _columns: &[String],
-) -> Result<Option<String>, PgStreamError> {
+) -> Result<Option<String>, PgTrickleError> {
     // Generate the recursive term SQL with the self-reference replaced
     // by the existing ST storage table, and base table scans replaced
     // by their change buffer deltas (INSERT rows only).
@@ -871,7 +877,7 @@ fn generate_seed_from_existing(
 fn generate_query_sql(
     op: &OpTree,
     self_ref_replacement: Option<&str>,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     match op {
         OpTree::Scan {
             schema,
@@ -895,7 +901,7 @@ fn generate_query_sql(
 
         OpTree::RecursiveSelfRef { alias, columns, .. } => {
             let replacement = self_ref_replacement.ok_or_else(|| {
-                PgStreamError::InternalError(
+                PgTrickleError::InternalError(
                     "RecursiveSelfRef encountered without replacement target".into(),
                 )
             })?;
@@ -1025,7 +1031,7 @@ fn generate_query_sql(
             ))
         }
 
-        _ => Err(PgStreamError::InternalError(format!(
+        _ => Err(PgTrickleError::InternalError(format!(
             "generate_query_sql: unsupported OpTree variant {:?} in recursive term",
             op.alias(),
         ))),
@@ -1037,7 +1043,7 @@ fn generate_query_sql(
 fn generate_from_sql(
     op: &OpTree,
     self_ref_replacement: Option<&str>,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     match op {
         OpTree::Scan {
             schema,
@@ -1053,7 +1059,7 @@ fn generate_from_sql(
 
         OpTree::RecursiveSelfRef { alias, .. } => {
             let replacement = self_ref_replacement.ok_or_else(|| {
-                PgStreamError::InternalError(
+                PgTrickleError::InternalError(
                     "RecursiveSelfRef encountered without replacement target".into(),
                 )
             })?;
@@ -1103,7 +1109,7 @@ fn generate_query_sql_with_change_buffers(
     ctx: &DiffContext,
     op: &OpTree,
     st_table: &str,
-) -> Result<Option<String>, PgStreamError> {
+) -> Result<Option<String>, PgTrickleError> {
     match op {
         OpTree::InnerJoin {
             condition,
@@ -1210,7 +1216,7 @@ fn generate_change_buffer_from(
     ctx: &DiffContext,
     op: &OpTree,
     st_table: &str,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     match op {
         OpTree::Scan {
             table_oid,
@@ -1314,7 +1320,7 @@ fn collect_self_ref_aliases(op: &OpTree) -> Vec<String> {
 fn generate_query_sql_targeted(
     op: &OpTree,
     self_ref_map: &std::collections::HashMap<String, String>,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     match op {
         OpTree::Scan {
             schema,
@@ -1338,7 +1344,7 @@ fn generate_query_sql_targeted(
 
         OpTree::RecursiveSelfRef { alias, columns, .. } => {
             let replacement = self_ref_map.get(alias).ok_or_else(|| {
-                PgStreamError::InternalError(format!(
+                PgTrickleError::InternalError(format!(
                     "generate_query_sql_targeted: no replacement for self-ref alias \"{alias}\""
                 ))
             })?;
@@ -1433,7 +1439,7 @@ fn generate_query_sql_targeted(
             ))
         }
 
-        _ => Err(PgStreamError::InternalError(format!(
+        _ => Err(PgTrickleError::InternalError(format!(
             "generate_query_sql_targeted: unsupported OpTree variant {:?}",
             op.alias(),
         ))),
@@ -1446,7 +1452,7 @@ fn generate_query_sql_targeted(
 fn generate_from_sql_targeted(
     op: &OpTree,
     self_ref_map: &std::collections::HashMap<String, String>,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     match op {
         OpTree::Scan {
             schema,
@@ -1462,7 +1468,7 @@ fn generate_from_sql_targeted(
 
         OpTree::RecursiveSelfRef { alias, .. } => {
             let replacement = self_ref_map.get(alias).ok_or_else(|| {
-                PgStreamError::InternalError(format!(
+                PgTrickleError::InternalError(format!(
                     "generate_from_sql_targeted: no replacement for self-ref alias \"{alias}\""
                 ))
             })?;
@@ -1505,7 +1511,7 @@ fn generate_nonlinear_seeds(
     base_delta_cte: &str,
     st_table: &str,
     columns: &[String],
-) -> Result<Vec<String>, PgStreamError> {
+) -> Result<Vec<String>, PgTrickleError> {
     if self_ref_aliases.len() <= 1 {
         return Ok(vec![]);
     }
@@ -1519,7 +1525,7 @@ fn generate_nonlinear_seeds(
             if i == j {
                 // This position reads from the base case delta (INSERT rows)
                 let delta_ref = format!(
-                    "(SELECT {col_list_str} FROM {base_delta_cte} WHERE __pgs_action = 'I')"
+                    "(SELECT {col_list_str} FROM {base_delta_cte} WHERE __pgt_action = 'I')"
                 );
                 replacements.insert(alias.clone(), delta_ref);
             } else {
@@ -1582,8 +1588,8 @@ mod tests {
     #[test]
     fn test_generate_query_sql_self_ref() {
         let self_ref = make_self_ref("tree", "t", &["id", "depth"]);
-        let sql = generate_query_sql(&self_ref, Some("__pgs_delta")).unwrap();
-        assert!(sql.contains("__pgs_delta AS \"t\""));
+        let sql = generate_query_sql(&self_ref, Some("__pgt_delta")).unwrap();
+        assert!(sql.contains("__pgt_delta AS \"t\""));
         assert!(sql.contains("\"t\".\"id\""));
         assert!(sql.contains("\"t\".\"depth\""));
     }
@@ -1615,9 +1621,9 @@ mod tests {
             right: Box::new(right),
         };
 
-        let sql = generate_query_sql(&join, Some("__pgs_delta")).unwrap();
+        let sql = generate_query_sql(&join, Some("__pgt_delta")).unwrap();
         assert!(sql.contains("JOIN"));
-        assert!(sql.contains("__pgs_delta"));
+        assert!(sql.contains("__pgt_delta"));
         assert!(sql.contains("\"c\".\"id\""));
         assert!(sql.contains("\"t\".\"depth\""));
     }
@@ -1663,8 +1669,8 @@ mod tests {
     #[test]
     fn test_generate_from_sql_self_ref() {
         let self_ref = make_self_ref("tree", "t", &["id"]);
-        let sql = generate_from_sql(&self_ref, Some("__pgs_cte_1")).unwrap();
-        assert_eq!(sql, "__pgs_cte_1 AS \"t\"");
+        let sql = generate_from_sql(&self_ref, Some("__pgt_cte_1")).unwrap();
+        assert_eq!(sql, "__pgt_cte_1 AS \"t\"");
     }
 
     // ── collect_select_cols tests ───────────────────────────────────
@@ -1910,14 +1916,14 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(
             "r1".to_string(),
-            "(SELECT \"src\", \"dst\" FROM __delta WHERE __pgs_action = 'I')".to_string(),
+            "(SELECT \"src\", \"dst\" FROM __delta WHERE __pgt_action = 'I')".to_string(),
         );
         map.insert("r2".to_string(), "\"public\".\"st\"".to_string());
 
         let sql = generate_query_sql_targeted(&join, &map).unwrap();
         assert!(
             sql.contains(
-                "(SELECT \"src\", \"dst\" FROM __delta WHERE __pgs_action = 'I') AS \"r1\""
+                "(SELECT \"src\", \"dst\" FROM __delta WHERE __pgt_action = 'I') AS \"r1\""
             )
         );
         assert!(sql.contains("\"public\".\"st\" AS \"r2\""));
@@ -1982,7 +1988,7 @@ mod tests {
 
         // Seed 0: r1 = delta, r2 = ST storage
         assert!(
-            seeds[0].contains("__base_delta WHERE __pgs_action = 'I'"),
+            seeds[0].contains("__base_delta WHERE __pgt_action = 'I'"),
             "Seed 0 should reference base delta inserts"
         );
         assert!(
@@ -1996,7 +2002,7 @@ mod tests {
             "Seed 1 should use ST storage for r1"
         );
         assert!(
-            seeds[1].contains("__base_delta WHERE __pgs_action = 'I'"),
+            seeds[1].contains("__base_delta WHERE __pgt_action = 'I'"),
             "Seed 1 should reference base delta inserts"
         );
     }
@@ -2025,9 +2031,9 @@ mod tests {
             right: Box::new(right),
         };
 
-        let sql = generate_query_sql(&join, Some("__pgs_delta")).unwrap();
+        let sql = generate_query_sql(&join, Some("__pgt_delta")).unwrap();
         assert!(sql.contains("LEFT JOIN"));
-        assert!(sql.contains("__pgs_delta"));
+        assert!(sql.contains("__pgt_delta"));
         assert!(sql.contains("\"c\".\"id\""));
         assert!(sql.contains("\"t\".\"depth\""));
     }

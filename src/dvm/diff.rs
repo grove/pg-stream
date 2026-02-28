@@ -8,10 +8,10 @@
 //! is a `WITH cte1 AS (...), cte2 AS (...), ... SELECT * FROM final_cte`
 //! query that computes the delta.
 
-use crate::config::pg_stream_change_buffer_schema;
+use crate::config::pg_trickle_change_buffer_schema;
 use crate::dvm::operators;
 use crate::dvm::parser::{CteRegistry, OpTree};
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::version::Frontier;
 use std::collections::HashMap;
 
@@ -21,9 +21,9 @@ use std::collections::HashMap;
 pub struct DiffResult {
     /// Name of the CTE containing this node's delta rows.
     pub cte_name: String,
-    /// Column names in the delta (excludes __pgs_row_id and __pgs_action).
+    /// Column names in the delta (excludes __pgt_row_id and __pgt_action).
     pub columns: Vec<String>,
-    /// When true, the delta output has at most one row per `__pgs_row_id`.
+    /// When true, the delta output has at most one row per `__pgt_row_id`.
     /// The MERGE statement can skip the outer DISTINCT ON + ORDER BY.
     pub is_deduplicated: bool,
 }
@@ -78,7 +78,7 @@ impl DiffContext {
             new_frontier,
             cte_counter: 0,
             ctes: Vec::new(),
-            change_buffer_schema: pg_stream_change_buffer_schema(),
+            change_buffer_schema: pg_trickle_change_buffer_schema(),
             st_qualified_name: None,
             cte_registry: CteRegistry::default(),
             cte_delta_cache: HashMap::new(),
@@ -92,14 +92,14 @@ impl DiffContext {
     /// Create a DiffContext without accessing PostgreSQL GUCs.
     ///
     /// Used by unit tests and benchmarks that run outside of PostgreSQL.
-    /// The `change_buffer_schema` defaults to `"pgstream_changes"`.
+    /// The `change_buffer_schema` defaults to `"pgtrickle_changes"`.
     pub fn new_standalone(prev_frontier: Frontier, new_frontier: Frontier) -> Self {
         DiffContext {
             prev_frontier,
             new_frontier,
             cte_counter: 0,
             ctes: Vec::new(),
-            change_buffer_schema: "pgstream_changes".to_string(),
+            change_buffer_schema: "pgtrickle_changes".to_string(),
             st_qualified_name: None,
             cte_registry: CteRegistry::default(),
             cte_delta_cache: HashMap::new(),
@@ -137,7 +137,7 @@ impl DiffContext {
     }
 
     /// Set the stream table name for aggregate merge queries.
-    pub fn with_pgs_name(mut self, schema: &str, name: &str) -> Self {
+    pub fn with_pgt_name(mut self, schema: &str, name: &str) -> Self {
         self.st_qualified_name = Some(format!(
             "\"{}\".\"{}\"",
             schema.replace('"', "\"\""),
@@ -171,26 +171,26 @@ impl DiffContext {
     /// Generate the complete delta query for an operator tree.
     ///
     /// Returns the final SQL `WITH ... SELECT ...` query string.
-    /// The output has columns: `__pgs_row_id`, `__pgs_action`, plus user columns.
-    pub fn differentiate(&mut self, op: &OpTree) -> Result<String, PgStreamError> {
+    /// The output has columns: `__pgt_row_id`, `__pgt_action`, plus user columns.
+    pub fn differentiate(&mut self, op: &OpTree) -> Result<String, PgTrickleError> {
         let result = self.diff_node(op)?;
         Ok(self.build_with_query(&result.cte_name))
     }
 
     /// Differentiate and also return the final diff columns (includes
-    /// auxiliary columns like `__pgs_count` for aggregate/distinct)
+    /// auxiliary columns like `__pgt_count` for aggregate/distinct)
     /// and the `is_deduplicated` flag from the operator tree.
     pub fn differentiate_with_columns(
         &mut self,
         op: &OpTree,
-    ) -> Result<(String, Vec<String>, bool), PgStreamError> {
+    ) -> Result<(String, Vec<String>, bool), PgTrickleError> {
         let result = self.diff_node(op)?;
         let sql = self.build_with_query(&result.cte_name);
         Ok((sql, result.columns, result.is_deduplicated))
     }
 
     /// Recursively differentiate an operator tree node.
-    pub fn diff_node(&mut self, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+    pub fn diff_node(&mut self, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
         match op {
             OpTree::Scan { .. } => operators::scan::diff_scan(self, op),
             OpTree::Filter { .. } => operators::filter::diff_filter(self, op),
@@ -206,7 +206,7 @@ impl DiffContext {
             OpTree::Subquery { .. } => operators::subquery::diff_subquery(self, op),
             OpTree::CteScan { .. } => operators::cte_scan::diff_cte_scan(self, op),
             OpTree::RecursiveCte { .. } => operators::recursive_cte::diff_recursive_cte(self, op),
-            OpTree::RecursiveSelfRef { .. } => Err(PgStreamError::InternalError(
+            OpTree::RecursiveSelfRef { .. } => Err(PgTrickleError::InternalError(
                 "RecursiveSelfRef encountered outside RecursiveCte diff context; \
                  this node should only appear inside a RecursiveCte's recursive term"
                     .into(),
@@ -229,7 +229,7 @@ impl DiffContext {
     /// Generate a unique CTE name with a descriptive prefix.
     pub fn next_cte_name(&mut self, prefix: &str) -> String {
         self.cte_counter += 1;
-        format!("__pgs_cte_{}_{}", prefix, self.cte_counter)
+        format!("__pgt_cte_{}_{}", prefix, self.cte_counter)
     }
 
     /// Add a CTE definition.
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn test_diff_context_defaults() {
         let ctx = DiffContext::new_standalone(Frontier::new(), Frontier::new());
-        assert_eq!(ctx.change_buffer_schema, "pgstream_changes");
+        assert_eq!(ctx.change_buffer_schema, "pgtrickle_changes");
         assert!(ctx.st_qualified_name.is_none());
         assert!(!ctx.use_placeholders);
         assert!(!ctx.merge_safe_dedup);
@@ -427,9 +427,9 @@ mod tests {
         let n1 = ctx.next_cte_name("scan");
         let n2 = ctx.next_cte_name("scan");
         let n3 = ctx.next_cte_name("filter");
-        assert_eq!(n1, "__pgs_cte_scan_1");
-        assert_eq!(n2, "__pgs_cte_scan_2");
-        assert_eq!(n3, "__pgs_cte_filter_3");
+        assert_eq!(n1, "__pgt_cte_scan_1");
+        assert_eq!(n2, "__pgt_cte_scan_2");
+        assert_eq!(n3, "__pgt_cte_filter_3");
     }
 
     #[test]
@@ -455,13 +455,13 @@ mod tests {
     fn test_build_with_query_single_cte() {
         let mut ctx = test_ctx();
         ctx.add_cte(
-            "__pgs_cte_scan_1".to_string(),
+            "__pgt_cte_scan_1".to_string(),
             "SELECT id FROM t".to_string(),
         );
-        let sql = ctx.build_with_query("__pgs_cte_scan_1");
+        let sql = ctx.build_with_query("__pgt_cte_scan_1");
         assert!(sql.starts_with("WITH "));
-        assert!(sql.contains("__pgs_cte_scan_1 AS (\nSELECT id FROM t\n)"));
-        assert!(sql.ends_with("SELECT * FROM __pgs_cte_scan_1"));
+        assert!(sql.contains("__pgt_cte_scan_1 AS (\nSELECT id FROM t\n)"));
+        assert!(sql.ends_with("SELECT * FROM __pgt_cte_scan_1"));
     }
 
     #[test]
@@ -506,12 +506,12 @@ mod tests {
         assert!(sql.contains("rec AS ("));
     }
 
-    // ── with_pgs_name() ──────────────────────────────────────────────
+    // ── with_pgt_name() ──────────────────────────────────────────────
 
     #[test]
-    fn test_with_pgs_name_sets_qualified_name() {
+    fn test_with_pgt_name_sets_qualified_name() {
         let ctx = DiffContext::new_standalone(Frontier::new(), Frontier::new())
-            .with_pgs_name("myschema", "my_st");
+            .with_pgt_name("myschema", "my_st");
         assert_eq!(
             ctx.st_qualified_name.as_deref(),
             Some("\"myschema\".\"my_st\""),
@@ -519,9 +519,9 @@ mod tests {
     }
 
     #[test]
-    fn test_with_pgs_name_escapes_quotes() {
+    fn test_with_pgt_name_escapes_quotes() {
         let ctx = DiffContext::new_standalone(Frontier::new(), Frontier::new())
-            .with_pgs_name("sch\"ema", "ta\"ble");
+            .with_pgt_name("sch\"ema", "ta\"ble");
         assert_eq!(
             ctx.st_qualified_name.as_deref(),
             Some("\"sch\"\"ema\".\"ta\"\"ble\""),

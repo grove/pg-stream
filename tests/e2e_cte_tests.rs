@@ -41,7 +41,7 @@ async fn test_cte_simple_full_mode() {
     )
     .await;
 
-    let (status, mode, populated, errors) = db.pgs_status("active_users_st").await;
+    let (status, mode, populated, errors) = db.pgt_status("active_users_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "FULL");
     assert!(populated);
@@ -106,7 +106,7 @@ async fn test_cte_simple_differential_create() {
     )
     .await;
 
-    let (status, mode, populated, _) = db.pgs_status("stocked_products_st").await;
+    let (status, mode, populated, _) = db.pgt_status("stocked_products_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "DIFFERENTIAL");
     assert!(populated);
@@ -670,7 +670,7 @@ async fn test_recursive_cte_full_mode_succeeds() {
     )
     .await;
 
-    let (status, mode, populated, _) = db.pgs_status("cat_tree_st").await;
+    let (status, mode, populated, _) = db.pgt_status("cat_tree_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "FULL");
     assert!(populated);
@@ -759,7 +759,7 @@ async fn test_recursive_cte_differential_mode_succeeds() {
     )
     .await;
 
-    let (status, mode, populated, _) = db.pgs_status("recursive_inc_st").await;
+    let (status, mode, populated, _) = db.pgt_status("recursive_inc_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "DIFFERENTIAL");
     assert!(populated);
@@ -890,7 +890,7 @@ async fn test_recursive_cte_alter_to_differential() {
     db.alter_st("alt_tree_st", "refresh_mode => 'DIFFERENTIAL'")
         .await;
 
-    let (_, mode, _, _) = db.pgs_status("alt_tree_st").await;
+    let (_, mode, _, _) = db.pgt_status("alt_tree_st").await;
     assert_eq!(mode, "DIFFERENTIAL");
 
     // Add data and refresh differentially
@@ -2399,7 +2399,7 @@ async fn test_cte_st_drop_cleans_up() {
 
     let cat_count: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'cleanup_cte_st'",
+            "SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'cleanup_cte_st'",
         )
         .await;
     assert_eq!(cat_count, 0, "Catalog entry should be removed");

@@ -17,7 +17,7 @@ pub fn test_ctx() -> DiffContext {
 
 /// Create a `DiffContext` with a ST name set (needed by aggregate/distinct/window).
 pub fn test_ctx_with_st(schema: &str, name: &str) -> DiffContext {
-    DiffContext::new_standalone(Frontier::new(), Frontier::new()).with_pgs_name(schema, name)
+    DiffContext::new_standalone(Frontier::new(), Frontier::new()).with_pgt_name(schema, name)
 }
 
 // ── Column builder ──────────────────────────────────────────────────────

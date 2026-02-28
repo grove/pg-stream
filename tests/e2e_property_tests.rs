@@ -1,4 +1,4 @@
-//! E2E property-based correctness tests for pgstream.
+//! E2E property-based correctness tests for pgtrickle.
 //!
 //! **THE KEY INVARIANT** (DBSP §4, Gupta & Mumick 1995 §3):
 //!
@@ -122,18 +122,18 @@ impl TrackedIds {
 
 /// Assert the KEY INVARIANT: ST contents == defining query result.
 ///
-/// Compares only user-visible columns (excludes all `__pgs_*` internal
+/// Compares only user-visible columns (excludes all `__pgt_*` internal
 /// columns) using `EXCEPT ALL` for correct multiset (bag) comparison.
-async fn assert_invariant(db: &E2eDb, pgs_name: &str, query: &str, seed: u64, cycle: usize) {
-    let st_table = format!("public.{pgs_name}");
+async fn assert_invariant(db: &E2eDb, pgt_name: &str, query: &str, seed: u64, cycle: usize) {
+    let st_table = format!("public.{pgt_name}");
 
-    // User-visible columns (exclude all __pgs_* internal columns)
+    // User-visible columns (exclude all __pgt_* internal columns)
     let cols: String = db
         .query_scalar(&format!(
             "SELECT string_agg(column_name, ', ' ORDER BY ordinal_position) \
              FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = '{pgs_name}' \
-               AND column_name NOT LIKE '__pgs_%'"
+             WHERE table_schema = 'public' AND table_name = '{pgt_name}' \
+               AND column_name NOT LIKE '__pgt_%'"
         ))
         .await;
 
@@ -173,7 +173,7 @@ async fn assert_invariant(db: &E2eDb, pgs_name: &str, query: &str, seed: u64, cy
              ST: {}, Query: {}\n\
              ST rows: {}, Query rows: {}\n\
              Extra in ST: {}, Missing from ST: {}",
-            cycle, seed, pgs_name, query, st_count, q_count, extra, missing,
+            cycle, seed, pgt_name, query, st_count, q_count, extra, missing,
         );
     }
 }

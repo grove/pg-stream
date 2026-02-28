@@ -1,4 +1,4 @@
-# pg_stream Ecosystem — Supportive Projects Plan
+# pg_trickle Ecosystem — Supportive Projects Plan
 
 Date: 2026-02-24
 Status: PROPOSED
@@ -7,20 +7,20 @@ Status: PROPOSED
 
 ## Overview
 
-This document describes the ecosystem of supportive projects around the pg_stream
+This document describes the ecosystem of supportive projects around the pg_trickle
 PostgreSQL extension. Each project is designed to lower adoption friction, improve
-operability, or integrate pg_stream with popular tools in the modern data stack.
+operability, or integrate pg_trickle with popular tools in the modern data stack.
 
 All projects are maintained in **separate repositories** unless noted otherwise. The
-pg_stream extension repo (`pg-stream`) remains focused on the core Rust/pgrx extension.
+pg_trickle extension repo (`pg-trickle`) remains focused on the core Rust/pgrx extension.
 
 ### Principles
 
-1. **SQL is the API.** Every integration wraps pg_stream's SQL functions — no custom
+1. **SQL is the API.** Every integration wraps pg_trickle's SQL functions — no custom
    wire protocols, no binary coupling to extension internals.
 2. **Separate repos, separate release cadences.** Ecosystem projects only change when
    the SQL API changes, not on every Rust refactor.
-3. **Zero required dependencies.** pg_stream works standalone. Every ecosystem project
+3. **Zero required dependencies.** pg_trickle works standalone. Every ecosystem project
    is optional and additive.
 4. **Start small, ship fast.** Each project has a minimal viable deliverable that can
    ship in days, with expansion phases that follow.
@@ -30,13 +30,13 @@ pg_stream extension repo (`pg-stream`) remains focused on the core Rust/pgrx ext
 ## Table of Contents
 
 - [Roadmap Summary](#roadmap-summary)
-- [Project 1 — dbt Macro Package](#project-1--dbt-macro-package-dbt-pgstream)
+- [Project 1 — dbt Macro Package](#project-1--dbt-macro-package-dbt-pgtrickle)
 - [Project 2 — Prometheus Exporter Config](#project-2--prometheus-exporter-config)
 - [Project 3 — Grafana Dashboard](#project-3--grafana-dashboard)
 - [Project 4 — Docker Hub Image](#project-4--docker-hub-image)
 - [Project 5 — CNPG Integration](#project-5--cnpg-integration)
 - [Project 6 — Airflow Provider](#project-6--airflow-provider)
-- [Project 7 — CLI Tool](#project-7--cli-tool-pgstream)
+- [Project 7 — CLI Tool](#project-7--cli-tool-pgtrickle)
 - [Project 8 — dbt Adapter](#project-8--dbt-adapter)
 - [Project 9 — PGXN & OS Packages](#project-9--pgxn--os-packages)
 - [Project 10 — Flyway & Liquibase Support](#project-10--flyway--liquibase-support)
@@ -61,18 +61,18 @@ are noted in each project section.
 
 ---
 
-## Project 1 — dbt Macro Package (`dbt-pgstream`)
+## Project 1 — dbt Macro Package (`dbt-pgtrickle`)
 
 > Full plan: [../dbt/PLAN_DBT_MACRO.md](../dbt/PLAN_DBT_MACRO.md)
 
 ### Summary
 
 A standalone dbt package containing a custom `stream_table` materialization that wraps
-pg_stream's SQL API. Works with the standard `dbt-postgres` adapter.
+pg_trickle's SQL API. Works with the standard `dbt-postgres` adapter.
 
 ### Repository
 
-- **Repo:** `github.com/<org>/dbt-pgstream` (separate)
+- **Repo:** `github.com/<org>/dbt-pgtrickle` (separate)
 - **Language:** Jinja SQL
 - **Distribution:** Git install via `packages.yml`, later dbt Hub
 
@@ -94,62 +94,62 @@ pg_stream's SQL API. Works with the standard `dbt-postgres` adapter.
 
 ### Summary
 
-A `postgres_exporter` custom queries configuration file that exposes pg_stream metrics
+A `postgres_exporter` custom queries configuration file that exposes pg_trickle metrics
 as Prometheus metrics. Requires zero custom code — just a YAML config file consumed by
 the standard [postgres_exporter](https://github.com/prometheus-community/postgres_exporter).
 
 ### Repository
 
-- **Repo:** `github.com/<org>/pgstream-monitoring` (separate, shared with Grafana dashboard)
+- **Repo:** `github.com/<org>/pgtrickle-monitoring` (separate, shared with Grafana dashboard)
 - **Language:** YAML + SQL
 - **Distribution:** Git clone or copy the file
 
 ### Metrics Exposed
 
-#### From `pgstream.pg_stat_stream_tables`
+#### From `pgtrickle.pg_stat_stream_tables`
 
 | Prometheus Metric | Source Column | Type | Labels |
 |-------------------|---------------|------|--------|
-| `pgstream_refreshes_total` | `total_refreshes` | counter | `pgs_name`, `schema` |
-| `pgstream_refreshes_successful_total` | `successful_refreshes` | counter | `pgs_name` |
-| `pgstream_refreshes_failed_total` | `failed_refreshes` | counter | `pgs_name` |
-| `pgstream_rows_inserted_total` | `total_rows_inserted` | counter | `pgs_name` |
-| `pgstream_rows_deleted_total` | `total_rows_deleted` | counter | `pgs_name` |
-| `pgstream_avg_refresh_duration_ms` | `avg_duration_ms` | gauge | `pgs_name` |
-| `pgstream_staleness_seconds` | `staleness` | gauge | `pgs_name` |
-| `pgstream_stale` | `stale` | gauge (0/1) | `pgs_name` |
-| `pgstream_consecutive_errors` | `consecutive_errors` | gauge | `pgs_name` |
-| `pgstream_is_populated` | `is_populated` | gauge (0/1) | `pgs_name` |
+| `pgtrickle_refreshes_total` | `total_refreshes` | counter | `pgt_name`, `schema` |
+| `pgtrickle_refreshes_successful_total` | `successful_refreshes` | counter | `pgt_name` |
+| `pgtrickle_refreshes_failed_total` | `failed_refreshes` | counter | `pgt_name` |
+| `pgtrickle_rows_inserted_total` | `total_rows_inserted` | counter | `pgt_name` |
+| `pgtrickle_rows_deleted_total` | `total_rows_deleted` | counter | `pgt_name` |
+| `pgtrickle_avg_refresh_duration_ms` | `avg_duration_ms` | gauge | `pgt_name` |
+| `pgtrickle_staleness_seconds` | `staleness` | gauge | `pgt_name` |
+| `pgtrickle_stale` | `stale` | gauge (0/1) | `pgt_name` |
+| `pgtrickle_consecutive_errors` | `consecutive_errors` | gauge | `pgt_name` |
+| `pgtrickle_is_populated` | `is_populated` | gauge (0/1) | `pgt_name` |
 
-#### From `pgstream.check_cdc_health()`
+#### From `pgtrickle.check_cdc_health()`
 
 | Prometheus Metric | Source Column | Type | Labels |
 |-------------------|---------------|------|--------|
-| `pgstream_cdc_mode` | `cdc_mode` | gauge (enum) | `source_table` |
-| `pgstream_cdc_lag_bytes` | `lag_bytes` | gauge | `source_table`, `slot_name` |
-| `pgstream_cdc_alert` | `alert` | gauge (0/1) | `source_table`, `alert_type` |
+| `pgtrickle_cdc_mode` | `cdc_mode` | gauge (enum) | `source_table` |
+| `pgtrickle_cdc_lag_bytes` | `lag_bytes` | gauge | `source_table`, `slot_name` |
+| `pgtrickle_cdc_alert` | `alert` | gauge (0/1) | `source_table`, `alert_type` |
 
 ### Deliverable Structure
 
 ```
-pgstream-monitoring/
+pgtrickle-monitoring/
 ├── README.md
 ├── prometheus/
-│   ├── pgstream_queries.yml          # postgres_exporter custom queries
+│   ├── pgtrickle_queries.yml          # postgres_exporter custom queries
 │   └── alerts.yml                    # Prometheus alerting rules
 ├── grafana/
-│   └── pgstream-dashboard.json       # Grafana dashboard (see Project 3)
+│   └── pgtrickle-dashboard.json       # Grafana dashboard (see Project 3)
 └── docker-compose.yml                # Full observability stack demo
 ```
 
-### Example: `pgstream_queries.yml`
+### Example: `pgtrickle_queries.yml`
 
 ```yaml
-pgstream_stream_table_stats:
+pgtrickle_stream_table_stats:
   query: |
     SELECT
-      pgs_schema AS schema,
-      pgs_name,
+      pgt_schema AS schema,
+      pgt_name,
       status,
       refresh_mode,
       COALESCE(EXTRACT(EPOCH FROM staleness), 0) AS staleness_seconds,
@@ -162,11 +162,11 @@ pgstream_stream_table_stats:
       total_rows_inserted,
       total_rows_deleted,
       COALESCE(avg_duration_ms, 0) AS avg_duration_ms
-    FROM pgstream.pg_stat_stream_tables
+    FROM pgtrickle.pg_stat_stream_tables
   metrics:
     - schema:
         usage: "LABEL"
-    - pgs_name:
+    - pgt_name:
         usage: "LABEL"
     - status:
         usage: "LABEL"
@@ -203,7 +203,7 @@ pgstream_stream_table_stats:
         usage: "GAUGE"
         description: "Average refresh duration in milliseconds"
 
-pgstream_cdc_health:
+pgtrickle_cdc_health:
   query: |
     SELECT
       source_table,
@@ -213,7 +213,7 @@ pgstream_cdc_health:
       COALESCE(confirmed_lsn::text, '') AS confirmed_lsn,
       CASE WHEN alert IS NOT NULL THEN 1 ELSE 0 END AS has_alert,
       COALESCE(alert, '') AS alert_type
-    FROM pgstream.check_cdc_health()
+    FROM pgtrickle.check_cdc_health()
   metrics:
     - source_table:
         usage: "LABEL"
@@ -236,34 +236,34 @@ pgstream_cdc_health:
 ```yaml
 # prometheus/alerts.yml
 groups:
-  - name: pgstream
+  - name: pgtrickle
     rules:
-      - alert: PgStreamTableStale
-        expr: pgstream_stream_table_stats_is_stale == 1
+      - alert: PgTrickleTableStale
+        expr: pgtrickle_stream_table_stats_is_stale == 1
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Stream table {{ $labels.pgs_name }} is stale"
+          summary: "Stream table {{ $labels.pgt_name }} is stale"
 
-      - alert: PgStreamConsecutiveErrors
-        expr: pgstream_stream_table_stats_consecutive_errors >= 3
+      - alert: PgTrickleConsecutiveErrors
+        expr: pgtrickle_stream_table_stats_consecutive_errors >= 3
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "Stream table {{ $labels.pgs_name }} has {{ $value }} consecutive errors"
+          summary: "Stream table {{ $labels.pgt_name }} has {{ $value }} consecutive errors"
 
-      - alert: PgStreamCdcLagHigh
-        expr: pgstream_cdc_health_lag_bytes > 1073741824
+      - alert: PgTrickleCdcLagHigh
+        expr: pgtrickle_cdc_health_lag_bytes > 1073741824
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "CDC lag for {{ $labels.source_table }} exceeds 1GB"
 
-      - alert: PgStreamCdcAlert
-        expr: pgstream_cdc_health_has_alert == 1
+      - alert: PgTrickleCdcAlert
+        expr: pgtrickle_cdc_health_has_alert == 1
         for: 1m
         labels:
           severity: critical
@@ -279,12 +279,12 @@ groups:
 
 ### Summary
 
-A pre-built Grafana dashboard JSON that visualizes pg_stream metrics from Prometheus
+A pre-built Grafana dashboard JSON that visualizes pg_trickle metrics from Prometheus
 (Project 2). Importable via Grafana UI or provisioning.
 
 ### Repository
 
-- **Repo:** Same as Project 2 (`pgstream-monitoring`)
+- **Repo:** Same as Project 2 (`pgtrickle-monitoring`)
 - **Distribution:** JSON file, optionally published to [Grafana Dashboards](https://grafana.com/grafana/dashboards/)
 
 ### Dashboard Panels
@@ -293,33 +293,33 @@ A pre-built Grafana dashboard JSON that visualizes pg_stream metrics from Promet
 
 | Panel | Type | Query |
 |-------|------|-------|
-| Active Stream Tables | Stat | `count(pgstream_..._status{status="ACTIVE"})` |
-| Stale Tables | Stat (red if >0) | `count(pgstream_..._is_stale == 1)` |
-| Error Tables | Stat (red if >0) | `count(pgstream_..._status{status="ERROR"})` |
-| Total Refreshes/min | Stat | `rate(pgstream_..._total_refreshes[5m])` |
+| Active Stream Tables | Stat | `count(pgtrickle_..._status{status="ACTIVE"})` |
+| Stale Tables | Stat (red if >0) | `count(pgtrickle_..._is_stale == 1)` |
+| Error Tables | Stat (red if >0) | `count(pgtrickle_..._status{status="ERROR"})` |
+| Total Refreshes/min | Stat | `rate(pgtrickle_..._total_refreshes[5m])` |
 
 #### Row 2 — Refresh Performance
 
 | Panel | Type | Query |
 |-------|------|-------|
-| Avg Refresh Duration | Time series | `pgstream_..._avg_duration_ms` by `pgs_name` |
-| Refresh Rate | Time series | `rate(pgstream_..._total_refreshes[5m])` by `pgs_name` |
-| Failure Rate | Time series | `rate(pgstream_..._failed_refreshes[5m])` by `pgs_name` |
+| Avg Refresh Duration | Time series | `pgtrickle_..._avg_duration_ms` by `pgt_name` |
+| Refresh Rate | Time series | `rate(pgtrickle_..._total_refreshes[5m])` by `pgt_name` |
+| Failure Rate | Time series | `rate(pgtrickle_..._failed_refreshes[5m])` by `pgt_name` |
 
 #### Row 3 — Staleness
 
 | Panel | Type | Query |
 |-------|------|-------|
-| Staleness per ST | Time series | `pgstream_..._staleness_seconds` by `pgs_name` |
-| Rows Changed/min | Time series | `rate(pgstream_..._total_rows_inserted[5m]) + rate(pgstream_..._total_rows_deleted[5m])` |
+| Staleness per ST | Time series | `pgtrickle_..._staleness_seconds` by `pgt_name` |
+| Rows Changed/min | Time series | `rate(pgtrickle_..._total_rows_inserted[5m]) + rate(pgtrickle_..._total_rows_deleted[5m])` |
 
 #### Row 4 — CDC Health
 
 | Panel | Type | Query |
 |-------|------|-------|
-| CDC Mode per Source | Table | `pgstream_cdc_health{cdc_mode}` by `source_table` |
-| Replication Lag | Time series | `pgstream_cdc_health_lag_bytes` by `source_table` |
-| CDC Alerts | Alert list | `pgstream_cdc_health_has_alert == 1` |
+| CDC Mode per Source | Table | `pgtrickle_cdc_health{cdc_mode}` by `source_table` |
+| Replication Lag | Time series | `pgtrickle_cdc_health_lag_bytes` by `source_table` |
+| CDC Alerts | Alert list | `pgtrickle_cdc_health_has_alert == 1` |
 
 #### Row 5 — Per-Table Detail (variable: `$stream_table`)
 
@@ -337,7 +337,7 @@ A pre-built Grafana dashboard JSON that visualizes pg_stream metrics from Promet
 version: '3.8'
 services:
   postgres:
-    image: pg_stream:latest
+    image: pg_trickle:latest
     environment:
       POSTGRES_PASSWORD: postgres
     ports: ['5432:5432']
@@ -346,9 +346,9 @@ services:
     image: quay.io/prometheuscommunity/postgres-exporter:latest
     environment:
       DATA_SOURCE_NAME: "postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable"
-      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/pgstream_queries.yml
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/pgtrickle_queries.yml
     volumes:
-      - ./prometheus/pgstream_queries.yml:/etc/pgstream_queries.yml:ro
+      - ./prometheus/pgtrickle_queries.yml:/etc/pgtrickle_queries.yml:ro
     ports: ['9187:9187']
 
   prometheus:
@@ -361,7 +361,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     volumes:
-      - ./grafana/pgstream-dashboard.json:/var/lib/grafana/dashboards/pgstream.json:ro
+      - ./grafana/pgtrickle-dashboard.json:/var/lib/grafana/dashboards/pgtrickle.json:ro
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     ports: ['3000:3000']
     environment:
@@ -376,14 +376,14 @@ services:
 
 ### Summary
 
-A production-ready, ready-to-run Docker image (`postgres:18-pgstream`) with pg_stream
+A production-ready, ready-to-run Docker image (`postgres:18-pgtrickle`) with pg_trickle
 pre-installed and configured in `shared_preload_libraries`. Published to Docker Hub
 and/or GitHub Container Registry (GHCR).
 
 ### Repository
 
-- **Repo:** Same as `pg-stream` main repo (Dockerfile + CI workflow)
-- **Published to:** Docker Hub (`pgstream/postgres:18`) and GHCR (`ghcr.io/<org>/pg_stream:latest`)
+- **Repo:** Same as `pg-trickle` main repo (Dockerfile + CI workflow)
+- **Published to:** Docker Hub (`pgtrickle/postgres:18`) and GHCR (`ghcr.io/<org>/pg_trickle:latest`)
 
 ### Dockerfile
 
@@ -391,18 +391,18 @@ Based on the existing `cnpg/Dockerfile` but with `shared_preload_libraries` set 
 default (unlike the CNPG image which defers to the operator):
 
 ```dockerfile
-# Dockerfile.release (in pg-stream repo root)
-FROM pg_stream_builder AS builder
+# Dockerfile.release (in pg-trickle repo root)
+FROM pg_trickle_builder AS builder
 # ... (reuse existing build stage from cnpg/Dockerfile) ...
 
 FROM postgres:18.1
-COPY --from=builder /usr/share/postgresql/18/extension/pg_stream* \
+COPY --from=builder /usr/share/postgresql/18/extension/pg_trickle* \
      /usr/share/postgresql/18/extension/
-COPY --from=builder /usr/lib/postgresql/18/lib/pg_stream.so \
+COPY --from=builder /usr/lib/postgresql/18/lib/pg_trickle.so \
      /usr/lib/postgresql/18/lib/
 
 # Pre-configure for immediate use
-RUN echo "shared_preload_libraries = 'pg_stream'" >> \
+RUN echo "shared_preload_libraries = 'pg_trickle'" >> \
     /usr/share/postgresql/postgresql.conf.sample
 ```
 
@@ -428,8 +428,8 @@ jobs:
         with:
           push: true
           tags: |
-            pgstream/postgres:18
-            pgstream/postgres:${{ github.ref_name }}
+            pgtrickle/postgres:18
+            pgtrickle/postgres:${{ github.ref_name }}
           file: Dockerfile.release
 ```
 
@@ -437,19 +437,19 @@ jobs:
 
 | Tag | Meaning |
 |-----|---------|
-| `pgstream/postgres:18` | Latest pg_stream on PG 18 |
-| `pgstream/postgres:18-0.1.0` | Specific pg_stream version |
-| `pgstream/postgres:latest` | Alias for `:18` |
+| `pgtrickle/postgres:18` | Latest pg_trickle on PG 18 |
+| `pgtrickle/postgres:18-0.1.0` | Specific pg_trickle version |
+| `pgtrickle/postgres:latest` | Alias for `:18` |
 
 ### Quick Start
 
 ```bash
-docker run -d --name pgstream \
+docker run -d --name pgtrickle \
   -e POSTGRES_PASSWORD=postgres \
   -p 5432:5432 \
-  pgstream/postgres:18
+  pgtrickle/postgres:18
 
-psql -h localhost -U postgres -c "CREATE EXTENSION pg_stream;"
+psql -h localhost -U postgres -c "CREATE EXTENSION pg_trickle;"
 ```
 
 ### Effort: ~8 hours
@@ -466,9 +466,9 @@ CNPG cluster.
 
 ### Repository
 
-- **Repo:** Same as `pg-stream` main repo (`cnpg/` directory) — CNPG manifests are
+- **Repo:** Same as `pg-trickle` main repo (`cnpg/` directory) — CNPG manifests are
   deployment config, not a separate product
-- **Helm chart:** Optionally in a separate `pgstream-helm` repo if published to
+- **Helm chart:** Optionally in a separate `pgtrickle-helm` repo if published to
   Artifact Hub
 
 ### Deliverables
@@ -481,7 +481,7 @@ CNPG cluster.
   - WAL-mode CDC enabled (with `wal_level: logical`)
 - Add `Backup` and `ScheduledBackup` CRDs
 - Add `Pooler` CRD (PgBouncer) for connection pooling
-- Document required RBAC for the pg_stream extension
+- Document required RBAC for the pg_trickle extension
 
 ```
 cnpg/
@@ -496,7 +496,7 @@ cnpg/
 #### Phase 2 — Helm Chart (~8 hours)
 
 ```
-pgstream-helm/
+pgtrickle-helm/
 ├── Chart.yaml
 ├── values.yaml
 ├── templates/
@@ -511,8 +511,8 @@ Key `values.yaml` parameters:
 
 ```yaml
 instances: 3
-image: ghcr.io/<org>/pg_stream:latest
-pgstream:
+image: ghcr.io/<org>/pg_trickle:latest
+pgtrickle:
   enabled: true
   schedulerIntervalMs: 1000
   minScheduleSeconds: 60
@@ -536,15 +536,15 @@ pooler:
 
 ### Summary
 
-An Apache Airflow provider package (`airflow-provider-pgstream`) containing operators and
-sensors for integrating pg_stream into Airflow DAGs. Enables data teams to orchestrate
+An Apache Airflow provider package (`airflow-provider-pgtrickle`) containing operators and
+sensors for integrating pg_trickle into Airflow DAGs. Enables data teams to orchestrate
 stream table refreshes alongside their existing ETL/ELT pipelines.
 
 ### Repository
 
-- **Repo:** `github.com/<org>/airflow-provider-pgstream` (separate)
+- **Repo:** `github.com/<org>/airflow-provider-pgtrickle` (separate)
 - **Language:** Python
-- **Distribution:** PyPI (`pip install airflow-provider-pgstream`)
+- **Distribution:** PyPI (`pip install airflow-provider-pgtrickle`)
 
 ### Components
 
@@ -552,47 +552,47 @@ stream table refreshes alongside their existing ETL/ELT pipelines.
 
 | Operator | Purpose | SQL Called |
 |----------|---------|-----------|
-| `PgStreamCreateOperator` | Create a stream table | `pgstream.create_stream_table()` |
-| `PgStreamDropOperator` | Drop a stream table | `pgstream.drop_stream_table()` |
-| `PgStreamRefreshOperator` | Trigger a manual refresh | `pgstream.refresh_stream_table()` |
-| `PgStreamAlterOperator` | Alter schedule/mode/status | `pgstream.alter_stream_table()` |
+| `PgTrickleCreateOperator` | Create a stream table | `pgtrickle.create_stream_table()` |
+| `PgTrickleDropOperator` | Drop a stream table | `pgtrickle.drop_stream_table()` |
+| `PgTrickleRefreshOperator` | Trigger a manual refresh | `pgtrickle.refresh_stream_table()` |
+| `PgTrickleAlterOperator` | Alter schedule/mode/status | `pgtrickle.alter_stream_table()` |
 
 #### Sensors
 
 | Sensor | Purpose | SQL Polled |
 |--------|---------|------------|
-| `PgStreamFreshnessSensor` | Wait until a ST is fresh (not stale) | `pgstream.pg_stat_stream_tables` |
-| `PgStreamHealthSensor` | Wait until CDC health is OK | `pgstream.check_cdc_health()` |
-| `PgStreamStatusSensor` | Wait until ST reaches a target status | `pgstream.pgs_stream_tables` |
+| `PgTrickleFreshnessSensor` | Wait until a ST is fresh (not stale) | `pgtrickle.pg_stat_stream_tables` |
+| `PgTrickleHealthSensor` | Wait until CDC health is OK | `pgtrickle.check_cdc_health()` |
+| `PgTrickleStatusSensor` | Wait until ST reaches a target status | `pgtrickle.pgt_stream_tables` |
 
 #### Hooks
 
 | Hook | Purpose |
 |------|---------|
-| `PgStreamHook` | Extends `PostgresHook` with pg_stream-specific helper methods |
+| `PgTrickleHook` | Extends `PostgresHook` with pg_trickle-specific helper methods |
 
 ### Example DAG
 
 ```python
 from airflow import DAG
 from airflow.utils.dates import days_ago
-from airflow_provider_pgstream.operators import (
-    PgStreamRefreshOperator,
+from airflow_provider_pgtrickle.operators import (
+    PgTrickleRefreshOperator,
 )
-from airflow_provider_pgstream.sensors import (
-    PgStreamFreshnessSensor,
+from airflow_provider_pgtrickle.sensors import (
+    PgTrickleFreshnessSensor,
 )
 
-with DAG("pgstream_refresh", start_date=days_ago(1), schedule_interval="@hourly"):
+with DAG("pgtrickle_refresh", start_date=days_ago(1), schedule_interval="@hourly"):
 
-    wait_fresh = PgStreamFreshnessSensor(
+    wait_fresh = PgTrickleFreshnessSensor(
         task_id="wait_for_orders_fresh",
         stream_table="order_totals",
         postgres_conn_id="my_pg",
         timeout=300,
     )
 
-    refresh = PgStreamRefreshOperator(
+    refresh = PgTrickleRefreshOperator(
         task_id="refresh_order_totals",
         stream_table="order_totals",
         postgres_conn_id="my_pg",
@@ -604,13 +604,13 @@ with DAG("pgstream_refresh", start_date=days_ago(1), schedule_interval="@hourly"
 ### File Structure
 
 ```
-airflow-provider-pgstream/
+airflow-provider-pgtrickle/
 ├── pyproject.toml
 ├── README.md
-├── airflow_provider_pgstream/
+├── airflow_provider_pgtrickle/
 │   ├── __init__.py
 │   ├── hooks/
-│   │   └── pgstream.py              # PgStreamHook (~60 lines)
+│   │   └── pgtrickle.py              # PgTrickleHook (~60 lines)
 │   ├── operators/
 │   │   ├── __init__.py
 │   │   ├── create.py                # ~40 lines
@@ -632,16 +632,16 @@ airflow-provider-pgstream/
 
 ---
 
-## Project 7 — CLI Tool (`pgstream`)
+## Project 7 — CLI Tool (`pgtrickle`)
 
 ### Summary
 
-A standalone command-line tool for managing pg_stream from the terminal. Provides a
+A standalone command-line tool for managing pg_trickle from the terminal. Provides a
 user-friendly interface to common operations without writing SQL.
 
 ### Repository
 
-- **Repo:** `github.com/<org>/pgstream-cli` (separate) or as `src/bin/pgstream.rs`
+- **Repo:** `github.com/<org>/pgtrickle-cli` (separate) or as `src/bin/pgtrickle.rs`
   in the main repo if written in Rust
 - **Language:** Rust (preferred — shares build infra) or Python with `click` + `psycopg`
 - **Distribution:** GitHub Releases (binaries), Homebrew, `cargo install`, or PyPI
@@ -649,10 +649,10 @@ user-friendly interface to common operations without writing SQL.
 ### Commands
 
 ```
-pgstream — CLI for pg_stream streaming tables
+pgtrickle — CLI for pg_trickle streaming tables
 
 USAGE:
-    pgstream [OPTIONS] <COMMAND>
+    pgtrickle [OPTIONS] <COMMAND>
 
 CONNECTION:
     -h, --host <HOST>          PostgreSQL host [default: localhost]
@@ -679,14 +679,14 @@ COMMANDS:
 
 ```bash
 # List all stream tables with status
-$ pgstream list
+$ pgtrickle list
 NAME             SCHEMA   STATUS   MODE           SCHEDULE  STALE  ERRORS
 order_totals     public   ACTIVE   DIFFERENTIAL   5m        no     0
 big_customers    public   ACTIVE   DIFFERENTIAL   5m        no     0
 daily_revenue    public   ERROR    FULL           1h        yes    3
 
 # Detailed status
-$ pgstream status order_totals
+$ pgtrickle status order_totals
 Name:           order_totals
 Schema:         public
 Status:         ACTIVE
@@ -700,7 +700,7 @@ Avg Duration:   42ms
 Source Tables:   orders (TRIGGER), customers (WAL)
 
 # Live watch (refreshes every 2s)
-$ pgstream watch --interval 2s
+$ pgtrickle watch --interval 2s
 ┌──────────────┬────────┬──────────────┬──────┬───────┬──────────┐
 │ NAME         │ STATUS │ MODE         │ STALE│ ERRORS│ LAST     │
 ├──────────────┼────────┼──────────────┼──────┼───────┼──────────┤
@@ -710,15 +710,15 @@ $ pgstream watch --interval 2s
 └──────────────┴────────┴──────────────┴──────┴───────┴──────────┘
 
 # Create from file
-$ pgstream create my_table --file my_query.sql --schedule 10m --mode DIFFERENTIAL
+$ pgtrickle create my_table --file my_query.sql --schedule 10m --mode DIFFERENTIAL
 Created stream table: my_table
 
 # CDC health check
-$ pgstream health
+$ pgtrickle health
 SOURCE TABLE     CDC MODE       SLOT                  LAG      ALERT
-public.orders    WAL            pg_stream_slot_16384  512KB    none
+public.orders    WAL            pg_trickle_slot_16384  512KB    none
 public.events    TRIGGER        —                     —        —
-public.users     TRANSITIONING  pg_stream_slot_16400  0B       none
+public.users     TRANSITIONING  pg_trickle_slot_16400  0B       none
 ```
 
 ### Implementation Notes
@@ -739,16 +739,16 @@ table formatting and live display.
 
 ### Summary
 
-A full `dbt-pgstream` adapter extending `dbt-postgres`. Provides first-class stream
-table support: custom relation types, `__pgs_row_id` column filtering, native source
+A full `dbt-pgtrickle` adapter extending `dbt-postgres`. Provides first-class stream
+table support: custom relation types, `__pgt_row_id` column filtering, native source
 freshness, and operational run-operations.
 
 ### Repository
 
-- **Repo:** `github.com/<org>/dbt-pgstream` (same repo as the macro package, or
+- **Repo:** `github.com/<org>/dbt-pgtrickle` (same repo as the macro package, or
   superseding it)
 - **Language:** Python + Jinja SQL
-- **Distribution:** PyPI (`pip install dbt-pgstream`)
+- **Distribution:** PyPI (`pip install dbt-pgtrickle`)
 - **Prerequisite:** Project 1 (macro package) is the stepping stone; the adapter
   absorbs its macros
 
@@ -756,7 +756,7 @@ freshness, and operational run-operations.
 
 | Feature | Macro Package | Full Adapter |
 |---------|--------------|--------------|
-| `__pgs_row_id` hidden | No | Yes |
+| `__pgt_row_id` hidden | No | Yes |
 | Relation type `stream_table` | No (shows as `table`) | Yes |
 | Native source freshness | Manual macro | Adapter override |
 | Connection-time extension check | No | Yes |
@@ -770,13 +770,13 @@ freshness, and operational run-operations.
 
 ### Summary
 
-Publish pg_stream to [PGXN](https://pgxn.org/) (the PostgreSQL Extension Network) and
+Publish pg_trickle to [PGXN](https://pgxn.org/) (the PostgreSQL Extension Network) and
 produce `.deb`/`.rpm` packages for Linux distributions. This is the standard way
 PostgreSQL users discover and install extensions.
 
 ### Repository
 
-- **Repo:** Same as `pg-stream` main repo (packaging config + CI workflows)
+- **Repo:** Same as `pg-trickle` main repo (packaging config + CI workflows)
 
 ### Deliverables
 
@@ -786,14 +786,14 @@ Add a `META.json` at the repo root:
 
 ```json
 {
-  "name": "pg_stream",
+  "name": "pg_trickle",
   "abstract": "Streaming tables with incremental view maintenance for PostgreSQL",
   "version": "0.1.0",
   "maintainer": ["Your Name <you@example.com>"],
   "license": "postgresql",
   "provides": {
-    "pg_stream": {
-      "file": "pg_stream.control",
+    "pg_trickle": {
+      "file": "pg_trickle.control",
       "version": "0.1.0"
     }
   },
@@ -806,11 +806,11 @@ Add a `META.json` at the repo root:
   },
   "resources": {
     "repository": {
-      "url": "https://github.com/<org>/pg-stream.git",
+      "url": "https://github.com/<org>/pg-trickle.git",
       "type": "git"
     },
     "bugtracker": {
-      "web": "https://github.com/<org>/pg-stream/issues"
+      "web": "https://github.com/<org>/pg-trickle/issues"
     }
   },
   "generated_by": "hand",
@@ -822,7 +822,7 @@ Register at pgxn.org and publish with `pgxn-utils`.
 
 #### 9.2 — Debian/Ubuntu Packages (~8 hours)
 
-CI workflow that cross-compiles pg_stream and produces `.deb` packages:
+CI workflow that cross-compiles pg_trickle and produces `.deb` packages:
 
 ```yaml
 # .github/workflows/deb-package.yml
@@ -840,8 +840,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build in Docker
         run: |
-          docker build -t pg-stream-builder -f packaging/Dockerfile.${{ matrix.os }} .
-          docker run --rm -v $(pwd)/dist:/dist pg-stream-builder
+          docker build -t pg-trickle-builder -f packaging/Dockerfile.${{ matrix.os }} .
+          docker run --rm -v $(pwd)/dist:/dist pg-trickle-builder
       - uses: softprops/action-gh-release@v1
         with:
           files: dist/*.deb
@@ -856,10 +856,10 @@ Similar workflow producing `.rpm` packages for RHEL/Rocky/Alma 9.
 For macOS development:
 
 ```ruby
-class PgStream < Formula
+class PgTrickle < Formula
   desc "Streaming tables with incremental view maintenance for PostgreSQL"
-  homepage "https://github.com/<org>/pg-stream"
-  url "https://github.com/<org>/pg-stream/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/<org>/pg-trickle"
+  url "https://github.com/<org>/pg-trickle/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "..."
   license "PostgreSQL"
   depends_on "postgresql@18"
@@ -882,7 +882,7 @@ need guidance on the correct patterns.
 
 ### Repository
 
-- **Repo:** Documentation in `pg-stream` main repo (`docs/integrations/`)
+- **Repo:** Documentation in `pg-trickle` main repo (`docs/integrations/`)
 - **Optional tooling:** Liquibase extension in a separate repo
 
 ### Deliverables
@@ -893,7 +893,7 @@ Document the migration pattern in `docs/integrations/FLYWAY.md`:
 
 ```sql
 -- V1__create_order_totals.sql
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_totals',
     'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
     '5m',
@@ -901,10 +901,10 @@ SELECT pgstream.create_stream_table(
 );
 
 -- V2__update_order_totals_schedule.sql
-SELECT pgstream.alter_stream_table('order_totals', schedule => '10m');
+SELECT pgtrickle.alter_stream_table('order_totals', schedule => '10m');
 
 -- V3__drop_order_totals.sql
-SELECT pgstream.drop_stream_table('order_totals');
+SELECT pgtrickle.drop_stream_table('order_totals');
 ```
 
 Flyway executes arbitrary SQL, so no plugin is needed — just the documentation showing
@@ -917,14 +917,14 @@ Document the `sql` changeset pattern in `docs/integrations/LIQUIBASE.md`:
 ```xml
 <changeSet id="1" author="dev">
     <sql>
-        SELECT pgstream.create_stream_table(
+        SELECT pgtrickle.create_stream_table(
             'order_totals',
             'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
             '5m', 'DIFFERENTIAL'
         );
     </sql>
     <rollback>
-        <sql>SELECT pgstream.drop_stream_table('order_totals');</sql>
+        <sql>SELECT pgtrickle.drop_stream_table('order_totals');</sql>
     </rollback>
 </changeSet>
 ```
@@ -958,29 +958,29 @@ models with metadata access (staleness, last refresh, status).
 
 ### Repository
 
-- **Repos:** Separate per ORM (`django-pgstream`, `sqlalchemy-pgstream`)
+- **Repos:** Separate per ORM (`django-pgtrickle`, `sqlalchemy-pgtrickle`)
 - **Language:** Python
 - **Distribution:** PyPI
 
-### 11.1 — Django Integration (`django-pgstream`)
+### 11.1 — Django Integration (`django-pgtrickle`)
 
 ```python
-# django_pgstream/models.py
+# django_pgtrickle/models.py
 from django.db import models
 
 class StreamTableManager(models.Manager):
-    """Read-only manager that exposes pg_stream metadata."""
+    """Read-only manager that exposes pg_trickle metadata."""
 
     def get_queryset(self):
-        return super().get_queryset().defer('__pgs_row_id')
+        return super().get_queryset().defer('__pgt_row_id')
 
     def is_stale(self) -> bool:
         """Check if the stream table data is stale."""
         from django.db import connection
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT stale FROM pgstream.stream_tables_info "
-                "WHERE pgs_name = %s", [self.model._meta.db_table]
+                "SELECT stale FROM pgtrickle.stream_tables_info "
+                "WHERE pgt_name = %s", [self.model._meta.db_table]
             )
             row = cursor.fetchone()
             return row[0] if row else None
@@ -995,7 +995,7 @@ class StreamTableManager(models.Manager):
 
 
 class StreamTableModel(models.Model):
-    """Base class for Django models backed by pg_stream stream tables."""
+    """Base class for Django models backed by pg_trickle stream tables."""
 
     objects = StreamTableManager()
 
@@ -1014,14 +1014,14 @@ class OrderTotals(StreamTableModel):
 ```
 
 **Additional features:**
-- Django management command: `python manage.py pgstream_status`
+- Django management command: `python manage.py pgtrickle_status`
 - Django admin integration: read-only ModelAdmin with refresh button
 - Health check: Django health check backend for `django-health-check`
 
-### 11.2 — SQLAlchemy Integration (`sqlalchemy-pgstream`)
+### 11.2 — SQLAlchemy Integration (`sqlalchemy-pgtrickle`)
 
 ```python
-# sqlalchemy_pgstream/mixin.py
+# sqlalchemy_pgtrickle/mixin.py
 from sqlalchemy import event, inspect
 from sqlalchemy.ext.hybrid import hybrid_property
 
@@ -1042,8 +1042,8 @@ class StreamTableMixin:
     @classmethod
     def is_stale(cls, session) -> bool:
         result = session.execute(
-            "SELECT stale FROM pgstream.stream_tables_info "
-            "WHERE pgs_name = :name",
+            "SELECT stale FROM pgtrickle.stream_tables_info "
+            "WHERE pgt_name = :name",
             {"name": cls.__tablename__}
         )
         row = result.fetchone()
@@ -1052,7 +1052,7 @@ class StreamTableMixin:
     @classmethod
     def refresh(cls, session):
         session.execute(
-            f"SELECT pgstream.refresh_stream_table('{cls.__tablename__}')"
+            f"SELECT pgtrickle.refresh_stream_table('{cls.__tablename__}')"
         )
         session.commit()
 ```
@@ -1065,7 +1065,7 @@ class StreamTableMixin:
 
 ```
                           ┌──────────────────┐
-                          │   pg_stream      │
+                          │   pg_trickle      │
                           │   (core ext)     │
                           └────────┬─────────┘
                                    │
@@ -1118,46 +1118,46 @@ Everything else is independent and can be built in any order.
 Every ecosystem project must include:
 - **README.md** — Quick start (copy-paste in <2 minutes), prerequisites, configuration
 - **CHANGELOG.md** — Semantic versioned history
-- **LICENSE** — Same as pg_stream (PostgreSQL license)
+- **LICENSE** — Same as pg_trickle (PostgreSQL license)
 - **CI badge** — Build status in README
 
 ### Versioning
 
 All ecosystem projects follow semantic versioning. The major version tracks compatibility
-with pg_stream's SQL API:
-- pg_stream 0.x → ecosystem projects 0.x (unstable API)
-- pg_stream 1.0 → ecosystem projects 1.0+ (stable API)
+with pg_trickle's SQL API:
+- pg_trickle 0.x → ecosystem projects 0.x (unstable API)
+- pg_trickle 1.0 → ecosystem projects 1.0+ (stable API)
 
-### Testing Against pg_stream
+### Testing Against pg_trickle
 
-Every project that calls pg_stream SQL functions must have integration tests running
-against a real PostgreSQL 18 instance with pg_stream installed. Use the existing
+Every project that calls pg_trickle SQL functions must have integration tests running
+against a real PostgreSQL 18 instance with pg_trickle installed. Use the existing
 `tests/Dockerfile.e2e` as the base test image, or the Docker Hub image (Project 4)
 once published.
 
 ### Shared CI Infrastructure
 
 Projects can share GitHub Actions workflows:
-- Reusable workflow for "spin up PostgreSQL 18 + pg_stream" as a service container
-- Reusable workflow for "build pg_stream Docker image" (needed by all integration tests)
+- Reusable workflow for "spin up PostgreSQL 18 + pg_trickle" as a service container
+- Reusable workflow for "build pg_trickle Docker image" (needed by all integration tests)
 
 ### SQL API Stability Contract
 
-All ecosystem projects depend on pg_stream's SQL API surface. Changes to these functions
+All ecosystem projects depend on pg_trickle's SQL API surface. Changes to these functions
 require coordinated updates:
 
 | Function | Used By |
 |----------|---------|
-| `pgstream.create_stream_table()` | P1, P6, P7, P8, P10 |
-| `pgstream.alter_stream_table()` | P1, P6, P7, P8, P10 |
-| `pgstream.drop_stream_table()` | P1, P6, P7, P8, P10 |
-| `pgstream.refresh_stream_table()` | P1, P6, P7, P8, P11 |
-| `pgstream.pg_stat_stream_tables` (view) | P1, P2, P3, P6, P7, P8, P11 |
-| `pgstream.check_cdc_health()` | P2, P3, P6, P7, P8 |
-| `pgstream.explain_st()` | P7, P8 |
-| `pgstream.get_refresh_history()` | P7, P8 |
-| `pgstream.pgs_stream_tables` (table) | P1, P7, P8, P10, P11 |
-| `pgstream.stream_tables_info` (view) | P7, P11 |
+| `pgtrickle.create_stream_table()` | P1, P6, P7, P8, P10 |
+| `pgtrickle.alter_stream_table()` | P1, P6, P7, P8, P10 |
+| `pgtrickle.drop_stream_table()` | P1, P6, P7, P8, P10 |
+| `pgtrickle.refresh_stream_table()` | P1, P6, P7, P8, P11 |
+| `pgtrickle.pg_stat_stream_tables` (view) | P1, P2, P3, P6, P7, P8, P11 |
+| `pgtrickle.check_cdc_health()` | P2, P3, P6, P7, P8 |
+| `pgtrickle.explain_st()` | P7, P8 |
+| `pgtrickle.get_refresh_history()` | P7, P8 |
+| `pgtrickle.pgt_stream_tables` (table) | P1, P7, P8, P10, P11 |
+| `pgtrickle.stream_tables_info` (view) | P7, P11 |
 
 Before making breaking changes to any of these, check the "Used By" column and update
 the corresponding ecosystem projects.

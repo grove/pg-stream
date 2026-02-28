@@ -23,7 +23,7 @@ Fixes # <!-- issue number, if applicable -->
 
 - [ ] No `unwrap()` / `panic!()` in non-test code
 - [ ] All `unsafe` blocks have `// SAFETY:` comments
-- [ ] New SQL functions use `#[pg_extern(schema = "pgstream")]`
+- [ ] New SQL functions use `#[pg_extern(schema = "pgtrickle")]`
 - [ ] `just fmt && just lint` passes with zero warnings
 - [ ] Error messages include context (table name, query fragment, etc.)
 - [ ] CHANGELOG.md updated under `## [Unreleased]` if user-visible

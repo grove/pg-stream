@@ -12,20 +12,20 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a Subquery node.
 ///
 /// Delegates to the child's differentiation. If column aliases are
 /// specified, wraps the result in a renaming CTE.
-pub fn diff_subquery(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_subquery(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Subquery {
         alias,
         column_aliases,
         child,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_subquery called on non-Subquery node".into(),
         ));
     };
@@ -59,7 +59,7 @@ pub fn diff_subquery(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
     let cte_name = ctx.next_cte_name(&format!("subq_{alias}"));
 
     let sql = format!(
-        "SELECT __pgs_row_id, __pgs_action, {cols}\n\
+        "SELECT __pgt_row_id, __pgt_action, {cols}\n\
          FROM {child_cte}",
         cols = rename_exprs.join(", "),
         child_cte = child_result.cte_name,

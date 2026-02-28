@@ -1,4 +1,4 @@
-//! E2E tests for `pgstream.alter_stream_table()`.
+//! E2E tests for `pgtrickle.alter_stream_table()`.
 //!
 //! Validates altering schedule, refresh_mode, and status (suspend/resume).
 //!
@@ -21,7 +21,7 @@ async fn test_alter_schedule() {
     // Verify initial schedule (stored as text)
     let schedule_before: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'al_sched_st'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_sched_st'",
         )
         .await;
     assert_eq!(schedule_before, "1m");
@@ -31,7 +31,7 @@ async fn test_alter_schedule() {
 
     let schedule_after: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'al_sched_st'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_sched_st'",
         )
         .await;
     assert_eq!(schedule_after, "5m", "Schedule should be updated to '5m'");
@@ -48,13 +48,13 @@ async fn test_alter_refresh_mode() {
     db.create_st("al_mode_st", "SELECT id FROM al_mode", "1m", "DIFFERENTIAL")
         .await;
 
-    let (_, mode_before, _, _) = db.pgs_status("al_mode_st").await;
+    let (_, mode_before, _, _) = db.pgt_status("al_mode_st").await;
     assert_eq!(mode_before, "DIFFERENTIAL");
 
     // Change to FULL
     db.alter_st("al_mode_st", "refresh_mode => 'FULL'").await;
 
-    let (_, mode_after, _, _) = db.pgs_status("al_mode_st").await;
+    let (_, mode_after, _, _) = db.pgt_status("al_mode_st").await;
     assert_eq!(mode_after, "FULL");
 }
 
@@ -69,18 +69,18 @@ async fn test_alter_suspend() {
     db.create_st("al_susp_st", "SELECT id FROM al_susp", "1m", "FULL")
         .await;
 
-    let (status_before, _, _, _) = db.pgs_status("al_susp_st").await;
+    let (status_before, _, _, _) = db.pgt_status("al_susp_st").await;
     assert_eq!(status_before, "ACTIVE");
 
     // Suspend
     db.alter_st("al_susp_st", "status => 'SUSPENDED'").await;
 
-    let (status_after, _, _, _) = db.pgs_status("al_susp_st").await;
+    let (status_after, _, _, _) = db.pgt_status("al_susp_st").await;
     assert_eq!(status_after, "SUSPENDED");
 
     // Verify refresh is refused
     let result = db
-        .try_execute("SELECT pgstream.refresh_stream_table('al_susp_st')")
+        .try_execute("SELECT pgtrickle.refresh_stream_table('al_susp_st')")
         .await;
     assert!(
         result.is_err(),
@@ -101,11 +101,11 @@ async fn test_alter_resume() {
 
     // Suspend then resume
     db.alter_st("al_resume_st", "status => 'SUSPENDED'").await;
-    let (status, _, _, _) = db.pgs_status("al_resume_st").await;
+    let (status, _, _, _) = db.pgt_status("al_resume_st").await;
     assert_eq!(status, "SUSPENDED");
 
     db.alter_st("al_resume_st", "status => 'ACTIVE'").await;
-    let (status, _, _, errors) = db.pgs_status("al_resume_st").await;
+    let (status, _, _, errors) = db.pgt_status("al_resume_st").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(errors, 0, "consecutive_errors should be reset on resume");
 
@@ -120,7 +120,7 @@ async fn test_alter_nonexistent_fails() {
     let db = E2eDb::new().await.with_extension().await;
 
     let result = db
-        .try_execute("SELECT pgstream.alter_stream_table('nonexistent_st', status => 'SUSPENDED')")
+        .try_execute("SELECT pgtrickle.alter_stream_table('nonexistent_st', status => 'SUSPENDED')")
         .await;
     assert!(result.is_err(), "Altering a nonexistent ST should fail");
 }
@@ -143,7 +143,7 @@ async fn test_alter_schedule_compound_duration() {
 
     let sched: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'al_comp_st'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_comp_st'",
         )
         .await;
     assert_eq!(sched, "1h30m");
@@ -166,7 +166,7 @@ async fn test_alter_schedule_to_cron() {
 
     let schedule: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'al_cron_st'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_cron_st'",
         )
         .await;
     assert_eq!(schedule, "*/10 * * * *");
@@ -187,7 +187,7 @@ async fn test_alter_schedule_to_cron_alias() {
 
     let schedule: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'al_calias_st'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_calias_st'",
         )
         .await;
     assert_eq!(schedule, "@daily");
@@ -202,14 +202,14 @@ async fn test_alter_schedule_from_cron_to_duration() {
 
     // Start with cron
     db.execute(
-        "SELECT pgstream.create_stream_table('al_c2d_st', \
+        "SELECT pgtrickle.create_stream_table('al_c2d_st', \
          $$ SELECT id FROM al_c2d $$, '@hourly', 'FULL')",
     )
     .await;
 
     let before: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'al_c2d_st'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_c2d_st'",
         )
         .await;
     assert_eq!(before, "@hourly");
@@ -219,7 +219,7 @@ async fn test_alter_schedule_from_cron_to_duration() {
 
     let after: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'al_c2d_st'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'al_c2d_st'",
         )
         .await;
     assert_eq!(after, "10m");
@@ -238,7 +238,7 @@ async fn test_alter_schedule_invalid_cron_fails() {
 
     // Invalid cron: missing fields
     let result = db
-        .try_execute("SELECT pgstream.alter_stream_table('al_badcron_st', schedule => '* *')")
+        .try_execute("SELECT pgtrickle.alter_stream_table('al_badcron_st', schedule => '* *')")
         .await;
     assert!(
         result.is_err(),

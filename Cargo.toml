@@ -1,11 +1,11 @@
 [package]
-name = "pg_stream"
+name = "pg_trickle"
 version = "0.1.1"
 edition = "2024"
 description = "Streaming Stream Tables for PostgreSQL 18 with differential view maintenance"
 license = "Apache-2.0"
-repository = "https://github.com/grove/pg-stream"
-homepage = "https://github.com/grove/pg-stream"
+repository = "https://github.com/grove/pg-trickle"
+homepage = "https://github.com/grove/pg-trickle"
 readme = "README.md"
 keywords = ["postgresql", "streaming", "materialized-view", "incremental", "pgrx"]
 categories = ["database"]
@@ -18,7 +18,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pg13", "p
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
-name = "pgrx_embed_pg_stream"
+name = "pgrx_embed_pg_trickle"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]

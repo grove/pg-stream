@@ -9,12 +9,12 @@ Status: IMPLEMENTED (Phases 1–8, 10 complete; Phase 9 CI live in `.github/work
 
 ## Overview
 
-Implement pg_stream integration with [dbt Core](https://docs.getdbt.com/docs/introduction)
+Implement pg_trickle integration with [dbt Core](https://docs.getdbt.com/docs/introduction)
 as a **dbt package** containing a custom materialization macro (`stream_table`). This approach
-requires no Python adapter code — just Jinja SQL macros that call pg_stream's SQL API functions.
+requires no Python adapter code — just Jinja SQL macros that call pg_trickle's SQL API functions.
 It works with the standard `dbt-postgres` adapter.
 
-The package lives **inside the pg_stream repository** as the `dbt-pgstream/` subfolder.
+The package lives **inside the pg_trickle repository** as the `dbt-pgtrickle/` subfolder.
 This keeps the macro co-located with the extension source, enables single-PR changes when
 the SQL API evolves, and lets CI test the macros against the actual extension in one pipeline.
 Users install it via a git URL with the `subdirectory` key in their `packages.yml`.
@@ -40,7 +40,7 @@ existing dbt models.
 - [Phase 8 — Integration Tests](#phase-8--integration-tests)
 - [Phase 9 — CI Pipeline](#phase-9--ci-pipeline)
 - [Phase 10 — Documentation](#phase-10--documentation)
-- [pg-stream SQL API Reference](#pg-stream-sql-api-reference)
+- [pg-trickle SQL API Reference](#pg-trickle-sql-api-reference)
 - [Limitations](#limitations)
 - [File Layout](#file-layout)
 - [Effort Estimate](#effort-estimate)
@@ -55,7 +55,7 @@ existing dbt models.
 ┌──────────────────────────────────────────────────────────────┐
 │                      dbt Core (CLI)                          │
 │                                                              │
-│  packages.yml ─→ dbt deps ─→ installs dbt-pgstream macros   │
+│  packages.yml ─→ dbt deps ─→ installs dbt-pgtrickle macros   │
 │                                                              │
 │  dbt run ──────→ stream_table materialization                │
 │                    ├─ create_stream_table()                   │
@@ -63,25 +63,25 @@ existing dbt models.
 │                    └─ drop_stream_table()                     │
 │  dbt test ─────→ standard test runner (heap table queries)   │
 │  dbt source freshness → see Phase 7 (custom run-operation)   │
-│  dbt run-operation ─→ pgstream_refresh / drop_all / freshness│
+│  dbt run-operation ─→ pgtrickle_refresh / drop_all / freshness│
 └──────────────────┬───────────────────────────────────────────┘
                    │  Standard dbt-postgres adapter (no custom adapter)
                    ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                   PostgreSQL 18 + pg_stream                  │
+│                   PostgreSQL 18 + pg_trickle                  │
 │                                                              │
-│  pgstream.create_stream_table(name, query, schedule,         │
+│  pgtrickle.create_stream_table(name, query, schedule,         │
 │                                refresh_mode, initialize)     │
-│  pgstream.alter_stream_table(name, ...)                      │
-│  pgstream.drop_stream_table(name)                            │
-│  pgstream.refresh_stream_table(name)                         │
-│  pgstream.pg_stat_stream_tables   (monitoring view)          │
-│  pgstream.pgs_stream_tables       (catalog table)            │
-│  pgstream.check_cdc_health()      (health function)          │
+│  pgtrickle.alter_stream_table(name, ...)                      │
+│  pgtrickle.drop_stream_table(name)                            │
+│  pgtrickle.refresh_stream_table(name)                         │
+│  pgtrickle.pg_stat_stream_tables   (monitoring view)          │
+│  pgtrickle.pgt_stream_tables       (catalog table)            │
+│  pgtrickle.check_cdc_health()      (health function)          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-The key insight is that pg_stream's entire API is SQL function calls, not DDL. A dbt
+The key insight is that pg_trickle's entire API is SQL function calls, not DDL. A dbt
 custom materialization can wrap these calls in Jinja macros and map dbt's lifecycle
 (create → run → test → teardown) onto them.
 
@@ -93,25 +93,25 @@ custom materialization can wrap these calls in Jinja macros and map dbt's lifecy
 |-------------|----------------|-------|
 | dbt Core | ≥ 1.6 | Required for `subdirectory` support in `packages.yml` |
 | dbt-postgres adapter | Matching dbt Core version | Standard adapter; no custom adapter needed |
-| PostgreSQL | 18.x | pg_stream extension requires PG 18 |
-| pg_stream extension | ≥ 0.1.0 | `CREATE EXTENSION pg_stream;` must succeed |
-| dbt execution role | — | Needs permission to call `pgstream.*` functions |
+| PostgreSQL | 18.x | pg_trickle extension requires PG 18 |
+| pg_trickle extension | ≥ 0.1.0 | `CREATE EXTENSION pg_trickle;` must succeed |
+| dbt execution role | — | Needs permission to call `pgtrickle.*` functions |
 
 ---
 
 ## Phase 1 — Package Scaffolding
 
-### 1.1 Location within the pg_stream repo
+### 1.1 Location within the pg_trickle repo
 
-The dbt package lives as a subfolder in the main pg_stream repository. This avoids a
+The dbt package lives as a subfolder in the main pg_trickle repository. This avoids a
 separate repo, keeps the SQL API and macros in sync, and lets CI test both together.
 
 ```
-pg-stream/                            # Main extension repo
+pg-trickle/                            # Main extension repo
 ├── src/                              # Rust extension source
 ├── tests/                            # Extension tests
 ├── docs/
-├── dbt-pgstream/                     # ← dbt macro package (subfolder)
+├── dbt-pgtrickle/                     # ← dbt macro package (subfolder)
 │   ├── dbt_project.yml
 │   ├── README.md
 │   ├── macros/
@@ -153,15 +153,15 @@ Users install the package via a git URL with the `subdirectory` key (dbt Core �
 ```yaml
 # packages.yml (in the user's dbt project)
 packages:
-  - git: "https://github.com/<org>/pg-stream.git"
+  - git: "https://github.com/<org>/pg-trickle.git"
     revision: v0.1.0    # git tag, branch, or commit SHA
-    subdirectory: "dbt-pgstream"
+    subdirectory: "dbt-pgtrickle"
 ```
 
 Then run:
 
 ```bash
-dbt deps   # clones pg-stream repo, installs only dbt-pgstream/ subfolder
+dbt deps   # clones pg-trickle repo, installs only dbt-pgtrickle/ subfolder
 ```
 
 > **Note:** `dbt deps` performs a shallow clone by default, so pulling the full Rust
@@ -184,8 +184,8 @@ PyPI), it can be extracted to a separate repo at that point.
 ### 1.4 dbt_project.yml
 
 ```yaml
-# dbt-pgstream/dbt_project.yml
-name: 'dbt_pgstream'
+# dbt-pgtrickle/dbt_project.yml
+name: 'dbt_pgtrickle'
 version: '0.1.0'
 config-version: 2
 
@@ -201,7 +201,7 @@ clean-targets:
 
 ## Phase 2 — SQL API Wrappers
 
-These macros provide thin, safe wrappers around pg_stream's SQL API functions. They are
+These macros provide thin, safe wrappers around pg_trickle's SQL API functions. They are
 used by the materialization (Phase 4) and lifecycle operations (Phase 6).
 
 All wrappers use `dbt.string_literal()` for safe quoting and `run_query()` for execution.
@@ -216,13 +216,13 @@ All wrappers use `dbt.string_literal()` for safe quoting and `run_query()` for e
 
 File: `macros/adapters/create_stream_table.sql`
 
-Note: `schedule` may be `none` if the user wants pg_stream's CALCULATED schedule.
-The pg_stream SQL API accepts `NULL` for schedule, which triggers automatic calculation.
+Note: `schedule` may be `none` if the user wants pg_trickle's CALCULATED schedule.
+The pg_trickle SQL API accepts `NULL` for schedule, which triggers automatic calculation.
 
 ```sql
-{% macro pgstream_create_stream_table(name, query, schedule, refresh_mode, initialize) %}
+{% macro pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize) %}
   {% set create_sql %}
-    SELECT pgstream.create_stream_table(
+    SELECT pgtrickle.create_stream_table(
       {{ dbt.string_literal(name) }},
       {{ dbt.string_literal(query) }},
       {% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %},
@@ -231,7 +231,7 @@ The pg_stream SQL API accepts `NULL` for schedule, which triggers automatic calc
     )
   {% endset %}
   {% do run_query(create_sql) %}
-  {{ log("pg_stream: created stream table '" ~ name ~ "'", info=true) }}
+  {{ log("pg_trickle: created stream table '" ~ name ~ "'", info=true) }}
 {% endmacro %}
 ```
 
@@ -239,16 +239,16 @@ The pg_stream SQL API accepts `NULL` for schedule, which triggers automatic calc
 
 File: `macros/adapters/alter_stream_table.sql`
 
-Pass `NULL` for parameters that should remain unchanged. The pg_stream API treats `NULL`
+Pass `NULL` for parameters that should remain unchanged. The pg_trickle API treats `NULL`
 as "keep current value".
 
 Accepts an optional `current_info` parameter to avoid a redundant catalog lookup when
 the materialization has already fetched the metadata.
 
 ```sql
-{% macro pgstream_alter_stream_table(name, schedule, refresh_mode, status=none, current_info=none) %}
+{% macro pgtrickle_alter_stream_table(name, schedule, refresh_mode, status=none, current_info=none) %}
   {# Use pre-fetched metadata if available, otherwise look it up #}
-  {% set current = current_info if current_info else pgstream_get_stream_table_info(name) %}
+  {% set current = current_info if current_info else pgtrickle_get_stream_table_info(name) %}
   {% if current %}
     {% set needs_alter = false %}
 
@@ -266,7 +266,7 @@ the materialization has already fetched the metadata.
 
     {% if needs_alter %}
       {% set alter_sql %}
-        SELECT pgstream.alter_stream_table(
+        SELECT pgtrickle.alter_stream_table(
           {{ dbt.string_literal(name) }},
           schedule => {% if current.schedule != schedule %}{% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %}{% else %}NULL{% endif %},
           refresh_mode => {% if current.refresh_mode != refresh_mode %}{% if refresh_mode is none %}NULL{% else %}{{ dbt.string_literal(refresh_mode) }}{% endif %}{% else %}NULL{% endif %},
@@ -274,7 +274,7 @@ the materialization has already fetched the metadata.
         )
       {% endset %}
       {% do run_query(alter_sql) %}
-      {{ log("pg_stream: altered stream table '" ~ name ~ "'", info=true) }}
+      {{ log("pg_trickle: altered stream table '" ~ name ~ "'", info=true) }}
     {% endif %}
   {% endif %}
 {% endmacro %}
@@ -285,12 +285,12 @@ the materialization has already fetched the metadata.
 File: `macros/adapters/drop_stream_table.sql`
 
 ```sql
-{% macro pgstream_drop_stream_table(name) %}
+{% macro pgtrickle_drop_stream_table(name) %}
   {% set drop_sql %}
-    SELECT pgstream.drop_stream_table({{ dbt.string_literal(name) }})
+    SELECT pgtrickle.drop_stream_table({{ dbt.string_literal(name) }})
   {% endset %}
   {% do run_query(drop_sql) %}
-  {{ log("pg_stream: dropped stream table '" ~ name ~ "'", info=true) }}
+  {{ log("pg_trickle: dropped stream table '" ~ name ~ "'", info=true) }}
 {% endmacro %}
 ```
 
@@ -299,12 +299,12 @@ File: `macros/adapters/drop_stream_table.sql`
 File: `macros/adapters/refresh_stream_table.sql`
 
 ```sql
-{% macro pgstream_refresh_stream_table(name) %}
+{% macro pgtrickle_refresh_stream_table(name) %}
   {% set refresh_sql %}
-    SELECT pgstream.refresh_stream_table({{ dbt.string_literal(name) }})
+    SELECT pgtrickle.refresh_stream_table({{ dbt.string_literal(name) }})
   {% endset %}
   {% do run_query(refresh_sql) %}
-  {{ log("pg_stream: refreshed stream table '" ~ name ~ "'", info=true) }}
+  {{ log("pg_trickle: refreshed stream table '" ~ name ~ "'", info=true) }}
 {% endmacro %}
 ```
 
@@ -326,7 +326,7 @@ File: `macros/utils/stream_table_exists.sql`
 
 Handles both simple names (`order_totals`) and schema-qualified names
 (`analytics.order_totals`) by splitting on `.` and matching against **both**
-`pgs_schema` and `pgs_name` columns. This avoids ambiguity when two schemas
+`pgt_schema` and `pgt_name` columns. This avoids ambiguity when two schemas
 have a stream table with the same name.
 
 Unqualified names default to `target.schema` (from the dbt profile), matching
@@ -334,7 +334,7 @@ how the materialization resolves schemas. This avoids a mismatch with the Rust
 API fallback (`current_schema()`).
 
 ```sql
-{% macro pgstream_stream_table_exists(name) %}
+{% macro pgtrickle_stream_table_exists(name) %}
   {% if execute %}
     {# Split schema-qualified name if present #}
     {% set parts = name.split('.') %}
@@ -348,9 +348,9 @@ API fallback (`current_schema()`).
 
     {% set query %}
       SELECT EXISTS(
-        SELECT 1 FROM pgstream.pgs_stream_tables
-        WHERE pgs_schema = {{ dbt.string_literal(lookup_schema) }}
-          AND pgs_name = {{ dbt.string_literal(lookup_name) }}
+        SELECT 1 FROM pgtrickle.pgt_stream_tables
+        WHERE pgt_schema = {{ dbt.string_literal(lookup_schema) }}
+          AND pgt_name = {{ dbt.string_literal(lookup_name) }}
       ) AS st_exists
     {% endset %}
     {% set result = run_query(query) %}
@@ -366,13 +366,13 @@ API fallback (`current_schema()`).
 
 File: `macros/utils/get_stream_table_info.sql`
 
-Returns a row dict with `pgs_name`, `pgs_schema`, `defining_query`, `schedule`,
+Returns a row dict with `pgt_name`, `pgt_schema`, `defining_query`, `schedule`,
 `refresh_mode`, `status` — or `none` if the stream table does not exist.
-Filters on both `pgs_schema` and `pgs_name` to avoid ambiguity.
+Filters on both `pgt_schema` and `pgt_name` to avoid ambiguity.
 Unqualified names default to `target.schema`.
 
 ```sql
-{% macro pgstream_get_stream_table_info(name) %}
+{% macro pgtrickle_get_stream_table_info(name) %}
   {% if execute %}
     {% set parts = name.split('.') %}
     {% if parts | length == 2 %}
@@ -384,10 +384,10 @@ Unqualified names default to `target.schema`.
     {% endif %}
 
     {% set query %}
-      SELECT pgs_name, pgs_schema, defining_query, schedule, refresh_mode, status
-      FROM pgstream.pgs_stream_tables
-      WHERE pgs_schema = {{ dbt.string_literal(lookup_schema) }}
-        AND pgs_name = {{ dbt.string_literal(lookup_name) }}
+      SELECT pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status
+      FROM pgtrickle.pgt_stream_tables
+      WHERE pgt_schema = {{ dbt.string_literal(lookup_schema) }}
+        AND pgt_name = {{ dbt.string_literal(lookup_name) }}
     {% endset %}
     {% set result = run_query(query) %}
     {% if result and result.rows | length > 0 %}
@@ -429,18 +429,18 @@ The materialization must handle three cases:
   {# -- Always schema-qualify the stream table name -- #}
   {%- set qualified_name = st_schema ~ '.' ~ st_name -%}
 
-  {# -- Authoritative existence check via pg_stream catalog.
+  {# -- Authoritative existence check via pg_trickle catalog.
        We don't rely solely on dbt's relation cache because the stream table
        may have been created/dropped outside dbt. -- #}
-  {%- set st_exists = pgstream_stream_table_exists(qualified_name) -%}
+  {%- set st_exists = pgtrickle_stream_table_exists(qualified_name) -%}
 
-  {{ log("pg_stream: materializing stream table '" ~ qualified_name ~ "'", info=true) }}
+  {{ log("pg_trickle: materializing stream table '" ~ qualified_name ~ "'", info=true) }}
 
   {{ run_hooks(pre_hooks) }}
 
   {# -- Full refresh: drop and recreate -- #}
   {% if full_refresh_mode and st_exists %}
-    {{ pgstream_drop_stream_table(qualified_name) }}
+    {{ pgtrickle_drop_stream_table(qualified_name) }}
     {% set st_exists = false %}
   {% endif %}
 
@@ -449,25 +449,25 @@ The materialization must handle three cases:
 
   {% if not st_exists %}
     {# -- CREATE: stream table does not exist yet -- #}
-    {{ pgstream_create_stream_table(
+    {{ pgtrickle_create_stream_table(
          qualified_name, defining_query, schedule, refresh_mode, initialize
        ) }}
     {% do adapter.cache_new(this.incorporate(type='table')) %}
   {% else %}
     {# -- UPDATE: stream table exists — check if query changed -- #}
-    {%- set current_info = pgstream_get_stream_table_info(qualified_name) -%}
+    {%- set current_info = pgtrickle_get_stream_table_info(qualified_name) -%}
 
     {% if current_info and current_info.defining_query != defining_query %}
       {# Query changed: must drop and recreate (no in-place ALTER for query) #}
-      {{ log("pg_stream: query changed — dropping and recreating '" ~ qualified_name ~ "'", info=true) }}
-      {{ pgstream_drop_stream_table(qualified_name) }}
-      {{ pgstream_create_stream_table(
+      {{ log("pg_trickle: query changed — dropping and recreating '" ~ qualified_name ~ "'", info=true) }}
+      {{ pgtrickle_drop_stream_table(qualified_name) }}
+      {{ pgtrickle_create_stream_table(
            qualified_name, defining_query, schedule, refresh_mode, initialize
          ) }}
     {% else %}
       {# Query unchanged: update schedule/mode/status if they differ.
          Pass current_info to avoid redundant catalog lookup. #}
-      {{ pgstream_alter_stream_table(
+      {{ pgtrickle_alter_stream_table(
            qualified_name, schedule, refresh_mode,
            status=status, current_info=current_info
          ) }}
@@ -485,8 +485,8 @@ The materialization must handle three cases:
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| `adapter='postgres'` | Tie to postgres adapter | pg_stream only runs on PostgreSQL; avoids confusion with other adapters |
-| `pgstream_stream_table_exists()` | Authoritative check via catalog | Correct even if stream table was created/dropped outside dbt (unlike `load_cached_relation`) |
+| `adapter='postgres'` | Tie to postgres adapter | pg_trickle only runs on PostgreSQL; avoids confusion with other adapters |
+| `pgtrickle_stream_table_exists()` | Authoritative check via catalog | Correct even if stream table was created/dropped outside dbt (unlike `load_cached_relation`) |
 | `dbt.string_literal()` | Safe quoting for all parameters | Prevents SQL injection from model configs |
 | `flags.FULL_REFRESH` | Check dbt global flag | Standard way to detect `--full-refresh` flag |
 | `run_hooks(pre_hooks)` / `run_hooks(post_hooks)` | Support dbt hooks | Allows users to add custom pre/post SQL |
@@ -496,13 +496,13 @@ The materialization must handle three cases:
 ### 4.3 Query change detection
 
 The materialization compares the compiled SQL (`sql`) with the `defining_query` stored
-in `pgstream.pgs_stream_tables`. If they differ, it drops and recreates the stream table.
+in `pgtrickle.pgt_stream_tables`. If they differ, it drops and recreates the stream table.
 
 **Known limitation:** String comparison is sensitive to whitespace differences. The same
 logical query with different formatting will be treated as a change, triggering an
 unnecessary drop/recreate.
 
-**Future improvement:** pg_stream could expose a `pgs_query_hash` column in the catalog
+**Future improvement:** pg_trickle could expose a `pgt_query_hash` column in the catalog
 that stores a normalized hash of the defining query. The materialization would then
 compare hashes instead of raw strings. For now, the simple string comparison is
 acceptable because:
@@ -554,7 +554,7 @@ GROUP BY customer_id
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `materialized` | string | — | Must be `'stream_table'` |
-| `schedule` | string/null | `'1m'` | Refresh schedule (duration or cron). Set to `null` for pg_stream's CALCULATED schedule. Passed directly to `create_stream_table()`. |
+| `schedule` | string/null | `'1m'` | Refresh schedule (duration or cron). Set to `null` for pg_trickle's CALCULATED schedule. Passed directly to `create_stream_table()`. |
 | `refresh_mode` | string | `'DIFFERENTIAL'` | `'FULL'` or `'DIFFERENTIAL'`. |
 | `initialize` | bool | `true` | Whether to populate on creation. |
 | `status` | string/null | `null` (no change) | `'ACTIVE'` or `'PAUSED'`. When set, passed to `alter_stream_table()` on subsequent runs. Allows pausing/resuming a stream table from dbt config. |
@@ -590,7 +590,7 @@ models:
 
 `dbt build` runs models and tests in DAG order. Since stream table models typically
 reference raw source tables (not other dbt models), they tend to be scheduled early in
-the DAG. This is fine — the materialization creates the stream table, and pg_stream's
+the DAG. This is fine — the materialization creates the stream table, and pg_trickle's
 background scheduler handles ongoing refreshes independently of dbt.
 
 Note: if a standard dbt model depends on a stream table (via `ref()`), `dbt build` will
@@ -602,11 +602,11 @@ ordering.
 
 File: `macros/operations/refresh.sql`
 
-Named `pgstream_refresh` (not just `refresh`) to avoid name collisions with other
+Named `pgtrickle_refresh` (not just `refresh`) to avoid name collisions with other
 packages or user macros.
 
 ```sql
-{% macro pgstream_refresh(model_name, schema=none) %}
+{% macro pgtrickle_refresh(model_name, schema=none) %}
   {# Schema-qualify if not already qualified #}
   {% if '.' in model_name %}
     {% set qualified = model_name %}
@@ -615,17 +615,17 @@ packages or user macros.
   {% else %}
     {% set qualified = target.schema ~ '.' ~ model_name %}
   {% endif %}
-  {{ pgstream_refresh_stream_table(qualified) }}
+  {{ pgtrickle_refresh_stream_table(qualified) }}
 {% endmacro %}
 ```
 
 Usage:
 ```bash
 # Uses target.schema from profiles.yml by default
-dbt run-operation pgstream_refresh --args '{"model_name": "order_totals"}'
+dbt run-operation pgtrickle_refresh --args '{"model_name": "order_totals"}'
 
 # Or explicitly schema-qualify
-dbt run-operation pgstream_refresh --args '{"model_name": "analytics.order_totals"}''
+dbt run-operation pgtrickle_refresh --args '{"model_name": "analytics.order_totals"}''
 ```
 
 ### 6.3 Drop stream tables
@@ -650,36 +650,36 @@ Safe in shared environments where non-dbt stream tables may exist.
       {% set st_name = model.config.get('stream_table_name', model.name) %}
       {% set st_schema = model.config.get('stream_table_schema', target.schema) %}
       {% set qualified = st_schema ~ '.' ~ st_name %}
-      {% if pgstream_stream_table_exists(qualified) %}
-        {{ pgstream_drop_stream_table(qualified) }}
+      {% if pgtrickle_stream_table_exists(qualified) %}
+        {{ pgtrickle_drop_stream_table(qualified) }}
         {% do dropped.append(qualified) %}
       {% endif %}
     {% endfor %}
-    {{ log("pg_stream: dropped " ~ dropped | length ~ " dbt-managed stream table(s)", info=true) }}
+    {{ log("pg_trickle: dropped " ~ dropped | length ~ " dbt-managed stream table(s)", info=true) }}
   {% endif %}
 {% endmacro %}
 ```
 
 #### `drop_all_stream_tables_force` (nuclear — all stream tables)
 
-Queries the pg_stream catalog directly. Drops **all** stream tables, including those
+Queries the pg_trickle catalog directly. Drops **all** stream tables, including those
 created outside dbt. Use with caution in shared environments.
 
 ```sql
 {% macro drop_all_stream_tables_force() %}
   {% if execute %}
     {% set query %}
-      SELECT pgs_schema || '.' || pgs_name AS qualified_name
-      FROM pgstream.pgs_stream_tables
+      SELECT pgt_schema || '.' || pgt_name AS qualified_name
+      FROM pgtrickle.pgt_stream_tables
     {% endset %}
     {% set results = run_query(query) %}
     {% if results and results.rows | length > 0 %}
       {% for row in results.rows %}
-        {{ pgstream_drop_stream_table(row['qualified_name']) }}
+        {{ pgtrickle_drop_stream_table(row['qualified_name']) }}
       {% endfor %}
-      {{ log("pg_stream: force-dropped " ~ results.rows | length ~ " stream table(s)", info=true) }}
+      {{ log("pg_trickle: force-dropped " ~ results.rows | length ~ " stream table(s)", info=true) }}
     {% else %}
-      {{ log("pg_stream: no stream tables found to drop", info=true) }}
+      {{ log("pg_trickle: no stream tables found to drop", info=true) }}
     {% endif %}
   {% endif %}
 {% endmacro %}
@@ -689,12 +689,12 @@ created outside dbt. Use with caution in shared environments.
 
 File: `macros/operations/check_cdc_health.sql`
 
-Wraps pg_stream's `check_cdc_health()` function, which is shown in the architecture
+Wraps pg_trickle's `check_cdc_health()` function, which is shown in the architecture
 diagram but not otherwise exposed in the macro package. Useful for CI and debugging
 CDC pipeline issues.
 
 ```sql
-{% macro pgstream_check_cdc_health() %}
+{% macro pgtrickle_check_cdc_health() %}
   {#
     Check CDC health for all stream tables. Reports trigger/WAL status,
     buffer table sizes, and any replication slot issues.
@@ -702,12 +702,12 @@ CDC pipeline issues.
   #}
   {% if execute %}
     {% set query %}
-      SELECT * FROM pgstream.check_cdc_health()
+      SELECT * FROM pgtrickle.check_cdc_health()
     {% endset %}
     {% set results = run_query(query) %}
     {% set problems = [] %}
     {% for row in results.rows %}
-      {% set st = row['pgs_schema'] ~ '.' ~ row['pgs_name'] %}
+      {% set st = row['pgt_schema'] ~ '.' ~ row['pgt_name'] %}
       {% set source = row['source_schema'] ~ '.' ~ row['source_table'] %}
       {{ log("CDC: " ~ st ~ " ← " ~ source ~ " [" ~ row['cdc_mode'] ~ "] buffer=" ~ row['buffer_rows'], info=true) }}
       {% if row['healthy'] == false %}
@@ -725,7 +725,7 @@ CDC pipeline issues.
 
 Usage:
 ```bash
-dbt run-operation pgstream_check_cdc_health
+dbt run-operation pgtrickle_check_cdc_health
 ```
 
 ### 6.5 `dbt test`
@@ -733,7 +733,7 @@ dbt run-operation pgstream_check_cdc_health
 No special handling needed. Stream tables are standard PostgreSQL heap tables. All dbt
 tests (schema tests, data tests, custom tests) work normally by querying the table.
 
-The `__pgs_row_id` column is present but does not interfere with tests unless the user
+The `__pgt_row_id` column is present but does not interfere with tests unless the user
 explicitly selects `*` and checks column counts. Document this in the README.
 
 ### 6.5 `dbt ls` (listing stream table models)
@@ -749,7 +749,7 @@ check freshness or refresh them individually.
 
 ### 6.6 `dbt docs generate`
 
-dbt introspects tables via `information_schema`. The `__pgs_row_id` column will appear
+dbt introspects tables via `information_schema`. The `__pgt_row_id` column will appear
 in the generated docs. Add a post-hook or custom docs macro to annotate it:
 
 ```yaml
@@ -757,8 +757,8 @@ in the generated docs. Add a post-hook or custom docs macro to annotate it:
 models:
   - name: order_totals
     columns:
-      - name: __pgs_row_id
-        description: "Internal pg_stream row identity hash. Ignore this column."
+      - name: __pgt_row_id
+        description: "Internal pg_trickle row identity hash. Ignore this column."
 ```
 
 ---
@@ -768,7 +768,7 @@ models:
 ### 7.1 Why native `dbt source freshness` doesn't work directly
 
 dbt's `dbt source freshness` runs `SELECT MAX(loaded_at_field) FROM <source_table>`.
-However, `last_refresh_at` lives in the **catalog table** (`pgstream.pgs_stream_tables`),
+However, `last_refresh_at` lives in the **catalog table** (`pgtrickle.pgt_stream_tables`),
 not on the stream table itself. Running `SELECT MAX(last_refresh_at) FROM order_totals`
 would fail because that column doesn't exist on the stream table.
 
@@ -778,7 +778,7 @@ out of scope for a macro-only package.
 ### 7.2 Workaround: run-operation freshness check
 
 Instead of native `dbt source freshness`, we provide a run-operation that queries
-pg_stream's `pg_stat_stream_tables` monitoring view. This view already computes
+pg_trickle's `pg_stat_stream_tables` monitoring view. This view already computes
 `staleness` and `stale` — the macro avoids duplicating that logic.
 
 The macro **raises an error** when any stream table exceeds the error threshold,
@@ -788,9 +788,9 @@ CI pipelines where a silent log message would be missed.
 File: `macros/hooks/source_freshness.sql`
 
 ```sql
-{% macro pgstream_check_freshness(model_name=none, warn_seconds=600, error_seconds=1800) %}
+{% macro pgtrickle_check_freshness(model_name=none, warn_seconds=600, error_seconds=1800) %}
   {#
-    Check freshness of stream tables via pg_stream's monitoring view.
+    Check freshness of stream tables via pg_trickle's monitoring view.
     If model_name is provided, check only that stream table.
     Otherwise, check all stream tables.
 
@@ -805,22 +805,22 @@ File: `macros/hooks/source_freshness.sql`
   {% if execute %}
     {% set query %}
       SELECT
-        pgs_name,
-        pgs_schema,
+        pgt_name,
+        pgt_schema,
         last_refresh_at,
         EXTRACT(EPOCH FROM staleness)::int AS staleness_seconds,
         stale,
         consecutive_errors
-      FROM pgstream.pg_stat_stream_tables
+      FROM pgtrickle.pg_stat_stream_tables
       WHERE status = 'ACTIVE'
       {% if model_name is not none %}
-        AND pgs_name = {{ dbt.string_literal(model_name) }}
+        AND pgt_name = {{ dbt.string_literal(model_name) }}
       {% endif %}
     {% endset %}
     {% set results = run_query(query) %}
     {% set errors = [] %}
     {% for row in results.rows %}
-      {% set name = row['pgs_schema'] ~ '.' ~ row['pgs_name'] %}
+      {% set name = row['pgt_schema'] ~ '.' ~ row['pgt_name'] %}
       {% set staleness = row['staleness_seconds'] %}
       {% if staleness is not none and staleness > error_seconds %}
         {{ log("ERROR: stream table '" ~ name ~ "' is stale (" ~ staleness ~ "s > " ~ error_seconds ~ "s)", info=true) }}
@@ -847,23 +847,23 @@ File: `macros/hooks/source_freshness.sql`
 Usage:
 ```bash
 # Check all stream tables
-dbt run-operation pgstream_check_freshness
+dbt run-operation pgtrickle_check_freshness
 
 # Check a specific stream table with custom thresholds
-dbt run-operation pgstream_check_freshness \
+dbt run-operation pgtrickle_check_freshness \
   --args '{model_name: order_totals, warn_seconds: 300, error_seconds: 900}'
 ```
 
 ### 7.3 Future: native source freshness (requires Option B adapter)
 
 To enable `dbt source freshness` natively, Option B (custom adapter) could override
-`collect_freshness()` in Python to query `pgstream.pgs_stream_tables.last_refresh_at`
+`collect_freshness()` in Python to query `pgtrickle.pgt_stream_tables.last_refresh_at`
 directly. This would allow the standard `sources.yml` freshness config to work:
 
 ```yaml
 # This YAML only works with Option B (custom adapter) — NOT with this macro package
 sources:
-  - name: pgstream
+  - name: pgtrickle
     schema: public
     freshness:
       warn_after: {count: 10, period: minute}
@@ -872,19 +872,19 @@ sources:
       - name: order_totals
 ```
 
-For the macro-only approach, use the `pgstream_check_freshness` run-operation above.
+For the macro-only approach, use the `pgtrickle_check_freshness` run-operation above.
 
 ---
 
 ## Phase 8 — Integration Tests
 
-The `dbt-pgstream/integration_tests/` directory is a standalone dbt project that
-validates all macros against a real PostgreSQL 18 instance with pg_stream installed.
+The `dbt-pgtrickle/integration_tests/` directory is a standalone dbt project that
+validates all macros against a real PostgreSQL 18 instance with pg_trickle installed.
 
 ### 8.1 Test project structure
 
 ```
-dbt-pgstream/integration_tests/
+dbt-pgtrickle/integration_tests/
 ├── dbt_project.yml
 ├── profiles.yml
 ├── packages.yml           # local: ../
@@ -902,7 +902,7 @@ dbt-pgstream/integration_tests/
 ### 8.2 `integration_tests/dbt_project.yml`
 
 ```yaml
-name: 'dbt_pgstream_integration_tests'
+name: 'dbt_pgtrickle_integration_tests'
 version: '0.1.0'
 config-version: 2
 
@@ -921,7 +921,7 @@ clean-targets:
 
 ```yaml
 packages:
-  - local: ../    # Install the parent dbt-pgstream package
+  - local: ../    # Install the parent dbt-pgtrickle package
 ```
 
 ### 8.4 `integration_tests/profiles.yml`
@@ -1030,8 +1030,8 @@ WHERE a.customer_id IS NULL
 ```sql
 -- Verify no stream tables have consecutive errors.
 -- An empty result set means the test passes.
-SELECT pgs_name, consecutive_errors
-FROM pgstream.pgs_stream_tables
+SELECT pgt_name, consecutive_errors
+FROM pgtrickle.pgt_stream_tables
 WHERE consecutive_errors > 0
 ```
 
@@ -1054,7 +1054,7 @@ ELAPSED=0
 
 while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
   POPULATED=$(psql -tAc \
-    "SELECT is_populated FROM pgstream.pgs_stream_tables WHERE pgs_name = '$NAME'")
+    "SELECT is_populated FROM pgtrickle.pgt_stream_tables WHERE pgt_name = '$NAME'")
   if [ "$POPULATED" = "t" ]; then
     echo "Stream table '$NAME' is populated after ${ELAPSED}s"
     exit 0
@@ -1075,7 +1075,7 @@ alter path works. This can be done by having a second model file or by using
 
 ```bash
 # After initial dbt run, verify schedule is '1m'
-psql -tAc "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'order_totals'"
+psql -tAc "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'order_totals'"
 # Should output: 1m
 
 # TODO: Update model config to schedule='5m' and re-run
@@ -1116,7 +1116,7 @@ mv models/marts/order_totals.sql.bak models/marts/order_totals.sql
 ### 8.13 Test flow
 
 ```bash
-cd dbt-pgstream/integration_tests
+cd dbt-pgtrickle/integration_tests
 
 # Cleanup trap — ensure stream tables are dropped even if tests fail
 cleanup() { dbt run-operation drop_all_stream_tables 2>/dev/null || true; }
@@ -1130,9 +1130,9 @@ dbt test                                # Run schema + data tests
 dbt run --full-refresh                  # Test drop/recreate path
 ./scripts/wait_for_populated.sh order_totals 30  # Wait again after recreate
 dbt test                                # Verify still correct after full-refresh
-dbt run-operation pgstream_refresh \
+dbt run-operation pgtrickle_refresh \
   --args '{model_name: order_totals}'   # Test manual refresh operation
-dbt run-operation pgstream_check_freshness  # Test freshness check
+dbt run-operation pgtrickle_check_freshness  # Test freshness check
 dbt run-operation drop_all_stream_tables    # Test teardown (dbt-managed only)
 ```
 
@@ -1140,7 +1140,7 @@ dbt run-operation drop_all_stream_tables    # Test teardown (dbt-managed only)
 
 ## Phase 9 — CI Pipeline
 
-Since the macros live in the pg_stream repo, dbt integration tests run as part of the
+Since the macros live in the pg_trickle repo, dbt integration tests run as part of the
 main CI pipeline alongside the Rust extension tests.
 
 ### 9.1 CI job for main workflow
@@ -1150,14 +1150,14 @@ Add a `dbt-integration` job to the existing `.github/workflows/ci.yml`:
 ```yaml
 dbt-integration:
   runs-on: ubuntu-latest
-  needs: [build]   # Ensure the pg_stream Docker image is built first
+  needs: [build]   # Ensure the pg_trickle Docker image is built first
   strategy:
     matrix:
       dbt-version: ['1.6', '1.7', '1.8', '1.9']
     fail-fast: false
   services:
     postgres:
-      image: pg-stream-e2e:latest    # Custom image with pg_stream
+      image: pg-trickle-e2e:latest    # Custom image with pg_trickle
       ports: ['5432:5432']
       env:
         POSTGRES_PASSWORD: postgres
@@ -1173,9 +1173,9 @@ dbt-integration:
           "dbt-core~=${{ matrix.dbt-version }}.0" \
           "dbt-postgres~=${{ matrix.dbt-version }}.0"
 
-    - name: Create pg_stream extension
+    - name: Create pg_trickle extension
       run: |
-        PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE EXTENSION pg_stream;"
+        PGPASSWORD=postgres psql -h localhost -U postgres -c "CREATE EXTENSION pg_trickle;"
 
     - name: Run integration tests
       env:
@@ -1185,7 +1185,7 @@ dbt-integration:
         PGPASSWORD: postgres
         PGDATABASE: postgres
       run: |
-        cd dbt-pgstream/integration_tests
+        cd dbt-pgtrickle/integration_tests
         dbt deps
         dbt seed
         dbt run
@@ -1194,18 +1194,18 @@ dbt-integration:
         dbt run --full-refresh
         ./scripts/wait_for_populated.sh order_totals 30
         dbt test
-        dbt run-operation pgstream_refresh --args '{model_name: order_totals}'
-        dbt run-operation pgstream_check_freshness
+        dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
+        dbt run-operation pgtrickle_check_freshness
         dbt run-operation drop_all_stream_tables
 ```
 
 ### 9.2 CI considerations
 
-- **Docker build time:** The pg-stream Docker build compiles Rust — takes 10-15 min.
+- **Docker build time:** The pg-trickle Docker build compiles Rust — takes 10-15 min.
   Consider caching the Docker image via `docker/build-push-action` with GitHub Actions
   cache, or building it in a separate job and sharing via artifact.
 - **Polling instead of sleep:** Use `wait_for_populated.sh` instead of `sleep`.
-  CI environments vary in speed — polling `pgstream.pgs_stream_tables.is_populated`
+  CI environments vary in speed — polling `pgtrickle.pgt_stream_tables.is_populated`
   is deterministic and doesn't waste time on fast machines or fail on slow ones.
 - **dbt version matrix:** Test against dbt-core 1.6 through 1.9 to catch compatibility
   issues. 1.6 is the minimum (for `subdirectory` support in `packages.yml`).
@@ -1213,7 +1213,7 @@ dbt-integration:
   base image is available on Docker Hub at CI time.
 - **No separate CI workflow:** The dbt tests run inside the main pipeline, ensuring API
   changes in the Rust extension are immediately validated against the macros in the same PR.
-- **Private repo auth:** If the pg_stream repo is private, users (and CI) need
+- **Private repo auth:** If the pg_trickle repo is private, users (and CI) need
   SSH keys or tokens configured for `dbt deps` to clone via git. Document this
   in the README.
 
@@ -1221,20 +1221,20 @@ dbt-integration:
 
 ## Phase 10 — Documentation
 
-### 10.1 `dbt-pgstream/README.md`
+### 10.1 `dbt-pgtrickle/README.md`
 
 Cover these sections:
 
-1. **What is dbt-pgstream** — one-paragraph description
-2. **Prerequisites** — PG 18, pg_stream extension, dbt Core ≥ 1.6
+1. **What is dbt-pgtrickle** — one-paragraph description
+2. **Prerequisites** — PG 18, pg_trickle extension, dbt Core ≥ 1.6
 3. **Installation** — `packages.yml` snippet with git URL + `subdirectory`
 4. **Quick Start** — minimal model example (config + SQL)
 5. **Configuration Reference** — table of all config keys with defaults
-6. **Operations** — `pgstream_refresh`, `drop_all_stream_tables`, `drop_all_stream_tables_force`, `pgstream_check_cdc_health`
-7. **Freshness Monitoring** — `pgstream_check_freshness` run-operation (note: native `dbt source freshness` not supported; raises error on threshold breach)
+6. **Operations** — `pgtrickle_refresh`, `drop_all_stream_tables`, `drop_all_stream_tables_force`, `pgtrickle_check_cdc_health`
+7. **Freshness Monitoring** — `pgtrickle_check_freshness` run-operation (note: native `dbt source freshness` not supported; raises error on threshold breach)
 8. **Useful `dbt` Commands** — `dbt ls --select config.materialized:stream_table`, `dbt build` interactions
 9. **Testing** — how stream tables interact with dbt test
-10. **`__pgs_row_id` Column** — what it is, how to handle it
+10. **`__pgt_row_id` Column** — what it is, how to handle it
 11. **Limitations** — known limitations table (link to this plan)
 12. **Contributing** — link to development setup
 13. **License** — Apache 2.0
@@ -1246,7 +1246,7 @@ Follow [Keep a Changelog](https://keepachangelog.com/) format:
 ```markdown
 # Changelog
 
-All notable changes to the dbt-pgstream package will be documented in this file.
+All notable changes to the dbt-pgtrickle package will be documented in this file.
 
 ## [Unreleased]
 
@@ -1256,9 +1256,9 @@ All notable changes to the dbt-pgstream package will be documented in this file.
 - Custom `stream_table` materialization
 - SQL API wrapper macros (create, alter, drop, refresh)
 - Utility macros (stream_table_exists, get_stream_table_info)
-- Freshness monitoring via `pgstream_check_freshness` run-operation (raises error on breach)
-- CDC health check via `pgstream_check_cdc_health` run-operation
-- `pgstream_refresh` and `drop_all_stream_tables` run-operations
+- Freshness monitoring via `pgtrickle_check_freshness` run-operation (raises error on breach)
+- CDC health check via `pgtrickle_check_cdc_health` run-operation
+- `pgtrickle_refresh` and `drop_all_stream_tables` run-operations
 - `drop_all_stream_tables_force` for dropping all stream tables (including non-dbt)
 - Integration test suite with seed data, polling helper, and query-change test
 - CI pipeline (dbt 1.6-1.9 version matrix in main repo workflow)
@@ -1270,9 +1270,9 @@ All macros should have Jinja doc comments at the top:
 
 ```sql
 {#
-  pgstream_create_stream_table(name, query, schedule, refresh_mode, initialize)
+  pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize)
 
-  Creates a new stream table via pgstream.create_stream_table().
+  Creates a new stream table via pgtrickle.create_stream_table().
   Called by the stream_table materialization on first run.
 
   Args:
@@ -1282,16 +1282,16 @@ All macros should have Jinja doc comments at the top:
     refresh_mode (str): 'FULL' or 'DIFFERENTIAL'
     initialize (bool): Whether to populate immediately on creation
 #}
-{% macro pgstream_create_stream_table(name, query, schedule, refresh_mode, initialize) %}
+{% macro pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize) %}
   ...
 {% endmacro %}
 ```
 
 ---
 
-## pg-stream SQL API Reference
+## pg-trickle SQL API Reference
 
-Functions and catalog objects used by this package (all in `pgstream` schema):
+Functions and catalog objects used by this package (all in `pgtrickle` schema):
 
 ### Functions
 
@@ -1301,15 +1301,15 @@ Functions and catalog objects used by this package (all in `pgstream` schema):
 | `alter_stream_table` | `(name text, schedule text DEFAULT NULL, refresh_mode text DEFAULT NULL, status text DEFAULT NULL) → void` | Materialization (update path) |
 | `drop_stream_table` | `(name text) → void` | Materialization (full-refresh), `drop_all` operation |
 | `refresh_stream_table` | `(name text) → void` | `refresh` run-operation |
-| `check_cdc_health` | `() → SETOF record` | `pgstream_check_cdc_health` run-operation |
+| `check_cdc_health` | `() → SETOF record` | `pgtrickle_check_cdc_health` run-operation |
 
 ### Catalog Objects
 
 | Object | Type | Used By |
 |--------|------|---------|
-| `pgstream.pgs_stream_tables` | Table | `stream_table_exists()`, `get_stream_table_info()`, `drop_all_stream_tables()` |
-| `pgstream.pg_stat_stream_tables` | View | `pgstream_check_freshness()` run-operation |
-| `pgstream.pgs_stream_tables.consecutive_errors` | Column | `assert_no_errors` integration test |
+| `pgtrickle.pgt_stream_tables` | Table | `stream_table_exists()`, `get_stream_table_info()`, `drop_all_stream_tables()` |
+| `pgtrickle.pg_stat_stream_tables` | View | `pgtrickle_check_freshness()` run-operation |
+| `pgtrickle.pgt_stream_tables.consecutive_errors` | Column | `assert_no_errors` integration test |
 
 ---
 
@@ -1318,28 +1318,28 @@ Functions and catalog objects used by this package (all in `pgstream` schema):
 | Limitation | Impact | Workaround |
 |------------|--------|------------|
 | No in-place query alteration | `alter_stream_table()` cannot change the defining query; must drop/recreate — brief data gap | The materialization handles this automatically |
-| `__pgs_row_id` visible | Internal column appears in `SELECT *` and dbt docs | Document it; exclude in downstream models; Option B (adapter) can hide it |
+| `__pgt_row_id` visible | Internal column appears in `SELECT *` and dbt docs | Document it; exclude in downstream models; Option B (adapter) can hide it |
 | No `dbt snapshot` support | Snapshots use SCD Type-2 logic that doesn't apply to stream tables | Use a separate snapshot on the stream table as a regular table |
 | No cross-database refs | Stream tables live in the same database as sources | Standard PostgreSQL limitation |
 | Concurrent `dbt run` | Multiple `dbt run` invocations could race on create/drop of same stream table | Use dbt's `--target` or coordinate via CI |
-| `dbt deps` payload | Users clone the full pg_stream repo (shallow, ~few MB) | Use `subdirectory` key; acceptable tradeoff |
+| `dbt deps` payload | Users clone the full pg_trickle repo (shallow, ~few MB) | Use `subdirectory` key; acceptable tradeoff |
 | Query change detection | String comparison is sensitive to whitespace differences | dbt compiles deterministically; unnecessary recreations are safe |
-| No native `dbt source freshness` | `loaded_at_field` cannot reference catalog columns; overriding `collect_freshness` requires adapter-level code | Use `pgstream_check_freshness` run-operation instead |
+| No native `dbt source freshness` | `loaded_at_field` cannot reference catalog columns; overriding `collect_freshness` requires adapter-level code | Use `pgtrickle_check_freshness` run-operation instead |
 | PostgreSQL 18 required | PG 18 not yet GA — limits early adoption | Extension requirement, not dbt package issue |
-| Extension is early-stage | pg_stream SQL API may evolve | Pin to pg_stream version; update macros as needed |
+| Extension is early-stage | pg_trickle SQL API may evolve | Pin to pg_trickle version; update macros as needed |
 | Shared version tags | dbt package and Rust extension share git tags; a dbt-only fix requires a new extension release tag | Accept for now; extract to separate repo if this becomes a problem |
 
 ---
 
 ## File Layout
 
-Within the pg_stream repository:
+Within the pg_trickle repository:
 
 ```
-pg-stream/
+pg-trickle/
 ├── src/                                  # Rust extension source
 ├── tests/                                # Extension tests
-├── dbt-pgstream/                         # ← dbt macro package
+├── dbt-pgtrickle/                         # ← dbt macro package
 │   ├── dbt_project.yml                   # Package manifest
 │   ├── README.md                         # Quick start, installation
 │   ├── CHANGELOG.md                      # Release history
@@ -1382,7 +1382,7 @@ pg-stream/
 
 **Estimated total:** ~320 lines Jinja SQL macros + ~120 lines YAML config + ~120 lines test SQL/scripts
 
-> No `.github/workflows/` directory inside `dbt-pgstream/` — CI lives in the main repo's
+> No `.github/workflows/` directory inside `dbt-pgtrickle/` — CI lives in the main repo's
 > workflow files and includes a `dbt-integration` job.
 
 ---
@@ -1443,9 +1443,9 @@ GROUP BY customer_id
 ```yaml
 # packages.yml (in the user's dbt project)
 packages:
-  - git: "https://github.com/<org>/pg-stream.git"
+  - git: "https://github.com/<org>/pg-trickle.git"
     revision: v0.1.0
-    subdirectory: "dbt-pgstream"
+    subdirectory: "dbt-pgtrickle"
 ```
 
 ```bash
@@ -1462,17 +1462,17 @@ dbt run --select order_totals
 dbt test --select order_totals
 
 # Manual one-off refresh
-dbt run-operation pgstream_refresh --args '{"model_name": "order_totals"}'
+dbt run-operation pgtrickle_refresh --args '{"model_name": "order_totals"}'
 
 # Force drop + recreate
 dbt run --select order_totals --full-refresh
 
 # Check freshness (run-operation, not native dbt source freshness)
 # Exits non-zero if any stream table exceeds error threshold
-dbt run-operation pgstream_check_freshness
+dbt run-operation pgtrickle_check_freshness
 
 # Check CDC pipeline health
-dbt run-operation pgstream_check_cdc_health
+dbt run-operation pgtrickle_check_cdc_health
 
 # List all stream table models
 dbt ls --select config.materialized:stream_table
@@ -1492,27 +1492,27 @@ Changes to this plan document, in reverse chronological order.
 
 ### 2026-02-24 — Review round 1
 
-Fixes and improvements based on critique against the actual pg_stream codebase:
+Fixes and improvements based on critique against the actual pg_trickle codebase:
 
 **Bugs fixed:**
 1. **Source freshness rewritten (Phase 7):** Native `dbt source freshness` cannot work
    because `last_refresh_at` lives in the catalog table, not on the stream table itself.
    Overriding `collect_freshness` requires adapter-level code (Option B). Replaced with
-   a `pgstream_check_freshness` run-operation that queries the catalog directly.
+   a `pgtrickle_check_freshness` run-operation that queries the catalog directly.
 2. **Authoritative existence check (Phase 4):** Replaced `load_cached_relation(this)`
-   with `pgstream_stream_table_exists()` as the authoritative check. The relation cache
+   with `pgtrickle_stream_table_exists()` as the authoritative check. The relation cache
    can be wrong if stream tables are created/dropped outside dbt.
 3. **Double catalog lookup eliminated (Phase 2.2 + 4.1):** `alter_stream_table` now
    accepts a `current_info` parameter so the materialization can pass its already-fetched
    metadata instead of making a redundant SPI roundtrip.
 4. **Schema-qualified catalog lookup (Phase 3):** Utility macros now filter on **both**
-   `pgs_schema` AND `pgs_name`, matching how the Rust catalog layer queries
-   (`WHERE pgs_schema = $1 AND pgs_name = $2`). Prevents ambiguity when two schemas
+   `pgt_schema` AND `pgt_name`, matching how the Rust catalog layer queries
+   (`WHERE pgt_schema = $1 AND pgt_name = $2`). Prevents ambiguity when two schemas
    have a stream table with the same name.
 5. **NULL schedule handling (Phase 2.1):** `create_stream_table` wrapper now passes SQL
-   `NULL` when `schedule` is `none`, enabling pg_stream's CALCULATED schedule behavior.
-6. **Health test column name (Phase 8.9):** Fixed `name` → `pgs_name` to match the
-   actual `pgs_stream_tables` catalog column.
+   `NULL` when `schedule` is `none`, enabling pg_trickle's CALCULATED schedule behavior.
+6. **Health test column name (Phase 8.9):** Fixed `name` → `pgt_name` to match the
+   actual `pgt_stream_tables` catalog column.
 
 **Missing coverage added:**
 7. **`status` config key (Phase 5.2):** Users can now set `status: PAUSED` or
@@ -1524,7 +1524,7 @@ Fixes and improvements based on critique against the actual pg_stream codebase:
     with a `wait_for_populated.sh` polling script that checks `is_populated` in the catalog.
 
 **Improvements:**
-11. **Renamed `refresh` → `pgstream_refresh` (Phase 6.2):** Avoids name collisions with
+11. **Renamed `refresh` → `pgtrickle_refresh` (Phase 6.2):** Avoids name collisions with
     other packages or user macros.
 12. **Safe drop as default (Phase 6.3):** `drop_all_stream_tables` now drops only
     dbt-managed stream tables (via `graph.nodes`). The catalog-based "nuclear" version is
@@ -1557,7 +1557,7 @@ Second critique pass, cross-referencing macro code against the Rust API implemen
    `refresh_mode` is Jinja `none`, the alter SQL rendered `{{ dbt.string_literal(none) }}`
    which produces the string literal `'None'` — not SQL `NULL`. Added explicit
    `{% if ... is none %}NULL{% else %}...{% endif %}` guards in the alter SQL generation.
-3. **Freshness check didn't fail CI (Phase 7.2):** `pgstream_check_freshness` only
+3. **Freshness check didn't fail CI (Phase 7.2):** `pgtrickle_check_freshness` only
    logged warnings/errors but returned exit code 0. `dbt run-operation` would silently
    pass in CI even with stale data. Now calls `exceptions.raise_compiler_error()` when
    any stream table exceeds the error threshold.
@@ -1566,15 +1566,15 @@ Second critique pass, cross-referencing macro code against the Rust API implemen
 4. **Freshness macro now uses `pg_stat_stream_tables` view (Phase 7.2):** Replaced
    manual `EXTRACT(EPOCH FROM (now() - data_timestamp))` with the view's pre-computed
    `staleness` column. Avoids duplicating staleness logic.
-5. **`pgstream_refresh` now schema-qualifies (Phase 6.2):** Added optional `schema`
+5. **`pgtrickle_refresh` now schema-qualifies (Phase 6.2):** Added optional `schema`
    parameter; defaults to `target.schema` for unqualified names. Consistent with
    how the materialization schema-qualifies.
 6. **Query-change test (Phase 8.12):** Added test section that modifies the model SQL
    between runs and verifies the automatic drop/recreate path fires.
 7. **Test flow cleanup trap (Phase 8.13):** Added `trap cleanup EXIT` to ensure stream
    tables are dropped even if tests fail mid-way. Prevents state leaking between CI runs.
-8. **`check_cdc_health` wrapper (Phase 6.4):** New `pgstream_check_cdc_health`
-   run-operation wrapping `pgstream.check_cdc_health()` — the function was in the
+8. **`check_cdc_health` wrapper (Phase 6.4):** New `pgtrickle_check_cdc_health`
+   run-operation wrapping `pgtrickle.check_cdc_health()` — the function was in the
    architecture diagram but had no macro. Raises error on unhealthy sources.
 9. **`dbt ls` tip (Phase 6.5):** Documented `dbt ls --select config.materialized:stream_table`
    as a useful command for listing all stream table models.

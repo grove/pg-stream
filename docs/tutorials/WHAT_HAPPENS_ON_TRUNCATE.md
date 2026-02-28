@@ -1,6 +1,6 @@
 # What Happens When You TRUNCATE a Table?
 
-This tutorial explains what happens when a `TRUNCATE` statement hits a base table that is referenced by a stream table. Unlike INSERT, UPDATE, and DELETE — which are fully tracked by the CDC trigger — TRUNCATE is a special case that **bypasses row-level triggers entirely**. Understanding this gap is essential for operating pg_stream correctly.
+This tutorial explains what happens when a `TRUNCATE` statement hits a base table that is referenced by a stream table. Unlike INSERT, UPDATE, and DELETE — which are fully tracked by the CDC trigger — TRUNCATE is a special case that **bypasses row-level triggers entirely**. Understanding this gap is essential for operating pg_trickle correctly.
 
 > **Prerequisite:** Read [WHAT_HAPPENS_ON_INSERT.md](WHAT_HAPPENS_ON_INSERT.md) first — it introduces the 7-phase lifecycle. This tutorial explains why TRUNCATE breaks that lifecycle and how to recover.
 
@@ -15,7 +15,7 @@ CREATE TABLE orders (
     amount   NUMERIC(10,2) NOT NULL
 );
 
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'customer_totals',
     $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
@@ -54,12 +54,12 @@ All four rows are removed instantly.
 
 ### What Happens at the Trigger Level: Nothing
 
-PostgreSQL's `TRUNCATE` command does **not** fire row-level AFTER triggers. This is by design in PostgreSQL — TRUNCATE is a DDL-like operation that removes all rows without scanning them individually. The per-row `AFTER INSERT OR UPDATE OR DELETE` trigger that pg_stream installs is simply never invoked.
+PostgreSQL's `TRUNCATE` command does **not** fire row-level AFTER triggers. This is by design in PostgreSQL — TRUNCATE is a DDL-like operation that removes all rows without scanning them individually. The per-row `AFTER INSERT OR UPDATE OR DELETE` trigger that pg_trickle installs is simply never invoked.
 
 The change buffer remains empty:
 
 ```
-pgstream_changes.changes_16384
+pgtrickle_changes.changes_16384
 ┌───────────┬─────────────┬────────┬──────────┬──────────┐
 │ change_id │ lsn         │ action │ ...      │ ...      │
 ├───────────┼─────────────┼────────┼──────────┼──────────┤
@@ -102,7 +102,7 @@ This is not a bug — it's a fundamental limitation of trigger-based CDC. The tr
 The fix is straightforward. Force a manual refresh:
 
 ```sql
-SELECT pgstream.refresh_stream_table('customer_totals');
+SELECT pgtrickle.refresh_stream_table('customer_totals');
 ```
 
 This executes a **full refresh** regardless of the stream table's configured refresh mode:
@@ -115,7 +115,7 @@ This executes a **full refresh** regardless of the stream table's configured ref
 Since the `orders` table is empty, the defining query returns zero rows. The stream table becomes empty too:
 
 ```sql
-SELECT pgstream.refresh_stream_table('customer_totals');
+SELECT pgtrickle.refresh_stream_table('customer_totals');
 
 SELECT * FROM customer_totals;
  customer | total | order_count
@@ -177,7 +177,7 @@ The new data (charlie, dave) is correct. But the old data (alice, bob) persists 
 ### How to Fix
 
 ```sql
-SELECT pgstream.refresh_stream_table('customer_totals');
+SELECT pgtrickle.refresh_stream_table('customer_totals');
 
 SELECT * FROM customer_totals;
  customer | total  | order_count
@@ -205,7 +205,7 @@ CREATE TABLE orders (
     amount      NUMERIC(10,2)
 );
 
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_details',
     $$
       SELECT c.name, c.tier, o.amount
@@ -228,7 +228,7 @@ The `CASCADE` also truncates `orders` (due to the foreign key). Neither TRUNCATE
 The stream table continues to show all the old joined rows as if nothing happened. The only recovery is a manual refresh:
 
 ```sql
-SELECT pgstream.refresh_stream_table('order_details');
+SELECT pgtrickle.refresh_stream_table('order_details');
 ```
 
 ---
@@ -238,7 +238,7 @@ SELECT pgstream.refresh_stream_table('order_details');
 If the stream table uses `FULL` refresh mode instead of `DIFFERENTIAL`:
 
 ```sql
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'customer_totals_full',
     $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
@@ -317,7 +317,7 @@ Make it a habit: if you TRUNCATE a base table, immediately refresh all dependent
 
 ```sql
 TRUNCATE orders;
-SELECT pgstream.refresh_stream_table('customer_totals');
+SELECT pgtrickle.refresh_stream_table('customer_totals');
 ```
 
 ### 2. Use DELETE FROM for Small Tables
@@ -333,7 +333,7 @@ CREATE OR REPLACE FUNCTION reload_orders(data jsonb) RETURNS void AS $$
 BEGIN
     TRUNCATE orders;
     INSERT INTO orders SELECT * FROM jsonb_populate_recordset(null::orders, data);
-    PERFORM pgstream.refresh_stream_table('customer_totals');
+    PERFORM pgtrickle.refresh_stream_table('customer_totals');
 END;
 $$ LANGUAGE plpgsql;
 ```
@@ -344,7 +344,7 @@ If a table is routinely truncated and reloaded, FULL refresh mode may be simpler
 
 ### 5. Monitor for Staleness
 
-pg_stream emits monitoring alerts when a stream table's data deviates from expected freshness. After a TRUNCATE, the `data_timestamp` still advances (since the scheduler sees no pending changes), but the actual data is stale. The most reliable detection is comparing the stream table results against a fresh query:
+pg_trickle emits monitoring alerts when a stream table's data deviates from expected freshness. After a TRUNCATE, the `data_timestamp` still advances (since the scheduler sees no pending changes), but the actual data is stale. The most reliable detection is comparing the stream table results against a fresh query:
 
 ```sql
 -- Quick consistency check
@@ -369,13 +369,13 @@ SELECT count(*) FROM orders;            -- should be 0 after TRUNCATE
 
 ## Summary
 
-TRUNCATE is the one common DML-like operation that falls outside pg_stream's automatic change tracking. The trigger-based CDC architecture captures INSERT, UPDATE, and DELETE perfectly — but TRUNCATE bypasses row-level triggers by design.
+TRUNCATE is the one common DML-like operation that falls outside pg_trickle's automatic change tracking. The trigger-based CDC architecture captures INSERT, UPDATE, and DELETE perfectly — but TRUNCATE bypasses row-level triggers by design.
 
 The key takeaways:
 
 1. **TRUNCATE does not fire row-level triggers** — the change buffer stays empty
 2. **The stream table becomes stale** — showing data that no longer exists in the base table
-3. **Manual refresh fixes it** — `SELECT pgstream.refresh_stream_table('name')` recomputes from scratch
+3. **Manual refresh fixes it** — `SELECT pgtrickle.refresh_stream_table('name')` recomputes from scratch
 4. **FULL mode is immune** — every refresh recomputes regardless of change tracking
 5. **`DELETE FROM` is the trigger-safe alternative** — slower but keeps everything consistent automatically
 6. **After TRUNCATE, always refresh** — make this a standard part of your ETL workflow

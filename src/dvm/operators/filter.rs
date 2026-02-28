@@ -12,12 +12,12 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::parser::{Expr, OpTree};
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a Filter node.
-pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Filter { predicate, child } = op else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_filter called on non-Filter node".into(),
         ));
     };
@@ -42,7 +42,7 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         .collect();
 
     let sql = format!(
-        "SELECT __pgs_row_id, __pgs_action, {cols}\n\
+        "SELECT __pgt_row_id, __pgt_action, {cols}\n\
          FROM {child_cte}\n\
          WHERE {predicate}",
         cols = col_refs.join(", "),
@@ -60,7 +60,7 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
     // For scan-chain queries (filter at top, no aggregate above), the
     // MERGE statement's outer DISTINCT ON already handles dedup.
     //
-    // Previously a DISTINCT ON (__pgs_row_id) CTE was added here that
+    // Previously a DISTINCT ON (__pgt_row_id) CTE was added here that
     // collapsed D+I pairs into a single INSERT, which broke aggregate
     // correctness when a row's UPDATE crossed the filter boundary while
     // remaining in the same group.
@@ -292,8 +292,8 @@ mod tests {
         let result = diff_filter(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        assert_sql_contains(&sql, "__pgs_row_id");
-        assert_sql_contains(&sql, "__pgs_action");
+        assert_sql_contains(&sql, "__pgt_row_id");
+        assert_sql_contains(&sql, "__pgt_action");
     }
 
     #[test]

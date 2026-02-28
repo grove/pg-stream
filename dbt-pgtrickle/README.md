@@ -1,11 +1,11 @@
-# dbt-pgstream
+# dbt-pgtrickle
 
 A [dbt](https://www.getdbt.com/) package that integrates
-[pg_stream](https://github.com/<org>/pg-stream) stream tables into your dbt
+[pg_trickle](https://github.com/<org>/pg-trickle) stream tables into your dbt
 project via a custom `stream_table` materialization.
 
 No custom Python adapter required — works with the standard `dbt-postgres`
-adapter. Just Jinja SQL macros that call pg_stream's SQL API.
+adapter. Just Jinja SQL macros that call pg_trickle's SQL API.
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ adapter. Just Jinja SQL macros that call pg_stream's SQL API.
 | dbt Core | ≥ 1.6 |
 | dbt-postgres adapter | Matching dbt Core version |
 | PostgreSQL | 18.x |
-| pg_stream extension | ≥ 0.1.0 (`CREATE EXTENSION pg_stream;`) |
+| pg_trickle extension | ≥ 0.1.0 (`CREATE EXTENSION pg_trickle;`) |
 
 ## Installation
 
@@ -22,9 +22,9 @@ Add to your `packages.yml`:
 
 ```yaml
 packages:
-  - git: "https://github.com/<org>/pg-stream.git"
+  - git: "https://github.com/<org>/pg-trickle.git"
     revision: v0.1.0
-    subdirectory: "dbt-pgstream"
+    subdirectory: "dbt-pgtrickle"
 ```
 
 Then run:
@@ -65,7 +65,7 @@ dbt test --select order_totals  # Tests work normally (it's a real table)
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `materialized` | string | — | Must be `'stream_table'` |
-| `schedule` | string/null | `'1m'` | Refresh schedule (e.g., `'5m'`, `'1h'`, cron). `null` for pg_stream's CALCULATED schedule. |
+| `schedule` | string/null | `'1m'` | Refresh schedule (e.g., `'5m'`, `'1h'`, cron). `null` for pg_trickle's CALCULATED schedule. |
 | `refresh_mode` | string | `'DIFFERENTIAL'` | `'FULL'` or `'DIFFERENTIAL'` |
 | `initialize` | bool | `true` | Populate on creation |
 | `status` | string/null | `null` | `'ACTIVE'` or `'PAUSED'`. When set, applies on subsequent runs via `alter_stream_table()`. |
@@ -86,10 +86,10 @@ models:
 
 ## Operations
 
-### `pgstream_refresh` — Manual refresh
+### `pgtrickle_refresh` — Manual refresh
 
 ```bash
-dbt run-operation pgstream_refresh --args '{"model_name": "order_totals"}'
+dbt run-operation pgtrickle_refresh --args '{"model_name": "order_totals"}'
 ```
 
 ### `drop_all_stream_tables` — Drop dbt-managed stream tables
@@ -102,16 +102,16 @@ dbt run-operation drop_all_stream_tables
 
 ### `drop_all_stream_tables_force` — Drop ALL stream tables
 
-Drops everything from the pg_stream catalog, including non-dbt stream tables:
+Drops everything from the pg_trickle catalog, including non-dbt stream tables:
 
 ```bash
 dbt run-operation drop_all_stream_tables_force
 ```
 
-### `pgstream_check_cdc_health` — CDC pipeline health
+### `pgtrickle_check_cdc_health` — CDC pipeline health
 
 ```bash
-dbt run-operation pgstream_check_cdc_health
+dbt run-operation pgtrickle_check_cdc_health
 ```
 
 Raises an error (non-zero exit) if any CDC source is unhealthy.
@@ -119,15 +119,15 @@ Raises an error (non-zero exit) if any CDC source is unhealthy.
 ## Freshness Monitoring
 
 Native `dbt source freshness` is not supported (the `last_refresh_at` column lives in
-the catalog, not on the stream table). Use the `pgstream_check_freshness` run-operation
+the catalog, not on the stream table). Use the `pgtrickle_check_freshness` run-operation
 instead:
 
 ```bash
 # Check all active stream tables (defaults: warn=600s, error=1800s)
-dbt run-operation pgstream_check_freshness
+dbt run-operation pgtrickle_check_freshness
 
 # Custom thresholds
-dbt run-operation pgstream_check_freshness \
+dbt run-operation pgtrickle_check_freshness \
   --args '{model_name: order_totals, warn_seconds: 300, error_seconds: 900}'
 ```
 
@@ -163,9 +163,9 @@ models:
           - unique
 ```
 
-## `__pgs_row_id` Column
+## `__pgt_row_id` Column
 
-pg_stream adds an internal `__pgs_row_id` column to stream tables for row identity
+pg_trickle adds an internal `__pgt_row_id` column to stream tables for row identity
 tracking. This column:
 
 - Appears in `SELECT *` and `dbt docs generate`
@@ -174,8 +174,8 @@ tracking. This column:
 
 ```yaml
 columns:
-  - name: __pgs_row_id
-    description: "Internal pg_stream row identity hash. Ignore this column."
+  - name: __pgt_row_id
+    description: "Internal pg_trickle row identity hash. Ignore this column."
 ```
 
 ## Limitations
@@ -183,12 +183,12 @@ columns:
 | Limitation | Workaround |
 |------------|------------|
 | No in-place query alteration | Materialization auto-drops and recreates when query changes |
-| `__pgs_row_id` visible | Document it; exclude in downstream `SELECT` |
-| No native `dbt source freshness` | Use `pgstream_check_freshness` run-operation |
+| `__pgt_row_id` visible | Document it; exclude in downstream `SELECT` |
+| No native `dbt source freshness` | Use `pgtrickle_check_freshness` run-operation |
 | No `dbt snapshot` support | Snapshot the stream table as a regular table |
 | Query change detection is whitespace-sensitive | dbt compiles deterministically; unnecessary recreations are safe |
 | PostgreSQL 18 required | Extension requirement |
-| Shared version tags with pg_stream extension | Pin to specific git revision |
+| Shared version tags with pg_trickle extension | Pin to specific git revision |
 
 ## Contributing
 
@@ -210,7 +210,7 @@ just test-dbt-fast
 Or use the script directly with options:
 
 ```bash
-cd dbt-pgstream/integration_tests/scripts
+cd dbt-pgtrickle/integration_tests/scripts
 
 # Default: builds image, runs tests with dbt 1.9, cleans up
 ./run_dbt_tests.sh
@@ -228,13 +228,13 @@ DBT_VERSION=1.6 ./run_dbt_tests.sh --skip-build
 PGPORT=25432 ./run_dbt_tests.sh
 ```
 
-### Manual testing against an existing pg_stream instance
+### Manual testing against an existing pg_trickle instance
 
-If you already have PostgreSQL 18 + pg_stream running locally:
+If you already have PostgreSQL 18 + pg_trickle running locally:
 
 ```bash
 export PGHOST=localhost PGPORT=5432 PGUSER=postgres PGPASSWORD=postgres PGDATABASE=postgres
-cd dbt-pgstream/integration_tests
+cd dbt-pgtrickle/integration_tests
 dbt deps
 dbt seed
 dbt run

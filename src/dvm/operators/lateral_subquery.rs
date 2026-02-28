@@ -18,7 +18,7 @@
 use crate::dvm::diff::{DiffContext, DiffResult, col_list, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a LateralSubquery node via row-scoped recomputation.
 ///
@@ -28,7 +28,7 @@ use crate::error::PgStreamError;
 pub fn diff_lateral_subquery(
     ctx: &mut DiffContext,
     op: &OpTree,
-) -> Result<DiffResult, PgStreamError> {
+) -> Result<DiffResult, PgTrickleError> {
     let OpTree::LateralSubquery {
         subquery_sql,
         alias,
@@ -39,7 +39,7 @@ pub fn diff_lateral_subquery(
         ..
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_lateral_subquery called on non-LateralSubquery node".into(),
         ));
     };
@@ -69,7 +69,7 @@ pub fn diff_lateral_subquery(
     // ── CTE 1: Find source rows that changed ──────────────────────────
     let changed_sources_cte = ctx.next_cte_name("lat_sq_changed");
     let changed_sources_sql = format!(
-        "SELECT DISTINCT \"__pgs_row_id\", \"__pgs_action\", {child_col_list}\n\
+        "SELECT DISTINCT \"__pgt_row_id\", \"__pgt_action\", {child_col_list}\n\
          FROM {child_delta}",
         child_col_list = col_list(child_cols),
         child_delta = child_result.cte_name,
@@ -96,7 +96,7 @@ pub fn diff_lateral_subquery(
         .join(", ");
 
     let old_rows_sql = format!(
-        "SELECT st.\"__pgs_row_id\", {all_cols_st}\n\
+        "SELECT st.\"__pgt_row_id\", {all_cols_st}\n\
          FROM {st_table} st\n\
          WHERE EXISTS (\n\
              SELECT 1 FROM {changed_sources_cte} cs\n\
@@ -163,7 +163,7 @@ pub fn diff_lateral_subquery(
                 outer_alias_q = quote_ident(&outer_alias),
             ),
             format!(
-                "{outer_alias_q}.\"__pgs_action\" = 'I'",
+                "{outer_alias_q}.\"__pgt_action\" = 'I'",
                 outer_alias_q = quote_ident(&outer_alias),
             ),
         )
@@ -175,14 +175,14 @@ pub fn diff_lateral_subquery(
                 outer_alias_q = quote_ident(&outer_alias),
             ),
             format!(
-                "{outer_alias_q}.\"__pgs_action\" = 'I'",
+                "{outer_alias_q}.\"__pgt_action\" = 'I'",
                 outer_alias_q = quote_ident(&outer_alias),
             ),
         )
     };
 
     let expand_sql = format!(
-        "SELECT {row_id_expr} AS \"__pgs_row_id\",\n\
+        "SELECT {row_id_expr} AS \"__pgt_row_id\",\n\
                 {child_col_refs_str},\n\
                 {sub_col_refs_str}\n\
          {lateral_clause}\n\
@@ -197,11 +197,11 @@ pub fn diff_lateral_subquery(
 
     let final_sql = format!(
         "-- Delete old subquery results for changed source rows\n\
-         SELECT \"__pgs_row_id\", 'D' AS \"__pgs_action\", {all_cols_name}\n\
+         SELECT \"__pgt_row_id\", 'D' AS \"__pgt_action\", {all_cols_name}\n\
          FROM {old_rows_cte}\n\
          UNION ALL\n\
          -- Insert re-executed subquery results for new/updated source rows\n\
-         SELECT \"__pgs_row_id\", 'I' AS \"__pgs_action\", {all_cols_name}\n\
+         SELECT \"__pgt_row_id\", 'I' AS \"__pgt_action\", {all_cols_name}\n\
          FROM {expand_cte}",
     );
     ctx.add_cte(final_cte.clone(), final_sql);
@@ -353,7 +353,7 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         // The expand CTE should only process INSERT actions
-        assert_sql_contains(&sql, "__pgs_action\" = 'I'");
+        assert_sql_contains(&sql, "__pgt_action\" = 'I'");
     }
 
     #[test]
@@ -373,7 +373,7 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         // Row ID hash should include both child and subquery columns
-        assert_sql_contains(&sql, "pg_stream_hash");
+        assert_sql_contains(&sql, "pg_trickle_hash");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# PLAN: TPC-H Test Suite for pg_stream
+# PLAN: TPC-H Test Suite for pg_trickle
 
 **Status:** In Progress  
 **Date:** 2026-02-28  
@@ -14,7 +14,7 @@ stream tables, run locally via `just test-tpch`.
 
 All planned artifacts have been implemented. The test suite runs green
 (`3 passed; 0 failed`) and validates the core DBSP invariant for every
-query that pg_stream can currently handle:
+query that pg_trickle can currently handle:
 
 | Artifact | Status |
 |----------|--------|
@@ -62,7 +62,7 @@ across multiple runs.
 
 | Category | Queries | Root Cause |
 |----------|---------|------------|
-| **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_stream DVM does not support correlated scalar subqueries in WHERE |
+| **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_trickle DVM does not support correlated scalar subqueries in WHERE |
 | **Cycle 3 — aggregate drift (cumulative)** | Q01 | Single-table aggregate (lineitem GROUP BY) drifts after 3 mutation cycles when run in shared container following many prior queries' mutation rounds. No joins involved — not caused by join delta changes. Likely pre-existing issue that manifests under mutation accumulation. |
 | **Cycle 2 — join delta value drift** | Q03 | 3-table join (lineitem ⋈ orders ⋈ customer) with SUM aggregate. Pre-change snapshot fix reduced error from extra=1,missing=1 to extra=1,missing=0. Remaining issue: extra row in delta (only for nested join children where L₀ fallback to L₁ allows double-counting). |
 | **Cycle 3 — SemiJoin delta drift** | Q04 | SemiJoin (EXISTS subquery) aggregate drifts after 3 cycles when run in shared container. Similar pattern to Q01 — fails only at cycle 3, suggesting cumulative effects. |
@@ -73,12 +73,12 @@ across multiple runs.
 | ~~**Aggregate drift — scalar row_id mismatch**~~ | ~~Q06~~ | ~~FIXED~~ — `row_id_expr_for_query` detects scalar aggregates and returns singleton hash matching DIFF delta |
 | ~~**Aggregate drift — AVG precision loss**~~ | ~~Q01~~ | ~~PARTIALLY FIXED~~ — AVG now uses group-rescan; Q01 improved from cycle 2 to cycle 3 failure |
 | ~~**Aggregate drift — conditional aggregate (flaky)**~~ | ~~Q12~~ | ~~FIXED~~ — scalar row_id fix stabilized; passes all 3 cycles consistently |
-| ~~**Cycle 2 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin snapshot with EXISTS/NOT EXISTS subqueries + `__pgs_count` filtering |
-| ~~**Cycle 2 — SemiJoin IN parser limitation**~~ | ~~Q18~~ | ~~FIXED~~ — `parse_any_sublink` now preserves GROUP BY/HAVING; `__pgs_count` filtered from SemiJoin `r_old_snapshot` |
-| ~~**Cycle 2 — deep join alias disambiguation**~~ | ~~Q21~~ | ~~FIXED~~ — Safe aliases (`__pgs_sl`/`__pgs_sr`/`__pgs_al`/`__pgs_ar`) for SemiJoin/AntiJoin snapshot; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths |
+| ~~**Cycle 2 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin snapshot with EXISTS/NOT EXISTS subqueries + `__pgt_count` filtering |
+| ~~**Cycle 2 — SemiJoin IN parser limitation**~~ | ~~Q18~~ | ~~FIXED~~ — `parse_any_sublink` now preserves GROUP BY/HAVING; `__pgt_count` filtered from SemiJoin `r_old_snapshot` |
+| ~~**Cycle 2 — deep join alias disambiguation**~~ | ~~Q21~~ | ~~FIXED~~ — Safe aliases (`__pgt_sl`/`__pgt_sr`/`__pgt_al`/`__pgt_ar`) for SemiJoin/AntiJoin snapshot; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths |
 | ~~**Cycle 2 — SemiJoin column ref**~~ | ~~Q20~~ | ~~FIXED~~ — see "Resolved" section |
 | ~~**Cycle 2 — MERGE column ref**~~ | ~~Q13, Q15~~ | ~~PARTIALLY FIXED~~ — intermediate aggregate detection now bypasses stream table LEFT JOIN; Q13 progressed to data mismatch; Q15 progressed to data mismatch |
-| ~~**Cycle 2 — null `__pgs_count` violation**~~ | ~~Q06, Q19~~ | ~~FIXED~~ — COALESCE guards on `d.__ins_count`/`d.__del_count` in merge CTE |
+| ~~**Cycle 2 — null `__pgt_count` violation**~~ | ~~Q06, Q19~~ | ~~FIXED~~ — COALESCE guards on `d.__ins_count`/`d.__del_count` in merge CTE |
 | ~~**Cycle 2 — aggregate GROUP BY leak**~~ | ~~Q14~~ | ~~FIXED~~ — `AggFunc::ComplexExpression` for nested-aggregate target expressions |
 | ~~**Cycle 2 — subquery OID leak**~~ | ~~Q04~~ | ~~FIXED~~ — `query_tree_walker_impl` for complete OID extraction (Q04 now reaches data mismatch) |
 | ~~**Cycle 2 — aggregate conditional SUM drift**~~ | ~~Q12~~ | ~~FIXED~~ — COALESCE fix resolved the conditional `SUM(CASE … END)` drift |
@@ -102,7 +102,7 @@ Several queries were rewritten to avoid unsupported SQL features:
 
 ### What Remains
 
-The remaining work is entirely **pg_stream DVM bug fixes** — the test suite
+The remaining work is entirely **pg_trickle DVM bug fixes** — the test suite
 itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
@@ -175,13 +175,13 @@ Deeper DVM support (named correlation context) is needed.
 |----------------|-----------|-------------|-------------------|
 | **P1** — Inner join double-counting (ΔL ⋈ ΔR) | Inner join delta `ΔJ = (ΔL ⋈ R₁) + (L₁ ⋈ ΔR)` uses post-change L₁ in Part 2, double-counting `ΔL ⋈ ΔR` when both sides change on the same join key simultaneously (e.g., RF1 inserts both new orders and lineitems for the same orderkey). For algebraic aggregates (SUM), the double-counted rows directly corrupt the aggregate values. | Part 2 of inner join now uses pre-change snapshot L₀ for Scan children: `L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. For nested join children, falls back to L₁ with semi-join filter (L₀ too expensive). Reverted 3-part correction term approach (regressed Q21 via SemiJoin interaction). | Q07 (all 3 cycles pass). Q03 improved (extra=1→extra=1,missing=1→missing=0). |
 | **NEW** — Change buffer premature cleanup | `drain_pending_cleanups` used per-ST range-based cleanup (`DELETE WHERE lsn > prev AND lsn <= new`). When multiple STs shared the same source table (e.g., lineitem), one ST's deferred cleanup deleted change buffer entries that another ST hadn't yet processed. The second ST's DIFF refresh would see 0 changes and produce stale results. | Replaced range-based cleanup with min-frontier cleanup: compute `MIN(frontier_lsn)` across ALL STs that depend on each source OID via catalog query. Only entries at or below the min frontier (consumed by all consumers) are deleted. TRUNCATE optimization uses same safe threshold. `PendingCleanup` struct simplified (frontier fields removed). | Q01 (all 3 cycles pass), Q06 (all 3 cycles pass), Q14 (all 3 cycles pass). Also unmasked pre-existing DVM bugs in Q15 and Q19 that were hidden by lost change data. |
-| P1 — Scalar aggregate row_id mismatch | FULL refresh used `pg_stream_hash(row_to_json + row_number)` while DIFF used `pg_stream_hash('__singleton_group')` for scalar aggregates (no GROUP BY). The mismatched `__pgs_row_id` values caused MERGE to INSERT instead of UPDATE, creating phantom duplicate rows. | `row_id_expr_for_query()` now detects scalar aggregates via `is_scalar_aggregate_root()` (checks through Filter/Project/Subquery wrappers) and returns `pg_stream_hash('__singleton_group')` for both FULL and DIFF. 5 unit tests added. | Q06 (all 3 cycles pass), Q12 (stabilized — was flaky) |
+| P1 — Scalar aggregate row_id mismatch | FULL refresh used `pg_trickle_hash(row_to_json + row_number)` while DIFF used `pg_trickle_hash('__singleton_group')` for scalar aggregates (no GROUP BY). The mismatched `__pgt_row_id` values caused MERGE to INSERT instead of UPDATE, creating phantom duplicate rows. | `row_id_expr_for_query()` now detects scalar aggregates via `is_scalar_aggregate_root()` (checks through Filter/Project/Subquery wrappers) and returns `pg_trickle_hash('__singleton_group')` for both FULL and DIFF. 5 unit tests added. | Q06 (all 3 cycles pass), Q12 (stabilized — was flaky) |
 | P1 — AVG algebraic precision loss | `agg_merge_expr` for AVG used `(old_avg * old_count + delta_ins - delta_del) / new_count`. Since PostgreSQL rounds AVG results to scale=16 for NUMERIC, `AVG * COUNT ≠ original SUM`, causing cumulative drift across refresh cycles. | AVG now uses group-rescan strategy: `AggFunc::Avg` added to `is_group_rescan()`; removed from algebraic arms in `agg_delta_exprs`, `agg_merge_expr`, and `direct_agg_delta_exprs`. Affected groups are re-aggregated from source via rescan CTE. 4 unit tests updated. | Q01 (improved: passes 2/3 cycles, was failing cycle 2) |
-| P4 — SemiJoin IN parser | `parse_any_sublink` discarded GROUP BY/HAVING from inner SELECT of `IN (SELECT … GROUP BY … HAVING …)` | `parse_any_sublink` now preserves GROUP BY/HAVING; `extract_aggregates_from_expr` helper for HAVING aggregate extraction; `build_snapshot_sql` Filter-on-Aggregate support; `__pgs_count` filtered from SemiJoin `right_col_list` in `r_old_snapshot` | Q18 (all 3 cycles pass) |
-| P5 — SemiJoin/AntiJoin alias | `build_snapshot_sql` didn't handle SemiJoin/AntiJoin (produced comment placeholder); `InnerJoin.alias()` returns `"join"` (SQL reserved keyword) causing syntax errors | SemiJoin snapshot: `EXISTS (SELECT 1 FROM … WHERE …)` with safe aliases `__pgs_sl`/`__pgs_sr`; AntiJoin snapshot: `NOT EXISTS` with `__pgs_al`/`__pgs_ar`; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths | Q21 (all 3 cycles pass) |
-| P2+P4+P5 — SemiJoin snapshot | SemiJoin delta produced data mismatch because `build_snapshot_sql` couldn't produce correct snapshot SQL for SemiJoin subtrees | Combined effect of SemiJoin/AntiJoin EXISTS snapshot, `__pgs_count` filtering, and SemiJoin IN parser fixes | Q04 (all 3 cycles pass) |
-| P2 — Q15 structural (multi-part) | Five cascading errors: (1) `column r.__pgs_scalar_1 does not exist` — Project/Subquery not in snapshot; (2) EXCEPT column count mismatch — `__pgs_count` in `child_to_from_sql` but not intermediate `output_cols`; (3) `column "supplier_no" does not exist` — GROUP BY alias lost by parser; (4) `has_source_alias` didn't recognize Subquery own-alias; (5) `is_simple_source` didn't treat Subquery as atomic source | Five fixes: (1) `build_snapshot_sql` for Project + Subquery-with-aliases; (2) removed `__pgs_count` from `child_to_from_sql` Aggregate + intermediate `output_cols`; (3) parser Step 3a2 — semantic match GROUP BY expressions vs target aliases, wrap in Project when aliases differ; (4) `has_source_alias` checks `sub_alias == alias`; (5) `is_simple_source` returns true for Subquery alias match | Q15 (structural → data mismatch; SQL errors resolved, accuracy remains) |
-| P1 — `__pgs_count` NULL | Global aggregates (no GROUP BY): `SUM(CASE … THEN 1 ELSE 0 END)` over empty delta returns NULL, propagating through `new_count = old + NULL - NULL = NULL` → NOT NULL violation | COALESCE guards: wrapped `d.__ins_count` and `d.__del_count` in `COALESCE(…, 0)` in merge CTE `new_count`, action classification, Count/CountStar merge, and AVG denominator | Q06 (partial: cycles 1-2 pass, drift cycle 3), Q19 (all 3 cycles) |
+| P4 — SemiJoin IN parser | `parse_any_sublink` discarded GROUP BY/HAVING from inner SELECT of `IN (SELECT … GROUP BY … HAVING …)` | `parse_any_sublink` now preserves GROUP BY/HAVING; `extract_aggregates_from_expr` helper for HAVING aggregate extraction; `build_snapshot_sql` Filter-on-Aggregate support; `__pgt_count` filtered from SemiJoin `right_col_list` in `r_old_snapshot` | Q18 (all 3 cycles pass) |
+| P5 — SemiJoin/AntiJoin alias | `build_snapshot_sql` didn't handle SemiJoin/AntiJoin (produced comment placeholder); `InnerJoin.alias()` returns `"join"` (SQL reserved keyword) causing syntax errors | SemiJoin snapshot: `EXISTS (SELECT 1 FROM … WHERE …)` with safe aliases `__pgt_sl`/`__pgt_sr`; AntiJoin snapshot: `NOT EXISTS` with `__pgt_al`/`__pgt_ar`; `resolve_disambiguated_column` + `is_simple_source` for SemiJoin/AntiJoin paths | Q21 (all 3 cycles pass) |
+| P2+P4+P5 — SemiJoin snapshot | SemiJoin delta produced data mismatch because `build_snapshot_sql` couldn't produce correct snapshot SQL for SemiJoin subtrees | Combined effect of SemiJoin/AntiJoin EXISTS snapshot, `__pgt_count` filtering, and SemiJoin IN parser fixes | Q04 (all 3 cycles pass) |
+| P2 — Q15 structural (multi-part) | Five cascading errors: (1) `column r.__pgt_scalar_1 does not exist` — Project/Subquery not in snapshot; (2) EXCEPT column count mismatch — `__pgt_count` in `child_to_from_sql` but not intermediate `output_cols`; (3) `column "supplier_no" does not exist` — GROUP BY alias lost by parser; (4) `has_source_alias` didn't recognize Subquery own-alias; (5) `is_simple_source` didn't treat Subquery as atomic source | Five fixes: (1) `build_snapshot_sql` for Project + Subquery-with-aliases; (2) removed `__pgt_count` from `child_to_from_sql` Aggregate + intermediate `output_cols`; (3) parser Step 3a2 — semantic match GROUP BY expressions vs target aliases, wrap in Project when aliases differ; (4) `has_source_alias` checks `sub_alias == alias`; (5) `is_simple_source` returns true for Subquery alias match | Q15 (structural → data mismatch; SQL errors resolved, accuracy remains) |
+| P1 — `__pgt_count` NULL | Global aggregates (no GROUP BY): `SUM(CASE … THEN 1 ELSE 0 END)` over empty delta returns NULL, propagating through `new_count = old + NULL - NULL = NULL` → NOT NULL violation | COALESCE guards: wrapped `d.__ins_count` and `d.__del_count` in `COALESCE(…, 0)` in merge CTE `new_count`, action classification, Count/CountStar merge, and AVG denominator | Q06 (partial: cycles 1-2 pass, drift cycle 3), Q19 (all 3 cycles) |
 | P1 — Conditional SUM drift | Aggregate delta `SUM(CASE WHEN … THEN 1 ELSE 0 END)` produced wrong Count merge due to missing COALESCE on `d.__ins_*`/`d.__del_*` delta columns | Same COALESCE fix as above — Count/CountStar merge expression now wraps delta columns | Q12 (was all 3 cycles; now flaky cycle 3 — likely pre-existing issue masked by data) |
 | P2 — Subquery OID leak | `extract_source_relations` only walked the outer query's rtable; EXISTS/IN subqueries in WHERE/HAVING are SubLink nodes in the expression tree, NOT RTE_SUBQUERY entries | Replaced manual `collect_relation_oids` with PostgreSQL's `query_tree_walker_impl` using `QTW_EXAMINE_RTES_BEFORE` flag + `expression_tree_walker_impl` for SubLink recursion | Q04 (OID check passes, now reaches data mismatch — separate SemiJoin drift bug) |
 | P2 — Aggregate GROUP BY leak | `expr_contains_agg` didn't recurse into A_Expr/CaseExpr; `extract_aggregates` only recognized top-level FuncCall. Q14's `100 * SUM(…) / CASE WHEN SUM(…) = 0 THEN NULL ELSE SUM(…) END` was not detected as an aggregate expression | Two fixes: (1) `expr_contains_agg` now uses `raw_expression_tree_walker_impl` for full recursion; (2) `extract_aggregates` creates `AggFunc::ComplexExpression(raw_sql)` for complex expressions wrapping nested aggregates — uses group-rescan strategy (re-evaluates from source on change) | Q14 (all 3 cycles pass) |
@@ -410,7 +410,7 @@ to LEFT JOIN NULL-padding.
 The TPC-H tests use the same `E2eDb` Docker container (from
 `tests/e2e/mod.rs`) that all E2E tests already use. This means:
 
-- Same `pg_stream_e2e:latest` Docker image (built by `./tests/build_e2e_image.sh`)
+- Same `pg_trickle_e2e:latest` Docker image (built by `./tests/build_e2e_image.sh`)
 - Same testcontainers-rs lifecycle (auto-start, auto-cleanup)
 - Same `with_extension()` setup, `create_st()`, `refresh_st()`, `drop_st()` helpers
 - Same `assert_st_matches_query()` correctness assertion
@@ -454,7 +454,7 @@ This is handled automatically by `just test-tpch` (which depends on
 
 ## TPC-H Schema
 
-Standard 8-table schema with primary keys (required for pg_stream CDC
+Standard 8-table schema with primary keys (required for pg_trickle CDC
 triggers):
 
 ```sql
@@ -469,7 +469,7 @@ CREATE TABLE lineitem (l_orderkey INT, l_linenumber INT, l_partkey INT, l_suppke
 ```
 
 Foreign-key constraints are **not** created — they are not required by
-pg_stream and would slow down RF1/RF2 operations.
+pg_trickle and would slow down RF1/RF2 operations.
 
 ---
 
@@ -718,7 +718,7 @@ test-tpch-large: build-e2e-image     # SF-0.1
 ### Step 4: Validation & Iteration ✅ (partial)
 
 1. ✅ `just test-tpch-fast` runs and all 3 tests pass (exit code 0)
-2. ✅ 18 queries blocked by pg_stream DVM bugs (documented above)
+2. ✅ 18 queries blocked by pg_trickle DVM bugs (documented above)
 3. ✅ Data generator produces sufficient rows for all 22 queries
 4. ⬜ RF3 UPDATEs currently only change lineitem prices — customer
    segment rotation was removed to work around the LEFT JOIN DVM bug.

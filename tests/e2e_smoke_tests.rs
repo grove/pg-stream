@@ -30,28 +30,28 @@ async fn test_create_extension_succeeds() {
 
     // Verify the extension is installed
     let exists: bool = db
-        .query_scalar("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stream')")
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trickle')")
         .await;
     assert!(exists, "Extension should be installed");
 }
 
 #[tokio::test]
-async fn test_pg_stream_schema_created() {
+async fn test_pg_trickle_schema_created() {
     let db = E2eDb::new().await.with_extension().await;
 
-    let pg_stream_exists: bool = db
+    let pg_trickle_exists: bool = db
         .query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgstream')",
+            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgtrickle')",
         )
         .await;
-    assert!(pg_stream_exists, "pg_stream schema should exist");
+    assert!(pg_trickle_exists, "pg_trickle schema should exist");
 
     let changes_exists: bool = db
         .query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgstream_changes')",
+            "SELECT EXISTS(SELECT 1 FROM information_schema.schemata WHERE schema_name = 'pgtrickle_changes')",
         )
         .await;
-    assert!(changes_exists, "pgstream_changes schema should exist");
+    assert!(changes_exists, "pgtrickle_changes schema should exist");
 }
 
 #[tokio::test]
@@ -59,10 +59,10 @@ async fn test_catalog_tables_created() {
     let db = E2eDb::new().await.with_extension().await;
 
     let tables = [
-        ("pgstream", "pgs_stream_tables"),
-        ("pgstream", "pgs_dependencies"),
-        ("pgstream", "pgs_refresh_history"),
-        ("pgstream", "pgs_change_tracking"),
+        ("pgtrickle", "pgt_stream_tables"),
+        ("pgtrickle", "pgt_dependencies"),
+        ("pgtrickle", "pgt_refresh_history"),
+        ("pgtrickle", "pgt_change_tracking"),
     ];
 
     for (schema, table) in tables {
@@ -72,12 +72,12 @@ async fn test_catalog_tables_created() {
 }
 
 #[tokio::test]
-async fn test_pgs_status_returns_empty_initially() {
+async fn test_pgt_status_returns_empty_initially() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // pgs_status() should return 0 rows when no STs exist
+    // pgt_status() should return 0 rows when no STs exist
     let count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_status()")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_status()")
         .await;
     assert_eq!(count, 0);
 }
@@ -104,7 +104,7 @@ async fn test_create_and_query_stream_table() {
     .await;
 
     // Verify catalog entry
-    let (status, mode, populated, errors) = db.pgs_status("order_totals").await;
+    let (status, mode, populated, errors) = db.pgt_status("order_totals").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "DIFFERENTIAL");
     assert!(populated);
@@ -186,7 +186,7 @@ async fn test_drop_cleans_up() {
     assert!(!exists, "ST storage table should be gone after drop");
 
     let catalog_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'temp_st'")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'temp_st'")
         .await;
     assert_eq!(catalog_count, 0, "Catalog entry should be removed");
 }
@@ -197,12 +197,12 @@ async fn test_monitoring_views_exist() {
 
     // Both monitoring views should be queryable
     let info_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.stream_tables_info")
+        .query_scalar("SELECT count(*) FROM pgtrickle.stream_tables_info")
         .await;
     assert_eq!(info_count, 0);
 
     let stat_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pg_stat_stream_tables")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pg_stat_stream_tables")
         .await;
     assert_eq!(stat_count, 0);
 }
@@ -213,14 +213,14 @@ async fn test_event_triggers_installed() {
 
     let ddl_trigger: bool = db
         .query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_stream_ddl_tracker')",
+            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_trickle_ddl_tracker')",
         )
         .await;
     assert!(ddl_trigger, "DDL event trigger should exist");
 
     let drop_trigger: bool = db
         .query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_stream_drop_tracker')",
+            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_trickle_drop_tracker')",
         )
         .await;
     assert!(drop_trigger, "Drop event trigger should exist");

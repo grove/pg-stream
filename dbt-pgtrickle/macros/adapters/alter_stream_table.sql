@@ -1,9 +1,9 @@
 {#
-  pgstream_alter_stream_table(name, schedule, refresh_mode, status, current_info)
+  pgtrickle_alter_stream_table(name, schedule, refresh_mode, status, current_info)
 
-  Alters an existing stream table via pgstream.alter_stream_table().
+  Alters an existing stream table via pgtrickle.alter_stream_table().
   Only sends changes — parameters that match the current state are passed as NULL
-  (which pg_stream treats as "keep current value").
+  (which pg_trickle treats as "keep current value").
 
   Args:
     name (str): Stream table name (schema-qualified)
@@ -13,9 +13,9 @@
     current_info (dict|none): Pre-fetched metadata from get_stream_table_info().
                               If provided, avoids a redundant catalog lookup.
 #}
-{% macro pgstream_alter_stream_table(name, schedule, refresh_mode, status=none, current_info=none) %}
+{% macro pgtrickle_alter_stream_table(name, schedule, refresh_mode, status=none, current_info=none) %}
   {# Use pre-fetched metadata if available, otherwise look it up #}
-  {% set current = current_info if current_info else pgstream_get_stream_table_info(name) %}
+  {% set current = current_info if current_info else pgtrickle_get_stream_table_info(name) %}
   {% if current %}
     {% set needs_alter = false %}
 
@@ -33,7 +33,7 @@
 
     {% if needs_alter %}
       {% set alter_sql %}
-        SELECT pgstream.alter_stream_table(
+        SELECT pgtrickle.alter_stream_table(
           {{ dbt.string_literal(name) }},
           schedule => {% if current.schedule != schedule %}{% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %}{% else %}NULL{% endif %},
           refresh_mode => {% if current.refresh_mode != refresh_mode %}{% if refresh_mode is none %}NULL{% else %}{{ dbt.string_literal(refresh_mode) }}{% endif %}{% else %}NULL{% endif %},
@@ -41,7 +41,7 @@
         )
       {% endset %}
       {% do run_query(alter_sql) %}
-      {{ log("pg_stream: altered stream table '" ~ name ~ "'", info=true) }}
+      {{ log("pg_trickle: altered stream table '" ~ name ~ "'", info=true) }}
     {% endif %}
   {% endif %}
 {% endmacro %}

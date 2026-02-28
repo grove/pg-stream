@@ -1,6 +1,6 @@
 # Summary
 
-[pg_stream](introduction.md)
+[pg_trickle](introduction.md)
 
 ---
 

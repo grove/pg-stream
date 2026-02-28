@@ -4,7 +4,7 @@
 //! - The extension loads correctly with `shared_preload_libraries`
 //! - GUC parameters are registered and queryable
 //! - The background scheduler automatically refreshes stale STs
-//! - The scheduler respects the `pg_stream.enabled` GUC
+//! - The scheduler respects the `pg_trickle.enabled` GUC
 //!
 //! **Note:** Background worker tests are timing-dependent. They use generous
 //! timeouts and retry loops. The scheduler interval and minimum schedule
@@ -20,26 +20,26 @@ use std::time::Duration;
 // ── Helper ─────────────────────────────────────────────────────────────────
 
 /// Configure the scheduler for fast testing:
-/// - `pg_stream.scheduler_interval_ms = 100` (wake every 100ms)
-/// - `pg_stream.min_schedule_seconds = 1` (allow 1-second schedule)
+/// - `pg_trickle.scheduler_interval_ms = 100` (wake every 100ms)
+/// - `pg_trickle.min_schedule_seconds = 1` (allow 1-second schedule)
 ///
 /// Uses `ALTER SYSTEM` + `pg_reload_conf()` so the background worker
 /// picks up the changes.
 async fn configure_fast_scheduler(db: &E2eDb) {
-    db.execute("ALTER SYSTEM SET pg_stream.scheduler_interval_ms = 100")
+    db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
         .await;
-    db.execute("ALTER SYSTEM SET pg_stream.min_schedule_seconds = 1")
+    db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 1")
         .await;
     db.execute("SELECT pg_reload_conf()").await;
     // Give the bgworker a moment to pick up new config
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
-/// Wait until a ST has been auto-refreshed by checking pgs_refresh_history.
+/// Wait until a ST has been auto-refreshed by checking pgt_refresh_history.
 /// The scheduler (unlike manual refresh) writes history records.
 /// Returns true if a completed record appears within the timeout.
 #[allow(dead_code)]
-async fn wait_for_scheduler_refresh(db: &E2eDb, pgs_name: &str, timeout: Duration) -> bool {
+async fn wait_for_scheduler_refresh(db: &E2eDb, pgt_name: &str, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
 
     loop {
@@ -50,9 +50,9 @@ async fn wait_for_scheduler_refresh(db: &E2eDb, pgs_name: &str, timeout: Duratio
 
         let count: i64 = db
             .query_scalar(&format!(
-                "SELECT count(*) FROM pgstream.pgs_refresh_history h \
-                 JOIN pgstream.pgs_stream_tables d ON h.pgs_id = d.pgs_id \
-                 WHERE d.pgs_name = '{pgs_name}' AND h.status = 'COMPLETED'"
+                "SELECT count(*) FROM pgtrickle.pgt_refresh_history h \
+                 JOIN pgtrickle.pgt_stream_tables d ON h.pgt_id = d.pgt_id \
+                 WHERE d.pgt_name = '{pgt_name}' AND h.status = 'COMPLETED'"
             ))
             .await;
 
@@ -73,20 +73,20 @@ async fn test_extension_loads_with_shared_preload() {
     // Verify shared_preload_libraries includes our extension
     let spl: String = db.query_scalar("SHOW shared_preload_libraries").await;
     assert!(
-        spl.contains("pg_stream"),
-        "shared_preload_libraries should contain pg_stream, got: {}",
+        spl.contains("pg_trickle"),
+        "shared_preload_libraries should contain pg_trickle, got: {}",
         spl,
     );
 
     // Verify the extension is listed in pg_extension
     let ext_exists: bool = db
-        .query_scalar("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stream')")
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trickle')")
         .await;
     assert!(ext_exists, "Extension should be installed");
 
     // Verify no ERROR-level messages — check that we can use the API
     let st_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_stream_tables")
         .await;
     assert_eq!(st_count, 0, "Fresh install should have 0 STs");
 }
@@ -96,49 +96,53 @@ async fn test_extension_loads_with_shared_preload() {
 async fn test_gucs_registered() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
 
-    // pg_stream.enabled — default: on
-    let enabled: String = db.query_scalar("SHOW pg_stream.enabled").await;
-    assert_eq!(enabled, "on", "pg_stream.enabled default should be 'on'");
+    // pg_trickle.enabled — default: on
+    let enabled: String = db.query_scalar("SHOW pg_trickle.enabled").await;
+    assert_eq!(enabled, "on", "pg_trickle.enabled default should be 'on'");
 
-    // pg_stream.scheduler_interval_ms — default: 1000
+    // pg_trickle.scheduler_interval_ms — default: 1000
     let interval: String = db
-        .query_scalar("SHOW pg_stream.scheduler_interval_ms")
+        .query_scalar("SHOW pg_trickle.scheduler_interval_ms")
         .await;
     assert_eq!(
         interval, "1000",
-        "pg_stream.scheduler_interval_ms default should be '1000'"
+        "pg_trickle.scheduler_interval_ms default should be '1000'"
     );
 
-    // pg_stream.min_schedule_seconds — default: 60
-    let min_schedule: String = db.query_scalar("SHOW pg_stream.min_schedule_seconds").await;
+    // pg_trickle.min_schedule_seconds — default: 60
+    let min_schedule: String = db
+        .query_scalar("SHOW pg_trickle.min_schedule_seconds")
+        .await;
     assert_eq!(
         min_schedule, "60",
-        "pg_stream.min_schedule_seconds default should be '60'"
+        "pg_trickle.min_schedule_seconds default should be '60'"
     );
 
-    // pg_stream.max_consecutive_errors — default: 3
+    // pg_trickle.max_consecutive_errors — default: 3
     let max_errors: String = db
-        .query_scalar("SHOW pg_stream.max_consecutive_errors")
+        .query_scalar("SHOW pg_trickle.max_consecutive_errors")
         .await;
     assert_eq!(
         max_errors, "3",
-        "pg_stream.max_consecutive_errors default should be '3'"
+        "pg_trickle.max_consecutive_errors default should be '3'"
     );
 
-    // pg_stream.change_buffer_schema — default: pgstream_changes
-    let buf_schema: String = db.query_scalar("SHOW pg_stream.change_buffer_schema").await;
+    // pg_trickle.change_buffer_schema — default: pgtrickle_changes
+    let buf_schema: String = db
+        .query_scalar("SHOW pg_trickle.change_buffer_schema")
+        .await;
     assert_eq!(
-        buf_schema, "pgstream_changes",
-        "pg_stream.change_buffer_schema default should be 'pgstream_changes'"
+        buf_schema, "pgtrickle_changes",
+        "pg_trickle.change_buffer_schema default should be 'pgtrickle_changes'"
     );
 
-    // pg_stream.max_concurrent_refreshes — default: 4
+    // pg_trickle.max_concurrent_refreshes — default: 4
     let max_conc: String = db
-        .query_scalar("SHOW pg_stream.max_concurrent_refreshes")
+        .query_scalar("SHOW pg_trickle.max_concurrent_refreshes")
         .await;
     assert_eq!(
         max_conc, "4",
-        "pg_stream.max_concurrent_refreshes default should be '4'"
+        "pg_trickle.max_concurrent_refreshes default should be '4'"
     );
 }
 
@@ -148,13 +152,13 @@ async fn test_gucs_can_be_altered() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
 
     // Change scheduler_interval_ms
-    db.execute("ALTER SYSTEM SET pg_stream.scheduler_interval_ms = 200")
+    db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 200")
         .await;
     db.execute("SELECT pg_reload_conf()").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let interval: String = db
-        .query_scalar("SHOW pg_stream.scheduler_interval_ms")
+        .query_scalar("SHOW pg_trickle.scheduler_interval_ms")
         .await;
     assert_eq!(
         interval, "200",
@@ -162,28 +166,30 @@ async fn test_gucs_can_be_altered() {
     );
 
     // Change min_schedule_seconds
-    db.execute("ALTER SYSTEM SET pg_stream.min_schedule_seconds = 5")
+    db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 5")
         .await;
     db.execute("SELECT pg_reload_conf()").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let min_schedule: String = db.query_scalar("SHOW pg_stream.min_schedule_seconds").await;
+    let min_schedule: String = db
+        .query_scalar("SHOW pg_trickle.min_schedule_seconds")
+        .await;
     assert_eq!(
         min_schedule, "5",
         "min_schedule_seconds should be updated to 5"
     );
 
     // Change enabled
-    db.execute("ALTER SYSTEM SET pg_stream.enabled = false")
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
         .await;
     db.execute("SELECT pg_reload_conf()").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let enabled: String = db.query_scalar("SHOW pg_stream.enabled").await;
-    assert_eq!(enabled, "off", "pg_stream.enabled should be 'off'");
+    let enabled: String = db.query_scalar("SHOW pg_trickle.enabled").await;
+    assert_eq!(enabled, "off", "pg_trickle.enabled should be 'off'");
 
     // Reset back
-    db.execute("ALTER SYSTEM SET pg_stream.enabled = true")
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = true")
         .await;
     db.execute("SELECT pg_reload_conf()").await;
 }
@@ -230,9 +236,9 @@ async fn test_auto_refresh_within_schedule() {
     // Verify refresh history was written by the scheduler
     let history_count: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_refresh_history h \
-             JOIN pgstream.pgs_stream_tables d ON h.pgs_id = d.pgs_id \
-             WHERE d.pgs_name = 'auto_st' AND h.status = 'COMPLETED'",
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables d ON h.pgt_id = d.pgt_id \
+             WHERE d.pgt_name = 'auto_st' AND h.status = 'COMPLETED'",
         )
         .await;
     assert!(
@@ -299,9 +305,9 @@ async fn test_scheduler_writes_refresh_history() {
     // Initial population does NOT write to history (done by create_stream_table)
     let initial_history: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_refresh_history h \
-             JOIN pgstream.pgs_stream_tables d ON h.pgs_id = d.pgs_id \
-             WHERE d.pgs_name = 'hist_st'",
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables d ON h.pgt_id = d.pgt_id \
+             WHERE d.pgt_name = 'hist_st'",
         )
         .await;
 
@@ -317,14 +323,14 @@ async fn test_scheduler_writes_refresh_history() {
     // Verify refresh history was written
     let new_history: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_refresh_history h \
-             JOIN pgstream.pgs_stream_tables d ON h.pgs_id = d.pgs_id \
-             WHERE d.pgs_name = 'hist_st' AND h.status = 'COMPLETED'",
+            "SELECT count(*) FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables d ON h.pgt_id = d.pgt_id \
+             WHERE d.pgt_name = 'hist_st' AND h.status = 'COMPLETED'",
         )
         .await;
     assert!(
         new_history > initial_history,
-        "Scheduler should write COMPLETED records to pgs_refresh_history \
+        "Scheduler should write COMPLETED records to pgt_refresh_history \
          (initial={}, after={})",
         initial_history,
         new_history,
@@ -453,12 +459,12 @@ async fn test_auto_refresh_updates_catalog_metadata() {
     // Record initial timestamps
     let _initial_refresh_at: Option<String> = db
         .query_scalar_opt(
-            "SELECT last_refresh_at::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
+            "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'meta_st'",
         )
         .await;
     let initial_data_ts: Option<String> = db
         .query_scalar_opt(
-            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
+            "SELECT data_timestamp::text FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'meta_st'",
         )
         .await;
 
@@ -473,12 +479,12 @@ async fn test_auto_refresh_updates_catalog_metadata() {
     // Verify timestamps advanced
     let new_refresh_at: Option<String> = db
         .query_scalar_opt(
-            "SELECT last_refresh_at::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
+            "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'meta_st'",
         )
         .await;
     let new_data_ts: Option<String> = db
         .query_scalar_opt(
-            "SELECT data_timestamp::text FROM pgstream.pgs_stream_tables WHERE pgs_name = 'meta_st'",
+            "SELECT data_timestamp::text FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'meta_st'",
         )
         .await;
 
@@ -494,6 +500,6 @@ async fn test_auto_refresh_updates_catalog_metadata() {
     );
 
     // consecutive_errors should be 0
-    let (_, _, _, errors) = db.pgs_status("meta_st").await;
+    let (_, _, _, errors) = db.pgt_status("meta_st").await;
     assert_eq!(errors, 0, "consecutive_errors should be 0 after success");
 }

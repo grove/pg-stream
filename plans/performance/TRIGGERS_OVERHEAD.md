@@ -5,8 +5,8 @@
 The existing benchmark suite (`tests/e2e_bench_tests.rs`) measures **refresh duration** — how fast incremental refresh processes changes — but says nothing about the **write-side cost** the CDC trigger imposes on source tables. Every INSERT, UPDATE, or DELETE on a source table fires a PL/pgSQL AFTER trigger that:
 
 1. Calls `pg_current_wal_lsn()`
-2. Computes `pg_stream_hash(NEW."pk"::text)` (or `pg_stream_hash_multi(ARRAY[...])` for composite PKs)
-3. Inserts a row into `pg_stream_changes.changes_<oid>` with typed `new_*`/`old_*` columns
+2. Computes `pg_trickle_hash(NEW."pk"::text)` (or `pg_trickle_hash_multi(ARRAY[...])` for composite PKs)
+3. Inserts a row into `pg_trickle_changes.changes_<oid>` with typed `new_*`/`old_*` columns
 4. Maintains the covering B-tree index `(lsn, pk_hash, change_id) INCLUDE (action)`
 5. Increments the `change_id` BIGSERIAL sequence
 
@@ -17,27 +17,27 @@ This overhead is invisible in refresh benchmarks but directly impacts the **DML 
 For a table with OID `16384` and columns `(id INT, amount NUMERIC)` with PK on `id`:
 
 ```sql
-CREATE OR REPLACE FUNCTION pg_stream_changes.pg_stream_cdc_fn_16384()
+CREATE OR REPLACE FUNCTION pg_trickle_changes.pg_trickle_cdc_fn_16384()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO pg_stream_changes.changes_16384
+        INSERT INTO pg_trickle_changes.changes_16384
             (lsn, action, pk_hash, "new_id", "new_amount")
         VALUES (pg_current_wal_lsn(), 'I',
-                pg_stream.pg_stream_hash(NEW."id"::text), NEW."id", NEW."amount");
+                pg_trickle.pg_trickle_hash(NEW."id"::text), NEW."id", NEW."amount");
         RETURN NEW;
     ELSIF TG_OP = 'UPDATE' THEN
-        INSERT INTO pg_stream_changes.changes_16384
+        INSERT INTO pg_trickle_changes.changes_16384
             (lsn, action, pk_hash, "new_id", "new_amount", "old_id", "old_amount")
         VALUES (pg_current_wal_lsn(), 'U',
-                pg_stream.pg_stream_hash(NEW."id"::text), NEW."id", NEW."amount",
+                pg_trickle.pg_trickle_hash(NEW."id"::text), NEW."id", NEW."amount",
                 OLD."id", OLD."amount");
         RETURN NEW;
     ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO pg_stream_changes.changes_16384
+        INSERT INTO pg_trickle_changes.changes_16384
             (lsn, action, pk_hash, "old_id", "old_amount")
         VALUES (pg_current_wal_lsn(), 'D',
-                pg_stream.pg_stream_hash(OLD."id"::text), OLD."id", OLD."amount");
+                pg_trickle.pg_trickle_hash(OLD."id"::text), OLD."id", OLD."amount");
         RETURN OLD;
     END IF;
     RETURN NULL;
@@ -47,7 +47,7 @@ $$;
 
 The trigger cost is proportional to:
 - **Column count** — each column produces a `new_*` and/or `old_*` typed value in the INSERT
-- **PK type** — single-column uses `pg_stream_hash()`, composite uses `pg_stream_hash_multi(ARRAY[...])`
+- **PK type** — single-column uses `pg_trickle_hash()`, composite uses `pg_trickle_hash_multi(ARRAY[...])`
 - **DML operation** — UPDATE writes both `new_*` and `old_*` (widest buffer row)
 
 ---
@@ -72,7 +72,7 @@ For each (schema, pk_type, dml_operation) combination:
 
 1. **Baseline run** — execute DML on the source table with **no trigger installed** (plain table, no stream table created). Measure wall-clock time for `BATCH_SIZE` operations across `CYCLES` iterations.
 
-2. **Trigger run** — create a stream table referencing the source (which installs the CDC trigger automatically via `pg_stream.create_stream_table()`). TRUNCATE the change buffer between cycles to isolate per-row trigger cost from buffer-growth/bloat effects. Measure the same DML workload.
+2. **Trigger run** — create a stream table referencing the source (which installs the CDC trigger automatically via `pg_trickle.create_stream_table()`). TRUNCATE the change buffer between cycles to isolate per-row trigger cost from buffer-growth/bloat effects. Measure the same DML workload.
 
 3. **Compute overhead**:
    - `overhead_us_per_row = (trigger_avg_us - baseline_avg_us) / BATCH_SIZE`
@@ -137,8 +137,8 @@ Trigger INSERT has ~40 column references for UPDATE (20 `new_*` + 20 `old_*`). B
 
 | PK Type | Schema Modification | Hash Function | Notes |
 |---------|-------------------|---------------|-------|
-| **Single INT** | `id SERIAL PRIMARY KEY` | `pg_stream_hash(NEW."id"::text)` | Baseline — cheapest hash |
-| **Composite 2-col** | `PRIMARY KEY (id, seq)` with extra `seq INT NOT NULL DEFAULT 1` | `pg_stream_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-hash |
+| **Single INT** | `id SERIAL PRIMARY KEY` | `pg_trickle_hash(NEW."id"::text)` | Baseline — cheapest hash |
+| **Composite 2-col** | `PRIMARY KEY (id, seq)` with extra `seq INT NOT NULL DEFAULT 1` | `pg_trickle_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-hash |
 | **No PK** | Remove PRIMARY KEY constraint | No `pk_hash` column in buffer | Simpler trigger, but `lsn`-only index; tests the fallback path in `src/cdc.rs` |
 
 ### 3.5. DML Operations
@@ -303,13 +303,13 @@ async fn bench_trigger_overhead(
 
     // Creating the ST installs the CDC trigger automatically
     db.execute(&format!(
-        "SELECT pg_stream.create_stream_table('overhead_st', $q${}$q$, '1 hour', 'INCREMENTAL')",
+        "SELECT pg_trickle.create_stream_table('overhead_st', $q${}$q$, '1 hour', 'INCREMENTAL')",
         st_query
     )).await;
 
     // Full initial refresh so the ST is populated
     db.execute(
-        "SELECT pg_stream.refresh_stream_table('overhead_st', force_full => true)"
+        "SELECT pg_trickle.refresh_stream_table('overhead_st', force_full => true)"
     ).await;
 
     // Discover the change buffer table name
@@ -353,7 +353,7 @@ Output format (printed to stdout with `[BENCH_TRIGGER]` prefix for parseability)
 
 ```
 ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
-║                    pg_stream Trigger Overhead Results                               ║
+║                    pg_trickle Trigger Overhead Results                               ║
 ╠════════════╤══════════╤══════════╤══════════╤══════════╤══════════╤════════╤════════════════╣
 ║ Schema     │ PK Type  │ DML Op   │ Base µs  │ Trig µs  │ Δ µs/row │ Ratio  │ Trig ops/s     ║
 ╠════════════╪══════════╪══════════╪══════════╪══════════╪══════════╪════════╪════════════════╣
@@ -431,8 +431,8 @@ bench-trigger:
 
 | PK Type | Hash Call | Expected overhead |
 |---------|-----------|------------------|
-| Single INT | `pg_stream_hash(NEW."id"::text)` | Baseline — single `::text` cast + xxh64 |
-| Composite (id, seq) | `pg_stream_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-element hash |
+| Single INT | `pg_trickle_hash(NEW."id"::text)` | Baseline — single `::text` cast + xxh64 |
+| Composite (id, seq) | `pg_trickle_hash_multi(ARRAY[NEW."id"::text, NEW."seq"::text])` | Array construction + multi-element hash |
 | No PK | (none — `pk_hash` column omitted) | Cheaper trigger, but index is `(lsn)` only |
 
 **Hypothesis:** Composite PK adds ~0.5–1 µs/row over single PK due to array construction. No-PK should be slightly cheaper than single PK (no hash computation), but the `lsn`-only index may lead to wider scan ranges during refresh (not measured here, but worth noting).
@@ -473,7 +473,7 @@ These are rough estimates. The benchmark will provide actual numbers for this sp
 |-----------|---------|-------|
 | PL/pgSQL function entry/exit | 0.5–1.0 | Fixed overhead per trigger invocation |
 | `pg_current_wal_lsn()` call | 0.1–0.2 | Lightweight system function |
-| `pg_stream_hash(pk::text)` | 0.2–0.5 | Cast + xxh64 hash |
+| `pg_trickle_hash(pk::text)` | 0.2–0.5 | Cast + xxh64 hash |
 | `INSERT INTO changes_<oid>` (heap) | 0.5–1.0 | Scales with row width |
 | B-tree index update | 0.3–0.8 | Single covering index (was 2 previously) |
 | WAL write for buffer row | 0.3–0.5 | Scales with row width |
@@ -489,7 +489,7 @@ These are rough estimates. The benchmark will provide actual numbers for this sp
 
 If the overhead is > 5 µs/row for wide tables, an `UNLOGGED` change buffer would eliminate WAL generation for trigger writes, potentially halving the overhead. Trade-off: change buffer data is lost on crash (acceptable if refreshes re-initialize from a full scan).
 
-**Action:** If measured WAL overhead > 30% of trigger cost → implement `pg_stream.change_buffer_unlogged` GUC.
+**Action:** If measured WAL overhead > 30% of trigger cost → implement `pg_trickle.change_buffer_unlogged` GUC.
 
 ### 7.2. Decision: When to Migrate to Logical Replication
 
@@ -502,7 +502,7 @@ Per `AGENTS.md` and ADR-001/ADR-002 in `plans/adrs/PLAN_ADRS.md`, triggers are r
 
 ### 7.3. Decision: Column Pruning for Change Buffers
 
-If the column-count sweep shows strong scaling (e.g., 3x overhead at 20 cols vs 3 cols), then a future optimization could prune the change buffer to only capture columns actually referenced in the stream table's defining query (via `columns_used` in `pg_stream.pgs_dependencies`).
+If the column-count sweep shows strong scaling (e.g., 3x overhead at 20 cols vs 3 cols), then a future optimization could prune the change buffer to only capture columns actually referenced in the stream table's defining query (via `columns_used` in `pg_trickle.pgt_dependencies`).
 
 **Action:** If wide-table overhead > 3x narrow-table overhead → prioritize column pruning optimization.
 

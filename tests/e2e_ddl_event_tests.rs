@@ -30,7 +30,7 @@ async fn test_drop_source_fires_event_trigger() {
     let ddl_trigger: bool = db
         .query_scalar(
             "SELECT EXISTS( \
-                SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_stream_ddl_tracker' \
+                SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_trickle_ddl_tracker' \
             )",
         )
         .await;
@@ -39,7 +39,7 @@ async fn test_drop_source_fires_event_trigger() {
     let drop_trigger: bool = db
         .query_scalar(
             "SELECT EXISTS( \
-                SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_stream_drop_tracker' \
+                SELECT 1 FROM pg_event_trigger WHERE evtname = 'pg_trickle_drop_tracker' \
             )",
         )
         .await;
@@ -55,14 +55,14 @@ async fn test_drop_source_fires_event_trigger() {
         // or the storage table may have been cascade-dropped too (cleaning up the catalog).
         let st_count: i64 = db
             .query_scalar(
-                "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_drop_st'",
+                "SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'evt_drop_st'",
             )
             .await;
         if st_count > 0 {
             // The event trigger sets status to ERROR when a source is dropped
             let status: String = db
                 .query_scalar(
-                    "SELECT status FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_drop_st'",
+                    "SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'evt_drop_st'",
                 )
                 .await;
             assert_eq!(
@@ -118,7 +118,7 @@ async fn test_drop_st_storage_by_sql() {
     )
     .await;
 
-    // Drop the ST storage table directly (bypassing pgstream.drop_stream_table)
+    // Drop the ST storage table directly (bypassing pgtrickle.drop_stream_table)
     let result = db
         .try_execute("DROP TABLE public.evt_storage_st CASCADE")
         .await;
@@ -130,7 +130,7 @@ async fn test_drop_st_storage_by_sql() {
 
         let cat_count: i64 = db
             .query_scalar(
-                "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_storage_st'",
+                "SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'evt_storage_st'",
             )
             .await;
         assert_eq!(
@@ -166,7 +166,7 @@ async fn test_rename_source_table() {
     // The defining query still references 'evt_rename_src' which is now gone.
     // Refresh should reveal the problem.
     let result = db
-        .try_execute("SELECT pgstream.refresh_stream_table('evt_rename_st')")
+        .try_execute("SELECT pgtrickle.refresh_stream_table('evt_rename_st')")
         .await;
 
     // After renaming source, refresh with old name should fail
@@ -209,7 +209,7 @@ async fn test_function_change_marks_st_for_reinit() {
     let func_count: i64 = db
         .query_scalar(
             "SELECT coalesce(array_length(functions_used, 1), 0)::bigint \
-             FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_func_st'",
+             FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'evt_func_st'",
         )
         .await;
     assert!(
@@ -221,7 +221,7 @@ async fn test_function_change_marks_st_for_reinit() {
     let has_func: bool = db
         .query_scalar(
             "SELECT functions_used @> ARRAY['evt_double']::text[] \
-             FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_func_st'",
+             FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'evt_func_st'",
         )
         .await;
     assert!(has_func, "functions_used should contain 'evt_double'");
@@ -235,7 +235,7 @@ async fn test_function_change_marks_st_for_reinit() {
     // The DDL hook should have marked the ST for reinit
     let needs_reinit: bool = db
         .query_scalar(
-            "SELECT needs_reinit FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_func_st'",
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'evt_func_st'",
         )
         .await;
     assert!(
@@ -278,7 +278,7 @@ async fn test_drop_function_marks_st_for_reinit() {
     // The drop hook should have marked the ST for reinit
     let needs_reinit: bool = db
         .query_scalar(
-            "SELECT needs_reinit FROM pgstream.pgs_stream_tables WHERE pgs_name = 'evt_dfunc_st'",
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'evt_dfunc_st'",
         )
         .await;
     assert!(

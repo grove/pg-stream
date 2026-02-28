@@ -3,7 +3,7 @@
 Date: 2026-02-26
 Status: IMPLEMENTED
 Supersedes: Project 5 in [PLAN_ECO_SYSTEM.md](PLAN_ECO_SYSTEM.md)
-PR: [#15](https://github.com/grove/pg-stream/pull/15)
+PR: [#15](https://github.com/grove/pg-trickle/pull/15)
 Branch: `cloudnative-pg-image-volume`
 
 ---
@@ -41,9 +41,9 @@ Files changed:
 
 ## Overview
 
-Replace the current full-PostgreSQL Docker image (`ghcr.io/<owner>/pg_stream`)
+Replace the current full-PostgreSQL Docker image (`ghcr.io/<owner>/pg_trickle`)
 with a minimal, `scratch`-based **extension-only** OCI image
-(`ghcr.io/<owner>/pg_stream-ext`) that follows the
+(`ghcr.io/<owner>/pg_trickle-ext`) that follows the
 [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/)
 specification.
 
@@ -105,11 +105,11 @@ their `Cluster` resource via `.spec.postgresql.extensions`.
 │  Cluster CR (.spec.postgresql.extensions)                           │
 │                                                                     │
 │  extensions:                                                        │
-│    - name: pg-stream                                                │
+│    - name: pg-trickle                                                │
 │      image:                                                         │
-│        reference: ghcr.io/<owner>/pg_stream-ext:0.2.0               │
+│        reference: ghcr.io/<owner>/pg_trickle-ext:0.2.0               │
 │                                                                     │
-│  shared_preload_libraries: [pg_stream]                              │
+│  shared_preload_libraries: [pg_trickle]                              │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
                                  ▼
@@ -118,10 +118,10 @@ their `Cluster` resource via `.spec.postgresql.extensions`.
 │                                                                     │
 │  1. Triggers rolling update                                         │
 │  2. Mounts extension image as ImageVolume at:                       │
-│       /extensions/pg-stream/                                        │
+│       /extensions/pg-trickle/                                        │
 │  3. Appends to postgresql.conf:                                     │
-│       extension_control_path = '..:/extensions/pg-stream/share'     │
-│       dynamic_library_path   = '..:/extensions/pg-stream/lib'       │
+│       extension_control_path = '..:/extensions/pg-trickle/share'     │
+│       dynamic_library_path   = '..:/extensions/pg-trickle/lib'       │
 │  4. Starts PostgreSQL                                               │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │
@@ -129,15 +129,15 @@ their `Cluster` resource via `.spec.postgresql.extensions`.
 ┌─────────────────────────────────────────────────────────────────────┐
 │  PostgreSQL 18 Pod                                                  │
 │                                                                     │
-│  /extensions/pg-stream/                                             │
+│  /extensions/pg-trickle/                                             │
 │  ├── lib/                                                           │
-│  │   └── pg_stream.so          ← shared library                     │
+│  │   └── pg_trickle.so          ← shared library                     │
 │  └── share/                                                         │
 │      └── extension/                                                 │
-│          ├── pg_stream.control  ← extension control file            │
-│          └── pg_stream--0.2.0.sql  ← SQL migration                  │
+│          ├── pg_trickle.control  ← extension control file            │
+│          └── pg_trickle--0.2.0.sql  ← SQL migration                  │
 │                                                                     │
-│  CREATE EXTENSION pg_stream;   ← works via extension_control_path   │
+│  CREATE EXTENSION pg_trickle;   ← works via extension_control_path   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -146,16 +146,16 @@ their `Cluster` resource via `.spec.postgresql.extensions`.
 ```
 /
 ├── lib/
-│   └── pg_stream.so
+│   └── pg_trickle.so
 └── share/
     └── extension/
-        ├── pg_stream.control
-        └── pg_stream--<version>.sql
+        ├── pg_trickle.control
+        └── pg_trickle--<version>.sql
 ```
 
 This layout follows the CNPG default convention. The operator automatically
-appends `/extensions/pg-stream/share` to `extension_control_path` and
-`/extensions/pg-stream/lib` to `dynamic_library_path`.
+appends `/extensions/pg-trickle/share` to `extension_control_path` and
+`/extensions/pg-trickle/lib` to `dynamic_library_path`.
 
 ---
 
@@ -164,7 +164,7 @@ appends `/extensions/pg-stream/share` to `extension_control_path` and
 | Property | Value |
 |---|---|
 | Base image | `scratch` |
-| Image name | `ghcr.io/<owner>/pg_stream-ext` |
+| Image name | `ghcr.io/<owner>/pg_trickle-ext` |
 | Tag scheme | `<version>` (e.g. `0.2.0`), `<major.minor>` (e.g. `0.2`), `latest` |
 | Architectures | `linux/amd64`, `linux/arm64` |
 | OCI labels | `title`, `description`, `licenses`, `source`, `version` |
@@ -199,15 +199,15 @@ image. No Rust compilation happens here.
 # =============================================================================
 # Extension-only image for CloudNativePG Image Volume Extensions.
 #
-# Contains ONLY the pg_stream shared library, control file, and SQL
+# Contains ONLY the pg_trickle shared library, control file, and SQL
 # migrations. Designed to be mounted as an ImageVolume in a CNPG Cluster.
 #
 # Usage (from dist/ context with pre-built artifacts in artifact/):
-#   docker build -t pg_stream-ext:latest -f cnpg/Dockerfile.ext dist/
+#   docker build -t pg_trickle-ext:latest -f cnpg/Dockerfile.ext dist/
 # =============================================================================
 FROM scratch
 
-ARG REPO_URL=https://github.com/grove/pg-stream
+ARG REPO_URL=https://github.com/grove/pg-trickle
 ARG VERSION=dev
 
 # Extension shared library
@@ -217,8 +217,8 @@ COPY artifact/lib/*.so /lib/
 COPY artifact/extension/ /share/extension/
 
 # OCI labels
-LABEL org.opencontainers.image.title="pg_stream-ext" \
-      org.opencontainers.image.description="pg_stream extension for CloudNativePG Image Volume Extensions" \
+LABEL org.opencontainers.image.title="pg_trickle-ext" \
+      org.opencontainers.image.description="pg_trickle extension for CloudNativePG Image Volume Extensions" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="${REPO_URL}"
@@ -239,11 +239,11 @@ extension from source; Stage 2 copies only the extension files into `scratch`.
 
 ```dockerfile
 # =============================================================================
-# Multi-stage build: compiles pg_stream from source, then produces a
+# Multi-stage build: compiles pg_trickle from source, then produces a
 # scratch-based extension image for CNPG Image Volume Extensions.
 #
 # Usage (from project root):
-#   docker build -t pg_stream-ext:latest -f cnpg/Dockerfile.ext-build .
+#   docker build -t pg_trickle-ext:latest -f cnpg/Dockerfile.ext-build .
 # =============================================================================
 
 # ── Stage 1: Build the extension ────────────────────────────────────────────
@@ -277,28 +277,28 @@ RUN mkdir -p src/bin src/ivm/operators benches && \
     cargo fetch
 
 COPY src/ src/
-COPY pg_stream.control ./
+COPY pg_trickle.control ./
 
 RUN cargo pgrx package --pg-config /usr/bin/pg_config
 
 # Verify artifacts exist
-RUN find target/release/pg_stream-pg18 -type f
+RUN find target/release/pg_trickle-pg18 -type f
 
 # ── Stage 2: Scratch extension image ───────────────────────────────────────
 FROM scratch
 
 # Copy shared library
 COPY --from=builder \
-    /build/target/release/pg_stream-pg18/usr/lib/postgresql/18/lib/ \
+    /build/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/ \
     /lib/
 
 # Copy extension control + SQL files
 COPY --from=builder \
-    /build/target/release/pg_stream-pg18/usr/share/postgresql/18/extension/ \
+    /build/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/ \
     /share/extension/
 
-LABEL org.opencontainers.image.title="pg_stream-ext" \
-      org.opencontainers.image.description="pg_stream extension for CloudNativePG Image Volume Extensions" \
+LABEL org.opencontainers.image.title="pg_trickle-ext" \
+      org.opencontainers.image.description="pg_trickle extension for CloudNativePG Image Volume Extensions" \
       org.opencontainers.image.licenses="Apache-2.0"
 ```
 
@@ -321,8 +321,8 @@ into `/usr/lib/postgresql/18/lib/` are all unnecessary when using Image Volumes.
 
 Changes:
 
-1. **Rename `IMAGE_NAME`** from `${{ github.repository_owner }}/pg_stream` to
-   `${{ github.repository_owner }}/pg_stream-ext`.
+1. **Rename `IMAGE_NAME`** from `${{ github.repository_owner }}/pg_trickle` to
+   `${{ github.repository_owner }}/pg_trickle-ext`.
 
 2. **`test-release` job** — The smoke test currently builds a full Docker image
    and runs `CREATE EXTENSION` inside it. Since the extension image is
@@ -332,22 +332,22 @@ Changes:
    **Option A (implemented):** Keep the existing artifact-level verification
    (extract tar, check file tree), then validate the Docker image layout:
    ```bash
-   docker build -t pg_stream-ext:test -f cnpg/Dockerfile.ext dist/
-   ID=$(docker create pg_stream-ext:test true)
+   docker build -t pg_trickle-ext:test -f cnpg/Dockerfile.ext dist/
+   ID=$(docker create pg_trickle-ext:test true)
    docker cp "$ID:/lib/" /tmp/ext-lib/
    docker cp "$ID:/share/" /tmp/ext-share/
    docker rm "$ID"
    # Verify expected files exist
-   test -f /tmp/ext-lib/pg_stream.so
-   test -f /tmp/ext-share/extension/pg_stream.control
-   ls /tmp/ext-share/extension/pg_stream--*.sql
+   test -f /tmp/ext-lib/pg_trickle.so
+   test -f /tmp/ext-share/extension/pg_trickle.control
+   ls /tmp/ext-share/extension/pg_trickle--*.sql
    ```
    **Option B (also implemented):** A composite image is also built in the
    same job for a SQL-level `CREATE EXTENSION` smoke test:
    ```dockerfile
    FROM postgres:18.1
-   COPY --from=pg_stream-ext:test /lib/ /usr/lib/postgresql/18/lib/
-   COPY --from=pg_stream-ext:test /share/extension/ /usr/share/postgresql/18/extension/
+   COPY --from=pg_trickle-ext:test /lib/ /usr/lib/postgresql/18/lib/
+   COPY --from=pg_trickle-ext:test /share/extension/ /usr/share/postgresql/18/extension/
    ```
    Both options were implemented: Option A validates the image layout, then
    Option B runs a full `CREATE EXTENSION` + `SELECT` smoke test using the
@@ -385,7 +385,7 @@ mitigation strategies:
   works but does not exercise the Image Volume path end-to-end.
   ```dockerfile
   # tests/Dockerfile.cnpg-smoke (CI-only, not shipped)
-  FROM pg_stream-ext:ci AS ext
+  FROM pg_trickle-ext:ci AS ext
   FROM postgres:18.1
   COPY --from=ext /lib/ /usr/lib/postgresql/18/lib/
   COPY --from=ext /share/extension/ /usr/share/postgresql/18/extension/
@@ -412,12 +412,12 @@ references the extension image via `.spec.postgresql.extensions`.
 
 ```yaml
 # =============================================================================
-# Example CloudNativePG Cluster with pg_stream via Image Volume Extensions.
+# Example CloudNativePG Cluster with pg_trickle via Image Volume Extensions.
 #
 # Prerequisites:
 #   1. Kubernetes 1.33+ with ImageVolume feature gate enabled
 #   2. CNPG operator 1.28+ installed
-#   3. pg_stream-ext image available in the cluster registry
+#   3. pg_trickle-ext image available in the cluster registry
 #
 # Deploy:
 #   kubectl apply -f cnpg/cluster-example.yaml
@@ -426,27 +426,27 @@ references the extension image via `.spec.postgresql.extensions`.
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
-  name: pg-stream-demo
+  name: pg-trickle-demo
   labels:
-    app.kubernetes.io/name: pg-stream
+    app.kubernetes.io/name: pg-trickle
     app.kubernetes.io/component: database
 spec:
   instances: 3
 
   # Use the official CNPG minimal PostgreSQL 18 operand image.
-  # The pg_stream extension is loaded via Image Volumes below.
+  # The pg_trickle extension is loaded via Image Volumes below.
   imageName: ghcr.io/cloudnative-pg/postgresql:18
 
   postgresql:
     # Required: load the extension shared library at server start.
     shared_preload_libraries:
-      - pg_stream
+      - pg_trickle
 
-    # Extension image — mounted at /extensions/pg-stream/
+    # Extension image — mounted at /extensions/pg-trickle/
     extensions:
-      - name: pg-stream
+      - name: pg-trickle
         image:
-          reference: ghcr.io/<owner>/pg_stream-ext:<version>
+          reference: ghcr.io/<owner>/pg_trickle-ext:<version>
 
     parameters:
       # Recommended: scheduler bgworker + refresh workers
@@ -464,14 +464,14 @@ Add a separate `Database` resource for declarative extension management:
 apiVersion: postgresql.cnpg.io/v1
 kind: Database
 metadata:
-  name: pg-stream-app
+  name: pg-trickle-app
 spec:
   name: app
   owner: app
   cluster:
-    name: pg-stream-demo
+    name: pg-trickle-demo
   extensions:
-    - name: pg_stream
+    - name: pg_trickle
 ```
 
 **Changes from the old manifest:**
@@ -490,7 +490,7 @@ spec:
 
 # Build the CNPG extension image (from source)
 docker-build:
-    docker build -t pg_stream-ext:latest -f cnpg/Dockerfile.ext-build .
+    docker build -t pg_trickle-ext:latest -f cnpg/Dockerfile.ext-build .
 ```
 
 ### Task 8 — Update Documentation
@@ -504,14 +504,14 @@ Replace the "Using the Docker image" section:
 ```markdown
 ### 3. Using with CloudNativePG (Kubernetes)
 
-pg_stream is distributed as an OCI extension image for use with
+pg_trickle is distributed as an OCI extension image for use with
 [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/).
 
 **Requirements:** Kubernetes 1.33+, CNPG 1.28+, PostgreSQL 18.
 
 ```bash
 # Pull the extension image
-docker pull ghcr.io/grove/pg_stream-ext:0.1.0
+docker pull ghcr.io/grove/pg_trickle-ext:0.1.0
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and
@@ -523,17 +523,17 @@ manually into a standard PostgreSQL container:
 
 ```bash
 # Extract extension files from the release archive
-tar xzf pg_stream-0.1.0-pg18-linux-amd64.tar.gz
-cd pg_stream-0.1.0-pg18-linux-amd64
+tar xzf pg_trickle-0.1.0-pg18-linux-amd64.tar.gz
+cd pg_trickle-0.1.0-pg18-linux-amd64
 
 # Run PostgreSQL with the extension mounted
 docker run --rm \
-  -v $PWD/lib/pg_stream.so:/usr/lib/postgresql/18/lib/pg_stream.so:ro \
+  -v $PWD/lib/pg_trickle.so:/usr/lib/postgresql/18/lib/pg_trickle.so:ro \
   -v $PWD/extension/:/tmp/ext/:ro \
   -e POSTGRES_PASSWORD=postgres \
   postgres:18.1 \
   sh -c 'cp /tmp/ext/* /usr/share/postgresql/18/extension/ && \
-         exec postgres -c shared_preload_libraries=pg_stream'
+         exec postgres -c shared_preload_libraries=pg_trickle'
 ```
 ```
 
@@ -543,7 +543,7 @@ Update the release artifacts table:
 
 | Artifact | Description |
 |----------|-------------|
-| `ghcr.io/grove/pg_stream-ext:<ver>` | CNPG extension image (amd64 + arm64) |
+| `ghcr.io/grove/pg_trickle-ext:<ver>` | CNPG extension image (amd64 + arm64) |
 
 Update the Docker verification instructions to use the new image name and
 layout validation (since the image has no shell, use `docker create` + `docker cp`).
@@ -577,20 +577,20 @@ Update any references to the Docker image name.
 
 ```bash
 # Build extension image from source
-docker build -t pg_stream-ext:test -f cnpg/Dockerfile.ext-build .
+docker build -t pg_trickle-ext:test -f cnpg/Dockerfile.ext-build .
 
 # Verify image size (should be < 10 MB)
-docker images pg_stream-ext:test
+docker images pg_trickle-ext:test
 
 # Verify file layout
-ID=$(docker create pg_stream-ext:test true)
+ID=$(docker create pg_trickle-ext:test true)
 docker cp "$ID:/lib/" /tmp/ext-lib/
 docker cp "$ID:/share/" /tmp/ext-share/
 docker rm "$ID"
 
-test -f /tmp/ext-lib/pg_stream.so
-test -f /tmp/ext-share/extension/pg_stream.control
-ls /tmp/ext-share/extension/pg_stream--*.sql
+test -f /tmp/ext-lib/pg_trickle.so
+test -f /tmp/ext-share/extension/pg_trickle.control
+ls /tmp/ext-share/extension/pg_trickle--*.sql
 
 echo "Extension image layout verified."
 ```
@@ -603,19 +603,19 @@ kubectl apply -f cnpg/cluster-example.yaml
 kubectl apply -f cnpg/database-example.yaml
 
 # Wait for cluster
-kubectl wait cluster/pg-stream-demo --for=condition=Ready --timeout=300s
+kubectl wait cluster/pg-trickle-demo --for=condition=Ready --timeout=300s
 
 # Verify extension is available
-kubectl exec pg-stream-demo-1 -- \
-  psql -U postgres -d app -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';"
+kubectl exec pg-trickle-demo-1 -- \
+  psql -U postgres -d app -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';"
 ```
 
 ### Release Pipeline
 
 - Push a tag → release workflow runs
 - `publish-docker-arch` builds per-arch `scratch` images
-- `publish-docker` creates multi-arch manifest at `ghcr.io/<owner>/pg_stream-ext:<version>`
-- `docker pull ghcr.io/<owner>/pg_stream-ext:<version>` succeeds
+- `publish-docker` creates multi-arch manifest at `ghcr.io/<owner>/pg_trickle-ext:<version>`
+- `docker pull ghcr.io/<owner>/pg_trickle-ext:<version>` succeeds
 - `docker inspect` confirms `scratch`-based image with OCI labels
 
 ---
@@ -638,7 +638,7 @@ manual installation.
 
 ### Context
 
-The current approach bakes the pg_stream extension into a full PostgreSQL
+The current approach bakes the pg_trickle extension into a full PostgreSQL
 Docker image (`postgres:18.1` + extension files + UID remapping). This requires:
 
 - Maintaining a custom PostgreSQL image

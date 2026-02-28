@@ -11,7 +11,7 @@ use std::sync::atomic::AtomicU64;
 ///
 /// Protected by `PGS_STATE` lightweight lock for concurrent access.
 #[derive(Copy, Clone, Default)]
-pub struct PgStreamSharedState {
+pub struct PgTrickleSharedState {
     /// Incremented when the DAG changes (create/alter/drop ST).
     pub dag_version: u64,
     /// PID of the scheduler background worker (0 if not running).
@@ -22,20 +22,21 @@ pub struct PgStreamSharedState {
     pub last_scheduler_wake: i64,
 }
 
-// SAFETY: PgStreamSharedState is Copy + Clone + Default and contains only
+// SAFETY: PgTrickleSharedState is Copy + Clone + Default and contains only
 // primitive types, making it safe for shared memory access under PgLwLock.
-unsafe impl PGRXSharedMemory for PgStreamSharedState {}
+unsafe impl PGRXSharedMemory for PgTrickleSharedState {}
 
 /// Lightweight-lock–protected shared state.
 // SAFETY: PgLwLock::new requires a static CStr name for the lock.
-pub static PGS_STATE: PgLwLock<PgStreamSharedState> = unsafe { PgLwLock::new(c"pg_stream_state") };
+pub static PGS_STATE: PgLwLock<PgTrickleSharedState> =
+    unsafe { PgLwLock::new(c"pg_trickle_state") };
 
 /// Atomic signal for DAG rebuild. Backends increment this when creating,
 /// altering, or dropping stream tables. The scheduler compares its local
 /// version to detect changes.
 // SAFETY: PgAtomic::new requires a static CStr name.
 pub static DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64> =
-    unsafe { PgAtomic::new(c"pg_stream_dag_signal") };
+    unsafe { PgAtomic::new(c"pg_trickle_dag_signal") };
 
 /// Atomic generation counter for cross-session cache invalidation (G8.1).
 ///
@@ -45,7 +46,8 @@ pub static DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64> =
 /// generation and flushes its thread-local caches when the shared value
 /// advances.
 // SAFETY: PgAtomic::new requires a static CStr name.
-pub static CACHE_GENERATION: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"pg_stream_cache_gen") };
+pub static CACHE_GENERATION: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_cache_gen") };
 
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {

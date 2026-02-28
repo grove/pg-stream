@@ -99,7 +99,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'src/**'
-              - 'pg_stream.control'
+              - 'pg_trickle.control'
 
   # ── Build matrix (Step 2: Windows removed) ──────────────────────────────
   build:
@@ -142,11 +142,11 @@ jobs:
       - name: Create archive (tar.gz)
         shell: bash
         run: |
-          ARCHIVE_NAME="pg_stream-${{ steps.version.outputs.version }}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
+          ARCHIVE_NAME="pg_trickle-${{ steps.version.outputs.version }}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
           mkdir -p "dist/${ARCHIVE_NAME}"
 
           # Find and copy the pgrx package output
-          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_stream-pg*' -type d | head -1)
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_trickle-pg*' -type d | head -1)
           if [[ -z "$PKG_DIR" ]]; then
             echo "ERROR: cannot find pgrx package output"
             find target/release -maxdepth 2 -type d
@@ -187,20 +187,20 @@ jobs:
         with:
           context: .
           file: tests/Dockerfile.e2e
-          tags: pg_stream_e2e:latest
+          tags: pg_trickle_e2e:latest
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Save Docker image as artifact
         run: |
-          docker save pg_stream_e2e:latest | gzip > pg_stream_e2e.tar.gz
-          ls -lh pg_stream_e2e.tar.gz
+          docker save pg_trickle_e2e:latest | gzip > pg_trickle_e2e.tar.gz
+          ls -lh pg_trickle_e2e.tar.gz
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v4
         with:
           name: docker-image
-          path: pg_stream_e2e.tar.gz
+          path: pg_trickle_e2e.tar.gz
           retention-days: 3
           compression-level: 0  # already gzipped

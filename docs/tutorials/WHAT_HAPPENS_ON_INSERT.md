@@ -15,7 +15,7 @@ CREATE TABLE orders (
 );
 
 -- Stream table: always-fresh customer totals
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'customer_totals',
     $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
@@ -43,12 +43,12 @@ INSERT INTO orders (customer, amount) VALUES ('alice', 49.99);
 
 ### What happens inside PostgreSQL
 
-When `create_stream_table()` was called, pg_stream installed an **AFTER INSERT OR UPDATE OR DELETE** trigger on the `orders` table. This trigger fires automatically — the user's `INSERT` statement triggers it transparently.
+When `create_stream_table()` was called, pg_trickle installed an **AFTER INSERT OR UPDATE OR DELETE** trigger on the `orders` table. This trigger fires automatically — the user's `INSERT` statement triggers it transparently.
 
-The trigger function (`pgstream_changes.pg_stream_cdc_fn_<oid>()`) executes inside the same transaction as the INSERT and writes a single row into the **change buffer table**:
+The trigger function (`pgtrickle_changes.pg_trickle_cdc_fn_<oid>()`) executes inside the same transaction as the INSERT and writes a single row into the **change buffer table**:
 
 ```
-pgstream_changes.changes_16384    (where 16384 = orders table OID)
+pgtrickle_changes.changes_16384    (where 16384 = orders table OID)
 ┌───────────┬─────────────┬────────┬─────────┬──────────┬──────────┬────────────┐
 │ change_id │ lsn         │ action │ pk_hash  │ new_id   │ new_cust │ new_amount │
 ├───────────┼─────────────┼────────┼─────────┼──────────┼──────────┼────────────┤
@@ -66,7 +66,7 @@ The trigger adds **zero overhead to the user's transaction commit** beyond this 
 
 ## Phase 2: The Scheduler Wakes Up
 
-A background worker called the **scheduler** runs inside PostgreSQL (registered via `shared_preload_libraries`). It wakes up every `pg_stream.scheduler_interval_ms` milliseconds (default: 1000ms) and performs a tick:
+A background worker called the **scheduler** runs inside PostgreSQL (registered via `shared_preload_libraries`). It wakes up every `pg_trickle.scheduler_interval_ms` milliseconds (default: 1000ms) and performs a tick:
 
 1. **Rebuild the DAG** (if any stream tables were created/dropped since last tick) — a dependency graph of all stream tables and their source tables.
 2. **Topological sort** — determine the refresh order so that stream tables depending on other stream tables are refreshed after their dependencies.
@@ -100,11 +100,11 @@ Before running the full delta query, the scheduler runs a **short-circuit check*
 
 ```sql
 SELECT count(*)::bigint FROM (
-    SELECT 1 FROM pgstream_changes.changes_16384
+    SELECT 1 FROM pgtrickle_changes.changes_16384
     WHERE lsn > '0/1A3F2A00'::pg_lsn
     AND lsn <= '0/1A3F2C00'::pg_lsn
     LIMIT <threshold>
-) __pgs_capped
+) __pgt_capped
 ```
 
 This query also checks the **adaptive threshold**: if the number of changes exceeds a percentage of the source table size (default: 10%), the scheduler falls back to a FULL refresh instead of DIFFERENTIAL, because applying thousands of individual deltas would be slower than a bulk reload.
@@ -135,29 +135,29 @@ The `Scan(orders)` operator becomes a read from the change buffer:
 
 ```sql
 -- Reads only changes in the LSN window, splitting UPDATEs into DELETE+INSERT
-WITH __pgs_raw AS (
+WITH __pgt_raw AS (
     SELECT c.pk_hash, c.action,
            c."new_customer", c."old_customer",
            c."new_amount", c."old_amount"
-    FROM pgstream_changes.changes_16384 c
+    FROM pgtrickle_changes.changes_16384 c
     WHERE c.lsn > '0/1A3F2A00'::pg_lsn
     AND   c.lsn <= '0/1A3F2C00'::pg_lsn
 )
 -- INSERT rows: take new_* values
-SELECT pk_hash AS __pgs_row_id, 'I' AS __pgs_action,
+SELECT pk_hash AS __pgt_row_id, 'I' AS __pgt_action,
        "new_customer" AS customer, "new_amount" AS amount
-FROM __pgs_raw WHERE action IN ('I', 'U')
+FROM __pgt_raw WHERE action IN ('I', 'U')
 UNION ALL
 -- DELETE rows: take old_* values
-SELECT pk_hash AS __pgs_row_id, 'D' AS __pgs_action,
+SELECT pk_hash AS __pgt_row_id, 'D' AS __pgt_action,
        "old_customer" AS customer, "old_amount" AS amount
-FROM __pgs_raw WHERE action IN ('D', 'U')
+FROM __pgt_raw WHERE action IN ('D', 'U')
 ```
 
 For our single INSERT, this produces:
 
 ```
-__pgs_row_id | __pgs_action | customer | amount
+__pgt_row_id | __pgt_action | customer | amount
 -------------|--------------|----------|-------
 -837291      | I            | alice    | 49.99
 ```
@@ -169,12 +169,12 @@ The `Aggregate` differentiation is the heart of incremental maintenance. Instead
 ```sql
 -- Delta for SUM: add new values, subtract deleted values
 SELECT customer,
-       SUM(CASE WHEN __pgs_action = 'I' THEN amount
-                WHEN __pgs_action = 'D' THEN -amount END) AS total,
-       SUM(CASE WHEN __pgs_action = 'I' THEN 1
-                WHEN __pgs_action = 'D' THEN -1 END) AS order_count,
-       pgstream.pg_stream_hash(customer::text) AS __pgs_row_id,
-       'I' AS __pgs_action
+       SUM(CASE WHEN __pgt_action = 'I' THEN amount
+                WHEN __pgt_action = 'D' THEN -amount END) AS total,
+       SUM(CASE WHEN __pgt_action = 'I' THEN 1
+                WHEN __pgt_action = 'D' THEN -1 END) AS order_count,
+       pgtrickle.pg_trickle_hash(customer::text) AS __pgt_row_id,
+       'I' AS __pgt_action
 FROM <scan_delta>
 GROUP BY customer
 ```
@@ -182,12 +182,12 @@ GROUP BY customer
 For our INSERT of `('alice', 49.99)`, this yields:
 
 ```
-customer | total  | order_count | __pgs_row_id | __pgs_action
+customer | total  | order_count | __pgt_row_id | __pgt_action
 ---------|--------|-------------|--------------|-------------
 alice    | +49.99 | +1          | 7283194      | I
 ```
 
-The stream table uses reference counting: it tracks `__pgs_count` (how many source rows contribute to each group). When `__pgs_count` reaches 0, the group row is deleted.
+The stream table uses reference counting: it tracks `__pgt_count` (how many source rows contribute to each group). When `__pgt_count` reaches 0, the group row is deleted.
 
 ## Phase 6: MERGE Into the Stream Table
 
@@ -196,13 +196,13 @@ The delta is applied to the `customer_totals` storage table using a single SQL `
 ```sql
 MERGE INTO public.customer_totals AS st
 USING (<delta_query>) AS d
-ON st.__pgs_row_id = d.__pgs_row_id
-WHEN MATCHED AND d.__pgs_action = 'D' THEN DELETE
-WHEN MATCHED AND d.__pgs_action = 'I' THEN
+ON st.__pgt_row_id = d.__pgt_row_id
+WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE
+WHEN MATCHED AND d.__pgt_action = 'I' THEN
     UPDATE SET customer = d.customer, total = d.total, order_count = d.order_count
-WHEN NOT MATCHED AND d.__pgs_action = 'I' THEN
-    INSERT (__pgs_row_id, customer, total, order_count)
-    VALUES (d.__pgs_row_id, d.customer, d.total, d.order_count)
+WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN
+    INSERT (__pgt_row_id, customer, total, order_count)
+    VALUES (d.__pgt_row_id, d.customer, d.total, d.order_count)
 ```
 
 Since `alice` didn't exist before, this is a `NOT MATCHED` → `INSERT`. The stream table now contains:
@@ -220,16 +220,16 @@ After the MERGE succeeds:
 
 1. **Consumed changes are deleted** from the buffer table:
    ```sql
-   DELETE FROM pgstream_changes.changes_16384
+   DELETE FROM pgtrickle_changes.changes_16384
    WHERE lsn > '0/1A3F2A00'::pg_lsn
    AND lsn <= '0/1A3F2C00'::pg_lsn
    ```
 
 2. **The frontier is saved** to the catalog as JSONB, so the next refresh knows where to start.
 
-3. **The refresh is recorded** in `pgstream.pgs_refresh_history`:
+3. **The refresh is recorded** in `pgtrickle.pgt_refresh_history`:
    ```
-   refresh_id | pgs_id | action       | rows_inserted | rows_deleted | status    | initiated_by
+   refresh_id | pgt_id | action       | rows_inserted | rows_deleted | status    | initiated_by
    1          | 1      | DIFFERENTIAL | 1             | 0            | COMPLETED | SCHEDULER
    ```
 
@@ -265,7 +265,7 @@ The aggregate differentiation computes: `+59.99 - 49.99 = +10.00` for alice's to
 DELETE FROM orders WHERE id = 1;
 ```
 
-The trigger writes `action = 'D'` with the `OLD` values. The aggregate differentiation computes `-49.99` for the total and `-1` for the count. If the `__pgs_count` reaches 0 (no more orders for alice), the MERGE deletes alice's row from the stream table entirely.
+The trigger writes `action = 'D'` with the `OLD` values. The aggregate differentiation computes `-49.99` for the total and `-1` for the count. If the `__pgt_count` reaches 0 (no more orders for alice), the MERGE deletes alice's row from the stream table entirely.
 
 ## Performance: Why This Is Fast
 

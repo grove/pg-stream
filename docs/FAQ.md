@@ -4,9 +4,9 @@
 
 ## General
 
-### What is pg_stream?
+### What is pg_trickle?
 
-pg_stream is a PostgreSQL 18 extension that implements **stream tables** — declarative, automatically-refreshing materialized views with **Differential View Maintenance (DVM)**. You define a SQL query and a refresh schedule; the extension handles change capture, delta computation, and incremental refresh automatically.
+pg_trickle is a PostgreSQL 18 extension that implements **stream tables** — declarative, automatically-refreshing materialized views with **Differential View Maintenance (DVM)**. You define a SQL query and a refresh schedule; the extension handles change capture, delta computation, and incremental refresh automatically.
 
 It is inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential dataflow framework. See [DBSP_COMPARISON.md](research/DBSP_COMPARISON.md) for a detailed comparison.
 
@@ -25,51 +25,51 @@ It is inspired by the [DBSP](https://arxiv.org/abs/2203.16684) differential data
 
 **PostgreSQL 18.x** exclusively. The extension uses features specific to PostgreSQL 18.
 
-### Does pg_stream require `wal_level = logical`?
+### Does pg_trickle require `wal_level = logical`?
 
-**No.** pg_stream uses lightweight row-level triggers for change data capture, not logical replication. You do not need to set `wal_level = logical` or configure `max_replication_slots`.
+**No.** pg_trickle uses lightweight row-level triggers for change data capture, not logical replication. You do not need to set `wal_level = logical` or configure `max_replication_slots`.
 
-### Is pg_stream production-ready?
+### Is pg_trickle production-ready?
 
-pg_stream is under active development. It has a comprehensive test suite (700+ unit tests, 290+ end-to-end tests), but users should evaluate it against their specific workloads before deploying to production.
+pg_trickle is under active development. It has a comprehensive test suite (700+ unit tests, 290+ end-to-end tests), but users should evaluate it against their specific workloads before deploying to production.
 
 ---
 
 ## Installation & Setup
 
-### How do I install pg_stream?
+### How do I install pg_trickle?
 
-1. Add `pg_stream` to `shared_preload_libraries` in `postgresql.conf`:
+1. Add `pg_trickle` to `shared_preload_libraries` in `postgresql.conf`:
    ```ini
-   shared_preload_libraries = 'pg_stream'
+   shared_preload_libraries = 'pg_trickle'
    ```
 2. Restart PostgreSQL.
 3. Run:
    ```sql
-   CREATE EXTENSION pg_stream;
+   CREATE EXTENSION pg_trickle;
    ```
 
 See [INSTALL.md](../INSTALL.md) for platform-specific instructions and pre-built release artifacts.
 
 ### What are the minimum configuration requirements?
 
-Only `shared_preload_libraries = 'pg_stream'` is mandatory (requires a restart). All other settings have sensible defaults. `max_worker_processes = 8` is recommended.
+Only `shared_preload_libraries = 'pg_trickle'` is mandatory (requires a restart). All other settings have sensible defaults. `max_worker_processes = 8` is recommended.
 
-### Can I install pg_stream on a managed PostgreSQL service (RDS, Cloud SQL, etc.)?
+### Can I install pg_trickle on a managed PostgreSQL service (RDS, Cloud SQL, etc.)?
 
-It depends on whether the service allows custom extensions and `shared_preload_libraries`. Since pg_stream does **not** require `wal_level = logical`, it avoids one of the most common restrictions on managed services. Check your provider's documentation for custom extension support.
+It depends on whether the service allows custom extensions and `shared_preload_libraries`. Since pg_trickle does **not** require `wal_level = logical`, it avoids one of the most common restrictions on managed services. Check your provider's documentation for custom extension support.
 
-### How do I uninstall pg_stream?
+### How do I uninstall pg_trickle?
 
 1. Drop all stream tables first (or they will be cascade-dropped):
    ```sql
-   SELECT pgstream.drop_stream_table(pgs_name) FROM pgstream.pgs_stream_tables;
+   SELECT pgtrickle.drop_stream_table(pgt_name) FROM pgtrickle.pgt_stream_tables;
    ```
 2. Drop the extension:
    ```sql
-   DROP EXTENSION pg_stream CASCADE;
+   DROP EXTENSION pg_trickle CASCADE;
    ```
-3. Remove `pg_stream` from `shared_preload_libraries` and restart PostgreSQL.
+3. Remove `pg_trickle` from `shared_preload_libraries` and restart PostgreSQL.
 
 ---
 
@@ -78,7 +78,7 @@ It depends on whether the service allows custom extensions and `shared_preload_l
 ### How do I create a stream table?
 
 ```sql
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_totals',                                           -- name
     'SELECT customer_id, SUM(amount) AS total
      FROM orders GROUP BY customer_id',                       -- defining query
@@ -127,7 +127,7 @@ Use **FULL** when:
 
 ### What is the minimum allowed schedule?
 
-The `pg_stream.min_schedule_seconds` GUC (default: `60`) sets the floor. Schedules shorter than this value are rejected. Set to `1` for development/testing.
+The `pg_trickle.min_schedule_seconds` GUC (default: `60`) sets the floor. Schedules shorter than this value are rejected. Set to `1` for development/testing.
 
 ### Can a stream table reference another stream table?
 
@@ -135,13 +135,13 @@ The `pg_stream.min_schedule_seconds` GUC (default: `60`) sets the floor. Schedul
 
 ```sql
 -- ST1: aggregates orders
-SELECT pgstream.create_stream_table('order_totals',
+SELECT pgtrickle.create_stream_table('order_totals',
     'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
     '1m', 'DIFFERENTIAL');
 
 -- ST2: filters ST1
-SELECT pgstream.create_stream_table('big_customers',
-    'SELECT customer_id, total FROM pgstream.order_totals WHERE total > 1000',
+SELECT pgtrickle.create_stream_table('big_customers',
+    'SELECT customer_id, total FROM pgtrickle.order_totals WHERE total > 1000',
     '1m', 'DIFFERENTIAL');
 ```
 
@@ -149,16 +149,16 @@ SELECT pgstream.create_stream_table('big_customers',
 
 ```sql
 -- Change schedule
-SELECT pgstream.alter_stream_table('order_totals', schedule => '10m');
+SELECT pgtrickle.alter_stream_table('order_totals', schedule => '10m');
 
 -- Switch refresh mode
-SELECT pgstream.alter_stream_table('order_totals', refresh_mode => 'FULL');
+SELECT pgtrickle.alter_stream_table('order_totals', refresh_mode => 'FULL');
 
 -- Suspend
-SELECT pgstream.alter_stream_table('order_totals', status => 'SUSPENDED');
+SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');
 
 -- Resume
-SELECT pgstream.alter_stream_table('order_totals', status => 'ACTIVE');
+SELECT pgtrickle.alter_stream_table('order_totals', status => 'ACTIVE');
 ```
 
 ### Can I change the defining query of a stream table?
@@ -166,17 +166,17 @@ SELECT pgstream.alter_stream_table('order_totals', status => 'ACTIVE');
 Not directly. You must drop and recreate the stream table:
 
 ```sql
-SELECT pgstream.drop_stream_table('order_totals');
-SELECT pgstream.create_stream_table('order_totals', '<new query>', '5m', 'DIFFERENTIAL');
+SELECT pgtrickle.drop_stream_table('order_totals');
+SELECT pgtrickle.create_stream_table('order_totals', '<new query>', '5m', 'DIFFERENTIAL');
 ```
 
 ### How do I trigger a manual refresh?
 
 ```sql
-SELECT pgstream.refresh_stream_table('order_totals');
+SELECT pgtrickle.refresh_stream_table('order_totals');
 ```
 
-This works even when `pg_stream.enabled = false` (scheduler disabled).
+This works even when `pg_trickle.enabled = false` (scheduler disabled).
 
 ---
 
@@ -240,9 +240,9 @@ Each rejected feature is explained in detail in the [Why Are These SQL Features 
 
 ## Change Data Capture (CDC)
 
-### How does pg_stream capture changes to source tables?
+### How does pg_trickle capture changes to source tables?
 
-pg_stream installs `AFTER INSERT/UPDATE/DELETE` row-level PL/pgSQL triggers on each source table. These triggers write change records (action, old/new row data as JSONB, LSN, transaction ID) into per-source buffer tables in the `pgstream_changes` schema.
+pg_trickle installs `AFTER INSERT/UPDATE/DELETE` row-level PL/pgSQL triggers on each source table. These triggers write change records (action, old/new row data as JSONB, LSN, transaction ID) into per-source buffer tables in the `pgtrickle_changes` schema.
 
 ### What is the overhead of CDC triggers?
 
@@ -260,21 +260,21 @@ Yes. When the last stream table referencing a source is dropped, the trigger and
 
 ### What happens if a source table is dropped or altered?
 
-pg_stream has DDL event triggers that detect `ALTER TABLE` and `DROP TABLE` on source tables. When detected:
+pg_trickle has DDL event triggers that detect `ALTER TABLE` and `DROP TABLE` on source tables. When detected:
 - Affected stream tables are marked with `needs_reinit = true`
 - The next refresh cycle performs a full reinitialization (drops and recreates the storage table)
 - A `reinitialize_needed` NOTIFY alert is sent
 
 ### How do I check if a source table has switched from trigger-based CDC to WAL-based CDC?
 
-When you enable hybrid CDC (`pg_stream.cdc_mode = 'auto'`), pg_stream starts capturing changes with triggers and can automatically transition to WAL-based logical replication once conditions are met. There are several ways to check the current CDC mode for each source table:
+When you enable hybrid CDC (`pg_trickle.cdc_mode = 'auto'`), pg_trickle starts capturing changes with triggers and can automatically transition to WAL-based logical replication once conditions are met. There are several ways to check the current CDC mode for each source table:
 
 **1. Query the dependency catalog directly:**
 
 ```sql
 SELECT d.source_relid, c.relname AS source_table, d.cdc_mode,
        d.slot_name, d.decoder_confirmed_lsn, d.transition_started_at
-FROM pgstream.pgs_dependencies d
+FROM pgtrickle.pgt_dependencies d
 JOIN pg_class c ON c.oid = d.source_relid;
 ```
 
@@ -287,7 +287,7 @@ The `cdc_mode` column shows one of three values:
 
 ```sql
 SELECT source_table, cdc_mode, slot_name, lag_bytes, alert
-FROM pgstream.check_cdc_health();
+FROM pgtrickle.check_cdc_health();
 ```
 
 This returns a row per source table with the current mode, replication slot lag (for WAL-mode sources), and any alert conditions such as `slot_lag_exceeds_threshold` or `replication_slot_missing`.
@@ -295,10 +295,10 @@ This returns a row per source table with the current mode, replication slot lag 
 **3. Listen for real-time transition notifications:**
 
 ```sql
-LISTEN pg_stream_cdc_transition;
+LISTEN pg_trickle_cdc_transition;
 ```
 
-pg_stream sends a `NOTIFY` with a JSON payload whenever a transition starts, completes, or is rolled back. Example payload:
+pg_trickle sends a `NOTIFY` with a JSON payload whenever a transition starts, completes, or is rolled back. Example payload:
 
 ```json
 {
@@ -306,7 +306,7 @@ pg_stream sends a `NOTIFY` with a JSON payload whenever a transition starts, com
   "source_table": "public.orders",
   "old_mode": "TRANSITIONING",
   "new_mode": "WAL",
-  "slot_name": "pg_stream_slot_16384"
+  "slot_name": "pg_trickle_slot_16384"
 }
 ```
 
@@ -315,12 +315,12 @@ This lets you integrate CDC mode changes into your monitoring stack without poll
 **4. Check the global GUC setting:**
 
 ```sql
-SHOW pg_stream.cdc_mode;
+SHOW pg_trickle.cdc_mode;
 ```
 
-This shows the *desired* global behavior (`trigger`, `auto`, or `wal`), not the per-table actual state. The per-table state lives in `pgs_dependencies.cdc_mode` as described above.
+This shows the *desired* global behavior (`trigger`, `auto`, or `wal`), not the per-table actual state. The per-table state lives in `pgt_dependencies.cdc_mode` as described above.
 
-See [CONFIGURATION.md](CONFIGURATION.md) for details on the `pg_stream.cdc_mode` and `pg_stream.wal_transition_timeout` GUCs.
+See [CONFIGURATION.md](CONFIGURATION.md) for details on the `pg_trickle.cdc_mode` and `pg_trickle.wal_transition_timeout` GUCs.
 
 ### Is it safe to add triggers to a stream table while the source table is switching CDC modes?
 
@@ -345,7 +345,7 @@ A trigger added between two refresh cycles will simply be picked up on the next 
 
 ### How do I tune the scheduler interval?
 
-The `pg_stream.scheduler_interval_ms` GUC controls how often the scheduler checks for stale stream tables (default: 1000 ms).
+The `pg_trickle.scheduler_interval_ms` GUC controls how often the scheduler checks for stale stream tables (default: 1000 ms).
 
 | Workload | Recommended Value |
 |---|---|
@@ -355,7 +355,7 @@ The `pg_stream.scheduler_interval_ms` GUC controls how often the scheduler check
 
 ### What is the adaptive fallback to FULL?
 
-When the number of pending changes exceeds `pg_stream.differential_max_change_ratio` (default: 15%) of the source table size, DIFFERENTIAL mode automatically falls back to FULL for that refresh cycle. This prevents pathological delta queries on bulk changes.
+When the number of pending changes exceeds `pg_trickle.differential_max_change_ratio` (default: 15%) of the source table size, DIFFERENTIAL mode automatically falls back to FULL for that refresh cycle. This prevents pathological delta queries on bulk changes.
 
 - Set to `0.0` to always use DIFFERENTIAL (even on large change sets)
 - Set to `1.0` to effectively always use FULL
@@ -363,26 +363,26 @@ When the number of pending changes exceeds `pg_stream.differential_max_change_ra
 
 ### How many concurrent refreshes can run?
 
-Controlled by `pg_stream.max_concurrent_refreshes` (default: 4, range: 1–32). Each concurrent refresh uses a background worker. Increase this if you have many stream tables and available CPU/IO.
+Controlled by `pg_trickle.max_concurrent_refreshes` (default: 4, range: 1–32). Each concurrent refresh uses a background worker. Increase this if you have many stream tables and available CPU/IO.
 
 ### How do I check if my stream tables are keeping up?
 
 ```sql
 -- Quick overview
-SELECT pgs_name, status, staleness, stale
-FROM pgstream.stream_tables_info;
+SELECT pgt_name, status, staleness, stale
+FROM pgtrickle.stream_tables_info;
 
 -- Detailed statistics
-SELECT pgs_name, total_refreshes, avg_duration_ms, consecutive_errors, stale
-FROM pgstream.pg_stat_stream_tables;
+SELECT pgt_name, total_refreshes, avg_duration_ms, consecutive_errors, stale
+FROM pgtrickle.pg_stat_stream_tables;
 
 -- Recent refresh history for a specific ST
-SELECT * FROM pgstream.get_refresh_history('order_totals', 10);
+SELECT * FROM pgtrickle.get_refresh_history('order_totals', 10);
 ```
 
-### What is `__pgs_row_id`?
+### What is `__pgt_row_id`?
 
-Every stream table has a `__pgs_row_id BIGINT PRIMARY KEY` column. It stores a 64-bit xxHash of the row's group-by key (or all columns for non-aggregate queries). The refresh engine uses it for delta `MERGE` operations (matching DELETEs and INSERTs by row ID).
+Every stream table has a `__pgt_row_id BIGINT PRIMARY KEY` column. It stores a 64-bit xxHash of the row's group-by key (or all columns for non-aggregate queries). The refresh engine uses it for delta `MERGE` operations (matching DELETEs and INSERTs by row ID).
 
 **You should ignore this column in your queries.** It is an implementation detail.
 
@@ -403,13 +403,13 @@ Every stream table has a `__pgs_row_id BIGINT PRIMARY KEY` column. It stores a 6
 **Yes.** Stream tables can be published like any ordinary table:
 
 ```sql
-CREATE PUBLICATION my_pub FOR TABLE pgstream.order_totals;
+CREATE PUBLICATION my_pub FOR TABLE pgtrickle.order_totals;
 ```
 
 **Important caveats:**
-- The `__pgs_row_id` column is replicated (it is the primary key)
+- The `__pgt_row_id` column is replicated (it is the primary key)
 - Subscribers receive materialized data, not the defining query
-- Do **not** install pg_stream on the subscriber and attempt to refresh the replicated table — it will have no CDC triggers or catalog entries
+- Do **not** install pg_trickle on the subscriber and attempt to refresh the replicated table — it will have no CDC triggers or catalog entries
 - Internal change buffer tables are not published by default
 
 ### Can I `INSERT`, `UPDATE`, or `DELETE` rows in a stream table directly?
@@ -422,18 +422,18 @@ CREATE PUBLICATION my_pub FOR TABLE pgstream.order_totals;
 
 ### Can I add my own triggers to stream tables?
 
-**Yes, for DIFFERENTIAL mode stream tables.** When user-defined row-level triggers are detected (or `pg_stream.user_triggers = 'on'`), the refresh engine automatically switches from `MERGE` to explicit `DELETE` + `UPDATE` + `INSERT` statements. This ensures triggers fire with the correct `TG_OP`, `OLD`, and `NEW` values.
+**Yes, for DIFFERENTIAL mode stream tables.** When user-defined row-level triggers are detected (or `pg_trickle.user_triggers = 'on'`), the refresh engine automatically switches from `MERGE` to explicit `DELETE` + `UPDATE` + `INSERT` statements. This ensures triggers fire with the correct `TG_OP`, `OLD`, and `NEW` values.
 
 **Limitations:**
 - Row-level triggers do **not** fire during FULL refresh (they are automatically suppressed via `DISABLE TRIGGER USER`). Use `REFRESH MODE DIFFERENTIAL` for stream tables with triggers.
 - The `IS DISTINCT FROM` guard prevents no-op `UPDATE` triggers when the aggregate result is unchanged.
 - `BEFORE` triggers that modify `NEW` will affect the stored value — the next refresh may "correct" it back, causing oscillation.
 
-See the `pg_stream.user_triggers` GUC in [CONFIGURATION.md](CONFIGURATION.md) for control options.
+See the `pg_trickle.user_triggers` GUC in [CONFIGURATION.md](CONFIGURATION.md) for control options.
 
 ### Can I `ALTER TABLE` a stream table directly?
 
-**No.** Use `pgstream.alter_stream_table()` to modify schedule, refresh mode, or status. To change the defining query, drop and recreate the stream table.
+**No.** Use `pgtrickle.alter_stream_table()` to modify schedule, refresh mode, or status. To change the defining query, drop and recreate the stream table.
 
 ---
 
@@ -443,12 +443,12 @@ See the `pg_stream.user_triggers` GUC in [CONFIGURATION.md](CONFIGURATION.md) fo
 
 | View | Description |
 |---|---|
-| `pgstream.stream_tables_info` | Status overview with computed staleness |
-| `pgstream.pg_stat_stream_tables` | Comprehensive stats (refresh counts, avg duration, error streaks) |
+| `pgtrickle.stream_tables_info` | Status overview with computed staleness |
+| `pgtrickle.pg_stat_stream_tables` | Comprehensive stats (refresh counts, avg duration, error streaks) |
 
 ### How do I get alerted when something goes wrong?
 
-pg_stream sends PostgreSQL `NOTIFY` messages on the `pg_stream_alert` channel with JSON payloads:
+pg_trickle sends PostgreSQL `NOTIFY` messages on the `pg_trickle_alert` channel with JSON payloads:
 
 | Event | When |
 |---|---|
@@ -461,17 +461,17 @@ pg_stream sends PostgreSQL `NOTIFY` messages on the `pg_stream_alert` channel wi
 
 Listen with:
 ```sql
-LISTEN pg_stream_alert;
+LISTEN pg_trickle_alert;
 ```
 
 ### What happens when a stream table keeps failing?
 
-After `pg_stream.max_consecutive_errors` (default: 3) consecutive failures, the stream table moves to `ERROR` status and automatic refreshes stop. An `auto_suspended` NOTIFY alert is sent.
+After `pg_trickle.max_consecutive_errors` (default: 3) consecutive failures, the stream table moves to `ERROR` status and automatic refreshes stop. An `auto_suspended` NOTIFY alert is sent.
 
 To recover:
 ```sql
 -- Fix the underlying issue (e.g., restore a dropped source table), then:
-SELECT pgstream.alter_stream_table('my_table', status => 'ACTIVE');
+SELECT pgtrickle.alter_stream_table('my_table', status => 'ACTIVE');
 ```
 
 Retries use exponential backoff (base 1s, max 60s, ±25% jitter, up to 5 retries before counting as a real failure).
@@ -482,15 +482,15 @@ Retries use exponential backoff (base 1s, max 60s, ±25% jitter, up to 5 retries
 
 | GUC | Type | Default | Description |
 |---|---|---|---|
-| `pg_stream.enabled` | bool | `true` | Enable/disable the scheduler. Manual refreshes still work when `false`. |
-| `pg_stream.scheduler_interval_ms` | int | `1000` | Scheduler wake interval in milliseconds (100–60000) |
-| `pg_stream.min_schedule_seconds` | int | `60` | Minimum allowed schedule duration (1–86400) |
-| `pg_stream.max_consecutive_errors` | int | `3` | Failures before auto-suspending (1–100) |
-| `pg_stream.change_buffer_schema` | text | `pgstream_changes` | Schema for CDC buffer tables |
-| `pg_stream.max_concurrent_refreshes` | int | `4` | Max parallel refresh workers (1–32) |
-| `pg_stream.user_triggers` | text | `auto` | User trigger handling: `auto` (detect), `on` (always explicit DML), `off` (suppress) |
-| `pg_stream.differential_max_change_ratio` | float | `0.15` | Change ratio threshold for adaptive FULL fallback (0.0–1.0) |
-| `pg_stream.cleanup_use_truncate` | bool | `true` | Use TRUNCATE instead of DELETE for buffer cleanup |
+| `pg_trickle.enabled` | bool | `true` | Enable/disable the scheduler. Manual refreshes still work when `false`. |
+| `pg_trickle.scheduler_interval_ms` | int | `1000` | Scheduler wake interval in milliseconds (100–60000) |
+| `pg_trickle.min_schedule_seconds` | int | `60` | Minimum allowed schedule duration (1–86400) |
+| `pg_trickle.max_consecutive_errors` | int | `3` | Failures before auto-suspending (1–100) |
+| `pg_trickle.change_buffer_schema` | text | `pgtrickle_changes` | Schema for CDC buffer tables |
+| `pg_trickle.max_concurrent_refreshes` | int | `4` | Max parallel refresh workers (1–32) |
+| `pg_trickle.user_triggers` | text | `auto` | User trigger handling: `auto` (detect), `on` (always explicit DML), `off` (suppress) |
+| `pg_trickle.differential_max_change_ratio` | float | `0.15` | Change ratio threshold for adaptive FULL fallback (0.0–1.0) |
+| `pg_trickle.cleanup_use_truncate` | bool | `true` | Use TRUNCATE instead of DELETE for buffer cleanup |
 
 All GUCs are `SUSET` context (superuser SET) and take effect without restart, except `shared_preload_libraries` which requires a PostgreSQL restart.
 
@@ -525,20 +525,20 @@ See the [Installation Guide](../INSTALL.md#unit-tests-crash-on-macos-26-symbol-n
 
 The initial full refresh may have failed. Check:
 ```sql
-SELECT * FROM pgstream.get_refresh_history('my_table', 5);
+SELECT * FROM pgtrickle.get_refresh_history('my_table', 5);
 ```
 If the error is transient, retry with:
 ```sql
-SELECT pgstream.refresh_stream_table('my_table');
+SELECT pgtrickle.refresh_stream_table('my_table');
 ```
 
 ### My stream table shows stale data but the scheduler is running
 
 Common causes:
 1. **TRUNCATE on source table** — bypasses CDC triggers. Manual refresh needed.
-2. **Too many errors** — check `consecutive_errors` in `pgstream.pg_stat_stream_tables`. Resume with `ALTER ... status => 'ACTIVE'`.
+2. **Too many errors** — check `consecutive_errors` in `pgtrickle.pg_stat_stream_tables`. Resume with `ALTER ... status => 'ACTIVE'`.
 3. **Long-running refresh** — check for lock contention or slow defining queries.
-4. **Scheduler disabled** — verify `SHOW pg_stream.enabled;` returns `on`.
+4. **Scheduler disabled** — verify `SHOW pg_trickle.enabled;` returns `on`.
 
 ### I get "cycle detected" when creating a stream table
 
@@ -546,12 +546,12 @@ Stream tables cannot have circular dependencies. If ST-A depends on ST-B and ST-
 
 ### A source table was altered and my stream table stopped refreshing
 
-pg_stream detects DDL changes via event triggers and marks affected stream tables with `needs_reinit = true`. The next scheduler cycle will reinitialize (full drop + recreate of storage) the stream table automatically. If the schema change breaks the defining query, the reinitialization will fail — check refresh history for the error and recreate the stream table with an updated query.
+pg_trickle detects DDL changes via event triggers and marks affected stream tables with `needs_reinit = true`. The next scheduler cycle will reinitialize (full drop + recreate of storage) the stream table automatically. If the schema change breaks the defining query, the reinitialization will fail — check refresh history for the error and recreate the stream table with an updated query.
 
 ### How do I see the delta query generated for a stream table?
 
 ```sql
-SELECT pgstream.explain_st('order_totals');
+SELECT pgtrickle.explain_st('order_totals');
 ```
 
 This shows the DVM operator tree, source tables, and the generated delta SQL.
@@ -560,21 +560,21 @@ This shows the DVM operator tree, source tables, and the generated delta SQL.
 
 ## Why Are These SQL Features Not Supported?
 
-This section gives detailed technical explanations for each SQL limitation. pg_stream follows the principle of **"fail loudly rather than produce wrong data"** — every unsupported feature is detected at stream-table creation time and rejected with a clear error message and a suggested rewrite.
+This section gives detailed technical explanations for each SQL limitation. pg_trickle follows the principle of **"fail loudly rather than produce wrong data"** — every unsupported feature is detected at stream-table creation time and rejected with a clear error message and a suggested rewrite.
 
 ### How does `NATURAL JOIN` work?
 
-`NATURAL JOIN` is **now fully supported**. At parse time, pg_stream resolves the common columns between the two tables (using `OpTree::output_columns()`) and synthesizes explicit equi-join conditions. This supports `INNER`, `LEFT`, `RIGHT`, and `FULL` NATURAL JOIN variants.
+`NATURAL JOIN` is **now fully supported**. At parse time, pg_trickle resolves the common columns between the two tables (using `OpTree::output_columns()`) and synthesizes explicit equi-join conditions. This supports `INNER`, `LEFT`, `RIGHT`, and `FULL` NATURAL JOIN variants.
 
 Internally, `NATURAL JOIN` is converted to an explicit `JOIN ... ON` before the DVM engine builds its operator tree, so delta computation works identically to a manually specified equi-join.
 
-**Note:** The internal `__pgs_row_id` column is excluded from common column resolution, so NATURAL JOINs between stream tables work correctly.
+**Note:** The internal `__pgt_row_id` column is excluded from common column resolution, so NATURAL JOINs between stream tables work correctly.
 
 ### How do `GROUPING SETS`, `CUBE`, and `ROLLUP` work?
 
-`GROUPING SETS`, `CUBE`, and `ROLLUP` are **now fully supported** via an automatic parse-time rewrite. pg_stream decomposes these constructs into a `UNION ALL` of separate `GROUP BY` queries before the DVM engine processes the query.
+`GROUPING SETS`, `CUBE`, and `ROLLUP` are **now fully supported** via an automatic parse-time rewrite. pg_trickle decomposes these constructs into a `UNION ALL` of separate `GROUP BY` queries before the DVM engine processes the query.
 
-> **Explosion guard:** `CUBE(N)` generates $2^N$ branches. pg_stream rejects
+> **Explosion guard:** `CUBE(N)` generates $2^N$ branches. pg_trickle rejects
 > CUBE/ROLLUP combinations that would produce more than **64 branches** to
 > prevent runaway memory usage. Use explicit `GROUPING SETS(...)` instead.
 
@@ -597,7 +597,7 @@ SELECT NULL::text, NULL::text, SUM(amount) FROM sales
 
 ### How does `DISTINCT ON (…)` work?
 
-`DISTINCT ON` is **now fully supported** via an automatic parse-time rewrite. pg_stream transparently transforms `DISTINCT ON` into a `ROW_NUMBER()` window function subquery:
+`DISTINCT ON` is **now fully supported** via an automatic parse-time rewrite. pg_trickle transparently transforms `DISTINCT ON` into a `ROW_NUMBER()` window function subquery:
 
 ```sql
 -- This defining query:
@@ -658,7 +658,7 @@ Window functions like `ROW_NUMBER() OVER (…)` are supported as **standalone co
 
 This restriction exists because:
 
-1. **Partition-based recomputation.** pg_stream's differential mode handles window functions by recomputing entire partitions that were affected by changes. When a window function is buried inside an expression, the DVM engine cannot isolate the window computation from the surrounding expression, making it impossible to correctly identify which partitions to recompute.
+1. **Partition-based recomputation.** pg_trickle's differential mode handles window functions by recomputing entire partitions that were affected by changes. When a window function is buried inside an expression, the DVM engine cannot isolate the window computation from the surrounding expression, making it impossible to correctly identify which partitions to recompute.
 
 2. **Expression tree ambiguity.** The DVM parser would need to differentiate the outer expression (arithmetic, `CASE`, etc.) while treating the inner window function specially. This creates a combinatorial explosion of differentiation rules for every possible expression type × window function combination.
 
@@ -677,7 +677,7 @@ FROM employees
 
 -- ST2 (references ST1):
 SELECT id, CASE WHEN rn = 1 THEN 'top' ELSE 'other' END AS rank_label
-FROM pgstream.employees_ranked
+FROM pgtrickle.employees_ranked
 ```
 
 ### Why is `FOR UPDATE` / `FOR SHARE` rejected?
@@ -692,7 +692,7 @@ FROM pgstream.employees_ranked
 
 `ALL (subquery)` compares a value against every row returned by a subquery (e.g., `WHERE x > ALL (SELECT y FROM t)`). It is rejected because:
 
-1. **Negation rewrite complexity.** `x > ALL (SELECT y FROM t)` is logically equivalent to `NOT EXISTS (SELECT 1 FROM t WHERE y >= x)`, which pg_stream can handle via its anti-join operator. The rewrite is straightforward.
+1. **Negation rewrite complexity.** `x > ALL (SELECT y FROM t)` is logically equivalent to `NOT EXISTS (SELECT 1 FROM t WHERE y >= x)`, which pg_trickle can handle via its anti-join operator. The rewrite is straightforward.
 
 2. **Rare usage.** `ALL (subquery)` is uncommon in analytical queries. Supporting it directly would add operator complexity for minimal benefit.
 
@@ -739,7 +739,7 @@ Stream tables are regular PostgreSQL heap tables under the hood, but their conte
 
 Stream table contents are the **output** of the refresh engine — they represent the materialized result of the defining query at a specific point in time. Direct DML would corrupt this contract in several ways:
 
-1. **Row ID integrity.** Every row has a `__pgs_row_id` (a 64-bit xxHash of the group-by key or all columns). The refresh engine uses this for delta `MERGE` — matching incoming deltas against existing rows. A manually inserted row with an incorrect or duplicate `__pgs_row_id` would cause the next differential refresh to produce wrong results (double-counting, missed deletes, or merge conflicts).
+1. **Row ID integrity.** Every row has a `__pgt_row_id` (a 64-bit xxHash of the group-by key or all columns). The refresh engine uses this for delta `MERGE` — matching incoming deltas against existing rows. A manually inserted row with an incorrect or duplicate `__pgt_row_id` would cause the next differential refresh to produce wrong results (double-counting, missed deletes, or merge conflicts).
 
 2. **Frontier inconsistency.** Each refresh records a *frontier* — a set of per-source LSN positions that represent "data up to this point has been materialized." A manual DML change is not tracked by any frontier. The next differential refresh would either overwrite the change (if the delta touches the same row) or leave the stream table in a state that doesn't match any consistent point-in-time snapshot of the source data.
 
@@ -761,41 +761,41 @@ Foreign key constraints require that referenced/referencing rows exist at the ti
 
 ### How do user-defined triggers work on stream tables?
 
-When a DIFFERENTIAL mode stream table has user-defined row-level triggers (or `pg_stream.user_triggers = 'on'`), the refresh engine uses **explicit DML decomposition** instead of `MERGE`:
+When a DIFFERENTIAL mode stream table has user-defined row-level triggers (or `pg_trickle.user_triggers = 'on'`), the refresh engine uses **explicit DML decomposition** instead of `MERGE`:
 
-1. **Delta materialized once.** The delta query result is stored in a temporary table (`__pgs_delta_<id>`) to avoid evaluating it three times.
+1. **Delta materialized once.** The delta query result is stored in a temporary table (`__pgt_delta_<id>`) to avoid evaluating it three times.
 
-2. **DELETE removed rows.** Rows in the stream table whose `__pgs_row_id` is absent from the delta are deleted. `AFTER DELETE` triggers fire with correct `OLD` values.
+2. **DELETE removed rows.** Rows in the stream table whose `__pgt_row_id` is absent from the delta are deleted. `AFTER DELETE` triggers fire with correct `OLD` values.
 
-3. **UPDATE changed rows.** Rows whose `__pgs_row_id` exists in both the stream table and delta but whose values differ (checked via `IS DISTINCT FROM`) are updated. `AFTER UPDATE` triggers fire with correct `OLD` and `NEW`. No-op updates (where values are identical) are skipped, preventing spurious triggers.
+3. **UPDATE changed rows.** Rows whose `__pgt_row_id` exists in both the stream table and delta but whose values differ (checked via `IS DISTINCT FROM`) are updated. `AFTER UPDATE` triggers fire with correct `OLD` and `NEW`. No-op updates (where values are identical) are skipped, preventing spurious triggers.
 
-4. **INSERT new rows.** Rows in the delta whose `__pgs_row_id` is absent from the stream table are inserted. `AFTER INSERT` triggers fire with correct `NEW` values.
+4. **INSERT new rows.** Rows in the delta whose `__pgt_row_id` is absent from the stream table are inserted. `AFTER INSERT` triggers fire with correct `NEW` values.
 
-**FULL refresh behavior:** Row-level user triggers are automatically suppressed during FULL refresh via `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so listeners know a FULL refresh occurred. Use `REFRESH MODE DIFFERENTIAL` for stream tables that need per-row trigger semantics.
+**FULL refresh behavior:** Row-level user triggers are automatically suppressed during FULL refresh via `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER`. A `NOTIFY pgtrickle_refresh` is emitted so listeners know a FULL refresh occurred. Use `REFRESH MODE DIFFERENTIAL` for stream tables that need per-row trigger semantics.
 
 **Performance:** The explicit DML path adds ~25–60% overhead compared to MERGE for triggered stream tables. Stream tables without user triggers have zero overhead (only a fast `pg_trigger` check, <0.1 ms).
 
-**Control:** The `pg_stream.user_triggers` GUC controls this behavior:
+**Control:** The `pg_trickle.user_triggers` GUC controls this behavior:
 - `auto` (default): detect user triggers automatically
 - `on`: always use explicit DML (useful for testing)
 - `off`: always use MERGE, suppressing triggers
 
 ### Why can't I `ALTER TABLE` a stream table directly?
 
-Stream table metadata (defining query, schedule, refresh mode) is stored in the pg_stream catalog (`pgstream.pgs_stream_tables`). A direct `ALTER TABLE` would change the physical table without updating the catalog, causing:
+Stream table metadata (defining query, schedule, refresh mode) is stored in the pg_trickle catalog (`pgtrickle.pgt_stream_tables`). A direct `ALTER TABLE` would change the physical table without updating the catalog, causing:
 
 1. **Column mismatch.** If you add or remove columns, the refresh engine's cached delta query and `MERGE` statement would reference columns that no longer exist (or miss new ones), causing runtime errors.
 
-2. **`__pgs_row_id` invalidation.** The row ID hash is computed from the defining query's output columns. Altering the table schema without updating the defining query would make existing row IDs inconsistent with the new column set.
+2. **`__pgt_row_id` invalidation.** The row ID hash is computed from the defining query's output columns. Altering the table schema without updating the defining query would make existing row IDs inconsistent with the new column set.
 
-Use `pgstream.alter_stream_table()` to change schedule, refresh mode, or status. To change the defining query or column structure, drop and recreate the stream table.
+Use `pgtrickle.alter_stream_table()` to change schedule, refresh mode, or status. To change the defining query or column structure, drop and recreate the stream table.
 
 ### Why can't I `TRUNCATE` a stream table?
 
-`TRUNCATE` removes all rows instantly but does not update the pg_stream frontier or change buffers. After a `TRUNCATE`:
+`TRUNCATE` removes all rows instantly but does not update the pg_trickle frontier or change buffers. After a `TRUNCATE`:
 
 1. **Differential refresh sees no changes.** The frontier still records the last-processed LSN. No new source changes may have occurred, so the next differential refresh produces an empty delta — leaving the stream table empty even though the source still has data.
 
 2. **No recovery path for differential mode.** The refresh engine has no way to detect that the stream table was externally truncated. It assumes the current contents match the frontier.
 
-Use `pgstream.refresh_stream_table('my_table')` to force a full re-materialization, or drop and recreate the stream table if you need a clean slate.
+Use `pgtrickle.refresh_stream_table('my_table')` to force a full re-materialization, or drop and recreate the stream table if you need a clean slate.

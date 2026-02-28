@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Build the Docker image for pg_stream E2E integration tests.
+# Build the Docker image for pg_trickle E2E integration tests.
 #
 # This script builds a multi-stage Docker image that:
 #   1. Compiles the extension from source (Rust + cargo-pgrx)
@@ -14,7 +14,7 @@
 # =============================================================================
 set -euo pipefail
 
-IMAGE_NAME="pg_stream_e2e"
+IMAGE_NAME="pg_trickle_e2e"
 IMAGE_TAG="latest"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -51,5 +51,5 @@ echo ""
 echo "To test manually:"
 echo "  docker run --rm -d --name pgs-e2e -e POSTGRES_PASSWORD=postgres -p 15432:5432 ${IMAGE_NAME}:${IMAGE_TAG}"
 echo "  sleep 3"
-echo "  psql -h localhost -p 15432 -U postgres -c \"CREATE EXTENSION pg_stream;\""
+echo "  psql -h localhost -p 15432 -U postgres -c \"CREATE EXTENSION pg_trickle;\""
 echo "  docker stop pgs-e2e"

@@ -2,7 +2,7 @@
 
 > **Status:** Draft  
 > **Target version:** v1.0.0  
-> **Author:** pg_stream project
+> **Author:** pg_trickle project
 
 ---
 
@@ -25,12 +25,12 @@ All packages target **PostgreSQL 18** on **x86_64** and **aarch64**.
 ```toml
 # Cargo.toml — fields required by all packaging targets
 [package]
-name    = "pg_stream"
+name    = "pg_trickle"
 version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "PostgreSQL streaming tables with incremental view maintenance"
-repository  = "https://github.com/geir/pg-stream"
+repository  = "https://github.com/geir/pg-trickle"
 ```
 
 Required tools:
@@ -48,15 +48,15 @@ cargo install cargo-deb     # .deb builder
 
 ```json
 {
-  "name": "pg_stream",
+  "name": "pg_trickle",
   "abstract": "Streaming tables with incremental view maintenance for PostgreSQL 18",
   "version": "1.0.0",
-  "maintainer": "pg_stream contributors",
+  "maintainer": "pg_trickle contributors",
   "license": "apache_2_0",
   "provides": {
-    "pg_stream": {
+    "pg_trickle": {
       "abstract": "Streaming tables with IVM",
-      "file": "pg_stream.control",
+      "file": "pg_trickle.control",
       "docfile": "README.md",
       "version": "1.0.0"
     }
@@ -78,10 +78,10 @@ cargo install cargo-deb     # .deb builder
 cargo pgrx package --pg-config $(pg_config)
 
 # Verify the package structure
-ls target/release/pg_stream-pg18/
+ls target/release/pg_trickle-pg18/
 
 # Upload to PGXN (requires PGXN account + API key)
-pgxn upload pg_stream-1.0.0.zip
+pgxn upload pg_trickle-1.0.0.zip
 ```
 
 ### 3.3 CI job (`.github/workflows/pgxn.yml`)
@@ -98,7 +98,7 @@ jobs:
       - uses: pgxn/setup-pgxn@v1
         with: { pg-version: '18' }
       - run: cargo pgrx package --pg-config $(pg_config)
-      - run: pgxn upload pg_stream-${GITHUB_REF_NAME#v}.zip
+      - run: pgxn upload pg_trickle-${GITHUB_REF_NAME#v}.zip
         env:
           PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
           PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
@@ -112,15 +112,15 @@ jobs:
 
 ```toml
 [package.metadata.deb]
-name            = "postgresql-18-pg-stream"
+name            = "postgresql-18-pg-trickle"
 section         = "database"
 priority        = "optional"
 depends         = "postgresql-18"
 maintainer-scripts = "debian/"
 assets = [
-  ["target/release/pg_stream.so",   "usr/lib/postgresql/18/lib/", "755"],
-  ["pg_stream.control",             "usr/share/postgresql/18/extension/", "644"],
-  ["pg_stream--*.sql",              "usr/share/postgresql/18/extension/", "644"],
+  ["target/release/pg_trickle.so",   "usr/lib/postgresql/18/lib/", "755"],
+  ["pg_trickle.control",             "usr/share/postgresql/18/extension/", "644"],
+  ["pg_trickle--*.sql",              "usr/share/postgresql/18/extension/", "644"],
 ]
 ```
 
@@ -132,8 +132,8 @@ cargo deb --target x86_64-unknown-linux-gnu
 cargo deb --target aarch64-unknown-linux-gnu
 
 # Test install on clean PG18 system
-dpkg -i target/x86_64-unknown-linux-gnu/debian/postgresql-18-pg-stream_1.0.0_amd64.deb
-psql -c "CREATE EXTENSION pg_stream;"
+dpkg -i target/x86_64-unknown-linux-gnu/debian/postgresql-18-pg-trickle_1.0.0_amd64.deb
+psql -c "CREATE EXTENSION pg_trickle;"
 ```
 
 ### 4.3 PPA Hosting
@@ -146,10 +146,10 @@ psql -c "CREATE EXTENSION pg_stream;"
 
 ## 5. RPM / RHEL
 
-### 5.1 Spec file outline (`pg_stream.spec`)
+### 5.1 Spec file outline (`pg_trickle.spec`)
 
 ```spec
-Name:       pg_stream_18
+Name:       pg_trickle_18
 Version:    1.0.0
 Release:    1%{?dist}
 Summary:    PostgreSQL 18 streaming tables with IVM
@@ -158,16 +158,16 @@ Requires:   postgresql18
 
 %install
 install -d %{buildroot}%{_libdir}/pgsql/
-install -m 755 target/release/pg_stream.so %{buildroot}%{_libdir}/pgsql/
+install -m 755 target/release/pg_trickle.so %{buildroot}%{_libdir}/pgsql/
 install -d %{buildroot}%{_datadir}/pgsql/extension/
-install -m 644 pg_stream.control %{buildroot}%{_datadir}/pgsql/extension/
-install -m 644 pg_stream--*.sql  %{buildroot}%{_datadir}/pgsql/extension/
+install -m 644 pg_trickle.control %{buildroot}%{_datadir}/pgsql/extension/
+install -m 644 pg_trickle--*.sql  %{buildroot}%{_datadir}/pgsql/extension/
 ```
 
 ### 5.2 Build
 
 ```bash
-rpmbuild -ba pg_stream.spec
+rpmbuild -ba pg_trickle.spec
 ```
 
 Distribution: GitHub Releases initially; PGDG yum repository if community
@@ -182,16 +182,16 @@ Each package MUST be tested on a clean environment before release:
 ```bash
 # Debian
 docker run --rm -it ubuntu:24.04 bash -c "
-  apt-get install -y postgresql-18 ./postgresql-18-pg-stream_1.0.0_amd64.deb &&
+  apt-get install -y postgresql-18 ./postgresql-18-pg-trickle_1.0.0_amd64.deb &&
   pg_ctlcluster 18 main start &&
-  psql -U postgres -c 'CREATE EXTENSION pg_stream; SELECT pgstream.version();'
+  psql -U postgres -c 'CREATE EXTENSION pg_trickle; SELECT pgtrickle.version();'
 "
 
 # RPM
 docker run --rm -it rockylinux:9 bash -c "
-  dnf install -y postgresql18-server pg_stream_18-1.0.0-1.el9.x86_64.rpm &&
+  dnf install -y postgresql18-server pg_trickle_18-1.0.0-1.el9.x86_64.rpm &&
   postgresql-setup --initdb && systemctl start postgresql &&
-  psql -U postgres -c 'CREATE EXTENSION pg_stream; SELECT pgstream.version();'
+  psql -U postgres -c 'CREATE EXTENSION pg_trickle; SELECT pgtrickle.version();'
 "
 ```
 
@@ -208,7 +208,7 @@ Packaging jobs should only run on release tags (`v*`) to minimise spend.
 
 - [INSTALL.md](../../INSTALL.md)
 - [Cargo.toml](../../Cargo.toml)
-- [pg_stream.control](../../pg_stream.control)
+- [pg_trickle.control](../../pg_trickle.control)
 - [PLAN_VERSIONING.md](PLAN_VERSIONING.md)
 - [PLAN_DOCKER_IMAGE.md](PLAN_DOCKER_IMAGE.md)
 - [GITHUB_ACTIONS_COST.md](GITHUB_ACTIONS_COST.md)

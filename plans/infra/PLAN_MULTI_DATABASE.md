@@ -2,14 +2,14 @@
 
 > **Status:** Draft  
 > **Target version:** Post-1.0 (Scale S3)  
-> **Author:** pg_stream project
+> **Author:** pg_trickle project
 
 ---
 
 ## 1. Current Constraint
 
-pg_stream is locked to operating inside a **single PostgreSQL database** (the
-one where `CREATE EXTENSION pg_stream` was run). This is a fundamental
+pg_trickle is locked to operating inside a **single PostgreSQL database** (the
+one where `CREATE EXTENSION pg_trickle` was run). This is a fundamental
 architectural constraint, not a missing feature.
 
 Root causes:
@@ -17,10 +17,10 @@ Root causes:
 | Constraint | Why it matters |
 |-----------|---------------|
 | `Spi::connect()` executes in the extension's current database | Cross-database SPI is impossible in PostgreSQL |
-| Background worker registers at `_PG_init()` time | One BGW per `_PG_init` call — each database that loads `pg_stream` gets its own BGW slot |
+| Background worker registers at `_PG_init()` time | One BGW per `_PG_init` call — each database that loads `pg_trickle` gets its own BGW slot |
 | `pg_shmem_init!()` allocates fixed shared memory | The slot count is fixed at server start; must accommodate N databases |
 | Trigger catalog (`pg_trigger`) | Triggers target tables in the current database only |
-| Change buffer schema (`pgstream_changes`) | Lives in the extension's database |
+| Change buffer schema (`pgtrickle_changes`) | Lives in the extension's database |
 
 The multi-database constraint is therefore not a single code change but a set
 of **orthogonal problems** that interact.
@@ -31,8 +31,8 @@ of **orthogonal problems** that interact.
 
 ### Option A: Per-database background worker (current approach, scaled)
 
-**How it works today:** Each database that installs pg_stream gets one BGW slot
-when the server loads `shared_preload_libraries = 'pg_stream'`. The BGW
+**How it works today:** Each database that installs pg_trickle gets one BGW slot
+when the server loads `shared_preload_libraries = 'pg_trickle'`. The BGW
 connects to its own database.
 
 **Extension:** This already gives multi-database isolation for free — each
@@ -68,7 +68,7 @@ connection management.
 ### Option D: PostgreSQL logical replication + Subscriber
 
 Stream changes from source databases to a central "hub" database using logical
-replication. pg_stream operates only in the hub.
+replication. pg_trickle operates only in the hub.
 
 **Cost:** High — additional replication slots, latency, schema synchronization.  
 **Verdict: Viable as a separate architectural pattern, not an extension feature.**
@@ -77,13 +77,13 @@ replication. pg_stream operates only in the hub.
 
 ## 3. Schema Isolation Requirements
 
-Each database that installs pg_stream has:
+Each database that installs pg_trickle has:
 
 ```
 <database>/
-  pgstream.pgs_stream_tables        -- catalog
-  pgstream_changes.changes_<oid>    -- change buffers
-  pgstream.<function>               -- SQL API
+  pgtrickle.pgt_stream_tables        -- catalog
+  pgtrickle_changes.changes_<oid>    -- change buffers
+  pgtrickle.<function>               -- SQL API
 ```
 
 No cross-database state sharing is needed or desired. The per-database BGW
@@ -94,7 +94,7 @@ model (Option A) already satisfies this.
 ## 4. Shared Memory Considerations
 
 `pg_shmem_init!()` allocates a fixed `PgLwLock` and `PgAtomic` block at
-server start. If multiple databases load pg_stream, each gets its own shmem
+server start. If multiple databases load pg_trickle, each gets its own shmem
 block because each `_PG_init()` call is isolated per-database. Confirm this
 with a two-database smoke test.
 
@@ -105,20 +105,20 @@ with a two-database smoke test.
 ### Phase 1 (v0.3.0): Test and document multi-database
 
 - Add a multi-database E2E test: two databases on the same PG server, each
-  with `pg_stream` installed, verify independent BGWs.
+  with `pg_trickle` installed, verify independent BGWs.
 - Document memory and BGW slot consumption per database.
-- Expose `pg_stream.enabled` per-database to allow disabling in low-priority DBs.
+- Expose `pg_trickle.enabled` per-database to allow disabling in low-priority DBs.
 
 ### Phase 2 (Post-1.0): BGW pool sizing guidance
 
-- Add a GUC `pg_stream.max_databases` (informational; actual limit is
+- Add a GUC `pg_trickle.max_databases` (informational; actual limit is
   `max_worker_processes`).
-- Add a monitoring view `pgstream.server_worker_inventory` showing all
+- Add a monitoring view `pgtrickle.server_worker_inventory` showing all
   registered BGWs and their databases.
 
 ### Phase 3 (Post-1.0): External orchestrator integration
 
-- Document the `pgstream.manual_refresh(stream_table_name)` pattern for
+- Document the `pgtrickle.manual_refresh(stream_table_name)` pattern for
   external callers.
 - See [REPORT_PARALLELIZATION.md](../performance/REPORT_PARALLELIZATION.md) §D.
 
@@ -127,7 +127,7 @@ with a two-database smoke test.
 ## 6. Interaction with CNPG
 
 CNPG clusters can host multiple PostgreSQL databases. The per-database BGW
-model works transparently — each DB that has `pg_stream` installed will have
+model works transparently — each DB that has `pg_trickle` installed will have
 an active BGW. The CNPG `cluster-example.yaml` should document the
 `max_worker_processes` guidance.
 

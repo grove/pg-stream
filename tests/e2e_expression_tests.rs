@@ -376,7 +376,7 @@ async fn test_natural_join_accepted_via_rewrite() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('nat_join_st', \
+            "SELECT pgtrickle.create_stream_table('nat_join_st', \
              $$ SELECT t1.id, t1.val, t2.score FROM t1 NATURAL JOIN t2 $$, '1m', 'FULL')",
         )
         .await;
@@ -397,7 +397,7 @@ async fn test_distinct_on_accepted_via_rewrite() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('distinct_on_st', \
+            "SELECT pgtrickle.create_stream_table('distinct_on_st', \
              $$ SELECT DISTINCT ON (category) id, category, ts FROM logs ORDER BY category, ts DESC $$, '1m', 'FULL')",
         )
         .await;
@@ -419,7 +419,7 @@ async fn test_stddev_aggregate_supported_in_differential_mode() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('stddev_st', \
+            "SELECT pgtrickle.create_stream_table('stddev_st', \
              $$ SELECT grp, STDDEV(val) AS std FROM metrics GROUP BY grp $$, '1m', 'DIFFERENTIAL')",
         )
         .await;
@@ -479,7 +479,7 @@ async fn test_exists_subquery_in_where() {
         .await;
 
     // Refresh
-    db.execute("SELECT pgstream.refresh_stream_table('exists_st')")
+    db.execute("SELECT pgtrickle.refresh_stream_table('exists_st')")
         .await;
 
     // Only parents with children should appear (1 and 3)
@@ -705,7 +705,7 @@ async fn test_between_filter_differential_with_inserts() {
     // Insert new data and refresh
     db.execute("INSERT INTO sensor VALUES (3, 90), (4, 60)")
         .await;
-    db.execute("SELECT pgstream.refresh_stream_table('sensor_in_range')")
+    db.execute("SELECT pgtrickle.refresh_stream_table('sensor_in_range')")
         .await;
 
     let count = db.count("public.sensor_in_range").await;
@@ -734,7 +734,7 @@ async fn test_in_list_filter_differential_with_inserts() {
 
     db.execute("INSERT INTO items2 VALUES (3, 'C'), (4, 'D')")
         .await;
-    db.execute("SELECT pgstream.refresh_stream_table('cat_filter_st')")
+    db.execute("SELECT pgtrickle.refresh_stream_table('cat_filter_st')")
         .await;
 
     let count = db.count("public.cat_filter_st").await;

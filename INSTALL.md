@@ -20,9 +20,9 @@ Download the archive for your platform from the
 
 | Platform | Archive |
 |---|---|
-| Linux x86_64 | `pg_stream-<ver>-pg18-linux-amd64.tar.gz` |
-| macOS Apple Silicon | `pg_stream-<ver>-pg18-macos-arm64.tar.gz` |
-| Windows x64 | `pg_stream-<ver>-pg18-windows-amd64.zip` |
+| Linux x86_64 | `pg_trickle-<ver>-pg18-linux-amd64.tar.gz` |
+| macOS Apple Silicon | `pg_trickle-<ver>-pg18-macos-arm64.tar.gz` |
+| Windows x64 | `pg_trickle-<ver>-pg18-windows-amd64.zip` |
 
 Optionally verify the checksum against `SHA256SUMS.txt` from the same release:
 
@@ -35,8 +35,8 @@ sha256sum -c SHA256SUMS.txt
 **Linux / macOS:**
 
 ```bash
-tar xzf pg_stream-0.1.1-pg18-linux-amd64.tar.gz
-cd pg_stream-0.1.1-pg18-linux-amd64
+tar xzf pg_trickle-0.1.1-pg18-linux-amd64.tar.gz
+cd pg_trickle-0.1.1-pg18-linux-amd64
 
 sudo cp lib/*.so  "$(pg_config --pkglibdir)/"
 sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
@@ -45,8 +45,8 @@ sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
 **Windows (PowerShell):**
 
 ```powershell
-Expand-Archive pg_stream-0.1.1-pg18-windows-amd64.zip -DestinationPath .
-cd pg_stream-0.1.1-pg18-windows-amd64
+Expand-Archive pg_trickle-0.1.1-pg18-windows-amd64.zip -DestinationPath .
+cd pg_trickle-0.1.1-pg18-windows-amd64
 
 Copy-Item lib\*.dll  "$(pg_config --pkglibdir)\"
 Copy-Item extension\* "$(pg_config --sharedir)\extension\"
@@ -54,14 +54,14 @@ Copy-Item extension\* "$(pg_config --sharedir)\extension\"
 
 ### 3. Using with CloudNativePG (Kubernetes)
 
-pg_stream is distributed as an OCI extension image for use with
+pg_trickle is distributed as an OCI extension image for use with
 [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/).
 
 **Requirements:** Kubernetes 1.33+, CNPG 1.28+, PostgreSQL 18.
 
 ```bash
 # Pull the extension image
-docker pull ghcr.io/grove/pg_stream-ext:0.1.1
+docker pull ghcr.io/grove/pg_trickle-ext:0.1.1
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and
@@ -75,17 +75,17 @@ into a standard PostgreSQL container from a release archive:
 
 ```bash
 # Extract extension files from the release archive
-tar xzf pg_stream-0.1.1-pg18-linux-amd64.tar.gz
-cd pg_stream-0.1.1-pg18-linux-amd64
+tar xzf pg_trickle-0.1.1-pg18-linux-amd64.tar.gz
+cd pg_trickle-0.1.1-pg18-linux-amd64
 
 # Run PostgreSQL with the extension mounted
 docker run --rm \
-  -v $PWD/lib/pg_stream.so:/usr/lib/postgresql/18/lib/pg_stream.so:ro \
+  -v $PWD/lib/pg_trickle.so:/usr/lib/postgresql/18/lib/pg_trickle.so:ro \
   -v $PWD/extension/:/tmp/ext/:ro \
   -e POSTGRES_PASSWORD=postgres \
   postgres:18.1 \
   sh -c 'cp /tmp/ext/* /usr/share/postgresql/18/extension/ && \
-         exec postgres -c shared_preload_libraries=pg_stream'
+         exec postgres -c shared_preload_libraries=pg_trickle'
 ```
 
 ---
@@ -124,7 +124,7 @@ Add the following to `postgresql.conf` **before starting PostgreSQL**:
 
 ```ini
 # Required — loads the extension shared library at server start
-shared_preload_libraries = 'pg_stream'
+shared_preload_libraries = 'pg_trickle'
 
 # Recommended — must accommodate scheduler + refresh workers
 max_worker_processes = 8
@@ -145,15 +145,15 @@ systemctl restart postgresql
 Connect to the target database and run:
 
 ```sql
-CREATE EXTENSION pg_stream;
+CREATE EXTENSION pg_trickle;
 ```
 
 This creates:
 
-- The `pgstream` schema with catalog tables and SQL functions
-- The `pgstream_changes` schema for change buffer tables
+- The `pgtrickle` schema with catalog tables and SQL functions
+- The `pgtrickle_changes` schema for change buffer tables
 - Event triggers for DDL tracking
-- The `pgstream.pg_stat_stream_tables` monitoring view
+- The `pgtrickle.pg_stat_stream_tables` monitoring view
 
 ## Verification
 
@@ -161,42 +161,42 @@ After installation, verify everything is working:
 
 ```sql
 -- Check the extension version
-SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_stream';
+SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';
 
 -- Or get a full status overview (includes version, scheduler state, stream table count)
-SELECT * FROM pgstream.pgs_status();
+SELECT * FROM pgtrickle.pgt_status();
 ```
 
 ### Inspecting the installation
 
 ```sql
 -- Check the installed version
-SELECT extversion FROM pg_extension WHERE extname = 'pg_stream';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle';
 
 -- Check which schemas were created
 SELECT schema_name
 FROM information_schema.schemata
-WHERE schema_name IN ('pgstream', 'pgstream_changes');
+WHERE schema_name IN ('pgtrickle', 'pgtrickle_changes');
 
 -- Check all registered GUC variables
-SHOW pg_stream.enabled;
-SHOW pg_stream.scheduler_interval_ms;
-SHOW pg_stream.max_concurrent_refreshes;
+SHOW pg_trickle.enabled;
+SHOW pg_trickle.scheduler_interval_ms;
+SHOW pg_trickle.max_concurrent_refreshes;
 
 -- Check the scheduler background worker is running
-SELECT * FROM pgstream.pgs_status();
+SELECT * FROM pgtrickle.pgt_status();
 
 -- List all stream tables
-SELECT pgs_schema, pgs_name, status, refresh_mode, is_populated
-FROM pgstream.pgs_stream_tables;
+SELECT pgt_schema, pgt_name, status, refresh_mode, is_populated
+FROM pgtrickle.pgt_stream_tables;
 
 -- Check that the shared library loaded correctly
-SELECT * FROM pg_extension WHERE extname = 'pg_stream';
+SELECT * FROM pg_extension WHERE extname = 'pg_trickle';
 
 -- Verify the catalog tables exist
 SELECT tablename
 FROM pg_tables
-WHERE schemaname = 'pgstream'
+WHERE schemaname = 'pgtrickle'
 ORDER BY tablename;
 ```
 
@@ -206,7 +206,7 @@ ORDER BY tablename;
 CREATE TABLE test_source (id INT PRIMARY KEY, val TEXT);
 INSERT INTO test_source VALUES (1, 'hello');
 
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'test_st',
     'SELECT id, val FROM test_source',
     '1m',
@@ -217,13 +217,13 @@ SELECT * FROM test_st;
 -- Should return: 1 | hello
 
 -- Clean up
-SELECT pgstream.drop_stream_table('test_st');
+SELECT pgtrickle.drop_stream_table('test_st');
 DROP TABLE test_source;
 ```
 
 ## Upgrading
 
-To upgrade pg_stream to a newer version without losing data:
+To upgrade pg_trickle to a newer version without losing data:
 
 ### 1. Install the new extension files
 
@@ -234,8 +234,8 @@ the extension from your databases first.
 **Linux / macOS:**
 
 ```bash
-tar xzf pg_stream-<new-ver>-pg18-linux-amd64.tar.gz
-cd pg_stream-<new-ver>-pg18-linux-amd64
+tar xzf pg_trickle-<new-ver>-pg18-linux-amd64.tar.gz
+cd pg_trickle-<new-ver>-pg18-linux-amd64
 
 sudo cp lib/*.so  "$(pg_config --pkglibdir)/"
 sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
@@ -255,28 +255,28 @@ systemctl restart postgresql
 
 ### 3. Apply the schema migration in each database
 
-Connect to every database where pg_stream is installed and run:
+Connect to every database where pg_trickle is installed and run:
 
 ```sql
 -- Upgrade to the latest bundled version
-ALTER EXTENSION pg_stream UPDATE;
+ALTER EXTENSION pg_trickle UPDATE;
 
 -- Or upgrade to a specific version
-ALTER EXTENSION pg_stream UPDATE TO '0.2.0';
+ALTER EXTENSION pg_trickle UPDATE TO '0.2.0';
 ```
 
 PostgreSQL uses the versioned SQL migration scripts bundled with the release
-(e.g. `pg_stream--0.1.0--0.2.0.sql`) to apply any catalog changes. The command
+(e.g. `pg_trickle--0.1.0--0.2.0.sql`) to apply any catalog changes. The command
 is a no-op when no migration script is needed for a given release.
 
 You can confirm the active version afterwards:
 
 ```sql
-SELECT extversion FROM pg_extension WHERE extname = 'pg_stream';
+SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle';
 ```
 
 > **Coming soon:** A future release will include a helper function
-> (`pgstream.upgrade()`) that automates steps 2–3 across all databases in the
+> (`pgtrickle.upgrade()`) that automates steps 2–3 across all databases in the
 > cluster and validates catalog integrity after the migration. Until then, the
 > manual steps above are the supported upgrade path.
 
@@ -286,14 +286,14 @@ SELECT extversion FROM pg_extension WHERE extname = 'pg_stream';
 
 ```sql
 -- Drop all stream tables first
-SELECT pgstream.drop_stream_table(pgs_schema || '.' || pgs_name)
-FROM pgstream.pgs_stream_tables;
+SELECT pgtrickle.drop_stream_table(pgt_schema || '.' || pgt_name)
+FROM pgtrickle.pgt_stream_tables;
 
 -- Drop the extension
-DROP EXTENSION pg_stream CASCADE;
+DROP EXTENSION pg_trickle CASCADE;
 ```
 
-Remove `pg_stream` from `shared_preload_libraries` in `postgresql.conf` and restart PostgreSQL.
+Remove `pg_trickle` from `shared_preload_libraries` in `postgresql.conf` and restart PostgreSQL.
 
 ## Troubleshooting
 
@@ -340,7 +340,7 @@ you can use the wrapper script instead:
 
 ### Extension fails to load
 
-Ensure `shared_preload_libraries = 'pg_stream'` is set and PostgreSQL has been **restarted** (not just reloaded). The extension requires shared memory initialization at startup.
+Ensure `shared_preload_libraries = 'pg_trickle'` is set and PostgreSQL has been **restarted** (not just reloaded). The extension requires shared memory initialization at startup.
 
 ### Background worker not starting
 

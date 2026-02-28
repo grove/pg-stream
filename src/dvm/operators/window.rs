@@ -16,10 +16,10 @@
 use crate::dvm::diff::{DiffContext, DiffResult, col_list, prefixed_col_list, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a Window node.
-pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Window {
         window_exprs,
         partition_by,
@@ -27,7 +27,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         child,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_window called on non-Window node".into(),
         ));
     };
@@ -54,7 +54,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         // Un-partitioned: any change means recompute everything.
         // Emit a single dummy row to trigger recomputation.
         let parts_sql = format!(
-            "SELECT 1 AS __pgs_dummy\nFROM {child} LIMIT 1",
+            "SELECT 1 AS __pgt_dummy\nFROM {child} LIMIT 1",
             child = child_result.cte_name,
         );
         ctx.add_cte(changed_parts_cte.clone(), parts_sql);
@@ -90,7 +90,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         .join(", ");
 
     let old_rows_sql = format!(
-        "SELECT st.\"__pgs_row_id\", {all_cols_st}\n\
+        "SELECT st.\"__pgt_row_id\", {all_cols_st}\n\
          FROM {st_table} st\n\
          WHERE EXISTS (\n\
          SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_st_cp}\n\
@@ -121,16 +121,16 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
 
     let current_input_sql = format!(
         "-- Surviving old rows (pass-through only, window cols stripped)\n\
-         SELECT o.\"__pgs_row_id\", {pt_cols_old}\n\
+         SELECT o.\"__pgt_row_id\", {pt_cols_old}\n\
          FROM {old_rows_cte} o\n\
-         WHERE o.\"__pgs_row_id\" NOT IN (\n\
-             SELECT \"__pgs_row_id\" FROM {child_delta} WHERE \"__pgs_action\" = 'D'\n\
+         WHERE o.\"__pgt_row_id\" NOT IN (\n\
+             SELECT \"__pgt_row_id\" FROM {child_delta} WHERE \"__pgt_action\" = 'D'\n\
          )\n\
          UNION ALL\n\
          -- Newly inserted rows\n\
-         SELECT d.\"__pgs_row_id\", {pt_cols_delta}\n\
+         SELECT d.\"__pgt_row_id\", {pt_cols_delta}\n\
          FROM {child_delta} d\n\
-         WHERE d.\"__pgs_action\" = 'I'\n\
+         WHERE d.\"__pgt_action\" = 'I'\n\
          AND EXISTS (\n\
              SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_delta_cp}\n\
          )",
@@ -152,7 +152,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
         .map(|c| format!("ci.{}::TEXT", quote_ident(c)))
         .collect();
     let row_id_expr = if hash_exprs.is_empty() {
-        "pgstream.pg_stream_hash('__window_singleton')".to_string()
+        "pgtrickle.pg_trickle_hash('__window_singleton')".to_string()
     } else {
         build_hash_expr(&hash_exprs)
     };
@@ -160,7 +160,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
     let pt_cols_ci = prefixed_col_list("ci", &pt_aliases);
 
     let recomputed_sql = format!(
-        "SELECT {row_id_expr} AS \"__pgs_row_id\",\n\
+        "SELECT {row_id_expr} AS \"__pgt_row_id\",\n\
                {pt_cols_ci},\n\
                {wf_selects}\n\
          FROM {current_input_cte} ci",
@@ -175,11 +175,11 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgS
 
     let final_sql = format!(
         "-- Delete old window results for changed partitions\n\
-         SELECT \"__pgs_row_id\", 'D' AS \"__pgs_action\", {all_cols_name}\n\
+         SELECT \"__pgt_row_id\", 'D' AS \"__pgt_action\", {all_cols_name}\n\
          FROM {old_rows_cte}\n\
          UNION ALL\n\
          -- Insert recomputed window results\n\
-         SELECT \"__pgs_row_id\", 'I' AS \"__pgs_action\", {all_cols_name}\n\
+         SELECT \"__pgt_row_id\", 'I' AS \"__pgt_action\", {all_cols_name}\n\
          FROM {recomputed_cte}",
     );
     ctx.add_cte(final_cte.clone(), final_sql);

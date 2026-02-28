@@ -12,7 +12,7 @@
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::{AggExpr, AggFunc, Expr, OpTree};
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Resolve a column reference expression against child CTE column names.
 ///
@@ -199,8 +199,8 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             for expr in group_by {
                 selects.push(expr.to_sql());
             }
-            // NOTE: do NOT include COUNT(*) AS __pgs_count here.
-            // The intermediate aggregate delta output_cols excludes __pgs_count
+            // NOTE: do NOT include COUNT(*) AS __pgt_count here.
+            // The intermediate aggregate delta output_cols excludes __pgt_count
             // (it's internal bookkeeping), so the child_to_from_sql must match.
             // Including it here would cause column count mismatches in the
             // EXCEPT ALL between SELECT * FROM this subquery and the delta CTE.
@@ -326,7 +326,7 @@ fn build_intermediate_agg_delta(
     group_output: &[String],
     aggregates: &[AggExpr],
     delta_cte: &str,
-) -> Result<DiffResult, PgStreamError> {
+) -> Result<DiffResult, PgTrickleError> {
     let source_from = child_to_from_sql(child);
 
     // We need the child's source SQL for rescanning. If we can't reconstruct
@@ -335,7 +335,7 @@ fn build_intermediate_agg_delta(
         Some(sql) => sql,
         None => {
             // Fallback: if we have the defining query, wrap it. Otherwise error.
-            return Err(PgStreamError::InternalError(
+            return Err(PgTrickleError::InternalError(
                 "Cannot build intermediate aggregate delta: \
                  child FROM clause cannot be reconstructed"
                     .into(),
@@ -354,8 +354,8 @@ fn build_intermediate_agg_delta(
             rescan_selects.push(format!("{expr_sql} AS {qt_output}"));
         }
     }
-    // COUNT(*) to track the group's row count (__pgs_count)
-    rescan_selects.push("COUNT(*) AS __pgs_count".to_string());
+    // COUNT(*) to track the group's row count (__pgt_count)
+    rescan_selects.push("COUNT(*) AS __pgt_count".to_string());
     for agg in aggregates {
         rescan_selects.push(format!(
             "{} AS {}",
@@ -381,10 +381,10 @@ fn build_intermediate_agg_delta(
     } else {
         let corr: Vec<String> = group_output
             .iter()
-            .map(|c| format!("{c} IS NOT DISTINCT FROM __pgs_d2.{}", quote_ident(c)))
+            .map(|c| format!("{c} IS NOT DISTINCT FROM __pgt_d2.{}", quote_ident(c)))
             .collect();
         format!(
-            "EXISTS (SELECT 1 FROM {delta_cte} __pgs_d2 WHERE {})",
+            "EXISTS (SELECT 1 FROM {delta_cte} __pgt_d2 WHERE {})",
             corr.join(" AND "),
         )
     };
@@ -420,7 +420,7 @@ fn build_intermediate_agg_delta(
     // has disambiguated names — positional matching handles this correctly.
 
     // Get the child's delta CTE columns (these are what diff_node produced
-    // for the child). We need the data columns (excluding __pgs_action, __pgs_row_id).
+    // for the child). We need the data columns (excluding __pgt_action, __pgt_row_id).
     let child_result = ctx.diff_node(child)?;
     let delta_data_cols: Vec<String> = child_result
         .columns
@@ -438,10 +438,10 @@ fn build_intermediate_agg_delta(
         if let Some(as_pos) = from_sql.rfind(" AS ") {
             from_sql[as_pos + 4..].trim_matches('"').to_string()
         } else {
-            "__pgs_old".to_string()
+            "__pgt_old".to_string()
         }
     } else {
-        "__pgs_old".to_string()
+        "__pgt_old".to_string()
     };
 
     let old_rescan_cte = ctx.next_cte_name("agg_old");
@@ -449,9 +449,9 @@ fn build_intermediate_agg_delta(
         "SELECT {selects}\nFROM (\
          SELECT * FROM {from_sql}{where_connector} \
          EXCEPT ALL \
-         SELECT {delta_col_list} FROM {child_delta} WHERE __pgs_action = 'I' \
+         SELECT {delta_col_list} FROM {child_delta} WHERE __pgt_action = 'I' \
          UNION ALL \
-         SELECT {delta_col_list} FROM {child_delta} WHERE __pgs_action = 'D'\
+         SELECT {delta_col_list} FROM {child_delta} WHERE __pgt_action = 'D'\
          ) {old_alias}{group_by}",
         selects = rescan_selects.join(",\n       "),
         child_delta = child_result.cte_name,
@@ -463,11 +463,11 @@ fn build_intermediate_agg_delta(
     // ── Final CTE: emit D/I pairs ───────────────────────────────────
     let final_cte = ctx.next_cte_name("agg_final");
 
-    // Build output columns — exclude __pgs_count since this is an intermediate
-    // aggregate. __pgs_count is internal bookkeeping for the top-level aggregate's
+    // Build output columns — exclude __pgt_count since this is an intermediate
+    // aggregate. __pgt_count is internal bookkeeping for the top-level aggregate's
     // MERGE with the stream table. Including it in intermediate output causes
     // parent operators (e.g., InnerJoin) to propagate it into column references
-    // against snapshots that don't have it (leading to "column __pgs_count
+    // against snapshots that don't have it (leading to "column __pgt_count
     // does not exist" errors).
     let mut output_cols = Vec::new();
     output_cols.extend(group_output.iter().cloned());
@@ -485,12 +485,12 @@ fn build_intermediate_agg_delta(
         .map(|c| format!("o.{}::TEXT", quote_ident(c)))
         .collect();
     let row_id_new = if group_hash_exprs_n.is_empty() {
-        "pgstream.pg_stream_hash('__singleton_group')".to_string()
+        "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
     } else {
         build_hash_expr(&group_hash_exprs_n)
     };
     let row_id_old = if group_hash_exprs_o.is_empty() {
-        "pgstream.pg_stream_hash('__singleton_group')".to_string()
+        "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
     } else {
         build_hash_expr(&group_hash_exprs_o)
     };
@@ -539,17 +539,17 @@ fn build_intermediate_agg_delta(
     let final_sql = format!(
         "\
 -- D events: old state of affected groups
-SELECT {row_id_old} AS __pgs_row_id,
-       'D'::TEXT AS __pgs_action,
-       {extra_old_groups}o.__pgs_count{extra_old_aggs}
+SELECT {row_id_old} AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {extra_old_groups}o.__pgt_count{extra_old_aggs}
 FROM {old_rescan_cte} o
 
 UNION ALL
 
 -- I events: new state of affected groups
-SELECT {row_id_new} AS __pgs_row_id,
-       'I'::TEXT AS __pgs_action,
-       {extra_new_groups}n.__pgs_count{extra_new_aggs}
+SELECT {row_id_new} AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {extra_new_groups}n.__pgt_count{extra_new_aggs}
 FROM {new_rescan_cte} n",
     );
 
@@ -634,10 +634,10 @@ fn build_rescan_cte(
             // to correctly handle NULL group-key values.
             let corr: Vec<String> = group_output
                 .iter()
-                .map(|c| format!("{c} IS NOT DISTINCT FROM __pgs_d2.{}", quote_ident(c),))
+                .map(|c| format!("{c} IS NOT DISTINCT FROM __pgt_d2.{}", quote_ident(c),))
                 .collect();
             format!(
-                "EXISTS (SELECT 1 FROM {delta_cte} __pgs_d2 WHERE {})",
+                "EXISTS (SELECT 1 FROM {delta_cte} __pgt_d2 WHERE {})",
                 corr.join(" AND "),
             )
         };
@@ -675,7 +675,7 @@ fn build_rescan_cte(
         } else if group_output.len() == 1 {
             let col = &group_output[0];
             format!(
-                "\nWHERE __pgs_dq.{} IN (SELECT {} FROM {delta_cte})",
+                "\nWHERE __pgt_dq.{} IN (SELECT {} FROM {delta_cte})",
                 quote_ident(col),
                 quote_ident(col),
             )
@@ -684,13 +684,13 @@ fn build_rescan_cte(
                 .iter()
                 .map(|c| {
                     format!(
-                        "__pgs_dq.{qc} IS NOT DISTINCT FROM __pgs_d2.{qc}",
+                        "__pgt_dq.{qc} IS NOT DISTINCT FROM __pgt_d2.{qc}",
                         qc = quote_ident(c),
                     )
                 })
                 .collect();
             format!(
-                "\nWHERE EXISTS (SELECT 1 FROM {delta_cte} __pgs_d2 WHERE {})",
+                "\nWHERE EXISTS (SELECT 1 FROM {delta_cte} __pgt_d2 WHERE {})",
                 corr.join(" AND "),
             )
         };
@@ -698,16 +698,16 @@ fn build_rescan_cte(
         // Select only the rescan aggregate columns from the defining query
         let dq_selects: Vec<String> = group_output
             .iter()
-            .map(|c| format!("__pgs_dq.{}", quote_ident(c)))
+            .map(|c| format!("__pgt_dq.{}", quote_ident(c)))
             .chain(
                 rescan_aggs
                     .iter()
-                    .map(|a| format!("__pgs_dq.{}", quote_ident(&a.alias))),
+                    .map(|a| format!("__pgt_dq.{}", quote_ident(&a.alias))),
             )
             .collect();
 
         format!(
-            "SELECT {selects}\nFROM ({defining_query}) __pgs_dq{where_clause}",
+            "SELECT {selects}\nFROM ({defining_query}) __pgt_dq{where_clause}",
             selects = dq_selects.join(", "),
         )
     } else {
@@ -778,14 +778,14 @@ fn generate_direct_agg_delta(
     scan: &OpTree,
     group_by: &[Expr],
     aggregates: &[AggExpr],
-) -> Result<(String, Vec<String>), PgStreamError> {
+) -> Result<(String, Vec<String>), PgTrickleError> {
     let OpTree::Scan {
         table_oid,
         columns: _,
         ..
     } = scan
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "generate_direct_agg_delta called on non-Scan".into(),
         ));
     };
@@ -942,14 +942,14 @@ fn direct_agg_delta_exprs(agg: &AggExpr) -> (String, String) {
 }
 
 /// Differentiate an Aggregate node.
-pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Aggregate {
         group_by,
         aggregates,
         child,
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_aggregate called on non-Aggregate node".into(),
         ));
     };
@@ -999,9 +999,9 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
         // Always track insert/delete counts
         delta_selects
-            .push("SUM(CASE WHEN __pgs_action = 'I' THEN 1 ELSE 0 END) AS __ins_count".to_string());
+            .push("SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE 0 END) AS __ins_count".to_string());
         delta_selects
-            .push("SUM(CASE WHEN __pgs_action = 'D' THEN 1 ELSE 0 END) AS __del_count".to_string());
+            .push("SUM(CASE WHEN __pgt_action = 'D' THEN 1 ELSE 0 END) AS __del_count".to_string());
 
         // Per-aggregate tracking
         for agg in aggregates {
@@ -1074,13 +1074,13 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .map(|c| format!("d.{}::TEXT", quote_ident(c)))
         .collect();
     let row_id_expr = if group_hash_exprs.is_empty() {
-        "pgstream.pg_stream_hash('__singleton_group')".to_string()
+        "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
     } else {
         build_hash_expr(&group_hash_exprs)
     };
 
     let mut merge_selects = Vec::new();
-    merge_selects.push(format!("{row_id_expr} AS __pgs_row_id"));
+    merge_selects.push(format!("{row_id_expr} AS __pgt_row_id"));
 
     // Group columns
     for col in &group_output {
@@ -1094,9 +1094,9 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // set and return NULL, not 0.  Wrapping in COALESCE(…, 0) keeps the
     // arithmetic safe.
     merge_selects.push(
-        "COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) AS new_count".to_string(),
+        "COALESCE(st.__pgt_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) AS new_count".to_string(),
     );
-    merge_selects.push("COALESCE(st.__pgs_count, 0) AS old_count".to_string());
+    merge_selects.push("COALESCE(st.__pgt_count, 0) AS old_count".to_string());
 
     // Per-aggregate new values + old values for G-S1 change detection
     for agg in aggregates {
@@ -1119,10 +1119,10 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     merge_selects.push(
         "\
 CASE
-    WHEN st.__pgs_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
-    WHEN COALESCE(st.__pgs_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) <= 0 THEN 'D'
+    WHEN st.__pgt_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
+    WHEN COALESCE(st.__pgt_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) <= 0 THEN 'D'
     ELSE 'U'
-END AS __pgs_meta_action"
+END AS __pgt_meta_action"
             .to_string(),
     );
 
@@ -1162,7 +1162,7 @@ END AS __pgs_meta_action"
     // ── CTE 3: Single-row-per-group emit ────────────────────────────
     //
     // Each group produces exactly ONE delta row. MERGE handles all
-    // three cases correctly with a single action per __pgs_row_id:
+    // three cases correctly with a single action per __pgt_row_id:
     //
     //   I row  → action='I', new values  → NOT MATCHED → INSERT
     //   D row  → action='D', old values  → MATCHED     → DELETE
@@ -1176,7 +1176,7 @@ END AS __pgs_meta_action"
     // Build output column list
     let mut output_cols = Vec::new();
     output_cols.extend(group_output.iter().cloned());
-    output_cols.push("__pgs_count".to_string());
+    output_cols.push("__pgt_count".to_string());
     for agg in aggregates {
         output_cols.push(agg.alias.clone());
     }
@@ -1194,14 +1194,14 @@ END AS __pgs_meta_action"
     };
 
     // Build CASE expressions: D → old values, I/U → new values
-    let count_case = "CASE WHEN m.__pgs_meta_action = 'D' THEN m.old_count ELSE m.new_count END";
+    let count_case = "CASE WHEN m.__pgt_meta_action = 'D' THEN m.old_count ELSE m.new_count END";
 
     let mut agg_cases: Vec<String> = Vec::new();
     for agg in aggregates {
         let new_col = quote_ident(&format!("new_{}", agg.alias));
         let old_col = quote_ident(&format!("old_{}", agg.alias));
         agg_cases.push(format!(
-            "CASE WHEN m.__pgs_meta_action = 'D' THEN m.{old_col} ELSE m.{new_col} END AS {}",
+            "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} ELSE m.{new_col} END AS {}",
             quote_ident(&agg.alias),
         ));
     }
@@ -1236,12 +1236,12 @@ END AS __pgs_meta_action"
 
     let final_sql = format!(
         "\
-SELECT m.__pgs_row_id,
-       CASE WHEN m.__pgs_meta_action = 'D' THEN 'D' ELSE 'I' END AS __pgs_action,
-       {extra_group}{count_case} AS __pgs_count{extra_agg_cases}
+SELECT m.__pgt_row_id,
+       CASE WHEN m.__pgt_meta_action = 'D' THEN 'D' ELSE 'I' END AS __pgt_action,
+       {extra_group}{count_case} AS __pgt_count{extra_agg_cases}
 FROM {merge_cte} m
-WHERE m.__pgs_meta_action IN ('I', 'D')
-   OR (m.__pgs_meta_action = 'U'
+WHERE m.__pgt_meta_action IN ('I', 'D')
+   OR (m.__pgt_meta_action = 'U'
        AND ({change_guard}))",
     );
 
@@ -1274,8 +1274,8 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
 
     match &agg.function {
         AggFunc::CountStar => (
-            format!("SUM(CASE WHEN __pgs_action = 'I'{filter_and} THEN 1 ELSE 0 END)"),
-            format!("SUM(CASE WHEN __pgs_action = 'D'{filter_and} THEN 1 ELSE 0 END)"),
+            format!("SUM(CASE WHEN __pgt_action = 'I'{filter_and} THEN 1 ELSE 0 END)"),
+            format!("SUM(CASE WHEN __pgt_action = 'D'{filter_and} THEN 1 ELSE 0 END)"),
         ),
         AggFunc::Count => {
             let col = agg
@@ -1285,10 +1285,10 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
                 .unwrap_or("*".into());
             (
                 format!(
-                    "SUM(CASE WHEN __pgs_action = 'I' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
+                    "SUM(CASE WHEN __pgt_action = 'I' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
                 ),
                 format!(
-                    "SUM(CASE WHEN __pgs_action = 'D' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
+                    "SUM(CASE WHEN __pgt_action = 'D' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
                 ),
             )
         }
@@ -1299,8 +1299,8 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
                 .map(|e| resolve_expr_for_child(e, child_cols))
                 .unwrap_or("0".into());
             (
-                format!("SUM(CASE WHEN __pgs_action = 'I'{filter_and} THEN {col} ELSE 0 END)"),
-                format!("SUM(CASE WHEN __pgs_action = 'D'{filter_and} THEN {col} ELSE 0 END)"),
+                format!("SUM(CASE WHEN __pgt_action = 'I'{filter_and} THEN {col} ELSE 0 END)"),
+                format!("SUM(CASE WHEN __pgt_action = 'D'{filter_and} THEN {col} ELSE 0 END)"),
             )
         }
         AggFunc::Min | AggFunc::Max => {
@@ -1311,8 +1311,8 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
                 .unwrap_or("NULL".into());
             let func = agg.function.sql_name();
             (
-                format!("{func}(CASE WHEN __pgs_action = 'I'{filter_and} THEN {col} END)"),
-                format!("{func}(CASE WHEN __pgs_action = 'D'{filter_and} THEN {col} END)"),
+                format!("{func}(CASE WHEN __pgt_action = 'I'{filter_and} THEN {col} END)"),
+                format!("{func}(CASE WHEN __pgt_action = 'D'{filter_and} THEN {col} END)"),
             )
         }
         // Group-rescan aggregates: track insertions/deletions as simple counts.
@@ -1327,10 +1327,10 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
             // We only need to detect "any change happened" — counting suffices.
             (
                 format!(
-                    "SUM(CASE WHEN __pgs_action = 'I'{filter_and} AND {col} IS NOT NULL THEN 1 ELSE 0 END)"
+                    "SUM(CASE WHEN __pgt_action = 'I'{filter_and} AND {col} IS NOT NULL THEN 1 ELSE 0 END)"
                 ),
                 format!(
-                    "SUM(CASE WHEN __pgs_action = 'D'{filter_and} AND {col} IS NOT NULL THEN 1 ELSE 0 END)"
+                    "SUM(CASE WHEN __pgt_action = 'D'{filter_and} AND {col} IS NOT NULL THEN 1 ELSE 0 END)"
                 ),
             )
         }
@@ -1371,7 +1371,7 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             //   → The new extremum might be entirely different. We cannot compute
             //     it algebraically. We return NULL as a sentinel to trigger the
             //     downstream action classifier to treat this as a DELETE + INSERT
-            //     pair via the __pgs_meta_action = 'U' path.
+            //     pair via the __pgt_meta_action = 'U' path.
             //
             // The "was deleted" check: d.__del_{alias} IS NOT NULL AND
             //   d.__del_{alias} = st.{alias} (the deleted extremum equals the stored one).
@@ -1502,9 +1502,9 @@ mod tests {
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Output: group cols + __pgs_count + aggregate aliases
+        // Output: group cols + __pgt_count + aggregate aliases
         assert!(result.columns.contains(&"region".to_string()));
-        assert!(result.columns.contains(&"__pgs_count".to_string()));
+        assert!(result.columns.contains(&"__pgt_count".to_string()));
         assert!(result.columns.contains(&"cnt".to_string()));
 
         // Should use direct bypass (P5) since it's Scan → Aggregate with COUNT(*)
@@ -1559,8 +1559,8 @@ mod tests {
 
         // Should NOT use P5 direct bypass when child is not a direct Scan
         assert_sql_not_contains(&sql, "LATERAL");
-        // Should use standard path with __pgs_action
-        assert_sql_contains(&sql, "__pgs_action");
+        // Should use standard path with __pgt_action
+        assert_sql_contains(&sql, "__pgt_action");
     }
 
     #[test]
@@ -1851,7 +1851,7 @@ mod tests {
         );
         let (ins, del) = agg_delta_exprs(&agg, &[]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "Insert expr should check action: {ins}",
         );
         assert!(
@@ -1859,7 +1859,7 @@ mod tests {
             "Insert expr should contain filter: {ins}",
         );
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "Delete expr should check action: {del}",
         );
         assert!(
@@ -2034,7 +2034,7 @@ mod tests {
         let agg = bool_and_col("active", "all_active");
         let (ins, _del) = agg_delta_exprs(&agg, &["active".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "BOOL_AND insert delta should check action: {ins}",
         );
         assert!(
@@ -2048,7 +2048,7 @@ mod tests {
         let agg = bool_or_col("active", "any_active");
         let (_ins, del) = agg_delta_exprs(&agg, &["active".to_string()]);
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "BOOL_OR delete delta should check action: {del}",
         );
     }
@@ -2068,7 +2068,7 @@ mod tests {
         let agg = array_agg_col("val", "vals");
         let (ins, _del) = agg_delta_exprs(&agg, &["val".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "ARRAY_AGG insert delta should check action: {ins}",
         );
     }
@@ -2287,7 +2287,7 @@ mod tests {
         let agg = bit_and_col("flags", "all_flags");
         let (ins, del) = agg_delta_exprs(&agg, &["flags".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "BIT_AND insert delta should check action: {ins}",
         );
         assert!(
@@ -2295,7 +2295,7 @@ mod tests {
             "BIT_AND insert delta should check NOT NULL: {ins}",
         );
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "BIT_AND delete delta should check action: {del}",
         );
     }
@@ -2315,11 +2315,11 @@ mod tests {
         let agg = bit_xor_col("flags", "xor_flags");
         let (ins, del) = agg_delta_exprs(&agg, &["flags".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "BIT_XOR insert delta should check action: {ins}",
         );
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "BIT_XOR delete delta should check action: {del}",
         );
     }
@@ -2420,7 +2420,7 @@ mod tests {
         let agg = json_object_agg_col("name", "value", "obj");
         let (ins, del) = agg_delta_exprs(&agg, &["name".to_string(), "value".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "JSON_OBJECT_AGG insert delta should check action: {ins}",
         );
         assert!(
@@ -2428,7 +2428,7 @@ mod tests {
             "JSON_OBJECT_AGG insert delta should check NOT NULL: {ins}",
         );
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "JSON_OBJECT_AGG delete delta should check action: {del}",
         );
     }
@@ -2550,11 +2550,11 @@ mod tests {
         let agg = stddev_pop_col("amount", "sd_pop");
         let (ins, del) = agg_delta_exprs(&agg, &["amount".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "STDDEV_POP insert delta should check action: {ins}",
         );
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "STDDEV_POP delete delta should check action: {del}",
         );
     }
@@ -2578,11 +2578,11 @@ mod tests {
         let agg = var_pop_col("amount", "v_pop");
         let (ins, del) = agg_delta_exprs(&agg, &["amount".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "VAR_POP insert delta should check action: {ins}",
         );
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "VAR_POP delete delta should check action: {del}",
         );
     }
@@ -2825,11 +2825,11 @@ mod tests {
         let agg = mode_col("category", "most_common");
         let (ins, del) = agg_delta_exprs(&agg, &["category".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "MODE insert delta should check action: {ins}",
         );
         assert!(
-            del.contains("__pgs_action = 'D'"),
+            del.contains("__pgt_action = 'D'"),
             "MODE delete delta should check action: {del}",
         );
     }
@@ -2839,7 +2839,7 @@ mod tests {
         let agg = percentile_cont_col("0.5", "amount", "median_amount");
         let (ins, _del) = agg_delta_exprs(&agg, &["amount".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "PERCENTILE_CONT insert delta should check action: {ins}",
         );
     }
@@ -2849,7 +2849,7 @@ mod tests {
         let agg = percentile_disc_col("0.75", "score", "p75_score");
         let (ins, _del) = agg_delta_exprs(&agg, &["score".to_string()]);
         assert!(
-            ins.contains("__pgs_action = 'I'"),
+            ins.contains("__pgt_action = 'I'"),
             "PERCENTILE_DISC insert delta should check action: {ins}",
         );
     }

@@ -1,4 +1,4 @@
-//! TPC-H correctness tests for pg_stream DIFFERENTIAL refresh.
+//! TPC-H correctness tests for pg_trickle DIFFERENTIAL refresh.
 //!
 //! Validates the core DBSP invariant: after every differential refresh,
 //! the stream table's contents must be multiset-equal to re-executing
@@ -334,7 +334,7 @@ async fn assert_tpch_invariant(
 ) -> Result<(), String> {
     let st_table = format!("public.{st_name}");
 
-    // Get user-visible columns — exclude internal pg_stream bookkeeping columns.
+    // Get user-visible columns — exclude internal pg_trickle bookkeeping columns.
     // Use explicit names (not LIKE) to match the approach in E2eDb::assert_st_matches_query.
     let cols: String = db
         .query_scalar(&format!(
@@ -342,7 +342,7 @@ async fn assert_tpch_invariant(
              FROM information_schema.columns \
              WHERE (table_schema || '.' || table_name = 'public.{st_name}' \
                 OR table_name = '{st_name}') \
-               AND column_name NOT IN ('__pgs_row_id', '__pgs_count')"
+               AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
         ))
         .await;
 
@@ -396,10 +396,10 @@ fn log_progress(qname: &str, tier: u8, cycle: usize, total_cycles: usize, elapse
 }
 
 /// Refresh a stream table, returning an error instead of panicking.
-/// Used to gracefully handle known pg_stream DVM bugs without stopping the test.
+/// Used to gracefully handle known pg_trickle DVM bugs without stopping the test.
 async fn try_refresh_st(db: &E2eDb, st_name: &str) -> Result<(), String> {
     db.try_execute(&format!(
-        "SELECT pgstream.refresh_stream_table('{st_name}')"
+        "SELECT pgtrickle.refresh_stream_table('{st_name}')"
     ))
     .await
     .map_err(|e| e.to_string())
@@ -457,7 +457,7 @@ async fn test_tpch_differential_correctness() {
         let st_name = format!("tpch_{}", q.name);
         let create_result = db
             .try_execute(&format!(
-                "SELECT pgstream.create_stream_table('{st_name}', $${sql}$$, '1m', 'DIFFERENTIAL')",
+                "SELECT pgtrickle.create_stream_table('{st_name}', $${sql}$$, '1m', 'DIFFERENTIAL')",
                 sql = q.sql,
             ))
             .await;
@@ -473,10 +473,10 @@ async fn test_tpch_differential_correctness() {
         // Diagnostic: show source OIDs from deps and change buffer tables
         let dep_rows: Vec<(i64, String)> = sqlx::query_as(&format!(
             "SELECT d.source_relid::bigint, c.relname::text \
-                 FROM pgstream.pgs_dependencies d \
-                 JOIN pgstream.pgs_stream_tables st ON st.pgs_id = d.pgs_id \
+                 FROM pgtrickle.pgt_dependencies d \
+                 JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = d.pgt_id \
                  LEFT JOIN pg_class c ON c.oid = d.source_relid \
-                 WHERE st.pgs_name = '{st_name}' AND d.source_type = 'TABLE' \
+                 WHERE st.pgt_name = '{st_name}' AND d.source_type = 'TABLE' \
                  ORDER BY d.source_relid"
         ))
         .fetch_all(&db.pool)
@@ -492,7 +492,7 @@ async fn test_tpch_differential_correctness() {
         let buf_rows: Vec<(String,)> = sqlx::query_as(
             "SELECT c.relname::text \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = 'pgstream_changes' AND c.relkind = 'r' \
+             WHERE n.nspname = 'pgtrickle_changes' AND c.relkind = 'r' \
              ORDER BY c.relname",
         )
         .fetch_all(&db.pool)
@@ -507,7 +507,7 @@ async fn test_tpch_differential_correctness() {
             println!("  WARN baseline — {e}");
             skipped.push((q.name, format!("baseline invariant: {e}")));
             let _ = db
-                .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_name}')"))
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
                 .await;
             continue;
         }
@@ -533,13 +533,13 @@ async fn test_tpch_differential_correctness() {
             db.execute("ANALYZE lineitem").await;
             db.execute("ANALYZE customer").await;
 
-            // Differential refresh — soft error for known pg_stream DVM bugs
+            // Differential refresh — soft error for known pg_trickle DVM bugs
             if let Err(e) = try_refresh_st(&db, &st_name).await {
                 // Dump change buffer tables on error for diagnosis
                 let buf_rows2: Vec<(String,)> = sqlx::query_as(
                     "SELECT c.relname::text \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = 'pgstream_changes' AND c.relkind = 'r' \
+                     WHERE n.nspname = 'pgtrickle_changes' AND c.relkind = 'r' \
                      ORDER BY c.relname",
                 )
                 .fetch_all(&db.pool)
@@ -548,7 +548,7 @@ async fn test_tpch_differential_correctness() {
                 let buf_names2: Vec<&str> = buf_rows2.iter().map(|(n,)| n.as_str()).collect();
 
                 let msg = e.lines().next().unwrap_or(&e).to_string();
-                println!("  WARN cycle {cycle} — pg_stream DVM error: {msg}");
+                println!("  WARN cycle {cycle} — pg_trickle DVM error: {msg}");
                 println!("    change_buffers_at_error: {}", buf_names2.join(", "));
                 skipped.push((q.name, format!("DVM error cycle {cycle}: {msg}")));
                 dvm_ok = false;
@@ -579,7 +579,7 @@ async fn test_tpch_differential_correctness() {
 
         // Clean up
         let _ = db
-            .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_name}')"))
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
             .await;
     }
 
@@ -590,7 +590,7 @@ async fn test_tpch_differential_correctness() {
         skipped.len()
     );
     if !skipped.is_empty() {
-        println!("  Skipped (pg_stream limitation):");
+        println!("  Skipped (pg_trickle limitation):");
         for (name, reason) in &skipped {
             let short = reason.split(':').next_back().unwrap_or(reason).trim();
             println!("    {name}: {short}");
@@ -606,7 +606,7 @@ async fn test_tpch_differential_correctness() {
 
     assert!(
         failed.is_empty(),
-        "{} queries failed with assertion errors (not pg_stream limitations)",
+        "{} queries failed with assertion errors (not pg_trickle limitations)",
         failed.len()
     );
 }
@@ -643,7 +643,7 @@ async fn test_tpch_cross_query_consistency() {
         let st_name = format!("tpch_x_{}", q.name);
         let result = db
             .try_execute(&format!(
-                "SELECT pgstream.create_stream_table('{st_name}', $${sql}$$, '1m', 'DIFFERENTIAL')",
+                "SELECT pgtrickle.create_stream_table('{st_name}', $${sql}$$, '1m', 'DIFFERENTIAL')",
                 sql = q.sql,
             ))
             .await;
@@ -671,7 +671,7 @@ async fn test_tpch_cross_query_consistency() {
         if let Err(e) = assert_tpch_invariant(&db, st_name, sql, qname, 0).await {
             println!("  WARN baseline {qname} — {e}");
             let _ = db
-                .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_name}')"))
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
                 .await;
         } else {
             baseline_ok.push((st_name.clone(), qname, sql));
@@ -705,7 +705,7 @@ async fn test_tpch_cross_query_consistency() {
                     let msg = e.lines().next().unwrap_or(&e).to_string();
                     println!("  WARN: {qname} refresh error cycle {cycle}: {msg}");
                     let _ = db
-                        .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_name}')"))
+                        .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
                         .await;
                 }
                 Ok(_) => match assert_tpch_invariant(&db, st_name, sql, qname, cycle).await {
@@ -714,7 +714,9 @@ async fn test_tpch_cross_query_consistency() {
                         let msg = e.lines().next().unwrap_or(&e).to_string();
                         println!("  WARN: {qname} invariant cycle {cycle}: {msg}");
                         let _ = db
-                            .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_name}')"))
+                            .try_execute(&format!(
+                                "SELECT pgtrickle.drop_stream_table('{st_name}')"
+                            ))
                             .await;
                     }
                 },
@@ -734,7 +736,7 @@ async fn test_tpch_cross_query_consistency() {
     // Cleanup remaining active STs
     for (st_name, _, _) in &active {
         let _ = db
-            .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_name}')"))
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
             .await;
     }
 
@@ -780,13 +782,13 @@ async fn test_tpch_full_vs_differential() {
         // Create both STs
         let full_ok = db
             .try_execute(&format!(
-                "SELECT pgstream.create_stream_table('{st_full}', $${sql}$$, '1m', 'FULL')",
+                "SELECT pgtrickle.create_stream_table('{st_full}', $${sql}$$, '1m', 'FULL')",
                 sql = q.sql,
             ))
             .await;
         let diff_ok = db
             .try_execute(&format!(
-                "SELECT pgstream.create_stream_table('{st_diff}', $${sql}$$, '1m', 'DIFFERENTIAL')",
+                "SELECT pgtrickle.create_stream_table('{st_diff}', $${sql}$$, '1m', 'DIFFERENTIAL')",
                 sql = q.sql,
             ))
             .await;
@@ -795,10 +797,10 @@ async fn test_tpch_full_vs_differential() {
             println!("  {}: SKIP — create failed", q.name);
             skipped.push(q.name.to_string());
             let _ = db
-                .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_full}')"))
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_full}')"))
                 .await;
             let _ = db
-                .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_diff}')"))
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_diff}')"))
                 .await;
             continue;
         }
@@ -821,7 +823,7 @@ async fn test_tpch_full_vs_differential() {
             db.execute("ANALYZE lineitem").await;
             db.execute("ANALYZE customer").await;
 
-            // Refresh both — soft error for known pg_stream DVM bugs
+            // Refresh both — soft error for known pg_trickle DVM bugs
             for (mode, st) in [("FULL", &st_full), ("DIFF", &st_diff)] {
                 if let Err(e) = try_refresh_st(&db, st).await {
                     let msg = e.lines().next().unwrap_or(&e).to_string();
@@ -841,7 +843,7 @@ async fn test_tpch_full_vs_differential() {
                      FROM information_schema.columns \
                      WHERE (table_schema || '.' || table_name = 'public.{st_diff}' \
                         OR table_name = '{st_diff}') \
-                       AND column_name NOT IN ('__pgs_row_id', '__pgs_count')"
+                       AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
                 ))
                 .await;
 
@@ -887,21 +889,24 @@ async fn test_tpch_full_vs_differential() {
         } else {
             skipped.push(q.name.to_string());
             println!(
-                "  SKIP: {} — DVM error (known pg_stream limitation)",
+                "  SKIP: {} — DVM error (known pg_trickle limitation)",
                 q.name
             );
         }
 
         let _ = db
-            .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_full}')"))
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_full}')"))
             .await;
         let _ = db
-            .try_execute(&format!("SELECT pgstream.drop_stream_table('{st_diff}')"))
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_diff}')"))
             .await;
     }
 
     if !skipped.is_empty() {
-        println!("\n  Skipped (pg_stream limitation): {}", skipped.join(", "));
+        println!(
+            "\n  Skipped (pg_trickle limitation): {}",
+            skipped.join(", ")
+        );
     }
     println!(
         "\n  FULL vs DIFFERENTIAL: {passed}/{} queries passed ✓\n",

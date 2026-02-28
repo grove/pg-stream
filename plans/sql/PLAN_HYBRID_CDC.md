@@ -9,7 +9,7 @@
 
 ## Motivation
 
-pg_stream currently uses row-level AFTER triggers exclusively for CDC. This
+pg_trickle currently uses row-level AFTER triggers exclusively for CDC. This
 works well but imposes synchronous write-side overhead (~2–15 μs per row) on
 every tracked source table. As analysed in the
 [Triggers vs Replication Report §3.2](REPORT_TRIGGERS_VS_REPLICATION.md#32-steady-state-triggers-vs-logical-replication-honest-comparison),
@@ -39,7 +39,7 @@ degradation, just the current behavior.
 
 3. **Same buffer table schema** — The downstream pipeline (DVM, MERGE,
    frontier) must not change. Logical replication populates the same
-   `pgstream_changes.changes_<oid>` buffer tables with the same column
+   `pgtrickle_changes.changes_<oid>` buffer tables with the same column
    layout.
 
 4. **Graceful fallback** — If slot creation fails, or if the WAL decoder
@@ -87,7 +87,7 @@ Before starting implementation, these must be established:
 
 ### CDC Mode State Machine
 
-Each source dependency (`pgstream.pgs_dependencies`) tracks its CDC mode:
+Each source dependency (`pgtrickle.pgt_dependencies`) tracks its CDC mode:
 
 ```
 TRIGGER ──▸ TRANSITIONING ──▸ WAL
@@ -111,12 +111,12 @@ TRIGGER ──▸ TRANSITIONING ──▸ WAL
 
 **Goal:** Add the metadata columns needed to track CDC mode per source.
 
-#### 1.1 Extend `pgstream.pgs_dependencies`
+#### 1.1 Extend `pgtrickle.pgt_dependencies`
 
 Add columns to track per-source CDC mode and WAL decoder state:
 
 ```sql
-ALTER TABLE pgstream.pgs_dependencies
+ALTER TABLE pgtrickle.pgt_dependencies
   ADD COLUMN cdc_mode TEXT NOT NULL DEFAULT 'TRIGGER'
     CHECK (cdc_mode IN ('TRIGGER', 'TRANSITIONING', 'WAL')),
   ADD COLUMN slot_name TEXT,
@@ -135,7 +135,7 @@ Update [src/catalog.rs](../../src/catalog.rs):
 
 ```rust
 pub struct StDependency {
-    pub pgs_id: i64,
+    pub pgt_id: i64,
     pub source_relid: pg_sys::Oid,
     pub source_type: String,
     pub columns_used: Option<Vec<String>>,
@@ -153,7 +153,7 @@ pub enum CdcMode {
 }
 ```
 
-#### 1.3 Add GUC: `pg_stream.cdc_mode`
+#### 1.3 Add GUC: `pg_trickle.cdc_mode`
 
 Add to [src/config.rs](../../src/config.rs):
 
@@ -169,7 +169,7 @@ pub static PGS_CDC_MODE: GucSetting<Option<std::ffi::CString>> =
 The `"trigger"` default ensures zero behavior change for existing users.
 Setting `"auto"` enables the hybrid approach.
 
-#### 1.4 Add GUC: `pg_stream.wal_transition_timeout`
+#### 1.4 Add GUC: `pg_trickle.wal_transition_timeout`
 
 ```rust
 /// Maximum time (seconds) to wait for WAL decoder to catch up during
@@ -182,7 +182,7 @@ pub static PGS_WAL_TRANSITION_TIMEOUT: GucSetting<i32> =
 
 | File | Changes |
 |---|---|
-| `src/lib.rs` | Add columns to `pgs_dependencies` CREATE TABLE |
+| `src/lib.rs` | Add columns to `pgt_dependencies` CREATE TABLE |
 | `src/catalog.rs` | Extend `StDependency` struct, add `CdcMode` enum, CRUD for new columns |
 | `src/config.rs` | Add `PGS_CDC_MODE` and `PGS_WAL_TRANSITION_TIMEOUT` GUCs |
 | `src/error.rs` | Add `WalTransitionError` variant |
@@ -209,9 +209,9 @@ Add to [src/cdc.rs](../../src/cdc.rs):
 /// Returns true if ALL of:
 /// - `wal_level` is 'logical'
 /// - `max_replication_slots` > currently used slots
-/// - `pg_stream.cdc_mode` is 'auto' or 'wal'
-pub fn can_use_logical_replication() -> Result<bool, PgStreamError> {
-    let cdc_mode = config::pg_stream_cdc_mode();
+/// - `pg_trickle.cdc_mode` is 'auto' or 'wal'
+pub fn can_use_logical_replication() -> Result<bool, PgTrickleError> {
+    let cdc_mode = config::pg_trickle_cdc_mode();
     if cdc_mode == "trigger" {
         return Ok(false);
     }
@@ -222,8 +222,8 @@ pub fn can_use_logical_replication() -> Result<bool, PgStreamError> {
 
     if wal_level != "logical" {
         if cdc_mode == "wal" {
-            return Err(PgStreamError::InvalidArgument(
-                "pg_stream.cdc_mode = 'wal' requires wal_level = logical".into()
+            return Err(PgTrickleError::InvalidArgument(
+                "pg_trickle.cdc_mode = 'wal' requires wal_level = logical".into()
             ));
         }
         return Ok(false);
@@ -247,7 +247,7 @@ pub fn can_use_logical_replication() -> Result<bool, PgStreamError> {
 /// Returns true if REPLICA IDENTITY is DEFAULT (has PK) or FULL.
 /// Returns false if NOTHING or if using an index that doesn't cover
 /// all needed columns.
-pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgStreamError> {
+pub fn check_replica_identity(source_oid: pg_sys::Oid) -> Result<bool, PgTrickleError> {
     let identity = Spi::get_one_with_args::<String>(
         "SELECT CASE relreplident \
            WHEN 'd' THEN 'default' \
@@ -295,12 +295,12 @@ Add to [src/scheduler.rs](../../src/scheduler.rs) or a new `src/wal_decoder.rs`:
 /// Register a WAL decoder background worker for a specific source table.
 ///
 /// The worker creates a logical replication slot, starts streaming changes,
-/// and writes decoded rows into pgstream_changes.changes_<oid> using the
+/// and writes decoded rows into pgtrickle_changes.changes_<oid> using the
 /// same typed-column schema as the trigger-based CDC.
 pub fn register_wal_decoder_worker(source_oid: u32, slot_name: &str) {
-    BackgroundWorkerBuilder::new(&format!("pg_stream WAL decoder {}", source_oid))
-        .set_function("pg_stream_wal_decoder_main")
-        .set_library("pg_stream")
+    BackgroundWorkerBuilder::new(&format!("pg_trickle WAL decoder {}", source_oid))
+        .set_function("pg_trickle_wal_decoder_main")
+        .set_library("pg_trickle")
         .enable_spi_access()
         .set_start_time(BgWorkerStartTime::RecoveryFinished)
         .set_restart_time(Some(std::time::Duration::from_secs(10)))
@@ -318,13 +318,13 @@ The decoder worker:
 2. **Creates** a logical replication slot (if not already created):
    ```sql
    SELECT pg_create_logical_replication_slot(
-       'pgstream_<source_oid>', 'pgoutput'
+       'pgtrickle_<source_oid>', 'pgoutput'
    )
    ```
 3. **Configures** the slot for the specific source table:
    ```sql
    -- pgoutput protocol parameters
-   publication_names: 'pgstream_cdc_<source_oid>'
+   publication_names: 'pgtrickle_cdc_<source_oid>'
    ```
 4. **Starts streaming** via `pg_logical_slot_get_changes()` in a polling loop
 5. **Decodes** each change and writes to the buffer table:
@@ -333,7 +333,7 @@ The decoder worker:
    - Sets `lsn` from the WAL record's LSN
    - Sets `action` to `'I'` / `'U'` / `'D'` / `'T'` (TRUNCATE)
 6. **Confirms** the LSN position to advance the slot
-7. **Updates** `decoder_confirmed_lsn` in `pgs_dependencies`
+7. **Updates** `decoder_confirmed_lsn` in `pgt_dependencies`
 8. **Handles SIGTERM** gracefully
 
 #### 3.3 Publication management
@@ -342,14 +342,14 @@ Each tracked source table needs a publication for the `pgoutput` plugin:
 
 ```sql
 -- Created during transition setup
-CREATE PUBLICATION pgstream_cdc_<source_oid> FOR TABLE <source_table>;
+CREATE PUBLICATION pgtrickle_cdc_<source_oid> FOR TABLE <source_table>;
 
 -- Dropped when the source is no longer tracked
-DROP PUBLICATION IF EXISTS pgstream_cdc_<source_oid>;
+DROP PUBLICATION IF EXISTS pgtrickle_cdc_<source_oid>;
 ```
 
 Multiple STs that share the same source table share the same publication and
-replication slot (reference-counted in `pgs_change_tracking`).
+replication slot (reference-counted in `pgt_change_tracking`).
 
 #### 3.4 TRUNCATE handling
 
@@ -386,8 +386,8 @@ ALTER TABLE <source_table> REPLICA IDENTITY FULL;
 ```
 
 This must be done carefully — it changes the source table's WAL format, which
-affects other subscribers. Add a GUC `pg_stream.auto_replica_identity` (default
-`false`) to control whether pg_stream is allowed to auto-set this.
+affects other subscribers. Add a GUC `pg_trickle.auto_replica_identity` (default
+`false`) to control whether pg_trickle is allowed to auto-set this.
 
 #### 3.6 Error mapping: WAL decode to buffer table
 
@@ -426,7 +426,7 @@ can be an optimization in a future phase.
 ```rust
 // Polling approach
 fn poll_wal_changes(source_oid: u32, slot_name: &str, change_schema: &str)
-    -> Result<(), PgStreamError>
+    -> Result<(), PgTrickleError>
 {
     let changes = Spi::connect(|client| {
         client.select(
@@ -434,7 +434,7 @@ fn poll_wal_changes(source_oid: u32, slot_name: &str, change_schema: &str)
                 "SELECT lsn, xid, data FROM pg_logical_slot_get_changes(\
                     '{slot_name}', NULL, NULL, \
                     'proto_version', '1', \
-                    'publication_names', 'pgstream_cdc_{source_oid}'\
+                    'publication_names', 'pgtrickle_cdc_{source_oid}'\
                 )"
             ),
             None, &[],
@@ -486,7 +486,7 @@ table has been successfully created and populated.
 Scheduler tick:
   for each source dependency where cdc_mode = 'TRIGGER':
     if can_use_logical_replication() AND check_replica_identity(source_oid):
-      start_wal_transition(source_oid, pgs_id)
+      start_wal_transition(source_oid, pgt_id)
 ```
 
 #### 4.2 `start_wal_transition()`
@@ -495,9 +495,9 @@ Scheduler tick:
 fn start_wal_transition(
     source_oid: pg_sys::Oid,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid = source_oid.to_u32();
-    let slot_name = format!("pgstream_{}", oid);
+    let slot_name = format!("pgtrickle_{}", oid);
 
     // Step 1: Create publication for this source table
     create_cdc_publication(source_oid)?;
@@ -519,7 +519,7 @@ fn start_wal_transition(
     register_wal_decoder_worker(oid, &slot_name);
 
     info!(
-        "pg_stream: started WAL transition for source OID {} (slot: {}, handoff LSN: {})",
+        "pg_trickle: started WAL transition for source OID {} (slot: {}, handoff LSN: {})",
         oid, slot_name, handoff_lsn
     );
 
@@ -539,8 +539,8 @@ Two rows with the same `lsn` and `pk_hash` but different `change_id` values
 are duplicates. The refresh engine's delta query already uses:
 
 ```sql
-SELECT DISTINCT ON (__pgs_row_id) * FROM (delta_sql) __raw
-ORDER BY __pgs_row_id, __pgs_action DESC
+SELECT DISTINCT ON (__pgt_row_id) * FROM (delta_sql) __raw
+ORDER BY __pgt_row_id, __pgt_action DESC
 ```
 
 This deduplicates by row ID. However, the raw change buffer may still have
@@ -548,8 +548,8 @@ duplicates that inflate the delta. Add an explicit dedup step:
 
 ```sql
 -- During TRANSITIONING, dedup buffer before refresh
-DELETE FROM pgstream_changes.changes_<oid> a
-USING pgstream_changes.changes_<oid> b
+DELETE FROM pgtrickle_changes.changes_<oid> a
+USING pgtrickle_changes.changes_<oid> b
 WHERE a.lsn = b.lsn
   AND a.pk_hash = b.pk_hash
   AND a.action = b.action
@@ -575,7 +575,7 @@ Called by the scheduler when it detects the decoder has caught up:
 fn complete_wal_transition(
     source_oid: pg_sys::Oid,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid = source_oid.to_u32();
 
     // Step 1: Verify decoder has caught up past the handoff LSN
@@ -587,7 +587,7 @@ fn complete_wal_transition(
         // Not caught up yet — check timeout
         if transition_timed_out(source_oid)? {
             warning!(
-                "pg_stream: WAL transition timed out for source OID {}; \
+                "pg_trickle: WAL transition timed out for source OID {}; \
                  falling back to triggers",
                 oid
             );
@@ -603,7 +603,7 @@ fn complete_wal_transition(
     update_cdc_mode(source_oid, CdcMode::Wal, None)?;
 
     info!(
-        "pg_stream: completed WAL transition for source OID {} — trigger dropped",
+        "pg_trickle: completed WAL transition for source OID {} — trigger dropped",
         oid
     );
 
@@ -619,9 +619,9 @@ Fallback if transition fails or times out:
 fn abort_wal_transition(
     source_oid: pg_sys::Oid,
     change_schema: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let oid = source_oid.to_u32();
-    let slot_name = format!("pgstream_{}", oid);
+    let slot_name = format!("pgtrickle_{}", oid);
 
     // Step 1: Stop the WAL decoder worker
     stop_wal_decoder_worker(oid)?;
@@ -644,7 +644,7 @@ fn abort_wal_transition(
     }
 
     warning!(
-        "pg_stream: aborted WAL transition for source OID {}; using triggers",
+        "pg_trickle: aborted WAL transition for source OID {}; using triggers",
         oid
     );
 
@@ -659,7 +659,7 @@ Modify the scheduler tick in [src/scheduler.rs](../../src/scheduler.rs):
 ```rust
 // After Step A (DAG rebuild) and before Step B (refresh execution):
 // Step A.5: Check and advance WAL transitions
-if config::pg_stream_cdc_mode() != "trigger" {
+if config::pg_trickle_cdc_mode() != "trigger" {
     for dep in &all_dependencies {
         match dep.cdc_mode {
             CdcMode::Trigger => {
@@ -718,7 +718,7 @@ When dropping a stream table whose sources use WAL-based CDC:
 3. If other STs share the source → just remove the dependency, leave decoder
    running
 
-Update `pgs_change_tracking.tracked_by_pgs_ids` to remove the ST's `pgs_id`.
+Update `pgt_change_tracking.tracked_by_pgt_ids` to remove the ST's `pgt_id`.
 
 #### 5.2 DDL event hook changes (`hooks.rs`)
 
@@ -747,7 +747,7 @@ the decoder can detect this and re-read `resolve_source_column_defs()`.
 
 **Goal:** Expose CDC mode and decoder health in monitoring views.
 
-#### 6.1 Extend `pgstream.pg_stat_stream_tables`
+#### 6.1 Extend `pgtrickle.pg_stat_stream_tables`
 
 Add columns:
 
@@ -761,7 +761,7 @@ Add columns:
 #### 6.2 Health check function
 
 ```sql
-SELECT pgstream.check_cdc_health();
+SELECT pgtrickle.check_cdc_health();
 ```
 
 Returns a table with per-source health status:
@@ -773,7 +773,7 @@ Returns a table with per-source health status:
 
 #### 6.3 `NOTIFY` integration
 
-Emit `NOTIFY pg_stream_cdc_transition` when a source transitions between
+Emit `NOTIFY pg_trickle_cdc_transition` when a source transitions between
 modes, including:
 - Source table name
 - Old mode → New mode
@@ -793,15 +793,15 @@ modes, including:
 Replication slots are named predictably for easy identification:
 
 ```
-pgstream_<source_oid>
+pgtrickle_<source_oid>
 ```
 
-Example: `pgstream_16384` for source table with OID 16384.
+Example: `pgtrickle_16384` for source table with OID 16384.
 
 Publications follow the same pattern:
 
 ```
-pgstream_cdc_<source_oid>
+pgtrickle_cdc_<source_oid>
 ```
 
 ---
@@ -810,22 +810,22 @@ pgstream_cdc_<source_oid>
 
 When multiple stream tables depend on the same source table, they should share
 a single replication slot and publication. The existing
-`pgstream.pgs_change_tracking` table already tracks this:
+`pgtrickle.pgt_change_tracking` table already tracks this:
 
 ```sql
 -- Existing table (from lib.rs)
-CREATE TABLE pgstream.pgs_change_tracking (
+CREATE TABLE pgtrickle.pgt_change_tracking (
     source_relid        OID PRIMARY KEY,
     slot_name           TEXT NOT NULL,
     last_consumed_lsn   PG_LSN,
-    tracked_by_pgs_ids  BIGINT[]
+    tracked_by_pgt_ids  BIGINT[]
 );
 ```
 
 This table serves as the reference count for shared slots:
 - When the first ST targeting a source enables WAL → create slot + decoder
-- When additional STs target the same source → add `pgs_id` to array
-- When a ST is dropped → remove `pgs_id`; if array empty → drop slot + decoder
+- When additional STs target the same source → add `pgt_id` to array
+- When a ST is dropped → remove `pgt_id`; if array empty → drop slot + decoder
 
 ---
 
@@ -844,9 +844,9 @@ This table serves as the reference count for shared slots:
 
 On scheduler startup (already has `recover_from_crash()`):
 
-1. Scan `pgs_dependencies` for `cdc_mode = 'TRANSITIONING'`
+1. Scan `pgt_dependencies` for `cdc_mode = 'TRANSITIONING'`
 2. If transition timed out → `abort_wal_transition()`
-3. Scan `pgs_dependencies` for `cdc_mode = 'WAL'`
+3. Scan `pgt_dependencies` for `cdc_mode = 'WAL'`
 4. Verify replication slots exist in `pg_replication_slots`
 5. If slot missing → fall back to triggers, recreate trigger
 
@@ -854,7 +854,7 @@ On scheduler startup (already has `recover_from_crash()`):
 
 ## Rollout Strategy
 
-The hybrid approach is **opt-in** via the `pg_stream.cdc_mode` GUC:
+The hybrid approach is **opt-in** via the `pg_trickle.cdc_mode` GUC:
 
 | Setting | Behavior |
 |---|---|
@@ -864,7 +864,7 @@ The hybrid approach is **opt-in** via the `pg_stream.cdc_mode` GUC:
 
 This allows:
 - Existing users: zero change, zero risk
-- Adventurous users: set `pg_stream.cdc_mode = 'auto'` and benefit from reduced
+- Adventurous users: set `pg_trickle.cdc_mode = 'auto'` and benefit from reduced
   write overhead
 - Environments already using logical replication: set `'wal'` for guaranteed
   WAL-based CDC
@@ -919,7 +919,7 @@ Phases 5 and 6 are follow-up work.
    row came from a trigger or WAL decoder aids transition dedup but slightly
    widens the buffer table. Worth it for correctness during transition.
 
-4. **REPLICA IDENTITY FULL auto-set** — Should pg_stream automatically set
+4. **REPLICA IDENTITY FULL auto-set** — Should pg_trickle automatically set
    `REPLICA IDENTITY FULL` on source tables without PKs? This has side effects
    for other WAL consumers. Default to `false`; let users opt in.
 
@@ -943,7 +943,7 @@ transaction cannot commit until all of them complete:
 |---|---|---|
 | PL/pgSQL function dispatch | ~0.5–1 μs | Function cache lookup, parameter binding |
 | `pg_current_wal_lsn()` | ~0.2 μs | Lightweight syscall to read WAL position |
-| `pg_stream_hash()` / `pg_stream_hash_multi()` | ~0.5–5 μs | Scales with PK width; composite keys are more expensive |
+| `pg_trickle_hash()` / `pg_trickle_hash_multi()` | ~0.5–5 μs | Scales with PK width; composite keys are more expensive |
 | Buffer table heap INSERT | ~1–3 μs | Writes OLD+NEW typed columns (row width dependent) |
 | Buffer table index update | ~0.5–2 μs | Single covering B-tree: `(lsn, pk_hash, change_id) INCLUDE (action)` |
 | `BIGSERIAL` sequence increment | ~0.1–0.3 μs | Lightweight lock on `change_id` sequence |
@@ -1050,7 +1050,7 @@ largest wins. The synchronous overhead compounds under concurrency.
 | Aspect | Triggers | WAL-based |
 |---|---|---|
 | TRUNCATE captured | ❌ No — stream table goes stale | ✅ Yes — native WAL event |
-| Recovery | Manual: `SELECT pgstream.refresh_stream_table('...')` | Automatic: decoder captures TRUNCATE, marks reinit |
+| Recovery | Manual: `SELECT pgtrickle.refresh_stream_table('...')` | Automatic: decoder captures TRUNCATE, marks reinit |
 | Performance | N/A (correctness issue, not perf) | N/A |
 
 **Practical impact: Critical for ETL users.** This is a correctness fix, not
@@ -1101,7 +1101,7 @@ tables, but this happens in a separate process and can be batched.
 | TRUNCATE patterns | Correctness fix | **Critical** — eliminates stale-data risk |
 | Low-volume, narrow tables | ~15% faster writes | **Negligible** — not worth the complexity alone |
 
-**Overall estimate for the "average" pg_stream user (moderate writes, <20
+**Overall estimate for the "average" pg_trickle user (moderate writes, <20
 columns, <10 concurrent writers): 20–40% faster source-table writes.**
 
 **For high-throughput users (batch ETL, wide tables, 50+ concurrent writers):

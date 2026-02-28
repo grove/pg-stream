@@ -54,7 +54,7 @@ async fn test_full_lifecycle_create_mutate_refresh_drop() {
     // Verify cleanup
     assert!(!db.table_exists("public", "lc_st").await);
     let cat_count: i64 = db
-        .query_scalar("SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'lc_st'")
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'lc_st'")
         .await;
     assert_eq!(cat_count, 0);
 }
@@ -219,7 +219,7 @@ async fn test_empty_source_table() {
 
     assert_eq!(db.count("public.empty_st").await, 0);
 
-    let (status, _, populated, _) = db.pgs_status("empty_st").await;
+    let (status, _, populated, _) = db.pgt_status("empty_st").await;
     assert_eq!(status, "ACTIVE");
     assert!(populated, "is_populated should be true even with 0 rows");
 }

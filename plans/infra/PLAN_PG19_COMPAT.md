@@ -2,13 +2,13 @@
 
 > **Status:** Draft  
 > **Target version:** Post-1.0 (Advanced SQL A3)  
-> **Author:** pg_stream project
+> **Author:** pg_trickle project
 
 ---
 
 ## 1. Overview
 
-pg_stream currently targets PostgreSQL 18.x exclusively. This document covers
+pg_trickle currently targets PostgreSQL 18.x exclusively. This document covers
 the strategy to add PostgreSQL 19 support without regressing PG18 support,
 targeting the period after PostgreSQL 19 beta availability (estimated late 2026).
 
@@ -141,8 +141,8 @@ required code updates. For PG19:
 | PostgreSQL 19 alpha 1 | May 2026 |
 | PostgreSQL 19 beta 1 | June 2026 |
 | pgrx 0.18.x with PG19 support | July–August 2026 |
-| pg_stream PG19 CI green | August–September 2026 |
-| pg_stream 1.1.0 with PG19 support | September–October 2026 |
+| pg_trickle PG19 CI green | August–September 2026 |
+| pg_trickle 1.1.0 with PG19 support | September–October 2026 |
 
 ---
 

@@ -1,22 +1,22 @@
 # =============================================================================
 # Extension-only image for CloudNativePG Image Volume Extensions.
 #
-# Contains ONLY the pg_stream shared library, control file, and SQL
+# Contains ONLY the pg_trickle shared library, control file, and SQL
 # migrations. Designed to be mounted as an ImageVolume in a CNPG Cluster.
 #
 # This is a scratch-based image with no OS, no shell, no PostgreSQL server.
-# CNPG mounts it at /extensions/pg-stream/ and configures:
-#   extension_control_path → /extensions/pg-stream/share
-#   dynamic_library_path   → /extensions/pg-stream/lib
+# CNPG mounts it at /extensions/pg-trickle/ and configures:
+#   extension_control_path → /extensions/pg-trickle/share
+#   dynamic_library_path   → /extensions/pg-trickle/lib
 #
 # Usage (from dist/ context with pre-built artifacts in artifact/):
-#   docker build -t pg_stream-ext:latest -f cnpg/Dockerfile.ext dist/
+#   docker build -t pg_trickle-ext:latest -f cnpg/Dockerfile.ext dist/
 #
 # See: https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/
 # =============================================================================
 FROM scratch
 
-ARG REPO_URL=https://github.com/grove/pg-stream
+ARG REPO_URL=https://github.com/grove/pg-trickle
 ARG VERSION=dev
 
 # Extension shared library (.so)
@@ -26,8 +26,8 @@ COPY artifact/lib/*.so /lib/
 COPY artifact/extension/ /share/extension/
 
 # OCI image labels
-LABEL org.opencontainers.image.title="pg_stream-ext" \
-      org.opencontainers.image.description="pg_stream extension for CloudNativePG Image Volume Extensions" \
+LABEL org.opencontainers.image.title="pg_trickle-ext" \
+      org.opencontainers.image.description="pg_trickle extension for CloudNativePG Image Volume Extensions" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="${REPO_URL}"

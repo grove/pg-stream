@@ -2,7 +2,7 @@
 //!
 //! ΔI(Scan(T)) reads from the change buffer table for T.
 //!
-//! The change buffer table `pgstream_changes.changes_<oid>` contains:
+//! The change buffer table `pgtrickle_changes.changes_<oid>` contains:
 //! - change_id BIGSERIAL — insertion ordering (no PK index)
 //! - lsn PG_LSN
 //! - action CHAR(1) — 'I', 'U', 'D'
@@ -22,19 +22,19 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a Scan node.
 ///
 /// Reads from the change buffer in a **single pass** and produces a delta
-/// with columns: `__pgs_row_id`, `__pgs_action`, plus all table columns.
+/// with columns: `__pgt_row_id`, `__pgt_action`, plus all table columns.
 ///
 /// UPDATEs are expanded into (DELETE old, INSERT new) via UNION ALL
 /// branches, so the change buffer index on `lsn` is used exactly once.
 ///
 /// Column extraction uses typed columns `c."new_{col}"` / `c."old_{col}"`
 /// directly from the change buffer table — no JSONB deserialization.
-pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Scan {
         table_oid,
         columns,
@@ -43,7 +43,7 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStr
         ..
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_scan called on non-Scan node".into(),
         ));
     };
@@ -64,7 +64,7 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStr
     // Always use the pre-computed pk_hash from the trigger (G-J1 optimization).
     let pk_hash_expr = "c.pk_hash".to_string();
 
-    // For the DELETE part of an UPDATE split, the __pgs_row_id must match
+    // For the DELETE part of an UPDATE split, the __pgt_row_id must match
     // the existing ST row, which was computed from the OLD column values.
     // The trigger stores pk_hash from NEW values for UPDATEs, so we
     // recompute an old-value-based hash for the DELETE branch.
@@ -82,10 +82,10 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStr
         .map(|c| format!("c.{}::TEXT", quote_ident(&format!("old_{c}"))))
         .collect();
     let old_pk_hash_expr = if old_hash_args.len() == 1 {
-        format!("pgstream.pg_stream_hash({})", old_hash_args[0])
+        format!("pgtrickle.pg_trickle_hash({})", old_hash_args[0])
     } else {
         format!(
-            "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
             old_hash_args.join(", "),
         )
     };
@@ -234,10 +234,10 @@ SELECT * FROM {multi_cte}",
     let cte_name = ctx.next_cte_name(&format!("scan_{alias}"));
     let is_deduplicated;
 
-    // DELETE __pgs_row_id uses __pk_hash_old (computed from OLD column
+    // DELETE __pgt_row_id uses __pk_hash_old (computed from OLD column
     // values) so it matches the existing ST row — critical for keyless
     // tables where UPDATE changes ALL columns and thus the hash.
-    // INSERT __pgs_row_id uses __pk_hash (from NEW column values).
+    // INSERT __pgt_row_id uses __pk_hash (from NEW column values).
 
     let sql = if ctx.merge_safe_dedup {
         // ── Merge-safe dedup mode ──────────────────────────────────────
@@ -251,8 +251,8 @@ SELECT * FROM {multi_cte}",
 -- the row hash changed (keyless table update — old row must be removed).
 -- For PK-based tables __pk_hash_old == __pk_hash always, so the OR
 -- clause never fires → no regression.
-SELECT c.__pk_hash_old AS __pgs_row_id,
-       'D'::TEXT AS __pgs_action,
+SELECT c.__pk_hash_old AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
        {old_col_refs}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash_old)
@@ -266,8 +266,8 @@ FROM (
 UNION ALL
 
 -- INSERT events: row exists after (handles inserts + updates)
-SELECT c.__pk_hash AS __pgs_row_id,
-       'I'::TEXT AS __pgs_action,
+SELECT c.__pk_hash AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
        {new_col_refs}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash)
@@ -289,8 +289,8 @@ FROM (
 -- Uses old_* columns from the earliest non-INSERT change per PK.
 -- __pk_hash_old ensures the row_id matches the existing ST row,
 -- which is critical for keyless tables where all-column hash changes.
-SELECT c.__pk_hash_old AS __pgs_row_id,
-       'D'::TEXT AS __pgs_action,
+SELECT c.__pk_hash_old AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
        {old_col_refs}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash)
@@ -304,8 +304,8 @@ UNION ALL
 
 -- INSERT events: row exists after (last_action != 'D')
 -- Uses new_* columns from the latest non-DELETE change per PK.
-SELECT c.__pk_hash AS __pgs_row_id,
-       'I'::TEXT AS __pgs_action,
+SELECT c.__pk_hash AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
        {new_col_refs}
 FROM (
   SELECT DISTINCT ON (s.__pk_hash)
@@ -345,11 +345,11 @@ fn find_pk_columns(pk_columns: &[String], columns: &[crate::dvm::parser::Column]
 /// Build a hash expression from a list of SQL expressions.
 pub fn build_hash_expr(exprs: &[String]) -> String {
     if exprs.len() == 1 {
-        format!("pgstream.pg_stream_hash({})", exprs[0])
+        format!("pgtrickle.pg_trickle_hash({})", exprs[0])
     } else {
         let array_items: Vec<String> = exprs.iter().map(|e| format!("{e}::TEXT")).collect();
         format!(
-            "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
             array_items.join(", "),
         )
     }
@@ -379,7 +379,7 @@ mod tests {
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        assert_sql_contains(&sql, "\"pgstream_changes\".changes_42");
+        assert_sql_contains(&sql, "\"pgtrickle_changes\".changes_42");
     }
 
     #[test]
@@ -451,8 +451,8 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         // Should have DELETE and INSERT event branches
-        assert_sql_contains(&sql, "'D'::TEXT AS __pgs_action");
-        assert_sql_contains(&sql, "'I'::TEXT AS __pgs_action");
+        assert_sql_contains(&sql, "'D'::TEXT AS __pgt_action");
+        assert_sql_contains(&sql, "'I'::TEXT AS __pgt_action");
     }
 
     #[test]
@@ -537,13 +537,13 @@ mod tests {
     #[test]
     fn test_build_hash_expr_single() {
         let result = build_hash_expr(&["x".to_string()]);
-        assert_eq!(result, "pgstream.pg_stream_hash(x)");
+        assert_eq!(result, "pgtrickle.pg_trickle_hash(x)");
     }
 
     #[test]
     fn test_build_hash_expr_multiple() {
         let result = build_hash_expr(&["a".to_string(), "b".to_string()]);
-        assert!(result.contains("pgstream.pg_stream_hash_multi"));
+        assert!(result.contains("pgtrickle.pg_trickle_hash_multi"));
         assert!(result.contains("a::TEXT"));
         assert!(result.contains("b::TEXT"));
     }

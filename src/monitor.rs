@@ -1,18 +1,18 @@
-//! Monitoring, observability, and alerting for pgstream.
+//! Monitoring, observability, and alerting for pgtrickle.
 //!
 //! # Statistics
 //!
 //! Per-ST statistics are tracked in shared memory via atomic counters and
-//! exposed through the `pgstream.st_refresh_stats()` table-returning function
-//! which aggregates from `pgstream.pgs_refresh_history`.
+//! exposed through the `pgtrickle.st_refresh_stats()` table-returning function
+//! which aggregates from `pgtrickle.pgt_refresh_history`.
 //!
-//! The `pgstream.pg_stat_stream_tables` view combines catalog metadata with
+//! The `pgtrickle.pg_stat_stream_tables` view combines catalog metadata with
 //! runtime stats for a single-query operational overview.
 //!
 //! # NOTIFY Alerting
 //!
 //! Operational events are emitted via PostgreSQL `NOTIFY` on the
-//! `pg_stream_alert` channel. Clients can `LISTEN pg_stream_alert;` to receive
+//! `pg_trickle_alert` channel. Clients can `LISTEN pg_trickle_alert;` to receive
 //! JSON-formatted events:
 //! - `stale` — data staleness exceeds 2× schedule
 //! - `auto_suspended` — ST suspended due to consecutive errors
@@ -23,12 +23,12 @@ use pgrx::prelude::*;
 
 use crate::catalog::{CdcMode, StDependency};
 use crate::config;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::wal_decoder;
 
 // ── NOTIFY Alerting ────────────────────────────────────────────────────────
 
-/// Alert event types emitted on the `pg_stream_alert` NOTIFY channel.
+/// Alert event types emitted on the `pg_trickle_alert` NOTIFY channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlertEvent {
     /// data staleness exceeds 2× schedule.
@@ -61,17 +61,17 @@ impl AlertEvent {
     }
 }
 
-/// Emit a NOTIFY on the `pg_stream_alert` channel with a JSON payload.
+/// Emit a NOTIFY on the `pg_trickle_alert` channel with a JSON payload.
 ///
 /// The payload is a JSON object with at minimum an `event` field.
 /// Callers can add arbitrary key-value pairs for context.
-pub fn emit_alert(event: AlertEvent, pgs_schema: &str, pgs_name: &str, extra: &str) {
+pub fn emit_alert(event: AlertEvent, pgt_schema: &str, pgt_name: &str, extra: &str) {
     let payload = format!(
-        r#"{{"event":"{}","pgs_schema":"{}","pgs_name":"{}","st":"{}",{}}}"#,
+        r#"{{"event":"{}","pgt_schema":"{}","pgt_name":"{}","st":"{}",{}}}"#,
         event.as_str(),
-        pgs_schema.replace('"', r#"\""#),
-        pgs_name.replace('"', r#"\""#),
-        format!("{}.{}", pgs_schema, pgs_name).replace('"', r#"\""#),
+        pgt_schema.replace('"', r#"\""#),
+        pgt_name.replace('"', r#"\""#),
+        format!("{}.{}", pgt_schema, pgt_name).replace('"', r#"\""#),
         extra,
     );
 
@@ -84,19 +84,19 @@ pub fn emit_alert(event: AlertEvent, pgs_schema: &str, pgs_name: &str, extra: &s
 
     // Escape single quotes for SQL
     let escaped = safe_payload.replace('\'', "''");
-    let sql = format!("NOTIFY pg_stream_alert, '{}'", escaped);
+    let sql = format!("NOTIFY pg_trickle_alert, '{}'", escaped);
 
     if let Err(e) = Spi::run(&sql) {
-        pgrx::warning!("pg_stream: failed to emit alert {}: {}", event.as_str(), e);
+        pgrx::warning!("pg_trickle: failed to emit alert {}: {}", event.as_str(), e);
     }
 }
 
 /// Emit a stale-data alert.
-pub fn alert_stale_data(pgs_schema: &str, pgs_name: &str, staleness_secs: f64, schedule_secs: f64) {
+pub fn alert_stale_data(pgt_schema: &str, pgt_name: &str, staleness_secs: f64, schedule_secs: f64) {
     emit_alert(
         AlertEvent::StaleData,
-        pgs_schema,
-        pgs_name,
+        pgt_schema,
+        pgt_name,
         &format!(
             r#""staleness_seconds":{:.1},"schedule_seconds":{:.1},"ratio":{:.2}"#,
             staleness_secs,
@@ -111,31 +111,31 @@ pub fn alert_stale_data(pgs_schema: &str, pgs_name: &str, staleness_secs: f64, s
 }
 
 /// Emit an auto-suspended alert.
-pub fn alert_auto_suspended(pgs_schema: &str, pgs_name: &str, error_count: i32) {
+pub fn alert_auto_suspended(pgt_schema: &str, pgt_name: &str, error_count: i32) {
     emit_alert(
         AlertEvent::AutoSuspended,
-        pgs_schema,
-        pgs_name,
+        pgt_schema,
+        pgt_name,
         &format!(r#""consecutive_errors":{}"#, error_count),
     );
 }
 
 /// Emit a resumed alert (ST cleared from SUSPENDED back to ACTIVE).
-pub fn alert_resumed(pgs_schema: &str, pgs_name: &str) {
+pub fn alert_resumed(pgt_schema: &str, pgt_name: &str) {
     emit_alert(
         AlertEvent::Resumed,
-        pgs_schema,
-        pgs_name,
+        pgt_schema,
+        pgt_name,
         r#""previous_status":"SUSPENDED""#,
     );
 }
 
 /// Emit a reinitialize-needed alert.
-pub fn alert_reinitialize_needed(pgs_schema: &str, pgs_name: &str, reason: &str) {
+pub fn alert_reinitialize_needed(pgt_schema: &str, pgt_name: &str, reason: &str) {
     emit_alert(
         AlertEvent::ReinitializeNeeded,
-        pgs_schema,
-        pgs_name,
+        pgt_schema,
+        pgt_name,
         &format!(r#""reason":"{}""#, reason.replace('"', r#"\""#)),
     );
 }
@@ -148,16 +148,16 @@ pub fn alert_buffer_growth(slot_name: &str, pending_bytes: i64) {
         pending_bytes,
     );
     let escaped = payload.replace('\'', "''");
-    let sql = format!("NOTIFY pg_stream_alert, '{}'", escaped);
+    let sql = format!("NOTIFY pg_trickle_alert, '{}'", escaped);
     if let Err(e) = Spi::run(&sql) {
-        pgrx::warning!("pg_stream: failed to emit slot_lag_warning: {}", e);
+        pgrx::warning!("pg_trickle: failed to emit slot_lag_warning: {}", e);
     }
 }
 
 /// Emit a refresh-completed alert.
 pub fn alert_refresh_completed(
-    pgs_schema: &str,
-    pgs_name: &str,
+    pgt_schema: &str,
+    pgt_name: &str,
     action: &str,
     rows_inserted: i64,
     rows_deleted: i64,
@@ -165,8 +165,8 @@ pub fn alert_refresh_completed(
 ) {
     emit_alert(
         AlertEvent::RefreshCompleted,
-        pgs_schema,
-        pgs_name,
+        pgt_schema,
+        pgt_name,
         &format!(
             r#""action":"{}","rows_inserted":{},"rows_deleted":{},"duration_ms":{}"#,
             action, rows_inserted, rows_deleted, duration_ms,
@@ -175,11 +175,11 @@ pub fn alert_refresh_completed(
 }
 
 /// Emit a refresh-failed alert.
-pub fn alert_refresh_failed(pgs_schema: &str, pgs_name: &str, action: &str, error: &str) {
+pub fn alert_refresh_failed(pgt_schema: &str, pgt_name: &str, action: &str, error: &str) {
     emit_alert(
         AlertEvent::RefreshFailed,
-        pgs_schema,
-        pgs_name,
+        pgt_schema,
+        pgt_name,
         &format!(
             r#""action":"{}","error":"{}""#,
             action,
@@ -192,14 +192,14 @@ pub fn alert_refresh_failed(pgs_schema: &str, pgs_name: &str, action: &str, erro
 
 /// Return per-ST refresh statistics aggregated from the refresh history table.
 ///
-/// This is the primary monitoring function, exposed as `pgstream.st_refresh_stats()`.
-#[pg_extern(schema = "pgstream", name = "st_refresh_stats")]
+/// This is the primary monitoring function, exposed as `pgtrickle.st_refresh_stats()`.
+#[pg_extern(schema = "pgtrickle", name = "st_refresh_stats")]
 #[allow(clippy::type_complexity)]
 fn st_refresh_stats() -> TableIterator<
     'static,
     (
-        name!(pgs_name, String),
-        name!(pgs_schema, String),
+        name!(pgt_name, String),
+        name!(pgt_schema, String),
         name!(status, String),
         name!(refresh_mode, String),
         name!(is_populated, bool),
@@ -220,8 +220,8 @@ fn st_refresh_stats() -> TableIterator<
         let result = client
             .select(
                 "SELECT
-                    st.pgs_name,
-                    st.pgs_schema,
+                    st.pgt_name,
+                    st.pgt_schema,
                     st.status,
                     st.refresh_mode,
                     st.is_populated,
@@ -240,10 +240,10 @@ fn st_refresh_stats() -> TableIterator<
                                   AND st.schedule NOT LIKE '% %'
                                   AND st.schedule NOT LIKE '@%'
                              THEN EXTRACT(EPOCH FROM (now() - st.data_timestamp)) >
-                                  pgstream.parse_duration_seconds(st.schedule)
+                                  pgtrickle.parse_duration_seconds(st.schedule)
                         END,
                     false)
-                FROM pgstream.pgs_stream_tables st
+                FROM pgtrickle.pgt_stream_tables st
                 LEFT JOIN LATERAL (
                     SELECT
                         count(*) AS total_refreshes,
@@ -256,17 +256,17 @@ fn st_refresh_stats() -> TableIterator<
                                   FILTER (WHERE h.end_time IS NOT NULL)
                              ELSE 0
                         END AS avg_duration_ms
-                    FROM pgstream.pgs_refresh_history h
-                    WHERE h.pgs_id = st.pgs_id
+                    FROM pgtrickle.pgt_refresh_history h
+                    WHERE h.pgt_id = st.pgt_id
                 ) stats ON true
                 LEFT JOIN LATERAL (
                     SELECT h2.action, h2.status
-                    FROM pgstream.pgs_refresh_history h2
-                    WHERE h2.pgs_id = st.pgs_id
+                    FROM pgtrickle.pgt_refresh_history h2
+                    WHERE h2.pgt_id = st.pgt_id
                     ORDER BY h2.refresh_id DESC
                     LIMIT 1
                 ) last_hist ON true
-                ORDER BY st.pgs_schema, st.pgs_name",
+                ORDER BY st.pgt_schema, st.pgt_name",
                 None,
                 &[],
             )
@@ -275,8 +275,8 @@ fn st_refresh_stats() -> TableIterator<
 
         let mut out = Vec::new();
         for row in result {
-            let pgs_name = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
-            let pgs_schema = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+            let pgt_name = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let pgt_schema = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
             let status = row.get::<String>(3).unwrap_or(None).unwrap_or_default();
             let refresh_mode = row.get::<String>(4).unwrap_or(None).unwrap_or_default();
             let is_populated = row.get::<bool>(5).unwrap_or(None).unwrap_or(false);
@@ -293,8 +293,8 @@ fn st_refresh_stats() -> TableIterator<
             let stale = row.get::<bool>(16).unwrap_or(None).unwrap_or(false);
 
             out.push((
-                pgs_name,
-                pgs_schema,
+                pgt_name,
+                pgt_schema,
                 status,
                 refresh_mode,
                 is_populated,
@@ -319,8 +319,8 @@ fn st_refresh_stats() -> TableIterator<
 
 /// Return refresh history for a specific ST, most recent first.
 ///
-/// Exposed as `pgstream.get_refresh_history(name, limit)`.
-#[pg_extern(schema = "pgstream", name = "get_refresh_history")]
+/// Exposed as `pgtrickle.get_refresh_history(name, limit)`.
+#[pg_extern(schema = "pgtrickle", name = "get_refresh_history")]
 #[allow(clippy::type_complexity)]
 fn get_refresh_history(
     name: &str,
@@ -364,9 +364,9 @@ fn get_refresh_history(
                          ELSE NULL
                     END::float8,
                     h.error_message
-                FROM pgstream.pgs_refresh_history h
-                JOIN pgstream.pgs_stream_tables st ON st.pgs_id = h.pgs_id
-                WHERE st.pgs_schema = $1 AND st.pgs_name = $2
+                FROM pgtrickle.pgt_refresh_history h
+                JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+                WHERE st.pgt_schema = $1 AND st.pgt_name = $2
                 ORDER BY h.refresh_id DESC
                 LIMIT $3",
                 None,
@@ -411,8 +411,8 @@ fn get_refresh_history(
 /// Get the current staleness in seconds for a specific ST.
 ///
 /// Returns NULL if the ST has never been refreshed.
-/// Exposed as `pgstream.get_staleness(name)`.
-#[pg_extern(schema = "pgstream", name = "get_staleness")]
+/// Exposed as `pgtrickle.get_staleness(name)`.
+#[pg_extern(schema = "pgtrickle", name = "get_staleness")]
 fn get_staleness(name: &str) -> Option<f64> {
     let parts: Vec<&str> = name.splitn(2, '.').collect();
     let (schema, table_name) = if parts.len() == 2 {
@@ -423,8 +423,8 @@ fn get_staleness(name: &str) -> Option<f64> {
 
     Spi::get_one_with_args::<f64>(
         "SELECT EXTRACT(EPOCH FROM (now() - data_timestamp))::float8 \
-         FROM pgstream.pgs_stream_tables \
-         WHERE pgs_schema = $1 AND pgs_name = $2 AND data_timestamp IS NOT NULL",
+         FROM pgtrickle.pgt_stream_tables \
+         WHERE pgt_schema = $1 AND pgt_name = $2 AND data_timestamp IS NOT NULL",
         &[schema.into(), table_name.into()],
     )
     .unwrap_or(None)
@@ -434,8 +434,8 @@ fn get_staleness(name: &str) -> Option<f64> {
 ///
 /// Returns trigger/slot name, source table, active status, retained WAL bytes,
 /// and the CDC mode (`trigger`, `wal`, or `transitioning`).
-/// Exposed as `pgstream.slot_health()` (kept for API compatibility).
-#[pg_extern(schema = "pgstream", name = "slot_health")]
+/// Exposed as `pgtrickle.slot_health()` (kept for API compatibility).
+#[pg_extern(schema = "pgtrickle", name = "slot_health")]
 fn slot_health() -> TableIterator<
     'static,
     (
@@ -455,7 +455,7 @@ fn slot_health() -> TableIterator<
                 "SELECT
                     ct.slot_name,
                     ct.source_relid::bigint
-                FROM pgstream.pgs_change_tracking ct",
+                FROM pgtrickle.pgt_change_tracking ct",
                 None,
                 &[],
             )
@@ -517,8 +517,8 @@ fn slot_health() -> TableIterator<
 ///
 /// Returns whether the query supports differential refresh,
 /// lists the operators found, and shows the generated delta query.
-/// Exposed as `pgstream.explain_st(name)`.
-#[pg_extern(schema = "pgstream", name = "explain_st")]
+/// Exposed as `pgtrickle.explain_st(name)`.
+#[pg_extern(schema = "pgtrickle", name = "explain_st")]
 fn explain_st(
     name: &str,
 ) -> TableIterator<'static, (name!(property, String), name!(value, String))> {
@@ -535,7 +535,10 @@ fn explain_st(
     TableIterator::new(rows)
 }
 
-fn explain_st_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String)>, PgStreamError> {
+fn explain_st_impl(
+    schema: &str,
+    table_name: &str,
+) -> Result<Vec<(String, String)>, PgTrickleError> {
     use crate::catalog::StreamTableMeta;
     use crate::dvm;
 
@@ -544,8 +547,8 @@ fn explain_st_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String
     let mut props = Vec::new();
 
     props.push((
-        "pgs_name".to_string(),
-        format!("{}.{}", st.pgs_schema, st.pgs_name),
+        "pgt_name".to_string(),
+        format!("{}.{}", st.pgt_schema, st.pgt_name),
     ));
     props.push(("defining_query".to_string(), st.defining_query.clone()));
     props.push((
@@ -581,8 +584,8 @@ fn explain_st_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String
                 &st.defining_query,
                 &prev_frontier,
                 &new_frontier,
-                &st.pgs_schema,
-                &st.pgs_name,
+                &st.pgt_schema,
+                &st.pgt_name,
             ) {
                 Ok(result) => {
                     props.push(("delta_query".to_string(), result.delta_sql));
@@ -617,8 +620,8 @@ fn explain_st_impl(schema: &str, table_name: &str) -> Result<Vec<(String, String
 /// Returns per-source health status including CDC mode, estimated lag,
 /// last confirmed LSN, and whether the slot lag exceeds a threshold.
 ///
-/// Exposed as `pgstream.check_cdc_health()`.
-#[pg_extern(schema = "pgstream", name = "check_cdc_health")]
+/// Exposed as `pgtrickle.check_cdc_health()`.
+#[pg_extern(schema = "pgtrickle", name = "check_cdc_health")]
 #[allow(clippy::type_complexity)]
 fn check_cdc_health() -> TableIterator<
     'static,
@@ -713,7 +716,7 @@ fn check_cdc_health() -> TableIterator<
 
 // ── CDC Transition NOTIFY ──────────────────────────────────────────────────
 
-/// Emit a `NOTIFY pg_stream_cdc_transition` with a JSON payload when a
+/// Emit a `NOTIFY pg_trickle_cdc_transition` with a JSON payload when a
 /// source transitions between CDC modes.
 ///
 /// Payload includes source table name, old mode, new mode, and slot name.
@@ -740,10 +743,10 @@ pub fn emit_cdc_transition_notify(
     );
 
     let escaped = payload.replace('\'', "''");
-    let sql = format!("NOTIFY pg_stream_cdc_transition, '{}'", escaped);
+    let sql = format!("NOTIFY pg_trickle_cdc_transition, '{}'", escaped);
 
     if let Err(e) = Spi::run(&sql) {
-        pgrx::warning!("pg_stream: failed to emit cdc_transition NOTIFY: {}", e);
+        pgrx::warning!("pg_trickle: failed to emit cdc_transition NOTIFY: {}", e);
     }
 }
 
@@ -756,13 +759,13 @@ pub fn emit_cdc_transition_notify(
 pub fn check_slot_health_and_alert() {
     // With trigger-based CDC, we check pending change buffer size instead
     // of replication slot WAL retention. Alert if buffer tables grow too large.
-    let change_schema = config::pg_stream_change_buffer_schema();
+    let change_schema = config::pg_trickle_change_buffer_schema();
 
     let sources = Spi::connect(|client| {
         let result = client
             .select(
                 "SELECT ct.slot_name, ct.source_relid::bigint \
-                 FROM pgstream.pgs_change_tracking ct",
+                 FROM pgtrickle.pgt_change_tracking ct",
                 None,
                 &[],
             )

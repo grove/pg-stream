@@ -1,5 +1,5 @@
 //! E2E test harness that boots a PostgreSQL 18.1 container with
-//! the pg_stream extension pre-installed.
+//! the pg_trickle extension pre-installed.
 //!
 //! # Prerequisites
 //!
@@ -29,13 +29,13 @@ use testcontainers::{
     runners::AsyncRunner,
 };
 
-const IMAGE_NAME: &str = "pg_stream_e2e";
+const IMAGE_NAME: &str = "pg_trickle_e2e";
 const IMAGE_TAG: &str = "latest";
 
 /// Return the Docker image name to use for E2E containers.
 ///
 /// Reads `PGS_E2E_IMAGE` env var. If set, it is expected to be in
-/// `name:tag` form (e.g. `pg_stream_e2e_cov:latest`).
+/// `name:tag` form (e.g. `pg_trickle_e2e_cov:latest`).
 /// Falls back to `IMAGE_NAME:IMAGE_TAG`.
 fn e2e_image() -> (String, String) {
     match std::env::var("PGS_E2E_IMAGE") {
@@ -61,7 +61,7 @@ fn coverage_mount() -> Option<Mount> {
 }
 
 /// A test database backed by a PostgreSQL 18.1 container with
-/// the compiled pg_stream extension installed and
+/// the compiled pg_trickle extension installed and
 /// `shared_preload_libraries` configured.
 ///
 /// The container is automatically cleaned up when `E2eDb` is dropped.
@@ -77,7 +77,7 @@ impl E2eDb {
     /// The container is ready to accept connections but the extension is NOT
     /// yet created. Call [`with_extension`] to run `CREATE EXTENSION`.
     pub async fn new() -> Self {
-        Self::new_with_db("pg_stream_test").await
+        Self::new_with_db("pg_trickle_test").await
     }
 
     /// Start a container and connect to the `postgres` database.
@@ -106,7 +106,7 @@ impl E2eDb {
     /// docker run --cpus=2 --cpuset-cpus=0,1 --memory=2g ...
     /// ```
     pub async fn new_bench() -> Self {
-        Self::new_with_db_bench("pg_stream_test").await
+        Self::new_with_db_bench("pg_trickle_test").await
     }
 
     /// Get the Docker container ID (for `docker logs` and profile capture).
@@ -132,7 +132,7 @@ impl E2eDb {
         }
 
         let container = image.start().await.expect(
-            "Failed to start pg_stream E2E container. \
+            "Failed to start pg_trickle E2E container. \
                      Did you run ./tests/build_e2e_image.sh first?",
         );
 
@@ -249,15 +249,15 @@ impl E2eDb {
         unreachable!()
     }
 
-    /// Install the extension (`CREATE EXTENSION pg_stream`).
+    /// Install the extension (`CREATE EXTENSION pg_trickle`).
     ///
     /// This creates all catalog tables, views, event triggers, and
-    /// SQL functions in the `pg_stream` schema.
+    /// SQL functions in the `pg_trickle` schema.
     pub async fn with_extension(self) -> Self {
-        sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_stream CASCADE")
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE")
             .execute(&self.pool)
             .await
-            .expect("Failed to CREATE EXTENSION pg_stream");
+            .expect("Failed to CREATE EXTENSION pg_trickle");
         self
     }
 
@@ -308,10 +308,10 @@ impl E2eDb {
 
     // ── Extension API Helpers ──────────────────────────────────────────
 
-    /// Create a stream table via `pgstream.create_stream_table()`.
+    /// Create a stream table via `pgtrickle.create_stream_table()`.
     pub async fn create_st(&self, name: &str, query: &str, schedule: &str, refresh_mode: &str) {
         let sql = format!(
-            "SELECT pgstream.create_stream_table('{name}', $${query}$$, \
+            "SELECT pgtrickle.create_stream_table('{name}', $${query}$$, \
              '{schedule}', '{refresh_mode}')"
         );
         self.execute(&sql).await;
@@ -327,32 +327,32 @@ impl E2eDb {
         initialize: bool,
     ) {
         let sql = format!(
-            "SELECT pgstream.create_stream_table('{name}', $${query}$$, \
+            "SELECT pgtrickle.create_stream_table('{name}', $${query}$$, \
              '{schedule}', '{refresh_mode}', {initialize})"
         );
         self.execute(&sql).await;
     }
 
-    /// Refresh a stream table via `pgstream.refresh_stream_table()`.
+    /// Refresh a stream table via `pgtrickle.refresh_stream_table()`.
     pub async fn refresh_st(&self, name: &str) {
-        self.execute(&format!("SELECT pgstream.refresh_stream_table('{name}')"))
+        self.execute(&format!("SELECT pgtrickle.refresh_stream_table('{name}')"))
             .await;
     }
 
-    /// Drop a stream table via `pgstream.drop_stream_table()`.
+    /// Drop a stream table via `pgtrickle.drop_stream_table()`.
     pub async fn drop_st(&self, name: &str) {
-        self.execute(&format!("SELECT pgstream.drop_stream_table('{name}')"))
+        self.execute(&format!("SELECT pgtrickle.drop_stream_table('{name}')"))
             .await;
     }
 
-    /// Alter a stream table via `pgstream.alter_stream_table()`.
+    /// Alter a stream table via `pgtrickle.alter_stream_table()`.
     ///
     /// `args` should be the named arguments after the name, e.g.:
     /// `"schedule => '5m'"` or
     /// `"status => 'SUSPENDED'"`.
     pub async fn alter_st(&self, name: &str, args: &str) {
         self.execute(&format!(
-            "SELECT pgstream.alter_stream_table('{name}', {args})"
+            "SELECT pgtrickle.alter_stream_table('{name}', {args})"
         ))
         .await;
     }
@@ -362,21 +362,21 @@ impl E2eDb {
     /// Get the status tuple for a specific ST from the catalog.
     ///
     /// Returns `(status, refresh_mode, is_populated, consecutive_errors)`.
-    pub async fn pgs_status(&self, name: &str) -> (String, String, bool, i32) {
+    pub async fn pgt_status(&self, name: &str) -> (String, String, bool, i32) {
         sqlx::query_as(
             "SELECT status, refresh_mode, is_populated, consecutive_errors \
-             FROM pgstream.pgs_stream_tables \
-             WHERE pgs_schema || '.' || pgs_name = $1 OR pgs_name = $1",
+             FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_schema || '.' || pgt_name = $1 OR pgt_name = $1",
         )
         .bind(name)
         .fetch_one(&self.pool)
         .await
-        .unwrap_or_else(|e| panic!("pgs_status query failed for '{}': {}", name, e))
+        .unwrap_or_else(|e| panic!("pgt_status query failed for '{}': {}", name, e))
     }
 
     /// Verify a ST's contents match its defining query exactly (set equality).
     ///
-    /// Ignores the internal `__pgs_row_id` column by comparing only the
+    /// Ignores the internal `__pgt_row_id` column by comparing only the
     /// user-visible columns produced by the defining query.
     ///
     /// Columns of type `json` are cast to `text` because the `json` type
@@ -394,7 +394,7 @@ impl E2eDb {
              FROM information_schema.columns \
              WHERE (table_schema || '.' || table_name = '{st_table}' \
                 OR table_name = '{st_table}') \
-             AND column_name NOT IN ('__pgs_row_id', '__pgs_count')"
+             AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
         );
         let (raw_cols, cast_cols): (Option<String>, Option<String>) = sqlx::query_as(&cols_sql)
             .fetch_one(&self.pool)
@@ -411,9 +411,9 @@ impl E2eDb {
                 "SELECT NOT EXISTS ( \
                     (SELECT {cast_cols} FROM {st_table} \
                      EXCEPT \
-                     SELECT {cast_cols} FROM ({defining_query}) __pgs_dq) \
+                     SELECT {cast_cols} FROM ({defining_query}) __pgt_dq) \
                     UNION ALL \
-                    (SELECT {cast_cols} FROM ({defining_query}) __pgs_dq2 \
+                    (SELECT {cast_cols} FROM ({defining_query}) __pgt_dq2 \
                      EXCEPT \
                      SELECT {cast_cols} FROM {st_table}) \
                 )"
@@ -473,14 +473,14 @@ impl E2eDb {
     /// or the timeout expires. Returns `true` if a refresh was detected.
     pub async fn wait_for_auto_refresh(
         &self,
-        pgs_name: &str,
+        pgt_name: &str,
         timeout: std::time::Duration,
     ) -> bool {
         let start = std::time::Instant::now();
         let initial_ts: Option<String> = self
             .query_scalar_opt(&format!(
                 "SELECT data_timestamp::text \
-                 FROM pgstream.pgs_stream_tables WHERE pgs_name = '{pgs_name}'"
+                 FROM pgtrickle.pgt_stream_tables WHERE pgt_name = '{pgt_name}'"
             ))
             .await;
 
@@ -493,7 +493,7 @@ impl E2eDb {
             let current_ts: Option<String> = self
                 .query_scalar_opt(&format!(
                     "SELECT data_timestamp::text \
-                     FROM pgstream.pgs_stream_tables WHERE pgs_name = '{pgs_name}'"
+                     FROM pgtrickle.pgt_stream_tables WHERE pgt_name = '{pgt_name}'"
                 ))
                 .await;
 

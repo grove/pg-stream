@@ -59,9 +59,9 @@ CARGO_OUTPUT=$(cargo test --lib --features "$FEATURES" --no-run 2>&1)
 echo "$CARGO_OUTPUT"
 
 # Extract the binary path from cargo output.
-# cargo prints: "Executable unittests src/lib.rs (target/debug/deps/pg_stream-HASH)"
+# cargo prints: "Executable unittests src/lib.rs (target/debug/deps/pg_trickle-HASH)"
 TEST_BIN=$(echo "$CARGO_OUTPUT" \
-           | grep -oE 'target/debug/deps/pg_stream-[a-f0-9]+' \
+           | grep -oE 'target/debug/deps/pg_trickle-[a-f0-9]+' \
            | head -1)
 
 if [[ -n "$TEST_BIN" ]]; then
@@ -69,16 +69,16 @@ if [[ -n "$TEST_BIN" ]]; then
 fi
 
 if [[ -z "${TEST_BIN:-}" ]] || [[ ! -x "$TEST_BIN" ]]; then
-    # Fallback: pick the newest executable pg_stream- binary
+    # Fallback: pick the newest executable pg_trickle- binary
     if [[ "$OS" == "Darwin" ]]; then
         TEST_BIN=$(find "$PROJECT_DIR/target/debug/deps" \
-                        -maxdepth 1 -name 'pg_stream-*' -type f -perm +111 \
+                        -maxdepth 1 -name 'pg_trickle-*' -type f -perm +111 \
                         2>/dev/null \
                    | xargs ls -t 2>/dev/null \
                    | head -1)
     else
         TEST_BIN=$(find "$PROJECT_DIR/target/debug/deps" \
-                        -maxdepth 1 -name 'pg_stream-*' -type f -executable \
+                        -maxdepth 1 -name 'pg_trickle-*' -type f -executable \
                         2>/dev/null \
                    | xargs ls -t 2>/dev/null \
                    | head -1)

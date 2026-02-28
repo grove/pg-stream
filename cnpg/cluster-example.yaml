@@ -1,63 +1,63 @@
 # =============================================================================
-# Example CloudNativePG Cluster with pg_stream via Image Volume Extensions.
+# Example CloudNativePG Cluster with pg_trickle via Image Volume Extensions.
 #
 # This uses the official CNPG minimal PostgreSQL 18 operand image with the
-# pg_stream extension mounted as an ImageVolume. The extension image is a
+# pg_trickle extension mounted as an ImageVolume. The extension image is a
 # scratch-based OCI image containing only the .so, .control, and .sql files.
 #
 # Prerequisites:
 #   1. Kubernetes 1.33+ with ImageVolume feature gate enabled
 #   2. CNPG operator 1.28+ installed
-#   3. pg_stream-ext image available in the cluster registry
+#   3. pg_trickle-ext image available in the cluster registry
 #
 # Deploy:
 #   kubectl apply -f cnpg/cluster-example.yaml
 #   kubectl apply -f cnpg/database-example.yaml
 #
 # Connect:
-#   kubectl exec -it pg-stream-demo-1 -- psql -U postgres -d app
+#   kubectl exec -it pg-trickle-demo-1 -- psql -U postgres -d app
 #
 # See: https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/
 # =============================================================================
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
-  name: pg-stream-demo
+  name: pg-trickle-demo
   labels:
-    app.kubernetes.io/name: pg-stream
+    app.kubernetes.io/name: pg-trickle
     app.kubernetes.io/component: database
 spec:
   # Number of PostgreSQL instances (1 primary + N-1 replicas)
   instances: 3
 
   # Use the official CNPG minimal PostgreSQL 18 operand image.
-  # The pg_stream extension is loaded via Image Volumes below —
+  # The pg_trickle extension is loaded via Image Volumes below —
   # no custom PostgreSQL image is needed.
   imageName: ghcr.io/cloudnative-pg/postgresql:18
 
   postgresql:
     # Required: load the extension shared library at server start
     shared_preload_libraries:
-      - pg_stream
+      - pg_trickle
 
-    # Extension image — mounted at /extensions/pg-stream/
+    # Extension image — mounted at /extensions/pg-trickle/
     # CNPG automatically configures:
-    #   extension_control_path → /extensions/pg-stream/share
-    #   dynamic_library_path   → /extensions/pg-stream/lib
+    #   extension_control_path → /extensions/pg-trickle/share
+    #   dynamic_library_path   → /extensions/pg-trickle/lib
     extensions:
-      - name: pg-stream
+      - name: pg-trickle
         image:
-          reference: ghcr.io/<owner>/pg_stream-ext:<version>
+          reference: ghcr.io/<owner>/pg_trickle-ext:<version>
 
     parameters:
       # Recommended: scheduler bgworker + refresh workers
       max_worker_processes: "8"
 
       # Optional: tune scheduler interval (default: 1000ms)
-      # pg_stream.scheduler_interval_ms: "1000"
+      # pg_trickle.scheduler_interval_ms: "1000"
 
       # Optional: tune minimum schedule duration (default: 60s)
-      # pg_stream.min_schedule_seconds: "60"
+      # pg_trickle.min_schedule_seconds: "60"
 
   bootstrap:
     initdb:

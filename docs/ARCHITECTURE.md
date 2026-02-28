@@ -1,7 +1,7 @@
 # Architecture
 
-This document describes the internal architecture of pg_stream — a PostgreSQL 18 extension that implements stream tables with differential view maintenance.
-For a high-level description of what pg_stream does and why, read [ESSENCE.md](../ESSENCE.md). For release milestones and future plans, see [ROADMAP.md](../ROADMAP.md).
+This document describes the internal architecture of pg_trickle — a PostgreSQL 18 extension that implements stream tables with differential view maintenance.
+For a high-level description of what pg_trickle does and why, read [ESSENCE.md](../ESSENCE.md). For release milestones and future plans, see [ROADMAP.md](../ROADMAP.md).
 
 ---
 
@@ -25,7 +25,7 @@ For a high-level description of what pg_stream does and why, read [ESSENCE.md](.
 │               │                            │                    │
 │  ┌────────────▼───────────┐   ┌────────────┴───────────┐        │
 │  │   Change Buffer        │   │   DVM Engine           │        │
-│  │   (pgstream_changes.*) │   │   (Operator Tree)      │        │
+│  │   (pgtrickle_changes.*) │   │   (Operator Tree)      │        │
 │  └────────────┬───────────┘   └────────────▲───────────┘        │
 │               │                            │                    │
 │               └────────────┬───────────────┘                    │
@@ -39,8 +39,8 @@ For a high-level description of what pg_stream does and why, read [ESSENCE.md](.
 │  └───────────────────────────────────────────────────────┘      │
 │                                                                 │
 │  ┌────────────────────────────────────────────────────────┐     │
-│  │                    Catalog (pgstream.*)                │     │
-│  │  pgs_stream_tables │ pgs_dependencies │ pgs_refresh_history│  │
+│  │                    Catalog (pgtrickle.*)                │     │
+│  │  pgt_stream_tables │ pgt_dependencies │ pgt_refresh_history│  │
 │  └────────────────────────────────────────────────────────┘     │
 │                                                                 │
 │  ┌──────────────────────────────────────────────────────┐       │
@@ -57,24 +57,24 @@ For a high-level description of what pg_stream does and why, read [ESSENCE.md](.
 
 ### 1. SQL API Layer (`src/api.rs`)
 
-The public entry point for users. All operations are exposed as `#[pg_extern]` functions in the `pgstream` schema:
+The public entry point for users. All operations are exposed as `#[pg_extern]` functions in the `pgtrickle` schema:
 
 - **create_stream_table** — Applies a chain of auto-rewrite passes (view inlining → DISTINCT ON → GROUPING SETS → scalar subquery → SubLinks in OR → multi-PARTITION BY windows), parses the defining query, builds an operator tree, creates the storage table, registers CDC slots, populates the catalog, and optionally performs an initial full refresh.
 - **alter_stream_table** — Modifies schedule, refresh mode, or status (ACTIVE/SUSPENDED).
 - **drop_stream_table** — Removes the storage table, catalog entries, and cleans up CDC slots.
 - **refresh_stream_table** — Triggers a manual refresh (same path as automatic scheduling).
-- **pgs_status** — Returns a summary of all registered stream tables.
+- **pgt_status** — Returns a summary of all registered stream tables.
 
 ### 2. Catalog (`src/catalog.rs`)
 
-The catalog manages persistent metadata stored in PostgreSQL tables within the `pgstream` schema:
+The catalog manages persistent metadata stored in PostgreSQL tables within the `pgtrickle` schema:
 
 | Table | Purpose |
 |---|---|
-| `pgstream.pgs_stream_tables` | Core metadata: name, query, schedule, status, frontier, etc. |
-| `pgstream.pgs_dependencies` | DAG edges from ST to source tables |
-| `pgstream.pgs_refresh_history` | Audit log of every refresh operation |
-| `pgstream.pgs_change_tracking` | Per-source CDC slot metadata |
+| `pgtrickle.pgt_stream_tables` | Core metadata: name, query, schedule, status, frontier, etc. |
+| `pgtrickle.pgt_dependencies` | DAG edges from ST to source tables |
+| `pgtrickle.pgt_refresh_history` | Audit log of every refresh operation |
+| `pgtrickle.pgt_change_tracking` | Per-source CDC slot metadata |
 
 Schema creation is handled by `extension_sql!()` macros that run at `CREATE EXTENSION` time.
 
@@ -82,11 +82,11 @@ Schema creation is handled by `extension_sql!()` macros that run at `CREATE EXTE
 
 ```mermaid
 erDiagram
-    pgs_stream_tables {
-        bigserial pgs_id PK
-        oid pgs_relid UK "OID of materialized storage table"
-        text pgs_name
-        text pgs_schema
+    pgt_stream_tables {
+        bigserial pgt_id PK
+        oid pgt_relid UK "OID of materialized storage table"
+        text pgt_name
+        text pgt_schema
         text defining_query
         text original_query "User's original SQL (pre-inlining)"
         text schedule "Duration or cron expression"
@@ -104,8 +104,8 @@ erDiagram
         timestamptz updated_at
     }
 
-    pgs_dependencies {
-        bigint pgs_id PK,FK "References pgs_stream_tables.pgs_id"
+    pgt_dependencies {
+        bigint pgt_id PK,FK "References pgt_stream_tables.pgt_id"
         oid source_relid PK "OID of source table"
         text source_type "TABLE | STREAM_TABLE | VIEW"
         text_arr columns_used "Column-level lineage"
@@ -115,9 +115,9 @@ erDiagram
         timestamptz transition_started_at "Trigger→WAL transition start"
     }
 
-    pgs_refresh_history {
+    pgt_refresh_history {
         bigserial refresh_id PK
-        bigint pgs_id FK "References pgs_stream_tables.pgs_id"
+        bigint pgt_id FK "References pgt_stream_tables.pgt_id"
         timestamptz data_timestamp
         timestamptz start_time
         timestamptz end_time
@@ -130,28 +130,28 @@ erDiagram
         timestamptz freshness_deadline
     }
 
-    pgs_change_tracking {
+    pgt_change_tracking {
         oid source_relid PK "OID of tracked source table"
         text slot_name "Trigger function name"
         pg_lsn last_consumed_lsn
-        bigint_arr tracked_by_pgs_ids "ST IDs sharing this source"
+        bigint_arr tracked_by_pgt_ids "ST IDs sharing this source"
     }
 
-    pgs_stream_tables ||--o{ pgs_dependencies : "has sources"
-    pgs_stream_tables ||--o{ pgs_refresh_history : "has refresh history"
-    pgs_stream_tables }o--o{ pgs_change_tracking : "tracks via pgs_ids array"
+    pgt_stream_tables ||--o{ pgt_dependencies : "has sources"
+    pgt_stream_tables ||--o{ pgt_refresh_history : "has refresh history"
+    pgt_stream_tables }o--o{ pgt_change_tracking : "tracks via pgt_ids array"
 ```
 
-> **Note:** Change buffer tables (`pgstream_changes.changes_<oid>`) are created dynamically per source table OID and live in the separate `pgstream_changes` schema.
+> **Note:** Change buffer tables (`pgtrickle_changes.changes_<oid>`) are created dynamically per source table OID and live in the separate `pgtrickle_changes` schema.
 
 ### 3. CDC / Change Data Capture (`src/cdc.rs`, `src/wal_decoder.rs`)
 
-pg_stream uses a **hybrid CDC** architecture that starts with triggers and optionally transitions to WAL-based (logical replication) capture for lower write-side overhead.
+pg_trickle uses a **hybrid CDC** architecture that starts with triggers and optionally transitions to WAL-based (logical replication) capture for lower write-side overhead.
 
 #### Trigger Mode (default)
 
-1. **Trigger Management** — Creates `AFTER INSERT OR UPDATE OR DELETE` row-level triggers (`pg_stream_cdc_<oid>`) on each tracked source table. Each trigger fires a PL/pgSQL function (`pg_stream_cdc_fn_<oid>()`) that writes changes to the buffer table.
-2. **Change Buffering** — Decoded changes are written to per-source change buffer tables in the `pgstream_changes` schema. Each row captures the LSN (`pg_current_wal_lsn()`), transaction ID, action type (I/U/D), and the new/old row data as JSONB via `to_jsonb()`.
+1. **Trigger Management** — Creates `AFTER INSERT OR UPDATE OR DELETE` row-level triggers (`pg_trickle_cdc_<oid>`) on each tracked source table. Each trigger fires a PL/pgSQL function (`pg_trickle_cdc_fn_<oid>()`) that writes changes to the buffer table.
+2. **Change Buffering** — Decoded changes are written to per-source change buffer tables in the `pgtrickle_changes` schema. Each row captures the LSN (`pg_current_wal_lsn()`), transaction ID, action type (I/U/D), and the new/old row data as JSONB via `to_jsonb()`.
 3. **Cleanup** — Consumed changes are deleted after each successful refresh via `delete_consumed_changes()`, bounded by the upper LSN to prevent unbounded scans.
 4. **Lifecycle** — Triggers and trigger functions are automatically created when a source table is first tracked and dropped when the last stream table referencing a source is removed.
 
@@ -159,12 +159,12 @@ The trigger approach was chosen as the default for **transaction safety** (trigg
 
 #### WAL Mode (optional, automatic transition)
 
-When `pg_stream.cdc_mode` is set to `'auto'` or `'wal'` and `wal_level = logical` is available, the system transitions from trigger-based to WAL-based CDC after the first successful refresh:
+When `pg_trickle.cdc_mode` is set to `'auto'` or `'wal'` and `wal_level = logical` is available, the system transitions from trigger-based to WAL-based CDC after the first successful refresh:
 
 1. **WAL Availability Detection** — At stream table creation, checks whether `wal_level = logical` is configured. If so, the source dependency is marked for WAL transition.
 2. **WAL Decoder Background Worker** — A dedicated background worker (`src/wal_decoder.rs`) polls logical replication slots and writes decoded changes into the same change buffer tables used by triggers, ensuring a uniform format for the DVM engine.
-3. **Transition Orchestration** — The transition is a three-step process: (a) create a replication slot, (b) wait for the decoder to catch up to the trigger's last confirmed LSN, (c) drop the trigger and switch the dependency to WAL mode. If the decoder doesn't catch up within `pg_stream.wal_transition_timeout` (default 300s), the system falls back to triggers.
-4. **CDC Mode Tracking** — Each source dependency in `pgs_dependencies` carries a `cdc_mode` column (TRIGGER / TRANSITIONING / WAL) and WAL-specific metadata (`slot_name`, `decoder_confirmed_lsn`, `transition_started_at`).
+3. **Transition Orchestration** — The transition is a three-step process: (a) create a replication slot, (b) wait for the decoder to catch up to the trigger's last confirmed LSN, (c) drop the trigger and switch the dependency to WAL mode. If the decoder doesn't catch up within `pg_trickle.wal_transition_timeout` (default 300s), the system falls back to triggers.
+4. **CDC Mode Tracking** — Each source dependency in `pgt_dependencies` carries a `cdc_mode` column (TRIGGER / TRANSITIONING / WAL) and WAL-specific metadata (`slot_name`, `decoder_confirmed_lsn`, `transition_started_at`).
 
 See ADR-001 and ADR-002 in [plans/adrs/PLAN_ADRS.md](../plans/adrs/PLAN_ADRS.md) for the original design rationale and [plans/sql/PLAN_HYBRID_CDC.md](../plans/sql/PLAN_HYBRID_CDC.md) for the full implementation plan.
 
@@ -278,7 +278,7 @@ Orchestrates the complete refresh cycle:
        │
  ┌─────▼──────────────┐
  │ Determine Action   │ → FULL, DIFFERENTIAL, NO_DATA, REINITIALIZE, or SKIP?
- │                    │   (adaptive: if change ratio > pg_stream.differential_max_change_ratio,
+ │                    │   (adaptive: if change ratio > pg_trickle.differential_max_change_ratio,
  │                    │    downgrade DIFFERENTIAL → FULL automatically)
  └─────┬──────────────┘
        │
@@ -288,7 +288,7 @@ Orchestrates the complete refresh cycle:
  └─────┬──────┘
        │
  ┌─────▼──────────────┐
- │ Record History     │ → Write to pgstream.pgs_refresh_history
+ │ Record History     │ → Write to pgtrickle.pgt_refresh_history
  └─────┬──────────────┘
        │
  ┌─────▼──────────────┐
@@ -304,19 +304,19 @@ Orchestrates the complete refresh cycle:
 
 #### Registration & Lifecycle
 
-pg_stream registers **one PostgreSQL background worker** — the *scheduler* — during `_PG_init()` (extension load). Because it is registered at startup, `pg_stream` **must** appear in `shared_preload_libraries`, which requires a server restart.
+pg_trickle registers **one PostgreSQL background worker** — the *scheduler* — during `_PG_init()` (extension load). Because it is registered at startup, `pg_trickle` **must** appear in `shared_preload_libraries`, which requires a server restart.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                  PostgreSQL postmaster                           │
 │                                                                  │
-│  shared_preload_libraries = 'pg_stream'                          │
+│  shared_preload_libraries = 'pg_trickle'                          │
 │       │                                                          │
 │       ▼                                                          │
 │  _PG_init()                                                      │
-│    ├─ Register GUCs (pg_stream.enabled, scheduler_interval_ms …) │
-│    ├─ Register shared memory (PgStreamSharedState, atomics)      │
-│    └─ BackgroundWorkerBuilder::new("pg_stream scheduler")        │
+│    ├─ Register GUCs (pg_trickle.enabled, scheduler_interval_ms …) │
+│    ├─ Register shared memory (PgTrickleSharedState, atomics)      │
+│    └─ BackgroundWorkerBuilder::new("pg_trickle scheduler")        │
 │         .set_start_time(RecoveryFinished)                        │
 │         .set_restart_time(5s)       ← auto-restart on crash      │
 │         .load()                                                  │
@@ -324,7 +324,7 @@ pg_stream registers **one PostgreSQL background worker** — the *scheduler* —
 │  After recovery finishes:                                        │
 │       │                                                          │
 │       ▼                                                          │
-│  pg_stream_scheduler_main()         ← background worker starts   │
+│  pg_trickle_scheduler_main()         ← background worker starts   │
 │    ├─ Attach SIGHUP + SIGTERM handlers                           │
 │    ├─ Connect to SPI (database = "postgres")                     │
 │    ├─ Crash recovery: mark stale RUNNING records as FAILED       │
@@ -335,7 +335,7 @@ pg_stream registers **one PostgreSQL background worker** — the *scheduler* —
 │         │                                      │                 │
 │     ┌───▼───────────────────────────────┐      │                 │
 │     │ SIGTERM? → log + break            │      │                 │
-│     │ pg_stream.enabled = false? → skip │      │                 │
+│     │ pg_trickle.enabled = false? → skip │      │                 │
 │     │ Otherwise → scheduler tick        │      │                 │
 │     └───┬───────────────────────────────┘      │                 │
 │         │                                      │                 │
@@ -351,7 +351,7 @@ Key lifecycle properties:
 | **Auto-restart** | 5-second delay after an unexpected crash |
 | **Graceful shutdown** | Handles `SIGTERM` — breaks the main loop and exits cleanly |
 | **Config reload** | Handles `SIGHUP` — re-reads GUC values on the next latch wake |
-| **Crash recovery** | On startup, any `pgs_refresh_history` rows stuck in `RUNNING` status are marked `FAILED` (the transaction that wrote them was rolled back by PostgreSQL, but the status row may have been committed in a prior transaction) |
+| **Crash recovery** | On startup, any `pgt_refresh_history` rows stuck in `RUNNING` status are marked `FAILED` (the transaction that wrote them was rolled back by PostgreSQL, but the status row may have been committed in a prior transaction) |
 | **Database** | Connects to the `postgres` database via SPI |
 
 #### Scheduler Tick
@@ -372,9 +372,9 @@ Each tick of the main loop performs the following steps inside a single transact
 
 #### Sequential Processing
 
-**The scheduler processes stream tables sequentially within a single background worker.** Although `pg_stream.max_concurrent_refreshes` (default 4) exists as a GUC, it currently only prevents a manual `pgstream.refresh_stream_table()` call from overlapping with the scheduler on the *same* ST — it does not spawn additional workers. All STs are refreshed one at a time in topological order.
+**The scheduler processes stream tables sequentially within a single background worker.** Although `pg_trickle.max_concurrent_refreshes` (default 4) exists as a GUC, it currently only prevents a manual `pgtrickle.refresh_stream_table()` call from overlapping with the scheduler on the *same* ST — it does not spawn additional workers. All STs are refreshed one at a time in topological order.
 
-The PostgreSQL GUC `max_worker_processes` (default 8) sets the server-wide budget for *all* background workers (autovacuum, parallel query, logical replication, extensions). pg_stream consumes **one** slot from that budget.
+The PostgreSQL GUC `max_worker_processes` (default 8) sets the server-wide budget for *all* background workers (autovacuum, parallel query, logical replication, extensions). pg_trickle consumes **one** slot from that budget.
 
 #### Retry & Error Handling
 
@@ -382,7 +382,7 @@ Each ST maintains an in-memory `RetryState` (reset on scheduler restart):
 
 - **Retryable errors** (SPI failures, lock contention, slot issues) trigger exponential backoff.
 - **Permanent errors** (schema mismatch, user errors) skip backoff but increment `consecutive_errors`.
-- When `consecutive_errors` reaches `pg_stream.max_consecutive_errors` (default 3), the ST is auto-suspended and a `NOTIFY` alert is emitted.
+- When `consecutive_errors` reaches `pg_trickle.max_consecutive_errors` (default 3), the ST is auto-suspended and a `NOTIFY` alert is emitted.
 - Schema errors additionally set `needs_reinit`, triggering a `REINITIALIZE` on the next successful cycle.
 
 #### Scheduling Policy
@@ -392,11 +392,11 @@ Automatic refresh scheduling uses **canonical periods** (48·2ⁿ seconds, n = 0
 - Picks the smallest canonical period ≤ `schedule`.
 - For **DOWNSTREAM** schedule (NULL schedule), the ST refreshes only when explicitly triggered or when a downstream ST needs it.
 - Advisory locks prevent concurrent refreshes of the same ST.
-- The scheduler is driven by the background worker polling at the `pg_stream.scheduler_interval_ms` GUC interval.
+- The scheduler is driven by the background worker polling at the `pg_trickle.scheduler_interval_ms` GUC interval.
 
 #### Shared Memory (`src/shmem.rs`)
 
-The scheduler background worker and user sessions share a `PgStreamSharedState` structure protected by a `PgLwLock`. Key fields:
+The scheduler background worker and user sessions share a `PgTrickleSharedState` structure protected by a `PgLwLock`. Key fields:
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -415,7 +415,7 @@ Event triggers monitor DDL changes to source tables and functions:
 
 - **`_on_ddl_end`** — Fires on `ALTER TABLE` to detect column adds/drops/type changes. If a source table used by a ST is altered, the ST's `needs_reinit` flag is set. Also detects `CREATE OR REPLACE FUNCTION` / `ALTER FUNCTION` — if the function appears in a ST's `functions_used` catalog column, the ST is marked for reinit.
 - **`_on_sql_drop`** — Fires on `DROP TABLE` to set `needs_reinit` for affected STs. Also detects `DROP FUNCTION` and marks affected STs for reinit.
-- **Function name extraction** — `object_identity` strings (e.g., `public.my_func(integer, text)`) are parsed to extract the bare function name, which is matched against the `functions_used TEXT[]` column in `pgs_stream_tables`.
+- **Function name extraction** — `object_identity` strings (e.g., `public.my_func(integer, text)`) are parsed to extract the bare function name, which is matched against the `functions_used TEXT[]` column in `pgt_stream_tables`.
 
 Reinitialization is deferred until the next refresh cycle, which then performs a `REINITIALIZE` action (drop and recreate the storage table from the updated query).
 
@@ -423,9 +423,9 @@ Reinitialization is deferred until the next refresh cycle, which then performs a
 
 Centralized error types using `thiserror`:
 
-- `PgStreamError` variants cover catalog access, SQL execution, CDC, DVM, DAG, and config errors.
+- `PgTrickleError` variants cover catalog access, SQL execution, CDC, DVM, DAG, and config errors.
 - Each refresh failure increments `consecutive_errors`.
-- When `consecutive_errors` reaches `pg_stream.max_consecutive_errors` (default 3), the ST is moved to `ERROR` status and suspended from automatic refresh.
+- When `consecutive_errors` reaches `pg_trickle.max_consecutive_errors` (default 3), the ST is moved to `ERROR` status and suspended from automatic refresh.
 - Manual intervention (`ALTER ... status => 'ACTIVE'`) resets the counter.
 
 ### 11. Monitoring (`src/monitor.rs`)
@@ -438,16 +438,16 @@ Provides observability functions:
 - **slot_health** — Checks replication slot state and WAL retention.
 - **check_cdc_health** — Per-source CDC health status including mode, slot lag, confirmed LSN, and alerts.
 - **explain_st** — Describes the DVM plan for a given ST.
-- **Views** — `pgstream.stream_tables_info` (computed staleness) and `pgstream.pg_stat_stream_tables` (combined stats).
+- **Views** — `pgtrickle.stream_tables_info` (computed staleness) and `pgtrickle.pg_stat_stream_tables` (combined stats).
 
 #### NOTIFY Alerting
 
-Operational events are broadcast via PostgreSQL `NOTIFY` on the `pg_stream_alert` channel. Clients can subscribe with `LISTEN pg_stream_alert;` and receive JSON-formatted events:
+Operational events are broadcast via PostgreSQL `NOTIFY` on the `pg_trickle_alert` channel. Clients can subscribe with `LISTEN pg_trickle_alert;` and receive JSON-formatted events:
 
 | Event | Condition |
 |---|---|
 | `stale` | data staleness exceeds 2× `schedule` |
-| `auto_suspended` | ST suspended after `pg_stream.max_consecutive_errors` failures |
+| `auto_suspended` | ST suspended after `pg_trickle.max_consecutive_errors` failures |
 | `reinitialize_needed` | Upstream DDL change detected |
 | `slot_lag_warning` | Replication slot WAL retention is growing |
 | `cdc_transition_complete` | Source transitioned from trigger to WAL-based CDC |
@@ -459,10 +459,10 @@ Operational events are broadcast via PostgreSQL `NOTIFY` on the `pg_stream_alert
 
 Provides deterministic 64-bit row identifiers using **xxHash (xxh64)** with a fixed seed. Two SQL functions are exposed:
 
-- **`pgstream.pg_stream_hash(text)`** — Hash a single text value; used for simple single-column row IDs.
-- **`pgstream.pg_stream_hash_multi(text[])`** — Hash multiple values (separated by a record-separator byte `\x1E`) for composite keys (join row IDs, GROUP BY keys).
+- **`pgtrickle.pg_trickle_hash(text)`** — Hash a single text value; used for simple single-column row IDs.
+- **`pgtrickle.pg_trickle_hash_multi(text[])`** — Hash multiple values (separated by a record-separator byte `\x1E`) for composite keys (join row IDs, GROUP BY keys).
 
-Row IDs are written into every stream table's storage as an internal `__pgs_row_id BIGINT` column and are used by the delta application phase to match `DELETE` candidates precisely.
+Row IDs are written into every stream table's storage as an internal `__pgt_row_id BIGINT` column and are used by the delta application phase to match `DELETE` candidates precisely.
 
 ### 13. Configuration (`src/config.rs`)
 
@@ -470,22 +470,22 @@ Twelve GUC (Grand Unified Configuration) variables control runtime behavior, plu
 
 | GUC | Default | Purpose |
 |---|---|---|
-| `pg_stream.enabled` | `true` | Master on/off switch for the scheduler |
-| `pg_stream.scheduler_interval_ms` | `1000` | Scheduler background worker wake interval (ms) |
-| `pg_stream.min_schedule_seconds` | `60` | Minimum allowed `schedule` |
-| `pg_stream.max_consecutive_errors` | `3` | Errors before auto-suspending a ST |
-| `pg_stream.change_buffer_schema` | `pgstream_changes` | Schema for change buffer tables |
-| `pg_stream.max_concurrent_refreshes` | `4` | Maximum parallel refresh workers |
-| `pg_stream.differential_max_change_ratio` | `0.15` | Change-to-table-size ratio above which DIFFERENTIAL falls back to FULL |
-| `pg_stream.cleanup_use_truncate` | `true` | Use `TRUNCATE` instead of `DELETE` for change buffer cleanup when the entire buffer is consumed |
-| `pg_stream.user_triggers` | `'auto'` | User-defined trigger handling: `auto` / `on` / `off` |
-| `pg_stream.block_source_ddl` | `false` | Block column-affecting DDL on tracked source tables instead of reinit |
-| `pg_stream.cdc_mode` | `'trigger'` | CDC mechanism: `trigger` / `auto` / `wal` |
-| `pg_stream.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
-| `pg_stream.merge_planner_hints` | `true` | Inject `SET LOCAL` planner hints (disable nestloop, raise work_mem) before MERGE |
-| `pg_stream.merge_work_mem_mb` | `64` | `work_mem` (MB) applied when delta exceeds 10 000 rows and planner hints enabled |
-| `pg_stream.merge_strategy` | `'auto'` | Delta application strategy: `auto` / `merge` / `delete_insert` |
-| `pg_stream.use_prepared_statements` | `true` | Use SQL PREPARE/EXECUTE for cached MERGE templates |
+| `pg_trickle.enabled` | `true` | Master on/off switch for the scheduler |
+| `pg_trickle.scheduler_interval_ms` | `1000` | Scheduler background worker wake interval (ms) |
+| `pg_trickle.min_schedule_seconds` | `60` | Minimum allowed `schedule` |
+| `pg_trickle.max_consecutive_errors` | `3` | Errors before auto-suspending a ST |
+| `pg_trickle.change_buffer_schema` | `pgtrickle_changes` | Schema for change buffer tables |
+| `pg_trickle.max_concurrent_refreshes` | `4` | Maximum parallel refresh workers |
+| `pg_trickle.differential_max_change_ratio` | `0.15` | Change-to-table-size ratio above which DIFFERENTIAL falls back to FULL |
+| `pg_trickle.cleanup_use_truncate` | `true` | Use `TRUNCATE` instead of `DELETE` for change buffer cleanup when the entire buffer is consumed |
+| `pg_trickle.user_triggers` | `'auto'` | User-defined trigger handling: `auto` / `on` / `off` |
+| `pg_trickle.block_source_ddl` | `false` | Block column-affecting DDL on tracked source tables instead of reinit |
+| `pg_trickle.cdc_mode` | `'trigger'` | CDC mechanism: `trigger` / `auto` / `wal` |
+| `pg_trickle.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
+| `pg_trickle.merge_planner_hints` | `true` | Inject `SET LOCAL` planner hints (disable nestloop, raise work_mem) before MERGE |
+| `pg_trickle.merge_work_mem_mb` | `64` | `work_mem` (MB) applied when delta exceeds 10 000 rows and planner hints enabled |
+| `pg_trickle.merge_strategy` | `'auto'` | Delta application strategy: `auto` / `merge` / `delete_insert` |
+| `pg_trickle.use_prepared_statements` | `true` | Use SQL PREPARE/EXECUTE for cached MERGE templates |
 
 ---
 
@@ -498,14 +498,14 @@ Twelve GUC (Grand Unified Configuration) variables control runtime behavior, plu
  Hybrid CDC Layer:
    ┌─────────────────────────────────────────────┐
    │ TRIGGER mode: Row-Level AFTER Trigger        │
-   │   pg_stream_cdc_fn_<oid>() → buffer table    │
+   │   pg_trickle_cdc_fn_<oid>() → buffer table    │
    │                                              │
    │ WAL mode: Logical Replication Slot           │
    │   wal_decoder bgworker → same buffer table   │
    └─────────────────────────────────────────────┘
            │
            ▼
- Change Buffer Table (pgstream_changes.changes_<oid>)
+ Change Buffer Table (pgtrickle_changes.changes_<oid>)
    Columns: change_id, lsn, xid, action (I/U/D), row_data (jsonb)
            │
            ▼
@@ -519,14 +519,14 @@ Twelve GUC (Grand Unified Configuration) variables control runtime behavior, plu
            │
            ▼
  Delta Application:
-   DELETE FROM storage WHERE __pgs_row_id IN (removed)
+   DELETE FROM storage WHERE __pgt_row_id IN (removed)
    INSERT INTO storage SELECT ... FROM (added)
            │
            ▼
  Frontier Update: advance per-source LSN
            │
            ▼
- History Record: log to pgstream.pgs_refresh_history
+ History Record: log to pgtrickle.pgt_refresh_history
 ```
 
 ---
@@ -544,9 +544,9 @@ src/
 ├── config.rs        # GUC variable registration
 ├── dag.rs           # Dependency graph (cycle detection, topo sort)
 ├── error.rs         # Centralized error types
-├── hash.rs          # xxHash row ID generation (pg_stream_hash / pg_stream_hash_multi)
+├── hash.rs          # xxHash row ID generation (pg_trickle_hash / pg_trickle_hash_multi)
 ├── hooks.rs         # DDL event trigger handlers (_on_ddl_end, _on_sql_drop)
-├── shmem.rs         # Shared memory state (PgStreamSharedState, DAG_REBUILD_SIGNAL, CACHE_GENERATION)
+├── shmem.rs         # Shared memory state (PgTrickleSharedState, DAG_REBUILD_SIGNAL, CACHE_GENERATION)
 ├── dvm/
 │   ├── mod.rs       # DVM module root + recursive CTE orchestration
 │   ├── parser.rs    # Query → OpTree converter (CTE extraction, subquery, window support)
@@ -582,12 +582,12 @@ src/
 └── wal_decoder.rs   # WAL-based CDC (logical replication slot polling, transitions)
 ```
 
-### Extension Control File (`pg_stream.control`)
+### Extension Control File (`pg_trickle.control`)
 
-The `pg_stream.control` file in the repository root is required by PostgreSQL's
+The `pg_trickle.control` file in the repository root is required by PostgreSQL's
 extension infrastructure. It declares the extension's description, default
 version, shared-library path, and privilege requirements. PostgreSQL reads this
-file when `CREATE EXTENSION pg_stream;` is executed.
+file when `CREATE EXTENSION pg_trickle;` is executed.
 
 During packaging (`cargo pgrx package`), pgrx replaces the `@CARGO_VERSION@`
 placeholder with the version from `Cargo.toml` and copies the file into the

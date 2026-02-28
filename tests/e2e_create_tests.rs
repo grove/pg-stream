@@ -1,4 +1,4 @@
-//! E2E tests for `pgstream.create_stream_table()`.
+//! E2E tests for `pgtrickle.create_stream_table()`.
 //!
 //! Validates stream table creation with various queries, modes,
 //! parameters, error conditions, and CDC infrastructure setup.
@@ -31,13 +31,13 @@ async fn test_create_simple_select() {
     // Verify catalog entry
     let cat_count: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'order_snapshot'",
+            "SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'order_snapshot'",
         )
         .await;
     assert_eq!(cat_count, 1, "Catalog entry should exist");
 
     // Verify status
-    let (status, mode, populated, errors) = db.pgs_status("order_snapshot").await;
+    let (status, mode, populated, errors) = db.pgt_status("order_snapshot").await;
     assert_eq!(status, "ACTIVE");
     assert_eq!(mode, "DIFFERENTIAL");
     assert!(
@@ -161,7 +161,7 @@ async fn test_create_full_mode() {
     db.create_st("st_full", "SELECT id, val FROM src_full", "1m", "FULL")
         .await;
 
-    let (_, mode, _, _) = db.pgs_status("st_full").await;
+    let (_, mode, _, _) = db.pgt_status("st_full").await;
     assert_eq!(mode, "FULL");
 }
 
@@ -181,7 +181,7 @@ async fn test_create_differential_mode() {
     )
     .await;
 
-    let (_, mode, _, _) = db.pgs_status("st_inc").await;
+    let (_, mode, _, _) = db.pgt_status("st_inc").await;
     assert_eq!(mode, "DIFFERENTIAL");
 }
 
@@ -201,7 +201,7 @@ async fn test_create_custom_schedule() {
     // Verify stored in catalog (text)
     let sched: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_custom_sched'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_custom_sched'",
         )
         .await;
     assert_eq!(sched, "5m", "Schedule should be '5m'");
@@ -217,14 +217,14 @@ async fn test_create_null_schedule() {
 
     // Pass NULL schedule directly (CALCULATED mode)
     db.execute(
-        "SELECT pgstream.create_stream_table('st_calc', \
+        "SELECT pgtrickle.create_stream_table('st_calc', \
          $$ SELECT id FROM src_calc $$, NULL::text, 'FULL')",
     )
     .await;
 
     let is_null: bool = db
         .query_scalar(
-            "SELECT schedule IS NULL FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_calc'",
+            "SELECT schedule IS NULL FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_calc'",
         )
         .await;
     assert!(is_null, "schedule should be NULL for CALCULATED");
@@ -258,7 +258,7 @@ async fn test_create_no_initialize() {
     assert_eq!(count, 0, "Table should be empty when initialize=false");
 
     // is_populated should be false
-    let (_, _, populated, _) = db.pgs_status("st_noinit").await;
+    let (_, _, populated, _) = db.pgt_status("st_noinit").await;
     assert!(!populated, "is_populated should be false");
 }
 
@@ -285,7 +285,7 @@ async fn test_create_schema_qualified() {
 
     // Verify catalog entry has correct schema
     let cat_schema: String = db
-        .query_scalar("SELECT pgs_schema FROM pgstream.pgs_stream_tables WHERE pgs_name = 'my_st'")
+        .query_scalar("SELECT pgt_schema FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'my_st'")
         .await;
     assert_eq!(cat_schema, "myschema");
 }
@@ -305,7 +305,7 @@ async fn test_create_duplicate_name_fails() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('dup_st', \
+            "SELECT pgtrickle.create_stream_table('dup_st', \
              $$ SELECT id FROM src_dup $$, '1m', 'FULL')",
         )
         .await;
@@ -318,7 +318,7 @@ async fn test_create_invalid_query_fails() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('bad_st', \
+            "SELECT pgtrickle.create_stream_table('bad_st', \
              $$ SELECT * FROM nonexistent_table $$, '1m', 'FULL')",
         )
         .await;
@@ -335,7 +335,7 @@ async fn test_create_invalid_refresh_mode_fails() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('bogus_st', \
+            "SELECT pgtrickle.create_stream_table('bogus_st', \
              $$ SELECT id FROM src_bogus $$, '1m', 'BOGUS')",
         )
         .await;
@@ -362,7 +362,7 @@ async fn test_create_cdc_trigger_installed() {
     .await;
 
     let source_oid = db.table_oid("products").await;
-    let trigger_name = format!("pg_stream_cdc_{}", source_oid);
+    let trigger_name = format!("pg_trickle_cdc_{}", source_oid);
     let exists = db.trigger_exists(&trigger_name, "products").await;
     assert!(exists, "CDC trigger should be installed on source table");
 }
@@ -380,7 +380,7 @@ async fn test_create_change_buffer_exists() {
 
     let source_oid = db.table_oid("items").await;
     let buffer_exists = db
-        .table_exists("pgstream_changes", &format!("changes_{}", source_oid))
+        .table_exists("pgtrickle_changes", &format!("changes_{}", source_oid))
         .await;
     assert!(buffer_exists, "Change buffer table should exist");
 }
@@ -403,10 +403,10 @@ async fn test_create_dependencies_recorded() {
 
     let source_oid = db.table_oid("dep_src").await;
 
-    // Verify pgs_dependencies has correct source
+    // Verify pgt_dependencies has correct source
     let dep_count: i64 = db
         .query_scalar(&format!(
-            "SELECT count(*) FROM pgstream.pgs_dependencies \
+            "SELECT count(*) FROM pgtrickle.pgt_dependencies \
              WHERE source_relid = {}::oid",
             source_oid
         ))
@@ -416,7 +416,7 @@ async fn test_create_dependencies_recorded() {
     // Verify source_type
     let src_type: String = db
         .query_scalar(&format!(
-            "SELECT source_type FROM pgstream.pgs_dependencies \
+            "SELECT source_type FROM pgtrickle.pgt_dependencies \
              WHERE source_relid = {}::oid LIMIT 1",
             source_oid
         ))
@@ -436,10 +436,10 @@ async fn test_create_change_tracking_recorded() {
 
     let source_oid = db.table_oid("ct_src").await;
 
-    // Verify pgs_change_tracking has an entry for this source
+    // Verify pgt_change_tracking has an entry for this source
     let ct_count: i64 = db
         .query_scalar(&format!(
-            "SELECT count(*) FROM pgstream.pgs_change_tracking \
+            "SELECT count(*) FROM pgtrickle.pgt_change_tracking \
              WHERE source_relid = {}::oid",
             source_oid
         ))
@@ -449,7 +449,7 @@ async fn test_create_change_tracking_recorded() {
     // Verify slot_name is non-empty
     let slot_name: String = db
         .query_scalar(&format!(
-            "SELECT slot_name FROM pgstream.pgs_change_tracking \
+            "SELECT slot_name FROM pgtrickle.pgt_change_tracking \
              WHERE source_relid = {}::oid",
             source_oid
         ))
@@ -477,7 +477,7 @@ async fn test_create_with_compound_duration() {
 
     let sched: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_compound'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_compound'",
         )
         .await;
     assert_eq!(sched, "1h30m", "Compound duration should be stored as-is");
@@ -498,7 +498,7 @@ async fn test_create_with_seconds_duration() {
         .await;
 
     let sched: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_secs'")
+        .query_scalar("SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_secs'")
         .await;
     assert_eq!(sched, "90s");
 }
@@ -515,7 +515,9 @@ async fn test_create_with_hours_duration() {
         .await;
 
     let sched: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_hours'")
+        .query_scalar(
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_hours'",
+        )
         .await;
     assert_eq!(sched, "2h");
 }
@@ -532,7 +534,7 @@ async fn test_create_with_days_duration() {
         .await;
 
     let sched: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_days'")
+        .query_scalar("SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_days'")
         .await;
     assert_eq!(sched, "1d");
 }
@@ -547,13 +549,13 @@ async fn test_create_with_cron_expression() {
 
     // Use cron expression: every 5 minutes
     db.execute(
-        "SELECT pgstream.create_stream_table('st_cron', \
+        "SELECT pgtrickle.create_stream_table('st_cron', \
          $$ SELECT id FROM src_cron $$, '*/5 * * * *', 'FULL')",
     )
     .await;
 
     let schedule: String = db
-        .query_scalar("SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_cron'")
+        .query_scalar("SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_cron'")
         .await;
     assert_eq!(schedule, "*/5 * * * *");
 
@@ -570,14 +572,14 @@ async fn test_create_with_cron_alias() {
     db.execute("INSERT INTO src_cron_alias VALUES (1)").await;
 
     db.execute(
-        "SELECT pgstream.create_stream_table('st_cron_alias', \
+        "SELECT pgtrickle.create_stream_table('st_cron_alias', \
          $$ SELECT id FROM src_cron_alias $$, '@hourly', 'FULL')",
     )
     .await;
 
     let schedule: String = db
         .query_scalar(
-            "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'st_cron_alias'",
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_cron_alias'",
         )
         .await;
     assert_eq!(schedule, "@hourly");
@@ -594,7 +596,7 @@ async fn test_create_with_invalid_cron_fails() {
     // Invalid cron: only 3 fields
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('st_badcron', \
+            "SELECT pgtrickle.create_stream_table('st_badcron', \
              $$ SELECT id FROM src_badcron $$, '* * *', 'FULL')",
         )
         .await;
@@ -615,7 +617,7 @@ async fn test_create_with_invalid_duration_fails() {
     // Invalid duration: unknown unit
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('st_baddur', \
+            "SELECT pgtrickle.create_stream_table('st_baddur', \
              $$ SELECT id FROM src_baddur $$, '5x', 'FULL')",
         )
         .await;

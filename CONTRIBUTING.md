@@ -1,6 +1,6 @@
-# Contributing to pg_stream
+# Contributing to pg_trickle
 
-Thank you for your interest in contributing! pg_stream is an Apache 2.0-licensed
+Thank you for your interest in contributing! pg_trickle is an Apache 2.0-licensed
 open-source project and welcomes contributions of all kinds.
 
 ## Before You Start
@@ -59,8 +59,8 @@ The PR template will walk you through the checklist.
 
 - No `unwrap()` or `panic!()` in non-test code
 - All `unsafe` blocks require a `// SAFETY:` comment
-- Errors go through `PgStreamError` in `src/error.rs`
-- New SQL functions use `#[pg_extern(schema = "pgstream")]`
+- Errors go through `PgTrickleError` in `src/error.rs`
+- New SQL functions use `#[pg_extern(schema = "pgtrickle")]`
 - Tests use Testcontainers — never a local PostgreSQL instance
 
 Full details are in [AGENTS.md](AGENTS.md).

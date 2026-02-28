@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# E2E Coverage Script for pg_stream
+# E2E Coverage Script for pg_trickle
 #
 # Builds a coverage-instrumented Docker image, runs E2E tests against it,
 # extracts profraw files, and generates combined unit + E2E coverage reports.
@@ -27,7 +27,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COVERAGE_DIR="${PROJECT_ROOT}/coverage"
 E2E_COV_DIR="${COVERAGE_DIR}/e2e"
 COMBINED_DIR="${COVERAGE_DIR}/combined"
-COV_IMAGE="pg_stream_e2e_cov:latest"
+COV_IMAGE="pg_trickle_e2e_cov:latest"
 
 # Colors for output
 RED='\033[0;31m'
@@ -197,7 +197,7 @@ info "Generating combined coverage reports..."
 # Find the .so / .dylib built with coverage instrumentation.
 # cargo-llvm-cov builds the instrumented binary in its own target dir;
 # we need the one from the unit test run (host-side instrumented library).
-INSTRUMENTED_LIB="$(find "${PROJECT_ROOT}/target" -name 'libpg_stream*.so' -o -name 'libpg_stream*.dylib' 2>/dev/null | head -1)"
+INSTRUMENTED_LIB="$(find "${PROJECT_ROOT}/target" -name 'libpg_trickle*.so' -o -name 'libpg_trickle*.dylib' 2>/dev/null | head -1)"
 
 # Find llvm-cov binary
 LLVM_COV=""

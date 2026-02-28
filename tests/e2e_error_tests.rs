@@ -18,7 +18,7 @@ async fn test_invalid_sql_in_defining_query() {
     // Typo: FORM instead of FROM
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('bad_sql_st', \
+            "SELECT pgtrickle.create_stream_table('bad_sql_st', \
              $$ SELECT * FORM orders $$, '1m', 'FULL')",
         )
         .await;
@@ -33,7 +33,7 @@ async fn test_self_referencing_query_fails() {
     // Note: the table doesn't exist yet when create is called, so this should fail
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('self_ref_st', \
+            "SELECT pgtrickle.create_stream_table('self_ref_st', \
              $$ SELECT * FROM self_ref_st $$, '1m', 'FULL')",
         )
         .await;
@@ -104,7 +104,7 @@ async fn test_create_with_zero_schedule() {
     // Zero schedule — might succeed or be rejected, depending on implementation
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('zero_sched_st', \
+            "SELECT pgtrickle.create_stream_table('zero_sched_st', \
              $$ SELECT id FROM zero_sched_src $$, '0s', 'FULL')",
         )
         .await;
@@ -114,7 +114,7 @@ async fn test_create_with_zero_schedule() {
     if result.is_ok() {
         let sched: String = db
             .query_scalar(
-                "SELECT schedule FROM pgstream.pgs_stream_tables WHERE pgs_name = 'zero_sched_st'",
+                "SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'zero_sched_st'",
             )
             .await;
         assert_eq!(sched, "0s");
@@ -132,7 +132,7 @@ async fn test_create_with_negative_schedule() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('neg_sched_st', \
+            "SELECT pgtrickle.create_stream_table('neg_sched_st', \
              $$ SELECT id FROM neg_sched_src $$, '-1m', 'FULL')",
         )
         .await;
@@ -167,12 +167,12 @@ async fn test_drop_source_table_with_active_st() {
         // Check if ST was cleaned up or marked for reinit
         let st_exists: bool = db
             .query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_name = 'orphan_st')",
+                "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'orphan_st')",
             )
             .await;
         // Either the ST was cleaned up, or it may still exist in error state
         if st_exists {
-            let (status, _, _, _) = db.pgs_status("orphan_st").await;
+            let (status, _, _, _) = db.pgt_status("orphan_st").await;
             // The ST should be in some error/invalid state
             assert!(
                 status == "ERROR" || status == "SUSPENDED" || status == "ACTIVE",
@@ -252,7 +252,7 @@ async fn test_limit_returns_unsupported_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('limit_st', \
+            "SELECT pgtrickle.create_stream_table('limit_st', \
              $$ SELECT id, val FROM limit_src LIMIT 5 $$, '1m', 'FULL')",
         )
         .await;
@@ -273,7 +273,7 @@ async fn test_offset_returns_unsupported_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('offset_st', \
+            "SELECT pgtrickle.create_stream_table('offset_st', \
              $$ SELECT id, val FROM offset_src OFFSET 5 $$, '1m', 'FULL')",
         )
         .await;
@@ -294,7 +294,7 @@ async fn test_order_by_with_limit_returns_unsupported_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('orderlimit_st', \
+            "SELECT pgtrickle.create_stream_table('orderlimit_st', \
              $$ SELECT id, val FROM orderlimit_src ORDER BY id LIMIT 10 $$, '1m', 'FULL')",
         )
         .await;
@@ -315,7 +315,7 @@ async fn test_limit_offset_combined_returns_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('limoff_st', \
+            "SELECT pgtrickle.create_stream_table('limoff_st', \
              $$ SELECT id, val FROM limoff_src LIMIT 10 OFFSET 5 $$, '1m', 'FULL')",
         )
         .await;
@@ -337,7 +337,7 @@ async fn test_for_update_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('forupd_st', \
+            "SELECT pgtrickle.create_stream_table('forupd_st', \
              $$ SELECT id, val FROM forupd_src FOR UPDATE $$, '1m', 'FULL')",
         )
         .await;
@@ -362,7 +362,7 @@ async fn test_for_share_rejected_with_clear_error() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('forshr_st', \
+            "SELECT pgtrickle.create_stream_table('forshr_st', \
              $$ SELECT id, val FROM forshr_src FOR SHARE $$, '1m', 'FULL')",
         )
         .await;
@@ -383,7 +383,7 @@ async fn test_for_no_key_update_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('fornku_st', \
+            "SELECT pgtrickle.create_stream_table('fornku_st', \
              $$ SELECT id, val FROM fornku_src FOR NO KEY UPDATE $$, '1m', 'FULL')",
         )
         .await;
@@ -399,7 +399,7 @@ async fn test_for_key_share_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('forks_st', \
+            "SELECT pgtrickle.create_stream_table('forks_st', \
              $$ SELECT id, val FROM forks_src FOR KEY SHARE $$, '1m', 'FULL')",
         )
         .await;
@@ -451,12 +451,12 @@ async fn test_concurrent_refresh_safety() {
     let pool2 = db.pool.clone();
 
     let h1 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('conc_st')")
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('conc_st')")
             .execute(&pool)
             .await
     });
     let h2 = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('conc_st')")
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('conc_st')")
             .execute(&pool2)
             .await
     });
@@ -494,7 +494,7 @@ async fn test_grouping_sets_accepted_via_rewrite() {
     // Use a simpler GROUPING SETS that only references columns in select list.
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('gs_st', \
+            "SELECT pgtrickle.create_stream_table('gs_st', \
              $$ SELECT dept, SUM(amount) FROM gs_src \
              GROUP BY GROUPING SETS ((dept), ()) $$, '1m', 'FULL')",
         )
@@ -516,7 +516,7 @@ async fn test_rollup_accepted_via_rewrite() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('rollup_st', \
+            "SELECT pgtrickle.create_stream_table('rollup_st', \
              $$ SELECT dept, region, SUM(amount) FROM rollup_src \
              GROUP BY ROLLUP (dept, region) $$, '1m', 'FULL')",
         )
@@ -538,7 +538,7 @@ async fn test_cube_accepted_via_rewrite() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('cube_st', \
+            "SELECT pgtrickle.create_stream_table('cube_st', \
              $$ SELECT dept, region, SUM(amount) FROM cube_src \
              GROUP BY CUBE (dept, region) $$, '1m', 'FULL')",
         )
@@ -560,7 +560,7 @@ async fn test_grouping_sets_differential_mode_also_rewritten() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('gsd_st', \
+            "SELECT pgtrickle.create_stream_table('gsd_st', \
              $$ SELECT dept, SUM(amount) FROM gsd_src \
              GROUP BY GROUPING SETS ((dept), ()) $$, '1m', 'DIFFERENTIAL')",
         )
@@ -585,7 +585,7 @@ async fn test_tablesample_bernoulli_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('ts_st', \
+            "SELECT pgtrickle.create_stream_table('ts_st', \
              $$ SELECT id, val FROM ts_src TABLESAMPLE BERNOULLI(10) $$, '1m', 'FULL')",
         )
         .await;
@@ -610,7 +610,7 @@ async fn test_tablesample_system_rejected() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('tss_st', \
+            "SELECT pgtrickle.create_stream_table('tss_st', \
              $$ SELECT id, val FROM tss_src TABLESAMPLE SYSTEM(50) $$, '1m', 'FULL')",
         )
         .await;
@@ -635,7 +635,7 @@ async fn test_percentile_cont_now_supported_in_differential_mode() {
 
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('pct_st', \
+            "SELECT pgtrickle.create_stream_table('pct_st', \
              $$ SELECT dept, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY amount) AS median \
              FROM pct_src GROUP BY dept $$, '1m', 'DIFFERENTIAL')",
         )
@@ -672,7 +672,7 @@ async fn test_volatile_operator_rejected_in_differential() {
     // DIFFERENTIAL mode should reject the volatile operator.
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('volop_st', \
+            "SELECT pgtrickle.create_stream_table('volop_st', \
              $$ SELECT id, a |+| b AS result FROM volop_src $$, '1m', 'DIFFERENTIAL')",
         )
         .await;

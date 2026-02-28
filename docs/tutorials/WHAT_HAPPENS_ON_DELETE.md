@@ -15,7 +15,7 @@ CREATE TABLE orders (
     amount   NUMERIC(10,2) NOT NULL
 );
 
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'customer_totals',
     $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
@@ -57,7 +57,7 @@ Alice still has one remaining order (id=1, amount=50.00). The group shrinks but 
 The AFTER DELETE trigger fires and writes **one row** to the change buffer with only OLD values:
 
 ```
-pgstream_changes.changes_16384
+pgtrickle_changes.changes_16384
 ┌───────────┬─────────────┬────────┬──────────┬──────────┬────────────┬──────────┬────────────┐
 │ change_id │ lsn         │ action │ new_cust │ new_amt  │ old_cust   │ old_amt  │ pk_hash    │
 ├───────────┼─────────────┼────────┼──────────┼──────────┼────────────┼──────────┼────────────┤
@@ -79,7 +79,7 @@ Identical to the INSERT flow. The scheduler detects one change row in the LSN wi
 Unlike UPDATE (which splits into D+I), a DELETE produces a **single event**:
 
 ```
-__pgs_row_id | __pgs_action | customer | amount
+__pgt_row_id | __pgt_action | customer | amount
 -------------|--------------|----------|-------
 4521038      | D            | alice    | 30.00
 ```
@@ -113,12 +113,12 @@ new_count = old_count + ins_count - del_count = 2 + 0 - 1 = 1  (still > 0)
 Since `new_count > 0` and the group already existed (`old_count = 2`), the action is classified as **'U' (update)**. The aggregate emits the group with its new values:
 
 ```
-customer | total | order_count | __pgs_row_id | __pgs_action
+customer | total | order_count | __pgt_row_id | __pgt_action
 ---------|-------|-------------|--------------|-------------
 alice    | 50.00 | 1           | 7283194      | I
 ```
 
-Note: the 'U' meta-action is emitted as `__pgs_action = 'I'` because the MERGE treats it as an update-via-INSERT (see aggregate final CTE: `CASE WHEN __pgs_meta_action = 'D' THEN 'D' ELSE 'I' END`).
+Note: the 'U' meta-action is emitted as `__pgt_action = 'I'` because the MERGE treats it as an update-via-INSERT (see aggregate final CTE: `CASE WHEN __pgt_meta_action = 'D' THEN 'D' ELSE 'I' END`).
 
 ### Phase 6: MERGE
 
@@ -127,8 +127,8 @@ The MERGE statement matches alice's existing row and updates it:
 ```sql
 MERGE INTO customer_totals AS st
 USING (...delta...) AS d
-ON st.__pgs_row_id = d.__pgs_row_id
-WHEN MATCHED AND d.__pgs_action = 'I' THEN
+ON st.__pgt_row_id = d.__pgt_row_id
+WHEN MATCHED AND d.__pgt_action = 'I' THEN
   UPDATE SET customer = d.customer, total = d.total, order_count = d.order_count, ...
 ```
 
@@ -147,7 +147,7 @@ SELECT * FROM customer_totals;
 The change buffer rows in the consumed LSN window are deleted:
 
 ```sql
-DELETE FROM pgstream_changes.changes_16384
+DELETE FROM pgtrickle_changes.changes_16384
 WHERE lsn > '0/1A3F2FFF'::pg_lsn AND lsn <= '0/1A3F3000'::pg_lsn;
 ```
 
@@ -172,7 +172,7 @@ change_id | lsn         | action | old_cust | old_amt | pk_hash
 Single DELETE event:
 
 ```
-__pgs_row_id | __pgs_action | customer | amount
+__pgt_row_id | __pgt_action | customer | amount
 -------------|--------------|----------|-------
 -837291      | D            | alice    | 50.00
 ```
@@ -191,7 +191,7 @@ When `new_count` drops to 0 (or below), the aggregate classifies this as action 
 The aggregate emits a DELETE for alice's group:
 
 ```
-customer | __pgs_row_id | __pgs_action
+customer | __pgt_row_id | __pgt_action
 ---------|--------------|-------------
 alice    | 7283194      | D
 ```
@@ -201,7 +201,7 @@ alice    | 7283194      | D
 The MERGE matches alice's existing row and **deletes** it:
 
 ```sql
-WHEN MATCHED AND d.__pgs_action = 'D' THEN DELETE
+WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE
 ```
 
 Result:
@@ -238,7 +238,7 @@ change_id | action | old_cust | old_amt | pk_hash
 Each PK has exactly one change, so both take the single-change fast path:
 
 ```
-__pgs_row_id | __pgs_action | customer | amount
+__pgt_row_id | __pgt_action | customer | amount
 -------------|--------------|----------|-------
 pk_hash_3    | D            | bob      | 75.00
 pk_hash_4    | D            | bob      | 25.00
@@ -333,7 +333,7 @@ Filtering:
 Net delta:
 
 ```
-__pgs_row_id | __pgs_action | amount
+__pgt_row_id | __pgt_action | amount
 -------------|--------------|-------
 pk_hash_3    | D            | 75.00
 ```
@@ -359,7 +359,7 @@ CREATE TABLE orders (
     amount      NUMERIC(10,2)
 );
 
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'order_details',
     $$
       SELECT c.name, c.tier, o.amount
@@ -411,7 +411,7 @@ So:
 
 Part 1 produces:
 ```
-name  | tier    | amount | __pgs_action
+name  | tier    | amount | __pgt_action
 ------|---------|--------|-------------
 alice | premium | 30.00  | D
 ```
@@ -444,7 +444,7 @@ Now $\Delta R$ has a DELETE for bob, while $\Delta L$ is empty:
 Part 2 produces DELETE events for every order that referenced bob:
 
 ```
-name | tier     | amount | __pgs_action
+name | tier     | amount | __pgt_action
 -----|----------|--------|-------------
 bob  | standard | 75.00  | D
 ```
@@ -474,7 +474,7 @@ change_id | action | old_cust | old_amt | pk_hash
 Each deleted PK is independent (different pk_hash values), so each takes the single-change fast path. Two DELETE events:
 
 ```
-__pgs_row_id | __pgs_action | customer | amount
+__pgt_row_id | __pgt_action | customer | amount
 -------------|--------------|----------|-------
 pk_hash_2    | D            | alice    | 30.00
 pk_hash_4    | D            | bob      | 25.00
@@ -520,7 +520,7 @@ This means the stream table becomes **stale** — it still shows the old aggrega
 **Workaround**: After a TRUNCATE, manually reinitialize:
 
 ```sql
-SELECT pgstream.refresh_stream_table('customer_totals');
+SELECT pgtrickle.refresh_stream_table('customer_totals');
 ```
 
 With the `FULL` refresh mode (or by setting the reinitialize flag), the stream table is recomputed from scratch, producing correct results.
@@ -546,21 +546,21 @@ With the `FULL` refresh mode (or by setting the reinitialize flag), the stream t
 
 ## The Reference Counting Principle
 
-The core insight behind incremental DELETE handling is **reference counting**. Every aggregate group in the stream table maintains an internal counter (`__pgs_count`) that tracks how many source rows contribute to the group:
+The core insight behind incremental DELETE handling is **reference counting**. Every aggregate group in the stream table maintains an internal counter (`__pgt_count`) that tracks how many source rows contribute to the group:
 
 ```
 Stream table internal state:
-customer | total | order_count | __pgs_count (hidden)
+customer | total | order_count | __pgt_count (hidden)
 ---------|-------|-------------|---------------------
 alice    | 80.00 | 2           | 2
 bob      | 100.00| 2           | 2
 ```
 
-- **INSERT** → `__pgs_count += 1`
-- **DELETE** → `__pgs_count -= 1`
-- **UPDATE** → `__pgs_count += 0` (D cancels I for same-group updates)
+- **INSERT** → `__pgt_count += 1`
+- **DELETE** → `__pgt_count -= 1`
+- **UPDATE** → `__pgt_count += 0` (D cancels I for same-group updates)
 
-When `__pgs_count` reaches 0:
+When `__pgt_count` reaches 0:
 - The group has zero contributing rows
 - The aggregate emits a DELETE event
 - The MERGE removes the row from the stream table

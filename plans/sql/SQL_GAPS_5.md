@@ -10,7 +10,7 @@
 
 - [x] **C-1: Populate `columns_used` + wire `detect_schema_change_kind()`** — Done 2026-02-24
   - `OpTree::source_columns_used()` + `ParseResult::source_columns_used()` collect per-source column names from Scan nodes
-  - `StDependency::insert()` accepts and writes `columns_used` to `pgs_dependencies`
+  - `StDependency::insert()` accepts and writes `columns_used` to `pgt_dependencies`
   - `get_for_st()` / `get_all()` read `columns_used` from DB (no longer hardcoded `None`)
   - `api.rs`: extracts column map from `ParseResult` during creation, passes to dependency insert
   - `handle_alter_table()` calls `detect_schema_change_kind()` — benign DDL skips reinit, only column changes trigger reinit + cascade
@@ -117,8 +117,8 @@ query that will produce wrong results.
   SELECT customer_id, order_id, created_at FROM (
     SELECT *, ROW_NUMBER() OVER (
       PARTITION BY customer_id ORDER BY created_at DESC
-    ) AS __pgs_rn FROM orders
-  ) __pgs_don WHERE __pgs_rn = 1
+    ) AS __pgt_rn FROM orders
+  ) __pgt_don WHERE __pgt_rn = 1
   ```
 - Reuses existing Window + Filter operators — no new OpTree variant needed
 - ~150 lines in `parser.rs` + unit tests + E2E tests
@@ -325,8 +325,8 @@ would significantly expand the extension's coverage.
   SELECT * FROM orders WHERE amount > (SELECT avg(amount) FROM orders)
   -- Rewrite to:
   SELECT o.* FROM orders o
-  CROSS JOIN (SELECT avg(amount) AS __pgs_scalar FROM orders) __pgs_sq
-  WHERE o.amount > __pgs_sq.__pgs_scalar
+  CROSS JOIN (SELECT avg(amount) AS __pgt_scalar FROM orders) __pgt_sq
+  WHERE o.amount > __pgt_sq.__pgt_scalar
   ```
 - The CROSS JOIN produces exactly one row from the scalar subquery
 - Reuses existing InnerJoin operator for delta computation
@@ -566,7 +566,7 @@ After Steps S1–S6 (highest-impact work):
 | PLAN_SQL_GAPS_2 | 1 | GROUPING SETS P0, GROUP BY hardening, TABLESAMPLE | 745 → 750 |
 | PLAN_SQL_GAPS_3 | ~5 | 5 new aggregates + 3 subquery operators | 750 → 809 |
 | PLAN_SQL_GAPS_4 | 1 | Report accuracy + 3 ordered-set aggregates | 809 → 826 |
-| Hybrid CDC + user triggers + pgs_ rename | ~3 | Hybrid CDC, user triggers, 72-file rename | 826 → 872 |
+| Hybrid CDC + user triggers + pgt_ rename | ~3 | Hybrid CDC, user triggers, 72-file rename | 826 → 872 |
 | **SQL_GAPS_5 C-1** | **1** | **columns_used population + smart schema change detection** | **872 (no new tests yet)** |
 | **SQL_GAPS_5** | **~10** | **Target: volatile detection, DISTINCT ON, ALL subquery, 11 regression aggs, mixed UNION, TRUNCATE, schema infra, NATURAL JOIN, keyless tables** | **872 → 920+** |
 
@@ -597,11 +597,11 @@ C-1). C0-c remains for future work (session C-2).
 > `handle_alter_table()`. Benign DDL (indexes, comments, statistics) and
 > constraint-only changes no longer trigger unnecessary reinitialization.
 
-#### C0-a. `columns_used TEXT[]` in `pgs_dependencies` — ✅ DONE
+#### C0-a. `columns_used TEXT[]` in `pgt_dependencies` — ✅ DONE
 
 | Field | Value |
 |-------|-------|
-| **Schema column** | `pgs_dependencies.columns_used TEXT[]` ([src/lib.rs](../../src/lib.rs) table DDL) |
+| **Schema column** | `pgt_dependencies.columns_used TEXT[]` ([src/lib.rs](../../src/lib.rs) table DDL) |
 | **Rust struct** | `StDependency.columns_used: Option<Vec<String>>` ([src/catalog.rs L82](../../src/catalog.rs#L82)) |
 | **Insert** | `StDependency::insert()` now accepts `Option<Vec<String>>` and writes to DB |
 | **Read** | `get_for_st()` and `get_all()` now read `columns_used` from query results |
@@ -614,7 +614,7 @@ C-1). C0-c remains for future work (session C-2).
 |-------|-------|
 | **Location** | [src/hooks.rs L590](../../src/hooks.rs#L590) |
 | **Purpose** | Classifies ALTER TABLE changes as `ColumnChange`, `ConstraintChange`, or `Benign` |
-| **Mechanism** | Compares `columns_used` (from `pgs_dependencies`) against current `pg_attribute` |
+| **Mechanism** | Compares `columns_used` (from `pgt_dependencies`) against current `pg_attribute` |
 | **Status** | **Wired in.** `handle_alter_table()` calls `detect_schema_change_kind()` per-ST and only reinits on `ColumnChange`. `Benign` and `ConstraintChange` skip reinit. |
 
 #### C0-c. No Column Snapshot at Creation Time
@@ -637,8 +637,8 @@ table used by a stream table.
 
 | Field | Value |
 |-------|-------|
-| **Mechanism** | Extend `_on_ddl_end` at [src/hooks.rs L51](../../src/hooks.rs#L51) to `ERROR` instead of reinit when `pg_stream.block_source_ddl` GUC is `true` |
-| **New GUC** | `pg_stream.block_source_ddl` (boolean, default `false`) in [src/config.rs](../../src/config.rs) |
+| **Mechanism** | Extend `_on_ddl_end` at [src/hooks.rs L51](../../src/hooks.rs#L51) to `ERROR` instead of reinit when `pg_trickle.block_source_ddl` GUC is `true` |
+| **New GUC** | `pg_trickle.block_source_ddl` (boolean, default `false`) in [src/config.rs](../../src/config.rs) |
 | **Scope** | ALTER TABLE (ADD/DROP/RENAME/ALTER COLUMN, DROP CONSTRAINT) on tables referenced by any stream table |
 | **Exempt** | CREATE INDEX, COMMENT ON, ALTER TABLE SET STATISTICS — benign ops that don't affect column structure |
 | **Effort** | 3–4 hours |
@@ -651,7 +651,7 @@ _on_ddl_end():
       let kind = detect_schema_change_kind(...)  // already built
       if kind == ColumnChange:
         error!("ALTER TABLE blocked: table is a source for stream tables. \
-                Set pg_stream.block_source_ddl = false to allow.")
+                Set pg_trickle.block_source_ddl = false to allow.")
       // ConstraintChange and Benign pass through
 ```
 
@@ -674,7 +674,7 @@ error depending on the feature).
 
 #### Step 1: Populate `columns_used` — ✅ DONE
 
-During stream table creation (`pgstream.create()` → `StDependency::insert()`),
+During stream table creation (`pgtrickle.create()` → `StDependency::insert()`),
 column names from `resolve_columns()` results are passed through the API layer
 into catalog storage.
 
@@ -703,7 +703,7 @@ triggers unnecessary reinitialization.
 
 #### Step 3: Store Column Snapshot (3–4 hours)
 
-Add a new catalog table or extend `pgs_dependencies` with:
+Add a new catalog table or extend `pgt_dependencies` with:
 
 | Column | Type | Purpose |
 |--------|------|---------|
@@ -721,7 +721,7 @@ snapshot. This enables precise change detection:
 #### Step 4: NATURAL JOIN Column Resolution Snapshot (2 hours)
 
 For NATURAL JOIN specifically, store the resolved common-column names at
-creation time in `pgs_dependencies` or the column snapshot. On reinit:
+creation time in `pgt_dependencies` or the column snapshot. On reinit:
 
 1. Re-resolve common columns from current `pg_attribute`
 2. Compare against stored list
@@ -755,7 +755,7 @@ parse time to resolve common column names, then synthesize an explicit equi-join
 are stored, enabling semantic drift detection on reinit.
 
 **Keyless tables detail:** Without a PK, row identity falls back to an
-all-column content hash for `__pgs_row_id`. If a PK is later added, the row
+all-column content hash for `__pgt_row_id`. If a PK is later added, the row
 identity strategy should switch. Under Policy C2 Step 2, `ConstraintChange` is
 detected and triggers reinit. ~4–6 hours for the initial keyless implementation.
 
@@ -808,7 +808,7 @@ independently. Steps are numbered sequentially for easy reference.
 | Step | Item(s) | Effort | Delivers | Prereqs |
 |------|---------|--------|----------|----------|
 | ~~**S7**~~ | ~~C-2: Column snapshot + schema fingerprint~~ | ~~3–4h~~ | ~~✅ DONE~~ | C-1 ✅ |
-| ~~**S8**~~ | ~~C-3: `pg_stream.block_source_ddl` GUC~~ | ~~3–4h~~ | ~~✅ DONE~~ | — |
+| ~~**S8**~~ | ~~C-3: `pg_trickle.block_source_ddl` GUC~~ | ~~3–4h~~ | ~~✅ DONE~~ | — |
 
 #### Tier 4 — Schema-Dependent Features (newly unlocked)
 
@@ -870,7 +870,7 @@ is Detection + Smart Reinit.
    add column snapshots. ~7–9 hours total.
 
 2. **DDL Blocking as opt-in strict mode** (C-3). Offer
-   `pg_stream.block_source_ddl = true` for production deployments where source
+   `pg_trickle.block_source_ddl = true` for production deployments where source
    schemas are stable. Default to `false`.
 
 3. **Schema-dependent features** (C-4 + C-5). NATURAL JOIN with reinit-aware
@@ -923,9 +923,9 @@ design reasons that no schema policy can address:
 - [ ] 11 regression aggregates supported in DIFFERENTIAL mode (S5)
 - [ ] Mixed UNION / UNION ALL works correctly (S6)
 - [x] Column snapshot stored per source dependency with schema fingerprint (S7)
-- [x] `pg_stream.block_source_ddl` GUC available, default false (S8)
+- [x] `pg_trickle.block_source_ddl` GUC available, default false (S8)
 - [x] NATURAL JOIN supported with catalog-resolved rewrite + column snapshot (S9)
-- [x] Keyless tables supported with all-column content hash for `__pgs_row_id` (S10)
+- [x] Keyless tables supported with all-column content hash for `__pgt_row_id` (S10)
 - [x] GROUPING SETS / CUBE / ROLLUP via UNION ALL decomposition (S11)
 - [x] Scalar subquery in WHERE via CROSS JOIN rewrite (S12)
 - [x] SubLinks inside OR via OR-to-UNION rewrite (S13)

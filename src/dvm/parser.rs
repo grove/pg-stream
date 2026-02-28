@@ -10,7 +10,7 @@
 //!
 //! We use approach (1) for the tree structure + approach (2) for type resolution.
 
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use pgrx::prelude::*;
 use std::collections::HashMap;
 
@@ -712,7 +712,7 @@ impl ParseResult {
     /// Collect `(table_oid, Vec<column_name>)` for all source tables
     /// referenced across the main tree and CTE bodies.
     ///
-    /// Used to populate `pgs_dependencies.columns_used` at creation time
+    /// Used to populate `pgt_dependencies.columns_used` at creation time
     /// so `detect_schema_change_kind()` can accurately classify DDL events.
     pub fn source_columns_used(&self) -> std::collections::HashMap<u32, Vec<String>> {
         let mut map: std::collections::HashMap<u32, std::collections::HashSet<String>> =
@@ -732,7 +732,7 @@ impl ParseResult {
 
     /// Collect all function names referenced in the defining query (G8.2).
     ///
-    /// Used to populate `pgs_stream_tables.functions_used` at creation time
+    /// Used to populate `pgt_stream_tables.functions_used` at creation time
     /// so that DDL hooks can detect `CREATE OR REPLACE FUNCTION` /
     /// `DROP FUNCTION` events that affect this stream table.
     ///
@@ -955,12 +955,12 @@ impl OpTree {
 
     /// Returns `true` if the operator tree contains Aggregate, Distinct,
     /// Intersect, or Except — meaning the storage table needs a
-    /// `__pgs_count BIGINT` auxiliary column for differential maintenance.
+    /// `__pgt_count BIGINT` auxiliary column for differential maintenance.
     ///
     /// Recurses through transparent wrappers (`Filter`, `Project`,
     /// `Subquery`) that may sit on top (e.g. HAVING adds a `Filter`
     /// around the `Aggregate`).
-    pub fn needs_pgs_count(&self) -> bool {
+    pub fn needs_pgt_count(&self) -> bool {
         match self {
             OpTree::Aggregate { .. }
             | OpTree::Distinct { .. }
@@ -969,7 +969,7 @@ impl OpTree {
             // Transparent wrappers — delegate to child
             OpTree::Filter { child, .. }
             | OpTree::Project { child, .. }
-            | OpTree::Subquery { child, .. } => child.needs_pgs_count(),
+            | OpTree::Subquery { child, .. } => child.needs_pgt_count(),
             _ => false,
         }
     }
@@ -997,7 +997,7 @@ impl OpTree {
         }
     }
 
-    /// Return the column names that should be hashed to produce `__pgs_row_id`.
+    /// Return the column names that should be hashed to produce `__pgt_row_id`.
     ///
     /// This mirrors the hash generation in each operator's diff function:
     /// - **Scan**: non-nullable (heuristic PK) columns, or all if none
@@ -1076,7 +1076,7 @@ impl OpTree {
                 let cols: Vec<String> = group_by.iter().map(|e| e.output_name()).collect();
                 if cols.is_empty() {
                     // Scalar aggregate: special sentinel
-                    None // caller handles with pg_stream_hash('__singleton_group')
+                    None // caller handles with pg_trickle_hash('__singleton_group')
                 } else {
                     Some(cols)
                 }
@@ -1295,7 +1295,7 @@ impl OpTree {
     ///
     /// When the same table appears in multiple Scan nodes (self-join), the
     /// column lists are merged (union of column names). This is used to
-    /// populate `pgs_dependencies.columns_used` at creation time.
+    /// populate `pgt_dependencies.columns_used` at creation time.
     pub fn source_columns_used(&self) -> std::collections::HashMap<u32, Vec<String>> {
         let mut map: std::collections::HashMap<u32, std::collections::HashSet<String>> =
             std::collections::HashMap::new();
@@ -1518,7 +1518,7 @@ pub fn max_volatility(a: char, b: char) -> char {
 /// For overloaded functions (multiple `pg_proc` rows with the same `proname`),
 /// returns the worst volatility across all overloads.
 #[cfg(not(test))]
-pub fn lookup_function_volatility(func_name: &str) -> Result<char, PgStreamError> {
+pub fn lookup_function_volatility(func_name: &str) -> Result<char, PgTrickleError> {
     // Strip schema qualification if present (e.g., "pg_catalog.lower" → "lower").
     let bare_name = func_name.rsplit('.').next().unwrap_or(func_name);
 
@@ -1549,13 +1549,13 @@ pub fn lookup_function_volatility(func_name: &str) -> Result<char, PgStreamError
         Ok(worst)
     })
     .map_err(|e: pgrx::spi::SpiError| {
-        PgStreamError::SpiError(format!("volatility lookup failed: {e}"))
+        PgTrickleError::SpiError(format!("volatility lookup failed: {e}"))
     })
 }
 
 /// Test-only stub: SPI is unavailable in unit tests, so assume volatile.
 #[cfg(test)]
-pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgStreamError> {
+pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgTrickleError> {
     Ok('v')
 }
 
@@ -1574,7 +1574,7 @@ pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgStreamErro
 /// Closes Gap G7.2: custom operators with volatile `oprcode` functions
 /// (e.g., PostGIS `&&` or user-defined operators) are now detected.
 #[cfg(not(test))]
-pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgStreamError> {
+pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgTrickleError> {
     Spi::connect(|client| {
         let result = client.select(
             "SELECT p.provolatile::text \
@@ -1598,14 +1598,14 @@ pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgStreamError> 
         Ok(worst)
     })
     .map_err(|e: pgrx::spi::SpiError| {
-        PgStreamError::SpiError(format!("operator volatility lookup failed: {e}"))
+        PgTrickleError::SpiError(format!("operator volatility lookup failed: {e}"))
     })
 }
 
 /// Test-only stub: SPI is unavailable in unit tests, so assume immutable
 /// for operators (most built-in operators are immutable).
 #[cfg(test)]
-pub fn lookup_operator_volatility(_op_name: &str) -> Result<char, PgStreamError> {
+pub fn lookup_operator_volatility(_op_name: &str) -> Result<char, PgTrickleError> {
     Ok('i')
 }
 
@@ -1621,7 +1621,7 @@ pub fn lookup_operator_volatility(_op_name: &str) -> Result<char, PgStreamError>
 /// volatile. This closes the G7.1 gap where expressions like
 /// `CASE WHEN now() > x THEN ...` deparsed to `Expr::Raw` would bypass
 /// volatility checking.
-pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStreamError> {
+pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgTrickleError> {
     match expr {
         Expr::FuncCall { func_name, args } => {
             let vol = lookup_function_volatility(func_name)?;
@@ -1654,7 +1654,7 @@ pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgStrea
 /// statement, then uses `raw_parser()` to parse and recursively walks the
 /// resulting parse tree nodes.
 #[cfg(not(test))]
-fn collect_raw_expr_volatility(raw_sql: &str, worst: &mut char) -> Result<(), PgStreamError> {
+fn collect_raw_expr_volatility(raw_sql: &str, worst: &mut char) -> Result<(), PgTrickleError> {
     // Skip simple literals and column references — no function calls possible.
     if raw_sql.is_empty()
         || raw_sql == "NULL"
@@ -1696,7 +1696,7 @@ fn collect_raw_expr_volatility(raw_sql: &str, worst: &mut char) -> Result<(), Pg
 
 /// Test-only stub: assume volatile for any Expr::Raw (safe default).
 #[cfg(test)]
-fn collect_raw_expr_volatility(_raw_sql: &str, worst: &mut char) -> Result<(), PgStreamError> {
+fn collect_raw_expr_volatility(_raw_sql: &str, worst: &mut char) -> Result<(), PgTrickleError> {
     // In tests, conservatively assume volatile for raw expressions.
     *worst = max_volatility(*worst, 'v');
     Ok(())
@@ -1708,7 +1708,7 @@ fn collect_raw_expr_volatility(_raw_sql: &str, worst: &mut char) -> Result<(), P
 fn walk_node_for_volatility(
     node: *mut pg_sys::Node,
     worst: &mut char,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     if node.is_null() {
         return Ok(());
     }
@@ -1825,7 +1825,7 @@ fn walk_node_for_volatility(
 }
 
 /// Return the worst volatility found in an expression tree.
-pub fn worst_volatility(expr: &Expr) -> Result<char, PgStreamError> {
+pub fn worst_volatility(expr: &Expr) -> Result<char, PgTrickleError> {
     let mut worst = 'i';
     collect_volatilities(expr, &mut worst)?;
     Ok(worst)
@@ -1834,14 +1834,14 @@ pub fn worst_volatility(expr: &Expr) -> Result<char, PgStreamError> {
 /// Walk an entire OpTree and return the worst volatility found in any
 /// expression (target list, WHERE, JOIN conditions, HAVING, aggregates,
 /// window functions).
-pub fn tree_worst_volatility(tree: &OpTree) -> Result<char, PgStreamError> {
+pub fn tree_worst_volatility(tree: &OpTree) -> Result<char, PgTrickleError> {
     let mut worst = 'i';
     tree_collect_volatility(tree, &mut worst)?;
     Ok(worst)
 }
 
 /// Walk an entire [`ParseResult`] (tree + CTE registry) for volatility.
-pub fn tree_worst_volatility_with_registry(result: &ParseResult) -> Result<char, PgStreamError> {
+pub fn tree_worst_volatility_with_registry(result: &ParseResult) -> Result<char, PgTrickleError> {
     let mut worst = 'i';
     // Check all CTE bodies
     for (_name, body) in &result.cte_registry.entries {
@@ -1851,7 +1851,7 @@ pub fn tree_worst_volatility_with_registry(result: &ParseResult) -> Result<char,
     Ok(worst)
 }
 
-fn tree_collect_volatility(tree: &OpTree, worst: &mut char) -> Result<(), PgStreamError> {
+fn tree_collect_volatility(tree: &OpTree, worst: &mut char) -> Result<(), PgTrickleError> {
     match tree {
         OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
         OpTree::Project {
@@ -1973,16 +1973,16 @@ fn tree_collect_volatility(tree: &OpTree, worst: &mut char) -> Result<(), PgStre
 }
 
 /// Check if an operator tree is supported for differential maintenance.
-pub fn check_ivm_support(tree: &OpTree) -> Result<(), PgStreamError> {
+pub fn check_ivm_support(tree: &OpTree) -> Result<(), PgTrickleError> {
     check_ivm_support_inner(tree)
 }
 
 /// Check if a [`ParseResult`] (tree + CTE registry) is fully supported.
-pub fn check_ivm_support_with_registry(result: &ParseResult) -> Result<(), PgStreamError> {
+pub fn check_ivm_support_with_registry(result: &ParseResult) -> Result<(), PgTrickleError> {
     // Validate all CTE bodies first
     for (name, body) in &result.cte_registry.entries {
         check_ivm_support_inner(body)
-            .map_err(|e| PgStreamError::UnsupportedOperator(format!("in CTE '{name}': {e}")))?;
+            .map_err(|e| PgTrickleError::UnsupportedOperator(format!("in CTE '{name}': {e}")))?;
     }
     check_ivm_support_inner(&result.tree)
 }
@@ -1997,9 +1997,9 @@ fn check_join_children_are_base_tables(
     left: &OpTree,
     right: &OpTree,
     join_kind: &str,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     if !resolves_to_base_table(left) {
-        return Err(PgStreamError::UnsupportedOperator(format!(
+        return Err(PgTrickleError::UnsupportedOperator(format!(
             "nested joins are not supported for DIFFERENTIAL mode: \
              left child of {join_kind} must resolve to a base table, \
              not a {}",
@@ -2007,7 +2007,7 @@ fn check_join_children_are_base_tables(
         )));
     }
     if !resolves_to_base_table(right) {
-        return Err(PgStreamError::UnsupportedOperator(format!(
+        return Err(PgTrickleError::UnsupportedOperator(format!(
             "nested joins are not supported for DIFFERENTIAL mode: \
              right child of {join_kind} must resolve to a base table, \
              not a {}",
@@ -2047,7 +2047,7 @@ fn resolves_to_base_table(op: &OpTree) -> bool {
     }
 }
 
-fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgStreamError> {
+fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgTrickleError> {
     match tree {
         OpTree::Scan { .. } => Ok(()),
         OpTree::Project { child, .. } => check_ivm_support(child),
@@ -2227,22 +2227,22 @@ impl CteParseContext {
 ///
 /// # Requires
 /// Must be called within a PostgreSQL backend (uses `raw_parser()`).
-pub fn query_has_recursive_cte(query: &str) -> Result<bool, PgStreamError> {
+pub fn query_has_recursive_cte(query: &str) -> Result<bool, PgTrickleError> {
     // SAFETY: raw_parser is safe when called within a PostgreSQL backend
     // with a valid memory context.
     unsafe { query_has_recursive_cte_inner(query) }
 }
 
-unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgStreamError> {
+unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     let raw_list =
         unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
     if raw_list.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "raw_parser returned NULL".into(),
         ));
     }
@@ -2282,7 +2282,7 @@ unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgStreamErr
 /// Foreign tables (`relkind = 'f'`) are also left as-is.
 ///
 /// Returns the original query unchanged if no views are found.
-pub fn rewrite_views_inline(query: &str) -> Result<String, PgStreamError> {
+pub fn rewrite_views_inline(query: &str) -> Result<String, PgTrickleError> {
     let max_depth = 10;
     let mut current = query.to_string();
 
@@ -2294,7 +2294,7 @@ pub fn rewrite_views_inline(query: &str) -> Result<String, PgStreamError> {
         current = rewritten;
     }
 
-    Err(PgStreamError::QueryParseError(format!(
+    Err(PgTrickleError::QueryParseError(format!(
         "View inlining exceeded maximum nesting depth of {max_depth}. \
          This may indicate circular view dependencies."
     )))
@@ -2304,11 +2304,11 @@ pub fn rewrite_views_inline(query: &str) -> Result<String, PgStreamError> {
 /// any view RangeVars with `(pg_get_viewdef(oid, true)) AS alias`.
 ///
 /// Returns the original string unchanged if no views are found.
-fn rewrite_views_inline_once(query: &str) -> Result<String, PgStreamError> {
+fn rewrite_views_inline_once(query: &str) -> Result<String, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
     let raw_list =
@@ -2362,7 +2362,7 @@ struct ViewSubstitution {
 ///
 /// Returns: `'r'` (table), `'v'` (view), `'m'` (matview), `'f'` (foreign),
 /// `'p'` (partitioned table), etc.
-fn resolve_relkind(schema: &str, relname: &str) -> Result<Option<String>, PgStreamError> {
+fn resolve_relkind(schema: &str, relname: &str) -> Result<Option<String>, PgTrickleError> {
     let sql = format!(
         "SELECT c.relkind::text FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -2373,16 +2373,16 @@ fn resolve_relkind(schema: &str, relname: &str) -> Result<Option<String>, PgStre
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         result
             .first()
             .get::<String>(1)
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))
     })
 }
 
 /// Get the SQL definition of a view using `pg_get_viewdef(oid, true)`.
-fn get_view_definition(schema: &str, relname: &str) -> Result<String, PgStreamError> {
+fn get_view_definition(schema: &str, relname: &str) -> Result<String, PgTrickleError> {
     let sql = format!(
         "SELECT pg_get_viewdef(c.oid, true) FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -2393,13 +2393,13 @@ fn get_view_definition(schema: &str, relname: &str) -> Result<String, PgStreamEr
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let raw = result
             .first()
             .get::<String>(1)
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
             .ok_or_else(|| {
-                PgStreamError::QueryParseError(format!(
+                PgTrickleError::QueryParseError(format!(
                     "Could not retrieve view definition for {schema}.{relname}"
                 ))
             })?;
@@ -2421,11 +2421,11 @@ fn strip_view_definition_suffix(raw: &str) -> String {
 ///
 /// Returns `None` if the relation cannot be found in `pg_class` (e.g. CTE
 /// names, subquery aliases, or function-call ranges).
-fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgStreamError> {
+fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgTrickleError> {
     if !rv.schemaname.is_null() {
         let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
             .to_str()
-            .map_err(|_| PgStreamError::QueryParseError("Invalid schema name encoding".into()))?;
+            .map_err(|_| PgTrickleError::QueryParseError("Invalid schema name encoding".into()))?;
         return Ok(Some(schema.to_string()));
     }
 
@@ -2435,7 +2435,7 @@ fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgSt
     }
     let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
         .to_str()
-        .map_err(|_| PgStreamError::QueryParseError("Invalid relation name encoding".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Invalid relation name encoding".into()))?;
 
     let sql = format!(
         "SELECT n.nspname::text FROM pg_class c \
@@ -2449,7 +2449,7 @@ fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgSt
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         // Iterate to handle empty results (CTE names, subquery aliases, etc.)
         for row in result {
             if let Ok(Some(schema)) = row.get::<String>(1) {
@@ -2469,7 +2469,7 @@ unsafe fn collect_view_substitutions(
     select: *const pg_sys::SelectStmt,
     subs: &mut Vec<ViewSubstitution>,
     found_view: &mut bool,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let s = unsafe { &*select };
 
     // Handle set operations: recurse into larg/rarg
@@ -2522,7 +2522,7 @@ unsafe fn collect_view_subs_from_item(
     node: *mut pg_sys::Node,
     subs: &mut Vec<ViewSubstitution>,
     found_view: &mut bool,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     if node.is_null() {
         return Ok(());
     }
@@ -2536,7 +2536,7 @@ unsafe fn collect_view_subs_from_item(
         }
         let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
             .to_str()
-            .map_err(|_| PgStreamError::QueryParseError("Invalid relation name encoding".into()))?
+            .map_err(|_| PgTrickleError::QueryParseError("Invalid relation name encoding".into()))?
             .to_string();
 
         // Resolve schema — if not found, this is a CTE/subquery alias, skip.
@@ -2608,7 +2608,7 @@ unsafe fn collect_view_subs_from_item(
 unsafe fn deparse_select_stmt_with_view_subs(
     stmt: *const pg_sys::SelectStmt,
     subs: &[ViewSubstitution],
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     let s = unsafe { &*stmt };
 
     // Handle set operations: deparse each arm separately
@@ -2791,7 +2791,7 @@ unsafe fn deparse_select_stmt_with_view_subs(
 unsafe fn deparse_with_clause_with_view_subs(
     with_clause: *mut pg_sys::WithClause,
     subs: &[ViewSubstitution],
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     let wc = unsafe { &*with_clause };
     let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
     let mut cte_parts = Vec::new();
@@ -2840,9 +2840,11 @@ unsafe fn deparse_with_clause_with_view_subs(
 unsafe fn deparse_from_item_with_view_subs(
     node: *mut pg_sys::Node,
     subs: &[ViewSubstitution],
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     if node.is_null() {
-        return Err(PgStreamError::QueryParseError("NULL FROM item node".into()));
+        return Err(PgTrickleError::QueryParseError(
+            "NULL FROM item node".into(),
+        ));
     }
 
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
@@ -2958,7 +2960,7 @@ unsafe fn deparse_from_item_with_view_subs(
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeSubselect without valid SelectStmt".into(),
             ));
         }
@@ -2992,7 +2994,7 @@ unsafe fn deparse_from_item_with_view_subs(
 ///
 /// # Safety
 /// Caller must ensure `wdef` points to a valid `WindowDef`.
-unsafe fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgStreamError> {
+unsafe fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgTrickleError> {
     let mut parts = Vec::new();
 
     // PARTITION BY
@@ -3021,11 +3023,11 @@ unsafe fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgStrea
 /// Materialized views are stale snapshots — CDC triggers cannot track
 /// `REFRESH MATERIALIZED VIEW`. The user should use the underlying query
 /// directly or switch to FULL refresh mode.
-pub fn reject_materialized_views(query: &str) -> Result<(), PgStreamError> {
+pub fn reject_materialized_views(query: &str) -> Result<(), PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
     let raw_list =
@@ -3052,7 +3054,7 @@ pub fn reject_materialized_views(query: &str) -> Result<(), PgStreamError> {
 /// Reject foreign tables in the defining query for DIFFERENTIAL mode.
 ///
 /// Foreign tables do not support row-level triggers, so CDC cannot track them.
-pub fn reject_foreign_tables(query: &str) -> Result<(), PgStreamError> {
+pub fn reject_foreign_tables(query: &str) -> Result<(), PgTrickleError> {
     // Uses the same implementation as reject_materialized_views;
     // the check function handles both.
     reject_materialized_views(query)
@@ -3065,7 +3067,7 @@ pub fn reject_foreign_tables(query: &str) -> Result<(), PgStreamError> {
 /// Caller must ensure `select` points to a valid `SelectStmt`.
 unsafe fn check_for_matviews_or_foreign(
     select: *const pg_sys::SelectStmt,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     let s = unsafe { &*select };
 
     // Handle set operations
@@ -3093,7 +3095,7 @@ unsafe fn check_for_matviews_or_foreign(
 /// Caller must ensure `node` points to a valid parse tree node.
 unsafe fn check_from_item_for_matview_or_foreign(
     node: *mut pg_sys::Node,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     if node.is_null() {
         return Ok(());
     }
@@ -3117,7 +3119,7 @@ unsafe fn check_from_item_for_matview_or_foreign(
 
         match relkind.as_deref() {
             Some("m") => {
-                return Err(PgStreamError::UnsupportedOperator(format!(
+                return Err(PgTrickleError::UnsupportedOperator(format!(
                     "Materialized view '{schema}.{relname}' cannot be used as a source in \
                      DIFFERENTIAL mode. Materialized views are stale snapshots — CDC triggers \
                      cannot track REFRESH MATERIALIZED VIEW. Use the underlying query directly, \
@@ -3125,7 +3127,7 @@ unsafe fn check_from_item_for_matview_or_foreign(
                 )));
             }
             Some("f") => {
-                return Err(PgStreamError::UnsupportedOperator(format!(
+                return Err(PgTrickleError::UnsupportedOperator(format!(
                     "Foreign table '{schema}.{relname}' cannot be used as a source in \
                      DIFFERENTIAL mode. Row-level triggers cannot be created on foreign tables. \
                      Use FULL refresh mode instead."
@@ -3169,17 +3171,17 @@ unsafe fn check_from_item_for_matview_or_foreign(
 ///
 /// ```sql
 /// SELECT col1, col2 FROM (
-///   SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY e1, e2 ORDER BY ...) AS __pgs_rn
+///   SELECT col1, col2, ROW_NUMBER() OVER (PARTITION BY e1, e2 ORDER BY ...) AS __pgt_rn
 ///   FROM t
-/// ) __pgs_do WHERE __pgs_rn = 1
+/// ) __pgt_do WHERE __pgt_rn = 1
 /// ```
 ///
 /// Returns the original query unchanged if it does not use DISTINCT ON.
-pub fn rewrite_distinct_on(query: &str) -> Result<String, PgStreamError> {
+pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
     let raw_list =
@@ -3305,7 +3307,7 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgStreamError> {
 
         // For outer SELECT, use the alias if it exists, otherwise the expression
         let outer_name = alias.as_deref().unwrap_or(&expr_sql);
-        outer_cols.push(format!("__pgs_do.\"{}\"", outer_name.replace('"', "\"\"")));
+        outer_cols.push(format!("__pgt_do.\"{}\"", outer_name.replace('"', "\"\"")));
 
         // Inner target: expression AS alias (or just expression)
         if let Some(ref a) = alias {
@@ -3325,7 +3327,7 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgStreamError> {
         .map(|ob| format!(" ORDER BY {ob}"))
         .unwrap_or_default();
     let row_number =
-        format!("ROW_NUMBER() OVER (PARTITION BY {partition_by}{order_clause}) AS __pgs_rn");
+        format!("ROW_NUMBER() OVER (PARTITION BY {partition_by}{order_clause}) AS __pgt_rn");
 
     // Reconstruct the inner SELECT (without DISTINCT ON and ORDER BY)
     // We need: FROM clause, WHERE clause, GROUP BY, HAVING
@@ -3384,11 +3386,11 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgStreamError> {
         "SELECT {outer_select} FROM (\
          SELECT {inner_targets}, {row_number} \
          FROM {from_sql}{where_sql}{group_sql}{having_sql}\
-         ) __pgs_do WHERE __pgs_do.__pgs_rn = 1"
+         ) __pgt_do WHERE __pgt_do.__pgt_rn = 1"
     );
 
     pgrx::debug1!(
-        "[pg_stream] Rewrote DISTINCT ON query to ROW_NUMBER(): {}",
+        "[pg_trickle] Rewrote DISTINCT ON query to ROW_NUMBER(): {}",
         rewritten
     );
 
@@ -3415,11 +3417,11 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgStreamError> {
 /// 5. Combine all branches with `UNION ALL`.
 ///
 /// If the query contains no grouping sets, it is returned unchanged.
-pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgStreamError> {
+pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
     let raw_list =
@@ -3506,7 +3508,7 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgStreamError> {
         // Reject early rather than building a query too large for PG to parse (G5.2).
         const MAX_GROUPING_BRANCHES: usize = 64;
         if final_sets.len() > MAX_GROUPING_BRANCHES {
-            return Err(PgStreamError::QueryParseError(format!(
+            return Err(PgTrickleError::QueryParseError(format!(
                 "CUBE/ROLLUP generates {} grouping set branches which exceeds the limit of {}. \
                  Use explicit GROUPING SETS(...) to enumerate only the required combinations.",
                 final_sets.len(),
@@ -3679,7 +3681,7 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgStreamError> {
     let rewritten = branches.join(" UNION ALL ");
 
     pgrx::debug1!(
-        "[pg_stream] Rewrote GROUPING SETS query to UNION ALL: {}",
+        "[pg_trickle] Rewrote GROUPING SETS query to UNION ALL: {}",
         rewritten
     );
 
@@ -3704,7 +3706,7 @@ enum TargetKind {
 
 /// Expand a `GroupingSet` node into a list of grouping sets (each set
 /// is a `Vec<String>` of column names).
-fn expand_grouping_set(gs: &pg_sys::GroupingSet) -> Result<Vec<Vec<String>>, PgStreamError> {
+fn expand_grouping_set(gs: &pg_sys::GroupingSet) -> Result<Vec<Vec<String>>, PgTrickleError> {
     let columns = extract_grouping_set_columns(gs)?;
 
     match gs.kind {
@@ -3766,7 +3768,7 @@ fn expand_grouping_set(gs: &pg_sys::GroupingSet) -> Result<Vec<Vec<String>>, PgS
             Ok(sets)
         }
 
-        _ => Err(PgStreamError::UnsupportedOperator(format!(
+        _ => Err(PgTrickleError::UnsupportedOperator(format!(
             "Unknown GroupingSet kind: {:?}",
             gs.kind
         ))),
@@ -3774,7 +3776,7 @@ fn expand_grouping_set(gs: &pg_sys::GroupingSet) -> Result<Vec<Vec<String>>, PgS
 }
 
 /// Extract column names from a `GroupingSet`'s content list.
-fn extract_grouping_set_columns(gs: &pg_sys::GroupingSet) -> Result<Vec<String>, PgStreamError> {
+fn extract_grouping_set_columns(gs: &pg_sys::GroupingSet) -> Result<Vec<String>, PgTrickleError> {
     if gs.content.is_null() {
         return Ok(vec![]);
     }
@@ -3794,7 +3796,7 @@ fn extract_grouping_set_columns(gs: &pg_sys::GroupingSet) -> Result<Vec<String>,
 
 /// Extract `GROUPING(col, …)` argument column names from a raw-parse
 /// `GroupingFunc` node.
-fn extract_grouping_func_args(gf: &pg_sys::GroupingFunc) -> Result<Vec<String>, PgStreamError> {
+fn extract_grouping_func_args(gf: &pg_sys::GroupingFunc) -> Result<Vec<String>, PgTrickleError> {
     if gf.args.is_null() {
         return Ok(vec![]);
     }
@@ -3835,8 +3837,8 @@ fn compute_grouping_value(args: &[String], current_set: &[String]) -> i64 {
 /// SELECT * FROM orders WHERE amount > (SELECT avg(amount) FROM orders)
 /// -- Rewrite to:
 /// SELECT * FROM orders
-/// CROSS JOIN (SELECT avg(amount) AS __pgs_scalar_1 FROM orders) AS __pgs_sq_1
-/// WHERE amount > __pgs_sq_1.__pgs_scalar_1
+/// CROSS JOIN (SELECT avg(amount) AS __pgt_scalar_1 FROM orders) AS __pgt_sq_1
+/// WHERE amount > __pgt_sq_1.__pgt_scalar_1
 /// ```
 ///
 /// This is called **before** the DVM parser so the downstream operator tree
@@ -3846,11 +3848,11 @@ fn compute_grouping_value(args: &[String], current_set: &[String]) -> i64 {
 /// Only handles EXPR_SUBLINK (scalar subqueries) in the top-level WHERE clause
 /// (both bare and under AND/OR conjunctions). Correlated scalar subqueries
 /// are NOT rewritten (they reference outer columns).
-pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamError> {
+pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
     let raw_list =
@@ -3920,10 +3922,10 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamE
     let mut cross_joins: Vec<String> = Vec::new();
     for (i, sq) in non_correlated.iter().enumerate() {
         let idx = i + 1;
-        let sq_alias = format!("__pgs_sq_{idx}");
-        let scalar_alias = format!("__pgs_scalar_{idx}");
-        let inner_alias = format!("__pgs_v_{idx}");
-        let inner_col = format!("__pgs_c_{idx}");
+        let sq_alias = format!("__pgt_sq_{idx}");
+        let scalar_alias = format!("__pgt_scalar_{idx}");
+        let inner_alias = format!("__pgt_v_{idx}");
+        let inner_col = format!("__pgt_c_{idx}");
         // The inner scalar subquery returns exactly 1 column and 1 row.
         // We wrap it so the DVM parser sees a subquery with a valid FROM clause:
         //   (SELECT v."c" AS "scalar" FROM (original_subquery) AS v("c")) AS "sq"
@@ -3943,8 +3945,8 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamE
     let mut rewritten_where = where_expr;
     for (i, sq) in non_correlated.iter().enumerate() {
         let idx = i + 1;
-        let sq_alias = format!("__pgs_sq_{idx}");
-        let scalar_alias = format!("__pgs_scalar_{idx}");
+        let sq_alias = format!("__pgt_sq_{idx}");
+        let scalar_alias = format!("__pgt_scalar_{idx}");
         let replacement = format!("\"{sq_alias}\".\"{scalar_alias}\"");
         // Replace the scalar subquery SQL in the WHERE expression
         // The node_to_expr will have emitted the scalar subquery as "(SELECT ...)"
@@ -4061,7 +4063,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgStreamE
     );
 
     pgrx::debug1!(
-        "[pg_stream] Rewrote scalar subquery in WHERE to CROSS JOIN: {}",
+        "[pg_trickle] Rewrote scalar subquery in WHERE to CROSS JOIN: {}",
         rewritten
     );
 
@@ -4192,7 +4194,7 @@ unsafe fn collect_table_names_from_node(node: *mut pg_sys::Node, out: &mut Vec<S
 unsafe fn collect_scalar_sublinks_in_where(
     node: *mut pg_sys::Node,
     out: &mut Vec<ScalarSubqueryExtract>,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     if node.is_null() {
         return Ok(());
     }
@@ -4279,11 +4281,11 @@ unsafe fn collect_scalar_sublinks_in_where(
 ///
 /// The UNION (not UNION ALL) handles deduplication of rows that match
 /// multiple OR arms.
-pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgStreamError> {
+pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
     let raw_list =
@@ -4406,7 +4408,10 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgStreamError> {
 
     let rewritten = format!("{}{order_sql}", branches.join(" UNION "));
 
-    pgrx::debug1!("[pg_stream] Rewrote SubLinks-in-OR to UNION: {}", rewritten);
+    pgrx::debug1!(
+        "[pg_trickle] Rewrote SubLinks-in-OR to UNION: {}",
+        rewritten
+    );
 
     Ok(rewritten)
 }
@@ -4424,7 +4429,7 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgStreamError> {
 fn rewrite_and_with_or_sublinks(
     select: &pg_sys::SelectStmt,
     and_expr: &pg_sys::BoolExpr,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(and_expr.args) };
 
     // Find the OR arm with sublinks and collect non-OR conjuncts
@@ -4498,7 +4503,7 @@ fn rewrite_and_with_or_sublinks(
     let rewritten = format!("{}{order_sql}", branches.join(" UNION "));
 
     pgrx::debug1!(
-        "[pg_stream] Rewrote AND(..OR-sublinks..) to UNION: {}",
+        "[pg_trickle] Rewrote AND(..OR-sublinks..) to UNION: {}",
         rewritten
     );
 
@@ -4506,7 +4511,7 @@ fn rewrite_and_with_or_sublinks(
 }
 
 /// Deparse a full SELECT statement back to SQL text.
-fn deparse_full_select(select: &pg_sys::SelectStmt) -> Result<String, PgStreamError> {
+fn deparse_full_select(select: &pg_sys::SelectStmt) -> Result<String, PgTrickleError> {
     let from_sql = extract_from_clause_sql(select)?;
     let target_sql = deparse_select_target_list(select);
     let where_sql = if select.whereClause.is_null() {
@@ -4640,28 +4645,28 @@ fn deparse_order_clause(select: &pg_sys::SelectStmt) -> String {
 ///        SUM(amount) OVER (PARTITION BY dept)   AS dept_sum
 /// FROM orders
 /// -- Rewrite to:
-/// SELECT __pgs_w1.id, __pgs_w1.region, __pgs_w1.dept,
-///        __pgs_w1.region_sum, __pgs_w2.dept_sum
+/// SELECT __pgt_w1.id, __pgt_w1.region, __pgt_w1.dept,
+///        __pgt_w1.region_sum, __pgt_w2.dept_sum
 /// FROM (
 ///   SELECT id, region, dept, amount,
 ///          SUM(amount) OVER (PARTITION BY region) AS region_sum
 ///   FROM orders
-/// ) __pgs_w1
+/// ) __pgt_w1
 /// JOIN (
 ///   SELECT id, region, dept, amount,
 ///          SUM(amount) OVER (PARTITION BY dept) AS dept_sum
 ///   FROM orders
-/// ) __pgs_w2 ON __pgs_w1.__pgs_row_marker = __pgs_w2.__pgs_row_marker
+/// ) __pgt_w2 ON __pgt_w1.__pgt_row_marker = __pgt_w2.__pgt_row_marker
 /// ```
 ///
 /// Each subquery computes one group of window functions with the same
 /// PARTITION BY, plus a row marker for joining. The final query selects
 /// pass-through columns from the first subquery and window columns from each.
-pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgStreamError> {
+pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
     let raw_list =
@@ -4785,14 +4790,14 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgStreamEr
                 if let Some(name) = expr.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
                     name.to_string()
                 } else {
-                    format!("__pgs_col_{}", i + 1)
+                    format!("__pgt_col_{}", i + 1)
                 }
             })
         })
         .collect();
 
     // Row marker: ROW_NUMBER() OVER () for deterministic join
-    let row_marker = "ROW_NUMBER() OVER () AS __pgs_row_marker";
+    let row_marker = "ROW_NUMBER() OVER () AS __pgt_row_marker";
 
     // ── Build subqueries for each partition group ─────────────────────
     let mut subquery_aliases: Vec<String> = Vec::new();
@@ -4800,7 +4805,7 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgStreamEr
     let mut window_col_sources: Vec<(String, String)> = Vec::new(); // (subquery_alias, col_alias)
 
     for (group_idx, (_partition_key, group)) in partition_groups.iter().enumerate() {
-        let sq_alias = format!("__pgs_w{}", group_idx + 1);
+        let sq_alias = format!("__pgt_w{}", group_idx + 1);
 
         let mut sq_select_parts: Vec<String> = Vec::new();
 
@@ -4857,7 +4862,7 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgStreamEr
 
     for i in 1..subquery_sqls.len() {
         outer_from = format!(
-            "{outer_from} JOIN ({}) AS \"{}\" ON \"{}\".\"__pgs_row_marker\" = \"{}\".\"__pgs_row_marker\"",
+            "{outer_from} JOIN ({}) AS \"{}\" ON \"{}\".\"__pgt_row_marker\" = \"{}\".\"__pgt_row_marker\"",
             subquery_sqls[i],
             subquery_aliases[i].replace('"', "\"\""),
             subquery_aliases[0].replace('"', "\"\""),
@@ -4874,7 +4879,7 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgStreamEr
     );
 
     pgrx::debug1!(
-        "[pg_stream] Rewrote multi-PARTITION BY windows: {}",
+        "[pg_trickle] Rewrote multi-PARTITION BY windows: {}",
         rewritten
     );
 
@@ -4898,7 +4903,7 @@ struct WindowInfo {
 unsafe fn extract_window_info_from_targets(
     target_list: &pgrx::PgList<pg_sys::Node>,
     _select: &pg_sys::SelectStmt,
-) -> Result<Vec<WindowInfo>, PgStreamError> {
+) -> Result<Vec<WindowInfo>, PgTrickleError> {
     let mut infos = Vec::new();
 
     for node_ptr in target_list.iter_ptr() {
@@ -4962,7 +4967,7 @@ unsafe fn extract_window_info_from_targets(
                 .to_string()
         } else {
             // Generate a default alias
-            format!("__pgs_wfn_{}", infos.len() + 1)
+            format!("__pgt_wfn_{}", infos.len() + 1)
         };
 
         infos.push(WindowInfo {
@@ -4976,9 +4981,9 @@ unsafe fn extract_window_info_from_targets(
 }
 
 /// Extract FROM clause as SQL text from a SelectStmt.
-fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgStreamError> {
+fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgTrickleError> {
     if select.fromClause.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "DISTINCT ON query must have a FROM clause".into(),
         ));
     }
@@ -4991,7 +4996,7 @@ fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgStre
         parts.push(unsafe { from_item_to_sql(node_ptr)? });
     }
     if parts.is_empty() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "DISTINCT ON query FROM clause is empty".into(),
         ));
     }
@@ -5002,7 +5007,7 @@ fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgStre
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree Node.
-unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
         let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
         let mut name = String::new();
@@ -5090,11 +5095,11 @@ unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgStreamEr
     }
 }
 
-pub fn reject_limit_offset(query: &str) -> Result<(), PgStreamError> {
+pub fn reject_limit_offset(query: &str) -> Result<(), PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid
     // memory context. We only read from the returned parse tree.
@@ -5119,14 +5124,14 @@ pub fn reject_limit_offset(query: &str) -> Result<(), PgStreamError> {
     let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     if !select.limitCount.is_null() {
-        return Err(PgStreamError::UnsupportedOperator(
+        return Err(PgTrickleError::UnsupportedOperator(
             "LIMIT is not supported in defining queries. \
              Stream tables materialize the full result set."
                 .into(),
         ));
     }
     if !select.limitOffset.is_null() {
-        return Err(PgStreamError::UnsupportedOperator(
+        return Err(PgTrickleError::UnsupportedOperator(
             "OFFSET is not supported in defining queries. \
              Stream tables materialize the full result set."
                 .into(),
@@ -5147,11 +5152,11 @@ pub fn reject_limit_offset(query: &str) -> Result<(), PgStreamError> {
 ///
 /// This avoids running the full DVM parser (which resolves table OIDs,
 /// builds the operator tree, etc.) for queries that would fail anyway.
-pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgStreamError> {
+pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     // SAFETY: raw_parser is safe within a PostgreSQL backend.
     let raw_list =
@@ -5194,7 +5199,7 @@ pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgStreamError> {
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
-unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgStreamError> {
+unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickleError> {
     // ── DISTINCT ON ─────────────────────────────────────────────────
     // DISTINCT ON is handled by auto-rewriting to a ROW_NUMBER() window
     // function in the DVM parser (`rewrite_distinct_on()`). No rejection
@@ -5223,7 +5228,7 @@ unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), Pg
 
     // ── FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE ──
     if !select.lockingClause.is_null() {
-        return Err(PgStreamError::UnsupportedOperator(
+        return Err(PgTrickleError::UnsupportedOperator(
             "FOR UPDATE/FOR SHARE is not supported in defining queries. \
              Stream tables do not support row-level locking. \
              Remove the FOR UPDATE/FOR SHARE clause."
@@ -5249,7 +5254,7 @@ unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), Pg
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgStreamError> {
+unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgTrickleError> {
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
         let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
         // Recursively check join children
@@ -5265,7 +5270,7 @@ unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgS
         // TABLESAMPLE: SELECT * FROM t TABLESAMPLE BERNOULLI(10)
         // Stream tables materialize complete result sets; non-deterministic
         // sampling is not meaningful. Reject in both FULL and DIFFERENTIAL modes.
-        return Err(PgStreamError::UnsupportedOperator(
+        return Err(PgTrickleError::UnsupportedOperator(
             "TABLESAMPLE is not supported in defining queries. \
              Stream tables materialize the complete result set; \
              use a WHERE condition with random() if sampling is needed."
@@ -5286,7 +5291,7 @@ unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgS
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
 unsafe fn check_where_for_unsupported_sublinks(
     node: *mut pg_sys::Node,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
         // EXISTS, ANY (IN), ALL, and EXPR SubLinks are handled during parsing
         return Ok(());
@@ -5336,7 +5341,7 @@ struct SublinkWrapper {
 unsafe fn extract_where_sublinks(
     node: *mut pg_sys::Node,
     cte_ctx: &mut CteParseContext,
-) -> Result<(Vec<SublinkWrapper>, Option<Expr>), PgStreamError> {
+) -> Result<(Vec<SublinkWrapper>, Option<Expr>), PgTrickleError> {
     // Case 1: The node itself is a SubLink
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
         let wrapper = unsafe { parse_sublink_to_wrapper(node, false, cte_ctx)? };
@@ -5396,7 +5401,7 @@ unsafe fn extract_where_sublinks(
                     if inner_bool.boolop == pg_sys::BoolExprType::OR_EXPR
                         && unsafe { node_tree_contains_sublink(arg_ptr) }
                     {
-                        return Err(PgStreamError::UnsupportedOperator(
+                        return Err(PgTrickleError::UnsupportedOperator(
                             "Subquery expressions (EXISTS, IN) inside OR conditions are not \
                              supported in this nesting pattern. Consider rewriting \
                              using UNION or separate stream tables."
@@ -5435,7 +5440,7 @@ unsafe fn extract_where_sublinks(
         if boolexpr.boolop == pg_sys::BoolExprType::OR_EXPR
             && unsafe { node_tree_contains_sublink(node) }
         {
-            return Err(PgStreamError::UnsupportedOperator(
+            return Err(PgTrickleError::UnsupportedOperator(
                 "Subquery expressions (EXISTS, IN) inside OR conditions are not \
                  supported in this nesting pattern. Consider rewriting \
                  using UNION or separate stream tables."
@@ -5521,16 +5526,16 @@ unsafe fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
 /// # Safety
 /// Caller must ensure `select_node` points to a valid pg_sys::Node
 /// (typically a SelectStmt).
-unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if select_node.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "NULL node in deparse_select_to_sql".into(),
         ));
     }
 
     // Check if it's a SelectStmt
     if !unsafe { pgrx::is_a(select_node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "Expected SelectStmt in deparse_select_to_sql".into(),
         ));
     }
@@ -5605,9 +5610,9 @@ unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+unsafe fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if node.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "NULL node in deparse_from_item".into(),
         ));
     }
@@ -5689,7 +5694,7 @@ unsafe fn parse_sublink_to_wrapper(
     node: *mut pg_sys::Node,
     negated: bool,
     cte_ctx: &mut CteParseContext,
-) -> Result<SublinkWrapper, PgStreamError> {
+) -> Result<SublinkWrapper, PgTrickleError> {
     let sublink = unsafe { &*(node as *const pg_sys::SubLink) };
 
     match sublink.subLinkType {
@@ -5712,14 +5717,14 @@ unsafe fn parse_sublink_to_wrapper(
             // still reach here, it's a case the rewrite didn't catch
             // (e.g., deeply nested or correlated). Reject with a helpful
             // error message.
-            Err(PgStreamError::UnsupportedOperator(
+            Err(PgTrickleError::UnsupportedOperator(
                 "Scalar subqueries in WHERE clauses are not supported for DIFFERENTIAL mode. \
                  This usually means the query has a correlated scalar subquery that cannot \
                  be automatically rewritten. Consider rewriting as a JOIN or CTE."
                     .into(),
             ))
         }
-        _ => Err(PgStreamError::UnsupportedOperator(
+        _ => Err(PgTrickleError::UnsupportedOperator(
             "Unsupported subquery type in WHERE clause. \
              Rewrite using a JOIN or LATERAL subquery."
                 .to_string(),
@@ -5740,9 +5745,9 @@ unsafe fn parse_exists_sublink(
     sublink: &pg_sys::SubLink,
     negated: bool,
     cte_ctx: &mut CteParseContext,
-) -> Result<SublinkWrapper, PgStreamError> {
+) -> Result<SublinkWrapper, PgTrickleError> {
     if sublink.subselect.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "EXISTS subquery has NULL subselect".into(),
         ));
     }
@@ -5752,7 +5757,7 @@ unsafe fn parse_exists_sublink(
     // Parse the inner FROM clause into an OpTree
     let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.fromClause) };
     if from_list.is_empty() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "EXISTS subquery must have a FROM clause".into(),
         ));
     }
@@ -5804,9 +5809,9 @@ unsafe fn parse_any_sublink(
     sublink: &pg_sys::SubLink,
     negated: bool,
     cte_ctx: &mut CteParseContext,
-) -> Result<SublinkWrapper, PgStreamError> {
+) -> Result<SublinkWrapper, PgTrickleError> {
     if sublink.subselect.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "IN/ANY subquery has NULL subselect".into(),
         ));
     }
@@ -5816,7 +5821,7 @@ unsafe fn parse_any_sublink(
     // Parse the inner FROM clause
     let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.fromClause) };
     if from_list.is_empty() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "IN subquery must have a FROM clause".into(),
         ));
     }
@@ -5835,7 +5840,7 @@ unsafe fn parse_any_sublink(
 
     // Extract the test expression (left-hand side of IN)
     let test_expr = if sublink.testexpr.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "IN subquery has NULL test expression".into(),
         ));
     } else {
@@ -5845,7 +5850,7 @@ unsafe fn parse_any_sublink(
     // Extract the inner SELECT target (the column being compared)
     let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
     if target_list.is_empty() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "IN subquery SELECT list is empty".into(),
         ));
     }
@@ -5854,13 +5859,13 @@ unsafe fn parse_any_sublink(
     let inner_col_expr = if unsafe { pgrx::is_a(first_target, pg_sys::NodeTag::T_ResTarget) } {
         let rt = unsafe { &*(first_target as *const pg_sys::ResTarget) };
         if rt.val.is_null() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "IN subquery target column is NULL".into(),
             ));
         }
         unsafe { node_to_expr(rt.val)? }
     } else {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "IN subquery target is not a ResTarget".into(),
         ));
     };
@@ -5932,7 +5937,7 @@ unsafe fn parse_any_sublink(
         }
 
         // Wrap in Subquery so the SemiJoin treats it as a derived table
-        let sub_alias = format!("__pgs_in_sub_{}", inner_tree.alias());
+        let sub_alias = format!("__pgt_in_sub_{}", inner_tree.alias());
         inner_tree = OpTree::Subquery {
             alias: sub_alias,
             column_aliases: Vec::new(),
@@ -5987,7 +5992,7 @@ unsafe fn parse_any_sublink(
 ///
 /// Used to find aggregates in HAVING clauses that may not appear in the
 /// SELECT target list. Each discovered aggregate is assigned a unique alias
-/// `__pgs_having_{N}` where N starts from `start_idx`.
+/// `__pgt_having_{N}` where N starts from `start_idx`.
 fn extract_aggregates_from_expr(expr: &Expr, start_idx: usize) -> Vec<AggExpr> {
     let mut result = Vec::new();
     extract_aggregates_from_expr_inner(expr, start_idx, &mut result);
@@ -6014,7 +6019,7 @@ fn extract_aggregates_from_expr_inner(expr: &Expr, start_idx: usize, out: &mut V
             };
             if let Some(func) = agg_func {
                 let argument = args.first().cloned();
-                let alias = format!("__pgs_having_{}", start_idx + out.len());
+                let alias = format!("__pgt_having_{}", start_idx + out.len());
                 out.push(AggExpr {
                     function: func,
                     argument,
@@ -6054,9 +6059,9 @@ unsafe fn parse_all_sublink(
     sublink: &pg_sys::SubLink,
     negated: bool,
     cte_ctx: &mut CteParseContext,
-) -> Result<SublinkWrapper, PgStreamError> {
+) -> Result<SublinkWrapper, PgTrickleError> {
     if sublink.subselect.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "ALL subquery has NULL subselect".into(),
         ));
     }
@@ -6066,7 +6071,7 @@ unsafe fn parse_all_sublink(
     // Parse the inner FROM clause
     let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.fromClause) };
     if from_list.is_empty() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "ALL subquery must have a FROM clause".into(),
         ));
     }
@@ -6085,7 +6090,7 @@ unsafe fn parse_all_sublink(
 
     // Extract the test expression (left-hand side: `x` in `x op ALL (...)`)
     let test_expr = if sublink.testexpr.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "ALL subquery has NULL test expression".into(),
         ));
     } else {
@@ -6095,7 +6100,7 @@ unsafe fn parse_all_sublink(
     // Extract the inner SELECT target column
     let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
     if target_list.is_empty() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "ALL subquery SELECT list is empty".into(),
         ));
     }
@@ -6104,13 +6109,13 @@ unsafe fn parse_all_sublink(
     let inner_col_expr = if unsafe { pgrx::is_a(first_target, pg_sys::NodeTag::T_ResTarget) } {
         let rt = unsafe { &*(first_target as *const pg_sys::ResTarget) };
         if rt.val.is_null() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "ALL subquery target column is NULL".into(),
             ));
         }
         unsafe { node_to_expr(rt.val)? }
     } else {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "ALL subquery target is not a ResTarget".into(),
         ));
     };
@@ -6162,7 +6167,7 @@ unsafe fn parse_all_sublink(
 ///
 /// Returns the legacy `OpTree` (without CTE registry). For full CTE
 /// support, prefer [`parse_defining_query_full`].
-pub fn parse_defining_query(query: &str) -> Result<OpTree, PgStreamError> {
+pub fn parse_defining_query(query: &str) -> Result<OpTree, PgTrickleError> {
     // SAFETY: We're calling PostgreSQL C parser functions with valid inputs.
     // raw_parser and related functions are safe when called within
     // a PostgreSQL backend with a valid memory context.
@@ -6175,28 +6180,28 @@ pub fn parse_defining_query(query: &str) -> Result<OpTree, PgStreamError> {
 /// This is the preferred entry point — the returned `CteRegistry` enables
 /// the diff engine to differentiate each CTE body only once even when the
 /// CTE is referenced multiple times (Tier 2 optimization).
-pub fn parse_defining_query_full(query: &str) -> Result<ParseResult, PgStreamError> {
+pub fn parse_defining_query_full(query: &str) -> Result<ParseResult, PgTrickleError> {
     // SAFETY: same invariants as parse_defining_query.
     unsafe { parse_defining_query_inner(query) }
 }
 
-unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgStreamError> {
+unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrickleError> {
     use std::ffi::CString;
 
     let c_query = CString::new(query)
-        .map_err(|_| PgStreamError::QueryParseError("Query contains null bytes".into()))?;
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
 
     let raw_list =
         unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
     if raw_list.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "raw_parser returned NULL".into(),
         ));
     }
 
     let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
     if list.len() != 1 {
-        return Err(PgStreamError::QueryParseError(format!(
+        return Err(PgTrickleError::QueryParseError(format!(
             "Expected 1 statement, got {}",
             list.len(),
         )));
@@ -6204,11 +6209,11 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgStrea
 
     let raw_stmt = list
         .head()
-        .ok_or_else(|| PgStreamError::QueryParseError("Empty parse list".into()))?;
+        .ok_or_else(|| PgTrickleError::QueryParseError("Empty parse list".into()))?;
 
     let stmt_ptr = unsafe { (*raw_stmt).stmt as *const pg_sys::SelectStmt };
     if !unsafe { pgrx::is_a(stmt_ptr as *mut pg_sys::Node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "Defining query must be a SELECT statement".into(),
         ));
     }
@@ -6316,14 +6321,14 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgStrea
 unsafe fn parse_set_operation(
     select: &pg_sys::SelectStmt,
     cte_ctx: &mut CteParseContext,
-) -> Result<OpTree, PgStreamError> {
+) -> Result<OpTree, PgTrickleError> {
     match select.op {
         pg_sys::SetOperation::SETOP_UNION => {
             let mut children = Vec::new();
             unsafe { collect_union_children(select, select.all, &mut children, cte_ctx)? };
 
             if children.len() < 2 {
-                return Err(PgStreamError::QueryParseError(
+                return Err(PgTrickleError::QueryParseError(
                     "UNION / UNION ALL requires at least 2 children".into(),
                 ));
             }
@@ -6357,7 +6362,7 @@ unsafe fn parse_set_operation(
                 all: select.all,
             })
         }
-        _ => Err(PgStreamError::UnsupportedOperator(format!(
+        _ => Err(PgTrickleError::UnsupportedOperator(format!(
             "Set operation {:?} not supported",
             select.op,
         ))),
@@ -6371,9 +6376,9 @@ unsafe fn parse_set_operation(
 unsafe fn parse_set_op_child(
     child_ptr: *mut pg_sys::SelectStmt,
     cte_ctx: &mut CteParseContext,
-) -> Result<OpTree, PgStreamError> {
+) -> Result<OpTree, PgTrickleError> {
     if child_ptr.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "Set operation branch is NULL".into(),
         ));
     }
@@ -6400,7 +6405,7 @@ unsafe fn collect_union_children(
     parent_all: bool,
     children: &mut Vec<OpTree>,
     cte_ctx: &mut CteParseContext,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     unsafe {
         if !select.larg.is_null() && !select.rarg.is_null() {
             let larg = &*select.larg;
@@ -6450,11 +6455,11 @@ unsafe fn parse_select_stmt(
     select: &pg_sys::SelectStmt,
     _full_query: &str,
     cte_ctx: &mut CteParseContext,
-) -> Result<OpTree, PgStreamError> {
+) -> Result<OpTree, PgTrickleError> {
     // ── Step 1: Parse FROM clause into Scan/Join tree ──────────────────
     let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
     if from_list.is_empty() {
-        return Err(PgStreamError::QueryParseError(format!(
+        return Err(PgTrickleError::QueryParseError(format!(
             "Defining query must have a FROM clause (op={}, all={}, larg_null={}, rarg_null={}, target_len={}, where_null={})",
             select.op,
             select.all,
@@ -6566,7 +6571,7 @@ unsafe fn parse_select_stmt(
             unsafe { extract_window_exprs(&target_list, select.windowClause)? };
 
         if window_exprs.is_empty() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "Window function detected but extraction failed".into(),
             ));
         }
@@ -6583,7 +6588,7 @@ unsafe fn parse_select_stmt(
             let this_partition: Vec<String> =
                 wexpr.partition_by.iter().map(|e| e.to_sql()).collect();
             if this_partition != canonical_partition {
-                return Err(PgStreamError::UnsupportedOperator(
+                return Err(PgTrickleError::UnsupportedOperator(
                     "All window functions in a defining query must share the same \
                      PARTITION BY clause for differential maintenance. \
                      The multi-PARTITION BY auto-rewrite did not handle this query; \
@@ -6685,7 +6690,7 @@ unsafe fn parse_select_stmt(
     } else {
         // ── Step 4: Parse target list as Project ───────────────────────
         if !select.havingClause.is_null() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "HAVING clause requires GROUP BY or aggregate functions".into(),
             ));
         }
@@ -6712,7 +6717,7 @@ unsafe fn parse_select_stmt(
         let has_real_exprs = distinct_list.iter_ptr().any(|ptr| !ptr.is_null());
         if has_real_exprs {
             // DISTINCT ON (expr, ...) — reject
-            return Err(PgStreamError::UnsupportedOperator(
+            return Err(PgTrickleError::UnsupportedOperator(
                 "DISTINCT ON is not supported in defining queries. \
                  Use plain DISTINCT or rewrite with window functions."
                     .into(),
@@ -6731,14 +6736,14 @@ unsafe fn parse_select_stmt(
 
     // ── Step 7: Reject LIMIT / OFFSET ──────────────────────────────────
     if !select.limitCount.is_null() {
-        return Err(PgStreamError::UnsupportedOperator(
+        return Err(PgTrickleError::UnsupportedOperator(
             "LIMIT is not supported in defining queries. \
              Stream tables materialize the full result set."
                 .into(),
         ));
     }
     if !select.limitOffset.is_null() {
-        return Err(PgStreamError::UnsupportedOperator(
+        return Err(PgTrickleError::UnsupportedOperator(
             "OFFSET is not supported in defining queries. \
              Stream tables materialize the full result set."
                 .into(),
@@ -6752,7 +6757,7 @@ unsafe fn parse_select_stmt(
 unsafe fn parse_from_item(
     node: *mut pg_sys::Node,
     cte_ctx: &mut CteParseContext,
-) -> Result<OpTree, PgStreamError> {
+) -> Result<OpTree, PgTrickleError> {
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
         let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
         let schema_name = if rv.schemaname.is_null() {
@@ -6765,7 +6770,7 @@ unsafe fn parse_from_item(
         };
         let table_name = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
             .to_str()
-            .map_err(|_| PgStreamError::QueryParseError("Invalid table name encoding".into()))?
+            .map_err(|_| PgTrickleError::QueryParseError("Invalid table name encoding".into()))?
             .to_string();
         let alias = if !rv.alias.is_null() {
             let a = unsafe { &*(rv.alias) };
@@ -6897,7 +6902,7 @@ unsafe fn parse_from_item(
                     });
                 }
                 other => {
-                    return Err(PgStreamError::UnsupportedOperator(format!(
+                    return Err(PgTrickleError::UnsupportedOperator(format!(
                         "Only INNER JOIN LATERAL and LEFT JOIN LATERAL are supported, got {:?}",
                         other,
                     )));
@@ -6925,7 +6930,7 @@ unsafe fn parse_from_item(
                     });
                 }
                 other => {
-                    return Err(PgStreamError::UnsupportedOperator(format!(
+                    return Err(PgTrickleError::UnsupportedOperator(format!(
                         "Only INNER JOIN and LEFT JOIN with LATERAL functions are supported, got {:?}",
                         other,
                     )));
@@ -6950,7 +6955,7 @@ unsafe fn parse_from_item(
                 .collect();
 
             if common.is_empty() {
-                return Err(PgStreamError::QueryParseError(
+                return Err(PgTrickleError::QueryParseError(
                     "NATURAL JOIN has no common columns between left and right sides. \
                      Use an explicit JOIN ... ON condition instead."
                         .into(),
@@ -7001,7 +7006,7 @@ unsafe fn parse_from_item(
                     left: Box::new(left),
                     right: Box::new(right),
                 }),
-                other => Err(PgStreamError::UnsupportedOperator(format!(
+                other => Err(PgTrickleError::UnsupportedOperator(format!(
                     "NATURAL JOIN type {other:?} not supported",
                 ))),
             };
@@ -7037,7 +7042,7 @@ unsafe fn parse_from_item(
                 left: Box::new(left),
                 right: Box::new(right),
             }),
-            other => Err(PgStreamError::UnsupportedOperator(format!(
+            other => Err(PgTrickleError::UnsupportedOperator(format!(
                 "Join type {other:?} not supported for differential mode",
             ))),
         }
@@ -7045,14 +7050,14 @@ unsafe fn parse_from_item(
         // Subquery in FROM: SELECT ... FROM (SELECT ...) AS alias(c1, c2)
         let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
         if sub.subquery.is_null() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeSubselect with NULL subquery".into(),
             ));
         }
 
         // The subquery must be a SelectStmt
         if !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) } {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "Subquery in FROM must be a SELECT statement".into(),
             ));
         }
@@ -7129,14 +7134,14 @@ unsafe fn parse_from_item(
         // Each element is a two-element List: [FuncCall, column_def_list].
         let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
         if func_list.is_empty() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeFunction with no functions".into(),
             ));
         }
 
         // We support a single function. ROWS FROM(f1, f2, ...) is not supported.
         if rf.is_rowsfrom && func_list.len() > 1 {
-            return Err(PgStreamError::UnsupportedOperator(
+            return Err(PgTrickleError::UnsupportedOperator(
                 "ROWS FROM() with multiple functions is not supported. \
                  Use a single set-returning function in FROM instead."
                     .into(),
@@ -7149,14 +7154,14 @@ unsafe fn parse_from_item(
         let inner_list =
             unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_list_node as *mut pg_sys::List) };
         if inner_list.is_empty() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeFunction inner list is empty".into(),
             ));
         }
 
         let func_node = inner_list.head().unwrap();
         if !unsafe { pgrx::is_a(func_node, pg_sys::NodeTag::T_FuncCall) } {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeFunction does not contain a FuncCall node".into(),
             ));
         }
@@ -7249,14 +7254,14 @@ unsafe fn parse_from_item(
         // TABLESAMPLE: SELECT * FROM t TABLESAMPLE BERNOULLI(10)
         // Stream tables materialize complete result sets; sampling at parse
         // time is not meaningful or supported.
-        Err(PgStreamError::UnsupportedOperator(
+        Err(PgTrickleError::UnsupportedOperator(
             "TABLESAMPLE is not supported in defining queries. \
              Stream tables materialize the complete result set; \
              use a WHERE condition with random() if sampling is needed."
                 .into(),
         ))
     } else {
-        Err(PgStreamError::UnsupportedOperator(format!(
+        Err(PgTrickleError::UnsupportedOperator(format!(
             "Unsupported FROM item node type: {:?}",
             unsafe { (*node).type_ },
         )))
@@ -7290,7 +7295,7 @@ type RecursiveCteMapResult = (
 /// Caller must ensure `with_clause` points to a valid `WithClause` node.
 unsafe fn extract_cte_map_with_recursive(
     with_clause: *const pg_sys::WithClause,
-) -> Result<RecursiveCteMapResult, PgStreamError> {
+) -> Result<RecursiveCteMapResult, PgTrickleError> {
     let wc = unsafe { &*with_clause };
     let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
     let mut map = HashMap::new();
@@ -7307,17 +7312,17 @@ unsafe fn extract_cte_map_with_recursive(
         // Extract CTE name
         let cte_name = unsafe { std::ffi::CStr::from_ptr(cte.ctename) }
             .to_str()
-            .map_err(|_| PgStreamError::QueryParseError("Invalid CTE name encoding".into()))?
+            .map_err(|_| PgTrickleError::QueryParseError("Invalid CTE name encoding".into()))?
             .to_string();
 
         // The CTE body is ctequery, which must be a SelectStmt
         if cte.ctequery.is_null() {
-            return Err(PgStreamError::QueryParseError(format!(
+            return Err(PgTrickleError::QueryParseError(format!(
                 "CTE '{cte_name}' has NULL body",
             )));
         }
         if !unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) } {
-            return Err(PgStreamError::QueryParseError(format!(
+            return Err(PgTrickleError::QueryParseError(format!(
                 "CTE '{cte_name}' body is not a SELECT statement",
             )));
         }
@@ -7340,13 +7345,13 @@ unsafe fn extract_cte_map_with_recursive(
         if is_recursive {
             // Recursive CTE — split UNION [ALL] into base + recursive terms
             if body.op != pg_sys::SetOperation::SETOP_UNION {
-                return Err(PgStreamError::QueryParseError(format!(
+                return Err(PgTrickleError::QueryParseError(format!(
                     "Recursive CTE '{cte_name}' body must be a UNION or UNION ALL",
                 )));
             }
 
             if body.larg.is_null() || body.rarg.is_null() {
-                return Err(PgStreamError::QueryParseError(format!(
+                return Err(PgTrickleError::QueryParseError(format!(
                     "Recursive CTE '{cte_name}' UNION is missing left or right arm",
                 )));
             }
@@ -7372,7 +7377,7 @@ unsafe fn extract_cte_map_with_recursive(
 /// `WITH x(a, b) AS (SELECT id, name FROM ...)`.
 ///
 /// Returns an empty `Vec` if no column aliases are specified.
-fn extract_cte_def_colnames(cte: &pg_sys::CommonTableExpr) -> Result<Vec<String>, PgStreamError> {
+fn extract_cte_def_colnames(cte: &pg_sys::CommonTableExpr) -> Result<Vec<String>, PgTrickleError> {
     let colnames = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(cte.aliascolnames) };
     let mut names = Vec::new();
     for node_ptr in colnames.iter_ptr() {
@@ -7389,7 +7394,7 @@ fn extract_cte_def_colnames(cte: &pg_sys::CommonTableExpr) -> Result<Vec<String>
 ///
 /// # Safety
 /// Caller must ensure `alias` points to a valid `Alias` struct.
-fn extract_alias_colnames(alias: &pg_sys::Alias) -> Result<Vec<String>, PgStreamError> {
+fn extract_alias_colnames(alias: &pg_sys::Alias) -> Result<Vec<String>, PgTrickleError> {
     let colnames = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(alias.colnames) };
     let mut names = Vec::new();
     for node_ptr in colnames.iter_ptr() {
@@ -7400,7 +7405,7 @@ fn extract_alias_colnames(alias: &pg_sys::Alias) -> Result<Vec<String>, PgStream
 }
 
 /// Resolve a table name to its OID via SPI.
-fn resolve_table_oid(schema: &str, table: &str) -> Result<u32, PgStreamError> {
+fn resolve_table_oid(schema: &str, table: &str) -> Result<u32, PgTrickleError> {
     let sql = format!(
         "SELECT c.oid FROM pg_class c \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -7412,18 +7417,18 @@ fn resolve_table_oid(schema: &str, table: &str) -> Result<u32, PgStreamError> {
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let oid: Option<pg_sys::Oid> = result
             .first()
             .get(1)
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         oid.map(|o| o.to_u32())
-            .ok_or_else(|| PgStreamError::NotFound(format!("{schema}.{table}")))
+            .ok_or_else(|| PgTrickleError::NotFound(format!("{schema}.{table}")))
     })
 }
 
 /// Resolve column metadata for a table via SPI.
-fn resolve_columns(table_oid: u32) -> Result<Vec<Column>, PgStreamError> {
+fn resolve_columns(table_oid: u32) -> Result<Vec<Column>, PgTrickleError> {
     let sql = format!(
         "SELECT attname::text, atttypid, attnotnull \
          FROM pg_attribute \
@@ -7435,20 +7440,20 @@ fn resolve_columns(table_oid: u32) -> Result<Vec<Column>, PgStreamError> {
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut columns = Vec::new();
         for row in result {
             let name: String = row
                 .get(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
             let type_oid: pg_sys::Oid = row
                 .get(2)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or(pg_sys::Oid::INVALID);
             let not_null: bool = row
                 .get(3)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or(false);
             columns.push(Column {
                 name,
@@ -7463,7 +7468,7 @@ fn resolve_columns(table_oid: u32) -> Result<Vec<Column>, PgStreamError> {
 /// Resolve primary key column names for a table via `pg_constraint`.
 ///
 /// Returns columns in key order. Returns an empty Vec if no PK exists.
-fn resolve_pk_columns(table_oid: u32) -> Result<Vec<String>, PgStreamError> {
+fn resolve_pk_columns(table_oid: u32) -> Result<Vec<String>, PgTrickleError> {
     let sql = format!(
         "SELECT a.attname::text \
          FROM pg_constraint c \
@@ -7477,12 +7482,12 @@ fn resolve_pk_columns(table_oid: u32) -> Result<Vec<String>, PgStreamError> {
     Spi::connect(|client| {
         let result = client
             .select(&sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let mut pk_cols = Vec::new();
         for row in result {
             let name: String = row
                 .get(1)
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
             pk_cols.push(name);
         }
@@ -7491,9 +7496,9 @@ fn resolve_pk_columns(table_oid: u32) -> Result<Vec<String>, PgStreamError> {
 }
 
 /// Convert a pg_sys::Node to an Expr.
-unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
+unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> {
     if node.is_null() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "NULL node in expression".into(),
         ));
     }
@@ -7540,7 +7545,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
                     })
                 }
             }
-            n => Err(PgStreamError::QueryParseError(format!(
+            n => Err(PgTrickleError::QueryParseError(format!(
                 "Unexpected ColumnRef with {n} fields",
             ))),
         }
@@ -7695,7 +7700,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
                     right.to_sql()
                 )))
             }
-            _other => Err(PgStreamError::UnsupportedOperator(format!(
+            _other => Err(PgTrickleError::UnsupportedOperator(format!(
                 "A_Expr kind {:?} is not supported in defining queries",
                 _other,
             ))),
@@ -7714,7 +7719,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
             pg_sys::BoolExprType::AND_EXPR => {
                 if args.len() < 2 {
                     return args.into_iter().next().ok_or_else(|| {
-                        PgStreamError::QueryParseError("Empty AND expression".into())
+                        PgTrickleError::QueryParseError("Empty AND expression".into())
                     });
                 }
                 let mut result = args[0].clone();
@@ -7730,7 +7735,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
             pg_sys::BoolExprType::OR_EXPR => {
                 if args.len() < 2 {
                     return args.into_iter().next().ok_or_else(|| {
-                        PgStreamError::QueryParseError("Empty OR expression".into())
+                        PgTrickleError::QueryParseError("Empty OR expression".into())
                     });
                 }
                 let mut result = args[0].clone();
@@ -7744,10 +7749,9 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
                 Ok(result)
             }
             pg_sys::BoolExprType::NOT_EXPR => {
-                let inner = args
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| PgStreamError::QueryParseError("Empty NOT expression".into()))?;
+                let inner = args.into_iter().next().ok_or_else(|| {
+                    PgTrickleError::QueryParseError("Empty NOT expression".into())
+                })?;
                 Ok(Expr::FuncCall {
                     func_name: "NOT".to_string(),
                     args: vec![inner],
@@ -7903,7 +7907,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
                 // Scalar subquery — reconstruct as Raw SQL
                 // The subselect is a SelectStmt; deparse it back to SQL
                 if sublink.subselect.is_null() {
-                    return Err(PgStreamError::QueryParseError(
+                    return Err(PgTrickleError::QueryParseError(
                         "Scalar subquery has NULL subselect".into(),
                     ));
                 }
@@ -7914,7 +7918,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
                 // EXISTS in an expression context (e.g., inside CASE WHEN)
                 // Reconstruct as Raw SQL
                 if sublink.subselect.is_null() {
-                    return Err(PgStreamError::QueryParseError(
+                    return Err(PgTrickleError::QueryParseError(
                         "EXISTS subquery has NULL subselect".into(),
                     ));
                 }
@@ -7924,7 +7928,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
             pg_sys::SubLinkType::ANY_SUBLINK => {
                 // IN/ANY in an expression context
                 if sublink.subselect.is_null() || sublink.testexpr.is_null() {
-                    return Err(PgStreamError::QueryParseError(
+                    return Err(PgTrickleError::QueryParseError(
                         "IN/ANY subquery has NULL subselect or testexpr".into(),
                     ));
                 }
@@ -7937,7 +7941,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
                     pg_sys::SubLinkType::ALL_SUBLINK => "ALL (subquery)",
                     _ => "subquery expression",
                 };
-                Err(PgStreamError::UnsupportedOperator(format!(
+                Err(PgTrickleError::UnsupportedOperator(format!(
                     "{kind_desc} is not supported in defining queries. \
                      Consider rewriting as a JOIN or LATERAL subquery.",
                 )))
@@ -8161,7 +8165,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgStreamError> {
     } else {
         // Catch-all: reject with clear error instead of silently producing broken SQL
         let tag = unsafe { (*node).type_ };
-        Err(PgStreamError::UnsupportedOperator(format!(
+        Err(PgTrickleError::UnsupportedOperator(format!(
             "Expression type {tag:?} is not supported in defining queries",
         )))
     }
@@ -8235,7 +8239,7 @@ unsafe fn append_json_agg_clauses(
 ///
 /// # Safety
 /// `jt` must point to a valid `pg_sys::JsonTable` node.
-unsafe fn deparse_json_table(jt: *const pg_sys::JsonTable) -> Result<String, PgStreamError> {
+unsafe fn deparse_json_table(jt: *const pg_sys::JsonTable) -> Result<String, PgTrickleError> {
     let jt_ref = unsafe { &*jt };
 
     // Context item (the input expression)
@@ -8290,7 +8294,7 @@ unsafe fn deparse_json_table(jt: *const pg_sys::JsonTable) -> Result<String, PgS
 ///
 /// # Safety
 /// `passing` must be null or a valid pg_sys::List.
-unsafe fn deparse_json_table_passing(passing: *mut pg_sys::List) -> Result<String, PgStreamError> {
+unsafe fn deparse_json_table_passing(passing: *mut pg_sys::List) -> Result<String, PgTrickleError> {
     if passing.is_null() {
         return Ok(String::new());
     }
@@ -8313,7 +8317,7 @@ unsafe fn deparse_json_table_passing(passing: *mut pg_sys::List) -> Result<Strin
 ///
 /// # Safety
 /// `columns` must be null or a valid pg_sys::List of JsonTableColumn nodes.
-unsafe fn deparse_json_table_columns(columns: *mut pg_sys::List) -> Result<String, PgStreamError> {
+unsafe fn deparse_json_table_columns(columns: *mut pg_sys::List) -> Result<String, PgTrickleError> {
     if columns.is_null() {
         return Ok(String::new());
     }
@@ -8330,9 +8334,9 @@ unsafe fn deparse_json_table_columns(columns: *mut pg_sys::List) -> Result<Strin
 ///
 /// # Safety
 /// `node` must point to a valid `pg_sys::JsonTableColumn`.
-unsafe fn deparse_json_table_column(node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+unsafe fn deparse_json_table_column(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonTableColumn) } {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "Expected JsonTableColumn node".into(),
         ));
     }
@@ -8455,7 +8459,7 @@ unsafe fn deparse_json_table_column(node: *mut pg_sys::Node) -> Result<String, P
             s.push_str(&format!(" COLUMNS ({nested_cols})"));
             Ok(s)
         }
-        _ => Err(PgStreamError::QueryParseError(format!(
+        _ => Err(PgTrickleError::QueryParseError(format!(
             "Unknown JSON_TABLE column type: {}",
             col.coltype,
         ))),
@@ -8502,7 +8506,7 @@ unsafe fn deparse_json_behavior(behavior: *const pg_sys::JsonBehavior, suffix: &
 }
 
 /// Extract operator name from an A_Expr name list.
-unsafe fn extract_operator_name(name_list: *mut pg_sys::List) -> Result<String, PgStreamError> {
+unsafe fn extract_operator_name(name_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
     let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(name_list) };
     if let Some(node) = list.head() {
         unsafe { node_to_string(node) }
@@ -8512,7 +8516,7 @@ unsafe fn extract_operator_name(name_list: *mut pg_sys::List) -> Result<String, 
 }
 
 /// Extract function name from funcname list (possibly schema-qualified).
-unsafe fn extract_func_name(name_list: *mut pg_sys::List) -> Result<String, PgStreamError> {
+unsafe fn extract_func_name(name_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
     let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(name_list) };
     let mut parts = Vec::new();
     for n in list.iter_ptr() {
@@ -8531,7 +8535,7 @@ unsafe fn extract_func_name(name_list: *mut pg_sys::List) -> Result<String, PgSt
 ///
 /// # Safety
 /// Caller must ensure `fcall` points to a valid `pg_sys::FuncCall` node.
-unsafe fn deparse_func_call(fcall: *const pg_sys::FuncCall) -> Result<String, PgStreamError> {
+unsafe fn deparse_func_call(fcall: *const pg_sys::FuncCall) -> Result<String, PgTrickleError> {
     let fcall_ref = unsafe { &*fcall };
     let func_name = unsafe { extract_func_name(fcall_ref.funcname)? };
 
@@ -8559,7 +8563,7 @@ unsafe fn deparse_func_call(fcall: *const pg_sys::FuncCall) -> Result<String, Pg
 /// Caller must ensure `stmt` points to a valid `pg_sys::SelectStmt`.
 unsafe fn deparse_select_stmt_to_sql(
     stmt: *const pg_sys::SelectStmt,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     // SAFETY: caller guarantees stmt is valid.
     let s = unsafe { &*stmt };
     let mut parts = Vec::new();
@@ -8633,7 +8637,7 @@ unsafe fn deparse_select_stmt_to_sql(
 ///
 /// # Safety
 /// Caller must ensure `target_list` points to a valid `pg_sys::List`.
-unsafe fn deparse_target_list(target_list: *mut pg_sys::List) -> Result<String, PgStreamError> {
+unsafe fn deparse_target_list(target_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
     let targets = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(target_list) };
     let mut items = Vec::new();
     for node_ptr in targets.iter_ptr() {
@@ -8662,7 +8666,7 @@ unsafe fn deparse_target_list(target_list: *mut pg_sys::List) -> Result<String, 
 ///
 /// # Safety
 /// Caller must ensure `from_list` points to a valid `pg_sys::List`.
-unsafe fn deparse_from_clause(from_list: *mut pg_sys::List) -> Result<String, PgStreamError> {
+unsafe fn deparse_from_clause(from_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
     let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(from_list) };
     let mut items = Vec::new();
     for node_ptr in list.iter_ptr() {
@@ -8676,9 +8680,11 @@ unsafe fn deparse_from_clause(from_list: *mut pg_sys::List) -> Result<String, Pg
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid pg_sys::Node.
-unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if node.is_null() {
-        return Err(PgStreamError::QueryParseError("NULL FROM item node".into()));
+        return Err(PgTrickleError::QueryParseError(
+            "NULL FROM item node".into(),
+        ));
     }
 
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
@@ -8730,7 +8736,7 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeSubselect without valid SelectStmt".into(),
             ));
         }
@@ -8749,7 +8755,7 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
         let rf = unsafe { &*(node as *const pg_sys::RangeFunction) };
         let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
         if func_list.is_empty() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeFunction with no functions in deparse".into(),
             ));
         }
@@ -8757,7 +8763,7 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
         let inner_list =
             unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_list_node as *mut pg_sys::List) };
         if inner_list.is_empty() {
-            return Err(PgStreamError::QueryParseError(
+            return Err(PgTrickleError::QueryParseError(
                 "RangeFunction inner list empty in deparse".into(),
             ));
         }
@@ -8797,7 +8803,7 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
 /// Caller must ensure all nodes in `sort_list` are valid `SortBy` nodes.
 unsafe fn deparse_sort_clause(
     sort_list: &pgrx::PgList<pg_sys::Node>,
-) -> Result<String, PgStreamError> {
+) -> Result<String, PgTrickleError> {
     let mut items = Vec::new();
     for node_ptr in sort_list.iter_ptr() {
         let sort_sql = unsafe { deparse_sort_by(node_ptr as *const pg_sys::SortBy)? };
@@ -8810,7 +8816,7 @@ unsafe fn deparse_sort_clause(
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::SortBy`.
-unsafe fn deparse_sort_by(node: *const pg_sys::SortBy) -> Result<String, PgStreamError> {
+unsafe fn deparse_sort_by(node: *const pg_sys::SortBy) -> Result<String, PgTrickleError> {
     // SAFETY: caller guarantees node is valid.
     let sb = unsafe { &*node };
     let expr = unsafe { node_to_expr(sb.node)? };
@@ -8838,7 +8844,7 @@ unsafe fn deparse_sort_by(node: *const pg_sys::SortBy) -> Result<String, PgStrea
 /// Caller must ensure `target_list` points to a valid `pg_sys::List`.
 unsafe fn extract_select_output_cols(
     target_list: *mut pg_sys::List,
-) -> Result<Vec<String>, PgStreamError> {
+) -> Result<Vec<String>, PgTrickleError> {
     let targets = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(target_list) };
     let mut cols = Vec::new();
     for (i, node_ptr) in targets.iter_ptr().enumerate() {
@@ -8872,7 +8878,7 @@ unsafe fn extract_select_output_cols(
 ///
 /// # Safety
 /// Caller must ensure `from_list` points to a valid `pg_sys::List`.
-unsafe fn extract_from_oids(from_list: *mut pg_sys::List) -> Result<Vec<u32>, PgStreamError> {
+unsafe fn extract_from_oids(from_list: *mut pg_sys::List) -> Result<Vec<u32>, PgTrickleError> {
     let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(from_list) };
     let mut oids = Vec::new();
     for node_ptr in list.iter_ptr() {
@@ -8888,7 +8894,7 @@ unsafe fn extract_from_oids(from_list: *mut pg_sys::List) -> Result<Vec<u32>, Pg
 unsafe fn collect_from_item_oids(
     node: *mut pg_sys::Node,
     oids: &mut Vec<u32>,
-) -> Result<(), PgStreamError> {
+) -> Result<(), PgTrickleError> {
     if node.is_null() {
         return Ok(());
     }
@@ -8923,7 +8929,7 @@ unsafe fn collect_from_item_oids(
         let oid = pgrx::Spi::connect(|client| {
             let result = client
                 .select(&sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             for row in result {
                 if let Ok(Some(id)) = row.get::<i32>(1) {
                     return Ok(id as u32);
@@ -8953,9 +8959,9 @@ unsafe fn collect_from_item_oids(
 }
 
 /// Convert a String/Value node to a Rust String.
-unsafe fn node_to_string(node: *mut pg_sys::Node) -> Result<String, PgStreamError> {
+unsafe fn node_to_string(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if node.is_null() {
-        return Err(PgStreamError::QueryParseError("NULL node".into()));
+        return Err(PgTrickleError::QueryParseError("NULL node".into()));
     }
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_String) } {
         let s = unsafe { &*(node as *const pg_sys::String) };
@@ -9253,7 +9259,7 @@ type WindowExtraction = (Vec<WindowExpr>, Vec<(Expr, String)>);
 unsafe fn extract_window_exprs(
     target_list: &pgrx::PgList<pg_sys::Node>,
     window_clause: *mut pg_sys::List,
-) -> Result<WindowExtraction, PgStreamError> {
+) -> Result<WindowExtraction, PgTrickleError> {
     let mut window_exprs = Vec::new();
     let mut pass_through = Vec::new();
 
@@ -9279,7 +9285,7 @@ unsafe fn extract_window_exprs(
         // Check if a window function is nested inside an expression (CASE, COALESCE, etc.)
         // We detect this but cannot extract it — reject with a clear error.
         if unsafe { node_contains_window_func(rt.val) } {
-            return Err(PgStreamError::UnsupportedOperator(
+            return Err(PgTrickleError::UnsupportedOperator(
                 "Window functions nested inside expressions (CASE, COALESCE, arithmetic, etc.) \
                  are not supported in defining queries. Move the window function to a separate \
                  column, e.g.:\n  SELECT ROW_NUMBER() OVER (...) AS rn, ... FROM t\n\
@@ -9318,7 +9324,7 @@ unsafe fn parse_window_func_call(
     fcall: &pg_sys::FuncCall,
     rt: &pg_sys::ResTarget,
     window_clause: *mut pg_sys::List,
-) -> Result<WindowExpr, PgStreamError> {
+) -> Result<WindowExpr, PgTrickleError> {
     // Function name
     let func_name = unsafe { extract_func_name(fcall.funcname)? };
 
@@ -9708,7 +9714,7 @@ fn is_known_aggregate(name: &str) -> bool {
 /// Extract aggregates and non-aggregate expressions from a target list.
 unsafe fn extract_aggregates(
     target_list: &pgrx::PgList<pg_sys::Node>,
-) -> Result<(Vec<AggExpr>, Vec<Expr>), PgStreamError> {
+) -> Result<(Vec<AggExpr>, Vec<Expr>), PgTrickleError> {
     let mut aggs = Vec::new();
     let mut non_aggs = Vec::new();
 
@@ -9835,7 +9841,7 @@ unsafe fn extract_aggregates(
                 });
             } else if is_known_aggregate(&name_lower) {
                 // Recognized as an aggregate but not supported for differential maintenance
-                return Err(PgStreamError::UnsupportedOperator(format!(
+                return Err(PgTrickleError::UnsupportedOperator(format!(
                     "Aggregate function {func_name}() is not supported in DIFFERENTIAL mode. \
                      Supported aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, \
                      STRING_AGG, ARRAY_AGG, JSON_AGG, JSONB_AGG, BIT_AND, BIT_OR, BIT_XOR, \
@@ -9847,7 +9853,7 @@ unsafe fn extract_aggregates(
                 )));
             } else if is_user_defined_aggregate(&name_lower) {
                 // User-defined aggregate (CREATE AGGREGATE) — not supported
-                return Err(PgStreamError::UnsupportedOperator(format!(
+                return Err(PgTrickleError::UnsupportedOperator(format!(
                     "User-defined aggregate function {func_name}() is not supported \
                      in DIFFERENTIAL mode. Only built-in PostgreSQL aggregates are \
                      supported. Use FULL refresh mode instead.",
@@ -9970,7 +9976,7 @@ unsafe fn extract_aggregates(
 /// Parse the target list (SELECT expressions) into Expr + alias pairs.
 unsafe fn parse_target_list(
     target_list: &pgrx::PgList<pg_sys::Node>,
-) -> Result<(Vec<Expr>, Vec<String>), PgStreamError> {
+) -> Result<(Vec<Expr>, Vec<String>), PgTrickleError> {
     let mut expressions = Vec::new();
     let mut aliases = Vec::new();
 
@@ -10449,14 +10455,14 @@ mod tests {
     }
 
     #[test]
-    fn test_needs_pgs_count_distinct_wrapping_union_all() {
-        // Distinct wrapping UnionAll needs pgs_count (reference counting)
+    fn test_needs_pgt_count_distinct_wrapping_union_all() {
+        // Distinct wrapping UnionAll needs pgt_count (reference counting)
         let tree = OpTree::Distinct {
             child: Box::new(OpTree::UnionAll {
                 children: vec![scan_node("a", 1, &["id"]), scan_node("b", 2, &["id"])],
             }),
         };
-        assert!(tree.needs_pgs_count());
+        assert!(tree.needs_pgt_count());
     }
 
     #[test]
@@ -11941,40 +11947,40 @@ mod tests {
         assert_eq!(rewritten.to_sql(), "(region = 'US')");
     }
 
-    // ── OpTree::needs_pgs_count tests ──────────────────────────────
+    // ── OpTree::needs_pgt_count tests ──────────────────────────────
 
     #[test]
-    fn test_needs_pgs_count_aggregate() {
+    fn test_needs_pgt_count_aggregate() {
         let tree = OpTree::Aggregate {
             group_by: vec![col("region")],
             aggregates: vec![],
             child: Box::new(scan_node("t", 1, &["region"])),
         };
-        assert!(tree.needs_pgs_count());
+        assert!(tree.needs_pgt_count());
     }
 
     #[test]
-    fn test_needs_pgs_count_distinct() {
+    fn test_needs_pgt_count_distinct() {
         let tree = OpTree::Distinct {
             child: Box::new(scan_node("t", 1, &["id"])),
         };
-        assert!(tree.needs_pgs_count());
+        assert!(tree.needs_pgt_count());
     }
 
     #[test]
-    fn test_needs_pgs_count_scan_false() {
+    fn test_needs_pgt_count_scan_false() {
         let tree = scan_node("t", 1, &["id"]);
-        assert!(!tree.needs_pgs_count());
+        assert!(!tree.needs_pgt_count());
     }
 
     #[test]
-    fn test_needs_pgs_count_project_false() {
+    fn test_needs_pgt_count_project_false() {
         let tree = OpTree::Project {
             expressions: vec![col("id")],
             aliases: vec!["id".to_string()],
             child: Box::new(scan_node("t", 1, &["id"])),
         };
-        assert!(!tree.needs_pgs_count());
+        assert!(!tree.needs_pgt_count());
     }
 
     // ── OpTree::group_by_columns tests ──────────────────────────────
@@ -13246,13 +13252,13 @@ mod tests {
     }
 
     #[test]
-    fn test_semi_join_needs_pgs_count_false() {
+    fn test_semi_join_needs_pgt_count_false() {
         let tree = OpTree::SemiJoin {
             condition: Expr::Literal("TRUE".into()),
             left: Box::new(make_scan(1, "t1", "t1", &["id"])),
             right: Box::new(make_scan(2, "t2", "t2", &["id"])),
         };
-        assert!(!tree.needs_pgs_count());
+        assert!(!tree.needs_pgt_count());
     }
 
     #[test]
@@ -13569,41 +13575,41 @@ mod tests {
         // Simulate the scalar subquery replacement logic
         let original_where = "amount > (SELECT avg(\"amount\") FROM \"orders\")";
         let expr_sql = "(SELECT avg(\"amount\") FROM \"orders\")";
-        let replacement = "\"__pgs_sq_1\".\"__pgs_scalar_1\"";
+        let replacement = "\"__pgt_sq_1\".\"__pgt_scalar_1\"";
 
         let rewritten = original_where.replace(expr_sql, replacement);
-        assert_eq!(rewritten, "amount > \"__pgs_sq_1\".\"__pgs_scalar_1\"");
+        assert_eq!(rewritten, "amount > \"__pgt_sq_1\".\"__pgt_scalar_1\"");
     }
 
     #[test]
     fn test_multi_partition_row_marker_join() {
-        // Verify the join strategy: subqueries joined on __pgs_row_marker
-        let sq1_alias = "__pgs_w1";
-        let sq2_alias = "__pgs_w2";
+        // Verify the join strategy: subqueries joined on __pgt_row_marker
+        let sq1_alias = "__pgt_w1";
+        let sq2_alias = "__pgt_w2";
 
         let join_cond = format!(
-            "\"{}\".\"__pgs_row_marker\" = \"{}\".\"__pgs_row_marker\"",
+            "\"{}\".\"__pgt_row_marker\" = \"{}\".\"__pgt_row_marker\"",
             sq1_alias, sq2_alias
         );
 
-        assert!(join_cond.contains("__pgs_w1"));
-        assert!(join_cond.contains("__pgs_w2"));
-        assert!(join_cond.contains("__pgs_row_marker"));
+        assert!(join_cond.contains("__pgt_w1"));
+        assert!(join_cond.contains("__pgt_w2"));
+        assert!(join_cond.contains("__pgt_row_marker"));
     }
 
     #[test]
     fn test_cross_join_construction() {
         // Verify the CROSS JOIN construction for scalar subquery rewrite
         let idx = 1;
-        let sq_alias = format!("__pgs_sq_{idx}");
-        let scalar_alias = format!("__pgs_scalar_{idx}");
+        let sq_alias = format!("__pgt_sq_{idx}");
+        let scalar_alias = format!("__pgt_scalar_{idx}");
         let sq_sql = "SELECT avg(amount) FROM orders";
 
         let cross_join = format!("CROSS JOIN ({sq_sql} AS \"{scalar_alias}\") AS \"{sq_alias}\"");
 
         assert!(cross_join.contains("CROSS JOIN"));
         assert!(cross_join.contains("avg(amount)"));
-        assert!(cross_join.contains("__pgs_sq_1"));
-        assert!(cross_join.contains("__pgs_scalar_1"));
+        assert!(cross_join.contains("__pgt_sq_1"));
+        assert!(cross_join.contains("__pgt_scalar_1"));
     }
 }

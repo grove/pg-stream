@@ -9,7 +9,7 @@ Last Updated: 2026-02-25
 ## Overview
 
 This plan proposes a comprehensive set of Architecture Decision Records (ADRs)
-for pg_stream — covering both **decisions already made** during development and
+for pg_trickle — covering both **decisions already made** during development and
 **forward-looking decisions** needed to achieve full PostgreSQL and SQL feature
 coverage.
 
@@ -29,7 +29,7 @@ Each ADR follows a standard template:
 |---------------|-------------------------|
 | **Status**    | Accepted / Superseded / Proposed / Not Started |
 | **Date**      | YYYY-MM-DD              |
-| **Deciders**  | pg_stream core team     |
+| **Deciders**  | pg_trickle core team     |
 | **Category**  | <area>                  |
 
 ## Context
@@ -96,9 +96,9 @@ transparently transition to logical replication for steady-state if
 - Three CDC states: TRIGGER → TRANSITIONING → WAL
 - No-data-loss transition (trigger stays active until WAL catches up)
 - Graceful fallback if slot creation fails or WAL decoder doesn't catch up
-  within `pg_stream.wal_transition_timeout`
+  within `pg_trickle.wal_transition_timeout`
 - Same buffer table schema regardless of CDC mode
-- `pg_stream.cdc_mode` GUC for user control (auto/trigger/wal)
+- `pg_trickle.cdc_mode` GUC for user control (auto/trigger/wal)
 
 ---
 
@@ -126,7 +126,7 @@ rules (analogous to automatic differentiation in calculus) to generate delta SQL
   RecursiveCte, Window, LateralFunction, LateralSubquery, SemiJoin, AntiJoin,
   ScalarSubquery (+more planned)
 - Delta SQL is generated as CTEs, not materialized intermediates
-- Row identity via `__pgs_row_id` (xxHash) for diff-based delta application
+- Row identity via `__pgt_row_id` (xxHash) for diff-based delta application
 - Theoretical basis: DBSP (Budiu et al. 2023), Gupta & Mumick (1995)
 
 ---
@@ -139,7 +139,7 @@ rules (analogous to automatic differentiation in calculus) to generate delta SQL
 | **Category** | Storage / IVM Engine |
 | **Sources** | `plans/PLAN.md` Key Design Decisions, `src/hash.rs`, `src/dvm/row_id.rs` |
 
-**Decision:** Use 64-bit xxHash of the primary key as the `__pgs_row_id`
+**Decision:** Use 64-bit xxHash of the primary key as the `__pgt_row_id`
 column (stored as `BIGINT`) rather than UUIDs or composite-key matching.
 
 **Alternatives considered:**
@@ -151,7 +151,7 @@ column (stored as `BIGINT`) rather than UUIDs or composite-key matching.
 - 8 bytes vs 16 bytes per row (significant at scale)
 - Collision probability: ~1 in 2^64 per unique key — acceptable for practical
   datasets
-- `pg_stream_hash()` for single-column PKs, `pg_stream_hash_multi()` for
+- `pg_trickle_hash()` for single-column PKs, `pg_trickle_hash_multi()` for
   composites
 - Visible to users via `SELECT *` — a known tradeoff
 
@@ -166,7 +166,7 @@ column (stored as `BIGINT`) rather than UUIDs or composite-key matching.
 | **Sources** | `plans/PLAN.md` Key Design Decisions, `src/cdc.rs` |
 
 **Decision:** Store CDC changes in dedicated PostgreSQL tables
-(`pgstream_changes.changes_<oid>`) rather than in shared memory, message
+(`pgtrickle_changes.changes_<oid>`) rather than in shared memory, message
 queues, or a single global changes table.
 
 **Alternatives considered:**
@@ -204,7 +204,7 @@ keep the fast single-MERGE path.
 **Key points:**
 - `has_user_triggers()` detection at refresh time
 - `CachedMergeTemplate` extended with explicit DML templates
-- `pg_stream.user_triggers` GUC (auto/on/off)
+- `pg_trickle.user_triggers` GUC (auto/on/off)
 - FULL refresh: triggers suppressed via `DISABLE TRIGGER USER` + `NOTIFY`
 
 ---
@@ -272,7 +272,7 @@ the aggregate value, triggering re-aggregation from source data.
 | **Category** | API Design |
 | **Sources** | `plans/PLAN.md` Key Design Decisions |
 
-**Decision:** Expose the API as SQL functions (`pgstream.create_stream_table()`,
+**Decision:** Expose the API as SQL functions (`pgtrickle.create_stream_table()`,
 etc.) rather than custom DDL syntax (`CREATE STREAM TABLE ...`).
 
 **Alternatives considered:**
@@ -288,22 +288,22 @@ etc.) rather than custom DDL syntax (`CREATE STREAM TABLE ...`).
 
 ---
 
-### ADR-011: `pgstream` Schema with `pgs_` Prefix Convention
+### ADR-011: `pgtrickle` Schema with `pgt_` Prefix Convention
 
 | Field | Value |
 |-------|-------|
 | **Status** | Accepted |
 | **Category** | API Design / Naming |
-| **Sources** | Code history (dt_ → st_ → pgs_ rename across 72 files) |
+| **Sources** | Code history (dt_ → st_ → pgt_ rename across 72 files) |
 
-**Decision:** All internal catalog objects use the `pgstream` schema and `pgs_`
-column/table prefix. Change buffers live in a separate `pgstream_changes` schema.
+**Decision:** All internal catalog objects use the `pgtrickle` schema and `pgt_`
+column/table prefix. Change buffers live in a separate `pgtrickle_changes` schema.
 
 **Key points:**
 - Original naming used `dt_` (derived table), renamed to `st_` (stream table),
-  then to `pgs_` (pg_stream) for global uniqueness and consistency
-- Two schemas: `pgstream` (API + catalog) and `pgstream_changes` (buffer tables)
-- `pgs_` prefix avoids collisions with user objects
+  then to `pgt_` (pg_trickle) for global uniqueness and consistency
+- Two schemas: `pgtrickle` (API + catalog) and `pgtrickle_changes` (buffer tables)
+- `pgt_` prefix avoids collisions with user objects
 
 ---
 
@@ -360,15 +360,15 @@ seconds) rather than arbitrary user-specified intervals.
 | **Sources** | `src/scheduler.rs`, `src/shmem.rs`, `docs/ARCHITECTURE.md` |
 
 **Decision:** Use a single background worker for scheduling, with shared memory
-for inter-process communication (`PgLwLock<PgStreamSharedState>` and
+for inter-process communication (`PgLwLock<PgTrickleSharedState>` and
 `PgAtomic<AtomicU64>` DAG rebuild signal).
 
 **Key points:**
-- Wakes at `pg_stream.scheduler_interval_ms` intervals
+- Wakes at `pg_trickle.scheduler_interval_ms` intervals
 - Detects DAG changes via atomic counter comparison (lock-free)
 - Topological refresh ordering within each wake cycle
 - `SIGTERM` graceful shutdown
-- `pg_stream.enabled` GUC to disable without unloading
+- `pg_trickle.enabled` GUC to disable without unloading
 
 ---
 
@@ -381,7 +381,7 @@ for inter-process communication (`PgLwLock<PgStreamSharedState>` and
 | **Sources** | `plans/PLAN.md` Key Design Decisions, `src/refresh.rs` |
 
 **Decision:** Use PostgreSQL's replication origin mechanism
-(`pg_stream_refresh`) to tag refresh-generated writes, preventing CDC triggers
+(`pg_trickle_refresh`) to tag refresh-generated writes, preventing CDC triggers
 from re-capturing changes made by the refresh itself (feedback loops).
 
 **Key points:**
@@ -400,7 +400,7 @@ from re-capturing changes made by the refresh itself (feedback loops).
 | **Sources** | `docs/ARCHITECTURE.md`, `src/refresh.rs` |
 
 **Decision:** When the change ratio exceeds
-`pg_stream.differential_max_change_ratio`, automatically downgrade a
+`pg_trickle.differential_max_change_ratio`, automatically downgrade a
 DIFFERENTIAL refresh to FULL, since delta processing becomes more expensive
 than full recomputation at high change rates.
 
@@ -440,8 +440,8 @@ Defer the full custom Python adapter as an upgrade path.
 | **Category** | Ecosystem / Tooling |
 | **Sources** | `plans/dbt/PLAN_DBT_MACRO.md`, `plans/ecosystem/PLAN_ECO_SYSTEM.md` |
 
-**Decision:** Ship the dbt macro package as `dbt-pgstream/` inside the main
-pg_stream repository, not in a separate repo.
+**Decision:** Ship the dbt macro package as `dbt-pgtrickle/` inside the main
+pg_trickle repository, not in a separate repo.
 
 **Key points:**
 - SQL API changes validated against macros in the same PR (via CI)
@@ -464,7 +464,7 @@ testcontainers-rs and a custom E2E Docker image. Tests never assume a local
 PostgreSQL installation.
 
 **Key points:**
-- Custom `Dockerfile.e2e` builds PG 18 + pg_stream from source
+- Custom `Dockerfile.e2e` builds PG 18 + pg_trickle from source
 - Deterministic, reproducible test environments
 - Three-tier test pyramid: unit (no DB) → integration (testcontainers) → E2E
   (full extension Docker image)
@@ -483,8 +483,8 @@ PostgreSQL installation.
 counter columns alongside each aggregate result.
 
 **Key points:**
-- `COUNT(*)` maintained via `__pgs_count` counter
-- `SUM(x)` maintained via `__pgs_sum_x` + `__pgs_count` for correctness when
+- `COUNT(*)` maintained via `__pgt_count` counter
+- `SUM(x)` maintained via `__pgt_sum_x` + `__pgt_count` for correctness when
   group shrinks to zero
 - `AVG(x)` derived from SUM/COUNT at read time
 - MIN/MAX uses semi-algebraic approach (CASE/LEAST/GREATEST with NULL sentinel
@@ -561,7 +561,7 @@ a recursive `Expr` tree scanner.
 - Volatility lookup infrastructure (SPI query to `pg_proc.provolatile`)
 - Recursive expression scanner for `worst_volatility()` computation
 - Integration into parser validation at `create_stream_table()` time
-- GUC: `pg_stream.volatile_function_policy` (reject/warn/allow)
+- GUC: `pg_trickle.volatile_function_policy` (reject/warn/allow)
 - Handle overloaded functions (multiple `proname` entries with different
   volatility)
 
@@ -846,7 +846,7 @@ FROM + LATERAL covers all practical use cases.
 | **Sources** | `plans/infra/CITUS.md` |
 | **Effort** | Very High (~6 months) |
 
-**Context:** pg_stream has zero multi-node awareness. Every core module assumes
+**Context:** pg_trickle has zero multi-node awareness. Every core module assumes
 a single PostgreSQL instance with local OIDs, local WAL, local triggers, and a
 single background worker. Citus compatibility requires addressing 6 major
 incompatibilities.
@@ -922,7 +922,7 @@ reinitialization even if the changed column isn't used by the stream table.
 1. **Keep full reinitialization** — correct but heavy-handed; any ALTER TABLE on
    a source table forces a full rebuild
 2. **Column-level tracking** — only reinitialize if claimed columns are affected.
-   The `columns_used` field in `pgs_dependencies` already tracks this; use it
+   The `columns_used` field in `pgt_dependencies` already tracks this; use it
    to filter DDL events.
 3. **Transparent ALTER propagation** — when a source table gets a new column,
    automatically add it to the stream table if the defining query uses `SELECT *`
@@ -950,7 +950,7 @@ and behavioral changes need a migration strategy. PostgreSQL supports
 
 **Options:**
 1. **pgrx-managed migrations** — rely on pgrx's SQL generation for each version
-2. **Manual migration scripts** — hand-written `pg_stream--1.0--1.1.sql` files
+2. **Manual migration scripts** — hand-written `pg_trickle--1.0--1.1.sql` files
    with explicit `ALTER TABLE`, data migrations, etc.
 3. **Hybrid** — pgrx for function signatures + manual scripts for catalog
    schema changes
@@ -1032,7 +1032,7 @@ cases and switch to Option 3 if type mismatches surface.
 | **Category** | Correctness / Storage |
 | **Effort** | Medium (6-8 hours) |
 
-**Context:** The current `__pgs_row_id` is computed from the primary key of
+**Context:** The current `__pgt_row_id` is computed from the primary key of
 source tables. For defining queries that involve aggregations, expressions, or
 joins, the row ID is derived from GROUP BY keys, join keys, or synthetic
 identifiers. But what if a source table has no primary key?
@@ -1181,7 +1181,7 @@ plans/adrs/
 │
 │ ── API & Schema Design (010-019) ──
 ├── adr-010-sql-functions-not-ddl.md
-├── adr-011-pgstream-schema-naming.md
+├── adr-011-pgtrickle-schema-naming.md
 ├── adr-012-postgresql-18-only.md
 │
 │ ── Scheduling & Runtime (020-029) ──

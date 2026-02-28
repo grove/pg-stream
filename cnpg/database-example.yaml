@@ -2,7 +2,7 @@
 # Example CloudNativePG Database resource with declarative extension management.
 #
 # This resource tells the CNPG operator to automatically run
-# CREATE EXTENSION pg_stream in the specified database. It replaces the
+# CREATE EXTENSION pg_trickle in the specified database. It replaces the
 # old postInitSQL approach.
 #
 # Prerequisites:
@@ -16,11 +16,11 @@
 apiVersion: postgresql.cnpg.io/v1
 kind: Database
 metadata:
-  name: pg-stream-app
+  name: pg-trickle-app
 spec:
   name: app
   owner: app
   cluster:
-    name: pg-stream-demo
+    name: pg-trickle-demo
   extensions:
-    - name: pg_stream
+    - name: pg_trickle

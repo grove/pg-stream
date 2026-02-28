@@ -1,4 +1,4 @@
-# pg_stream — Implementation Plan
+# pg_trickle — Implementation Plan
 
 ## Streaming tables for PostgreSQL 18 as a Rust Extension
 
@@ -32,7 +32,7 @@ A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declar
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        User SQL Session                         │
-│  pg_stream.create_stream_table('enriched_orders',                   │
+│  pg_trickle.create_stream_table('enriched_orders',                   │
 │    'SELECT o.*, c.name FROM orders o JOIN customers c ...',     │
 │    '5m', 'INCREMENTAL')                        │
 └───────────────────────────┬──────────────────────────────────────┘
@@ -50,18 +50,18 @@ A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declar
 │  Catalog Layer │ │  DAG Manager   │ │  DDL Event Triggers    │
 │  (catalog.rs)  │ │  (dag.rs)      │ │  (hooks.rs)            │
 │                │ │                │ │                        │
-│  pg_stream.stream_ │ │  Topological   │ │  Track ALTER/DROP on   │
+│  pg_trickle.stream_ │ │  Topological   │ │  Track ALTER/DROP on   │
 │  tables        │ │  sort, cycle   │ │  upstream tables →     │
-│  pg_stream.st_deps  │ │  detection,    │ │  mark REINITIALIZE     │
-│  pg_stream.st_hist  │ │  DOWNSTREAM    │ │                        │
-│  pg_stream.st_cdc   │ │  resolution    │ │                        │
+│  pg_trickle.st_deps  │ │  detection,    │ │  mark REINITIALIZE     │
+│  pg_trickle.st_hist  │ │  DOWNSTREAM    │ │                        │
+│  pg_trickle.st_cdc   │ │  resolution    │ │                        │
 └────────────────┘ └───────┬────────┘ └────────────────────────┘
                            │
                            ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │               Scheduler Background Worker (scheduler.rs)         │
 │                                                                  │
-│  Main loop (wakes every pg_stream.scheduler_interval_ms):             │
+│  Main loop (wakes every pg_trickle.scheduler_interval_ms):             │
 │  1. Consume CDC changes → change buffer tables                   │
 │  2. Compute data timestamps (canonical periods 48·2ⁿ s)         │
 │  3. Topological refresh ordering                                 │
@@ -78,7 +78,7 @@ A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declar
 │  Writes changes via     │     │  INCREMENTAL → delta query +     │
 │  PL/pgSQL to buffer     │     │    MERGE (DELETE+INSERT)         │
 │  Change buffer tables   │     │  REINITIALIZE → full recompute   │
-│  in pg_stream_changes schema │     │    + rebuild row IDs             │
+│  in pg_trickle_changes schema │     │    + rebuild row IDs             │
 └─────────────────────────┘     └──────────────┬───────────────────┘
                                                │
                                                ▼
@@ -93,7 +93,7 @@ A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declar
 │    aggregate.rs, distinct.rs, window.rs, union_all.rs,           │
 │    outer_join.rs                                                 │
 │                                                                  │
-│  Output: SQL delta query with __pgs_row_id + __pgs_action      │
+│  Output: SQL delta query with __pgt_row_id + __pgt_action      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -101,7 +101,7 @@ A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declar
 
 ```
 Base Tables ──TRIGGER──▶ Change Buffer Tables
-                     (pg_stream_changes.changes_<oid>)
+                     (pg_trickle_changes.changes_<oid>)
                           │
             ┌─────────────┼─────────────┐
             ▼             ▼             ▼
@@ -117,7 +117,7 @@ Base Tables ──TRIGGER──▶ Change Buffer Tables
                             │
                             ▼
                    Delta Result Set
-                   (__pgs_row_id, __pgs_action, cols...)
+                   (__pgt_row_id, __pgt_action, cols...)
                             │
                             ▼
                    MERGE into ST storage table
@@ -132,7 +132,7 @@ Base Tables ──TRIGGER──▶ Change Buffer Tables
 
 ```bash
 cargo pgrx init --pg18 /path/to/pg18/bin/pg_config
-cargo pgrx new pg_stream
+cargo pgrx new pg_trickle
 ```
 
 Pin pgrx to v0.17.x in `Cargo.toml`. Set `edition = "2024"`, target PostgreSQL 18.x.
@@ -178,17 +178,17 @@ Register via pgrx's GUC API in `_PG_init()`:
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `pg_stream.enabled` | bool | `true` | Master enable/disable switch |
-| `pg_stream.scheduler_interval_ms` | int | `1000` | Scheduler wake interval (ms) |
-| `pg_stream.min_target_lag_seconds` | int | `60` | Minimum allowed target lag |
-| `pg_stream.max_consecutive_errors` | int | `3` | Errors before auto-suspend |
-| `pg_stream.change_buffer_schema` | string | `pg_stream_changes` | Schema for change buffer tables |
-| `pg_stream.log_level` | enum | `info` | Extension log verbosity |
-| `pg_stream.max_concurrent_refreshes` | int | `4` | Max parallel refresh workers |
+| `pg_trickle.enabled` | bool | `true` | Master enable/disable switch |
+| `pg_trickle.scheduler_interval_ms` | int | `1000` | Scheduler wake interval (ms) |
+| `pg_trickle.min_target_lag_seconds` | int | `60` | Minimum allowed target lag |
+| `pg_trickle.max_consecutive_errors` | int | `3` | Errors before auto-suspend |
+| `pg_trickle.change_buffer_schema` | string | `pg_trickle_changes` | Schema for change buffer tables |
+| `pg_trickle.log_level` | enum | `info` | Extension log verbosity |
+| `pg_trickle.max_concurrent_refreshes` | int | `4` | Max parallel refresh workers |
 
 ### Step 0.4 — Shared preload enforcement
 
-In `_PG_init()`, check `pg_sys::process_shared_preload_libraries_in_progress`. If false, emit `ereport(ERROR)` instructing the user to add `pg_stream` to `shared_preload_libraries` in `postgresql.conf`. This is required for background workers and shared memory.
+In `_PG_init()`, check `pg_sys::process_shared_preload_libraries_in_progress`. If false, emit `ereport(ERROR)` instructing the user to add `pg_trickle` to `shared_preload_libraries` in `postgresql.conf`. This is required for background workers and shared memory.
 
 ### Step 0.5 — Shared memory initialization (`shmem.rs`)
 
@@ -196,14 +196,14 @@ Define shared memory structures for scheduler↔backend coordination:
 
 ```rust
 #[derive(Copy, Clone)]
-struct PgStreamSharedState {
+struct PgTrickleSharedState {
     dag_version: u64,             // Incremented on DAG changes
     scheduler_pid: i32,           // PID of scheduler worker
     scheduler_running: bool,      // Is scheduler alive?
     last_scheduler_wake: i64,     // Unix timestamp of last wake
 }
 
-static PGS_STATE: PgLwLock<PgStreamSharedState> = PgLwLock::new();
+static PGS_STATE: PgLwLock<PgTrickleSharedState> = PgLwLock::new();
 static DAG_REBUILD_SIGNAL: PgAtomic<u64> = PgAtomic::new();
 ```
 
@@ -217,18 +217,18 @@ When a user creates/alters/drops a ST, they increment `DAG_REBUILD_SIGNAL` atomi
 
 ### Step 1.1 — Extension schema and catalog tables
 
-Create via `extension_sql!()` in the migration script (`pg_stream--0.1.0.sql`):
+Create via `extension_sql!()` in the migration script (`pg_trickle--0.1.0.sql`):
 
 ```sql
-CREATE SCHEMA IF NOT EXISTS pgstream;
-CREATE SCHEMA IF NOT EXISTS pg_stream_changes;
+CREATE SCHEMA IF NOT EXISTS pgtrickle;
+CREATE SCHEMA IF NOT EXISTS pg_trickle_changes;
 
 -- Core ST metadata
-CREATE TABLE pg_stream.pgs_stream_tables (
-    pgs_id       BIGSERIAL PRIMARY KEY,
-    pgs_relid    OID NOT NULL UNIQUE,        -- OID of underlying storage table
-    pgs_name     TEXT NOT NULL,
-    pgs_schema   TEXT NOT NULL,
+CREATE TABLE pg_trickle.pgt_stream_tables (
+    pgt_id       BIGSERIAL PRIMARY KEY,
+    pgt_relid    OID NOT NULL UNIQUE,        -- OID of underlying storage table
+    pgt_name     TEXT NOT NULL,
+    pgt_schema   TEXT NOT NULL,
     defining_query TEXT NOT NULL,
     target_lag  INTERVAL,                   -- NULL = DOWNSTREAM
     refresh_mode TEXT NOT NULL DEFAULT 'INCREMENTAL'
@@ -244,23 +244,23 @@ CREATE TABLE pg_stream.pgs_stream_tables (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX ON pg_stream.pgs_stream_tables (status);
+CREATE INDEX ON pg_trickle.pgt_stream_tables (status);
 
 -- DAG edges
-CREATE TABLE pg_stream.pgs_dependencies (
-    pgs_id        BIGINT NOT NULL REFERENCES pg_stream.pgs_stream_tables(pgs_id) ON DELETE CASCADE,
+CREATE TABLE pg_trickle.pgt_dependencies (
+    pgt_id        BIGINT NOT NULL REFERENCES pg_trickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
     source_relid OID NOT NULL,
     source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW')),
     columns_used TEXT[],
-    PRIMARY KEY (pgs_id, source_relid)
+    PRIMARY KEY (pgt_id, source_relid)
 );
 
-CREATE INDEX ON pg_stream.pgs_dependencies (source_relid);
+CREATE INDEX ON pg_trickle.pgt_dependencies (source_relid);
 
 -- Refresh history / audit log
-CREATE TABLE pg_stream.pgs_refresh_history (
+CREATE TABLE pg_trickle.pgt_refresh_history (
     refresh_id    BIGSERIAL PRIMARY KEY,
-    pgs_id         BIGINT NOT NULL,
+    pgt_id         BIGINT NOT NULL,
     data_timestamp TIMESTAMPTZ NOT NULL,
     start_time    TIMESTAMPTZ NOT NULL,
     end_time      TIMESTAMPTZ,
@@ -273,14 +273,14 @@ CREATE TABLE pg_stream.pgs_refresh_history (
                    CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED'))
 );
 
-CREATE INDEX ON pg_stream.pgs_refresh_history (pgs_id, data_timestamp);
+CREATE INDEX ON pg_trickle.pgt_refresh_history (pgt_id, data_timestamp);
 
--- Per-source CDC trigger tracking (slot_name stores trigger name, e.g., 'pg_stream_cdc_16384')
-CREATE TABLE pg_stream.pgs_change_tracking (
+-- Per-source CDC trigger tracking (slot_name stores trigger name, e.g., 'pg_trickle_cdc_16384')
+CREATE TABLE pg_trickle.pgt_change_tracking (
     source_relid      OID PRIMARY KEY,
     slot_name         TEXT NOT NULL,
     last_consumed_lsn PG_LSN,
-    tracked_by_pgs_ids BIGINT[]
+    tracked_by_pgt_ids BIGINT[]
 );
 ```
 
@@ -290,10 +290,10 @@ Implement Rust functions wrapping SPI calls:
 
 ```rust
 pub struct StreamTableMeta {
-    pub pgs_id: i64,
-    pub pgs_relid: pg_sys::Oid,
-    pub pgs_name: String,
-    pub pgs_schema: String,
+    pub pgt_id: i64,
+    pub pgt_relid: pg_sys::Oid,
+    pub pgt_name: String,
+    pub pgt_schema: String,
     pub defining_query: String,
     pub target_lag: Option<Interval>,
     pub refresh_mode: RefreshMode,
@@ -308,15 +308,15 @@ pub enum RefreshMode { Full, Incremental }
 pub enum StStatus { Initializing, Active, Suspended, Error }
 
 impl StreamTableMeta {
-    pub fn insert(meta: &StreamTableMeta) -> Result<i64, PgStreamError> { ... }
-    pub fn get_by_name(schema: &str, name: &str) -> Result<Self, PgStreamError> { ... }
-    pub fn get_by_relid(relid: Oid) -> Result<Self, PgStreamError> { ... }
-    pub fn get_all_active() -> Result<Vec<Self>, PgStreamError> { ... }
-    pub fn update_status(pgs_id: i64, status: StStatus) -> Result<(), PgStreamError> { ... }
-    pub fn update_after_refresh(pgs_id: i64, data_ts: TimestampWithTimeZone,
-                                frontier: JsonB) -> Result<(), PgStreamError> { ... }
-    pub fn increment_errors(pgs_id: i64) -> Result<i32, PgStreamError> { ... }
-    pub fn delete(pgs_id: i64) -> Result<(), PgStreamError> { ... }
+    pub fn insert(meta: &StreamTableMeta) -> Result<i64, PgTrickleError> { ... }
+    pub fn get_by_name(schema: &str, name: &str) -> Result<Self, PgTrickleError> { ... }
+    pub fn get_by_relid(relid: Oid) -> Result<Self, PgTrickleError> { ... }
+    pub fn get_all_active() -> Result<Vec<Self>, PgTrickleError> { ... }
+    pub fn update_status(pgt_id: i64, status: StStatus) -> Result<(), PgTrickleError> { ... }
+    pub fn update_after_refresh(pgt_id: i64, data_ts: TimestampWithTimeZone,
+                                frontier: JsonB) -> Result<(), PgTrickleError> { ... }
+    pub fn increment_errors(pgt_id: i64) -> Result<i32, PgTrickleError> { ... }
+    pub fn delete(pgt_id: i64) -> Result<(), PgTrickleError> { ... }
 }
 
 pub struct StDependency { ... }
@@ -324,18 +324,18 @@ pub struct RefreshRecord { ... }
 // Similar CRUD implementations for dependencies and refresh history.
 ```
 
-All catalog access goes through `Spi::connect()`. Error handling wraps PostgreSQL errors into `PgStreamError` type.
+All catalog access goes through `Spi::connect()`. Error handling wraps PostgreSQL errors into `PgTrickleError` type.
 
 ---
 
 ## Phase 2 — User-Facing SQL API
 
-### Step 2.1 — `pg_stream.create_stream_table()`
+### Step 2.1 — `pg_trickle.create_stream_table()`
 
 **Signature:**
 
 ```sql
-pg_stream.create_stream_table(
+pg_trickle.create_stream_table(
     name         TEXT,              -- 'schema.table_name' or 'table_name'
     query        TEXT,              -- Defining SELECT query
     target_lag   INTERVAL DEFAULT '1 minute',  -- NULL for DOWNSTREAM
@@ -344,17 +344,17 @@ pg_stream.create_stream_table(
 ) RETURNS VOID
 ```
 
-**Implementation (`api.rs` — `#[pg_extern(schema = "pgstream")]`):**
+**Implementation (`api.rs` — `#[pg_extern(schema = "pgtrickle")]`):**
 
 1. **Parse name** into `(schema, table_name)`. Default schema = `current_schema()`.
 
 2. **Validate the defining query:**
    - Execute `SELECT * FROM (<query>) sub LIMIT 0` via SPI to verify syntax and get output column types. If it fails, propagate the error.
    - Parse the query via `pg_sys::raw_parser()` to obtain the raw parse tree.
-   - Walk the `RangeTblEntry` list from the parse tree to extract all referenced relation OIDs. Classify each as `TABLE`, `VIEW`, or `STREAM_TABLE` (check `pg_stream.pgs_stream_tables`).
+   - Walk the `RangeTblEntry` list from the parse tree to extract all referenced relation OIDs. Classify each as `TABLE`, `VIEW`, or `STREAM_TABLE` (check `pg_trickle.pgt_stream_tables`).
 
 3. **Cycle detection:**
-   - Load existing DAG from `pg_stream.pgs_dependencies`.
+   - Load existing DAG from `pg_trickle.pgt_dependencies`.
    - Add proposed edges (new ST → its sources).
    - Run Kahn's algorithm. If any nodes remain unprocessed, a cycle exists → error.
 
@@ -365,39 +365,39 @@ pg_stream.create_stream_table(
 5. **Create the underlying storage table:**
    ```sql
    CREATE TABLE <schema>.<name> (
-       __pgs_row_id BIGINT,
+       __pgt_row_id BIGINT,
        -- ... all columns from the defining query ...
    )
    ```
    Derive the column list from the `LIMIT 0` result metadata.
    
    For aggregate queries (INCREMENTAL mode), also add auxiliary columns:
-   - `__pgs_count BIGINT` — for COUNT/DISTINCT tracking
-   - `__pgs_sum_<col> NUMERIC` — for each SUM/AVG aggregate
+   - `__pgt_count BIGINT` — for COUNT/DISTINCT tracking
+   - `__pgt_sum_<col> NUMERIC` — for each SUM/AVG aggregate
    
-   Create a unique index on `__pgs_row_id`.
+   Create a unique index on `__pgt_row_id`.
 
 6. **Initialize** (if `initialize = true`):
    ```sql
-   INSERT INTO <schema>.<name> (__pgs_row_id, <user_cols>, [__pgs_count, ...])
+   INSERT INTO <schema>.<name> (__pgt_row_id, <user_cols>, [__pgt_count, ...])
    SELECT <row_id_expr>, sub.*, [1, <col>, ...] FROM (<query>) sub
    ```
    Set `is_populated = true`, `data_timestamp = now()`.
 
-7. **Insert catalog entries** into `pg_stream.pgs_stream_tables` and `pg_stream.pgs_dependencies`.
+7. **Insert catalog entries** into `pg_trickle.pgt_stream_tables` and `pg_trickle.pgt_dependencies`.
 
 8. **Create CDC triggers** for any new base table sources not already tracked:
-   - Create a PL/pgSQL trigger function `pg_stream.pg_stream_cdc_fn_<source_oid>()`
-   - Create an `AFTER INSERT OR UPDATE OR DELETE` trigger `pg_stream_cdc_<source_oid>` on the source table
-   - Trigger writes change data (LSN, XID, action, row data as JSONB) to `pg_stream_changes.changes_<source_oid>`
-   - Insert tracking record into `pg_stream.pgs_change_tracking` with trigger name
+   - Create a PL/pgSQL trigger function `pg_trickle.pg_trickle_cdc_fn_<source_oid>()`
+   - Create an `AFTER INSERT OR UPDATE OR DELETE` trigger `pg_trickle_cdc_<source_oid>` on the source table
+   - Trigger writes change data (LSN, XID, action, row data as JSONB) to `pg_trickle_changes.changes_<source_oid>`
+   - Insert tracking record into `pg_trickle.pgt_change_tracking` with trigger name
 
 9. **Signal the scheduler** by incrementing `DAG_REBUILD_SIGNAL` in shared memory (no-op if shared memory not initialized).
 
-### Step 2.2 — `pg_stream.alter_stream_table()`
+### Step 2.2 — `pg_trickle.alter_stream_table()`
 
 ```sql
-pg_stream.alter_stream_table(
+pg_trickle.alter_stream_table(
     name         TEXT,
     target_lag   INTERVAL DEFAULT NULL,
     refresh_mode TEXT DEFAULT NULL,
@@ -410,27 +410,27 @@ pg_stream.alter_stream_table(
 - If resuming from SUSPENDED: reset `consecutive_errors = 0`.
 - Signal scheduler to rebuild DAG.
 
-### Step 2.3 — `pg_stream.drop_stream_table()`
+### Step 2.3 — `pg_trickle.drop_stream_table()`
 
 ```sql
-pg_stream.drop_stream_table(name TEXT) RETURNS VOID
+pg_trickle.drop_stream_table(name TEXT) RETURNS VOID
 ```
 
-- Look up the ST in `pg_stream.pgs_stream_tables` by name/schema.
+- Look up the ST in `pg_trickle.pgt_stream_tables` by name/schema.
 - Drop the underlying storage table: `DROP TABLE <schema>.<name>`.
-- Delete entries from `pg_stream.pgs_stream_tables`, `pg_stream.pgs_dependencies`, `pg_stream.pgs_refresh_history`.
+- Delete entries from `pg_trickle.pgt_stream_tables`, `pg_trickle.pgt_dependencies`, `pg_trickle.pgt_refresh_history`.
 - Clean up CDC triggers if no other STs reference the source:
-  - `DROP TRIGGER pg_stream_cdc_<source_oid> ON <source_table>`
-  - `DROP FUNCTION pg_stream.pg_stream_cdc_fn_<source_oid>() CASCADE`
-- Remove orphaned change buffer tables in `pg_stream_changes`.
+  - `DROP TRIGGER pg_trickle_cdc_<source_oid> ON <source_table>`
+  - `DROP FUNCTION pg_trickle.pg_trickle_cdc_fn_<source_oid>() CASCADE`
+- Remove orphaned change buffer tables in `pg_trickle_changes`.
 - Signal scheduler.
 
-Also register an **object access hook** (`hooks.rs`) so that `DROP TABLE <pgs_name>` done directly (not via `pg_stream.drop_stream_table()`) also cleans up catalog entries. Check if the dropped OID exists in `pg_stream.pgs_stream_tables.pgs_relid`. If yes, cascade the cleanup.
+Also register an **object access hook** (`hooks.rs`) so that `DROP TABLE <pgt_name>` done directly (not via `pg_trickle.drop_stream_table()`) also cleans up catalog entries. Check if the dropped OID exists in `pg_trickle.pgt_stream_tables.pgt_relid`. If yes, cascade the cleanup.
 
-### Step 2.4 — `pg_stream.refresh_stream_table()`
+### Step 2.4 — `pg_trickle.refresh_stream_table()`
 
 ```sql
-pg_stream.refresh_stream_table(name TEXT) RETURNS VOID
+pg_trickle.refresh_stream_table(name TEXT) RETURNS VOID
 ```
 
 - Sets a data timestamp of `now()`.
@@ -442,26 +442,26 @@ pg_stream.refresh_stream_table(name TEXT) RETURNS VOID
 
 ```sql
 -- Computed view with current lag
-CREATE VIEW pg_stream.stream_tables_info AS
+CREATE VIEW pg_trickle.stream_tables_info AS
 SELECT st.*,
        now() - st.data_timestamp AS current_lag,
        CASE WHEN st.target_lag IS NOT NULL
             THEN (now() - st.data_timestamp) > st.target_lag
             ELSE FALSE
        END AS lag_exceeded
-FROM pg_stream.pgs_stream_tables st;
+FROM pg_trickle.pgt_stream_tables st;
 
 -- Recent refresh history
-CREATE FUNCTION pg_stream.refresh_history(
-    pgs_name TEXT, max_rows INT DEFAULT 20
-) RETURNS SETOF pg_stream.pgs_refresh_history ...;
+CREATE FUNCTION pg_trickle.refresh_history(
+    pgt_name TEXT, max_rows INT DEFAULT 20
+) RETURNS SETOF pg_trickle.pgt_refresh_history ...;
 
 -- DAG visualization
-CREATE FUNCTION pg_stream.st_graph()
-RETURNS TABLE(pgs_name TEXT, source_name TEXT, source_type TEXT) ...;
+CREATE FUNCTION pg_trickle.st_graph()
+RETURNS TABLE(pgt_name TEXT, source_name TEXT, source_type TEXT) ...;
 
 -- Compact status overview
-CREATE FUNCTION pg_stream.pgs_status()
+CREATE FUNCTION pg_trickle.pgt_status()
 RETURNS TABLE(
     name TEXT, status TEXT, refresh_mode TEXT,
     target_lag INTERVAL, current_lag INTERVAL,
@@ -477,12 +477,12 @@ RETURNS TABLE(
 
 For each base table tracked by at least one ST, maintain a row-level trigger that captures changes:
 
-- **Trigger name:** `pg_stream_cdc_<source_oid>` (e.g., `pg_stream_cdc_16384`)
-- **Trigger function:** `pg_stream.pg_stream_cdc_fn_<source_oid>()` (PL/pgSQL)
+- **Trigger name:** `pg_trickle_cdc_<source_oid>` (e.g., `pg_trickle_cdc_16384`)
+- **Trigger function:** `pg_trickle.pg_trickle_cdc_fn_<source_oid>()` (PL/pgSQL)
 - **Timing:** `AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW`
 - **Action:** Writes change metadata and row data (as JSONB) directly to the change buffer table
-- **Creation:** via `CREATE TRIGGER` during `pg_stream.create_stream_table()`
-- **Destruction:** via `DROP TRIGGER` during `pg_stream.drop_stream_table()` when no STs reference the source
+- **Creation:** via `CREATE TRIGGER` during `pg_trickle.create_stream_table()`
+- **Destruction:** via `DROP TRIGGER` during `pg_trickle.drop_stream_table()` when no STs reference the source
 
 **Why triggers instead of logical replication?**
 - **Transaction safety:** Triggers can be created in the same transaction as DDL/DML, enabling a single-function `create_stream_table()` API
@@ -494,10 +494,10 @@ For each base table tracked by at least one ST, maintain a row-level trigger tha
 
 ### Step 3.2 — Change buffer tables
 
-Schema: `pg_stream_changes`. One table per tracked source:
+Schema: `pg_trickle_changes`. One table per tracked source:
 
 ```sql
-CREATE TABLE pg_stream_changes.changes_<source_oid> (
+CREATE TABLE pg_trickle_changes.changes_<source_oid> (
     change_id   BIGSERIAL PRIMARY KEY,
     lsn         PG_LSN NOT NULL,
     xid         BIGINT NOT NULL,
@@ -507,33 +507,33 @@ CREATE TABLE pg_stream_changes.changes_<source_oid> (
     captured_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX ON pg_stream_changes.changes_<source_oid> (lsn);
+CREATE INDEX ON pg_trickle_changes.changes_<source_oid> (lsn);
 ```
 
-Tables are created by `pg_stream.create_stream_table()` when a new source is first tracked. They are append-only; consumed changes are deleted after each refresh cycle.
+Tables are created by `pg_trickle.create_stream_table()` when a new source is first tracked. They are append-only; consumed changes are deleted after each refresh cycle.
 
 ### Step 3.3 — CDC trigger function implementation
 
 The PL/pgSQL trigger function writes changes directly to the buffer table:
 
 ```sql
-CREATE OR REPLACE FUNCTION pg_stream.pg_stream_cdc_fn_<oid>()
+CREATE OR REPLACE FUNCTION pg_trickle.pg_trickle_cdc_fn_<oid>()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        INSERT INTO pg_stream_changes.changes_<oid>
+        INSERT INTO pg_trickle_changes.changes_<oid>
             (lsn, xid, action, row_data)
         VALUES (pg_current_wal_lsn(), pg_current_xact_id()::text::bigint, 'I',
                 row_to_json(NEW)::jsonb);
         RETURN NEW;
     ELSIF TG_OP = 'UPDATE' THEN
-        INSERT INTO pg_stream_changes.changes_<oid>
+        INSERT INTO pg_trickle_changes.changes_<oid>
             (lsn, xid, action, row_data, old_row_data)
         VALUES (pg_current_wal_lsn(), pg_current_xact_id()::text::bigint, 'U',
                 row_to_json(NEW)::jsonb, row_to_json(OLD)::jsonb);
         RETURN NEW;
     ELSIF TG_OP = 'DELETE' THEN
-        INSERT INTO pg_stream_changes.changes_<oid>
+        INSERT INTO pg_trickle_changes.changes_<oid>
             (lsn, xid, action, old_row_data)
         VALUES (pg_current_wal_lsn(), pg_current_xact_id()::text::bigint, 'D',
                 row_to_json(OLD)::jsonb);
@@ -555,12 +555,12 @@ $$;
 During incremental refresh, the scheduler reads pending changes from buffer tables:
 
 ```rust
-fn get_pending_changes(source_oid: Oid, from_lsn: PgLsn, to_lsn: PgLsn) -> Result<Vec<Change>, PgStreamError> {
+fn get_pending_changes(source_oid: Oid, from_lsn: PgLsn, to_lsn: PgLsn) -> Result<Vec<Change>, PgTrickleError> {
     Spi::connect(|client| {
         let changes = client.select(
             &format!(
                 "SELECT lsn, xid, action, row_data, old_row_data 
-                 FROM pg_stream_changes.changes_{} 
+                 FROM pg_trickle_changes.changes_{} 
                  WHERE lsn > $1 AND lsn <= $2 
                  ORDER BY lsn, change_id",
                 source_oid
@@ -578,7 +578,7 @@ fn get_pending_changes(source_oid: Oid, from_lsn: PgLsn, to_lsn: PgLsn) -> Resul
 After applying changes to the ST, consumed changes are deleted:
 
 ```sql
-DELETE FROM pg_stream_changes.changes_<oid> WHERE lsn <= $1
+DELETE FROM pg_trickle_changes.changes_<oid> WHERE lsn <= $1
 ```
 
 ---
@@ -599,7 +599,7 @@ pub struct StDag {
 
 pub enum NodeId {
     BaseTable(Oid),
-    StreamTable(i64),  // pgs_id
+    StreamTable(i64),  // pgt_id
 }
 
 pub struct DagNode {
@@ -613,13 +613,13 @@ pub struct DagNode {
 
 **Operations:**
 
-- `StDag::build_from_catalog()` — load `pg_stream.pgs_stream_tables` and `pg_stream.pgs_dependencies` via SPI, construct in-memory graph.
-- `StDag::add_st(pgs_id, sources)` — add a ST node with edges.
+- `StDag::build_from_catalog()` — load `pg_trickle.pgt_stream_tables` and `pg_trickle.pgt_dependencies` via SPI, construct in-memory graph.
+- `StDag::add_st(pgt_id, sources)` — add a ST node with edges.
 - `StDag::detect_cycles() -> Result<(), CycleError>` — Kahn's algorithm (BFS topological sort). If any nodes remain after processing all zero-indegree nodes, a cycle exists.
 - `StDag::topological_order() -> Vec<NodeId>` — return STs in refresh order (upstream first).
-- `StDag::resolve_downstream_lags()` — for STs with `target_lag = NULL`, compute effective lag as `MIN(target_lag)` across all immediate downstream dependents. Repeat until convergence. If no downstream, use `pg_stream.min_target_lag_seconds`.
-- `StDag::get_upstream(pgs_id) -> Vec<NodeId>` — all transitive upstream nodes.
-- `StDag::get_downstream(pgs_id) -> Vec<NodeId>` — all transitive downstream nodes.
+- `StDag::resolve_downstream_lags()` — for STs with `target_lag = NULL`, compute effective lag as `MIN(target_lag)` across all immediate downstream dependents. Repeat until convergence. If no downstream, use `pg_trickle.min_target_lag_seconds`.
+- `StDag::get_upstream(pgt_id) -> Vec<NodeId>` — all transitive upstream nodes.
+- `StDag::get_downstream(pgt_id) -> Vec<NodeId>` — all transitive downstream nodes.
 
 **Cycle detection algorithm (Kahn's):**
 
@@ -672,9 +672,9 @@ Because all periods are powers of 2 × 48, they align: a 96s period timestamp is
 Register in `_PG_init()`:
 
 ```rust
-BackgroundWorkerBuilder::new("pg_stream scheduler")
-    .set_function("pg_stream_scheduler_main")
-    .set_library("pg_stream")
+BackgroundWorkerBuilder::new("pg_trickle scheduler")
+    .set_function("pg_trickle_scheduler_main")
+    .set_library("pg_trickle")
     .enable_spi_access()
     .set_start_time(BgWorkerStartTime::RecoveryFinished)
     .set_restart_time(Some(Duration::from_secs(5)))
@@ -686,7 +686,7 @@ BackgroundWorkerBuilder::new("pg_stream scheduler")
 ```rust
 #[pg_guard]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(
         SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM
     );
@@ -698,7 +698,7 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
     loop {
         // Wait for scheduler interval or signal
         if !BackgroundWorker::wait_latch(Some(Duration::from_millis(
-            pg_stream_scheduler_interval_ms()
+            pg_trickle_scheduler_interval_ms()
         ))) {
             break; // SIGTERM received
         }
@@ -729,7 +729,7 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
                 if current_lag > st.effective_lag {
                     let period = select_canonical_period(st.effective_lag);
                     let target_ts = canonical_data_timestamp(period);
-                    needs_refresh.push(StToRefresh { pgs_id: st.id, target_ts });
+                    needs_refresh.push(StToRefresh { pgt_id: st.id, target_ts });
                 }
             }
 
@@ -741,7 +741,7 @@ pub extern "C-unwind" fn pg_stream_scheduler_main(_arg: pg_sys::Datum) {
                 execute_single_refresh(refresh_task, &dag);
             }
 
-            Ok::<(), PgStreamError>(())
+            Ok::<(), PgTrickleError>(())
         }).unwrap_or_else(|e| {
             log!("Scheduler error: {}", e);
         });
@@ -797,7 +797,7 @@ pub fn determine_refresh_action(
 
 ```sql
 SELECT EXISTS(
-    SELECT 1 FROM pg_stream_changes.changes_<source_oid>
+    SELECT 1 FROM pg_trickle_changes.changes_<source_oid>
     WHERE lsn > <last_consumed_lsn>
     LIMIT 1
 )
@@ -807,18 +807,18 @@ Check for each source table in the ST's dependency list. If any have changes, `h
 
 **How to detect `needs_reinit`:**
 
-Maintained by the DDL event trigger (Phase 7). If any upstream table has had a schema change since the last refresh, mark the ST for reinitialize. Stored as a flag in `pg_stream.pgs_stream_tables` or a separate reinit queue.
+Maintained by the DDL event trigger (Phase 7). If any upstream table has had a schema change since the last refresh, mark the ST for reinitialize. Stored as a flag in `pg_trickle.pgt_stream_tables` or a separate reinit queue.
 
 ### Step 5.2 — NO_DATA refresh
 
 ```rust
 fn execute_no_data_refresh(st: &StreamTableMeta, target_ts: SystemTime) {
     Spi::run(&format!(
-        "UPDATE pg_stream.pgs_stream_tables SET data_timestamp = $1, last_refresh_at = now(),
-         updated_at = now() WHERE pgs_id = $2"
-    ), /* target_ts, st.pgs_id */);
+        "UPDATE pg_trickle.pgt_stream_tables SET data_timestamp = $1, last_refresh_at = now(),
+         updated_at = now() WHERE pgt_id = $2"
+    ), /* target_ts, st.pgt_id */);
 
-    insert_refresh_history(st.pgs_id, target_ts, "NO_DATA", "COMPLETED", 0, 0);
+    insert_refresh_history(st.pgt_id, target_ts, "NO_DATA", "COMPLETED", 0, 0);
 }
 ```
 
@@ -828,28 +828,28 @@ Zero-cost: no warehouse/compute used, only metadata update.
 
 ```sql
 BEGIN;
-SELECT pg_replication_origin_session_setup('pg_stream_refresh');
+SELECT pg_replication_origin_session_setup('pg_trickle_refresh');
 
 -- Lock the ST to prevent concurrent access during refresh
-SELECT pg_advisory_xact_lock(pgs_relid::bigint);
+SELECT pg_advisory_xact_lock(pgt_relid::bigint);
 
 -- Truncate and repopulate
 TRUNCATE <schema>.<name>;
-INSERT INTO <schema>.<name> (__pgs_row_id, <user_cols>)
+INSERT INTO <schema>.<name> (__pgt_row_id, <user_cols>)
 SELECT <row_id_expr>, sub.* FROM (<defining_query>) sub;
 
 -- Update catalog
-UPDATE pg_stream.pgs_stream_tables
+UPDATE pg_trickle.pgt_stream_tables
 SET data_timestamp = <target_ts>, is_populated = true,
     frontier = <new_frontier>, last_refresh_at = now(),
     consecutive_errors = 0, status = 'ACTIVE', updated_at = now()
-WHERE pgs_id = <pgs_id>;
+WHERE pgt_id = <pgt_id>;
 
 -- Record history
-INSERT INTO pg_stream.pgs_refresh_history (...) VALUES (...);
+INSERT INTO pg_trickle.pgt_refresh_history (...) VALUES (...);
 
 -- Clean up consumed changes
-DELETE FROM pg_stream_changes.changes_<source_oid> WHERE lsn <= <consumed_lsn>;
+DELETE FROM pg_trickle_changes.changes_<source_oid> WHERE lsn <= <consumed_lsn>;
 
 SELECT pg_replication_origin_session_reset();
 COMMIT;
@@ -859,26 +859,26 @@ COMMIT;
 
 ```sql
 BEGIN;
-SELECT pg_replication_origin_session_setup('pg_stream_refresh');
-SELECT pg_advisory_xact_lock(pgs_relid::bigint);
+SELECT pg_replication_origin_session_setup('pg_trickle_refresh');
+SELECT pg_advisory_xact_lock(pgt_relid::bigint);
 
 -- Step 1: Compute the delta (SQL generated by IVM engine — see Phase 6)
-CREATE TEMP TABLE __pgs_delta ON COMMIT DROP AS
+CREATE TEMP TABLE __pgt_delta ON COMMIT DROP AS
 <generated_delta_query>;
--- Result has columns: __pgs_row_id, __pgs_action ('I' or 'D'), <user_cols>,
---                     [__pgs_count, __pgs_sum_*, ...] (auxiliary cols for aggregates)
+-- Result has columns: __pgt_row_id, __pgt_action ('I' or 'D'), <user_cols>,
+--                     [__pgt_count, __pgt_sum_*, ...] (auxiliary cols for aggregates)
 
 -- Step 2: Delete removed/updated rows
 DELETE FROM <schema>.<name> st
-USING __pgs_delta d
-WHERE st.__pgs_row_id = d.__pgs_row_id
-  AND d.__pgs_action = 'D';
+USING __pgt_delta d
+WHERE st.__pgt_row_id = d.__pgt_row_id
+  AND d.__pgt_action = 'D';
 
 -- Step 3: Insert new/updated rows
-INSERT INTO <schema>.<name> (__pgs_row_id, <user_cols>, [__pgs_count, ...])
-SELECT d.__pgs_row_id, <user_cols>, [d.__pgs_count, ...]
-FROM __pgs_delta d
-WHERE d.__pgs_action = 'I';
+INSERT INTO <schema>.<name> (__pgt_row_id, <user_cols>, [__pgt_count, ...])
+SELECT d.__pgt_row_id, <user_cols>, [d.__pgt_count, ...]
+FROM __pgt_delta d
+WHERE d.__pgt_action = 'I';
 
 -- Step 4: Update catalog, record history, clean up change buffers
 -- (same as FULL refresh)
@@ -887,18 +887,18 @@ SELECT pg_replication_origin_session_reset();
 COMMIT;
 ```
 
-For updates (a value changes within the same row ID), the delta contains both a `'D'` row (old) and an `'I'` row (new) for the same `__pgs_row_id`. The DELETE runs first, followed by the INSERT.
+For updates (a value changes within the same row ID), the delta contains both a `'D'` row (old) and an `'I'` row (new) for the same `__pgt_row_id`. The DELETE runs first, followed by the INSERT.
 
 ### Step 5.5 — REINITIALIZE refresh
 
 Same as FULL refresh, but also:
-- Recompute auxiliary columns (`__pgs_count`, `__pgs_sum_*`) for aggregate STs
+- Recompute auxiliary columns (`__pgt_count`, `__pgt_sum_*`) for aggregate STs
 - Rebuild any internal metadata about the query structure (in case the defining query's semantics changed due to upstream DDL)
 - Reset the frontier to reflect the fresh computation
 
 ### Step 5.6 — Advisory locking
 
-Each ST is locked during refresh using `pg_advisory_xact_lock(pgs_relid::bigint)`. This:
+Each ST is locked during refresh using `pg_advisory_xact_lock(pgt_relid::bigint)`. This:
 - Prevents concurrent refreshes of the same ST
 - Is transaction-scoped (automatically released on COMMIT/ROLLBACK)
 - Does not block readers of the ST (regular SELECT still works)
@@ -992,24 +992,24 @@ pub struct Column {
 
 ### Step 6.2 — Row ID generation (`dvm/row_id.rs`)
 
-Every row in an incrementally-maintained ST has a unique `__pgs_row_id BIGINT`. Row IDs must be deterministic (same input → same ID) for the MERGE to work correctly.
+Every row in an incrementally-maintained ST has a unique `__pgt_row_id BIGINT`. Row IDs must be deterministic (same input → same ID) for the MERGE to work correctly.
 
 **Strategy per operator:**
 
 | Operator | Row ID computation |
 |---|---|
-| Scan(table) | `pg_stream_hash(pk_col1, pk_col2, ...)` using primary key, or `pg_stream_hash(all_cols)` if no PK (with warning) |
+| Scan(table) | `pg_trickle_hash(pk_col1, pk_col2, ...)` using primary key, or `pg_trickle_hash(all_cols)` if no PK (with warning) |
 | Project | Pass through child's row ID |
 | Filter | Pass through child's row ID |
-| InnerJoin | `pg_stream_hash(left.__pgs_row_id, right.__pgs_row_id)` |
-| Aggregate | `pg_stream_hash(group_by_col1, group_by_col2, ...)` |
-| Distinct | `pg_stream_hash(all_output_cols)` |
+| InnerJoin | `pg_trickle_hash(left.__pgt_row_id, right.__pgt_row_id)` |
+| Aggregate | `pg_trickle_hash(group_by_col1, group_by_col2, ...)` |
+| Distinct | `pg_trickle_hash(all_output_cols)` |
 
 **Hash function:** Use xxHash64 via a SQL function:
 
 ```sql
 -- Exposed as a pg_extern
-CREATE FUNCTION pg_stream.pg_stream_hash(VARIADIC args ANYARRAY) RETURNS BIGINT ...;
+CREATE FUNCTION pg_trickle.pg_trickle_hash(VARIADIC args ANYARRAY) RETURNS BIGINT ...;
 ```
 
 Implement in Rust using the `xxhash-rust` crate. Accept variadic input, serialize all arguments, compute xxHash64, return as BIGINT.
@@ -1029,7 +1029,7 @@ pub struct DiffContext {
 impl DiffContext {
     /// Generate the delta query for the entire operator tree.
     /// Returns the final SQL query string.
-    pub fn differentiate(&mut self, op: &OpTree) -> Result<String, PgStreamError> {
+    pub fn differentiate(&mut self, op: &OpTree) -> Result<String, PgTrickleError> {
         let final_cte = self.diff_node(op)?;
 
         // Build the WITH query
@@ -1044,7 +1044,7 @@ impl DiffContext {
         ))
     }
 
-    fn diff_node(&mut self, op: &OpTree) -> Result<String, PgStreamError> {
+    fn diff_node(&mut self, op: &OpTree) -> Result<String, PgTrickleError> {
         match op {
             OpTree::Scan { .. } => self.diff_scan(op),
             OpTree::Project { .. } => self.diff_project(op),
@@ -1061,7 +1061,7 @@ impl DiffContext {
 
     fn next_cte_name(&mut self) -> String {
         self.cte_counter += 1;
-        format!("__pgs_cte_{}", self.cte_counter)
+        format!("__pgt_cte_{}", self.cte_counter)
     }
 }
 ```
@@ -1071,7 +1071,7 @@ impl DiffContext {
 $\Delta_I(\text{Scan}(T))$ reads from the change buffer table:
 
 ```rust
-fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgStreamError> {
+fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgTrickleError> {
     let OpTree::Scan { table_oid, columns, alias, .. } = scan else { unreachable!() };
 
     let cte_name = self.next_cte_name();
@@ -1083,32 +1083,32 @@ fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgStreamError> {
     let sql = format!(
         "SELECT
             CASE WHEN action = 'D' THEN
-                pg_stream.pg_stream_hash({pk_extraction_from_old})
+                pg_trickle.pg_trickle_hash({pk_extraction_from_old})
             ELSE
-                pg_stream.pg_stream_hash({pk_extraction_from_new})
-            END AS __pgs_row_id,
+                pg_trickle.pg_trickle_hash({pk_extraction_from_new})
+            END AS __pgt_row_id,
             CASE
                 WHEN action = 'I' THEN 'I'
                 WHEN action = 'D' THEN 'D'
-                WHEN action = 'U' AND __pgs_update_part = 'old' THEN 'D'
-                WHEN action = 'U' AND __pgs_update_part = 'new' THEN 'I'
-            END AS __pgs_action,
+                WHEN action = 'U' AND __pgt_update_part = 'old' THEN 'D'
+                WHEN action = 'U' AND __pgt_update_part = 'new' THEN 'I'
+            END AS __pgt_action,
             {col_extractions}
         FROM (
             -- Direct inserts and deletes
-            SELECT action, row_data, old_row_data, NULL AS __pgs_update_part
-            FROM pg_stream_changes.changes_{table_oid}
+            SELECT action, row_data, old_row_data, NULL AS __pgt_update_part
+            FROM pg_trickle_changes.changes_{table_oid}
             WHERE lsn > '{prev_lsn}' AND lsn <= '{new_lsn}'
               AND action IN ('I', 'D')
             UNION ALL
             -- Updates expanded to old+new pairs
-            SELECT action, row_data, old_row_data, 'old' AS __pgs_update_part
-            FROM pg_stream_changes.changes_{table_oid}
+            SELECT action, row_data, old_row_data, 'old' AS __pgt_update_part
+            FROM pg_trickle_changes.changes_{table_oid}
             WHERE lsn > '{prev_lsn}' AND lsn <= '{new_lsn}'
               AND action = 'U'
             UNION ALL
-            SELECT action, row_data, old_row_data, 'new' AS __pgs_update_part
-            FROM pg_stream_changes.changes_{table_oid}
+            SELECT action, row_data, old_row_data, 'new' AS __pgt_update_part
+            FROM pg_trickle_changes.changes_{table_oid}
             WHERE lsn > '{prev_lsn}' AND lsn <= '{new_lsn}'
               AND action = 'U'
         ) expanded",
@@ -1131,10 +1131,10 @@ fn diff_scan(&mut self, scan: &OpTree) -> Result<String, PgStreamError> {
 
 $$\Delta_I(\pi_E(Q)) = \pi_E(\Delta_I(Q))$$
 
-Simply apply the same projection expressions to the child's delta, passing through `__pgs_row_id` and `__pgs_action`:
+Simply apply the same projection expressions to the child's delta, passing through `__pgt_row_id` and `__pgt_action`:
 
 ```rust
-fn diff_project(&mut self, project: &OpTree) -> Result<String, PgStreamError> {
+fn diff_project(&mut self, project: &OpTree) -> Result<String, PgTrickleError> {
     let OpTree::Project { expressions, child } = project else { unreachable!() };
     let child_cte = self.diff_node(child)?;
     let cte_name = self.next_cte_name();
@@ -1145,7 +1145,7 @@ fn diff_project(&mut self, project: &OpTree) -> Result<String, PgStreamError> {
         .join(", ");
 
     let sql = format!(
-        "SELECT __pgs_row_id, __pgs_action, {} FROM {}",
+        "SELECT __pgt_row_id, __pgt_action, {} FROM {}",
         expr_list, child_cte
     );
 
@@ -1163,13 +1163,13 @@ For inserts: keep those satisfying $P$. For deletes: keep those that *were* sati
 Simplified approach — apply the predicate to both inserts and deletes:
 
 ```rust
-fn diff_filter(&mut self, filter: &OpTree) -> Result<String, PgStreamError> {
+fn diff_filter(&mut self, filter: &OpTree) -> Result<String, PgTrickleError> {
     let OpTree::Filter { predicate, child } = filter else { unreachable!() };
     let child_cte = self.diff_node(child)?;
     let cte_name = self.next_cte_name();
 
     let sql = format!(
-        "SELECT __pgs_row_id, __pgs_action, * FROM {} WHERE {}",
+        "SELECT __pgt_row_id, __pgt_action, * FROM {} WHERE {}",
         child_cte, predicate.to_sql()
     );
 
@@ -1201,8 +1201,8 @@ Where:
 
 ```sql
 -- Part 1: delta_left JOIN current_right
-SELECT pg_stream.pg_stream_hash(dl.__pgs_row_id, r.<pk>) AS __pgs_row_id,
-       dl.__pgs_action,
+SELECT pg_trickle.pg_trickle_hash(dl.__pgt_row_id, r.<pk>) AS __pgt_row_id,
+       dl.__pgt_action,
        <output_cols>
 FROM <delta_left_cte> dl
 JOIN <right_table> r ON <join_condition>
@@ -1212,16 +1212,16 @@ UNION ALL
 -- Part 2: previous_left JOIN delta_right
 -- previous_left = current ST state for upstream STs,
 --                 or current table for base tables
-SELECT pg_stream.pg_stream_hash(l.<pk>, dr.__pgs_row_id) AS __pgs_row_id,
-       dr.__pgs_action,
+SELECT pg_trickle.pg_trickle_hash(l.<pk>, dr.__pgt_row_id) AS __pgt_row_id,
+       dr.__pgt_action,
        <output_cols>
 FROM <left_table_current> l
 JOIN <delta_right_cte> dr ON <join_condition>
 -- Exclude rows already counted in Part 1 (anti-join on left keys)
 WHERE NOT EXISTS (
     SELECT 1 FROM <delta_left_cte> dl2
-    WHERE dl2.__pgs_row_id = pg_stream.pg_stream_hash(l.<pk>)
-      AND dl2.__pgs_action = 'I'
+    WHERE dl2.__pgt_row_id = pg_trickle.pg_trickle_hash(l.<pk>)
+      AND dl2.__pgt_action = 'I'
 )
 ```
 
@@ -1237,52 +1237,52 @@ This is the most intricate operator. Uses auxiliary counters stored in the ST al
 
 | User aggregate | Auxiliary columns in ST | Maintenance logic |
 |---|---|---|
-| `COUNT(*)` | `__pgs_count` | `+= count_of_inserts - count_of_deletes` |
-| `COUNT(col)` | `__pgs_count`, `__pgs_count_nonnull` | Track total and non-null counts |
-| `SUM(col)` | `__pgs_count`, `__pgs_sum_col` | `sum += sum_of_inserts - sum_of_deletes` |
-| `AVG(col)` | `__pgs_count`, `__pgs_sum_col` | `avg = sum / count` |
-| `MIN(col)` | `__pgs_count`, `__pgs_min_col`, `__pgs_min_count` | If current min deleted & min_count reaches 0: RESCAN group |
-| `MAX(col)` | `__pgs_count`, `__pgs_max_col`, `__pgs_max_count` | If current max deleted & max_count reaches 0: RESCAN group |
+| `COUNT(*)` | `__pgt_count` | `+= count_of_inserts - count_of_deletes` |
+| `COUNT(col)` | `__pgt_count`, `__pgt_count_nonnull` | Track total and non-null counts |
+| `SUM(col)` | `__pgt_count`, `__pgt_sum_col` | `sum += sum_of_inserts - sum_of_deletes` |
+| `AVG(col)` | `__pgt_count`, `__pgt_sum_col` | `avg = sum / count` |
+| `MIN(col)` | `__pgt_count`, `__pgt_min_col`, `__pgt_min_count` | If current min deleted & min_count reaches 0: RESCAN group |
+| `MAX(col)` | `__pgt_count`, `__pgt_max_col`, `__pgt_max_count` | If current max deleted & max_count reaches 0: RESCAN group |
 
 **Generated delta SQL:**
 
 ```sql
 -- Compute per-group changes from the child delta
-__pgs_cte_agg_delta AS (
+__pgt_cte_agg_delta AS (
     SELECT
         <group_by_cols>,
-        SUM(CASE WHEN __pgs_action = 'I' THEN 1 ELSE 0 END) AS __ins_count,
-        SUM(CASE WHEN __pgs_action = 'D' THEN 1 ELSE 0 END) AS __del_count,
-        SUM(CASE WHEN __pgs_action = 'I' THEN <agg_col> ELSE 0 END) AS __ins_sum,
-        SUM(CASE WHEN __pgs_action = 'D' THEN <agg_col> ELSE 0 END) AS __del_sum
+        SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE 0 END) AS __ins_count,
+        SUM(CASE WHEN __pgt_action = 'D' THEN 1 ELSE 0 END) AS __del_count,
+        SUM(CASE WHEN __pgt_action = 'I' THEN <agg_col> ELSE 0 END) AS __ins_sum,
+        SUM(CASE WHEN __pgt_action = 'D' THEN <agg_col> ELSE 0 END) AS __del_sum
     FROM <child_delta_cte>
     GROUP BY <group_by_cols>
 ),
 
 -- Merge with existing ST state to classify actions
-__pgs_cte_agg_merge AS (
+__pgt_cte_agg_merge AS (
     SELECT
-        pg_stream.pg_stream_hash(<group_by_cols>) AS __pgs_row_id,
+        pg_trickle.pg_trickle_hash(<group_by_cols>) AS __pgt_row_id,
         <group_by_cols>,
 
         -- New auxiliary values
-        COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count
+        COALESCE(st.__pgt_count, 0) + d.__ins_count - d.__del_count
             AS new_count,
-        COALESCE(st.__pgs_sum_col, 0) + d.__ins_sum - d.__del_sum
+        COALESCE(st.__pgt_sum_col, 0) + d.__ins_sum - d.__del_sum
             AS new_sum,
 
         -- Determine action
         CASE
-            WHEN st.__pgs_count IS NULL AND (d.__ins_count - d.__del_count) > 0
+            WHEN st.__pgt_count IS NULL AND (d.__ins_count - d.__del_count) > 0
                 THEN 'I'   -- New group appears
-            WHEN COALESCE(st.__pgs_count, 0) + d.__ins_count - d.__del_count <= 0
+            WHEN COALESCE(st.__pgt_count, 0) + d.__ins_count - d.__del_count <= 0
                 THEN 'D'   -- Group vanishes
             ELSE 'U'       -- Group value changes (emit D+I pair)
-        END AS __pgs_meta_action,
+        END AS __pgt_meta_action,
 
-        st.__pgs_count AS old_count
+        st.__pgt_count AS old_count
 
-    FROM __pgs_cte_agg_delta d
+    FROM __pgt_cte_agg_delta d
     LEFT JOIN <st_table> st
         ON st.<group_key_1> = d.<group_key_1>
        AND st.<group_key_2> = d.<group_key_2>
@@ -1290,45 +1290,45 @@ __pgs_cte_agg_merge AS (
 ),
 
 -- Expand 'U' (update) into D+I pairs, emit final delta
-__pgs_cte_agg_final AS (
+__pgt_cte_agg_final AS (
     -- Inserts (new groups)
-    SELECT __pgs_row_id, 'I' AS __pgs_action,
+    SELECT __pgt_row_id, 'I' AS __pgt_action,
            <group_by_cols>,
-           new_count AS __pgs_count,
-           new_sum AS __pgs_sum_col,
+           new_count AS __pgt_count,
+           new_sum AS __pgt_sum_col,
            CASE WHEN new_count > 0 THEN new_sum::numeric / new_count ELSE NULL END AS avg_col
-    FROM __pgs_cte_agg_merge
-    WHERE __pgs_meta_action = 'I'
+    FROM __pgt_cte_agg_merge
+    WHERE __pgt_meta_action = 'I'
 
     UNION ALL
 
     -- Deletes (vanished groups)
-    SELECT __pgs_row_id, 'D' AS __pgs_action,
+    SELECT __pgt_row_id, 'D' AS __pgt_action,
            <group_by_cols>,
-           0 AS __pgs_count, 0 AS __pgs_sum_col, NULL AS avg_col
-    FROM __pgs_cte_agg_merge
-    WHERE __pgs_meta_action = 'D'
+           0 AS __pgt_count, 0 AS __pgt_sum_col, NULL AS avg_col
+    FROM __pgt_cte_agg_merge
+    WHERE __pgt_meta_action = 'D'
 
     UNION ALL
 
     -- Updates: emit delete of old row
-    SELECT __pgs_row_id, 'D' AS __pgs_action,
+    SELECT __pgt_row_id, 'D' AS __pgt_action,
            <group_by_cols>,
-           old_count AS __pgs_count,
-           NULL AS __pgs_sum_col, NULL AS avg_col
-    FROM __pgs_cte_agg_merge
-    WHERE __pgs_meta_action = 'U'
+           old_count AS __pgt_count,
+           NULL AS __pgt_sum_col, NULL AS avg_col
+    FROM __pgt_cte_agg_merge
+    WHERE __pgt_meta_action = 'U'
 
     UNION ALL
 
     -- Updates: emit insert of new row
-    SELECT __pgs_row_id, 'I' AS __pgs_action,
+    SELECT __pgt_row_id, 'I' AS __pgt_action,
            <group_by_cols>,
-           new_count AS __pgs_count,
-           new_sum AS __pgs_sum_col,
+           new_count AS __pgt_count,
+           new_sum AS __pgt_sum_col,
            CASE WHEN new_count > 0 THEN new_sum::numeric / new_count ELSE NULL END AS avg_col
-    FROM __pgs_cte_agg_merge
-    WHERE __pgs_meta_action = 'U'
+    FROM __pgt_cte_agg_merge
+    WHERE __pgt_meta_action = 'U'
 )
 ```
 
@@ -1346,7 +1346,7 @@ This is the same approach used by pg_ivm. It degrades to a per-group full recomp
 DISTINCT is modeled as `GROUP BY ALL` with `COUNT(*)`:
 
 ```rust
-fn diff_distinct(&mut self, distinct: &OpTree) -> Result<String, PgStreamError> {
+fn diff_distinct(&mut self, distinct: &OpTree) -> Result<String, PgTrickleError> {
     let OpTree::Distinct { child } = distinct else { unreachable!() };
 
     // Rewrite DISTINCT as: Aggregate(group_by=all_cols, agg=[COUNT(*)], child)
@@ -1356,19 +1356,19 @@ fn diff_distinct(&mut self, distinct: &OpTree) -> Result<String, PgStreamError> 
 }
 ```
 
-The ST storage table includes a `__pgs_count` column tracking multiplicity. Rows only appear/disappear when count crosses the 0 boundary.
+The ST storage table includes a `__pgt_count` column tracking multiplicity. Rows only appear/disappear when count crosses the 0 boundary.
 
 ### Step 6.10 — Change consolidation
 
-After the full delta is computed, ensure at most one row per `(__pgs_row_id, __pgs_action)` pair:
+After the full delta is computed, ensure at most one row per `(__pgt_row_id, __pgt_action)` pair:
 
 ```sql
 -- Final consolidation (can be skipped for insert-only optimized paths)
-SELECT __pgs_row_id, __pgs_action, <cols>
+SELECT __pgt_row_id, __pgt_action, <cols>
 FROM (
     SELECT *, ROW_NUMBER() OVER (
-        PARTITION BY __pgs_row_id, __pgs_action
-        ORDER BY __pgs_row_id -- deterministic tie-breaking
+        PARTITION BY __pgt_row_id, __pgt_action
+        ORDER BY __pgt_row_id -- deterministic tie-breaking
     ) AS __rn
     FROM <final_delta_cte>
 ) sub
@@ -1400,7 +1400,7 @@ UNION ALL
 -- Rows in Q that gained their first match in R → DELETE the NULL-padded row
 ```
 
-This requires tracking whether each left row has any match in R. Use a count: `__pgs_match_count`. When it transitions 0→1 (first match appears), delete the NULL-padded row. When 1→0 (last match disappears), insert the NULL-padded row.
+This requires tracking whether each left row has any match in R. Use a count: `__pgt_match_count`. When it transitions 0→1 (first match appears), delete the NULL-padded row. When 1→0 (last match disappears), insert the NULL-padded row.
 
 #### UNION ALL differentiation (`dvm/operators/union_all.rs`)
 
@@ -1409,12 +1409,12 @@ $$\Delta_I(Q_1 \cup Q_2) = \Delta_I(Q_1) \cup \Delta_I(Q_2)$$
 Straightforward — just UNION ALL the deltas of each child, prefixing row IDs with a child index to prevent collisions:
 
 ```sql
-SELECT pg_stream.pg_stream_hash(1, __pgs_row_id) AS __pgs_row_id,
-       __pgs_action, <cols>
+SELECT pg_trickle.pg_trickle_hash(1, __pgt_row_id) AS __pgt_row_id,
+       __pgt_action, <cols>
 FROM <delta_child_1>
 UNION ALL
-SELECT pg_stream.pg_stream_hash(2, __pgs_row_id) AS __pgs_row_id,
-       __pgs_action, <cols>
+SELECT pg_trickle.pg_trickle_hash(2, __pgt_row_id) AS __pgt_row_id,
+       __pgt_action, <cols>
 FROM <delta_child_2>
 ```
 
@@ -1426,37 +1426,37 @@ Approach: recompute the window function for all partitions that have *any* chang
 
 ```sql
 -- Step 1: Find changed partition keys
-__pgs_changed_partitions AS (
+__pgt_changed_partitions AS (
     SELECT DISTINCT <partition_by_cols>
     FROM <child_delta_cte>
 ),
 
 -- Step 2: Delete old window results for changed partitions
 -- (emit as 'D' actions)
-__pgs_window_deletes AS (
-    SELECT st.__pgs_row_id, 'D' AS __pgs_action, <cols>
+__pgt_window_deletes AS (
+    SELECT st.__pgt_row_id, 'D' AS __pgt_action, <cols>
     FROM <st_table> st
-    SEMI JOIN __pgs_changed_partitions cp
+    SEMI JOIN __pgt_changed_partitions cp
         ON st.<pk1> = cp.<pk1> AND ...
 ),
 
 -- Step 3: Recompute window function for changed partitions
 -- using current (post-refresh) source data
-__pgs_window_inserts AS (
-    SELECT pg_stream.pg_stream_hash(<pk_cols>) AS __pgs_row_id,
-           'I' AS __pgs_action,
+__pgt_window_inserts AS (
+    SELECT pg_trickle.pg_trickle_hash(<pk_cols>) AS __pgt_row_id,
+           'I' AS __pgt_action,
            <cols>,
            <window_function> OVER (PARTITION BY <pk> ORDER BY <ok>) AS <wf_col>
     FROM <source_table_current> src
-    SEMI JOIN __pgs_changed_partitions cp
+    SEMI JOIN __pgt_changed_partitions cp
         ON src.<pk1> = cp.<pk1> AND ...
 ),
 
 -- Step 4: Combine
-__pgs_window_delta AS (
-    SELECT * FROM __pgs_window_deletes
+__pgt_window_delta AS (
+    SELECT * FROM __pgt_window_deletes
     UNION ALL
-    SELECT * FROM __pgs_window_inserts
+    SELECT * FROM __pgt_window_inserts
 )
 ```
 
@@ -1472,14 +1472,14 @@ Create event triggers via `extension_sql!()`:
 
 ```sql
 -- Track DDL changes that may affect STs
-CREATE OR REPLACE FUNCTION pg_stream._on_ddl_end()
+CREATE OR REPLACE FUNCTION pg_trickle._on_ddl_end()
 RETURNS event_trigger
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'pg_stream_on_ddl_end_wrapper';
+AS 'MODULE_PATHNAME', 'pg_trickle_on_ddl_end_wrapper';
 
-CREATE EVENT TRIGGER pg_stream_ddl_tracker
+CREATE EVENT TRIGGER pg_trickle_ddl_tracker
 ON ddl_command_end
-EXECUTE FUNCTION pg_stream._on_ddl_end();
+EXECUTE FUNCTION pg_trickle._on_ddl_end();
 ```
 
 The Rust implementation (`#[pg_guard]` function called via a thin C wrapper):
@@ -1502,7 +1502,7 @@ fn handle_ddl_end() {
         // Check if this object is an upstream dependency of any ST
         let affected_sts = Spi::connect(|client| {
             client.select(
-                "SELECT pgs_id FROM pg_stream.pgs_dependencies WHERE source_relid = $1",
+                "SELECT pgt_id FROM pg_trickle.pgt_dependencies WHERE source_relid = $1",
                 None, Some(vec![(PgBuiltInOids::OIDOID.oid(), objid.into_datum())])
             )
         });
@@ -1513,16 +1513,16 @@ fn handle_ddl_end() {
             "ALTER TABLE" => {
                 // Mark affected STs for REINITIALIZE
                 for st in affected_sts {
-                    mark_for_reinitialize(st.pgs_id);
+                    mark_for_reinitialize(st.pgt_id);
                     log!(INFO, "ST {} marked for reinitialize due to ALTER TABLE on {}",
-                         st.pgs_id, objid);
+                         st.pgt_id, objid);
                 }
             }
             "DROP TABLE" => {
                 // Mark affected STs as ERROR
                 for st in affected_sts {
-                    set_pgs_status(st.pgs_id, StStatus::Error);
-                    log!(WARNING, "ST {} error: upstream table {} dropped", st.pgs_id, objid);
+                    set_pgt_status(st.pgt_id, StStatus::Error);
+                    log!(WARNING, "ST {} error: upstream table {} dropped", st.pgt_id, objid);
                 }
             }
             _ => {}
@@ -1541,12 +1541,12 @@ static mut PREV_OBJECT_ACCESS_HOOK: Option<pg_sys::object_access_hook_type> = No
 pub fn register_object_access_hook() {
     unsafe {
         PREV_OBJECT_ACCESS_HOOK = pg_sys::object_access_hook;
-        pg_sys::object_access_hook = Some(pg_stream_object_access_hook);
+        pg_sys::object_access_hook = Some(pg_trickle_object_access_hook);
     }
 }
 
 #[pg_guard]
-extern "C-unwind" fn pg_stream_object_access_hook(
+extern "C-unwind" fn pg_trickle_object_access_hook(
     access: pg_sys::ObjectAccessType,
     class_id: pg_sys::Oid,
     object_id: pg_sys::Oid,
@@ -1566,7 +1566,7 @@ extern "C-unwind" fn pg_stream_object_access_hook(
         // Check if this OID is a ST storage table
         let is_st = Spi::connect(|client| {
             client.select(
-                "SELECT 1 FROM pg_stream.pgs_stream_tables WHERE pgs_relid = $1",
+                "SELECT 1 FROM pg_trickle.pgt_stream_tables WHERE pgt_relid = $1",
                 None, Some(vec![(PgBuiltInOids::OIDOID.oid(), object_id.into_datum())])
             ).len() > 0
         });
@@ -1574,10 +1574,10 @@ extern "C-unwind" fn pg_stream_object_access_hook(
         if is_st {
             // Clean up catalog entries
             Spi::run_with_args(
-                "DELETE FROM pg_stream.pgs_stream_tables WHERE pgs_relid = $1",
+                "DELETE FROM pg_trickle.pgt_stream_tables WHERE pgt_relid = $1",
                 Some(vec![(PgBuiltInOids::OIDOID.oid(), object_id.into_datum())])
             );
-            // Cascade deletes will clean up pgs_dependencies
+            // Cascade deletes will clean up pgt_dependencies
             // Signal scheduler to rebuild DAG
             DAG_REBUILD_SIGNAL.fetch_add(1, Ordering::Relaxed);
         }
@@ -1587,7 +1587,7 @@ extern "C-unwind" fn pg_stream_object_access_hook(
 
 ### Step 7.3 — `mark_for_reinitialize` mechanism
 
-Add a column `needs_reinit BOOLEAN DEFAULT FALSE` to `pg_stream.pgs_stream_tables` (or use the separate `status` field). When the event trigger detects an upstream schema change:
+Add a column `needs_reinit BOOLEAN DEFAULT FALSE` to `pg_trickle.pgt_stream_tables` (or use the separate `status` field). When the event trigger detects an upstream schema change:
 
 1. Set `needs_reinit = true` on affected STs.
 2. On next scheduler cycle, the refresh executor checks this flag.
@@ -1614,7 +1614,7 @@ pub struct SourceVersion {
 }
 ```
 
-Stored as JSONB in `pg_stream.pgs_stream_tables.frontier`:
+Stored as JSONB in `pg_trickle.pgt_stream_tables.frontier`:
 
 ```json
 {
@@ -1694,15 +1694,15 @@ Track per-ST:
 Expose via a view:
 
 ```sql
-CREATE VIEW pg_stream.pg_stat_stream_tables AS
-SELECT st.pgs_name, st.pgs_schema,
+CREATE VIEW pg_trickle.pg_stat_stream_tables AS
+SELECT st.pgt_name, st.pgt_schema,
        -- stats from custom cumulative statistics
        s.refresh_count, s.total_refresh_duration_ms,
        s.rows_inserted_total, s.rows_deleted_total,
        s.skip_count, s.error_count,
        s.last_lag_ms, s.max_lag_ms
-FROM pg_stream.pgs_stream_tables st
-JOIN pg_stream._get_stats() s ON s.pgs_id = st.pgs_id;
+FROM pg_trickle.pgt_stream_tables st
+JOIN pg_trickle._get_stats() s ON s.pgt_id = st.pgt_id;
 ```
 
 ### Step 9.2 — Custom EXPLAIN option (PG 18)
@@ -1730,9 +1730,9 @@ fn emit_alert(channel: &str, payload: &str) {
 }
 
 // Usage:
-emit_alert("pg_stream_alert", &format!(
+emit_alert("pg_trickle_alert", &format!(
     "{{\"event\": \"lag_exceeded\", \"st\": \"{}\", \"lag_seconds\": {}}}",
-    st.pgs_name, current_lag_secs
+    st.pgt_name, current_lag_secs
 ));
 ```
 
@@ -1742,7 +1742,7 @@ Alert events:
 - `reinitialize_needed` — Upstream DDL change detected
 - `buffer_lag_warning` — Change buffer table row count growing large (>1M pending changes)
 
-Users can `LISTEN pg_stream_alert;` for integration with monitoring/alerting systems.
+Users can `LISTEN pg_trickle_alert;` for integration with monitoring/alerting systems.
 
 ---
 
@@ -1751,7 +1751,7 @@ Users can `LISTEN pg_stream_alert;` for integration with monitoring/alerting sys
 ### Step 10.1 — Error classification
 
 ```rust
-pub enum PgStreamError {
+pub enum PgTrickleError {
     // User errors — fail, don't retry
     QueryParseError(String),
     DivisionByZero(String),
@@ -1777,20 +1777,20 @@ pub enum PgStreamError {
 ### Step 10.2 — Auto-suspend
 
 ```rust
-fn handle_refresh_failure(st: &StreamTableMeta, error: &PgStreamError) {
-    let new_error_count = StreamTableMeta::increment_errors(st.pgs_id).unwrap();
+fn handle_refresh_failure(st: &StreamTableMeta, error: &PgTrickleError) {
+    let new_error_count = StreamTableMeta::increment_errors(st.pgt_id).unwrap();
 
-    insert_refresh_history(st.pgs_id, target_ts, action, "FAILED",
+    insert_refresh_history(st.pgt_id, target_ts, action, "FAILED",
                           0, 0, Some(error.to_string()));
 
-    if new_error_count >= pg_stream_max_consecutive_errors() {
-        StreamTableMeta::update_status(st.pgs_id, StStatus::Suspended);
-        emit_alert("pg_stream_alert", &format!(
+    if new_error_count >= pg_trickle_max_consecutive_errors() {
+        StreamTableMeta::update_status(st.pgt_id, StStatus::Suspended);
+        emit_alert("pg_trickle_alert", &format!(
             "{{\"event\": \"auto_suspended\", \"st\": \"{}\", \"errors\": {}, \"last_error\": \"{}\"}}",
-            st.pgs_name, new_error_count, error
+            st.pgt_name, new_error_count, error
         ));
         log!(WARNING, "ST {} auto-suspended after {} consecutive errors: {}",
-             st.pgs_name, new_error_count, error);
+             st.pgt_name, new_error_count, error);
     }
 }
 ```
@@ -1801,17 +1801,17 @@ fn handle_refresh_failure(st: &StreamTableMeta, error: &PgStreamError) {
 fn check_skip_needed(st: &StreamTableMeta) -> bool {
     // Try to acquire advisory lock (non-blocking)
     let locked = Spi::get_one::<bool>(
-        &format!("SELECT pg_try_advisory_lock({})", st.pgs_relid as i64)
+        &format!("SELECT pg_try_advisory_lock({})", st.pgt_relid as i64)
     ).unwrap_or(false);
 
     if locked {
         // We got the lock — release it, no skip needed
-        Spi::run(&format!("SELECT pg_advisory_unlock({})", st.pgs_relid as i64));
+        Spi::run(&format!("SELECT pg_advisory_unlock({})", st.pgt_relid as i64));
         false
     } else {
         // Another refresh is in progress — skip this one
-        insert_refresh_history(st.pgs_id, target_ts, "SKIP", "SKIPPED", 0, 0, None);
-        log!(INFO, "ST {} refresh skipped — previous refresh still in progress", st.pgs_name);
+        insert_refresh_history(st.pgt_id, target_ts, "SKIP", "SKIPPED", 0, 0, None);
+        log!(INFO, "ST {} refresh skipped — previous refresh still in progress", st.pgt_name);
         true
     }
 }
@@ -1828,7 +1828,7 @@ fn recover_from_crash() {
     // Any RUNNING refresh records indicate interrupted transactions
     // PostgreSQL would have rolled them back automatically
     Spi::run(
-        "UPDATE pg_stream.pgs_refresh_history SET status = 'FAILED',
+        "UPDATE pg_trickle.pgt_refresh_history SET status = 'FAILED',
          error_message = 'Interrupted by scheduler restart',
          end_time = now()
          WHERE status = 'RUNNING'"
@@ -1864,7 +1864,7 @@ Run against a live PostgreSQL 18 instance via pgrx:
 fn test_create_and_query_simple_st() {
     Spi::run("CREATE TABLE orders (id INT PRIMARY KEY, amount NUMERIC)");
     Spi::run("INSERT INTO orders VALUES (1, 100), (2, 200)");
-    Spi::run("SELECT pg_stream.create_stream_table(
+    Spi::run("SELECT pg_trickle.create_stream_table(
         'order_totals',
         'SELECT id, amount FROM orders',
         '1m',
@@ -1988,13 +1988,13 @@ Metrics to capture:
 |---|---|
 | `README.md` | Project overview, features, quick start guide |
 | `INSTALL.md` | Prerequisites (PG 18.x, Rust 1.82+, pgrx 0.17.x), build steps, postgresql.conf settings |
-| `docs/SQL_REFERENCE.md` | All `pg_stream.*` functions with signatures, parameters, return types, examples |
+| `docs/SQL_REFERENCE.md` | All `pg_trickle.*` functions with signatures, parameters, return types, examples |
 | `docs/ARCHITECTURE.md` | Component diagram, data flow, DVS explanation, scheduling algorithm |
 | `docs/DVM_OPERATORS.md` | Supported operators, differentiation rules, limitations, Phase 1 vs Phase 2 |
 | `docs/CONFIGURATION.md` | All GUC variables with defaults, descriptions, tuning guidance |
 | `LICENSE` | Apache 2.0 or PostgreSQL License |
 | `Cargo.toml` | pgrx 0.17.x, xxhash-rust, serde/serde_json (for Frontier JSONB), proptest (dev) |
-| `pg_stream.control` | Extension control file for PostgreSQL |
+| `pg_trickle.control` | Extension control file for PostgreSQL |
 
 ### Step 12.2 — Build and install
 
@@ -2005,7 +2005,7 @@ cargo pgrx install --release --pg-config /path/to/pg18/bin/pg_config
 ### Step 12.3 — Required postgresql.conf
 
 ```ini
-shared_preload_libraries = 'pg_stream'
+shared_preload_libraries = 'pg_trickle'
 max_worker_processes = 8     # Must include scheduler + refresh workers
 
 # Note: wal_level = logical is NOT required for trigger-based CDC (current implementation).
@@ -2028,7 +2028,7 @@ max_worker_processes = 8     # Must include scheduler + refresh workers
 
 6. **Crash safety:** After scheduler crash and restart, all STs resume normal operation with no data corruption. Verified by kill-and-recover tests.
 
-7. **Cycle rejection:** `pg_stream.create_stream_table()` rejects queries that would create cycles in the dependency graph.
+7. **Cycle rejection:** `pg_trickle.create_stream_table()` rejects queries that would create cycles in the dependency graph.
 
 8. **Schema evolution:** Upstream DDL changes (ALTER TABLE, DROP TABLE) are detected and handled gracefully (reinitialize or error with diagnostic).
 
@@ -2039,11 +2039,11 @@ max_worker_processes = 8     # Must include scheduler + refresh workers
 | Decision | Choice | Rationale | Trade-off |
 |---|---|---|---|
 | **CDC mechanism** | Row-level triggers (PL/pgSQL) | Single-transaction create API, no `wal_level=logical` requirement, simple lifecycle, immediate change visibility | Per-row trigger overhead (mitigated for <1K writes/sec); future migration path to logical replication for high-throughput |
-| **DDL syntax** | SQL functions (`pg_stream.create_stream_table(...)`) | Works without parser modifications, clean extension boundary, idiomatic PostgreSQL extension pattern | Less "native" feel than `CREATE STREAM TABLE` syntax |
+| **DDL syntax** | SQL functions (`pg_trickle.create_stream_table(...)`) | Works without parser modifications, clean extension boundary, idiomatic PostgreSQL extension pattern | Less "native" feel than `CREATE STREAM TABLE` syntax |
 | **Target PostgreSQL** | PG 18 only | Leverages custom cumulative statistics, custom EXPLAIN options, DSM improvements, improved logical replication | Narrows user base to PG 18+ |
 | **IVM scope** | Phased — Phase 1 (project, filter, inner join, GROUP BY aggregates, DISTINCT) then Phase 2 (outer joins, UNION ALL, window functions) | Phase 1 covers ~80% of real queries; Phase 2 operators are significantly more complex | Phase 1-only users miss outer joins and window functions |
 | **Row IDs** | 64-bit xxHash stored as `BIGINT` | Fast computation, compact storage (8 bytes), sufficient collision resistance for practical datasets | Theoretical collision risk (1 in 2⁶⁴); trade vs. UUID (16 bytes, zero collision) |
 | **Scheduling heuristic** | Canonical periods of 48·2ⁿ seconds | Guarantees timestamp alignment across STs with different target lags | Refresh period may be much smaller than target lag |
 | **Change storage** | Buffer tables (not in-memory) | Durable across crashes, queryable for debugging, supports arbitrary-size change sets | Extra I/O; mitigated by aggressive cleanup and auto-vacuum |
 | **Aggregate maintenance** | Auxiliary counter columns (like pg_ivm) | Well-understood approach, correct for COUNT/SUM/AVG; MIN/MAX degrade gracefully | Hidden columns increase storage; MIN/MAX may require rescan |
-| **Replication origin** | `pg_stream_refresh` origin to prevent feedback loops | Standard PostgreSQL mechanism, reliable filtering | Requires origin tracking overhead |
+| **Replication origin** | `pg_trickle_refresh` origin to prevent feedback loops | Standard PostgreSQL mechanism, reliable filtering | Requires origin tracking overhead |

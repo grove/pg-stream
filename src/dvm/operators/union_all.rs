@@ -7,18 +7,18 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a UnionAll node.
-pub fn diff_union_all(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgStreamError> {
+pub fn diff_union_all(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::UnionAll { children } = op else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_union_all called on non-UnionAll node".into(),
         ));
     };
 
     if children.is_empty() {
-        return Err(PgStreamError::QueryParseError(
+        return Err(PgTrickleError::QueryParseError(
             "UNION ALL with no children".into(),
         ));
     }
@@ -42,9 +42,9 @@ pub fn diff_union_all(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .enumerate()
         .map(|(i, result)| {
             format!(
-                "SELECT pgstream.pg_stream_hash_multi(ARRAY['{idx}'::TEXT, __pgs_row_id::TEXT]) \
-                 AS __pgs_row_id,\n\
-                 __pgs_action, {col_list}\n\
+                "SELECT pgtrickle.pg_trickle_hash_multi(ARRAY['{idx}'::TEXT, __pgt_row_id::TEXT]) \
+                 AS __pgt_row_id,\n\
+                 __pgt_action, {col_list}\n\
                  FROM {cte}",
                 idx = i + 1,
                 cte = result.cte_name,
@@ -79,7 +79,7 @@ mod tests {
         assert_eq!(result.columns, vec!["id", "val"]);
         assert_sql_contains(&sql, "UNION ALL");
         // Each child gets a prefixed row_id
-        assert_sql_contains(&sql, "pgstream.pg_stream_hash_multi");
+        assert_sql_contains(&sql, "pgtrickle.pg_trickle_hash_multi");
     }
 
     #[test]

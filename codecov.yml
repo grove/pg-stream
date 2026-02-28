@@ -1,7 +1,7 @@
 # Codecov configuration
 # https://docs.codecov.com/docs/codecov-yaml
 #
-# pg_stream is a pgrx extension. Functions annotated #[pg_extern] and all SPI/
+# pg_trickle is a pgrx extension. Functions annotated #[pg_extern] and all SPI/
 # trigger/WAL/background-worker code execute inside the PostgreSQL server
 # process and cannot be instrumented by cargo-llvm-cov. Coverage is collected
 # from unit tests only (src/dvm/**, src/dag.rs, src/hash.rs, etc.).

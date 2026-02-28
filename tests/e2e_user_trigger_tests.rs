@@ -438,7 +438,7 @@ async fn test_guc_off_suppresses_triggers() {
     db.execute("TRUNCATE audit_log").await;
 
     // Set GUC to 'off' — should suppress triggers (use MERGE path)
-    db.execute("SET pg_stream.user_triggers = 'off'").await;
+    db.execute("SET pg_trickle.user_triggers = 'off'").await;
 
     // Modify source and refresh
     db.execute("INSERT INTO src_guc_off VALUES (2, 'b')").await;
@@ -479,7 +479,7 @@ async fn test_guc_auto_detects_triggers() {
     db.refresh_st("st_guc_auto").await;
 
     // GUC should default to 'auto'
-    let guc_val: String = db.query_scalar("SHOW pg_stream.user_triggers").await;
+    let guc_val: String = db.query_scalar("SHOW pg_trickle.user_triggers").await;
     assert_eq!(guc_val, "auto", "Default GUC should be 'auto'");
 
     // Attach trigger — auto mode should detect it

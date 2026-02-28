@@ -31,7 +31,7 @@ async fn test_concurrent_inserts_during_refresh() {
         .await;
 
     let refresh_handle = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('cc_st')")
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('cc_st')")
             .execute(&pool_refresh)
             .await
     });
@@ -79,7 +79,7 @@ async fn test_create_two_sts_simultaneously() {
 
     let h1 = tokio::spawn(async move {
         sqlx::query(
-            "SELECT pgstream.create_stream_table('cc_st_a', \
+            "SELECT pgtrickle.create_stream_table('cc_st_a', \
              $$ SELECT id, val FROM cc_src_a $$, '1m', 'FULL')",
         )
         .execute(&pool_a)
@@ -88,7 +88,7 @@ async fn test_create_two_sts_simultaneously() {
 
     let h2 = tokio::spawn(async move {
         sqlx::query(
-            "SELECT pgstream.create_stream_table('cc_st_b', \
+            "SELECT pgtrickle.create_stream_table('cc_st_b', \
              $$ SELECT id, val FROM cc_src_b $$, '1m', 'FULL')",
         )
         .execute(&pool_b)
@@ -129,7 +129,7 @@ async fn test_refresh_and_drop_race() {
     let pool_drop = db.pool.clone();
 
     let h_refresh = tokio::spawn(async move {
-        sqlx::query("SELECT pgstream.refresh_stream_table('cc_race_st')")
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('cc_race_st')")
             .execute(&pool_refresh)
             .await
     });
@@ -137,7 +137,7 @@ async fn test_refresh_and_drop_race() {
     let h_drop = tokio::spawn(async move {
         // Slight delay to let refresh start
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        sqlx::query("SELECT pgstream.drop_stream_table('cc_race_st')")
+        sqlx::query("SELECT pgtrickle.drop_stream_table('cc_race_st')")
             .execute(&pool_drop)
             .await
     });
@@ -157,7 +157,7 @@ async fn test_refresh_and_drop_race() {
     if drop_ok {
         let exists: bool = db
             .query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pgstream.pgs_stream_tables WHERE pgs_name = 'cc_race_st')",
+                "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'cc_race_st')",
             )
             .await;
         // It might or might not exist depending on ordering

@@ -1,12 +1,12 @@
 //! Refresh executor — handles full, differential, and reinitialize refreshes.
 //!
 //! The executor is called by the scheduler for automated refreshes and by
-//! `pgstream.refresh_stream_table()` for manual refreshes.
+//! `pgtrickle.refresh_stream_table()` for manual refreshes.
 //!
 //! ## Delta SQL Caching
 //!
 //! The differential refresh path caches the delta SQL template and MERGE
-//! SQL template per `pgs_id` in thread-local storage. On subsequent
+//! SQL template per `pgt_id` in thread-local storage. On subsequent
 //! refreshes, the cached templates are resolved with actual frontier LSN
 //! values — skipping SQL parsing, DVM differentiation, and MERGE SQL
 //! string formatting. This eliminates ~45ms of overhead per refresh
@@ -21,7 +21,7 @@ use std::time::Instant;
 use crate::catalog::{StDependency, StreamTableMeta};
 use crate::dag::RefreshMode;
 use crate::dvm;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 use crate::version::Frontier;
 
 // ── MERGE SQL template cache ────────────────────────────────────────
@@ -49,7 +49,7 @@ struct CachedMergeTemplate {
     cleanup_sql_template: String,
 
     // ── User-trigger explicit DML templates ──────────────────────────
-    // These templates reference `__pgs_delta_{pgs_id}` (a temp table
+    // These templates reference `__pgt_delta_{pgt_id}` (a temp table
     // materialized at execution time) and do NOT contain LSN placeholders.
     /// DELETE statement for the trigger-enabled DML path.
     /// Deletes rows where the delta action is 'D'.
@@ -66,7 +66,7 @@ struct CachedMergeTemplate {
 }
 
 thread_local! {
-    /// Per-session cache of MERGE SQL templates, keyed by `pgs_id`.
+    /// Per-session cache of MERGE SQL templates, keyed by `pgt_id`.
     ///
     /// Cross-session invalidation (G8.1): flushed when the shared
     /// `CACHE_GENERATION` counter advances.
@@ -80,7 +80,7 @@ thread_local! {
 // ── D-2: Prepared statement tracking ────────────────────────────────
 
 thread_local! {
-    /// Tracks which `pgs_id`s have a SQL `PREPARE`d MERGE statement
+    /// Tracks which `pgt_id`s have a SQL `PREPARE`d MERGE statement
     /// in the current session.  Used by the prepared-statement path
     /// to skip re-issuing `PREPARE` on cache-hit refreshes.
     static PREPARED_MERGE_STMTS: RefCell<HashSet<i64>> =
@@ -145,7 +145,7 @@ fn drain_pending_cleanups() {
         }
     }
 
-    let use_truncate = crate::config::pg_stream_cleanup_use_truncate();
+    let use_truncate = crate::config::pg_trickle_cleanup_use_truncate();
 
     for oid in all_oids {
         // Check that the change buffer table still exists before
@@ -167,7 +167,7 @@ fn drain_pending_cleanups() {
 
         if !table_exists {
             pgrx::debug1!(
-                "[pg_stream] Deferred cleanup: skipping changes_{} (table dropped)",
+                "[pg_trickle] Deferred cleanup: skipping changes_{} (table dropped)",
                 oid,
             );
             continue;
@@ -183,8 +183,8 @@ fn drain_pending_cleanups() {
         // refresh first and won't read from the change buffer.
         let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
             "SELECT MIN((st.frontier->'sources'->'{oid}'->>'lsn')::pg_lsn)::TEXT \
-             FROM pgstream.pgs_stream_tables st \
-             JOIN pgstream.pgs_dependencies dep ON dep.pgs_id = st.pgs_id \
+             FROM pgtrickle.pgt_stream_tables st \
+             JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
              WHERE dep.source_relid = {oid} \
                AND dep.source_type = 'TABLE' \
                AND st.frontier IS NOT NULL \
@@ -197,7 +197,7 @@ fn drain_pending_cleanups() {
             _ => {
                 // No consumers with a frontier, or all at 0/0 — nothing to clean.
                 pgrx::debug1!(
-                    "[pg_stream] Deferred cleanup: no safe threshold for changes_{}, skipping",
+                    "[pg_trickle] Deferred cleanup: no safe threshold for changes_{}, skipping",
                     oid,
                 );
                 continue;
@@ -225,7 +225,7 @@ fn drain_pending_cleanups() {
                 "TRUNCATE \"{schema}\".changes_{oid}",
                 schema = change_schema,
             )) {
-                pgrx::debug1!("[pg_stream] Deferred cleanup TRUNCATE failed: {}", e);
+                pgrx::debug1!("[pg_trickle] Deferred cleanup TRUNCATE failed: {}", e);
             }
         } else {
             let delete_sql = format!(
@@ -234,7 +234,7 @@ fn drain_pending_cleanups() {
                 schema = change_schema,
             );
             if let Err(e) = Spi::run(&delete_sql) {
-                pgrx::debug1!("[pg_stream] Deferred cleanup DELETE failed: {}", e);
+                pgrx::debug1!("[pg_trickle] Deferred cleanup DELETE failed: {}", e);
             }
         }
     }
@@ -275,7 +275,7 @@ const PLANNER_HINT_WORKMEM_THRESHOLD: i64 = 10_000;
 /// `SET LOCAL` is automatically reset at the end of the current transaction,
 /// so these hints cannot leak to other queries.
 fn apply_planner_hints(estimated_delta: i64) {
-    if !crate::config::pg_stream_merge_planner_hints() {
+    if !crate::config::pg_trickle_merge_planner_hints() {
         return;
     }
 
@@ -283,19 +283,19 @@ fn apply_planner_hints(estimated_delta: i64) {
         // Large delta: disable nested loops AND raise work_mem for hash joins
         if let Err(e) = Spi::run("SET LOCAL enable_nestloop = off") {
             pgrx::debug1!(
-                "[pg_stream] D-1: failed to SET LOCAL enable_nestloop: {}",
+                "[pg_trickle] D-1: failed to SET LOCAL enable_nestloop: {}",
                 e
             );
         }
-        let mb = crate::config::pg_stream_merge_work_mem_mb();
+        let mb = crate::config::pg_trickle_merge_work_mem_mb();
         if let Err(e) = Spi::run(&format!("SET LOCAL work_mem = '{mb}MB'")) {
-            pgrx::debug1!("[pg_stream] D-1: failed to SET LOCAL work_mem: {}", e);
+            pgrx::debug1!("[pg_trickle] D-1: failed to SET LOCAL work_mem: {}", e);
         }
     } else if estimated_delta >= PLANNER_HINT_NESTLOOP_THRESHOLD {
         // Medium delta: just disable nested loops
         if let Err(e) = Spi::run("SET LOCAL enable_nestloop = off") {
             pgrx::debug1!(
-                "[pg_stream] D-1: failed to SET LOCAL enable_nestloop: {}",
+                "[pg_trickle] D-1: failed to SET LOCAL enable_nestloop: {}",
                 e
             );
         }
@@ -367,17 +367,17 @@ fn build_execute_params(
 }
 
 /// Invalidate the MERGE template cache for a ST (call on DDL changes).
-pub fn invalidate_merge_cache(pgs_id: i64) {
+pub fn invalidate_merge_cache(pgt_id: i64) {
     MERGE_TEMPLATE_CACHE.with(|cache| {
-        cache.borrow_mut().remove(&pgs_id);
+        cache.borrow_mut().remove(&pgt_id);
     });
     // D-2: Also deallocate any prepared statement for this ST.
-    if PREPARED_MERGE_STMTS.with(|s| s.borrow_mut().remove(&pgs_id)) {
+    if PREPARED_MERGE_STMTS.with(|s| s.borrow_mut().remove(&pgt_id)) {
         // Guard SPI call so unit tests (which run outside PG) don't
         // force the linker to resolve pg_sys symbols at load time.
         #[cfg(not(test))]
         {
-            let stmt = format!("__pgs_merge_{pgs_id}");
+            let stmt = format!("__pgt_merge_{pgt_id}");
             // Note: DEALLOCATE does not support IF EXISTS in PostgreSQL.
             // Check pg_prepared_statements first to avoid an error.
             let exists = Spi::get_one::<bool>(&format!(
@@ -404,14 +404,14 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     use crate::version::Frontier;
     use std::hash::{Hash, Hasher};
 
-    let schema = &st.pgs_schema;
-    let name = &st.pgs_name;
+    let schema = &st.pgt_schema;
+    let name = &st.pgt_name;
 
     // Use dummy frontiers — placeholders will be embedded in the template
     let dummy = Frontier::new();
 
     let delta_result = match dvm::generate_delta_query_cached(
-        st.pgs_id,
+        st.pgt_id,
         &st.defining_query,
         &dummy,
         &dummy,
@@ -421,7 +421,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
         Ok(r) => r,
         Err(e) => {
             pgrx::log!(
-                "pg_stream: cache pre-warm skipped for {}.{}: {}",
+                "pg_trickle: cache pre-warm skipped for {}.{}: {}",
                 schema,
                 name,
                 e
@@ -463,7 +463,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
         .join(", ");
 
     let delta_sql_template =
-        dvm::get_delta_sql_template(st.pgs_id).unwrap_or(delta_result.delta_sql);
+        dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_result.delta_sql);
 
     // Build the USING clause — skip DISTINCT ON when the delta is already
     // deduplicated (G-M1 optimization for scan-chain queries).
@@ -471,9 +471,9 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
         format!("({delta_sql_template})")
     } else {
         format!(
-            "(SELECT DISTINCT ON (__pgs_row_id) * \
+            "(SELECT DISTINCT ON (__pgt_row_id) * \
              FROM ({delta_sql_template}) __raw \
-             ORDER BY __pgs_row_id, __pgs_action DESC)"
+             ORDER BY __pgt_row_id, __pgt_action DESC)"
         )
     };
 
@@ -490,17 +490,17 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     let merge_template = format!(
         "MERGE INTO {quoted_table} AS st \
          USING {using_clause} AS d \
-         ON st.__pgs_row_id = d.__pgs_row_id \
-         WHEN MATCHED AND d.__pgs_action = 'D' THEN DELETE \
-         WHEN MATCHED AND d.__pgs_action = 'I' AND ({is_distinct_clause}) THEN \
+         ON st.__pgt_row_id = d.__pgt_row_id \
+         WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE \
+         WHEN MATCHED AND d.__pgt_action = 'I' AND ({is_distinct_clause}) THEN \
            UPDATE SET {update_set_clause} \
-         WHEN NOT MATCHED AND d.__pgs_action = 'I' THEN \
-           INSERT (__pgs_row_id, {user_col_list}) \
-           VALUES (d.__pgs_row_id, {d_user_col_list})",
+         WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN \
+           INSERT (__pgt_row_id, {user_col_list}) \
+           VALUES (d.__pgt_row_id, {d_user_col_list})",
     );
 
     // Build cleanup template.
-    let cleanup_schema = crate::config::pg_stream_change_buffer_schema().replace('"', "\"\"");
+    let cleanup_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
     let cleanup_stmts: Vec<String> = source_oids
         .iter()
         .map(|oid| {
@@ -523,32 +523,32 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     // ── User-trigger explicit DML templates ──────────────────────────
     let trigger_delete_template = format!(
         "DELETE FROM {quoted_table} AS st \
-         USING __pgs_delta_{pgs_id} AS d \
-         WHERE st.__pgs_row_id = d.__pgs_row_id \
-           AND d.__pgs_action = 'D'",
-        pgs_id = st.pgs_id,
+         USING __pgt_delta_{pgt_id} AS d \
+         WHERE st.__pgt_row_id = d.__pgt_row_id \
+           AND d.__pgt_action = 'D'",
+        pgt_id = st.pgt_id,
     );
 
     let trigger_update_template = format!(
         "UPDATE {quoted_table} AS st \
          SET {update_set_clause} \
-         FROM __pgs_delta_{pgs_id} AS d \
-         WHERE st.__pgs_row_id = d.__pgs_row_id \
-           AND d.__pgs_action = 'I' \
+         FROM __pgt_delta_{pgt_id} AS d \
+         WHERE st.__pgt_row_id = d.__pgt_row_id \
+           AND d.__pgt_action = 'I' \
            AND ({is_distinct_clause})",
-        pgs_id = st.pgs_id,
+        pgt_id = st.pgt_id,
     );
 
     let trigger_insert_template = format!(
-        "INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
-         SELECT d.__pgs_row_id, {d_user_col_list} \
-         FROM __pgs_delta_{pgs_id} AS d \
-         WHERE d.__pgs_action = 'I' \
+        "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+         SELECT d.__pgt_row_id, {d_user_col_list} \
+         FROM __pgt_delta_{pgt_id} AS d \
+         WHERE d.__pgt_action = 'I' \
            AND NOT EXISTS (\
              SELECT 1 FROM {quoted_table} AS st \
-             WHERE st.__pgs_row_id = d.__pgs_row_id\
+             WHERE st.__pgt_row_id = d.__pgt_row_id\
            )",
-        pgs_id = st.pgs_id,
+        pgt_id = st.pgt_id,
     );
 
     // Cache the MERGE template with LSN placeholder tokens.
@@ -556,7 +556,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     // via string substitution, then executes the resolved SQL.
     MERGE_TEMPLATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(
-            st.pgs_id,
+            st.pgt_id,
             CachedMergeTemplate {
                 defining_query_hash: query_hash,
                 merge_sql_template: merge_template,
@@ -572,7 +572,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     });
 
     pgrx::log!(
-        "pg_stream: pre-warmed delta+MERGE cache for {}.{}",
+        "pg_trickle: pre-warmed delta+MERGE cache for {}.{}",
         schema,
         name
     );
@@ -620,15 +620,15 @@ pub fn determine_refresh_action(st: &StreamTableMeta, has_upstream_changes: bool
 ///
 /// When user triggers are detected (and the GUC is not `"off"`), they are
 /// suppressed during the TRUNCATE + INSERT via `DISABLE TRIGGER USER` /
-/// `ENABLE TRIGGER USER`. A `NOTIFY pgstream_refresh` is emitted so
+/// `ENABLE TRIGGER USER`. A `NOTIFY pgtrickle_refresh` is emitted so
 /// listeners know a FULL refresh occurred.
 ///
 /// **Note:** Row-level user triggers do NOT fire correctly for FULL refresh.
 /// Users who need per-row trigger semantics should use `REFRESH MODE
 /// DIFFERENTIAL`. See PLAN_USER_TRIGGERS_EXPLICIT_DML.md §2.
-pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgStreamError> {
-    let schema = &st.pgs_schema;
-    let name = &st.pgs_name;
+pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    let schema = &st.pgt_schema;
+    let name = &st.pgt_name;
     let query = &st.defining_query;
 
     let quoted_table = format!(
@@ -638,33 +638,33 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgStream
     );
 
     // Check for user triggers to suppress during FULL refresh.
-    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let user_triggers_mode = crate::config::pg_trickle_user_triggers();
     let has_triggers = match user_triggers_mode.as_str() {
         "on" => true,
         "off" => false,
-        _ => crate::cdc::has_user_triggers(st.pgs_relid)?,
+        _ => crate::cdc::has_user_triggers(st.pgt_relid)?,
     };
 
     // Suppress user triggers during TRUNCATE + INSERT to prevent
     // spurious trigger invocations with wrong semantics.
     if has_triggers {
         Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
-    // For aggregate/distinct STs, inject COUNT(*) AS __pgs_count into the
+    // For aggregate/distinct STs, inject COUNT(*) AS __pgt_count into the
     // defining query so the auxiliary column is populated correctly.
     let effective_query = if st.refresh_mode == crate::dag::RefreshMode::Differential
-        && crate::dvm::query_needs_pgs_count(query)
+        && crate::dvm::query_needs_pgt_count(query)
     {
-        crate::api::inject_pgs_count(query)
+        crate::api::inject_pgt_count(query)
     } else {
         query.clone()
     };
 
     // Truncate
     Spi::run(&format!("TRUNCATE {quoted_table}"))
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
@@ -674,7 +674,7 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgStream
         ua_sql
     } else {
         let row_id_expr = crate::dvm::row_id_expr_for_query(query);
-        format!("SELECT {row_id_expr} AS __pgs_row_id, sub.* FROM ({effective_query}) sub",)
+        format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
     };
 
     let insert_sql = format!("INSERT INTO {quoted_table} {insert_body}");
@@ -682,27 +682,27 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgStream
     let rows_inserted = Spi::connect_mut(|client| {
         let result = client
             .update(&insert_sql, None, &[])
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-        Ok::<usize, PgStreamError>(result.len())
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<usize, PgTrickleError>(result.len())
     })?;
 
     // Re-enable user triggers and emit NOTIFY so listeners know a FULL
     // refresh occurred.
     if has_triggers {
         Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         // Escape single quotes in the JSON payload.
         let escaped_name = name.replace('\'', "''");
         let escaped_schema = schema.replace('\'', "''");
         Spi::run(&format!(
-            "NOTIFY pgstream_refresh, '{{\"stream_table\": \"{escaped_name}\", \
+            "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
              \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\", \"rows\": {rows_inserted}}}'"
         ))
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
         pgrx::info!(
-            "pg_stream: FULL refresh of {}.{} with user triggers suppressed ({} rows). \
+            "pg_trickle: FULL refresh of {}.{} with user triggers suppressed ({} rows). \
              Row-level triggers do NOT fire for FULL refresh; use REFRESH MODE DIFFERENTIAL.",
             schema,
             name,
@@ -714,12 +714,12 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgStream
 }
 
 /// Execute a NO_DATA refresh: just advance the data timestamp.
-pub fn execute_no_data_refresh(st: &StreamTableMeta) -> Result<(), PgStreamError> {
+pub fn execute_no_data_refresh(st: &StreamTableMeta) -> Result<(), PgTrickleError> {
     let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
-        .map_err(|e| PgStreamError::SpiError(e.to_string()))?
-        .ok_or_else(|| PgStreamError::InternalError("now() returned NULL".into()))?;
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
 
-    StreamTableMeta::update_after_refresh(st.pgs_id, now, 0)?;
+    StreamTableMeta::update_after_refresh(st.pgt_id, now, 0)?;
     Ok(())
 }
 
@@ -740,13 +740,13 @@ pub fn execute_differential_refresh(
     st: &StreamTableMeta,
     prev_frontier: &Frontier,
     new_frontier: &Frontier,
-) -> Result<(i64, i64), PgStreamError> {
-    let schema = &st.pgs_schema;
-    let name = &st.pgs_name;
+) -> Result<(i64, i64), PgTrickleError> {
+    let schema = &st.pgt_schema;
+    let name = &st.pgt_name;
 
     // ── Short-circuit: skip the entire pipeline if no changes exist ──────
-    let change_schema = crate::config::pg_stream_change_buffer_schema().replace('"', "\"\"");
-    let catalog_source_oids: Vec<u32> = StDependency::get_for_st(st.pgs_id)
+    let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
+    let catalog_source_oids: Vec<u32> = StDependency::get_for_st(st.pgt_id)
         .unwrap_or_default()
         .into_iter()
         .filter(|dep| dep.source_type == "TABLE")
@@ -770,18 +770,18 @@ pub fn execute_differential_refresh(
 
         if !reg_exists {
             pgrx::warning!(
-                "[pg_stream] PREFLIGHT FAIL: change buffer table \
+                "[pg_trickle] PREFLIGHT FAIL: change buffer table \
                  \"{change_schema}\".changes_{oid} not found via to_regclass \
-                 for ST {schema}.{name} (pgs_id={}, catalog_source_oids={:?}). \
+                 for ST {schema}.{name} (pgt_id={}, catalog_source_oids={:?}). \
                  Skipping differential refresh.",
-                st.pgs_id,
+                st.pgt_id,
                 catalog_source_oids,
             );
             return Ok((0, 0));
         }
     }
     pgrx::debug1!(
-        "[pg_stream] PREFLIGHT OK for ST {}.{} — source OIDs: {:?}",
+        "[pg_trickle] PREFLIGHT OK for ST {}.{} — source OIDs: {:?}",
         schema,
         name,
         catalog_source_oids,
@@ -868,7 +868,7 @@ pub fn execute_differential_refresh(
 
     if has_truncate {
         pgrx::info!(
-            "[pg_stream] Source table TRUNCATE detected — falling back to FULL refresh for {}.{}",
+            "[pg_trickle] Source table TRUNCATE detected — falling back to FULL refresh for {}.{}",
             schema,
             name,
         );
@@ -881,7 +881,7 @@ pub fn execute_differential_refresh(
     // skipped entirely for the no-data case (handled above).
     //
     // Session 7: per-ST adaptive threshold takes priority over global GUC.
-    let global_ratio = crate::config::pg_stream_differential_max_change_ratio();
+    let global_ratio = crate::config::pg_trickle_differential_max_change_ratio();
     let max_ratio = st.auto_threshold.unwrap_or(global_ratio);
     let mut should_fallback = false;
     let mut total_change_count: i64 = 0;
@@ -908,7 +908,7 @@ pub fn execute_differential_refresh(
                 LIMIT CASE WHEN {max_ratio_lit} > 0 \
                       THEN (sz.table_size::double precision * {max_ratio_lit})::bigint + 1 \
                       ELSE 9223372036854775807 END\
-             ) __pgs_capped) cnt",
+             ) __pgt_capped) cnt",
         );
 
         // Defensive: if the change-buffer table was dropped between the
@@ -918,16 +918,16 @@ pub fn execute_differential_refresh(
         let (table_size, change_count) = match Spi::connect(|client| {
             let row = client
                 .select(&sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .first();
             let ts: i64 = row.get::<i64>(1).unwrap_or(Some(1000)).unwrap_or(1000);
             let cc: i64 = row.get::<i64>(2).unwrap_or(Some(0)).unwrap_or(0);
-            Ok::<(i64, i64), PgStreamError>((ts, cc))
+            Ok::<(i64, i64), PgTrickleError>((ts, cc))
         }) {
             Ok(pair) => pair,
             Err(e) => {
                 pgrx::debug1!(
-                    "[pg_stream] Threshold check for changes_{} failed (table dropped?): {}",
+                    "[pg_trickle] Threshold check for changes_{} failed (table dropped?): {}",
                     oid,
                     e,
                 );
@@ -952,7 +952,7 @@ pub fn execute_differential_refresh(
 
     if should_fallback {
         pgrx::info!(
-            "[pg_stream] Adaptive fallback: change ratio exceeds threshold {:.0}% — using FULL refresh",
+            "[pg_trickle] Adaptive fallback: change ratio exceeds threshold {:.0}% — using FULL refresh",
             max_ratio * 100.0,
         );
         let t_full_start = Instant::now();
@@ -960,11 +960,11 @@ pub fn execute_differential_refresh(
         let full_ms = t_full_start.elapsed().as_secs_f64() * 1000.0;
         // Record FULL timing for future threshold auto-tuning.
         if let Err(e) = StreamTableMeta::update_adaptive_threshold(
-            st.pgs_id,
+            st.pgt_id,
             st.auto_threshold, // keep current threshold
             Some(full_ms),
         ) {
-            pgrx::debug1!("[pg_stream] Failed to update last_full_ms: {}", e);
+            pgrx::debug1!("[pg_trickle] Failed to update last_full_ms: {}", e);
         }
         return result;
     }
@@ -992,7 +992,7 @@ pub fn execute_differential_refresh(
 
     let cached = MERGE_TEMPLATE_CACHE.with(|cache| {
         let map = cache.borrow();
-        map.get(&st.pgs_id)
+        map.get(&st.pgt_id)
             .filter(|entry| entry.defining_query_hash == query_hash)
             .cloned()
     });
@@ -1045,7 +1045,7 @@ pub fn execute_differential_refresh(
     } else {
         // ── Cache miss: full pipeline + PREPARE + cache ──────────────
         let delta_result = dvm::generate_delta_query_cached(
-            st.pgs_id,
+            st.pgt_id,
             &st.defining_query,
             prev_frontier,
             new_frontier,
@@ -1086,7 +1086,7 @@ pub fn execute_differential_refresh(
             .join(", ");
 
         // Build cleanup SQL templates — plain DELETE statements (no DO block).
-        let cleanup_schema = crate::config::pg_stream_change_buffer_schema().replace('"', "\"\"");
+        let cleanup_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
         let cleanup_stmts: Vec<String> = source_oids
             .iter()
             .map(|oid| {
@@ -1102,16 +1102,16 @@ pub fn execute_differential_refresh(
         // Build the MERGE template using the raw delta SQL template
         // (with __PGS_PREV_LSN_* / __PGS_NEW_LSN_* placeholder tokens).
         let delta_sql_template =
-            dvm::get_delta_sql_template(st.pgs_id).unwrap_or(delta_sql.clone());
+            dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_sql.clone());
 
         // Build template USING clause — skip DISTINCT ON when deduplicated (G-M1)
         let template_using = if is_dedup {
             format!("({delta_sql_template})")
         } else {
             format!(
-                "(SELECT DISTINCT ON (__pgs_row_id) * \
+                "(SELECT DISTINCT ON (__pgt_row_id) * \
                  FROM ({delta_sql_template}) __raw \
-                 ORDER BY __pgs_row_id, __pgs_action DESC)"
+                 ORDER BY __pgt_row_id, __pgt_action DESC)"
             )
         };
 
@@ -1132,54 +1132,55 @@ pub fn execute_differential_refresh(
         let merge_template = format!(
             "MERGE INTO {quoted_table} AS st \
              USING {template_using} AS d \
-             ON st.__pgs_row_id = d.__pgs_row_id \
-             WHEN MATCHED AND d.__pgs_action = 'D' THEN DELETE \
-             WHEN MATCHED AND d.__pgs_action = 'I' AND ({is_distinct_clause}) THEN \
+             ON st.__pgt_row_id = d.__pgt_row_id \
+             WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE \
+             WHEN MATCHED AND d.__pgt_action = 'I' AND ({is_distinct_clause}) THEN \
                UPDATE SET {update_set_clause} \
-             WHEN NOT MATCHED AND d.__pgs_action = 'I' THEN \
-               INSERT (__pgs_row_id, {user_col_list}) \
-               VALUES (d.__pgs_row_id, {d_user_col_list})",
+             WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN \
+               INSERT (__pgt_row_id, {user_col_list}) \
+               VALUES (d.__pgt_row_id, {d_user_col_list})",
         );
 
         // ── B-3: DELETE + INSERT template removed (always use MERGE) ─
+
         // ── D-2: Build parameterized MERGE SQL for PREPARE ─────────
         let parameterized_merge_sql = parameterize_lsn_template(&merge_template, &source_oids);
 
         // ── User-trigger explicit DML templates ──────────────────────
         let trigger_delete_template = format!(
             "DELETE FROM {quoted_table} AS st \
-             USING __pgs_delta_{pgs_id} AS d \
-             WHERE st.__pgs_row_id = d.__pgs_row_id \
-               AND d.__pgs_action = 'D'",
-            pgs_id = st.pgs_id,
+             USING __pgt_delta_{pgt_id} AS d \
+             WHERE st.__pgt_row_id = d.__pgt_row_id \
+               AND d.__pgt_action = 'D'",
+            pgt_id = st.pgt_id,
         );
 
         let trigger_update_template = format!(
             "UPDATE {quoted_table} AS st \
              SET {update_set_clause} \
-             FROM __pgs_delta_{pgs_id} AS d \
-             WHERE st.__pgs_row_id = d.__pgs_row_id \
-               AND d.__pgs_action = 'I' \
+             FROM __pgt_delta_{pgt_id} AS d \
+             WHERE st.__pgt_row_id = d.__pgt_row_id \
+               AND d.__pgt_action = 'I' \
                AND ({is_distinct_clause})",
-            pgs_id = st.pgs_id,
+            pgt_id = st.pgt_id,
         );
 
         let trigger_insert_template = format!(
-            "INSERT INTO {quoted_table} (__pgs_row_id, {user_col_list}) \
-             SELECT d.__pgs_row_id, {d_user_col_list} \
-             FROM __pgs_delta_{pgs_id} AS d \
-             WHERE d.__pgs_action = 'I' \
+            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+             SELECT d.__pgt_row_id, {d_user_col_list} \
+             FROM __pgt_delta_{pgt_id} AS d \
+             WHERE d.__pgt_action = 'I' \
                AND NOT EXISTS (\
                  SELECT 1 FROM {quoted_table} AS st \
-                 WHERE st.__pgs_row_id = d.__pgs_row_id\
+                 WHERE st.__pgt_row_id = d.__pgt_row_id\
                )",
-            pgs_id = st.pgs_id,
+            pgt_id = st.pgt_id,
         );
 
         // Store templates in the cache for subsequent refreshes.
         MERGE_TEMPLATE_CACHE.with(|cache| {
             cache.borrow_mut().insert(
-                st.pgs_id,
+                st.pgt_id,
                 CachedMergeTemplate {
                     defining_query_hash: query_hash,
                     merge_sql_template: merge_template.clone(),
@@ -1228,12 +1229,12 @@ pub fn execute_differential_refresh(
         .filter(|oid| !catalog_source_oids.contains(oid))
         .collect();
     if !missing_in_delta.is_empty() {
-        return Err(PgStreamError::InternalError(format!(
+        return Err(PgTrickleError::InternalError(format!(
             "OID MISMATCH (source_oids): delta template references \
              OIDs {missing_in_delta:?} not in catalog deps \
              {catalog_source_oids:?}. Delta source_oids={delta_oids:?}, \
-             ST={schema}.{name} pgs_id={}",
-            st.pgs_id,
+             ST={schema}.{name} pgt_id={}",
+            st.pgt_id,
         )));
     }
 
@@ -1266,14 +1267,14 @@ pub fn execute_differential_refresh(
         if !missing_in_sql.is_empty() {
             // Dump first 500 chars of merge SQL for diagnosis
             let sql_prefix: String = resolved.merge_sql.chars().take(500).collect();
-            return Err(PgStreamError::InternalError(format!(
+            return Err(PgTrickleError::InternalError(format!(
                 "OID MISMATCH (SQL text): merge SQL references changes_* \
                  for OIDs {missing_in_sql:?} not in catalog deps \
                  {catalog_source_oids:?}. SQL OIDs found={sql_oids:?}, \
                  delta source_oids={delta_oids:?}, \
-                 ST={schema}.{name} pgs_id={}. \
+                 ST={schema}.{name} pgt_id={}. \
                  SQL prefix: {sql_prefix}",
-                st.pgs_id,
+                st.pgt_id,
             )));
         }
     }
@@ -1286,20 +1287,20 @@ pub fn execute_differential_refresh(
     // ── User-trigger detection ───────────────────────────────────────
     // Determine whether to use the explicit DML path based on the GUC
     // and the presence of user-defined row-level triggers on the ST.
-    let user_triggers_mode = crate::config::pg_stream_user_triggers();
+    let user_triggers_mode = crate::config::pg_trickle_user_triggers();
     let use_explicit_dml = match user_triggers_mode.as_str() {
         "on" => true,
         "off" => false,
         _ => {
             // "auto": detect user triggers
-            crate::cdc::has_user_triggers(st.pgs_relid)?
+            crate::cdc::has_user_triggers(st.pgt_relid)?
         }
     };
 
     // When user_triggers = 'off' but there ARE user triggers on the ST,
     // suppress them during the MERGE to prevent spurious firing.
     let suppress_triggers =
-        user_triggers_mode.as_str() == "off" && crate::cdc::has_user_triggers(st.pgs_relid)?;
+        user_triggers_mode.as_str() == "off" && crate::cdc::has_user_triggers(st.pgt_relid)?;
     if suppress_triggers {
         let quoted_table = format!(
             "\"{}\".\"{}\"",
@@ -1307,15 +1308,15 @@ pub fn execute_differential_refresh(
             name.replace('"', "\"\""),
         );
         Spi::run(&format!("ALTER TABLE {quoted_table} DISABLE TRIGGER USER"))
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     // ── B-3: Strategy selection ──────────────────────────────────────
     // Always use MERGE. The delete_insert path was removed in v0.2.0
-    // (pg_stream.merge_strategy GUC removed — C1 cleanup).
+    // (pg_trickle.merge_strategy GUC removed — C1 cleanup).
 
     // ── D-2: Prepared-statement flag ─────────────────────────────────
-    let use_prepared = crate::config::pg_stream_use_prepared_statements() && was_cache_hit;
+    let use_prepared = crate::config::pg_trickle_use_prepared_statements() && was_cache_hit;
 
     let (merge_count, strategy_label) = if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
@@ -1326,12 +1327,12 @@ pub fn execute_differential_refresh(
         // This avoids evaluating the delta query three times.
         let t_mat_start = Instant::now();
         let materialize_sql = format!(
-            "CREATE TEMP TABLE __pgs_delta_{pgs_id} ON COMMIT DROP AS \
+            "CREATE TEMP TABLE __pgt_delta_{pgt_id} ON COMMIT DROP AS \
              SELECT * FROM {using_clause} AS d",
-            pgs_id = st.pgs_id,
+            pgt_id = st.pgt_id,
             using_clause = resolved.trigger_using_sql,
         );
-        Spi::run(&materialize_sql).map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+        Spi::run(&materialize_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         let t_mat = t_mat_start.elapsed();
 
         // Step 2: DELETE removed rows (AFTER DELETE triggers fire)
@@ -1339,8 +1340,8 @@ pub fn execute_differential_refresh(
         let del_count = Spi::connect_mut(|client| {
             let result = client
                 .update(&resolved.trigger_delete_sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-            Ok::<usize, PgStreamError>(result.len())
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
         })?;
         let t_del = t_del_start.elapsed();
 
@@ -1350,8 +1351,8 @@ pub fn execute_differential_refresh(
         let upd_count = Spi::connect_mut(|client| {
             let result = client
                 .update(&resolved.trigger_update_sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-            Ok::<usize, PgStreamError>(result.len())
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
         })?;
         let t_upd = t_upd_start.elapsed();
 
@@ -1360,8 +1361,8 @@ pub fn execute_differential_refresh(
         let ins_count = Spi::connect_mut(|client| {
             let result = client
                 .update(&resolved.trigger_insert_sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-            Ok::<usize, PgStreamError>(result.len())
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
         })?;
         let t_ins = t_ins_start.elapsed();
 
@@ -1383,9 +1384,9 @@ pub fn execute_differential_refresh(
         // ── D-2: MERGE via prepared statement ────────────────────────
         // After ~5 executions PostgreSQL switches from custom to generic
         // plan, saving ~1-2ms of parse/plan overhead per refresh cycle.
-        let stmt_name = format!("__pgs_merge_{}", st.pgs_id);
+        let stmt_name = format!("__pgt_merge_{}", st.pgt_id);
 
-        let already_prepared = PREPARED_MERGE_STMTS.with(|s| s.borrow().contains(&st.pgs_id));
+        let already_prepared = PREPARED_MERGE_STMTS.with(|s| s.borrow().contains(&st.pgt_id));
 
         if !already_prepared {
             let type_list = build_prepare_type_list(resolved.source_oids.len());
@@ -1405,10 +1406,10 @@ pub fn execute_differential_refresh(
                 "PREPARE {stmt_name} ({type_list}) AS {}",
                 resolved.parameterized_merge_sql
             ))
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
             PREPARED_MERGE_STMTS.with(|s| {
-                s.borrow_mut().insert(st.pgs_id);
+                s.borrow_mut().insert(st.pgt_id);
             });
         }
 
@@ -1418,8 +1419,8 @@ pub fn execute_differential_refresh(
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&execute_sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-            Ok::<usize, PgStreamError>(result.len())
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
         })?;
         (n, "merge_prepared")
     } else {
@@ -1427,8 +1428,8 @@ pub fn execute_differential_refresh(
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&resolved.merge_sql, None, &[])
-                .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
-            Ok::<usize, PgStreamError>(result.len())
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<usize, PgTrickleError>(result.len())
         })?;
         (n, "merge")
     };
@@ -1441,7 +1442,7 @@ pub fn execute_differential_refresh(
             name.replace('"', "\"\""),
         );
         Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
-            .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
     }
 
     let t2 = Instant::now();
@@ -1453,7 +1454,7 @@ pub fn execute_differential_refresh(
     // approach to safely handle shared change buffers across multiple STs.
     let cleanup_source_oids = MERGE_TEMPLATE_CACHE.with(|cache| {
         let map = cache.borrow();
-        map.get(&st.pgs_id)
+        map.get(&st.pgt_id)
             .map(|entry| entry.source_oids.clone())
             .unwrap_or_default()
     });
@@ -1476,7 +1477,7 @@ pub fn execute_differential_refresh(
         "cache_miss"
     };
 
-    let hint_tier = if !crate::config::pg_stream_merge_planner_hints() {
+    let hint_tier = if !crate::config::pg_trickle_merge_planner_hints() {
         "off"
     } else if total_change_count >= PLANNER_HINT_WORKMEM_THRESHOLD {
         "nestloop+workmem"
@@ -1515,7 +1516,7 @@ pub fn execute_differential_refresh(
         let new_threshold = compute_adaptive_threshold(current_threshold, incr_total_ms, last_full);
         if (new_threshold - current_threshold).abs() > 0.001 {
             pgrx::debug1!(
-                "[pg_stream] Adaptive threshold: INCR={:.1}ms vs FULL={:.1}ms (ratio={:.2}), threshold {:.3} → {:.3}",
+                "[pg_trickle] Adaptive threshold: INCR={:.1}ms vs FULL={:.1}ms (ratio={:.2}), threshold {:.3} → {:.3}",
                 incr_total_ms,
                 last_full,
                 incr_total_ms / last_full,
@@ -1524,9 +1525,9 @@ pub fn execute_differential_refresh(
             );
         }
         if let Err(e) =
-            StreamTableMeta::update_adaptive_threshold(st.pgs_id, Some(new_threshold), None)
+            StreamTableMeta::update_adaptive_threshold(st.pgt_id, Some(new_threshold), None)
         {
-            pgrx::debug1!("[pg_stream] Failed to update adaptive threshold: {}", e);
+            pgrx::debug1!("[pg_trickle] Failed to update adaptive threshold: {}", e);
         }
     }
 
@@ -1566,16 +1567,16 @@ fn compute_adaptive_threshold(current: f64, incr_ms: f64, full_ms: f64) -> f64 {
 }
 
 /// Execute a reinitialize refresh: full recompute after schema change.
-pub fn execute_reinitialize_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgStreamError> {
+pub fn execute_reinitialize_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
     // Same as full refresh but also clears the reinit flag
     let result = execute_full_refresh(st)?;
 
     // Clear reinit flag
     Spi::run(&format!(
-        "UPDATE pgstream.pgs_stream_tables SET needs_reinit = FALSE WHERE pgs_id = {}",
-        st.pgs_id,
+        "UPDATE pgtrickle.pgt_stream_tables SET needs_reinit = FALSE WHERE pgt_id = {}",
+        st.pgt_id,
     ))
-    .map_err(|e| PgStreamError::SpiError(e.to_string()))?;
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
     Ok(result)
 }
@@ -1592,10 +1593,10 @@ mod tests {
 
     fn test_st(refresh_mode: RefreshMode, needs_reinit: bool) -> StreamTableMeta {
         StreamTableMeta {
-            pgs_id: 1,
-            pgs_relid: pg_sys::Oid::from(0u32),
-            pgs_name: "test_st".to_string(),
-            pgs_schema: "public".to_string(),
+            pgt_id: 1,
+            pgt_relid: pg_sys::Oid::from(0u32),
+            pgt_name: "test_st".to_string(),
+            pgt_schema: "public".to_string(),
             defining_query: "SELECT 1".to_string(),
             original_query: None,
             schedule: None,

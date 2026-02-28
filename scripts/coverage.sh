@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Code Coverage Script for pg_stream
+# Code Coverage Script for pg_trickle
 #
 # Generates code coverage reports for unit tests using cargo-llvm-cov.
 #

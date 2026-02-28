@@ -1,8 +1,8 @@
-# PLAN_CITUS.md — Citus Compatibility for pg_stream
+# PLAN_CITUS.md — Citus Compatibility for pg_trickle
 
 ## 1. Executive Summary
 
-This plan makes pg_stream work transparently with Citus-distributed source tables and optionally distributed ST storage tables, with auto-detection at runtime. The extension currently has **zero multi-node awareness** — every core module assumes a single PostgreSQL instance with local OIDs, local WAL, local triggers, and a single background worker.
+This plan makes pg_trickle work transparently with Citus-distributed source tables and optionally distributed ST storage tables, with auto-detection at runtime. The extension currently has **zero multi-node awareness** — every core module assumes a single PostgreSQL instance with local OIDs, local WAL, local triggers, and a single background worker.
 
 The plan touches all 13 source files across 7 phases, replacing OID-based naming with stable identifiers, LSN-based frontiers with a coordinator-managed logical sequence, local-only triggers with worker-propagated triggers, and single-node MERGE with Citus-compatible apply logic.
 
@@ -16,19 +16,19 @@ The plan touches all 13 source files across 7 phases, replacing OID-based naming
 
 ### 2.1. OID-Based Change Buffer Naming (HIGH — pervasive)
 
-Change buffer tables are named `pg_stream_changes.changes_<oid>` where `<oid>` is the **local PostgreSQL OID** of the source table. OIDs are **not globally unique** across Citus nodes. A table distributed across worker nodes will have different OIDs on each worker. The coordinator OID ≠ worker OIDs.
+Change buffer tables are named `pg_trickle_changes.changes_<oid>` where `<oid>` is the **local PostgreSQL OID** of the source table. OIDs are **not globally unique** across Citus nodes. A table distributed across worker nodes will have different OIDs on each worker. The coordinator OID ≠ worker OIDs.
 
 **~25 locations** across `src/cdc.rs`, `src/refresh.rs`, `src/dvm/operators/scan.rs`, `src/dvm/operators/aggregate.rs`, `src/dvm/operators/recursive_cte.rs`.
 
 Affected patterns:
 - Table creation: `CREATE TABLE IF NOT EXISTS {schema}.changes_{oid}`
 - Trigger creation: `INSERT INTO {change_schema}.changes_{oid}`
-- Trigger naming: `pg_stream_cdc_{oid}`
-- Function naming: `pg_stream_cdc_fn_{oid}`
+- Trigger naming: `pg_trickle_cdc_{oid}`
+- Function naming: `pg_trickle_cdc_fn_{oid}`
 - Index creation: `idx_changes_{oid}_lsn_pk_cid`
 - Cleanup: `DELETE FROM {schema}.changes_{oid}`
 - Delta CTE SQL: `"{}.changes_{}"` keyed by `table_oid`
-- Frontier storage: JSONB keyed by `"oid_string"` in `pg_stream.pgs_stream_tables.frontier`
+- Frontier storage: JSONB keyed by `"oid_string"` in `pg_trickle.pgt_stream_tables.frontier`
 
 ### 2.2. `pg_current_wal_lsn()` as Change Frontier (HIGH — architectural)
 
@@ -65,10 +65,10 @@ Affected code:
 1 background worker, 2 shared memory structures. All coordinator-local. Advisory locks are node-local.
 
 Affected code:
-- `BackgroundWorkerBuilder::new("pg_stream scheduler")` in `src/scheduler.rs` (L41-L48)
-- `PGS_STATE: PgLwLock<PgStreamSharedState>` in `src/shmem.rs` (L31)
+- `BackgroundWorkerBuilder::new("pg_trickle scheduler")` in `src/scheduler.rs` (L41-L48)
+- `PGS_STATE: PgLwLock<PgTrickleSharedState>` in `src/shmem.rs` (L31)
 - `DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64>` in `src/shmem.rs` (L37)
-- `pg_try_advisory_lock(st.pgs_id)` in `src/scheduler.rs` (L281-L296, L425-L431)
+- `pg_try_advisory_lock(st.pgt_id)` in `src/scheduler.rs` (L281-L296, L425-L431)
 
 ### 2.6. System Catalog & Row Estimates (LOW — manageable)
 
@@ -129,11 +129,11 @@ pub fn get_worker_nodes() -> Vec<(String, i32)>
 // Queries: SELECT nodename, nodeport FROM pg_dist_node WHERE isactive AND noderole = 'primary'
 
 /// Execute SQL on all nodes (coordinator + workers)
-pub fn run_on_all_nodes(sql: &str) -> Result<(), PgStreamError>
+pub fn run_on_all_nodes(sql: &str) -> Result<(), PgTrickleError>
 // Wraps: SELECT run_command_on_all_nodes($1)
 
 /// Execute SQL on workers only
-pub fn run_on_workers(sql: &str) -> Result<(), PgStreamError>
+pub fn run_on_workers(sql: &str) -> Result<(), PgTrickleError>
 // Wraps: SELECT run_command_on_workers($1)
 ```
 
@@ -151,7 +151,7 @@ Used throughout the codebase to branch behavior.
 
 **P1.3: Enrich source dependencies with placement**
 
-- Add `source_placement TEXT` column to `pg_stream.pgs_dependencies` in `src/lib.rs`
+- Add `source_placement TEXT` column to `pg_trickle.pgt_dependencies` in `src/lib.rs`
 - In `extract_source_relations()` at `src/api.rs` (L702), after resolving OIDs, call `citus::is_distributed_table()` / `citus::is_reference_table()` to determine each source's placement
 - Store placement in `StDependency` struct in `src/catalog.rs`
 
@@ -168,7 +168,7 @@ Used throughout the codebase to branch behavior.
 ```rust
 pub struct SourceIdentifier {
     pub oid: pg_sys::Oid,
-    pub stable_name: String,  // pg_stream_hash(schema_name || '.' || table_name)
+    pub stable_name: String,  // pg_trickle_hash(schema_name || '.' || table_name)
 }
 ```
 
@@ -181,8 +181,8 @@ Replace `changes_{oid}` with `changes_{stable_hash}` in all locations:
 | Location | Current | New |
 |----------|---------|-----|
 | `src/cdc.rs` `create_change_buffer_table()` (L209) | `changes_{oid}` | `changes_{stable_hash}` |
-| `src/cdc.rs` `create_change_trigger()` (L37) | `pg_stream_cdc_fn_{oid}` | `pg_stream_cdc_fn_{stable_hash}` |
-| `src/cdc.rs` trigger name (L577) | `pg_stream_cdc_{oid}` | `pg_stream_cdc_{stable_hash}` |
+| `src/cdc.rs` `create_change_trigger()` (L37) | `pg_trickle_cdc_fn_{oid}` | `pg_trickle_cdc_fn_{stable_hash}` |
+| `src/cdc.rs` trigger name (L577) | `pg_trickle_cdc_{oid}` | `pg_trickle_cdc_{stable_hash}` |
 | `src/cdc.rs` index name (L245-L259) | `idx_changes_{oid}_*` | `idx_changes_{stable_hash}_*` |
 | `src/cdc.rs` `delete_consumed_changes()` (L430) | `changes_{oid}` | `changes_{stable_hash}` |
 | `src/refresh.rs` cleanup (L617-L624) | `changes_{oid}` | `changes_{stable_hash}` |
@@ -204,7 +204,7 @@ Replace `changes_{oid}` with `changes_{stable_hash}` in all locations:
 
 **P2.5: Catalog migration**
 
-- Add `source_stable_name TEXT` column to `pg_stream.pgs_dependencies` and `pg_stream.pgs_change_tracking` in `src/lib.rs`
+- Add `source_stable_name TEXT` column to `pg_trickle.pgt_dependencies` and `pg_trickle.pgt_change_tracking` in `src/lib.rs`
 - OID columns kept for local lookups; `stable_name` becomes the join key for cross-node operations
 - Write SQL migration (`ALTER EXTENSION ... UPDATE`) that backfills `stable_name` for existing tracked sources by joining `pg_class` + `pg_namespace`
 
@@ -221,7 +221,7 @@ Replace `changes_{oid}` with `changes_{stable_hash}` in all locations:
 Add to catalog DDL in `src/lib.rs`:
 
 ```sql
-CREATE SEQUENCE pg_stream.change_seq;
+CREATE SEQUENCE pg_trickle.change_seq;
 ```
 
 This provides globally-ordered, monotonically-increasing values that replace `pg_current_wal_lsn()`.
@@ -231,7 +231,7 @@ This provides globally-ordered, monotonically-increasing values that replace `pg
 ```rust
 pub enum FrontierMode {
     Lsn,         // Single-node: use pg_current_wal_lsn()
-    LogicalSeq,  // Citus: use nextval('pg_stream.change_seq')
+    LogicalSeq,  // Citus: use nextval('pg_trickle.change_seq')
 }
 ```
 
@@ -242,9 +242,9 @@ Determined at ST creation time based on whether any source is `CitusDistributed`
 Modify the trigger function template in `src/cdc.rs` (L102-L131):
 
 - **Local/reference sources:** Keep `pg_current_wal_lsn()` for backward compatibility
-- **Distributed sources:** Use `nextval('pg_stream.change_seq')` instead:
+- **Distributed sources:** Use `nextval('pg_trickle.change_seq')` instead:
   ```sql
-  VALUES (nextval('pg_stream.change_seq'), 'I', ...);
+  VALUES (nextval('pg_trickle.change_seq'), 'I', ...);
   ```
 
 **P3.4: Dual-mode change buffer schema**
@@ -268,7 +268,7 @@ Update all frontier comparison logic. The `lsn_gt()` comparator at L109 needs a 
 
 `get_current_wal_lsn()` in `src/cdc.rs` (L380) becomes `get_current_frontier_position()`:
 - Local mode: Returns `VersionMarker::Lsn(pg_current_wal_lsn())`
-- Citus mode: Returns `VersionMarker::Seq(currval('pg_stream.change_seq'))`
+- Citus mode: Returns `VersionMarker::Seq(currval('pg_trickle.change_seq'))`
 
 **P3.7: Update change detection query**
 
@@ -281,7 +281,7 @@ Citus sequences on the coordinator are not automatically available on workers. O
 2. Use `run_command_on_workers()` to create matching sequence on each worker
 3. Use Citus metadata sequences with 2PC for global uniqueness
 
-**Decision needed:** Benchmark which Citus sequence propagation mechanism works most reliably under high-frequency trigger calls. The trigger on each worker must call `nextval('pg_stream.change_seq')` and get globally-unique, monotonically-increasing values.
+**Decision needed:** Benchmark which Citus sequence propagation mechanism works most reliably under high-frequency trigger calls. The trigger on each worker must call `nextval('pg_trickle.change_seq')` and get globally-unique, monotonically-increasing values.
 
 **Files modified:** `src/cdc.rs`, `src/version.rs`, `src/refresh.rs`, `src/dvm/diff.rs`, `src/lib.rs`, `src/config.rs`
 
@@ -312,7 +312,7 @@ pub fn create_change_trigger(
     pk_columns: &[String],
     columns: &[(String, String)],
     placement: &TablePlacement,
-) -> Result<String, PgStreamError>
+) -> Result<String, PgTrickleError>
 ```
 
 For `CitusDistributed`:
@@ -324,8 +324,8 @@ For `CitusDistributed`:
 
 For distributed sources, the change buffer table must exist on all workers where triggers fire:
 
-1. Create `pg_stream_changes.changes_{stable_hash}` on coordinator
-2. Call `SELECT create_distributed_table('pg_stream_changes.changes_{stable_hash}', 'seq_id')` to distribute the buffer by sequence ID
+1. Create `pg_trickle_changes.changes_{stable_hash}` on coordinator
+2. Call `SELECT create_distributed_table('pg_trickle_changes.changes_{stable_hash}', 'seq_id')` to distribute the buffer by sequence ID
 3. Workers write locally to their shard of the change buffer
 4. The coordinator can query the entire buffer via normal SQL — Citus routes to all workers and unions results
 
@@ -374,23 +374,23 @@ When creating a ST, auto-select placement:
 | All sources local | `local` | Current behavior, no changes |
 | Any source is reference, none distributed | `local` | Reference table data is on coordinator |
 | Any source is distributed, ST estimated < 100K rows | `reference` | Small STs replicated everywhere for fast reads |
-| Any source is distributed, ST estimated ≥ 100K rows | `distributed` | Large STs distributed by `__pgs_row_id` |
+| Any source is distributed, ST estimated ≥ 100K rows | `distributed` | Large STs distributed by `__pgt_row_id` |
 
-Add `st_placement TEXT` column to `pg_stream.pgs_stream_tables` in `src/lib.rs` (L80). Values: `'local'`, `'reference'`, `'distributed'`. Default: `'local'`.
+Add `st_placement TEXT` column to `pg_trickle.pgt_stream_tables` in `src/lib.rs` (L80). Values: `'local'`, `'reference'`, `'distributed'`. Default: `'local'`.
 
 **P5.2: Storage table distribution**
 
-After `CREATE TABLE {pgs_schema}.{pgs_name}`, based on placement:
+After `CREATE TABLE {pgt_schema}.{pgt_name}`, based on placement:
 
 ```sql
 -- For reference STs:
-SELECT create_reference_table('{pgs_schema}.{pgs_name}');
+SELECT create_reference_table('{pgt_schema}.{pgt_name}');
 
 -- For distributed STs:
-SELECT create_distributed_table('{pgs_schema}.{pgs_name}', '__pgs_row_id');
+SELECT create_distributed_table('{pgt_schema}.{pgt_name}', '__pgt_row_id');
 ```
 
-The unique index on `__pgs_row_id` serves as the distribution key.
+The unique index on `__pgt_row_id` serves as the distribution key.
 
 **P5.3: Replace MERGE with INSERT ON CONFLICT + DELETE**
 
@@ -398,20 +398,20 @@ For `st_placement = 'distributed'`, replace the MERGE statement in `src/refresh.
 
 ```sql
 -- Step 1: Delete rows that are removed or updated
-DELETE FROM {st} WHERE __pgs_row_id IN (
-    SELECT __pgs_row_id FROM ({delta_cte}) d WHERE d.__pgs_action = 'D'
+DELETE FROM {st} WHERE __pgt_row_id IN (
+    SELECT __pgt_row_id FROM ({delta_cte}) d WHERE d.__pgt_action = 'D'
 );
 
 -- Step 2: Insert new rows or update existing
 INSERT INTO {st} ({columns})
-SELECT {columns} FROM ({delta_cte}) d WHERE d.__pgs_action = 'I'
-ON CONFLICT (__pgs_row_id) DO UPDATE SET
+SELECT {columns} FROM ({delta_cte}) d WHERE d.__pgt_action = 'I'
+ON CONFLICT (__pgt_row_id) DO UPDATE SET
     {col1} = EXCLUDED.{col1},
     {col2} = EXCLUDED.{col2},
     ...;
 ```
 
-This is fully supported by Citus when `__pgs_row_id` is the distribution column.
+This is fully supported by Citus when `__pgt_row_id` is the distribution column.
 
 **P5.4: Extend `CachedMergeTemplate`**
 
@@ -441,10 +441,10 @@ The delta CTE chain (generated by `src/dvm/operators/`) references `changes_{sta
 1. Profile with `EXPLAIN ANALYZE` in integration tests
 2. If push-down fails, materialize the delta into a temp table before apply:
    ```sql
-   CREATE TEMP TABLE __pgs_delta AS ({delta_cte});
-   DELETE FROM {st} WHERE __pgs_row_id IN (SELECT __pgs_row_id FROM __pgs_delta WHERE __pgs_action = 'D');
-   INSERT INTO {st} SELECT ... FROM __pgs_delta WHERE __pgs_action = 'I' ON CONFLICT ...;
-   DROP TABLE __pgs_delta;
+   CREATE TEMP TABLE __pgt_delta AS ({delta_cte});
+   DELETE FROM {st} WHERE __pgt_row_id IN (SELECT __pgt_row_id FROM __pgt_delta WHERE __pgt_action = 'D');
+   INSERT INTO {st} SELECT ... FROM __pgt_delta WHERE __pgt_action = 'I' ON CONFLICT ...;
+   DROP TABLE __pgt_delta;
    ```
 
 **P5.7: Fix row count estimates for distributed tables**
@@ -471,15 +471,15 @@ Or use `SELECT count(*) FROM citus_shards WHERE table_name = ...` as a fallback.
 
 **P6.1: Scheduler remains coordinator-only**
 
-The background worker at `src/scheduler.rs` (L41) stays on the coordinator node. It discovers STs from the local `pg_stream.pgs_stream_tables` catalog and executes refreshes that Citus routes to workers as needed. No changes to worker registration.
+The background worker at `src/scheduler.rs` (L41) stays on the coordinator node. It discovers STs from the local `pg_trickle.pgt_stream_tables` catalog and executes refreshes that Citus routes to workers as needed. No changes to worker registration.
 
 **P6.2: Replace advisory locks with catalog-based locks**
 
 Add a new lock table to `src/lib.rs`:
 
 ```sql
-CREATE TABLE pg_stream.st_locks (
-    pgs_id      BIGINT PRIMARY KEY REFERENCES pg_stream.pgs_stream_tables(pgs_id),
+CREATE TABLE pg_trickle.st_locks (
+    pgt_id      BIGINT PRIMARY KEY REFERENCES pg_trickle.pgt_stream_tables(pgt_id),
     locked_by  INT,            -- PID of lock holder
     locked_at  TIMESTAMPTZ
 );
@@ -488,37 +488,37 @@ CREATE TABLE pg_stream.st_locks (
 Lock acquisition (replaces `pg_try_advisory_lock` at `src/scheduler.rs` L281, L425):
 
 ```sql
-INSERT INTO pg_stream.st_locks (pgs_id, locked_by, locked_at)
+INSERT INTO pg_trickle.st_locks (pgt_id, locked_by, locked_at)
 VALUES ($1, pg_backend_pid(), now())
-ON CONFLICT (pgs_id) DO NOTHING
+ON CONFLICT (pgt_id) DO NOTHING
 ```
 
 Returns 1 row if acquired, 0 if already locked. Release:
 
 ```sql
-DELETE FROM pg_stream.st_locks WHERE pgs_id = $1 AND locked_by = pg_backend_pid()
+DELETE FROM pg_trickle.st_locks WHERE pgt_id = $1 AND locked_by = pg_backend_pid()
 ```
 
-Add a stale-lock cleanup: locks older than `pg_stream.lock_timeout` (default: 10 minutes) are automatically released by the scheduler loop.
+Add a stale-lock cleanup: locks older than `pg_trickle.lock_timeout` (default: 10 minutes) are automatically released by the scheduler loop.
 
 **P6.3: Replace shared memory DAG signal with LISTEN/NOTIFY**
 
 Replace `PgAtomic<AtomicU64>` DAG rebuild signal at `src/shmem.rs` (L37) with PostgreSQL's LISTEN/NOTIFY:
 
-- `signal_dag_rebuild()` → `NOTIFY pg_stream_dag_rebuild`
-- Scheduler loop → `LISTEN pg_stream_dag_rebuild` + poll with `pg_sleep_for()`
+- `signal_dag_rebuild()` → `NOTIFY pg_trickle_dag_rebuild`
+- Scheduler loop → `LISTEN pg_trickle_dag_rebuild` + poll with `pg_sleep_for()`
 
 This works across all connections to the same database (coordinator). For multi-coordinator HA setups, only one coordinator is writable at a time, so LISTEN/NOTIFY is sufficient.
 
 **P6.4: Conditional shared memory usage**
 
-Keep `PgLwLock<PgStreamSharedState>` for `scheduler_pid` and `scheduler_running` — these are coordinator-local state that doesn't need cross-node visibility. Only replace the DAG rebuild signal.
+Keep `PgLwLock<PgTrickleSharedState>` for `scheduler_pid` and `scheduler_running` — these are coordinator-local state that doesn't need cross-node visibility. Only replace the DAG rebuild signal.
 
 Update `src/shmem.rs`:
 ```rust
 pub fn signal_dag_rebuild() {
     // Use NOTIFY for Citus-safe signaling
-    let _ = Spi::run("NOTIFY pg_stream_dag_rebuild");
+    let _ = Spi::run("NOTIFY pg_trickle_dag_rebuild");
     // Also update atomic for backward compat with local shmem consumers
     if is_shmem_available() {
         DAG_REBUILD_SIGNAL.get().fetch_add(1, Ordering::SeqCst);
@@ -572,17 +572,17 @@ RUN cargo pgrx package
 
 **P7.3: SQL migration scripts**
 
-Write `ALTER EXTENSION pg_stream UPDATE` migration that:
+Write `ALTER EXTENSION pg_trickle UPDATE` migration that:
 
-1. Add `source_stable_name TEXT` and `source_placement TEXT` columns to `pg_stream.pgs_dependencies`
-2. Add `source_stable_name TEXT` column to `pg_stream.pgs_change_tracking`
-3. Add `st_placement TEXT DEFAULT 'local'` column to `pg_stream.pgs_stream_tables`
-4. Create `pg_stream.change_seq` sequence
-5. Create `pg_stream.st_locks` table
+1. Add `source_stable_name TEXT` and `source_placement TEXT` columns to `pg_trickle.pgt_dependencies`
+2. Add `source_stable_name TEXT` column to `pg_trickle.pgt_change_tracking`
+3. Add `st_placement TEXT DEFAULT 'local'` column to `pg_trickle.pgt_stream_tables`
+4. Create `pg_trickle.change_seq` sequence
+5. Create `pg_trickle.st_locks` table
 6. Backfill `stable_name` from current OID-based data:
    ```sql
-   UPDATE pg_stream.pgs_dependencies d SET source_stable_name = (
-       SELECT pg_stream.stable_hash(n.nspname || '.' || c.relname)
+   UPDATE pg_trickle.pgt_dependencies d SET source_stable_name = (
+       SELECT pg_trickle.stable_hash(n.nspname || '.' || c.relname)
        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
        WHERE c.oid = d.source_relid
    );
@@ -680,9 +680,9 @@ Phase 7 testing runs incrementally throughout all phases.
 
 2. **Distributed sequence semantics:** Does `nextval()` on a Citus-distributed sequence provide **strict monotonic ordering** across workers, or only uniqueness? If only uniqueness, the frontier ordering assumption breaks and we need an alternative (e.g., `(worker_id, local_seq)` composite ordering).
 
-3. **Schema `pg_stream_changes` on workers:** Workers may not have the `pg_stream_changes` schema. The extension `CREATE SCHEMA` runs on coordinator only. Must use `run_on_all_nodes('CREATE SCHEMA IF NOT EXISTS pg_stream_changes')` during setup.
+3. **Schema `pg_trickle_changes` on workers:** Workers may not have the `pg_trickle_changes` schema. The extension `CREATE SCHEMA` runs on coordinator only. Must use `run_on_all_nodes('CREATE SCHEMA IF NOT EXISTS pg_trickle_changes')` during setup.
 
-4. **Extension loading on workers:** Do workers need `shared_preload_libraries = 'pg_stream'`? The background worker is coordinator-only, but the trigger functions reference the extension. If workers don't load the extension, PL/pgSQL triggers (not C triggers) should work without it.
+4. **Extension loading on workers:** Do workers need `shared_preload_libraries = 'pg_trickle'`? The background worker is coordinator-only, but the trigger functions reference the extension. If workers don't load the extension, PL/pgSQL triggers (not C triggers) should work without it.
 
 5. **Citus columnar storage:** Should ST storage tables support Citus columnar? Columnar doesn't support UPDATE/DELETE, so it's incompatible with incremental refresh. Document as unsupported.
 

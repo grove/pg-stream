@@ -216,7 +216,7 @@ jobs:
               - 'Cargo.lock'
               - 'src/**'
               - 'sql/**'
-              - 'pg_stream.control'
+              - 'pg_trickle.control'
             rust:
               - 'src/**'
               - 'Cargo.toml'

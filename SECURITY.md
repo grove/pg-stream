@@ -24,7 +24,7 @@ We aim to acknowledge reports within **48 hours** and provide a fix or mitigatio
 
 A useful report includes:
 
-- PostgreSQL version and `pg_stream` version
+- PostgreSQL version and `pg_trickle` version
 - Minimal reproduction SQL or Rust code
 - Description of the unintended behaviour and its security impact
 - Whether the vulnerability requires a trusted (superuser) or untrusted role to trigger
@@ -33,10 +33,10 @@ A useful report includes:
 
 In-scope:
 
-- SQL injection or privilege escalation via `pgstream.*` functions
+- SQL injection or privilege escalation via `pgtrickle.*` functions
 - Memory safety issues in the Rust extension code (buffer overflows, use-after-free, etc.)
 - Denial-of-service caused by a low-privilege user triggering runaway resource usage
-- Information disclosure through change buffers (`pgstream_changes.*`) or monitoring views
+- Information disclosure through change buffers (`pgtrickle_changes.*`) or monitoring views
 
 Out-of-scope:
 

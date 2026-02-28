@@ -1,4 +1,4 @@
-//! E2E tests for `pgstream.drop_stream_table()`.
+//! E2E tests for `pgtrickle.drop_stream_table()`.
 //!
 //! Validates that dropping a ST cleans up the storage table, catalog entries,
 //! dependencies, CDC triggers, and change tracking — while preserving
@@ -44,7 +44,7 @@ async fn test_drop_removes_catalog_entry() {
 
     let before: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_cat_st'",
+            "SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'dr_cat_st'",
         )
         .await;
     assert_eq!(before, 1);
@@ -53,7 +53,7 @@ async fn test_drop_removes_catalog_entry() {
 
     let after: i64 = db
         .query_scalar(
-            "SELECT count(*) FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_cat_st'",
+            "SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'dr_cat_st'",
         )
         .await;
     assert_eq!(after, 0, "Catalog entry should be removed");
@@ -69,14 +69,14 @@ async fn test_drop_removes_dependencies() {
     db.create_st("dr_dep_st", "SELECT id FROM dr_dep", "1m", "FULL")
         .await;
 
-    let pgs_id: i64 = db
-        .query_scalar("SELECT pgs_id FROM pgstream.pgs_stream_tables WHERE pgs_name = 'dr_dep_st'")
+    let pgt_id: i64 = db
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'dr_dep_st'")
         .await;
 
     let deps_before: i64 = db
         .query_scalar(&format!(
-            "SELECT count(*) FROM pgstream.pgs_dependencies WHERE pgs_id = {}",
-            pgs_id
+            "SELECT count(*) FROM pgtrickle.pgt_dependencies WHERE pgt_id = {}",
+            pgt_id
         ))
         .await;
     assert!(
@@ -88,8 +88,8 @@ async fn test_drop_removes_dependencies() {
 
     let deps_after: i64 = db
         .query_scalar(&format!(
-            "SELECT count(*) FROM pgstream.pgs_dependencies WHERE pgs_id = {}",
-            pgs_id
+            "SELECT count(*) FROM pgtrickle.pgt_dependencies WHERE pgt_id = {}",
+            pgt_id
         ))
         .await;
     assert_eq!(deps_after, 0, "Dependencies should be removed on drop");
@@ -107,7 +107,7 @@ async fn test_drop_removes_cdc_trigger() {
         .await;
 
     let source_oid = db.table_oid("dr_trig").await;
-    let trigger_name = format!("pg_stream_cdc_{}", source_oid);
+    let trigger_name = format!("pg_trickle_cdc_{}", source_oid);
 
     assert!(
         db.trigger_exists(&trigger_name, "dr_trig").await,
@@ -148,7 +148,7 @@ async fn test_drop_preserves_trigger_for_other_st() {
     .await;
 
     let source_oid = db.table_oid("dr_shared").await;
-    let trigger_name = format!("pg_stream_cdc_{}", source_oid);
+    let trigger_name = format!("pg_trickle_cdc_{}", source_oid);
 
     // Drop one ST
     db.drop_st("st_shared_1").await;
@@ -178,7 +178,7 @@ async fn test_drop_removes_change_tracking() {
 
     let ct_before: i64 = db
         .query_scalar(&format!(
-            "SELECT count(*) FROM pgstream.pgs_change_tracking WHERE source_relid = {}::oid",
+            "SELECT count(*) FROM pgtrickle.pgt_change_tracking WHERE source_relid = {}::oid",
             source_oid
         ))
         .await;
@@ -188,7 +188,7 @@ async fn test_drop_removes_change_tracking() {
 
     let ct_after: i64 = db
         .query_scalar(&format!(
-            "SELECT count(*) FROM pgstream.pgs_change_tracking WHERE source_relid = {}::oid",
+            "SELECT count(*) FROM pgtrickle.pgt_change_tracking WHERE source_relid = {}::oid",
             source_oid
         ))
         .await;
@@ -205,7 +205,7 @@ async fn test_drop_nonexistent_fails() {
     let db = E2eDb::new().await.with_extension().await;
 
     let result = db
-        .try_execute("SELECT pgstream.drop_stream_table('no_such_st')")
+        .try_execute("SELECT pgtrickle.drop_stream_table('no_such_st')")
         .await;
     assert!(result.is_err(), "Dropping a nonexistent ST should fail");
 }

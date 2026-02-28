@@ -1,10 +1,10 @@
-# Getting Started with pg_stream
+# Getting Started with pg_trickle
 
-## What is pg_stream?
+## What is pg_trickle?
 
-pg_stream adds **stream tables** to PostgreSQL — tables that are defined by a SQL query and kept automatically up to date as the underlying data changes. Think of them as materialized views that refresh themselves, but smarter: instead of re-running the entire query on every refresh, pg_stream uses **Incremental View Maintenance (IVM)** to process only the rows that changed.
+pg_trickle adds **stream tables** to PostgreSQL — tables that are defined by a SQL query and kept automatically up to date as the underlying data changes. Think of them as materialized views that refresh themselves, but smarter: instead of re-running the entire query on every refresh, pg_trickle uses **Incremental View Maintenance (IVM)** to process only the rows that changed.
 
-Traditional materialized views force a choice: either re-run the full query (expensive) or accept stale data. pg_stream eliminates this trade-off. When you insert a single row into a million-row table, pg_stream computes the effect of that one row on the query result — it doesn't touch the other 999,999.
+Traditional materialized views force a choice: either re-run the full query (expensive) or accept stale data. pg_trickle eliminates this trade-off. When you insert a single row into a million-row table, pg_trickle computes the effect of that one row on the query result — it doesn't touch the other 999,999.
 
 ### How data flows
 
@@ -16,7 +16,7 @@ The key concept is that **data flows downstream automatically** — from your ba
          ▼
   ┌─────────────┐   triggers (or WAL)   ┌─────────────────────┐
   │ Base Tables │ ─────────────────────▶ │   Change Buffers    │
-  │ (you write) │                        │ (pgstream_changes.*) │
+  │ (you write) │                        │ (pgtrickle_changes.*) │
   └─────────────┘                        └──────────┬──────────┘
                                                      │
                                            delta query (ΔQ) on refresh
@@ -38,10 +38,10 @@ proportional to what actually changed.
 
 1. You write to your base tables normally — `INSERT`, `UPDATE`, `DELETE`
 2. Lightweight `AFTER` row-level triggers capture each change into a buffer, atomically in the same transaction. No polling, no logical replication slots required by default.
-3. On each refresh cycle, pg_stream derives a **delta query (ΔQ)** that reads only the buffered changes since the last refresh frontier
+3. On each refresh cycle, pg_trickle derives a **delta query (ΔQ)** that reads only the buffered changes since the last refresh frontier
 4. The delta is merged into the stream table — only the affected rows are written
 5. If other stream tables depend on this one, they are scheduled next (topological order)
-6. Optionally: once `wal_level = logical` is available and the first refresh succeeds, pg_stream automatically transitions from triggers to **WAL-based CDC** (~2–15 μs write overhead vs triggers). The transition is seamless and transparent.
+6. Optionally: once `wal_level = logical` is available and the first refresh succeeds, pg_trickle automatically transitions from triggers to **WAL-based CDC** (~2–15 μs write overhead vs triggers). The transition is seamless and transparent.
 
 This tutorial walks through a concrete org-chart example so you can see this flow end to end, including a chain of stream tables that propagates changes automatically.
 
@@ -67,15 +67,15 @@ By the end you will have:
 
 ## Prerequisites
 
-- PostgreSQL 18.x with pg_stream installed (see [INSTALL.md](../INSTALL.md))
-- `shared_preload_libraries = 'pg_stream'` in `postgresql.conf`
+- PostgreSQL 18.x with pg_trickle installed (see [INSTALL.md](../INSTALL.md))
+- `shared_preload_libraries = 'pg_trickle'` in `postgresql.conf`
 - `psql` or any SQL client
 
 ---
 
 ## Step 1: Create the Base Tables
 
-These are ordinary PostgreSQL tables — pg_stream doesn't require any special column types, annotations, or schema conventions. The only requirement is that tables have a **primary key** (pg_stream uses it internally to track which rows changed).
+These are ordinary PostgreSQL tables — pg_trickle doesn't require any special column types, annotations, or schema conventions. The only requirement is that tables have a **primary key** (pg_trickle uses it internally to track which rows changed).
 
 ```sql
 -- Department hierarchy (self-referencing tree)
@@ -140,10 +140,10 @@ Company (1)
 
 ## Step 2: Create the First Stream Table — Recursive Hierarchy
 
-Our first stream table flattens the department tree. For every department, it computes the full path from the root and the depth level. This uses `WITH RECURSIVE` — a SQL construct that can't be differentiated with simple algebraic rules (the recursion depends on itself), but pg_stream handles it using **incremental strategies** (semi-naive evaluation for inserts, Delete-and-Rederive for mixed changes) that we'll explain later.
+Our first stream table flattens the department tree. For every department, it computes the full path from the root and the depth level. This uses `WITH RECURSIVE` — a SQL construct that can't be differentiated with simple algebraic rules (the recursion depends on itself), but pg_trickle handles it using **incremental strategies** (semi-naive evaluation for inserts, Delete-and-Rederive for mixed changes) that we'll explain later.
 
 ```sql
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'department_tree',
     $$
     WITH RECURSIVE tree AS (
@@ -173,11 +173,11 @@ SELECT pgstream.create_stream_table(
 That single function call did a lot of work atomically (all in one transaction):
 
 1. **Parsed** the defining query into an operator tree — identifying the recursive CTE, the scan on `departments`, the join, the union
-2. **Created a storage table** called `department_tree` in the `public` schema — a real PostgreSQL heap table with columns matching the SELECT output, plus internal columns `__pgs_row_id` (a hash used to track individual rows)
+2. **Created a storage table** called `department_tree` in the `public` schema — a real PostgreSQL heap table with columns matching the SELECT output, plus internal columns `__pgt_row_id` (a hash used to track individual rows)
 3. **Installed CDC triggers** on the `departments` table — lightweight `AFTER INSERT OR UPDATE OR DELETE` row-level triggers that will capture every future change
-4. **Created a change buffer table** in the `pgstream_changes` schema — this is where the triggers write captured changes
+4. **Created a change buffer table** in the `pgtrickle_changes` schema — this is where the triggers write captured changes
 5. **Ran an initial full refresh** — executed the recursive query against the current data and populated the storage table
-6. **Registered the stream table** in pg_stream's catalog with a 30-second refresh schedule
+6. **Registered the stream table** in pg_trickle's catalog with a 30-second refresh schedule
 
 Query it immediately — it's already populated:
 
@@ -199,9 +199,9 @@ Expected output:
   3 | Sales       |         1 | Company > Sales             |     1
 ```
 
-This is a **real PostgreSQL table** — you can create indexes on it, join it in other queries, reference it in views, or even use it as a source for other stream tables. pg_stream keeps it in sync automatically.
+This is a **real PostgreSQL table** — you can create indexes on it, join it in other queries, reference it in views, or even use it as a source for other stream tables. pg_trickle keeps it in sync automatically.
 
-> **Key insight:** The recursive query that computes paths and depths would normally need to be re-run manually (or via `REFRESH MATERIALIZED VIEW`). With pg_stream, it stays fresh — any change to the `departments` table is automatically reflected within the schedule bound (30 seconds here).
+> **Key insight:** The recursive query that computes paths and depths would normally need to be re-run manually (or via `REFRESH MATERIALIZED VIEW`). With pg_trickle, it stays fresh — any change to the `departments` table is automatically reflected within the schedule bound (30 seconds here).
 
 ---
 
@@ -209,10 +209,10 @@ This is a **real PostgreSQL table** — you can create indexes on it, join it in
 
 Now create `department_stats`. The twist: instead of joining directly against `departments`, it joins against `department_tree` — the stream table we just created. This creates a **chain**: changes to `departments` update `department_tree`, whose changes then trigger `department_stats` to update.
 
-This demonstrates how pg_stream builds a **DAG** — a directed acyclic graph of stream tables — and automatically schedules refreshes in topological order.
+This demonstrates how pg_trickle builds a **DAG** — a directed acyclic graph of stream tables — and automatically schedules refreshes in topological order.
 
 ```sql
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'department_stats',
     $$
     SELECT
@@ -234,11 +234,11 @@ SELECT pgstream.create_stream_table(
 
 ### What just happened — and why this one is different?
 
-Like before, pg_stream parsed the query, created a storage table, and set up CDC. But `department_stats` depends on `department_tree`, not a base table — so *no new triggers were installed*. Instead, pg_stream registered `department_tree` as an upstream dependency in the DAG.
+Like before, pg_trickle parsed the query, created a storage table, and set up CDC. But `department_stats` depends on `department_tree`, not a base table — so *no new triggers were installed*. Instead, pg_trickle registered `department_tree` as an upstream dependency in the DAG.
 
 The schedule is `'CALCULATED'`, which means: "don't give this table its own schedule — inherit the tightest schedule of any downstream table that queries it". Since no other stream table has been created yet, PostgreSQL will prompt a full refresh on demand for now.
 
-The query has no recursive CTE, so pg_stream uses **algebraic differentiation**:
+The query has no recursive CTE, so pg_trickle uses **algebraic differentiation**:
 
 1. Decomposed into operators: `Scan(department_tree)` → `LEFT JOIN` → `Scan(employees)` → `Aggregate(GROUP BY + COUNT/SUM/AVG)` → `Project`
 2. Derived a differentiation rule for each:
@@ -278,7 +278,7 @@ Notice that the `full_path` column comes from `department_tree` — this data al
 Now add a rollup that aggregates `department_stats` by top-level group (depth = 1):
 
 ```sql
-SELECT pgstream.create_stream_table(
+SELECT pgtrickle.create_stream_table(
     'department_report',
     $$
     SELECT
@@ -311,7 +311,7 @@ department_tree ──────────┤
                   (DIFF, 30s)  ◀── only explicit schedule
 ```
 
-`department_report` drives the whole pipeline. Because it has a 30-second schedule, pg_stream automatically propagates that cadence upstream: `department_stats` and `department_tree` will also be refreshed within 30 seconds of a base table change, in topological order, with no manual configuration.
+`department_report` drives the whole pipeline. Because it has a 30-second schedule, pg_trickle automatically propagates that cadence upstream: `department_stats` and `department_tree` will also be refreshed within 30 seconds of a base table change, in topological order, with no manual configuration.
 
 Query the report:
 
@@ -331,7 +331,7 @@ SELECT * FROM department_report ORDER BY division;
 
 ## Step 4: Watch a Change Cascade Through All Three Layers
 
-This is the heart of pg_stream. We'll make four changes to the base tables and watch changes propagate automatically through the three-layer DAG — each layer doing only the minimum work.
+This is the heart of pg_trickle. We'll make four changes to the base tables and watch changes propagate automatically through the three-layer DAG — each layer doing only the minimum work.
 
 ### The data flow pipeline (three layers)
 
@@ -369,7 +369,7 @@ INSERT INTO employees (name, department_id, salary) VALUES
     ('Heidi', 6, 105000);  -- New Frontend engineer
 ```
 
-**What happened immediately (in your transaction):** The `AFTER INSERT` trigger on `employees` fired and wrote one row to `pgstream_changes.changes_<employees_oid>`. The row contains the new values, action type `I`, and the LSN at the time of insert. Your transaction committed normally — no blocking.
+**What happened immediately (in your transaction):** The `AFTER INSERT` trigger on `employees` fired and wrote one row to `pgtrickle_changes.changes_<employees_oid>`. The row contains the new values, action type `I`, and the LSN at the time of insert. Your transaction committed normally — no blocking.
 
 The stream tables don't know about Heidi yet. The change is in the buffer, waiting for the next refresh.
 
@@ -377,7 +377,7 @@ Refresh the whole pipeline in one call (or wait for the 30-second schedule):
 
 ```sql
 -- refresh_stream_table cascades to dependent tables automatically
-SELECT pgstream.refresh_stream_table('department_report');
+SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
 **What happened across the three layers:**
@@ -403,7 +403,7 @@ WHERE department_name = 'Frontend';
 
 The 6 other groups in `department_stats` were **not touched at all**.
 
-> **Contrast with a standard materialized view:** `REFRESH MATERIALIZED VIEW` would re-scan all 8 employees, re-join with all 7 departments, re-aggregate, and update all 7 rows. With pg_stream, the work was proportional to the 1 changed row — across all three layers.
+> **Contrast with a standard materialized view:** `REFRESH MATERIALIZED VIEW` would re-scan all 8 employees, re-join with all 7 departments, re-aggregate, and update all 7 rows. With pg_trickle, the work was proportional to the 1 changed row — across all three layers.
 
 ### 4b: A department change cascades through the whole DAG
 
@@ -419,7 +419,7 @@ INSERT INTO departments (id, name, parent_id) VALUES
 Refresh the whole pipeline:
 
 ```sql
-SELECT pgstream.refresh_stream_table('department_report');
+SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
 **What happened across all three layers:**
@@ -430,7 +430,7 @@ SELECT pgstream.refresh_stream_table('department_report');
 | `department_stats` | Delta query reads new row from dept_tree's change buffer; DevOps has 0 employees so delta is minimal | 1 inserted (headcount=0) |
 | `department_report` | Delta on Engineering row: headcount stays the same (DevOps has 0 employees) | 0 effective changes |
 
-**How the recursive CTE refresh works** — unlike `department_stats`, recursive CTEs can't be algebraically differentiated (the recursion references itself). pg_stream uses **incremental fixpoint strategies**:
+**How the recursive CTE refresh works** — unlike `department_stats`, recursive CTEs can't be algebraically differentiated (the recursion references itself). pg_trickle uses **incremental fixpoint strategies**:
 
 - **INSERT** → semi-naive evaluation: differentiate the base case, propagate the delta through the recursive term, stopping when no new rows are produced. Only new rows inserted.
 - **DELETE or UPDATE** → Delete-and-Rederive (DRed): remove rows derived from deleted facts, re-derive rows that may have alternative derivation paths, handle cascades cleanly.
@@ -460,7 +460,7 @@ UPDATE departments SET name = 'R&D' WHERE id = 2;
 Refresh:
 
 ```sql
-SELECT pgstream.refresh_stream_table('department_report');
+SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
 **What happened:**
@@ -498,7 +498,7 @@ DELETE FROM employees WHERE name = 'Bob';
 **What happened:** The `AFTER DELETE` trigger on `employees` fired, writing a change buffer row with action type `D` and Bob's old values (`department_id=5, salary=115000`). The delta query will use these old values to compute the correct aggregate adjustment — it knows to subtract 115000 from Backend's salary sum and decrement the count.
 
 ```sql
-SELECT pgstream.refresh_stream_table('department_stats');
+SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT * FROM department_stats WHERE department_name = 'Backend';
 ```
 
@@ -514,7 +514,7 @@ Headcount dropped from 2 → 1 and the salary aggregates updated. Again, only th
 
 ## Step 5: Automatic Scheduling — Let the DAG Drive Itself
 
-In the examples above, we called `refresh_stream_table()` manually. In production you never need to do this. pg_stream runs a **background scheduler** that automatically refreshes stale tables — in topological order.
+In the examples above, we called `refresh_stream_table()` manually. In production you never need to do this. pg_trickle runs a **background scheduler** that automatically refreshes stale tables — in topological order.
 
 ### How schedules propagate
 
@@ -534,7 +534,7 @@ We gave `department_report` a `'30s'` schedule and the two upstream tables a `'C
 
 1. Queries the catalog for stream tables past their freshness bound
 2. Sorts them topologically (upstream first) — `department_tree` refreshes before `department_stats`, which refreshes before `department_report`
-3. Runs each refresh (respecting `pg_stream.max_concurrent_refreshes`)
+3. Runs each refresh (respecting `pg_trickle.max_concurrent_refreshes`)
 4. Updates the last-refresh frontier
 
 ### Monitoring
@@ -542,7 +542,7 @@ We gave `department_report` a `'30s'` schedule and the two upstream tables a `'C
 ```sql
 -- Current status of all stream tables
 SELECT table_name, schedule, last_refresh_at, stale, refresh_mode
-FROM pgstream.pgs_status();
+FROM pgtrickle.pgt_status();
 ```
 
 ```
@@ -556,29 +556,29 @@ FROM pgstream.pgs_status();
 ```sql
 -- Detailed performance stats
 SELECT table_name, refresh_count, avg_refresh_ms, rows_affected_last
-FROM pgstream.pg_stat_stream_tables;
+FROM pgtrickle.pg_stat_stream_tables;
 ```
 
 ### Optional: WAL-based CDC
 
-By default pg_stream uses triggers. If `wal_level = logical` is configured, set:
+By default pg_trickle uses triggers. If `wal_level = logical` is configured, set:
 
 ```sql
-ALTER SYSTEM SET pg_stream.cdc_mode = 'auto';
+ALTER SYSTEM SET pg_trickle.cdc_mode = 'auto';
 SELECT pg_reload_conf();
 ```
 
-pg_stream will automatically transition each stream table from trigger-based to WAL-based capture after the first successful refresh — reducing per-write overhead from ~50–200 μs to ~2–15 μs. The transition is transparent; your queries and the refresh schedule are unaffected.
+pg_trickle will automatically transition each stream table from trigger-based to WAL-based capture after the first successful refresh — reducing per-write overhead from ~50–200 μs to ~2–15 μs. The transition is transparent; your queries and the refresh schedule are unaffected.
 
 ---
 
 ## Step 6: Understanding the Two IVM Strategies
 
-You've now seen both strategies pg_stream uses for incremental view maintenance. Understanding when each applies helps you write efficient stream table queries.
+You've now seen both strategies pg_trickle uses for incremental view maintenance. Understanding when each applies helps you write efficient stream table queries.
 
 ### Algebraic Differentiation (used by `department_stats`)
 
-For queries composed of scans, filters, joins, and algebraic aggregates (COUNT, SUM, AVG), pg_stream can derive the IVM delta **mathematically**. The rules come from the theory of [DBSP (Database Stream Processing)](https://arxiv.org/abs/2203.16684):
+For queries composed of scans, filters, joins, and algebraic aggregates (COUNT, SUM, AVG), pg_trickle can derive the IVM delta **mathematically**. The rules come from the theory of [DBSP (Database Stream Processing)](https://arxiv.org/abs/2203.16684):
 
 | Operator | Delta Rule | Cost |
 |----------|-----------|------|
@@ -592,7 +592,7 @@ The total cost is proportional to the number of **changes**, not the table size.
 
 ### Incremental Strategies for Recursive CTEs (used by `department_tree`)
 
-For recursive CTEs, pg_stream can't derive an algebraic delta because the recursion references itself. Instead it uses two complementary strategies, chosen automatically based on what changed:
+For recursive CTEs, pg_trickle can't derive an algebraic delta because the recursion references itself. Instead it uses two complementary strategies, chosen automatically based on what changed:
 
 **Semi-naive evaluation** (for INSERT-only changes):
 1. Differentiate the base case — find the new seed rows
@@ -608,7 +608,7 @@ Both strategies are more efficient than full recomputation — they work on the 
 
 ### When to use which?
 
-You don't choose — pg_stream detects the strategy automatically based on the query structure:
+You don't choose — pg_trickle detects the strategy automatically based on the query structure:
 
 | Query Pattern | Strategy | Performance |
 |---------------|----------|-------------|
@@ -628,9 +628,9 @@ You don't choose — pg_stream detects the strategy automatically based on the q
 When you're done experimenting, drop the stream tables. Drop dependents before their sources:
 
 ```sql
-SELECT pgstream.drop_stream_table('department_report');
-SELECT pgstream.drop_stream_table('department_stats');
-SELECT pgstream.drop_stream_table('department_tree');
+SELECT pgtrickle.drop_stream_table('department_report');
+SELECT pgtrickle.drop_stream_table('department_stats');
+SELECT pgtrickle.drop_stream_table('department_tree');
 
 DROP TABLE employees;
 DROP TABLE departments;
@@ -639,8 +639,8 @@ DROP TABLE departments;
 `drop_stream_table` atomically removes in a single transaction:
 - The storage table (e.g., `public.department_stats`)
 - CDC triggers on source tables (removed only if no other stream table references the same source)
-- Change buffer tables in `pgstream_changes`
-- Catalog entries in `pgstream.pgs_stream_tables`
+- Change buffer tables in `pgtrickle_changes`
+- Catalog entries in `pgtrickle.pgt_stream_tables`
 
 ---
 
@@ -655,9 +655,9 @@ DROP TABLE departments;
 | **Semi-naive / DRed** | Incremental strategies for `WITH RECURSIVE` — INSERT uses semi-naive, DELETE/UPDATE uses Delete-and-Rederive |
 | **Downstream propagation** | A single base table write cascades through an entire chain of stream tables, automatically, in the right order |
 | **Hybrid CDC** | Triggers by default; optional automatic transition to WAL-based capture for lower write-side overhead |
-| **Monitoring** | `pgs_status()` and `pg_stat_stream_tables` for freshness, timing, and error history |
+| **Monitoring** | `pgt_status()` and `pg_stat_stream_tables` for freshness, timing, and error history |
 
-The key takeaway: you write to base tables — **pg_stream does the rest**. Data flows downstream automatically, each layer doing the minimum work proportional to what changed, in dependency order.
+The key takeaway: you write to base tables — **pg_trickle does the rest**. Data flows downstream automatically, each layer doing the minimum work proportional to what changed, in dependency order.
 
 ---
 

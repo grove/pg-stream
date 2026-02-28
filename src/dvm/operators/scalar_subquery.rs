@@ -26,13 +26,13 @@
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::build_snapshot_sql;
 use crate::dvm::parser::OpTree;
-use crate::error::PgStreamError;
+use crate::error::PgTrickleError;
 
 /// Differentiate a ScalarSubquery node.
 pub fn diff_scalar_subquery(
     ctx: &mut DiffContext,
     op: &OpTree,
-) -> Result<DiffResult, PgStreamError> {
+) -> Result<DiffResult, PgTrickleError> {
     let OpTree::ScalarSubquery {
         subquery,
         alias,
@@ -40,7 +40,7 @@ pub fn diff_scalar_subquery(
         ..
     } = op
     else {
-        return Err(PgStreamError::InternalError(
+        return Err(PgTrickleError::InternalError(
             "diff_scalar_subquery called on non-ScalarSubquery node".into(),
         ));
     };
@@ -107,9 +107,9 @@ pub fn diff_scalar_subquery(
         let r_old_snapshot = format!(
             "(SELECT {sq_col_list} FROM {subquery_snapshot} {sq_alias} \
              EXCEPT ALL \
-             SELECT {sq_col_list} FROM {delta_sq} WHERE __pgs_action = 'I' \
+             SELECT {sq_col_list} FROM {delta_sq} WHERE __pgt_action = 'I' \
              UNION ALL \
-             SELECT {sq_col_list} FROM {delta_sq} WHERE __pgs_action = 'D')",
+             SELECT {sq_col_list} FROM {delta_sq} WHERE __pgt_action = 'D')",
             sq_alias = quote_ident(subquery_alias),
             delta_sq = subquery_result.cte_name,
         );
@@ -126,7 +126,7 @@ pub fn diff_scalar_subquery(
             .map(|c| format!("cs.{}::TEXT", quote_ident(c)))
             .collect();
         format!(
-            "pgstream.pg_stream_hash_multi(ARRAY[{}])",
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
             key_exprs.join(", ")
         )
     };
@@ -134,8 +134,8 @@ pub fn diff_scalar_subquery(
     let sql = format!(
         "\
 -- Part 1: outer child delta rows with current scalar value
-SELECT dc.__pgs_row_id,
-       dc.__pgs_action,
+SELECT dc.__pgt_row_id,
+       dc.__pgt_action,
        {dc_cols},
        {scalar_sql} AS {alias_ident}
 FROM {delta_child} dc
@@ -143,8 +143,8 @@ FROM {delta_child} dc
 UNION ALL
 
 -- Part 2: all outer rows re-emitted when scalar subquery value changes (DELETE old)
-SELECT {hash_child} AS __pgs_row_id,
-       'D' AS __pgs_action,
+SELECT {hash_child} AS __pgt_row_id,
+       'D' AS __pgt_action,
        {cs_cols},
        {scalar_old_sql} AS {alias_ident}
 FROM {child_snapshot} cs
@@ -154,8 +154,8 @@ WHERE EXISTS (SELECT 1 FROM {delta_subquery} WHERE 1=1)
 UNION ALL
 
 -- Part 2b: all outer rows re-emitted when scalar subquery value changes (INSERT new)
-SELECT {hash_child} AS __pgs_row_id,
-       'I' AS __pgs_action,
+SELECT {hash_child} AS __pgt_row_id,
+       'I' AS __pgt_action,
        {cs_cols},
        {scalar_sql} AS {alias_ident}
 FROM {child_snapshot} cs

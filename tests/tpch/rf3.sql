@@ -6,7 +6,7 @@
 -- - Quantity changes (affects filter predicates like l_quantity < threshold)
 --
 -- NOTE: customer UPDATE (market-segment rotation) is intentionally omitted.
--- pg_stream has a known DVM bug where refreshing a LEFT JOIN stream table
+-- pg_trickle has a known DVM bug where refreshing a LEFT JOIN stream table
 -- after an UPDATE to the left-joined table generates invalid SQL on the
 -- second+ refresh cycle ("column c_custkey does not exist"). This affects
 -- Q13 only. Tracked separately. Do not re-add until the LEFT JOIN DVM is fixed.

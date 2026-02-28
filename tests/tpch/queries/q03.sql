@@ -1,6 +1,6 @@
 -- Q3: Shipping Priority
 -- Operators: 3-table Join -> Filter -> Aggregate
--- LIMIT removed (unsupported by pg_stream)
+-- LIMIT removed (unsupported by pg_trickle)
 SELECT
     l_orderkey,
     SUM(l_extendedprice * (1 - l_discount)) AS revenue,

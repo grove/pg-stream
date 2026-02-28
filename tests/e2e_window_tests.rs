@@ -495,7 +495,7 @@ async fn test_window_in_case_expression_rejected() {
     // Window function inside CASE should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_nested_st', \
+            "SELECT pgtrickle.create_stream_table('wf_nested_st', \
              $$ SELECT CASE WHEN ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) <= 3 \
              THEN 'top' ELSE 'other' END AS tier FROM wf_nested $$, '1m', 'DIFFERENTIAL')",
         )
@@ -522,7 +522,7 @@ async fn test_window_in_coalesce_rejected() {
     // Window function inside COALESCE should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_coal_st', \
+            "SELECT pgtrickle.create_stream_table('wf_coal_st', \
              $$ SELECT COALESCE(SUM(val) OVER (PARTITION BY dept), 0) AS total FROM wf_coal $$, '1m', 'DIFFERENTIAL')",
         )
         .await;
@@ -550,7 +550,7 @@ async fn test_window_in_arithmetic_rejected() {
     // Window function inside arithmetic should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_arith_st', \
+            "SELECT pgtrickle.create_stream_table('wf_arith_st', \
              $$ SELECT ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) * 10 AS scaled_rank \
              FROM wf_arith $$, '1m', 'DIFFERENTIAL')",
         )
@@ -579,7 +579,7 @@ async fn test_window_in_cast_rejected() {
     // Window function inside CAST should be rejected in DIFFERENTIAL mode
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_cast_st', \
+            "SELECT pgtrickle.create_stream_table('wf_cast_st', \
              $$ SELECT CAST(ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS TEXT) AS rn_text \
              FROM wf_cast $$, '1m', 'DIFFERENTIAL')",
         )
@@ -608,7 +608,7 @@ async fn test_window_deeply_nested_rejected() {
     // Window function deeply nested: CASE → COALESCE → window (DIFFERENTIAL mode)
     let result = db
         .try_execute(
-            "SELECT pgstream.create_stream_table('wf_deep_st', \
+            "SELECT pgtrickle.create_stream_table('wf_deep_st', \
              $$ SELECT CASE WHEN COALESCE(ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC), 0) <= 3 \
              THEN 'top' ELSE 'other' END AS tier FROM wf_deep $$, '1m', 'DIFFERENTIAL')"
         )
