@@ -1159,105 +1159,93 @@ verification tests pass.
 
 ### Tier 2 — Robustness & P2 Fixes
 
-| Step | Gap | Description | Effort | Priority |
-|------|-----|-------------|--------|----------|
-| **F13** | G4.2 | Warn on LIMIT in subquery without ORDER BY | 3–4h | P2 |
-| **F14** | G5.2 | CUBE combinatorial explosion: reject large CUBEs | 1h | P2 |
-| **F15** | G5.6 | RANGE_AGG/RANGE_INTERSECT_AGG recognition | 1h | P2 |
-| **F16** | G8.2 | Detect read replicas, skip worker | 2–3h | P2 |
+| Step | Gap | Description | Effort | Priority | Status |
+|------|-----|-------------|--------|----------|--------|
+| **F13** | G4.2 | Warn on LIMIT in subquery without ORDER BY | 3–4h | P2 | ✅ Done (warn_limit_without_order_in_subqueries in parser.rs) |
+| **F14** | G5.2 | CUBE combinatorial explosion: reject large CUBEs | 1h | P2 | ✅ Already done (64-branch limit in rewrite_grouping_sets) |
+| **F15** | G5.6 | RANGE_AGG/RANGE_INTERSECT_AGG recognition | 1h | P2 | ✅ Done (added to is_known_aggregate, rejected in DIFFERENTIAL mode) |
+| **F16** | G8.2 | Detect read replicas, skip worker | 2–3h | P2 | ✅ Done (pg_is_in_recovery check in scheduler + api.rs) |
 
-**Estimated effort:** 7–9 hours  
-**Value:** Prevents crashes and confusing errors in edge cases.
+**Estimated effort:** 7–9 hours → **Actual: ~2 hours (F14 was already done)**  
+**Status: ✅ COMPLETE**
 
 ### Tier 3 — Test Coverage (No New Features, High ROI)
 
-| Step | Gap | Description | Effort |
-|------|-----|-------------|--------|
-| **F17** | G6.1 | 21 aggregate E2E differential tests | 6–8h |
-| **F18** | G6.2 | FULL JOIN E2E tests | 3–4h |
-| **F19** | G6.3 | INTERSECT/EXCEPT E2E tests | 3–4h |
-| **F20** | G6.4 | ScalarSubquery E2E tests | 2–3h |
-| **F21** | G6.5 | SubLinks-in-OR E2E tests | 2–3h |
-| **F22** | G6.6 | Multi-partition window E2E tests | 2–3h |
-| **F23** | G6.7 | GUC variation E2E tests | 4–6h |
-| **F24** | G6.8 | Multi-cycle refresh E2E tests | 3–4h |
-| **F25** | G1.4 | HAVING group transition E2E test | 2–3h |
-| **F26** | G1.6 | FULL JOIN NULL keys E2E test | 2h |
+| Step | Gap | Description | Effort | Status |
+|------|-----|-------------|--------|--------|
+| **F17** | G6.1 | 21 aggregate E2E differential tests | 6–8h | 📝 Stub created (e2e_aggregate_coverage_tests.rs) |
+| **F18** | G6.2 | FULL JOIN E2E tests | 3–4h | 📝 Stub created (e2e_full_join_tests.rs) |
+| **F19** | G6.3 | INTERSECT/EXCEPT E2E tests | 3–4h | 📝 Stub created (e2e_set_operation_tests.rs) |
+| **F20** | G6.4 | ScalarSubquery E2E tests | 2–3h | 📝 Stub created (e2e_scalar_subquery_tests.rs) |
+| **F21** | G6.5 | SubLinks-in-OR E2E tests | 2–3h | 📝 Stub created (e2e_sublink_or_tests.rs) |
+| **F22** | G6.6 | Multi-partition window E2E tests | 2–3h | 📝 Stub created (e2e_multi_window_tests.rs) |
+| **F23** | G6.7 | GUC variation E2E tests | 4–6h | 📝 Stub created (e2e_guc_variation_tests.rs) |
+| **F24** | G6.8 | Multi-cycle refresh E2E tests | 3–4h | 📝 Stub created (e2e_multi_cycle_tests.rs) |
+| **F25** | G1.4 | HAVING group transition E2E test | 2–3h | 📝 Stub created (e2e_having_transition_tests.rs) |
+| **F26** | G1.6 | FULL JOIN NULL keys E2E test | 2h | 📝 Stub created (e2e_full_join_tests.rs) |
 
 **Estimated effort:** 29–38 hours  
-**Value:** Verifies existing code correctness without adding new features.
-Catches regressions. May surface P1 bugs in untested operators.
+**Status: 📝 STUBS CREATED (test scenarios documented, implementations pending)**
 
 ### Tier 4 — Operational Hardening
 
-| Step | Gap | Description | Effort |
-|------|-----|-------------|--------|
-| **F27** | G4.3 | Expose adaptive threshold | 2–3h |
-| **F28** | G4.4 | DEALLOCATE prepared statements on DDL | 1–2h |
-| **F29** | G8.6 | Parse SPI SQLSTATE for retry classification | 3–4h |
-| **F30** | G9.1 | Add delta_row_count to refresh history | 3–4h |
-| **F31** | G9.4 | Emit StaleData NOTIFY consistently | 2–3h |
-| **F32** | G2.4 | WAL transition retry with backoff | 3–4h |
-| **F33** | G2.5 | WAL column rename detection | 2–3h |
-| **F34** | G3.4 | Clear error on SPI permission failure | 2h |
-| **F35** | G3.5 | Block triggers on change buffer tables | 1h |
-| **F36** | G4.5 | Temp table cleanup on error | 1–2h |
-| **F37** | G5.1 | DISTINCT ON without ORDER BY warning | 1h |
-| **F38** | G5.5 | NATURAL JOIN column drift tracking | 2–3h |
-| **F39** | G7.2 | Drop orphaned buffer table columns | 2–3h |
-| **F40** | G8.3 | Extension upgrade migration scripts | See PLAN_DB_SCHEMA_STABILITY.md |
+| Step | Gap | Description | Effort | Status |
+|------|-----|-------------|--------|--------|
+| **F27** | G4.3 | Expose adaptive threshold | 2–3h | ✅ Done (stream_tables_info view includes auto_threshold via SELECT st.*) |
+| **F28** | G4.4 | DEALLOCATE prepared statements on DDL | 1–2h | ✅ Already done (invalidate_merge_cache handles DEALLOCATE) |
+| **F29** | G8.6 | Parse SPI SQLSTATE for retry classification | 3–4h | ✅ Done (classify_spi_error_retryable in error.rs) |
+| **F30** | G9.1 | Add delta_row_count to refresh history | 3–4h | ✅ Done (3 new columns + RefreshRecord API + scheduler integration) |
+| **F31** | G9.4 | Emit StaleData NOTIFY consistently | 2–3h | ✅ Done (emit_stale_alert_if_needed in scheduler.rs) |
+| **F32** | G2.4 | WAL transition retry with backoff | 3–4h | ✅ Done (3× progressive timeout in check_and_complete_transition) |
+| **F33** | G2.5 | WAL column rename detection | 2–3h | ✅ Done (detect_schema_mismatch checks missing expected columns) |
+| **F34** | G3.4 | Clear error on SPI permission failure | 2h | ✅ Done (SpiPermissionError variant in error.rs) |
+| **F35** | G3.5 | Block triggers on change buffer tables | 1h | ✅ Done (handle_create_trigger in hooks.rs) |
+| **F36** | G4.5 | Temp table cleanup on error | 1–2h | ✅ Already done (ON COMMIT DROP in temp table creation) |
+| **F37** | G5.1 | DISTINCT ON without ORDER BY warning | 1h | ✅ Done (warning in rewrite_distinct_on) |
+| **F38** | G5.5 | NATURAL JOIN column drift tracking | 2–3h | ✅ Done (warning when NATURAL JOIN is resolved) |
+| **F39** | G7.2 | Drop orphaned buffer table columns | 2–3h | ✅ Done (sync_change_buffer_columns drops orphaned columns) |
+| **F40** | G8.3 | Extension upgrade migration scripts | See PLAN_DB_SCHEMA_STABILITY.md | ⬜ Deferred |
 
-**Estimated effort:** 25–36 hours  
-**Value:** Production polish. Many items are 1–3 hour fixes.
+**Estimated effort:** 25–36 hours → **Actual: ~6 hours (F28, F36 already done; F40 deferred)**  
+**Status: 13/14 COMPLETE (F40 deferred)**
 
 ### Tier 5 — Nice-to-Have
 
-| Step | Gap | Description | Effort |
-|------|-----|-------------|--------|
-| **F41** | G4.6 | Wide table MERGE hash shortcut | 4–6h |
-| **F42** | G8.4 | Document delta memory bounds | 1h |
-| **F43** | G8.5 | Document sequential processing | 1h |
-| **F44** | G8.7 | Document connection overhead | 1h |
-| **F45** | G9.2 | Memory/temp file usage tracking | 4–6h |
-| **F46** | G9.3 | Buffer alert threshold GUC | 1h |
-| **F47** | G9.5 | Expose adaptive threshold function | 1–2h |
-| **F48** | G1.5 | Keyless table duplicate rows E2E | 2–3h |
-| **F49** | G3.6 | Generated column snapshot filter alignment | 1–2h |
-| **F50** | G7.3 | Benchmark covering index overhead | 2h |
-| **F51** | G7.4 | Change buffer schema permissions | 1–2h |
+| Step | Gap | Description | Effort | Status |
+|------|-----|-------------|--------|--------|
+| **F41** | G4.6 | Wide table MERGE hash shortcut | 4–6h | ✅ Done (build_is_distinct_clause with >50-col hash in refresh.rs) |
+| **F42** | G8.4 | Document delta memory bounds | 1h | ✅ Done (FAQ.md "memory limits for delta processing" section) |
+| **F43** | G8.5 | Document sequential processing | 1h | ✅ Done (FAQ.md "Why are refreshes processed sequentially?" section) |
+| **F44** | G8.7 | Document connection overhead | 1h | ✅ Done (FAQ.md "How many connections does pg_trickle use?" section) |
+| **F45** | G9.2 | Memory/temp file usage tracking | 4–6h | ✅ Done (query_temp_file_usage in monitor.rs) |
+| **F46** | G9.3 | Buffer alert threshold GUC | 1h | ✅ Done (pg_trickle.buffer_alert_threshold GUC in config.rs) |
+| **F47** | G9.5 | Expose adaptive threshold function | 1–2h | ✅ Done (pgtrickle.st_auto_threshold SQL function in monitor.rs) |
+| **F48** | G1.5 | Keyless table duplicate rows E2E | 2–3h | 📝 Stub created (e2e_keyless_duplicate_tests.rs) |
+| **F49** | G3.6 | Generated column snapshot filter alignment | 1–2h | ✅ Done (attgenerated filter in build_column_snapshot) |
+| **F50** | G7.3 | Benchmark covering index overhead | 2h | ⬜ Not started (benchmark only) |
+| **F51** | G7.4 | Change buffer schema permissions | 1–2h | ✅ Done (REVOKE ALL FROM PUBLIC on pgtrickle_changes schema) |
 
-**Estimated effort:** 19–30 hours
+**Estimated effort:** 19–30 hours → **Actual: ~4 hours**  
+**Status: 9/11 COMPLETE (F48 stub, F50 deferred)**
 
 ### Summary
 
 | Tier | Steps | Effort | Cumulative | Status |
 |------|-------|--------|------------|--------|
 | 0 — Critical | F1–F7 | 22–33h → ~8h | ~8h | ✅ Complete |
-| 1 — Verification | F8–F12 | 17–24h → ~4h | ~12h | 4/5 (F9 pending) |
-| 2 — Robustness | F13–F16 | 7–9h | ~21h | Not started |
-| 3 — Test Coverage | F17–F26 | 29–38h | ~59h | Not started |
-| 4 — Operational | F27–F40 | 25–36h | ~95h | Not started |
-| 5 — Nice-to-Have | F41–F51 | 19–30h | ~125h | Not started |
-| **Total** | **51 steps** | **~125h remaining** | — | **11/51 done** |
+| 1 — Verification | F8–F12 | 17–24h → ~4h | ~12h | 4/5 (F9 pending audit) |
+| 2 — Robustness | F13–F16 | 7–9h → ~2h | ~14h | ✅ Complete |
+| 3 — Test Coverage | F17–F26 | 29–38h | ~52h | 📝 Stubs created |
+| 4 — Operational | F27–F40 | 25–36h → ~6h | ~58h | 13/14 (F40 deferred) |
+| 5 — Nice-to-Have | F41–F51 | 19–30h → ~4h | ~62h | 9/11 (F48 stub, F50 deferred) |
+| **Total** | **51 steps** | **~62h actual** | — | **37/51 done, 10 stubs, 4 deferred** |
 
-### Recommended Execution Order
+### Remaining Work (Prioritized)
 
-```
-Session 1:  F1 (remove delete_insert) + F4 (pgoutput parsing)        ~4h
-Session 2:  F6 (ALTER TYPE) + F7 (ALTER POLICY) + F10 (ALTER DOMAIN) ~8h
-Session 3:  F8 (window partition E2E) + F9 (recursive monotonicity)  ~12h
-Session 4:  F13 (LIMIT warning) + F14 (CUBE limit) + F15 (RANGE_AGG) ~5h
-Session 5:  F17–F22 (test coverage batch 1: aggregates, FULL JOIN)   ~18h
-Session 6:  F23–F26 (test coverage batch 2: GUCs, multi-cycle)       ~11h
-Session 7:  F2 (WAL pk_hash) + F3 (WAL old_*)                        ~14h
-Session 8:  F11 (keyless docs) + F12 (PgBouncer) + F16 (replica)     ~7h
-Session 9+: F27–F51 (operational hardening)                           ~44h
-```
-
-**Note:** F2, F3, and F7 are the most impactful WAL decoder fixes. Sessions 1–4
-focus on non-WAL issues that affect the current default trigger-based CDC.
-WAL decoder fixes are deferred to Session 7 since they only matter when WAL
-mode is explicitly enabled.
+1. **F9** (Tier 1) — Recursive CTE monotonicity audit — requires manual SQL audit
+2. **F17–F26, F48** (Tier 3) — E2E test implementations — stubs created, need full tests
+3. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to PLAN_DB_SCHEMA_STABILITY.md
+4. **F50** (Tier 5) — Benchmark covering index overhead — benchmark only, no code change
 
 ---
 
