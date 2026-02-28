@@ -64,14 +64,33 @@ TPC-H suite was completed:
    NULL-padded).  Prevents spurious null-padded rows that could corrupt
    intermediate aggregate old-state reconstruction via EXCEPT ALL.
 
+6. **Comment-aware keyword parsing** — `find_top_level_keyword()` now
+   skips single-line (`--`) and block (`/* */`) SQL comments when
+   searching for keywords like `FROM`. Previously, a comment containing
+   `FROM` (e.g., `-- Operators: ... Subquery-in-FROM ...`) would match
+   before the actual SQL `FROM` clause, causing `inject_pgt_count` to
+   insert `COUNT(*) AS __pgt_count` into the comment instead of the
+   query. Defensive fix — Q13 was not affected at this commit but the
+   bug would silently corrupt any future query with `FROM` in a comment.
+
+7. **Algebraic intermediate aggregate path** — For intermediate
+   aggregates (subquery-in-FROM) where all aggregate functions are
+   algebraically invertible (COUNT, COUNT(*), SUM), old values are now
+   computed as `old = new - ins + del` using the already-computed delta
+   CTE. This eliminates the second `diff_node(child)` call (which
+   created duplicate LEFT JOIN CTEs) and the EXCEPT ALL old-state
+   reconstruction (which had column-matching fragility). Non-invertible
+   aggregates (MIN, MAX, group-rescan) fall back to the original
+   EXCEPT ALL path.
+
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 43s)
+Phase 1: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 44s)
 Phase 2: test result: ok. 1 passed; 0 failed  (16/20 STs survive, 42s)
 Phase 3: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 45s)
 ```
 
 **Deterministically passing (17):** Q01, Q04, Q05, Q06, Q07, Q08, Q09,
-Q10, Q11, Q12, Q14, Q16, Q18, Q19, Q20, Q21, Q22 — pass all 3 cycles
+Q11, Q12, Q13, Q14, Q16, Q18, Q19, Q20, Q21, Q22 — pass all 3 cycles
 consistently across multiple runs in Phase 1 (individual query mode).
 
 **Phase 2 (cross-query): 16/20** — Q04 now survives cross-query mode
@@ -99,9 +118,9 @@ Not a correctness blocker but impacts cycle time at larger scale factors.
 
 | Query | Cycle 2+ Error | Category |
 |-------|----------------|----------|
-| Q03 | Data mismatch cycle 2: ST=49, Q=48, extra=1, missing=0 — one extra row in 3-table join delta (l_orderkey=465). | Join delta value drift |
-| Q13 | Data mismatch cycle 2: ST=2, Q=3, extra=0, missing=1 — missing row (c_count=10, custdist=140); intermediate aggregate (LeftJoin + subquery-in-FROM + outer GROUP BY) | Intermediate agg |
-| Q15 | Data mismatch cycle 2: ST=3, Q=1, extra=2, missing=0 — phantom rows (supplier#7 with stale total_revenue); scalar subquery MAX filter doesn't recompute correctly | Scalar subquery delta |
+| Q03 | Data mismatch cycle 2: ST=49, Q=49, extra=1, missing=1 — one extra, one missing row in 3-table join delta. | Join delta value drift |
+| Q10 | Data mismatch cycle 3: ST=33, Q=31, extra=2, missing=0 — two phantom rows in 4-table join delta (customer ⋈ orders ⋈ lineitem ⋈ nation) with SUM aggregate. Same root cause as Q03: nested join L₁ fallback. | Join delta value drift |
+| Q15 | Data mismatch cycle 2: ST=2, Q=1, extra=1, missing=0 — phantom row (supplier with stale total_revenue); scalar subquery MAX filter doesn't recompute correctly | Scalar subquery delta |
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
 (`column "p_partkey" does not exist`).
@@ -112,10 +131,10 @@ Not a correctness blocker but impacts cycle time at larger scale factors.
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_trickle DVM does not support correlated scalar subqueries in WHERE |
 | ~~**Cycle 3 — aggregate drift (cumulative)**~~ | ~~Q01~~ | ~~FIXED~~ — Root cause was WAL LSN capture using `pg_current_wal_lsn()` (write position) instead of `pg_current_wal_insert_lsn()` (insert position). See "WAL LSN capture fix" in Resolved section. |
-| **Cycle 2 — join delta value drift** | Q03 | 3-table join (lineitem ⋈ orders ⋈ customer) with SUM aggregate. Pre-change snapshot fix reduced error from extra=1,missing=1 to extra=1,missing=0. Remaining issue: extra row in delta (only for nested join children where L₀ fallback to L₁ allows double-counting). |
+| **Cycle 2+ — join delta value drift** | Q03, Q10 | 3–4 table join chains with SUM aggregate. Nested join children use L₁ (post-change) instead of L₀ (pre-change), allowing double-counting when both sides change simultaneously. Q03: 3-table chain (lineitem ⋈ orders ⋈ customer), Q10: 4-table chain (customer ⋈ orders ⋈ lineitem ⋈ nation). |
 | ~~**Cycle 3 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin Part 1 now uses R_old snapshot for DELETE actions. When RF2 deletes rows from both sides, the DELETE check evaluates EXISTS against the pre-change right state. See Resolved section. |
 | ~~**Cycle 2 — join delta value drift**~~ | ~~Q07~~ | ~~FIXED~~ — Inner join pre-change snapshot (L₀ via EXCEPT ALL for Scan children) eliminates double-counting of ΔL ⋈ ΔR when both sides change simultaneously |
-| **Cycle 2 — intermediate aggregate** | Q13 | Intermediate aggregate (LeftJoin → subquery-in-FROM → outer GROUP BY) produces fewer rows (ST=2, Q=3). `build_intermediate_agg_delta` old/new rescan approach loses a group. |
+| ~~**Cycle 2 — intermediate aggregate**~~ | ~~Q13~~ | ~~FIXED~~ — Algebraic intermediate aggregate path computes old values as `old = new - ins + del`, eliminating duplicate `diff_node(child)` call and EXCEPT ALL. Comment-aware keyword parsing prevents `inject_pgt_count` from matching keywords in SQL comments. |
 | **Cycle 2 — scalar subquery delta** | Q15 | `WHERE total_revenue = (SELECT MAX(...))` — scalar subquery MAX filter produces phantom rows. Delta engine doesn't correctly handle cascading MAX changes. Was previously masked by change buffer cleanup bug. |
 | ~~**Cycle 2 — scalar aggregate deletion**~~ | ~~Q19~~ | ~~FIXED~~ — Scalar aggregate singleton row is never deleted. The merge CTE skips 'D' classification for no-GROUP-BY aggregates and emits NULL for SUM/MIN/MAX when count=0. See Resolved section. |
 | ~~**Aggregate drift — scalar row_id mismatch**~~ | ~~Q06~~ | ~~FIXED~~ — `row_id_expr_for_query` detects scalar aggregates and returns singleton hash matching DIFF delta |
@@ -161,8 +180,8 @@ patterns are added.
 
 | # | Category | Queries | Impact | Difficulty | Files |
 |---|----------|---------|--------|------------|-------|
-| **P1** | Join delta value drift | Q03 | +1 pass | Hard | `join.rs` (nested join L₀) |
-| **P2** | Intermediate aggregate | Q13 | +1 pass | Medium | `aggregate.rs` (`build_intermediate_agg_delta`) |
+| **P1** | Join delta value drift | Q03, Q10 | +2 pass | Hard | `join.rs` (nested join L₀) |
+| ~~**P2**~~ | ~~Intermediate aggregate~~ | ~~Q13~~ | ~~RESOLVED~~ | ~~Medium~~ | ~~`aggregate.rs`, `api.rs`~~ |
 | **P3** | Scalar subquery delta | Q15 | +1 pass | Hard | `aggregate.rs`, `join_common.rs` (CROSS JOIN + MAX) |
 | **P4** | Correlated scalar subquery | Q02, Q17 | +2 create | Hard | `parser.rs` (`rewrite_scalar_subquery_in_where`) |
 | **P5** | Cross-query interference | Q07 (Phase 2 only) | stability | Medium | `refresh.rs` (min-frontier edge case) |
@@ -177,10 +196,16 @@ simultaneously on the same join key. The fix is limited to Scan children
 because computing L₀ for nested join children (via full join snapshot
 EXCEPT ALL) is prohibitively expensive for multi-table chains.
 
-**Q03: STALLED** — Error: `extra=1, missing=0` (one extra row in cycle 2).
-The 3-table chain `(lineitem ⋈ orders) ⋈ customer` uses L₀ for Scan
-children at the inner level, but the outer join's Part 2 falls back to L₁
-(post-change) for the nested join child.
+**Q03: STALLED** — Error: `extra=1, missing=1` (one extra, one missing row
+in cycle 2). The 3-table chain `(lineitem ⋈ orders) ⋈ customer` uses L₀
+for Scan children at the inner level, but the outer join's Part 2 falls
+back to L₁ (post-change) for the nested join child.
+
+**Q10: NEW** — Error: `extra=2, missing=0` (two phantom rows in cycle 3).
+The 4-table chain `(customer ⋈ orders ⋈ lineitem ⋈ nation)` with
+`SUM(l_extendedprice * (1 - l_discount))` aggregate exhibits the same
+nested-join L₁ fallback double-counting as Q03. Was previously listed as
+passing but confirmed failing at the 8e238ee baseline.
 
 An L₀ fix for nested join children was **attempted and reverted** because it
 caused a Q21 regression (numwait off by -1). The L₀ nested-child fix
@@ -195,37 +220,33 @@ delta chains.
 design across join.rs and semi_join.rs.
 
 **Files:** `src/dvm/operators/join.rs`, `src/dvm/operators/semi_join.rs`
-**Impact:** Would fix Q03 (+1 pass → 18/22)
+**Impact:** Would fix Q03 + Q10 (+2 pass → 19/22)
 
-#### P2: Fix intermediate aggregate data mismatch (Q13)
+#### P2: Fix intermediate aggregate data mismatch (Q13) — RESOLVED
 
-Q13 progressed from `column st.c_custkey does not exist` to a data mismatch
-(ST=2, Q=3, missing: c_count=10, custdist=140). The intermediate aggregate
-detection and `build_intermediate_agg_delta` function correctly handle the
-LeftJoin child. The group_filter correctly references the aliased column
-name from the aggregate delta CTE (not the raw LeftJoin delta).
+**RESOLVED** — Two fixes applied:
 
-**Investigated and ruled out:**
-- Group filter column mismatch (actually works — CTE_B aliases
-  `customer__c_custkey` to `c_custkey`)
-- LEFT JOIN Part 4/5 spurious null-padded rows (fixed with R_old check,
-  but didn't change Q13's behavior — NULL o_orderkey doesn't affect
-  COUNT(o_orderkey))
-- CHAR type padding in EXCEPT ALL (PostgreSQL resolves to TEXT common type)
-- Column count/position mismatch in EXCEPT ALL (Scan has all columns)
+1. **Algebraic intermediate aggregate path** — For intermediate aggregates
+   where all aggregate functions are algebraically invertible (COUNT,
+   COUNT(*), SUM), old values are now computed as
+   `old = COALESCE(new, 0) - COALESCE(ins, 0) + COALESCE(del, 0)` using
+   the already-computed delta CTE LEFT JOINed with the new-rescan CTE.
+   This eliminates the second `diff_node(child)` call (no duplicate
+   LEFT JOIN CTEs) and the EXCEPT ALL old-state reconstruction. Non-
+   invertible aggregates (MIN, MAX, group-rescan) fall back to the
+   original EXCEPT ALL path.
 
-**Next hypothesis:** The EXCEPT ALL old-state reconstruction may have a
-subtle row-matching issue with the duplicate `diff_node(child)` call that
-creates a second set of LEFT JOIN delta CTEs. The old_rescan uses a SECOND
-LEFT JOIN delta (CTE_C) while the group_filter references the FIRST
-aggregate delta (CTE_B). If row content differs between the two due to
-intermediate state or CTE materialization timing, the EXCEPT ALL could
-produce incorrect old c_count values. An algebraic approach (computing
-old values as `new - ins + del` instead of EXCEPT ALL) could bypass this.
+2. **Comment-aware keyword parsing** — `find_top_level_keyword()` now
+   skips `--` single-line and `/* */` block comments. Before this fix,
+   a comment like `-- Operators: ... Subquery-in-FROM ...` would cause
+   `inject_pgt_count` to insert `COUNT(*) AS __pgt_count` into the
+   comment instead of before the real `FROM` clause. Defensive fix —
+   Q13 was passing without it at this baseline, but the bug would
+   silently corrupt any future query with keywords in comments.
 
-**Files:** `src/dvm/operators/aggregate.rs` (`build_intermediate_agg_delta`),
-`src/dvm/operators/outer_join.rs` (Part 4/5 R_old — done)
-**Impact:** Would fix Q13 (+1 pass)
+**Files:** `src/dvm/operators/aggregate.rs` (`build_intermediate_agg_delta`,
+`is_algebraically_invertible`), `src/api.rs` (`find_top_level_keyword`)
+**Impact:** Q13 passes all 3 cycles. Defensive fix for comment handling.
 
 #### P3: Fix scalar subquery delta accuracy (Q15)
 
@@ -285,6 +306,7 @@ scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| **P2** — Intermediate aggregate + comment-aware keyword parsing | Two issues: (1) `build_intermediate_agg_delta` called `diff_node(child)` a second time for EXCEPT ALL old-state reconstruction, creating duplicate LEFT JOIN CTEs with potential row-content divergence. (2) `find_top_level_keyword()` didn't skip SQL comments — a comment containing `FROM` could cause `inject_pgt_count` to inject into the comment instead of the query. | (1) Algebraic intermediate aggregate path: for COUNT/SUM aggregates, old values computed as `old = COALESCE(new, 0) - COALESCE(ins, 0) + COALESCE(del, 0)` using delta CTE LEFT JOIN new-rescan. MIN/MAX/group-rescan fall back to EXCEPT ALL. (2) `find_top_level_keyword()` now skips `--` and `/* */` comments. Added `is_algebraically_invertible()` helper. | Q13 passes all 3 cycles (was data mismatch). Defensive fix for future queries with keywords in comments. |
 | **NEW** — LEFT JOIN Part 4/5 R_old snapshot | Part 4 (delete stale NULL-padded rows) emitted D for ALL left rows matching a new right INSERT, even when the left row already had matching right rows. Part 5 (insert NULL-padded) didn't verify the left row previously had matches. For the MERGE layer this was harmless (no-op on non-existent rows), but for intermediate aggregate old-state reconstruction via EXCEPT ALL/UNION ALL, the spurious D rows added phantom NULL-padded rows to the old state. | Part 4 now checks R_old (`NOT EXISTS (... R_old ...)`) to only emit D when the left row truly had NO matching right rows before. Part 5 now checks R_old (`EXISTS (... R_old ...)`) to confirm the left row HAD matches before. R_old = `R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. | Algebraic correctness improvement for LEFT JOIN delta. Does not change Q13 directly (NULL o_orderkey doesn't affect COUNT(o_orderkey)), but prevents subtle EXCEPT ALL corruption for other intermediate aggregate patterns. |
 | **NEW** — WAL LSN capture (write vs insert position) | CDC trigger and `get_slot_positions()` both used `pg_current_wal_lsn()`, which returns the WAL **write** position (last flushed to kernel). Within a not-yet-committed transaction, the write position can lag behind the actual WAL records being generated. When RF mutations run quickly after a refresh, the trigger captures the **same stale write position** as the previous frontier. The strict `lsn > prev_frontier` scan filter then excludes all new entries, producing a silent no-op refresh. All change buffer entries end up with identical LSN values equal to the frontier. | Changed both the trigger function and `get_current_wal_lsn()` to use `pg_current_wal_insert_lsn()` — the WAL **insert** position, which advances immediately as new WAL records are generated, even within uncommitted transactions. This guarantees each trigger entry gets a unique, monotonically increasing LSN that is always past any prior frontier. | Q01 (all 3 cycles pass — was failing cycle 3) |
 | **NEW** — Frontier-based change buffer cleanup | The deferred cleanup in `drain_pending_cleanups()` stores pending work in thread-local `PENDING_CLEANUP` (`RefCell<Vec<PendingCleanup>>`). When a connection pool dispatches successive `refresh_stream_table()` calls to different PostgreSQL backend processes, the cleanup state from cycle N's backend is invisible to cycle N+1's backend. Change buffer entries accumulate across cycles. | Added `cleanup_change_buffers_by_frontier()` that runs at the start of every differential refresh. Uses persisted frontier data from the catalog (not thread-local) to compute safe cleanup thresholds and delete stale entries. Supplements the existing thread-local drain. | Defense-in-depth for Q01 fix and all multi-cycle refresh scenarios |
