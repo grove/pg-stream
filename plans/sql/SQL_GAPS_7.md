@@ -55,12 +55,12 @@ tracking, and production deployment:
 | **Total new gaps** | **1** | **11** | **4** | **27** | **10** | **53** |
 
 The single P0 item is:
-1. **DELETE+INSERT merge strategy double-evaluation** — the delta query is
-   evaluated twice (once for DELETE, once for INSERT), and the DELETE mutates the
-   stream table before the INSERT's delta evaluation, causing stale reads for
-   aggregate/DISTINCT queries. This is gated behind an explicit GUC
-   (`pg_stream.merge_strategy = 'delete_insert'`) with the default `auto`
-   always using MERGE.
+1. **Remove `delete_insert` merge strategy** — the strategy is unsafe for
+   aggregate/DISTINCT queries (double-evaluation against mutated state), slower
+   than `MERGE` for small deltas, and incompatible with prepared statements.
+   The `auto` strategy already covers the only legitimate use case (large-delta
+   bulk apply). Decision: remove `delete_insert` as a valid GUC value and emit
+   an error if it is set.
 
 The 11 P1 items cluster in three areas:
 - **WAL decoder** (3): pk_hash=0 for keyless tables, `old_*` columns always NULL
@@ -185,17 +185,32 @@ semantically incorrect results under specific data mutation patterns.
 | **Root cause** | The delta query reads `current_right` after all changes are applied (snapshot at query time), not at the frontier LSN |
 | **Effort** | 8–12 hours |
 
-**Mitigation options:**
+**Options:**
 
-| Option | Approach | Tradeoffs |
-|--------|----------|-----------|
-| **A. CTE snapshot** | Wrap the right side in a CTE that reads at the frontier LSN using `pg_snapshot_xmin()` | Requires SERIALIZABLE or snapshot export; complex |
-| **B. Dual-phase delta** | Compute the DELETE delta first using old state, then INSERT delta using new state | Doubles query cost; architecturally invasive |
-| **C. Compensating anti-join** | After the MERGE, detect orphaned rows whose join partner no longer exists and emit corrective DELETEs | Simpler but adds a post-MERGE cleanup pass |
-| **D. Document + FULL fallback** | Document the edge case; let the adaptive threshold trigger FULL refresh when large batches of key-modifying UPDATEs are detected | Pragmatic; no code change; relies on existing fallback |
+**A. CTE snapshot** — wrap the right side in a CTE that reads at the frontier LSN using `pg_snapshot_xmin()`
+- ✅ Fully correct under simultaneous multi-table mutations
+- ❌ Requires SERIALIZABLE isolation or snapshot export — invasive and expensive
+- ❌ Complex implementation; risk of introducing other timing edge cases
 
-**Recommendation:** Option D for now (document + rely on adaptive FULL fallback).
-Option C as a future enhancement if customer reports surface.
+**B. Dual-phase delta** — compute DELETE delta first using old state, then INSERT delta using new state
+- ✅ Architecturally clean separation of old and new state
+- ❌ Doubles the delta query execution cost on every refresh
+- ❌ Architecturally invasive — requires significant rework of the refresh pipeline
+
+**C. Compensating anti-join** — after the MERGE, detect orphaned rows whose join partner no longer exists and emit corrective DELETEs
+- ✅ Simpler than A or B — a clean-up pass after the existing MERGE
+- ✅ Correct for the specific failure mode (stale join result retention)
+- ❌ Adds a post-MERGE pass on every refresh, even for unaffected tables
+- ❌ Does not handle all races — only the "partner deleted" case
+
+**D. Document + FULL fallback** — document the edge case; rely on the adaptive threshold to trigger FULL refresh when large batches of key-modifying UPDATEs are detected
+- ✅ Zero code change — no implementation risk
+- ✅ The adaptive threshold already handles bulk-UPDATE workloads naturally
+- ✅ The failure mode requires a very specific simultaneous combination (key change + right-side delete in the same cycle) — rare in practice
+- ❌ Does not protect against the bug in low-frequency, surgical update scenarios
+- ❌ Relies on the user understanding the documented limitation
+
+**Decision:** Option D for v0.2.0 (document + rely on adaptive FULL fallback). Option C as a future enhancement if customer reports surface.
 
 ---
 
@@ -211,9 +226,19 @@ Option C as a future enhancement if customer reports surface.
 | **Impact** | Medium — requires UPDATE on PARTITION BY key column |
 | **Effort** | 4–6 hours (verification + E2E test) |
 
-**Recommendation:** Write a targeted E2E test that UPDATEs a PARTITION BY key
-and verifies both old and new partitions are correct after refresh. If the test
-passes, downgrade to P4 (documented edge case). If it fails, implement the fix.
+**Options (test-gated):** Write a targeted E2E test that UPDATEs a PARTITION BY key and verifies both old and new partitions are correct after refresh.
+
+- **If test passes:** downgrade to P4 (documented edge case, no fix needed)
+  - ✅ Zero implementation cost
+  - ✅ Confirms the existing DELETE+INSERT splitting is already correct
+- **If test fails — fix `diff_window`:** adapt the window operator to snapshot the old partition key before applying the delta
+  - ✅ Correct for all PARTITION BY key change scenarios
+  - ❌ 4–6h implementation inside the most complex diff operator
+- **If test fails — document as known limitation:**
+  - ✅ Zero code change
+  - ❌ Any UPDATE on a PARTITION BY key produces silently wrong results
+
+**Decision:** Test-gated — run E2E first, then decide.
 
 ---
 
@@ -229,10 +254,20 @@ passes, downgrade to P4 (documented edge case). If it fails, implement the fix.
 | **Impact** | Low — non-monotone recursive CTEs are rare |
 | **Effort** | 6–8 hours |
 
-**Recommendation:** Audit the monotonicity detection in `diff_recursive_cte` to
-ensure non-monotone recursive terms always fall back to recomputation. Add E2E
-tests with non-monotone recursive queries (e.g., `WITH RECURSIVE ... SELECT ...
-EXCEPT SELECT ...`).
+**Options (audit-gated):** Audit the monotonicity detection in `diff_recursive_cte` and add E2E tests with non-monotone recursive queries (e.g., `WITH RECURSIVE ... SELECT ... EXCEPT SELECT ...`).
+
+- **If audit confirms correct fallback:** downgrade to P4 (verified by test)
+  - ✅ No code change needed
+  - ✅ Non-monotone recursive CTEs are rare in practice
+- **If audit finds incorrect fallback — fix strategy selector:**
+  - ✅ Correct differential behaviour for all recursive CTE variants
+  - ❌ The fixpoint logic in `diff_recursive_cte` is complex; risk of regression
+- **If audit finds incorrect fallback — reject non-monotone recursive CTEs in DIFFERENTIAL mode:**
+  - ✅ Simple guard: detect EXCEPT/NOT EXISTS/aggregation in recursive term and reject with a clear error
+  - ✅ Users are directed to FULL mode, which is always correct
+  - ❌ Reduces SQL coverage for an edge case that is theoretically supportable
+
+**Decision:** Audit-gated — run audit + E2E first, then decide between fix and rejection.
 
 ---
 
@@ -301,8 +336,23 @@ These gaps only manifest when the WAL CDC path is active
 | **Severity** | **P1 — Silent duplicates** |
 | **Effort** | 4–6 hours |
 
-**Recommendation:** Implement all-column content hashing in the WAL decoder,
-matching the trigger behavior. Or require PRIMARY KEY for WAL mode.
+**Options:**
+
+**A. Implement all-column content hashing in WAL decoder**
+- ✅ WAL CDC works transparently for keyless tables — no user-facing restriction
+- ✅ Consistent hash between trigger and WAL paths, enabling clean TRIGGER→WAL transition
+- ❌ Hashing all columns on every row is CPU-expensive for wide tables
+- ❌ Must reproduce the exact serialisation of `row_to_json(NEW)::text` from raw WAL bytes — fragile
+- ❌ Generated or excluded columns must be aligned precisely between both paths, or transitions produce hash mismatches
+
+**B. Require PRIMARY KEY for WAL mode**
+- ✅ Simple: one guard check at transition time with a clear error message
+- ✅ Avoids hashing performance overhead
+- ✅ Any table worth production WAL CDC should have a PK; a reasonable prerequisite
+- ❌ Permanent capability gap — keyless tables stay on trigger-based CDC
+- ❌ Creates an asymmetry: trigger path supports keyless tables, WAL path does not
+
+**Decision:** Option B — require PRIMARY KEY for WAL mode. The WAL path is opt-in and production-gated; requiring a PK is a defensible prerequisite. The asymmetry is acceptable and clearly documented.
 
 ---
 
@@ -314,11 +364,27 @@ matching the trigger behavior. Or require PRIMARY KEY for WAL mode.
 | **Problem** | For UPDATE events, `old_*` columns are always written as NULL (comment: "simplified here"). The trigger-based path writes the actual old values. |
 | **Impact** | This breaks the scan delta's UPDATE→DELETE+INSERT splitting, which uses `old_*` values for the DELETE half. Filter predicates that detect rows leaving a filter boundary also need old values. Any non-trivial defining query produces incorrect deltas in WAL CDC mode. |
 | **Severity** | **P1 — Incorrect deltas for all non-trivial queries** |
-| **Effort** | 8–12 hours (requires REPLICA IDENTITY FULL or careful handling) |
+| **Effort** | 8–12 hours |
 
-**Recommendation:** Implement old-value extraction from pgoutput. This requires
-either `REPLICA IDENTITY FULL` on the source table or parsing the pgoutput
-`O` (old tuple data) message that appears when `REPLICA IDENTITY FULL` is set.
+**Options:**
+
+**A. Require `REPLICA IDENTITY FULL` on source tables**
+- ✅ Gives the complete old tuple — exactly mirrors what triggers capture
+- ✅ Simpler decoder: just parse the pgoutput `O` (old tuple) message
+- ✅ Correct for all query types: filter boundary detection, non-PK joins, aggregations
+- ❌ Doubles WAL volume per UPDATE on every source table — significant on write-heavy workloads
+- ❌ Requires `ALTER TABLE ... REPLICA IDENTITY FULL` on each source table — user-visible setup step
+- ❌ Easy to miss on newly added source tables; no automatic enforcement
+
+**B. Handle `REPLICA IDENTITY DEFAULT` (PK columns only)**
+- ✅ No WAL size overhead for tables that don't need full old-row data
+- ✅ Works correctly for simple cases: DELETEs and UPDATEs that don't cross filter boundaries
+- ❌ `old_*` values only available for PK columns — non-PK old values remain NULL
+- ❌ Any stream table whose delta depends on old non-PK values produces silently wrong results
+- ❌ Significantly more complex: must track which columns have old values per event
+- ❌ Partial coverage is very difficult to explain and reason about
+
+**Decision:** Option A — require `REPLICA IDENTITY FULL`. Partial old-tuple coverage (B) creates a category of silent wrong results worse than the trigger fallback. Requiring `REPLICA IDENTITY FULL` is a documented, one-time setup step and standard practice for logical replication use cases.
 
 ---
 
@@ -332,9 +398,7 @@ either `REPLICA IDENTITY FULL` on the source table or parsing the pgoutput
 | **Impact** | Medium — any table or column value containing action keywords |
 | **Effort** | 2–3 hours |
 
-**Recommendation:** Parse the pgoutput format positionally — the action keyword
-appears after `table <schema>.<table>: <ACTION>:`. Use a regex or positional
-parsing instead of `contains()`.
+**Decision:** Parse the pgoutput format positionally — the action keyword appears after `table <schema>.<table>: <ACTION>:`. Use a regex or positional parsing instead of `contains()`. No real alternative: the current approach is a bug, not a design choice.
 
 ---
 
@@ -462,20 +526,15 @@ to exclude `attgenerated != ''` columns.
 
 ## 7. Gap Category 4: Refresh Engine Edge Cases
 
-### G4.1 — DELETE+INSERT Strategy Double-Evaluation
+### G4.1 — DELETE+INSERT Strategy: Remove
 
 | Field | Value |
 |-------|-------|
-| **Location** | `refresh.rs` — DELETE+INSERT merge strategy |
-| **Problem** | The delta query is evaluated twice: once for DELETE, then for INSERT. The DELETE mutates the stream table before the INSERT's delta is evaluated. For aggregate/DISTINCT queries where the delta LEFT JOINs back to the stream table (to read `__pgs_count` or existing values), the INSERT phase sees stale data modified by the DELETE phase. |
-| **Severity** | **P0 — Silent wrong results (gated behind explicit GUC)** |
-| **Impact** | Only affects users who explicitly set `pg_stream.merge_strategy = 'delete_insert'` (default is `auto` which uses MERGE) |
-| **Effort** | 2–4 hours |
-
-**Recommendation:** Either (a) reject `delete_insert` for queries with
-`needs_pgs_count() == true` at strategy selection time, or (b) wrap both
-phases in a single-evaluation CTE (`WITH delta AS MATERIALIZED (...)` then
-DELETE using delta, INSERT using delta).
+| **Location** | `refresh.rs`, `config.rs` — DELETE+INSERT merge strategy |
+| **Problem** | The `delete_insert` strategy has three compounding issues: (1) double-evaluation against mutated state causes silent wrong results for aggregate/DISTINCT queries; (2) it is slower than `MERGE` for small deltas; (3) it is incompatible with prepared statements. The `auto` strategy already switches to bulk apply for large deltas — the only scenario where DELETE+INSERT has any advantage. |
+| **Severity** | **P0 — Remove before public release** |
+| **Decision** | Remove `delete_insert` as a valid `pg_stream.merge_strategy` value. Accept only `auto` and `merge`. Emit `ERROR` if `delete_insert` is set. |
+| **Effort** | 1–2 hours |
 
 ---
 
@@ -489,8 +548,19 @@ DELETE using delta, INSERT using delta).
 | **Impact** | Medium — `LIMIT` in lateral subqueries is a common pattern |
 | **Effort** | 3–4 hours |
 
-**Recommendation:** Warn (not reject) when `LIMIT` is found in a subquery without
-`ORDER BY`. With `ORDER BY`, `LIMIT` in subqueries is deterministic and safe.
+**Options:**
+
+**A. Warn (not reject) when `LIMIT` appears in a subquery without `ORDER BY`**
+- ✅ Does not break existing queries that are deterministic in practice
+- ✅ `LIMIT` with `ORDER BY` is a legitimate, safe pattern (e.g., `LATERAL (SELECT ... ORDER BY price LIMIT 1)`)
+- ❌ Warning may be ignored; user can end up with silently non-deterministic results
+
+**B. Reject `LIMIT` in subqueries entirely**
+- ✅ Eliminates the non-determinism risk completely
+- ❌ Breaks the common `LATERAL (SELECT ... ORDER BY ... LIMIT 1)` pattern, which is deterministic and useful
+- ❌ Overly restrictive — the problem only exists without `ORDER BY`
+
+**Decision:** Option A — warn when `LIMIT` appears without `ORDER BY`, allow when `ORDER BY` is present. The warning clearly communicates the risk without blocking legitimate deterministic uses.
 
 ---
 
@@ -781,9 +851,24 @@ the most important operators (aggregate, join, window).
 | **Impact** | Low — requires keyless tables + exact duplicates |
 | **Effort** | 4–6 hours |
 
-**Recommendation:** Document this limitation prominently. Consider using
-`ctid` as a tiebreaker (caveat: ctid changes on VACUUM/UPDATE), or requiring
-at minimum a UNIQUE constraint.
+**Options:**
+
+**A. Document the limitation**
+- ✅ Zero code change
+- ✅ The failure mode requires an unusual combination: keyless table + exact duplicate rows
+- ❌ Silent wrong results for anyone who hits this edge case
+
+**B. Use `ctid` as a tiebreaker**
+- ✅ `ctid` is always unique within a table at a point in time
+- ❌ `ctid` changes after VACUUM, CLUSTER, or UPDATE (which rewrites the row) — the tiebreaker itself becomes unstable
+- ❌ Using `ctid` in the change buffer means the delta can't match rows across a VACUUM, causing ghost deletes
+
+**C. Require UNIQUE constraint for DIFFERENTIAL mode on keyless tables**
+- ✅ Clean user-facing contract: DIFFERENTIAL requires a PK or UNIQUE constraint
+- ✅ Consistent with the G2.1 decision (requiring PK for WAL mode)
+- ❌ Existing keyless-table stream tables in DIFFERENTIAL mode would break on upgrade
+
+**Decision:** Option A — document prominently. This limitation was already covered by F11 in v0.1.0. The `ctid` approach is too fragile, and requiring a unique constraint for DIFFERENTIAL is a breaking change. The combination of keyless + exact duplicates is sufficiently rare that documentation is the right call.
 
 ---
 
@@ -836,10 +921,22 @@ extension creation. Grant access only to the extension owner.
 | **Severity** | **P1** |
 | **Effort** | 4–6 hours |
 
-**Recommendation:** (1) Document PgBouncer incompatibility prominently. (2)
-Replace session-level advisory locks with `pg_advisory_xact_lock()` (transaction-
-scoped, PgBouncer-safe). (3) Use `SELECT ... FOR UPDATE SKIP LOCKED` on
-`pgs_stream_tables` as an alternative to advisory locks.
+**Options:**
+
+**A. Document the incompatibility — require session-mode pooling or a direct connection**
+- ✅ Zero code change — no implementation risk or maintenance burden
+- ✅ Standard practice: many PostgreSQL extensions document the same restriction (PostGIS, pgcrypto, etc.)
+- ✅ Session-mode pooling and direct connections are common in self-hosted and CNPG deployments
+- ❌ Transaction-mode pooling is the default at many cloud providers (RDS Proxy, Supabase, Neon) — permanently blocks those users
+
+**B. Replace advisory locks with transaction-scoped locking + eliminate prepared statements**
+- ✅ Makes transaction-mode pooling work — `pg_advisory_xact_lock()` and `FOR UPDATE SKIP LOCKED` are transaction-scoped
+- ✅ Removes all session-state dependencies — fully cloud-native
+- ❌ Large refactor: advisory locks are used in refresh, CDC, and scheduling coordination throughout the codebase
+- ❌ Must also eliminate or rework prepared statements (`PREPARE __pgs_merge_*`) which are also session-scoped
+- ❌ Scope is v0.3.0+ — not appropriate as a v0.2.0 correctness fix
+
+**Decision:** Option A for v0.2.0 — document clearly. Option B is architecturally desirable but must be paired with eliminating prepared statements; it belongs in v0.3.0 operational hardening.
 
 ---
 
@@ -851,8 +948,20 @@ scoped, PgBouncer-safe). (3) Use `SELECT ... FOR UPDATE SKIP LOCKED` on
 | **Severity** | **P2** |
 | **Effort** | 2–3 hours |
 
-**Recommendation:** Detect replica mode in `_PG_init()` or at scheduler startup.
-Skip worker registration on replicas. Add clear error for manual refresh on replicas.
+**Options:**
+
+**A. Detect replica mode at startup and skip background worker registration**
+- ✅ Extension loads silently on replicas — no errors, no background worker slot consumed
+- ✅ The replica stays consistent via the primary's WAL replay — no refresh needed
+- ✅ `pg_is_in_recovery()` is a simple, reliable detection mechanism
+- ✅ Promotion is detected automatically: `pg_is_in_recovery()` changes to `false`
+
+**B. Allow worker to start on replicas, fail loudly on first write attempt**
+- ✅ Slightly simpler: no upfront detection code
+- ❌ Consumes a background worker slot and a connection before failing
+- ❌ Error message from a failed SPI write attempt is cryptic and confusing for users
+
+**Decision:** Option A — detect replica mode at startup and skip worker registration. Emit a clear error message for manual `refresh_stream_table()` calls on replicas.
 
 ---
 
@@ -1020,7 +1129,7 @@ correct in this analysis:
 
 | Step | Gap | Description | Effort | Priority |
 |------|-----|-------------|--------|----------|
-| **F1** | G4.1 | DELETE+INSERT strategy: guard or remove | 2–4h | P0 |
+| **F1** | G4.1 | Remove `delete_insert` strategy | 1–2h | P0 |
 | **F2** | G2.1 | WAL decoder: keyless table pk_hash | 4–6h | P1 |
 | **F3** | G2.2 | WAL decoder: old_* columns for UPDATE | 8–12h | P1 |
 | **F4** | G2.3 | WAL decoder: pgoutput action parsing | 2–3h | P1 |
@@ -1126,13 +1235,13 @@ Catches regressions. May surface P1 bugs in untested operators.
 | 2 — Robustness | F13–F16 | 7–9h | 46–66h |
 | 3 — Test Coverage | F17–F26 | 29–38h | 75–104h |
 | 4 — Operational | F27–F40 | 25–36h | 100–140h |
-| 5 — Nice-to-Have | F41–F51 | 19–30h | 119–170h |
-| **Total** | **51 steps** | **119–170h** | — |
+| 5 — Nice-to-Have | F41–F51 | 19–30h | 117–168h |
+| **Total** | **51 steps** | **117–168h** | — |
 
 ### Recommended Execution Order
 
 ```
-Session 1:  F1 (DELETE+INSERT guard) + F4 (pgoutput parsing)        ~5h
+Session 1:  F1 (remove delete_insert) + F4 (pgoutput parsing)        ~4h
 Session 2:  F6 (ALTER TYPE) + F7 (ALTER POLICY) + F10 (ALTER DOMAIN) ~8h
 Session 3:  F8 (window partition E2E) + F9 (recursive monotonicity)  ~12h
 Session 4:  F13 (LIMIT warning) + F14 (CUBE limit) + F15 (RANGE_AGG) ~5h
@@ -1226,7 +1335,7 @@ and robustly in all edge cases under production conditions?"
 | **CDC (trigger-based)** | ✅ Production-ready | F11: keyless duplicate row limitation documented |
 | **CDC (WAL-based)** | ❌ Not production-ready | F2, F3, F4: three P1 correctness issues |
 | **DDL tracking** | ⚠️ Nearly complete | F6, F7, F10: ALTER TYPE/DOMAIN/POLICY untracked |
-| **Refresh engine** | ⚠️ Mostly solid | F1: DELETE+INSERT guard (P0 but gated) |
+| **Refresh engine** | ⚠️ Mostly solid | F1: remove `delete_insert` strategy (P0) |
 | **Production deployment** | ⚠️ Gaps | F12: PgBouncer; F16: replicas; F40: upgrades |
 | **Test coverage** | ⚠️ Significant gaps | F17–F26: 10 test suite expansion tasks |
 | **Monitoring** | ⚠️ Basic | F27–F31: observability improvements |

@@ -63,13 +63,13 @@ coverage.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| F1 | DELETE+INSERT merge strategy double-evaluation guard | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G1.1 (P0) |
+| F1 | Remove `delete_insert` merge strategy (unsafe + superseded by `auto`) | 1–2h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.1 (P0) |
 | F2 | WAL decoder: keyless-table pk_hash computation | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.1 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | F3 | WAL decoder: old_* column population for UPDATEs | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.2 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | F5 | JOIN key column change detection in delta SQL | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.1 (P1) |
 | F6 | ALTER TYPE / ALTER POLICY DDL tracking | 3–5h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G9.1 (P1) |
 
-> **Subtotal: 17–25 hours** (F4 and F7 moved to v0.1.0)
+> **Subtotal: 15–23 hours** (F1 reduced 3–4h → 1–2h; F4 and F7 moved to v0.1.0)
 
 ### Tier 1 — Verification
 
@@ -93,15 +93,16 @@ coverage.
 |------|-------------|--------|-----|
 | F17–F26 | 21 aggregate differential E2E, FULL JOIN E2E, INTERSECT/EXCEPT pairs, GUC variation tests, CI combined coverage | 29–38h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G7 · [STATUS_TESTING.md](plans/testing/STATUS_TESTING.md) |
 
-> **TPC-H coverage baseline** — A 22-query TPC-H correctness test suite
-> (`just test-tpch`, local-only, SF=0.01) is now in place and provides
-> deep regression coverage for F5, F17–F26, and the aggregate +
-> multi-join operator paths. 20/22 queries create; 4/22 pass all cycles.
-> F5 (JOIN key column qualification in delta SQL) is confirmed as the
-> single blocking gap for 16/22 queries at cycle 2+.
-> See [plans/testing/PLAN_TEST_SUITE_TPC_H.md](plans/testing/PLAN_TEST_SUITE_TPC_H.md).
+**v0.2.0 total: ~66–92 hours** (F1 reduced 3–4h → 1–2h; F4, F7, F11, F14 moved to v0.1.0)
+**TPC-H coverage baseline** — A 22-query TPC-H correctness test suite
+(`just test-tpch`, local-only, SF=0.01) is now in place and provides
+deep regression coverage for F5, F17–F26, and the aggregate +
+multi-join operator paths. 20/22 queries create; 4/22 pass all cycles.
+F5 (JOIN key column qualification in delta SQL) is confirmed as the
+single blocking gap for 16/22 queries at cycle 2+.
+See [plans/testing/PLAN_TEST_SUITE_TPC_H.md](plans/testing/PLAN_TEST_SUITE_TPC_H.md).
 
-> **v0.2.0 total: ~68–94 hours** (F4, F7, F11, F14 moved to v0.1.0)
+**v0.2.0 total: ~68–94 hours** (F4, F7, F11, F14 moved to v0.1.0)
 
 **Exit criteria:**
 - [ ] Zero P0 gaps
@@ -247,10 +248,10 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 | Milestone | Effort estimate | Cumulative |
 |-----------|-----------------|------------|
-| v0.2.0 — Correctness | 68–94h | 68–94h |
-| v0.3.0 — Production ready | 40–58h | 108–152h |
-| v0.4.0 — Observability & Integration | 18–27h | 126–179h |
-| v1.0.0 — Stable release | 18–27h | 144–206h |
+| v0.2.0 — Correctness | 66–92h | 66–92h |
+| v0.3.0 — Production ready | 40–58h | 106–150h |
+| v0.4.0 — Observability & Integration | 18–27h | 124–177h |
+| v1.0.0 — Stable release | 18–27h | 142–204h |
 | Post-1.0 (ecosystem) | 88–134h | 232–340h |
 | Post-1.0 (scale) | 6+ months | — |
 
