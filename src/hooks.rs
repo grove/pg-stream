@@ -153,6 +153,28 @@ fn handle_ddl_command(cmd: &DdlCommand) {
             handle_function_change(cmd);
         }
 
+        // ── Type DDL (G3.1) ───────────────────────────────────────────
+        // ALTER TYPE can rename enum values, add enum values, or modify
+        // composite types. If a source column uses the affected type,
+        // the stream table's defining query may produce different results.
+        ("type", "ALTER TYPE") => {
+            handle_type_change(cmd);
+        }
+
+        // ── Domain DDL (G3.2) ─────────────────────────────────────────
+        // ALTER DOMAIN can add/drop constraints. A new constraint may
+        // cause the next refresh to fail if delta rows violate it.
+        ("domain", "ALTER DOMAIN") | ("domain", "CREATE DOMAIN") => {
+            handle_domain_change(cmd);
+        }
+
+        // ── Row-Level Security (G3.3) ─────────────────────────────────
+        // CREATE/ALTER/DROP POLICY and ENABLE/DISABLE RLS on source tables
+        // can silently change the result set of the defining query.
+        ("policy", "CREATE POLICY") | ("policy", "ALTER POLICY") | ("policy", "DROP POLICY") => {
+            handle_policy_change(cmd);
+        }
+
         _ => {}
     }
 }
@@ -335,6 +357,282 @@ fn extract_function_name(identity: &str) -> String {
         .unwrap_or(without_args);
 
     name.to_lowercase()
+}
+
+// ── ALTER TYPE handling (G3.1) ─────────────────────────────────────────────
+
+/// Handle ALTER TYPE on a type that may be used by columns in source tables
+/// tracked by stream tables.
+///
+/// ALTER TYPE ... ADD VALUE is benign (new enum values don't invalidate
+/// existing data). ALTER TYPE ... RENAME VALUE or structural changes
+/// (composite type modifications) may change query semantics, so we
+/// reinitialize affected STs.
+fn handle_type_change(cmd: &DdlCommand) {
+    let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
+
+    // Find all STs that depend on source tables whose columns use this type.
+    // We query pg_attribute to find tables with columns of this type OID,
+    // then check if those tables are source dependencies of any ST.
+    let affected_pgt_ids = match find_sts_using_type(cmd.objid) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to query STs for type {}: {}",
+                identity,
+                e,
+            );
+            return;
+        }
+    };
+
+    if affected_pgt_ids.is_empty() {
+        return;
+    }
+
+    pgrx::info!(
+        "pg_trickle: type {} changed, marking {} stream table(s) for reinit",
+        identity,
+        affected_pgt_ids.len(),
+    );
+
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to mark ST {} for reinit after type change: {}",
+                pgt_id,
+                e,
+            );
+        }
+    }
+
+    // Cascade to transitively dependent STs.
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to cascade type reinit: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to cascade type reinit to ST {}: {}",
+                pgt_id,
+                e,
+            );
+        }
+    }
+
+    let total = affected_pgt_ids.len() + cascade_ids.len();
+    log!(
+        "pg_trickle_ddl_tracker: ALTER TYPE {} → {} ST(s) marked for reinitialize",
+        identity,
+        total,
+    );
+
+    shmem::signal_dag_rebuild();
+    shmem::bump_cache_generation();
+}
+
+/// Find all ST pgt_ids that depend on source tables containing columns of
+/// the given type OID (or domain based on it).
+fn find_sts_using_type(type_oid: pg_sys::Oid) -> Result<Vec<i64>, PgTrickleError> {
+    Spi::connect(|client| {
+        // Find source tables that have any column of this type, then join
+        // with pgt_dependencies to find affected STs.
+        let table = client
+            .select(
+                "SELECT DISTINCT d.pgt_id \
+                 FROM pgtrickle.pgt_dependencies d \
+                 JOIN pg_attribute a ON a.attrelid = d.source_relid \
+                 WHERE a.atttypid = $1 \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped",
+                None,
+                &[type_oid.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        let mut ids = Vec::new();
+        for row in table {
+            if let Ok(Some(id)) = row.get::<i64>(1) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    })
+}
+
+// ── ALTER DOMAIN handling (G3.2) ───────────────────────────────────────────
+
+/// Handle ALTER DOMAIN on a domain that may be used by columns in source
+/// tables tracked by stream tables.
+///
+/// Adding/dropping constraints on a domain can cause the next refresh to fail
+/// if delta INSERT rows violate the new constraint. We proactively reinitialize
+/// affected STs so the schema change is detected cleanly.
+fn handle_domain_change(cmd: &DdlCommand) {
+    let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
+
+    // Domains are types in pg_type. The OID from pg_event_trigger_ddl_commands()
+    // is the domain's pg_type.oid. We reuse find_sts_using_type since domain
+    // columns in pg_attribute have atttypid = the domain OID.
+    let affected_pgt_ids = match find_sts_using_type(cmd.objid) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to query STs for domain {}: {}",
+                identity,
+                e,
+            );
+            return;
+        }
+    };
+
+    if affected_pgt_ids.is_empty() {
+        return;
+    }
+
+    pgrx::info!(
+        "pg_trickle: domain {} changed, marking {} stream table(s) for reinit",
+        identity,
+        affected_pgt_ids.len(),
+    );
+
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to mark ST {} for reinit after domain change: {}",
+                pgt_id,
+                e,
+            );
+        }
+    }
+
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to cascade domain reinit: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to cascade domain reinit to ST {}: {}",
+                pgt_id,
+                e,
+            );
+        }
+    }
+
+    let total = affected_pgt_ids.len() + cascade_ids.len();
+    log!(
+        "pg_trickle_ddl_tracker: ALTER DOMAIN {} → {} ST(s) marked for reinitialize",
+        identity,
+        total,
+    );
+
+    shmem::signal_dag_rebuild();
+    shmem::bump_cache_generation();
+}
+
+// ── Row-Level Security (RLS) policy handling (G3.3) ────────────────────────
+
+/// Handle CREATE/ALTER/DROP POLICY on a table that may be a source table
+/// tracked by stream tables.
+///
+/// RLS policy changes can silently alter the result set of the defining
+/// query if the background worker's role is subject to RLS. We reinitialize
+/// affected STs to ensure correctness.
+fn handle_policy_change(cmd: &DdlCommand) {
+    let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
+
+    // For policy events, the objid from pg_event_trigger_ddl_commands() is
+    // the policy OID (pg_policy.oid), not the table OID. Look up the table
+    // via pg_policy.polrelid.
+    let table_oid = match Spi::get_one::<pg_sys::Oid>(&format!(
+        "SELECT polrelid FROM pg_policy WHERE oid = {}",
+        cmd.objid.to_u32(),
+    )) {
+        Ok(Some(oid)) => oid,
+        _ => {
+            // Can't resolve the table — may already be dropped. Ignore.
+            return;
+        }
+    };
+
+    let affected_pgt_ids = match find_downstream_pgt_ids(table_oid) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to query deps for policy change on {}: {}",
+                identity,
+                e,
+            );
+            return;
+        }
+    };
+
+    if affected_pgt_ids.is_empty() {
+        return;
+    }
+
+    pgrx::info!(
+        "pg_trickle: RLS policy {} changed, marking {} stream table(s) for reinit",
+        identity,
+        affected_pgt_ids.len(),
+    );
+
+    for pgt_id in &affected_pgt_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to mark ST {} for reinit after policy change: {}",
+                pgt_id,
+                e,
+            );
+        }
+    }
+
+    let cascade_ids = match find_transitive_downstream_sts(&affected_pgt_ids) {
+        Ok(ids) => ids,
+        Err(e) => {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to cascade policy reinit: {}",
+                e
+            );
+            Vec::new()
+        }
+    };
+
+    for pgt_id in &cascade_ids {
+        if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+            pgrx::warning!(
+                "pg_trickle_ddl_tracker: failed to cascade policy reinit to ST {}: {}",
+                pgt_id,
+                e,
+            );
+        }
+    }
+
+    let total = affected_pgt_ids.len() + cascade_ids.len();
+    log!(
+        "pg_trickle_ddl_tracker: policy change on {} → {} ST(s) marked for reinitialize",
+        identity,
+        total,
+    );
+
+    shmem::signal_dag_rebuild();
+    shmem::bump_cache_generation();
 }
 
 // ── ALTER TABLE handling ───────────────────────────────────────────────────

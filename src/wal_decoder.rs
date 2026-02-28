@@ -381,6 +381,50 @@ fn parse_pgoutput_columns(data: &str) -> std::collections::HashMap<String, Strin
     cols
 }
 
+/// Parse old-tuple column values from a pgoutput UPDATE data line.
+///
+/// With `REPLICA IDENTITY FULL`, pgoutput UPDATE messages include an
+/// "old-key:" section before the "new-tuple:" section:
+/// ```text
+/// table public.t: UPDATE: old-key: id[integer]:1 name[text]:'Alice' new-tuple: id[integer]:1 name[text]:'Bob'
+/// ```
+///
+/// This function extracts the "old-key:" portion and parses column values.
+/// Returns an empty map for non-UPDATE messages or messages without an
+/// "old-key:" section (i.e., REPLICA IDENTITY DEFAULT where only PK
+/// columns appear in old-key).
+fn parse_pgoutput_old_columns(data: &str) -> std::collections::HashMap<String, String> {
+    let mut cols = std::collections::HashMap::new();
+
+    // Find the "old-key:" section in UPDATE messages.
+    let old_key_start = match data.find("old-key:") {
+        Some(pos) => pos + 9, // skip past "old-key: "
+        None => return cols,
+    };
+
+    // The old-key section ends at "new-tuple:" (if present) or at end of string.
+    let old_key_end = data[old_key_start..]
+        .find("new-tuple:")
+        .map(|pos| old_key_start + pos)
+        .unwrap_or(data.len());
+
+    let old_section = &data[old_key_start..old_key_end];
+
+    // Parse column_name[type]:value pairs from the old-key section.
+    for segment in old_section.split_whitespace() {
+        if let Some(bracket_pos) = segment.find('[') {
+            let col_name = &segment[..bracket_pos];
+            if let Some(colon_pos) = segment.find("]:") {
+                let value = &segment[colon_pos + 2..];
+                let clean_value = value.trim_matches('\'');
+                cols.insert(col_name.to_string(), clean_value.to_string());
+            }
+        }
+    }
+
+    cols
+}
+
 /// Write a decoded WAL change to the buffer table.
 ///
 /// Maps the parsed pgoutput data into the typed buffer table columns,
@@ -401,6 +445,15 @@ fn write_decoded_change(
     }
 
     let parsed = parse_pgoutput_columns(data);
+
+    // G2.2: Parse old-tuple values for UPDATE events.
+    // With REPLICA IDENTITY FULL, pgoutput includes the old tuple in the
+    // "old-key:" section before the new tuple. Parse both sections.
+    let old_parsed = if *action == 'U' {
+        parse_pgoutput_old_columns(data)
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Build the INSERT statement for the buffer table
     let has_pk = !pk_columns.is_empty();
@@ -441,10 +494,16 @@ fn write_decoded_change(
                 } else {
                     col_values.push("NULL".to_string());
                 }
-                // old values (available with REPLICA IDENTITY FULL or for PK columns)
+                // G2.2: old values from pgoutput old-key section.
+                // With REPLICA IDENTITY FULL (required by try_start_transition),
+                // pgoutput includes the complete old tuple. Parse old values
+                // from the "old-key:" section of the UPDATE message.
                 col_names.push(format!("\"old_{}\"", safe_name));
-                // pgoutput separates old-key and new-tuple; simplified here
-                col_values.push("NULL".to_string());
+                if let Some(val) = old_parsed.get(col_name) {
+                    col_values.push(format!("'{}'", val.replace('\'', "''")));
+                } else {
+                    col_values.push("NULL".to_string());
+                }
             }
             'D' => {
                 col_names.push(format!("\"old_{}\"", safe_name));
@@ -841,6 +900,36 @@ fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), P
         return Ok(());
     }
 
+    // G2.1: Require PRIMARY KEY for WAL mode. Keyless tables use content-based
+    // hashing in trigger mode, which cannot be reproduced from raw WAL bytes.
+    // The pk_hash mismatch between trigger (content hash) and WAL ("0") would
+    // cause duplicate rows during transition.
+    let pk_columns = cdc::resolve_pk_columns(dep.source_relid)?;
+    if pk_columns.is_empty() {
+        log!(
+            "pg_trickle: source OID {} has no PRIMARY KEY — WAL-based CDC requires a PK. \
+             Staying on trigger-based CDC.",
+            dep.source_relid.to_u32()
+        );
+        return Ok(());
+    }
+
+    // G2.2: Require REPLICA IDENTITY FULL for WAL mode. Without it, UPDATE
+    // events only contain PK columns as old values — non-PK old_* columns
+    // would be NULL, breaking filter boundary detection and JOIN delta
+    // computation.
+    let identity = cdc::get_replica_identity_mode(dep.source_relid)?;
+    if identity != "full" {
+        log!(
+            "pg_trickle: source OID {} has REPLICA IDENTITY '{}' (need FULL) — \
+             WAL-based CDC requires REPLICA IDENTITY FULL for correct UPDATE old values. \
+             Run: ALTER TABLE ... REPLICA IDENTITY FULL. Staying on triggers.",
+            dep.source_relid.to_u32(),
+            identity
+        );
+        return Ok(());
+    }
+
     // All prerequisites met — start the transition
     start_wal_transition(dep.source_relid, dep.pgt_id, change_schema)?;
 
@@ -1181,5 +1270,55 @@ mod tests {
         let mut parsed = std::collections::HashMap::new();
         parsed.insert("id".to_string(), "42".to_string());
         assert!(!detect_schema_mismatch(&parsed, &expected));
+    }
+
+    // ── parse_pgoutput_old_columns tests (G2.2) ───────────────────
+
+    #[test]
+    fn test_parse_old_columns_update_with_old_key() {
+        let data = "table public.users: UPDATE: old-key: id[integer]:1 name[text]:'Alice' new-tuple: id[integer]:1 name[text]:'Bob'";
+        let old = parse_pgoutput_old_columns(data);
+        assert_eq!(old.get("id").map(|s| s.as_str()), Some("1"));
+        assert_eq!(old.get("name").map(|s| s.as_str()), Some("Alice"));
+    }
+
+    #[test]
+    fn test_parse_old_columns_no_old_key_section() {
+        // UPDATE without REPLICA IDENTITY FULL produces no old-key section
+        let data = "table public.users: UPDATE: id[integer]:1 name[text]:'Bob'";
+        let old = parse_pgoutput_old_columns(data);
+        assert!(old.is_empty());
+    }
+
+    #[test]
+    fn test_parse_old_columns_insert_has_no_old_key() {
+        let data = "table public.users: INSERT: id[integer]:1 name[text]:'Alice'";
+        let old = parse_pgoutput_old_columns(data);
+        assert!(old.is_empty());
+    }
+
+    #[test]
+    fn test_parse_old_columns_delete_has_no_old_key() {
+        let data = "table public.users: DELETE: id[integer]:1";
+        let old = parse_pgoutput_old_columns(data);
+        assert!(old.is_empty());
+    }
+
+    #[test]
+    fn test_parse_old_columns_old_key_at_end() {
+        // Edge case: old-key section without a following new-tuple marker
+        let data = "table public.users: UPDATE: old-key: id[integer]:99 name[text]:'Zara'";
+        let old = parse_pgoutput_old_columns(data);
+        assert_eq!(old.get("id").map(|s| s.as_str()), Some("99"));
+        assert_eq!(old.get("name").map(|s| s.as_str()), Some("Zara"));
+    }
+
+    #[test]
+    fn test_parse_old_columns_composite_pk() {
+        let data = "table public.orders: UPDATE: old-key: customer_id[integer]:5 order_id[integer]:10 new-tuple: customer_id[integer]:5 order_id[integer]:10 status[text]:'shipped'";
+        let old = parse_pgoutput_old_columns(data);
+        assert_eq!(old.get("customer_id").map(|s| s.as_str()), Some("5"));
+        assert_eq!(old.get("order_id").map(|s| s.as_str()), Some("10"));
+        assert_eq!(old.len(), 2);
     }
 }
