@@ -221,6 +221,67 @@ SELECT pgstream.drop_stream_table('test_st');
 DROP TABLE test_source;
 ```
 
+## Upgrading
+
+To upgrade pg_stream to a newer version without losing data:
+
+### 1. Install the new extension files
+
+Follow the same steps as [Installing from a Pre-built Release](#installing-from-a-pre-built-release)
+to overwrite the shared library and SQL files with the new version. You do **not** need to drop
+the extension from your databases first.
+
+**Linux / macOS:**
+
+```bash
+tar xzf pg_stream-<new-ver>-pg18-linux-amd64.tar.gz
+cd pg_stream-<new-ver>-pg18-linux-amd64
+
+sudo cp lib/*.so  "$(pg_config --pkglibdir)/"
+sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
+```
+
+### 2. Restart PostgreSQL (when required)
+
+If the shared library ABI has changed, restart PostgreSQL before proceeding so the
+new `.so`/`.dll` is loaded. The release notes for each version will call this out
+explicitly when a restart is required.
+
+```bash
+pg_ctl restart -D /path/to/data
+# or
+systemctl restart postgresql
+```
+
+### 3. Apply the schema migration in each database
+
+Connect to every database where pg_stream is installed and run:
+
+```sql
+-- Upgrade to the latest bundled version
+ALTER EXTENSION pg_stream UPDATE;
+
+-- Or upgrade to a specific version
+ALTER EXTENSION pg_stream UPDATE TO '0.2.0';
+```
+
+PostgreSQL uses the versioned SQL migration scripts bundled with the release
+(e.g. `pg_stream--0.1.0--0.2.0.sql`) to apply any catalog changes. The command
+is a no-op when no migration script is needed for a given release.
+
+You can confirm the active version afterwards:
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'pg_stream';
+```
+
+> **Coming soon:** A future release will include a helper function
+> (`pgstream.upgrade()`) that automates steps 2–3 across all databases in the
+> cluster and validates catalog integrity after the migration. Until then, the
+> manual steps above are the supported upgrade path.
+
+---
+
 ## Uninstallation
 
 ```sql
