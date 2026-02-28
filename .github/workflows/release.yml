@@ -135,7 +135,7 @@ jobs:
           Write-Host "Archive: ${archiveName}.zip"
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.artifact_suffix }}
           path: dist/*.${{ matrix.archive_ext }}
