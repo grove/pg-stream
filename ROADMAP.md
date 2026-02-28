@@ -1,7 +1,7 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-02-27
-> **Current version:** 0.1.1
+> **Last updated:** 2026-02-28
+> **Current version:** 0.1.2
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -93,16 +93,14 @@ coverage.
 |------|-------------|--------|-----|
 | F17–F26 | 21 aggregate differential E2E, FULL JOIN E2E, INTERSECT/EXCEPT pairs, GUC variation tests, CI combined coverage | 29–38h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G7 · [STATUS_TESTING.md](plans/testing/STATUS_TESTING.md) |
 
-**v0.2.0 total: ~66–92 hours** (F1 reduced 3–4h → 1–2h; F4, F7, F11, F14 moved to v0.1.0)
 **TPC-H coverage baseline** — A 22-query TPC-H correctness test suite
 (`just test-tpch`, local-only, SF=0.01) is now in place and provides
 deep regression coverage for F5, F17–F26, and the aggregate +
-multi-join operator paths. 20/22 queries create; 4/22 pass all cycles.
-F5 (JOIN key column qualification in delta SQL) is confirmed as the
-single blocking gap for 16/22 queries at cycle 2+.
+multi-join operator paths. 20/22 queries create; 15/22 pass deterministic
+correctness checks across multiple mutation cycles.
 See [plans/testing/PLAN_TEST_SUITE_TPC_H.md](plans/testing/PLAN_TEST_SUITE_TPC_H.md).
 
-**v0.2.0 total: ~68–94 hours** (F4, F7, F11, F14 moved to v0.1.0)
+**v0.2.0 total: ~66–92 hours** (F1 reduced 3–4h → 1–2h; F4, F7, F11, F14 moved to v0.1.0)
 
 **Exit criteria:**
 - [ ] Zero P0 gaps

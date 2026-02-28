@@ -9,6 +9,12 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+*(No unreleased changes.)*
+
+---
+
+## [0.1.2] — 2026-02-28
+
 ### Changed
 
 #### Project Renamed from pg_stream to pg_trickle
