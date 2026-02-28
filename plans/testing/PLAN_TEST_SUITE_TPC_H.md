@@ -30,9 +30,9 @@ query that pg_trickle can currently handle:
 | Phase 2: Cross-Query Consistency | Done — 16/20 STs survive all cycles |
 | Phase 3: FULL vs DIFFERENTIAL | Done — 17/22 pass |
 
-### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
+### Latest Test Run (2026-02-28, SF=0.01, 3 cycles)
 
-All three phases run cleanly. Four DVM fixes applied since the initial
+All three phases run cleanly. Five DVM fixes applied since the initial
 TPC-H suite was completed:
 
 1. **WAL LSN capture** (`pg_current_wal_insert_lsn()`) — CDC triggers and
@@ -55,6 +55,14 @@ TPC-H suite was completed:
    NULL). The merge CTE now skips the 'D' classification for scalar
    aggregates and emits NULL (not 0) for SUM/MIN/MAX when count drops
    to 0.
+
+5. **LEFT JOIN Part 4/5 R_old check** — Parts 4 and 5 of the LEFT JOIN
+   delta now verify the pre-change right state (R_old) before emitting
+   NULL-padded D/I rows. Part 4 only emits D when the left row had NO
+   matching right rows before (was truly NULL-padded). Part 5 only emits
+   I when the left row HAD matches before (truly transitioning to
+   NULL-padded).  Prevents spurious null-padded rows that could corrupt
+   intermediate aggregate old-state reconstruction via EXCEPT ALL.
 
 ```
 Phase 1: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 43s)
@@ -192,17 +200,31 @@ design across join.rs and semi_join.rs.
 #### P2: Fix intermediate aggregate data mismatch (Q13)
 
 Q13 progressed from `column st.c_custkey does not exist` to a data mismatch
-(ST=2, Q=3). The intermediate aggregate detection and
-`build_intermediate_agg_delta` function correctly handle the LeftJoin child
-but the old/new rescan produces fewer rows than expected.
+(ST=2, Q=3, missing: c_count=10, custdist=140). The intermediate aggregate
+detection and `build_intermediate_agg_delta` function correctly handle the
+LeftJoin child. The group_filter correctly references the aliased column
+name from the aggregate delta CTE (not the raw LeftJoin delta).
 
-**Hypothesis:** The `group_filter` (WHERE clause limiting rescan to affected
-groups) doesn't capture all groups affected by LEFT JOIN delta changes. When
-an order is deleted, the LEFT JOIN delta may not produce a change row for
-the affected customer, so the intermediate aggregate doesn't rescan that
-group.
+**Investigated and ruled out:**
+- Group filter column mismatch (actually works — CTE_B aliases
+  `customer__c_custkey` to `c_custkey`)
+- LEFT JOIN Part 4/5 spurious null-padded rows (fixed with R_old check,
+  but didn't change Q13's behavior — NULL o_orderkey doesn't affect
+  COUNT(o_orderkey))
+- CHAR type padding in EXCEPT ALL (PostgreSQL resolves to TEXT common type)
+- Column count/position mismatch in EXCEPT ALL (Scan has all columns)
 
-**Files:** `src/dvm/operators/aggregate.rs` (`build_intermediate_agg_delta`)
+**Next hypothesis:** The EXCEPT ALL old-state reconstruction may have a
+subtle row-matching issue with the duplicate `diff_node(child)` call that
+creates a second set of LEFT JOIN delta CTEs. The old_rescan uses a SECOND
+LEFT JOIN delta (CTE_C) while the group_filter references the FIRST
+aggregate delta (CTE_B). If row content differs between the two due to
+intermediate state or CTE materialization timing, the EXCEPT ALL could
+produce incorrect old c_count values. An algebraic approach (computing
+old values as `new - ins + del` instead of EXCEPT ALL) could bypass this.
+
+**Files:** `src/dvm/operators/aggregate.rs` (`build_intermediate_agg_delta`),
+`src/dvm/operators/outer_join.rs` (Part 4/5 R_old — done)
 **Impact:** Would fix Q13 (+1 pass)
 
 #### P3: Fix scalar subquery delta accuracy (Q15)
@@ -263,6 +285,7 @@ scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| **NEW** — LEFT JOIN Part 4/5 R_old snapshot | Part 4 (delete stale NULL-padded rows) emitted D for ALL left rows matching a new right INSERT, even when the left row already had matching right rows. Part 5 (insert NULL-padded) didn't verify the left row previously had matches. For the MERGE layer this was harmless (no-op on non-existent rows), but for intermediate aggregate old-state reconstruction via EXCEPT ALL/UNION ALL, the spurious D rows added phantom NULL-padded rows to the old state. | Part 4 now checks R_old (`NOT EXISTS (... R_old ...)`) to only emit D when the left row truly had NO matching right rows before. Part 5 now checks R_old (`EXISTS (... R_old ...)`) to confirm the left row HAD matches before. R_old = `R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. | Algebraic correctness improvement for LEFT JOIN delta. Does not change Q13 directly (NULL o_orderkey doesn't affect COUNT(o_orderkey)), but prevents subtle EXCEPT ALL corruption for other intermediate aggregate patterns. |
 | **NEW** — WAL LSN capture (write vs insert position) | CDC trigger and `get_slot_positions()` both used `pg_current_wal_lsn()`, which returns the WAL **write** position (last flushed to kernel). Within a not-yet-committed transaction, the write position can lag behind the actual WAL records being generated. When RF mutations run quickly after a refresh, the trigger captures the **same stale write position** as the previous frontier. The strict `lsn > prev_frontier` scan filter then excludes all new entries, producing a silent no-op refresh. All change buffer entries end up with identical LSN values equal to the frontier. | Changed both the trigger function and `get_current_wal_lsn()` to use `pg_current_wal_insert_lsn()` — the WAL **insert** position, which advances immediately as new WAL records are generated, even within uncommitted transactions. This guarantees each trigger entry gets a unique, monotonically increasing LSN that is always past any prior frontier. | Q01 (all 3 cycles pass — was failing cycle 3) |
 | **NEW** — Frontier-based change buffer cleanup | The deferred cleanup in `drain_pending_cleanups()` stores pending work in thread-local `PENDING_CLEANUP` (`RefCell<Vec<PendingCleanup>>`). When a connection pool dispatches successive `refresh_stream_table()` calls to different PostgreSQL backend processes, the cleanup state from cycle N's backend is invisible to cycle N+1's backend. Change buffer entries accumulate across cycles. | Added `cleanup_change_buffers_by_frontier()` that runs at the start of every differential refresh. Uses persisted frontier data from the catalog (not thread-local) to compute safe cleanup thresholds and delete stale entries. Supplements the existing thread-local drain. | Defense-in-depth for Q01 fix and all multi-cycle refresh scenarios |
 | **NEW** — SemiJoin/AntiJoin Part 1 R_old snapshot | SemiJoin Part 1 (`Δ_left ⋉ R_current`) checked EXISTS against R_current for all delta actions. When RF2 deletes rows from both sides simultaneously (e.g., orders AND their lineitems), a deleted left row's 'D' action checks EXISTS against R_current where the matching right-side rows are already gone → EXISTS fails → DELETE not emitted → stale row accumulates in ST. Same pattern for AntiJoin with NOT EXISTS. | Part 1 now uses CASE WHEN: DELETEs check `EXISTS(... R_old ...)` (pre-change right), INSERTs check `EXISTS(... R_current ...)`. R_old is the standard pre-change snapshot (`R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`). Mirror fix applied to AntiJoin. | Q04 (all 3 cycles pass — was failing cycle 3 with extra=1, missing=1) |

@@ -114,6 +114,31 @@ pub fn diff_left_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // Part 5 NOT EXISTS: uses l (current_left) and r (current_right)
     let not_exists_cond = rewrite_join_condition(condition, left, "l", right, "r");
 
+    // R_old condition: uses l (current_left) and __pgt_r_old (pre-change right)
+    let r_old_cond = rewrite_join_condition(condition, left, "l", right, "__pgt_r_old");
+
+    // Build R_old snapshot for Parts 4/5: pre-change right state.
+    // R_old = R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
+    // Used to check whether a left row had ANY matching right row BEFORE
+    // the current cycle's changes, preventing spurious NULL-padded D/I.
+    let right_user_cols: Vec<&String> = right_cols.iter().filter(|c| *c != "__pgt_count").collect();
+    let right_col_list: String = right_user_cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let right_alias = right.alias();
+
+    let r_old_snapshot = format!(
+        "(SELECT {right_col_list} FROM {right_table} {ra} \
+         EXCEPT ALL \
+         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'I' \
+         UNION ALL \
+         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'D')",
+        ra = quote_ident(right_alias),
+        delta_right = right_result.cte_name,
+    );
+
     // Null-padded columns for Parts 4 & 5 (left from `l`, right all NULL)
     let l_null_padded_cols = [l_cols.as_slice(), null_right_cols.as_slice()]
         .concat()
@@ -172,11 +197,13 @@ WHERE NOT EXISTS (
 
 UNION ALL
 
--- Part 4: Delete stale NULL-padded rows when new right matches appear.
--- When a right INSERT creates a first match for a previously-unmatched
--- left row, the NULL-padded ST row must be removed. We emit DELETE for
--- the NULL-padded combination; if it doesn't exist in the ST, the MERGE
--- ignores it (NOT MATCHED + action='D' → no-op).
+-- Part 4: Delete stale NULL-padded rows when a left row gains its FIRST right match.
+-- When a right INSERT creates a new match for a left row that previously had NO
+-- matching right rows (was NULL-padded), the NULL-padded ST row must be removed.
+-- We check R_old (pre-change right) to verify the left row truly had no matches
+-- before. Without this check, left rows that ALREADY had matches would get
+-- spurious D(NULL-padded) rows that corrupt intermediate aggregate old-state
+-- reconstruction via EXCEPT ALL/UNION ALL.
 SELECT 0::BIGINT AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
        {l_null_padded_cols}
@@ -184,13 +211,17 @@ FROM {left_table} l
 JOIN {delta_right} dr ON {join_cond_part2}
 WHERE dr.__pgt_action = 'I'
   AND (SELECT has_ins FROM {flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )
 
 UNION ALL
 
--- Part 5: Insert NULL-padded rows when a left row loses all right matches.
--- When a right DELETE removes the last match for an existing left row,
--- the left row reverts to NULL-padded. Check current right (post-changes)
--- to verify no remaining matches exist.
+-- Part 5: Insert NULL-padded rows when a left row loses ALL right matches.
+-- When a right DELETE removes the last match for a left row, the left row
+-- reverts to NULL-padded. Check current right (post-changes) to verify no
+-- remaining matches exist, AND check R_old to confirm the left row previously
+-- HAD matches (otherwise it was already NULL-padded — no change needed).
 SELECT 0::BIGINT AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
        {l_null_padded_cols}
@@ -200,7 +231,10 @@ WHERE dr.__pgt_action = 'D'
   AND (SELECT has_del FROM {flags_cte})
   AND NOT EXISTS (
     SELECT 1 FROM {right_table} r WHERE {not_exists_cond}
-)",
+  )
+  AND EXISTS (
+    SELECT 1 FROM {r_old_snapshot} __pgt_r_old WHERE {r_old_cond}
+  )",
         delta_left = left_result.cte_name,
         delta_right = right_result.cte_name,
         flags_cte = flags_cte,
