@@ -1,13 +1,17 @@
 //! Inner join differentiation.
 //!
-//! ΔI(Q ⋈C R) = (ΔIQ ⋈C R₁) ∪ (Q₀ ⋈C ΔIR)
+//! ΔI(Q ⋈C R) = (ΔQ ⋈C R₁) + (Q₀ ⋈C ΔR)
 //!
 //! Where:
-//! - R₁ = current state of R (post-change)
-//! - Q₀ = current state of Q (using the live table)
+//! - R₁ = current state of R (post-change, i.e. live table)
+//! - Q₀ = pre-change state of Q, reconstructed as
+//!   Q_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
+//! - ΔQ, ΔR = deltas (INSERT/DELETE) for each side
 //!
-//! For correctness with simultaneous changes on both sides, an anti-join
-//! is used in Part 2 to avoid double-counting rows where both sides changed.
+//! Using Q₀ (pre-change) in Part 2 instead of Q₁ (post-change) avoids
+//! double-counting when both sides change simultaneously: Part 1 already
+//! handles (ΔQ ⋈ R₁), and using Q₀ excludes newly-inserted Q rows that
+//! would duplicate Part 1's contribution.
 //!
 //! ## Semi-join optimization
 //!
@@ -150,7 +154,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // Rewrite join condition with aliases for each part.
     // The original condition uses the source table aliases (e.g. o.cust_id = c.id).
     // Part 1 needs: dl (delta left) + r (base right).
-    // Part 2 needs: l (base left) + dr (delta right).
+    // Part 2 needs: l (pre-change left) + dr (delta right).
     //
     // For nested join children, column names are disambiguated with the
     // original table alias prefix (e.g., o.cust_id → dl."o__cust_id").
@@ -178,18 +182,67 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         &left_result.cte_name,
         JoinSide::Right,
     );
-    // Part 2: left base table filtered by delta-right join keys
-    let left_table_filtered = build_semijoin_subquery(
-        &left_table,
-        &equi_keys,
-        &right_result.cte_name,
-        JoinSide::Left,
-    );
+    // ── Pre-change snapshot for Part 2 (Scan children only) ─────────
+    //
+    // Standard DBSP: ΔJ = (ΔL ⋈ R₁) + (L₀ ⋈ ΔR)
+    //
+    // L₀ = the state of the left child BEFORE the current cycle's changes.
+    // Reconstructed as: L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes.
+    //
+    // For Scan children this is cheap: one table scan and a small delta.
+    // For nested join children, computing L₀ requires the full join
+    // snapshot plus EXCEPT ALL — prohibitively expensive for multi-table
+    // chains. Fall back to post-change L₁ with semi-join filter, which
+    // may double-count when both sides change simultaneously, but this
+    // only matters when the LEFT child of the outer join also changes,
+    // which is uncommon in practice (RF mutations typically touch only
+    // base tables, not derived join results).
+    let left_part2_source = if is_simple_child(left) {
+        // Scan child: use cheap L₀ via EXCEPT ALL
+        let left_data_cols: String = left_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
 
-    // With PK-based row IDs, DISTINCT ON (__pgs_row_id) in the MERGE's
-    // USING clause handles deduplication correctly. Duplicate INSERT rows
-    // from both parts resolve to the same PK-based hash and are collapsed.
-    // No anti-join needed for correctness; it was only a perf optimization.
+        let left_alias = left.alias();
+        let left_pre_change = format!(
+            "(SELECT {left_data_cols} FROM {left_table} {la} \
+             EXCEPT ALL \
+             SELECT {left_data_cols} FROM {delta_left} WHERE __pgs_action = 'I' \
+             UNION ALL \
+             SELECT {left_data_cols} FROM {delta_left} WHERE __pgs_action = 'D')",
+            la = quote_ident(left_alias),
+            delta_left = left_result.cte_name,
+        );
+        // Apply semi-join filter to L₀ if equi-keys are available
+        if equi_keys.is_empty() {
+            left_pre_change
+        } else {
+            let filters: Vec<String> = equi_keys
+                .iter()
+                .map(|(left_key, right_key)| {
+                    format!(
+                        "{left_key} IN (SELECT DISTINCT {right_key} FROM {})",
+                        right_result.cte_name
+                    )
+                })
+                .collect();
+            format!(
+                "(SELECT * FROM {left_pre_change} __l0 WHERE {filters})",
+                filters = filters.join(" AND "),
+            )
+        }
+    } else {
+        // Nested join child: use post-change L₁ with semi-join filter
+        // (too expensive to compute L₀ via EXCEPT ALL for nested joins)
+        build_semijoin_subquery(
+            &left_table,
+            &equi_keys,
+            &right_result.cte_name,
+            JoinSide::Left,
+        )
+    };
 
     let cte_name = ctx.next_cte_name("join");
 
@@ -204,11 +257,13 @@ JOIN {right_table_filtered} r ON {join_cond_part1}
 
 UNION ALL
 
--- Part 2: current_left JOIN delta_right (semi-join filtered)
+-- Part 2: pre-change_left JOIN delta_right
+-- For Scan children: L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
+-- For nested joins: L₁ = current snapshot (semi-join filtered)
 SELECT {hash_part2} AS __pgs_row_id,
        dr.__pgs_action,
        {all_cols_part2}
-FROM {left_table_filtered} l
+FROM {left_part2_source} l
 JOIN {delta_right} dr ON {join_cond_part2}",
         delta_left = left_result.cte_name,
         delta_right = right_result.cte_name,
@@ -362,10 +417,26 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should have two parts (delta_left JOIN right, left JOIN delta_right)
+        // Should have two parts (delta_left JOIN right, pre-change_left JOIN delta_right)
         assert_sql_contains(&sql, "Part 1");
         assert_sql_contains(&sql, "Part 2");
-        assert_sql_contains(&sql, "UNION ALL");
+        assert_sql_contains(&sql, "pre-change_left");
+    }
+
+    #[test]
+    fn test_diff_inner_join_pre_change_snapshot() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "orders", "public", "o", &["id", "cust_id"]);
+        let right = scan(2, "customers", "public", "c", &["id", "name"]);
+        let cond = eq_cond("o", "cust_id", "c", "id");
+        let tree = inner_join(cond, left, right);
+        let result = diff_inner_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Part 2 should use L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
+        assert_sql_contains(&sql, "EXCEPT ALL");
+        assert_sql_contains(&sql, "__pgs_action = 'I'");
+        assert_sql_contains(&sql, "__pgs_action = 'D'");
     }
 
     #[test]
