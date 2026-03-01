@@ -26,13 +26,13 @@ query that pg_trickle can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 17/22 pass, 5 soft-skip |
+| Phase 1: Differential Correctness | Done — 19/22 pass, 3 soft-skip |
 | Phase 2: Cross-Query Consistency | Done — 16/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 17/22 pass |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 19/22 pass |
 
-### Latest Test Run (2026-02-28, SF=0.01, 3 cycles)
+### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
 
-All three phases run cleanly. Five DVM fixes applied since the initial
+All three phases run cleanly. Seven DVM fixes applied since the initial
 TPC-H suite was completed:
 
 1. **WAL LSN capture** (`pg_current_wal_insert_lsn()`) — CDC triggers and
@@ -83,21 +83,32 @@ TPC-H suite was completed:
    aggregates (MIN, MAX, group-rescan) fall back to the original
    EXCEPT ALL path.
 
+8. **Nested join correction term (Part 3)** — For inner join chains
+   where the left child is a shallow nested join (join of two Scan
+   nodes), a correction term cancels the double-counting introduced by
+   using L₁ (post-change) instead of L₀ (pre-change) in Part 2. The
+   correction joins both delta CTEs (ΔL ⋈ ΔR): insert delta rows emit
+   with flipped action (cancelling excess), delete delta rows emit with
+   original action (adding missing contribution). Limited to shallow
+   nesting (one level) to avoid cascading CTE complexity that crashes
+   PostgreSQL's planner on deeper chains (e.g. 8-table Q08).
+
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 44s)
-Phase 2: test result: ok. 1 passed; 0 failed  (16/20 STs survive, 42s)
-Phase 3: test result: ok. 1 passed; 0 failed  (17/22 queries pass, 45s)
+Phase 1: test result: ok. 1 passed; 0 failed  (19/22 queries pass, ~50s)
+Phase 2: test result: ok. 1 passed; 0 failed  (16/20 STs survive, ~45s)
+Phase 3: test result: ok. 1 passed; 0 failed  (19/22 queries pass, ~50s)
 ```
 
-**Deterministically passing (17):** Q01, Q04, Q05, Q06, Q07, Q08, Q09,
-Q11, Q12, Q13, Q14, Q16, Q18, Q19, Q20, Q21, Q22 — pass all 3 cycles
-consistently across multiple runs in Phase 1 (individual query mode).
+**Deterministically passing (19):** Q01, Q03, Q04, Q05, Q06, Q07, Q08,
+Q09, Q10, Q11, Q12, Q13, Q14, Q16, Q18, Q19, Q20, Q21, Q22 — pass all
+3 cycles consistently across multiple runs in Phase 1 (individual query
+mode).
 
 **Phase 2 (cross-query): 16/20** — Q04 now survives cross-query mode
 (was failing before SemiJoin R_old fix). Q03, Q07, Q13, Q15 fail in
 cross-query mode.
 
-**Phase 3 (FULL vs DIFF): 17/22** — matches Phase 1 results.
+**Phase 3 (FULL vs DIFF): 19/22** — matches Phase 1 results.
 
 **Performance observation:** SemiJoin/AntiJoin queries exhibit 30–80×
 slowdown on cycles 2–3 vs cycle 1:
@@ -114,12 +125,10 @@ snapshot (potentially a multi-table join) and evaluates 3 EXISTS subqueries
 per row, including `r_old_snapshot` (EXCEPT ALL / UNION ALL set operation).
 Not a correctness blocker but impacts cycle time at larger scale factors.
 
-**Queries failing cycle 2+ (3):**
+**Queries failing cycle 2+ (1):**
 
 | Query | Cycle 2+ Error | Category |
 |-------|----------------|----------|
-| Q03 | Data mismatch cycle 2: ST=49, Q=49, extra=1, missing=1 — one extra, one missing row in 3-table join delta. | Join delta value drift |
-| Q10 | Data mismatch cycle 3: ST=33, Q=31, extra=2, missing=0 — two phantom rows in 4-table join delta (customer ⋈ orders ⋈ lineitem ⋈ nation) with SUM aggregate. Same root cause as Q03: nested join L₁ fallback. | Join delta value drift |
 | Q15 | Data mismatch cycle 2: ST=2, Q=1, extra=1, missing=0 — phantom row (supplier with stale total_revenue); scalar subquery MAX filter doesn't recompute correctly | Scalar subquery delta |
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
@@ -131,7 +140,7 @@ Not a correctness blocker but impacts cycle time at larger scale factors.
 |----------|---------|------------|
 | **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_trickle DVM does not support correlated scalar subqueries in WHERE |
 | ~~**Cycle 3 — aggregate drift (cumulative)**~~ | ~~Q01~~ | ~~FIXED~~ — Root cause was WAL LSN capture using `pg_current_wal_lsn()` (write position) instead of `pg_current_wal_insert_lsn()` (insert position). See "WAL LSN capture fix" in Resolved section. |
-| **Cycle 2+ — join delta value drift** | Q03, Q10 | 3–4 table join chains with SUM aggregate. Nested join children use L₁ (post-change) instead of L₀ (pre-change), allowing double-counting when both sides change simultaneously. Q03: 3-table chain (lineitem ⋈ orders ⋈ customer), Q10: 4-table chain (customer ⋈ orders ⋈ lineitem ⋈ nation). |
+| ~~**Cycle 2+ — join delta value drift**~~ | ~~Q03, Q10~~ | ~~FIXED~~ — Nested join correction term (Part 3) cancels double-counting from L₁ fallback. See Resolved section. |
 | ~~**Cycle 3 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin Part 1 now uses R_old snapshot for DELETE actions. When RF2 deletes rows from both sides, the DELETE check evaluates EXISTS against the pre-change right state. See Resolved section. |
 | ~~**Cycle 2 — join delta value drift**~~ | ~~Q07~~ | ~~FIXED~~ — Inner join pre-change snapshot (L₀ via EXCEPT ALL for Scan children) eliminates double-counting of ΔL ⋈ ΔR when both sides change simultaneously |
 | ~~**Cycle 2 — intermediate aggregate**~~ | ~~Q13~~ | ~~FIXED~~ — Algebraic intermediate aggregate path computes old values as `old = new - ins + del`, eliminating duplicate `diff_node(child)` call and EXCEPT ALL. Comment-aware keyword parsing prevents `inject_pgt_count` from matching keywords in SQL comments. |
@@ -174,53 +183,51 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-**Scorecard:** 17/22 pass (77%) · 3 data mismatch · 2 CREATE blocked
+**Scorecard:** 19/22 pass (86%) · 1 data mismatch · 2 CREATE blocked
 
 #### Prioritized Remaining Work
 
 | # | Category | Queries | Impact | Difficulty | Files |
 |---|----------|---------|--------|------------|-------|
-| **P1** | Join delta value drift | Q03, Q10 | +2 pass | Hard | `join.rs` (nested join L₀) |
+| ~~**P1**~~ | ~~Join delta value drift~~ | ~~Q03, Q10~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`join.rs`~~ |
 | ~~**P2**~~ | ~~Intermediate aggregate~~ | ~~Q13~~ | ~~RESOLVED~~ | ~~Medium~~ | ~~`aggregate.rs`, `api.rs`~~ |
 | **P3** | Scalar subquery delta | Q15 | +1 pass | Hard | `aggregate.rs`, `join_common.rs` (CROSS JOIN + MAX) |
 | **P4** | Correlated scalar subquery | Q02, Q17 | +2 create | Hard | `parser.rs` (`rewrite_scalar_subquery_in_where`) |
 | **P5** | Cross-query interference | Q07 (Phase 2 only) | stability | Medium | `refresh.rs` (min-frontier edge case) |
 | **P6** | SemiJoin performance | Q21, Q18, Q20, Q04 | perf | Low | `semi_join.rs`, `anti_join.rs` (Part 2 snapshot) |
 
-#### P1: Fix join delta value drift (Q03) — Q07 FIXED
+#### P1: Fix join delta value drift (Q03, Q10) — RESOLVED
 
-**Q07: FIXED** — Inner join Part 2 now uses pre-change snapshot L₀ for Scan
-children: `L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. This
-eliminates double-counting of `ΔL ⋈ ΔR` rows when both sides change
-simultaneously on the same join key. The fix is limited to Scan children
-because computing L₀ for nested join children (via full join snapshot
-EXCEPT ALL) is prohibitively expensive for multi-table chains.
+**RESOLVED** — Two-part fix applied:
 
-**Q03: STALLED** — Error: `extra=1, missing=1` (one extra, one missing row
-in cycle 2). The 3-table chain `(lineitem ⋈ orders) ⋈ customer` uses L₀
-for Scan children at the inner level, but the outer join's Part 2 falls
-back to L₁ (post-change) for the nested join child.
+1. **L₀ pre-change snapshot for Scan children** (previous commit) — Part 2
+   of the inner join delta now reconstructs the pre-change state L₀ via
+   `L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes` for Scan-type
+   children.  Eliminates double-counting of `ΔL ⋈ ΔR` rows when both
+   sides change simultaneously on the same join key.
 
-**Q10: NEW** — Error: `extra=2, missing=0` (two phantom rows in cycle 3).
-The 4-table chain `(customer ⋈ orders ⋈ lineitem ⋈ nation)` with
-`SUM(l_extendedprice * (1 - l_discount))` aggregate exhibits the same
-nested-join L₁ fallback double-counting as Q03. Was previously listed as
-passing but confirmed failing at the 8e238ee baseline.
+2. **Correction term (Part 3) for shallow nested joins** — For nested join
+   children where L₀ is too expensive to compute (full join snapshot +
+   EXCEPT ALL), Part 2 uses L₁ (post-change) and a correction term
+   subtracts the double-counted rows.  The correction joins both delta
+   CTEs directly (`ΔL ⋈ ΔR`): insert deltas emit with flipped action
+   (cancelling excess), delete deltas emit with original action (adding
+   missing contribution).  Limited to **shallow** nesting (left child is
+   a join of two Scan nodes) to avoid cascading CTE complexity that
+   crashes PostgreSQL's planner on deeper chains (e.g. 8-table Q08).
 
-An L₀ fix for nested join children was **attempted and reverted** because it
-caused a Q21 regression (numwait off by -1). The L₀ nested-child fix
-generates additional correct D rows from the pre-change inner join state,
-but these interact with the SemiJoin Part 1 R_old snapshot to produce
-double-counting through the SemiJoin/aggregate pipeline. The two features
-(L₀ for nested children + SemiJoin R_old) are individually correct but
-require a coordinated design to avoid multiplicative overlap in multi-layer
-delta chains.
+   Math: `Error = (L₁ − L₀) ⋈ ΔR = (ΔL_I − ΔL_D) ⋈ ΔR`
+   - ΔL_I ⋈ ΔR → excess in Part 2 → flip dr action to cancel
+   - ΔL_D ⋈ ΔR → missing from Part 2 → keep dr action
 
-**Blocked by:** SemiJoin R_old interaction — needs coordinated L₀ + R_old
-design across join.rs and semi_join.rs.
+An earlier L₀ approach for nested joins (using EXCEPT ALL on the full join
+snapshot) was attempted and reverted because it caused a Q21 regression
+(numwait off by −1). The correction term approach avoids this because it
+doesn't change the SemiJoin operator's input snapshot — it only adds
+correction rows to the InnerJoin delta output.
 
-**Files:** `src/dvm/operators/join.rs`, `src/dvm/operators/semi_join.rs`
-**Impact:** Would fix Q03 + Q10 (+2 pass → 19/22)
+**Files:** `src/dvm/operators/join.rs` (`is_shallow_join`, Part 3 correction)
+**Impact:** Q03 + Q10 pass all 3 cycles (+2 pass → 19/22)
 
 #### P2: Fix intermediate aggregate data mismatch (Q13) — RESOLVED
 
@@ -306,6 +313,7 @@ scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| **P1** — Nested join correction term (Part 3) | Inner join Part 2 uses L₁ (post-change) for nested join children instead of L₀ (pre-change). When both sides of a 3–4 table join chain change simultaneously (e.g., RF1 inserts into both lineitem and orders), Part 2 double-counts `ΔL ⋈ ΔR` overlap rows. For scan children L₀ is used (cheap EXCEPT ALL), but for nested children L₀ is too expensive. | Added Part 3 correction term: joins both delta CTEs (`ΔL ⋈ ΔR`) with action adjustments — insert delta rows emit with flipped action (cancelling excess double-count from L₁), delete delta rows keep original action (adding missing contribution). `is_shallow_join()` guard limits correction to one level of nesting (left child is join of two Scans) to avoid cascading CTE complexity that crashes PostgreSQL on deep join chains (8-table Q08). | Q03 (all 3 cycles pass — was extra=1, missing=1). Q10 (all 3 cycles pass — was extra=2, missing=0). |
 | **P2** — Intermediate aggregate + comment-aware keyword parsing | Two issues: (1) `build_intermediate_agg_delta` called `diff_node(child)` a second time for EXCEPT ALL old-state reconstruction, creating duplicate LEFT JOIN CTEs with potential row-content divergence. (2) `find_top_level_keyword()` didn't skip SQL comments — a comment containing `FROM` could cause `inject_pgt_count` to inject into the comment instead of the query. | (1) Algebraic intermediate aggregate path: for COUNT/SUM aggregates, old values computed as `old = COALESCE(new, 0) - COALESCE(ins, 0) + COALESCE(del, 0)` using delta CTE LEFT JOIN new-rescan. MIN/MAX/group-rescan fall back to EXCEPT ALL. (2) `find_top_level_keyword()` now skips `--` and `/* */` comments. Added `is_algebraically_invertible()` helper. | Q13 passes all 3 cycles (was data mismatch). Defensive fix for future queries with keywords in comments. |
 | **NEW** — LEFT JOIN Part 4/5 R_old snapshot | Part 4 (delete stale NULL-padded rows) emitted D for ALL left rows matching a new right INSERT, even when the left row already had matching right rows. Part 5 (insert NULL-padded) didn't verify the left row previously had matches. For the MERGE layer this was harmless (no-op on non-existent rows), but for intermediate aggregate old-state reconstruction via EXCEPT ALL/UNION ALL, the spurious D rows added phantom NULL-padded rows to the old state. | Part 4 now checks R_old (`NOT EXISTS (... R_old ...)`) to only emit D when the left row truly had NO matching right rows before. Part 5 now checks R_old (`EXISTS (... R_old ...)`) to confirm the left row HAD matches before. R_old = `R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. | Algebraic correctness improvement for LEFT JOIN delta. Does not change Q13 directly (NULL o_orderkey doesn't affect COUNT(o_orderkey)), but prevents subtle EXCEPT ALL corruption for other intermediate aggregate patterns. |
 | **NEW** — WAL LSN capture (write vs insert position) | CDC trigger and `get_slot_positions()` both used `pg_current_wal_lsn()`, which returns the WAL **write** position (last flushed to kernel). Within a not-yet-committed transaction, the write position can lag behind the actual WAL records being generated. When RF mutations run quickly after a refresh, the trigger captures the **same stale write position** as the previous frontier. The strict `lsn > prev_frontier` scan filter then excludes all new entries, producing a silent no-op refresh. All change buffer entries end up with identical LSN values equal to the frontier. | Changed both the trigger function and `get_current_wal_lsn()` to use `pg_current_wal_insert_lsn()` — the WAL **insert** position, which advances immediately as new WAL records are generated, even within uncommitted transactions. This guarantees each trigger entry gets a unique, monotonically increasing LSN that is always past any prior frontier. | Q01 (all 3 cycles pass — was failing cycle 3) |
