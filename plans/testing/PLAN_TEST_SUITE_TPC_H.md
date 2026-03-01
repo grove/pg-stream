@@ -1,10 +1,18 @@
-# PLAN: TPC-H Test Suite for pg_trickle
+# PLAN: TPC-H-Derived Test Suite for pg_trickle
+
+> **TPC-H Fair Use:** This workload is *derived from* the TPC-H Benchmark
+> specification but does **not** constitute a TPC-H Benchmark result. Data
+> is generated with a custom pure-SQL generator (not `dbgen`), queries have
+> been modified (LIMIT removed, LIKE rewritten, RF3 added), and no
+> TPC-defined metric (QphH) is computed. "TPC-H" and "TPC Benchmark" are
+> trademarks of the Transaction Processing Performance Council
+> ([tpc.org](https://www.tpc.org/)).
 
 **Status:** In Progress  
 **Date:** 2026-02-29  
 **Branch:** `test-suite-tpc-h-part-2`  
-**Scope:** Implement TPC-H as a correctness and regression test suite for
-stream tables, run locally via `just test-tpch`.
+**Scope:** Implement TPC-H-derived queries as a correctness and regression
+test suite for stream tables, run locally via `just test-tpch`.
 
 ---
 

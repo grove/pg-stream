@@ -1,4 +1,9 @@
--- TPC-H Schema for pg_trickle correctness testing.
+-- TPC-H-derived schema for pg_trickle correctness testing.
+--
+-- This schema is derived from the TPC-H Benchmark specification but does
+-- not constitute a TPC-H Benchmark result. "TPC-H" is a trademark of the
+-- Transaction Processing Performance Council (tpc.org).
+--
 -- Standard 8-table schema with primary keys (required for CDC triggers).
 -- No foreign keys — they are not required and slow down RF1/RF2.
 

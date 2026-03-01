@@ -37,18 +37,25 @@ Public test suites address all four gaps.
 
 ---
 
-## Suite 1: TPC-H — Analytical Benchmark
+## Suite 1: TPC-H-Derived — Analytical Workload
 
-### Why TPC-H
+> **TPC-H Fair Use:** Our test suite is *derived from* the TPC-H Benchmark
+> specification but does **not** constitute a TPC-H Benchmark result. We use
+> a custom SQL data generator (not `dbgen`), modified queries, and a
+> non-standard RF3. "TPC-H" is a trademark of the Transaction Processing
+> Performance Council ([tpc.org](https://www.tpc.org/)).
 
-TPC-H is the industry-standard decision-support benchmark. Its 22 queries
-cover joins (up to 8 tables), aggregates, subqueries (scalar, EXISTS, IN),
-HAVING, CASE WHEN, DISTINCT — all operators pg_trickle supports in
-DIFFERENTIAL mode. Its two **refresh functions** (RF1: bulk INSERT, RF2:
-bulk DELETE) directly exercise the CDC → delta refresh pipeline.
+### Why a TPC-H-Derived Workload
 
-**URL:** https://www.tpc.org/tpch/  
-**Data generator:** `dbgen` (included in TPC-H tools)
+The TPC-H specification defines an industry-standard decision-support
+schema and query set. Its 22 queries cover joins (up to 8 tables),
+aggregates, subqueries (scalar, EXISTS, IN), HAVING, CASE WHEN, DISTINCT —
+all operators pg_trickle supports in DIFFERENTIAL mode. Its two **refresh
+functions** (RF1: bulk INSERT, RF2: bulk DELETE) directly exercise the
+CDC → delta refresh pipeline.
+
+**Specification:** https://www.tpc.org/tpch/  
+**Our data generator:** Custom pure-SQL (`generate_series`), not `dbgen`
 
 ### Query Compatibility Analysis
 

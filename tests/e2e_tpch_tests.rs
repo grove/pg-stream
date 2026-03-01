@@ -1,8 +1,14 @@
-//! TPC-H correctness tests for pg_trickle DIFFERENTIAL refresh.
+//! TPC-H-derived correctness tests for pg_trickle DIFFERENTIAL refresh.
 //!
 //! Validates the core DBSP invariant: after every differential refresh,
 //! the stream table's contents must be multiset-equal to re-executing
 //! the defining query from scratch.
+//!
+//! **TPC-H Fair Use:** This workload is *derived from* the TPC-H Benchmark
+//! specification but does not constitute a TPC-H Benchmark result. Data is
+//! generated with a custom pure-SQL generator (not `dbgen`), queries have
+//! been modified, and no TPC-defined metric (QphH) is computed. "TPC-H" is
+//! a trademark of the Transaction Processing Performance Council (tpc.org).
 //!
 //! These tests are `#[ignore]`d to skip in normal CI. Run explicitly:
 //!
