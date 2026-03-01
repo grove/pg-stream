@@ -13,7 +13,7 @@ use crate::dvm::operators;
 use crate::dvm::parser::{CteRegistry, OpTree};
 use crate::error::PgTrickleError;
 use crate::version::Frontier;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The result of differentiating a single operator node.
 /// Contains the CTE name that holds this node's delta output.
@@ -38,6 +38,12 @@ pub struct DiffContext {
     cte_counter: usize,
     /// Accumulated CTE definitions: `(name, sql, is_recursive, is_materialized)`.
     ctes: Vec<(String, String, bool, bool)>,
+    /// CTEs that should emit `AS NOT MATERIALIZED (...)` to prevent
+    /// PostgreSQL from auto-materializing them when referenced >= 2 times.
+    /// Used when Part 3 correction adds a second reference to a child
+    /// join delta CTE — without this, PG materializes the CTE into temp
+    /// files, exhausting `temp_file_limit`.
+    not_materialized_ctes: HashSet<String>,
     /// Schema for change buffer tables.
     pub change_buffer_schema: String,
     /// The target stream table's schema.qualified name (for aggregate merge).
@@ -84,6 +90,7 @@ impl DiffContext {
             new_frontier,
             cte_counter: 0,
             ctes: Vec::new(),
+            not_materialized_ctes: HashSet::new(),
             change_buffer_schema: pg_trickle_change_buffer_schema(),
             st_qualified_name: None,
             cte_registry: CteRegistry::default(),
@@ -106,6 +113,7 @@ impl DiffContext {
             new_frontier,
             cte_counter: 0,
             ctes: Vec::new(),
+            not_materialized_ctes: HashSet::new(),
             change_buffer_schema: "pgtrickle_changes".to_string(),
             st_qualified_name: None,
             cte_registry: CteRegistry::default(),
@@ -260,6 +268,17 @@ impl DiffContext {
         self.ctes.push((name, sql, false, true));
     }
 
+    /// Retroactively mark an already-added CTE as `NOT MATERIALIZED`.
+    ///
+    /// PostgreSQL (12+) auto-materializes CTEs referenced >= 2 times.
+    /// When Part 3 correction adds a second reference to a child join
+    /// delta CTE, the auto-materialization can spill huge temp files.
+    /// Marking the CTE as NOT MATERIALIZED forces PG to inline it as
+    /// a subquery for each reference, avoiding the temp file issue.
+    pub fn mark_cte_not_materialized(&mut self, name: &str) {
+        self.not_materialized_ctes.insert(name.to_string());
+    }
+
     /// Build the final WITH query from accumulated CTEs.
     pub(crate) fn build_with_query(&self, final_cte: &str) -> String {
         if self.ctes.is_empty() {
@@ -279,6 +298,8 @@ impl DiffContext {
             .map(|(name, sql, _, is_mat)| {
                 if *is_mat {
                     format!("{name} AS MATERIALIZED (\n{sql}\n)")
+                } else if self.not_materialized_ctes.contains(name.as_str()) {
+                    format!("{name} AS NOT MATERIALIZED (\n{sql}\n)")
                 } else {
                     format!("{name} AS (\n{sql}\n)")
                 }

@@ -54,7 +54,11 @@ impl Expr {
                 table_alias,
                 column_name,
             } => match table_alias {
-                Some(alias) => format!("{alias}.{column_name}"),
+                Some(alias) => format!(
+                    "\"{}\".\"{}\"",
+                    alias.replace('"', "\"\""),
+                    column_name.replace('"', "\"\""),
+                ),
                 None => column_name.clone(),
             },
             Expr::Literal(val) => val.clone(),
@@ -7130,10 +7134,21 @@ unsafe fn parse_select_stmt(
         // Comma-separated FROM items create InnerJoin(TRUE, ...) chains.
         // Promote eligible predicates from the Filter into appropriate
         // JOIN ON clauses, converting cross joins to equi-joins.
-        // DISABLED: pushdown interacts badly with join condition rewriting
-        // in the diff engine (cycle-2 syntax errors on 8 TPC-H queries).
-        // The correctness issue is instead addressed by extending Part 3
-        // correction to all non-simple join children.
+        //
+        // DISABLED: two remaining issues prevent enabling this:
+        //  (a) Correlated scalar subqueries (Q17) — promoted predicates
+        //      remove column refs that the scalar subquery correlation
+        //      still needs, causing "column X does not exist" errors.
+        //  (b) The quoting fix in Expr::to_sql() resolves the "syntax
+        //      error at or near '.'" from reserved-keyword aliases, but
+        //      Q07 still shows revenue drift even with pushdown enabled.
+        //      The Q07 root cause is not L₀/L₁ double-counting — all
+        //      right sides (customer, nation) are static in TPC-H RF.
+        //      The issue is deeper (possibly aggregate or MERGE layer).
+        //
+        // To re-enable: fix (a) by skipping pushdown when the Filter
+        // predicate contains ScalarSubquery/SubLink references, and
+        // investigate (b) in the aggregate diff or MERGE pipeline.
         // tree = push_filter_into_cross_joins(tree);
     }
 
@@ -11031,7 +11046,7 @@ mod tests {
     #[test]
     fn test_expr_column_ref_qualified() {
         let e = qualified_col("orders", "id");
-        assert_eq!(e.to_sql(), "orders.id");
+        assert_eq!(e.to_sql(), "\"orders\".\"id\"");
     }
 
     #[test]
@@ -12678,21 +12693,21 @@ mod tests {
     fn test_rewrite_aliases_column_ref_left() {
         let e = qualified_col("a", "id");
         let rewritten = e.rewrite_aliases("a", "new_a", "b", "new_b");
-        assert_eq!(rewritten.to_sql(), "new_a.id");
+        assert_eq!(rewritten.to_sql(), "\"new_a\".\"id\"");
     }
 
     #[test]
     fn test_rewrite_aliases_column_ref_right() {
         let e = qualified_col("b", "name");
         let rewritten = e.rewrite_aliases("a", "new_a", "b", "new_b");
-        assert_eq!(rewritten.to_sql(), "new_b.name");
+        assert_eq!(rewritten.to_sql(), "\"new_b\".\"name\"");
     }
 
     #[test]
     fn test_rewrite_aliases_unknown_alias_unchanged() {
         let e = qualified_col("c", "val");
         let rewritten = e.rewrite_aliases("a", "new_a", "b", "new_b");
-        assert_eq!(rewritten.to_sql(), "c.val");
+        assert_eq!(rewritten.to_sql(), "\"c\".\"val\"");
     }
 
     #[test]
@@ -12710,7 +12725,7 @@ mod tests {
             right: Box::new(qualified_col("b", "id")),
         };
         let rewritten = e.rewrite_aliases("a", "x", "b", "y");
-        assert_eq!(rewritten.to_sql(), "(x.id = y.id)");
+        assert_eq!(rewritten.to_sql(), "(\"x\".\"id\" = \"y\".\"id\")");
     }
 
     #[test]
@@ -12720,7 +12735,10 @@ mod tests {
             args: vec![qualified_col("a", "x"), qualified_col("b", "y")],
         };
         let rewritten = e.rewrite_aliases("a", "left", "b", "right");
-        assert_eq!(rewritten.to_sql(), "coalesce(left.x, right.y)");
+        assert_eq!(
+            rewritten.to_sql(),
+            "coalesce(\"left\".\"x\", \"right\".\"y\")"
+        );
     }
 
     #[test]

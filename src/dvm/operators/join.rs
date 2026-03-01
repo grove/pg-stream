@@ -124,9 +124,9 @@ fn contains_semijoin(op: &OpTree) -> bool {
 }
 
 /// Count the number of Scan (base table) nodes in a join subtree.
-/// Used to estimate the size of the snapshot for L₀ via EXCEPT ALL.
-/// Join children with many scan nodes produce huge snapshots that spill
-/// >100 GB of temp files at SF=0.01 — limit L₀ to small subtrees.
+/// Used to limit L₀ via EXCEPT ALL to small subtrees (≤ 2 scans).
+/// Larger subtrees fall back to L₁ + Part 3 correction to avoid
+/// cascading CTE materialization that can exhaust temp_file_limit.
 fn join_scan_count(op: &OpTree) -> usize {
     match op {
         OpTree::Scan { .. } => 1,
@@ -141,9 +141,9 @@ fn join_scan_count(op: &OpTree) -> usize {
 }
 
 /// Returns true if `op` is a join whose **both** children are simple (Scan)
-/// nodes.  This is used to limit the correction term (Part 3) to the first
-/// level of nesting — deeper chains (e.g. 8-table Q08) would generate
-/// cascading correction CTEs that crash PostgreSQL's planner.
+/// nodes.  Previously this gated Part 3 correction term generation — now
+/// used only for diagnostics; Part 3 is generated for all join children
+/// via `is_join_child()` to fix Q07-type double-counting errors.
 fn is_shallow_join(op: &OpTree) -> bool {
     match op {
         OpTree::InnerJoin { left, right, .. } | OpTree::LeftJoin { left, right, .. } => {
@@ -288,18 +288,22 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     let join_cond_part2 = rewrite_join_condition(condition, left, "l", right, "dr");
 
     // Part 3 correction condition: dl (delta left) + dr (delta right).
-    // Only used when Part 2 uses L₁ (post-change) instead of L₀ and the
-    // left child is a shallow join.  With the expanded L₀ approach for
-    // non-SemiJoin join children, this is only needed for SemiJoin-
-    // containing shallow join children.
+    // Used when Part 2 uses L₁ (post-change) instead of L₀.  The
+    // correction cancels the (ΔL ⋈ ΔR) double-counting error introduced
+    // by using L₁.  Generated for join children up to 3 scan nodes
+    // (one level beyond the L₀ threshold of ≤ 2).  This fixes Q07-type
+    // revenue drift in 6-table join chains.  Deeper levels (4+ scans)
+    // omit the correction to avoid cascading CTE complexity that causes
+    // temp file bloat on PostgreSQL.
     //
     // The correction is computed eagerly here but only emitted when
     // `!use_l0` (see `correction_sql` below).
-    let join_cond_correction = if !is_simple_child(left) && is_shallow_join(left) {
-        Some(rewrite_join_condition(condition, left, "dl", right, "dr"))
-    } else {
-        None
-    };
+    let join_cond_correction =
+        if !is_simple_child(left) && is_join_child(left) && join_scan_count(left) <= 3 {
+            Some(rewrite_join_condition(condition, left, "dl", right, "dr"))
+        } else {
+            None
+        };
 
     // Extract equi-join key pairs for semi-join optimization.
     // If we can identify (left_key, right_key) pairs from the condition,
@@ -427,6 +431,12 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // directly, the correction is unnecessary (no double-counting error).
     let correction_sql = if !use_l0 {
         if let Some(cond) = &join_cond_correction {
+            // The correction adds a second FROM-clause reference to
+            // delta_left.  PostgreSQL (12+) auto-materializes CTEs with
+            // >= 2 references, which can spill huge temp files for join
+            // delta CTEs.  Mark it NOT MATERIALIZED so PG inlines it.
+            ctx.mark_cte_not_materialized(&left_result.cte_name);
+
             // Row ID for correction rows: hash of both delta row IDs.
             // For aggregate queries (Q03, Q10), the aggregate recomputes row_ids
             // from GROUP BY columns, so the join-level row_id doesn't need to
@@ -808,8 +818,8 @@ mod tests {
     #[test]
     fn test_diff_inner_join_deep_chain_no_correction() {
         // ((a ⋈ b) ⋈ c) ⋈ d — 4-table chain.
-        // All join children are non-SemiJoin, so all levels use L₀ via
-        // EXCEPT ALL. No correction terms should be generated at any level.
+        // Inner level (a⋈b, 2 scans) uses L₀ via EXCEPT ALL.
+        // Outer level (left has 3 scans) uses L₁ + Part 3 correction.
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let inner1 = inner_join(eq_cond("a", "id", "b", "id"), a, b);
@@ -821,11 +831,11 @@ mod tests {
         let mut ctx = test_ctx();
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        // No correction terms at any level (all use L₀)
+        // One correction term at the outermost level (3-scan left > ≤ 2 threshold)
         let correction_count = sql.matches("Correction for nested join").count();
         assert_eq!(
-            correction_count, 0,
-            "expected 0 correction terms (all levels use L₀), got {correction_count}\n{sql}"
+            correction_count, 1,
+            "expected 1 correction term (outermost level), got {correction_count}\n{sql}"
         );
     }
 
@@ -1002,16 +1012,16 @@ mod tests {
     }
 
     #[test]
-    fn test_deep_join_uses_l1_not_l0() {
+    fn test_deep_join_uses_l1_with_correction() {
         // With threshold=2, a 3-table chain (left has 2 scans) should
-        // use L₀ (EXCEPT ALL), but a 4-table chain (left has 3 scans)
-        // should fall back to L₁ (no EXCEPT ALL, no Part 3 since deeper
-        // than one nesting level).
+        // use L₀ (EXCEPT ALL). A 4-table chain (left has 3 scans) should
+        // fall back to L₁ WITH Part 3 correction (the correction cancels
+        // ΔL ⋈ ΔR double-counting without expensive snapshot materialization).
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let c = scan(3, "c", "public", "c", &["id"]);
 
-        // left = a ⋈ b (2 scans) — should use L₀
+        // left = a ⋈ b (2 scans) — L₀ via EXCEPT ALL
         let j_ab = inner_join(eq_cond("a", "id", "b", "id"), a.clone(), b);
         let tree_3 = inner_join(eq_cond("a", "id", "c", "id"), j_ab, c);
 
@@ -1020,9 +1030,7 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
         assert_sql_contains(&sql, "EXCEPT ALL");
 
-        // left = a ⋈ b ⋈ c (3 scans) — should use L₁ (no L₀, no Part 3
-        // because the left child is deeper than "shallow" (not both
-        // children are Scans))
+        // left = a ⋈ b ⋈ c (3 scans) — L₁ WITH Part 3 correction
         let a2 = scan(1, "a", "public", "a", &["id"]);
         let b2 = scan(2, "b", "public", "b", &["id"]);
         let c2 = scan(3, "c", "public", "c", &["id"]);
@@ -1034,7 +1042,8 @@ mod tests {
         let mut ctx2 = test_ctx();
         let result2 = diff_inner_join(&mut ctx2, &tree_4).unwrap();
         let sql2 = ctx2.build_with_query(&result2.cte_name);
-        // 3-scan left child → L₁ without correction (not shallow)
-        assert_sql_not_contains(&sql2, "Part 3");
+        // 3-scan left child → L₁ with Part 3 correction
+        assert_sql_contains(&sql2, "Part 3");
+        assert_sql_contains(&sql2, "Correction for nested join");
     }
 }

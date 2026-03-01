@@ -986,8 +986,8 @@ mod tests {
         let cond = eq_cond("o", "cust_id", "c", "id");
 
         let rewritten = rewrite_join_condition(&cond, &o, "dl", &c, "r");
-        assert!(rewritten.contains("dl."));
-        assert!(rewritten.contains("r."));
+        assert!(rewritten.contains("\"dl\"."));
+        assert!(rewritten.contains("\"r\"."));
     }
 
     #[test]
@@ -1008,7 +1008,7 @@ mod tests {
             "expected o__prod_id, got: {rewritten}"
         );
         // "p" is a simple Scan → plain "id"
-        assert!(rewritten.contains("r."));
+        assert!(rewritten.contains("\"r\"."));
     }
 
     #[test]

@@ -8,7 +8,7 @@
 > trademarks of the Transaction Processing Performance Council
 > ([tpc.org](https://www.tpc.org/)).
 
-**Status:** COMPLETE — All 22 queries pass, CI integrated  
+**Status:** ACTIVE — 21/22 pass, Q07 open investigation  
 **Date:** 2026-03-01  
 **Branch:** `test-suite-tpc-h-part-2`  
 **Scope:** Implement TPC-H-derived queries as a correctness and regression
@@ -35,7 +35,7 @@ query that pg_trickle can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 22/22 pass |
+| Phase 1: Differential Correctness | Done — 21/22 pass (Q07 known) |
 | Phase 2: Cross-Query Consistency | Done — 21/22 STs survive all cycles |
 | Phase 3: FULL vs DIFFERENTIAL | Done — 22/22 pass |
 
@@ -94,14 +94,16 @@ initial TPC-H suite was completed:
    EXCEPT ALL path.
 
 8. **Nested join correction term (Part 3)** — For inner join chains
-   where the left child is a shallow nested join (join of two Scan
-   nodes), a correction term cancels the double-counting introduced by
-   using L₁ (post-change) instead of L₀ (pre-change) in Part 2. The
-   correction joins both delta CTEs (ΔL ⋈ ΔR): insert delta rows emit
-   with flipped action (cancelling excess), delete delta rows emit with
-   original action (adding missing contribution). Limited to shallow
-   nesting (one level) to avoid cascading CTE complexity that crashes
-   PostgreSQL's planner on deeper chains (e.g. 8-table Q08).
+   where the left child is a nested join with ≤ 3 scan nodes, a
+   correction term cancels the double-counting introduced by using L₁
+   (post-change) instead of L₀ (pre-change) in Part 2.  The correction
+   joins both delta CTEs (ΔL ⋈ ΔR): insert delta rows emit with flipped
+   action (cancelling excess), delete delta rows emit with original
+   action (adding missing contribution).  Limited to ≤ 3 scans (one
+   level beyond the L₀ threshold of ≤ 2) to avoid cascading CTE
+   complexity.  The child CTE is marked `NOT MATERIALIZED` to prevent
+   PostgreSQL from auto-materializing it when the correction adds a
+   second FROM-clause reference (which otherwise causes temp file bloat).
 
 9. **Scalar subquery Part 2 C₀ pre-change snapshot** — Part 2 of the
    scalar subquery delta now uses C₀ (pre-change child snapshot) instead
@@ -180,22 +182,46 @@ initial TPC-H suite was completed:
     these prevent both dead tuple accumulation and temp file bloat from
     growing PostgreSQL's data directory beyond safe limits.
 
+16. **Expr::to\_sql() quoting + NOT MATERIALIZED CTE support** — Two
+    infrastructure improvements:
+    (a) `Expr::to_sql()` now always double-quotes table alias and column
+    name in `ColumnRef` expressions (`"alias"."column"` instead of bare
+    `alias.column`). This prevents SQL syntax errors when the alias is a
+    reserved keyword (e.g. `OpTree::alias()` returns `"join"` for
+    `InnerJoin` nodes — unquoted `join.column` triggers "syntax error at
+    or near '.'"). Required for future predicate pushdown enablement.
+    (b) `DiffContext::mark_cte_not_materialized()` allows retroactively
+    marking a CTE as `NOT MATERIALIZED` in the WITH clause. Used when
+    Part 3 correction adds a second FROM-clause reference to a child
+    join delta CTE — PostgreSQL (12+) auto-materializes CTEs referenced
+    ≥ 2 times, which spills huge temp files for join delta CTEs.
+    NOT MATERIALIZED forces PG to inline the CTE as a subquery for each
+    reference, avoiding the temp file issue.
+
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~45s)
-Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, ~27s)
-Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~45s)
+Phase 1: test result: ok. 1 passed; 0 failed  (21/22 queries pass, Q07 known)
+Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, Q07 known)
+Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass)
 ```
 
-**Deterministically passing (22):** Q01, Q02, Q03, Q04, Q05, Q06, Q07,
+**Deterministically passing (21):** Q01, Q02, Q03, Q04, Q05, Q06,
 Q08, Q09, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q17, Q18, Q19, Q20, Q21,
-Q22 — all 22 TPC-H queries pass all 3 mutation cycles consistently in
-Phase 1 (individual query mode).
+Q22 — all pass 5 mutation cycles consistently in Phase 1.
 
-**Phase 2 (cross-query): 21/22** — Q07 has a known inner join delta bug
-in cross-query mode (extra=1, missing=1 on cycle 2). Confirmed as a delta
-computation error (FULL refresh fixes it; next differential fails again).
-Root cause: deep join chain (6-table) lacks Part 3 correction at non-shallow
-levels. All other queries survive cross-query mode.
+**Known failing (1): Q07** — Revenue drift at cycle 3 (2nd differential
+refresh). EXTRA/MISSING row with matching group key (FRANCE→GERMANY,
+1995) but different SUM(revenue). Investigation findings:
+- NOT caused by L₀/L₁ double-counting: right-side tables (customer,
+  nation) are static in TPC-H RF — Part 3 correction produces 0 rows
+- NOT caused by cross-product intermediates: enabling predicate pushdown
+  (which gives proper equi-joins) does not fix Q07
+- Error is data-dependent: appears specifically at cycle 3 (38th overall
+  RF cycle after prior queries), $4-5 revenue drift on NUMERIC type
+- Likely in the aggregate delta pipeline or MERGE layer, not join delta
+- FULL refresh produces correct results (Phase 3: 22/22)
+
+**Phase 2 (cross-query): 21/22** — Q07 fails at cycle 2 in cross-query
+mode (same root cause). All other queries survive.
 
 **Phase 3 (FULL vs DIFF): 22/22** — all queries match.
 
