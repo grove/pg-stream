@@ -216,7 +216,7 @@ SELECT pgtrickle.drop_stream_table('regional_totals');
 | Document | Description |
 |---|---|
 | [plans/sql/PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) | Plan for `CREATE MATERIALIZED VIEW ... WITH (pgtrickle.stream)` syntax |
-| [docs/research/CUSTOM_SQL_SYNTAX.md](docs/research/CUSTOM_SQL_SYNTAX.md) | Research: PostgreSQL extension syntax mechanisms |
+| [plans/sql/REPORT_CUSTOM_SQL_SYNTAX.md](plans/sql/REPORT_CUSTOM_SQL_SYNTAX.md) | Research: PostgreSQL extension syntax mechanisms |
 
 ### Deep-Dive Tutorials
 

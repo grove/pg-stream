@@ -71,6 +71,7 @@ new entries when creating documents.
 | [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Proposed | Multi-path refresh for diamond dependencies in the DAG |
 | [PLAN_LATERAL_JOINS.md](sql/PLAN_LATERAL_JOINS.md) | PLAN | Implemented | LATERAL join support (subqueries with LATERAL) |
 | [PLAN_NON_DETERMINISM.md](sql/PLAN_NON_DETERMINISM.md) | PLAN | Not started | Non-deterministic function handling |
+| [REPORT_CUSTOM_SQL_SYNTAX.md](sql/REPORT_CUSTOM_SQL_SYNTAX.md) | REPORT | Reference | PostgreSQL extension syntax mechanisms research |
 | [PLAN_DB_SCHEMA_STABILITY.md](sql/PLAN_DB_SCHEMA_STABILITY.md) | REPORT | Assessment | Database schema stability assessment (pre-1.0) |
 | [PLAN_HYBRID_CDC.md](sql/PLAN_HYBRID_CDC.md) | PLAN | Complete | Hybrid CDC — trigger bootstrap → logical replication |
 | [PLAN_NATIVE_SYNTAX.md](sql/PLAN_NATIVE_SYNTAX.md) | PLAN | Proposed | Native PostgreSQL syntax for stream tables |
