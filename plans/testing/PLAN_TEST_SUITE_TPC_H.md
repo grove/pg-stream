@@ -26,13 +26,13 @@ query that pg_trickle can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 19/22 pass, 3 soft-skip |
+| Phase 1: Differential Correctness | Done — 20/22 pass, 2 soft-skip |
 | Phase 2: Cross-Query Consistency | Done — 16/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 19/22 pass |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 20/22 pass |
 
-### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
+### Latest Test Run (2026-03-02, SF=0.01, 3 cycles)
 
-All three phases run cleanly. Seven DVM fixes applied since the initial
+All three phases run cleanly. Eleven DVM fixes applied since the initial
 TPC-H suite was completed:
 
 1. **WAL LSN capture** (`pg_current_wal_insert_lsn()`) — CDC triggers and
@@ -93,16 +93,47 @@ TPC-H suite was completed:
    nesting (one level) to avoid cascading CTE complexity that crashes
    PostgreSQL's planner on deeper chains (e.g. 8-table Q08).
 
+9. **Scalar subquery Part 2 C₀ pre-change snapshot** — Part 2 of the
+   scalar subquery delta now uses C₀ (pre-change child snapshot) instead
+   of C₁ (post-change) when computing `parent × Δchild`. Reconstructed
+   via `child_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. This
+   follows the DBSP cross-product formula `Δ(C×S) = (ΔC×S₁) + (C₀×ΔS)`
+   and avoids double-counting when both parent and child change.
+
+10. **InnerJoin L₀ for Subquery/Aggregate children** — Extended the
+    L₀ pre-change snapshot (EXCEPT ALL) approach from Scan-only children
+    to all non-join children (Subquery, Aggregate). For queries like Q15
+    where the inner cross join connects two subqueries that both depend
+    on the same source table (lineitem), using L₁ instead of L₀ causes
+    missed DELETE rows. The `is_join_child()` helper distinguishes nested
+    join children (which still use L₁ + correction) from Subquery/
+    Aggregate children (which safely use L₀).
+
+11. **Project row_id `unwrap_transparent` + `build_hash_expr`
+    parenthesization** — Two issues fixed Q15's row_id mismatch between
+    FULL and DIFF refresh:
+    (a) `row_id_key_columns()` and `diff_project()` now look through
+    transparent wrapper nodes (Filter, Subquery) via `unwrap_transparent()`
+    to find the underlying join or lateral operator. Q15 has
+    `Project > Filter > InnerJoin` — without unwrapping, the Project
+    fell through to position-based `row_to_json + row_number` row_ids
+    while DIFF used content-based hashing, causing DELETE to never match.
+    (b) `build_hash_expr()` now wraps each expression in parentheses
+    before the `::TEXT` cast: `(expr)::TEXT` instead of `expr::TEXT`.
+    Without parens, SQL precedence causes `a * (1 - b)::TEXT` to cast
+    only `b` to TEXT, producing "numeric * text" type errors for queries
+    with arithmetic projection expressions (Q07, Q08, Q09).
+
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (19/22 queries pass, ~50s)
+Phase 1: test result: ok. 1 passed; 0 failed  (20/22 queries pass, ~38s)
 Phase 2: test result: ok. 1 passed; 0 failed  (16/20 STs survive, ~45s)
-Phase 3: test result: ok. 1 passed; 0 failed  (19/22 queries pass, ~50s)
+Phase 3: test result: ok. 1 passed; 0 failed  (20/22 queries pass, ~38s)
 ```
 
-**Deterministically passing (19):** Q01, Q03, Q04, Q05, Q06, Q07, Q08,
-Q09, Q10, Q11, Q12, Q13, Q14, Q16, Q18, Q19, Q20, Q21, Q22 — pass all
-3 cycles consistently across multiple runs in Phase 1 (individual query
-mode).
+**Deterministically passing (20):** Q01, Q03, Q04, Q05, Q06, Q07, Q08,
+Q09, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q18, Q19, Q20, Q21, Q22 — pass
+all 3 cycles consistently across multiple runs in Phase 1 (individual
+query mode).
 
 **Phase 2 (cross-query): 16/20** — Q04 now survives cross-query mode
 (was failing before SemiJoin R_old fix). Q03, Q07, Q13, Q15 fail in
@@ -125,11 +156,7 @@ snapshot (potentially a multi-table join) and evaluates 3 EXISTS subqueries
 per row, including `r_old_snapshot` (EXCEPT ALL / UNION ALL set operation).
 Not a correctness blocker but impacts cycle time at larger scale factors.
 
-**Queries failing cycle 2+ (1):**
-
-| Query | Cycle 2+ Error | Category |
-|-------|----------------|----------|
-| Q15 | Data mismatch cycle 2: ST=2, Q=1, extra=1, missing=0 — phantom row (supplier with stale total_revenue); scalar subquery MAX filter doesn't recompute correctly | Scalar subquery delta |
+**Queries failing cycle 2+ (0):** None — all creatable queries pass all cycles.
 
 **Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
 (`column "p_partkey" does not exist`).
@@ -144,7 +171,7 @@ Not a correctness blocker but impacts cycle time at larger scale factors.
 | ~~**Cycle 3 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin Part 1 now uses R_old snapshot for DELETE actions. When RF2 deletes rows from both sides, the DELETE check evaluates EXISTS against the pre-change right state. See Resolved section. |
 | ~~**Cycle 2 — join delta value drift**~~ | ~~Q07~~ | ~~FIXED~~ — Inner join pre-change snapshot (L₀ via EXCEPT ALL for Scan children) eliminates double-counting of ΔL ⋈ ΔR when both sides change simultaneously |
 | ~~**Cycle 2 — intermediate aggregate**~~ | ~~Q13~~ | ~~FIXED~~ — Algebraic intermediate aggregate path computes old values as `old = new - ins + del`, eliminating duplicate `diff_node(child)` call and EXCEPT ALL. Comment-aware keyword parsing prevents `inject_pgt_count` from matching keywords in SQL comments. |
-| **Cycle 2 — scalar subquery delta** | Q15 | `WHERE total_revenue = (SELECT MAX(...))` — scalar subquery MAX filter produces phantom rows. Delta engine doesn't correctly handle cascading MAX changes. Was previously masked by change buffer cleanup bug. |
+| ~~**Cycle 2 — scalar subquery delta**~~ | ~~Q15~~ | ~~FIXED~~ — Three fixes: (1) scalar subquery Part 2 C₀ pre-change snapshot, (2) InnerJoin L₀ for Subquery children, (3) Project row_id `unwrap_transparent` + `build_hash_expr` parenthesization. See Resolved section. |
 | ~~**Cycle 2 — scalar aggregate deletion**~~ | ~~Q19~~ | ~~FIXED~~ — Scalar aggregate singleton row is never deleted. The merge CTE skips 'D' classification for no-GROUP-BY aggregates and emits NULL for SUM/MIN/MAX when count=0. See Resolved section. |
 | ~~**Aggregate drift — scalar row_id mismatch**~~ | ~~Q06~~ | ~~FIXED~~ — `row_id_expr_for_query` detects scalar aggregates and returns singleton hash matching DIFF delta |
 | ~~**Aggregate drift — AVG precision loss**~~ | ~~Q01~~ | ~~PARTIALLY FIXED~~ — AVG now uses group-rescan; Q01 improved from cycle 2 to cycle 3 failure |
@@ -183,7 +210,7 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-**Scorecard:** 19/22 pass (86%) · 1 data mismatch · 2 CREATE blocked
+**Scorecard:** 20/22 pass (91%) · 0 data mismatch · 2 CREATE blocked
 
 #### Prioritized Remaining Work
 
@@ -191,7 +218,7 @@ patterns are added.
 |---|----------|---------|--------|------------|-------|
 | ~~**P1**~~ | ~~Join delta value drift~~ | ~~Q03, Q10~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`join.rs`~~ |
 | ~~**P2**~~ | ~~Intermediate aggregate~~ | ~~Q13~~ | ~~RESOLVED~~ | ~~Medium~~ | ~~`aggregate.rs`, `api.rs`~~ |
-| **P3** | Scalar subquery delta | Q15 | +1 pass | Hard | `aggregate.rs`, `join_common.rs` (CROSS JOIN + MAX) |
+| ~~**P3**~~ | ~~Scalar subquery delta~~ | ~~Q15~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`scalar_subquery.rs`, `join.rs`, `parser.rs`, `project.rs`, `scan.rs`~~ |
 | **P4** | Correlated scalar subquery | Q02, Q17 | +2 create | Hard | `parser.rs` (`rewrite_scalar_subquery_in_where`) |
 | **P5** | Cross-query interference | Q07 (Phase 2 only) | stability | Medium | `refresh.rs` (min-frontier edge case) |
 | **P6** | SemiJoin performance | Q21, Q18, Q20, Q04 | perf | Low | `semi_join.rs`, `anti_join.rs` (Part 2 snapshot) |
@@ -255,22 +282,48 @@ correction rows to the InnerJoin delta output.
 `is_algebraically_invertible`), `src/api.rs` (`find_top_level_keyword`)
 **Impact:** Q13 passes all 3 cycles. Defensive fix for comment handling.
 
-#### P3: Fix scalar subquery delta accuracy (Q15)
+#### P3: Fix scalar subquery delta accuracy (Q15) — RESOLVED
 
-Q15 uses `WHERE total_revenue = (SELECT MAX(total_revenue) FROM revenue0)` —
-a scalar subquery that computes MAX over a derived table. When the derived
-table's data changes, the MAX value changes, and the filter condition selects
-different suppliers. The delta produces phantom rows (ST=3, Q=1, extra=2).
+**RESOLVED** — Three independent fixes applied:
 
-**Root cause:** The delta engine applies the MAX filter to the old and new
-states independently but doesn't re-evaluate which supplier matches the
-*new* MAX. The CROSS JOIN rewrite correctly propagates the scalar subquery
-result but the filter delta doesn't handle cascading changes (inner change
-→ new MAX → different outer rows pass the filter).
+1. **Scalar subquery Part 2 C₀ pre-change snapshot** — Part 2 of
+   `diff_scalar_subquery` now uses C₀ (pre-change child) instead of C₁
+   (post-change) when computing `parent × Δchild`. Follows the DBSP
+   cross-product formula `Δ(C×S) = (ΔC×S₁) + (C₀×ΔS)`. C₀ is
+   reconstructed via `child_cte EXCEPT ALL Δ_I UNION ALL Δ_D`. This fix
+   applies to SELECT-list scalar subqueries, not Q15's WHERE clause form
+   (which is rewritten to a CROSS JOIN before parsing), but improves
+   correctness for other scalar subquery patterns.
 
-**Files:** `src/dvm/operators/aggregate.rs` (intermediate agg delta for MAX),
-`src/dvm/operators/join_common.rs` (CROSS JOIN delta with scalar subquery)
-**Impact:** Would fix Q15 (+1 pass)
+2. **InnerJoin L₀ for Subquery/Aggregate children** — Extended the L₀
+   pre-change snapshot (EXCEPT ALL) from Scan-only to all non-join
+   children. Q15's inner `InnerJoin(revenue0, __pgt_sq_1)` has two
+   Subquery children that both depend on lineitem. Using L₁ for the left
+   (revenue0) in Part 2 double-counts rows when both sides change. The
+   `is_join_child()` helper distinguishes nested join children (which
+   still use L₁ + correction term) from Subquery/Aggregate children
+   (which safely use L₀ via EXCEPT ALL).
+
+3. **Project row_id `unwrap_transparent` + `build_hash_expr`
+   parenthesization** — The actual root cause of Q15's data mismatch:
+   (a) Q15's OpTree has `Project > Filter > InnerJoin`. The Project's
+   `row_id_key_columns()` and `diff_project()` checked only the
+   immediate child (Filter), missing the InnerJoin underneath. This
+   caused FULL refresh to use position-based `row_to_json + row_number`
+   row_ids while DIFF used content-based hashing — DELETE could never
+   match stored rows. The new `unwrap_transparent()` helper looks through
+   Filter/Subquery wrappers to find the underlying operator.
+   (b) `build_hash_expr()` cast `expr::TEXT` without parentheses.
+   For complex expressions like `a * (1 - b)::TEXT`, SQL precedence
+   casts only `b` to TEXT, producing "numeric * text" errors. Fixed by
+   wrapping: `(expr)::TEXT`.
+
+**Files:** `src/dvm/operators/scalar_subquery.rs` (C₀ snapshot),
+`src/dvm/operators/join.rs` (`is_join_child`, L₀ extension),
+`src/dvm/parser.rs` (`unwrap_transparent`, `row_id_key_columns`),
+`src/dvm/operators/project.rs` (`diff_project` unwrap),
+`src/dvm/operators/scan.rs` (`build_hash_expr` parens)
+**Impact:** Q15 passes all 3 cycles (+1 pass → 20/22)
 
 #### P4: Fix correlated scalar subquery support (Q02, Q17)
 
@@ -280,7 +333,7 @@ column names (no `table.` prefix), so it cannot apply the CROSS JOIN rewrite.
 Deeper DVM support (named correlation context) is needed.
 
 **Files:** `src/dvm/parser.rs` (`rewrite_scalar_subquery_in_where`)
-**Impact:** Would unblock Q02 and Q17 (+2 CREATE → 19/22 creatable)
+**Impact:** Would unblock Q02 and Q17 (+2 CREATE → 22/22 creatable)
 
 #### P5: Investigate cross-query interference (Q07 Phase 2)
 
@@ -313,6 +366,7 @@ scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| **P3** — Scalar subquery delta + row_id mismatch | Three independent issues: (1) Scalar subquery Part 2 used C₁ instead of C₀ (DBSP formula violation). (2) InnerJoin L₀ only applied to Scan children, not Subquery/Aggregate (Q15's cross join between two Subqueries that share lineitem source). (3) Project `row_id_key_columns()` and `diff_project()` didn't look through Filter/Subquery wrappers — Q15's `Project > Filter > InnerJoin` used position-based row_id for FULL but content-based for DIFF, causing DELETE to never match. (4) `build_hash_expr` `::TEXT` cast precedence error for complex expressions. | (1) Part 2 of scalar subquery delta uses C₀ via EXCEPT ALL. (2) `is_join_child()` helper + L₀ for non-join children. (3) `unwrap_transparent()` helper to look through Filter/Subquery in both `row_id_key_columns` and `diff_project`. (4) `(expr)::TEXT` parenthesization in `build_hash_expr`. | Q15 (all 3 cycles pass — was ST=2, Q=1, extra=1, missing=0 on cycle 2) |
 | **P1** — Nested join correction term (Part 3) | Inner join Part 2 uses L₁ (post-change) for nested join children instead of L₀ (pre-change). When both sides of a 3–4 table join chain change simultaneously (e.g., RF1 inserts into both lineitem and orders), Part 2 double-counts `ΔL ⋈ ΔR` overlap rows. For scan children L₀ is used (cheap EXCEPT ALL), but for nested children L₀ is too expensive. | Added Part 3 correction term: joins both delta CTEs (`ΔL ⋈ ΔR`) with action adjustments — insert delta rows emit with flipped action (cancelling excess double-count from L₁), delete delta rows keep original action (adding missing contribution). `is_shallow_join()` guard limits correction to one level of nesting (left child is join of two Scans) to avoid cascading CTE complexity that crashes PostgreSQL on deep join chains (8-table Q08). | Q03 (all 3 cycles pass — was extra=1, missing=1). Q10 (all 3 cycles pass — was extra=2, missing=0). |
 | **P2** — Intermediate aggregate + comment-aware keyword parsing | Two issues: (1) `build_intermediate_agg_delta` called `diff_node(child)` a second time for EXCEPT ALL old-state reconstruction, creating duplicate LEFT JOIN CTEs with potential row-content divergence. (2) `find_top_level_keyword()` didn't skip SQL comments — a comment containing `FROM` could cause `inject_pgt_count` to inject into the comment instead of the query. | (1) Algebraic intermediate aggregate path: for COUNT/SUM aggregates, old values computed as `old = COALESCE(new, 0) - COALESCE(ins, 0) + COALESCE(del, 0)` using delta CTE LEFT JOIN new-rescan. MIN/MAX/group-rescan fall back to EXCEPT ALL. (2) `find_top_level_keyword()` now skips `--` and `/* */` comments. Added `is_algebraically_invertible()` helper. | Q13 passes all 3 cycles (was data mismatch). Defensive fix for future queries with keywords in comments. |
 | **NEW** — LEFT JOIN Part 4/5 R_old snapshot | Part 4 (delete stale NULL-padded rows) emitted D for ALL left rows matching a new right INSERT, even when the left row already had matching right rows. Part 5 (insert NULL-padded) didn't verify the left row previously had matches. For the MERGE layer this was harmless (no-op on non-existent rows), but for intermediate aggregate old-state reconstruction via EXCEPT ALL/UNION ALL, the spurious D rows added phantom NULL-padded rows to the old state. | Part 4 now checks R_old (`NOT EXISTS (... R_old ...)`) to only emit D when the left row truly had NO matching right rows before. Part 5 now checks R_old (`EXISTS (... R_old ...)`) to confirm the left row HAD matches before. R_old = `R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`. | Algebraic correctness improvement for LEFT JOIN delta. Does not change Q13 directly (NULL o_orderkey doesn't affect COUNT(o_orderkey)), but prevents subtle EXCEPT ALL corruption for other intermediate aggregate patterns. |
