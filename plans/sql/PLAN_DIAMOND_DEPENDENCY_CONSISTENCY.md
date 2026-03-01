@@ -1,8 +1,8 @@
 # Plan: Diamond Dependency Consistency (Multi-Path Refresh)
 
 Date: 2026-02-28
-Status: PROPOSED
-Last Updated: 2026-02-28
+Status: DECIDED — Option 1 (Epoch-Based Atomic Groups)
+Last Updated: 2026-03-01
 
 ---
 
@@ -511,9 +511,9 @@ vector clock theory.
 
 ## 5. Recommendation
 
-### Primary: Option 1 (Epoch-Based Atomic Refresh Groups)
+### Decision: Option 1 — Epoch-Based Atomic Refresh Groups
 
-**Recommended for implementation**, with the following rationale:
+**Rationale:**
 
 1. **Strongest guarantee.** By grouping related STs and executing them
    atomically, D **never** observes an inconsistent state. This aligns with
@@ -530,18 +530,18 @@ vector clock theory.
 4. **Operationally sound.** If one member of the group fails, the group is
    skipped and retried next cycle — matching existing retry/backoff behavior.
 
-### Secondary: Option 2 (Frontier Alignment) as a lightweight fallback
-
-For users who prefer availability over consistency, the **frontier alignment
-check** can be added as a separate, non-default mode. This is simpler to
-implement and can serve as a Phase 1 deliverable while the full epoch-based
-approach is built.
+5. **Option 2 not needed.** Frontier alignment is fully subsumed: within an
+   atomic group B, C, and D are committed together, so misaligned frontiers
+   are structurally impossible. Option 2 is not implemented as a user-facing
+   mode.
 
 ### Configuration
 
+Only two modes are exposed:
+
 ```sql
 -- Global default
-SET pg_trickle.diamond_consistency = 'atomic';  -- or 'aligned', 'none'
+SET pg_trickle.diamond_consistency = 'atomic';  -- or 'none'
 
 -- Per-ST override
 SELECT pgtrickle.alter_stream_table(
@@ -553,89 +553,290 @@ SELECT pgtrickle.alter_stream_table(
 | Mode | Behavior |
 |------|----------|
 | `'none'` | Current behavior. No cross-path consistency. (Default in v0.x for backward compat.) |
-| `'aligned'` | Frontier alignment check. D is skipped if upstream frontiers diverge. |
-| `'atomic'` | Epoch-based atomic groups. Related STs refresh atomically or not at all. |
+| `'atomic'` | Epoch-based atomic groups. Related STs refresh atomically or not at all. (Recommended.) |
 
 ---
 
 ## 6. Implementation Plan
 
-### Phase 1: Diamond Detection in DAG (dag.rs)
+Implementation order follows strict dependency: each step builds on the
+previous one. Steps 1–3 have no database dependency and can be validated
+with `just test-unit`. Steps 4–6 require an integration/E2E environment.
 
-Add `detect_diamond_dependencies()` and `compute_consistency_groups()` to
-`StDag`. Unit-testable without a database.
+---
 
-**Key algorithm:** For each fan-in node D (where `|upstream_st_deps| >= 2`),
-compute the **transitive closure** of upstream paths. If two paths share a
-common ancestor that is a base table or ST, the intermediate STs form a
-consistency group.
+### Step 1 — Define data structures in `dag.rs` (no DB)
 
-```
-detect_diamonds(dag):
-  diamonds = []
-  for each ST node D where in-degree(D, ST-only edges) >= 2:
-    paths = all_paths_to_roots(D)
-    for each pair of paths (P1, P2):
-      shared = ancestors(P1) ∩ ancestors(P2)
-      if shared ≠ ∅:
-        intermediates = (P1 ∪ P2) \ {D} \ shared
-        diamonds.append(Diamond {
-          convergence: D,
-          shared_sources: shared,
-          intermediates: intermediates,
-        })
-  return merge_overlapping(diamonds)
-```
+**Goal:** Represent diamonds and consistency groups as first-class types.
 
-**Complexity:** $O(V \cdot E)$ in the worst case, but DAGs are typically
-shallow (2-4 levels deep) so this is negligible.
+1. Add `Diamond` struct:
+   ```rust
+   /// A detected diamond in the ST dependency graph.
+   pub struct Diamond {
+       /// The fan-in ST that joins two or more upstream paths.
+       pub convergence: NodeId,
+       /// Base tables / STs that are the shared root(s) of the paths.
+       pub shared_sources: Vec<NodeId>,
+       /// Intermediate STs on all paths from shared_sources to convergence.
+       pub intermediates: Vec<NodeId>,
+   }
+   ```
 
-### Phase 2: Frontier Alignment Check (version.rs, scheduler.rs)
+2. Add `ConsistencyGroup` struct:
+   ```rust
+   /// A set of STs that must refresh atomically.
+   pub struct ConsistencyGroup {
+       /// All members, in topological order, including the convergence ST.
+       pub members: Vec<NodeId>,
+       /// The fan-in ST(s) that required this group.
+       pub convergence_points: Vec<NodeId>,
+       /// Monotonically increasing counter; advances on every successful
+       /// group refresh.
+       pub epoch: u64,
+   }
+   ```
 
-Add `check_frontier_alignment()` to the scheduler's per-ST evaluation loop.
-Before refreshing a fan-in node:
+3. Add an `is_singleton(&self) -> bool` helper on `ConsistencyGroup` that
+   returns `true` when `members.len() == 1` — used to short-circuit the
+   SAVEPOINT overhead for non-diamond STs.
 
-1. Identify shared transitive sources.
-2. Compare downstream ST frontiers for those sources.
-3. If misaligned, skip and log a warning.
+**Validation:** `just fmt && just lint` must pass with zero warnings.
 
-This is the simplest valuable delivered — low risk, no schema changes.
+---
 
-### Phase 3: Atomic Refresh Groups (scheduler.rs)
+### Step 2 — Implement diamond detection in `dag.rs` (no DB)
 
-Modify the scheduler's main loop to:
+**Goal:** A pure function that detects all diamonds in a given `StDag` and
+returns a list of `Diamond` values.
 
-1. During DAG rebuild, compute consistency groups.
-2. Replace the flat `for node in ordered` loop with a group-aware loop.
-3. Wrap each group's refreshes in a SAVEPOINT.
-4. On any group member failure, ROLLBACK TO SAVEPOINT and mark all
-   group members as skipped.
-5. Record the group refresh outcome in `pgt_refresh_history`.
+1. Add `pub fn detect_diamonds(dag: &StDag) -> Vec<Diamond>` to `StDag`:
 
-### Phase 4: Configuration & Documentation
+   ```
+   detect_diamonds(dag):
+     diamonds = []
+     for each ST node D where |ST-only upstream deps| >= 2:
+       paths = all_paths_to_roots(D, ST-only edges)
+       for each pair (P1, P2) in paths:
+         shared = ancestors(P1) ∩ ancestors(P2)
+         if shared ≠ ∅:
+           intermediates = (nodes(P1) ∪ nodes(P2)) \ {D} \ shared
+           diamonds.push(Diamond {
+             convergence: D,
+             shared_sources: shared,
+             intermediates: intermediates,
+           })
+     return merge_overlapping(diamonds)
+   ```
 
-1. Add `pg_trickle.diamond_consistency` GUC.
-2. Add `diamond_consistency` column to `pgt_stream_tables`.
-3. Update `create_stream_table()` and `alter_stream_table()` to accept the
-   new parameter.
-4. Add monitoring: `pgtrickle.diamond_groups()` function to inspect detected
-   groups.
-5. Document the feature in SQL_REFERENCE.md and CONFIGURATION.md.
+2. Add `merge_overlapping(diamonds: Vec<Diamond>) -> Vec<Diamond>`: combine
+   any two `Diamond` values whose `intermediates` sets overlap into a single
+   `Diamond`. This handles nested and multi-diamond DAGs correctly.
 
-### Phase 5: Testing
+3. **Complexity:** $O(V \cdot E)$ worst case; acceptable because DAGs are
+   shallow. Cache the result alongside the DAG (rebuild only when
+   `DAG_REBUILD_SIGNAL` advances — see Step 5).
 
-| Test | Type | Description |
-|------|------|-------------|
-| `test_diamond_detection_simple` | Unit | A→B→D, A→C→D detected |
-| `test_diamond_detection_deep` | Unit | A→B→E→D, A→C→D (3-level) |
-| `test_diamond_detection_no_diamond` | Unit | Linear chain not flagged |
-| `test_diamond_detection_multiple` | Unit | Overlapping diamonds |
-| `test_frontier_alignment_pass` | Integration | Both STs at same LSN → D refreshes |
-| `test_frontier_alignment_fail` | Integration | B ahead, C behind → D skipped |
-| `test_atomic_group_all_succeed` | E2E | B and C both succeed → D refreshed |
-| `test_atomic_group_partial_fail` | E2E | B succeeds, C fails → B rolled back, D skipped |
-| `test_atomic_group_convergence` | E2E | After retry, B+C succeed → D correct |
-| `test_no_diamond_unaffected` | E2E | Linear chains refresh as before |
+4. Write unit tests (all in `src/dag.rs` under `#[cfg(test)]`):
+
+   | Test name | Scenario |
+   |---|---|
+   | `test_detect_diamonds_simple` | A→B→D, A→C→D — one diamond detected |
+   | `test_detect_diamonds_deep` | A→B→E→D, A→C→D — 3-level path |
+   | `test_detect_diamonds_none` | Linear A→B→C — no diamond |
+   | `test_detect_diamonds_overlapping` | Two diamonds sharing an intermediate |
+   | `test_detect_diamonds_multiple_roots` | B and C have *different* root tables — not a diamond |
+
+**Validation:** `just test-unit` must pass.
+
+---
+
+### Step 3 — Implement consistency group computation in `dag.rs` (no DB)
+
+**Goal:** Convert the list of `Diamond` values into a list of
+`ConsistencyGroup` values that the scheduler can iterate.
+
+1. Add `pub fn compute_consistency_groups(dag: &StDag) -> Vec<ConsistencyGroup>`:
+   - Call `detect_diamonds(dag)` to get raw diamonds.
+   - For each diamond, create a group with `members = intermediates ∪
+     {convergence}` sorted in topological order (so the convergence ST is
+     always last).
+   - Merge groups whose member sets overlap (transitive closure — handles
+     nested diamonds and multi-convergence DAGs).
+   - For every ST not in any group, emit a singleton `ConsistencyGroup`
+     (`members = [st]`) so the scheduler can use a uniform loop.
+
+2. Expose `pub fn consistency_groups(&self) -> &[ConsistencyGroup]` on
+   `StDag` (cached after DAG rebuild; invalidated on signal).
+
+3. Write unit tests:
+
+   | Test name | Scenario |
+   |---|---|
+   | `test_groups_simple_diamond` | B and C in one group, D as convergence |
+   | `test_groups_singleton_non_diamond` | Linear ST gets a size-1 group |
+   | `test_groups_nested_merge` | Two overlapping diamonds merged into one group |
+   | `test_groups_independent_diamonds` | Two independent diamonds → two separate groups |
+
+**Validation:** `just test-unit` must pass.
+
+---
+
+### Step 4 — Add catalog column and GUC in `catalog.rs` / `config.rs`
+
+**Goal:** Persist the per-ST `diamond_consistency` setting and expose the
+global GUC. No scheduler logic yet.
+
+1. In `config.rs`: add `pg_trickle.diamond_consistency` GUC of type `enum`
+   with values `'none'` (default, backward-compatible) and `'atomic'`.
+   Define a `DiamondConsistency` Rust enum mirroring these values.
+
+2. In `catalog.rs`: add a `diamond_consistency TEXT NOT NULL DEFAULT 'none'`
+   column to `pgtrickle.pgt_stream_tables` via a migration SQL block. Add
+   `get_diamond_consistency(oid) -> DiamondConsistency` and
+   `set_diamond_consistency(oid, DiamondConsistency)` helpers.
+
+3. Update `create_stream_table()` in `api.rs` to accept an optional
+   `diamond_consistency => 'atomic'` parameter; store it via the catalog
+   helper. Default to the GUC value when not supplied.
+
+4. Update `alter_stream_table()` in `api.rs` similarly.
+
+5. Write a catalog integration test:
+
+   | Test name | Scenario |
+   |---|---|
+   | `test_catalog_diamond_consistency_default` | Newly created ST defaults to GUC value |
+   | `test_catalog_diamond_consistency_override` | Per-ST override round-trips correctly |
+
+**Validation:** `just fmt && just lint && just test-integration`.
+
+---
+
+### Step 5 — Wire consistency groups into the scheduler (`scheduler.rs`)
+
+**Goal:** Replace the flat `for node in topological_order` loop with a
+group-aware loop that uses SAVEPOINT for atomic groups.
+
+1. After the DAG rebuild step, call `dag.consistency_groups()` to obtain
+   the current group list. Store it in the scheduler's tick state.
+
+2. Replace the existing per-ST refresh loop with:
+
+   ```rust
+   for group in dag.consistency_groups() {
+       if group.is_singleton() {
+           // Fast path: no SAVEPOINT overhead for non-diamond STs.
+           execute_single_refresh(&group.members[0], &mut ctx)?;
+           continue;
+       }
+
+       // Check that every member has diamond_consistency = 'atomic'.
+       // If any member opts out, fall back to independent refreshes.
+       let all_atomic = group.members.iter()
+           .all(|m| catalog::get_diamond_consistency(m) == DiamondConsistency::Atomic);
+
+       if !all_atomic {
+           for member in &group.members {
+               execute_single_refresh(member, &mut ctx)?;
+           }
+           continue;
+       }
+
+       Spi::run("SAVEPOINT pgt_consistency_group")?;
+       let mut group_ok = true;
+
+       for member in &group.members {       // already in topo order
+           if let Err(e) = execute_single_refresh(member, &mut ctx) {
+               log!("diamond group rollback: member {:?} failed: {}", member, e);
+               group_ok = false;
+               break;
+           }
+       }
+
+       if group_ok {
+           Spi::run("RELEASE SAVEPOINT pgt_consistency_group")?;
+           group.advance_epoch();           // see Step 3
+       } else {
+           Spi::run("ROLLBACK TO SAVEPOINT pgt_consistency_group")?;
+           // All members retain their pre-tick state; retry next cycle.
+           record_group_skip(&group, &mut ctx);
+       }
+   }
+   ```
+
+3. Update `record_refresh_outcome()` (or equivalent) to log the group epoch
+   into `pgt_refresh_history` so operators can trace which tick a group
+   successfully committed.
+
+4. Confirm that the `BackgroundWorker` transaction wrapping in the scheduler
+   tick is **outside** the group loop — each tick is already one outer
+   transaction; SAVEPOINTs nest inside it correctly.
+
+**Validation:** `just fmt && just lint`. Do not run E2E yet (needs Step 6).
+
+---
+
+### Step 6 — Add monitoring SQL function (`api.rs`)
+
+**Goal:** Give operators visibility into detected diamond groups.
+
+1. Add `pgtrickle.diamond_groups()` returning `TABLE(group_id INT,
+   member_name TEXT, member_schema TEXT, is_convergence BOOL, epoch BIGINT)`.
+   Reads the in-memory `consistency_groups()` list via SPI or a lightweight
+   shared-state slot.
+
+2. Add `pgtrickle.explain_st(name TEXT)` output to include a
+   `diamond_group_id` column (or extend the existing function if it exists).
+
+**Validation:** `just fmt && just lint`.
+
+---
+
+### Step 7 — E2E tests
+
+Add to `tests/e2e_diamond_tests.rs`:
+
+| Test name | Type | What it proves |
+|---|---|---|
+| `test_diamond_atomic_all_succeed` | E2E | B and C both succeed → D refreshed, epoch advances |
+| `test_diamond_atomic_partial_fail` | E2E | B succeeds, C fails → ROLLBACK TO SAVEPOINT, D unchanged, B rolled back |
+| `test_diamond_atomic_convergence` | E2E | After retry, B+C succeed → D correct and consistent |
+| `test_diamond_none_mode_unblocked` | E2E | With `diamond_consistency='none'`, C failure does **not** roll back B |
+| `test_diamond_linear_unaffected` | E2E | Linear chain A→B→C refreshes independently (no SAVEPOINT overhead) |
+| `test_diamond_nested_merge` | E2E | Nested diamond: all intermediates grouped, D only refreshes when all succeed |
+| `test_diamond_groups_sql_function` | E2E | `pgtrickle.diamond_groups()` returns correct membership |
+
+**Validation:** `just test-e2e`.
+
+---
+
+### Step 8 — Documentation
+
+1. Add `diamond_consistency` parameter to `create_stream_table()` and
+   `alter_stream_table()` in `docs/SQL_REFERENCE.md`.
+2. Add `pg_trickle.diamond_consistency` GUC entry to
+   `docs/CONFIGURATION.md`.
+3. Add a "Diamond Dependency Consistency" section to
+   `docs/ARCHITECTURE.md` explaining the problem, the atomic group
+   solution, and the interaction with topological ordering.
+4. Update `CHANGELOG.md`.
+
+**Validation:** `just fmt && just lint && just test-all`.
+
+---
+
+### Recommended Implementation Order Summary
+
+| Step | File(s) | Depends on | Testable with |
+|---|---|---|---|
+| 1 — Data structures | `dag.rs` | — | `just lint` |
+| 2 — Diamond detection | `dag.rs` | Step 1 | `just test-unit` |
+| 3 — Consistency groups | `dag.rs` | Step 2 | `just test-unit` |
+| 4 — Catalog + GUC | `catalog.rs`, `config.rs`, `api.rs` | Step 3 | `just test-integration` |
+| 5 — Scheduler wiring | `scheduler.rs` | Steps 3, 4 | `just lint` |
+| 6 — Monitoring function | `api.rs` | Steps 3, 5 | `just lint` |
+| 7 — E2E tests | `tests/e2e_diamond_tests.rs` | Steps 5, 6 | `just test-e2e` |
+| 8 — Documentation | `docs/`, `CHANGELOG.md` | Steps 1–7 | `just test-all` |
 
 ---
 
