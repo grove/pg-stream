@@ -331,7 +331,7 @@ after every differential refresh — across all 22 TPC-H-derived queries at SF=0
 #### Native Syntax Planning
 - **Native DDL syntax research** — comprehensive analysis of 15 PostgreSQL
   extension syntax mechanisms for supporting `CREATE STREAM TABLE`-like syntax.
-  See `docs/research/CUSTOM_SQL_SYNTAX.md`.
+  See `plans/sql/REPORT_CUSTOM_SQL_SYNTAX.md`.
 - **Native syntax plan** — tiered strategy: Tier 1 (function API, existing),
   Tier 1.5 (`CALL` procedure wrappers), Tier 2 (`CREATE MATERIALIZED VIEW ...
   WITH (pgtrickle.stream = true)` via `ProcessUtility_hook`). See

@@ -903,7 +903,7 @@ Implement a tiered syntax strategy:
 
 ## References
 
-1. [Custom SQL Syntax Research Report](../../docs/research/CUSTOM_SQL_SYNTAX.md) —
+1. [Custom SQL Syntax Research Report](REPORT_CUSTOM_SQL_SYNTAX.md) —
    Comprehensive analysis of all PostgreSQL extension syntax mechanisms
 2. TimescaleDB `process_utility.c` —
    [github.com/timescale/timescaledb](https://github.com/timescale/timescaledb/blob/main/src/process_utility.c)

@@ -42,4 +42,4 @@
 
 - [DBSP Comparison](research/DBSP_COMPARISON.md)
 - [Prior Art](research/PRIOR_ART.md)
-- [Custom SQL Syntax](research/CUSTOM_SQL_SYNTAX.md)
+- [Custom SQL Syntax](../plans/sql/REPORT_CUSTOM_SQL_SYNTAX.md)
