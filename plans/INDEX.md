@@ -48,6 +48,7 @@ new entries when creating documents.
 | [PLAN_DOCKER_IMAGE.md](infra/PLAN_DOCKER_IMAGE.md) | PLAN | Draft | Official Docker image |
 | [PLAN_EXTERNAL_PROCESS.md](infra/PLAN_EXTERNAL_PROCESS.md) | REPORT | Exploration | External sidecar process feasibility study |
 | [PLAN_MULTI_DATABASE.md](infra/PLAN_MULTI_DATABASE.md) | PLAN | Draft | Multi-database support |
+| [PLAN_PARTITIONING_SHARDING.md](infra/PLAN_PARTITIONING_SHARDING.md) | PLAN | Research | PostgreSQL partitioning & sharding compatibility |
 | [PLAN_PACKAGING.md](infra/PLAN_PACKAGING.md) | PLAN | Draft | Distribution packaging |
 | [PLAN_PG19_COMPAT.md](infra/PLAN_PG19_COMPAT.md) | PLAN | Draft | PostgreSQL 19 forward-compatibility |
 | [PLAN_PGWIRE_PROXY.md](infra/PLAN_PGWIRE_PROXY.md) | REPORT | Research | pgwire proxy / intercept analysis |
