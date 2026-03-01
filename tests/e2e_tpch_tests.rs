@@ -10,7 +10,9 @@
 //! been modified, and no TPC-defined metric (QphH) is computed. "TPC-H" is
 //! a trademark of the Transaction Processing Performance Council (tpc.org).
 //!
-//! These tests are `#[ignore]`d to skip in normal CI. Run explicitly:
+//! These tests are `#[ignore]`d to skip in normal `cargo test` runs.
+//! They run automatically in CI on push to main (see .github/workflows/ci.yml)
+//! or manually:
 //!
 //! ```bash
 //! just test-tpch              # SF-0.01, ~2 min

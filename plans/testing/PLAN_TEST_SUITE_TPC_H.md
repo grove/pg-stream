@@ -8,11 +8,12 @@
 > trademarks of the Transaction Processing Performance Council
 > ([tpc.org](https://www.tpc.org/)).
 
-**Status:** All Priorities Resolved (P1–P7) — Pending E2E Verification  
-**Date:** 2026-03-03  
+**Status:** COMPLETE — All 22 queries pass, CI integrated  
+**Date:** 2026-03-01  
 **Branch:** `test-suite-tpc-h-part-2`  
 **Scope:** Implement TPC-H-derived queries as a correctness and regression
-test suite for stream tables, run locally via `just test-tpch`.
+test suite for stream tables. Run locally via `just test-tpch` or automatically
+in CI on every push to main.
 
 ---
 
@@ -38,10 +39,11 @@ query that pg_trickle can currently handle:
 | Phase 2: Cross-Query Consistency | Done — 21/22 STs survive all cycles |
 | Phase 3: FULL vs DIFFERENTIAL | Done — 22/22 pass |
 
-### Latest Test Run (2026-03-03, SF=0.01, 3 cycles)
+### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
 
-All three phases run cleanly. Fifteen DVM fixes and infrastructure
-improvements applied since the initial TPC-H suite was completed:
+All three phases run cleanly (verified on macOS arm64, Docker Desktop).
+Fifteen DVM fixes and infrastructure improvements applied since the
+initial TPC-H suite was completed:
 
 1. **WAL LSN capture** (`pg_current_wal_insert_lsn()`) — CDC triggers and
    frontier capture now use the WAL insert position instead of the write
@@ -179,9 +181,9 @@ improvements applied since the initial TPC-H suite was completed:
     growing PostgreSQL's data directory beyond safe limits.
 
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~25s)
-Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, ~21s)
-Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~25s)
+Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~45s)
+Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, ~27s)
+Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~45s)
 ```
 
 **Deterministically passing (22):** Q01, Q02, Q03, Q04, Q05, Q06, Q07,
@@ -262,16 +264,21 @@ Several queries were rewritten to avoid unsupported SQL features:
 
 ### What Remains
 
-The remaining work is entirely **pg_trickle DVM bug fixes** — the test suite
-itself is complete and the harness correctly soft-skips queries blocked by
-known limitations. No more test code changes are needed unless new test
-patterns are added.
+The test suite is complete and CI-integrated. All 22 queries pass
+deterministically. The only outstanding item is the Q07 Phase 2 drift.
 
 **Scorecard:** 22/22 pass (100%) · 0 data mismatch · 0 CREATE blocked
 
-All priorities P1–P7 are now RESOLVED. Remaining work is E2E verification
-(rebuild Docker image and re-run all 3 phases) and cleanup of disabled
-dead code (predicate pushdown in parser.rs).
+All priorities P1–P7 are RESOLVED. CI integration added to
+`.github/workflows/ci.yml` as a step in the E2E tests job. 
+
+#### Prioritized Remaining Work
+
+| # | Category | Impact | Difficulty | Status |
+|---|----------|--------|------------|--------|
+| **R1** | Q07 Phase 2 cross-query revenue drift (~$2) | Low — only affects Phase 2 cross-query mode; Phase 1 & 3 pass | Hard — requires deep join chain (5+ tables) L₀ without temp bloat or a multi-level correction term | **Known limitation** |
+| **R2** | Remove disabled predicate pushdown dead code (`parser.rs` ~527 lines) | Cleanup — no functional impact | Easy | Not started |
+| **R3** | Support unsupported SQL patterns (LIKE, NULLIF, BETWEEN, CTE, COUNT DISTINCT) natively | Would remove query workarounds for Q02/Q08/Q09/Q14/Q15/Q16 | Medium-Hard per pattern | Future work |
 
 #### Prioritized Remaining Work
 
@@ -565,13 +572,14 @@ O(delta_rows) in Part 2 left snapshot scan.
    in combinations the existing E2E tests never reach.
 3. **Regression safety net** — Catch delta-computation regressions that
    single-operator E2E tests miss.
-4. **Local-only** — No CI integration. Run via `just test-tpch` on a
-   developer machine with Docker.
+4. **CI integration** — Run automatically on push to main as part of the
+   E2E test suite (`.github/workflows/ci.yml`).
 
 ## Non-Goals
 
 - Performance benchmarking (SF-10/100) — future work.
-- CI gating — too slow (~5–10 min) for PR checks.
+- PR gating — TPC-H tests run ~2 min but require a Docker image build
+  (~15 min), so they are triggered on pushes to main only (same as E2E).
 - Comparison with Feldera or other IVM engines.
 
 ---
