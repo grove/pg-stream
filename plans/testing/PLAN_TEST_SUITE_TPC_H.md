@@ -136,9 +136,9 @@ TPC-H suite was completed:
     unsupported A_Expr kind 7.
 
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~37s)
-Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, ~33s)
-Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~37s)
+Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~25s)
+Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, ~21s)
+Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~25s)
 ```
 
 **Deterministically passing (22):** Q01, Q02, Q03, Q04, Q05, Q06, Q07,
@@ -146,26 +146,28 @@ Q08, Q09, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q17, Q18, Q19, Q20, Q21,
 Q22 — all 22 TPC-H queries pass all 3 mutation cycles consistently in
 Phase 1 (individual query mode).
 
-**Phase 2 (cross-query): 21/22** — Q07 has a known floating-point revenue
-rounding issue in cross-query mode (extra=1, missing=1 on cycle 2). All
-other queries survive cross-query mode.
+**Phase 2 (cross-query): 21/22** — Q07 has a known inner join delta bug
+in cross-query mode (extra=1, missing=1 on cycle 2). Confirmed as a delta
+computation error (FULL refresh fixes it; next differential fails again).
+Root cause: deep join chain (6-table) lacks Part 3 correction at non-shallow
+levels. All other queries survive cross-query mode.
 
 **Phase 3 (FULL vs DIFF): 22/22** — all queries match.
 
-**Performance observation:** SemiJoin/AntiJoin queries exhibit 30–80×
-slowdown on cycles 2–3 vs cycle 1:
+**Performance (after P6 R_old materialization):** SemiJoin/AntiJoin queries
+showed significant improvement on Q04 and Q21:
 
-| Query | Cycle 1 | Cycle 2 | Cycle 3 | Slowdown |
-|-------|---------|---------|---------|----------|
-| Q21 | 75ms | 5,422ms | 5,415ms | 72× |
-| Q18 | 64ms | 4,933ms | 5,099ms | 77× |
-| Q20 | 88ms | 2,184ms | 2,270ms | 25× |
-| Q04 | 59ms | 1,993ms | 2,108ms | 34× |
+| Query | Cycle 1 | Cycle 2 | Cycle 3 | Before | Improvement |
+|-------|---------|---------|---------|--------|-------------|
+| Q04 | 60ms | 59ms | 59ms | 2,000ms | **34× faster** |
+| Q21 | 159ms | 1,889ms | 1,877ms | 5,400ms | **2.9× faster** |
+| Q18 | 58ms | 5,192ms | 4,960ms | 5,000ms | ~same |
+| Q20 | 54ms | 2,345ms | 2,193ms | 2,200ms | ~same |
 
-Root cause: Part 2 of SemiJoin/AntiJoin delta scans the full left-side
-snapshot (potentially a multi-table join) and evaluates 3 EXISTS subqueries
-per row, including `r_old_snapshot` (EXCEPT ALL / UNION ALL set operation).
-Not a correctness blocker but impacts cycle time at larger scale factors.
+Q04 is fully resolved (constant-time across cycles). Q21 reduced from 72×
+to 12× slowdown. Q18/Q20 remain bottlenecked by the left-side snapshot
+scan (multi-table join), not R_old — further optimization requires delta-key
+pre-filtering of the left snapshot.
 
 **Queries failing cycle 2+ (0):** None — all 22 queries pass all cycles.
 
@@ -232,8 +234,9 @@ patterns are added.
 | ~~**P2**~~ | ~~Intermediate aggregate~~ | ~~Q13~~ | ~~RESOLVED~~ | ~~Medium~~ | ~~`aggregate.rs`, `api.rs`~~ |
 | ~~**P3**~~ | ~~Scalar subquery delta~~ | ~~Q15~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`scalar_subquery.rs`, `join.rs`, `parser.rs`, `project.rs`, `scan.rs`~~ |
 | ~~**P4**~~ | ~~Correlated scalar subquery~~ | ~~Q02, Q17~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`parser.rs`~~ |
-| **P5** | Cross-query interference | Q07 (Phase 2 only) | stability | Medium | `refresh.rs` (min-frontier edge case) |
-| **P6** | SemiJoin performance | Q21, Q18, Q20, Q04 | perf | Low | `semi_join.rs`, `anti_join.rs` (Part 2 snapshot) |
+| **P5** | Cross-query interference | Q07 (Phase 2 only) | stability | Hard | `join.rs` (deep join chain L₁ vs L₀) |
+| ~~**P6**~~ | ~~SemiJoin performance~~ | ~~Q04, Q21~~ | ~~RESOLVED~~ | ~~Low~~ | ~~`semi_join.rs`, `anti_join.rs`, `diff.rs`~~ |
+| **P7** | SemiJoin left-snapshot perf | Q18, Q20 | perf | Medium | `semi_join.rs` (delta-key pre-filter) |
 
 #### P1: Fix join delta value drift (Q03, Q10) — RESOLVED
 
@@ -372,34 +375,79 @@ correction rows to the InnerJoin delta output.
 #### P5: Investigate cross-query interference (Q07 Phase 2)
 
 Q07 passes all 3 cycles in Phase 1 (individual) but fails cycle 2 in Phase 2
-(cross-query: ST=2, Q=2, extra=1, missing=1). When 20 STs share the same
-source tables and are refreshed sequentially, Q07 gets incorrect join delta
-values. This may be a subtle change buffer min-frontier edge case where the
-frontier advances during sequential refresh, causing some STs to see partial
-change data from the next mutation round.
+(cross-query: ST=2, Q=2, extra=1, missing=1). Diagnostic confirmed:
 
-**Files:** `src/refresh.rs` (min-frontier cleanup, `drain_pending_cleanups`)
+- **FULL refresh FIXES the mismatch** — the delta computation has a bug.
+- **Post-FULL differential STILL FAILS** — the delta SQL itself is wrong
+  (not accumulated error). The bug reproduces every cycle.
+- **Revenue difference**: ~$2.31 (NUMERIC, not floating-point rounding).
+  The ST has a lower revenue than the direct query for group
+  (FRANCE, GERMANY, 1995), indicating a row is being missed or
+  double-counted in the aggregate SUM.
+
+**Root cause hypothesis (upgraded to Hard):** Q07 is a 6-table inner join
+chain (`supplier ⋈ lineitem ⋈ orders ⋈ customer ⋈ nation1 ⋈ nation2`).
+The Part 3 correction term is only applied at level 2 (shallow join:
+`InnerJoin(supplier, lineitem) ⋈ orders`). Deeper levels use L₁ (post-change)
+without correction. For most data patterns, the uncorrected error at deeper
+levels is zero (deeper joins involve static tables like customer/nation).
+However, the specific mutation pattern in Phase 2 (shared sources, 22 STs,
+different data state than Phase 1) exposes a non-zero error.
+
+The frontier/cleanup mechanisms were verified as correct — the issue is
+purely in the delta SQL, not in change buffer management.
+
+**Potential fix:** Extend Part 3 correction to deeper levels, but this risks
+generating SQL too complex for PostgreSQL's planner (the reason the correction
+was limited to shallow joins in the first place). A safer approach would be
+to compute L₀ via EXCEPT ALL for non-SemiJoin nested join chains, since the
+Q21 regression concern only applies to SemiJoin interactions.
+
+**Files:** `src/dvm/operators/join.rs` (`is_shallow_join`, `is_join_child`)
 **Impact:** Would stabilize Q07 in Phase 2 (Phase 1 unaffected)
 
-#### P6: SemiJoin/AntiJoin performance optimization
+#### P6: SemiJoin/AntiJoin R_old materialization — RESOLVED
 
-SemiJoin/AntiJoin Part 2 delta queries exhibit 30–80× slowdown on cycles 2–3
-vs cycle 1 (e.g., Q21: 75ms → 5.4s). Root cause: full left-side snapshot
-scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
-(EXCEPT ALL / UNION ALL operation). Not a correctness blocker.
+**RESOLVED** — Materialized `R_old` (pre-change right snapshot) as a CTE
+with `AS MATERIALIZED` to prevent PostgreSQL from re-evaluating the
+`EXCEPT ALL / UNION ALL` set operation for every `EXISTS` check in
+Part 1 (DELETE action) and Part 2 (status change detection).
 
-**Potential fixes:**
-- Materialize `r_old_snapshot` as a CTE instead of inline subquery
-- Add an index hint or hash-based filter on the delta join keys
-- Pre-filter left snapshot rows using a hash semi-join against delta keys
+Added `add_materialized_cte()` to `DiffContext` which emits
+`name AS MATERIALIZED (sql)` in the WITH clause. Applied to both
+`semi_join.rs` and `anti_join.rs`.
 
-**Files:** `src/dvm/operators/semi_join.rs`, `src/dvm/operators/anti_join.rs`
-**Impact:** Performance only — would reduce cycle time for Q21, Q18, Q20, Q04
+**Results:**
+- Q04: 2,000ms → 59ms (**34× faster**, constant-time across cycles)
+- Q21: 5,400ms → 1,880ms (**2.9× faster**)
+- Q18: ~5,000ms → ~5,100ms (~same — bottleneck is left-side snapshot)
+- Q20: ~2,200ms → ~2,300ms (~same — bottleneck is left-side snapshot)
+- Phase 2 cross-query cycle time: 16s → 9.4s (41% reduction)
+
+**Files:** `src/dvm/diff.rs` (`add_materialized_cte`, tuple update),
+`src/dvm/operators/semi_join.rs`, `src/dvm/operators/anti_join.rs`
+
+#### P7: SemiJoin left-snapshot delta-key pre-filtering (Q18, Q20)
+
+Q18 and Q20 remain bottlenecked by the full left-side snapshot scan in
+Part 2. The R_old materialization didn't help because their bottleneck is
+scanning the multi-table left-side join (not the R_old computation).
+
+**Potential fix:** Extract equi-join keys from the SemiJoin condition and
+pre-filter the left snapshot with `WHERE join_key IN (SELECT DISTINCT
+join_key FROM delta_right)`. This mirrors the optimization already used in
+`diff_inner_join` (via `build_semijoin_subquery`). Move `extract_equijoin_keys`
+from `join.rs` to `join_common.rs` and reuse in `semi_join.rs`/`anti_join.rs`.
+
+**Files:** `src/dvm/operators/semi_join.rs`, `src/dvm/operators/anti_join.rs`,
+`src/dvm/operators/join_common.rs` (share `extract_equijoin_keys`)
+**Impact:** Performance only — would reduce cycle time for Q18, Q20
 
 #### Resolved
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| **P6** — SemiJoin/AntiJoin R_old materialization | Part 1 and Part 2 of SemiJoin/AntiJoin delta evaluated the R_old pre-change snapshot (`R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`) as an inline subquery. Each `EXISTS` check re-evaluated the full set operation. For Q04 (simple SemiJoin), R_old was evaluated 2× per left row. For Q21 (3 nested SemiJoins with EXCEPT ALL), the cost was proportional to `left_rows × right_table_size`. | Promoted R_old to a `MATERIALIZED` CTE via new `add_materialized_cte()` in `DiffContext`. PostgreSQL computes the EXCEPT ALL + UNION ALL once and hash-probes the cached result for each EXISTS check. Applied to both `semi_join.rs` and `anti_join.rs`. | Q04 (2,000ms → 59ms, 34× faster). Q21 (5,400ms → 1,880ms, 2.9× faster). Phase 2 cross-query cycle: 16s → 9.4s. |
 | **P4** — Correlated scalar subquery decorrelation | Scalar subquery rewriter only detected correlation via dot-qualified references (`outer_table.col`). Q02/Q17 use bare column names (`p_partkey` from outer `part` table) in correlated subqueries — detected as non-correlated → CROSS JOIN wrapper breaks correlation → "column p_partkey does not exist". | Three fixes: (1) `detect_correlation_columns()` queries `pg_attribute` for outer-only table columns and uses word-boundary matching against subquery text. (2) `decorrelate_scalar_subquery()` separates correlation from regular conditions, builds GROUP BY subquery with correlation key + scalar alias, adds as comma-join to avoid SQL precedence issues with INNER JOIN on comma-separated FROM. `strip_table_qualifier()` removes inner aliases from GROUP BY to prevent DVM delta scope errors. (3) Q02 LIKE → `right()` workaround. | Q02, Q17 (all 3 cycles pass — was "column p_partkey does not exist" on CREATE). 22/22 = 100%. |
 | **P3** — Scalar subquery delta + row_id mismatch | Three independent issues: (1) Scalar subquery Part 2 used C₁ instead of C₀ (DBSP formula violation). (2) InnerJoin L₀ only applied to Scan children, not Subquery/Aggregate (Q15's cross join between two Subqueries that share lineitem source). (3) Project `row_id_key_columns()` and `diff_project()` didn't look through Filter/Subquery wrappers — Q15's `Project > Filter > InnerJoin` used position-based row_id for FULL but content-based for DIFF, causing DELETE to never match. (4) `build_hash_expr` `::TEXT` cast precedence error for complex expressions. | (1) Part 2 of scalar subquery delta uses C₀ via EXCEPT ALL. (2) `is_join_child()` helper + L₀ for non-join children. (3) `unwrap_transparent()` helper to look through Filter/Subquery in both `row_id_key_columns` and `diff_project`. (4) `(expr)::TEXT` parenthesization in `build_hash_expr`. | Q15 (all 3 cycles pass — was ST=2, Q=1, extra=1, missing=0 on cycle 2) |
 | **P1** — Nested join correction term (Part 3) | Inner join Part 2 uses L₁ (post-change) for nested join children instead of L₀ (pre-change). When both sides of a 3–4 table join chain change simultaneously (e.g., RF1 inserts into both lineitem and orders), Part 2 double-counts `ΔL ⋈ ΔR` overlap rows. For scan children L₀ is used (cheap EXCEPT ALL), but for nested children L₀ is too expensive. | Added Part 3 correction term: joins both delta CTEs (`ΔL ⋈ ΔR`) with action adjustments — insert delta rows emit with flipped action (cancelling excess double-count from L₁), delete delta rows keep original action (adding missing contribution). `is_shallow_join()` guard limits correction to one level of nesting (left child is join of two Scans) to avoid cascading CTE complexity that crashes PostgreSQL on deep join chains (8-table Q08). | Q03 (all 3 cycles pass — was extra=1, missing=1). Q10 (all 3 cycles pass — was extra=2, missing=0). |
