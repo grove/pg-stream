@@ -7125,6 +7125,16 @@ unsafe fn parse_select_stmt(
                 child: Box::new(tree),
             };
         }
+
+        // ── Predicate pushdown into cross joins ────────────────────
+        // Comma-separated FROM items create InnerJoin(TRUE, ...) chains.
+        // Promote eligible predicates from the Filter into appropriate
+        // JOIN ON clauses, converting cross joins to equi-joins.
+        // DISABLED: pushdown interacts badly with join condition rewriting
+        // in the diff engine (cycle-2 syntax errors on 8 TPC-H queries).
+        // The correctness issue is instead addressed by extending Part 3
+        // correction to all non-simple join children.
+        // tree = push_filter_into_cross_joins(tree);
     }
 
     // ── Step 3: Parse GROUP BY + aggregates ─────────────────────────────
@@ -10651,6 +10661,324 @@ fn rewrite_having_expr(expr: &Expr, aggregates: &[AggExpr]) -> Expr {
 /// Check if expressions are just `*` (select all).
 fn is_star_only(exprs: &[Expr]) -> bool {
     exprs.len() == 1 && matches!(exprs[0], Expr::Star { table_alias: None })
+}
+
+// ── Predicate pushdown into cross joins ──────────────────────────────────
+//
+// Comma-separated FROM items produce a left-deep InnerJoin chain with
+// `condition = Literal("TRUE")`.  The WHERE clause predicates are placed
+// in a single Filter above the entire chain.
+//
+// This pass promotes predicates from the Filter into the appropriate
+// JOIN ON clauses.  Benefits:
+//
+//  1. Eliminates cross-product intermediates in delta CTEs
+//  2. Enables semi-join optimisation in diff_inner_join
+//  3. Fixes Part 3 correction accuracy for multi-table joins (Q07)
+//
+// Algorithm:
+//   a) Split the filter predicate into AND-connected parts.
+//   b) For each part, collect referenced source-table aliases.
+//   c) Walk the InnerJoin chain top-down. At each level, if the right
+//      child contains any alias referenced by the predicate, that is
+//      the level to attach it (all remaining aliases are guaranteed to
+//      be in the left subtree of a left-deep chain).
+//   d) Any predicate that can't be promoted stays in the Filter.
+
+/// Push filter predicates down into cross-join ON clauses.
+fn push_filter_into_cross_joins(tree: OpTree) -> OpTree {
+    let OpTree::Filter { predicate, child } = tree else {
+        return tree;
+    };
+
+    // Quick check: does the child contain any cross join?
+    if !has_cross_join(&child) {
+        return OpTree::Filter { predicate, child };
+    }
+
+    // Split predicate into AND-connected parts
+    let parts = split_and_predicates(predicate);
+
+    // Classify parts: collect referenced source aliases for each
+    let mut to_promote: Vec<(Expr, Vec<String>)> = Vec::new();
+    let mut remaining: Vec<Expr> = Vec::new();
+
+    for part in parts {
+        let mut aliases = Vec::new();
+        collect_expr_source_aliases(&part, &child, &mut aliases);
+        aliases.sort();
+        aliases.dedup();
+
+        if aliases.len() >= 2 {
+            // References multiple source tables — promote into the join
+            to_promote.push((part, aliases));
+        } else {
+            // Single-table predicate or can't determine — keep as filter
+            remaining.push(part);
+        }
+    }
+
+    if to_promote.is_empty() {
+        // Nothing to promote — rebuild the original Filter
+        return OpTree::Filter {
+            predicate: join_and_predicates(remaining),
+            child,
+        };
+    }
+
+    // Promote each predicate into the join chain
+    let mut new_tree = *child;
+    for (pred, aliases) in to_promote {
+        new_tree = promote_predicate(new_tree, pred, &aliases);
+    }
+
+    // Wrap remaining predicates (if any)
+    if remaining.is_empty() {
+        new_tree
+    } else {
+        OpTree::Filter {
+            predicate: join_and_predicates(remaining),
+            child: Box::new(new_tree),
+        }
+    }
+}
+
+/// Check if an OpTree contains any InnerJoin with condition = Literal("TRUE").
+fn has_cross_join(op: &OpTree) -> bool {
+    match op {
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+            ..
+        } => {
+            matches!(condition, Expr::Literal(s) if s == "TRUE")
+                || has_cross_join(left)
+                || has_cross_join(right)
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => has_cross_join(child),
+        OpTree::SemiJoin { left, .. } | OpTree::AntiJoin { left, .. } => has_cross_join(left),
+        _ => false,
+    }
+}
+
+/// Split an AND-connected expression into its individual conjuncts.
+fn split_and_predicates(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp { op, left, right } if op.eq_ignore_ascii_case("AND") => {
+            let mut parts = split_and_predicates(*left);
+            parts.extend(split_and_predicates(*right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
+/// Join predicates with AND. Panics if the slice is empty.
+fn join_and_predicates(parts: Vec<Expr>) -> Expr {
+    let mut iter = parts.into_iter();
+    let mut result = iter.next().expect("at least one predicate required");
+    for part in iter {
+        result = Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(result),
+            right: Box::new(part),
+        };
+    }
+    result
+}
+
+/// Collect all source-table aliases referenced by column refs in an expression.
+///
+/// For qualified column refs (`n1.n_name`), the table alias is used directly
+/// if it matches a Scan in the tree.  For unqualified refs (`s_suppkey`),
+/// the tree is searched to find which Scan owns the column.
+fn collect_expr_source_aliases(expr: &Expr, tree: &OpTree, aliases: &mut Vec<String>) {
+    match expr {
+        Expr::ColumnRef {
+            table_alias: Some(tbl),
+            column_name: _,
+        } => {
+            // Verify the alias exists somewhere in the tree
+            if scan_has_alias(tree, tbl) {
+                aliases.push(tbl.clone());
+            }
+        }
+        Expr::ColumnRef {
+            table_alias: None,
+            column_name,
+        } => {
+            if let Some(alias) = find_scan_for_column(tree, column_name) {
+                aliases.push(alias);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_source_aliases(left, tree, aliases);
+            collect_expr_source_aliases(right, tree, aliases);
+        }
+        Expr::FuncCall { args, .. } => {
+            for arg in args {
+                collect_expr_source_aliases(arg, tree, aliases);
+            }
+        }
+        Expr::Raw(sql) => {
+            // Best-effort: look for `alias.column` patterns in raw SQL.
+            // This won't catch everything but handles common cases.
+            for alias in collect_tree_scan_aliases(tree) {
+                if sql.contains(&format!("{}.", alias)) || sql.contains(&format!("\"{}\".", alias))
+                {
+                    aliases.push(alias);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if the tree contains a Scan with the given alias.
+fn scan_has_alias(op: &OpTree, alias: &str) -> bool {
+    match op {
+        OpTree::Scan { alias: a, .. } => a == alias,
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => {
+            scan_has_alias(left, alias) || scan_has_alias(right, alias)
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => scan_has_alias(child, alias),
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            scan_has_alias(child, alias)
+        }
+        _ => false,
+    }
+}
+
+/// Find which Scan node owns a given column name.
+fn find_scan_for_column(op: &OpTree, column_name: &str) -> Option<String> {
+    match op {
+        OpTree::Scan { alias, columns, .. } => {
+            if columns.iter().any(|c| c.name == column_name) {
+                Some(alias.clone())
+            } else {
+                None
+            }
+        }
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => find_scan_for_column(left, column_name)
+            .or_else(|| find_scan_for_column(right, column_name)),
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => find_scan_for_column(child, column_name),
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            find_scan_for_column(child, column_name)
+        }
+        _ => None,
+    }
+}
+
+/// Collect all Scan aliases in the tree.
+fn collect_tree_scan_aliases(op: &OpTree) -> Vec<String> {
+    match op {
+        OpTree::Scan { alias, .. } => vec![alias.clone()],
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => {
+            let mut v = collect_tree_scan_aliases(left);
+            v.extend(collect_tree_scan_aliases(right));
+            v
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => collect_tree_scan_aliases(child),
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            collect_tree_scan_aliases(child)
+        }
+        _ => vec![],
+    }
+}
+
+/// Promote a predicate into the appropriate InnerJoin level.
+///
+/// Walks a left-deep InnerJoin chain top-down.  At each level, if the
+/// right child contains any alias referenced by the predicate, this is
+/// the level to attach it (the left subtree contains all other aliases).
+fn promote_predicate(tree: OpTree, pred: Expr, aliases: &[String]) -> OpTree {
+    match tree {
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            // Check if the right child contains any of the referenced aliases
+            let right_has_alias = aliases.iter().any(|a| scan_has_alias(&right, a));
+
+            if right_has_alias && matches!(&condition, Expr::Literal(s) if s == "TRUE") {
+                // Promote: replace TRUE with the predicate
+                OpTree::InnerJoin {
+                    condition: pred,
+                    left,
+                    right,
+                }
+            } else if right_has_alias {
+                // Already has a condition — combine with AND
+                OpTree::InnerJoin {
+                    condition: Expr::BinaryOp {
+                        op: "AND".to_string(),
+                        left: Box::new(condition),
+                        right: Box::new(pred),
+                    },
+                    left,
+                    right,
+                }
+            } else {
+                // The right child doesn't have any referenced alias.
+                // Recurse into the left child (which is the deeper part
+                // of the left-deep chain).
+                OpTree::InnerJoin {
+                    condition,
+                    left: Box::new(promote_predicate(*left, pred, aliases)),
+                    right,
+                }
+            }
+        }
+        // Pass through transparent wrappers (SemiJoin/AntiJoin wrap the join chain)
+        OpTree::SemiJoin {
+            condition,
+            left,
+            right,
+        } => OpTree::SemiJoin {
+            condition,
+            left: Box::new(promote_predicate(*left, pred, aliases)),
+            right,
+        },
+        OpTree::AntiJoin {
+            condition,
+            left,
+            right,
+        } => OpTree::AntiJoin {
+            condition,
+            left: Box::new(promote_predicate(*left, pred, aliases)),
+            right,
+        },
+        // Can't promote further — shouldn't happen in well-formed trees
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -14246,5 +14574,204 @@ mod tests {
             "select count(*) from orders",
             "p_partkey"
         ));
+    }
+
+    // ── Predicate pushdown tests ──────────────────────────────────────
+
+    #[test]
+    fn test_push_filter_two_table_cross_join() {
+        // FROM a, b WHERE a.id = b.id
+        let a = scan_node("a", 1, &["id", "name"]);
+        let b = scan_node("b", 2, &["id", "val"]);
+        let cross = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let filter = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(qualified_col("b", "id")),
+            },
+            child: Box::new(cross),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // Should become InnerJoin with the condition promoted
+        match &result {
+            OpTree::InnerJoin { condition, .. } => {
+                // Condition should contain "a.id = b.id" (not TRUE)
+                assert_ne!(condition.to_sql(), "TRUE");
+                assert!(condition.to_sql().contains("="));
+            }
+            _ => panic!("Expected InnerJoin, got {:?}", result.node_kind()),
+        }
+    }
+
+    #[test]
+    fn test_push_filter_three_table_cross_join() {
+        // FROM a, b, c WHERE a.x = b.x AND b.y = c.y
+        let a = scan_node("a", 1, &["x"]);
+        let b = scan_node("b", 2, &["x", "y"]);
+        let c = scan_node("c", 3, &["y"]);
+        let inner = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let outer = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(inner),
+            right: Box::new(c),
+        };
+        let pred = Expr::BinaryOp {
+            op: "AND".into(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "x")),
+                right: Box::new(qualified_col("b", "x")),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("b", "y")),
+                right: Box::new(qualified_col("c", "y")),
+            }),
+        };
+        let filter = OpTree::Filter {
+            predicate: pred,
+            child: Box::new(outer),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // Outer join should have b.y = c.y (c is right child)
+        // Inner join should have a.x = b.x (b is right child)
+        // No filter should remain
+        match &result {
+            OpTree::InnerJoin {
+                condition: outer_cond,
+                left,
+                ..
+            } => {
+                assert!(
+                    outer_cond.to_sql().contains("y"),
+                    "outer: {}",
+                    outer_cond.to_sql()
+                );
+                match left.as_ref() {
+                    OpTree::InnerJoin {
+                        condition: inner_cond,
+                        ..
+                    } => {
+                        assert!(
+                            inner_cond.to_sql().contains("x"),
+                            "inner: {}",
+                            inner_cond.to_sql()
+                        );
+                    }
+                    _ => panic!("Expected inner InnerJoin"),
+                }
+            }
+            _ => panic!("Expected InnerJoin, got {:?}", result.node_kind()),
+        }
+    }
+
+    #[test]
+    fn test_push_filter_preserves_single_table_predicate() {
+        // FROM a, b WHERE a.id = b.id AND a.name = 'foo'
+        let a = scan_node("a", 1, &["id", "name"]);
+        let b = scan_node("b", 2, &["id"]);
+        let cross = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let pred = Expr::BinaryOp {
+            op: "AND".into(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(qualified_col("b", "id")),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "name")),
+                right: Box::new(Expr::Literal("'foo'".into())),
+            }),
+        };
+        let filter = OpTree::Filter {
+            predicate: pred,
+            child: Box::new(cross),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // The join predicate should be promoted; single-table pred stays as Filter
+        match &result {
+            OpTree::Filter {
+                predicate: remaining,
+                child,
+            } => {
+                // Remaining filter: a.name = 'foo'
+                assert!(remaining.to_sql().contains("name"));
+                match child.as_ref() {
+                    OpTree::InnerJoin { condition, .. } => {
+                        assert_ne!(condition.to_sql(), "TRUE");
+                    }
+                    _ => panic!("Expected InnerJoin inside Filter"),
+                }
+            }
+            _ => panic!("Expected Filter wrapper for single-table predicate"),
+        }
+    }
+
+    #[test]
+    fn test_push_filter_no_cross_join_passthrough() {
+        // Filter over a proper join — should pass through unchanged
+        let a = scan_node("a", 1, &["id"]);
+        let b = scan_node("b", 2, &["id"]);
+        let join = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(qualified_col("b", "id")),
+            },
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let filter = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: ">".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(Expr::Literal("10".into())),
+            },
+            child: Box::new(join),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        assert!(matches!(result, OpTree::Filter { .. }));
+    }
+
+    #[test]
+    fn test_push_filter_unqualified_columns() {
+        // FROM a, b WHERE x = y (unqualified columns resolved by scan)
+        let a = scan_node("a", 1, &["x"]);
+        let b = scan_node("b", 2, &["y"]);
+        let cross = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let filter = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(col("x")),
+                right: Box::new(col("y")),
+            },
+            child: Box::new(cross),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // Should promote the predicate (both sides resolve to different scans)
+        match &result {
+            OpTree::InnerJoin { condition, .. } => {
+                assert_ne!(condition.to_sql(), "TRUE");
+            }
+            _ => panic!("Expected InnerJoin with promoted condition"),
+        }
     }
 }

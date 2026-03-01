@@ -204,6 +204,25 @@ impl E2eDb {
         db.execute("ALTER SYSTEM SET synchronous_commit = 'off'")
             .await;
         db.execute("ALTER SYSTEM SET max_wal_size = '1GB'").await;
+        // Limit temp file usage to prevent runaway disk consumption
+        // from CTE materialisation and sort spills.
+        db.execute("ALTER SYSTEM SET temp_file_limit = '512MB'")
+            .await;
+        // Aggressive autovacuum: change-buffer tables and stream tables
+        // accumulate dead tuples rapidly during differential refreshes.
+        // Without aggressive settings the default autovacuum can't keep
+        // up, causing the PostgreSQL data directory to bloat (121 GB+
+        // observed in TPC-H Phase 2 tests).
+        db.execute("ALTER SYSTEM SET autovacuum_vacuum_scale_factor = '0.01'")
+            .await;
+        db.execute("ALTER SYSTEM SET autovacuum_vacuum_threshold = '50'")
+            .await;
+        db.execute("ALTER SYSTEM SET autovacuum_naptime = '5s'")
+            .await;
+        db.execute("ALTER SYSTEM SET autovacuum_vacuum_cost_delay = '2ms'")
+            .await;
+        db.execute("ALTER SYSTEM SET autovacuum_vacuum_cost_limit = '1000'")
+            .await;
         // Enable INFO logging so [PGS_PROFILE] lines appear in server stderr
         db.execute("ALTER SYSTEM SET log_min_messages = 'info'")
             .await;

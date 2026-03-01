@@ -1173,6 +1173,7 @@ pub fn execute_differential_refresh(
 
     let resolved = if let Some(entry) = cached {
         // ── Cache hit: resolve LSN placeholders ──────────────────────
+        pgrx::debug1!("[pg_trickle] cache HIT for pgt_id={}", st.pgt_id);
         // Substitute __PGS_PREV/NEW_LSN_{oid}__ tokens with actual values.
         // Each execution gets a fresh plan with accurate LSN selectivity
         // estimates, avoiding the PREPARE/EXECUTE custom-plan penalty.
@@ -1197,6 +1198,7 @@ pub fn execute_differential_refresh(
         }
     } else {
         // ── Cache miss: full pipeline + PREPARE + cache ──────────────
+        pgrx::debug1!("[pg_trickle] cache MISS for pgt_id={}", st.pgt_id);
         let delta_result = dvm::generate_delta_query_cached(
             st.pgt_id,
             &st.defining_query,
@@ -1562,20 +1564,43 @@ pub fn execute_differential_refresh(
         let params = build_execute_params(&resolved.source_oids, prev_frontier, new_frontier);
         let execute_sql = format!("EXECUTE {stmt_name}({params})");
 
+        let parameterized_sql_for_debug = resolved.parameterized_merge_sql.clone();
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&execute_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             Ok::<usize, PgTrickleError>(result.len())
+        })
+        .inspect_err(|_e| {
+            let path = format!("/tmp/pgt_debug_exec_{}.sql", st.pgt_id);
+            let content =
+                format!("-- EXECUTE: {execute_sql}\n-- Template:\n{parameterized_sql_for_debug}");
+            let _ = std::fs::write(&path, &content);
+            pgrx::warning!(
+                "[pg_trickle] EXECUTE failed for pgt_id={}, SQL dumped to {}",
+                st.pgt_id,
+                path
+            );
         })?;
         (n, "merge_prepared")
     } else {
         // ── MERGE path (default for small deltas) ───────────────────
+        let merge_sql_for_debug = resolved.merge_sql.clone();
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&resolved.merge_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             Ok::<usize, PgTrickleError>(result.len())
+        })
+        .inspect_err(|_e| {
+            // Dump failing SQL to /tmp for debugging
+            let path = format!("/tmp/pgt_debug_merge_{}.sql", st.pgt_id);
+            let _ = std::fs::write(&path, &merge_sql_for_debug);
+            pgrx::warning!(
+                "[pg_trickle] MERGE failed for pgt_id={}, SQL dumped to {}",
+                st.pgt_id,
+                path
+            );
         })?;
         (n, "merge")
     };

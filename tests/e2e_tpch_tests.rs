@@ -608,6 +608,10 @@ async fn test_tpch_differential_correctness() {
                 n_cycles,
                 ct.elapsed().as_secs_f64() * 1000.0,
             );
+
+            // Reclaim dead-tuple bloat from change-buffer DELETEs and
+            // stream-table MERGEs before the next cycle.
+            db.execute("VACUUM").await;
         }
 
         if dvm_ok {
@@ -761,6 +765,11 @@ async fn test_tpch_cross_query_consistency() {
         }
         active = next_active;
 
+        // Reclaim dead-tuple bloat from change-buffer DELETEs and
+        // stream-table MERGEs before the next cycle. Without this the
+        // PostgreSQL data directory can grow to 100+ GB across cycles.
+        db.execute("VACUUM").await;
+
         println!(
             "  Cycle {}/{} — {} STs verified — {:.0}ms ✓",
             cycle,
@@ -895,6 +904,9 @@ async fn test_tpch_full_vs_differential() {
                     )"
                 ))
                 .await;
+
+            // Reclaim dead-tuple bloat between cycles.
+            db.execute("VACUUM").await;
 
             if !matches {
                 let full_count: i64 = db
