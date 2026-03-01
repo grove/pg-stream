@@ -964,3 +964,71 @@ async fn test_tpch_full_vs_differential() {
         queries.len()
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Q07 Isolation Test — regression test for BinaryOp parenthesisation fix
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_q07_isolation() {
+    let sf = scale_factor();
+    let n_cycles = cycles();
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  Q07 Isolation Test — SF={sf}, cycles={n_cycles}");
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+    let t = Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let q07_sql = include_str!("tpch/queries/q07.sql");
+    let st_name = "tpch_q07_iso";
+
+    // Create Q07 ST only
+    db.try_execute(&format!(
+        "SELECT pgtrickle.create_stream_table('{st_name}', $${q07_sql}$$, '1m', 'DIFFERENTIAL')",
+    ))
+    .await
+    .expect("Q07 create failed");
+    println!("  Q07 ST created ✓");
+
+    // Baseline
+    assert_tpch_invariant(&db, st_name, q07_sql, "q07", 0)
+        .await
+        .expect("Baseline failed");
+    println!("  baseline ✓");
+
+    for cycle in 1..=n_cycles {
+        let ct = Instant::now();
+        let next_ok = max_orderkey(&db).await + 1;
+        apply_rf1(&db, next_ok).await;
+        apply_rf2(&db).await;
+        apply_rf3(&db).await;
+        db.execute("ANALYZE orders").await;
+        db.execute("ANALYZE lineitem").await;
+        db.execute("ANALYZE customer").await;
+
+        try_refresh_st(&db, st_name)
+            .await
+            .unwrap_or_else(|e| panic!("Q07 refresh error cycle {cycle}: {e}"));
+
+        match assert_tpch_invariant(&db, st_name, q07_sql, "q07", cycle).await {
+            Ok(()) => println!(
+                "  cycle {cycle}/{n_cycles} — {:.0}ms ✓",
+                ct.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => {
+                panic!("  cycle {cycle}/{n_cycles} — FAILED: {e}");
+            }
+        }
+        db.execute("VACUUM").await;
+    }
+
+    let _ = db
+        .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+        .await;
+    println!("\n  Q07 isolation test complete\n");
+}

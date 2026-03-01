@@ -8,7 +8,7 @@
 > trademarks of the Transaction Processing Performance Council
 > ([tpc.org](https://www.tpc.org/)).
 
-**Status:** ACTIVE — 21/22 pass, Q07 open investigation  
+**Status:** COMPLETE — 22/22 pass, all phases green  
 **Date:** 2026-03-01  
 **Branch:** `test-suite-tpc-h-part-2`  
 **Scope:** Implement TPC-H-derived queries as a correctness and regression
@@ -35,8 +35,8 @@ query that pg_trickle can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 21/22 pass (Q07 known) |
-| Phase 2: Cross-Query Consistency | Done — 21/22 STs survive all cycles |
+| Phase 1: Differential Correctness | Done — 22/22 pass |
+| Phase 2: Cross-Query Consistency | Done — 22/22 STs survive all cycles |
 | Phase 3: FULL vs DIFFERENTIAL | Done — 22/22 pass |
 
 ### Latest Test Run (2026-03-01, SF=0.01, 3 cycles)
@@ -184,6 +184,7 @@ initial TPC-H suite was completed:
 
 16. **Expr::to\_sql() quoting + NOT MATERIALIZED CTE support** — Two
     infrastructure improvements:
+
     (a) `Expr::to_sql()` now always double-quotes table alias and column
     name in `ColumnRef` expressions (`"alias"."column"` instead of bare
     `alias.column`). This prevents SQL syntax errors when the alias is a
@@ -198,30 +199,28 @@ initial TPC-H suite was completed:
     NOT MATERIALIZED forces PG to inline the CTE as a subquery for each
     reference, avoiding the temp file issue.
 
+17. **Project `resolve_expr_to_child` BinaryOp parenthesisation** — The
+    `resolve_expr_to_child()` function in `project.rs` was missing
+    parentheses around `BinaryOp` expressions: `format!("{l} {op} {r}")`
+    instead of `format!("({l} {op} {r})")`. This caused nested
+    arithmetic like `l_extendedprice * (1 - l_discount)` to be
+    serialized as `l_extendedprice * 1 - l_discount` — SQL operator
+    precedence then evaluates `(price * 1) - discount` instead of
+    `price * (1 - discount)`. Q07's `volume` column computed
+    `231.84 - 0.01 = 231.83` instead of `231.84 * 0.99 = 229.5216`.
+    Note: `aggregate.rs`'s `resolve_expr_for_child()` already had
+    correct parenthesisation; this was the only affected call site.
+
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (21/22 queries pass, Q07 known)
-Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, Q07 known)
+Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass)
+Phase 2: test result: ok. 1 passed; 0 failed  (22/22 STs survive all cycles)
 Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass)
 ```
 
-**Deterministically passing (21):** Q01, Q02, Q03, Q04, Q05, Q06,
-Q08, Q09, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q17, Q18, Q19, Q20, Q21,
-Q22 — all pass 5 mutation cycles consistently in Phase 1.
+**Deterministically passing (22):** Q01–Q22 — all pass 3+ mutation
+cycles consistently in all three phases.
 
-**Known failing (1): Q07** — Revenue drift at cycle 3 (2nd differential
-refresh). EXTRA/MISSING row with matching group key (FRANCE→GERMANY,
-1995) but different SUM(revenue). Investigation findings:
-- NOT caused by L₀/L₁ double-counting: right-side tables (customer,
-  nation) are static in TPC-H RF — Part 3 correction produces 0 rows
-- NOT caused by cross-product intermediates: enabling predicate pushdown
-  (which gives proper equi-joins) does not fix Q07
-- Error is data-dependent: appears specifically at cycle 3 (38th overall
-  RF cycle after prior queries), $4-5 revenue drift on NUMERIC type
-- Likely in the aggregate delta pipeline or MERGE layer, not join delta
-- FULL refresh produces correct results (Phase 3: 22/22)
-
-**Phase 2 (cross-query): 21/22** — Q07 fails at cycle 2 in cross-query
-mode (same root cause). All other queries survive.
+**Phase 2 (cross-query): 22/22** — all queries survive all cycles.
 
 **Phase 3 (FULL vs DIFF): 22/22** — all queries match.
 
@@ -291,7 +290,7 @@ Several queries were rewritten to avoid unsupported SQL features:
 ### What Remains
 
 The test suite is complete and CI-integrated. All 22 queries pass
-deterministically. The only outstanding item is the Q07 Phase 2 drift.
+deterministically across all three phases.
 
 **Scorecard:** 22/22 pass (100%) · 0 data mismatch · 0 CREATE blocked
 
@@ -302,7 +301,7 @@ All priorities P1–P7 are RESOLVED. CI integration added to
 
 | # | Category | Impact | Difficulty | Status |
 |---|----------|--------|------------|--------|
-| **R1** | Q07 Phase 2 cross-query revenue drift (~$2) | Low — only affects Phase 2 cross-query mode; Phase 1 & 3 pass | Hard — requires deep join chain (5+ tables) L₀ without temp bloat or a multi-level correction term | **Known limitation** |
+| ~~**R1**~~ | ~~Q07 Phase 2 cross-query revenue drift (~$2)~~ | ~~RESOLVED~~ — Root cause was missing parentheses in `resolve_expr_to_child()` BinaryOp (fix #17) | ~~Hard~~ | **Resolved** |
 | **R2** | Remove disabled predicate pushdown dead code (`parser.rs` ~527 lines) | Cleanup — no functional impact | Easy | Not started |
 | **R3** | Support unsupported SQL patterns (LIKE, NULLIF, BETWEEN, CTE, COUNT DISTINCT) natively | Would remove query workarounds for Q02/Q08/Q09/Q14/Q15/Q16 | Medium-Hard per pattern | Future work |
 
@@ -481,8 +480,8 @@ correction rows to the InnerJoin delta output.
 `src/dvm/diff.rs` (`inside_semijoin` field),
 `src/dvm/operators/semi_join.rs` (flag setting),
 `src/dvm/operators/anti_join.rs` (flag setting)
-**Impact:** Q07 Phase 2 cross-query interference fixed (was extra=1, missing=1 on cycle 2).
-Phase 2: 21/22 → 22/22 (pending E2E verification after image rebuild).
+**Impact:** Q07 Phase 2 cross-query join interference partially fixed (was extra=1, missing=1 on cycle 2).
+Phase 2: 21/22 (Q07 still had residual revenue drift of ~$2 — fully resolved by fix #17, BinaryOp parenthesisation in `project.rs`).
 
 #### P6: SemiJoin/AntiJoin R_old materialization — RESOLVED
 
