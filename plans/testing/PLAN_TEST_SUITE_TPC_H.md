@@ -26,13 +26,13 @@ query that pg_trickle can currently handle:
 | `tests/tpch/queries/q01.sql` – `q22.sql` | Done (22 files) |
 | `tests/e2e_tpch_tests.rs` (harness) | Done (3 test functions) |
 | `justfile` targets | Done (`test-tpch`, `test-tpch-fast`, `test-tpch-large`) |
-| Phase 1: Differential Correctness | Done — 20/22 pass, 2 soft-skip |
+| Phase 1: Differential Correctness | Done — 22/22 pass |
 | Phase 2: Cross-Query Consistency | Done — 16/20 STs survive all cycles |
-| Phase 3: FULL vs DIFFERENTIAL | Done — 20/22 pass |
+| Phase 3: FULL vs DIFFERENTIAL | Done — 22/22 pass |
 
-### Latest Test Run (2026-03-02, SF=0.01, 3 cycles)
+### Latest Test Run (2026-03-03, SF=0.01, 3 cycles)
 
-All three phases run cleanly. Eleven DVM fixes applied since the initial
+All three phases run cleanly. Twelve DVM fixes applied since the initial
 TPC-H suite was completed:
 
 1. **WAL LSN capture** (`pg_current_wal_insert_lsn()`) — CDC triggers and
@@ -124,22 +124,33 @@ TPC-H suite was completed:
     only `b` to TEXT, producing "numeric * text" type errors for queries
     with arithmetic projection expressions (Q07, Q08, Q09).
 
+12. **Correlated scalar subquery decorrelation** — The scalar subquery
+    rewriter now detects correlated subqueries that use bare column
+    names (not dot-qualified) by looking up outer-only table columns
+    in `pg_catalog`. Correlated subqueries are transformed into
+    non-correlated GROUP BY subqueries joined back to the outer query
+    via a comma-join with equality conditions in WHERE. Table qualifiers
+    are stripped from the decorrelated GROUP BY columns to avoid alias
+    scoping issues in DVM delta queries. Q02's `LIKE '%BRASS'` was
+    also rewritten to `right(p_type, 5) = 'BRASS'` to avoid the
+    unsupported A_Expr kind 7.
+
 ```
-Phase 1: test result: ok. 1 passed; 0 failed  (20/22 queries pass, ~38s)
-Phase 2: test result: ok. 1 passed; 0 failed  (16/20 STs survive, ~45s)
-Phase 3: test result: ok. 1 passed; 0 failed  (20/22 queries pass, ~38s)
+Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~37s)
+Phase 2: test result: ok. 1 passed; 0 failed  (21/22 STs survive, ~33s)
+Phase 3: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~37s)
 ```
 
-**Deterministically passing (20):** Q01, Q03, Q04, Q05, Q06, Q07, Q08,
-Q09, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q18, Q19, Q20, Q21, Q22 — pass
-all 3 cycles consistently across multiple runs in Phase 1 (individual
-query mode).
+**Deterministically passing (22):** Q01, Q02, Q03, Q04, Q05, Q06, Q07,
+Q08, Q09, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q17, Q18, Q19, Q20, Q21,
+Q22 — all 22 TPC-H queries pass all 3 mutation cycles consistently in
+Phase 1 (individual query mode).
 
-**Phase 2 (cross-query): 16/20** — Q04 now survives cross-query mode
-(was failing before SemiJoin R_old fix). Q03, Q07, Q13, Q15 fail in
-cross-query mode.
+**Phase 2 (cross-query): 21/22** — Q07 has a known floating-point revenue
+rounding issue in cross-query mode (extra=1, missing=1 on cycle 2). All
+other queries survive cross-query mode.
 
-**Phase 3 (FULL vs DIFF): 19/22** — matches Phase 1 results.
+**Phase 3 (FULL vs DIFF): 22/22** — all queries match.
 
 **Performance observation:** SemiJoin/AntiJoin queries exhibit 30–80×
 slowdown on cycles 2–3 vs cycle 1:
@@ -156,16 +167,16 @@ snapshot (potentially a multi-table join) and evaluates 3 EXISTS subqueries
 per row, including `r_old_snapshot` (EXCEPT ALL / UNION ALL set operation).
 Not a correctness blocker but impacts cycle time at larger scale factors.
 
-**Queries failing cycle 2+ (0):** None — all creatable queries pass all cycles.
+**Queries failing cycle 2+ (0):** None — all 22 queries pass all cycles.
 
-**Queries that cannot be created (2):** Q02, Q17 — correlated scalar subquery
-(`column "p_partkey" does not exist`).
+**Queries that cannot be created (0):** None — all 22 queries create
+successfully.
 
 ### Query Failure Classification
 
 | Category | Queries | Root Cause |
 |----------|---------|------------|
-| **CREATE fails — correlated scalar subquery** | Q02, Q17 | Column reference in correlated subquery not resolved — pg_trickle DVM does not support correlated scalar subqueries in WHERE |
+| ~~**CREATE fails — correlated scalar subquery**~~ | ~~Q02, Q17~~ | ~~FIXED~~ — Decorrelation rewrite transforms correlated scalar subqueries into GROUP BY + comma-join |
 | ~~**Cycle 3 — aggregate drift (cumulative)**~~ | ~~Q01~~ | ~~FIXED~~ — Root cause was WAL LSN capture using `pg_current_wal_lsn()` (write position) instead of `pg_current_wal_insert_lsn()` (insert position). See "WAL LSN capture fix" in Resolved section. |
 | ~~**Cycle 2+ — join delta value drift**~~ | ~~Q03, Q10~~ | ~~FIXED~~ — Nested join correction term (Part 3) cancels double-counting from L₁ fallback. See Resolved section. |
 | ~~**Cycle 3 — SemiJoin delta drift**~~ | ~~Q04~~ | ~~FIXED~~ — SemiJoin/AntiJoin Part 1 now uses R_old snapshot for DELETE actions. When RF2 deletes rows from both sides, the DELETE check evaluates EXISTS against the pre-change right state. See Resolved section. |
@@ -196,6 +207,7 @@ Several queries were rewritten to avoid unsupported SQL features:
 
 | Query | Change | Reason |
 |-------|--------|--------|
+| Q02 | `LIKE '%BRASS'` → `right(p_type, 5) = 'BRASS'` | A_Expr kind 7 unsupported |
 | Q08 | `NULLIF(...)` → `CASE WHEN ... THEN ... END`; `BETWEEN` → explicit `>= AND <=` | A_Expr kind 5 unsupported |
 | Q09 | `LIKE '%green%'` → `strpos(p_name, 'green') > 0` | A_Expr kind 7 unsupported |
 | Q14 | `NULLIF(...)` → `CASE`; `LIKE 'PROMO%'` → `left(p_type, 5) = 'PROMO'` | A_Expr kind 5 & 7 |
@@ -210,7 +222,7 @@ itself is complete and the harness correctly soft-skips queries blocked by
 known limitations. No more test code changes are needed unless new test
 patterns are added.
 
-**Scorecard:** 20/22 pass (91%) · 0 data mismatch · 2 CREATE blocked
+**Scorecard:** 22/22 pass (100%) · 0 data mismatch · 0 CREATE blocked
 
 #### Prioritized Remaining Work
 
@@ -219,7 +231,7 @@ patterns are added.
 | ~~**P1**~~ | ~~Join delta value drift~~ | ~~Q03, Q10~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`join.rs`~~ |
 | ~~**P2**~~ | ~~Intermediate aggregate~~ | ~~Q13~~ | ~~RESOLVED~~ | ~~Medium~~ | ~~`aggregate.rs`, `api.rs`~~ |
 | ~~**P3**~~ | ~~Scalar subquery delta~~ | ~~Q15~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`scalar_subquery.rs`, `join.rs`, `parser.rs`, `project.rs`, `scan.rs`~~ |
-| **P4** | Correlated scalar subquery | Q02, Q17 | +2 create | Hard | `parser.rs` (`rewrite_scalar_subquery_in_where`) |
+| ~~**P4**~~ | ~~Correlated scalar subquery~~ | ~~Q02, Q17~~ | ~~RESOLVED~~ | ~~Hard~~ | ~~`parser.rs`~~ |
 | **P5** | Cross-query interference | Q07 (Phase 2 only) | stability | Medium | `refresh.rs` (min-frontier edge case) |
 | **P6** | SemiJoin performance | Q21, Q18, Q20, Q04 | perf | Low | `semi_join.rs`, `anti_join.rs` (Part 2 snapshot) |
 
@@ -325,15 +337,37 @@ correction rows to the InnerJoin delta output.
 `src/dvm/operators/scan.rs` (`build_hash_expr` parens)
 **Impact:** Q15 passes all 3 cycles (+1 pass → 20/22)
 
-#### P4: Fix correlated scalar subquery support (Q02, Q17)
+#### P4: Fix correlated scalar subquery support (Q02, Q17) — RESOLVED
 
-Q02 and Q17 use correlated scalar subqueries in WHERE clauses. The rewriter
-cannot safely detect when a scalar subquery references outer columns via bare
-column names (no `table.` prefix), so it cannot apply the CROSS JOIN rewrite.
-Deeper DVM support (named correlation context) is needed.
+**RESOLVED** — Three-part fix applied:
 
-**Files:** `src/dvm/parser.rs` (`rewrite_scalar_subquery_in_where`)
-**Impact:** Would unblock Q02 and Q17 (+2 CREATE → 22/22 creatable)
+1. **Catalog-based correlation detection** — `detect_correlation_columns()`
+   queries `pg_attribute` for column names of outer-only tables (tables in
+   the outer FROM but NOT in the inner subquery FROM). Uses word-boundary
+   matching against the subquery SQL text to detect bare column references
+   from outer tables (e.g., `p_partkey` from table `part`). This catches
+   correlations that the existing dot-qualified heuristic (`outer_table.col`)
+   misses.
+
+2. **Decorrelation to GROUP BY + comma-join** — Correlated scalar subqueries
+   are transformed into non-correlated equivalents. The inner subquery's
+   WHERE clause is flattened into AND-ed conditions. Correlation conditions
+   (equality with an outer column) are removed from WHERE and the inner
+   side becomes a GROUP BY key + SELECT column. The decorrelated subquery
+   is added to the outer FROM as a comma-separated item (not INNER JOIN,
+   to avoid SQL precedence issues with comma-joins). The original scalar
+   subquery expression in WHERE is replaced with a reference to the
+   decorrelated result column. Table qualifiers are stripped from GROUP BY
+   columns to avoid alias scoping issues in DVM delta queries.
+
+3. **Q02 LIKE workaround** — `p_type LIKE '%BRASS'` rewritten to
+   `right(p_type, 5) = 'BRASS'` (same pattern as Q09/Q16 LIKE workarounds).
+
+**Files:** `src/dvm/parser.rs` (`detect_correlation_columns`,
+`decorrelate_scalar_subquery`, `contains_word_boundary`, `strip_table_qualifier`,
+`flatten_and_conditions`, `check_correlation_condition`),
+`tests/tpch/queries/q02.sql` (LIKE workaround)
+**Impact:** Q02 + Q17 pass all 3 cycles (+2 pass → 22/22, 100%)
 
 #### P5: Investigate cross-query interference (Q07 Phase 2)
 
@@ -366,6 +400,7 @@ scan with 3 correlated EXISTS subqueries per row, including `r_old_snapshot`
 
 | Priority (old) | Root Cause | Fix Applied | Queries Unblocked |
 |----------------|-----------|-------------|-------------------|
+| **P4** — Correlated scalar subquery decorrelation | Scalar subquery rewriter only detected correlation via dot-qualified references (`outer_table.col`). Q02/Q17 use bare column names (`p_partkey` from outer `part` table) in correlated subqueries — detected as non-correlated → CROSS JOIN wrapper breaks correlation → "column p_partkey does not exist". | Three fixes: (1) `detect_correlation_columns()` queries `pg_attribute` for outer-only table columns and uses word-boundary matching against subquery text. (2) `decorrelate_scalar_subquery()` separates correlation from regular conditions, builds GROUP BY subquery with correlation key + scalar alias, adds as comma-join to avoid SQL precedence issues with INNER JOIN on comma-separated FROM. `strip_table_qualifier()` removes inner aliases from GROUP BY to prevent DVM delta scope errors. (3) Q02 LIKE → `right()` workaround. | Q02, Q17 (all 3 cycles pass — was "column p_partkey does not exist" on CREATE). 22/22 = 100%. |
 | **P3** — Scalar subquery delta + row_id mismatch | Three independent issues: (1) Scalar subquery Part 2 used C₁ instead of C₀ (DBSP formula violation). (2) InnerJoin L₀ only applied to Scan children, not Subquery/Aggregate (Q15's cross join between two Subqueries that share lineitem source). (3) Project `row_id_key_columns()` and `diff_project()` didn't look through Filter/Subquery wrappers — Q15's `Project > Filter > InnerJoin` used position-based row_id for FULL but content-based for DIFF, causing DELETE to never match. (4) `build_hash_expr` `::TEXT` cast precedence error for complex expressions. | (1) Part 2 of scalar subquery delta uses C₀ via EXCEPT ALL. (2) `is_join_child()` helper + L₀ for non-join children. (3) `unwrap_transparent()` helper to look through Filter/Subquery in both `row_id_key_columns` and `diff_project`. (4) `(expr)::TEXT` parenthesization in `build_hash_expr`. | Q15 (all 3 cycles pass — was ST=2, Q=1, extra=1, missing=0 on cycle 2) |
 | **P1** — Nested join correction term (Part 3) | Inner join Part 2 uses L₁ (post-change) for nested join children instead of L₀ (pre-change). When both sides of a 3–4 table join chain change simultaneously (e.g., RF1 inserts into both lineitem and orders), Part 2 double-counts `ΔL ⋈ ΔR` overlap rows. For scan children L₀ is used (cheap EXCEPT ALL), but for nested children L₀ is too expensive. | Added Part 3 correction term: joins both delta CTEs (`ΔL ⋈ ΔR`) with action adjustments — insert delta rows emit with flipped action (cancelling excess double-count from L₁), delete delta rows keep original action (adding missing contribution). `is_shallow_join()` guard limits correction to one level of nesting (left child is join of two Scans) to avoid cascading CTE complexity that crashes PostgreSQL on deep join chains (8-table Q08). | Q03 (all 3 cycles pass — was extra=1, missing=1). Q10 (all 3 cycles pass — was extra=2, missing=0). |
 | **P2** — Intermediate aggregate + comment-aware keyword parsing | Two issues: (1) `build_intermediate_agg_delta` called `diff_node(child)` a second time for EXCEPT ALL old-state reconstruction, creating duplicate LEFT JOIN CTEs with potential row-content divergence. (2) `find_top_level_keyword()` didn't skip SQL comments — a comment containing `FROM` could cause `inject_pgt_count` to inject into the comment instead of the query. | (1) Algebraic intermediate aggregate path: for COUNT/SUM aggregates, old values computed as `old = COALESCE(new, 0) - COALESCE(ins, 0) + COALESCE(del, 0)` using delta CTE LEFT JOIN new-rescan. MIN/MAX/group-rescan fall back to EXCEPT ALL. (2) `find_top_level_keyword()` now skips `--` and `/* */` comments. Added `is_algebraically_invertible()` helper. | Q13 passes all 3 cycles (was data mismatch). Defensive fix for future queries with keywords in comments. |
