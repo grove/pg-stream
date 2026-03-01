@@ -18,7 +18,7 @@ new entries when creating documents.
 
 | File | Type | Status | Summary |
 |------|------|--------|---------|
-| [PLAN_ADRS.md](adrs/PLAN_ADRS.md) | ADR | Proposed | Collection of architecture decision records |
+| [PLAN_ADRS.md](adrs/PLAN_ADRS.md) | PLAN | Proposed | ADR collection — all architecture decisions in one document |
 
 ## dbt/
 

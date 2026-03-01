@@ -19,7 +19,6 @@ Every document has **exactly one** type, expressed as a filename prefix.
 | `PLAN_` | Implementation plan with concrete phases, steps, and acceptance criteria. | You know *what* to build and need to describe *how*. | `PLAN_HYBRID_CDC.md`, `PLAN_PACKAGING.md` |
 | `GAP_` | Gap analysis — identifies what is missing relative to a competitor, standard, SQL spec, or target state. | You need to compare current capabilities against a reference and catalogue deficits. | `GAP_ANALYSIS_EPSIO.md`, `GAP_SQL_PHASE_7.md` |
 | `REPORT_` | Research, investigation, feasibility study, options analysis, comparison, or assessment. Reference material — not directly actionable. | You explored a topic and need to record findings for future reference. | `REPORT_PARALLELIZATION.md`, `REPORT_TRIGGERS_VS_REPLICATION.md` |
-| `ADR_` | Architecture Decision Record — a single significant technical decision with alternatives considered and consequences. | A non-obvious technical choice was made (or rejected) and the reasoning must be preserved. | `ADR_001_TRIGGER_CDC.md` |
 | `STATUS_` | Point-in-time progress snapshot or tracking dashboard for an ongoing area. | You need a living document that tracks where an area stands today. | `STATUS_PERFORMANCE.md`, `STATUS_TESTING.md` |
 
 **Choosing between types:**
@@ -40,7 +39,7 @@ Every document has **exactly one** type, expressed as a filename prefix.
 <PREFIX>_<TOPIC>[_<QUALIFIER>].md
 ```
 
-- **PREFIX** — One of `PLAN_`, `GAP_`, `REPORT_`, `ADR_`, `STATUS_`.
+- **PREFIX** — One of `PLAN_`, `GAP_`, `REPORT_`, `STATUS_`.
 - **TOPIC** — Two-to-four `UPPER_SNAKE_CASE` words describing the subject.
 - **QUALIFIER** (optional) — Version, part number, or narrowing scope.
 - Always `.md`.
@@ -50,7 +49,6 @@ Good:
 PLAN_STREAMING_AGGREGATION.md
 REPORT_TRIGGERS_VS_REPLICATION.md
 GAP_ANALYSIS_FELDERA.md
-ADR_003_ROW_IDENTITY_HASHING.md
 STATUS_TESTING.md
 ```
 
@@ -72,15 +70,6 @@ GAP_SQL_PHASE_5.md
 PLAN_PERFORMANCE_PART_9.md
 ```
 
-### ADR Numbering
-
-ADRs use a zero-padded three-digit sequence:
-
-```
-ADR_001_TRIGGER_BASED_CDC.md
-ADR_002_DEFERRED_VS_IMMEDIATE_IVM.md
-```
-
 ---
 
 ## Folder Structure
@@ -92,7 +81,7 @@ plans/
 ├── README.md                 ← this file (guidelines)
 ├── INDEX.md                  ← full document inventory with statuses
 ├── PLAN.md                   ← master implementation plan (top-level only)
-├── adrs/                     ← Architecture Decision Records
+├── adrs/                     ← Architecture Decision Records (single collection file)
 ├── dbt/                      ← dbt adapter & macros
 ├── ecosystem/                ← Competitor analysis, integrations, compatibility
 ├── infra/                    ← CI/CD, packaging, deployment, Docker, costs
@@ -108,8 +97,7 @@ plans/
    separate `gaps/` folder.
 2. `PLAN.md` (the master plan) stays at the `plans/` root. No other documents
    at the root unless they span all topic areas.
-3. `adrs/` is the only folder scoped to a single document type.
-4. Create a new subfolder only when there are **3+ documents** that don't fit
+3. Create a new subfolder only when there are **3+ documents** that don't fit
    an existing folder. Discuss in PR before adding.
 
 ---
