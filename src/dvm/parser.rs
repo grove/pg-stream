@@ -886,6 +886,16 @@ impl ParseResult {
     }
 }
 
+/// Look through transparent wrapper nodes (Filter, Subquery) to find the
+/// underlying operator. Used by `row_id_key_columns()` — a Filter sitting
+/// between Project and InnerJoin should not prevent PK-based row_ids.
+pub fn unwrap_transparent(op: &OpTree) -> &OpTree {
+    match op {
+        OpTree::Filter { child, .. } | OpTree::Subquery { child, .. } => unwrap_transparent(child),
+        other => other,
+    }
+}
+
 impl OpTree {
     /// Get the alias for this node (used in CTE naming).
     pub fn alias(&self) -> &str {
@@ -1037,11 +1047,16 @@ impl OpTree {
                 // with the OTHER side's CURRENT values, not the OLD values
                 // stored in the ST. PK columns are stable across value
                 // changes, so DELETE hashes always match the stored row_id.
+                //
+                // Look through transparent wrappers (Filter, Subquery) to
+                // find the underlying join node. Q15 has Project > Filter >
+                // InnerJoin — the Filter must not prevent PK-based row_ids.
+                let unwrapped = unwrap_transparent(child);
                 if matches!(
-                    child.as_ref(),
+                    unwrapped,
                     OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. }
                 ) {
-                    let pk_aliases = join_pk_aliases(expressions, aliases, child);
+                    let pk_aliases = join_pk_aliases(expressions, aliases, unwrapped);
                     return Some(pk_aliases.unwrap_or_else(|| aliases.clone()));
                 }
                 // For lateral function/subquery children, use all projected
@@ -1051,7 +1066,7 @@ impl OpTree {
                 // (which recomputes row_id in the Project operator) produce the
                 // same row_ids.
                 if matches!(
-                    child.as_ref(),
+                    unwrapped,
                     OpTree::LateralFunction { .. } | OpTree::LateralSubquery { .. }
                 ) {
                     return Some(aliases.clone());

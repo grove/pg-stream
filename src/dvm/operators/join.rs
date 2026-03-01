@@ -13,6 +13,16 @@
 //! handles (ΔQ ⋈ R₁), and using Q₀ excludes newly-inserted Q rows that
 //! would duplicate Part 1's contribution.
 //!
+//! Q₀ is computed via EXCEPT ALL for:
+//! - **Scan children**: one table scan + small delta (cheap)
+//! - **Subquery/Aggregate children**: snapshot + delta EXCEPT ALL
+//!   (critical for correlated sources like Q15 where revenue0 and
+//!   MAX(total_revenue) both depend on lineitem)
+//!
+//! For **nested join children** (InnerJoin/LeftJoin), Q₀ via EXCEPT ALL
+//! interacts badly with SemiJoin R_old (Q21 regression), so Q₁ is used
+//! with a correction term for shallow cases (Part 3).
+//!
 //! ## Nested join children — correction term (Part 3)
 //!
 //! For Scan children, Q₀ is computed cheaply via EXCEPT ALL / UNION ALL.
@@ -57,6 +67,20 @@ use crate::dvm::operators::join_common::{
 };
 use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
+
+/// Returns true if `op` is (or wraps) a join node, indicating a nested join
+/// child for which the EXCEPT ALL L₀ approach may interact badly with
+/// SemiJoin R_old (causing Q21-type regressions). Subquery/Aggregate
+/// children are **not** considered join children — they can safely use L₀.
+fn is_join_child(op: &OpTree) -> bool {
+    match op {
+        OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. } => true,
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => is_join_child(child),
+        _ => false,
+    }
+}
 
 /// Returns true if `op` is a join whose **both** children are simple (Scan)
 /// nodes.  This is used to limit the correction term (Part 3) to the first
@@ -237,23 +261,25 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         &left_result.cte_name,
         JoinSide::Right,
     );
-    // ── Pre-change snapshot for Part 2 (Scan children only) ─────────
+    // ── Pre-change snapshot for Part 2 ────────────────────────────
     //
     // Standard DBSP: ΔJ = (ΔL ⋈ R₁) + (L₀ ⋈ ΔR)
     //
     // L₀ = the state of the left child BEFORE the current cycle's changes.
     // Reconstructed as: L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes.
     //
-    // For Scan children this is cheap: one table scan and a small delta.
-    // For nested join children, computing L₀ requires the full join
-    // snapshot plus EXCEPT ALL — prohibitively expensive for multi-table
-    // chains. Fall back to post-change L₁ with semi-join filter, which
-    // may double-count when both sides change simultaneously, but this
-    // only matters when the LEFT child of the outer join also changes,
-    // which is uncommon in practice (RF mutations typically touch only
-    // base tables, not derived join results).
-    let left_part2_source = if is_simple_child(left) {
-        // Scan child: use cheap L₀ via EXCEPT ALL
+    // For Scan children and Subquery/Aggregate children, L₀ is computed
+    // via EXCEPT ALL on the snapshot. For Subquery children (e.g.
+    // revenue0 in Q15), this is critical when the inner subquery and
+    // outer child share a common source table — using L₁ instead of L₀
+    // causes missed DELETE rows and duplicate INSERT rows.
+    //
+    // For nested join children (InnerJoin/LeftJoin), computing L₀ via
+    // EXCEPT ALL interacts badly with SemiJoin R_old (Q21 regression).
+    // These use L₁ + correction term for shallow joins, or plain L₁ for
+    // deeper chains.
+    let left_part2_source = if is_simple_child(left) || !is_join_child(left) {
+        // Scan or Subquery/Aggregate child: use L₀ via EXCEPT ALL
         let left_data_cols: String = left_cols
             .iter()
             .map(|c| quote_ident(c))
@@ -290,7 +316,8 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
         }
     } else {
         // Nested join child: use post-change L₁ with semi-join filter
-        // (too expensive to compute L₀ via EXCEPT ALL for nested joins)
+        // (L₀ via EXCEPT ALL for joins interacts badly with SemiJoin R_old)
+        // Shallow join children get a correction term (Part 3) below.
         build_semijoin_subquery(
             &left_table,
             &equi_keys,
