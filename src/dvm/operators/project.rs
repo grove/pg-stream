@@ -183,7 +183,7 @@ fn resolve_expr_to_child(expr: &Expr, child_cols: &[String]) -> String {
         Expr::BinaryOp { op, left, right } => {
             let l = resolve_expr_to_child(left, child_cols);
             let r = resolve_expr_to_child(right, child_cols);
-            format!("{l} {op} {r}")
+            format!("({l} {op} {r})")
         }
         Expr::FuncCall { func_name, args } => {
             let resolved_args: Vec<String> = args
