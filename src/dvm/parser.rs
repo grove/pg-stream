@@ -3926,12 +3926,31 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     // Detect correlation by checking if the subquery's WHERE references
     // column names from tables in the outer FROM clause.
     let outer_tables = unsafe { collect_from_clause_table_names(select) };
-    let non_correlated: Vec<&ScalarSubqueryExtract> = scalar_subqueries
-        .iter()
-        .filter(|sq| !sq.is_correlated(&outer_tables))
-        .collect();
 
-    if non_correlated.is_empty() {
+    // Classify each scalar subquery:
+    //   1. Dot-qualified correlated (existing heuristic) → skip entirely
+    //   2. Bare-column correlated (catalog-detected)   → decorrelate to INNER JOIN
+    //   3. Non-correlated                              → CROSS JOIN
+    let mut non_correlated: Vec<&ScalarSubqueryExtract> = Vec::new();
+    let mut to_decorrelate: Vec<(
+        &ScalarSubqueryExtract,
+        std::collections::HashMap<String, String>,
+    )> = Vec::new();
+
+    for sq in &scalar_subqueries {
+        if sq.is_correlated(&outer_tables) {
+            // Dot-qualified correlation (e.g., "outer_table.col") — skip
+            continue;
+        }
+        let outer_cols = detect_correlation_columns(sq, &outer_tables);
+        if outer_cols.is_empty() {
+            non_correlated.push(sq);
+        } else {
+            to_decorrelate.push((sq, outer_cols));
+        }
+    }
+
+    if non_correlated.is_empty() && to_decorrelate.is_empty() {
         return Ok(query.to_string());
     }
 
@@ -3940,15 +3959,23 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     // FROM clause
     let from_sql = extract_from_clause_sql(select)?;
 
+    // Unified index counter for all subquery aliases
+    let mut next_idx = 1usize;
+
     // Build CROSS JOIN additions for each non-correlated scalar subquery.
     // The wrapper SELECT uses the original scalar subquery as a derived table
     // in its FROM clause, so the DVM parser (which requires FROM) can handle it.
     //
     // Format: CROSS JOIN (SELECT v."c" AS "scalar_alias"
     //                      FROM (inner_sql) AS v("c")) AS "sq_alias"
-    let mut cross_joins: Vec<String> = Vec::new();
-    for (i, sq) in non_correlated.iter().enumerate() {
-        let idx = i + 1;
+    let mut extra_joins: Vec<String> = Vec::new();
+    let mut extra_from_items: Vec<String> = Vec::new();
+    let mut extra_where_parts: Vec<String> = Vec::new();
+    let mut where_replacements: Vec<(String, String)> = Vec::new();
+
+    for sq in &non_correlated {
+        let idx = next_idx;
+        next_idx += 1;
         let sq_alias = format!("__pgt_sq_{idx}");
         let scalar_alias = format!("__pgt_scalar_{idx}");
         let inner_alias = format!("__pgt_v_{idx}");
@@ -3956,28 +3983,55 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
         // The inner scalar subquery returns exactly 1 column and 1 row.
         // We wrap it so the DVM parser sees a subquery with a valid FROM clause:
         //   (SELECT v."c" AS "scalar" FROM (original_subquery) AS v("c")) AS "sq"
-        cross_joins.push(format!(
+        extra_joins.push(format!(
             "CROSS JOIN (SELECT \"{inner_alias}\".\"{inner_col}\" AS \"{scalar_alias}\" \
              FROM ({sq_sql}) AS \"{inner_alias}\"(\"{inner_col}\")) AS \"{sq_alias}\"",
             sq_sql = sq.subquery_sql,
         ));
+        let replacement = format!("\"{sq_alias}\".\"{scalar_alias}\"");
+        where_replacements.push((sq.expr_sql.clone(), replacement));
+    }
+
+    // Build comma-joined FROM items for decorrelated correlated subqueries.
+    // Decorrelated subqueries are added as comma-separated FROM items (not
+    // INNER JOIN) to avoid SQL precedence issues with comma-joins.
+    for (sq, outer_cols) in &to_decorrelate {
+        let idx = next_idx;
+        next_idx += 1;
+        match decorrelate_scalar_subquery(sq, outer_cols, idx) {
+            Ok(decorrelated) => {
+                extra_from_items.push(decorrelated.from_item);
+                extra_where_parts.extend(decorrelated.extra_where_conditions);
+                where_replacements.push((sq.expr_sql.clone(), decorrelated.scalar_ref));
+            }
+            Err(e) => {
+                pgrx::debug1!(
+                    "[pg_trickle] Skipping decorrelation of scalar subquery: {}",
+                    e
+                );
+                // Fall back: skip this subquery
+                continue;
+            }
+        }
+    }
+
+    if extra_joins.is_empty() && extra_from_items.is_empty() {
+        return Ok(query.to_string());
     }
 
     // Rewrite the WHERE expression, replacing scalar subquery occurrences
-    // with column references to the CROSS JOIN aliases.
+    // with column references to the CROSS/INNER JOIN aliases.
     let where_expr = unsafe { node_to_expr(select.whereClause) }
         .map(|e| e.to_sql())
         .unwrap_or_else(|_| "TRUE".to_string());
 
     let mut rewritten_where = where_expr;
-    for (i, sq) in non_correlated.iter().enumerate() {
-        let idx = i + 1;
-        let sq_alias = format!("__pgt_sq_{idx}");
-        let scalar_alias = format!("__pgt_scalar_{idx}");
-        let replacement = format!("\"{sq_alias}\".\"{scalar_alias}\"");
-        // Replace the scalar subquery SQL in the WHERE expression
-        // The node_to_expr will have emitted the scalar subquery as "(SELECT ...)"
-        rewritten_where = rewritten_where.replace(&sq.expr_sql, &replacement);
+    for (find, replacement) in &where_replacements {
+        rewritten_where = rewritten_where.replace(find, replacement);
+    }
+    // Append decorrelation join conditions to WHERE
+    for cond in &extra_where_parts {
+        rewritten_where = format!("{rewritten_where} AND {cond}");
     }
 
     // Target list
@@ -4083,14 +4137,19 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     };
 
     // ── Assemble rewritten query ─────────────────────────────────────
+    // Build the complete FROM clause: original + comma-joined decorrelated subqueries + CROSS JOINs
+    let mut from_parts = vec![from_sql];
+    from_parts.extend(extra_from_items.iter().cloned());
+    let full_from = from_parts.join(", ");
+
     let rewritten = format!(
-        "SELECT{distinct_sql} {targets} FROM {from_sql} {cross_joins} WHERE {rewritten_where}{group_sql}{having_sql}{order_sql}",
+        "SELECT{distinct_sql} {targets} FROM {full_from} {extra_joins} WHERE {rewritten_where}{group_sql}{having_sql}{order_sql}",
         targets = targets.join(", "),
-        cross_joins = cross_joins.join(" "),
+        extra_joins = extra_joins.join(" "),
     );
 
     pgrx::debug1!(
-        "[pg_trickle] Rewrote scalar subquery in WHERE to CROSS JOIN: {}",
+        "[pg_trickle] Rewrote scalar subquery in WHERE: {}",
         rewritten
     );
 
@@ -4286,6 +4345,358 @@ unsafe fn collect_scalar_sublinks_in_where(
     }
 
     Ok(())
+}
+
+// ── Correlated scalar subquery decorrelation ────────────────────────
+
+/// Information about a decorrelated scalar subquery, ready to be added
+/// as a comma-joined subquery in the outer FROM clause with extra WHERE conditions.
+struct DecorrelatedSubquery {
+    /// The subquery to add to FROM as a comma-separated item.
+    /// e.g., `(SELECT ...) AS "__pgt_sq_1"`
+    from_item: String,
+    /// Additional equality conditions to add to WHERE (decorrelation join).
+    /// e.g., `p_partkey = "__pgt_sq_1"."__pgt_corr_key_1"`
+    extra_where_conditions: Vec<String>,
+    /// The reference to the scalar result column for WHERE replacement.
+    /// e.g., `"__pgt_sq_1"."__pgt_scalar_1"`
+    scalar_ref: String,
+}
+
+/// A correlation condition found in a scalar subquery's WHERE clause.
+struct CorrelationCondition {
+    /// The column name from the outer query (e.g., `p_partkey`).
+    outer_column: String,
+    /// The full inner column expression as SQL (the side that stays in the subquery).
+    /// e.g., `ps_partkey` or `l2.l_partkey`
+    inner_expr_sql: String,
+}
+
+/// Detect whether a scalar subquery is correlated with the outer query by
+/// looking up column names of outer-only tables (tables in the outer FROM
+/// but NOT in the inner FROM) in `pg_catalog`.
+///
+/// Returns a map from column name → table name for outer columns found in
+/// the subquery text. Returns an empty map if not correlated.
+fn detect_correlation_columns(
+    sq: &ScalarSubqueryExtract,
+    outer_tables: &[String],
+) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+
+    // Find tables that appear in the outer FROM but NOT in the inner FROM.
+    let outer_only: Vec<&String> = outer_tables
+        .iter()
+        .filter(|t| !sq.inner_tables.contains(t))
+        .collect();
+
+    if outer_only.is_empty() {
+        return HashMap::new();
+    }
+
+    let sq_lower = sq.subquery_sql.to_lowercase();
+    let mut outer_columns: HashMap<String, String> = HashMap::new();
+
+    let result = pgrx::Spi::connect(|client| {
+        for table_name in &outer_only {
+            let query = format!(
+                "SELECT a.attname::text \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON a.attrelid = c.oid \
+                 LEFT JOIN pg_namespace n ON c.relnamespace = n.oid \
+                 WHERE c.relname = '{}' \
+                 AND (n.nspname = 'public' OR n.nspname = current_schema()) \
+                 AND a.attnum > 0 AND NOT a.attisdropped",
+                table_name.replace('\'', "''")
+            );
+            let rows = client.select(&query, None, &[])?;
+            for row in rows {
+                if let Some(col_name) = row.get::<String>(1)? {
+                    let col_lower = col_name.to_lowercase();
+                    if contains_word_boundary(&sq_lower, &col_lower) {
+                        outer_columns.insert(col_lower, table_name.to_string());
+                    }
+                }
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(())
+    });
+
+    if result.is_err() {
+        return std::collections::HashMap::new();
+    }
+    outer_columns
+}
+
+/// Strip a leading table qualifier from a column reference.
+///
+/// e.g., `"l2.l_partkey"` → `"l_partkey"`, `"ps_partkey"` → `"ps_partkey"`.
+fn strip_table_qualifier(expr: &str) -> String {
+    if let Some(dot_pos) = expr.find('.') {
+        expr[dot_pos + 1..].to_string()
+    } else {
+        expr.to_string()
+    }
+}
+
+/// Check if `word` appears as a whole word in `text`.
+///
+/// A word boundary is defined as the start/end of string or a character
+/// that is not alphanumeric and not underscore (since SQL identifiers
+/// can contain underscores).
+fn contains_word_boundary(text: &str, word: &str) -> bool {
+    let text_bytes = text.as_bytes();
+    let word_len = word.len();
+    let mut start = 0;
+    while start + word_len <= text.len() {
+        if let Some(pos) = text[start..].find(word) {
+            let abs_pos = start + pos;
+            let before_ok = abs_pos == 0 || {
+                let c = text_bytes[abs_pos - 1];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            let after_pos = abs_pos + word_len;
+            let after_ok = after_pos >= text.len() || {
+                let c = text_bytes[after_pos];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs_pos + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Flatten a WHERE clause AND tree into individual conditions.
+///
+/// Recursively unpacks `BoolExpr(AND, args)` nodes, collecting leaf
+/// condition nodes.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree `Node`.
+unsafe fn flatten_and_conditions(node: *mut pg_sys::Node, out: &mut Vec<*mut pg_sys::Node>) {
+    if node.is_null() {
+        return;
+    }
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
+        if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR && !boolexpr.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
+            for arg_ptr in args.iter_ptr() {
+                if !arg_ptr.is_null() {
+                    unsafe { flatten_and_conditions(arg_ptr, out) };
+                }
+            }
+            return;
+        }
+    }
+    out.push(node);
+}
+
+/// Check if a WHERE condition node is an equality between a bare outer column
+/// and an inner expression. Returns the correlation info if so.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree `Node`.
+unsafe fn check_correlation_condition(
+    node: *mut pg_sys::Node,
+    outer_columns: &std::collections::HashMap<String, String>,
+) -> Option<CorrelationCondition> {
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
+        return None;
+    }
+    let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+    if aexpr.kind != pg_sys::A_Expr_Kind::AEXPR_OP {
+        return None;
+    }
+    let op_name = unsafe { extract_operator_name(aexpr.name) }.ok()?;
+    if op_name != "=" {
+        return None;
+    }
+    let left_expr = unsafe { node_to_expr(aexpr.lexpr) }.ok()?;
+    let right_expr = unsafe { node_to_expr(aexpr.rexpr) }.ok()?;
+
+    // Check if left side is a bare outer column
+    if let Expr::ColumnRef {
+        table_alias: None,
+        ref column_name,
+    } = left_expr
+        && outer_columns.contains_key(&column_name.to_lowercase())
+    {
+        return Some(CorrelationCondition {
+            outer_column: column_name.clone(),
+            inner_expr_sql: right_expr.to_sql(),
+        });
+    }
+
+    // Check if right side is a bare outer column
+    if let Expr::ColumnRef {
+        table_alias: None,
+        ref column_name,
+    } = right_expr
+        && outer_columns.contains_key(&column_name.to_lowercase())
+    {
+        return Some(CorrelationCondition {
+            outer_column: column_name.clone(),
+            inner_expr_sql: left_expr.to_sql(),
+        });
+    }
+
+    None
+}
+
+/// Decorrelate a correlated scalar subquery into an INNER JOIN.
+///
+/// Given a correlated scalar subquery like:
+/// ```sql
+/// (SELECT MIN(ps_supplycost) FROM partsupp, ... WHERE p_partkey = ps_partkey AND ...)
+/// ```
+///
+/// Produces:
+/// ```sql
+/// INNER JOIN (SELECT ps_partkey AS "__pgt_corr_key_1",
+///             MIN(ps_supplycost) AS "__pgt_scalar_1"
+///             FROM partsupp, ... WHERE ... GROUP BY ps_partkey)
+///     AS "__pgt_sq_1" ON p_partkey = "__pgt_sq_1"."__pgt_corr_key_1"
+/// ```
+fn decorrelate_scalar_subquery(
+    sq: &ScalarSubqueryExtract,
+    outer_columns: &std::collections::HashMap<String, String>,
+    idx: usize,
+) -> Result<DecorrelatedSubquery, PgTrickleError> {
+    use std::ffi::CString;
+
+    let sq_alias = format!("__pgt_sq_{idx}");
+    let scalar_alias = format!("__pgt_scalar_{idx}");
+
+    // Re-parse the inner subquery to get AST access
+    let c_sql = CString::new(sq.subquery_sql.as_str())
+        .map_err(|_| PgTrickleError::QueryParseError("Subquery contains null bytes".into()))?;
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_sql.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Err(PgTrickleError::QueryParseError(
+            "Failed to re-parse scalar subquery for decorrelation".into(),
+        ));
+    }
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = list.head().ok_or_else(|| {
+        PgTrickleError::QueryParseError("Empty parse tree for scalar subquery".into())
+    })?;
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Err(PgTrickleError::QueryParseError(
+            "Scalar subquery is not a SelectStmt".into(),
+        ));
+    }
+    let inner_select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // ── Flatten WHERE into AND-ed conditions ─────────────────────────
+    let mut conditions: Vec<*mut pg_sys::Node> = Vec::new();
+    if !inner_select.whereClause.is_null() {
+        unsafe { flatten_and_conditions(inner_select.whereClause, &mut conditions) };
+    }
+
+    // ── Separate correlation vs. regular conditions ──────────────────
+    let mut correlations: Vec<CorrelationCondition> = Vec::new();
+    let mut regular_conditions: Vec<String> = Vec::new();
+
+    for cond_node in &conditions {
+        if let Some(corr) = unsafe { check_correlation_condition(*cond_node, outer_columns) } {
+            correlations.push(corr);
+        } else {
+            let expr = unsafe { node_to_expr(*cond_node) }
+                .map(|e| e.to_sql())
+                .unwrap_or_else(|_| "TRUE".to_string());
+            regular_conditions.push(expr);
+        }
+    }
+
+    if correlations.is_empty() {
+        return Err(PgTrickleError::QueryParseError(
+            "No correlation conditions found in scalar subquery".into(),
+        ));
+    }
+
+    // ── Extract the original target list (scalar expression) ─────────
+    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
+    let mut original_target_exprs: Vec<String> = Vec::new();
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+        let expr = unsafe { node_to_expr(rt.val) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "NULL".to_string());
+        original_target_exprs.push(expr);
+    }
+
+    // ── FROM clause (unchanged) ──────────────────────────────────────
+    let from_sql = extract_from_clause_sql(inner_select)?;
+
+    // ── Build decorrelated SELECT items ──────────────────────────────
+    let mut select_items: Vec<String> = Vec::new();
+    let mut group_by_items: Vec<String> = Vec::new();
+    let mut extra_where_conds: Vec<String> = Vec::new();
+
+    for (j, corr) in correlations.iter().enumerate() {
+        let key_alias = format!("__pgt_corr_key_{}", j + 1);
+        // Strip table qualifier from inner expression to avoid alias scoping
+        // issues in DVM delta queries (e.g., "l2.l_partkey" → "l_partkey").
+        let inner_col_unqualified = strip_table_qualifier(&corr.inner_expr_sql);
+        select_items.push(format!("{} AS \"{}\"", inner_col_unqualified, key_alias));
+        group_by_items.push(inner_col_unqualified);
+        extra_where_conds.push(format!(
+            "{} = \"{}\".\"{}\"",
+            corr.outer_column, sq_alias, key_alias
+        ));
+    }
+
+    // The original scalar expression becomes the scalar alias
+    let scalar_expr = original_target_exprs.join(", ");
+    select_items.push(format!("{} AS \"{}\"", scalar_expr, scalar_alias));
+
+    // ── WHERE clause (without correlation conditions) ─────────────────
+    let where_sql = if regular_conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", regular_conditions.join(" AND "))
+    };
+
+    // ── GROUP BY ─────────────────────────────────────────────────────
+    let group_by_sql = format!(" GROUP BY {}", group_by_items.join(", "));
+
+    // ── Assemble decorrelated subquery ───────────────────────────────
+    let decorrelated_sql = format!(
+        "SELECT {} FROM {}{}{}",
+        select_items.join(", "),
+        from_sql,
+        where_sql,
+        group_by_sql,
+    );
+
+    // Use comma-join (not INNER JOIN) to avoid SQL precedence issues
+    // when the outer FROM uses comma-separated tables.
+    let from_item = format!("({decorrelated_sql}) AS \"{sq_alias}\"");
+
+    let scalar_ref = format!("\"{sq_alias}\".\"{scalar_alias}\"");
+
+    pgrx::debug1!("[pg_trickle] Decorrelated scalar subquery: {}", from_item);
+
+    Ok(DecorrelatedSubquery {
+        from_item,
+        extra_where_conditions: extra_where_conds,
+        scalar_ref,
+    })
 }
 
 // ── SubLinks inside OR → OR-to-UNION rewrite ───────────────────────
@@ -13784,5 +14195,56 @@ mod tests {
         assert!(cross_join.contains("avg(amount)"));
         assert!(cross_join.contains("__pgt_sq_1"));
         assert!(cross_join.contains("__pgt_scalar_1"));
+    }
+
+    // ── contains_word_boundary tests ────────────────────────────────
+
+    #[test]
+    fn test_contains_word_boundary_basic() {
+        assert!(contains_word_boundary(
+            "p_partkey = ps_partkey",
+            "p_partkey"
+        ));
+        assert!(contains_word_boundary(
+            "p_partkey = ps_partkey",
+            "ps_partkey"
+        ));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_at_start_end() {
+        assert!(contains_word_boundary("p_partkey", "p_partkey"));
+        assert!(contains_word_boundary("foo p_partkey", "p_partkey"));
+        assert!(contains_word_boundary("p_partkey foo", "p_partkey"));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_no_match_substring() {
+        // "p_partkey" should NOT match inside "ps_partkey" — the 's' before
+        // is alphanumeric so it's not a word boundary.
+        assert!(!contains_word_boundary("ps_partkey", "p_partkey"));
+        // "l_quantity" should not match in "xl_quantity"
+        assert!(!contains_word_boundary("xl_quantity", "l_quantity"));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_with_operators() {
+        assert!(contains_word_boundary(
+            "where p_partkey = ps_partkey and s_suppkey = ps_suppkey",
+            "p_partkey"
+        ));
+        // Quoted identifiers
+        assert!(contains_word_boundary(
+            "\"p_partkey\" = \"ps_partkey\"",
+            "p_partkey"
+        ));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_not_found() {
+        assert!(!contains_word_boundary(
+            "select count(*) from orders",
+            "p_partkey"
+        ));
     }
 }
