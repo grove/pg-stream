@@ -18,10 +18,10 @@
 //! - **Subquery/Aggregate children**: snapshot + delta EXCEPT ALL
 //!   (critical for correlated sources like Q15 where revenue0 and
 //!   MAX(total_revenue) both depend on lineitem)
-//! - **Non-SemiJoin join children**: full join snapshot + EXCEPT ALL.
+//! - **Non-SemiJoin join children (≤ 2 tables)**: full join snapshot +
+//!   EXCEPT ALL.  Limited to small subtrees (≤ 2 scan nodes) because
+//!   larger join snapshots spill multiple GB of temp files at SF=0.01.
 //!   Safe because the Q21 regression only affects SemiJoin interactions.
-//!   Fixes deep join chains like Q07 (6-table) where the shallow Part 3
-//!   correction cannot reach deeper nesting levels.
 //!
 //! For **SemiJoin-containing join children**, Q₀ via EXCEPT ALL interacts
 //! badly with SemiJoin R_old (Q21 numwait regression), so Q₁ is used
@@ -120,6 +120,23 @@ fn contains_semijoin(op: &OpTree) -> bool {
             base, recursive, ..
         } => contains_semijoin(base) || contains_semijoin(recursive),
         OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => false,
+    }
+}
+
+/// Count the number of Scan (base table) nodes in a join subtree.
+/// Used to estimate the size of the snapshot for L₀ via EXCEPT ALL.
+/// Join children with many scan nodes produce huge snapshots that spill
+/// >100 GB of temp files at SF=0.01 — limit L₀ to small subtrees.
+fn join_scan_count(op: &OpTree) -> usize {
+    match op {
+        OpTree::Scan { .. } => 1,
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => join_scan_count(left) + join_scan_count(right),
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => join_scan_count(child),
+        _ => 0, // Non-join nodes (Aggregate, SemiJoin, etc.) — stop counting
     }
 }
 
@@ -324,16 +341,19 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // shallow joins, or plain L₁ for deeper chains.
     //
     // For nested join children WITHOUT SemiJoin/AntiJoin (pure InnerJoin/
-    // LeftJoin chains like Q07's 6-table chain), L₀ via EXCEPT ALL is
-    // safe and eliminates the double-counting error that the shallow
-    // Part 3 correction can't reach at deeper nesting levels.
+    // LeftJoin chains), L₀ via EXCEPT ALL is safe but expensive: the
+    // full join snapshot must be materialized as temp files for the set
+    // difference.  At SF=0.01, a 3-table join snapshot can still spill
+    // several GB of temp files.  We limit L₀ to join subtrees with
+    // ≤ 2 scan nodes (simple 2-table joins) to keep temp usage bounded
+    // while still improving correctness at the first nesting level.
     //
     // Additionally, joins inside a SemiJoin/AntiJoin ancestor must use
     // L₁ to avoid Q21-type regressions where sub-join EXCEPT ALL
     // interacts with the SemiJoin's R_old computation.
     let use_l0 = is_simple_child(left)
         || !is_join_child(left)
-        || (!contains_semijoin(left) && !ctx.inside_semijoin);
+        || (!contains_semijoin(left) && !ctx.inside_semijoin && join_scan_count(left) <= 2);
 
     let left_part2_source = if use_l0 {
         // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
@@ -961,5 +981,60 @@ mod tests {
         assert_sql_contains(&sql, "Part 3");
         // L₁ with correction, not L₀ via EXCEPT ALL at the outer level
         assert_sql_contains(&sql, "Correction for nested join");
+    }
+
+    #[test]
+    fn test_join_scan_count() {
+        let a = scan(1, "a", "public", "a", &["id"]);
+        assert_eq!(join_scan_count(&a), 1);
+
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let j2 = inner_join(eq_cond("a", "id", "b", "id"), a.clone(), b.clone());
+        assert_eq!(join_scan_count(&j2), 2);
+
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let j3 = inner_join(eq_cond("a", "id", "c", "id"), j2.clone(), c.clone());
+        assert_eq!(join_scan_count(&j3), 3);
+
+        let d = scan(4, "d", "public", "d", &["id"]);
+        let j4 = inner_join(eq_cond("a", "id", "d", "id"), j3, d);
+        assert_eq!(join_scan_count(&j4), 4);
+    }
+
+    #[test]
+    fn test_deep_join_uses_l1_not_l0() {
+        // With threshold=2, a 3-table chain (left has 2 scans) should
+        // use L₀ (EXCEPT ALL), but a 4-table chain (left has 3 scans)
+        // should fall back to L₁ (no EXCEPT ALL, no Part 3 since deeper
+        // than one nesting level).
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+
+        // left = a ⋈ b (2 scans) — should use L₀
+        let j_ab = inner_join(eq_cond("a", "id", "b", "id"), a.clone(), b);
+        let tree_3 = inner_join(eq_cond("a", "id", "c", "id"), j_ab, c);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree_3).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert_sql_contains(&sql, "EXCEPT ALL");
+
+        // left = a ⋈ b ⋈ c (3 scans) — should use L₁ (no L₀, no Part 3
+        // because the left child is deeper than "shallow" (not both
+        // children are Scans))
+        let a2 = scan(1, "a", "public", "a", &["id"]);
+        let b2 = scan(2, "b", "public", "b", &["id"]);
+        let c2 = scan(3, "c", "public", "c", &["id"]);
+        let d2 = scan(4, "d", "public", "d", &["id"]);
+        let j_ab2 = inner_join(eq_cond("a", "id", "b", "id"), a2, b2);
+        let j_abc = inner_join(eq_cond("a", "id", "c", "id"), j_ab2, c2);
+        let tree_4 = inner_join(eq_cond("a", "id", "d", "id"), j_abc, d2);
+
+        let mut ctx2 = test_ctx();
+        let result2 = diff_inner_join(&mut ctx2, &tree_4).unwrap();
+        let sql2 = ctx2.build_with_query(&result2.cte_name);
+        // 3-scan left child → L₁ without correction (not shallow)
+        assert_sql_not_contains(&sql2, "Part 3");
     }
 }
