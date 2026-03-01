@@ -10,7 +10,7 @@
 ## Table of Contents
 
 1. [Motivation](#motivation)
-2. [Suite 1: TPC-H — Analytical Benchmark](#suite-1-tpc-h--analytical-benchmark)
+2. [Suite 1: TPC-H-Derived — Analytical Workload](#suite-1-tpc-h-derived--analytical-workload)
 3. [Suite 2: sqllogictest — Broad Correctness](#suite-2-sqllogictest--broad-correctness)
 4. [Suite 3: Join Order Benchmark (JOB) — Real-World Data](#suite-3-join-order-benchmark-job--real-world-data)
 5. [Suite 4: Feldera / DBSP Benchmarks — Theory Peer Comparison](#suite-4-feldera--dbsp-benchmarks--theory-peer-comparison)

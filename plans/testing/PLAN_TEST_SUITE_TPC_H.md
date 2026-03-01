@@ -145,16 +145,20 @@ improvements applied since the initial TPC-H suite was completed:
 
 13. **InnerJoin L₀ for non-SemiJoin join children (P5)** — Extended the
     L₀ pre-change snapshot (EXCEPT ALL) approach to nested join children
-    whose subtrees do NOT contain SemiJoin/AntiJoin nodes. Previously,
-    ALL nested join children used L₁ (post-change) with a shallow Part 3
-    correction term, which failed for deep join chains like Q07 (6-table)
-    where the correction couldn't reach level 3+. Added
-    `contains_semijoin()` helper to classify subtrees, plus an
-    `inside_semijoin` flag on `DiffContext` to prevent L₀ usage for
-    inner joins nested inside SemiJoin/AntiJoin ancestors (avoids Q21
-    numwait regression from EXCEPT ALL interacting with R_old).
-    Decision logic: `use_l0 = is_simple_child(left) || !is_join_child(left)
-    || (!contains_semijoin(left) && !ctx.inside_semijoin)`.
+    whose subtrees do NOT contain SemiJoin/AntiJoin nodes, limited to
+    small join subtrees (≤ 2 scan nodes) to prevent temp file bloat.
+    Previously, ALL nested join children used L₁ (post-change) with a
+    shallow Part 3 correction term, which failed for deep join chains
+    like Q07 (6-table) where the correction couldn't reach level 3+.
+    Added `contains_semijoin()` and `join_scan_count()` helpers to
+    classify subtrees, plus an `inside_semijoin` flag on `DiffContext`
+    to prevent L₀ usage for inner joins nested inside SemiJoin/AntiJoin
+    ancestors (avoids Q21 numwait regression from EXCEPT ALL interacting
+    with R_old). Decision logic: `use_l0 = is_simple_child(left) ||
+    !is_join_child(left) || (!contains_semijoin(left) &&
+    !ctx.inside_semijoin && join_scan_count(left) <= 2)`.
+    Larger join subtrees (3+ tables) fall back to L₁ without correction
+    (correction only computable for shallow joins).
 
 14. **SemiJoin/AntiJoin delta-key pre-filtering (P7)** — Part 2 of
     SemiJoin and AntiJoin delta now pre-filters the left-side snapshot
@@ -167,10 +171,12 @@ improvements applied since the initial TPC-H suite was completed:
 
 15. **Docker disk bloat prevention** — E2E bench tests now configure
     aggressive autovacuum (`vacuum_scale_factor=0.01`, `naptime=5s`,
-    `cost_delay=2ms`, `cost_limit=1000`) and run explicit `VACUUM` after
-    each mutation cycle. Prevents dead tuple accumulation from growing
-    PostgreSQL's `base/` directory beyond 100GB during extended TPC-H
-    test runs (was 121GB before fix).
+    `cost_delay=2ms`, `cost_limit=1000`), run explicit `VACUUM` after
+    each mutation cycle, and set `temp_file_limit = '4GB'` as a safety
+    net. The `join_scan_count(left) <= 2` limit on L₀ (P5) prevents
+    deep join chains from spilling >100 GB of temp files. Together
+    these prevent both dead tuple accumulation and temp file bloat from
+    growing PostgreSQL's data directory beyond safe limits.
 
 ```
 Phase 1: test result: ok. 1 passed; 0 failed  (22/22 queries pass, ~25s)

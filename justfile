@@ -80,17 +80,17 @@ test-pgrx:
 # Run all tests (unit + integration + E2E + pgrx)
 test-all: test-unit test-integration test-e2e test-pgrx
 
-# ── TPC-H Tests ───────────────────────────────────────────────────────────
+# ── TPC-H-Derived Tests ───────────────────────────────────────────────────
 
-# Run TPC-H correctness tests (SF-0.01, ~2 min, requires E2E Docker image)
+# Run TPC-H-derived correctness tests (SF-0.01, ~2 min, requires E2E Docker image)
 test-tpch: build-e2e-image
     cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
-# Run TPC-H tests without rebuilding the Docker image
+# Run TPC-H-derived tests without rebuilding the Docker image
 test-tpch-fast:
     cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
-# Run TPC-H tests at larger scale (SF-0.1, ~5 min)
+# Run TPC-H-derived tests at larger scale (SF-0.1, ~5 min)
 test-tpch-large: build-e2e-image
     TPCH_SCALE=0.1 cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 

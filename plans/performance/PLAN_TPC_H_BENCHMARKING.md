@@ -484,7 +484,7 @@ Produce a before/after table for all 22 queries:
 
 ### 5-3: Update STATUS_PERFORMANCE.md
 
-Add a new "TPC-H Benchmark" section to
+Add a new "TPC-H-Derived Benchmark" section to
 [STATUS_PERFORMANCE.md](STATUS_PERFORMANCE.md) with the full 22-query
 results at each scale factor.
 

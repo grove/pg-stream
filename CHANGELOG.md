@@ -42,7 +42,7 @@ was renamed.
 Fixed inner join pre-change snapshot logic that caused delta double-counting
 during differential refresh. The snapshot now correctly eliminates rows that
 would be counted twice when both sides of the join have changes in the same
-refresh cycle. Discovered via TPC-H Q07.
+refresh cycle. Discovered via TPC-H-derived Q07.
 
 #### DVM: Multi-Stream-Table Change Buffer Cleanup
 
@@ -55,15 +55,15 @@ per-source-table.
 
 Fixed scalar aggregate `row_id` generation that produced mismatched identifiers
 between delta and merge phases, and corrected `AVG` group rescan logic that
-failed to recompute averages after partial group changes. Fixes TPC-H Q06 and
-improves Q01.
+failed to recompute averages after partial group changes. Fixes TPC-H-derived
+Q06 and improves Q01.
 
 #### DVM: SemiJoin/AntiJoin Snapshots and GROUP BY Alias Projection
 
 Fixed snapshot handling for `SemiJoin` and `AntiJoin` operators that missed
 pre-change state, corrected `__pgt_count` filtering in delta output, and
 fixed the parser's `GROUP BY` alias resolution to emit proper `Project` nodes.
-Raises TPC-H passing count to 14/22.
+Raises TPC-H-derived passing count to 14/22.
 
 #### DVM: Unqualified Column Resolution and Deep Disambiguation
 
@@ -87,10 +87,10 @@ Prevented the background cleanup worker from crashing when it encounters
 pending cleanup entries for change buffer tables that have already been
 dropped (e.g., after a stream table is removed mid-cycle).
 
-#### DVM Parser: 4 Query Rewrite Bugs (TPC-H Regression Coverage)
+#### DVM Parser: 4 Query Rewrite Bugs (TPC-H-Derived Regression Coverage)
 
-Fixed four bugs in `src/dvm/parser.rs` discovered while building the TPC-H
-correctness test suite. Together they unblock 3 more TPC-H queries (Q04,
+Fixed four bugs in `src/dvm/parser.rs` discovered while building the TPC-H-derived
+correctness test suite. Together they unblock 3 more TPC-H-derived queries (Q04,
 Q15, Q21) from stream table creation, raising the create-success rate from
 17/22 to 20/22.
 
@@ -115,19 +115,24 @@ Q15, Q21) from stream table creation, raising the create-success rate from
 
 ### Added
 
-#### TPC-H Correctness Test Suite
+#### TPC-H-Derived Correctness Test Suite
 
-Added a full TPC-H correctness test suite (`tests/e2e_tpch_tests.rs`) that
+> **TPC Fair Use Policy:** The queries in this test suite are *derived from* the
+> TPC-H Benchmark specification and do not constitute TPC-H Benchmark results.
+> TPC Benchmark™ is a trademark of the Transaction Processing Performance
+> Council (TPC). pg_trickle results are not comparable to published TPC results.
+
+Added a TPC-H-derived correctness test suite (`tests/e2e_tpch_tests.rs`) that
 validates the core DBSP invariant — `Contents(ST) ≡ Result(defining_query)`
-after every differential refresh — across all 22 TPC-H queries at SF=0.01.
+after every differential refresh — across all 22 TPC-H-derived queries at SF=0.01.
 
 - **Schema & data generation** (`tests/tpch/schema.sql`, `datagen.sql`) —
   SQL-only, no external `dbgen` dependency, works with existing `E2eDb`
   testcontainers infrastructure.
 - **Mutation scripts** (`rf1.sql` INSERT, `rf2.sql` DELETE, `rf3.sql` UPDATE)
   — multi-cycle churn to catch cumulative drift.
-- **22 query files** (`tests/tpch/queries/q01.sql`–`q22.sql`) — standard
-  TPC-H queries adapted for pg_trickle SQL compatibility:
+- **22 query files** (`tests/tpch/queries/q01.sql`–`q22.sql`) — queries
+  derived from TPC-H, adapted for pg_trickle SQL compatibility:
 
   | Query | Adaptation |
   |-------|-----------|
