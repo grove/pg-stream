@@ -190,4 +190,4 @@ docker exec <cid> psql -U postgres -c "
 - [cnpg/Dockerfile](../../cnpg/Dockerfile)
 - [tests/Dockerfile.e2e](../../tests/Dockerfile.e2e)
 - [PLAN_PACKAGING.md](PLAN_PACKAGING.md)
-- [GITHUB_ACTIONS_COST.md](GITHUB_ACTIONS_COST.md)
+- [PLAN_GITHUB_ACTIONS_COST.md](PLAN_GITHUB_ACTIONS_COST.md)

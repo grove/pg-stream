@@ -56,7 +56,7 @@ degradation, just the current behavior.
 
 Before starting implementation, these must be established:
 
-- [ ] Benchmark trigger overhead ([TRIGGERS_OVERHEAD.md](../performance/TRIGGERS_OVERHEAD.md))
+- [ ] Benchmark trigger overhead ([PLAN_TRIGGERS_OVERHEAD.md](../performance/PLAN_TRIGGERS_OVERHEAD.md))
       to validate that the migration is worth the complexity
 - [ ] Verify `pgoutput` provides sufficient column-level data for the buffer
       table schema (NEW/OLD values per column, action type, LSN)
@@ -1108,6 +1108,6 @@ columns, <10 concurrent writers): 20–40% faster source-table writes.**
 2–3× faster source-table writes.**
 
 > **Note:** These estimates are analytical, based on per-component cost
-> modeling. The [TRIGGERS_OVERHEAD.md](../performance/TRIGGERS_OVERHEAD.md)
+> modeling. The [PLAN_TRIGGERS_OVERHEAD.md](../performance/PLAN_TRIGGERS_OVERHEAD.md)
 > benchmark plan will provide empirical measurements to validate or revise
 > these numbers.

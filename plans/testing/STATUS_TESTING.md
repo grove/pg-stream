@@ -361,7 +361,7 @@ Each new property test would exercise the full pipeline: CDC trigger → change 
 
 ### 5.6 Write-Side Overhead Benchmarks
 
-**Priority: Low.** A benchmark plan exists in [`TRIGGERS_OVERHEAD.md`](../performance/TRIGGERS_OVERHEAD.md) to measure CDC trigger impact on DML throughput (INSERT/UPDATE/DELETE ops/sec with and without triggers). This would complement the existing refresh benchmarks by quantifying the **write-side cost** of monitoring a source table. Not yet implemented.
+**Priority: Low.** A benchmark plan exists in [`PLAN_TRIGGERS_OVERHEAD.md`](../performance/PLAN_TRIGGERS_OVERHEAD.md) to measure CDC trigger impact on DML throughput (INSERT/UPDATE/DELETE ops/sec with and without triggers). This would complement the existing refresh benchmarks by quantifying the **write-side cost** of monitoring a source table. Not yet implemented.
 
 ### 5.7 Expand Integration Tests as Version-Compatibility Canaries
 

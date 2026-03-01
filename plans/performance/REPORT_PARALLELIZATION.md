@@ -3,7 +3,7 @@
 > **Status:** Planning — no implementation changes proposed yet.
 > **Date:** 2026-02-26
 > **Related:** [ARCHITECTURE.md § 8](../../docs/ARCHITECTURE.md) ·
-> [SQL_GAPS_7.md § G8.5](../sql/SQL_GAPS_7.md) ·
+> [GAP_SQL_PHASE_7.md § G8.5](../sql/GAP_SQL_PHASE_7.md) ·
 > [CONFIGURATION.md](../../docs/CONFIGURATION.md)
 
 ---

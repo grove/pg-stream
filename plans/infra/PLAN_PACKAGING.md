@@ -199,7 +199,7 @@ docker run --rm -it rockylinux:9 bash -c "
 
 ## 7. GitHub Actions Cost Note
 
-See [GITHUB_ACTIONS_COST.md](GITHUB_ACTIONS_COST.md) for runner cost analysis.
+See [PLAN_GITHUB_ACTIONS_COST.md](PLAN_GITHUB_ACTIONS_COST.md) for runner cost analysis.
 Packaging jobs should only run on release tags (`v*`) to minimise spend.
 
 ---
@@ -211,4 +211,4 @@ Packaging jobs should only run on release tags (`v*`) to minimise spend.
 - [pg_trickle.control](../../pg_trickle.control)
 - [PLAN_VERSIONING.md](PLAN_VERSIONING.md)
 - [PLAN_DOCKER_IMAGE.md](PLAN_DOCKER_IMAGE.md)
-- [GITHUB_ACTIONS_COST.md](GITHUB_ACTIONS_COST.md)
+- [PLAN_GITHUB_ACTIONS_COST.md](PLAN_GITHUB_ACTIONS_COST.md)

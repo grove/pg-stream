@@ -17,8 +17,8 @@ Every document has **exactly one** type, expressed as a filename prefix.
 | Prefix | What it is | When to use | Examples |
 |--------|-----------|-------------|---------|
 | `PLAN_` | Implementation plan with concrete phases, steps, and acceptance criteria. | You know *what* to build and need to describe *how*. | `PLAN_HYBRID_CDC.md`, `PLAN_PACKAGING.md` |
-| `GAP_` | Gap analysis — identifies what is missing relative to a competitor, standard, SQL spec, or target state. | You need to compare current capabilities against a reference and catalogue deficits. | `GAP_ANALYSIS_EPSIO.md`, `SQL_GAPS_7.md` |
-| `REPORT_` | Research, investigation, feasibility study, options analysis, comparison, or assessment. Reference material — not directly actionable. | You explored a topic and need to record findings for future reference. | `REPORT_PARALLELIZATION.md`, `REPORT_PG_IVM_COMPARISON.md` |
+| `GAP_` | Gap analysis — identifies what is missing relative to a competitor, standard, SQL spec, or target state. | You need to compare current capabilities against a reference and catalogue deficits. | `GAP_ANALYSIS_EPSIO.md`, `GAP_SQL_PHASE_7.md` |
+| `REPORT_` | Research, investigation, feasibility study, options analysis, comparison, or assessment. Reference material — not directly actionable. | You explored a topic and need to record findings for future reference. | `REPORT_PARALLELIZATION.md`, `REPORT_TRIGGERS_VS_REPLICATION.md` |
 | `ADR_` | Architecture Decision Record — a single significant technical decision with alternatives considered and consequences. | A non-obvious technical choice was made (or rejected) and the reasoning must be preserved. | `ADR_001_TRIGGER_CDC.md` |
 | `STATUS_` | Point-in-time progress snapshot or tracking dashboard for an ongoing area. | You need a living document that tracks where an area stands today. | `STATUS_PERFORMANCE.md`, `STATUS_TESTING.md` |
 
@@ -58,7 +58,7 @@ Avoid:
 ```
 citus.md                    # no prefix, lowercase
 PLAN performance part 8.md  # spaces, no underscores
-SQL_GAPS_7.md               # missing type prefix
+PERF_RESULTS.md             # non-standard prefix
 ```
 
 ### Iterative / Multi-Part Documents

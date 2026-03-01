@@ -2,7 +2,7 @@
 
 **Date:** 2026-02-26
 **Status:** Planning
-**Baseline:** PERFORMANCE_PART_8.md results (2026-02-22)
+**Baseline:** PLAN_PERFORMANCE_PART_8.md results (2026-02-22)
 **Scope:** Higher-level performance strategy, architectural improvements,
 and benchmark infrastructure enhancements.
 
@@ -153,7 +153,7 @@ feature. Priorities:
    resolves the join_agg 100K/10% = 0.3x regression
 2. **Lower the default auto_threshold** from 0.15 to 0.10 — this triggers
    FULL fallback earlier when costs are close
-3. **Track and expose the threshold** (per SQL_GAPS_7 §F27) so operators can
+3. **Track and expose the threshold** (per GAP_SQL_PHASE_7 §F27) so operators can
    debug strategy decisions
 
 ### D3: Row-Level vs Statement-Level CDC Triggers
@@ -228,7 +228,7 @@ If the stream table's defining query only references 3 of 20 source columns,
 the trigger still writes all 20 `new_*` and 20 `old_*` columns.
 
 **Impact:** For wide tables (20+ columns), trigger overhead scales linearly
-with column count (estimated from TRIGGERS_OVERHEAD.md: 3x overhead for 20
+with column count (estimated from PLAN_TRIGGERS_OVERHEAD.md: 3x overhead for 20
 cols vs 3 cols for UPDATE). Pruning to only referenced columns could reduce
 trigger cost by 50–80% for wide tables.
 
@@ -378,7 +378,7 @@ FROM __pgt_old o;
 
 ### B-3: Benchmark Write-Side Improvement
 
-Use the TRIGGERS_OVERHEAD.md benchmark design to measure:
+Use the PLAN_TRIGGERS_OVERHEAD.md benchmark design to measure:
 - Baseline vs row-level vs statement-level trigger overhead
 - Column count scaling: narrow (3), medium (8), wide (20) tables
 - Bulk vs single-row DML
@@ -406,7 +406,7 @@ instead of `Vec<NodeId>`. Trivial modification to Kahn's algorithm.
 For each level, spawn up to `max_concurrent_refreshes` dynamic background
 workers. Each worker:
 1. Receives `pgt_id` via datum
-2. Acquires advisory lock (or `FOR UPDATE SKIP LOCKED` per SQL_GAPS_7 Q7)
+2. Acquires advisory lock (or `FOR UPDATE SKIP LOCKED` per GAP_SQL_PHASE_7 Q7)
 3. Executes `refresh_stream_table()`
 4. Writes result to `pgt_refresh_history`
 5. Exits
@@ -430,7 +430,7 @@ to update retry state and scheduling decisions.
 
 ### D-1: Hash-Based Change Detection for Wide Tables
 
-Per SQL_GAPS_7 §G4.6, the MERGE `WHEN MATCHED` arm uses per-column
+Per GAP_SQL_PHASE_7 §G4.6, the MERGE `WHEN MATCHED` arm uses per-column
 `IS DISTINCT FROM` chains. For 100+ columns, this causes plan cache bloat.
 
 **Fix:** For tables with > 50 columns, replace the per-column chain with a
@@ -592,7 +592,7 @@ ANALYZE` on the first measured cycle.
 
 **Problem:** Each benchmark run produces printed output. Comparing results
 across runs (e.g., before/after an optimization) requires manual
-side-by-side reading, as manually done in PERFORMANCE_PART_8.md.
+side-by-side reading, as manually done in PLAN_PERFORMANCE_PART_8.md.
 
 **Fix:** Write benchmark results to a JSON file
 (`target/bench_results/<timestamp>.json`). Provide a comparison script:
@@ -612,7 +612,7 @@ multiple concurrent writers hit source tables simultaneously. This stress-
 tests trigger overhead differently (BIGSERIAL contention, change buffer
 index lock contention, WAL write serialization).
 
-**Fix:** Extend the trigger overhead benchmark (TRIGGERS_OVERHEAD.md) to
+**Fix:** Extend the trigger overhead benchmark (PLAN_TRIGGERS_OVERHEAD.md) to
 sweep writer concurrency: 1, 2, 4, 8 connections performing DML
 simultaneously.
 
@@ -751,9 +751,9 @@ while parallel refresh only helps multi-ST deployments.
 
 | Plan | Relationship |
 |------|-------------|
-| [PERFORMANCE_PART_8.md](PERFORMANCE_PART_8.md) | Direct predecessor. Part 8's regression analysis (A-1 through A-3) feeds Session 1 here. |
+| [PLAN_PERFORMANCE_PART_8.md](PLAN_PERFORMANCE_PART_8.md) | Direct predecessor. Part 8's regression analysis (A-1 through A-3) feeds Session 1 here. |
 | [REPORT_PARALLELIZATION.md](REPORT_PARALLELIZATION.md) | Session 4 (parallel refresh) implements Options A+B from this report. |
-| [TRIGGERS_OVERHEAD.md](TRIGGERS_OVERHEAD.md) | Session 3 (statement-level triggers) builds on this benchmark design. |
+| [PLAN_TRIGGERS_OVERHEAD.md](PLAN_TRIGGERS_OVERHEAD.md) | Session 3 (statement-level triggers) builds on this benchmark design. |
 | [STATUS_PERFORMANCE.md](STATUS_PERFORMANCE.md) | Historical tracking. Update after each session completes. |
-| [SQL_GAPS_7.md](../sql/SQL_GAPS_7.md) | §F27 (expose adaptive threshold), §G4.6 (wide table MERGE), §G8.5 (sequential processing). |
-| [SQL_GAPS_7_QUESTIONS.md](../sql/SQL_GAPS_7_QUESTIONS.md) | Q7 (PgBouncer: FOR UPDATE SKIP LOCKED) affects parallel refresh locking strategy. |
+| [GAP_SQL_PHASE_7.md](../sql/GAP_SQL_PHASE_7.md) | §F27 (expose adaptive threshold), §G4.6 (wide table MERGE), §G8.5 (sequential processing). |
+| [GAP_SQL_PHASE_7_QUESTIONS.md](../sql/GAP_SQL_PHASE_7_QUESTIONS.md) | Q7 (PgBouncer: FOR UPDATE SKIP LOCKED) affects parallel refresh locking strategy. |

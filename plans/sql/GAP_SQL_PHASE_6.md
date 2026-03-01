@@ -74,7 +74,7 @@ This analysis was performed by:
 4. **CDC system review** of `src/cdc.rs` trigger setup, `src/hooks.rs` DDL event handling, `src/refresh.rs` refresh engine
 5. **Documentation comparison** across `SQL_REFERENCE.md`, `DVM_OPERATORS.md`, `ARCHITECTURE.md`, `CONFIGURATION.md` vs actual code
 6. **Test coverage analysis** of 896 unit tests, 350 E2E tests, and 61 integration tests
-7. **Review of previous gap analyses** (SQL_GAPS_1 through SQL_GAPS_5, REPORT_SQL_GAPS.md)
+7. **Review of previous gap analyses** (SQL_GAPS_1 through SQL_GAPS_5, GAP_SQL_OVERVIEW.md)
 
 ---
 

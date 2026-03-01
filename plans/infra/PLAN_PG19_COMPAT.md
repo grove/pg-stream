@@ -117,7 +117,7 @@ strategy:
 ```
 
 Cost impact: doubles the CI matrix size. See
-[GITHUB_ACTIONS_COST.md](GITHUB_ACTIONS_COST.md) for budget analysis.
+[PLAN_GITHUB_ACTIONS_COST.md](PLAN_GITHUB_ACTIONS_COST.md) for budget analysis.
 
 ---
 
@@ -163,7 +163,7 @@ required code updates. For PG19:
 ## References
 
 - [Cargo.toml](../../Cargo.toml)
-- [plans/infra/GITHUB_ACTIONS_COST.md](GITHUB_ACTIONS_COST.md)
+- [plans/infra/PLAN_GITHUB_ACTIONS_COST.md](PLAN_GITHUB_ACTIONS_COST.md)
 - [plans/infra/PLAN_VERSIONING.md](PLAN_VERSIONING.md)
 - [src/wal_decoder.rs](../../src/wal_decoder.rs)
 - [pgrx releases](https://github.com/pgcentralfoundation/pgrx/releases)

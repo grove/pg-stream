@@ -159,4 +159,4 @@ the table falls back to the standard background worker refresh cycle.
 - [src/dvm/diff.rs](../../src/dvm/diff.rs)
 - [src/cdc.rs](../../src/cdc.rs)
 - [docs/DVM_OPERATORS.md](../../docs/DVM_OPERATORS.md)
-- [plans/sql/SQL_GAPS_7.md](SQL_GAPS_7.md)
+- [plans/sql/GAP_SQL_PHASE_7.md](GAP_SQL_PHASE_7.md)
