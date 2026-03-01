@@ -3,8 +3,8 @@
 **Status:** Implemented  
 **Date:** 2026-02-25  
 **Branch:** `main`  
-**Resolves:** SQL_GAPS_6 G2.1 (P0 — views as sources in DIFFERENTIAL mode)  
-**Related:** SQL_GAPS_6 G2.2 (materialized views — handled separately)  
+**Resolves:** GAP_SQL_PHASE_6 G2.1 (P0 — views as sources in DIFFERENTIAL mode)  
+**Related:** GAP_SQL_PHASE_6 G2.2 (materialized views — handled separately)  
 **Effort:** 8–12 hours (implementation + tests)
 
 ---

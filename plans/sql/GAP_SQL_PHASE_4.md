@@ -3,7 +3,7 @@
 **Status:** Complete  
 **Date:** 2026-02-22
 **Branch:** `main`
-**Scope:** Full evaluation of SQL gap status, REPORT_SQL_GAPS.md accuracy audit, and prioritized remaining work.
+**Scope:** Full evaluation of SQL gap status, GAP_SQL_OVERVIEW.md accuracy audit, and prioritized remaining work.
 **Current state:** 826 unit tests, 21 E2E test files, 25 AggFunc variants, 21 OpTree variants, 20 diff operators
 
 ---
@@ -15,7 +15,7 @@
 | Task | Description | Status |
 |------|-------------|--------|
 | 1 | Window-in-subexpression recursive detection (14 node types) | ✅ |
-| 2 | REPORT_SQL_GAPS.md discrepancy cleanup | ✅ |
+| 2 | GAP_SQL_OVERVIEW.md discrepancy cleanup | ✅ |
 | 3 | Stale comment fix on `check_from_item_unsupported()` | ✅ |
 | 4 | CROSS JOIN test coverage (3 unit + 4 E2E) | ✅ |
 | 5 | FOR UPDATE/FOR SHARE rejection (4 E2E) | ✅ |
@@ -30,7 +30,7 @@ No remaining work.
 | 1 | GROUPING SETS silent-skip P0 bug fix | ✅ |
 | 2 | GROUP BY `if let Ok` → `?` error propagation hardening | ✅ |
 | 3 | TABLESAMPLE explicit rejection | ✅ |
-| 4 | REPORT_SQL_GAPS.md Gap 6.2 correction | ✅ |
+| 4 | GAP_SQL_OVERVIEW.md Gap 6.2 correction | ✅ |
 | 5 | Aggregate rejection E2E test coverage | ✅ |
 | 6 | Documentation updates | ✅ |
 
@@ -55,7 +55,7 @@ Sessions 6–8 (Tier 3 structural enhancements) were listed as deferred. These a
 
 ---
 
-## REPORT_SQL_GAPS.md — Accuracy Audit
+## GAP_SQL_OVERVIEW.md — Accuracy Audit
 
 ### 🔴 Critical Inaccuracies Found
 
@@ -196,9 +196,9 @@ These require new OpTree variants or major parser changes — not just following
 
 ---
 
-## REPORT_SQL_GAPS.md — Required Updates ✅ ALL COMPLETE
+## GAP_SQL_OVERVIEW.md — Required Updates ✅ ALL COMPLETE
 
-All corrections have been applied to REPORT_SQL_GAPS.md.
+All corrections have been applied to GAP_SQL_OVERVIEW.md.
 
 ### Task R1: Fix Gap 4 (Subquery) status ✅ COMPLETE
 
@@ -223,7 +223,7 @@ All corrections have been applied to REPORT_SQL_GAPS.md.
 **Applied:**
 1. Phase B: B1–B3 marked as ✅ IMPLEMENTED with details
 2. "Estimated effort" and "sessions remaining" removed — Phase B fully complete
-3. Recommended Next Step: Points to PLAN_SQL_GAPS_4.md for remaining work
+3. Recommended Next Step: Points to GAP_SQL_PHASE_4.md for remaining work
 
 ### Task R4: Update "What Works Well" table ✅ COMPLETE
 
@@ -238,7 +238,7 @@ All corrections have been applied to REPORT_SQL_GAPS.md.
 
 ### What to Do Next
 
-**Option A: Fix REPORT_SQL_GAPS.md accuracy (Tasks R1-R4) — Recommended first**
+**Option A: Fix GAP_SQL_OVERVIEW.md accuracy (Tasks R1-R4) — Recommended first**
 - **Effort:** 1 hour
 - **Rationale:** The report is the canonical reference. Having it say "REJECTED" for features that are fully implemented is misleading. This should be fixed before any new feature work.
 
@@ -282,7 +282,7 @@ These items have low user demand and/or high complexity relative to their value:
 
 After this plan's recommended work (Sessions 1-2):
 
-- [x] REPORT_SQL_GAPS.md is 100% accurate — no stale claims ✅ DONE (Option A, Tasks R1-R4)
+- [x] GAP_SQL_OVERVIEW.md is 100% accurate — no stale claims ✅ DONE (Option A, Tasks R1-R4)
 - [x] 25 AggFunc variants (up from 22): added MODE, PERCENTILE_CONT, PERCENTILE_DISC ✅ DONE
 - [ ] OR: DISTINCT ON works via window-function rewrite
 - [x] 826 unit tests (target was 825+) ✅ DONE

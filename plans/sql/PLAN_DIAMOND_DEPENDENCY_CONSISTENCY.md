@@ -689,7 +689,7 @@ transaction. Diamond consistency is a deferred-mode-only concern.
 
 ### 8.3 Circular References (SCCs)
 
-The SCC-based refresh logic in [CIRCULAR_REFERENCES.md](sql/CIRCULAR_REFERENCES.md)
+The SCC-based refresh logic in [PLAN_CIRCULAR_REFERENCES.md](PLAN_CIRCULAR_REFERENCES.md)
 handles cycles via fixed-point iteration. A diamond that is also part of a
 cycle would need the SCC logic to account for consistency groups. The
 recommended approach: treat the entire SCC as one consistency group (which

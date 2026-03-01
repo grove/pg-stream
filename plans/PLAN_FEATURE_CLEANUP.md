@@ -146,7 +146,7 @@ fn resume_stream_table(name: &str) {
 `pg_trickle.max_concurrent_refreshes` (default: 4, max: 32) implies the
 scheduler runs multiple refreshes in parallel. It does not. The scheduler
 processes stream tables sequentially in topological order within a single
-background worker (G8.5 in SQL_GAPS_7.md). The GUC is read but has no
+background worker (G8.5 in GAP_SQL_PHASE_7.md). The GUC is read but has no
 effect on behaviour.
 
 #### Options
@@ -280,7 +280,7 @@ worth the churn before v0.2.0.
 
 `pg_trickle.wal_transition_timeout` is visible to users, implying that WAL
 CDC is a normal operational mode to configure. It is not — WAL CDC has
-three P1 correctness issues (F2, F3, F4 in SQL_GAPS_7.md) and is not
+three P1 correctness issues (F2, F3, F4 in GAP_SQL_PHASE_7.md) and is not
 production-ready until v0.3.0.
 
 #### Options

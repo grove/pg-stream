@@ -499,7 +499,7 @@ counter columns alongside each aggregate result.
 |-------|-------|
 | **Status** | Accepted |
 | **Category** | IVM Engine |
-| **Sources** | `plans/sql/LATERAL_JOINS.md`, `src/dvm/operators/lateral_function.rs` |
+| **Sources** | `plans/sql/PLAN_LATERAL_JOINS.md`, `src/dvm/operators/lateral_function.rs` |
 
 **Decision:** Differentiate LATERAL subqueries (and SRFs in FROM) by
 **row-scoped recomputation**: when an outer row changes, re-execute the
@@ -521,7 +521,7 @@ rejected, partially supported, or not yet considered.
 
 ### Current State Summary
 
-- **49+ of 52 original SQL gaps resolved** (see `plans/sql/SQL_GAPS_4.md`)
+- **49+ of 52 original SQL gaps resolved** (see `plans/sql/GAP_SQL_PHASE_4.md`)
 - **Zero P0 (silent corruption) or P1 (incorrect semantics) issues remain**
 - **25 aggregate functions** in DIFFERENTIAL mode; 17 recognized-but-rejected
 - **All rejected constructs** have clear error messages with rewrite suggestions
@@ -532,7 +532,7 @@ rejected, partially supported, or not yet considered.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Correctness |
-| **Sources** | `plans/sql/NON_DETERMINISM.md` |
+| **Sources** | `plans/sql/PLAN_NON_DETERMINISM.md` |
 | **Effort** | Medium (3-5 sessions) |
 
 **Context:** Volatile functions (`random()`, `gen_random_uuid()`,
@@ -573,7 +573,7 @@ a recursive `Expr` tree scanner.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Aggregation |
-| **Sources** | `plans/sql/SQL_GAPS_4.md` (item S1) |
+| **Sources** | `plans/sql/GAP_SQL_PHASE_4.md` (item S1) |
 | **Effort** | High (10-15 hours) |
 
 **Context:** Currently rejected with a clear error suggesting separate stream
@@ -603,7 +603,7 @@ reuses existing infrastructure. Option 1 is acceptable if demand is low.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Deduplication |
-| **Sources** | `plans/sql/SQL_GAPS_4.md` (item S2) |
+| **Sources** | `plans/sql/GAP_SQL_PHASE_4.md` (item S2) |
 | **Effort** | Medium (6-8 hours) |
 
 **Context:** `DISTINCT ON (expr)` is a PostgreSQL-specific extension that
@@ -631,7 +631,7 @@ reuses the existing Window operator, and requires minimal new code.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / DAG Architecture |
-| **Sources** | `plans/sql/CIRCULAR_REFERENCES.md` |
+| **Sources** | `plans/sql/PLAN_CIRCULAR_REFERENCES.md` |
 | **Effort** | Very High (~20-30 hours) |
 
 **Context:** The dependency graph currently enforces a strict DAG. Creating a
@@ -670,7 +670,7 @@ require explicit user opt-in.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Joins |
-| **Sources** | `plans/sql/REPORT_SQL_GAPS.md` (Gap 2.3) |
+| **Sources** | `plans/sql/GAP_SQL_OVERVIEW.md` (Gap 2.3) |
 | **Effort** | Medium (6-8 hours) |
 
 **Context:** NATURAL JOIN is currently rejected with a clear error suggesting
@@ -700,7 +700,7 @@ message already suggests the correct alternative.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Aggregation |
-| **Sources** | `plans/sql/SQL_GAPS_4.md` (items A3, E5, E6) |
+| **Sources** | `plans/sql/GAP_SQL_PHASE_4.md` (items A3, E5, E6) |
 | **Effort** | Low-Medium (6-10 hours total) |
 
 **Context:** 17 aggregate functions are recognized but rejected in DIFFERENTIAL
@@ -729,7 +729,7 @@ for hypothetical-set and XMLAGG — extremely rare use cases.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Set Operations |
-| **Sources** | `plans/sql/SQL_GAPS_4.md` (item S3) |
+| **Sources** | `plans/sql/GAP_SQL_PHASE_4.md` (item S3) |
 | **Effort** | Medium (4-6 hours) |
 
 **Context:** Queries mixing `UNION` and `UNION ALL` in the same query are
@@ -757,7 +757,7 @@ rather than flattening.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Window Functions |
-| **Sources** | `plans/sql/SQL_GAPS_4.md` (item S4) |
+| **Sources** | `plans/sql/GAP_SQL_PHASE_4.md` (item S4) |
 | **Effort** | High (8-10 hours) |
 
 **Context:** Queries with window functions using different `PARTITION BY` clauses
@@ -788,7 +788,7 @@ acceptable until demand is demonstrated.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / Subqueries |
-| **Sources** | `plans/sql/SQL_GAPS_4.md` (items E1, E2, E3) |
+| **Sources** | `plans/sql/GAP_SQL_PHASE_4.md` (items E1, E2, E3) |
 | **Effort** | High (18-24 hours total for all 3) |
 
 **Context:** Three subquery patterns are currently rejected in DIFFERENTIAL mode:
@@ -822,7 +822,7 @@ AntiJoin pattern; defer E1 and E2 due to high complexity relative to benefit.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | SQL Feature / LATERAL |
-| **Sources** | `plans/sql/SQL_GAPS_4.md` (item S5) |
+| **Sources** | `plans/sql/GAP_SQL_PHASE_4.md` (item S5) |
 | **Effort** | Low (3-4 hours) |
 
 **Context:** `ROWS FROM(func1(...), func2(...))` zips the output of multiple
@@ -843,7 +843,7 @@ FROM + LATERAL covers all practical use cases.
 |-------|-------|
 | **Status** | Not Started |
 | **Category** | PostgreSQL Integration |
-| **Sources** | `plans/infra/CITUS.md` |
+| **Sources** | `plans/infra/PLAN_CITUS.md` |
 | **Effort** | Very High (~6 months) |
 
 **Context:** pg_trickle has zero multi-node awareness. Every core module assumes

@@ -12,7 +12,6 @@ new entries when creating documents.
 | File | Type | Status | Summary |
 |------|------|--------|---------|
 | [PLAN.md](PLAN.md) | PLAN | — | Master implementation plan (Phases 0–12) |
-| [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Proposed | Multi-path refresh for diamond dependencies in the DAG |
 | [PLAN_FEATURE_CLEANUP.md](PLAN_FEATURE_CLEANUP.md) | PLAN | In progress | Remove low-value surface before public release |
 
 ## adrs/
@@ -36,15 +35,15 @@ new entries when creating documents.
 | [GAP_ANALYSIS_FELDERA.md](ecosystem/GAP_ANALYSIS_FELDERA.md) | GAP | — | Core SQL IVM engine comparison vs Feldera |
 | [PLAN_CLOUDNATIVEPG.md](ecosystem/PLAN_CLOUDNATIVEPG.md) | PLAN | Implemented | CloudNativePG image volume extension |
 | [PLAN_ECO_SYSTEM.md](ecosystem/PLAN_ECO_SYSTEM.md) | PLAN | Proposed | Supportive projects ecosystem plan |
-| [REPORT_PG_IVM_COMPARISON.md](ecosystem/REPORT_PG_IVM_COMPARISON.md) | REPORT | Reference | pg_trickle vs pg_ivm comparison & gap analysis |
+| [GAP_PG_IVM_COMPARISON.md](ecosystem/GAP_PG_IVM_COMPARISON.md) | GAP | Reference | pg_trickle vs pg_ivm comparison & gap analysis |
 
 ## infra/
 
 | File | Type | Status | Summary |
 |------|------|--------|---------|
-| [CITUS.md](infra/CITUS.md) | PLAN | — | Citus distributed table compatibility |
-| [CODECOV.md](infra/CODECOV.md) | PLAN | Implementing | Codecov integration for coverage reporting |
-| [GITHUB_ACTIONS_COST.md](infra/GITHUB_ACTIONS_COST.md) | PLAN | — | Reduce GitHub Actions resource consumption |
+| [PLAN_CITUS.md](infra/PLAN_CITUS.md) | PLAN | — | Citus distributed table compatibility |
+| [PLAN_CODECOV.md](infra/PLAN_CODECOV.md) | PLAN | Implementing | Codecov integration for coverage reporting |
+| [PLAN_GITHUB_ACTIONS_COST.md](infra/PLAN_GITHUB_ACTIONS_COST.md) | PLAN | — | Reduce GitHub Actions resource consumption |
 | [PLAN_DOCKER_IMAGE.md](infra/PLAN_DOCKER_IMAGE.md) | PLAN | Draft | Official Docker image |
 | [PLAN_EXTERNAL_PROCESS.md](infra/PLAN_EXTERNAL_PROCESS.md) | REPORT | Exploration | External sidecar process feasibility study |
 | [PLAN_MULTI_DATABASE.md](infra/PLAN_MULTI_DATABASE.md) | PLAN | Draft | Multi-database support |
@@ -58,19 +57,20 @@ new entries when creating documents.
 
 | File | Type | Status | Summary |
 |------|------|--------|---------|
-| [PERFORMANCE_PART_8.md](performance/PERFORMANCE_PART_8.md) | PLAN | — | Residual bottlenecks & next-wave optimizations |
+| [PLAN_PERFORMANCE_PART_8.md](performance/PLAN_PERFORMANCE_PART_8.md) | PLAN | — | Residual bottlenecks & next-wave optimizations |
 | [PLAN_PERFORMANCE_PART_9.md](performance/PLAN_PERFORMANCE_PART_9.md) | PLAN | Planning | Strategic performance roadmap |
 | [REPORT_PARALLELIZATION.md](performance/REPORT_PARALLELIZATION.md) | REPORT | Planning | Parallelization options analysis |
 | [STATUS_PERFORMANCE.md](performance/STATUS_PERFORMANCE.md) | STATUS | — | Performance benchmark history & trends |
-| [TRIGGERS_OVERHEAD.md](performance/TRIGGERS_OVERHEAD.md) | PLAN | — | CDC trigger write-side overhead benchmark |
+| [PLAN_TRIGGERS_OVERHEAD.md](performance/PLAN_TRIGGERS_OVERHEAD.md) | PLAN | — | CDC trigger write-side overhead benchmark |
 
 ## sql/
 
 | File | Type | Status | Summary |
 |------|------|--------|---------|
-| [CIRCULAR_REFERENCES.md](sql/CIRCULAR_REFERENCES.md) | PLAN | Not started | Circular references in the dependency graph |
-| [LATERAL_JOINS.md](sql/LATERAL_JOINS.md) | PLAN | Implemented | LATERAL join support (subqueries with LATERAL) |
-| [NON_DETERMINISM.md](sql/NON_DETERMINISM.md) | PLAN | Not started | Non-deterministic function handling |
+| [PLAN_CIRCULAR_REFERENCES.md](sql/PLAN_CIRCULAR_REFERENCES.md) | PLAN | Not started | Circular references in the dependency graph |
+| [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Proposed | Multi-path refresh for diamond dependencies in the DAG |
+| [PLAN_LATERAL_JOINS.md](sql/PLAN_LATERAL_JOINS.md) | PLAN | Implemented | LATERAL join support (subqueries with LATERAL) |
+| [PLAN_NON_DETERMINISM.md](sql/PLAN_NON_DETERMINISM.md) | PLAN | Not started | Non-deterministic function handling |
 | [PLAN_DB_SCHEMA_STABILITY.md](sql/PLAN_DB_SCHEMA_STABILITY.md) | REPORT | Assessment | Database schema stability assessment (pre-1.0) |
 | [PLAN_HYBRID_CDC.md](sql/PLAN_HYBRID_CDC.md) | PLAN | Complete | Hybrid CDC — trigger bootstrap → logical replication |
 | [PLAN_NATIVE_SYNTAX.md](sql/PLAN_NATIVE_SYNTAX.md) | PLAN | Proposed | Native PostgreSQL syntax for stream tables |
@@ -79,13 +79,13 @@ new entries when creating documents.
 | [PLAN_UPGRADE_MIGRATIONS.md](sql/PLAN_UPGRADE_MIGRATIONS.md) | PLAN | Draft | Extension upgrade migrations |
 | [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](sql/PLAN_USER_TRIGGERS_EXPLICIT_DML.md) | PLAN | Implemented | User triggers on stream tables via explicit DML |
 | [PLAN_VIEW_INLINING.md](sql/PLAN_VIEW_INLINING.md) | PLAN | Implemented | View inlining for stream tables |
-| [REPORT_SQL_GAPS.md](sql/REPORT_SQL_GAPS.md) | GAP | Reference | SQL support gap analysis (periodically updated) |
+| [GAP_SQL_OVERVIEW.md](sql/GAP_SQL_OVERVIEW.md) | GAP | Reference | SQL support gap analysis (periodically updated) |
 | [REPORT_TRIGGERS_VS_REPLICATION.md](sql/REPORT_TRIGGERS_VS_REPLICATION.md) | REPORT | Reference | Triggers vs logical replication for CDC |
-| [SQL_GAPS_4.md](sql/SQL_GAPS_4.md) | GAP | Complete | SQL gaps — phase 4 |
-| [SQL_GAPS_5.md](sql/SQL_GAPS_5.md) | GAP | In progress | SQL gaps — phase 5 |
-| [SQL_GAPS_6.md](sql/SQL_GAPS_6.md) | GAP | Reference | SQL gaps — phase 6 (comprehensive analysis) |
-| [SQL_GAPS_7.md](sql/SQL_GAPS_7.md) | GAP | In progress | SQL gaps — phase 7 (deep analysis) |
-| [SQL_GAPS_7_QUESTIONS.md](sql/SQL_GAPS_7_QUESTIONS.md) | GAP | — | Open questions from SQL_GAPS_7 |
+| [GAP_SQL_PHASE_4.md](sql/GAP_SQL_PHASE_4.md) | GAP | Complete | SQL gaps — phase 4 |
+| [GAP_SQL_PHASE_5.md](sql/GAP_SQL_PHASE_5.md) | GAP | In progress | SQL gaps — phase 5 |
+| [GAP_SQL_PHASE_6.md](sql/GAP_SQL_PHASE_6.md) | GAP | Reference | SQL gaps — phase 6 (comprehensive analysis) |
+| [GAP_SQL_PHASE_7.md](sql/GAP_SQL_PHASE_7.md) | GAP | In progress | SQL gaps — phase 7 (deep analysis) |
+| [GAP_SQL_PHASE_7_QUESTIONS.md](sql/GAP_SQL_PHASE_7_QUESTIONS.md) | GAP | — | Open questions from GAP_SQL_PHASE_7 |
 
 ## testing/
 

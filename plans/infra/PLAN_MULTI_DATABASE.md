@@ -131,7 +131,7 @@ model works transparently — each DB that has `pg_trickle` installed will have
 an active BGW. The CNPG `cluster-example.yaml` should document the
 `max_worker_processes` guidance.
 
-See [CITUS.md](CITUS.md) for Citus (distributed PG) considerations, which
+See [PLAN_CITUS.md](PLAN_CITUS.md) for Citus (distributed PG) considerations, which
 has similar but more complex multi-node constraints.
 
 ---
@@ -141,5 +141,5 @@ has similar but more complex multi-node constraints.
 - [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) — BGW section
 - [src/scheduler.rs](../../src/scheduler.rs)
 - [plans/performance/REPORT_PARALLELIZATION.md](../performance/REPORT_PARALLELIZATION.md)
-- [plans/infra/CITUS.md](CITUS.md)
+- [plans/infra/PLAN_CITUS.md](PLAN_CITUS.md)
 - [cnpg/cluster-example.yaml](../../cnpg/cluster-example.yaml)

@@ -2,7 +2,7 @@
 
 > **Status:** Draft  
 > **Target version:** v0.3.0  
-> **Related gap:** SQL_GAPS_7.md G8.2  
+> **Related gap:** GAP_SQL_PHASE_7.md G8.2  
 > **Author:** pg_trickle project
 
 ---
@@ -170,7 +170,7 @@ The E2E Docker image (`tests/Dockerfile.e2e`) SHOULD be parameterized by
 
 ## References
 
-- [plans/sql/SQL_GAPS_7.md](SQL_GAPS_7.md) — G8.2
+- [plans/sql/GAP_SQL_PHASE_7.md](GAP_SQL_PHASE_7.md) — G8.2
 - [src/catalog.rs](../../src/catalog.rs)
 - [PLAN_VERSIONING.md](../infra/PLAN_VERSIONING.md)
 - [PostgreSQL Extension Versioning](https://www.postgresql.org/docs/current/extend-extensions.html)

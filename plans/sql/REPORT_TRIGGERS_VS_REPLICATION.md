@@ -451,7 +451,7 @@ including:
 ### Recommendation 5: Benchmark Trigger Overhead
 
 Execute the benchmark plan in
-[TRIGGERS_OVERHEAD.md](../performance/TRIGGERS_OVERHEAD.md) to establish
+[PLAN_TRIGGERS_OVERHEAD.md](../performance/PLAN_TRIGGERS_OVERHEAD.md) to establish
 data-driven thresholds for the logical replication migration crossover point.
 The results should feed directly into the §3.3 crossover analysis.
 

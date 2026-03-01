@@ -1,7 +1,7 @@
-# SQL_GAPS_7 — Open Questions
+# GAP_SQL_PHASE_7 — Open Questions
 
 **Date:** 2026-02-25
-**Source:** [SQL_GAPS_7.md](SQL_GAPS_7.md) Prioritized Implementation Roadmap
+**Source:** [GAP_SQL_PHASE_7.md](GAP_SQL_PHASE_7.md) Prioritized Implementation Roadmap
 
 ---
 
