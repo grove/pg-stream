@@ -84,6 +84,7 @@ new entries when creating documents.
 | [PLAN_VIEW_INLINING.md](sql/PLAN_VIEW_INLINING.md) | PLAN | Implemented | View inlining for stream tables |
 | [GAP_SQL_OVERVIEW.md](sql/GAP_SQL_OVERVIEW.md) | GAP | Reference | SQL support gap analysis (periodically updated) |
 | [REPORT_TRIGGERS_VS_REPLICATION.md](sql/REPORT_TRIGGERS_VS_REPLICATION.md) | REPORT | Reference | Triggers vs logical replication for CDC |
+| [PLAN_ORDER_BY_LIMIT_OFFSET.md](sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) | PLAN | Not started | Close ORDER BY / LIMIT / OFFSET gaps (incl. TopK) |
 | [GAP_SQL_PHASE_4.md](sql/GAP_SQL_PHASE_4.md) | GAP | Complete | SQL gaps — phase 4 |
 | [GAP_SQL_PHASE_5.md](sql/GAP_SQL_PHASE_5.md) | GAP | In progress | SQL gaps — phase 5 |
 | [GAP_SQL_PHASE_6.md](sql/GAP_SQL_PHASE_6.md) | GAP | Reference | SQL gaps — phase 6 (comprehensive analysis) |
