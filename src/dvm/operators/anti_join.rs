@@ -89,15 +89,19 @@ pub fn diff_anti_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .join(", ");
     let right_alias = right.alias();
 
-    let r_old_snapshot = format!(
-        "(SELECT {right_col_list} FROM {right_table} {right_alias} \
+    // Materialize R_old as a CTE — same optimization as semi_join.rs.
+    // Prevents re-evaluation of the EXCEPT ALL / UNION ALL per EXISTS check.
+    let r_old_cte_name = ctx.next_cte_name("r_old");
+    let r_old_sql = format!(
+        "SELECT {right_col_list} FROM {right_table} {right_alias} \
          EXCEPT ALL \
          SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'I' \
          UNION ALL \
-         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'D') ",
+         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'D'",
         delta_right = right_result.cte_name,
         right_alias = quote_ident(right_alias),
     );
+    ctx.add_materialized_cte(r_old_cte_name.clone(), r_old_sql);
 
     let cte_name = ctx.next_cte_name("anti_join");
 
@@ -113,7 +117,7 @@ SELECT {hash_part1} AS __pgt_row_id,
        {dl_cols}
 FROM {delta_left} dl
 WHERE CASE WHEN dl.__pgt_action = 'D'
-           THEN NOT EXISTS (SELECT 1 FROM {r_old_snapshot} r_old WHERE {cond_part1_old})
+           THEN NOT EXISTS (SELECT 1 FROM {r_old_cte} r_old WHERE {cond_part1_old})
            ELSE NOT EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part1})
       END
 
@@ -130,14 +134,14 @@ SELECT {hash_part2} AS __pgt_row_id,
 FROM {left_snapshot} l
 WHERE EXISTS (SELECT 1 FROM {delta_right} dr WHERE {cond_part2_dr})
   AND (EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part2_new})
-       <> EXISTS (SELECT 1 FROM {r_old_snapshot} r_old WHERE {cond_part2_old}))",
+       <> EXISTS (SELECT 1 FROM {r_old_cte} r_old WHERE {cond_part2_old}))",
         dl_cols = dl_col_refs.join(", "),
         l_cols = l_col_refs.join(", "),
         delta_left = left_result.cte_name,
         delta_right = right_result.cte_name,
         left_snapshot = build_snapshot_sql(left),
         right_table = right_table,
-        r_old_snapshot = r_old_snapshot,
+        r_old_cte = r_old_cte_name,
         cond_part1_old = cond_part1_old,
     );
 

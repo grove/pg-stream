@@ -36,8 +36,8 @@ pub struct DiffContext {
     pub new_frontier: Frontier,
     /// Counter for generating unique CTE names.
     cte_counter: usize,
-    /// Accumulated CTE definitions: `(name, sql, is_recursive)`.
-    ctes: Vec<(String, String, bool)>,
+    /// Accumulated CTE definitions: `(name, sql, is_recursive, is_materialized)`.
+    ctes: Vec<(String, String, bool, bool)>,
     /// Schema for change buffer tables.
     pub change_buffer_schema: String,
     /// The target stream table's schema.qualified name (for aggregate merge).
@@ -234,12 +234,22 @@ impl DiffContext {
 
     /// Add a CTE definition.
     pub fn add_cte(&mut self, name: String, sql: String) {
-        self.ctes.push((name, sql, false));
+        self.ctes.push((name, sql, false, false));
     }
 
     /// Add a recursive CTE definition (requires `WITH RECURSIVE`).
     pub fn add_recursive_cte(&mut self, name: String, sql: String) {
-        self.ctes.push((name, sql, true));
+        self.ctes.push((name, sql, true, false));
+    }
+
+    /// Add a `MATERIALIZED` CTE definition.
+    ///
+    /// Forces PostgreSQL (12+) to evaluate the CTE once and cache the
+    /// result, preventing re-execution for each reference.  Used when
+    /// the CTE body is expensive (e.g. EXCEPT ALL / UNION ALL set
+    /// operation for R_old snapshots in semi-join / anti-join deltas).
+    pub fn add_materialized_cte(&mut self, name: String, sql: String) {
+        self.ctes.push((name, sql, false, true));
     }
 
     /// Build the final WITH query from accumulated CTEs.
@@ -248,7 +258,7 @@ impl DiffContext {
             return format!("SELECT * FROM {final_cte}");
         }
 
-        let has_recursive = self.ctes.iter().any(|(_, _, is_rec)| *is_rec);
+        let has_recursive = self.ctes.iter().any(|(_, _, is_rec, _)| *is_rec);
         let with_keyword = if has_recursive {
             "WITH RECURSIVE"
         } else {
@@ -258,7 +268,13 @@ impl DiffContext {
         let cte_defs: Vec<String> = self
             .ctes
             .iter()
-            .map(|(name, sql, _)| format!("{name} AS (\n{sql}\n)"))
+            .map(|(name, sql, _, is_mat)| {
+                if *is_mat {
+                    format!("{name} AS MATERIALIZED (\n{sql}\n)")
+                } else {
+                    format!("{name} AS (\n{sql}\n)")
+                }
+            })
             .collect();
 
         format!(
