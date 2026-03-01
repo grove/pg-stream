@@ -19,7 +19,9 @@
 //!   - If EXISTS in R_current AND NOT EXISTS in R_old → DELETE (lost)
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
-use crate::dvm::operators::join_common::{build_snapshot_sql, rewrite_join_condition};
+use crate::dvm::operators::join_common::{
+    build_snapshot_sql, extract_equijoin_keys_aliased, rewrite_join_condition,
+};
 use crate::dvm::parser::OpTree;
 use crate::error::PgTrickleError;
 
@@ -36,9 +38,15 @@ pub fn diff_anti_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         ));
     };
 
-    // Differentiate both children
+    // Differentiate both children.
+    // Set inside_semijoin flag so inner joins within this subtree use L₁
+    // (post-change snapshot) instead of L₀ via EXCEPT ALL, avoiding the
+    // Q21-type numwait regression.
+    let saved_inside_semijoin = ctx.inside_semijoin;
+    ctx.inside_semijoin = true;
     let left_result = ctx.diff_node(left)?;
     let right_result = ctx.diff_node(right)?;
+    ctx.inside_semijoin = saved_inside_semijoin;
 
     let right_table = build_snapshot_sql(right);
 
@@ -103,6 +111,34 @@ pub fn diff_anti_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     );
     ctx.add_materialized_cte(r_old_cte_name.clone(), r_old_sql);
 
+    // ── Delta-key pre-filtering for Part 2 ──────────────────────────
+    // Same approach as semi_join.rs: extract equi-join keys to build a
+    // WHERE ... IN (SELECT DISTINCT ... FROM delta_right) filter on the
+    // left snapshot, reducing the Part 2 scan from O(|L|) to O(|ΔR|).
+    let equi_keys_raw = extract_equijoin_keys_aliased(condition, left, "__pgt_pre", right, "dr");
+    let equi_keys: Vec<_> = equi_keys_raw
+        .into_iter()
+        .filter(|(lk, rk)| lk.contains("__pgt_pre") && rk.starts_with("dr."))
+        .collect();
+    let left_snapshot_raw = build_snapshot_sql(left);
+    let left_snapshot_filtered = if equi_keys.is_empty() {
+        left_snapshot_raw
+    } else {
+        let filters: Vec<String> = equi_keys
+            .iter()
+            .map(|(left_key, right_key)| {
+                format!(
+                    "{left_key} IN (SELECT DISTINCT {right_key} FROM {} dr)",
+                    right_result.cte_name
+                )
+            })
+            .collect();
+        format!(
+            "(SELECT * FROM {left_snapshot_raw} \"__pgt_pre\" WHERE {filters})",
+            filters = filters.join(" AND "),
+        )
+    };
+
     let cte_name = ctx.next_cte_name("anti_join");
 
     let sql = format!(
@@ -126,6 +162,7 @@ UNION ALL
 -- Part 2: left rows whose anti-join status changed due to right-side delta
 -- Emit 'I' if row now has no match in R_current but had a match in R_old
 -- Emit 'D' if row had no match in R_old but now has a match in R_current
+-- Left snapshot is pre-filtered by delta-right join keys for performance.
 SELECT {hash_part2} AS __pgt_row_id,
        CASE WHEN NOT EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part2_new})
             THEN 'I' ELSE 'D'
@@ -139,7 +176,7 @@ WHERE EXISTS (SELECT 1 FROM {delta_right} dr WHERE {cond_part2_dr})
         l_cols = l_col_refs.join(", "),
         delta_left = left_result.cte_name,
         delta_right = right_result.cte_name,
-        left_snapshot = build_snapshot_sql(left),
+        left_snapshot = left_snapshot_filtered,
         right_table = right_table,
         r_old_cte = r_old_cte_name,
         cond_part1_old = cond_part1_old,

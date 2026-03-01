@@ -810,6 +810,64 @@ pub fn build_base_table_key_exprs(op: &OpTree, alias: &str) -> Vec<String> {
     }
 }
 
+/// Extract equi-join key pairs from a condition, with column references
+/// rewritten for the given aliases using the same disambiguation logic
+/// as [`rewrite_join_condition`].
+///
+/// Returns `(left_col_sql, right_col_sql)` pairs suitable for building
+/// `WHERE left_col IN (SELECT DISTINCT right_col FROM delta)` filters
+/// that pre-filter a snapshot scan to only rows matching the delta.
+///
+/// Falls back gracefully: if the condition is too complex (OR, functions,
+/// non-equality operators), returns an empty vec and the optimization is
+/// skipped.
+pub fn extract_equijoin_keys_aliased(
+    condition: &Expr,
+    left: &OpTree,
+    left_alias: &str,
+    right: &OpTree,
+    right_alias: &str,
+) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    collect_aliased_keys(condition, left, left_alias, right, right_alias, &mut keys);
+    keys
+}
+
+/// Recursively collect equi-join key pairs with alias rewriting.
+fn collect_aliased_keys(
+    expr: &Expr,
+    left: &OpTree,
+    left_alias: &str,
+    right: &OpTree,
+    right_alias: &str,
+    keys: &mut Vec<(String, String)>,
+) {
+    match expr {
+        Expr::BinaryOp {
+            op,
+            left: l_expr,
+            right: r_expr,
+        } if op == "=" => {
+            let l_rewritten =
+                rewrite_expr_for_join(l_expr, left, left_alias, right, right_alias).to_sql();
+            let r_rewritten =
+                rewrite_expr_for_join(r_expr, left, left_alias, right, right_alias).to_sql();
+            keys.push((l_rewritten, r_rewritten));
+        }
+        Expr::BinaryOp {
+            op,
+            left: l_expr,
+            right: r_expr,
+        } if op.eq_ignore_ascii_case("AND") => {
+            collect_aliased_keys(l_expr, left, left_alias, right, right_alias, keys);
+            collect_aliased_keys(r_expr, left, left_alias, right, right_alias, keys);
+        }
+        _ => {
+            // Non-equality / non-AND: skip.
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

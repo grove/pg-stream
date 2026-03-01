@@ -18,9 +18,13 @@
 //! - **Subquery/Aggregate children**: snapshot + delta EXCEPT ALL
 //!   (critical for correlated sources like Q15 where revenue0 and
 //!   MAX(total_revenue) both depend on lineitem)
+//! - **Non-SemiJoin join children**: full join snapshot + EXCEPT ALL.
+//!   Safe because the Q21 regression only affects SemiJoin interactions.
+//!   Fixes deep join chains like Q07 (6-table) where the shallow Part 3
+//!   correction cannot reach deeper nesting levels.
 //!
-//! For **nested join children** (InnerJoin/LeftJoin), Q₀ via EXCEPT ALL
-//! interacts badly with SemiJoin R_old (Q21 regression), so Q₁ is used
+//! For **SemiJoin-containing join children**, Q₀ via EXCEPT ALL interacts
+//! badly with SemiJoin R_old (Q21 numwait regression), so Q₁ is used
 //! with a correction term for shallow cases (Part 3).
 //!
 //! ## Nested join children — correction term (Part 3)
@@ -72,6 +76,10 @@ use crate::error::PgTrickleError;
 /// child for which the EXCEPT ALL L₀ approach may interact badly with
 /// SemiJoin R_old (causing Q21-type regressions). Subquery/Aggregate
 /// children are **not** considered join children — they can safely use L₀.
+///
+/// Note: even for join children, L₀ is now used when the subtree does NOT
+/// contain SemiJoin/AntiJoin nodes (see `contains_semijoin`). This function
+/// is combined with `contains_semijoin` to decide L₀ vs L₁.
 fn is_join_child(op: &OpTree) -> bool {
     match op {
         OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. } => true,
@@ -79,6 +87,39 @@ fn is_join_child(op: &OpTree) -> bool {
         | OpTree::Project { child, .. }
         | OpTree::Subquery { child, .. } => is_join_child(child),
         _ => false,
+    }
+}
+
+/// Returns true if the subtree rooted at `op` contains any SemiJoin or
+/// AntiJoin node.  Used to decide whether a nested join child can safely
+/// use L₀ via EXCEPT ALL: SemiJoin-containing subtrees must use L₁ to
+/// avoid the Q21 numwait regression (R_old interaction), while pure
+/// InnerJoin/LeftJoin chains can safely use L₀.
+fn contains_semijoin(op: &OpTree) -> bool {
+    match op {
+        OpTree::SemiJoin { .. } | OpTree::AntiJoin { .. } => true,
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            contains_semijoin(left) || contains_semijoin(right)
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. }
+        | OpTree::Window { child, .. }
+        | OpTree::LateralFunction { child, .. }
+        | OpTree::LateralSubquery { child, .. }
+        | OpTree::ScalarSubquery { child, .. } => contains_semijoin(child),
+        OpTree::UnionAll { children } => children.iter().any(contains_semijoin),
+        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+            contains_semijoin(left) || contains_semijoin(right)
+        }
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => contains_semijoin(base) || contains_semijoin(recursive),
+        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => false,
     }
 }
 
@@ -230,10 +271,13 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     let join_cond_part2 = rewrite_join_condition(condition, left, "l", right, "dr");
 
     // Part 3 correction condition: dl (delta left) + dr (delta right).
-    // Only used when left is a nested join child whose immediate children
-    // are both simple (Scan) — i.e. one level of nesting.  For deeper
-    // chains (8-table joins like Q08) the cascading corrections generate
-    // SQL that is too complex for PostgreSQL.
+    // Only used when Part 2 uses L₁ (post-change) instead of L₀ and the
+    // left child is a shallow join.  With the expanded L₀ approach for
+    // non-SemiJoin join children, this is only needed for SemiJoin-
+    // containing shallow join children.
+    //
+    // The correction is computed eagerly here but only emitted when
+    // `!use_l0` (see `correction_sql` below).
     let join_cond_correction = if !is_simple_child(left) && is_shallow_join(left) {
         Some(rewrite_join_condition(condition, left, "dl", right, "dr"))
     } else {
@@ -274,12 +318,26 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // outer child share a common source table — using L₁ instead of L₀
     // causes missed DELETE rows and duplicate INSERT rows.
     //
-    // For nested join children (InnerJoin/LeftJoin), computing L₀ via
-    // EXCEPT ALL interacts badly with SemiJoin R_old (Q21 regression).
-    // These use L₁ + correction term for shallow joins, or plain L₁ for
-    // deeper chains.
-    let left_part2_source = if is_simple_child(left) || !is_join_child(left) {
-        // Scan or Subquery/Aggregate child: use L₀ via EXCEPT ALL
+    // For nested join children that contain SemiJoin/AntiJoin operators,
+    // computing L₀ via EXCEPT ALL interacts badly with SemiJoin R_old
+    // (Q21 numwait regression). These use L₁ + correction term for
+    // shallow joins, or plain L₁ for deeper chains.
+    //
+    // For nested join children WITHOUT SemiJoin/AntiJoin (pure InnerJoin/
+    // LeftJoin chains like Q07's 6-table chain), L₀ via EXCEPT ALL is
+    // safe and eliminates the double-counting error that the shallow
+    // Part 3 correction can't reach at deeper nesting levels.
+    //
+    // Additionally, joins inside a SemiJoin/AntiJoin ancestor must use
+    // L₁ to avoid Q21-type regressions where sub-join EXCEPT ALL
+    // interacts with the SemiJoin's R_old computation.
+    let use_l0 = is_simple_child(left)
+        || !is_join_child(left)
+        || (!contains_semijoin(left) && !ctx.inside_semijoin);
+
+    let left_part2_source = if use_l0 {
+        // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
+        // use L₀ via EXCEPT ALL
         let left_data_cols: String = left_cols
             .iter()
             .map(|c| quote_ident(c))
@@ -315,8 +373,9 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
             )
         }
     } else {
-        // Nested join child: use post-change L₁ with semi-join filter
-        // (L₀ via EXCEPT ALL for joins interacts badly with SemiJoin R_old)
+        // SemiJoin-containing nested join child: use post-change L₁ with
+        // semi-join filter (L₀ via EXCEPT ALL interacts badly with
+        // SemiJoin R_old, causing Q21-type regressions).
         // Shallow join children get a correction term (Part 3) below.
         build_semijoin_subquery(
             &left_table,
@@ -343,17 +402,21 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // This avoids computing L₀ for nested joins (expensive EXCEPT ALL on
     // full snapshot) and doesn't change the SemiJoin operator's inputs,
     // avoiding the Q21 regression that the previous L₀ approach caused.
-    let correction_sql = if let Some(cond) = &join_cond_correction {
-        // Row ID for correction rows: hash of both delta row IDs.
-        // For aggregate queries (Q03, Q10), the aggregate recomputes row_ids
-        // from GROUP BY columns, so the join-level row_id doesn't need to
-        // match Part 2's exactly.
-        let hash_correction =
-            "pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, dr.__pgt_row_id::TEXT])"
-                .to_string();
+    //
+    // Only applied when Part 2 uses L₁ (!use_l0).  When L₀ is used
+    // directly, the correction is unnecessary (no double-counting error).
+    let correction_sql = if !use_l0 {
+        if let Some(cond) = &join_cond_correction {
+            // Row ID for correction rows: hash of both delta row IDs.
+            // For aggregate queries (Q03, Q10), the aggregate recomputes row_ids
+            // from GROUP BY columns, so the join-level row_id doesn't need to
+            // match Part 2's exactly.
+            let hash_correction =
+                "pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, dr.__pgt_row_id::TEXT])"
+                    .to_string();
 
-        format!(
-            "
+            format!(
+                "
 
 UNION ALL
 
@@ -369,10 +432,14 @@ SELECT {hash_correction} AS __pgt_row_id,
        {all_cols_correction}
 FROM {delta_left} dl
 JOIN {delta_right} dr ON {cond}",
-            delta_left = left_result.cte_name,
-            delta_right = right_result.cte_name,
-        )
+                delta_left = left_result.cte_name,
+                delta_right = right_result.cte_name,
+            )
+        } else {
+            String::new()
+        }
     } else {
+        // L₀ is used directly — no correction needed.
         String::new()
     };
 
@@ -692,7 +759,9 @@ mod tests {
 
     #[test]
     fn test_diff_inner_join_nested_three_tables() {
-        // (orders ⋈ customers) ⋈ products — 3-table nested inner join
+        // (orders ⋈ customers) ⋈ products — 3-table nested inner join.
+        // The left child (orders ⋈ customers) is a non-SemiJoin join chain,
+        // so Part 2 uses L₀ via EXCEPT ALL (no correction term needed).
         let o = scan(1, "orders", "public", "o", &["id", "cust_id", "prod_id"]);
         let c = scan(2, "customers", "public", "c", &["id", "name"]);
         let inner = inner_join(eq_cond("o", "cust_id", "c", "id"), o, c);
@@ -707,17 +776,20 @@ mod tests {
         );
         let dr = result.unwrap();
         let sql = ctx.build_with_query(&dr.cte_name);
-        // Should produce three parts for nested left child
+        // Should produce Part 1 + Part 2 (with L₀ via EXCEPT ALL)
         assert_sql_contains(&sql, "Part 1");
         assert_sql_contains(&sql, "Part 2");
-        assert_sql_contains(&sql, "Part 3");
+        // L₀ uses EXCEPT ALL for the pre-change snapshot
+        assert_sql_contains(&sql, "EXCEPT ALL");
+        // No correction term — L₀ is exact for non-SemiJoin join children
+        assert_sql_not_contains(&sql, "Part 3");
     }
 
     #[test]
     fn test_diff_inner_join_deep_chain_no_correction() {
         // ((a ⋈ b) ⋈ c) ⋈ d — 4-table chain.
-        // The outermost join's left child (a⋈b⋈c) is NOT a shallow join
-        // so the correction term should NOT appear at the outermost level.
+        // All join children are non-SemiJoin, so all levels use L₀ via
+        // EXCEPT ALL. No correction terms should be generated at any level.
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let inner1 = inner_join(eq_cond("a", "id", "b", "id"), a, b);
@@ -728,24 +800,19 @@ mod tests {
 
         let mut ctx = test_ctx();
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
-        // The outermost CTE should NOT have Part 3
-        let outer_cte_name = &result.cte_name;
-        let sql = ctx.build_with_query(outer_cte_name);
-        // Find the outermost join CTE SQL (last join CTE in the WITH chain)
-        // The assertion checks the full SQL, but Part 3 should only be in
-        // the inner CTE (a⋈b⋈c level), not the outermost (a⋈b⋈c⋈d level).
-        // We verify by checking the inner CTE has Part 3 but counting them:
-        // exactly one Part 3 section should exist (from the inner level).
+        let sql = ctx.build_with_query(&result.cte_name);
+        // No correction terms at any level (all use L₀)
         let correction_count = sql.matches("Correction for nested join").count();
         assert_eq!(
-            correction_count, 1,
-            "expected exactly 1 correction term (inner level only), got {correction_count}\n{sql}"
+            correction_count, 0,
+            "expected 0 correction terms (all levels use L₀), got {correction_count}\n{sql}"
         );
     }
 
     #[test]
-    fn test_diff_inner_join_nested_correction_term() {
-        // For nested left child, Part 3 correction should be present
+    fn test_diff_inner_join_nested_uses_l0_via_except_all() {
+        // Non-SemiJoin nested join children use L₀ via EXCEPT ALL,
+        // eliminating the need for a correction term.
         let a = scan(1, "a", "public", "a", &["id"]);
         let b = scan(2, "b", "public", "b", &["id"]);
         let inner = inner_join(eq_cond("a", "id", "b", "id"), a, b);
@@ -756,16 +823,14 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Part 3 should contain the correction term markers
-        assert_sql_contains(&sql, "Part 3");
-        assert_sql_contains(&sql, "Correction");
-        // Should flip actions: when dl.action='I', flip dr's action
-        assert_sql_contains(&sql, "CASE WHEN dl.__pgt_action = 'I'");
-        // Should join delta_left with delta_right
-        assert!(
-            sql.matches("UNION ALL").count() >= 2,
-            "expected at least 2 UNION ALLs (Parts 1+2+3), got:\n{sql}"
-        );
+        // L₀ via EXCEPT ALL should be present in the outer join's Part 2
+        assert_sql_contains(&sql, "EXCEPT ALL");
+        // No correction term — L₀ is exact
+        assert_sql_not_contains(&sql, "Correction for nested join");
+        assert_sql_not_contains(&sql, "Part 3");
+        // Should still have valid structure: Part 1 + Part 2
+        assert_sql_contains(&sql, "Part 1");
+        assert_sql_contains(&sql, "Part 2");
     }
 
     #[test]
@@ -868,5 +933,33 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         // Should still produce valid diff SQL
         assert!(!result.columns.is_empty());
+    }
+
+    #[test]
+    fn test_diff_inner_join_inside_semijoin_uses_l1() {
+        // When inside_semijoin is true (i.e. this inner join is a child of
+        // a SemiJoin/AntiJoin), non-SemiJoin join children should fall back
+        // to L₁ (post-change snapshot) to avoid the Q21-type regression.
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let inner = inner_join(eq_cond("a", "id", "b", "id"), a, b);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let tree = inner_join(eq_cond("a", "id", "c", "id"), inner, c);
+
+        let mut ctx = test_ctx();
+        // Simulate being inside a SemiJoin ancestor
+        ctx.inside_semijoin = true;
+        let result = diff_inner_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // inside_semijoin → L₁ used for the left join child, so the
+        // EXCEPT ALL approach is NOT used for the outer join's Part 2
+        // left snapshot.  Instead, the correction term (Part 3) appears
+        // for the shallow nested join child.
+        assert_sql_contains(&sql, "Part 1");
+        assert_sql_contains(&sql, "Part 2");
+        assert_sql_contains(&sql, "Part 3");
+        // L₁ with correction, not L₀ via EXCEPT ALL at the outer level
+        assert_sql_contains(&sql, "Correction for nested join");
     }
 }

@@ -68,6 +68,12 @@ pub struct DiffContext {
     /// Only set to true when the top-level operator is a scan-chain
     /// (Scan/Filter/Project — no aggregate/join/union above it).
     pub merge_safe_dedup: bool,
+    /// When true, the current diff node is inside a SemiJoin or AntiJoin
+    /// ancestor.  Inner joins inside a SemiJoin context must use L₁
+    /// (post-change snapshot) instead of L₀ via EXCEPT ALL to avoid the
+    /// Q21-type numwait regression where EXCEPT ALL at sub-join levels
+    /// interacts with the SemiJoin's R_old snapshot computation.
+    pub inside_semijoin: bool,
 }
 
 impl DiffContext {
@@ -86,6 +92,7 @@ impl DiffContext {
             defining_query: None,
             st_user_columns: None,
             merge_safe_dedup: false,
+            inside_semijoin: false,
         }
     }
 
@@ -107,6 +114,7 @@ impl DiffContext {
             defining_query: None,
             st_user_columns: None,
             merge_safe_dedup: false,
+            inside_semijoin: false,
         }
     }
 
