@@ -224,6 +224,7 @@ PG 14–15 support can follow in a later release.
 | O3 | ~~Adaptive fallback threshold exposure via monitoring~~ | ✅ Done in v0.1.3 (F27) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.4 |
 | O4 | ~~SPI SQLSTATE error classification for retry~~ | ✅ Done in v0.1.3 (F29) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.6 |
 | O5 | Slot lag alerting thresholds (configurable) | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G10 |
+| O6 | Simplify `pg_trickle.user_triggers` GUC (remove redundant `on` value) | 1h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) C5 |
 
 ### WAL CDC Hardening
 
@@ -234,7 +235,7 @@ PG 14–15 support can follow in a later release.
 | W3 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | W4 | Promote `pg_trickle.cdc_mode = 'auto'` to recommended | Documentation | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 
-> **v0.3.0 total: ~142–212 hours**
+> **v0.3.0 total: ~143–213 hours**
 
 **Exit criteria:**
 - [ ] `max_concurrent_refreshes` drives real parallel refresh
@@ -346,10 +347,10 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | Milestone | Effort estimate | Cumulative | Status |
 |-----------|-----------------|------------|--------|
 | v0.1.x — Core engine + correctness | ~30h actual | 30h | ✅ Released |
-| v0.3.0 — Production ready | 142–212h | 172–242h | 🔜 Next |
-| v0.4.0 — Observability & Integration | 18–27h | 190–269h | |
-| v1.0.0 — Stable release | 18–27h | 208–296h | |
-| Post-1.0 (ecosystem) | 88–134h | 296–430h | |
+| v0.3.0 — Production ready | 143–213h | 173–243h | 🔜 Next |
+| v0.4.0 — Observability & Integration | 18–27h | 191–270h | |
+| v1.0.0 — Stable release | 18–27h | 209–297h | |
+| Post-1.0 (ecosystem) | 88–134h | 297–431h | |
 | Post-1.0 (scale) | 6+ months | — | |
 
 ---
