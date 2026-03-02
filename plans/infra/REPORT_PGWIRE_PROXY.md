@@ -1,7 +1,7 @@
 # REPORT_PGWIRE_PROXY.md — pgwire Proxy / Intercept Analysis
 
 > **Status:** Research / Analysis  
-> **Relates to:** [PLAN_EXTERNAL_PROCESS.md](PLAN_EXTERNAL_PROCESS.md) (§11, Open Question #4)  
+> **Relates to:** [REPORT_EXTERNAL_PROCESS.md](REPORT_EXTERNAL_PROCESS.md) (§11, Open Question #4)  
 > **Author:** pg_trickle project
 
 ---
@@ -25,7 +25,7 @@
 
 ## 1. Context and Question
 
-The [External Sidecar Process plan](PLAN_EXTERNAL_PROCESS.md) envisions
+The [External Sidecar Process report](REPORT_EXTERNAL_PROCESS.md) outlines
 pg_trickle running as a standalone process that connects to PostgreSQL over
 standard pgwire client connections. Open Question #4 asks:
 
@@ -510,7 +510,7 @@ this provides no UX benefit over the direct sidecar approach.
 | **Total (Lite Proxy — Option B)** | **16-29 weeks** | 4-7 months of focused work |
 
 For comparison, the entire sidecar (Option A, no proxy) is estimated at
-15-22 weeks in [PLAN_EXTERNAL_PROCESS.md](PLAN_EXTERNAL_PROCESS.md). Adding
+15-22 weeks in [REPORT_EXTERNAL_PROCESS.md](REPORT_EXTERNAL_PROCESS.md). Adding
 a proxy roughly **doubles** the sidecar development timeline.
 
 ### 7.2 Ongoing Maintenance
@@ -721,7 +721,7 @@ direct sidecar is proven and there is clear demand.
   connection pooler and proxy (MIT)
 - [Supavisor](https://github.com/supabase/supavisor) — Cloud-native
   PostgreSQL connection pooler (Apache-2.0)
-- [PLAN_EXTERNAL_PROCESS.md](PLAN_EXTERNAL_PROCESS.md) — External sidecar
+- [REPORT_EXTERNAL_PROCESS.md](REPORT_EXTERNAL_PROCESS.md) — External sidecar
   process feasibility study
 - [PLAN_NATIVE_SYNTAX.md](../sql/PLAN_NATIVE_SYNTAX.md) — Native DDL
   syntax plan for the extension
