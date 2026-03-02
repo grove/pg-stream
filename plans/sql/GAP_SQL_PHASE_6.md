@@ -755,7 +755,10 @@ fixed. Listed here for completeness and to prevent re-evaluation.
 
 | Construct | Reason | Error Message |
 |-----------|--------|---------------|
-| `LIMIT` / `OFFSET` / `FETCH FIRST` | Stream tables materialize full result sets | "LIMIT is not supported in defining queries." |
+| `LIMIT` without `ORDER BY` | Undefined ordering — rejected | "LIMIT is not supported in defining queries." |
+| `OFFSET` | Stream tables materialize full result sets — rejected | "OFFSET is not supported in defining queries." |
+| `ORDER BY` + `LIMIT` (TopK) | ✅ **Now supported** — scoped recomputation via MERGE | Accepted (not an error) |
+| `FETCH FIRST` / `FETCH NEXT` | Same as LIMIT — TopK if ORDER BY present, rejected otherwise | Same as LIMIT |
 | `FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE` | Row-level locking has no meaning on materialized stream tables | "FOR UPDATE/FOR SHARE is not supported." |
 | `TABLESAMPLE` | Non-deterministic; stream tables are complete result sets | "TABLESAMPLE is not supported." |
 | `ROWS FROM()` with multiple functions | Extremely niche | "ROWS FROM() with multiple functions is not supported." |

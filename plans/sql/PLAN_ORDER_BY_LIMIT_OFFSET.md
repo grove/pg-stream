@@ -1,6 +1,6 @@
 # PLAN: Close ORDER BY / LIMIT / OFFSET Gaps
 
-**Status:** In progress — Parts 1–3 implemented, Part 4 partially done
+**Status:** In progress — Parts 1–4 implemented (gap doc updates done), E2E/TPC-H testing pending
 **Effort:** ~20–28 hours total (G1–G3 quick wins, G4 main body of work)
 
 ---
@@ -628,10 +628,10 @@ supported.
 - [x] **G4** — E2E tests for TopK (Step 7) — `tests/e2e_topk_tests.rs`
 - [x] Docs — SQL Reference, FAQ, CHANGELOG (Steps 8–10)
 - [x] **TPC-H** — Restore ORDER BY + LIMIT in 5 query files (Part 4)
-- [ ] **TPC-H** — Update PLAN_TEST_SUITE_TPC_H.md workaround tables (Part 4)
-- [ ] **TPC-H** — Update PLAN_TEST_SUITES.md tables + feature matrix (Part 4)
-- [ ] **Gap analyses** — Update GAP_SQL_PHASE_4/6/7, GAP_SQL_OVERVIEW (Part 4)
-- [ ] **Ecosystem** — Update GAP_ANALYSIS_EPSIO.md, GAP_PG_IVM_COMPARISON.md (Part 4)
+- [x] **TPC-H** — Update PLAN_TEST_SUITE_TPC_H.md workaround tables (Part 4)
+- [x] **TPC-H** — Update PLAN_TEST_SUITES.md tables + feature matrix (Part 4)
+- [x] **Gap analyses** — Update GAP_SQL_PHASE_4/6/7, GAP_SQL_OVERVIEW (Part 4)
+- [x] **Ecosystem** — Update GAP_ANALYSIS_EPSIO.md, GAP_PG_IVM_COMPARISON.md (Part 4)
 - [x] `just fmt && just lint` clean
 - [ ] `just test-e2e` green
 - [ ] `just test-tpch` green (with restored LIMIT queries)
@@ -645,31 +645,38 @@ supported.
    O(total log total). Mitigation: document that TopK stream tables perform
    best with an index on the ORDER BY column(s). Consider emitting a
    `NOTICE` at creation time if no suitable index is detected.
+   **Status:** Documented in SQL_REFERENCE.md. Index notice deferred to future.
 
 2. **LIMIT with subquery expression.** Should `LIMIT (SELECT ...)` be
-   supported? Decision: no — require a constant integer. Dynamic limits
+   supported? **Decision: No** — require a constant integer. Dynamic limits
    would need re-evaluation on every refresh, complicating caching and
-   catalog storage.
+   catalog storage. Implemented: `detect_topk_pattern()` only accepts
+   constant integer `A_Const` nodes.
 
 3. **Interaction with DISTINCT ON + LIMIT.** `SELECT DISTINCT ON (x) ...
    ORDER BY x, y LIMIT 5` — the DISTINCT ON rewrite runs first (producing
    a ROW_NUMBER subquery). TopK detection then sees the rewritten query,
-   which no longer has a top-level LIMIT. Two options: (a) detect TopK
-   *before* DISTINCT ON rewrite, (b) detect it on the original query text.
-   Need to decide ordering. Leaning toward (a): detect TopK first, strip
-   LIMIT, then let DISTINCT ON rewrite proceed on the base query.
+   which no longer has a top-level LIMIT.
+   **Decision:** TopK detection runs *before* `reject_limit_offset()` on
+   the original query. DISTINCT ON rewrite happens independently. If DISTINCT
+   ON + LIMIT is used, the DISTINCT ON rewrite produces a subquery that no
+   longer has top-level LIMIT, so TopK won't be detected — this is correct
+   behavior (the DISTINCT ON semantics dominate). Deferred to future if
+   users request it.
 
 4. **`alter_stream_table` behavior.** Can a user change the LIMIT value on
-   an existing TopK table? Can they remove the LIMIT? This needs API design.
-   Initial proposal: `alter_stream_table` with a new defining query
-   re-detects TopK; changing between TopK and non-TopK forces a full refresh.
+   an existing TopK table? **Decision (current):** Not supported via
+   `alter_stream_table`. To change the LIMIT, drop and recreate. Future:
+   add `defining_query` parameter to `alter_stream_table`.
 
 5. **Monitoring / observability.** TopK tables should be identifiable in
-   `pgtrickle.stream_tables_info()` output. Expose `topk_limit` and
-   `topk_order_by` in the monitoring view.
+   `pgtrickle.stream_tables_info()` output.
+   **Status: ✅ Done** — `is_topk` boolean exposed in monitoring view.
+   Catalog columns `topk_limit` and `topk_order_by` are also queryable.
 
 6. **Future: Option C (boundary tracking).** When profiling shows that
    most refreshes recompute unnecessarily (changes exist but don't affect
    the top-N), implement boundary tracking as a transparent optimization.
    This is backward-compatible: no API or schema changes, just a smarter
    skip decision in the refresh path.
+   **Status:** Deferred — no user reports of performance issues yet.

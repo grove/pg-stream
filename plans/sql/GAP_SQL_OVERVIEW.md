@@ -500,18 +500,28 @@ The subquery is wrapped in `OpTree::Subquery` and its internal column references
 
 ## Gap 6: Clause Features
 
-### 6.1 — LIMIT / OFFSET (P2)
+### 6.1 — LIMIT / OFFSET (P2) — ✅ PARTIALLY RESOLVED
 
-**Severity: P2 — Rejected with clear error**
+**Severity: P2 → Resolved for TopK; LIMIT without ORDER BY and OFFSET remain rejected**
 
+**TopK (ORDER BY + LIMIT)** is now supported:
 ```sql
--- ❌ Error: "LIMIT is not supported in defining queries."
-SELECT * FROM orders ORDER BY created_at LIMIT 100
+-- ✅ Accepted as TopK — stores only the top 100 rows, refreshed via MERGE
+SELECT * FROM orders ORDER BY created_at DESC LIMIT 100
 ```
 
-**Location:** [parser.rs line 1639](../../src/dvm/parser.rs#L1639)
+**LIMIT without ORDER BY** and **OFFSET** remain rejected:
+```sql
+-- ❌ Error: "LIMIT is not supported in defining queries without ORDER BY (TopK requires ORDER BY)."
+SELECT * FROM orders LIMIT 100
 
-This is an intentional design decision — stream tables materialize the full result set. The error message is clear.
+-- ❌ Error: "OFFSET is not supported in defining queries."
+SELECT * FROM orders ORDER BY created_at OFFSET 10
+```
+
+**Location:** [parser.rs `detect_topk_pattern()` + `reject_limit_offset()`](../../src/dvm/parser.rs)
+
+TopK stream tables bypass the DVM delta pipeline and use scoped recomputation — the full ORDER BY + LIMIT query is re-executed on each refresh and merged into the storage table.
 
 ### 6.2 — GROUPING SETS / CUBE / ROLLUP (P0) ✅ FIXED (REJECTED)
 

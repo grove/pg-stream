@@ -118,7 +118,9 @@ The report has **not been updated** to reflect PLAN_SQL_GAPS_3 completion. Multi
 
 | Construct | Error Behavior | Applies To |
 |-----------|---------------|------------|
-| LIMIT / OFFSET | Rejected — stream tables are full result sets | All modes |
+| ORDER BY + LIMIT (TopK) | ✅ Supported — scoped recomputation via MERGE | All modes |
+| LIMIT without ORDER BY | Rejected — undefined ordering | All modes |
+| OFFSET | Rejected — stream tables are full result sets | All modes |
 | DISTINCT ON | Rejected → use DISTINCT or ROW_NUMBER() | All modes |
 | NATURAL JOIN | Rejected → use explicit JOIN ... ON | All modes |
 | GROUPING SETS / CUBE / ROLLUP | Rejected → use separate STs + UNION ALL, or FULL mode | All modes |

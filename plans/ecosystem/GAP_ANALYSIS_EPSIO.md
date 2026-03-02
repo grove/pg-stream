@@ -62,7 +62,7 @@ exist in PostgreSQL's SQL dialect.
 | **Recursive queries (WITH RECURSIVE)** | ❌ (not documented) | ✅ (recomputation-diff) | **pg_trickle** |
 | **GROUPING SETS / CUBE / ROLLUP** | ❌ (not documented) | ✅ (auto-rewritten) | **pg_trickle** |
 | **DISTINCT / DISTINCT ON** | ✅ / ✅ | ✅ / ✅ (auto-rewritten) | Tied |
-| **ORDER BY + LIMIT (TopK)** | ✅ | ❌ | **Epsio** |
+| **ORDER BY + LIMIT (TopK)** | ✅ | ✅ (scoped recomputation) | Tied |
 | **Persistent operator state** | ✅ (RocksDB) | ❌ (stateless delta SQL per refresh) | **Epsio** |
 | **Continuous updates** | ✅ (streaming, ~50ms batches) | ❌ (periodic scheduled refresh) | **Epsio** |
 | **Transactional consistency** | ✅ (cross-table, via unified CDC stream) | ✅ (single-transaction refresh) | Tied |
@@ -245,11 +245,12 @@ set subtraction or intersection.
 | ROLLUP | ❌ (not documented) | ✅ (auto-rewritten via GROUPING SETS) |
 | GROUPING() function | ❌ (not documented) | ✅ |
 | HAVING | ❌ (not documented) | ✅ |
-| ORDER BY + LIMIT (TopK) | ✅ | ❌ |
+| ORDER BY + LIMIT (TopK) | ✅ | ✅ (scoped recomputation) |
 
-**Gap for pg_trickle:** No ORDER BY + LIMIT (TopK) support. Epsio can
-incrementally maintain "top N rows" queries, which is a useful pattern for
-dashboards and leaderboards.
+**~~Gap for pg_trickle:~~** ✅ **Resolved.** ORDER BY + LIMIT (TopK) is now
+supported via scoped recomputation (MERGE-based). Epsio uses true
+incremental TopK; pg_trickle re-executes the full query when changes exist
+but skips refresh when no changes are detected.
 
 **Gap for Epsio:** No documented support for GROUPING SETS, CUBE, ROLLUP, or
 HAVING. These are critical for multi-dimensional analytical aggregations.
@@ -308,7 +309,7 @@ lags behind database.
 |---|---------|--------|
 | 1 | **Persistent operator state** (RocksDB) | Avoids re-reading source table snapshots on each update |
 | 2 | **Continuous streaming updates** (~50ms batches) | Near-real-time view freshness vs periodic refresh |
-| 3 | **ORDER BY + LIMIT (TopK)** | Incrementally maintained "top N" queries |
+| 3 | ~~**ORDER BY + LIMIT (TopK)**~~ | ~~Incrementally maintained "top N" queries~~ — **Resolved in pg_trickle** (scoped recomputation) |
 | 4 | **Adaptive micro-batching** | Auto-adjusts batch size for throughput |
 | 5 | **Automatic error recovery** | Repopulates view on internal errors, retries on DB errors |
 
@@ -344,7 +345,7 @@ lags behind database.
 
 | Priority | Feature | Description | Effort | Rationale |
 |----------|---------|-------------|--------|-----------|
-| **Medium** | ORDER BY + LIMIT (TopK) | Incrementally maintain "top N rows" queries | 16–24h | Common dashboard/leaderboard pattern; Epsio supports this, pg_trickle does not |
+| ~~**Medium**~~ | ~~ORDER BY + LIMIT (TopK)~~ | ~~Incrementally maintain "top N rows" queries~~ | ~~16–24h~~ | ✅ **Done** — implemented via scoped recomputation (MERGE-based TopK) |
 
 ### Not worth pursuing
 

@@ -154,7 +154,8 @@ This analysis was performed by:
 
 | Construct | Error Behavior |
 |-----------|---------------|
-| LIMIT / OFFSET / FETCH FIRST | Rejected — stream tables need all rows |
+| LIMIT without ORDER BY / OFFSET | Rejected — stream tables need all rows |
+| ORDER BY + LIMIT (TopK) | ✅ Supported — scoped recomputation via MERGE |
 | FOR UPDATE / FOR SHARE | Rejected — row-level locking incompatible |
 | TABLESAMPLE | Rejected — non-deterministic |
 | ALL sublink (`x op ALL (SELECT ...)`) | Rejected — use NOT EXISTS |
@@ -1105,7 +1106,8 @@ correct in this analysis:
 
 | Construct | Reason | Status |
 |-----------|--------|--------|
-| LIMIT / OFFSET / FETCH FIRST | Stream tables are full result sets | ✅ Correct |
+| LIMIT without ORDER BY / OFFSET | Stream tables are full result sets | ✅ Correct |
+| ORDER BY + LIMIT (TopK) | Scoped recomputation via MERGE | ✅ Supported |
 | FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE | Row-level locking meaningless | ✅ Correct |
 | TABLESAMPLE | Non-deterministic sampling | ✅ Correct |
 | ROWS FROM() with multiple functions | Extremely niche | ✅ Correct |

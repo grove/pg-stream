@@ -65,7 +65,7 @@ All 22 TPC-H queries are compatible with pg_trickle:
 |----------|---------|-------------|
 | Works as-is | Q6, Q14, Q17, Q19 | None |
 | Remove ORDER BY only | Q1, Q4, Q5, Q7, Q8, Q9, Q11, Q12, Q13, Q15, Q16, Q20, Q22 | Cosmetic — ORDER BY is silently ignored anyway |
-| Remove LIMIT (+ ORDER BY) | Q2, Q3, Q10, Q18, Q21 | LIMIT is rejected by parser — must remove |
+| TopK (ORDER BY + LIMIT) | Q2, Q3, Q10, Q18, Q21 | ✅ Supported — ORDER BY + LIMIT now accepted as TopK pattern |
 
 - **0 queries are blocked** by unsupported SQL features.
 - **Q15** additionally requires inlining its `CREATE VIEW` as a CTE or
@@ -77,15 +77,15 @@ All 22 TPC-H queries are compatible with pg_trickle:
 | # | Name | Key SQL Features | Blocked? |
 |---|------|-----------------|----------|
 | Q1 | Pricing Summary | GROUP BY, SUM/AVG/COUNT, WHERE (date) | No |
-| Q2 | Minimum Cost Supplier | Correlated scalar subquery (MIN), 8-table join | Remove LIMIT |
-| Q3 | Shipping Priority | 3-table join, GROUP BY, SUM | Remove LIMIT |
+| Q2 | Minimum Cost Supplier | Correlated scalar subquery (MIN), 8-table join | TopK |
+| Q3 | Shipping Priority | 3-table join, GROUP BY, SUM | TopK |
 | Q4 | Order Priority Checking | EXISTS subquery, GROUP BY, COUNT | No |
 | Q5 | Local Supplier Volume | 6-table join, GROUP BY, SUM | No |
 | Q6 | Forecasting Revenue | Single-table SUM, WHERE filters | No |
 | Q7 | Volume Shipping | 6-table join, CASE WHEN, SUM | No |
 | Q8 | National Market Share | 8-table join, CASE WHEN, subquery in FROM | No |
 | Q9 | Product Type Profit | 6-table join, expressions, LIKE | No |
-| Q10 | Returned Item Reporting | 4-table join, GROUP BY, SUM | Remove LIMIT |
+| Q10 | Returned Item Reporting | 4-table join, GROUP BY, SUM | TopK |
 | Q11 | Important Stock ID | HAVING with scalar subquery, 3-table join | No |
 | Q12 | Shipping Modes | SUM(CASE WHEN), IN, BETWEEN | No |
 | Q13 | Customer Distribution | LEFT OUTER JOIN, nested GROUP BY, subquery in FROM | No |
@@ -93,10 +93,10 @@ All 22 TPC-H queries are compatible with pg_trickle:
 | Q15 | Top Supplier | View → inline as CTE; MAX subquery | Inline view |
 | Q16 | Parts/Supplier | COUNT(DISTINCT), NOT IN subquery, NOT LIKE | No |
 | Q17 | Small-Quantity Revenue | Scalar subquery (AVG), 2-table join | No |
-| Q18 | Large Volume Customer | IN subquery with HAVING, 3-table join | Remove LIMIT |
+| Q18 | Large Volume Customer | IN subquery with HAVING, 3-table join | TopK |
 | Q19 | Discounted Revenue | Complex OR/AND WHERE, SUM | No |
 | Q20 | Potential Promotion | Nested IN subqueries (2 levels) | No |
-| Q21 | Suppliers Waiting | EXISTS + NOT EXISTS, multi-join | Remove LIMIT |
+| Q21 | Suppliers Waiting | EXISTS + NOT EXISTS, multi-join | TopK |
 | Q22 | Global Sales Opportunity | NOT EXISTS, scalar subquery, SUBSTRING | No |
 
 ### SQL Feature Coverage by TPC-H
@@ -119,7 +119,7 @@ All 22 TPC-H queries are compatible with pg_trickle:
 | Subquery in FROM | Q8,Q13,Q15,Q22 | ✅ Full |
 | BETWEEN | Q1,Q3–Q6,Q12,Q15,Q20 | ✅ Full |
 | LIKE / NOT LIKE | Q9,Q13,Q16 | ✅ Full |
-| LIMIT | Q2,Q3,Q10,Q18,Q21 | ❌ Rejected — must remove |
+| LIMIT (TopK) | Q2,Q3,Q10,Q18,Q21 | ✅ Supported (ORDER BY + LIMIT) |
 
 ### Refresh Functions
 

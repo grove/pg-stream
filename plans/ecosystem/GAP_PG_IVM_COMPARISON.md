@@ -478,7 +478,8 @@ refreshed after its upstream dependencies.
 ### pg_trickle Limitations
 - Data is stale between refresh cycles — not suitable for applications
   requiring sub-second consistency.
-- `LIMIT` / `OFFSET` not supported in DIFFERENTIAL mode.
+- `LIMIT` without `ORDER BY` and `OFFSET` not supported.
+- `ORDER BY` + `LIMIT` (TopK) is supported via scoped recomputation (MERGE).
 - Volatile SQL functions rejected in DIFFERENTIAL mode.
 - Materialized views as sources not supported in DIFFERENTIAL mode.
 - `ALTER EXTENSION pg_trickle UPDATE` migration scripts not yet implemented

@@ -3,7 +3,7 @@
 > **TPC-H Fair Use:** This workload is *derived from* the TPC-H Benchmark
 > specification but does **not** constitute a TPC-H Benchmark result. Data
 > is generated with a custom pure-SQL generator (not `dbgen`), queries have
-> been modified (LIMIT removed, LIKE rewritten, RF3 added), and no
+> been modified (LIKE rewritten, RF3 added), and no
 > TPC-defined metric (QphH) is computed. "TPC-H" and "TPC Benchmark" are
 > trademarks of the Transaction Processing Performance Council
 > ([tpc.org](https://www.tpc.org/)).
@@ -865,8 +865,8 @@ subquery).
 
 | Modification | Queries Affected | Reason |
 |-------------|------------------|--------|
-| Remove ORDER BY | All with ORDER BY | Silently ignored by stream tables |
-| Remove LIMIT | Q2,Q3,Q10,Q18,Q21 | LIMIT rejected by parser |
+| Remove ORDER BY | All with ORDER BY (except TopK queries) | Silently ignored by stream tables |
+| ~~Remove LIMIT~~ | ~~Q2,Q3,Q10,Q18,Q21~~ | ~~LIMIT rejected by parser~~ — **Restored:** TopK (ORDER BY + LIMIT) now supported |
 | NULLIF → CASE WHEN | Q8, Q14 | A_Expr kind 5 unsupported in DIFFERENTIAL |
 | LIKE/NOT LIKE → strpos()/left() | Q9, Q14, Q16 | A_Expr kind 7 unsupported in DIFFERENTIAL |
 | COUNT(DISTINCT) → DISTINCT subquery + COUNT(*) | Q16 | COUNT(DISTINCT) unsupported |
