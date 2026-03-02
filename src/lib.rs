@@ -110,6 +110,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     auto_threshold  DOUBLE PRECISION,
     last_full_ms    DOUBLE PRECISION,
     functions_used  TEXT[],
+    diamond_consistency TEXT NOT NULL DEFAULT 'none'
+                     CHECK (diamond_consistency IN ('none', 'atomic')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

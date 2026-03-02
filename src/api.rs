@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::catalog::{CdcMode, StDependency, StreamTableMeta};
 use crate::cdc;
 use crate::config;
-use crate::dag::{DagNode, NodeId, RefreshMode, StDag, StStatus};
+use crate::dag::{DagNode, DiamondConsistency, NodeId, RefreshMode, StDag, StStatus};
 use crate::error::PgTrickleError;
 use crate::refresh;
 use crate::shmem;
@@ -24,6 +24,7 @@ use crate::wal_decoder;
 /// - `schedule`: Desired maximum schedule. `NULL` for CALCULATED.
 /// - `refresh_mode`: `'FULL'` or `'DIFFERENTIAL'`.
 /// - `initialize`: Whether to populate the table immediately.
+/// - `diamond_consistency`: `'none'` (default = GUC) or `'atomic'`.
 #[pg_extern(schema = "pgtrickle")]
 fn create_stream_table(
     name: &str,
@@ -31,8 +32,16 @@ fn create_stream_table(
     schedule: default!(Option<&str>, "'1m'"),
     refresh_mode: default!(&str, "'DIFFERENTIAL'"),
     initialize: default!(bool, true),
+    diamond_consistency: default!(Option<&str>, "NULL"),
 ) {
-    let result = create_stream_table_impl(name, query, schedule, refresh_mode, initialize);
+    let result = create_stream_table_impl(
+        name,
+        query,
+        schedule,
+        refresh_mode,
+        initialize,
+        diamond_consistency,
+    );
     if let Err(e) = result {
         pgrx::error!("{}", e);
     }
@@ -44,8 +53,26 @@ fn create_stream_table_impl(
     schedule: Option<&str>,
     refresh_mode_str: &str,
     initialize: bool,
+    diamond_consistency: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
+
+    // Parse diamond consistency — use GUC default when not specified
+    let dc = match diamond_consistency {
+        Some(s) => {
+            let val = s.to_lowercase();
+            match val.as_str() {
+                "none" | "atomic" => DiamondConsistency::from_sql_str(&val),
+                other => {
+                    return Err(PgTrickleError::InvalidArgument(format!(
+                        "invalid diamond_consistency value: '{}' (expected 'none' or 'atomic')",
+                        other
+                    )));
+                }
+            }
+        }
+        None => DiamondConsistency::from_sql_str(&config::pg_trickle_diamond_consistency()),
+    };
 
     // Parse schema.name
     let (schema, table_name) = parse_qualified_name(name)?;
@@ -260,6 +287,7 @@ fn create_stream_table_impl(
         schedule_str,
         refresh_mode,
         parsed_tree.as_ref().map(|pr| pr.functions_used()),
+        dc,
     )?;
 
     // Build per-source column usage map from the parsed OpTree so that
@@ -377,8 +405,9 @@ fn alter_stream_table(
     schedule: default!(Option<&str>, "NULL"),
     refresh_mode: default!(Option<&str>, "NULL"),
     status: default!(Option<&str>, "NULL"),
+    diamond_consistency: default!(Option<&str>, "NULL"),
 ) {
-    let result = alter_stream_table_impl(name, schedule, refresh_mode, status);
+    let result = alter_stream_table_impl(name, schedule, refresh_mode, status, diamond_consistency);
     if let Err(e) = result {
         pgrx::error!("{}", e);
     }
@@ -389,6 +418,7 @@ fn alter_stream_table_impl(
     schedule: Option<&str>,
     refresh_mode: Option<&str>,
     status: Option<&str>,
+    diamond_consistency: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -426,6 +456,22 @@ fn alter_stream_table_impl(
                 &[st.pgt_id.into()],
             )
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+
+    if let Some(dc_str) = diamond_consistency {
+        let val = dc_str.to_lowercase();
+        match val.as_str() {
+            "none" | "atomic" => {
+                let dc = DiamondConsistency::from_sql_str(&val);
+                StreamTableMeta::set_diamond_consistency(st.pgt_id, dc)?;
+            }
+            other => {
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "invalid diamond_consistency value: '{}' (expected 'none' or 'atomic')",
+                    other
+                )));
+            }
         }
     }
 
@@ -838,6 +884,69 @@ fn pgt_status() -> TableIterator<
             out.push((
                 name, status, mode, populated, errors, schedule, data_ts, staleness,
             ));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
+/// Show detected diamond consistency groups.
+///
+/// Returns one row per group member, indicating which group it belongs to,
+/// whether it is a convergence (fan-in) node, and the group's current epoch.
+#[pg_extern(schema = "pgtrickle", name = "diamond_groups")]
+#[allow(clippy::type_complexity)]
+fn diamond_groups() -> TableIterator<
+    'static,
+    (
+        name!(group_id, i32),
+        name!(member_name, String),
+        name!(member_schema, String),
+        name!(is_convergence, bool),
+        name!(epoch, i64),
+    ),
+> {
+    let rows: Vec<_> = Spi::connect(|_client| {
+        let dag = match StDag::build_from_catalog(config::pg_trickle_min_schedule_seconds()) {
+            Ok(d) => d,
+            Err(e) => {
+                pgrx::warning!("diamond_groups: failed to build DAG: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let groups = dag.compute_consistency_groups();
+        let mut out = Vec::new();
+
+        for (idx, group) in groups.iter().enumerate() {
+            // Skip singletons — they are not in a diamond.
+            if group.is_singleton() {
+                continue;
+            }
+
+            let group_id = (idx + 1) as i32;
+            let convergence_set: std::collections::HashSet<_> =
+                group.convergence_points.iter().collect();
+
+            for member in &group.members {
+                if let NodeId::StreamTable(pgt_id) = member {
+                    // Load metadata for name/schema
+                    let (name, schema) = match StreamTableMeta::get_all_active() {
+                        Ok(sts) => {
+                            if let Some(st) = sts.iter().find(|s| s.pgt_id == *pgt_id) {
+                                (st.pgt_name.clone(), st.pgt_schema.clone())
+                            } else {
+                                (format!("pgt_id={}", pgt_id), "unknown".to_string())
+                            }
+                        }
+                        Err(_) => (format!("pgt_id={}", pgt_id), "unknown".to_string()),
+                    };
+
+                    let is_convergence = convergence_set.contains(member);
+                    out.push((group_id, name, schema, is_convergence, group.epoch as i64));
+                }
+            }
         }
         out
     });
