@@ -43,8 +43,7 @@ jobs:
 
       - name: Run Criterion benchmarks
         run: |
-          cargo bench --bench refresh_bench --bench diff_operators \
-            -- --output-format bencher | tee bench-output.txt
+          ./scripts/run_benchmarks.sh -- --output-format bencher | tee bench-output.txt
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4

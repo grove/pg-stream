@@ -106,17 +106,17 @@ test-dbt-fast:
 
 # ── Benchmarks ────────────────────────────────────────────────────────────
 
-# Run all criterion benchmarks
+# Run all criterion benchmarks (uses pg_stub to satisfy pgrx symbols)
 bench:
-    cargo bench --bench refresh_bench --bench diff_operators
+    ./scripts/run_benchmarks.sh
 
 # Run only the diff-operator benchmarks
 bench-diff:
-    cargo bench --bench diff_operators
+    ./scripts/run_benchmarks.sh diff_operators
 
 # Run benchmarks with Bencher-compatible output
 bench-bencher:
-    cargo bench --bench refresh_bench --bench diff_operators -- --output-format bencher
+    ./scripts/run_benchmarks.sh -- --output-format bencher
 
 # ── Coverage ──────────────────────────────────────────────────────────────
 
