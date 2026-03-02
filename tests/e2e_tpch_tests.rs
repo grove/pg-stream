@@ -1,10 +1,18 @@
-//! TPC-H correctness tests for pg_trickle DIFFERENTIAL refresh.
+//! TPC-H-derived correctness tests for pg_trickle DIFFERENTIAL refresh.
 //!
 //! Validates the core DBSP invariant: after every differential refresh,
 //! the stream table's contents must be multiset-equal to re-executing
 //! the defining query from scratch.
 //!
-//! These tests are `#[ignore]`d to skip in normal CI. Run explicitly:
+//! **TPC-H Fair Use:** This workload is *derived from* the TPC-H Benchmark
+//! specification but does not constitute a TPC-H Benchmark result. Data is
+//! generated with a custom pure-SQL generator (not `dbgen`), queries have
+//! been modified, and no TPC-defined metric (QphH) is computed. "TPC-H" is
+//! a trademark of the Transaction Processing Performance Council (tpc.org).
+//!
+//! These tests are `#[ignore]`d to skip in normal `cargo test` runs.
+//! They run automatically in CI on push to main (see .github/workflows/ci.yml)
+//! or manually:
 //!
 //! ```bash
 //! just test-tpch              # SF-0.01, ~2 min
@@ -378,6 +386,37 @@ async fn assert_tpch_invariant(
             ))
             .await;
 
+        // Detailed column-level diagnostics: show extra/missing rows
+        let extra_rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT row_to_json(x)::text FROM \
+             (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) x \
+             LIMIT 10"
+        ))
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+        let missing_rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT row_to_json(x)::text FROM \
+             (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) x \
+             LIMIT 10"
+        ))
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+
+        if !extra_rows.is_empty() {
+            println!("    EXTRA rows (in ST but not query):");
+            for (row,) in &extra_rows {
+                println!("      {row}");
+            }
+        }
+        if !missing_rows.is_empty() {
+            println!("    MISSING rows (in query but not ST):");
+            for (row,) in &missing_rows {
+                println!("      {row}");
+            }
+        }
+
         return Err(format!(
             "INVARIANT VIOLATION: {qname} cycle {cycle} — \
              ST rows: {st_count}, Q rows: {q_count}, \
@@ -571,6 +610,10 @@ async fn test_tpch_differential_correctness() {
                 n_cycles,
                 ct.elapsed().as_secs_f64() * 1000.0,
             );
+
+            // Reclaim dead-tuple bloat from change-buffer DELETEs and
+            // stream-table MERGEs before the next cycle.
+            db.execute("VACUUM").await;
         }
 
         if dvm_ok {
@@ -724,6 +767,11 @@ async fn test_tpch_cross_query_consistency() {
         }
         active = next_active;
 
+        // Reclaim dead-tuple bloat from change-buffer DELETEs and
+        // stream-table MERGEs before the next cycle. Without this the
+        // PostgreSQL data directory can grow to 100+ GB across cycles.
+        db.execute("VACUUM").await;
+
         println!(
             "  Cycle {}/{} — {} STs verified — {:.0}ms ✓",
             cycle,
@@ -859,6 +907,9 @@ async fn test_tpch_full_vs_differential() {
                 ))
                 .await;
 
+            // Reclaim dead-tuple bloat between cycles.
+            db.execute("VACUUM").await;
+
             if !matches {
                 let full_count: i64 = db
                     .query_scalar(&format!("SELECT count(*) FROM public.{st_full}"))
@@ -912,4 +963,72 @@ async fn test_tpch_full_vs_differential() {
         "\n  FULL vs DIFFERENTIAL: {passed}/{} queries passed ✓\n",
         queries.len()
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Q07 Isolation Test — regression test for BinaryOp parenthesisation fix
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_q07_isolation() {
+    let sf = scale_factor();
+    let n_cycles = cycles();
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  Q07 Isolation Test — SF={sf}, cycles={n_cycles}");
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+    let t = Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let q07_sql = include_str!("tpch/queries/q07.sql");
+    let st_name = "tpch_q07_iso";
+
+    // Create Q07 ST only
+    db.try_execute(&format!(
+        "SELECT pgtrickle.create_stream_table('{st_name}', $${q07_sql}$$, '1m', 'DIFFERENTIAL')",
+    ))
+    .await
+    .expect("Q07 create failed");
+    println!("  Q07 ST created ✓");
+
+    // Baseline
+    assert_tpch_invariant(&db, st_name, q07_sql, "q07", 0)
+        .await
+        .expect("Baseline failed");
+    println!("  baseline ✓");
+
+    for cycle in 1..=n_cycles {
+        let ct = Instant::now();
+        let next_ok = max_orderkey(&db).await + 1;
+        apply_rf1(&db, next_ok).await;
+        apply_rf2(&db).await;
+        apply_rf3(&db).await;
+        db.execute("ANALYZE orders").await;
+        db.execute("ANALYZE lineitem").await;
+        db.execute("ANALYZE customer").await;
+
+        try_refresh_st(&db, st_name)
+            .await
+            .unwrap_or_else(|e| panic!("Q07 refresh error cycle {cycle}: {e}"));
+
+        match assert_tpch_invariant(&db, st_name, q07_sql, "q07", cycle).await {
+            Ok(()) => println!(
+                "  cycle {cycle}/{n_cycles} — {:.0}ms ✓",
+                ct.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(e) => {
+                panic!("  cycle {cycle}/{n_cycles} — FAILED: {e}");
+            }
+        }
+        db.execute("VACUUM").await;
+    }
+
+    let _ = db
+        .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+        .await;
+    println!("\n  Q07 isolation test complete\n");
 }

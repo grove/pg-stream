@@ -347,7 +347,11 @@ pub fn build_hash_expr(exprs: &[String]) -> String {
     if exprs.len() == 1 {
         format!("pgtrickle.pg_trickle_hash({})", exprs[0])
     } else {
-        let array_items: Vec<String> = exprs.iter().map(|e| format!("{e}::TEXT")).collect();
+        // Wrap each expression in parentheses to ensure ::TEXT cast binds
+        // to the whole expression, not just the last operand. Without
+        // parens, `a * (1 - b)::TEXT` would cast only `b` to TEXT due to
+        // SQL precedence of :: over arithmetic operators.
+        let array_items: Vec<String> = exprs.iter().map(|e| format!("({e})::TEXT")).collect();
         format!(
             "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
             array_items.join(", "),
@@ -544,7 +548,20 @@ mod tests {
     fn test_build_hash_expr_multiple() {
         let result = build_hash_expr(&["a".to_string(), "b".to_string()]);
         assert!(result.contains("pgtrickle.pg_trickle_hash_multi"));
-        assert!(result.contains("a::TEXT"));
-        assert!(result.contains("b::TEXT"));
+        assert!(result.contains("(a)::TEXT"));
+        assert!(result.contains("(b)::TEXT"));
+    }
+
+    #[test]
+    fn test_build_hash_expr_complex_expressions_parenthesized() {
+        // Verify that complex expressions are wrapped in parens before ::TEXT
+        // to prevent operator precedence issues (e.g. `a * b::TEXT` becoming
+        // `a * (b::TEXT)` instead of the intended `(a * b)::TEXT`).
+        let result = build_hash_expr(&[
+            "l_extendedprice * (1 - l_discount)".to_string(),
+            "volume".to_string(),
+        ]);
+        assert!(result.contains("(l_extendedprice * (1 - l_discount))::TEXT"));
+        assert!(result.contains("(volume)::TEXT"));
     }
 }

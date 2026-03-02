@@ -7,17 +7,27 @@
 //! rows change (the scalar value is different). When the outer source changes,
 //! only the changed rows are affected (the scalar value stays the same).
 //!
-//! ## Delta strategy
+//! ## Delta strategy (DBSP cross-product formula)
 //!
-//! **Part 1 — outer child changes only** (inner source unchanged):
-//!   The scalar value is constant. Pass through delta_outer rows, appending
-//!   the current scalar subquery result as the extra column.
+//! ```text
+//! Δ(C × S) = (ΔC × S₁) + (C₀ × ΔS)
+//! ```
 //!
-//! **Part 2 — inner source changes** (scalar value changes):
-//!   Every row in the outer child needs to be re-emitted with the new scalar
-//!   value. We emit DELETE for all current outer rows (with old scalar) and
-//!   INSERT for all current outer rows (with new scalar).
-//!   This is a full recomputation of the outer side when the scalar changes.
+//! **Part 1 — outer child changes** (`ΔC × S₁`):
+//!   Pass through delta_outer rows, appending the current scalar value (`S₁`).
+//!
+//! **Part 2 — inner source changes** (`C₀ × ΔS`):
+//!   For each row in the pre-change outer child (`C₀`), emit DELETE with the
+//!   old scalar value (`S₀`) and INSERT with the new scalar value (`S₁`).
+//!
+//! Using `C₀` (pre-change) instead of `C₁` (post-change) in Part 2 is
+//! critical when the outer child and inner subquery share a common source
+//! table (e.g., Q15: both revenue0 and MAX(total_revenue) depend on
+//! lineitem). Using `C₁` would double-count `ΔC × ΔS` overlap rows and
+//! miss DELETE rows whose column values changed between cycles.
+//!
+//! `C₀` is reconstructed as:
+//! `C_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes`
 //!
 //! Optimization: if only the outer source changed and the inner source is
 //! stable, Part 2 is skipped entirely. The diff engine already handles this
@@ -131,9 +141,35 @@ pub fn diff_scalar_subquery(
         )
     };
 
+    // ── Pre-change outer child snapshot (C₀) for Part 2 ────────────
+    //
+    // DBSP: Δ(C × S) = (ΔC × S₁) + (C₀ × ΔS)
+    //
+    // C₀ = C_current EXCEPT ALL ΔC_inserts UNION ALL ΔC_deletes
+    //
+    // Using C₀ instead of C₁ in Part 2 prevents double-counting when
+    // the outer child and scalar subquery share a common source table
+    // (e.g., Q15 where revenue0 and MAX(total_revenue) both depend on
+    // lineitem). Without C₀, Part 2 DELETE uses current child values
+    // that no longer match the old scalar, causing missed DELETEs.
+    let child_data_cols: String = child_cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let child_old_snapshot = format!(
+        "(SELECT {child_data_cols} FROM {child_table} __cs_inner \
+         EXCEPT ALL \
+         SELECT {child_data_cols} FROM {delta_child} WHERE __pgt_action = 'I' \
+         UNION ALL \
+         SELECT {child_data_cols} FROM {delta_child} WHERE __pgt_action = 'D')",
+        delta_child = child_result.cte_name,
+    );
+
     let sql = format!(
         "\
--- Part 1: outer child delta rows with current scalar value
+-- Part 1: outer child delta rows with current scalar value (ΔC × S₁)
 SELECT dc.__pgt_row_id,
        dc.__pgt_action,
        {dc_cols},
@@ -142,23 +178,23 @@ FROM {delta_child} dc
 
 UNION ALL
 
--- Part 2: all outer rows re-emitted when scalar subquery value changes (DELETE old)
+-- Part 2: pre-change outer rows with old scalar (C₀ × S₀ → DELETE)
 SELECT {hash_child} AS __pgt_row_id,
        'D' AS __pgt_action,
        {cs_cols},
        {scalar_old_sql} AS {alias_ident}
-FROM {child_snapshot} cs
+FROM {child_old_snapshot} cs
 WHERE EXISTS (SELECT 1 FROM {delta_subquery} WHERE 1=1)
   AND {scalar_sql} IS DISTINCT FROM {scalar_old_sql}
 
 UNION ALL
 
--- Part 2b: all outer rows re-emitted when scalar subquery value changes (INSERT new)
+-- Part 2b: pre-change outer rows with new scalar (C₀ × S₁ → INSERT)
 SELECT {hash_child} AS __pgt_row_id,
        'I' AS __pgt_action,
        {cs_cols},
        {scalar_sql} AS {alias_ident}
-FROM {child_snapshot} cs
+FROM {child_old_snapshot} cs
 WHERE EXISTS (SELECT 1 FROM {delta_subquery} WHERE 1=1)
   AND {scalar_sql} IS DISTINCT FROM {scalar_old_sql}",
         dc_cols = dc_col_refs.join(", "),
@@ -166,7 +202,6 @@ WHERE EXISTS (SELECT 1 FROM {delta_subquery} WHERE 1=1)
         alias_ident = quote_ident(alias),
         delta_child = child_result.cte_name,
         delta_subquery = subquery_result.cte_name,
-        child_snapshot = child_table,
     );
 
     ctx.add_cte(cte_name.clone(), sql);
@@ -220,6 +255,38 @@ mod tests {
         assert!(
             sql.contains("IS DISTINCT FROM"),
             "Part 2 should check for scalar value change"
+        );
+    }
+
+    #[test]
+    fn test_diff_scalar_subquery_uses_pre_change_snapshot() {
+        // Part 2 must use C₀ (pre-change outer child snapshot) via EXCEPT ALL
+        // to avoid double-counting when outer and inner share a source table.
+        let mut ctx = test_ctx();
+        let outer = scan(1, "lineitem", "public", "l", &["id", "amount"]);
+        let inner = scan(2, "lineitem", "public", "l2", &["total"]);
+        let tree = OpTree::ScalarSubquery {
+            subquery: Box::new(inner),
+            alias: "max_total".to_string(),
+            subquery_source_oids: vec![2],
+            child: Box::new(outer),
+        };
+        let result = diff_scalar_subquery(&mut ctx, &tree).unwrap();
+
+        let sql = ctx.build_with_query(&result.cte_name);
+        // Part 2 should use EXCEPT ALL to reconstruct C₀
+        assert!(
+            sql.contains("EXCEPT ALL"),
+            "Part 2 should use EXCEPT ALL for pre-change outer snapshot:\n{sql}"
+        );
+        // The EXCEPT ALL should reference the child's delta CTE
+        assert!(
+            sql.contains("__pgt_action = 'I'"),
+            "EXCEPT ALL should subtract inserts:\n{sql}"
+        );
+        assert!(
+            sql.contains("__pgt_action = 'D'"),
+            "UNION ALL should add back deletes:\n{sql}"
         );
     }
 

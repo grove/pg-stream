@@ -93,12 +93,15 @@ coverage.
 |------|-------------|--------|-----|
 | F17–F26 | 21 aggregate differential E2E, FULL JOIN E2E, INTERSECT/EXCEPT pairs, GUC variation tests, CI combined coverage | 29–38h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G7 · [STATUS_TESTING.md](plans/testing/STATUS_TESTING.md) |
 
-**TPC-H coverage baseline** — A 22-query TPC-H correctness test suite
-(`just test-tpch`, local-only, SF=0.01) is now in place and provides
-deep regression coverage for F5, F17–F26, and the aggregate +
+**TPC-H-derived coverage baseline** — A 22-query correctness test suite
+derived from TPC-H (`just test-tpch`, local-only, SF=0.01) is now in place
+and provides deep regression coverage for F5, F17–F26, and the aggregate +
 multi-join operator paths. 20/22 queries create; 15/22 pass deterministic
 correctness checks across multiple mutation cycles.
 See [plans/testing/PLAN_TEST_SUITE_TPC_H.md](plans/testing/PLAN_TEST_SUITE_TPC_H.md).
+
+> *Queries are derived from the TPC-H Benchmark specification; results are not
+> comparable to published TPC results. TPC Benchmark™ is a trademark of TPC.*
 
 **v0.2.0 total: ~66–92 hours** (F1 reduced 3–4h → 1–2h; F4, F7, F11, F14 moved to v0.1.0)
 

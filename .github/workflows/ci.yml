@@ -102,7 +102,7 @@ jobs:
     name: E2E tests
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +114,11 @@ jobs:
 
       - name: Run E2E test suite
         run: cargo test --test 'e2e_*' -- --test-threads=1
+
+      - name: Run TPC-H-derived correctness tests
+        run: |
+          cargo test --test e2e_tpch_tests -- \
+            --ignored --test-threads=1 --nocapture
 
   # ── Benchmarks (non-blocking, Linux only) ───────────────────────────────
   # Expensive; run on weekly schedule and manual dispatch only.

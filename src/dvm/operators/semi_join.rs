@@ -27,7 +27,9 @@
 //!   To avoid false positives, also check if it matched R_old. Only emit if status changed.
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
-use crate::dvm::operators::join_common::{build_snapshot_sql, rewrite_join_condition};
+use crate::dvm::operators::join_common::{
+    build_snapshot_sql, extract_equijoin_keys_aliased, rewrite_join_condition,
+};
 use crate::dvm::parser::OpTree;
 use crate::error::PgTrickleError;
 
@@ -44,14 +46,21 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         ));
     };
 
-    // Differentiate both children
+    // Differentiate both children.
+    // Set inside_semijoin flag so inner joins within this subtree use L₁
+    // (post-change snapshot) instead of L₀ via EXCEPT ALL, avoiding the
+    // Q21-type numwait regression.
+    let saved_inside_semijoin = ctx.inside_semijoin;
+    ctx.inside_semijoin = true;
     let left_result = ctx.diff_node(left)?;
     let right_result = ctx.diff_node(right)?;
+    ctx.inside_semijoin = saved_inside_semijoin;
 
     let right_table = build_snapshot_sql(right);
 
     // Rewrite join condition aliases for each part
     let cond_part1 = rewrite_join_condition(condition, left, "dl", right, "r");
+    let cond_part1_old = rewrite_join_condition(condition, left, "dl", right, "r_old");
     let cond_part2_new = rewrite_join_condition(condition, left, "l", right, "r");
     let cond_part2_dr = rewrite_join_condition(condition, left, "l", right, "dr");
     let cond_part2_old = rewrite_join_condition(condition, left, "l", right, "r_old");
@@ -109,32 +118,89 @@ pub fn diff_semi_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .join(", ");
     let right_alias = right.alias();
 
-    let r_old_snapshot = format!(
-        "(SELECT {right_col_list} FROM {right_table} {right_alias} \
+    // Materialize R_old as a CTE to avoid re-evaluating the EXCEPT ALL /
+    // UNION ALL set operation for every EXISTS check in Part 1 and Part 2.
+    // At SF=0.01 with 3 mutation cycles, this reduces Q21 from ~5.4s to
+    // sub-second by allowing PostgreSQL to hash-probe the pre-computed
+    // snapshot instead of repeatedly scanning and differencing the tables.
+    let r_old_cte_name = ctx.next_cte_name("r_old");
+    let r_old_sql = format!(
+        "SELECT {right_col_list} FROM {right_table} {right_alias} \
          EXCEPT ALL \
          SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'I' \
          UNION ALL \
-         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'D') ",
+         SELECT {right_col_list} FROM {delta_right} WHERE __pgt_action = 'D'",
         delta_right = right_result.cte_name,
         right_alias = quote_ident(right_alias),
     );
+    ctx.add_materialized_cte(r_old_cte_name.clone(), r_old_sql);
+
+    // ── Delta-key pre-filtering for Part 2 ──────────────────────────
+    //
+    // Part 2 scans the full left snapshot looking for rows correlated
+    // with delta_right. For large left tables (e.g. lineitem in Q18/Q21)
+    // this sequential scan dominates refresh time even though only a few
+    // rows are actually affected.
+    //
+    // Extract equi-join keys from the condition and use them to build a
+    // semi-join filter that limits the left snapshot to rows whose join
+    // keys appear in delta_right. This converts O(|L|) into O(|ΔR|)
+    // when the join key is indexed.
+    //
+    // The keys are rewritten using the same alias logic as the condition
+    // rewriting. We filter to only "clean" key pairs where the left side
+    // references the pre-filter alias and the right side references the
+    // delta alias — this avoids incorrect filters when rewriting fails.
+    let equi_keys_raw = extract_equijoin_keys_aliased(condition, left, "__pgt_pre", right, "dr");
+    let equi_keys: Vec<_> = equi_keys_raw
+        .into_iter()
+        .filter(|(lk, rk)| lk.contains("__pgt_pre") && rk.starts_with("dr."))
+        .collect();
+    let left_snapshot_raw = build_snapshot_sql(left);
+    let left_snapshot_filtered = if equi_keys.is_empty() {
+        left_snapshot_raw
+    } else {
+        let filters: Vec<String> = equi_keys
+            .iter()
+            .map(|(left_key, right_key)| {
+                format!(
+                    "{left_key} IN (SELECT DISTINCT {right_key} FROM {} dr)",
+                    right_result.cte_name
+                )
+            })
+            .collect();
+        format!(
+            "(SELECT * FROM {left_snapshot_raw} \"__pgt_pre\" WHERE {filters})",
+            filters = filters.join(" AND "),
+        )
+    };
 
     let cte_name = ctx.next_cte_name("semi_join");
 
     let sql = format!(
         "\
--- Part 1: delta_left rows that match current right (semi-join filter)
+-- Part 1: delta_left rows that match right (semi-join filter)
+-- INSERT: new left row has match in R_current  → emit INSERT
+-- DELETE: old left row had match in R_old      → emit DELETE
+-- For INSERTs we check the live right table (post-change state).
+-- For DELETEs we check R_old (pre-change state) because the matching
+-- right rows may also have been deleted in the same mutation cycle
+-- (e.g. RF2 deletes both orders AND their lineitems simultaneously).
 SELECT {hash_part1} AS __pgt_row_id,
        dl.__pgt_action,
        {dl_cols}
 FROM {delta_left} dl
-WHERE EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part1})
+WHERE CASE WHEN dl.__pgt_action = 'D'
+           THEN EXISTS (SELECT 1 FROM {r_old_cte} r_old WHERE {cond_part1_old})
+           ELSE EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part1})
+      END
 
 UNION ALL
 
 -- Part 2: left rows whose semi-join status changed due to right-side delta
 -- Emit 'I' if row now matches R_current but didn't match R_old
 -- Emit 'D' if row matched R_old but no longer matches R_current
+-- Left snapshot is pre-filtered by delta-right join keys for performance.
 SELECT {hash_part2} AS __pgt_row_id,
        CASE WHEN EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part2_new})
             THEN 'I' ELSE 'D'
@@ -143,14 +209,15 @@ SELECT {hash_part2} AS __pgt_row_id,
 FROM {left_snapshot} l
 WHERE EXISTS (SELECT 1 FROM {delta_right} dr WHERE {cond_part2_dr})
   AND (EXISTS (SELECT 1 FROM {right_table} r WHERE {cond_part2_new})
-       <> EXISTS (SELECT 1 FROM {r_old_snapshot} r_old WHERE {cond_part2_old}))",
+       <> EXISTS (SELECT 1 FROM {r_old_cte} r_old WHERE {cond_part2_old}))",
         dl_cols = dl_col_refs.join(", "),
         l_cols = l_col_refs.join(", "),
         delta_left = left_result.cte_name,
         delta_right = right_result.cte_name,
-        left_snapshot = build_snapshot_sql(left),
+        left_snapshot = left_snapshot_filtered,
         right_table = right_table,
-        r_old_snapshot = r_old_snapshot,
+        r_old_cte = r_old_cte_name,
+        cond_part1_old = cond_part1_old,
     );
 
     ctx.add_cte(cte_name.clone(), sql);

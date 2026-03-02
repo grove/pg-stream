@@ -1804,6 +1804,32 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
                 in_string = true;
                 i += 1;
             }
+            // Skip single-line comments: -- until end of line
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // skip the newline
+                }
+            }
+            // Skip block comments: /* ... */
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                i += 2;
+                let mut block_depth = 1i32;
+                while i < bytes.len() && block_depth > 0 {
+                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        block_depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        block_depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
             b'(' => {
                 depth += 1;
                 i += 1;

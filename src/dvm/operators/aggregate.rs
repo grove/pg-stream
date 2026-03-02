@@ -306,16 +306,40 @@ pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
 
 // ── Intermediate aggregate delta (subquery-in-FROM) ─────────────────
 
+/// Returns true if the aggregate's old value can be computed algebraically
+/// from new value + delta counts: `old = new - ins + del`.
+///
+/// Only COUNT, COUNT_STAR, and SUM are algebraically invertible.
+/// MIN/MAX/AVG and group-rescan aggregates require a full rescan of old data.
+fn is_algebraically_invertible(agg: &AggExpr) -> bool {
+    matches!(
+        agg.function,
+        AggFunc::CountStar | AggFunc::Count | AggFunc::Sum
+    )
+}
+
 /// Build delta CTEs for an intermediate aggregate (one whose group-by
 /// columns do NOT exist in the stream table).
 ///
 /// Instead of LEFT JOINing to the stream table (which doesn't have the
 /// intermediate columns), this builds:
 ///
+/// **Algebraic path** (when all aggregates are COUNT/SUM):
+/// 1. A "new rescan" CTE: re-aggregates affected groups from current data.
+/// 2. A final CTE: emits 'D' with old values computed algebraically
+///    (`old = new - ins + del` from the already-computed delta_cte) and
+///    'I' with new values from the rescan.
+///
+/// **EXCEPT ALL path** (when MIN/MAX/group-rescan aggregates are present):
 /// 1. A "new rescan" CTE: re-aggregates affected groups from current data.
 /// 2. An "old rescan" CTE: re-aggregates affected groups from old data
 ///    (current data minus child delta inserts, plus child delta deletes).
 /// 3. A final CTE: emits 'D' for old rows and 'I' for new rows.
+///
+/// The algebraic path is preferred because it:
+/// - Avoids a second `diff_node(child)` call (no duplicate CTEs)
+/// - Eliminates EXCEPT ALL (no column-matching or materialization issues)
+/// - Uses the already-computed delta values from the standard aggregate path
 ///
 /// The parent operator receives D/I pairs and processes them as normal
 /// delta events.
@@ -410,59 +434,6 @@ fn build_intermediate_agg_delta(
     );
     ctx.add_cte(new_rescan_cte.clone(), new_rescan_sql);
 
-    // ── Old rescan CTE: aggregate on old (pre-change) data ──────────
-    //
-    // Old data = current data - delta inserts + delta deletes.
-    // We use EXCEPT ALL / UNION ALL which works positionally (by column
-    // position, not by name). The source side uses SELECT * from the original
-    // FROM clause, while the delta side uses the child delta CTE columns.
-    // For join children, the source has raw column names while the delta
-    // has disambiguated names — positional matching handles this correctly.
-
-    // Get the child's delta CTE columns (these are what diff_node produced
-    // for the child). We need the data columns (excluding __pgt_action, __pgt_row_id).
-    let child_result = ctx.diff_node(child)?;
-    let delta_data_cols: Vec<String> = child_result
-        .columns
-        .iter()
-        .map(|c| quote_ident(c))
-        .collect();
-    let delta_col_list = delta_data_cols.join(", ");
-
-    // Use the same alias for the old_rescan wrapper as the original FROM
-    // expression. This ensures that qualified column references in aggregate
-    // expressions (e.g., MAX(q.total_revenue)) resolve correctly against
-    // both the new_rescan and old_rescan CTEs.
-    let old_rescan_alias = if from_sql.starts_with('(') {
-        // Extract alias from "(...) AS alias" pattern
-        if let Some(as_pos) = from_sql.rfind(" AS ") {
-            from_sql[as_pos + 4..].trim_matches('"').to_string()
-        } else {
-            "__pgt_old".to_string()
-        }
-    } else {
-        "__pgt_old".to_string()
-    };
-
-    let old_rescan_cte = ctx.next_cte_name("agg_old");
-    let old_rescan_sql = format!(
-        "SELECT {selects}\nFROM (\
-         SELECT * FROM {from_sql}{where_connector} \
-         EXCEPT ALL \
-         SELECT {delta_col_list} FROM {child_delta} WHERE __pgt_action = 'I' \
-         UNION ALL \
-         SELECT {delta_col_list} FROM {child_delta} WHERE __pgt_action = 'D'\
-         ) {old_alias}{group_by}",
-        selects = rescan_selects.join(",\n       "),
-        child_delta = child_result.cte_name,
-        old_alias = quote_ident(&old_rescan_alias),
-        group_by = group_by_sql,
-    );
-    ctx.add_cte(old_rescan_cte.clone(), old_rescan_sql);
-
-    // ── Final CTE: emit D/I pairs ───────────────────────────────────
-    let final_cte = ctx.next_cte_name("agg_final");
-
     // Build output columns — exclude __pgt_count since this is an intermediate
     // aggregate. __pgt_count is internal bookkeeping for the top-level aggregate's
     // MERGE with the stream table. Including it in intermediate output causes
@@ -475,69 +446,249 @@ fn build_intermediate_agg_delta(
         output_cols.push(agg.alias.clone());
     }
 
-    // Row ID from group-by columns
-    let group_hash_exprs_n: Vec<String> = group_output
-        .iter()
-        .map(|c| format!("n.{}::TEXT", quote_ident(c)))
-        .collect();
-    let group_hash_exprs_o: Vec<String> = group_output
-        .iter()
-        .map(|c| format!("o.{}::TEXT", quote_ident(c)))
-        .collect();
-    let row_id_new = if group_hash_exprs_n.is_empty() {
-        "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
-    } else {
-        build_hash_expr(&group_hash_exprs_n)
-    };
-    let row_id_old = if group_hash_exprs_o.is_empty() {
-        "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
-    } else {
-        build_hash_expr(&group_hash_exprs_o)
-    };
+    // Check if all aggregates are algebraically invertible.
+    // If so, we can compute old = new - ins + del using the already-computed
+    // delta_cte, avoiding a second diff_node(child) call and EXCEPT ALL.
+    let all_algebraic = aggregates.iter().all(is_algebraically_invertible);
 
-    let new_group_refs = group_output
-        .iter()
-        .map(|c| format!("n.{}", quote_ident(c)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let old_group_refs = group_output
-        .iter()
-        .map(|c| format!("o.{}", quote_ident(c)))
-        .collect::<Vec<_>>()
-        .join(", ");
+    if all_algebraic {
+        // ── Algebraic path: old = new − ins + del ───────────────────
+        //
+        // D events use the delta_cte (which has __ins_count, __del_count,
+        // __ins_{alias}, __del_{alias} per group) LEFT JOINed with
+        // new_rescan to compute old values algebraically.
+        // I events come directly from new_rescan.
+        //
+        // This avoids a second diff_node(child) call (no duplicate CTEs)
+        // and eliminates the EXCEPT ALL (no column-matching issues).
 
-    let new_agg_refs: Vec<String> = aggregates
-        .iter()
-        .map(|a| format!("n.{}", quote_ident(&a.alias)))
-        .collect();
-    let old_agg_refs: Vec<String> = aggregates
-        .iter()
-        .map(|a| format!("o.{}", quote_ident(&a.alias)))
-        .collect();
+        let final_cte = ctx.next_cte_name("agg_final");
 
-    let extra_new_groups = if new_group_refs.is_empty() {
-        String::new()
-    } else {
-        format!("{new_group_refs}, ")
-    };
-    let extra_old_groups = if old_group_refs.is_empty() {
-        String::new()
-    } else {
-        format!("{old_group_refs}, ")
-    };
-    let extra_new_aggs = if new_agg_refs.is_empty() {
-        String::new()
-    } else {
-        format!(",\n       {}", new_agg_refs.join(",\n       "))
-    };
-    let extra_old_aggs = if old_agg_refs.is_empty() {
-        String::new()
-    } else {
-        format!(",\n       {}", old_agg_refs.join(",\n       "))
-    };
+        // Row ID from group-by columns (d prefix for D events, n for I)
+        let group_hash_d: Vec<String> = group_output
+            .iter()
+            .map(|c| format!("d.{}::TEXT", quote_ident(c)))
+            .collect();
+        let group_hash_n: Vec<String> = group_output
+            .iter()
+            .map(|c| format!("n.{}::TEXT", quote_ident(c)))
+            .collect();
+        let row_id_d = if group_hash_d.is_empty() {
+            "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
+        } else {
+            build_hash_expr(&group_hash_d)
+        };
+        let row_id_n = if group_hash_n.is_empty() {
+            "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
+        } else {
+            build_hash_expr(&group_hash_n)
+        };
 
-    let final_sql = format!(
-        "\
+        // D event group columns from delta_cte
+        let d_group_refs: Vec<String> = group_output
+            .iter()
+            .map(|c| format!("d.{}", quote_ident(c)))
+            .collect();
+        let n_group_refs: Vec<String> = group_output
+            .iter()
+            .map(|c| format!("n.{}", quote_ident(c)))
+            .collect();
+
+        // Algebraic old expressions: old_X = COALESCE(new_X, 0) - ins_X + del_X
+        let old_pgt_count = "COALESCE(n.\"__pgt_count\", 0) \
+                             - COALESCE(d.\"__ins_count\", 0) \
+                             + COALESCE(d.\"__del_count\", 0)";
+        let old_agg_exprs: Vec<String> = aggregates
+            .iter()
+            .map(|agg| {
+                let alias = &agg.alias;
+                let ins_col = format!("__ins_{alias}");
+                let del_col = format!("__del_{alias}");
+                format!(
+                    "COALESCE(n.{a}, 0) - COALESCE(d.{i}, 0) + COALESCE(d.{d}, 0) AS {a}",
+                    a = quote_ident(alias),
+                    i = quote_ident(&ins_col),
+                    d = quote_ident(&del_col),
+                )
+            })
+            .collect();
+
+        let new_agg_refs: Vec<String> = aggregates
+            .iter()
+            .map(|a| format!("n.{}", quote_ident(&a.alias)))
+            .collect();
+
+        // JOIN condition between delta_cte and new_rescan on group columns
+        let join_cond = if group_output.is_empty() {
+            "TRUE".to_string()
+        } else {
+            group_output
+                .iter()
+                .map(|c| format!("d.{q} IS NOT DISTINCT FROM n.{q}", q = quote_ident(c),))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+
+        // Format column sections
+        let extra_d_groups = if d_group_refs.is_empty() {
+            String::new()
+        } else {
+            format!("{}, ", d_group_refs.join(", "))
+        };
+        let extra_n_groups = if n_group_refs.is_empty() {
+            String::new()
+        } else {
+            format!("{}, ", n_group_refs.join(", "))
+        };
+        let extra_old_aggs = if old_agg_exprs.is_empty() {
+            String::new()
+        } else {
+            format!(",\n       {}", old_agg_exprs.join(",\n       "))
+        };
+        let extra_new_aggs = if new_agg_refs.is_empty() {
+            String::new()
+        } else {
+            format!(",\n       {}", new_agg_refs.join(",\n       "))
+        };
+
+        let final_sql = format!(
+            "\
+-- D events: old state (algebraic: old = new - ins + del)
+SELECT {row_id_d} AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {extra_d_groups}{old_pgt_count} AS __pgt_count{extra_old_aggs}
+FROM {delta_cte} d
+LEFT JOIN {new_rescan_cte} n ON {join_cond}
+
+UNION ALL
+
+-- I events: new state of affected groups
+SELECT {row_id_n} AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {extra_n_groups}n.__pgt_count{extra_new_aggs}
+FROM {new_rescan_cte} n",
+        );
+
+        ctx.add_cte(final_cte.clone(), final_sql);
+
+        Ok(DiffResult {
+            cte_name: final_cte,
+            columns: output_cols,
+            is_deduplicated: false,
+        })
+    } else {
+        // ── EXCEPT ALL path: rescan old data ────────────────────────
+        //
+        // Old data = current data - delta inserts + delta deletes.
+        // We use EXCEPT ALL / UNION ALL which works positionally (by column
+        // position, not by name). The source side uses SELECT * from the
+        // original FROM clause, while the delta side uses the child delta
+        // CTE columns. Positional matching handles name differences.
+
+        // Get the child's delta CTE columns (these are what diff_node
+        // produced for the child). We need data columns only (excluding
+        // __pgt_action, __pgt_row_id).
+        let child_result = ctx.diff_node(child)?;
+        let delta_data_cols: Vec<String> = child_result
+            .columns
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect();
+        let delta_col_list = delta_data_cols.join(", ");
+
+        // Use the same alias for the old_rescan wrapper as the original
+        // FROM expression so qualified column refs resolve correctly.
+        let old_rescan_alias = if from_sql.starts_with('(') {
+            if let Some(as_pos) = from_sql.rfind(" AS ") {
+                from_sql[as_pos + 4..].trim_matches('"').to_string()
+            } else {
+                "__pgt_old".to_string()
+            }
+        } else {
+            "__pgt_old".to_string()
+        };
+
+        let old_rescan_cte = ctx.next_cte_name("agg_old");
+        let old_rescan_sql = format!(
+            "SELECT {selects}\nFROM (\
+             SELECT * FROM {from_sql}{where_connector} \
+             EXCEPT ALL \
+             SELECT {delta_col_list} FROM {child_delta} WHERE __pgt_action = 'I' \
+             UNION ALL \
+             SELECT {delta_col_list} FROM {child_delta} WHERE __pgt_action = 'D'\
+             ) {old_alias}{group_by}",
+            selects = rescan_selects.join(",\n       "),
+            child_delta = child_result.cte_name,
+            old_alias = quote_ident(&old_rescan_alias),
+            group_by = group_by_sql,
+        );
+        ctx.add_cte(old_rescan_cte.clone(), old_rescan_sql);
+
+        // ── Final CTE: emit D/I pairs ───────────────────────────────
+        let final_cte = ctx.next_cte_name("agg_final");
+
+        let group_hash_n: Vec<String> = group_output
+            .iter()
+            .map(|c| format!("n.{}::TEXT", quote_ident(c)))
+            .collect();
+        let group_hash_o: Vec<String> = group_output
+            .iter()
+            .map(|c| format!("o.{}::TEXT", quote_ident(c)))
+            .collect();
+        let row_id_new = if group_hash_n.is_empty() {
+            "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
+        } else {
+            build_hash_expr(&group_hash_n)
+        };
+        let row_id_old = if group_hash_o.is_empty() {
+            "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
+        } else {
+            build_hash_expr(&group_hash_o)
+        };
+
+        let new_group_refs = group_output
+            .iter()
+            .map(|c| format!("n.{}", quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let old_group_refs = group_output
+            .iter()
+            .map(|c| format!("o.{}", quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let new_agg_refs: Vec<String> = aggregates
+            .iter()
+            .map(|a| format!("n.{}", quote_ident(&a.alias)))
+            .collect();
+        let old_agg_refs: Vec<String> = aggregates
+            .iter()
+            .map(|a| format!("o.{}", quote_ident(&a.alias)))
+            .collect();
+
+        let extra_new_groups = if new_group_refs.is_empty() {
+            String::new()
+        } else {
+            format!("{new_group_refs}, ")
+        };
+        let extra_old_groups = if old_group_refs.is_empty() {
+            String::new()
+        } else {
+            format!("{old_group_refs}, ")
+        };
+        let extra_new_aggs = if new_agg_refs.is_empty() {
+            String::new()
+        } else {
+            format!(",\n       {}", new_agg_refs.join(",\n       "))
+        };
+        let extra_old_aggs = if old_agg_refs.is_empty() {
+            String::new()
+        } else {
+            format!(",\n       {}", old_agg_refs.join(",\n       "))
+        };
+
+        let final_sql = format!(
+            "\
 -- D events: old state of affected groups
 SELECT {row_id_old} AS __pgt_row_id,
        'D'::TEXT AS __pgt_action,
@@ -551,15 +702,16 @@ SELECT {row_id_new} AS __pgt_row_id,
        'I'::TEXT AS __pgt_action,
        {extra_new_groups}n.__pgt_count{extra_new_aggs}
 FROM {new_rescan_cte} n",
-    );
+        );
 
-    ctx.add_cte(final_cte.clone(), final_sql);
+        ctx.add_cte(final_cte.clone(), final_sql);
 
-    Ok(DiffResult {
-        cte_name: final_cte,
-        columns: output_cols,
-        is_deduplicated: false,
-    })
+        Ok(DiffResult {
+            cte_name: final_cte,
+            columns: output_cols,
+            is_deduplicated: false,
+        })
+    }
 }
 
 /// Build a rescan CTE that re-aggregates affected groups from the source
@@ -1115,16 +1267,32 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         ));
     }
 
+    // ── Scalar-aggregate guard ───────────────────────────────────
+    //
+    // PostgreSQL scalar aggregates (no GROUP BY) always return exactly
+    // one row: `SELECT SUM(x) FROM empty_table` → 1 row (NULL).  The
+    // singleton ST row must **never** be deleted, so we omit the 'D'
+    // classification for scalar aggregates and emit 'U' instead.
+    let is_scalar_agg = group_by.is_empty();
+
     // Action classification (same COALESCE guards as new_count)
-    merge_selects.push(
+    let action_case = if is_scalar_agg {
+        "\
+CASE
+    WHEN st.__pgt_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
+    ELSE 'U'
+END AS __pgt_meta_action"
+            .to_string()
+    } else {
         "\
 CASE
     WHEN st.__pgt_count IS NULL AND (COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)) > 0 THEN 'I'
     WHEN COALESCE(st.__pgt_count, 0) + COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0) <= 0 THEN 'D'
     ELSE 'U'
 END AS __pgt_meta_action"
-            .to_string(),
-    );
+            .to_string()
+    };
+    merge_selects.push(action_case);
 
     // Join condition on group-by columns
     let join_cond = if group_output.is_empty() {
@@ -1200,10 +1368,26 @@ END AS __pgt_meta_action"
     for agg in aggregates {
         let new_col = quote_ident(&format!("new_{}", agg.alias));
         let old_col = quote_ident(&format!("old_{}", agg.alias));
-        agg_cases.push(format!(
-            "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} ELSE m.{new_col} END AS {}",
-            quote_ident(&agg.alias),
-        ));
+        // For scalar aggregates, SUM (and similar nullable aggs) must return
+        // NULL — not 0 — when new_count drops to 0, matching PostgreSQL's
+        // `SELECT SUM(x) FROM empty_table` → NULL semantics.  COUNT(*) and
+        // COUNT(col) correctly yield 0 from the count arithmetic, so they
+        // don't need this override.
+        let needs_null_on_empty =
+            is_scalar_agg && matches!(agg.function, AggFunc::Sum | AggFunc::Min | AggFunc::Max);
+        if needs_null_on_empty {
+            agg_cases.push(format!(
+                "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} \
+                 WHEN m.new_count <= 0 THEN NULL \
+                 ELSE m.{new_col} END AS {}",
+                quote_ident(&agg.alias),
+            ));
+        } else {
+            agg_cases.push(format!(
+                "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} ELSE m.{new_col} END AS {}",
+                quote_ident(&agg.alias),
+            ));
+        }
     }
 
     let extra_agg_cases = if agg_cases.is_empty() {

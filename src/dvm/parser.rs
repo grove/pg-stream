@@ -54,7 +54,11 @@ impl Expr {
                 table_alias,
                 column_name,
             } => match table_alias {
-                Some(alias) => format!("{alias}.{column_name}"),
+                Some(alias) => format!(
+                    "\"{}\".\"{}\"",
+                    alias.replace('"', "\"\""),
+                    column_name.replace('"', "\"\""),
+                ),
                 None => column_name.clone(),
             },
             Expr::Literal(val) => val.clone(),
@@ -886,6 +890,16 @@ impl ParseResult {
     }
 }
 
+/// Look through transparent wrapper nodes (Filter, Subquery) to find the
+/// underlying operator. Used by `row_id_key_columns()` — a Filter sitting
+/// between Project and InnerJoin should not prevent PK-based row_ids.
+pub fn unwrap_transparent(op: &OpTree) -> &OpTree {
+    match op {
+        OpTree::Filter { child, .. } | OpTree::Subquery { child, .. } => unwrap_transparent(child),
+        other => other,
+    }
+}
+
 impl OpTree {
     /// Get the alias for this node (used in CTE naming).
     pub fn alias(&self) -> &str {
@@ -1037,11 +1051,16 @@ impl OpTree {
                 // with the OTHER side's CURRENT values, not the OLD values
                 // stored in the ST. PK columns are stable across value
                 // changes, so DELETE hashes always match the stored row_id.
+                //
+                // Look through transparent wrappers (Filter, Subquery) to
+                // find the underlying join node. Q15 has Project > Filter >
+                // InnerJoin — the Filter must not prevent PK-based row_ids.
+                let unwrapped = unwrap_transparent(child);
                 if matches!(
-                    child.as_ref(),
+                    unwrapped,
                     OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. }
                 ) {
-                    let pk_aliases = join_pk_aliases(expressions, aliases, child);
+                    let pk_aliases = join_pk_aliases(expressions, aliases, unwrapped);
                     return Some(pk_aliases.unwrap_or_else(|| aliases.clone()));
                 }
                 // For lateral function/subquery children, use all projected
@@ -1051,7 +1070,7 @@ impl OpTree {
                 // (which recomputes row_id in the Project operator) produce the
                 // same row_ids.
                 if matches!(
-                    child.as_ref(),
+                    unwrapped,
                     OpTree::LateralFunction { .. } | OpTree::LateralSubquery { .. }
                 ) {
                     return Some(aliases.clone());
@@ -3911,12 +3930,31 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     // Detect correlation by checking if the subquery's WHERE references
     // column names from tables in the outer FROM clause.
     let outer_tables = unsafe { collect_from_clause_table_names(select) };
-    let non_correlated: Vec<&ScalarSubqueryExtract> = scalar_subqueries
-        .iter()
-        .filter(|sq| !sq.is_correlated(&outer_tables))
-        .collect();
 
-    if non_correlated.is_empty() {
+    // Classify each scalar subquery:
+    //   1. Dot-qualified correlated (existing heuristic) → skip entirely
+    //   2. Bare-column correlated (catalog-detected)   → decorrelate to INNER JOIN
+    //   3. Non-correlated                              → CROSS JOIN
+    let mut non_correlated: Vec<&ScalarSubqueryExtract> = Vec::new();
+    let mut to_decorrelate: Vec<(
+        &ScalarSubqueryExtract,
+        std::collections::HashMap<String, String>,
+    )> = Vec::new();
+
+    for sq in &scalar_subqueries {
+        if sq.is_correlated(&outer_tables) {
+            // Dot-qualified correlation (e.g., "outer_table.col") — skip
+            continue;
+        }
+        let outer_cols = detect_correlation_columns(sq, &outer_tables);
+        if outer_cols.is_empty() {
+            non_correlated.push(sq);
+        } else {
+            to_decorrelate.push((sq, outer_cols));
+        }
+    }
+
+    if non_correlated.is_empty() && to_decorrelate.is_empty() {
         return Ok(query.to_string());
     }
 
@@ -3925,15 +3963,23 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     // FROM clause
     let from_sql = extract_from_clause_sql(select)?;
 
+    // Unified index counter for all subquery aliases
+    let mut next_idx = 1usize;
+
     // Build CROSS JOIN additions for each non-correlated scalar subquery.
     // The wrapper SELECT uses the original scalar subquery as a derived table
     // in its FROM clause, so the DVM parser (which requires FROM) can handle it.
     //
     // Format: CROSS JOIN (SELECT v."c" AS "scalar_alias"
     //                      FROM (inner_sql) AS v("c")) AS "sq_alias"
-    let mut cross_joins: Vec<String> = Vec::new();
-    for (i, sq) in non_correlated.iter().enumerate() {
-        let idx = i + 1;
+    let mut extra_joins: Vec<String> = Vec::new();
+    let mut extra_from_items: Vec<String> = Vec::new();
+    let mut extra_where_parts: Vec<String> = Vec::new();
+    let mut where_replacements: Vec<(String, String)> = Vec::new();
+
+    for sq in &non_correlated {
+        let idx = next_idx;
+        next_idx += 1;
         let sq_alias = format!("__pgt_sq_{idx}");
         let scalar_alias = format!("__pgt_scalar_{idx}");
         let inner_alias = format!("__pgt_v_{idx}");
@@ -3941,28 +3987,55 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
         // The inner scalar subquery returns exactly 1 column and 1 row.
         // We wrap it so the DVM parser sees a subquery with a valid FROM clause:
         //   (SELECT v."c" AS "scalar" FROM (original_subquery) AS v("c")) AS "sq"
-        cross_joins.push(format!(
+        extra_joins.push(format!(
             "CROSS JOIN (SELECT \"{inner_alias}\".\"{inner_col}\" AS \"{scalar_alias}\" \
              FROM ({sq_sql}) AS \"{inner_alias}\"(\"{inner_col}\")) AS \"{sq_alias}\"",
             sq_sql = sq.subquery_sql,
         ));
+        let replacement = format!("\"{sq_alias}\".\"{scalar_alias}\"");
+        where_replacements.push((sq.expr_sql.clone(), replacement));
+    }
+
+    // Build comma-joined FROM items for decorrelated correlated subqueries.
+    // Decorrelated subqueries are added as comma-separated FROM items (not
+    // INNER JOIN) to avoid SQL precedence issues with comma-joins.
+    for (sq, outer_cols) in &to_decorrelate {
+        let idx = next_idx;
+        next_idx += 1;
+        match decorrelate_scalar_subquery(sq, outer_cols, idx) {
+            Ok(decorrelated) => {
+                extra_from_items.push(decorrelated.from_item);
+                extra_where_parts.extend(decorrelated.extra_where_conditions);
+                where_replacements.push((sq.expr_sql.clone(), decorrelated.scalar_ref));
+            }
+            Err(e) => {
+                pgrx::debug1!(
+                    "[pg_trickle] Skipping decorrelation of scalar subquery: {}",
+                    e
+                );
+                // Fall back: skip this subquery
+                continue;
+            }
+        }
+    }
+
+    if extra_joins.is_empty() && extra_from_items.is_empty() {
+        return Ok(query.to_string());
     }
 
     // Rewrite the WHERE expression, replacing scalar subquery occurrences
-    // with column references to the CROSS JOIN aliases.
+    // with column references to the CROSS/INNER JOIN aliases.
     let where_expr = unsafe { node_to_expr(select.whereClause) }
         .map(|e| e.to_sql())
         .unwrap_or_else(|_| "TRUE".to_string());
 
     let mut rewritten_where = where_expr;
-    for (i, sq) in non_correlated.iter().enumerate() {
-        let idx = i + 1;
-        let sq_alias = format!("__pgt_sq_{idx}");
-        let scalar_alias = format!("__pgt_scalar_{idx}");
-        let replacement = format!("\"{sq_alias}\".\"{scalar_alias}\"");
-        // Replace the scalar subquery SQL in the WHERE expression
-        // The node_to_expr will have emitted the scalar subquery as "(SELECT ...)"
-        rewritten_where = rewritten_where.replace(&sq.expr_sql, &replacement);
+    for (find, replacement) in &where_replacements {
+        rewritten_where = rewritten_where.replace(find, replacement);
+    }
+    // Append decorrelation join conditions to WHERE
+    for cond in &extra_where_parts {
+        rewritten_where = format!("{rewritten_where} AND {cond}");
     }
 
     // Target list
@@ -4068,14 +4141,19 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     };
 
     // ── Assemble rewritten query ─────────────────────────────────────
+    // Build the complete FROM clause: original + comma-joined decorrelated subqueries + CROSS JOINs
+    let mut from_parts = vec![from_sql];
+    from_parts.extend(extra_from_items.iter().cloned());
+    let full_from = from_parts.join(", ");
+
     let rewritten = format!(
-        "SELECT{distinct_sql} {targets} FROM {from_sql} {cross_joins} WHERE {rewritten_where}{group_sql}{having_sql}{order_sql}",
+        "SELECT{distinct_sql} {targets} FROM {full_from} {extra_joins} WHERE {rewritten_where}{group_sql}{having_sql}{order_sql}",
         targets = targets.join(", "),
-        cross_joins = cross_joins.join(" "),
+        extra_joins = extra_joins.join(" "),
     );
 
     pgrx::debug1!(
-        "[pg_trickle] Rewrote scalar subquery in WHERE to CROSS JOIN: {}",
+        "[pg_trickle] Rewrote scalar subquery in WHERE: {}",
         rewritten
     );
 
@@ -4271,6 +4349,358 @@ unsafe fn collect_scalar_sublinks_in_where(
     }
 
     Ok(())
+}
+
+// ── Correlated scalar subquery decorrelation ────────────────────────
+
+/// Information about a decorrelated scalar subquery, ready to be added
+/// as a comma-joined subquery in the outer FROM clause with extra WHERE conditions.
+struct DecorrelatedSubquery {
+    /// The subquery to add to FROM as a comma-separated item.
+    /// e.g., `(SELECT ...) AS "__pgt_sq_1"`
+    from_item: String,
+    /// Additional equality conditions to add to WHERE (decorrelation join).
+    /// e.g., `p_partkey = "__pgt_sq_1"."__pgt_corr_key_1"`
+    extra_where_conditions: Vec<String>,
+    /// The reference to the scalar result column for WHERE replacement.
+    /// e.g., `"__pgt_sq_1"."__pgt_scalar_1"`
+    scalar_ref: String,
+}
+
+/// A correlation condition found in a scalar subquery's WHERE clause.
+struct CorrelationCondition {
+    /// The column name from the outer query (e.g., `p_partkey`).
+    outer_column: String,
+    /// The full inner column expression as SQL (the side that stays in the subquery).
+    /// e.g., `ps_partkey` or `l2.l_partkey`
+    inner_expr_sql: String,
+}
+
+/// Detect whether a scalar subquery is correlated with the outer query by
+/// looking up column names of outer-only tables (tables in the outer FROM
+/// but NOT in the inner FROM) in `pg_catalog`.
+///
+/// Returns a map from column name → table name for outer columns found in
+/// the subquery text. Returns an empty map if not correlated.
+fn detect_correlation_columns(
+    sq: &ScalarSubqueryExtract,
+    outer_tables: &[String],
+) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+
+    // Find tables that appear in the outer FROM but NOT in the inner FROM.
+    let outer_only: Vec<&String> = outer_tables
+        .iter()
+        .filter(|t| !sq.inner_tables.contains(t))
+        .collect();
+
+    if outer_only.is_empty() {
+        return HashMap::new();
+    }
+
+    let sq_lower = sq.subquery_sql.to_lowercase();
+    let mut outer_columns: HashMap<String, String> = HashMap::new();
+
+    let result = pgrx::Spi::connect(|client| {
+        for table_name in &outer_only {
+            let query = format!(
+                "SELECT a.attname::text \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON a.attrelid = c.oid \
+                 LEFT JOIN pg_namespace n ON c.relnamespace = n.oid \
+                 WHERE c.relname = '{}' \
+                 AND (n.nspname = 'public' OR n.nspname = current_schema()) \
+                 AND a.attnum > 0 AND NOT a.attisdropped",
+                table_name.replace('\'', "''")
+            );
+            let rows = client.select(&query, None, &[])?;
+            for row in rows {
+                if let Some(col_name) = row.get::<String>(1)? {
+                    let col_lower = col_name.to_lowercase();
+                    if contains_word_boundary(&sq_lower, &col_lower) {
+                        outer_columns.insert(col_lower, table_name.to_string());
+                    }
+                }
+            }
+        }
+        Ok::<_, pgrx::spi::Error>(())
+    });
+
+    if result.is_err() {
+        return std::collections::HashMap::new();
+    }
+    outer_columns
+}
+
+/// Strip a leading table qualifier from a column reference.
+///
+/// e.g., `"l2.l_partkey"` → `"l_partkey"`, `"ps_partkey"` → `"ps_partkey"`.
+fn strip_table_qualifier(expr: &str) -> String {
+    if let Some(dot_pos) = expr.find('.') {
+        expr[dot_pos + 1..].to_string()
+    } else {
+        expr.to_string()
+    }
+}
+
+/// Check if `word` appears as a whole word in `text`.
+///
+/// A word boundary is defined as the start/end of string or a character
+/// that is not alphanumeric and not underscore (since SQL identifiers
+/// can contain underscores).
+fn contains_word_boundary(text: &str, word: &str) -> bool {
+    let text_bytes = text.as_bytes();
+    let word_len = word.len();
+    let mut start = 0;
+    while start + word_len <= text.len() {
+        if let Some(pos) = text[start..].find(word) {
+            let abs_pos = start + pos;
+            let before_ok = abs_pos == 0 || {
+                let c = text_bytes[abs_pos - 1];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            let after_pos = abs_pos + word_len;
+            let after_ok = after_pos >= text.len() || {
+                let c = text_bytes[after_pos];
+                !c.is_ascii_alphanumeric() && c != b'_'
+            };
+            if before_ok && after_ok {
+                return true;
+            }
+            start = abs_pos + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Flatten a WHERE clause AND tree into individual conditions.
+///
+/// Recursively unpacks `BoolExpr(AND, args)` nodes, collecting leaf
+/// condition nodes.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree `Node`.
+unsafe fn flatten_and_conditions(node: *mut pg_sys::Node, out: &mut Vec<*mut pg_sys::Node>) {
+    if node.is_null() {
+        return;
+    }
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
+        if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR && !boolexpr.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
+            for arg_ptr in args.iter_ptr() {
+                if !arg_ptr.is_null() {
+                    unsafe { flatten_and_conditions(arg_ptr, out) };
+                }
+            }
+            return;
+        }
+    }
+    out.push(node);
+}
+
+/// Check if a WHERE condition node is an equality between a bare outer column
+/// and an inner expression. Returns the correlation info if so.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree `Node`.
+unsafe fn check_correlation_condition(
+    node: *mut pg_sys::Node,
+    outer_columns: &std::collections::HashMap<String, String>,
+) -> Option<CorrelationCondition> {
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
+        return None;
+    }
+    let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+    if aexpr.kind != pg_sys::A_Expr_Kind::AEXPR_OP {
+        return None;
+    }
+    let op_name = unsafe { extract_operator_name(aexpr.name) }.ok()?;
+    if op_name != "=" {
+        return None;
+    }
+    let left_expr = unsafe { node_to_expr(aexpr.lexpr) }.ok()?;
+    let right_expr = unsafe { node_to_expr(aexpr.rexpr) }.ok()?;
+
+    // Check if left side is a bare outer column
+    if let Expr::ColumnRef {
+        table_alias: None,
+        ref column_name,
+    } = left_expr
+        && outer_columns.contains_key(&column_name.to_lowercase())
+    {
+        return Some(CorrelationCondition {
+            outer_column: column_name.clone(),
+            inner_expr_sql: right_expr.to_sql(),
+        });
+    }
+
+    // Check if right side is a bare outer column
+    if let Expr::ColumnRef {
+        table_alias: None,
+        ref column_name,
+    } = right_expr
+        && outer_columns.contains_key(&column_name.to_lowercase())
+    {
+        return Some(CorrelationCondition {
+            outer_column: column_name.clone(),
+            inner_expr_sql: left_expr.to_sql(),
+        });
+    }
+
+    None
+}
+
+/// Decorrelate a correlated scalar subquery into an INNER JOIN.
+///
+/// Given a correlated scalar subquery like:
+/// ```sql
+/// (SELECT MIN(ps_supplycost) FROM partsupp, ... WHERE p_partkey = ps_partkey AND ...)
+/// ```
+///
+/// Produces:
+/// ```sql
+/// INNER JOIN (SELECT ps_partkey AS "__pgt_corr_key_1",
+///             MIN(ps_supplycost) AS "__pgt_scalar_1"
+///             FROM partsupp, ... WHERE ... GROUP BY ps_partkey)
+///     AS "__pgt_sq_1" ON p_partkey = "__pgt_sq_1"."__pgt_corr_key_1"
+/// ```
+fn decorrelate_scalar_subquery(
+    sq: &ScalarSubqueryExtract,
+    outer_columns: &std::collections::HashMap<String, String>,
+    idx: usize,
+) -> Result<DecorrelatedSubquery, PgTrickleError> {
+    use std::ffi::CString;
+
+    let sq_alias = format!("__pgt_sq_{idx}");
+    let scalar_alias = format!("__pgt_scalar_{idx}");
+
+    // Re-parse the inner subquery to get AST access
+    let c_sql = CString::new(sq.subquery_sql.as_str())
+        .map_err(|_| PgTrickleError::QueryParseError("Subquery contains null bytes".into()))?;
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_sql.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Err(PgTrickleError::QueryParseError(
+            "Failed to re-parse scalar subquery for decorrelation".into(),
+        ));
+    }
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = list.head().ok_or_else(|| {
+        PgTrickleError::QueryParseError("Empty parse tree for scalar subquery".into())
+    })?;
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Err(PgTrickleError::QueryParseError(
+            "Scalar subquery is not a SelectStmt".into(),
+        ));
+    }
+    let inner_select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // ── Flatten WHERE into AND-ed conditions ─────────────────────────
+    let mut conditions: Vec<*mut pg_sys::Node> = Vec::new();
+    if !inner_select.whereClause.is_null() {
+        unsafe { flatten_and_conditions(inner_select.whereClause, &mut conditions) };
+    }
+
+    // ── Separate correlation vs. regular conditions ──────────────────
+    let mut correlations: Vec<CorrelationCondition> = Vec::new();
+    let mut regular_conditions: Vec<String> = Vec::new();
+
+    for cond_node in &conditions {
+        if let Some(corr) = unsafe { check_correlation_condition(*cond_node, outer_columns) } {
+            correlations.push(corr);
+        } else {
+            let expr = unsafe { node_to_expr(*cond_node) }
+                .map(|e| e.to_sql())
+                .unwrap_or_else(|_| "TRUE".to_string());
+            regular_conditions.push(expr);
+        }
+    }
+
+    if correlations.is_empty() {
+        return Err(PgTrickleError::QueryParseError(
+            "No correlation conditions found in scalar subquery".into(),
+        ));
+    }
+
+    // ── Extract the original target list (scalar expression) ─────────
+    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
+    let mut original_target_exprs: Vec<String> = Vec::new();
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+        let expr = unsafe { node_to_expr(rt.val) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "NULL".to_string());
+        original_target_exprs.push(expr);
+    }
+
+    // ── FROM clause (unchanged) ──────────────────────────────────────
+    let from_sql = extract_from_clause_sql(inner_select)?;
+
+    // ── Build decorrelated SELECT items ──────────────────────────────
+    let mut select_items: Vec<String> = Vec::new();
+    let mut group_by_items: Vec<String> = Vec::new();
+    let mut extra_where_conds: Vec<String> = Vec::new();
+
+    for (j, corr) in correlations.iter().enumerate() {
+        let key_alias = format!("__pgt_corr_key_{}", j + 1);
+        // Strip table qualifier from inner expression to avoid alias scoping
+        // issues in DVM delta queries (e.g., "l2.l_partkey" → "l_partkey").
+        let inner_col_unqualified = strip_table_qualifier(&corr.inner_expr_sql);
+        select_items.push(format!("{} AS \"{}\"", inner_col_unqualified, key_alias));
+        group_by_items.push(inner_col_unqualified);
+        extra_where_conds.push(format!(
+            "{} = \"{}\".\"{}\"",
+            corr.outer_column, sq_alias, key_alias
+        ));
+    }
+
+    // The original scalar expression becomes the scalar alias
+    let scalar_expr = original_target_exprs.join(", ");
+    select_items.push(format!("{} AS \"{}\"", scalar_expr, scalar_alias));
+
+    // ── WHERE clause (without correlation conditions) ─────────────────
+    let where_sql = if regular_conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", regular_conditions.join(" AND "))
+    };
+
+    // ── GROUP BY ─────────────────────────────────────────────────────
+    let group_by_sql = format!(" GROUP BY {}", group_by_items.join(", "));
+
+    // ── Assemble decorrelated subquery ───────────────────────────────
+    let decorrelated_sql = format!(
+        "SELECT {} FROM {}{}{}",
+        select_items.join(", "),
+        from_sql,
+        where_sql,
+        group_by_sql,
+    );
+
+    // Use comma-join (not INNER JOIN) to avoid SQL precedence issues
+    // when the outer FROM uses comma-separated tables.
+    let from_item = format!("({decorrelated_sql}) AS \"{sq_alias}\"");
+
+    let scalar_ref = format!("\"{sq_alias}\".\"{scalar_alias}\"");
+
+    pgrx::debug1!("[pg_trickle] Decorrelated scalar subquery: {}", from_item);
+
+    Ok(DecorrelatedSubquery {
+        from_item,
+        extra_where_conditions: extra_where_conds,
+        scalar_ref,
+    })
 }
 
 // ── SubLinks inside OR → OR-to-UNION rewrite ───────────────────────
@@ -6699,6 +7129,27 @@ unsafe fn parse_select_stmt(
                 child: Box::new(tree),
             };
         }
+
+        // ── Predicate pushdown into cross joins ────────────────────
+        // Comma-separated FROM items create InnerJoin(TRUE, ...) chains.
+        // Promote eligible predicates from the Filter into appropriate
+        // JOIN ON clauses, converting cross joins to equi-joins.
+        //
+        // DISABLED: two remaining issues prevent enabling this:
+        //  (a) Correlated scalar subqueries (Q17) — promoted predicates
+        //      remove column refs that the scalar subquery correlation
+        //      still needs, causing "column X does not exist" errors.
+        //  (b) The quoting fix in Expr::to_sql() resolves the "syntax
+        //      error at or near '.'" from reserved-keyword aliases, but
+        //      Q07 still shows revenue drift even with pushdown enabled.
+        //      The Q07 root cause is not L₀/L₁ double-counting — all
+        //      right sides (customer, nation) are static in TPC-H RF.
+        //      The issue is deeper (possibly aggregate or MERGE layer).
+        //
+        // To re-enable: fix (a) by skipping pushdown when the Filter
+        // predicate contains ScalarSubquery/SubLink references, and
+        // investigate (b) in the aggregate diff or MERGE pipeline.
+        // tree = push_filter_into_cross_joins(tree);
     }
 
     // ── Step 3: Parse GROUP BY + aggregates ─────────────────────────────
@@ -10227,6 +10678,324 @@ fn is_star_only(exprs: &[Expr]) -> bool {
     exprs.len() == 1 && matches!(exprs[0], Expr::Star { table_alias: None })
 }
 
+// ── Predicate pushdown into cross joins ──────────────────────────────────
+//
+// Comma-separated FROM items produce a left-deep InnerJoin chain with
+// `condition = Literal("TRUE")`.  The WHERE clause predicates are placed
+// in a single Filter above the entire chain.
+//
+// This pass promotes predicates from the Filter into the appropriate
+// JOIN ON clauses.  Benefits:
+//
+//  1. Eliminates cross-product intermediates in delta CTEs
+//  2. Enables semi-join optimisation in diff_inner_join
+//  3. Fixes Part 3 correction accuracy for multi-table joins (Q07)
+//
+// Algorithm:
+//   a) Split the filter predicate into AND-connected parts.
+//   b) For each part, collect referenced source-table aliases.
+//   c) Walk the InnerJoin chain top-down. At each level, if the right
+//      child contains any alias referenced by the predicate, that is
+//      the level to attach it (all remaining aliases are guaranteed to
+//      be in the left subtree of a left-deep chain).
+//   d) Any predicate that can't be promoted stays in the Filter.
+
+/// Push filter predicates down into cross-join ON clauses.
+fn push_filter_into_cross_joins(tree: OpTree) -> OpTree {
+    let OpTree::Filter { predicate, child } = tree else {
+        return tree;
+    };
+
+    // Quick check: does the child contain any cross join?
+    if !has_cross_join(&child) {
+        return OpTree::Filter { predicate, child };
+    }
+
+    // Split predicate into AND-connected parts
+    let parts = split_and_predicates(predicate);
+
+    // Classify parts: collect referenced source aliases for each
+    let mut to_promote: Vec<(Expr, Vec<String>)> = Vec::new();
+    let mut remaining: Vec<Expr> = Vec::new();
+
+    for part in parts {
+        let mut aliases = Vec::new();
+        collect_expr_source_aliases(&part, &child, &mut aliases);
+        aliases.sort();
+        aliases.dedup();
+
+        if aliases.len() >= 2 {
+            // References multiple source tables — promote into the join
+            to_promote.push((part, aliases));
+        } else {
+            // Single-table predicate or can't determine — keep as filter
+            remaining.push(part);
+        }
+    }
+
+    if to_promote.is_empty() {
+        // Nothing to promote — rebuild the original Filter
+        return OpTree::Filter {
+            predicate: join_and_predicates(remaining),
+            child,
+        };
+    }
+
+    // Promote each predicate into the join chain
+    let mut new_tree = *child;
+    for (pred, aliases) in to_promote {
+        new_tree = promote_predicate(new_tree, pred, &aliases);
+    }
+
+    // Wrap remaining predicates (if any)
+    if remaining.is_empty() {
+        new_tree
+    } else {
+        OpTree::Filter {
+            predicate: join_and_predicates(remaining),
+            child: Box::new(new_tree),
+        }
+    }
+}
+
+/// Check if an OpTree contains any InnerJoin with condition = Literal("TRUE").
+fn has_cross_join(op: &OpTree) -> bool {
+    match op {
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+            ..
+        } => {
+            matches!(condition, Expr::Literal(s) if s == "TRUE")
+                || has_cross_join(left)
+                || has_cross_join(right)
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => has_cross_join(child),
+        OpTree::SemiJoin { left, .. } | OpTree::AntiJoin { left, .. } => has_cross_join(left),
+        _ => false,
+    }
+}
+
+/// Split an AND-connected expression into its individual conjuncts.
+fn split_and_predicates(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp { op, left, right } if op.eq_ignore_ascii_case("AND") => {
+            let mut parts = split_and_predicates(*left);
+            parts.extend(split_and_predicates(*right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
+/// Join predicates with AND. Panics if the slice is empty.
+fn join_and_predicates(parts: Vec<Expr>) -> Expr {
+    let mut iter = parts.into_iter();
+    let mut result = iter.next().expect("at least one predicate required");
+    for part in iter {
+        result = Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(result),
+            right: Box::new(part),
+        };
+    }
+    result
+}
+
+/// Collect all source-table aliases referenced by column refs in an expression.
+///
+/// For qualified column refs (`n1.n_name`), the table alias is used directly
+/// if it matches a Scan in the tree.  For unqualified refs (`s_suppkey`),
+/// the tree is searched to find which Scan owns the column.
+fn collect_expr_source_aliases(expr: &Expr, tree: &OpTree, aliases: &mut Vec<String>) {
+    match expr {
+        Expr::ColumnRef {
+            table_alias: Some(tbl),
+            column_name: _,
+        } => {
+            // Verify the alias exists somewhere in the tree
+            if scan_has_alias(tree, tbl) {
+                aliases.push(tbl.clone());
+            }
+        }
+        Expr::ColumnRef {
+            table_alias: None,
+            column_name,
+        } => {
+            if let Some(alias) = find_scan_for_column(tree, column_name) {
+                aliases.push(alias);
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr_source_aliases(left, tree, aliases);
+            collect_expr_source_aliases(right, tree, aliases);
+        }
+        Expr::FuncCall { args, .. } => {
+            for arg in args {
+                collect_expr_source_aliases(arg, tree, aliases);
+            }
+        }
+        Expr::Raw(sql) => {
+            // Best-effort: look for `alias.column` patterns in raw SQL.
+            // This won't catch everything but handles common cases.
+            for alias in collect_tree_scan_aliases(tree) {
+                if sql.contains(&format!("{}.", alias)) || sql.contains(&format!("\"{}\".", alias))
+                {
+                    aliases.push(alias);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if the tree contains a Scan with the given alias.
+fn scan_has_alias(op: &OpTree, alias: &str) -> bool {
+    match op {
+        OpTree::Scan { alias: a, .. } => a == alias,
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => {
+            scan_has_alias(left, alias) || scan_has_alias(right, alias)
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => scan_has_alias(child, alias),
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            scan_has_alias(child, alias)
+        }
+        _ => false,
+    }
+}
+
+/// Find which Scan node owns a given column name.
+fn find_scan_for_column(op: &OpTree, column_name: &str) -> Option<String> {
+    match op {
+        OpTree::Scan { alias, columns, .. } => {
+            if columns.iter().any(|c| c.name == column_name) {
+                Some(alias.clone())
+            } else {
+                None
+            }
+        }
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => find_scan_for_column(left, column_name)
+            .or_else(|| find_scan_for_column(right, column_name)),
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => find_scan_for_column(child, column_name),
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            find_scan_for_column(child, column_name)
+        }
+        _ => None,
+    }
+}
+
+/// Collect all Scan aliases in the tree.
+fn collect_tree_scan_aliases(op: &OpTree) -> Vec<String> {
+    match op {
+        OpTree::Scan { alias, .. } => vec![alias.clone()],
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. }
+        | OpTree::SemiJoin { left, right, .. }
+        | OpTree::AntiJoin { left, right, .. } => {
+            let mut v = collect_tree_scan_aliases(left);
+            v.extend(collect_tree_scan_aliases(right));
+            v
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. } => collect_tree_scan_aliases(child),
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            collect_tree_scan_aliases(child)
+        }
+        _ => vec![],
+    }
+}
+
+/// Promote a predicate into the appropriate InnerJoin level.
+///
+/// Walks a left-deep InnerJoin chain top-down.  At each level, if the
+/// right child contains any alias referenced by the predicate, this is
+/// the level to attach it (the left subtree contains all other aliases).
+fn promote_predicate(tree: OpTree, pred: Expr, aliases: &[String]) -> OpTree {
+    match tree {
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            // Check if the right child contains any of the referenced aliases
+            let right_has_alias = aliases.iter().any(|a| scan_has_alias(&right, a));
+
+            if right_has_alias && matches!(&condition, Expr::Literal(s) if s == "TRUE") {
+                // Promote: replace TRUE with the predicate
+                OpTree::InnerJoin {
+                    condition: pred,
+                    left,
+                    right,
+                }
+            } else if right_has_alias {
+                // Already has a condition — combine with AND
+                OpTree::InnerJoin {
+                    condition: Expr::BinaryOp {
+                        op: "AND".to_string(),
+                        left: Box::new(condition),
+                        right: Box::new(pred),
+                    },
+                    left,
+                    right,
+                }
+            } else {
+                // The right child doesn't have any referenced alias.
+                // Recurse into the left child (which is the deeper part
+                // of the left-deep chain).
+                OpTree::InnerJoin {
+                    condition,
+                    left: Box::new(promote_predicate(*left, pred, aliases)),
+                    right,
+                }
+            }
+        }
+        // Pass through transparent wrappers (SemiJoin/AntiJoin wrap the join chain)
+        OpTree::SemiJoin {
+            condition,
+            left,
+            right,
+        } => OpTree::SemiJoin {
+            condition,
+            left: Box::new(promote_predicate(*left, pred, aliases)),
+            right,
+        },
+        OpTree::AntiJoin {
+            condition,
+            left,
+            right,
+        } => OpTree::AntiJoin {
+            condition,
+            left: Box::new(promote_predicate(*left, pred, aliases)),
+            right,
+        },
+        // Can't promote further — shouldn't happen in well-formed trees
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10277,7 +11046,7 @@ mod tests {
     #[test]
     fn test_expr_column_ref_qualified() {
         let e = qualified_col("orders", "id");
-        assert_eq!(e.to_sql(), "orders.id");
+        assert_eq!(e.to_sql(), "\"orders\".\"id\"");
     }
 
     #[test]
@@ -11924,21 +12693,21 @@ mod tests {
     fn test_rewrite_aliases_column_ref_left() {
         let e = qualified_col("a", "id");
         let rewritten = e.rewrite_aliases("a", "new_a", "b", "new_b");
-        assert_eq!(rewritten.to_sql(), "new_a.id");
+        assert_eq!(rewritten.to_sql(), "\"new_a\".\"id\"");
     }
 
     #[test]
     fn test_rewrite_aliases_column_ref_right() {
         let e = qualified_col("b", "name");
         let rewritten = e.rewrite_aliases("a", "new_a", "b", "new_b");
-        assert_eq!(rewritten.to_sql(), "new_b.name");
+        assert_eq!(rewritten.to_sql(), "\"new_b\".\"name\"");
     }
 
     #[test]
     fn test_rewrite_aliases_unknown_alias_unchanged() {
         let e = qualified_col("c", "val");
         let rewritten = e.rewrite_aliases("a", "new_a", "b", "new_b");
-        assert_eq!(rewritten.to_sql(), "c.val");
+        assert_eq!(rewritten.to_sql(), "\"c\".\"val\"");
     }
 
     #[test]
@@ -11956,7 +12725,7 @@ mod tests {
             right: Box::new(qualified_col("b", "id")),
         };
         let rewritten = e.rewrite_aliases("a", "x", "b", "y");
-        assert_eq!(rewritten.to_sql(), "(x.id = y.id)");
+        assert_eq!(rewritten.to_sql(), "(\"x\".\"id\" = \"y\".\"id\")");
     }
 
     #[test]
@@ -11966,7 +12735,10 @@ mod tests {
             args: vec![qualified_col("a", "x"), qualified_col("b", "y")],
         };
         let rewritten = e.rewrite_aliases("a", "left", "b", "right");
-        assert_eq!(rewritten.to_sql(), "coalesce(left.x, right.y)");
+        assert_eq!(
+            rewritten.to_sql(),
+            "coalesce(\"left\".\"x\", \"right\".\"y\")"
+        );
     }
 
     #[test]
@@ -13769,5 +14541,255 @@ mod tests {
         assert!(cross_join.contains("avg(amount)"));
         assert!(cross_join.contains("__pgt_sq_1"));
         assert!(cross_join.contains("__pgt_scalar_1"));
+    }
+
+    // ── contains_word_boundary tests ────────────────────────────────
+
+    #[test]
+    fn test_contains_word_boundary_basic() {
+        assert!(contains_word_boundary(
+            "p_partkey = ps_partkey",
+            "p_partkey"
+        ));
+        assert!(contains_word_boundary(
+            "p_partkey = ps_partkey",
+            "ps_partkey"
+        ));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_at_start_end() {
+        assert!(contains_word_boundary("p_partkey", "p_partkey"));
+        assert!(contains_word_boundary("foo p_partkey", "p_partkey"));
+        assert!(contains_word_boundary("p_partkey foo", "p_partkey"));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_no_match_substring() {
+        // "p_partkey" should NOT match inside "ps_partkey" — the 's' before
+        // is alphanumeric so it's not a word boundary.
+        assert!(!contains_word_boundary("ps_partkey", "p_partkey"));
+        // "l_quantity" should not match in "xl_quantity"
+        assert!(!contains_word_boundary("xl_quantity", "l_quantity"));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_with_operators() {
+        assert!(contains_word_boundary(
+            "where p_partkey = ps_partkey and s_suppkey = ps_suppkey",
+            "p_partkey"
+        ));
+        // Quoted identifiers
+        assert!(contains_word_boundary(
+            "\"p_partkey\" = \"ps_partkey\"",
+            "p_partkey"
+        ));
+    }
+
+    #[test]
+    fn test_contains_word_boundary_not_found() {
+        assert!(!contains_word_boundary(
+            "select count(*) from orders",
+            "p_partkey"
+        ));
+    }
+
+    // ── Predicate pushdown tests ──────────────────────────────────────
+
+    #[test]
+    fn test_push_filter_two_table_cross_join() {
+        // FROM a, b WHERE a.id = b.id
+        let a = scan_node("a", 1, &["id", "name"]);
+        let b = scan_node("b", 2, &["id", "val"]);
+        let cross = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let filter = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(qualified_col("b", "id")),
+            },
+            child: Box::new(cross),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // Should become InnerJoin with the condition promoted
+        match &result {
+            OpTree::InnerJoin { condition, .. } => {
+                // Condition should contain "a.id = b.id" (not TRUE)
+                assert_ne!(condition.to_sql(), "TRUE");
+                assert!(condition.to_sql().contains("="));
+            }
+            _ => panic!("Expected InnerJoin, got {:?}", result.node_kind()),
+        }
+    }
+
+    #[test]
+    fn test_push_filter_three_table_cross_join() {
+        // FROM a, b, c WHERE a.x = b.x AND b.y = c.y
+        let a = scan_node("a", 1, &["x"]);
+        let b = scan_node("b", 2, &["x", "y"]);
+        let c = scan_node("c", 3, &["y"]);
+        let inner = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let outer = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(inner),
+            right: Box::new(c),
+        };
+        let pred = Expr::BinaryOp {
+            op: "AND".into(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "x")),
+                right: Box::new(qualified_col("b", "x")),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("b", "y")),
+                right: Box::new(qualified_col("c", "y")),
+            }),
+        };
+        let filter = OpTree::Filter {
+            predicate: pred,
+            child: Box::new(outer),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // Outer join should have b.y = c.y (c is right child)
+        // Inner join should have a.x = b.x (b is right child)
+        // No filter should remain
+        match &result {
+            OpTree::InnerJoin {
+                condition: outer_cond,
+                left,
+                ..
+            } => {
+                assert!(
+                    outer_cond.to_sql().contains("y"),
+                    "outer: {}",
+                    outer_cond.to_sql()
+                );
+                match left.as_ref() {
+                    OpTree::InnerJoin {
+                        condition: inner_cond,
+                        ..
+                    } => {
+                        assert!(
+                            inner_cond.to_sql().contains("x"),
+                            "inner: {}",
+                            inner_cond.to_sql()
+                        );
+                    }
+                    _ => panic!("Expected inner InnerJoin"),
+                }
+            }
+            _ => panic!("Expected InnerJoin, got {:?}", result.node_kind()),
+        }
+    }
+
+    #[test]
+    fn test_push_filter_preserves_single_table_predicate() {
+        // FROM a, b WHERE a.id = b.id AND a.name = 'foo'
+        let a = scan_node("a", 1, &["id", "name"]);
+        let b = scan_node("b", 2, &["id"]);
+        let cross = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let pred = Expr::BinaryOp {
+            op: "AND".into(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(qualified_col("b", "id")),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "name")),
+                right: Box::new(Expr::Literal("'foo'".into())),
+            }),
+        };
+        let filter = OpTree::Filter {
+            predicate: pred,
+            child: Box::new(cross),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // The join predicate should be promoted; single-table pred stays as Filter
+        match &result {
+            OpTree::Filter {
+                predicate: remaining,
+                child,
+            } => {
+                // Remaining filter: a.name = 'foo'
+                assert!(remaining.to_sql().contains("name"));
+                match child.as_ref() {
+                    OpTree::InnerJoin { condition, .. } => {
+                        assert_ne!(condition.to_sql(), "TRUE");
+                    }
+                    _ => panic!("Expected InnerJoin inside Filter"),
+                }
+            }
+            _ => panic!("Expected Filter wrapper for single-table predicate"),
+        }
+    }
+
+    #[test]
+    fn test_push_filter_no_cross_join_passthrough() {
+        // Filter over a proper join — should pass through unchanged
+        let a = scan_node("a", 1, &["id"]);
+        let b = scan_node("b", 2, &["id"]);
+        let join = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(qualified_col("b", "id")),
+            },
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let filter = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: ">".into(),
+                left: Box::new(qualified_col("a", "id")),
+                right: Box::new(Expr::Literal("10".into())),
+            },
+            child: Box::new(join),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        assert!(matches!(result, OpTree::Filter { .. }));
+    }
+
+    #[test]
+    fn test_push_filter_unqualified_columns() {
+        // FROM a, b WHERE x = y (unqualified columns resolved by scan)
+        let a = scan_node("a", 1, &["x"]);
+        let b = scan_node("b", 2, &["y"]);
+        let cross = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".into()),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+        let filter = OpTree::Filter {
+            predicate: Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(col("x")),
+                right: Box::new(col("y")),
+            },
+            child: Box::new(cross),
+        };
+        let result = push_filter_into_cross_joins(filter);
+        // Should promote the predicate (both sides resolve to different scans)
+        match &result {
+            OpTree::InnerJoin { condition, .. } => {
+                assert_ne!(condition.to_sql(), "TRUE");
+            }
+            _ => panic!("Expected InnerJoin with promoted condition"),
+        }
     }
 }

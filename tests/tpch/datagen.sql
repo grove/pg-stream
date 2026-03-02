@@ -1,4 +1,9 @@
--- TPC-H Data Generator — pure SQL, no external tools.
+-- TPC-H-derived data generator — pure SQL, no external tools.
+--
+-- This data generator is inspired by the TPC-H Benchmark specification but
+-- uses custom SQL-based generation (not the TPC reference `dbgen` tool).
+-- Results do not constitute a TPC-H Benchmark result. "TPC-H" is a
+-- trademark of the Transaction Processing Performance Council (tpc.org).
 --
 -- Generates TPC-H-like data using generate_series with deterministic
 -- pseudo-random distributions. Parameterized by a scale factor (SF)

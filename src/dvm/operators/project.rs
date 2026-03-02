@@ -9,7 +9,7 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
-use crate::dvm::parser::{Expr, OpTree, join_pk_expr_indices};
+use crate::dvm::parser::{Expr, OpTree, join_pk_expr_indices, unwrap_transparent};
 use crate::error::PgTrickleError;
 
 /// Differentiate a Project node.
@@ -64,12 +64,16 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
     // We must reference the SOURCE column names (from child CTE), not the
     // aliases, since SQL doesn't allow referencing aliases defined in the
     // same SELECT clause.
+    // Look through transparent wrappers (Filter, Subquery) to find the
+    // underlying child node. Q15 has Project > Filter > InnerJoin — the
+    // Filter must not prevent PK-based row_ids or lateral detection.
+    let unwrapped = unwrap_transparent(child);
     let is_join_child = matches!(
-        child.as_ref(),
+        unwrapped,
         OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. }
     );
     let is_lateral_child = matches!(
-        child.as_ref(),
+        unwrapped,
         OpTree::LateralFunction { .. } | OpTree::LateralSubquery { .. }
     );
 
@@ -77,7 +81,7 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
         // Use PK-corresponding expressions for hashing — PK-based row_ids
         // are stable across value changes, avoiding hash mismatch when
         // both join sides change simultaneously.
-        let pk_indices = join_pk_expr_indices(expressions, child);
+        let pk_indices = join_pk_expr_indices(expressions, unwrapped);
         let hash_exprs: Vec<&Expr> = if pk_indices.is_empty() {
             // Fallback: hash all expressions (no PK info available)
             expressions.iter().collect()
@@ -179,7 +183,7 @@ fn resolve_expr_to_child(expr: &Expr, child_cols: &[String]) -> String {
         Expr::BinaryOp { op, left, right } => {
             let l = resolve_expr_to_child(left, child_cols);
             let r = resolve_expr_to_child(right, child_cols);
-            format!("{l} {op} {r}")
+            format!("({l} {op} {r})")
         }
         Expr::FuncCall { func_name, args } => {
             let resolved_args: Vec<String> = args

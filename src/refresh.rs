@@ -240,6 +240,113 @@ fn drain_pending_cleanups() {
     }
 }
 
+/// Frontier-based cleanup: delete stale change buffer rows using the persisted
+/// frontier in `pgt_stream_tables` rather than thread-local state.
+///
+/// This complements `drain_pending_cleanups` by handling the case where the
+/// deferred cleanup was queued on a different PostgreSQL backend process
+/// (e.g., when a connection pool dispatches successive refresh calls to
+/// different backends).
+///
+/// For each source OID, computes the minimum frontier LSN across ALL stream
+/// tables that depend on it, then deletes change buffer entries at or below
+/// that threshold.  This is safe because all consumers have already advanced
+/// past those entries.
+fn cleanup_change_buffers_by_frontier(change_schema: &str, source_oids: &[u32]) {
+    if source_oids.is_empty() {
+        return;
+    }
+
+    let use_truncate = crate::config::pg_trickle_cleanup_use_truncate();
+
+    for &oid in source_oids {
+        // Check that the change buffer table exists
+        let table_exists = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(\
+               SELECT 1 FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE n.nspname = '{schema}' \
+                 AND c.relname = 'changes_{oid}' \
+                 AND c.relkind = 'r'\
+             )",
+            schema = change_schema,
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        if !table_exists {
+            continue;
+        }
+
+        // Compute the minimum frontier LSN across ALL stream tables that
+        // depend on this source OID.
+        let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
+            "SELECT MIN((st.frontier->'sources'->'{oid}'->>'lsn')::pg_lsn)::TEXT \
+             FROM pgtrickle.pgt_stream_tables st \
+             JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
+             WHERE dep.source_relid = {oid} \
+               AND dep.source_type = 'TABLE' \
+               AND st.frontier IS NOT NULL \
+               AND st.frontier->'sources'->'{oid}'->>'lsn' IS NOT NULL",
+        ))
+        .unwrap_or(None);
+
+        let safe_lsn = match min_lsn {
+            Some(lsn) if lsn != "0/0" => lsn,
+            _ => continue,
+        };
+
+        // Quick check: are there any entries to clean up?
+        let has_stale = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(\
+               SELECT 1 FROM \"{schema}\".changes_{oid} \
+               WHERE lsn <= '{safe_lsn}'::pg_lsn \
+               LIMIT 1\
+             )",
+            schema = change_schema,
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        if !has_stale {
+            continue;
+        }
+
+        let can_truncate = if use_truncate {
+            Spi::get_one::<bool>(&format!(
+                "SELECT NOT EXISTS(\
+                   SELECT 1 FROM \"{schema}\".changes_{oid} \
+                   WHERE lsn > '{safe_lsn}'::pg_lsn \
+                   LIMIT 1\
+                 )",
+                schema = change_schema,
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+        } else {
+            false
+        };
+
+        if can_truncate {
+            if let Err(e) = Spi::run(&format!(
+                "TRUNCATE \"{schema}\".changes_{oid}",
+                schema = change_schema,
+            )) {
+                pgrx::debug1!("[pg_trickle] Frontier-based cleanup TRUNCATE failed: {}", e);
+            }
+        } else {
+            let delete_sql = format!(
+                "DELETE FROM \"{schema}\".changes_{oid} \
+                 WHERE lsn <= '{safe_lsn}'::pg_lsn",
+                schema = change_schema,
+            );
+            if let Err(e) = Spi::run(&delete_sql) {
+                pgrx::debug1!("[pg_trickle] Frontier-based cleanup DELETE failed: {}", e);
+            }
+        }
+    }
+}
+
 /// Flush pending cleanup entries that reference any of the given source OIDs.
 ///
 /// Called during `drop_stream_table` to prevent stale cleanup entries from
@@ -828,6 +935,16 @@ pub fn execute_differential_refresh(
     // before we check for new changes.
     drain_pending_cleanups();
 
+    // C-1b: Frontier-based cleanup — always runs regardless of thread-local
+    // state.  The deferred cleanup (above) relies on PENDING_CLEANUP in
+    // thread-local storage, which is lost when a connection pool dispatches
+    // successive refresh calls to different PostgreSQL backend processes.
+    // This additional pass uses the catalog frontier (persisted in
+    // pgt_stream_tables.frontier) to compute the safe cleanup threshold,
+    // ensuring stale change buffer rows are removed even when the
+    // thread-local queue is empty.
+    cleanup_change_buffers_by_frontier(&change_schema, &catalog_source_oids);
+
     let t_decision_start = Instant::now();
 
     // ── E-1: Ultra-fast EXISTS for no-data short-circuit ─────────────
@@ -1056,6 +1173,7 @@ pub fn execute_differential_refresh(
 
     let resolved = if let Some(entry) = cached {
         // ── Cache hit: resolve LSN placeholders ──────────────────────
+        pgrx::debug1!("[pg_trickle] cache HIT for pgt_id={}", st.pgt_id);
         // Substitute __PGS_PREV/NEW_LSN_{oid}__ tokens with actual values.
         // Each execution gets a fresh plan with accurate LSN selectivity
         // estimates, avoiding the PREPARE/EXECUTE custom-plan penalty.
@@ -1080,6 +1198,7 @@ pub fn execute_differential_refresh(
         }
     } else {
         // ── Cache miss: full pipeline + PREPARE + cache ──────────────
+        pgrx::debug1!("[pg_trickle] cache MISS for pgt_id={}", st.pgt_id);
         let delta_result = dvm::generate_delta_query_cached(
             st.pgt_id,
             &st.defining_query,
@@ -1445,20 +1564,43 @@ pub fn execute_differential_refresh(
         let params = build_execute_params(&resolved.source_oids, prev_frontier, new_frontier);
         let execute_sql = format!("EXECUTE {stmt_name}({params})");
 
+        let parameterized_sql_for_debug = resolved.parameterized_merge_sql.clone();
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&execute_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             Ok::<usize, PgTrickleError>(result.len())
+        })
+        .inspect_err(|_e| {
+            let path = format!("/tmp/pgt_debug_exec_{}.sql", st.pgt_id);
+            let content =
+                format!("-- EXECUTE: {execute_sql}\n-- Template:\n{parameterized_sql_for_debug}");
+            let _ = std::fs::write(&path, &content);
+            pgrx::warning!(
+                "[pg_trickle] EXECUTE failed for pgt_id={}, SQL dumped to {}",
+                st.pgt_id,
+                path
+            );
         })?;
         (n, "merge_prepared")
     } else {
         // ── MERGE path (default for small deltas) ───────────────────
+        let merge_sql_for_debug = resolved.merge_sql.clone();
         let n = Spi::connect_mut(|client| {
             let result = client
                 .update(&resolved.merge_sql, None, &[])
                 .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
             Ok::<usize, PgTrickleError>(result.len())
+        })
+        .inspect_err(|_e| {
+            // Dump failing SQL to /tmp for debugging
+            let path = format!("/tmp/pgt_debug_merge_{}.sql", st.pgt_id);
+            let _ = std::fs::write(&path, &merge_sql_for_debug);
+            pgrx::warning!(
+                "[pg_trickle] MERGE failed for pgt_id={}, SQL dumped to {}",
+                st.pgt_id,
+                path
+            );
         })?;
         (n, "merge")
     };

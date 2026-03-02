@@ -1838,7 +1838,7 @@ mod tests {
         // Base table should be replaced with ST storage
         assert!(sql.contains("\"public\".\"st\" AS \"c\""));
         // Join condition should be preserved (BinaryOp wraps in parens)
-        assert!(sql.contains("(c.parent_id = t.id)"));
+        assert!(sql.contains("(\"c\".\"parent_id\" = \"t\".\"id\")"));
     }
 
     #[test]
@@ -2029,7 +2029,7 @@ mod tests {
             )
         );
         assert!(sql.contains("\"public\".\"st\" AS \"r2\""));
-        assert!(sql.contains("(r1.dst = r2.src)"));
+        assert!(sql.contains("(\"r1\".\"dst\" = \"r2\".\"src\")"));
     }
 
     #[test]
@@ -2720,7 +2720,7 @@ mod tests {
         let sql = sql.expect("Should produce SQL for Project-over-InnerJoin");
         // Project expressions should resolve against the inlined FROM
         assert!(
-            sql.contains("n.id"),
+            sql.contains("\"n\".\"id\""),
             "Should reference n.id from project expressions"
         );
         // Self-ref should be replaced with ST storage
