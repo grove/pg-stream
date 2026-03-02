@@ -46,7 +46,7 @@ Every document has **exactly one** type, expressed as a filename prefix.
 
 Good:
 ```
-PLAN_STREAMING_AGGREGATION.md
+PLAN_TRANSACTIONAL_IVM.md
 REPORT_TRIGGERS_VS_REPLICATION.md
 GAP_ANALYSIS_FELDERA.md
 STATUS_TESTING.md

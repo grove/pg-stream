@@ -597,7 +597,32 @@ SELECT pgivm.create_immv('my_view', 'SELECT a, sum(b) FROM t GROUP BY a');
    (already done for deferred mode).
 3. **Prepared statement reuse** — keep SPI prepared statements across trigger
    invocations within the same transaction.
-4. **Benchmarking suite** — compare pg_trickle IMMEDIATE vs pg_ivm vs
+4. **Aggregate fast-path optimization** — for "pure aggregate" queries
+   (no JOINs, no subqueries, single GROUP BY, all aggregate functions
+   invertible), bypass full delta SQL and emit a single parameterized
+   `UPDATE target SET sum = sum + $1, count = count + 1 WHERE group_key = $2`.
+   This reduces the per-DML cost to a single index-lookup UPDATE.
+
+   Invertible aggregate classification:
+
+   | Aggregate | Invertible | Delta formula |
+   |-----------|-----------|---------------|
+   | `COUNT(*)` | Yes | +1 (INSERT), -1 (DELETE) |
+   | `SUM(expr)` | Yes | +new_val (INSERT), -old_val (DELETE) |
+   | `AVG(expr)` | Partial | Maintain (sum, count) pair; derive avg |
+   | `MIN(expr)` | No | Removal of minimum requires full scan |
+   | `MAX(expr)` | No | Removal of maximum requires full scan |
+   | `COUNT(DISTINCT)` | No | Requires set state |
+   | `ARRAY_AGG` | No | Requires ordered state |
+   | `PERCENTILE_*` | No | Requires sorted state |
+   | `BOOL_AND/OR` | No | Removal requires full scan |
+
+   Only queries where **all** aggregates are invertible qualify. Add a
+   GROUP BY cardinality guard: if the estimated number of groups exceeds
+   a threshold (e.g. 100K), fall back to standard delta SQL to avoid
+   per-row UPDATE overhead exceeding batch delta cost.
+
+5. **Benchmarking suite** — compare pg_trickle IMMEDIATE vs pg_ivm vs
    deferred refresh on standard workloads.
 
 ---
