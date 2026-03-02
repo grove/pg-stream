@@ -832,11 +832,11 @@ Add to `tests/e2e_diamond_tests.rs`:
 | 1 — Data structures | `dag.rs` | — | `just lint` | ✅ Done |
 | 2 — Diamond detection | `dag.rs` | Step 1 | `just test-unit` | ✅ Done |
 | 3 — Consistency groups | `dag.rs` | Step 2 | `just test-unit` | ✅ Done |
-| 4 — Catalog + GUC | `catalog.rs`, `config.rs`, `api.rs` | Step 3 | `just test-integration` | ⬜ Next |
-| 5 — Scheduler wiring | `scheduler.rs` | Steps 3, 4 | `just lint` | ⬜ |
-| 6 — Monitoring function | `api.rs` | Steps 3, 5 | `just lint` | ⬜ |
-| 7 — E2E tests | `tests/e2e_diamond_tests.rs` | Steps 5, 6 | `just test-e2e` | ⬜ |
-| 8 — Documentation | `docs/`, `CHANGELOG.md` | Steps 1–7 | `just test-all` | ⬜ |
+| 4 — Catalog + GUC | `catalog.rs`, `config.rs`, `api.rs`, `lib.rs` | Step 3 | `just test-integration` | ✅ Done |
+| 5 — Scheduler wiring | `scheduler.rs` | Steps 3, 4 | `just lint` | ✅ Done |
+| 6 — Monitoring function | `api.rs` | Steps 3, 5 | `just lint` | ✅ Done |
+| 7 — E2E tests | `tests/e2e_diamond_tests.rs` | Steps 5, 6 | `just test-e2e` | ✅ Done |
+| 8 — Documentation | `docs/`, `CHANGELOG.md` | Steps 1–7 | `just test-all` | ⬜ Next |
 
 ### What Was Implemented (2026-03-02)
 
@@ -866,16 +866,56 @@ Steps 1–3 completed in `src/dag.rs`:
 
 All 965 unit tests pass. `just fmt && just lint` clean.
 
+### What Was Implemented (Steps 4–7)
+
+Steps 4–7 completed across multiple files:
+
+**Step 4 — Catalog + GUC:**
+- **`DiamondConsistency` enum** in `dag.rs` — `None` / `Atomic` variants
+  with `as_str()`, `from_sql_str()`, `Display`.
+- **`PGS_DIAMOND_CONSISTENCY` GUC** in `config.rs` — string GUC defaulting
+  to `"none"`, registered as `pg_trickle.diamond_consistency`.
+- **`diamond_consistency` column** added to `pgtrickle.pgt_stream_tables`
+  DDL in `lib.rs` — `TEXT NOT NULL DEFAULT 'none' CHECK (... IN ('none', 'atomic'))`.
+- **`StreamTableMeta.diamond_consistency`** field in `catalog.rs` — added to
+  struct, all SELECT queries, `from_spi_table`, `from_spi_heap_tuple`,
+  `insert()`. New helpers: `get_diamond_consistency()`, `set_diamond_consistency()`.
+- **`create_stream_table()`** now accepts optional `diamond_consistency` param
+  (defaults to GUC value).
+- **`alter_stream_table()`** now accepts optional `diamond_consistency` param.
+
+**Step 5 — Scheduler wiring:**
+- Replaced flat `for node in ordered` loop with group-aware loop using
+  `dag.compute_consistency_groups()`.
+- Singleton groups use fast path via `refresh_single_st()` (no SAVEPOINT).
+- Multi-member groups check that all members have `diamond_consistency = 'atomic'`.
+  If not, fall back to independent refreshes.
+- Atomic groups: `SAVEPOINT pgt_consistency_group` → refresh each member →
+  `RELEASE SAVEPOINT` on success, `ROLLBACK TO SAVEPOINT` on any failure.
+- Added `refresh_single_st()` helper to avoid code duplication.
+
+**Step 6 — Monitoring function:**
+- **`pgtrickle.diamond_groups()`** SQL function returning `TABLE(group_id,
+  member_name, member_schema, is_convergence, epoch)`. Builds DAG on-demand,
+  computes groups, skips singletons, and resolves ST names from catalog.
+
+**Step 7 — E2E tests:**
+- Created `tests/e2e_diamond_tests.rs` with 8 test cases:
+  `test_diamond_consistency_default`, `test_diamond_consistency_create_atomic`,
+  `test_diamond_consistency_alter`, `test_diamond_groups_sql_function`,
+  `test_diamond_linear_unaffected`, `test_diamond_none_mode_no_groups`,
+  `test_diamond_atomic_all_succeed`, `test_diamond_consistency_in_catalog_view`.
+
+**4 new unit tests** for `DiamondConsistency` enum:
+`test_diamond_consistency_as_str`, `test_diamond_consistency_from_sql_str`,
+`test_diamond_consistency_display`, `test_diamond_consistency_roundtrip`.
+
+All 969 unit tests pass. `just fmt && just lint` clean.
+
 ### Prioritized Remaining Work
 
-1. **Step 4 — Catalog + GUC** (next): Add `diamond_consistency` column and
-   GUC. Required before scheduler wiring.
-2. **Step 5 — Scheduler wiring**: Core behavior change — SAVEPOINT grouping.
-3. **Step 6 — Monitoring function**: `pgtrickle.diamond_groups()` SQL
-   function.
-4. **Step 7 — E2E tests**: Validates end-to-end atomic group behavior.
-5. **Step 8 — Documentation**: SQL_REFERENCE, CONFIGURATION, ARCHITECTURE,
-   CHANGELOG.
+1. **Step 8 — Documentation** (next): Add `diamond_consistency` to
+   SQL_REFERENCE, CONFIGURATION, ARCHITECTURE, and CHANGELOG.
 
 ---
 
