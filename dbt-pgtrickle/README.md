@@ -11,7 +11,7 @@ adapter. Just Jinja SQL macros that call pg_trickle's SQL API.
 
 | Requirement | Minimum Version |
 |-------------|----------------|
-| dbt Core | ≥ 1.6 |
+| dbt Core | ≥ 1.7 |
 | dbt-postgres adapter | Matching dbt Core version |
 | PostgreSQL | 18.x |
 | pg_trickle extension | ≥ 0.1.0 (`CREATE EXTENSION pg_trickle;`) |
@@ -220,9 +220,6 @@ cd dbt-pgtrickle/integration_tests/scripts
 
 # Keep the container running after tests (for debugging)
 ./run_dbt_tests.sh --skip-build --keep-container
-
-# Use a specific dbt version
-DBT_VERSION=1.6 ./run_dbt_tests.sh --skip-build
 
 # Use a custom port (avoids conflicts with local PostgreSQL)
 PGPORT=25432 ./run_dbt_tests.sh

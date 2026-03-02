@@ -77,7 +77,7 @@
     {% endif %}
   {% endif %}
 
-  {# dbt 1.6 requires the 'main' statement to be executed at least once.
+  {# dbt requires the 'main' statement to be executed at least once.
      Our DDL runs via run_query() (separate connection), so we satisfy the
      framework with a lightweight no-op on the main connection. #}
   {% call statement('main') %}

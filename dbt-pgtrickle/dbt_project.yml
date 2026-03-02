@@ -2,7 +2,7 @@ name: 'dbt_pgtrickle'
 version: '0.1.0'
 config-version: 2
 
-require-dbt-version: [">=1.6.0", "<2.0.0"]  # >=1.6 for subdirectory support
+require-dbt-version: [">=1.7.0", "<2.0.0"]
 
 macro-paths: ["macros"]
 clean-targets:

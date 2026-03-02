@@ -148,7 +148,7 @@ jobs:
 
   # ── dbt-pgtrickle integration tests (Linux only) ──────────────────────────
   # Cost-optimized: single job builds the Docker image once, then tests
-  # against dbt-core min (1.6) and max (1.11). Intermediate versions are
+  # against dbt-core min (1.7) and max (1.10). Intermediate versions are
   # skipped — if both boundary versions pass, the middle ones will too.
   # Runs on weekly schedule and manual dispatch only (slow Docker build).
   dbt-integration:
@@ -190,7 +190,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Test with dbt 1.6 (minimum supported)
+      - name: Test with dbt 1.7 (minimum supported)
         env:
           PGHOST: localhost
           PGPORT: '5432'
@@ -198,7 +198,7 @@ jobs:
           PGPASSWORD: postgres
           PGDATABASE: postgres
         run: |
-          pip install "dbt-core~=1.6.0" "dbt-postgres~=1.6.0"
+          pip install "dbt-core~=1.7.0" "dbt-postgres~=1.7.0"
           echo "=== dbt version ==="
           dbt --version
           cd dbt-pgtrickle/integration_tests

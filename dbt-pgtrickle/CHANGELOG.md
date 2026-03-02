@@ -15,4 +15,4 @@ All notable changes to the dbt-pgtrickle package will be documented in this file
 - `pgtrickle_refresh` and `drop_all_stream_tables` run-operations
 - `drop_all_stream_tables_force` for dropping all stream tables (including non-dbt)
 - Integration test suite with seed data, polling helper, and query-change test
-- CI pipeline (dbt 1.6-1.9 version matrix in main repo workflow)
+- CI pipeline (dbt 1.7-1.10 version matrix in main repo workflow)
