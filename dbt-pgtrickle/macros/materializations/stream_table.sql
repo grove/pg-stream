@@ -56,12 +56,6 @@
     {{ dbt_pgtrickle.pgtrickle_create_stream_table(
          qualified_name, defining_query, schedule, refresh_mode, initialize
        ) }}
-    {# cache_new was added in dbt 1.7; fall back to cache_added for 1.6.x #}
-    {% if adapter.cache_new is callable %}
-      {% do adapter.cache_new(this.incorporate(type='table')) %}
-    {% else %}
-      {% do adapter.cache_added(this.incorporate(type='table')) %}
-    {% endif %}
   {% else %}
     {# -- UPDATE: stream table exists — check if query changed -- #}
     {%- set current_info = dbt_pgtrickle.pgtrickle_get_stream_table_info(qualified_name) -%}
@@ -82,6 +76,13 @@
          ) }}
     {% endif %}
   {% endif %}
+
+  {# dbt 1.6 requires the 'main' statement to be executed at least once.
+     Our DDL runs via run_query() (separate connection), so we satisfy the
+     framework with a lightweight no-op on the main connection. #}
+  {% call statement('main') %}
+    SELECT 1
+  {% endcall %}
 
   {{ run_hooks(post_hooks) }}
 
