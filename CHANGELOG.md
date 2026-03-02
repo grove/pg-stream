@@ -14,6 +14,17 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - **TopK (ORDER BY + LIMIT) support** — Queries with a top-level `ORDER BY … LIMIT N` (constant integer, no OFFSET) are now recognized as "TopK" and accepted. TopK stream tables store only the top-N rows. Refreshes use scoped-recomputation via MERGE (bypass the DVM delta pipeline). Catalog columns `topk_limit` and `topk_order_by` record the pattern. Monitoring view exposes `is_topk`.
 - **FETCH FIRST / FETCH NEXT rejection** — `FETCH FIRST N ROWS ONLY` and `FETCH NEXT N ROWS ONLY` now produce the same unsupported-feature error as `LIMIT`.
 - **OFFSET without ORDER BY warning** — Subqueries using `OFFSET` without `ORDER BY` now emit a parser warning (alongside the existing `LIMIT` without `ORDER BY` warning).
+- **Diamond dependency consistency** — detect diamond-shaped dependency graphs
+  among stream tables and optionally refresh them as atomic groups using
+  `SAVEPOINT`. Prevents split-version reads at convergence (fan-in) nodes.
+  - New `diamond_consistency` parameter on `create_stream_table()` and
+    `alter_stream_table()` (`'none'` or `'atomic'`).
+  - New `pg_trickle.diamond_consistency` GUC to set the cluster-wide default.
+  - New `pgtrickle.diamond_groups()` monitoring function to inspect detected
+    groups, convergence points, and epoch counters.
+  - Scheduler wraps multi-member groups in a SAVEPOINT when
+    `diamond_consistency = 'atomic'`; on any failure the entire group is
+    rolled back, preserving consistency.
 
 ---
 
