@@ -16,16 +16,14 @@ use e2e::E2eDb;
 #[tokio::test]
 async fn test_full_join_basic_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE fj_left (id SERIAL PRIMARY KEY, key INT, lval TEXT);
-         CREATE TABLE fj_right (id SERIAL PRIMARY KEY, key INT, rval TEXT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO fj_left (key, lval) VALUES (1, 'a'), (2, 'b'), (3, 'c');
-         INSERT INTO fj_right (key, rval) VALUES (2, 'x'), (3, 'y'), (4, 'z');",
-    )
-    .await;
+    db.execute("CREATE TABLE fj_left (id SERIAL PRIMARY KEY, key INT, lval TEXT)")
+        .await;
+    db.execute("CREATE TABLE fj_right (id SERIAL PRIMARY KEY, key INT, rval TEXT)")
+        .await;
+    db.execute("INSERT INTO fj_left (key, lval) VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await;
+    db.execute("INSERT INTO fj_right (key, rval) VALUES (2, 'x'), (3, 'y'), (4, 'z')")
+        .await;
 
     let q = "SELECT l.key AS lkey, l.lval, r.key AS rkey, r.rval \
              FROM fj_left l FULL OUTER JOIN fj_right r ON l.key = r.key";
@@ -63,16 +61,14 @@ async fn test_full_join_basic_differential() {
 #[tokio::test]
 async fn test_full_join_null_keys_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE fj_nl (id SERIAL PRIMARY KEY, key INT, val TEXT);
-         CREATE TABLE fj_nr (id SERIAL PRIMARY KEY, key INT, val TEXT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO fj_nl (key, val) VALUES (1, 'a'), (NULL, 'null_left');
-         INSERT INTO fj_nr (key, val) VALUES (1, 'x'), (NULL, 'null_right');",
-    )
-    .await;
+    db.execute("CREATE TABLE fj_nl (id SERIAL PRIMARY KEY, key INT, val TEXT)")
+        .await;
+    db.execute("CREATE TABLE fj_nr (id SERIAL PRIMARY KEY, key INT, val TEXT)")
+        .await;
+    db.execute("INSERT INTO fj_nl (key, val) VALUES (1, 'a'), (NULL, 'null_left')")
+        .await;
+    db.execute("INSERT INTO fj_nr (key, val) VALUES (1, 'x'), (NULL, 'null_right')")
+        .await;
 
     let q = "SELECT l.key AS lkey, l.val AS lval, r.key AS rkey, r.val AS rval \
              FROM fj_nl l FULL OUTER JOIN fj_nr r ON l.key = r.key";
@@ -104,16 +100,14 @@ async fn test_full_join_null_keys_differential() {
 #[tokio::test]
 async fn test_full_join_key_update_migration() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE fj_ml (id SERIAL PRIMARY KEY, key INT, val TEXT);
-         CREATE TABLE fj_mr (id SERIAL PRIMARY KEY, key INT, val TEXT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO fj_ml (key, val) VALUES (1, 'a'), (2, 'b');
-         INSERT INTO fj_mr (key, val) VALUES (1, 'x'), (3, 'z');",
-    )
-    .await;
+    db.execute("CREATE TABLE fj_ml (id SERIAL PRIMARY KEY, key INT, val TEXT)")
+        .await;
+    db.execute("CREATE TABLE fj_mr (id SERIAL PRIMARY KEY, key INT, val TEXT)")
+        .await;
+    db.execute("INSERT INTO fj_ml (key, val) VALUES (1, 'a'), (2, 'b')")
+        .await;
+    db.execute("INSERT INTO fj_mr (key, val) VALUES (1, 'x'), (3, 'z')")
+        .await;
 
     let q = "SELECT l.key AS lkey, l.val AS lval, r.key AS rkey, r.val AS rval \
              FROM fj_ml l FULL OUTER JOIN fj_mr r ON l.key = r.key";
@@ -138,16 +132,14 @@ async fn test_full_join_key_update_migration() {
 #[tokio::test]
 async fn test_full_join_with_aggregate_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE fj_al (id SERIAL PRIMARY KEY, dept TEXT, budget INT);
-         CREATE TABLE fj_ar (id SERIAL PRIMARY KEY, dept TEXT, revenue INT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO fj_al (dept, budget) VALUES ('eng', 100), ('eng', 200), ('sales', 50);
-         INSERT INTO fj_ar (dept, revenue) VALUES ('eng', 500), ('mkt', 300);",
-    )
-    .await;
+    db.execute("CREATE TABLE fj_al (id SERIAL PRIMARY KEY, dept TEXT, budget INT)")
+        .await;
+    db.execute("CREATE TABLE fj_ar (id SERIAL PRIMARY KEY, dept TEXT, revenue INT)")
+        .await;
+    db.execute("INSERT INTO fj_al (dept, budget) VALUES ('eng', 100), ('eng', 200), ('sales', 50)")
+        .await;
+    db.execute("INSERT INTO fj_ar (dept, revenue) VALUES ('eng', 500), ('mkt', 300)")
+        .await;
 
     let q = "SELECT COALESCE(l.dept, r.dept) AS dept, \
              SUM(l.budget) AS total_budget, SUM(r.revenue) AS total_revenue \
@@ -174,16 +166,14 @@ async fn test_full_join_with_aggregate_differential() {
 #[tokio::test]
 async fn test_full_join_multi_column_key_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE fj_mcl (id SERIAL PRIMARY KEY, a INT, b TEXT, lval INT);
-         CREATE TABLE fj_mcr (id SERIAL PRIMARY KEY, a INT, b TEXT, rval INT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO fj_mcl (a, b, lval) VALUES (1, 'x', 10), (2, 'y', 20);
-         INSERT INTO fj_mcr (a, b, rval) VALUES (1, 'x', 100), (3, 'z', 300);",
-    )
-    .await;
+    db.execute("CREATE TABLE fj_mcl (id SERIAL PRIMARY KEY, a INT, b TEXT, lval INT)")
+        .await;
+    db.execute("CREATE TABLE fj_mcr (id SERIAL PRIMARY KEY, a INT, b TEXT, rval INT)")
+        .await;
+    db.execute("INSERT INTO fj_mcl (a, b, lval) VALUES (1, 'x', 10), (2, 'y', 20)")
+        .await;
+    db.execute("INSERT INTO fj_mcr (a, b, rval) VALUES (1, 'x', 100), (3, 'z', 300)")
+        .await;
 
     let q = "SELECT l.a AS la, l.b AS lb, l.lval, r.a AS ra, r.b AS rb, r.rval \
              FROM fj_mcl l FULL OUTER JOIN fj_mcr r ON l.a = r.a AND l.b = r.b";
