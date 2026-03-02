@@ -1010,32 +1010,170 @@ ensures consistency for diamonds even in manual mode.
 
 ---
 
-## 9. Prior Art References
+## 9. Prior Art & Related Work
 
-1. **DBSP** (Budiu et al., 2023) — Synchronous circuit execution ensures
-   all operators process the same logical timestamp. No diamond problem by
-   construction.
+The diamond dependency consistency problem — ensuring that a downstream
+operator that joins two or more independently computed intermediate results
+sees a coherent snapshot rather than a "split view" — is a well-known
+challenge in dataflow and streaming systems. This section surveys how the
+problem manifests and is addressed across the landscape.
 
-2. **Differential Dataflow** (McSherry et al., 2013) — Frontier-based
-   progress tracking with capabilities. An operator only advances when all
-   inputs have advanced. Direct inspiration for Option 4.2 and 4.5.
+### 9.1 The Problem in Context
 
-3. **Timely Dataflow** (Murray et al., 2013) — Pointstamp-based progress
-   tracking in a distributed dataflow system. The "can_advance" predicate
-   is analogous to our frontier alignment check.
+Jamie Brandon's *"An opinionated map of incremental and streaming systems"*
+(2021) provides the clearest framing. He distinguishes **internally
+consistent** systems (which always return an output that is the correct
+result for some present or past input) from **internally inconsistent** ones:
 
-4. **Chandy-Lamport Snapshots** (1985) — Consistent global snapshots in
-   distributed systems via marker messages. Inspiration for the epoch-based
-   approach where the "epoch" acts as a marker.
+> "An internally inconsistent system might return outputs that are not the
+> correct result for any of the past inputs. Perhaps they … combined part
+> of one input with part of another, or finished processed some update down
+> one path in the graph but not yet down another."
+> — scattered-thoughts.net, 2021
 
-5. **Vector Clocks** (Mattern, 1989; Fidge, 1988) — Logical timestamps for
+The last clause is precisely the diamond problem. Brandon observes that
+*all* high-temporal-locality systems (Flink, Kafka Streams, ksqlDB, Spark
+Structured Streaming) permit internal inconsistency under various
+scenarios, whereas low-temporal-locality systems built on explicit logical
+time (Differential Dataflow, Materialize) are internally consistent by
+construction. pg_trickle occupies a middle ground — it is a periodic-refresh
+IVM system (not a continuous streaming system), so it uses per-refresh
+epoch boundaries rather than continuous logical timestamps to enforce
+consistency within diamond groups.
+
+### 9.2 Foundational Theory
+
+1. **Chandy-Lamport Snapshots** (1985) — The seminal algorithm for
+   consistent global snapshots in distributed systems via marker messages.
+   Inspiration for our epoch-based approach where the "epoch" acts as a
+   marker that flows through the dependency graph. When all paths within a
+   consistency group complete under the same SAVEPOINT, the system has
+   effectively taken a Chandy-Lamport snapshot of the group.
+
+2. **Vector Clocks** (Mattern, 1989; Fidge, 1988) — Logical timestamps for
    causality tracking in distributed systems. Directly applicable to Option
-   4.5.
+   4.5 (per-path version vectors) in our options analysis. Our chosen Option
+   1 trades the fine-grained per-event tracking of vector clocks for a
+   simpler epoch-based grouping that is sufficient for periodic refresh.
 
-6. **Materialize** (materialize.com) — Commercial implementation using
-   Differential Dataflow timestamps for consistent multi-path incremental
-   computation. Their "read policies" determine at which timestamp queries
-   see results — analogous to our consistency mode options.
+### 9.3 Streaming Dataflow Systems
+
+3. **DBSP** (Budiu, McSherry, Ryzhyk & Tannen, 2022) — Formalized as
+   synchronous circuits where all operators process the same logical
+   timestamp in lock-step. The circuit advances one discrete step at a time,
+   computing the entire fixed-point before producing output. This eliminates
+   the diamond problem *by construction* — there is no window in which one
+   path has advanced while another has not. Feldera is the commercial
+   implementation. Our epoch-based atomic groups achieve a similar effect
+   within PostgreSQL's transactional model: the SAVEPOINT boundary
+   corresponds to a DBSP "step", ensuring all group members advance
+   atomically.
+   *Ref: arXiv:2203.16684; VLDB 2023*
+
+4. **Differential Dataflow** (McSherry et al., 2013) — Frontier-based
+   progress tracking with capabilities. An operator only advances its output
+   frontier when *all* input frontiers have advanced past a timestamp. This
+   provides automatic diamond consistency: a join operator at the confluence
+   of two paths will not emit results at time *t* until both paths have
+   delivered all updates through time *t*. Direct inspiration for Options
+   4.2 and 4.5 in our analysis.
+
+5. **Timely Dataflow** (Murray et al., SOSP 2013) — Pointstamp-based
+   progress tracking in a distributed dataflow system. The `can_advance`
+   predicate at each operator answers "could I still receive data at or
+   before timestamp *t*?" — analogous to our frontier alignment check.
+   Timely's progress protocol is the mechanism that enables Differential
+   Dataflow's consistency guarantees.
+
+6. **Apache Flink** — Uses **checkpoint barriers** (inspired by
+   Chandy-Lamport) that flow through the dataflow graph. At operators with
+   multiple inputs, barriers must be **aligned**: the operator buffers data
+   from the faster input until the barrier arrives on all inputs, ensuring
+   that the checkpoint captures a consistent cut across all paths. This is
+   structurally identical to the diamond problem — Flink's barrier alignment
+   ensures that a join operator's snapshot does not mix pre-barrier data from
+   one path with post-barrier data from another. Flink also offers
+   *unaligned checkpoints* (since 1.11) which trade off consistent cuts for
+   lower latency by including in-flight data in the snapshot. Our approach
+   is analogous to Flink's aligned barriers, but at the granularity of
+   per-group refresh rather than per-record processing.
+   *Ref: Carbone et al., "Lightweight Asynchronous Snapshots for
+   Distributed Dataflows", arXiv:1506.08603*
+
+7. **Noria / Readyset** (Gjengset et al., OSDI 2018) — A
+   partially-stateful dataflow system that takes an interesting different
+   approach. Noria uses **upqueries** — on-demand backward traversal of the
+   dataflow graph to fill in missing state. For multi-path (diamond)
+   topologies, upqueries from a join node must reconcile state from
+   multiple parents that may be at different points in time. Noria addresses
+   this by processing updates through all paths before making results visible
+   at downstream operators. The Readyset commercial system (née Noria)
+   describes itself as using "partially-stateful streaming dataflow" for
+   incrementally maintaining SQL query result sets.
+   *Ref: "Noria: Dynamic, Partially-Stateful Data-Flow for
+   High-Performance Web Applications", OSDI 2018*
+
+### 9.4 Streaming Databases
+
+8. **Materialize** (materialize.com) — The most relevant commercial system.
+   Built on Differential Dataflow and Timely Dataflow, Materialize enforces
+   **internal consistency** as a core guarantee. Frank McSherry and Natacha
+   Crooks's 2020 blog post defines internal consistency formally:
+
+   > "A view is internally consistent at time *t* if it reflects all events
+   > that have a timestamp smaller or equal to *t*, and no events that have
+   > a timestamp greater than *t*."
+
+   For hierarchies of views (exactly the diamond pattern), Materialize
+   ensures that a downstream view's output at time *t* incorporates all
+   upstream changes through time *t* across every path. The key mechanisms
+   are: (a) logical timestamps assigned at ingestion, (b) frontier tracking
+   that prevents a view from advancing until all inputs have caught up, and
+   (c) **timestamp closing** — the ability to determine when no more data
+   will arrive at a given timestamp, even for idle sources.
+
+   Materialize also distinguishes **causal dependencies** (event A caused
+   event B) from **atomic dependencies** (events A and B should appear
+   simultaneously, e.g. within a transaction). Our `diamond_consistency =
+   'atomic'` mode enforces atomic dependencies within consistency groups.
+   *Ref: "Consistency in Streaming Systems", materialize.com/blog/consistency/*
+
+9. **RisingWave** — A cloud-native streaming database that maintains
+   materialized views incrementally. RisingWave uses a barrier-based
+   checkpoint mechanism similar to Flink's for consistency across its
+   dataflow operators. Barriers propagate through the operator graph and
+   must align at join points, ensuring multi-path consistency.
+   *Ref: docs.risingwave.com*
+
+### 9.5 How pg_trickle Compares
+
+| System | Consistency mechanism | Granularity | Diamond handling |
+|--------|----------------------|-------------|-----------------|
+| DBSP / Feldera | Synchronous stepping | Per-circuit-step | By construction |
+| Differential Dataflow | Frontier tracking | Per-timestamp | By construction |
+| Timely Dataflow | Pointstamp progress | Per-timestamp | By construction |
+| Flink | Barrier alignment | Per-checkpoint | Barrier buffering |
+| Noria / Readyset | Upquery reconciliation | Per-query | On-demand |
+| Materialize | Timestamp frontiers | Per-timestamp | By construction |
+| RisingWave | Barrier checkpoints | Per-barrier | Barrier alignment |
+| **pg_trickle** | **Epoch + SAVEPOINT** | **Per-refresh-group** | **Atomic rollback** |
+
+pg_trickle's approach is pragmatic and fits naturally within PostgreSQL's
+transactional model. Rather than implementing a full logical-timestamp
+system (which would require fundamental changes to how PostgreSQL processes
+queries), we:
+
+- **Detect** diamond topologies statically via DAG analysis
+  (`detect_diamonds`, `compute_consistency_groups`)
+- **Group** affected stream tables into consistency groups
+- **Execute** each group's refresh within a single SAVEPOINT, so either all
+  members advance or all roll back
+- **Configure** the trade-off via `diamond_consistency` (none/atomic) and
+  the planned `diamond_schedule_policy` (fastest/slowest)
+
+This is most similar to Flink's barrier alignment approach, adapted from a
+continuous-streaming context to a periodic-refresh context, and implemented
+using PostgreSQL savepoints rather than in-memory barrier buffers.
 
 ---
 
