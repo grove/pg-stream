@@ -176,6 +176,16 @@ fn create_stream_table_impl(
         .as_ref()
         .is_some_and(|pr| pr.tree.needs_pgt_count());
 
+    // Detect if the query is INTERSECT/EXCEPT (needs __pgt_count_l, __pgt_count_r).
+    let needs_dual_count = parsed_tree
+        .as_ref()
+        .is_some_and(|pr| pr.tree.needs_dual_count());
+
+    // Detect if the query is a UNION (without ALL) needing dedup count.
+    let needs_union_dedup = parsed_tree
+        .as_ref()
+        .is_some_and(|pr| pr.tree.needs_union_dedup_count());
+
     // Note: recursive CTEs (WITH RECURSIVE) are allowed in both FULL and
     // DIFFERENTIAL modes. For DIFFERENTIAL, the DVM engine uses a
     // recomputation diff strategy that re-executes the query and diffs
@@ -203,8 +213,15 @@ fn create_stream_table_impl(
     // Get the change buffer schema for CDC setup
     let change_schema = config::pg_trickle_change_buffer_schema();
 
-    // Create the underlying storage table
-    let storage_ddl = build_create_table_sql(&schema, &table_name, &columns, needs_count);
+    // Create the underlying storage table — UNION (dedup) also needs __pgt_count
+    let storage_needs_pgt_count = needs_count || needs_union_dedup;
+    let storage_ddl = build_create_table_sql(
+        &schema,
+        &table_name,
+        &columns,
+        storage_needs_pgt_count,
+        needs_dual_count,
+    );
     Spi::run(&storage_ddl)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
 
@@ -333,7 +350,16 @@ fn create_stream_table_impl(
     // Initialize if requested
     if initialize {
         let t_init = Instant::now();
-        initialize_st(&schema, &table_name, query, pgt_id, &columns, needs_count)?;
+        initialize_st(
+            &schema,
+            &table_name,
+            query,
+            pgt_id,
+            &columns,
+            needs_count,
+            needs_dual_count,
+            needs_union_dedup,
+        )?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
 
         // Record initial full materialization time so the adaptive
@@ -675,15 +701,35 @@ fn execute_manual_full_refresh(
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
-    // For UNION ALL queries, decompose into per-branch subqueries with
+    // For INTERSECT/EXCEPT, compute per-branch multiplicities for dual-count
+    // storage. For UNION (dedup), convert to UNION ALL and count.
+    // For UNION ALL, decompose into per-branch subqueries with
     // child-prefixed row IDs matching diff_union_all's formula.
-    let insert_body =
-        if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(&st.defining_query) {
-            ua_sql
+    let insert_body = if crate::dvm::query_needs_dual_count(&st.defining_query) {
+        let col_names = crate::dvm::get_defining_query_columns(&st.defining_query)?;
+        if let Some(set_op_sql) = crate::dvm::try_set_op_refresh_sql(&st.defining_query, &col_names)
+        {
+            set_op_sql
         } else {
             let row_id_expr = crate::dvm::row_id_expr_for_query(&st.defining_query);
             format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
-        };
+        }
+    } else if crate::dvm::query_needs_union_dedup_count(&st.defining_query) {
+        let col_names = crate::dvm::get_defining_query_columns(&st.defining_query)?;
+        if let Some(union_sql) =
+            crate::dvm::try_union_dedup_refresh_sql(&st.defining_query, &col_names)
+        {
+            union_sql
+        } else {
+            let row_id_expr = crate::dvm::row_id_expr_for_query(&st.defining_query);
+            format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
+        }
+    } else if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(&st.defining_query) {
+        ua_sql
+    } else {
+        let row_id_expr = crate::dvm::row_id_expr_for_query(&st.defining_query);
+        format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
+    };
 
     let insert_sql = format!("INSERT INTO {quoted_table} {insert_body}");
     Spi::run(&insert_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
@@ -1541,6 +1587,7 @@ fn build_create_table_sql(
     name: &str,
     columns: &[ColumnDef],
     needs_pgt_count: bool,
+    needs_dual_count: bool,
 ) -> String {
     let col_defs: Vec<String> = columns
         .iter()
@@ -1563,7 +1610,10 @@ fn build_create_table_sql(
         .collect();
 
     // Add __pgt_count auxiliary column for aggregate/distinct STs.
-    let count_col = if needs_pgt_count {
+    let aux_cols = if needs_dual_count {
+        // INTERSECT/EXCEPT need dual branch counts
+        ",\n    __pgt_count_l BIGINT NOT NULL DEFAULT 0,\n    __pgt_count_r BIGINT NOT NULL DEFAULT 0"
+    } else if needs_pgt_count {
         ",\n    __pgt_count BIGINT NOT NULL DEFAULT 0"
     } else {
         ""
@@ -1574,7 +1624,7 @@ fn build_create_table_sql(
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
-        count_col,
+        aux_cols,
     )
 }
 
@@ -1595,13 +1645,16 @@ fn get_table_oid(schema: &str, name: &str) -> Result<pg_sys::Oid, PgTrickleError
 }
 
 /// Initialize a stream table by populating it from its defining query.
+#[allow(clippy::too_many_arguments)]
 fn initialize_st(
     schema: &str,
     name: &str,
     query: &str,
     pgt_id: i64,
-    _columns: &[ColumnDef],
+    columns: &[ColumnDef],
     needs_pgt_count: bool,
+    needs_dual_count: bool,
+    needs_union_dedup: bool,
 ) -> Result<(), PgTrickleError> {
     // For aggregate/distinct STs, inject COUNT(*) AS __pgt_count into the
     // defining query so the auxiliary column is populated correctly.
@@ -1613,9 +1666,39 @@ fn initialize_st(
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
+    // For INTERSECT/EXCEPT queries, compute per-branch multiplicities
+    // matching the dual-count storage schema.
+    // For UNION (without ALL) queries, convert to UNION ALL and count
+    // per-unique-row multiplicities for the __pgt_count column.
     // For UNION ALL queries, decompose into per-branch subqueries with
     // child-prefixed row IDs matching diff_union_all's formula.
-    let insert_body = if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(query) {
+    let insert_body = if needs_dual_count {
+        let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        if let Some(set_op_sql) = crate::dvm::try_set_op_refresh_sql(query, &col_names) {
+            set_op_sql
+        } else {
+            // Fallback: should not happen since needs_dual_count implies set-op
+            let row_id_expr = crate::dvm::row_id_expr_for_query(query);
+            format!(
+                "SELECT {row_id_expr} AS __pgt_row_id, sub.*, \
+                 1::bigint AS __pgt_count_l, 0::bigint AS __pgt_count_r \
+                 FROM ({effective_query}) sub",
+            )
+        }
+    } else if needs_union_dedup {
+        let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        if let Some(union_sql) = crate::dvm::try_union_dedup_refresh_sql(query, &col_names) {
+            union_sql
+        } else {
+            // Fallback: treat as normal query with __pgt_count = 1
+            let row_id_expr = crate::dvm::row_id_expr_for_query(query);
+            format!(
+                "SELECT {row_id_expr} AS __pgt_row_id, sub.*, \
+                 1::bigint AS __pgt_count \
+                 FROM ({query}) sub",
+            )
+        }
+    } else if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(query) {
         ua_sql
     } else {
         let row_id_expr = crate::dvm::row_id_expr_for_query(query);

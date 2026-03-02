@@ -976,14 +976,41 @@ impl OpTree {
     /// around the `Aggregate`).
     pub fn needs_pgt_count(&self) -> bool {
         match self {
-            OpTree::Aggregate { .. }
-            | OpTree::Distinct { .. }
-            | OpTree::Intersect { .. }
-            | OpTree::Except { .. } => true,
+            OpTree::Aggregate { .. } => true,
+            OpTree::Distinct { child, .. } => {
+                // UNION (dedup) = Distinct { UnionAll }; uses union-dedup count path instead
+                !matches!(child.as_ref(), OpTree::UnionAll { .. })
+            }
             // Transparent wrappers — delegate to child
             OpTree::Filter { child, .. }
             | OpTree::Project { child, .. }
             | OpTree::Subquery { child, .. } => child.needs_pgt_count(),
+            // INTERSECT/EXCEPT use dual counts, not __pgt_count
+            OpTree::Intersect { .. } | OpTree::Except { .. } => false,
+            _ => false,
+        }
+    }
+
+    /// Whether this operator represents a UNION (without ALL) that needs
+    /// deduplication counting via `__pgt_count` in a wrapped UNION ALL form.
+    pub fn needs_union_dedup_count(&self) -> bool {
+        match self {
+            OpTree::Distinct { child, .. } => matches!(child.as_ref(), OpTree::UnionAll { .. }),
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. } => child.needs_union_dedup_count(),
+            _ => false,
+        }
+    }
+
+    /// Whether this operator needs dual multiplicity counts
+    /// (`__pgt_count_l`, `__pgt_count_r`) for set operation tracking.
+    pub fn needs_dual_count(&self) -> bool {
+        match self {
+            OpTree::Intersect { .. } | OpTree::Except { .. } => true,
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. } => child.needs_dual_count(),
             _ => false,
         }
     }
@@ -8372,22 +8399,68 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         // Handle COUNT(*) and other agg_star calls.
         // PostgreSQL represents COUNT(*) as FuncCall { agg_star: true, args: [] }.
         // We must emit the "*" explicitly so to_sql() produces COUNT(*) not COUNT().
+        let base_args_str = if fcall.agg_star {
+            "*".to_string()
+        } else {
+            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let mut args = Vec::new();
+            for n in args_list.iter_ptr() {
+                if let Ok(e) = unsafe { node_to_expr(n) } {
+                    args.push(e.to_sql());
+                }
+            }
+            args.join(", ")
+        };
+
+        // Window functions: FuncCall with non-null .over → emit full OVER clause
+        if !fcall.over.is_null() {
+            let over = unsafe { &*fcall.over };
+            let mut over_parts = Vec::new();
+
+            // PARTITION BY
+            if !over.partitionClause.is_null() {
+                let parts_list =
+                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(over.partitionClause) };
+                let mut pk = Vec::new();
+                for p in parts_list.iter_ptr() {
+                    pk.push(unsafe { node_to_expr(p) }?.to_sql());
+                }
+                over_parts.push(format!("PARTITION BY {}", pk.join(", ")));
+            }
+
+            // ORDER BY
+            if !over.orderClause.is_null() {
+                let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(over.orderClause) };
+                let sort_sql = unsafe { deparse_sort_clause(&sort_list)? };
+                over_parts.push(format!("ORDER BY {}", sort_sql));
+            }
+
+            // Frame clause (ROWS/RANGE/GROUPS BETWEEN ... AND ...)
+            if let Some(frame_sql) = unsafe { deparse_window_frame(over) } {
+                over_parts.push(frame_sql);
+            }
+
+            let over_sql = over_parts.join(" ");
+            return Ok(Expr::Raw(format!(
+                "{func_name}({base_args_str}) OVER ({over_sql})"
+            )));
+        }
+
         if fcall.agg_star {
-            return Ok(Expr::FuncCall {
+            Ok(Expr::FuncCall {
                 func_name,
                 args: vec![Expr::Raw("*".to_string())],
-            });
-        }
-
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
-        let mut args = Vec::new();
-        for n in args_list.iter_ptr() {
-            if let Ok(e) = unsafe { node_to_expr(n) } {
-                args.push(e);
+            })
+        } else {
+            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let mut args = Vec::new();
+            for n in args_list.iter_ptr() {
+                if let Ok(e) = unsafe { node_to_expr(n) } {
+                    args.push(e);
+                }
             }
+            Ok(Expr::FuncCall { func_name, args })
         }
-
-        Ok(Expr::FuncCall { func_name, args })
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
         let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
         let inner = unsafe { node_to_expr(tc.arg)? };
@@ -10412,7 +10485,10 @@ unsafe fn extract_aggregates(
                 };
 
                 // Parse optional WITHIN GROUP (ORDER BY ...) for ordered-set aggregates
-                let order_within_group = if fcall.agg_within_group && !fcall.agg_order.is_null() {
+                // and regular aggregate ORDER BY (e.g., STRING_AGG(val, ',' ORDER BY val)).
+                // Both are stored in order_within_group; agg_to_rescan_sql distinguishes
+                // between WITHIN GROUP and regular ORDER BY based on the AggFunc type.
+                let order_within_group = if !fcall.agg_order.is_null() {
                     let ord_list =
                         unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.agg_order) };
                     let mut sorts = Vec::new();
@@ -11383,13 +11459,14 @@ mod tests {
 
     #[test]
     fn test_needs_pgt_count_distinct_wrapping_union_all() {
-        // Distinct wrapping UnionAll needs pgt_count (reference counting)
+        // Distinct wrapping UnionAll uses union-dedup-count path, not pgt_count
         let tree = OpTree::Distinct {
             child: Box::new(OpTree::UnionAll {
                 children: vec![scan_node("a", 1, &["id"]), scan_node("b", 2, &["id"])],
             }),
         };
-        assert!(tree.needs_pgt_count());
+        assert!(!tree.needs_pgt_count());
+        assert!(tree.needs_union_dedup_count());
     }
 
     #[test]

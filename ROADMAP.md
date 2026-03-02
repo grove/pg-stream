@@ -1,7 +1,7 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-02-28
-> **Current version:** 0.1.2
+> **Last updated:** 2026-03-02
+> **Current version:** 0.1.3
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -59,56 +59,65 @@ Low-risk, high-value items pulled forward from v0.2.0:
 correct baseline. No new features — only fixes, verification, and test
 coverage.
 
-### Tier 0 — Critical (must-fix)
+> **Status: Substantially complete.** 50/51 SQL_GAPS_7 items were completed
+> in v0.1.3. The only remaining item is F40 (extension upgrade migration
+> scripts), deferred to PLAN_DB_SCHEMA_STABILITY.md.
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| F1 | Remove `delete_insert` merge strategy (unsafe + superseded by `auto`) | 1–2h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.1 (P0) |
-| F2 | WAL decoder: keyless-table pk_hash computation | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.1 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| F3 | WAL decoder: old_* column population for UPDATEs | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G3.2 · [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| F5 | JOIN key column change detection in delta SQL | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G4.1 (P1) |
-| F6 | ALTER TYPE / ALTER POLICY DDL tracking | 3–5h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G9.1 (P1) |
+### Tier 0 — Critical (must-fix) — ✅ COMPLETE
 
-> **Subtotal: 15–23 hours** (F1 reduced 3–4h → 1–2h; F4 and F7 moved to v0.1.0)
+| Item | Description | Status |
+|------|-------------|--------|
+| F1 | Remove `delete_insert` merge strategy | ✅ Done in v0.1.3 |
+| F2 | WAL decoder: keyless-table pk_hash computation | ✅ Done in v0.1.3 |
+| F3 | WAL decoder: old_* column population for UPDATEs | ✅ Done in v0.1.3 |
+| F5 | JOIN key column change detection in delta SQL | ✅ Done in v0.1.0 |
+| F6 | ALTER TYPE / ALTER POLICY DDL tracking | ✅ Done in v0.1.3 |
 
-### Tier 1 — Verification
+### Tier 1 — Verification — ✅ COMPLETE
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| F8–F10, F12 | Window partition key E2E, recursive CTE monotonicity audit, ALTER DOMAIN tracking, PgBouncer compatibility docs | 16–23h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G5–G9 |
+| Item | Description | Status |
+|------|-------------|--------|
+| F8–F10, F12 | Window partition key E2E, recursive CTE monotonicity audit, ALTER DOMAIN tracking, PgBouncer compatibility docs | ✅ Done in v0.1.3 |
 
-> F11 (keyless table duplicate-rows documentation) moved to v0.1.0.
+### Tier 2 — Robustness — ✅ COMPLETE
 
-### Tier 2 — Robustness
+| Item | Description | Status |
+|------|-------------|--------|
+| F13, F15–F16 | LIMIT-in-subquery warning, RANGE_AGG recognition, read replica detection | ✅ Done in v0.1.3 |
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| F13, F15–F16 | LIMIT-in-subquery warning, RANGE_AGG recognition, read replica detection, SPI error classification | 6–8h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G2, G5, G6, G8 |
+### Tier 3 — Test coverage — ✅ COMPLETE
 
-> F14 (CUBE explosion guard) moved to v0.1.0.
+| Item | Description | Status |
+|------|-------------|--------|
+| F17–F26 | 62 E2E tests across 10 test files | ✅ Done in v0.1.3 |
 
-### Tier 3 — Test coverage
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| F17–F26 | 21 aggregate differential E2E, FULL JOIN E2E, INTERSECT/EXCEPT pairs, GUC variation tests, CI combined coverage | 29–38h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G7 · [STATUS_TESTING.md](plans/testing/STATUS_TESTING.md) |
-
-**TPC-H-derived coverage baseline** — A 22-query correctness test suite
-derived from TPC-H (`just test-tpch`, local-only, SF=0.01) is now in place
-and provides deep regression coverage for F5, F17–F26, and the aggregate +
-multi-join operator paths. 20/22 queries create; 15/22 pass deterministic
-correctness checks across multiple mutation cycles.
+**TPC-H-derived coverage baseline** — The 22-query correctness test suite
+now achieves **22/22 queries create and pass deterministic correctness checks**
+across multiple mutation cycles (`just test-tpch`, local-only, SF=0.01).
 See [plans/testing/PLAN_TEST_SUITE_TPC_H.md](plans/testing/PLAN_TEST_SUITE_TPC_H.md).
 
 > *Queries are derived from the TPC-H Benchmark specification; results are not
 > comparable to published TPC results. TPC Benchmark™ is a trademark of TPC.*
 
-**v0.2.0 total: ~66–92 hours** (F1 reduced 3–4h → 1–2h; F4, F7, F11, F14 moved to v0.1.0)
+### Tier 4 — Operational Hardening — 13/14 COMPLETE
+
+| Item | Description | Status |
+|------|-------------|--------|
+| F27–F39 | Adaptive threshold, SPI retry, delta metrics, WAL hardening, etc. | ✅ Done in v0.1.3 |
+| F40 | Extension upgrade migration scripts | ⬜ Deferred to PLAN_DB_SCHEMA_STABILITY.md |
+
+### Tier 5 — Nice-to-Have — ✅ COMPLETE
+
+| Item | Description | Status |
+|------|-------------|--------|
+| F41–F51 | Wide table hash, memory docs, monitoring, keyless E2E, etc. | ✅ Done in v0.1.3 |
+
+**v0.2.0 total: ~30 hours actual** (originally estimated 66–92h)
 
 **Exit criteria:**
-- [ ] Zero P0 gaps
-- [ ] All P1 gaps resolved or documented as known limitations
-- [ ] E2E test count ≥ 400 with 0 pre-existing failures
+- [x] Zero P0 gaps
+- [x] All P1 gaps resolved or documented as known limitations
+- [x] E2E test count ≥ 400 with 0 pre-existing failures (currently 460)
 - [ ] Combined coverage ≥ 75%
 
 ---
@@ -133,15 +142,15 @@ milestone.
 |------|-------------|--------|-----|
 | O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 · [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
 | O2 | Prepared statement cleanup on cache invalidation | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.3 |
-| O3 | Adaptive fallback threshold exposure via monitoring | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.4 |
-| O4 | SPI SQLSTATE error classification for retry | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.6 |
+| O3 | ~~Adaptive fallback threshold exposure via monitoring~~ | ✅ Done in v0.1.3 (F27) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.4 |
+| O4 | ~~SPI SQLSTATE error classification for retry~~ | ✅ Done in v0.1.3 (F29) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.6 |
 | O5 | Slot lag alerting thresholds (configurable) | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G10 |
 
 ### WAL CDC Hardening
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| W1 | WAL decoder fixes (F2–F4 prerequisite from v0.2.0) | Done in v0.2.0 | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W1 | WAL decoder fixes (F2–F3 completed in v0.1.3) | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | W2 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | W3 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | W4 | Promote `pg_trickle.cdc_mode = 'auto'` to recommended | Documentation | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
