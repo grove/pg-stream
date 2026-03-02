@@ -1,8 +1,8 @@
 # Plan: Diamond Dependency Consistency (Multi-Path Refresh)
 
 Date: 2026-02-28
-Status: DECIDED — Option 1 (Epoch-Based Atomic Groups)
-Last Updated: 2026-03-01
+Status: IN PROGRESS — Option 1 (Epoch-Based Atomic Groups)
+Last Updated: 2026-03-02
 
 ---
 
@@ -565,7 +565,7 @@ with `just test-unit`. Steps 4–6 require an integration/E2E environment.
 
 ---
 
-### Step 1 — Define data structures in `dag.rs` (no DB)
+### Step 1 — Define data structures in `dag.rs` (no DB) ✅ DONE
 
 **Goal:** Represent diamonds and consistency groups as first-class types.
 
@@ -604,7 +604,7 @@ with `just test-unit`. Steps 4–6 require an integration/E2E environment.
 
 ---
 
-### Step 2 — Implement diamond detection in `dag.rs` (no DB)
+### Step 2 — Implement diamond detection in `dag.rs` (no DB) ✅ DONE
 
 **Goal:** A pure function that detects all diamonds in a given `StDag` and
 returns a list of `Diamond` values.
@@ -650,7 +650,7 @@ returns a list of `Diamond` values.
 
 ---
 
-### Step 3 — Implement consistency group computation in `dag.rs` (no DB)
+### Step 3 — Implement consistency group computation in `dag.rs` (no DB) ✅ DONE
 
 **Goal:** Convert the list of `Diamond` values into a list of
 `ConsistencyGroup` values that the scheduler can iterate.
@@ -827,16 +827,119 @@ Add to `tests/e2e_diamond_tests.rs`:
 
 ### Recommended Implementation Order Summary
 
-| Step | File(s) | Depends on | Testable with |
-|---|---|---|---|
-| 1 — Data structures | `dag.rs` | — | `just lint` |
-| 2 — Diamond detection | `dag.rs` | Step 1 | `just test-unit` |
-| 3 — Consistency groups | `dag.rs` | Step 2 | `just test-unit` |
-| 4 — Catalog + GUC | `catalog.rs`, `config.rs`, `api.rs` | Step 3 | `just test-integration` |
-| 5 — Scheduler wiring | `scheduler.rs` | Steps 3, 4 | `just lint` |
-| 6 — Monitoring function | `api.rs` | Steps 3, 5 | `just lint` |
-| 7 — E2E tests | `tests/e2e_diamond_tests.rs` | Steps 5, 6 | `just test-e2e` |
-| 8 — Documentation | `docs/`, `CHANGELOG.md` | Steps 1–7 | `just test-all` |
+| Step | File(s) | Depends on | Testable with | Status |
+|---|---|---|---|---|
+| 1 — Data structures | `dag.rs` | — | `just lint` | ✅ Done |
+| 2 — Diamond detection | `dag.rs` | Step 1 | `just test-unit` | ✅ Done |
+| 3 — Consistency groups | `dag.rs` | Step 2 | `just test-unit` | ✅ Done |
+| 4 — Catalog + GUC | `catalog.rs`, `config.rs`, `api.rs`, `lib.rs` | Step 3 | `just test-integration` | ✅ Done |
+| 5 — Scheduler wiring | `scheduler.rs` | Steps 3, 4 | `just lint` | ✅ Done |
+| 6 — Monitoring function | `api.rs` | Steps 3, 5 | `just lint` | ✅ Done |
+| 7 — E2E tests | `tests/e2e_diamond_tests.rs` | Steps 5, 6 | `just test-e2e` | ✅ Done |
+| 8 — Documentation | `docs/`, `CHANGELOG.md` | Steps 1–7 | `just test-all` | ✅ Done |
+
+### What Was Implemented (2026-03-02)
+
+Steps 1–3 completed in `src/dag.rs`:
+
+- **`Diamond` struct** — represents a detected diamond with convergence node,
+  shared sources, and intermediate STs.
+- **`ConsistencyGroup` struct** — represents an atomic refresh group with
+  topologically-ordered members, convergence points, and epoch counter.
+  Includes `is_singleton()` and `advance_epoch()` helpers.
+- **`StDag::detect_diamonds()`** — walks all fan-in ST nodes, computes
+  transitive ancestor sets per upstream branch, finds shared ancestors,
+  and merges overlapping diamonds.
+- **`StDag::compute_consistency_groups()`** — converts diamonds into
+  scheduler-ready groups in topological order, merges overlapping groups
+  transitively, and emits singleton groups for non-diamond STs.
+- **Private helpers**: `collect_ancestors()` (recursive upstream walk),
+  `merge_overlapping_diamonds()` (union-find-style diamond merging).
+
+**12 new unit tests** added and passing:
+`test_detect_diamonds_simple`, `test_detect_diamonds_deep`,
+`test_detect_diamonds_none_linear`, `test_detect_diamonds_multiple_roots_no_diamond`,
+`test_detect_diamonds_overlapping`, `test_groups_simple_diamond`,
+`test_groups_singleton_non_diamond`, `test_groups_independent_diamonds`,
+`test_groups_nested_merge`, `test_consistency_group_epoch_advance`,
+`test_consistency_group_is_singleton`.
+
+All 965 unit tests pass. `just fmt && just lint` clean.
+
+### What Was Implemented (Steps 4–7)
+
+Steps 4–7 completed across multiple files:
+
+**Step 4 — Catalog + GUC:**
+- **`DiamondConsistency` enum** in `dag.rs` — `None` / `Atomic` variants
+  with `as_str()`, `from_sql_str()`, `Display`.
+- **`PGS_DIAMOND_CONSISTENCY` GUC** in `config.rs` — string GUC defaulting
+  to `"none"`, registered as `pg_trickle.diamond_consistency`.
+- **`diamond_consistency` column** added to `pgtrickle.pgt_stream_tables`
+  DDL in `lib.rs` — `TEXT NOT NULL DEFAULT 'none' CHECK (... IN ('none', 'atomic'))`.
+- **`StreamTableMeta.diamond_consistency`** field in `catalog.rs` — added to
+  struct, all SELECT queries, `from_spi_table`, `from_spi_heap_tuple`,
+  `insert()`. New helpers: `get_diamond_consistency()`, `set_diamond_consistency()`.
+- **`create_stream_table()`** now accepts optional `diamond_consistency` param
+  (defaults to GUC value).
+- **`alter_stream_table()`** now accepts optional `diamond_consistency` param.
+
+**Step 5 — Scheduler wiring:**
+- Replaced flat `for node in ordered` loop with group-aware loop using
+  `dag.compute_consistency_groups()`.
+- Singleton groups use fast path via `refresh_single_st()` (no SAVEPOINT).
+- Multi-member groups check that all members have `diamond_consistency = 'atomic'`.
+  If not, fall back to independent refreshes.
+- Atomic groups: `SAVEPOINT pgt_consistency_group` → refresh each member →
+  `RELEASE SAVEPOINT` on success, `ROLLBACK TO SAVEPOINT` on any failure.
+- Added `refresh_single_st()` helper to avoid code duplication.
+
+**Step 6 — Monitoring function:**
+- **`pgtrickle.diamond_groups()`** SQL function returning `TABLE(group_id,
+  member_name, member_schema, is_convergence, epoch)`. Builds DAG on-demand,
+  computes groups, skips singletons, and resolves ST names from catalog.
+
+**Step 7 — E2E tests:**
+- Created `tests/e2e_diamond_tests.rs` with 8 test cases:
+  `test_diamond_consistency_default`, `test_diamond_consistency_create_atomic`,
+  `test_diamond_consistency_alter`, `test_diamond_groups_sql_function`,
+  `test_diamond_linear_unaffected`, `test_diamond_none_mode_no_groups`,
+  `test_diamond_atomic_all_succeed`, `test_diamond_consistency_in_catalog_view`.
+
+**4 new unit tests** for `DiamondConsistency` enum:
+`test_diamond_consistency_as_str`, `test_diamond_consistency_from_sql_str`,
+`test_diamond_consistency_display`, `test_diamond_consistency_roundtrip`.
+
+All 969 unit tests pass. `just fmt && just lint` clean.
+
+### What Was Implemented (Step 8 — Documentation)
+
+**SQL_REFERENCE.md:**
+- Added `diamond_consistency` (6th) parameter to `create_stream_table()` signature, parameter table, and description.
+- Added `diamond_consistency` parameter to `alter_stream_table()` signature and parameter table.
+- Added full `pgtrickle.diamond_groups()` function documentation with return columns, example output, and usage notes.
+
+**CONFIGURATION.md:**
+- Added `pg_trickle.diamond_consistency` GUC section with value table, description, SQL examples, and usage notes.
+- Added `pg_trickle.diamond_consistency = 'none'` to the Complete postgresql.conf Example.
+
+**ARCHITECTURE.md:**
+- Added section 13 "Diamond Dependency Consistency" covering the problem, detection algorithm, consistency groups, scheduler SAVEPOINT wiring, and monitoring.
+- Added `diamond_groups` to Monitoring section's function list.
+- Added `pg_trickle.diamond_consistency` row to the GUC quick reference table.
+
+**CHANGELOG.md:**
+- Added diamond dependency consistency feature under `[Unreleased]` → `### Added`.
+
+### Prioritized Remaining Work
+
+All 8 steps are complete. No remaining work for the initial implementation.
+
+Potential future enhancements (not prioritized):
+- Parallel refresh of diamond group members (see §7.1).
+- Expose `diamond_group_id` in `pgtrickle.explain_st()` output.
+- Cache consistency groups in shared memory for large deployments (1000+ STs).
+- Interaction with cron-scheduled STs within diamond groups.
 
 ---
 
