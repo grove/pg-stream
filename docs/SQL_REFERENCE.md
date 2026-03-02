@@ -12,11 +12,12 @@ Create a new stream table.
 
 ```sql
 pgtrickle.create_stream_table(
-    name          text,
-    query         text,
-    schedule text      DEFAULT '1m',
-    refresh_mode  text      DEFAULT 'DIFFERENTIAL',
-    initialize    bool      DEFAULT true
+    name                  text,
+    query                 text,
+    schedule              text      DEFAULT '1m',
+    refresh_mode          text      DEFAULT 'DIFFERENTIAL',
+    initialize            bool      DEFAULT true,
+    diamond_consistency   text      DEFAULT NULL
 ) → void
 ```
 
@@ -29,6 +30,7 @@ pgtrickle.create_stream_table(
 | `schedule` | `text` | `'1m'` | Refresh schedule as a Prometheus/GNU-style duration string (e.g., `'30s'`, `'5m'`, `'1h'`, `'1h30m'`, `'1d'`) **or** a cron expression (e.g., `'*/5 * * * *'`, `'@hourly'`). Set to `NULL` for CALCULATED mode (inherits schedule from downstream dependents). |
 | `refresh_mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` (truncate and reload) or `'DIFFERENTIAL'` (apply delta only). |
 | `initialize` | `bool` | `true` | If `true`, populates the table immediately via a full refresh. If `false`, creates the table empty. |
+| `diamond_consistency` | `text` | `NULL` (GUC default) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). When `NULL`, inherits from the `pg_trickle.diamond_consistency` GUC. See [CONFIGURATION.md](CONFIGURATION.md). |
 
 **Duration format:**
 
@@ -548,10 +550,11 @@ Alter properties of an existing stream table.
 
 ```sql
 pgtrickle.alter_stream_table(
-    name          text,
-    schedule text      DEFAULT NULL,
-    refresh_mode  text      DEFAULT NULL,
-    status        text      DEFAULT NULL
+    name                  text,
+    schedule              text      DEFAULT NULL,
+    refresh_mode          text      DEFAULT NULL,
+    status                text      DEFAULT NULL,
+    diamond_consistency   text      DEFAULT NULL
 ) → void
 ```
 
@@ -563,6 +566,7 @@ pgtrickle.alter_stream_table(
 | `schedule` | `text` | `NULL` | New schedule as a duration string (e.g., `'5m'`). Pass `NULL` to leave unchanged. |
 | `refresh_mode` | `text` | `NULL` | New refresh mode (`'FULL'` or `'DIFFERENTIAL'`). Pass `NULL` to leave unchanged. |
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
+| `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |
 
 **Examples:**
 
@@ -846,6 +850,51 @@ SELECT * FROM pgtrickle.check_cdc_health();
 |---|---|---|---|---|---|---|
 | 16384 | public.orders | TRIGGER | | | | |
 | 16390 | public.events | WAL | pg_trickle_slot_16390 | 524288 | 0/1A8B000 | |
+
+---
+
+### pgtrickle.diamond_groups
+
+List all detected diamond dependency groups and their members.
+
+When stream tables form diamond-shaped dependency graphs (multiple paths converge at a single fan-in node), the scheduler groups them for coordinated refresh. This function exposes those groups for monitoring and debugging.
+
+```sql
+pgtrickle.diamond_groups() → SETOF record(
+    group_id        int4,
+    member_name     text,
+    member_schema   text,
+    is_convergence  bool,
+    epoch           int8
+)
+```
+
+**Return columns:**
+
+| Column | Type | Description |
+|---|---|---|
+| `group_id` | `int4` | Numeric identifier for the consistency group (1-based). |
+| `member_name` | `text` | Name of the stream table in this group. |
+| `member_schema` | `text` | Schema of the stream table. |
+| `is_convergence` | `bool` | `true` if this member is a convergence (fan-in) node where multiple paths meet. |
+| `epoch` | `int8` | Group epoch counter — advances on each successful atomic refresh of the group. |
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.diamond_groups();
+```
+
+| group_id | member_name | member_schema | is_convergence | epoch |
+|---|---|---|---|---|
+| 1 | st_b | public | false | 0 |
+| 1 | st_c | public | false | 0 |
+| 1 | st_d | public | true | 0 |
+
+**Notes:**
+- Singleton stream tables (not part of any diamond) are omitted.
+- The DAG is rebuilt on each call from the catalog — results reflect the current dependency graph.
+- Groups are only relevant when `diamond_consistency = 'atomic'` is set on the convergence node or globally via the `pg_trickle.diamond_consistency` GUC.
 
 ---
 

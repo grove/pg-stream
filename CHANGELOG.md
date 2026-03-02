@@ -9,7 +9,19 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-*(No unreleased changes.)*
+### Added
+
+- **Diamond dependency consistency** — detect diamond-shaped dependency graphs
+  among stream tables and optionally refresh them as atomic groups using
+  `SAVEPOINT`. Prevents split-version reads at convergence (fan-in) nodes.
+  - New `diamond_consistency` parameter on `create_stream_table()` and
+    `alter_stream_table()` (`'none'` or `'atomic'`).
+  - New `pg_trickle.diamond_consistency` GUC to set the cluster-wide default.
+  - New `pgtrickle.diamond_groups()` monitoring function to inspect detected
+    groups, convergence points, and epoch counters.
+  - Scheduler wraps multi-member groups in a SAVEPOINT when
+    `diamond_consistency = 'atomic'`; on any failure the entire group is
+    rolled back, preserving consistency.
 
 ---
 

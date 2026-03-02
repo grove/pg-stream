@@ -836,7 +836,7 @@ Add to `tests/e2e_diamond_tests.rs`:
 | 5 — Scheduler wiring | `scheduler.rs` | Steps 3, 4 | `just lint` | ✅ Done |
 | 6 — Monitoring function | `api.rs` | Steps 3, 5 | `just lint` | ✅ Done |
 | 7 — E2E tests | `tests/e2e_diamond_tests.rs` | Steps 5, 6 | `just test-e2e` | ✅ Done |
-| 8 — Documentation | `docs/`, `CHANGELOG.md` | Steps 1–7 | `just test-all` | ⬜ Next |
+| 8 — Documentation | `docs/`, `CHANGELOG.md` | Steps 1–7 | `just test-all` | ✅ Done |
 
 ### What Was Implemented (2026-03-02)
 
@@ -912,10 +912,34 @@ Steps 4–7 completed across multiple files:
 
 All 969 unit tests pass. `just fmt && just lint` clean.
 
+### What Was Implemented (Step 8 — Documentation)
+
+**SQL_REFERENCE.md:**
+- Added `diamond_consistency` (6th) parameter to `create_stream_table()` signature, parameter table, and description.
+- Added `diamond_consistency` parameter to `alter_stream_table()` signature and parameter table.
+- Added full `pgtrickle.diamond_groups()` function documentation with return columns, example output, and usage notes.
+
+**CONFIGURATION.md:**
+- Added `pg_trickle.diamond_consistency` GUC section with value table, description, SQL examples, and usage notes.
+- Added `pg_trickle.diamond_consistency = 'none'` to the Complete postgresql.conf Example.
+
+**ARCHITECTURE.md:**
+- Added section 13 "Diamond Dependency Consistency" covering the problem, detection algorithm, consistency groups, scheduler SAVEPOINT wiring, and monitoring.
+- Added `diamond_groups` to Monitoring section's function list.
+- Added `pg_trickle.diamond_consistency` row to the GUC quick reference table.
+
+**CHANGELOG.md:**
+- Added diamond dependency consistency feature under `[Unreleased]` → `### Added`.
+
 ### Prioritized Remaining Work
 
-1. **Step 8 — Documentation** (next): Add `diamond_consistency` to
-   SQL_REFERENCE, CONFIGURATION, ARCHITECTURE, and CHANGELOG.
+All 8 steps are complete. No remaining work for the initial implementation.
+
+Potential future enhancements (not prioritized):
+- Parallel refresh of diamond group members (see §7.1).
+- Expose `diamond_group_id` in `pgtrickle.explain_st()` output.
+- Cache consistency groups in shared memory for large deployments (1000+ STs).
+- Interaction with cron-scheduled STs within diamond groups.
 
 ---
 

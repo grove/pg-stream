@@ -438,6 +438,7 @@ Provides observability functions:
 - **slot_health** — Checks replication slot state and WAL retention.
 - **check_cdc_health** — Per-source CDC health status including mode, slot lag, confirmed LSN, and alerts.
 - **explain_st** — Describes the DVM plan for a given ST.
+- **diamond_groups** — Lists detected diamond dependency groups, their members, convergence points, and epoch counters.
 - **Views** — `pgtrickle.stream_tables_info` (computed staleness) and `pgtrickle.pg_stat_stream_tables` (combined stats).
 
 #### NOTIFY Alerting
@@ -464,7 +465,50 @@ Provides deterministic 64-bit row identifiers using **xxHash (xxh64)** with a fi
 
 Row IDs are written into every stream table's storage as an internal `__pgt_row_id BIGINT` column and are used by the delta application phase to match `DELETE` candidates precisely.
 
-### 13. Configuration (`src/config.rs`)
+### 13. Diamond Dependency Consistency (`src/dag.rs`)
+
+When stream tables form **diamond-shaped dependency graphs**, a convergence (fan-in) node may read from multiple upstream STs that share a common ancestor:
+
+```
+        A (source table)
+       / \
+      B   C   (intermediate STs)
+       \ /
+        D     (convergence / fan-in ST)
+```
+
+If B refreshes successfully but C fails, D would read a fresh version of B's data alongside stale data from C — a **split-version inconsistency**.
+
+#### Detection
+
+`StDag::detect_diamonds()` walks all fan-in nodes (STs with multiple upstream ST dependencies) and computes transitive ancestor sets per branch. If two or more branches share ancestors, a diamond is detected. Overlapping diamonds are merged.
+
+#### Consistency Groups
+
+`StDag::compute_consistency_groups()` converts detected diamonds into **consistency groups** — topologically ordered sets of STs that must be refreshed atomically. Each group contains:
+
+- **Members** — All intermediate STs plus the convergence node, in refresh order.
+- **Convergence points** — The fan-in nodes where multiple paths meet.
+- **Epoch counter** — Advances on each successful atomic refresh.
+
+STs not involved in any diamond are placed in singleton groups (no overhead).
+
+#### Scheduler Wiring
+
+When `diamond_consistency = 'atomic'` (per-ST or via the `pg_trickle.diamond_consistency` GUC):
+
+1. The scheduler wraps each multi-member group in a `SAVEPOINT pgt_consistency_group`.
+2. Each member is refreshed in topological order within the savepoint.
+3. **If all succeed** — `RELEASE SAVEPOINT` and advance the group epoch.
+4. **If any member fails** — `ROLLBACK TO SAVEPOINT` undoes all members' changes. The failure is logged and the group retries on the next scheduler tick.
+
+With `diamond_consistency = 'none'` (default), members refresh independently in topological order — matching pre-feature behavior.
+
+#### Monitoring
+
+The `pgtrickle.diamond_groups()` SQL function exposes detected groups for operational visibility. See [SQL_REFERENCE.md](SQL_REFERENCE.md) for details.
+
+### 14. Configuration (`src/config.rs`)
 
 Twelve GUC (Grand Unified Configuration) variables control runtime behavior, plus five performance-tuning GUCs. See [CONFIGURATION.md](CONFIGURATION.md) for details.
 
@@ -482,6 +526,7 @@ Twelve GUC (Grand Unified Configuration) variables control runtime behavior, plu
 | `pg_trickle.block_source_ddl` | `false` | Block column-affecting DDL on tracked source tables instead of reinit |
 | `pg_trickle.cdc_mode` | `'trigger'` | CDC mechanism: `trigger` / `auto` / `wal` |
 | `pg_trickle.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
+| `pg_trickle.diamond_consistency` | `'none'` | Diamond dependency consistency mode: `none` or `atomic` |
 | `pg_trickle.merge_planner_hints` | `true` | Inject `SET LOCAL` planner hints (disable nestloop, raise work_mem) before MERGE |
 | `pg_trickle.merge_work_mem_mb` | `64` | `work_mem` (MB) applied when delta exceeds 10 000 rows and planner hints enabled |
 | `pg_trickle.use_prepared_statements` | `true` | Use SQL PREPARE/EXECUTE for cached MERGE templates |
