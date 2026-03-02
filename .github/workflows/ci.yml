@@ -135,7 +135,7 @@ jobs:
         uses: ./.github/actions/setup-pgrx
 
       - name: Run benchmarks
-        run: cargo bench --bench refresh_bench --bench diff_operators
+        run: ./scripts/run_benchmarks.sh
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -148,7 +148,7 @@ jobs:
 
   # ── dbt-pgtrickle integration tests (Linux only) ──────────────────────────
   # Cost-optimized: single job builds the Docker image once, then tests
-  # against dbt-core min (1.6) and max (1.9). Intermediate versions are
+  # against dbt-core min (1.6) and max (1.11). Intermediate versions are
   # skipped — if both boundary versions pass, the middle ones will too.
   # Runs on weekly schedule and manual dispatch only (slow Docker build).
   dbt-integration:
@@ -214,7 +214,7 @@ jobs:
           dbt run-operation pgtrickle_check_freshness
           dbt run-operation drop_all_stream_tables
 
-      - name: Test with dbt 1.9 (latest supported)
+      - name: Test with dbt 1.9
         env:
           PGHOST: localhost
           PGPORT: '5432'
@@ -223,6 +223,54 @@ jobs:
           PGDATABASE: postgres
         run: |
           pip install "dbt-core~=1.9.0" "dbt-postgres~=1.9.0"
+          echo "=== dbt version ==="
+          dbt --version
+          cd dbt-pgtrickle/integration_tests
+          dbt deps
+          dbt seed
+          dbt run
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run --full-refresh
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgtrickle_check_freshness
+          dbt run-operation drop_all_stream_tables
+
+      - name: Test with dbt 1.10
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+        run: |
+          pip install "dbt-core~=1.10.0" "dbt-postgres~=1.10.0"
+          echo "=== dbt version ==="
+          dbt --version
+          cd dbt-pgtrickle/integration_tests
+          dbt deps
+          dbt seed
+          dbt run
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run --full-refresh
+          ./scripts/wait_for_populated.sh order_totals 30
+          dbt test
+          dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgtrickle_check_freshness
+          dbt run-operation drop_all_stream_tables
+
+      - name: Test with dbt 1.11 (latest supported)
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+        run: |
+          pip install "dbt-core~=1.11.0" "dbt-postgres~=1.11.0"
           echo "=== dbt version ==="
           dbt --version
           cd dbt-pgtrickle/integration_tests

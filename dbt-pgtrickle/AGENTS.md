@@ -113,7 +113,7 @@ The `stream_table` materialization must handle exactly four cases:
 3. **Exists + query changed:** Drop, then create
 4. **Exists + query unchanged:** Alter (schedule/mode only) or no-op
 
-Always call `adapter.cache_new()` after creating a new relation.
+Always call `adapter.cache_new()` (dbt ≥1.7) or `adapter.cache_added()` (dbt 1.6.x) after creating a new relation — use the `callable` guard in the materialization to support both.
 Always call `run_hooks(pre_hooks)` / `run_hooks(post_hooks)`.
 Always return `{'relations': [target_relation]}`.
 
