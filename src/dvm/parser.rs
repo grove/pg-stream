@@ -984,7 +984,8 @@ impl OpTree {
             // Transparent wrappers — delegate to child
             OpTree::Filter { child, .. }
             | OpTree::Project { child, .. }
-            | OpTree::Subquery { child, .. } => child.needs_pgt_count(),
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.needs_pgt_count(),
             // INTERSECT/EXCEPT use dual counts, not __pgt_count
             OpTree::Intersect { .. } | OpTree::Except { .. } => false,
             _ => false,
@@ -1136,7 +1137,9 @@ impl OpTree {
             OpTree::Window { .. } => {
                 // Window functions like RANK/DENSE_RANK can produce identical
                 // output rows (tied values). Fall back to row_number-based
-                // hash to guarantee uniqueness.
+                // hash in the initial population to guarantee uniqueness.
+                // The window diff operator computes its own unique row_ids
+                // during partition recomputation.
                 None
             }
             OpTree::LateralFunction { .. } => {
@@ -5255,18 +5258,29 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
         .enumerate()
         .map(|(i, (expr, alias))| {
             alias.clone().unwrap_or_else(|| {
-                // Try to extract a simple column name from the expression
-                if let Some(name) = expr.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                    name.to_string()
-                } else {
+                // Try to extract a simple column name from the expression.
+                // Handles both quoted ("name") and unquoted (name) column refs.
+                let trimmed = expr.trim_matches('"');
+                if trimmed.contains('.') || trimmed.contains('(') || trimmed.contains(' ') {
                     format!("__pgt_col_{}", i + 1)
+                } else {
+                    trimmed.to_string()
                 }
             })
         })
         .collect();
 
-    // Row marker: ROW_NUMBER() OVER () for deterministic join
-    let row_marker = "ROW_NUMBER() OVER () AS __pgt_row_marker";
+    // ── Build CTE base with row marker ────────────────────────────────
+    // Use a CTE so the row marker (ROW_NUMBER() OVER ()) is computed once
+    // and referenced as a plain column in each subquery. This avoids
+    // adding a second window function to each subquery which would
+    // trigger the multi-PARTITION BY check recursively.
+    // List columns explicitly (not SELECT *) to avoid A_Star parse issues.
+    let cte_cols: Vec<String> = pt_select.clone();
+    let cte_base = format!(
+        "SELECT {}, ROW_NUMBER() OVER () AS __pgt_row_marker FROM {from_sql}{where_sql}{group_sql}{having_sql}",
+        cte_cols.join(", ")
+    );
 
     // ── Build subqueries for each partition group ─────────────────────
     let mut subquery_aliases: Vec<String> = Vec::new();
@@ -5291,13 +5305,10 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
             window_col_sources.push((sq_alias.clone(), wi.alias.clone()));
         }
 
-        // Include row marker
-        sq_select_parts.push(row_marker.to_string());
+        // Include row marker (now a plain column from the CTE, not a window function)
+        sq_select_parts.push("__pgt_row_marker".to_string());
 
-        let sq_sql = format!(
-            "SELECT {} FROM {from_sql}{where_sql}{group_sql}{having_sql}",
-            sq_select_parts.join(", ")
-        );
+        let sq_sql = format!("SELECT {} FROM __pgt_numbered", sq_select_parts.join(", "));
         subquery_sqls.push(sq_sql);
         subquery_aliases.push(sq_alias);
     }
@@ -5322,6 +5333,12 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
         ));
     }
 
+    // Include __pgt_row_marker in the outer SELECT so the DVM can store
+    // it in the stream table. The Window diff reads old rows from the ST
+    // including pass-through columns; without __pgt_row_marker in storage,
+    // the CTE that fetches old rows would fail with "column does not exist".
+    outer_select_parts.push(format!("\"{first_sq}\".\"__pgt_row_marker\"",));
+
     // ── Build outer FROM (JOIN chain) ──────────────────────────────
     let mut outer_from = format!(
         "({}) AS \"{}\"",
@@ -5343,7 +5360,7 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
     let order_sql = deparse_order_clause(select);
 
     let rewritten = format!(
-        "SELECT {} FROM {outer_from}{order_sql}",
+        "WITH __pgt_numbered AS ({cte_base}) SELECT {} FROM {outer_from}{order_sql}",
         outer_select_parts.join(", ")
     );
 
@@ -7198,29 +7215,29 @@ unsafe fn parse_select_stmt(
             ));
         }
 
-        // Validate: all window expressions must share the same PARTITION BY.
-        // Multi-PARTITION BY should have been rewritten by
-        // rewrite_multi_partition_windows(). If still present, reject.
+        // Determine the shared PARTITION BY for the DVM diff optimizer.
+        // If all window functions share the same PARTITION BY, use it —
+        // the diff engine can then recompute only affected partitions.
+        // When PARTITION BY clauses differ, fall back to empty (un-partitioned)
+        // which triggers full recomputation on any change (correct but
+        // less targeted).
         let canonical_partition: Vec<String> = window_exprs[0]
             .partition_by
             .iter()
             .map(|e| e.to_sql())
             .collect();
-        for wexpr in &window_exprs[1..] {
-            let this_partition: Vec<String> =
-                wexpr.partition_by.iter().map(|e| e.to_sql()).collect();
-            if this_partition != canonical_partition {
-                return Err(PgTrickleError::UnsupportedOperator(
-                    "All window functions in a defining query must share the same \
-                     PARTITION BY clause for differential maintenance. \
-                     The multi-PARTITION BY auto-rewrite did not handle this query; \
-                     consider splitting into separate stream tables."
-                        .into(),
-                ));
-            }
-        }
+        let all_same_partition = window_exprs[1..].iter().all(|wexpr| {
+            let p: Vec<String> = wexpr.partition_by.iter().map(|e| e.to_sql()).collect();
+            p == canonical_partition
+        });
 
-        let partition_by = window_exprs[0].partition_by.clone();
+        let partition_by = if all_same_partition {
+            window_exprs[0].partition_by.clone()
+        } else {
+            // Different PARTITION BY clauses → un-partitioned diff mode
+            // (full recomputation on any change).
+            vec![]
+        };
 
         // If there's also a GROUP BY, build the Aggregate child first.
         if !group_list.is_empty() || has_aggregates {
@@ -10244,6 +10261,11 @@ unsafe fn is_agg_node(node: *mut pg_sys::Node) -> bool {
     }
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
         let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
+        // Window functions (FuncCall with OVER clause) are NOT aggregates,
+        // even if they use aggregate function names like SUM, COUNT.
+        if !fcall.over.is_null() {
+            return false;
+        }
         if fcall.agg_within_group
             || !fcall.agg_order.is_null()
             || fcall.agg_star
@@ -10411,6 +10433,16 @@ unsafe fn extract_aggregates(
 
         if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_FuncCall) } {
             let fcall = unsafe { &*(rt.val as *const pg_sys::FuncCall) };
+
+            // Window functions (FuncCall with OVER clause) are NOT aggregates.
+            // Treat them as plain expressions — they'll be handled by the
+            // window operator path in parse_select_stmt.
+            if !fcall.over.is_null() {
+                let expr = unsafe { node_to_expr(rt.val)? };
+                non_aggs.push(expr);
+                continue;
+            }
+
             let func_name = unsafe { extract_func_name(fcall.funcname)? };
             let name_lower = func_name.to_lowercase();
 

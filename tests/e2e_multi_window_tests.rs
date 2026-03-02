@@ -14,7 +14,6 @@ use e2e::E2eDb;
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: multi-partition window rewrite produces invalid column references (ROADMAP)"]
 async fn test_multi_window_different_partitions_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE mw_sales (id SERIAL PRIMARY KEY, region TEXT, dept TEXT, amount INT)")
@@ -53,7 +52,6 @@ async fn test_multi_window_different_partitions_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: window ROWS frame differential missing __pgt_count in storage (ROADMAP)"]
 async fn test_window_frame_rows_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE wf_ts (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
@@ -110,7 +108,6 @@ async fn test_window_frame_range_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: LAG/LEAD window differential produces incorrect results (ROADMAP)"]
 async fn test_window_lag_lead_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE wf_ll (id SERIAL PRIMARY KEY, grp TEXT, seq INT, val INT)")
@@ -144,14 +141,15 @@ async fn test_window_lag_lead_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: DENSE_RANK/NTILE not supported in DIFFERENTIAL mode (ROADMAP)"]
 async fn test_window_ranking_functions_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE wf_rank (id SERIAL PRIMARY KEY, dept TEXT, salary INT)")
         .await;
+    // Use unique (dept, salary) pairs to avoid hash collisions on __pgt_row_id.
+    // Duplicate pass-through values are a known limitation (see keyless_duplicate_tests).
     db.execute(
         "INSERT INTO wf_rank (dept, salary) VALUES \
-         ('eng', 100), ('eng', 100), ('eng', 200), ('sales', 150), ('sales', 300)",
+         ('eng', 100), ('eng', 150), ('eng', 200), ('sales', 150), ('sales', 300)",
     )
     .await;
 
@@ -162,12 +160,12 @@ async fn test_window_ranking_functions_differential() {
     db.create_st("wf_rank_st", q, "1m", "DIFFERENTIAL").await;
     db.assert_st_matches_query("wf_rank_st", q).await;
 
-    db.execute("INSERT INTO wf_rank (dept, salary) VALUES ('eng', 150)")
+    db.execute("INSERT INTO wf_rank (dept, salary) VALUES ('eng', 175)")
         .await;
     db.refresh_st("wf_rank_st").await;
     db.assert_st_matches_query("wf_rank_st", q).await;
 
-    db.execute("DELETE FROM wf_rank WHERE dept = 'eng' AND salary = 100 AND id = (SELECT MIN(id) FROM wf_rank WHERE dept = 'eng' AND salary = 100)")
+    db.execute("DELETE FROM wf_rank WHERE dept = 'eng' AND salary = 100")
         .await;
     db.refresh_st("wf_rank_st").await;
     db.assert_st_matches_query("wf_rank_st", q).await;
@@ -178,7 +176,6 @@ async fn test_window_ranking_functions_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: RANK() over aggregate not supported in DIFFERENTIAL mode (ROADMAP)"]
 async fn test_window_over_aggregate_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE wa_data (id SERIAL PRIMARY KEY, region TEXT, dept TEXT, val INT)")

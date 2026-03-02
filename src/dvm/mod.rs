@@ -60,8 +60,8 @@ pub use parser::{
     CteRegistry, ParseResult, check_ivm_support, check_ivm_support_with_registry,
     parse_defining_query, parse_defining_query_full, query_has_recursive_cte, reject_limit_offset,
     reject_materialized_views, reject_unsupported_constructs, rewrite_distinct_on,
-    rewrite_grouping_sets, rewrite_multi_partition_windows, rewrite_scalar_subquery_in_where,
-    rewrite_sublinks_in_or, rewrite_views_inline, tree_worst_volatility_with_registry,
+    rewrite_grouping_sets, rewrite_scalar_subquery_in_where, rewrite_sublinks_in_or,
+    rewrite_views_inline, tree_worst_volatility_with_registry,
     warn_limit_without_order_in_subqueries,
 };
 

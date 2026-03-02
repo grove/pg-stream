@@ -110,7 +110,6 @@ async fn test_multi_cycle_join_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: window function differential produces incorrect results across refresh cycles (ROADMAP)"]
 async fn test_multi_cycle_window_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE mc_win (id SERIAL PRIMARY KEY, dept TEXT, salary INT)")

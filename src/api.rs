@@ -93,10 +93,10 @@ fn create_stream_table_impl(
     // per OR arm, so the DVM parser only sees non-OR sublinks.
     let query = &crate::dvm::rewrite_sublinks_in_or(query)?;
 
-    // ── Multiple PARTITION BY → multi-pass window rewrite ──────────
-    // Window functions with different PARTITION BY clauses are split
-    // into separate subqueries joined by a row marker.
-    let query = &crate::dvm::rewrite_multi_partition_windows(query)?;
+    // ── Multiple PARTITION BY → handled natively ────────────────────
+    // Window functions with different PARTITION BY clauses are now
+    // handled by the parser as un-partitioned (full recomputation).
+    // No SQL rewrite needed.
 
     // Validate the defining query by running LIMIT 0
     let columns = validate_defining_query(query)?;
