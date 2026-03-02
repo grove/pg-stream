@@ -11,7 +11,7 @@ adapter. Just Jinja SQL macros that call pg_trickle's SQL API.
 
 | Requirement | Minimum Version |
 |-------------|----------------|
-| dbt Core | ≥ 1.7 |
+| dbt Core | ≥ 1.9 |
 | dbt-postgres adapter | Matching dbt Core version |
 | PostgreSQL | 18.x |
 | pg_trickle extension | ≥ 0.1.0 (`CREATE EXTENSION pg_trickle;`) |

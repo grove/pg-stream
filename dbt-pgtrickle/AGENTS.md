@@ -7,7 +7,7 @@ dbt package providing a `stream_table` custom materialization for the
 SQL macros — no Python adapter code. Works with stock `dbt-postgres`.
 
 - **Language:** Jinja2 SQL (dbt macros)
-- **Framework:** dbt Core ≥ 1.7, dbt-postgres adapter
+- **Framework:** dbt Core ≥ 1.9, dbt-postgres adapter
 - **Target database:** PostgreSQL 18 with pg_trickle extension
 - **Package name:** `dbt_pg_trickle`
 - **License:** Apache 2.0
