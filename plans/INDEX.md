@@ -35,6 +35,7 @@ new entries when creating documents.
 | [GAP_ANALYSIS_FELDERA.md](ecosystem/GAP_ANALYSIS_FELDERA.md) | GAP | — | Core SQL IVM engine comparison vs Feldera |
 | [PLAN_CLOUDNATIVEPG.md](ecosystem/PLAN_CLOUDNATIVEPG.md) | PLAN | Implemented | CloudNativePG image volume extension |
 | [PLAN_ECO_SYSTEM.md](ecosystem/PLAN_ECO_SYSTEM.md) | PLAN | Proposed | Supportive projects ecosystem plan |
+| [REPORT_READYSET.md](ecosystem/REPORT_READYSET.md) | REPORT | Reference | pg_trickle vs ReadySet comparison & layered deployment guidance |
 | [REPORT_TIMESCALEDB.md](ecosystem/REPORT_TIMESCALEDB.md) | REPORT | Research | TimescaleDB synergy — IVM over hypertables & design lessons |
 | [GAP_PG_IVM_COMPARISON.md](ecosystem/GAP_PG_IVM_COMPARISON.md) | GAP | Reference | pg_trickle vs pg_ivm comparison & gap analysis |
 
@@ -70,7 +71,7 @@ new entries when creating documents.
 | File | Type | Status | Summary |
 |------|------|--------|---------|
 | [PLAN_CIRCULAR_REFERENCES.md](sql/PLAN_CIRCULAR_REFERENCES.md) | PLAN | Not started | Circular references in the dependency graph |
-| [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Proposed | Multi-path refresh for diamond dependencies in the DAG |
+| [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Decided | Diamond consistency decision: prioritize atomic refresh groups (with aligned mode fallback) |
 | [PLAN_LATERAL_JOINS.md](sql/PLAN_LATERAL_JOINS.md) | PLAN | Implemented | LATERAL join support (subqueries with LATERAL) |
 | [PLAN_NON_DETERMINISM.md](sql/PLAN_NON_DETERMINISM.md) | PLAN | Not started | Non-deterministic function handling |
 | [REPORT_CUSTOM_SQL_SYNTAX.md](sql/REPORT_CUSTOM_SQL_SYNTAX.md) | REPORT | Reference | PostgreSQL extension syntax mechanisms research |
