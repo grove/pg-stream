@@ -939,7 +939,10 @@ Potential future enhancements (not prioritized):
 - Parallel refresh of diamond group members (see §7.1).
 - Expose `diamond_group_id` in `pgtrickle.explain_st()` output.
 - Cache consistency groups in shared memory for large deployments (1000+ STs).
-- Interaction with cron-scheduled STs within diamond groups.
+
+Next implementation phase (see §11):
+- Steps 9–13: `pg_trickle.diamond_schedule_policy` GUC, scheduler wiring,
+  documentation, and tests.
 
 ---
 
@@ -1036,31 +1039,200 @@ ensures consistency for diamonds even in manual mode.
 
 ---
 
-## 10. Open Questions
+## 10. Open Questions (Resolved)
 
 1. **Granularity of groups:** Should the group include D itself, or only the
    intermediate STs (B, C)? Including D makes the atomic guarantee stronger
    (D's old state is preserved on failure) but increases the group size and
-   lock duration. **Proposed answer:** Include D in the group.
+   lock duration.
+   **Decision:** Include D in the group. ✅ Implemented in Steps 1–3.
 
 2. **Nested diamonds:** If D is itself part of another diamond (D→E, D→F→G,
-   with G joining E and F), should groups be merged transitively? **Proposed
-   answer:** Yes — compute the transitive closure of shared-ancestor
-   relationships and merge overlapping groups.
+   with G joining E and F), should groups be merged transitively?
+   **Decision:** Yes — compute the transitive closure of shared-ancestor
+   relationships and merge overlapping groups. ✅ Implemented in Step 3
+   (`merge_overlapping_diamonds`).
 
 3. **Performance impact of group detection:** The algorithm runs during DAG
    rebuild. For typical deployments (10-50 STs), this is negligible. For
    large deployments (1000+ STs), we may need to cache the result.
-   **Proposed answer:** Cache consistency groups alongside the DAG; rebuild
-   only when `DAG_REBUILD_SIGNAL` advances.
+   **Decision:** Cache consistency groups alongside the DAG; rebuild only
+   when `DAG_REBUILD_SIGNAL` advances. ✅ Already the case — groups are
+   computed from the cached DAG which is rebuilt only on signal.
 
 4. **Interaction with cron schedules:** If B has a `*/5 * * * *` schedule
-   and C has a `*/10 * * * *` schedule, the consistency group forces both to
-   refresh at the slower rate (every 10 minutes). Is this acceptable?
-   **Proposed answer:** Yes, with documentation. Users who need different
-   rates should use `diamond_consistency = 'none'` and accept eventual
-   consistency.
+   and C has a `*/10 * * * *` schedule, how should the group decide when to
+   refresh?
+   **Decision:** Make it configurable via a new `pg_trickle.diamond_schedule_policy`
+   GUC with two values:
+   - `'fastest'` **(default)** — group refreshes when **any** member is due.
+     Over-delivers on freshness for slower members. Correct default because
+     users who opt into `atomic` mode prioritize consistency over efficiency.
+   - `'slowest'` — group refreshes when **all** members are due. Conserves
+     resources but under-delivers freshness for faster members.
+   The policy only applies when `diamond_consistency = 'atomic'`; in `'none'`
+   mode each ST uses its own schedule independently.
+   ⬜ Implementation plan in §11 below.
 
 5. **Monitoring:** How do users know their STs are in a diamond group?
-   **Proposed answer:** Expose via `pgtrickle.diamond_groups()` SQL function
-   and show in `pgtrickle.explain_st()` output.
+   **Decision:** Expose via `pgtrickle.diamond_groups()` SQL function and
+   show in `pgtrickle.explain_st()` output. ✅ `diamond_groups()` implemented
+   in Step 6. `explain_st()` enhancement deferred to future work.
+
+---
+
+## 11. Implementation Plan: Diamond Schedule Policy (Q4)
+
+A new GUC to control when a consistency group's refresh fires relative to
+its members' individual schedules.
+
+### Overview
+
+```
+pg_trickle.diamond_schedule_policy = 'fastest'   -- default
+pg_trickle.diamond_schedule_policy = 'slowest'
+```
+
+| Policy | Trigger condition | Trade-off |
+|---|---|---|
+| `'fastest'` | `any(member, is_due)` | Higher freshness, more refreshes |
+| `'slowest'` | `all(member, is_due)` | Lower resource cost, staler data |
+
+Only takes effect when `diamond_consistency = 'atomic'`. In `'none'` mode,
+each ST uses its own schedule independently — the policy is irrelevant.
+
+### Step 9 — Add `diamond_schedule_policy` GUC
+
+**Files:** `src/config.rs`, `src/lib.rs`
+
+1. Add a `GucSetting<Option<&'static CStr>>` named
+   `PGS_DIAMOND_SCHEDULE_POLICY` with default `"fastest"`.
+
+2. Register in `_PG_init()` as `pg_trickle.diamond_schedule_policy`.
+
+3. Add a public accessor:
+   ```rust
+   pub fn pg_trickle_diamond_schedule_policy() -> String {
+       PGS_DIAMOND_SCHEDULE_POLICY
+           .get()
+           .map(|s| s.to_str().unwrap_or("fastest").to_string())
+           .unwrap_or_else(|| "fastest".to_string())
+   }
+   ```
+
+4. Add a `DiamondSchedulePolicy` enum in `dag.rs`:
+   ```rust
+   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   pub enum DiamondSchedulePolicy {
+       Fastest,
+       Slowest,
+   }
+
+   impl DiamondSchedulePolicy {
+       pub fn from_str(s: &str) -> Option<Self> {
+           match s.trim().to_lowercase().as_str() {
+               "fastest" => Some(Self::Fastest),
+               "slowest" => Some(Self::Slowest),
+               _ => None,
+           }
+       }
+   }
+   ```
+
+**Validation:** `just fmt && just lint`.
+
+### Step 10 — Wire group schedule evaluation into the scheduler
+
+**Files:** `src/scheduler.rs`
+
+The current scheduler evaluates each ST's schedule individually in the
+topological loop. With consistency groups, the group-level loop must
+evaluate whether the **group as a whole** is due.
+
+1. Add a helper function:
+   ```rust
+   /// Determine if a consistency group is due for refresh.
+   fn is_group_due(
+       group: &ConsistencyGroup,
+       policy: DiamondSchedulePolicy,
+       dag: &StDag,
+   ) -> bool {
+       let member_due: Vec<bool> = group.members.iter().filter_map(|m| {
+           if let NodeId::StreamTable(id) = m {
+               load_st_by_id(*id).map(|st| check_schedule(&st, dag) || st.needs_reinit)
+           } else {
+               None
+           }
+       }).collect();
+
+       match policy {
+           DiamondSchedulePolicy::Fastest => member_due.iter().any(|&d| d),
+           DiamondSchedulePolicy::Slowest => member_due.iter().all(|&d| d),
+       }
+   }
+   ```
+
+2. In the group-aware refresh loop (the `compute_consistency_groups()` path),
+   replace per-member `check_schedule()` with `is_group_due()` for
+   multi-member groups. Singleton groups continue using the existing
+   per-ST `check_schedule()` directly.
+
+3. When the group **is** due, refresh **all** members regardless of their
+   individual schedule status — the atomic guarantee requires all-or-nothing.
+
+**Validation:** `just fmt && just lint`.
+
+### Step 11 — Documentation
+
+**Files:** `docs/CONFIGURATION.md`, `docs/ARCHITECTURE.md`, `docs/SQL_REFERENCE.md`
+
+1. **CONFIGURATION.md** — Add a `### pg_trickle.diamond_schedule_policy`
+   section documenting both values, default, and interaction with
+   `diamond_consistency`.
+
+2. **ARCHITECTURE.md** — Update the "Diamond Dependency Consistency"
+   section (§13) to mention the schedule policy and its effect on group
+   refresh timing.
+
+3. **SQL_REFERENCE.md** — Note in the `diamond_groups()` function docs that
+   the active schedule policy affects when groups fire.
+
+4. **CHANGELOG.md** — Add under `[Unreleased]`.
+
+**Validation:** `just fmt && just lint`.
+
+### Step 12 — Unit tests
+
+**Files:** `src/dag.rs` (`#[cfg(test)]`), `src/scheduler.rs` (`#[cfg(test)]`)
+
+| Test name | What it proves |
+|---|---|
+| `test_diamond_schedule_policy_from_str` | Parses `"fastest"`, `"slowest"`, rejects invalid |
+| `test_diamond_schedule_policy_default` | Default is `Fastest` |
+| `test_is_group_due_fastest_any_triggers` | With `Fastest`, group fires when any member is due |
+| `test_is_group_due_slowest_all_required` | With `Slowest`, group fires only when all are due |
+| `test_is_group_due_singleton_bypass` | Singleton groups bypass policy check |
+
+**Validation:** `just test-unit`.
+
+### Step 13 — E2E tests
+
+**Files:** `tests/e2e_diamond_tests.rs`
+
+| Test name | What it proves |
+|---|---|
+| `test_diamond_schedule_policy_fastest` | With `fastest`, group refreshes when fastest member is due |
+| `test_diamond_schedule_policy_slowest` | With `slowest`, group waits until slowest member is due |
+| `test_diamond_schedule_policy_none_mode_ignored` | Policy has no effect when `diamond_consistency = 'none'` |
+
+**Validation:** `just test-e2e`.
+
+### Implementation Order Summary
+
+| Step | File(s) | Depends on | Testable with | Status |
+|---|---|---|---|---|
+| 9 — GUC + enum | `config.rs`, `lib.rs`, `dag.rs` | Steps 1–8 | `just lint` | ⬜ Next |
+| 10 — Scheduler wiring | `scheduler.rs` | Step 9 | `just lint` | ⬜ |
+| 11 — Documentation | `docs/`, `CHANGELOG.md` | Step 10 | `just lint` | ⬜ |
+| 12 — Unit tests | `dag.rs`, `scheduler.rs` | Step 10 | `just test-unit` | ⬜ |
+| 13 — E2E tests | `tests/e2e_diamond_tests.rs` | Step 10 | `just test-e2e` | ⬜ |
