@@ -378,6 +378,22 @@ pub fn query_needs_pgt_count(defining_query: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Check whether a defining query is an INTERSECT or EXCEPT that needs
+/// dual-count columns (`__pgt_count_l`, `__pgt_count_r`).
+pub fn query_needs_dual_count(defining_query: &str) -> bool {
+    parse_defining_query(defining_query)
+        .map(|tree| tree.needs_dual_count())
+        .unwrap_or(false)
+}
+
+/// Check whether a defining query is a UNION (without ALL) that needs
+/// deduplicated counting via a wrapped UNION ALL.
+pub fn query_needs_union_dedup_count(defining_query: &str) -> bool {
+    parse_defining_query(defining_query)
+        .map(|tree| tree.needs_union_dedup_count())
+        .unwrap_or(false)
+}
+
 /// Extract GROUP BY column names from a defining query.
 ///
 /// Returns `Some(["region", "category"])` for aggregate queries with
@@ -577,6 +593,331 @@ fn split_top_level_union_all(query: &str) -> Option<Vec<String>> {
     parts.push(query[last_split..].trim().to_string());
 
     if parts.len() >= 2 { Some(parts) } else { None }
+}
+
+/// Replace top-level `UNION` (without `ALL`) keywords with `UNION ALL`.
+///
+/// Returns `None` when no replaceable `UNION` is found.
+/// Respects parentheses, single-quoted strings, and double-quoted identifiers.
+fn replace_top_level_union_with_union_all(query: &str) -> Option<String> {
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut result = String::new();
+    let mut depth: i32 = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut last_copy = 0;
+    let mut found = false;
+
+    let mut i = 0;
+    while i < len {
+        let ch = bytes[i];
+
+        if in_single_quote {
+            if ch == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double_quote {
+            if ch == b'"' {
+                if i + 1 < len && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            b'\'' => in_single_quote = true,
+            b'"' => in_double_quote = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                // Look for UNION keyword at word boundary
+                if i + 5 <= len
+                    && query[i..i + 5].eq_ignore_ascii_case("UNION")
+                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                    && (i + 5 >= len
+                        || !(bytes[i + 5].is_ascii_alphanumeric() || bytes[i + 5] == b'_'))
+                {
+                    // Skip whitespace after UNION
+                    let mut j = i + 5;
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    // Check if NOT followed by ALL
+                    let has_all = j + 3 <= len
+                        && query[j..j + 3].eq_ignore_ascii_case("ALL")
+                        && (j + 3 >= len
+                            || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'));
+                    if !has_all {
+                        // Insert " ALL" after UNION
+                        result.push_str(&query[last_copy..i + 5]);
+                        result.push_str(" ALL");
+                        last_copy = i + 5;
+                        found = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        i += 1;
+    }
+
+    if found {
+        result.push_str(&query[last_copy..]);
+        Some(result)
+    } else {
+        None
+    }
+}
+
+/// For UNION (without ALL) queries, generate a full-refresh SELECT that
+/// computes per-unique-row multiplicity counts across all branches by
+/// converting `UNION` to `UNION ALL` and wrapping with `COUNT(*)`.
+///
+/// Returns `None` when the query does not contain a replaceable top-level
+/// `UNION` keyword.
+pub fn try_union_dedup_refresh_sql(
+    defining_query: &str,
+    column_names: &[String],
+) -> Option<String> {
+    let union_all_version = replace_top_level_union_with_union_all(defining_query)?;
+
+    let quoted_cols: Vec<String> = column_names.iter().map(|c| diff::quote_ident(c)).collect();
+    let sub_cols: Vec<String> = column_names
+        .iter()
+        .map(|c| format!("sub.{}", diff::quote_ident(c)))
+        .collect();
+    let col_list = sub_cols.join(", ");
+    let group_list = sub_cols.join(", ");
+
+    // Hash expression for __pgt_row_id (references outer sub2)
+    let hash_items: Vec<String> = quoted_cols
+        .iter()
+        .map(|c| format!("sub2.{c}::TEXT"))
+        .collect();
+    let hash_expr = if hash_items.len() == 1 {
+        format!("pgtrickle.pg_trickle_hash({})", hash_items[0])
+    } else {
+        format!(
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+            hash_items.join(", ")
+        )
+    };
+
+    let outer_cols: Vec<String> = quoted_cols.iter().map(|c| format!("sub2.{c}")).collect();
+    let outer_col_list = outer_cols.join(", ");
+
+    let sql = format!(
+        "SELECT {hash_expr} AS __pgt_row_id, {outer_col_list}, sub2.__pgt_count\n\
+         FROM (\n\
+         \x20 SELECT {col_list}, COUNT(*) AS __pgt_count\n\
+         \x20 FROM ({union_all_version}) sub\n\
+         \x20 GROUP BY {group_list}\n\
+         ) sub2"
+    );
+
+    Some(sql)
+}
+
+/// The kind and components of a top-level INTERSECT or EXCEPT operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetOpKind {
+    Intersect,
+    IntersectAll,
+    Except,
+    ExceptAll,
+}
+
+/// Result of splitting a query on a top-level set operation keyword.
+#[derive(Debug, Clone)]
+pub struct SetOpParts {
+    pub kind: SetOpKind,
+    pub left: String,
+    pub right: String,
+}
+
+/// Split a SQL query on the **outermost** `INTERSECT [ALL]` or `EXCEPT [ALL]`
+/// keyword. Returns `None` when no top-level set operation is found.
+///
+/// Respects parentheses, single-quoted strings, and double-quoted identifiers,
+/// following the same approach as `split_top_level_union_all`.
+fn split_top_level_set_op(query: &str) -> Option<SetOpParts> {
+    let bytes = query.as_bytes();
+    let len = bytes.len();
+    let mut depth: i32 = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+
+    let mut i = 0;
+    while i < len {
+        let ch = bytes[i];
+
+        if in_single_quote {
+            if ch == b'\'' {
+                if i + 1 < len && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double_quote {
+            if ch == b'"' {
+                if i + 1 < len && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            b'\'' => in_single_quote = true,
+            b'"' => in_double_quote = true,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 => {
+                let is_word_start =
+                    i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+
+                // Try INTERSECT (9 chars)
+                if is_word_start
+                    && i + 9 <= len
+                    && query[i..i + 9].eq_ignore_ascii_case("INTERSECT")
+                    && (i + 9 >= len
+                        || !(bytes[i + 9].is_ascii_alphanumeric() || bytes[i + 9] == b'_'))
+                {
+                    let left = query[..i].trim().to_string();
+                    let mut j = i + 9;
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    let (kind, right_start) = if j + 3 <= len
+                        && query[j..j + 3].eq_ignore_ascii_case("ALL")
+                        && (j + 3 >= len
+                            || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'))
+                    {
+                        (SetOpKind::IntersectAll, j + 3)
+                    } else {
+                        (SetOpKind::Intersect, i + 9)
+                    };
+                    let right = query[right_start..].trim().to_string();
+                    return Some(SetOpParts { kind, left, right });
+                }
+
+                // Try EXCEPT (6 chars)
+                if is_word_start
+                    && i + 6 <= len
+                    && query[i..i + 6].eq_ignore_ascii_case("EXCEPT")
+                    && (i + 6 >= len
+                        || !(bytes[i + 6].is_ascii_alphanumeric() || bytes[i + 6] == b'_'))
+                {
+                    let left = query[..i].trim().to_string();
+                    let mut j = i + 6;
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    let (kind, right_start) = if j + 3 <= len
+                        && query[j..j + 3].eq_ignore_ascii_case("ALL")
+                        && (j + 3 >= len
+                            || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'))
+                    {
+                        (SetOpKind::ExceptAll, j + 3)
+                    } else {
+                        (SetOpKind::Except, i + 6)
+                    };
+                    let right = query[right_start..].trim().to_string();
+                    return Some(SetOpParts { kind, left, right });
+                }
+            }
+            _ => {}
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+/// For INTERSECT / EXCEPT queries, generate a full-refresh SELECT that
+/// computes per-branch multiplicity counts (`__pgt_count_l`, `__pgt_count_r`)
+/// matching the storage schema used by the differential operators.
+///
+/// Returns `None` when the query is not a top-level set operation.
+pub fn try_set_op_refresh_sql(defining_query: &str, column_names: &[String]) -> Option<String> {
+    let parts = split_top_level_set_op(defining_query)?;
+
+    let quoted_cols: Vec<String> = column_names.iter().map(|c| diff::quote_ident(c)).collect();
+    let col_list = quoted_cols.join(", ");
+
+    // Hash expression for __pgt_row_id (same formula as the diff operators)
+    let hash_items: Vec<String> = column_names
+        .iter()
+        .map(|c| format!("l.{}::TEXT", diff::quote_ident(c)))
+        .collect();
+    let hash_expr = if hash_items.len() == 1 {
+        format!("pgtrickle.pg_trickle_hash({})", hash_items[0])
+    } else {
+        format!(
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+            hash_items.join(", ")
+        )
+    };
+
+    let l_cols: Vec<String> = column_names
+        .iter()
+        .map(|c| format!("l.{}", diff::quote_ident(c)))
+        .collect();
+    let l_col_list = l_cols.join(", ");
+
+    let (join_type, where_clause) = match parts.kind {
+        SetOpKind::Intersect => ("INNER JOIN", String::new()),
+        SetOpKind::IntersectAll => ("INNER JOIN", String::new()),
+        SetOpKind::Except => ("LEFT JOIN", "\nWHERE r.__cnt IS NULL".to_string()),
+        SetOpKind::ExceptAll => (
+            "LEFT JOIN",
+            "\nWHERE l.__cnt > COALESCE(r.__cnt, 0)".to_string(),
+        ),
+    };
+
+    let sql = format!(
+        "WITH __pgt_left AS (\n\
+         \x20 SELECT {col_list}, COUNT(*) AS __cnt\n\
+         \x20 FROM ({left}) __sub\n\
+         \x20 GROUP BY {col_list}\n\
+         ),\n\
+         __pgt_right AS (\n\
+         \x20 SELECT {col_list}, COUNT(*) AS __cnt\n\
+         \x20 FROM ({right}) __sub\n\
+         \x20 GROUP BY {col_list}\n\
+         )\n\
+         SELECT {hash_expr} AS __pgt_row_id,\n\
+         \x20      {l_col_list},\n\
+         \x20      l.__cnt AS __pgt_count_l,\n\
+         \x20      COALESCE(r.__cnt, 0) AS __pgt_count_r\n\
+         FROM __pgt_left l\n\
+         {join_type} __pgt_right r USING ({col_list}){where_clause}",
+        left = parts.left,
+        right = parts.right,
+    );
+
+    Some(sql)
 }
 
 /// Get output column names from a defining query by running it with LIMIT 0.
@@ -879,6 +1220,84 @@ mod tests {
     fn test_needs_pgt_count_scan_false() {
         let s = scan(1, "t", "public", "t", &["id"]);
         assert!(!s.needs_pgt_count());
+    }
+
+    // ── split_top_level_set_op ──────────────────────────────────────
+
+    #[test]
+    fn test_split_set_op_intersect() {
+        let parts =
+            split_top_level_set_op("SELECT val FROM t1 INTERSECT SELECT val FROM t2").unwrap();
+        assert_eq!(parts.kind, SetOpKind::Intersect);
+        assert_eq!(parts.left, "SELECT val FROM t1");
+        assert_eq!(parts.right, "SELECT val FROM t2");
+    }
+
+    #[test]
+    fn test_split_set_op_intersect_all() {
+        let parts =
+            split_top_level_set_op("SELECT val FROM t1 INTERSECT ALL SELECT val FROM t2").unwrap();
+        assert_eq!(parts.kind, SetOpKind::IntersectAll);
+        assert_eq!(parts.left, "SELECT val FROM t1");
+        assert_eq!(parts.right, "SELECT val FROM t2");
+    }
+
+    #[test]
+    fn test_split_set_op_except() {
+        let parts = split_top_level_set_op("SELECT val FROM t1 EXCEPT SELECT val FROM t2").unwrap();
+        assert_eq!(parts.kind, SetOpKind::Except);
+        assert_eq!(parts.left, "SELECT val FROM t1");
+        assert_eq!(parts.right, "SELECT val FROM t2");
+    }
+
+    #[test]
+    fn test_split_set_op_except_all() {
+        let parts =
+            split_top_level_set_op("SELECT val FROM t1 EXCEPT ALL SELECT val FROM t2").unwrap();
+        assert_eq!(parts.kind, SetOpKind::ExceptAll);
+        assert_eq!(parts.left, "SELECT val FROM t1");
+        assert_eq!(parts.right, "SELECT val FROM t2");
+    }
+
+    #[test]
+    fn test_split_set_op_case_insensitive() {
+        let parts =
+            split_top_level_set_op("SELECT val FROM t1 intersect SELECT val FROM t2").unwrap();
+        assert_eq!(parts.kind, SetOpKind::Intersect);
+    }
+
+    #[test]
+    fn test_split_set_op_inside_parens_not_split() {
+        let result = split_top_level_set_op("SELECT * FROM (SELECT 1 INTERSECT SELECT 2) sub");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_split_set_op_no_set_op() {
+        assert!(split_top_level_set_op("SELECT id FROM t1").is_none());
+    }
+
+    #[test]
+    fn test_split_set_op_parenthesized_left() {
+        let parts = split_top_level_set_op(
+            "(SELECT val FROM t1 UNION ALL SELECT val FROM t2) EXCEPT SELECT val FROM t3",
+        )
+        .unwrap();
+        assert_eq!(parts.kind, SetOpKind::Except);
+        assert_eq!(
+            parts.left,
+            "(SELECT val FROM t1 UNION ALL SELECT val FROM t2)"
+        );
+        assert_eq!(parts.right, "SELECT val FROM t3");
+    }
+
+    #[test]
+    fn test_split_set_op_preserves_quoted_strings() {
+        let parts =
+            split_top_level_set_op("SELECT 'INTERSECT' FROM t1 INTERSECT SELECT val FROM t2")
+                .unwrap();
+        assert_eq!(parts.kind, SetOpKind::Intersect);
+        assert_eq!(parts.left, "SELECT 'INTERSECT' FROM t1");
     }
 
     // ── is_scalar_aggregate_root() ─────────────────────────────────

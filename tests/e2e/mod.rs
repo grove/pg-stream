@@ -415,7 +415,7 @@ impl E2eDb {
              FROM information_schema.columns \
              WHERE (table_schema || '.' || table_name = '{st_table}' \
                 OR table_name = '{st_table}') \
-             AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
+             AND column_name NOT IN ('__pgt_row_id', '__pgt_count', '__pgt_count_l', '__pgt_count_r')"
         );
         let (raw_cols, cast_cols): (Option<String>, Option<String>) = sqlx::query_as(&cols_sql)
             .fetch_one(&self.pool)

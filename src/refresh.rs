@@ -811,9 +811,27 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
-    // For UNION ALL queries, decompose into per-branch subqueries with
+    // For INTERSECT/EXCEPT, compute per-branch multiplicities for dual-count
+    // storage. For UNION (dedup), convert to UNION ALL and count.
+    // For UNION ALL, decompose into per-branch subqueries with
     // child-prefixed row IDs matching diff_union_all's formula.
-    let insert_body = if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(query) {
+    let insert_body = if crate::dvm::query_needs_dual_count(query) {
+        let col_names = crate::dvm::get_defining_query_columns(query)?;
+        if let Some(set_op_sql) = crate::dvm::try_set_op_refresh_sql(query, &col_names) {
+            set_op_sql
+        } else {
+            let row_id_expr = crate::dvm::row_id_expr_for_query(query);
+            format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
+        }
+    } else if crate::dvm::query_needs_union_dedup_count(query) {
+        let col_names = crate::dvm::get_defining_query_columns(query)?;
+        if let Some(union_sql) = crate::dvm::try_union_dedup_refresh_sql(query, &col_names) {
+            union_sql
+        } else {
+            let row_id_expr = crate::dvm::row_id_expr_for_query(query);
+            format!("SELECT {row_id_expr} AS __pgt_row_id, sub.* FROM ({effective_query}) sub",)
+        }
+    } else if let Some(ua_sql) = crate::dvm::try_union_all_refresh_sql(query) {
         ua_sql
     } else {
         let row_id_expr = crate::dvm::row_id_expr_for_query(query);
