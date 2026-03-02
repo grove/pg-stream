@@ -70,6 +70,7 @@ new entries when creating documents.
 
 | File | Type | Status | Summary |
 |------|------|--------|---------|
+| [PLAN_CIRCUIT_BREAKER.md](sql/PLAN_CIRCUIT_BREAKER.md) | PLAN | Exploration | Circuit breaker — halt refresh on anomalous change volume |
 | [PLAN_CIRCULAR_REFERENCES.md](sql/PLAN_CIRCULAR_REFERENCES.md) | PLAN | Not started | Circular references in the dependency graph |
 | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) | PLAN | Proposed | Cross-source snapshot consistency for converging independent branches |
 | [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Decided | Diamond consistency decision: prioritize atomic refresh groups (with aligned mode fallback) |
@@ -78,6 +79,7 @@ new entries when creating documents.
 | [REPORT_CUSTOM_SQL_SYNTAX.md](sql/REPORT_CUSTOM_SQL_SYNTAX.md) | REPORT | Reference | PostgreSQL extension syntax mechanisms research |
 | [REPORT_DB_SCHEMA_STABILITY.md](sql/REPORT_DB_SCHEMA_STABILITY.md) | REPORT | Assessment | Database schema stability assessment (pre-1.0) |
 | [PLAN_HYBRID_CDC.md](sql/PLAN_HYBRID_CDC.md) | PLAN | Complete | Hybrid CDC — trigger bootstrap → logical replication |
+| [PLAN_WATERMARK_GATING.md](sql/PLAN_WATERMARK_GATING.md) | PLAN | Exploration | User-provided watermarks for cross-source gating of externally-loaded data |
 | [PLAN_NATIVE_SYNTAX.md](sql/PLAN_NATIVE_SYNTAX.md) | PLAN | Proposed | Native PostgreSQL syntax for stream tables |
 | [PLAN_TRANSACTIONAL_IVM.md](sql/PLAN_TRANSACTIONAL_IVM.md) | PLAN | Proposed | Transactionally updated views (immediate IVM) |
 | [PLAN_UPGRADE_MIGRATIONS.md](sql/PLAN_UPGRADE_MIGRATIONS.md) | PLAN | Draft | Extension upgrade migrations |
