@@ -47,7 +47,7 @@ new entries when creating documents.
 | [PLAN_CODECOV.md](infra/PLAN_CODECOV.md) | PLAN | Implementing | Codecov integration for coverage reporting |
 | [PLAN_GITHUB_ACTIONS_COST.md](infra/PLAN_GITHUB_ACTIONS_COST.md) | PLAN | — | Reduce GitHub Actions resource consumption |
 | [PLAN_DOCKER_IMAGE.md](infra/PLAN_DOCKER_IMAGE.md) | PLAN | Draft | Official Docker image |
-| [PLAN_EXTERNAL_PROCESS.md](infra/PLAN_EXTERNAL_PROCESS.md) | REPORT | Exploration | External sidecar process feasibility study |
+| [REPORT_EXTERNAL_PROCESS.md](infra/REPORT_EXTERNAL_PROCESS.md) | REPORT | Exploration | External sidecar process feasibility study |
 | [PLAN_MULTI_DATABASE.md](infra/PLAN_MULTI_DATABASE.md) | PLAN | Draft | Multi-database support |
 | [PLAN_PARTITIONING_SHARDING.md](infra/PLAN_PARTITIONING_SHARDING.md) | PLAN | Research | PostgreSQL partitioning & sharding compatibility |
 | [PLAN_PACKAGING.md](infra/PLAN_PACKAGING.md) | PLAN | Draft | Distribution packaging |
@@ -71,6 +71,7 @@ new entries when creating documents.
 | File | Type | Status | Summary |
 |------|------|--------|---------|
 | [PLAN_CIRCULAR_REFERENCES.md](sql/PLAN_CIRCULAR_REFERENCES.md) | PLAN | Not started | Circular references in the dependency graph |
+| [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) | PLAN | Proposed | Cross-source snapshot consistency for converging independent branches |
 | [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Decided | Diamond consistency decision: prioritize atomic refresh groups (with aligned mode fallback) |
 | [PLAN_LATERAL_JOINS.md](sql/PLAN_LATERAL_JOINS.md) | PLAN | Implemented | LATERAL join support (subqueries with LATERAL) |
 | [PLAN_NON_DETERMINISM.md](sql/PLAN_NON_DETERMINISM.md) | PLAN | Not started | Non-deterministic function handling |

@@ -1,4 +1,4 @@
-# PLAN_EXTERNAL_PROCESS.md — External Sidecar Process Architecture
+# REPORT_EXTERNAL_PROCESS.md — External Sidecar Process Architecture
 
 > **Status:** Exploration / Feasibility Study  
 > **Target version:** Post-1.0 (if pursued)  
