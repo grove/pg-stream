@@ -46,7 +46,7 @@ jobs:
           ./scripts/run_benchmarks.sh -- --output-format bencher | tee bench-output.txt
 
       - name: Upload benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: criterion-results
