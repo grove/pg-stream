@@ -29,7 +29,7 @@ on:
       - '.github/workflows/ci.yml'
       - '.github/actions/**'
   schedule:
-    - cron: '0 6 * * 1'  # Weekly Monday 06:00 UTC — full matrix
+    - cron: '0 5 * * *'  # Daily 05:00 UTC — full matrix
   workflow_dispatch:
 
 concurrency:
