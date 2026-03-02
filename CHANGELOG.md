@@ -135,9 +135,9 @@ test compilation.
 
 ### Changed
 
-- **Test count:** ~1,759 total tests (up from ~1,138), 460 E2E tests across
-  34 test files (up from ~22).
-- **14 new GUC variables** — `buffer_alert_threshold` added. Total: 13 GUCs.
+- **Test count:** ~1,442 total tests (up from ~1,138): 954 unit + 28 integration
+  + 460 E2E across 34 test files (up from ~22).
+- **1 new GUC variable** — `buffer_alert_threshold` added. Total: 16 GUCs.
 
 ---
 

@@ -329,7 +329,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** ~1,196 unit tests + 74 integration tests + 34 E2E test suites (~460 E2E tests), 0 failures.
+**Test counts:** ~954 unit tests + 28 integration tests + 34 E2E test suites (~460 E2E tests).
 
 ### Code Coverage
 
