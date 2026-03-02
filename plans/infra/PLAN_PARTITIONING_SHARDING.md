@@ -2,7 +2,7 @@
 
 **Status:** Plan  
 **Date:** 2026-03-01  
-**Related:** [PLAN_CITUS.md](PLAN_CITUS.md) · [PLAN_TIMESCALEDB.md](../ecosystem/PLAN_TIMESCALEDB.md) · [REPORT_TRIGGERS_VS_REPLICATION.md](../sql/REPORT_TRIGGERS_VS_REPLICATION.md)
+**Related:** [PLAN_CITUS.md](PLAN_CITUS.md) · [REPORT_TIMESCALEDB.md](../ecosystem/REPORT_TIMESCALEDB.md) · [REPORT_TRIGGERS_VS_REPLICATION.md](../sql/REPORT_TRIGGERS_VS_REPLICATION.md)
 
 ---
 
@@ -80,7 +80,7 @@ Partition strategies: `RANGE`, `LIST`, `HASH`. Sub-partitioning is supported.
   Dropping old partitions is equivalent to `DROP TABLE` on a child — the parent
   OID remains valid.
 - **TimescaleDB hypertables** — Transparent time-based partitioning. See
-  [PLAN_TIMESCALEDB.md](../ecosystem/PLAN_TIMESCALEDB.md) for detailed analysis.
+  [REPORT_TIMESCALEDB.md](../ecosystem/REPORT_TIMESCALEDB.md) for detailed analysis.
   Hypertables are partitioned tables with additional metadata; triggers on the
   parent propagate to chunks.
 
@@ -431,7 +431,7 @@ file with tests covering the scenarios above.
 | **Native partitioning (RANGE/LIST/HASH)** | Works (PG 13+) | Not supported | Ready with caveats |
 | **Sub-partitioning** | Works (same as above) | Not supported | Untested |
 | **pg_partman managed** | Works (triggers propagate to new partitions) | Not supported | Untested |
-| **TimescaleDB hypertables** | Works (see [PLAN_TIMESCALEDB.md](../ecosystem/PLAN_TIMESCALEDB.md)) | Not supported | Research |
+| **TimescaleDB hypertables** | Works (see [REPORT_TIMESCALEDB.md](../ecosystem/REPORT_TIMESCALEDB.md)) | Not supported | Research |
 | **Citus distributed** | Not supported | Not supported | See [PLAN_CITUS.md](PLAN_CITUS.md) |
 | **Citus reference tables** | Works (coordinator-local triggers) | Possible | Untested |
 | **FDW foreign tables** | Full refresh only | N/A | Needs implementation |

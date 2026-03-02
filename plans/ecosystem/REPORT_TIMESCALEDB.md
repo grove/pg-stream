@@ -1,4 +1,4 @@
-# PLAN_TIMESCALEDB.md — TimescaleDB Synergy & Lessons for pg_trickle
+# REPORT_TIMESCALEDB.md — TimescaleDB Synergy & Lessons for pg_trickle
 
 Date: 2026-03-01
 Status: RESEARCH
@@ -236,8 +236,8 @@ workloads (UPDATEs/DELETEs require MERGE-like semantics, not UNION ALL).
 **Priority:** Phase 2 — high user value; aligns with the "freshness without
 latency" goal.
 
-**See also:** [PLAN_STREAMING_AGGREGATION.md](../sql/PLAN_STREAMING_AGGREGATION.md)
-for the sub-second latency path, which overlaps with this idea.
+**See also:** [PLAN_TRANSACTIONAL_IVM.md](../sql/PLAN_TRANSACTIONAL_IVM.md)
+for transactionally updated views (immediate IVM), which overlaps with this idea.
 
 ### 5.3. Append-Only Fast Path
 
@@ -412,5 +412,5 @@ robust for error scenarios where refreshes fail repeatedly.
 - [TimescaleDB source — Invalidation log](https://github.com/timescale/timescaledb/blob/main/src/ts_catalog/continuous_agg.h)
 - [DBSP paper (Budiu et al., 2022)](https://arxiv.org/abs/2203.16684)
 - pg_trickle [ARCHITECTURE.md](../../docs/ARCHITECTURE.md)
-- pg_trickle [PLAN_STREAMING_AGGREGATION.md](../sql/PLAN_STREAMING_AGGREGATION.md)
+- pg_trickle [PLAN_TRANSACTIONAL_IVM.md](../sql/PLAN_TRANSACTIONAL_IVM.md)
 - pg_trickle [PLAN_CITUS.md](../infra/PLAN_CITUS.md) — similar extension-compat plan

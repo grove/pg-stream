@@ -1,4 +1,4 @@
-# PLAN_DB_SCHEMA_STABILITY.md — Database Schema Stability Assessment
+# REPORT_DB_SCHEMA_STABILITY.md — Database Schema Stability Assessment
 
 **Author:** pg_trickle team  
 **Date:** 2026-02-25  

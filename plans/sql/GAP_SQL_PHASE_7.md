@@ -971,7 +971,7 @@ extension creation. Grant access only to the extension owner.
 |-------|-------|
 | **Problem** | No `ALTER EXTENSION pg_trickle UPDATE` migration SQL files exist. Upgrading the extension binary without a migration path strands the catalog at the old schema version. |
 | **Severity** | **P3** |
-| **Effort** | See `plans/sql/PLAN_DB_SCHEMA_STABILITY.md` for full analysis |
+| **Effort** | See `plans/sql/REPORT_DB_SCHEMA_STABILITY.md` for full analysis |
 
 **Recommendation:** Implement versioned SQL migration files before 1.0 release.
 
@@ -1204,7 +1204,7 @@ verification tests pass.
 | **F37** | G5.1 | DISTINCT ON without ORDER BY warning | 1h | ✅ Done (warning in rewrite_distinct_on) |
 | **F38** | G5.5 | NATURAL JOIN column drift tracking | 2–3h | ✅ Done (warning when NATURAL JOIN is resolved) |
 | **F39** | G7.2 | Drop orphaned buffer table columns | 2–3h | ✅ Done (sync_change_buffer_columns drops orphaned columns) |
-| **F40** | G8.3 | Extension upgrade migration scripts | See PLAN_DB_SCHEMA_STABILITY.md | ⬜ Deferred |
+| **F40** | G8.3 | Extension upgrade migration scripts | See REPORT_DB_SCHEMA_STABILITY.md | ⬜ Deferred |
 
 **Estimated effort:** 25–36 hours → **Actual: ~6 hours (F28, F36 already done; F40 deferred)**  
 **Status: 13/14 COMPLETE (F40 deferred)**
@@ -1242,7 +1242,7 @@ verification tests pass.
 
 ### Remaining Work (Prioritized)
 
-1. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to PLAN_DB_SCHEMA_STABILITY.md
+1. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to REPORT_DB_SCHEMA_STABILITY.md
 
 All other items are complete. F9 (recursive CTE monotonicity audit) was resolved
 with `recursive_term_is_non_monotone()` guard in `recursive_cte.rs` that forces
@@ -1336,10 +1336,10 @@ and robustly in all edge cases under production conditions?"
 **Minimum viable 1.0:** All tiers 0–5 are complete except F40 (extension upgrade
 migration scripts, deferred). 50/51 items done. 936 unit tests + 62 new E2E tests
 provide comprehensive coverage. The only remaining blocker is F40 for seamless
-upgrades, tracked in PLAN_DB_SCHEMA_STABILITY.md.
+upgrades, tracked in REPORT_DB_SCHEMA_STABILITY.md.
 
 ### Prioritized Remaining Work
 
-1. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to PLAN_DB_SCHEMA_STABILITY.md
+1. **F40** (Tier 4) — Extension upgrade migration scripts — deferred to REPORT_DB_SCHEMA_STABILITY.md
 
 All other items (50/51) are complete. SQL_GAPS_7 is effectively done.

@@ -1,4 +1,4 @@
-# PLAN_PGWIRE_PROXY.md — pgwire Proxy / Intercept Analysis
+# REPORT_PGWIRE_PROXY.md — pgwire Proxy / Intercept Analysis
 
 > **Status:** Research / Analysis  
 > **Relates to:** [PLAN_EXTERNAL_PROCESS.md](PLAN_EXTERNAL_PROCESS.md) (§11, Open Question #4)  

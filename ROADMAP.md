@@ -240,7 +240,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
-| A2 | Streaming aggregation (sub-second latency path) | TBD | [PLAN_STREAMING_AGGREGATION.md](plans/sql/PLAN_STREAMING_AGGREGATION.md) |
+| A2 | Transactional IVM (immediate, same-transaction refresh) | TBD | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
 | A3 | PostgreSQL 19 forward-compatibility | TBD | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 
 ---
@@ -277,6 +277,6 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | [plans/infra/PLAN_MULTI_DATABASE.md](plans/infra/PLAN_MULTI_DATABASE.md) | Multi-database support |
 | [plans/infra/PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) | PostgreSQL 19 forward-compatibility |
 | [plans/sql/PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) | Extension upgrade migrations |
-| [plans/sql/PLAN_STREAMING_AGGREGATION.md](plans/sql/PLAN_STREAMING_AGGREGATION.md) | Sub-second streaming aggregation |
+| [plans/sql/PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) | Transactional IVM (immediate, same-transaction refresh) |
 | [plans/adrs/PLAN_ADRS.md](plans/adrs/PLAN_ADRS.md) | Architectural decisions |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture |

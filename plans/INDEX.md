@@ -35,7 +35,7 @@ new entries when creating documents.
 | [GAP_ANALYSIS_FELDERA.md](ecosystem/GAP_ANALYSIS_FELDERA.md) | GAP | — | Core SQL IVM engine comparison vs Feldera |
 | [PLAN_CLOUDNATIVEPG.md](ecosystem/PLAN_CLOUDNATIVEPG.md) | PLAN | Implemented | CloudNativePG image volume extension |
 | [PLAN_ECO_SYSTEM.md](ecosystem/PLAN_ECO_SYSTEM.md) | PLAN | Proposed | Supportive projects ecosystem plan |
-| [PLAN_TIMESCALEDB.md](ecosystem/PLAN_TIMESCALEDB.md) | PLAN | Research | TimescaleDB synergy — IVM over hypertables & design lessons |
+| [REPORT_TIMESCALEDB.md](ecosystem/REPORT_TIMESCALEDB.md) | REPORT | Research | TimescaleDB synergy — IVM over hypertables & design lessons |
 | [GAP_PG_IVM_COMPARISON.md](ecosystem/GAP_PG_IVM_COMPARISON.md) | GAP | Reference | pg_trickle vs pg_ivm comparison & gap analysis |
 
 ## infra/
@@ -51,8 +51,8 @@ new entries when creating documents.
 | [PLAN_PARTITIONING_SHARDING.md](infra/PLAN_PARTITIONING_SHARDING.md) | PLAN | Research | PostgreSQL partitioning & sharding compatibility |
 | [PLAN_PACKAGING.md](infra/PLAN_PACKAGING.md) | PLAN | Draft | Distribution packaging |
 | [PLAN_PG19_COMPAT.md](infra/PLAN_PG19_COMPAT.md) | PLAN | Draft | PostgreSQL 19 forward-compatibility |
-| [PLAN_PGWIRE_PROXY.md](infra/PLAN_PGWIRE_PROXY.md) | REPORT | Research | pgwire proxy / intercept analysis |
-| [PLAN_PG_BACKCOMPAT.md](infra/PLAN_PG_BACKCOMPAT.md) | REPORT | Research | Supporting older PostgreSQL versions (13–17) |
+| [REPORT_PGWIRE_PROXY.md](infra/REPORT_PGWIRE_PROXY.md) | REPORT | Research | pgwire proxy / intercept analysis |
+| [PLAN_PG_BACKCOMPAT.md](infra/PLAN_PG_BACKCOMPAT.md) | PLAN | Research | Supporting older PostgreSQL versions (13–17) |
 | [PLAN_VERSIONING.md](infra/PLAN_VERSIONING.md) | PLAN | Draft | Semantic versioning & compatibility policy |
 
 ## performance/
@@ -74,10 +74,9 @@ new entries when creating documents.
 | [PLAN_LATERAL_JOINS.md](sql/PLAN_LATERAL_JOINS.md) | PLAN | Implemented | LATERAL join support (subqueries with LATERAL) |
 | [PLAN_NON_DETERMINISM.md](sql/PLAN_NON_DETERMINISM.md) | PLAN | Not started | Non-deterministic function handling |
 | [REPORT_CUSTOM_SQL_SYNTAX.md](sql/REPORT_CUSTOM_SQL_SYNTAX.md) | REPORT | Reference | PostgreSQL extension syntax mechanisms research |
-| [PLAN_DB_SCHEMA_STABILITY.md](sql/PLAN_DB_SCHEMA_STABILITY.md) | REPORT | Assessment | Database schema stability assessment (pre-1.0) |
+| [REPORT_DB_SCHEMA_STABILITY.md](sql/REPORT_DB_SCHEMA_STABILITY.md) | REPORT | Assessment | Database schema stability assessment (pre-1.0) |
 | [PLAN_HYBRID_CDC.md](sql/PLAN_HYBRID_CDC.md) | PLAN | Complete | Hybrid CDC — trigger bootstrap → logical replication |
 | [PLAN_NATIVE_SYNTAX.md](sql/PLAN_NATIVE_SYNTAX.md) | PLAN | Proposed | Native PostgreSQL syntax for stream tables |
-| [PLAN_STREAMING_AGGREGATION.md](sql/PLAN_STREAMING_AGGREGATION.md) | PLAN | Draft | Sub-second latency path via streaming aggregation |
 | [PLAN_TRANSACTIONAL_IVM.md](sql/PLAN_TRANSACTIONAL_IVM.md) | PLAN | Proposed | Transactionally updated views (immediate IVM) |
 | [PLAN_UPGRADE_MIGRATIONS.md](sql/PLAN_UPGRADE_MIGRATIONS.md) | PLAN | Draft | Extension upgrade migrations |
 | [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](sql/PLAN_USER_TRIGGERS_EXPLICIT_DML.md) | PLAN | Implemented | User triggers on stream tables via explicit DML |
@@ -96,5 +95,5 @@ new entries when creating documents.
 | File | Type | Status | Summary |
 |------|------|--------|---------|
 | [PLAN_TEST_SUITES.md](testing/PLAN_TEST_SUITES.md) | PLAN | Proposed | External test suites for pg_trickle |
-| [PLAN_TEST_SUITE_TPC_H.md](testing/PLAN_TEST_SUITE_TPC_H.md) | PLAN | In progress | TPC-H test suite |
+| [PLAN_TEST_SUITE_TPC_H.md](testing/PLAN_TEST_SUITE_TPC_H.md) | PLAN | Complete | TPC-H test suite |
 | [STATUS_TESTING.md](testing/STATUS_TESTING.md) | STATUS | — | Testing & coverage status |
