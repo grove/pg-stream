@@ -77,6 +77,13 @@
     {% endif %}
   {% endif %}
 
+  {# dbt 1.6 requires the 'main' statement to be executed at least once.
+     Our DDL runs via run_query() (separate connection), so we satisfy the
+     framework with a lightweight no-op on the main connection. #}
+  {% call statement('main') %}
+    SELECT 1
+  {% endcall %}
+
   {{ run_hooks(post_hooks) }}
 
   {{ return({'relations': [target_relation]}) }}
