@@ -1201,8 +1201,12 @@ using PostgreSQL savepoints rather than in-memory barrier buffers.
 4. **Interaction with cron schedules:** If B has a `*/5 * * * *` schedule
    and C has a `*/10 * * * *` schedule, how should the group decide when to
    refresh?
-   **Decision:** Make it configurable via a new `pg_trickle.diamond_schedule_policy`
-   GUC with two values:
+   **Decision:** Per-convergence-node `diamond_schedule_policy` column (Option A),
+   with a cluster-wide `pg_trickle.diamond_schedule_policy` GUC as the default.
+   The convergence node (the fan-in ST, i.e. D) owns the policy because the
+   group exists to serve D's freshness requirements. B and C are intermediate
+   nodes and don't set the policy.
+   Two values:
    - `'fastest'` **(default)** — group refreshes when **any** member is due.
      Over-delivers on freshness for slower members. Correct default because
      users who opt into `atomic` mode prioritize consistency over efficiency.
@@ -1210,6 +1214,16 @@ using PostgreSQL savepoints rather than in-memory barrier buffers.
      resources but under-delivers freshness for faster members.
    The policy only applies when `diamond_consistency = 'atomic'`; in `'none'`
    mode each ST uses its own schedule independently.
+   SQL API mirrors `diamond_consistency` — set it on the convergence node at
+   create or alter time:
+   ```sql
+   SELECT pgtrickle.create_stream_table('order_avg_by_region', '...',
+     diamond_consistency => 'atomic',
+     diamond_schedule_policy => 'slowest');
+   ```
+   The scheduler reads the policy from `ConsistencyGroup.convergence_points`
+   (already computed by `compute_consistency_groups`). When multiple
+   convergence points exist, the strictest policy (`slowest > fastest`) wins.
    ⬜ Implementation plan in §11 below.
 
 5. **Monitoring:** How do users know their STs are in a diamond group?
@@ -1221,47 +1235,51 @@ using PostgreSQL savepoints rather than in-memory barrier buffers.
 
 ## 11. Implementation Plan: Diamond Schedule Policy (Q4)
 
-A new GUC to control when a consistency group's refresh fires relative to
-its members' individual schedules.
+A new **per-convergence-node catalog column** and matching GUC default to
+control when a consistency group's refresh fires relative to its members'
+individual schedules.
 
-### Overview
+### Design: Option A — Per-convergence-node
+
+The convergence node (D — the fan-in ST) owns the policy because the group
+exists to serve D's freshness requirements. Intermediate nodes (B, C) do not
+set the policy. The GUC provides the cluster-wide default used when the
+catalog column is not set explicitly.
 
 ```
-pg_trickle.diamond_schedule_policy = 'fastest'   -- default
-pg_trickle.diamond_schedule_policy = 'slowest'
+-- Intermediate nodes: set consistency only
+SELECT pgtrickle.create_stream_table('order_totals_by_region', '...',
+  diamond_consistency => 'atomic');
+
+SELECT pgtrickle.create_stream_table('order_counts_by_region', '...',
+  diamond_consistency => 'atomic');
+
+-- Convergence node: also sets schedule policy
+SELECT pgtrickle.create_stream_table('order_avg_by_region', '...',
+  diamond_consistency => 'atomic',
+  diamond_schedule_policy => 'slowest');
 ```
+
+When multiple convergence points exist (nested diamonds), the strictest policy
+(`slowest > fastest`) wins.
 
 | Policy | Trigger condition | Trade-off |
 |---|---|---|
-| `'fastest'` | `any(member, is_due)` | Higher freshness, more refreshes |
+| `'fastest'` **(default)** | `any(member, is_due)` | Higher freshness, more refreshes |
 | `'slowest'` | `all(member, is_due)` | Lower resource cost, staler data |
 
 Only takes effect when `diamond_consistency = 'atomic'`. In `'none'` mode,
 each ST uses its own schedule independently — the policy is irrelevant.
 
-### Step 9 — Add `diamond_schedule_policy` GUC
+### Step 9 — Add enum, GUC fallback, and catalog column
 
-**Files:** `src/config.rs`, `src/lib.rs`
+**Files:** `src/dag.rs`, `src/config.rs`, `src/lib.rs`, `src/catalog.rs`, `src/api.rs`
 
-1. Add a `GucSetting<Option<&'static CStr>>` named
-   `PGS_DIAMOND_SCHEDULE_POLICY` with default `"fastest"`.
-
-2. Register in `_PG_init()` as `pg_trickle.diamond_schedule_policy`.
-
-3. Add a public accessor:
+1. Add `DiamondSchedulePolicy` enum in `dag.rs`:
    ```rust
-   pub fn pg_trickle_diamond_schedule_policy() -> String {
-       PGS_DIAMOND_SCHEDULE_POLICY
-           .get()
-           .map(|s| s.to_str().unwrap_or("fastest").to_string())
-           .unwrap_or_else(|| "fastest".to_string())
-   }
-   ```
-
-4. Add a `DiamondSchedulePolicy` enum in `dag.rs`:
-   ```rust
-   #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+   #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
    pub enum DiamondSchedulePolicy {
+       #[default]
        Fastest,
        Slowest,
    }
@@ -1274,8 +1292,54 @@ each ST uses its own schedule independently — the policy is irrelevant.
                _ => None,
            }
        }
+       pub fn as_str(self) -> &'static str {
+           match self {
+               Self::Fastest => "fastest",
+               Self::Slowest => "slowest",
+           }
+       }
+       /// Strictest of two policies (slowest > fastest).
+       pub fn stricter(self, other: Self) -> Self {
+           if self == Self::Slowest || other == Self::Slowest {
+               Self::Slowest
+           } else {
+               Self::Fastest
+           }
+       }
    }
    ```
+
+2. In `src/config.rs` add GUC fallback `PGS_DIAMOND_SCHEDULE_POLICY`
+   (default `"fastest"`) and register in `_PG_init()` as
+   `pg_trickle.diamond_schedule_policy`. Add accessor:
+   ```rust
+   pub fn pg_trickle_diamond_schedule_policy() -> DiamondSchedulePolicy {
+       PGS_DIAMOND_SCHEDULE_POLICY
+           .get()
+           .and_then(|s| DiamondSchedulePolicy::from_str(s.to_str().ok()?))
+           .unwrap_or_default()
+   }
+   ```
+
+3. In `src/lib.rs` DDL, add to `pgtrickle.pgt_stream_tables`:
+   ```sql
+   diamond_schedule_policy TEXT NOT NULL DEFAULT 'fastest'
+       CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
+   ```
+
+4. In `src/catalog.rs`, add `diamond_schedule_policy: DiamondSchedulePolicy`
+   to `StreamTableRecord`, update all SELECT/INSERT/UPDATE queries, and add:
+   ```rust
+   pub fn set_diamond_schedule_policy(
+       pgt_id: i64,
+       policy: DiamondSchedulePolicy,
+   ) -> Result<(), PgTrickleError>
+   ```
+
+5. In `src/api.rs`, add `diamond_schedule_policy: Option<String>` parameter
+   to `create_stream_table` and `alter_stream_table`, validated and persisted
+   via `catalog::set_diamond_schedule_policy`. Only the convergence node
+   needs it; setting it on B or C is allowed but has no effect.
 
 **Validation:** `just fmt && just lint`.
 
@@ -1283,26 +1347,37 @@ each ST uses its own schedule independently — the policy is irrelevant.
 
 **Files:** `src/scheduler.rs`
 
-The current scheduler evaluates each ST's schedule individually in the
-topological loop. With consistency groups, the group-level loop must
-evaluate whether the **group as a whole** is due.
-
-1. Add a helper function:
+1. Add a helper that resolves the effective policy for a group by reading
+   the catalog value from each convergence node and taking the strictest:
    ```rust
-   /// Determine if a consistency group is due for refresh.
+   fn group_schedule_policy(group: &ConsistencyGroup) -> DiamondSchedulePolicy {
+       let guc_default = config::pg_trickle_diamond_schedule_policy();
+       group.convergence_points.iter().fold(guc_default, |acc, node| {
+           if let NodeId::StreamTable(id) = node {
+               load_st_by_id(*id)
+                   .map(|st| acc.stricter(st.diamond_schedule_policy))
+                   .unwrap_or(acc)
+           } else {
+               acc
+           }
+       })
+   }
+   ```
+
+2. Add `is_group_due` helper:
+   ```rust
    fn is_group_due(
        group: &ConsistencyGroup,
        policy: DiamondSchedulePolicy,
-       dag: &StDag,
+       now_ms: i64,
    ) -> bool {
        let member_due: Vec<bool> = group.members.iter().filter_map(|m| {
            if let NodeId::StreamTable(id) = m {
-               load_st_by_id(*id).map(|st| check_schedule(&st, dag) || st.needs_reinit)
+               load_st_by_id(*id).map(|st| check_schedule(&st, now_ms) || st.needs_reinit)
            } else {
                None
            }
        }).collect();
-
        match policy {
            DiamondSchedulePolicy::Fastest => member_due.iter().any(|&d| d),
            DiamondSchedulePolicy::Slowest => member_due.iter().all(|&d| d),
@@ -1310,30 +1385,37 @@ evaluate whether the **group as a whole** is due.
    }
    ```
 
-2. In the group-aware refresh loop (the `compute_consistency_groups()` path),
-   replace per-member `check_schedule()` with `is_group_due()` for
-   multi-member groups. Singleton groups continue using the existing
-   per-ST `check_schedule()` directly.
+3. In the group-aware refresh loop, replace per-member schedule checks with:
+   ```rust
+   let policy = group_schedule_policy(group);
+   if !is_group_due(group, policy, now_ms) {
+       continue;
+   }
+   // proceed with SAVEPOINT refresh of all members
+   ```
+   Singleton groups continue using the existing per-ST `check_schedule()`
+   directly — no policy read needed.
 
-3. When the group **is** due, refresh **all** members regardless of their
+4. When the group **is** due, refresh **all** members regardless of their
    individual schedule status — the atomic guarantee requires all-or-nothing.
 
 **Validation:** `just fmt && just lint`.
 
 ### Step 11 — Documentation
 
-**Files:** `docs/CONFIGURATION.md`, `docs/ARCHITECTURE.md`, `docs/SQL_REFERENCE.md`
+**Files:** `docs/CONFIGURATION.md`, `docs/ARCHITECTURE.md`, `docs/SQL_REFERENCE.md`, `CHANGELOG.md`
 
-1. **CONFIGURATION.md** — Add a `### pg_trickle.diamond_schedule_policy`
-   section documenting both values, default, and interaction with
-   `diamond_consistency`.
+1. **CONFIGURATION.md** — Add `### pg_trickle.diamond_schedule_policy`
+   section: values, default, interaction with `diamond_consistency`, note
+   that per-convergence-node value overrides GUC.
 
-2. **ARCHITECTURE.md** — Update the "Diamond Dependency Consistency"
-   section (§13) to mention the schedule policy and its effect on group
-   refresh timing.
+2. **ARCHITECTURE.md** — Update §13 "Diamond Dependency Consistency" to
+   describe the schedule policy, convergence-node ownership, and strictest-
+   wins rule for nested diamonds.
 
-3. **SQL_REFERENCE.md** — Note in the `diamond_groups()` function docs that
-   the active schedule policy affects when groups fire.
+3. **SQL_REFERENCE.md** — Add `diamond_schedule_policy` parameter to
+   `create_stream_table` and `alter_stream_table` tables; update
+   `diamond_groups()` output to show the effective policy per group.
 
 4. **CHANGELOG.md** — Add under `[Unreleased]`.
 
@@ -1347,9 +1429,12 @@ evaluate whether the **group as a whole** is due.
 |---|---|
 | `test_diamond_schedule_policy_from_str` | Parses `"fastest"`, `"slowest"`, rejects invalid |
 | `test_diamond_schedule_policy_default` | Default is `Fastest` |
+| `test_diamond_schedule_policy_stricter` | `slowest.stricter(fastest)` → `slowest` |
 | `test_is_group_due_fastest_any_triggers` | With `Fastest`, group fires when any member is due |
 | `test_is_group_due_slowest_all_required` | With `Slowest`, group fires only when all are due |
 | `test_is_group_due_singleton_bypass` | Singleton groups bypass policy check |
+| `test_group_policy_convergence_node_overrides_guc` | Convergence node `slowest` overrides GUC `fastest` |
+| `test_group_policy_nested_strictest_wins` | Two convergence nodes: one `fastest`, one `slowest` → `slowest` |
 
 **Validation:** `just test-unit`.
 
@@ -1359,9 +1444,11 @@ evaluate whether the **group as a whole** is due.
 
 | Test name | What it proves |
 |---|---|
-| `test_diamond_schedule_policy_fastest` | With `fastest`, group refreshes when fastest member is due |
-| `test_diamond_schedule_policy_slowest` | With `slowest`, group waits until slowest member is due |
+| `test_diamond_schedule_policy_fastest_default` | Default GUC `fastest` fires when any member due |
+| `test_diamond_schedule_policy_slowest_per_node` | Convergence node `slowest` waits until all due |
+| `test_diamond_schedule_policy_overrides_guc` | Per-node value overrides cluster GUC |
 | `test_diamond_schedule_policy_none_mode_ignored` | Policy has no effect when `diamond_consistency = 'none'` |
+| `test_diamond_schedule_policy_nested_strictest_wins` | Nested diamond uses strictest convergence policy |
 
 **Validation:** `just test-e2e`.
 
@@ -1369,7 +1456,7 @@ evaluate whether the **group as a whole** is due.
 
 | Step | File(s) | Depends on | Testable with | Status |
 |---|---|---|---|---|
-| 9 — GUC + enum | `config.rs`, `lib.rs`, `dag.rs` | Steps 1–8 | `just lint` | ⬜ Next |
+| 9 — Enum + GUC + catalog + API | `dag.rs`, `config.rs`, `lib.rs`, `catalog.rs`, `api.rs` | Steps 1–8 | `just lint` | ⬜ Next |
 | 10 — Scheduler wiring | `scheduler.rs` | Step 9 | `just lint` | ⬜ |
 | 11 — Documentation | `docs/`, `CHANGELOG.md` | Step 10 | `just lint` | ⬜ |
 | 12 — Unit tests | `dag.rs`, `scheduler.rs` | Step 10 | `just test-unit` | ⬜ |
