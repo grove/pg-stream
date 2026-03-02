@@ -256,3 +256,166 @@ async fn test_diamond_consistency_in_catalog_view() {
         .await;
     assert_eq!(dc, "atomic");
 }
+
+// ── Diamond Schedule Policy Tests ──────────────────────────────────────
+
+/// Verify that the `diamond_schedule_policy` column defaults to 'fastest'
+/// when not explicitly specified.
+#[tokio::test]
+async fn test_diamond_schedule_policy_default() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE src_sp (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO src_sp VALUES (1, 10)").await;
+    db.create_st("test_default_sp", "SELECT * FROM src_sp", "1m", "FULL")
+        .await;
+
+    let sp: String = db
+        .query_scalar(
+            "SELECT diamond_schedule_policy FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'test_default_sp'",
+        )
+        .await;
+    assert_eq!(
+        sp, "fastest",
+        "expected default diamond_schedule_policy to be 'fastest'"
+    );
+}
+
+/// Verify that create_stream_table accepts diamond_schedule_policy='slowest'.
+#[tokio::test]
+async fn test_diamond_schedule_policy_create_slowest() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE src_sp2 (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO src_sp2 VALUES (1, 10)").await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('test_slowest_sp', \
+         $$SELECT * FROM src_sp2$$, '1m', 'FULL', true, 'atomic', 'slowest')",
+    )
+    .await;
+
+    let sp: String = db
+        .query_scalar(
+            "SELECT diamond_schedule_policy FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'test_slowest_sp'",
+        )
+        .await;
+    assert_eq!(sp, "slowest");
+}
+
+/// Verify that alter_stream_table can change diamond_schedule_policy.
+#[tokio::test]
+async fn test_diamond_schedule_policy_alter() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE src_sp3 (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO src_sp3 VALUES (1, 10)").await;
+    db.create_st("test_alter_sp", "SELECT * FROM src_sp3", "1m", "FULL")
+        .await;
+
+    // Should start as 'fastest'
+    let sp: String = db
+        .query_scalar(
+            "SELECT diamond_schedule_policy FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'test_alter_sp'",
+        )
+        .await;
+    assert_eq!(sp, "fastest");
+
+    // Alter to 'slowest'
+    db.alter_st("test_alter_sp", "diamond_schedule_policy => 'slowest'")
+        .await;
+
+    let sp: String = db
+        .query_scalar(
+            "SELECT diamond_schedule_policy FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'test_alter_sp'",
+        )
+        .await;
+    assert_eq!(sp, "slowest");
+}
+
+/// Verify that diamond_groups() returns the schedule_policy column.
+#[tokio::test]
+async fn test_diamond_groups_shows_schedule_policy() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_diamond(&db, "atomic").await;
+
+    let sp: String = db
+        .query_scalar("SELECT schedule_policy FROM pgtrickle.diamond_groups() LIMIT 1")
+        .await;
+    assert!(
+        sp == "fastest" || sp == "slowest",
+        "expected schedule_policy to be 'fastest' or 'slowest', got '{}'",
+        sp
+    );
+}
+
+/// Verify that setting diamond_schedule_policy on the convergence node is
+/// reflected in diamond_groups().
+#[tokio::test]
+async fn test_diamond_schedule_policy_convergence_override() {
+    let db = E2eDb::new().await.with_extension().await;
+    setup_diamond(&db, "atomic").await;
+
+    // Set the convergence node (st_d) to 'slowest'
+    db.alter_st("st_d", "diamond_schedule_policy => 'slowest'")
+        .await;
+
+    // diamond_groups() should show 'slowest' for all members of the group
+    let sp: String = db
+        .query_scalar(
+            "SELECT schedule_policy FROM pgtrickle.diamond_groups() \
+             WHERE is_convergence = true LIMIT 1",
+        )
+        .await;
+    assert_eq!(
+        sp, "slowest",
+        "convergence node 'slowest' should be reflected in diamond_groups()"
+    );
+}
+
+/// Verify that diamond_schedule_policy is visible in the catalog info view.
+#[tokio::test]
+async fn test_diamond_schedule_policy_in_catalog_view() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE src_sp4 (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO src_sp4 VALUES (1, 10)").await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('test_cat_sp', \
+         $$SELECT * FROM src_sp4$$, '1m', 'FULL', true, 'atomic', 'slowest')",
+    )
+    .await;
+
+    let sp: String = db
+        .query_scalar(
+            "SELECT diamond_schedule_policy FROM pgtrickle.stream_tables_info \
+             WHERE pgt_name = 'test_cat_sp'",
+        )
+        .await;
+    assert_eq!(sp, "slowest");
+}
+
+/// Verify that invalid diamond_schedule_policy values are rejected.
+#[tokio::test]
+async fn test_diamond_schedule_policy_invalid_rejected() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE src_sp5 (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO src_sp5 VALUES (1, 10)").await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('test_bad_sp', \
+             $$SELECT * FROM src_sp5$$, '1m', 'FULL', true, 'atomic', 'invalid')",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "expected error for invalid diamond_schedule_policy"
+    );
+}

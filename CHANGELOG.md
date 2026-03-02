@@ -20,8 +20,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   - New `diamond_consistency` parameter on `create_stream_table()` and
     `alter_stream_table()` (`'none'` or `'atomic'`).
   - New `pg_trickle.diamond_consistency` GUC to set the cluster-wide default.
+  - New `diamond_schedule_policy` parameter on `create_stream_table()` and
+    `alter_stream_table()` (`'fastest'` or `'slowest'`). Controls whether an
+    atomic group fires when any member is due or when all are due.
+  - New `pg_trickle.diamond_schedule_policy` GUC (default `'fastest'`).
+    Per-convergence-node values override the GUC; strictest wins for nested
+    diamonds.
   - New `pgtrickle.diamond_groups()` monitoring function to inspect detected
-    groups, convergence points, and epoch counters.
+    groups, convergence points, epoch counters, and effective schedule policy.
   - Scheduler wraps multi-member groups in a SAVEPOINT when
     `diamond_consistency = 'atomic'`; on any failure the entire group is
     rolled back, preserving consistency.

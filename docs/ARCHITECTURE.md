@@ -504,6 +504,17 @@ When `diamond_consistency = 'atomic'` (per-ST or via the `pg_trickle.diamond_con
 
 With `diamond_consistency = 'none'` (default), members refresh independently in topological order — matching pre-feature behavior.
 
+#### Schedule Policy
+
+The `diamond_schedule_policy` setting (per-convergence-node or via the `pg_trickle.diamond_schedule_policy` GUC) controls **when** an atomic group fires:
+
+| Policy | Trigger condition | Trade-off |
+|---|---|---|
+| `'fastest'` **(default)** | Any member is due | Higher freshness, more refreshes |
+| `'slowest'` | All members are due | Lower resource cost, staler data |
+
+The policy is set on the convergence (fan-in) node. When multiple convergence nodes exist in the same group (nested diamonds), the **strictest** policy wins (`slowest > fastest`). The GUC serves as a cluster-wide fallback for nodes without an explicit per-node setting.
+
 #### Monitoring
 
 The `pgtrickle.diamond_groups()` SQL function exposes detected groups for operational visibility. See [SQL_REFERENCE.md](SQL_REFERENCE.md) for details.
@@ -527,6 +538,7 @@ Twelve GUC (Grand Unified Configuration) variables control runtime behavior, plu
 | `pg_trickle.cdc_mode` | `'trigger'` | CDC mechanism: `trigger` / `auto` / `wal` |
 | `pg_trickle.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
 | `pg_trickle.diamond_consistency` | `'none'` | Diamond dependency consistency mode: `none` or `atomic` |
+| `pg_trickle.diamond_schedule_policy` | `'fastest'` | Schedule policy for atomic diamond groups: `fastest` or `slowest` |
 | `pg_trickle.merge_planner_hints` | `true` | Inject `SET LOCAL` planner hints (disable nestloop, raise work_mem) before MERGE |
 | `pg_trickle.merge_work_mem_mb` | `64` | `work_mem` (MB) applied when delta exceeds 10 000 rows and planner hints enabled |
 | `pg_trickle.use_prepared_statements` | `true` | Use SQL PREPARE/EXECUTE for cached MERGE templates |

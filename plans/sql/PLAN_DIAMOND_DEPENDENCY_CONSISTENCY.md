@@ -940,9 +940,9 @@ Potential future enhancements (not prioritized):
 - Expose `diamond_group_id` in `pgtrickle.explain_st()` output.
 - Cache consistency groups in shared memory for large deployments (1000+ STs).
 
-Next implementation phase (see §11):
-- Steps 9–13: `pg_trickle.diamond_schedule_policy` GUC, scheduler wiring,
-  documentation, and tests.
+All 13 implementation steps are now complete (Steps 1–8: core diamond detection
+and atomic refresh; Steps 9–13: `diamond_schedule_policy` per-convergence-node
+with GUC fallback, scheduler wiring, documentation, unit tests, and E2E tests).
 
 ---
 
@@ -1456,8 +1456,8 @@ each ST uses its own schedule independently — the policy is irrelevant.
 
 | Step | File(s) | Depends on | Testable with | Status |
 |---|---|---|---|---|
-| 9 — Enum + GUC + catalog + API | `dag.rs`, `config.rs`, `lib.rs`, `catalog.rs`, `api.rs` | Steps 1–8 | `just lint` | ⬜ Next |
-| 10 — Scheduler wiring | `scheduler.rs` | Step 9 | `just lint` | ⬜ |
-| 11 — Documentation | `docs/`, `CHANGELOG.md` | Step 10 | `just lint` | ⬜ |
-| 12 — Unit tests | `dag.rs`, `scheduler.rs` | Step 10 | `just test-unit` | ⬜ |
-| 13 — E2E tests | `tests/e2e_diamond_tests.rs` | Step 10 | `just test-e2e` | ⬜ |
+| 9 — Enum + GUC + catalog + API | `dag.rs`, `config.rs`, `lib.rs`, `catalog.rs`, `api.rs` | Steps 1–8 | `just lint` | ✅ Done |
+| 10 — Scheduler wiring | `scheduler.rs` | Step 9 | `just lint` | ✅ Done |
+| 11 — Documentation | `docs/`, `CHANGELOG.md` | Step 10 | `just lint` | ✅ Done |
+| 12 — Unit tests | `dag.rs`, `scheduler.rs` | Step 10 | `just test-unit` | ✅ Done |
+| 13 — E2E tests | `tests/e2e_diamond_tests.rs` | Step 10 | `just test-e2e` | ✅ Done |

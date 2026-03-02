@@ -441,6 +441,35 @@ SET pg_trickle.diamond_consistency = 'none';
 
 ---
 
+### pg_trickle.diamond_schedule_policy
+
+Default schedule policy for atomic diamond consistency groups.
+
+When `diamond_consistency = 'atomic'`, multiple stream tables in a diamond group are refreshed together. This GUC controls **when** the group fires:
+
+| Value | Description |
+|-------|-------------|
+| `'fastest'` | **(default)** Fire the group when **any** member is due for refresh. Maximizes freshness at the cost of more frequent refreshes. |
+| `'slowest'` | Fire the group only when **all** members are due. Reduces resource usage but allows more staleness. |
+
+**Default:** `'fastest'`
+
+Per-convergence-node values override this GUC. Set the policy on the convergence (fan-in) node via `create_stream_table(... diamond_schedule_policy => 'slowest')` or `alter_stream_table(... diamond_schedule_policy => 'slowest')`.
+
+When multiple convergence nodes exist (nested diamonds), the **strictest** policy wins (`slowest > fastest`).
+
+```sql
+-- Set globally to slowest
+SET pg_trickle.diamond_schedule_policy = 'slowest';
+
+-- Default (fastest)
+SET pg_trickle.diamond_schedule_policy = 'fastest';
+```
+
+> **Note:** This setting only takes effect when `diamond_consistency = 'atomic'`. In `'none'` mode each ST uses its own schedule independently.
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -465,6 +494,7 @@ pg_trickle.block_source_ddl = false
 pg_trickle.cdc_mode = 'trigger'
 pg_trickle.wal_transition_timeout = 300
 pg_trickle.diamond_consistency = 'none'
+pg_trickle.diamond_schedule_policy = 'fastest'
 ```
 
 ---

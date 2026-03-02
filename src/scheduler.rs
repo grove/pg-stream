@@ -26,7 +26,7 @@ use std::panic::AssertUnwindSafe;
 use crate::catalog::{RefreshRecord, StreamTableMeta};
 use crate::cdc;
 use crate::config;
-use crate::dag::{DiamondConsistency, NodeId, StDag, StStatus};
+use crate::dag::{DiamondConsistency, DiamondSchedulePolicy, NodeId, StDag, StStatus};
 use crate::error::{RetryPolicy, RetryState};
 use crate::monitor;
 use crate::refresh::{self, RefreshAction};
@@ -198,7 +198,13 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     continue;
                 }
 
-                // Atomic group: wrap all members in a SAVEPOINT.
+                // Atomic group: check group-level schedule policy.
+                let policy = group_schedule_policy(group);
+                if !is_group_due(group, policy, dag_ref) {
+                    continue;
+                }
+
+                // All members due (per policy) — wrap in a SAVEPOINT.
                 let sp_result = Spi::run("SAVEPOINT pgt_consistency_group");
                 if let Err(e) = sp_result {
                     log!(
@@ -231,12 +237,6 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     let retry = retry_states.entry(pgt_id).or_default();
                     if retry.is_in_backoff(now_ms) {
                         emit_stale_alert_if_needed(&st);
-                        continue;
-                    }
-
-                    // Check schedule
-                    let needs_refresh = check_schedule(&st, dag_ref);
-                    if !needs_refresh && !st.needs_reinit {
                         continue;
                     }
 
@@ -403,6 +403,59 @@ fn current_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Resolve the effective schedule policy for a consistency group.
+///
+/// Reads the `diamond_schedule_policy` from each convergence node in the group
+/// and returns the strictest (`Slowest > Fastest`). Falls back to the
+/// `pg_trickle.diamond_schedule_policy` GUC.
+fn group_schedule_policy(group: &crate::dag::ConsistencyGroup) -> DiamondSchedulePolicy {
+    let guc_default = config::pg_trickle_diamond_schedule_policy();
+    group
+        .convergence_points
+        .iter()
+        .fold(guc_default, |acc, node| {
+            if let NodeId::StreamTable(id) = node {
+                load_st_by_id(*id)
+                    .map(|st| acc.stricter(st.diamond_schedule_policy))
+                    .unwrap_or(acc)
+            } else {
+                acc
+            }
+        })
+}
+
+/// Check whether a multi-member group is due for refresh according to its
+/// schedule policy.
+///
+/// - `Fastest`: fires when **any** member is due.
+/// - `Slowest`: fires only when **all** members are due.
+fn is_group_due(
+    group: &crate::dag::ConsistencyGroup,
+    policy: DiamondSchedulePolicy,
+    dag: &StDag,
+) -> bool {
+    let member_due: Vec<bool> = group
+        .members
+        .iter()
+        .filter_map(|m| {
+            if let NodeId::StreamTable(id) = m {
+                load_st_by_id(*id).map(|st| check_schedule(&st, dag) || st.needs_reinit)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if member_due.is_empty() {
+        return false;
+    }
+
+    match policy {
+        DiamondSchedulePolicy::Fastest => member_due.iter().any(|&d| d),
+        DiamondSchedulePolicy::Slowest => member_due.iter().all(|&d| d),
+    }
 }
 
 /// Load a stream table by its pgt_id, or return None if not found.

@@ -17,7 +17,8 @@ pgtrickle.create_stream_table(
     schedule              text      DEFAULT '1m',
     refresh_mode          text      DEFAULT 'DIFFERENTIAL',
     initialize            bool      DEFAULT true,
-    diamond_consistency   text      DEFAULT NULL
+    diamond_consistency   text      DEFAULT NULL,
+    diamond_schedule_policy text    DEFAULT NULL
 ) → void
 ```
 
@@ -31,6 +32,7 @@ pgtrickle.create_stream_table(
 | `refresh_mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` (truncate and reload) or `'DIFFERENTIAL'` (apply delta only). |
 | `initialize` | `bool` | `true` | If `true`, populates the table immediately via a full refresh. If `false`, creates the table empty. |
 | `diamond_consistency` | `text` | `NULL` (GUC default) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). When `NULL`, inherits from the `pg_trickle.diamond_consistency` GUC. See [CONFIGURATION.md](CONFIGURATION.md). |
+| `diamond_schedule_policy` | `text` | `NULL` (GUC default) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. When `NULL`, inherits from the `pg_trickle.diamond_schedule_policy` GUC. |
 
 **Duration format:**
 
@@ -555,7 +557,8 @@ pgtrickle.alter_stream_table(
     schedule              text      DEFAULT NULL,
     refresh_mode          text      DEFAULT NULL,
     status                text      DEFAULT NULL,
-    diamond_consistency   text      DEFAULT NULL
+    diamond_consistency   text      DEFAULT NULL,
+    diamond_schedule_policy text    DEFAULT NULL
 ) → void
 ```
 
@@ -568,6 +571,7 @@ pgtrickle.alter_stream_table(
 | `refresh_mode` | `text` | `NULL` | New refresh mode (`'FULL'` or `'DIFFERENTIAL'`). Pass `NULL` to leave unchanged. |
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
 | `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |
+| `diamond_schedule_policy` | `text` | `NULL` | New schedule policy for atomic diamond groups (`'fastest'` or `'slowest'`). Pass `NULL` to leave unchanged. |
 
 **Examples:**
 
@@ -866,7 +870,8 @@ pgtrickle.diamond_groups() → SETOF record(
     member_name     text,
     member_schema   text,
     is_convergence  bool,
-    epoch           int8
+    epoch           int8,
+    schedule_policy text
 )
 ```
 
@@ -879,6 +884,7 @@ pgtrickle.diamond_groups() → SETOF record(
 | `member_schema` | `text` | Schema of the stream table. |
 | `is_convergence` | `bool` | `true` if this member is a convergence (fan-in) node where multiple paths meet. |
 | `epoch` | `int8` | Group epoch counter — advances on each successful atomic refresh of the group. |
+| `schedule_policy` | `text` | Effective schedule policy for this group (`'fastest'` or `'slowest'`). Computed from convergence node settings with strictest-wins. |
 
 **Example:**
 
@@ -886,11 +892,11 @@ pgtrickle.diamond_groups() → SETOF record(
 SELECT * FROM pgtrickle.diamond_groups();
 ```
 
-| group_id | member_name | member_schema | is_convergence | epoch |
-|---|---|---|---|---|
-| 1 | st_b | public | false | 0 |
-| 1 | st_c | public | false | 0 |
-| 1 | st_d | public | true | 0 |
+| group_id | member_name | member_schema | is_convergence | epoch | schedule_policy |
+|---|---|---|---|---|---|
+| 1 | st_b | public | false | 0 | fastest |
+| 1 | st_c | public | false | 0 | fastest |
+| 1 | st_d | public | true | 0 | fastest |
 
 **Notes:**
 - Singleton stream tables (not part of any diamond) are omitted.

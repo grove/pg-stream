@@ -66,6 +66,59 @@ impl std::fmt::Display for DiamondConsistency {
     }
 }
 
+/// Per-convergence-node schedule policy for diamond consistency groups.
+///
+/// Controls whether a multi-member atomic group fires as soon as *any* member
+/// is due (`Fastest`) or waits until *all* members are due (`Slowest`).
+///
+/// Set on the convergence node; the GUC `pg_trickle.diamond_schedule_policy`
+/// provides a cluster-wide fallback.  When multiple convergence points exist
+/// (nested diamonds), the strictest policy wins (`Slowest > Fastest`).
+///
+/// Only meaningful when `diamond_consistency = 'atomic'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiamondSchedulePolicy {
+    /// Fire the group when **any** member is due (higher freshness).
+    #[default]
+    Fastest,
+    /// Fire the group only when **all** members are due (lower resource cost).
+    Slowest,
+}
+
+impl DiamondSchedulePolicy {
+    /// Serialize to the SQL CHECK constraint value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DiamondSchedulePolicy::Fastest => "fastest",
+            DiamondSchedulePolicy::Slowest => "slowest",
+        }
+    }
+
+    /// Deserialize from SQL string. Returns `None` for unrecognized values.
+    pub fn from_sql_str(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "fastest" => Some(Self::Fastest),
+            "slowest" => Some(Self::Slowest),
+            _ => None,
+        }
+    }
+
+    /// Return the stricter of two policies (`Slowest > Fastest`).
+    pub fn stricter(self, other: Self) -> Self {
+        if self == Self::Slowest || other == Self::Slowest {
+            Self::Slowest
+        } else {
+            Self::Fastest
+        }
+    }
+}
+
+impl std::fmt::Display for DiamondSchedulePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// A detected diamond in the ST dependency graph.
 ///
 /// A diamond exists when two or more paths from shared source(s) converge at a
@@ -1819,6 +1872,88 @@ mod tests {
             let s = dc.as_str();
             let parsed = DiamondConsistency::from_sql_str(s);
             assert_eq!(dc, parsed);
+        }
+    }
+
+    // ── DiamondSchedulePolicy enum tests ───────────────────────────────
+
+    #[test]
+    fn test_diamond_schedule_policy_from_str() {
+        assert_eq!(
+            DiamondSchedulePolicy::from_sql_str("fastest"),
+            Some(DiamondSchedulePolicy::Fastest)
+        );
+        assert_eq!(
+            DiamondSchedulePolicy::from_sql_str("slowest"),
+            Some(DiamondSchedulePolicy::Slowest)
+        );
+        assert_eq!(
+            DiamondSchedulePolicy::from_sql_str("FASTEST"),
+            Some(DiamondSchedulePolicy::Fastest)
+        );
+        assert_eq!(
+            DiamondSchedulePolicy::from_sql_str("SLOWEST"),
+            Some(DiamondSchedulePolicy::Slowest)
+        );
+        assert_eq!(
+            DiamondSchedulePolicy::from_sql_str(" fastest "),
+            Some(DiamondSchedulePolicy::Fastest)
+        );
+        // Invalid values return None
+        assert_eq!(DiamondSchedulePolicy::from_sql_str("invalid"), None);
+        assert_eq!(DiamondSchedulePolicy::from_sql_str(""), None);
+    }
+
+    #[test]
+    fn test_diamond_schedule_policy_default() {
+        assert_eq!(
+            DiamondSchedulePolicy::default(),
+            DiamondSchedulePolicy::Fastest
+        );
+    }
+
+    #[test]
+    fn test_diamond_schedule_policy_as_str() {
+        assert_eq!(DiamondSchedulePolicy::Fastest.as_str(), "fastest");
+        assert_eq!(DiamondSchedulePolicy::Slowest.as_str(), "slowest");
+    }
+
+    #[test]
+    fn test_diamond_schedule_policy_stricter() {
+        // Slowest is always the stricter policy
+        assert_eq!(
+            DiamondSchedulePolicy::Slowest.stricter(DiamondSchedulePolicy::Fastest),
+            DiamondSchedulePolicy::Slowest
+        );
+        assert_eq!(
+            DiamondSchedulePolicy::Fastest.stricter(DiamondSchedulePolicy::Slowest),
+            DiamondSchedulePolicy::Slowest
+        );
+        assert_eq!(
+            DiamondSchedulePolicy::Slowest.stricter(DiamondSchedulePolicy::Slowest),
+            DiamondSchedulePolicy::Slowest
+        );
+        assert_eq!(
+            DiamondSchedulePolicy::Fastest.stricter(DiamondSchedulePolicy::Fastest),
+            DiamondSchedulePolicy::Fastest
+        );
+    }
+
+    #[test]
+    fn test_diamond_schedule_policy_display() {
+        assert_eq!(format!("{}", DiamondSchedulePolicy::Fastest), "fastest");
+        assert_eq!(format!("{}", DiamondSchedulePolicy::Slowest), "slowest");
+    }
+
+    #[test]
+    fn test_diamond_schedule_policy_roundtrip() {
+        for p in [
+            DiamondSchedulePolicy::Fastest,
+            DiamondSchedulePolicy::Slowest,
+        ] {
+            let s = p.as_str();
+            let parsed = DiamondSchedulePolicy::from_sql_str(s);
+            assert_eq!(Some(p), parsed);
         }
     }
 }

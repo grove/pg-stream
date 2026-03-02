@@ -9,7 +9,9 @@ use std::time::Instant;
 use crate::catalog::{CdcMode, StDependency, StreamTableMeta};
 use crate::cdc;
 use crate::config;
-use crate::dag::{DagNode, DiamondConsistency, NodeId, RefreshMode, StDag, StStatus};
+use crate::dag::{
+    DagNode, DiamondConsistency, DiamondSchedulePolicy, NodeId, RefreshMode, StDag, StStatus,
+};
 use crate::error::PgTrickleError;
 use crate::refresh;
 use crate::shmem;
@@ -25,6 +27,7 @@ use crate::wal_decoder;
 /// - `refresh_mode`: `'FULL'` or `'DIFFERENTIAL'`.
 /// - `initialize`: Whether to populate the table immediately.
 /// - `diamond_consistency`: `'none'` (default = GUC) or `'atomic'`.
+/// - `diamond_schedule_policy`: `'fastest'` (default = GUC) or `'slowest'`.
 #[pg_extern(schema = "pgtrickle")]
 fn create_stream_table(
     name: &str,
@@ -33,6 +36,7 @@ fn create_stream_table(
     refresh_mode: default!(&str, "'DIFFERENTIAL'"),
     initialize: default!(bool, true),
     diamond_consistency: default!(Option<&str>, "NULL"),
+    diamond_schedule_policy: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -41,6 +45,7 @@ fn create_stream_table(
         refresh_mode,
         initialize,
         diamond_consistency,
+        diamond_schedule_policy,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -54,6 +59,7 @@ fn create_stream_table_impl(
     refresh_mode_str: &str,
     initialize: bool,
     diamond_consistency: Option<&str>,
+    diamond_schedule_policy: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
 
@@ -72,6 +78,20 @@ fn create_stream_table_impl(
             }
         }
         None => DiamondConsistency::from_sql_str(&config::pg_trickle_diamond_consistency()),
+    };
+
+    // Parse diamond schedule policy — use GUC default when not specified
+    let dsp = match diamond_schedule_policy {
+        Some(s) => match DiamondSchedulePolicy::from_sql_str(s) {
+            Some(p) => p,
+            None => {
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "invalid diamond_schedule_policy value: '{}' (expected 'fastest' or 'slowest')",
+                    s
+                )));
+            }
+        },
+        None => config::pg_trickle_diamond_schedule_policy(),
     };
 
     // Parse schema.name
@@ -337,6 +357,7 @@ fn create_stream_table_impl(
         topk_info.as_ref().map(|i| i.limit_value as i32),
         topk_info.as_ref().map(|i| i.order_by_sql.as_str()),
         dc,
+        dsp,
     )?;
 
     // Build per-source column usage map from the parsed OpTree so that
@@ -465,8 +486,16 @@ fn alter_stream_table(
     refresh_mode: default!(Option<&str>, "NULL"),
     status: default!(Option<&str>, "NULL"),
     diamond_consistency: default!(Option<&str>, "NULL"),
+    diamond_schedule_policy: default!(Option<&str>, "NULL"),
 ) {
-    let result = alter_stream_table_impl(name, schedule, refresh_mode, status, diamond_consistency);
+    let result = alter_stream_table_impl(
+        name,
+        schedule,
+        refresh_mode,
+        status,
+        diamond_consistency,
+        diamond_schedule_policy,
+    );
     if let Err(e) = result {
         pgrx::error!("{}", e);
     }
@@ -478,6 +507,7 @@ fn alter_stream_table_impl(
     refresh_mode: Option<&str>,
     status: Option<&str>,
     diamond_consistency: Option<&str>,
+    diamond_schedule_policy: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -529,6 +559,20 @@ fn alter_stream_table_impl(
                 return Err(PgTrickleError::InvalidArgument(format!(
                     "invalid diamond_consistency value: '{}' (expected 'none' or 'atomic')",
                     other
+                )));
+            }
+        }
+    }
+
+    if let Some(dsp_str) = diamond_schedule_policy {
+        match DiamondSchedulePolicy::from_sql_str(dsp_str) {
+            Some(p) => {
+                StreamTableMeta::set_diamond_schedule_policy(st.pgt_id, p)?;
+            }
+            None => {
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "invalid diamond_schedule_policy value: '{}' (expected 'fastest' or 'slowest')",
+                    dsp_str
                 )));
             }
         }
@@ -987,7 +1031,8 @@ fn pgt_status() -> TableIterator<
 /// Show detected diamond consistency groups.
 ///
 /// Returns one row per group member, indicating which group it belongs to,
-/// whether it is a convergence (fan-in) node, and the group's current epoch.
+/// whether it is a convergence (fan-in) node, the group's current epoch,
+/// and the effective schedule policy.
 #[pg_extern(schema = "pgtrickle", name = "diamond_groups")]
 #[allow(clippy::type_complexity)]
 fn diamond_groups() -> TableIterator<
@@ -998,6 +1043,7 @@ fn diamond_groups() -> TableIterator<
         name!(member_schema, String),
         name!(is_convergence, bool),
         name!(epoch, i64),
+        name!(schedule_policy, String),
     ),
 > {
     let rows: Vec<_> = Spi::connect(|_client| {
@@ -1022,6 +1068,24 @@ fn diamond_groups() -> TableIterator<
             let convergence_set: std::collections::HashSet<_> =
                 group.convergence_points.iter().collect();
 
+            // Compute effective schedule policy for the group.
+            let guc_default = config::pg_trickle_diamond_schedule_policy();
+            let effective_policy =
+                group
+                    .convergence_points
+                    .iter()
+                    .fold(guc_default, |acc, node| {
+                        if let NodeId::StreamTable(id) = node {
+                            StreamTableMeta::get_all_active()
+                                .ok()
+                                .and_then(|sts| sts.into_iter().find(|s| s.pgt_id == *id))
+                                .map(|st| acc.stricter(st.diamond_schedule_policy))
+                                .unwrap_or(acc)
+                        } else {
+                            acc
+                        }
+                    });
+
             for member in &group.members {
                 if let NodeId::StreamTable(pgt_id) = member {
                     // Load metadata for name/schema
@@ -1037,7 +1101,14 @@ fn diamond_groups() -> TableIterator<
                     };
 
                     let is_convergence = convergence_set.contains(member);
-                    out.push((group_id, name, schema, is_convergence, group.epoch as i64));
+                    out.push((
+                        group_id,
+                        name,
+                        schema,
+                        is_convergence,
+                        group.epoch as i64,
+                        effective_policy.as_str().to_string(),
+                    ));
                 }
             }
         }
