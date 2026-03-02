@@ -414,6 +414,33 @@ SET pg_trickle.wal_transition_timeout = 300;
 
 ---
 
+### pg_trickle.diamond_consistency
+
+Default diamond dependency consistency mode for new stream tables.
+
+When stream tables form diamond-shaped dependency graphs (e.g., A → B, A → C, B → D, C → D), the scheduler can group the intermediate STs (B, C) and the convergence node (D) into an atomic refresh group. In `atomic` mode, if any member of the group fails to refresh, all members are rolled back via `SAVEPOINT`, ensuring the convergence node never reads a mix of old and new data from its upstream sources.
+
+| Value | Description |
+|-------|-------------|
+| `'none'` | **(default)** Independent refresh — each ST is refreshed individually in topological order. A partial failure in a diamond may leave the convergence node reading mixed versions. |
+| `'atomic'` | Atomic group refresh — all members of a diamond group are wrapped in a SAVEPOINT. On any failure, the entire group is rolled back and retried together. |
+
+**Default:** `'none'`
+
+This GUC sets the default for new stream tables created without an explicit `diamond_consistency` parameter. Individual stream tables can override it via `create_stream_table(... diamond_consistency => 'atomic')` or `alter_stream_table(... diamond_consistency => 'atomic')`.
+
+```sql
+-- Enable atomic diamond consistency globally
+SET pg_trickle.diamond_consistency = 'atomic';
+
+-- Disable (default — independent refresh)
+SET pg_trickle.diamond_consistency = 'none';
+```
+
+> **Note:** Atomic mode only takes effect for stream tables that are part of a detected diamond group. Linear chains and standalone STs are unaffected.
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -437,6 +464,7 @@ pg_trickle.user_triggers = 'auto'
 pg_trickle.block_source_ddl = false
 pg_trickle.cdc_mode = 'trigger'
 pg_trickle.wal_transition_timeout = 300
+pg_trickle.diamond_consistency = 'none'
 ```
 
 ---

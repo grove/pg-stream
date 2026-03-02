@@ -1781,6 +1781,7 @@ mod tests {
             last_full_ms: None,
             functions_used: None,
             frontier: None,
+            diamond_consistency: crate::dag::DiamondConsistency::None,
         }
     }
 

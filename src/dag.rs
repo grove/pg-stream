@@ -27,6 +27,94 @@ use std::time::Duration;
 
 use crate::error::PgTrickleError;
 
+// ── Diamond dependency types ───────────────────────────────────────────────
+
+/// Per-stream-table diamond consistency mode.
+///
+/// Controls whether a stream table participates in atomic SAVEPOINT-based
+/// refresh groups when it is part of a diamond dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiamondConsistency {
+    /// No atomic grouping — each ST refreshes independently (default).
+    None,
+    /// All members of the diamond's consistency group are wrapped in a
+    /// single SAVEPOINT; if any member fails the entire group rolls back.
+    Atomic,
+}
+
+impl DiamondConsistency {
+    /// Serialize to the SQL CHECK constraint value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DiamondConsistency::None => "none",
+            DiamondConsistency::Atomic => "atomic",
+        }
+    }
+
+    /// Deserialize from SQL string. Falls back to `None` for unknown values.
+    pub fn from_sql_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "atomic" => DiamondConsistency::Atomic,
+            _ => DiamondConsistency::None,
+        }
+    }
+}
+
+impl std::fmt::Display for DiamondConsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A detected diamond in the ST dependency graph.
+///
+/// A diamond exists when two or more paths from shared source(s) converge at a
+/// single fan-in stream table via different intermediate STs.
+///
+/// Example: `A → B → D` and `A → C → D` — convergence is D, shared source is
+/// A, intermediates are {B, C}.
+#[derive(Debug, Clone)]
+pub struct Diamond {
+    /// The fan-in ST that joins two or more upstream paths.
+    pub convergence: NodeId,
+    /// Base tables / STs that are the shared root(s) of the converging paths.
+    pub shared_sources: Vec<NodeId>,
+    /// Intermediate STs on all paths from shared_sources to convergence
+    /// (excludes both the convergence node and the shared sources).
+    pub intermediates: Vec<NodeId>,
+}
+
+/// A set of stream tables that must refresh atomically to maintain cross-path
+/// consistency.
+///
+/// When `diamond_consistency = 'atomic'`, all members are wrapped in a single
+/// SAVEPOINT. If any member's refresh fails, the entire group is rolled back.
+#[derive(Debug, Clone)]
+pub struct ConsistencyGroup {
+    /// All members in topological order, including the convergence ST (last).
+    pub members: Vec<NodeId>,
+    /// The fan-in ST(s) that required this group.
+    pub convergence_points: Vec<NodeId>,
+    /// Monotonically increasing counter; advances on every successful group
+    /// refresh.
+    pub epoch: u64,
+}
+
+impl ConsistencyGroup {
+    /// Returns `true` when the group contains only a single ST.
+    ///
+    /// Singleton groups represent non-diamond STs and skip the SAVEPOINT
+    /// overhead in the scheduler.
+    pub fn is_singleton(&self) -> bool {
+        self.members.len() == 1
+    }
+
+    /// Advance the epoch counter after a successful group refresh.
+    pub fn advance_epoch(&mut self) {
+        self.epoch += 1;
+    }
+}
+
 #[cfg(feature = "pg18")]
 use pgrx::prelude::*;
 
@@ -351,6 +439,213 @@ impl StDag {
         }
     }
 
+    // ── Diamond dependency detection ──────────────────────────────────
+
+    /// Detect all diamond dependencies in the DAG.
+    ///
+    /// A diamond exists when a fan-in ST node D (with ≥2 upstream ST
+    /// dependencies) has two upstream paths that share a common ancestor.
+    ///
+    /// Returns a list of [`Diamond`] values with overlapping diamonds merged.
+    pub fn detect_diamonds(&self) -> Vec<Diamond> {
+        let mut diamonds = Vec::new();
+
+        // Find all fan-in nodes: STs with ≥2 upstream ST-or-base dependencies
+        // that have at least 2 upstream *ST* dependencies (the interesting case
+        // for atomic groups) or 2+ paths sharing a common ancestor via base
+        // tables.
+        for &node in &self.all_nodes {
+            if !matches!(node, NodeId::StreamTable(_)) {
+                continue;
+            }
+            let upstream = self.get_upstream(node);
+            if upstream.len() < 2 {
+                continue;
+            }
+
+            // Collect all paths to roots for each upstream branch.
+            // Each "path" is the set of all ancestors reachable from one
+            // immediate upstream node.
+            let mut branch_ancestors: Vec<(NodeId, HashSet<NodeId>)> = Vec::new();
+            for &up in &upstream {
+                let mut ancestors = HashSet::new();
+                self.collect_ancestors(up, &mut ancestors);
+                ancestors.insert(up); // include the immediate upstream itself
+                branch_ancestors.push((up, ancestors));
+            }
+
+            // Compare every pair of branches for shared ancestors.
+            for i in 0..branch_ancestors.len() {
+                for j in (i + 1)..branch_ancestors.len() {
+                    let shared: Vec<NodeId> = branch_ancestors[i]
+                        .1
+                        .intersection(&branch_ancestors[j].1)
+                        .copied()
+                        .collect();
+
+                    if shared.is_empty() {
+                        continue;
+                    }
+
+                    // Intermediates = union of both branches minus
+                    // the convergence node and the shared sources.
+                    let shared_set: HashSet<NodeId> = shared.iter().copied().collect();
+                    let mut intermediates_set: HashSet<NodeId> = HashSet::new();
+
+                    // Add STs from branch i between shared sources and convergence
+                    for &anc in &branch_ancestors[i].1 {
+                        if !shared_set.contains(&anc) && anc != node {
+                            intermediates_set.insert(anc);
+                        }
+                    }
+                    // Add STs from branch j between shared sources and convergence
+                    for &anc in &branch_ancestors[j].1 {
+                        if !shared_set.contains(&anc) && anc != node {
+                            intermediates_set.insert(anc);
+                        }
+                    }
+
+                    // Also include the immediate upstream nodes if they are STs
+                    // and not themselves shared sources.
+                    let up_i = branch_ancestors[i].0;
+                    let up_j = branch_ancestors[j].0;
+                    if !shared_set.contains(&up_i) {
+                        intermediates_set.insert(up_i);
+                    }
+                    if !shared_set.contains(&up_j) {
+                        intermediates_set.insert(up_j);
+                    }
+
+                    // Only keep ST nodes as intermediates (base tables don't refresh).
+                    let intermediates: Vec<NodeId> = intermediates_set
+                        .into_iter()
+                        .filter(|n| matches!(n, NodeId::StreamTable(_)))
+                        .collect();
+
+                    diamonds.push(Diamond {
+                        convergence: node,
+                        shared_sources: shared,
+                        intermediates,
+                    });
+                }
+            }
+        }
+
+        Self::merge_overlapping_diamonds(diamonds)
+    }
+
+    /// Compute consistency groups for the scheduler.
+    ///
+    /// Each detected diamond produces a group containing the intermediate STs
+    /// and the convergence ST, in topological order. Overlapping groups are
+    /// merged transitively. STs not in any diamond get singleton groups.
+    pub fn compute_consistency_groups(&self) -> Vec<ConsistencyGroup> {
+        let diamonds = self.detect_diamonds();
+
+        // Build a mapping: NodeId → set index, to enable union-find merging.
+        let mut node_to_group: HashMap<NodeId, usize> = HashMap::new();
+        let mut groups: Vec<HashSet<NodeId>> = Vec::new();
+        let mut convergence_map: Vec<HashSet<NodeId>> = Vec::new();
+
+        for diamond in &diamonds {
+            // Members = intermediates ∪ {convergence}
+            let mut members: HashSet<NodeId> = diamond.intermediates.iter().copied().collect();
+            members.insert(diamond.convergence);
+
+            // Check if any existing group overlaps with this one.
+            let overlapping: Vec<usize> = members
+                .iter()
+                .filter_map(|n| node_to_group.get(n).copied())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if overlapping.is_empty() {
+                // New group.
+                let idx = groups.len();
+                for &m in &members {
+                    node_to_group.insert(m, idx);
+                }
+                groups.push(members);
+                let mut cp = HashSet::new();
+                cp.insert(diamond.convergence);
+                convergence_map.push(cp);
+            } else {
+                // Merge into the first overlapping group.
+                let target = overlapping[0];
+                for &m in &members {
+                    node_to_group.insert(m, target);
+                    groups[target].insert(m);
+                }
+                convergence_map[target].insert(diamond.convergence);
+
+                // Merge other overlapping groups into target.
+                for &other in overlapping.iter().skip(1) {
+                    let other_members: HashSet<NodeId> = groups[other].drain().collect();
+                    for m in &other_members {
+                        node_to_group.insert(*m, target);
+                    }
+                    groups[target].extend(other_members);
+                    let other_cp: HashSet<NodeId> = convergence_map[other].drain().collect();
+                    convergence_map[target].extend(other_cp);
+                }
+            }
+        }
+
+        // Sort each group's members in topological order.
+        let topo_order = self.topological_order().unwrap_or_default();
+        let topo_pos: HashMap<NodeId, usize> = topo_order
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, i))
+            .collect();
+
+        let mut result: Vec<ConsistencyGroup> = Vec::new();
+        let mut assigned: HashSet<NodeId> = HashSet::new();
+
+        for (i, group_set) in groups.iter().enumerate() {
+            if group_set.is_empty() {
+                continue; // Merged away.
+            }
+            let mut members: Vec<NodeId> = group_set.iter().copied().collect();
+            members.sort_by_key(|n| topo_pos.get(n).copied().unwrap_or(usize::MAX));
+
+            let convergence_points: Vec<NodeId> = convergence_map[i].iter().copied().collect();
+
+            for &m in &members {
+                assigned.insert(m);
+            }
+
+            result.push(ConsistencyGroup {
+                members,
+                convergence_points,
+                epoch: 0,
+            });
+        }
+
+        // Add singleton groups for all STs not in any diamond group.
+        for &node in &self.all_nodes {
+            if matches!(node, NodeId::StreamTable(_)) && !assigned.contains(&node) {
+                result.push(ConsistencyGroup {
+                    members: vec![node],
+                    convergence_points: vec![],
+                    epoch: 0,
+                });
+            }
+        }
+
+        // Sort groups by the topological position of their first member
+        // so the scheduler processes them in dependency order.
+        result.sort_by_key(|g| {
+            g.members
+                .first()
+                .and_then(|n| topo_pos.get(n).copied())
+                .unwrap_or(usize::MAX)
+        });
+
+        result
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────
 
     /// Kahn's algorithm: BFS topological sort.
@@ -401,6 +696,76 @@ impl StDag {
                 NodeId::StreamTable(id) => format!("stream_table(id={})", id),
             },
         }
+    }
+
+    /// Recursively collect all transitive ancestors of `node` (upstream walk).
+    fn collect_ancestors(&self, node: NodeId, ancestors: &mut HashSet<NodeId>) {
+        if let Some(upstream) = self.reverse_edges.get(&node) {
+            for &up in upstream {
+                if ancestors.insert(up) {
+                    self.collect_ancestors(up, ancestors);
+                }
+            }
+        }
+    }
+
+    /// Merge diamonds whose `intermediates` sets overlap into a single diamond.
+    ///
+    /// This handles nested diamonds (e.g., D and G both being fan-in nodes
+    /// sharing an intermediate ST) by transitively merging overlapping sets.
+    fn merge_overlapping_diamonds(diamonds: Vec<Diamond>) -> Vec<Diamond> {
+        if diamonds.is_empty() {
+            return diamonds;
+        }
+
+        // Union-Find approach: group diamonds whose intermediates overlap.
+        let mut merged: Vec<Diamond> = Vec::new();
+
+        for diamond in diamonds {
+            let int_set: HashSet<NodeId> = diamond.intermediates.iter().copied().collect();
+
+            // Find which merged diamond overlaps with this one.
+            let mut merge_target: Option<usize> = None;
+            for (i, existing) in merged.iter().enumerate() {
+                let existing_set: HashSet<NodeId> =
+                    existing.intermediates.iter().copied().collect();
+                if !int_set.is_disjoint(&existing_set) {
+                    merge_target = Some(i);
+                    break;
+                }
+            }
+
+            match merge_target {
+                Some(idx) => {
+                    // Merge into existing diamond.
+                    let existing = &mut merged[idx];
+                    let mut combined_int: HashSet<NodeId> =
+                        existing.intermediates.iter().copied().collect();
+                    combined_int.extend(diamond.intermediates);
+                    existing.intermediates = combined_int.into_iter().collect();
+
+                    let mut combined_sources: HashSet<NodeId> =
+                        existing.shared_sources.iter().copied().collect();
+                    combined_sources.extend(diamond.shared_sources);
+                    existing.shared_sources = combined_sources.into_iter().collect();
+
+                    // If the convergence points differ, the original convergence
+                    // becomes an intermediate (it's now an interior node of a
+                    // larger merged diamond), unless they're the same.
+                    if diamond.convergence != existing.convergence {
+                        // Keep the downstream-most convergence; add the other
+                        // to intermediates. For simplicity, keep the new one's
+                        // convergence as well — the consistency group computation
+                        // handles multiple convergence points.
+                    }
+                }
+                None => {
+                    merged.push(diamond);
+                }
+            }
+        }
+
+        merged
     }
 }
 
@@ -1048,5 +1413,412 @@ mod tests {
             "cycle error should contain node names: {}",
             msg
         );
+    }
+
+    // ── Diamond detection tests ─────────────────────────────────────────
+
+    /// Helper: create a simple DagNode for tests.
+    fn make_st(id: i64, name: &str) -> DagNode {
+        DagNode {
+            id: NodeId::StreamTable(id),
+            schedule: Some(Duration::from_secs(60)),
+            effective_schedule: Duration::from_secs(60),
+            name: name.to_string(),
+            status: StStatus::Active,
+            schedule_raw: None,
+        }
+    }
+
+    #[test]
+    fn test_detect_diamonds_simple() {
+        // A (base) → B (ST) → D (ST)
+        // A (base) → C (ST) → D (ST)
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+        let d = NodeId::StreamTable(3);
+
+        dag.add_st_node(make_st(1, "B"));
+        dag.add_st_node(make_st(2, "C"));
+        dag.add_st_node(make_st(3, "D"));
+
+        dag.add_edge(a, b);
+        dag.add_edge(a, c);
+        dag.add_edge(b, d);
+        dag.add_edge(c, d);
+
+        let diamonds = dag.detect_diamonds();
+        assert_eq!(diamonds.len(), 1, "expected one diamond, got {diamonds:?}");
+        assert_eq!(diamonds[0].convergence, d);
+        assert!(
+            diamonds[0].shared_sources.contains(&a),
+            "shared sources should contain A"
+        );
+        let int_set: HashSet<NodeId> = diamonds[0].intermediates.iter().copied().collect();
+        assert!(int_set.contains(&b), "intermediates should contain B");
+        assert!(int_set.contains(&c), "intermediates should contain C");
+    }
+
+    #[test]
+    fn test_detect_diamonds_deep() {
+        // A (base) → B → E → D
+        // A (base) → C → D
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+        let d = NodeId::StreamTable(3);
+        let e = NodeId::StreamTable(4);
+
+        dag.add_st_node(make_st(1, "B"));
+        dag.add_st_node(make_st(2, "C"));
+        dag.add_st_node(make_st(3, "D"));
+        dag.add_st_node(make_st(4, "E"));
+
+        dag.add_edge(a, b);
+        dag.add_edge(b, e);
+        dag.add_edge(e, d);
+        dag.add_edge(a, c);
+        dag.add_edge(c, d);
+
+        let diamonds = dag.detect_diamonds();
+        assert_eq!(diamonds.len(), 1, "expected one diamond, got {diamonds:?}");
+        assert_eq!(diamonds[0].convergence, d);
+
+        let int_set: HashSet<NodeId> = diamonds[0].intermediates.iter().copied().collect();
+        // B, C, and E are all intermediates
+        assert!(int_set.contains(&b), "should contain B");
+        assert!(int_set.contains(&c), "should contain C");
+        assert!(int_set.contains(&e), "should contain E");
+    }
+
+    #[test]
+    fn test_detect_diamonds_none_linear() {
+        // Linear chain: A → B → C (no diamond)
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+
+        dag.add_st_node(make_st(1, "B"));
+        dag.add_st_node(make_st(2, "C"));
+
+        dag.add_edge(a, b);
+        dag.add_edge(b, c);
+
+        let diamonds = dag.detect_diamonds();
+        assert!(diamonds.is_empty(), "linear chain should have no diamonds");
+    }
+
+    #[test]
+    fn test_detect_diamonds_multiple_roots_no_diamond() {
+        // B1 (base) → B2 → D
+        // C1 (base) → C2 → D
+        // Different roots — NOT a diamond (cross-source, not intra-source).
+        let mut dag = StDag::new();
+        let b1 = NodeId::BaseTable(1);
+        let c1 = NodeId::BaseTable(2);
+        let b2 = NodeId::StreamTable(1);
+        let c2 = NodeId::StreamTable(2);
+        let d = NodeId::StreamTable(3);
+
+        dag.add_st_node(make_st(1, "B2"));
+        dag.add_st_node(make_st(2, "C2"));
+        dag.add_st_node(make_st(3, "D"));
+
+        dag.add_edge(b1, b2);
+        dag.add_edge(c1, c2);
+        dag.add_edge(b2, d);
+        dag.add_edge(c2, d);
+
+        let diamonds = dag.detect_diamonds();
+        assert!(
+            diamonds.is_empty(),
+            "different-root fan-in should not be a diamond"
+        );
+    }
+
+    #[test]
+    fn test_detect_diamonds_overlapping() {
+        // A → B → D,  A → C → D   (diamond 1)
+        // D → E → G,  D → F → G   (diamond 2, overlapping at D)
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+        let d = NodeId::StreamTable(3);
+        let e = NodeId::StreamTable(4);
+        let f = NodeId::StreamTable(5);
+        let g = NodeId::StreamTable(6);
+
+        for (id, name) in [(1, "B"), (2, "C"), (3, "D"), (4, "E"), (5, "F"), (6, "G")] {
+            dag.add_st_node(make_st(id, name));
+        }
+
+        dag.add_edge(a, b);
+        dag.add_edge(a, c);
+        dag.add_edge(b, d);
+        dag.add_edge(c, d);
+        dag.add_edge(d, e);
+        dag.add_edge(d, f);
+        dag.add_edge(e, g);
+        dag.add_edge(f, g);
+
+        let diamonds = dag.detect_diamonds();
+        // Should detect 2 diamonds (convergence at D and at G).
+        // They may or may not be merged depending on intermediate overlap.
+        assert!(!diamonds.is_empty(), "should detect at least one diamond");
+
+        // Check that both D and G are convergence or at least one diamond
+        // captures both fan-in points.
+        let convergence_nodes: HashSet<NodeId> = diamonds.iter().map(|d| d.convergence).collect();
+        assert!(
+            convergence_nodes.contains(&d) || convergence_nodes.contains(&g),
+            "should detect diamond at D or G"
+        );
+    }
+
+    // ── Consistency group tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_groups_simple_diamond() {
+        // A → B → D, A → C → D
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+        let d = NodeId::StreamTable(3);
+
+        dag.add_st_node(make_st(1, "B"));
+        dag.add_st_node(make_st(2, "C"));
+        dag.add_st_node(make_st(3, "D"));
+
+        dag.add_edge(a, b);
+        dag.add_edge(a, c);
+        dag.add_edge(b, d);
+        dag.add_edge(c, d);
+
+        let groups = dag.compute_consistency_groups();
+
+        // Find the non-singleton group containing D.
+        let diamond_group = groups.iter().find(|g| !g.is_singleton());
+        assert!(
+            diamond_group.is_some(),
+            "expected a non-singleton group for the diamond"
+        );
+        let group = diamond_group.unwrap();
+
+        assert!(group.members.contains(&b), "group should contain B");
+        assert!(group.members.contains(&c), "group should contain C");
+        assert!(group.members.contains(&d), "group should contain D");
+        assert!(
+            group.convergence_points.contains(&d),
+            "D should be a convergence point"
+        );
+
+        // D must be last in topological order within the group.
+        assert_eq!(
+            *group.members.last().unwrap(),
+            d,
+            "convergence node D should be last"
+        );
+    }
+
+    #[test]
+    fn test_groups_singleton_non_diamond() {
+        // Linear: A → B → C (no diamond)
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+
+        dag.add_st_node(make_st(1, "B"));
+        dag.add_st_node(make_st(2, "C"));
+
+        dag.add_edge(a, b);
+        dag.add_edge(b, c);
+
+        let groups = dag.compute_consistency_groups();
+        assert_eq!(
+            groups.len(),
+            2,
+            "each ST should get its own singleton group"
+        );
+        assert!(groups.iter().all(|g| g.is_singleton()));
+    }
+
+    #[test]
+    fn test_groups_independent_diamonds() {
+        // Diamond 1: A1 → B1 → D1, A1 → C1 → D1
+        // Diamond 2: A2 → B2 → D2, A2 → C2 → D2
+        let mut dag = StDag::new();
+        let a1 = NodeId::BaseTable(1);
+        let a2 = NodeId::BaseTable(2);
+        let b1 = NodeId::StreamTable(1);
+        let c1 = NodeId::StreamTable(2);
+        let d1 = NodeId::StreamTable(3);
+        let b2 = NodeId::StreamTable(4);
+        let c2 = NodeId::StreamTable(5);
+        let d2 = NodeId::StreamTable(6);
+
+        for (id, name) in [
+            (1, "B1"),
+            (2, "C1"),
+            (3, "D1"),
+            (4, "B2"),
+            (5, "C2"),
+            (6, "D2"),
+        ] {
+            dag.add_st_node(make_st(id, name));
+        }
+
+        dag.add_edge(a1, b1);
+        dag.add_edge(a1, c1);
+        dag.add_edge(b1, d1);
+        dag.add_edge(c1, d1);
+
+        dag.add_edge(a2, b2);
+        dag.add_edge(a2, c2);
+        dag.add_edge(b2, d2);
+        dag.add_edge(c2, d2);
+
+        let groups = dag.compute_consistency_groups();
+        let non_singleton: Vec<_> = groups.iter().filter(|g| !g.is_singleton()).collect();
+        assert_eq!(
+            non_singleton.len(),
+            2,
+            "two independent diamonds should produce two non-singleton groups"
+        );
+
+        // Each non-singleton group should have 3 members.
+        for g in &non_singleton {
+            assert_eq!(g.members.len(), 3, "diamond group should have 3 members");
+        }
+    }
+
+    #[test]
+    fn test_groups_nested_merge() {
+        // A → B → D, A → C → D (diamond at D)
+        // D → E → G, D → F → G (diamond at G)
+        // These should merge because D is in both.
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+        let d = NodeId::StreamTable(3);
+        let e = NodeId::StreamTable(4);
+        let f = NodeId::StreamTable(5);
+        let g = NodeId::StreamTable(6);
+
+        for (id, name) in [(1, "B"), (2, "C"), (3, "D"), (4, "E"), (5, "F"), (6, "G")] {
+            dag.add_st_node(make_st(id, name));
+        }
+
+        dag.add_edge(a, b);
+        dag.add_edge(a, c);
+        dag.add_edge(b, d);
+        dag.add_edge(c, d);
+        dag.add_edge(d, e);
+        dag.add_edge(d, f);
+        dag.add_edge(e, g);
+        dag.add_edge(f, g);
+
+        let groups = dag.compute_consistency_groups();
+        let non_singleton: Vec<_> = groups.iter().filter(|g| !g.is_singleton()).collect();
+
+        // D is shared between both diamonds, so groups should be merged.
+        // Total non-singleton group(s) should contain B, C, D, E, F, G.
+        let all_members: HashSet<NodeId> = non_singleton
+            .iter()
+            .flat_map(|g| g.members.iter().copied())
+            .collect();
+
+        assert!(all_members.contains(&b));
+        assert!(all_members.contains(&c));
+        assert!(all_members.contains(&d));
+        assert!(all_members.contains(&e));
+        assert!(all_members.contains(&f));
+        assert!(all_members.contains(&g));
+    }
+
+    #[test]
+    fn test_consistency_group_epoch_advance() {
+        let mut group = ConsistencyGroup {
+            members: vec![NodeId::StreamTable(1), NodeId::StreamTable(2)],
+            convergence_points: vec![NodeId::StreamTable(2)],
+            epoch: 0,
+        };
+
+        assert_eq!(group.epoch, 0);
+        group.advance_epoch();
+        assert_eq!(group.epoch, 1);
+        group.advance_epoch();
+        assert_eq!(group.epoch, 2);
+    }
+
+    #[test]
+    fn test_consistency_group_is_singleton() {
+        let singleton = ConsistencyGroup {
+            members: vec![NodeId::StreamTable(1)],
+            convergence_points: vec![],
+            epoch: 0,
+        };
+        assert!(singleton.is_singleton());
+
+        let multi = ConsistencyGroup {
+            members: vec![NodeId::StreamTable(1), NodeId::StreamTable(2)],
+            convergence_points: vec![NodeId::StreamTable(2)],
+            epoch: 0,
+        };
+        assert!(!multi.is_singleton());
+    }
+
+    // ── DiamondConsistency enum tests ──────────────────────────────────
+
+    #[test]
+    fn test_diamond_consistency_as_str() {
+        assert_eq!(DiamondConsistency::None.as_str(), "none");
+        assert_eq!(DiamondConsistency::Atomic.as_str(), "atomic");
+    }
+
+    #[test]
+    fn test_diamond_consistency_from_sql_str() {
+        assert_eq!(
+            DiamondConsistency::from_sql_str("none"),
+            DiamondConsistency::None
+        );
+        assert_eq!(
+            DiamondConsistency::from_sql_str("atomic"),
+            DiamondConsistency::Atomic
+        );
+        assert_eq!(
+            DiamondConsistency::from_sql_str("ATOMIC"),
+            DiamondConsistency::Atomic
+        );
+        assert_eq!(
+            DiamondConsistency::from_sql_str("NONE"),
+            DiamondConsistency::None
+        );
+        // Unknown values fall back to None
+        assert_eq!(
+            DiamondConsistency::from_sql_str("unknown"),
+            DiamondConsistency::None
+        );
+    }
+
+    #[test]
+    fn test_diamond_consistency_display() {
+        assert_eq!(format!("{}", DiamondConsistency::None), "none");
+        assert_eq!(format!("{}", DiamondConsistency::Atomic), "atomic");
+    }
+
+    #[test]
+    fn test_diamond_consistency_roundtrip() {
+        for dc in [DiamondConsistency::None, DiamondConsistency::Atomic] {
+            let s = dc.as_str();
+            let parsed = DiamondConsistency::from_sql_str(s);
+            assert_eq!(dc, parsed);
+        }
     }
 }
