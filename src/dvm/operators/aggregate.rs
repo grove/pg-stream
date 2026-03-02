@@ -271,10 +271,15 @@ pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
     }
 
     let args_sql = arg_parts.join(", ");
-    let base = format!("{func_name}({args_sql})");
 
-    // WITHIN GROUP for ordered-set aggregates
-    let within_group = match &agg.order_within_group {
+    // Ordered-set aggregates (MODE, PERCENTILE_*) use WITHIN GROUP (ORDER BY ...).
+    // Regular aggregates (STRING_AGG, ARRAY_AGG, etc.) use ORDER BY inside parens.
+    let is_ordered_set = matches!(
+        agg.function,
+        AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc
+    );
+
+    let order_sql = match &agg.order_within_group {
         Some(sorts) if !sorts.is_empty() => {
             let sort_list: Vec<String> = sorts
                 .iter()
@@ -290,9 +295,21 @@ pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
                     format!("{}{dir}{nulls}", s.expr.to_sql())
                 })
                 .collect();
-            format!(" WITHIN GROUP (ORDER BY {})", sort_list.join(", "))
+            Some(sort_list.join(", "))
         }
-        _ => String::new(),
+        _ => None,
+    };
+
+    let (base, within_group) = match order_sql {
+        Some(ref order) if is_ordered_set => (
+            format!("{func_name}({args_sql})"),
+            format!(" WITHIN GROUP (ORDER BY {order})"),
+        ),
+        Some(ref order) => (
+            format!("{func_name}({args_sql} ORDER BY {order})"),
+            String::new(),
+        ),
+        None => (format!("{func_name}({args_sql})"), String::new()),
     };
 
     // FILTER clause
@@ -716,7 +733,7 @@ FROM {new_rescan_cte} n",
 
 /// Build a rescan CTE that re-aggregates affected groups from the source
 /// table. Used for group-rescan aggregates (BIT_AND, STRING_AGG, etc.)
-/// that cannot be maintained algebraically.
+/// and MIN/MAX (semi-algebraic: needs rescan when extremum is deleted).
 ///
 /// The CTE selects from the original source tables (reconstructed from
 /// the child OpTree or wrapped from the defining query), filters to only
@@ -732,10 +749,13 @@ fn build_rescan_cte(
     aggregates: &[AggExpr],
     delta_cte: &str,
 ) -> Option<String> {
-    // Only needed if there are group-rescan aggregates
+    // Include group-rescan aggregates AND MIN/MAX (which need rescan
+    // when the old extremum is deleted).
     let rescan_aggs: Vec<&AggExpr> = aggregates
         .iter()
-        .filter(|a| a.function.is_group_rescan())
+        .filter(|a| {
+            a.function.is_group_rescan() || matches!(a.function, AggFunc::Min | AggFunc::Max)
+        })
         .collect();
     if rescan_aggs.is_empty() {
         return None;
@@ -1552,23 +1572,13 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             //   → Use LEAST/GREATEST(old_value, new_inserts) = simple algebraic merge.
             //
             // Case 2: The old extremum WAS deleted.
-            //   → The new extremum might be entirely different. We cannot compute
-            //     it algebraically. We return NULL as a sentinel to trigger the
-            //     downstream action classifier to treat this as a DELETE + INSERT
-            //     pair via the __pgt_meta_action = 'U' path.
+            //   → The new extremum might be entirely different. When a rescan CTE
+            //     is available (has_rescan=true), use the rescanned value from
+            //     source data. Otherwise fall back to just the insert extremum
+            //     (which may be NULL if there were no inserts).
             //
             // The "was deleted" check: d.__del_{alias} IS NOT NULL AND
             //   d.__del_{alias} = st.{alias} (the deleted extremum equals the stored one).
-            //
-            // When this triggers, we return NULL. The change-detection guard
-            // (IS DISTINCT FROM) will see old != NULL, new = NULL → "changed",
-            // emitting the group for re-aggregation. The MERGE layer will
-            // DELETE the old row and INSERT a recomputed one (via FULL refresh
-            // of that group key).
-            //
-            // For the non-deleted case:
-            //   MIN: LEAST(old, ins) — if ins < old, use ins; else keep old
-            //   MAX: GREATEST(old, ins) — if ins > old, use ins; else keep old
             let func = if matches!(agg.function, AggFunc::Min) {
                 "LEAST"
             } else {
@@ -1576,11 +1586,19 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             };
             let ins = quote_ident(&format!("__ins_{alias}"));
             let del = quote_ident(&format!("__del_{alias}"));
-            format!(
-                "CASE WHEN d.{del} IS NOT NULL AND d.{del} = st.{qt} \
-                 THEN d.{ins} \
-                 ELSE {func}(st.{qt}, d.{ins}) END"
-            )
+            if has_rescan {
+                format!(
+                    "CASE WHEN d.{del} IS NOT NULL AND d.{del} = st.{qt} \
+                     THEN r.{qt} \
+                     ELSE {func}(st.{qt}, d.{ins}) END"
+                )
+            } else {
+                format!(
+                    "CASE WHEN d.{del} IS NOT NULL AND d.{del} = st.{qt} \
+                     THEN d.{ins} \
+                     ELSE {func}(st.{qt}, d.{ins}) END"
+                )
+            }
         }
         // Group-rescan aggregates: use rescan CTE value when available,
         // or fall back to NULL sentinel.
@@ -3259,7 +3277,9 @@ mod tests {
     }
 
     #[test]
-    fn test_no_rescan_cte_for_min_max() {
+    fn test_rescan_cte_for_min_max() {
+        // MIN/MAX now include a rescan CTE so that when the old extremum
+        // is deleted, the correct new extremum is rescanned from source.
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
@@ -3269,7 +3289,10 @@ mod tests {
         );
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        assert_sql_not_contains(&sql, "agg_rescan");
+        assert_sql_contains(&sql, "agg_rescan");
+        // Rescan fallback in merge: when extremum deleted, use r.{col}
+        assert_sql_contains(&sql, "THEN r.\"min_amt\"");
+        assert_sql_contains(&sql, "THEN r.\"max_amt\"");
     }
 
     #[test]

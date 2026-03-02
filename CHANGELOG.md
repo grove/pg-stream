@@ -107,6 +107,27 @@ mutation cycles. Fixed Q02 subquery and TPC-H schema/datagen edge cases.
 
 ### Fixed
 
+#### Aggregate Differential Correctness
+
+- **MIN/MAX rescan on extremum deletion:** When the current MIN or MAX value was
+  deleted and no new inserts existed, the merge expression returned NULL instead
+  of rescanning the source table. MIN/MAX now participate in the rescan CTE and
+  use the rescanned value when the extremum is deleted.
+- **Regular aggregate ORDER BY parsing:** `STRING_AGG(val, ',' ORDER BY val)` and
+  `ARRAY_AGG(val ORDER BY val)` silently dropped the ORDER BY clause because the
+  parser only captured ordering for ordered-set aggregates (`WITHIN GROUP`). Now
+  all aggregate ORDER BY clauses are parsed correctly.
+- **ORDER BY placement in rescan SQL:** Regular aggregate ORDER BY is now emitted
+  inside the function call parentheses (`STRING_AGG(val, ',' ORDER BY val)`)
+  rather than as `WITHIN GROUP (ORDER BY ...)`, which is reserved for ordered-set
+  aggregates (MODE, PERCENTILE_CONT, PERCENTILE_DISC).
+
+#### E2E Test Infrastructure: Multi-Statement Execute
+
+- Fixed `db.execute()` calls that sent multiple SQL statements in a single
+  prepared statement (which PostgreSQL rejects). Split into separate calls in
+  `e2e_full_join_tests.rs`.
+
 #### CI: pg_stub.c Missing Stubs
 
 Added `palloc0` and error reporting stubs to `scripts/pg_stub.c` to fix unit

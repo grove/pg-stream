@@ -10412,7 +10412,10 @@ unsafe fn extract_aggregates(
                 };
 
                 // Parse optional WITHIN GROUP (ORDER BY ...) for ordered-set aggregates
-                let order_within_group = if fcall.agg_within_group && !fcall.agg_order.is_null() {
+                // and regular aggregate ORDER BY (e.g., STRING_AGG(val, ',' ORDER BY val)).
+                // Both are stored in order_within_group; agg_to_rescan_sql distinguishes
+                // between WITHIN GROUP and regular ORDER BY based on the AggFunc type.
+                let order_within_group = if !fcall.agg_order.is_null() {
                     let ord_list =
                         unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.agg_order) };
                     let mut sorts = Vec::new();
