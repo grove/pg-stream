@@ -14,9 +14,109 @@
 //! 6. Combine deletes + inserts into final delta
 
 use crate::dvm::diff::{DiffContext, DiffResult, col_list, prefixed_col_list, quote_ident};
-use crate::dvm::operators::scan::build_hash_expr;
-use crate::dvm::parser::OpTree;
+use crate::dvm::parser::{AggFunc, OpTree, WindowExpr};
 use crate::error::PgTrickleError;
+
+/// Build a mapping from aggregate SQL expressions (uppercased) to their
+/// output aliases.
+///
+/// When a Window sits on top of an Aggregate (e.g., `RANK() OVER (ORDER BY SUM(val))`),
+/// the window function's ORDER BY references aggregate expressions that no longer exist
+/// in the pre-aggregated current_input CTE. This mapping allows the window diff to
+/// rewrite `SUM(val)` → `dept_total` (the aggregate's output alias) so the
+/// recomputed CTE references the correct columns.
+fn build_agg_alias_map(child: &OpTree) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    // Look through transparent wrappers to find the Aggregate node
+    let node = match child {
+        OpTree::Filter { child, .. } | OpTree::Subquery { child, .. } => child.as_ref(),
+        other => other,
+    };
+    if let OpTree::Aggregate { aggregates, .. } = node {
+        for agg in aggregates {
+            // Build the SQL form of this aggregate: e.g., SUM("val")
+            let agg_sql = match &agg.function {
+                AggFunc::CountStar => "COUNT(*)".to_string(),
+                _ => {
+                    let arg_sql = agg.argument.as_ref().map_or(String::new(), |e| e.to_sql());
+                    format!("{}({})", agg.function.sql_name(), arg_sql)
+                }
+            };
+            // Use uppercase key for case-insensitive matching
+            map.insert(agg_sql.to_uppercase(), agg.alias.clone());
+        }
+    }
+    map
+}
+
+/// Render a window function expression back to SQL, replacing aggregate
+/// expressions in ORDER BY / PARTITION BY with their aliases from the
+/// aggregate child. This is needed when the Window sits on top of an
+/// Aggregate (e.g., `RANK() OVER (ORDER BY SUM(val))` becomes
+/// `RANK() OVER (ORDER BY "dept_total")`).
+///
+/// The `agg_map` keys are uppercased for case-insensitive matching.
+fn render_window_sql(
+    w: &WindowExpr,
+    agg_map: &std::collections::HashMap<String, String>,
+) -> String {
+    if agg_map.is_empty() {
+        return w.to_sql();
+    }
+
+    /// Resolve an expression against the aggregate alias map (case-insensitive).
+    fn resolve(sql: &str, m: &std::collections::HashMap<String, String>) -> String {
+        m.get(&sql.to_uppercase())
+            .map_or_else(|| sql.to_string(), |alias| quote_ident(alias))
+    }
+
+    let args_sql = if w.args.is_empty() {
+        String::new()
+    } else {
+        w.args
+            .iter()
+            .map(|a| resolve(&a.to_sql(), agg_map))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut over_parts = Vec::new();
+    if !w.partition_by.is_empty() {
+        let pb = w
+            .partition_by
+            .iter()
+            .map(|e| resolve(&e.to_sql(), agg_map))
+            .collect::<Vec<_>>()
+            .join(", ");
+        over_parts.push(format!("PARTITION BY {pb}"));
+    }
+    if !w.order_by.is_empty() {
+        let ob = w
+            .order_by
+            .iter()
+            .map(|s| {
+                let resolved = resolve(&s.expr.to_sql(), agg_map);
+                let dir = if s.ascending { "ASC" } else { "DESC" };
+                let nulls = if s.ascending {
+                    if s.nulls_first { " NULLS FIRST" } else { "" }
+                } else if s.nulls_first {
+                    ""
+                } else {
+                    " NULLS LAST"
+                };
+                format!("{resolved} {dir}{nulls}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        over_parts.push(format!("ORDER BY {ob}"));
+    }
+    if let Some(ref frame) = w.frame_clause {
+        over_parts.push(frame.clone());
+    }
+
+    let over_clause = over_parts.join(" ");
+    format!("{}({args_sql}) OVER ({over_clause})", w.func_name)
+}
 
 /// Differentiate a Window node.
 pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
@@ -43,8 +143,21 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
     // Column lists
     let pt_aliases: Vec<String> = pass_through.iter().map(|(_, a)| a.clone()).collect();
     let wf_aliases: Vec<String> = window_exprs.iter().map(|w| w.alias.clone()).collect();
+
+    // Detect auxiliary columns from the child result (e.g., __pgt_count
+    // from an Aggregate child) that need to be passed through the window
+    // diff so the MERGE can update them in the storage table.
+    // Only include internal __pgt_* columns, not regular child columns.
+    let aux_cols: Vec<String> = child_result
+        .columns
+        .iter()
+        .filter(|c| c.starts_with("__pgt_") && !pt_aliases.contains(c) && !wf_aliases.contains(c))
+        .cloned()
+        .collect();
+
     let mut all_output_cols = pt_aliases.clone();
     all_output_cols.extend(wf_aliases.iter().cloned());
+    all_output_cols.extend(aux_cols.iter().cloned());
 
     let partition_cols: Vec<String> = partition_by.iter().map(|e| e.to_sql()).collect();
 
@@ -119,51 +232,131 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
             .join(" AND ")
     };
 
-    let current_input_sql = format!(
-        "-- Surviving old rows (pass-through only, window cols stripped)\n\
-         SELECT o.\"__pgt_row_id\", {pt_cols_old}\n\
-         FROM {old_rows_cte} o\n\
-         WHERE o.\"__pgt_row_id\" NOT IN (\n\
-             SELECT \"__pgt_row_id\" FROM {child_delta} WHERE \"__pgt_action\" = 'D'\n\
-         )\n\
-         UNION ALL\n\
-         -- Newly inserted rows\n\
-         SELECT d.\"__pgt_row_id\", {pt_cols_delta}\n\
-         FROM {child_delta} d\n\
-         WHERE d.\"__pgt_action\" = 'I'\n\
-         AND EXISTS (\n\
-             SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_delta_cp}\n\
-         )",
-        child_delta = child_result.cte_name,
-    );
+    let current_input_sql = {
+        // Build aux column selections for surviving old rows and delta inserts
+        let aux_old = if aux_cols.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = aux_cols
+                .iter()
+                .map(|c| format!(", o.{}", quote_ident(c)))
+                .collect();
+            parts.join("")
+        };
+        let aux_delta = if aux_cols.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = aux_cols
+                .iter()
+                .map(|c| format!(", d.{}", quote_ident(c)))
+                .collect();
+            parts.join("")
+        };
+
+        // Match surviving old rows against child delta DELETEs using
+        // pass-through columns, not __pgt_row_id. The ST stores row IDs
+        // based on row_to_json+row_number from initial population,
+        // while the child (scan) delta uses PK-based hashes. These differ,
+        // so __pgt_row_id cannot be used for the exclusion filter.
+        let delete_match_cond = if pt_aliases.is_empty() {
+            // No pass-through columns: match on dummy (all rows excluded)
+            "TRUE".to_string()
+        } else {
+            pt_aliases
+                .iter()
+                .map(|c| {
+                    let qc = quote_ident(c);
+                    format!("d2.{qc} = o.{qc}")
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        };
+
+        format!(
+            "-- Surviving old rows (pass-through only, window cols stripped)\n\
+             SELECT {pt_cols_old}{aux_old}\n\
+             FROM {old_rows_cte} o\n\
+             WHERE NOT EXISTS (\n\
+                 SELECT 1 FROM {child_delta} d2\n\
+                 WHERE d2.\"__pgt_action\" = 'D' AND {delete_match_cond}\n\
+             )\n\
+             UNION ALL\n\
+             -- Newly inserted rows\n\
+             SELECT {pt_cols_delta}{aux_delta}\n\
+             FROM {child_delta} d\n\
+             WHERE d.\"__pgt_action\" = 'I'\n\
+             AND EXISTS (\n\
+                 SELECT 1 FROM {changed_parts_cte} cp WHERE {partition_join_delta_cp}\n\
+             )",
+            child_delta = child_result.cte_name,
+        )
+    };
     ctx.add_cte(current_input_cte.clone(), current_input_sql);
 
     // ── CTE 4: Recompute window functions on current input ─────────────
     let recomputed_cte = ctx.next_cte_name("win_recomp");
 
+    // Build aggregate alias map for Window-over-Aggregate queries.
+    // When the child is an Aggregate, ORDER BY expressions like SUM(val)
+    // must be rewritten to their output aliases (e.g., "dept_total").
+    let agg_map = build_agg_alias_map(child);
+
     let window_func_selects: Vec<String> = window_exprs
         .iter()
-        .map(|w| format!("{} AS {}", w.to_sql(), quote_ident(&w.alias)))
+        .map(|w| {
+            format!(
+                "{} AS {}",
+                render_window_sql(w, &agg_map),
+                quote_ident(&w.alias)
+            )
+        })
         .collect();
 
-    // Row ID: re-derive from pass-through columns to stay deterministic
-    let hash_exprs: Vec<String> = pt_aliases
-        .iter()
-        .map(|c| format!("ci.{}::TEXT", quote_ident(c)))
-        .collect();
-    let row_id_expr = if hash_exprs.is_empty() {
-        "pgtrickle.pg_trickle_hash('__window_singleton')".to_string()
-    } else {
-        build_hash_expr(&hash_exprs)
-    };
+    // Compute unique row_ids using row_to_json + row_number, matching the
+    // initial population formula. This guarantees uniqueness even when
+    // pass-through columns have duplicates (e.g., DENSE_RANK ties).
+    // The window diff deletes ALL old rows in changed partitions and
+    // inserts ALL recomputed rows, so row_ids don't need to match between
+    // old and new — they just need to be unique.
 
     let pt_cols_ci = prefixed_col_list("ci", &pt_aliases);
 
+    // Include aux columns in recomputed output
+    let aux_ci = if aux_cols.is_empty() {
+        String::new()
+    } else {
+        let parts: Vec<String> = aux_cols
+            .iter()
+            .map(|c| format!(",\n               ci.{}", quote_ident(c)))
+            .collect();
+        parts.join("")
+    };
+
     let recomputed_sql = format!(
-        "SELECT {row_id_expr} AS \"__pgt_row_id\",\n\
-               {pt_cols_ci},\n\
-               {wf_selects}\n\
-         FROM {current_input_cte} ci",
+        "SELECT pgtrickle.pg_trickle_hash(\
+               row_to_json(w)::text || '/' || row_number() OVER ()::text\
+         ) AS \"__pgt_row_id\",\n\
+               {all_cols_w}{aux_w}\n\
+         FROM (\n\
+               SELECT {pt_cols_ci},\n\
+                      {wf_selects}{aux_ci}\n\
+               FROM {current_input_cte} ci\n\
+         ) w",
+        all_cols_w = all_output_cols
+            .iter()
+            .filter(|c| !aux_cols.contains(c))
+            .map(|c| format!("w.{}", quote_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        aux_w = if aux_cols.is_empty() {
+            String::new()
+        } else {
+            aux_cols
+                .iter()
+                .map(|c| format!(", w.{}", quote_ident(c)))
+                .collect::<Vec<String>>()
+                .join("")
+        },
         wf_selects = window_func_selects.join(",\n       "),
     );
     ctx.add_cte(recomputed_cte.clone(), recomputed_sql);

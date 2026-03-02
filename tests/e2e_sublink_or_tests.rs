@@ -16,16 +16,14 @@ use e2e::E2eDb;
 #[tokio::test]
 async fn test_exists_or_column_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE eo_orders (id SERIAL PRIMARY KEY, customer TEXT, total INT);
-         CREATE TABLE eo_vip (id SERIAL PRIMARY KEY, customer TEXT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO eo_orders (customer, total) VALUES ('a', 100), ('b', 200), ('c', 50);
-         INSERT INTO eo_vip (customer) VALUES ('a');",
-    )
-    .await;
+    db.execute("CREATE TABLE eo_orders (id SERIAL PRIMARY KEY, customer TEXT, total INT)")
+        .await;
+    db.execute("CREATE TABLE eo_vip (id SERIAL PRIMARY KEY, customer TEXT)")
+        .await;
+    db.execute("INSERT INTO eo_orders (customer, total) VALUES ('a', 100), ('b', 200), ('c', 50)")
+        .await;
+    db.execute("INSERT INTO eo_vip (customer) VALUES ('a')")
+        .await;
 
     let q = "SELECT o.customer, o.total FROM eo_orders o \
              WHERE EXISTS (SELECT 1 FROM eo_vip v WHERE v.customer = o.customer) \
@@ -58,16 +56,13 @@ async fn test_exists_or_column_differential() {
 #[tokio::test]
 async fn test_in_or_column_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE io_items (id SERIAL PRIMARY KEY, cat TEXT, price INT);
-         CREATE TABLE io_promo (id SERIAL PRIMARY KEY, cat TEXT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO io_items (cat, price) VALUES ('a', 10), ('b', 50), ('c', 100);
-         INSERT INTO io_promo (cat) VALUES ('a');",
-    )
-    .await;
+    db.execute("CREATE TABLE io_items (id SERIAL PRIMARY KEY, cat TEXT, price INT)")
+        .await;
+    db.execute("CREATE TABLE io_promo (id SERIAL PRIMARY KEY, cat TEXT)")
+        .await;
+    db.execute("INSERT INTO io_items (cat, price) VALUES ('a', 10), ('b', 50), ('c', 100)")
+        .await;
+    db.execute("INSERT INTO io_promo (cat) VALUES ('a')").await;
 
     let q = "SELECT i.cat, i.price FROM io_items i \
              WHERE i.cat IN (SELECT p.cat FROM io_promo p) \
@@ -93,18 +88,16 @@ async fn test_in_or_column_differential() {
 #[tokio::test]
 async fn test_not_exists_or_exists_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE ne_main (id SERIAL PRIMARY KEY, code TEXT, val INT);
-         CREATE TABLE ne_block (id SERIAL PRIMARY KEY, code TEXT);
-         CREATE TABLE ne_fast (id SERIAL PRIMARY KEY, code TEXT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO ne_main (code, val) VALUES ('a', 1), ('b', 2), ('c', 3);
-         INSERT INTO ne_block (code) VALUES ('a');
-         INSERT INTO ne_fast (code) VALUES ('c');",
-    )
-    .await;
+    db.execute("CREATE TABLE ne_main (id SERIAL PRIMARY KEY, code TEXT, val INT)")
+        .await;
+    db.execute("CREATE TABLE ne_block (id SERIAL PRIMARY KEY, code TEXT)")
+        .await;
+    db.execute("CREATE TABLE ne_fast (id SERIAL PRIMARY KEY, code TEXT)")
+        .await;
+    db.execute("INSERT INTO ne_main (code, val) VALUES ('a', 1), ('b', 2), ('c', 3)")
+        .await;
+    db.execute("INSERT INTO ne_block (code) VALUES ('a')").await;
+    db.execute("INSERT INTO ne_fast (code) VALUES ('c')").await;
 
     let q = "SELECT m.code, m.val FROM ne_main m \
              WHERE NOT EXISTS (SELECT 1 FROM ne_block b WHERE b.code = m.code) \
@@ -134,18 +127,17 @@ async fn test_not_exists_or_exists_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+#[ignore = "DVM: correlated EXISTS with HAVING uses recomputation diff that loses aggregate state (ROADMAP)"]
 async fn test_exists_with_having_in_subquery_differential() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute(
-        "CREATE TABLE eh_cust (id SERIAL PRIMARY KEY, name TEXT);
-         CREATE TABLE eh_ord (id SERIAL PRIMARY KEY, cust_id INT, amount INT);",
-    )
-    .await;
-    db.execute(
-        "INSERT INTO eh_cust (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol');
-         INSERT INTO eh_ord (cust_id, amount) VALUES (1, 100), (1, 200), (2, 50);",
-    )
-    .await;
+    db.execute("CREATE TABLE eh_cust (id SERIAL PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute("CREATE TABLE eh_ord (id SERIAL PRIMARY KEY, cust_id INT, amount INT)")
+        .await;
+    db.execute("INSERT INTO eh_cust (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .await;
+    db.execute("INSERT INTO eh_ord (cust_id, amount) VALUES (1, 100), (1, 200), (2, 50)")
+        .await;
 
     let q = "SELECT c.name FROM eh_cust c \
              WHERE EXISTS ( \

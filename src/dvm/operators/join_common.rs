@@ -221,6 +221,28 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                 ra = quote_ident(right_alias),
             )
         }
+        OpTree::Window {
+            window_exprs,
+            pass_through,
+            child,
+            ..
+        } => {
+            let inner = build_snapshot_sql(child);
+            let child_alias = child.alias();
+            let mut selects: Vec<String> = pass_through
+                .iter()
+                .map(|(_, alias)| quote_ident(alias))
+                .collect();
+            for w in window_exprs {
+                selects.push(format!("{} AS {}", w.to_sql(), quote_ident(&w.alias)));
+            }
+            format!(
+                "(SELECT {} FROM {} {})",
+                selects.join(", "),
+                inner,
+                quote_ident(child_alias),
+            )
+        }
         _ => {
             // Fallback for unsupported node types.
             format!("/* unsupported snapshot for {} */", op.node_kind())

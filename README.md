@@ -75,7 +75,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Window functions** | `ROW_NUMBER`, `RANK`, `SUM OVER`, etc. | ✅ Full | Partition-based recomputation |
 | **Window functions** | Window frame clauses | ✅ Full | `ROWS`, `RANGE`, `GROUPS` with `BETWEEN` bounds and `EXCLUDE` |
 | **Window functions** | Named `WINDOW` clauses | ✅ Full | `WINDOW w AS (...)` resolved from query-level window definitions |
-| **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Auto-split into joined subqueries |
+| **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Same partition key used directly; different keys fall back to full recomputation |
 | **LATERAL SRFs** | `jsonb_array_elements`, `unnest`, `jsonb_each`, etc. | ✅ Full | Row-scoped recomputation in DIFFERENTIAL mode |
 | **JSON_TABLE** | `JSON_TABLE(expr, path COLUMNS (...))` | ✅ Full | PostgreSQL 17+; modeled as lateral function |
 | **Expressions** | `CASE WHEN … THEN … ELSE … END` | ✅ Full | Both searched and simple CASE |
@@ -133,7 +133,7 @@ CREATE EXTENSION pg_trickle;
 pg_trickle is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
 
 ```bash
-docker pull ghcr.io/grove/pg_trickle-ext:0.1.2
+docker pull ghcr.io/grove/pg_trickle-ext:0.1.3
 ```
 
 Deploy with the official CNPG PostgreSQL 18 operand image:
@@ -147,7 +147,7 @@ spec:
     extensions:
       - name: pg-trickle
         image:
-          reference: ghcr.io/grove/pg_trickle-ext:0.1.2
+          reference: ghcr.io/grove/pg_trickle-ext:0.1.3
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and [cnpg/database-example.yaml](cnpg/database-example.yaml) for complete examples. Requires Kubernetes 1.33+ and CNPG 1.28+.
@@ -329,7 +329,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** ~910 unit tests + 74 integration tests + 23 E2E test suites (~384 E2E tests), 0 failures.
+**Test counts:** ~963 unit tests + 32 integration tests + 34 E2E test suites (~460 E2E tests).
 
 ### Code Coverage
 

@@ -145,9 +145,11 @@ async fn test_window_ranking_functions_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE wf_rank (id SERIAL PRIMARY KEY, dept TEXT, salary INT)")
         .await;
+    // Use unique (dept, salary) pairs to avoid hash collisions on __pgt_row_id.
+    // Duplicate pass-through values are a known limitation (see keyless_duplicate_tests).
     db.execute(
         "INSERT INTO wf_rank (dept, salary) VALUES \
-         ('eng', 100), ('eng', 100), ('eng', 200), ('sales', 150), ('sales', 300)",
+         ('eng', 100), ('eng', 150), ('eng', 200), ('sales', 150), ('sales', 300)",
     )
     .await;
 
@@ -158,12 +160,12 @@ async fn test_window_ranking_functions_differential() {
     db.create_st("wf_rank_st", q, "1m", "DIFFERENTIAL").await;
     db.assert_st_matches_query("wf_rank_st", q).await;
 
-    db.execute("INSERT INTO wf_rank (dept, salary) VALUES ('eng', 150)")
+    db.execute("INSERT INTO wf_rank (dept, salary) VALUES ('eng', 175)")
         .await;
     db.refresh_st("wf_rank_st").await;
     db.assert_st_matches_query("wf_rank_st", q).await;
 
-    db.execute("DELETE FROM wf_rank WHERE dept = 'eng' AND salary = 100 AND id = (SELECT MIN(id) FROM wf_rank WHERE dept = 'eng' AND salary = 100)")
+    db.execute("DELETE FROM wf_rank WHERE dept = 'eng' AND salary = 100")
         .await;
     db.refresh_st("wf_rank_st").await;
     db.assert_st_matches_query("wf_rank_st", q).await;

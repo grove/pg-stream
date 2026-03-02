@@ -976,14 +976,42 @@ impl OpTree {
     /// around the `Aggregate`).
     pub fn needs_pgt_count(&self) -> bool {
         match self {
-            OpTree::Aggregate { .. }
-            | OpTree::Distinct { .. }
-            | OpTree::Intersect { .. }
-            | OpTree::Except { .. } => true,
+            OpTree::Aggregate { .. } => true,
+            OpTree::Distinct { child, .. } => {
+                // UNION (dedup) = Distinct { UnionAll }; uses union-dedup count path instead
+                !matches!(child.as_ref(), OpTree::UnionAll { .. })
+            }
             // Transparent wrappers — delegate to child
             OpTree::Filter { child, .. }
             | OpTree::Project { child, .. }
-            | OpTree::Subquery { child, .. } => child.needs_pgt_count(),
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.needs_pgt_count(),
+            // INTERSECT/EXCEPT use dual counts, not __pgt_count
+            OpTree::Intersect { .. } | OpTree::Except { .. } => false,
+            _ => false,
+        }
+    }
+
+    /// Whether this operator represents a UNION (without ALL) that needs
+    /// deduplication counting via `__pgt_count` in a wrapped UNION ALL form.
+    pub fn needs_union_dedup_count(&self) -> bool {
+        match self {
+            OpTree::Distinct { child, .. } => matches!(child.as_ref(), OpTree::UnionAll { .. }),
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. } => child.needs_union_dedup_count(),
+            _ => false,
+        }
+    }
+
+    /// Whether this operator needs dual multiplicity counts
+    /// (`__pgt_count_l`, `__pgt_count_r`) for set operation tracking.
+    pub fn needs_dual_count(&self) -> bool {
+        match self {
+            OpTree::Intersect { .. } | OpTree::Except { .. } => true,
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. } => child.needs_dual_count(),
             _ => false,
         }
     }
@@ -1109,7 +1137,9 @@ impl OpTree {
             OpTree::Window { .. } => {
                 // Window functions like RANK/DENSE_RANK can produce identical
                 // output rows (tied values). Fall back to row_number-based
-                // hash to guarantee uniqueness.
+                // hash in the initial population to guarantee uniqueness.
+                // The window diff operator computes its own unique row_ids
+                // during partition recomputation.
                 None
             }
             OpTree::LateralFunction { .. } => {
@@ -5228,18 +5258,29 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
         .enumerate()
         .map(|(i, (expr, alias))| {
             alias.clone().unwrap_or_else(|| {
-                // Try to extract a simple column name from the expression
-                if let Some(name) = expr.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                    name.to_string()
-                } else {
+                // Try to extract a simple column name from the expression.
+                // Handles both quoted ("name") and unquoted (name) column refs.
+                let trimmed = expr.trim_matches('"');
+                if trimmed.contains('.') || trimmed.contains('(') || trimmed.contains(' ') {
                     format!("__pgt_col_{}", i + 1)
+                } else {
+                    trimmed.to_string()
                 }
             })
         })
         .collect();
 
-    // Row marker: ROW_NUMBER() OVER () for deterministic join
-    let row_marker = "ROW_NUMBER() OVER () AS __pgt_row_marker";
+    // ── Build CTE base with row marker ────────────────────────────────
+    // Use a CTE so the row marker (ROW_NUMBER() OVER ()) is computed once
+    // and referenced as a plain column in each subquery. This avoids
+    // adding a second window function to each subquery which would
+    // trigger the multi-PARTITION BY check recursively.
+    // List columns explicitly (not SELECT *) to avoid A_Star parse issues.
+    let cte_cols: Vec<String> = pt_select.clone();
+    let cte_base = format!(
+        "SELECT {}, ROW_NUMBER() OVER () AS __pgt_row_marker FROM {from_sql}{where_sql}{group_sql}{having_sql}",
+        cte_cols.join(", ")
+    );
 
     // ── Build subqueries for each partition group ─────────────────────
     let mut subquery_aliases: Vec<String> = Vec::new();
@@ -5264,13 +5305,10 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
             window_col_sources.push((sq_alias.clone(), wi.alias.clone()));
         }
 
-        // Include row marker
-        sq_select_parts.push(row_marker.to_string());
+        // Include row marker (now a plain column from the CTE, not a window function)
+        sq_select_parts.push("__pgt_row_marker".to_string());
 
-        let sq_sql = format!(
-            "SELECT {} FROM {from_sql}{where_sql}{group_sql}{having_sql}",
-            sq_select_parts.join(", ")
-        );
+        let sq_sql = format!("SELECT {} FROM __pgt_numbered", sq_select_parts.join(", "));
         subquery_sqls.push(sq_sql);
         subquery_aliases.push(sq_alias);
     }
@@ -5295,6 +5333,12 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
         ));
     }
 
+    // Include __pgt_row_marker in the outer SELECT so the DVM can store
+    // it in the stream table. The Window diff reads old rows from the ST
+    // including pass-through columns; without __pgt_row_marker in storage,
+    // the CTE that fetches old rows would fail with "column does not exist".
+    outer_select_parts.push(format!("\"{first_sq}\".\"__pgt_row_marker\"",));
+
     // ── Build outer FROM (JOIN chain) ──────────────────────────────
     let mut outer_from = format!(
         "({}) AS \"{}\"",
@@ -5316,7 +5360,7 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
     let order_sql = deparse_order_clause(select);
 
     let rewritten = format!(
-        "SELECT {} FROM {outer_from}{order_sql}",
+        "WITH __pgt_numbered AS ({cte_base}) SELECT {} FROM {outer_from}{order_sql}",
         outer_select_parts.join(", ")
     );
 
@@ -7171,29 +7215,29 @@ unsafe fn parse_select_stmt(
             ));
         }
 
-        // Validate: all window expressions must share the same PARTITION BY.
-        // Multi-PARTITION BY should have been rewritten by
-        // rewrite_multi_partition_windows(). If still present, reject.
+        // Determine the shared PARTITION BY for the DVM diff optimizer.
+        // If all window functions share the same PARTITION BY, use it —
+        // the diff engine can then recompute only affected partitions.
+        // When PARTITION BY clauses differ, fall back to empty (un-partitioned)
+        // which triggers full recomputation on any change (correct but
+        // less targeted).
         let canonical_partition: Vec<String> = window_exprs[0]
             .partition_by
             .iter()
             .map(|e| e.to_sql())
             .collect();
-        for wexpr in &window_exprs[1..] {
-            let this_partition: Vec<String> =
-                wexpr.partition_by.iter().map(|e| e.to_sql()).collect();
-            if this_partition != canonical_partition {
-                return Err(PgTrickleError::UnsupportedOperator(
-                    "All window functions in a defining query must share the same \
-                     PARTITION BY clause for differential maintenance. \
-                     The multi-PARTITION BY auto-rewrite did not handle this query; \
-                     consider splitting into separate stream tables."
-                        .into(),
-                ));
-            }
-        }
+        let all_same_partition = window_exprs[1..].iter().all(|wexpr| {
+            let p: Vec<String> = wexpr.partition_by.iter().map(|e| e.to_sql()).collect();
+            p == canonical_partition
+        });
 
-        let partition_by = window_exprs[0].partition_by.clone();
+        let partition_by = if all_same_partition {
+            window_exprs[0].partition_by.clone()
+        } else {
+            // Different PARTITION BY clauses → un-partitioned diff mode
+            // (full recomputation on any change).
+            vec![]
+        };
 
         // If there's also a GROUP BY, build the Aggregate child first.
         if !group_list.is_empty() || has_aggregates {
@@ -8372,22 +8416,68 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         // Handle COUNT(*) and other agg_star calls.
         // PostgreSQL represents COUNT(*) as FuncCall { agg_star: true, args: [] }.
         // We must emit the "*" explicitly so to_sql() produces COUNT(*) not COUNT().
+        let base_args_str = if fcall.agg_star {
+            "*".to_string()
+        } else {
+            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let mut args = Vec::new();
+            for n in args_list.iter_ptr() {
+                if let Ok(e) = unsafe { node_to_expr(n) } {
+                    args.push(e.to_sql());
+                }
+            }
+            args.join(", ")
+        };
+
+        // Window functions: FuncCall with non-null .over → emit full OVER clause
+        if !fcall.over.is_null() {
+            let over = unsafe { &*fcall.over };
+            let mut over_parts = Vec::new();
+
+            // PARTITION BY
+            if !over.partitionClause.is_null() {
+                let parts_list =
+                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(over.partitionClause) };
+                let mut pk = Vec::new();
+                for p in parts_list.iter_ptr() {
+                    pk.push(unsafe { node_to_expr(p) }?.to_sql());
+                }
+                over_parts.push(format!("PARTITION BY {}", pk.join(", ")));
+            }
+
+            // ORDER BY
+            if !over.orderClause.is_null() {
+                let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(over.orderClause) };
+                let sort_sql = unsafe { deparse_sort_clause(&sort_list)? };
+                over_parts.push(format!("ORDER BY {}", sort_sql));
+            }
+
+            // Frame clause (ROWS/RANGE/GROUPS BETWEEN ... AND ...)
+            if let Some(frame_sql) = unsafe { deparse_window_frame(over) } {
+                over_parts.push(frame_sql);
+            }
+
+            let over_sql = over_parts.join(" ");
+            return Ok(Expr::Raw(format!(
+                "{func_name}({base_args_str}) OVER ({over_sql})"
+            )));
+        }
+
         if fcall.agg_star {
-            return Ok(Expr::FuncCall {
+            Ok(Expr::FuncCall {
                 func_name,
                 args: vec![Expr::Raw("*".to_string())],
-            });
-        }
-
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
-        let mut args = Vec::new();
-        for n in args_list.iter_ptr() {
-            if let Ok(e) = unsafe { node_to_expr(n) } {
-                args.push(e);
+            })
+        } else {
+            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let mut args = Vec::new();
+            for n in args_list.iter_ptr() {
+                if let Ok(e) = unsafe { node_to_expr(n) } {
+                    args.push(e);
+                }
             }
+            Ok(Expr::FuncCall { func_name, args })
         }
-
-        Ok(Expr::FuncCall { func_name, args })
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
         let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
         let inner = unsafe { node_to_expr(tc.arg)? };
@@ -10171,6 +10261,11 @@ unsafe fn is_agg_node(node: *mut pg_sys::Node) -> bool {
     }
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
         let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
+        // Window functions (FuncCall with OVER clause) are NOT aggregates,
+        // even if they use aggregate function names like SUM, COUNT.
+        if !fcall.over.is_null() {
+            return false;
+        }
         if fcall.agg_within_group
             || !fcall.agg_order.is_null()
             || fcall.agg_star
@@ -10338,6 +10433,16 @@ unsafe fn extract_aggregates(
 
         if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_FuncCall) } {
             let fcall = unsafe { &*(rt.val as *const pg_sys::FuncCall) };
+
+            // Window functions (FuncCall with OVER clause) are NOT aggregates.
+            // Treat them as plain expressions — they'll be handled by the
+            // window operator path in parse_select_stmt.
+            if !fcall.over.is_null() {
+                let expr = unsafe { node_to_expr(rt.val)? };
+                non_aggs.push(expr);
+                continue;
+            }
+
             let func_name = unsafe { extract_func_name(fcall.funcname)? };
             let name_lower = func_name.to_lowercase();
 
@@ -10412,7 +10517,10 @@ unsafe fn extract_aggregates(
                 };
 
                 // Parse optional WITHIN GROUP (ORDER BY ...) for ordered-set aggregates
-                let order_within_group = if fcall.agg_within_group && !fcall.agg_order.is_null() {
+                // and regular aggregate ORDER BY (e.g., STRING_AGG(val, ',' ORDER BY val)).
+                // Both are stored in order_within_group; agg_to_rescan_sql distinguishes
+                // between WITHIN GROUP and regular ORDER BY based on the AggFunc type.
+                let order_within_group = if !fcall.agg_order.is_null() {
                     let ord_list =
                         unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.agg_order) };
                     let mut sorts = Vec::new();
@@ -11383,13 +11491,14 @@ mod tests {
 
     #[test]
     fn test_needs_pgt_count_distinct_wrapping_union_all() {
-        // Distinct wrapping UnionAll needs pgt_count (reference counting)
+        // Distinct wrapping UnionAll uses union-dedup-count path, not pgt_count
         let tree = OpTree::Distinct {
             child: Box::new(OpTree::UnionAll {
                 children: vec![scan_node("a", 1, &["id"]), scan_node("b", 2, &["id"])],
             }),
         };
-        assert!(tree.needs_pgt_count());
+        assert!(!tree.needs_pgt_count());
+        assert!(tree.needs_union_dedup_count());
     }
 
     #[test]

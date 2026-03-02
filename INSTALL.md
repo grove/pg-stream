@@ -35,8 +35,8 @@ sha256sum -c SHA256SUMS.txt
 **Linux / macOS:**
 
 ```bash
-tar xzf pg_trickle-0.1.2-pg18-linux-amd64.tar.gz
-cd pg_trickle-0.1.2-pg18-linux-amd64
+tar xzf pg_trickle-0.1.3-pg18-linux-amd64.tar.gz
+cd pg_trickle-0.1.3-pg18-linux-amd64
 
 sudo cp lib/*.so  "$(pg_config --pkglibdir)/"
 sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
@@ -45,8 +45,8 @@ sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
 **Windows (PowerShell):**
 
 ```powershell
-Expand-Archive pg_trickle-0.1.2-pg18-windows-amd64.zip -DestinationPath .
-cd pg_trickle-0.1.2-pg18-windows-amd64
+Expand-Archive pg_trickle-0.1.3-pg18-windows-amd64.zip -DestinationPath .
+cd pg_trickle-0.1.3-pg18-windows-amd64
 
 Copy-Item lib\*.dll  "$(pg_config --pkglibdir)\"
 Copy-Item extension\* "$(pg_config --sharedir)\extension\"
@@ -61,7 +61,7 @@ pg_trickle is distributed as an OCI extension image for use with
 
 ```bash
 # Pull the extension image
-docker pull ghcr.io/grove/pg_trickle-ext:0.1.2
+docker pull ghcr.io/grove/pg_trickle-ext:0.1.3
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and
@@ -75,8 +75,8 @@ into a standard PostgreSQL container from a release archive:
 
 ```bash
 # Extract extension files from the release archive
-tar xzf pg_trickle-0.1.2-pg18-linux-amd64.tar.gz
-cd pg_trickle-0.1.2-pg18-linux-amd64
+tar xzf pg_trickle-0.1.3-pg18-linux-amd64.tar.gz
+cd pg_trickle-0.1.3-pg18-linux-amd64
 
 # Run PostgreSQL with the extension mounted
 docker run --rm \
