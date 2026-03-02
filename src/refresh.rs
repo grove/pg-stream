@@ -1909,6 +1909,7 @@ mod tests {
             frontier: None,
             topk_limit: None,
             topk_order_by: None,
+            diamond_consistency: crate::dag::DiamondConsistency::None,
         }
     }
 

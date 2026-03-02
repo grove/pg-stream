@@ -29,6 +29,43 @@ use crate::error::PgTrickleError;
 
 // ── Diamond dependency types ───────────────────────────────────────────────
 
+/// Per-stream-table diamond consistency mode.
+///
+/// Controls whether a stream table participates in atomic SAVEPOINT-based
+/// refresh groups when it is part of a diamond dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiamondConsistency {
+    /// No atomic grouping — each ST refreshes independently (default).
+    None,
+    /// All members of the diamond's consistency group are wrapped in a
+    /// single SAVEPOINT; if any member fails the entire group rolls back.
+    Atomic,
+}
+
+impl DiamondConsistency {
+    /// Serialize to the SQL CHECK constraint value.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DiamondConsistency::None => "none",
+            DiamondConsistency::Atomic => "atomic",
+        }
+    }
+
+    /// Deserialize from SQL string. Falls back to `None` for unknown values.
+    pub fn from_sql_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "atomic" => DiamondConsistency::Atomic,
+            _ => DiamondConsistency::None,
+        }
+    }
+}
+
+impl std::fmt::Display for DiamondConsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 /// A detected diamond in the ST dependency graph.
 ///
 /// A diamond exists when two or more paths from shared source(s) converge at a
@@ -1735,5 +1772,53 @@ mod tests {
             epoch: 0,
         };
         assert!(!multi.is_singleton());
+    }
+
+    // ── DiamondConsistency enum tests ──────────────────────────────────
+
+    #[test]
+    fn test_diamond_consistency_as_str() {
+        assert_eq!(DiamondConsistency::None.as_str(), "none");
+        assert_eq!(DiamondConsistency::Atomic.as_str(), "atomic");
+    }
+
+    #[test]
+    fn test_diamond_consistency_from_sql_str() {
+        assert_eq!(
+            DiamondConsistency::from_sql_str("none"),
+            DiamondConsistency::None
+        );
+        assert_eq!(
+            DiamondConsistency::from_sql_str("atomic"),
+            DiamondConsistency::Atomic
+        );
+        assert_eq!(
+            DiamondConsistency::from_sql_str("ATOMIC"),
+            DiamondConsistency::Atomic
+        );
+        assert_eq!(
+            DiamondConsistency::from_sql_str("NONE"),
+            DiamondConsistency::None
+        );
+        // Unknown values fall back to None
+        assert_eq!(
+            DiamondConsistency::from_sql_str("unknown"),
+            DiamondConsistency::None
+        );
+    }
+
+    #[test]
+    fn test_diamond_consistency_display() {
+        assert_eq!(format!("{}", DiamondConsistency::None), "none");
+        assert_eq!(format!("{}", DiamondConsistency::Atomic), "atomic");
+    }
+
+    #[test]
+    fn test_diamond_consistency_roundtrip() {
+        for dc in [DiamondConsistency::None, DiamondConsistency::Atomic] {
+            let s = dc.as_str();
+            let parsed = DiamondConsistency::from_sql_str(s);
+            assert_eq!(dc, parsed);
+        }
     }
 }

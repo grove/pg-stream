@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     functions_used  TEXT[],
     topk_limit      INT,
     topk_order_by   TEXT,
+    diamond_consistency TEXT NOT NULL DEFAULT 'none'
+                     CHECK (diamond_consistency IN ('none', 'atomic')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
