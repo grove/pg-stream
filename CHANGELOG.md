@@ -107,6 +107,51 @@ mutation cycles. Fixed Q02 subquery and TPC-H schema/datagen edge cases.
 
 ### Fixed
 
+#### Window Function Differential Maintenance (6 tests un-ignored)
+
+Fixed window function differential maintenance to correctly handle non-RANGE
+frames, LAG/LEAD, ranking functions (DENSE_RANK, NTILE, RANK), and
+window-over-aggregate queries. Six previously-ignored E2E tests now pass:
+
+- **Parser: `is_agg_node()` OVER clause check** — Window function calls with
+  `OVER` were incorrectly classified as aggregate nodes, causing wrong operator
+  tree construction.
+- **Parser: `extract_aggregates()` OVER clause early return** — Aggregates
+  wrapped in `OVER (...)` were extracted as plain aggregates, producing
+  duplicate columns in the delta SQL.
+- **Parser: `needs_pgt_count` Window delegation** — The `__pgt_count` tracking
+  column was not propagated through Window operators.
+- **Window diff: NOT EXISTS filter on pass-through columns** — The
+  `current_input` CTE used `__pgt_row_id` for change detection, which does not
+  exist in the Window operator's input. Switched to NOT EXISTS join on
+  pass-through columns.
+- **Window diff: `build_agg_alias_map` + `render_window_sql`** — Window
+  functions wrapping aggregates (e.g., `RANK() OVER (ORDER BY SUM(x))`)
+  emitted raw aggregate expressions instead of referencing the aggregate
+  output aliases.
+- **Row ID uniqueness via `row_to_json` + `row_number`** — Window functions
+  over tied values (DENSE_RANK, RANK) produced duplicate `__pgt_row_id` hashes.
+  Row IDs are now computed from the full row content plus a positional disambiguator.
+
+#### INTERSECT/EXCEPT Differential Correctness (6 tests un-ignored)
+
+Fixed INTERSECT and EXCEPT differential SQL generation that produced invalid
+GROUP BY clauses. The set operation diff now correctly generates dual-count
+multiplicity tracking with LEAST/GREATEST boundary crossing.
+
+#### SubLink OR Differential Correctness (3 tests un-ignored)
+
+Fixed EXISTS/IN subqueries combined with OR in WHERE clauses that generated
+invalid GROUP BY expressions. The semi-join/anti-join delta operators now
+correctly handle OR-combined SubLinks.
+
+#### Multi-Partition Window Native Handling
+
+Queries with multiple window functions using different PARTITION BY clauses
+are now handled natively by the parser instead of requiring a CTE+JOIN
+rewrite. If all windows share the same partition key, it is used directly;
+otherwise the window operator falls back to un-partitioned (full) recomputation.
+
 #### Aggregate Differential Correctness
 
 - **MIN/MAX rescan on extremum deletion:** When the current MIN or MAX value was
@@ -137,26 +182,23 @@ test compilation.
 
 ### Changed
 
-- **Test count:** ~1,442 total tests (up from ~1,138): 954 unit + 28 integration
-  + 460 E2E across 34 test files (up from ~22). 33 E2E tests are `#[ignore]`d
+- **Test count:** ~1,455 total tests (up from ~1,138): 963 unit + 32 integration
+  + 460 E2E across 34 test files (up from ~22). 18 E2E tests are `#[ignore]`d
   pending DVM correctness fixes (see Known Limitations below).
 - **1 new GUC variable** — `buffer_alert_threshold` added. Total: 16 GUCs.
 
 ### Known Limitations
 
-33 E2E tests are marked `#[ignore]` due to pre-existing DVM differential logic
-bugs that will be addressed in v0.2.0:
+18 E2E tests are marked `#[ignore]` due to pre-existing DVM differential logic
+bugs that will be addressed in future releases:
 
 | Suite | Ignored | Reason |
 |---|---|---|
 | `e2e_full_join_tests` | 5/5 | FULL OUTER JOIN differential produces incorrect results |
-| `e2e_set_operation_tests` | 6/6 | INTERSECT/EXCEPT differential generates invalid GROUP BY |
-| `e2e_sublink_or_tests` | 4/4 | EXISTS/IN with OR generates invalid GROUP BY |
 | `e2e_having_transition_tests` | 5/7 | HAVING threshold crossing differential incorrect |
 | `e2e_keyless_duplicate_tests` | 5/7 | Keyless table duplicate-row row_id hash collision |
-| `e2e_multi_window_tests` | 5/6 | Window function differential (non-RANGE frames, LAG/LEAD, ranking) |
-| `e2e_scalar_subquery_tests` | 2/4 | Correlated subquery and NULL-result subquery differential |
-| `e2e_multi_cycle_tests` | 1/5 | Multi-cycle window differential |
+| `e2e_scalar_subquery_tests` | 2/4 | Correlated scalar subquery differential generates invalid SQL |
+| `e2e_sublink_or_tests` | 1/4 | Correlated EXISTS with HAVING loses aggregate state |
 
 ---
 

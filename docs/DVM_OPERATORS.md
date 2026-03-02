@@ -600,9 +600,10 @@ Where $P$ is the PARTITION BY key and $f$ is the window function.
 
 1. Identify affected partition keys from the child delta.
 2. Delete old window function results for affected partitions from storage.
-3. Fetch surviving (unchanged) rows in affected partitions from the child.
+3. Build the current input for affected partitions by excluding changed rows via NOT EXISTS on pass-through columns.
 4. Recompute the window function on the current input for affected partitions.
-5. Emit the recomputed rows as inserts.
+5. Compute unique row IDs via `row_to_json` + `row_number` (handles tied values in ranking functions).
+6. Emit the recomputed rows as inserts.
 
 **SQL Generation:**
 ```sql
@@ -610,16 +611,25 @@ Where $P$ is the PARTITION BY key and $f$ is the window function.
 WITH affected_partitions AS (
     SELECT DISTINCT <partition_cols> FROM (<child_delta>)
 ),
--- CTE 2: Surviving rows (not in delta) for affected partitions  
-surviving AS (
-    SELECT * FROM <storage_table>
+-- CTE 2: Current input (surviving rows not in delta) for affected partitions
+current_input AS (
+    SELECT * FROM <child_snapshot>
     WHERE (<partition_cols>) IN (SELECT * FROM affected_partitions)
-    AND __pgt_row_id NOT IN (SELECT __pgt_row_id FROM (<child_delta>) WHERE __pgt_action = 'D')
+    AND NOT EXISTS (
+        SELECT 1 FROM (<child_delta>) d
+        WHERE d.<col1> IS NOT DISTINCT FROM <child_alias>.<col1>
+        AND   d.<col2> IS NOT DISTINCT FROM <child_alias>.<col2> ...
+    )
 ),
--- CTE 3: Recompute window function
+-- CTE 3: Recompute window function with unique row IDs
 recomputed AS (
-    SELECT *, <window_func> OVER (PARTITION BY <partition_cols> ORDER BY <order_cols>) AS <alias>
-    FROM surviving
+    SELECT *, pgtrickle.pg_trickle_hash(
+        row_to_json(w)::text || '/' || row_number() OVER ()::text
+    ) AS __pgt_row_id
+    FROM (
+        SELECT *, <window_func> OVER (PARTITION BY <partition_cols> ORDER BY <order_cols>) AS <alias>
+        FROM current_input
+    ) w
 )
 -- Delete old results + insert recomputed results
 SELECT 'D' AS __pgt_action, ...  -- old rows from affected partitions
@@ -629,8 +639,10 @@ SELECT 'I' AS __pgt_action, ...  -- recomputed rows
 
 **Notes:**
 - The cost is proportional to the size of affected partitions, not the full table. For workloads where changes spread across few partitions, this is efficient.
-- All window expressions must share the same PARTITION BY / ORDER BY clause.
+- When multiple window functions use different PARTITION BY clauses, the parser accepts all of them. If they share the same partition key it is used directly; otherwise the operator falls back to un-partitioned (full) recomputation.
 - Without PARTITION BY, the entire table is treated as a single partition — any change triggers a full recomputation.
+- Window functions wrapping aggregates (e.g., `RANK() OVER (ORDER BY SUM(x))`) are supported: the window diff rewrites ORDER BY / PARTITION BY expressions to reference aggregate output aliases via `build_agg_alias_map`.
+- Row IDs are computed from the full row content (`row_to_json`) plus a positional disambiguator (`row_number`) to avoid hash collisions with tied ranking values (DENSE_RANK, RANK).
 
 **Window Frame Clauses:**
 

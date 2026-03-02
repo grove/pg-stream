@@ -75,7 +75,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Window functions** | `ROW_NUMBER`, `RANK`, `SUM OVER`, etc. | ✅ Full | Partition-based recomputation |
 | **Window functions** | Window frame clauses | ✅ Full | `ROWS`, `RANGE`, `GROUPS` with `BETWEEN` bounds and `EXCLUDE` |
 | **Window functions** | Named `WINDOW` clauses | ✅ Full | `WINDOW w AS (...)` resolved from query-level window definitions |
-| **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Auto-split into joined subqueries |
+| **Window functions** | Multiple `PARTITION BY` clauses | ✅ Full | Same partition key used directly; different keys fall back to full recomputation |
 | **LATERAL SRFs** | `jsonb_array_elements`, `unnest`, `jsonb_each`, etc. | ✅ Full | Row-scoped recomputation in DIFFERENTIAL mode |
 | **JSON_TABLE** | `JSON_TABLE(expr, path COLUMNS (...))` | ✅ Full | PostgreSQL 17+; modeled as lateral function |
 | **Expressions** | `CASE WHEN … THEN … ELSE … END` | ✅ Full | Both searched and simple CASE |
@@ -329,7 +329,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** ~954 unit tests + 28 integration tests + 34 E2E test suites (~460 E2E tests).
+**Test counts:** ~963 unit tests + 32 integration tests + 34 E2E test suites (~460 E2E tests).
 
 ### Code Coverage
 
