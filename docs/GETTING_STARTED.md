@@ -559,16 +559,16 @@ We gave `department_report` a `'1m'` schedule and the two upstream tables `NULL`
 
 ```sql
 -- Current status of all stream tables
-SELECT table_name, schedule, last_refresh_at, stale, refresh_mode
+SELECT name, schedule, data_timestamp, staleness, refresh_mode
 FROM pgtrickle.pgt_status();
 ```
 
 ```
-    table_name      | schedule  | last_refresh_at         | stale | refresh_mode
---------------------+-----------+-------------------------+-------+--------------
- department_tree    | 1m        | 2026-02-26 10:30:00.123 | f     | DIFFERENTIAL
- department_stats   | 1m        | 2026-02-26 10:30:00.456 | f     | DIFFERENTIAL
- department_report  | 1m        | 2026-02-26 10:30:00.789 | f     | DIFFERENTIAL
+        name         | schedule  |       data_timestamp        |    staleness    | refresh_mode
+---------------------+-----------+-----------------------------+-----------------+--------------
+ public.department_tree   | 1m   | 2026-02-26 10:30:00.123+01 | 00:00:00.877    | DIFFERENTIAL
+ public.department_stats  | NULL | 2026-02-26 10:30:00.456+01 | 00:00:00.544    | DIFFERENTIAL
+ public.department_report | 1m   | 2026-02-26 10:30:00.789+01 | 00:00:00.211    | DIFFERENTIAL
 ```
 
 ```sql

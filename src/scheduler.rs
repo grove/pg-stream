@@ -741,8 +741,11 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
         return false;
     }
 
-    // CALCULATED STs: refresh when upstream refreshed
-    false
+    // CALCULATED STs: refresh whenever upstream sources have pending changes.
+    // The topological iteration order guarantees upstream STs are refreshed
+    // first within a tick, so their change buffers are already populated by
+    // the time we check here.
+    check_upstream_changes(st)
 }
 
 /// Emit a StaleData alert if the stream table is currently stale.
