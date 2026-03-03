@@ -7762,6 +7762,21 @@ unsafe fn parse_select_stmt(
         // expression name (l_suppkey), losing the alias. Detect renames
         // BEFORE moving group_by into the Aggregate.
         let (target_exprs, target_aliases) = unsafe { parse_target_list(&target_list)? };
+
+        // Resolve ordinal GROUP BY references (e.g., GROUP BY 1 → first
+        // target expression). PostgreSQL allows GROUP BY <n> to refer to
+        // the Nth output column. Resolve these to the actual target
+        // expressions now so that rename detection below can match them.
+        for gb_expr in &mut group_by {
+            if let Expr::Raw(s) = &gb_expr {
+                if let Ok(pos) = s.parse::<usize>() {
+                    if pos >= 1 && pos <= target_exprs.len() {
+                        *gb_expr = target_exprs[pos - 1].clone();
+                    }
+                }
+            }
+        }
+
         let mut rename_map = std::collections::HashMap::<usize, String>::new();
         for (i, gb_expr) in group_by.iter().enumerate() {
             let gb_sql = gb_expr.to_sql();
