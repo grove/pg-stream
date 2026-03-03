@@ -189,12 +189,86 @@ COMMIT;
 | **Monitoring / observability** | 1 catalog table | Extensive (stats, history, staleness, CDC health, NOTIFY) | **pg_trickle** |
 | **CDC mechanism** | Triggers only | Hybrid (triggers + optional WAL) | **pg_trickle** |
 | **DDL tracking** | No automatic handling | Yes (event triggers, auto-reinit) | **pg_trickle** |
-| **TRUNCATE handling** | Yes (auto-truncate IMMV) | Via full refresh | pg_ivm |
+| **TRUNCATE handling** | Yes (auto-truncate IMMV) | IMMEDIATE mode: full refresh in same txn; DEFERRED: queued full refresh | Tie (functionally equivalent in IMMEDIATE mode) |
 | **Auto-indexing** | Yes (on GROUP BY / DISTINCT / PK columns) | No (user creates indexes) | pg_ivm |
-| **Row Level Security** | Yes (with limitations) | Not documented | pg_ivm |
+| **Row Level Security** | Yes (with limitations) | Not documented / not tested | pg_ivm |
 | **Concurrency model** | ExclusiveLock on IMMV during maintenance | Advisory locks, non-blocking reads | **pg_trickle** |
 | **Data type restrictions** | Must have btree opclass (no json, xml, point) | No documented type restrictions | **pg_trickle** |
-| **Maturity / ecosystem** | 4 years, 1.4k stars, PGXN, yum packages | Pre-release (0.1.2), dbt integration | pg_ivm |
+| **Maturity / ecosystem** | 4 years, 1.4k stars, PGXN, yum packages | Pre-release (0.1.3), dbt integration | pg_ivm |
+
+### 4.1 Areas Where pg_ivm Wins
+
+Of the ~35 dimensions in the summary table above, pg_ivm holds an advantage in
+only **4** (down from 6 before IMMEDIATE mode was implemented). Two are
+substantive, two are temporary gaps with existing plans.
+
+#### 1. PostgreSQL Version Support (substantive, planned resolution)
+
+pg_ivm ships pre-built packages for **PostgreSQL 13–18** across all major
+Linux distros via yum.postgresql.org and PGXN. pg_trickle currently targets
+**PG 18 only**.
+
+This is the single largest remaining structural gap. PG 13 is EOL (Nov 2025),
+but PG 14–17 are widely deployed in production environments. Users on those
+versions simply cannot use pg_trickle today.
+
+**Planned resolution:** [PLAN_PG_BACKCOMPAT.md](../infra/PLAN_PG_BACKCOMPAT.md)
+details backporting to PG 14–18 (~2.5–3 weeks). pgrx 0.17 already supports
+PG 14–18 via feature flags; ~435 lines in `parser.rs` need `#[cfg]` gating
+for JSON/SQL-standard parse-tree handling.
+
+#### 2. Auto-Indexing (substantive, low priority)
+
+When pg_ivm creates an IMMV, it automatically adds indexes on columns used in
+`GROUP BY`, `DISTINCT`, and primary keys. This is a genuine usability advantage
+— new users get reasonable read performance without manual intervention.
+
+pg_trickle leaves index creation entirely to the user. For DIFFERENTIAL mode
+stream tables, the DVM engine's MERGE-based delta application already uses the
+stream table's primary key (which is auto-created), but secondary indexes for
+read-side query patterns must be added manually.
+
+**Impact:** Low — experienced users always create application-specific indexes
+anyway. Auto-indexing mostly helps onboarding and simple use-cases.
+
+**Planned resolution:** Tracked as part of the pg_ivm compatibility layer
+(Phase 2, postponed to post-1.0). Could also be implemented independently as
+a `CREATE INDEX IF NOT EXISTS` step in `create_stream_table`.
+
+#### 3. Row Level Security (niche gap, untested)
+
+pg_ivm respects Row Level Security policies during IMMV maintenance — the
+trigger functions execute with the permissions of the IMMV owner, and RLS
+policies on base tables are enforced. There are caveats: if an RLS policy
+changes, the IMMV must be manually refreshed to reflect the new policy.
+
+pg_trickle has not documented or tested RLS interaction. The trigger-based
+CDC captures all row changes regardless of RLS policies, and the refresh
+process runs as the extension owner. It is unknown whether RLS policies on
+base tables are correctly enforced during delta application.
+
+**Impact:** Niche — RLS on base tables feeding into materialized views is
+uncommon in practice. Most deployments apply RLS at the application query
+layer, not on the materialized summary.
+
+**Planned resolution:** 2–3 hours to document behavior and add E2E tests.
+
+#### 4. Maturity / Ecosystem (temporary, closing over time)
+
+pg_ivm has **4 years of production use**, ~1,400 GitHub stars, 17 releases,
+and is distributed via PGXN, yum, and apt package repositories. It has a
+track record of stability and a community of users.
+
+pg_trickle is a **pre-release** (v0.1.3) with no production deployments yet.
+While it has extensive test coverage (~992 unit tests + ~510 E2E tests), it
+lacks the battle-testing that comes from real-world usage.
+
+**Impact:** High for risk-averse organizations considering production adoption.
+Low for greenfield projects or teams willing to adopt early.
+
+**Resolution:** This gap closes naturally with time, releases, and adoption.
+The dbt integration (`dbt-pgtrickle`) and CNPG/Kubernetes deployment support
+accelerate ecosystem development.
 
 ---
 
