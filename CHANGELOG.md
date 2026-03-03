@@ -11,6 +11,31 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Added
 
+- **Observability / Monitoring functions** — Six new `pgtrickle` schema
+  functions for runtime introspection, all callable without superuser:
+  - `pgtrickle.change_buffer_sizes()` — per-stream-table CDC change buffer
+    row counts, byte estimates, and oldest pending change timestamp; useful
+    for spotting buffer build-up or stalled ingestion.
+  - `pgtrickle.list_sources(stream_table_name)` — enumerate all base tables
+    tracked by a given stream table, including their OID, estimated row count,
+    current bloat, and CDC-enabled flag.
+  - `pgtrickle.dependency_tree()` — ASCII-tree view of the full stream table
+    dependency graph: each node shows refresh mode, status, and schedule
+    interval so you can read the whole DAG at a glance.
+  - `pgtrickle.health_check()` — single-query triage returning
+    `(check_name, severity, detail)` rows (severity `'OK'|'WARN'|'ERROR'`)
+    for seven checks: scheduler running, error/suspended tables, stale
+    tables, needs-reinit tables, consecutive-error tables, CDC buffer growth
+    (> 10 000 pending rows), and WAL slot retention (> 100 MB).
+  - `pgtrickle.refresh_timeline(max_rows DEFAULT 50)` — cross-stream-table
+    chronological refresh history (most-recent first), joining
+    `pgt_refresh_history` with `pgt_stream_tables`; shows action, status,
+    inserted/deleted rows, duration, and any error message.
+  - `pgtrickle.trigger_inventory()` — one row per (source table, trigger
+    type) verifying that both the DML trigger (`pg_trickle_cdc_<oid>`) and
+    the TRUNCATE trigger (`pg_trickle_cdc_truncate_<oid>`) are present and
+    enabled in `pg_trigger`; highlights missing or disabled triggers.
+
 - **IMMEDIATE refresh mode (Transactional IVM)** — New `'IMMEDIATE'` refresh
   mode maintains stream tables synchronously within the same transaction as
   the base table DML. Uses statement-level AFTER triggers with transition

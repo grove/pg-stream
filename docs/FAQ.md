@@ -1827,6 +1827,131 @@ The extension must be created separately in each database — `shared_preload_li
 pg_trickle provides built-in monitoring views and NOTIFY-based alerting.
 This section explains the available views, alert events, and failure handling.
 
+### How do I list all stream tables in my database?
+
+Several options depending on how much detail you need:
+
+```sql
+-- Quickest: name + status + mode + staleness
+SELECT name, status, refresh_mode, is_populated, staleness
+FROM pgtrickle.stream_tables_info;
+
+-- Full stats: refresh counts, rows inserted/deleted, avg duration, error streaks
+SELECT * FROM pgtrickle.pg_stat_stream_tables;
+
+-- Live status including consecutive_errors and data_timestamp
+SELECT * FROM pgtrickle.pgt_status();
+
+-- Raw catalog (all persisted properties, no computed fields)
+SELECT * FROM pgtrickle.pgt_stream_tables;
+```
+
+### How do I inspect what pg_trickle is doing right now?
+
+**Quick status snapshot:**
+
+```sql
+SELECT name, status, refresh_mode, consecutive_errors, staleness
+FROM pgtrickle.pgt_status();
+```
+
+**Deep dive into a specific stream table** — shows the defining query, DVM
+operator tree, source tables, generated delta SQL, and current WAL frontier:
+
+```sql
+SELECT * FROM pgtrickle.explain_st('my_table');
+```
+
+Key properties returned:
+
+| Property | Description |
+|---|---|
+| `dvm_supported` | Whether differential maintenance is possible for this query |
+| `operator_tree` | How the DVM engine has decomposed the query |
+| `delta_query` | The actual SQL executed during a differential refresh |
+| `frontier` | Per-source LSN positions flushed at last refresh |
+
+**Recent refresh activity:**
+
+```sql
+-- Last 10 refreshes for a stream table (action, status, rows, duration):
+SELECT * FROM pgtrickle.get_refresh_history('my_table', 10);
+
+-- Aggregate refresh stats for all stream tables:
+SELECT * FROM pgtrickle.st_refresh_stats();
+```
+
+**CDC and slot health:**
+
+```sql
+-- Per-source CDC mode, WAL lag, and alerts:
+SELECT * FROM pgtrickle.check_cdc_health();
+
+-- Replication slot health (slot_name, active, lag_bytes):
+SELECT * FROM pgtrickle.slot_health();
+```
+
+**Real-time event stream:**
+
+```sql
+LISTEN pg_trickle_alert;
+-- Receives JSON payloads for: stale_data, auto_suspended, resumed,
+-- reinitialize_needed, buffer_growth_warning, refresh_completed, refresh_failed
+```
+
+**Pending change buffers** (rows not yet consumed by a differential refresh):
+
+```sql
+SELECT stream_table, source_table, cdc_mode, pending_rows, buffer_bytes
+FROM pgtrickle.change_buffer_sizes()
+ORDER BY pending_rows DESC;
+```
+
+### Are there convenience functions for inspecting source tables and CDC buffers?
+
+Yes. pg_trickle provides two functions added to complement the existing monitoring suite:
+
+**`pgtrickle.list_sources(name)`** — shows every source table a stream table depends on, the CDC mode each uses, and any column-level usage metadata:
+
+```sql
+SELECT * FROM pgtrickle.list_sources('order_totals');
+-- Returns: source_table, source_oid, source_type, cdc_mode, columns_used
+```
+
+**`pgtrickle.change_buffer_sizes()`** — shows, for every tracked source table, how many CDC rows are pending (not yet consumed by a differential refresh) and the estimated on-disk size of the change buffer:
+
+```sql
+SELECT * FROM pgtrickle.change_buffer_sizes()
+ORDER BY pending_rows DESC;
+-- Returns: stream_table, source_table, source_oid, cdc_mode, pending_rows, buffer_bytes
+```
+
+A large `pending_rows` value for a source table means a differential refresh is overdue or stalled — use `pgtrickle.get_refresh_history()` to investigate.
+
+### Can I see a tree view of all stream table dependencies?
+
+Yes. `pgtrickle.dependency_tree()` walks the dependency DAG and renders it as an indented ASCII tree:
+
+```sql
+SELECT tree_line, status, refresh_mode
+FROM pgtrickle.dependency_tree();
+```
+
+Example output:
+
+```
+tree_line                                 | status | refresh_mode
+------------------------------------------+--------+--------------
+report_summary                            | ACTIVE | DIFFERENTIAL
+├── orders_by_region                      | ACTIVE | DIFFERENTIAL
+│   ├── public.orders [src]              |        |
+│   └── public.customers [src]           |        |
+└── revenue_totals                        | ACTIVE | DIFFERENTIAL
+    └── public.orders [src]              |        |
+```
+
+Each row has `node` (qualified name), `node_type` (`stream_table` or `source_table`), `depth`, `status`, and `refresh_mode`. Source tables are shown as leaves tagged with `[src]`.
+
 ### What monitoring views are available?
 
 | View | Description |

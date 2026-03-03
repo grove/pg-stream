@@ -948,6 +948,187 @@ SELECT * FROM pgtrickle.explain_st('order_totals');
 
 ---
 
+### pgtrickle.change_buffer_sizes
+
+Show pending change counts and estimated on-disk sizes for all CDC-tracked
+source tables.
+
+Returns one row per `(stream_table, source_table)` pair.
+
+```sql
+pgtrickle.change_buffer_sizes() → SETOF record(
+    stream_table  text,     -- qualified stream table name
+    source_table  text,     -- qualified source table name
+    source_oid    bigint,
+    cdc_mode      text,     -- 'trigger', 'wal', or 'transitioning'
+    pending_rows  bigint,   -- rows in buffer not yet consumed
+    buffer_bytes  bigint    -- estimated buffer table size in bytes
+)
+```
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.change_buffer_sizes()
+ORDER BY pending_rows DESC;
+```
+
+Useful for spotting a source table whose CDC buffer is growing unexpectedly
+(which may indicate a stalled differential refresh or a high-write source that
+has outpaced the schedule).
+
+---
+
+### pgtrickle.list_sources
+
+List the source tables that a stream table depends on.
+
+```sql
+pgtrickle.list_sources(name text) → SETOF record(
+    source_table   text,         -- qualified source table name
+    source_oid     bigint,
+    source_type    text,         -- 'table', 'stream_table', etc.
+    cdc_mode       text,         -- 'trigger', 'wal', or 'transitioning'
+    columns_used   text          -- column-level dependency info (if available)
+)
+```
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.list_sources('order_totals');
+```
+
+Returns the tables tracked by CDC for the given stream table, along with
+how they are being tracked. Useful when diagnosing why a stream table is
+not refreshing or to audit which source tables are being trigger-tracked.
+
+---
+
+### pgtrickle.health_check
+
+Run a set of health checks against the pg_trickle installation and return one row per check.
+
+```sql
+pgtrickle.health_check() → SETOF record(
+    check_name  text,   -- identifier for the check
+    severity    text,   -- 'OK', 'WARN', or 'ERROR'
+    detail      text    -- human-readable explanation
+)
+```
+
+Filter to problems only:
+
+```sql
+SELECT check_name, severity, detail
+FROM pgtrickle.health_check()
+WHERE severity != 'OK';
+```
+
+Checks: `scheduler_running`, `error_tables`, `stale_tables`, `needs_reinit`,
+`consecutive_errors`, `buffer_growth` (> 10 000 pending rows), `slot_lag` (> 100 MB).
+
+---
+
+### pgtrickle.refresh_timeline
+
+Return recent refresh records across **all** stream tables in a single chronological view.
+
+```sql
+pgtrickle.refresh_timeline(
+    max_rows int  DEFAULT 50
+) → SETOF record(
+    start_time      timestamptz,
+    stream_table    text,
+    action          text,
+    status          text,
+    rows_inserted   bigint,
+    rows_deleted    bigint,
+    duration_ms     float8,
+    error_message   text
+)
+```
+
+**Example:**
+
+```sql
+-- Most recent 20 events across all stream tables:
+SELECT start_time, stream_table, action, status, round(duration_ms::numeric,1) AS ms
+FROM pgtrickle.refresh_timeline(20);
+
+-- Just failures in the last 100 events:
+SELECT * FROM pgtrickle.refresh_timeline(100) WHERE status = 'ERROR';
+```
+
+---
+
+### pgtrickle.trigger_inventory
+
+List all CDC triggers that pg_trickle should have installed, and verify each one exists and is enabled in `pg_catalog`.
+
+```sql
+pgtrickle.trigger_inventory() → SETOF record(
+    source_table  text,    -- qualified source table name
+    source_oid    bigint,
+    trigger_name  text,    -- expected trigger name
+    trigger_type  text,    -- 'DML' or 'TRUNCATE'
+    present       bool,    -- trigger exists in pg_catalog
+    enabled       bool     -- trigger is not disabled
+)
+```
+
+A `present = false` row means change capture is broken for that source.
+
+**Example:**
+
+```sql
+-- Show only missing or disabled triggers:
+SELECT source_table, trigger_type, trigger_name
+FROM pgtrickle.trigger_inventory()
+WHERE NOT present OR NOT enabled;
+```
+
+---
+
+### pgtrickle.dependency_tree
+
+Render all stream table dependencies as an indented ASCII tree.
+
+```sql
+pgtrickle.dependency_tree() → SETOF record(
+    tree_line    text,    -- indented visual line (├──, └──, │ characters)
+    node         text,    -- qualified name (schema.table)
+    node_type    text,    -- 'stream_table' or 'source_table'
+    depth        int,
+    status       text,    -- NULL for source_table nodes
+    refresh_mode text     -- NULL for source_table nodes
+)
+```
+
+Roots (stream tables with no stream-table parents) appear at depth 0. Each
+dependent is indented beneath its parent. Plain source tables are rendered as
+leaf nodes tagged `[src]`.
+
+**Example:**
+
+```sql
+SELECT tree_line, status, refresh_mode
+FROM pgtrickle.dependency_tree();
+```
+
+```
+tree_line                               status   refresh_mode
+----------------------------------------+---------+--------------
+report_summary                          ACTIVE   DIFFERENTIAL
+├── orders_by_region                    ACTIVE   DIFFERENTIAL
+│   ├── public.orders [src]
+│   └── public.customers [src]
+└── revenue_totals                      ACTIVE   DIFFERENTIAL
+    └── public.orders [src]
+```
+
+---
+
 ### pgtrickle.pg_trickle_hash
 
 Compute a 64-bit xxHash row ID from a text value.
