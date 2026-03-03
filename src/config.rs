@@ -8,16 +8,6 @@ use pgrx::guc::*;
 /// Master enable/disable switch for the extension.
 pub static PGS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
-/// Database the background scheduler connects to (deprecated).
-///
-/// **Deprecated since v0.2.0**: The new launcher-based architecture
-/// auto-discovers all databases and spawns per-database scheduler workers
-/// automatically. This GUC is now only used as a fallback when the per-database
-/// scheduler was not launched by the launcher (e.g., direct invocation in
-/// tests). Leave it at the default `"postgres"` — there is no need to set it.
-pub static PGS_DATABASE: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
-
 /// Scheduler wake interval in milliseconds.
 pub static PGS_SCHEDULER_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 
@@ -149,17 +139,6 @@ pub fn register_gucs() {
         c"When false, the scheduler will not run and no refreshes will be triggered.",
         &PGS_ENABLED,
         GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        c"pg_trickle.database",
-        c"[Deprecated] Database the background scheduler connects to.",
-        c"Deprecated: the new launcher worker auto-discovers all databases. \
-           This GUC is only used as a fallback when the scheduler is not \
-           launched by the launcher. Leave at the default 'postgres'.",
-        &PGS_DATABASE,
-        GucContext::Sighup,
         GucFlags::default(),
     );
 
@@ -448,14 +427,6 @@ pub fn pg_trickle_diamond_consistency() -> String {
         .get()
         .map(|cs| cs.to_str().unwrap_or("none").to_string())
         .unwrap_or_else(|| "none".to_string())
-}
-
-/// Returns the target database name for the background scheduler.
-pub fn pg_trickle_database() -> String {
-    PGS_DATABASE
-        .get()
-        .map(|cs| cs.to_str().unwrap_or("postgres").to_string())
-        .unwrap_or_else(|| "postgres".to_string())
 }
 
 /// Returns the default diamond schedule policy as a `DiamondSchedulePolicy`.

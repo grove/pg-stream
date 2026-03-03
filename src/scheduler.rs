@@ -22,7 +22,7 @@
 //!    - Consumes CDC changes, determines refresh needs, executes refreshes.
 //!
 //! This design means pg_trickle works transparently in all databases on a
-//! server — no `pg_trickle.database` GUC configuration required.
+//! server without any manual configuration.
 //!
 //! # Error Handling & Resilience
 //! - **Advisory locks**: prevent concurrent refreshes of the same ST
@@ -239,10 +239,9 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
 
     // Determine which database to connect to.
     // Dynamic workers spawned by the launcher have the DB name in bgw_extra.
-    // The legacy GUC fallback is kept for backward compatibility.
     let extra = BackgroundWorker::get_extra();
     let db_name = if extra.is_empty() {
-        config::pg_trickle_database()
+        "postgres".to_string()
     } else {
         extra.to_string()
     };

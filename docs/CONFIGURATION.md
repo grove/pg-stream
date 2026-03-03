@@ -6,7 +6,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 ## Overview
 
-pg_trickle exposes sixteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_trickle exposes fifteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -41,46 +41,6 @@ SET pg_trickle.enabled = false;
 
 -- Re-enable
 SET pg_trickle.enabled = true;
-```
-
----
-
-### pg_trickle.database *(deprecated)*
-
-> **Deprecated since v0.2.0.** No longer needed. See below.
-
-| Property | Value |
-|---|---|
-| Type | `string` |
-| Default | `'postgres'` |
-| Context | `SIGHUP` |
-
-**Background:** In earlier versions, pg_trickle ran a single background worker that connected to one fixed database controlled by this GUC. If the extension was installed in a database other than `postgres`, the worker would crash on startup because it couldn't find the catalog tables.
-
-**What changed:** pg_trickle now runs a **launcher** worker (`pg_trickle launcher`) that automatically scans all databases on the server every 10 seconds and spawns a dedicated **per-database scheduler** (`pg_trickle scheduler`) for each database where the extension is installed. No manual configuration is required.
-
-```
-pg_trickle launcher            (one per server, permanent)
-  ├─▶ pg_trickle scheduler     (database: app1) — started automatically
-  ├─▶ pg_trickle scheduler     (database: app2) — started automatically
-  └─▶ pg_trickle scheduler     (database: app3) — started automatically
-```
-
-The launchers probes each database on startup; databases without pg_trickle cause the worker to exit cleanly. The launcher re-probes those databases every 5 minutes, so `CREATE EXTENSION pg_trickle` in a new database is picked up automatically within 5 minutes.
-
-**If you have `pg_trickle.database` set** (e.g., from a previous version), you can remove it — it has no effect:
-
-```sql
-ALTER SYSTEM RESET pg_trickle.database;
-SELECT pg_reload_conf();
-```
-
-To verify the launcher and per-database schedulers are running:
-
-```sql
-SELECT application_name, datname, state
-FROM pg_stat_activity
-WHERE application_name IN ('pg_trickle launcher', 'pg_trickle scheduler');
 ```
 
 ---
