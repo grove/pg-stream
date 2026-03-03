@@ -1146,11 +1146,30 @@ impl OpTree {
                 ) {
                     return Some(aliases.clone());
                 }
-                // Project may drop columns — check that returned key columns
-                // are among the project's output columns. Otherwise fall back.
-                let out = self.output_columns();
+                // Project may drop or rename columns — map child's key
+                // column names through the aliasing, then verify they're in
+                // the output. E.g., Aggregate GROUP BY "name" → Project
+                // alias "region" at the same position.
+                let child_out = child.output_columns();
                 match child.row_id_key_columns() {
-                    Some(keys) if keys.iter().all(|k| out.contains(k)) => Some(keys),
+                    Some(keys) => {
+                        let mapped: Vec<String> = keys
+                            .iter()
+                            .map(|k| {
+                                if let Some(pos) = child_out.iter().position(|c| c == k) {
+                                    aliases.get(pos).cloned().unwrap_or_else(|| k.clone())
+                                } else {
+                                    k.clone()
+                                }
+                            })
+                            .collect();
+                        let out = self.output_columns();
+                        if mapped.iter().all(|k| out.contains(k)) {
+                            Some(mapped)
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 }
             }
@@ -1172,10 +1191,11 @@ impl OpTree {
                 }
             }
             OpTree::Subquery { child, .. } => child.row_id_key_columns(),
-            OpTree::CteScan { .. } => {
-                // CTE scan: the row_id comes from the CTE body diff.
-                // We can't easily determine this statically.
-                None
+            OpTree::CteScan { columns, .. } => {
+                // CTE scan: use all CTE output columns as content hash.
+                // This matches the intermediate aggregate's row_id formula
+                // when the CTE body contains an aggregate.
+                Some(columns.clone())
             }
             OpTree::Window { .. } => {
                 // Window functions like RANK/DENSE_RANK can produce identical
@@ -1191,9 +1211,10 @@ impl OpTree {
                 None
             }
             OpTree::LateralSubquery { .. } => {
-                // LATERAL subquery results have no natural primary key.
-                // Row IDs are content-hash based, computed by the diff operator.
-                None
+                // Use content-hash for row IDs so that the initial population
+                // and differential refresh produce consistent __pgt_row_id values.
+                let cols = self.output_columns();
+                if cols.is_empty() { None } else { Some(cols) }
             }
             // Join, UnionAll, RecursiveCte: complex hash, no simple column list
             _ => None,
@@ -1766,8 +1787,17 @@ pub fn lookup_operator_volatility(_op_name: &str) -> Result<char, PgTrickleError
 pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgTrickleError> {
     match expr {
         Expr::FuncCall { func_name, args } => {
-            let vol = lookup_function_volatility(func_name)?;
-            *worst = max_volatility(*worst, vol);
+            // COALESCE, NULLIF, GREATEST, LEAST are parser constructs that
+            // don't appear in pg_proc. They are inherently immutable — their
+            // result depends only on their arguments. Skip the pg_proc lookup
+            // and just check argument volatility.
+            let upper = func_name.to_uppercase();
+            let is_builtin_construct =
+                matches!(upper.as_str(), "COALESCE" | "NULLIF" | "GREATEST" | "LEAST");
+            if !is_builtin_construct {
+                let vol = lookup_function_volatility(func_name)?;
+                *worst = max_volatility(*worst, vol);
+            }
             for arg in args {
                 collect_volatilities(arg, worst)?;
             }
@@ -8665,7 +8695,12 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
 
         match fields.len() {
             1 => {
-                let col_name = unsafe { node_to_string(fields.head().unwrap())? };
+                let field = fields.head().unwrap();
+                // Bare `SELECT *` arrives as ColumnRef with a single A_Star field.
+                if unsafe { pgrx::is_a(field, pg_sys::NodeTag::T_A_Star) } {
+                    return Ok(Expr::Star { table_alias: None });
+                }
+                let col_name = unsafe { node_to_string(field)? };
                 Ok(Expr::ColumnRef {
                     table_alias: None,
                     column_name: col_name,
@@ -9029,26 +9064,36 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         sql.push_str(" END");
         Ok(Expr::Raw(sql))
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CoalesceExpr) } {
-        // COALESCE(a, b, ...)
+        // COALESCE(a, b, ...) — emit as FuncCall so that
+        // resolve_expr_to_child can properly resolve column refs
+        // in each argument (avoids Raw-string replacement issues
+        // with qualified column refs like "b"."bonus").
         let coalesce = unsafe { &*(node as *const pg_sys::CoalesceExpr) };
         let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(coalesce.args) };
-        let mut args_sql = Vec::new();
+        let mut args = Vec::new();
         for n in args_list.iter_ptr() {
-            args_sql.push(unsafe { node_to_expr(n)? }.to_sql());
+            args.push(unsafe { node_to_expr(n)? });
         }
-        Ok(Expr::Raw(format!("COALESCE({})", args_sql.join(", "))))
+        Ok(Expr::FuncCall {
+            func_name: "COALESCE".to_string(),
+            args,
+        })
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullIfExpr) } {
-        // NULLIF(a, b) — represented as OpExpr with opno for "=" and
-        // NullIfExpr override; args has exactly 2 elements.
+        // NULLIF(a, b) — emit as FuncCall for proper column
+        // resolution in resolve_expr_to_child.
         let nullif = unsafe { &*(node as *const pg_sys::NullIfExpr) };
         let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(nullif.args) };
-        let mut args_sql = Vec::new();
+        let mut args = Vec::new();
         for n in args_list.iter_ptr() {
-            args_sql.push(unsafe { node_to_expr(n)? }.to_sql());
+            args.push(unsafe { node_to_expr(n)? });
         }
-        Ok(Expr::Raw(format!("NULLIF({})", args_sql.join(", "))))
+        Ok(Expr::FuncCall {
+            func_name: "NULLIF".to_string(),
+            args,
+        })
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_MinMaxExpr) } {
-        // GREATEST(...) / LEAST(...)
+        // GREATEST(...) / LEAST(...) — emit as FuncCall for proper
+        // column resolution in resolve_expr_to_child.
         let mmexpr = unsafe { &*(node as *const pg_sys::MinMaxExpr) };
         let func_name = if mmexpr.op == pg_sys::MinMaxOp::IS_GREATEST {
             "GREATEST"
@@ -9056,11 +9101,14 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             "LEAST"
         };
         let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(mmexpr.args) };
-        let mut args_sql = Vec::new();
+        let mut args = Vec::new();
         for n in args_list.iter_ptr() {
-            args_sql.push(unsafe { node_to_expr(n)? }.to_sql());
+            args.push(unsafe { node_to_expr(n)? });
         }
-        Ok(Expr::Raw(format!("{func_name}({})", args_sql.join(", "))))
+        Ok(Expr::FuncCall {
+            func_name: func_name.to_string(),
+            args,
+        })
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SQLValueFunction) } {
         // CURRENT_TIMESTAMP, CURRENT_USER, etc.
         let svf = unsafe { &*(node as *const pg_sys::SQLValueFunction) };
@@ -13795,7 +13843,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_id_key_columns_cte_scan_returns_none() {
+    fn test_row_id_key_columns_cte_scan_returns_columns() {
         let tree = OpTree::CteScan {
             cte_id: 0,
             cte_name: "x".to_string(),
@@ -13804,7 +13852,7 @@ mod tests {
             cte_def_aliases: vec![],
             column_aliases: vec![],
         };
-        assert_eq!(tree.row_id_key_columns(), None);
+        assert_eq!(tree.row_id_key_columns(), Some(vec!["id".to_string()]));
     }
 
     #[test]
@@ -14575,21 +14623,75 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_raw_coalesce_format() {
-        let expr = Expr::Raw("COALESCE(a, b, 0)".to_string());
+    fn test_expr_funccall_coalesce_format() {
+        let expr = Expr::FuncCall {
+            func_name: "COALESCE".to_string(),
+            args: vec![
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "a".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "b".to_string(),
+                },
+                Expr::Raw("0".to_string()),
+            ],
+        };
         assert_eq!(expr.to_sql(), "COALESCE(a, b, 0)");
     }
 
     #[test]
-    fn test_expr_raw_nullif_format() {
-        let expr = Expr::Raw("NULLIF(a, 0)".to_string());
+    fn test_expr_funccall_nullif_format() {
+        let expr = Expr::FuncCall {
+            func_name: "NULLIF".to_string(),
+            args: vec![
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "a".to_string(),
+                },
+                Expr::Raw("0".to_string()),
+            ],
+        };
         assert_eq!(expr.to_sql(), "NULLIF(a, 0)");
     }
 
     #[test]
-    fn test_expr_raw_greatest_least_format() {
-        let g = Expr::Raw("GREATEST(a, b, c)".to_string());
-        let l = Expr::Raw("LEAST(a, b, c)".to_string());
+    fn test_expr_funccall_greatest_least_format() {
+        let g = Expr::FuncCall {
+            func_name: "GREATEST".to_string(),
+            args: vec![
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "a".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "b".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "c".to_string(),
+                },
+            ],
+        };
+        let l = Expr::FuncCall {
+            func_name: "LEAST".to_string(),
+            args: vec![
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "a".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "b".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "c".to_string(),
+                },
+            ],
+        };
         assert_eq!(g.to_sql(), "GREATEST(a, b, c)");
         assert_eq!(l.to_sql(), "LEAST(a, b, c)");
     }

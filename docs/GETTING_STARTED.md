@@ -41,7 +41,7 @@ proportional to what actually changed.
 3. On each refresh cycle, pg_trickle derives a **delta query (ΔQ)** that reads only the buffered changes since the last refresh frontier
 4. The delta is merged into the stream table — only the affected rows are written
 5. If other stream tables depend on this one, they are scheduled next (topological order)
-6. Optionally: once `wal_level = logical` is available and the first refresh succeeds, pg_trickle automatically transitions from triggers to **WAL-based CDC** (~2–15 μs write overhead vs triggers). The transition is seamless and transparent.
+6. Optionally: once `wal_level = logical` is available and the first refresh succeeds, pg_trickle automatically transitions from triggers to **WAL-based CDC** (near-zero write-path overhead compared to ~2–15 μs for triggers). The transition is seamless and transparent.
 
 This tutorial walks through a concrete org-chart example so you can see this flow end to end, including a chain of stream tables that propagates changes automatically.
 
@@ -235,7 +235,7 @@ SELECT pgtrickle.create_stream_table(
     LEFT JOIN employees e ON e.department_id = t.id
     GROUP BY t.id, t.name, t.path, t.depth
     $$,
-    NULL,               -- inherit schedule from downstream; see explanation below
+    NULL,               -- CALCULATED: inherit schedule from downstream; see explanation below
     'DIFFERENTIAL'
 );
 ```
@@ -244,7 +244,7 @@ SELECT pgtrickle.create_stream_table(
 
 Like before, pg_trickle parsed the query, created a storage table, and set up CDC. But `department_stats` depends on `department_tree`, not a base table — so *no new triggers were installed*. Instead, pg_trickle registered `department_tree` as an upstream dependency in the DAG.
 
-The schedule is `NULL` (CALCULATED mode), which means: "don't give this table its own schedule — inherit the tightest schedule of any downstream table that queries it". Since no other stream table has been created yet, PostgreSQL will prompt a full refresh on demand for now.
+The schedule is `NULL` (CALCULATED mode), which means: "don't give this table its own schedule — inherit the tightest schedule of any downstream table that queries it". Since no other stream table has been created yet, it will be refreshed on demand or when a downstream dependent triggers it.
 
 The query has no recursive CTE, so pg_trickle uses **algebraic differentiation**:
 
@@ -536,7 +536,7 @@ In the examples above, we called `refresh_stream_table()` manually. In productio
 
 ### How schedules propagate
 
-We gave `department_report` a `'1m'` schedule and the two upstream tables `NULL` (CALCULATED) schedule. This is the recommended pattern:
+We gave `department_report` a `'1m'` schedule and the two upstream tables a `NULL` schedule (CALCULATED mode). This is the recommended pattern:
 
 ```
  department_tree    (CALCULATED → inherits 1m from downstream)
@@ -546,7 +546,7 @@ We gave `department_report` a `'1m'` schedule and the two upstream tables `NULL`
  department_report  (1m — the only explicit schedule)
 ```
 
-`CALCULATED` means: compute the tightest schedule across all downstream dependents. You declare freshness requirements at the tables your application queries — the system figures out how often each upstream table needs to refresh.
+CALCULATED (schedule = `NULL`) means: compute the tightest schedule across all downstream dependents. You declare freshness requirements at the tables your application queries — the system figures out how often each upstream table needs to refresh.
 
 ### What the scheduler does every second
 
@@ -566,7 +566,7 @@ FROM pgtrickle.pgt_status();
 ```
         name         | schedule  |       data_timestamp        |    staleness    | refresh_mode
 ---------------------+-----------+-----------------------------+-----------------+--------------
- public.department_tree   | 1m   | 2026-02-26 10:30:00.123+01 | 00:00:00.877    | DIFFERENTIAL
+ public.department_tree   | NULL | 2026-02-26 10:30:00.123+01 | 00:00:00.877    | DIFFERENTIAL
  public.department_stats  | NULL | 2026-02-26 10:30:00.456+01 | 00:00:00.544    | DIFFERENTIAL
  public.department_report | 1m   | 2026-02-26 10:30:00.789+01 | 00:00:00.211    | DIFFERENTIAL
 ```
@@ -586,7 +586,7 @@ ALTER SYSTEM SET pg_trickle.cdc_mode = 'auto';
 SELECT pg_reload_conf();
 ```
 
-pg_trickle will automatically transition each stream table from trigger-based to WAL-based capture after the first successful refresh — reducing per-write overhead from ~50–200 μs to ~2–15 μs. The transition is transparent; your queries and the refresh schedule are unaffected.
+pg_trickle will automatically transition each stream table from trigger-based to WAL-based capture after the first successful refresh — reducing per-write overhead from ~2–15 μs (triggers) to near-zero (WAL-based capture adds no synchronous overhead to your DML). The transition is transparent; your queries and the refresh schedule are unaffected.
 
 ---
 
@@ -672,7 +672,7 @@ DROP TABLE departments;
 | **Algebraic IVM** | Delta queries that process only changed rows — O(changes) regardless of table size |
 | **Semi-naive / DRed** | Incremental strategies for `WITH RECURSIVE` — INSERT uses semi-naive, DELETE/UPDATE uses Delete-and-Rederive |
 | **Downstream propagation** | A single base table write cascades through an entire chain of stream tables, automatically, in the right order |
-| **Hybrid CDC** | Triggers by default; optional automatic transition to WAL-based capture for lower write-side overhead |
+| **Trigger-based CDC** | Lightweight row-level triggers by default (no WAL configuration needed); optional transition to WAL-based capture via `pg_trickle.cdc_mode = 'auto'` |
 | **Monitoring** | `pgt_status()` and `pg_stat_stream_tables` for freshness, timing, and error history |
 
 The key takeaway: you write to base tables — **pg_trickle does the rest**. Data flows downstream automatically, each layer doing the minimum work proportional to what changed, in dependency order.

@@ -88,7 +88,15 @@ pub fn diff_except(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
     );
     ctx.add_cte(merge_cte.clone(), merge_sql);
 
-    // CTE 3: Detect boundary crossings using GREATEST(0, count_L - count_R)
+    // CTE 3: Detect boundary crossings.
+    //
+    // IMPORTANT: We never emit 'D' (DELETE) for EXCEPT/EXCEPT ALL.
+    // Instead, when a row becomes invisible (effective count drops to 0),
+    // we emit 'I' (UPDATE) with the new counts, keeping the row in the
+    // ST.  This preserves the per-branch multiplicity counts so that
+    // future deltas can correctly restore the row when the boundary
+    // crosses back.  Deleting the row would lose count information,
+    // causing stale state on subsequent refreshes.
     let final_cte = ctx.next_cte_name("exct_final");
 
     let final_sql = if *all {
@@ -104,9 +112,9 @@ WHERE GREATEST(0, old_count_l - old_count_r) <= 0
 
 UNION ALL
 
--- Row vanishes: effective count was positive, now 0
-SELECT __pgt_row_id, 'D' AS __pgt_action,
-       {col_list}, 0 AS __pgt_count_l, 0 AS __pgt_count_r
+-- Row becomes invisible: keep with updated counts (never delete)
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
 WHERE GREATEST(0, old_count_l - old_count_r) > 0
   AND GREATEST(0, new_count_l - new_count_r) <= 0
@@ -122,25 +130,27 @@ WHERE GREATEST(0, old_count_l - old_count_r) > 0
   AND (new_count_l != old_count_l OR new_count_r != old_count_r)",
         )
     } else {
-        // EXCEPT (set): effective count = count_L > 0 AND count_R = 0
-        // We model this as GREATEST(0, count_L - count_R) crossing 0
+        // EXCEPT (set): row present iff count_L > 0 AND count_R = 0.
+        // This is true set-difference semantics: a value appears in the
+        // result when it exists in the left branch and does NOT exist in
+        // the right branch, regardless of multiplicities.
         format!(
             "\
--- Row appears: was absent, now present
+-- Row appears: was absent (not in L or was in R), now in L and not in R
 SELECT __pgt_row_id, 'I' AS __pgt_action,
        {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
-WHERE GREATEST(0, old_count_l - old_count_r) <= 0
-  AND GREATEST(0, new_count_l - new_count_r) > 0
+WHERE NOT (old_count_l > 0 AND old_count_r = 0)
+  AND (new_count_l > 0 AND new_count_r = 0)
 
 UNION ALL
 
--- Row vanishes: was present, now absent
-SELECT __pgt_row_id, 'D' AS __pgt_action,
-       {col_list}, 0 AS __pgt_count_l, 0 AS __pgt_count_r
+-- Row becomes invisible: keep with updated counts (never delete)
+SELECT __pgt_row_id, 'I' AS __pgt_action,
+       {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
-WHERE GREATEST(0, old_count_l - old_count_r) > 0
-  AND GREATEST(0, new_count_l - new_count_r) <= 0
+WHERE (old_count_l > 0 AND old_count_r = 0)
+  AND NOT (new_count_l > 0 AND new_count_r = 0)
 
 UNION ALL
 
@@ -148,8 +158,8 @@ UNION ALL
 SELECT __pgt_row_id, 'I' AS __pgt_action,
        {col_list}, new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r
 FROM {merge_cte}
-WHERE GREATEST(0, old_count_l - old_count_r) > 0
-  AND GREATEST(0, new_count_l - new_count_r) > 0
+WHERE (old_count_l > 0 AND old_count_r = 0)
+  AND (new_count_l > 0 AND new_count_r = 0)
   AND (new_count_l != old_count_l OR new_count_r != old_count_r)",
         )
     };
@@ -200,9 +210,9 @@ mod tests {
         let result = diff_except(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // EXCEPT uses GREATEST(0, count_L - count_R)
-        assert_sql_contains(&sql, "GREATEST(0, old_count_l - old_count_r)");
-        assert_sql_contains(&sql, "GREATEST(0, new_count_l - new_count_r)");
+        // EXCEPT (set) uses count_L > 0 AND count_R = 0 boundary
+        assert_sql_contains(&sql, "old_count_l > 0 AND old_count_r = 0");
+        assert_sql_contains(&sql, "new_count_l > 0 AND new_count_r = 0");
     }
 
     #[test]
@@ -255,9 +265,9 @@ mod tests {
         let sql2 = ctx2.build_with_query(&r2.cte_name);
 
         // The left-branch CTE should differ (different tables)
-        // Both should still have GREATEST-based logic
-        assert_sql_contains(&sql1, "GREATEST");
-        assert_sql_contains(&sql2, "GREATEST");
+        // Both should still have boundary-crossing logic
+        assert_sql_contains(&sql1, "old_count_l > 0");
+        assert_sql_contains(&sql2, "old_count_l > 0");
         // They should not be identical — different scan ordering
         assert_ne!(sql1, sql2);
     }
@@ -340,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_except_delete_action_zeros_counts() {
+    fn test_diff_except_invisible_rows_keep_counts() {
         let mut ctx = test_ctx_with_st("public", "st");
         let left = scan(1, "a", "public", "a", &["x"]);
         let right = scan(2, "b", "public", "b", &["x"]);
@@ -348,9 +358,14 @@ mod tests {
         let result = diff_except(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // DELETE rows should emit 0 for both counts
-        assert_sql_contains(&sql, "'D' AS __pgt_action");
-        assert_sql_contains(&sql, "0 AS __pgt_count_l, 0 AS __pgt_count_r");
+        // Invisible rows keep their counts (never zero, never delete)
+        // All actions are 'I' — no 'D' emitted
+        assert_sql_contains(&sql, "'I' AS __pgt_action");
+        // new counts are preserved even for invisible rows
+        assert_sql_contains(
+            &sql,
+            "new_count_l AS __pgt_count_l, new_count_r AS __pgt_count_r",
+        );
     }
 
     #[test]
@@ -387,8 +402,9 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_except_set_and_all_both_use_greatest() {
-        // Both EXCEPT and EXCEPT ALL use GREATEST(0, L-R) boundary detection
+    fn test_diff_except_set_uses_exact_boundary_all_uses_greatest() {
+        // Set EXCEPT uses count_L > 0 AND count_R = 0 boundary detection,
+        // while EXCEPT ALL uses GREATEST(0, L-R) for bag semantics.
         let mut ctx_set = test_ctx_with_st("public", "st");
         let tree_set = except(
             scan(1, "a", "public", "a", &["x"]),
@@ -407,10 +423,12 @@ mod tests {
         let r_all = diff_except(&mut ctx_all, &tree_all).unwrap();
         let sql_all = ctx_all.build_with_query(&r_all.cte_name);
 
-        // Both should use GREATEST
-        assert_sql_contains(&sql_set, "GREATEST(0, old_count_l - old_count_r)");
+        // Set EXCEPT: uses exact count_L > 0 AND count_R = 0
+        assert_sql_contains(&sql_set, "old_count_l > 0 AND old_count_r = 0");
+        assert_sql_contains(&sql_set, "new_count_l > 0 AND new_count_r = 0");
+
+        // EXCEPT ALL: uses GREATEST
         assert_sql_contains(&sql_all, "GREATEST(0, old_count_l - old_count_r)");
-        assert_sql_contains(&sql_set, "GREATEST(0, new_count_l - new_count_r)");
         assert_sql_contains(&sql_all, "GREATEST(0, new_count_l - new_count_r)");
 
         // Output columns are identical
@@ -429,8 +447,10 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         // L branch feeds the positive side, R branch the negative side
-        // in GREATEST(0, count_L - count_R)
-        assert_sql_contains(&sql, "new_count_l - new_count_r");
-        assert_sql_contains(&sql, "old_count_l - old_count_r");
+        // in the set-difference boundary: count_L > 0 AND count_R = 0
+        assert_sql_contains(&sql, "new_count_l");
+        assert_sql_contains(&sql, "new_count_r");
+        assert_sql_contains(&sql, "old_count_l");
+        assert_sql_contains(&sql, "old_count_r");
     }
 }

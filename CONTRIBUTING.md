@@ -55,6 +55,30 @@ Full setup instructions are in [INSTALL.md](INSTALL.md).
 
 The PR template will walk you through the checklist.
 
+### CI Coverage on PRs
+
+PR CI runs **unit tests (Linux only) and integration tests**. E2E tests,
+TPC-H tests, benchmarks, dbt, and CNPG smoke tests are skipped on PRs to
+keep the feedback loop fast (~15 min).
+
+To trigger the **full CI matrix** on your PR branch (recommended for DVM
+engine, refresh, or CDC changes):
+
+```bash
+gh workflow run ci.yml --ref <your-branch>
+```
+
+To run all tests locally before pushing:
+
+```bash
+just test-all          # unit + integration + e2e
+
+# TPC-H correctness tests (requires e2e Docker image):
+cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+```
+
+See [AGENTS.md § Testing](AGENTS.md#testing) for the full CI coverage matrix.
+
 ## Coding Conventions (summary)
 
 - No `unwrap()` or `panic!()` in non-test code

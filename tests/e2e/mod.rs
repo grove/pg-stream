@@ -402,6 +402,9 @@ impl E2eDb {
     ///
     /// Columns of type `json` are cast to `text` because the `json` type
     /// does not have an equality operator (needed by `EXCEPT`).
+    ///
+    /// For EXCEPT STs (which keep invisible rows with dual-count tracking),
+    /// the comparison filters to visible rows only.
     pub async fn assert_st_matches_query(&self, st_table: &str, defining_query: &str) {
         // Get column names from the ST, excluding internal columns.
         // Also get the cast expressions (json → text) for EXCEPT compatibility.
@@ -424,27 +427,55 @@ impl E2eDb {
         let raw_cols = raw_cols.unwrap_or_else(|| "*".to_string());
         let cast_cols = cast_cols.unwrap_or_else(|| "*".to_string());
 
+        // Check whether the ST has dual-count columns (__pgt_count_l,
+        // __pgt_count_r), indicating an EXCEPT or INTERSECT set operation.
+        // EXCEPT STs keep invisible rows for multiplicity tracking, so we
+        // must filter to visible rows only.
+        let has_dual_counts: bool = self
+            .query_scalar(&format!(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM information_schema.columns \
+                    WHERE (table_schema || '.' || table_name = '{st_table}' \
+                       OR table_name = '{st_table}') \
+                    AND column_name = '__pgt_count_l')"
+            ))
+            .await;
+
+        // Build a visibility filter for EXCEPT STs.
+        // - EXCEPT (set): visible iff count_l > 0 AND count_r = 0
+        // - EXCEPT ALL:   visible iff count_l > count_r
+        // INTERSECT STs don't need this (invisible rows are deleted).
+        let except_filter = if has_dual_counts && defining_query.to_uppercase().contains("EXCEPT") {
+            if defining_query.to_uppercase().contains("EXCEPT ALL") {
+                " WHERE __pgt_count_l > __pgt_count_r"
+            } else {
+                " WHERE __pgt_count_l > 0 AND __pgt_count_r = 0"
+            }
+        } else {
+            ""
+        };
+
         // If there are json columns, wrap both sides to cast consistently.
         // Otherwise use the simpler direct comparison.
         let sql = if raw_cols != cast_cols {
             // json columns present: cast them on both sides of EXCEPT
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {cast_cols} FROM {st_table} \
+                    (SELECT {cast_cols} FROM {st_table}{except_filter} \
                      EXCEPT \
                      SELECT {cast_cols} FROM ({defining_query}) __pgt_dq) \
                     UNION ALL \
                     (SELECT {cast_cols} FROM ({defining_query}) __pgt_dq2 \
                      EXCEPT \
-                     SELECT {cast_cols} FROM {st_table}) \
+                     SELECT {cast_cols} FROM {st_table}{except_filter}) \
                 )"
             )
         } else {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {raw_cols} FROM {st_table} EXCEPT ({defining_query})) \
+                    (SELECT {raw_cols} FROM {st_table}{except_filter} EXCEPT ({defining_query})) \
                     UNION ALL \
-                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}) \
+                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}{except_filter}) \
                 )"
             )
         };

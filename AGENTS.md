@@ -125,13 +125,14 @@ See [plans/PLAN.md](plans/PLAN.md) for the full design plan.
 
 ## Testing
 
-Three test tiers, each with its own infrastructure:
+Five test tiers, each with its own infrastructure:
 
 | Tier | Location | Runner | Needs DB? |
-|------|----------|--------|-----------|
+|------|----------|--------|----------|
 | Unit | `src/**` (`#[cfg(test)]`) | `just test-unit` | No |
 | Integration | `tests/*_tests.rs` (not `e2e_*`) | `just test-integration` | Yes (Testcontainers) |
 | E2E | `tests/e2e_*_tests.rs` | `just test-e2e` | Yes (custom Docker image) |
+| TPC-H | `tests/e2e_tpch_tests.rs` (`#[ignore]`) | see below | Yes (custom Docker image) |
 | dbt | `dbt-pgtrickle/integration_tests/` | `just test-dbt` | Yes (Docker + dbt) |
 
 - Shared helpers live in `tests/common/mod.rs`.
@@ -140,6 +141,47 @@ Three test tiers, each with its own infrastructure:
 - Name tests: `test_<component>_<scenario>_<expected>`.
 - Test both success and failure paths.
 - dbt tests use `just test-dbt-fast` to skip Docker image rebuild.
+
+### CI Coverage by Trigger
+
+| Job | PR | Push to main | Daily schedule | Manual dispatch |
+|-----|-----|-------------|----------------|------------------|
+| Unit (Linux) | ✅ | ✅ | ✅ | ✅ |
+| Unit (macOS + Windows) | ❌ | ❌ | ✅ | ✅ |
+| Integration | ✅ | ✅ | ✅ | ✅ |
+| E2E + TPC-H | ❌ | ✅ | ✅ | ✅ |
+| Benchmarks | ❌ | ❌ | ✅ | ✅ |
+| dbt integration | ❌ | ❌ | ✅ | ✅ |
+| CNPG smoke test | ❌ | ❌ | ✅ | ✅ |
+
+> **Note:** E2E and TPC-H tests are **skipped on PRs** (the Docker build is
+> ~20 min). They run automatically on push to main and daily. To run the full
+> CI matrix on a PR branch, use manual dispatch (see below).
+
+### Running All Tests Locally
+
+```bash
+just test-all          # unit + integration + e2e (builds Docker image)
+
+# TPC-H tests (not included in test-all, require e2e image):
+just build-e2e-image
+cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+
+# Control TPC-H cycle count (default varies per test):
+TPCH_CYCLES=5 cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+```
+
+### Triggering Full CI on a PR Branch
+
+To run the complete CI matrix (including E2E, TPC-H, benchmarks, dbt, and
+CNPG) on a feature branch:
+
+```bash
+gh workflow run ci.yml --ref <branch-name>
+```
+
+This is recommended before merging any PR that touches the DVM engine,
+refresh logic, or CDC pipeline.
 
 ---
 

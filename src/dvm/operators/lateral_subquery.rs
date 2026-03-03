@@ -35,8 +35,8 @@ pub fn diff_lateral_subquery(
         column_aliases,
         output_cols,
         is_left_join,
+        subquery_source_oids,
         child,
-        ..
     } = op
     else {
         return Err(PgTrickleError::InternalError(
@@ -66,32 +66,98 @@ pub fn diff_lateral_subquery(
     let mut all_output_cols: Vec<String> = child_cols.clone();
     all_output_cols.extend(sub_cols.iter().cloned());
 
-    // ── CTE 1: Find source rows that changed ──────────────────────────
+    // ── Resolve ST column names ─────────────────────────────────────
+    //
+    // The ST may have aliased column names (e.g. `a.id AS a_id`
+    // becomes `a_id` in the ST, while the child scan has `id`).
+    // `ctx.st_user_columns` may have been remapped by diff_project to
+    // use child-level names. Use `st_column_alias_map` to translate
+    // back to the *actual* ST column names for `st.*` references.
+    let actual_st_col = |col: &str| -> String {
+        if let Some(ref map) = ctx.st_column_alias_map {
+            map.get(col).cloned().unwrap_or_else(|| col.to_string())
+        } else {
+            col.to_string()
+        }
+    };
+
+    let st_col_names: Vec<String> = if let Some(ref st_cols) = ctx.st_user_columns {
+        if st_cols.len() >= all_output_cols.len() {
+            st_cols[..all_output_cols.len()]
+                .iter()
+                .map(|c| actual_st_col(c))
+                .collect()
+        } else {
+            all_output_cols.clone()
+        }
+    } else {
+        all_output_cols.clone()
+    };
+    let st_child_cols: Vec<String> = st_col_names[..child_cols.len()].to_vec();
+
+    // ── CTE 1: Find source rows that changed ───────────────────────────
+    //
+    // Starts with rows from the child delta (outer table changes).
+    // When inner subquery sources also have changes, ALL current outer
+    // rows are included so that their LATERAL subquery results are
+    // recomputed (the inner aggregate value may have changed).
     let changed_sources_cte = ctx.next_cte_name("lat_sq_changed");
-    let changed_sources_sql = format!(
-        "SELECT DISTINCT \"__pgt_row_id\", \"__pgt_action\", {child_col_list}\n\
-         FROM {child_delta}",
-        child_col_list = col_list(child_cols),
-        child_delta = child_result.cte_name,
-    );
+
+    // Build an inner-source-change check: if ANY inner source table has
+    // new change-buffer rows, we must recompute the LATERAL subquery for
+    // every current outer row.
+    let inner_change_branch =
+        build_inner_change_branch(ctx, child, child_cols, subquery_source_oids);
+
+    let changed_sources_sql = if let Some(inner_branch) = inner_change_branch {
+        format!(
+            "SELECT DISTINCT \"__pgt_row_id\", \"__pgt_action\", {child_col_list}\n\
+             FROM {child_delta}\n\
+             UNION ALL\n\
+             {inner_branch}",
+            child_col_list = col_list(child_cols),
+            child_delta = child_result.cte_name,
+        )
+    } else {
+        format!(
+            "SELECT DISTINCT \"__pgt_row_id\", \"__pgt_action\", {child_col_list}\n\
+             FROM {child_delta}",
+            child_col_list = col_list(child_cols),
+            child_delta = child_result.cte_name,
+        )
+    };
     ctx.add_cte(changed_sources_cte.clone(), changed_sources_sql);
 
     // ── CTE 2: Old ST rows for changed source rows (DELETE actions) ────
     let old_rows_cte = ctx.next_cte_name("lat_sq_old");
 
-    // Build a join condition: for each child column, match st.col = cs.col
+    // Build a join condition: match st.{st_col} = cs.{child_col}
+    // The ST may use aliased names, while the changed_sources CTE uses
+    // the child's original column names.
     let join_on_child_cols = child_cols
         .iter()
-        .map(|c| {
-            let qc = quote_ident(c);
-            format!("st.{qc} IS NOT DISTINCT FROM cs.{qc}")
+        .zip(st_child_cols.iter())
+        .map(|(child_c, st_c)| {
+            let qc_child = quote_ident(child_c);
+            let qc_st = quote_ident(st_c);
+            format!("st.{qc_st} IS NOT DISTINCT FROM cs.{qc_child}")
         })
         .collect::<Vec<_>>()
         .join(" AND ");
 
+    // SELECT st columns with aliases back to the expected output names
     let all_cols_st = all_output_cols
         .iter()
-        .map(|c| format!("st.{}", quote_ident(c)))
+        .zip(st_col_names.iter())
+        .map(|(out_c, st_c)| {
+            let qst = quote_ident(st_c);
+            let qout = quote_ident(out_c);
+            if st_c == out_c {
+                format!("st.{qst}")
+            } else {
+                format!("st.{qst} AS {qout}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -124,21 +190,18 @@ pub fn diff_lateral_subquery(
         .collect();
     let child_col_refs_str = child_col_refs.join(", ");
 
-    // Build hash expression for the row ID: hash all output columns
+    // Build hash expression for the row ID: hash all output columns.
+    // Do NOT use COALESCE for NULL — pg_trickle_hash_multi handles NULL
+    // elements by hashing a '\x00NULL\x00' sentinel, which keeps this
+    // consistent with the initial-load hash in row_id_expr_for_query.
     let hash_exprs: Vec<String> = child_cols
         .iter()
         .map(|c| format!("{}.{}::TEXT", quote_ident(&outer_alias), quote_ident(c)))
-        .chain(sub_cols.iter().map(|c| {
-            if *is_left_join {
-                format!(
-                    "COALESCE({}.{}::TEXT, '')",
-                    quote_ident(alias),
-                    quote_ident(c),
-                )
-            } else {
-                format!("{}.{}::TEXT", quote_ident(alias), quote_ident(c))
-            }
-        }))
+        .chain(
+            sub_cols
+                .iter()
+                .map(|c| format!("{}.{}::TEXT", quote_ident(alias), quote_ident(c))),
+        )
         .collect();
     let row_id_expr = build_hash_expr(&hash_exprs);
 
@@ -211,6 +274,81 @@ pub fn diff_lateral_subquery(
         columns: all_output_cols,
         is_deduplicated: false,
     })
+}
+
+/// Build a SQL branch that selects ALL current outer rows when any inner
+/// subquery source table has changes in the current refresh window.
+///
+/// Returns `None` if there are no inner source OIDs to monitor, or if
+/// the delta source is not change-buffer based (IMMEDIATE mode).
+///
+/// The output SQL selects `0 AS __pgt_row_id, 'I' AS __pgt_action, cols`
+/// from the outer base table, guarded by an `EXISTS` check on the inner
+/// source change buffers. The row_id is unused (the downstream CTEs
+/// match on column equality), and 'I' ensures the expand CTE
+/// re-executes the subquery for every outer row.
+fn build_inner_change_branch(
+    ctx: &DiffContext,
+    child: &OpTree,
+    child_cols: &[String],
+    inner_oids: &[u32],
+) -> Option<String> {
+    use crate::dvm::diff::DeltaSource;
+    use crate::dvm::operators::join_common::build_snapshot_sql;
+
+    // Only change-buffer mode has persistent change tables to check.
+    if !matches!(ctx.delta_source, DeltaSource::ChangeBuffer) {
+        return None;
+    }
+
+    // Filter to inner OIDs that are NOT the child's own OID (the child
+    // delta is already handled by the main branch).
+    let child_oid = child.source_oids();
+    let inner_only: Vec<u32> = inner_oids
+        .iter()
+        .copied()
+        .filter(|oid| !child_oid.contains(oid))
+        .collect();
+
+    if inner_only.is_empty() {
+        return None;
+    }
+
+    // Build EXISTS checks for each inner source's change buffer.
+    let exists_checks: Vec<String> = inner_only
+        .iter()
+        .map(|oid| {
+            let change_table =
+                format!("{}.changes_{}", quote_ident(&ctx.change_buffer_schema), oid,);
+            let prev_lsn = ctx.get_prev_lsn(*oid);
+            let new_lsn = ctx.get_new_lsn(*oid);
+            format!(
+                "EXISTS (SELECT 1 FROM {change_table} c \
+                 WHERE c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn \
+                 LIMIT 1)"
+            )
+        })
+        .collect();
+    let any_inner_changed = exists_checks.join(" OR ");
+
+    // Build column references from the outer base table
+    let outer_snap = build_snapshot_sql(child);
+    let outer_alias = child.alias();
+    let col_refs: Vec<String> = child_cols
+        .iter()
+        .map(|c| format!("{}.{}", quote_ident(outer_alias), quote_ident(c)))
+        .collect();
+    let col_refs_str = col_refs.join(", ");
+
+    Some(format!(
+        "-- All outer rows when inner subquery sources changed\n\
+         SELECT 0::BIGINT AS \"__pgt_row_id\",\n\
+                'I'::TEXT AS \"__pgt_action\",\n\
+                {col_refs_str}\n\
+         FROM {outer_snap} {outer_alias_q}\n\
+         WHERE {any_inner_changed}",
+        outer_alias_q = quote_ident(outer_alias),
+    ))
 }
 
 #[cfg(test)]
@@ -438,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_lateral_subquery_left_join_coalesce_hash() {
+    fn test_diff_lateral_subquery_left_join_null_safe_hash() {
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["id"]);
         let tree = lateral_subquery(
@@ -453,8 +591,11 @@ mod tests {
         let result = diff_lateral_subquery(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // LEFT JOIN should use COALESCE for NULL-safe hashing
-        assert_sql_contains(&sql, "COALESCE");
+        // LEFT JOIN uses raw col::TEXT in hash (pg_trickle_hash_multi
+        // handles NULLs via \x00NULL\x00 sentinel). No COALESCE needed.
+        assert_sql_contains(&sql, "LEFT JOIN LATERAL");
+        // Hash expression uses sub.val::TEXT without COALESCE
+        assert_sql_contains(&sql, "\"sub\".\"val\"::TEXT");
     }
 
     #[test]
