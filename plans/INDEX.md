@@ -13,6 +13,7 @@ new entries when creating documents.
 |------|------|--------|---------|
 | [PLAN.md](PLAN.md) | PLAN | — | Master implementation plan (Phases 0–12) |
 | [PLAN_FEATURE_CLEANUP.md](PLAN_FEATURE_CLEANUP.md) | PLAN | In progress | Remove low-value surface before public release |
+| [ANALYSIS_COMPOSABILITY.md](ANALYSIS_COMPOSABILITY.md) | REPORT | Proposed | Extractable components & internal decomposition analysis |
 
 ## adrs/
 
