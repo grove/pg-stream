@@ -294,3 +294,20 @@ LEFT JOIN LATERAL (
     name = "pg_trickle_monitoring_views",
     requires = [parse_duration_seconds],
 );
+
+// ── Launcher notification (must be last) ──────────────────────────────
+//
+// Signal the launcher background worker to re-probe this database.
+// Without this, the launcher applies a 5-minute skip TTL for databases
+// where pg_trickle was not installed on first probe. Bumping the shared
+// memory signal at the end of CREATE EXTENSION ensures the launcher
+// detects the new install within its next 10-second wake cycle.
+
+extension_sql!(
+    r#"
+SELECT pgtrickle._signal_launcher_rescan();
+"#,
+    name = "pg_trickle_launcher_notify",
+    requires = [_signal_launcher_rescan],
+    finalize,
+);

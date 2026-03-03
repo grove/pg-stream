@@ -1162,6 +1162,18 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Bump the shared-memory DAG rebuild signal.
+///
+/// Called automatically at the end of `CREATE EXTENSION pg_trickle` so the
+/// launcher background worker notices the new install and spawns a scheduler
+/// immediately, rather than waiting for the 5-minute skip TTL.
+///
+/// Also safe to call manually if the launcher needs a nudge.
+#[pg_extern(schema = "pgtrickle")]
+fn _signal_launcher_rescan() {
+    crate::shmem::signal_dag_rebuild();
+}
+
 /// Parse a Prometheus/GNU-style duration string and return seconds.
 ///
 /// Used by SQL views to compare schedule. Returns NULL for invalid input

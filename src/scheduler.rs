@@ -105,6 +105,10 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
 
     log!("pg_trickle launcher started");
 
+    // Track the DAG rebuild signal so we can detect CREATE EXTENSION in any
+    // database and immediately re-probe, rather than waiting for skip_ttl.
+    let mut last_dag_version = shmem::current_dag_version();
+
     // last_attempt[db] = when we last tried to spawn a worker for that DB.
     // Used to avoid hammering databases where pg_trickle is not installed.
     let mut last_attempt: HashMap<String, std::time::Instant> = HashMap::new();
@@ -169,6 +173,15 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
                 }
             })
         }));
+
+        // If any backend bumped the DAG signal (CREATE EXTENSION, create_st,
+        // etc.) since our last loop, clear the skip cache so we re-probe all
+        // databases immediately.
+        let dag_version = shmem::current_dag_version();
+        if dag_version != last_dag_version {
+            last_dag_version = dag_version;
+            last_attempt.clear();
+        }
 
         for db in &databases {
             if active.contains(db) {
