@@ -32,6 +32,27 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
     `diamond_consistency = 'atomic'`; on any failure the entire group is
     rolled back, preserving consistency.
 
+### Fixed
+
+- **E2E test type mismatch** — `test_diamond_atomic_all_succeed` queried
+  `total` (an `INT4` column from `INT + INT`) as `i64`; corrected to `i32`.
+- **dbt macros: DDL rollback bug** — `pgtrickle_create_stream_table`,
+  `pgtrickle_drop_stream_table`, `pgtrickle_alter_stream_table`, and
+  `pgtrickle_refresh_stream_table` all used `run_query()`, which shares the
+  model's connection. dbt wraps the model's main statement in
+  `BEGIN … ROLLBACK`, causing the DDL to be silently rolled back. Fixed by
+  replacing `run_query()` with `{% call statement(..., auto_begin=False) %}`
+  with explicit `BEGIN; … COMMIT;` so DDL is committed unconditionally.
+- **dbt test script: Python 3.14 incompatibility** — `dbt-core 1.9` depends on
+  `pydantic v1` / `mashumaro`, neither of which supports Python 3.14. The test
+  script now creates a dedicated `.venv-dbt` using Python 3.13 for dbt.
+- **dbt test script: broken `PROJECT_ROOT` path** — was computing 3 levels up
+  from `integration_tests/scripts/` instead of 2, resolving to the wrong
+  directory. Fixed.
+- **dbt test script: `psql` not on PATH** — added auto-detection of
+  Homebrew-keg PostgreSQL `bin/` directories so `wait_for_populated.sh` can
+  connect without requiring a globally linked `psql`.
+
 ---
 
 ## [0.1.3] — 2026-03-02

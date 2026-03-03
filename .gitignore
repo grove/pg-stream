@@ -14,3 +14,6 @@ coverage/
 
 # mdBook build output
 book/
+
+# dbt separate venv (Python 3.13, not committed)
+.venv-dbt/

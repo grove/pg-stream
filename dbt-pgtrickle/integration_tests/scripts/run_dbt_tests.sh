@@ -28,7 +28,20 @@ KEEP_CONTAINER="${KEEP_CONTAINER:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INTEGRATION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-PROJECT_ROOT="$(cd "$INTEGRATION_DIR/../../.." && pwd)"
+PROJECT_ROOT="$(cd "$INTEGRATION_DIR/../.." && pwd)"
+
+# Ensure psql is on PATH (Homebrew postgresql kegs may not be linked)
+for _pg_dir in \
+    /opt/homebrew/opt/postgresql@18/bin \
+    /opt/homebrew/opt/postgresql@17/bin \
+    /opt/homebrew/opt/postgresql@16/bin \
+    /usr/local/opt/postgresql@18/bin \
+    /usr/local/opt/postgresql@17/bin; do
+  if [[ -x "$_pg_dir/psql" ]]; then
+    export PATH="$_pg_dir:$PATH"
+    break
+  fi
+done
 
 # Parse flags
 for arg in "$@"; do
@@ -112,11 +125,22 @@ echo "Creating pg_trickle extension..."
 docker exec "$CONTAINER_NAME" \
   psql -U postgres -c "CREATE EXTENSION pg_trickle;"
 
-# ── Install dbt (if needed) ────────────────────────────────────────────────
+# ── Set up dbt Python environment ─────────────────────────────────────────
+# dbt-core 1.9 requires Python <=3.13 (pydantic v1 incompatible with 3.14).
+# Use a dedicated .venv-dbt virtual environment so we don't pollute the main
+# project venv (which may be Python 3.14+).
+DBT_VENV="$PROJECT_ROOT/.venv-dbt"
+if [[ ! -f "$DBT_VENV/bin/activate" ]]; then
+  echo "Creating dbt venv at $DBT_VENV using Python 3.13..."
+  PYTHON_DBT="$(command -v python3.13 || command -v python3.12 || command -v python3)"
+  "$PYTHON_DBT" -m venv "$DBT_VENV"
+fi
+# shellcheck source=/dev/null
+source "$DBT_VENV/bin/activate"
 if ! command -v dbt &>/dev/null; then
   echo ""
   echo "Installing dbt-core~=${DBT_VERSION}.0 and dbt-postgres~=${DBT_VERSION}.0..."
-  pip install "dbt-core~=${DBT_VERSION}.0" "dbt-postgres~=${DBT_VERSION}.0"
+  pip install --quiet "dbt-core~=${DBT_VERSION}.0" "dbt-postgres~=${DBT_VERSION}.0"
 fi
 echo ""
 echo "dbt version:"
