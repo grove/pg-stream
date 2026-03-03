@@ -51,11 +51,12 @@ RUN cargo pgrx init --pg18 /usr/bin/pg_config
 WORKDIR /build
 COPY Cargo.toml ./
 
-RUN mkdir -p src/bin src/ivm/operators benches && \
+RUN mkdir -p src/bin src/dvm/operators benches && \
     echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
     echo '#![allow(warnings)]' > src/lib.rs && \
-    echo '' > src/ivm/mod.rs && \
-    echo '' > src/ivm/operators/mod.rs && \
+    echo '' > src/dvm/mod.rs && \
+    echo '' > src/dvm/operators/mod.rs && \
+    echo '' > src/ivm.rs && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs && \
     cargo generate-lockfile && \

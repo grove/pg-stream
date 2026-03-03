@@ -41,6 +41,8 @@ use crate::error::PgTrickleError;
 pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Scan {
         table_oid,
+        table_name,
+        schema,
         columns,
         pk_columns,
         alias,
@@ -58,9 +60,9 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTri
     // while passing it as mutable to the sub-functions.
     let delta_source = ctx.delta_source.clone();
     match &delta_source {
-        DeltaSource::TransitionTable { tables } => {
-            diff_scan_transition(ctx, *table_oid, columns, pk_columns, alias, tables)
-        }
+        DeltaSource::TransitionTable { tables } => diff_scan_transition(
+            ctx, *table_oid, schema, table_name, columns, pk_columns, alias, tables,
+        ),
         DeltaSource::ChangeBuffer => {
             diff_scan_change_buffer(ctx, *table_oid, columns, pk_columns, alias)
         }
@@ -81,9 +83,12 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTri
 /// No net-effect computation is needed because each statement trigger
 /// fires exactly once — there are no multiple changes per PK within
 /// a single trigger invocation.
+#[allow(clippy::too_many_arguments)]
 fn diff_scan_transition(
     ctx: &mut DiffContext,
     table_oid: u32,
+    schema: &str,
+    table_name: &str,
     columns: &[crate::dvm::parser::Column],
     pk_columns: &[String],
     alias: &str,
@@ -146,15 +151,20 @@ FROM {new_table}",
     if branches.is_empty() {
         // No transition tables for this source — emit an empty delta.
         // This can happen for sources that weren't modified in this statement.
-        // Use a SELECT … LIMIT 0 from the source table to get correct column
-        // types without needing to track them explicitly.
-        let null_cols: Vec<String> = columns
+        //
+        // Select from the actual source table with WHERE false to inherit
+        // correct column types. Untyped NULL defaults to text in PostgreSQL,
+        // which causes type-mismatch errors when downstream CTEs compare
+        // these columns with typed columns from the other join side.
+        let col_refs_str = columns
             .iter()
-            .map(|c| format!("NULL AS {}", quote_ident(&c.name)))
-            .collect();
+            .map(|c| quote_ident(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let qualified_table = format!("{}.{}", quote_ident(schema), quote_ident(table_name),);
         let sql = format!(
-            "SELECT NULL::BIGINT AS __pgt_row_id, NULL::TEXT AS __pgt_action, {} WHERE false",
-            null_cols.join(", "),
+            "SELECT NULL::BIGINT AS __pgt_row_id, NULL::TEXT AS __pgt_action, \
+             {col_refs_str} FROM {qualified_table} WHERE false",
         );
         ctx.add_cte(cte_name.clone(), sql);
     } else {

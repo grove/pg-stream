@@ -545,8 +545,14 @@ async fn test_block_source_ddl_guc_prevents_alter() {
     )
     .await;
 
-    // Enable blocking GUC
-    db.execute("SET pg_trickle.block_source_ddl = true").await;
+    // Enable blocking GUC (use ALTER SYSTEM + reload so it applies to all
+    // pool connections, not just the current session which the pool may not
+    // reuse for the next query).
+    db.execute("ALTER SYSTEM SET pg_trickle.block_source_ddl = true")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
+    // Allow the reload to propagate
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // ALTER on a monitored source should now return an error
     let result = db

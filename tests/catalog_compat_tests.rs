@@ -394,26 +394,45 @@ async fn test_relkind_for_partitioned_index() {
 async fn test_advisory_lock_roundtrip() {
     let db = TestDb::new().await;
 
+    // Advisory locks are session-level, so we must use a single connection
+    // (not the pool, which may dispatch queries to different connections).
+    let mut conn = db.pool.acquire().await.expect("acquire connection");
+
     // Acquire an advisory lock (session-level)
-    let acquired: bool = db.query_scalar("SELECT pg_try_advisory_lock(12345)").await;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(12345)")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("lock query");
     assert!(acquired, "Should acquire advisory lock on first attempt");
 
     // A second attempt on the same key should still succeed (same session)
-    let acquired_again: bool = db.query_scalar("SELECT pg_try_advisory_lock(12345)").await;
+    let acquired_again: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(12345)")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("re-lock query");
     assert!(
         acquired_again,
         "Same session should re-acquire its own advisory lock"
     );
 
     // Release the lock (need to release twice since we acquired twice)
-    let released: bool = db.query_scalar("SELECT pg_advisory_unlock(12345)").await;
+    let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(12345)")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("unlock query");
     assert!(released, "Advisory lock release should return true");
 
-    let released2: bool = db.query_scalar("SELECT pg_advisory_unlock(12345)").await;
+    let released2: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(12345)")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("unlock query 2");
     assert!(released2, "Second advisory lock release should return true");
 
     // Releasing without holding should return false
-    let released3: bool = db.query_scalar("SELECT pg_advisory_unlock(12345)").await;
+    let released3: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(12345)")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("unlock query 3");
     assert!(
         !released3,
         "Releasing unowned advisory lock should return false"

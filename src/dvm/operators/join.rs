@@ -313,7 +313,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // column names in the condition don't directly match the snapshot
     // or delta CTE columns for complex children.
     let equi_keys = if is_simple_child(left) && is_simple_child(right) {
-        extract_equijoin_keys(condition)
+        extract_equijoin_keys(condition, left_prefix, right_prefix)
     } else {
         vec![]
     };
@@ -520,39 +520,97 @@ type EquiKeyPair = (String, String);
 ///
 /// Walks the expression tree looking for `col_a = col_b` patterns,
 /// including through AND conjunctions. Returns pairs of
-/// `(left_side_sql, right_side_sql)` for each equality found.
+/// `(left_table_key, right_table_key)` where each key is normalized
+/// so the first element belongs to the left child and the second to
+/// the right child, based on table alias matching.
 ///
 /// Falls back gracefully: if the condition is too complex (OR, functions,
 /// non-equality operators), returns an empty vec and we skip the
 /// semi-join optimization.
-fn extract_equijoin_keys(condition: &Expr) -> Vec<EquiKeyPair> {
+fn extract_equijoin_keys(
+    condition: &Expr,
+    left_alias: &str,
+    right_alias: &str,
+) -> Vec<EquiKeyPair> {
     let mut keys = Vec::new();
-    collect_equijoin_keys(condition, &mut keys);
+    collect_equijoin_keys(condition, left_alias, right_alias, &mut keys);
     keys
 }
 
 /// Recursively collect equi-join key pairs from an expression.
 ///
-/// Table qualifiers are stripped because the keys are used inside
-/// semi-join subqueries where the original table aliases are not in scope.
-fn collect_equijoin_keys(expr: &Expr, keys: &mut Vec<EquiKeyPair>) {
+/// Table qualifiers are stripped in the output because the keys are used
+/// inside semi-join subqueries where the original table aliases are not
+/// in scope. However, qualifiers are inspected first to correctly orient
+/// each `(left_key, right_key)` pair based on which table alias each
+/// side of the `=` belongs to.
+fn collect_equijoin_keys(
+    expr: &Expr,
+    left_alias: &str,
+    right_alias: &str,
+    keys: &mut Vec<EquiKeyPair>,
+) {
     match expr {
         Expr::BinaryOp { op, left, right } if op == "=" => {
-            // Found an equality — record both sides with qualifiers stripped
-            keys.push((
-                left.strip_qualifier().to_sql(),
-                right.strip_qualifier().to_sql(),
-            ));
+            // Found an equality — determine which side belongs to which table.
+            let left_stripped = left.strip_qualifier().to_sql();
+            let right_stripped = right.strip_qualifier().to_sql();
+
+            let left_belongs_to = classify_column_side(left, left_alias, right_alias);
+            let right_belongs_to = classify_column_side(right, left_alias, right_alias);
+
+            match (left_belongs_to, right_belongs_to) {
+                (ColumnSide::Left, ColumnSide::Right) => {
+                    // Normal order: left_of_= is left-table, right_of_= is right-table
+                    keys.push((left_stripped, right_stripped));
+                }
+                (ColumnSide::Right, ColumnSide::Left) => {
+                    // Swapped: left_of_= is right-table, right_of_= is left-table
+                    keys.push((right_stripped, left_stripped));
+                }
+                _ => {
+                    // Both same side or unknown — skip this key pair
+                    // (semi-join optimization won't apply for this key)
+                }
+            }
         }
         Expr::BinaryOp { op, left, right } if op.eq_ignore_ascii_case("AND") => {
             // AND conjunction — recurse into both sides
-            collect_equijoin_keys(left, keys);
-            collect_equijoin_keys(right, keys);
+            collect_equijoin_keys(left, left_alias, right_alias, keys);
+            collect_equijoin_keys(right, left_alias, right_alias, keys);
         }
         _ => {
             // Non-equality / non-AND: skip (don't add anything).
             // The optimization will be skipped if no keys are found.
         }
+    }
+}
+
+/// Which side of the join a column belongs to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ColumnSide {
+    Left,
+    Right,
+    Unknown,
+}
+
+/// Determine which side of the join a column expression belongs to,
+/// based on its table alias.
+fn classify_column_side(expr: &Expr, left_alias: &str, right_alias: &str) -> ColumnSide {
+    if let Expr::ColumnRef {
+        table_alias: Some(alias),
+        ..
+    } = expr
+    {
+        if alias == left_alias {
+            ColumnSide::Left
+        } else if alias == right_alias {
+            ColumnSide::Right
+        } else {
+            ColumnSide::Unknown
+        }
+    } else {
+        ColumnSide::Unknown
     }
 }
 
@@ -689,9 +747,24 @@ mod tests {
 
     #[test]
     fn test_extract_equijoin_keys_simple_equality() {
+        // Condition: o.cust_id = c.id → left alias "o", right alias "c"
         let cond = eq_cond("o", "cust_id", "c", "id");
-        let keys = extract_equijoin_keys(&cond);
+        let keys = extract_equijoin_keys(&cond, "o", "c");
         assert_eq!(keys.len(), 1);
+        // Normalized: (left_table_key, right_table_key)
+        assert!(keys[0].0.contains("cust_id"));
+        assert!(keys[0].1.contains("id"));
+    }
+
+    #[test]
+    fn test_extract_equijoin_keys_swapped_order() {
+        // Condition: c.id = o.cust_id (right-table col on LEFT of =)
+        let cond = eq_cond("c", "id", "o", "cust_id");
+        let keys = extract_equijoin_keys(&cond, "o", "c");
+        assert_eq!(keys.len(), 1);
+        // Should be normalized: (left_table_key, right_table_key)
+        assert!(keys[0].0.contains("cust_id"));
+        assert!(keys[0].1.contains("id"));
     }
 
     #[test]
@@ -701,14 +774,14 @@ mod tests {
             eq_cond("o", "a", "c", "b"),
             eq_cond("o", "x", "c", "y"),
         );
-        let keys = extract_equijoin_keys(&cond);
+        let keys = extract_equijoin_keys(&cond, "o", "c");
         assert_eq!(keys.len(), 2);
     }
 
     #[test]
     fn test_extract_equijoin_keys_non_equality_returns_empty() {
         let cond = binop(">", qcolref("o", "a"), qcolref("c", "b"));
-        let keys = extract_equijoin_keys(&cond);
+        let keys = extract_equijoin_keys(&cond, "o", "c");
         assert!(keys.is_empty());
     }
 

@@ -9,7 +9,7 @@
 //! - Vanishes (new_count ≤ 0, was > 0) → DELETE
 //! - Changes value → UPDATE (emitted as DELETE + INSERT pair)
 
-use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
+use crate::dvm::diff::{DeltaSource, DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::{AggExpr, AggFunc, Expr, OpTree};
 use crate::error::PgTrickleError;
@@ -1132,7 +1132,14 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // (SUM/COUNT/AVG), extract only the needed group-by keys and aggregate
     // argument columns directly from the change buffer via JSONB '->>'
     // instead of deserializing ALL columns with jsonb_populate_record.
-    let (delta_cte, group_output) = if is_direct_agg_eligible(child, group_by, aggregates) {
+    //
+    // The P5 bypass reads directly from the change buffer table, so it is
+    // only applicable for ChangeBuffer delta sources. For TransitionTable
+    // (IMMEDIATE mode), we always use the standard path which correctly
+    // reads from the trigger transition temp tables via diff_scan.
+    let use_p5 = matches!(ctx.delta_source, DeltaSource::ChangeBuffer)
+        && is_direct_agg_eligible(child, group_by, aggregates);
+    let (delta_cte, group_output) = if use_p5 {
         generate_direct_agg_delta(ctx, child, group_by, aggregates)?
     } else {
         // ── Standard path: differentiate child first ───────────────────

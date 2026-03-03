@@ -795,13 +795,13 @@ async fn test_ivm_cascading_immediate_sts() {
         "ST_A should have 3 rows after INSERT"
     );
 
-    // ST_B may need refresh if cascading triggers don't fire synchronously.
-    // Check if it updated; if not, do a manual refresh.
-    let b_count = db.count("public.cascade_b").await;
-    if b_count != 2 {
-        // If cascading didn't propagate, verify after explicit refresh.
-        db.refresh_st("cascade_b").await;
-    }
+    // Cascading IVM triggers propagate the INSERT from cascade_base → ST_A,
+    // but the second-level cascade (ST_A → ST_B) may not fire synchronously
+    // because the IVM delta application uses SPI INSERT which may not
+    // propagate transition tables through nested trigger levels in all cases.
+    // Do an explicit refresh of ST_B to ensure correctness.
+    db.refresh_st("cascade_b").await;
+
     assert_eq!(
         db.count("public.cascade_b").await,
         2,
