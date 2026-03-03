@@ -1928,6 +1928,30 @@ ORDER BY pending_rows DESC;
 
 A large `pending_rows` value for a source table means a differential refresh is overdue or stalled — use `pgtrickle.get_refresh_history()` to investigate.
 
+### Can I see a tree view of all stream table dependencies?
+
+Yes. `pgtrickle.dependency_tree()` walks the dependency DAG and renders it as an indented ASCII tree:
+
+```sql
+SELECT tree_line, status, refresh_mode
+FROM pgtrickle.dependency_tree();
+```
+
+Example output:
+
+```
+tree_line                                 | status | refresh_mode
+------------------------------------------+--------+--------------
+report_summary                            | ACTIVE | DIFFERENTIAL
+├── orders_by_region                      | ACTIVE | DIFFERENTIAL
+│   ├── public.orders [src]              |        |
+│   └── public.customers [src]           |        |
+└── revenue_totals                        | ACTIVE | DIFFERENTIAL
+    └── public.orders [src]              |        |
+```
+
+Each row has `node` (qualified name), `node_type` (`stream_table` or `source_table`), `depth`, `status`, and `refresh_mode`. Source tables are shown as leaves tagged with `[src]`.
+
 ### What monitoring views are available?
 
 | View | Description |

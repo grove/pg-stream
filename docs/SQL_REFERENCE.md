@@ -1005,6 +1005,45 @@ not refreshing or to audit which source tables are being trigger-tracked.
 
 ---
 
+### pgtrickle.dependency_tree
+
+Render all stream table dependencies as an indented ASCII tree.
+
+```sql
+pgtrickle.dependency_tree() → SETOF record(
+    tree_line    text,    -- indented visual line (├──, └──, │ characters)
+    node         text,    -- qualified name (schema.table)
+    node_type    text,    -- 'stream_table' or 'source_table'
+    depth        int,
+    status       text,    -- NULL for source_table nodes
+    refresh_mode text     -- NULL for source_table nodes
+)
+```
+
+Roots (stream tables with no stream-table parents) appear at depth 0. Each
+dependent is indented beneath its parent. Plain source tables are rendered as
+leaf nodes tagged `[src]`.
+
+**Example:**
+
+```sql
+SELECT tree_line, status, refresh_mode
+FROM pgtrickle.dependency_tree();
+```
+
+```
+tree_line                               status   refresh_mode
+----------------------------------------+---------+--------------
+report_summary                          ACTIVE   DIFFERENTIAL
+├── orders_by_region                    ACTIVE   DIFFERENTIAL
+│   ├── public.orders [src]
+│   └── public.customers [src]
+└── revenue_totals                      ACTIVE   DIFFERENTIAL
+    └── public.orders [src]
+```
+
+---
+
 ### pgtrickle.pg_trickle_hash
 
 Compute a 64-bit xxHash row ID from a text value.
