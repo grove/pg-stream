@@ -71,6 +71,16 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
     `diamond_consistency = 'atomic'`; on any failure the entire group is
     rolled back, preserving consistency.
 
+- **Multi-database auto-discovery** — The background scheduler now
+  automatically discovers and services all databases on the server where
+  pg_trickle is installed. A single long-lived **launcher worker** connects
+  to `postgres`, polls `pg_database` every 10 seconds, and dynamically spawns
+  a per-database **scheduler worker** for each database that has the extension.
+  Per-database workers exit cleanly if pg_trickle is not installed, and the
+  launcher retries each database at a 5-minute back-off. No manual
+  configuration is required — removing the need for the `pg_trickle.database`
+  GUC, which has been removed.
+
 ### Fixed
 
 - **E2E test type mismatch** — `test_diamond_atomic_all_succeed` queried
