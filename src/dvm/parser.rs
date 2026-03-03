@@ -1023,6 +1023,9 @@ impl OpTree {
     /// without GROUP BY (scalar aggregates).
     ///
     /// For transparent wrappers (`Project`, `Subquery`), delegates to child.
+    /// When a `Project` renames GROUP BY columns (e.g., `t.id AS department_id`),
+    /// the Project's aliases are used instead of the raw Aggregate names,
+    /// matching the storage table's column names.
     pub fn group_by_columns(&self) -> Option<Vec<String>> {
         match self {
             OpTree::Aggregate { group_by, .. } => {
@@ -1032,9 +1035,41 @@ impl OpTree {
                     Some(group_by.iter().map(|e| e.output_name()).collect())
                 }
             }
-            OpTree::Project { child, .. } | OpTree::Subquery { child, .. } => {
-                child.group_by_columns()
+            OpTree::Project {
+                child,
+                aliases,
+                expressions,
+            } => {
+                // If the child is an Aggregate with GROUP BY, resolve the
+                // group-by column names through this Project's alias mapping.
+                // The storage table uses the Project's aliases (the SELECT
+                // output names), not the Aggregate's raw group-by expression
+                // names. Without this, `GROUP BY t.id` with alias
+                // `department_id` would produce an index on "id" while the
+                // storage table column is "department_id".
+                if let Some(raw_names) = child.group_by_columns() {
+                    let resolved: Vec<String> = raw_names
+                        .iter()
+                        .map(|raw| {
+                            // Find the expression in this Project that
+                            // references the raw group-by column, and return
+                            // the corresponding alias.
+                            for (expr, alias) in expressions.iter().zip(aliases.iter()) {
+                                if expr.output_name() == *raw {
+                                    return alias.clone();
+                                }
+                            }
+                            // No matching expression — keep the raw name
+                            // (shouldn't happen for well-formed trees).
+                            raw.clone()
+                        })
+                        .collect();
+                    Some(resolved)
+                } else {
+                    None
+                }
             }
+            OpTree::Subquery { child, .. } => child.group_by_columns(),
             _ => None,
         }
     }
@@ -13535,6 +13570,40 @@ mod tests {
     fn test_group_by_columns_scan_returns_none() {
         let tree = scan_node("t", 1, &["id"]);
         assert_eq!(tree.group_by_columns(), None);
+    }
+
+    #[test]
+    fn test_group_by_columns_project_renames_columns() {
+        // Simulates: SELECT t.id AS department_id, t.name AS dept_name, COUNT(*)
+        //            FROM ... GROUP BY t.id, t.name
+        // The Aggregate group_by has ["id", "name"] but the Project aliases
+        // them to ["department_id", "dept_name"]. The storage table uses the
+        // Project aliases, so group_by_columns() must return those.
+        let tree = OpTree::Project {
+            expressions: vec![col("id"), col("name"), col("cnt")],
+            aliases: vec![
+                "department_id".to_string(),
+                "dept_name".to_string(),
+                "cnt".to_string(),
+            ],
+            child: Box::new(OpTree::Aggregate {
+                group_by: vec![col("id"), col("name")],
+                aggregates: vec![AggExpr {
+                    function: AggFunc::CountStar,
+                    argument: None,
+                    alias: "cnt".to_string(),
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                }],
+                child: Box::new(scan_node("t", 1, &["id", "name"])),
+            }),
+        };
+        assert_eq!(
+            tree.group_by_columns(),
+            Some(vec!["department_id".to_string(), "dept_name".to_string()])
+        );
     }
 
     // ── OpTree::row_id_key_columns tests ────────────────────────────
