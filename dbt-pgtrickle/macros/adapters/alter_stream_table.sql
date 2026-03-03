@@ -32,15 +32,16 @@
     {% endif %}
 
     {% if needs_alter %}
-      {% set alter_sql %}
+      {% call statement('pgtrickle_alter', auto_begin=False, fetch_result=False) %}
+        BEGIN;
         SELECT pgtrickle.alter_stream_table(
           {{ dbt.string_literal(name) }},
           schedule => {% if current.schedule != schedule %}{% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %}{% else %}NULL{% endif %},
           refresh_mode => {% if current.refresh_mode != refresh_mode %}{% if refresh_mode is none %}NULL{% else %}{{ dbt.string_literal(refresh_mode) }}{% endif %}{% else %}NULL{% endif %},
           status => {% if status is not none and current.status != status %}{{ dbt.string_literal(status) }}{% else %}NULL{% endif %}
-        )
-      {% endset %}
-      {% do run_query(alter_sql) %}
+        );
+        COMMIT;
+      {% endcall %}
       {{ log("pg_trickle: altered stream table '" ~ name ~ "'", info=true) }}
     {% endif %}
   {% endif %}

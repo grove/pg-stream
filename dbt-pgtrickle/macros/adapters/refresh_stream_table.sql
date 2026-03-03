@@ -7,9 +7,14 @@
     name (str): Stream table name (schema-qualified)
 #}
 {% macro pgtrickle_refresh_stream_table(name) %}
-  {% set refresh_sql %}
-    SELECT pgtrickle.refresh_stream_table({{ dbt.string_literal(name) }})
-  {% endset %}
-  {% do run_query(refresh_sql) %}
+  {#
+    Run refresh_stream_table() outside dbt's model transaction — see
+    pgtrickle_create_stream_table for the full rationale (explicit BEGIN/COMMIT).
+  #}
+  {% call statement('pgtrickle_refresh', auto_begin=False, fetch_result=False) %}
+    BEGIN;
+    SELECT pgtrickle.refresh_stream_table({{ dbt.string_literal(name) }});
+    COMMIT;
+  {% endcall %}
   {{ log("pg_trickle: refreshed stream table '" ~ name ~ "'", info=true) }}
 {% endmacro %}
