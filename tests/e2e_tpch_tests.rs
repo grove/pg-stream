@@ -1032,3 +1032,397 @@ async fn test_tpch_q07_isolation() {
         .await;
     println!("\n  Q07 isolation test complete\n");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase T1-B: Performance — FULL vs DIFFERENTIAL wall-clock timing
+//
+// For each query: create both FULL and DIFFERENTIAL STs, run RF cycles,
+// record per-refresh wall-clock time, and output a speedup table.
+//
+// Controlled via:
+//   TPCH_SCALE  (default 0.01)
+//   TPCH_CYCLES (default 3)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_performance_comparison() {
+    let sf = scale_factor();
+    let n_cycles = cycles();
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  TPC-H T1-B Performance — SF={sf}, cycles={n_cycles}");
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let t = Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let queries = tpch_queries();
+
+    struct PerfRow {
+        name: String,
+        tier: u8,
+        full_ms: Vec<f64>,
+        diff_ms: Vec<f64>,
+    }
+
+    let mut results: Vec<PerfRow> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    for q in &queries {
+        let st_full = format!("perf_f_{}", q.name);
+        let st_diff = format!("perf_d_{}", q.name);
+
+        let full_ok = db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_full}', $${sql}$$, '1m', 'FULL')",
+                sql = q.sql,
+            ))
+            .await;
+        let diff_ok = db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_diff}', $${sql}$$, '1m', 'DIFFERENTIAL')",
+                sql = q.sql,
+            ))
+            .await;
+
+        if full_ok.is_err() || diff_ok.is_err() {
+            skipped.push(q.name.to_string());
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_full}')"))
+                .await;
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_diff}')"))
+                .await;
+            continue;
+        }
+
+        let mut full_times = Vec::new();
+        let mut diff_times = Vec::new();
+        let mut ok = true;
+
+        for cycle in 1..=n_cycles {
+            let next_ok = max_orderkey(&db).await + 1;
+            apply_rf1(&db, next_ok).await;
+            apply_rf2(&db).await;
+            apply_rf3(&db).await;
+            db.execute("ANALYZE orders").await;
+            db.execute("ANALYZE lineitem").await;
+
+            let t_full = Instant::now();
+            if let Err(e) = try_refresh_st(&db, &st_full).await {
+                println!(
+                    "  WARN: {} FULL cycle {}: {}",
+                    q.name,
+                    cycle,
+                    e.lines().next().unwrap_or(&e)
+                );
+                ok = false;
+                break;
+            }
+            full_times.push(t_full.elapsed().as_secs_f64() * 1000.0);
+
+            let t_diff = Instant::now();
+            if let Err(e) = try_refresh_st(&db, &st_diff).await {
+                println!(
+                    "  WARN: {} DIFF cycle {}: {}",
+                    q.name,
+                    cycle,
+                    e.lines().next().unwrap_or(&e)
+                );
+                ok = false;
+                break;
+            }
+            diff_times.push(t_diff.elapsed().as_secs_f64() * 1000.0);
+
+            db.execute("VACUUM").await;
+        }
+
+        if ok {
+            results.push(PerfRow {
+                name: q.name.to_string(),
+                tier: q.tier,
+                full_ms: full_times,
+                diff_ms: diff_times,
+            });
+        } else {
+            skipped.push(q.name.to_string());
+        }
+
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_full}')"))
+            .await;
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_diff}')"))
+            .await;
+    }
+
+    // ── Results table ────────────────────────────────────────────
+
+    println!();
+    println!("┌──────┬──────┬────────────┬────────────┬──────────┐");
+    println!("│ Query│ Tier │  FULL (ms) │  DIFF (ms) │ Speedup  │");
+    println!("├──────┼──────┼────────────┼────────────┼──────────┤");
+
+    let mut total_full = 0.0f64;
+    let mut total_diff = 0.0f64;
+
+    for r in &results {
+        let avg_full = r.full_ms.iter().sum::<f64>() / r.full_ms.len().max(1) as f64;
+        let avg_diff = r.diff_ms.iter().sum::<f64>() / r.diff_ms.len().max(1) as f64;
+        let speedup = if avg_diff > 0.0 {
+            avg_full / avg_diff
+        } else {
+            f64::NAN
+        };
+        total_full += avg_full;
+        total_diff += avg_diff;
+
+        println!(
+            "│ {:<4} │  T{}  │ {:>8.1}   │ {:>8.1}   │ {:>6.2}x  │",
+            r.name, r.tier, avg_full, avg_diff, speedup,
+        );
+    }
+
+    let total_speedup = if total_diff > 0.0 {
+        total_full / total_diff
+    } else {
+        f64::NAN
+    };
+
+    println!("├──────┼──────┼────────────┼────────────┼──────────┤");
+    println!(
+        "│ Total│      │ {:>8.1}   │ {:>8.1}   │ {:>6.2}x  │",
+        total_full, total_diff, total_speedup,
+    );
+    println!("└──────┴──────┴────────────┴────────────┴──────────┘");
+
+    if !skipped.is_empty() {
+        println!("\n  Skipped (DVM limitation): {}", skipped.join(", "));
+    }
+    println!(
+        "\n  T1-B Performance: {}/{} queries benchmarked ✓\n",
+        results.len(),
+        queries.len()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase T1-C: Sustained Churn — correctness over many cycles
+//
+// Runs N cycles of RF1+RF2+RF3 with DIFFERENTIAL refresh. Every 10th
+// cycle, verifies correctness against the defining query (full rescan).
+// Tracks cumulative drift, change buffer sizes, and wall-clock time.
+//
+// Controlled via:
+//   TPCH_SCALE          (default 0.01)
+//   TPCH_CHURN_CYCLES   (default 50)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn churn_cycles() -> usize {
+    std::env::var("TPCH_CHURN_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_sustained_churn() {
+    let sf = scale_factor();
+    let n_cycles = churn_cycles();
+    let check_every = 10usize;
+    println!("\n══════════════════════════════════════════════════════════");
+    println!(
+        "  TPC-H T1-C Sustained Churn — SF={sf}, cycles={n_cycles}, check every {check_every}"
+    );
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let t = Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    // Use a subset of queries that are known to work well with DIFFERENTIAL.
+    // q01 (agg), q03 (join+agg), q05 (multi-join+agg), q06 (filter+agg),
+    // q10 (join+agg), q12 (join+agg+case), q14 (join+agg).
+    let churn_queries: Vec<(&str, &str)> = vec![
+        ("q01", include_str!("tpch/queries/q01.sql")),
+        ("q03", include_str!("tpch/queries/q03.sql")),
+        ("q05", include_str!("tpch/queries/q05.sql")),
+        ("q06", include_str!("tpch/queries/q06.sql")),
+        ("q10", include_str!("tpch/queries/q10.sql")),
+        ("q12", include_str!("tpch/queries/q12.sql")),
+        ("q14", include_str!("tpch/queries/q14.sql")),
+    ];
+
+    // Create DIFFERENTIAL STs for each query
+    let mut active_sts: Vec<(String, String)> = Vec::new();
+    for (name, sql) in &churn_queries {
+        let st_name = format!("churn_{name}");
+        match db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_name}', $${sql}$$, '1m', 'DIFFERENTIAL')",
+            ))
+            .await
+        {
+            Ok(_) => {
+                active_sts.push((st_name, sql.to_string()));
+                println!("  {name}: stream table created ✓");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                println!("  {name}: SKIP — {}", msg.lines().next().unwrap_or(&msg));
+            }
+        }
+    }
+
+    if active_sts.is_empty() {
+        println!("\n  No STs could be created — aborting\n");
+        return;
+    }
+
+    // Track per-cycle refresh times and buffer sizes
+    let mut cycle_ms: Vec<f64> = Vec::new();
+    let mut drift_detected = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for cycle in 1..=n_cycles {
+        let ct = Instant::now();
+
+        let next_ok = max_orderkey(&db).await + 1;
+        apply_rf1(&db, next_ok).await;
+        apply_rf2(&db).await;
+        apply_rf3(&db).await;
+
+        // Refresh all active STs
+        for (st_name, _sql) in &active_sts {
+            if let Err(e) = try_refresh_st(&db, st_name).await {
+                let msg = format!(
+                    "cycle {cycle} {st_name}: {}",
+                    e.lines().next().unwrap_or(&e)
+                );
+                errors.push(msg.clone());
+                println!("  WARN: {msg}");
+            }
+        }
+
+        let elapsed = ct.elapsed().as_secs_f64() * 1000.0;
+        cycle_ms.push(elapsed);
+
+        // Periodic correctness check
+        if cycle % check_every == 0 || cycle == n_cycles {
+            let mut check_ok = true;
+            for (st_name, sql) in &active_sts {
+                match assert_tpch_invariant(&db, st_name, sql, st_name, cycle).await {
+                    Ok(()) => {}
+                    Err(msg) => {
+                        drift_detected += 1;
+                        check_ok = false;
+                        errors.push(msg.clone());
+                        println!("  DRIFT: {msg}");
+                    }
+                }
+            }
+
+            // Report change buffer sizes
+            let buf_total: i64 = db
+                .query_scalar(
+                    "SELECT COALESCE(SUM(c.reltuples), 0)::bigint \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = 'pgtrickle_changes'",
+                )
+                .await;
+
+            let check_mark = if check_ok { "✓" } else { "✗" };
+            println!(
+                "  cycle {cycle:>3}/{n_cycles} — {elapsed:>7.0}ms — buf≈{buf_total} — check {check_mark}",
+            );
+
+            db.execute("VACUUM").await;
+        } else if cycle % 5 == 0 {
+            println!("  cycle {cycle:>3}/{n_cycles} — {elapsed:>7.0}ms");
+        }
+    }
+
+    // ── Summary ──────────────────────────────────────────────────
+
+    let avg_ms = cycle_ms.iter().sum::<f64>() / cycle_ms.len().max(1) as f64;
+    let max_ms = cycle_ms.iter().cloned().fold(0.0f64, f64::max);
+    let min_ms = cycle_ms.iter().cloned().fold(f64::MAX, f64::min);
+
+    println!();
+    println!("┌────────────────────────────────────────────────────────────┐");
+    println!("│ TPC-H T1-C Sustained Churn Results                        │");
+    println!("├────────────────────────────────────────────────────────────┤");
+    println!(
+        "│ STs active: {:>2} / {:>2}                                       │",
+        active_sts.len(),
+        churn_queries.len()
+    );
+    println!(
+        "│ Cycles:     {:>4}                                           │",
+        n_cycles
+    );
+    println!(
+        "│ Avg cycle:  {:>8.1} ms                                    │",
+        avg_ms
+    );
+    println!(
+        "│ Min/Max:    {:>8.1} / {:>8.1} ms                         │",
+        min_ms, max_ms
+    );
+    println!(
+        "│ Drift:      {:>4} detected                                  │",
+        drift_detected
+    );
+    println!(
+        "│ Errors:     {:>4} refresh failures                          │",
+        errors.len()
+    );
+    println!(
+        "│ Verdict:    {}                                          │",
+        if drift_detected == 0 && errors.is_empty() {
+            "✅ PASS"
+        } else if drift_detected == 0 {
+            "⚠️  WARN (refresh errors but no drift)"
+        } else {
+            "❌ FAIL (drift detected)"
+        }
+    );
+    println!("└────────────────────────────────────────────────────────────┘");
+
+    if !errors.is_empty() {
+        println!("\n  Errors:");
+        for (i, e) in errors.iter().enumerate().take(20) {
+            println!("    {}: {e}", i + 1);
+        }
+    }
+
+    // Cleanup
+    for (st_name, _) in &active_sts {
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+    }
+
+    println!(
+        "\n  T1-C Sustained Churn: {} drift in {} cycles\n",
+        if drift_detected == 0 {
+            "zero"
+        } else {
+            "NON-ZERO"
+        },
+        n_cycles
+    );
+
+    assert_eq!(
+        drift_detected, 0,
+        "Cumulative drift must be zero over {n_cycles} churn cycles"
+    );
+}

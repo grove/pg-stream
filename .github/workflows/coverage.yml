@@ -1,8 +1,8 @@
 # =============================================================================
 # Code Coverage Workflow
 #
-# Generates unit-test coverage and uploads to Codecov.
-#   push → main : automatic (src/Cargo changes only)
+# Generates unit-test and E2E coverage, uploads to Codecov.
+#   push → main : automatic (src/Cargo/test changes only)
 #   manual       : workflow_dispatch
 # =============================================================================
 name: Coverage
@@ -14,6 +14,7 @@ on:
       - 'src/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'tests/**'
   workflow_dispatch:
 
 concurrency:
@@ -72,5 +73,116 @@ jobs:
         with:
           name: coverage-lcov
           path: coverage/lcov.info
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ── E2E coverage (Docker-based, weekly + manual) ──────────────────────
+  # Runs the full E2E test suite against a coverage-instrumented Docker
+  # image, extracts profraw files, merges with unit profdata, and uploads
+  # combined coverage. Expensive (~30 min), so scheduled weekly only.
+  e2e-coverage:
+    name: E2E coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Build coverage-instrumented Docker image
+        run: |
+          docker build \
+            -t pg_trickle_e2e_cov:latest \
+            -f tests/Dockerfile.e2e-coverage .
+
+      - name: Run E2E tests with coverage
+        run: |
+          mkdir -p coverage/e2e
+          PGS_E2E_IMAGE=pg_trickle_e2e_cov:latest \
+          PGS_E2E_COVERAGE_DIR="$(pwd)/coverage/e2e" \
+            cargo test --test 'e2e_*' --features pg18 -- --test-threads=1
+
+      - name: Count profraw files
+        run: |
+          COUNT=$(find coverage/e2e -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
+          echo "Collected ${COUNT} profraw files"
+          if [[ "${COUNT}" -eq 0 ]]; then
+            echo "::warning::No profraw files collected — coverage instrumentation may not be working"
+          fi
+
+      - name: Build pg_stub for LD_PRELOAD
+        run: |
+          cc -shared -fPIC -o target/libpg_stub.so scripts/pg_stub.c
+
+      - name: Generate unit test profdata
+        env:
+          LD_PRELOAD: ${{ github.workspace }}/target/libpg_stub.so
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --no-report \
+            --features pg18 \
+            --lib \
+            --ignore-filename-regex '(pgrx_generated|build\.rs|tests/common)'
+
+      - name: Merge profdata and generate LCOV
+        run: |
+          SYSROOT="$(rustc --print sysroot)"
+          PROFDATA="$(find "${SYSROOT}" -name llvm-profdata -type f | head -1)"
+          LLVM_COV="$(find "${SYSROOT}" -name llvm-cov -type f | head -1)"
+
+          # Merge E2E profraw into a single profdata
+          "${PROFDATA}" merge -sparse \
+            coverage/e2e/*.profraw \
+            -o coverage/e2e/merged.profdata
+
+          # Find unit test profdata from cargo-llvm-cov
+          UNIT_PD="$(find target -name '*.profdata' -newer Cargo.toml 2>/dev/null | head -1)"
+
+          # Merge unit + E2E profdata
+          mkdir -p coverage/combined
+          MERGE_ARGS=(coverage/e2e/merged.profdata)
+          if [[ -n "${UNIT_PD}" ]]; then
+            MERGE_ARGS+=("${UNIT_PD}")
+          fi
+          "${PROFDATA}" merge -sparse "${MERGE_ARGS[@]}" \
+            -o coverage/combined/combined.profdata
+
+          # Find instrumented library
+          LIB="$(find target -name 'libpg_trickle*.so' -o -name 'libpg_trickle*.dylib' 2>/dev/null | head -1)"
+
+          if [[ -n "${LIB}" ]] && [[ -n "${LLVM_COV}" ]]; then
+            "${LLVM_COV}" export \
+              --instr-profile=coverage/combined/combined.profdata \
+              --object "${LIB}" \
+              --sources src/ \
+              --format=lcov \
+              > coverage/combined/lcov.info 2>/dev/null || true
+          fi
+
+      - name: Upload E2E coverage to Codecov
+        uses: codecov/codecov-action@v5
+        if: hashFiles('coverage/combined/lcov.info') != ''
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage/combined/lcov.info
+          flags: e2e
+          fail_ci_if_error: false
+
+      - name: Upload combined coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-e2e-combined
+          path: |
+            coverage/combined/
+            coverage/e2e/merged.profdata
           retention-days: 7
           if-no-files-found: ignore

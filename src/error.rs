@@ -533,4 +533,28 @@ mod tests {
         assert!(!state.record_failure(&policy, 2000));
         assert_eq!(state.attempts, 2);
     }
+
+    // ── G: Additional pure function tests ───────────────────────────
+
+    #[test]
+    fn test_error_kind_display_all_variants() {
+        assert_eq!(format!("{}", PgTrickleErrorKind::User), "USER");
+        assert_eq!(format!("{}", PgTrickleErrorKind::Schema), "SCHEMA");
+        assert_eq!(format!("{}", PgTrickleErrorKind::System), "SYSTEM");
+        assert_eq!(format!("{}", PgTrickleErrorKind::Internal), "INTERNAL");
+    }
+
+    #[test]
+    fn test_retry_policy_default_values() {
+        let policy = RetryPolicy::default();
+        assert_eq!(
+            policy.base_delay_ms, 1_000,
+            "default base delay should be 1s"
+        );
+        assert_eq!(
+            policy.max_delay_ms, 60_000,
+            "default max delay should be 60s"
+        );
+        assert_eq!(policy.max_attempts, 5, "default max attempts should be 5");
+    }
 }

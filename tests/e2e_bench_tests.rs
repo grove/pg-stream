@@ -961,3 +961,220 @@ async fn bench_covering_index_overhead() {
     println!("└─────────────────────────────────────────────────────────┘");
     println!();
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// E: CDC Trigger Overhead Benchmark
+//
+// Measures write-side overhead introduced by row-level AFTER triggers used
+// for change-data-capture. Compares INSERT/UPDATE/DELETE throughput on a
+// table that is a stream table source (has CDC triggers) versus an
+// identical table with no triggers.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore]
+async fn bench_cdc_trigger_overhead() {
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let rows = 50_000usize;
+    let batch = 5_000usize;
+    let iterations = 10usize;
+
+    // ── Setup: two identical tables ──────────────────────────────
+
+    // Table WITH CDC triggers (source of a stream table)
+    db.execute("CREATE TABLE cdc_src (id SERIAL PRIMARY KEY, region TEXT, amount INT)")
+        .await;
+    db.execute(&format!(
+        "INSERT INTO cdc_src (region, amount) \
+         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                WHEN 3 THEN 'w' ELSE 'c' END, (i * 17) % 10000 \
+         FROM generate_series(1, {rows}) AS s(i)"
+    ))
+    .await;
+
+    // Create a stream table so CDC triggers are installed on cdc_src
+    db.create_st(
+        "cdc_bench_st",
+        "SELECT id, region, amount FROM cdc_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Table WITHOUT CDC triggers (control)
+    db.execute("CREATE TABLE nocdc_src (id SERIAL PRIMARY KEY, region TEXT, amount INT)")
+        .await;
+    db.execute(&format!(
+        "INSERT INTO nocdc_src (region, amount) \
+         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                WHEN 3 THEN 'w' ELSE 'c' END, (i * 17) % 10000 \
+         FROM generate_series(1, {rows}) AS s(i)"
+    ))
+    .await;
+
+    db.execute("ANALYZE cdc_src").await;
+    db.execute("ANALYZE nocdc_src").await;
+
+    // Verify CDC trigger exists on the source
+    let trig_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             WHERE c.relname = 'cdc_src' AND t.tgname LIKE 'pgt_%'",
+        )
+        .await;
+    assert!(
+        trig_count > 0,
+        "CDC triggers should be installed on cdc_src"
+    );
+
+    // ── Benchmark: INSERT ────────────────────────────────────────
+
+    let mut cdc_insert_ms = Vec::new();
+    let mut nocdc_insert_ms = Vec::new();
+
+    for i in 0..iterations {
+        let offset = rows + i * batch;
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "INSERT INTO cdc_src (region, amount) \
+             SELECT 'n', (i * 13) % 10000 \
+             FROM generate_series(1, {batch}) AS s(i)"
+        ))
+        .await;
+        cdc_insert_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "INSERT INTO nocdc_src (region, amount) \
+             SELECT 'n', (i * 13) % 10000 \
+             FROM generate_series(1, {batch}) AS s(i)"
+        ))
+        .await;
+        nocdc_insert_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        // Drain the change buffer periodically to avoid bloat
+        if i % 3 == 2 {
+            db.refresh_st("cdc_bench_st").await;
+        }
+
+        let _ = offset;
+    }
+
+    // ── Benchmark: UPDATE ────────────────────────────────────────
+
+    let mut cdc_update_ms = Vec::new();
+    let mut nocdc_update_ms = Vec::new();
+
+    for _ in 0..iterations {
+        let start = Instant::now();
+        db.execute(&format!(
+            "UPDATE cdc_src SET amount = amount + 1 \
+             WHERE id IN (SELECT id FROM cdc_src ORDER BY id LIMIT {batch})"
+        ))
+        .await;
+        cdc_update_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "UPDATE nocdc_src SET amount = amount + 1 \
+             WHERE id IN (SELECT id FROM nocdc_src ORDER BY id LIMIT {batch})"
+        ))
+        .await;
+        nocdc_update_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        db.refresh_st("cdc_bench_st").await;
+    }
+
+    // ── Benchmark: DELETE ────────────────────────────────────────
+
+    let mut cdc_delete_ms = Vec::new();
+    let mut nocdc_delete_ms = Vec::new();
+
+    for i in 0..iterations {
+        // Delete a batch of rows (from the end to avoid conflicting with updates)
+        let start = Instant::now();
+        db.execute(&format!(
+            "DELETE FROM cdc_src \
+             WHERE id IN (SELECT id FROM cdc_src ORDER BY id DESC LIMIT {})",
+            batch / 5
+        ))
+        .await;
+        cdc_delete_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "DELETE FROM nocdc_src \
+             WHERE id IN (SELECT id FROM nocdc_src ORDER BY id DESC LIMIT {})",
+            batch / 5
+        ))
+        .await;
+        nocdc_delete_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        if i % 3 == 2 {
+            db.refresh_st("cdc_bench_st").await;
+        }
+    }
+
+    // ── Results ──────────────────────────────────────────────────
+
+    let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let overhead = |cdc: &[f64], nocdc: &[f64]| {
+        let a = avg(cdc);
+        let b = avg(nocdc);
+        if b > 0.0 { ((a - b) / b) * 100.0 } else { 0.0 }
+    };
+
+    let ins_oh = overhead(&cdc_insert_ms, &nocdc_insert_ms);
+    let upd_oh = overhead(&cdc_update_ms, &nocdc_update_ms);
+    let del_oh = overhead(&cdc_delete_ms, &nocdc_delete_ms);
+    let avg_oh = (ins_oh + upd_oh + del_oh) / 3.0;
+
+    println!();
+    println!("┌───────────────────────────────────────────────────────────┐");
+    println!("│ E: CDC Trigger Overhead Benchmark                        │");
+    println!("├───────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Config: {} base rows, {} rows/batch, {} iterations       │",
+        rows, batch, iterations
+    );
+    println!("│                                                           │");
+    println!("│ Operation    CDC (avg)    No-CDC (avg)    Overhead        │");
+    println!(
+        "│ INSERT    {:>8.2} ms    {:>8.2} ms    {:>+6.1}%          │",
+        avg(&cdc_insert_ms),
+        avg(&nocdc_insert_ms),
+        ins_oh,
+    );
+    println!(
+        "│ UPDATE    {:>8.2} ms    {:>8.2} ms    {:>+6.1}%          │",
+        avg(&cdc_update_ms),
+        avg(&nocdc_update_ms),
+        upd_oh,
+    );
+    println!(
+        "│ DELETE    {:>8.2} ms    {:>8.2} ms    {:>+6.1}%          │",
+        avg(&cdc_delete_ms),
+        avg(&nocdc_delete_ms),
+        del_oh,
+    );
+    println!("│                                                           │");
+    println!(
+        "│ Average overhead: {:>+.1}%                                 │",
+        avg_oh
+    );
+    println!(
+        "│ Verdict: {}                                           │",
+        if avg_oh < 20.0 {
+            "✅ Acceptable (<20%)"
+        } else if avg_oh < 50.0 {
+            "⚠️  Moderate (20-50%)"
+        } else {
+            "❌ High (>50%)       "
+        }
+    );
+    println!("└───────────────────────────────────────────────────────────┘");
+    println!();
+}

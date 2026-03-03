@@ -281,3 +281,178 @@ async fn test_union_all_grouping_sets_manual_rewrite_pattern() {
         "Manual GROUPING SETS UNION ALL rewrite should produce rows from both branches"
     );
 }
+
+// ── pg_get_viewdef for CTE-based views ──────────────────────────────
+
+#[tokio::test]
+async fn test_pg_get_viewdef_cte_view() {
+    let db = TestDb::new().await;
+
+    db.execute("CREATE TABLE vd_cte_src (id INT, region TEXT, amount NUMERIC)")
+        .await;
+    db.execute(
+        "CREATE VIEW vd_cte_view AS \
+         WITH totals AS (SELECT region, SUM(amount) AS total FROM vd_cte_src GROUP BY region) \
+         SELECT region, total FROM totals WHERE total > 0",
+    )
+    .await;
+
+    let raw: String = db
+        .query_scalar(
+            "SELECT pg_get_viewdef(c.oid, true) FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'vd_cte_view'",
+        )
+        .await;
+    let trimmed = raw.trim_end_matches(';').trim();
+    assert!(
+        !trimmed.is_empty(),
+        "CTE view definition should not be empty"
+    );
+
+    // Must be usable as a subquery
+    let subq = format!("SELECT count(*) FROM ({trimmed}) _q");
+    let count: i64 = db.query_scalar(&subq).await;
+    assert_eq!(count, 0, "CTE view definition should be usable as subquery");
+}
+
+// ── pg_proc volatility column ───────────────────────────────────────
+
+#[tokio::test]
+async fn test_pg_proc_volatility_column_values() {
+    let db = TestDb::new().await;
+
+    db.execute(
+        "CREATE FUNCTION cc_immutable(x INT) RETURNS INT AS $$ SELECT x $$ \
+         LANGUAGE SQL IMMUTABLE",
+    )
+    .await;
+    db.execute(
+        "CREATE FUNCTION cc_volatile(x INT) RETURNS INT AS $$ SELECT x $$ \
+         LANGUAGE SQL VOLATILE",
+    )
+    .await;
+
+    let imm_vol: String = db
+        .query_scalar("SELECT provolatile::text FROM pg_proc WHERE proname = 'cc_immutable'")
+        .await;
+    let vol_vol: String = db
+        .query_scalar("SELECT provolatile::text FROM pg_proc WHERE proname = 'cc_volatile'")
+        .await;
+
+    assert_eq!(imm_vol, "i", "IMMUTABLE function provolatile should be 'i'");
+    assert_eq!(vol_vol, "v", "VOLATILE function provolatile should be 'v'");
+}
+
+// ── relkind for partitioned index ───────────────────────────────────
+
+#[tokio::test]
+async fn test_relkind_for_partitioned_index() {
+    let db = TestDb::new().await;
+
+    db.execute("CREATE TABLE pk_test (id INT, val INT) PARTITION BY RANGE (id)")
+        .await;
+    db.execute("CREATE TABLE pk_test_1 PARTITION OF pk_test FOR VALUES FROM (1) TO (100)")
+        .await;
+    db.execute("CREATE INDEX ON pk_test (val)").await;
+
+    // Count indexes on the partitioned table family
+    let idx_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_class c \
+             WHERE c.relname LIKE 'pk_test%' AND c.relkind IN ('i', 'I')",
+        )
+        .await;
+    assert!(
+        idx_count > 0,
+        "Should find at least one index on partitioned table"
+    );
+
+    // Verify the parent index has relkind 'I' (partitioned index)
+    let parent_kind: String = db
+        .query_scalar(
+            "SELECT c.relkind::text FROM pg_class c \
+             JOIN pg_index i ON i.indexrelid = c.oid \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             WHERE t.relname = 'pk_test' AND c.relkind IN ('i', 'I') \
+             LIMIT 1",
+        )
+        .await;
+    assert!(
+        parent_kind == "i" || parent_kind == "I",
+        "Index relkind should be 'i' or 'I', got: {parent_kind:?}"
+    );
+}
+
+// ── F4 — Advisory lock compatibility ────────────────────────────────
+
+/// F4 — pg_try_advisory_lock / pg_advisory_unlock roundtrip.
+///
+/// pg_trickle uses advisory locks to prevent concurrent refreshes of the
+/// same stream table. This test pins the advisory lock API behaviour.
+#[tokio::test]
+async fn test_advisory_lock_roundtrip() {
+    let db = TestDb::new().await;
+
+    // Acquire an advisory lock (session-level)
+    let acquired: bool = db.query_scalar("SELECT pg_try_advisory_lock(12345)").await;
+    assert!(acquired, "Should acquire advisory lock on first attempt");
+
+    // A second attempt on the same key should still succeed (same session)
+    let acquired_again: bool = db.query_scalar("SELECT pg_try_advisory_lock(12345)").await;
+    assert!(
+        acquired_again,
+        "Same session should re-acquire its own advisory lock"
+    );
+
+    // Release the lock (need to release twice since we acquired twice)
+    let released: bool = db.query_scalar("SELECT pg_advisory_unlock(12345)").await;
+    assert!(released, "Advisory lock release should return true");
+
+    let released2: bool = db.query_scalar("SELECT pg_advisory_unlock(12345)").await;
+    assert!(released2, "Second advisory lock release should return true");
+
+    // Releasing without holding should return false
+    let released3: bool = db.query_scalar("SELECT pg_advisory_unlock(12345)").await;
+    assert!(
+        !released3,
+        "Releasing unowned advisory lock should return false"
+    );
+}
+
+// ── F5 — Extension version discovery via pg_available_extensions ─────
+
+/// F5 — pg_available_extensions reports installed extension versions.
+///
+/// pg_trickle queries pg_available_extensions to detect the installed version
+/// for upgrade migration checks. This test pins the catalog shape.
+#[tokio::test]
+async fn test_pg_available_extensions_shape() {
+    let db = TestDb::new().await;
+
+    // The `plpgsql` extension is always available in PostgreSQL.
+    let plpgsql_version: String = db
+        .query_scalar(
+            "SELECT installed_version::text FROM pg_available_extensions \
+             WHERE name = 'plpgsql'",
+        )
+        .await;
+    assert!(
+        !plpgsql_version.is_empty(),
+        "plpgsql should have a non-empty installed_version"
+    );
+
+    // Verify the expected columns exist in pg_available_extensions
+    let col_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'pg_catalog' \
+             AND table_name = 'pg_available_extensions' \
+             AND column_name IN ('name', 'default_version', 'installed_version', 'comment')",
+        )
+        .await;
+    assert_eq!(
+        col_count, 4,
+        "pg_available_extensions should have name, default_version, installed_version, comment columns"
+    );
+}

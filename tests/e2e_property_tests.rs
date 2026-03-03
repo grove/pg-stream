@@ -981,3 +981,600 @@ async fn test_property_full_mode() {
         assert_invariant(&db, "propf_filt", q_filt, seed, cycle).await;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 12: Window function — FULL mode (not differentiable)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_property_window_function_full() {
+    let seed: u64 = 0xCAFE_0020;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE prop_win (id INT PRIMARY KEY, dept TEXT, salary INT)")
+        .await;
+
+    let depts = ["eng", "sales", "ops"];
+    let mut ids = TrackedIds::new();
+    for _ in 0..INITIAL_ROWS {
+        let id = ids.alloc();
+        let dept = rng.choose(&depts);
+        let salary = rng.i32_range(50_000, 150_000);
+        db.execute(&format!(
+            "INSERT INTO prop_win VALUES ({id}, '{dept}', {salary})"
+        ))
+        .await;
+    }
+
+    let query = "SELECT id, dept, salary, \
+                 RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rnk \
+                 FROM prop_win";
+    db.create_st("prop_win_st", query, "1m", "FULL").await;
+    assert_invariant(&db, "prop_win_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        let n_ins = rng.usize_range(1, 4);
+        for _ in 0..n_ins {
+            let id = ids.alloc();
+            let dept = rng.choose(&depts);
+            let salary = rng.i32_range(50_000, 150_000);
+            db.execute(&format!(
+                "INSERT INTO prop_win VALUES ({id}, '{dept}', {salary})"
+            ))
+            .await;
+        }
+        if let Some(id) = ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_win WHERE id = {id}"))
+                .await;
+        }
+        if let Some(id) = ids.pick(&mut rng) {
+            let salary = rng.i32_range(50_000, 150_000);
+            db.execute(&format!(
+                "UPDATE prop_win SET salary = {salary} WHERE id = {id}"
+            ))
+            .await;
+        }
+        db.refresh_st("prop_win_st").await;
+        assert_invariant(&db, "prop_win_st", query, seed, cycle).await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 13: Non-recursive CTE — DIFFERENTIAL
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_property_cte_nonrecursive_differential() {
+    let seed: u64 = 0xCAFE_0021;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE prop_cte2 (id INT PRIMARY KEY, region TEXT, amount INT)")
+        .await;
+
+    let regions = ["north", "south"];
+    let mut ids = TrackedIds::new();
+    for _ in 0..INITIAL_ROWS {
+        let id = ids.alloc();
+        let region = rng.choose(&regions);
+        let amount = rng.i32_range(100, 1000);
+        db.execute(&format!(
+            "INSERT INTO prop_cte2 VALUES ({id}, '{region}', {amount})"
+        ))
+        .await;
+    }
+
+    let query = "WITH totals AS ( \
+                   SELECT region, SUM(amount) AS total FROM prop_cte2 GROUP BY region \
+                 ) \
+                 SELECT region, total FROM totals WHERE total > 500";
+    db.create_st("prop_cte2_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_invariant(&db, "prop_cte2_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        let n_ins = rng.usize_range(1, 4);
+        for _ in 0..n_ins {
+            let id = ids.alloc();
+            let region = rng.choose(&regions);
+            let amount = rng.i32_range(100, 1000);
+            db.execute(&format!(
+                "INSERT INTO prop_cte2 VALUES ({id}, '{region}', {amount})"
+            ))
+            .await;
+        }
+        if let Some(id) = ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_cte2 WHERE id = {id}"))
+                .await;
+        }
+        db.refresh_st("prop_cte2_st").await;
+        assert_invariant(&db, "prop_cte2_st", query, seed, cycle).await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 14: LATERAL join — DIFFERENTIAL
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_property_lateral_join_differential() {
+    let seed: u64 = 0xCAFE_0022;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE prop_lat_a (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("CREATE TABLE prop_lat_b (id INT PRIMARY KEY, a_id INT, score INT)")
+        .await;
+
+    let mut a_ids = TrackedIds::new();
+    let mut b_ids = TrackedIds::new();
+
+    for _ in 0..10 {
+        let id = a_ids.alloc();
+        let val = rng.i32_range(1, 100);
+        db.execute(&format!("INSERT INTO prop_lat_a VALUES ({id}, {val})"))
+            .await;
+    }
+    for _ in 0..INITIAL_ROWS {
+        let id = b_ids.alloc();
+        if let Some(a_id) = a_ids.pick(&mut rng) {
+            let score = rng.i32_range(1, 100);
+            db.execute(&format!(
+                "INSERT INTO prop_lat_b VALUES ({id}, {a_id}, {score})"
+            ))
+            .await;
+        }
+    }
+
+    let query = "SELECT a.id AS a_id, a.val, sub.max_score \
+                 FROM prop_lat_a a \
+                 LEFT JOIN LATERAL ( \
+                   SELECT MAX(b.score) AS max_score \
+                   FROM prop_lat_b b WHERE b.a_id = a.id \
+                 ) sub ON true";
+    db.create_st("prop_lat_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_invariant(&db, "prop_lat_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        let id = b_ids.alloc();
+        if let Some(a_id) = a_ids.pick(&mut rng) {
+            let score = rng.i32_range(1, 100);
+            db.execute(&format!(
+                "INSERT INTO prop_lat_b VALUES ({id}, {a_id}, {score})"
+            ))
+            .await;
+        }
+        if let Some(b_id) = b_ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_lat_b WHERE id = {b_id}"))
+                .await;
+        }
+        db.refresh_st("prop_lat_st").await;
+        assert_invariant(&db, "prop_lat_st", query, seed, cycle).await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 15: EXCEPT — DIFFERENTIAL
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_property_except_differential() {
+    let seed: u64 = 0xCAFE_0023;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE prop_exc_a (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("CREATE TABLE prop_exc_b (id INT PRIMARY KEY, val INT)")
+        .await;
+
+    let mut a_ids = TrackedIds::new();
+    let mut b_ids = TrackedIds::new();
+
+    for _ in 0..INITIAL_ROWS {
+        let id = a_ids.alloc();
+        let val = rng.i32_range(1, 10);
+        db.execute(&format!("INSERT INTO prop_exc_a VALUES ({id}, {val})"))
+            .await;
+    }
+    for _ in 0..INITIAL_ROWS {
+        let id = b_ids.alloc();
+        let val = rng.i32_range(1, 10);
+        db.execute(&format!("INSERT INTO prop_exc_b VALUES ({id}, {val})"))
+            .await;
+    }
+
+    let query = "SELECT val FROM prop_exc_a EXCEPT SELECT val FROM prop_exc_b";
+    db.create_st("prop_exc_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_invariant(&db, "prop_exc_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        let id = a_ids.alloc();
+        let val = rng.i32_range(1, 10);
+        db.execute(&format!("INSERT INTO prop_exc_a VALUES ({id}, {val})"))
+            .await;
+
+        if rng.gen_bool() {
+            let id = b_ids.alloc();
+            let val = rng.i32_range(1, 10);
+            db.execute(&format!("INSERT INTO prop_exc_b VALUES ({id}, {val})"))
+                .await;
+        }
+        if let Some(id) = a_ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_exc_a WHERE id = {id}"))
+                .await;
+        }
+
+        db.refresh_st("prop_exc_st").await;
+        assert_invariant(&db, "prop_exc_st", query, seed, cycle).await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 16: HAVING clause — DIFFERENTIAL
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_property_having_differential() {
+    let seed: u64 = 0xCAFE_0024;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE prop_hav (id INT PRIMARY KEY, category TEXT, amount INT)")
+        .await;
+
+    let cats = ["a", "b", "c", "d"];
+    let mut ids = TrackedIds::new();
+    for _ in 0..INITIAL_ROWS {
+        let id = ids.alloc();
+        let cat = rng.choose(&cats);
+        let amt = rng.i32_range(1, 100);
+        db.execute(&format!(
+            "INSERT INTO prop_hav VALUES ({id}, '{cat}', {amt})"
+        ))
+        .await;
+    }
+
+    let query = "SELECT category, SUM(amount) AS total, COUNT(*) AS cnt \
+                 FROM prop_hav GROUP BY category HAVING SUM(amount) > 100";
+    db.create_st("prop_hav_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_invariant(&db, "prop_hav_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        let n_ins = rng.usize_range(1, 4);
+        for _ in 0..n_ins {
+            let id = ids.alloc();
+            let cat = rng.choose(&cats);
+            let amt = rng.i32_range(1, 100);
+            db.execute(&format!(
+                "INSERT INTO prop_hav VALUES ({id}, '{cat}', {amt})"
+            ))
+            .await;
+        }
+        if let Some(id) = ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_hav WHERE id = {id}"))
+                .await;
+        }
+        db.refresh_st("prop_hav_st").await;
+        assert_invariant(&db, "prop_hav_st", query, seed, cycle).await;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 17: Three-table join — DIFFERENTIAL
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_property_three_table_join_differential() {
+    let seed: u64 = 0xCAFE_0025;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE prop_t3a (id INT PRIMARY KEY, key INT, a INT)")
+        .await;
+    db.execute("CREATE TABLE prop_t3b (id INT PRIMARY KEY, key INT, b INT)")
+        .await;
+    db.execute("CREATE TABLE prop_t3c (id INT PRIMARY KEY, key INT, c INT)")
+        .await;
+
+    let mut a_ids = TrackedIds::new();
+    let mut b_ids = TrackedIds::new();
+    let mut c_ids = TrackedIds::new();
+
+    for _ in 0..10 {
+        let id = a_ids.alloc();
+        let key = rng.i32_range(1, 4);
+        let v = rng.i32_range(1, 100);
+        db.execute(&format!("INSERT INTO prop_t3a VALUES ({id}, {key}, {v})"))
+            .await;
+
+        let id = b_ids.alloc();
+        let key = rng.i32_range(1, 4);
+        let v = rng.i32_range(1, 100);
+        db.execute(&format!("INSERT INTO prop_t3b VALUES ({id}, {key}, {v})"))
+            .await;
+
+        let id = c_ids.alloc();
+        let key = rng.i32_range(1, 4);
+        let v = rng.i32_range(1, 100);
+        db.execute(&format!("INSERT INTO prop_t3c VALUES ({id}, {key}, {v})"))
+            .await;
+    }
+
+    let query = "SELECT a.id AS aid, b.id AS bid, c.id AS cid, a.a + b.b + c.c AS total \
+                 FROM prop_t3a a JOIN prop_t3b b ON a.key = b.key \
+                                 JOIN prop_t3c c ON b.key = c.key";
+    db.create_st("prop_t3_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_invariant(&db, "prop_t3_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        // DML on table a
+        let id = a_ids.alloc();
+        let key = rng.i32_range(1, 4);
+        let v = rng.i32_range(1, 100);
+        db.execute(&format!("INSERT INTO prop_t3a VALUES ({id}, {key}, {v})"))
+            .await;
+
+        // DML on table b
+        let id = b_ids.alloc();
+        let key = rng.i32_range(1, 4);
+        let v = rng.i32_range(1, 100);
+        db.execute(&format!("INSERT INTO prop_t3b VALUES ({id}, {key}, {v})"))
+            .await;
+
+        if let Some(id) = a_ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_t3a WHERE id = {id}"))
+                .await;
+        }
+
+        db.refresh_st("prop_t3_st").await;
+        assert_invariant(&db, "prop_t3_st", query, seed, cycle).await;
+    }
+}
+
+// ── Test 18: INTERSECT (DIFFERENTIAL) ──────────────────────────────────
+
+/// A7 — INTERSECT set operation with differential maintenance.
+#[tokio::test]
+async fn test_property_intersect_differential() {
+    let seed: u64 = 0xCAFE_0026;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE prop_int_a (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("CREATE TABLE prop_int_b (id INT PRIMARY KEY, val INT)")
+        .await;
+
+    let mut a_ids = TrackedIds::new();
+    let mut b_ids = TrackedIds::new();
+
+    // Insert initial data with overlapping val ranges to ensure non-empty INTERSECT
+    for _ in 0..INITIAL_ROWS {
+        let id = a_ids.alloc();
+        let val = rng.i32_range(1, 8);
+        db.execute(&format!("INSERT INTO prop_int_a VALUES ({id}, {val})"))
+            .await;
+    }
+    for _ in 0..INITIAL_ROWS {
+        let id = b_ids.alloc();
+        let val = rng.i32_range(1, 8);
+        db.execute(&format!("INSERT INTO prop_int_b VALUES ({id}, {val})"))
+            .await;
+    }
+
+    let query = "SELECT val FROM prop_int_a INTERSECT SELECT val FROM prop_int_b";
+    db.create_st("prop_int_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_invariant(&db, "prop_int_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        let id = a_ids.alloc();
+        let val = rng.i32_range(1, 8);
+        db.execute(&format!("INSERT INTO prop_int_a VALUES ({id}, {val})"))
+            .await;
+
+        if rng.gen_bool() {
+            let id = b_ids.alloc();
+            let val = rng.i32_range(1, 8);
+            db.execute(&format!("INSERT INTO prop_int_b VALUES ({id}, {val})"))
+                .await;
+        }
+        if let Some(id) = a_ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_int_a WHERE id = {id}"))
+                .await;
+        }
+        if let Some(id) = b_ids.remove_random(&mut rng) {
+            db.execute(&format!("DELETE FROM prop_int_b WHERE id = {id}"))
+                .await;
+        }
+
+        db.refresh_st("prop_int_st").await;
+        assert_invariant(&db, "prop_int_st", query, seed, cycle).await;
+    }
+}
+
+// ── Test 19: Composite PK (DIFFERENTIAL) ───────────────────────────────
+
+/// A8 — Multi-column primary key table with differential maintenance.
+#[tokio::test]
+async fn test_property_composite_pk_differential() {
+    let seed: u64 = 0xCAFE_0027;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE prop_cpk_src (\
+         tenant_id INT, item_id INT, quantity INT, \
+         PRIMARY KEY (tenant_id, item_id))",
+    )
+    .await;
+
+    // Track composite keys as (tenant_id * 10000 + item_id) packed into i64
+    let mut ids = TrackedIds::new();
+    let mut used_keys: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+
+    for _ in 0..INITIAL_ROWS {
+        let _id_unused = ids.alloc();
+        let tenant = rng.i32_range(1, 4);
+        let item = rng.i32_range(1, 20);
+        if used_keys.insert((tenant, item)) {
+            let qty = rng.i32_range(1, 100);
+            db.execute(&format!(
+                "INSERT INTO prop_cpk_src VALUES ({tenant}, {item}, {qty})"
+            ))
+            .await;
+        }
+    }
+
+    let query = "SELECT tenant_id, item_id, quantity FROM prop_cpk_src";
+    db.create_st("prop_cpk_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_invariant(&db, "prop_cpk_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        // Insert new unique composite key rows
+        let n_ins = rng.usize_range(1, 3);
+        for _ in 0..n_ins {
+            let _id_unused = ids.alloc();
+            let tenant = rng.i32_range(1, 4);
+            let item = rng.i32_range(1, 30);
+            if used_keys.insert((tenant, item)) {
+                let qty = rng.i32_range(1, 100);
+                db.execute(&format!(
+                    "INSERT INTO prop_cpk_src VALUES ({tenant}, {item}, {qty})"
+                ))
+                .await;
+            }
+        }
+
+        // Delete a random existing row
+        if !used_keys.is_empty() && rng.gen_bool() {
+            let keys: Vec<(i32, i32)> = used_keys.iter().copied().collect();
+            let idx = rng.usize_range(0, keys.len().saturating_sub(1));
+            let (t, i) = keys[idx];
+            used_keys.remove(&(t, i));
+            db.execute(&format!(
+                "DELETE FROM prop_cpk_src WHERE tenant_id = {t} AND item_id = {i}"
+            ))
+            .await;
+        }
+
+        // Update a random existing row
+        if !used_keys.is_empty() {
+            let keys: Vec<(i32, i32)> = used_keys.iter().copied().collect();
+            let idx = rng.usize_range(0, keys.len().saturating_sub(1));
+            let (t, i) = keys[idx];
+            let new_qty = rng.i32_range(1, 100);
+            db.execute(&format!(
+                "UPDATE prop_cpk_src SET quantity = {new_qty} \
+                 WHERE tenant_id = {t} AND item_id = {i}"
+            ))
+            .await;
+        }
+
+        db.refresh_st("prop_cpk_st").await;
+        assert_invariant(&db, "prop_cpk_st", query, seed, cycle).await;
+    }
+}
+
+// ── Test 20: Recursive CTE (FULL mode) ────────────────────────────────
+
+/// A9 — Recursive CTE is not differentiable; FULL mode must maintain the
+/// invariant across DML cycles.
+#[tokio::test]
+async fn test_property_recursive_cte_full() {
+    let seed: u64 = 0xCAFE_0028;
+    let mut rng = Rng::new(seed);
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Adjacency list for a tree/graph structure
+    db.execute(
+        "CREATE TABLE prop_rcte_nodes (\
+         id INT PRIMARY KEY, parent_id INT, label TEXT)",
+    )
+    .await;
+
+    let mut ids = TrackedIds::new();
+
+    // Build initial tree: root node + children
+    let root_id = ids.alloc();
+    db.execute(&format!(
+        "INSERT INTO prop_rcte_nodes VALUES ({root_id}, NULL, 'root')"
+    ))
+    .await;
+
+    for _ in 0..INITIAL_ROWS {
+        let id = ids.alloc();
+        // Pick a random existing node as parent
+        let parent = if let Some(p) = ids.pick(&mut rng) {
+            p
+        } else {
+            root_id
+        };
+        let label = rng.choose(&["alpha", "beta", "gamma", "delta"]);
+        db.execute(&format!(
+            "INSERT INTO prop_rcte_nodes VALUES ({id}, {parent}, '{label}')"
+        ))
+        .await;
+    }
+
+    let query = "WITH RECURSIVE tree AS ( \
+                   SELECT id, parent_id, label, 1 AS depth \
+                   FROM prop_rcte_nodes WHERE parent_id IS NULL \
+                   UNION ALL \
+                   SELECT n.id, n.parent_id, n.label, t.depth + 1 \
+                   FROM prop_rcte_nodes n JOIN tree t ON n.parent_id = t.id \
+                 ) \
+                 SELECT id, parent_id, label, depth FROM tree";
+    db.create_st("prop_rcte_st", query, "1m", "FULL").await;
+    assert_invariant(&db, "prop_rcte_st", query, seed, 0).await;
+
+    for cycle in 1..=CYCLES {
+        // Add new leaf nodes
+        let n_ins = rng.usize_range(1, 3);
+        for _ in 0..n_ins {
+            let id = ids.alloc();
+            let parent = if let Some(p) = ids.pick(&mut rng) {
+                p
+            } else {
+                root_id
+            };
+            let label = rng.choose(&["alpha", "beta", "gamma", "delta"]);
+            db.execute(&format!(
+                "INSERT INTO prop_rcte_nodes VALUES ({id}, {parent}, '{label}')"
+            ))
+            .await;
+        }
+
+        // Delete a random non-root leaf (avoid cascading orphans by only
+        // deleting nodes that have no children)
+        if rng.gen_bool() {
+            let leaf_opt: Option<i64> = db
+                .query_scalar_opt(
+                    "SELECT n.id FROM prop_rcte_nodes n \
+                     WHERE n.parent_id IS NOT NULL \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM prop_rcte_nodes c WHERE c.parent_id = n.id \
+                     ) \
+                     ORDER BY n.id LIMIT 1",
+                )
+                .await;
+            if let Some(leaf_id) = leaf_opt {
+                db.execute(&format!("DELETE FROM prop_rcte_nodes WHERE id = {leaf_id}"))
+                    .await;
+                // Remove from tracked set (best-effort — TrackedIds doesn't support
+                // arbitrary removal by value, but the invariant check doesn't depend on it)
+            }
+        }
+
+        db.refresh_st("prop_rcte_st").await;
+        assert_invariant(&db, "prop_rcte_st", query, seed, cycle).await;
+    }
+}

@@ -15183,4 +15183,47 @@ mod tests {
             _ => panic!("Expected InnerJoin with promoted condition"),
         }
     }
+
+    // ── strip_view_definition_suffix tests ───────────────────────────
+
+    #[test]
+    fn test_strip_view_definition_suffix_with_semicolon() {
+        assert_eq!(strip_view_definition_suffix("SELECT 1;"), "SELECT 1");
+    }
+
+    #[test]
+    fn test_strip_view_definition_suffix_with_whitespace_and_semicolon() {
+        // Semicolon immediately at end, followed by nothing
+        assert_eq!(
+            strip_view_definition_suffix("SELECT id FROM t  ;"),
+            "SELECT id FROM t"
+        );
+    }
+
+    #[test]
+    fn test_strip_view_definition_suffix_no_semicolon() {
+        assert_eq!(
+            strip_view_definition_suffix("SELECT id FROM t"),
+            "SELECT id FROM t"
+        );
+    }
+
+    #[test]
+    fn test_strip_view_definition_suffix_empty_string() {
+        assert_eq!(strip_view_definition_suffix(""), "");
+    }
+
+    #[test]
+    fn test_strip_view_definition_suffix_only_semicolons() {
+        assert_eq!(strip_view_definition_suffix(";;;"), "");
+    }
+
+    #[test]
+    fn test_strip_view_definition_suffix_preserves_interior_semicolons() {
+        // A semicolon in the middle should NOT be stripped
+        assert_eq!(
+            strip_view_definition_suffix("SELECT ';' FROM t;"),
+            "SELECT ';' FROM t"
+        );
+    }
 }

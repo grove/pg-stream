@@ -165,3 +165,158 @@ async fn test_refresh_and_drop_race() {
         let _ = exists;
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// C1 — Multiple STs on same source refreshed concurrently
+// ══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_concurrent_refresh_multiple_sts_same_source() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE cc_shared (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO cc_shared SELECT g, g * 10 FROM generate_series(1, 50) g")
+        .await;
+
+    db.create_st(
+        "cc_shared_st1",
+        "SELECT id, val FROM cc_shared",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.create_st(
+        "cc_shared_st2",
+        "SELECT id, val * 2 AS val2 FROM cc_shared",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    // Insert more data, then refresh both concurrently
+    db.execute("INSERT INTO cc_shared SELECT g, g * 10 FROM generate_series(51, 100) g")
+        .await;
+
+    let pool1 = db.pool.clone();
+    let pool2 = db.pool.clone();
+
+    let h1 = tokio::spawn(async move {
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('cc_shared_st1')")
+            .execute(&pool1)
+            .await
+    });
+    let h2 = tokio::spawn(async move {
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('cc_shared_st2')")
+            .execute(&pool2)
+            .await
+    });
+
+    let (r1, r2) = tokio::join!(h1, h2);
+    r1.expect("task1 panicked").expect("refresh st1 failed");
+    r2.expect("task2 panicked").expect("refresh st2 failed");
+
+    // Both STs should reflect the full 100-row source
+    assert_eq!(db.count("public.cc_shared_st1").await, 100);
+    assert_eq!(db.count("public.cc_shared_st2").await, 100);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// C2 — Advisory lock contention: concurrent refresh of same ST
+// ══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_concurrent_refresh_same_st_no_corruption() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE cc_lock_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO cc_lock_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    db.create_st(
+        "cc_lock_st",
+        "SELECT id, val FROM cc_lock_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    db.execute("INSERT INTO cc_lock_src SELECT g, g FROM generate_series(101, 200) g")
+        .await;
+
+    let pool1 = db.pool.clone();
+    let pool2 = db.pool.clone();
+
+    let h1 = tokio::spawn(async move {
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('cc_lock_st')")
+            .execute(&pool1)
+            .await
+    });
+    let h2 = tokio::spawn(async move {
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('cc_lock_st')")
+            .execute(&pool2)
+            .await
+    });
+
+    let (r1, r2) = tokio::join!(h1, h2);
+    // Both calls may succeed (advisory lock serializes) or second may skip.
+    // Neither should panic.
+    let _ = r1.expect("task1 panicked");
+    let _ = r2.expect("task2 panicked");
+
+    // After both complete, row count must be exactly correct — no duplicates
+    let count = db.count("public.cc_lock_st").await;
+    assert_eq!(count, 200, "No duplicate rows after concurrent refreshes");
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// C3 — Full-refresh racing with DML on source
+// ══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_full_refresh_racing_with_dml() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE cc_dml_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO cc_dml_src SELECT g, g FROM generate_series(1, 100) g")
+        .await;
+
+    db.create_st("cc_dml_st", "SELECT id, val FROM cc_dml_src", "1m", "FULL")
+        .await;
+    assert_eq!(db.count("public.cc_dml_st").await, 100);
+
+    db.execute("INSERT INTO cc_dml_src SELECT g, g FROM generate_series(101, 150) g")
+        .await;
+
+    let pool_r = db.pool.clone();
+    let pool_i = db.pool.clone();
+
+    let h_refresh = tokio::spawn(async move {
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('cc_dml_st')")
+            .execute(&pool_r)
+            .await
+    });
+    let h_insert = tokio::spawn(async move {
+        sqlx::query("INSERT INTO cc_dml_src SELECT g, g FROM generate_series(151, 200) g")
+            .execute(&pool_i)
+            .await
+    });
+
+    let (r_refresh, r_insert) = tokio::join!(h_refresh, h_insert);
+    r_refresh
+        .expect("refresh task panicked")
+        .expect("refresh failed");
+    r_insert
+        .expect("insert task panicked")
+        .expect("insert failed");
+
+    // After a stabilising refresh, count must converge to 200
+    db.refresh_st("cc_dml_st").await;
+    let count = db.count("public.cc_dml_st").await;
+    assert_eq!(
+        count, 200,
+        "ST must converge to 200 after stabilising refresh"
+    );
+}

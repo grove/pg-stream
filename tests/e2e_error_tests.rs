@@ -764,3 +764,151 @@ async fn test_volatile_operator_allowed_in_full_mode() {
     let count = db.count("public.volop2_st").await;
     assert_eq!(count, 2);
 }
+
+// ── Error Recovery: resume, suspended status ───────────────────────────
+
+/// D2 — resume_stream_table() on a SUSPENDED ST → back to ACTIVE.
+#[tokio::test]
+async fn test_resume_stream_table_clears_suspended_status() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE err_resume_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO err_resume_src VALUES (1, 1)").await;
+
+    db.create_st(
+        "err_resume_st",
+        "SELECT id, val FROM err_resume_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    // Suspend via alter_stream_table
+    db.alter_st("err_resume_st", "status => 'SUSPENDED'").await;
+
+    let (status, _, _, _) = db.pgt_status("err_resume_st").await;
+    assert_eq!(status, "SUSPENDED");
+
+    // Resume
+    db.execute("SELECT pgtrickle.resume_stream_table('err_resume_st')")
+        .await;
+
+    let (status_after, _, _, errors_after) = db.pgt_status("err_resume_st").await;
+    assert_eq!(
+        status_after, "ACTIVE",
+        "resume_stream_table() should transition from SUSPENDED to ACTIVE"
+    );
+    assert_eq!(errors_after, 0, "consecutive_errors should be reset to 0");
+}
+
+/// D3 — Refresh is rejected for a SUSPENDED ST.
+#[tokio::test]
+async fn test_refresh_rejected_for_suspended_st() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE err_susp_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO err_susp_src VALUES (1, 1)").await;
+
+    db.create_st(
+        "err_susp_st",
+        "SELECT id, val FROM err_susp_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    // Suspend the ST
+    db.alter_st("err_susp_st", "status => 'SUSPENDED'").await;
+
+    // Refresh should fail while suspended
+    let result = db
+        .try_execute("SELECT pgtrickle.refresh_stream_table('err_susp_st')")
+        .await;
+    assert!(
+        result.is_err(),
+        "refresh_stream_table() should be rejected for a SUSPENDED ST"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.to_lowercase().contains("suspended") || msg.to_lowercase().contains("resume"),
+        "Error should mention suspension or resume, got: {msg}"
+    );
+}
+
+/// D — resume_stream_table() on an unknown ST returns error.
+#[tokio::test]
+async fn test_resume_unknown_stream_table_errors() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    let result = db
+        .try_execute("SELECT pgtrickle.resume_stream_table('nonexistent_st')")
+        .await;
+    assert!(
+        result.is_err(),
+        "Resuming unknown ST should return an error"
+    );
+}
+
+// ── D1 — Transaction abort leaves no orphans ──────────────────────────
+
+/// D1 — A rolled-back transaction that called create_stream_table()
+/// should leave no catalog entry, no storage table, and no CDC triggers.
+#[tokio::test]
+async fn test_create_st_transaction_abort_leaves_no_orphans() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE err_txn_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO err_txn_src VALUES (1, 1), (2, 2)")
+        .await;
+
+    // Execute create inside a transaction that we roll back.
+    // We use separate statements because sqlx auto-commits each query.
+    let pool = db.pool.clone();
+    let mut tx = pool.begin().await.expect("begin txn");
+    let create_result = sqlx::query(
+        "SELECT pgtrickle.create_stream_table('err_txn_st', \
+         $$ SELECT id, val FROM err_txn_src $$, '1m', 'FULL')",
+    )
+    .execute(&mut *tx)
+    .await;
+
+    // Whether create succeeded or not, we roll back the transaction.
+    let _ = create_result;
+    tx.rollback().await.expect("rollback txn");
+
+    // After rollback: no storage table should exist.
+    let exists = db.table_exists("public", "err_txn_st").await;
+    assert!(
+        !exists,
+        "Storage table should not exist after transaction rollback"
+    );
+
+    // No catalog entry should remain.
+    let cat_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'err_txn_st'",
+        )
+        .await;
+    assert_eq!(
+        cat_count, 0,
+        "No catalog entry should remain after rollback"
+    );
+
+    // No CDC triggers referencing this ST should exist.
+    let trigger_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             WHERE c.relname = 'err_txn_src' \
+             AND t.tgname LIKE '%pgtrickle%err_txn_st%'",
+        )
+        .await;
+    assert_eq!(
+        trigger_count, 0,
+        "No CDC triggers should remain after rollback"
+    );
+}

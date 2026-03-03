@@ -879,6 +879,7 @@ mod tests {
     fn test_alert_event_as_str() {
         assert_eq!(AlertEvent::StaleData.as_str(), "stale_data");
         assert_eq!(AlertEvent::AutoSuspended.as_str(), "auto_suspended");
+        assert_eq!(AlertEvent::Resumed.as_str(), "resumed");
         assert_eq!(
             AlertEvent::ReinitializeNeeded.as_str(),
             "reinitialize_needed"
@@ -902,6 +903,7 @@ mod tests {
         let variants = [
             AlertEvent::StaleData,
             AlertEvent::AutoSuspended,
+            AlertEvent::Resumed,
             AlertEvent::ReinitializeNeeded,
             AlertEvent::BufferGrowthWarning,
             AlertEvent::RefreshCompleted,

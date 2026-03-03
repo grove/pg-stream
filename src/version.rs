@@ -307,6 +307,38 @@ mod tests {
     }
 
     #[test]
+    fn test_frontier_get_snapshot_ts_present() {
+        let mut frontier = Frontier::new();
+        frontier.set_source(100, "0/1".to_string(), "2026-03-03T10:00:00Z".to_string());
+        assert_eq!(
+            frontier.get_snapshot_ts(100),
+            Some("2026-03-03T10:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn test_frontier_get_snapshot_ts_absent() {
+        let frontier = Frontier::new();
+        assert_eq!(frontier.get_snapshot_ts(999), None);
+    }
+
+    #[test]
+    fn test_frontier_is_empty_new() {
+        let frontier = Frontier::new();
+        assert!(frontier.is_empty(), "New frontier should be empty");
+    }
+
+    #[test]
+    fn test_frontier_is_empty_after_set_source() {
+        let mut frontier = Frontier::new();
+        frontier.set_source(1, "0/1".to_string(), "ts".to_string());
+        assert!(
+            !frontier.is_empty(),
+            "Frontier with sources should not be empty"
+        );
+    }
+
+    #[test]
     fn test_lsn_comparison() {
         assert!(lsn_gt("0/2", "0/1"));
         assert!(lsn_gt("1/0", "0/FFFFFFFF"));
