@@ -41,14 +41,54 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
         .map(|c| quote_ident(c))
         .collect();
 
-    let sql = format!(
-        "SELECT __pgt_row_id, __pgt_action, {cols}\n\
-         FROM {child_cte}\n\
-         WHERE {predicate}",
-        cols = col_refs.join(", "),
-        child_cte = child_result.cte_name,
-        predicate = predicate_sql,
-    );
+    // ── HAVING-aware filter ───────────────────────────────────────────
+    //
+    // When the filter sits on top of an aggregate (i.e., it's a HAVING
+    // clause), the aggregate's delta emits 'I' actions for updated groups
+    // with new aggregate values. If the new values no longer satisfy the
+    // predicate but the group was previously in the ST (old values did
+    // satisfy), we must emit a DELETE so the stale row is removed.
+    //
+    // Without this, groups that cross the HAVING threshold from above to
+    // below would remain in the ST with stale data.
+    let is_having = matches!(child.as_ref(), OpTree::Aggregate { .. });
+    let has_st = ctx.st_qualified_name.is_some();
+
+    let sql = if is_having && has_st {
+        let st_table = ctx.st_qualified_name.as_deref().unwrap();
+        format!(
+            "-- Part 1: delta rows that satisfy the predicate — pass through\n\
+             SELECT __pgt_row_id, __pgt_action, {cols}\n\
+             FROM {child_cte}\n\
+             WHERE {predicate}\n\
+             \n\
+             UNION ALL\n\
+             \n\
+             -- Part 2: aggregate updates that no longer satisfy HAVING\n\
+             -- but the row IS in the ST → emit DELETE to remove stale row\n\
+             SELECT __pgt_row_id, 'D' AS __pgt_action, {cols}\n\
+             FROM {child_cte}\n\
+             WHERE NOT ({predicate})\n\
+               AND __pgt_action = 'I'\n\
+               AND EXISTS (\n\
+                   SELECT 1 FROM {st_table} st\n\
+                   WHERE st.__pgt_row_id = {child_cte}.__pgt_row_id\n\
+               )",
+            cols = col_refs.join(", "),
+            child_cte = child_result.cte_name,
+            predicate = predicate_sql,
+            st_table = st_table,
+        )
+    } else {
+        format!(
+            "SELECT __pgt_row_id, __pgt_action, {cols}\n\
+             FROM {child_cte}\n\
+             WHERE {predicate}",
+            cols = col_refs.join(", "),
+            child_cte = child_result.cte_name,
+            predicate = predicate_sql,
+        )
+    };
 
     ctx.add_cte(cte_name.clone(), sql);
 
