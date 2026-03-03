@@ -90,7 +90,7 @@ erDiagram
         text defining_query
         text original_query "User's original SQL (pre-inlining)"
         text schedule "Duration or cron expression"
-        text refresh_mode "FULL | DIFFERENTIAL"
+        text refresh_mode "FULL | DIFFERENTIAL | IMMEDIATE"
         text status "INITIALIZING | ACTIVE | SUSPENDED | ERROR"
         boolean is_populated
         timestamptz data_timestamp "Freshness watermark"

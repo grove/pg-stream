@@ -1,6 +1,6 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-02
+> **Last updated:** 2026-03-03
 > **Current version:** 0.1.3
 
 For a concise description of what pg_trickle is and why it exists, read
@@ -19,13 +19,13 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                      We are here
-                                           │
-                                           ▼
+                                                    We are here
+                                                         │
+                                                         ▼
  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
  │  0.1.x   │   │  0.2.0   │   │  0.3.0   │──▶│  0.4.0   │──▶│  1.0.0   │──▶│  1.x+    │
- │ Released │   │ Active   │   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
- │ ✅       │   │ 🔜       │   │ ready    │   │ ability  │   │ Release  │   │ Ecosystem│
+ │ Released │   │ Complete │   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
+ │ ✅       │   │ ✅       │   │ ready    │   │ ability  │   │ Release  │   │ Ecosystem│
  └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
 ```
 
@@ -72,7 +72,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full feature list.
 
 ## v0.2.0 — TopK, Diamond Consistency & Transactional IVM
 
-**Status: TopK and Diamond Dependency Consistency implemented; Transactional IVM Phase 1 in progress.**
+**Status: All features implemented. Ready for release.**
 
 The 51-item SQL_GAPS_7 correctness plan was completed in v0.1.x. v0.2.0 delivers
 three major feature additions. The one remaining SQL_GAPS_7 item (F40 — extension
@@ -137,41 +137,44 @@ Atomic refresh groups eliminate the inconsistency window in diamond DAGs
 
 See [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](plans/sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md).
 
-### Transactional IVM — Phase 1 (Immediate Mode MVP)
+### Transactional IVM — IMMEDIATE Mode ✅
 
-Add an `IMMEDIATE` refresh mode that updates stream tables **within the same
+New `IMMEDIATE` refresh mode that updates stream tables **within the same
 transaction** as base table DML, using statement-level AFTER triggers with
-transition tables. This makes pg_trickle a **drop-in replacement for pg_ivm**
-and provides read-your-writes consistency. Only Phase 1 (core engine + single-
-and multi-table immediate IVM) is in scope; the pg_ivm compatibility layer
-(Phase 2), extended SQL support (Phase 3), and performance optimizations
-(Phase 4) are deferred to post-1.0.
+transition tables. Phase 1 (core engine) and Phase 3 (extended SQL support)
+are complete. Phase 2 (pg_ivm compatibility layer) is postponed. Phase 4
+(performance optimizations) has partial completion (delta SQL template caching).
 
-The DVM engine is ~90% reusable — only the `Scan` operator needs a dual-path
-for reading from transition-table ENRs instead of change buffer tables. All
-other operators (Join, Aggregate, Filter, TopK, etc.) are source-agnostic.
+| Item | Description | Status |
+|------|-------------|--------|
+| TI1 | `RefreshMode::Immediate` enum, catalog CHECK, API validation | ✅ Done |
+| TI2 | Statement-level IVM trigger functions with transition tables | ✅ Done |
+| TI3 | `DeltaSource::TransitionTable` — Scan operator dual-path | ✅ Done |
+| TI4 | Delta application (DELETE + INSERT ON CONFLICT) | ✅ Done |
+| TI5 | Advisory lock-based concurrency (`IvmLockMode`) | ✅ Done |
+| TI6 | TRUNCATE handling (full refresh of stream table) | ✅ Done |
+| TI7 | `alter_stream_table` mode switching (DIFFERENTIAL↔IMMEDIATE, FULL↔IMMEDIATE) | ✅ Done |
+| TI8 | Query restriction validation (`validate_immediate_mode_support`) | ✅ Done |
+| TI9 | Delta SQL template caching (thread-local `IVM_DELTA_CACHE`) | ✅ Done |
+| TI10 | Window functions, LATERAL, scalar subqueries in IMMEDIATE mode | ✅ Done |
+| TI11 | Cascading IMMEDIATE stream tables (ST_A → ST_B) | ✅ Done |
+| TI12 | 29 E2E tests + 8 unit tests | ✅ Done |
+| TI13 | Documentation (SQL Reference, Architecture, FAQ, CHANGELOG) | ✅ Done |
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| TI1 | Add `IMMEDIATE` to `RefreshMode` enum, catalog CHECK constraint, API validation | 4h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §3.1, §3.6–3.8 |
-| TI2 | Statement-level IVM trigger functions (`pgt_ivm_before` / `pgt_ivm_after`) with transition table access | 12h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §3.2, §6.1 |
-| TI3 | In-memory trigger state management (before/after counting, tuplestore collection, `RegisterXactCallback` cleanup) | 4h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §6.2 |
-| TI4 | ENR registration for transition tables in SPI context | 6h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §6.3 |
-| TI5 | `Scan` operator dual-path: `DeltaSource::TransitionTable` vs `DeltaSource::ChangeBuffer` | 4h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §3.3 |
-| TI6 | Concurrency: ExclusiveLock on stream table during IMMEDIATE maintenance + TRUNCATE handling | 2–4h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §3.5, §5 Phase 1.5–1.6 |
-| TI7 | E2E tests: INSERT/UPDATE/DELETE immediate consistency, concurrent transactions, isolation levels | 8–12h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) §10 |
-| TI8 | Documentation (SQL Reference, Architecture, FAQ, CHANGELOG) | 2–4h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
+> Remaining performance optimizations (ENR-based transition table access,
+> aggregate fast-path, C-level trigger functions, prepared statement reuse)
+> are tracked under post-1.0 A2.
 
-> **Transactional IVM Phase 1 subtotal: ~32–48 hours**
->
-> Phases 2–4 (pg_ivm compat wrappers, extended SQL in IMMEDIATE mode,
-> C-level trigger optimization) are tracked under post-1.0 A2.
+See [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md).
 
 **Exit criteria:**
 - [x] `ORDER BY ... LIMIT N` (TopK) defining queries accepted and refreshed correctly
 - [x] TPC-H queries Q2, Q3, Q10, Q18, Q21 pass with original LIMIT restored
 - [x] Diamond dependency consistency (D1–D8) implemented and E2E-tested
-- [ ] IMMEDIATE refresh mode: INSERT/UPDATE/DELETE on base table updates stream table within the same transaction
+- [x] IMMEDIATE refresh mode: INSERT/UPDATE/DELETE on base table updates stream table within the same transaction
+- [x] Window functions, LATERAL, scalar subqueries work in IMMEDIATE mode
+- [x] Cascading IMMEDIATE stream tables (ST_A → ST_B) propagate correctly
+- [x] Concurrent transaction tests pass
 
 ---
 
@@ -356,7 +359,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
-| A2 | Transactional IVM Phases 2–4 (pg_ivm compat layer, extended SQL, C-level triggers) | ~36–54h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
+| A2 | Transactional IVM Phase 4 remaining (ENR-based transition tables, aggregate fast-path, C-level triggers, prepared stmt reuse) | ~36–54h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
 | A3 | PostgreSQL 19 forward-compatibility | TBD | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 | A4 | PostgreSQL 14–15 backward compatibility | ~40h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) |
 | A5 | Partitioned stream table storage (opt-in) | ~60–80h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §4 |
@@ -368,7 +371,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | Milestone | Effort estimate | Cumulative | Status |
 |-----------|-----------------|------------|--------|
 | v0.1.x — Core engine + correctness | ~30h actual | 30h | ✅ Released |
-| v0.2.0 — TopK, Diamond & Transactional IVM | ~32–48h remaining | 62–78h | 🔜 Next |
+| v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Done |
 | v0.3.0 — Production ready | 175–261h | 237–339h | |
 | v0.4.0 — Observability & Integration | 18–27h | 223–318h | |
 | v1.0.0 — Stable release | 18–27h | 241–345h | |

@@ -21,11 +21,15 @@ pg_trickle brings declarative, automatically-refreshing materialized views to Po
 ## Key Features
 
 - **Declarative** — define a query and a schedule bound (or cron expression); the extension schedules and executes refreshes automatically.
+- **Three refresh modes** — `DIFFERENTIAL` (incremental delta), `FULL` (complete recomputation), and `IMMEDIATE` (synchronous in-transaction maintenance via statement-level triggers with transition tables).
 - **Differential View Maintenance (DVM)** — only processes changed rows, not the entire base table. Delta queries are derived automatically from the defining query's operator tree.
+- **Transactional IVM (IMMEDIATE mode)** — stream tables can be maintained **within the same transaction** as the base table DML, providing read-your-writes consistency. Supports window functions, LATERAL joins, scalar subqueries, cascading IMMEDIATE stream tables, and all DVM operators except recursive CTEs.
 - **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in both FULL and DIFFERENTIAL modes.
+- **TopK support** — `ORDER BY ... LIMIT N` queries are accepted and refreshed correctly via scoped recomputation.
 - **Trigger-based CDC** — lightweight `AFTER` row-level triggers capture changes into buffer tables. No logical replication slots or `wal_level = logical` required. Triggers are created and dropped automatically.
 - **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_trickle.cdc_mode` GUC (`trigger` / `auto` / `wal`).
 - **DAG-aware scheduling** — stream tables that depend on other stream tables are refreshed in topological order. `CALCULATED` schedule propagation is supported.
+- **Diamond dependency consistency** — diamond-shaped DAGs (A→B→D, A→C→D) can be refreshed atomically to prevent split-version reads.
 - **Crash-safe** — advisory locks prevent concurrent refreshes; crash recovery marks in-flight refreshes as failed and resumes normal operation.
 - **Observable** — built-in monitoring views (`pgtrickle.pg_stat_stream_tables`), refresh history, slot health checks, staleness reporting, and `NOTIFY`-based alerting.
 
@@ -91,8 +95,9 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Source tables** | Tables without primary key | ✅ Full | Content-hash row identity via all columns |
 | **Source tables** | Views as sources | ✅ Full | Auto-inlined as subqueries; CDC triggers land on base tables |
 | **Source tables** | Materialized views | ❌ DIFF / ✅ FULL | Rejected in DIFFERENTIAL (stale snapshot); allowed in FULL |
-| **Ordering** | `ORDER BY` | ⚠️ Ignored | Accepted but silently discarded; storage row order is undefined |
-| **Ordering** | `LIMIT` / `OFFSET` | ❌ Rejected | Not supported — stream tables materialize the full result set |
+| **TopK** | `ORDER BY ... LIMIT N` | ✅ Full | TopK stream tables store only the top-N rows; scoped recomputation via MERGE |
+| **Ordering** | `ORDER BY` (without LIMIT) | ⚠️ Ignored | Accepted but silently discarded; storage row order is undefined |
+| **Ordering** | `LIMIT` / `OFFSET` (without ORDER BY) | ❌ Rejected | Not supported — stream tables materialize the full result set |
 
 See [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) for the full differentiation rules and CTE tiers.
 
@@ -166,7 +171,7 @@ INSERT INTO orders VALUES
     (1, 'US', 100), (2, 'EU', 200),
     (3, 'US', 300), (4, 'APAC', 50);
 
--- Create a stream table with 1-minute schedule
+-- Create a stream table with 1-minute schedule (DIFFERENTIAL mode)
 SELECT pgtrickle.create_stream_table(
     'regional_totals',
     'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
@@ -175,7 +180,16 @@ SELECT pgtrickle.create_stream_table(
     'DIFFERENTIAL'
 );
 
--- Or use a cron schedule (e.g., every hour)
+-- Or use IMMEDIATE mode: updated within the same transaction as DML
+SELECT pgtrickle.create_stream_table(
+    'regional_totals_live',
+    'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+     FROM orders GROUP BY region',
+    NULL,          -- no schedule needed
+    'IMMEDIATE'
+);
+
+-- Or use a cron schedule with FULL refresh
 SELECT pgtrickle.create_stream_table(
     'hourly_totals',
     'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
@@ -236,8 +250,9 @@ The following SQL features are **rejected with clear error messages** explaining
 | Materialized views in DIFFERENTIAL | CDC triggers cannot track `REFRESH MATERIALIZED VIEW` | Use the underlying query directly, or use FULL mode |
 | `TABLESAMPLE` | Stream tables materialize the complete result set; sampling at define-time is not meaningful | Use `WHERE random() < fraction` in the consuming query |
 | Window functions in expressions | Window functions inside `CASE`, `COALESCE`, arithmetic, etc. cannot be differentially maintained | Move window function to a separate column |
-| `LIMIT` / `OFFSET` | Stream tables materialize the full result set | Apply when querying the stream table |
+| `LIMIT` / `OFFSET` without `ORDER BY` | Stream tables materialize the full result set; arbitrary row subsets are non-deterministic | Use `ORDER BY ... LIMIT N` for TopK, or apply LIMIT when querying the stream table |
 | `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
+| Recursive CTEs in IMMEDIATE mode | Semi-naive fixpoint iteration not validated with transition tables | Use DIFFERENTIAL mode for recursive CTEs |
 
 ### Stream Table Restrictions
 
@@ -257,6 +272,8 @@ See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#re
 
 ## How It Works
 
+### DIFFERENTIAL / FULL Mode (scheduled)
+
 1. **Create** — `pgtrickle.create_stream_table()` parses the defining query into an operator tree, creates a storage table, installs lightweight CDC triggers on source tables, and registers the ST in the catalog.
 
 2. **Capture** — Changes to base tables are captured via the hybrid CDC layer. By default, `AFTER INSERT/UPDATE/DELETE` row-level triggers write to per-source change buffer tables in the `pgtrickle_changes` schema. With `pg_trickle.cdc_mode = 'auto'`, the system transitions to WAL-based capture (logical replication) after the first successful refresh for lower write-side overhead.
@@ -268,6 +285,17 @@ See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#re
 5. **Apply** — The delta query is executed and its results (INSERT/DELETE actions with row IDs) are merged into the storage table.
 
 6. **Version** — Each refresh records a frontier (per-source LSN positions) and a data timestamp, implementing a simplified Data Versioning System (DVS).
+
+### IMMEDIATE Mode (transactional)
+
+When `refresh_mode = 'IMMEDIATE'`, the stream table is maintained **within the same transaction** as the base table DML:
+
+1. **BEFORE triggers** acquire an advisory lock on the stream table.
+2. **AFTER triggers** (with `REFERENCING NEW TABLE AS ... OLD TABLE AS ...`) copy transition tables to temp tables.
+3. The DVM engine computes the delta from the transition tables (via `DeltaSource::TransitionTable`).
+4. The delta is applied to the stream table via DELETE + INSERT ON CONFLICT.
+
+No change buffer tables, no scheduler, no WAL infrastructure. The stream table is always up-to-date within the current transaction.
 
 ## Architecture
 
@@ -300,7 +328,7 @@ See [SQL Reference — Restrictions & Interoperability](docs/SQL_REFERENCE.md#re
 │       │                                     │
 │  ┌────▼─────────────────────────────┐       │
 │  │     Refresh Executor             │       │
-│  │     Full / Differential          │       │
+│  │  Full / Differential / Immediate │       │
 │  └────┬─────────────────────────────┘       │
 │       │                                     │
 │  ┌────▼─────────────────────────────┐       │
@@ -329,7 +357,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** ~963 unit tests + 32 integration tests + 34 E2E test suites (~460 E2E tests).
+**Test counts:** ~992 unit tests + 32 integration tests + 40+ E2E test suites (~510 E2E tests).
 
 ### Code Coverage
 
