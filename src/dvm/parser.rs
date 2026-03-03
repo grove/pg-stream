@@ -1611,40 +1611,88 @@ pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgTrickleErr
 /// Look up the volatility category of a PostgreSQL operator by name.
 ///
 /// Joins `pg_operator` → `pg_proc` via `oprcode` to get the implementing
-/// function's `provolatile`. Returns the worst volatility across all
-/// overloads of the operator name (e.g., `+` for int, float, numeric).
+/// function's `provolatile`.
+///
+/// **Overload disambiguation:** Many operators (`+`, `-`, `||`, etc.) have
+/// overloads spanning different type categories. For example, `+` is
+/// immutable for `int4 + int4` but stable for `timestamp + interval`
+/// (timezone-dependent), and `||` is immutable for `text || text` but
+/// stable for `textanycat(text, anynonarray)`. Without argument-type
+/// resolution we cannot determine which overload applies.
+///
+/// To avoid false "stable" warnings on expressions like `depth + 1` or
+/// `path || '>'`, we first compute the worst volatility across
+/// **concrete non-temporal** overloads (those whose left AND right operand
+/// types are neither date/time category `'D'` nor pseudo-type category
+/// `'P'`). If at least one such overload exists, we return that result.
+/// Only when ALL overloads involve temporal or pseudo-types do we fall
+/// back to the worst across all overloads.
 ///
 /// Returns `'i'` if the operator is not found — all built-in operators
 /// (arithmetic, comparison, logical) are immutable. Unknown operators
-/// default to 'i' because operator-not-found typically means the query
+/// default to `'i'` because operator-not-found typically means the query
 /// would fail anyway; the volatile/stable cases arise only with custom
 /// operators that DO exist in `pg_operator`.
 ///
 /// Closes Gap G7.2: custom operators with volatile `oprcode` functions
-/// (e.g., PostGIS `&&` or user-defined operators) are now detected.
+/// (e.g., PostGIS `&&` or user-defined operators) are still detected.
 #[cfg(not(test))]
 pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgTrickleError> {
     Spi::connect(|client| {
         let result = client.select(
-            "SELECT p.provolatile::text \
+            "SELECT p.provolatile::text AS vol, \
+                    COALESCE(tl.typcategory, 'X') AS lcat, \
+                    COALESCE(tr.typcategory, 'X') AS rcat \
              FROM pg_catalog.pg_operator o \
              JOIN pg_catalog.pg_proc p ON o.oprcode = p.oid \
+             LEFT JOIN pg_catalog.pg_type tl ON o.oprleft = tl.oid \
+             LEFT JOIN pg_catalog.pg_type tr ON o.oprright = tr.oid \
              WHERE o.oprname = $1",
             None,
             &[op_name.into()],
         )?;
 
-        let mut worst = 'i';
+        let mut worst_all = 'i';
+        let mut worst_concrete = 'i';
+        let mut has_concrete = false;
+
         for row in result {
             let vol: String = row
-                .get_by_name::<String, _>("provolatile")
+                .get_by_name::<String, _>("vol")
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "i".to_string());
+            let lcat: String = row
+                .get_by_name::<String, _>("lcat")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "X".to_string());
+            let rcat: String = row
+                .get_by_name::<String, _>("rcat")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "X".to_string());
+
             let ch = vol.chars().next().unwrap_or('i');
-            worst = max_volatility(worst, ch);
+            worst_all = max_volatility(worst_all, ch);
+
+            // Exclude overloads with temporal (D) or pseudo-type (P)
+            // arguments — these cause false positives when the actual
+            // resolved overload uses concrete non-temporal types.
+            let lc = lcat.chars().next().unwrap_or('X');
+            let rc = rcat.chars().next().unwrap_or('X');
+            if lc != 'D' && lc != 'P' && rc != 'D' && rc != 'P' {
+                has_concrete = true;
+                worst_concrete = max_volatility(worst_concrete, ch);
+            }
         }
-        Ok(worst)
+
+        // Prefer concrete non-temporal overloads when available.
+        Ok(if has_concrete {
+            worst_concrete
+        } else {
+            worst_all
+        })
     })
     .map_err(|e: pgrx::spi::SpiError| {
         PgTrickleError::SpiError(format!("operator volatility lookup failed: {e}"))
@@ -1652,7 +1700,9 @@ pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgTrickleError>
 }
 
 /// Test-only stub: SPI is unavailable in unit tests, so assume immutable
-/// for operators (most built-in operators are immutable).
+/// for operators (most built-in operators are immutable). In the real
+/// implementation, temporal/pseudo-type overloads are filtered out to avoid
+/// false stable warnings — see the `#[cfg(not(test))]` variant.
 #[cfg(test)]
 pub fn lookup_operator_volatility(_op_name: &str) -> Result<char, PgTrickleError> {
     Ok('i')
