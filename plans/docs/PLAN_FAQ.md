@@ -1,16 +1,19 @@
 # Plan: FAQ Expansion
 
 Date: 2026-03-03
-Status: PROPOSED
+Status: IMPLEMENTED
 
 ---
 
 ## Overview
 
-This plan proposes expanding the FAQ (`docs/FAQ.md`) with additional questions
-that users of pg_trickle are likely to ask. The current FAQ covers 63 questions
-across 13 sections. This plan proposes **78 new questions** grouped into 16
-categories, each with a unique identifier and a priority ranking.
+This plan proposed expanding the FAQ (`docs/FAQ.md`) with additional questions
+that users of pg_trickle are likely to ask. The original FAQ covered 63 questions
+across 13 sections. After implementation, the FAQ now contains **158 questions**
+across **24 sections** (~2066 lines).
+
+**All 94 proposed questions have been implemented** (78 net-new + 16 overlapping
+entries expanded/cross-linked within existing sections).
 
 ### Priority Key
 
@@ -235,25 +238,25 @@ Recursive CTE support is a differentiator — document it well.
 
 ## Summary
 
-| Category | Count | P1 | P2 | P3 |
-|----------|------:|---:|---:|---:|
-| Getting Started / Conceptual | 9 | 4 | 3 | 2 |
-| Data Freshness & Consistency | 6 | 3 | 2 | 1 |
-| IMMEDIATE Mode | 8 | 3 | 4 | 1 |
-| CDC — Triggers vs. WAL | 7 | 2 | 3 | 2 |
-| Aggregates & Group-By | 5 | 2 | 2 | 1 |
-| Joins | 4 | 1 | 2 | 1 |
-| CTEs & Recursive Queries | 4 | 1 | 2 | 1 |
-| Window Functions & LATERAL | 4 | 0 | 3 | 1 |
-| TopK (ORDER BY … LIMIT) | 4 | 1 | 2 | 1 |
-| Tables Without Primary Keys | 3 | 1 | 1 | 1 |
-| Diamond Dependencies & DAG | 5 | 0 | 3 | 2 |
-| Schema Changes & DDL Events | 6 | 2 | 3 | 1 |
-| Performance & Sizing | 7 | 2 | 3 | 2 |
-| dbt Integration | 7 | 2 | 3 | 2 |
-| Deployment & Operations | 8 | 2 | 4 | 2 |
-| Error Recovery & Debugging | 7 | 2 | 3 | 2 |
-| **Total** | **94** | **28** | **43** | **23** |
+| Category | Count | P1 | P2 | P3 | Status |
+|----------|------:|---:|---:|---:|--------|
+| Getting Started / Conceptual | 9 | 4 | 3 | 2 | ✅ Implemented |
+| Data Freshness & Consistency | 6 | 3 | 2 | 1 | ✅ Implemented |
+| IMMEDIATE Mode | 8 | 3 | 4 | 1 | ✅ Implemented |
+| CDC — Triggers vs. WAL | 7 | 2 | 3 | 2 | ✅ Implemented |
+| Aggregates & Group-By | 5 | 2 | 2 | 1 | ✅ Implemented |
+| Joins | 4 | 1 | 2 | 1 | ✅ Implemented |
+| CTEs & Recursive Queries | 4 | 1 | 2 | 1 | ✅ Implemented |
+| Window Functions & LATERAL | 4 | 0 | 3 | 1 | ✅ Implemented |
+| TopK (ORDER BY … LIMIT) | 4 | 1 | 2 | 1 | ✅ Implemented |
+| Tables Without Primary Keys | 3 | 1 | 1 | 1 | ✅ Implemented |
+| Diamond Dependencies & DAG | 5 | 0 | 3 | 2 | ✅ Implemented |
+| Schema Changes & DDL Events | 6 | 2 | 3 | 1 | ✅ Implemented |
+| Performance & Sizing | 7 | 2 | 3 | 2 | ✅ Implemented |
+| dbt Integration | 7 | 2 | 3 | 2 | ✅ Implemented |
+| Deployment & Operations | 8 | 2 | 4 | 2 | ✅ Implemented |
+| Error Recovery & Debugging | 7 | 2 | 3 | 2 | ✅ Implemented |
+| **Total** | **94** | **28** | **43** | **23** | **All done** |
 
 ---
 
