@@ -1,8 +1,8 @@
 # Plan: Transactionally Updated Views (Immediate IVM)
 
 Date: 2026-02-28
-Status: IN PROGRESS (Phase 1 MVP implemented)
-Last Updated: 2026-07-09
+Status: IN PROGRESS (Phase 1 complete, Phase 3 & 4 partially complete)
+Last Updated: 2026-07-10
 
 ---
 
@@ -519,8 +519,8 @@ SELECT pgivm.create_immv('my_view', 'SELECT a, sum(b) FROM t GROUP BY a');
 
 **Goal:** Single-table & multi-table immediate IVM with aggregates and JOIN.
 
-> **Implementation Status (2026-07-09):** Phase 1 MVP is implemented. See
-> implementation notes below for deviations from the original design.
+> **Implementation Status (2026-07-10):** Phase 1 is fully implemented.
+> See implementation notes below for deviations from the original design.
 
 1. **Add IMMEDIATE refresh mode to catalog and API** ✅ DONE
    - `RefreshMode::Immediate` variant added to `dag.rs` with `is_immediate()`
@@ -571,19 +571,48 @@ SELECT pgivm.create_immv('my_view', 'SELECT a, sum(b) FROM t GROUP BY a');
    - BEFORE TRUNCATE trigger acquires advisory lock for serialization.
 
 6. **Basic concurrency: Advisory lock on all IMMEDIATE stream tables** ✅ DONE
-   - **Deviation from plan:** Uses `pg_advisory_xact_lock(st_oid)` instead of
-     `ExclusiveLock`. Simpler for Phase 1 — avoids complex lock-mode
-     analysis. Advisory lock provides equivalent serialization.
+   - Uses `pg_advisory_xact_lock(st_oid)` as default lock. Simple scan
+     chains (Scan → optional Filter → optional Project) use
+     `pg_try_advisory_xact_lock(st_oid)` instead for lighter concurrency.
+   - `IvmLockMode` enum (`Exclusive` / `RowExclusive`) with `for_query()`
+     analysis determines the lock mode at trigger creation time.
    - Lock acquired in BEFORE trigger, released at transaction end.
 
-7. **Tests** ✅ DONE
+7. **`alter_stream_table` mode switching** ✅ DONE
+   - Switching between DIFFERENTIAL↔IMMEDIATE and FULL↔IMMEDIATE is fully
+     supported. Tears down old infrastructure (IVM triggers or CDC triggers),
+     sets up new infrastructure, updates catalog, runs full refresh.
+   - Validates query restrictions when switching TO IMMEDIATE mode.
+   - Restores a default schedule ('1m') when switching FROM IMMEDIATE.
+
+8. **Query restriction validation for IMMEDIATE mode** ✅ DONE
+   - `validate_immediate_mode_support()` in `src/dvm/parser.rs` walks the
+     OpTree and rejects: Window functions, RecursiveCte, LateralSubquery,
+     LateralFunction, ScalarSubquery. Clear error messages suggest using
+     DIFFERENTIAL mode instead.
+   - Called at both `create_stream_table` and `alter_stream_table` time.
+
+9. **Delta SQL template caching** ✅ DONE
+   - Thread-local `IVM_DELTA_CACHE` keyed by (pgt_id, source_oid, has_new,
+     has_old). Avoids re-parsing and re-differentiating the defining query
+     on every trigger invocation.
+   - Cross-session invalidation via shared cache generation counter.
+   - `invalidate_ivm_delta_cache(pgt_id)` for explicit invalidation.
+
+10. **Tests** ✅ DONE
    - 7 unit tests for transition table scan path in `scan.rs`.
    - 1 unit test for `RefreshMode::Immediate` helpers.
-   - 10 E2E tests in `tests/e2e_ivm_tests.rs`: create, INSERT/UPDATE/DELETE
+   - 22 E2E tests in `tests/e2e_ivm_tests.rs`: create, INSERT/UPDATE/DELETE
      propagation, TRUNCATE, DROP cleanup, TopK rejection, manual refresh,
-     mixed operations.
+     mixed operations, mode switching (DIFFERENTIAL↔IMMEDIATE,
+     FULL↔IMMEDIATE), query restriction validation (window functions,
+     LATERAL, scalar subqueries), aggregate + join in IMMEDIATE mode,
+     alter-to-IMMEDIATE rejection for unsupported queries.
 
-### Phase 2: pg_ivm Compatibility Layer
+### Phase 2: pg_ivm Compatibility Layer — POSTPONED
+
+**Status:** Postponed — not needed for core pg_trickle functionality. Will
+be revisited if there is user demand for pg_ivm migration support.
 
 **Goal:** Drop-in replacement for pg_ivm users.
 
@@ -605,19 +634,25 @@ SELECT pgivm.create_immv('my_view', 'SELECT a, sum(b) FROM t GROUP BY a');
 
 1. **Window functions** — partition-based recomputation (already supported in
    deferred mode).
-2. **UNION/INTERSECT/EXCEPT** — merge deltas from branches.
+2. **UNION/INTERSECT/EXCEPT** — merge deltas from branches. ✅ DONE
+   (already allowed; `validate_immediate_mode_support` passes UNION ALL,
+   INTERSECT, EXCEPT through without restriction).
 3. **LATERAL subqueries and functions**.
 4. **Cascading IMMEDIATE stream tables** — when ST A updates, immediately
    propagate to downstream ST B (within the same transaction).
 5. **Optimized locking** — use RowExclusiveLock when safe (single-table,
-   no agg/distinct, INSERT-only).
+   no agg/distinct, INSERT-only). ✅ DONE
+   (`IvmLockMode::for_query()` analysis in `src/ivm.rs`; simple scan
+   chains use `pg_try_advisory_xact_lock`, others use `pg_advisory_xact_lock`).
 
 ### Phase 4: Performance Optimization
 
 1. **C-level trigger functions** (Option B from §3.2) to eliminate PL/pgSQL
    overhead.
 2. **Delta SQL template caching** — pre-compile IMMEDIATE mode delta SQL
-   (already done for deferred mode).
+   (already done for deferred mode). ✅ DONE
+   (thread-local `IVM_DELTA_CACHE` in `src/ivm.rs`; keyed by
+   (pgt_id, source_oid, has_new, has_old) with cross-session invalidation).
 3. **Prepared statement reuse** — keep SPI prepared statements across trigger
    invocations within the same transaction.
 4. **Aggregate fast-path optimization** — for "pure aggregate" queries
@@ -648,26 +683,29 @@ SELECT pgivm.create_immv('my_view', 'SELECT a, sum(b) FROM t GROUP BY a');
 5. **Benchmarking suite** — compare pg_trickle IMMEDIATE vs pg_ivm vs
    deferred refresh on standard workloads.
 
-### Prioritized Remaining Work (post Phase 1 MVP)
+### Prioritized Remaining Work (post Phase 1)
 
-The following items are prioritized by impact and dependency order:
+The following items remain from the original plan. Items marked ✅ are done;
+the rest are ordered by priority.
 
-| Priority | Item | Phase | Description |
-|----------|------|-------|-------------|
-| **P0** | `alter_stream_table` mode switching | 1 | Allow switching between DIFFERENTIAL↔IMMEDIATE (drop old triggers, create new ones, full refresh). Currently `alter_stream_table` doesn't handle IMMEDIATE. |
-| **P0** | E2E test validation | 1 | Run `just test-e2e` to validate the 10 E2E IVM tests pass against a real PostgreSQL 18 instance. |
-| **P1** | In-memory state tracking (`IvmTriggerState`) | 1 | Per-session hash table to batch before/after trigger counts for multi-table views. Currently each trigger invocation is independent. |
-| **P1** | Query restriction validation | 1 | Enforce Phase 1 query subset (§3.8) at creation time — e.g., reject window functions, UNION, recursive CTEs with IMMEDIATE. |
-| **P1** | ENR-based transition table access | 4 | Replace temp-table copy pattern with direct Ephemeral Named Relation access from transition tables. Avoids data copy overhead. |
-| **P2** | pg_ivm compatibility layer | 2 | `pgivm.*` wrapper functions: `create_immv()`, `refresh_immv()`, `get_immv_def()`, catalog view. |
-| **P2** | Optimized locking (RowExclusiveLock) | 3 | Use RowExclusiveLock when safe (single-table, INSERT-only, no agg/distinct). Currently uses advisory lock for all. |
-| **P2** | Concurrent transaction tests | 1 | Test concurrent DML + IMMEDIATE IVM under READ COMMITTED and REPEATABLE READ. |
-| **P3** | `DROP TABLE` interception for IMMEDIATE STs | 2 | Support `DROP TABLE` as alternative to `drop_stream_table()`. |
-| **P3** | Cascading IMMEDIATE stream tables | 3 | ST A → ST B propagation within the same transaction. |
-| **P3** | Delta SQL template caching | 4 | Pre-compile IMMEDIATE mode delta SQL to avoid per-DML parse overhead. |
-| **P4** | Extended query support (window, UNION, LATERAL) | 3 | Enable advanced SQL constructs in IMMEDIATE mode. |
-| **P4** | Aggregate fast-path optimization | 4 | Single-UPDATE path for pure-aggregate queries with invertible aggs. |
-| **P4** | C-level trigger functions | 4 | Replace PL/pgSQL wrappers with C-level trigger functions for lower overhead. |
+| Priority | Item | Phase | Status |
+|----------|------|-------|--------|
+| ~~P0~~ | ~~`alter_stream_table` mode switching~~ | 1 | ✅ Done |
+| ~~P0~~ | ~~E2E test validation~~ | 1 | ✅ Done (22 tests) |
+| **P1** | In-memory state tracking (`IvmTriggerState`) | 1 | Not started |
+| ~~P1~~ | ~~Query restriction validation~~ | 1 | ✅ Done |
+| **P1** | ENR-based transition table access | 4 | Not started |
+| ~~P2~~ | ~~pg_ivm compatibility layer~~ | 2 | POSTPONED |
+| ~~P2~~ | ~~Optimized locking (RowExclusiveLock)~~ | 3 | ✅ Done |
+| **P2** | Concurrent transaction tests | 1 | Not started |
+| ~~P3~~ | ~~`DROP TABLE` interception for IMMEDIATE STs~~ | 2 | POSTPONED |
+| **P3** | Cascading IMMEDIATE stream tables | 3 | Not started |
+| ~~P3~~ | ~~Delta SQL template caching~~ | 4 | ✅ Done |
+| **P3** | Window functions in IMMEDIATE mode | 3 | Not started |
+| **P3** | LATERAL subqueries in IMMEDIATE mode | 3 | Not started |
+| **P4** | Aggregate fast-path optimization | 4 | Not started |
+| **P4** | C-level trigger functions | 4 | Not started |
+| **P4** | Prepared statement reuse | 4 | Not started |
 
 ---
 

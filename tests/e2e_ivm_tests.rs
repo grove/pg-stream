@@ -296,3 +296,329 @@ async fn test_ivm_mixed_operations_in_sequence() {
         .await;
     assert_eq!(db.count("public.acct_imm").await, 2);
 }
+
+// ── Mode Switching (alter_stream_table) ────────────────────────────────
+
+#[tokio::test]
+async fn test_ivm_alter_differential_to_immediate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sw_d2i (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO sw_d2i VALUES (1, 'a'), (2, 'b')")
+        .await;
+
+    // Start as DIFFERENTIAL.
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('sw_d2i_st', \
+         $$SELECT id, val FROM sw_d2i$$, '5m', 'DIFFERENTIAL')",
+    )
+    .await;
+
+    let (_, mode, _, _) = db.pgt_status("sw_d2i_st").await;
+    assert_eq!(mode, "DIFFERENTIAL");
+
+    // Switch to IMMEDIATE.
+    db.alter_st("sw_d2i_st", "refresh_mode => 'IMMEDIATE'")
+        .await;
+
+    let (status, mode, populated, _) = db.pgt_status("sw_d2i_st").await;
+    assert_eq!(mode, "IMMEDIATE");
+    assert_eq!(status, "ACTIVE");
+    assert!(populated, "ST should be populated after mode switch");
+
+    // Verify existing data is intact.
+    assert_eq!(db.count("public.sw_d2i_st").await, 2);
+
+    // Verify IVM triggers are active — INSERT should propagate immediately.
+    db.execute("INSERT INTO sw_d2i VALUES (3, 'c')").await;
+    assert_eq!(
+        db.count("public.sw_d2i_st").await,
+        3,
+        "INSERT should propagate immediately after switch to IMMEDIATE"
+    );
+}
+
+#[tokio::test]
+async fn test_ivm_alter_immediate_to_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sw_i2d (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO sw_i2d VALUES (1, 'x')").await;
+
+    create_immediate_st(&db, "sw_i2d_st", "SELECT id, val FROM sw_i2d").await;
+
+    let (_, mode, _, _) = db.pgt_status("sw_i2d_st").await;
+    assert_eq!(mode, "IMMEDIATE");
+
+    // Switch to DIFFERENTIAL with a schedule.
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('sw_i2d_st', \
+         refresh_mode => 'DIFFERENTIAL', schedule => '10m')",
+    )
+    .await;
+
+    let (status, mode, populated, _) = db.pgt_status("sw_i2d_st").await;
+    assert_eq!(mode, "DIFFERENTIAL");
+    assert_eq!(status, "ACTIVE");
+    assert!(populated, "ST should remain populated after mode switch");
+    assert_eq!(db.count("public.sw_i2d_st").await, 1);
+
+    // IVM triggers should be gone — INSERT should NOT propagate immediately.
+    db.execute("INSERT INTO sw_i2d VALUES (2, 'y')").await;
+    assert_eq!(
+        db.count("public.sw_i2d_st").await,
+        1,
+        "INSERT should NOT propagate in DIFFERENTIAL mode"
+    );
+}
+
+#[tokio::test]
+async fn test_ivm_alter_full_to_immediate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sw_f2i (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO sw_f2i VALUES (1, 'p'), (2, 'q')")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('sw_f2i_st', \
+         $$SELECT id, val FROM sw_f2i$$, '5m', 'FULL')",
+    )
+    .await;
+
+    let (_, mode, _, _) = db.pgt_status("sw_f2i_st").await;
+    assert_eq!(mode, "FULL");
+
+    // Switch to IMMEDIATE.
+    db.alter_st("sw_f2i_st", "refresh_mode => 'IMMEDIATE'")
+        .await;
+
+    let (_, mode, populated, _) = db.pgt_status("sw_f2i_st").await;
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(populated);
+    assert_eq!(db.count("public.sw_f2i_st").await, 2);
+
+    // Verify IVM triggers are active.
+    db.execute("INSERT INTO sw_f2i VALUES (3, 'r')").await;
+    assert_eq!(db.count("public.sw_f2i_st").await, 3);
+}
+
+#[tokio::test]
+async fn test_ivm_alter_immediate_to_full() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sw_i2f (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO sw_i2f VALUES (1, 'z')").await;
+
+    create_immediate_st(&db, "sw_i2f_st", "SELECT id, val FROM sw_i2f").await;
+
+    // Switch to FULL.
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('sw_i2f_st', \
+         refresh_mode => 'FULL', schedule => '5m')",
+    )
+    .await;
+
+    let (_, mode, _, _) = db.pgt_status("sw_i2f_st").await;
+    assert_eq!(mode, "FULL");
+
+    // IVM triggers should be removed — manual INSERT shouldn't propagate.
+    db.execute("INSERT INTO sw_i2f VALUES (2, 'w')").await;
+    assert_eq!(
+        db.count("public.sw_i2f_st").await,
+        1,
+        "INSERT should NOT propagate in FULL mode"
+    );
+}
+
+// ── IMMEDIATE Query Restriction Validation ─────────────────────────────
+
+#[tokio::test]
+async fn test_ivm_reject_window_function_immediate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE win_src (id INT PRIMARY KEY, val INT, grp TEXT)")
+        .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('win_imm', \
+             $$SELECT id, val, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM win_src$$, \
+             NULL, 'IMMEDIATE')",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Window functions should be rejected in IMMEDIATE mode"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Window") || err_msg.contains("window") || err_msg.contains("IMMEDIATE"),
+        "Error should mention window functions or IMMEDIATE mode: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ivm_reject_lateral_join_immediate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE lat_parent (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("CREATE TABLE lat_child (id INT PRIMARY KEY, parent_id INT, score INT)")
+        .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('lat_imm', \
+             $$SELECT p.id, t.score FROM lat_parent p, \
+             LATERAL (SELECT score FROM lat_child c WHERE c.parent_id = p.id ORDER BY score DESC LIMIT 1) t$$, \
+             NULL, 'IMMEDIATE')",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "LATERAL joins should be rejected in IMMEDIATE mode"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("LATERAL") || err_msg.contains("lateral") || err_msg.contains("IMMEDIATE"),
+        "Error should mention LATERAL or IMMEDIATE mode: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ivm_reject_scalar_subquery_immediate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE ssq_main (id INT PRIMARY KEY, cat TEXT)")
+        .await;
+    db.execute("CREATE TABLE ssq_counts (cat TEXT PRIMARY KEY, cnt INT)")
+        .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('ssq_imm', \
+             $$SELECT id, cat, (SELECT cnt FROM ssq_counts sc WHERE sc.cat = m.cat) AS cat_count FROM ssq_main m$$, \
+             NULL, 'IMMEDIATE')",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Scalar subqueries should be rejected in IMMEDIATE mode"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("subquer") || err_msg.contains("IMMEDIATE"),
+        "Error should mention scalar subqueries or IMMEDIATE mode: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_ivm_allow_aggregate_in_immediate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE agg_src (id INT PRIMARY KEY, category TEXT, amount NUMERIC)")
+        .await;
+    db.execute("INSERT INTO agg_src VALUES (1, 'A', 10), (2, 'B', 20), (3, 'A', 30)")
+        .await;
+
+    // Aggregates should be allowed in IMMEDIATE mode.
+    create_immediate_st(
+        &db,
+        "agg_imm",
+        "SELECT category, SUM(amount) AS total FROM agg_src GROUP BY category",
+    )
+    .await;
+
+    let (_, mode, populated, _) = db.pgt_status("agg_imm").await;
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(populated);
+
+    let count = db.count("public.agg_imm").await;
+    assert_eq!(count, 2, "Should have 2 groups (A, B)");
+
+    // INSERT should propagate and update aggregate.
+    db.execute("INSERT INTO agg_src VALUES (4, 'A', 40)").await;
+
+    let total_a: String = db
+        .query_scalar("SELECT total::text FROM public.agg_imm WHERE category = 'A'")
+        .await;
+    assert_eq!(total_a, "80", "SUM for category A should be 10+30+40=80");
+}
+
+#[tokio::test]
+async fn test_ivm_allow_join_in_immediate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE join_left (id INT PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute("CREATE TABLE join_right (id INT PRIMARY KEY, left_id INT, val INT)")
+        .await;
+    db.execute("INSERT INTO join_left VALUES (1, 'Alpha'), (2, 'Beta')")
+        .await;
+    db.execute("INSERT INTO join_right VALUES (1, 1, 100), (2, 2, 200)")
+        .await;
+
+    // Joins should be allowed in IMMEDIATE mode.
+    create_immediate_st(
+        &db,
+        "join_imm",
+        "SELECT l.id, l.name, r.val FROM join_left l INNER JOIN join_right r ON r.left_id = l.id",
+    )
+    .await;
+
+    let (_, mode, populated, _) = db.pgt_status("join_imm").await;
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(populated);
+    assert_eq!(db.count("public.join_imm").await, 2);
+
+    // INSERT into right table should propagate.
+    db.execute("INSERT INTO join_right VALUES (3, 1, 300)")
+        .await;
+    assert_eq!(
+        db.count("public.join_imm").await,
+        3,
+        "Join ST should have 3 rows after INSERT into right table"
+    );
+}
+
+// ── Alter Mode Switching Validation ────────────────────────────────────
+
+#[tokio::test]
+async fn test_ivm_alter_to_immediate_rejects_window() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sw_rej (id INT PRIMARY KEY, val INT, grp TEXT)")
+        .await;
+
+    // Create as DIFFERENTIAL with a window function query.
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('sw_rej_st', \
+         $$SELECT id, val, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM sw_rej$$, \
+         '5m', 'DIFFERENTIAL')",
+    )
+    .await;
+
+    // Attempt to switch to IMMEDIATE — should be rejected.
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.alter_stream_table('sw_rej_st', refresh_mode => 'IMMEDIATE')",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Switching a window-function ST to IMMEDIATE should be rejected"
+    );
+
+    // Verify mode didn't change.
+    let (_, mode, _, _) = db.pgt_status("sw_rej_st").await;
+    assert_eq!(mode, "DIFFERENTIAL", "Mode should remain DIFFERENTIAL");
+}

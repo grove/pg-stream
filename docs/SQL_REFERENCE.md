@@ -577,7 +577,7 @@ pgtrickle.alter_stream_table(
 |---|---|---|---|
 | `name` | `text` | — | Name of the stream table (schema-qualified or unqualified). |
 | `schedule` | `text` | `NULL` | New schedule as a duration string (e.g., `'5m'`). Pass `NULL` to leave unchanged. |
-| `refresh_mode` | `text` | `NULL` | New refresh mode (`'FULL'` or `'DIFFERENTIAL'`). Pass `NULL` to leave unchanged. |
+| `refresh_mode` | `text` | `NULL` | New refresh mode (`'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`). Pass `NULL` to leave unchanged. Switching to/from `'IMMEDIATE'` migrates trigger infrastructure (IVM triggers ↔ CDC triggers), clears or restores the schedule, and runs a full refresh. |
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
 | `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |
 | `diamond_schedule_policy` | `text` | `NULL` | New schedule policy for atomic diamond groups (`'fastest'` or `'slowest'`). Pass `NULL` to leave unchanged. |
@@ -590,6 +590,13 @@ SELECT pgtrickle.alter_stream_table('order_totals', schedule => '5m');
 
 -- Switch to full refresh mode
 SELECT pgtrickle.alter_stream_table('order_totals', refresh_mode => 'FULL');
+
+-- Switch to immediate (transactional) mode — installs IVM triggers, clears schedule
+SELECT pgtrickle.alter_stream_table('order_totals', refresh_mode => 'IMMEDIATE');
+
+-- Switch from immediate back to differential — re-creates CDC triggers, restores schedule
+SELECT pgtrickle.alter_stream_table('order_totals',
+    refresh_mode => 'DIFFERENTIAL', schedule => '5m');
 
 -- Suspend a stream table
 SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');
@@ -1276,6 +1283,33 @@ SELECT pgtrickle.create_stream_table('order_summary',
 ```
 
 > **Note:** pg_trickle targets PostgreSQL 18. On PostgreSQL 12 or earlier (not supported), parent triggers do **not** fire for partition-routed rows, which would cause silent data loss.
+
+### IMMEDIATE Mode Query Restrictions
+
+The `'IMMEDIATE'` refresh mode supports a subset of the SQL constructs supported by `'DIFFERENTIAL'` and `'FULL'` modes. Queries are validated at stream table creation and when switching to IMMEDIATE mode via `alter_stream_table`.
+
+**Supported in IMMEDIATE mode:**
+
+- Simple `SELECT ... FROM table` scans, filters, projections
+- `JOIN` (INNER, LEFT, FULL OUTER)
+- `GROUP BY` with standard aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, etc.)
+- `DISTINCT`
+- Non-recursive `WITH` (CTEs)
+- `UNION ALL`, `INTERSECT`, `EXCEPT`
+- `EXISTS` / `IN` subqueries (`SemiJoin`, `AntiJoin`)
+- Subqueries in `FROM`
+
+**Not yet supported in IMMEDIATE mode** (use `'DIFFERENTIAL'` instead):
+
+| Construct | Reason |
+|-----------|--------|
+| Window functions (`ROW_NUMBER`, `RANK`, etc.) | Partition-based recomputation not validated with transition tables |
+| Recursive CTEs (`WITH RECURSIVE`) | Semi-naive evaluation not yet implemented |
+| `LATERAL` subqueries | Row-scoped recomputation not yet implemented |
+| `LATERAL` set-returning functions (`unnest()`, `jsonb_array_elements()`, etc.) | Row-scoped recomputation not yet implemented |
+| Scalar subqueries in `SELECT` | Correlated subquery delta not yet implemented |
+
+Attempting to create or switch to IMMEDIATE mode with an unsupported construct produces a clear error message suggesting `'DIFFERENTIAL'` mode.
 
 ### Logical Replication Targets
 

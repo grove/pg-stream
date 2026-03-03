@@ -26,15 +26,128 @@
 //! 4. **Delta application** uses the same explicit DML path (DELETE +
 //!    UPDATE + INSERT) as the deferred mode's user-trigger path.
 //!
-//! ## Phase 1 Limitations
+//! ## Current Limitations
 //!
-//! - Only `ExclusiveLock` (no row-level locking optimization).
 //! - No cascading IVM (stream table depending on another stream table).
 //! - TRUNCATE causes a full refresh of the stream table.
 //! - No ENR-based access (uses temp tables instead for simplicity).
+//! - Window functions, recursive CTEs, LATERAL joins, and scalar subqueries
+//!   are not yet supported in IMMEDIATE mode.
 
 use crate::error::PgTrickleError;
 use pgrx::prelude::*;
+
+// ── Lock Mode Analysis ─────────────────────────────────────────────────
+
+/// The type of lock acquired by BEFORE triggers on the stream table.
+///
+/// Determines the concurrency strategy for IMMEDIATE mode:
+/// - `Exclusive` — advisory lock prevents all concurrent IVM updates.
+///   Required for queries with aggregates, DISTINCT, or multi-table joins
+///   where concurrent modifications could produce incorrect results.
+/// - `RowExclusive` — lighter lock allowing concurrent inserts to proceed
+///   in parallel when safe. Suitable for simple single-table SELECT queries
+///   without aggregates or DISTINCT, where each row_id is independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IvmLockMode {
+    /// ExclusiveLock equivalent — serializes all IVM updates.
+    Exclusive,
+    /// RowExclusiveLock equivalent — allows concurrent non-conflicting inserts.
+    RowExclusive,
+}
+
+impl IvmLockMode {
+    /// Analyze a defining query to determine the appropriate lock mode.
+    ///
+    /// Uses `RowExclusive` only when the query is a simple single-table
+    /// projection/filter without aggregates or DISTINCT. All other queries
+    /// use `Exclusive` to prevent incorrect delta computation from
+    /// concurrent modifications.
+    pub fn for_query(defining_query: &str) -> Self {
+        // Try to parse the defining query. If parsing fails, default to Exclusive.
+        let result = match crate::dvm::parse_defining_query(defining_query) {
+            Ok(tree) => tree,
+            Err(_) => return IvmLockMode::Exclusive,
+        };
+
+        if Self::is_simple_scan_chain(&result) {
+            IvmLockMode::RowExclusive
+        } else {
+            IvmLockMode::Exclusive
+        }
+    }
+
+    /// Check if an OpTree is a simple scan chain:
+    /// Scan → optional Filter → optional Project
+    /// (no joins, no aggregates, no distinct, no subqueries, etc.)
+    fn is_simple_scan_chain(tree: &crate::dvm::parser::OpTree) -> bool {
+        use crate::dvm::parser::OpTree;
+        match tree {
+            OpTree::Scan { .. } => true,
+            OpTree::Filter { child, .. } | OpTree::Project { child, .. } => {
+                Self::is_simple_scan_chain(child)
+            }
+            _ => false,
+        }
+    }
+}
+
+// ── Delta SQL Template Cache ───────────────────────────────────────────
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+/// Cache key for IVM delta templates: (pgt_id, source_oid, has_new, has_old).
+///
+/// The delta SQL varies by which transition tables are present:
+/// - INSERT: has_new=true, has_old=false
+/// - UPDATE: has_new=true, has_old=true
+/// - DELETE: has_new=false, has_old=true
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct IvmCacheKey {
+    pgt_id: i64,
+    source_oid: u32,
+    has_new: bool,
+    has_old: bool,
+}
+
+/// Cached IVM delta template — stores the pre-computed delta SQL,
+/// output columns, and the hash of the defining query for invalidation.
+#[derive(Clone)]
+struct CachedIvmDelta {
+    /// Hash of the defining query — for staleness detection.
+    defining_query_hash: u64,
+    /// Pre-computed delta SQL (references transition temp tables).
+    delta_sql: String,
+    /// User-facing column names from the delta result.
+    user_columns: Vec<String>,
+}
+
+fn hash_str(s: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
+thread_local! {
+    /// Per-session cache of IVM delta SQL templates.
+    /// Keyed by (pgt_id, source_oid, has_new, has_old).
+    /// Invalidated when the defining query hash changes or the
+    /// shared cache generation counter advances.
+    static IVM_DELTA_CACHE: RefCell<HashMap<IvmCacheKey, CachedIvmDelta>> =
+        RefCell::new(HashMap::new());
+
+    /// Local snapshot of the shared cache generation counter.
+    static LOCAL_IVM_CACHE_GEN: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Invalidate all cached IVM delta templates for a given pgt_id.
+pub fn invalidate_ivm_delta_cache(pgt_id: i64) {
+    IVM_DELTA_CACHE.with(|cache| {
+        cache.borrow_mut().retain(|k, _| k.pgt_id != pgt_id);
+    });
+}
 
 /// Install IVM triggers on a source table for an IMMEDIATE-mode stream table.
 ///
@@ -47,10 +160,12 @@ use pgrx::prelude::*;
 /// * `source_oid` — OID of the base table to install triggers on.
 /// * `pgt_id` — The stream table's `pgt_id` (catalog primary key).
 /// * `st_relid` — OID of the stream table (for locking).
+/// * `lock_mode` — The lock mode to use for BEFORE triggers.
 pub fn setup_ivm_triggers(
     source_oid: pg_sys::Oid,
     pgt_id: i64,
     st_relid: pg_sys::Oid,
+    lock_mode: IvmLockMode,
 ) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
     let st_oid_u32 = st_relid.to_u32();
@@ -64,8 +179,19 @@ pub fn setup_ivm_triggers(
             })?;
 
     // ── BEFORE triggers (statement-level) ────────────────────────────
-    // Acquire ExclusiveLock on the stream table to prevent concurrent
-    // conflicting updates. This matches pg_ivm's approach.
+    // Acquire a lock on the stream table to prevent concurrent conflicting
+    // updates. The lock mode depends on the query complexity:
+    // - Exclusive (advisory lock): for queries with aggregates, DISTINCT,
+    //   or multi-table joins where concurrent writes can conflict.
+    // - RowExclusive: for simple single-table scans where row_ids are
+    //   independent and concurrent inserts are safe.
+    let lock_body = match lock_mode {
+        IvmLockMode::Exclusive => format!("PERFORM pg_advisory_xact_lock({st_oid_u32}::BIGINT);"),
+        IvmLockMode::RowExclusive => {
+            format!("PERFORM pg_try_advisory_xact_lock({st_oid_u32}::BIGINT);")
+        }
+    };
+
     for op in &["INSERT", "UPDATE", "DELETE"] {
         let trigger_name = format!(
             "pgt_ivm_before_{op}_{pgt_id}",
@@ -80,9 +206,8 @@ pub fn setup_ivm_triggers(
             "CREATE OR REPLACE FUNCTION {fn_name}()
              RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN
-                 -- Acquire ExclusiveLock on the stream table to prevent
-                 -- concurrent IVM updates.
-                 PERFORM pg_advisory_xact_lock({st_oid_u32}::BIGINT);
+                 -- Lock stream table for IVM ({lock_mode:?} mode).
+                 {lock_body}
                  RETURN NULL;
              END;
              $$"
@@ -347,9 +472,11 @@ pub fn cleanup_ivm_triggers(source_relid: pg_sys::Oid, pgt_id: i64) -> Result<()
 ///
 /// This function:
 /// 1. Loads the stream table metadata from the catalog.
-/// 2. Builds a `DeltaSource::TransitionTable` with the temp table names.
-/// 3. Generates delta SQL using the DVM engine.
-/// 4. Applies the delta (DELETE + UPDATE + INSERT) to the stream table.
+/// 2. Generates (or retrieves from cache) the delta SQL using the DVM engine.
+/// 3. Applies the delta (DELETE + INSERT ON CONFLICT) to the stream table.
+///
+/// Delta SQL templates are cached per (pgt_id, source_oid, has_new, has_old)
+/// to avoid re-parsing the defining query on every trigger invocation.
 #[pg_extern(schema = "pgtrickle")]
 fn pgt_ivm_apply_delta(
     pgt_id: i64,
@@ -358,10 +485,6 @@ fn pgt_ivm_apply_delta(
     has_old: bool,
 ) -> Result<(), PgTrickleError> {
     use crate::catalog::StreamTableMeta;
-    use crate::dvm::diff::{DeltaSource, DiffContext, TransitionTableNames};
-    use crate::dvm::parser::parse_defining_query;
-    use crate::version::Frontier;
-    use std::collections::HashMap;
 
     let source_oid_u32 = source_oid as u32;
 
@@ -370,41 +493,9 @@ fn pgt_ivm_apply_delta(
         PgTrickleError::NotFound(format!("Stream table with pgt_id={pgt_id} not found"))
     })?;
 
-    // Build the OpTree from the defining query.
-    let defining_query = &st.defining_query;
-
-    let op_tree = parse_defining_query(defining_query).map_err(|e| {
-        PgTrickleError::InternalError(format!("Failed to parse defining query for IVM: {e}"))
-    })?;
-
-    // Build transition table names.
-    let mut tables = HashMap::new();
-    tables.insert(
-        source_oid_u32,
-        TransitionTableNames {
-            new_name: if has_new {
-                Some(format!("__pgt_newtable_{source_oid_u32}"))
-            } else {
-                None
-            },
-            old_name: if has_old {
-                Some(format!("__pgt_oldtable_{source_oid_u32}"))
-            } else {
-                None
-            },
-        },
-    );
-
-    // Create a DiffContext with transition table source.
-    // Frontiers are not used in transition table mode, but required by
-    // the DiffContext constructor.
-    let dummy_frontier = Frontier::default();
-    let mut ctx = DiffContext::new(dummy_frontier.clone(), dummy_frontier)
-        .with_delta_source(DeltaSource::TransitionTable { tables })
-        .with_pgt_name(&st.pgt_schema, &st.pgt_name);
-
-    // Differentiate the operator tree to get delta SQL.
-    let (delta_sql, user_columns, _is_dedup) = ctx.differentiate_with_columns(&op_tree)?;
+    // Try to get cached delta SQL template.
+    let (delta_sql, user_columns) =
+        get_or_compute_ivm_delta(pgt_id, source_oid_u32, has_new, has_old, &st)?;
 
     // Build the qualified stream table name.
     let st_qualified = format!(
@@ -483,6 +574,102 @@ fn pgt_ivm_apply_delta(
     );
 
     Ok(())
+}
+
+/// Get or compute the IVM delta SQL for a given trigger invocation.
+///
+/// Uses a thread-local cache to avoid re-parsing and re-differentiating
+/// the defining query on every trigger invocation. Cache entries are
+/// keyed by (pgt_id, source_oid, has_new, has_old) and invalidated when
+/// the defining query changes or the shared cache generation advances.
+fn get_or_compute_ivm_delta(
+    pgt_id: i64,
+    source_oid: u32,
+    has_new: bool,
+    has_old: bool,
+    st: &crate::catalog::StreamTableMeta,
+) -> Result<(String, Vec<String>), PgTrickleError> {
+    use crate::dvm::diff::{DeltaSource, DiffContext, TransitionTableNames};
+    use crate::dvm::parser::parse_defining_query;
+    use crate::version::Frontier;
+
+    let defining_query = &st.defining_query;
+    let query_hash = hash_str(defining_query);
+
+    let cache_key = IvmCacheKey {
+        pgt_id,
+        source_oid,
+        has_new,
+        has_old,
+    };
+
+    // Cross-session invalidation: flush if the shared generation counter
+    // has advanced past our local snapshot.
+    let shared_gen = crate::shmem::current_cache_generation();
+    LOCAL_IVM_CACHE_GEN.with(|local| {
+        if local.get() < shared_gen {
+            IVM_DELTA_CACHE.with(|cache| cache.borrow_mut().clear());
+            local.set(shared_gen);
+        }
+    });
+
+    // Check the thread-local cache.
+    let cached = IVM_DELTA_CACHE.with(|cache| {
+        let map = cache.borrow();
+        map.get(&cache_key)
+            .filter(|entry| entry.defining_query_hash == query_hash)
+            .cloned()
+    });
+
+    if let Some(entry) = cached {
+        return Ok((entry.delta_sql, entry.user_columns));
+    }
+
+    // Cache miss — parse, differentiate, and cache.
+    let op_tree = parse_defining_query(defining_query).map_err(|e| {
+        PgTrickleError::InternalError(format!("Failed to parse defining query for IVM: {e}"))
+    })?;
+
+    // Build transition table names.
+    let mut tables = HashMap::new();
+    tables.insert(
+        source_oid,
+        TransitionTableNames {
+            new_name: if has_new {
+                Some(format!("__pgt_newtable_{source_oid}"))
+            } else {
+                None
+            },
+            old_name: if has_old {
+                Some(format!("__pgt_oldtable_{source_oid}"))
+            } else {
+                None
+            },
+        },
+    );
+
+    // Create a DiffContext with transition table source.
+    let dummy_frontier = Frontier::default();
+    let mut ctx = DiffContext::new(dummy_frontier.clone(), dummy_frontier)
+        .with_delta_source(DeltaSource::TransitionTable { tables })
+        .with_pgt_name(&st.pgt_schema, &st.pgt_name);
+
+    // Differentiate the operator tree to get delta SQL.
+    let (delta_sql, user_columns, _is_dedup) = ctx.differentiate_with_columns(&op_tree)?;
+
+    // Store in cache.
+    IVM_DELTA_CACHE.with(|cache| {
+        cache.borrow_mut().insert(
+            cache_key,
+            CachedIvmDelta {
+                defining_query_hash: query_hash,
+                delta_sql: delta_sql.clone(),
+                user_columns: user_columns.clone(),
+            },
+        );
+    });
+
+    Ok((delta_sql, user_columns))
 }
 
 /// SQL-callable function: handle TRUNCATE on a base table for an

@@ -215,6 +215,14 @@ fn create_stream_table_impl(
         ));
     }
 
+    // ── IMMEDIATE mode: validate query restrictions ─────────────────
+    // IMMEDIATE mode does not yet support window functions, recursive CTEs,
+    // LATERAL joins, or scalar subqueries. Reject these early with a clear
+    // message pointing users to DIFFERENTIAL mode.
+    if refresh_mode.is_immediate() {
+        crate::dvm::validate_immediate_mode_support(query)?;
+    }
+
     // For DIFFERENTIAL and IMMEDIATE modes, run the full DVM parser to
     // catch unsupported aggregates, FILTER clauses, etc. that are
     // specifically problematic for incremental view maintenance.
@@ -425,9 +433,10 @@ fn create_stream_table_impl(
     if refresh_mode.is_immediate() {
         // IMMEDIATE mode: install statement-level IVM triggers on each
         // base table source (no change buffer tables, no row-level triggers).
+        let lock_mode = crate::ivm::IvmLockMode::for_query(query);
         for (source_oid, source_type) in &source_relids {
             if source_type == "TABLE" {
-                crate::ivm::setup_ivm_triggers(*source_oid, pgt_id, pgt_relid)?;
+                crate::ivm::setup_ivm_triggers(*source_oid, pgt_id, pgt_relid, lock_mode)?;
             }
         }
     } else {
@@ -554,16 +563,146 @@ fn alter_stream_table_impl(
     }
 
     if let Some(mode_str) = refresh_mode {
-        let _mode = RefreshMode::from_str(mode_str)?;
+        let new_mode = RefreshMode::from_str(mode_str)?;
+        let old_mode = st.refresh_mode;
 
-        // Note: recursive CTEs are now allowed in DIFFERENTIAL mode
-        // (the DVM engine uses a recomputation diff strategy).
+        if new_mode != old_mode {
+            // ── Validate mode switch ────────────────────────────────
+            // TopK tables cannot switch to IMMEDIATE mode.
+            if new_mode.is_immediate() && st.topk_limit.is_some() {
+                return Err(PgTrickleError::UnsupportedOperator(
+                    "Cannot switch TopK stream table to IMMEDIATE mode. \
+                     TopK tables use scoped recomputation which requires a \
+                     scheduled refresh."
+                        .into(),
+                ));
+            }
 
-        Spi::run_with_args(
-            "UPDATE pgtrickle.pgt_stream_tables SET refresh_mode = $1, updated_at = now() WHERE pgt_id = $2",
-            &[mode_str.to_uppercase().into(), st.pgt_id.into()],
-        )
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            // Validate query restrictions for IMMEDIATE mode.
+            if new_mode.is_immediate() {
+                crate::dvm::validate_immediate_mode_support(&st.defining_query)?;
+            }
+
+            // Get dependencies for trigger migration.
+            let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+            let change_schema = config::pg_trickle_change_buffer_schema();
+
+            // ── Tear down OLD mode's infrastructure ─────────────────
+            match old_mode {
+                RefreshMode::Immediate => {
+                    // Drop IVM triggers from source tables.
+                    for dep in &deps {
+                        if dep.source_type == "TABLE"
+                            && let Err(e) =
+                                crate::ivm::cleanup_ivm_triggers(dep.source_relid, st.pgt_id)
+                        {
+                            pgrx::warning!(
+                                "Failed to clean up IVM triggers for oid {}: {}",
+                                dep.source_relid.to_u32(),
+                                e
+                            );
+                        }
+                    }
+                }
+                RefreshMode::Full | RefreshMode::Differential => {
+                    // Drop CDC triggers + change buffer tables from source
+                    // tables (only if switching TO IMMEDIATE; FULL↔DIFF
+                    // keeps CDC infrastructure).
+                    if new_mode.is_immediate() {
+                        for dep in &deps {
+                            if dep.source_type == "TABLE"
+                                && let Err(e) =
+                                    cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode)
+                            {
+                                pgrx::warning!(
+                                    "Failed to clean up CDC for oid {}: {}",
+                                    dep.source_relid.to_u32(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Set up NEW mode's infrastructure ────────────────────
+            match new_mode {
+                RefreshMode::Immediate => {
+                    // Install IVM triggers on source tables.
+                    let lock_mode = crate::ivm::IvmLockMode::for_query(&st.defining_query);
+                    for dep in &deps {
+                        if dep.source_type == "TABLE" {
+                            crate::ivm::setup_ivm_triggers(
+                                dep.source_relid,
+                                st.pgt_id,
+                                st.pgt_relid,
+                                lock_mode,
+                            )?;
+                        }
+                    }
+                    // Clear schedule for IMMEDIATE mode.
+                    Spi::run_with_args(
+                        "UPDATE pgtrickle.pgt_stream_tables SET schedule = NULL WHERE pgt_id = $1",
+                        &[st.pgt_id.into()],
+                    )
+                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+                }
+                RefreshMode::Full | RefreshMode::Differential => {
+                    // If switching FROM IMMEDIATE, recreate CDC triggers.
+                    if old_mode.is_immediate() {
+                        for dep in &deps {
+                            if dep.source_type == "TABLE" {
+                                setup_cdc_for_source(dep.source_relid, st.pgt_id, &change_schema)?;
+                            }
+                        }
+                        // Restore a default schedule if none is set.
+                        if schedule.is_none() {
+                            Spi::run_with_args(
+                                "UPDATE pgtrickle.pgt_stream_tables \
+                                 SET schedule = COALESCE(schedule, '1m') \
+                                 WHERE pgt_id = $1",
+                                &[st.pgt_id.into()],
+                            )
+                            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+                        }
+                    }
+                }
+            }
+
+            // ── Update catalog ──────────────────────────────────────
+            Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_stream_tables \
+                 SET refresh_mode = $1, updated_at = now() WHERE pgt_id = $2",
+                &[mode_str.to_uppercase().into(), st.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+            // ── Full refresh to ensure consistency ──────────────────
+            let source_oids: Vec<pg_sys::Oid> = deps
+                .iter()
+                .filter(|d| d.source_type == "TABLE")
+                .map(|d| d.source_relid)
+                .collect();
+            // Re-load ST with updated mode for the refresh dispatch.
+            let updated_st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+            execute_manual_full_refresh(&updated_st, &schema, &table_name, &source_oids)?;
+
+            pgrx::info!(
+                "Stream table {}.{} switched from {} to {} mode (full refresh applied)",
+                schema,
+                table_name,
+                old_mode.as_str(),
+                new_mode.as_str(),
+            );
+        } else {
+            // Same mode — just update catalog (no-op but harmless).
+            Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_stream_tables \
+                 SET refresh_mode = $1, updated_at = now() WHERE pgt_id = $2",
+                &[mode_str.to_uppercase().into(), st.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
     }
 
     if let Some(status_str) = status {

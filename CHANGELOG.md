@@ -23,12 +23,30 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   - New `src/ivm.rs` module with trigger setup/cleanup, delta application
     (`pgt_ivm_apply_delta`), and TRUNCATE handling (`pgt_ivm_handle_truncate`).
   - Advisory lock-based concurrency control (ExclusiveLock equivalent).
+  - `IvmLockMode` enum (`Exclusive` / `RowExclusive`) with `for_query()`
+    analysis — simple scan chains use lighter `pg_try_advisory_xact_lock`,
+    complex queries (aggregates, joins, DISTINCT) use `pg_advisory_xact_lock`.
+  - `alter_stream_table` fully supports mode switching between
+    DIFFERENTIAL↔IMMEDIATE and FULL↔IMMEDIATE: tears down old infrastructure
+    (IVM triggers or CDC triggers), sets up new infrastructure, updates
+    catalog, runs full refresh, restores schedule when leaving IMMEDIATE.
+  - `validate_immediate_mode_support()` — rejects window functions, recursive
+    CTEs, LATERAL subqueries, LATERAL functions, and scalar subqueries at
+    creation/alter time with clear error messages suggesting DIFFERENTIAL mode.
+  - Delta SQL template caching — thread-local `IVM_DELTA_CACHE` keyed by
+    (pgt_id, source_oid, has_new, has_old) avoids re-parsing the defining
+    query on every trigger invocation. Cross-session invalidation via shared
+    cache generation counter.
   - TRUNCATE on base table triggers full refresh of the stream table.
   - Manual `refresh_stream_table()` for IMMEDIATE STs does a full refresh.
   - TopK + IMMEDIATE combination is explicitly rejected.
   - Catalog `get_by_id(pgt_id)` lookup method added.
-  - E2E tests: `tests/e2e_ivm_tests.rs` with INSERT/UPDATE/DELETE/TRUNCATE
-    propagation, DROP cleanup, validation, and mixed-operation tests.
+  - E2E tests: `tests/e2e_ivm_tests.rs` with 22 tests covering
+    INSERT/UPDATE/DELETE/TRUNCATE propagation, DROP cleanup, validation,
+    mixed-operation tests, mode switching (DIFFERENTIAL↔IMMEDIATE,
+    FULL↔IMMEDIATE), query restriction validation (window functions,
+    LATERAL, scalar subqueries), aggregate + join in IMMEDIATE mode, and
+    alter-to-IMMEDIATE rejection for unsupported queries.
   - Unit tests for transition table scan path (7 tests) and
     `RefreshMode::Immediate` helpers.
 - **TopK (ORDER BY + LIMIT) support** — Queries with a top-level `ORDER BY … LIMIT N` (constant integer, no OFFSET) are now recognized as "TopK" and accepted. TopK stream tables store only the top-N rows. Refreshes use scoped-recomputation via MERGE (bypass the DVM delta pipeline). Catalog columns `topk_limit` and `topk_order_by` record the pattern. Monitoring view exposes `is_topk`.

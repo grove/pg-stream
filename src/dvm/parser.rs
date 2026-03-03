@@ -2204,6 +2204,132 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgTrickleError> {
     }
 }
 
+// ── IMMEDIATE-mode validation ──────────────────────────────────────────────
+
+/// Validate that a defining query is compatible with IMMEDIATE mode.
+///
+/// IMMEDIATE mode uses statement-level AFTER triggers with transition tables
+/// and does not support the full range of SQL constructs that DIFFERENTIAL
+/// mode handles. This function parses the defining query and rejects
+/// unsupported constructs with an actionable error message.
+///
+/// **Supported in IMMEDIATE mode:**
+/// - Simple SELECT (Scan, Filter, Project)
+/// - JOINs (INNER, LEFT, FULL)
+/// - GROUP BY with standard aggregates
+/// - DISTINCT
+/// - Simple subqueries in FROM
+/// - Non-recursive CTEs
+/// - EXISTS/IN subqueries (SemiJoin/AntiJoin)
+///
+/// **Rejected (deferred to later phases):**
+/// - Window functions (use partition-based recomputation — complex)
+/// - Recursive CTEs (use semi-naive evaluation — complex)
+/// - LATERAL subqueries and functions (use row-scoped recomputation)
+/// - Scalar subqueries in SELECT
+pub fn validate_immediate_mode_support(defining_query: &str) -> Result<(), PgTrickleError> {
+    let result = parse_defining_query_full(defining_query)?;
+
+    // First validate general DVM support (aggregates, etc.).
+    check_ivm_support_with_registry(&result)?;
+
+    // Then validate IMMEDIATE-specific restrictions.
+    check_immediate_support(&result.tree)?;
+
+    // Also check CTE bodies.
+    for entry in &result.cte_registry.entries {
+        check_immediate_support(&entry.1)?;
+    }
+
+    Ok(())
+}
+
+/// Walk an OpTree and reject constructs not yet supported in IMMEDIATE mode.
+fn check_immediate_support(tree: &OpTree) -> Result<(), PgTrickleError> {
+    match tree {
+        // Leaf nodes — always OK.
+        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => Ok(()),
+
+        // Transparent wrappers — recurse into child.
+        OpTree::Project { child, .. }
+        | OpTree::Filter { child, .. }
+        | OpTree::Distinct { child }
+        | OpTree::Subquery { child, .. } => check_immediate_support(child),
+
+        // Joins — recurse into both sides.
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            check_immediate_support(left)?;
+            check_immediate_support(right)
+        }
+
+        // Aggregates — allowed, recurse into child.
+        OpTree::Aggregate { child, .. } => check_immediate_support(child),
+
+        // UNION ALL — allowed (each branch is a scan/filter/project chain).
+        OpTree::UnionAll { children } => {
+            for child in children {
+                check_immediate_support(child)?;
+            }
+            Ok(())
+        }
+
+        // INTERSECT/EXCEPT — allowed.
+        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+            check_immediate_support(left)?;
+            check_immediate_support(right)
+        }
+
+        // SemiJoin/AntiJoin (EXISTS/IN subqueries) — allowed.
+        OpTree::SemiJoin { left, right, .. } | OpTree::AntiJoin { left, right, .. } => {
+            check_immediate_support(left)?;
+            check_immediate_support(right)
+        }
+
+        // ── Rejected constructs ─────────────────────────────────────
+
+        // Window functions use partition-based recomputation which requires
+        // re-executing parts of the query. Deferred to Phase 3.
+        OpTree::Window { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "Window functions are not yet supported in IMMEDIATE mode. \
+             The partition-based recomputation strategy has not been validated \
+             with transition-table-based delta computation. Use 'DIFFERENTIAL' \
+             mode instead."
+                .into(),
+        )),
+
+        // Recursive CTEs use semi-naive evaluation with iteration.
+        OpTree::RecursiveCte { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "Recursive CTEs (WITH RECURSIVE) are not yet supported in IMMEDIATE \
+             mode. Use 'DIFFERENTIAL' mode instead."
+                .into(),
+        )),
+
+        // LATERAL subqueries use row-scoped recomputation.
+        OpTree::LateralSubquery { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "LATERAL subqueries are not yet supported in IMMEDIATE mode. \
+             Use 'DIFFERENTIAL' mode instead."
+                .into(),
+        )),
+
+        // LATERAL set-returning functions use row-scoped recomputation.
+        OpTree::LateralFunction { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "LATERAL set-returning functions (e.g. unnest(), \
+             jsonb_array_elements()) are not yet supported in IMMEDIATE \
+             mode. Use 'DIFFERENTIAL' mode instead."
+                .into(),
+        )),
+
+        // Scalar subqueries in SELECT.
+        OpTree::ScalarSubquery { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "Scalar subqueries in SELECT are not yet supported in IMMEDIATE \
+             mode. Use 'DIFFERENTIAL' mode instead."
+                .into(),
+        )),
+    }
+}
+
 // ── Query Parsing ──────────────────────────────────────────────────────────
 
 /// Context threaded through the parser for CTE handling.
