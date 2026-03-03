@@ -11,7 +11,7 @@
 #   ./dbt-pgtrickle/integration_tests/scripts/run_dbt_tests.sh --keep-container
 #
 # Environment variables:
-#   DBT_VERSION       dbt-core version to install (default: 1.9)
+#   DBT_VERSION       dbt-core version to install (default: 1.10)
 #   PGPORT            PostgreSQL port (default: 15432, avoids conflicts)
 #   CONTAINER_NAME    Docker container name (default: pgtrickle-dbt-local)
 #   SKIP_BUILD        Set to "1" to skip Docker image rebuild
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # ── Configuration ───────────────────────────────────────────────────────────
-DBT_VERSION="${DBT_VERSION:-1.9}"
+DBT_VERSION="${DBT_VERSION:-1.10}"
 PGPORT="${PGPORT:-15432}"
 CONTAINER_NAME="${CONTAINER_NAME:-pgtrickle-dbt-local}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -126,7 +126,7 @@ docker exec "$CONTAINER_NAME" \
   psql -U postgres -c "CREATE EXTENSION pg_trickle;"
 
 # ── Set up dbt Python environment ─────────────────────────────────────────
-# dbt-core 1.9 requires Python <=3.13 (pydantic v1 incompatible with 3.14).
+# dbt-core 1.10 requires Python <=3.13 (mashumaro dependency incompatible with 3.14).
 # Use a dedicated .venv-dbt virtual environment so we don't pollute the main
 # project venv (which may be Python 3.14+).
 DBT_VENV="$PROJECT_ROOT/.venv-dbt"

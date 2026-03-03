@@ -24,8 +24,8 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
                                            ▼
  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
  │  0.1.x   │   │  0.2.0   │   │  0.3.0   │──▶│  0.4.0   │──▶│  1.0.0   │──▶│  1.x+    │
- │ Released │   │ Released │   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
- │ ✅       │   │ (merged) │   │ ready    │   │ ability  │   │ Release  │   │ Ecosystem│
+ │ Released │   │ Active   │   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
+ │ ✅       │   │ 🔜       │   │ ready    │   │ ability  │   │ Release  │   │ Ecosystem│
  └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
 ```
 
@@ -70,13 +70,13 @@ See [CHANGELOG.md](CHANGELOG.md) for the full feature list.
 
 ---
 
-## v0.2.0 — Correctness & Stability — Released (merged into v0.1.x)
+## v0.2.0 — TopK, Diamond Consistency & Transactional IVM
 
-**Status: All work delivered in the v0.1.x patch series.**
+**Status: TopK and Diamond Dependency Consistency implemented; Transactional IVM Phase 1 in progress.**
 
-The 51-item SQL_GAPS_7 correctness plan was completed ahead of schedule: 50
-items landed in v0.1.0–v0.1.3. The one remaining item (F40 — extension upgrade
-migration scripts) is deferred to v0.3.0 as O1.
+The 51-item SQL_GAPS_7 correctness plan was completed in v0.1.x. v0.2.0 delivers
+three major feature additions. The one remaining SQL_GAPS_7 item (F40 — extension
+upgrade migration scripts) is deferred to v0.3.0 as O1.
 
 <details>
 <summary>Completed items (click to expand)</summary>
@@ -99,79 +99,43 @@ multiple mutation cycles (`just test-tpch`, SF=0.01).
 
 </details>
 
----
+### ORDER BY / LIMIT / OFFSET — TopK Support ✅
 
-## v0.3.0 — Production Readiness
+`ORDER BY ... LIMIT N` defining queries are accepted and refreshed correctly.
+All 9 plan items (TK1–TK9) implemented, including 5 TPC-H queries with ORDER BY
+restored (Q2, Q3, Q10, Q18, Q21).
 
-**Goal:** Operational polish, parallel refresh, production-grade WAL-based CDC,
-diamond dependency consistency, correctness safeguards, and validated
-partitioning support. The extension is suitable for production use after this
-milestone.
-
-### Diamond Dependency Consistency
-
-Diamond DAGs (where two stream tables share an upstream source and both feed a
-third) currently have an inconsistency window: if B refreshes but C fails, the
-fan-in table D sees a split view of the source data.
-
-**Decision:** Option 1 — Epoch-Based Atomic Refresh Groups. Detected multi-path
-groups in the DAG refresh atomically within a SAVEPOINT; on failure the group
-rolls back and retries next cycle. Linear (non-diamond) STs are unaffected.
-
-| Step | Description | Effort |
+| Item | Description | Status |
 |------|-------------|--------|
-| D1 | Data structures (`Diamond`, `ConsistencyGroup`) in `dag.rs` | 2–3h |
-| D2 | Diamond detection algorithm in `dag.rs` (pure, unit-tested) | 3–4h |
-| D3 | Consistency group computation in `dag.rs` (pure, unit-tested) | 2–3h |
-| D4 | Catalog column + GUC (`diamond_consistency`) in `catalog.rs`/`config.rs`/`api.rs` | 3–4h |
-| D5 | Scheduler wiring (`scheduler.rs`) with SAVEPOINT loop | 4–6h |
-| D6 | Monitoring function `pgtrickle.diamond_groups()` | 2–3h |
-| D7 | E2E test suite (`tests/e2e_diamond_tests.rs`, 7 tests) | 4–6h |
-| D8 | Documentation (`SQL_REFERENCE.md`, `CONFIGURATION.md`, `ARCHITECTURE.md`) | 2–3h |
+| TK1 | E2E tests for `FETCH FIRST` / `FETCH NEXT` rejection | ✅ Done |
+| TK2 | OFFSET without ORDER BY warning in subqueries | ✅ Done |
+| TK3 | `detect_topk_pattern()` + `TopKInfo` struct in `parser.rs` | ✅ Done |
+| TK4 | Catalog columns: `pgt_topk_limit`, `pgt_topk_order_by` | ✅ Done |
+| TK5 | TopK-aware refresh path (scoped recomputation via MERGE) | ✅ Done |
+| TK6 | DVM pipeline bypass for TopK tables in `api.rs` | ✅ Done |
+| TK7 | E2E + unit tests (`e2e_topk_tests.rs`, 18 tests) | ✅ Done |
+| TK8 | Documentation (SQL Reference, FAQ, CHANGELOG) | ✅ Done |
+| TK9 | TPC-H: restored ORDER BY + LIMIT in Q2, Q3, Q10, Q18, Q21 | ✅ Done |
+
+See [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md).
+
+### Diamond Dependency Consistency ✅
+
+Atomic refresh groups eliminate the inconsistency window in diamond DAGs
+(A→B→D, A→C→D). All 8 plan items (D1–D8) implemented.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| D1 | Data structures (`Diamond`, `ConsistencyGroup`) in `dag.rs` | ✅ Done |
+| D2 | Diamond detection algorithm in `dag.rs` | ✅ Done |
+| D3 | Consistency group computation in `dag.rs` | ✅ Done |
+| D4 | Catalog columns + GUCs (`diamond_consistency`, `diamond_schedule_policy`) | ✅ Done |
+| D5 | Scheduler wiring with SAVEPOINT loop | ✅ Done |
+| D6 | Monitoring function `pgtrickle.diamond_groups()` | ✅ Done |
+| D7 | E2E test suite (`tests/e2e_diamond_tests.rs`) | ✅ Done |
+| D8 | Documentation (`SQL_REFERENCE.md`, `CONFIGURATION.md`, `ARCHITECTURE.md`) | ✅ Done |
 
 See [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](plans/sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md).
-
-> **Diamond subtotal: ~22–32 hours**
-
-### Non-Deterministic Function Handling
-
-Volatile functions (`random()`, `gen_random_uuid()`, `clock_timestamp()`) break
-delta computation in DIFFERENTIAL mode — values change on each evaluation,
-causing phantom changes and corrupted row identity hashes. This is a silent
-correctness gap.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| ND1 | Volatility lookup via `pg_proc.provolatile` + recursive `Expr` scanner | 1–2h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Part 1 |
-| ND2 | OpTree volatility walker + enforcement policy (reject volatile in DIFFERENTIAL, warn for stable) | 1h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Part 2 |
-| ND3 | E2E tests (volatile rejected, stable warned, immutable allowed, nested volatile in WHERE) | 1–2h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §E2E Tests |
-| ND4 | Documentation (`SQL_REFERENCE.md`, `DVM_OPERATORS.md`) | 0.5h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Files |
-
-> **Non-determinism subtotal: ~4–6 hours**
-
-### ORDER BY / LIMIT / OFFSET — TopK Support
-
-`ORDER BY ... LIMIT N` in defining queries is currently rejected. This is a
-competitive gap (Epsio supports incremental TopK) and a common
-dashboard/leaderboard pattern. The plan also closes FETCH FIRST test coverage
-and adds OFFSET-without-ORDER-BY warnings for subqueries.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| TK1 | E2E tests for `FETCH FIRST` / `FETCH NEXT` rejection (G1) | 0.5h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Step 1 |
-| TK2 | Extend subquery warning to OFFSET without ORDER BY (G2/G3) | 1–2h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Step 2 |
-| TK3 | `detect_topk_pattern()` + `TopKInfo` struct in `parser.rs` | 3–4h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Step 3 |
-| TK4 | Catalog columns: `pgt_topk_limit`, `pgt_topk_order_by` | 2–3h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Step 4 |
-| TK5 | TopK-aware refresh path (scoped recomputation via MERGE) | 4–6h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Step 5 |
-| TK6 | DVM pipeline bypass for TopK tables in `api.rs` | 2–3h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Step 6 |
-| TK7 | E2E + unit tests (`e2e_topk_tests.rs`, 18 tests) | 6–8h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Step 7 |
-| TK8 | Documentation (SQL Reference, FAQ, CHANGELOG) | 2–3h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Steps 8–10 |
-| TK9 | TPC-H: restore ORDER BY + LIMIT in 5 queries (Q2, Q3, Q10, Q18, Q21) | 1–2h | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) §Part 4 |
-
-> **TopK subtotal: ~20–28 hours**
->
-> Note: boundary-tracked recomputation (Option C) and dedicated TopK operator
-> with overflow buffer (Option D) are documented as future optimizations.
 
 ### Transactional IVM — Phase 1 (Immediate Mode MVP)
 
@@ -202,6 +166,36 @@ other operators (Join, Aggregate, Filter, TopK, etc.) are source-agnostic.
 >
 > Phases 2–4 (pg_ivm compat wrappers, extended SQL in IMMEDIATE mode,
 > C-level trigger optimization) are tracked under post-1.0 A2.
+
+**Exit criteria:**
+- [x] `ORDER BY ... LIMIT N` (TopK) defining queries accepted and refreshed correctly
+- [x] TPC-H queries Q2, Q3, Q10, Q18, Q21 pass with original LIMIT restored
+- [x] Diamond dependency consistency (D1–D8) implemented and E2E-tested
+- [ ] IMMEDIATE refresh mode: INSERT/UPDATE/DELETE on base table updates stream table within the same transaction
+
+---
+
+## v0.3.0 — Production Readiness
+
+**Goal:** Operational polish, parallel refresh, production-grade WAL-based CDC,
+correctness safeguards, and validated partitioning support. The extension is
+suitable for production use after this milestone.
+
+### Non-Deterministic Function Handling
+
+Volatile functions (`random()`, `gen_random_uuid()`, `clock_timestamp()`) break
+delta computation in DIFFERENTIAL mode — values change on each evaluation,
+causing phantom changes and corrupted row identity hashes. This is a silent
+correctness gap.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ND1 | Volatility lookup via `pg_proc.provolatile` + recursive `Expr` scanner | 1–2h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Part 1 |
+| ND2 | OpTree volatility walker + enforcement policy (reject volatile in DIFFERENTIAL, warn for stable) | 1h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Part 2 |
+| ND3 | E2E tests (volatile rejected, stable warned, immutable allowed, nested volatile in WHERE) | 1–2h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §E2E Tests |
+| ND4 | Documentation (`SQL_REFERENCE.md`, `DVM_OPERATORS.md`) | 0.5h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Files |
+
+> **Non-determinism subtotal: ~4–6 hours**
 
 ### Partitioning Support (Source Tables)
 
@@ -271,13 +265,9 @@ PG 14–15 support can follow in a later release.
 - [ ] `max_concurrent_refreshes` drives real parallel refresh
 - [ ] WAL CDC mode passes full E2E suite
 - [ ] Extension upgrade path tested (`0.1.x → 0.3.0`)
-- [ ] Diamond dependency consistency (D1–D8) implemented and E2E-tested
 - [ ] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
-- [ ] `ORDER BY ... LIMIT N` (TopK) defining queries accepted and refreshed correctly
-- [ ] TPC-H queries Q2, Q3, Q10, Q18, Q21 pass with original LIMIT restored
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
 - [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
-- [ ] IMMEDIATE refresh mode: INSERT/UPDATE/DELETE on base table updates stream table within the same transaction
 - [ ] Zero P0/P1 gaps remaining
 
 ---
@@ -378,7 +368,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | Milestone | Effort estimate | Cumulative | Status |
 |-----------|-----------------|------------|--------|
 | v0.1.x — Core engine + correctness | ~30h actual | 30h | ✅ Released |
-| v0.3.0 — Production ready | 175–261h | 205–291h | 🔜 Next |
+| v0.2.0 — TopK, Diamond & Transactional IVM | ~32–48h remaining | 62–78h | 🔜 Next |
+| v0.3.0 — Production ready | 175–261h | 237–339h | |
 | v0.4.0 — Observability & Integration | 18–27h | 223–318h | |
 | v1.0.0 — Stable release | 18–27h | 241–345h | |
 | Post-1.0 (ecosystem) | 88–134h | 329–479h | |

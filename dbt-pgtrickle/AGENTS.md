@@ -7,7 +7,7 @@ dbt package providing a `stream_table` custom materialization for the
 SQL macros — no Python adapter code. Works with stock `dbt-postgres`.
 
 - **Language:** Jinja2 SQL (dbt macros)
-- **Framework:** dbt Core ≥ 1.9, dbt-postgres adapter
+- **Framework:** dbt Core ≥ 1.9, ≤ 1.10, dbt-postgres adapter
 - **Target database:** PostgreSQL 18 with pg_trickle extension
 - **Package name:** `dbt_pg_trickle`
 - **License:** Apache 2.0
@@ -55,8 +55,8 @@ just test-dbt        # full (rebuilds Docker image from source)
 
 The test runner (`integration_tests/scripts/run_dbt_tests.sh`) automatically:
 - Creates a dedicated `.venv-dbt` virtual environment using **Python 3.13**
-  (dbt-core 1.9 requires Python ≤3.13; pydantic v1 is incompatible with 3.14)
-- Installs `dbt-core~=1.9` and `dbt-postgres~=1.9` into that venv
+  (dbt-core 1.10 requires Python ≤3.13; mashumaro dependency incompatible with 3.14)
+- Installs `dbt-core~=1.10` and `dbt-postgres~=1.10` into that venv
 - Adds the Homebrew-keg PostgreSQL `bin/` to PATH so `psql` is available
 
 To run dbt commands manually after `just test-dbt-fast` (while the container is
