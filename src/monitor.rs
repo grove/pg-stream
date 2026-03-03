@@ -1253,6 +1253,428 @@ fn dependency_tree() -> TableIterator<
     TableIterator::new(output)
 }
 
+/// A single-query health overview of the pg_trickle installation.
+///
+/// Returns one row per check. Each row has a `severity` of `OK`, `WARN`, or
+/// `ERROR` and a human-readable `detail`. Run this to get an instant triage
+/// of whether anything needs attention.
+///
+/// Checks performed:
+/// - `scheduler_running`    — background worker is alive
+/// - `error_tables`         — any stream tables in ERROR/SUSPENDED status
+/// - `stale_tables`         — any stream tables with staleness > 2× schedule
+/// - `needs_reinit`         — any stream tables awaiting reinitialization
+/// - `consecutive_errors`   — any stream tables accumulating errors (not yet suspended)
+/// - `buffer_growth`        — any CDC change buffer with > 10 000 pending rows
+/// - `slot_lag`             — any WAL replication slot retaining > 100 MB of WAL
+///
+/// Exposed as `pgtrickle.health_check()`.
+#[pg_extern(schema = "pgtrickle", name = "health_check")]
+fn health_check() -> TableIterator<
+    'static,
+    (
+        name!(check_name, String),
+        name!(severity, String),
+        name!(detail, String),
+    ),
+> {
+    let mut rows: Vec<(String, String, String)> = Vec::new();
+
+    Spi::connect(|client| {
+        // ── 1. Scheduler running ────────────────────────────────────────────
+        let scheduler_count = client
+            .select(
+                "SELECT count(*)::int FROM pg_stat_activity \
+                 WHERE application_name = 'pg_trickle scheduler'",
+                None,
+                &[],
+            )
+            .ok()
+            .and_then(|r| r.first().get::<i32>(1).unwrap_or(None))
+            .unwrap_or(0);
+
+        let (sev, detail) = if scheduler_count > 0 {
+            ("OK", format!("{} worker(s) running", scheduler_count))
+        } else {
+            (
+                "ERROR",
+                "No pg_trickle scheduler background worker found in pg_stat_activity. \
+                 Check that pg_trickle is in shared_preload_libraries and \
+                 pg_trickle.enabled = on."
+                    .to_string(),
+            )
+        };
+        rows.push(("scheduler_running".to_string(), sev.to_string(), detail));
+
+        // ── 2. ERROR / SUSPENDED stream tables ─────────────────────────────
+        let bad_tables: Vec<String> = client
+            .select(
+                "SELECT pgt_schema || '.' || pgt_name \
+                 FROM pgtrickle.pgt_stream_tables \
+                 WHERE status IN ('ERROR', 'SUSPENDED') \
+                 ORDER BY 1",
+                None,
+                &[],
+            )
+            .map(|r| {
+                r.filter_map(|row| row.get::<String>(1).unwrap_or(None))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (sev, detail) = if bad_tables.is_empty() {
+            (
+                "OK".to_string(),
+                "All stream tables are ACTIVE or INITIALIZING".to_string(),
+            )
+        } else {
+            (
+                "ERROR".to_string(),
+                format!(
+                    "{} stream table(s) in ERROR/SUSPENDED: {}",
+                    bad_tables.len(),
+                    bad_tables.join(", ")
+                ),
+            )
+        };
+        rows.push(("error_tables".to_string(), sev, detail));
+
+        // ── 3. Stale stream tables ──────────────────────────────────────────
+        let stale_tables: Vec<String> = client
+            .select(
+                "SELECT name FROM pgtrickle.stream_tables_info \
+                 WHERE stale = true \
+                 ORDER BY 1",
+                None,
+                &[],
+            )
+            .map(|r| {
+                r.filter_map(|row| row.get::<String>(1).unwrap_or(None))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (sev, detail) = if stale_tables.is_empty() {
+            ("OK".to_string(), "No stale stream tables".to_string())
+        } else {
+            (
+                "WARN".to_string(),
+                format!(
+                    "{} stale stream table(s) (staleness > 2× schedule): {}",
+                    stale_tables.len(),
+                    stale_tables.join(", ")
+                ),
+            )
+        };
+        rows.push(("stale_tables".to_string(), sev, detail));
+
+        // ── 4. needs_reinit ─────────────────────────────────────────────────
+        let reinit_tables: Vec<String> = client
+            .select(
+                "SELECT pgt_schema || '.' || pgt_name \
+                 FROM pgtrickle.pgt_stream_tables \
+                 WHERE needs_reinit = true \
+                 ORDER BY 1",
+                None,
+                &[],
+            )
+            .map(|r| {
+                r.filter_map(|row| row.get::<String>(1).unwrap_or(None))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (sev, detail) = if reinit_tables.is_empty() {
+            (
+                "OK".to_string(),
+                "No stream tables awaiting reinitialization".to_string(),
+            )
+        } else {
+            (
+                "WARN".to_string(),
+                format!(
+                    "{} stream table(s) need reinitialization (DDL change detected): {}",
+                    reinit_tables.len(),
+                    reinit_tables.join(", ")
+                ),
+            )
+        };
+        rows.push(("needs_reinit".to_string(), sev, detail));
+
+        // ── 5. Consecutive errors (not yet suspended) ───────────────────────
+        let erroring_tables: Vec<String> = client
+            .select(
+                "SELECT pgt_schema || '.' || pgt_name \
+                 FROM pgtrickle.pgt_stream_tables \
+                 WHERE consecutive_errors > 0 AND status NOT IN ('ERROR', 'SUSPENDED') \
+                 ORDER BY consecutive_errors DESC",
+                None,
+                &[],
+            )
+            .map(|r| {
+                r.filter_map(|row| row.get::<String>(1).unwrap_or(None))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (sev, detail) = if erroring_tables.is_empty() {
+            (
+                "OK".to_string(),
+                "No stream tables accumulating refresh errors".to_string(),
+            )
+        } else {
+            (
+                "WARN".to_string(),
+                format!(
+                    "{} stream table(s) have consecutive errors (approaching auto-suspend): {}",
+                    erroring_tables.len(),
+                    erroring_tables.join(", ")
+                ),
+            )
+        };
+        rows.push(("consecutive_errors".to_string(), sev, detail));
+
+        // ── 6. CDC buffer growth (> 10 000 pending rows for any source) ─────
+        let bloated: Vec<String> = client
+            .select(
+                "SELECT source_table || ' (' || pending_rows || ' pending)' \
+                 FROM pgtrickle.change_buffer_sizes() \
+                 WHERE pending_rows > 10000 \
+                 ORDER BY pending_rows DESC",
+                None,
+                &[],
+            )
+            .map(|r| {
+                r.filter_map(|row| row.get::<String>(1).unwrap_or(None))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (sev, detail) = if bloated.is_empty() {
+            (
+                "OK".to_string(),
+                "All CDC buffers within normal range".to_string(),
+            )
+        } else {
+            (
+                "WARN".to_string(),
+                format!(
+                    "{} CDC buffer(s) exceeding 10 000 pending rows — differential refresh may be stalled: {}",
+                    bloated.len(),
+                    bloated.join(", ")
+                ),
+            )
+        };
+        rows.push(("buffer_growth".to_string(), sev, detail));
+
+        // ── 7. WAL slot lag ─────────────────────────────────────────────────
+        let lagging: Vec<String> = client
+            .select(
+                "SELECT slot_name || ' (' || pg_size_pretty(retained_wal_bytes) || ')' \
+                 FROM pgtrickle.slot_health() \
+                 WHERE retained_wal_bytes > 100 * 1024 * 1024 \
+                 ORDER BY retained_wal_bytes DESC",
+                None,
+                &[],
+            )
+            .map(|r| {
+                r.filter_map(|row| row.get::<String>(1).unwrap_or(None))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let (sev, detail) = if lagging.is_empty() {
+            (
+                "OK".to_string(),
+                "All WAL replication slots within normal range".to_string(),
+            )
+        } else {
+            (
+                "WARN".to_string(),
+                format!(
+                    "{} WAL slot(s) retaining > 100 MB — risk of slot invalidation: {}",
+                    lagging.len(),
+                    lagging.join(", ")
+                ),
+            )
+        };
+        rows.push(("slot_lag".to_string(), sev, detail));
+    });
+
+    TableIterator::new(rows)
+}
+
+/// Cross-stream-table refresh timeline, most recent first.
+///
+/// Returns up to `max_rows` refresh records across all stream tables in a
+/// single chronological view. Useful for spotting refresh bursts, cascading
+/// failures, or unexpected mode changes without having to query each stream
+/// table individually.
+///
+/// Exposed as `pgtrickle.refresh_timeline(limit)`.
+#[pg_extern(schema = "pgtrickle", name = "refresh_timeline")]
+#[allow(clippy::type_complexity)]
+fn refresh_timeline(
+    max_rows: default!(i32, 50),
+) -> TableIterator<
+    'static,
+    (
+        name!(start_time, TimestampWithTimeZone),
+        name!(stream_table, String),
+        name!(action, String),
+        name!(status, String),
+        name!(rows_inserted, i64),
+        name!(rows_deleted, i64),
+        name!(duration_ms, Option<f64>),
+        name!(error_message, Option<String>),
+    ),
+> {
+    let epoch_zero = TimestampWithTimeZone::try_from(0i64)
+        .unwrap_or_else(|_| pgrx::error!("refresh_timeline: failed to construct epoch timestamp"));
+
+    let rows: Vec<_> = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT
+                    h.start_time,
+                    st.pgt_schema || '.' || st.pgt_name AS stream_table,
+                    h.action,
+                    h.status,
+                    COALESCE(h.rows_inserted, 0)::bigint,
+                    COALESCE(h.rows_deleted, 0)::bigint,
+                    CASE WHEN h.end_time IS NOT NULL
+                         THEN EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000
+                         ELSE NULL
+                    END::float8,
+                    h.error_message
+                 FROM pgtrickle.pgt_refresh_history h
+                 JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+                 ORDER BY h.start_time DESC
+                 LIMIT $1",
+                None,
+                &[max_rows.into()],
+            )
+            .map_err(|e| pgrx::error!("refresh_timeline: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
+
+        let mut out = Vec::new();
+        for row in result {
+            let start = row
+                .get::<TimestampWithTimeZone>(1)
+                .unwrap_or(None)
+                .unwrap_or(epoch_zero);
+            let table = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+            let action = row.get::<String>(3).unwrap_or(None).unwrap_or_default();
+            let status = row.get::<String>(4).unwrap_or(None).unwrap_or_default();
+            let ins = row.get::<i64>(5).unwrap_or(None).unwrap_or(0);
+            let del = row.get::<i64>(6).unwrap_or(None).unwrap_or(0);
+            let dur = row.get::<f64>(7).unwrap_or(None);
+            let err = row.get::<String>(8).unwrap_or(None);
+            out.push((start, table, action, status, ins, del, dur, err));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
+/// Inventory of CDC triggers installed by pg_trickle for each tracked source.
+///
+/// For each source in `pgt_dependencies`, reports whether the expected pg_trickle
+/// CDC triggers (`pg_trickle_cdc_<oid>` for DML and `pg_trickle_cdc_truncate_<oid>`
+/// for TRUNCATE) are present and enabled in `pg_catalog`. A `present = false` row
+/// indicates a missing trigger that will prevent change capture for that source.
+///
+/// Exposed as `pgtrickle.trigger_inventory()`.
+#[pg_extern(schema = "pgtrickle", name = "trigger_inventory")]
+#[allow(clippy::type_complexity)]
+fn trigger_inventory() -> TableIterator<
+    'static,
+    (
+        name!(source_table, String),
+        name!(source_oid, i64),
+        name!(trigger_name, String),
+        name!(trigger_type, String),
+        name!(present, bool),
+        name!(enabled, bool),
+    ),
+> {
+    let rows: Vec<_> = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT
+                    n.nspname::text || '.' || c.relname::text AS source_table,
+                    d.source_relid::bigint                    AS source_oid,
+                    'pg_trickle_cdc_' || d.source_relid::text AS dml_trigger,
+                    'pg_trickle_cdc_truncate_' || d.source_relid::text AS trunc_trigger,
+                    -- DML trigger present?
+                    EXISTS (SELECT 1 FROM pg_trigger t
+                            WHERE t.tgrelid = d.source_relid
+                              AND t.tgname = 'pg_trickle_cdc_' || d.source_relid::text)
+                        AS dml_present,
+                    -- DML trigger enabled? (tgenabled: 'O'=origin, 'D'=disabled, etc.)
+                    COALESCE((SELECT t.tgenabled != 'D'
+                              FROM pg_trigger t
+                              WHERE t.tgrelid = d.source_relid
+                                AND t.tgname = 'pg_trickle_cdc_' || d.source_relid::text),
+                             false) AS dml_enabled,
+                    -- TRUNCATE trigger present?
+                    EXISTS (SELECT 1 FROM pg_trigger t
+                            WHERE t.tgrelid = d.source_relid
+                              AND t.tgname = 'pg_trickle_cdc_truncate_' || d.source_relid::text)
+                        AS trunc_present,
+                    -- TRUNCATE trigger enabled?
+                    COALESCE((SELECT t.tgenabled != 'D'
+                              FROM pg_trigger t
+                              WHERE t.tgrelid = d.source_relid
+                                AND t.tgname = 'pg_trickle_cdc_truncate_' || d.source_relid::text),
+                             false) AS trunc_enabled
+                 FROM (SELECT DISTINCT source_relid FROM pgtrickle.pgt_dependencies
+                       WHERE source_relid != 0) d
+                 JOIN pg_class     c ON c.oid = d.source_relid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 ORDER BY source_table",
+                None,
+                &[],
+            )
+            .map_err(|e| pgrx::error!("trigger_inventory: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
+
+        let mut out = Vec::new();
+        for row in result {
+            let source_table = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let source_oid = row.get::<i64>(2).unwrap_or(None).unwrap_or(0);
+            let dml_trigger = row.get::<String>(3).unwrap_or(None).unwrap_or_default();
+            let trunc_trigger = row.get::<String>(4).unwrap_or(None).unwrap_or_default();
+            let dml_present = row.get::<bool>(5).unwrap_or(None).unwrap_or(false);
+            let dml_enabled = row.get::<bool>(6).unwrap_or(None).unwrap_or(false);
+            let trunc_present = row.get::<bool>(7).unwrap_or(None).unwrap_or(false);
+            let trunc_enabled = row.get::<bool>(8).unwrap_or(None).unwrap_or(false);
+
+            // Emit one row per trigger type (DML + TRUNCATE)
+            out.push((
+                source_table.clone(),
+                source_oid,
+                dml_trigger,
+                "DML".to_string(),
+                dml_present,
+                dml_enabled,
+            ));
+            out.push((
+                source_table,
+                source_oid,
+                trunc_trigger,
+                "TRUNCATE".to_string(),
+                trunc_present,
+                trunc_enabled,
+            ));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
