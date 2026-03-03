@@ -1,6 +1,6 @@
 # pg_trickle vs pg_ivm — Comparison Report & Gap Analysis
 
-**Date:** 2026-02-28 (merged 2026-03-01)
+**Date:** 2026-02-28 (merged 2026-03-01, updated 2026-03-03)
 **Author:** Internal research
 **Status:** Reference document
 
@@ -16,26 +16,32 @@ target audience.
 
 `pg_ivm` is a mature, widely-deployed C extension (1.4k GitHub stars, 17 releases)
 focused on **immediate**, synchronous IVM that runs inside the same transaction as
-the base-table write. `pg_trickle` is an early-stage Rust extension targeting
-**deferred, scheduled** IVM with a richer SQL dialect, a dependency DAG, and
-built-in operational tooling.
+the base-table write. `pg_trickle` is an early-stage Rust extension offering
+**both deferred (scheduled) and immediate (transactional) IVM** with a richer SQL
+dialect, a dependency DAG, and built-in operational tooling.
 
 pg_trickle is **significantly ahead** of pg_ivm in SQL coverage, operator support,
-aggregate support, and operational features. pg_ivm's two structural advantages —
-**immediate (synchronous) maintenance** and **broader PostgreSQL version support
-(PG 13–18)** — are both addressed by existing plans:
+aggregate support, and operational features. As of v0.2.0, pg_trickle also
+matches pg_ivm's core strength — **immediate, in-transaction maintenance** — via
+the `IMMEDIATE` refresh mode (Phase 1 + 3 complete). pg_ivm's one remaining
+structural advantage is **broader PostgreSQL version support (PG 13–18)**:
 
-- [PLAN_TRANSACTIONAL_IVM.md](../sql/PLAN_TRANSACTIONAL_IVM.md) proposes an
-  `IMMEDIATE` refresh mode with statement-level AFTER triggers, transition
-  tables, and a full **pg_ivm compatibility layer** (`pgivm.create_immv()`,
-  `pgivm.refresh_immv()`, `pgivm.pg_ivm_immv` catalog view).
+- **IMMEDIATE mode — implemented.** Statement-level AFTER triggers with
+  transition tables update stream tables within the same transaction as
+  base-table DML. Window functions, LATERAL, scalar subqueries, and
+  cascading IMMEDIATE stream tables are all supported. Only recursive CTEs
+  are restricted (use DIFFERENTIAL mode instead). See
+  [PLAN_TRANSACTIONAL_IVM.md](../sql/PLAN_TRANSACTIONAL_IVM.md).
+- **pg_ivm compatibility layer — postponed.** The `pgivm.create_immv()` /
+  `pgivm.refresh_immv()` / `pgivm.pg_ivm_immv` wrappers (Phase 2) are
+  deferred to post-1.0.
 - [PLAN_PG_BACKCOMPAT.md](../infra/PLAN_PG_BACKCOMPAT.md) details backporting
   pg_trickle to **PG 14–18** (recommended) or **PG 16–18** (minimum viable),
   requiring ~2.5–3 weeks of effort primarily in `#[cfg]`-gating ~435 lines
   of JSON/SQL-standard parse-tree handling.
 
-Once these plans are implemented, **every pg_ivm advantage will be neutralized
-or surpassed**, while pg_trickle retains its 24+ unique features.
+With IMMEDIATE mode implemented, **pg_ivm's only remaining advantage is PG
+version breadth**. pg_trickle retains its 27+ unique features.
 
 ---
 
@@ -45,7 +51,7 @@ or surpassed**, while pg_trickle retains its 24+ unique features.
 |---|---|---|
 | Repository | [sraoss/pg_ivm](https://github.com/sraoss/pg_ivm) | [grove/pg-trickle](https://github.com/grove/pg-trickle) |
 | Language | C | Rust (pgrx 0.17) |
-| Latest release | 1.13 (2025-10-20) | 0.1.2 (2026-02-28) |
+| Latest release | 1.13 (2025-10-20) | 0.1.3 (2026-03-01) |
 | Stars | ~1,400 | early stage |
 | License | PostgreSQL License | Apache 2.0 |
 | PG versions | 13 – 18 | 18 only; **PG 14–18 planned** |
@@ -113,18 +119,39 @@ COMMIT;
 - The WAL-based CDC mode (`pg_trickle.cdc_mode = 'wal'`) eliminates trigger
   overhead entirely when `wal_level = logical` is available.
 
-### Planned: pg_trickle IMMEDIATE Mode
+### Implemented: pg_trickle IMMEDIATE Mode
 
-[PLAN_TRANSACTIONAL_IVM.md](../sql/PLAN_TRANSACTIONAL_IVM.md) defines an
-`IMMEDIATE` refresh mode that uses statement-level AFTER triggers with
-transition tables (the same mechanism pg_ivm uses). Key design decisions:
+pg_trickle now offers an `IMMEDIATE` refresh mode (Phase 1 + Phase 3 complete)
+that uses statement-level AFTER triggers with transition tables — the same
+mechanism pg_ivm uses. Key implementation details:
 
-- **Reuses the DVM engine** — the Scan operator reads from Ephemeral Named
-  Relations (transition tables) instead of change buffer tables.
-- **Phase 1** covers pg_ivm's full query subset plus pg_trickle's auto-rewrites.
-- **Phase 2** adds a `pgivm.*` compatibility layer for drop-in migration.
-- **Phase 3** extends IMMEDIATE mode to window functions, set operations,
-  LATERAL, recursive CTEs, and cascading IMMEDIATE stream tables.
+- **Reuses the DVM engine** — the Scan operator reads from transition tables
+  (via temporary views) instead of change buffer tables.
+- **Phase 1** (complete): core IMMEDIATE engine — INSERT/UPDATE/DELETE/TRUNCATE
+  handling, advisory lock-based concurrency (`IvmLockMode`), mode switching
+  via `alter_stream_table`, query restriction validation.
+- **Phase 2** (postponed): `pgivm.*` compatibility layer for drop-in migration.
+- **Phase 3** (complete): extended SQL support — window functions, LATERAL,
+  scalar subqueries, cascading IMMEDIATE stream tables. Only recursive CTEs
+  remain restricted in IMMEDIATE mode.
+- **Phase 4** (partial): delta SQL template caching implemented; ENR-based
+  transition tables, aggregate fast-path, C-level triggers deferred to post-1.0.
+
+```sql
+-- Create an IMMEDIATE stream table (zero staleness)
+SELECT pgtrickle.create_stream_table(
+    'live_totals',
+    'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
+    NULL,          -- no schedule needed
+    'IMMEDIATE'
+);
+
+-- Updates propagate within the same transaction
+BEGIN;
+  INSERT INTO orders (region, amount) VALUES ('EU', 100);
+  SELECT * FROM live_totals;  -- already includes the new row
+COMMIT;
+```
 
 ---
 
@@ -132,7 +159,7 @@ transition tables (the same mechanism pg_ivm uses). Key design decisions:
 
 | Dimension | pg_ivm | pg_trickle | Winner |
 |-----------|--------|-----------|--------|
-| **Maintenance timing** | Immediate (in-transaction triggers) | Deferred (scheduler/manual); **IMMEDIATE mode planned** | pg_ivm (today); **planned parity** |
+| **Maintenance timing** | Immediate (in-transaction triggers) | Deferred (scheduler/manual) **and** IMMEDIATE (in-transaction) | **pg_trickle** (offers both models) |
 | **PostgreSQL versions** | 13–18 | 18 only; **PG 14–18 planned** | pg_ivm (today); **planned parity** |
 | **Aggregate functions** | 5 (COUNT, SUM, AVG, MIN, MAX) | 39+ (all built-in aggregates) | **pg_trickle** |
 | **FILTER clause on aggregates** | No | Yes | **pg_trickle** |
@@ -331,12 +358,20 @@ pg_ivm IMMVs are standard PostgreSQL tables. They can be dropped with
 ### pg_trickle API
 
 ```sql
--- Create a stream table
+-- Create a stream table (deferred, scheduled)
 SELECT pgtrickle.create_stream_table(
     'order_totals',
     'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
     '2m',           -- refresh schedule
     'DIFFERENTIAL'  -- or 'FULL'
+);
+
+-- Create a stream table (immediate, in-transaction)
+SELECT pgtrickle.create_stream_table(
+    'live_totals',
+    'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
+    NULL,           -- no schedule needed
+    'IMMEDIATE'
 );
 
 -- Manual refresh
@@ -476,14 +511,15 @@ refreshed after its upstream dependencies.
 - On high-churn tables, `min`/`max` aggregates can trigger expensive rescans.
 
 ### pg_trickle Limitations
-- Data is stale between refresh cycles — not suitable for applications
-  requiring sub-second consistency.
-- `LIMIT` without `ORDER BY` and `OFFSET` not supported.
+- In DIFFERENTIAL/FULL mode, data is stale between refresh cycles.
+  Use **IMMEDIATE mode** for zero-staleness, in-transaction consistency.
+- Recursive CTEs are not supported in IMMEDIATE mode (use DIFFERENTIAL).
+- `LIMIT` without `ORDER BY` and `OFFSET` not supported in defining queries.
 - `ORDER BY` + `LIMIT` (TopK) is supported via scoped recomputation (MERGE).
 - Volatile SQL functions rejected in DIFFERENTIAL mode.
 - Materialized views as sources not supported in DIFFERENTIAL mode.
 - `ALTER EXTENSION pg_trickle UPDATE` migration scripts not yet implemented
-  (planned for v0.2.0+).
+  (planned for v0.3.0+).
 - Targets PostgreSQL 18 only; no backport to PG 13–17 (planned for PG 14–18).
 - Early release — not yet production-hardened.
 
@@ -523,49 +559,51 @@ refreshed after its upstream dependencies.
 
 ## 15. Features Unique to Each System
 
-### Features Unique to pg_trickle (24 items, no pg_ivm equivalent)
+### Features Unique to pg_trickle (27 items, no pg_ivm equivalent)
 
-1. **39+ aggregate functions** (vs 5)
-2. **FILTER / HAVING / WITHIN GROUP** on aggregates
-3. **Window functions** (partition recomputation)
-4. **Set operations** (UNION ALL, UNION, INTERSECT, EXCEPT — all 6 variants)
-5. **Recursive CTEs** (semi-naive, DRed, recomputation)
-6. **LATERAL subqueries and SRFs** (jsonb_array_elements, unnest, JSON_TABLE)
-7. **Anti-join / semi-join operators** (NOT EXISTS, NOT IN, IN, EXISTS with full SQL)
-8. **Scalar subqueries** in SELECT list
-9. **Views as sources** (auto-inlined with nested expansion)
-10. **Partitioned table support**
-11. **Cascading stream tables** (ST referencing other STs via DAG)
-12. **Background scheduler** (cron + duration + canonical periods)
-13. **GROUPING SETS / CUBE / ROLLUP** (auto-rewritten)
-14. **DISTINCT ON** (auto-rewritten to ROW_NUMBER)
-15. **Hybrid CDC** (trigger → WAL transition)
-16. **DDL change detection** and automatic reinitialization
-17. **Monitoring suite** (refresh stats, staleness tracking, CDC health, NOTIFY)
-18. **Auto-rewrite pipeline** (6 transparent SQL rewrites)
-19. **Volatile function detection**
-20. **Adaptive FULL fallback** (change ratio threshold)
-21. **dbt macro package**
-22. **CNPG / Kubernetes deployment**
-23. **SQL/JSON constructors** (JSON_OBJECT, JSON_ARRAY, etc.)
-24. **JSON_TABLE** support (PG 17+)
+1. **IMMEDIATE + deferred modes** (pg_ivm is immediate-only; pg_trickle offers both)
+2. **39+ aggregate functions** (vs 5)
+3. **FILTER / HAVING / WITHIN GROUP** on aggregates
+4. **Window functions** (partition recomputation)
+5. **Set operations** (UNION ALL, UNION, INTERSECT, EXCEPT — all 6 variants)
+6. **Recursive CTEs** (semi-naive, DRed, recomputation)
+7. **LATERAL subqueries and SRFs** (jsonb_array_elements, unnest, JSON_TABLE)
+8. **Anti-join / semi-join operators** (NOT EXISTS, NOT IN, IN, EXISTS with full SQL)
+9. **Scalar subqueries** in SELECT list
+10. **Views as sources** (auto-inlined with nested expansion)
+11. **Partitioned table support**
+12. **Cascading stream tables** (ST referencing other STs via DAG)
+13. **Background scheduler** (cron + duration + canonical periods)
+14. **GROUPING SETS / CUBE / ROLLUP** (auto-rewritten)
+15. **DISTINCT ON** (auto-rewritten to ROW_NUMBER)
+16. **Hybrid CDC** (trigger → WAL transition)
+17. **DDL change detection** and automatic reinitialization
+18. **Monitoring suite** (refresh stats, staleness tracking, CDC health, NOTIFY)
+19. **Auto-rewrite pipeline** (6 transparent SQL rewrites)
+20. **Volatile function detection**
+21. **Adaptive FULL fallback** (change ratio threshold)
+22. **dbt macro package**
+23. **CNPG / Kubernetes deployment**
+24. **SQL/JSON constructors** (JSON_OBJECT, JSON_ARRAY, etc.)
+25. **JSON_TABLE** support (PG 17+)
+26. **TopK stream tables** (ORDER BY + LIMIT with incremental maintenance)
+27. **Diamond dependency consistency** (multi-path refresh atomicity)
 
 ### Features Unique to pg_ivm (with planned resolutions)
 
-| # | Feature | Planned Resolution | Ref |
-|---|---------|-------------------|-----|
-| 1 | **Immediate (synchronous) maintenance** | `IMMEDIATE` refresh mode + pg_ivm compat layer | [PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md) |
-| 2 | **Auto-index creation** on GROUP BY / DISTINCT / PK | Phase 2 of transactional IVM plan | [PLAN_TRANSACTIONAL_IVM §5.2](../sql/PLAN_TRANSACTIONAL_IVM.md) |
-| 3 | **TRUNCATE propagation** (auto-truncate IMMV) | Handled by IMMEDIATE mode TRUNCATE triggers | [PLAN_TRANSACTIONAL_IVM §3.2](../sql/PLAN_TRANSACTIONAL_IVM.md) |
-| 4 | **Row Level Security** respect | Document and test | — |
-| 5 | **PostgreSQL 13–17 support** | PG 14–18 backcompat (~2.5–3 weeks) | [PLAN_PG_BACKCOMPAT](../infra/PLAN_PG_BACKCOMPAT.md) |
+| # | Feature | Status | Ref |
+|---|---------|--------|-----|
+| 1 | **Immediate (synchronous) maintenance** | ✅ **Closed** — IMMEDIATE refresh mode implemented (Phase 1 + 3) | [PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md) |
+| 2 | **Auto-index creation** on GROUP BY / DISTINCT / PK | Postponed (Phase 2 of transactional IVM) | [PLAN_TRANSACTIONAL_IVM §5.2](../sql/PLAN_TRANSACTIONAL_IVM.md) |
+| 3 | **TRUNCATE propagation** (auto-truncate IMMV) | ✅ **Closed** — IMMEDIATE mode fires full refresh on TRUNCATE | [PLAN_TRANSACTIONAL_IVM §3.2](../sql/PLAN_TRANSACTIONAL_IVM.md) |
+| 4 | **Row Level Security** respect | Not yet addressed | — |
+| 5 | **PostgreSQL 13–17 support** | PG 14–18 backcompat planned (~2.5–3 weeks) | [PLAN_PG_BACKCOMPAT](../infra/PLAN_PG_BACKCOMPAT.md) |
 | 6 | **session_preload_libraries** | Not applicable (background worker needs shared_preload) | — |
 | 7 | **Rename via ALTER TABLE** | Event trigger support (low effort) | — |
-| 8 | **Drop via DROP TABLE** | Phase 2 of transactional IVM plan | [PLAN_TRANSACTIONAL_IVM §4.3](../sql/PLAN_TRANSACTIONAL_IVM.md) |
+| 8 | **Drop via DROP TABLE** | Postponed (Phase 2 of transactional IVM) | [PLAN_TRANSACTIONAL_IVM §4.3](../sql/PLAN_TRANSACTIONAL_IVM.md) |
 
-Of the 8 items, **5 have concrete implementation plans**. Only RLS testing,
-`session_preload_libraries` (not applicable), and `ALTER TABLE RENAME` remain
-unaddressed.
+Of the 8 items, **2 are now closed** (immediate maintenance and TRUNCATE), **3
+have concrete implementation plans**, and 3 are low-priority or not applicable.
 
 ---
 
@@ -573,17 +611,17 @@ unaddressed.
 
 | Scenario | Recommended |
 |---|---|
-| Need views consistent within the same transaction | **pg_ivm** |
-| Application cannot tolerate any view staleness | **pg_ivm** |
-| High write throughput, views can be slightly stale | **pg_trickle** |
+| Need views consistent within the same transaction | **Either** (pg_trickle IMMEDIATE mode or pg_ivm) |
+| Application cannot tolerate any view staleness | **Either** (pg_trickle IMMEDIATE mode or pg_ivm) |
+| High write throughput, views can be slightly stale | **pg_trickle** (DIFFERENTIAL mode) |
 | Multi-layer summary pipelines with dependencies | **pg_trickle** |
 | Time-based or cron-driven refresh schedules | **pg_trickle** |
 | Views with complex SQL (window functions, CTEs, UNION) | **pg_trickle** |
-| Simple aggregation with zero-staleness requirement | **pg_ivm** |
+| Simple aggregation with zero-staleness requirement | **Either** (pg_trickle has richer SQL coverage) |
 | Kubernetes / CloudNativePG deployment | **pg_trickle** |
 | dbt integration | **pg_trickle** |
 | PostgreSQL 13–17 | **pg_ivm** |
-| PostgreSQL 18 | Either (pg_trickle preferred for new projects) |
+| PostgreSQL 18 | **pg_trickle** (superset of pg_ivm) |
 | Production-hardened, stable API | **pg_ivm** |
 | Early adopter, rich SQL coverage needed | **pg_trickle** |
 
@@ -593,12 +631,17 @@ unaddressed.
 
 The two extensions can be installed in the same database simultaneously — they
 use different schemas (`pgivm` vs `pgtrickle`/`pgtrickle_changes`) and do not
-interfere with each other. A plausible combined deployment:
+interfere with each other. However, with pg_trickle's `IMMEDIATE` mode now
+available, there is less reason to use both:
 
-- Use **pg_ivm** for small, critical lookup tables that must be perfectly
-  consistent within transactions (e.g. permission caches, balance totals).
-- Use **pg_trickle** for large analytical summary tables, multi-layer
-  aggregation pipelines, or views with complex SQL that pg_ivm cannot handle.
+- Use **pg_trickle IMMEDIATE** for small, critical lookup tables that must be
+  perfectly consistent within transactions (the use-case that previously
+  required pg_ivm).
+- Use **pg_trickle DIFFERENTIAL/FULL** for large analytical summary tables,
+  multi-layer aggregation pipelines, or views where slight staleness is
+  acceptable.
+- Use **pg_ivm** only if you need PostgreSQL 13–17 support or prefer its
+  mature, battle-tested codebase.
 
 ---
 
@@ -608,11 +651,10 @@ interfere with each other. A plausible combined deployment:
 
 | Priority | Item | Plan | Effort | Closes Gaps |
 |----------|------|------|--------|-------------|
-| **High** | IMMEDIATE refresh mode | [PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md) Phase 1 | Medium | #1 (immediate maintenance), #3 (TRUNCATE) |
-| **High** | pg_ivm compatibility layer | [PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md) Phase 2 | Medium | #2 (auto-indexing), #7 (rename), #8 (DROP TABLE) |
+| ✅ Done | IMMEDIATE refresh mode | [PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md) Phase 1 + 3 | Complete | #1 (immediate maintenance), #3 (TRUNCATE) |
+| Postponed | pg_ivm compatibility layer | [PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md) Phase 2 | Deferred to post-1.0 | #2 (auto-indexing), #7 (rename), #8 (DROP TABLE) |
 | **High** | PG 16–18 backcompat (MVP) | [PLAN_PG_BACKCOMPAT](../infra/PLAN_PG_BACKCOMPAT.md) §11 | ~1.5 weeks | #5 (PG version support) |
 | **Medium** | PG 14–18 backcompat (full) | [PLAN_PG_BACKCOMPAT](../infra/PLAN_PG_BACKCOMPAT.md) §5 | ~2.5–3 weeks | #5 (PG version support) |
-| **Medium** | Extended IMMEDIATE SQL | [PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md) Phase 3 | Medium | Extends #1 beyond pg_ivm parity |
 
 ### Remaining small gaps (no existing plan)
 
@@ -637,25 +679,27 @@ with 34+ additional aggregate functions, window functions, set operations,
 recursive CTEs, LATERAL support, anti/semi-joins, and a comprehensive
 operational layer.
 
-The two remaining structural gaps — **immediate maintenance** and **PG version
-support** — both have detailed implementation plans:
+The **immediate maintenance** gap is now closed: pg_trickle's `IMMEDIATE`
+refresh mode (Phase 1 + 3 complete) provides the same in-transaction
+consistency as pg_ivm, while also supporting window functions, LATERAL,
+scalar subqueries, and cascading stream tables in IMMEDIATE mode — all of
+which pg_ivm cannot do.
 
-1. **[PLAN_TRANSACTIONAL_IVM](../sql/PLAN_TRANSACTIONAL_IVM.md)** adds an
-   `IMMEDIATE` refresh mode that reuses the DVM engine with transition-table-
-   based delta sources, plus a `pgivm.*` compatibility layer for drop-in
-   pg_ivm migration.
+The one remaining structural gap is **PG version support**:
 
-2. **[PLAN_PG_BACKCOMPAT](../infra/PLAN_PG_BACKCOMPAT.md)** details backporting
-   to PG 14–18 (or PG 16–18 as MVP) in ~2.5–3 weeks, primarily by `#[cfg]`-
-   gating ~435 lines of JSON/SQL-standard parse-tree code.
+- **[PLAN_PG_BACKCOMPAT](../infra/PLAN_PG_BACKCOMPAT.md)** details backporting
+  to PG 14–18 (or PG 16–18 as MVP) in ~2.5–3 weeks, primarily by `#[cfg]`-
+  gating ~435 lines of JSON/SQL-standard parse-tree code.
 
-Once both plans are implemented, **pg_trickle will be a strict superset of
-pg_ivm** in every dimension: same immediate maintenance model, broader PG
+Once backcompat is implemented, **pg_trickle will be a strict superset of
+pg_ivm** in every dimension: same immediate maintenance model, comparable PG
 version support (14–18 vs 13–18, with PG 13 EOL), dramatically wider SQL
 coverage, and a complete operational layer that pg_ivm entirely lacks.
 
-For users migrating from pg_ivm, the compatibility layer (`pgivm.create_immv`,
-`pgivm.refresh_immv`, `pgivm.pg_ivm_immv`) enables **zero-change migration**.
+For users migrating from pg_ivm, the `IMMEDIATE` refresh mode already provides
+the same zero-staleness guarantee. A full compatibility layer (`pgivm.create_immv`,
+`pgivm.refresh_immv`, `pgivm.pg_ivm_immv`) is planned for post-1.0 to enable
+**zero-change migration**.
 
 ---
 
