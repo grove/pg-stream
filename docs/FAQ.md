@@ -30,7 +30,7 @@ troubleshooting. Use the table of contents below to jump to a specific topic.
 - [Schema Changes & DDL Events](#schema-changes--ddl-events) — Reinitialize, event triggers
 
 **Operations**
-- [Performance & Tuning](#performance--tuning) — Scheduler tuning, disk space, adaptive fallback
+- [Performance & Tuning](#performance--tuning) — Scheduler tuning, min schedule risks, disk space, adaptive fallback
 - [Interoperability](#interoperability) — Views, replication, connection poolers, triggers
 - [dbt Integration](#dbt-integration) — Materialization, commands, freshness checks
 - [Deployment & Operations](#deployment--operations) — Workers, upgrades, replicas, Kubernetes
@@ -1339,6 +1339,31 @@ The `pg_trickle.scheduler_interval_ms` GUC controls how often the scheduler chec
 | Low-latency (near real-time) | `100`–`500` |
 | Standard | `1000` (default) |
 | Low-overhead (many STs, long schedules) | `5000`–`10000` |
+
+### Is there any risk in setting `min_schedule_seconds` very low?
+
+Yes. `pg_trickle.min_schedule_seconds` (default: 60) is a safety guardrail, not an arbitrary limit. Setting it very low — especially in production — can cause several problems:
+
+**WAL amplification.** Every differential refresh writes a `MERGE` to the WAL. At 1-second intervals across many stream tables, WAL generation rises sharply, increasing replication lag and storage costs.
+
+**Lock contention.** Each refresh acquires locks on the change buffer table. With `cleanup_use_truncate = true` (the default), this is an `AccessExclusiveLock`. Sub-second schedules can starve concurrent `INSERT`/`UPDATE`/`DELETE` statements on the source tables.
+
+**Cascading refresh load.** If a refresh takes longer than the schedule interval (e.g., an 800 ms refresh on a 1-second schedule), the next refresh fires almost immediately upon completion. With chained or diamond-shaped ST graphs, the entire topological chain must complete within the interval to avoid falling behind.
+
+**Autovacuum pressure.** Rapid `MERGE` operations produce dead tuples in the stream table faster than autovacuum can clean them up, bloating the table and degrading query performance over time.
+
+**Adaptive fallback triggering.** At high change rates, `pg_trickle.differential_max_change_ratio` may trigger a FULL refresh instead of DIFFERENTIAL. A FULL refresh at 1-second intervals is very expensive and defeats the purpose of differential maintenance.
+
+**Practical guidance:**
+
+| Environment | Recommended minimum |
+|---|---|
+| Development / testing | `1` s — fine for fast iteration |
+| Lightly loaded production | `10`–`30` s |
+| Standard production | `60` s (default) |
+| High-throughput OLTP | `120`+ s — let change buffers accumulate for efficient batch merging |
+
+If you need near-real-time results, consider **IMMEDIATE mode** (`refresh_mode => 'DIFFERENTIAL'` with same-transaction refresh) instead of a very short schedule — it avoids the scheduler overhead entirely and updates the stream table within your transaction.
 
 ### What is the adaptive fallback to FULL?
 
