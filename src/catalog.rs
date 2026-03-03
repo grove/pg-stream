@@ -343,6 +343,24 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// Record a "no data" refresh cycle — the table was verified up-to-date but
+    /// no rows were written.  Updates `last_refresh_at` so staleness calculations
+    /// see the check, but intentionally preserves `data_timestamp` so that
+    /// downstream stream tables (which compare `upstream.data_timestamp > us.data_timestamp`
+    /// to detect when a full refresh is needed) do not see a spurious "upstream
+    /// changed" signal after a pure no-data verification pass.
+    pub fn update_after_no_data_refresh(pgt_id: i64) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET is_populated = true, \
+             last_refresh_at = now(), consecutive_errors = 0, \
+             status = 'ACTIVE', needs_reinit = false, updated_at = now() \
+             WHERE pgt_id = $1",
+            &[pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Mark a ST as populated with a data timestamp and store frontier after refresh.
     pub fn update_after_refresh_with_frontier(
         pgt_id: i64,
