@@ -373,10 +373,13 @@ INSERT INTO employees (name, department_id, salary) VALUES
 
 The stream tables don't know about Heidi yet. The change is in the buffer, waiting for the next refresh.
 
-Refresh the whole pipeline in one call (or wait for the 30-second schedule):
+Refresh the pipeline in dependency order (or wait for the 1-minute schedule):
 
 ```sql
--- refresh_stream_table cascades to dependent tables automatically
+-- Refresh each layer in source-to-sink order.
+-- department_stats reads from employees (has buffered changes).
+-- department_report reads from department_stats.
+SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
@@ -416,9 +419,14 @@ INSERT INTO departments (id, name, parent_id) VALUES
 
 **What happened:** The CDC trigger on `departments` fired. The change buffer for `departments` has one new row. None of the stream tables know about it yet.
 
-Refresh the whole pipeline:
+Refresh each layer in dependency order:
 
 ```sql
+-- department_tree reads from departments (has buffered changes).
+-- department_stats reads from department_tree.
+-- department_report reads from department_stats.
+SELECT pgtrickle.refresh_stream_table('department_tree');
+SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
