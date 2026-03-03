@@ -466,6 +466,24 @@ SET pg_trickle.diamond_schedule_policy = 'slowest';
 SET pg_trickle.diamond_schedule_policy = 'fastest';
 ```
 
+#### Choosing a policy
+
+**Use `'fastest'` (default) when:**
+- Data freshness matters — the convergence node should reflect changes as soon as any upstream member has new data.
+- Your diamond members have similar schedules, so the cost difference between the two policies is small.
+- You are unsure which to pick. `'fastest'` matches the intuitive expectation of a streaming pipeline: "if anything changed, recompute now."
+
+**Use `'slowest'` when:**
+- All members of the diamond have meaningfully different schedules (e.g. B refreshes every 30 s, C every 10 min). With `'fastest'`, the group fires every 30 s even though C contributes stale data for most of those runs — largely wasted work.
+- The convergence node runs a heavy aggregation or join and the extra CPU/I/O cost of redundant refreshes outweighs the staleness penalty.
+- You are running a batch/analytical workload where freshness is secondary to throughput (e.g. TPC-H-style reporting).
+
+**Why `'fastest'` is the default:**  
+`pg_trickle` is a streaming/CDC-oriented extension. Users generally expect near-real-time results and are surprised when a convergence node lags because one slow member acts as a rate limiter for the whole group. `'slowest'` should be an explicit opt-in for cost-sensitive deployments, not something users stumble into by default.
+
+**Watch out for the "slowest member" effect with `'slowest'`:**  
+The effective refresh cadence of the convergence node becomes `min(all member schedules)`. A single rarely-scheduled intermediate ST silently degrades freshness for the entire output, which can be hard to diagnose without inspecting `pgtrickle.diamond_groups()`.
+
 > **Note:** This setting only takes effect when `diamond_consistency = 'atomic'`. In `'none'` mode each ST uses its own schedule independently.
 
 ---
