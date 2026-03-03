@@ -168,6 +168,18 @@ When `pg_trickle.cdc_mode` is set to `'auto'` or `'wal'` and `wal_level = logica
 
 See ADR-001 and ADR-002 in [plans/adrs/PLAN_ADRS.md](../plans/adrs/PLAN_ADRS.md) for the original design rationale and [plans/sql/PLAN_HYBRID_CDC.md](../plans/sql/PLAN_HYBRID_CDC.md) for the full implementation plan.
 
+#### Immediate Mode / Transactional IVM (`src/ivm.rs`)
+
+When `refresh_mode = 'IMMEDIATE'`, pg_trickle uses **statement-level AFTER triggers with transition tables** instead of row-level CDC triggers. The stream table is maintained **synchronously within the same transaction** as the base table DML.
+
+1. **BEFORE Triggers** — Statement-level BEFORE triggers on each base table acquire an advisory lock on the stream table to prevent concurrent conflicting updates.
+2. **AFTER Triggers** — Statement-level AFTER triggers with `REFERENCING NEW TABLE AS ... OLD TABLE AS ...` copy the transition table data to temp tables, then call the Rust `pgt_ivm_apply_delta()` function.
+3. **Delta Computation** — The DVM engine's `Scan` operator reads from the temp tables (via `DeltaSource::TransitionTable`) instead of change buffer tables. No LSN filtering or net-effect computation is needed — each trigger invocation represents a single atomic statement.
+4. **Delta Application** — The computed delta is applied via explicit DML (DELETE + INSERT ON CONFLICT) to the stream table.
+5. **TRUNCATE** — A separate AFTER TRUNCATE trigger calls `pgt_ivm_handle_truncate()`, which truncates the stream table and re-populates from the defining query.
+
+No change buffer tables, no scheduler involvement, and no WAL infrastructure is needed for IMMEDIATE mode. See [plans/sql/PLAN_TRANSACTIONAL_IVM.md](../plans/sql/PLAN_TRANSACTIONAL_IVM.md) for the design plan.
+
 ### 4. DVM Engine (`src/dvm/`)
 
 The Differential View Maintenance engine is the core of the system. It transforms the defining SQL query into an executable operator tree that can compute deltas efficiently.
@@ -602,6 +614,7 @@ src/
 ├── error.rs         # Centralized error types
 ├── hash.rs          # xxHash row ID generation (pg_trickle_hash / pg_trickle_hash_multi)
 ├── hooks.rs         # DDL event trigger handlers (_on_ddl_end, _on_sql_drop)
+├── ivm.rs           # Transactional IVM (IMMEDIATE mode: statement-level triggers)
 ├── shmem.rs         # Shared memory state (PgTrickleSharedState, DAG_REBUILD_SIGNAL, CACHE_GENERATION)
 ├── dvm/
 │   ├── mod.rs       # DVM module root + recursive CTE orchestration

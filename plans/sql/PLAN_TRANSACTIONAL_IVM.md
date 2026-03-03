@@ -1,8 +1,8 @@
 # Plan: Transactionally Updated Views (Immediate IVM)
 
 Date: 2026-02-28
-Status: PROPOSED
-Last Updated: 2026-02-28
+Status: IN PROGRESS (Phase 1 MVP implemented)
+Last Updated: 2026-07-09
 
 ---
 
@@ -519,46 +519,69 @@ SELECT pgivm.create_immv('my_view', 'SELECT a, sum(b) FROM t GROUP BY a');
 
 **Goal:** Single-table & multi-table immediate IVM with aggregates and JOIN.
 
-1. **Add IMMEDIATE refresh mode to catalog and API**
-   - Accept `'IMMEDIATE'` in `create_stream_table` and `alter_stream_table`.
-   - Store in `pgt_stream_tables.refresh_mode`.
-   - Validate query restrictions.
+> **Implementation Status (2026-07-09):** Phase 1 MVP is implemented. See
+> implementation notes below for deviations from the original design.
 
-2. **Implement statement-level IVM triggers**
-   - `pgtrickle.pgt_ivm_before(st_oid, lock_mode)` — BEFORE trigger function.
-   - `pgtrickle.pgt_ivm_after(st_oid, lock_mode)` — AFTER trigger function
-     with transition table access.
-   - Wire trigger creation into `create_stream_table` when
-     `refresh_mode = 'IMMEDIATE'`.
-   - In-memory state tracking (hash table keyed by stream table OID) for
-     before/after counts, snapshots, transition tuplestores.
+1. **Add IMMEDIATE refresh mode to catalog and API** ✅ DONE
+   - `RefreshMode::Immediate` variant added to `dag.rs` with `is_immediate()`
+     and `is_scheduled()` helpers.
+   - `create_stream_table` accepts `'IMMEDIATE'`, sets schedule to NULL,
+     skips CDC trigger setup, calls `ivm::setup_ivm_triggers()` instead.
+   - Catalog CHECK constraint updated: `('FULL', 'DIFFERENTIAL', 'IMMEDIATE')`.
+   - TopK + IMMEDIATE combination rejected at creation time.
+   - Manual `refresh_stream_table()` for IMMEDIATE STs does a full refresh.
 
-3. **Adapt DVM delta computation for transition tables**
-   - New `DeltaSource` enum: `ChangeBuffer { lsn_range }` vs
-     `TransitionTable { old_tuplestore, new_tuplestore }`.
-   - Modify `Scan` operator to generate delta SQL from ENRs when in
-     IMMEDIATE mode.
-   - Reuse all other operators as-is (Filter, Project, Join, Aggregate,
-     etc. don't care where the scan delta comes from).
+2. **Implement statement-level IVM triggers** ✅ DONE
+   - New `src/ivm.rs` module (~572 lines) with:
+     - `setup_ivm_triggers()` — creates 8 triggers per source table (4 BEFORE
+       + 4 AFTER with transition tables `REFERENCING NEW/OLD TABLE AS`).
+     - `cleanup_ivm_triggers()` — drops all triggers and PL/pgSQL functions.
+     - PL/pgSQL wrapper functions that copy transition tables to temp tables
+       then call Rust `pg_extern` functions.
+   - **Deviation from plan:** Phase 1 uses PL/pgSQL wrappers + temp tables
+     instead of C-level ENR access (Option A from §3.2). This is simpler
+     and avoids unsafe code. ENR optimization deferred to Phase 4.
+   - **Deviation:** No in-memory state tracking (`IvmTriggerState` hash table)
+     in Phase 1. Each trigger invocation independently loads metadata and
+     applies the delta. Simpler and correct, but slightly less efficient
+     for multi-table views where before/after counting would batch work.
 
-4. **Delta application via existing explicit DML path**
-   - Reuse the existing trigger_delete/update/insert templates from
-     `CachedMergeTemplate`.
-   - Instead of materializing into `__pgt_delta_{pgt_id}`, materialize
-     from the ENR-based delta SQL.
+3. **Adapt DVM delta computation for transition tables** ✅ DONE
+   - `DeltaSource` enum added to `src/dvm/diff.rs`: `ChangeBuffer` (default)
+     vs `TransitionTable { tables: HashMap<u32, TransitionTableNames> }`.
+   - `DiffContext` gained `delta_source` field with `with_delta_source()`
+     builder method.
+   - `diff_scan()` in `src/dvm/operators/scan.rs` refactored to dispatch
+     between `diff_scan_change_buffer()` (existing) and
+     `diff_scan_transition()` (new).
+   - Transition scan: reads from temp tables, computes `__pgt_row_id` from
+     PK hash, emits `UNION ALL` of DELETE (old) + INSERT (new).
 
-5. **Handle TRUNCATE**
-   - Truncate the stream table, or full-refresh for aggregate views
-     without GROUP BY.
+4. **Delta application via existing explicit DML path** ✅ DONE
+   - `pgt_ivm_apply_delta(pgt_id, source_oid, has_new, has_old)` — `pg_extern`
+     function that loads ST metadata, parses defining query, builds
+     `DeltaSource::TransitionTable`, generates delta SQL via DVM, materializes
+     to temp table, then applies DELETE + INSERT ON CONFLICT.
+   - Reuses existing DVM engine — Filter, Project, Join, Aggregate operators
+     work unchanged.
 
-6. **Basic concurrency: ExclusiveLock on all IMMEDIATE stream tables**
-   - pg_ivm's approach. Sufficient for correctness.
+5. **Handle TRUNCATE** ✅ DONE
+   - `pgt_ivm_handle_truncate(pgt_id)` — `pg_extern` function that truncates
+     the stream table and re-populates from the defining query.
+   - BEFORE TRUNCATE trigger acquires advisory lock for serialization.
 
-7. **Tests**
-   - Unit tests for delta computation with transition tables.
-   - E2E tests: INSERT/UPDATE/DELETE on base tables, verify stream table
-     updates immediately.
-   - Concurrent transaction tests.
+6. **Basic concurrency: Advisory lock on all IMMEDIATE stream tables** ✅ DONE
+   - **Deviation from plan:** Uses `pg_advisory_xact_lock(st_oid)` instead of
+     `ExclusiveLock`. Simpler for Phase 1 — avoids complex lock-mode
+     analysis. Advisory lock provides equivalent serialization.
+   - Lock acquired in BEFORE trigger, released at transaction end.
+
+7. **Tests** ✅ DONE
+   - 7 unit tests for transition table scan path in `scan.rs`.
+   - 1 unit test for `RefreshMode::Immediate` helpers.
+   - 10 E2E tests in `tests/e2e_ivm_tests.rs`: create, INSERT/UPDATE/DELETE
+     propagation, TRUNCATE, DROP cleanup, TopK rejection, manual refresh,
+     mixed operations.
 
 ### Phase 2: pg_ivm Compatibility Layer
 
@@ -624,6 +647,27 @@ SELECT pgivm.create_immv('my_view', 'SELECT a, sum(b) FROM t GROUP BY a');
 
 5. **Benchmarking suite** — compare pg_trickle IMMEDIATE vs pg_ivm vs
    deferred refresh on standard workloads.
+
+### Prioritized Remaining Work (post Phase 1 MVP)
+
+The following items are prioritized by impact and dependency order:
+
+| Priority | Item | Phase | Description |
+|----------|------|-------|-------------|
+| **P0** | `alter_stream_table` mode switching | 1 | Allow switching between DIFFERENTIAL↔IMMEDIATE (drop old triggers, create new ones, full refresh). Currently `alter_stream_table` doesn't handle IMMEDIATE. |
+| **P0** | E2E test validation | 1 | Run `just test-e2e` to validate the 10 E2E IVM tests pass against a real PostgreSQL 18 instance. |
+| **P1** | In-memory state tracking (`IvmTriggerState`) | 1 | Per-session hash table to batch before/after trigger counts for multi-table views. Currently each trigger invocation is independent. |
+| **P1** | Query restriction validation | 1 | Enforce Phase 1 query subset (§3.8) at creation time — e.g., reject window functions, UNION, recursive CTEs with IMMEDIATE. |
+| **P1** | ENR-based transition table access | 4 | Replace temp-table copy pattern with direct Ephemeral Named Relation access from transition tables. Avoids data copy overhead. |
+| **P2** | pg_ivm compatibility layer | 2 | `pgivm.*` wrapper functions: `create_immv()`, `refresh_immv()`, `get_immv_def()`, catalog view. |
+| **P2** | Optimized locking (RowExclusiveLock) | 3 | Use RowExclusiveLock when safe (single-table, INSERT-only, no agg/distinct). Currently uses advisory lock for all. |
+| **P2** | Concurrent transaction tests | 1 | Test concurrent DML + IMMEDIATE IVM under READ COMMITTED and REPEATABLE READ. |
+| **P3** | `DROP TABLE` interception for IMMEDIATE STs | 2 | Support `DROP TABLE` as alternative to `drop_stream_table()`. |
+| **P3** | Cascading IMMEDIATE stream tables | 3 | ST A → ST B propagation within the same transaction. |
+| **P3** | Delta SQL template caching | 4 | Pre-compile IMMEDIATE mode delta SQL to avoid per-DML parse overhead. |
+| **P4** | Extended query support (window, UNION, LATERAL) | 3 | Enable advanced SQL constructs in IMMEDIATE mode. |
+| **P4** | Aggregate fast-path optimization | 4 | Single-UPDATE path for pure-aggregate queries with invertible aggs. |
+| **P4** | C-level trigger functions | 4 | Replace PL/pgSQL wrappers with C-level trigger functions for lower overhead. |
 
 ---
 

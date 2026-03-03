@@ -91,17 +91,25 @@ SELECT pgtrickle.create_stream_table(
 
 - **FULL** — Truncates the stream table and re-runs the entire defining query every refresh cycle. Simple but expensive for large result sets.
 - **DIFFERENTIAL** — Computes only the delta (changes since the last refresh) using the DVM engine and applies it via a `MERGE` statement. Much faster when only a small fraction of source data changes between refreshes.
+- **IMMEDIATE** — Maintains the stream table synchronously within the same transaction as the base table DML. Uses statement-level triggers with transition tables — no change buffers, no scheduler. The stream table is always up-to-date.
 
-### When should I use FULL vs. DIFFERENTIAL?
+### When should I use FULL vs. DIFFERENTIAL vs. IMMEDIATE?
 
 Use **DIFFERENTIAL** (default) when:
 - Source tables are large and changes between refreshes are small
 - The defining query uses supported operators (most common SQL is supported)
+- Some staleness (seconds to minutes) is acceptable
 
 Use **FULL** when:
 - The defining query uses unsupported aggregates (`CORR`, `COVAR_*`, `REGR_*`)
 - Source tables are small and a full recompute is cheap
 - You see frequent adaptive fallbacks to FULL (check refresh history)
+
+Use **IMMEDIATE** when:
+- The stream table must always reflect the latest committed data
+- You need transactional consistency (reads within the same transaction see updated data)
+- Write-side overhead per DML statement is acceptable
+- The defining query is relatively simple (no TopK, no materialized view sources)
 
 ### What schedule formats are supported?
 

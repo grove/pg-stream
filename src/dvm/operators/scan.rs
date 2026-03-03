@@ -20,7 +20,7 @@
 //! `c."new_{col}"` / `c."old_{col}"` with proper PostgreSQL types,
 //! eliminating `jsonb_populate_record` overhead.
 
-use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
+use crate::dvm::diff::{DeltaSource, DiffContext, DiffResult, quote_ident};
 use crate::dvm::parser::OpTree;
 use crate::error::PgTrickleError;
 
@@ -34,6 +34,10 @@ use crate::error::PgTrickleError;
 ///
 /// Column extraction uses typed columns `c."new_{col}"` / `c."old_{col}"`
 /// directly from the change buffer table — no JSONB deserialization.
+///
+/// When the context's `delta_source` is `TransitionTable`, reads from
+/// statement-level trigger transition tables (ENRs) instead — no LSN
+/// filtering, no net-effect computation needed.
 pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTrickleError> {
     let OpTree::Scan {
         table_oid,
@@ -48,14 +52,147 @@ pub fn diff_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgTri
         ));
     };
 
+    // Dispatch based on delta source: transition tables (IMMEDIATE) vs
+    // change buffer (DIFFERENTIAL).
+    // Clone the delta_source to avoid holding an immutable borrow on ctx
+    // while passing it as mutable to the sub-functions.
+    let delta_source = ctx.delta_source.clone();
+    match &delta_source {
+        DeltaSource::TransitionTable { tables } => {
+            diff_scan_transition(ctx, *table_oid, columns, pk_columns, alias, tables)
+        }
+        DeltaSource::ChangeBuffer => {
+            diff_scan_change_buffer(ctx, *table_oid, columns, pk_columns, alias)
+        }
+    }
+}
+
+/// Differentiate a Scan node using trigger transition tables (IMMEDIATE mode).
+///
+/// Transition tables are registered as Ephemeral Named Relations (ENRs):
+/// - `__pgt_newtable_<oid>`: rows from INSERT/UPDATE (NEW values)
+/// - `__pgt_oldtable_<oid>`: rows from UPDATE/DELETE (OLD values)
+///
+/// The delta is straightforward:
+/// - INSERT: `SELECT 'I', cols FROM newtable` (with row_id from PK hash)
+/// - DELETE: `SELECT 'D', cols FROM oldtable` (with row_id from PK hash)
+/// - UPDATE: DELETE from oldtable UNION ALL INSERT from newtable
+///
+/// No net-effect computation is needed because each statement trigger
+/// fires exactly once — there are no multiple changes per PK within
+/// a single trigger invocation.
+fn diff_scan_transition(
+    ctx: &mut DiffContext,
+    table_oid: u32,
+    columns: &[crate::dvm::parser::Column],
+    pk_columns: &[String],
+    alias: &str,
+    tables: &std::collections::HashMap<u32, crate::dvm::diff::TransitionTableNames>,
+) -> Result<DiffResult, PgTrickleError> {
+    let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+
+    // Look up the transition table names for this source OID.
+    let tt_names = tables.get(&table_oid);
+
+    // Build the row_id hash expression from PK columns (or all columns
+    // for keyless tables). Unlike the change buffer path, there is no
+    // pre-computed pk_hash — we compute it from the actual column values.
+    let hash_cols: Vec<&str> = if pk_columns.is_empty() {
+        columns.iter().map(|c| c.name.as_str()).collect()
+    } else {
+        pk_columns.iter().map(|s| s.as_str()).collect()
+    };
+
+    let hash_args: Vec<String> = hash_cols
+        .iter()
+        .map(|c| format!("{}::TEXT", quote_ident(c)))
+        .collect();
+    let row_id_expr = build_hash_expr(&hash_args);
+
+    // Column list for SELECT
+    let col_refs: Vec<String> = columns.iter().map(|c| quote_ident(&c.name)).collect();
+    let col_refs_str = col_refs.join(", ");
+
+    // Build the delta CTE from available transition tables.
+    // Both branches may exist for UPDATE, or only one for INSERT/DELETE.
+    let mut branches = Vec::new();
+
+    if let Some(tt) = tt_names {
+        if let Some(ref old_name) = tt.old_name {
+            // DELETE branch: rows from oldtable
+            branches.push(format!(
+                "\
+SELECT {row_id_expr} AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {col_refs_str}
+FROM {old_table}",
+                old_table = quote_ident(old_name),
+            ));
+        }
+        if let Some(ref new_name) = tt.new_name {
+            // INSERT branch: rows from newtable
+            branches.push(format!(
+                "\
+SELECT {row_id_expr} AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {col_refs_str}
+FROM {new_table}",
+                new_table = quote_ident(new_name),
+            ));
+        }
+    }
+
+    let cte_name = ctx.next_cte_name(&format!("scan_{alias}"));
+    if branches.is_empty() {
+        // No transition tables for this source — emit an empty delta.
+        // This can happen for sources that weren't modified in this statement.
+        // Use a SELECT … LIMIT 0 from the source table to get correct column
+        // types without needing to track them explicitly.
+        let null_cols: Vec<String> = columns
+            .iter()
+            .map(|c| format!("NULL AS {}", quote_ident(&c.name)))
+            .collect();
+        let sql = format!(
+            "SELECT NULL::BIGINT AS __pgt_row_id, NULL::TEXT AS __pgt_action, {} WHERE false",
+            null_cols.join(", "),
+        );
+        ctx.add_cte(cte_name.clone(), sql);
+    } else {
+        let sql = branches.join("\nUNION ALL\n");
+        ctx.add_cte(cte_name.clone(), sql);
+    }
+
+    // Transition tables produce at most one row per PK per statement,
+    // so the delta is inherently deduplicated for scan-chain queries.
+    let is_deduplicated = ctx.merge_safe_dedup;
+
+    Ok(DiffResult {
+        cte_name,
+        columns: col_names,
+        is_deduplicated,
+    })
+}
+
+/// Differentiate a Scan node using change buffer tables (DIFFERENTIAL mode).
+///
+/// This is the original code path that reads from
+/// `pgtrickle_changes.changes_<oid>` with LSN-range filtering and
+/// net-effect computation.
+fn diff_scan_change_buffer(
+    ctx: &mut DiffContext,
+    table_oid: u32,
+    columns: &[crate::dvm::parser::Column],
+    pk_columns: &[String],
+    alias: &str,
+) -> Result<DiffResult, PgTrickleError> {
     let change_table = format!(
         "{}.changes_{}",
         quote_ident(&ctx.change_buffer_schema),
         table_oid,
     );
 
-    let prev_lsn = ctx.get_prev_lsn(*table_oid);
-    let new_lsn = ctx.get_new_lsn(*table_oid);
+    let prev_lsn = ctx.get_prev_lsn(table_oid);
+    let new_lsn = ctx.get_new_lsn(table_oid);
 
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
@@ -563,5 +700,129 @@ mod tests {
         ]);
         assert!(result.contains("(l_extendedprice * (1 - l_discount))::TEXT"));
         assert!(result.contains("(volume)::TEXT"));
+    }
+
+    // ── Transition table scan tests (IMMEDIATE mode) ────────────────
+
+    fn transition_ctx(
+        table_oid: u32,
+        old_name: Option<&str>,
+        new_name: Option<&str>,
+    ) -> DiffContext {
+        use crate::dvm::diff::{DeltaSource, TransitionTableNames};
+
+        let mut tables = std::collections::HashMap::new();
+        tables.insert(
+            table_oid,
+            TransitionTableNames {
+                old_name: old_name.map(|s| s.to_string()),
+                new_name: new_name.map(|s| s.to_string()),
+            },
+        );
+        test_ctx().with_delta_source(DeltaSource::TransitionTable { tables })
+    }
+
+    #[test]
+    fn test_diff_scan_transition_insert_only() {
+        let mut ctx = transition_ctx(100, None, Some("__pgt_newtable_100"));
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should reference the new transition table
+        assert_sql_contains(&sql, "__pgt_newtable_100");
+        // Should have INSERT action
+        assert_sql_contains(&sql, "'I'::TEXT AS __pgt_action");
+        // Should NOT have DELETE action (no old table)
+        assert!(!sql.contains("'D'::TEXT AS __pgt_action"));
+        // Should NOT reference change buffer
+        assert!(!sql.contains("pgtrickle_changes"));
+    }
+
+    #[test]
+    fn test_diff_scan_transition_delete_only() {
+        let mut ctx = transition_ctx(100, Some("__pgt_oldtable_100"), None);
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should reference the old transition table
+        assert_sql_contains(&sql, "__pgt_oldtable_100");
+        // Should have DELETE action
+        assert_sql_contains(&sql, "'D'::TEXT AS __pgt_action");
+        // Should NOT have INSERT action
+        assert!(!sql.contains("'I'::TEXT AS __pgt_action"));
+    }
+
+    #[test]
+    fn test_diff_scan_transition_update() {
+        let mut ctx = transition_ctx(100, Some("__pgt_oldtable_100"), Some("__pgt_newtable_100"));
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should reference both transition tables
+        assert_sql_contains(&sql, "__pgt_newtable_100");
+        assert_sql_contains(&sql, "__pgt_oldtable_100");
+        // Should have both DELETE and INSERT actions
+        assert_sql_contains(&sql, "'D'::TEXT AS __pgt_action");
+        assert_sql_contains(&sql, "'I'::TEXT AS __pgt_action");
+        // Combined via UNION ALL
+        assert_sql_contains(&sql, "UNION ALL");
+    }
+
+    #[test]
+    fn test_diff_scan_transition_no_tables_emits_empty() {
+        // Source OID not in the transition table map → empty delta
+        use crate::dvm::diff::{DeltaSource, TransitionTableNames};
+
+        let mut tables = std::collections::HashMap::new();
+        tables.insert(
+            999,
+            TransitionTableNames {
+                old_name: Some("__pgt_oldtable_999".to_string()),
+                new_name: Some("__pgt_newtable_999".to_string()),
+            },
+        );
+        let mut ctx = test_ctx().with_delta_source(DeltaSource::TransitionTable { tables });
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should have WHERE false for empty delta
+        assert_sql_contains(&sql, "WHERE false");
+    }
+
+    #[test]
+    fn test_diff_scan_transition_uses_pk_hash() {
+        let mut ctx = transition_ctx(100, None, Some("__pgt_newtable_100"));
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should compute row_id from PK column
+        assert_sql_contains(&sql, "pgtrickle.pg_trickle_hash");
+        assert_sql_contains(&sql, "\"id\"::TEXT");
+    }
+
+    #[test]
+    fn test_diff_scan_transition_columns_preserved() {
+        let mut ctx = transition_ctx(42, None, Some("__pgt_newtable_42"));
+        let tree = scan(42, "items", "public", "i", &["id", "name", "price"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+
+        assert_eq!(result.columns, vec!["id", "name", "price"]);
+    }
+
+    #[test]
+    fn test_diff_scan_transition_no_lsn_filter() {
+        let mut ctx = transition_ctx(100, None, Some("__pgt_newtable_100"));
+        let tree = scan(100, "orders", "public", "o", &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Transition table mode should NOT have LSN filtering
+        assert!(!sql.contains("pg_lsn"));
+        assert!(!sql.contains("c.lsn"));
     }
 }

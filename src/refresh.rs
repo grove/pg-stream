@@ -756,6 +756,10 @@ pub fn determine_refresh_action(st: &StreamTableMeta, has_upstream_changes: bool
     match st.refresh_mode {
         RefreshMode::Full => RefreshAction::Full,
         RefreshMode::Differential => RefreshAction::Differential,
+        // IMMEDIATE-mode STs are maintained by triggers, not by the
+        // scheduler.  If we somehow reach this point (e.g. manual
+        // refresh), fall back to a full refresh.
+        RefreshMode::Immediate => RefreshAction::Full,
     }
 }
 

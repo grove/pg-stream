@@ -218,6 +218,10 @@ impl StStatus {
 pub enum RefreshMode {
     Full,
     Differential,
+    /// Immediate (transactional) IVM — stream table is updated within the same
+    /// transaction as the base table DML, using statement-level AFTER triggers
+    /// with transition tables.
+    Immediate,
 }
 
 impl RefreshMode {
@@ -225,7 +229,18 @@ impl RefreshMode {
         match self {
             RefreshMode::Full => "FULL",
             RefreshMode::Differential => "DIFFERENTIAL",
+            RefreshMode::Immediate => "IMMEDIATE",
         }
+    }
+
+    /// Returns true if this mode uses a background schedule for refresh.
+    pub fn is_scheduled(&self) -> bool {
+        matches!(self, RefreshMode::Full | RefreshMode::Differential)
+    }
+
+    /// Returns true if this is IMMEDIATE (transactional) mode.
+    pub fn is_immediate(&self) -> bool {
+        matches!(self, RefreshMode::Immediate)
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -233,10 +248,11 @@ impl RefreshMode {
         match s.to_uppercase().as_str() {
             "FULL" => Ok(RefreshMode::Full),
             "DIFFERENTIAL" => Ok(RefreshMode::Differential),
+            "IMMEDIATE" => Ok(RefreshMode::Immediate),
             // Accept INCREMENTAL as a deprecated alias for backward compatibility.
             "INCREMENTAL" => Ok(RefreshMode::Differential),
             other => Err(PgTrickleError::InvalidArgument(format!(
-                "unknown refresh mode: {other}. Must be 'FULL' or 'DIFFERENTIAL'"
+                "unknown refresh mode: {other}. Must be 'FULL', 'DIFFERENTIAL', or 'IMMEDIATE'"
             ))),
         }
     }
@@ -1169,7 +1185,11 @@ mod tests {
 
     #[test]
     fn test_refresh_mode_as_str_and_from_str_roundtrip() {
-        for mode in [RefreshMode::Full, RefreshMode::Differential] {
+        for mode in [
+            RefreshMode::Full,
+            RefreshMode::Differential,
+            RefreshMode::Immediate,
+        ] {
             let s = mode.as_str();
             let parsed = RefreshMode::from_str(s).unwrap();
             assert_eq!(parsed, mode);
@@ -1185,6 +1205,14 @@ mod tests {
             RefreshMode::from_str("incremental").unwrap(),
             RefreshMode::Differential
         );
+        assert_eq!(
+            RefreshMode::from_str("IMMEDIATE").unwrap(),
+            RefreshMode::Immediate
+        );
+        assert_eq!(
+            RefreshMode::from_str("immediate").unwrap(),
+            RefreshMode::Immediate
+        );
     }
 
     #[test]
@@ -1194,6 +1222,16 @@ mod tests {
         if let Err(PgTrickleError::InvalidArgument(msg)) = result {
             assert!(msg.contains("unknown refresh mode"));
         }
+    }
+
+    #[test]
+    fn test_refresh_mode_immediate_helpers() {
+        assert!(RefreshMode::Immediate.is_immediate());
+        assert!(!RefreshMode::Immediate.is_scheduled());
+        assert!(!RefreshMode::Full.is_immediate());
+        assert!(RefreshMode::Full.is_scheduled());
+        assert!(!RefreshMode::Differential.is_immediate());
+        assert!(RefreshMode::Differential.is_scheduled());
     }
 
     #[test]

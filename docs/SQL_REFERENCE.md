@@ -28,8 +28,8 @@ pgtrickle.create_stream_table(
 |---|---|---|---|
 | `name` | `text` | — | Name of the stream table. May be schema-qualified (`myschema.my_st`). Defaults to `public` schema. |
 | `query` | `text` | — | The defining SQL query. Must be a valid SELECT statement using supported operators. |
-| `schedule` | `text` | `'1m'` | Refresh schedule as a Prometheus/GNU-style duration string (e.g., `'30s'`, `'5m'`, `'1h'`, `'1h30m'`, `'1d'`) **or** a cron expression (e.g., `'*/5 * * * *'`, `'@hourly'`). Set to `NULL` for CALCULATED mode (inherits schedule from downstream dependents). |
-| `refresh_mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` (truncate and reload) or `'DIFFERENTIAL'` (apply delta only). |
+| `schedule` | `text` | `'1m'` | Refresh schedule as a Prometheus/GNU-style duration string (e.g., `'30s'`, `'5m'`, `'1h'`, `'1h30m'`, `'1d'`) **or** a cron expression (e.g., `'*/5 * * * *'`, `'@hourly'`). Set to `NULL` for CALCULATED mode (inherits schedule from downstream dependents) or IMMEDIATE mode (no scheduling needed). |
+| `refresh_mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` (truncate and reload), `'DIFFERENTIAL'` (apply delta only), or `'IMMEDIATE'` (synchronous in-transaction maintenance via statement-level triggers). |
 | `initialize` | `bool` | `true` | If `true`, populates the table immediately via a full refresh. If `false`, creates the table empty. |
 | `diamond_consistency` | `text` | `NULL` (GUC default) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). When `NULL`, inherits from the `pg_trickle.diamond_consistency` GUC. See [CONFIGURATION.md](CONFIGURATION.md). |
 | `diamond_schedule_policy` | `text` | `NULL` (GUC default) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. When `NULL`, inherits from the `pg_trickle.diamond_schedule_policy` GUC. |
@@ -86,6 +86,15 @@ SELECT pgtrickle.create_stream_table(
     'SELECT region, SUM(revenue) AS total FROM sales GROUP BY region',
     '0 6 * * 1-5',
     'FULL'
+);
+
+-- Immediate mode: maintained synchronously within the same transaction
+-- No schedule needed — updates happen automatically when base table changes
+SELECT pgtrickle.create_stream_table(
+    'live_totals',
+    'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
+    NULL,
+    'IMMEDIATE'
 );
 ```
 

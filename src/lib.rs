@@ -29,6 +29,7 @@ pub mod dvm;
 pub mod error;
 mod hash;
 mod hooks;
+mod ivm;
 mod monitor;
 mod refresh;
 mod scheduler;
@@ -98,7 +99,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     original_query  TEXT,
     schedule      TEXT,
     refresh_mode    TEXT NOT NULL DEFAULT 'DIFFERENTIAL'
-                     CHECK (refresh_mode IN ('FULL', 'DIFFERENTIAL', 'DIFFERENTIAL')),
+                     CHECK (refresh_mode IN ('FULL', 'DIFFERENTIAL', 'IMMEDIATE')),
     status          TEXT NOT NULL DEFAULT 'INITIALIZING'
                      CHECK (status IN ('INITIALIZING', 'ACTIVE', 'SUSPENDED', 'ERROR')),
     is_populated    BOOLEAN NOT NULL DEFAULT FALSE,

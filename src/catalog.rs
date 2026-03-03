@@ -232,6 +232,33 @@ impl StreamTableMeta {
         })
     }
 
+    /// Look up a stream table by its catalog `pgt_id`.
+    ///
+    /// Returns `Ok(Some(meta))` if found, `Ok(None)` if the row doesn't exist.
+    pub fn get_by_id(pgt_id: i64) -> Result<Option<Self>, PgTrickleError> {
+        Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT pgt_id, pgt_relid, pgt_name, pgt_schema, defining_query, \
+                     original_query, schedule, refresh_mode, status, is_populated, \
+                     data_timestamp, consecutive_errors, needs_reinit, frontier, \
+                     auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
+                     diamond_consistency, diamond_schedule_policy \
+                     FROM pgtrickle.pgt_stream_tables \
+                     WHERE pgt_id = $1",
+                    None,
+                    &[pgt_id.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+            if table.is_empty() {
+                return Ok(None);
+            }
+
+            Self::from_spi_table(&table.first()).map(Some)
+        })
+    }
+
     /// Get all active stream tables.
     pub fn get_all_active() -> Result<Vec<Self>, PgTrickleError> {
         Spi::connect(|client| {

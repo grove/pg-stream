@@ -11,6 +11,26 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Added
 
+- **IMMEDIATE refresh mode (Transactional IVM)** — New `'IMMEDIATE'` refresh
+  mode maintains stream tables synchronously within the same transaction as
+  the base table DML. Uses statement-level AFTER triggers with transition
+  tables — no change buffers, no scheduler. The stream table is always
+  up-to-date within the current transaction.
+  - New `RefreshMode::Immediate` variant with `is_immediate()` /
+    `is_scheduled()` helper methods.
+  - `DeltaSource::TransitionTable` — DVM Scan operator reads from trigger
+    transition tables instead of change buffer tables when in IMMEDIATE mode.
+  - New `src/ivm.rs` module with trigger setup/cleanup, delta application
+    (`pgt_ivm_apply_delta`), and TRUNCATE handling (`pgt_ivm_handle_truncate`).
+  - Advisory lock-based concurrency control (ExclusiveLock equivalent).
+  - TRUNCATE on base table triggers full refresh of the stream table.
+  - Manual `refresh_stream_table()` for IMMEDIATE STs does a full refresh.
+  - TopK + IMMEDIATE combination is explicitly rejected.
+  - Catalog `get_by_id(pgt_id)` lookup method added.
+  - E2E tests: `tests/e2e_ivm_tests.rs` with INSERT/UPDATE/DELETE/TRUNCATE
+    propagation, DROP cleanup, validation, and mixed-operation tests.
+  - Unit tests for transition table scan path (7 tests) and
+    `RefreshMode::Immediate` helpers.
 - **TopK (ORDER BY + LIMIT) support** — Queries with a top-level `ORDER BY … LIMIT N` (constant integer, no OFFSET) are now recognized as "TopK" and accepted. TopK stream tables store only the top-N rows. Refreshes use scoped-recomputation via MERGE (bypass the DVM delta pipeline). Catalog columns `topk_limit` and `topk_order_by` record the pattern. Monitoring view exposes `is_topk`.
 - **FETCH FIRST / FETCH NEXT rejection** — `FETCH FIRST N ROWS ONLY` and `FETCH NEXT N ROWS ONLY` now produce the same unsupported-feature error as `LIMIT`.
 - **OFFSET without ORDER BY warning** — Subqueries using `OFFSET` without `ORDER BY` now emit a parser warning (alongside the existing `LIMIT` without `ORDER BY` warning).

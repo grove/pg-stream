@@ -15,6 +15,39 @@ use crate::error::PgTrickleError;
 use crate::version::Frontier;
 use std::collections::{HashMap, HashSet};
 
+/// Source of delta data for scan operators.
+///
+/// Determines how the `Scan` operator reads change data:
+/// - `ChangeBuffer`: reads from `pgtrickle_changes.changes_<oid>` tables
+///   with LSN-range filtering (for DIFFERENTIAL mode).
+/// - `TransitionTable`: reads from statement-level trigger transition tables
+///   (`__pgt_newtable` / `__pgt_oldtable`), registered as Ephemeral Named
+///   Relations (for IMMEDIATE mode).
+#[derive(Debug, Clone, Default)]
+pub enum DeltaSource {
+    /// Deferred mode: read from change buffer tables with LSN range filtering.
+    #[default]
+    ChangeBuffer,
+    /// Immediate mode: read from trigger transition tables.
+    /// Contains the transition table name suffixes per source table OID.
+    TransitionTable {
+        /// Map from source table OID to the transition table names
+        /// (old_table_name, new_table_name). A name is None if the
+        /// operation doesn't produce that transition table (e.g., INSERT
+        /// has no OLD table).
+        tables: HashMap<u32, TransitionTableNames>,
+    },
+}
+
+/// Names of the transition tables for a specific source table in IMMEDIATE mode.
+#[derive(Debug, Clone)]
+pub struct TransitionTableNames {
+    /// Name of the OLD transition table (for DELETE/UPDATE). None for INSERT.
+    pub old_name: Option<String>,
+    /// Name of the NEW transition table (for INSERT/UPDATE). None for DELETE.
+    pub new_name: Option<String>,
+}
+
 /// The result of differentiating a single operator node.
 /// Contains the CTE name that holds this node's delta output.
 #[derive(Debug, Clone)]
@@ -80,6 +113,9 @@ pub struct DiffContext {
     /// Q21-type numwait regression where EXCEPT ALL at sub-join levels
     /// interacts with the SemiJoin's R_old snapshot computation.
     pub inside_semijoin: bool,
+    /// Source of delta data: change buffer tables (deferred) or transition
+    /// tables (immediate). Determines how the Scan operator generates SQL.
+    pub delta_source: DeltaSource,
 }
 
 impl DiffContext {
@@ -100,6 +136,7 @@ impl DiffContext {
             st_user_columns: None,
             merge_safe_dedup: false,
             inside_semijoin: false,
+            delta_source: DeltaSource::ChangeBuffer,
         }
     }
 
@@ -123,12 +160,19 @@ impl DiffContext {
             st_user_columns: None,
             merge_safe_dedup: false,
             inside_semijoin: false,
+            delta_source: DeltaSource::ChangeBuffer,
         }
     }
 
     /// Enable placeholder mode for generating cacheable SQL templates.
     pub fn with_placeholders(mut self) -> Self {
         self.use_placeholders = true;
+        self
+    }
+
+    /// Set the delta source (change buffer vs transition tables).
+    pub fn with_delta_source(mut self, ds: DeltaSource) -> Self {
+        self.delta_source = ds;
         self
     }
 
