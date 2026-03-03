@@ -22,11 +22,11 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
                                                     We are here
                                                          │
                                                          ▼
- ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
- │  0.1.x   │   │  0.2.0   │   │  0.3.0   │──▶│  0.4.0   │──▶│  1.0.0   │──▶│  1.x+    │
- │ Released │   │ Complete │   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
- │ ✅       │   │ ✅       │   │ ready    │   │ ability  │   │ Release  │   │ Ecosystem│
- └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
+ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+ │ 0.1.x  │ │ 0.2.0  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
+ │Released│─│Complete│─│Correct│─│Compat │─│Observ-│─│Stable │─│Scale &│
+ │ ✅      │ │ ✅      │ │& Secur│ │& Scale│ │ability│ │Release│ │Ecosys.│
+ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -178,11 +178,11 @@ See [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md).
 
 ---
 
-## v0.3.0 — Production Readiness
+## v0.3.0 — Correctness, Security & Operations
 
-**Goal:** Operational polish, parallel refresh, production-grade WAL-based CDC,
-correctness safeguards, and validated partitioning support. The extension is
-suitable for production use after this milestone.
+**Goal:** Fix correctness gaps, harden security (RLS), validate partitioned
+sources, improve CDC reliability, and polish operational tooling. The extension
+is safe for pre-production use after this milestone.
 
 ### Non-Deterministic Function Handling
 
@@ -199,6 +199,28 @@ correctness gap.
 | ND4 | Documentation (`SQL_REFERENCE.md`, `DVM_OPERATORS.md`) | 0.5h | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Files |
 
 > **Non-determinism subtotal: ~4–6 hours**
+
+### Row-Level Security (RLS) Support
+
+Stream tables materialize the full result set (like `MATERIALIZED VIEW`). RLS
+is applied on the stream table itself for read-side filtering. Phase 1
+hardens the security context; Phase 2 adds a tutorial; Phase 3 completes DDL
+tracking. Phase 4 (per-role `security_invoker`) is deferred to post-1.0.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| R1 | Document RLS semantics in SQL_REFERENCE.md and FAQ.md | 1h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.1 |
+| R2 | Disable RLS on change buffer tables (`ALTER TABLE ... DISABLE ROW LEVEL SECURITY`) | 30min | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.1 R2 |
+| R3 | Force superuser context for manual `refresh_stream_table()` (prevent "who refreshed it?" hazard) | 2h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.1 R3 |
+| R4 | Force SECURITY DEFINER on IVM trigger functions (IMMEDIATE mode delta queries must see all rows) | 2h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.1 R4 |
+| R5 | E2E test: RLS on source table does not affect stream table content | 1h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.1 R5 |
+| R6 | Tutorial: RLS on stream tables (enable RLS, per-tenant policies, verify filtering) | 1.5h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.2 R6 |
+| R7 | E2E test: RLS on stream table filters reads per role | 1h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.2 R7 |
+| R8 | E2E test: IMMEDIATE mode + RLS on stream table | 30min | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.2 R8 |
+| R9 | Track ENABLE/DISABLE RLS DDL on source tables (AT_EnableRowSecurity et al.) in hooks.rs | 2h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.3 R9 |
+| R10 | E2E test: ENABLE RLS on source table triggers reinit | 1h | [PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) §3.3 R10 |
+
+> **RLS subtotal: ~8–12 hours** (Phase 4 `security_invoker` deferred to post-1.0)
 
 ### Partitioning Support (Source Tables)
 
@@ -217,30 +239,11 @@ partitioned storage tables are deferred to a future release.
 
 > **Partitioning subtotal: ~18–32 hours**
 
-### PostgreSQL Backward Compatibility (PG 16–18)
-
-pg_trickle currently targets PG 18 only. pgrx 0.17.0 supports PG 13–18 via
-feature flags. Starting with PG 16–18 minimizes scope (only JSON_TABLE gating
-needed) while widening the deployment target for the production-ready release.
-PG 14–15 support can follow in a later release.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| BC1 | Cargo.toml feature flags (`pg16`, `pg17`, `pg18`) + `cfg_aliases` | 4–8h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phase 1 |
-| BC2 | `#[cfg]` gate JSON_TABLE nodes in `parser.rs` (~250 lines, PG 17+) | 12–16h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phase 2 |
-| BC3 | `pg_get_viewdef()` trailing-semicolon behavior verification | 2–4h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phase 3 |
-| BC4 | CI matrix expansion (PG 16, 17, 18) + parameterized Dockerfiles | 12–16h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phases 4–5 |
-| BC5 | WAL decoder validation against PG 16–17 `pgoutput` format | 8–12h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §6A |
-
-> **Backward compatibility subtotal: ~38–56 hours**
-
-### Performance & Parallelism
+### Performance
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | P1 | Verify PostgreSQL parallel query for delta SQL | 0h | [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md) §E |
-| P2 | DAG level extraction (`topological_levels()`) | 2–4h | [REPORT_PARALLELIZATION.md §B](plans/performance/REPORT_PARALLELIZATION.md) |
-| P3 | Dynamic background worker dispatch per level | 12–16h | [REPORT_PARALLELIZATION.md §A+B](plans/performance/REPORT_PARALLELIZATION.md) |
 
 ### Operational
 
@@ -262,20 +265,60 @@ PG 14–15 support can follow in a later release.
 | W3 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 | W4 | Promote `pg_trickle.cdc_mode = 'auto'` to recommended | Documentation | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 
-> **v0.3.0 total: ~175–261 hours**
+> **v0.3.0 total: ~55–85 hours**
 
 **Exit criteria:**
-- [ ] `max_concurrent_refreshes` drives real parallel refresh
+- [ ] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
+- [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
+- [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
+- [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
 - [ ] WAL CDC mode passes full E2E suite
 - [ ] Extension upgrade path tested (`0.1.x → 0.3.0`)
-- [ ] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
-- [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
-- [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
 - [ ] Zero P0/P1 gaps remaining
 
 ---
 
-## v0.4.0 — Observability & Integration
+## v0.4.0 — Backward Compatibility & Parallel Refresh
+
+**Goal:** Widen the deployment target from PG 18-only to PG 16–18, and enable
+parallel refresh across DAG levels. After this milestone the extension is
+suitable for production use on mainstream PostgreSQL versions.
+
+### PostgreSQL Backward Compatibility (PG 16–18)
+
+pg_trickle currently targets PG 18 only. pgrx 0.17.0 supports PG 13–18 via
+feature flags. Starting with PG 16–18 minimizes scope (only JSON_TABLE gating
+needed) while widening the deployment target for the production-ready release.
+PG 14–15 support can follow in a later release.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| BC1 | Cargo.toml feature flags (`pg16`, `pg17`, `pg18`) + `cfg_aliases` | 4–8h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phase 1 |
+| BC2 | `#[cfg]` gate JSON_TABLE nodes in `parser.rs` (~250 lines, PG 17+) | 12–16h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phase 2 |
+| BC3 | `pg_get_viewdef()` trailing-semicolon behavior verification | 2–4h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phase 3 |
+| BC4 | CI matrix expansion (PG 16, 17, 18) + parameterized Dockerfiles | 12–16h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phases 4–5 |
+| BC5 | WAL decoder validation against PG 16–17 `pgoutput` format | 8–12h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §6A |
+
+> **Backward compatibility subtotal: ~38–56 hours**
+
+### Parallel Refresh
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| P2 | DAG level extraction (`topological_levels()`) | 2–4h | [REPORT_PARALLELIZATION.md §B](plans/performance/REPORT_PARALLELIZATION.md) |
+| P3 | Dynamic background worker dispatch per level | 12–16h | [REPORT_PARALLELIZATION.md §A+B](plans/performance/REPORT_PARALLELIZATION.md) |
+
+> **v0.4.0 total: ~52–76 hours**
+
+**Exit criteria:**
+- [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
+- [ ] `max_concurrent_refreshes` drives real parallel refresh via DAG levels
+- [ ] WAL decoder validated against PG 16–17 `pgoutput` format
+- [ ] CI matrix covers PG 16, 17, 18
+
+---
+
+## v0.5.0 — Observability & Integration
 
 **Goal:** Prometheus/Grafana observability, dbt-pgtrickle formal release,
 complete documentation review, and validated upgrade path. After this
@@ -296,12 +339,12 @@ milestone the product is externally visible and monitored.
 | R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
 | O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 · [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
 
-> **v0.4.0 total: ~18–27 hours**
+> **v0.5.0 total: ~18–27 hours**
 
 **Exit criteria:**
 - [ ] Grafana dashboard published
 - [ ] dbt-pgtrickle 0.1.0 on PyPI
-- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.3.0 → 0.4.0`)
+- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.4.0 → 0.5.0`)
 - [ ] All public documentation current and reviewed
 
 ---
@@ -327,7 +370,7 @@ distribution — getting pg_trickle onto package registries.
 - [ ] Published on PGXN and Docker Hub
 - [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
-- [ ] Upgrade path from v0.4.0 tested
+- [ ] Upgrade path from v0.5.0 tested
 - [ ] Semantic versioning policy in effect
 
 ---
@@ -372,10 +415,11 @@ These are not gated on 1.0 but represent the longer-term horizon.
 |-----------|-----------------|------------|--------|
 | v0.1.x — Core engine + correctness | ~30h actual | 30h | ✅ Released |
 | v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Done |
-| v0.3.0 — Production ready | 175–261h | 237–339h | |
-| v0.4.0 — Observability & Integration | 18–27h | 223–318h | |
-| v1.0.0 — Stable release | 18–27h | 241–345h | |
-| Post-1.0 (ecosystem) | 88–134h | 329–479h | |
+| v0.3.0 — Correctness, Security & Operations | 55–85h | 117–163h | |
+| v0.4.0 — Backward Compat & Parallel Refresh | 52–76h | 169–239h | |
+| v0.5.0 — Observability & Integration | 18–27h | 187–266h | |
+| v1.0.0 — Stable release | 18–27h | 205–293h | |
+| Post-1.0 (ecosystem) | 88–134h | 293–427h | |
 | Post-1.0 (scale) | 6+ months | — | |
 
 ---
@@ -402,6 +446,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | [plans/sql/PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) | Transactional IVM (immediate, same-transaction refresh) |
 | [plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) | ORDER BY / LIMIT / OFFSET gaps & TopK support |
 | [plans/sql/PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) | Non-deterministic function handling |
+| [plans/sql/PLAN_ROW_LEVEL_SECURITY.md](plans/sql/PLAN_ROW_LEVEL_SECURITY.md) | Row-Level Security support plan (Phases 1–4) |
 | [plans/infra/PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) | PostgreSQL partitioning & sharding compatibility |
 | [plans/infra/PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) | Supporting older PostgreSQL versions (13–17) |
 | [plans/sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](plans/sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | Diamond dependency consistency (multi-path refresh atomicity) |
