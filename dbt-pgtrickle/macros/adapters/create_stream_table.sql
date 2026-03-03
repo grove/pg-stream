@@ -13,15 +13,23 @@
     initialize (bool): Whether to populate immediately on creation
 #}
 {% macro pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize) %}
-  {% set create_sql %}
+  {#
+    Run create_stream_table() outside of dbt's model transaction.
+    dbt wraps the model's main statement in BEGIN...ROLLBACK (for testing /
+    dry-run purposes). Any SQL executed via run_query() shares the same
+    connection and is therefore also rolled back. To prevent this, we embed
+    explicit BEGIN / COMMIT so the DDL commits unconditionally.
+  #}
+  {% call statement('pgtrickle_create', auto_begin=False, fetch_result=False) %}
+    BEGIN;
     SELECT pgtrickle.create_stream_table(
       {{ dbt.string_literal(name) }},
       {{ dbt.string_literal(query) }},
       {% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %},
       {{ dbt.string_literal(refresh_mode) }},
       {{ initialize }}
-    )
-  {% endset %}
-  {% do run_query(create_sql) %}
+    );
+    COMMIT;
+  {% endcall %}
   {{ log("pg_trickle: created stream table '" ~ name ~ "'", info=true) }}
 {% endmacro %}

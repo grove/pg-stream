@@ -113,6 +113,24 @@ pub static PGS_BLOCK_SOURCE_DDL: GucSetting<bool> = GucSetting::<bool>::new(fals
 /// both high-throughput workloads (raise) and small tables (lower).
 pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 
+/// Default diamond consistency mode for newly created stream tables.
+///
+/// - `"none"` (default): No atomic grouping — each ST refreshes independently.
+/// - `"atomic"`: All members of a diamond's consistency group are wrapped in a
+///   single SAVEPOINT; if any member fails the entire group rolls back.
+pub static PGS_DIAMOND_CONSISTENCY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"none"));
+
+/// Default diamond schedule policy for atomic consistency groups.
+///
+/// - `"fastest"` (default): The group fires when *any* member is due.
+/// - `"slowest"`: The group fires only when *all* members are due.
+///
+/// Per-convergence-node values override the GUC.  When multiple convergence
+/// nodes exist (nested diamonds), the strictest policy wins.
+pub static PGS_DIAMOND_SCHEDULE_POLICY: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"fastest"));
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -287,6 +305,29 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_string_guc(
+        c"pg_trickle.diamond_consistency",
+        c"Default diamond consistency mode: none or atomic.",
+        c"'none' (default) refreshes each ST independently. \
+           'atomic' wraps diamond consistency groups in a SAVEPOINT so all members \
+           succeed or fail together.",
+        &PGS_DIAMOND_CONSISTENCY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_trickle.diamond_schedule_policy",
+        c"Default schedule policy for atomic diamond groups: fastest or slowest.",
+        c"'fastest' (default) fires the group when any member is due. \
+           'slowest' fires only when all members are due. \
+           Per-convergence-node values override the GUC. Only meaningful with \
+           diamond_consistency = 'atomic'.",
+        &PGS_DIAMOND_SCHEDULE_POLICY,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -378,4 +419,24 @@ pub fn pg_trickle_block_source_ddl() -> bool {
 /// Returns the buffer alert threshold (row count).
 pub fn pg_trickle_buffer_alert_threshold() -> i64 {
     PGS_BUFFER_ALERT_THRESHOLD.get() as i64
+}
+
+/// Returns the default diamond consistency mode: `"none"` or `"atomic"`.
+pub fn pg_trickle_diamond_consistency() -> String {
+    PGS_DIAMOND_CONSISTENCY
+        .get()
+        .map(|cs| cs.to_str().unwrap_or("none").to_string())
+        .unwrap_or_else(|| "none".to_string())
+}
+
+/// Returns the default diamond schedule policy as a `DiamondSchedulePolicy`.
+pub fn pg_trickle_diamond_schedule_policy() -> crate::dag::DiamondSchedulePolicy {
+    PGS_DIAMOND_SCHEDULE_POLICY
+        .get()
+        .and_then(|cs| {
+            cs.to_str()
+                .ok()
+                .and_then(crate::dag::DiamondSchedulePolicy::from_sql_str)
+        })
+        .unwrap_or_default()
 }

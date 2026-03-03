@@ -26,7 +26,7 @@ use std::panic::AssertUnwindSafe;
 use crate::catalog::{RefreshRecord, StreamTableMeta};
 use crate::cdc;
 use crate::config;
-use crate::dag::{NodeId, StDag, StStatus};
+use crate::dag::{DiamondConsistency, DiamondSchedulePolicy, NodeId, StDag, StStatus};
 use crate::error::{RetryPolicy, RetryState};
 use crate::monitor;
 use crate::refresh::{self, RefreshAction};
@@ -149,90 +149,140 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 None => return,
             };
 
-            // Step B: Get topological refresh order
-            let ordered = match dag_ref.topological_order() {
-                Ok(order) => order,
-                Err(e) => {
-                    log!("pg_trickle: DAG has cycles: {}", e);
-                    return;
-                }
-            };
+            // Step B: Validate topological order (detect cycles)
+            if let Err(e) = dag_ref.topological_order() {
+                log!("pg_trickle: DAG has cycles: {}", e);
+                return;
+            }
 
-            // Step C: Check each ST for schedule and refresh if needed
-            for node_id in &ordered {
-                let pgt_id = match node_id {
-                    NodeId::StreamTable(id) => *id,
-                    _ => continue,
-                };
+            // Step C: Compute consistency groups and refresh group-by-group
+            let groups = dag_ref.compute_consistency_groups();
 
-                // Load fresh ST metadata
-                let st = match load_st_by_id(pgt_id) {
-                    Some(st) => st,
-                    None => continue,
-                };
-
-                // Skip non-active STs
-                if st.status != StStatus::Active && st.status != StStatus::Initializing {
+            for group in &groups {
+                if group.is_singleton() {
+                    // Fast path: no SAVEPOINT overhead for non-diamond STs.
+                    let pgt_id = match &group.members[0] {
+                        NodeId::StreamTable(id) => *id,
+                        _ => continue,
+                    };
+                    refresh_single_st(pgt_id, dag_ref, now_ms, &mut retry_states, &retry_policy);
                     continue;
                 }
 
-                // Phase 10: Check retry backoff — skip if in cooldown
-                let retry = retry_states.entry(pgt_id).or_default();
-                if retry.is_in_backoff(now_ms) {
-                    // F31: Emit StaleData alert when skipping a stale ST due to backoff
-                    emit_stale_alert_if_needed(&st);
+                // Multi-member group: check if all members have diamond_consistency = 'atomic'.
+                let all_atomic = group.members.iter().all(|m| {
+                    if let NodeId::StreamTable(id) = m {
+                        load_st_by_id(*id)
+                            .map(|st| st.diamond_consistency == DiamondConsistency::Atomic)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                });
+
+                if !all_atomic {
+                    // Not all members opted in — fall back to independent refreshes.
+                    for member in &group.members {
+                        let pgt_id = match member {
+                            NodeId::StreamTable(id) => *id,
+                            _ => continue,
+                        };
+                        refresh_single_st(
+                            pgt_id,
+                            dag_ref,
+                            now_ms,
+                            &mut retry_states,
+                            &retry_policy,
+                        );
+                    }
                     continue;
                 }
 
-                // Check if ST exceeds its effective schedule
-                let needs_refresh = check_schedule(&st, dag_ref);
-                if !needs_refresh && !st.needs_reinit {
+                // Atomic group: check group-level schedule policy.
+                let policy = group_schedule_policy(group);
+                if !is_group_due(group, policy, dag_ref) {
                     continue;
                 }
 
-                // Phase 10: Skip mechanism — check advisory lock
-                if check_skip_needed(&st) {
+                // All members due (per policy) — wrap in a SAVEPOINT.
+                let sp_result = Spi::run("SAVEPOINT pgt_consistency_group");
+                if let Err(e) = sp_result {
                     log!(
-                        "pg_trickle: skipping {}.{} — previous refresh still running",
-                        st.pgt_schema,
-                        st.pgt_name,
+                        "pg_trickle: failed to create SAVEPOINT for diamond group: {}",
+                        e
                     );
                     continue;
                 }
 
-                // Determine the refresh action
-                let has_changes = check_upstream_changes(&st);
-                let action = refresh::determine_refresh_action(&st, has_changes);
+                let mut group_ok = true;
+                let mut refreshed_ids: Vec<i64> = Vec::new();
 
-                // Execute refresh with retry-aware error handling
-                let result = execute_scheduled_refresh(&st, action);
+                for member in &group.members {
+                    let pgt_id = match member {
+                        NodeId::StreamTable(id) => *id,
+                        _ => continue,
+                    };
 
-                // Update retry state based on result
-                let retry = retry_states.entry(pgt_id).or_default();
-                match result {
-                    RefreshOutcome::Success => {
-                        retry.reset();
+                    let st = match load_st_by_id(pgt_id) {
+                        Some(st) => st,
+                        None => continue,
+                    };
+
+                    // Skip non-active STs
+                    if st.status != StStatus::Active && st.status != StStatus::Initializing {
+                        continue;
                     }
-                    RefreshOutcome::RetryableFailure => {
-                        let will_retry = retry.record_failure(&retry_policy, now_ms);
-                        if will_retry {
+
+                    // Check retry backoff
+                    let retry = retry_states.entry(pgt_id).or_default();
+                    if retry.is_in_backoff(now_ms) {
+                        emit_stale_alert_if_needed(&st);
+                        continue;
+                    }
+
+                    // Skip if advisory lock held
+                    if check_skip_needed(&st) {
+                        continue;
+                    }
+
+                    let has_changes = check_upstream_changes(&st);
+                    let action = refresh::determine_refresh_action(&st, has_changes);
+                    let result = execute_scheduled_refresh(&st, action);
+
+                    match result {
+                        RefreshOutcome::Success => {
+                            refreshed_ids.push(pgt_id);
+                        }
+                        RefreshOutcome::RetryableFailure | RefreshOutcome::PermanentFailure => {
                             log!(
-                                "pg_trickle: {}.{} will retry in {}ms (attempt {}/{})",
+                                "pg_trickle: diamond group rollback — member {}.{} failed",
                                 st.pgt_schema,
                                 st.pgt_name,
-                                retry_policy.backoff_ms(retry.attempts - 1),
-                                retry.attempts,
-                                retry_policy.max_attempts,
                             );
+                            group_ok = false;
+                            break;
                         }
-                        // If max attempts exhausted, the error has already been
-                        // counted toward consecutive_errors and may trigger suspension
                     }
-                    RefreshOutcome::PermanentFailure => {
-                        // Non-retryable: don't use backoff, let consecutive_errors
-                        // handle suspension
-                        retry.reset();
+                }
+
+                if group_ok {
+                    let _ = Spi::run("RELEASE SAVEPOINT pgt_consistency_group");
+                    // Reset retry states for all refreshed members
+                    for id in &refreshed_ids {
+                        retry_states.entry(*id).or_default().reset();
                     }
+                } else {
+                    let _ = Spi::run("ROLLBACK TO SAVEPOINT pgt_consistency_group");
+                    let _ = Spi::run("RELEASE SAVEPOINT pgt_consistency_group");
+                    // Record failure for retry tracking on all attempted members
+                    for id in &refreshed_ids {
+                        let retry = retry_states.entry(*id).or_default();
+                        retry.record_failure(&retry_policy, now_ms);
+                    }
+                    log!(
+                        "pg_trickle: diamond group rolled back ({} members)",
+                        group.members.len(),
+                    );
                 }
             }
 
@@ -252,8 +302,9 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
 
             // Step F: Prune retry states for STs that no longer exist
             // (avoid accumulating stale state)
-            let active_ids: std::collections::HashSet<i64> = ordered
+            let active_ids: std::collections::HashSet<i64> = groups
                 .iter()
+                .flat_map(|g| g.members.iter())
                 .filter_map(|n| match n {
                     NodeId::StreamTable(id) => Some(*id),
                     _ => None,
@@ -352,6 +403,59 @@ fn current_epoch_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Resolve the effective schedule policy for a consistency group.
+///
+/// Reads the `diamond_schedule_policy` from each convergence node in the group
+/// and returns the strictest (`Slowest > Fastest`). Falls back to the
+/// `pg_trickle.diamond_schedule_policy` GUC.
+fn group_schedule_policy(group: &crate::dag::ConsistencyGroup) -> DiamondSchedulePolicy {
+    let guc_default = config::pg_trickle_diamond_schedule_policy();
+    group
+        .convergence_points
+        .iter()
+        .fold(guc_default, |acc, node| {
+            if let NodeId::StreamTable(id) = node {
+                load_st_by_id(*id)
+                    .map(|st| acc.stricter(st.diamond_schedule_policy))
+                    .unwrap_or(acc)
+            } else {
+                acc
+            }
+        })
+}
+
+/// Check whether a multi-member group is due for refresh according to its
+/// schedule policy.
+///
+/// - `Fastest`: fires when **any** member is due.
+/// - `Slowest`: fires only when **all** members are due.
+fn is_group_due(
+    group: &crate::dag::ConsistencyGroup,
+    policy: DiamondSchedulePolicy,
+    dag: &StDag,
+) -> bool {
+    let member_due: Vec<bool> = group
+        .members
+        .iter()
+        .filter_map(|m| {
+            if let NodeId::StreamTable(id) = m {
+                load_st_by_id(*id).map(|st| check_schedule(&st, dag) || st.needs_reinit)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if member_due.is_empty() {
+        return false;
+    }
+
+    match policy {
+        DiamondSchedulePolicy::Fastest => member_due.iter().any(|&d| d),
+        DiamondSchedulePolicy::Slowest => member_due.iter().all(|&d| d),
+    }
 }
 
 /// Load a stream table by its pgt_id, or return None if not found.
@@ -501,6 +605,74 @@ fn check_upstream_changes(st: &StreamTableMeta) -> bool {
     }
 
     false
+}
+
+/// Refresh a single (non-group) stream table with full retry handling.
+///
+/// This is the singleton fast path used by both non-diamond STs and
+/// diamond STs where not all members opted into atomic mode.
+fn refresh_single_st(
+    pgt_id: i64,
+    dag_ref: &StDag,
+    now_ms: u64,
+    retry_states: &mut HashMap<i64, RetryState>,
+    retry_policy: &RetryPolicy,
+) {
+    let st = match load_st_by_id(pgt_id) {
+        Some(st) => st,
+        None => return,
+    };
+
+    if st.status != StStatus::Active && st.status != StStatus::Initializing {
+        return;
+    }
+
+    let retry = retry_states.entry(pgt_id).or_default();
+    if retry.is_in_backoff(now_ms) {
+        emit_stale_alert_if_needed(&st);
+        return;
+    }
+
+    let needs_refresh = check_schedule(&st, dag_ref);
+    if !needs_refresh && !st.needs_reinit {
+        return;
+    }
+
+    if check_skip_needed(&st) {
+        log!(
+            "pg_trickle: skipping {}.{} — previous refresh still running",
+            st.pgt_schema,
+            st.pgt_name,
+        );
+        return;
+    }
+
+    let has_changes = check_upstream_changes(&st);
+    let action = refresh::determine_refresh_action(&st, has_changes);
+    let result = execute_scheduled_refresh(&st, action);
+
+    let retry = retry_states.entry(pgt_id).or_default();
+    match result {
+        RefreshOutcome::Success => {
+            retry.reset();
+        }
+        RefreshOutcome::RetryableFailure => {
+            let will_retry = retry.record_failure(retry_policy, now_ms);
+            if will_retry {
+                log!(
+                    "pg_trickle: {}.{} will retry in {}ms (attempt {}/{})",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    retry_policy.backoff_ms(retry.attempts - 1),
+                    retry.attempts,
+                    retry_policy.max_attempts,
+                );
+            }
+        }
+        RefreshOutcome::PermanentFailure => {
+            retry.reset();
+        }
+    }
 }
 
 /// Execute a scheduled refresh for a stream table.

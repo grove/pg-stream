@@ -414,6 +414,80 @@ SET pg_trickle.wal_transition_timeout = 300;
 
 ---
 
+### pg_trickle.diamond_consistency
+
+Default diamond dependency consistency mode for new stream tables.
+
+When stream tables form diamond-shaped dependency graphs (e.g., A → B, A → C, B → D, C → D), the scheduler can group the intermediate STs (B, C) and the convergence node (D) into an atomic refresh group. In `atomic` mode, if any member of the group fails to refresh, all members are rolled back via `SAVEPOINT`, ensuring the convergence node never reads a mix of old and new data from its upstream sources.
+
+| Value | Description |
+|-------|-------------|
+| `'none'` | **(default)** Independent refresh — each ST is refreshed individually in topological order. A partial failure in a diamond may leave the convergence node reading mixed versions. |
+| `'atomic'` | Atomic group refresh — all members of a diamond group are wrapped in a SAVEPOINT. On any failure, the entire group is rolled back and retried together. |
+
+**Default:** `'none'`
+
+This GUC sets the default for new stream tables created without an explicit `diamond_consistency` parameter. Individual stream tables can override it via `create_stream_table(... diamond_consistency => 'atomic')` or `alter_stream_table(... diamond_consistency => 'atomic')`.
+
+```sql
+-- Enable atomic diamond consistency globally
+SET pg_trickle.diamond_consistency = 'atomic';
+
+-- Disable (default — independent refresh)
+SET pg_trickle.diamond_consistency = 'none';
+```
+
+> **Note:** Atomic mode only takes effect for stream tables that are part of a detected diamond group. Linear chains and standalone STs are unaffected.
+
+---
+
+### pg_trickle.diamond_schedule_policy
+
+Default schedule policy for atomic diamond consistency groups.
+
+When `diamond_consistency = 'atomic'`, multiple stream tables in a diamond group are refreshed together. This GUC controls **when** the group fires:
+
+| Value | Description |
+|-------|-------------|
+| `'fastest'` | **(default)** Fire the group when **any** member is due for refresh. Maximizes freshness at the cost of more frequent refreshes. |
+| `'slowest'` | Fire the group only when **all** members are due. Reduces resource usage but allows more staleness. |
+
+**Default:** `'fastest'`
+
+Per-convergence-node values override this GUC. Set the policy on the convergence (fan-in) node via `create_stream_table(... diamond_schedule_policy => 'slowest')` or `alter_stream_table(... diamond_schedule_policy => 'slowest')`.
+
+When multiple convergence nodes exist (nested diamonds), the **strictest** policy wins (`slowest > fastest`).
+
+```sql
+-- Set globally to slowest
+SET pg_trickle.diamond_schedule_policy = 'slowest';
+
+-- Default (fastest)
+SET pg_trickle.diamond_schedule_policy = 'fastest';
+```
+
+#### Choosing a policy
+
+**Use `'fastest'` (default) when:**
+- Data freshness matters — the convergence node should reflect changes as soon as any upstream member has new data.
+- Your diamond members have similar schedules, so the cost difference between the two policies is small.
+- You are unsure which to pick. `'fastest'` matches the intuitive expectation of a streaming pipeline: "if anything changed, recompute now."
+
+**Use `'slowest'` when:**
+- All members of the diamond have meaningfully different schedules (e.g. B refreshes every 30 s, C every 10 min). With `'fastest'`, the group fires every 30 s even though C contributes stale data for most of those runs — largely wasted work.
+- The convergence node runs a heavy aggregation or join and the extra CPU/I/O cost of redundant refreshes outweighs the staleness penalty.
+- You are running a batch/analytical workload where freshness is secondary to throughput (e.g. TPC-H-style reporting).
+
+**Why `'fastest'` is the default:**  
+`pg_trickle` is a streaming/CDC-oriented extension. Users generally expect near-real-time results and are surprised when a convergence node lags because one slow member acts as a rate limiter for the whole group. `'slowest'` should be an explicit opt-in for cost-sensitive deployments, not something users stumble into by default.
+
+**Watch out for the "slowest member" effect with `'slowest'`:**  
+The effective refresh cadence of the convergence node becomes `min(all member schedules)`. A single rarely-scheduled intermediate ST silently degrades freshness for the entire output, which can be hard to diagnose without inspecting `pgtrickle.diamond_groups()`.
+
+> **Note:** This setting only takes effect when `diamond_consistency = 'atomic'`. In `'none'` mode each ST uses its own schedule independently.
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -437,6 +511,8 @@ pg_trickle.user_triggers = 'auto'
 pg_trickle.block_source_ddl = false
 pg_trickle.cdc_mode = 'trigger'
 pg_trickle.wal_transition_timeout = 300
+pg_trickle.diamond_consistency = 'none'
+pg_trickle.diamond_schedule_policy = 'fastest'
 ```
 
 ---

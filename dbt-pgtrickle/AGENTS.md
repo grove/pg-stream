@@ -48,12 +48,23 @@ integration_tests/                 # Standalone dbt project for testing
 After any macro change, run the integration test suite:
 
 ```bash
-cd integration_tests
-dbt deps          # Install/update the parent package
-dbt seed          # Load test fixtures
-dbt run           # Create/update stream tables
-sleep 5           # Wait for pg-trickle scheduler
-dbt test          # Run data + schema tests
+# The just command handles Docker, Python venv, and dbt installation:
+just test-dbt-fast   # fast (reuses existing E2E Docker image)
+just test-dbt        # full (rebuilds Docker image from source)
+```
+
+The test runner (`integration_tests/scripts/run_dbt_tests.sh`) automatically:
+- Creates a dedicated `.venv-dbt` virtual environment using **Python 3.13**
+  (dbt-core 1.9 requires Python ≤3.13; pydantic v1 is incompatible with 3.14)
+- Installs `dbt-core~=1.9` and `dbt-postgres~=1.9` into that venv
+- Adds the Homebrew-keg PostgreSQL `bin/` to PATH so `psql` is available
+
+To run dbt commands manually after `just test-dbt-fast` (while the container is
+still up), activate the venv first:
+```bash
+source .venv-dbt/bin/activate
+cd dbt-pgtrickle/integration_tests
+dbt deps && dbt run && dbt test
 ```
 
 After changes to the materialization logic, also test the full-refresh and alter paths:
@@ -116,6 +127,32 @@ The `stream_table` materialization must handle exactly four cases:
 Always call `adapter.cache_new()` after creating a new relation.
 Always call `run_hooks(pre_hooks)` / `run_hooks(post_hooks)`.
 Always return `{'relations': [target_relation]}`.
+
+### DDL Transaction Safety (CRITICAL)
+
+**Never use `run_query()` for DDL calls to `pgtrickle.*` functions.**
+
+dbt wraps each model's main statement in an implicit `BEGIN … ROLLBACK` on the
+model's connection. `run_query()` reuses the same connection, so the DDL is
+silently rolled back when the main transaction ends — even when the model
+reports `OK`.
+
+Instead, use `{% call statement(..., auto_begin=False, fetch_result=False) %}`
+with explicit `BEGIN; … COMMIT;` embedded in the SQL:
+
+```jinja
+{% call statement('pgtrickle_create', auto_begin=False, fetch_result=False) %}
+  BEGIN;
+  SELECT pgtrickle.create_stream_table(...);
+  COMMIT;
+{% endcall %}
+```
+
+This guarantees the DDL commits unconditionally regardless of what dbt's
+connection state is.
+
+**Rule:** Every `dbt-pgtrickle/macros/adapters/*.sql` macro that mutates the
+database (create, drop, alter, refresh) must use this pattern.
 
 ### Config Defaults
 

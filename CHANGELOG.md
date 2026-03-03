@@ -14,6 +14,44 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - **TopK (ORDER BY + LIMIT) support** — Queries with a top-level `ORDER BY … LIMIT N` (constant integer, no OFFSET) are now recognized as "TopK" and accepted. TopK stream tables store only the top-N rows. Refreshes use scoped-recomputation via MERGE (bypass the DVM delta pipeline). Catalog columns `topk_limit` and `topk_order_by` record the pattern. Monitoring view exposes `is_topk`.
 - **FETCH FIRST / FETCH NEXT rejection** — `FETCH FIRST N ROWS ONLY` and `FETCH NEXT N ROWS ONLY` now produce the same unsupported-feature error as `LIMIT`.
 - **OFFSET without ORDER BY warning** — Subqueries using `OFFSET` without `ORDER BY` now emit a parser warning (alongside the existing `LIMIT` without `ORDER BY` warning).
+- **Diamond dependency consistency** — detect diamond-shaped dependency graphs
+  among stream tables and optionally refresh them as atomic groups using
+  `SAVEPOINT`. Prevents split-version reads at convergence (fan-in) nodes.
+  - New `diamond_consistency` parameter on `create_stream_table()` and
+    `alter_stream_table()` (`'none'` or `'atomic'`).
+  - New `pg_trickle.diamond_consistency` GUC to set the cluster-wide default.
+  - New `diamond_schedule_policy` parameter on `create_stream_table()` and
+    `alter_stream_table()` (`'fastest'` or `'slowest'`). Controls whether an
+    atomic group fires when any member is due or when all are due.
+  - New `pg_trickle.diamond_schedule_policy` GUC (default `'fastest'`).
+    Per-convergence-node values override the GUC; strictest wins for nested
+    diamonds.
+  - New `pgtrickle.diamond_groups()` monitoring function to inspect detected
+    groups, convergence points, epoch counters, and effective schedule policy.
+  - Scheduler wraps multi-member groups in a SAVEPOINT when
+    `diamond_consistency = 'atomic'`; on any failure the entire group is
+    rolled back, preserving consistency.
+
+### Fixed
+
+- **E2E test type mismatch** — `test_diamond_atomic_all_succeed` queried
+  `total` (an `INT4` column from `INT + INT`) as `i64`; corrected to `i32`.
+- **dbt macros: DDL rollback bug** — `pgtrickle_create_stream_table`,
+  `pgtrickle_drop_stream_table`, `pgtrickle_alter_stream_table`, and
+  `pgtrickle_refresh_stream_table` all used `run_query()`, which shares the
+  model's connection. dbt wraps the model's main statement in
+  `BEGIN … ROLLBACK`, causing the DDL to be silently rolled back. Fixed by
+  replacing `run_query()` with `{% call statement(..., auto_begin=False) %}`
+  with explicit `BEGIN; … COMMIT;` so DDL is committed unconditionally.
+- **dbt test script: Python 3.14 incompatibility** — `dbt-core 1.9` depends on
+  `pydantic v1` / `mashumaro`, neither of which supports Python 3.14. The test
+  script now creates a dedicated `.venv-dbt` using Python 3.13 for dbt.
+- **dbt test script: broken `PROJECT_ROOT` path** — was computing 3 levels up
+  from `integration_tests/scripts/` instead of 2, resolving to the wrong
+  directory. Fixed.
+- **dbt test script: `psql` not on PATH** — added auto-detection of
+  Homebrew-keg PostgreSQL `bin/` directories so `wait_for_populated.sh` can
+  connect without requiring a globally linked `psql`.
 
 ---
 
