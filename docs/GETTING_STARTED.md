@@ -478,6 +478,8 @@ UPDATE departments SET name = 'R&D' WHERE id = 2;
 Refresh:
 
 ```sql
+SELECT pgtrickle.refresh_stream_table('department_tree');
+SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
@@ -517,6 +519,7 @@ DELETE FROM employees WHERE name = 'Bob';
 
 ```sql
 SELECT pgtrickle.refresh_stream_table('department_stats');
+SELECT pgtrickle.refresh_stream_table('department_report');
 SELECT * FROM department_stats WHERE department_name = 'Backend';
 ```
 
@@ -573,7 +576,7 @@ FROM pgtrickle.pgt_status();
 
 ```sql
 -- Detailed performance stats
-SELECT table_name, refresh_count, avg_refresh_ms, rows_affected_last
+SELECT pgt_name, total_refreshes, avg_duration_ms, total_rows_inserted
 FROM pgtrickle.pg_stat_stream_tables;
 ```
 
