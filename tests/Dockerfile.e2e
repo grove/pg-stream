@@ -103,4 +103,12 @@ RUN echo "" >> /usr/share/postgresql/postgresql.conf.sample && \
 RUN ls -la /usr/share/postgresql/18/extension/pg_trickle* && \
     ls -la /usr/lib/postgresql/18/lib/pg_trickle*
 
+# Pre-create the extension on the `postgres` database during initdb.
+# The launcher background worker probes databases on startup — if the
+# extension isn't installed yet it waits 5 min (skip_ttl) before re-probing.
+# Creating the extension in initdb.d ensures the launcher's first probe
+# finds it and spawns a scheduler immediately.
+RUN echo "CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE;" \
+    > /docker-entrypoint-initdb.d/00-create-pg-trickle.sql
+
 EXPOSE 5432
