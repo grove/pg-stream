@@ -280,14 +280,14 @@ fn replace_word_boundary(text: &str, word: &str, replacement: &str) -> String {
                 true
             } else {
                 let c = chars[i - 1];
-                !c.is_alphanumeric() && c != '_' && c != '.'
+                !c.is_alphanumeric() && c != '_' && c != '.' && c != '"'
             };
             // Check word boundary: char after must not be alphanumeric/underscore
             let after_ok = if i + word_len >= chars.len() {
                 true
             } else {
                 let c = chars[i + word_len];
-                !c.is_alphanumeric() && c != '_'
+                !c.is_alphanumeric() && c != '_' && c != '"'
             };
 
             if before_ok && after_ok {

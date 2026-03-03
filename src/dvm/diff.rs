@@ -122,6 +122,13 @@ pub struct DiffContext {
     /// Source of delta data: change buffer tables (deferred) or transition
     /// tables (immediate). Determines how the Scan operator generates SQL.
     pub delta_source: DeltaSource,
+    /// Maps child column names to their corresponding ST column names.
+    ///
+    /// Populated by `diff_project` when a Project renames columns
+    /// (e.g., `r.name AS region`). Downstream operators (like aggregate)
+    /// use this to reference the correct ST column names in JOIN
+    /// conditions and SELECT lists.
+    pub st_column_alias_map: Option<HashMap<String, String>>,
 }
 
 impl DiffContext {
@@ -144,6 +151,7 @@ impl DiffContext {
             inside_semijoin: false,
             st_has_pgt_count: false,
             delta_source: DeltaSource::ChangeBuffer,
+            st_column_alias_map: None,
         }
     }
 
@@ -169,6 +177,7 @@ impl DiffContext {
             inside_semijoin: false,
             st_has_pgt_count: false,
             delta_source: DeltaSource::ChangeBuffer,
+            st_column_alias_map: None,
         }
     }
 
