@@ -103,11 +103,17 @@ async fn test_guc_merge_work_mem_mb_custom() {
 #[tokio::test]
 async fn test_guc_block_source_ddl_on() {
     let db = E2eDb::new().await.with_extension().await;
-    db.execute("SET pg_trickle.block_source_ddl = on").await;
     setup_guc_test(&db).await;
     db.create_st("guc_st", GUC_QUERY, "1m", "DIFFERENTIAL")
         .await;
     db.assert_st_matches_query("guc_st", GUC_QUERY).await;
+
+    // Use ALTER SYSTEM + reload so the GUC applies to all pool connections,
+    // not just the current session which the pool may not reuse.
+    db.execute("ALTER SYSTEM SET pg_trickle.block_source_ddl = true")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Column-altering DDL should be blocked
     let result = db

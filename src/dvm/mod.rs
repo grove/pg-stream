@@ -249,12 +249,14 @@ pub fn generate_delta_query(
     // which includes auxiliary columns (e.g. __pgt_count) for aggregate/distinct.
     let st_user_cols = result.tree.output_columns();
     let is_scan_chain = is_scan_chain_tree(&result.tree);
+    let has_pgt_count = result.tree.needs_pgt_count();
     let mut ctx = DiffContext::new(prev_frontier.clone(), new_frontier.clone())
         .with_pgt_name(pgt_schema, pgt_name)
         .with_cte_registry(result.cte_registry)
         .with_defining_query(defining_query);
     ctx.st_user_columns = Some(st_user_cols);
     ctx.merge_safe_dedup = is_scan_chain;
+    ctx.st_has_pgt_count = has_pgt_count;
     let (delta_sql, output_columns, diff_dedup) = ctx.differentiate_with_columns(&result.tree)?;
 
     Ok(DeltaQueryResult {
@@ -334,6 +336,7 @@ pub fn generate_delta_query_cached(
     // Use dummy frontiers — the actual LSN values come from placeholders.
     let is_scan_chain = is_scan_chain_tree(&result.tree);
     let st_user_cols = result.tree.output_columns();
+    let has_pgt_count = result.tree.needs_pgt_count();
     let mut ctx = DiffContext::new(Frontier::new(), Frontier::new())
         .with_placeholders()
         .with_pgt_name(pgt_schema, pgt_name)
@@ -341,6 +344,7 @@ pub fn generate_delta_query_cached(
         .with_defining_query(defining_query);
     ctx.st_user_columns = Some(st_user_cols);
     ctx.merge_safe_dedup = is_scan_chain;
+    ctx.st_has_pgt_count = has_pgt_count;
     let (template_sql, output_columns, diff_dedup) =
         ctx.differentiate_with_columns(&result.tree)?;
 
@@ -866,34 +870,57 @@ pub fn try_set_op_refresh_sql(defining_query: &str, column_names: &[String]) -> 
     let quoted_cols: Vec<String> = column_names.iter().map(|c| diff::quote_ident(c)).collect();
     let col_list = quoted_cols.join(", ");
 
-    // Hash expression for __pgt_row_id (same formula as the diff operators)
-    let hash_items: Vec<String> = column_names
-        .iter()
-        .map(|c| format!("l.{}::TEXT", diff::quote_ident(c)))
-        .collect();
-    let hash_expr = if hash_items.len() == 1 {
-        format!("pgtrickle.pg_trickle_hash({})", hash_items[0])
-    } else {
-        format!(
-            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
-            hash_items.join(", ")
-        )
-    };
-
     let l_cols: Vec<String> = column_names
         .iter()
         .map(|c| format!("l.{}", diff::quote_ident(c)))
         .collect();
     let l_col_list = l_cols.join(", ");
 
+    // Hash expression for __pgt_row_id (using l.* prefix)
+    let l_hash_items: Vec<String> = column_names
+        .iter()
+        .map(|c| format!("l.{}::TEXT", diff::quote_ident(c)))
+        .collect();
+
     let (join_type, where_clause) = match parts.kind {
         SetOpKind::Intersect => ("INNER JOIN", String::new()),
         SetOpKind::IntersectAll => ("INNER JOIN", String::new()),
-        SetOpKind::Except => ("LEFT JOIN", "\nWHERE r.__cnt IS NULL".to_string()),
-        SetOpKind::ExceptAll => (
-            "LEFT JOIN",
-            "\nWHERE l.__cnt > COALESCE(r.__cnt, 0)".to_string(),
-        ),
+        // EXCEPT: use FULL OUTER JOIN to populate ALL unique values from
+        // both branches with their per-branch counts. Invisible rows
+        // (count_l = 0 or count_r > 0) are kept so that the differential
+        // engine can track multiplicity changes correctly across refreshes.
+        SetOpKind::Except | SetOpKind::ExceptAll => ("FULL OUTER JOIN", String::new()),
+    };
+
+    // For FULL OUTER JOIN (EXCEPT), columns from one side may be NULL.
+    // Use COALESCE to pick from whichever side matched.
+    let (select_cols, hash_items_final) =
+        if matches!(parts.kind, SetOpKind::Except | SetOpKind::ExceptAll) {
+            let coalesced: Vec<String> = column_names
+                .iter()
+                .map(|c| {
+                    format!(
+                        "COALESCE(l.{qc}, r.{qc}) AS {qc}",
+                        qc = diff::quote_ident(c)
+                    )
+                })
+                .collect();
+            let hash_items_c: Vec<String> = column_names
+                .iter()
+                .map(|c| format!("COALESCE(l.{qc}, r.{qc})::TEXT", qc = diff::quote_ident(c)))
+                .collect();
+            (coalesced.join(",\n       "), hash_items_c)
+        } else {
+            (l_col_list.clone(), l_hash_items.clone())
+        };
+
+    let hash_expr_final = if hash_items_final.len() == 1 {
+        format!("pgtrickle.pg_trickle_hash({})", hash_items_final[0])
+    } else {
+        format!(
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+            hash_items_final.join(", ")
+        )
     };
 
     let sql = format!(
@@ -907,9 +934,9 @@ pub fn try_set_op_refresh_sql(defining_query: &str, column_names: &[String]) -> 
          \x20 FROM ({right}) __sub\n\
          \x20 GROUP BY {col_list}\n\
          )\n\
-         SELECT {hash_expr} AS __pgt_row_id,\n\
-         \x20      {l_col_list},\n\
-         \x20      l.__cnt AS __pgt_count_l,\n\
+         SELECT {hash_expr_final} AS __pgt_row_id,\n\
+         \x20      {select_cols},\n\
+         \x20      COALESCE(l.__cnt, 0) AS __pgt_count_l,\n\
          \x20      COALESCE(r.__cnt, 0) AS __pgt_count_r\n\
          FROM __pgt_left l\n\
          {join_type} __pgt_right r USING ({col_list}){where_clause}",

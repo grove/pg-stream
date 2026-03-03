@@ -1154,6 +1154,14 @@ fn get_data_timestamp_str() -> String {
     format!("{now_secs}Z")
 }
 
+/// Return the pg_trickle extension version (from `Cargo.toml`).
+///
+/// This matches the version reported by `pg_extension.extversion`.
+#[pg_extern(schema = "pgtrickle", immutable, parallel_safe)]
+fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// Parse a Prometheus/GNU-style duration string and return seconds.
 ///
 /// Used by SQL views to compare schedule. Returns NULL for invalid input

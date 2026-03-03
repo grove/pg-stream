@@ -481,14 +481,45 @@ fn build_intermediate_agg_delta(
 
         let final_cte = ctx.next_cte_name("agg_final");
 
-        // Row ID from group-by columns (d prefix for D events, n for I)
+        // Row ID: hash ALL output columns (group + aggregates) so the
+        // row_id matches the initial load's content hash.  This is
+        // necessary for CTE-wrapped aggregates where the intermediate
+        // aggregate's row_id flows directly to the MERGE.
+        //
+        // For D events, the aggregate values are the OLD (pre-change)
+        // values computed algebraically;  for I events, they are the
+        // NEW values from the rescan CTE.  A value change thus produces
+        // different row_ids for D and I, which is correct: the D event
+        // deletes the old ST row (matched by old content hash), and the
+        // I event inserts a new ST row (with new content hash).
+        let old_agg_hash_exprs: Vec<String> = aggregates
+            .iter()
+            .map(|agg| {
+                let alias = &agg.alias;
+                let ins_col = format!("__ins_{alias}");
+                let del_col = format!("__del_{alias}");
+                format!(
+                    "(COALESCE(n.{a}, 0) - COALESCE(d.{i}, 0) + COALESCE(d.{d}, 0))::TEXT",
+                    a = quote_ident(alias),
+                    i = quote_ident(&ins_col),
+                    d = quote_ident(&del_col),
+                )
+            })
+            .collect();
+        let new_agg_hash_exprs: Vec<String> = aggregates
+            .iter()
+            .map(|a| format!("n.{}::TEXT", quote_ident(&a.alias)))
+            .collect();
+
         let group_hash_d: Vec<String> = group_output
             .iter()
             .map(|c| format!("d.{}::TEXT", quote_ident(c)))
+            .chain(old_agg_hash_exprs)
             .collect();
         let group_hash_n: Vec<String> = group_output
             .iter()
             .map(|c| format!("n.{}::TEXT", quote_ident(c)))
+            .chain(new_agg_hash_exprs)
             .collect();
         let row_id_d = if group_hash_d.is_empty() {
             "pgtrickle.pg_trickle_hash('__singleton_group')".to_string()
@@ -1211,8 +1242,17 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
     // the ST doesn't have the intermediate columns.  Instead, we build an
     // "old snapshot" CTE by re-aggregating the child's old data (current
     // data minus child delta inserts, plus child delta deletes).
+    //
+    // Also intermediate when the ST does NOT have `__pgt_count` — e.g.,
+    // an aggregate inside a CTE body where the top-level tree is
+    // Filter(CteScan{...}).  The aggregate's group/value columns match
+    // the ST's user columns, but `__pgt_count` was never added because
+    // `needs_pgt_count()` returns false for the top-level CteScan.
     let is_intermediate = if let Some(ref st_cols) = ctx.st_user_columns {
-        if !group_output.is_empty() {
+        if !ctx.st_has_pgt_count {
+            // ST has no __pgt_count → aggregate merge cannot read st.__pgt_count
+            true
+        } else if !group_output.is_empty() {
             // Grouped aggregate: check if any group column is missing from ST
             group_output.iter().any(|g| !st_cols.contains(g))
         } else if !aggregates.is_empty() {
@@ -1247,6 +1287,18 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     let st_table = ctx.st_qualified_name.as_deref().unwrap_or("/* st_table */");
 
+    // When a parent Project renames columns (e.g., `name AS region`),
+    // the aggregate's group_output names don't match the ST column names.
+    // Use the alias map to translate group/agg column names back to the
+    // actual ST column names for `st.{col}` references.
+    let st_col_name = |col: &str| -> String {
+        if let Some(ref map) = ctx.st_column_alias_map {
+            map.get(col).cloned().unwrap_or_else(|| col.to_string())
+        } else {
+            col.to_string()
+        }
+    };
+
     // Row ID from group-by columns (using output names)
     let group_hash_exprs: Vec<String> = group_output
         .iter()
@@ -1279,7 +1331,7 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     // Per-aggregate new values + old values for G-S1 change detection
     for agg in aggregates {
-        let new_val_expr = agg_merge_expr(agg, has_rescan);
+        let new_val_expr = agg_merge_expr_mapped(agg, has_rescan, &st_col_name(&agg.alias));
         merge_selects.push(format!(
             "{new_val_expr} AS {}",
             quote_ident(&format!("new_{}", agg.alias)),
@@ -1289,7 +1341,7 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         // correct: IS DISTINCT FROM will see old=NULL vs new=<value> → changed.
         merge_selects.push(format!(
             "st.{} AS {}",
-            quote_ident(&agg.alias),
+            quote_ident(&st_col_name(&agg.alias)),
             quote_ident(&format!("old_{}", agg.alias)),
         ));
     }
@@ -1327,7 +1379,14 @@ END AS __pgt_meta_action"
     } else {
         group_output
             .iter()
-            .map(|c| format!("st.{qc} = d.{qc}", qc = quote_ident(c)))
+            .map(|c| {
+                let st_c = st_col_name(c);
+                format!(
+                    "st.{st_qc} = d.{d_qc}",
+                    st_qc = quote_ident(&st_c),
+                    d_qc = quote_ident(c),
+                )
+            })
             .collect::<Vec<_>>()
             .join(" AND ")
     };
@@ -1554,9 +1613,13 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
 /// When `has_rescan` is true, group-rescan aggregates reference the rescan
 /// CTE (`r.{alias}`) instead of producing a NULL sentinel. This correctly
 /// re-aggregates the affected group from source data.
-fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
+///
+/// When no column aliasing is in effect, use [`agg_merge_expr`] which
+/// defaults `st_col` to `agg.alias`.
+fn agg_merge_expr_mapped(agg: &AggExpr, has_rescan: bool, st_col: &str) -> String {
     let alias = &agg.alias;
-    let qt = quote_ident(alias);
+    let qt = quote_ident(st_col);
+    let r_qt = quote_ident(alias);
     match &agg.function {
         AggFunc::CountStar | AggFunc::Count => {
             format!(
@@ -1596,7 +1659,7 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             if has_rescan {
                 format!(
                     "CASE WHEN d.{del} IS NOT NULL AND d.{del} = st.{qt} \
-                     THEN r.{qt} \
+                     THEN r.{r_qt} \
                      ELSE {func}(st.{qt}, d.{ins}) END"
                 )
             } else {
@@ -1620,7 +1683,7 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
             if has_rescan {
                 format!(
                     "CASE WHEN COALESCE(d.{ins}, 0) > 0 OR COALESCE(d.{del}, 0) > 0 \
-                     THEN r.{qt} \
+                     THEN r.{r_qt} \
                      ELSE st.{qt} END"
                 )
             } else {
@@ -1633,6 +1696,13 @@ fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
         }
         _ => unreachable!("unexpected AggFunc variant in agg_merge_expr"),
     }
+}
+
+/// Convenience wrapper: uses the aggregate's own alias as the ST column name.
+///
+/// Equivalent to `agg_merge_expr_mapped(agg, has_rescan, &agg.alias)`.
+fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
+    agg_merge_expr_mapped(agg, has_rescan, &agg.alias)
 }
 
 #[cfg(test)]

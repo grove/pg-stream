@@ -25,8 +25,53 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
         ));
     };
 
-    // First, differentiate the child
+    // When a Project renames columns (e.g., `r.name AS region`), the
+    // child's output column names differ from the ST's column names
+    // (which use Project aliases). Temporarily map st_user_columns to
+    // the child's output names so that downstream operators (e.g.,
+    // diff_aggregate's is_intermediate check) can match their output
+    // columns against the "effective" ST columns at their level.
+    //
+    // Also build st_column_alias_map so that downstream operators can
+    // translate their own column names back to the actual ST column names
+    // (e.g., aggregate merge CTE needs st."region" not st."name").
+    let saved_st_cols = ctx.st_user_columns.clone();
+    let saved_alias_map = ctx.st_column_alias_map.clone();
+    if let Some(ref st_cols) = saved_st_cols {
+        let child_out = child.output_columns();
+        // Map positionally: aliases[i] in st_cols → child_out[i]
+        if child_out.len() == aliases.len() {
+            let mut alias_map = std::collections::HashMap::new();
+            let mapped: Vec<String> = st_cols
+                .iter()
+                .map(|st_col| {
+                    if let Some(pos) = aliases.iter().position(|a| a == st_col) {
+                        let child_name = child_out
+                            .get(pos)
+                            .cloned()
+                            .unwrap_or_else(|| st_col.clone());
+                        if child_name != *st_col {
+                            alias_map.insert(child_name.clone(), st_col.clone());
+                        }
+                        child_name
+                    } else {
+                        st_col.clone()
+                    }
+                })
+                .collect();
+            ctx.st_user_columns = Some(mapped);
+            if !alias_map.is_empty() {
+                ctx.st_column_alias_map = Some(alias_map);
+            }
+        }
+    }
+
+    // Differentiate the child
     let child_result = ctx.diff_node(child)?;
+
+    // Restore st_user_columns and alias map
+    ctx.st_user_columns = saved_st_cols;
+    ctx.st_column_alias_map = saved_alias_map;
 
     // The child CTE's column names. For join children, columns are
     // disambiguated as "table__col" (e.g., "l__id", "r__id").

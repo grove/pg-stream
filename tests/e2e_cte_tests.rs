@@ -903,8 +903,12 @@ async fn test_recursive_cte_alter_to_differential() {
 async fn test_recursive_cte_graph_traversal() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Graph with possible multiple paths (UNION ALL allows duplicates,
-    // but still demonstrates graph traversal).
+    // Graph with convergent paths (node 4 reachable via 1→2→4 and
+    // 1→3→4). UNION ALL in the recursive part allows duplicates, so
+    // the outer SELECT uses DISTINCT to collapse identical traversal
+    // rows (e.g., two copies of (5, 8, 3) arriving via both paths
+    // through node 4). Without DISTINCT the __pgt_row_id hash would
+    // collide on the duplicate rows.
     db.execute(
         "CREATE TABLE edges (from_node INT, to_node INT, weight INT, \
          PRIMARY KEY (from_node, to_node))",
@@ -926,7 +930,7 @@ async fn test_recursive_cte_graph_traversal() {
              FROM edges e \
              JOIN reachable r ON e.from_node = r.to_node \
              WHERE r.hops < 10\
-         ) SELECT to_node, weight, hops FROM reachable",
+         ) SELECT DISTINCT to_node, weight, hops FROM reachable",
         "1m",
         "FULL",
     )
