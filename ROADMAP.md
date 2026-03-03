@@ -1,7 +1,7 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-03
-> **Current version:** 0.1.3
+> **Last updated:** 2026-03-04
+> **Current version:** 0.2.0
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -19,12 +19,12 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                                    We are here
-                                                         │
-                                                         ▼
+                                                              We are here
+                                                                   │
+                                                                   ▼
  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
  │  0.1.x   │   │  0.2.0   │   │  0.3.0   │──▶│  0.4.0   │──▶│  1.0.0   │──▶│  1.x+    │
- │ Released │   │ Complete │   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
+ │ Released │   │ Released │   │ Prod-    │   │ Observ-  │   │ Stable   │   │ Scale &  │
  │ ✅       │   │ ✅       │   │ ready    │   │ ability  │   │ Release  │   │ Ecosystem│
  └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
 ```
@@ -72,11 +72,11 @@ See [CHANGELOG.md](CHANGELOG.md) for the full feature list.
 
 ## v0.2.0 — TopK, Diamond Consistency & Transactional IVM
 
-**Status: All features implemented. Ready for release.**
+**Status: Released (2026-03-04).**
 
 The 51-item SQL_GAPS_7 correctness plan was completed in v0.1.x. v0.2.0 delivers
 three major feature additions. The one remaining SQL_GAPS_7 item (F40 — extension
-upgrade migration scripts) is deferred to v0.3.0 as O1.
+upgrade migration scripts) is deferred to v0.3.0 as O1.4
 
 <details>
 <summary>Completed items (click to expand)</summary>

@@ -7,7 +7,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [Unreleased]
+## [0.2.0] — 2026-03-04
 
 ### Added
 
@@ -75,6 +75,33 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 - **E2E test type mismatch** — `test_diamond_atomic_all_succeed` queried
   `total` (an `INT4` column from `INT + INT`) as `i64`; corrected to `i32`.
+- **IVM P5 aggregate bypass in IMMEDIATE mode** — The P5 direct aggregate
+  optimization path read directly from `pgtrickle_changes.changes_<oid>` tables,
+  which don't exist for IMMEDIATE mode stream tables. Fixed by skipping the P5
+  bypass when `DeltaSource::TransitionTable` is active, falling through to the
+  standard path that correctly reads from trigger transition temp tables.
+- **IVM empty delta CTE type mismatch** — When a join query's non-modified
+  source table produced an empty delta CTE, untyped `NULL` columns defaulted to
+  `text` in PostgreSQL, causing `integer = text` comparison errors in downstream
+  join conditions. Fixed by selecting from the actual source table with
+  `WHERE false` to inherit correct column types.
+- **Equi-join key normalization for semi-join optimization** — `extract_equijoin_keys`
+  returned key pairs in expression order (`left_of_= , right_of_=`), but callers
+  assumed `(left_table_key, right_table_key)`. When conditions were written as
+  `r.col = l.col`, the keys were swapped, causing incorrect semi-join filters
+  (wrong column referenced on wrong table). Fixed by inspecting table aliases
+  before stripping qualifiers and normalizing each pair so the first element
+  always belongs to the left join child.
+- **Dockerfile ivm module conflict** — Three Dockerfiles (`tests/Dockerfile.e2e`,
+  `tests/Dockerfile.e2e-coverage`, `cnpg/Dockerfile.ext-build`) created
+  `src/ivm/mod.rs` stubs for dependency caching, conflicting with the new flat
+  `src/ivm.rs` module. Fixed stubs to match the current module structure.
+- **E2E DDL block GUC pool routing** — `test_block_source_ddl_guc_prevents_alter`
+  used session-level `SET`, but PgPool may route subsequent queries to different
+  connections. Fixed to use `ALTER SYSTEM SET` + `pg_reload_conf()`.
+- **Integration test advisory lock pool routing** —
+  `test_advisory_lock_roundtrip` used pool-level queries for session-scoped
+  advisory locks. Fixed to use a single acquired connection.
 - **dbt macros: DDL rollback bug** — `pgtrickle_create_stream_table`,
   `pgtrickle_drop_stream_table`, `pgtrickle_alter_stream_table`, and
   `pgtrickle_refresh_stream_table` all used `run_query()`, which shares the
