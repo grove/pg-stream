@@ -988,11 +988,13 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
 
 /// Execute a NO_DATA refresh: just advance the data timestamp.
 pub fn execute_no_data_refresh(st: &StreamTableMeta) -> Result<(), PgTrickleError> {
-    let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-        .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
-
-    StreamTableMeta::update_after_refresh(st.pgt_id, now, 0)?;
+    // Record that we checked — but do NOT update data_timestamp.
+    // data_timestamp is reserved for refreshes that actually write rows.
+    // Downstream stream tables compare upstream.data_timestamp against their
+    // own data_timestamp to decide whether a full refresh is needed; bumping
+    // data_timestamp on a no-data pass would trigger spurious full refreshes
+    // of every downstream ST every time this table is polled.
+    StreamTableMeta::update_after_no_data_refresh(st.pgt_id)?;
     Ok(())
 }
 

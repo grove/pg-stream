@@ -71,6 +71,14 @@ By the end you will have:
 - `shared_preload_libraries = 'pg_trickle'` in `postgresql.conf`
 - `psql` or any SQL client
 
+Connect to the database you want to use and enable the extension:
+
+```sql
+CREATE EXTENSION pg_trickle;
+```
+
+No additional configuration is needed. pg_trickle automatically discovers all databases on the server and starts a scheduler for each one where the extension is installed.
+
 ---
 
 ## Step 1: Create the Base Tables
@@ -373,10 +381,15 @@ INSERT INTO employees (name, department_id, salary) VALUES
 
 The stream tables don't know about Heidi yet. The change is in the buffer, waiting for the next refresh.
 
-Refresh the whole pipeline in one call (or wait for the 1-minute schedule):
+> **In production you don't need to do anything.** The background scheduler will refresh `department_stats` and then `department_report` automatically within the next minute. Manual refresh calls are only needed here to see the result immediately without waiting.
+
+To trigger it now (optional — skip and wait ~1 minute if you prefer):
 
 ```sql
--- refresh_stream_table cascades to dependent tables automatically
+-- Refresh in source-to-sink order.
+-- department_stats reads from employees (has buffered changes).
+-- department_report reads from department_stats.
+SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
@@ -416,9 +429,14 @@ INSERT INTO departments (id, name, parent_id) VALUES
 
 **What happened:** The CDC trigger on `departments` fired. The change buffer for `departments` has one new row. None of the stream tables know about it yet.
 
-Refresh the whole pipeline:
+> **Again, the scheduler handles this automatically.** All three tables will refresh in the correct dependency order within the next minute. To see the result immediately:
 
 ```sql
+-- department_tree reads from departments (has buffered changes).
+-- department_stats reads from department_tree.
+-- department_report reads from department_stats.
+SELECT pgtrickle.refresh_stream_table('department_tree');
+SELECT pgtrickle.refresh_stream_table('department_stats');
 SELECT pgtrickle.refresh_stream_table('department_report');
 ```
 
@@ -541,16 +559,16 @@ CALCULATED (schedule = `NULL`) means: compute the tightest schedule across all d
 
 ```sql
 -- Current status of all stream tables
-SELECT table_name, schedule, last_refresh_at, stale, refresh_mode
+SELECT name, schedule, data_timestamp, staleness, refresh_mode
 FROM pgtrickle.pgt_status();
 ```
 
 ```
-    table_name      | schedule  | last_refresh_at         | stale | refresh_mode
---------------------+-----------+-------------------------+-------+--------------
- department_tree    | 1m        | 2026-02-26 10:30:00.123 | f     | DIFFERENTIAL
- department_stats   | 1m        | 2026-02-26 10:30:00.456 | f     | DIFFERENTIAL
- department_report  | 1m        | 2026-02-26 10:30:00.789 | f     | DIFFERENTIAL
+        name         | schedule  |       data_timestamp        |    staleness    | refresh_mode
+---------------------+-----------+-----------------------------+-----------------+--------------
+ public.department_tree   | NULL | 2026-02-26 10:30:00.123+01 | 00:00:00.877    | DIFFERENTIAL
+ public.department_stats  | NULL | 2026-02-26 10:30:00.456+01 | 00:00:00.544    | DIFFERENTIAL
+ public.department_report | 1m   | 2026-02-26 10:30:00.789+01 | 00:00:00.211    | DIFFERENTIAL
 ```
 
 ```sql

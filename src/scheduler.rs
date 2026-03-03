@@ -1,15 +1,30 @@
 //! Background worker scheduler for pgtrickle.
 //!
-//! The scheduler runs as a PostgreSQL background worker, periodically checking
-//! for stream tables that need refreshing based on their schedule.
+//! # Architecture — Launcher + Per-Database Workers
 //!
-//! # Architecture
-//! - Registered in `_PG_init()` via `BackgroundWorkerBuilder`
-//! - Wakes every `pg_trickle.scheduler_interval_ms` milliseconds
-//! - Reads shared memory to detect DAG changes
-//! - Consumes CDC changes, determines refresh needs, executes refreshes
+//! The extension uses a two-tier background worker model:
 //!
-//! # Error Handling & Resilience (Phase 10)
+//! 1. **Launcher** (`pg_trickle launcher`) — one per server, static.
+//!    - Connects to the `postgres` database to query system catalogs.
+//!    - Every 10 s, scans `pg_database` for all available databases.
+//!    - For each database, checks `pg_stat_activity` for an existing scheduler.
+//!    - Spawns a dynamic per-database scheduler for any database that lacks one.
+//!    - Automatically re-spawns schedulers that crash or exit.
+//!    - Databases without pg_trickle installed are skipped for 5 minutes before
+//!      re-probing (graceful exit by the per-DB worker signals this).
+//!
+//! 2. **Per-database scheduler** (`pg_trickle scheduler`) — one per database
+//!    that has pg_trickle installed, dynamic.
+//!    - Receives the database name via `bgw_extra` (set by the launcher).
+//!    - Checks that pg_trickle is installed; exits cleanly if not.
+//!    - Wakes every `pg_trickle.scheduler_interval_ms` milliseconds.
+//!    - Reads shared memory to detect DAG changes.
+//!    - Consumes CDC changes, determines refresh needs, executes refreshes.
+//!
+//! This design means pg_trickle works transparently in all databases on a
+//! server without any manual configuration.
+//!
+//! # Error Handling & Resilience
 //! - **Advisory locks**: prevent concurrent refreshes of the same ST
 //! - **Retry with backoff**: retryable errors get exponential backoff per ST
 //! - **Skip mechanism**: if a ST refresh is already running, skip it gracefully
@@ -20,7 +35,7 @@
 use pgrx::bgworkers::*;
 use pgrx::prelude::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 
 use crate::catalog::{RefreshRecord, StreamTableMeta};
@@ -34,9 +49,206 @@ use crate::shmem;
 use crate::version;
 use crate::wal_decoder;
 
-/// Register the scheduler background worker.
+/// Register the launcher background worker.
 ///
 /// Called from `_PG_init()` when loaded via `shared_preload_libraries`.
+/// The launcher discovers all databases on the server and spawns a separate
+/// per-database scheduler worker for each one that has pg_trickle installed.
+pub fn register_launcher_worker() {
+    BackgroundWorkerBuilder::new("pg_trickle launcher")
+        .set_function("pg_trickle_launcher_main")
+        .set_library("pg_trickle")
+        .enable_spi_access()
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(std::time::Duration::from_secs(5)))
+        .load();
+}
+
+/// Main entry point for the launcher background worker.
+///
+/// Runs once per server. Connects to `postgres` (always present) to query
+/// `pg_database` and `pg_stat_activity`, then dynamically spawns a scheduler
+/// worker for every database where pg_trickle is installed.
+///
+/// # Safety
+/// Called directly by PostgreSQL as a background worker entry point.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    // Connect to `postgres` — always available; used only for system catalog queries.
+    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+
+    // Check for replica — launcher cannot spawn workers on standbys.
+    let is_replica = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+        Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+    }));
+    if is_replica {
+        log!("pg_trickle launcher: running on read replica, sleeping until promotion");
+        loop {
+            let ok = BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(30)));
+            if !ok {
+                return;
+            }
+            let still = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+                Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+                    .unwrap_or(Some(false))
+                    .unwrap_or(false)
+            }));
+            if !still {
+                break;
+            }
+        }
+    }
+
+    log!("pg_trickle launcher started");
+
+    // Track the DAG rebuild signal so we can detect CREATE EXTENSION in any
+    // database and immediately re-probe, rather than waiting for skip_ttl.
+    let mut last_dag_version = shmem::current_dag_version();
+
+    // last_attempt[db] = when we last tried to spawn a worker for that DB.
+    // Used to avoid hammering databases where pg_trickle is not installed.
+    let mut last_attempt: HashMap<String, std::time::Instant> = HashMap::new();
+    // DBs where we have seen a scheduler successfully start at least once this
+    // session. Used to distinguish "never had pg_trickle" (long backoff) from
+    // "had a running scheduler that crashed" (short backoff).
+    let mut had_scheduler: HashSet<String> = HashSet::new();
+    // How long to wait before re-probing a DB that has never had pg_trickle.
+    let skip_ttl = std::time::Duration::from_secs(300);
+    // How long to wait before respawning a scheduler that crashed / exited
+    // on a DB where pg_trickle was previously confirmed running.  Kept short
+    // so DROP EXTENSION + CREATE EXTENSION doesn't stall for 5 minutes.
+    let retry_ttl = std::time::Duration::from_secs(15);
+
+    loop {
+        // ── Collect all connectable, non-template databases  ──────────────
+        let databases: Vec<String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            Spi::connect(|client| -> Vec<String> {
+                match client.select(
+                    "SELECT datname::text FROM pg_database \
+                     WHERE NOT datistemplate AND datallowconn",
+                    None,
+                    &[],
+                ) {
+                    Ok(result) => {
+                        let mut out = Vec::new();
+                        for row in result {
+                            if let Some(db) = row.get_by_name::<String, _>("datname").ok().flatten()
+                            {
+                                out.push(db);
+                            }
+                        }
+                        out
+                    }
+                    Err(_) => vec![],
+                }
+            })
+        }));
+
+        // ── Databases that already have a running scheduler worker  ────────
+        let active: HashSet<String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            Spi::connect(|client| -> HashSet<String> {
+                match client.select(
+                    "SELECT datname::text \
+                     FROM pg_stat_activity \
+                     WHERE application_name = 'pg_trickle scheduler' \
+                       AND datname IS NOT NULL",
+                    None,
+                    &[],
+                ) {
+                    Ok(result) => {
+                        let mut out = HashSet::new();
+                        for row in result {
+                            if let Some(db) = row.get_by_name::<String, _>("datname").ok().flatten()
+                            {
+                                out.insert(db);
+                            }
+                        }
+                        out
+                    }
+                    Err(_) => HashSet::new(),
+                }
+            })
+        }));
+
+        // If any backend bumped the DAG signal (CREATE EXTENSION, create_st,
+        // etc.) since our last loop, clear the skip cache so we re-probe all
+        // databases immediately.
+        let dag_version = shmem::current_dag_version();
+        if dag_version != last_dag_version {
+            last_dag_version = dag_version;
+            last_attempt.clear();
+        }
+
+        for db in &databases {
+            if active.contains(db) {
+                // Worker healthy — record that this DB has had a running
+                // scheduler so we can use the short retry_ttl if it crashes.
+                had_scheduler.insert(db.clone());
+                last_attempt.remove(db);
+                continue;
+            }
+
+            // Choose the right backoff: short for DBs that previously ran a
+            // scheduler (crash / DROP EXTENSION scenario), long for DBs that
+            // have never had pg_trickle installed.
+            let ttl = if had_scheduler.contains(db) {
+                retry_ttl
+            } else {
+                skip_ttl
+            };
+
+            // Should we (re)try this database?
+            let retry = last_attempt
+                .get(db)
+                .map(|t| t.elapsed() >= ttl)
+                .unwrap_or(true);
+            if !retry {
+                continue;
+            }
+
+            last_attempt.insert(db.clone(), std::time::Instant::now());
+
+            match BackgroundWorkerBuilder::new("pg_trickle scheduler")
+                .set_function("pg_trickle_scheduler_main")
+                .set_library("pg_trickle")
+                .enable_spi_access()
+                // Pass the database name via bgw_extra (max 128 bytes).
+                .set_extra(db.as_str())
+                // No restart_time — the launcher itself handles respawning.
+                .set_restart_time(None)
+                .load_dynamic()
+            {
+                Ok(_) => {
+                    log!(
+                        "pg_trickle launcher: spawned scheduler for database '{}'",
+                        db
+                    );
+                }
+                Err(_) => {
+                    warning!(
+                        "pg_trickle launcher: could not spawn scheduler for database '{}'",
+                        db
+                    );
+                }
+            }
+        }
+
+        // Wake every 10 s or on SIGHUP/SIGTERM.
+        if !BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(10))) {
+            log!("pg_trickle launcher shutting down");
+            break;
+        }
+    }
+}
+
+/// Register the scheduler background worker (single-database, legacy).
+///
+/// Kept for reference — `_PG_init()` now registers the launcher instead.
+/// The launcher dynamically spawns instances of this worker, one per database.
 pub fn register_scheduler_worker() {
     BackgroundWorkerBuilder::new("pg_trickle scheduler")
         .set_function("pg_trickle_scheduler_main")
@@ -56,7 +268,33 @@ pub fn register_scheduler_worker() {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+
+    // Determine which database to connect to.
+    // Dynamic workers spawned by the launcher have the DB name in bgw_extra.
+    let extra = BackgroundWorker::get_extra();
+    let db_name = if extra.is_empty() {
+        "postgres".to_string()
+    } else {
+        extra.to_string()
+    };
+    BackgroundWorker::connect_worker_to_spi(Some(db_name.as_str()), None);
+
+    // Exit cleanly if pg_trickle is not installed in this database.
+    // The launcher will re-probe after its skip TTL (5 min) expires.
+    let is_installed = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+        Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trickle')",
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false)
+    }));
+    if !is_installed {
+        log!(
+            "pg_trickle scheduler: pg_trickle not installed in database '{}', exiting",
+            db_name
+        );
+        return;
+    }
 
     // F16 (G8.2): Detect read replicas — the scheduler cannot write on a
     // standby. Skip all work and sleep until promotion.
@@ -122,6 +360,29 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
 
         if !config::pg_trickle_enabled() {
             continue;
+        }
+
+        // Check that pg_trickle is still installed in this database.  It can
+        // be dropped at any time via DROP EXTENSION, which removes the schema
+        // and all catalog tables.  Without this guard the very next SPI query
+        // that references pgtrickle.* would crash the worker with exit code 1,
+        // causing the launcher to apply the full 5-minute skip_ttl backoff.
+        // Exiting cleanly here lets the launcher detect the fresh install
+        // using the shorter retry_ttl for databases that previously had a
+        // running scheduler.
+        let still_installed = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+            Spi::get_one::<bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trickle')",
+            )
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+        }));
+        if !still_installed {
+            log!(
+                "pg_trickle scheduler: pg_trickle was dropped from database '{}', exiting",
+                db_name
+            );
+            return;
         }
 
         let now_ms = current_epoch_ms();
@@ -246,7 +507,11 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     }
 
                     let has_changes = check_upstream_changes(&st);
-                    let action = refresh::determine_refresh_action(&st, has_changes);
+                    let action = if has_changes && has_stream_table_source_changes(&st) {
+                        RefreshAction::Full
+                    } else {
+                        refresh::determine_refresh_action(&st, has_changes)
+                    };
                     let result = execute_scheduled_refresh(&st, action);
 
                     match result {
@@ -512,17 +777,20 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
             return crate::api::cron_is_due(trimmed, last_refresh_epoch);
         }
 
-        // Duration-based: compare staleness against parsed seconds
+        // Duration-based: compare staleness against parsed seconds.
+        // Uses last_refresh_at (updated on every run, including NO_DATA)
+        // rather than data_timestamp (only updated when data changes).
+        // This ensures the 1-minute schedule fires at most once per minute
+        // regardless of whether the previous run found any data changes.
         if let Ok(max_secs) = crate::api::parse_duration(trimmed) {
             let stale = Spi::get_one_with_args::<bool>(
-                "SELECT CASE WHEN data_timestamp IS NULL THEN true \
-                 ELSE EXTRACT(EPOCH FROM (now() - data_timestamp)) > $2 END \
+                "SELECT CASE WHEN last_refresh_at IS NULL THEN true \
+                 ELSE EXTRACT(EPOCH FROM (now() - last_refresh_at)) > $2 END \
                  FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
                 &[st.pgt_id.into(), max_secs.into()],
             )
             .unwrap_or(Some(false))
             .unwrap_or(false);
-
             return stale;
         }
 
@@ -535,8 +803,11 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
         return false;
     }
 
-    // CALCULATED STs: refresh when upstream refreshed
-    false
+    // CALCULATED STs: refresh whenever upstream sources have pending changes.
+    // The topological iteration order guarantees upstream STs are refreshed
+    // first within a tick, so their change buffers are already populated by
+    // the time we check here.
+    check_upstream_changes(st)
 }
 
 /// Emit a StaleData alert if the stream table is currently stale.
@@ -577,15 +848,29 @@ fn emit_stale_alert_if_needed(st: &StreamTableMeta) {
 
 /// Check if any upstream source has pending changes.
 fn check_upstream_changes(st: &StreamTableMeta) -> bool {
-    // With trigger-based CDC, changes are written directly to buffer tables.
-    // Check if any buffer table for this ST's sources has pending rows.
-    let change_schema = config::pg_trickle_change_buffer_schema();
+    // Walk every dependency of this stream table and check whether any source
+    // has pending changes that have not yet been reflected in our data.
+    //
+    // Two kinds of upstream sources:
+    //   TABLE        — base tables with trigger-based CDC.  Pending changes
+    //                  live in pgtrickle_changes.changes_{oid}.
+    //   STREAM_TABLE — intermediate stream tables (no change buffer).  We
+    //                  detect staleness by comparing data_timestamps: if the
+    //                  upstream ST was last refreshed *after* we were, our
+    //                  data is out-of-date.
+    if !st.is_populated {
+        return true;
+    }
+    has_table_source_changes(st) || has_stream_table_source_changes(st)
+}
 
-    // Get source OIDs for this ST
+/// Returns `true` if any TABLE-type upstream source has rows in its CDC change
+/// buffer that have not yet been consumed by a differential refresh.
+fn has_table_source_changes(st: &StreamTableMeta) -> bool {
+    let change_schema = config::pg_trickle_change_buffer_schema();
     let source_oids = get_source_oids_for_st(st.pgt_id);
 
     for oid in &source_oids {
-        // Check if the buffer table has any rows
         let has_rows = Spi::get_one::<bool>(&format!(
             "SELECT EXISTS(SELECT 1 FROM {}.changes_{} LIMIT 1)",
             change_schema,
@@ -598,12 +883,43 @@ fn check_upstream_changes(st: &StreamTableMeta) -> bool {
             return true;
         }
     }
+    false
+}
 
-    // If no CDC tracking yet, assume changes exist (conservative)
-    if !st.is_populated {
-        return true;
+/// Returns `true` if any STREAM_TABLE upstream has a `data_timestamp` more
+/// recent than our own `data_timestamp`.
+///
+/// STREAM_TABLE upstreams have no CDC change buffer.  We detect staleness via
+/// a `data_timestamp` comparison instead.  When this returns `true`, the
+/// caller **must** use `RefreshAction::Full` — a differential refresh cannot
+/// incorporate stream-table changes (no change buffer to diff against).
+fn has_stream_table_source_changes(st: &StreamTableMeta) -> bool {
+    let deps = crate::catalog::StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+
+    for dep in &deps {
+        if dep.source_type != "STREAM_TABLE" {
+            continue;
+        }
+
+        let upstream_newer = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS ( \
+               SELECT 1 \
+               FROM pgtrickle.pgt_stream_tables upstream \
+               JOIN pgtrickle.pgt_stream_tables us ON us.pgt_id = {} \
+               WHERE upstream.pgt_relid = {}::oid \
+                 AND upstream.data_timestamp \
+                     > COALESCE(us.data_timestamp, '-infinity'::timestamptz) \
+             )",
+            st.pgt_id,
+            dep.source_relid.to_u32(),
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        if upstream_newer {
+            return true;
+        }
     }
-
     false
 }
 
@@ -648,7 +964,18 @@ fn refresh_single_st(
     }
 
     let has_changes = check_upstream_changes(&st);
-    let action = refresh::determine_refresh_action(&st, has_changes);
+
+    // STREAM_TABLE upstream sources have no CDC change buffer.  When an
+    // upstream stream table has newer data (detected via data_timestamp
+    // comparison in check_upstream_changes/has_stream_table_source_changes),
+    // a DIFFERENTIAL refresh would be a no-op — there are no buffer rows to
+    // merge.  Force a FULL refresh instead so the data actually incorporates
+    // the upstream's latest rows.
+    let action = if has_changes && has_stream_table_source_changes(&st) {
+        RefreshAction::Full
+    } else {
+        refresh::determine_refresh_action(&st, has_changes)
+    };
     let result = execute_scheduled_refresh(&st, action);
 
     let retry = retry_states.entry(pgt_id).or_default();
@@ -901,7 +1228,32 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
                 was_full_fallback,
             );
 
-            let _ = StreamTableMeta::update_after_refresh(st.pgt_id, now, rows_inserted);
+            // For NO_DATA refreshes, data_timestamp must NOT be updated —
+            // execute_no_data_refresh already updated last_refresh_at only.
+            // Updating data_timestamp here would cause downstream stream
+            // tables that compare upstream.data_timestamp to see a false
+            // "upstream changed" signal on every no-data polling cycle.
+            //
+            // DIFFERENTIAL refreshes that produce 0 rows are also treated as
+            // effective NO_DATA: the change buffer may still contain rows
+            // from the previous cycle (deferred cleanup runs at the START of
+            // the next differential), causing has_table_source_changes() to
+            // return true and the scheduler to trigger a DIFFERENTIAL that
+            // finds nothing in the current frontier window.  Bumping
+            // data_timestamp for such 0-row differentials would cause
+            // downstream STs to see a false "upstream changed" signal and
+            // trigger unnecessary FULL refreshes.
+            if action == RefreshAction::NoData {
+                // Already handled by execute_no_data_refresh
+            } else if action == RefreshAction::Differential
+                && rows_inserted == 0
+                && rows_deleted == 0
+            {
+                // Effective NO_DATA — update last_refresh_at only
+                let _ = StreamTableMeta::update_after_no_data_refresh(st.pgt_id);
+            } else {
+                let _ = StreamTableMeta::update_after_refresh(st.pgt_id, now, rows_inserted);
+            }
 
             monitor::alert_refresh_completed(
                 &st.pgt_schema,

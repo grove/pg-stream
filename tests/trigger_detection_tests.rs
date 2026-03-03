@@ -28,6 +28,7 @@ const HAS_USER_TRIGGERS_SQL: &str = r#"
         WHERE tgrelid = $1::oid
           AND NOT tgisinternal
           AND tgname NOT LIKE 'pgt_%'
+          AND tgname NOT LIKE 'pg_trickle_%'
           AND tgtype & 1 = 1
     )
 "#;
@@ -276,4 +277,102 @@ async fn test_trigger_detection_after_drop() {
         .await
         .expect("query failed");
     assert!(!after, "Should not detect trigger after drop");
+}
+
+/// Regression: `pg_trickle_%` prefixed triggers (CDC triggers installed by
+/// the extension) must NOT be counted as user triggers. Before the fix,
+/// only `pgt_%` was excluded, so `pg_trickle_cdc_<oid>` triggers were
+/// incorrectly detected as user triggers, forcing the slower explicit-DML
+/// refresh path.
+#[tokio::test]
+async fn test_trigger_detection_ignores_pg_trickle_prefix() {
+    let db = TestDb::new().await;
+
+    db.execute("CREATE TABLE detect_trickle (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute(
+        "CREATE OR REPLACE FUNCTION noop_fn() RETURNS TRIGGER AS $$
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .await;
+    // Simulate the CDC trigger name pattern used by pg_trickle
+    db.execute(
+        "CREATE TRIGGER pg_trickle_cdc_12345 AFTER INSERT ON detect_trickle
+         FOR EACH ROW EXECUTE FUNCTION noop_fn()",
+    )
+    .await;
+
+    let oid: i32 = db
+        .query_scalar("SELECT 'detect_trickle'::regclass::oid::int")
+        .await;
+
+    let has_triggers: bool = sqlx::query_scalar(HAS_USER_TRIGGERS_SQL)
+        .bind(oid)
+        .fetch_one(&db.pool)
+        .await
+        .expect("trigger detection query failed");
+
+    assert!(
+        !has_triggers,
+        "pg_trickle_-prefixed triggers should be excluded from user trigger detection"
+    );
+}
+
+/// Regression: Both `pgt_%` AND `pg_trickle_%` triggers should be excluded,
+/// while a real user trigger alongside them is still detected.
+#[tokio::test]
+async fn test_trigger_detection_mixed_internal_and_user() {
+    let db = TestDb::new().await;
+
+    db.execute("CREATE TABLE detect_all (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute(
+        "CREATE OR REPLACE FUNCTION noop_fn() RETURNS TRIGGER AS $$
+         BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .await;
+    // Internal: pgt_* prefix
+    db.execute(
+        "CREATE TRIGGER pgt_change_buffer AFTER INSERT ON detect_all
+         FOR EACH ROW EXECUTE FUNCTION noop_fn()",
+    )
+    .await;
+    // Internal: pg_trickle_* prefix (CDC)
+    db.execute(
+        "CREATE TRIGGER pg_trickle_cdc_99999 AFTER INSERT ON detect_all
+         FOR EACH ROW EXECUTE FUNCTION noop_fn()",
+    )
+    .await;
+
+    let oid: i32 = db
+        .query_scalar("SELECT 'detect_all'::regclass::oid::int")
+        .await;
+
+    // With only internal triggers, should be false
+    let has_triggers: bool = sqlx::query_scalar(HAS_USER_TRIGGERS_SQL)
+        .bind(oid)
+        .fetch_one(&db.pool)
+        .await
+        .expect("query failed");
+    assert!(
+        !has_triggers,
+        "Only internal triggers present — should not detect user triggers"
+    );
+
+    // Add a real user trigger
+    db.execute(
+        "CREATE TRIGGER audit_log_trigger AFTER UPDATE ON detect_all
+         FOR EACH ROW EXECUTE FUNCTION noop_fn()",
+    )
+    .await;
+
+    let has_triggers_with_user: bool = sqlx::query_scalar(HAS_USER_TRIGGERS_SQL)
+        .bind(oid)
+        .fetch_one(&db.pool)
+        .await
+        .expect("query failed");
+    assert!(
+        has_triggers_with_user,
+        "Real user trigger should be detected alongside internal triggers"
+    );
 }

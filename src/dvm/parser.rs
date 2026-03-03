@@ -1023,6 +1023,9 @@ impl OpTree {
     /// without GROUP BY (scalar aggregates).
     ///
     /// For transparent wrappers (`Project`, `Subquery`), delegates to child.
+    /// When a `Project` renames GROUP BY columns (e.g., `t.id AS department_id`),
+    /// the Project's aliases are used instead of the raw Aggregate names,
+    /// matching the storage table's column names.
     pub fn group_by_columns(&self) -> Option<Vec<String>> {
         match self {
             OpTree::Aggregate { group_by, .. } => {
@@ -1032,26 +1035,47 @@ impl OpTree {
                     Some(group_by.iter().map(|e| e.output_name()).collect())
                 }
             }
-            OpTree::Project { child, aliases, .. } => {
-                // Map child's GROUP BY column names through the Project's
-                // aliasing so they match the storage table columns.
-                // E.g., `SELECT r.name AS region ... GROUP BY r.name`:
-                //   child returns ["name"], Project aliases → ["region"].
-                let child_gb = child.group_by_columns()?;
-                let child_out = child.output_columns();
-                let mapped: Vec<String> = child_gb
-                    .iter()
-                    .map(|gb_name| {
-                        // Find position of gb_name in child's output columns
-                        if let Some(pos) = child_out.iter().position(|c| c == gb_name) {
-                            // Map to the Project alias at the same position
-                            aliases.get(pos).cloned().unwrap_or_else(|| gb_name.clone())
-                        } else {
-                            gb_name.clone()
-                        }
-                    })
-                    .collect();
-                Some(mapped)
+            OpTree::Project {
+                child,
+                aliases,
+                expressions,
+            } => {
+                // If the child is an Aggregate with GROUP BY, resolve the
+                // group-by column names through this Project's alias mapping.
+                // The storage table uses the Project's aliases (the SELECT
+                // output names), not the Aggregate's raw group-by expression
+                // names. Without this, `GROUP BY t.id` with alias
+                // `department_id` would produce an index on "id" while the
+                // storage table column is "department_id".
+                if let Some(raw_names) = child.group_by_columns() {
+                    let resolved: Vec<String> = raw_names
+                        .iter()
+                        .map(|raw| {
+                            // Handle ordinal GROUP BY (e.g., GROUP BY 1):
+                            // resolve the integer position to the Nth alias.
+                            if let Ok(pos) = raw.parse::<usize>()
+                                && pos >= 1
+                                && pos <= aliases.len()
+                            {
+                                return aliases[pos - 1].clone();
+                            }
+                            // Find the expression in this Project that
+                            // references the raw group-by column, and return
+                            // the corresponding alias.
+                            for (expr, alias) in expressions.iter().zip(aliases.iter()) {
+                                if expr.output_name() == *raw {
+                                    return alias.clone();
+                                }
+                            }
+                            // No matching expression — keep the raw name
+                            // (shouldn't happen for well-formed trees).
+                            raw.clone()
+                        })
+                        .collect();
+                    Some(resolved)
+                } else {
+                    None
+                }
             }
             OpTree::Subquery { child, .. } => child.group_by_columns(),
             _ => None,
@@ -1651,40 +1675,88 @@ pub fn lookup_function_volatility(_func_name: &str) -> Result<char, PgTrickleErr
 /// Look up the volatility category of a PostgreSQL operator by name.
 ///
 /// Joins `pg_operator` → `pg_proc` via `oprcode` to get the implementing
-/// function's `provolatile`. Returns the worst volatility across all
-/// overloads of the operator name (e.g., `+` for int, float, numeric).
+/// function's `provolatile`.
+///
+/// **Overload disambiguation:** Many operators (`+`, `-`, `||`, etc.) have
+/// overloads spanning different type categories. For example, `+` is
+/// immutable for `int4 + int4` but stable for `timestamp + interval`
+/// (timezone-dependent), and `||` is immutable for `text || text` but
+/// stable for `textanycat(text, anynonarray)`. Without argument-type
+/// resolution we cannot determine which overload applies.
+///
+/// To avoid false "stable" warnings on expressions like `depth + 1` or
+/// `path || '>'`, we first compute the worst volatility across
+/// **concrete non-temporal** overloads (those whose left AND right operand
+/// types are neither date/time category `'D'` nor pseudo-type category
+/// `'P'`). If at least one such overload exists, we return that result.
+/// Only when ALL overloads involve temporal or pseudo-types do we fall
+/// back to the worst across all overloads.
 ///
 /// Returns `'i'` if the operator is not found — all built-in operators
 /// (arithmetic, comparison, logical) are immutable. Unknown operators
-/// default to 'i' because operator-not-found typically means the query
+/// default to `'i'` because operator-not-found typically means the query
 /// would fail anyway; the volatile/stable cases arise only with custom
 /// operators that DO exist in `pg_operator`.
 ///
 /// Closes Gap G7.2: custom operators with volatile `oprcode` functions
-/// (e.g., PostGIS `&&` or user-defined operators) are now detected.
+/// (e.g., PostGIS `&&` or user-defined operators) are still detected.
 #[cfg(not(test))]
 pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgTrickleError> {
     Spi::connect(|client| {
         let result = client.select(
-            "SELECT p.provolatile::text \
+            "SELECT p.provolatile::text AS vol, \
+                    COALESCE(tl.typcategory::text, 'X') AS lcat, \
+                    COALESCE(tr.typcategory::text, 'X') AS rcat \
              FROM pg_catalog.pg_operator o \
              JOIN pg_catalog.pg_proc p ON o.oprcode = p.oid \
+             LEFT JOIN pg_catalog.pg_type tl ON o.oprleft = tl.oid \
+             LEFT JOIN pg_catalog.pg_type tr ON o.oprright = tr.oid \
              WHERE o.oprname = $1",
             None,
             &[op_name.into()],
         )?;
 
-        let mut worst = 'i';
+        let mut worst_all = 'i';
+        let mut worst_concrete = 'i';
+        let mut has_concrete = false;
+
         for row in result {
             let vol: String = row
-                .get_by_name::<String, _>("provolatile")
+                .get_by_name::<String, _>("vol")
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "i".to_string());
+            let lcat: String = row
+                .get_by_name::<String, _>("lcat")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "X".to_string());
+            let rcat: String = row
+                .get_by_name::<String, _>("rcat")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "X".to_string());
+
             let ch = vol.chars().next().unwrap_or('i');
-            worst = max_volatility(worst, ch);
+            worst_all = max_volatility(worst_all, ch);
+
+            // Exclude overloads with temporal (D) or pseudo-type (P)
+            // arguments — these cause false positives when the actual
+            // resolved overload uses concrete non-temporal types.
+            let lc = lcat.chars().next().unwrap_or('X');
+            let rc = rcat.chars().next().unwrap_or('X');
+            if lc != 'D' && lc != 'P' && rc != 'D' && rc != 'P' {
+                has_concrete = true;
+                worst_concrete = max_volatility(worst_concrete, ch);
+            }
         }
-        Ok(worst)
+
+        // Prefer concrete non-temporal overloads when available.
+        Ok(if has_concrete {
+            worst_concrete
+        } else {
+            worst_all
+        })
     })
     .map_err(|e: pgrx::spi::SpiError| {
         PgTrickleError::SpiError(format!("operator volatility lookup failed: {e}"))
@@ -1692,7 +1764,9 @@ pub fn lookup_operator_volatility(op_name: &str) -> Result<char, PgTrickleError>
 }
 
 /// Test-only stub: SPI is unavailable in unit tests, so assume immutable
-/// for operators (most built-in operators are immutable).
+/// for operators (most built-in operators are immutable). In the real
+/// implementation, temporal/pseudo-type overloads are filtered out to avoid
+/// false stable warnings — see the `#[cfg(not(test))]` variant.
 #[cfg(test)]
 pub fn lookup_operator_volatility(_op_name: &str) -> Result<char, PgTrickleError> {
     Ok('i')
@@ -7719,6 +7793,21 @@ unsafe fn parse_select_stmt(
         // expression name (l_suppkey), losing the alias. Detect renames
         // BEFORE moving group_by into the Aggregate.
         let (target_exprs, target_aliases) = unsafe { parse_target_list(&target_list)? };
+
+        // Resolve ordinal GROUP BY references (e.g., GROUP BY 1 → first
+        // target expression). PostgreSQL allows GROUP BY <n> to refer to
+        // the Nth output column. Resolve these to the actual target
+        // expressions now so that rename detection below can match them.
+        for gb_expr in &mut group_by {
+            if let Expr::Raw(s) = &gb_expr
+                && let Ok(pos) = s.parse::<usize>()
+                && pos >= 1
+                && pos <= target_exprs.len()
+            {
+                *gb_expr = target_exprs[pos - 1].clone();
+            }
+        }
+
         let mut rename_map = std::collections::HashMap::<usize, String>::new();
         for (i, gb_expr) in group_by.iter().enumerate() {
             let gb_sql = gb_expr.to_sql();
@@ -13552,6 +13641,81 @@ mod tests {
     fn test_group_by_columns_scan_returns_none() {
         let tree = scan_node("t", 1, &["id"]);
         assert_eq!(tree.group_by_columns(), None);
+    }
+
+    #[test]
+    fn test_group_by_columns_project_renames_columns() {
+        // Simulates: SELECT t.id AS department_id, t.name AS dept_name, COUNT(*)
+        //            FROM ... GROUP BY t.id, t.name
+        // The Aggregate group_by has ["id", "name"] but the Project aliases
+        // them to ["department_id", "dept_name"]. The storage table uses the
+        // Project aliases, so group_by_columns() must return those.
+        let tree = OpTree::Project {
+            expressions: vec![col("id"), col("name"), col("cnt")],
+            aliases: vec![
+                "department_id".to_string(),
+                "dept_name".to_string(),
+                "cnt".to_string(),
+            ],
+            child: Box::new(OpTree::Aggregate {
+                group_by: vec![col("id"), col("name")],
+                aggregates: vec![AggExpr {
+                    function: AggFunc::CountStar,
+                    argument: None,
+                    alias: "cnt".to_string(),
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                }],
+                child: Box::new(scan_node("t", 1, &["id", "name"])),
+            }),
+        };
+        assert_eq!(
+            tree.group_by_columns(),
+            Some(vec!["department_id".to_string(), "dept_name".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_group_by_columns_project_ordinal_group_by() {
+        // Simulates: SELECT split_part(full_path, ' > ', 2) AS division,
+        //                   SUM(headcount) AS total_headcount
+        //            FROM ... GROUP BY 1
+        // The Aggregate group_by has ordinal Literal("1"). The Project must
+        // resolve position 1 → alias "division".
+        let tree = OpTree::Project {
+            expressions: vec![
+                Expr::FuncCall {
+                    func_name: "split_part".to_string(),
+                    args: vec![
+                        col("full_path"),
+                        Expr::Literal("' > '".to_string()),
+                        Expr::Literal("2".to_string()),
+                    ],
+                },
+                col("total_headcount"),
+            ],
+            aliases: vec!["division".to_string(), "total_headcount".to_string()],
+            child: Box::new(OpTree::Aggregate {
+                group_by: vec![Expr::Literal("1".to_string())],
+                aggregates: vec![AggExpr {
+                    function: AggFunc::Sum,
+                    argument: Some(col("headcount")),
+                    alias: "total_headcount".to_string(),
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                }],
+                child: Box::new(scan_node(
+                    "department_stats",
+                    1,
+                    &["full_path", "headcount"],
+                )),
+            }),
+        };
+        assert_eq!(tree.group_by_columns(), Some(vec!["division".to_string()]));
     }
 
     // ── OpTree::row_id_key_columns tests ────────────────────────────

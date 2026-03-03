@@ -6,7 +6,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 ## Overview
 
-pg_trickle exposes sixteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_trickle exposes fifteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
