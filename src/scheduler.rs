@@ -1,15 +1,30 @@
 //! Background worker scheduler for pgtrickle.
 //!
-//! The scheduler runs as a PostgreSQL background worker, periodically checking
-//! for stream tables that need refreshing based on their schedule.
+//! # Architecture — Launcher + Per-Database Workers
 //!
-//! # Architecture
-//! - Registered in `_PG_init()` via `BackgroundWorkerBuilder`
-//! - Wakes every `pg_trickle.scheduler_interval_ms` milliseconds
-//! - Reads shared memory to detect DAG changes
-//! - Consumes CDC changes, determines refresh needs, executes refreshes
+//! The extension uses a two-tier background worker model:
 //!
-//! # Error Handling & Resilience (Phase 10)
+//! 1. **Launcher** (`pg_trickle launcher`) — one per server, static.
+//!    - Connects to the `postgres` database to query system catalogs.
+//!    - Every 10 s, scans `pg_database` for all available databases.
+//!    - For each database, checks `pg_stat_activity` for an existing scheduler.
+//!    - Spawns a dynamic per-database scheduler for any database that lacks one.
+//!    - Automatically re-spawns schedulers that crash or exit.
+//!    - Databases without pg_trickle installed are skipped for 5 minutes before
+//!      re-probing (graceful exit by the per-DB worker signals this).
+//!
+//! 2. **Per-database scheduler** (`pg_trickle scheduler`) — one per database
+//!    that has pg_trickle installed, dynamic.
+//!    - Receives the database name via `bgw_extra` (set by the launcher).
+//!    - Checks that pg_trickle is installed; exits cleanly if not.
+//!    - Wakes every `pg_trickle.scheduler_interval_ms` milliseconds.
+//!    - Reads shared memory to detect DAG changes.
+//!    - Consumes CDC changes, determines refresh needs, executes refreshes.
+//!
+//! This design means pg_trickle works transparently in all databases on a
+//! server — no `pg_trickle.database` GUC configuration required.
+//!
+//! # Error Handling & Resilience
 //! - **Advisory locks**: prevent concurrent refreshes of the same ST
 //! - **Retry with backoff**: retryable errors get exponential backoff per ST
 //! - **Skip mechanism**: if a ST refresh is already running, skip it gracefully
@@ -20,7 +35,7 @@
 use pgrx::bgworkers::*;
 use pgrx::prelude::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 
 use crate::catalog::{RefreshRecord, StreamTableMeta};
@@ -34,9 +49,174 @@ use crate::shmem;
 use crate::version;
 use crate::wal_decoder;
 
-/// Register the scheduler background worker.
+/// Register the launcher background worker.
 ///
 /// Called from `_PG_init()` when loaded via `shared_preload_libraries`.
+/// The launcher discovers all databases on the server and spawns a separate
+/// per-database scheduler worker for each one that has pg_trickle installed.
+pub fn register_launcher_worker() {
+    BackgroundWorkerBuilder::new("pg_trickle launcher")
+        .set_function("pg_trickle_launcher_main")
+        .set_library("pg_trickle")
+        .enable_spi_access()
+        .set_start_time(BgWorkerStartTime::RecoveryFinished)
+        .set_restart_time(Some(std::time::Duration::from_secs(5)))
+        .load();
+}
+
+/// Main entry point for the launcher background worker.
+///
+/// Runs once per server. Connects to `postgres` (always present) to query
+/// `pg_database` and `pg_stat_activity`, then dynamically spawns a scheduler
+/// worker for every database where pg_trickle is installed.
+///
+/// # Safety
+/// Called directly by PostgreSQL as a background worker entry point.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+    // Connect to `postgres` — always available; used only for system catalog queries.
+    BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
+
+    // Check for replica — launcher cannot spawn workers on standbys.
+    let is_replica = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+        Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+    }));
+    if is_replica {
+        log!("pg_trickle launcher: running on read replica, sleeping until promotion");
+        loop {
+            let ok = BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(30)));
+            if !ok {
+                return;
+            }
+            let still = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+                Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
+                    .unwrap_or(Some(false))
+                    .unwrap_or(false)
+            }));
+            if !still {
+                break;
+            }
+        }
+    }
+
+    log!("pg_trickle launcher started");
+
+    // last_attempt[db] = when we last tried to spawn a worker for that DB.
+    // Used to avoid hammering databases where pg_trickle is not installed.
+    let mut last_attempt: HashMap<String, std::time::Instant> = HashMap::new();
+    // How long to wait before re-probing a DB that has no pg_trickle.
+    let skip_ttl = std::time::Duration::from_secs(300);
+
+    loop {
+        // ── Collect all connectable, non-template databases  ──────────────
+        let databases: Vec<String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            Spi::connect(|client| -> Vec<String> {
+                match client.select(
+                    "SELECT datname::text FROM pg_database \
+                     WHERE NOT datistemplate AND datallowconn",
+                    None,
+                    &[],
+                ) {
+                    Ok(result) => {
+                        let mut out = Vec::new();
+                        for row in result {
+                            if let Some(db) = row.get_by_name::<String, _>("datname").ok().flatten()
+                            {
+                                out.push(db);
+                            }
+                        }
+                        out
+                    }
+                    Err(_) => vec![],
+                }
+            })
+        }));
+
+        // ── Databases that already have a running scheduler worker  ────────
+        let active: HashSet<String> = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            Spi::connect(|client| -> HashSet<String> {
+                match client.select(
+                    "SELECT datname::text \
+                     FROM pg_stat_activity \
+                     WHERE application_name = 'pg_trickle scheduler' \
+                       AND datname IS NOT NULL",
+                    None,
+                    &[],
+                ) {
+                    Ok(result) => {
+                        let mut out = HashSet::new();
+                        for row in result {
+                            if let Some(db) = row.get_by_name::<String, _>("datname").ok().flatten()
+                            {
+                                out.insert(db);
+                            }
+                        }
+                        out
+                    }
+                    Err(_) => HashSet::new(),
+                }
+            })
+        }));
+
+        for db in &databases {
+            if active.contains(db) {
+                // Worker healthy — reset backoff so a future crash respawns fast.
+                last_attempt.remove(db);
+                continue;
+            }
+
+            // Should we (re)try this database?
+            let retry = last_attempt
+                .get(db)
+                .map(|t| t.elapsed() >= skip_ttl)
+                .unwrap_or(true);
+            if !retry {
+                continue;
+            }
+
+            last_attempt.insert(db.clone(), std::time::Instant::now());
+
+            match BackgroundWorkerBuilder::new("pg_trickle scheduler")
+                .set_function("pg_trickle_scheduler_main")
+                .set_library("pg_trickle")
+                .enable_spi_access()
+                // Pass the database name via bgw_extra (max 128 bytes).
+                .set_extra(db.as_str())
+                // No restart_time — the launcher itself handles respawning.
+                .set_restart_time(None)
+                .load_dynamic()
+            {
+                Ok(_) => {
+                    log!(
+                        "pg_trickle launcher: spawned scheduler for database '{}'",
+                        db
+                    );
+                }
+                Err(_) => {
+                    warning!(
+                        "pg_trickle launcher: could not spawn scheduler for database '{}'",
+                        db
+                    );
+                }
+            }
+        }
+
+        // Wake every 10 s or on SIGHUP/SIGTERM.
+        if !BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(10))) {
+            log!("pg_trickle launcher shutting down");
+            break;
+        }
+    }
+}
+
+/// Register the scheduler background worker (single-database, legacy).
+///
+/// Kept for reference — `_PG_init()` now registers the launcher instead.
+/// The launcher dynamically spawns instances of this worker, one per database.
 pub fn register_scheduler_worker() {
     BackgroundWorkerBuilder::new("pg_trickle scheduler")
         .set_function("pg_trickle_scheduler_main")
@@ -56,8 +236,34 @@ pub fn register_scheduler_worker() {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    let db_name = config::pg_trickle_database();
+
+    // Determine which database to connect to.
+    // Dynamic workers spawned by the launcher have the DB name in bgw_extra.
+    // The legacy GUC fallback is kept for backward compatibility.
+    let extra = BackgroundWorker::get_extra();
+    let db_name = if extra.is_empty() {
+        config::pg_trickle_database()
+    } else {
+        extra.to_string()
+    };
     BackgroundWorker::connect_worker_to_spi(Some(db_name.as_str()), None);
+
+    // Exit cleanly if pg_trickle is not installed in this database.
+    // The launcher will re-probe after its skip TTL (5 min) expires.
+    let is_installed = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+        Spi::get_one::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_trickle')",
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false)
+    }));
+    if !is_installed {
+        log!(
+            "pg_trickle scheduler: pg_trickle not installed in database '{}', exiting",
+            db_name
+        );
+        return;
+    }
 
     // F16 (G8.2): Detect read replicas — the scheduler cannot write on a
     // standby. Skip all work and sleep until promotion.

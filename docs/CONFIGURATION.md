@@ -45,33 +45,42 @@ SET pg_trickle.enabled = true;
 
 ---
 
-### pg_trickle.database
+### pg_trickle.database *(deprecated)*
 
-The name of the database the background scheduler connects to on startup.
+> **Deprecated since v0.2.0.** No longer needed. See below.
 
 | Property | Value |
 |---|---|
 | Type | `string` |
 | Default | `'postgres'` |
 | Context | `SIGHUP` |
-| Restart Required | Background worker restart (automatic after reload) |
 
-The scheduler background worker must connect to the database where pg_trickle is installed. The default (`'postgres'`) only works if the extension is installed in the `postgres` database. If you install pg_trickle in a different database (e.g., `myapp`), you **must** set this GUC or the scheduler will crash on every startup with `relation "pgtrickle.pgt_refresh_history" does not exist`.
+**Background:** In earlier versions, pg_trickle ran a single background worker that connected to one fixed database controlled by this GUC. If the extension was installed in a database other than `postgres`, the worker would crash on startup because it couldn't find the catalog tables.
 
-**This is the most common cause of stream tables not refreshing automatically.**
+**What changed:** pg_trickle now runs a **launcher** worker (`pg_trickle launcher`) that automatically scans all databases on the server every 10 seconds and spawns a dedicated **per-database scheduler** (`pg_trickle scheduler`) for each database where the extension is installed. No manual configuration is required.
 
-```sql
--- Set once (persisted to postgresql.auto.conf):
-ALTER SYSTEM SET pg_trickle.database = 'myapp';
-SELECT pg_reload_conf();
--- The background worker will restart within ~5 seconds and connect to the correct DB.
+```
+pg_trickle launcher            (one per server, permanent)
+  ├─▶ pg_trickle scheduler     (database: app1) — started automatically
+  ├─▶ pg_trickle scheduler     (database: app2) — started automatically
+  └─▶ pg_trickle scheduler     (database: app3) — started automatically
 ```
 
-You can verify the scheduler is running after the reload:
+The launchers probes each database on startup; databases without pg_trickle cause the worker to exit cleanly. The launcher re-probes those databases every 5 minutes, so `CREATE EXTENSION pg_trickle` in a new database is picked up automatically within 5 minutes.
+
+**If you have `pg_trickle.database` set** (e.g., from a previous version), you can remove it — it has no effect:
 
 ```sql
-SELECT pid, backend_type FROM pg_stat_activity
-WHERE application_name = 'pg_trickle scheduler';
+ALTER SYSTEM RESET pg_trickle.database;
+SELECT pg_reload_conf();
+```
+
+To verify the launcher and per-database schedulers are running:
+
+```sql
+SELECT application_name, datname, state
+FROM pg_stat_activity
+WHERE application_name IN ('pg_trickle launcher', 'pg_trickle scheduler');
 ```
 
 ---
@@ -524,10 +533,6 @@ The effective refresh cadence of the convergence node becomes `min(all member sc
 ```ini
 # Required
 shared_preload_libraries = 'pg_trickle'
-
-# IMPORTANT: set this to the database where pg_trickle is installed
-# (default 'postgres' only works if the extension is in the postgres DB)
-pg_trickle.database = 'postgres'
 
 # Optional tuning
 pg_trickle.enabled = true

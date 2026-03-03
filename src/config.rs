@@ -8,12 +8,13 @@ use pgrx::guc::*;
 /// Master enable/disable switch for the extension.
 pub static PGS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
-/// Database the background scheduler connects to.
+/// Database the background scheduler connects to (deprecated).
 ///
-/// Must be the name of the database where pg_trickle is installed.
-/// Defaults to `"postgres"`. Change this (and reload + restart the
-/// background worker) when you install pg_trickle into a non-default
-/// database.
+/// **Deprecated since v0.2.0**: The new launcher-based architecture
+/// auto-discovers all databases and spawns per-database scheduler workers
+/// automatically. This GUC is now only used as a fallback when the per-database
+/// scheduler was not launched by the launcher (e.g., direct invocation in
+/// tests). Leave it at the default `"postgres"` — there is no need to set it.
 pub static PGS_DATABASE: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(Some(c"postgres"));
 
@@ -153,11 +154,10 @@ pub fn register_gucs() {
 
     GucRegistry::define_string_guc(
         c"pg_trickle.database",
-        c"Database the background scheduler connects to.",
-        c"The scheduler background worker connects to this database on startup. \
-           Must match the database where pg_trickle is installed. \
-           After changing, run: SELECT pg_reload_conf(); then wait for the background \
-           worker to restart (it restarts every 5 s on error).",
+        c"[Deprecated] Database the background scheduler connects to.",
+        c"Deprecated: the new launcher worker auto-discovers all databases. \
+           This GUC is only used as a fallback when the scheduler is not \
+           launched by the launcher. Leave at the default 'postgres'.",
         &PGS_DATABASE,
         GucContext::Sighup,
         GucFlags::default(),

@@ -63,8 +63,10 @@ pub extern "C-unwind" fn _PG_init() {
         // Register shared memory allocations
         shmem::init_shared_memory();
 
-        // Register the scheduler background worker
-        scheduler::register_scheduler_worker();
+        // Register the launcher background worker.
+        // The launcher auto-discovers all databases on this server and
+        // spawns a per-database scheduler for each one with pg_trickle installed.
+        scheduler::register_launcher_worker();
 
         log!("pg_trickle: initialized (shared_preload_libraries)");
     } else {
