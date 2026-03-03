@@ -178,6 +178,76 @@ async fn assert_invariant(db: &E2eDb, pgt_name: &str, query: &str, seed: u64, cy
     }
 }
 
+/// Assert invariant for EXCEPT STs that keep invisible rows.
+///
+/// EXCEPT STs never delete rows — invisible rows (where the effective
+/// count dropped to 0) are kept with updated per-branch counts.
+/// The visible rows are those with `__pgt_count_l > 0 AND __pgt_count_r = 0`.
+async fn assert_invariant_except(db: &E2eDb, pgt_name: &str, query: &str, seed: u64, cycle: usize) {
+    let st_table = format!("public.{pgt_name}");
+
+    // User-visible columns (exclude all __pgt_* internal columns)
+    let cols: String = db
+        .query_scalar(&format!(
+            "SELECT string_agg(column_name, ', ' ORDER BY ordinal_position) \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = '{pgt_name}' \
+               AND column_name NOT LIKE '__pgt_%'"
+        ))
+        .await;
+
+    // Multiset equality: visible ST rows vs defining query
+    let matches: bool = db
+        .query_scalar(&format!(
+            "SELECT NOT EXISTS ( \
+                (SELECT {cols} FROM {st_table} \
+                 WHERE __pgt_count_l > 0 AND __pgt_count_r = 0 \
+                 EXCEPT ALL ({query})) \
+                UNION ALL \
+                (({query}) EXCEPT ALL \
+                 SELECT {cols} FROM {st_table} \
+                 WHERE __pgt_count_l > 0 AND __pgt_count_r = 0) \
+            )"
+        ))
+        .await;
+
+    if !matches {
+        let st_count: i64 = db
+            .query_scalar(&format!(
+                "SELECT count(*) FROM {st_table} \
+                 WHERE __pgt_count_l > 0 AND __pgt_count_r = 0"
+            ))
+            .await;
+        let q_count: i64 = db
+            .query_scalar(&format!("SELECT count(*) FROM ({query}) _q"))
+            .await;
+        let extra: i64 = db
+            .query_scalar(&format!(
+                "SELECT count(*) FROM \
+                 (SELECT {cols} FROM {st_table} \
+                  WHERE __pgt_count_l > 0 AND __pgt_count_r = 0 \
+                  EXCEPT ALL ({query})) _x"
+            ))
+            .await;
+        let missing: i64 = db
+            .query_scalar(&format!(
+                "SELECT count(*) FROM \
+                 (({query}) EXCEPT ALL \
+                  SELECT {cols} FROM {st_table} \
+                  WHERE __pgt_count_l > 0 AND __pgt_count_r = 0) _x"
+            ))
+            .await;
+
+        panic!(
+            "INVARIANT VIOLATED at cycle {} (seed={:#x})\n\
+             ST: {}, Query: {}\n\
+             ST visible rows: {}, Query rows: {}\n\
+             Extra in ST: {}, Missing from ST: {}",
+            cycle, seed, pgt_name, query, st_count, q_count, extra, missing,
+        );
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Test 1: Simple scan — SELECT all columns
 // ═══════════════════════════════════════════════════════════════════════
@@ -1190,7 +1260,7 @@ async fn test_property_except_differential() {
     let query = "SELECT val FROM prop_exc_a EXCEPT SELECT val FROM prop_exc_b";
     db.create_st("prop_exc_st", query, "1m", "DIFFERENTIAL")
         .await;
-    assert_invariant(&db, "prop_exc_st", query, seed, 0).await;
+    assert_invariant_except(&db, "prop_exc_st", query, seed, 0).await;
 
     for cycle in 1..=CYCLES {
         let id = a_ids.alloc();
@@ -1210,7 +1280,7 @@ async fn test_property_except_differential() {
         }
 
         db.refresh_st("prop_exc_st").await;
-        assert_invariant(&db, "prop_exc_st", query, seed, cycle).await;
+        assert_invariant_except(&db, "prop_exc_st", query, seed, cycle).await;
     }
 }
 
@@ -1556,7 +1626,7 @@ async fn test_property_recursive_cte_full() {
         // Delete a random non-root leaf (avoid cascading orphans by only
         // deleting nodes that have no children)
         if rng.gen_bool() {
-            let leaf_opt: Option<i64> = db
+            let leaf_opt: Option<i32> = db
                 .query_scalar_opt(
                     "SELECT n.id FROM prop_rcte_nodes n \
                      WHERE n.parent_id IS NOT NULL \
