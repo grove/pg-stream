@@ -1,4 +1,4 @@
-# Composability Analysis — Extractable Components & Internal Decomposition
+# Engine Composability Analysis — Extractable Components & Internal Decomposition
 
 **Date:** 2026-03-03
 **Status:** Analysis / Proposal

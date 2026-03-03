@@ -13,7 +13,6 @@ new entries when creating documents.
 |------|------|--------|---------|
 | [PLAN.md](PLAN.md) | PLAN | — | Master implementation plan (Phases 0–12) |
 | [PLAN_FEATURE_CLEANUP.md](PLAN_FEATURE_CLEANUP.md) | PLAN | In progress | Remove low-value surface before public release |
-| [ANALYSIS_COMPOSABILITY.md](ANALYSIS_COMPOSABILITY.md) | REPORT | Proposed | Extractable components & internal decomposition analysis |
 
 ## adrs/
 
@@ -58,6 +57,8 @@ new entries when creating documents.
 | [PLAN_VERSIONING.md](infra/PLAN_VERSIONING.md) | PLAN | Draft | Semantic versioning & compatibility policy |
 | [REPORT_BLUE_GREEN_DEPLOYMENT.md](infra/REPORT_BLUE_GREEN_DEPLOYMENT.md) | REPORT | Exploration | Blue-green deployment — hot-swap pipelines with zero downtime |
 | [REPORT_DOWNSTREAM_CONSUMERS.md](infra/REPORT_DOWNSTREAM_CONSUMERS.md) | REPORT | Exploration | Downstream consumer patterns — getting changes out of stream tables |
+| [REPORT_ENGINE_COMPOSABILITY.md](infra/REPORT_ENGINE_COMPOSABILITY.md) | REPORT | Proposed | Engine composability and extraction analysis |
+| [REPORT_FEATURE_COMPOSABILITY.md](infra/REPORT_FEATURE_COMPOSABILITY.md) | REPORT | Exploration | Composability analysis of 7 major features: fuse, watermark, blue-green, sidecar, diamond, cross-source snapshot, transactional IVM |
 
 ## performance/
 
