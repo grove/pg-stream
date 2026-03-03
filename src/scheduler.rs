@@ -1220,7 +1220,25 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
             // Updating data_timestamp here would cause downstream stream
             // tables that compare upstream.data_timestamp to see a false
             // "upstream changed" signal on every no-data polling cycle.
-            if action != RefreshAction::NoData {
+            //
+            // DIFFERENTIAL refreshes that produce 0 rows are also treated as
+            // effective NO_DATA: the change buffer may still contain rows
+            // from the previous cycle (deferred cleanup runs at the START of
+            // the next differential), causing has_table_source_changes() to
+            // return true and the scheduler to trigger a DIFFERENTIAL that
+            // finds nothing in the current frontier window.  Bumping
+            // data_timestamp for such 0-row differentials would cause
+            // downstream STs to see a false "upstream changed" signal and
+            // trigger unnecessary FULL refreshes.
+            if action == RefreshAction::NoData {
+                // Already handled by execute_no_data_refresh
+            } else if action == RefreshAction::Differential
+                && rows_inserted == 0
+                && rows_deleted == 0
+            {
+                // Effective NO_DATA — update last_refresh_at only
+                let _ = StreamTableMeta::update_after_no_data_refresh(st.pgt_id);
+            } else {
                 let _ = StreamTableMeta::update_after_refresh(st.pgt_id, now, rows_inserted);
             }
 
