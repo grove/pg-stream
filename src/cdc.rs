@@ -906,6 +906,7 @@ pub fn has_user_triggers(st_relid: pg_sys::Oid) -> Result<bool, PgTrickleError> 
            WHERE tgrelid = {}::oid \
              AND tgisinternal = false \
              AND tgname NOT LIKE 'pgt_%' \
+             AND tgname NOT LIKE 'pg_trickle_%' \
          )",
         st_relid.to_u32(),
     ))
