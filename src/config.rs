@@ -115,11 +115,16 @@ pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(
 
 /// Default diamond consistency mode for newly created stream tables.
 ///
-/// - `"none"` (default): No atomic grouping — each ST refreshes independently.
-/// - `"atomic"`: All members of a diamond's consistency group are wrapped in a
-///   single SAVEPOINT; if any member fails the entire group rolls back.
+/// - `"atomic"` (default): All members of a diamond's consistency group are
+///   wrapped in a single SAVEPOINT; if any member fails the entire group
+///   rolls back. This prevents inconsistent partial refreshes.
+/// - `"none"`: No atomic grouping — each ST refreshes independently.
+///
+/// EC-13: Changed default from `"none"` to `"atomic"` because silent
+/// inconsistency in diamond topologies is a more dangerous failure mode
+/// than the minor performance overhead of SAVEPOINT grouping.
 pub static PGS_DIAMOND_CONSISTENCY: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"none"));
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"atomic"));
 
 /// Default diamond schedule policy for atomic consistency groups.
 ///
@@ -425,8 +430,8 @@ pub fn pg_trickle_buffer_alert_threshold() -> i64 {
 pub fn pg_trickle_diamond_consistency() -> String {
     PGS_DIAMOND_CONSISTENCY
         .get()
-        .map(|cs| cs.to_str().unwrap_or("none").to_string())
-        .unwrap_or_else(|| "none".to_string())
+        .map(|cs| cs.to_str().unwrap_or("atomic").to_string())
+        .unwrap_or_else(|| "atomic".to_string())
 }
 
 /// Returns the default diamond schedule policy as a `DiamondSchedulePolicy`.

@@ -45,6 +45,8 @@ pub enum AlertEvent {
     RefreshCompleted,
     /// Refresh failed.
     RefreshFailed,
+    /// EC-11: Refresh duration is approaching the schedule interval.
+    SchedulerFallingBehind,
 }
 
 impl AlertEvent {
@@ -57,6 +59,7 @@ impl AlertEvent {
             AlertEvent::BufferGrowthWarning => "buffer_growth_warning",
             AlertEvent::RefreshCompleted => "refresh_completed",
             AlertEvent::RefreshFailed => "refresh_failed",
+            AlertEvent::SchedulerFallingBehind => "scheduler_falling_behind",
         }
     }
 }
@@ -184,6 +187,26 @@ pub fn alert_refresh_failed(pgt_schema: &str, pgt_name: &str, action: &str, erro
             r#""action":"{}","error":"{}""#,
             action,
             error.replace('"', r#"\""#),
+        ),
+    );
+}
+
+/// EC-11: Emit a scheduler-falling-behind alert when refresh duration
+/// exceeds 80% of the schedule interval.
+pub fn alert_falling_behind(
+    pgt_schema: &str,
+    pgt_name: &str,
+    elapsed_ms: i64,
+    schedule_ms: i64,
+    ratio: f64,
+) {
+    emit_alert(
+        AlertEvent::SchedulerFallingBehind,
+        pgt_schema,
+        pgt_name,
+        &format!(
+            r#""elapsed_ms":{},"schedule_ms":{},"ratio":{:.2}"#,
+            elapsed_ms, schedule_ms, ratio,
         ),
     );
 }
@@ -818,6 +841,66 @@ pub fn check_slot_health_and_alert() {
         let threshold = config::pg_trickle_buffer_alert_threshold();
         if pending > threshold {
             alert_buffer_growth(&trigger_name, pending);
+        }
+    }
+
+    // EC-34: Check that WAL-mode dependencies still have their replication
+    // slots. If a slot was dropped (e.g., by a DBA), fall back to TRIGGER
+    // mode and emit a WARNING so the operator knows.
+    check_wal_slot_existence();
+}
+
+/// EC-34: Verify that WAL-mode dependencies still have their replication
+/// slots. If a slot is missing, fall back to TRIGGER mode and warn.
+fn check_wal_slot_existence() {
+    use crate::catalog::{CdcMode, StDependency};
+
+    let deps = match StDependency::get_all() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    for dep in &deps {
+        if dep.cdc_mode != CdcMode::Wal {
+            continue;
+        }
+
+        let slot_name = match &dep.slot_name {
+            Some(name) => name.clone(),
+            None => crate::wal_decoder::slot_name_for_source(dep.source_relid),
+        };
+
+        // Check if the replication slot exists
+        let slot_exists = Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[slot_name.as_str().into()],
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        if !slot_exists {
+            pgrx::warning!(
+                "pg_trickle: replication slot '{}' for source OID {} is missing. \
+                 Falling back to trigger-based CDC. The slot may have been dropped \
+                 manually or by a management tool.",
+                slot_name,
+                dep.source_relid.to_u32(),
+            );
+
+            // Fall back to TRIGGER mode
+            if let Err(e) = StDependency::update_cdc_mode(
+                dep.pgt_id,
+                dep.source_relid,
+                CdcMode::Trigger,
+                None,
+                None,
+            ) {
+                pgrx::warning!(
+                    "pg_trickle: failed to fall back to TRIGGER mode for source OID {}: {}",
+                    dep.source_relid.to_u32(),
+                    e,
+                );
+            }
         }
     }
 }
@@ -1695,6 +1778,10 @@ mod tests {
         );
         assert_eq!(AlertEvent::RefreshCompleted.as_str(), "refresh_completed");
         assert_eq!(AlertEvent::RefreshFailed.as_str(), "refresh_failed");
+        assert_eq!(
+            AlertEvent::SchedulerFallingBehind.as_str(),
+            "scheduler_falling_behind"
+        );
     }
 
     #[test]
@@ -1713,6 +1800,7 @@ mod tests {
             AlertEvent::BufferGrowthWarning,
             AlertEvent::RefreshCompleted,
             AlertEvent::RefreshFailed,
+            AlertEvent::SchedulerFallingBehind,
         ];
         // All as_str() values should be distinct
         let strs: Vec<&str> = variants.iter().map(|v| v.as_str()).collect();

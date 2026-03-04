@@ -24,15 +24,38 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 STUB_SRC="$SCRIPT_DIR/pg_stub.c"
 FEATURES="${1:-pg18}"
 
+DEFAULT_TARGET_DIR="$PROJECT_DIR/target"
+if [[ ! -d "$DEFAULT_TARGET_DIR" ]] || [[ ! -w "$DEFAULT_TARGET_DIR" ]]; then
+    FALLBACK_TARGET_DIR="$PROJECT_DIR/.cargo-target"
+    mkdir -p "$FALLBACK_TARGET_DIR" 2>/dev/null || true
+
+    if [[ -d "$FALLBACK_TARGET_DIR" ]] && [[ -w "$FALLBACK_TARGET_DIR" ]]; then
+        export CARGO_TARGET_DIR="$FALLBACK_TARGET_DIR"
+    else
+        HOME_FALLBACK_TARGET_DIR="${HOME:-/tmp}/.cache/pg_trickle-target"
+        mkdir -p "$HOME_FALLBACK_TARGET_DIR" 2>/dev/null || true
+
+        if [[ -d "$HOME_FALLBACK_TARGET_DIR" ]] && [[ -w "$HOME_FALLBACK_TARGET_DIR" ]]; then
+            export CARGO_TARGET_DIR="$HOME_FALLBACK_TARGET_DIR"
+        else
+            export CARGO_TARGET_DIR="${TMPDIR:-/tmp}/pg_trickle-target"
+        fi
+
+        mkdir -p "$CARGO_TARGET_DIR"
+    fi
+else
+    export CARGO_TARGET_DIR="$DEFAULT_TARGET_DIR"
+fi
+
 OS="$(uname)"
 case "$OS" in
     Darwin)
-        STUB_LIB="$PROJECT_DIR/target/libpg_stub.dylib"
+        STUB_LIB="$CARGO_TARGET_DIR/libpg_stub.dylib"
         STUB_CC_FLAGS="-shared -install_name @rpath/libpg_stub.dylib"
         PRELOAD_VAR="DYLD_INSERT_LIBRARIES"
         ;;
     *)
-        STUB_LIB="$PROJECT_DIR/target/libpg_stub.so"
+        STUB_LIB="$CARGO_TARGET_DIR/libpg_stub.so"
         STUB_CC_FLAGS="-shared -fPIC"
         PRELOAD_VAR="LD_PRELOAD"
         ;;
@@ -65,19 +88,19 @@ TEST_BIN=$(echo "$CARGO_OUTPUT" \
            | head -1)
 
 if [[ -n "$TEST_BIN" ]]; then
-    TEST_BIN="$PROJECT_DIR/$TEST_BIN"
+    TEST_BIN="$CARGO_TARGET_DIR/${TEST_BIN#target/}"
 fi
 
 if [[ -z "${TEST_BIN:-}" ]] || [[ ! -x "$TEST_BIN" ]]; then
     # Fallback: pick the newest executable pg_trickle- binary
     if [[ "$OS" == "Darwin" ]]; then
-        TEST_BIN=$(find "$PROJECT_DIR/target/debug/deps" \
+        TEST_BIN=$(find "$CARGO_TARGET_DIR/debug/deps" \
                         -maxdepth 1 -name 'pg_trickle-*' -type f -perm +111 \
                         2>/dev/null \
                    | xargs ls -t 2>/dev/null \
                    | head -1)
     else
-        TEST_BIN=$(find "$PROJECT_DIR/target/debug/deps" \
+        TEST_BIN=$(find "$CARGO_TARGET_DIR/debug/deps" \
                         -maxdepth 1 -name 'pg_trickle-*' -type f -executable \
                         2>/dev/null \
                    | xargs ls -t 2>/dev/null \
@@ -86,7 +109,7 @@ if [[ -z "${TEST_BIN:-}" ]] || [[ ! -x "$TEST_BIN" ]]; then
 fi
 
 if [[ -z "${TEST_BIN:-}" ]]; then
-    echo "ERROR: Could not find the test binary in target/debug/deps/" >&2
+    echo "ERROR: Could not find the test binary in $CARGO_TARGET_DIR/debug/deps/" >&2
     exit 1
 fi
 

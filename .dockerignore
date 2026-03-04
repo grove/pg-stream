@@ -1,0 +1,30 @@
+target/
+.git/
+.github/
+
+# Docs and generated site
+book/
+docs/
+plans/
+
+# Local/editor/devcontainer metadata
+.devcontainer/
+.vscode/
+.idea/
+
+# Project subtrees not needed for extension build images
+dbt-pgtrickle/
+cnpg/
+tests/
+scripts/
+benches/
+
+# Misc large/noisy files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Keep the specific Dockerfiles used by builds
+!tests/Dockerfile.e2e
+!cnpg/Dockerfile.ext-build

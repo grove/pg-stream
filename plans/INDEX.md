@@ -13,6 +13,7 @@ new entries when creating documents.
 |------|------|--------|---------|
 | [PLAN.md](PLAN.md) | PLAN | — | Master implementation plan (Phases 0–12) |
 | [PLAN_EDGE_CASES.md](PLAN_EDGE_CASES.md) | PLAN | Proposed | Edge case catalogue with workarounds & prioritised remediation |
+| [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) | PLAN | Proposed | Combined implementation order for PLAN_EDGE_CASES + PLAN_TRANSACTIONAL_IVM_PART_2 |
 | [PLAN_FEATURE_CLEANUP.md](PLAN_FEATURE_CLEANUP.md) | PLAN | In progress | Remove low-value surface before public release |
 
 ## adrs/
@@ -53,6 +54,7 @@ new entries when creating documents.
 | [PLAN_PARTITIONING_SHARDING.md](infra/PLAN_PARTITIONING_SHARDING.md) | PLAN | Research | PostgreSQL partitioning & sharding compatibility |
 | [PLAN_PACKAGING.md](infra/PLAN_PACKAGING.md) | PLAN | Draft | Distribution packaging |
 | [PLAN_PG19_COMPAT.md](infra/PLAN_PG19_COMPAT.md) | PLAN | Draft | PostgreSQL 19 forward-compatibility |
+| [PLAN_DEVCONTAINER_UNIT_TEST_WORKFLOW.md](infra/PLAN_DEVCONTAINER_UNIT_TEST_WORKFLOW.md) | PLAN | Implemented | Devcontainer unit-test stability and build reuse |
 | [REPORT_PGWIRE_PROXY.md](infra/REPORT_PGWIRE_PROXY.md) | REPORT | Research | pgwire proxy / intercept analysis |
 | [PLAN_PG_BACKCOMPAT.md](infra/PLAN_PG_BACKCOMPAT.md) | PLAN | Research | Supporting older PostgreSQL versions (13–17) |
 | [PLAN_VERSIONING.md](infra/PLAN_VERSIONING.md) | PLAN | Draft | Semantic versioning & compatibility policy |
@@ -84,8 +86,11 @@ new entries when creating documents.
 | [REPORT_CUSTOM_SQL_SYNTAX.md](sql/REPORT_CUSTOM_SQL_SYNTAX.md) | REPORT | Reference | PostgreSQL extension syntax mechanisms research |
 | [REPORT_DB_SCHEMA_STABILITY.md](sql/REPORT_DB_SCHEMA_STABILITY.md) | REPORT | Assessment | Database schema stability assessment (pre-1.0) |
 | [PLAN_HYBRID_CDC.md](sql/PLAN_HYBRID_CDC.md) | PLAN | Complete | Hybrid CDC — trigger bootstrap → logical replication |
+| [PLAN_BOOTSTRAP_GATING.md](sql/PLAN_BOOTSTRAP_GATING.md) | PLAN | Exploration | Bootstrap gating — block downstream refresh until external sources are initially populated |
 | [PLAN_WATERMARK_GATING.md](sql/PLAN_WATERMARK_GATING.md) | PLAN | Exploration | User-provided watermarks for cross-source gating of externally-loaded data |
 | [PLAN_NATIVE_SYNTAX.md](sql/PLAN_NATIVE_SYNTAX.md) | PLAN | Proposed | Native PostgreSQL syntax for stream tables |
+| [PLAN_ALTER_QUERY.md](sql/PLAN_ALTER_QUERY.md) | PLAN | Draft | Allow alter_stream_table to change the defining query in place |
+| [PLAN_REFRESH_MODE_DEFAULT.md](sql/PLAN_REFRESH_MODE_DEFAULT.md) | PLAN | Draft | Make refresh mode selection optional with adaptive default behavior |
 | [PLAN_TRANSACTIONAL_IVM.md](sql/PLAN_TRANSACTIONAL_IVM.md) | PLAN | Proposed | Transactionally updated views (immediate IVM) |
 | [PLAN_UPGRADE_MIGRATIONS.md](sql/PLAN_UPGRADE_MIGRATIONS.md) | PLAN | Draft | Extension upgrade migrations |
 | [PLAN_USER_TRIGGERS_EXPLICIT_DML.md](sql/PLAN_USER_TRIGGERS_EXPLICIT_DML.md) | PLAN | Implemented | User triggers on stream tables via explicit DML |

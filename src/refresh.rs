@@ -542,6 +542,44 @@ fn build_is_distinct_clause(user_cols: &[String]) -> String {
     }
 }
 
+/// EC-06: Build a counted DELETE template for keyless sources.
+///
+/// For keyless tables, multiple stream table rows can share the same
+/// `__pgt_row_id` (content hash). A plain `DELETE ... USING delta` would
+/// remove ALL matching rows, not just the intended count. This template
+/// uses ROW_NUMBER on both the stream table and delta to pair them 1:1,
+/// then deletes only the paired ctids.
+fn build_keyless_delete_template(quoted_table: &str, pgt_id: i64) -> String {
+    format!(
+        "DELETE FROM {quoted_table} \
+         WHERE ctid IN (\
+           SELECT numbered_st.st_ctid \
+           FROM (\
+             SELECT st2.ctid AS st_ctid, \
+                    st2.__pgt_row_id, \
+                    ROW_NUMBER() OVER (\
+                      PARTITION BY st2.__pgt_row_id ORDER BY st2.ctid\
+                    ) AS st_rn \
+             FROM {quoted_table} st2 \
+             WHERE st2.__pgt_row_id IN (\
+               SELECT DISTINCT __pgt_row_id \
+               FROM __pgt_delta_{pgt_id} \
+               WHERE __pgt_action = 'D'\
+             )\
+           ) numbered_st \
+           JOIN (\
+             SELECT __pgt_row_id, \
+                    COUNT(*)::INT AS del_count \
+             FROM __pgt_delta_{pgt_id} \
+             WHERE __pgt_action = 'D' \
+             GROUP BY __pgt_row_id\
+           ) dc ON numbered_st.__pgt_row_id = dc.__pgt_row_id \
+           WHERE numbered_st.st_rn <= dc.del_count\
+         )",
+        pgt_id = pgt_id,
+    )
+}
+
 /// Pre-warm the delta SQL + MERGE template caches for a stream table.
 ///
 /// Called after `create_stream_table()` to avoid a cold-start penalty on
@@ -617,7 +655,14 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
 
     // Build the USING clause — skip DISTINCT ON when the delta is already
     // deduplicated (G-M1 optimization for scan-chain queries).
+    //
+    // EC-06: For keyless sources the delta is never deduplicated (multiple
+    // rows can share the same __pgt_row_id). Skip DISTINCT ON unconditionally.
     let using_clause = if delta_result.is_deduplicated {
+        format!("({delta_sql_template})")
+    } else if st.has_keyless_source {
+        // Keyless: do NOT collapse with DISTINCT ON — duplicate row_ids are
+        // intentional (one per net insert/delete).
         format!("({delta_sql_template})")
     } else {
         format!(
@@ -664,14 +709,30 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     let parameterized_merge_sql = parameterize_lsn_template(&merge_template, source_oids);
 
     // ── User-trigger explicit DML templates ──────────────────────────
-    let trigger_delete_template = format!(
-        "DELETE FROM {quoted_table} AS st \
-         USING __pgt_delta_{pgt_id} AS d \
-         WHERE st.__pgt_row_id = d.__pgt_row_id \
-           AND d.__pgt_action = 'D'",
-        pgt_id = st.pgt_id,
-    );
+    //
+    // EC-06: Keyless sources use counted DELETE (ROW_NUMBER matching)
+    // and plain INSERT (no NOT EXISTS / ON CONFLICT) since duplicate
+    // __pgt_row_id values are expected. The UPDATE step is a no-op
+    // because the scan-level net counting decomposes updates into
+    // separate D + I rows.
+    let trigger_delete_template = if st.has_keyless_source {
+        build_keyless_delete_template(&quoted_table, st.pgt_id)
+    } else {
+        format!(
+            "DELETE FROM {quoted_table} AS st \
+             USING __pgt_delta_{pgt_id} AS d \
+             WHERE st.__pgt_row_id = d.__pgt_row_id \
+               AND d.__pgt_action = 'D'",
+            pgt_id = st.pgt_id,
+        )
+    };
 
+    // EC-06: For keyless sources, the scan-level delta decomposes UPDATEs
+    // into D+I pairs (different content hashes), so the UPDATE template
+    // naturally matches 0 rows. For aggregate queries on keyless sources,
+    // the aggregate delta produces 'I' actions for changed groups that
+    // need real UPDATEs. Using the normal UPDATE template handles both
+    // cases correctly.
     let trigger_update_template = format!(
         "UPDATE {quoted_table} AS st \
          SET {update_set_clause} \
@@ -682,17 +743,29 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
         pgt_id = st.pgt_id,
     );
 
-    let trigger_insert_template = format!(
-        "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
-         SELECT d.__pgt_row_id, {d_user_col_list} \
-         FROM __pgt_delta_{pgt_id} AS d \
-         WHERE d.__pgt_action = 'I' \
-           AND NOT EXISTS (\
-             SELECT 1 FROM {quoted_table} AS st \
-             WHERE st.__pgt_row_id = d.__pgt_row_id\
-           )",
-        pgt_id = st.pgt_id,
-    );
+    let trigger_insert_template = if st.has_keyless_source {
+        // Plain INSERT — no NOT EXISTS check since duplicate row_ids
+        // are expected for keyless sources.
+        format!(
+            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+             SELECT d.__pgt_row_id, {d_user_col_list} \
+             FROM __pgt_delta_{pgt_id} AS d \
+             WHERE d.__pgt_action = 'I'",
+            pgt_id = st.pgt_id,
+        )
+    } else {
+        format!(
+            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+             SELECT d.__pgt_row_id, {d_user_col_list} \
+             FROM __pgt_delta_{pgt_id} AS d \
+             WHERE d.__pgt_action = 'I' \
+               AND NOT EXISTS (\
+                 SELECT 1 FROM {quoted_table} AS st \
+                 WHERE st.__pgt_row_id = d.__pgt_row_id\
+               )",
+            pgt_id = st.pgt_id,
+        )
+    };
 
     // Cache the MERGE template with LSN placeholder tokens.
     // Each refresh resolves the tokens to concrete LSN values
@@ -774,6 +847,11 @@ pub fn determine_refresh_action(st: &StreamTableMeta, has_upstream_changes: bool
 /// TopK tables. The caller decides whether to invoke it (DIFFERENTIAL mode
 /// checks change buffers first and skips if no changes exist).
 pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
+    // triggers allow the refresh executor to modify the storage table.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
 
@@ -889,6 +967,11 @@ pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
 /// Users who need per-row trigger semantics should use `REFRESH MODE
 /// DIFFERENTIAL`. See PLAN_USER_TRIGGERS_EXPLICIT_DML.md §2.
 pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
+    // triggers allow the refresh executor to modify the storage table.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
     let query = &st.defining_query;
@@ -1399,7 +1482,8 @@ pub fn execute_differential_refresh(
             dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_sql.clone());
 
         // Build template USING clause — skip DISTINCT ON when deduplicated (G-M1)
-        let template_using = if is_dedup {
+        // EC-06: For keyless sources, never collapse with DISTINCT ON.
+        let template_using = if is_dedup || st.has_keyless_source {
             format!("({delta_sql_template})")
         } else {
             format!(
@@ -1434,14 +1518,22 @@ pub fn execute_differential_refresh(
         let parameterized_merge_sql = parameterize_lsn_template(&merge_template, &source_oids);
 
         // ── User-trigger explicit DML templates ──────────────────────
-        let trigger_delete_template = format!(
-            "DELETE FROM {quoted_table} AS st \
-             USING __pgt_delta_{pgt_id} AS d \
-             WHERE st.__pgt_row_id = d.__pgt_row_id \
-               AND d.__pgt_action = 'D'",
-            pgt_id = st.pgt_id,
-        );
+        //
+        // EC-06: Keyless sources use counted DELETE + plain INSERT.
+        let trigger_delete_template = if st.has_keyless_source {
+            build_keyless_delete_template(&quoted_table, st.pgt_id)
+        } else {
+            format!(
+                "DELETE FROM {quoted_table} AS st \
+                 USING __pgt_delta_{pgt_id} AS d \
+                 WHERE st.__pgt_row_id = d.__pgt_row_id \
+                   AND d.__pgt_action = 'D'",
+                pgt_id = st.pgt_id,
+            )
+        };
 
+        // EC-06: Use normal UPDATE template for keyless sources — see
+        // prewarm_merge_cache comment for full rationale.
         let trigger_update_template = format!(
             "UPDATE {quoted_table} AS st \
              SET {update_set_clause} \
@@ -1452,17 +1544,27 @@ pub fn execute_differential_refresh(
             pgt_id = st.pgt_id,
         );
 
-        let trigger_insert_template = format!(
-            "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
-             SELECT d.__pgt_row_id, {d_user_col_list} \
-             FROM __pgt_delta_{pgt_id} AS d \
-             WHERE d.__pgt_action = 'I' \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM {quoted_table} AS st \
-                 WHERE st.__pgt_row_id = d.__pgt_row_id\
-               )",
-            pgt_id = st.pgt_id,
-        );
+        let trigger_insert_template = if st.has_keyless_source {
+            format!(
+                "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+                 SELECT d.__pgt_row_id, {d_user_col_list} \
+                 FROM __pgt_delta_{pgt_id} AS d \
+                 WHERE d.__pgt_action = 'I'",
+                pgt_id = st.pgt_id,
+            )
+        } else {
+            format!(
+                "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
+                 SELECT d.__pgt_row_id, {d_user_col_list} \
+                 FROM __pgt_delta_{pgt_id} AS d \
+                 WHERE d.__pgt_action = 'I' \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM {quoted_table} AS st \
+                     WHERE st.__pgt_row_id = d.__pgt_row_id\
+                   )",
+                pgt_id = st.pgt_id,
+            )
+        };
 
         // Store templates in the cache for subsequent refreshes.
         MERGE_TEMPLATE_CACHE.with(|cache| {
@@ -1583,6 +1685,11 @@ pub fn execute_differential_refresh(
             crate::cdc::has_user_triggers(st.pgt_relid)?
         }
     };
+
+    // EC-06: Keyless sources must use explicit DML because MERGE fails
+    // when multiple target rows match a single source row (non-unique
+    // __pgt_row_id). Force explicit DML path for counted deletion.
+    let use_explicit_dml = use_explicit_dml || st.has_keyless_source;
 
     // When user_triggers = 'off' but there ARE user triggers on the ST,
     // suppress them during the MERGE to prevent spurious firing.
@@ -1925,6 +2032,7 @@ mod tests {
             topk_offset: None,
             diamond_consistency: crate::dag::DiamondConsistency::None,
             diamond_schedule_policy: crate::dag::DiamondSchedulePolicy::default(),
+            has_keyless_source: false,
         }
     }
 

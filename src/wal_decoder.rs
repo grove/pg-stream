@@ -893,6 +893,12 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError
                         e
                     );
                 }
+                // EC-18: If cdc_mode is "auto" and we're still on triggers,
+                // log WHY we can't transition. Rate-limit to avoid log spam
+                // (every ~60 scheduler ticks ≈ once per minute at default interval).
+                if cdc_mode == "auto" {
+                    emit_auto_cdc_stuck_log(dep);
+                }
             }
             CdcMode::Transitioning => {
                 // Poll WAL changes (both trigger and WAL are active)
@@ -982,6 +988,64 @@ fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), P
     start_wal_transition(dep.source_relid, dep.pgt_id, change_schema)?;
 
     Ok(())
+}
+
+/// EC-18: Rate-limited LOG explaining why `auto` CDC mode is stuck in TRIGGER
+/// phase for a particular source.
+///
+/// Uses a simple modular counter on scheduler ticks. Only emits once every
+/// ~60 invocations (approximately once per minute at the default 1s
+/// scheduler interval).
+fn emit_auto_cdc_stuck_log(dep: &StDependency) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let tick = TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if !tick.is_multiple_of(60) {
+        return;
+    }
+
+    let source_oid = dep.source_relid;
+    let reason = match cdc::can_use_logical_replication() {
+        Ok(false) | Err(_) => {
+            "wal_level is not 'logical'. Set wal_level = logical in postgresql.conf and restart."
+                .to_string()
+        }
+        Ok(true) => {
+            // WAL is available, check other prerequisites
+            let pk_columns = cdc::resolve_pk_columns(source_oid).unwrap_or_default();
+            if pk_columns.is_empty() {
+                format!(
+                    "source OID {} has no PRIMARY KEY. WAL-based CDC requires a PK. \
+                     Add a PRIMARY KEY or switch to cdc_mode = 'trigger'.",
+                    source_oid.to_u32()
+                )
+            } else {
+                let identity = cdc::get_replica_identity_mode(source_oid)
+                    .unwrap_or_else(|_| "unknown".to_string());
+                if identity != "full" {
+                    format!(
+                        "source OID {} has REPLICA IDENTITY '{}' (need FULL). \
+                         Run: ALTER TABLE ... REPLICA IDENTITY FULL",
+                        source_oid.to_u32(),
+                        identity
+                    )
+                } else {
+                    format!(
+                        "source OID {} meets prerequisites but transition has not started yet. \
+                         This may resolve on the next scheduler tick.",
+                        source_oid.to_u32()
+                    )
+                }
+            }
+        }
+    };
+
+    log!(
+        "pg_trickle: cdc_mode = 'auto' but source OID {} is still using triggers. Reason: {}",
+        source_oid.to_u32(),
+        reason
+    );
 }
 
 /// Poll WAL changes for a source that's in TRANSITIONING or WAL mode.

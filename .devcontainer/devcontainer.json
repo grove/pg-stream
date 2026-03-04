@@ -1,0 +1,67 @@
+// pg_trickle devcontainer configuration
+// https://containers.dev/implementors/json_reference/
+{
+  "name": "pg_trickle Dev",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+
+  // Run as non-root vscode user
+  "remoteUser": "vscode",
+  "containerUser": "vscode",
+
+  // ── Features ──────────────────────────────────────────────────────────────
+  "features": {
+    // Docker-in-Docker for testcontainers (integration tests) and E2E image builds
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "dockerDashComposeVersion": "v2"
+    }
+  },
+
+  // ── Lifecycle Commands ────────────────────────────────────────────────────
+  // Initialize pgrx with the system pg_config (runs once after container create)
+  "postCreateCommand": "cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config",
+
+  // ── Persistent Volumes ────────────────────────────────────────────────────
+  "mounts": [
+    // Cache cargo registry across container rebuilds
+    "source=pg-trickle-cargo-registry,target=/home/vscode/.cargo/registry,type=volume",
+    // Cache cargo git checkouts across container rebuilds
+    "source=pg-trickle-cargo-git,target=/home/vscode/.cargo/git,type=volume",
+    // Cache pgrx home (compiled PG instance) across container rebuilds
+    "source=pg-trickle-pgrx-home,target=/home/vscode/.pgrx,type=volume",
+    // Cache build artifacts across container rebuilds
+    "source=pg-trickle-target,target=${containerWorkspaceFolder}/target,type=volume"
+  ],
+
+  // ── VS Code Customizations ────────────────────────────────────────────────
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "vadimcn.vscode-lldb",
+        "streetsidesoftware.code-spell-checker"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.features": ["pg18"],
+        "rust-analyzer.check.command": "clippy",
+        "rust-analyzer.check.extraArgs": ["--features", "pg18"],
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      }
+    }
+  },
+
+  // ── Environment Variables ──────────────────────────────────────────────────
+  "containerEnv": {
+    "CARGO_TERM_COLOR": "always"
+  },
+
+  // ── Forward PostgreSQL port (for pgrx run) ────────────────────────────────
+  "forwardPorts": [28818]
+}

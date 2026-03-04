@@ -2014,6 +2014,50 @@ max_worker_processes = 8     # Must include scheduler + refresh workers
 
 ---
 
+## Implementation Progress
+
+**Last updated:** 2026-03-04
+
+All phases (0–12) of the core plan are **IMPLEMENTED**. Current work
+focuses on edge-case hardening and SQL coverage expansion, tracked in
+[PLAN_EDGE_CASES.md](PLAN_EDGE_CASES.md) and
+[PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md).
+
+**Completed sprints:**
+
+- **Stage 1 (P0 Correctness):** EC-19 (WAL+keyless rejection), EC-06
+  (full keyless table support with net-counting delta, counted DELETE,
+  non-unique index + 2 post-implementation bug fixes), EC-01 (R₀ via
+  EXCEPT ALL for inner/left/full joins). Validated with TPC-H regression.
+- **Stage 2 (P1 Operational Safety):** EC-25/EC-26 (guard triggers
+  blocking direct DML/TRUNCATE on stream tables), EC-15 (SELECT * warning),
+  EC-11 (scheduler falling-behind alert), EC-13 (atomic diamond consistency
+  default), EC-18 (auto CDC stuck-in-TRIGGER logging), EC-34 (auto-detect
+  missing WAL slot).
+
+**Test coverage:** 1032+ unit tests, 7 keyless E2E tests, 5 guard trigger
+E2E tests, 9+ diamond E2E tests, plus integration and TPC-H regression
+suites.
+
+**What remains (prioritised):**
+
+1. **Stage 3 — SQL Coverage Expansion:** Mixed UNION, multi-PARTITION BY,
+   nested window expressions, ALL(subquery), deeply nested SubLinks,
+   ROWS FROM(), LATERAL RIGHT/FULL JOIN error message.
+2. **Stage 4 — P1 Remainder + Trigger Optimisations:** EC-16 (ALTER
+   FUNCTION detection), column-level change detection, incremental
+   TRUNCATE, buffer partitioning, skip-unchanged scanning, online ADD
+   COLUMN.
+3. **Stage 5 — Aggregate Coverage:** CORR/COVAR/REGR, hypothetical-set
+   aggregates, XMLAGG.
+4. **Stage 6 — IMMEDIATE Mode Parity:** Recursive CTEs + TopK in
+   IMMEDIATE mode.
+5. **Stage 7 — Usability + Docs:** Foreign tables, GROUPING SET GUC,
+   post-restart health check, PgBouncer docs, DDL-during-refresh docs,
+   replication docs.
+
+---
+
 ## Verification Criteria
 
 1. **Correctness invariant:** For all STs at all data timestamps, `ST contents == defining query result` (set equality). Verified by property-based tests.

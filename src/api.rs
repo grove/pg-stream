@@ -322,6 +322,24 @@ fn create_stream_table_impl(
     // F13/F14: Warn about source table edge cases
     warn_source_table_properties(&source_relids);
 
+    // EC-06: Detect whether any source table lacks a PRIMARY KEY.
+    // When true, the storage table uses a non-unique index on __pgt_row_id
+    // and the apply logic uses counted DELETE instead of MERGE, because
+    // identical duplicate rows produce the same content hash → same row_id.
+    let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
+        if source_type != "TABLE" {
+            return false;
+        }
+        cdc::resolve_pk_columns(*oid)
+            .map(|pk| pk.is_empty())
+            .unwrap_or(false)
+    });
+
+    // EC-15: Warn when the defining query uses SELECT * — column additions
+    // to source tables will break the stream table silently (column count
+    // mismatch) or require reinitialization.
+    warn_select_star(query);
+
     // Cycle detection
     check_for_cycles(&source_relids)?;
 
@@ -345,14 +363,32 @@ fn create_stream_table_impl(
     // Get the OID of the newly created table
     let pgt_relid = get_table_oid(&schema, &table_name)?;
 
-    // Create unique index on __pgt_row_id
-    let index_sql = format!(
-        "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
-        quote_identifier(&schema),
-        quote_identifier(&table_name),
-    );
+    // Create index on __pgt_row_id.
+    //
+    // EC-06: For keyless sources, use a non-unique index because identical
+    // duplicate rows produce the same content hash → same __pgt_row_id.
+    // A UNIQUE index would prevent storing those duplicates correctly.
+    let index_sql = if has_keyless_source {
+        format!(
+            "CREATE INDEX ON {}.{} (__pgt_row_id)",
+            quote_identifier(&schema),
+            quote_identifier(&table_name),
+        )
+    } else {
+        format!(
+            "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
+            quote_identifier(&schema),
+            quote_identifier(&table_name),
+        )
+    };
     Spi::run(&index_sql)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create row_id index: {}", e)))?;
+
+    // EC-25/EC-26: Install a guard trigger that blocks direct DML on the
+    // stream table's storage table. The storage table should only be modified
+    // by the refresh executor. Direct INSERT/UPDATE/DELETE/TRUNCATE by users
+    // would corrupt the incrementally-maintained data.
+    install_dml_guard_trigger(&schema, &table_name)?;
 
     // U1/U2: Auto-create composite index on GROUP BY columns for aggregate
     // queries. This accelerates the LEFT JOIN in the agg_merge CTE during
@@ -401,6 +437,7 @@ fn create_stream_table_impl(
             .and_then(|i| i.offset_value.map(|v| v as i32)),
         dc,
         dsp,
+        has_keyless_source,
     )?;
 
     // Build per-source column usage map from the parsed OpTree so that
@@ -963,6 +1000,11 @@ fn execute_manual_refresh(
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<(), PgTrickleError> {
+    // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
+    // allow the refresh executor to modify the storage table.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     // TopK tables use the scoped-recomputation refresh path regardless of
     // refresh_mode (they always do ORDER BY … LIMIT N via MERGE).
     if st.topk_limit.is_some() {
@@ -1003,6 +1045,13 @@ fn execute_manual_full_refresh(
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<(), PgTrickleError> {
+    // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
+    // triggers allow the refresh executor to modify the storage table.
+    // This is needed when called directly (e.g., from alter_stream_table)
+    // without going through execute_manual_refresh.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     let quoted_table = format!(
         "{}.{}",
         quote_identifier(schema),
@@ -1342,6 +1391,75 @@ fn diamond_groups() -> TableIterator<
 
 // ── Helper functions ───────────────────────────────────────────────────────
 
+/// EC-25/EC-26: Install a guard trigger that blocks direct DML on a stream
+/// table's storage table.
+///
+/// Creates a PL/pgSQL trigger function and a BEFORE trigger for
+/// INSERT/UPDATE/DELETE that raises an exception if the caller is not
+/// the pg_trickle refresh executor.  The trigger checks the
+/// `pg_trickle.internal_refresh` GUC which is set to `true` only during
+/// refresh execution.
+///
+/// Also installs an event trigger guard for TRUNCATE via a separate trigger.
+fn install_dml_guard_trigger(schema: &str, table_name: &str) -> Result<(), PgTrickleError> {
+    let qualified = format!(
+        "{}.{}",
+        quote_identifier(schema),
+        quote_identifier(table_name),
+    );
+    let trigger_func_name = format!(
+        "{}._pgt_guard_{}",
+        quote_identifier(schema),
+        table_name.replace('"', ""),
+    );
+
+    // Create the guard trigger function
+    //
+    // IMPORTANT: For DELETE operations, NEW is NULL in PostgreSQL trigger
+    // functions. A BEFORE trigger returning NULL silently cancels the
+    // operation. We must return OLD for DELETE and NEW for INSERT/UPDATE
+    // to allow the managed refresh executor to proceed.
+    let create_func_sql = format!(
+        "CREATE OR REPLACE FUNCTION {}() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF current_setting('pg_trickle.internal_refresh', true) IS DISTINCT FROM 'true' THEN \
+             RAISE EXCEPTION 'Direct DML on stream table % is not allowed. \
+             Stream tables are maintained automatically by pg_trickle.', TG_TABLE_NAME; \
+           END IF; \
+           IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; \
+         END; $$",
+        trigger_func_name,
+    );
+    Spi::run(&create_func_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to create DML guard function: {}", e))
+    })?;
+
+    // Create the BEFORE INSERT/UPDATE/DELETE trigger
+    let create_trigger_sql = format!(
+        "CREATE TRIGGER pgt_dml_guard \
+         BEFORE INSERT OR UPDATE OR DELETE ON {} \
+         FOR EACH ROW EXECUTE FUNCTION {}()",
+        qualified, trigger_func_name,
+    );
+    Spi::run(&create_trigger_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to create DML guard trigger: {}", e))
+    })?;
+
+    // EC-25: Also guard against TRUNCATE via a statement-level trigger
+    let create_truncate_trigger_sql = format!(
+        "CREATE TRIGGER pgt_truncate_guard \
+         BEFORE TRUNCATE ON {} \
+         FOR EACH STATEMENT EXECUTE FUNCTION {}()",
+        qualified, trigger_func_name,
+    );
+    Spi::run(&create_truncate_trigger_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to create TRUNCATE guard trigger: {}", e))
+    })?;
+
+    Ok(())
+}
+
 /// Set up CDC tracking for a base table source.
 ///
 /// Creates a change buffer table and a CDC trigger on the source table
@@ -1366,6 +1484,37 @@ fn setup_cdc_for_source(
     if !already_tracked {
         // Resolve PK columns for trigger pk_hash computation
         let pk_columns = cdc::resolve_pk_columns(source_oid)?;
+
+        // EC-19: If CDC mode is "wal" or "auto" and the source table has no
+        // primary key, verify REPLICA IDENTITY FULL. Without it, WAL-based
+        // CDC cannot produce correct old-row values for UPDATE/DELETE, leading
+        // to silent data corruption.
+        if pk_columns.is_empty() {
+            let cdc_mode = config::pg_trickle_cdc_mode();
+            if cdc_mode == "wal" || cdc_mode == "auto" {
+                let identity = cdc::get_replica_identity_mode(source_oid)?;
+                if identity != "full" {
+                    let table_name = Spi::get_one_with_args::<String>(
+                        "SELECT format('%I.%I', n.nspname, c.relname) \
+                         FROM pg_class c \
+                         JOIN pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE c.oid = $1",
+                        &[source_oid.into()],
+                    )
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| format!("OID {}", source_oid.to_u32()));
+
+                    return Err(PgTrickleError::InvalidArgument(format!(
+                        "Source table {} has no PRIMARY KEY and REPLICA IDENTITY is '{}'. \
+                         WAL-based CDC (cdc_mode = '{}') requires either a PRIMARY KEY \
+                         or REPLICA IDENTITY FULL on keyless tables. \
+                         Fix: ALTER TABLE {} REPLICA IDENTITY FULL; \
+                         or set pg_trickle.cdc_mode = 'trigger'.",
+                        table_name, identity, cdc_mode, table_name
+                    )));
+                }
+            }
+        }
 
         // Resolve all source columns for typed change buffer
         let col_defs = cdc::resolve_source_column_defs(source_oid)?;
@@ -1946,7 +2095,103 @@ fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String)]) {
                 table_name,
             );
         }
+
+        // EC-06: Keyless table warning — source tables without a PRIMARY KEY
+        // use content-based hashing for change detection, which is slower and
+        // cannot distinguish between identical duplicate rows.
+        match cdc::resolve_pk_columns(*oid) {
+            Ok(pk_cols) if pk_cols.is_empty() => {
+                pgrx::warning!(
+                    "pg_trickle: source table {} has no PRIMARY KEY. Change detection \
+                     will use content-based hashing, which is slower for wide tables \
+                     and cannot distinguish identical duplicate rows. Consider adding \
+                     a PRIMARY KEY for best performance.",
+                    table_name,
+                );
+            }
+            _ => {}
+        }
     }
+}
+
+/// EC-15: Warn when the defining query contains `SELECT *` at the top level.
+///
+/// `SELECT *` makes the stream table fragile: if a column is added to or
+/// removed from a source table, the stream table's storage schema will be
+/// out of sync with the defining query, causing errors or silent data loss
+/// on the next refresh.
+///
+/// This is a best-effort heuristic check using the raw query text. It looks
+/// for `SELECT ... * ...` patterns that are not inside a subquery or aggregate
+/// (e.g., `count(*)` is allowed).
+fn warn_select_star(query: &str) {
+    if detect_select_star(query) {
+        pgrx::warning!(
+            "pg_trickle: defining query uses SELECT *. If source table columns \
+             are added or removed, the stream table will require reinitialization. \
+             Consider listing columns explicitly for resilience against schema \
+             changes."
+        );
+    }
+}
+
+/// Pure detection logic for `SELECT *` patterns in a defining query.
+///
+/// Returns `true` if the query contains a bare `*` (or `table.*`) in the
+/// top-level SELECT list. Ignores `*` inside function calls like `count(*)`.
+///
+/// This is intentionally conservative — false positives are OK (it's a
+/// warning), but false negatives for `SELECT *` should be rare.
+fn detect_select_star(query: &str) -> bool {
+    // Quick exit: no asterisk at all
+    if !query.contains('*') {
+        return false;
+    }
+
+    let upper = query.to_uppercase();
+
+    // Find the first top-level SELECT ... FROM
+    if let Some(select_pos) = upper.find("SELECT") {
+        let after_select = &upper[select_pos + 6..];
+        // Find FROM (at the same nesting level)
+        let mut depth = 0i32;
+        let mut from_offset = None;
+        for (i, ch) in after_select.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && after_select[i..].starts_with("FROM") {
+                // Check if it's a word boundary (not part of a larger word)
+                let before_ok = i == 0 || !after_select.as_bytes()[i - 1].is_ascii_alphanumeric();
+                let after_ok = i + 4 >= after_select.len()
+                    || !after_select.as_bytes()[i + 4].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    from_offset = Some(i);
+                    break;
+                }
+            }
+        }
+
+        if let Some(end) = from_offset {
+            let select_list = &after_select[..end];
+            // Check for bare `*` or `table.*` at top-level (depth 0)
+            let mut depth = 0i32;
+            let chars: Vec<char> = select_list.chars().collect();
+            for &ch in chars.iter() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    '*' if depth == 0 => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Classify a source relation as TABLE, STREAM_TABLE, or VIEW.
@@ -2106,6 +2351,11 @@ fn initialize_st(
     needs_union_dedup: bool,
     topk_info: Option<&crate::dvm::TopKInfo>,
 ) -> Result<(), PgTrickleError> {
+    // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
+    // allow the initialization INSERT into the storage table.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     // For aggregate/distinct STs, inject COUNT(*) AS __pgt_count into the
     // defining query so the auxiliary column is populated correctly.
     let effective_query = if needs_pgt_count {
@@ -2940,5 +3190,64 @@ mod tests {
     fn test_cron_is_due_with_alias() {
         let old_epoch = chrono::Utc::now().timestamp() - 7200; // 2 hours ago
         assert!(cron_is_due("@hourly", Some(old_epoch)));
+    }
+
+    // ── EC-15: detect_select_star unit tests ───────────────────────────
+
+    #[test]
+    fn test_detect_select_star_bare() {
+        assert!(detect_select_star("SELECT * FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_table_qualified() {
+        assert!(detect_select_star("SELECT t.* FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_explicit_columns_no_star() {
+        assert!(!detect_select_star("SELECT id, name FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_count_star_not_flagged() {
+        assert!(!detect_select_star("SELECT count(*) FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_sum_star_not_flagged() {
+        assert!(!detect_select_star("SELECT sum(*) FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_mixed_agg_and_bare_star() {
+        // `count(*), *` has a bare `*` at top level
+        assert!(detect_select_star("SELECT count(*), * FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_no_asterisk_at_all() {
+        assert!(!detect_select_star("SELECT id FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_subquery_star_ignored() {
+        // The outer SELECT has explicit columns; the inner SELECT * is inside parens
+        assert!(!detect_select_star(
+            "SELECT id, (SELECT * FROM b LIMIT 1) FROM t"
+        ));
+    }
+
+    #[test]
+    fn test_detect_select_star_case_insensitive() {
+        assert!(detect_select_star("select * from t"));
+        assert!(detect_select_star("SELECT * FROM t"));
+        assert!(detect_select_star("Select * From t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_no_from() {
+        // No FROM clause — should not crash, just return false
+        assert!(!detect_select_star("SELECT 1"));
     }
 }

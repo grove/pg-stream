@@ -2,21 +2,33 @@
 //!
 //! FULL OUTER JOIN = INNER JOIN + left anti-join + right anti-join.
 //!
-//! The delta is a 7-part UNION ALL:
+//! The delta is a multi-part UNION ALL:
 //!
-//! 1. **Part 1** — delta_left JOIN current_right (matching rows)
-//! 2. **Part 2** — current_left JOIN delta_right (matching rows)
-//! 3. **Part 3** — delta_left anti-join right (non-matching left → NULL right)
-//! 4. **Part 4** — Delete stale NULL-padded left rows when new right matches
-//! 5. **Part 5** — Insert NULL-padded left rows when last right match removed
-//! 6. **Part 6** — delta_right anti-join left (non-matching right → NULL left)
-//! 7. **Part 7** — Symmetric transitions for right side gaining/losing left matches
+//! 1. **Part 1a** — delta_left INSERTS JOIN R₁ (matching insert rows)
+//! 2. **Part 1b** — delta_left DELETES JOIN R₀ (matching delete rows, EC-01 fix)
+//! 3. **Part 2** — current_left JOIN delta_right (matching rows)
+//! 4. **Part 3a** — delta_left INSERTS anti-join R₁ (non-matching left → NULL right)
+//! 5. **Part 3b** — delta_left DELETES anti-join R₀ (non-matching left → NULL right)
+//! 6. **Part 4** — Delete stale NULL-padded left rows when new right matches
+//! 7. **Part 5** — Insert NULL-padded left rows when last right match removed
+//! 8. **Part 6** — delta_right anti-join left (non-matching right → NULL left)
+//! 9. **Part 7** — Symmetric transitions for right side gaining/losing left matches
 //!
-//! Parts 1-5 are identical to LEFT JOIN (outer_join.rs). Parts 6-7 add
+//! Parts 1-5 mirror the LEFT JOIN operator (outer_join.rs). Parts 6-7 add
 //! the symmetric right-side anti-join handling.
+//!
+//! ## EC-01 fix: R₀ for DELETE deltas in Parts 1 and 3
+//!
+//! Same as LEFT JOIN: Part 1 and Part 3 together partition delta_left rows
+//! into "matched" and "unmatched". When the right partner is simultaneously
+//! deleted, using R₁ (post-change) misses the match. Split by action:
+//! - INSERTs check R₁ (need current right state)
+//! - DELETEs check R₀ (need pre-change right state)
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
-use crate::dvm::operators::join_common::{build_snapshot_sql, rewrite_join_condition};
+use crate::dvm::operators::join_common::{
+    build_snapshot_sql, rewrite_join_condition, use_pre_change_snapshot,
+};
 use crate::dvm::parser::OpTree;
 use crate::error::PgTrickleError;
 
@@ -130,6 +142,37 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
         .concat()
         .join(", ");
 
+    // ── EC-01: Pre-change right snapshot for Parts 1b / 3b ─────────
+    //
+    // Same fix as inner_join / outer_join: when a left DELETE's old right
+    // partner is simultaneously deleted, R₁ misses the match.
+    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin);
+
+    let r0_snapshot = if use_r0 {
+        let right_all_cols: String = right_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let right_alias = right.alias();
+        let r0 = format!(
+            "(SELECT {right_all_cols} FROM {right_table} {ra} \
+             EXCEPT ALL \
+             SELECT {right_all_cols} FROM {delta_right} WHERE __pgt_action = 'I' \
+             UNION ALL \
+             SELECT {right_all_cols} FROM {delta_right} WHERE __pgt_action = 'D')",
+            ra = quote_ident(right_alias),
+            delta_right = right_result.cte_name,
+        );
+        Some(r0)
+    } else {
+        None
+    };
+
+    if use_r0 {
+        ctx.mark_cte_not_materialized(&right_result.cte_name);
+    }
+
     // ── Pre-compute delta action flags for both sides ──────────────
     let left_flags_cte = ctx.next_cte_name("fj_left_flags");
     ctx.add_cte(
@@ -155,8 +198,131 @@ pub fn diff_full_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
 
     let cte_name = ctx.next_cte_name("full_join");
 
-    let sql = format!(
-        "\
+    let sql = if let Some(ref r0) = r0_snapshot {
+        // ── EC-01: Split Part 1 and Part 3 by action ────────────────
+        format!(
+            "\
+-- Part 1a: delta_left INSERTS JOIN current_right R₁ (matching insert rows)
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, pgtrickle.pg_trickle_hash(row_to_json(r)::text)::TEXT]) AS __pgt_row_id,
+       dl.__pgt_action,
+       {part1_cols}
+FROM {delta_left} dl
+JOIN {right_table} r ON {join_cond_part1}
+WHERE dl.__pgt_action = 'I'
+
+UNION ALL
+
+-- Part 1b: delta_left DELETES JOIN pre-change_right R₀ (EC-01 fix)
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, pgtrickle.pg_trickle_hash(row_to_json(r)::text)::TEXT]) AS __pgt_row_id,
+       dl.__pgt_action,
+       {part1_cols}
+FROM {delta_left} dl
+JOIN {r0_snapshot} r ON {join_cond_part1}
+WHERE dl.__pgt_action = 'D'
+
+UNION ALL
+
+-- Part 2: current_left JOIN delta_right
+SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[pgtrickle.pg_trickle_hash(row_to_json(l)::text)::TEXT, dr.__pgt_row_id::TEXT]) AS __pgt_row_id,
+       dr.__pgt_action,
+       {part2_cols}
+FROM {left_table} l
+JOIN {delta_right} dr ON {join_cond_part2}
+
+UNION ALL
+
+-- Part 3a: delta_left INSERTS anti-join R₁ (non-matching inserts → NULL right cols)
+SELECT dl.__pgt_row_id,
+       dl.__pgt_action,
+       {antijoin_left_cols}
+FROM {delta_left} dl
+WHERE dl.__pgt_action = 'I'
+  AND NOT EXISTS (
+    SELECT 1 FROM {right_table} r WHERE {join_cond_antijoin_l}
+)
+
+UNION ALL
+
+-- Part 3b: delta_left DELETES anti-join R₀ (non-matching deletes → NULL right cols)
+SELECT dl.__pgt_row_id,
+       dl.__pgt_action,
+       {antijoin_left_cols}
+FROM {delta_left} dl
+WHERE dl.__pgt_action = 'D'
+  AND NOT EXISTS (
+    SELECT 1 FROM {r0_snapshot} r WHERE {join_cond_antijoin_l}
+)
+
+UNION ALL
+
+-- Part 4: Delete stale NULL-padded left rows when new right matches appear
+SELECT 0::BIGINT AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {l_null_right_padded}
+FROM {left_table} l
+JOIN {delta_right} dr ON {join_cond_part2}
+WHERE dr.__pgt_action = 'I'
+  AND (SELECT has_ins FROM {right_flags_cte})
+
+UNION ALL
+
+-- Part 5: Insert NULL-padded left rows when left row loses all right matches
+SELECT 0::BIGINT AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {l_null_right_padded}
+FROM {left_table} l
+JOIN {delta_right} dr ON {join_cond_part2}
+WHERE dr.__pgt_action = 'D'
+  AND (SELECT has_del FROM {right_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {right_table} r WHERE {not_exists_cond_lr}
+)
+
+UNION ALL
+
+-- Part 6: delta_right anti-join left (non-matching right rows → NULL left cols)
+SELECT dr.__pgt_row_id,
+       dr.__pgt_action,
+       {antijoin_right_cols}
+FROM {delta_right} dr
+WHERE NOT EXISTS (
+    SELECT 1 FROM {left_table} l WHERE {join_cond_antijoin_r}
+)
+
+UNION ALL
+
+-- Part 7a: Delete stale NULL-padded right rows when new left matches appear
+SELECT 0::BIGINT AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {null_left_r_padded}
+FROM {right_table} r
+JOIN {delta_left} dl ON {join_cond_antijoin_l}
+WHERE dl.__pgt_action = 'I'
+  AND (SELECT has_ins FROM {left_flags_cte})
+
+UNION ALL
+
+-- Part 7b: Insert NULL-padded right rows when right row loses all left matches
+SELECT 0::BIGINT AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {null_left_r_padded}
+FROM {right_table} r
+JOIN {delta_left} dl ON {join_cond_antijoin_l}
+WHERE dl.__pgt_action = 'D'
+  AND (SELECT has_del FROM {left_flags_cte})
+  AND NOT EXISTS (
+    SELECT 1 FROM {left_table} l WHERE {not_exists_cond_lr}
+)",
+            delta_left = left_result.cte_name,
+            delta_right = right_result.cte_name,
+            r0_snapshot = r0,
+            left_flags_cte = left_flags_cte,
+            right_flags_cte = right_flags_cte,
+        )
+    } else {
+        // Right child is complex — keep Part 1 and Part 3 unsplit.
+        format!(
+            "\
 -- Part 1: delta_left JOIN current_right (matching rows)
 SELECT pgtrickle.pg_trickle_hash_multi(ARRAY[dl.__pgt_row_id::TEXT, pgtrickle.pg_trickle_hash(row_to_json(r)::text)::TEXT]) AS __pgt_row_id,
        dl.__pgt_action,
@@ -244,11 +410,12 @@ WHERE dl.__pgt_action = 'D'
   AND NOT EXISTS (
     SELECT 1 FROM {left_table} l WHERE {not_exists_cond_lr}
 )",
-        delta_left = left_result.cte_name,
-        delta_right = right_result.cte_name,
-        left_flags_cte = left_flags_cte,
-        right_flags_cte = right_flags_cte,
-    );
+            delta_left = left_result.cte_name,
+            delta_right = right_result.cte_name,
+            left_flags_cte = left_flags_cte,
+            right_flags_cte = right_flags_cte,
+        )
+    };
 
     ctx.add_cte(cte_name.clone(), sql);
 
@@ -298,15 +465,40 @@ mod tests {
         let result = diff_full_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should have all 8 parts (1-7b)
-        assert_sql_contains(&sql, "Part 1");
+        // EC-01: Parts 1 and 3 are split when right child is simple (Scan)
+        assert_sql_contains(&sql, "Part 1a");
+        assert_sql_contains(&sql, "Part 1b");
         assert_sql_contains(&sql, "Part 2");
-        assert_sql_contains(&sql, "Part 3");
+        assert_sql_contains(&sql, "Part 3a");
+        assert_sql_contains(&sql, "Part 3b");
         assert_sql_contains(&sql, "Part 4");
         assert_sql_contains(&sql, "Part 5");
         assert_sql_contains(&sql, "Part 6");
         assert_sql_contains(&sql, "Part 7a");
         assert_sql_contains(&sql, "Part 7b");
+    }
+
+    #[test]
+    fn test_ec01_full_join_r0_uses_except_all() {
+        // For Scan right children, Part 1b and Part 3b should use R₀ via
+        // EXCEPT ALL to find pre-change right partners.
+        let mut ctx = test_ctx();
+        let left = scan(1, "a", "public", "a", &["id"]);
+        let right = scan(2, "b", "public", "b", &["id", "name"]);
+        let cond = eq_cond("a", "id", "b", "id");
+        let tree = OpTree::FullJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+        let result = diff_full_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // R₀ uses EXCEPT ALL pattern
+        assert_sql_contains(&sql, "EXCEPT ALL");
+        // Part 1b and Part 3b present
+        assert_sql_contains(&sql, "Part 1b");
+        assert_sql_contains(&sql, "Part 3b");
     }
 
     #[test]
