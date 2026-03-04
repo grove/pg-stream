@@ -173,7 +173,19 @@ docs-build:
 docs-serve:
     mdbook serve --open
 # ── Housekeeping ──────────────────────────────────────────────────────────
+# Validate upgrade script covers all new SQL objects (no Docker needed)
+check-upgrade from to:
+    scripts/check_upgrade_completeness.sh {{from}} {{to}}
 
+# Build the two-version upgrade Docker image for E2E upgrade testing
+build-upgrade-image from="0.1.3" to="0.2.1":
+    ./tests/build_e2e_upgrade_image.sh {{from}} {{to}}
+
+# Run E2E upgrade tests (builds upgrade Docker image first)
+test-upgrade from="0.1.3" to="0.2.1": (build-upgrade-image from to)
+    PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
+    PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
+        cargo test --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture
 # Remove build artifacts
 clean:
     cargo clean

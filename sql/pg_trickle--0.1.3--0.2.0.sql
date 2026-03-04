@@ -79,4 +79,95 @@ STRICT
 LANGUAGE c
 AS 'MODULE_PATHNAME', '_signal_launcher_rescan_wrapper';
 
-SELECT 'pg_trickle upgrade 0.1.3 → 0.2.0: added list_sources, change_buffer_sizes, _signal_launcher_rescan';
+-- Monitoring: refresh timeline history
+CREATE OR REPLACE FUNCTION pgtrickle."refresh_timeline"(
+	"max_rows" INT DEFAULT 50
+) RETURNS TABLE (
+	"start_time" timestamp with time zone,
+	"stream_table" TEXT,
+	"action" TEXT,
+	"status" TEXT,
+	"rows_inserted" bigint,
+	"rows_deleted" bigint,
+	"duration_ms" double precision,
+	"error_message" TEXT
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'refresh_timeline_wrapper';
+
+-- IVM: handle TRUNCATE on source tables
+CREATE OR REPLACE FUNCTION pgtrickle."pgt_ivm_handle_truncate"(
+	"pgt_id" bigint
+) RETURNS VOID
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'pgt_ivm_handle_truncate_wrapper';
+
+-- Monitoring: health check diagnostics
+CREATE OR REPLACE FUNCTION pgtrickle."health_check"() RETURNS TABLE (
+	"check_name" TEXT,
+	"severity" TEXT,
+	"detail" TEXT
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'health_check_wrapper';
+
+-- IVM: apply delta changes from CDC buffers
+CREATE OR REPLACE FUNCTION pgtrickle."pgt_ivm_apply_delta"(
+	"pgt_id" bigint,
+	"source_oid" INT,
+	"has_new" bool,
+	"has_old" bool
+) RETURNS VOID
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'pgt_ivm_apply_delta_wrapper';
+
+-- Monitoring: trigger inventory for all source tables
+CREATE OR REPLACE FUNCTION pgtrickle."trigger_inventory"() RETURNS TABLE (
+	"source_table" TEXT,
+	"source_oid" bigint,
+	"trigger_name" TEXT,
+	"trigger_type" TEXT,
+	"present" bool,
+	"enabled" bool
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'trigger_inventory_wrapper';
+
+-- API: extension version string
+CREATE OR REPLACE FUNCTION pgtrickle."version"() RETURNS TEXT
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'version_wrapper';
+
+-- Monitoring: dependency tree visualization
+CREATE OR REPLACE FUNCTION pgtrickle."dependency_tree"() RETURNS TABLE (
+	"tree_line" TEXT,
+	"node" TEXT,
+	"node_type" TEXT,
+	"depth" INT,
+	"status" TEXT,
+	"refresh_mode" TEXT
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'dependency_tree_wrapper';
+
+-- API: diamond dependency groups
+CREATE OR REPLACE FUNCTION pgtrickle."diamond_groups"() RETURNS TABLE (
+	"group_id" INT,
+	"member_name" TEXT,
+	"member_schema" TEXT,
+	"is_convergence" bool,
+	"epoch" bigint,
+	"schedule_policy" TEXT
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'diamond_groups_wrapper';
+
+SELECT 'pg_trickle upgrade 0.1.3 → 0.2.0: added list_sources, change_buffer_sizes, _signal_launcher_rescan, refresh_timeline, pgt_ivm_handle_truncate, health_check, pgt_ivm_apply_delta, trigger_inventory, version, dependency_tree, diamond_groups';

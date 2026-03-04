@@ -1,7 +1,7 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-04
-> **Current version:** 0.2.0
+> **Last updated:** 2025-06-18
+> **Current version:** 0.2.1
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -19,14 +19,14 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                                    We are here
-                                                         │
-                                                         ▼
- ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
- │ 0.1.x  │ │ 0.2.0  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
- │Released│─│Complete│─│Correct│─│Compat │─│Observ-│─│Stable │─│Scale &│
- │ ✅      │ │ ✅      │ │& Secur│ │& Scale│ │ability│ │Release│ │Ecosys.│
- └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+                                                              We are here
+                                                                   │
+                                                                   ▼
+ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+ │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
+ │Released│─│Released│─│Released│─│Correct│─│Compat │─│Observ-│─│Stable │─│Scale &│
+ │ ✅      │ │ ✅      │ │ ✅      │ │& Secur│ │& Scale│ │ability│ │Release│ │Ecosys.│
+ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -75,8 +75,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full feature list.
 **Status: Released (2026-03-04).**
 
 The 51-item SQL_GAPS_7 correctness plan was completed in v0.1.x. v0.2.0 delivers
-three major feature additions. The one remaining SQL_GAPS_7 item (F40 — extension
-upgrade migration scripts) is deferred to v0.3.0 as O1.4
+three major feature additions.
 
 <details>
 <summary>Completed items (click to expand)</summary>
@@ -88,7 +87,7 @@ upgrade migration scripts) is deferred to v0.3.0 as O1.4
 | 2 — Robustness | F13, F15–F16 | ✅ Done in v0.1.2–v0.1.3 |
 | 3 — Test coverage | F17–F26 (62 E2E tests) | ✅ Done in v0.1.2–v0.1.3 |
 | 4 — Operational hardening | F27–F39 | ✅ Done in v0.1.3 |
-| 4 — Upgrade migrations | F40 | ⬜ Deferred → v0.3.0 O1 |
+| 4 — Upgrade migrations | F40 | ✅ Done in v0.2.1 |
 | 5 — Nice-to-have | F41–F51 | ✅ Done in v0.1.3 |
 
 **TPC-H baseline:** 22/22 queries pass deterministic correctness checks across
@@ -178,6 +177,50 @@ See [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md).
 
 ---
 
+## v0.2.1 — Upgrade Infrastructure & Documentation
+
+**Status: Released (2025-06-18).**
+
+Patch release focused on upgrade safety and documentation. No SQL-level
+changes — the extension's function/view/trigger interface is identical to
+0.2.0.
+
+### Upgrade Migration Infrastructure ✅
+
+Complete safety net for `ALTER EXTENSION pg_trickle UPDATE`:
+
+| Item | Description | Status |
+|------|-------------|--------|
+| U1 | `scripts/check_upgrade_completeness.sh` — CI completeness checker | ✅ Done |
+| U2 | `sql/archive/` with archived SQL baselines per version | ✅ Done |
+| U3 | `tests/Dockerfile.e2e-upgrade` for real upgrade tests | ✅ Done |
+| U4 | 6 upgrade E2E tests (function parity, stream table survival, etc.) | ✅ Done |
+| U5 | CI: `upgrade-check` (every PR) + `upgrade-e2e` (push-to-main) | ✅ Done |
+| U6 | `docs/UPGRADING.md` user-facing upgrade guide | ✅ Done |
+| U7 | `just check-upgrade`, `just build-upgrade-image`, `just test-upgrade` | ✅ Done |
+| U8 | Fixed 0.1.3→0.2.0 upgrade script (was no-op placeholder) | ✅ Done |
+
+### Documentation Expansion ✅
+
+GitHub Pages book grew from 14 to 20 pages:
+
+| Page | Section | Source |
+|------|---------|--------|
+| dbt Integration | Integrations | `dbt-pgtrickle/README.md` |
+| Contributing | Reference | `CONTRIBUTING.md` |
+| Security Policy | Reference | `SECURITY.md` |
+| Release Process | Reference | `docs/RELEASE.md` |
+| pg_ivm Comparison | Research | `plans/ecosystem/GAP_PG_IVM_COMPARISON.md` |
+| Triggers vs Replication | Research | `plans/sql/REPORT_TRIGGERS_VS_REPLICATION.md` |
+
+**Exit criteria:**
+- [x] `ALTER EXTENSION pg_trickle UPDATE` from 0.1.3→0.2.0 tested end-to-end
+- [x] Completeness check passes (upgrade script covers all pgrx-generated SQL objects)
+- [x] CI enforces upgrade script completeness on every PR
+- [x] All documentation pages build and render in mdBook
+
+---
+
 ## v0.3.0 — Correctness, Security & Operations
 
 **Goal:** Fix correctness gaps, harden security (RLS), validate partitioned
@@ -249,7 +292,7 @@ partitioned storage tables are deferred to a future release.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 · [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
+| O1 | ~~Extension upgrade migrations (`ALTER EXTENSION UPDATE`)~~ | ✅ Done in v0.2.1 | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
 | O2 | Prepared statement cleanup on cache invalidation | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.3 |
 | O3 | ~~Adaptive fallback threshold exposure via monitoring~~ | ✅ Done in v0.1.3 (F27) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.4 |
 | O4 | ~~SPI SQLSTATE error classification for retry~~ | ✅ Done in v0.1.3 (F29) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.6 |
@@ -273,7 +316,7 @@ partitioned storage tables are deferred to a future release.
 - [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
 - [ ] WAL CDC mode passes full E2E suite
-- [ ] Extension upgrade path tested (`0.1.x → 0.3.0`)
+- [ ] Extension upgrade path tested (`0.2.x → 0.3.0`)
 - [ ] Zero P0/P1 gaps remaining
 
 ---
@@ -337,9 +380,8 @@ milestone the product is externally visible and monitored.
 |------|-------------|--------|-----|
 | R5 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
 | R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
-| O1 | Extension upgrade migrations (`ALTER EXTENSION UPDATE`) | 4–6h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.2 · [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
 
-> **v0.5.0 total: ~18–27 hours**
+> **v0.5.0 total: ~14–21 hours**
 
 **Exit criteria:**
 - [ ] Grafana dashboard published
@@ -414,12 +456,13 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | Milestone | Effort estimate | Cumulative | Status |
 |-----------|-----------------|------------|--------|
 | v0.1.x — Core engine + correctness | ~30h actual | 30h | ✅ Released |
-| v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Done |
-| v0.3.0 — Correctness, Security & Operations | 55–85h | 117–163h | |
-| v0.4.0 — Backward Compat & Parallel Refresh | 52–76h | 169–239h | |
-| v0.5.0 — Observability & Integration | 18–27h | 187–266h | |
-| v1.0.0 — Stable release | 18–27h | 205–293h | |
-| Post-1.0 (ecosystem) | 88–134h | 293–427h | |
+| v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Released |
+| v0.2.1 — Upgrade Infrastructure & Documentation | ~8h | 70–86h | ✅ Released |
+| v0.3.0 — Correctness, Security & Operations | 55–85h | 125–171h | |
+| v0.4.0 — Backward Compat & Parallel Refresh | 52–76h | 177–247h | |
+| v0.5.0 — Observability & Integration | 14–21h | 191–268h | |
+| v1.0.0 — Stable release | 18–27h | 209–295h | |
+| Post-1.0 (ecosystem) | 88–134h | 297–429h | |
 | Post-1.0 (scale) | 6+ months | — | |
 
 ---

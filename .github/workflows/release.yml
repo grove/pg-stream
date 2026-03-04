@@ -103,6 +103,30 @@ jobs:
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
           echo "Archive: ${ARCHIVE_NAME}.tar.gz ($(du -h "${ARCHIVE_NAME}.tar.gz" | cut -f1))"
 
+      - name: Archive full SQL for future upgrade diffs
+        if: matrix.archive_ext == 'tar.gz' && matrix.artifact_suffix == 'linux-amd64'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_trickle-pg*' -type d | head -1)
+          FULL_SQL=$(find "${PKG_DIR}" -name "pg_trickle--${VERSION}.sql" | head -1)
+          if [[ -n "$FULL_SQL" ]]; then
+            mkdir -p sql/archive
+            cp "$FULL_SQL" "sql/archive/pg_trickle--${VERSION}.sql"
+            echo "Archived: sql/archive/pg_trickle--${VERSION}.sql"
+          else
+            echo "WARNING: Full install SQL not found for archiving"
+          fi
+
+      - name: Upload SQL archive artifact
+        if: matrix.archive_ext == 'tar.gz' && matrix.artifact_suffix == 'linux-amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-archive
+          path: sql/archive/pg_trickle--*.sql
+          retention-days: 90
+          if-no-files-found: ignore
+
       - name: Create archive (zip)
         if: matrix.archive_ext == 'zip'
         shell: pwsh

@@ -1,0 +1,55 @@
+# =============================================================================
+# Lightweight Dockerfile for upgrade E2E tests.
+#
+# Extends the standard E2E image (pg_trickle_e2e:latest) by adding:
+#   - The old version's full install SQL (so CREATE EXTENSION VERSION 'X' works)
+#   - The upgrade script (so ALTER EXTENSION UPDATE TO 'Y' works)
+#
+# This allows tests to:
+#   1. CREATE EXTENSION pg_trickle VERSION '0.1.3'
+#   2. Populate data under the old schema
+#   3. ALTER EXTENSION pg_trickle UPDATE TO '0.2.0'
+#   4. Verify all objects exist and data is intact
+#
+# The old SQL runs against the new .so binary — this works because:
+#   - We only ADD functions between versions (nothing removed yet)
+#   - MODULE_PATHNAME resolves to the current .so which has all symbols
+#
+# Usage:
+#   docker build -t pg_trickle_upgrade_e2e:latest \
+#     --build-arg FROM_VERSION=0.1.3 \
+#     --build-arg TO_VERSION=0.2.0 \
+#     -f tests/Dockerfile.e2e-upgrade .
+#
+# Prerequisites: pg_trickle_e2e:latest must be built first.
+# =============================================================================
+
+ARG BASE_IMAGE=pg_trickle_e2e:latest
+FROM ${BASE_IMAGE}
+
+ARG FROM_VERSION=0.1.3
+ARG TO_VERSION=0.2.0
+
+LABEL org.opencontainers.image.title="pg_trickle upgrade E2E test image"
+LABEL org.opencontainers.image.description="PostgreSQL 18.1 with pg_trickle for upgrade path testing (${FROM_VERSION} → ${TO_VERSION})"
+
+# Copy the old version's full install SQL so that
+#   CREATE EXTENSION pg_trickle VERSION '<FROM_VERSION>'
+# finds the script.
+COPY sql/archive/pg_trickle--${FROM_VERSION}.sql \
+     /usr/share/postgresql/18/extension/pg_trickle--${FROM_VERSION}.sql
+
+# Copy the upgrade script so ALTER EXTENSION UPDATE can chain versions.
+COPY sql/pg_trickle--${FROM_VERSION}--${TO_VERSION}.sql \
+     /usr/share/postgresql/18/extension/pg_trickle--${FROM_VERSION}--${TO_VERSION}.sql
+
+# Remove the auto-create initdb script — upgrade tests control when and
+# which version gets installed.
+RUN rm -f /docker-entrypoint-initdb.d/00-create-pg-trickle.sql
+
+# Verify all required extension files are present
+RUN echo "=== Extension files for upgrade testing ===" && \
+    ls -la /usr/share/postgresql/18/extension/pg_trickle* && \
+    echo "==========================================="
+
+EXPOSE 5432

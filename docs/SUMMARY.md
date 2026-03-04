@@ -10,6 +10,14 @@
 - [SQL Reference](SQL_REFERENCE.md)
 - [Configuration](CONFIGURATION.md)
 - [Installation](installation.md)
+- [Upgrading](UPGRADING.md)
+- [Contributing](contributing.md)
+
+---
+
+# Integrations
+
+- [dbt-pgtrickle](integrations/dbt.md)
 
 ---
 
@@ -35,6 +43,8 @@
 - [FAQ](FAQ.md)
 - [Changelog](changelog.md)
 - [Roadmap](roadmap.md)
+- [Release Process](RELEASE.md)
+- [Security Policy](security.md)
 
 ---
 
@@ -43,3 +53,5 @@
 - [DBSP Comparison](research/DBSP_COMPARISON.md)
 - [Prior Art](research/PRIOR_ART.md)
 - [Custom SQL Syntax](../plans/sql/REPORT_CUSTOM_SQL_SYNTAX.md)
+- [pg_ivm Comparison](research/PG_IVM_COMPARISON.md)
+- [Triggers vs Replication](research/TRIGGERS_VS_REPLICATION.md)

@@ -7,6 +7,47 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
+## [0.2.1] — 2025-06-18
+
+### Added
+
+- **Upgrade migration infrastructure** — Complete safety net for
+  `ALTER EXTENSION pg_trickle UPDATE` upgrades:
+  - `scripts/check_upgrade_completeness.sh` — CI-runnable script that diffs
+    the pgrx-generated full install SQL against the hand-authored upgrade
+    script to detect missing functions, views, or event triggers.
+  - `tests/Dockerfile.e2e-upgrade` — lightweight Docker image for testing
+    real version-to-version upgrades (`CREATE EXTENSION VERSION '0.1.3'` →
+    `ALTER EXTENSION UPDATE TO '0.2.0'`).
+  - 6 new upgrade E2E tests verifying function existence, stream table
+    survival, view queryability, event triggers, version consistency, and
+    function parity with fresh installs after upgrade.
+  - `upgrade-check` CI job runs on every PR (no Docker needed).
+  - `upgrade-e2e` CI job runs on push-to-main and daily schedule.
+  - `sql/archive/` directory with archived SQL baselines for each version.
+  - `just check-upgrade`, `just build-upgrade-image`, `just test-upgrade`
+    convenience targets.
+  - `docs/UPGRADING.md` user-facing upgrade guide.
+  - `sql/pg_trickle--0.2.0--0.2.1.sql` no-op migration script (no SQL
+    changes in this release).
+
+- **GitHub Pages book expansion** — Six new documentation pages across
+  three new sections:
+  - *Integrations:* dbt-pgtrickle documentation.
+  - *Reference:* Contributing guide, Security policy, Release process.
+  - *Research:* pg_ivm comparison, Triggers vs Replication analysis.
+  - Book grew from 14 to 20 pages across 6 sections.
+
+### Fixed
+
+- **Upgrade script completeness** — The `pg_trickle--0.1.3--0.2.0.sql`
+  upgrade script was a no-op placeholder, causing `ALTER EXTENSION UPDATE`
+  to silently skip 11 new functions. Fixed by adding all missing
+  `CREATE OR REPLACE FUNCTION` statements. Validated by the new completeness
+  check script.
+
+---
+
 ## [0.2.0] — 2026-03-04
 
 ### Added

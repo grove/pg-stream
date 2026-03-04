@@ -225,6 +225,9 @@ DROP TABLE test_source;
 
 To upgrade pg_trickle to a newer version without losing data:
 
+> For comprehensive upgrade instructions, version-specific notes,
+> troubleshooting, and rollback procedures, see [docs/UPGRADING.md](docs/UPGRADING.md).
+
 ### 1. Install the new extension files
 
 Follow the same steps as [Installing from a Pre-built Release](#installing-from-a-pre-built-release)

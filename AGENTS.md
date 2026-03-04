@@ -150,6 +150,8 @@ Five test tiers, each with its own infrastructure:
 | Unit (macOS + Windows) | ❌ | ❌ | ✅ | ✅ |
 | Integration | ✅ | ✅ | ✅ | ✅ |
 | E2E + TPC-H | ❌ | ✅ | ✅ | ✅ |
+| Upgrade completeness | ✅ | ✅ | ✅ | ✅ |
+| Upgrade E2E | ❌ | ✅ | ✅ | ✅ |
 | Benchmarks | ❌ | ❌ | ✅ | ✅ |
 | dbt integration | ❌ | ❌ | ✅ | ✅ |
 | CNPG smoke test | ❌ | ❌ | ✅ | ✅ |

@@ -14,6 +14,8 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'sql/**'
+      - 'scripts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/**'
@@ -23,6 +25,8 @@ on:
     branches: [main]
     paths:
       - 'src/**'
+      - 'sql/**'
+      - 'scripts/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'tests/**'
@@ -118,6 +122,52 @@ jobs:
       - name: Run TPC-H-derived correctness tests
         run: |
           cargo test --test e2e_tpch_tests -- \
+            --ignored --test-threads=1 --nocapture
+
+  # ── Upgrade completeness check (every PR) ───────────────────────────────
+  # Lightweight: validates that the upgrade SQL script covers all objects
+  # in the pgrx-generated full install script. No Docker needed.
+  upgrade-check:
+    name: Upgrade completeness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate upgrade script completeness
+        run: |
+          # Check each upgrade step in the chain
+          scripts/check_upgrade_completeness.sh 0.1.3 0.2.0
+          scripts/check_upgrade_completeness.sh 0.2.0 0.2.1
+
+  # ── Upgrade E2E tests (push-to-main + daily) ───────────────────────────
+  # True version-to-version upgrade tests: install old version, populate
+  # data, run ALTER EXTENSION UPDATE, verify everything works.
+  upgrade-e2e-tests:
+    name: Upgrade E2E tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    needs: [e2e-tests]
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Build upgrade E2E Docker image
+        run: ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.1
+
+      - name: Run upgrade E2E tests
+        env:
+          PGS_E2E_IMAGE: pg_trickle_upgrade_e2e:latest
+          PGS_UPGRADE_FROM: "0.1.3"
+          PGS_UPGRADE_TO: "0.2.1"
+        run: |
+          cargo test --test e2e_upgrade_tests -- \
             --ignored --test-threads=1 --nocapture
 
   # ── Benchmarks (non-blocking, Linux only) ───────────────────────────────
