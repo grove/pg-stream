@@ -1,0 +1,9 @@
+-- pg_trickle 0.2.0 → 0.2.1 upgrade script
+--
+-- This release contains only infrastructure and documentation changes:
+--   - Upgrade migration infrastructure (scripts, CI, E2E tests)
+--   - GitHub Pages book expansion (6 new documentation pages)
+--   - UPGRADING.md user-facing upgrade guide
+--
+-- No new SQL objects, functions, views, or event triggers were added.
+-- The extension's SQL interface is identical to 0.2.0.

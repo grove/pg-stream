@@ -307,7 +307,7 @@ async fn test_upgrade_monitoring_views_present() {
 //
 // They are #[ignore]d by default because the upgrade image must be built
 // separately. Run with:
-//   just test-upgrade 0.1.3 0.2.0
+//   just test-upgrade 0.1.3 0.2.1
 // which builds the image and sets the env var automatically.
 
 /// Helper: returns true if the upgrade E2E image is available.
@@ -330,7 +330,7 @@ async fn test_upgrade_0_1_3_to_0_2_0_new_functions_exist() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.1".into());
 
     // Start container WITHOUT auto-extension, install old version manually
     let db = E2eDb::new().await;
@@ -393,7 +393,7 @@ async fn test_upgrade_0_1_3_to_0_2_0_stream_tables_survive() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.1".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -443,7 +443,7 @@ async fn test_upgrade_0_1_3_to_0_2_0_views_queryable() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.1".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -486,7 +486,7 @@ async fn test_upgrade_0_1_3_to_0_2_0_event_triggers_present() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.1".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -529,7 +529,7 @@ async fn test_upgrade_0_1_3_to_0_2_0_version_consistency() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.1".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -568,7 +568,7 @@ async fn test_upgrade_0_1_3_to_0_2_0_function_parity_with_fresh_install() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.1".into());
 
     let db = E2eDb::new().await;
 

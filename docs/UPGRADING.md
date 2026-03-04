@@ -123,6 +123,34 @@ SELECT pgtrickle.refresh_stream_table('your_stream_table');
 **No breaking changes.** All v0.1.3 functions and views continue to work
 as before.
 
+### 0.2.0 → 0.2.1
+
+**No SQL changes.** The extension's function, view, and event trigger
+interface is identical to 0.2.0. This is an infrastructure-only release.
+
+The migration script (`pg_trickle--0.2.0--0.2.1.sql`) is a no-op.
+
+**What's new:**
+- Upgrade migration safety infrastructure (scripts, CI, E2E tests)
+- GitHub Pages book expansion (6 new documentation pages)
+- User-facing upgrade guide (this document)
+
+---
+
+## Supported Upgrade Paths
+
+The following upgrade chains are supported:
+
+| From | To | Scripts used |
+|------|----|-------------|
+| 0.1.3 | 0.2.0 | `pg_trickle--0.1.3--0.2.0.sql` |
+| 0.1.3 | 0.2.1 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` |
+| 0.2.0 | 0.2.1 | `pg_trickle--0.2.0--0.2.1.sql` |
+
+PostgreSQL automatically chains migration scripts. Running
+`ALTER EXTENSION pg_trickle UPDATE` from v0.1.3 will apply both scripts
+in sequence.
+
 ---
 
 ## Rollback / Downgrade
