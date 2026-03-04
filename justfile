@@ -91,6 +91,18 @@ test-pgrx:
 [group: "test"]
 test-all: test-unit test-integration test-e2e test-pgrx
 
+# ── Pipeline DAG Tests ───────────────────────────────────────────────────
+
+# Run multi-level DAG pipeline tests (rebuilds Docker image)
+[group: "test"]
+test-pipeline: build-e2e-image
+    cargo test --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
+
+# Run pipeline DAG tests, skip Docker image rebuild
+[group: "test"]
+test-pipeline-fast:
+    cargo test --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
+
 # ── TPC-H Tests ───────────────────────────────────────────────────────────
 
 # Run TPC-H correctness tests at SF-0.01 (~2 min, rebuilds Docker image)
