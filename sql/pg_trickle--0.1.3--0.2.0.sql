@@ -43,8 +43,40 @@
 -- END
 -- $$;
 
--- ── Placeholder: no schema changes in this version ───────────────────
--- This migration is a no-op. Remove this line and uncomment the DDL
--- above when actual schema changes are needed for 0.2.0.
+-- ── New functions in 0.2.0 ────────────────────────────────────────────
 
-SELECT 'pg_trickle upgrade 0.1.3 → 0.2.0: no-op (template)';
+-- Monitoring: list source tables for a given stream table
+CREATE OR REPLACE FUNCTION pgtrickle."list_sources"(
+        "name" TEXT
+) RETURNS TABLE (
+        "source_table" TEXT,
+        "source_oid" bigint,
+        "source_type" TEXT,
+        "cdc_mode" TEXT,
+        "columns_used" TEXT
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'list_sources_wrapper';
+
+-- Monitoring: inspect CDC change buffer sizes per stream table
+CREATE OR REPLACE FUNCTION pgtrickle."change_buffer_sizes"() RETURNS TABLE (
+        "stream_table" TEXT,
+        "source_table" TEXT,
+        "source_oid" bigint,
+        "cdc_mode" TEXT,
+        "pending_rows" bigint,
+        "buffer_bytes" bigint
+)
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'change_buffer_sizes_wrapper';
+
+-- Internal: signal the launcher background worker to rescan databases
+-- immediately (bypasses the skip_ttl cache after CREATE EXTENSION).
+CREATE OR REPLACE FUNCTION pgtrickle."_signal_launcher_rescan"() RETURNS void
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', '_signal_launcher_rescan_wrapper';
+
+SELECT 'pg_trickle upgrade 0.1.3 → 0.2.0: added list_sources, change_buffer_sizes, _signal_launcher_rescan';
