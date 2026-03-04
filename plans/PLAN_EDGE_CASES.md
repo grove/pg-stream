@@ -40,7 +40,7 @@ others are fixable engineering gaps. This document:
 | **Impact** | Stale row remains in stream table until next full refresh |
 | **Current mitigation** | Adaptive FULL fallback (`pg_trickle.adaptive_full_threshold`) |
 | **Documented in** | FAQ § "Known edge cases"; SQL_REFERENCE § "Known Delta Computation Limitations" |
-| **Status** | ✅ **IMPLEMENTED** — Part 1 split (R₀ via EXCEPT ALL) in `diff_inner_join` |
+| **Status** | ✅ **IMPLEMENTED** — Part 1 split (R₀ via EXCEPT ALL) in `diff_inner_join`, `diff_left_join`, `diff_full_join` |
 
 **Root cause:** The delta query reads `current_right` after all changes are
 applied. When the old join partner is deleted before the delta runs, the

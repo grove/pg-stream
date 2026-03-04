@@ -83,78 +83,11 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::{
-    build_base_table_key_exprs, build_snapshot_sql, is_simple_child, rewrite_join_condition,
+    build_base_table_key_exprs, build_snapshot_sql, is_join_child, is_simple_child,
+    join_scan_count, rewrite_join_condition, use_pre_change_snapshot,
 };
 use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
-
-/// Returns true if `op` is (or wraps) a join node, indicating a nested join
-/// child for which the EXCEPT ALL L₀ approach may interact badly with
-/// SemiJoin R_old (causing Q21-type regressions). Subquery/Aggregate
-/// children are **not** considered join children — they can safely use L₀.
-///
-/// Note: even for join children, L₀ is now used when the subtree does NOT
-/// contain SemiJoin/AntiJoin nodes (see `contains_semijoin`). This function
-/// is combined with `contains_semijoin` to decide L₀ vs L₁.
-fn is_join_child(op: &OpTree) -> bool {
-    match op {
-        OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. } => true,
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. } => is_join_child(child),
-        _ => false,
-    }
-}
-
-/// Returns true if the subtree rooted at `op` contains any SemiJoin or
-/// AntiJoin node.  Used to decide whether a nested join child can safely
-/// use L₀ via EXCEPT ALL: SemiJoin-containing subtrees must use L₁ to
-/// avoid the Q21 numwait regression (R_old interaction), while pure
-/// InnerJoin/LeftJoin chains can safely use L₀.
-fn contains_semijoin(op: &OpTree) -> bool {
-    match op {
-        OpTree::SemiJoin { .. } | OpTree::AntiJoin { .. } => true,
-        OpTree::InnerJoin { left, right, .. }
-        | OpTree::LeftJoin { left, right, .. }
-        | OpTree::FullJoin { left, right, .. } => {
-            contains_semijoin(left) || contains_semijoin(right)
-        }
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. }
-        | OpTree::Aggregate { child, .. }
-        | OpTree::Distinct { child, .. }
-        | OpTree::Window { child, .. }
-        | OpTree::LateralFunction { child, .. }
-        | OpTree::LateralSubquery { child, .. }
-        | OpTree::ScalarSubquery { child, .. } => contains_semijoin(child),
-        OpTree::UnionAll { children } => children.iter().any(contains_semijoin),
-        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
-            contains_semijoin(left) || contains_semijoin(right)
-        }
-        OpTree::RecursiveCte {
-            base, recursive, ..
-        } => contains_semijoin(base) || contains_semijoin(recursive),
-        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => false,
-    }
-}
-
-/// Count the number of Scan (base table) nodes in a join subtree.
-/// Used to limit L₀ via EXCEPT ALL to small subtrees (≤ 2 scans).
-/// Larger subtrees fall back to L₁ + Part 3 correction to avoid
-/// cascading CTE materialization that can exhaust temp_file_limit.
-fn join_scan_count(op: &OpTree) -> usize {
-    match op {
-        OpTree::Scan { .. } => 1,
-        OpTree::InnerJoin { left, right, .. }
-        | OpTree::LeftJoin { left, right, .. }
-        | OpTree::FullJoin { left, right, .. } => join_scan_count(left) + join_scan_count(right),
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. } => join_scan_count(child),
-        _ => 0, // Non-join nodes (Aggregate, SemiJoin, etc.) — stop counting
-    }
-}
 
 /// Returns true if `op` is a join whose **both** children are simple (Scan)
 /// nodes.  Previously this gated Part 3 correction term generation — now
@@ -371,9 +304,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // Additionally, joins inside a SemiJoin/AntiJoin ancestor must use
     // L₁ to avoid Q21-type regressions where sub-join EXCEPT ALL
     // interacts with the SemiJoin's R_old computation.
-    let use_l0 = is_simple_child(left)
-        || !is_join_child(left)
-        || (!contains_semijoin(left) && !ctx.inside_semijoin && join_scan_count(left) <= 2);
+    let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin);
 
     let left_part2_source = if use_l0 {
         // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
@@ -442,9 +373,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     //
     // The same child-type heuristics as use_l0 apply: Scan and simple
     // children use R₀; SemiJoin-containing deep chains fall back to R₁.
-    let use_r0 = is_simple_child(right)
-        || !is_join_child(right)
-        || (!contains_semijoin(right) && !ctx.inside_semijoin && join_scan_count(right) <= 2);
+    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin);
 
     let right_part1_source = if use_r0 {
         // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
