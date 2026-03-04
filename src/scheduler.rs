@@ -1111,6 +1111,10 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
         .as_secs();
     let data_ts_frontier = format!("{}Z", now_secs);
 
+    // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
+    // allow the refresh executor to modify the storage table.
+    let _ = Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'");
+
     // Execute the refresh
     let result = if st.topk_limit.is_some() {
         // TopK tables bypass the normal Full/Differential refresh paths and use
@@ -1277,6 +1281,34 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
             // F31: Emit StaleData alert if still stale after refresh
             // (e.g., refresh took longer than the schedule interval)
             emit_stale_alert_if_needed(st);
+
+            // EC-11: Emit falling-behind alert if refresh duration exceeds
+            // 80% of the schedule interval. This warns operators that the
+            // refresh cannot keep up with the configured schedule.
+            if let Some(secs) = schedule_secs {
+                let schedule_ms = (secs * 1000) as i64;
+                if schedule_ms > 0 {
+                    let ratio = elapsed_ms as f64 / schedule_ms as f64;
+                    if ratio >= 0.8 {
+                        monitor::alert_falling_behind(
+                            &st.pgt_schema,
+                            &st.pgt_name,
+                            elapsed_ms,
+                            schedule_ms,
+                            ratio,
+                        );
+                        pgrx::warning!(
+                            "pg_trickle: refresh of {}.{} took {}ms ({:.0}% of {}ms schedule). \
+                             The scheduler may not be able to keep up with the configured interval.",
+                            st.pgt_schema,
+                            st.pgt_name,
+                            elapsed_ms,
+                            ratio * 100.0,
+                            schedule_ms,
+                        );
+                    }
+                }
+            }
 
             RefreshOutcome::Success
         }

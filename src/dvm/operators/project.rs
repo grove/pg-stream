@@ -291,7 +291,7 @@ mod tests {
     fn test_diff_project_preserves_dedup_flag() {
         let mut ctx = test_ctx();
         ctx.merge_safe_dedup = true;
-        let child = scan(1, "t", "public", "t", &["id", "val"]);
+        let child = scan_with_pk(1, "t", "public", "t", &["id", "val"], &["id"]);
         let tree = project(vec![colref("val")], vec!["val"], child);
         let result = diff_project(&mut ctx, &tree).unwrap();
         assert!(result.is_deduplicated);

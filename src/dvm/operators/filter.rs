@@ -340,7 +340,7 @@ mod tests {
     fn test_diff_filter_preserves_dedup_flag() {
         let mut ctx = test_ctx();
         ctx.merge_safe_dedup = true;
-        let child = scan(1, "t", "public", "t", &["id"]);
+        let child = scan_with_pk(1, "t", "public", "t", &["id"], &["id"]);
         let tree = filter(binop(">", colref("id"), lit("0")), child);
         let result = diff_filter(&mut ctx, &tree).unwrap();
 
@@ -371,7 +371,7 @@ mod tests {
     fn test_diff_filter_inherits_dedup_when_child_already_dedup() {
         let mut ctx = test_ctx();
         ctx.merge_safe_dedup = true;
-        let child = scan(1, "t", "public", "t", &["id", "amount"]);
+        let child = scan_with_pk(1, "t", "public", "t", &["id", "amount"], &["id"]);
         let tree = filter(binop(">", colref("amount"), lit("100")), child);
         let result = diff_filter(&mut ctx, &tree).unwrap();
         let _sql = ctx.build_with_query(&result.cte_name);

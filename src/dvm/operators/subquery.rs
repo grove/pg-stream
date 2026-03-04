@@ -107,7 +107,7 @@ mod tests {
     fn test_diff_subquery_preserves_dedup_flag() {
         let mut ctx = test_ctx();
         ctx.merge_safe_dedup = true;
-        let child = scan(1, "t", "public", "t", &["id"]);
+        let child = scan_with_pk(1, "t", "public", "t", &["id"], &["id"]);
         let tree = subquery("sq", vec!["x"], child);
         let result = diff_subquery(&mut ctx, &tree).unwrap();
         assert!(result.is_deduplicated);

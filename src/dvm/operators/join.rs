@@ -1,12 +1,28 @@
 //! Inner join differentiation.
 //!
-//! ΔI(Q ⋈C R) = (ΔQ ⋈C R₁) + (Q₀ ⋈C ΔR)
+//! ΔI(Q ⋈C R) = (ΔQ_I ⋈C R₁) + (ΔQ_D ⋈C R₀) + (Q₀ ⋈C ΔR)
 //!
 //! Where:
 //! - R₁ = current state of R (post-change, i.e. live table)
-//! - Q₀ = pre-change state of Q, reconstructed as
-//!   Q_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
-//! - ΔQ, ΔR = deltas (INSERT/DELETE) for each side
+//! - R₀ = pre-change state of R, reconstructed as
+//!   R_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
+//! - Q₀ = pre-change state of Q, reconstructed similarly
+//! - ΔQ_I, ΔQ_D = insert and delete deltas for the left side
+//! - ΔR = delta for the right side
+//!
+//! ## EC-01 fix: R₀ for DELETE deltas in Part 1
+//!
+//! The original formula `(ΔQ ⋈ R₁)` reads the right side AFTER all
+//! changes. When the old join partner on the right is deleted before
+//! the delta runs, the DELETE half finds no match and is silently
+//! dropped, leaving a stale row in the stream table.
+//!
+//! The fix splits Part 1 into:
+//! - **Part 1a**: ΔQ_inserts ⋈ R₁ (post-change right — new rows need current partners)
+//! - **Part 1b**: ΔQ_deletes ⋈ R₀ (pre-change right — old rows need old partners)
+//!
+//! R₀ is computed identically to Q₀: `R_current EXCEPT ALL ΔR_I UNION ALL ΔR_D`.
+//! The split is applied when `use_r0` is true (simple right children).
 //!
 //! Using Q₀ (pre-change) in Part 2 instead of Q₁ (post-change) avoids
 //! double-counting when both sides change simultaneously: Part 1 already
@@ -67,78 +83,11 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::{
-    build_base_table_key_exprs, build_snapshot_sql, is_simple_child, rewrite_join_condition,
+    build_base_table_key_exprs, build_snapshot_sql, is_join_child, is_simple_child,
+    join_scan_count, rewrite_join_condition, use_pre_change_snapshot,
 };
 use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
-
-/// Returns true if `op` is (or wraps) a join node, indicating a nested join
-/// child for which the EXCEPT ALL L₀ approach may interact badly with
-/// SemiJoin R_old (causing Q21-type regressions). Subquery/Aggregate
-/// children are **not** considered join children — they can safely use L₀.
-///
-/// Note: even for join children, L₀ is now used when the subtree does NOT
-/// contain SemiJoin/AntiJoin nodes (see `contains_semijoin`). This function
-/// is combined with `contains_semijoin` to decide L₀ vs L₁.
-fn is_join_child(op: &OpTree) -> bool {
-    match op {
-        OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. } => true,
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. } => is_join_child(child),
-        _ => false,
-    }
-}
-
-/// Returns true if the subtree rooted at `op` contains any SemiJoin or
-/// AntiJoin node.  Used to decide whether a nested join child can safely
-/// use L₀ via EXCEPT ALL: SemiJoin-containing subtrees must use L₁ to
-/// avoid the Q21 numwait regression (R_old interaction), while pure
-/// InnerJoin/LeftJoin chains can safely use L₀.
-fn contains_semijoin(op: &OpTree) -> bool {
-    match op {
-        OpTree::SemiJoin { .. } | OpTree::AntiJoin { .. } => true,
-        OpTree::InnerJoin { left, right, .. }
-        | OpTree::LeftJoin { left, right, .. }
-        | OpTree::FullJoin { left, right, .. } => {
-            contains_semijoin(left) || contains_semijoin(right)
-        }
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. }
-        | OpTree::Aggregate { child, .. }
-        | OpTree::Distinct { child, .. }
-        | OpTree::Window { child, .. }
-        | OpTree::LateralFunction { child, .. }
-        | OpTree::LateralSubquery { child, .. }
-        | OpTree::ScalarSubquery { child, .. } => contains_semijoin(child),
-        OpTree::UnionAll { children } => children.iter().any(contains_semijoin),
-        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
-            contains_semijoin(left) || contains_semijoin(right)
-        }
-        OpTree::RecursiveCte {
-            base, recursive, ..
-        } => contains_semijoin(base) || contains_semijoin(recursive),
-        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => false,
-    }
-}
-
-/// Count the number of Scan (base table) nodes in a join subtree.
-/// Used to limit L₀ via EXCEPT ALL to small subtrees (≤ 2 scans).
-/// Larger subtrees fall back to L₁ + Part 3 correction to avoid
-/// cascading CTE materialization that can exhaust temp_file_limit.
-fn join_scan_count(op: &OpTree) -> usize {
-    match op {
-        OpTree::Scan { .. } => 1,
-        OpTree::InnerJoin { left, right, .. }
-        | OpTree::LeftJoin { left, right, .. }
-        | OpTree::FullJoin { left, right, .. } => join_scan_count(left) + join_scan_count(right),
-        OpTree::Filter { child, .. }
-        | OpTree::Project { child, .. }
-        | OpTree::Subquery { child, .. } => join_scan_count(child),
-        _ => 0, // Non-join nodes (Aggregate, SemiJoin, etc.) — stop counting
-    }
-}
 
 /// Returns true if `op` is a join whose **both** children are simple (Scan)
 /// nodes.  Previously this gated Part 3 correction term generation — now
@@ -355,9 +304,7 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
     // Additionally, joins inside a SemiJoin/AntiJoin ancestor must use
     // L₁ to avoid Q21-type regressions where sub-join EXCEPT ALL
     // interacts with the SemiJoin's R_old computation.
-    let use_l0 = is_simple_child(left)
-        || !is_join_child(left)
-        || (!contains_semijoin(left) && !ctx.inside_semijoin && join_scan_count(left) <= 2);
+    let use_l0 = use_pre_change_snapshot(left, ctx.inside_semijoin);
 
     let left_part2_source = if use_l0 {
         // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
@@ -407,6 +354,69 @@ pub fn diff_inner_join(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult,
             &right_result.cte_name,
             JoinSide::Left,
         )
+    };
+
+    // ── EC-01: Pre-change snapshot for Part 1 (right side) ──────────
+    //
+    // Standard formula: ΔJ = (ΔL ⋈ R₁) + (L₀ ⋈ ΔR)
+    //
+    // Part 1 joins delta_left with the right side. When a left-side row's
+    // join key changes AND the old right partner is simultaneously
+    // deleted, the DELETE half of Part 1 finds no match in R₁ (current
+    // right) and the stale row is silently retained in the stream table.
+    //
+    // Fix: split Part 1 into two arms:
+    //   Part 1a: ΔL_inserts ⋈ R₁  (inserts need current right partners)
+    //   Part 1b: ΔL_deletes ⋈ R₀  (deletes need pre-change right partners)
+    //
+    // R₀ = R_current EXCEPT ALL ΔR_inserts UNION ALL ΔR_deletes
+    //
+    // The same child-type heuristics as use_l0 apply: Scan and simple
+    // children use R₀; SemiJoin-containing deep chains fall back to R₁.
+    let use_r0 = use_pre_change_snapshot(right, ctx.inside_semijoin);
+
+    let right_part1_source = if use_r0 {
+        // Scan, Subquery/Aggregate child, or non-SemiJoin join child:
+        // use R₀ via EXCEPT ALL for DELETE delta rows
+        let right_data_cols: String = right_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let right_alias = right.alias();
+        let right_pre_change = format!(
+            "(SELECT {right_data_cols} FROM {right_table} {ra} \
+             EXCEPT ALL \
+             SELECT {right_data_cols} FROM {delta_right} WHERE __pgt_action = 'I' \
+             UNION ALL \
+             SELECT {right_data_cols} FROM {delta_right} WHERE __pgt_action = 'D')",
+            ra = quote_ident(right_alias),
+            delta_right = right_result.cte_name,
+        );
+        // Apply semi-join filter to R₀ if equi-keys are available
+        // (filter R₀ by join keys that appear in delta_left)
+        if equi_keys.is_empty() {
+            right_pre_change
+        } else {
+            let filters: Vec<String> = equi_keys
+                .iter()
+                .map(|(left_key, right_key)| {
+                    format!(
+                        "{right_key} IN (SELECT DISTINCT {left_key} FROM {})",
+                        left_result.cte_name
+                    )
+                })
+                .collect();
+            format!(
+                "(SELECT * FROM {right_pre_change} __r0 WHERE {filters})",
+                filters = filters.join(" AND "),
+            )
+        }
+    } else {
+        // Nested/complex right child: fall back to R₁ (current right).
+        // Part 1 is NOT split in this case — kept as-is for safety.
+        right_table_filtered.clone()
     };
 
     let cte_name = ctx.next_cte_name("join");
@@ -473,8 +483,55 @@ JOIN {delta_right} dr ON {cond}",
         String::new()
     };
 
-    let sql = format!(
-        "\
+    // When use_r0 is true, R₀ via EXCEPT ALL references the right delta CTE
+    // multiple times (for the EXCEPT ALL sub-selects). Mark it NOT MATERIALIZED
+    // to prevent PostgreSQL from spilling temp files for CTE materialization.
+    if use_r0 {
+        ctx.mark_cte_not_materialized(&right_result.cte_name);
+    }
+
+    let sql = if use_r0 {
+        // ── EC-01: Split Part 1 into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀)
+        format!(
+            "\
+-- Part 1a: delta_left INSERTS JOIN current_right R₁ (semi-join filtered)
+SELECT {hash_part1} AS __pgt_row_id,
+       dl.__pgt_action,
+       {all_cols_part1}
+FROM {delta_left} dl
+JOIN {right_table_filtered} r ON {join_cond_part1}
+WHERE dl.__pgt_action = 'I'
+
+UNION ALL
+
+-- Part 1b: delta_left DELETES JOIN pre-change_right R₀ (EC-01 fix)
+-- R₀ = R_current EXCEPT ALL ΔR_inserts UNION ALL ΔR_deletes
+-- Ensures deleted left rows find their old right partner even when
+-- the right partner was simultaneously deleted.
+SELECT {hash_part1} AS __pgt_row_id,
+       dl.__pgt_action,
+       {all_cols_part1}
+FROM {delta_left} dl
+JOIN {right_part1_source} r ON {join_cond_part1}
+WHERE dl.__pgt_action = 'D'
+
+UNION ALL
+
+-- Part 2: pre-change_left JOIN delta_right
+-- For Scan children: L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
+-- For nested joins: L₁ = current snapshot (semi-join filtered, corrected below)
+SELECT {hash_part2} AS __pgt_row_id,
+       dr.__pgt_action,
+       {all_cols_part2}
+FROM {left_part2_source} l
+JOIN {delta_right} dr ON {join_cond_part2}{correction_sql}",
+            delta_left = left_result.cte_name,
+            delta_right = right_result.cte_name,
+        )
+    } else {
+        // Right child is complex — keep Part 1 unsplit (no regression).
+        format!(
+            "\
 -- Part 1: delta_left JOIN current_right (semi-join filtered)
 SELECT {hash_part1} AS __pgt_row_id,
        dl.__pgt_action,
@@ -492,9 +549,10 @@ SELECT {hash_part2} AS __pgt_row_id,
        {all_cols_part2}
 FROM {left_part2_source} l
 JOIN {delta_right} dr ON {join_cond_part2}{correction_sql}",
-        delta_left = left_result.cte_name,
-        delta_right = right_result.cte_name,
-    );
+            delta_left = left_result.cte_name,
+            delta_right = right_result.cte_name,
+        )
+    };
 
     ctx.add_cte(cte_name.clone(), sql);
 
@@ -702,10 +760,12 @@ mod tests {
         let result = diff_inner_join(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should have two parts (delta_left JOIN right, pre-change_left JOIN delta_right)
-        assert_sql_contains(&sql, "Part 1");
+        // EC-01: Part 1 is now split into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀)
+        assert_sql_contains(&sql, "Part 1a");
+        assert_sql_contains(&sql, "Part 1b");
         assert_sql_contains(&sql, "Part 2");
         assert_sql_contains(&sql, "pre-change_left");
+        assert_sql_contains(&sql, "pre-change_right R");
     }
 
     #[test]
@@ -719,9 +779,16 @@ mod tests {
         let sql = ctx.build_with_query(&result.cte_name);
 
         // Part 2 should use L₀ = L_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes
+        // Part 1b should use R₀ = R_current EXCEPT ALL ΔR_inserts UNION ALL ΔR_deletes
         assert_sql_contains(&sql, "EXCEPT ALL");
         assert_sql_contains(&sql, "__pgt_action = 'I'");
         assert_sql_contains(&sql, "__pgt_action = 'D'");
+        // Both L₀ and R₀ should be present (at least two EXCEPT ALL occurrences)
+        let except_count = sql.matches("EXCEPT ALL").count();
+        assert!(
+            except_count >= 2,
+            "expected ≥2 EXCEPT ALL (L₀ + R₀), got {except_count}\n{sql}"
+        );
     }
 
     #[test]
@@ -1118,5 +1185,124 @@ mod tests {
         // 3-scan left child → L₁ with Part 3 correction
         assert_sql_contains(&sql2, "Part 3");
         assert_sql_contains(&sql2, "Correction for nested join");
+    }
+
+    // ── EC-01: R₀ via EXCEPT ALL tests ──────────────────────────────
+
+    #[test]
+    fn test_ec01_simple_join_splits_part1() {
+        // Two simple Scan children → Part 1 split into 1a (inserts ⋈ R₁)
+        // and 1b (deletes ⋈ R₀ via EXCEPT ALL).
+        let left = scan(1, "orders", "public", "o", &["id", "cust_id"]);
+        let right = scan(2, "customers", "public", "c", &["id", "name"]);
+        let cond = eq_cond("o", "cust_id", "c", "id");
+        let tree = inner_join(cond, left, right);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Part 1a: inserts → R₁ (current right)
+        assert_sql_contains(&sql, "Part 1a");
+        assert_sql_contains(&sql, "INSERTS JOIN current_right R");
+
+        // Part 1b: deletes → R₀ (pre-change right via EXCEPT ALL)
+        assert_sql_contains(&sql, "Part 1b");
+        assert_sql_contains(&sql, "DELETES JOIN pre-change_right R");
+        assert_sql_contains(&sql, "EC-01 fix");
+
+        // Part 1a filters by action = 'I', Part 1b filters by action = 'D'
+        assert_sql_contains(&sql, "__pgt_action = 'I'");
+        assert_sql_contains(&sql, "__pgt_action = 'D'");
+    }
+
+    #[test]
+    fn test_ec01_r0_uses_except_all() {
+        // Verify R₀ is built via EXCEPT ALL from the right snapshot.
+        let left = scan(1, "a", "public", "a", &["id", "key"]);
+        let right = scan(2, "b", "public", "b", &["id", "val"]);
+        let cond = eq_cond("a", "key", "b", "id");
+        let tree = inner_join(cond, left, right);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should have at least 2 EXCEPT ALL occurrences: one for L₀, one for R₀.
+        let except_count = sql.matches("EXCEPT ALL").count();
+        assert!(
+            except_count >= 2,
+            "expected ≥2 EXCEPT ALL (L₀ + R₀), got {except_count}"
+        );
+
+        // R₀ references the right-side table ("b")
+        assert_sql_contains(&sql, "\"public\".\"b\"");
+    }
+
+    #[test]
+    fn test_ec01_nested_right_child_no_split() {
+        // When right child is a nested join with >2 scan nodes,
+        // use_r0 is false → Part 1 stays unsplit for the OUTER join.
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let right_inner = inner_join(eq_cond("b", "id", "c", "id"), b, c);
+        let d = scan(4, "d", "public", "d", &["id"]);
+        let right_deep = inner_join(eq_cond("b", "id", "d", "id"), right_inner, d);
+        // right has 3 scans → use_r0 = false (exceeds ≤2 threshold)
+        let tree = inner_join(eq_cond("a", "id", "b", "id"), a, right_deep);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // The outermost join CTE name is result.cte_name. Extract just
+        // that CTE's body to check the outer level's Part 1 is unsplit.
+        let outer_cte_marker = format!("{} AS", result.cte_name);
+        let outer_sql = sql.split(&outer_cte_marker).last().unwrap_or("");
+        // Outer join should have unsplit Part 1 (not 1a/1b)
+        assert_sql_not_contains(outer_sql, "Part 1a");
+        assert_sql_not_contains(outer_sql, "Part 1b");
+        assert_sql_contains(outer_sql, "Part 1:");
+    }
+
+    #[test]
+    fn test_ec01_nested_right_child_2_scans_uses_r0() {
+        // When right child is a nested join with ≤2 scan nodes and no
+        // SemiJoin, use_r0 is true → Part 1 is split.
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let right_join = inner_join(eq_cond("b", "id", "c", "id"), b, c);
+        let tree = inner_join(eq_cond("a", "id", "b", "id"), a, right_join);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Right has 2 scans → use_r0 = true → Part 1 split
+        assert_sql_contains(&sql, "Part 1a");
+        assert_sql_contains(&sql, "Part 1b");
+    }
+
+    #[test]
+    fn test_ec01_three_union_all_arms() {
+        // Simple 2-table join: Part 1a + Part 1b + Part 2 = 3 arms
+        let left = scan(1, "l", "public", "l", &["id"]);
+        let right = scan(2, "r", "public", "r", &["id"]);
+        let tree = inner_join(eq_cond("l", "id", "r", "id"), left, right);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // The join CTE should contain Part 1a, 1b, and Part 2 markers.
+        let outer_cte_marker = format!("{} AS", result.cte_name);
+        let outer_sql = sql.split(&outer_cte_marker).last().unwrap_or("");
+        let union_count = outer_sql.matches("UNION ALL").count();
+        assert!(
+            union_count >= 2,
+            "expected ≥2 UNION ALL (1a+1b+Part2), got {union_count}"
+        );
     }
 }

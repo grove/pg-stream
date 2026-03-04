@@ -40,6 +40,7 @@ others are fixable engineering gaps. This document:
 | **Impact** | Stale row remains in stream table until next full refresh |
 | **Current mitigation** | Adaptive FULL fallback (`pg_trickle.adaptive_full_threshold`) |
 | **Documented in** | FAQ § "Known edge cases"; SQL_REFERENCE § "Known Delta Computation Limitations" |
+| **Status** | ✅ **IMPLEMENTED** — Part 1 split (R₀ via EXCEPT ALL) in `diff_inner_join`, `diff_left_join`, `diff_full_join` |
 
 **Root cause:** The delta query reads `current_right` after all changes are
 applied. When the old join partner is deleted before the delta runs, the
@@ -127,12 +128,31 @@ default 64) so power users can raise it when they accept the memory cost.
 | **Current mitigation** | Keep window functions as top-level SELECT columns |
 | **Documented in** | FAQ § "Window Functions" |
 
-**Proposed fix:** Automatically rewrite `CASE WHEN ROW_NUMBER() OVER (…) = 1
-THEN …` into a CTE that projects the window as a standalone column, then
-wrap the CASE expression in the outer query. This is a parser-level
-transformation in `src/dvm/parser.rs`. Complex cases (nested window calls
-inside arithmetic) may remain unsupported, but the most common pattern
-(CASE/IF around a single window) covers ~80% of user demand.
+**Chosen fix: nested-subquery lift (see PLAN_TRANSACTIONAL_IVM_PART_2.md Task 1.3):**
+
+Add a new auto-rewrite pass (`rewrite_nested_window_exprs`) that lifts
+window functions out of expressions into a synthetic column in an inner
+subquery, then applies the outer expression against that column:
+
+```sql
+-- Before (rejected):
+SELECT id, ABS(ROW_NUMBER() OVER (ORDER BY score) - 5) AS adjusted_rank
+FROM players
+
+-- After rewrite (supported):
+SELECT id, ABS(__pgt_wf_1 - 5) AS adjusted_rank
+FROM (
+    SELECT id, score,
+           ROW_NUMBER() OVER (ORDER BY score) AS __pgt_wf_1
+    FROM players
+) __pgt_wf_inner
+```
+
+The subquery approach is preferred over the earlier CTE approach because a
+`WITH` clause produces a `WithQuery` node in the OpTree, requiring the DVM
+engine to handle CTEs wrapping window functions — an untested path. The
+subquery produces a nested `Scan → Window → Project` chain that the existing
+DVM path already handles correctly.
 
 ---
 
@@ -187,21 +207,45 @@ recursion should use FULL mode.
 | **Impact** | Phantom or missed deletes in stream table |
 | **Current mitigation** | Add a primary key; add a synthetic unique column; or use FULL mode |
 | **Documented in** | FAQ § "Keyless Tables"; SQL_REFERENCE § "Row Identity" |
+| **Status** | ✅ **IMPLEMENTED** — Full EC-06 fix: catalog `has_keyless_source` flag, non-unique index for keyless sources, net-counting delta SQL in scan.rs (decompose changes into atomic +1/-1 per content hash, expand via `generate_series`), counted DELETE (ROW_NUMBER matching) in refresh.rs and ivm.rs, plain INSERT (no ON CONFLICT) for keyless sources. WARNING at creation time also implemented. |
 
-**Proposed fix:**
+**Implementation (completed):**
 
-1. **Short term (P0):** Emit a `WARNING` at `create_stream_table()` time
-   when any source table lacks a primary key AND the defining query does not
-   contain `DISTINCT`. The warning should link to the FAQ entry.
-2. **Medium term:** Implement a **count-based hash** — instead of a single
-   xxHash per row, track `(row_hash, count)` tuples. When a duplicate is
-   inserted, increment the count; when deleted, decrement. This fixes the
-   "delete one of N identical rows removes all N" problem at the cost of a
-   small counter column in the change buffer.
-3. **Long term:** Evaluate `ctid`-based row identity for keyless tables.
-   `ctid` is stable within a transaction but changes after VACUUM FULL.
-   Feasible only for trigger-mode CDC where the trigger captures `ctid`
-   at write time.
+1. ~~**Short term (P0):** Emit a `WARNING` at `create_stream_table()` time~~ ✅ Done
+2. **Full fix (P0):** ✅ Implemented via net-counting approach:
+   - **Catalog:** Added `has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE`
+     to `pgtrickle.pgt_stream_tables` (set at creation time).
+   - **Index:** Non-unique `CREATE INDEX` for keyless sources (instead of
+     `CREATE UNIQUE INDEX`), allowing duplicate `__pgt_row_id` values.
+   - **Delta SQL (scan.rs):** For keyless tables, decomposes all change
+     events into atomic `+1` (INSERT) / `-1` (DELETE) operations per
+     content hash. UPDATEs are split into their DELETE-old + INSERT-new
+     components. Net counts are computed via `GROUP BY content_hash` +
+     `SUM(delta_sign)`, then expanded to the correct number of D/I rows
+     using `generate_series`.
+   - **Apply (refresh.rs):** For keyless sources, forces explicit DML path
+     (cannot use MERGE with non-unique row_ids). Counted DELETE uses
+     `ROW_NUMBER` matching to pair delta deletes 1:1 with stream table
+     rows. Plain INSERT without NOT EXISTS / ON CONFLICT.
+   - **Apply (ivm.rs):** Same counted DELETE + plain INSERT for IMMEDIATE mode.
+   - **Upgrade SQL:** `ALTER TABLE ... ADD COLUMN IF NOT EXISTS has_keyless_source`
+
+**Bug fixes (post-implementation):**
+
+- **Guard trigger DELETE cancel:** The DML guard trigger (EC-26) used
+  `RETURN NEW` which is NULL for DELETE operations, silently cancelling
+  managed-refresh DELETEs on the stream table. Fixed to use
+  `IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;`.
+- **Keyless aggregate UPDATE no-op:** The keyless UPDATE template was a
+  no-op (`SELECT 1 WHERE false`), which is correct for keyless scans but
+  wrong for aggregate queries on keyless sources (where `'I'`-action rows
+  update existing groups). Fixed to use the normal UPDATE template, which
+  naturally matches 0 rows for scan-level keyless deltas.
+
+**Test coverage:** 7 E2E tests (`e2e_keyless_duplicate_tests.rs`) — all
+passing. Covers: duplicate rows basic, delete-one-of-duplicates,
+update-one-of-duplicates, unique content multi-cycle DML, delete-all-
+then-reinsert, mixed DML stress, aggregate with duplicates.
 
 ---
 
@@ -253,12 +297,21 @@ affected rows.
 | **Current mitigation** | Use DIFFERENTIAL mode |
 | **Documented in** | FAQ § "What SQL features are NOT supported in IMMEDIATE mode?" |
 
-**Proposed fix:** The main gap is recursive CTEs. TopK fundamentally
-requires scheduled recomputation. Materialised view sources require event
-trigger support that PostgreSQL does not provide for mat-view refreshes.
-**No code fix for recursive CTEs / TopK.** For mat-view sources, consider
-a polling-change-detection wrapper (same approach as EC-05 for foreign
-tables).
+**Proposed fix (recursive CTEs + TopK): deferred to PLAN_TRANSACTIONAL_IVM_PART_2.md Phase 5.**
+
+Implementation plans for both constructs now exist in Part 2:
+
+- **Recursive CTEs (G10 / Task 5.1):** Validate that the existing semi-naive
+  evaluation works correctly with `DeltaSource::TransitionTable`; remove the
+  `RecursiveCte` rejection from `check_immediate_support()` once validated.
+  A `max_stack_depth` guard is added before fixpoint iteration.
+- **TopK (G11 / Task 5.2):** Implement statement-level micro-refresh: compute
+  the new top K, diff against current stream table contents, apply
+  DELETE + INSERT. Guarded by a `pg_trickle.ivm_topk_max_limit` GUC
+  (default 1000) to prevent inline recomputation latency spikes for large K.
+
+For materialised view sources: use a polling-change-detection wrapper (same
+approach as EC-05 for foreign tables). No code fix proposed for this case.
 
 ---
 
@@ -288,6 +341,11 @@ the right answer when back-pressure is needed.
 | **Impact** | Perpetual latency spiral; cascading DAG chains fall behind |
 | **Current mitigation** | Widen the interval; use IMMEDIATE mode; or split the DAG |
 | **Documented in** | FAQ § "Performance and Tuning" |
+| **Status** | ✅ **IMPLEMENTED** — `scheduler_falling_behind` NOTIFY alert at 80% threshold |
+
+**Test coverage:** `SchedulerFallingBehind` variant covered in
+`test_alert_event_as_str` and `test_alert_event_all_variants_unique`
+(monitor.rs unit tests).
 
 **Chosen fix: `scheduler_falling_behind` NOTIFY alert (short term):**
 
@@ -329,6 +387,7 @@ call. Low priority — manual `refresh_stream_table()` already covers this.
 | **Impact** | Fan-in node reads inconsistent upstream versions |
 | **Current mitigation** | `diamond_consistency = 'atomic'` |
 | **Documented in** | FAQ § "Diamond Dependencies"; SQL_REFERENCE |
+| **Status** | ✅ **IMPLEMENTED** — default changed from `'none'` to `'atomic'` |
 
 **Proposed fix:** The `atomic` mode already fixes this. Remaining work:
 
@@ -365,12 +424,18 @@ can investigate. **No urgency** — the automatic retry handles recovery.
 | **Impact** | Refresh fails; stream table marked `needs_reinit` |
 | **Current mitigation** | Use explicit column lists in defining queries |
 | **Documented in** | FAQ § "Schema Changes" |
+| **Status** | ✅ **IMPLEMENTED** — WARNING at creation time for `SELECT *` |
+
+**Test coverage:** 10 unit tests for `detect_select_star()` pure function
+(api.rs): bare `*`, table-qualified `t.*`, explicit columns, `count(*)`,
+`sum(*)`, mixed agg+bare star, no asterisk, subquery star, case
+insensitivity, no-FROM clause.
 
 **Proposed fix:**
 
-1. **Short term (P1):** Emit a `WARNING` at `create_stream_table()` time
-   when the defining query contains `SELECT *`. Suggest using explicit
-   column lists.
+1. **Short term (P1):** ✅ Done — Emits `WARNING` at `create_stream_table()`
+   time when the defining query contains `SELECT *`. Detection logic
+   extracted to pure `detect_select_star()` function for unit testability.
 2. **Medium term:** When `needs_reinit` is triggered by a column-count
    mismatch, attempt an automatic reinitialisation: re-parse the query,
    verify the new column set is compatible, and refresh. If compatible,
@@ -426,6 +491,7 @@ documentation to clarify this is a theoretical edge case.
 | **Impact** | User thinks WAL CDC is active; actually stuck on triggers forever |
 | **Current mitigation** | Default is `TRIGGER` mode; `auto` must be explicitly set |
 | **Documented in** | FAQ § "CDC Architecture" |
+| **Status** | ✅ **IMPLEMENTED** — rate-limited LOG every ~60 scheduler ticks |
 
 **Proposed fix:**
 
@@ -447,6 +513,7 @@ documentation to clarify this is a theoretical edge case.
 | **Impact** | Silent data loss for UPDATEs/DELETEs on keyless tables in WAL mode |
 | **Current mitigation** | Set `REPLICA IDENTITY FULL` before switching to WAL CDC |
 | **Documented in** | FAQ § "CDC Architecture" |
+| **Status** | ✅ **IMPLEMENTED** — `setup_cdc_for_source()` rejects at creation time |
 
 **Proposed fix:**
 
@@ -550,12 +617,19 @@ is acceptable. **No further code fix needed.**
 | **Impact** | Frontier / buffer desync; future refreshes produce incorrect deltas |
 | **Current mitigation** | Use `refresh_stream_table()` to reset |
 | **Documented in** | SQL_REFERENCE § "What Is NOT Allowed" |
+| **Status** | ✅ **IMPLEMENTED** — BEFORE TRUNCATE guard trigger blocks direct TRUNCATE |
+
+**Test coverage:** `test_guard_trigger_blocks_truncate` E2E test
+(`e2e_guard_trigger_tests.rs`).
 
 **Proposed fix:**
 
-1. **Short term (P1):** Add an event trigger that intercepts `TRUNCATE` on
-   any table in the `pgtrickle` schema and raises an ERROR with a message
-   suggesting `refresh_stream_table()` instead.
+1. **Short term (P1):** ✅ Done — BEFORE TRUNCATE trigger installed on
+   storage tables at creation time. Checks `pg_trickle.internal_refresh`
+   session variable to allow managed refreshes. The `internal_refresh`
+   flag is set in all refresh code paths: `execute_manual_refresh`,
+   `execute_manual_full_refresh`, `execute_full_refresh`,
+   `execute_topk_refresh`, and `pgt_ivm_handle_truncate`.
 2. **Medium term:** Instead of blocking, intercept TRUNCATE and
    automatically perform a full refresh (same approach as IMMEDIATE mode
    TRUNCATE handling). This is friendlier but may surprise users who expect
@@ -572,13 +646,20 @@ is acceptable. **No further code fix needed.**
 | **Impact** | Data overwritten or duplicated on next refresh |
 | **Current mitigation** | Documentation; never write directly |
 | **Documented in** | SQL_REFERENCE § "What Is NOT Allowed" |
+| **Status** | ✅ **IMPLEMENTED** — BEFORE INSERT/UPDATE/DELETE guard trigger on storage table |
+
+**Test coverage:** 4 E2E tests (`e2e_guard_trigger_tests.rs`) —
+`test_guard_trigger_blocks_direct_insert`, `_update`, `_delete` +
+`test_guard_trigger_allows_managed_refresh`.
 
 **Proposed fix:**
 
-1. **Short term (P1):** Add a statement-level trigger on stream tables that
-   raises an ERROR for any INSERT/UPDATE/DELETE not originating from the
-   refresh engine (check for a session variable or advisory lock flag set by
-   the refresh transaction). This prevents accidental writes.
+1. **Short term (P1):** ✅ Done — Row-level BEFORE trigger installed on
+   storage tables at creation time. Uses `pg_trickle.internal_refresh`
+   session variable (checked via `current_setting(..., true)`) to allow
+   managed refreshes. Returns OLD for DELETE operations (returning NEW
+   would be NULL, silently cancelling the DELETE). The `internal_refresh`
+   flag is set across all refresh code paths.
 2. **Medium term:** Use a PostgreSQL row-level security policy or a
    `pg_trickle.allow_direct_dml` session variable as an escape hatch for
    power users.
@@ -695,14 +776,29 @@ differentiation path without a new delta template.
 | **Current mitigation** | Use FULL mode; or pre-aggregate in DIFFERENTIAL and compute in a view |
 | **Documented in** | FAQ § "Unsupported Aggregates" |
 
-**Chosen fix: auxiliary accumulator columns (long term):**
+**Chosen fix: group-rescan (see PLAN_TRANSACTIONAL_IVM_PART_2.md Task 4.1):**
 
-Add `CORR`/`COVAR_POP`/`COVAR_SAMP`/`REGR_*` support by maintaining
-auxiliary accumulator columns (`sum_x`, `sum_y`, `sum_xy`, `sum_x2`,
-`count`) in the stream table and generating SQL delta templates that update
-them incrementally. The algebra follows Welford's online algorithm adapted
-to SQL set differences. Accepted as a long-term deliverable; FULL mode
-and the pre-aggregate workaround remain the supported path until then.
+Implement `CORR`/`COVAR_POP`/`COVAR_SAMP`/`REGR_*` using the proven
+group-rescan strategy already used for `BOOL_AND`, `STRING_AGG`, etc.:
+
+1. Detect affected groups from the delta (groups where any row was
+   inserted, updated, or deleted).
+2. For each affected group, re-aggregate from source:
+   `SELECT group_key, CORR(y, x) FROM source GROUP BY group_key`
+3. Apply the result as an UPDATE to the stream table.
+
+This requires no stream table schema changes and no new OpTree variants.
+
+**Deferred — Welford auxiliary accumulator columns:**
+
+The earlier proposal of maintaining `sum_x`, `sum_y`, `sum_xy`, `sum_x2`,
+`count` accumulator columns in the stream table using Welford's online
+algorithm adapted to SQL EXCEPT/UNION was explored but is deferred.
+Rationale: it requires a breaking schema change to existing stream tables,
+the SQL delta-algebra correctness of the Welford adaptation is non-trivial
+to verify, and group-rescan is already correct and benchmarked for
+analogue aggregates. Revisit for v2.0 if group-rescan performance is
+insufficient for very large groups.
 
 ---
 
@@ -715,6 +811,7 @@ and the pre-aggregate workaround remain the supported path until then.
 | **Impact** | CDC stuck; slot-missing error after restore |
 | **Current mitigation** | Set `cdc_mode = 'trigger'` after restore; let auto recreate slots |
 | **Documented in** | FAQ § "Operations" |
+| **Status** | ✅ **IMPLEMENTED** — auto-detect missing slot in health check; fall back to TRIGGER |
 
 **Proposed fix:**
 

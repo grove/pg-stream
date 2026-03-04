@@ -890,6 +890,90 @@ fn collect_aliased_keys(
     }
 }
 
+/// Returns true if `op` is (or wraps) a join node, indicating a nested join
+/// child for which the EXCEPT ALL approach may interact badly with
+/// SemiJoin R_old (causing Q21-type regressions). Subquery/Aggregate
+/// children are **not** considered join children — they can safely use the
+/// pre-change snapshot.
+///
+/// Combined with [`contains_semijoin`] to decide whether to use the
+/// pre-change snapshot (L₀/R₀) vs post-change (L₁/R₁).
+pub fn is_join_child(op: &OpTree) -> bool {
+    match op {
+        OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. } => true,
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => is_join_child(child),
+        _ => false,
+    }
+}
+
+/// Returns true if the subtree rooted at `op` contains any SemiJoin or
+/// AntiJoin node.  Used to decide whether a nested join child can safely
+/// use the pre-change snapshot via EXCEPT ALL: SemiJoin-containing
+/// subtrees must use the post-change snapshot to avoid the Q21 numwait
+/// regression (R_old interaction), while pure InnerJoin/LeftJoin chains
+/// can safely use the pre-change snapshot.
+pub fn contains_semijoin(op: &OpTree) -> bool {
+    match op {
+        OpTree::SemiJoin { .. } | OpTree::AntiJoin { .. } => true,
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            contains_semijoin(left) || contains_semijoin(right)
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. }
+        | OpTree::Aggregate { child, .. }
+        | OpTree::Distinct { child, .. }
+        | OpTree::Window { child, .. }
+        | OpTree::LateralFunction { child, .. }
+        | OpTree::LateralSubquery { child, .. }
+        | OpTree::ScalarSubquery { child, .. } => contains_semijoin(child),
+        OpTree::UnionAll { children } => children.iter().any(contains_semijoin),
+        OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+            contains_semijoin(left) || contains_semijoin(right)
+        }
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => contains_semijoin(base) || contains_semijoin(recursive),
+        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => false,
+    }
+}
+
+/// Count the number of Scan (base table) nodes in a join subtree.
+/// Used to limit pre-change snapshot via EXCEPT ALL to small subtrees
+/// (≤ 2 scans).  Larger subtrees fall back to the post-change snapshot
+/// with a correction term to avoid cascading CTE materialization that
+/// can exhaust `temp_file_limit`.
+pub fn join_scan_count(op: &OpTree) -> usize {
+    match op {
+        OpTree::Scan { .. } => 1,
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => join_scan_count(left) + join_scan_count(right),
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Subquery { child, .. } => join_scan_count(child),
+        _ => 0, // Non-join nodes (Aggregate, SemiJoin, etc.) — stop counting
+    }
+}
+
+/// Returns true when the pre-change snapshot (via EXCEPT ALL) should be
+/// used for the given child node.  This is safe when:
+/// - The child is a simple Scan (cheap EXCEPT ALL)
+/// - The child is NOT a join (Subquery/Aggregate — safe for EXCEPT ALL)
+/// - The child is a join without SemiJoin/AntiJoin and ≤ 2 scan nodes
+///
+/// When false, the post-change snapshot should be used (possibly with a
+/// correction term for shallow join children).
+pub fn use_pre_change_snapshot(child: &OpTree, inside_semijoin: bool) -> bool {
+    is_simple_child(child)
+        || !is_join_child(child)
+        || (!contains_semijoin(child) && !inside_semijoin && join_scan_count(child) <= 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
