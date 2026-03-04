@@ -10,6 +10,7 @@
 - [SQL Reference](SQL_REFERENCE.md)
 - [Configuration](CONFIGURATION.md)
 - [Installation](installation.md)
+- [Upgrading](UPGRADING.md)
 
 ---
 

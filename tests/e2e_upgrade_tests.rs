@@ -1,11 +1,16 @@
 //! E2E tests for extension upgrade/migration safety (Category L).
 //!
-//! Validates that extension lifecycle operations (DROP + CREATE, schema
-//! verification) don't break existing data or leave orphaned objects.
+//! Two groups of tests:
 //!
-//! True version-to-version upgrade tests require two Docker images (old
-//! version and new version). These tests cover the foundational upgrade
-//! safety properties using the current single version.
+//! **L1–L7 (schema stability):** Run against the standard E2E image. Verify
+//! catalog schema, indexes, event triggers, and views are correct. These
+//! run on every E2E test invocation.
+//!
+//! **L8–L13 (true upgrade path):** Run against the upgrade E2E image
+//! (`pg_trickle_upgrade_e2e:latest`). Install old version, populate data,
+//! run `ALTER EXTENSION UPDATE`, and verify everything still works.
+//! Requires: `./tests/build_e2e_upgrade_image.sh` (or `just build-upgrade-image`).
+//! Set `PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest` to run these.
 //!
 //! See `plans/sql/PLAN_UPGRADE_MIGRATIONS.md` for the full upgrade strategy.
 //!
@@ -291,4 +296,321 @@ async fn test_upgrade_monitoring_views_present() {
             .await;
         assert_eq!(count, 0, "View {view} should be empty but queryable");
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L8–L13 — True version-to-version upgrade tests
+// ══════════════════════════════════════════════════════════════════════
+//
+// These tests require the upgrade E2E image:
+//   PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest
+//
+// They are #[ignore]d by default because the upgrade image must be built
+// separately. Run with:
+//   just test-upgrade 0.1.3 0.2.0
+// which builds the image and sets the env var automatically.
+
+/// Helper: returns true if the upgrade E2E image is available.
+/// Used to skip tests gracefully when image isn't built.
+fn upgrade_image_available() -> bool {
+    matches!(std::env::var("PGS_UPGRADE_FROM"), Ok(v) if !v.is_empty())
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L8 — All new functions exist after ALTER EXTENSION UPDATE
+// ══════════════════════════════════════════════════════════════════════
+
+/// Install from old version, run ALTER EXTENSION UPDATE, verify all
+/// new functions are callable.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_0_1_3_to_0_2_0_new_functions_exist() {
+    if !upgrade_image_available() {
+        eprintln!("SKIP: PGS_UPGRADE_FROM not set (need upgrade E2E image)");
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+
+    // Start container WITHOUT auto-extension, install old version manually
+    let db = E2eDb::new().await;
+
+    // Install old version
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+
+    // Verify old version is installed
+    let installed_version: String = db
+        .query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'")
+        .await;
+    assert_eq!(installed_version, from_version);
+
+    // Run the upgrade
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    // Verify new version
+    let new_version: String = db
+        .query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'")
+        .await;
+    assert_eq!(new_version, to_version);
+
+    // All new functions in 0.2.0 must be callable
+    let new_functions = vec![
+        "SELECT * FROM pgtrickle.change_buffer_sizes()",
+        "SELECT * FROM pgtrickle.health_check()",
+        "SELECT * FROM pgtrickle.dependency_tree()",
+        "SELECT * FROM pgtrickle.trigger_inventory()",
+        "SELECT * FROM pgtrickle.refresh_timeline(50)",
+        "SELECT pgtrickle.version()",
+        "SELECT * FROM pgtrickle.diamond_groups()",
+    ];
+
+    for func_call in &new_functions {
+        let result = sqlx::query(func_call).fetch_all(&db.pool).await;
+        assert!(
+            result.is_ok(),
+            "Function call failed after upgrade: {func_call}: {:?}",
+            result.err()
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L9 — Existing stream tables survive upgrade and refresh
+// ══════════════════════════════════════════════════════════════════════
+
+/// Install old version, create stream tables with data, upgrade, verify
+/// stream tables still exist and can be refreshed.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_0_1_3_to_0_2_0_stream_tables_survive() {
+    if !upgrade_image_available() {
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+
+    let db = E2eDb::new().await;
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+
+    // Create source table and stream table under old version
+    db.execute("CREATE TABLE upgrade_src (id INT PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute("INSERT INTO upgrade_src VALUES (1, 'alice'), (2, 'bob')")
+        .await;
+    db.create_st(
+        "upgrade_st",
+        "SELECT id, name FROM upgrade_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+    assert_eq!(db.count("public.upgrade_st").await, 2);
+
+    // Upgrade
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    // Stream table must still exist with data
+    assert_eq!(db.count("public.upgrade_st").await, 2);
+
+    // Insert more data and refresh — must still work after upgrade
+    db.execute("INSERT INTO upgrade_src VALUES (3, 'carol')")
+        .await;
+    db.refresh_st("upgrade_st").await;
+    assert_eq!(db.count("public.upgrade_st").await, 3);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L10 — Views queryable after upgrade
+// ══════════════════════════════════════════════════════════════════════
+
+/// Verify all monitoring views are queryable after ALTER EXTENSION UPDATE.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_0_1_3_to_0_2_0_views_queryable() {
+    if !upgrade_image_available() {
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+
+    let db = E2eDb::new().await;
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+
+    // Upgrade
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    // All views must be queryable
+    let views = vec![
+        "pgtrickle.stream_tables_info",
+        "pgtrickle.pg_stat_stream_tables",
+    ];
+    for view in &views {
+        let result = sqlx::query(&format!("SELECT count(*) FROM {view}"))
+            .fetch_one(&db.pool)
+            .await;
+        assert!(
+            result.is_ok(),
+            "View {view} not queryable after upgrade: {:?}",
+            result.err()
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L11 — Event triggers functional after upgrade
+// ══════════════════════════════════════════════════════════════════════
+
+/// Verify event triggers are present after ALTER EXTENSION UPDATE.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_0_1_3_to_0_2_0_event_triggers_present() {
+    if !upgrade_image_available() {
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+
+    let db = E2eDb::new().await;
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+
+    // Upgrade
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    let triggers = vec!["pg_trickle_ddl_tracker", "pg_trickle_drop_tracker"];
+    for trigger_name in &triggers {
+        let exists: bool = db
+            .query_scalar(&format!(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM pg_event_trigger \
+                    WHERE evtname = '{trigger_name}' \
+                )"
+            ))
+            .await;
+        assert!(
+            exists,
+            "Event trigger '{trigger_name}' missing after upgrade"
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L12 — Version function reports new version after upgrade
+// ══════════════════════════════════════════════════════════════════════
+
+/// Verify pgtrickle.version() matches the new version after upgrade.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_0_1_3_to_0_2_0_version_consistency() {
+    if !upgrade_image_available() {
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+
+    let db = E2eDb::new().await;
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+
+    // Upgrade
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    // pg_extension version must match
+    let ext_version: String = db
+        .query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'")
+        .await;
+    assert_eq!(ext_version, to_version);
+
+    // pgtrickle.version() must match
+    let fn_version: String = db.query_scalar("SELECT pgtrickle.version()").await;
+    assert_eq!(fn_version, to_version);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L13 — Function count matches fresh install after upgrade
+// ══════════════════════════════════════════════════════════════════════
+
+/// After upgrading, the number of pgtrickle.* functions should match
+/// a fresh CREATE EXTENSION install. This catches functions that are
+/// in the full install SQL but missing from the upgrade script.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_0_1_3_to_0_2_0_function_parity_with_fresh_install() {
+    if !upgrade_image_available() {
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.0".into());
+
+    let db = E2eDb::new().await;
+
+    // Install old version then upgrade
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    // Count functions after upgrade
+    let upgraded_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_proc p \
+             JOIN pg_namespace n ON p.pronamespace = n.oid \
+             WHERE n.nspname = 'pgtrickle'",
+        )
+        .await;
+
+    // Now do a fresh install in the same DB for comparison:
+    // Drop and recreate to get fresh install counts
+    db.execute("DROP EXTENSION pg_trickle CASCADE").await;
+    db.execute("CREATE EXTENSION pg_trickle CASCADE").await;
+
+    let fresh_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_proc p \
+             JOIN pg_namespace n ON p.pronamespace = n.oid \
+             WHERE n.nspname = 'pgtrickle'",
+        )
+        .await;
+
+    assert_eq!(
+        upgraded_count,
+        fresh_count,
+        "Upgraded install has {} functions but fresh install has {} — \
+         the upgrade script is missing {} function(s)",
+        upgraded_count,
+        fresh_count,
+        fresh_count - upgraded_count
+    );
 }
