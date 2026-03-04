@@ -1922,6 +1922,7 @@ mod tests {
             frontier: None,
             topk_limit: None,
             topk_order_by: None,
+            topk_offset: None,
             diamond_consistency: crate::dag::DiamondConsistency::None,
             diamond_schedule_policy: crate::dag::DiamondSchedulePolicy::default(),
         }
