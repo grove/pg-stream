@@ -162,7 +162,7 @@ jobs:
           ls -lh "${ARCHIVE_NAME}.tar.gz"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-${{ matrix.artifact_suffix }}
           path: dist/*.${{ matrix.archive_ext }}
@@ -198,7 +198,7 @@ jobs:
           ls -lh pg_trickle_e2e.tar.gz
 
       - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docker-image
           path: pg_trickle_e2e.tar.gz
