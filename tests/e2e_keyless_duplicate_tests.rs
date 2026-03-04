@@ -1,8 +1,9 @@
-//! E2E tests for keyless / duplicate-row table differential correctness (F48: G10.1).
+//! E2E tests for keyless / duplicate-row table differential correctness (EC-06).
 //!
-//! Validates that tables without primary keys (relying on __pgt_row_id)
-//! handle duplicate rows correctly under differential refresh:
-//! identical rows, delete-one-of-duplicates, update-one-of-duplicates.
+//! Validates that tables without primary keys (using net-counting delta
+//! via `has_keyless_source`) handle duplicate rows correctly under
+//! differential refresh: identical rows, delete-one-of-duplicates,
+//! update-one-of-duplicates, mixed DML stress.
 //!
 //! Prerequisites: `./tests/build_e2e_image.sh`
 
@@ -15,7 +16,6 @@ use e2e::E2eDb;
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: identical rows in keyless tables produce hash collisions on __pgt_row_id (ROADMAP)"]
 async fn test_keyless_duplicate_rows_basic() {
     let db = E2eDb::new().await.with_extension().await;
     // Keyless: no PRIMARY KEY — pgtrickle uses ctid-based row identity
@@ -39,7 +39,6 @@ async fn test_keyless_duplicate_rows_basic() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: identical rows in keyless tables produce hash collisions on __pgt_row_id (ROADMAP)"]
 async fn test_keyless_delete_one_duplicate() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_del (val INT, label TEXT)")
@@ -67,7 +66,6 @@ async fn test_keyless_delete_one_duplicate() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: identical rows in keyless tables produce hash collisions on __pgt_row_id (ROADMAP)"]
 async fn test_keyless_update_one_duplicate() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_upd (val INT, label TEXT)")
@@ -154,7 +152,6 @@ async fn test_keyless_unique_content() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: identical rows in keyless tables produce hash collisions on __pgt_row_id (ROADMAP)"]
 async fn test_keyless_delete_all_then_reinsert() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_cycle (val INT)").await;
@@ -181,7 +178,6 @@ async fn test_keyless_delete_all_then_reinsert() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: identical rows in keyless tables produce hash collisions on __pgt_row_id (ROADMAP)"]
 async fn test_keyless_mixed_dml_stress() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_stress (cat TEXT, val INT)")

@@ -737,6 +737,11 @@ fn pgt_ivm_handle_truncate(pgt_id: i64) -> Result<(), PgTrickleError> {
         PgTrickleError::NotFound(format!("Stream table with pgt_id={pgt_id} not found"))
     })?;
 
+    // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
+    // allow the IVM executor to modify the storage table.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     // For TRUNCATE, we do a full refresh: truncate the ST and re-populate.
     let st_qualified = format!(
         "\"{}\".\"{}\"",

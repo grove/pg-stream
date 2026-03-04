@@ -1778,6 +1778,10 @@ mod tests {
         );
         assert_eq!(AlertEvent::RefreshCompleted.as_str(), "refresh_completed");
         assert_eq!(AlertEvent::RefreshFailed.as_str(), "refresh_failed");
+        assert_eq!(
+            AlertEvent::SchedulerFallingBehind.as_str(),
+            "scheduler_falling_behind"
+        );
     }
 
     #[test]
@@ -1796,6 +1800,7 @@ mod tests {
             AlertEvent::BufferGrowthWarning,
             AlertEvent::RefreshCompleted,
             AlertEvent::RefreshFailed,
+            AlertEvent::SchedulerFallingBehind,
         ];
         // All as_str() values should be distinct
         let strs: Vec<&str> = variants.iter().map(|v| v.as_str()).collect();

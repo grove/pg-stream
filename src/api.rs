@@ -1045,6 +1045,13 @@ fn execute_manual_full_refresh(
     table_name: &str,
     source_oids: &[pg_sys::Oid],
 ) -> Result<(), PgTrickleError> {
+    // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
+    // triggers allow the refresh executor to modify the storage table.
+    // This is needed when called directly (e.g., from alter_stream_table)
+    // without going through execute_manual_refresh.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     let quoted_table = format!(
         "{}.{}",
         quote_identifier(schema),
@@ -1407,6 +1414,11 @@ fn install_dml_guard_trigger(schema: &str, table_name: &str) -> Result<(), PgTri
     );
 
     // Create the guard trigger function
+    //
+    // IMPORTANT: For DELETE operations, NEW is NULL in PostgreSQL trigger
+    // functions. A BEFORE trigger returning NULL silently cancels the
+    // operation. We must return OLD for DELETE and NEW for INSERT/UPDATE
+    // to allow the managed refresh executor to proceed.
     let create_func_sql = format!(
         "CREATE OR REPLACE FUNCTION {}() RETURNS trigger \
          LANGUAGE plpgsql AS $$ \
@@ -1415,7 +1427,7 @@ fn install_dml_guard_trigger(schema: &str, table_name: &str) -> Result<(), PgTri
              RAISE EXCEPTION 'Direct DML on stream table % is not allowed. \
              Stream tables are maintained automatically by pg_trickle.', TG_TABLE_NAME; \
            END IF; \
-           RETURN NEW; \
+           IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF; \
          END; $$",
         trigger_func_name,
     );
@@ -2113,18 +2125,29 @@ fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String)]) {
 /// for `SELECT ... * ...` patterns that are not inside a subquery or aggregate
 /// (e.g., `count(*)` is allowed).
 fn warn_select_star(query: &str) {
+    if detect_select_star(query) {
+        pgrx::warning!(
+            "pg_trickle: defining query uses SELECT *. If source table columns \
+             are added or removed, the stream table will require reinitialization. \
+             Consider listing columns explicitly for resilience against schema \
+             changes."
+        );
+    }
+}
+
+/// Pure detection logic for `SELECT *` patterns in a defining query.
+///
+/// Returns `true` if the query contains a bare `*` (or `table.*`) in the
+/// top-level SELECT list. Ignores `*` inside function calls like `count(*)`.
+///
+/// This is intentionally conservative — false positives are OK (it's a
+/// warning), but false negatives for `SELECT *` should be rare.
+fn detect_select_star(query: &str) -> bool {
     // Quick exit: no asterisk at all
     if !query.contains('*') {
-        return;
+        return false;
     }
 
-    // Use a simple regex to detect "SELECT <optional tokens> * <optional alias>"
-    // but not inside function calls like count(*), sum(*), etc.
-    // We look for `*` that appears after SELECT and before FROM, not preceded
-    // by `(` (which would indicate a function argument).
-    //
-    // This is intentionally conservative — false positives are OK (it's a
-    // warning), but false negatives for `SELECT *` should be rare.
     let upper = query.to_uppercase();
 
     // Find the first top-level SELECT ... FROM
@@ -2161,22 +2184,14 @@ fn warn_select_star(query: &str) {
                     '(' => depth += 1,
                     ')' => depth -= 1,
                     '*' if depth == 0 => {
-                        // Check it's not inside a function call: preceded by `(`
-                        // Actually, since we're at depth 0, it's not inside parens.
-                        // Just emit the warning.
-                        pgrx::warning!(
-                            "pg_trickle: defining query uses SELECT *. If source table columns \
-                             are added or removed, the stream table will require reinitialization. \
-                             Consider listing columns explicitly for resilience against schema \
-                             changes."
-                        );
-                        return;
+                        return true;
                     }
                     _ => {}
                 }
             }
         }
     }
+    false
 }
 
 /// Classify a source relation as TABLE, STREAM_TABLE, or VIEW.
@@ -3175,5 +3190,64 @@ mod tests {
     fn test_cron_is_due_with_alias() {
         let old_epoch = chrono::Utc::now().timestamp() - 7200; // 2 hours ago
         assert!(cron_is_due("@hourly", Some(old_epoch)));
+    }
+
+    // ── EC-15: detect_select_star unit tests ───────────────────────────
+
+    #[test]
+    fn test_detect_select_star_bare() {
+        assert!(detect_select_star("SELECT * FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_table_qualified() {
+        assert!(detect_select_star("SELECT t.* FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_explicit_columns_no_star() {
+        assert!(!detect_select_star("SELECT id, name FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_count_star_not_flagged() {
+        assert!(!detect_select_star("SELECT count(*) FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_sum_star_not_flagged() {
+        assert!(!detect_select_star("SELECT sum(*) FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_mixed_agg_and_bare_star() {
+        // `count(*), *` has a bare `*` at top level
+        assert!(detect_select_star("SELECT count(*), * FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_no_asterisk_at_all() {
+        assert!(!detect_select_star("SELECT id FROM t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_subquery_star_ignored() {
+        // The outer SELECT has explicit columns; the inner SELECT * is inside parens
+        assert!(!detect_select_star(
+            "SELECT id, (SELECT * FROM b LIMIT 1) FROM t"
+        ));
+    }
+
+    #[test]
+    fn test_detect_select_star_case_insensitive() {
+        assert!(detect_select_star("select * from t"));
+        assert!(detect_select_star("SELECT * FROM t"));
+        assert!(detect_select_star("Select * From t"));
+    }
+
+    #[test]
+    fn test_detect_select_star_no_from() {
+        // No FROM clause — should not crash, just return false
+        assert!(!detect_select_star("SELECT 1"));
     }
 }

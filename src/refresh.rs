@@ -727,20 +727,21 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
         )
     };
 
-    let trigger_update_template = if st.has_keyless_source {
-        // No-op: updates are decomposed into D + I at the scan level.
-        "SELECT 1 WHERE false /* EC-06: no-op for keyless sources */".to_string()
-    } else {
-        format!(
-            "UPDATE {quoted_table} AS st \
-             SET {update_set_clause} \
-             FROM __pgt_delta_{pgt_id} AS d \
-             WHERE st.__pgt_row_id = d.__pgt_row_id \
-               AND d.__pgt_action = 'I' \
-               AND ({is_distinct_clause})",
-            pgt_id = st.pgt_id,
-        )
-    };
+    // EC-06: For keyless sources, the scan-level delta decomposes UPDATEs
+    // into D+I pairs (different content hashes), so the UPDATE template
+    // naturally matches 0 rows. For aggregate queries on keyless sources,
+    // the aggregate delta produces 'I' actions for changed groups that
+    // need real UPDATEs. Using the normal UPDATE template handles both
+    // cases correctly.
+    let trigger_update_template = format!(
+        "UPDATE {quoted_table} AS st \
+         SET {update_set_clause} \
+         FROM __pgt_delta_{pgt_id} AS d \
+         WHERE st.__pgt_row_id = d.__pgt_row_id \
+           AND d.__pgt_action = 'I' \
+           AND ({is_distinct_clause})",
+        pgt_id = st.pgt_id,
+    );
 
     let trigger_insert_template = if st.has_keyless_source {
         // Plain INSERT — no NOT EXISTS check since duplicate row_ids
@@ -846,6 +847,11 @@ pub fn determine_refresh_action(st: &StreamTableMeta, has_upstream_changes: bool
 /// TopK tables. The caller decides whether to invoke it (DIFFERENTIAL mode
 /// checks change buffers first and skips if no changes exist).
 pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
+    // triggers allow the refresh executor to modify the storage table.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
 
@@ -961,6 +967,11 @@ pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
 /// Users who need per-row trigger semantics should use `REFRESH MODE
 /// DIFFERENTIAL`. See PLAN_USER_TRIGGERS_EXPLICIT_DML.md §2.
 pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
+    // triggers allow the refresh executor to modify the storage table.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
     let query = &st.defining_query;
@@ -1521,19 +1532,17 @@ pub fn execute_differential_refresh(
             )
         };
 
-        let trigger_update_template = if st.has_keyless_source {
-            "SELECT 1 WHERE false /* EC-06: no-op for keyless sources */".to_string()
-        } else {
-            format!(
-                "UPDATE {quoted_table} AS st \
-                 SET {update_set_clause} \
-                 FROM __pgt_delta_{pgt_id} AS d \
-                 WHERE st.__pgt_row_id = d.__pgt_row_id \
-                   AND d.__pgt_action = 'I' \
-                   AND ({is_distinct_clause})",
-                pgt_id = st.pgt_id,
-            )
-        };
+        // EC-06: Use normal UPDATE template for keyless sources — see
+        // prewarm_merge_cache comment for full rationale.
+        let trigger_update_template = format!(
+            "UPDATE {quoted_table} AS st \
+             SET {update_set_clause} \
+             FROM __pgt_delta_{pgt_id} AS d \
+             WHERE st.__pgt_row_id = d.__pgt_row_id \
+               AND d.__pgt_action = 'I' \
+               AND ({is_distinct_clause})",
+            pgt_id = st.pgt_id,
+        );
 
         let trigger_insert_template = if st.has_keyless_source {
             format!(
