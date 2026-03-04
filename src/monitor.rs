@@ -1342,7 +1342,8 @@ fn health_check() -> TableIterator<
         // ── 3. Stale stream tables ──────────────────────────────────────────
         let stale_tables: Vec<String> = client
             .select(
-                "SELECT name FROM pgtrickle.stream_tables_info \
+                "SELECT pgt_schema || '.' || pgt_name \
+                 FROM pgtrickle.stream_tables_info \
                  WHERE stale = true \
                  ORDER BY 1",
                 None,

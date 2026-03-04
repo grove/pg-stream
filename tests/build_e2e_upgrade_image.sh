@@ -7,18 +7,23 @@
 #   CREATE EXTENSION pg_trickle VERSION '<from>';
 #   ALTER EXTENSION pg_trickle UPDATE TO '<to>';
 #
+# Multi-hop upgrade chains are supported automatically. For example, when
+# upgrading 0.1.3 → 0.2.1, this script validates that the full chain exists
+# (0.1.3→0.2.0 and 0.2.0→0.2.1), then the Dockerfile copies all upgrade
+# scripts so PostgreSQL can chain them automatically via BFS path-finding.
+#
 # Prerequisites: the base E2E image must be built first.
 #   ./tests/build_e2e_image.sh
 #
 # Usage:
-#   ./tests/build_e2e_upgrade_image.sh                  # defaults: 0.1.3 → 0.2.0
-#   ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.0     # explicit versions
-#   ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.0 --no-cache
+#   ./tests/build_e2e_upgrade_image.sh                  # defaults: 0.1.3 → 0.2.1
+#   ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.1     # explicit versions
+#   ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.1 --no-cache
 # =============================================================================
 set -euo pipefail
 
 FROM_VERSION="${1:-0.1.3}"
-TO_VERSION="${2:-0.2.0}"
+TO_VERSION="${2:-0.2.1}"
 shift 2 2>/dev/null || true
 EXTRA_ARGS="${*:-}"
 
@@ -36,15 +41,32 @@ if ! docker image inspect "${BASE_IMAGE}" &>/dev/null; then
 fi
 
 ARCHIVE_SQL="${PROJECT_ROOT}/sql/archive/pg_trickle--${FROM_VERSION}.sql"
-UPGRADE_SQL="${PROJECT_ROOT}/sql/pg_trickle--${FROM_VERSION}--${TO_VERSION}.sql"
 
 if [[ ! -f "$ARCHIVE_SQL" ]]; then
     echo "ERROR: Archive SQL not found: ${ARCHIVE_SQL}"
     exit 1
 fi
-if [[ ! -f "$UPGRADE_SQL" ]]; then
-    echo "ERROR: Upgrade SQL not found: ${UPGRADE_SQL}"
-    exit 1
+
+# Validate the upgrade chain exists (supports multi-hop, e.g. 0.1.3→0.2.0→0.2.1).
+# Walks the chain by following available pg_trickle--<V>--<NEXT>.sql files.
+echo "Validating upgrade chain: ${FROM_VERSION} → ${TO_VERSION}"
+current="$FROM_VERSION"
+chain_steps=()
+while [[ "$current" != "$TO_VERSION" ]]; do
+    # Find the next step in the chain from the current version
+    next_script=$(ls "${PROJECT_ROOT}/sql/pg_trickle--${current}--"*.sql 2>/dev/null | sort | head -1)
+    if [[ -z "$next_script" ]]; then
+        echo "ERROR: No upgrade script found for: pg_trickle--${current}--*.sql"
+        echo "       Cannot reach ${TO_VERSION} from ${FROM_VERSION}."
+        exit 1
+    fi
+    next_ver=$(basename "$next_script" .sql | sed "s/pg_trickle--${current}--//")
+    chain_steps+=("${current} → ${next_ver}")
+    echo "  Found: $(basename "$next_script")"
+    current="$next_ver"
+done
+if [[ ${#chain_steps[@]} -gt 0 ]]; then
+    echo "  Chain validated: ${#chain_steps[@]} step(s)"
 fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
