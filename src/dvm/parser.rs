@@ -217,6 +217,16 @@ pub enum AggFunc {
     RegrSxx,
     RegrSxy,
     RegrSyy,
+    /// XMLAGG aggregate — group-rescan strategy.
+    /// Optional ORDER BY is stored in `order_within_group`.
+    XmlAgg,
+    /// Hypothetical-set aggregates — group-rescan strategy.
+    /// These use `WITHIN GROUP (ORDER BY ...)` syntax with one hypothetical value
+    /// as the function argument (e.g., `RANK(42) WITHIN GROUP (ORDER BY score)`).
+    HypRank,
+    HypDenseRank,
+    HypPercentRank,
+    HypCumeDist,
     /// Complex expression wrapping multiple aggregate calls.
     ///
     /// Created when a SELECT target is an arithmetic or conditional expression
@@ -271,6 +281,11 @@ impl AggFunc {
             AggFunc::RegrSxx => "REGR_SXX",
             AggFunc::RegrSxy => "REGR_SXY",
             AggFunc::RegrSyy => "REGR_SYY",
+            AggFunc::XmlAgg => "XMLAGG",
+            AggFunc::HypRank => "RANK",
+            AggFunc::HypDenseRank => "DENSE_RANK",
+            AggFunc::HypPercentRank => "PERCENT_RANK",
+            AggFunc::HypCumeDist => "CUME_DIST",
             AggFunc::ComplexExpression(_) => "COMPLEX_EXPRESSION",
         }
     }
@@ -319,6 +334,11 @@ impl AggFunc {
                 | AggFunc::RegrSxx
                 | AggFunc::RegrSxy
                 | AggFunc::RegrSyy
+                | AggFunc::XmlAgg
+                | AggFunc::HypRank
+                | AggFunc::HypDenseRank
+                | AggFunc::HypPercentRank
+                | AggFunc::HypCumeDist
                 | AggFunc::ComplexExpression(_)
         )
     }
@@ -11530,6 +11550,11 @@ unsafe fn extract_aggregates(
                 "regr_sxx" => Some(AggFunc::RegrSxx),
                 "regr_sxy" => Some(AggFunc::RegrSxy),
                 "regr_syy" => Some(AggFunc::RegrSyy),
+                "xmlagg" => Some(AggFunc::XmlAgg),
+                "rank" => Some(AggFunc::HypRank),
+                "dense_rank" => Some(AggFunc::HypDenseRank),
+                "percent_rank" => Some(AggFunc::HypPercentRank),
+                "cume_dist" => Some(AggFunc::HypCumeDist),
                 _ => None,
             } {
                 let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
@@ -11603,7 +11628,8 @@ unsafe fn extract_aggregates(
                      VARIANCE, VAR_POP, VAR_SAMP, ANY_VALUE, MODE, PERCENTILE_CONT, \
                      PERCENTILE_DISC, CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY, \
                      REGR_COUNT, REGR_INTERCEPT, REGR_R2, REGR_SLOPE, REGR_SXX, REGR_SXY, \
-                     REGR_SYY. Use FULL refresh mode instead.",
+                     REGR_SYY, XMLAGG, RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST WITHIN GROUP. \
+                     Use FULL refresh mode instead.",
                 )));
             } else if is_user_defined_aggregate(&name_lower) {
                 // User-defined aggregate (CREATE AGGREGATE) — not supported

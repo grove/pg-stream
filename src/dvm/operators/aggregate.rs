@@ -276,7 +276,13 @@ pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
     // Regular aggregates (STRING_AGG, ARRAY_AGG, etc.) use ORDER BY inside parens.
     let is_ordered_set = matches!(
         agg.function,
-        AggFunc::Mode | AggFunc::PercentileCont | AggFunc::PercentileDisc
+        AggFunc::Mode
+            | AggFunc::PercentileCont
+            | AggFunc::PercentileDisc
+            | AggFunc::HypRank
+            | AggFunc::HypDenseRank
+            | AggFunc::HypPercentRank
+            | AggFunc::HypCumeDist
     );
 
     let order_sql = match &agg.order_within_group {
@@ -2256,6 +2262,11 @@ mod tests {
         assert!(AggFunc::Mode.is_group_rescan());
         assert!(AggFunc::PercentileCont.is_group_rescan());
         assert!(AggFunc::PercentileDisc.is_group_rescan());
+        assert!(AggFunc::XmlAgg.is_group_rescan());
+        assert!(AggFunc::HypRank.is_group_rescan());
+        assert!(AggFunc::HypDenseRank.is_group_rescan());
+        assert!(AggFunc::HypPercentRank.is_group_rescan());
+        assert!(AggFunc::HypCumeDist.is_group_rescan());
     }
 
     #[test]
@@ -3048,6 +3059,11 @@ mod tests {
         assert!(AggFunc::Mode.is_group_rescan());
         assert!(AggFunc::PercentileCont.is_group_rescan());
         assert!(AggFunc::PercentileDisc.is_group_rescan());
+        assert!(AggFunc::XmlAgg.is_group_rescan());
+        assert!(AggFunc::HypRank.is_group_rescan());
+        assert!(AggFunc::HypDenseRank.is_group_rescan());
+        assert!(AggFunc::HypPercentRank.is_group_rescan());
+        assert!(AggFunc::HypCumeDist.is_group_rescan());
     }
 
     #[test]
@@ -3055,6 +3071,11 @@ mod tests {
         assert_eq!(AggFunc::Mode.sql_name(), "MODE");
         assert_eq!(AggFunc::PercentileCont.sql_name(), "PERCENTILE_CONT");
         assert_eq!(AggFunc::PercentileDisc.sql_name(), "PERCENTILE_DISC");
+        assert_eq!(AggFunc::XmlAgg.sql_name(), "XMLAGG");
+        assert_eq!(AggFunc::HypRank.sql_name(), "RANK");
+        assert_eq!(AggFunc::HypDenseRank.sql_name(), "DENSE_RANK");
+        assert_eq!(AggFunc::HypPercentRank.sql_name(), "PERCENT_RANK");
+        assert_eq!(AggFunc::HypCumeDist.sql_name(), "CUME_DIST");
     }
 
     #[test]
