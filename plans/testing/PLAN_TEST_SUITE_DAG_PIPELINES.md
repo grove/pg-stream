@@ -1,8 +1,8 @@
 # PLAN: DAG Pipeline Test Suite — Comprehensive Coverage
 
-**Status:** Proposed  
-**Date:** 2026-06-21  
-**Branch:** `e2e_pipeline_dag_tests` (existing), new branch TBD for implementation  
+**Status:** In Progress (Phase 1–2 complete)  
+**Date:** 2026-03-04  
+**Branch:** `e2e_pipeline_dag_tests`  
 **Scope:** Close all remaining gaps in multi-layer DAG pipeline E2E tests — multi-cycle cascades, mixed refresh modes, operational mid-pipeline changes, auto-refresh propagation, wide topologies, error resilience, and concurrent DML during pipeline refresh.
 
 ---
@@ -23,6 +23,31 @@
 12. [Implementation Roadmap](#implementation-roadmap)
 13. [Infrastructure & Helpers](#infrastructure--helpers)
 14. [File Organization](#file-organization)
+
+---
+
+## Implementation Status
+
+| Phase | Group | File | Tests | Status |
+|-------|-------|------|------:|--------|
+| 1 | Multi-Cycle DAG Cascades | `e2e_multi_cycle_dag_tests.rs` | 6 | **Done** |
+| 2 | Mixed Refresh Modes | `e2e_mixed_mode_dag_tests.rs` | 5 | **Done** |
+| 2 | Auto-Refresh Chain Propagation | `e2e_dag_autorefresh_tests.rs` | 5 | **Done** |
+| 2 | Wide Topologies | `e2e_dag_topology_tests.rs` | 5 | **Done** |
+| 3 | Operational Mid-Pipeline Changes | `e2e_dag_operations_tests.rs` | 7 | Not started |
+| 3 | Error Resilience | `e2e_dag_error_tests.rs` | 4 | Not started |
+| 3 | Concurrent DML | `e2e_dag_concurrent_tests.rs` | 3 | Not started |
+| 3 | IMMEDIATE Mode Cascades | `e2e_dag_immediate_tests.rs` | 4 | Not started |
+| **Total** | | | **39** | **21 done / 18 remaining** |
+
+### Prioritized Remaining Work
+
+| Priority | Group | Tests | Effort | Description |
+|----------|-------|------:|--------|-------------|
+| P2 | 3 — Operational Mid-Pipeline | 7 | 2.5h | SUSPEND/ALTER/DROP on intermediate nodes (exercises `DAG_REBUILD_SIGNAL`, `determine_refresh_action` for SUSPENDED) |
+| P2 | 6 — Error Resilience | 4 | 1h | Failure isolation between layers, error recovery, `consecutive_errors` catalog tracking |
+| P2 | 7 — Concurrent DML | 3 | 1h | DML between layer refreshes, concurrent inserts during pipeline refresh, rollback safety |
+| P2 | 8 — IMMEDIATE Cascades | 4 | 1h | Multi-layer IMMEDIATE propagation limits, mixed IMMED+DIFF, rollback safety |
 
 ---
 
@@ -522,24 +547,24 @@ ST₁ writes to). Current behavior: it does NOT cascade automatically.
 
 ## Implementation Roadmap
 
-### Phase 1: Multi-Cycle DAG (P0) — ~4 hours
+### Phase 1: Multi-Cycle DAG (P0) — ✅ COMPLETE
 
-| Step | Task | Effort |
+| Step | Task | Status |
 |------|------|--------|
-| 1.1 | Create `tests/e2e_multi_cycle_dag_tests.rs` with shared setup helpers | 30 min |
-| 1.2 | Implement tests 1.1–1.4 (core multi-cycle cascade coverage) | 90 min |
-| 1.3 | Implement tests 1.5–1.6 (stress + diamond multi-cycle) | 60 min |
-| 1.4 | Run full test suite, fix any discovered issues | 60 min |
+| 1.1 | Create `tests/e2e_multi_cycle_dag_tests.rs` with shared setup helpers | ✅ |
+| 1.2 | Implement tests 1.1–1.4 (core multi-cycle cascade coverage) | ✅ |
+| 1.3 | Implement tests 1.5–1.6 (stress + diamond multi-cycle) | ✅ |
+| 1.4 | Run full test suite, fix any discovered issues | ✅ |
 
-### Phase 2: Mixed Modes + Auto-Refresh (P1) — ~5 hours
+### Phase 2: Mixed Modes + Auto-Refresh (P1) — ✅ COMPLETE
 
-| Step | Task | Effort |
+| Step | Task | Status |
 |------|------|--------|
-| 2.1 | Create `tests/e2e_mixed_mode_dag_tests.rs`, implement tests 2.1–2.3 | 90 min |
-| 2.2 | Implement tests 2.4–2.5 (alter + IMMEDIATE leaf) | 60 min |
-| 2.3 | Create `tests/e2e_dag_autorefresh_tests.rs`, implement tests 4.1–4.2 | 60 min |
-| 2.4 | Implement tests 4.3–4.5 (CALCULATED, no-spurious, staggered) | 60 min |
-| 2.5 | Create `tests/e2e_dag_topology_tests.rs`, implement tests 5.1–5.5 | 60 min |
+| 2.1 | Create `tests/e2e_mixed_mode_dag_tests.rs`, implement tests 2.1–2.3 | ✅ |
+| 2.2 | Implement tests 2.4–2.5 (alter + IMMEDIATE leaf) | ✅ |
+| 2.3 | Create `tests/e2e_dag_autorefresh_tests.rs`, implement tests 4.1–4.2 | ✅ |
+| 2.4 | Implement tests 4.3–4.5 (CALCULATED, no-spurious, staggered) | ✅ |
+| 2.5 | Create `tests/e2e_dag_topology_tests.rs`, implement tests 5.1–5.5 | ✅ |
 
 ### Phase 3: Operations + Error + Concurrent (P2) — ~5 hours
 
@@ -560,7 +585,7 @@ ST₁ writes to). Current behavior: it does NOT cascade automatically.
 | 4.3 | Run `just lint` and `just test-e2e` end-to-end | 30 min |
 | 4.4 | Update PLAN_TESTING_GAPS.md to mark gaps as covered | 10 min |
 
-**Total estimated effort:** ~15 hours
+**Total estimated effort:** ~15 hours (~9h complete, ~5.5h remaining)
 
 ---
 
