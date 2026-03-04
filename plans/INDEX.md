@@ -12,6 +12,7 @@ new entries when creating documents.
 | File | Type | Status | Summary |
 |------|------|--------|---------|
 | [PLAN.md](PLAN.md) | PLAN | — | Master implementation plan (Phases 0–12) |
+| [PLAN_EDGE_CASES.md](PLAN_EDGE_CASES.md) | PLAN | Proposed | Edge case catalogue with workarounds & prioritised remediation |
 | [PLAN_FEATURE_CLEANUP.md](PLAN_FEATURE_CLEANUP.md) | PLAN | In progress | Remove low-value surface before public release |
 
 ## adrs/

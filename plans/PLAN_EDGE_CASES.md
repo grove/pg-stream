@@ -1,0 +1,794 @@
+# PLAN: Edge Cases — Catalogue, Workarounds & Prioritised Remediation
+
+**Status:** Proposed
+**Target milestone:** v0.3.0+
+**Last updated:** 2026-03-04
+
+---
+
+## Motivation
+
+pg_trickle's documentation (FAQ, SQL Reference, Architecture) describes 36
+discrete edge cases and limitations. Some are fundamental trade-offs,
+others are fixable engineering gaps. This document:
+
+1. Catalogues every known edge case in one place.
+2. Proposes concrete workarounds or fixes for each.
+3. Assigns a priority tier so the team can focus effort where it matters most.
+
+---
+
+## Priority Tiers
+
+| Tier | Meaning | Guidance |
+|------|---------|----------|
+| **P0** | Data correctness risk — users can silently get wrong results | Fix before v1.0 |
+| **P1** | Operational surprise — confusing failure, silent non-behaviour | Fix before v1.0 |
+| **P2** | Usability gap — documented but painful; strong workaround exists | Schedule for a minor release |
+| **P3** | Accepted trade-off — inherent to the design; document clearly | Keep documentation up to date |
+
+---
+
+## Edge Case Catalogue
+
+### EC-01 — JOIN key change + simultaneous right-side DELETE
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — JOIN delta |
+| **Tier** | **P0** |
+| **Impact** | Stale row remains in stream table until next full refresh |
+| **Current mitigation** | Adaptive FULL fallback (`pg_trickle.adaptive_full_threshold`) |
+| **Documented in** | FAQ § "Known edge cases"; SQL_REFERENCE § "Known Delta Computation Limitations" |
+
+**Root cause:** The delta query reads `current_right` after all changes are
+applied. When the old join partner is deleted before the delta runs, the
+DELETE half of the join finds no partner and is silently dropped.
+
+**Proposed fix:**
+
+1. **Short term (P0):** Lower the default `adaptive_full_threshold` so the
+   FULL fallback kicks in more aggressively when change volume is high — this
+   is when co-occurring key changes + deletes are most likely. Add a NOTIFY
+   alert when the fallback activates so operators are aware.
+2. **Medium term:** Implement a two-phase delta that snapshots the old join
+   state *before* applying changes, then diffs against the new state. This
+   eliminates the root cause. Prototype in a branch and benchmark the
+   overhead (expected: one extra temp-table scan per join source).
+3. **Long term:** Investigate "pre-image capture" — storing old join keys in
+   the change buffer alongside the new values, so the delta query can always
+   reconstruct the old join result without reading the current table.
+
+---
+
+### EC-02 — CUBE/ROLLUP expansion limit (> 64 branches)
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — grouping sets |
+| **Tier** | **P3** |
+| **Impact** | Creation error |
+| **Current mitigation** | Use explicit `GROUPING SETS(…)` |
+| **Documented in** | SQL_REFERENCE § "CUBE/ROLLUP Expansion Limit" |
+
+**Proposed fix:** The 64-branch limit is a sensible guard. Keep it but make
+the limit configurable via a GUC (`pg_trickle.max_grouping_set_branches`,
+default 64) so power users can raise it when they accept the memory cost.
+**Tier P3** — the explicit `GROUPING SETS` workaround is adequate.
+
+---
+
+### EC-03 — Window functions inside expressions
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — window functions |
+| **Tier** | **P2** |
+| **Impact** | Creation error |
+| **Current mitigation** | Keep window functions as top-level SELECT columns |
+| **Documented in** | FAQ § "Window Functions" |
+
+**Proposed fix:** Automatically rewrite `CASE WHEN ROW_NUMBER() OVER (…) = 1
+THEN …` into a CTE that projects the window as a standalone column, then
+wrap the CASE expression in the outer query. This is a parser-level
+transformation in `src/dvm/parser.rs`. Complex cases (nested window calls
+inside arithmetic) may remain unsupported, but the most common pattern
+(CASE/IF around a single window) covers ~80% of user demand.
+
+---
+
+### EC-04 — Non-monotone recursive CTEs rejected
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — recursive CTEs |
+| **Tier** | **P3** |
+| **Impact** | Creation error |
+| **Current mitigation** | Restructure as non-recursive CTE; or use FULL mode |
+| **Documented in** | FAQ § "Recursive CTEs" |
+
+**Proposed fix:** This is a fundamental limitation of semi-naive evaluation
+— non-monotone operators in the recursive term can "un-derive" rows,
+breaking the incremental fixpoint. **No code fix proposed.** Keep the clear
+error message and document the reasoning. Users who need non-monotone
+recursion should use FULL mode.
+
+---
+
+### EC-05 — Foreign tables in DIFFERENTIAL mode
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — foreign data wrappers |
+| **Tier** | **P2** |
+| **Impact** | Creation error |
+| **Current mitigation** | Use FULL mode |
+| **Documented in** | SQL_REFERENCE § "Source Tables" |
+
+**Proposed fix:**
+
+1. **Short term:** Improve the error message to suggest `FULL` mode
+   explicitly and mention the `postgres_fdw` + `IMPORT FOREIGN SCHEMA`
+   pattern.
+2. **Medium term:** Investigate a polling-based CDC fallback for foreign
+   tables — compare a hash of `SELECT * FROM ft LIMIT batch_size` on each
+   cycle. This is essentially what FULL mode does, but scoped to detect
+   whether *any* change occurred so we can skip the refresh when nothing
+   changed. Could reduce refresh cost by 50–90% for slowly-changing
+   foreign tables.
+
+---
+
+### EC-06 — Keyless tables with exact duplicate rows
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — row identity |
+| **Tier** | **P0** |
+| **Impact** | Phantom or missed deletes in stream table |
+| **Current mitigation** | Add a primary key; add a synthetic unique column; or use FULL mode |
+| **Documented in** | FAQ § "Keyless Tables"; SQL_REFERENCE § "Row Identity" |
+
+**Proposed fix:**
+
+1. **Short term (P0):** Emit a `WARNING` at `create_stream_table()` time
+   when any source table lacks a primary key AND the defining query does not
+   contain `DISTINCT`. The warning should link to the FAQ entry.
+2. **Medium term:** Implement a **count-based hash** — instead of a single
+   xxHash per row, track `(row_hash, count)` tuples. When a duplicate is
+   inserted, increment the count; when deleted, decrement. This fixes the
+   "delete one of N identical rows removes all N" problem at the cost of a
+   small counter column in the change buffer.
+3. **Long term:** Evaluate `ctid`-based row identity for keyless tables.
+   `ctid` is stable within a transaction but changes after VACUUM FULL.
+   Feasible only for trigger-mode CDC where the trigger captures `ctid`
+   at write time.
+
+---
+
+### EC-07 — IMMEDIATE mode write serialization
+
+| Field | Value |
+|-------|-------|
+| **Area** | IMMEDIATE mode — concurrency |
+| **Tier** | **P3** |
+| **Impact** | Reduced write throughput under high concurrency |
+| **Current mitigation** | Use DIFFERENTIAL mode for high-throughput OLTP |
+| **Documented in** | FAQ § "IMMEDIATE Mode Trade-offs" |
+
+**Proposed fix:** This is an inherent trade-off of synchronous IVM — you
+cannot maintain consistency without serialization. The `IvmLockMode`
+already uses lighter `pg_try_advisory_xact_lock` for simple scan chains.
+**No code fix proposed.** Document the throughput characteristics in the
+performance guide and add a benchmark that quantifies the write-side
+overhead so users can make informed mode choices.
+
+---
+
+### EC-08 — IMMEDIATE mode write amplification
+
+| Field | Value |
+|-------|-------|
+| **Area** | IMMEDIATE mode — latency |
+| **Tier** | **P3** |
+| **Impact** | Increased per-DML latency |
+| **Current mitigation** | Use DIFFERENTIAL mode |
+| **Documented in** | FAQ § "IMMEDIATE Mode Trade-offs" |
+
+**Proposed fix:** Inherent trade-off. Potential optimisation: batch multiple
+trigger invocations within a single statement into one delta application
+(the current implementation already uses statement-level triggers with
+transition tables, which provides this batching naturally). Add a benchmark
+to `benches/` that measures per-statement overhead for 1, 10, 100, 1000
+affected rows.
+
+---
+
+### EC-09 — IMMEDIATE mode unsupported constructs
+
+| Field | Value |
+|-------|-------|
+| **Area** | IMMEDIATE mode — SQL support |
+| **Tier** | **P2** |
+| **Impact** | Creation / alter error |
+| **Current mitigation** | Use DIFFERENTIAL mode |
+| **Documented in** | FAQ § "What SQL features are NOT supported in IMMEDIATE mode?" |
+
+**Proposed fix:** The main gap is recursive CTEs. TopK fundamentally
+requires scheduled recomputation. Materialised view sources require event
+trigger support that PostgreSQL does not provide for mat-view refreshes.
+**No code fix for recursive CTEs / TopK.** For mat-view sources, consider
+a polling-change-detection wrapper (same approach as EC-05 for foreign
+tables).
+
+---
+
+### EC-10 — IMMEDIATE mode: no throttling
+
+| Field | Value |
+|-------|-------|
+| **Area** | IMMEDIATE mode — back-pressure |
+| **Tier** | **P3** |
+| **Impact** | No rate limiting for high-frequency writes |
+| **Current mitigation** | Use DIFFERENTIAL mode with a schedule interval |
+| **Documented in** | FAQ § "IMMEDIATE Mode Trade-offs" |
+
+**Proposed fix:** By design — throttling IMMEDIATE would break the
+same-transaction consistency guarantee. **No code fix.** Ensure the FAQ
+clearly explains that DIFFERENTIAL with a short interval (e.g. `'1s'`) is
+the right answer when back-pressure is needed.
+
+---
+
+### EC-11 — Schedule interval shorter than refresh duration
+
+| Field | Value |
+|-------|-------|
+| **Area** | Scheduler — timing |
+| **Tier** | **P1** |
+| **Impact** | Perpetual latency spiral; cascading DAG chains fall behind |
+| **Current mitigation** | Widen the interval; use IMMEDIATE mode; or split the DAG |
+| **Documented in** | FAQ § "Performance and Tuning" |
+
+**Proposed fix:**
+
+1. **Short term (P1):** Add a `scheduler_falling_behind` NOTIFY alert when
+   the refresh duration exceeds 80% of the schedule interval for 3
+   consecutive cycles. Include the stream table name, average duration, and
+   configured interval in the payload.
+2. **Medium term:** Implement an `auto_backoff` GUC (default: `on`). When
+   enabled, the scheduler automatically doubles the effective interval
+   (capped at 10× configured) when falling behind, and recovers when
+   headroom returns. Log/NOTIFY on every backoff step.
+3. **Long term:** Add a `pgtrickle.explain_st(name)` recommendation that
+   flags "refresh takes longer than schedule" when it detects the pattern
+   in `pgt_refresh_history`.
+
+---
+
+### EC-12 — No read-your-writes (DIFFERENTIAL/FULL)
+
+| Field | Value |
+|-------|-------|
+| **Area** | Scheduler — consistency model |
+| **Tier** | **P3** |
+| **Impact** | Stale reads immediately after write |
+| **Current mitigation** | Use IMMEDIATE mode or call `refresh_stream_table()` manually |
+| **Documented in** | FAQ § "Consistency" |
+
+**Proposed fix:** Inherent to the scheduled refresh model. **No code fix.**
+Consider a convenience function `pgtrickle.write_and_refresh(dml_sql,
+st_name)` that executes the DML and triggers a manual refresh in a single
+call. Low priority — manual `refresh_stream_table()` already covers this.
+
+---
+
+### EC-13 — Diamond dependency split-version reads
+
+| Field | Value |
+|-------|-------|
+| **Area** | Diamond dependencies — consistency |
+| **Tier** | **P1** |
+| **Impact** | Fan-in node reads inconsistent upstream versions |
+| **Current mitigation** | `diamond_consistency = 'atomic'` |
+| **Documented in** | FAQ § "Diamond Dependencies"; SQL_REFERENCE |
+
+**Proposed fix:** The `atomic` mode already fixes this. Remaining work:
+
+1. **Short term (P1):** Default `diamond_consistency` to `'atomic'` for new
+   stream tables (currently `'none'`). This is a safer default — users who
+   don't need atomicity can opt out.
+2. **Medium term:** Add a `health_check()` warning when a diamond graph
+   exists but `diamond_consistency = 'none'`.
+
+---
+
+### EC-14 — Diamond upstream failure skips downstream
+
+| Field | Value |
+|-------|-------|
+| **Area** | Diamond dependencies — failure handling |
+| **Tier** | **P3** |
+| **Impact** | Downstream stays stale for one cycle |
+| **Current mitigation** | Automatic retry on next cycle |
+| **Documented in** | FAQ § "Diamond Dependencies" |
+
+**Proposed fix:** Current behaviour is correct. Add a NOTIFY
+`diamond_group_partial_failure` when a group member fails so operators
+can investigate. **No urgency** — the automatic retry handles recovery.
+
+---
+
+### EC-15 — SELECT * on source table + DDL
+
+| Field | Value |
+|-------|-------|
+| **Area** | DDL — schema evolution |
+| **Tier** | **P1** |
+| **Impact** | Refresh fails; stream table marked `needs_reinit` |
+| **Current mitigation** | Use explicit column lists in defining queries |
+| **Documented in** | FAQ § "Schema Changes" |
+
+**Proposed fix:**
+
+1. **Short term (P1):** Emit a `WARNING` at `create_stream_table()` time
+   when the defining query contains `SELECT *`. Suggest using explicit
+   column lists.
+2. **Medium term:** When `needs_reinit` is triggered by a column-count
+   mismatch, attempt an automatic reinitialisation: re-parse the query,
+   verify the new column set is compatible, and refresh. If compatible,
+   skip the `needs_reinit` flag and refresh directly.
+
+---
+
+### EC-16 — ALTER FUNCTION body change not detected
+
+| Field | Value |
+|-------|-------|
+| **Area** | DDL — function dependency tracking |
+| **Tier** | **P1** |
+| **Impact** | Stream table silently uses new function logic without a full rebase |
+| **Current mitigation** | Manual full refresh after function changes |
+| **Documented in** | FAQ § "Schema Changes" |
+
+**Proposed fix:**
+
+1. **Short term (P1):** Document this prominently in the "Gotchas" section
+   of the Getting Started guide.
+2. **Medium term:** Implement a `pg_proc.proversion` polling check — on
+   each refresh cycle, compare `xmin` or a hash of `pg_proc.prosrc` for
+   all functions referenced in the defining query. If changed, trigger an
+   automatic full refresh and log a NOTICE.
+
+---
+
+### EC-17 — Schema change during active refresh
+
+| Field | Value |
+|-------|-------|
+| **Area** | DDL — concurrency |
+| **Tier** | **P2** |
+| **Impact** | Refresh errors; stream table suspended |
+| **Documented in** | FAQ § "Schema Changes" |
+
+**Proposed fix:** The refresh transaction holds a `ShareLock` on source
+tables, which blocks concurrent `ALTER TABLE` (which needs
+`AccessExclusiveLock`). The window is only open if the DDL sneaks in
+between the lock acquisition and the first read. **No code fix needed** —
+PostgreSQL's locking already prevents the race in practice. Improve
+documentation to clarify this is a theoretical edge case.
+
+---
+
+### EC-18 — `auto` CDC mode silent non-upgrade
+
+| Field | Value |
+|-------|-------|
+| **Area** | CDC — mode transition |
+| **Tier** | **P1** |
+| **Impact** | User thinks WAL CDC is active; actually stuck on triggers forever |
+| **Current mitigation** | Default is `TRIGGER` mode; `auto` must be explicitly set |
+| **Documented in** | FAQ § "CDC Architecture" |
+
+**Proposed fix:**
+
+1. **Short term (P1):** When `cdc_mode = 'auto'`, emit a `LOG`-level
+   message on every scheduler cycle that explains *why* the transition
+   hasn't happened (e.g. "wal_level is 'replica', need 'logical'"). Rate-
+   limit to once per 5 minutes.
+2. **Medium term:** Add a `check_cdc_health()` finding for "auto mode stuck
+   in TRIGGER phase for > 1 hour".
+
+---
+
+### EC-19 — WAL mode + keyless tables need REPLICA IDENTITY FULL
+
+| Field | Value |
+|-------|-------|
+| **Area** | CDC — WAL decoding |
+| **Tier** | **P0** |
+| **Impact** | Silent data loss for UPDATEs/DELETEs on keyless tables in WAL mode |
+| **Current mitigation** | Set `REPLICA IDENTITY FULL` before switching to WAL CDC |
+| **Documented in** | FAQ § "CDC Architecture" |
+
+**Proposed fix:**
+
+1. **Short term (P0):** At `create_stream_table()` / `alter_stream_table()`
+   time, when `cdc_mode` involves WAL and any source table is keyless, check
+   `pg_class.relreplident` and **reject** with a clear error if not `'f'`
+   (full). This prevents the silent data loss entirely.
+2. **Medium term:** Automatically issue `ALTER TABLE … REPLICA IDENTITY
+   FULL` for keyless tables when entering WAL mode (with a NOTICE).
+
+---
+
+### EC-20 — CDC TRANSITIONING phase complexity
+
+| Field | Value |
+|-------|-------|
+| **Area** | CDC — mode transition |
+| **Tier** | **P2** |
+| **Impact** | Potential duplicate capture during transition; rollback to triggers on failure |
+| **Current mitigation** | LSN-based deduplication; automatic rollback |
+| **Documented in** | FAQ § "CDC Architecture" |
+
+**Proposed fix:** The existing safeguards (deduplication + rollback) are
+sound. Add a `trigger_inventory()` + `check_cdc_health()` combined check
+that verifies the transition completed successfully after a server restart
+or crash during the window.
+
+---
+
+### EC-21 — Stream tables not propagated to logical replication subscriber
+
+| Field | Value |
+|-------|-------|
+| **Area** | Replication — architecture |
+| **Tier** | **P3** |
+| **Impact** | Subscriber gets static snapshot without refresh capability |
+| **Current mitigation** | Run pg_trickle only on primary |
+| **Documented in** | FAQ § "Replication" |
+
+**Proposed fix:** Inherent to the architecture — CDC triggers and the
+scheduler only run on the primary. **No code fix.** Consider a future
+"subscriber mode" that detects replicated source tables and runs its own
+CDC + refresh cycle, but this is a major undertaking (v2.0+).
+
+---
+
+### EC-22 — Change buffers not published to subscribers
+
+| Field | Value |
+|-------|-------|
+| **Area** | Replication — change buffers |
+| **Tier** | **P3** |
+| **Impact** | Subscriber cannot drive its own refresh |
+| **Documented in** | FAQ § "Replication" |
+
+**Proposed fix:** By design. Same as EC-21 — keep documentation clear.
+
+---
+
+### EC-23 — Scheduler does not run on standby / replica
+
+| Field | Value |
+|-------|-------|
+| **Area** | Replication — standby |
+| **Tier** | **P3** |
+| **Impact** | No IVM on read replicas |
+| **Current mitigation** | Query the primary; or promote the replica |
+| **Documented in** | FAQ § "HA / Replication" |
+
+**Proposed fix:** By design — standbys are read-only. **No code fix.** A
+future enhancement could add a read-only health endpoint on standby that
+reports the last refresh timestamp from the replicated catalog, so
+monitoring can detect staleness.
+
+---
+
+### EC-24 — TRUNCATE on source table bypasses CDC triggers
+
+| Field | Value |
+|-------|-------|
+| **Area** | CDC — TRUNCATE handling |
+| **Tier** | **P3** |
+| **Impact** | Stream table not updated (until reinit on next cycle) |
+| **Current mitigation** | TRUNCATE event trigger marks `needs_reinit`; next cycle does full recompute |
+| **Documented in** | SQL_REFERENCE § "TRUNCATE" |
+
+**Proposed fix:** Already handled by the TRUNCATE event trigger. The only
+gap is latency — between the TRUNCATE and the next cycle, the stream table
+is stale. For IMMEDIATE mode, TRUNCATE triggers a same-transaction full
+refresh (already implemented). For DIFFERENTIAL/FULL, the current behaviour
+is acceptable. **No further code fix needed.**
+
+---
+
+### EC-25 — TRUNCATE on a stream table itself
+
+| Field | Value |
+|-------|-------|
+| **Area** | Stream table — direct manipulation |
+| **Tier** | **P1** |
+| **Impact** | Frontier / buffer desync; future refreshes produce incorrect deltas |
+| **Current mitigation** | Use `refresh_stream_table()` to reset |
+| **Documented in** | SQL_REFERENCE § "What Is NOT Allowed" |
+
+**Proposed fix:**
+
+1. **Short term (P1):** Add an event trigger that intercepts `TRUNCATE` on
+   any table in the `pgtrickle` schema and raises an ERROR with a message
+   suggesting `refresh_stream_table()` instead.
+2. **Medium term:** Instead of blocking, intercept TRUNCATE and
+   automatically perform a full refresh (same approach as IMMEDIATE mode
+   TRUNCATE handling). This is friendlier but may surprise users who expect
+   TRUNCATE to be instant.
+
+---
+
+### EC-26 — Direct DML on stream table
+
+| Field | Value |
+|-------|-------|
+| **Area** | Stream table — direct manipulation |
+| **Tier** | **P1** |
+| **Impact** | Data overwritten or duplicated on next refresh |
+| **Current mitigation** | Documentation; never write directly |
+| **Documented in** | SQL_REFERENCE § "What Is NOT Allowed" |
+
+**Proposed fix:**
+
+1. **Short term (P1):** Add a statement-level trigger on stream tables that
+   raises an ERROR for any INSERT/UPDATE/DELETE not originating from the
+   refresh engine (check for a session variable or advisory lock flag set by
+   the refresh transaction). This prevents accidental writes.
+2. **Medium term:** Use a PostgreSQL row-level security policy or a
+   `pg_trickle.allow_direct_dml` session variable as an escape hatch for
+   power users.
+
+---
+
+### EC-27 — Foreign keys on stream tables
+
+| Field | Value |
+|-------|-------|
+| **Area** | Stream table — constraints |
+| **Tier** | **P3** |
+| **Impact** | FK violations during bulk MERGE |
+| **Current mitigation** | Do not define FKs |
+| **Documented in** | SQL_REFERENCE § "What Is NOT Allowed" |
+
+**Proposed fix:** Reject `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` on
+stream tables via event trigger (same pattern as EC-25/EC-26). **P3** — the
+current documentation is sufficient, and FK creation on stream tables is
+rare.
+
+---
+
+### EC-28 — PgBouncer transaction pooling
+
+| Field | Value |
+|-------|-------|
+| **Area** | Infrastructure — connection pooling |
+| **Tier** | **P2** |
+| **Impact** | Prepared statement errors, lock escapes, GUC not applied |
+| **Current mitigation** | Use session-mode pooling; use `SET LOCAL` |
+| **Documented in** | FAQ § "PgBouncer" |
+
+**Proposed fix:** pg_trickle's scheduler uses a single dedicated backend
+connection (not pooled), so the scheduler itself is unaffected. The edge
+case applies to application queries that use `SET pg_trickle.*` GUCs via a
+pooled connection. **No code fix** — this is a PgBouncer limitation.
+Improve documentation with a recommended PgBouncer configuration snippet.
+
+---
+
+### EC-29 — TopK + set operations / GROUPING SETS
+
+| Field | Value |
+|-------|-------|
+| **Area** | TopK — SQL restrictions |
+| **Tier** | **P3** |
+| **Impact** | Creation error |
+| **Documented in** | SQL_REFERENCE § "TopK" |
+
+**Proposed fix:** TopK uses scoped recomputation via MERGE, which
+fundamentally requires a single `ORDER BY … LIMIT` at the top level. Set
+operations and multi-level grouping sets break this invariant. **No code
+fix.** Keep the clear rejection error and document the workaround (split
+into separate stream tables).
+
+---
+
+### EC-30 — Circular dependencies
+
+| Field | Value |
+|-------|-------|
+| **Area** | DAG — cycle detection |
+| **Tier** | **P3** |
+| **Impact** | Creation error with cycle path in message |
+| **Documented in** | FAQ § "Dependencies"; SQL_REFERENCE |
+
+**Proposed fix:** Already handled — rejected at creation time with a clear
+error listing the cycle path. See `plans/sql/PLAN_CIRCULAR_REFERENCES.md`
+for future exploration of safe fixed-point evaluation. **No further work.**
+
+---
+
+### EC-31 — FOR UPDATE / FOR SHARE in defining query
+
+| Field | Value |
+|-------|-------|
+| **Area** | SQL — row locking |
+| **Tier** | **P3** |
+| **Impact** | Creation error |
+| **Documented in** | SQL_REFERENCE § "Rejected Constructs" |
+
+**Proposed fix:** By design — row locks serve no purpose in stream table
+defining queries. **No code fix.** The error message is clear.
+
+---
+
+### EC-32 — ALL (subquery) not supported
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — subquery operators |
+| **Tier** | **P2** |
+| **Impact** | Creation error |
+| **Documented in** | FAQ § "Why Are These SQL Features Not Supported?" |
+
+**Proposed fix:** `ALL (subquery)` is mathematically a conjunction of
+per-row comparisons — differentiating it requires tracking the min/max of
+the subquery result and recomputing the predicate when the subquery changes.
+This is feasible but complex. **Medium term:** implement via rewrite to
+`NOT EXISTS (… EXCEPT …)` pattern at parse time in `src/dvm/parser.rs`,
+similar to how `ANY (subquery)` is handled.
+
+---
+
+### EC-33 — Statistical aggregates (CORR, COVAR_*, REGR_*)
+
+| Field | Value |
+|-------|-------|
+| **Area** | DIFFERENTIAL — aggregates |
+| **Tier** | **P3** |
+| **Impact** | Creation error in DIFFERENTIAL mode |
+| **Current mitigation** | Use FULL mode; or pre-aggregate in DIFFERENTIAL and compute in a view |
+| **Documented in** | FAQ § "Unsupported Aggregates" |
+
+**Proposed fix:** These aggregates require maintaining running sums of
+squares and cross-products. The algebra is well-known (Welford's online
+algorithm), but implementing it in SQL delta templates is non-trivial.
+**Long term:** add `CORR`/`COVAR_POP`/`COVAR_SAMP` support by maintaining
+auxiliary accumulators (`sum_x`, `sum_y`, `sum_xy`, `sum_x2`, `count`) in
+the stream table.
+
+---
+
+### EC-34 — Backup / restore loses WAL replication slots
+
+| Field | Value |
+|-------|-------|
+| **Area** | Operations — disaster recovery |
+| **Tier** | **P1** |
+| **Impact** | CDC stuck; slot-missing error after restore |
+| **Current mitigation** | Set `cdc_mode = 'trigger'` after restore; let auto recreate slots |
+| **Documented in** | FAQ § "Operations" |
+
+**Proposed fix:**
+
+1. **Short term (P1):** Add a `health_check()` finding that detects
+   "cdc_mode includes WAL but replication slot does not exist" and
+   recommends the trigger fallback.
+2. **Medium term:** On scheduler startup, when a source's `cdc_phase` is
+   `WAL` but the slot is missing, automatically fall back to TRIGGER mode
+   with a WARNING log and a NOTIFY.
+
+---
+
+### EC-35 — Managed cloud PostgreSQL restrictions
+
+| Field | Value |
+|-------|-------|
+| **Area** | Infrastructure — cloud compatibility |
+| **Tier** | **P3** |
+| **Impact** | Extension cannot be installed |
+| **Documented in** | FAQ § "Deployment" |
+
+**Proposed fix:** pg_trickle cannot control cloud provider policies. Keep
+the FAQ entry updated with a compatibility matrix (RDS, Cloud SQL,
+AlloyDB, Azure Flexible, Supabase, Neon). Note that trigger-based CDC
+avoids the most common restriction (`wal_level = logical`).
+
+---
+
+### EC-36 — Managed cloud: shared_preload_libraries restriction
+
+| Field | Value |
+|-------|-------|
+| **Area** | Infrastructure — cloud compatibility |
+| **Tier** | **P3** |
+| **Impact** | Background worker + shared memory unavailable |
+| **Documented in** | FAQ § "Deployment" |
+
+**Proposed fix:** Investigate a "no-bgworker" mode where
+`refresh_stream_table()` is called by an external cron (e.g. `pg_cron` or
+an application timer). The scheduler would be optional when
+`shared_preload_libraries` is unavailable. See
+`plans/infra/REPORT_EXTERNAL_PROCESS.md` for the sidecar feasibility
+study. **Long term (v2.0+).**
+
+---
+
+## Prioritised Recommendations
+
+### P0 — Must fix (data correctness)
+
+| # | Edge Case | Action | Estimated Effort |
+|---|-----------|--------|------------------|
+| 1 | EC-01: JOIN key change + right-side DELETE | Two-phase delta prototype; lower adaptive threshold default | 3–5 days |
+| 2 | EC-06: Keyless table duplicate rows | Emit WARNING at creation; implement count-based hash | 2–3 days |
+| 3 | EC-19: WAL + keyless without REPLICA IDENTITY FULL | Reject at creation time with clear error | 0.5 day |
+
+### P1 — Should fix (operational surprise)
+
+| # | Edge Case | Action | Estimated Effort |
+|---|-----------|--------|------------------|
+| 4 | EC-11: Schedule < refresh duration | Add `scheduler_falling_behind` NOTIFY alert | 1 day |
+| 5 | EC-13: Diamond split-version reads | Default `diamond_consistency` to `atomic` for new STs | 0.5 day |
+| 6 | EC-15: SELECT * + DDL breakage | Emit WARNING at creation for `SELECT *` | 0.5 day |
+| 7 | EC-16: ALTER FUNCTION undetected | `pg_proc` hash polling on refresh cycle | 2 days |
+| 8 | EC-18: `auto` CDC stuck in TRIGGER | Rate-limited LOG explaining why; health_check finding | 1 day |
+| 9 | EC-25: TRUNCATE on stream table | Event trigger to block TRUNCATE on pgtrickle schema | 0.5 day |
+| 10 | EC-26: Direct DML on stream table | Guard trigger detecting non-engine writes | 1 day |
+| 11 | EC-34: WAL slots lost after restore | Auto-detect missing slot; fall back to TRIGGER + WARNING | 1 day |
+
+### P2 — Nice to have (usability gaps)
+
+| # | Edge Case | Action | Estimated Effort |
+|---|-----------|--------|------------------|
+| 12 | EC-03: Window functions in expressions | CTE extraction in parser | 3–5 days |
+| 13 | EC-05: Foreign tables | Polling-based change detection | 2–3 days |
+| 14 | EC-09: IMMEDIATE unsupported constructs | doc improvements | 0.5 day |
+| 15 | EC-17: DDL during active refresh | doc improvements | 0.5 day |
+| 16 | EC-20: CDC TRANSITIONING complexity | post-restart health check | 1 day |
+| 17 | EC-28: PgBouncer | PgBouncer config snippet in docs | 0.5 day |
+| 18 | EC-32: ALL (subquery) | Parser rewrite to NOT EXISTS (… EXCEPT …) | 2–3 days |
+
+### P3 — Accepted trade-offs (document, no code change)
+
+EC-02, EC-04, EC-07, EC-08, EC-10, EC-12, EC-14, EC-21, EC-22, EC-23,
+EC-24, EC-27, EC-29, EC-30, EC-31, EC-33, EC-35, EC-36.
+
+These are either fundamental design trade-offs or have adequate existing
+mitigations. Keep documentation current and revisit if user demand
+surfaces.
+
+---
+
+## Implementation Order
+
+**Recommended sprint sequence** (assuming 2-week sprints):
+
+**Sprint 1 — P0 corrections:**
+- EC-19: WAL + keyless rejection (0.5 day — quick win)
+- EC-06: Keyless duplicate warning + count-based hash (2–3 days)
+- EC-01: Two-phase delta prototype (3–5 days)
+
+**Sprint 2 — P1 operational safety:**
+- EC-25: Block TRUNCATE on stream tables (0.5 day)
+- EC-26: Guard trigger for direct DML (1 day)
+- EC-15: Warn on `SELECT *` (0.5 day)
+- EC-11: `scheduler_falling_behind` alert (1 day)
+- EC-13: Default diamond_consistency to atomic (0.5 day)
+- EC-18: Rate-limited LOG for stuck auto mode (1 day)
+- EC-34: Auto-detect missing WAL slot (1 day)
+
+**Sprint 3 — P1 completion + P2 starts:**
+- EC-16: pg_proc hash polling for function changes (2 days)
+- EC-03: Window function CTE extraction (3–5 days)
+
+**Sprint 4+ — P2 usability:**
+- EC-05, EC-32: Foreign table change detection; ALL (subquery) rewrite
+- Documentation sweep for all P3 items
