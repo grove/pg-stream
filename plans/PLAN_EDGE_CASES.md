@@ -127,12 +127,13 @@ default 64) so power users can raise it when they accept the memory cost.
 | **Impact** | Creation error |
 | **Current mitigation** | Keep window functions as top-level SELECT columns |
 | **Documented in** | FAQ § "Window Functions" |
+| **Status** | ✅ **IMPLEMENTED** — `rewrite_nested_window_exprs()` subquery-lift in `src/dvm/parser.rs`; helper `collect_all_window_func_nodes()` for recursive window func harvesting; `deparse_select_window_clause()` for WINDOW clause passthrough; exported from `src/dvm/mod.rs`; wired in `src/api.rs` before DISTINCT ON rewrite |
 
-**Chosen fix: nested-subquery lift (see PLAN_TRANSACTIONAL_IVM_PART_2.md Task 1.3):**
+**Implementation: nested-subquery lift (see PLAN_TRANSACTIONAL_IVM_PART_2.md Task 1.3):**
 
-Add a new auto-rewrite pass (`rewrite_nested_window_exprs`) that lifts
-window functions out of expressions into a synthetic column in an inner
-subquery, then applies the outer expression against that column:
+Window functions nested inside expressions are lifted into a synthetic column
+in an inner subquery, then the outer SELECT applies the original expression
+with the window function replaced by the synthetic column alias:
 
 ```sql
 -- Before (rejected):
@@ -140,12 +141,11 @@ SELECT id, ABS(ROW_NUMBER() OVER (ORDER BY score) - 5) AS adjusted_rank
 FROM players
 
 -- After rewrite (supported):
-SELECT id, ABS(__pgt_wf_1 - 5) AS adjusted_rank
+SELECT id, ABS("__pgt_wf_inner"."__pgt_wf_1" - 5) AS "adjusted_rank"
 FROM (
-    SELECT id, score,
-           ROW_NUMBER() OVER (ORDER BY score) AS __pgt_wf_1
+    SELECT *, ROW_NUMBER() OVER (ORDER BY score) AS "__pgt_wf_1"
     FROM players
-) __pgt_wf_inner
+) "__pgt_wf_inner"
 ```
 
 The subquery approach is preferred over the earlier CTE approach because a
