@@ -250,8 +250,22 @@ SELECT pgtrickle.create_stream_table(
 ### What is the difference between FULL and DIFFERENTIAL refresh mode?
 
 - **FULL** — Truncates the stream table and re-runs the entire defining query every refresh cycle. Simple but expensive for large result sets.
-- **DIFFERENTIAL** — Computes only the delta (changes since the last refresh) using the DVM engine and applies it via a `MERGE` statement. Much faster when only a small fraction of source data changes between refreshes.
+- **DIFFERENTIAL** — Computes only the delta (changes since the last refresh) using the DVM engine and applies it via a `MERGE` statement. Much faster when only a small fraction of source data changes between refreshes. When the change ratio exceeds `pg_trickle.differential_max_change_ratio` (default 15%), DIFFERENTIAL automatically falls back to FULL for that cycle.
 - **IMMEDIATE** — Maintains the stream table synchronously within the same transaction as the base table DML. Uses statement-level triggers with transition tables — no change buffers, no scheduler. The stream table is always up-to-date.
+
+### Why does FULL mode exist if DIFFERENTIAL can fall back to it automatically?
+
+DIFFERENTIAL mode with adaptive fallback covers most user needs — it uses incremental deltas when changes are small and automatically switches to a full recompute when the change ratio is high. However, explicit FULL mode still has its place:
+
+1. **No CDC overhead.** FULL mode installs CDC triggers on source tables (for DAG tracking), but the refresh itself ignores the change buffers entirely. If your workload has very high write throughput and you know you'll always do a full recompute, FULL mode avoids the per-row trigger overhead of writing change records that will never be consumed incrementally.
+
+2. **Simpler debugging.** When investigating data correctness issues, FULL mode is a clean baseline — it re-runs the defining query with no delta computation, no frontier tracking, and no MERGE logic. If FULL produces correct results but DIFFERENTIAL doesn't, the bug is in the delta pipeline.
+
+3. **Predictable performance.** DIFFERENTIAL refresh time varies with the number of changes, which can be unpredictable. FULL refresh time is proportional to the total result set size, which is stable. For SLA-sensitive workloads where you'd rather have consistent 500ms refreshes than variable 5ms–500ms refreshes, FULL provides that predictability.
+
+4. **Unsupported-but-planned constructs.** Some queries may parse correctly in DIFFERENTIAL mode but produce suboptimal deltas. Using FULL mode explicitly is a safe fallback while the DVM engine matures.
+
+For most users, **DIFFERENTIAL is the right default**. Use FULL when you have a specific reason.
 
 ### When should I use FULL vs. DIFFERENTIAL vs. IMMEDIATE?
 
@@ -284,7 +298,7 @@ Use **IMMEDIATE** when:
 | ❌ Write amplification | Every DML statement on a base table also executes IVM trigger logic, adding latency to the original transaction. |
 | ❌ Serialized concurrent writes | An `ExclusiveLock` is taken on the stream table during maintenance, serializing writers. |
 | ❌ Limited SQL support | Window functions, recursive CTEs, `LATERAL` joins, scalar subqueries, and TopK (`ORDER BY … LIMIT`) are not supported — use `DIFFERENTIAL` instead. |
-| ❌ No cascading | IMMEDIATE stream tables that depend on other IMMEDIATE stream tables are not supported. |
+| ❌ Cascading limitations | Cascading IMMEDIATE stream tables work but may require manual refresh for deep chains. |
 | ❌ No throttling | The refresh cannot be delayed or rate-limited. |
 
 **Deferred mode (`FULL` / `DIFFERENTIAL`)**
@@ -300,6 +314,18 @@ Use **IMMEDIATE** when:
 | ❌ Infrastructure overhead | Requires change buffer tables, a background worker, and frontier tracking. |
 
 **Rule of thumb:** use `IMMEDIATE` when the query is simple and freshness within the transaction matters. Use `DIFFERENTIAL` (or `FULL`) for complex queries, high concurrency, or when you want to decouple write latency from view maintenance.
+
+### What happens if I have an IMMEDIATE stream table between two DIFFERENTIAL stream tables in a dependency chain?
+
+Consider the chain: `source → ST_A (DIFFERENTIAL) → ST_B (IMMEDIATE) → ST_C (DIFFERENTIAL)`. This is a valid but unusual configuration with important behavioral consequences:
+
+- **ST_A** refreshes on its schedule (e.g., every 1 minute) via the background scheduler.
+- **ST_B** is IMMEDIATE, so it has no CDC triggers on ST_A — it uses statement-level IVM triggers. But ST_A is updated by the *scheduler* (not by user DML), and the scheduler's `MERGE` operation *does* fire statement-level triggers on ST_A's dependents. So ST_B updates within the scheduler's transaction when ST_A refreshes.
+- **ST_C** is DIFFERENTIAL and depends on ST_B. Since ST_B is a stream table, ST_C's CDC triggers fire when ST_B is modified. The scheduler refreshes ST_C on its own schedule.
+
+The practical concern: **write latency stacking.** When the scheduler refreshes ST_A, ST_B's IVM triggers fire synchronously within that same transaction, adding IVM overhead to ST_A's refresh. If ST_B's delta computation is expensive, it slows down the entire scheduler cycle.
+
+**Recommendation:** Avoid mixing IMMEDIATE into the middle of a deferred chain. Either make the entire chain IMMEDIATE (for small, simple queries) or keep it entirely DIFFERENTIAL. If you need read-your-writes for one specific step, consider making that the terminal (leaf) stream table in the chain.
 
 ### What schedule formats are supported?
 
@@ -322,6 +348,19 @@ Use **IMMEDIATE** when:
 | Aliases | `@hourly`, `@daily` | Built-in shortcuts |
 
 **CALCULATED mode:** Pass `NULL` as the schedule to inherit the schedule from downstream dependents.
+
+### How do cron schedules handle timezones? What does `@daily` really mean?
+
+pg_trickle evaluates cron expressions in **UTC**. The underlying `croner` crate computes the next occurrence from a UTC timestamp, and the scheduler compares this against `chrono::Utc::now()`. There is no per-stream-table timezone setting.
+
+This means:
+- `@daily` (equivalent to `0 0 * * *`) fires at **midnight UTC**, not midnight in your local timezone.
+- `@hourly` (equivalent to `0 * * * *`) fires at the top of each UTC hour.
+- `0 9 * * 1-5` fires at 09:00 UTC on weekdays — if your server is in `America/New_York`, that's 04:00 or 05:00 local time depending on DST.
+
+If you need a schedule aligned to a local timezone, convert the desired local time to UTC and write the cron expression accordingly. For example, to refresh at 08:00 `Europe/Oslo` (UTC+1 in winter, UTC+2 in summer), use `0 6 * * *` in summer and `0 7 * * *` in winter — or accept the 1-hour seasonal shift and pick one.
+
+**Tip:** For most analytics workloads, UTC-based schedules are preferable because they don't shift with daylight saving transitions.
 
 ### What is the minimum allowed schedule?
 
@@ -379,6 +418,14 @@ SELECT pgtrickle.create_stream_table('order_totals',
 ```
 
 The new stream table will perform a full initial refresh to populate itself. The original query is preserved in the catalog's `original_query` column for reference.
+
+### Why doesn't `alter_stream_table()` support changing the defining query?
+
+`alter_stream_table()` lets you change operational parameters (schedule, refresh mode, status, diamond consistency) because those are metadata updates that don't affect the physical table or delta computation. But changing the defining query is fundamentally different — it requires rebuilding the `__pgt_row_id` hash computation, hidden auxiliary columns (`__pgt_count`, `__pgt_sum_x`), the DVM operator tree, the generated delta SQL, and the MERGE template. In practice, this means dropping the storage table and recreating it from scratch.
+
+In principle, `alter_stream_table()` could automate this by performing a drop + recreate under the hood. The reason it doesn't (yet) is that a query change is a destructive operation — it drops all indexes, user-defined triggers, and grants on the stream table. Making this explicit (separate `drop_stream_table` + `create_stream_table` calls) forces users to be aware of what they're losing and to re-apply any customizations afterward.
+
+This may change in a future release — an `alter_stream_table(..., defining_query => '...')` that automates the drop-and-recreate cycle (with clear warnings about side effects) is a reasonable convenience improvement.
 
 ### How do I trigger a manual refresh?
 
@@ -592,17 +639,8 @@ The following are rejected with clear error messages and suggested rewrites:
 |---|---|---|
 | `TABLESAMPLE` | Stream tables materialize the full result set | Use `WHERE random() < fraction` in consuming query |
 | Window functions in expressions | Cannot be differentially maintained | Move window function to a separate column |
-| `LIMIT` / `OFFSET` | Stream tables materialize the full result set | Apply when querying the stream table |
+| `LIMIT` / `OFFSET` (without `ORDER BY`) | Stream tables materialize the full result set; `ORDER BY … LIMIT N` *is* supported as [TopK](#topk-order-by--limit) | Apply when querying the stream table, or add `ORDER BY` to use the TopK pattern |
 | `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
-
-The following were previously rejected but are **now supported** via automatic parse-time rewrites:
-
-| Feature | How It Works |
-|---|---|
-| `DISTINCT ON (…)` | Auto-rewritten to `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) = 1` subquery |
-| `GROUPING SETS` / `CUBE` / `ROLLUP` | Auto-rewritten to `UNION ALL` of separate `GROUP BY` queries |
-| `NATURAL JOIN` | Common columns resolved at parse time; explicit equi-join synthesized |
-| `ALL (subquery)` | Rewritten to `NOT EXISTS` with negated condition (AntiJoin) |
 
 Each rejected feature is explained in detail in the [Why Are These SQL Features Not Supported?](#why-are-these-sql-features-not-supported) section below.
 
@@ -727,9 +765,9 @@ This is a known edge case. When a join key column is updated in the same refresh
 - You can stagger changes across refresh cycles.
 - Use FULL mode for tables where this pattern is common.
 
-### Why is NATURAL JOIN rejected?
+### How does NATURAL JOIN work?
 
-`NATURAL JOIN` is **now fully supported** — it is no longer rejected. At parse time, pg_trickle resolves the common columns between the two tables and synthesizes explicit equi-join conditions. The internal `__pgt_row_id` column is excluded from common column resolution, so NATURAL JOINs between stream tables also work correctly.
+`NATURAL JOIN` is fully supported. At parse time, pg_trickle resolves the common columns between the two tables and synthesizes explicit equi-join conditions. The internal `__pgt_row_id` column is excluded from common column resolution, so NATURAL JOINs between stream tables also work correctly.
 
 ---
 
@@ -951,9 +989,7 @@ If you have very high-throughput source tables (>10K writes/sec), consider enabl
 
 ### What happens when I `TRUNCATE` a source table?
 
-**TRUNCATE is now captured** via a statement-level `AFTER TRUNCATE` trigger that writes a `T` marker row to the change buffer. When the differential refresh engine detects this marker, it automatically falls back to a full refresh for that cycle, ensuring the stream table stays consistent.
-
-Previously, TRUNCATE bypassed row-level triggers entirely. This is no longer a concern — both FULL and DIFFERENTIAL mode stream tables handle TRUNCATE correctly.
+TRUNCATE is captured via a statement-level `AFTER TRUNCATE` trigger that writes a `T` marker row to the change buffer. When the differential refresh engine detects this marker, it automatically falls back to a full refresh for that cycle, ensuring the stream table stays consistent. Both FULL and DIFFERENTIAL mode stream tables handle TRUNCATE correctly.
 
 ### Are CDC triggers automatically cleaned up?
 
@@ -2210,7 +2246,7 @@ which is far harder to diagnose.
 
 ### How does `NATURAL JOIN` work?
 
-`NATURAL JOIN` is **now fully supported**. At parse time, pg_trickle resolves the common columns between the two tables (using `OpTree::output_columns()`) and synthesizes explicit equi-join conditions. This supports `INNER`, `LEFT`, `RIGHT`, and `FULL` NATURAL JOIN variants.
+`NATURAL JOIN` is fully supported. At parse time, pg_trickle resolves the common columns between the two tables (using `OpTree::output_columns()`) and synthesizes explicit equi-join conditions. This supports `INNER`, `LEFT`, `RIGHT`, and `FULL` NATURAL JOIN variants.
 
 Internally, `NATURAL JOIN` is converted to an explicit `JOIN ... ON` before the DVM engine builds its operator tree, so delta computation works identically to a manually specified equi-join.
 
@@ -2218,7 +2254,7 @@ Internally, `NATURAL JOIN` is converted to an explicit `JOIN ... ON` before the 
 
 ### How do `GROUPING SETS`, `CUBE`, and `ROLLUP` work?
 
-`GROUPING SETS`, `CUBE`, and `ROLLUP` are **now fully supported** via an automatic parse-time rewrite. pg_trickle decomposes these constructs into a `UNION ALL` of separate `GROUP BY` queries before the DVM engine processes the query.
+`GROUPING SETS`, `CUBE`, and `ROLLUP` are fully supported via an automatic parse-time rewrite. pg_trickle decomposes these constructs into a `UNION ALL` of separate `GROUP BY` queries before the DVM engine processes the query.
 
 > **Explosion guard:** `CUBE(N)` generates $2^N$ branches. pg_trickle rejects
 > CUBE/ROLLUP combinations that would produce more than **64 branches** to
@@ -2243,7 +2279,7 @@ SELECT NULL::text, NULL::text, SUM(amount) FROM sales
 
 ### How does `DISTINCT ON (…)` work?
 
-`DISTINCT ON` is **now fully supported** via an automatic parse-time rewrite. pg_trickle transparently transforms `DISTINCT ON` into a `ROW_NUMBER()` window function subquery:
+`DISTINCT ON` is fully supported via an automatic parse-time rewrite. pg_trickle transparently transforms `DISTINCT ON` into a `ROW_NUMBER()` window function subquery:
 
 ```sql
 -- This defining query:
@@ -2289,7 +2325,7 @@ Stream tables materialize the complete result set and keep it synchronized with 
 
 3. **Semantic mismatch.** Users who write `LIMIT 100` typically want to limit what they *read*, not what is *stored*.
 
-**Exception — TopK pattern:** When the defining query has a top-level `ORDER BY … LIMIT N` (constant integer, no OFFSET), pg_trickle recognizes this as a "TopK" query and accepts it. The stream table stores only the top-N rows and is refreshed via a MERGE-based scoped-recomputation strategy. See the SQL Reference for details.
+**Exception — TopK pattern:** When the defining query has a top-level `ORDER BY … LIMIT N` (constant integer, no OFFSET), pg_trickle recognizes this as a **TopK** query and **accepts it**. The `ORDER BY` clause is required — bare `LIMIT` without `ORDER BY` is always rejected because it selects an arbitrary subset. With `ORDER BY`, the top-N boundary is well-defined and the stream table stores exactly those rows. See the [TopK section](#topk-order-by--limit) for details.
 
 **Rewrite (when TopK doesn't apply):**
 ```sql
@@ -2336,22 +2372,9 @@ FROM pgtrickle.employees_ranked
 
 2. **No direct DML.** Since users cannot directly modify stream table rows, there is no use case for locking rows inside the defining query. The locks would be held for the duration of the refresh transaction and then released, serving no purpose.
 
-### Why is `ALL (subquery)` not supported?
+### How does `ALL (subquery)` work?
 
-`ALL (subquery)` compares a value against every row returned by a subquery (e.g., `WHERE x > ALL (SELECT y FROM t)`). It is rejected because:
-
-1. **Negation rewrite complexity.** `x > ALL (SELECT y FROM t)` is logically equivalent to `NOT EXISTS (SELECT 1 FROM t WHERE y >= x)`, which pg_trickle can handle via its anti-join operator. The rewrite is straightforward.
-
-2. **Rare usage.** `ALL (subquery)` is uncommon in analytical queries. Supporting it directly would add operator complexity for minimal benefit.
-
-**Rewrite:**
-```sql
--- Instead of:
-WHERE amount > ALL (SELECT threshold FROM limits)
-
--- Use NOT EXISTS:
-WHERE NOT EXISTS (SELECT 1 FROM limits WHERE threshold >= amount)
-```
+`ALL (subquery)` comparisons (e.g., `WHERE x > ALL (SELECT y FROM t)`) are supported via an automatic rewrite to `NOT EXISTS`. For example, `x > ALL (SELECT y FROM t)` is rewritten to `NOT EXISTS (SELECT 1 FROM t WHERE y >= x)`, which pg_trickle handles via its anti-join operator.
 
 ### Why is `ORDER BY` silently discarded?
 
