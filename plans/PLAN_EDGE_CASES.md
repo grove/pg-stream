@@ -452,15 +452,14 @@ insensitivity, no-FROM clause.
 | **Impact** | Stream table silently uses new function logic without a full rebase |
 | **Current mitigation** | Manual full refresh after function changes |
 | **Documented in** | FAQ § "Schema Changes" |
+| **Status** | ✅ **IMPLEMENTED** — `function_hashes TEXT` column on `pgt_stream_tables` (migration 0.2.1→0.2.2); `check_proc_hashes_changed()` in `refresh.rs` queries `md5(prosrc \|\| coalesce(probin::text,''))` from `pg_proc` on each diff refresh; on mismatch calls `mark_for_reinitialize` + NOTICE; on first call stores baseline silently |
 
-**Proposed fix:**
+**Implemented fix:**
 
-1. **Short term (P1):** Document this prominently in the "Gotchas" section
-   of the Getting Started guide.
-2. **Medium term:** Implement a `pg_proc.proversion` polling check — on
-   each refresh cycle, compare `xmin` or a hash of `pg_proc.prosrc` for
-   all functions referenced in the defining query. If changed, trigger an
-   automatic full refresh and log a NOTICE.
+Polling via `pg_proc` on each differential refresh:
+- On first call (stored hashes = NULL): compute and persist baseline. No reinit.
+- On following calls: recompute hashes. If any differ → `mark_for_reinitialize` + NOTICE. The next scheduler cycle performs a full refresh.
+- Uses `md5(string_agg(prosrc || coalesce(probin::text,''), ',' ORDER BY oid))` to handle polymorphic overloads robustly.
 
 ---
 

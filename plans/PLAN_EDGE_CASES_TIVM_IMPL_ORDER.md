@@ -5,10 +5,11 @@
 - [sql/PLAN_TRANSACTIONAL_IVM_PART_2.md](sql/PLAN_TRANSACTIONAL_IVM_PART_2.md) (Part 2)
 
 **Date:** 2026-03-04  
-**Last updated:** 2026-03-04  
-**Status:** Stages 1–2 COMPLETE (incl. bug fixes + test coverage).
-Stage 3 Phase 1 (Tasks 1.1–1.3) COMPLETE. Stage 3 Phase 2 Tasks 2.1–2.4 COMPLETE.
-Only Task 2.3 (ROWS FROM) remains — deferred (very low demand).
+**Last updated:** 2026-03-05  
+**Status:** Stages 1–3 COMPLETE (incl. bug fixes + test coverage).
+Task 2.3 (ROWS FROM) deferred.
+Stage 4 partially complete: EC-16 ✅ Done, Task 3.5 ✅ Done; Tasks 3.1–3.4 not started.
+Stage 5 COMPLETE: Tasks 4.1, 4.2, 4.3 all done.
 **Principle:** No SQL-surface expansion while P0 correctness bugs are open.
 
 ---
@@ -108,19 +109,19 @@ touches `src/refresh.rs`; Part 2 Phase 3 touches `src/cdc.rs`).
 
 ### EC-16 (PLAN_EDGE_CASES P1 remainder)
 
-| # | Item | Effort |
-|---|------|--------|
-| 18 | **EC-16** — `pg_proc` hash polling for undetected ALTER FUNCTION changes | 2 days |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 18 | **EC-16** — `pg_proc` hash polling for undetected ALTER FUNCTION changes | 2 days | ✅ Done — `function_hashes` TEXT column on `pgt_stream_tables` (migration 0.2.1→0.2.2); `check_proc_hashes_changed()` in `refresh.rs` computes `md5(prosrc)` map from `pg_proc` and drives `mark_for_reinitialize` on mismatch |
 
 ### Part 2 Phase 3 — Trigger-Level Optimisations
 
-| # | Item | Effort |
-|---|------|--------|
-| 19 | **Part 2 Task 3.1** — Column-level change detection for UPDATE: `changed_cols` bitmask in buffer | 3–4 days |
-| 20 | **Part 2 Task 3.2** — Incremental TRUNCATE: negation delta for simple single-source stream tables | 2–3 days |
-| 21 | **Part 2 Task 3.3** — Buffer table partitioning by LSN range: `pg_trickle.buffer_partitioning` GUC | 3–4 days |
-| 22 | **Part 2 Task 3.4** — Skip-unchanged-column scanning in delta SQL | 1–2 days |
-| 23 | **Part 2 Task 3.5** — Online ADD COLUMN without full reinit | 2–3 days |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 19 | **Part 2 Task 3.1** — Column-level change detection for UPDATE: `changed_cols` bitmask in buffer | 3–4 days | ❌ Not started |
+| 20 | **Part 2 Task 3.2** — Incremental TRUNCATE: negation delta for simple single-source stream tables | 2–3 days | ❌ Not started |
+| 21 | **Part 2 Task 3.3** — Buffer table partitioning by LSN range: `pg_trickle.buffer_partitioning` GUC | 3–4 days | ❌ Not started |
+| 22 | **Part 2 Task 3.4** — Skip-unchanged-column scanning in delta SQL | 1–2 days | ❌ Not started (depends on Task 3.1) |
+| 23 | **Part 2 Task 3.5** — Online ADD COLUMN without full reinit | 2–3 days | ✅ Done — `SchemaChangeKind::AddColumnOnly`; `alter_change_buffer_add_columns()` in `cdc.rs` extends buffer + rebuilds trigger + refreshes snapshot in-place |
 
 **Note on ordering within Phase 3:** Task 3.1 must land before 3.4 (3.4
 depends on the `changed_cols` bitmask). Tasks 3.2, 3.3, and 3.5 are
@@ -135,11 +136,11 @@ independent of each other.
 
 Pure additions. Independent of everything above.
 
-| # | Item | Effort |
-|---|------|--------|
-| 24 | **Part 2 Task 4.1** — Regression aggregates: `CORR`, `COVAR_*`, `REGR_*` via group-rescan | 2–3 days |
-| 25 | **Part 2 Task 4.2** — Hypothetical-set aggregates: `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()` WITHIN GROUP | 1–2 days |
-| 26 | **Part 2 Task 4.3** — `XMLAGG` via group-rescan | 0.5 day |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 24 | **Part 2 Task 4.1** — Regression aggregates: `CORR`, `COVAR_*`, `REGR_*` via group-rescan | 2–3 days | ✅ Done — already fully wired in prior session (`AggFunc::Corr/CovarPop/RegrAvgx` etc. + match arms + `is_group_rescan`) |
+| 25 | **Part 2 Task 4.2** — Hypothetical-set aggregates: `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()` WITHIN GROUP | 1–2 days | ✅ Done — `HypRank/HypDenseRank/HypPercentRank/HypCumeDist` variants; `is_ordered_set` updated; match arm wired |
+| 26 | **Part 2 Task 4.3** — `XMLAGG` via group-rescan | 0.5 day | ✅ Done — `AggFunc::XmlAgg`; `sql_name()` → `"XMLAGG"`; `is_group_rescan()` true; match arm wired |
 
 **Completion gate:** `just test-all` green + 36+ aggregate functions confirmed in unit tests.
 

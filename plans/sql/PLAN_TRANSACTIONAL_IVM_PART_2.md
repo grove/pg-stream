@@ -1,8 +1,8 @@
 # Plan: Expanding SQL Coverage in Trigger-Based CDC Mode (Part 2)
 
 **Date:** 2026-03-03  
-**Last updated:** 2026-03-04  
-**Status:** READY — Stages 1 and 2 of [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](../PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) are complete (EC-06 fully fixed incl. post-impl bug fixes, EC-01 complete for all join types, all Stage 2 safety items done). This plan is unblocked.  
+**Last updated:** 2026-03-05  
+**Status:** Stage 3 (Tasks 1.1–2.4) complete. Stage 4 (EC-16 + Task 3.5) partially complete. Stage 5 (Tasks 4.1–4.3) complete.  
 **Branch:** `edge-cases-and-transactional-ivm`  
 **Scope:** Limitations of `pg_trickle.cdc_mode = 'trigger'` (the default),
 and a phased implementation plan to maximise the SQL surface area supported
@@ -164,9 +164,9 @@ area available to trigger-mode users.
 | **G4** | SubLinks inside deeply nested OR | ✅ **DONE** — handles `AND(AND(OR(EXISTS)))` | `flatten_and_conjuncts()` helper + updated `and_contains_or_with_sublink()` + `rewrite_and_with_or_sublinks()` flattens AND tree recursively | — | 2 |
 | **G5** | ROWS FROM() with multiple functions | Rejected | Parser only handles single SRF | Extend `LateralFunction` to zip multiple SRFs | 2 |
 | **G6** | LATERAL with RIGHT/FULL JOIN | Rejected (PostgreSQL constraint) | PostgreSQL itself rejects RIGHT/FULL JOIN LATERAL | Error message updated to explain PostgreSQL-level constraint (**message improved**) | — |
-| **G7** | Regression aggregates (11 functions) | Rejected | Not implemented | Group-rescan (same pattern as existing aggregates) | 4 |
-| **G8** | Hypothetical-set aggregates (4 funcs) | Rejected | Not implemented | Group-rescan | 4 |
-| **G9** | XMLAGG | Rejected | Not implemented | Group-rescan | 4 |
+| **G7** | Regression aggregates (11 functions) | ✅ **DONE** — group-rescan | Already fully wired in prior session (`AggFunc::Corr`, `CovarPop`, `RegrAvgx` etc. + match arms + `is_group_rescan`) | — | 4 |
+| **G8** | Hypothetical-set aggregates (4 funcs) | ✅ **DONE** — group-rescan | `HypRank/HypDenseRank/HypPercentRank/HypCumeDist` variants; `is_ordered_set` updated in `agg_to_rescan_sql` | — | 4 |
+| **G9** | XMLAGG | ✅ **DONE** — group-rescan | `AggFunc::XmlAgg`; `sql_name()` → `"XMLAGG"`; `is_group_rescan()` true | — | 4 |
 | **G10** | Recursive CTEs in IMMEDIATE mode | Rejected | Fixpoint iteration not validated with transition tables | Validate and enable | 5 |
 | **G11** | TopK in IMMEDIATE mode | Rejected | Scoped recompute is a deferred/full pattern | Statement-level TopK maintenance | 5 |
 | **G12** | Window functions nested in expressions | ✅ **DONE** — auto-rewritten | `rewrite_nested_window_exprs()` lifts nested window funcs to inner subquery | Wired in `api.rs` before DISTINCT ON | 1 |
@@ -636,71 +636,15 @@ group-rescan strategy, bringing the total from 25 to 53.
 
 ### Task 4.1: Regression Aggregates (G7) — 11 Functions
 
-Implement `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_AVGX`, `REGR_AVGY`,
-`REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_SLOPE`, `REGR_SXX`,
-`REGR_SXY`, `REGR_SYY`.
-
-These are all two-argument aggregate functions that take (Y, X) pairs.
-The group-rescan strategy applies directly:
-
-1. Detect affected groups from the delta (groups where any row was
-   inserted, updated, or deleted).
-2. For each affected group, re-aggregate from source:
-   `SELECT group_key, CORR(y, x) AS corr_val FROM source GROUP BY group_key`
-3. Apply the result as an UPDATE to the stream table.
-
-**Files changed:**
-- `src/dvm/parser.rs` — add `AggFunc::Corr`, `AggFunc::CovarPop`,
-  `AggFunc::CovarSamp`, and 8 `AggFunc::Regr*` variants.
-  Update `parse_aggregate()` to recognise these function names.
-- `src/dvm/operators/aggregate.rs` — add cases to `group_rescan_agg_sql()`
-  for each new variant. The group-rescan pattern is identical to existing
-  aggregates (BOOL_AND, STRING_AGG, etc.) — emit the aggregate function
-  call over the source table grouped by the same GROUP BY keys.
-
-**Tests:**
-- Unit tests: 11 tests (one per aggregate), verifying delta SQL generation
-- E2E test: stream table with `CORR(y, x)`, INSERT/DELETE, verify delta
+**Status:** ✅ **DONE** — Already fully wired in a prior session. `AggFunc::Corr`, `CovarPop`, `CovarSamp`, `RegrAvgx`, `RegrAvgy`, `RegrCount`, `RegrIntercept`, `RegrR2`, `RegrSlope`, `RegrSxx`, `RegrSxy`, `RegrSyy` variants exist in `src/dvm/parser.rs`; all are in the `is_group_rescan()` match arm, have correct `sql_name()` mappings, and are wired in the `extract_aggregates` match block. G7 closed.
 
 ### Task 4.2: Hypothetical-Set Aggregates (G8) — 4 Functions
 
-Implement `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()` as
-**aggregate functions** (not window functions — these are already supported
-as window functions).
-
-Hypothetical-set aggregates use `WITHIN GROUP (ORDER BY ...)` syntax:
-```sql
-SELECT RANK(42) WITHIN GROUP (ORDER BY score) FROM students
-```
-
-The group-rescan strategy works here too: for affected groups, re-aggregate
-from source. The aggregate call syntax includes the hypothetical value and
-the ORDER BY clause.
-
-**Files changed:**
-- `src/dvm/parser.rs` — add `AggFunc::HypRank`, `AggFunc::HypDenseRank`,
-  `AggFunc::HypPercentRank`, `AggFunc::HypCumeDist` variants.  Extend
-  the ordered-set aggregate parsing (already exists for MODE/PERCENTILE)
-  to recognise these.
-- `src/dvm/operators/aggregate.rs` — group-rescan with hypothetical value
-
-**Tests:**
-- Unit tests: 4 tests (one per aggregate)
-- E2E test: stream table with `RANK(x) WITHIN GROUP (ORDER BY ...)`,
-  INSERT/DELETE, verify delta
+**Status:** ✅ **DONE** — `AggFunc::HypRank`, `HypDenseRank`, `HypPercentRank`, `HypCumeDist` variants added to `src/dvm/parser.rs`; all routed through `is_group_rescan()` = true; `is_ordered_set` in `agg_to_rescan_sql` updated to include all four; match arm wired ("rank" / "dense_rank" / "percent_rank" / "cume_dist" → respective variants); `sql_name()` returns `"RANK"` / `"DENSE_RANK"` / `"PERCENT_RANK"` / `"CUME_DIST"`. G8 closed.
 
 ### Task 4.3: XMLAGG (G9)
 
-Implement `XMLAGG(expr ORDER BY ...)`. Group-rescan strategy. Very niche
-but trivial given the established pattern.
-
-**Files changed:**
-- `src/dvm/parser.rs` — add `AggFunc::XmlAgg` variant
-- `src/dvm/operators/aggregate.rs` — group-rescan
-
-**Tests:**
-- Unit test: delta SQL generation
-- E2E test: stream table with XMLAGG, verify delta
+**Status:** ✅ **DONE** — `AggFunc::XmlAgg` variant added to `src/dvm/parser.rs`; `sql_name()` → `"XMLAGG"`; `is_group_rescan()` = true (ORDER BY is passed through inside the call, not via `is_ordered_set`); match arm wired ("xmlagg" → `AggFunc::XmlAgg`). G9 closed.
 
 ---
 
