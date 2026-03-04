@@ -790,11 +790,18 @@ pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         name.replace('"', "\"\""),
     );
 
-    // Reconstruct the full TopK query from base query + ORDER BY + LIMIT.
-    let topk_query = format!(
-        "{} ORDER BY {} LIMIT {}",
-        st.defining_query, topk_order_by, topk_limit
-    );
+    // Reconstruct the full TopK query from base query + ORDER BY + LIMIT [+ OFFSET].
+    let topk_query = if let Some(offset) = st.topk_offset {
+        format!(
+            "{} ORDER BY {} LIMIT {} OFFSET {}",
+            st.defining_query, topk_order_by, topk_limit, offset
+        )
+    } else {
+        format!(
+            "{} ORDER BY {} LIMIT {}",
+            st.defining_query, topk_order_by, topk_limit
+        )
+    };
 
     // Compute row_id using the same hash formula as normal refresh.
     let row_id_expr = crate::dvm::row_id_expr_for_query(&st.defining_query);
@@ -1915,6 +1922,7 @@ mod tests {
             frontier: None,
             topk_limit: None,
             topk_order_by: None,
+            topk_offset: None,
             diamond_consistency: crate::dag::DiamondConsistency::None,
             diamond_schedule_policy: crate::dag::DiamondSchedulePolicy::default(),
         }

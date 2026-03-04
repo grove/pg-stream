@@ -639,7 +639,7 @@ The following are rejected with clear error messages and suggested rewrites:
 |---|---|---|
 | `TABLESAMPLE` | Stream tables materialize the full result set | Use `WHERE random() < fraction` in consuming query |
 | Window functions in expressions | Cannot be differentially maintained | Move window function to a separate column |
-| `LIMIT` / `OFFSET` (without `ORDER BY`) | Stream tables materialize the full result set; `ORDER BY … LIMIT N` *is* supported as [TopK](#topk-order-by--limit) | Apply when querying the stream table, or add `ORDER BY` to use the TopK pattern |
+| `LIMIT` / `OFFSET` (without `ORDER BY`) | Stream tables materialize the full result set; `ORDER BY … LIMIT N [OFFSET M]` *is* supported as [TopK](#topk-order-by--limit) | Apply when querying the stream table, or add `ORDER BY` + `LIMIT` to use the TopK pattern |
 | `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
 
 Each rejected feature is explained in detail in the [Why Are These SQL Features Not Supported?](#why-are-these-sql-features-not-supported) section below.
@@ -658,7 +658,7 @@ Stream tables are heap tables with no guaranteed row order. Apply `ORDER BY` whe
 SELECT * FROM regional_totals ORDER BY total DESC;
 ```
 
-**Exception:** When `ORDER BY` is paired with `LIMIT N` (no OFFSET), pg_trickle recognizes the [TopK pattern](#topk-order-by--limit) and preserves both the ordering and the limit.
+**Exception:** When `ORDER BY` is paired with `LIMIT N` (with or without `OFFSET M`), pg_trickle recognizes the [TopK pattern](#topk-order-by--limit) and preserves the ordering, limit, and offset.
 
 ### Which aggregates support DIFFERENTIAL mode?
 
@@ -875,17 +875,17 @@ When a row's `PARTITION BY` key changes (e.g., an employee moves departments), t
 
 ## TopK (ORDER BY … LIMIT)
 
-TopK queries (`ORDER BY ... LIMIT N` without OFFSET) are handled via a
+TopK queries (`ORDER BY ... LIMIT N`, optionally with `OFFSET M`) are handled via a
 specialized MERGE-based strategy that re-executes the bounded query each cycle.
 This section explains how it works and its limitations.
 
 ### How does `ORDER BY … LIMIT N` work in a stream table?
 
-When a defining query has a top-level `ORDER BY … LIMIT N` (with a constant integer N and no OFFSET), pg_trickle recognizes it as a **TopK pattern**. The stream table stores only the top-N rows and is refreshed via a MERGE-based scoped-recomputation strategy:
+When a defining query has a top-level `ORDER BY … LIMIT N` (with a constant integer N), pg_trickle recognizes it as a **TopK pattern**. An optional `OFFSET M` (constant integer) selects a "page" within the ranked result. The stream table stores exactly N rows and is refreshed via a MERGE-based scoped-recomputation strategy:
 
-1. On each refresh, the full query (with ORDER BY + LIMIT) is re-executed against the source tables.
+1. On each refresh, the full query (with ORDER BY + LIMIT, and OFFSET if present) is re-executed against the source tables.
 2. The result is merged into the stream table using `MERGE` with `NOT MATCHED BY SOURCE` for deletes.
-3. The catalog records `topk_limit` and `topk_order_by` for the stream table.
+3. The catalog records `topk_limit`, `topk_order_by`, and optionally `topk_offset` for the stream table.
 
 TopK bypasses the DVM delta pipeline — it always re-executes the bounded query. This is efficient because the result set is bounded by N.
 
@@ -893,13 +893,24 @@ TopK bypasses the DVM delta pipeline — it always re-executes the bounded query
 SELECT pgtrickle.create_stream_table('top_customers',
     'SELECT customer_id, total FROM order_totals ORDER BY total DESC LIMIT 100',
     '1m', 'DIFFERENTIAL');
+
+-- With OFFSET — "page 2" of the leaderboard (rows 101–200):
+SELECT pgtrickle.create_stream_table('next_customers',
+    'SELECT customer_id, total FROM order_totals ORDER BY total DESC LIMIT 100 OFFSET 100',
+    '1m', 'DIFFERENTIAL');
 ```
 
-### Why is OFFSET not supported with TopK?
+### Does OFFSET work with TopK?
 
-`OFFSET` combined with `LIMIT` creates a **sliding window** (`LIMIT 10 OFFSET 20` = rows 21–30). When source data changes, rows shift positions, causing the entire window to shift. This makes incremental maintenance impractical — every change could evict and admit different rows.
+**Yes.** `ORDER BY … LIMIT N OFFSET M` is fully supported. The stream table stores exactly N rows starting from position M+1 in the ranked result. This is useful for:
 
-TopK without OFFSET has a stable boundary: only rows that cross the N-th position threshold change membership. `OFFSET` destroys this stability.
+- **Paginated dashboards:** Each page is a separate stream table with a different OFFSET.
+- **Excluding outliers:** `OFFSET 5 LIMIT 50` skips the top 5 and shows the next 50.
+- **Windowed leaderboards:** `OFFSET 10 LIMIT 10` shows the "second tier."
+
+**Caveat:** When source data changes, the "page" can shift — a row on page 3 may move to page 2 or 4. The stream table always reflects the current state of the page at the time of the last refresh.
+
+`OFFSET 0` is treated as no offset.
 
 ### What happens when a row below the top-N cutoff rises above it?
 
@@ -927,7 +938,7 @@ FROM employees e JOIN departments d ON e.dept_id = d.id
 ORDER BY e.salary DESC LIMIT 20
 ```
 
-The only restriction is that TopK cannot be combined with set operations (`UNION`/`INTERSECT`/`EXCEPT`), `GROUPING SETS`/`CUBE`/`ROLLUP`, or `OFFSET`.
+The only restriction is that TopK cannot be combined with set operations (`UNION`/`INTERSECT`/`EXCEPT`) or `GROUPING SETS`/`CUBE`/`ROLLUP`.
 
 ---
 
@@ -2325,7 +2336,7 @@ Stream tables materialize the complete result set and keep it synchronized with 
 
 3. **Semantic mismatch.** Users who write `LIMIT 100` typically want to limit what they *read*, not what is *stored*.
 
-**Exception — TopK pattern:** When the defining query has a top-level `ORDER BY … LIMIT N` (constant integer, no OFFSET), pg_trickle recognizes this as a **TopK** query and **accepts it**. The `ORDER BY` clause is required — bare `LIMIT` without `ORDER BY` is always rejected because it selects an arbitrary subset. With `ORDER BY`, the top-N boundary is well-defined and the stream table stores exactly those rows. See the [TopK section](#topk-order-by--limit) for details.
+**Exception — TopK pattern:** When the defining query has a top-level `ORDER BY … LIMIT N` (constant integer, optionally with `OFFSET M`), pg_trickle recognizes this as a **TopK** query and **accepts it**. The `ORDER BY` clause is required — bare `LIMIT` without `ORDER BY` is always rejected because it selects an arbitrary subset. With `ORDER BY`, the top-N boundary is well-defined and the stream table stores exactly those N rows (starting from position M+1 if OFFSET is specified). See the [TopK section](#topk-order-by--limit) for details.
 
 **Rewrite (when TopK doesn't apply):**
 ```sql

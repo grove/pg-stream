@@ -5867,8 +5867,9 @@ pub fn reject_limit_offset(query: &str) -> Result<(), PgTrickleError> {
     }
     if !select.limitOffset.is_null() {
         return Err(PgTrickleError::UnsupportedOperator(
-            "OFFSET is not supported in defining queries. \
-             Stream tables materialize the full result set."
+            "OFFSET is not supported in defining queries without ORDER BY + LIMIT. \
+             Use ORDER BY + LIMIT + OFFSET for paged TopK stream tables, \
+             or omit OFFSET to materialize the full result set."
                 .into(),
         ));
     }
@@ -5881,9 +5882,11 @@ pub fn reject_limit_offset(query: &str) -> Result<(), PgTrickleError> {
 pub struct TopKInfo {
     /// The LIMIT value as an integer.
     pub limit_value: i64,
-    /// The full defining query including ORDER BY + LIMIT (for refresh).
+    /// The OFFSET value as an integer, if present. `None` means no OFFSET.
+    pub offset_value: Option<i64>,
+    /// The full defining query including ORDER BY + LIMIT [+ OFFSET] (for refresh).
     pub full_query: String,
-    /// The defining query with ORDER BY and LIMIT stripped (for DVM, deps).
+    /// The defining query with ORDER BY, LIMIT, and OFFSET stripped (for DVM, deps).
     pub base_query: String,
     /// The deparsed ORDER BY clause (e.g., "score DESC, name ASC").
     pub order_by_sql: String,
@@ -5948,15 +5951,33 @@ pub fn detect_topk_pattern(query: &str) -> Result<Option<TopKInfo>, PgTrickleErr
         return Ok(None);
     }
 
-    // Reject ORDER BY + LIMIT + OFFSET
-    if !select.limitOffset.is_null() {
-        return Err(PgTrickleError::UnsupportedOperator(
-            "OFFSET is not supported with LIMIT in defining queries. \
-             Use ORDER BY + LIMIT alone for TopK patterns, and apply OFFSET \
-             when querying the stream table."
-                .into(),
-        ));
-    }
+    // Extract OFFSET value if present (must be a constant non-negative integer).
+    let offset_value = if !select.limitOffset.is_null() {
+        match unsafe { extract_const_int_from_node(select.limitOffset) } {
+            Some(v) if v >= 0 => {
+                if v == 0 {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+            Some(_) => {
+                return Err(PgTrickleError::UnsupportedOperator(
+                    "OFFSET must be a non-negative constant integer.".into(),
+                ));
+            }
+            None => {
+                return Err(PgTrickleError::UnsupportedOperator(
+                    "OFFSET in defining queries must be a constant integer \
+                     (e.g., OFFSET 10). Dynamic expressions like OFFSET (SELECT ...) \
+                     are not supported."
+                        .into(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     // Extract LIMIT value — must be a constant integer.
     let limit_node = select.limitCount;
@@ -5993,6 +6014,7 @@ pub fn detect_topk_pattern(query: &str) -> Result<Option<TopKInfo>, PgTrickleErr
 
     Ok(Some(TopKInfo {
         limit_value,
+        offset_value,
         full_query: query.to_string(),
         base_query,
         order_by_sql,
@@ -6062,12 +6084,13 @@ unsafe fn is_limit_all_node(node: *mut pg_sys::Node) -> bool {
     false
 }
 
-/// Strip ORDER BY and LIMIT / FETCH FIRST clauses from a query string.
+/// Strip ORDER BY, LIMIT, OFFSET, and FETCH FIRST clauses from a query string.
 ///
 /// Finds the last top-level `ORDER BY` keyword (not inside parentheses) and
 /// removes everything from there to the end. This is safe because TopK
 /// detection already verified the query has a top-level ORDER BY + LIMIT
-/// (no set operations).
+/// (no set operations). OFFSET always follows ORDER BY at the top level,
+/// so stripping from ORDER BY onward removes all three clauses.
 fn strip_order_by_and_limit(query: &str) -> String {
     let q = query.trim().trim_end_matches(';').trim();
     let upper = q.to_uppercase();

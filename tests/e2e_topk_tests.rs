@@ -550,22 +550,44 @@ async fn test_topk_limit_all_no_topk() {
 // ── Rejection cases ────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_topk_with_offset_rejected() {
+async fn test_topk_offset_without_limit_rejected() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE topk_rej_off (id INT PRIMARY KEY, val INT)")
         .await;
 
+    // ORDER BY + OFFSET without LIMIT → rejected (unbounded result set)
     let result = db
         .try_execute(
             "SELECT pgtrickle.create_stream_table('topk_rej_off_st', \
-             $$ SELECT id, val FROM topk_rej_off ORDER BY val DESC LIMIT 10 OFFSET 5 $$, \
+             $$ SELECT id, val FROM topk_rej_off ORDER BY val DESC OFFSET 5 $$, \
              '1m', 'FULL')",
         )
         .await;
     assert!(
         result.is_err(),
-        "ORDER BY + LIMIT + OFFSET should be rejected"
+        "ORDER BY + OFFSET (no LIMIT) should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_topk_offset_without_order_by_rejected() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_rej_noob (id INT PRIMARY KEY, val INT)")
+        .await;
+
+    // LIMIT + OFFSET without ORDER BY → rejected (non-deterministic)
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('topk_rej_noob_st', \
+             $$ SELECT id, val FROM topk_rej_noob LIMIT 5 OFFSET 2 $$, \
+             '1m', 'FULL')",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "LIMIT + OFFSET without ORDER BY should be rejected"
     );
 }
 
@@ -586,6 +608,242 @@ async fn test_topk_non_constant_limit_rejected() {
     assert!(
         result.is_err(),
         "Non-constant LIMIT expression should be rejected"
+    );
+}
+
+// ── FETCH FIRST syntax as TopK ─────────────────────────────────────────
+
+// ── OFFSET support (ORDER BY + LIMIT + OFFSET) ────────────────────────
+
+#[tokio::test]
+async fn test_topk_offset_create_basic() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_off_src (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_off_src VALUES (1,10),(2,20),(3,30),(4,40),(5,50),(6,60),(7,70)")
+        .await;
+
+    // Top 7 by score DESC = 70,60,50,40,30,20,10. LIMIT 3 OFFSET 2 = rows 3-5 = 50,40,30
+    db.create_st(
+        "topk_off_basic",
+        "SELECT id, score FROM topk_off_src ORDER BY score DESC LIMIT 3 OFFSET 2",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_off_basic").await, 3);
+
+    let max_score: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_off_basic")
+        .await;
+    assert_eq!(max_score, 50, "Top of page should be 50 (3rd highest)");
+
+    let min_score: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_off_basic")
+        .await;
+    assert_eq!(min_score, 30, "Bottom of page should be 30 (5th highest)");
+}
+
+#[tokio::test]
+async fn test_topk_offset_catalog_metadata() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_offcat (id INT PRIMARY KEY, v INT)")
+        .await;
+    db.execute("INSERT INTO topk_offcat VALUES (1,1),(2,2),(3,3)")
+        .await;
+
+    db.create_st(
+        "topk_offcat_st",
+        "SELECT id, v FROM topk_offcat ORDER BY v DESC LIMIT 2 OFFSET 1",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let topk_offset: i32 = db
+        .query_scalar(
+            "SELECT topk_offset FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'topk_offcat_st'",
+        )
+        .await;
+    assert_eq!(topk_offset, 1, "topk_offset should be stored in catalog");
+
+    let topk_limit: i32 = db
+        .query_scalar(
+            "SELECT topk_limit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'topk_offcat_st'",
+        )
+        .await;
+    assert_eq!(topk_limit, 2, "topk_limit should be stored in catalog");
+}
+
+#[tokio::test]
+async fn test_topk_offset_zero_is_no_offset() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_off0 (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_off0 VALUES (1,10),(2,50),(3,30)")
+        .await;
+
+    // OFFSET 0 is semantically equivalent to no OFFSET
+    db.create_st(
+        "topk_off0_st",
+        "SELECT id, score FROM topk_off0 ORDER BY score DESC LIMIT 2 OFFSET 0",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_off0_st").await, 2);
+
+    // Should get top 2: 50, 30 (same as no offset)
+    let max_score: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_off0_st")
+        .await;
+    assert_eq!(max_score, 50);
+
+    // topk_offset should be NULL (OFFSET 0 treated as no offset)
+    let has_offset: bool = db
+        .query_scalar(
+            "SELECT topk_offset IS NOT NULL FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'topk_off0_st'",
+        )
+        .await;
+    assert!(
+        !has_offset,
+        "OFFSET 0 should not set topk_offset in catalog"
+    );
+}
+
+#[tokio::test]
+async fn test_topk_offset_refresh_page_shifts() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_offref (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_offref VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+        .await;
+
+    // DESC order: 50,40,30,20,10. LIMIT 2 OFFSET 1 → rows 2-3 = 40,30
+    db.create_st(
+        "topk_offref_st",
+        "SELECT id, score FROM topk_offref ORDER BY score DESC LIMIT 2 OFFSET 1",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_offref_st").await, 2);
+    let max_score: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_offref_st")
+        .await;
+    assert_eq!(max_score, 40);
+
+    // Insert a row with score 45 → DESC: 50,45,40,30,20,10. OFFSET 1 LIMIT 2 → 45,40
+    db.execute("INSERT INTO topk_offref VALUES (6, 45)").await;
+    db.refresh_st("topk_offref_st").await;
+
+    assert_eq!(db.count("public.topk_offref_st").await, 2);
+    let max_score: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_offref_st")
+        .await;
+    assert_eq!(max_score, 45, "Page should shift: new second-highest is 45");
+
+    let min_score: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_offref_st")
+        .await;
+    assert_eq!(min_score, 40, "Third-highest is now 40");
+}
+
+#[tokio::test]
+async fn test_topk_offset_with_aggregates() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_offagg (id INT PRIMARY KEY, dept TEXT, salary INT)")
+        .await;
+    db.execute(
+        "INSERT INTO topk_offagg VALUES \
+         (1,'A',100),(2,'A',200),(3,'B',300),(4,'B',400),(5,'C',500),(6,'C',600),(7,'D',50)",
+    )
+    .await;
+
+    // dept totals: D=50, A=300, B=700, C=1100. DESC: C=1100, B=700, A=300, D=50
+    // LIMIT 2 OFFSET 1 → B=700, A=300
+    db.create_st(
+        "topk_offagg_st",
+        "SELECT dept, SUM(salary) AS total FROM topk_offagg GROUP BY dept ORDER BY total DESC LIMIT 2 OFFSET 1",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_offagg_st").await, 2);
+
+    let max_total: i64 = db
+        .query_scalar("SELECT MAX(total) FROM public.topk_offagg_st")
+        .await;
+    assert_eq!(max_total, 700, "Second-highest dept total is B=700");
+
+    let min_total: i64 = db
+        .query_scalar("SELECT MIN(total) FROM public.topk_offagg_st")
+        .await;
+    assert_eq!(min_total, 300, "Third-highest dept total is A=300");
+}
+
+#[tokio::test]
+async fn test_topk_offset_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_offdiff (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_offdiff VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+        .await;
+
+    // DESC: 50,40,30,20,10. LIMIT 2 OFFSET 2 → 30,20
+    db.create_st(
+        "topk_offdiff_st",
+        "SELECT id, score FROM topk_offdiff ORDER BY score DESC LIMIT 2 OFFSET 2",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_offdiff_st").await, 2);
+
+    let max_score: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_offdiff_st")
+        .await;
+    assert_eq!(max_score, 30);
+
+    // Delete score=50 → DESC: 40,30,20,10. OFFSET 2 LIMIT 2 → 20,10
+    db.execute("DELETE FROM topk_offdiff WHERE score = 50")
+        .await;
+    db.refresh_st("topk_offdiff_st").await;
+
+    let max_score: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_offdiff_st")
+        .await;
+    assert_eq!(max_score, 20, "After delete, page shifts down");
+}
+
+#[tokio::test]
+async fn test_topk_offset_non_constant_rejected() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_rej_ncoff (id INT PRIMARY KEY, val INT)")
+        .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('topk_rej_ncoff_st', \
+             $$ SELECT id, val FROM topk_rej_ncoff ORDER BY val DESC LIMIT 10 OFFSET (SELECT 5) $$, \
+             '1m', 'FULL')",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "Non-constant OFFSET expression should be rejected"
     );
 }
 

@@ -95,7 +95,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Source tables** | Tables without primary key | ✅ Full | Content-hash row identity via all columns |
 | **Source tables** | Views as sources | ✅ Full | Auto-inlined as subqueries; CDC triggers land on base tables |
 | **Source tables** | Materialized views | ❌ DIFF / ✅ FULL | Rejected in DIFFERENTIAL (stale snapshot); allowed in FULL |
-| **TopK** | `ORDER BY ... LIMIT N` | ✅ Full | TopK stream tables store only the top-N rows; scoped recomputation via MERGE |
+| **TopK** | `ORDER BY ... LIMIT N [OFFSET M]` | ✅ Full | TopK stream tables store only N rows (optionally from position M+1); scoped recomputation via MERGE |
 | **Ordering** | `ORDER BY` (without LIMIT) | ⚠️ Ignored | Accepted but silently discarded; storage row order is undefined |
 | **Ordering** | `LIMIT` / `OFFSET` (without ORDER BY) | ❌ Rejected | Not supported — stream tables materialize the full result set |
 

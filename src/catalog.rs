@@ -41,6 +41,8 @@ pub struct StreamTableMeta {
     pub topk_limit: Option<i32>,
     /// TopK ORDER BY clause SQL. None means this is not a TopK stream table.
     pub topk_order_by: Option<String>,
+    /// TopK OFFSET value. None means no OFFSET.
+    pub topk_offset: Option<i32>,
     /// Diamond consistency mode for this ST ('none' or 'atomic').
     pub diamond_consistency: DiamondConsistency,
     /// Diamond schedule policy for this convergence node ('fastest' or 'slowest').
@@ -144,6 +146,7 @@ impl StreamTableMeta {
         functions_used: Option<Vec<String>>,
         topk_limit: Option<i32>,
         topk_order_by: Option<&str>,
+        topk_offset: Option<i32>,
         diamond_consistency: DiamondConsistency,
         diamond_schedule_policy: DiamondSchedulePolicy,
     ) -> Result<i64, PgTrickleError> {
@@ -151,8 +154,8 @@ impl StreamTableMeta {
             let row = client
                 .update(
                     "INSERT INTO pgtrickle.pgt_stream_tables \
-                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, diamond_consistency, diamond_schedule_policy) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -166,6 +169,7 @@ impl StreamTableMeta {
                         functions_used.into(),
                         topk_limit.into(),
                         topk_order_by.into(),
+                        topk_offset.into(),
                         diamond_consistency.as_str().into(),
                         diamond_schedule_policy.as_str().into(),
                     ],
@@ -188,7 +192,7 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -213,7 +217,7 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -243,7 +247,7 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -268,7 +272,7 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -624,15 +628,16 @@ impl StreamTableMeta {
         let functions_used = table.get::<Vec<String>>(17).map_err(map_spi)?;
         let topk_limit = table.get::<i32>(18).map_err(map_spi)?;
         let topk_order_by = table.get::<String>(19).map_err(map_spi)?;
+        let topk_offset = table.get::<i32>(20).map_err(map_spi)?;
 
         let diamond_consistency_str = table
-            .get::<String>(20)
+            .get::<String>(21)
             .map_err(map_spi)?
             .unwrap_or_else(|| "none".into());
         let diamond_consistency = DiamondConsistency::from_sql_str(&diamond_consistency_str);
 
         let diamond_schedule_policy_str = table
-            .get::<String>(21)
+            .get::<String>(22)
             .map_err(map_spi)?
             .unwrap_or_else(|| "fastest".into());
         let diamond_schedule_policy =
@@ -658,6 +663,7 @@ impl StreamTableMeta {
             frontier,
             topk_limit,
             topk_order_by,
+            topk_offset,
             diamond_consistency,
             diamond_schedule_policy,
         })
@@ -724,15 +730,16 @@ impl StreamTableMeta {
         let functions_used = row.get::<Vec<String>>(17).map_err(map_spi)?;
         let topk_limit = row.get::<i32>(18).map_err(map_spi)?;
         let topk_order_by = row.get::<String>(19).map_err(map_spi)?;
+        let topk_offset = row.get::<i32>(20).map_err(map_spi)?;
 
         let diamond_consistency_str = row
-            .get::<String>(20)
+            .get::<String>(21)
             .map_err(map_spi)?
             .unwrap_or_else(|| "none".into());
         let diamond_consistency = DiamondConsistency::from_sql_str(&diamond_consistency_str);
 
         let diamond_schedule_policy_str = row
-            .get::<String>(21)
+            .get::<String>(22)
             .map_err(map_spi)?
             .unwrap_or_else(|| "fastest".into());
         let diamond_schedule_policy =
@@ -758,6 +765,7 @@ impl StreamTableMeta {
             frontier,
             topk_limit,
             topk_order_by,
+            topk_offset,
             diamond_consistency,
             diamond_schedule_policy,
         })

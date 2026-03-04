@@ -163,13 +163,25 @@ fn create_stream_table_impl(
     // order_by) is stored separately. The base query is what goes through
     // validation, dependency analysis, and (for non-TopK) DVM parsing.
     let (effective_query, topk_info) = if let Some(info) = topk_info {
-        pgrx::info!(
-            "pg_trickle: TopK pattern detected (ORDER BY {} LIMIT {}). \
-             The stream table will maintain the top {} rows.",
-            info.order_by_sql,
-            info.limit_value,
-            info.limit_value,
-        );
+        if let Some(offset) = info.offset_value {
+            pgrx::info!(
+                "pg_trickle: TopK pattern detected (ORDER BY {} LIMIT {} OFFSET {}). \
+                 The stream table will maintain rows {}–{}.",
+                info.order_by_sql,
+                info.limit_value,
+                offset,
+                offset + 1,
+                offset + info.limit_value,
+            );
+        } else {
+            pgrx::info!(
+                "pg_trickle: TopK pattern detected (ORDER BY {} LIMIT {}). \
+                 The stream table will maintain the top {} rows.",
+                info.order_by_sql,
+                info.limit_value,
+                info.limit_value,
+            );
+        }
         let base = info.base_query.clone();
         (base, Some(info))
     } else {
@@ -384,6 +396,9 @@ fn create_stream_table_impl(
         parsed_tree.as_ref().map(|pr| pr.functions_used()),
         topk_info.as_ref().map(|i| i.limit_value as i32),
         topk_info.as_ref().map(|i| i.order_by_sql.as_str()),
+        topk_info
+            .as_ref()
+            .and_then(|i| i.offset_value.map(|v| v as i32)),
         dc,
         dsp,
     )?;

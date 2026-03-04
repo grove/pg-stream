@@ -551,8 +551,8 @@ SELECT pgtrickle.create_stream_table(
 - WHERE subqueries (`EXISTS`, `IN`, scalar) are parsed into dedicated semi-join, anti-join, and scalar subquery operators with specialized delta computation.
 - `ALL (subquery)` is the only subquery form that is currently rejected.
 - **ORDER BY** is accepted but silently discarded — row order in the storage table is undefined (consistent with PostgreSQL's `CREATE MATERIALIZED VIEW` behavior). Apply ORDER BY when *querying* the stream table.
-- **TopK (ORDER BY + LIMIT)** — When a top-level `ORDER BY … LIMIT N` is present (with a constant integer limit and no OFFSET), the query is recognized as a "TopK" pattern and accepted. TopK stream tables store only the top-N rows and are refreshed via a scoped-recomputation MERGE strategy. The DVM delta pipeline is bypassed; instead, each refresh re-evaluates the full ORDER BY + LIMIT query and merges the result into the storage table. The catalog records `topk_limit` and `topk_order_by` for the stream table. TopK is not supported with set operations (UNION/INTERSECT/EXCEPT), GROUP BY ROLLUP/CUBE/GROUPING SETS, or OFFSET.
-- **LIMIT / OFFSET** without ORDER BY, and **OFFSET** in general, are rejected — stream tables materialize the full result set. Apply LIMIT when querying the stream table.
+- **TopK (ORDER BY + LIMIT)** — When a top-level `ORDER BY … LIMIT N` is present (with a constant integer limit, optionally with `OFFSET M`), the query is recognized as a "TopK" pattern and accepted. TopK stream tables store exactly N rows (starting from position M+1 if OFFSET is specified) and are refreshed via a scoped-recomputation MERGE strategy. The DVM delta pipeline is bypassed; instead, each refresh re-evaluates the full ORDER BY + LIMIT [+ OFFSET] query and merges the result into the storage table. The catalog records `topk_limit`, `topk_order_by`, and optionally `topk_offset` for the stream table. TopK is not supported with set operations (UNION/INTERSECT/EXCEPT) or GROUP BY ROLLUP/CUBE/GROUPING SETS.
+- **LIMIT / OFFSET** without ORDER BY are rejected — stream tables materialize the full result set. Apply LIMIT when querying the stream table.
 
 ---
 

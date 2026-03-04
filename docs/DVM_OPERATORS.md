@@ -988,7 +988,7 @@ The DVM engine builds the operator tree by analyzing the parsed query:
 9. **INTERSECT / EXCEPT** → `Intersect` or `Except` combining two sub-trees with dual-count tracking
 10. **Window functions** → `Window` wrapping the sub-tree with PARTITION BY / ORDER BY metadata
 11. **ORDER BY** → silently discarded (storage row order is undefined)
-12. **LIMIT / OFFSET** → rejected with a clear error (stream tables materialize the full result set)
+12. **LIMIT / OFFSET** → `ORDER BY + LIMIT [+ OFFSET]` is accepted as TopK (scoped recomputation); standalone `LIMIT` or `OFFSET` without `ORDER BY` is rejected
 
 For recursive CTEs (`WITH RECURSIVE`), the query is parsed into an OpTree with `RecursiveCte` operator nodes. In DIFFERENTIAL mode, the strategy (semi-naive, DRed, or recomputation) is selected automatically based on column compatibility and change type — see the Recursive CTEs section above for details.
 
