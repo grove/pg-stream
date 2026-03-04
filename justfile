@@ -75,12 +75,15 @@ build-e2e-image:
 # Run E2E tests (rebuilds Docker image first)
 [group: "test"]
 test-e2e: build-e2e-image
-    cargo test --test 'e2e_*' -- --test-threads=1
+    PGS_E2E_IMAGE=$(cat .e2e-image-tag) \
+        cargo test --test 'e2e_*' -- --test-threads=1
 
 # Run E2E tests, skip Docker image rebuild
 [group: "test"]
 test-e2e-fast:
-    cargo test --test 'e2e_*' -- --test-threads=1
+    @test -f .e2e-image-tag || (echo "ERROR: .e2e-image-tag missing — run 'just build-e2e-image' first" && exit 1)
+    PGS_E2E_IMAGE=$(cat .e2e-image-tag) \
+        cargo test --test 'e2e_*' -- --test-threads=1
 
 # Run tests via pgrx against a pgrx-managed postgres
 [group: "test"]
@@ -96,17 +99,21 @@ test-all: test-unit test-integration test-e2e test-pgrx
 # Run TPC-H correctness tests at SF-0.01 (~2 min, rebuilds Docker image)
 [group: "tpch"]
 test-tpch: build-e2e-image
-    cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    PGS_E2E_IMAGE=$(cat .e2e-image-tag) \
+        cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
 # Run TPC-H tests, skip Docker image rebuild
 [group: "tpch"]
 test-tpch-fast:
-    cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    @test -f .e2e-image-tag || (echo "ERROR: .e2e-image-tag missing — run 'just build-e2e-image' first" && exit 1)
+    PGS_E2E_IMAGE=$(cat .e2e-image-tag) \
+        cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
 # Run TPC-H tests at larger scale: SF-0.1 (~5 min, rebuilds Docker image)
 [group: "tpch"]
 test-tpch-large: build-e2e-image
-    TPCH_SCALE=0.1 cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    PGS_E2E_IMAGE=$(cat .e2e-image-tag) \
+        TPCH_SCALE=0.1 cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
 # ── dbt Tests ─────────────────────────────────────────────────────────────
 
@@ -135,7 +142,7 @@ build-upgrade-image from="0.1.3" to="0.2.1": build-e2e-image
 # Run upgrade E2E tests (builds base + upgrade Docker images first)
 [group: "upgrade"]
 test-upgrade from="0.1.3" to="0.2.1": (build-upgrade-image from to)
-    PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
+    PGS_E2E_IMAGE=$(cat .e2e-upgrade-image-tag) \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
         cargo test --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture
 

@@ -9,6 +9,11 @@
 //! ./tests/build_e2e_image.sh
 //! ```
 //!
+//! The build script writes the fully-qualified image reference (e.g.
+//! `pg_trickle_e2e:abc1234`) to `.e2e-image-tag`.  `just test-e2e` reads
+//! that file and forwards it as `PGS_E2E_IMAGE`.  To override for a single
+//! run: `PGS_E2E_IMAGE=pg_trickle_e2e:<tag> cargo test --test 'e2e_*' ...`
+//!
 //! # Usage
 //!
 //! ```rust

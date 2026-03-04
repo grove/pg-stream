@@ -6,7 +6,8 @@
 
 **Date:** 2026-03-04  
 **Last updated:** 2026-03-04  
-**Status:** Stages 1–2 COMPLETE (incl. bug fixes + test coverage).
+**Status:** Stages 1–2 COMPLETE (incl. bug fixes + test coverage).  
+Test infrastructure isolation (PLAN_TEST_ISOLATION.md) COMPLETE — SHA-based Docker image tags, tag-file handoff, justfile + CI propagation.  
 Next up: Stage 3 (SQL Coverage Expansion).  
 **Principle:** No SQL-surface expansion while P0 correctness bugs are open.
 

@@ -2,7 +2,9 @@
 
 **Status:** Proposed
 **Target milestone:** v0.3.0+
-**Last updated:** 2026-05-30
+**Last updated:** 2026-03-04
+
+> **Implementation progress:** Stages 1–2 of [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) are complete (EC-01, EC-06, EC-19 fixed; EC-11, EC-13, EC-15, EC-18, EC-25, EC-26, EC-34 hardened). Test infrastructure isolation also complete. Next: Stage 3 (SQL Coverage Expansion — EC-03, EC-04, EC-08, Part 2 Phases 1–2).
 
 ---
 

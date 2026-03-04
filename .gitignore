@@ -17,3 +17,7 @@ book/
 
 # dbt separate venv (Python 3.13, not committed)
 .venv-dbt/
+
+# E2E Docker image tag files (written by build_e2e_image.sh / build_e2e_upgrade_image.sh)
+.e2e-image-tag
+.e2e-upgrade-image-tag

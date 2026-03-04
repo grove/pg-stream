@@ -28,12 +28,29 @@ shift 2 2>/dev/null || true
 EXTRA_ARGS="${*:-}"
 
 IMAGE_NAME="pg_trickle_upgrade_e2e"
-IMAGE_TAG="latest"
-BASE_IMAGE="${PGS_E2E_BASE_IMAGE:-pg_trickle_e2e:latest}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Verify prerequisites
+# ── Resolve base image: env override → tag file → legacy :latest fallback ─
+BASE_IMAGE="${PGS_E2E_BASE_IMAGE:-}"
+if [[ -z "$BASE_IMAGE" ]] && [[ -f "${PROJECT_ROOT}/.e2e-image-tag" ]]; then
+    BASE_IMAGE=$(cat "${PROJECT_ROOT}/.e2e-image-tag")
+    echo "  Using base image from .e2e-image-tag: ${BASE_IMAGE}"
+fi
+BASE_IMAGE="${BASE_IMAGE:-pg_trickle_e2e:latest}"
+
+# ── Compute SHA tag (same scheme as build_e2e_image.sh) ──────────────────
+GIT_SHA=$(git -C "${PROJECT_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+DIRTY_COUNT=$(git -C "${PROJECT_ROOT}" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+if [[ "${DIRTY_COUNT}" -gt 0 ]]; then
+    GIT_SHA="${GIT_SHA}-dirty"
+fi
+
+IMAGE_TAG="${GIT_SHA}"
+IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
+UPGRADE_TAG_FILE="${PROJECT_ROOT}/.e2e-upgrade-image-tag"
+
+# Verify the base image is locally available.
 if ! docker image inspect "${BASE_IMAGE}" &>/dev/null; then
     echo "ERROR: Base image '${BASE_IMAGE}' not found."
     echo "       Run './tests/build_e2e_image.sh' first."
@@ -70,14 +87,14 @@ if [[ ${#chain_steps[@]} -gt 0 ]]; then
 fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Building upgrade E2E image: ${IMAGE_NAME}:${IMAGE_TAG}"
+echo "  Building upgrade E2E image: ${IMAGE_REF}"
 echo "  Upgrade path: ${FROM_VERSION} → ${TO_VERSION}"
 echo "  Base image:   ${BASE_IMAGE}"
 echo "  Dockerfile:   ${SCRIPT_DIR}/Dockerfile.e2e-upgrade"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 docker build \
-    -t "${IMAGE_NAME}:${IMAGE_TAG}" \
+    -t "${IMAGE_REF}" \
     --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
     --build-arg "FROM_VERSION=${FROM_VERSION}" \
     --build-arg "TO_VERSION=${TO_VERSION}" \
@@ -85,14 +102,19 @@ docker build \
     ${EXTRA_ARGS} \
     "${PROJECT_ROOT}"
 
+# Write the full image reference so downstream consumers don't need to
+# reconstruct the tag name.
+echo "${IMAGE_REF}" > "${UPGRADE_TAG_FILE}"
+echo "  Tag file written: .e2e-upgrade-image-tag → ${IMAGE_REF}"
+
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ✓ Image built: ${IMAGE_NAME}:${IMAGE_TAG}"
+echo "  ✓ Image built: ${IMAGE_REF}"
 echo "  Upgrade path: ${FROM_VERSION} → ${TO_VERSION}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 echo "To test manually:"
-echo "  docker run --rm -d --name pgs-upgrade -e POSTGRES_PASSWORD=postgres -p 15432:5432 ${IMAGE_NAME}:${IMAGE_TAG}"
+echo "  docker run --rm -d --name pgs-upgrade -e POSTGRES_PASSWORD=postgres -p 15432:5432 ${IMAGE_REF}"
 echo "  sleep 3"
 echo "  psql -h localhost -p 15432 -U postgres -c \"CREATE EXTENSION pg_trickle VERSION '${FROM_VERSION}';\""
 echo "  psql -h localhost -p 15432 -U postgres -c \"ALTER EXTENSION pg_trickle UPDATE TO '${TO_VERSION}';\""

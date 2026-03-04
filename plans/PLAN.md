@@ -2034,6 +2034,10 @@ focuses on edge-case hardening and SQL coverage expansion, tracked in
   EC-11 (scheduler falling-behind alert), EC-13 (atomic diamond consistency
   default), EC-18 (auto CDC stuck-in-TRIGGER logging), EC-34 (auto-detect
   missing WAL slot).
+- **Test Infrastructure (PLAN_TEST_ISOLATION.md):** SHA-based Docker image
+  tags replace `:latest`; build scripts write `.e2e-image-tag` and
+  `.e2e-upgrade-image-tag`; `justfile` and CI propagate `PGS_E2E_IMAGE`
+  from those files. Eliminates image-tag collisions in concurrent CI runs.
 
 **Test coverage:** 1032+ unit tests, 7 keyless E2E tests, 5 guard trigger
 E2E tests, 9+ diamond E2E tests, plus integration and TPC-H regression
