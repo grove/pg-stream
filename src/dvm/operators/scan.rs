@@ -235,7 +235,7 @@ fn diff_scan_change_buffer(
     //
     // This is tracked as EC-06 in PLAN_EDGE_CASES.md.
     // WARNING at creation time is already implemented.
-    let _is_keyless = pk_columns.is_empty();
+    let is_keyless = pk_columns.is_empty();
 
     // pk_hash is always pre-computed in the change buffer (from PK columns
     // or all-column content hash for keyless tables — S10).
@@ -343,6 +343,130 @@ fn diff_scan_change_buffer(
     // Used to split single-change PKs (fast path, no window functions)
     // from multi-change PKs (require FIRST_VALUE/LAST_VALUE).
     let lsn_filter = format!("c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn");
+
+    // ── EC-06: Keyless net-counting path ─────────────────────────────
+    //
+    // For keyless tables, identical rows share the same pk_hash (content
+    // hash), causing the DISTINCT ON logic to collapse independent events.
+    // Instead, we decompose all changes into atomic +1 (INSERT) / -1
+    // (DELETE) operations per content hash, sum to get a net count, and
+    // expand using generate_series. UPDATEs are split into their DELETE
+    // (old hash) + INSERT (new hash) components.
+    if is_keyless {
+        // Build column references aliased to original names.
+        let new_col_refs_raw: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "c.{} AS {}",
+                    quote_ident(&format!("new_{}", c.name)),
+                    quote_ident(&c.name),
+                )
+            })
+            .collect();
+        let old_col_refs_raw: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "c.{} AS {}",
+                    quote_ident(&format!("old_{}", c.name)),
+                    quote_ident(&c.name),
+                )
+            })
+            .collect();
+        let max_col_refs: Vec<String> = columns
+            .iter()
+            .map(|c| format!("MAX({}) AS {}", quote_ident(&c.name), quote_ident(&c.name)))
+            .collect();
+        let sub_col_refs: Vec<String> = columns
+            .iter()
+            .map(|c| format!("sub.{}", quote_ident(&c.name)))
+            .collect();
+
+        // CTE: Decompose all events into atomic +1/-1 per content hash.
+        let decomp_cte = ctx.next_cte_name(&format!("kl_decomp_{alias}"));
+        let decomp_sql = format!(
+            "\
+-- INSERT events: +1 per content hash
+SELECT {pk_hash_expr} AS content_hash, 1 AS delta_sign,
+       {new_refs}
+FROM {change_table} c
+WHERE {lsn_filter} AND c.action = 'I'
+
+UNION ALL
+
+-- DELETE events: -1 per content hash
+SELECT {pk_hash_expr} AS content_hash, -1 AS delta_sign,
+       {old_refs}
+FROM {change_table} c
+WHERE {lsn_filter} AND c.action = 'D'
+
+UNION ALL
+
+-- UPDATE INSERT side: +1 per new content hash
+SELECT {pk_hash_expr} AS content_hash, 1 AS delta_sign,
+       {new_refs}
+FROM {change_table} c
+WHERE {lsn_filter} AND c.action = 'U'
+
+UNION ALL
+
+-- UPDATE DELETE side: -1 per old content hash
+SELECT {old_pk_hash_expr} AS content_hash, -1 AS delta_sign,
+       {old_refs}
+FROM {change_table} c
+WHERE {lsn_filter} AND c.action = 'U'",
+            new_refs = new_col_refs_raw.join(",\n       "),
+            old_refs = old_col_refs_raw.join(",\n       "),
+        );
+        ctx.add_cte(decomp_cte.clone(), decomp_sql);
+
+        // Final CTE: aggregate net counts and expand with generate_series.
+        let cte_name = ctx.next_cte_name(&format!("scan_{alias}"));
+        let sql = format!(
+            "\
+-- Net inserts: content hashes with net_count > 0
+SELECT sub.content_hash AS __pgt_row_id,
+       'I'::TEXT AS __pgt_action,
+       {sub_cols}
+FROM (
+    SELECT content_hash,
+           {max_cols},
+           SUM(delta_sign)::INT AS net_count
+    FROM {decomp_cte}
+    GROUP BY content_hash
+    HAVING SUM(delta_sign) > 0
+) sub
+CROSS JOIN generate_series(1, sub.net_count) gs
+
+UNION ALL
+
+-- Net deletes: content hashes with net_count < 0
+SELECT sub.content_hash AS __pgt_row_id,
+       'D'::TEXT AS __pgt_action,
+       {sub_cols}
+FROM (
+    SELECT content_hash,
+           {max_cols},
+           SUM(delta_sign)::INT AS net_count
+    FROM {decomp_cte}
+    GROUP BY content_hash
+    HAVING SUM(delta_sign) < 0
+) sub
+CROSS JOIN generate_series(1, -sub.net_count) gs",
+            sub_cols = sub_col_refs.join(",\n       "),
+            max_cols = max_col_refs.join(",\n           "),
+        );
+        ctx.add_cte(cte_name.clone(), sql);
+
+        return Ok(DiffResult {
+            cte_name,
+            columns: col_names,
+            is_deduplicated: false,
+        });
+    }
+
+    // ── PK-based tables: standard pk_stats / single / multi pipeline ─
     let pk_stats_cte = ctx.next_cte_name(&format!("pk_stats_{alias}"));
     let pk_stats_sql = format!(
         "\
@@ -641,7 +765,7 @@ mod tests {
     fn test_diff_scan_merge_safe_dedup() {
         let mut ctx = test_ctx();
         ctx.merge_safe_dedup = true;
-        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "amount"], &["id"]);
         let result = diff_scan(&mut ctx, &tree).unwrap();
 
         // Merge-safe dedup → is_deduplicated = true
@@ -865,5 +989,95 @@ mod tests {
         // Transition table mode should NOT have LSN filtering
         assert!(!sql.contains("pg_lsn"));
         assert!(!sql.contains("c.lsn"));
+    }
+
+    // ── EC-06: Keyless net-counting delta tests ────────────────────────
+
+    #[test]
+    fn test_diff_scan_keyless_uses_net_counting() {
+        let mut ctx = test_ctx();
+        // scan() creates keyless tables (empty pk_columns)
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should use generate_series for net counting
+        assert_sql_contains(&sql, "generate_series");
+        // Should have decomposition CTE with delta_sign
+        assert_sql_contains(&sql, "delta_sign");
+        // Should compute net counts
+        assert_sql_contains(&sql, "SUM(delta_sign)");
+    }
+
+    #[test]
+    fn test_diff_scan_keyless_never_deduplicated() {
+        let mut ctx = test_ctx();
+        ctx.merge_safe_dedup = true;
+        // Even with merge_safe_dedup, keyless tables are never deduplicated
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+
+        assert!(!result.is_deduplicated);
+    }
+
+    #[test]
+    fn test_diff_scan_keyless_has_delete_and_insert_branches() {
+        let mut ctx = test_ctx();
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should have both D and I action branches
+        assert_sql_contains(&sql, "'D'::TEXT AS __pgt_action");
+        assert_sql_contains(&sql, "'I'::TEXT AS __pgt_action");
+    }
+
+    #[test]
+    fn test_diff_scan_keyless_decomposes_updates() {
+        let mut ctx = test_ctx();
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should handle UPDATE events by decomposing into +1 and -1
+        assert_sql_contains(&sql, "c.action = 'U'");
+        // Should have separate branches for UPDATE INSERT side and DELETE side
+        // The DELETE side uses old_* columns to compute the content hash
+        assert_sql_contains(&sql, "old_id");
+        assert_sql_contains(&sql, "old_amount");
+    }
+
+    #[test]
+    fn test_diff_scan_keyless_no_distinct_on() {
+        let mut ctx = test_ctx();
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Keyless path should NOT use DISTINCT ON
+        assert!(!sql.contains("DISTINCT ON"));
+    }
+
+    #[test]
+    fn test_diff_scan_pk_based_uses_distinct_on() {
+        let mut ctx = test_ctx();
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // PK-based tables should still use DISTINCT ON
+        assert_sql_contains(&sql, "DISTINCT ON");
+    }
+
+    #[test]
+    fn test_diff_scan_keyless_max_aggregation() {
+        let mut ctx = test_ctx();
+        let tree = scan(100, "orders", "public", "o", &["id", "amount"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should use MAX() to aggregate column values (identical rows
+        // have the same content, so MAX picks the correct value).
+        assert_sql_contains(&sql, "MAX(");
     }
 }

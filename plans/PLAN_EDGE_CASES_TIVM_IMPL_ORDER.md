@@ -5,8 +5,8 @@
 - [sql/PLAN_TRANSACTIONAL_IVM_PART_2.md](sql/PLAN_TRANSACTIONAL_IVM_PART_2.md) (Part 2)
 
 **Date:** 2026-03-04  
-**Last updated:** 2026-03-06  
-**Status:** IN PROGRESS — Stage 1 mostly complete (EC-01 done for all join types, EC-06 partial), Stage 2 complete  
+**Last updated:** 2026-03-07  
+**Status:** Stages 1–2 COMPLETE. Next up: Stage 3 (SQL Coverage Expansion).  
 **Principle:** No SQL-surface expansion while P0 correctness bugs are open.
 
 ---
@@ -19,16 +19,17 @@ ships until all three are resolved and TPC-H regression passes.
 | # | Item | Effort | Gate | Status |
 |---|------|--------|------|--------|
 | 1 | **EC-19** — Reject WAL + keyless without REPLICA IDENTITY FULL at creation time | 0.5 day | — | ✅ Done |
-| 2 | **EC-06** — Emit WARNING for keyless tables at creation; implement count-based hash delta | 2–3 days | EC-19 done | ⚠️ Warning done; design documented (TODO comments in scan.rs, ivm.rs, refresh.rs, api.rs); full row_id disambiguation TBD |
+| 2 | **EC-06** — Keyless tables: net-counting delta + counted DELETE + non-unique index | 2–3 days | EC-19 done | ✅ Done |
 | 3 | **EC-01** — R₀ via EXCEPT ALL: split Part 1 of `diff_inner_join`, `diff_left_join`, `diff_full_join` to use pre-change right state | 4–6 days | EC-06 done | ✅ Done — Part 1 split into 1a (inserts ⋈ R₁) + 1b (deletes ⋈ R₀); Part 3 split for outer/full joins; 8 unit tests |
 
 **Completion gate:** `just test-all` green + TPC-H Q07 passes with `TPCH_CYCLES=5`.
 
-**Remaining:** EC-06 count-based hash delta requires deep architectural changes
-(UNIQUE index removal, row_id disambiguation, counted DELETE). Estimated 2–3 days.
-WARNING at creation time is implemented; TODO comments mark all touch-points in
-scan.rs, ivm.rs, refresh.rs, api.rs. Can be deferred to Stage 4 if keyless
-tables remain a niche use case.
+**Stage 1 is COMPLETE.** All three P0 correctness bugs are resolved:
+- EC-19: WAL+keyless rejection at creation time.
+- EC-06: Full keyless support via `has_keyless_source` catalog flag, non-unique
+  index, net-counting delta SQL (decompose → SUM → generate_series), counted
+  DELETE (ROW_NUMBER matching), plain INSERT, forced explicit DML path.
+- EC-01: R₀ via EXCEPT ALL for inner/left/full joins.
 
 ---
 

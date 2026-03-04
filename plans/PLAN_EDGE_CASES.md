@@ -207,22 +207,28 @@ recursion should use FULL mode.
 | **Impact** | Phantom or missed deletes in stream table |
 | **Current mitigation** | Add a primary key; add a synthetic unique column; or use FULL mode |
 | **Documented in** | FAQ § "Keyless Tables"; SQL_REFERENCE § "Row Identity" |
-| **Status** | ⚠️ **PARTIAL** — WARNING at creation time implemented; count-based hash delta designed (TODO comments in scan.rs, ivm.rs, refresh.rs, api.rs); implementation requires UNIQUE index removal + row_id disambiguation |
+| **Status** | ✅ **IMPLEMENTED** — Full EC-06 fix: catalog `has_keyless_source` flag, non-unique index for keyless sources, net-counting delta SQL in scan.rs (decompose changes into atomic +1/-1 per content hash, expand via `generate_series`), counted DELETE (ROW_NUMBER matching) in refresh.rs and ivm.rs, plain INSERT (no ON CONFLICT) for keyless sources. WARNING at creation time also implemented. |
 
-**Proposed fix:**
+**Implementation (completed):**
 
-1. **Short term (P0):** Emit a `WARNING` at `create_stream_table()` time
-   when any source table lacks a primary key AND the defining query does not
-   contain `DISTINCT`. The warning should link to the FAQ entry.
-2. **Medium term:** Implement a **count-based hash** — instead of a single
-   xxHash per row, track `(row_hash, count)` tuples. When a duplicate is
-   inserted, increment the count; when deleted, decrement. This fixes the
-   "delete one of N identical rows removes all N" problem at the cost of a
-   small counter column in the change buffer.
-3. **Long term:** Evaluate `ctid`-based row identity for keyless tables.
-   `ctid` is stable within a transaction but changes after VACUUM FULL.
-   Feasible only for trigger-mode CDC where the trigger captures `ctid`
-   at write time.
+1. ~~**Short term (P0):** Emit a `WARNING` at `create_stream_table()` time~~ ✅ Done
+2. **Full fix (P0):** ✅ Implemented via net-counting approach:
+   - **Catalog:** Added `has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE`
+     to `pgtrickle.pgt_stream_tables` (set at creation time).
+   - **Index:** Non-unique `CREATE INDEX` for keyless sources (instead of
+     `CREATE UNIQUE INDEX`), allowing duplicate `__pgt_row_id` values.
+   - **Delta SQL (scan.rs):** For keyless tables, decomposes all change
+     events into atomic `+1` (INSERT) / `-1` (DELETE) operations per
+     content hash. UPDATEs are split into their DELETE-old + INSERT-new
+     components. Net counts are computed via `GROUP BY content_hash` +
+     `SUM(delta_sign)`, then expanded to the correct number of D/I rows
+     using `generate_series`.
+   - **Apply (refresh.rs):** For keyless sources, forces explicit DML path
+     (cannot use MERGE with non-unique row_ids). Counted DELETE uses
+     `ROW_NUMBER` matching to pair delta deletes 1:1 with stream table
+     rows. Plain INSERT without NOT EXISTS / ON CONFLICT.
+   - **Apply (ivm.rs):** Same counted DELETE + plain INSERT for IMMEDIATE mode.
+   - **Upgrade SQL:** `ALTER TABLE ... ADD COLUMN IF NOT EXISTS has_keyless_source`
 
 ---
 

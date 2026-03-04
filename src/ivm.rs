@@ -531,44 +531,86 @@ fn pgt_ivm_apply_delta(
 
         // DELETE: remove rows that were deleted or updated (action = 'D').
         //
-        // EC-06 TODO: For keyless sources with duplicate rows, this
-        // DELETE removes ALL stream table rows matching the row_id,
-        // even when only one duplicate should be removed. The fix
-        // should use counted DELETE (delete exactly N rows per hash
-        // using ctid + ROW_NUMBER). See PLAN_EDGE_CASES.md § EC-06.
-        let delete_sql = format!(
-            "DELETE FROM {st_qualified} AS t
-             USING {delta_table} AS d
-             WHERE d.__pgt_action = 'D'
-               AND t.__pgt_row_id = d.__pgt_row_id"
-        );
+        // EC-06: For keyless sources, use counted DELETE (ROW_NUMBER
+        // matching) to avoid deleting ALL duplicates when only a subset
+        // should be removed.
+        let delete_sql = if st.has_keyless_source {
+            format!(
+                "DELETE FROM {st_qualified} \
+                 WHERE ctid IN (\
+                   SELECT numbered_st.st_ctid \
+                   FROM (\
+                     SELECT st2.ctid AS st_ctid, \
+                            st2.__pgt_row_id, \
+                            ROW_NUMBER() OVER (\
+                              PARTITION BY st2.__pgt_row_id ORDER BY st2.ctid\
+                            ) AS st_rn \
+                     FROM {st_qualified} st2 \
+                     WHERE st2.__pgt_row_id IN (\
+                       SELECT DISTINCT __pgt_row_id \
+                       FROM {delta_table} \
+                       WHERE __pgt_action = 'D'\
+                     )\
+                   ) numbered_st \
+                   JOIN (\
+                     SELECT __pgt_row_id, \
+                            COUNT(*)::INT AS del_count \
+                     FROM {delta_table} \
+                     WHERE __pgt_action = 'D' \
+                     GROUP BY __pgt_row_id\
+                   ) dc ON numbered_st.__pgt_row_id = dc.__pgt_row_id \
+                   WHERE numbered_st.st_rn <= dc.del_count\
+                 )"
+            )
+        } else {
+            format!(
+                "DELETE FROM {st_qualified} AS t
+                 USING {delta_table} AS d
+                 WHERE d.__pgt_action = 'D'
+                   AND t.__pgt_row_id = d.__pgt_row_id"
+            )
+        };
         Spi::run(&delete_sql)
             .map_err(|e| PgTrickleError::SpiError(format!("IVM delta DELETE failed: {e}")))?;
 
         // INSERT: add rows that were inserted or updated (action = 'I').
-        // Use INSERT ... ON CONFLICT to handle the case where a row_id
-        // already exists (update scenario — the DELETE above should have
-        // removed it, but ON CONFLICT provides safety).
-        let insert_sql = format!(
-            "INSERT INTO {st_qualified} (__pgt_row_id, {col_list})
-             SELECT d.__pgt_row_id, {d_col_list}
-             FROM {delta_table} d
-             WHERE d.__pgt_action = 'I'
-             ON CONFLICT (__pgt_row_id) DO UPDATE SET {update_set}",
-            d_col_list = user_columns
-                .iter()
-                .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(", "),
-            update_set = user_columns
-                .iter()
-                .map(|c| {
-                    let quoted = format!("\"{}\"", c.replace('"', "\"\""));
-                    format!("{quoted} = EXCLUDED.{quoted}")
-                })
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
+        //
+        // EC-06: For keyless sources, use plain INSERT (no ON CONFLICT)
+        // since duplicate __pgt_row_id values are expected.
+        let insert_sql = if st.has_keyless_source {
+            format!(
+                "INSERT INTO {st_qualified} (__pgt_row_id, {col_list})
+                 SELECT d.__pgt_row_id, {d_col_list}
+                 FROM {delta_table} d
+                 WHERE d.__pgt_action = 'I'",
+                d_col_list = user_columns
+                    .iter()
+                    .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        } else {
+            format!(
+                "INSERT INTO {st_qualified} (__pgt_row_id, {col_list})
+                 SELECT d.__pgt_row_id, {d_col_list}
+                 FROM {delta_table} d
+                 WHERE d.__pgt_action = 'I'
+                 ON CONFLICT (__pgt_row_id) DO UPDATE SET {update_set}",
+                d_col_list = user_columns
+                    .iter()
+                    .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                update_set = user_columns
+                    .iter()
+                    .map(|c| {
+                        let quoted = format!("\"{}\"", c.replace('"', "\"\""));
+                        format!("{quoted} = EXCLUDED.{quoted}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        };
         Spi::run(&insert_sql)
             .map_err(|e| PgTrickleError::SpiError(format!("IVM delta INSERT failed: {e}")))?;
     }

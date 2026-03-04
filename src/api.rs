@@ -322,6 +322,19 @@ fn create_stream_table_impl(
     // F13/F14: Warn about source table edge cases
     warn_source_table_properties(&source_relids);
 
+    // EC-06: Detect whether any source table lacks a PRIMARY KEY.
+    // When true, the storage table uses a non-unique index on __pgt_row_id
+    // and the apply logic uses counted DELETE instead of MERGE, because
+    // identical duplicate rows produce the same content hash → same row_id.
+    let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
+        if source_type != "TABLE" {
+            return false;
+        }
+        cdc::resolve_pk_columns(*oid)
+            .map(|pk| pk.is_empty())
+            .unwrap_or(false)
+    });
+
     // EC-15: Warn when the defining query uses SELECT * — column additions
     // to source tables will break the stream table silently (column count
     // mismatch) or require reinitialization.
@@ -350,19 +363,24 @@ fn create_stream_table_impl(
     // Get the OID of the newly created table
     let pgt_relid = get_table_oid(&schema, &table_name)?;
 
-    // Create unique index on __pgt_row_id
+    // Create index on __pgt_row_id.
     //
-    // EC-06 TODO: For keyless sources with duplicate rows, the UNIQUE
-    // constraint prevents storing multiple identical rows (they have the
-    // same content hash → same __pgt_row_id). The full EC-06 fix should
-    // either: (a) use a non-unique index for keyless sources, or
-    // (b) disambiguate row_ids using ROW_NUMBER() during full refresh.
-    // See PLAN_EDGE_CASES.md § EC-06 for the design.
-    let index_sql = format!(
-        "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
-        quote_identifier(&schema),
-        quote_identifier(&table_name),
-    );
+    // EC-06: For keyless sources, use a non-unique index because identical
+    // duplicate rows produce the same content hash → same __pgt_row_id.
+    // A UNIQUE index would prevent storing those duplicates correctly.
+    let index_sql = if has_keyless_source {
+        format!(
+            "CREATE INDEX ON {}.{} (__pgt_row_id)",
+            quote_identifier(&schema),
+            quote_identifier(&table_name),
+        )
+    } else {
+        format!(
+            "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
+            quote_identifier(&schema),
+            quote_identifier(&table_name),
+        )
+    };
     Spi::run(&index_sql)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create row_id index: {}", e)))?;
 
@@ -419,6 +437,7 @@ fn create_stream_table_impl(
             .and_then(|i| i.offset_value.map(|v| v as i32)),
         dc,
         dsp,
+        has_keyless_source,
     )?;
 
     // Build per-source column usage map from the parsed OpTree so that

@@ -47,6 +47,10 @@ pub struct StreamTableMeta {
     pub diamond_consistency: DiamondConsistency,
     /// Diamond schedule policy for this convergence node ('fastest' or 'slowest').
     pub diamond_schedule_policy: DiamondSchedulePolicy,
+    /// Whether any source table lacks a PRIMARY KEY (EC-06).
+    /// When true, the storage table uses a non-unique index on __pgt_row_id
+    /// and the apply logic uses counted DELETE instead of MERGE.
+    pub has_keyless_source: bool,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -149,13 +153,14 @@ impl StreamTableMeta {
         topk_offset: Option<i32>,
         diamond_consistency: DiamondConsistency,
         diamond_schedule_policy: DiamondSchedulePolicy,
+        has_keyless_source: bool,
     ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
                     "INSERT INTO pgtrickle.pgt_stream_tables \
-                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -172,6 +177,7 @@ impl StreamTableMeta {
                         topk_offset.into(),
                         diamond_consistency.as_str().into(),
                         diamond_schedule_policy.as_str().into(),
+                        has_keyless_source.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -192,7 +198,8 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     topk_offset, diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy, \
+                     has_keyless_source \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -217,7 +224,8 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     topk_offset, diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy, \
+                     has_keyless_source \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -247,7 +255,8 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     topk_offset, diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy, \
+                     has_keyless_source \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -272,7 +281,8 @@ impl StreamTableMeta {
                      original_query, schedule, refresh_mode, status, is_populated, \
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
-                     topk_offset, diamond_consistency, diamond_schedule_policy \
+                     topk_offset, diamond_consistency, diamond_schedule_policy, \
+                     has_keyless_source \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -643,6 +653,8 @@ impl StreamTableMeta {
         let diamond_schedule_policy =
             DiamondSchedulePolicy::from_sql_str(&diamond_schedule_policy_str).unwrap_or_default();
 
+        let has_keyless_source = table.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
+
         Ok(StreamTableMeta {
             pgt_id,
             pgt_relid,
@@ -666,6 +678,7 @@ impl StreamTableMeta {
             topk_offset,
             diamond_consistency,
             diamond_schedule_policy,
+            has_keyless_source,
         })
     }
 
@@ -745,6 +758,8 @@ impl StreamTableMeta {
         let diamond_schedule_policy =
             DiamondSchedulePolicy::from_sql_str(&diamond_schedule_policy_str).unwrap_or_default();
 
+        let has_keyless_source = row.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
+
         Ok(StreamTableMeta {
             pgt_id,
             pgt_relid,
@@ -768,6 +783,7 @@ impl StreamTableMeta {
             topk_offset,
             diamond_consistency,
             diamond_schedule_policy,
+            has_keyless_source,
         })
     }
 }
