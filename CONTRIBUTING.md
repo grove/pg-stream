@@ -45,6 +45,31 @@ just test-e2e           # full E2E (builds Docker image)
 
 Full setup instructions are in [INSTALL.md](INSTALL.md).
 
+### Devcontainer / Containerized Development
+
+If you are developing in a devcontainer, use the default non-root `vscode` user
+and run the normal commands from the workspace root:
+
+```bash
+just fmt
+just lint
+just test-unit
+```
+
+`just test-unit` uses `scripts/run_unit_tests.sh`, which now selects a writable
+and cache-friendly target directory in this order:
+
+1. `target/` (preferred)
+2. `.cargo-target/` (project-local fallback)
+3. `$HOME/.cache/pg_trickle-target`
+4. `${TMPDIR:-/tmp}/pg_trickle-target` (last resort)
+
+This avoids permission failures on bind mounts and preserves incremental builds
+when source or test files change.
+
+If you see permission errors in containerized runs, verify you are not forcing a
+different container user/UID than expected by your workspace mount.
+
 ## Making a Pull Request
 
 1. Fork the repository and create a branch: `git checkout -b fix/my-fix`

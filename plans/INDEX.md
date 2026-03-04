@@ -53,6 +53,7 @@ new entries when creating documents.
 | [PLAN_PARTITIONING_SHARDING.md](infra/PLAN_PARTITIONING_SHARDING.md) | PLAN | Research | PostgreSQL partitioning & sharding compatibility |
 | [PLAN_PACKAGING.md](infra/PLAN_PACKAGING.md) | PLAN | Draft | Distribution packaging |
 | [PLAN_PG19_COMPAT.md](infra/PLAN_PG19_COMPAT.md) | PLAN | Draft | PostgreSQL 19 forward-compatibility |
+| [PLAN_DEVCONTAINER_UNIT_TEST_WORKFLOW.md](infra/PLAN_DEVCONTAINER_UNIT_TEST_WORKFLOW.md) | PLAN | Implemented | Devcontainer unit-test stability and build reuse |
 | [REPORT_PGWIRE_PROXY.md](infra/REPORT_PGWIRE_PROXY.md) | REPORT | Research | pgwire proxy / intercept analysis |
 | [PLAN_PG_BACKCOMPAT.md](infra/PLAN_PG_BACKCOMPAT.md) | PLAN | Research | Supporting older PostgreSQL versions (13–17) |
 | [PLAN_VERSIONING.md](infra/PLAN_VERSIONING.md) | PLAN | Draft | Semantic versioning & compatibility policy |
