@@ -1,7 +1,7 @@
 # PLAN: DAG Pipeline Test Suite — Comprehensive Coverage
 
 **Status:** Complete  
-**Date:** 2026-03-04  
+**Date:** 2026-03-04 (coverage map updated 2026-03-04)  
 **Branch:** `e2e_pipeline_dag_tests`  
 **Scope:** Close all remaining gaps in multi-layer DAG pipeline E2E tests — multi-cycle cascades, mixed refresh modes, operational mid-pipeline changes, auto-refresh propagation, wide topologies, error resilience, and concurrent DML during pipeline refresh.
 
@@ -89,34 +89,71 @@ and correctness depends on every layer seeing a consistent upstream state.
 
 ## Current Coverage Map
 
+> **Post-implementation state** — all 39 tests from this branch are now merged.
+> Legend: ✅ covered · ⚠️ partial · ❌ not covered
+
 ### Existing tests by topology and behavior
 
-| Behavior | Linear 2L | Linear 3L | Diamond | Fan-Out | Wide (4+) |
-|----------|:---------:|:---------:|:-------:|:-------:|:---------:|
-| Initial population | ✅ | ✅ | ✅ | ✅ | ❌ |
-| INSERT cascade | ✅ | ✅ | ✅ | ✅ | ❌ |
-| UPDATE cascade | ✅ | ✅ | ❌ | ✅ | ❌ |
-| DELETE cascade | ✅ | ✅ | ❌ | ✅ | ❌ |
-| Multi-cycle (4+) | ❌ ¹ | ❌ | ❌ | ❌ | ❌ |
-| Mixed modes | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Mid-pipeline SUSPEND | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Mid-pipeline ALTER | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Mid-pipeline DROP | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Auto-refresh cascade | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Error in middle layer | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Concurrent DML | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Behavior | Linear 2L | Linear 3L | Diamond | Fan-Out | Wide (4+L / 4+ leaves) |
+|----------|:---------:|:---------:|:-------:|:-------:|:----------------------:|
+| Initial population | ✅ | ✅ | ✅ | ✅ | ✅ ¹ |
+| INSERT cascade | ✅ | ✅ | ✅ | ✅ | ✅ |
+| UPDATE cascade | ✅ | ✅ | ✅ ² | ✅ | ⚠️ ³ |
+| DELETE cascade | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Multi-cycle (4+) | ✅ | ✅ | ✅ | ✅ | ⚠️ ³ |
+| Mixed modes (FULL/DIFF/IMMED) | ✅ | ✅ | ⚠️ ⁴ | ✅ | ❌ |
+| Mid-pipeline SUSPEND | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Mid-pipeline ALTER (schedule/mode/query) | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Mid-pipeline DROP | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Auto-refresh cascade | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Error in middle layer | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Concurrent DML | ✅ | ✅ | ❌ | ❌ | ❌ |
+| IMMEDIATE propagation | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Rollback safety | ✅ | ✅ | ❌ | ❌ | ❌ |
 
-¹ Multi-cycle tests exist for single-layer STs in `e2e_multi_cycle_tests.rs`.
+¹ `test_fanout_4_leaves` and `test_deep_linear_5_layers` cover wide/deep initial population.  
+² `test_mc_dag_diamond_multi_cycle` includes INSERT+DELETE over 5 cycles; UPDATE is implicitly covered via group-elimination-revival pattern.  
+³ Wide topologies are covered for INSERT and DELETE isolation (`test_wide_fanout_deletion_isolation`) but not explicit UPDATE or multi-cycle stress.  
+⁴ No test creates a diamond where the two intermediate legs use different refresh modes.
 
-### Key architecture paths not tested end-to-end
+### Key architecture paths — all closed
 
-| Code Path | Location | Gap |
-|-----------|----------|-----|
-| `has_stream_table_source_changes()` with 3+ topo levels | `src/scheduler.rs` ~L860 | Only tested with 2-layer auto-refresh |
-| `resolve_calculated_schedule()` with deep chains | `src/dag.rs` ~L700 | Only unit-tested |
-| `determine_refresh_action()` FULL→DIFF transition in cascade | `src/refresh.rs` ~L300 | Not tested at pipeline level |
-| Diamond consistency group update after ALTER | `src/dag.rs` ~L600 | Only tested for create, not mid-pipeline alter |
-| Topological ordering with mixed TABLE/STREAM_TABLE sources | `src/scheduler.rs` ~L800 | 2-layer only |
+| Code Path | Location | Previously | Now |
+|-----------|----------|-----------|-----|
+| `has_stream_table_source_changes()` with 3+ topo levels | `src/scheduler.rs` | 2-layer only | ✅ `test_autorefresh_3_layer_cascade`, `test_autorefresh_no_spurious_3_layer` |
+| `resolve_calculated_schedule()` with deep chains | `src/dag.rs` | unit tests only | ✅ `test_autorefresh_calculated_schedule`, `test_autorefresh_staggered_schedules` |
+| `determine_refresh_action()` FULL→DIFF transition in cascade | `src/refresh.rs` | not at pipeline level | ✅ `test_alter_mode_mid_pipeline_diff_to_full`, `test_mixed_mode_alter_mid_pipeline` |
+| Diamond consistency group update after ALTER | `src/dag.rs` | create only | ✅ `test_alter_mode_mid_pipeline_diff_to_full` |
+| Topological ordering with mixed TABLE/STREAM_TABLE sources | `src/scheduler.rs` | 2-layer only | ✅ `test_multi_source_diamond` |
+| `pg_sys::BeginInternalSubTransaction` atomic diamond group path | `src/scheduler.rs` | untested (was broken via SPI) | ✅ `test_autorefresh_diamond_cascade` (EC-13 fix) |
+
+### Test file inventory
+
+| File | Tests | Topology | Cycles | Notes |
+|------|------:|----------|:------:|-------|
+| `e2e_pipeline_dag_tests.rs` | 14 | Linear, diamond, fan-out | 1 | Pre-existing: broad single-cycle coverage |
+| `e2e_cascade_regression_tests.rs` | 8 | Linear 2–3L | 1–2 | Pre-existing: regression guard |
+| `e2e_diamond_tests.rs` | 15 | Diamond | 0–1 | Pre-existing + EC-13 default update |
+| `e2e_multi_cycle_tests.rs` | 5 | Single-ST | 4–8 | Pre-existing: single-layer multi-cycle |
+| `e2e_multi_cycle_dag_tests.rs` | 6 | Linear 3L + diamond | 4–10 | **New**: multi-cycle at pipeline level |
+| `e2e_mixed_mode_dag_tests.rs` | 5 | Linear 2–3L + immediate | 1–3 | **New**: FULL/DIFF/IMMED combinations |
+| `e2e_dag_autorefresh_tests.rs` | 5 | Linear 3L + diamond | scheduler | **New**: scheduler-driven cascade |
+| `e2e_dag_topology_tests.rs` | 5 | Fan-out, deep (5L), multi-source | 1 | **New**: wide/deep topologies |
+| `e2e_dag_operations_tests.rs` | 7 | Linear 2–3L | 1–2 | **New**: SUSPEND/ALTER/DROP mid-pipeline |
+| `e2e_dag_error_tests.rs` | 4 | Linear 2–3L | 1–2 | **New**: error isolation and recovery |
+| `e2e_dag_concurrent_tests.rs` | 3 | Linear 2–3L | 1–2 | **New**: DML racing pipeline refresh |
+| `e2e_dag_immediate_tests.rs` | 4 | Linear 2–3L + mixed | 1–2 | **New**: IMMEDIATE mode cascades |
+| **New total** | **39** | | | |
+
+### Remaining gaps (acknowledged, no current plan)
+
+| Gap | Why not covered now | Priority |
+|-----|---------------------|----------|
+| Wide topology (4+ leaves) + multi-cycle | High container load; single-cycle is adequate | P3 |
+| Diamond + mixed modes | Combinatorial; base diamond + mixed linear covers the logic | P3 |
+| Diamond + mid-pipeline ALTER/SUSPEND | Uncommon operational path | P3 |
+| Auto-refresh on fan-out (≥4 leaves) | No scheduler policy drives fan-out distinctly | P3 |
+| IMMEDIATE + diamond | Not a supported combination today | P3 |
 
 ---
 
