@@ -28,7 +28,7 @@ open-source project and welcomes contributions of all kinds.
 ```bash
 # Install pgrx
 cargo install cargo-pgrx --version "=0.17.0"
-cargo pgrx init --pg18 download
+cargo pgrx init --pg18 /usr/lib/postgresql/18/bin/pg_config
 
 # Build
 cargo build
@@ -69,6 +69,27 @@ when source or test files change.
 
 If you see permission errors in containerized runs, verify you are not forcing a
 different container user/UID than expected by your workspace mount.
+
+#### Run E2E tests in devcontainer
+
+E2E tests use Testcontainers and require Docker access from inside the
+devcontainer (provided by the Docker-in-Docker feature in
+`.devcontainer/devcontainer.json`).
+
+Run from the workspace root inside the devcontainer:
+
+```bash
+just build-e2e-image
+just test-e2e
+```
+
+Notes:
+
+- The E2E harness starts containers via `testcontainers` (`tests/e2e/mod.rs`).
+- The default E2E image is `pg_trickle_e2e:latest` (built by
+  `tests/build_e2e_image.sh`).
+- A plain `docker run` of the dev image is not equivalent to a full VS Code
+  devcontainer session with features/lifecycle hooks enabled.
 
 ## Making a Pull Request
 
