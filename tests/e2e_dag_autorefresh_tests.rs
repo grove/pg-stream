@@ -242,8 +242,28 @@ async fn test_autorefresh_calculated_schedule() {
     )
     .await;
 
-    // Wait for initial stabilization
-    wait_for_refresh_cycle(&db, "arc_l2", Duration::from_secs(30)).await;
+    // Wait for initial population of L2 (CALCULATED schedule).
+    // We can't use wait_for_refresh_cycle here because CALCULATED STs only
+    // refresh when upstream has changes — after initial populate there may not
+    // be a second refresh to detect.  Instead, poll until data_timestamp is set.
+    {
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed() > Duration::from_secs(60) {
+                panic!("Timed out waiting for initial population of arc_l2");
+            }
+            let ts: Option<String> = db
+                .query_scalar_opt(
+                    "SELECT data_timestamp::text \
+                     FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'arc_l2'",
+                )
+                .await;
+            if ts.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
 
     // Mutate
     db.execute("INSERT INTO arc_src VALUES (2, 200)").await;

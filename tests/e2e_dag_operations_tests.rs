@@ -169,14 +169,14 @@ async fn test_alter_schedule_mid_pipeline() {
     setup_ops_pipeline(&db).await;
     assert_ops_pipeline_correct(&db).await;
 
-    // Change L1's schedule from 1m to 5s
-    db.alter_st("ops_l1", "schedule => '5s'").await;
+    // Change L1's schedule from 1m to 90s (minimum allowed is 60s)
+    db.alter_st("ops_l1", "schedule => '90s'").await;
 
     // Verify schedule changed
     let schedule: String = db
         .query_scalar("SELECT schedule FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'ops_l1'")
         .await;
-    assert_eq!(schedule, "5s");
+    assert_eq!(schedule, "90s");
 
     // Mutate and refresh — pipeline should still converge
     db.execute("INSERT INTO ops_src (grp, val) VALUES ('d', 99)")
@@ -329,16 +329,18 @@ async fn test_drop_leaf_keeps_pipeline_intact() {
 // Test 3.6 — DROP middle layer cascades to downstream
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Drop the middle layer (L2). Because L3 depends on L2's storage table
-/// via its defining query, dropping L2 (which uses CASCADE) should cascade
-/// and invalidate or destroy L3 as well. L1 should remain intact.
+/// Drop the middle layer (L2). L3's storage table is an independent
+/// materialized table — it survives the `DROP TABLE ops_l2 CASCADE`.
+/// However, L3 becomes broken because its defining query references
+/// ops_l2 which no longer exists. L1 should remain intact.
 #[tokio::test]
 async fn test_drop_middle_layer_cascades() {
     let db = E2eDb::new().await.with_extension().await;
     setup_ops_pipeline(&db).await;
     assert_ops_pipeline_correct(&db).await;
 
-    // Drop L2 — L3's underlying storage depends on L2's table
+    // Drop L2 — CASCADE drops PG dependencies (triggers, views) but NOT
+    // L3's independent storage table.
     db.drop_st("ops_l2").await;
 
     // L2 should be gone from catalog
@@ -349,11 +351,20 @@ async fn test_drop_middle_layer_cascades() {
         .await;
     assert!(!l2_exists, "L2 should be gone from catalog");
 
-    // L3's storage table should also be gone (CASCADE from DROP TABLE)
+    // L3's storage table still exists (it's a separate physical table)
     let l3_table_exists = db.table_exists("public", "ops_l3").await;
     assert!(
-        !l3_table_exists,
-        "L3 storage table should be cascaded away when L2 is dropped"
+        l3_table_exists,
+        "L3 storage table should still exist (independent table)"
+    );
+
+    // But L3 is now broken — refreshing it fails because ops_l2 is gone
+    let result = db
+        .try_execute("SELECT pgtrickle.refresh_stream_table('ops_l3')")
+        .await;
+    assert!(
+        result.is_err(),
+        "L3 refresh should fail because its upstream L2 no longer exists"
     );
 
     // L1 should still be intact and refreshable

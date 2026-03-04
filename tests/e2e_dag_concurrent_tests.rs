@@ -161,9 +161,16 @@ async fn test_concurrent_insert_during_pipeline_refresh() {
     // Wait for all inserts to complete
     inserter.await.expect("inserter task should not panic");
 
-    // Final refresh to pick up any remaining changes
-    db.refresh_st("conc_dag_l1").await;
-    db.refresh_st("conc_dag_l2").await;
+    // Allow a short settle time so CDC buffers are fully visible
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Final refresh cycles to ensure all buffered changes are captured.
+    // Two cycles covers the case where the last insert's CDC entry was
+    // buffered during the previous refresh's snapshot.
+    for _ in 0..2 {
+        db.refresh_st("conc_dag_l1").await;
+        db.refresh_st("conc_dag_l2").await;
+    }
 
     // Verify full convergence
     db.assert_st_matches_query("conc_dag_l1", l1_q).await;

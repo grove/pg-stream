@@ -255,24 +255,24 @@ async fn test_mc_dag_mixed_dml_5_cycles() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// After initial population, 5 consecutive refresh cycles with no DML.
-/// Verifies no delta drift and stable data_timestamp across all layers.
+/// Verifies no delta drift — content stays identical and row counts are
+/// stable. Note: the manual `refresh_stream_table()` path always updates
+/// `data_timestamp` (unlike the scheduler, which preserves it on no-op
+/// cycles), so we verify content stability rather than timestamp stability.
 #[tokio::test]
 async fn test_mc_dag_noop_cycle_no_drift() {
     let db = E2eDb::new().await.with_extension().await;
     setup_3_layer_pipeline(&db).await;
     assert_pipeline_correct(&db).await;
 
-    // Record baseline data_timestamp for each layer
+    // Record baseline row counts for each layer
     let names = ["mc_l1", "mc_l2", "mc_l3"];
-    let mut ts_before = Vec::new();
+    let mut counts_before = Vec::new();
     for name in &names {
-        let ts: String = db
-            .query_scalar(&format!(
-                "SELECT COALESCE(data_timestamp::text, 'null') \
-                 FROM pgtrickle.pgt_stream_tables WHERE pgt_name = '{name}'"
-            ))
+        let count: i64 = db
+            .query_scalar(&format!("SELECT COUNT(*)::bigint FROM {name}"))
             .await;
-        ts_before.push(ts);
+        counts_before.push(count);
     }
 
     // 5 no-op refresh cycles
@@ -281,17 +281,14 @@ async fn test_mc_dag_noop_cycle_no_drift() {
         assert_pipeline_correct(&db).await;
     }
 
-    // data_timestamps should not have advanced
+    // Row counts should be unchanged — no phantom inserts or deletes
     for (i, name) in names.iter().enumerate() {
-        let ts: String = db
-            .query_scalar(&format!(
-                "SELECT COALESCE(data_timestamp::text, 'null') \
-                 FROM pgtrickle.pgt_stream_tables WHERE pgt_name = '{name}'"
-            ))
+        let count: i64 = db
+            .query_scalar(&format!("SELECT COUNT(*)::bigint FROM {name}"))
             .await;
         assert_eq!(
-            ts_before[i], ts,
-            "data_timestamp for '{name}' must not drift on no-op refresh cycles"
+            counts_before[i], count,
+            "row count for '{name}' must not drift on no-op refresh cycles"
         );
     }
 }
