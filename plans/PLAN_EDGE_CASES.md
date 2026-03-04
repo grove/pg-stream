@@ -792,3 +792,168 @@ surfaces.
 **Sprint 4+ — P2 usability:**
 - EC-05, EC-32: Foreign table change detection; ALL (subquery) rewrite
 - Documentation sweep for all P3 items
+
+---
+
+## Open Questions
+
+The following questions are unresolved design or validation unknowns that
+must be answered before the associated fixes can be fully specified or
+committed to.
+
+---
+
+### OQ-01 — EC-01: What is the correct new default for `adaptive_full_threshold`?
+
+**Current value:** unspecified (needs code audit to confirm).
+
+The fix for EC-01 proposes lowering the threshold so the FULL fallback
+triggers more aggressively when co-occurring key changes + deletes are
+likely. However, setting it too low eliminates the performance benefit of
+DIFFERENTIAL mode.
+
+**Recommendation:** Run a benchmark over the TPC-H Q07 workload (which
+exposes this bug) at threshold values of 1%, 5%, 10%, 25% (current
+default), and measure: (a) how often the fallback activates under a
+realistic mixed-change workload, (b) the refresh latency penalty per
+activation. Pick the lowest threshold where (b) stays under 2× the normal
+DIFFERENTIAL latency. This should be done as part of the EC-01 Sprint 1
+work before changing the default.
+
+---
+
+### OQ-02 — EC-01: Is pre-image capture viable without a breaking change buffer schema change?
+
+The long-term fix for EC-01 stores old join keys in the change buffer
+alongside new values. The current change buffer schema
+(`pgtrickle_changes.changes_<oid>`) stores new-row data plus a
+`change_type` column; it does not have old-key columns.
+
+**Open questions:**
+- Can old-key columns be added as nullable columns without breaking the
+  existing CDC trigger templates? (Likely yes — triggers would populate
+  them only on UPDATE/DELETE.)
+- Does adding 1–N extra columns per change buffer table require a migration
+  for existing installations, or can it be handled by `ALTER TABLE … ADD
+  COLUMN` during `needs_reinit`?
+- Should old-key columns be stored in a separate table
+  (`changes_<oid>_old_keys`) to keep the hot change path lean?
+
+**Recommendation:** Prototype the nullable-column approach in a branch
+first. Measure the write amplification on a high-throughput CDC workload.
+Only pursue the separate-table approach if the hot-path benchmark shows
+measurable regression (> 5% throughput drop on the source table).
+
+---
+
+### OQ-03 — EC-01: What is the overhead of the two-phase delta?
+
+The medium-term fix for EC-01 snapshots the old join state *before*
+applying changes. The plan estimates "one extra temp-table scan per join
+source" but this has not been measured.
+
+**Recommendation:** Before committing to the two-phase delta design,
+run a micro-benchmark comparing single-phase vs two-phase delta on a
+3-way join stream table with 100k / 1M / 10M source rows. If the overhead
+exceeds 30% of the current DIFFERENTIAL latency, reconsider the approach
+in favour of FULL-mode fallback at a lower threshold (OQ-01).
+
+---
+
+### OQ-04 — EC-03: Where exactly do window-function-in-expression rewrites fail?
+
+The CTE extraction rewrite for EC-03 is described as covering "~80% of
+user demand", with complex cases (nested window calls inside arithmetic)
+remaining unsupported.
+
+**Open questions:**
+- Is `SUM(ROW_NUMBER() OVER (…))` rejectable at parse time, or does it
+  require a full semantic analysis?
+- Can `NTILE(4) OVER (…) * 100` be rewritten to a CTE without changing
+  query semantics?
+- What are the most common real-world patterns users hit? (Survey the
+  GitHub issues / Discord.)
+
+**Recommendation:** Before implementing the rewrite, define a formal
+boundary: "any expression where a window function appears as a direct
+child of the SELECT list is rewriteable; anything deeper is rejected with
+a clear error." Enumerate the cases explicitly in a test file
+(`tests/e2e_window_expression_tests.rs`) before writing the rewrite code.
+This keeps the scope bounded.
+
+---
+
+### OQ-05 — EC-06: Is `ctid`-based row identity viable for trigger-mode CDC?
+
+The long-term fix for EC-06 proposes using `ctid` as a stable row
+identifier for keyless tables in trigger mode. `ctid` is the physical
+heap location and changes after `VACUUM FULL` / `CLUSTER`.
+
+**Open questions:**
+- Does pgrx expose the `ctid` of `OLD` in a row-level trigger? (Need to
+  verify via `SPI_gettypeid` or `HeapTupleHeader`.)
+- What happens if `VACUUM FULL` runs between the CDC trigger fire and the
+  next refresh cycle? Would the stale `ctid` silently match the wrong row?
+- Is `ctid` reset to the same value when the same physical slot is reused?
+  (Yes in PostgreSQL — `ctid` is reused after `VACUUM`, not unique across
+  time.)
+
+**Recommendation:** Do **not** pursue `ctid`-based identity. The reuse
+semantics make it unsafe as a durable row identifier. Instead, focus
+Sprint 1 effort on the count-based hash approach (OQ-05 is answered: ctid
+is off the table). If a unique row identity is required, recommend users
+add a `DEFAULT gen_random_uuid()` column.
+
+---
+
+### OQ-06 — EC-08: Do statement-level transition tables actually batch multiple row changes?
+
+The plan for EC-08 states that statement-level triggers with transition
+tables "provide batching naturally". This is true for a single `UPDATE`
+that affects N rows — the transition table contains all N old/new rows and
+the IVM trigger fires once. But it is **not** true for N separate
+single-row `UPDATE` statements in a loop — each fires the trigger once.
+
+**Open questions:**
+- What is the actual p50/p99 latency overhead per DML statement in
+  IMMEDIATE mode on a stream table with a 3-way join? (No benchmark
+  exists.)
+- Does `pg_advisory_xact_lock` inside the trigger add measurable
+  contention under 100+ concurrent single-row updates?
+
+**Recommendation:** Add `benches/ivm_write_overhead.rs` as a Criterion
+benchmark that measures per-statement latency for IMMEDIATE vs
+DIFFERENTIAL mode at 1, 10, 100 concurrent writers. Run it as part of the
+weekly benchmark schedule. Make the results visible in
+`docs/BENCHMARK.md` so users can make informed mode choices. This answers
+the question empirically rather than by assumption.
+
+---
+
+### OQ-07 — EC-36: How much of the scheduler can be decoupled for cloud deployments?
+
+The long-term fix for EC-36 proposes a "no-bgworker" mode where
+`refresh_stream_table()` is driven by `pg_cron` or an application timer.
+`plans/infra/REPORT_EXTERNAL_PROCESS.md` covers the sidecar feasibility
+research but reaches no conclusion.
+
+**Open questions:**
+- The scheduler currently holds a `pg_advisory_lock` during refresh to
+  prevent concurrent refreshes. Would a cron-driven caller need to acquire
+  this lock explicitly? (Yes — this is straightforward.)
+- The scheduler tracks refresh history in `pgt_refresh_history`. Would a
+  cron-driven caller need to insert rows there manually, or can this be
+  encapsulated in `refresh_stream_table()`? (Likely yes — needs a small
+  `refresh.rs` refactor.)
+- What happens to the background worker registration if `pg_trickle` is in
+  `shared_preload_libraries` but `pg_trickle.enabled = off`? The worker
+  starts but immediately sleeps — is this acceptable for cloud providers
+  that bill per background worker slot?
+
+**Recommendation:** The prerequisite for EC-36 is verifying that
+`refresh_stream_table()` already records to `pgt_refresh_history` (check
+`src/refresh.rs`). If it does, the cron-mode is already 80% implemented —
+users just need to disable the bgworker and call `refresh_stream_table()`
+on a schedule. Document this pattern in `docs/FAQ.md` under "Deployment on
+managed PostgreSQL" as an interim workaround before a formal no-bgworker
+mode is built.
