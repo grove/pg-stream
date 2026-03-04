@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Target milestone:** v0.3.0+
-**Last updated:** 2026-03-04
+**Last updated:** 2026-05-30
 
 ---
 
@@ -45,19 +45,58 @@ others are fixable engineering gaps. This document:
 applied. When the old join partner is deleted before the delta runs, the
 DELETE half of the join finds no partner and is silently dropped.
 
-**Proposed fix:**
+**Proposed fix (chosen approach: R₀ via EXCEPT ALL — medium-term):**
 
-1. **Short term (P0):** Lower the default `adaptive_full_threshold` so the
-   FULL fallback kicks in more aggressively when change volume is high — this
-   is when co-occurring key changes + deletes are most likely. Add a NOTIFY
-   alert when the fallback activates so operators are aware.
-2. **Medium term:** Implement a two-phase delta that snapshots the old join
-   state *before* applying changes, then diffs against the new state. This
-   eliminates the root cause. Prototype in a branch and benchmark the
-   overhead (expected: one extra temp-table scan per join source).
-3. **Long term:** Investigate "pre-image capture" — storing old join keys in
-   the change buffer alongside the new values, so the delta query can always
-   reconstruct the old join result without reading the current table.
+The short-term threshold adjustment is **not viable**: it trades query
+correctness for a heuristic that can still silently miss deletes when
+co-occurring changes fall below the threshold.
+
+**Primary fix — R₀ via EXCEPT ALL (4–6 days):**
+
+The delta formula in `src/dvm/operators/join.rs` is:
+
+```
+ΔJ = (ΔQ ⋈ R₁) + (L₀ ⋈ ΔR)        [current code]
+```
+
+Part 2 already computes `L₀` (pre-change left state) via EXCEPT ALL for
+Scan children (`left_part2_source` in `diff_inner_join`). The fix mirrors
+this symmetrically for Part 1's right side — splitting Part 1 into:
+
+```
+Part 1a: ΔQ_inserts ⋈ R₁           (post-change right — unchanged)
+Part 1b: ΔQ_deletes ⋈ R₀           (pre-change right via EXCEPT ALL)
+```
+
+`R₀` is computed identically to the existing `L₀`:
+```sql
+R_current EXCEPT ALL ΔR_inserts UNION ALL ΔR_deletes
+```
+
+`build_snapshot_sql()` already exists in `join_common.rs` and is reused
+here. The correction term (Part 3) was added for the `L₁` case in Part 2
+and is unaffected — Part 2 stays unchanged.
+
+**Implementation plan:**
+- Day 1–2: Add `right_part1_source` decision + EXCEPT ALL CTE analogous
+  to `use_l0` / `left_part2_source`. Mirror `use_r0` logic for nested
+  right children (no SemiJoin, ≤ 2 scan nodes → R₀; otherwise R₁).
+- Day 2–3: Split Part 1 SQL into two UNION ALL arms; update row ID hashing
+  for Part 1b arm.
+- Day 4–5: Integration tests — co-delete scenario, UPDATE-then-delete,
+  multi-cycle correctness.
+- Day 5–6: TPC-H regression suite (Q07 is the critical path).
+
+**Deferred — pre-image capture from change buffer:**
+
+The long-term approach (using `old_col` values already stored in the
+change buffer trigger to reconstruct R₀ from ΔR directly, skipping the
+live table scan) is deferred. The `old_col` values **are** already
+captured by the CDC trigger (`OLD."col"` → `"old_col"` for UPDATE/DELETE),
+but surfacing them through `DiffContext`/`DeltaSource` requires structural
+changes to the delta CTE column representation that carry higher risk.
+Estimated additional effort: 7–10 days. Schedule for v1.x when the EXCEPT
+ALL approach is already correct and benchmarked.
 
 ---
 
@@ -250,19 +289,17 @@ the right answer when back-pressure is needed.
 | **Current mitigation** | Widen the interval; use IMMEDIATE mode; or split the DAG |
 | **Documented in** | FAQ § "Performance and Tuning" |
 
-**Proposed fix:**
+**Chosen fix: `scheduler_falling_behind` NOTIFY alert (short term):**
 
-1. **Short term (P1):** Add a `scheduler_falling_behind` NOTIFY alert when
-   the refresh duration exceeds 80% of the schedule interval for 3
-   consecutive cycles. Include the stream table name, average duration, and
-   configured interval in the payload.
-2. **Medium term:** Implement an `auto_backoff` GUC (default: `on`). When
-   enabled, the scheduler automatically doubles the effective interval
-   (capped at 10× configured) when falling behind, and recovers when
-   headroom returns. Log/NOTIFY on every backoff step.
-3. **Long term:** Add a `pgtrickle.explain_st(name)` recommendation that
-   flags "refresh takes longer than schedule" when it detects the pattern
-   in `pgt_refresh_history`.
+When the refresh duration exceeds 80% of the schedule interval for 3
+consecutive cycles, emit a NOTIFY on the channel `pgtrickle_alerts` with a
+JSON payload containing the stream table name, average duration, and
+configured interval. Operators can LISTEN on the channel and wire it into
+their alerting stack.
+
+**Deferred:**
+- `auto_backoff` GUC (double effective interval when falling behind) — medium term, schedule for a later sprint.
+- `explain_st(name)` recommendation from `pgt_refresh_history` — long term.
 
 ---
 
@@ -638,12 +675,13 @@ defining queries. **No code fix.** The error message is clear.
 | **Impact** | Creation error |
 | **Documented in** | FAQ § "Why Are These SQL Features Not Supported?" |
 
-**Proposed fix:** `ALL (subquery)` is mathematically a conjunction of
-per-row comparisons — differentiating it requires tracking the min/max of
-the subquery result and recomputing the predicate when the subquery changes.
-This is feasible but complex. **Medium term:** implement via rewrite to
-`NOT EXISTS (… EXCEPT …)` pattern at parse time in `src/dvm/parser.rs`,
-similar to how `ANY (subquery)` is handled.
+**Chosen fix: rewrite to `NOT EXISTS (… EXCEPT …)` at parse time:**
+
+`ALL (subquery)` is mathematically a conjunction of per-row comparisons.
+Implement via rewrite to `NOT EXISTS (SELECT … EXCEPT SELECT val)` pattern
+at parse time in `src/dvm/parser.rs`, similar to how `ANY (subquery)` is
+already handled. This folds the `ALL` semantics into the existing subquery
+differentiation path without a new delta template.
 
 ---
 
@@ -657,12 +695,14 @@ similar to how `ANY (subquery)` is handled.
 | **Current mitigation** | Use FULL mode; or pre-aggregate in DIFFERENTIAL and compute in a view |
 | **Documented in** | FAQ § "Unsupported Aggregates" |
 
-**Proposed fix:** These aggregates require maintaining running sums of
-squares and cross-products. The algebra is well-known (Welford's online
-algorithm), but implementing it in SQL delta templates is non-trivial.
-**Long term:** add `CORR`/`COVAR_POP`/`COVAR_SAMP` support by maintaining
-auxiliary accumulators (`sum_x`, `sum_y`, `sum_xy`, `sum_x2`, `count`) in
-the stream table.
+**Chosen fix: auxiliary accumulator columns (long term):**
+
+Add `CORR`/`COVAR_POP`/`COVAR_SAMP`/`REGR_*` support by maintaining
+auxiliary accumulator columns (`sum_x`, `sum_y`, `sum_xy`, `sum_x2`,
+`count`) in the stream table and generating SQL delta templates that update
+them incrementally. The algebra follows Welford's online algorithm adapted
+to SQL set differences. Accepted as a long-term deliverable; FULL mode
+and the pre-aggregate workaround remain the supported path until then.
 
 ---
 
@@ -727,7 +767,7 @@ study. **Long term (v2.0+).**
 
 | # | Edge Case | Action | Estimated Effort |
 |---|-----------|--------|------------------|
-| 1 | EC-01: JOIN key change + right-side DELETE | Two-phase delta prototype; lower adaptive threshold default | 3–5 days |
+| 1 | EC-01: JOIN key change + right-side DELETE | R₀ via EXCEPT ALL — split Part 1 of `diff_inner_join` | 4–6 days |
 | 2 | EC-06: Keyless table duplicate rows | Emit WARNING at creation; implement count-based hash | 2–3 days |
 | 3 | EC-19: WAL + keyless without REPLICA IDENTITY FULL | Reject at creation time with clear error | 0.5 day |
 
@@ -759,11 +799,17 @@ study. **Long term (v2.0+).**
 ### P3 — Accepted trade-offs (document, no code change)
 
 EC-02, EC-04, EC-07, EC-08, EC-10, EC-12, EC-14, EC-21, EC-22, EC-23,
-EC-24, EC-27, EC-29, EC-30, EC-31, EC-33, EC-35, EC-36.
+EC-24, EC-27, EC-29, EC-30, EC-31, EC-35, EC-36.
 
 These are either fundamental design trade-offs or have adequate existing
 mitigations. Keep documentation current and revisit if user demand
 surfaces.
+
+### P3 — Committed long-term implementation
+
+| # | Edge Case | Action | Estimated Effort |
+|---|-----------|--------|------------------|
+| 19 | EC-33: CORR, COVAR_*, REGR_* | Auxiliary accumulator columns; Welford-based SQL delta templates | 5–8 days |
 
 ---
 
@@ -774,7 +820,7 @@ surfaces.
 **Sprint 1 — P0 corrections:**
 - EC-19: WAL + keyless rejection (0.5 day — quick win)
 - EC-06: Keyless duplicate warning + count-based hash (2–3 days)
-- EC-01: Two-phase delta prototype (3–5 days)
+- EC-01: R₀ via EXCEPT ALL (split Part 1 of `diff_inner_join`) (4–6 days)
 
 **Sprint 2 — P1 operational safety:**
 - EC-25: Block TRUNCATE on stream tables (0.5 day)
@@ -789,9 +835,10 @@ surfaces.
 - EC-16: pg_proc hash polling for function changes (2 days)
 - EC-03: Window function CTE extraction (3–5 days)
 
-**Sprint 4+ — P2 usability:**
-- EC-05, EC-32: Foreign table change detection; ALL (subquery) rewrite
-- Documentation sweep for all P3 items
+**Sprint 4+ — P2 + P3 long-term:**
+- EC-05, EC-32: Foreign table change detection; `ALL (subquery)` → `NOT EXISTS (… EXCEPT …)` rewrite
+- EC-33: Statistical aggregates via auxiliary accumulator columns
+- Documentation sweep for all remaining P3 items
 
 ---
 
@@ -803,60 +850,61 @@ committed to.
 
 ---
 
-### OQ-01 — EC-01: What is the correct new default for `adaptive_full_threshold`?
+### OQ-01 — EC-01: What is the correct new default for `adaptive_full_threshold`? ✅ RESOLVED
 
-**Current value:** unspecified (needs code audit to confirm).
-
-The fix for EC-01 proposes lowering the threshold so the FULL fallback
-triggers more aggressively when co-occurring key changes + deletes are
-likely. However, setting it too low eliminates the performance benefit of
-DIFFERENTIAL mode.
-
-**Recommendation:** Run a benchmark over the TPC-H Q07 workload (which
-exposes this bug) at threshold values of 1%, 5%, 10%, 25% (current
-default), and measure: (a) how often the fallback activates under a
-realistic mixed-change workload, (b) the refresh latency penalty per
-activation. Pick the lowest threshold where (b) stays under 2× the normal
-DIFFERENTIAL latency. This should be done as part of the EC-01 Sprint 1
-work before changing the default.
+**Resolution (2026-05-30):** The short-term threshold adjustment is dropped
+as not viable. It is a heuristic that can still silently miss deletes when
+co-occurring changes fall below the threshold, providing false safety. The
+primary fix is the R₀ via EXCEPT ALL approach (see EC-01). The
+`adaptive_full_threshold` GUC remains as-is for users who want it as an
+escape valve, but it is no longer positioned as an EC-01 mitigation path.
 
 ---
 
-### OQ-02 — EC-01: Is pre-image capture viable without a breaking change buffer schema change?
+### OQ-02 — EC-01: Is pre-image capture viable without a breaking change buffer schema change? ✅ RESOLVED
 
-The long-term fix for EC-01 stores old join keys in the change buffer
-alongside new values. The current change buffer schema
-(`pgtrickle_changes.changes_<oid>`) stores new-row data plus a
-`change_type` column; it does not have old-key columns.
+**Resolution (2026-05-30):** Schema changes are NOT needed. The CDC trigger
+(`src/cdc.rs`) already stores `OLD."col"` → `"old_col"` typed columns in the
+change buffer for every UPDATE and DELETE event. The old join key values are
+therefore already available. The question is now about *when* to use them.
 
-**Open questions:**
-- Can old-key columns be added as nullable columns without breaking the
-  existing CDC trigger templates? (Likely yes — triggers would populate
-  them only on UPDATE/DELETE.)
-- Does adding 1–N extra columns per change buffer table require a migration
-  for existing installations, or can it be handled by `ALTER TABLE … ADD
-  COLUMN` during `needs_reinit`?
-- Should old-key columns be stored in a separate table
-  (`changes_<oid>_old_keys`) to keep the hot change path lean?
-
-**Recommendation:** Prototype the nullable-column approach in a branch
-first. Measure the write amplification on a high-throughput CDC workload.
-Only pursue the separate-table approach if the hot-path benchmark shows
-measurable regression (> 5% throughput drop on the source table).
+The R₀ via EXCEPT ALL approach (chosen for Sprint 1) does not need `old_col`
+column access from the delta CTE at all — it reconstructs the pre-change right
+state from the live table + ΔR change set. The pre-image (`old_col`) approach
+is still viable as a future optimisation (avoids the live-table EXCEPT ALL
+scan) but is deferred to v1.x because it requires structural changes to
+`DiffContext`/`DeltaSource` to surface `old_col` values in the delta CTE
+output. Effort: 7–10 days when the time comes.
 
 ---
 
-### OQ-03 — EC-01: What is the overhead of the two-phase delta?
+### OQ-03 — EC-01: What is the overhead of the R₀ via EXCEPT ALL approach?
 
-The medium-term fix for EC-01 snapshots the old join state *before*
-applying changes. The plan estimates "one extra temp-table scan per join
-source" but this has not been measured.
+**Updated analysis (2026-05-30):**
 
-**Recommendation:** Before committing to the two-phase delta design,
-run a micro-benchmark comparing single-phase vs two-phase delta on a
-3-way join stream table with 100k / 1M / 10M source rows. If the overhead
-exceeds 30% of the current DIFFERENTIAL latency, reconsider the approach
-in favour of FULL-mode fallback at a lower threshold (OQ-01).
+Code archaeology shows the overhead is similar to what Part 2 already pays
+for `L₀`:
+
+- Part 1 already does a semi-join-filtered scan of `R₁` (full right table,
+  filtered by delta-left join keys). Adding R₀ = `R₁ EXCEPT ALL ΔR_inserts
+  UNION ALL ΔR_deletes` adds **one extra pass over the ΔR CTE** (which is
+  small — only changed rows). The live table is not scanned an extra time
+  because `R₁` is already in the query plan; the EXCEPT ALL just subtracts a
+  small set from it.
+- The semi-join filter that limits R₁ also applies to R₀, so the set
+  difference operates on already-filtered rows.
+- The correction term (Part 3) is unaffected by this change.
+
+**Expected overhead:** < 10% additional latency on the delta query for
+typical workloads where ΔR is small relative to R. The concern about "one
+extra temp-table scan per join source" from the original write-up was
+over-estimated — the EXCEPT ALL operates on the already-materialized ΔR CTE,
+not the full right table.
+
+**Recommendation:** Confirm with a micro-benchmark (1M right table, 0.1%
+change rate) before the Sprint 1 PR merges. Accept if overhead is under 30%
+of current DIFFERENTIAL latency; otherwise fall back to applying R₀ only
+when `ΔR` is non-empty (easy conditional).
 
 ---
 
