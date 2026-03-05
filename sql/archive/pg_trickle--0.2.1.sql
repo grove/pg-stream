@@ -42,11 +42,11 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     functions_used  TEXT[],
     topk_limit      INT,
     topk_order_by   TEXT,
+    topk_offset     INT,
     diamond_consistency TEXT NOT NULL DEFAULT 'none'
                      CHECK (diamond_consistency IN ('none', 'atomic')),
     diamond_schedule_policy TEXT NOT NULL DEFAULT 'fastest'
                      CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
-    topk_offset     INT,
     has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE,
     function_hashes TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
