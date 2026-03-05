@@ -37,7 +37,7 @@ as a parse-time alias for `NULL`; internal storage stays `NULL`.
 | `'calculated'` storage | Accepted/rejected at parse time; stored as `NULL` — no SQL migration needed |
 | `create_stream_table` default | Change from `'1m'` to `'calculated'` (breaking behavioral change; document in CHANGELOG) |
 | `default_schedule_seconds` default | `1` (matches new `min_schedule_seconds` default) |
-| Diamond GUC fallbacks | Hardcoded to `'none'` / `'fastest'` in Rust; per-table params in `create/alter_stream_table` are kept |
+| Diamond GUC fallbacks | Hardcoded to `'atomic'` / `'fastest'` in Rust (EC-13 set `'atomic'` as correct default); per-table params in `create/alter_stream_table` are kept |
 
 ---
 

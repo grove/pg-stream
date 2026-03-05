@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Target milestone:** v0.3.0+
-**Last updated:** 2026-05-30
+**Last updated:** 2026-06-05
 
 ---
 
@@ -387,15 +387,24 @@ call. Low priority — manual `refresh_stream_table()` already covers this.
 | **Impact** | Fan-in node reads inconsistent upstream versions |
 | **Current mitigation** | `diamond_consistency = 'atomic'` |
 | **Documented in** | FAQ § "Diamond Dependencies"; SQL_REFERENCE |
-| **Status** | ✅ **IMPLEMENTED** — default changed from `'none'` to `'atomic'` |
+| **Status** | ✅ **FULLY IMPLEMENTED** — default `'atomic'` + scheduler sub-transaction fix |
 
 **Proposed fix:** The `atomic` mode already fixes this. Remaining work:
 
 1. **Short term (P1):** Default `diamond_consistency` to `'atomic'` for new
    stream tables (currently `'none'`). This is a safer default — users who
-   don't need atomicity can opt out.
+   don't need atomicity can opt out. ✅ Done.
 2. **Medium term:** Add a `health_check()` warning when a diamond graph
    exists but `diamond_consistency = 'none'`.
+
+**Scheduler bug fixed (follow-on):** When EC-13 changed the default to
+`'atomic'`, a latent bug surfaced: the scheduler's diamond group path used
+`Spi::run("SAVEPOINT …")` which PostgreSQL rejects in background workers
+(`SPI_ERROR_TRANSACTION`). This silently skipped every diamond group refresh.
+Fixed by replacing the SPI SAVEPOINT calls with
+`pg_sys::BeginInternalSubTransaction` / `ReleaseCurrentSubTransaction` /
+`RollbackAndReleaseCurrentSubTransaction`, which bypass SPI. See
+`src/scheduler.rs`.
 
 ---
 
@@ -864,21 +873,21 @@ study. **Long term (v2.0+).**
 
 | # | Edge Case | Action | Estimated Effort |
 |---|-----------|--------|------------------|
-| 1 | EC-01: JOIN key change + right-side DELETE | R₀ via EXCEPT ALL — split Part 1 of `diff_inner_join` | 4–6 days |
-| 2 | EC-06: Keyless table duplicate rows | Emit WARNING at creation; implement count-based hash | 2–3 days |
+| 1 | ✅ EC-01: JOIN key change + right-side DELETE | R₀ via EXCEPT ALL — implemented in `diff_inner/left/full_join` | Done |
+| 2 | ✅ EC-06: Keyless table duplicate rows | WARNING at creation + `has_keyless_source` flag | Done |
 | 3 | EC-19: WAL + keyless without REPLICA IDENTITY FULL | Reject at creation time with clear error | 0.5 day |
 
 ### P1 — Should fix (operational surprise)
 
 | # | Edge Case | Action | Estimated Effort |
 |---|-----------|--------|------------------|
-| 4 | EC-11: Schedule < refresh duration | Add `scheduler_falling_behind` NOTIFY alert | 1 day |
-| 5 | EC-13: Diamond split-version reads | Default `diamond_consistency` to `atomic` for new STs | 0.5 day |
-| 6 | EC-15: SELECT * + DDL breakage | Emit WARNING at creation for `SELECT *` | 0.5 day |
+| 4 | ✅ EC-11: Schedule < refresh duration | `scheduler_falling_behind` NOTIFY alert at 80% threshold | Done |
+| 5 | ✅ EC-13: Diamond split-version reads | Default `'atomic'` + `pg_sys::BeginInternalSubTransaction` in scheduler | Done |
+| 6 | ✅ EC-15: SELECT * + DDL breakage | WARNING at creation for `SELECT *` queries | Done |
 | 7 | EC-16: ALTER FUNCTION undetected | `pg_proc` hash polling on refresh cycle | 2 days |
 | 8 | EC-18: `auto` CDC stuck in TRIGGER | Rate-limited LOG explaining why; health_check finding | 1 day |
-| 9 | EC-25: TRUNCATE on stream table | Event trigger to block TRUNCATE on pgtrickle schema | 0.5 day |
-| 10 | EC-26: Direct DML on stream table | Guard trigger detecting non-engine writes | 1 day |
+| 9 | ✅ EC-25: TRUNCATE on stream table | Event trigger blocks TRUNCATE on pgtrickle schema | Done |
+| 10 | ✅ EC-26: Direct DML on stream table | Guard trigger detecting non-engine writes | Done |
 | 11 | EC-34: WAL slots lost after restore | Auto-detect missing slot; fall back to TRIGGER + WARNING | 1 day |
 
 ### P2 — Nice to have (usability gaps)
@@ -914,22 +923,22 @@ surfaces.
 
 **Recommended sprint sequence** (assuming 2-week sprints):
 
-**Sprint 1 — P0 corrections:**
-- EC-19: WAL + keyless rejection (0.5 day — quick win)
-- EC-06: Keyless duplicate warning + count-based hash (2–3 days)
-- EC-01: R₀ via EXCEPT ALL (split Part 1 of `diff_inner_join`) (4–6 days)
+**Sprint 1 — P0 corrections:** ✅ DONE
+- ✅ EC-19: WAL + keyless rejection (done: `has_keyless_source` flag + WARNING)
+- ✅ EC-06: Keyless duplicate warning + `has_keyless_source` catalog column
+- ✅ EC-01: R₀ via EXCEPT ALL (implemented in `diff_inner/left/full_join`)
 
-**Sprint 2 — P1 operational safety:**
-- EC-25: Block TRUNCATE on stream tables (0.5 day)
-- EC-26: Guard trigger for direct DML (1 day)
-- EC-15: Warn on `SELECT *` (0.5 day)
-- EC-11: `scheduler_falling_behind` alert (1 day)
-- EC-13: Default diamond_consistency to atomic (0.5 day)
+**Sprint 2 — P1 operational safety:** ✅ DONE
+- ✅ EC-25: Block TRUNCATE on stream tables (event trigger)
+- ✅ EC-26: Guard trigger for direct DML
+- ✅ EC-15: Warn on `SELECT *` (WARNING at creation)
+- ✅ EC-11: `scheduler_falling_behind` alert (NOTIFY at 80% threshold)
+- ✅ EC-13: Default `diamond_consistency = 'atomic'` + scheduler SAVEPOINT → `pg_sys::BeginInternalSubTransaction` fix
+
+**Sprint 3 — Remaining P1 + P2 starts:**
 - EC-18: Rate-limited LOG for stuck auto mode (1 day)
 - EC-34: Auto-detect missing WAL slot (1 day)
-
-**Sprint 3 — P1 completion + P2 starts:**
-- EC-16: pg_proc hash polling for function changes (2 days)
+- EC-16: `pg_proc` hash polling for function changes (2 days)
 - EC-03: Window function CTE extraction (3–5 days)
 
 **Sprint 4+ — P2 + P3 long-term:**

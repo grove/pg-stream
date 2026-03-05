@@ -77,7 +77,7 @@ fn create_stream_table_impl(
                 }
             }
         }
-        None => DiamondConsistency::None,
+        None => DiamondConsistency::Atomic,
     };
 
     // Parse diamond schedule policy — default to 'fastest' when not specified

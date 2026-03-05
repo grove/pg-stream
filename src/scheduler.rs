@@ -465,15 +465,24 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     continue;
                 }
 
-                // All members due (per policy) — wrap in a SAVEPOINT.
-                let sp_result = Spi::run("SAVEPOINT pgt_consistency_group");
-                if let Err(e) = sp_result {
-                    log!(
-                        "pg_trickle: failed to create SAVEPOINT for diamond group: {}",
-                        e
-                    );
-                    continue;
-                }
+                // All members due (per policy) — wrap in an internal sub-transaction.
+                //
+                // Background workers cannot use `Spi::run("SAVEPOINT …")` because
+                // PostgreSQL rejects transaction-control commands issued via SPI
+                // (SPI_ERROR_TRANSACTION).  The correct approach is the internal
+                // C-level sub-transaction API which bypasses SPI entirely.
+                //
+                // SAFETY: BeginInternalSubTransaction sets up a sub-transaction
+                // within the current worker transaction using PostgreSQL's resource-
+                // owner mechanism.  We save and restore CurrentMemoryContext and
+                // CurrentResourceOwner to ensure no context leak regardless of
+                // whether the sub-transaction commits or rolls back.  All work
+                // inside is done through SPI (which handles its own C-level exception
+                // boundaries), so a Rust-visible panic from this block is not
+                // expected.
+                let old_cxt = unsafe { pg_sys::CurrentMemoryContext };
+                let old_owner = unsafe { pg_sys::CurrentResourceOwner };
+                unsafe { pg_sys::BeginInternalSubTransaction(std::ptr::null()) };
 
                 let mut group_ok = true;
                 let mut refreshed_ids: Vec<i64> = Vec::new();
@@ -531,14 +540,23 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 }
 
                 if group_ok {
-                    let _ = Spi::run("RELEASE SAVEPOINT pgt_consistency_group");
+                    // SAFETY: Commits the sub-transaction and restores context.
+                    unsafe {
+                        pg_sys::ReleaseCurrentSubTransaction();
+                        pg_sys::MemoryContextSwitchTo(old_cxt);
+                        pg_sys::CurrentResourceOwner = old_owner;
+                    }
                     // Reset retry states for all refreshed members
                     for id in &refreshed_ids {
                         retry_states.entry(*id).or_default().reset();
                     }
                 } else {
-                    let _ = Spi::run("ROLLBACK TO SAVEPOINT pgt_consistency_group");
-                    let _ = Spi::run("RELEASE SAVEPOINT pgt_consistency_group");
+                    // SAFETY: Rolls back the sub-transaction and restores context.
+                    unsafe {
+                        pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                        pg_sys::MemoryContextSwitchTo(old_cxt);
+                        pg_sys::CurrentResourceOwner = old_owner;
+                    }
                     // Record failure for retry tracking on all attempted members
                     for id in &refreshed_ids {
                         let retry = retry_states.entry(*id).or_default();
