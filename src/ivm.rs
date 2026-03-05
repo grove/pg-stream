@@ -627,6 +627,15 @@ fn pgt_ivm_apply_delta(
     // Clean up the delta temp table.
     let _ = Spi::run(&format!("DROP TABLE IF EXISTS {delta_table}"));
 
+    // Update data_timestamp so downstream stream tables that compare
+    // upstream timestamps (ST-on-ST) detect the change.
+    if delta_count > 0 {
+        let now = Spi::get_one::<pgrx::datum::TimestampWithTimeZone>("SELECT now()")
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
+        StreamTableMeta::update_after_refresh(pgt_id, now, delta_count)?;
+    }
+
     pgrx::debug1!(
         "[pg_trickle] IVM delta applied for pgt_id={}, source_oid={}, delta_rows={}",
         pgt_id,
