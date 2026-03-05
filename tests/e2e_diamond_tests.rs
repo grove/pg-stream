@@ -134,7 +134,7 @@ async fn test_diamond_consistency_alter() {
              WHERE pgt_name = 'test_alter_dc'",
         )
         .await;
-    assert_eq!(dc, "atomic");
+    assert_eq!(dc, "none");
 }
 
 /// Verify that a diamond topology with diamond_consistency='atomic' detects

@@ -41,7 +41,9 @@ async fn test_upgrade_catalog_schema_stability() {
         ("diamond_consistency", "text"),
         ("diamond_schedule_policy", "text"),
         ("frontier", "jsonb"),
+        ("function_hashes", "text"),
         ("functions_used", "ARRAY"),
+        ("has_keyless_source", "boolean"),
         ("is_populated", "boolean"),
         ("last_full_ms", "double precision"),
         ("last_refresh_at", "timestamp with time zone"),
@@ -55,6 +57,7 @@ async fn test_upgrade_catalog_schema_stability() {
         ("schedule", "text"),
         ("status", "text"),
         ("topk_limit", "integer"),
+        ("topk_offset", "integer"),
         ("topk_order_by", "text"),
         ("updated_at", "timestamp with time zone"),
     ];

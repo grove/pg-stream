@@ -82,6 +82,21 @@ pub fn create_change_trigger(
     let upd_pk = format!(", {pk_hash_new}");
     let del_pk = format!(", {pk_hash_old}");
 
+    // Task 3.1: Build the UPDATE changed_cols bitmask expression.
+    // For PK-based tables with ≤ 63 columns, compute a BIGINT bitmask where
+    // bit i is set when column i changed.  NULL for INSERT and DELETE rows
+    // (all columns are always populated in those cases).
+    let bitmask_opt = build_changed_cols_bitmask_expr(pk_columns, columns);
+    let upd_changed_col_decl = if bitmask_opt.is_some() {
+        ", changed_cols"
+    } else {
+        ""
+    };
+    let upd_changed_val = bitmask_opt
+        .as_deref()
+        .map(|expr| format!(",\n        ({expr})"))
+        .unwrap_or_default();
+
     // Build per-column typed INSERT components.
     // Instead of `to_jsonb(NEW)` / `to_jsonb(OLD)`, we write each column
     // individually as `NEW."col"` → `"new_col"` and `OLD."col"` → `"old_col"`.
@@ -136,10 +151,12 @@ pub fn create_change_trigger(
                          {ins_pk}{new_vals});
                  RETURN NEW;
              ELSIF TG_OP = 'UPDATE' THEN
+                 -- Task 3.1: record which columns changed via IS DISTINCT FROM bitmask.
+                 -- changed_cols IS NULL for INSERT/DELETE (all columns populated).
                  INSERT INTO {change_schema}.changes_{oid}
-                     (lsn, action{pk_col_decl}{new_col_names}{old_col_names})
+                     (lsn, action{pk_col_decl}{upd_changed_col_decl}{new_col_names}{old_col_names})
                  VALUES (pg_current_wal_insert_lsn(), 'U'
-                         {upd_pk}{new_vals}{old_vals});
+                         {upd_pk}{upd_changed_val}{new_vals}{old_vals});
                  RETURN NEW;
              ELSIF TG_OP = 'DELETE' THEN
                  INSERT INTO {change_schema}.changes_{oid}
@@ -278,13 +295,53 @@ pub fn drop_change_trigger(
 ///
 /// `columns` contains the source table column definitions as
 /// `(column_name, sql_type_name)` pairs from `resolve_source_column_defs()`.
+/// Task 3.1: Build the PL/pgSQL expression for the `changed_cols` BIGINT bitmask.
+///
+/// Bit `i` is set when `NEW.col_i IS DISTINCT FROM OLD.col_i`, allowing the
+/// scan delta to determine which columns were actually modified by an UPDATE.
+///
+/// Returns `None` when the optimization is not applicable:
+/// - Keyless tables (`pk_columns` empty): all columns contribute to
+///   the content hash and must always be present.
+/// - Tables with > 63 columns: a `BIGINT` bitmask cannot represent them
+///   all (bits 0–62 fit; bit 63 is the sign bit — use 63 as the cap).
+///
+/// For INSERT and DELETE rows `changed_cols` is stored as `NULL`, indicating
+/// that all new_*/old_* column values are populated (backward-compatible).
+pub fn build_changed_cols_bitmask_expr(
+    pk_columns: &[String],
+    columns: &[(String, String)],
+) -> Option<String> {
+    if pk_columns.is_empty() {
+        return None; // keyless: must always write all columns
+    }
+    if columns.len() > 63 {
+        return None; // too many columns for a BIGINT bitmask
+    }
+    let parts: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, (col_name, _))| {
+            let qcol = col_name.replace('"', "\"\"");
+            let bit: i64 = 1 << i;
+            format!(
+                "(CASE WHEN NEW.\"{qcol}\" IS DISTINCT FROM OLD.\"{qcol}\" \
+                 THEN {bit}::BIGINT ELSE 0 END)"
+            )
+        })
+        .collect();
+    Some(parts.join(" |\n        "))
+}
+
 pub fn create_change_buffer_table(
     source_oid: pg_sys::Oid,
     change_schema: &str,
     columns: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
     // pk_hash is always present (PK hash or all-column content hash).
-    let pk_col = ",pk_hash BIGINT";
+    // changed_cols is a BIGINT bitmask for UPDATE rows — bit i set when column i
+    // changed. NULL for INSERT and DELETE rows (all columns always populated).
+    let pk_col = ",pk_hash BIGINT,changed_cols BIGINT";
 
     // Build typed column definitions: "new_col" TYPE, "old_col" TYPE
     let typed_col_defs: String = columns
@@ -339,6 +396,110 @@ pub fn create_change_buffer_table(
     Spi::run(&idx_sql).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create change buffer index: {}", e))
     })?;
+
+    Ok(())
+}
+
+/// Task 3.5: Extend an existing change buffer table after ADD COLUMN DDL on the
+/// source table, and rebuild the CDC trigger function in-place — without a full
+/// ST reinitialize.
+///
+/// For each source column that does **not** yet have a corresponding `new_<col>`
+/// column in the change buffer:
+/// - `ALTER TABLE changes_{oid} ADD COLUMN IF NOT EXISTS "new_<col>" <type>`
+/// - `ALTER TABLE changes_{oid} ADD COLUMN IF NOT EXISTS "old_<col>" <type>`
+///
+/// After the buffer is extended the CDC trigger function is recreated via
+/// `rebuild_cdc_trigger_function`, and the stored column snapshot is refreshed
+/// so that the next DDL event picks up the new baseline correctly.
+pub fn alter_change_buffer_add_columns(
+    source_oid: pg_sys::Oid,
+    change_schema: &str,
+    pgt_id: i64,
+) -> Result<(), PgTrickleError> {
+    // Resolve current source columns.
+    let source_cols = resolve_source_column_defs(source_oid)?;
+
+    // Query existing columns in the change buffer.
+    let buffer_table = format!("{}.changes_{}", change_schema, source_oid.to_u32());
+    let existing_sql = format!(
+        "SELECT attname::text FROM pg_attribute \
+         WHERE attrelid = '{}'::regclass AND attnum > 0 AND NOT attisdropped",
+        buffer_table.replace('\'', "''"),
+    );
+    let existing_set: std::collections::HashSet<String> = Spi::connect(|client| {
+        let rows = client
+            .select(&existing_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let mut s = std::collections::HashSet::new();
+        for row in rows {
+            let name: String = row
+                .get(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or_default();
+            s.insert(name);
+        }
+        Ok(s)
+    })?;
+
+    // For each source column missing from the buffer, add both new_ and old_ variants.
+    // Also ensure changed_cols BIGINT column exists (Task 3.1 migration).
+    if !existing_set.contains("changed_cols") {
+        let add_sql = format!(
+            "ALTER TABLE {schema}.changes_{oid} ADD COLUMN IF NOT EXISTS changed_cols BIGINT",
+            schema = change_schema,
+            oid = source_oid.to_u32(),
+        );
+        if let Err(e) = Spi::run(&add_sql) {
+            pgrx::debug1!(
+                "[pg_trickle] alter_change_buffer_add_columns: failed to add changed_cols: {e}"
+            );
+        }
+    }
+
+    for (col_name, col_type) in &source_cols {
+        let new_col = format!("new_{}", col_name);
+        if !existing_set.contains(&new_col) {
+            let qcol = col_name.replace('"', "\"\"");
+            let qtype = col_type.as_str();
+            let add_new = format!(
+                "ALTER TABLE {schema}.changes_{oid} \
+                 ADD COLUMN IF NOT EXISTS \"new_{qcol}\" {qtype}",
+                schema = change_schema,
+                oid = source_oid.to_u32(),
+            );
+            let add_old = format!(
+                "ALTER TABLE {schema}.changes_{oid} \
+                 ADD COLUMN IF NOT EXISTS \"old_{qcol}\" {qtype}",
+                schema = change_schema,
+                oid = source_oid.to_u32(),
+            );
+            Spi::run(&add_new).map_err(|e| {
+                PgTrickleError::SpiError(format!(
+                    "Failed to add new_{} column to change buffer: {}",
+                    col_name, e
+                ))
+            })?;
+            Spi::run(&add_old).map_err(|e| {
+                PgTrickleError::SpiError(format!(
+                    "Failed to add old_{} column to change buffer: {}",
+                    col_name, e
+                ))
+            })?;
+        }
+    }
+
+    // Rebuild CDC trigger function to capture the new columns.
+    rebuild_cdc_trigger_function(source_oid, change_schema)?;
+
+    // Refresh stored column snapshot so the next DDL event uses the updated baseline.
+    if let Err(e) = crate::catalog::store_column_snapshot_for_pgt_id(pgt_id, source_oid) {
+        pgrx::debug1!(
+            "[pg_trickle] alter_change_buffer_add_columns: failed to refresh snapshot for ST {}: {}",
+            pgt_id,
+            e
+        );
+    }
 
     Ok(())
 }
@@ -594,6 +755,18 @@ pub fn rebuild_cdc_trigger_function(
     let upd_pk = format!(", {pk_hash_new}");
     let del_pk = format!(", {pk_hash_old}");
 
+    // Task 3.1: changed_cols bitmask for UPDATE rows.
+    let bitmask_opt = build_changed_cols_bitmask_expr(&pk_columns, &columns);
+    let upd_changed_col_decl = if bitmask_opt.is_some() {
+        ", changed_cols"
+    } else {
+        ""
+    };
+    let upd_changed_val = bitmask_opt
+        .as_deref()
+        .map(|expr| format!(",\n        ({expr})"))
+        .unwrap_or_default();
+
     let new_col_names: String = columns
         .iter()
         .map(|(name, _)| format!(", \"new_{}\"", name.replace('"', "\"\"")))
@@ -622,19 +795,20 @@ pub fn rebuild_cdc_trigger_function(
              IF TG_OP = 'INSERT' THEN
                  INSERT INTO {change_schema}.changes_{oid}
                      (lsn, action{pk_col_decl}{new_col_names})
-                 VALUES (pg_current_wal_lsn(), 'I'
+                 VALUES (pg_current_wal_insert_lsn(), 'I'
                          {ins_pk}{new_vals});
                  RETURN NEW;
              ELSIF TG_OP = 'UPDATE' THEN
+                 -- Task 3.1: record which columns changed via IS DISTINCT FROM bitmask.
                  INSERT INTO {change_schema}.changes_{oid}
-                     (lsn, action{pk_col_decl}{new_col_names}{old_col_names})
-                 VALUES (pg_current_wal_lsn(), 'U'
-                         {upd_pk}{new_vals}{old_vals});
+                     (lsn, action{pk_col_decl}{upd_changed_col_decl}{new_col_names}{old_col_names})
+                 VALUES (pg_current_wal_insert_lsn(), 'U'
+                         {upd_pk}{upd_changed_val}{new_vals}{old_vals});
                  RETURN NEW;
              ELSIF TG_OP = 'DELETE' THEN
                  INSERT INTO {change_schema}.changes_{oid}
                      (lsn, action{pk_col_decl}{old_col_names})
-                 VALUES (pg_current_wal_lsn(), 'D'
+                 VALUES (pg_current_wal_insert_lsn(), 'D'
                          {del_pk}{old_vals});
                  RETURN OLD;
              END IF;
@@ -705,12 +879,22 @@ fn sync_change_buffer_columns(
         .flat_map(|(col_name, _)| [format!("new_{}", col_name), format!("old_{}", col_name)])
         .collect();
 
-    // F39: Drop orphaned buffer columns whose source column was dropped.
-    // System columns (change_id, lsn, action, pk_hash) are preserved.
-    let system_cols: std::collections::HashSet<&str> = ["change_id", "lsn", "action", "pk_hash"]
-        .iter()
-        .copied()
-        .collect();
+    // System columns: never dropped, not tracked as data columns.
+    // changed_cols is a system column (Task 3.1 bitmask — preserved across schema changes).
+    let system_cols: std::collections::HashSet<&str> =
+        ["change_id", "lsn", "action", "pk_hash", "changed_cols"]
+            .iter()
+            .copied()
+            .collect();
+
+    // Ensure changed_cols column exists (Task 3.1 migration for existing buffers).
+    if !existing_cols.contains("changed_cols") {
+        let add_sql =
+            format!("ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS changed_cols BIGINT");
+        if let Err(e) = Spi::run(&add_sql) {
+            pgrx::debug1!("pg_trickle_cdc: failed to add changed_cols to {buffer_table}: {e}");
+        }
+    }
 
     for existing in &existing_cols {
         if system_cols.contains(existing.as_str()) {

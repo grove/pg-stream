@@ -217,6 +217,16 @@ pub enum AggFunc {
     RegrSxx,
     RegrSxy,
     RegrSyy,
+    /// XMLAGG aggregate — group-rescan strategy.
+    /// Optional ORDER BY is stored in `order_within_group`.
+    XmlAgg,
+    /// Hypothetical-set aggregates — group-rescan strategy.
+    /// These use `WITHIN GROUP (ORDER BY ...)` syntax with one hypothetical value
+    /// as the function argument (e.g., `RANK(42) WITHIN GROUP (ORDER BY score)`).
+    HypRank,
+    HypDenseRank,
+    HypPercentRank,
+    HypCumeDist,
     /// Complex expression wrapping multiple aggregate calls.
     ///
     /// Created when a SELECT target is an arithmetic or conditional expression
@@ -271,6 +281,11 @@ impl AggFunc {
             AggFunc::RegrSxx => "REGR_SXX",
             AggFunc::RegrSxy => "REGR_SXY",
             AggFunc::RegrSyy => "REGR_SYY",
+            AggFunc::XmlAgg => "XMLAGG",
+            AggFunc::HypRank => "RANK",
+            AggFunc::HypDenseRank => "DENSE_RANK",
+            AggFunc::HypPercentRank => "PERCENT_RANK",
+            AggFunc::HypCumeDist => "CUME_DIST",
             AggFunc::ComplexExpression(_) => "COMPLEX_EXPRESSION",
         }
     }
@@ -319,6 +334,11 @@ impl AggFunc {
                 | AggFunc::RegrSxx
                 | AggFunc::RegrSxy
                 | AggFunc::RegrSyy
+                | AggFunc::XmlAgg
+                | AggFunc::HypRank
+                | AggFunc::HypDenseRank
+                | AggFunc::HypPercentRank
+                | AggFunc::HypCumeDist
                 | AggFunc::ComplexExpression(_)
         )
     }
@@ -2276,6 +2296,11 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgTrickleError> {
                     | AggFunc::RegrSxx
                     | AggFunc::RegrSxy
                     | AggFunc::RegrSyy
+                    | AggFunc::XmlAgg
+                    | AggFunc::HypRank
+                    | AggFunc::HypDenseRank
+                    | AggFunc::HypPercentRank
+                    | AggFunc::HypCumeDist
                     | AggFunc::ComplexExpression(_) => {}
                 }
             }
@@ -5046,7 +5071,7 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
         if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR
             && unsafe { and_contains_or_with_sublink(select.whereClause) }
         {
-            return rewrite_and_with_or_sublinks(select, boolexpr);
+            return rewrite_and_with_or_sublinks(select, select.whereClause);
         }
         return Ok(query.to_string());
     }
@@ -5127,31 +5152,45 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
     Ok(rewritten)
 }
 
-/// Handle AND conjunction where one arm is an OR containing sublinks.
+/// Handle AND conjunction (at any nesting depth) where one arm is an OR
+/// containing sublinks.
 ///
 /// ```sql
-/// -- Input:
+/// -- Input (one-level AND):
 /// SELECT * FROM t WHERE a > 10 AND (status = 'active' OR EXISTS (...))
+/// -- Input (two-level AND):
+/// SELECT * FROM t WHERE a > 10 AND b = 1 AND (status = 'active' OR EXISTS (...))
 /// -- Rewrite to:
-/// SELECT * FROM t WHERE a > 10 AND status = 'active'
+/// SELECT * FROM t WHERE a > 10 AND ... AND status = 'active'
 /// UNION
-/// SELECT * FROM t WHERE a > 10 AND EXISTS (...)
+/// SELECT * FROM t WHERE a > 10 AND ... AND EXISTS (...)
 /// ```
+///
+/// The `where_node` argument is the entire WHERE clause node (typically a
+/// BoolExpr AND chain). The function flattens all nested AND layers before
+/// searching for the OR arm, so arbitrarily deep `AND(AND(OR(...)))` nesting
+/// is handled correctly.
 fn rewrite_and_with_or_sublinks(
     select: &pg_sys::SelectStmt,
-    and_expr: &pg_sys::BoolExpr,
+    where_node: *mut pg_sys::Node,
 ) -> Result<String, PgTrickleError> {
-    let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(and_expr.args) };
+    // Flatten the entire AND chain into a list of atomic conjuncts.
+    // AND(a, AND(b, OR(...))) → [a, b, OR(...)]
+    let mut conjuncts: Vec<*mut pg_sys::Node> = Vec::new();
+    unsafe { flatten_and_conjuncts(where_node, &mut conjuncts) };
 
-    // Find the OR arm with sublinks and collect non-OR conjuncts
+    // Find the first OR arm with sublinks; accumulate the rest as plain
+    // conjuncts. If there are multiple OR-with-sublinks, only the first
+    // is decomposed — subsequent ones are left as regular predicates
+    // (the downstream parser will handle or reject them).
     let mut or_arm: Option<*mut pg_sys::Node> = None;
     let mut other_conjuncts: Vec<String> = Vec::new();
 
-    for arg_ptr in args.iter_ptr() {
+    for arg_ptr in conjuncts {
         if arg_ptr.is_null() {
             continue;
         }
-        if unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_BoolExpr) } {
+        if or_arm.is_none() && unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_BoolExpr) } {
             let inner_bool = unsafe { &*(arg_ptr as *const pg_sys::BoolExpr) };
             if inner_bool.boolop == pg_sys::BoolExprType::OR_EXPR
                 && unsafe { node_tree_contains_sublink(arg_ptr) }
@@ -5703,6 +5742,262 @@ unsafe fn extract_window_info_from_targets(
     }
 
     Ok(infos)
+}
+
+/// Deparse the WINDOW clause of a SelectStmt into SQL, e.g. `w AS (PARTITION BY x ORDER BY y)`.
+///
+/// Returns an empty string when there is no WINDOW clause.
+///
+/// # Safety
+/// Caller must ensure `select` points to a valid `SelectStmt`.
+unsafe fn deparse_select_window_clause(
+    select: &pg_sys::SelectStmt,
+) -> Result<String, PgTrickleError> {
+    if select.windowClause.is_null() {
+        return Ok(String::new());
+    }
+    let window_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.windowClause) };
+    if window_list.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parts = Vec::new();
+    for node_ptr in window_list.iter_ptr() {
+        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_WindowDef) } {
+            let wdef = unsafe { &*(node_ptr as *const pg_sys::WindowDef) };
+            let wname = if !wdef.name.is_null() {
+                unsafe { std::ffi::CStr::from_ptr(wdef.name) }
+                    .to_str()
+                    .unwrap_or("w")
+                    .to_string()
+            } else {
+                continue;
+            };
+            let wspec = unsafe { deparse_window_def(wdef)? };
+            parts.push(format!("{wname} AS ({wspec})"));
+        }
+    }
+    Ok(parts.join(", "))
+}
+
+/// Rewrite queries where window functions are nested inside expressions.
+///
+/// The DVM engine requires window functions to appear at the top level of a
+/// SELECT target (i.e. `wf_expr AS alias`). When a window function is wrapped
+/// inside another expression — e.g. `ABS(ROW_NUMBER() OVER (...) - 5)` — the
+/// parser rejects the query with an "unsupported" error.
+///
+/// This pass lifts all nested window functions into an inner subquery:
+///
+/// ```sql
+/// -- Input
+/// SELECT ABS(ROW_NUMBER() OVER (ORDER BY score) - 5) AS dist FROM t;
+///
+/// -- Output
+/// SELECT "abs"("__pgt_wf_inner"."__pgt_wf_1" - 5) AS "dist"
+///   FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY score) AS "__pgt_wf_1"
+///         FROM t) "__pgt_wf_inner";
+/// ```
+///
+/// Returns the original query unchanged when:
+/// - The statement is a set operation (UNION / INTERSECT / EXCEPT)
+/// - `GROUP BY` is present (interaction with window functions is complex)
+/// - No nested window function expressions are found
+pub fn rewrite_nested_window_exprs(query: &str) -> Result<String, PgTrickleError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return Ok(query.to_string()),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(query.to_string());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // Set operations — don't rewrite; the union/intersect/except paths handle those
+    if select.op != pg_sys::SetOperation::SETOP_NONE {
+        return Ok(query.to_string());
+    }
+
+    // GROUP BY present — bail; window-over-aggregate interactions are non-trivial
+    if !select.groupClause.is_null() {
+        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        if !group_list.is_empty() {
+            return Ok(query.to_string());
+        }
+    }
+
+    if select.targetList.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+
+    // ── Detect targets with nested window function expressions ───────────
+    // "Nested" means: the ResTarget val is NOT a bare FuncCall-with-OVER,
+    // but node_contains_window_func says there IS a window func somewhere inside it.
+    let mut has_nested = false;
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+        // Skip bare window functions (direct FuncCall-with-OVER, not nested)
+        if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_FuncCall) } {
+            let fc = unsafe { &*(rt.val as *const pg_sys::FuncCall) };
+            if !fc.over.is_null() {
+                continue;
+            }
+        }
+        if unsafe { node_contains_window_func(rt.val) } {
+            has_nested = true;
+            break;
+        }
+    }
+
+    if !has_nested {
+        return Ok(query.to_string());
+    }
+
+    // ── Collect all distinct window function SQL strings ─────────────────
+    // Walk every target to harvest FuncCall-with-OVER nodes; deduplicate by SQL text.
+    let mut wf_entries: Vec<(String, String)> = Vec::new(); // (wf_sql, synthetic_alias)
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+        let mut wf_nodes: Vec<*mut pg_sys::Node> = Vec::new();
+        unsafe { collect_all_window_func_nodes(rt.val, &mut wf_nodes) };
+        for wf_node in wf_nodes {
+            let wf_sql = match unsafe { node_to_expr(wf_node) } {
+                Ok(e) => e.to_sql(),
+                Err(_) => continue,
+            };
+            if wf_entries.iter().any(|(s, _)| *s == wf_sql) {
+                continue; // Already seen this window function
+            }
+            let alias = format!("__pgt_wf_{}", wf_entries.len() + 1);
+            wf_entries.push((wf_sql, alias));
+        }
+    }
+
+    if wf_entries.is_empty() {
+        return Ok(query.to_string());
+    }
+
+    // ── Construct the inner SELECT ────────────────────────────────────────
+    // SELECT *, wf1_sql AS "__pgt_wf_1", wf2_sql AS "__pgt_wf_2", ... FROM ...
+    let from_sql = extract_from_clause_sql(select)?;
+
+    let where_sql = if select.whereClause.is_null() {
+        String::new()
+    } else {
+        let expr = unsafe { node_to_expr(select.whereClause) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "TRUE".to_string());
+        format!(" WHERE {expr}")
+    };
+
+    // Carry the WINDOW clause into the inner SELECT so named window
+    // references (OVER w) are still resolvable there.
+    let window_clause_sql = unsafe { deparse_select_window_clause(select)? };
+    let window_sql = if window_clause_sql.is_empty() {
+        String::new()
+    } else {
+        format!(" WINDOW {window_clause_sql}")
+    };
+
+    let inner_wf_parts: Vec<String> = wf_entries
+        .iter()
+        .map(|(wf_sql, alias)| format!("{wf_sql} AS \"{}\"", alias.replace('"', "\"\"")))
+        .collect();
+
+    let inner_select = format!(
+        "SELECT *, {} FROM {from_sql}{where_sql}{window_sql}",
+        inner_wf_parts.join(", ")
+    );
+
+    // ── Construct the outer SELECT ────────────────────────────────────────
+    // For non-nested targets: deparse with table qualifiers stripped.
+    // For nested targets: deparse, strip qualifiers, then replace each
+    // embedded wf_sql substring with its synthetic alias reference.
+    let mut outer_parts: Vec<String> = Vec::new();
+
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+
+        // Does this target contain a nested window function?
+        let is_direct_wf = unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_FuncCall) } && {
+            let fc = unsafe { &*(rt.val as *const pg_sys::FuncCall) };
+            !fc.over.is_null()
+        };
+        let has_wf_inside = !is_direct_wf && unsafe { node_contains_window_func(rt.val) };
+
+        let mut expr_sql = match unsafe { node_to_expr(rt.val) } {
+            Ok(e) => e.strip_qualifier().to_sql(),
+            Err(_) => continue,
+        };
+
+        if has_wf_inside {
+            // Replace embedded window function SQL with synthetic alias references.
+            // The alias is qualified with the inner subquery alias to resolve
+            // potential ambiguity when the outer query joins multiple tables.
+            for (wf_sql, alias) in &wf_entries {
+                let replacement = format!("\"__pgt_wf_inner\".\"{}\"", alias.replace('"', "\"\""));
+                expr_sql = expr_sql.replace(wf_sql.as_str(), &replacement);
+            }
+        }
+
+        let alias_part = if !rt.name.is_null() {
+            let a = unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                .to_str()
+                .unwrap_or("col");
+            format!(" AS \"{}\"", a.replace('"', "\"\""))
+        } else {
+            String::new()
+        };
+
+        outer_parts.push(format!("{expr_sql}{alias_part}"));
+    }
+
+    // ── Preserve ORDER BY from the outer query ───────────────────────────
+    let order_sql = deparse_order_clause(select);
+
+    let rewritten = format!(
+        "SELECT {} FROM ({inner_select}) \"__pgt_wf_inner\"{order_sql}",
+        outer_parts.join(", ")
+    );
+
+    pgrx::debug1!("[pg_trickle] rewrite_nested_window_exprs: {}", rewritten);
+
+    Ok(rewritten)
 }
 
 /// Extract FROM clause as SQL text from a SelectStmt.
@@ -6636,8 +6931,34 @@ unsafe fn node_tree_contains_sublink(node: *mut pg_sys::Node) -> bool {
     false
 }
 
-/// Check if an AND expression contains at least one OR conjunct that itself
-/// contains SubLink nodes. This is stricter than `node_tree_contains_sublink`
+/// Recursively flatten a boolean AND tree into a flat list of conjunct nodes.
+///
+/// `AND(a, AND(b, c))` → \[a, b, c\]; non-AND nodes are pushed directly.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse-tree Node.
+unsafe fn flatten_and_conjuncts(node: *mut pg_sys::Node, result: &mut Vec<*mut pg_sys::Node>) {
+    if node.is_null() {
+        return;
+    }
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        let be = unsafe { &*(node as *const pg_sys::BoolExpr) };
+        if be.boolop == pg_sys::BoolExprType::AND_EXPR && !be.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            for arg_ptr in args.iter_ptr() {
+                unsafe { flatten_and_conjuncts(arg_ptr, result) };
+            }
+            return;
+        }
+    }
+    result.push(node);
+}
+
+/// Check if an AND expression (at any depth) contains at least one OR
+/// conjunct that itself contains SubLink nodes.
+///
+/// Recurses into nested AND layers so that `AND(p, AND(q, OR(EXISTS(...))))`
+/// is detected correctly. This is stricter than `node_tree_contains_sublink`
 /// which returns true for AND + EXISTS (no OR), causing unnecessary deparsing.
 ///
 /// # Safety
@@ -6653,19 +6974,15 @@ unsafe fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
     if boolexpr.boolop != pg_sys::BoolExprType::AND_EXPR {
         return false;
     }
-    if boolexpr.args.is_null() {
-        return false;
-    }
-    let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
-    for arg_ptr in args.iter_ptr() {
-        if arg_ptr.is_null() {
-            continue;
-        }
-        // We're looking for an OR conjunct that contains SubLink nodes
-        if unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_BoolExpr) } {
-            let inner = unsafe { &*(arg_ptr as *const pg_sys::BoolExpr) };
+    // Flatten the whole AND tree then check whether any conjunct is
+    // an OR containing SubLink nodes.
+    let mut conjuncts: Vec<*mut pg_sys::Node> = Vec::new();
+    unsafe { flatten_and_conjuncts(node, &mut conjuncts) };
+    for conj in conjuncts {
+        if !conj.is_null() && unsafe { pgrx::is_a(conj, pg_sys::NodeTag::T_BoolExpr) } {
+            let inner = unsafe { &*(conj as *const pg_sys::BoolExpr) };
             if inner.boolop == pg_sys::BoolExprType::OR_EXPR
-                && unsafe { node_tree_contains_sublink(arg_ptr) }
+                && unsafe { node_tree_contains_sublink(conj) }
             {
                 return true;
             }
@@ -7286,13 +7603,19 @@ unsafe fn parse_all_sublink(
         unsafe { extract_func_name(sublink.operName) }.unwrap_or_else(|_| "=".to_string())
     };
 
-    // Build negated condition: NOT (test_expr op inner_col)
-    // The negation is expressed as raw SQL to avoid complex operator inversion.
+    // Build NULL-safe anti-join condition:
+    // (inner_col IS NULL OR NOT (test_expr op inner_col))
+    //
+    // Using just `NOT (test_expr op inner_col)` is not NULL-safe: when
+    // inner_col is NULL, `NOT (x op NULL)` evaluates to NULL (not TRUE),
+    // so the EXISTS does not fire for that row, and the outer row is
+    // incorrectly included. SQL semantics for ALL require that a NULL
+    // in the subquery makes the whole ALL expression indeterminate (hence
+    // the outer row should be excluded).
+    let inner_col_sql = inner_col_expr.to_sql();
     let negated_cond = Expr::Raw(format!(
-        "NOT ({} {} {})",
-        test_expr.to_sql(),
-        op_name,
-        inner_col_expr.to_sql()
+        "(({inner_col_sql}) IS NULL OR NOT ({} {op_name} {inner_col_sql}))",
+        test_expr.to_sql()
     ));
 
     // Combine with inner WHERE clause if present
@@ -8101,7 +8424,11 @@ unsafe fn parse_from_item(
                 }
                 other => {
                     return Err(PgTrickleError::UnsupportedOperator(format!(
-                        "Only INNER JOIN LATERAL and LEFT JOIN LATERAL are supported, got {:?}",
+                        "LATERAL subqueries support only INNER JOIN and LEFT JOIN. \
+                         RIGHT JOIN LATERAL and FULL JOIN LATERAL are rejected by \
+                         PostgreSQL itself because the lateral reference on the right \
+                         side creates a dependency that conflicts with RIGHT/FULL JOIN \
+                         semantics (got join type {:?}).",
                         other,
                     )));
                 }
@@ -8129,7 +8456,11 @@ unsafe fn parse_from_item(
                 }
                 other => {
                     return Err(PgTrickleError::UnsupportedOperator(format!(
-                        "Only INNER JOIN and LEFT JOIN with LATERAL functions are supported, got {:?}",
+                        "LATERAL set-returning functions support only INNER JOIN and LEFT JOIN. \
+                         RIGHT JOIN LATERAL and FULL JOIN LATERAL are rejected by \
+                         PostgreSQL itself because the lateral reference on the right \
+                         side creates a dependency that conflicts with RIGHT/FULL JOIN \
+                         semantics (got join type {:?}).",
                         other,
                     )));
                 }
@@ -10522,6 +10853,160 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     false
 }
 
+/// Recursively collect all FuncCall-with-OVER nodes inside an expression tree.
+///
+/// When a FuncCall-with-OVER is found it is pushed to `result` and recursion
+/// stops (window functions nested inside window spec arguments are invalid SQL).
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse-tree Node.
+unsafe fn collect_all_window_func_nodes(
+    node: *mut pg_sys::Node,
+    result: &mut Vec<*mut pg_sys::Node>,
+) {
+    if node.is_null() {
+        return;
+    }
+
+    // FuncCall with OVER → window function: collect and stop descent
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
+        let func = unsafe { &*(node as *const pg_sys::FuncCall) };
+        if !func.over.is_null() {
+            result.push(node);
+            return;
+        }
+        // Regular function call — recurse into args
+        if !func.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(func.args) };
+            for arg in args.iter_ptr() {
+                unsafe { collect_all_window_func_nodes(arg, result) };
+            }
+        }
+        return;
+    }
+
+    // A_Expr: binary/unary/subscript operators
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
+        let expr = unsafe { &*(node as *const pg_sys::A_Expr) };
+        if !expr.lexpr.is_null() {
+            unsafe { collect_all_window_func_nodes(expr.lexpr, result) };
+        }
+        if !expr.rexpr.is_null() {
+            unsafe { collect_all_window_func_nodes(expr.rexpr, result) };
+        }
+        return;
+    }
+
+    // TypeCast: (expr)::type
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
+        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
+        if !tc.arg.is_null() {
+            unsafe { collect_all_window_func_nodes(tc.arg, result) };
+        }
+        return;
+    }
+
+    // CaseExpr: CASE [arg] WHEN ... THEN ... ELSE ... END
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseExpr) } {
+        let case = unsafe { &*(node as *const pg_sys::CaseExpr) };
+        if !case.arg.is_null() {
+            unsafe { collect_all_window_func_nodes(case.arg as *mut pg_sys::Node, result) };
+        }
+        if !case.args.is_null() {
+            let when_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(case.args) };
+            for w in when_list.iter_ptr() {
+                if !w.is_null() && unsafe { pgrx::is_a(w, pg_sys::NodeTag::T_CaseWhen) } {
+                    let cw = unsafe { &*(w as *const pg_sys::CaseWhen) };
+                    if !cw.expr.is_null() {
+                        unsafe {
+                            collect_all_window_func_nodes(cw.expr as *mut pg_sys::Node, result)
+                        };
+                    }
+                    if !cw.result.is_null() {
+                        unsafe {
+                            collect_all_window_func_nodes(cw.result as *mut pg_sys::Node, result)
+                        };
+                    }
+                }
+            }
+        }
+        if !case.defresult.is_null() {
+            unsafe { collect_all_window_func_nodes(case.defresult as *mut pg_sys::Node, result) };
+        }
+        return;
+    }
+
+    // CoalesceExpr: COALESCE(a, b, ...)
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CoalesceExpr) } {
+        let coalesce = unsafe { &*(node as *const pg_sys::CoalesceExpr) };
+        if !coalesce.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(coalesce.args) };
+            for arg in args.iter_ptr() {
+                unsafe { collect_all_window_func_nodes(arg, result) };
+            }
+        }
+        return;
+    }
+
+    // NullIfExpr: NULLIF(a, b) — `args` list
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullIfExpr) } {
+        let nif = unsafe { &*(node as *const pg_sys::NullIfExpr) };
+        if !nif.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(nif.args) };
+            for arg in args.iter_ptr() {
+                unsafe { collect_all_window_func_nodes(arg, result) };
+            }
+        }
+        return;
+    }
+
+    // MinMaxExpr: GREATEST / LEAST
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_MinMaxExpr) } {
+        let mm = unsafe { &*(node as *const pg_sys::MinMaxExpr) };
+        if !mm.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(mm.args) };
+            for arg in args.iter_ptr() {
+                unsafe { collect_all_window_func_nodes(arg, result) };
+            }
+        }
+        return;
+    }
+
+    // BoolExpr: AND / OR / NOT
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        let be = unsafe { &*(node as *const pg_sys::BoolExpr) };
+        if !be.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            for arg in args.iter_ptr() {
+                unsafe { collect_all_window_func_nodes(arg, result) };
+            }
+        }
+        return;
+    }
+
+    // NullTest: IS NULL / IS NOT NULL
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullTest) } {
+        let nt = unsafe { &*(node as *const pg_sys::NullTest) };
+        if !nt.arg.is_null() {
+            unsafe { collect_all_window_func_nodes(nt.arg as *mut pg_sys::Node, result) };
+        }
+        return;
+    }
+
+    // RowExpr: ROW(a, b, c)
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RowExpr) } {
+        let row = unsafe { &*(node as *const pg_sys::RowExpr) };
+        if !row.args.is_null() {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(row.args) };
+            for arg in args.iter_ptr() {
+                unsafe { collect_all_window_func_nodes(arg, result) };
+            }
+        }
+    }
+
+    // Leaf nodes (ColumnRef, A_Const, SQLValueFunction, etc.) — no children
+}
+
 /// Extraction result for window function parsing.
 type WindowExtraction = (Vec<WindowExpr>, Vec<(Expr, String)>);
 
@@ -11070,6 +11555,11 @@ unsafe fn extract_aggregates(
                 "regr_sxx" => Some(AggFunc::RegrSxx),
                 "regr_sxy" => Some(AggFunc::RegrSxy),
                 "regr_syy" => Some(AggFunc::RegrSyy),
+                "xmlagg" => Some(AggFunc::XmlAgg),
+                "rank" => Some(AggFunc::HypRank),
+                "dense_rank" => Some(AggFunc::HypDenseRank),
+                "percent_rank" => Some(AggFunc::HypPercentRank),
+                "cume_dist" => Some(AggFunc::HypCumeDist),
                 _ => None,
             } {
                 let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
@@ -11143,7 +11633,8 @@ unsafe fn extract_aggregates(
                      VARIANCE, VAR_POP, VAR_SAMP, ANY_VALUE, MODE, PERCENTILE_CONT, \
                      PERCENTILE_DISC, CORR, COVAR_POP, COVAR_SAMP, REGR_AVGX, REGR_AVGY, \
                      REGR_COUNT, REGR_INTERCEPT, REGR_R2, REGR_SLOPE, REGR_SXX, REGR_SXY, \
-                     REGR_SYY. Use FULL refresh mode instead.",
+                     REGR_SYY, XMLAGG, RANK/DENSE_RANK/PERCENT_RANK/CUME_DIST WITHIN GROUP. \
+                     Use FULL refresh mode instead.",
                 )));
             } else if is_user_defined_aggregate(&name_lower) {
                 // User-defined aggregate (CREATE AGGREGATE) — not supported

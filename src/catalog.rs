@@ -51,6 +51,10 @@ pub struct StreamTableMeta {
     /// When true, the storage table uses a non-unique index on __pgt_row_id
     /// and the apply logic uses counted DELETE instead of MERGE.
     pub has_keyless_source: bool,
+    /// Serialized JSON map of function-name → SHA-256 hash for EC-16 polling.
+    /// None means no hashes have been recorded yet (baseline will be taken on
+    /// the next differential refresh).
+    pub function_hashes: Option<String>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -199,7 +203,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source \
+                     has_keyless_source, function_hashes \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -225,7 +229,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source \
+                     has_keyless_source, function_hashes \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -256,7 +260,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source \
+                     has_keyless_source, function_hashes \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -282,7 +286,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source \
+                     has_keyless_source, function_hashes \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -500,6 +504,23 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// Persist the function source hashes for a stream table (EC-16).
+    ///
+    /// `hashes_json` is a JSON text string mapping `{ "func_name": "md5hex", ... }`.
+    /// Pass `None` to clear (reset) stored hashes (e.g., after a full rebase).
+    pub fn update_function_hashes(
+        pgt_id: i64,
+        hashes_json: Option<&str>,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET function_hashes = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[hashes_json.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the per-ST adaptive fallback threshold and last FULL refresh time.
     ///
     /// Called after each differential or adaptive-fallback refresh to track
@@ -654,6 +675,7 @@ impl StreamTableMeta {
             DiamondSchedulePolicy::from_sql_str(&diamond_schedule_policy_str).unwrap_or_default();
 
         let has_keyless_source = table.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
+        let function_hashes = table.get::<String>(24).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -679,6 +701,7 @@ impl StreamTableMeta {
             diamond_consistency,
             diamond_schedule_policy,
             has_keyless_source,
+            function_hashes,
         })
     }
 
@@ -759,6 +782,7 @@ impl StreamTableMeta {
             DiamondSchedulePolicy::from_sql_str(&diamond_schedule_policy_str).unwrap_or_default();
 
         let has_keyless_source = row.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
+        let function_hashes = row.get::<String>(24).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -784,6 +808,7 @@ impl StreamTableMeta {
             diamond_consistency,
             diamond_schedule_policy,
             has_keyless_source,
+            function_hashes,
         })
     }
 }
@@ -1064,6 +1089,40 @@ pub fn get_schema_fingerprint(
         &[pgt_id.into(), source_oid.into()],
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+}
+
+/// Rebuild and persist the column snapshot + schema fingerprint for a given
+/// (pgt_id, source_oid) dependency pair.
+///
+/// Called after Task 3.5 ADD COLUMN online extension so that the next DDL
+/// event detects the correct baseline and does not spuriously trigger a reinit.
+#[cfg(not(test))]
+pub fn store_column_snapshot_for_pgt_id(
+    pgt_id: i64,
+    source_oid: pg_sys::Oid,
+) -> Result<(), PgTrickleError> {
+    let (snapshot, fingerprint) = build_column_snapshot(source_oid)?;
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_dependencies \
+         SET column_snapshot = $1, schema_fingerprint = $2 \
+         WHERE pgt_id = $3 AND source_relid = $4",
+        &[
+            snapshot.into(),
+            fingerprint.as_str().into(),
+            pgt_id.into(),
+            source_oid.into(),
+        ],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("Failed to store column snapshot: {e}")))
+}
+
+/// Test-only stub.
+#[cfg(test)]
+pub fn store_column_snapshot_for_pgt_id(
+    _pgt_id: i64,
+    _source_oid: pg_sys::Oid,
+) -> Result<(), PgTrickleError> {
+    Ok(())
 }
 
 // ── Refresh history CRUD ───────────────────────────────────────────────────

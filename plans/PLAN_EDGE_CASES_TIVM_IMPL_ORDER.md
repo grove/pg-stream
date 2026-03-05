@@ -5,9 +5,11 @@
 - [sql/PLAN_TRANSACTIONAL_IVM_PART_2.md](sql/PLAN_TRANSACTIONAL_IVM_PART_2.md) (Part 2)
 
 **Date:** 2026-03-04  
-**Last updated:** 2026-03-04  
-**Status:** Stages 1–2 COMPLETE (incl. bug fixes + test coverage).
-Next up: Stage 3 (SQL Coverage Expansion).  
+**Last updated:** 2026-03-06  
+**Status:** Stages 1–3 COMPLETE (incl. bug fixes + test coverage).
+Task 2.3 (ROWS FROM) deferred.
+Stage 4 partially complete: EC-16 ✅ Done, Task 3.1 ✅ Done, Task 3.2 ✅ Done, Task 3.5 ✅ Done; Tasks 3.3–3.4 deferred.
+Stage 5 COMPLETE: Tasks 4.1, 4.2, 4.3 all done.
 **Principle:** No SQL-surface expansion while P0 correctness bugs are open.
 
 ---
@@ -74,22 +76,29 @@ the DVM operator set — no CDC or scheduler changes.
 
 ### Phase 1 — Auto-Rewrite Completions (Part 2)
 
-| # | Item | Effort |
-|---|------|--------|
-| 11 | **Part 2 Task 1.1** — Mixed UNION / UNION ALL: `rewrite_mixed_union()` pass | 2–3 days |
-| 12 | **Part 2 Task 1.2** — Multiple PARTITION BY: `rewrite_multi_partition()` pass | 2–3 days |
-| 13 | **Part 2 Task 1.3 / EC-03** — Nested window expressions: `rewrite_nested_window_exprs()` subquery lift | 3–5 days |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 11 | **Part 2 Task 1.1** — Mixed UNION / UNION ALL | 2–3 days | ✅ **Already works natively** — `collect_union_children` + `Distinct`/`UnionAll` OpTree handle mixed arms; no SQL rewrite needed |
+| 12 | **Part 2 Task 1.2** — Multiple PARTITION BY | 2–3 days | ✅ **Handled natively** — window group recomputation approach; `rewrite_multi_partition_windows()` exists but is unused; api.rs comment confirms no rewrite call needed |
+| 13 | **Part 2 Task 1.3 / EC-03** — Nested window expressions | 3–5 days | ✅ **DONE** — `rewrite_nested_window_exprs()` subquery-lift in `src/dvm/parser.rs`; exported from `mod.rs`; wired in `api.rs` before DISTINCT ON rewrite |
 
 ### Phase 2 — New DVM Operators (Part 2)
 
-| # | Item | Effort |
-|---|------|--------|
-| 14 | **Part 2 Task 2.1 / EC-32** — `ALL (subquery)` → `NOT EXISTS (… EXCEPT …)` rewrite | 2–3 days |
-| 15 | **Part 2 Task 2.2** — Deeply nested SubLinks in OR: extend `rewrite_sublinks_in_bool_tree()` | 2–3 days |
-| 16 | **Part 2 Task 2.3** — `ROWS FROM()` with multiple functions: rewrite to `unnest` / LATERAL zip | 1–2 days |
-| 17 | **Part 2 Task 2.4** — LATERAL with RIGHT/FULL JOIN: update error message only (PostgreSQL-level constraint) | 0.5 day |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 14 | **Part 2 Task 2.1 / EC-32** — `ALL (subquery)` NULL-safe AntiJoin | 2–3 days | ✅ **DONE** — `parse_all_sublink()` in `src/dvm/parser.rs` updated to NULL-safe condition `(col IS NULL OR NOT (x op col))`; full AntiJoin pipeline was already wired |
+| 15 | **Part 2 Task 2.2** — Deeply nested SubLinks in OR | 2–3 days | ✅ **DONE** — `flatten_and_conjuncts()` helper added; `and_contains_or_with_sublink()` now recurses through nested AND layers; `rewrite_and_with_or_sublinks()` uses flattened conjunct list — handles `AND(AND(OR(EXISTS(...))))` |
+| 16 | **Part 2 Task 2.3** — `ROWS FROM()` with multiple functions | 1–2 days | ❌ Not started (deferred, very low demand) |
+| 17 | **Part 2 Task 2.4** — LATERAL with RIGHT/FULL JOIN: error message clarification | 0.5 day | ✅ **DONE** — error messages updated to explain PostgreSQL-level constraint |
 
 **Completion gate:** `just test-all` green + new E2E tests from each task passing.
+
+### Stage 3 Phase 2 — Prioritized Remaining Work
+
+1. **Task 2.3 — ROWS FROM()** *(LOW PRIORITY, deferred)*
+   - Very niche. Defer to Stage 4 or later.
+   - Would need `rewrite_rows_from()` pass: detect `ROWS FROM(f1(), f2())` nodes and
+     rewrite to multi-arg `unnest()` (common case) or explicit LATERAL zip.
 
 ---
 
@@ -100,19 +109,19 @@ touches `src/refresh.rs`; Part 2 Phase 3 touches `src/cdc.rs`).
 
 ### EC-16 (PLAN_EDGE_CASES P1 remainder)
 
-| # | Item | Effort |
-|---|------|--------|
-| 18 | **EC-16** — `pg_proc` hash polling for undetected ALTER FUNCTION changes | 2 days |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 18 | **EC-16** — `pg_proc` hash polling for undetected ALTER FUNCTION changes | 2 days | ✅ Done — `function_hashes` TEXT column on `pgt_stream_tables` (migration 0.2.1→0.2.2); `check_proc_hashes_changed()` in `refresh.rs` computes `md5(prosrc)` map from `pg_proc` and drives `mark_for_reinitialize` on mismatch |
 
 ### Part 2 Phase 3 — Trigger-Level Optimisations
 
-| # | Item | Effort |
-|---|------|--------|
-| 19 | **Part 2 Task 3.1** — Column-level change detection for UPDATE: `changed_cols` bitmask in buffer | 3–4 days |
-| 20 | **Part 2 Task 3.2** — Incremental TRUNCATE: negation delta for simple single-source stream tables | 2–3 days |
-| 21 | **Part 2 Task 3.3** — Buffer table partitioning by LSN range: `pg_trickle.buffer_partitioning` GUC | 3–4 days |
-| 22 | **Part 2 Task 3.4** — Skip-unchanged-column scanning in delta SQL | 1–2 days |
-| 23 | **Part 2 Task 3.5** — Online ADD COLUMN without full reinit | 2–3 days |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 19 | **Part 2 Task 3.1** — Column-level change detection for UPDATE: `changed_cols` bitmask in buffer | 3–4 days | ✅ Done — `changed_cols BIGINT` added to all new change buffer tables; `build_changed_cols_bitmask_expr()` generates per-column `IS DISTINCT FROM` bitmask; `create_change_trigger()` + `rebuild_cdc_trigger_function()` updated; `sync_change_buffer_columns()` preserves column; `alter_change_buffer_add_columns()` migrates existing buffers; all column values still written (scan unchanged) |
+| 20 | **Part 2 Task 3.2** — Incremental TRUNCATE: negation delta for simple single-source stream tables | 2–3 days | ✅ Done — `execute_incremental_truncate_delete()` fast-path: single-source ST with no post-TRUNCATE rows in window → `DELETE FROM stream_table` directly, skipping full defining-query re-execution; falls back to `execute_full_refresh()` for multi-source or post-TRUNCATE-insert cases |
+| 21 | **Part 2 Task 3.3** — Buffer table partitioning by LSN range: `pg_trickle.buffer_partitioning` GUC | 3–4 days | ❌ Deferred — per-cycle DDL overhead + partition management complexity; defer to Stage 6 or later |
+| 22 | **Part 2 Task 3.4** — Skip-unchanged-column scanning in delta SQL | 1–2 days | ❌ Deferred — requires column-usage demand-propagation pass in parser to prune Scan.columns to referenced-only; `resolve_columns()` currently returns ALL columns; defer until pruning pass is implemented |
+| 23 | **Part 2 Task 3.5** — Online ADD COLUMN without full reinit | 2–3 days | ✅ Done — `SchemaChangeKind::AddColumnOnly`; `alter_change_buffer_add_columns()` in `cdc.rs` extends buffer + rebuilds trigger + refreshes snapshot in-place |
 
 **Note on ordering within Phase 3:** Task 3.1 must land before 3.4 (3.4
 depends on the `changed_cols` bitmask). Tasks 3.2, 3.3, and 3.5 are
@@ -127,11 +136,11 @@ independent of each other.
 
 Pure additions. Independent of everything above.
 
-| # | Item | Effort |
-|---|------|--------|
-| 24 | **Part 2 Task 4.1** — Regression aggregates: `CORR`, `COVAR_*`, `REGR_*` via group-rescan | 2–3 days |
-| 25 | **Part 2 Task 4.2** — Hypothetical-set aggregates: `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()` WITHIN GROUP | 1–2 days |
-| 26 | **Part 2 Task 4.3** — `XMLAGG` via group-rescan | 0.5 day |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 24 | **Part 2 Task 4.1** — Regression aggregates: `CORR`, `COVAR_*`, `REGR_*` via group-rescan | 2–3 days | ✅ Done — already fully wired in prior session (`AggFunc::Corr/CovarPop/RegrAvgx` etc. + match arms + `is_group_rescan`) |
+| 25 | **Part 2 Task 4.2** — Hypothetical-set aggregates: `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()` WITHIN GROUP | 1–2 days | ✅ Done — `HypRank/HypDenseRank/HypPercentRank/HypCumeDist` variants; `is_ordered_set` updated; match arm wired |
+| 26 | **Part 2 Task 4.3** — `XMLAGG` via group-rescan | 0.5 day | ✅ Done — `AggFunc::XmlAgg`; `sql_name()` → `"XMLAGG"`; `is_group_rescan()` true; match arm wired |
 
 **Completion gate:** `just test-all` green + 36+ aggregate functions confirmed in unit tests.
 

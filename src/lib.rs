@@ -121,6 +121,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     diamond_schedule_policy TEXT NOT NULL DEFAULT 'fastest'
                      CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
     has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE,
+    function_hashes TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

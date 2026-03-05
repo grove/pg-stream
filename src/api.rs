@@ -127,6 +127,13 @@ fn create_stream_table_impl(
     let original_query = query.to_string();
     let query = &crate::dvm::rewrite_views_inline(query)?;
 
+    // ── Nested window expression lift auto-rewrite ─────────────────
+    // Window functions nested inside expressions (CASE, COALESCE, arithmetic,
+    // etc.) are lifted into an inner subquery, replacing them with synthetic
+    // column aliases that the DVM engine can handle directly.  Must run before
+    // DISTINCT ON rewrite because DISTINCT ON may itself contain window funcs.
+    let query = &crate::dvm::rewrite_nested_window_exprs(query)?;
+
     // ── DISTINCT ON auto-rewrite ───────────────────────────────────
     // DISTINCT ON (e1, e2) is rewritten to a ROW_NUMBER() window function
     // subquery before further parsing. The original query string is replaced

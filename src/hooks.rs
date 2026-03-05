@@ -686,6 +686,48 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
                     pgt_id,
                 );
             }
+            SchemaChangeKind::AddColumnOnly => {
+                // S8: When block_source_ddl GUC is enabled, ERROR instead of
+                // extending in-place — ADD COLUMN is still a column-affecting DDL.
+                if config::pg_trickle_block_source_ddl() {
+                    pgrx::error!(
+                        "pg_trickle: ALTER TABLE on {} blocked — column-affecting DDL is not \
+                         allowed on source tables tracked by stream tables when \
+                         pg_trickle.block_source_ddl = true. Set pg_trickle.block_source_ddl = \
+                         false to allow schema changes.",
+                        identity,
+                    );
+                }
+                // Task 3.5: Only new columns were added — extend the change buffer
+                // and rebuild the CDC trigger in-place without a full reinit.
+                pgrx::notice!(
+                    "pg_trickle_ddl_tracker: ALTER TABLE ADD COLUMN on {} for ST {} \
+                     — extending change buffer, no reinit needed",
+                    identity,
+                    pgt_id,
+                );
+                let cs = config::pg_trickle_change_buffer_schema();
+                match crate::cdc::alter_change_buffer_add_columns(objid, &cs, *pgt_id) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Buffer update failed — fall back to conservative reinit.
+                        pgrx::warning!(
+                            "pg_trickle_ddl_tracker: failed to extend change buffer for ST {}: {} \
+                             — falling back to reinit",
+                            pgt_id,
+                            e,
+                        );
+                        if let Err(e2) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+                            pgrx::warning!(
+                                "pg_trickle_ddl_tracker: failed to mark ST {} for reinit: {}",
+                                pgt_id,
+                                e2,
+                            );
+                        }
+                        reinit_pgt_ids.push(*pgt_id);
+                    }
+                }
+            }
             SchemaChangeKind::ConstraintChange => {
                 // Constraint-only change (e.g., adding/dropping a PK or unique
                 // constraint). Currently treat same as benign — the row_id
@@ -1300,6 +1342,9 @@ fn is_st_storage_table(relid: pg_sys::Oid) -> bool {
 pub enum SchemaChangeKind {
     /// Column added, dropped, or type changed — requires reinitialize.
     ColumnChange,
+    /// Only new columns were added; existing columns are unchanged.
+    /// The change buffer and CDC trigger can be updated in-place — no reinit needed.
+    AddColumnOnly,
     /// Constraint or index change — may not require reinitialize.
     ConstraintChange,
     /// Other DDL (comment, owner change, etc.) — no reinitialize needed.
@@ -1423,10 +1468,13 @@ fn detect_from_snapshot(
         .filter_map(|e| e["name"].as_str())
         .collect();
 
-    for name in current_cols.keys() {
-        if !stored_names.contains(name.as_str()) {
-            return Ok(SchemaChangeKind::ColumnChange); // new column added
-        }
+    let has_new = current_cols
+        .keys()
+        .any(|n| !stored_names.contains(n.as_str()));
+    if has_new {
+        // Only additive change: existing columns intact, new columns appear.
+        // The change buffer can be extended in-place; no full reinit needed.
+        return Ok(SchemaChangeKind::AddColumnOnly);
     }
 
     // Column set is identical — this is a constraint-only change.
@@ -1463,6 +1511,15 @@ mod tests {
         );
         assert_ne!(SchemaChangeKind::ColumnChange, SchemaChangeKind::Benign);
         assert_ne!(SchemaChangeKind::ConstraintChange, SchemaChangeKind::Benign,);
+        assert_ne!(
+            SchemaChangeKind::AddColumnOnly,
+            SchemaChangeKind::ColumnChange
+        );
+        assert_ne!(SchemaChangeKind::AddColumnOnly, SchemaChangeKind::Benign);
+        assert_eq!(
+            SchemaChangeKind::AddColumnOnly,
+            SchemaChangeKind::AddColumnOnly
+        );
     }
 
     #[test]

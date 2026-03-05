@@ -127,12 +127,13 @@ default 64) so power users can raise it when they accept the memory cost.
 | **Impact** | Creation error |
 | **Current mitigation** | Keep window functions as top-level SELECT columns |
 | **Documented in** | FAQ § "Window Functions" |
+| **Status** | ✅ **IMPLEMENTED** — `rewrite_nested_window_exprs()` subquery-lift in `src/dvm/parser.rs`; helper `collect_all_window_func_nodes()` for recursive window func harvesting; `deparse_select_window_clause()` for WINDOW clause passthrough; exported from `src/dvm/mod.rs`; wired in `src/api.rs` before DISTINCT ON rewrite |
 
-**Chosen fix: nested-subquery lift (see PLAN_TRANSACTIONAL_IVM_PART_2.md Task 1.3):**
+**Implementation: nested-subquery lift (see PLAN_TRANSACTIONAL_IVM_PART_2.md Task 1.3):**
 
-Add a new auto-rewrite pass (`rewrite_nested_window_exprs`) that lifts
-window functions out of expressions into a synthetic column in an inner
-subquery, then applies the outer expression against that column:
+Window functions nested inside expressions are lifted into a synthetic column
+in an inner subquery, then the outer SELECT applies the original expression
+with the window function replaced by the synthetic column alias:
 
 ```sql
 -- Before (rejected):
@@ -140,12 +141,11 @@ SELECT id, ABS(ROW_NUMBER() OVER (ORDER BY score) - 5) AS adjusted_rank
 FROM players
 
 -- After rewrite (supported):
-SELECT id, ABS(__pgt_wf_1 - 5) AS adjusted_rank
+SELECT id, ABS("__pgt_wf_inner"."__pgt_wf_1" - 5) AS "adjusted_rank"
 FROM (
-    SELECT id, score,
-           ROW_NUMBER() OVER (ORDER BY score) AS __pgt_wf_1
+    SELECT *, ROW_NUMBER() OVER (ORDER BY score) AS "__pgt_wf_1"
     FROM players
-) __pgt_wf_inner
+) "__pgt_wf_inner"
 ```
 
 The subquery approach is preferred over the earlier CTE approach because a
@@ -461,15 +461,14 @@ insensitivity, no-FROM clause.
 | **Impact** | Stream table silently uses new function logic without a full rebase |
 | **Current mitigation** | Manual full refresh after function changes |
 | **Documented in** | FAQ § "Schema Changes" |
+| **Status** | ✅ **IMPLEMENTED** — `function_hashes TEXT` column on `pgt_stream_tables` (migration 0.2.1→0.2.2); `check_proc_hashes_changed()` in `refresh.rs` queries `md5(prosrc \|\| coalesce(probin::text,''))` from `pg_proc` on each diff refresh; on mismatch calls `mark_for_reinitialize` + NOTICE; on first call stores baseline silently |
 
-**Proposed fix:**
+**Implemented fix:**
 
-1. **Short term (P1):** Document this prominently in the "Gotchas" section
-   of the Getting Started guide.
-2. **Medium term:** Implement a `pg_proc.proversion` polling check — on
-   each refresh cycle, compare `xmin` or a hash of `pg_proc.prosrc` for
-   all functions referenced in the defining query. If changed, trigger an
-   automatic full refresh and log a NOTICE.
+Polling via `pg_proc` on each differential refresh:
+- On first call (stored hashes = NULL): compute and persist baseline. No reinit.
+- On following calls: recompute hashes. If any differ → `mark_for_reinitialize` + NOTICE. The next scheduler cycle performs a full refresh.
+- Uses `md5(string_agg(prosrc || coalesce(probin::text,''), ',' ORDER BY oid))` to handle polymorphic overloads robustly.
 
 ---
 
@@ -764,14 +763,18 @@ defining queries. **No code fix.** The error message is clear.
 | **Tier** | **P2** |
 | **Impact** | Creation error |
 | **Documented in** | FAQ § "Why Are These SQL Features Not Supported?" |
+| **Status** | ✅ **IMPLEMENTED** — `parse_all_sublink()` in `src/dvm/parser.rs` updated with NULL-safe anti-join condition `(col IS NULL OR NOT (x op col))`; full AntiJoin pipeline was already wired (`parse_sublink_to_wrapper` → `parse_all_sublink` → `AntiJoin SublinkWrapper` → `diff_anti_join`) |
 
-**Chosen fix: rewrite to `NOT EXISTS (… EXCEPT …)` at parse time:**
+**Fix applied:** NULL-safe anti-join condition.
 
 `ALL (subquery)` is mathematically a conjunction of per-row comparisons.
-Implement via rewrite to `NOT EXISTS (SELECT … EXCEPT SELECT val)` pattern
-at parse time in `src/dvm/parser.rs`, similar to how `ANY (subquery)` is
-already handled. This folds the `ALL` semantics into the existing subquery
-differentiation path without a new delta template.
+The full pipeline through `parse_all_sublink()` → `AntiJoin` OpTree →
+`diff_anti_join` was already wired. The outstanding issue was NULL-safety:
+the previous condition `NOT (x op col)` evaluated to NULL (not TRUE) when
+`col IS NULL`, so NULL rows in the subquery were silently ignored, giving
+wrong results. Fixed by changing the condition to
+`(col IS NULL OR NOT (x op col))`, which correctly excludes the outer row
+whenever any subquery row is NULL or fails the comparison.
 
 ---
 

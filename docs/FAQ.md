@@ -373,6 +373,44 @@ ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 1;
 SELECT pg_reload_conf();
 ```
 
+### What happens if all stream tables in the DAG have a CALCULATED schedule?
+
+When every stream table uses a CALCULATED schedule (`schedule => NULL`), there
+are no explicit schedules for the resolution algorithm to derive from. The
+CALCULATED logic works by propagating `MIN(effective_schedule)` from downstream
+dependents upward through the DAG. If **no** node has an explicit duration:
+
+1. **Leaf nodes** (no downstream dependents) have no schedules to take the
+   minimum of, so they fall back to the `pg_trickle.min_schedule_seconds` GUC
+   (default: **60 seconds**).
+2. **Upstream nodes** then resolve to `MIN(fallback) = fallback`.
+3. The result: **every stream table in the DAG gets the fallback schedule**
+   (60 s by default).
+
+This is safe but usually not what you want — the whole DAG refreshes at the
+same generic interval. Best practice is to set an explicit schedule on at least
+the leaf (most-downstream) stream tables so that upstream CALCULATED schedules
+resolve to something meaningful:
+
+```sql
+-- Leaf ST with an explicit schedule
+SELECT pgtrickle.create_stream_table('daily_summary',
+    'SELECT region, SUM(total) FROM pgtrickle.order_totals GROUP BY region',
+    schedule => '10m');
+
+-- Upstream ST inherits that 10 m schedule via CALCULATED
+SELECT pgtrickle.create_stream_table('order_totals',
+    'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
+    schedule => NULL);
+```
+
+You can inspect the resolved effective schedules with:
+
+```sql
+SELECT pgt_name, schedule, effective_schedule
+FROM pgtrickle.pgt_stream_tables;
+```
+
 ### Can a stream table reference another stream table?
 
 **Yes.** Stream tables can depend on other stream tables. The scheduler automatically refreshes them in topological order (upstream first). Circular dependencies are detected and rejected at creation time.

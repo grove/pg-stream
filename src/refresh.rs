@@ -1101,6 +1101,120 @@ pub fn execute_no_data_refresh(st: &StreamTableMeta) -> Result<(), PgTrickleErro
 /// tokens for LSN values. Subsequent refreshes skip parsing, DVM
 /// differentiation, and MERGE SQL construction — they only substitute
 /// LSN values and execute. This eliminates ~45ms overhead per refresh.
+/// EC-16: Check whether any function referenced in `st.functions_used` has
+/// changed its source code since the last differential refresh.
+///
+/// For each function name in `functions_used`, queries `pg_proc` for the
+/// concatenated `md5(prosrc || coalesce(probin::text, ''))` of all matching
+/// overloads (joined by `,` to handle polymorphic overloads stably).  The
+/// resulting `{ "func_name": "md5hex", ... }` JSON map is compared against
+/// `st.function_hashes`.
+///
+/// **On the first call** (`st.function_hashes` is `None`): stores the current
+/// hashes and returns `false` (no change — baseline is being established).
+///
+/// **On subsequent calls**: returns `true` iff any hash differs, in which case
+/// the new hashes are persisted before returning.
+///
+/// Errors during SPI queries are logged and treated as "no change" to avoid
+/// cascading failures from a transient catalog problem.
+fn check_proc_hashes_changed(st: &StreamTableMeta) -> bool {
+    let funcs = match &st.functions_used {
+        Some(f) if !f.is_empty() => f,
+        _ => return false,
+    };
+
+    // Build current hash map: { func_name → md5(prosrc concatenated) }
+    let mut current_map: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for func_name in funcs {
+        let hash_opt = Spi::get_one_with_args::<String>(
+            "SELECT md5(string_agg(prosrc || coalesce(probin::text, ''), ',' ORDER BY oid)) \
+             FROM pg_catalog.pg_proc \
+             WHERE proname = $1",
+            &[func_name.as_str().into()],
+        )
+        .unwrap_or(None);
+
+        if let Some(h) = hash_opt {
+            current_map.insert(func_name.to_lowercase(), h);
+        }
+    }
+
+    // Serialize current map to JSON text.
+    let current_json = match serde_json::to_string(&current_map) {
+        Ok(j) => j,
+        Err(e) => {
+            pgrx::debug1!("[pg_trickle] EC-16: failed to serialize function hashes: {e}");
+            return false;
+        }
+    };
+
+    // Compare against stored hashes.
+    match &st.function_hashes {
+        None => {
+            // First-time baseline: store and report no change.
+            if let Err(e) = crate::catalog::StreamTableMeta::update_function_hashes(
+                st.pgt_id,
+                Some(&current_json),
+            ) {
+                pgrx::debug1!("[pg_trickle] EC-16: failed to store initial function hashes: {e}");
+            }
+            false
+        }
+        Some(stored) => {
+            if *stored == current_json {
+                false
+            } else {
+                // Hash changed — persist new hashes before returning.
+                if let Err(e) = crate::catalog::StreamTableMeta::update_function_hashes(
+                    st.pgt_id,
+                    Some(&current_json),
+                ) {
+                    pgrx::debug1!("[pg_trickle] EC-16: failed to update function hashes: {e}");
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Task 3.2: Fast-path DELETE for a single-source ST whose window contains a
+/// TRUNCATE marker with no subsequent INSERT/UPDATE/DELETE rows in scope.
+///
+/// Instead of running the full defining query, we simply DELETE all rows from
+/// the stream table.  This is O(ST rows) rather than O(source rows) and avoids
+/// re-executing an arbitrarily-expensive query when the result is always empty.
+fn execute_incremental_truncate_delete(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    // Suppress the CDC trigger on the ST itself during the operation.
+    Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    let schema = &st.pgt_schema;
+    let name = &st.pgt_name;
+    let quoted_table = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        name.replace('"', "\"\"")
+    );
+
+    let rows_deleted = Spi::connect_mut(|client| {
+        let result = client
+            .update(&format!("DELETE FROM {quoted_table}"), None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+
+    pgrx::notice!(
+        "[pg_trickle] Incremental TRUNCATE: deleted {} row(s) from {}.{} \
+         (pure TRUNCATE window — skipping full query re-execution)",
+        rows_deleted,
+        schema,
+        name,
+    );
+    Ok((0, rows_deleted))
+}
+
 pub fn execute_differential_refresh(
     st: &StreamTableMeta,
     prev_frontier: &Frontier,
@@ -1108,6 +1222,23 @@ pub fn execute_differential_refresh(
 ) -> Result<(i64, i64), PgTrickleError> {
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
+
+    // ── EC-16: Function-body change detection ────────────────────────
+    // Check whether any user-defined function referenced in this ST's
+    // defining query has had its source code changed via ALTER FUNCTION
+    // or CREATE OR REPLACE FUNCTION.  If so, force a full reinit on the
+    // next scheduler cycle and skip the differential refresh this cycle.
+    if check_proc_hashes_changed(st) {
+        if let Err(e) = crate::catalog::StreamTableMeta::mark_for_reinitialize(st.pgt_id) {
+            pgrx::warning!("[pg_trickle] EC-16: failed to mark ST {schema}.{name} for reinit: {e}");
+        } else {
+            pgrx::notice!(
+                "[pg_trickle] EC-16: function body change detected for stream table \
+                 {schema}.{name} — marked for full reinitialization on next cycle."
+            );
+        }
+        return Ok((0, 0));
+    }
 
     // ── Short-circuit: skip the entire pipeline if no changes exist ──────
     let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
@@ -1242,6 +1373,32 @@ pub fn execute_differential_refresh(
     });
 
     if has_truncate {
+        // Task 3.2: Fast path for single-source STs where the current window
+        // contains a TRUNCATE marker but no subsequent INSERT/UPDATE/DELETE rows.
+        // In that case the post-TRUNCATE result is always empty, so we can DELETE
+        // all ST rows directly instead of re-running the full defining query.
+        let is_single_source = catalog_source_oids.len() == 1;
+        let is_pure_truncate = is_single_source && {
+            let oid = catalog_source_oids[0];
+            let prev_lsn = prev_frontier.get_lsn(oid);
+            let new_lsn = new_frontier.get_lsn(oid);
+            !Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS(\
+                   SELECT 1 FROM \"{change_schema}\".changes_{oid} \
+                   WHERE lsn > '{prev_lsn}'::pg_lsn \
+                   AND lsn <= '{new_lsn}'::pg_lsn \
+                   AND action != 'T' \
+                   LIMIT 1\
+                 )",
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+        };
+
+        if is_pure_truncate {
+            return execute_incremental_truncate_delete(st);
+        }
+
         pgrx::info!(
             "[pg_trickle] Source table TRUNCATE detected — falling back to FULL refresh for {}.{}",
             schema,
@@ -2033,6 +2190,7 @@ mod tests {
             diamond_consistency: crate::dag::DiamondConsistency::None,
             diamond_schedule_policy: crate::dag::DiamondSchedulePolicy::default(),
             has_keyless_source: false,
+            function_hashes: None,
         }
     }
 

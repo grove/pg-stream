@@ -1,8 +1,8 @@
 # Plan: Expanding SQL Coverage in Trigger-Based CDC Mode (Part 2)
 
 **Date:** 2026-03-03  
-**Last updated:** 2026-03-04  
-**Status:** READY — Stages 1 and 2 of [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](../PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) are complete (EC-06 fully fixed incl. post-impl bug fixes, EC-01 complete for all join types, all Stage 2 safety items done). This plan is unblocked.  
+**Last updated:** 2026-03-06  
+**Status:** Stage 3 (Tasks 1.1–2.4) complete. Stage 4 (EC-16, Task 3.1, Task 3.2, Task 3.5) complete; Tasks 3.3 and 3.4 deferred. Stage 5 (Tasks 4.1–4.3) complete.  
 **Branch:** `edge-cases-and-transactional-ivm`  
 **Scope:** Limitations of `pg_trickle.cdc_mode = 'trigger'` (the default),
 and a phased implementation plan to maximise the SQL surface area supported
@@ -49,21 +49,28 @@ users to switch to WAL-based CDC.
 - 1032 unit tests, 22+ E2E test suites passing
 - 25 aggregate functions in DIFFERENTIAL mode
 - 21 OpTree variants, 20 diff operators
-- 5 auto-rewrite passes (view inlining, DISTINCT ON, GROUPING SETS, scalar
-  subquery in WHERE, SubLinks in OR)
+- 8 auto-rewrite passes (view inlining, nested window expressions, DISTINCT ON,
+  GROUPING SETS, scalar subquery in WHERE, SubLinks in OR, SubLinks in AND+OR,
+  SubLinks in deeply nested AND chains)
+- ALL (subquery) → NULL-safe AntiJoin via `parse_all_sublink()` (G3 closed)
 - NATURAL JOIN fully resolved at parse time
 - TRUNCATE on source table: statement-level trigger → automatic FULL refresh fallback
 - TRUNCATE on stream table: blocked by BEFORE TRUNCATE guard trigger (EC-25)
 - Direct DML on stream table: blocked by BEFORE I/U/D guard trigger (EC-26)
 - Keyless tables (no PK): fully supported via net-counting delta (EC-06)
+- Mixed UNION / UNION ALL handled natively (no rewrite needed)
+- Multiple PARTITION BY handled natively via full recomputation (no rewrite needed)
+- Nested window expressions lifted to inner subquery via `rewrite_nested_window_exprs()` (**G12 closed**)
 
 **After this plan (target):**
 
 - 900+ unit tests
 - 36+ aggregate functions in DIFFERENTIAL mode (11 regression + hypothetical)
-- Multiple PARTITION BY resolved via query-level rewrite
-- Mixed UNION / UNION ALL handled natively
-- ALL (subquery) operator
+- ✅ Multiple PARTITION BY resolved via query-level rewrite (done natively)
+- ✅ Mixed UNION / UNION ALL handled natively
+- ✅ Nested window expressions: `rewrite_nested_window_exprs()` subquery lift
+- ✅ ALL (subquery): `parse_all_sublink()` NULL-safe AntiJoin (G3 closed)
+- ✅ Deeply nested SubLinks in OR: `flatten_and_conjuncts()` handles AND(AND(OR(EXISTS))) (G4 closed)
 - Column-level change compression reducing trigger overhead by 30–60% for
   UPDATE-heavy workloads on wide tables
 - Batched trigger writes for bulk DML
@@ -151,18 +158,18 @@ area available to trigger-mode users.
 
 | ID | Construct | Current Status | Root Cause | Proposed Fix | Phase |
 |----|-----------|----------------|------------|-------------|-------|
-| **G1** | Mixed UNION / UNION ALL | Rejected | No per-arm dedup flag in OpTree | Add `dedup` flag per UNION arm | 1 |
-| **G2** | Multiple PARTITION BY in one query | Rejected | Single-pass partition recompute | Auto-rewrite to nested subqueries | 1 |
-| **G3** | ALL (subquery) | Rejected | Not implemented | New AntiJoin variant with universal quantification | 2 |
-| **G4** | SubLinks inside deeply nested OR | Rejected | Auto-rewrite handles simple cases; deeply nested patterns escape | Extend `rewrite_sublinks_in_or` to handle nested boolean trees | 2 |
+| **G1** | Mixed UNION / UNION ALL | ✅ **Works natively** | — | `collect_union_children` + `Distinct`/`UnionAll` OpTree handle mixed arms | 1 |
+| **G2** | Multiple PARTITION BY in one query | ✅ **Works natively** | — | Full recomputation approach; no SQL rewrite needed | 1 |
+| **G3** | ALL (subquery) | ✅ **DONE** — NULL-safe AntiJoin | `parse_all_sublink()` builds `(col IS NULL OR NOT (x op col))` condition; full AntiJoin diff pipeline already wired | EC-32 closed | 1 |
+| **G4** | SubLinks inside deeply nested OR | ✅ **DONE** — handles `AND(AND(OR(EXISTS)))` | `flatten_and_conjuncts()` helper + updated `and_contains_or_with_sublink()` + `rewrite_and_with_or_sublinks()` flattens AND tree recursively | — | 2 |
 | **G5** | ROWS FROM() with multiple functions | Rejected | Parser only handles single SRF | Extend `LateralFunction` to zip multiple SRFs | 2 |
-| **G6** | LATERAL with RIGHT/FULL JOIN | Rejected | Delta correctness not validated | Implement NULL-padded LATERAL delta for RIGHT/FULL | 2 |
-| **G7** | Regression aggregates (11 functions) | Rejected | Not implemented | Group-rescan (same pattern as existing aggregates) | 4 |
-| **G8** | Hypothetical-set aggregates (4 funcs) | Rejected | Not implemented | Group-rescan | 4 |
-| **G9** | XMLAGG | Rejected | Not implemented | Group-rescan | 4 |
+| **G6** | LATERAL with RIGHT/FULL JOIN | Rejected (PostgreSQL constraint) | PostgreSQL itself rejects RIGHT/FULL JOIN LATERAL | Error message updated to explain PostgreSQL-level constraint (**message improved**) | — |
+| **G7** | Regression aggregates (11 functions) | ✅ **DONE** — group-rescan | Already fully wired in prior session (`AggFunc::Corr`, `CovarPop`, `RegrAvgx` etc. + match arms + `is_group_rescan`) | — | 4 |
+| **G8** | Hypothetical-set aggregates (4 funcs) | ✅ **DONE** — group-rescan | `HypRank/HypDenseRank/HypPercentRank/HypCumeDist` variants; `is_ordered_set` updated in `agg_to_rescan_sql` | — | 4 |
+| **G9** | XMLAGG | ✅ **DONE** — group-rescan | `AggFunc::XmlAgg`; `sql_name()` → `"XMLAGG"`; `is_group_rescan()` true | — | 4 |
 | **G10** | Recursive CTEs in IMMEDIATE mode | Rejected | Fixpoint iteration not validated with transition tables | Validate and enable | 5 |
 | **G11** | TopK in IMMEDIATE mode | Rejected | Scoped recompute is a deferred/full pattern | Statement-level TopK maintenance | 5 |
-| **G12** | Window functions nested in expressions | Rejected | `expr_contains_window_function()` detects and rejects | Lift window to separate column, rewrite outer expr | 1 |
+| **G12** | Window functions nested in expressions | ✅ **DONE** — auto-rewritten | `rewrite_nested_window_exprs()` lifts nested window funcs to inner subquery | Wired in `api.rs` before DISTINCT ON | 1 |
 
 ### 3.2 Items That Are NOT Gaps (Correctly Handled)
 
@@ -192,144 +199,64 @@ SQL before the parser sees them.
 
 **Estimated effort:** 2–3 sessions (12–18 hours)
 
-### Task 1.1: Mixed UNION / UNION ALL (G1)
+### Task 1.1: Mixed UNION / UNION ALL (G1) — ✅ ALREADY WORKS NATIVELY
 
-**Current behaviour:** A query like `SELECT ... UNION SELECT ... UNION ALL
-SELECT ...` is rejected because the parser expects all set operations at the
-top level to be the same type.
+**Discovery:** Mixed UNION / UNION ALL queries work natively in the DVM
+engine without any SQL rewrite pass. `collect_union_children` in `parser.rs`
+preserves the nested `Distinct{UnionAll{...}}` structure: UNION arms are
+wrapped in a `Distinct` OpTree node, UNION ALL arms are wrapped in
+`UnionAll`. The `diff_distinct` and `diff_union_all` operators both handle
+this correctly. No `rewrite_mixed_union()` function is needed or planned.
 
-**Proposed fix:** Add a new auto-rewrite pass (`rewrite_mixed_union`) that
-runs after the existing passes. The rewrite detects mixed top-level UNION /
-UNION ALL and normalises them:
+**Action:** None. Close G1 as already handled.
 
-1. Parse the query with `raw_parser()`.
-2. Walk the `SelectStmt` tree to identify the set operation types.
-3. If all are the same type, return unchanged.
-4. If mixed:
-   - UNION (dedup) arms are grouped into a inner `SELECT DISTINCT * FROM
-     (arm1 UNION ALL arm2 ...) __pgt_dedup`.
-   - UNION ALL arms remain as-is.
-   - The final query is `grouped_dedup UNION ALL arm3 UNION ALL arm4 ...`.
+### Task 1.2: Multiple PARTITION BY Resolution (G2) — ✅ HANDLED NATIVELY
 
-This ensures the DVM engine only sees uniform UNION ALL at the top level,
-which it already handles. The DISTINCT wrapper provides the dedup semantics.
+**Discovery:** Multiple PARTITION BY window functions in one query are
+handled natively via the full-recomputation path. The `rewrite_multi_partition_windows()`
+function exists in `src/dvm/parser.rs` but is **not exported from `mod.rs`
+and not called in `api.rs`** — it is dead code. The working approach uses the
+existing window function analysis that treats queries with different PARTITION
+BY clauses as un-partitioned (full recomputation applies). An api.rs comment
+confirms: "Window functions with different PARTITION BY clauses are now
+handled by the parser as un-partitioned (full recomputation). No SQL rewrite
+needed."
 
-**Files changed:**
-- `src/dvm/parser.rs` — new `rewrite_mixed_union()` function
-- `src/dvm/mod.rs` — export and wire into the rewrite pipeline
-- `src/api.rs` — call `rewrite_mixed_union()` after existing passes
+**Action:** None. Close G2 as already handled natively. The dead
+`rewrite_multi_partition_windows()` function may be removed in a future
+cleanup pass.
 
-**Tests:**
-- Unit tests in `parser.rs`: 3–4 cases (2 UNION + 1 UNION ALL, 3-way mix,
-  nested mix, unchanged when uniform)
-- E2E test: create stream table with mixed UNION / UNION ALL, verify delta
-  correctness after INSERT on each source
+### Task 1.3: Window Functions Nested in Expressions (G12) — ✅ DONE
 
-### Task 1.2: Multiple PARTITION BY Resolution (G2)
+**Status:** **IMPLEMENTED** — `rewrite_nested_window_exprs()` in
+`src/dvm/parser.rs`, exported from `src/dvm/mod.rs`, wired in `src/api.rs`
+before the DISTINCT ON rewrite. The helper `collect_all_window_func_nodes()`
+recursively harvests all FuncCall-with-OVER nodes from an expression tree.
+The `deparse_select_window_clause()` helper carries the WINDOW clause
+(named window references) into the inner SELECT.
 
-**Current behaviour:** A defining query with window functions using different
-`PARTITION BY` clauses is rejected because the partition recomputation
-strategy requires a single partition key.
+**What was implemented:**
+- `rewrite_nested_window_exprs(query)` → lifts nested window funcs to inner subquery
+- `collect_all_window_func_nodes(node, result)` → recursive walker
+- `deparse_select_window_clause(select)` → deparsers the WINDOW clause
+- Bail-out conditions preserved: set operations, GROUP BY, no nested window funcs found
 
-**Proposed fix:** Add a new auto-rewrite pass (`rewrite_multi_partition`)
-that decomposes the query into nested subqueries:
-
+**Before/after:**
 ```sql
--- Before rewrite (rejected):
-SELECT id, name,
-       ROW_NUMBER() OVER (PARTITION BY category ORDER BY price) AS cat_rank,
-       SUM(qty) OVER (PARTITION BY region) AS region_total
-FROM products
+-- Before (rejected):
+SELECT id, ABS(ROW_NUMBER() OVER (ORDER BY score) - 5) AS adjusted_rank FROM players;
 
--- After rewrite (supported):
-SELECT __inner.id, __inner.name, __inner.cat_rank,
-       SUM(__inner.qty) OVER (PARTITION BY __inner.region) AS region_total
-FROM (
-    SELECT id, name, category, region, qty, price,
-           ROW_NUMBER() OVER (PARTITION BY category ORDER BY price) AS cat_rank
-    FROM products
-) __inner
+-- After rewrite (accepted by DVM):
+SELECT id, ABS("__pgt_wf_inner"."__pgt_wf_1" - 5) AS "adjusted_rank"
+  FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY score) AS "__pgt_wf_1" FROM players) "__pgt_wf_inner";
 ```
 
-The strategy:
-1. Parse the query and collect all window functions.
-2. Group by distinct PARTITION BY key.
-3. If only one group, return unchanged.
-4. Pick the "outermost" partition group (the one referenced by the fewest
-   downstream expressions) as the outer window.
-5. Push all other window functions into subqueries, layered inside-out.
-6. The outermost SELECT applies the final window function on the subquery
-   result.
-
-Each layer has a single PARTITION BY, which the DVM engine handles.
-
-**Complexity:** Medium — the rewrite is conceptually straightforward but
-extracting and re-assembling window clauses from the raw parse tree requires
-careful handling of aliases, ORDER BY, and frame specifications.
-
-**Files changed:**
-- `src/dvm/parser.rs` — new `rewrite_multi_partition()` function
-- `src/dvm/mod.rs` — export
-- `src/api.rs` — wire into rewrite pipeline (after GROUPING SETS, before
-  scalar subquery rewrite)
-
-**Tests:**
-- Unit tests: 4–5 cases (2 partitions, 3 partitions, mixed with/without
-  ORDER BY, ROWS frame, named WINDOW)
-- E2E test: create stream table with 2 different PARTITION BY, INSERT data,
-  verify both window results update correctly
-
-### Task 1.3: Window Functions Nested in Expressions (G12)
-
-**Current behaviour:** A defining query like `SELECT ABS(ROW_NUMBER() OVER
-(...))` is rejected because `expr_contains_window_function()` detects the
-nested window function and errors.
-
-**Note:** EC-03 in PLAN_EDGE_CASES.md originally proposed lifting via a CTE
-(`WITH __pgt_wf AS (...)`). That approach is superseded by this subquery
-lift. The CTE approach produces a `WithQuery` node in the OpTree requiring
-the DVM engine to handle CTEs wrapping window functions — an untested path.
-The subquery approach produces a nested `Scan → Window → Project` chain that
-the existing DVM path already handles correctly. EC-03 has been updated
-accordingly.
-
-**Proposed fix:** Add a new auto-rewrite pass (`rewrite_nested_window_exprs`)
-that lifts window functions out of expressions into separate columns, then
-wraps the result in an outer SELECT that applies the expression:
-
-```sql
--- Before rewrite (rejected):
-SELECT id, ABS(ROW_NUMBER() OVER (ORDER BY score) - 5) AS adjusted_rank
-FROM players
-
--- After rewrite (supported):
-SELECT id, ABS(__pgt_wf_1 - 5) AS adjusted_rank
-FROM (
-    SELECT id, score,
-           ROW_NUMBER() OVER (ORDER BY score) AS __pgt_wf_1
-    FROM players
-) __pgt_wf_inner
-```
-
-**Strategy:**
-1. Walk the target list looking for expressions containing window functions
-   (recursive `expr_contains_window_function()` already exists).
-2. For each such expression, extract the window function call into a
-   synthetic column in an inner subquery.
-3. Replace the window function reference in the outer expression with the
-   synthetic column name.
-4. Wrap in `SELECT outer_exprs FROM (inner_subquery) __pgt_wf_inner`.
-
-**Files changed:**
-- `src/dvm/parser.rs` — new `rewrite_nested_window_exprs()` function
-- `src/dvm/mod.rs` — export
-- `src/api.rs` — wire into rewrite pipeline (before DISTINCT ON, since
-  DISTINCT ON itself may use window functions)
-
-**Tests:**
-- Unit tests: 3–4 cases (ABS(ROW_NUMBER()), COALESCE(LAG(), 0), nested
-  arithmetic, multiple nested windows in one query)
-- E2E test: create stream table with window-in-expression, verify delta
+**Note:** EC-03 in PLAN_EDGE_CASES.md originally proposed a CTE-based lift.
+That approach is superseded by this subquery lift. The CTE approach produces
+a `WithQuery` node in the OpTree requiring the DVM engine to handle CTEs
+wrapping window functions — an untested path. The subquery approach produces
+a nested `Scan → Window → Project` chain that the existing DVM path already
+handles correctly. EC-03 has been updated accordingly.
 
 ---
 
@@ -340,103 +267,72 @@ be resolved by auto-rewriting to existing operators.
 
 **Estimated effort:** 3–4 sessions (18–24 hours)
 
-### Task 2.1: ALL (Subquery) Operator (G3)
+### Task 2.1: ALL (Subquery) Operator (G3) — ✅ DONE
 
-**Current behaviour:** `WHERE col > ALL (SELECT x FROM t)` is rejected with
-a suggestion to use `NOT EXISTS`.
+**Status:** **IMPLEMENTED** — `parse_all_sublink()` in `src/dvm/parser.rs` now
+uses a NULL-safe anti-join condition. The full pipeline was already wired:
+- `parse_sublink_to_wrapper()` routes `ALL_SUBLINK` → `parse_all_sublink()`
+- `parse_all_sublink()` builds an `AntiJoin` `SublinkWrapper`
+- `diff_anti_join()` in `operators/anti_join.rs` generates the delta SQL
 
-**Proposed fix:** Implement via rewrite to NOT EXISTS at the OpTree level
-(not SQL rewrite). `ALL (SELECT ...)` is semantically: "the predicate holds
-for every row returned by the subquery." This is the negation of `EXISTS
-(SELECT ... WHERE NOT predicate)`.
+**Bug fixed (NULL-safety):** The previous condition `NOT (x op col)` was not
+NULL-safe: when `col IS NULL`, `NOT (x op NULL)` evaluates to NULL (not TRUE),
+so the EXISTS clause did not fire for NULL rows, incorrectly including outer
+rows that should have been excluded.
 
-**Implementation:**
-1. In `extract_where_sublinks()` (parser.rs), detect `ALL_SUBLINK` nodes.
-2. Negate the comparison operator (e.g., `>` → `<=`).
-3. Construct an `AntiJoin` OpTree node with the negated condition — this
-   emits "rows from the left that have NO match in the right where the
-   negated condition holds," which is equivalent to ALL.
-4. Alternatively, rewrite to a SQL-level `NOT EXISTS (… EXCEPT …)` pattern
-   at the SQL level before parsing (see EC-32 in PLAN_EDGE_CASES.md).
-
-**Recommended approach:** SQL-level rewrite to `NOT EXISTS (… EXCEPT …)` —
-aligned with EC-32:
-
-```sql
--- col > ALL (SELECT x FROM t)
--- rewrites to:
-NOT EXISTS (SELECT col EXCEPT SELECT x FROM t WHERE col > x)
--- generalised NULL-safe form:
-NOT EXISTS (
-    SELECT 1 FROM subquery
-    WHERE col IS NOT DISTINCT FROM subquery_col
-      OR NOT (col op subquery_col)
-)
-```
-
-The `EXCEPT`-based pattern is preferred over `WHERE NOT (col op
-subquery_col)` because it is NULL-safe: PostgreSQL's `EXCEPT` uses
-`IS NOT DISTINCT FROM` equality, so a NULL in the subquery correctly
-prevents the predicate from holding — matching the SQL standard semantics
-for `ALL`. The `WHERE NOT` form silently drops NULL-containing rows,
-producing wrong results for `= ALL (...)` when the subquery contains NULLs.
-
-**Files changed:**
-- `src/dvm/parser.rs` — new `rewrite_all_sublink()` or extend
-  `extract_where_sublinks()` to handle `ALL_SUBLINK`
-- `src/dvm/mod.rs` — export if SQL-level rewrite
-- `src/api.rs` — wire into pipeline if SQL-level rewrite
-
-**Tests:**
-- Unit tests: 3 cases (ALL with `>`, `=`, `<>` operators)
-- E2E test: stream table with `WHERE price > ALL (SELECT ...)`, verify
-  delta correctness for INSERT/DELETE in both outer and inner tables
-
-### Task 2.2: Deeply Nested SubLinks in OR (G4)
-
-**Current behaviour:** The `rewrite_sublinks_in_or()` pass handles
-`WHERE a OR EXISTS (...)` at the top level. Deeply nested patterns like
-`WHERE x AND (y OR EXISTS (...))` survive the rewrite and are rejected.
-
-**Proposed fix:** Extend `rewrite_sublinks_in_or()` to recursively walk
-the boolean expression tree:
-
-1. **Base case:** If the node is not a BoolExpr, return unchanged.
-2. **AND node:** Recurse into each argument. If any argument becomes a
-   UNION after rewriting, the AND condition must be applied as a WHERE
-   filter on that UNION branch.
-3. **OR node (current):** Already decomposes into UNION branches. No change.
-4. **OR node (nested):** An OR inside an AND is handled by step 2 — the
-   AND's other arms become WHERE filters on the decomposed UNION.
+**New condition:** `(col IS NULL OR NOT (x op col))`
+- Correctly excludes the outer row when any inner row has `col IS NULL`
+- Correctly excludes the outer row when any inner row has `NOT (x op col)`
+- Correctly includes the outer row when all inner rows satisfy `x op col`
 
 **Example:**
 ```sql
--- Before (rejected):
-SELECT * FROM t WHERE x = 1 AND (y = 2 OR EXISTS (SELECT 1 FROM s WHERE s.id = t.id))
-
--- After rewrite (supported):
-SELECT * FROM t WHERE x = 1 AND y = 2
-UNION ALL
-SELECT * FROM t WHERE x = 1 AND EXISTS (SELECT 1 FROM s WHERE s.id = t.id)
+SELECT * FROM orders WHERE price > ALL (SELECT threshold FROM limits);
+-- AntiJoin condition: (threshold IS NULL OR NOT (price > threshold))
+-- i.e. exclude order if any limit row has NULL threshold or price <= threshold
 ```
 
-The key insight: the AND conjuncts that are NOT part of the OR are
-duplicated into each UNION branch. The OR arms become separate branches.
+**Files changed:**
+- `src/dvm/parser.rs` — `parse_all_sublink()`: updated condition to NULL-safe form
 
-**Complexity:** Medium-High — the recursive tree rewriting is conceptually
-clean but requires careful handling of NOT, double negation, and mixed
-AND/OR/NOT nesting.
+### Task 2.2: Deeply Nested SubLinks in OR (G4) — ✅ DONE
+
+**Status:** **IMPLEMENTED** — the SubLinks-in-OR rewrite pipeline now handles
+arbitrarily deep `AND(AND(... OR(EXISTS(...))))` nesting.
+
+**Root cause of the gap:** `rewrite_and_with_or_sublinks()` previously iterated
+only the direct children of the top-level AND node. `AND(a, AND(b, OR(EXISTS)))`
+has only two direct children (`a` and `AND(b, OR(EXISTS))`), so the inner
+`AND(b, OR(EXISTS))` was never recognized as "an OR-with-sublinks arm" —
+causing the rewrite to silently skip the query, which then failed downstream.
+
+**What was added:**
+1. **`flatten_and_conjuncts(node, result)`** — new recursive helper that
+   flattens `AND(a, AND(b, c))` → `[a, b, c]` at any nesting depth.
+2. **`and_contains_or_with_sublink()`** updated to use `flatten_and_conjuncts`
+   so it detects an OR-with-sublinks anywhere in a nested AND chain (not just
+   one level deep).
+3. **`rewrite_and_with_or_sublinks()`** signature changed from taking
+   `and_expr: &BoolExpr` to `where_node: *mut Node`; body now calls
+   `flatten_and_conjuncts` first, then finds the first OR-with-sublinks in the
+   flat list.
+
+**Before/after:**
+```sql
+-- Before (rejected — AND nesting was not flattened):
+SELECT * FROM t WHERE x = 1 AND (y = 2 AND (z = 3 OR EXISTS (SELECT 1 FROM s WHERE s.id = t.id)))
+
+-- After rewrite (supported):
+SELECT * FROM t WHERE x = 1 AND y = 2 AND z = 3
+UNION
+SELECT * FROM t WHERE x = 1 AND y = 2 AND EXISTS (SELECT 1 FROM s WHERE s.id = t.id)
+```
 
 **Files changed:**
-- `src/dvm/parser.rs` — extend `rewrite_sublinks_in_or()` or split into
-  `rewrite_sublinks_in_bool_tree()`
-- `src/dvm/mod.rs` — export
-- `src/api.rs` — replace existing call
-
-**Tests:**
-- Unit tests: 5–6 cases (nested AND(OR(EXISTS)), double nested,
-  NOT(OR(EXISTS)), mixed AND/OR/NOT, already-clean query unchanged)
-- E2E test: stream table with nested OR + EXISTS, verify delta
+- `src/dvm/parser.rs`:
+  - `flatten_and_conjuncts()` — new helper
+  - `and_contains_or_with_sublink()` — uses `flatten_and_conjuncts`
+  - `rewrite_and_with_or_sublinks()` — new signature + flattened body
 
 ### Task 2.3: ROWS FROM() with Multiple Functions (G5)
 
@@ -488,29 +384,21 @@ with `generate_series` (general case).
 - Unit tests: 3 cases (dual unnest, triple unnest, mixed SRFs)
 - E2E test: stream table over `ROWS FROM()`, verify delta
 
-### Task 2.4: LATERAL with RIGHT/FULL JOIN (G6)
+### Task 2.4: LATERAL with RIGHT/FULL JOIN (G6) — ✅ ERROR MESSAGE UPDATED
 
-**Current behaviour:** `RIGHT JOIN LATERAL` and `FULL JOIN LATERAL` are
-rejected.
-
-**Proposed fix:** This is a genuine PostgreSQL semantic constraint, not just
-a pg_trickle limitation. PostgreSQL itself rejects `RIGHT JOIN LATERAL` and
-`FULL JOIN LATERAL` in most contexts because the LATERAL reference creates a
-dependency from the right side to the left side, which conflicts with the
-semantics of RIGHT/FULL JOIN where the right side must be evaluated
-independently.
-
-**Recommendation:** Keep the rejection. This is a PostgreSQL-level constraint,
-not a pg_trickle limitation. Document it clearly in the error message:
+**Status:** **DONE** — error messages in `src/dvm/parser.rs` (two locations)
+updated to explain that `RIGHT JOIN LATERAL` and `FULL JOIN LATERAL` are
+rejected by PostgreSQL itself, not by pg_trickle. The messages now read:
 
 ```
-LATERAL subqueries can only be used with INNER JOIN or LEFT JOIN. RIGHT JOIN
-LATERAL and FULL JOIN LATERAL are not supported by PostgreSQL because the
-lateral reference creates a dependency from the right side to the left side.
+LATERAL subqueries support only INNER JOIN and LEFT JOIN. RIGHT JOIN LATERAL
+and FULL JOIN LATERAL are rejected by PostgreSQL itself because the lateral
+reference on the right side creates a dependency that conflicts with
+RIGHT/FULL JOIN semantics (got join type ...).
 ```
 
-**Action:** Update the error message to clarify this is a PostgreSQL
-constraint, not a pg_trickle limitation.
+No further work planned for G6 — this is a PostgreSQL-level constraint
+with no viable workaround.
 
 ---
 
@@ -524,7 +412,22 @@ trigger functions — they do not affect the DVM engine or SQL coverage.
 
 ### Task 3.1: Column-Level Change Detection for UPDATE
 
-**Current behaviour:** The UPDATE trigger writes all NEW and OLD column
+**Status:** ✅ **DONE** —
+`changed_cols BIGINT` column added to all new change buffer tables
+(`create_change_buffer_table()`). `build_changed_cols_bitmask_expr()` generates
+a per-column `IS DISTINCT FROM` bitmask expression. Both
+`create_change_trigger()` and `rebuild_cdc_trigger_function()` write the bitmask
+for UPDATE rows. `sync_change_buffer_columns()` recognises `changed_cols` as a
+system column (not dropped on schema changes). `alter_change_buffer_add_columns()`
+migrates existing buffer tables via `ADD COLUMN IF NOT EXISTS changed_cols BIGINT`.
+All column values are still written (scan-layer optimisation is Task 3.4, deferred).
+
+Deferred (Task 3.4 dependency): using the bitmask in `diff_scan_change_buffer()` to
+skip unchanged columns requires a demand-propagation pass to prune `Scan.columns`
+to only referenced columns. `resolve_columns()` currently returns ALL source columns;
+this pass is deferred.
+
+**Original behaviour:** The UPDATE trigger writes all NEW and OLD column
 values to the buffer table, regardless of which columns changed.
 
 **Proposed fix:** Modify the generated PL/pgSQL trigger function to compare
@@ -590,7 +493,16 @@ during the next DDL event trigger rebuild or via an explicit upgrade function.
 
 ### Task 3.2: Incremental TRUNCATE Handling
 
-**Current behaviour:** TRUNCATE on a source table writes a 'T' marker →
+**Status:** ✅ **DONE** —
+`execute_incremental_truncate_delete()` added to `src/refresh.rs`. The
+TRUNCATE detection block now checks: if the ST has exactly one source AND the
+current window contains no post-TRUNCATE rows (action `!= 'T'`), it calls
+`execute_incremental_truncate_delete()` which issues a direct
+`DELETE FROM stream_table` (O(ST rows) — no defining-query re-execution).
+For multi-source STs or windows with post-TRUNCATE inserts, it falls back to
+`execute_full_refresh()` unchanged.
+
+**Original behaviour:** TRUNCATE on a source table writes a 'T' marker →
 the refresh engine falls back to FULL refresh (TRUNCATE stream table +
 repopulate from defining query).
 
@@ -748,71 +660,15 @@ group-rescan strategy, bringing the total from 25 to 53.
 
 ### Task 4.1: Regression Aggregates (G7) — 11 Functions
 
-Implement `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_AVGX`, `REGR_AVGY`,
-`REGR_COUNT`, `REGR_INTERCEPT`, `REGR_R2`, `REGR_SLOPE`, `REGR_SXX`,
-`REGR_SXY`, `REGR_SYY`.
-
-These are all two-argument aggregate functions that take (Y, X) pairs.
-The group-rescan strategy applies directly:
-
-1. Detect affected groups from the delta (groups where any row was
-   inserted, updated, or deleted).
-2. For each affected group, re-aggregate from source:
-   `SELECT group_key, CORR(y, x) AS corr_val FROM source GROUP BY group_key`
-3. Apply the result as an UPDATE to the stream table.
-
-**Files changed:**
-- `src/dvm/parser.rs` — add `AggFunc::Corr`, `AggFunc::CovarPop`,
-  `AggFunc::CovarSamp`, and 8 `AggFunc::Regr*` variants.
-  Update `parse_aggregate()` to recognise these function names.
-- `src/dvm/operators/aggregate.rs` — add cases to `group_rescan_agg_sql()`
-  for each new variant. The group-rescan pattern is identical to existing
-  aggregates (BOOL_AND, STRING_AGG, etc.) — emit the aggregate function
-  call over the source table grouped by the same GROUP BY keys.
-
-**Tests:**
-- Unit tests: 11 tests (one per aggregate), verifying delta SQL generation
-- E2E test: stream table with `CORR(y, x)`, INSERT/DELETE, verify delta
+**Status:** ✅ **DONE** — Already fully wired in a prior session. `AggFunc::Corr`, `CovarPop`, `CovarSamp`, `RegrAvgx`, `RegrAvgy`, `RegrCount`, `RegrIntercept`, `RegrR2`, `RegrSlope`, `RegrSxx`, `RegrSxy`, `RegrSyy` variants exist in `src/dvm/parser.rs`; all are in the `is_group_rescan()` match arm, have correct `sql_name()` mappings, and are wired in the `extract_aggregates` match block. G7 closed.
 
 ### Task 4.2: Hypothetical-Set Aggregates (G8) — 4 Functions
 
-Implement `RANK()`, `DENSE_RANK()`, `PERCENT_RANK()`, `CUME_DIST()` as
-**aggregate functions** (not window functions — these are already supported
-as window functions).
-
-Hypothetical-set aggregates use `WITHIN GROUP (ORDER BY ...)` syntax:
-```sql
-SELECT RANK(42) WITHIN GROUP (ORDER BY score) FROM students
-```
-
-The group-rescan strategy works here too: for affected groups, re-aggregate
-from source. The aggregate call syntax includes the hypothetical value and
-the ORDER BY clause.
-
-**Files changed:**
-- `src/dvm/parser.rs` — add `AggFunc::HypRank`, `AggFunc::HypDenseRank`,
-  `AggFunc::HypPercentRank`, `AggFunc::HypCumeDist` variants.  Extend
-  the ordered-set aggregate parsing (already exists for MODE/PERCENTILE)
-  to recognise these.
-- `src/dvm/operators/aggregate.rs` — group-rescan with hypothetical value
-
-**Tests:**
-- Unit tests: 4 tests (one per aggregate)
-- E2E test: stream table with `RANK(x) WITHIN GROUP (ORDER BY ...)`,
-  INSERT/DELETE, verify delta
+**Status:** ✅ **DONE** — `AggFunc::HypRank`, `HypDenseRank`, `HypPercentRank`, `HypCumeDist` variants added to `src/dvm/parser.rs`; all routed through `is_group_rescan()` = true; `is_ordered_set` in `agg_to_rescan_sql` updated to include all four; match arm wired ("rank" / "dense_rank" / "percent_rank" / "cume_dist" → respective variants); `sql_name()` returns `"RANK"` / `"DENSE_RANK"` / `"PERCENT_RANK"` / `"CUME_DIST"`. G8 closed.
 
 ### Task 4.3: XMLAGG (G9)
 
-Implement `XMLAGG(expr ORDER BY ...)`. Group-rescan strategy. Very niche
-but trivial given the established pattern.
-
-**Files changed:**
-- `src/dvm/parser.rs` — add `AggFunc::XmlAgg` variant
-- `src/dvm/operators/aggregate.rs` — group-rescan
-
-**Tests:**
-- Unit test: delta SQL generation
-- E2E test: stream table with XMLAGG, verify delta
+**Status:** ✅ **DONE** — `AggFunc::XmlAgg` variant added to `src/dvm/parser.rs`; `sql_name()` → `"XMLAGG"`; `is_group_rescan()` = true (ORDER BY is passed through inside the call, not via `is_ordered_set`); match arm wired ("xmlagg" → `AggFunc::XmlAgg`). G9 closed.
 
 ---
 

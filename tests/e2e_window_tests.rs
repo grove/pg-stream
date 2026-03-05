@@ -480,8 +480,9 @@ async fn test_window_dense_rank() {
 
 // ── Nested window function detection (Gap 7.4) ──────────────────────
 // Note: nested window functions are rejected in DIFFERENTIAL mode because
-// the DVM parser cannot extract them for incremental maintenance.
-// FULL mode allows them since it just re-runs the query via PostgreSQL.
+// the DVM parser lifts nested window expressions to inner subqueries via
+// rewrite_nested_window_exprs() (Task 1.3 / EC-03). These queries are now
+// accepted in DIFFERENTIAL mode rather than rejected.
 
 #[tokio::test]
 async fn test_window_in_case_expression_rejected() {
@@ -491,8 +492,10 @@ async fn test_window_in_case_expression_rejected() {
         "CREATE TABLE wf_nested (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
     )
     .await;
+    db.execute("INSERT INTO wf_nested (dept, salary) VALUES ('eng', 100), ('eng', 80), ('hr', 90)")
+        .await;
 
-    // Window function inside CASE should be rejected in DIFFERENTIAL mode
+    // Window function inside CASE is now handled via subquery-lift rewrite (EC-03).
     let result = db
         .try_execute(
             "SELECT pgtrickle.create_stream_table('wf_nested_st', \
@@ -502,13 +505,8 @@ async fn test_window_in_case_expression_rejected() {
         .await;
 
     assert!(
-        result.is_err(),
-        "Nested window function in CASE should be rejected"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Window functions nested inside expressions"),
-        "Error should mention nested window functions, got: {err}"
+        result.is_ok(),
+        "Nested window function in CASE should be accepted via subquery-lift rewrite (EC-03)"
     );
 }
 
@@ -518,8 +516,10 @@ async fn test_window_in_coalesce_rejected() {
 
     db.execute("CREATE TABLE wf_coal (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, val INT)")
         .await;
+    db.execute("INSERT INTO wf_coal (dept, val) VALUES ('eng', 10), ('eng', 20), ('hr', 30)")
+        .await;
 
-    // Window function inside COALESCE should be rejected in DIFFERENTIAL mode
+    // Window function inside COALESCE is now handled via subquery-lift rewrite (EC-03).
     let result = db
         .try_execute(
             "SELECT pgtrickle.create_stream_table('wf_coal_st', \
@@ -528,13 +528,8 @@ async fn test_window_in_coalesce_rejected() {
         .await;
 
     assert!(
-        result.is_err(),
-        "Nested window function in COALESCE should be rejected"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Window functions nested inside expressions"),
-        "Error should mention nested window functions, got: {err}"
+        result.is_ok(),
+        "Nested window function in COALESCE should be accepted via subquery-lift rewrite (EC-03)"
     );
 }
 
@@ -546,8 +541,10 @@ async fn test_window_in_arithmetic_rejected() {
         "CREATE TABLE wf_arith (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
     )
     .await;
+    db.execute("INSERT INTO wf_arith (dept, salary) VALUES ('eng', 100), ('hr', 80)")
+        .await;
 
-    // Window function inside arithmetic should be rejected in DIFFERENTIAL mode
+    // Window function inside arithmetic is now handled via subquery-lift rewrite (EC-03).
     let result = db
         .try_execute(
             "SELECT pgtrickle.create_stream_table('wf_arith_st', \
@@ -557,13 +554,9 @@ async fn test_window_in_arithmetic_rejected() {
         .await;
 
     assert!(
-        result.is_err(),
-        "Nested window function in arithmetic should be rejected"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Window functions nested inside expressions"),
-        "Error should mention nested window functions, got: {err}"
+        result.is_ok(),
+        "Nested window function in arithmetic should be accepted via subquery-lift rewrite (EC-03): {:?}",
+        result.err()
     );
 }
 
@@ -575,8 +568,10 @@ async fn test_window_in_cast_rejected() {
         "CREATE TABLE wf_cast (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
     )
     .await;
+    db.execute("INSERT INTO wf_cast (dept, salary) VALUES ('eng', 100), ('hr', 80)")
+        .await;
 
-    // Window function inside CAST should be rejected in DIFFERENTIAL mode
+    // Window function inside CAST is now handled via subquery-lift rewrite (EC-03).
     let result = db
         .try_execute(
             "SELECT pgtrickle.create_stream_table('wf_cast_st', \
@@ -586,13 +581,9 @@ async fn test_window_in_cast_rejected() {
         .await;
 
     assert!(
-        result.is_err(),
-        "Nested window function in CAST should be rejected"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Window functions nested inside expressions"),
-        "Error should mention nested window functions, got: {err}"
+        result.is_ok(),
+        "Nested window function in CAST should be accepted via subquery-lift rewrite (EC-03): {:?}",
+        result.err()
     );
 }
 
@@ -604,8 +595,11 @@ async fn test_window_deeply_nested_rejected() {
         "CREATE TABLE wf_deep (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
     )
     .await;
+    db.execute("INSERT INTO wf_deep (dept, salary) VALUES ('eng', 100), ('eng', 80), ('hr', 90)")
+        .await;
 
-    // Window function deeply nested: CASE → COALESCE → window (DIFFERENTIAL mode)
+    // Deeply nested window function (CASE → COALESCE → window) is now handled via
+    // subquery-lift rewrite (EC-03).
     let result = db
         .try_execute(
             "SELECT pgtrickle.create_stream_table('wf_deep_st', \
@@ -615,13 +609,9 @@ async fn test_window_deeply_nested_rejected() {
         .await;
 
     assert!(
-        result.is_err(),
-        "Deeply nested window function should be rejected"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("Window functions nested inside expressions"),
-        "Error should mention nested window functions, got: {err}"
+        result.is_ok(),
+        "Deeply nested window function should be accepted via subquery-lift rewrite (EC-03): {:?}",
+        result.err()
     );
 }
 
