@@ -2658,9 +2658,9 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgTrickleError> {
 /// - Non-recursive CTEs
 /// - EXISTS/IN subqueries (SemiJoin/AntiJoin)
 ///
-/// **Rejected:**
-/// - Recursive CTEs (semi-naive evaluation with fixpoint iteration
-///   not yet validated with transition tables)
+/// **Rejected:** (reserved for future restrictions)
+/// - None currently — recursive CTEs (Task 5.1) and WhTopK (Task 5.2) are
+///   both now supported with appropriate GUC gates and runtime warnings.
 pub fn validate_immediate_mode_support(defining_query: &str) -> Result<(), PgTrickleError> {
     let result = parse_defining_query_full(defining_query)?;
 
@@ -3256,6 +3256,14 @@ unsafe fn deparse_select_stmt_with_view_subs(
         };
 
         let mut result = format!("{left} {op_str} {right}");
+
+        // Preserve WITH clause on the outer SETOP node (CTE + UNION ALL pattern).
+        // The CTE definitions live here, NOT on larg/rarg, so they must be
+        // prepended after the arms have been recursively processed.
+        if !s.withClause.is_null() {
+            let with_sql = unsafe { deparse_with_clause_with_view_subs(s.withClause, subs)? };
+            result = format!("{with_sql} {result}");
+        }
 
         // Top-level ORDER BY / LIMIT / OFFSET on set operations
         let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.sortClause) };
@@ -6099,7 +6107,19 @@ fn rewrite_rows_from_in_set_op(select: &pg_sys::SelectStmt) -> Result<String, Pg
         _ => "UNION",
     };
 
-    Ok(format!("{left} {op_str} {right}"))
+    let body = format!("{left} {op_str} {right}");
+
+    // Preserve any WITH clause attached to this set-operation SelectStmt.
+    // The CTE definitions live on the outermost SETOP node — they are NOT
+    // propagated to larg/rarg — so reconstructing from the arms alone drops them.
+    if !select.withClause.is_null() {
+        // SAFETY: withClause is non-null and points to a valid WithClause node
+        // obtained from the raw parse tree of a validated SQL string.
+        let with_sql = unsafe { deparse_with_clause_with_view_subs(select.withClause, &[])? };
+        Ok(format!("{with_sql} {body}"))
+    } else {
+        Ok(body)
+    }
 }
 
 // ── Multiple PARTITION BY → multi-pass window rewrite ──────────────
