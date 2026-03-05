@@ -507,25 +507,15 @@ The MERGE updates both rows. **All work is proportional to the number of deleted
 
 ---
 
-## Case 8: TRUNCATE (What Doesn't Work)
+## Case 8: TRUNCATE (Automatic Full Refresh)
 
 ```sql
 TRUNCATE orders;
 ```
 
-`TRUNCATE` does **not** fire row-level triggers. The change buffer receives zero entries. The next refresh cycle will detect no changes and skip the stream table.
+`TRUNCATE` does **not** fire row-level triggers. However, as of v0.2.0, pg_trickle installs a **statement-level AFTER TRUNCATE** trigger that writes a `'T'` marker to the change buffer. On the next refresh cycle, the scheduler detects this marker and automatically performs a **full refresh** — truncating the stream table and recomputing from the defining query.
 
-This means the stream table becomes **stale** — it still shows the old aggregate values while the base table is empty.
-
-**Workaround**: After a TRUNCATE, manually reinitialize:
-
-```sql
-SELECT pgtrickle.refresh_stream_table('customer_totals');
-```
-
-With the `FULL` refresh mode (or by setting the reinitialize flag), the stream table is recomputed from scratch, producing correct results.
-
-> **Why no TRUNCATE support?** PostgreSQL fires statement-level `AFTER TRUNCATE` triggers, but they don't provide OLD row data. The trigger can detect that a TRUNCATE happened, but cannot enumerate which rows were removed. Supporting TRUNCATE would require reading the stream table to determine what to subtract — effectively a full refresh anyway.
+No manual intervention is required. For details on how TRUNCATE is handled across all three refresh modes (DIFFERENTIAL, IMMEDIATE, FULL), see [What Happens When You TRUNCATE a Table?](WHAT_HAPPENS_ON_TRUNCATE.md).
 
 ---
 
@@ -582,6 +572,41 @@ This is mathematically rigorous — the stream table always reflects the correct
 | JOIN table DELETE | 1 | K (one per matched join row) | O(K) join |
 
 In all cases, the work is proportional to the number of **changed rows**, not the total table size. Deleting 3 rows from a billion-row table produces the same delta cost as from a 10-row table.
+
+---
+
+## What About IMMEDIATE Mode?
+
+Everything above describes **DIFFERENTIAL** mode — changes accumulate in a buffer and are applied on a schedule. As of v0.2.0, pg_trickle also supports **IMMEDIATE** mode, where the stream table is updated synchronously within the same transaction as your DELETE.
+
+### How IMMEDIATE Mode Differs for DELETE
+
+| Phase | DIFFERENTIAL | IMMEDIATE |
+|-------|-------------|----------|
+| **Trigger type** | Row-level AFTER trigger | Statement-level AFTER trigger with `REFERENCING OLD TABLE` |
+| **What's captured** | One buffer row with old_* columns per deleted row | A transition table containing all deleted rows |
+| **When delta runs** | Next scheduler tick | Immediately, in the same transaction |
+| **Delta source** | Change buffer rows with action='D' | Temp table copied from transition table |
+| **Concurrency** | No locking between writers | Advisory lock per stream table |
+
+When you run `DELETE FROM orders WHERE id = 2`:
+
+1. A **BEFORE DELETE** trigger acquires an advisory lock on the stream table
+2. The **AFTER DELETE** trigger captures `OLD TABLE AS __pgt_oldtable` into a temp table
+3. The DVM engine generates the same aggregate delta, reading deleted values from the old-table
+4. The delta is applied to the stream table immediately — groups are decremented, and groups reaching count=0 are removed
+5. Any query within the same transaction sees the updated stream table
+
+```sql
+BEGIN;
+DELETE FROM orders WHERE id = 2;  -- alice's 30.00 order
+-- customer_totals already reflects the deletion here!
+SELECT * FROM customer_totals WHERE customer = 'alice';
+-- Shows: alice | 50.00 | 1
+COMMIT;
+```
+
+The same reference counting, group deletion, and net-effect logic applies — the only difference is the data source (transition tables vs change buffer) and timing (synchronous vs scheduled).
 
 ---
 

@@ -402,6 +402,40 @@ In all cases, the work is proportional to the number of **changed rows**, not th
 
 ---
 
+## What About IMMEDIATE Mode?
+
+Everything above describes **DIFFERENTIAL** mode — changes accumulate in a buffer and are applied on a schedule. As of v0.2.0, pg_trickle also supports **IMMEDIATE** mode, where the stream table is updated synchronously within the same transaction as your UPDATE.
+
+### How IMMEDIATE Mode Differs for UPDATE
+
+| Phase | DIFFERENTIAL | IMMEDIATE |
+|-------|-------------|----------|
+| **Trigger type** | Row-level AFTER trigger | Statement-level AFTER trigger with `REFERENCING OLD TABLE, NEW TABLE` |
+| **What's captured** | One buffer row with old_* and new_* | Two transition tables: `__pgt_oldtable` and `__pgt_newtable` |
+| **When delta runs** | Next scheduler tick | Immediately, in the same transaction |
+| **D+I decomposition** | In the scan delta CTE | Same algebra, but reading from transition temp tables |
+| **Concurrency** | No locking between writers | Advisory lock per stream table |
+
+When you run `UPDATE orders SET amount = 59.99 WHERE id = 1`:
+
+1. A **BEFORE UPDATE** trigger acquires an advisory lock on the stream table
+2. The **AFTER UPDATE** trigger captures both `OLD TABLE AS __pgt_oldtable` and `NEW TABLE AS __pgt_newtable` into temp tables
+3. The DVM engine generates the same D+I decomposition, reading old values from the old-table and new values from the new-table
+4. The delta is applied to the stream table immediately
+5. Any query within the same transaction sees the updated stream table
+
+```sql
+BEGIN;
+UPDATE orders SET amount = 59.99 WHERE id = 1;
+-- customer_totals already reflects the new amount here!
+SELECT * FROM customer_totals WHERE customer = 'alice';
+COMMIT;
+```
+
+The same D+I split, aggregate differentiation, and net-effect logic applies — the only difference is the data source (transition tables vs change buffer) and timing (synchronous vs scheduled).
+
+---
+
 ## Next in This Series
 
 - **[What Happens When You INSERT a Row?](WHAT_HAPPENS_ON_INSERT.md)** — The full 7-phase lifecycle (start here if you haven't already)
