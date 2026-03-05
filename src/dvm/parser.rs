@@ -17087,4 +17087,516 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["dept", "salary"]);
     }
+
+    // ── strip_order_by_and_limit tests ──────────────────────────────
+
+    #[test]
+    fn test_strip_order_by_simple() {
+        let result = strip_order_by_and_limit("SELECT * FROM t ORDER BY id LIMIT 10");
+        assert_eq!(result, "SELECT * FROM t");
+    }
+
+    #[test]
+    fn test_strip_order_by_with_offset() {
+        let result = strip_order_by_and_limit("SELECT * FROM t ORDER BY id LIMIT 10 OFFSET 5");
+        assert_eq!(result, "SELECT * FROM t");
+    }
+
+    #[test]
+    fn test_strip_order_by_no_order_by() {
+        let result = strip_order_by_and_limit("SELECT * FROM t WHERE id > 1");
+        assert_eq!(result, "SELECT * FROM t WHERE id > 1");
+    }
+
+    #[test]
+    fn test_strip_order_by_preserves_subquery_order() {
+        // ORDER BY inside subquery should NOT be stripped
+        let q = "SELECT * FROM (SELECT * FROM t ORDER BY id) sub ORDER BY val LIMIT 5";
+        let result = strip_order_by_and_limit(q);
+        assert_eq!(result, "SELECT * FROM (SELECT * FROM t ORDER BY id) sub");
+    }
+
+    #[test]
+    fn test_strip_order_by_with_string_literal() {
+        // ORDER BY keyword inside a string literal should be ignored
+        let q = "SELECT * FROM t WHERE name = 'ORDER BY me' ORDER BY id LIMIT 3";
+        let result = strip_order_by_and_limit(q);
+        assert_eq!(result, "SELECT * FROM t WHERE name = 'ORDER BY me'");
+    }
+
+    #[test]
+    fn test_strip_order_by_trailing_semicolon() {
+        let result = strip_order_by_and_limit("SELECT * FROM t ORDER BY id;");
+        assert_eq!(result, "SELECT * FROM t");
+    }
+
+    #[test]
+    fn test_strip_order_by_fetch_first() {
+        let result =
+            strip_order_by_and_limit("SELECT * FROM t ORDER BY id FETCH FIRST 10 ROWS ONLY");
+        assert_eq!(result, "SELECT * FROM t");
+    }
+
+    // ── Expr::output_name tests ─────────────────────────────────────
+
+    #[test]
+    fn test_output_name_column_ref_unqualified() {
+        let e = col("amount");
+        assert_eq!(e.output_name(), "amount");
+    }
+
+    #[test]
+    fn test_output_name_column_ref_qualified() {
+        let e = qualified_col("orders", "total");
+        // output_name strips the qualifier
+        assert_eq!(e.output_name(), "total");
+    }
+
+    #[test]
+    fn test_output_name_literal() {
+        let e = Expr::Literal("42".to_string());
+        // Literals fall through to to_sql()
+        assert_eq!(e.output_name(), "42");
+    }
+
+    #[test]
+    fn test_output_name_func_call() {
+        let e = Expr::FuncCall {
+            func_name: "COUNT".to_string(),
+            args: vec![Expr::Star { table_alias: None }],
+        };
+        assert_eq!(e.output_name(), "COUNT(*)");
+    }
+
+    #[test]
+    fn test_output_name_binary_op() {
+        let e = Expr::BinaryOp {
+            op: "+".to_string(),
+            left: Box::new(col("a")),
+            right: Box::new(Expr::Literal("1".to_string())),
+        };
+        assert_eq!(e.output_name(), "(a + 1)");
+    }
+
+    // ── unwrap_transparent tests ────────────────────────────────────
+
+    #[test]
+    fn test_unwrap_transparent_filter() {
+        let scan = scan_node("t", 1, &["id"]);
+        let filtered = OpTree::Filter {
+            predicate: Expr::Literal("TRUE".to_string()),
+            child: Box::new(scan),
+        };
+        let inner = unwrap_transparent(&filtered);
+        assert!(matches!(inner, OpTree::Scan { .. }));
+    }
+
+    #[test]
+    fn test_unwrap_transparent_subquery() {
+        let scan = scan_node("t", 1, &["id"]);
+        let sub = OpTree::Subquery {
+            alias: "sub".to_string(),
+            column_aliases: vec![],
+            child: Box::new(scan),
+        };
+        let inner = unwrap_transparent(&sub);
+        assert!(matches!(inner, OpTree::Scan { .. }));
+    }
+
+    #[test]
+    fn test_unwrap_transparent_nested() {
+        let scan = scan_node("t", 1, &["id"]);
+        let filtered = OpTree::Filter {
+            predicate: Expr::Literal("TRUE".to_string()),
+            child: Box::new(OpTree::Subquery {
+                alias: "sub".to_string(),
+                column_aliases: vec![],
+                child: Box::new(scan),
+            }),
+        };
+        let inner = unwrap_transparent(&filtered);
+        assert!(matches!(inner, OpTree::Scan { .. }));
+    }
+
+    #[test]
+    fn test_unwrap_transparent_non_transparent() {
+        let scan = scan_node("t", 1, &["id"]);
+        let inner = unwrap_transparent(&scan);
+        assert!(matches!(inner, OpTree::Scan { .. }));
+    }
+
+    #[test]
+    fn test_unwrap_transparent_join_not_unwrapped() {
+        let join = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".to_string()),
+            left: Box::new(scan_node("a", 1, &["id"])),
+            right: Box::new(scan_node("b", 2, &["id"])),
+        };
+        let inner = unwrap_transparent(&join);
+        assert!(matches!(inner, OpTree::InnerJoin { .. }));
+    }
+
+    // ── OpTree::output_columns tests ────────────────────────────────
+
+    #[test]
+    fn test_output_columns_scan() {
+        let tree = scan_node("t", 1, &["id", "name", "value"]);
+        assert_eq!(tree.output_columns(), vec!["id", "name", "value"]);
+    }
+
+    #[test]
+    fn test_output_columns_project() {
+        let tree = OpTree::Project {
+            expressions: vec![col("x"), col("y")],
+            aliases: vec!["a".to_string(), "b".to_string()],
+            child: Box::new(scan_node("t", 1, &["x", "y", "z"])),
+        };
+        assert_eq!(tree.output_columns(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_output_columns_filter_passthrough() {
+        let tree = OpTree::Filter {
+            predicate: Expr::Literal("x > 0".to_string()),
+            child: Box::new(scan_node("t", 1, &["x", "y"])),
+        };
+        assert_eq!(tree.output_columns(), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn test_output_columns_inner_join() {
+        let tree = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".to_string()),
+            left: Box::new(scan_node("a", 1, &["id", "val"])),
+            right: Box::new(scan_node("b", 2, &["ref_id"])),
+        };
+        assert_eq!(tree.output_columns(), vec!["id", "val", "ref_id"]);
+    }
+
+    #[test]
+    fn test_output_columns_aggregate() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![col("dept")],
+            aggregates: vec![AggExpr {
+                function: AggFunc::Count,
+                argument: None,
+                alias: "cnt".to_string(),
+                is_distinct: false,
+                second_arg: None,
+                filter: None,
+                order_within_group: None,
+            }],
+            child: Box::new(scan_node("t", 1, &["dept", "salary"])),
+        };
+        assert_eq!(tree.output_columns(), vec!["dept", "cnt"]);
+    }
+
+    #[test]
+    fn test_output_columns_distinct() {
+        let tree = OpTree::Distinct {
+            child: Box::new(scan_node("t", 1, &["a", "b"])),
+        };
+        assert_eq!(tree.output_columns(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_output_columns_union_all() {
+        let tree = OpTree::UnionAll {
+            children: vec![
+                scan_node("a", 1, &["x", "y"]),
+                scan_node("b", 2, &["x", "y"]),
+            ],
+        };
+        assert_eq!(tree.output_columns(), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn test_output_columns_semi_join_left_only() {
+        let tree = OpTree::SemiJoin {
+            condition: Expr::Literal("TRUE".to_string()),
+            left: Box::new(scan_node("o", 1, &["id", "amount"])),
+            right: Box::new(scan_node("i", 2, &["order_id"])),
+        };
+        assert_eq!(tree.output_columns(), vec!["id", "amount"]);
+    }
+
+    // ── OpTree::source_oids tests ───────────────────────────────────
+
+    #[test]
+    fn test_source_oids_single_scan() {
+        let tree = scan_node("t", 42, &["id"]);
+        assert_eq!(tree.source_oids(), vec![42]);
+    }
+
+    #[test]
+    fn test_source_oids_join() {
+        let tree = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".to_string()),
+            left: Box::new(scan_node("a", 10, &["id"])),
+            right: Box::new(scan_node("b", 20, &["id"])),
+        };
+        assert_eq!(tree.source_oids(), vec![10, 20]);
+    }
+
+    #[test]
+    fn test_source_oids_filter_passthrough() {
+        let tree = OpTree::Filter {
+            predicate: Expr::Literal("x > 0".to_string()),
+            child: Box::new(scan_node("t", 99, &["x"])),
+        };
+        assert_eq!(tree.source_oids(), vec![99]);
+    }
+
+    #[test]
+    fn test_source_oids_recursive_self_ref_empty() {
+        let tree = OpTree::RecursiveSelfRef {
+            cte_name: "tree".to_string(),
+            alias: "t".to_string(),
+            columns: vec!["id".to_string()],
+        };
+        assert_eq!(tree.source_oids(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_source_oids_cte_scan_empty() {
+        let tree = OpTree::CteScan {
+            cte_id: 0,
+            cte_name: "cte1".to_string(),
+            alias: "c".to_string(),
+            columns: vec!["id".to_string()],
+            cte_def_aliases: vec![],
+            column_aliases: vec![],
+        };
+        assert_eq!(tree.source_oids(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn test_source_oids_union_all() {
+        let tree = OpTree::UnionAll {
+            children: vec![
+                scan_node("a", 5, &["id"]),
+                scan_node("b", 10, &["id"]),
+                scan_node("c", 15, &["id"]),
+            ],
+        };
+        assert_eq!(tree.source_oids(), vec![5, 10, 15]);
+    }
+
+    // ── split_and_predicates / join_and_predicates tests ────────────
+
+    #[test]
+    fn test_split_and_single_predicate() {
+        let expr = Expr::Literal("x > 0".to_string());
+        let parts = split_and_predicates(expr);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].to_sql(), "x > 0");
+    }
+
+    #[test]
+    fn test_split_and_flat_and() {
+        let expr = Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(Expr::Literal("a".to_string())),
+            right: Box::new(Expr::Literal("b".to_string())),
+        };
+        let parts = split_and_predicates(expr);
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn test_split_and_nested_and() {
+        let expr = Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(Expr::BinaryOp {
+                op: "AND".to_string(),
+                left: Box::new(Expr::Literal("a".to_string())),
+                right: Box::new(Expr::Literal("b".to_string())),
+            }),
+            right: Box::new(Expr::Literal("c".to_string())),
+        };
+        let parts = split_and_predicates(expr);
+        assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn test_split_and_non_and_operator_not_split() {
+        let expr = Expr::BinaryOp {
+            op: "OR".to_string(),
+            left: Box::new(Expr::Literal("a".to_string())),
+            right: Box::new(Expr::Literal("b".to_string())),
+        };
+        let parts = split_and_predicates(expr);
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn test_join_and_predicates_single() {
+        let parts = vec![Expr::Literal("a".to_string())];
+        let result = join_and_predicates(parts);
+        assert_eq!(result.to_sql(), "a");
+    }
+
+    #[test]
+    fn test_join_and_predicates_multiple() {
+        let parts = vec![
+            Expr::Literal("a".to_string()),
+            Expr::Literal("b".to_string()),
+            Expr::Literal("c".to_string()),
+        ];
+        let result = join_and_predicates(parts);
+        // Should produce ((a AND b) AND c)
+        assert_eq!(result.to_sql(), "((a AND b) AND c)");
+    }
+
+    #[test]
+    fn test_split_and_roundtrip() {
+        // Split then join should produce equivalent expression
+        let expr = Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(Expr::Literal("x > 0".to_string())),
+            right: Box::new(Expr::Literal("y < 10".to_string())),
+        };
+        let parts = split_and_predicates(expr);
+        assert_eq!(parts.len(), 2);
+        let rejoined = join_and_predicates(parts);
+        assert_eq!(rejoined.to_sql(), "(x > 0 AND y < 10)");
+    }
+
+    // ── AggFunc::is_group_rescan tests ──────────────────────────────
+
+    #[test]
+    fn test_agg_group_rescan_sum_is_algebraic() {
+        assert!(!AggFunc::Sum.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_count_is_algebraic() {
+        assert!(!AggFunc::Count.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_min_is_algebraic() {
+        assert!(!AggFunc::Min.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_max_is_algebraic() {
+        assert!(!AggFunc::Max.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_avg_needs_rescan() {
+        assert!(AggFunc::Avg.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_string_agg_needs_rescan() {
+        assert!(AggFunc::StringAgg.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_bool_and_needs_rescan() {
+        assert!(AggFunc::BoolAnd.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_array_agg_needs_rescan() {
+        assert!(AggFunc::ArrayAgg.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_stddev_pop_needs_rescan() {
+        assert!(AggFunc::StddevPop.is_group_rescan());
+    }
+
+    #[test]
+    fn test_agg_group_rescan_mode_needs_rescan() {
+        assert!(AggFunc::Mode.is_group_rescan());
+    }
+
+    // ── collect_volatilities expanded tests ──────────────────────────
+
+    #[test]
+    fn test_collect_volatilities_coalesce_skips_lookup() {
+        // COALESCE is a parser construct (immutable), should not trigger
+        // function volatility lookup. With immutable args, worst stays 'i'.
+        let expr = Expr::FuncCall {
+            func_name: "COALESCE".to_string(),
+            args: vec![col("x"), Expr::Literal("0".to_string())],
+        };
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
+    }
+
+    #[test]
+    fn test_collect_volatilities_nullif_skips_lookup() {
+        let expr = Expr::FuncCall {
+            func_name: "NULLIF".to_string(),
+            args: vec![col("x"), Expr::Literal("0".to_string())],
+        };
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
+    }
+
+    #[test]
+    fn test_collect_volatilities_greatest_least_skip_lookup() {
+        for name in &["GREATEST", "LEAST"] {
+            let expr = Expr::FuncCall {
+                func_name: name.to_string(),
+                args: vec![col("a"), col("b")],
+            };
+            let mut worst = 'i';
+            collect_volatilities(&expr, &mut worst).unwrap();
+            assert_eq!(worst, 'i', "{name} should skip function lookup");
+        }
+    }
+
+    #[test]
+    fn test_collect_volatilities_normal_func_is_volatile() {
+        // Non-builtin function → lookup stub returns 'v'
+        let expr = Expr::FuncCall {
+            func_name: "random".to_string(),
+            args: vec![],
+        };
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
+        assert_eq!(worst, 'v');
+    }
+
+    #[test]
+    fn test_collect_volatilities_coalesce_with_volatile_arg() {
+        // COALESCE itself is immutable but its args may be volatile
+        let expr = Expr::FuncCall {
+            func_name: "COALESCE".to_string(),
+            args: vec![
+                Expr::FuncCall {
+                    func_name: "random".to_string(),
+                    args: vec![],
+                },
+                Expr::Literal("0".to_string()),
+            ],
+        };
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
+        // random() → volatile via test stub
+        assert_eq!(worst, 'v');
+    }
+
+    #[test]
+    fn test_collect_volatilities_column_ref_stays_immutable() {
+        let expr = col("x");
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
+    }
+
+    #[test]
+    fn test_collect_volatilities_star_stays_immutable() {
+        let expr = Expr::Star { table_alias: None };
+        let mut worst = 'i';
+        collect_volatilities(&expr, &mut worst).unwrap();
+        assert_eq!(worst, 'i');
+    }
 }

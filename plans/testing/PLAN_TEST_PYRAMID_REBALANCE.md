@@ -22,9 +22,9 @@ level.
 | P2-E — Alert payloads | **Done** | 4 | Extracted `build_alert_payload` |
 | P2-F — CDC column lists | **Done** | 4 | Extracted `build_typed_col_defs` |
 | P3 — Light-E2E tier | Not started | — | Harness + migration |
-| P4 — Validation tests to unit | Not started | — | Factor validation into pure fns |
+| P4 — Validation tests to unit | **Done** | 55 | Revised scope (see below) |
 
-**Total new unit tests: 69** (1,040 → 1,109)
+**Total new unit tests: 124** (1,040 → 1,164)
 
 ### What Remains (prioritized)
 
@@ -33,14 +33,31 @@ level.
    ~580 E2E tests that don't need `shared_preload_libraries`. Add
    `just test-light-e2e` target and CI job.
 
-2. **P4 — Promote validation tests to unit level** (~2-3 hrs): Factor
-   LIMIT/OFFSET rejection, FOR UPDATE rejection, self-reference detection,
-   TABLESAMPLE rejection, volatile function detection, and recursive CTE
-   depth guard into pure `validate_*()` functions with unit tests.
-
-3. **P2-A4 — IVM trigger name generation** (optional): Extract
+2. **P2-A4 — IVM trigger name generation** (optional): Extract
    `ivm_trigger_names()` struct from `setup_ivm_triggers` for cleaner code.
    Low priority since the trigger names are simple format strings.
+
+### P4 Scope Revision
+
+The original P4 plan assumed LIMIT/OFFSET, FOR UPDATE, TABLESAMPLE, and
+self-reference validation could be factored into pure `validate_*()` functions.
+Investigation revealed these checks all call `raw_parser()` (PostgreSQL's C
+parser via FFI) and **cannot be unit-tested without a DB backend**. They belong
+in the Light-E2E tier (P3), not P4.
+
+Instead, P4 was redirected to test **existing pure functions** that lacked
+coverage — parser helpers, OpTree methods, and expression utilities:
+
+| Sub-phase | Function | Tests |
+|-----------|----------|------:|
+| P4-A | `strip_order_by_and_limit()` | 7 |
+| P4-B | `Expr::output_name()` | 5 |
+| P4-C | `unwrap_transparent()` | 5 |
+| P4-D | `OpTree::output_columns()` (8 variants) | 8 |
+| P4-E | `OpTree::source_oids()` (6 variants) | 6 |
+| P4-F | `split_and_predicates()` / `join_and_predicates()` | 7 |
+| P4-G | `AggFunc::is_group_rescan()` | 10 |
+| P4-H | `collect_volatilities()` expanded (COALESCE et al.) | 7 |
 
 ---
 
@@ -470,10 +487,10 @@ For each validation check currently tested only by E2E:
 
 | Tier | Tests | Share | Runs on PR? |
 |------|------:|------:|:-----------:|
-| Unit | ~1,150 | 63% | Yes |
+| Unit | ~1,164 | 63% | Yes |
 | Property | 27 | 1% | Yes |
 | Integration | 81 | 4% | Yes |
-| Light E2E | ~580 | 32% | **Yes** |
+| Light E2E | ~580 | 31% | **Yes** |
 | Full E2E | ~51 | 3% | No (main + daily) |
 
 All tests except 51 (3%) will run on every PR.
@@ -482,8 +499,8 @@ All tests except 51 (3%) will run on every PR.
 
 ## Verification Criteria
 
-- [ ] `just test-unit` passes with the new unit tests (Phases 1-2, 4)
-- [ ] `just lint` passes with zero warnings after all extractions
+- [x] `just test-unit` passes with the new unit tests (Phases 1-2, 4)
+- [x] `just lint` passes with zero warnings after all extractions
 - [ ] No E2E test is deleted — only duplicated to unit level or migrated to
       light-E2E tier
 - [ ] Light-E2E harness works with `cargo pgrx package` artifacts
