@@ -12,7 +12,11 @@ pub static PGS_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 pub static PGS_SCHEDULER_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(1000);
 
 /// Minimum allowed schedule in seconds.
-pub static PGS_MIN_SCHEDULE_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(60);
+pub static PGS_MIN_SCHEDULE_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(1);
+
+/// Default effective schedule (in seconds) for isolated CALCULATED stream tables
+/// that have no downstream dependents.
+pub static PGS_DEFAULT_SCHEDULE_SECONDS: GucSetting<i32> = GucSetting::<i32>::new(1);
 
 /// Maximum consecutive errors before auto-suspending a stream table.
 pub static PGS_MAX_CONSECUTIVE_ERRORS: GucSetting<i32> = GucSetting::<i32>::new(3);
@@ -113,29 +117,6 @@ pub static PGS_BLOCK_SOURCE_DDL: GucSetting<bool> = GucSetting::<bool>::new(fals
 /// both high-throughput workloads (raise) and small tables (lower).
 pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 
-/// Default diamond consistency mode for newly created stream tables.
-///
-/// - `"atomic"` (default): All members of a diamond's consistency group are
-///   wrapped in a single SAVEPOINT; if any member fails the entire group
-///   rolls back. This prevents inconsistent partial refreshes.
-/// - `"none"`: No atomic grouping — each ST refreshes independently.
-///
-/// EC-13: Changed default from `"none"` to `"atomic"` because silent
-/// inconsistency in diamond topologies is a more dangerous failure mode
-/// than the minor performance overhead of SAVEPOINT grouping.
-pub static PGS_DIAMOND_CONSISTENCY: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"atomic"));
-
-/// Default diamond schedule policy for atomic consistency groups.
-///
-/// - `"fastest"` (default): The group fires when *any* member is due.
-/// - `"slowest"`: The group fires only when *all* members are due.
-///
-/// Per-convergence-node values override the GUC.  When multiple convergence
-/// nodes exist (nested diamonds), the strictest policy wins.
-pub static PGS_DIAMOND_SCHEDULE_POLICY: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"fastest"));
-
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -163,6 +144,19 @@ pub fn register_gucs() {
         c"Minimum allowed schedule in seconds.",
         c"Stream tables cannot specify a schedule smaller than this value.",
         &PGS_MIN_SCHEDULE_SECONDS,
+        1,      // min
+        86_400, // max (1 day)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.default_schedule_seconds",
+        c"Default effective schedule (seconds) for isolated CALCULATED stream tables.",
+        c"When a CALCULATED stream table has no downstream dependents, this value \
+           is used as its effective refresh interval. Distinct from min_schedule_seconds \
+           which is the validation floor for duration-based schedules.",
+        &PGS_DEFAULT_SCHEDULE_SECONDS,
         1,      // min
         86_400, // max (1 day)
         GucContext::Suset,
@@ -310,29 +304,6 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
-
-    GucRegistry::define_string_guc(
-        c"pg_trickle.diamond_consistency",
-        c"Default diamond consistency mode: none or atomic.",
-        c"'none' (default) refreshes each ST independently. \
-           'atomic' wraps diamond consistency groups in a SAVEPOINT so all members \
-           succeed or fail together.",
-        &PGS_DIAMOND_CONSISTENCY,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-
-    GucRegistry::define_string_guc(
-        c"pg_trickle.diamond_schedule_policy",
-        c"Default schedule policy for atomic diamond groups: fastest or slowest.",
-        c"'fastest' (default) fires the group when any member is due. \
-           'slowest' fires only when all members are due. \
-           Per-convergence-node values override the GUC. Only meaningful with \
-           diamond_consistency = 'atomic'.",
-        &PGS_DIAMOND_SCHEDULE_POLICY,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -350,6 +321,12 @@ pub fn pg_trickle_scheduler_interval_ms() -> i32 {
 /// Returns the minimum schedule in seconds.
 pub fn pg_trickle_min_schedule_seconds() -> i32 {
     PGS_MIN_SCHEDULE_SECONDS.get()
+}
+
+/// Returns the default effective schedule (in seconds) for isolated CALCULATED
+/// stream tables that have no downstream dependents.
+pub fn pg_trickle_default_schedule_seconds() -> i32 {
+    PGS_DEFAULT_SCHEDULE_SECONDS.get()
 }
 
 /// Returns the max consecutive errors before auto-suspend.
@@ -424,24 +401,4 @@ pub fn pg_trickle_block_source_ddl() -> bool {
 /// Returns the buffer alert threshold (row count).
 pub fn pg_trickle_buffer_alert_threshold() -> i64 {
     PGS_BUFFER_ALERT_THRESHOLD.get() as i64
-}
-
-/// Returns the default diamond consistency mode: `"none"` or `"atomic"`.
-pub fn pg_trickle_diamond_consistency() -> String {
-    PGS_DIAMOND_CONSISTENCY
-        .get()
-        .map(|cs| cs.to_str().unwrap_or("atomic").to_string())
-        .unwrap_or_else(|| "atomic".to_string())
-}
-
-/// Returns the default diamond schedule policy as a `DiamondSchedulePolicy`.
-pub fn pg_trickle_diamond_schedule_policy() -> crate::dag::DiamondSchedulePolicy {
-    PGS_DIAMOND_SCHEDULE_POLICY
-        .get()
-        .and_then(|cs| {
-            cs.to_str()
-                .ok()
-                .and_then(crate::dag::DiamondSchedulePolicy::from_sql_str)
-        })
-        .unwrap_or_default()
 }

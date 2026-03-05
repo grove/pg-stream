@@ -4,6 +4,68 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
 
 ---
 
+## Table of Contents
+
+- [Functions](#functions)
+  - [pgtrickle.create\_stream\_table](#pgtricklecreate_stream_table)
+  - [pgtrickle.alter\_stream\_table](#pgtricklealter_stream_table)
+  - [pgtrickle.drop\_stream\_table](#pgtrickledrop_stream_table)
+  - [pgtrickle.resume\_stream\_table](#pgtrickleresume_stream_table)
+  - [pgtrickle.refresh\_stream\_table](#pgtricklerefresh_stream_table)
+  - [pgtrickle.pgt\_status](#pgtricklepgt_status)
+  - [pgtrickle.st\_refresh\_stats](#pgtricklest_refresh_stats)
+  - [pgtrickle.get\_refresh\_history](#pgtrickleget_refresh_history)
+  - [pgtrickle.get\_staleness](#pgtrickleget_staleness)
+  - [pgtrickle.slot\_health](#pgtrickleslot_health)
+  - [pgtrickle.check\_cdc\_health](#pgtricklecheck_cdc_health)
+  - [pgtrickle.diamond\_groups](#pgtricklediamond_groups)
+  - [pgtrickle.explain\_st](#pgtrickleexplain_st)
+  - [pgtrickle.change\_buffer\_sizes](#pgtricklechange_buffer_sizes)
+  - [pgtrickle.list\_sources](#pgtricklelist_sources)
+  - [pgtrickle.health\_check](#pgtricklehealth_check)
+  - [pgtrickle.refresh\_timeline](#pgtricklerefresh_timeline)
+  - [pgtrickle.trigger\_inventory](#pgtrickletrigger_inventory)
+  - [pgtrickle.dependency\_tree](#pgtrickledependency_tree)
+  - [pgtrickle.pg\_trickle\_hash](#pgtricklepg_trickle_hash)
+  - [pgtrickle.pg\_trickle\_hash\_multi](#pgtricklepg_trickle_hash_multi)
+- [Expression Support](#expression-support)
+  - [Conditional Expressions](#conditional-expressions)
+  - [Comparison Operators](#comparison-operators)
+  - [Boolean Tests](#boolean-tests)
+  - [SQL Value Functions](#sql-value-functions)
+  - [Array and Row Expressions](#array-and-row-expressions)
+  - [Subquery Expressions](#subquery-expressions)
+  - [Auto-Rewrite Pipeline](#auto-rewrite-pipeline)
+  - [HAVING Clause](#having-clause)
+  - [Tables Without Primary Keys (Keyless Tables)](#tables-without-primary-keys-keyless-tables)
+  - [Volatile Function Detection](#volatile-function-detection)
+  - [COLLATE Expressions](#collate-expressions)
+  - [IS JSON Predicate (PostgreSQL 16+)](#is-json-predicate-postgresql-16)
+  - [SQL/JSON Constructors (PostgreSQL 16+)](#sqljson-constructors-postgresql-16)
+  - [JSON\_TABLE (PostgreSQL 17+)](#json_table-postgresql-17)
+  - [Unsupported Expression Types](#unsupported-expression-types)
+- [Restrictions & Interoperability](#restrictions--interoperability)
+  - [Referencing Other Stream Tables](#referencing-other-stream-tables)
+  - [Views as Sources in Defining Queries](#views-as-sources-in-defining-queries)
+  - [Partitioned Tables as Sources](#partitioned-tables-as-sources)
+  - [IMMEDIATE Mode Query Restrictions](#immediate-mode-query-restrictions)
+  - [Logical Replication Targets](#logical-replication-targets)
+  - [Views on Stream Tables](#views-on-stream-tables)
+  - [Materialized Views on Stream Tables](#materialized-views-on-stream-tables)
+  - [Logical Replication of Stream Tables](#logical-replication-of-stream-tables)
+  - [Known Delta Computation Limitations](#known-delta-computation-limitations)
+  - [What Is NOT Allowed](#what-is-not-allowed)
+- [Views](#views)
+  - [pgtrickle.stream\_tables\_info](#pgtricklestream_tables_info)
+  - [pgtrickle.pg\_stat\_stream\_tables](#pgtricklepg_stat_stream_tables)
+- [Catalog Tables](#catalog-tables)
+  - [pgtrickle.pgt\_stream\_tables](#pgtricklepgt_stream_tables)
+  - [pgtrickle.pgt\_dependencies](#pgtricklepgt_dependencies)
+  - [pgtrickle.pgt\_refresh\_history](#pgtricklepgt_refresh_history)
+  - [pgtrickle.pgt\_change\_tracking](#pgtricklepgt_change_tracking)
+
+---
+
 ## Functions
 
 ### pgtrickle.create_stream_table
@@ -14,7 +76,7 @@ Create a new stream table.
 pgtrickle.create_stream_table(
     name                  text,
     query                 text,
-    schedule              text      DEFAULT '1m',
+    schedule              text      DEFAULT 'calculated',
     refresh_mode          text      DEFAULT 'DIFFERENTIAL',
     initialize            bool      DEFAULT true,
     diamond_consistency   text      DEFAULT NULL,
@@ -28,11 +90,11 @@ pgtrickle.create_stream_table(
 |---|---|---|---|
 | `name` | `text` | — | Name of the stream table. May be schema-qualified (`myschema.my_st`). Defaults to `public` schema. |
 | `query` | `text` | — | The defining SQL query. Must be a valid SELECT statement using supported operators. |
-| `schedule` | `text` | `'1m'` | Refresh schedule as a Prometheus/GNU-style duration string (e.g., `'30s'`, `'5m'`, `'1h'`, `'1h30m'`, `'1d'`) **or** a cron expression (e.g., `'*/5 * * * *'`, `'@hourly'`). Set to `NULL` for CALCULATED mode (inherits schedule from downstream dependents) or IMMEDIATE mode (no scheduling needed). |
+| `schedule` | `text` | `'calculated'` | Refresh schedule as a Prometheus/GNU-style duration string (e.g., `'30s'`, `'5m'`, `'1h'`, `'1h30m'`, `'1d'`) **or** a cron expression (e.g., `'*/5 * * * *'`, `'@hourly'`). Use `'calculated'` for CALCULATED mode (inherits schedule from downstream dependents). |
 | `refresh_mode` | `text` | `'DIFFERENTIAL'` | `'FULL'` (truncate and reload), `'DIFFERENTIAL'` (apply delta only), or `'IMMEDIATE'` (synchronous in-transaction maintenance via statement-level triggers). |
 | `initialize` | `bool` | `true` | If `true`, populates the table immediately via a full refresh. If `false`, creates the table empty. |
-| `diamond_consistency` | `text` | `NULL` (GUC default) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). When `NULL`, inherits from the `pg_trickle.diamond_consistency` GUC. See [CONFIGURATION.md](CONFIGURATION.md). |
-| `diamond_schedule_policy` | `text` | `NULL` (GUC default) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. When `NULL`, inherits from the `pg_trickle.diamond_schedule_policy` GUC. |
+| `diamond_consistency` | `text` | `NULL` (defaults to `'none'`) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). |
+| `diamond_schedule_policy` | `text` | `NULL` (defaults to `'fastest'`) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. |
 
 **Duration format:**
 
@@ -576,7 +638,7 @@ pgtrickle.alter_stream_table(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `name` | `text` | — | Name of the stream table (schema-qualified or unqualified). |
-| `schedule` | `text` | `NULL` | New schedule as a duration string (e.g., `'5m'`). Pass `NULL` to leave unchanged. |
+| `schedule` | `text` | `NULL` | New schedule as a duration string (e.g., `'5m'`). Pass `NULL` to leave unchanged. Pass `'calculated'` to switch to CALCULATED mode. |
 | `refresh_mode` | `text` | `NULL` | New refresh mode (`'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`). Pass `NULL` to leave unchanged. Switching to/from `'IMMEDIATE'` migrates trigger infrastructure (IVM triggers ↔ CDC triggers), clears or restores the schedule, and runs a full refresh. |
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
 | `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |

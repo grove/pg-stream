@@ -392,7 +392,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             // Step A: Check if DAG needs rebuild
             let current_version = shmem::current_dag_version();
             if current_version != dag_version || dag.is_none() {
-                match StDag::build_from_catalog(config::pg_trickle_min_schedule_seconds()) {
+                match StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds()) {
                     Ok(new_dag) => {
                         dag = Some(new_dag);
                         dag_version = current_version;
@@ -691,14 +691,12 @@ fn current_epoch_ms() -> u64 {
 /// Resolve the effective schedule policy for a consistency group.
 ///
 /// Reads the `diamond_schedule_policy` from each convergence node in the group
-/// and returns the strictest (`Slowest > Fastest`). Falls back to the
-/// `pg_trickle.diamond_schedule_policy` GUC.
+/// and returns the strictest (`Slowest > Fastest`). Falls back to `'fastest'`.
 fn group_schedule_policy(group: &crate::dag::ConsistencyGroup) -> DiamondSchedulePolicy {
-    let guc_default = config::pg_trickle_diamond_schedule_policy();
     group
         .convergence_points
         .iter()
-        .fold(guc_default, |acc, node| {
+        .fold(DiamondSchedulePolicy::Fastest, |acc, node| {
             if let NodeId::StreamTable(id) = node {
                 load_st_by_id(*id)
                     .map(|st| acc.stricter(st.diamond_schedule_policy))

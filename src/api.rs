@@ -23,16 +23,16 @@ use crate::wal_decoder;
 /// # Arguments
 /// - `name`: Schema-qualified name (`'schema.table'`) or unqualified (`'table'`).
 /// - `query`: The defining SELECT query.
-/// - `schedule`: Desired maximum schedule. `NULL` for CALCULATED.
+/// - `schedule`: Desired maximum schedule. `'calculated'` for CALCULATED mode (inherits schedule from downstream dependents).
 /// - `refresh_mode`: `'FULL'` or `'DIFFERENTIAL'`.
 /// - `initialize`: Whether to populate the table immediately.
-/// - `diamond_consistency`: `'none'` (default = GUC) or `'atomic'`.
-/// - `diamond_schedule_policy`: `'fastest'` (default = GUC) or `'slowest'`.
+/// - `diamond_consistency`: `'none'` (default) or `'atomic'`.
+/// - `diamond_schedule_policy`: `'fastest'` (default) or `'slowest'`.
 #[pg_extern(schema = "pgtrickle")]
 fn create_stream_table(
     name: &str,
     query: &str,
-    schedule: default!(Option<&str>, "'1m'"),
+    schedule: default!(Option<&str>, "'calculated'"),
     refresh_mode: default!(&str, "'DIFFERENTIAL'"),
     initialize: default!(bool, true),
     diamond_consistency: default!(Option<&str>, "NULL"),
@@ -63,7 +63,7 @@ fn create_stream_table_impl(
 ) -> Result<(), PgTrickleError> {
     let refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
 
-    // Parse diamond consistency — use GUC default when not specified
+    // Parse diamond consistency — default to 'none' when not specified
     let dc = match diamond_consistency {
         Some(s) => {
             let val = s.to_lowercase();
@@ -77,10 +77,10 @@ fn create_stream_table_impl(
                 }
             }
         }
-        None => DiamondConsistency::from_sql_str(&config::pg_trickle_diamond_consistency()),
+        None => DiamondConsistency::Atomic,
     };
 
-    // Parse diamond schedule policy — use GUC default when not specified
+    // Parse diamond schedule policy — default to 'fastest' when not specified
     let dsp = match diamond_schedule_policy {
         Some(s) => match DiamondSchedulePolicy::from_sql_str(s) {
             Some(p) => p,
@@ -91,7 +91,7 @@ fn create_stream_table_impl(
                 )));
             }
         },
-        None => config::pg_trickle_diamond_schedule_policy(),
+        None => DiamondSchedulePolicy::Fastest,
     };
 
     // Parse schema.name
@@ -105,11 +105,16 @@ fn create_stream_table_impl(
         None
     } else {
         match schedule {
+            Some(s) if s.trim().eq_ignore_ascii_case("calculated") => None,
             Some(s) => {
                 let _schedule = parse_schedule(s)?;
                 Some(s.trim().to_string())
             }
-            None => None,
+            None => {
+                return Err(PgTrickleError::InvalidArgument(
+                    "use 'calculated' instead of NULL to set CALCULATED schedule".to_string(),
+                ));
+            }
         }
     };
 
@@ -605,13 +610,22 @@ fn alter_stream_table_impl(
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 
     if let Some(val) = schedule {
-        let _schedule = parse_schedule(val)?;
-        let trimmed = val.trim();
-        Spi::run_with_args(
-            "UPDATE pgtrickle.pgt_stream_tables SET schedule = $1, updated_at = now() WHERE pgt_id = $2",
-            &[trimmed.into(), st.pgt_id.into()],
-        )
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        if val.trim().eq_ignore_ascii_case("calculated") {
+            // Switch to CALCULATED mode (NULL schedule in catalog)
+            Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_stream_tables SET schedule = NULL, updated_at = now() WHERE pgt_id = $1",
+                &[st.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        } else {
+            let _schedule = parse_schedule(val)?;
+            let trimmed = val.trim();
+            Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_stream_tables SET schedule = $1, updated_at = now() WHERE pgt_id = $2",
+                &[trimmed.into(), st.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
     }
 
     if let Some(mode_str) = refresh_mode {
@@ -1318,7 +1332,7 @@ fn diamond_groups() -> TableIterator<
     ),
 > {
     let rows: Vec<_> = Spi::connect(|_client| {
-        let dag = match StDag::build_from_catalog(config::pg_trickle_min_schedule_seconds()) {
+        let dag = match StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds()) {
             Ok(d) => d,
             Err(e) => {
                 pgrx::warning!("diamond_groups: failed to build DAG: {}", e);
@@ -1340,22 +1354,20 @@ fn diamond_groups() -> TableIterator<
                 group.convergence_points.iter().collect();
 
             // Compute effective schedule policy for the group.
-            let guc_default = config::pg_trickle_diamond_schedule_policy();
-            let effective_policy =
-                group
-                    .convergence_points
-                    .iter()
-                    .fold(guc_default, |acc, node| {
-                        if let NodeId::StreamTable(id) = node {
-                            StreamTableMeta::get_all_active()
-                                .ok()
-                                .and_then(|sts| sts.into_iter().find(|s| s.pgt_id == *id))
-                                .map(|st| acc.stricter(st.diamond_schedule_policy))
-                                .unwrap_or(acc)
-                        } else {
-                            acc
-                        }
-                    });
+            let effective_policy = group.convergence_points.iter().fold(
+                DiamondSchedulePolicy::Fastest,
+                |acc, node| {
+                    if let NodeId::StreamTable(id) = node {
+                        StreamTableMeta::get_all_active()
+                            .ok()
+                            .and_then(|sts| sts.into_iter().find(|s| s.pgt_id == *id))
+                            .map(|st| acc.stricter(st.diamond_schedule_policy))
+                            .unwrap_or(acc)
+                    } else {
+                        acc
+                    }
+                },
+            );
 
             for member in &group.members {
                 if let NodeId::StreamTable(pgt_id) = member {
@@ -2244,7 +2256,7 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgTri
     }
 
     // Build the DAG from catalog and add proposed edges
-    let mut dag = StDag::build_from_catalog(config::pg_trickle_min_schedule_seconds())?;
+    let mut dag = StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds())?;
 
     // Create a temporary node for the proposed ST (use a sentinel pgt_id)
     let proposed_id = NodeId::StreamTable(i64::MAX);
