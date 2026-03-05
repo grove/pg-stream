@@ -7,7 +7,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [0.2.1] — 2025-06-18
+## [0.2.1] — 2026-03-05
 
 ### Added
 
@@ -28,8 +28,16 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   - `just check-upgrade`, `just build-upgrade-image`, `just test-upgrade`
     convenience targets.
   - `docs/UPGRADING.md` user-facing upgrade guide.
-  - `sql/pg_trickle--0.2.0--0.2.1.sql` no-op migration script (no SQL
-    changes in this release).
+  - `sql/pg_trickle--0.2.0--0.2.1.sql` — three schema changes:
+    - `has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE` (EC-06): flag set
+      when any source table lacks a primary key; changes the row-id apply
+      strategy from MERGE to counted DELETE to handle duplicate rows safely.
+    - `function_hashes TEXT` (EC-16): stores the last-seen MD5 hash of each
+      function body referenced in the defining query; differential refreshes
+      detect silent `ALTER FUNCTION` body changes and force a full refresh.
+    - `topk_offset INT` (OS2 / EC-14): column pre-provisioned for the paged
+      TopK (`ORDER BY … LIMIT … OFFSET`) feature shipping in v0.2.2; always
+      NULL in this release, wired up in the next one.
 
 - **GitHub Pages book expansion** — Six new documentation pages across
   three new sections:

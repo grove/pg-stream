@@ -181,9 +181,15 @@ See [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md).
 
 **Status: Released (2026-03-05).**
 
-Patch release focused on upgrade safety and documentation. No SQL-level
-changes — the extension's function/view/trigger interface is identical to
-0.2.0.
+Patch release focused on upgrade safety, documentation, and three catalog
+schema additions via `sql/pg_trickle--0.2.0--0.2.1.sql`:
+
+- `has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE` — EC-06 keyless source
+  flag; changes apply strategy from MERGE to counted DELETE when set.
+- `function_hashes TEXT` — EC-16 function-body hash map; forces a full
+  refresh when a referenced function's body changes silently.
+- `topk_offset INT` — OS2 pre-provisioned column for paged TopK OFFSET
+  support (always NULL in this release; activated in v0.2.2).
 
 ### Upgrade Migration Infrastructure ✅
 
@@ -235,7 +241,7 @@ release validates E2E and adds the upgrade migration SQL.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | OS1 | Run `just build-e2e-image && just test-e2e` — validate all 8 new OFFSET tests | ~1h | [PLAN_OFFSET_SUPPORT.md](plans/sql/PLAN_OFFSET_SUPPORT.md) §Step 6 |
-| OS2 | `sql/pg_trickle--0.2.1--0.2.2.sql`: `ALTER TABLE pgtrickle.pgt_stream_tables ADD COLUMN topk_offset INT` | 30min | [PLAN_OFFSET_SUPPORT.md](plans/sql/PLAN_OFFSET_SUPPORT.md) §Step 2 |
+| OS2 | `sql/pg_trickle--0.2.1--0.2.2.sql`: no schema change needed — `topk_offset` column was pre-provisioned in 0.2.1; this migration only adds function/view updates if any | 30min | [PLAN_OFFSET_SUPPORT.md](plans/sql/PLAN_OFFSET_SUPPORT.md) §Step 2 |
 
 ### Upgrade Tooling
 
@@ -248,7 +254,7 @@ release validates E2E and adds the upgrade migration SQL.
 
 **Exit criteria:**
 - [ ] `ORDER BY + LIMIT + OFFSET` defining queries accepted, refreshed, and E2E-tested
-- [ ] `sql/pg_trickle--0.2.1--0.2.2.sql` covers `topk_offset` column
+- [ ] `sql/pg_trickle--0.2.1--0.2.2.sql` exists (column pre-provisioned in 0.2.1; only function/view updates if any)
 - [ ] Upgrade completeness check passes for 0.2.1→0.2.2
 - [ ] Version check fires at extension load if `.so`/SQL versions diverge
 

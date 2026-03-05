@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
                      CHECK (diamond_consistency IN ('none', 'atomic')),
     diamond_schedule_policy TEXT NOT NULL DEFAULT 'fastest'
                      CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
+    topk_offset     INT,
+    has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE,
+    function_hashes TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
