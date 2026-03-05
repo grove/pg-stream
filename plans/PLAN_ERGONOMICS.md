@@ -1,5 +1,25 @@
 # PLAN_ERGONOMICS — Developer & User Ergonomics Improvements
 
+## Status
+
+**All five tasks implemented** (2026-03-05). See git history for details.
+
+| Task | Status |
+|------|--------|
+| Task 1 — `'calculated'` keyword + default change | ✅ Done |
+| Task 2 — Lower `min_schedule_seconds` default to 1 | ✅ Done |
+| Task 3 — Add `default_schedule_seconds` GUC | ✅ Done |
+| Task 4 — Remove diamond GUCs | ✅ Done |
+| Task 5 — Add TOC to SQL_REFERENCE.md and CONFIGURATION.md | ✅ Done |
+
+### Remaining follow-up (not blocking)
+
+- E2E tests for `'calculated'` as schedule input (verify `NULL` input is rejected)
+- E2E test that `SHOW pg_trickle.diamond_consistency` returns an error
+- Update CHANGELOG.md with breaking behavioural changes (default schedule, NULL rejection)
+
+---
+
 ## Overview
 
 Five focused changes to make pg_trickle friendlier for new users while keeping

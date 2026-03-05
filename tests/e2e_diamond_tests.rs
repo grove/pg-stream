@@ -47,8 +47,8 @@ async fn setup_diamond(db: &E2eDb, dc: &str) {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-/// Verify that the `diamond_consistency` column defaults to the GUC value
-/// ('none') when not specified.
+/// Verify that the `diamond_consistency` column defaults to `'none'`
+/// when not specified.
 #[tokio::test]
 async fn test_diamond_consistency_default() {
     let db = E2eDb::new().await.with_extension().await;
@@ -260,7 +260,7 @@ async fn test_diamond_consistency_in_catalog_view() {
 
 // ── Diamond Schedule Policy Tests ──────────────────────────────────────
 
-/// Verify that the `diamond_schedule_policy` column defaults to 'fastest'
+/// Verify that the `diamond_schedule_policy` column defaults to `'fastest'`
 /// when not explicitly specified.
 #[tokio::test]
 async fn test_diamond_schedule_policy_default() {

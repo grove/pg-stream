@@ -4,9 +4,35 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 ---
 
+## Table of Contents
+
+- [Overview](#overview)
+- [GUC Variables](#guc-variables)
+  - [pg\_trickle.enabled](#pg_trickleenabled)
+  - [pg\_trickle.scheduler\_interval\_ms](#pg_tricklescheduler_interval_ms)
+  - [pg\_trickle.min\_schedule\_seconds](#pg_tricklemin_schedule_seconds)
+  - [pg\_trickle.default\_schedule\_seconds](#pg_trickledefault_schedule_seconds)
+  - [pg\_trickle.max\_consecutive\_errors](#pg_tricklemax_consecutive_errors)
+  - [pg\_trickle.change\_buffer\_schema](#pg_tricklechange_buffer_schema)
+  - [pg\_trickle.max\_concurrent\_refreshes](#pg_tricklemax_concurrent_refreshes)
+  - [pg\_trickle.differential\_max\_change\_ratio](#pg_trickledifferential_max_change_ratio)
+  - [pg\_trickle.cleanup\_use\_truncate](#pg_tricklecleanup_use_truncate)
+  - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints)
+  - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
+  - [pg\_trickle.use\_prepared\_statements](#pg_trickleuse_prepared_statements)
+  - [pg\_trickle.user\_triggers](#pg_trickleuser_triggers)
+  - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
+  - [pg\_trickle.cdc\_mode](#pg_tricklecdc_mode)
+  - [pg\_trickle.wal\_transition\_timeout](#pg_tricklewal_transition_timeout)
+- [Complete postgresql.conf Example](#complete-postgresqlconf-example)
+- [Runtime Configuration](#runtime-configuration)
+- [Further Reading](#further-reading)
+
+---
+
 ## Overview
 
-pg_trickle exposes fifteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_trickle exposes sixteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -77,7 +103,7 @@ Minimum allowed `schedule` value (in seconds) when creating or altering a stream
 | Property | Value |
 |---|---|
 | Type | `int` |
-| Default | `60` (1 minute) |
+| Default | `1` (1 second) |
 | Range | `1` – `86400` (1 second to 24 hours) |
 | Context | `SUSET` |
 | Restart Required | No |
@@ -85,12 +111,37 @@ Minimum allowed `schedule` value (in seconds) when creating or altering a stream
 This acts as a safety guardrail to prevent users from setting impractically small schedules that would cause excessive refresh overhead.
 
 **Tuning Guidance:**
-- **Development/testing**: Set to `1` for fast iteration.
-- **Production**: Keep at `60` or higher to prevent excessive WAL consumption and CPU usage.
+- **Development/testing**: Default `1` allows sub-second testing.
+- **Production**: Raise to `60` or higher to prevent excessive WAL consumption and CPU usage.
 
 ```sql
--- Allow 10-second schedules (for testing)
+-- Restrict to 10-second minimum schedules
 SET pg_trickle.min_schedule_seconds = 10;
+```
+
+---
+
+### pg_trickle.default_schedule_seconds
+
+Default effective schedule (in seconds) for isolated CALCULATED stream tables that have no downstream dependents.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `1` (1 second) |
+| Range | `1` – `86400` (1 second to 24 hours) |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When a CALCULATED stream table (scheduled with `'calculated'`) has no downstream dependents to derive a schedule from, this value is used as its effective refresh interval. This is distinct from `min_schedule_seconds`, which is the validation **floor** for duration-based schedules.
+
+**Tuning Guidance:**
+- **Development/testing**: Default `1` allows rapid iteration.
+- **Production standalone CALCULATED tables**: Raise to match your desired update cadence (e.g., `60` for once-per-minute).
+
+```sql
+-- Set default for isolated CALCULATED tables to 30 seconds
+SET pg_trickle.default_schedule_seconds = 30;
 ```
 
 ---
@@ -414,80 +465,6 @@ SET pg_trickle.wal_transition_timeout = 300;
 
 ---
 
-### pg_trickle.diamond_consistency
-
-Default diamond dependency consistency mode for new stream tables.
-
-When stream tables form diamond-shaped dependency graphs (e.g., A → B, A → C, B → D, C → D), the scheduler can group the intermediate STs (B, C) and the convergence node (D) into an atomic refresh group. In `atomic` mode, if any member of the group fails to refresh, all members are rolled back via `SAVEPOINT`, ensuring the convergence node never reads a mix of old and new data from its upstream sources.
-
-| Value | Description |
-|-------|-------------|
-| `'none'` | **(default)** Independent refresh — each ST is refreshed individually in topological order. A partial failure in a diamond may leave the convergence node reading mixed versions. |
-| `'atomic'` | Atomic group refresh — all members of a diamond group are wrapped in a SAVEPOINT. On any failure, the entire group is rolled back and retried together. |
-
-**Default:** `'none'`
-
-This GUC sets the default for new stream tables created without an explicit `diamond_consistency` parameter. Individual stream tables can override it via `create_stream_table(... diamond_consistency => 'atomic')` or `alter_stream_table(... diamond_consistency => 'atomic')`.
-
-```sql
--- Enable atomic diamond consistency globally
-SET pg_trickle.diamond_consistency = 'atomic';
-
--- Disable (default — independent refresh)
-SET pg_trickle.diamond_consistency = 'none';
-```
-
-> **Note:** Atomic mode only takes effect for stream tables that are part of a detected diamond group. Linear chains and standalone STs are unaffected.
-
----
-
-### pg_trickle.diamond_schedule_policy
-
-Default schedule policy for atomic diamond consistency groups.
-
-When `diamond_consistency = 'atomic'`, multiple stream tables in a diamond group are refreshed together. This GUC controls **when** the group fires:
-
-| Value | Description |
-|-------|-------------|
-| `'fastest'` | **(default)** Fire the group when **any** member is due for refresh. Maximizes freshness at the cost of more frequent refreshes. |
-| `'slowest'` | Fire the group only when **all** members are due. Reduces resource usage but allows more staleness. |
-
-**Default:** `'fastest'`
-
-Per-convergence-node values override this GUC. Set the policy on the convergence (fan-in) node via `create_stream_table(... diamond_schedule_policy => 'slowest')` or `alter_stream_table(... diamond_schedule_policy => 'slowest')`.
-
-When multiple convergence nodes exist (nested diamonds), the **strictest** policy wins (`slowest > fastest`).
-
-```sql
--- Set globally to slowest
-SET pg_trickle.diamond_schedule_policy = 'slowest';
-
--- Default (fastest)
-SET pg_trickle.diamond_schedule_policy = 'fastest';
-```
-
-#### Choosing a policy
-
-**Use `'fastest'` (default) when:**
-- Data freshness matters — the convergence node should reflect changes as soon as any upstream member has new data.
-- Your diamond members have similar schedules, so the cost difference between the two policies is small.
-- You are unsure which to pick. `'fastest'` matches the intuitive expectation of a streaming pipeline: "if anything changed, recompute now."
-
-**Use `'slowest'` when:**
-- All members of the diamond have meaningfully different schedules (e.g. B refreshes every 30 s, C every 10 min). With `'fastest'`, the group fires every 30 s even though C contributes stale data for most of those runs — largely wasted work.
-- The convergence node runs a heavy aggregation or join and the extra CPU/I/O cost of redundant refreshes outweighs the staleness penalty.
-- You are running a batch/analytical workload where freshness is secondary to throughput (e.g. TPC-H-style reporting).
-
-**Why `'fastest'` is the default:**  
-`pg_trickle` is a streaming/CDC-oriented extension. Users generally expect near-real-time results and are surprised when a convergence node lags because one slow member acts as a rate limiter for the whole group. `'slowest'` should be an explicit opt-in for cost-sensitive deployments, not something users stumble into by default.
-
-**Watch out for the "slowest member" effect with `'slowest'`:**  
-The effective refresh cadence of the convergence node becomes `min(all member schedules)`. A single rarely-scheduled intermediate ST silently degrades freshness for the entire output, which can be hard to diagnose without inspecting `pgtrickle.diamond_groups()`.
-
-> **Note:** This setting only takes effect when `diamond_consistency = 'atomic'`. In `'none'` mode each ST uses its own schedule independently.
-
----
-
 ## Complete postgresql.conf Example
 
 ```ini
@@ -497,7 +474,8 @@ shared_preload_libraries = 'pg_trickle'
 # Optional tuning
 pg_trickle.enabled = true
 pg_trickle.scheduler_interval_ms = 1000
-pg_trickle.min_schedule_seconds = 60
+pg_trickle.min_schedule_seconds = 1
+pg_trickle.default_schedule_seconds = 1
 pg_trickle.max_consecutive_errors = 3
 pg_trickle.change_buffer_schema = 'pgtrickle_changes'
 pg_trickle.max_concurrent_refreshes = 4   # reserved; no effect in v0.2.0
@@ -511,8 +489,6 @@ pg_trickle.user_triggers = 'auto'
 pg_trickle.block_source_ddl = false
 pg_trickle.cdc_mode = 'trigger'
 pg_trickle.wal_transition_timeout = 300
-pg_trickle.diamond_consistency = 'none'
-pg_trickle.diamond_schedule_policy = 'fastest'
 ```
 
 ---
