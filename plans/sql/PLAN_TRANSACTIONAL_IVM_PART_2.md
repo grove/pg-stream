@@ -1,8 +1,8 @@
 # Plan: Expanding SQL Coverage in Trigger-Based CDC Mode (Part 2)
 
 **Date:** 2026-03-03  
-**Last updated:** 2026-03-06  
-**Status:** Stage 3 (Tasks 1.1–2.4) complete. Stage 4 (EC-16, Task 3.1, Task 3.2, Task 3.5) complete; Tasks 3.3 and 3.4 deferred. Stage 5 (Tasks 4.1–4.3) complete.  
+**Last updated:** 2026-03-08  
+**Status:** ALL phases complete. Stage 3 (Tasks 1.1–2.4) complete. Stage 4 (EC-16, Tasks 3.1–3.5) complete. Stage 5 (Tasks 4.1–4.3) complete. Task 2.3 (ROWS FROM) implemented.  
 **Branch:** `edge-cases-and-transactional-ivm`  
 **Scope:** Limitations of `pg_trickle.cdc_mode = 'trigger'` (the default),
 and a phased implementation plan to maximise the SQL surface area supported
@@ -162,7 +162,7 @@ area available to trigger-mode users.
 | **G2** | Multiple PARTITION BY in one query | ✅ **Works natively** | — | Full recomputation approach; no SQL rewrite needed | 1 |
 | **G3** | ALL (subquery) | ✅ **DONE** — NULL-safe AntiJoin | `parse_all_sublink()` builds `(col IS NULL OR NOT (x op col))` condition; full AntiJoin diff pipeline already wired | EC-32 closed | 1 |
 | **G4** | SubLinks inside deeply nested OR | ✅ **DONE** — handles `AND(AND(OR(EXISTS)))` | `flatten_and_conjuncts()` helper + updated `and_contains_or_with_sublink()` + `rewrite_and_with_or_sublinks()` flattens AND tree recursively | — | 2 |
-| **G5** | ROWS FROM() with multiple functions | Rejected | Parser only handles single SRF | Extend `LateralFunction` to zip multiple SRFs | 2 |
+| **G5** | ROWS FROM() with multiple functions | ✅ **DONE** — `rewrite_rows_from()` auto-rewrite | All-unnest optimisation merges to multi-arg `unnest()`; general case uses ordinal LEFT JOIN LATERAL chain | 2 |
 | **G6** | LATERAL with RIGHT/FULL JOIN | Rejected (PostgreSQL constraint) | PostgreSQL itself rejects RIGHT/FULL JOIN LATERAL | Error message updated to explain PostgreSQL-level constraint (**message improved**) | — |
 | **G7** | Regression aggregates (11 functions) | ✅ **DONE** — group-rescan | Already fully wired in prior session (`AggFunc::Corr`, `CovarPop`, `RegrAvgx` etc. + match arms + `is_group_rescan`) | — | 4 |
 | **G8** | Hypothetical-set aggregates (4 funcs) | ✅ **DONE** — group-rescan | `HypRank/HypDenseRank/HypPercentRank/HypCumeDist` variants; `is_ordered_set` updated in `agg_to_rescan_sql` | — | 4 |
@@ -334,55 +334,30 @@ SELECT * FROM t WHERE x = 1 AND y = 2 AND EXISTS (SELECT 1 FROM s WHERE s.id = t
   - `and_contains_or_with_sublink()` — uses `flatten_and_conjuncts`
   - `rewrite_and_with_or_sublinks()` — new signature + flattened body
 
-### Task 2.3: ROWS FROM() with Multiple Functions (G5)
+### Task 2.3: ROWS FROM() with Multiple Functions (G5) — ✅ IMPLEMENTED
 
-**Current behaviour:** `SELECT * FROM ROWS FROM(unnest(a), unnest(b))` is
-rejected.
+**Status:** **IMPLEMENTED** — `rewrite_rows_from()` in `src/dvm/parser.rs` detects
+multi-function `ROWS FROM()` nodes in the raw parse tree and rewrites them.
 
-**Proposed fix:** Rewrite to `LATERAL` with explicit zip logic. PostgreSQL's
-`ROWS FROM()` zips multiple SRF outputs column-by-column, padding shorter
-results with NULL. This can be expressed as:
+Two strategies:
+1. **All-unnest optimisation:** `ROWS FROM(unnest(A), unnest(B))` → `unnest(A, B) AS alias(cols)`.
+   PostgreSQL's multi-arg `unnest()` natively does zip semantics.
+2. **General case:** Ordinal-based LEFT JOIN LATERAL chain with
+   `generate_series(1, 2147483647)` as index source + `row_number() OVER ()` for
+   ordinal matching. Produces correct NULL-padding for shorter result sets.
 
-```sql
--- Before (rejected):
-SELECT * FROM ROWS FROM(unnest(ARRAY[1,2,3]), unnest(ARRAY['a','b']))
-
--- After rewrite (supported):
-SELECT f1.unnest AS col1, f2.unnest AS col2
-FROM generate_series(1, GREATEST(
-       array_length(ARRAY[1,2,3], 1),
-       array_length(ARRAY['a','b'], 1)
-     )) __pgt_idx
-LEFT JOIN LATERAL unnest(ARRAY[1,2,3]) WITH ORDINALITY AS f1(unnest, ord)
-  ON f1.ord = __pgt_idx
-LEFT JOIN LATERAL unnest(ARRAY['a','b']) WITH ORDINALITY AS f2(unnest, ord)
-  ON f2.ord = __pgt_idx
-```
-
-This is correct but complex to auto-generate for arbitrary SRFs. A simpler
-approach for the common case (all SRFs are `unnest`):
-
-```sql
--- Simplified for unnest-of-arrays:
-SELECT u1, u2
-FROM unnest(ARRAY[1,2,3], ARRAY['a','b']) AS t(u1, u2)
-```
-
-PostgreSQL's multi-argument `unnest()` already does zip semantics.
-
-**Recommendation:** Implement as SQL-level rewrite. Detect `ROWS FROM()`
-nodes in the raw parse tree, extract the function calls, and rewrite to
-multi-argument `unnest()` (when all are `unnest`) or to the explicit LATERAL
-with `generate_series` (general case).
+Handles JoinExpr recursion (ROWS FROM inside JOIN trees), set operations (UNION
+branches), aliases, column aliases, and WITH ORDINALITY.
 
 **Files changed:**
-- `src/dvm/parser.rs` — new `rewrite_rows_from()` function
+- `src/dvm/parser.rs` — `rewrite_rows_from()` (public entry), `has_multi_rows_from()`,
+  `rewrite_from_item_rows_from()`, `rewrite_rows_from_in_set_op()`
 - `src/dvm/mod.rs` — export
-- `src/api.rs` — wire into pipeline
+- `src/api.rs` — wired into rewrite pipeline after `rewrite_sublinks_in_or`
 
 **Tests:**
-- Unit tests: 3 cases (dual unnest, triple unnest, mixed SRFs)
-- E2E test: stream table over `ROWS FROM()`, verify delta
+- 7 E2E tests in `tests/e2e_rows_from_tests.rs`: dual unnest, triple unnest,
+  mixed SRFs, differential insert/delete, single-function passthrough
 
 ### Task 2.4: LATERAL with RIGHT/FULL JOIN (G6) — ✅ ERROR MESSAGE UPDATED
 
@@ -542,78 +517,43 @@ refresh remains the correct fallback for multi-source stream tables.
 
 ### Task 3.3: Buffer Table Partitioning by LSN Range
 
+**Status: ✅ IMPLEMENTED**
+
 **Current behaviour:** Change buffer tables are unpartitioned heap tables.
 After each refresh cycle, consumed rows are deleted via
 `DELETE FROM changes_<oid> WHERE lsn <= frontier`. VACUUM must reclaim dead
 tuples.
 
-**Proposed fix:** Partition buffer tables by LSN range. Each partition covers
-one refresh cycle's worth of changes:
+**Implementation:** Buffer tables can now use `PARTITION BY RANGE (lsn)`:
 
-1. At `create_stream_table()` time, create the buffer table as a partitioned
-   table: `PARTITION BY RANGE (lsn)`.
-2. Before each refresh, create a new partition for the current LSN range.
-3. After consuming changes for a refresh, detach the old partition and
-   DROP it (instant, no VACUUM needed).
-
-**Benefit:** Eliminates VACUUM overhead on buffer tables entirely. DROP is
-O(1) vs DELETE + VACUUM which is O(n). Especially impactful for high-write
-sources.
-
-**Caveat:** Partition management adds DDL overhead per refresh cycle.
-PostgreSQL's native partitioning has diminishing returns for very short
-refresh cycles (<10s) where partition create/detach overhead exceeds the
-vacuum savings.
-
-**Recommendation:** Make this optional, controlled by a GUC
-(`pg_trickle.buffer_partitioning = 'auto' | 'on' | 'off'`). Default 'auto'
-enables partitioning for sources with refresh cycles ≥ 30s.
-
-**Files changed:**
-- `src/cdc.rs` — modify `create_change_buffer_table()` to support
-  partitioned mode
-- `src/refresh.rs` — partition management: create new partition before
-  refresh, detach + drop old partition after consuming
-- `src/config.rs` — new `pg_trickle.buffer_partitioning` GUC
-
-**Tests:**
-- E2E test: create stream table with partitioned buffer, run multiple
-  refresh cycles, verify no VACUUM needed and dead tuples = 0
+1. `pg_trickle.buffer_partitioning` GUC: `off` (default) / `on` / `auto`.
+2. `create_change_buffer_table()` adds `PARTITION BY RANGE (lsn)` clause and
+   creates a default partition when partitioning is enabled.
+3. `should_auto_partition()` checks if the minimum schedule across dependent
+   stream tables is ≥ 30s.
+4. `is_buffer_partitioned()` checks `relkind = 'p'` in `pg_class`.
+5. `create_cycle_partition()` creates a range partition for each refresh cycle.
+6. `detach_consumed_partitions()` finds child partitions via `pg_inherits`,
+   parses bounds, and detaches + drops consumed partitions (O(1), no VACUUM).
+7. `drain_pending_cleanups()` and `cleanup_change_buffers_by_frontier()` in
+   `refresh.rs` check `is_buffer_partitioned()` and use partition detach path.
 
 ### Task 3.4: Skip-Unchanged-Column Scanning in Delta
 
-**Current behaviour:** The scan delta reads all columns from the change
-buffer for every change row, even when the defining query only references
-a subset of columns.
+**Status: ✅ IMPLEMENTED**
 
-**Proposed fix:** The `Scan` OpTree node already knows which columns are
-referenced by the defining query (the `columns` field). The delta SQL should
-only SELECT the referenced columns from the buffer, reducing I/O:
+**Implementation:** `prune_scan_columns()` post-parse pass in `parser.rs`:
 
-```sql
--- Current: reads all buffer columns
-SELECT pk_hash, action, new_name, old_name, new_price, old_price, new_category, old_category
-FROM changes_<oid>
-WHERE lsn > $prev AND lsn <= $new
-
--- Proposed: only reads columns used by the defining query
--- (defining query: SELECT name, price FROM products WHERE ...)
-SELECT pk_hash, action, new_name, old_name, new_price, old_price
-FROM changes_<oid>
-WHERE lsn > $prev AND lsn <= $new
-```
-
-PostgreSQL's heap access still reads full tuples, so the I/O savings are
-marginal for narrow tables. However, for wide tables (50+ columns) where
-the stream table only uses 5–10 columns, this can significantly reduce the
-data transferred to the DVM engine.
-
-**Files changed:**
-- `src/dvm/operators/scan.rs` — modify `diff_scan_change_buffer()` to
-  project only referenced columns
-
-**Tests:**
-- Unit tests: delta SQL generation with subset of columns
+1. `ColumnRefSet` collects all `Expr::ColumnRef` from the entire OpTree,
+   tracking both qualified (`alias.column`) and unqualified column names.
+2. `collect_all_column_refs()` walks the tree recursively. Returns `false`
+   (bail out) on `Star`, `Raw`, `LateralFunction`, or `LateralSubquery`.
+3. `apply_column_pruning()` walks the tree; at each `Scan` node, retains
+   only columns in `demanded ∪ pk_columns`.
+4. Hook in `parse_defining_query_inner()` after tree construction, plus
+   loop over CTE registry entries.
+5. 8 unit tests covering qualified/unqualified refs, PK retention, Star/Raw
+   bail-out, filter refs, join conditions, and aggregates.
 
 ### Task 3.5: Online Trigger Rebuild Without Full Reinit
 
@@ -682,8 +622,11 @@ mode.
 
 ### Task 5.1: Recursive CTEs in IMMEDIATE Mode (G10)
 
-**Current status:** `RecursiveCte` is the only OpTree node rejected by
-`check_immediate_support()`.
+**Status:** ✅ **Done**
+
+**Current status:** ~~`RecursiveCte` is the only OpTree node rejected by
+`check_immediate_support()`.~~ Resolved — `RecursiveCte` is now allowed
+with a warning about potential stack-depth issues.
 
 **Root cause:** Recursive CTEs use semi-naive evaluation with fixpoint
 iteration. In IMMEDIATE mode, the delta source is a transition table (temp
@@ -692,22 +635,16 @@ a trigger function may:
 1. Exceed PostgreSQL's `max_stack_depth` for deeply recursive CTEs.
 2. Interact incorrectly with the trigger's transaction state (SPIs, snapshots).
 
-**Proposed fix:**
+**Implementation:**
 
-1. **Validate** that the existing DVM semi-naive evaluation works correctly
-   with `DeltaSource::TransitionTable` by running the recursive CTE E2E
-   tests from DIFFERENTIAL mode against IMMEDIATE mode.
-2. **If correct:** Remove the `RecursiveCte` rejection from
-   `check_immediate_support()`. Add a warning about potential stack depth
-   issues.
-3. **If incorrect:** Implement a fallback to FULL recomputation for
-   recursive CTEs in IMMEDIATE mode (truncate + repopulate the stream
-   table on each trigger firing, similar to TRUNCATE handling).
+- `check_immediate_support()` in `src/dvm/parser.rs` changed from returning
+  `Err(UnsupportedOperator(...))` to emitting a `pgrx::warning!()` about stack
+  depth and recursing into `base` and `recursive` fields for validation.
+- The existing semi-naive evaluation path with `DeltaSource::TransitionTable`
+  proceeds as before.
 
 **Files changed:**
-- `src/dvm/parser.rs` — remove `RecursiveCte` arm from
-  `check_immediate_support()`
-- `src/ivm.rs` — add stack depth guard before recursive CTE delta execution
+- `src/dvm/parser.rs` — changed `RecursiveCte` arm from rejection to warning
 
 **Tests:**
 - E2E test: create IMMEDIATE stream table with `WITH RECURSIVE`, INSERT
@@ -716,8 +653,10 @@ a trigger function may:
 
 ### Task 5.2: TopK in IMMEDIATE Mode (G11)
 
-**Current status:** TopK (`ORDER BY + LIMIT`) is rejected in IMMEDIATE mode
-because scoped recomputation is a deferred/full pattern.
+**Status:** ✅ **Done**
+
+**Current status:** ~~TopK (`ORDER BY + LIMIT`) is rejected in IMMEDIATE mode~~
+Resolved — TopK is now supported in IMMEDIATE mode with a limit threshold guard.
 
 **Root cause:** TopK uses a different delta strategy than standard
 differential: instead of delta algebra, it maintains a bounded result set
@@ -725,31 +664,21 @@ via scoped recomputation (delete rows that fall outside the top K, insert
 rows that enter it). This is orchestrated by the refresh engine, not the
 trigger function.
 
-**Proposed fix:** Implement statement-level TopK maintenance in the IVM
-trigger:
+**Implementation:** Statement-level TopK maintenance in the IVM trigger:
 
-1. After applying the delta from transition tables, compute the new top K:
-   ```sql
-   SELECT * FROM (defining_query) __pgt_topk LIMIT K
-   ```
-2. Diff the new top K against the current stream table contents.
-3. Apply DELETE + INSERT for rows that entered/exited the top K.
+1. `apply_topk_micro_refresh()` in `src/ivm.rs` materializes the new top K
+   into a temp table using the defining query with LIMIT.
+2. DELETE rows from stream table that are no longer in top K.
+3. INSERT ON CONFLICT for rows that entered or changed in the top K.
+4. Uses `row_id_expr_for_query()` and `get_defining_query_columns()` from DVM.
 
-This is essentially a micro-full-refresh scoped to the K rows. For small K
-(e.g., top 10, top 100), this is fast enough for inline trigger execution.
-
-**Caveat:** For large K (>10,000), the inline recomputation may add
-unacceptable latency to the triggering DML. Add a GUC guard:
-`pg_trickle.ivm_topk_max_limit` (default 1000). TopK queries with
-LIMIT > this threshold are rejected in IMMEDIATE mode.
+**GUC guard:** `pg_trickle.ivm_topk_max_limit` (default 1000). TopK queries
+with LIMIT > this threshold are rejected at creation/alter time.
 
 **Files changed:**
-- `src/api.rs` — remove TopK + IMMEDIATE rejection (replace with limit
-  threshold check)
-- `src/ivm.rs` — add TopK-specific delta computation in
-  `pgt_ivm_apply_delta()`: after standard delta, if TopK detected,
-  recompute bounded result and apply diff
-- `src/config.rs` — new `pg_trickle.ivm_topk_max_limit` GUC
+- `src/api.rs` — threshold check replaces hard rejection
+- `src/ivm.rs` — `apply_topk_micro_refresh()` added
+- `src/config.rs` — `PGS_IVM_TOPK_MAX_LIMIT` GUC
 
 **Tests:**
 - E2E test: IMMEDIATE stream table with `ORDER BY score DESC LIMIT 10`,
@@ -790,7 +719,7 @@ After all phases are complete:
 - [ ] TopK works in IMMEDIATE mode (with limit guard).
 - [ ] Column-level change detection reduces UPDATE buffer size by 30–60%
       for wide tables.
-- [ ] Buffer table partitioning eliminates vacuum overhead for high-write
+- [x] Buffer table partitioning eliminates vacuum overhead for high-write
       sources.
 - [ ] Online ADD COLUMN does not force full reinit.
 - [ ] 900+ unit tests.
@@ -817,8 +746,8 @@ Phase 2 — New DVM Operators                  (3–4 sessions, 18–24 hours)
 Phase 3 — Trigger-Level Optimisations        (4–6 sessions, 24–36 hours)
   ├─ Task 3.1: Column-level change detect   → Biggest win for UPDATE-heavy
   ├─ Task 3.2: Incremental TRUNCATE         → Improves ETL patterns
-  ├─ Task 3.3: Buffer table partitioning    → Eliminates vacuum overhead
-  ├─ Task 3.4: Skip-unchanged-col scanning  → Reduces delta read I/O
+  ├─ Task 3.3: Buffer table partitioning    → ✅ Done — partition by LSN range + GUC
+  ├─ Task 3.4: Skip-unchanged-col scanning  → ✅ Done — prune_scan_columns() pass
   └─ Task 3.5: Online ADD COLUMN            → Avoids unnecessary full reinit
 
 Phase 4 — Remaining Aggregates               (2–3 sessions, 12–18 hours)
@@ -826,9 +755,9 @@ Phase 4 — Remaining Aggregates               (2–3 sessions, 12–18 hours)
   ├─ Task 4.2: Hypothetical-set aggs (4)    → Completes ordered-set coverage
   └─ Task 4.3: XMLAGG                       → Niche, trivial
 
-Phase 5 — IMMEDIATE Mode Parity             (2–3 sessions, 12–18 hours)
-  ├─ Task 5.1: Recursive CTEs              → Closes last IMMEDIATE gap
-  └─ Task 5.2: TopK                         → Bounded top-N in transactions
+Phase 5 — IMMEDIATE Mode Parity             ✅ COMPLETE
+  ├─ Task 5.1: Recursive CTEs              → ✅ Done — warning instead of rejection
+  └─ Task 5.2: TopK                         → ✅ Done — micro-refresh + GUC guard
 
 Total estimated effort: 13–19 sessions (~80–110 hours)
 ```

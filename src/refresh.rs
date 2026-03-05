@@ -220,6 +220,27 @@ fn drain_pending_cleanups() {
             false
         };
 
+        // Task 3.3: Partitioned buffer cleanup via DETACH + DROP.
+        if crate::cdc::is_buffer_partitioned(&change_schema, oid) {
+            match crate::cdc::detach_consumed_partitions(&change_schema, oid, &safe_lsn) {
+                Ok(n) if n > 0 => {
+                    pgrx::debug1!(
+                        "[pg_trickle] Deferred cleanup: detached {} partition(s) from changes_{}",
+                        n,
+                        oid,
+                    );
+                }
+                Err(e) => {
+                    pgrx::debug1!(
+                        "[pg_trickle] Deferred cleanup partition detach failed: {}",
+                        e,
+                    );
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         if can_truncate {
             if let Err(e) = Spi::run(&format!(
                 "TRUNCATE \"{schema}\".changes_{oid}",
@@ -309,6 +330,27 @@ fn cleanup_change_buffers_by_frontier(change_schema: &str, source_oids: &[u32]) 
         .unwrap_or(false);
 
         if !has_stale {
+            continue;
+        }
+
+        // Task 3.3: Partitioned buffer cleanup via DETACH + DROP.
+        if crate::cdc::is_buffer_partitioned(change_schema, oid) {
+            match crate::cdc::detach_consumed_partitions(change_schema, oid, &safe_lsn) {
+                Ok(n) if n > 0 => {
+                    pgrx::debug1!(
+                        "[pg_trickle] Frontier cleanup: detached {} partition(s) from changes_{}",
+                        n,
+                        oid,
+                    );
+                }
+                Err(e) => {
+                    pgrx::debug1!(
+                        "[pg_trickle] Frontier cleanup partition detach failed: {}",
+                        e,
+                    );
+                }
+                _ => {}
+            }
             continue;
         }
 
@@ -1245,7 +1287,7 @@ pub fn execute_differential_refresh(
     let catalog_source_oids: Vec<u32> = StDependency::get_for_st(st.pgt_id)
         .unwrap_or_default()
         .into_iter()
-        .filter(|dep| dep.source_type == "TABLE")
+        .filter(|dep| dep.source_type == "TABLE" || dep.source_type == "FOREIGN_TABLE")
         .map(|dep| dep.source_relid.to_u32())
         .collect();
 
@@ -1297,6 +1339,28 @@ pub fn execute_differential_refresh(
     // ensuring stale change buffer rows are removed even when the
     // thread-local queue is empty.
     cleanup_change_buffers_by_frontier(&change_schema, &catalog_source_oids);
+
+    // ── EC-05: Poll foreign table sources ────────────────────────────
+    // For any FOREIGN_TABLE source, snapshot-diff the current contents
+    // and inject delta rows into the change buffer before the decision
+    // query checks for new data.
+    {
+        let ft_deps: Vec<_> = StDependency::get_for_st(st.pgt_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|dep| dep.source_type == "FOREIGN_TABLE")
+            .collect();
+        for dep in &ft_deps {
+            if let Err(e) = crate::cdc::poll_foreign_table_changes(dep.source_relid, &change_schema)
+            {
+                pgrx::warning!(
+                    "[pg_trickle] EC-05: failed to poll foreign table source OID {} \
+                     for ST {schema}.{name}: {e}",
+                    dep.source_relid.to_u32(),
+                );
+            }
+        }
+    }
 
     let t_decision_start = Instant::now();
 

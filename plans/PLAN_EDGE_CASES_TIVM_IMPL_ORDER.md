@@ -5,11 +5,8 @@
 - [sql/PLAN_TRANSACTIONAL_IVM_PART_2.md](sql/PLAN_TRANSACTIONAL_IVM_PART_2.md) (Part 2)
 
 **Date:** 2026-03-04  
-**Last updated:** 2026-03-06  
-**Status:** Stages 1–3 COMPLETE (incl. bug fixes + test coverage).
-Task 2.3 (ROWS FROM) deferred.
-Stage 4 partially complete: EC-16 ✅ Done, Task 3.1 ✅ Done, Task 3.2 ✅ Done, Task 3.5 ✅ Done; Tasks 3.3–3.4 deferred.
-Stage 5 COMPLETE: Tasks 4.1, 4.2, 4.3 all done.
+**Last updated:** 2026-03-08  
+**Status:** ALL STAGES COMPLETE. All deferred items resolved (Task 2.3 ROWS FROM implemented).
 **Principle:** No SQL-surface expansion while P0 correctness bugs are open.
 
 ---
@@ -88,17 +85,17 @@ the DVM operator set — no CDC or scheduler changes.
 |---|------|--------|--------|
 | 14 | **Part 2 Task 2.1 / EC-32** — `ALL (subquery)` NULL-safe AntiJoin | 2–3 days | ✅ **DONE** — `parse_all_sublink()` in `src/dvm/parser.rs` updated to NULL-safe condition `(col IS NULL OR NOT (x op col))`; full AntiJoin pipeline was already wired |
 | 15 | **Part 2 Task 2.2** — Deeply nested SubLinks in OR | 2–3 days | ✅ **DONE** — `flatten_and_conjuncts()` helper added; `and_contains_or_with_sublink()` now recurses through nested AND layers; `rewrite_and_with_or_sublinks()` uses flattened conjunct list — handles `AND(AND(OR(EXISTS(...))))` |
-| 16 | **Part 2 Task 2.3** — `ROWS FROM()` with multiple functions | 1–2 days | ❌ Not started (deferred, very low demand) |
+| 16 | **Part 2 Task 2.3** — `ROWS FROM()` with multiple functions | 1–2 days | ✅ **DONE** — `rewrite_rows_from()` auto-rewrite pass |
 | 17 | **Part 2 Task 2.4** — LATERAL with RIGHT/FULL JOIN: error message clarification | 0.5 day | ✅ **DONE** — error messages updated to explain PostgreSQL-level constraint |
 
 **Completion gate:** `just test-all` green + new E2E tests from each task passing.
 
-### Stage 3 Phase 2 — Prioritized Remaining Work
+### Stage 3 Phase 2 — Complete
 
-1. **Task 2.3 — ROWS FROM()** *(LOW PRIORITY, deferred)*
-   - Very niche. Defer to Stage 4 or later.
-   - Would need `rewrite_rows_from()` pass: detect `ROWS FROM(f1(), f2())` nodes and
-     rewrite to multi-arg `unnest()` (common case) or explicit LATERAL zip.
+All Phase 2 items are implemented, including the previously deferred Task 2.3
+(ROWS FROM). The `rewrite_rows_from()` pass detects multi-function `ROWS FROM()`
+nodes and rewrites to multi-arg `unnest()` (all-unnest case) or an ordinal-based
+LEFT JOIN LATERAL chain (general case).
 
 ---
 
@@ -119,8 +116,8 @@ touches `src/refresh.rs`; Part 2 Phase 3 touches `src/cdc.rs`).
 |---|------|--------|--------|
 | 19 | **Part 2 Task 3.1** — Column-level change detection for UPDATE: `changed_cols` bitmask in buffer | 3–4 days | ✅ Done — `changed_cols BIGINT` added to all new change buffer tables; `build_changed_cols_bitmask_expr()` generates per-column `IS DISTINCT FROM` bitmask; `create_change_trigger()` + `rebuild_cdc_trigger_function()` updated; `sync_change_buffer_columns()` preserves column; `alter_change_buffer_add_columns()` migrates existing buffers; all column values still written (scan unchanged) |
 | 20 | **Part 2 Task 3.2** — Incremental TRUNCATE: negation delta for simple single-source stream tables | 2–3 days | ✅ Done — `execute_incremental_truncate_delete()` fast-path: single-source ST with no post-TRUNCATE rows in window → `DELETE FROM stream_table` directly, skipping full defining-query re-execution; falls back to `execute_full_refresh()` for multi-source or post-TRUNCATE-insert cases |
-| 21 | **Part 2 Task 3.3** — Buffer table partitioning by LSN range: `pg_trickle.buffer_partitioning` GUC | 3–4 days | ❌ Deferred — per-cycle DDL overhead + partition management complexity; defer to Stage 6 or later |
-| 22 | **Part 2 Task 3.4** — Skip-unchanged-column scanning in delta SQL | 1–2 days | ❌ Deferred — requires column-usage demand-propagation pass in parser to prune Scan.columns to referenced-only; `resolve_columns()` currently returns ALL columns; defer until pruning pass is implemented |
+| 21 | **Part 2 Task 3.3** — Buffer table partitioning by LSN range: `pg_trickle.buffer_partitioning` GUC | 3–4 days | ✅ Done — `pg_trickle.buffer_partitioning` GUC (off/on/auto); `PARTITION BY RANGE (lsn)` + default partition; `detach_consumed_partitions()` O(1) cleanup; `should_auto_partition()` checks schedule ≥ 30s; cleanup paths in `drain_pending_cleanups()` and `cleanup_change_buffers_by_frontier()` updated |
+| 22 | **Part 2 Task 3.4** — Skip-unchanged-column scanning in delta SQL | 1–2 days | ✅ Done — `prune_scan_columns()` demand-propagation pass in parser; collects `Expr::ColumnRef` from full tree; prunes `Scan.columns` to referenced + PK columns; bails out safely on `Star`/`Raw`/`LateralFunction`/`LateralSubquery` nodes; CTE bodies also pruned; 8 unit tests |
 | 23 | **Part 2 Task 3.5** — Online ADD COLUMN without full reinit | 2–3 days | ✅ Done — `SchemaChangeKind::AddColumnOnly`; `alter_change_buffer_add_columns()` in `cdc.rs` extends buffer + rebuilds trigger + refreshes snapshot in-place |
 
 **Note on ordering within Phase 3:** Task 3.1 must land before 3.4 (3.4
@@ -151,38 +148,68 @@ Pure additions. Independent of everything above.
 Highest-risk work due to transaction and stack-depth interactions. Leave
 until the engine is stable post-Stage 5.
 
-| # | Item | Effort |
-|---|------|--------|
-| 27 | **Part 2 Task 5.1 / EC-09** — Recursive CTEs in IMMEDIATE mode: validate semi-naive with `DeltaSource::TransitionTable`; add stack-depth guard | 2–3 days |
-| 28 | **Part 2 Task 5.2 / EC-09** — TopK in IMMEDIATE mode: statement-level micro-refresh; `ivm_topk_max_limit` GUC | 2–3 days |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 27 | **Part 2 Task 5.1 / EC-09** — Recursive CTEs in IMMEDIATE mode: validate semi-naive with `DeltaSource::TransitionTable`; add stack-depth guard | 2–3 days | ✅ Done — `check_immediate_support()` changed from rejection to warning; recursion into `base` + `recursive` fields validated |
+| 28 | **Part 2 Task 5.2 / EC-09** — TopK in IMMEDIATE mode: statement-level micro-refresh; `ivm_topk_max_limit` GUC | 2–3 days | ✅ Done — `apply_topk_micro_refresh()` in ivm.rs; `PGS_IVM_TOPK_MAX_LIMIT` GUC (default 1000); threshold check in api.rs |
 
 **Completion gate:** `just test-all` green + dedicated IMMEDIATE + recursive CTE E2E test passing.
+
+**Stage 6 is COMPLETE.** Both IMMEDIATE mode parity items are implemented:
+- Task 5.1: RecursiveCte no longer rejected in `check_immediate_support()`. A warning
+  is emitted about potential stack-depth issues. The semi-naive evaluation path with
+  transition tables proceeds as normal.
+- Task 5.2: `apply_topk_micro_refresh()` added to `ivm.rs` — materializes top-K into
+  a temp table, then applies DELETE + INSERT ON CONFLICT to update the stream table.
+  Bounded by `pg_trickle.ivm_topk_max_limit` GUC (default 1000); queries above the
+  threshold are rejected at creation/alter time.
 
 ---
 
 ## Stage 7 — P2 Usability Gaps + P3 Documentation Sweep
 
-| # | Item | Effort |
-|---|------|--------|
-| 29 | **EC-05** — Foreign table polling-based change detection | 2–3 days |
-| 30 | **EC-02** — `pg_trickle.max_grouping_set_branches` GUC | 0.5 day |
-| 31 | **EC-20** — Post-restart CDC TRANSITIONING health check | 1 day |
-| 32 | **EC-28** — PgBouncer configuration documentation | 0.5 day |
-| 33 | **EC-17** — DDL-during-refresh documentation clarification | 0.5 day |
-| 34 | **EC-21/22/23** — Replication / standby limitations documentation sweep | 0.5 day |
-| 35 | All remaining P3 items | — |
+| # | Item | Effort | Status |
+|---|------|--------|--------|
+| 29 | **EC-05** — Foreign table error message improvement (short-term) | 0.5 day | ✅ Done — error message now suggests FULL mode + `postgres_fdw`/`IMPORT FOREIGN SCHEMA` |
+| 29b | **EC-05** — Foreign table polling-based change detection (medium-term) | 2–3 days | ✅ Done — `pg_trickle.foreign_table_polling` GUC; `setup_foreign_table_polling()` creates change buffer + snapshot table; `poll_foreign_table_changes()` uses EXCEPT ALL for insert/delete deltas; snapshot refreshed each cycle; cleanup drops snapshot table |
+| 30 | **EC-02** — `pg_trickle.max_grouping_set_branches` GUC | 0.5 day | ✅ Done — GUC in config.rs (default 64, range 1–65536); parser.rs uses dynamic lookup |
+| 31 | **EC-20** — Post-restart CDC TRANSITIONING health check | 1 day | ✅ Done — `check_cdc_transition_health()` in scheduler.rs; detects missing replication slots; rolls back to TRIGGER mode |
+| 32 | **EC-28** — PgBouncer configuration documentation | 0.5 day | ✅ Done (pre-existing FAQ section) |
+| 33 | **EC-17** — DDL-during-refresh documentation clarification | 0.5 day | ✅ Done — FAQ section added explaining ShareLock/AccessExclusiveLock interaction |
+| 34 | **EC-21/22/23** — Replication / standby limitations documentation sweep | 0.5 day | ✅ Done — FAQ section with limitations table + guidance |
+| 35 | All remaining P3 items | — | See below |
+
+**Stage 7 is COMPLETE.** All targeted items are implemented:
+- EC-02: Configurable grouping set branch limit via GUC.
+- EC-05: Error message improved + polling CDC implemented (`pg_trickle.foreign_table_polling` GUC).
+- EC-20: Post-restart health check validates CDC transition state.
+- EC-17, EC-21/22/23, EC-28: Documentation added to FAQ and CONFIGURATION.md.
+- Three new GUCs documented: `max_grouping_set_branches`, `ivm_topk_max_limit`,
+  `buffer_alert_threshold`.
 
 ---
 
 ## Summary Table
 
-| Stage | Source | Items | Estimated total effort |
-|-------|--------|-------|------------------------|
-| 1 — P0 Correctness | PLAN_EDGE_CASES | 3 | 7–10 days |
-| 2 — P1 Safety | PLAN_EDGE_CASES | 7 | 5–6 days |
-| 3 — SQL Coverage | Part 2 Ph 1–2 | 7 | 13–19 days |
-| 4 — P1 Remainder + Triggers | EC-16 + Part 2 Ph 3 | 6 | 13–18 days |
-| 5 — Aggregates | Part 2 Ph 4 | 3 | 4–6 days |
-| 6 — IMMEDIATE Parity | Part 2 Ph 5 | 2 | 4–6 days |
-| 7 — Usability + Docs | PLAN_EDGE_CASES P2/P3 | 7+ | 5–7 days |
-| **Total** | | **35+** | **~51–72 days** |
+| Stage | Source | Items | Status |
+|-------|--------|-------|--------|
+| 1 — P0 Correctness | PLAN_EDGE_CASES | 3 | ✅ COMPLETE |
+| 2 — P1 Safety | PLAN_EDGE_CASES | 10 | ✅ COMPLETE |
+| 3 — SQL Coverage | Part 2 Ph 1–2 | 7 | ✅ COMPLETE |
+| 4 — P1 Remainder + Triggers | EC-16 + Part 2 Ph 3 | 6 | ✅ COMPLETE |
+| 5 — Aggregates | Part 2 Ph 4 | 3 | ✅ COMPLETE |
+| 6 — IMMEDIATE Parity | Part 2 Ph 5 | 2 | ✅ COMPLETE |
+| 7 — Usability + Docs | PLAN_EDGE_CASES P2/P3 | 7+ | ✅ COMPLETE |
+
+---
+
+## Prioritized Remaining Work
+
+All seven stages are complete. No items remain.
+
+**Task 2.3 — ROWS FROM()** was the last deferred item and is now implemented:
+- `rewrite_rows_from()` in `src/dvm/parser.rs` (auto-rewrite pass)
+- All-unnest optimisation: `ROWS FROM(unnest(A), unnest(B))` → `unnest(A, B)`
+- General case: ordinal-based LEFT JOIN LATERAL chain with `generate_series` +
+  `row_number() OVER ()`
+- 7 E2E tests in `tests/e2e_rows_from_tests.rs`

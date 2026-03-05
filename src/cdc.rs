@@ -353,6 +353,17 @@ pub fn create_change_buffer_table(
         .collect::<Vec<_>>()
         .join("");
 
+    // Task 3.3: Determine whether to use partitioned buffer tables.
+    let partitioning_mode = crate::config::pg_trickle_buffer_partitioning();
+    let use_partitioning = partitioning_mode == "on"
+        || (partitioning_mode == "auto" && should_auto_partition(source_oid));
+
+    let partition_clause = if use_partitioning {
+        " PARTITION BY RANGE (lsn)"
+    } else {
+        ""
+    };
+
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {schema}.changes_{oid} (\
             change_id   BIGSERIAL,\
@@ -360,7 +371,7 @@ pub fn create_change_buffer_table(
             action      CHAR(1) NOT NULL\
             {pk_col}\
             {typed_col_defs}\
-        )",
+        ){partition_clause}",
         schema = change_schema,
         oid = source_oid.to_u32(),
     );
@@ -368,6 +379,20 @@ pub fn create_change_buffer_table(
     Spi::run(&sql).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create change buffer table: {}", e))
     })?;
+
+    // For partitioned tables, create a default partition to accept any LSN
+    // values until the first refresh cycle creates a range partition.
+    if use_partitioning {
+        let default_part_sql = format!(
+            "CREATE TABLE IF NOT EXISTS {schema}.changes_{oid}_default \
+             PARTITION OF {schema}.changes_{oid} DEFAULT",
+            schema = change_schema,
+            oid = source_oid.to_u32(),
+        );
+        Spi::run(&default_part_sql).map_err(|e| {
+            PgTrickleError::SpiError(format!("Failed to create default partition: {}", e))
+        })?;
+    }
 
     // AA1: Single covering index replaces the previous dual-index setup.
     //
@@ -398,6 +423,192 @@ pub fn create_change_buffer_table(
     })?;
 
     Ok(())
+}
+
+/// Task 3.3: Check whether the given source table's effective refresh schedule
+/// warrants auto-partitioning (>= 30 s).
+fn should_auto_partition(source_oid: pg_sys::Oid) -> bool {
+    // Look up the minimum schedule among all stream tables that depend
+    // on this source.  If ALL consumers refresh at >= 30 s intervals,
+    // the DDL overhead per cycle is worthwhile.
+    let min_schedule: Option<i32> = Spi::get_one::<i32>(&format!(
+        "SELECT MIN(COALESCE(s.schedule_seconds, {default})) \
+         FROM pgtrickle.pgt_stream_tables s \
+         JOIN pgtrickle.pgt_dependencies d ON d.pgt_id = s.pgt_id \
+         WHERE d.source_relid = {oid} AND d.source_type = 'TABLE'",
+        oid = source_oid.to_u32(),
+        default = crate::config::pg_trickle_default_schedule_seconds(),
+    ))
+    .unwrap_or(None);
+    min_schedule.unwrap_or(0) >= 30
+}
+
+/// Task 3.3: Check if a change buffer table is partitioned.
+pub fn is_buffer_partitioned(change_schema: &str, source_oid: u32) -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT c.relkind = 'p' \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = '{schema}' AND c.relname = 'changes_{oid}'",
+        schema = change_schema,
+        oid = source_oid,
+    ))
+    .unwrap_or(Some(false))
+    .unwrap_or(false)
+}
+
+/// Task 3.3: Detach and drop consumed partitions from a partitioned buffer table.
+///
+/// After a refresh cycle consumes all changes up to `safe_lsn`, any
+/// partitions whose upper bound is <= `safe_lsn` are fully consumed and
+/// can be detached + dropped.  This is O(1) — no VACUUM needed.
+///
+/// The default partition is never detached.
+pub fn detach_consumed_partitions(
+    change_schema: &str,
+    source_oid: u32,
+    safe_lsn: &str,
+) -> Result<u32, PgTrickleError> {
+    // Find child partitions with range upper bound <= safe_lsn.
+    // pg_catalog.pg_partition_upper_bound() is PG 14+ but we need to
+    // parse pg_get_expr(relpartbound) for portability.
+    //
+    // Partition naming convention: changes_{oid}_p{seq}
+    // Each has a bound like: FOR VALUES FROM ('X/Y') TO ('A/B')
+    // We find partitions whose upper bound <= safe_lsn.
+    let partitions: Vec<(String, String)> = Spi::connect(|client| {
+        let sql = format!(
+            "SELECT c.relname::text, \
+                    pg_get_expr(c.relpartbound, c.oid)::text AS bound_expr \
+             FROM pg_inherits i \
+             JOIN pg_class c ON c.oid = i.inhrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE i.inhparent = ('{schema}.changes_{oid}')::regclass \
+               AND n.nspname = '{schema}' \
+               AND c.relname != 'changes_{oid}_default'",
+            schema = change_schema,
+            oid = source_oid,
+        );
+        let result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let mut parts = Vec::new();
+        for row in result {
+            let name: String = row.get(1).unwrap_or(None).unwrap_or_default();
+            let bound: String = row.get(2).unwrap_or(None).unwrap_or_default();
+            parts.push((name, bound));
+        }
+        Ok::<_, PgTrickleError>(parts)
+    })?;
+
+    let mut detached = 0u32;
+    for (part_name, bound_expr) in &partitions {
+        // Parse upper bound from "FOR VALUES FROM ('X/Y') TO ('A/B')"
+        let upper = match parse_partition_upper_bound(bound_expr) {
+            Some(u) => u,
+            None => continue,
+        };
+
+        // Compare: upper_bound <= safe_lsn
+        let is_consumed =
+            Spi::get_one::<bool>(&format!("SELECT '{upper}'::pg_lsn <= '{safe_lsn}'::pg_lsn",))
+                .unwrap_or(Some(false))
+                .unwrap_or(false);
+
+        if is_consumed {
+            // CONCURRENTLY is not available inside a transaction, so use
+            // plain DETACH + DROP.
+            let detach_sql = format!(
+                "ALTER TABLE \"{schema}\".changes_{oid} DETACH PARTITION \"{schema}\".\"{part}\"",
+                schema = change_schema,
+                oid = source_oid,
+                part = part_name,
+            );
+            if let Err(e) = Spi::run(&detach_sql) {
+                pgrx::warning!(
+                    "[pg_trickle] Failed to detach partition {}: {}",
+                    part_name,
+                    e
+                );
+                continue;
+            }
+            let drop_sql = format!(
+                "DROP TABLE IF EXISTS \"{schema}\".\"{part}\"",
+                schema = change_schema,
+                part = part_name,
+            );
+            if let Err(e) = Spi::run(&drop_sql) {
+                pgrx::warning!(
+                    "[pg_trickle] Failed to drop detached partition {}: {}",
+                    part_name,
+                    e
+                );
+            }
+            detached += 1;
+        }
+    }
+
+    Ok(detached)
+}
+
+/// Task 3.3: Create a new range partition for the upcoming refresh cycle.
+///
+/// The partition covers `(prev_lsn, new_lsn]`.  The partition name
+/// includes a monotonic sequence number derived from the count of existing
+/// child partitions.
+pub fn create_cycle_partition(
+    change_schema: &str,
+    source_oid: u32,
+    prev_lsn: &str,
+    new_lsn: &str,
+) -> Result<String, PgTrickleError> {
+    // Sequence number: count existing range partitions (excluding default).
+    let seq: i64 = Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*)::BIGINT \
+         FROM pg_inherits i \
+         JOIN pg_class c ON c.oid = i.inhrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE i.inhparent = ('{schema}.changes_{oid}')::regclass \
+           AND n.nspname = '{schema}' \
+           AND c.relname != 'changes_{oid}_default'",
+        schema = change_schema,
+        oid = source_oid,
+    ))
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    let part_name = format!("changes_{}_p{}", source_oid, seq);
+    let sql = format!(
+        "CREATE TABLE \"{schema}\".\"{part}\" \
+         PARTITION OF \"{schema}\".changes_{oid} \
+         FOR VALUES FROM ('{prev_lsn}'::pg_lsn) TO ('{new_lsn}'::pg_lsn)",
+        schema = change_schema,
+        oid = source_oid,
+        part = part_name,
+        prev_lsn = prev_lsn,
+        new_lsn = new_lsn,
+    );
+    Spi::run(&sql).map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "Failed to create cycle partition {}: {}",
+            part_name, e,
+        ))
+    })?;
+
+    Ok(part_name)
+}
+
+/// Parse the upper bound LSN from a partition bound expression.
+///
+/// Input format: `FOR VALUES FROM ('0/1234') TO ('0/5678')`
+/// Returns: `Some("0/5678")`
+fn parse_partition_upper_bound(bound_expr: &str) -> Option<String> {
+    // Look for "TO ('" and extract the LSN between the quotes.
+    let to_idx = bound_expr.find("TO ('")?;
+    let start = to_idx + 5; // skip "TO ('"
+    let rest = &bound_expr[start..];
+    let end = rest.find("')")?;
+    Some(rest[..end].to_string())
 }
 
 /// Task 3.5: Extend an existing change buffer table after ADD COLUMN DDL on the
@@ -1096,6 +1307,199 @@ pub fn has_user_triggers(st_relid: pg_sys::Oid) -> Result<bool, PgTrickleError> 
     ))
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))
     .map(|v| v.unwrap_or(false))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EC-05 — Foreign table polling CDC
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Set up polling-based CDC for a foreign table source.
+///
+/// Creates the change buffer table (same schema as trigger-based CDC) plus
+/// a snapshot table that stores the previous contents of the foreign table.
+/// No trigger is installed — instead, [`poll_foreign_table_changes`] is
+/// called before each differential refresh to compute deltas.
+pub fn setup_foreign_table_polling(
+    source_oid: pg_sys::Oid,
+    pgt_id: i64,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    let oid_u32 = source_oid.to_u32();
+
+    // Check if already tracked
+    let already_tracked = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_change_tracking WHERE source_relid = $1)",
+        &[source_oid.into()],
+    )
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if !already_tracked {
+        let col_defs = resolve_source_column_defs(source_oid)?;
+
+        // Create the change buffer table (same as trigger-based CDC).
+        create_change_buffer_table(source_oid, change_schema, &col_defs)?;
+
+        // Create a snapshot table: stores the previous contents of the
+        // foreign table so we can compute EXCEPT-based deltas on each poll.
+        let snapshot_table = format!("\"{change_schema}\".snapshot_{oid_u32}");
+        let source_table = Spi::get_one_with_args::<String>(
+            "SELECT $1::oid::regclass::text",
+            &[source_oid.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| {
+            PgTrickleError::NotFound(format!("Foreign table with OID {oid_u32} not found"))
+        })?;
+
+        // Create snapshot as an empty copy of the source table structure.
+        Spi::run(&format!(
+            "CREATE TABLE IF NOT EXISTS {snapshot_table} (LIKE {source_table} INCLUDING ALL)"
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        // Seed the snapshot with the current foreign table contents.
+        Spi::run(&format!(
+            "INSERT INTO {snapshot_table} SELECT * FROM {source_table}"
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        // Record tracking with synthetic slot_name indicating polling CDC.
+        Spi::run_with_args(
+            "INSERT INTO pgtrickle.pgt_change_tracking \
+             (source_relid, slot_name, tracked_by_pgt_ids) \
+             VALUES ($1, $2, ARRAY[$3])",
+            &[
+                source_oid.into(),
+                format!("foreign_poll_{oid_u32}").as_str().into(),
+                pgt_id.into(),
+            ],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    } else {
+        // Already tracked — add this pgt_id to the tracking array.
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_change_tracking \
+             SET tracked_by_pgt_ids = array_append(tracked_by_pgt_ids, $1) \
+             WHERE source_relid = $2 AND NOT ($1 = ANY(tracked_by_pgt_ids))",
+            &[pgt_id.into(), source_oid.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Poll a foreign table source for changes and populate the change buffer.
+///
+/// Computes the symmetric difference between the current foreign table
+/// contents and the snapshot table using EXCEPT ALL, inserts the deltas
+/// into the change buffer, and refreshes the snapshot.
+///
+/// Uses `pg_current_wal_insert_lsn()` as the LSN for delta rows (even
+/// though the foreign table itself has no WAL entries, the local write
+/// to the change buffer does).
+pub fn poll_foreign_table_changes(
+    source_oid: pg_sys::Oid,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    let oid_u32 = source_oid.to_u32();
+    let change_table = format!("\"{change_schema}\".changes_{oid_u32}");
+    let snapshot_table = format!("\"{change_schema}\".snapshot_{oid_u32}");
+
+    let source_table =
+        Spi::get_one_with_args::<String>("SELECT $1::oid::regclass::text", &[source_oid.into()])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            .ok_or_else(|| {
+                PgTrickleError::NotFound(format!("Foreign table with OID {oid_u32} not found"))
+            })?;
+
+    let col_defs = resolve_source_column_defs(source_oid)?;
+    if col_defs.is_empty() {
+        return Ok(());
+    }
+    let pk_columns = resolve_pk_columns(source_oid)?;
+
+    // Build column lists for INSERT into change buffer.
+    let col_names: Vec<String> = col_defs
+        .iter()
+        .map(|(name, _)| format!("\"{}\"", name.replace('"', "\"\"")))
+        .collect();
+    let new_cols: Vec<String> = col_defs
+        .iter()
+        .map(|(name, _)| format!("\"new_{}\"", name.replace('"', "\"\"")))
+        .collect();
+    let old_cols: Vec<String> = col_defs
+        .iter()
+        .map(|(name, _)| format!("\"old_{}\"", name.replace('"', "\"\"")))
+        .collect();
+
+    // Build pk_hash expression for delta rows.
+    let hash_cols: Vec<String> = if pk_columns.is_empty() {
+        col_defs.iter().map(|(n, _)| n.clone()).collect()
+    } else {
+        pk_columns.clone()
+    };
+    let pk_hash_expr = if hash_cols.len() == 1 {
+        let c = format!("\"{}\"", hash_cols[0].replace('"', "\"\""));
+        format!("pgtrickle.pg_trickle_hash({c}::text)")
+    } else {
+        let items: Vec<String> = hash_cols
+            .iter()
+            .map(|c| format!("\"{}\"::text", c.replace('"', "\"\"")))
+            .collect();
+        format!(
+            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
+            items.join(", ")
+        )
+    };
+
+    let col_list = col_names.join(", ");
+    let new_col_list = new_cols.join(", ");
+    let old_col_list = old_cols.join(", ");
+
+    // NULL placeholders for the opposite side of each delta row.
+    let null_list = col_defs
+        .iter()
+        .map(|_| "NULL")
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // ── Deleted rows: in snapshot but not in current foreign table ──
+    // These appear as 'D' (delete) rows in the change buffer.
+    let deleted_sql = format!(
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {old_col_list}, {new_col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'D', {pk_hash_expr}, {col_list}, {null_list} \
+         FROM (\
+           SELECT {col_list} FROM {snapshot_table} \
+           EXCEPT ALL \
+           SELECT {col_list} FROM {source_table}\
+         ) __pgt_del"
+    );
+    Spi::run(&deleted_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    // ── Inserted rows: in current foreign table but not in snapshot ──
+    // These appear as 'I' (insert) rows in the change buffer.
+    let inserted_sql = format!(
+        "INSERT INTO {change_table} (lsn, action, pk_hash, {new_col_list}, {old_col_list}) \
+         SELECT pg_current_wal_insert_lsn(), 'I', {pk_hash_expr}, {col_list}, {null_list} \
+         FROM (\
+           SELECT {col_list} FROM {source_table} \
+           EXCEPT ALL \
+           SELECT {col_list} FROM {snapshot_table}\
+         ) __pgt_ins"
+    );
+    Spi::run(&inserted_sql).map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    // ── Refresh snapshot — replace contents with current foreign table ──
+    Spi::run(&format!("TRUNCATE {snapshot_table}"))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    Spi::run(&format!(
+        "INSERT INTO {snapshot_table} SELECT * FROM {source_table}"
+    ))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    Ok(())
 }
 
 #[cfg(test)]

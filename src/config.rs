@@ -117,6 +117,36 @@ pub static PGS_BLOCK_SOURCE_DDL: GucSetting<bool> = GucSetting::<bool>::new(fals
 /// both high-throughput workloads (raise) and small tables (lower).
 pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 
+/// Maximum allowed grouping set branches for CUBE/ROLLUP expansion (EC-02).
+pub static PGS_MAX_GROUPING_SET_BRANCHES: GucSetting<i32> = GucSetting::<i32>::new(64);
+
+/// Maximum LIMIT value for TopK stream tables in IMMEDIATE mode.
+///
+/// TopK queries with `LIMIT > threshold` are rejected in IMMEDIATE mode
+/// because inline recomputation of large result sets adds unacceptable
+/// latency to the trigger path. Set to 0 to disable TopK in IMMEDIATE mode.
+pub static PGS_IVM_TOPK_MAX_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(1000);
+
+/// Buffer table partitioning mode (Task 3.3).
+///
+/// Controls whether change buffer tables use `PARTITION BY RANGE (lsn)`:
+/// - `"off"` (default): Unpartitioned heap tables (current behaviour).
+/// - `"on"`: Always partition. After each refresh cycle, old partitions
+///   are detached and dropped (O(1), no VACUUM needed).
+/// - `"auto"`: Enable partitioning for sources whose effective refresh
+///   schedule is >= 30 s (below that, DDL overhead exceeds VACUUM savings).
+pub static PGS_BUFFER_PARTITIONING: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"off"));
+
+/// Enable polling-based change detection for foreign tables (EC-05).
+///
+/// When enabled, foreign tables used in DIFFERENTIAL / IMMEDIATE mode
+/// defining queries will be supported via a snapshot-comparison approach:
+/// before each refresh cycle the scheduler materializes a snapshot of
+/// the foreign table into a local shadow table, then computes EXCEPT ALL
+/// deltas against the previous snapshot.
+pub static PGS_FOREIGN_TABLE_POLLING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -304,6 +334,52 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.max_grouping_set_branches",
+        c"Maximum allowed grouping set branches in CUBE/ROLLUP queries.",
+        c"Prevents parsing memory exhaustion during combinatorial expansion. \
+           Raise if you need more than 64 grouping set branches.",
+        &PGS_MAX_GROUPING_SET_BRANCHES,
+        1,
+        65536,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.ivm_topk_max_limit",
+        c"Maximum LIMIT for TopK stream tables in IMMEDIATE mode.",
+        c"TopK queries exceeding this LIMIT are rejected in IMMEDIATE mode. \
+           Set to 0 to disable TopK in IMMEDIATE mode entirely.",
+        &PGS_IVM_TOPK_MAX_LIMIT,
+        0,
+        1_000_000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"pg_trickle.buffer_partitioning",
+        c"Buffer table partitioning mode: off, on, or auto.",
+        c"'off' uses unpartitioned heap tables (default). \
+           'on' always uses PARTITION BY RANGE (lsn) for change buffers. \
+           'auto' enables partitioning for sources with refresh cycles >= 30s.",
+        &PGS_BUFFER_PARTITIONING,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.foreign_table_polling",
+        c"Enable polling-based CDC for foreign tables.",
+        c"When true, foreign tables in defining queries are supported via \
+           snapshot-comparison. A local shadow table stores the previous state; \
+           EXCEPT ALL computes the delta on each refresh cycle.",
+        &PGS_FOREIGN_TABLE_POLLING,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -401,4 +477,17 @@ pub fn pg_trickle_block_source_ddl() -> bool {
 /// Returns the buffer alert threshold (row count).
 pub fn pg_trickle_buffer_alert_threshold() -> i64 {
     PGS_BUFFER_ALERT_THRESHOLD.get() as i64
+}
+
+/// Returns the buffer partitioning mode: `"off"`, `"on"`, or `"auto"`.
+pub fn pg_trickle_buffer_partitioning() -> String {
+    PGS_BUFFER_PARTITIONING
+        .get()
+        .map(|cs| cs.to_str().unwrap_or("off").to_string())
+        .unwrap_or_else(|| "off".to_string())
+}
+
+/// Returns whether foreign table polling CDC is enabled.
+pub fn pg_trickle_foreign_table_polling() -> bool {
+    PGS_FOREIGN_TABLE_POLLING.get()
 }

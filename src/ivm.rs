@@ -28,10 +28,12 @@
 //!
 //! ## Current Limitations
 //!
-//! - Recursive CTEs (`WITH RECURSIVE`) are not yet supported in IMMEDIATE mode.
 //! - TRUNCATE on a base table causes a full refresh of the stream table.
 //! - Uses temp tables for transition table access (ENR-based access is a
 //!   future optimization).
+//! - Recursive CTEs emit a warning about potential stack-depth issues.
+//! - TopK tables use micro-refresh (recompute top-K on each DML) gated by
+//!   `pg_trickle.ivm_topk_max_limit`.
 
 use crate::error::PgTrickleError;
 use pgrx::prelude::*;
@@ -497,6 +499,13 @@ fn pgt_ivm_apply_delta(
         PgTrickleError::NotFound(format!("Stream table with pgt_id={pgt_id} not found"))
     })?;
 
+    // ── Task 5.2: TopK micro-refresh in IMMEDIATE mode ──────────────
+    // Instead of delta computation, recompute the top-K rows and diff
+    // against the current stream table contents.
+    if st.topk_limit.is_some() {
+        return apply_topk_micro_refresh(&st);
+    }
+
     // Try to get cached delta SQL template.
     let (delta_sql, user_columns) =
         get_or_compute_ivm_delta(pgt_id, source_oid_u32, has_new, has_old, &st)?;
@@ -623,6 +632,104 @@ fn pgt_ivm_apply_delta(
         pgt_id,
         source_oid_u32,
         delta_count,
+    );
+
+    Ok(())
+}
+
+/// Task 5.2: TopK micro-refresh for IMMEDIATE mode.
+///
+/// Instead of delta-based incremental maintenance, recompute the top-K rows
+/// using the full defining query (with ORDER BY + LIMIT) and diff against
+/// the current stream table contents. This is a "micro-full-refresh" scoped
+/// to K rows — fast enough for inline trigger execution when K is small.
+fn apply_topk_micro_refresh(st: &crate::catalog::StreamTableMeta) -> Result<(), PgTrickleError> {
+    let st_qualified = format!(
+        "\"{}\".\"{}\"",
+        st.pgt_schema.replace('"', "\"\""),
+        st.pgt_name.replace('"', "\"\""),
+    );
+
+    let topk_limit = st.topk_limit.ok_or_else(|| {
+        PgTrickleError::InternalError("TopK micro-refresh called on non-TopK stream table".into())
+    })?;
+    let topk_order = st.topk_order_by.as_deref().ok_or_else(|| {
+        PgTrickleError::InternalError("TopK stream table missing order_by metadata".into())
+    })?;
+
+    // Build the full TopK query from the stored defining query + metadata.
+    let topk_query = if let Some(offset) = st.topk_offset {
+        format!(
+            "{} ORDER BY {} LIMIT {} OFFSET {}",
+            st.defining_query, topk_order, topk_limit, offset
+        )
+    } else {
+        format!(
+            "{} ORDER BY {} LIMIT {}",
+            st.defining_query, topk_order, topk_limit
+        )
+    };
+
+    let row_id_expr = crate::dvm::row_id_expr_for_query(&st.defining_query);
+    let columns = crate::dvm::get_defining_query_columns(&st.defining_query)?;
+
+    // Materialize the new top-K into a temp table.
+    let new_topk = format!("__pgt_ivm_topk_{}", st.pgt_id);
+    let materialize = format!(
+        "CREATE TEMP TABLE {new_topk} ON COMMIT DROP AS \
+         SELECT {row_id_expr} AS __pgt_row_id, sub.* \
+         FROM ({topk_query}) sub"
+    );
+    Spi::run(&materialize).map_err(|e| {
+        PgTrickleError::SpiError(format!("TopK micro-refresh materialize failed: {e}"))
+    })?;
+
+    // DELETE rows that left the top-K.
+    let delete_sql = format!(
+        "DELETE FROM {st_qualified} AS t \
+         WHERE NOT EXISTS (\
+             SELECT 1 FROM {new_topk} AS n WHERE n.__pgt_row_id = t.__pgt_row_id\
+         )"
+    );
+    Spi::run(&delete_sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("TopK micro-refresh DELETE failed: {e}")))?;
+
+    // Build column lists for INSERT.
+    let col_list = columns
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let n_col_list = columns
+        .iter()
+        .map(|c| format!("n.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let update_set = columns
+        .iter()
+        .map(|c| {
+            let q = format!("\"{}\"", c.replace('"', "\"\""));
+            format!("{q} = EXCLUDED.{q}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // INSERT new rows that entered the top-K (or update changed rows).
+    let insert_sql = format!(
+        "INSERT INTO {st_qualified} (__pgt_row_id, {col_list}) \
+         SELECT n.__pgt_row_id, {n_col_list} \
+         FROM {new_topk} n \
+         ON CONFLICT (__pgt_row_id) DO UPDATE SET {update_set}"
+    );
+    Spi::run(&insert_sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("TopK micro-refresh INSERT failed: {e}")))?;
+
+    // Clean up.
+    let _ = Spi::run(&format!("DROP TABLE IF EXISTS {new_topk}"));
+
+    pgrx::debug1!(
+        "[pg_trickle] TopK micro-refresh applied for pgt_id={}",
+        st.pgt_id,
     );
 
     Ok(())

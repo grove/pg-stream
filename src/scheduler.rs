@@ -346,6 +346,14 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
         recover_from_crash();
     }));
 
+    // EC-20: Post-restart CDC TRANSITIONING health check.
+    // If the scheduler was restarted during an active TRIGGER→WAL transition,
+    // verify the transition is still valid. Invalid transitions (stale slot,
+    // missing publication) are rolled back to TRIGGER mode.
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        check_cdc_transition_health();
+    }));
+
     loop {
         // Wait for the configured interval or a signal.
         let should_continue = BackgroundWorker::wait_latch(Some(std::time::Duration::from_millis(
@@ -646,6 +654,85 @@ fn recover_from_crash() {
             "pg_trickle: crash recovery — marked {} interrupted refresh(es) as FAILED",
             updated
         );
+    }
+}
+
+// ── CDC Transition Health Check (EC-20) ────────────────────────────────────
+
+/// Check CDC transitions left in TRANSITIONING state after a scheduler restart.
+///
+/// If the scheduler crashed or was restarted during an active TRIGGER→WAL
+/// transition, the replication slot or publication may be in an inconsistent
+/// state. This function checks all TRANSITIONING dependencies and rolls back
+/// any that have stale or missing slots.
+fn check_cdc_transition_health() {
+    use crate::catalog::StDependency;
+
+    let deps = match StDependency::get_all() {
+        Ok(d) => d,
+        Err(e) => {
+            log!(
+                "pg_trickle: CDC health check — failed to load dependencies: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let transitioning: Vec<_> = deps
+        .iter()
+        .filter(|d| d.cdc_mode == crate::catalog::CdcMode::Transitioning)
+        .collect();
+
+    if transitioning.is_empty() {
+        return;
+    }
+
+    log!(
+        "pg_trickle: CDC health check — found {} source(s) in TRANSITIONING state after restart",
+        transitioning.len()
+    );
+
+    for dep in transitioning {
+        let slot_name = dep.slot_name.as_deref().unwrap_or("__pgt_missing_slot__");
+
+        // Check if the replication slot still exists
+        let slot_exists = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = '{}')",
+            slot_name.replace('\'', "''")
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+        if !slot_exists {
+            log!(
+                "pg_trickle: CDC health check — replication slot '{}' missing for source OID {}. \
+                 Rolling back to TRIGGER mode.",
+                slot_name,
+                dep.source_relid.to_u32()
+            );
+            // Roll back to TRIGGER mode
+            if let Err(e) = StDependency::update_cdc_mode(
+                dep.pgt_id,
+                dep.source_relid,
+                crate::catalog::CdcMode::Trigger,
+                None,
+                None,
+            ) {
+                log!(
+                    "pg_trickle: CDC health check — failed to rollback source OID {}: {}",
+                    dep.source_relid.to_u32(),
+                    e
+                );
+            }
+        } else {
+            log!(
+                "pg_trickle: CDC health check — source OID {} in TRANSITIONING with valid slot '{}'. \
+                 Normal transition will resume.",
+                dep.source_relid.to_u32(),
+                slot_name
+            );
+        }
     }
 }
 

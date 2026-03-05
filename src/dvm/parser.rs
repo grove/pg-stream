@@ -1492,6 +1492,294 @@ impl OpTree {
             OpTree::ScalarSubquery { child, .. } => child.collect_source_columns(map),
         }
     }
+
+    /// Prune `Scan.columns` to only those columns referenced by the
+    /// defining query (plus PK columns needed for row_id computation).
+    ///
+    /// This reduces I/O in `diff_scan_change_buffer()` — fewer `new_*` /
+    /// `old_*` columns are selected from the change buffer, which matters
+    /// for wide source tables where the view references only a few columns.
+    ///
+    /// The approach is conservative: we collect all column names referenced
+    /// anywhere in the tree's expressions, then intersect with each Scan's
+    /// column set. Unqualified column refs and `Raw` / `Star` expressions
+    /// cause the pass to bail out for safety (keeping all columns).
+    pub fn prune_scan_columns(&mut self) {
+        let mut refs = ColumnRefSet::default();
+        if !self.collect_all_column_refs(&mut refs) {
+            // Bail out — found Star/Raw that prevent safe pruning.
+            return;
+        }
+        self.apply_column_pruning(&refs);
+    }
+
+    /// Collect all `Expr::ColumnRef` occurrences in the tree.
+    ///
+    /// Returns `false` if an unparseable expression (`Star`, `Raw`) is
+    /// encountered, meaning pruning should be skipped.
+    fn collect_all_column_refs(&self, refs: &mut ColumnRefSet) -> bool {
+        match self {
+            OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => true,
+            OpTree::Project {
+                expressions, child, ..
+            } => {
+                for expr in expressions {
+                    if !collect_refs_from_expr(expr, refs) {
+                        return false;
+                    }
+                }
+                child.collect_all_column_refs(refs)
+            }
+            OpTree::Filter {
+                predicate, child, ..
+            } => {
+                if !collect_refs_from_expr(predicate, refs) {
+                    return false;
+                }
+                child.collect_all_column_refs(refs)
+            }
+            OpTree::InnerJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::LeftJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::FullJoin {
+                condition,
+                left,
+                right,
+            } => {
+                if !collect_refs_from_expr(condition, refs) {
+                    return false;
+                }
+                left.collect_all_column_refs(refs) && right.collect_all_column_refs(refs)
+            }
+            OpTree::Aggregate {
+                group_by,
+                aggregates,
+                child,
+            } => {
+                for expr in group_by {
+                    if !collect_refs_from_expr(expr, refs) {
+                        return false;
+                    }
+                }
+                for agg in aggregates {
+                    if !collect_refs_from_agg(agg, refs) {
+                        return false;
+                    }
+                }
+                child.collect_all_column_refs(refs)
+            }
+            OpTree::Distinct { child } => child.collect_all_column_refs(refs),
+            OpTree::UnionAll { children } => {
+                children.iter().all(|c| c.collect_all_column_refs(refs))
+            }
+            OpTree::Intersect { left, right, .. } | OpTree::Except { left, right, .. } => {
+                left.collect_all_column_refs(refs) && right.collect_all_column_refs(refs)
+            }
+            OpTree::Subquery { child, .. } => child.collect_all_column_refs(refs),
+            OpTree::RecursiveCte {
+                base, recursive, ..
+            } => base.collect_all_column_refs(refs) && recursive.collect_all_column_refs(refs),
+            OpTree::Window {
+                window_exprs,
+                partition_by,
+                pass_through,
+                child,
+            } => {
+                for we in window_exprs {
+                    for arg in &we.args {
+                        if !collect_refs_from_expr(arg, refs) {
+                            return false;
+                        }
+                    }
+                    for pb in &we.partition_by {
+                        if !collect_refs_from_expr(pb, refs) {
+                            return false;
+                        }
+                    }
+                    for ob in &we.order_by {
+                        if !collect_refs_from_expr(&ob.expr, refs) {
+                            return false;
+                        }
+                    }
+                }
+                for pb in partition_by {
+                    if !collect_refs_from_expr(pb, refs) {
+                        return false;
+                    }
+                }
+                for (expr, _) in pass_through {
+                    if !collect_refs_from_expr(expr, refs) {
+                        return false;
+                    }
+                }
+                child.collect_all_column_refs(refs)
+            }
+            OpTree::LateralFunction { .. } => {
+                // func_sql is raw SQL text — cannot extract refs, so bail
+                // out to avoid pruning columns the function might reference.
+                false
+            }
+            OpTree::LateralSubquery { .. } => {
+                // subquery_sql is raw SQL — same safety concern.
+                false
+            }
+            OpTree::SemiJoin {
+                condition,
+                left,
+                right,
+            }
+            | OpTree::AntiJoin {
+                condition,
+                left,
+                right,
+            } => {
+                if !collect_refs_from_expr(condition, refs) {
+                    return false;
+                }
+                left.collect_all_column_refs(refs) && right.collect_all_column_refs(refs)
+            }
+            OpTree::ScalarSubquery {
+                subquery, child, ..
+            } => subquery.collect_all_column_refs(refs) && child.collect_all_column_refs(refs),
+        }
+    }
+
+    /// Apply pruning to Scan nodes based on collected column references.
+    fn apply_column_pruning(&mut self, refs: &ColumnRefSet) {
+        match self {
+            OpTree::Scan {
+                columns,
+                pk_columns,
+                alias,
+                ..
+            } => {
+                // Qualified refs for this scan alias + all unqualified refs
+                let demanded: std::collections::HashSet<&str> = refs
+                    .qualified
+                    .get(alias.as_str())
+                    .into_iter()
+                    .flatten()
+                    .map(|s| s.as_str())
+                    .chain(refs.unqualified.iter().map(|s| s.as_str()))
+                    .collect();
+
+                columns.retain(|c| {
+                    demanded.contains(c.name.as_str()) || pk_columns.iter().any(|pk| pk == &c.name)
+                });
+            }
+            OpTree::Project { child, .. }
+            | OpTree::Filter { child, .. }
+            | OpTree::Distinct { child }
+            | OpTree::Subquery { child, .. }
+            | OpTree::LateralSubquery { child, .. }
+            | OpTree::LateralFunction { child, .. }
+            | OpTree::Window { child, .. } => {
+                child.apply_column_pruning(refs);
+            }
+            OpTree::ScalarSubquery {
+                subquery, child, ..
+            } => {
+                subquery.apply_column_pruning(refs);
+                child.apply_column_pruning(refs);
+            }
+            OpTree::Aggregate { child, .. } => child.apply_column_pruning(refs),
+            OpTree::InnerJoin { left, right, .. }
+            | OpTree::LeftJoin { left, right, .. }
+            | OpTree::FullJoin { left, right, .. }
+            | OpTree::Intersect { left, right, .. }
+            | OpTree::Except { left, right, .. }
+            | OpTree::SemiJoin { left, right, .. }
+            | OpTree::AntiJoin { left, right, .. } => {
+                left.apply_column_pruning(refs);
+                right.apply_column_pruning(refs);
+            }
+            OpTree::UnionAll { children } => {
+                for c in children {
+                    c.apply_column_pruning(refs);
+                }
+            }
+            OpTree::RecursiveCte {
+                base, recursive, ..
+            } => {
+                base.apply_column_pruning(refs);
+                recursive.apply_column_pruning(refs);
+            }
+            OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => {}
+        }
+    }
+}
+
+/// Accumulated column references from all expressions in an OpTree.
+#[derive(Default)]
+struct ColumnRefSet {
+    /// `alias → {column_names}` for qualified references (`t.col`).
+    qualified: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Column names without table qualifier.
+    unqualified: std::collections::HashSet<String>,
+}
+
+/// Extract column references from an expression.
+/// Returns `false` on Star/Raw (cannot determine exact columns).
+fn collect_refs_from_expr(expr: &Expr, refs: &mut ColumnRefSet) -> bool {
+    match expr {
+        Expr::ColumnRef {
+            table_alias: Some(alias),
+            column_name,
+        } => {
+            refs.qualified
+                .entry(alias.clone())
+                .or_default()
+                .insert(column_name.clone());
+            true
+        }
+        Expr::ColumnRef {
+            table_alias: None,
+            column_name,
+        } => {
+            refs.unqualified.insert(column_name.clone());
+            true
+        }
+        Expr::Literal(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            collect_refs_from_expr(left, refs) && collect_refs_from_expr(right, refs)
+        }
+        Expr::FuncCall { args, .. } => args.iter().all(|a| collect_refs_from_expr(a, refs)),
+        Expr::Star { .. } | Expr::Raw(_) => false,
+    }
+}
+
+/// Extract column references from an aggregate expression.
+fn collect_refs_from_agg(agg: &AggExpr, refs: &mut ColumnRefSet) -> bool {
+    if let Some(ref arg) = agg.argument
+        && !collect_refs_from_expr(arg, refs)
+    {
+        return false;
+    }
+    if let Some(ref second) = agg.second_arg
+        && !collect_refs_from_expr(second, refs)
+    {
+        return false;
+    }
+    if let Some(ref filter) = agg.filter
+        && !collect_refs_from_expr(filter, refs)
+    {
+        return false;
+    }
+    if let Some(ref owg) = agg.order_within_group {
+        for sort in owg {
+            if !collect_refs_from_expr(&sort.expr, refs) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2455,16 +2743,21 @@ fn check_immediate_support(tree: &OpTree) -> Result<(), PgTrickleError> {
             check_immediate_support(subquery)
         }
 
-        // ── Rejected constructs ─────────────────────────────────────
-
-        // Recursive CTEs use semi-naive evaluation with iteration.
-        // The fixpoint computation interacts with transaction state in ways
-        // that have not been validated with transition tables.
-        OpTree::RecursiveCte { .. } => Err(PgTrickleError::UnsupportedOperator(
-            "Recursive CTEs (WITH RECURSIVE) are not yet supported in IMMEDIATE \
-             mode. Use 'DIFFERENTIAL' mode instead."
-                .into(),
-        )),
+        // ── Recursive CTEs ────────────────────────────────────────
+        // Task 5.1: Allow recursive CTEs in IMMEDIATE mode.
+        // Semi-naive evaluation works with DeltaSource::TransitionTable;
+        // emit a warning about potential stack-depth issues for deep recursion.
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => {
+            pgrx::warning!(
+                "pg_trickle: WITH RECURSIVE in IMMEDIATE mode uses semi-naive evaluation \
+                 inside the trigger. Deep recursion may approach PostgreSQL's max_stack_depth \
+                 limit. Monitor for 'stack depth limit exceeded' errors."
+            );
+            check_immediate_support(base)?;
+            check_immediate_support(recursive)
+        }
     }
 }
 
@@ -3440,11 +3733,17 @@ unsafe fn check_from_item_for_matview_or_foreign(
                 )));
             }
             Some("f") => {
-                return Err(PgTrickleError::UnsupportedOperator(format!(
-                    "Foreign table '{schema}.{relname}' cannot be used as a source in \
-                     DIFFERENTIAL mode. Row-level triggers cannot be created on foreign tables. \
-                     Use FULL refresh mode instead."
-                )));
+                if !crate::config::pg_trickle_foreign_table_polling() {
+                    return Err(PgTrickleError::UnsupportedOperator(format!(
+                        "Foreign table '{schema}.{relname}' cannot be used as a source in \
+                         DIFFERENTIAL or IMMEDIATE mode. Row-level triggers cannot be created \
+                         on foreign tables. Use FULL refresh mode instead, which re-queries \
+                         the foreign table on each refresh cycle. For postgres_fdw tables, \
+                         consider using IMPORT FOREIGN SCHEMA to keep the local schema in sync. \
+                         Alternatively, enable polling-based CDC with: \
+                         SET pg_trickle.foreign_table_polling = on;"
+                    )));
+                }
             }
             _ => {}
         }
@@ -3831,13 +4130,15 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgTrickleError> {
         // Guard against combinatorial explosion: CUBE(n) produces 2^n branches,
         // ROLLUP(n) produces n+1, combined CUBE+ROLLUP can easily exceed memory.
         // Reject early rather than building a query too large for PG to parse (G5.2).
-        const MAX_GROUPING_BRANCHES: usize = 64;
-        if final_sets.len() > MAX_GROUPING_BRANCHES {
+        // EC-02: Limit is configurable via pg_trickle.max_grouping_set_branches GUC.
+        let max_grouping_branches = crate::config::PGS_MAX_GROUPING_SET_BRANCHES.get() as usize;
+        if final_sets.len() > max_grouping_branches {
             return Err(PgTrickleError::QueryParseError(format!(
                 "CUBE/ROLLUP generates {} grouping set branches which exceeds the limit of {}. \
-                 Use explicit GROUPING SETS(...) to enumerate only the required combinations.",
+                 Use explicit GROUPING SETS(...) to enumerate only the required combinations, \
+                 or raise pg_trickle.max_grouping_set_branches.",
                 final_sets.len(),
-                MAX_GROUPING_BRANCHES
+                max_grouping_branches
             )));
         }
     }
@@ -5376,6 +5677,429 @@ fn deparse_order_clause(select: &pg_sys::SelectStmt) -> String {
     } else {
         format!(" ORDER BY {}", sorts.join(", "))
     }
+}
+
+// ── ROWS FROM() multi-function rewrite ─────────────────────────────
+
+/// Rewrite `ROWS FROM(f1(...), f2(...), ...)` into a form the DVM parser
+/// supports.
+///
+/// **All-unnest optimisation:** when every function is `unnest`, merge into
+/// a single multi-argument `unnest(A, B, ...)` call — PostgreSQL's built-in
+/// multi-arg `unnest()` already implements zip-with-NULL-padding semantics.
+///
+/// **General case:** rewrite to an ordinal-based LEFT JOIN LATERAL chain:
+/// ```sql
+/// generate_series(1, 2147483647) WITH ORDINALITY AS __pgt_idx(v, ord)
+/// LEFT JOIN LATERAL f1(...) WITH ORDINALITY AS __pgt_f0(col, ord)
+///   ON __pgt_f0.ord = __pgt_idx.ord
+/// LEFT JOIN LATERAL f2(...) WITH ORDINALITY AS __pgt_f1(col, ord)
+///   ON __pgt_f1.ord = __pgt_idx.ord
+/// ```
+/// with a `WHERE __pgt_f0.ord IS NOT NULL OR __pgt_f1.ord IS NOT NULL`
+/// filter to stop the infinite `generate_series` once all SRFs are exhausted.
+pub fn rewrite_rows_from(query: &str) -> Result<String, PgTrickleError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return Ok(query.to_string()),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(query.to_string());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // Set operations — recurse into each branch.
+    if select.op != pg_sys::SetOperation::SETOP_NONE {
+        return rewrite_rows_from_in_set_op(select);
+    }
+
+    // Walk the FROM clause looking for a multi-function ROWS FROM.
+    if select.fromClause.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    let mut found_rows_from = false;
+    for node_ptr in from_list.iter_ptr() {
+        if node_ptr.is_null() {
+            continue;
+        }
+        if unsafe { has_multi_rows_from(node_ptr) } {
+            found_rows_from = true;
+            break;
+        }
+    }
+
+    if !found_rows_from {
+        return Ok(query.to_string());
+    }
+
+    // ── Extract query components ─────────────────────────────────────
+
+    // SELECT list
+    let target_sql = unsafe { deparse_target_list(select.targetList)? };
+
+    // WHERE clause
+    let where_sql = if select.whereClause.is_null() {
+        None
+    } else {
+        let expr = unsafe { node_to_expr(select.whereClause)? };
+        Some(expr.to_sql())
+    };
+
+    // GROUP BY
+    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+    let group_sql = if group_list.is_empty() {
+        None
+    } else {
+        let mut groups = Vec::new();
+        for gn in group_list.iter_ptr() {
+            let expr = unsafe { node_to_expr(gn)? };
+            groups.push(expr.to_sql());
+        }
+        Some(groups.join(", "))
+    };
+
+    // HAVING
+    let having_sql = if select.havingClause.is_null() {
+        None
+    } else {
+        let expr = unsafe { node_to_expr(select.havingClause)? };
+        Some(expr.to_sql())
+    };
+
+    // ORDER BY + LIMIT + OFFSET
+    let order_sql = deparse_order_clause(select);
+    let limit_sql = if select.limitCount.is_null() {
+        None
+    } else {
+        let expr = unsafe { node_to_expr(select.limitCount)? };
+        Some(expr.to_sql())
+    };
+    let offset_sql = if select.limitOffset.is_null() {
+        None
+    } else {
+        let expr = unsafe { node_to_expr(select.limitOffset)? };
+        Some(expr.to_sql())
+    };
+
+    // DISTINCT
+    let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.distinctClause) };
+    let distinct_prefix = if !distinct_list.is_empty() {
+        "SELECT DISTINCT"
+    } else {
+        "SELECT"
+    };
+
+    // ── Rewrite FROM items ──────────────────────────────────────────
+    let mut from_parts = Vec::new();
+    for node_ptr in from_list.iter_ptr() {
+        if node_ptr.is_null() {
+            continue;
+        }
+        let sql = unsafe { rewrite_from_item_rows_from(node_ptr)? };
+        from_parts.push(sql);
+    }
+
+    // ── Rebuild query ───────────────────────────────────────────────
+    let mut parts = Vec::new();
+    parts.push(format!("{distinct_prefix} {target_sql}"));
+    parts.push(format!("FROM {}", from_parts.join(", ")));
+    if let Some(w) = &where_sql {
+        parts.push(format!("WHERE {w}"));
+    }
+    if let Some(g) = &group_sql {
+        parts.push(format!("GROUP BY {g}"));
+    }
+    if let Some(h) = &having_sql {
+        parts.push(format!("HAVING {h}"));
+    }
+    if !order_sql.is_empty() {
+        parts.push(order_sql.trim().to_string());
+    }
+    if let Some(l) = &limit_sql {
+        parts.push(format!("LIMIT {l}"));
+    }
+    if let Some(o) = &offset_sql {
+        parts.push(format!("OFFSET {o}"));
+    }
+
+    let rewritten = parts.join(" ");
+    pgrx::debug1!("[pg_trickle] rewrite_rows_from: {}", rewritten);
+    Ok(rewritten)
+}
+
+/// Check if a FROM-clause node is (or contains) a multi-function ROWS FROM.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree Node.
+unsafe fn has_multi_rows_from(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
+        let rf = unsafe { &*(node as *const pg_sys::RangeFunction) };
+        let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
+        return rf.is_rowsfrom && func_list.len() > 1;
+    }
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        return unsafe { has_multi_rows_from(join.larg) || has_multi_rows_from(join.rarg) };
+    }
+    false
+}
+
+/// Rewrite a single FROM-clause item, replacing any multi-function ROWS FROM
+/// with its rewritten equivalent.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid parse tree Node.
+unsafe fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
+    if node.is_null() {
+        return Ok("".to_string());
+    }
+
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
+        let rf = unsafe { &*(node as *const pg_sys::RangeFunction) };
+        let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
+
+        if !rf.is_rowsfrom || func_list.len() <= 1 {
+            // Single function — deparse normally.
+            return unsafe { deparse_from_item_to_sql(node) };
+        }
+
+        // ── Multi-function ROWS FROM ────────────────────────────────
+        // Extract each function call + its args.
+        let mut func_sqls: Vec<String> = Vec::new();
+        let mut func_names: Vec<String> = Vec::new();
+        let mut func_args: Vec<Vec<String>> = Vec::new();
+
+        for inner_node in func_list.iter_ptr() {
+            if inner_node.is_null() {
+                continue;
+            }
+            let inner_list =
+                unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_node as *mut pg_sys::List) };
+            if inner_list.is_empty() {
+                continue;
+            }
+            let func_node = inner_list.head().unwrap();
+            if !unsafe { pgrx::is_a(func_node, pg_sys::NodeTag::T_FuncCall) } {
+                continue;
+            }
+            let fcall = unsafe { &*(func_node as *const pg_sys::FuncCall) };
+            let name = unsafe { extract_func_name(fcall.funcname)? };
+            let sql = unsafe { deparse_func_call(func_node as *const pg_sys::FuncCall)? };
+
+            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let mut args = Vec::new();
+            for n in args_list.iter_ptr() {
+                let expr = unsafe { node_to_expr(n)? };
+                args.push(expr.to_sql());
+            }
+
+            func_names.push(name);
+            func_sqls.push(sql);
+            func_args.push(args);
+        }
+
+        if func_sqls.is_empty() {
+            return Ok("(SELECT 1 WHERE false) AS __pgt_empty".to_string());
+        }
+
+        // Extract alias + column aliases from the ROWS FROM node.
+        let rows_alias = if !rf.alias.is_null() {
+            let a = unsafe { &*(rf.alias) };
+            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
+                .to_str()
+                .unwrap_or("__pgt_rf")
+                .to_string()
+        } else {
+            "__pgt_rf".to_string()
+        };
+        let col_aliases = if !rf.alias.is_null() {
+            let a = unsafe { &*(rf.alias) };
+            extract_alias_colnames(a)?
+        } else {
+            Vec::new()
+        };
+
+        let with_ordinality = rf.ordinality;
+
+        // ── All-unnest optimisation ─────────────────────────────────
+        let all_unnest = func_names.iter().all(|n| n == "unnest");
+        if all_unnest {
+            // Merge: ROWS FROM(unnest(A), unnest(B)) → unnest(A, B) AS t(c1, c2)
+            let all_args: Vec<String> = func_args.iter().flat_map(|a| a.clone()).collect();
+            let mut result = format!("unnest({})", all_args.join(", "));
+            if with_ordinality {
+                result.push_str(" WITH ORDINALITY");
+            }
+            if !col_aliases.is_empty() {
+                result.push_str(&format!(" AS {}({})", rows_alias, col_aliases.join(", ")));
+            } else {
+                result.push_str(&format!(" AS {rows_alias}"));
+            }
+            return Ok(result);
+        }
+
+        // ── General case: ordinal-based LEFT JOIN LATERAL chain ─────
+        // Build:
+        //   (SELECT __pgt_f0.*, __pgt_f1.* FROM
+        //     generate_series(1, 2147483647) AS __pgt_idx(v)
+        //     LEFT JOIN LATERAL (SELECT f0_result.*, row_number() OVER () AS __pgt_ord
+        //                        FROM f0(...) AS f0_result) AS __pgt_f0
+        //       ON __pgt_f0.__pgt_ord = __pgt_idx.v
+        //     LEFT JOIN LATERAL (SELECT f1_result.*, row_number() OVER () AS __pgt_ord
+        //                        FROM f1(...) AS f1_result) AS __pgt_f1
+        //       ON __pgt_f1.__pgt_ord = __pgt_idx.v
+        //     WHERE __pgt_f0.__pgt_ord IS NOT NULL
+        //        OR __pgt_f1.__pgt_ord IS NOT NULL
+        //   ) AS alias
+        let mut join_parts = Vec::new();
+        let mut where_parts = Vec::new();
+        let mut select_parts = Vec::new();
+
+        for (i, func_sql) in func_sqls.iter().enumerate() {
+            let f_alias = format!("__pgt_f{i}");
+            let inner_alias = format!("__pgt_fi{i}");
+
+            // Each SRF is wrapped in a subquery that adds row_number() for
+            // ordinal matching.
+            let lateral_sql = format!(
+                "LATERAL (SELECT {inner_alias}.*, row_number() OVER () AS __pgt_ord \
+                 FROM {func_sql} AS {inner_alias}) AS {f_alias}"
+            );
+            join_parts.push(format!(
+                "LEFT JOIN {lateral_sql} ON {f_alias}.__pgt_ord = __pgt_idx.v"
+            ));
+            where_parts.push(format!("{f_alias}.__pgt_ord IS NOT NULL"));
+            select_parts.push(format!("{f_alias}.*"));
+        }
+
+        let inner_select = select_parts.join(", ");
+        let inner_from = format!(
+            "generate_series(1, 2147483647) AS __pgt_idx(v) {}",
+            join_parts.join(" ")
+        );
+        let inner_where = where_parts.join(" OR ");
+
+        let mut result = format!("(SELECT {inner_select} FROM {inner_from} WHERE {inner_where})");
+        if with_ordinality {
+            // Ordinality for the whole ROWS FROM — add row_number outside.
+            result = format!(
+                "(SELECT __pgt_rfo.*, row_number() OVER () AS ordinality \
+                 FROM {result} AS __pgt_rfo)"
+            );
+        }
+        if !col_aliases.is_empty() {
+            result.push_str(&format!(" AS {}({})", rows_alias, col_aliases.join(", ")));
+        } else {
+            result.push_str(&format!(" AS {rows_alias}"));
+        }
+
+        Ok(result)
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
+        // Recurse into join children.
+        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+        let left = unsafe { rewrite_from_item_rows_from(join.larg)? };
+        let right = unsafe { rewrite_from_item_rows_from(join.rarg)? };
+        let join_type = match join.jointype {
+            pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
+            pg_sys::JoinType::JOIN_FULL => "FULL JOIN",
+            pg_sys::JoinType::JOIN_RIGHT => "RIGHT JOIN",
+            pg_sys::JoinType::JOIN_INNER => {
+                if join.quals.is_null() {
+                    "CROSS JOIN"
+                } else {
+                    "JOIN"
+                }
+            }
+            _ => "JOIN",
+        };
+        let on_clause = if join.quals.is_null() {
+            String::new()
+        } else {
+            let cond = unsafe { node_to_expr(join.quals)? };
+            format!(" ON {}", cond.to_sql())
+        };
+        Ok(format!("{left} {join_type} {right}{on_clause}"))
+    } else {
+        // Not a ROWS FROM — deparse normally using existing helper.
+        unsafe { deparse_from_item_to_sql(node) }
+    }
+}
+
+/// Handle UNION/INTERSECT/EXCEPT branches for ROWS FROM rewriting.
+fn rewrite_rows_from_in_set_op(select: &pg_sys::SelectStmt) -> Result<String, PgTrickleError> {
+    // Recurse into each branch, rewrite, then reconstruct.
+    let left = if select.larg.is_null() {
+        return Ok(String::new());
+    } else {
+        let left_select = unsafe { &*select.larg };
+        if left_select.op != pg_sys::SetOperation::SETOP_NONE {
+            rewrite_rows_from_in_set_op(left_select)?
+        } else {
+            // Leaf branch — build a temporary query and rewrite it.
+            let leaf_sql = unsafe { deparse_select_stmt_to_sql(select.larg as *const _)? };
+            rewrite_rows_from(&leaf_sql)?
+        }
+    };
+
+    let right = if select.rarg.is_null() {
+        return Ok(left);
+    } else {
+        let right_select = unsafe { &*select.rarg };
+        if right_select.op != pg_sys::SetOperation::SETOP_NONE {
+            rewrite_rows_from_in_set_op(right_select)?
+        } else {
+            let leaf_sql = unsafe { deparse_select_stmt_to_sql(select.rarg as *const _)? };
+            rewrite_rows_from(&leaf_sql)?
+        }
+    };
+
+    let op_str = match select.op {
+        pg_sys::SetOperation::SETOP_UNION => {
+            if select.all {
+                "UNION ALL"
+            } else {
+                "UNION"
+            }
+        }
+        pg_sys::SetOperation::SETOP_INTERSECT => {
+            if select.all {
+                "INTERSECT ALL"
+            } else {
+                "INTERSECT"
+            }
+        }
+        pg_sys::SetOperation::SETOP_EXCEPT => {
+            if select.all {
+                "EXCEPT ALL"
+            } else {
+                "EXCEPT"
+            }
+        }
+        _ => "UNION",
+    };
+
+    Ok(format!("{left} {op_str} {right}"))
 }
 
 // ── Multiple PARTITION BY → multi-pass window rewrite ──────────────
@@ -7775,11 +8499,18 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrick
 
     // Check for set operations — use the `op` field rather than larg/rarg nullness
     // because PG18 may leave larg/rarg non-null on non-union SelectStmt nodes.
-    let tree = if select.op != pg_sys::SetOperation::SETOP_NONE {
+    let mut tree = if select.op != pg_sys::SetOperation::SETOP_NONE {
         unsafe { parse_set_operation(select, &mut cte_ctx)? }
     } else {
         unsafe { parse_select_stmt(select, query, &mut cte_ctx)? }
     };
+
+    // Prune Scan columns to only those referenced by the defining query,
+    // reducing the number of new_*/old_* columns read from change buffers.
+    tree.prune_scan_columns();
+    for (_, cte_tree) in &mut cte_ctx.registry.entries {
+        cte_tree.prune_scan_columns();
+    }
 
     Ok(ParseResult {
         tree,
@@ -16140,5 +16871,186 @@ mod tests {
             strip_view_definition_suffix("SELECT ';' FROM t;"),
             "SELECT ';' FROM t"
         );
+    }
+
+    // ── Column-pruning tests ────────────────────────────────────────
+
+    fn make_scan_pk(alias: &str, oid: u32, col_names: &[&str], pk: &[&str]) -> OpTree {
+        OpTree::Scan {
+            table_oid: oid,
+            table_name: alias.to_string(),
+            schema: "public".to_string(),
+            columns: col_names.iter().map(|n| make_column(n)).collect(),
+            pk_columns: pk.iter().map(|s| s.to_string()).collect(),
+            alias: alias.to_string(),
+        }
+    }
+
+    fn col_names(tree: &OpTree) -> Vec<String> {
+        match tree {
+            OpTree::Scan { columns, .. } => columns.iter().map(|c| c.name.clone()).collect(),
+            _ => panic!("expected Scan"),
+        }
+    }
+
+    #[test]
+    fn test_prune_scan_columns_project_qualified() {
+        // SELECT t.a, t.b FROM t(a, b, c, d)  →  Scan keeps {a, b}
+        let mut tree = OpTree::Project {
+            expressions: vec![qualified_col("t", "a"), qualified_col("t", "b")],
+            aliases: vec!["a".into(), "b".into()],
+            child: Box::new(scan_node("t", 1, &["a", "b", "c", "d"])),
+        };
+        tree.prune_scan_columns();
+        let OpTree::Project { child, .. } = &tree else {
+            panic!()
+        };
+        assert_eq!(col_names(child), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_prune_scan_columns_keeps_pk() {
+        // SELECT t.b FROM t(id, a, b) with PK=id  →  Scan keeps {id, b}
+        let mut tree = OpTree::Project {
+            expressions: vec![qualified_col("t", "b")],
+            aliases: vec!["b".into()],
+            child: Box::new(make_scan_pk("t", 1, &["id", "a", "b"], &["id"])),
+        };
+        tree.prune_scan_columns();
+        let OpTree::Project { child, .. } = &tree else {
+            panic!()
+        };
+        let mut names = col_names(child);
+        names.sort();
+        assert_eq!(names, vec!["b", "id"]);
+    }
+
+    #[test]
+    fn test_prune_scan_columns_filter_refs() {
+        // SELECT t.a FROM t(a, b, c) WHERE t.b > 0  →  Scan keeps {a, b}
+        let mut tree = OpTree::Project {
+            expressions: vec![qualified_col("t", "a")],
+            aliases: vec!["a".into()],
+            child: Box::new(OpTree::Filter {
+                predicate: qualified_col("t", "b"),
+                child: Box::new(scan_node("t", 1, &["a", "b", "c"])),
+            }),
+        };
+        tree.prune_scan_columns();
+        let OpTree::Project {
+            child: filter_box, ..
+        } = &tree
+        else {
+            panic!()
+        };
+        let OpTree::Filter { child, .. } = filter_box.as_ref() else {
+            panic!()
+        };
+        let mut names = col_names(child);
+        names.sort();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_prune_scan_columns_star_skips_pruning() {
+        // SELECT * FROM t(a, b, c)  →  Scan keeps all (Star bail-out)
+        let mut tree = OpTree::Project {
+            expressions: vec![Expr::Star { table_alias: None }],
+            aliases: vec!["*".into()],
+            child: Box::new(scan_node("t", 1, &["a", "b", "c"])),
+        };
+        tree.prune_scan_columns();
+        let OpTree::Project { child, .. } = &tree else {
+            panic!()
+        };
+        assert_eq!(col_names(child), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_prune_scan_columns_raw_skips_pruning() {
+        // Raw expression bail-out
+        let mut tree = OpTree::Project {
+            expressions: vec![Expr::Raw("t.a + 1".into())],
+            aliases: vec!["expr".into()],
+            child: Box::new(scan_node("t", 1, &["a", "b"])),
+        };
+        tree.prune_scan_columns();
+        let OpTree::Project { child, .. } = &tree else {
+            panic!()
+        };
+        assert_eq!(col_names(child), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_prune_scan_columns_unqualified_ref_matches_all_scans() {
+        // Unqualified column ref `a` should be kept in all scans
+        // SELECT a FROM t1(a, b) JOIN t2(a, c) ON ...
+        let mut tree = OpTree::Project {
+            expressions: vec![col("a")],
+            aliases: vec!["a".into()],
+            child: Box::new(OpTree::InnerJoin {
+                condition: Expr::BinaryOp {
+                    op: "=".into(),
+                    left: Box::new(qualified_col("t1", "a")),
+                    right: Box::new(qualified_col("t2", "a")),
+                },
+                left: Box::new(scan_node("t1", 1, &["a", "b"])),
+                right: Box::new(scan_node("t2", 2, &["a", "c"])),
+            }),
+        };
+        tree.prune_scan_columns();
+        let OpTree::Project { child, .. } = &tree else {
+            panic!()
+        };
+        let OpTree::InnerJoin { left, right, .. } = child.as_ref() else {
+            panic!()
+        };
+        assert_eq!(col_names(left), vec!["a"]);
+        assert_eq!(col_names(right), vec!["a"]);
+    }
+
+    #[test]
+    fn test_prune_scan_columns_join_condition() {
+        // Join condition refs are collected
+        let mut tree = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(qualified_col("t1", "id")),
+                right: Box::new(qualified_col("t2", "t1_id")),
+            },
+            left: Box::new(scan_node("t1", 1, &["id", "name", "extra"])),
+            right: Box::new(scan_node("t2", 2, &["t1_id", "val", "extra"])),
+        };
+        tree.prune_scan_columns();
+        let OpTree::InnerJoin { left, right, .. } = &tree else {
+            panic!()
+        };
+        assert_eq!(col_names(left), vec!["id"]);
+        assert_eq!(col_names(right), vec!["t1_id"]);
+    }
+
+    #[test]
+    fn test_prune_scan_columns_aggregate() {
+        // SELECT t.dept, SUM(t.salary) FROM t(id, dept, salary, name)
+        let mut tree = OpTree::Aggregate {
+            group_by: vec![qualified_col("t", "dept")],
+            aggregates: vec![AggExpr {
+                function: AggFunc::Sum,
+                argument: Some(qualified_col("t", "salary")),
+                alias: "total".into(),
+                is_distinct: false,
+                second_arg: None,
+                filter: None,
+                order_within_group: None,
+            }],
+            child: Box::new(scan_node("t", 1, &["id", "dept", "salary", "name"])),
+        };
+        tree.prune_scan_columns();
+        let OpTree::Aggregate { child, .. } = &tree else {
+            panic!()
+        };
+        let mut names = col_names(child);
+        names.sort();
+        assert_eq!(names, vec!["dept", "salary"]);
     }
 }

@@ -1408,6 +1408,36 @@ CREATE EVENT TRIGGER guard_source_ddl ON ddl_command_end
 EXECUTE FUNCTION prevent_source_ddl();
 ```
 
+### What happens if I run DDL on a source table during an active refresh? {#ec-17}
+
+**PostgreSQL's locking mechanism prevents most conflicts.** The refresh transaction acquires a `ShareLock` on source tables before reading them. Since `ALTER TABLE` (including `ADD COLUMN`, `DROP COLUMN`, `ALTER TYPE`) requires an `AccessExclusiveLock`, the DDL statement **blocks** until the refresh transaction completes.
+
+In practice:
+- **During a refresh:** The ALTER TABLE waits for the refresh to finish, then proceeds. pg_trickle's DDL event trigger then detects the change and marks the stream table for reinitialization.
+- **Between refreshes:** DDL proceeds immediately. The next refresh picks up the reinitialization flag.
+
+There is a tiny theoretical window between lock acquisition and the first read where DDL could sneak in, but this is prevented by PostgreSQL's MVCC — the refresh's snapshot was taken before the DDL committed, so it reads the old schema regardless.
+
+**If `pg_trickle.block_source_ddl = true`:** Column-affecting DDL on tracked source tables is rejected entirely with an ERROR, regardless of whether a refresh is running.
+
+### Do stream tables work with logical replication? {#ec-21-22-23}
+
+**Stream tables are replicated to standbys via physical (streaming) replication** like any other heap table. However, they are **not** automatically maintained by pg_trickle on the subscriber:
+
+| Aspect | Primary | Physical standby | Logical subscriber |
+|---|---|---|---|
+| **Scheduler runs** | Yes | No (read-only) | No (no pg_trickle catalog) |
+| **Stream tables readable** | Yes | Yes (replicated) | Only if published |
+| **Refreshes occur** | Yes | No (standby is read-only) | No |
+| **Change buffers** | Managed by pg_trickle | Replicated but not consumed | Not available |
+
+**Key limitations:**
+- Change buffer tables (`pgtrickle_changes.*`) are **not published** through logical replication — they are internal transient data.
+- The pg_trickle catalog (`pgtrickle.pgt_stream_tables`) is not replicated through logical replication.
+- On a physical standby, stream tables receive updates through streaming replication with the usual replication lag.
+
+**Recommended pattern:** Run pg_trickle on the primary only. Read stream tables from any physical standby.
+
 ---
 
 ## Performance & Tuning

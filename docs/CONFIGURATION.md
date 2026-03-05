@@ -24,6 +24,9 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
   - [pg\_trickle.cdc\_mode](#pg_tricklecdc_mode)
   - [pg\_trickle.wal\_transition\_timeout](#pg_tricklewal_transition_timeout)
+  - [pg\_trickle.buffer\_alert\_threshold](#pg_ticklebuffer_alert_threshold)
+  - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
+  - [pg\_trickle.ivm\_topk\_max\_limit](#pg_trickleivm_topk_max_limit)
 - [Complete postgresql.conf Example](#complete-postgresqlconf-example)
 - [Runtime Configuration](#runtime-configuration)
 - [Further Reading](#further-reading)
@@ -32,7 +35,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 ## Overview
 
-pg_trickle exposes sixteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_trickle exposes nineteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -465,6 +468,56 @@ SET pg_trickle.wal_transition_timeout = 300;
 
 ---
 
+### pg_trickle.buffer_alert_threshold
+
+When any source table's change buffer exceeds this number of rows, a
+`BufferGrowthWarning` alert is emitted. Raise for high-throughput workloads,
+lower for small tables.
+
+**Default:** `1000000` (1 million rows)  
+**Range:** `1000` – `100000000`
+
+```sql
+SET pg_trickle.buffer_alert_threshold = 500000;
+```
+
+---
+
+### pg_trickle.max_grouping_set_branches
+
+Maximum allowed grouping set branches in `CUBE`/`ROLLUP` queries.
+`CUBE(n)` produces $2^n$ branches — without a limit, large cubes cause
+memory exhaustion during parsing. Users who genuinely need more than
+64 branches can raise this GUC.
+
+**Default:** `64`  
+**Range:** `1` – `65536`
+
+```sql
+-- Allow up to 128 grouping set branches
+SET pg_trickle.max_grouping_set_branches = 128;
+```
+
+---
+
+### pg_trickle.ivm_topk_max_limit
+
+Maximum `LIMIT` value for TopK stream tables in **IMMEDIATE** mode.
+TopK queries exceeding this threshold are rejected because the inline
+micro-refresh (recomputing top-K rows on every DML statement) adds
+latency proportional to `LIMIT`. Set to `0` to disable TopK in
+IMMEDIATE mode entirely.
+
+**Default:** `1000`  
+**Range:** `0` – `1000000`
+
+```sql
+-- Allow TopK up to LIMIT 5000 in IMMEDIATE mode
+SET pg_trickle.ivm_topk_max_limit = 5000;
+```
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -489,6 +542,9 @@ pg_trickle.user_triggers = 'auto'
 pg_trickle.block_source_ddl = false
 pg_trickle.cdc_mode = 'trigger'
 pg_trickle.wal_transition_timeout = 300
+pg_trickle.buffer_alert_threshold = 1000000
+pg_trickle.max_grouping_set_branches = 64
+pg_trickle.ivm_topk_max_limit = 1000
 ```
 
 ---

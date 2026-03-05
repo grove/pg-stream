@@ -110,11 +110,12 @@ ALL approach is already correct and benchmarked.
 | **Impact** | Creation error |
 | **Current mitigation** | Use explicit `GROUPING SETS(…)` |
 | **Documented in** | SQL_REFERENCE § "CUBE/ROLLUP Expansion Limit" |
+| **Status** | ✅ **Done** — `pg_trickle.max_grouping_set_branches` GUC (default 64, range 1–65536) |
 
-**Proposed fix:** The 64-branch limit is a sensible guard. Keep it but make
-the limit configurable via a GUC (`pg_trickle.max_grouping_set_branches`,
-default 64) so power users can raise it when they accept the memory cost.
-**Tier P3** — the explicit `GROUPING SETS` workaround is adequate.
+**Proposed fix:** ~~The 64-branch limit is a sensible guard. Keep it but make
+the limit configurable via a GUC~~ **Implemented:** `PGS_MAX_GROUPING_SET_BRANCHES`
+in `src/config.rs`; parser.rs reads GUC dynamically instead of const.
+Documented in CONFIGURATION.md.
 
 ---
 
@@ -183,18 +184,18 @@ recursion should use FULL mode.
 | **Impact** | Creation error |
 | **Current mitigation** | Use FULL mode |
 | **Documented in** | SQL_REFERENCE § "Source Tables" |
+| **Status** | ✅ **IMPLEMENTED** — error message improved + polling CDC implemented |
 
 **Proposed fix:**
 
-1. **Short term:** Improve the error message to suggest `FULL` mode
+1. ✅ **Short term (Done):** Improved the error message to suggest `FULL` mode
    explicitly and mention the `postgres_fdw` + `IMPORT FOREIGN SCHEMA`
    pattern.
-2. **Medium term:** Investigate a polling-based CDC fallback for foreign
-   tables — compare a hash of `SELECT * FROM ft LIMIT batch_size` on each
-   cycle. This is essentially what FULL mode does, but scoped to detect
-   whether *any* change occurred so we can skip the refresh when nothing
-   changed. Could reduce refresh cost by 50–90% for slowly-changing
-   foreign tables.
+2. ✅ **Medium term (Done):** Polling-based CDC for foreign tables. Enabled via
+   `pg_trickle.foreign_table_polling = on` GUC. Creates a snapshot table per
+   foreign table source; before each differential refresh, computes EXCEPT ALL
+   deltas and populates the standard change buffer. Snapshot is refreshed each
+   cycle. Cleanup path drops snapshot tables when STs are removed.
 
 ---
 
@@ -296,18 +297,18 @@ affected rows.
 | **Impact** | Creation / alter error |
 | **Current mitigation** | Use DIFFERENTIAL mode |
 | **Documented in** | FAQ § "What SQL features are NOT supported in IMMEDIATE mode?" |
+| **Status** | ✅ **Done** — recursive CTEs + TopK now supported in IMMEDIATE mode |
 
-**Proposed fix (recursive CTEs + TopK): deferred to PLAN_TRANSACTIONAL_IVM_PART_2.md Phase 5.**
+**Proposed fix (recursive CTEs + TopK): ~~deferred to~~ implemented from PLAN_TRANSACTIONAL_IVM_PART_2.md Phase 5.**
 
-Implementation plans for both constructs now exist in Part 2:
+Both constructs are now implemented:
 
-- **Recursive CTEs (G10 / Task 5.1):** Validate that the existing semi-naive
-  evaluation works correctly with `DeltaSource::TransitionTable`; remove the
-  `RecursiveCte` rejection from `check_immediate_support()` once validated.
-  A `max_stack_depth` guard is added before fixpoint iteration.
-- **TopK (G11 / Task 5.2):** Implement statement-level micro-refresh: compute
-  the new top K, diff against current stream table contents, apply
-  DELETE + INSERT. Guarded by a `pg_trickle.ivm_topk_max_limit` GUC
+- **Recursive CTEs (G10 / Task 5.1):** `check_immediate_support()` changed from
+  rejection to warning about stack depth. Semi-naive evaluation proceeds with
+  `DeltaSource::TransitionTable`.
+- **TopK (G11 / Task 5.2):** `apply_topk_micro_refresh()` in `ivm.rs` implements
+  statement-level micro-refresh. Bounded by `pg_trickle.ivm_topk_max_limit` GUC
+  (default 1000).
   (default 1000) to prevent inline recomputation latency spikes for large K.
 
 For materialised view sources: use a polling-change-detection wrapper (same
@@ -480,13 +481,12 @@ Polling via `pg_proc` on each differential refresh:
 | **Tier** | **P2** |
 | **Impact** | Refresh errors; stream table suspended |
 | **Documented in** | FAQ § "Schema Changes" |
+| **Status** | ✅ **Done** — FAQ section documents lock interaction |
 
-**Proposed fix:** The refresh transaction holds a `ShareLock` on source
-tables, which blocks concurrent `ALTER TABLE` (which needs
-`AccessExclusiveLock`). The window is only open if the DDL sneaks in
-between the lock acquisition and the first read. **No code fix needed** —
-PostgreSQL's locking already prevents the race in practice. Improve
-documentation to clarify this is a theoretical edge case.
+**Proposed fix:** ~~No code fix needed~~ **Implemented:** FAQ section added
+explaining `ShareLock` on source tables during refresh blocks concurrent
+`ALTER TABLE` (`AccessExclusiveLock`). The window is only open if the DDL
+sneaks in between lock acquisition and first read.
 
 ---
 
@@ -543,11 +543,13 @@ documentation to clarify this is a theoretical edge case.
 | **Impact** | Potential duplicate capture during transition; rollback to triggers on failure |
 | **Current mitigation** | LSN-based deduplication; automatic rollback |
 | **Documented in** | FAQ § "CDC Architecture" |
+| **Status** | ✅ **Done** — `check_cdc_transition_health()` in scheduler.rs |
 
-**Proposed fix:** The existing safeguards (deduplication + rollback) are
-sound. Add a `trigger_inventory()` + `check_cdc_health()` combined check
-that verifies the transition completed successfully after a server restart
-or crash during the window.
+**Proposed fix:** ~~Add a `trigger_inventory()` + `check_cdc_health()` combined check~~
+**Implemented:** `check_cdc_transition_health()` runs after `recover_from_crash()`
+in the scheduler. Loads all stream table deps, filters TRANSITIONING entries,
+checks `pg_replication_slots` for slot existence, rolls back to TRIGGER mode
+if slot is missing, logs status.
 
 ---
 
@@ -560,6 +562,7 @@ or crash during the window.
 | **Impact** | Subscriber gets static snapshot without refresh capability |
 | **Current mitigation** | Run pg_trickle only on primary |
 | **Documented in** | FAQ § "Replication" |
+| **Status** | ✅ **Done** — FAQ documentation sweep completed |
 
 **Proposed fix:** Inherent to the architecture — CDC triggers and the
 scheduler only run on the primary. **No code fix.** Consider a future
@@ -576,6 +579,7 @@ CDC + refresh cycle, but this is a major undertaking (v2.0+).
 | **Tier** | **P3** |
 | **Impact** | Subscriber cannot drive its own refresh |
 | **Documented in** | FAQ § "Replication" |
+| **Status** | ✅ **Done** — FAQ documentation sweep completed |
 
 **Proposed fix:** By design. Same as EC-21 — keep documentation clear.
 
@@ -590,6 +594,7 @@ CDC + refresh cycle, but this is a major undertaking (v2.0+).
 | **Impact** | No IVM on read replicas |
 | **Current mitigation** | Query the primary; or promote the replica |
 | **Documented in** | FAQ § "HA / Replication" |
+| **Status** | ✅ **Done** — FAQ documentation sweep completed |
 
 **Proposed fix:** By design — standbys are read-only. **No code fix.** A
 future enhancement could add a read-only health endpoint on standby that
@@ -700,6 +705,7 @@ rare.
 | **Impact** | Prepared statement errors, lock escapes, GUC not applied |
 | **Current mitigation** | Use session-mode pooling; use `SET LOCAL` |
 | **Documented in** | FAQ § "PgBouncer" |
+| **Status** | ✅ **Done** — documentation already exists |
 
 **Proposed fix:** pg_trickle's scheduler uses a single dedicated backend
 connection (not pooled), so the scheduler itself is unaffected. The edge
@@ -898,17 +904,17 @@ study. **Long term (v2.0+).**
 | # | Edge Case | Action | Estimated Effort |
 |---|-----------|--------|------------------|
 | 12 | EC-03: Window functions in expressions | CTE extraction in parser | 3–5 days |
-| 13 | EC-05: Foreign tables | Polling-based change detection | 2–3 days |
-| 14 | EC-09: IMMEDIATE unsupported constructs | doc improvements | 0.5 day |
-| 15 | EC-17: DDL during active refresh | doc improvements | 0.5 day |
-| 16 | EC-20: CDC TRANSITIONING complexity | post-restart health check | 1 day |
-| 17 | EC-28: PgBouncer | PgBouncer config snippet in docs | 0.5 day |
+| 13 | EC-05: Foreign tables | ✅ IMPLEMENTED — error msg + polling CDC | — |
+| 14 | ✅ EC-09: IMMEDIATE unsupported constructs | Done — recursive CTEs + TopK now supported | Done |
+| 15 | ✅ EC-17: DDL during active refresh | FAQ documentation added | Done |
+| 16 | ✅ EC-20: CDC TRANSITIONING complexity | `check_cdc_transition_health()` in scheduler.rs | Done |
+| 17 | ✅ EC-28: PgBouncer | Documentation already exists | Done |
 | 18 | EC-32: ALL (subquery) | Parser rewrite to NOT EXISTS (… EXCEPT …) | 2–3 days |
 
 ### P3 — Accepted trade-offs (document, no code change)
 
-EC-02, EC-04, EC-07, EC-08, EC-10, EC-12, EC-14, EC-21, EC-22, EC-23,
-EC-24, EC-27, EC-29, EC-30, EC-31, EC-35, EC-36.
+✅ EC-02 (GUC implemented), EC-04, EC-07, EC-08, EC-10, EC-12, EC-14,
+✅ EC-21/22/23 (docs done), EC-24, EC-27, EC-29, EC-30, EC-31, EC-35, EC-36.
 
 These are either fundamental design trade-offs or have adequate existing
 mitigations. Keep documentation current and revisit if user demand

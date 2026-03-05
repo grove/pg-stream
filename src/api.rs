@@ -157,6 +157,12 @@ fn create_stream_table_impl(
     // per OR arm, so the DVM parser only sees non-OR sublinks.
     let query = &crate::dvm::rewrite_sublinks_in_or(query)?;
 
+    // ── ROWS FROM() multi-function rewrite ─────────────────────────
+    // ROWS FROM(f1(), f2(), ...) with multiple SRFs is rewritten to
+    // a single multi-arg unnest() (all-unnest case) or an ordinal-based
+    // LEFT JOIN LATERAL chain (general case).
+    let query = &crate::dvm::rewrite_rows_from(query)?;
+
     // ── Multiple PARTITION BY → handled natively ────────────────────
     // Window functions with different PARTITION BY clauses are now
     // handled by the parser as un-partitioned (full recomputation).
@@ -227,16 +233,27 @@ fn create_stream_table_impl(
         crate::dvm::reject_materialized_views(query)?;
     }
 
-    // ── IMMEDIATE mode: reject TopK ─────────────────────────────────
-    // TopK tables rely on scoped recomputation, which is a deferred/full
-    // pattern incompatible with within-transaction trigger-based IVM.
-    if refresh_mode.is_immediate() && topk_info.is_some() {
-        return Err(PgTrickleError::UnsupportedOperator(
-            "ORDER BY + LIMIT (TopK) is not supported in IMMEDIATE mode. \
-             TopK tables use scoped recomputation which requires a scheduled \
-             refresh. Use 'DIFFERENTIAL' or 'FULL' mode for TopK queries."
-                .into(),
-        ));
+    // ── IMMEDIATE mode: TopK with limit threshold (Task 5.2) ────────
+    // TopK in IMMEDIATE mode uses inline micro-refresh (recompute top K
+    // rows and diff against current storage). Gated by ivm_topk_max_limit GUC.
+    if let (true, Some(info)) = (refresh_mode.is_immediate(), &topk_info) {
+        let topk_limit = info.limit_value;
+        let max_limit = crate::config::PGS_IVM_TOPK_MAX_LIMIT.get() as i64;
+        if max_limit == 0 || topk_limit > max_limit {
+            return Err(PgTrickleError::UnsupportedOperator(format!(
+                "ORDER BY + LIMIT {topk_limit} (TopK) exceeds the IMMEDIATE mode threshold \
+                 (pg_trickle.ivm_topk_max_limit = {max_limit}). TopK tables in IMMEDIATE mode \
+                 recompute the top-K rows on every DML statement. Reduce LIMIT, raise the \
+                 threshold, or use 'DIFFERENTIAL' mode for large TopK queries."
+            )));
+        }
+        pgrx::warning!(
+            "pg_trickle: TopK (LIMIT {}) in IMMEDIATE mode uses micro-refresh — \
+             the top-{} rows are recomputed on every DML statement. \
+             This adds latency proportional to the defining query cost.",
+            topk_limit,
+            topk_limit
+        );
     }
 
     // ── IMMEDIATE mode: validate query restrictions ─────────────────
@@ -339,7 +356,7 @@ fn create_stream_table_impl(
     // and the apply logic uses counted DELETE instead of MERGE, because
     // identical duplicate rows produce the same content hash → same row_id.
     let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
-        if source_type != "TABLE" {
+        if source_type != "TABLE" && source_type != "FOREIGN_TABLE" {
             return false;
         }
         cdc::resolve_pk_columns(*oid)
@@ -467,7 +484,7 @@ fn create_stream_table_impl(
         // Build column snapshot + fingerprint for TABLE sources.
         // Views and stream tables don't need snapshots since their schema
         // is derived from their own defining queries.
-        let (snapshot, fingerprint) = if source_type == "TABLE" {
+        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
             match crate::catalog::build_column_snapshot(*source_oid) {
                 Ok((s, f)) => (Some(s), Some(f)),
                 Err(e) => {
@@ -508,6 +525,8 @@ fn create_stream_table_impl(
         for (source_oid, source_type) in &source_relids {
             if source_type == "TABLE" {
                 setup_cdc_for_source(*source_oid, pgt_id, &change_schema)?;
+            } else if source_type == "FOREIGN_TABLE" {
+                cdc::setup_foreign_table_polling(*source_oid, pgt_id, &change_schema)?;
             }
         }
     }
@@ -641,14 +660,17 @@ fn alter_stream_table_impl(
 
         if new_mode != old_mode {
             // ── Validate mode switch ────────────────────────────────
-            // TopK tables cannot switch to IMMEDIATE mode.
-            if new_mode.is_immediate() && st.topk_limit.is_some() {
-                return Err(PgTrickleError::UnsupportedOperator(
-                    "Cannot switch TopK stream table to IMMEDIATE mode. \
-                     TopK tables use scoped recomputation which requires a \
-                     scheduled refresh."
-                        .into(),
-                ));
+            // TopK tables: check limit threshold for IMMEDIATE mode.
+            if let (true, Some(topk_limit)) = (new_mode.is_immediate(), st.topk_limit) {
+                let topk_limit = topk_limit as i64;
+                let max_limit = crate::config::PGS_IVM_TOPK_MAX_LIMIT.get() as i64;
+                if max_limit == 0 || topk_limit > max_limit {
+                    return Err(PgTrickleError::UnsupportedOperator(format!(
+                        "Cannot switch TopK stream table (LIMIT {topk_limit}) to IMMEDIATE mode. \
+                         Exceeds pg_trickle.ivm_topk_max_limit = {max_limit}. Raise the threshold \
+                         or keep using DIFFERENTIAL/FULL mode."
+                    )));
+                }
             }
 
             // Validate query restrictions for IMMEDIATE mode.
@@ -1629,6 +1651,14 @@ fn cleanup_cdc_for_source(
             source_oid.to_u32(),
         );
         let _ = Spi::run(&drop_buf_sql);
+
+        // EC-05: Drop the snapshot table (only exists for foreign table sources).
+        let drop_snap_sql = format!(
+            "DROP TABLE IF EXISTS {}.snapshot_{} CASCADE",
+            quote_identifier(&change_schema),
+            source_oid.to_u32(),
+        );
+        let _ = Spi::run(&drop_snap_sql);
 
         // Delete tracking record
         let _ = Spi::run_with_args(
