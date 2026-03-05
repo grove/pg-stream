@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # =============================================================================
 # Multi-stage Dockerfile for pg_trickle E2E integration tests.
 #
@@ -11,12 +12,20 @@
 #   docker build -t pg_trickle_e2e:latest -f tests/Dockerfile.e2e .
 #
 # The build context must be the project root (parent of tests/).
+#
+# Speed notes:
+#   The `# syntax=docker/dockerfile:1` directive enables BuildKit, which
+#   supports --mount=type=cache.  These cache mounts persist the cargo registry
+#   and incremental build artefacts on the Docker host between builds.
+#   After an initial ~10 min full build, subsequent src-only changes rebuild
+#   in ~1–2 min (only changed crates are recompiled).
+#   Enable explicitly: DOCKER_BUILDKIT=1 docker build …  (default on Docker ≥23)
 # =============================================================================
 
 # ── Stage 1: Build the extension ────────────────────────────────────────────
 FROM postgres:18.1 AS builder
 
-# Install build dependencies
+# Install build dependencies (layer-cached; re-runs only if this RUN changes)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         build-essential \
@@ -31,25 +40,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust toolchain (stable)
+# Install Rust toolchain (layer-cached; only re-runs if this RUN changes)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Install cargo-pgrx (must match the version in Cargo.toml)
-RUN cargo install --locked cargo-pgrx --version 0.17.0
+# Install cargo-pgrx (layer-cached; only re-runs if the version changes).
+# Use a cache mount for the cargo registry so the crate download/compile
+# artefacts survive across image rebuilds on the same host.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    cargo install --locked cargo-pgrx --version 0.17.0
 
-# Initialize pgrx for PG 18 using the system pg_config
+# Initialize pgrx for PG 18 using the system pg_config (layer-cached)
 RUN cargo pgrx init --pg18 /usr/bin/pg_config
 
 # ── Dependency caching layer ────────────────────────────────────────────────
-# Copy only the manifests first so that dependency downloads are cached
-# separately from source changes.
+# Copy manifests + lockfile so dep downloads are cached separately from source.
 WORKDIR /build
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 
-# Create minimal stubs so cargo can resolve dependencies & generate lockfile.
-# The real source is copied in the next step.
+# Create minimal stubs so cargo can resolve the workspace without real source.
 RUN mkdir -p src/bin src/dvm/operators benches && \
     echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
     echo '#![allow(warnings)]' > src/lib.rs && \
@@ -57,25 +68,34 @@ RUN mkdir -p src/bin src/dvm/operators benches && \
     echo '' > src/dvm/operators/mod.rs && \
     echo '' > src/ivm.rs && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
-    echo 'fn main() {}' > benches/diff_operators.rs && \
-    cargo generate-lockfile && \
+    echo 'fn main() {}' > benches/diff_operators.rs
+
+# Pre-fetch all crates.  Cache mount keeps the registry between builds so
+# this becomes a no-op when Cargo.lock hasn't changed.
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     cargo fetch
 
 # ── Build the real extension ────────────────────────────────────────────────
-# Now copy the actual source. This invalidates the cache only when src/ changes.
+# Copy actual source — invalidates only the compile step below.
 COPY src/ src/
 COPY pg_trickle.control ./
 
-# Build the extension package
-# pgrx package outputs to target/release/pg_trickle-pg18/ with
-# the directory structure mirroring the system pg_config paths:
-#   /usr/share/postgresql/18/extension/*.control, *--version.sql
-#   /usr/lib/postgresql/18/lib/*.so
-RUN cargo pgrx package --pg-config /usr/bin/pg_config
+# Compile the extension.
+# The target/ cache mount keeps incremental artefacts between builds on the
+# same host, so only crates touched by the source change are recompiled.
+# Artefacts are copied to /artefacts/ so that Stage 2 can COPY them
+# (cache-mounted paths aren't directly visible to downstream COPY --from=).
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo pgrx package --pg-config /usr/bin/pg_config && \
+    mkdir -p /artefacts && \
+    cp -r target/release/pg_trickle-pg18 /artefacts/
 
 # Verify the artifacts were produced
 RUN echo "=== Package artifacts ===" && \
-    find target/release/pg_trickle-pg18 -type f && \
+    find /artefacts/pg_trickle-pg18 -type f && \
     echo "========================="
 
 # ── Stage 2: Runtime image with extension installed ─────────────────────────
@@ -86,11 +106,11 @@ LABEL org.opencontainers.image.description="PostgreSQL 18.1 with pg_trickle exte
 
 # Copy extension artifacts from the builder stage
 COPY --from=builder \
-    /build/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/ \
+    /artefacts/pg_trickle-pg18/usr/share/postgresql/18/extension/ \
     /usr/share/postgresql/18/extension/
 
 COPY --from=builder \
-    /build/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/ \
+    /artefacts/pg_trickle-pg18/usr/lib/postgresql/18/lib/ \
     /usr/lib/postgresql/18/lib/
 
 # Configure shared_preload_libraries so background worker + shared memory work.

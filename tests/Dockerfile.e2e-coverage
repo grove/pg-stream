@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # =============================================================================
 # Multi-stage Dockerfile for pg_trickle E2E coverage measurement.
 #
@@ -41,15 +42,17 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Install llvm-tools-preview for profdata/cov binaries
 RUN rustup component add llvm-tools-preview
 
-# Install cargo-pgrx (must match the version in Cargo.toml)
-RUN cargo install --locked cargo-pgrx --version 0.17.0
+# Install cargo-pgrx (layer-cached; only re-runs if the version changes).
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    cargo install --locked cargo-pgrx --version 0.17.0
 
-# Initialize pgrx for PG 18 using the system pg_config
+# Initialize pgrx for PG 18 using the system pg_config (layer-cached)
 RUN cargo pgrx init --pg18 /usr/bin/pg_config
 
 # ── Dependency caching layer ────────────────────────────────────────────────
 WORKDIR /build
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 
 RUN mkdir -p src/bin src/dvm/operators benches && \
     echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
@@ -58,21 +61,29 @@ RUN mkdir -p src/bin src/dvm/operators benches && \
     echo '' > src/dvm/operators/mod.rs && \
     echo '' > src/ivm.rs && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
-    echo 'fn main() {}' > benches/diff_operators.rs && \
-    cargo generate-lockfile && \
+    echo 'fn main() {}' > benches/diff_operators.rs
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
     cargo fetch
 
 # ── Build the real extension with coverage instrumentation ──────────────────
 COPY src/ src/
 COPY pg_trickle.control ./
 
-# Enable LLVM source-based code coverage
+# Enable LLVM source-based code coverage.
+# Cache mount on target/ keeps incremental artefacts between builds.
 ENV RUSTFLAGS="-C instrument-coverage"
-RUN cargo pgrx package --pg-config /usr/bin/pg_config
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo pgrx package --pg-config /usr/bin/pg_config && \
+    mkdir -p /artefacts && \
+    cp -r target/release/pg_trickle-pg18 /artefacts/
 
 # Verify the artifacts were produced
 RUN echo "=== Coverage-instrumented package artifacts ===" && \
-    find target/release/pg_trickle-pg18 -type f && \
+    find /artefacts/pg_trickle-pg18 -type f && \
     echo "========================="
 
 # Copy llvm-profdata into a well-known location for the final image.
@@ -94,11 +105,11 @@ LABEL org.opencontainers.image.description="PostgreSQL 18.1 with coverage-instru
 
 # Copy extension artifacts from the builder stage
 COPY --from=builder \
-    /build/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/ \
+    /artefacts/pg_trickle-pg18/usr/share/postgresql/18/extension/ \
     /usr/share/postgresql/18/extension/
 
 COPY --from=builder \
-    /build/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/ \
+    /artefacts/pg_trickle-pg18/usr/lib/postgresql/18/lib/ \
     /usr/lib/postgresql/18/lib/
 
 # Copy llvm-profdata for optional in-container merge
