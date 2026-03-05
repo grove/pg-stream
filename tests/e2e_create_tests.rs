@@ -215,10 +215,10 @@ async fn test_create_null_schedule() {
         .await;
     db.execute("INSERT INTO src_calc VALUES (1)").await;
 
-    // Pass NULL schedule directly (CALCULATED mode)
+    // Pass 'calculated' schedule string (CALCULATED mode; NULL is no longer accepted)
     db.execute(
         "SELECT pgtrickle.create_stream_table('st_calc', \
-         $$ SELECT id FROM src_calc $$, NULL::text, 'FULL')",
+         $$ SELECT id FROM src_calc $$, 'calculated', 'FULL')",
     )
     .await;
 
@@ -227,7 +227,10 @@ async fn test_create_null_schedule() {
             "SELECT schedule IS NULL FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'st_calc'",
         )
         .await;
-    assert!(is_null, "schedule should be NULL for CALCULATED");
+    assert!(
+        is_null,
+        "schedule should be NULL in catalog for CALCULATED mode"
+    );
 }
 
 // ── Initialize Parameter ───────────────────────────────────────────────

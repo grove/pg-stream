@@ -54,7 +54,7 @@ async fn test_mixed_full_then_diff_2_layer() {
         "SELECT pgtrickle.create_stream_table(
             'mfull_l2',
             $$SELECT grp, total * 2 AS doubled FROM mfull_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -121,7 +121,7 @@ async fn test_mixed_diff_then_full_2_layer() {
         "SELECT pgtrickle.create_stream_table(
             'mdf_l2',
             $$SELECT grp, total * 3 AS tripled FROM mdf_l1$$,
-            NULL,
+            'calculated',
             'FULL'
         )",
     )
@@ -189,7 +189,7 @@ async fn test_mixed_3_layer_full_diff_diff() {
         "SELECT pgtrickle.create_stream_table(
             'm3_l2',
             $$SELECT grp, total * 2 AS doubled FROM m3_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -200,7 +200,7 @@ async fn test_mixed_3_layer_full_diff_diff() {
         "SELECT pgtrickle.create_stream_table(
             'm3_l3',
             $$SELECT grp, doubled FROM m3_l2 WHERE doubled > 50$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -269,7 +269,7 @@ async fn test_mixed_mode_alter_mid_pipeline() {
         "SELECT pgtrickle.create_stream_table(
             'malter_l2',
             $$SELECT grp, total * 2 AS doubled FROM malter_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -343,7 +343,7 @@ async fn test_mixed_immediate_leaf() {
         "SELECT pgtrickle.create_stream_table(
             'mimm_l2',
             $$SELECT grp, total * 2 AS doubled FROM mimm_l1$$,
-            NULL,
+            'calculated',
             'IMMEDIATE'
         )",
     )

@@ -223,25 +223,27 @@ async fn test_ivm_drop_cleans_up_triggers() {
 // ── Validation Errors ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_ivm_reject_topk_immediate() {
+async fn test_ivm_topk_immediate_within_threshold() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE scores (id INT PRIMARY KEY, name TEXT, score INT)")
         .await;
-
-    // TopK + IMMEDIATE should be rejected.
-    let result = db
-        .try_execute(
-            "SELECT pgtrickle.create_stream_table('top_scores', \
-             $$SELECT name, score FROM scores ORDER BY score DESC LIMIT 10$$, \
-             NULL, 'IMMEDIATE')",
-        )
+    db.execute("INSERT INTO scores VALUES (1, 'Alice', 90), (2, 'Bob', 80), (3, 'Carol', 70)")
         .await;
 
-    assert!(
-        result.is_err(),
-        "TopK with IMMEDIATE mode should be rejected"
-    );
+    // TopK (ORDER BY + LIMIT 10) is allowed in IMMEDIATE mode when within the
+    // ivm_topk_max_limit threshold (default 1000). Uses inline micro-refresh.
+    create_immediate_st(
+        &db,
+        "top_scores",
+        "SELECT name, score FROM scores ORDER BY score DESC LIMIT 10",
+    )
+    .await;
+
+    let (_, mode, populated, _) = db.pgt_status("top_scores").await;
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(populated);
+    assert_eq!(db.count("public.top_scores").await, 3);
 }
 
 // ── Manual Refresh ─────────────────────────────────────────────────────
@@ -441,37 +443,32 @@ async fn test_ivm_alter_immediate_to_full() {
 // ── IMMEDIATE Query Restriction Validation ─────────────────────────────
 
 #[tokio::test]
-async fn test_ivm_reject_recursive_cte_immediate() {
+async fn test_ivm_recursive_cte_immediate_allowed() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE rc_src (id INT PRIMARY KEY, parent_id INT, name TEXT)")
         .await;
-
-    // Recursive CTE should still be rejected in IMMEDIATE mode.
-    let result = db
-        .try_execute(
-            "SELECT pgtrickle.create_stream_table('rc_imm', \
-             $$WITH RECURSIVE tree AS ( \
-               SELECT id, parent_id, name FROM rc_src WHERE parent_id IS NULL \
-               UNION ALL \
-               SELECT c.id, c.parent_id, c.name FROM rc_src c \
-               INNER JOIN tree t ON c.parent_id = t.id \
-             ) SELECT id, parent_id, name FROM tree$$, \
-             NULL, 'IMMEDIATE')",
-        )
+    db.execute("INSERT INTO rc_src VALUES (1, NULL, 'root'), (2, 1, 'child1'), (3, 1, 'child2')")
         .await;
 
-    assert!(
-        result.is_err(),
-        "Recursive CTEs should be rejected in IMMEDIATE mode"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("Recursive")
-            || err_msg.contains("recursive")
-            || err_msg.contains("WITH RECURSIVE"),
-        "Error should mention recursive CTE: {err_msg}"
-    );
+    // Recursive CTEs are now allowed in IMMEDIATE mode (Task 5.1).
+    // Semi-naive evaluation inside the trigger uses transition tables.
+    create_immediate_st(
+        &db,
+        "rc_imm",
+        "WITH RECURSIVE tree AS ( \
+           SELECT id, parent_id, name FROM rc_src WHERE parent_id IS NULL \
+           UNION ALL \
+           SELECT c.id, c.parent_id, c.name FROM rc_src c \
+           INNER JOIN tree t ON c.parent_id = t.id \
+         ) SELECT id, parent_id, name FROM tree",
+    )
+    .await;
+
+    let (_, mode, populated, _) = db.pgt_status("rc_imm").await;
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(populated);
+    assert_eq!(db.count("public.rc_imm").await, 3);
 }
 
 // ── Window Functions in IMMEDIATE Mode ─────────────────────────────────
@@ -693,7 +690,7 @@ async fn test_ivm_allow_join_in_immediate() {
 // ── Alter Mode Switching Validation ────────────────────────────────────
 
 #[tokio::test]
-async fn test_ivm_alter_to_immediate_rejects_recursive_cte() {
+async fn test_ivm_alter_to_immediate_allows_recursive_cte() {
     let db = E2eDb::new().await.with_extension().await;
 
     db.execute("CREATE TABLE sw_rc (id INT PRIMARY KEY, parent_id INT, name TEXT)")
@@ -712,19 +709,13 @@ async fn test_ivm_alter_to_immediate_rejects_recursive_cte() {
     )
     .await;
 
-    // Attempt to switch to IMMEDIATE — should be rejected (recursive CTE).
-    let result = db
-        .try_execute("SELECT pgtrickle.alter_stream_table('sw_rc_st', refresh_mode => 'IMMEDIATE')")
-        .await;
+    // Recursive CTEs are now allowed in IMMEDIATE mode (Task 5.1).
+    // Switching a recursive-CTE ST to IMMEDIATE should succeed.
+    db.alter_st("sw_rc_st", "refresh_mode => 'IMMEDIATE'").await;
 
-    assert!(
-        result.is_err(),
-        "Switching a recursive-CTE ST to IMMEDIATE should be rejected"
-    );
-
-    // Verify mode didn't change.
+    // Verify mode changed to IMMEDIATE.
     let (_, mode, _, _) = db.pgt_status("sw_rc_st").await;
-    assert_eq!(mode, "DIFFERENTIAL", "Mode should remain DIFFERENTIAL");
+    assert_eq!(mode, "IMMEDIATE", "Mode should switch to IMMEDIATE");
 }
 
 #[tokio::test]

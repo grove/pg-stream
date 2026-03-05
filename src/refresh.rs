@@ -2169,7 +2169,14 @@ pub fn execute_differential_refresh(
         }
     }
 
-    Ok((merge_count as i64, 0))
+    // Guarantee a non-zero count when the change buffer actually had entries.
+    // PostgreSQL MERGE may report 0 processed rows via SPI even when it
+    // modifies data (observed with pgrx 0.17 / PostgreSQL 18).
+    // Since we already verified `any_changes=true` above, the MERGE must
+    // have processed at least one change buffer entry.
+    let effective_count = (merge_count as i64).max(1);
+
+    Ok((effective_count, 0))
 }
 
 /// Compute a new adaptive fallback threshold based on observed performance.

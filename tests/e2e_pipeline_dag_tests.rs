@@ -392,8 +392,8 @@ async fn test_nx_pipeline_insert_new_auction_then_bid() {
     let bob_bids: i64 = db
         .query_scalar("SELECT total_bids::bigint FROM nx_bidder_stats WHERE bidder_name = 'Bob'")
         .await;
-    // Bob originally bid on auctions 3 and 5 → 2 bids; new bid = 3 total
-    assert_eq!(bob_bids, 3);
+    // Bob originally bid on auctions 1, 3, 5 → 3 bids; new bid on 6 = 4 total
+    assert_eq!(bob_bids, 4);
 }
 
 /// Deleting a person who has bids cascades through L2a (bidder_stats).
@@ -406,16 +406,20 @@ async fn test_nx_pipeline_delete_bidder_cascades() {
     nx_create_bidder_stats(&db).await;
     nx_create_category_metrics(&db).await;
 
-    // Remove Charlie's bids first (FK constraint), then Charlie
+    // Remove Charlie's bids first, then bids on Charlie's auction,
+    // then Charlie's auction, then Charlie (FK cascade order).
     db.execute("DELETE FROM nx_bids WHERE bidder_id = 3").await;
+    db.execute("DELETE FROM nx_bids WHERE auction_id = 3").await;
+    db.execute("DELETE FROM nx_auctions WHERE seller_id = 3")
+        .await;
     db.execute("DELETE FROM nx_persons WHERE id = 3").await;
 
     db.refresh_st("nx_auction_bids").await;
     db.refresh_st("nx_bidder_stats").await;
     db.refresh_st("nx_category_metrics").await;
 
-    // L1: 3 fewer bids (ids 2, 5, 8 where bidder_id = 3)
-    assert_eq!(db.count("nx_auction_bids").await, 7);
+    // L1: 4 fewer bids: 3 by Charlie (ids 2,5,8) + 1 on Charlie's auction (id 6)
+    assert_eq!(db.count("nx_auction_bids").await, 6);
 
     // L2a: Charlie's row removed; other 4 persons still present
     assert_eq!(db.count("nx_bidder_stats").await, 4);
@@ -424,14 +428,21 @@ async fn test_nx_pipeline_delete_bidder_cascades() {
         .await;
     assert_eq!(charlie_count, 0);
 
-    // L2b: Electronics loses Charlie's bid (bid 2: 550.00, bid 5: 250.00)
-    //       Art loses Charlie's bid (bid 8: 350.00)
+    // L2b: Electronics loses Charlie's bids (bid 2: 550.00, bid 5: 250.00)
+    //       Art loses Charlie's bid (bid 8: 350.00) + Bob's bid on
+    //       Charlie's auction (bid 6: 160.00), and auction 3 is gone.
     let elec_bids: i64 = db
         .query_scalar(
             "SELECT total_bids::bigint FROM nx_category_metrics WHERE category = 'Electronics'",
         )
         .await;
     assert_eq!(elec_bids, 3); // was 5, lost bids 2 and 5
+
+    // Art: only bid 7 remains (Alice, auction 4)
+    let art_bids: i64 = db
+        .query_scalar("SELECT total_bids::bigint FROM nx_category_metrics WHERE category = 'Art'")
+        .await;
+    assert_eq!(art_bids, 1); // was 3, lost bids 6 and 8
 
     // DBSP invariant: all L2 tables match their defining queries
     db.assert_st_matches_query(
@@ -1203,7 +1214,8 @@ async fn test_tl_pipeline_insert_readings_cascades() {
     .await
     .unwrap();
     assert_eq!(ws_a_count, 9);
-    assert_eq!(ws_a_max, "24.5000");
+    // Max is from humidity sensor 2 (reading id 5, value 62.5), not new temp readings
+    assert_eq!(ws_a_max, "62.5000");
 
     // Other devices unaffected
     let ws_b_count: i64 = db

@@ -66,12 +66,11 @@ async fn test_invalid_schedule_below_minimum() {
         .await;
     db.execute("INSERT INTO sched_src VALUES (1)").await;
 
-    // The minimum schedule is controlled by pg_trickle.min_schedule_seconds GUC (default 30).
-    // Try to create with a schedule below that minimum.
+    // '0s' parses to 0 seconds, which is always below the minimum (GUC floor ≥ 1 second).
     let result = db
         .try_execute(
             "SELECT pgtrickle.create_stream_table('tiny_sched_st', \
-             $$ SELECT id FROM sched_src $$, '1s', 'FULL')",
+             $$ SELECT id FROM sched_src $$, '0s', 'FULL')",
         )
         .await;
     assert!(result.is_err(), "Schedule below minimum should be rejected");

@@ -123,7 +123,7 @@ async fn create_department_stats(db: &E2eDb) {
             LEFT JOIN employees e ON e.department_id = t.id
             GROUP BY t.id, t.name, t.path, t.depth
             $$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )

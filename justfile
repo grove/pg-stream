@@ -67,7 +67,13 @@ test-integration:
         --test property_tests \
         -- --test-threads=1
 
-# Build the E2E Docker test image
+# Build the pre-compiled builder base image (Rust + cargo-pgrx + pgrx init).
+# Only needed once, or when upgrading the Rust toolchain or pgrx version.
+[group: "test"]
+build-builder-image:
+    docker build -t pg_trickle_builder:pg18 -f tests/Dockerfile.builder .
+
+# Build the E2E Docker test image (auto-builds builder image if absent)
 [group: "test"]
 build-e2e-image:
     ./tests/build_e2e_image.sh

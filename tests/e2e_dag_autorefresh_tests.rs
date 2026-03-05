@@ -211,7 +211,7 @@ async fn test_autorefresh_diamond_cascade() {
 // Test 4.3 — CALCULATED schedule
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// L1 (schedule 1s) → L2 (schedule NULL = CALCULATED).
+/// L1 (schedule 1s) → L2 (schedule 'calculated' = CALCULATED).
 /// L2 should refresh whenever L1 has pending changes.
 #[tokio::test]
 async fn test_autorefresh_calculated_schedule() {
@@ -231,19 +231,23 @@ async fn test_autorefresh_calculated_schedule() {
     )
     .await;
 
-    // L2: CALCULATED schedule (NULL)
+    // L2: CALCULATED schedule ('calculated')
     db.execute(
         "SELECT pgtrickle.create_stream_table(
             'arc_l2',
             $$SELECT id, val * 10 AS scaled FROM arc_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
     .await;
 
-    // Wait for initial stabilization
-    wait_for_refresh_cycle(&db, "arc_l2", Duration::from_secs(30)).await;
+    // Wait for initial stabilization: arc_l1 has an explicit 1s schedule so
+    // the scheduler will refresh it shortly regardless of whether there are
+    // source changes.  arc_l2 uses CALCULATED schedule — it only fires when
+    // upstream data_timestamp advances, so we cannot use it as a readiness
+    // signal here (no new rows arrived since creation).
+    wait_for_refresh_cycle(&db, "arc_l1", Duration::from_secs(30)).await;
 
     // Mutate
     db.execute("INSERT INTO arc_src VALUES (2, 200)").await;

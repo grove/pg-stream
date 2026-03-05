@@ -172,7 +172,7 @@ async fn test_fanout_then_converge() {
               FROM foc_sum s
               JOIN foc_cnt c ON s.grp = c.grp
               JOIN foc_max m ON s.grp = m.grp$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -245,7 +245,7 @@ async fn test_deep_linear_5_layers() {
         "SELECT pgtrickle.create_stream_table(
             'd5_l2',
             $$SELECT id, grp, val * 2 AS v2 FROM d5_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -256,7 +256,7 @@ async fn test_deep_linear_5_layers() {
         "SELECT pgtrickle.create_stream_table(
             'd5_l3',
             $$SELECT grp, SUM(v2) AS total FROM d5_l2 GROUP BY grp$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -267,7 +267,7 @@ async fn test_deep_linear_5_layers() {
         "SELECT pgtrickle.create_stream_table(
             'd5_l4',
             $$SELECT grp, total, RANK() OVER (ORDER BY total DESC) AS rnk FROM d5_l3$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -278,7 +278,7 @@ async fn test_deep_linear_5_layers() {
         "SELECT pgtrickle.create_stream_table(
             'd5_l5',
             $$SELECT grp, total FROM d5_l4 WHERE rnk <= 2$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -372,7 +372,7 @@ async fn test_multi_source_diamond() {
         "SELECT pgtrickle.create_stream_table(
             'msd_l2a',
             $$SELECT lval, SUM(rval) AS total FROM msd_l1 GROUP BY lval$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -383,7 +383,7 @@ async fn test_multi_source_diamond() {
         "SELECT pgtrickle.create_stream_table(
             'msd_l2b',
             $$SELECT lval, COUNT(*) AS cnt FROM msd_l1 GROUP BY lval$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )

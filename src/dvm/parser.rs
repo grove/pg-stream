@@ -2658,9 +2658,9 @@ fn check_ivm_support_inner(tree: &OpTree) -> Result<(), PgTrickleError> {
 /// - Non-recursive CTEs
 /// - EXISTS/IN subqueries (SemiJoin/AntiJoin)
 ///
-/// **Rejected:**
-/// - Recursive CTEs (semi-naive evaluation with fixpoint iteration
-///   not yet validated with transition tables)
+/// **Rejected:** (reserved for future restrictions)
+/// - None currently — recursive CTEs (Task 5.1) and WhTopK (Task 5.2) are
+///   both now supported with appropriate GUC gates and runtime warnings.
 pub fn validate_immediate_mode_support(defining_query: &str) -> Result<(), PgTrickleError> {
     let result = parse_defining_query_full(defining_query)?;
 
@@ -3256,6 +3256,14 @@ unsafe fn deparse_select_stmt_with_view_subs(
         };
 
         let mut result = format!("{left} {op_str} {right}");
+
+        // Preserve WITH clause on the outer SETOP node (CTE + UNION ALL pattern).
+        // The CTE definitions live here, NOT on larg/rarg, so they must be
+        // prepended after the arms have been recursively processed.
+        if !s.withClause.is_null() {
+            let with_sql = unsafe { deparse_with_clause_with_view_subs(s.withClause, subs)? };
+            result = format!("{with_sql} {result}");
+        }
 
         // Top-level ORDER BY / LIMIT / OFFSET on set operations
         let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.sortClause) };
@@ -5959,52 +5967,66 @@ unsafe fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String,
             return Ok(result);
         }
 
-        // ── General case: ordinal-based LEFT JOIN LATERAL chain ─────
-        // Build:
-        //   (SELECT __pgt_f0.*, __pgt_f1.* FROM
-        //     generate_series(1, 2147483647) AS __pgt_idx(v)
-        //     LEFT JOIN LATERAL (SELECT f0_result.*, row_number() OVER () AS __pgt_ord
-        //                        FROM f0(...) AS f0_result) AS __pgt_f0
-        //       ON __pgt_f0.__pgt_ord = __pgt_idx.v
-        //     LEFT JOIN LATERAL (SELECT f1_result.*, row_number() OVER () AS __pgt_ord
-        //                        FROM f1(...) AS f1_result) AS __pgt_f1
-        //       ON __pgt_f1.__pgt_ord = __pgt_idx.v
-        //     WHERE __pgt_f0.__pgt_ord IS NOT NULL
-        //        OR __pgt_f1.__pgt_ord IS NOT NULL
+        // ── General case: ordinal-based FULL OUTER JOIN chain ────────
+        // Each SRF is wrapped in a subquery that adds row_number() so we
+        // can match them by ordinal.  We chain them via FULL OUTER JOIN
+        // which naturally handles different-length results by padding
+        // with NULLs — matching ROWS FROM semantics.
+        //
+        //   LATERAL (SELECT __pgt_f0.__pgt_c0, __pgt_f1.__pgt_c1 FROM
+        //     (SELECT val AS __pgt_c0, row_number() OVER () AS __pgt_rn
+        //      FROM f0(...) AS val) AS __pgt_f0
+        //     FULL OUTER JOIN
+        //     (SELECT val AS __pgt_c1, row_number() OVER () AS __pgt_rn
+        //      FROM f1(...) AS val) AS __pgt_f1
+        //     ON __pgt_f0.__pgt_rn = __pgt_f1.__pgt_rn
         //   ) AS alias
-        let mut join_parts = Vec::new();
-        let mut where_parts = Vec::new();
+        let mut subqueries = Vec::new();
         let mut select_parts = Vec::new();
 
         for (i, func_sql) in func_sqls.iter().enumerate() {
             let f_alias = format!("__pgt_f{i}");
-            let inner_alias = format!("__pgt_fi{i}");
+            let col_alias = format!("__pgt_c{i}");
 
-            // Each SRF is wrapped in a subquery that adds row_number() for
-            // ordinal matching.
-            let lateral_sql = format!(
-                "LATERAL (SELECT {inner_alias}.*, row_number() OVER () AS __pgt_ord \
-                 FROM {func_sql} AS {inner_alias}) AS {f_alias}"
+            // Each SRF is wrapped in a subquery with its result column
+            // given a known alias and row_number() for ordinal matching.
+            let sub = format!(
+                "(SELECT {col_alias}, row_number() OVER () AS __pgt_rn \
+                 FROM {func_sql} AS {col_alias}) AS {f_alias}"
             );
-            join_parts.push(format!(
-                "LEFT JOIN {lateral_sql} ON {f_alias}.__pgt_ord = __pgt_idx.v"
-            ));
-            where_parts.push(format!("{f_alias}.__pgt_ord IS NOT NULL"));
-            select_parts.push(format!("{f_alias}.*"));
+            subqueries.push((f_alias.clone(), sub));
+            select_parts.push(format!("{f_alias}.{col_alias}"));
         }
 
-        let inner_select = select_parts.join(", ");
-        let inner_from = format!(
-            "generate_series(1, 2147483647) AS __pgt_idx(v) {}",
-            join_parts.join(" ")
-        );
-        let inner_where = where_parts.join(" OR ");
+        // Chain subqueries via FULL OUTER JOIN on ordinal.
+        // For >2 SRFs, the join ON uses COALESCE of prior ordinals.
+        let inner_from = if subqueries.len() == 1 {
+            subqueries[0].1.clone()
+        } else {
+            let mut chain = subqueries[0].1.clone();
+            let mut coalesce_parts = vec![format!("{}.__pgt_rn", subqueries[0].0)];
+            for (f_alias, sub) in subqueries.iter().skip(1) {
+                let on_left = if coalesce_parts.len() == 1 {
+                    coalesce_parts[0].clone()
+                } else {
+                    format!("COALESCE({})", coalesce_parts.join(", "))
+                };
+                chain = format!("{chain} FULL OUTER JOIN {sub} ON {on_left} = {f_alias}.__pgt_rn");
+                coalesce_parts.push(format!("{f_alias}.__pgt_rn"));
+            }
+            chain
+        };
 
-        let mut result = format!("(SELECT {inner_select} FROM {inner_from} WHERE {inner_where})");
+        let inner_select = select_parts.join(", ");
+
+        // Use LATERAL so SRF arguments can reference columns from
+        // earlier FROM items (e.g. `unnest(m.arr)` where `m` is a
+        // preceding table).
+        let mut result = format!("LATERAL (SELECT {inner_select} FROM {inner_from})");
         if with_ordinality {
             // Ordinality for the whole ROWS FROM — add row_number outside.
             result = format!(
-                "(SELECT __pgt_rfo.*, row_number() OVER () AS ordinality \
+                "LATERAL (SELECT __pgt_rfo.*, row_number() OVER () AS ordinality \
                  FROM {result} AS __pgt_rfo)"
             );
         }
@@ -6099,7 +6121,19 @@ fn rewrite_rows_from_in_set_op(select: &pg_sys::SelectStmt) -> Result<String, Pg
         _ => "UNION",
     };
 
-    Ok(format!("{left} {op_str} {right}"))
+    let body = format!("{left} {op_str} {right}");
+
+    // Preserve any WITH clause attached to this set-operation SelectStmt.
+    // The CTE definitions live on the outermost SETOP node — they are NOT
+    // propagated to larg/rarg — so reconstructing from the arms alone drops them.
+    if !select.withClause.is_null() {
+        // SAFETY: withClause is non-null and points to a valid WithClause node
+        // obtained from the raw parse tree of a validated SQL string.
+        let with_sql = unsafe { deparse_with_clause_with_view_subs(select.withClause, &[])? };
+        Ok(format!("{with_sql} {body}"))
+    } else {
+        Ok(body)
+    }
 }
 
 // ── Multiple PARTITION BY → multi-pass window rewrite ──────────────

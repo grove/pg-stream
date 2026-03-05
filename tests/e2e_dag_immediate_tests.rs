@@ -118,7 +118,7 @@ async fn test_immediate_with_differential_downstream() {
         "SELECT pgtrickle.create_stream_table(
             'immd_b',
             $$SELECT grp, total * 3 AS tripled FROM immd_a$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )

@@ -34,7 +34,7 @@ use e2e::E2eDb;
 /// Set up a simple two-layer cascade:
 ///   base_table `orders` → ST `order_summary` → ST `order_report`
 ///
-/// `order_summary` uses a NULL (CALCULATED) schedule.
+/// `order_summary` uses a `'calculated'` schedule (CALCULATED mode).
 /// `order_report` uses a '1m' schedule.
 async fn setup_two_layer_cascade(db: &E2eDb) {
     db.execute(
@@ -63,12 +63,12 @@ async fn setup_two_layer_cascade(db: &E2eDb) {
     .await;
 
     // Layer 2: order_report — reads from order_summary (ST-on-ST)
-    // Uses NULL schedule (CALCULATED mode)
+    // Uses 'calculated' schedule (CALCULATED mode)
     db.execute(
         "SELECT pgtrickle.create_stream_table(
             'order_report',
             $$SELECT region, total_amount FROM order_summary WHERE order_count > 0$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -549,7 +549,7 @@ async fn test_three_layer_cascade_insert_propagates() {
             $$SELECT category, total,
                      CASE WHEN total > 25 THEN true ELSE false END AS is_big
               FROM category_totals$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -560,7 +560,7 @@ async fn test_three_layer_cascade_insert_propagates() {
         "SELECT pgtrickle.create_stream_table(
             'big_categories',
             $$SELECT category, total FROM category_flags WHERE is_big = true$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -625,7 +625,7 @@ async fn test_three_layer_cascade_update_propagates() {
             $$SELECT category, total,
                      CASE WHEN total >= 200 THEN 'premium' ELSE 'basic' END AS tier
               FROM prod_summary$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -636,7 +636,7 @@ async fn test_three_layer_cascade_update_propagates() {
         "SELECT pgtrickle.create_stream_table(
             'premium_categories',
             $$SELECT category, total FROM prod_labels WHERE tier = 'premium'$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -704,7 +704,7 @@ async fn test_st_on_st_dependency_is_stream_table_type() {
         "SELECT pgtrickle.create_stream_table(
             'dep_layer2',
             $$SELECT id, val * 2 AS doubled FROM dep_layer1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )

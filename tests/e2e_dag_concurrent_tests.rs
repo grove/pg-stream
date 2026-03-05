@@ -52,7 +52,7 @@ async fn test_dml_between_layer_refreshes() {
         "SELECT pgtrickle.create_stream_table(
             'btw_l2',
             $$SELECT grp, total * 2 AS doubled FROM btw_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -127,7 +127,7 @@ async fn test_concurrent_insert_during_pipeline_refresh() {
         "SELECT pgtrickle.create_stream_table(
             'conc_dag_l2',
             $$SELECT grp, total * 2 AS doubled FROM conc_dag_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -161,7 +161,14 @@ async fn test_concurrent_insert_during_pipeline_refresh() {
     // Wait for all inserts to complete
     inserter.await.expect("inserter task should not panic");
 
-    // Final refresh to pick up any remaining changes
+    // Final refresh to pick up any remaining changes.
+    // Two full passes of L1→L2 ensure convergence even when the last
+    // cycle's L2 FULL refresh pushed L2.data_timestamp past L1's:
+    //   Pass 1: L1 picks up remaining CDC entries.
+    //   Pass 2: L2 detects L1 changed (or L1 is already up-to-date and
+    //           L2 was refreshed from L1 in a cycle that already had all data).
+    db.refresh_st("conc_dag_l1").await;
+    db.refresh_st("conc_dag_l2").await;
     db.refresh_st("conc_dag_l1").await;
     db.refresh_st("conc_dag_l2").await;
 
@@ -203,7 +210,7 @@ async fn test_rollback_between_refreshes() {
         "SELECT pgtrickle.create_stream_table(
             'rb_l2',
             $$SELECT grp, total * 2 AS doubled FROM rb_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )

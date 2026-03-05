@@ -980,6 +980,33 @@ impl StDependency {
             Ok(result)
         })
     }
+
+    /// Return the `pgt_id`s of all stream tables that depend on the given
+    /// `source_relid` as a `STREAM_TABLE` source.
+    ///
+    /// Used by `drop_stream_table` to implement CASCADE: dropping a stream
+    /// table also drops every stream table downstream of it.
+    pub fn get_downstream_pgt_ids(source_relid: pg_sys::Oid) -> Result<Vec<i64>, PgTrickleError> {
+        Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT DISTINCT pgt_id \
+                     FROM pgtrickle.pgt_dependencies \
+                     WHERE source_relid = $1 AND source_type = 'STREAM_TABLE'",
+                    None,
+                    &[source_relid.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+            let mut result = Vec::new();
+            for row in table {
+                let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+                if let Some(id) = row.get::<i64>(1).map_err(map_spi)? {
+                    result.push(id);
+                }
+            }
+            Ok(result)
+        })
+    }
 }
 
 // ── Column snapshot helpers ────────────────────────────────────────────────

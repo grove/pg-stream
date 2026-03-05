@@ -59,7 +59,7 @@ async fn setup_ops_pipeline(db: &E2eDb) {
         "SELECT pgtrickle.create_stream_table(
             'ops_l2',
             $$SELECT grp, total * 2 AS doubled FROM ops_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -70,7 +70,7 @@ async fn setup_ops_pipeline(db: &E2eDb) {
         "SELECT pgtrickle.create_stream_table(
             'ops_l3',
             $$SELECT grp, doubled FROM ops_l2 WHERE doubled > 30$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -256,7 +256,7 @@ async fn test_alter_query_mid_pipeline() {
         "SELECT pgtrickle.create_stream_table(
             'ops_l2',
             $$SELECT grp, total * 2 AS doubled FROM ops_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -265,7 +265,7 @@ async fn test_alter_query_mid_pipeline() {
         "SELECT pgtrickle.create_stream_table(
             'ops_l3',
             $$SELECT grp, doubled FROM ops_l2 WHERE doubled > 30$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -397,7 +397,7 @@ async fn test_suspend_resume_cycle_data_consistency() {
         "SELECT pgtrickle.create_stream_table(
             'sr_l2',
             $$SELECT grp, total * 2 AS doubled FROM sr_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )

@@ -61,7 +61,7 @@ async fn setup_3_layer_pipeline(db: &E2eDb) {
         "SELECT pgtrickle.create_stream_table(
             'mc_l2',
             $$SELECT grp, total, total * 2 AS doubled FROM mc_l1$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -72,7 +72,7 @@ async fn setup_3_layer_pipeline(db: &E2eDb) {
         "SELECT pgtrickle.create_stream_table(
             'mc_l3',
             $$SELECT grp, doubled FROM mc_l2 WHERE doubled > 30$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -164,7 +164,7 @@ async fn setup_diamond_pipeline(db: &E2eDb) {
             'dm_l2',
             $$SELECT a.grp, a.total, b.cnt
               FROM dm_l1a a JOIN dm_l1b b ON a.grp = b.grp$$,
-            NULL,
+            'calculated',
             'DIFFERENTIAL'
         )",
     )
@@ -262,7 +262,14 @@ async fn test_mc_dag_noop_cycle_no_drift() {
     setup_3_layer_pipeline(&db).await;
     assert_pipeline_correct(&db).await;
 
-    // Record baseline data_timestamp for each layer
+    // Warm-up refresh: the first refresh after creation establishes the
+    // WAL frontier for each layer (triggers a FULL refresh since no frontier
+    // exists yet). Only after the frontier is set do subsequent no-op
+    // refreshes correctly avoid bumping data_timestamp.
+    refresh_pipeline(&db).await;
+    assert_pipeline_correct(&db).await;
+
+    // Record baseline data_timestamp for each layer AFTER frontier is established.
     let names = ["mc_l1", "mc_l2", "mc_l3"];
     let mut ts_before = Vec::new();
     for name in &names {
@@ -275,7 +282,8 @@ async fn test_mc_dag_noop_cycle_no_drift() {
         ts_before.push(ts);
     }
 
-    // 5 no-op refresh cycles
+    // 5 no-op refresh cycles — no source data changes, so data_timestamp must
+    // not advance (no spurious downstream wakeups).
     for _ in 0..5 {
         refresh_pipeline(&db).await;
         assert_pipeline_correct(&db).await;

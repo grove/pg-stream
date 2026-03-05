@@ -8,29 +8,56 @@
 #
 # The resulting image can be used by testcontainers-rs in the E2E tests.
 #
+# Build speed:
+#   On first call, the pre-built builder base image pg_trickle_builder:pg18
+#   is built automatically (Rust + cargo-pgrx + pgrx init, ~7 min once).
+#   Subsequent calls to this script (without --no-cache) skip the builder
+#   image step and take ~2-3 min cold / ~30 s warm.
+#
 # Usage:
-#   ./tests/build_e2e_image.sh            # default build
-#   ./tests/build_e2e_image.sh --no-cache # force full rebuild
+#   ./tests/build_e2e_image.sh              # default build (auto-builds builder)
+#   ./tests/build_e2e_image.sh --no-cache   # force full rebuild of both images
 # =============================================================================
 set -euo pipefail
 
 IMAGE_NAME="pg_trickle_e2e"
 IMAGE_TAG="latest"
+BUILDER_IMAGE="pg_trickle_builder:pg18"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Pass through any extra args (e.g. --no-cache)
 EXTRA_ARGS="${*:-}"
 
+# ── Ensure the builder base image is available ───────────────────────────────
+# Skip this check when --no-cache is given (the caller wants a full scratch
+# build, so we don't want to rebuild the builder separately first).
+if [[ "${EXTRA_ARGS}" != *"--no-cache"* ]]; then
+    if ! docker image inspect "${BUILDER_IMAGE}" &>/dev/null; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Builder image not found: ${BUILDER_IMAGE}"
+        echo "  Building it now (one-time, ~7 min) …"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        docker build \
+            -t "${BUILDER_IMAGE}" \
+            -f "${SCRIPT_DIR}/Dockerfile.builder" \
+            "${PROJECT_ROOT}"
+    else
+        echo "  Builder image present: ${BUILDER_IMAGE}"
+    fi
+fi
+
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  Building E2E test image: ${IMAGE_NAME}:${IMAGE_TAG}"
 echo "  Project root: ${PROJECT_ROOT}"
 echo "  Dockerfile:   ${SCRIPT_DIR}/Dockerfile.e2e"
+echo "  Builder image: ${BUILDER_IMAGE}"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
 docker build \
     -t "${IMAGE_NAME}:${IMAGE_TAG}" \
     -f "${SCRIPT_DIR}/Dockerfile.e2e" \
+    --build-arg "BUILDER_IMAGE=${BUILDER_IMAGE}" \
     ${EXTRA_ARGS} \
     "${PROJECT_ROOT}"
 
