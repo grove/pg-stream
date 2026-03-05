@@ -109,13 +109,13 @@ async fn test_gucs_registered() {
         "pg_trickle.scheduler_interval_ms default should be '1000'"
     );
 
-    // pg_trickle.min_schedule_seconds — default: 60
+    // pg_trickle.min_schedule_seconds — default: 1
     let min_schedule: String = db
         .query_scalar("SHOW pg_trickle.min_schedule_seconds")
         .await;
     assert_eq!(
-        min_schedule, "60",
-        "pg_trickle.min_schedule_seconds default should be '60'"
+        min_schedule, "1",
+        "pg_trickle.min_schedule_seconds default should be '1'"
     );
 
     // pg_trickle.max_consecutive_errors — default: 3
