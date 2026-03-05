@@ -158,6 +158,16 @@ test-upgrade from="0.1.3" to="0.2.1": (build-upgrade-image from to)
 bench:
     ./scripts/run_benchmarks.sh
 
+# Run database-level E2E benchmark suite (rebuilds Docker image)
+[group: "bench"]
+test-bench-e2e: build-e2e-image
+    cargo test --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
+
+# Run E2E benchmarks, skip Docker image rebuild
+[group: "bench"]
+test-bench-e2e-fast:
+    cargo test --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
+
 # Run diff-operator benchmarks only
 [group: "bench"]
 bench-diff:
