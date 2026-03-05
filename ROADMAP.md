@@ -19,14 +19,14 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                                              We are here
-                                                                   │
-                                                                   ▼
- ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
- │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
- │Released│─│Released│─│Released│─│Correct│─│Compat │─│Observ-│─│Stable │─│Scale &│
- │ ✅      │ │ ✅      │ │ ✅      │ │& Secur│ │& Scale│ │ability│ │Release│ │Ecosys.│
- └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+                                  We are here
+                                       │
+                                       ▼
+ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+ │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
+ │Released│─│Released│─│Released│─│OFFSET+│─│Correct│─│Compat │─│Observ-│─│Stable │─│Scale &│
+ │ ✅      │ │ ✅      │ │ ✅      │ │Upgrade│ │& Secur│ │& Cloud│ │ability│ │Release│ │Ecosys.│
+ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -179,7 +179,7 @@ See [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md).
 
 ## v0.2.1 — Upgrade Infrastructure & Documentation
 
-**Status: Released (2025-06-18).**
+**Status: Released (2026-03-05).**
 
 Patch release focused on upgrade safety and documentation. No SQL-level
 changes — the extension's function/view/trigger interface is identical to
@@ -315,25 +315,18 @@ partitioned storage tables are deferred to a future release.
 
 > **Partitioning subtotal: ~18–32 hours**
 
-### Performance
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| P1 | Verify PostgreSQL parallel query for delta SQL | 0h | [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md) §E |
-
 ### Operational
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| O1 | ~~Extension upgrade migrations (`ALTER EXTENSION UPDATE`)~~ | ✅ Done in v0.2.1 | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
-| O2 | Prepared statement cleanup on cache invalidation | 3–4h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.3 |
-| O3 | ~~Adaptive fallback threshold exposure via monitoring~~ | ✅ Done in v0.1.3 (F27) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.4 |
-| O4 | ~~SPI SQLSTATE error classification for retry~~ | ✅ Done in v0.1.3 (F29) | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G8.6 |
-| O5 | Slot lag alerting thresholds (configurable) | 2–3h | [SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) G10 |
-| O6 | Simplify `pg_trickle.user_triggers` GUC (remove redundant `on` value) | 1h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) C5 |
-| O7 | `pg_trickle_dump`: SQL export tool for manual backup before upgrade | 3–4h | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) §5.3 |
+| O1 | Prepared statement cleanup on cache invalidation | 3–4h | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) G8.3 |
+| O2 | Slot lag alerting thresholds (configurable) | 2–3h | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) G10 |
+| O3 | Simplify `pg_trickle.user_triggers` GUC (remove redundant `on` value) | 1h | [PLAN_FEATURE_CLEANUP.md](plans/PLAN_FEATURE_CLEANUP.md) C5 |
+| O4 | `pg_trickle_dump`: SQL export tool for manual backup before upgrade | 3–4h | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) §5.3 |
 
-### IMMEDIATE Mode Parity (Stage 6)
+> **Operational subtotal: ~9–12 hours**
+
+### IMMEDIATE Mode Parity
 
 Close the gap between DIFFERENTIAL and IMMEDIATE mode SQL coverage for the
 two remaining high-risk patterns — recursive CTEs and TopK queries.
@@ -371,12 +364,15 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 
 ### WAL CDC Hardening
 
+> WAL decoder F2–F3 fixes (keyless pk_hash, `old_*` columns for UPDATE) landed in v0.1.3.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| W1 | WAL decoder fixes (F2–F3 completed in v0.1.3) | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W2 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W3 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W4 | Promote `pg_trickle.cdc_mode = 'auto'` to recommended | Documentation | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W1 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W2 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W3 | Promote `pg_trickle.cdc_mode = 'auto'` to recommended | ~1h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+
+> **WAL CDC subtotal: ~13–19 hours**
 
 > **v0.3.0 total: ~120–170 hours**
 
@@ -395,11 +391,13 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 
 ---
 
-## v0.4.0 — Backward Compatibility & Parallel Refresh
+## v0.4.0 — Backward Compatibility, Cloud & Scale
 
-**Goal:** Widen the deployment target from PG 18-only to PG 16–18, and enable
-parallel refresh across DAG levels. After this milestone the extension is
-suitable for production use on mainstream PostgreSQL versions.
+**Goal:** Widen the deployment target from PG 18-only to PG 16–18, enable
+parallel refresh across DAG levels, achieve compatibility with connection
+poolers (PgBouncer transaction mode), and validate correctness against
+external test corpora. After this milestone the extension is suitable for
+production use on mainstream PostgreSQL deployments including cloud providers.
 
 ### PostgreSQL Backward Compatibility (PG 16–18)
 
@@ -422,8 +420,10 @@ PG 14–15 support can follow in a later release.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| P2 | DAG level extraction (`topological_levels()`) | 2–4h | [REPORT_PARALLELIZATION.md §B](plans/performance/REPORT_PARALLELIZATION.md) |
-| P3 | Dynamic background worker dispatch per level | 12–16h | [REPORT_PARALLELIZATION.md §A+B](plans/performance/REPORT_PARALLELIZATION.md) |
+| P1 | DAG level extraction (`topological_levels()`) | 2–4h | [REPORT_PARALLELIZATION.md §B](plans/performance/REPORT_PARALLELIZATION.md) |
+| P2 | Dynamic background worker dispatch per level | 12–16h | [REPORT_PARALLELIZATION.md §A+B](plans/performance/REPORT_PARALLELIZATION.md) |
+
+> **Parallel refresh subtotal: ~14–20 hours**
 
 ### Connection Pooler Compatibility
 
@@ -567,7 +567,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.2.1 — Upgrade Infrastructure & Documentation | ~8h | 70–86h | ✅ Released |
 | v0.2.2 — OFFSET Support & Upgrade Tooling | ~5h | 75–91h | |
 | v0.3.0 — Correctness, Security & Operations | 120–170h | 195–261h | |
-| v0.4.0 — Backward Compat, Pooler & External Suites | 200–280h | 395–541h | |
+| v0.4.0 — Backward Compatibility, Cloud & Scale | 200–280h | 395–541h | |
 | v0.5.0 — Observability & Integration | 14–21h | 409–562h | |
 | v1.0.0 — Stable release | 18–27h | 427–589h | |
 | Post-1.0 (ecosystem) | 88–134h | 515–723h | |
