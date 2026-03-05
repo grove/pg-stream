@@ -125,12 +125,21 @@ as before.
 
 ### 0.2.0 → 0.2.1
 
-**No SQL changes.** The extension's function, view, and event trigger
-interface is identical to 0.2.0. This is an infrastructure-only release.
+**Three new catalog columns** added to `pgtrickle.pgt_stream_tables`:
 
-The migration script (`pg_trickle--0.2.0--0.2.1.sql`) is a no-op.
+| Column | Type | Default | Purpose |
+|--------|------|---------|--------|
+| `topk_offset` | `INT` | `NULL` | Pre-provisioned for paged TopK OFFSET (activated in v0.2.2) |
+| `has_keyless_source` | `BOOLEAN NOT NULL` | `FALSE` | EC-06: keyless source flag; switches apply strategy from MERGE to counted DELETE |
+| `function_hashes` | `TEXT` | `NULL` | EC-16: stores MD5 hashes of referenced function bodies for change detection |
 
-**What's new:**
+The migration script (`pg_trickle--0.2.0--0.2.1.sql`) adds these columns
+via `ALTER TABLE … ADD COLUMN IF NOT EXISTS`.
+
+**No breaking changes.** All v0.2.0 functions, views, and event triggers
+continue to work as before.
+
+**What's also new:**
 - Upgrade migration safety infrastructure (scripts, CI, E2E tests)
 - GitHub Pages book expansion (6 new documentation pages)
 - User-facing upgrade guide (this document)

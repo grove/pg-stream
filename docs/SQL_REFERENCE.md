@@ -1769,8 +1769,9 @@ Core metadata for each stream table.
 | `pgt_name` | `text` | Table name |
 | `pgt_schema` | `text` | Schema name |
 | `defining_query` | `text` | The SQL query that defines the ST |
+| `original_query` | `text` | The user-supplied query before normalization |
 | `schedule` | `text` | Refresh schedule (duration or cron expression) |
-| `refresh_mode` | `text` | FULL or DIFFERENTIAL |
+| `refresh_mode` | `text` | FULL, DIFFERENTIAL, or IMMEDIATE |
 | `status` | `text` | INITIALIZING, ACTIVE, SUSPENDED, ERROR |
 | `is_populated` | `bool` | Whether the table has been populated |
 | `data_timestamp` | `timestamptz` | Timestamp of the data in the ST |
@@ -1778,7 +1779,16 @@ Core metadata for each stream table.
 | `last_refresh_at` | `timestamptz` | When last refreshed |
 | `consecutive_errors` | `int` | Current error streak count |
 | `needs_reinit` | `bool` | Whether upstream DDL requires reinitialization |
+| `auto_threshold` | `double precision` | Per-ST adaptive fallback threshold (overrides GUC) |
+| `last_full_ms` | `double precision` | Last FULL refresh duration in milliseconds |
 | `functions_used` | `text[]` | Function names used in the defining query (for DDL tracking) |
+| `topk_limit` | `int` | LIMIT value for TopK stream tables (`NULL` if not TopK) |
+| `topk_order_by` | `text` | ORDER BY clause SQL for TopK stream tables |
+| `topk_offset` | `int` | OFFSET value for paged TopK queries (pre-provisioned for v0.2.2) |
+| `diamond_consistency` | `text` | Diamond consistency mode: `none` or `atomic` |
+| `diamond_schedule_policy` | `text` | Diamond schedule policy: `fastest` or `slowest` |
+| `has_keyless_source` | `bool` | Whether any source table lacks a PRIMARY KEY (EC-06) |
+| `function_hashes` | `text` | MD5 hashes of referenced function bodies for change detection (EC-16) |
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last modification timestamp |
 
@@ -1790,8 +1800,10 @@ DAG edges — records which source tables each ST depends on, including CDC mode
 |---|---|---|
 | `pgt_id` | `bigint` | FK to pgt_stream_tables |
 | `source_relid` | `oid` | OID of the source table |
-| `source_type` | `text` | TABLE, STREAM_TABLE, or VIEW |
+| `source_type` | `text` | TABLE, STREAM_TABLE, VIEW, MATVIEW, or FOREIGN_TABLE |
 | `columns_used` | `text[]` | Which columns are referenced |
+| `column_snapshot` | `jsonb` | Snapshot of source column metadata at creation time |
+| `schema_fingerprint` | `text` | SHA-256 fingerprint of column snapshot for fast equality checks |
 | `cdc_mode` | `text` | Current CDC mode: TRIGGER, TRANSITIONING, or WAL |
 | `slot_name` | `text` | Replication slot name (WAL/TRANSITIONING modes) |
 | `decoder_confirmed_lsn` | `pg_lsn` | WAL decoder's last confirmed position |
@@ -1811,6 +1823,9 @@ Audit log of all refresh operations.
 | `action` | `text` | NO_DATA, FULL, DIFFERENTIAL, REINITIALIZE, SKIP |
 | `rows_inserted` | `bigint` | Rows inserted |
 | `rows_deleted` | `bigint` | Rows deleted |
+| `delta_row_count` | `bigint` | Number of delta rows processed from change buffers |
+| `merge_strategy_used` | `text` | Which merge strategy was used (e.g. MERGE, DELETE+INSERT) |
+| `was_full_fallback` | `bool` | Whether the refresh fell back to FULL from DIFFERENTIAL |
 | `error_message` | `text` | Error message if failed |
 | `status` | `text` | RUNNING, COMPLETED, FAILED, SKIPPED |
 | `initiated_by` | `text` | What triggered: SCHEDULER, MANUAL, or INITIAL |

@@ -1,5 +1,12 @@
 -- pg_trickle 0.2.0 → 0.2.1 upgrade script
 --
+-- topk_offset: OFFSET value for paged TopK queries (EC-14 / OS2).
+-- Added here so upgraders from 0.2.0 are in sync with fresh 0.2.1 installs;
+-- the OFFSET feature itself ships in 0.2.2 — the column is non-breaking
+-- (NULL default, no code path activated until OFFSET is wired up).
+ALTER TABLE pgtrickle.pgt_stream_tables
+    ADD COLUMN IF NOT EXISTS topk_offset INT;
+
 -- EC-06: Add has_keyless_source flag to pgt_stream_tables.
 -- When TRUE, the stream table uses a non-unique index on __pgt_row_id
 -- and the apply logic uses counted DELETE instead of MERGE, because

@@ -61,7 +61,7 @@ By the end you will have:
 
 - Seen how stream tables are created, queried, and refreshed
 - Watched a single `UPDATE` in a base table cascade through three layers of stream tables automatically
-- Understood the two IVM strategies and when each applies
+- Understood the three refresh modes and IVM strategies
 
 ---
 
@@ -175,6 +175,8 @@ SELECT pgtrickle.create_stream_table(
     refresh_mode => 'DIFFERENTIAL'
 );
 ```
+
+> **New in v0.2.0:** `create_stream_table` also accepts `diamond_consistency` (`'none'` or `'atomic'`) and `diamond_schedule_policy` (`'fastest'` or `'slowest'`) parameters for managing diamond-shaped dependency graphs. Schedules can also be specified as cron expressions (e.g., `'*/5 * * * *'`, `'@hourly'`). See [SQL_REFERENCE.md](SQL_REFERENCE.md) for the full parameter list.
 
 ### What just happened?
 
@@ -562,23 +564,45 @@ CALCULATED (schedule = `NULL`) means: compute the tightest schedule across all d
 
 ```sql
 -- Current status of all stream tables
-SELECT name, schedule, data_timestamp, staleness, refresh_mode
+SELECT name, status, refresh_mode, schedule, data_timestamp, staleness
 FROM pgtrickle.pgt_status();
 ```
 
 ```
-        name         | schedule  |       data_timestamp        |    staleness    | refresh_mode
----------------------+-----------+-----------------------------+-----------------+--------------
- public.department_tree   | NULL | 2026-02-26 10:30:00.123+01 | 00:00:00.877    | DIFFERENTIAL
- public.department_stats  | NULL | 2026-02-26 10:30:00.456+01 | 00:00:00.544    | DIFFERENTIAL
- public.department_report | 1m   | 2026-02-26 10:30:00.789+01 | 00:00:00.211    | DIFFERENTIAL
+        name                 | status |  refresh_mode | schedule |       data_timestamp        |    staleness
+-----------------------------+--------+---------------+----------+-----------------------------+-----------------
+ public.department_tree      | ACTIVE | DIFFERENTIAL  |          | 2026-02-26 10:30:00.123+01 | 00:00:00.877
+ public.department_stats     | ACTIVE | DIFFERENTIAL  |          | 2026-02-26 10:30:00.456+01 | 00:00:00.544
+ public.department_report    | ACTIVE | DIFFERENTIAL  | 1m       | 2026-02-26 10:30:00.789+01 | 00:00:00.211
 ```
 
 ```sql
 -- Detailed performance stats
-SELECT pgt_name, total_refreshes, avg_duration_ms, total_rows_inserted
+SELECT pgt_name, total_refreshes, avg_duration_ms, successful_refreshes
 FROM pgtrickle.pg_stat_stream_tables;
 ```
+
+```sql
+-- Health check: quick triage of common issues
+SELECT check_name, severity, detail FROM pgtrickle.health_check();
+```
+
+```sql
+-- Visualize the dependency DAG
+SELECT * FROM pgtrickle.dependency_tree();
+```
+
+```sql
+-- Recent refresh timeline across all stream tables
+SELECT * FROM pgtrickle.refresh_timeline(10);
+```
+
+```sql
+-- Check CDC change buffer sizes (spotting buffer build-up)
+SELECT * FROM pgtrickle.change_buffer_sizes();
+```
+
+See [SQL_REFERENCE.md](SQL_REFERENCE.md) for the full list of monitoring functions including `list_sources()`, `trigger_inventory()`, and `diamond_groups()`.
 
 ### Optional: WAL-based CDC
 
@@ -593,9 +617,47 @@ pg_trickle will automatically transition each stream table from trigger-based to
 
 ---
 
-## Step 6: Understanding the Two IVM Strategies
+## Step 6: Understanding the Refresh Modes and IVM Strategies
 
-You've now seen both strategies pg_trickle uses for incremental view maintenance. Understanding when each applies helps you write efficient stream table queries.
+You've now seen the IVM strategies pg_trickle uses for incremental view maintenance. Understanding the three refresh modes and when each strategy applies helps you write efficient stream table queries.
+
+### The Three Refresh Modes
+
+| Mode | When it refreshes | Use case |
+|------|------------------|----------|
+| **DIFFERENTIAL** | On a schedule (background) | Most use cases — processes only changed rows |
+| **FULL** | On a schedule (background) | Fallback when the query can't be differentiated |
+| **IMMEDIATE** | Synchronously, in the same transaction as the DML | Real-time dashboards, audit tables — the stream table is always up-to-date |
+
+**IMMEDIATE mode** (new in v0.2.0) maintains stream tables synchronously within the same transaction as the base table DML. It uses statement-level AFTER triggers with transition tables — no change buffers, no scheduler. The stream table is always consistent with the current transaction.
+
+```sql
+-- Create a stream table that updates in real-time
+SELECT pgtrickle.create_stream_table(
+    name         => 'live_headcount',
+    query        => $$
+    SELECT department_id, COUNT(*) AS headcount
+    FROM employees
+    GROUP BY department_id
+    $$,
+    refresh_mode => 'IMMEDIATE'
+);
+
+-- After any INSERT/UPDATE/DELETE on employees,
+-- live_headcount is already up-to-date — no refresh needed!
+```
+
+IMMEDIATE mode supports joins, aggregates, window functions, LATERAL subqueries, and cascading IMMEDIATE stream tables. Recursive CTEs are not supported in IMMEDIATE mode (use DIFFERENTIAL instead).
+
+You can switch between modes at any time:
+
+```sql
+-- Switch from DIFFERENTIAL to IMMEDIATE
+SELECT pgtrickle.alter_stream_table('department_stats', refresh_mode => 'IMMEDIATE');
+
+-- Switch back to DIFFERENTIAL with a schedule
+SELECT pgtrickle.alter_stream_table('department_stats', refresh_mode => 'DIFFERENTIAL', schedule => '1m');
+```
 
 ### Algebraic Differentiation (used by `department_stats`)
 
@@ -627,7 +689,7 @@ For recursive CTEs, pg_trickle can't derive an algebraic delta because the recur
 
 Both strategies are more efficient than full recomputation — they work on the *affected portion of the result set*, not the entire recursive query. The MERGE only modifies rows that actually changed.
 
-### When to use which?
+### When to use which strategy?
 
 You don't choose — pg_trickle detects the strategy automatically based on the query structure:
 
@@ -641,6 +703,8 @@ You don't choose — pg_trickle detects the strategy automatically based on the 
 | Recursive CTEs (`WITH RECURSIVE`) INSERT | Semi-naive evaluation | O(new rows derived from the change) |
 | Recursive CTEs (`WITH RECURSIVE`) DELETE/UPDATE | Delete-and-Rederive | Re-derives rows with alternative paths; O(affected subgraph) |
 | Window functions | Partition recompute | Only affected partitions recomputed |
+| `ORDER BY … LIMIT N` (TopK) | Scoped recomputation | Re-evaluates top-N via MERGE; stores exactly N rows |
+| IMMEDIATE mode queries | In-transaction delta | Same algebraic strategies, applied synchronously via transition tables |
 
 ---
 
@@ -674,9 +738,12 @@ DROP TABLE departments;
 | **DAG scheduling** | Stream tables can depend on other stream tables; refreshes run in topological order, schedules propagate upstream via `CALCULATED` mode |
 | **Algebraic IVM** | Delta queries that process only changed rows — O(changes) regardless of table size |
 | **Semi-naive / DRed** | Incremental strategies for `WITH RECURSIVE` — INSERT uses semi-naive, DELETE/UPDATE uses Delete-and-Rederive |
+| **IMMEDIATE mode** | Synchronous in-transaction IVM — stream tables updated within the same transaction as your DML, always consistent |
+| **TopK** | `ORDER BY … LIMIT N` queries store exactly N rows, refreshed via scoped recomputation |
+| **Diamond consistency** | Atomic refresh groups for diamond-shaped dependency graphs via `diamond_consistency = 'atomic'` |
 | **Downstream propagation** | A single base table write cascades through an entire chain of stream tables, automatically, in the right order |
 | **Trigger-based CDC** | Lightweight row-level triggers by default (no WAL configuration needed); optional transition to WAL-based capture via `pg_trickle.cdc_mode = 'auto'` |
-| **Monitoring** | `pgt_status()` and `pg_stat_stream_tables` for freshness, timing, and error history |
+| **Monitoring** | `pgt_status()`, `health_check()`, `dependency_tree()`, `pg_stat_stream_tables`, and more for freshness, timing, and error history |
 
 The key takeaway: you write to base tables — **pg_trickle does the rest**. Data flows downstream automatically, each layer doing the minimum work proportional to what changed, in dependency order.
 

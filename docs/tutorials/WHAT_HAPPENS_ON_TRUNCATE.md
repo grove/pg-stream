@@ -44,7 +44,7 @@ bob      | 100.00 | 2
 
 ---
 
-## Case 1: TRUNCATE the Base Table
+## Case 1: TRUNCATE the Base Table (DIFFERENTIAL Mode)
 
 ```sql
 TRUNCATE orders;
@@ -52,54 +52,52 @@ TRUNCATE orders;
 
 All four rows are removed instantly.
 
-### What Happens at the Trigger Level: Nothing
+### What Happens at the Trigger Level: TRUNCATE Marker
 
-PostgreSQL's `TRUNCATE` command does **not** fire row-level AFTER triggers. This is by design in PostgreSQL — TRUNCATE is a DDL-like operation that removes all rows without scanning them individually. The per-row `AFTER INSERT OR UPDATE OR DELETE` trigger that pg_trickle installs is simply never invoked.
+> **Updated in v0.2.0:** pg_trickle now installs a **statement-level AFTER TRUNCATE** trigger on tracked source tables. This trigger writes a single marker row to the change buffer with `action = 'T'`.
 
-The change buffer remains empty:
+Unlike the per-row DML triggers, the TRUNCATE trigger cannot capture individual row data (PostgreSQL's `TRUNCATE` does not provide `OLD` records). Instead, it writes a sentinel:
 
 ```
 pgtrickle_changes.changes_16384
 ┌───────────┬─────────────┬────────┬──────────┬──────────┐
-│ change_id │ lsn         │ action │ ...      │ ...      │
+│ change_id │ lsn         │ action │ new_*    │ old_*    │
 ├───────────┼─────────────┼────────┼──────────┼──────────┤
-│ (empty)   │             │        │          │          │
+│ 5         │ 0/1A3F4000  │ T      │ NULL     │ NULL     │
 └───────────┴─────────────┴────────┴──────────┴──────────┘
 ```
 
-No rows. Zero change events captured.
+The `'T'` action marker tells the refresh engine: "a TRUNCATE happened — a full refresh is required."
 
-### What Happens at the Scheduler: Skip
+### What Happens at the Scheduler: Automatic Full Refresh
 
 On the next refresh cycle, the scheduler:
 1. Checks the change buffer for rows in the LSN window
-2. Finds **zero rows**
-3. Classifies the refresh action as `NO_DATA`
-4. Advances the data timestamp but **does not modify the stream table**
+2. Finds the `action = 'T'` marker row
+3. **Falls back to a FULL refresh** — regardless of the stream table's configured `refresh_mode`
+4. TRUNCATEs the stream table
+5. Re-executes the defining query against the current base table state
+6. Inserts all results
 
-The stream table still shows the old values:
+Since the `orders` table is now empty, the defining query returns zero rows:
 
 ```sql
+-- After the next scheduled refresh:
 SELECT * FROM customer_totals;
- customer | total  | order_count
-----------|--------|------------
- alice    | 80.00  | 2            ← STALE! orders table is empty
- bob      | 100.00 | 2            ← STALE! orders table is empty
+ customer | total | order_count
+----------|-------|------------
+ (0 rows)                        ← correct: orders is empty
 ```
 
-**The stream table is now stale.** It reflects data that no longer exists in the base table.
+**No manual intervention required.** The TRUNCATE marker ensures the stream table is automatically brought back into consistency on the next refresh cycle.
 
-### Why This Happens
-
-The entire incremental view maintenance pipeline depends on the change buffer to know what changed. Without change events, the DVM has no deltas to apply. The stream table's reference-counted aggregates still think there are 4 orders contributing to two groups.
-
-This is not a bug — it's a fundamental limitation of trigger-based CDC. The trigger can only fire when PostgreSQL executes individual row operations, and TRUNCATE deliberately skips per-row processing for performance.
+> **Note:** In versions before v0.2.0, TRUNCATE was not captured at all — the change buffer stayed empty and the stream table became silently stale. If you're running an older version, you still need to call `pgtrickle.refresh_stream_table()` manually after a TRUNCATE.
 
 ---
 
-## Case 2: How to Recover — Manual Refresh
+## Case 2: Manual Refresh (Explicit Recovery)
 
-The fix is straightforward. Force a manual refresh:
+Although TRUNCATE is now automatically handled on the next refresh cycle, you can force an immediate recovery without waiting:
 
 ```sql
 SELECT pgtrickle.refresh_stream_table('customer_totals');
@@ -108,22 +106,11 @@ SELECT pgtrickle.refresh_stream_table('customer_totals');
 This executes a **full refresh** regardless of the stream table's configured refresh mode:
 
 1. **TRUNCATE** the stream table itself (clearing the stale data)
-2. **Re-execute** the defining query: `SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count FROM orders GROUP BY customer`
+2. **Re-execute** the defining query
 3. **INSERT** the results into the stream table
 4. **Update the frontier** so future differential refreshes start from the current LSN
 
-Since the `orders` table is empty, the defining query returns zero rows. The stream table becomes empty too:
-
-```sql
-SELECT pgtrickle.refresh_stream_table('customer_totals');
-
-SELECT * FROM customer_totals;
- customer | total | order_count
-----------|-------|------------
- (0 rows)                        ← correct: orders is empty
-```
-
-The stream table is now consistent again. Future INSERT/UPDATE/DELETE operations on `orders` will be captured normally by the trigger and propagated incrementally.
+This is useful when you can't wait for the next scheduled refresh cycle and need the stream table consistent immediately.
 
 ---
 
@@ -143,48 +130,27 @@ COMMIT;
 
 ### What the Change Buffer Sees
 
-- TRUNCATE: **0 events** (not captured)
+- TRUNCATE: **1 marker event** (`action = 'T'`) — captured by the statement-level trigger
 - INSERT charlie 100.00: **1 event** (captured)
 - INSERT charlie 200.00: **1 event** (captured)
 - INSERT dave 150.00: **1 event** (captured)
 
-The change buffer has 3 INSERT events — but knows nothing about the 4 rows that were removed by TRUNCATE.
+The change buffer has 4 rows — the TRUNCATE marker plus 3 INSERT events.
 
 ### What the Scheduler Does
 
-The scheduler sees 3 pending changes and runs a DIFFERENTIAL refresh:
-
-```
-Aggregate delta (from INSERTs only):
-  Group "charlie": ins_count = 2, ins_total = 300.00
-  Group "dave":    ins_count = 1, ins_total = 150.00
-```
-
-The MERGE applies these deltas to the **existing** stream table:
+The scheduler sees the `action = 'T'` marker and triggers a **full refresh**, ignoring the individual INSERT events. The full refresh re-executes the defining query against the current state of `orders`, which now contains only charlie and dave:
 
 ```sql
-SELECT * FROM customer_totals;
- customer | total  | order_count
-----------|--------|------------
- alice    | 80.00  | 2            ← STALE! alice has no orders
- bob      | 100.00 | 2            ← STALE! bob has no orders
- charlie  | 300.00 | 2            ← correct
- dave     | 150.00 | 1            ← correct
-```
-
-The new data (charlie, dave) is correct. But the old data (alice, bob) persists because the TRUNCATE that removed their orders was never captured. The reference counts for alice and bob were never decremented.
-
-### How to Fix
-
-```sql
-SELECT pgtrickle.refresh_stream_table('customer_totals');
-
+-- After the next scheduled refresh:
 SELECT * FROM customer_totals;
  customer | total  | order_count
 ----------|--------|------------
  charlie  | 300.00 | 2            ← correct
  dave     | 150.00 | 1            ← correct
 ```
+
+The old data (alice, bob) is gone because the full refresh recomputed from scratch. This is correct — the TRUNCATE marker ensures consistency regardless of what other changes occurred in the same window.
 
 ---
 
@@ -223,12 +189,14 @@ Now truncate the dimension table:
 TRUNCATE customers CASCADE;
 ```
 
-The `CASCADE` also truncates `orders` (due to the foreign key). Neither TRUNCATE fires row-level triggers. The change buffer is empty for both tables.
+The `CASCADE` also truncates `orders` (due to the foreign key). Both tables have TRUNCATE triggers installed, so both write a `'T'` marker to their respective change buffers.
 
-The stream table continues to show all the old joined rows as if nothing happened. The only recovery is a manual refresh:
+On the next refresh cycle, the scheduler detects the TRUNCATE markers and performs a full refresh. The stream table is recomputed from the now-empty base tables:
 
 ```sql
-SELECT pgtrickle.refresh_stream_table('order_details');
+-- After the next scheduled refresh:
+SELECT * FROM order_details;
+-- (0 rows) — correct
 ```
 
 ---
@@ -260,97 +228,73 @@ So after a TRUNCATE of the base table, the **next scheduled refresh** automatica
 
 ## Why PostgreSQL Doesn't Fire Row Triggers on TRUNCATE
 
-Understanding the PostgreSQL internals helps explain why this limitation exists:
+Understanding the PostgreSQL internals helps explain why per-row capture is impossible:
 
-| Operation | Mechanism | Row triggers fired? |
-|-----------|-----------|-------------------|
-| `DELETE FROM t` | Scans and removes rows one by one | Yes — AFTER DELETE per row |
-| `TRUNCATE t` | Removes all heap files and reinitializes the table storage | No — no per-row processing |
-| `DELETE FROM t WHERE true` | Same as `DELETE FROM t` (full scan) | Yes — AFTER DELETE per row |
+| Operation | Mechanism | Row triggers fired? | Statement triggers fired? |
+|-----------|-----------|-------------------|-------------------------|
+| `DELETE FROM t` | Scans and removes rows one by one | Yes — AFTER DELETE per row | Yes |
+| `TRUNCATE t` | Removes all heap files and reinitializes the table storage | No — no per-row processing | Yes — AFTER TRUNCATE |
+| `DELETE FROM t WHERE true` | Same as `DELETE FROM t` (full scan) | Yes — AFTER DELETE per row | Yes |
 
 `TRUNCATE` is fundamentally different from `DELETE`. It's an O(1) operation that replaces the table's storage files, while DELETE is O(N) — scanning every row and recording each removal in WAL.
 
-PostgreSQL does support **statement-level** `AFTER TRUNCATE` triggers:
-
-```sql
-CREATE TRIGGER after_truncate_trigger
-    AFTER TRUNCATE ON orders
-    FOR EACH STATEMENT
-    EXECUTE FUNCTION some_function();
-```
-
-However, statement-level TRUNCATE triggers:
-- Do **not** receive OLD row data (there's no `OLD` record)
-- Cannot enumerate which rows were removed
-- Only know that a TRUNCATE happened on a specific table
-
-This means a TRUNCATE trigger could detect the event but cannot generate the per-row DELETE events that the DVM pipeline needs.
+pg_trickle uses a **statement-level** `AFTER TRUNCATE` trigger to detect the event and write a `'T'` marker to the change buffer. This marker does not contain per-row data (PostgreSQL's TRUNCATE trigger doesn't provide OLD records), but it's sufficient to signal that a full refresh is needed.
 
 ---
 
 ## Alternative: DELETE FROM Instead of TRUNCATE
 
-If you need the stream table to stay consistent without manual intervention, use `DELETE FROM` instead of `TRUNCATE`:
+For **DIFFERENTIAL** mode, `TRUNCATE` is now handled automatically (via the `'T'` marker and full refresh fallback). However, using `DELETE FROM` instead of `TRUNCATE` has its own advantages:
 
 ```sql
 -- Instead of: TRUNCATE orders;
 DELETE FROM orders;
 ```
 
-This is slower (O(N) vs O(1)) but fires the row-level DELETE trigger for every row. The change buffer captures all removals, and the next differential refresh correctly decrements all reference counts, removing groups whose count reaches zero.
+This fires the row-level DELETE trigger for every row. The change buffer captures all removals, and the next differential refresh correctly decrements all reference counts through the standard algebraic delta path — avoiding the need for a full refresh fallback.
 
-| Approach | Speed | Stream table consistent? |
-|----------|-------|------------------------|
-| `TRUNCATE orders` | O(1) — instant | No — requires manual refresh |
-| `DELETE FROM orders` | O(N) — scans all rows | Yes — triggers fire for each row |
-| `TRUNCATE` + manual refresh | O(1) + O(query) | Yes — after manual refresh |
+| Approach | Speed | Stream table consistent? | Refresh type |
+|----------|-------|------------------------|-------------|
+| `TRUNCATE orders` | O(1) — instant | Yes — automatic full refresh on next cycle | FULL (fallback) |
+| `DELETE FROM orders` | O(N) — scans all rows | Yes — per-row triggers fire | DIFFERENTIAL |
+| `TRUNCATE` + manual refresh | O(1) + O(query) | Yes — immediately | FULL (manual) |
 
-For tables with millions of rows, `DELETE FROM` can be slow and generate significant WAL. In those cases, TRUNCATE followed by a manual refresh is often the pragmatic choice.
+For tables with millions of rows, `DELETE FROM` can be slow and generate significant WAL. TRUNCATE is generally the better choice — the automatic full refresh fallback makes it safe to use.
 
 ---
 
 ## Best Practices
 
-### 1. Always Refresh After TRUNCATE
+### 1. TRUNCATE Is Safe to Use
 
-Make it a habit: if you TRUNCATE a base table, immediately refresh all dependent stream tables:
+As of v0.2.0, TRUNCATE on tracked source tables is automatically detected and triggers a full refresh on the next scheduler cycle. No manual intervention is required for standard operation.
+
+### 2. Use Manual Refresh for Immediate Consistency
+
+If you need the stream table to be consistent immediately (not on the next cycle), call refresh explicitly:
 
 ```sql
 TRUNCATE orders;
 SELECT pgtrickle.refresh_stream_table('customer_totals');
 ```
 
-### 2. Use DELETE FROM for Small Tables
+### 3. Consider IMMEDIATE Mode for Real-Time Needs
 
-For tables with fewer than ~100K rows, `DELETE FROM` is fast enough and keeps everything consistent automatically.
-
-### 3. Wrap TRUNCATE + Refresh in a Function
-
-For ETL pipelines, create a helper:
-
-```sql
-CREATE OR REPLACE FUNCTION reload_orders(data jsonb) RETURNS void AS $$
-BEGIN
-    TRUNCATE orders;
-    INSERT INTO orders SELECT * FROM jsonb_populate_recordset(null::orders, data);
-    PERFORM pgtrickle.refresh_stream_table('customer_totals');
-END;
-$$ LANGUAGE plpgsql;
-```
+For stream tables that need to reflect TRUNCATE instantly (within the same transaction), use IMMEDIATE mode. The TRUNCATE trigger automatically performs a full refresh synchronously.
 
 ### 4. Consider FULL Mode for ETL-Heavy Tables
 
 If a table is routinely truncated and reloaded, FULL refresh mode may be simpler than DIFFERENTIAL — it naturally handles TRUNCATE because it recomputes from scratch every cycle.
 
-### 5. Monitor for Staleness
+### 5. Use `trigger_inventory()` to Verify Triggers
 
-pg_trickle emits monitoring alerts when a stream table's data deviates from expected freshness. After a TRUNCATE, the `data_timestamp` still advances (since the scheduler sees no pending changes), but the actual data is stale. The most reliable detection is comparing the stream table results against a fresh query:
+You can verify that both the DML trigger and the TRUNCATE trigger are installed and enabled:
 
 ```sql
--- Quick consistency check
-SELECT count(*) FROM customer_totals;  -- still shows rows?
-SELECT count(*) FROM orders;            -- should be 0 after TRUNCATE
+SELECT * FROM pgtrickle.trigger_inventory();
 ```
+
+This shows one row per (source table, trigger type) confirming both `pg_trickle_cdc_<oid>` (DML) and `pg_trickle_cdc_truncate_<oid>` (TRUNCATE) triggers are present.
 
 ---
 
@@ -358,27 +302,59 @@ SELECT count(*) FROM orders;            -- should be 0 after TRUNCATE
 
 | Aspect | INSERT | UPDATE | DELETE | TRUNCATE |
 |--------|--------|--------|--------|----------|
-| **Trigger fires?** | Yes (per row) | Yes (per row) | Yes (per row) | No |
-| **Change buffer** | 1 row per INSERT | 1 row per UPDATE | 1 row per DELETE | Empty |
-| **Stream table updated?** | Yes (next refresh) | Yes (next refresh) | Yes (next refresh) | No — stays stale |
-| **Recovery** | Automatic | Automatic | Automatic | Manual refresh required |
+| **Row trigger fires?** | Yes (per row) | Yes (per row) | Yes (per row) | No |
+| **Statement trigger fires?** | Yes | Yes | Yes | Yes (writes `'T'` marker) |
+| **Change buffer** | 1 row per INSERT | 1 row per UPDATE | 1 row per DELETE | 1 marker row (`action='T'`) |
+| **Stream table updated?** | Yes (next refresh) | Yes (next refresh) | Yes (next refresh) | Yes (full refresh on next cycle) |
+| **Recovery** | Automatic (differential) | Automatic (differential) | Automatic (differential) | Automatic (full refresh fallback) |
 | **FULL mode affected?** | N/A (recomputes) | N/A (recomputes) | N/A (recomputes) | N/A (recomputes) |
-| **Speed** | O(1) per row | O(1) per row | O(1) per row | O(1) total |
+| **IMMEDIATE mode?** | Synchronous delta | Synchronous delta | Synchronous delta | Synchronous full refresh |
+| **Speed** | O(1) per row | O(1) per row | O(1) per row | O(1) + O(query) for refresh |
+
+---
+
+## What About IMMEDIATE Mode?
+
+In **IMMEDIATE** mode, TRUNCATE is handled synchronously within the same transaction:
+
+1. The **BEFORE TRUNCATE** trigger acquires an advisory lock on the stream table
+2. The **AFTER TRUNCATE** trigger calls `pgt_ivm_handle_truncate(pgt_id)`
+3. This function TRUNCATEs the stream table and re-populates it by re-executing the defining query
+4. The stream table is immediately consistent — within the same transaction
+
+```sql
+SELECT pgtrickle.create_stream_table(
+    name         => 'customer_totals_live',
+    query        => $$
+      SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
+      FROM orders GROUP BY customer
+    $$,
+    refresh_mode => 'IMMEDIATE'
+);
+
+BEGIN;
+TRUNCATE orders;
+-- customer_totals_live is already empty here!
+SELECT * FROM customer_totals_live;  -- (0 rows)
+COMMIT;
+```
+
+No waiting for a scheduler cycle, no stale data — TRUNCATE is fully handled in real-time.
 
 ---
 
 ## Summary
 
-TRUNCATE is the one common DML-like operation that falls outside pg_trickle's automatic change tracking. The trigger-based CDC architecture captures INSERT, UPDATE, and DELETE perfectly — but TRUNCATE bypasses row-level triggers by design.
+As of v0.2.0, TRUNCATE is fully tracked by pg_trickle across all three refresh modes. While it cannot be captured as per-row DELETE events (PostgreSQL's TRUNCATE doesn't process individual rows), pg_trickle uses a statement-level trigger to detect the event and respond appropriately.
 
 The key takeaways:
 
-1. **TRUNCATE does not fire row-level triggers** — the change buffer stays empty
-2. **The stream table becomes stale** — showing data that no longer exists in the base table
-3. **Manual refresh fixes it** — `SELECT pgtrickle.refresh_stream_table('name')` recomputes from scratch
-4. **FULL mode is immune** — every refresh recomputes regardless of change tracking
-5. **`DELETE FROM` is the trigger-safe alternative** — slower but keeps everything consistent automatically
-6. **After TRUNCATE, always refresh** — make this a standard part of your ETL workflow
+1. **TRUNCATE is automatically handled** — a statement-level AFTER TRUNCATE trigger writes a `'T'` marker to the change buffer
+2. **DIFFERENTIAL mode: automatic full refresh** — the scheduler detects the marker and falls back to a full refresh on the next cycle
+3. **IMMEDIATE mode: synchronous full refresh** — the stream table is rebuilt within the same transaction
+4. **FULL mode: naturally immune** — every refresh recomputes from scratch regardless
+5. **Manual refresh for instant consistency** — call `pgtrickle.refresh_stream_table()` if you can't wait for the next cycle
+6. **`DELETE FROM` remains an alternative** — fires per-row triggers, enabling incremental delta processing instead of full refresh fallback
 
 ---
 

@@ -229,9 +229,11 @@ After the MERGE succeeds:
 
 3. **The refresh is recorded** in `pgtrickle.pgt_refresh_history`:
    ```
-   refresh_id | pgt_id | action       | rows_inserted | rows_deleted | status    | initiated_by
-   1          | 1      | DIFFERENTIAL | 1             | 0            | COMPLETED | SCHEDULER
+   refresh_id | pgt_id | action       | rows_inserted | rows_deleted | delta_row_count | status    | initiated_by
+   1          | 1      | DIFFERENTIAL | 1             | 0            | 1               | COMPLETED | SCHEDULER
    ```
+
+   The `delta_row_count` column (new in v0.2.0) records the total number of change buffer rows consumed during this refresh cycle.
 
 4. **The data timestamp** on the stream table is advanced, resetting the staleness clock.
 
@@ -281,6 +283,53 @@ The trigger writes `action = 'D'` with the `OLD` values. The aggregate different
 | Adaptive fallback | Automatically switches to FULL refresh when changes exceed a threshold |
 
 For a table with 10 million rows and 100 changed rows, a DIFFERENTIAL refresh processes only those 100 rows. A FULL refresh would need to scan all 10 million.
+
+---
+
+## What About IMMEDIATE Mode?
+
+Everything described above applies to **DIFFERENTIAL** mode — the default, where changes accumulate in a buffer and are applied on a schedule. As of v0.2.0, pg_trickle also supports **IMMEDIATE** mode, which takes a fundamentally different path.
+
+With IMMEDIATE mode, there are no change buffers, no scheduler, and no waiting:
+
+```sql
+SELECT pgtrickle.create_stream_table(
+    name         => 'customer_totals_live',
+    query        => $$
+      SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
+      FROM orders GROUP BY customer
+    $$,
+    refresh_mode => 'IMMEDIATE'
+);
+```
+
+### How IMMEDIATE Mode Differs for INSERT
+
+| Phase | DIFFERENTIAL | IMMEDIATE |
+|-------|-------------|----------|
+| **Trigger type** | Row-level AFTER trigger | Statement-level AFTER trigger with `REFERENCING NEW TABLE` |
+| **What's captured** | One buffer row per INSERT | A transition table containing all inserted rows |
+| **When delta runs** | Next scheduler tick (up to schedule bound) | Immediately, in the same transaction |
+| **Delta source** | Change buffer table (`pgtrickle_changes.*`) | Temp table copied from transition table |
+| **Concurrency** | No locking between writers | Advisory lock per stream table |
+
+When you run `INSERT INTO orders ...`:
+
+1. A **BEFORE INSERT** statement-level trigger acquires an advisory lock on the stream table
+2. The **AFTER INSERT** trigger captures the transition table (`NEW TABLE AS __pgt_newtable`) into a temp table
+3. The DVM engine generates the same delta query, but reads from the temp table instead of the change buffer
+4. The delta is applied to the stream table via INSERT/DELETE DML (not MERGE)
+5. The stream table is immediately up-to-date — **within the same transaction**
+
+```sql
+BEGIN;
+INSERT INTO orders (customer, amount) VALUES ('alice', 49.99);
+-- customer_totals_live already shows alice with total=49.99 here!
+SELECT * FROM customer_totals_live;
+COMMIT;
+```
+
+The delta SQL template is cached per (pgt_id, source_oid, has_new, has_old) combination, so subsequent trigger invocations skip query parsing entirely.
 
 ---
 
