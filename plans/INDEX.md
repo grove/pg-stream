@@ -111,4 +111,5 @@ new entries when creating documents.
 |------|------|--------|---------|
 | [PLAN_TEST_SUITES.md](testing/PLAN_TEST_SUITES.md) | PLAN | Proposed | External test suites for pg_trickle |
 | [PLAN_TEST_SUITE_TPC_H.md](testing/PLAN_TEST_SUITE_TPC_H.md) | PLAN | Complete | TPC-H test suite |
+| [PLAN_TEST_PYRAMID_REBALANCE.md](testing/PLAN_TEST_PYRAMID_REBALANCE.md) | PLAN | Proposed | Shift coverage down the pyramid — extract unit tests, light-E2E tier |
 | [STATUS_TESTING.md](testing/STATUS_TESTING.md) | STATUS | — | Testing & coverage status |
