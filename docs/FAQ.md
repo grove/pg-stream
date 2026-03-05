@@ -239,11 +239,11 @@ Check your provider's documentation for custom extension support. Services that 
 
 ```sql
 SELECT pgtrickle.create_stream_table(
-    'order_totals',                                           -- name
-    'SELECT customer_id, SUM(amount) AS total
-     FROM orders GROUP BY customer_id',                       -- defining query
-    '5m',                                                     -- refresh schedule
-    'DIFFERENTIAL'                                            -- refresh mode
+    name         => 'order_totals',
+    query        => 'SELECT customer_id, SUM(amount) AS total
+     FROM orders GROUP BY customer_id',
+    schedule     => '5m',
+    refresh_mode => 'DIFFERENTIAL'
 );
 ```
 
@@ -375,7 +375,7 @@ SELECT pg_reload_conf();
 
 ### What happens if all stream tables in the DAG have a CALCULATED schedule?
 
-When every stream table uses a CALCULATED schedule (`schedule => NULL`), there
+When every stream table uses a CALCULATED schedule (`schedule => 'calculated'`), there
 are no explicit schedules for the resolution algorithm to derive from. The
 CALCULATED logic works by propagating `MIN(effective_schedule)` from downstream
 dependents upward through the DAG. If **no** node has an explicit duration:
@@ -394,14 +394,18 @@ resolve to something meaningful:
 
 ```sql
 -- Leaf ST with an explicit schedule
-SELECT pgtrickle.create_stream_table('daily_summary',
-    'SELECT region, SUM(total) FROM pgtrickle.order_totals GROUP BY region',
-    schedule => '10m');
+SELECT pgtrickle.create_stream_table(
+    name     => 'daily_summary',
+    query    => 'SELECT region, SUM(total) FROM pgtrickle.order_totals GROUP BY region',
+    schedule => '10m'
+);
 
 -- Upstream ST inherits that 10 m schedule via CALCULATED
-SELECT pgtrickle.create_stream_table('order_totals',
-    'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
-    schedule => NULL);
+SELECT pgtrickle.create_stream_table(
+    name     => 'order_totals',
+    query    => 'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
+    schedule => 'calculated'
+);
 ```
 
 You can inspect the resolved effective schedules with:
@@ -417,14 +421,20 @@ FROM pgtrickle.pgt_stream_tables;
 
 ```sql
 -- ST1: aggregates orders
-SELECT pgtrickle.create_stream_table('order_totals',
-    'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
-    '1m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'order_totals',
+    query        => 'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 
 -- ST2: filters ST1
-SELECT pgtrickle.create_stream_table('big_customers',
-    'SELECT customer_id, total FROM pgtrickle.order_totals WHERE total > 1000',
-    '1m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'big_customers',
+    query        => 'SELECT customer_id, total FROM pgtrickle.order_totals WHERE total > 1000',
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 ```
 
 ### How do I change a stream table's schedule or mode?
@@ -449,10 +459,13 @@ Not directly — the defining query is fixed at creation time. To change it, you
 
 ```sql
 SELECT pgtrickle.drop_stream_table('order_totals');
-SELECT pgtrickle.create_stream_table('order_totals',
-    'SELECT customer_id, SUM(amount) AS total, COUNT(*) AS order_count
+SELECT pgtrickle.create_stream_table(
+    name         => 'order_totals',
+    query        => 'SELECT customer_id, SUM(amount) AS total, COUNT(*) AS order_count
      FROM orders GROUP BY customer_id',  -- updated query
-    '5m', 'DIFFERENTIAL');
+    schedule     => '5m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 ```
 
 The new stream table will perform a full initial refresh to populate itself. The original query is preserved in the catalog's `original_query` column for reference.
@@ -928,14 +941,20 @@ When a defining query has a top-level `ORDER BY … LIMIT N` (with a constant in
 TopK bypasses the DVM delta pipeline — it always re-executes the bounded query. This is efficient because the result set is bounded by N.
 
 ```sql
-SELECT pgtrickle.create_stream_table('top_customers',
-    'SELECT customer_id, total FROM order_totals ORDER BY total DESC LIMIT 100',
-    '1m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'top_customers',
+    query        => 'SELECT customer_id, total FROM order_totals ORDER BY total DESC LIMIT 100',
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 
 -- With OFFSET — "page 2" of the leaderboard (rows 101–200):
-SELECT pgtrickle.create_stream_table('next_customers',
-    'SELECT customer_id, total FROM order_totals ORDER BY total DESC LIMIT 100 OFFSET 100',
-    '1m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'next_customers',
+    query        => 'SELECT customer_id, total FROM order_totals ORDER BY total DESC LIMIT 100 OFFSET 100',
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 ```
 
 ### Does OFFSET work with TopK?
@@ -1337,9 +1356,12 @@ Dropping a column that is referenced in a stream table's defining query will cau
 
 ```sql
 SELECT pgtrickle.drop_stream_table('order_totals');
-SELECT pgtrickle.create_stream_table('order_totals',
-    'SELECT id, name FROM orders',  -- updated query without dropped column
-    '1m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'order_totals',
+    query        => 'SELECT id, name FROM orders',  -- updated query without dropped column
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 ```
 
 ### What happens when I `CREATE OR REPLACE` a view used by a stream table?
@@ -1711,7 +1733,12 @@ SELECT pgtrickle.alter_stream_table('order_totals', schedule => '10m');
 
 -- To change the defining query or column structure, drop and recreate:
 SELECT pgtrickle.drop_stream_table('order_totals');
-SELECT pgtrickle.create_stream_table('order_totals', '...', '5m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'order_totals',
+    query        => '...',
+    schedule     => '5m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 ```
 
 ### Does pg_trickle work with PgBouncer or other connection poolers?
@@ -2195,9 +2222,12 @@ If the schema change breaks the defining query (e.g., a column referenced in the
 
 ```sql
 SELECT pgtrickle.drop_stream_table('order_totals');
-SELECT pgtrickle.create_stream_table('order_totals',
-    'SELECT id, name FROM orders',  -- updated query reflecting new schema
-    '1m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'order_totals',
+    query        => 'SELECT id, name FROM orders',  -- updated query reflecting new schema
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 ```
 
 Check the refresh history for the specific error message:
@@ -2307,7 +2337,12 @@ If reinitialization keeps failing (e.g., the defining query references a dropped
 UPDATE pgtrickle.pgt_stream_tables SET needs_reinit = false WHERE pgt_name = 'my_st';
 -- Or drop and recreate:
 SELECT pgtrickle.drop_stream_table('my_st');
-SELECT pgtrickle.create_stream_table('my_st', 'SELECT ...', '1m', 'DIFFERENTIAL');
+SELECT pgtrickle.create_stream_table(
+    name         => 'my_st',
+    query        => 'SELECT ...',
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
+);
 ```
 
 ---

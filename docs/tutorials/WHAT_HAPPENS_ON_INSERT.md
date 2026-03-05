@@ -16,13 +16,13 @@ CREATE TABLE orders (
 
 -- Stream table: always-fresh customer totals
 SELECT pgtrickle.create_stream_table(
-    'customer_totals',
-    $$
+    name         => 'customer_totals',
+    query        => $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
       FROM orders GROUP BY customer
     $$,
-    '1m',           -- refresh when data is staler than 1 minute
-    'DIFFERENTIAL'  -- only process changed rows, not the full table
+    schedule     => '1m',           -- refresh when data is staler than 1 minute
+    refresh_mode => 'DIFFERENTIAL'  -- only process changed rows, not the full table
 );
 ```
 

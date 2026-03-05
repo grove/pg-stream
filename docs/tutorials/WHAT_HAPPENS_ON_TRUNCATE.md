@@ -16,13 +16,13 @@ CREATE TABLE orders (
 );
 
 SELECT pgtrickle.create_stream_table(
-    'customer_totals',
-    $$
+    name         => 'customer_totals',
+    query        => $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
       FROM orders GROUP BY customer
     $$,
-    '1m',
-    'DIFFERENTIAL'
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
 );
 
 -- Seed some data
@@ -206,14 +206,14 @@ CREATE TABLE orders (
 );
 
 SELECT pgtrickle.create_stream_table(
-    'order_details',
-    $$
+    name         => 'order_details',
+    query        => $$
       SELECT c.name, c.tier, o.amount
       FROM orders o
       JOIN customers c ON o.customer_id = c.id
     $$,
-    '1m',
-    'DIFFERENTIAL'
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
 );
 ```
 
@@ -239,13 +239,13 @@ If the stream table uses `FULL` refresh mode instead of `DIFFERENTIAL`:
 
 ```sql
 SELECT pgtrickle.create_stream_table(
-    'customer_totals_full',
-    $$
+    name         => 'customer_totals_full',
+    query        => $$
       SELECT customer, SUM(amount) AS total, COUNT(*) AS order_count
       FROM orders GROUP BY customer
     $$,
-    '1m',
-    'FULL'
+    schedule     => '1m',
+    refresh_mode => 'FULL'
 );
 ```
 

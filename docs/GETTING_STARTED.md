@@ -152,8 +152,8 @@ Our first stream table flattens the department tree. For every department, it co
 
 ```sql
 SELECT pgtrickle.create_stream_table(
-    'department_tree',
-    $$
+    name         => 'department_tree',
+    query        => $$
     WITH RECURSIVE tree AS (
         -- Base case: root departments (no parent)
         SELECT id, name, parent_id, name AS path, 0 AS depth
@@ -171,8 +171,8 @@ SELECT pgtrickle.create_stream_table(
     )
     SELECT id, name, parent_id, path, depth FROM tree
     $$,
-    '1m',
-    'DIFFERENTIAL'
+    schedule     => '1m',
+    refresh_mode => 'DIFFERENTIAL'
 );
 ```
 
@@ -221,8 +221,8 @@ This demonstrates how pg_trickle builds a **DAG** — a directed acyclic graph o
 
 ```sql
 SELECT pgtrickle.create_stream_table(
-    'department_stats',
-    $$
+    name         => 'department_stats',
+    query        => $$
     SELECT
         t.id          AS department_id,
         t.name        AS department_name,
@@ -235,8 +235,8 @@ SELECT pgtrickle.create_stream_table(
     LEFT JOIN employees e ON e.department_id = t.id
     GROUP BY t.id, t.name, t.path, t.depth
     $$,
-    NULL,               -- CALCULATED: inherit schedule from downstream; see explanation below
-    'DIFFERENTIAL'
+    schedule     => 'calculated',      -- CALCULATED: inherit schedule from downstream; see explanation below
+    refresh_mode => 'DIFFERENTIAL'
 );
 ```
 
@@ -287,8 +287,8 @@ Now add a rollup that aggregates `department_stats` by top-level group (depth = 
 
 ```sql
 SELECT pgtrickle.create_stream_table(
-    'department_report',
-    $$
+    name         => 'department_report',
+    query        => $$
     SELECT
         split_part(full_path, ' > ', 2) AS division,
         SUM(headcount)                  AS total_headcount,
@@ -297,8 +297,8 @@ SELECT pgtrickle.create_stream_table(
     WHERE depth >= 1
     GROUP BY 1
     $$,
-    '1m',             -- this is the only explicit schedule; CALCULATED tables above inherit it
-    'DIFFERENTIAL'
+    schedule     => '1m',             -- this is the only explicit schedule; CALCULATED tables above inherit it
+    refresh_mode => 'DIFFERENTIAL'
 );
 ```
 

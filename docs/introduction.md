@@ -8,9 +8,9 @@ stay fresh.
 ```sql
 -- Declare a stream table — a view that maintains itself
 SELECT pgtrickle.create_stream_table(
-    'active_orders',
-    'SELECT * FROM orders WHERE status = ''active''',
-    '30s'
+    name     => 'active_orders',
+    query    => 'SELECT * FROM orders WHERE status = ''active''',
+    schedule => '30s'
 );
 
 -- Insert a row — the stream table updates automatically on the next refresh
