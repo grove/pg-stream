@@ -9,7 +9,7 @@
   Config keys:
     materialized: 'stream_table'
     schedule: str|null (default '1m')
-    refresh_mode: 'FULL' or 'DIFFERENTIAL' (default 'DIFFERENTIAL')
+    refresh_mode: 'AUTO', 'FULL', 'DIFFERENTIAL', or 'IMMEDIATE' (default 'AUTO')
     initialize: bool (default true)
     status: 'ACTIVE' or 'PAUSED' or null (default null — no change)
     stream_table_name: str (default model name)
@@ -21,7 +21,7 @@
 
   {# -- Model config -- #}
   {%- set schedule = config.get('schedule', '1m') -%}
-  {%- set refresh_mode = config.get('refresh_mode', 'DIFFERENTIAL') -%}
+  {%- set refresh_mode = config.get('refresh_mode', 'AUTO') -%}
   {%- set initialize = config.get('initialize', true) -%}
   {%- set status = config.get('status', none) -%}
   {%- set st_name = config.get('stream_table_name', target_relation.identifier) -%}

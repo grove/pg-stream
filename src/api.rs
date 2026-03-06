@@ -24,7 +24,8 @@ use crate::wal_decoder;
 /// - `name`: Schema-qualified name (`'schema.table'`) or unqualified (`'table'`).
 /// - `query`: The defining SELECT query.
 /// - `schedule`: Desired maximum schedule. `'calculated'` for CALCULATED mode (inherits schedule from downstream dependents).
-/// - `refresh_mode`: `'FULL'` or `'DIFFERENTIAL'`.
+/// - `refresh_mode`: `'AUTO'` (default — DIFFERENTIAL with FULL fallback),
+///   `'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`.
 /// - `initialize`: Whether to populate the table immediately.
 /// - `diamond_consistency`: `'none'` (default) or `'atomic'`.
 /// - `diamond_schedule_policy`: `'fastest'` (default) or `'slowest'`.
@@ -33,7 +34,7 @@ fn create_stream_table(
     name: &str,
     query: &str,
     schedule: default!(Option<&str>, "'calculated'"),
-    refresh_mode: default!(&str, "'DIFFERENTIAL'"),
+    refresh_mode: default!(&str, "'AUTO'"),
     initialize: default!(bool, true),
     diamond_consistency: default!(Option<&str>, "NULL"),
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
@@ -61,7 +62,8 @@ fn create_stream_table_impl(
     diamond_consistency: Option<&str>,
     diamond_schedule_policy: Option<&str>,
 ) -> Result<(), PgTrickleError> {
-    let refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
+    let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
+    let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
 
     // Parse diamond consistency — default to 'none' when not specified
     let dc = match diamond_consistency {
@@ -222,15 +224,42 @@ fn create_stream_table_impl(
     // (NATURAL JOIN, subquery expressions like EXISTS/IN).
     // This is a lightweight check that inspects the raw parse tree without
     // doing full DVM tree construction.
-    crate::dvm::reject_unsupported_constructs(query)?;
+    //
+    // AUTO mode: if the construct is rejected, downgrade to FULL instead
+    // of erroring — the user didn't explicitly ask for DIFFERENTIAL.
+    if let Err(e) = crate::dvm::reject_unsupported_constructs(query) {
+        if is_auto {
+            pgrx::info!(
+                "Query uses constructs not supported by differential maintenance ({}); \
+                 using FULL refresh mode. See docs/DVM_OPERATORS.md for supported operators.",
+                e
+            );
+            refresh_mode = RefreshMode::Full;
+        } else {
+            return Err(e);
+        }
+    }
 
     // ── Reject materialized views / foreign tables in DIFFERENTIAL/IMMEDIATE ──
     // After view inlining, any remaining RangeVars are base tables,
     // stream tables, matviews, or foreign tables. Matviews and foreign
     // tables don't support row-level / statement-level triggers, so they
     // can't be used as DIFFERENTIAL or IMMEDIATE sources.
-    if refresh_mode == RefreshMode::Differential || refresh_mode == RefreshMode::Immediate {
-        crate::dvm::reject_materialized_views(query)?;
+    //
+    // AUTO mode: downgrade to FULL if matviews/foreign tables are present.
+    if (refresh_mode == RefreshMode::Differential || refresh_mode == RefreshMode::Immediate)
+        && let Err(e) = crate::dvm::reject_materialized_views(query)
+    {
+        if is_auto && refresh_mode == RefreshMode::Differential {
+            pgrx::info!(
+                "Query references materialized views or foreign tables ({}); \
+                 using FULL refresh mode.",
+                e
+            );
+            refresh_mode = RefreshMode::Full;
+        } else {
+            return Err(e);
+        }
     }
 
     // ── IMMEDIATE mode: TopK with limit threshold (Task 5.2) ────────
@@ -271,11 +300,26 @@ fn create_stream_table_impl(
     // TopK tables bypass the DVM pipeline entirely — they use scoped
     // recomputation (re-execute the ORDER BY + LIMIT query) instead of
     // delta-based incremental maintenance.
+    //
+    // AUTO mode: if DVM parsing fails, downgrade to FULL instead of
+    // erroring — the user didn't explicitly request DIFFERENTIAL.
     let parsed_tree = if (refresh_mode == RefreshMode::Differential
         || refresh_mode == RefreshMode::Immediate)
         && topk_info.is_none()
     {
-        Some(crate::dvm::parse_defining_query_full(query)?)
+        match crate::dvm::parse_defining_query_full(query) {
+            Ok(tree) => Some(tree),
+            Err(e) if is_auto && refresh_mode == RefreshMode::Differential => {
+                pgrx::info!(
+                    "Query cannot use differential maintenance ({}); \
+                     using FULL refresh mode. See docs/DVM_OPERATORS.md for supported operators.",
+                    e
+                );
+                refresh_mode = RefreshMode::Full;
+                None
+            }
+            Err(e) => return Err(e),
+        }
     } else {
         None
     };

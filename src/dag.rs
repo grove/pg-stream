@@ -251,10 +251,19 @@ impl RefreshMode {
             "IMMEDIATE" => Ok(RefreshMode::Immediate),
             // Accept INCREMENTAL as a deprecated alias for backward compatibility.
             "INCREMENTAL" => Ok(RefreshMode::Differential),
+            // AUTO is handled at the API layer (create_stream_table_impl);
+            // it should never reach from_str because the caller resolves it
+            // before calling this function.
+            "AUTO" => Ok(RefreshMode::Differential),
             other => Err(PgTrickleError::InvalidArgument(format!(
-                "unknown refresh mode: {other}. Must be 'FULL', 'DIFFERENTIAL', or 'IMMEDIATE'"
+                "unknown refresh mode: {other}. Must be 'AUTO', 'FULL', 'DIFFERENTIAL', or 'IMMEDIATE'"
             ))),
         }
+    }
+
+    /// Returns true if the given string represents the AUTO sentinel value.
+    pub fn is_auto_str(s: &str) -> bool {
+        s.eq_ignore_ascii_case("AUTO")
     }
 }
 
@@ -1222,6 +1231,31 @@ mod tests {
         if let Err(PgTrickleError::InvalidArgument(msg)) = result {
             assert!(msg.contains("unknown refresh mode"));
         }
+    }
+
+    #[test]
+    fn test_refresh_mode_auto_resolves_to_differential() {
+        assert_eq!(
+            RefreshMode::from_str("AUTO").unwrap(),
+            RefreshMode::Differential
+        );
+        assert_eq!(
+            RefreshMode::from_str("auto").unwrap(),
+            RefreshMode::Differential
+        );
+        assert_eq!(
+            RefreshMode::from_str("Auto").unwrap(),
+            RefreshMode::Differential
+        );
+    }
+
+    #[test]
+    fn test_refresh_mode_is_auto_str() {
+        assert!(RefreshMode::is_auto_str("AUTO"));
+        assert!(RefreshMode::is_auto_str("auto"));
+        assert!(RefreshMode::is_auto_str("Auto"));
+        assert!(!RefreshMode::is_auto_str("DIFFERENTIAL"));
+        assert!(!RefreshMode::is_auto_str("FULL"));
     }
 
     #[test]

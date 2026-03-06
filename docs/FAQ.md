@@ -235,15 +235,37 @@ Check your provider's documentation for custom extension support. Services that 
 
 ## Creating & Managing Stream Tables
 
+### Do I need to choose a refresh mode?
+
+No. The default mode (`'AUTO'`) is adaptive: it uses differential (delta-only)
+maintenance when efficient, and automatically falls back to full
+recomputation when the change volume is high or the query cannot be
+differentiated. This works well for the vast majority of queries.
+
+You only need to specify a mode explicitly when:
+- You want **FULL** mode to force recomputation every time (rare).
+- You want **IMMEDIATE** mode for sub-second, in-transaction updates
+  (adds overhead to every write on source tables).
+- You want strict **DIFFERENTIAL** mode and prefer an error over silent
+  fallback when the query isn't differentiable.
+
 ### How do I create a stream table?
 
 ```sql
+-- Minimal: just name and query. Refreshes on a calculated schedule
+-- using adaptive differential maintenance.
 SELECT pgtrickle.create_stream_table(
-    name         => 'order_totals',
-    query        => 'SELECT customer_id, SUM(amount) AS total
+    'order_totals',
+    'SELECT customer_id, SUM(amount) AS total
+     FROM orders GROUP BY customer_id'
+);
+
+-- With custom schedule:
+SELECT pgtrickle.create_stream_table(
+    name     => 'order_totals',
+    query    => 'SELECT customer_id, SUM(amount) AS total
      FROM orders GROUP BY customer_id',
-    schedule     => '5m',
-    refresh_mode => 'DIFFERENTIAL'
+    schedule => '5m'
 );
 ```
 
