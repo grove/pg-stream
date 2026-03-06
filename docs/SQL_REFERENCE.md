@@ -595,6 +595,7 @@ Alter properties of an existing stream table.
 ```sql
 pgtrickle.alter_stream_table(
     name                  text,
+    query                 text      DEFAULT NULL,
     schedule              text      DEFAULT NULL,
     refresh_mode          text      DEFAULT NULL,
     status                text      DEFAULT NULL,
@@ -608,6 +609,7 @@ pgtrickle.alter_stream_table(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `name` | `text` | — | Name of the stream table (schema-qualified or unqualified). |
+| `query` | `text` | `NULL` | New defining query. Pass `NULL` to leave unchanged. When set, the function validates the new query, migrates the storage table schema if needed, updates catalog entries and dependencies, and runs a full refresh. Schema changes are classified as **same** (no DDL), **compatible** (ALTER TABLE ADD/DROP COLUMN), or **incompatible** (full storage rebuild with OID change). |
 | `schedule` | `text` | `NULL` | New schedule as a duration string (e.g., `'5m'`). Pass `NULL` to leave unchanged. Pass `'calculated'` to switch to CALCULATED mode. |
 | `refresh_mode` | `text` | `NULL` | New refresh mode (`'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`). Pass `NULL` to leave unchanged. Switching to/from `'IMMEDIATE'` migrates trigger infrastructure (IVM triggers ↔ CDC triggers), clears or restores the schedule, and runs a full refresh. |
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
@@ -617,6 +619,19 @@ pgtrickle.alter_stream_table(
 **Examples:**
 
 ```sql
+-- Change the defining query (same output schema — fast path)
+SELECT pgtrickle.alter_stream_table('order_totals',
+    query => 'SELECT customer_id, SUM(amount) AS total FROM orders WHERE status = ''active'' GROUP BY customer_id');
+
+-- Change query and add a column (compatible schema migration)
+SELECT pgtrickle.alter_stream_table('order_totals',
+    query => 'SELECT customer_id, SUM(amount) AS total, COUNT(*) AS cnt FROM orders GROUP BY customer_id');
+
+-- Change query and mode simultaneously
+SELECT pgtrickle.alter_stream_table('order_totals',
+    query => 'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
+    refresh_mode => 'FULL');
+
 -- Change schedule
 SELECT pgtrickle.alter_stream_table('order_totals', schedule => '5m');
 
@@ -638,6 +653,13 @@ SELECT pgtrickle.resume_stream_table('order_totals');
 -- Or via alter_stream_table
 SELECT pgtrickle.alter_stream_table('order_totals', status => 'ACTIVE');
 ```
+
+**Notes:**
+- When `query` is provided, the function runs the full query rewrite pipeline (view inlining, DISTINCT ON, GROUPING SETS, etc.) and validates the new query before applying changes.
+- The entire ALTER QUERY operation runs within a single transaction. If any step fails, the stream table is left unchanged.
+- For same-schema and compatible-schema changes, the storage table OID is preserved — views, policies, and publications referencing the stream table remain valid.
+- For incompatible schema changes (e.g., changing a column from `integer` to `text`), the storage table is rebuilt and the OID changes. A `WARNING` is emitted.
+- The stream table is temporarily suspended during query migration to prevent concurrent scheduler refreshes.
 
 ---
 

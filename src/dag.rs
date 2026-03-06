@@ -419,6 +419,25 @@ impl StDag {
             .push(source);
     }
 
+    /// Remove all incoming edges for a node and replace them with new ones.
+    ///
+    /// Used by ALTER QUERY cycle detection: the existing ST keeps its node
+    /// but its source edges are replaced with the proposed new sources.
+    pub fn replace_incoming_edges(&mut self, target: NodeId, new_sources: Vec<NodeId>) {
+        // Remove old incoming edges
+        if let Some(old_sources) = self.reverse_edges.remove(&target) {
+            for src in &old_sources {
+                if let Some(dsts) = self.edges.get_mut(src) {
+                    dsts.retain(|d| *d != target);
+                }
+            }
+        }
+        // Add new incoming edges
+        for src in new_sources {
+            self.add_edge(src, target);
+        }
+    }
+
     /// Get all upstream sources of a stream table node.
     pub fn get_upstream(&self, node: NodeId) -> Vec<NodeId> {
         self.reverse_edges.get(&node).cloned().unwrap_or_default()

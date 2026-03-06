@@ -11,6 +11,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Added
 
+- **ALTER QUERY** — `alter_stream_table` now accepts a `query` parameter to
+  change the defining query of an existing stream table. The function validates
+  the new query, classifies schema changes (same, compatible, or incompatible),
+  migrates the storage table accordingly, updates catalog entries and
+  dependencies, performs ALTER-aware cycle detection, and runs a full refresh.
+  Compatible schema changes preserve the storage table OID (views, policies,
+  and publications remain valid).
+
 - **ORDER BY + LIMIT + OFFSET (Paged TopK)** — `OFFSET` is now supported in
   defining queries with `ORDER BY ... LIMIT N OFFSET M`. Nine E2E tests
   validate paging, catalog metadata storage, aggregate queries, and rejection

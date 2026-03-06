@@ -53,6 +53,1040 @@ fn create_stream_table(
     }
 }
 
+/// Run the full query rewrite pipeline: view inlining, nested window
+/// expressions, DISTINCT ON, GROUPING SETS, scalar subqueries, SubLinks
+/// in OR, and ROWS FROM.
+///
+/// Returns the rewritten query string. The caller should keep the
+/// original query separately if needed for `original_query` tracking.
+fn run_query_rewrite_pipeline(query: &str) -> Result<String, PgTrickleError> {
+    // View inlining — must run first so view definitions containing
+    // DISTINCT ON, GROUPING SETS, etc. get further rewritten.
+    let query = crate::dvm::rewrite_views_inline(query)?;
+    // Nested window expression lift
+    let query = crate::dvm::rewrite_nested_window_exprs(&query)?;
+    // DISTINCT ON → ROW_NUMBER() window
+    let query = crate::dvm::rewrite_distinct_on(&query)?;
+    // GROUPING SETS / CUBE / ROLLUP → UNION ALL of GROUP BY
+    let query = crate::dvm::rewrite_grouping_sets(&query)?;
+    // Scalar subquery in WHERE → CROSS JOIN
+    let query = crate::dvm::rewrite_scalar_subquery_in_where(&query)?;
+    // SubLinks inside OR → UNION branches
+    let query = crate::dvm::rewrite_sublinks_in_or(&query)?;
+    // ROWS FROM() multi-function rewrite
+    let query = crate::dvm::rewrite_rows_from(&query)?;
+    Ok(query)
+}
+
+/// Validated query metadata returned by [`validate_and_parse_query`].
+struct ValidatedQuery {
+    /// Output columns from `SELECT ... LIMIT 0`.
+    columns: Vec<ColumnDef>,
+    /// Full DVM parse result (only for DIFFERENTIAL/IMMEDIATE non-TopK).
+    parsed_tree: Option<crate::dvm::ParseResult>,
+    /// TopK metadata (if ORDER BY + LIMIT pattern detected).
+    topk_info: Option<crate::dvm::TopKInfo>,
+    /// The effective defining query (base query for TopK, original otherwise).
+    effective_query: String,
+    /// Whether the query needs `__pgt_count` (aggregate/distinct).
+    needs_pgt_count: bool,
+    /// Whether the query needs `__pgt_count_l`/`__pgt_count_r` (INTERSECT/EXCEPT).
+    needs_dual_count: bool,
+    /// Whether the query needs `__pgt_count` for UNION dedup.
+    needs_union_dedup: bool,
+    /// Whether any source table lacks a PRIMARY KEY (EC-06).
+    has_keyless_source: bool,
+    /// Source relation OIDs and types extracted from the query.
+    source_relids: Vec<(pg_sys::Oid, String)>,
+}
+
+/// Validate a rewritten query and parse it for DVM. This runs the LIMIT 0
+/// check, TopK detection, unsupported construct rejection, DVM parsing,
+/// volatility checks, and source relation extraction.
+///
+/// When `is_auto` is true and the query cannot be maintained incrementally,
+/// `refresh_mode` is downgraded to `RefreshMode::Full` instead of returning
+/// an error.
+fn validate_and_parse_query(
+    query: &str,
+    refresh_mode: &mut RefreshMode,
+    is_auto: bool,
+) -> Result<ValidatedQuery, PgTrickleError> {
+    // Validate the defining query by running LIMIT 0
+    let columns = validate_defining_query(query)?;
+
+    // TopK detection — must run BEFORE reject_limit_offset
+    let topk_info = crate::dvm::detect_topk_pattern(query)?;
+
+    let (effective_query, topk_info) = if let Some(info) = topk_info {
+        if let Some(offset) = info.offset_value {
+            pgrx::info!(
+                "pg_trickle: TopK pattern detected (ORDER BY {} LIMIT {} OFFSET {}). \
+                 The stream table will maintain rows {}–{}.",
+                info.order_by_sql,
+                info.limit_value,
+                offset,
+                offset + 1,
+                offset + info.limit_value,
+            );
+        } else {
+            pgrx::info!(
+                "pg_trickle: TopK pattern detected (ORDER BY {} LIMIT {}). \
+                 The stream table will maintain the top {} rows.",
+                info.order_by_sql,
+                info.limit_value,
+                info.limit_value,
+            );
+        }
+        let base = info.base_query.clone();
+        (base, Some(info))
+    } else {
+        (query.to_string(), None)
+    };
+    let q = if topk_info.is_some() {
+        &effective_query
+    } else {
+        query
+    };
+
+    // Reject LIMIT / OFFSET (TopK already handled above).
+    crate::dvm::reject_limit_offset(q)?;
+    crate::dvm::warn_limit_without_order_in_subqueries(q);
+
+    // Reject unsupported constructs (NATURAL JOIN, subquery expressions).
+    // AUTO mode: downgrade to FULL instead of erroring.
+    if let Err(e) = crate::dvm::reject_unsupported_constructs(q) {
+        if is_auto {
+            pgrx::info!(
+                "Query uses constructs not supported by differential maintenance ({}); \
+                 using FULL refresh mode. See docs/DVM_OPERATORS.md for supported operators.",
+                e
+            );
+            *refresh_mode = RefreshMode::Full;
+        } else {
+            return Err(e);
+        }
+    }
+
+    // Reject matviews/foreign tables in DIFFERENTIAL/IMMEDIATE.
+    // AUTO mode: downgrade to FULL if matviews/foreign tables are present.
+    if (*refresh_mode == RefreshMode::Differential || *refresh_mode == RefreshMode::Immediate)
+        && let Err(e) = crate::dvm::reject_materialized_views(q)
+    {
+        if is_auto && *refresh_mode == RefreshMode::Differential {
+            pgrx::info!(
+                "Query references materialized views or foreign tables ({}); \
+                 using FULL refresh mode.",
+                e
+            );
+            *refresh_mode = RefreshMode::Full;
+        } else {
+            return Err(e);
+        }
+    }
+
+    // IMMEDIATE mode: TopK limit threshold check
+    if let (true, Some(info)) = (refresh_mode.is_immediate(), &topk_info) {
+        let topk_limit = info.limit_value;
+        let max_limit = crate::config::PGS_IVM_TOPK_MAX_LIMIT.get() as i64;
+        if max_limit == 0 || topk_limit > max_limit {
+            return Err(PgTrickleError::UnsupportedOperator(format!(
+                "ORDER BY + LIMIT {topk_limit} (TopK) exceeds the IMMEDIATE mode threshold \
+                 (pg_trickle.ivm_topk_max_limit = {max_limit}). TopK tables in IMMEDIATE mode \
+                 recompute the top-K rows on every DML statement. Reduce LIMIT, raise the \
+                 threshold, or use 'DIFFERENTIAL' mode for large TopK queries."
+            )));
+        }
+        pgrx::warning!(
+            "pg_trickle: TopK (LIMIT {}) in IMMEDIATE mode uses micro-refresh — \
+             the top-{} rows are recomputed on every DML statement. \
+             This adds latency proportional to the defining query cost.",
+            topk_limit,
+            topk_limit
+        );
+    }
+
+    // IMMEDIATE mode: query restriction validation
+    if refresh_mode.is_immediate() {
+        crate::dvm::validate_immediate_mode_support(q)?;
+    }
+
+    // DVM parse for DIFFERENTIAL/IMMEDIATE (non-TopK).
+    // AUTO mode: if DVM parsing fails, downgrade to FULL instead of erroring.
+    let parsed_tree = if (*refresh_mode == RefreshMode::Differential
+        || *refresh_mode == RefreshMode::Immediate)
+        && topk_info.is_none()
+    {
+        match crate::dvm::parse_defining_query_full(q) {
+            Ok(tree) => Some(tree),
+            Err(e) if is_auto && *refresh_mode == RefreshMode::Differential => {
+                pgrx::info!(
+                    "Query cannot use differential maintenance ({}); \
+                     using FULL refresh mode. See docs/DVM_OPERATORS.md for supported operators.",
+                    e
+                );
+                *refresh_mode = RefreshMode::Full;
+                None
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+
+    // Volatility check
+    if let Some(ref pr) = parsed_tree {
+        let vol = crate::dvm::tree_worst_volatility_with_registry(pr)?;
+        match vol {
+            'v' => {
+                return Err(PgTrickleError::UnsupportedOperator(
+                    "Defining query contains volatile expressions (e.g., random(), \
+                     clock_timestamp(), or custom volatile operators). Volatile \
+                     functions and operators are not supported in DIFFERENTIAL or \
+                     IMMEDIATE mode because they produce different values on each \
+                     evaluation, breaking delta computation. Use FULL refresh mode \
+                     instead, or replace with a deterministic alternative."
+                        .into(),
+                ));
+            }
+            's' => {
+                pgrx::warning!(
+                    "Defining query contains stable functions (e.g., now(), \
+                     current_timestamp). These return the same value within a \
+                     single refresh but may shift between refreshes. \
+                     Delta computation is correct within each refresh cycle."
+                );
+            }
+            _ => {} // 'i' (immutable) — no action
+        }
+    }
+
+    let needs_pgt_count = parsed_tree
+        .as_ref()
+        .is_some_and(|pr| pr.tree.needs_pgt_count());
+    let needs_dual_count = parsed_tree
+        .as_ref()
+        .is_some_and(|pr| pr.tree.needs_dual_count());
+    let needs_union_dedup = parsed_tree
+        .as_ref()
+        .is_some_and(|pr| pr.tree.needs_union_dedup_count());
+
+    // Extract source dependencies
+    let source_relids = extract_source_relations(q)?;
+
+    // EC-06: Detect keyless sources
+    let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
+        if source_type != "TABLE" && source_type != "FOREIGN_TABLE" {
+            return false;
+        }
+        cdc::resolve_pk_columns(*oid)
+            .map(|pk| pk.is_empty())
+            .unwrap_or(false)
+    });
+
+    Ok(ValidatedQuery {
+        columns,
+        parsed_tree,
+        topk_info,
+        effective_query,
+        needs_pgt_count,
+        needs_dual_count,
+        needs_union_dedup,
+        has_keyless_source,
+        source_relids,
+    })
+}
+
+/// Set up the storage table: CREATE TABLE, row_id index, DML guard trigger,
+/// and optional GROUP BY composite index.
+#[allow(clippy::too_many_arguments)]
+fn setup_storage_table(
+    schema: &str,
+    table_name: &str,
+    columns: &[ColumnDef],
+    needs_pgt_count: bool,
+    needs_dual_count: bool,
+    has_keyless_source: bool,
+    refresh_mode: RefreshMode,
+    parsed_tree: Option<&crate::dvm::ParseResult>,
+) -> Result<pg_sys::Oid, PgTrickleError> {
+    let storage_needs_pgt_count = needs_pgt_count;
+    let storage_ddl = build_create_table_sql(
+        schema,
+        table_name,
+        columns,
+        storage_needs_pgt_count,
+        needs_dual_count,
+    );
+    Spi::run(&storage_ddl)
+        .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
+
+    let pgt_relid = get_table_oid(schema, table_name)?;
+
+    // Create index on __pgt_row_id (EC-06: non-unique for keyless sources)
+    let index_sql = if has_keyless_source {
+        format!(
+            "CREATE INDEX ON {}.{} (__pgt_row_id)",
+            quote_identifier(schema),
+            quote_identifier(table_name),
+        )
+    } else {
+        format!(
+            "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
+            quote_identifier(schema),
+            quote_identifier(table_name),
+        )
+    };
+    Spi::run(&index_sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("Failed to create row_id index: {}", e)))?;
+
+    // DML guard trigger
+    install_dml_guard_trigger(schema, table_name)?;
+
+    // GROUP BY composite index for aggregate queries in DIFFERENTIAL mode
+    if refresh_mode == RefreshMode::Differential
+        && let Some(pr) = parsed_tree
+        && let Some(group_cols) = pr.tree.group_by_columns()
+        && !group_cols.is_empty()
+    {
+        let quoted_cols: Vec<String> = group_cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect();
+        let group_index_sql = format!(
+            "CREATE INDEX ON {}.{} ({})",
+            quote_identifier(schema),
+            quote_identifier(table_name),
+            quoted_cols.join(", "),
+        );
+        Spi::run(&group_index_sql).map_err(|e| {
+            PgTrickleError::SpiError(format!("Failed to create group-by index: {}", e))
+        })?;
+    }
+
+    Ok(pgt_relid)
+}
+
+/// Insert catalog entry and dependency edges for a new stream table.
+#[allow(clippy::too_many_arguments)]
+fn insert_catalog_and_deps(
+    pgt_relid: pg_sys::Oid,
+    schema: &str,
+    table_name: &str,
+    defining_query: &str,
+    original_query: Option<&str>,
+    schedule: Option<String>,
+    refresh_mode: RefreshMode,
+    vq: &ValidatedQuery,
+    dc: DiamondConsistency,
+    dsp: DiamondSchedulePolicy,
+) -> Result<i64, PgTrickleError> {
+    let pgt_id = StreamTableMeta::insert(
+        pgt_relid,
+        table_name,
+        schema,
+        defining_query,
+        original_query,
+        schedule,
+        refresh_mode,
+        vq.parsed_tree.as_ref().map(|pr| pr.functions_used()),
+        vq.topk_info.as_ref().map(|i| i.limit_value as i32),
+        vq.topk_info.as_ref().map(|i| i.order_by_sql.as_str()),
+        vq.topk_info
+            .as_ref()
+            .and_then(|i| i.offset_value.map(|v| v as i32)),
+        dc,
+        dsp,
+        vq.has_keyless_source,
+    )?;
+
+    // Build per-source column usage map
+    let columns_used_map = vq
+        .parsed_tree
+        .as_ref()
+        .map(|pr| pr.source_columns_used())
+        .unwrap_or_default();
+
+    // Insert dependency edges with column snapshots
+    for (source_oid, source_type) in &vq.source_relids {
+        let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
+
+        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
+            match crate::catalog::build_column_snapshot(*source_oid) {
+                Ok((s, f)) => (Some(s), Some(f)),
+                Err(e) => {
+                    pgrx::debug1!(
+                        "pg_trickle: failed to build column snapshot for source {}: {}",
+                        source_oid.to_u32(),
+                        e,
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        StDependency::insert_with_snapshot(
+            pgt_id,
+            *source_oid,
+            source_type,
+            cols,
+            snapshot,
+            fingerprint,
+        )?;
+    }
+
+    Ok(pgt_id)
+}
+
+/// Set up CDC or IVM trigger infrastructure on source tables.
+fn setup_trigger_infrastructure(
+    source_relids: &[(pg_sys::Oid, String)],
+    refresh_mode: RefreshMode,
+    pgt_id: i64,
+    pgt_relid: pg_sys::Oid,
+    defining_query: &str,
+) -> Result<(), PgTrickleError> {
+    let change_schema = config::pg_trickle_change_buffer_schema();
+    if refresh_mode.is_immediate() {
+        let lock_mode = crate::ivm::IvmLockMode::for_query(defining_query);
+        for (source_oid, source_type) in source_relids {
+            if source_type == "TABLE" {
+                crate::ivm::setup_ivm_triggers(*source_oid, pgt_id, pgt_relid, lock_mode)?;
+            }
+        }
+    } else {
+        for (source_oid, source_type) in source_relids {
+            if source_type == "TABLE" {
+                setup_cdc_for_source(*source_oid, pgt_id, &change_schema)?;
+            } else if source_type == "FOREIGN_TABLE" {
+                cdc::setup_foreign_table_polling(*source_oid, pgt_id, &change_schema)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Schema comparison for ALTER QUERY ──────────────────────────────────────
+
+/// Classification of how the output schema changed between old and new query.
+#[derive(Debug)]
+enum SchemaChange {
+    /// Column names, types, and count are identical — fast path.
+    Same,
+    /// Columns added or removed; surviving columns have compatible types.
+    Compatible {
+        added: Vec<ColumnDef>,
+        removed: Vec<String>,
+    },
+    /// Column type changed incompatibly — requires full storage rebuild.
+    Incompatible { reason: String },
+}
+
+/// Compare old vs new output column schemas to classify the change.
+fn classify_schema_change(old: &[ColumnDef], new: &[ColumnDef]) -> SchemaChange {
+    // Build lookup by name for old columns
+    let old_map: std::collections::HashMap<&str, &ColumnDef> =
+        old.iter().map(|c| (c.name.as_str(), c)).collect();
+    let new_map: std::collections::HashMap<&str, &ColumnDef> =
+        new.iter().map(|c| (c.name.as_str(), c)).collect();
+
+    // Check for type incompatibilities on surviving columns
+    for new_col in new {
+        if let Some(old_col) = old_map.get(new_col.name.as_str())
+            && old_col.type_oid != new_col.type_oid
+        {
+            // Check if PostgreSQL has an implicit cast
+            let can_cast = Spi::get_one_with_args::<bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_cast \
+                 WHERE castsource = $1 AND casttarget = $2 \
+                 AND castcontext = 'i')",
+                &[
+                    old_col.type_oid.value().into(),
+                    new_col.type_oid.value().into(),
+                ],
+            )
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
+
+            if !can_cast {
+                return SchemaChange::Incompatible {
+                    reason: format!(
+                        "column '{}' type changed from OID {} to {} (no implicit cast)",
+                        new_col.name,
+                        old_col.type_oid.value(),
+                        new_col.type_oid.value(),
+                    ),
+                };
+            }
+        }
+    }
+
+    // Identify added and removed columns
+    let added: Vec<ColumnDef> = new
+        .iter()
+        .filter(|c| !old_map.contains_key(c.name.as_str()))
+        .cloned()
+        .collect();
+    let removed: Vec<String> = old
+        .iter()
+        .filter(|c| !new_map.contains_key(c.name.as_str()))
+        .map(|c| c.name.clone())
+        .collect();
+
+    if added.is_empty() && removed.is_empty() {
+        // Check ordering — if column order changed, treat as Compatible
+        // (no DDL needed, but we track the difference)
+        let same_order = old.len() == new.len()
+            && old
+                .iter()
+                .zip(new.iter())
+                .all(|(o, n)| o.name == n.name && o.type_oid == n.type_oid);
+        if same_order {
+            SchemaChange::Same
+        } else {
+            // Types compatible but order changed — treated as Same since
+            // column order in storage doesn't affect correctness
+            SchemaChange::Same
+        }
+    } else {
+        SchemaChange::Compatible { added, removed }
+    }
+}
+
+// ── Dependency diffing for ALTER QUERY ────────────────────────────────────
+
+/// Result of diffing old vs new source dependencies.
+struct DependencyDiff {
+    /// Sources present in new query but not old.
+    added: Vec<(pg_sys::Oid, String)>,
+    /// Sources present in old query but not new.
+    removed: Vec<(pg_sys::Oid, String)>,
+    /// Sources present in both old and new queries.
+    kept: Vec<(pg_sys::Oid, String)>,
+}
+
+/// Compute which source dependencies were added, removed, or kept.
+fn diff_dependencies(
+    old_deps: &[StDependency],
+    new_sources: &[(pg_sys::Oid, String)],
+) -> DependencyDiff {
+    let old_oids: std::collections::HashSet<u32> =
+        old_deps.iter().map(|d| d.source_relid.to_u32()).collect();
+    let new_oids: std::collections::HashSet<u32> =
+        new_sources.iter().map(|(o, _)| o.to_u32()).collect();
+
+    let added = new_sources
+        .iter()
+        .filter(|(o, _)| !old_oids.contains(&o.to_u32()))
+        .cloned()
+        .collect();
+    let removed = old_deps
+        .iter()
+        .filter(|d| !new_oids.contains(&d.source_relid.to_u32()))
+        .map(|d| (d.source_relid, d.source_type.clone()))
+        .collect();
+    let kept = new_sources
+        .iter()
+        .filter(|(o, _)| old_oids.contains(&o.to_u32()))
+        .cloned()
+        .collect();
+
+    DependencyDiff {
+        added,
+        removed,
+        kept,
+    }
+}
+
+// ── Storage table migration for ALTER QUERY ──────────────────────────────
+
+/// Migrate the storage table schema for a Compatible schema change.
+/// For Same schema, this is a no-op. For Incompatible, the caller
+/// must drop and recreate the storage table.
+fn migrate_storage_table_compatible(
+    schema: &str,
+    table_name: &str,
+    added: &[ColumnDef],
+    removed: &[String],
+) -> Result<(), PgTrickleError> {
+    let quoted_table = format!(
+        "{}.{}",
+        quote_identifier(schema),
+        quote_identifier(table_name),
+    );
+
+    // Add new columns
+    for col in added {
+        let type_name = match col.type_oid {
+            PgOid::Invalid => "text".to_string(),
+            oid => {
+                Spi::get_one_with_args::<String>("SELECT $1::regtype::text", &[oid.value().into()])
+                    .unwrap_or(Some("text".to_string()))
+                    .unwrap_or_else(|| "text".to_string())
+            }
+        };
+        let add_sql = format!(
+            "ALTER TABLE {} ADD COLUMN {} {}",
+            quoted_table,
+            quote_identifier(&col.name),
+            type_name,
+        );
+        Spi::run(&add_sql).map_err(|e| {
+            PgTrickleError::SpiError(format!("Failed to add column '{}': {}", col.name, e))
+        })?;
+    }
+
+    // Drop removed columns
+    for col_name in removed {
+        let drop_sql = format!(
+            "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+            quoted_table,
+            quote_identifier(col_name),
+        );
+        Spi::run(&drop_sql).map_err(|e| {
+            PgTrickleError::SpiError(format!("Failed to drop column '{}': {}", col_name, e))
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Manage auxiliary count columns (__pgt_count, __pgt_count_l, __pgt_count_r)
+/// during ALTER QUERY when the query type changes (e.g., flat → aggregate).
+fn migrate_aux_columns(
+    schema: &str,
+    table_name: &str,
+    old_needs_pgt_count: bool,
+    old_needs_dual_count: bool,
+    new_needs_pgt_count: bool,
+    new_needs_dual_count: bool,
+    new_needs_union_dedup: bool,
+) -> Result<(), PgTrickleError> {
+    let quoted_table = format!(
+        "{}.{}",
+        quote_identifier(schema),
+        quote_identifier(table_name),
+    );
+
+    let new_storage_needs_pgt_count = new_needs_pgt_count || new_needs_union_dedup;
+
+    // Transition: __pgt_count
+    if !old_needs_pgt_count && new_storage_needs_pgt_count && !new_needs_dual_count {
+        Spi::run(&format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count BIGINT NOT NULL DEFAULT 0",
+            quoted_table
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    } else if old_needs_pgt_count && !new_storage_needs_pgt_count && !new_needs_dual_count {
+        Spi::run(&format!(
+            "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count",
+            quoted_table
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
+    // Transition: __pgt_count_l / __pgt_count_r
+    if !old_needs_dual_count && new_needs_dual_count {
+        Spi::run(&format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count_l BIGINT NOT NULL DEFAULT 0",
+            quoted_table
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Spi::run(&format!(
+            "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count_r BIGINT NOT NULL DEFAULT 0",
+            quoted_table
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        // Drop __pgt_count if it was there and no longer needed
+        if old_needs_pgt_count {
+            Spi::run(&format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count",
+                quoted_table
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    } else if old_needs_dual_count && !new_needs_dual_count {
+        Spi::run(&format!(
+            "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count_l",
+            quoted_table
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Spi::run(&format!(
+            "ALTER TABLE {} DROP COLUMN IF EXISTS __pgt_count_r",
+            quoted_table
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        // Add __pgt_count if newly needed
+        if new_storage_needs_pgt_count {
+            Spi::run(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS __pgt_count BIGINT NOT NULL DEFAULT 0",
+                quoted_table
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+
+    Ok(())
+}
+
+// ── Core ALTER QUERY implementation ──────────────────────────────────────
+
+/// Perform an in-place query migration on an existing stream table.
+/// Called from `alter_stream_table_impl` when `query` is `Some(...)`.
+///
+/// Executes Phases 0–5 from the ALTER QUERY design:
+///   0. Validate & classify
+///   1. Suspend & drain
+///   2. Tear down old infrastructure
+///   3. Migrate storage table
+///   4. Update catalog & set up new infrastructure
+///   5. Repopulate
+fn alter_stream_table_query(
+    st: &StreamTableMeta,
+    schema: &str,
+    table_name: &str,
+    new_query: &str,
+) -> Result<(), PgTrickleError> {
+    // ── Phase 0: Validate & classify ──
+
+    // Run the full rewrite pipeline on the new query
+    let original_new_query = new_query.to_string();
+    let rewritten_query = run_query_rewrite_pipeline(new_query)?;
+
+    // Determine the effective refresh mode — use the ST's current mode
+    let mut refresh_mode = st.refresh_mode;
+
+    // Validate and parse the new query
+    let vq = validate_and_parse_query(&rewritten_query, &mut refresh_mode, false)?;
+
+    // Cycle detection on the new dependency set (ALTER-aware: replaces
+    // the existing ST's edges rather than creating a sentinel node)
+    check_for_cycles_alter(st.pgt_id, &vq.source_relids)?;
+
+    // Get the current storage table columns (excluding internal __pgt_* columns)
+    let old_columns = get_storage_table_columns(schema, table_name)?;
+
+    // Classify schema change
+    let schema_change = classify_schema_change(&old_columns, &vq.columns);
+
+    // Diff source dependencies
+    let old_deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+    let dep_diff = diff_dependencies(&old_deps, &vq.source_relids);
+
+    // Detect old auxiliary column state from current ST metadata
+    let old_needs_pgt_count = crate::dvm::query_needs_pgt_count(&st.defining_query);
+    let old_needs_dual_count = crate::dvm::query_needs_dual_count(&st.defining_query);
+
+    // ── Phase 1: Suspend ──
+    StreamTableMeta::update_status(st.pgt_id, StStatus::Suspended)?;
+
+    // Flush pending deferred cleanups for sources being removed
+    let removed_oids: Vec<u32> = dep_diff.removed.iter().map(|(o, _)| o.to_u32()).collect();
+    if !removed_oids.is_empty() {
+        crate::refresh::flush_pending_cleanups_for_oids(&removed_oids);
+    }
+
+    // ── Phase 2: Tear down old infrastructure ──
+
+    // Remove CDC/IVM triggers from sources that are no longer needed
+    for (source_oid, source_type) in &dep_diff.removed {
+        if source_type == "TABLE" {
+            if refresh_mode.is_immediate() {
+                if let Err(e) = crate::ivm::cleanup_ivm_triggers(*source_oid, st.pgt_id) {
+                    pgrx::warning!(
+                        "Failed to clean up IVM triggers for removed source {}: {}",
+                        source_oid.to_u32(),
+                        e
+                    );
+                }
+            } else {
+                let old_dep = old_deps.iter().find(|d| d.source_relid == *source_oid);
+                let cdc_mode = old_dep.map(|d| d.cdc_mode).unwrap_or(CdcMode::Trigger);
+                if let Err(e) = cleanup_cdc_for_source(*source_oid, cdc_mode) {
+                    pgrx::warning!(
+                        "Failed to clean up CDC for removed source {}: {}",
+                        source_oid.to_u32(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    // Invalidate caches
+    shmem::bump_cache_generation();
+
+    // Flush MERGE template cache and deallocate prepared statements
+    refresh::invalidate_merge_cache(st.pgt_id);
+
+    // ── Phase 3: Migrate storage table ──
+
+    let new_pgt_relid = match &schema_change {
+        SchemaChange::Same => {
+            // No DDL required
+            st.pgt_relid
+        }
+        SchemaChange::Compatible { added, removed } => {
+            migrate_storage_table_compatible(schema, table_name, added, removed)?;
+            st.pgt_relid
+        }
+        SchemaChange::Incompatible { reason } => {
+            pgrx::warning!(
+                "pg_trickle: ALTER QUERY requires full storage rebuild: {}. \
+                 The storage table OID will change.",
+                reason
+            );
+
+            // Detach pgt_relid before DROP so the sql_drop event trigger
+            // does not recognise the table as ST storage and delete the
+            // catalog row.
+            Spi::run_with_args(
+                "UPDATE pgtrickle.pgt_stream_tables \
+                 SET pgt_relid = 0 WHERE pgt_id = $1",
+                &[st.pgt_id.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+            // Drop existing storage table
+            let drop_sql = format!(
+                "DROP TABLE IF EXISTS {}.{} CASCADE",
+                quote_identifier(schema),
+                quote_identifier(table_name),
+            );
+            Spi::run(&drop_sql).map_err(|e| {
+                PgTrickleError::SpiError(format!("Failed to drop storage table: {}", e))
+            })?;
+
+            // Recreate with new schema
+            let storage_needs_pgt_count = vq.needs_pgt_count || vq.needs_union_dedup;
+            setup_storage_table(
+                schema,
+                table_name,
+                &vq.columns,
+                storage_needs_pgt_count,
+                vq.needs_dual_count,
+                vq.has_keyless_source,
+                refresh_mode,
+                vq.parsed_tree.as_ref(),
+            )?
+        }
+    };
+
+    // For Same/Compatible, also handle auxiliary column transitions
+    if !matches!(schema_change, SchemaChange::Incompatible { .. }) {
+        migrate_aux_columns(
+            schema,
+            table_name,
+            old_needs_pgt_count,
+            old_needs_dual_count,
+            vq.needs_pgt_count,
+            vq.needs_dual_count,
+            vq.needs_union_dedup,
+        )?;
+    }
+
+    // ── Phase 4: Update catalog & set up new infrastructure ──
+
+    // Compute the effective defining query for storage — TopK stores the base query
+    let defining_query = if vq.topk_info.is_some() {
+        &vq.effective_query
+    } else {
+        &rewritten_query
+    };
+
+    // Update the pgt_stream_tables catalog row
+    let original_query_opt = if original_new_query != *defining_query {
+        Some(original_new_query.as_str())
+    } else {
+        None
+    };
+
+    let functions_used = vq.parsed_tree.as_ref().map(|pr| pr.functions_used());
+    let topk_limit = vq.topk_info.as_ref().map(|i| i.limit_value as i32);
+    let topk_order_by_owned = vq.topk_info.as_ref().map(|i| i.order_by_sql.clone());
+    let topk_order_by = topk_order_by_owned.as_deref();
+    let topk_offset = vq
+        .topk_info
+        .as_ref()
+        .and_then(|i| i.offset_value.map(|v| v as i32));
+
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_stream_tables SET \
+         pgt_relid = $1, \
+         defining_query = $2, \
+         original_query = $3, \
+         functions_used = $4, \
+         topk_limit = $5, \
+         topk_order_by = $6, \
+         topk_offset = $7, \
+         needs_reinit = false, \
+         frontier = NULL, \
+         is_populated = false, \
+         has_keyless_source = $8, \
+         updated_at = now() \
+         WHERE pgt_id = $9",
+        &[
+            new_pgt_relid.into(),
+            defining_query.into(),
+            original_query_opt.into(),
+            functions_used.into(),
+            topk_limit.into(),
+            topk_order_by.into(),
+            topk_offset.into(),
+            vq.has_keyless_source.into(),
+            st.pgt_id.into(),
+        ],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    // Delete old dependency rows and insert new ones
+    StDependency::delete_for_st(st.pgt_id)?;
+
+    let columns_used_map = vq
+        .parsed_tree
+        .as_ref()
+        .map(|pr| pr.source_columns_used())
+        .unwrap_or_default();
+
+    for (source_oid, source_type) in &vq.source_relids {
+        let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
+        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
+            match crate::catalog::build_column_snapshot(*source_oid) {
+                Ok((s, f)) => (Some(s), Some(f)),
+                Err(e) => {
+                    pgrx::debug1!(
+                        "pg_trickle: failed to build column snapshot for source {}: {}",
+                        source_oid.to_u32(),
+                        e,
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+        StDependency::insert_with_snapshot(
+            st.pgt_id,
+            *source_oid,
+            source_type,
+            cols,
+            snapshot,
+            fingerprint,
+        )?;
+    }
+
+    // Set up CDC/IVM triggers for newly added sources
+    let change_schema = config::pg_trickle_change_buffer_schema();
+    for (source_oid, source_type) in &dep_diff.added {
+        if source_type == "TABLE" {
+            if refresh_mode.is_immediate() {
+                let lock_mode = crate::ivm::IvmLockMode::for_query(defining_query);
+                crate::ivm::setup_ivm_triggers(*source_oid, st.pgt_id, new_pgt_relid, lock_mode)?;
+            } else {
+                setup_cdc_for_source(*source_oid, st.pgt_id, &change_schema)?;
+            }
+        } else if source_type == "FOREIGN_TABLE" && !refresh_mode.is_immediate() {
+            cdc::setup_foreign_table_polling(*source_oid, st.pgt_id, &change_schema)?;
+        }
+    }
+
+    // Register view soft-dependencies if view inlining was applied
+    if original_query_opt.is_some()
+        && let Ok(original_sources) = extract_source_relations(&original_new_query)
+    {
+        for (src_oid, src_type) in &original_sources {
+            if src_type == "VIEW" {
+                let already_registered = vq.source_relids.iter().any(|(o, _)| o == src_oid);
+                if !already_registered {
+                    StDependency::insert_with_snapshot(
+                        st.pgt_id, *src_oid, src_type, None, None, None,
+                    )?;
+                }
+            }
+        }
+    }
+
+    // Signal DAG rebuild and cache invalidation
+    shmem::signal_dag_rebuild();
+    shmem::bump_cache_generation();
+
+    // ── Phase 5: Repopulate ──
+
+    // Execute a full refresh to populate the storage table with new query results
+    let source_oids: Vec<pg_sys::Oid> = vq
+        .source_relids
+        .iter()
+        .filter(|(_, t)| t == "TABLE")
+        .map(|(o, _)| *o)
+        .collect();
+
+    // Re-load ST with updated metadata for the refresh
+    let updated_st = StreamTableMeta::get_by_name(schema, table_name)?;
+    execute_manual_full_refresh(&updated_st, schema, table_name, &source_oids)?;
+
+    // Re-activate the stream table
+    StreamTableMeta::update_status(st.pgt_id, StStatus::Active)?;
+
+    // Pre-warm delta SQL + MERGE template cache for DIFFERENTIAL mode
+    if refresh_mode == RefreshMode::Differential {
+        let st = StreamTableMeta::get_by_name(schema, table_name)?;
+        refresh::prewarm_merge_cache(&st);
+    }
+
+    pgrx::info!(
+        "Stream table {}.{} ALTER QUERY completed (schema change: {})",
+        schema,
+        table_name,
+        match &schema_change {
+            SchemaChange::Same => "same",
+            SchemaChange::Compatible { .. } => "compatible",
+            SchemaChange::Incompatible { .. } => "incompatible (full rebuild)",
+        }
+    );
+
+    Ok(())
+}
+
+/// Get the user-visible columns of a storage table (excluding __pgt_* internal columns).
+fn get_storage_table_columns(
+    schema: &str,
+    table_name: &str,
+) -> Result<Vec<ColumnDef>, PgTrickleError> {
+    Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT a.attname::text, a.atttypid \
+                 FROM pg_attribute a \
+                 JOIN pg_class c ON c.oid = a.attrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 \
+                 AND a.attnum > 0 AND NOT a.attisdropped \
+                 AND a.attname NOT LIKE '__pgt_%' \
+                 ORDER BY a.attnum",
+                None,
+                &[schema.into(), table_name.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        let mut columns = Vec::new();
+        for row in table {
+            let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+            let name = row.get::<String>(1).map_err(map_spi)?.unwrap_or_default();
+            let type_oid_raw = row
+                .get::<pg_sys::Oid>(2)
+                .map_err(map_spi)?
+                .unwrap_or(pg_sys::InvalidOid);
+            columns.push(ColumnDef {
+                name,
+                type_oid: PgOid::from(type_oid_raw),
+            });
+        }
+        Ok(columns)
+    })
+}
+
 fn create_stream_table_impl(
     name: &str,
     query: &str,
@@ -99,10 +1133,7 @@ fn create_stream_table_impl(
     // Parse schema.name
     let (schema, table_name) = parse_qualified_name(name)?;
 
-    // Parse and validate schedule — accepts either a Prometheus-style
-    // duration string (e.g., '5m', '1h30m') or a cron expression
-    // (e.g., '*/5 * * * *', '@hourly').
-    // IMMEDIATE mode ignores the schedule (refresh is inline within DML).
+    // Parse and validate schedule
     let schedule_str = if refresh_mode.is_immediate() {
         None
     } else {
@@ -120,266 +1151,15 @@ fn create_stream_table_impl(
         }
     };
 
-    // ── View inlining auto-rewrite ─────────────────────────────────
-    // Views in the FROM clause are replaced with their underlying SELECT
-    // definition as inline subqueries. This ensures CDC triggers land on base
-    // tables and the DVM parser sees real table scans with PKs. Must run
-    // first so view definitions containing DISTINCT ON, GROUPING SETS, etc.
-    // get further rewritten by the downstream passes.
+    // ── Query rewrite pipeline ─────────────────────────────────────
     let original_query = query.to_string();
-    let query = &crate::dvm::rewrite_views_inline(query)?;
+    let query = &run_query_rewrite_pipeline(query)?;
 
-    // ── Nested window expression lift auto-rewrite ─────────────────
-    // Window functions nested inside expressions (CASE, COALESCE, arithmetic,
-    // etc.) are lifted into an inner subquery, replacing them with synthetic
-    // column aliases that the DVM engine can handle directly.  Must run before
-    // DISTINCT ON rewrite because DISTINCT ON may itself contain window funcs.
-    let query = &crate::dvm::rewrite_nested_window_exprs(query)?;
-
-    // ── DISTINCT ON auto-rewrite ───────────────────────────────────
-    // DISTINCT ON (e1, e2) is rewritten to a ROW_NUMBER() window function
-    // subquery before further parsing. The original query string is replaced
-    // so all downstream validation and parsing sees the rewritten form.
-    let query = &crate::dvm::rewrite_distinct_on(query)?;
-
-    // ── GROUPING SETS / CUBE / ROLLUP auto-rewrite ─────────────────
-    // GROUPING SETS, CUBE, and ROLLUP are decomposed into a UNION ALL of
-    // separate GROUP BY queries.  GROUPING() calls become integer literals.
-    // The rewrite happens before validation so all downstream code sees
-    // only plain GROUP BY + UNION ALL.
-    let query = &crate::dvm::rewrite_grouping_sets(query)?;
-
-    // ── Scalar subquery in WHERE → CROSS JOIN auto-rewrite ─────────
-    // WHERE col > (SELECT avg(x) FROM t) is rewritten to a CROSS JOIN
-    // with the scalar subquery, replacing the subquery reference.
-    let query = &crate::dvm::rewrite_scalar_subquery_in_where(query)?;
-
-    // ── SubLinks inside OR → UNION auto-rewrite ────────────────────
-    // WHERE a OR EXISTS (...) is decomposed into UNION branches, one
-    // per OR arm, so the DVM parser only sees non-OR sublinks.
-    let query = &crate::dvm::rewrite_sublinks_in_or(query)?;
-
-    // ── ROWS FROM() multi-function rewrite ─────────────────────────
-    // ROWS FROM(f1(), f2(), ...) with multiple SRFs is rewritten to
-    // a single multi-arg unnest() (all-unnest case) or an ordinal-based
-    // LEFT JOIN LATERAL chain (general case).
-    let query = &crate::dvm::rewrite_rows_from(query)?;
-
-    // ── Multiple PARTITION BY → handled natively ────────────────────
-    // Window functions with different PARTITION BY clauses are now
-    // handled by the parser as un-partitioned (full recomputation).
-    // No SQL rewrite needed.
-
-    // Validate the defining query by running LIMIT 0
-    let columns = validate_defining_query(query)?;
-
-    // ── TopK detection (ORDER BY + LIMIT) ──────────────────────────────
-    // Detect TopK pattern BEFORE reject_limit_offset, so ORDER BY + LIMIT
-    // queries are accepted and routed through the TopK path.
-    let topk_info = crate::dvm::detect_topk_pattern(query)?;
-
-    // For TopK tables, the "defining query" stored in the catalog is the
-    // base query (without ORDER BY + LIMIT). The TopK metadata (limit,
-    // order_by) is stored separately. The base query is what goes through
-    // validation, dependency analysis, and (for non-TopK) DVM parsing.
-    let (effective_query, topk_info) = if let Some(info) = topk_info {
-        if let Some(offset) = info.offset_value {
-            pgrx::info!(
-                "pg_trickle: TopK pattern detected (ORDER BY {} LIMIT {} OFFSET {}). \
-                 The stream table will maintain rows {}–{}.",
-                info.order_by_sql,
-                info.limit_value,
-                offset,
-                offset + 1,
-                offset + info.limit_value,
-            );
-        } else {
-            pgrx::info!(
-                "pg_trickle: TopK pattern detected (ORDER BY {} LIMIT {}). \
-                 The stream table will maintain the top {} rows.",
-                info.order_by_sql,
-                info.limit_value,
-                info.limit_value,
-            );
-        }
-        let base = info.base_query.clone();
-        (base, Some(info))
-    } else {
-        (query.to_string(), None)
-    };
-    let query = if topk_info.is_some() {
-        &effective_query
-    } else {
-        query
-    };
-
-    // Reject LIMIT / OFFSET in the defining query (TopK already handled above).
-    crate::dvm::reject_limit_offset(query)?;
-
-    // F13 (G4.2): Warn when LIMIT appears in a subquery without ORDER BY.
-    // Does not reject — LIMIT with ORDER BY is legitimate and deterministic.
-    crate::dvm::warn_limit_without_order_in_subqueries(query);
-
-    // Reject constructs that are unsupported regardless of refresh mode
-    // (NATURAL JOIN, subquery expressions like EXISTS/IN).
-    // This is a lightweight check that inspects the raw parse tree without
-    // doing full DVM tree construction.
-    //
-    // AUTO mode: if the construct is rejected, downgrade to FULL instead
-    // of erroring — the user didn't explicitly ask for DIFFERENTIAL.
-    if let Err(e) = crate::dvm::reject_unsupported_constructs(query) {
-        if is_auto {
-            pgrx::info!(
-                "Query uses constructs not supported by differential maintenance ({}); \
-                 using FULL refresh mode. See docs/DVM_OPERATORS.md for supported operators.",
-                e
-            );
-            refresh_mode = RefreshMode::Full;
-        } else {
-            return Err(e);
-        }
-    }
-
-    // ── Reject materialized views / foreign tables in DIFFERENTIAL/IMMEDIATE ──
-    // After view inlining, any remaining RangeVars are base tables,
-    // stream tables, matviews, or foreign tables. Matviews and foreign
-    // tables don't support row-level / statement-level triggers, so they
-    // can't be used as DIFFERENTIAL or IMMEDIATE sources.
-    //
-    // AUTO mode: downgrade to FULL if matviews/foreign tables are present.
-    if (refresh_mode == RefreshMode::Differential || refresh_mode == RefreshMode::Immediate)
-        && let Err(e) = crate::dvm::reject_materialized_views(query)
-    {
-        if is_auto && refresh_mode == RefreshMode::Differential {
-            pgrx::info!(
-                "Query references materialized views or foreign tables ({}); \
-                 using FULL refresh mode.",
-                e
-            );
-            refresh_mode = RefreshMode::Full;
-        } else {
-            return Err(e);
-        }
-    }
-
-    // ── IMMEDIATE mode: TopK with limit threshold (Task 5.2) ────────
-    // TopK in IMMEDIATE mode uses inline micro-refresh (recompute top K
-    // rows and diff against current storage). Gated by ivm_topk_max_limit GUC.
-    if let (true, Some(info)) = (refresh_mode.is_immediate(), &topk_info) {
-        let topk_limit = info.limit_value;
-        let max_limit = crate::config::PGS_IVM_TOPK_MAX_LIMIT.get() as i64;
-        if max_limit == 0 || topk_limit > max_limit {
-            return Err(PgTrickleError::UnsupportedOperator(format!(
-                "ORDER BY + LIMIT {topk_limit} (TopK) exceeds the IMMEDIATE mode threshold \
-                 (pg_trickle.ivm_topk_max_limit = {max_limit}). TopK tables in IMMEDIATE mode \
-                 recompute the top-K rows on every DML statement. Reduce LIMIT, raise the \
-                 threshold, or use 'DIFFERENTIAL' mode for large TopK queries."
-            )));
-        }
-        pgrx::warning!(
-            "pg_trickle: TopK (LIMIT {}) in IMMEDIATE mode uses micro-refresh — \
-             the top-{} rows are recomputed on every DML statement. \
-             This adds latency proportional to the defining query cost.",
-            topk_limit,
-            topk_limit
-        );
-    }
-
-    // ── IMMEDIATE mode: validate query restrictions ─────────────────
-    // IMMEDIATE mode does not yet support window functions, recursive CTEs,
-    // LATERAL joins, or scalar subqueries. Reject these early with a clear
-    // message pointing users to DIFFERENTIAL mode.
-    if refresh_mode.is_immediate() {
-        crate::dvm::validate_immediate_mode_support(query)?;
-    }
-
-    // For DIFFERENTIAL and IMMEDIATE modes, run the full DVM parser to
-    // catch unsupported aggregates, FILTER clauses, etc. that are
-    // specifically problematic for incremental view maintenance.
-    // FULL mode skips this since it just truncates and reloads.
-    // TopK tables bypass the DVM pipeline entirely — they use scoped
-    // recomputation (re-execute the ORDER BY + LIMIT query) instead of
-    // delta-based incremental maintenance.
-    //
-    // AUTO mode: if DVM parsing fails, downgrade to FULL instead of
-    // erroring — the user didn't explicitly request DIFFERENTIAL.
-    let parsed_tree = if (refresh_mode == RefreshMode::Differential
-        || refresh_mode == RefreshMode::Immediate)
-        && topk_info.is_none()
-    {
-        match crate::dvm::parse_defining_query_full(query) {
-            Ok(tree) => Some(tree),
-            Err(e) if is_auto && refresh_mode == RefreshMode::Differential => {
-                pgrx::info!(
-                    "Query cannot use differential maintenance ({}); \
-                     using FULL refresh mode. See docs/DVM_OPERATORS.md for supported operators.",
-                    e
-                );
-                refresh_mode = RefreshMode::Full;
-                None
-            }
-            Err(e) => return Err(e),
-        }
-    } else {
-        None
-    };
-
-    // ── Volatility check ────────────────────────────────────────────
-    // Volatile functions break delta computation in DIFFERENTIAL/IMMEDIATE mode.
-    // Stable functions are allowed with a warning.
-    if let Some(ref pr) = parsed_tree {
-        let vol = crate::dvm::tree_worst_volatility_with_registry(pr)?;
-        match vol {
-            'v' => {
-                return Err(PgTrickleError::UnsupportedOperator(
-                    "Defining query contains volatile expressions (e.g., random(), \
-                     clock_timestamp(), or custom volatile operators). Volatile \
-                     functions and operators are not supported in DIFFERENTIAL or \
-                     IMMEDIATE mode because they produce different values on each \
-                     evaluation, breaking delta computation. Use FULL refresh mode \
-                     instead, or replace with a deterministic alternative."
-                        .into(),
-                ));
-            }
-            's' => {
-                pgrx::warning!(
-                    "Defining query contains stable functions (e.g., now(), \
-                     current_timestamp). These return the same value within a \
-                     single refresh but may shift between refreshes. \
-                     Delta computation is correct within each refresh cycle."
-                );
-            }
-            _ => {} // 'i' (immutable) — no action
-        }
-    } else if refresh_mode == RefreshMode::Full {
-        // FULL mode: warn if volatile functions are present.
-        // We still validate the query by parsing it (LIMIT 0 already ran),
-        // but we don't have a full OpTree. Do a lightweight SPI check on
-        // any function names we can extract. This is best-effort — the
-        // user already chose FULL mode, so we just warn.
-        // (Skip for now — FULL mode re-evaluates everything from scratch,
-        // so volatile is expected-but-surprising behavior.)
-    }
-
-    // Detect if the query has aggregate/distinct (needs __pgt_count auxiliary column).
-    let needs_count = parsed_tree
-        .as_ref()
-        .is_some_and(|pr| pr.tree.needs_pgt_count());
-
-    // Detect if the query is INTERSECT/EXCEPT (needs __pgt_count_l, __pgt_count_r).
-    let needs_dual_count = parsed_tree
-        .as_ref()
-        .is_some_and(|pr| pr.tree.needs_dual_count());
-
-    // Detect if the query is a UNION (without ALL) needing dedup count.
-    let needs_union_dedup = parsed_tree
-        .as_ref()
-        .is_some_and(|pr| pr.tree.needs_union_dedup_count());
-
-    // Note: recursive CTEs (WITH RECURSIVE) are allowed in both FULL and
-    // DIFFERENTIAL modes. For DIFFERENTIAL, the DVM engine uses a
-    // recomputation diff strategy that re-executes the query and diffs
-    // the result against the current storage.
+    // ── Validate & parse ───────────────────────────────────────────
+    let vq = validate_and_parse_query(query, &mut refresh_mode, is_auto)?;
+    // Warnings
+    warn_source_table_properties(&vq.source_relids);
+    warn_select_star(query);
 
     // Check for duplicate
     if StreamTableMeta::get_by_name(&schema, &table_name).is_ok() {
@@ -389,203 +1169,53 @@ fn create_stream_table_impl(
         )));
     }
 
-    // Extract source dependencies from the query
-    let source_relids = extract_source_relations(query)?;
-
-    // F13/F14: Warn about source table edge cases
-    warn_source_table_properties(&source_relids);
-
-    // EC-06: Detect whether any source table lacks a PRIMARY KEY.
-    // When true, the storage table uses a non-unique index on __pgt_row_id
-    // and the apply logic uses counted DELETE instead of MERGE, because
-    // identical duplicate rows produce the same content hash → same row_id.
-    let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
-        if source_type != "TABLE" && source_type != "FOREIGN_TABLE" {
-            return false;
-        }
-        cdc::resolve_pk_columns(*oid)
-            .map(|pk| pk.is_empty())
-            .unwrap_or(false)
-    });
-
-    // EC-15: Warn when the defining query uses SELECT * — column additions
-    // to source tables will break the stream table silently (column count
-    // mismatch) or require reinitialization.
-    warn_select_star(query);
-
     // Cycle detection
-    check_for_cycles(&source_relids)?;
+    check_for_cycles(&vq.source_relids)?;
 
-    // ── Phase 1: DDL and DML (writes) ──
+    // ── Phase 1: DDL ──
 
-    // Get the change buffer schema for CDC setup
-    let change_schema = config::pg_trickle_change_buffer_schema();
-
-    // Create the underlying storage table — UNION (dedup) also needs __pgt_count
-    let storage_needs_pgt_count = needs_count || needs_union_dedup;
-    let storage_ddl = build_create_table_sql(
+    // Create storage table, indexes, and DML guard trigger
+    let storage_needs_pgt_count = vq.needs_pgt_count || vq.needs_union_dedup;
+    let pgt_relid = setup_storage_table(
         &schema,
         &table_name,
-        &columns,
+        &vq.columns,
         storage_needs_pgt_count,
-        needs_dual_count,
-    );
-    Spi::run(&storage_ddl)
-        .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
+        vq.needs_dual_count,
+        vq.has_keyless_source,
+        refresh_mode,
+        vq.parsed_tree.as_ref(),
+    )?;
 
-    // Get the OID of the newly created table
-    let pgt_relid = get_table_oid(&schema, &table_name)?;
-
-    // Create index on __pgt_row_id.
-    //
-    // EC-06: For keyless sources, use a non-unique index because identical
-    // duplicate rows produce the same content hash → same __pgt_row_id.
-    // A UNIQUE index would prevent storing those duplicates correctly.
-    let index_sql = if has_keyless_source {
-        format!(
-            "CREATE INDEX ON {}.{} (__pgt_row_id)",
-            quote_identifier(&schema),
-            quote_identifier(&table_name),
-        )
-    } else {
-        format!(
-            "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
-            quote_identifier(&schema),
-            quote_identifier(&table_name),
-        )
-    };
-    Spi::run(&index_sql)
-        .map_err(|e| PgTrickleError::SpiError(format!("Failed to create row_id index: {}", e)))?;
-
-    // EC-25/EC-26: Install a guard trigger that blocks direct DML on the
-    // stream table's storage table. The storage table should only be modified
-    // by the refresh executor. Direct INSERT/UPDATE/DELETE/TRUNCATE by users
-    // would corrupt the incrementally-maintained data.
-    install_dml_guard_trigger(&schema, &table_name)?;
-
-    // U1/U2: Auto-create composite index on GROUP BY columns for aggregate
-    // queries. This accelerates the LEFT JOIN in the agg_merge CTE during
-    // differential refreshes by allowing index lookups instead of seq scans.
-    if refresh_mode == RefreshMode::Differential
-        && let Some(ref pr) = parsed_tree
-        && let Some(group_cols) = pr.tree.group_by_columns()
-        && !group_cols.is_empty()
-    {
-        let quoted_cols: Vec<String> = group_cols
-            .iter()
-            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-            .collect();
-        let group_index_sql = format!(
-            "CREATE INDEX ON {}.{} ({})",
-            quote_identifier(&schema),
-            quote_identifier(&table_name),
-            quoted_cols.join(", "),
-        );
-        Spi::run(&group_index_sql).map_err(|e| {
-            PgTrickleError::SpiError(format!("Failed to create group-by index: {}", e))
-        })?;
-    }
-
-    // Insert catalog entry.
-    // Store the original (pre-inlining) query so that reinit after view
-    // definition changes can re-run the full rewrite pipeline.
+    // Insert catalog entry + dependency edges
     let original_query_opt = if original_query != *query {
         Some(original_query.as_str())
     } else {
         None
     };
-    let pgt_id = StreamTableMeta::insert(
+    let pgt_id = insert_catalog_and_deps(
         pgt_relid,
-        &table_name,
         &schema,
+        &table_name,
         query,
         original_query_opt,
         schedule_str,
         refresh_mode,
-        parsed_tree.as_ref().map(|pr| pr.functions_used()),
-        topk_info.as_ref().map(|i| i.limit_value as i32),
-        topk_info.as_ref().map(|i| i.order_by_sql.as_str()),
-        topk_info
-            .as_ref()
-            .and_then(|i| i.offset_value.map(|v| v as i32)),
+        &vq,
         dc,
         dsp,
-        has_keyless_source,
     )?;
 
-    // Build per-source column usage map from the parsed OpTree so that
-    // `detect_schema_change_kind()` can accurately classify DDL events
-    // (benign vs column-affecting) instead of conservatively reinitializing.
-    let columns_used_map = parsed_tree
-        .as_ref()
-        .map(|pr| pr.source_columns_used())
-        .unwrap_or_default();
-
-    // Insert dependency edges with column snapshots for schema change detection.
-    for (source_oid, source_type) in &source_relids {
-        let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
-
-        // Build column snapshot + fingerprint for TABLE sources.
-        // Views and stream tables don't need snapshots since their schema
-        // is derived from their own defining queries.
-        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
-            match crate::catalog::build_column_snapshot(*source_oid) {
-                Ok((s, f)) => (Some(s), Some(f)),
-                Err(e) => {
-                    pgrx::debug1!(
-                        "pg_trickle: failed to build column snapshot for source {}: {}",
-                        source_oid.to_u32(),
-                        e,
-                    );
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        StDependency::insert_with_snapshot(
-            pgt_id,
-            *source_oid,
-            source_type,
-            cols,
-            snapshot,
-            fingerprint,
-        )?;
-    }
-
     // ── Phase 2: CDC / IVM trigger setup ──
-    if refresh_mode.is_immediate() {
-        // IMMEDIATE mode: install statement-level IVM triggers on each
-        // base table source (no change buffer tables, no row-level triggers).
-        let lock_mode = crate::ivm::IvmLockMode::for_query(query);
-        for (source_oid, source_type) in &source_relids {
-            if source_type == "TABLE" {
-                crate::ivm::setup_ivm_triggers(*source_oid, pgt_id, pgt_relid, lock_mode)?;
-            }
-        }
-    } else {
-        // FULL / DIFFERENTIAL mode: install row-level CDC triggers + change buffers.
-        for (source_oid, source_type) in &source_relids {
-            if source_type == "TABLE" {
-                setup_cdc_for_source(*source_oid, pgt_id, &change_schema)?;
-            } else if source_type == "FOREIGN_TABLE" {
-                cdc::setup_foreign_table_polling(*source_oid, pgt_id, &change_schema)?;
-            }
-        }
-    }
+    setup_trigger_infrastructure(&vq.source_relids, refresh_mode, pgt_id, pgt_relid, query)?;
 
     // ── Phase 2b: Register view soft-dependencies for DDL tracking ──
-    // If views were inlined, the rewritten query only references base tables.
-    // We also need to register the original view OIDs so that DDL hooks
-    // (CREATE OR REPLACE VIEW, DROP VIEW) can find affected stream tables.
     if original_query_opt.is_some()
         && let Ok(original_sources) = extract_source_relations(&original_query)
     {
         for (src_oid, src_type) in &original_sources {
             if src_type == "VIEW" {
-                // Only register if not already in the base-table deps
-                let already_registered = source_relids.iter().any(|(o, _)| o == src_oid);
+                let already_registered = vq.source_relids.iter().any(|(o, _)| o == src_oid);
                 if !already_registered {
                     StDependency::insert_with_snapshot(
                         pgt_id, *src_oid, src_type, None, None, None,
@@ -603,11 +1233,11 @@ fn create_stream_table_impl(
             &table_name,
             query,
             pgt_id,
-            &columns,
-            needs_count,
-            needs_dual_count,
-            needs_union_dedup,
-            topk_info.as_ref(),
+            &vq.columns,
+            vq.needs_pgt_count,
+            vq.needs_dual_count,
+            vq.needs_union_dedup,
+            vq.topk_info.as_ref(),
         )?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
 
@@ -649,6 +1279,7 @@ fn create_stream_table_impl(
 #[pg_extern(schema = "pgtrickle")]
 fn alter_stream_table(
     name: &str,
+    query: default!(Option<&str>, "NULL"),
     schedule: default!(Option<&str>, "NULL"),
     refresh_mode: default!(Option<&str>, "NULL"),
     status: default!(Option<&str>, "NULL"),
@@ -657,6 +1288,7 @@ fn alter_stream_table(
 ) {
     let result = alter_stream_table_impl(
         name,
+        query,
         schedule,
         refresh_mode,
         status,
@@ -670,6 +1302,7 @@ fn alter_stream_table(
 
 fn alter_stream_table_impl(
     name: &str,
+    query: Option<&str>,
     schedule: Option<&str>,
     refresh_mode: Option<&str>,
     status: Option<&str>,
@@ -678,6 +1311,11 @@ fn alter_stream_table_impl(
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
+    // ── Query migration (must run first, before other parameter changes) ──
+    if let Some(new_query) = query {
+        alter_stream_table_query(&st, &schema, &table_name, new_query)?;
+    }
 
     if let Some(val) = schedule {
         if val.trim().eq_ignore_ascii_case("calculated") {
@@ -2490,6 +3128,53 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgTri
     }
 
     // Run cycle detection
+    dag.detect_cycles()
+}
+
+/// Cycle detection variant for ALTER QUERY.
+///
+/// Instead of creating a sentinel node (as `check_for_cycles` does for CREATE),
+/// this function re-uses the existing ST's node in the DAG and replaces its
+/// incoming edges with the proposed new source dependencies. This correctly
+/// detects cycles like A → B → A that a sentinel node would miss.
+fn check_for_cycles_alter(
+    pgt_id: i64,
+    source_relids: &[(pg_sys::Oid, String)],
+) -> Result<(), PgTrickleError> {
+    if source_relids.is_empty() {
+        return Ok(());
+    }
+
+    let has_st_source = source_relids
+        .iter()
+        .any(|(_, stype)| stype == "STREAM_TABLE");
+
+    if !has_st_source {
+        return Ok(());
+    }
+
+    let mut dag = StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds())?;
+
+    let target_node = NodeId::StreamTable(pgt_id);
+
+    // Resolve new source node IDs
+    let new_sources: Vec<NodeId> = source_relids
+        .iter()
+        .map(|(source_oid, source_type)| {
+            if source_type == "STREAM_TABLE" {
+                match crate::catalog::StreamTableMeta::get_by_relid(*source_oid) {
+                    Ok(meta) => NodeId::StreamTable(meta.pgt_id),
+                    Err(_) => NodeId::BaseTable(source_oid.to_u32()),
+                }
+            } else {
+                NodeId::BaseTable(source_oid.to_u32())
+            }
+        })
+        .collect();
+
+    // Replace the ST's incoming edges with the proposed new ones
+    dag.replace_incoming_edges(target_node, new_sources);
+
     dag.detect_cycles()
 }
 

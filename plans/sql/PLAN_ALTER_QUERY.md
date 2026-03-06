@@ -1,8 +1,65 @@
 # Plan: Allow `alter_stream_table` to Change the Defining Query
 
-**Status:** Draft  
+**Status:** Complete  
 **Author:** Copilot  
-**Date:** 2026-03-04
+**Date:** 2026-03-04  
+**Last Updated:** 2026-03-06
+
+---
+
+## Progress Summary
+
+### Completed (Steps 1–9)
+- [x] **Step 1: Refactor `create_stream_table_impl`** — Extracted reusable
+  functions: `run_query_rewrite_pipeline()`, `validate_and_parse_query()`,
+  `setup_storage_table()`, `insert_catalog_and_deps()`,
+  `setup_trigger_infrastructure()`. `create_stream_table_impl` now calls these.
+- [x] **Step 2: Schema comparison** — Added `SchemaChange` enum and
+  `classify_schema_change()` (Same / Compatible / Incompatible with `pg_cast`
+  implicit cast check).
+- [x] **Step 3: Storage table migration** — Added
+  `migrate_storage_table_compatible()` (ALTER TABLE ADD/DROP COLUMN),
+  `migrate_aux_columns()` (__pgt_count transitions), and full rebuild path
+  for incompatible changes.
+- [x] **Step 4: Dependency diffing** — Added `DependencyDiff` struct,
+  `diff_dependencies()`, and `StDependency::delete_for_st()`.
+- [x] **Step 5: Core ALTER QUERY** — Implemented `alter_stream_table_query()`
+  with Phases 0–5 (validate, suspend, teardown, migrate, catalog update,
+  repopulate).
+- [x] **Step 6: SQL signature** — Added `query` parameter to
+  `alter_stream_table` / `alter_stream_table_impl`.
+- [x] **Step 6b: Upgrade migration script** — Created
+  `sql/pg_trickle--0.2.1--0.2.2.sql` that DROPs the old 6-parameter
+  `alter_stream_table` signature and CREATEs the new 7-parameter version
+  with the `query` parameter.
+- [x] **Step 7: dbt materialization** — Updated
+  `dbt-pgtrickle/macros/materializations/stream_table.sql` to use
+  `ALTER ... query =>` instead of drop+recreate for query changes.
+  Updated `dbt-pgtrickle/macros/adapters/alter_stream_table.sql` to accept
+  and pass the `query` parameter.
+- [x] **Step 8: Docs** — Updated `docs/SQL_REFERENCE.md` with new `query`
+  parameter documentation, examples, and schema migration behavior notes.
+  Updated `docs/FAQ.md` to replace "must drop and recreate" guidance with
+  the new ALTER QUERY approach. Updated `docs/ARCHITECTURE.md` description.
+- [x] **Step 9: E2E tests** — Created `tests/e2e_alter_query_tests.rs` with
+  15 tests covering same-schema, compatible-schema (add/remove column, type
+  change), incompatible-schema (type change with full rebuild), dependency
+  changes (add/remove sources), aggregate transitions, query+mode change,
+  error handling (invalid query, cycle detection), view inlining, OID
+  stability, and catalog update verification.
+
+### Bugs Found & Fixed During E2E Testing
+- **Incompatible schema FK violation** — `DROP TABLE ... CASCADE` on the
+  storage table triggered the `sql_drop` event trigger, which detected the
+  table as ST storage and deleted the `pgt_stream_tables` catalog row. Fix:
+  set `pgt_relid = 0` before the DROP so `is_st_storage_table()` returns
+  false, then the event trigger skips cleanup.
+- **Cycle detection missed ALTER cycles** — `check_for_cycles()` created a
+  sentinel node (`pgt_id = MAX`) for CREATE, but for ALTER the existing ST
+  already has edges in the DAG. A sentinel can't detect A → B → A cycles.
+  Fix: added `check_for_cycles_alter()` that re-uses the existing ST node
+  and calls `StDag::replace_incoming_edges()` to swap in proposed sources
+  before running cycle detection.
 
 ---
 
@@ -366,7 +423,7 @@ The core logic, called from `alter_stream_table_impl` when `query` is
 `Some(...)`. Orchestrates Phases 0–5, using the utilities from Steps 1–4.
 
 ### Step 6: Update SQL signature & upgrade script
-**Files:** `src/api.rs` (pgrx attribute), `sql/pg_trickle--0.2.1--0.3.0.sql`  
+**Files:** `src/api.rs` (pgrx attribute), `sql/pg_trickle--0.2.1--0.2.2.sql`  
 **Effort:** ~1 hour
 
 Add the `query` parameter to the `#[pg_extern]` function signature with

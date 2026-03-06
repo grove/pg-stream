@@ -826,6 +826,15 @@ impl StDependency {
         Self::insert_with_snapshot(pgt_id, source_relid, source_type, columns_used, None, None)
     }
 
+    /// Delete all dependency edges for a stream table.
+    pub fn delete_for_st(pgt_id: i64) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "DELETE FROM pgtrickle.pgt_dependencies WHERE pgt_id = $1",
+            &[pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Insert a dependency edge with column snapshot and schema fingerprint.
     pub fn insert_with_snapshot(
         pgt_id: i64,

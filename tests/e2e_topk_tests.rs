@@ -991,3 +991,403 @@ async fn test_subquery_offset_with_order_by_no_warning() {
         "OFFSET 2 with ORDER BY from 5 rows should yield 3 rows"
     );
 }
+
+// ── IMMEDIATE mode TopK ────────────────────────────────────────────────
+//
+// TopK stream tables in IMMEDIATE mode use statement-level micro-refresh
+// (`apply_topk_micro_refresh`) — the full ORDER BY + LIMIT query is
+// re-executed and diffed against the current storage on every DML.
+
+/// Helper: create an IMMEDIATE-mode stream table (NULL schedule).
+async fn create_immediate_st(db: &E2eDb, name: &str, query: &str) {
+    let sql = format!(
+        "SELECT pgtrickle.create_stream_table('{name}', $${query}$$, \
+         NULL, 'IMMEDIATE')"
+    );
+    db.execute(&sql).await;
+}
+
+#[tokio::test]
+async fn test_topk_immediate_basic_creation() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_src (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_src VALUES (1,10),(2,50),(3,30),(4,40),(5,20)")
+        .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_basic",
+        "SELECT id, score FROM topk_imm_src ORDER BY score DESC LIMIT 3",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_imm_basic").await, 3);
+
+    // Verify correct rows: top 3 scores are 50, 40, 30
+    let max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_basic")
+        .await;
+    assert_eq!(max, 50);
+
+    let min: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_basic")
+        .await;
+    assert_eq!(min, 30);
+
+    // Catalog should record IMMEDIATE mode + TopK metadata
+    let (status, mode, populated, _) = db.pgt_status("topk_imm_basic").await;
+    assert_eq!(status, "ACTIVE");
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(populated);
+
+    let topk_limit: i32 = db
+        .query_scalar(
+            "SELECT topk_limit FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'topk_imm_basic'",
+        )
+        .await;
+    assert_eq!(topk_limit, 3);
+}
+
+#[tokio::test]
+async fn test_topk_immediate_insert_enters_top_n() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_ins (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_ins VALUES (1,10),(2,20),(3,30)")
+        .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_ins_st",
+        "SELECT id, score FROM topk_imm_ins ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_imm_ins_st").await, 2);
+
+    // Insert a row with a higher score — should immediately enter top-2
+    db.execute("INSERT INTO topk_imm_ins VALUES (4, 50)").await;
+
+    assert_eq!(
+        db.count("public.topk_imm_ins_st").await,
+        2,
+        "Still 2 rows after insert"
+    );
+
+    let max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_ins_st")
+        .await;
+    assert_eq!(max, 50, "New high-score row should be in the top-2");
+
+    let min: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_ins_st")
+        .await;
+    assert_eq!(min, 30, "Bottom of top-2 should now be 30");
+}
+
+#[tokio::test]
+async fn test_topk_immediate_insert_below_threshold_no_change() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_lo (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_lo VALUES (1,100),(2,200),(3,300)")
+        .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_lo_st",
+        "SELECT id, score FROM topk_imm_lo ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+
+    // Top-2: 300, 200
+    let min_before: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_lo_st")
+        .await;
+    assert_eq!(min_before, 200);
+
+    // Insert a row below the top-2 threshold — should not change the ST
+    db.execute("INSERT INTO topk_imm_lo VALUES (4, 50)").await;
+
+    assert_eq!(db.count("public.topk_imm_lo_st").await, 2);
+
+    let min_after: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_lo_st")
+        .await;
+    assert_eq!(min_after, 200, "Top-2 unchanged by below-threshold insert");
+}
+
+#[tokio::test]
+async fn test_topk_immediate_delete_expands_window() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_del (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_del VALUES (1,10),(2,20),(3,30),(4,40)")
+        .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_del_st",
+        "SELECT id, score FROM topk_imm_del ORDER BY score DESC LIMIT 3",
+    )
+    .await;
+
+    // Top-3: 40, 30, 20
+    assert_eq!(db.count("public.topk_imm_del_st").await, 3);
+
+    // Delete the top row — row with score=10 should now enter the top-3
+    db.execute("DELETE FROM topk_imm_del WHERE id = 4").await;
+
+    assert_eq!(
+        db.count("public.topk_imm_del_st").await,
+        3,
+        "Still 3 rows after delete"
+    );
+
+    let max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_del_st")
+        .await;
+    assert_eq!(max, 30, "New top score after deleting 40");
+
+    let min: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_del_st")
+        .await;
+    assert_eq!(min, 10, "Score 10 should now be in top-3");
+}
+
+#[tokio::test]
+async fn test_topk_immediate_update_changes_ranking() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_upd (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_upd VALUES (1,10),(2,20),(3,30),(4,40)")
+        .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_upd_st",
+        "SELECT id, score FROM topk_imm_upd ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+
+    // Top-2: 40, 30
+    assert_eq!(db.count("public.topk_imm_upd_st").await, 2);
+
+    // Update row id=1 (score 10 → 50) — should enter top-2 and push out id=3
+    db.execute("UPDATE topk_imm_upd SET score = 50 WHERE id = 1")
+        .await;
+
+    assert_eq!(db.count("public.topk_imm_upd_st").await, 2);
+
+    let max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_upd_st")
+        .await;
+    assert_eq!(max, 50, "Updated row should be new top");
+
+    let min: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_upd_st")
+        .await;
+    assert_eq!(min, 40, "Second place should be 40");
+}
+
+#[tokio::test]
+async fn test_topk_immediate_multiple_dml_in_transaction() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_tx (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_tx VALUES (1,10),(2,20),(3,30)")
+        .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_tx_st",
+        "SELECT id, score FROM topk_imm_tx ORDER BY score DESC LIMIT 2",
+    )
+    .await;
+
+    // Top-2: 30, 20
+    assert_eq!(db.count("public.topk_imm_tx_st").await, 2);
+
+    // Multiple DML in a single transaction — each triggers micro-refresh
+    db.execute(
+        "BEGIN; \
+         INSERT INTO topk_imm_tx VALUES (4, 50); \
+         DELETE FROM topk_imm_tx WHERE id = 3; \
+         INSERT INTO topk_imm_tx VALUES (5, 40); \
+         COMMIT",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_imm_tx_st").await, 2);
+
+    // After: available scores are 10, 20, 40, 50 → top-2: 50, 40
+    let max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_tx_st")
+        .await;
+    assert_eq!(max, 50);
+
+    let min: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_tx_st")
+        .await;
+    assert_eq!(min, 40);
+}
+
+#[tokio::test]
+async fn test_topk_immediate_with_aggregate() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE topk_imm_agg (category TEXT, amount INT, \
+         id SERIAL PRIMARY KEY)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO topk_imm_agg (category, amount) VALUES \
+         ('a',100),('a',200),('b',150),('b',250),('c',50)",
+    )
+    .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_agg_st",
+        "SELECT category, SUM(amount) AS total \
+         FROM topk_imm_agg GROUP BY category \
+         ORDER BY total DESC LIMIT 2",
+    )
+    .await;
+
+    // Categories: a=300, b=400, c=50 → top-2: b(400), a(300)
+    assert_eq!(db.count("public.topk_imm_agg_st").await, 2);
+
+    let top: String = db
+        .query_scalar("SELECT category FROM public.topk_imm_agg_st ORDER BY total DESC LIMIT 1")
+        .await;
+    assert_eq!(top, "b");
+
+    // Add a big amount to category c — should overtake a
+    db.execute("INSERT INTO topk_imm_agg (category, amount) VALUES ('c', 500)")
+        .await;
+
+    // Now: a=300, b=400, c=550 → top-2: c(550), b(400)
+    let new_top: String = db
+        .query_scalar("SELECT category FROM public.topk_imm_agg_st ORDER BY total DESC LIMIT 1")
+        .await;
+    assert_eq!(
+        new_top, "c",
+        "Category c should now be #1 after huge insert"
+    );
+}
+
+#[tokio::test]
+async fn test_topk_immediate_with_offset() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_off (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_off VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+        .await;
+
+    create_immediate_st(
+        &db,
+        "topk_imm_off_st",
+        "SELECT id, score FROM topk_imm_off ORDER BY score DESC LIMIT 2 OFFSET 1",
+    )
+    .await;
+
+    // Rows 2–3 by descending score: 40, 30
+    assert_eq!(db.count("public.topk_imm_off_st").await, 2);
+
+    let max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_off_st")
+        .await;
+    assert_eq!(max, 40);
+
+    // Insert a new top score — should shift the window
+    db.execute("INSERT INTO topk_imm_off VALUES (6, 60)").await;
+
+    // New order: 60, 50, 40, 30, 20, 10 → OFFSET 1 LIMIT 2: 50, 40
+    let new_max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_off_st")
+        .await;
+    assert_eq!(new_max, 50, "Window should shift to 50,40 after new top");
+
+    let new_min: i32 = db
+        .query_scalar("SELECT MIN(score) FROM public.topk_imm_off_st")
+        .await;
+    assert_eq!(new_min, 40);
+}
+
+#[tokio::test]
+async fn test_topk_immediate_threshold_rejection() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_rej (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_rej VALUES (1,1)").await;
+
+    // Set the GUC to a very low limit
+    db.execute("SET pg_trickle.ivm_topk_max_limit = 5").await;
+
+    // Creating a TopK with LIMIT > threshold should fail
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('topk_imm_rej_st', \
+             $$SELECT id, val FROM topk_imm_rej ORDER BY val DESC LIMIT 10$$, \
+             NULL, 'IMMEDIATE')",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "TopK LIMIT 10 > ivm_topk_max_limit 5 should be rejected"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("exceeds the IMMEDIATE mode threshold"),
+        "Error should mention threshold: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_topk_immediate_mode_switch_from_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE topk_imm_sw (id INT PRIMARY KEY, score INT)")
+        .await;
+    db.execute("INSERT INTO topk_imm_sw VALUES (1,10),(2,20),(3,30),(4,40)")
+        .await;
+
+    // Create as DIFFERENTIAL first
+    db.create_st(
+        "topk_imm_sw_st",
+        "SELECT id, score FROM topk_imm_sw ORDER BY score DESC LIMIT 2",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    assert_eq!(db.count("public.topk_imm_sw_st").await, 2);
+
+    // Switch to IMMEDIATE mode
+    db.alter_st("topk_imm_sw_st", "refresh_mode => 'IMMEDIATE'")
+        .await;
+
+    let (_, mode, _, _) = db.pgt_status("topk_imm_sw_st").await;
+    assert_eq!(mode, "IMMEDIATE");
+
+    // DML should now propagate immediately
+    db.execute("INSERT INTO topk_imm_sw VALUES (5, 50)").await;
+
+    let max: i32 = db
+        .query_scalar("SELECT MAX(score) FROM public.topk_imm_sw_st")
+        .await;
+    assert_eq!(max, 50, "IMMEDIATE micro-refresh should pick up new top");
+}

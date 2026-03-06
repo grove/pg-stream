@@ -227,10 +227,12 @@ GitHub Pages book grew from 14 to 20 pages:
 
 ---
 
-## v0.2.2 — OFFSET Support, AUTO Mode & Upgrade Tooling
+## v0.2.2 — OFFSET, AUTO Mode, ALTER QUERY, Edge Cases & CDC Hardening
 
 **Goal:** Ship the `ORDER BY + LIMIT + OFFSET` (Paged TopK) feature started
-in v0.2.1, make AUTO the default refresh mode, and close upgrade tooling gaps.
+in v0.2.1, make AUTO the default refresh mode, add ALTER QUERY support,
+close upgrade tooling gaps, harden edge cases and WAL CDC, close IMMEDIATE
+mode parity gaps, and sweep remaining documentation holes.
 
 ### ORDER BY + LIMIT + OFFSET (Paged TopK) — Finalization ✅
 
@@ -250,6 +252,16 @@ tests). The `topk_offset` catalog column was pre-provisioned in v0.2.1.
 | AM2 | `create_stream_table` default changed from `'DIFFERENTIAL'` to `'AUTO'` | ✅ Done | — |
 | AM3 | `create_stream_table` schedule default changed from `'1m'` to `'calculated'` | ✅ Done | — |
 
+### ALTER QUERY ✅
+
+| Item | Description | Status | Ref |
+|------|-------------|--------|-----|
+| AQ1 | `alter_stream_table(query => ...)` — validate, classify schema change, migrate storage | ✅ Done | [PLAN_ALTER_QUERY.md](plans/PLAN_ALTER_QUERY.md) |
+| AQ2 | Schema classification: same, compatible (ADD/DROP COLUMN), incompatible (full rebuild) | ✅ Done | — |
+| AQ3 | ALTER-aware cycle detection (`check_for_cycles_alter`) | ✅ Done | — |
+| AQ4 | CDC dependency migration (add/remove triggers for changed sources) | ✅ Done | — |
+| AQ5 | SQL Reference & CHANGELOG documentation | ✅ Done | — |
+
 ### Upgrade Tooling ✅
 
 | Item | Description | Status | Ref |
@@ -257,11 +269,65 @@ tests). The `topk_offset` catalog column was pre-provisioned in v0.2.1.
 | UG1 | Version mismatch check — scheduler warns if `.so` version ≠ SQL version | ✅ Done | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) §5.2 |
 | UG2 | FAQ upgrade section — 3 new entries with UPGRADING.md cross-links | ✅ Done | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) §5.4 |
 
+### IMMEDIATE Mode Parity ✅
+
+Close the gap between DIFFERENTIAL and IMMEDIATE mode SQL coverage for the
+two remaining high-risk patterns — recursive CTEs and TopK queries.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| IM1 | Validate recursive CTE semi-naive in IMMEDIATE mode; add stack-depth guard for deeply recursive defining queries | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.1 | ✅ Done — `check_for_delete_changes` handles `TransitionTable`; `generate_change_buffer_from` uses NEW transition table in IMMEDIATE mode; `ivm_recursive_max_depth` GUC (default 100) injects `__pgt_depth` counter into semi-naive SQL |
+| IM2 | TopK in IMMEDIATE mode: statement-level micro-refresh + `ivm_topk_max_limit` GUC | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.2 | ✅ Done — `apply_topk_micro_refresh()` in ivm.rs; GUC threshold check in api.rs; 10 E2E tests (basic, insert, delete, update, aggregate, offset, multi-DML, threshold rejection, mode switch) |
+
+> **IMMEDIATE parity subtotal: ✅ Complete (IM1 + IM2)**
+
+### Edge Case Hardening
+
+Self-contained items from Stage 7 of the edge-cases/TIVM implementation plan.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| EC1 | `pg_trickle.max_grouping_set_branches` GUC — cap CUBE/ROLLUP branch-count explosion | 4h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-02 |
+| EC2 | Post-restart CDC `TRANSITIONING` health check — detect stuck CDC transitions after crash or restart | 1d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-20 |
+| EC3 | Foreign table support: polling-based change detection via periodic re-execution | 2–3d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-05 |
+
+> **Edge-case hardening subtotal: ~3–5 days**
+
+### Documentation Sweep
+
+Remaining documentation gaps identified in Stage 7 of the gap analysis.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DS1 | DDL-during-refresh behaviour: document safe patterns and races | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-17 |
+| DS2 | Replication/standby limitations: document in FAQ and Architecture | 3h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-21/22/23 |
+| DS3 | PgBouncer configuration guide: session-mode requirements and known incompatibilities | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
+
+> **Documentation sweep subtotal: ~1 day**
+
+### WAL CDC Hardening
+
+> WAL decoder F2–F3 fixes (keyless pk_hash, `old_*` columns for UPDATE) landed in v0.1.3.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| W1 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W2 | WAL→trigger automatic fallback hardening | 4–6h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W3 | Promote `pg_trickle.cdc_mode = 'auto'` to default | ~1h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+
+> **WAL CDC subtotal: ~13–19 hours**
+
 **Exit criteria:**
 - [x] `ORDER BY + LIMIT + OFFSET` defining queries accepted, refreshed, and E2E-tested
 - [x] `sql/pg_trickle--0.2.1--0.2.2.sql` exists (column pre-provisioned in 0.2.1; function signature updates)
 - [ ] Upgrade completeness check passes for 0.2.1→0.2.2
 - [x] Version check fires at scheduler startup if `.so`/SQL versions diverge
+- [x] IMMEDIATE mode: recursive CTE semi-naive validated; `ivm_recursive_max_depth` depth guard added
+- [x] IMMEDIATE mode: TopK micro-refresh fully tested end-to-end (10 E2E tests)
+- [ ] `max_grouping_set_branches` GUC guards CUBE/ROLLUP explosion
+- [x] Post-restart CDC TRANSITIONING health check in place
+- [ ] DDL-during-refresh and standby/replication limitations documented
+- [x] WAL CDC mode passes full E2E suite
 - [ ] E2E tests pass (`just build-e2e-image && just test-e2e`)
 
 ---
@@ -269,8 +335,8 @@ tests). The `topk_offset` catalog column was pre-provisioned in v0.2.1.
 ## v0.3.0 — Correctness, Security & Operations
 
 **Goal:** Fix correctness gaps, harden security (RLS), validate partitioned
-sources, improve CDC reliability, and polish operational tooling. The extension
-is safe for pre-production use after this milestone.
+sources, and polish operational tooling. The extension is safe for
+pre-production use after this milestone.
 
 ### Non-Deterministic Function Handling
 
@@ -338,67 +404,13 @@ partitioned storage tables are deferred to a future release.
 
 > **Operational subtotal: ~9–12 hours**
 
-### IMMEDIATE Mode Parity
-
-Close the gap between DIFFERENTIAL and IMMEDIATE mode SQL coverage for the
-two remaining high-risk patterns — recursive CTEs and TopK queries.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| IM1 | Validate recursive CTE semi-naive in IMMEDIATE mode; add stack-depth guard for deeply recursive defining queries | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.1 | ✅ Done — `check_for_delete_changes` handles `TransitionTable`; `generate_change_buffer_from` uses NEW transition table in IMMEDIATE mode; `ivm_recursive_max_depth` GUC (default 100) injects `__pgt_depth` counter into semi-naive SQL |
-| IM2 | TopK in IMMEDIATE mode: statement-level micro-refresh + `ivm_topk_max_limit` GUC | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.2 |
-
-> **IMMEDIATE parity subtotal: IM1 complete; IM2 pending (~2–3 days)**
-
-### Edge Case Hardening
-
-Self-contained items from Stage 7 of the edge-cases/TIVM implementation plan.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| EC1 | `pg_trickle.max_grouping_set_branches` GUC — cap CUBE/ROLLUP branch-count explosion | 4h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-02 |
-| EC2 | Post-restart CDC `TRANSITIONING` health check — detect stuck CDC transitions after crash or restart | 1d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-20 |
-| EC3 | Foreign table support: polling-based change detection via periodic re-execution | 2–3d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-05 |
-
-> **Edge-case hardening subtotal: ~3–5 days**
-
-### Documentation Sweep
-
-Remaining documentation gaps identified in Stage 7 of the gap analysis.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| DS1 | DDL-during-refresh behaviour: document safe patterns and races | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-17 |
-| DS2 | Replication/standby limitations: document in FAQ and Architecture | 3h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-21/22/23 |
-| DS3 | PgBouncer configuration guide: session-mode requirements and known incompatibilities | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
-
-> **Documentation sweep subtotal: ~1 day**
-
-### WAL CDC Hardening
-
-> WAL decoder F2–F3 fixes (keyless pk_hash, `old_*` columns for UPDATE) landed in v0.1.3.
-
-| Item | Description | Effort | Status | Ref |
-|------|-------------|--------|--------|-----|
-| W1 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W2 | WAL→trigger automatic fallback hardening | 4–6h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W3 | Promote `pg_trickle.cdc_mode = 'auto'` to default | ~1h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-
-> **WAL CDC subtotal: ~13–19 hours**
-
-> **v0.3.0 total: ~120–170 hours**
+> **v0.3.0 total: ~75–115 hours**
 
 **Exit criteria:**
 - [ ] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
 - [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
 - [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
-- [x] WAL CDC mode passes full E2E suite
-- [x] IMMEDIATE mode: recursive CTE semi-naive validated; `ivm_recursive_max_depth` depth guard added
-- [ ] IMMEDIATE mode: TopK micro-refresh fully tested end-to-end
-- [ ] `max_grouping_set_branches` GUC guards CUBE/ROLLUP explosion
-- [x] Post-restart CDC TRANSITIONING health check in place
-- [ ] DDL-during-refresh and standby/replication limitations documented
 - [ ] Extension upgrade path tested (`0.2.x → 0.3.0`)
 - [ ] Zero P0/P1 gaps remaining
 
@@ -578,8 +590,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.1.x — Core engine + correctness | ~30h actual | 30h | ✅ Released |
 | v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Released |
 | v0.2.1 — Upgrade Infrastructure & Documentation | ~8h | 70–86h | ✅ Released |
-| v0.2.2 — OFFSET Support & Upgrade Tooling | ~5h | 75–91h | |
-| v0.3.0 — Correctness, Security & Operations | 120–170h | 195–261h | |
+| v0.2.2 — OFFSET Support, ALTER QUERY & Upgrade Tooling | ~50–70h | 120–156h | |
+| v0.3.0 — Correctness, Security & Operations | 75–115h | 195–271h | |
 | v0.4.0 — Backward Compatibility, Cloud & Scale | 200–280h | 395–541h | |
 | v0.5.0 — Observability & Integration | 14–21h | 409–562h | |
 | v1.0.0 — Stable release | 18–27h | 427–589h | |

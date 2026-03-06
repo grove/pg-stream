@@ -61,11 +61,12 @@
     {%- set current_info = dbt_pgtrickle.pgtrickle_get_stream_table_info(qualified_name) -%}
 
     {% if current_info and current_info.defining_query != defining_query %}
-      {# Query changed: must drop and recreate (no in-place ALTER for query) #}
-      {{ log("pg_trickle: query changed — dropping and recreating '" ~ qualified_name ~ "'", info=true) }}
-      {{ dbt_pgtrickle.pgtrickle_drop_stream_table(qualified_name) }}
-      {{ dbt_pgtrickle.pgtrickle_create_stream_table(
-           qualified_name, defining_query, schedule, refresh_mode, initialize
+      {# Query changed: use ALTER ... query => to migrate in place #}
+      {{ log("pg_trickle: query changed — altering '" ~ qualified_name ~ "' in place", info=true) }}
+      {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
+           qualified_name, schedule, refresh_mode,
+           status=status, current_info=current_info,
+           query=defining_query
          ) }}
     {% else %}
       {# Query unchanged: update schedule/mode/status if they differ.

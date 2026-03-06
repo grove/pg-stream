@@ -477,28 +477,31 @@ SELECT pgtrickle.alter_stream_table('order_totals', status => 'ACTIVE');
 
 ### Can I change the defining query of a stream table?
 
-Not directly — the defining query is fixed at creation time. To change it, you need to drop the existing stream table and create a new one with the updated query:
+Yes — use the `query` parameter of `alter_stream_table()`:
 
 ```sql
-SELECT pgtrickle.drop_stream_table('order_totals');
-SELECT pgtrickle.create_stream_table(
-    name         => 'order_totals',
-    query        => 'SELECT customer_id, SUM(amount) AS total, COUNT(*) AS order_count
-     FROM orders GROUP BY customer_id',  -- updated query
-    schedule     => '5m',
-    refresh_mode => 'DIFFERENTIAL'
-);
+SELECT pgtrickle.alter_stream_table('order_totals',
+    query => 'SELECT customer_id, SUM(amount) AS total, COUNT(*) AS order_count
+              FROM orders GROUP BY customer_id');
 ```
 
-The new stream table will perform a full initial refresh to populate itself. The original query is preserved in the catalog's `original_query` column for reference.
+The ALTER QUERY operation validates the new query, migrates the storage table schema if needed, updates catalog entries and source dependencies, and runs a full refresh — all within a single transaction. Concurrent readers see either the old data or the new data, never an empty table.
 
-### Why doesn't `alter_stream_table()` support changing the defining query?
+**Schema migration behavior:**
 
-`alter_stream_table()` lets you change operational parameters (schedule, refresh mode, status, diamond consistency) because those are metadata updates that don't affect the physical table or delta computation. But changing the defining query is fundamentally different — it requires rebuilding the `__pgt_row_id` hash computation, hidden auxiliary columns (`__pgt_count`, `__pgt_sum_x`), the DVM operator tree, the generated delta SQL, and the MERGE template. In practice, this means dropping the storage table and recreating it from scratch.
+| Schema change | Behavior |
+|---|---|
+| Same columns | Fast path — no storage DDL, just catalog update + full refresh |
+| Columns added or removed | Compatible migration via `ALTER TABLE ADD/DROP COLUMN` — storage table OID preserved |
+| Column type incompatible | Full rebuild — storage table dropped and recreated (OID changes, `WARNING` emitted) |
 
-In principle, `alter_stream_table()` could automate this by performing a drop + recreate under the hood. The reason it doesn't (yet) is that a query change is a destructive operation — it drops all indexes, user-defined triggers, and grants on the stream table. Making this explicit (separate `drop_stream_table` + `create_stream_table` calls) forces users to be aware of what they're losing and to re-apply any customizations afterward.
+You can also change the query and other parameters simultaneously:
 
-This may change in a future release — an `alter_stream_table(..., defining_query => '...')` that automates the drop-and-recreate cycle (with clear warnings about side effects) is a reasonable convenience improvement.
+```sql
+SELECT pgtrickle.alter_stream_table('order_totals',
+    query => 'SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id',
+    refresh_mode => 'FULL');
+```
 
 ### How do I trigger a manual refresh?
 

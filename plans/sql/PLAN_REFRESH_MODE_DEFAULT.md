@@ -285,7 +285,7 @@ propagate as before.
 Changed `default!(&str, "'DIFFERENTIAL'")` to `default!(&str, "'AUTO'")`.
 
 ### Step 4: Update SQL upgrade script
-**File:** `sql/pg_trickle--0.2.1--0.3.0.sql` (or current version)  
+**File:** `sql/pg_trickle--0.2.1--0.2.2.sql` (or current version)  
 **Status:** Deferred — no catalog migration needed since AUTO is never
 persisted. The new default only affects the pgrx-generated function
 signature, which is recreated on `CREATE EXTENSION` / `ALTER EXTENSION
