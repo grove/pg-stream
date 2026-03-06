@@ -225,3 +225,34 @@ pass — IMMEDIATE mode + `WITH RECURSIVE` — has been fully resolved:
 - E2E tests added: INSERT-only (semi-naive), DELETE (DRed), and depth guard.
 - Docs updated: SQL_REFERENCE.md, README.md, ROADMAP.md.
 
+**Task 5.2 landing (March 2026):**
+- `apply_topk_micro_refresh()` in `ivm.rs` materializes top-K into temp table,
+  DELETEs departed rows, INSERTs/UPDATEs new rows via INSERT ON CONFLICT.
+- `PGS_IVM_TOPK_MAX_LIMIT` GUC (default 1000) — queries exceeding this threshold
+  are rejected at stream table creation time with a clear error message.
+- Threshold validation added to `validate_and_parse_query()` in api.rs.
+- 10 E2E tests added to `e2e_topk_tests.rs`: basic creation, INSERT enters top-N,
+  INSERT below threshold (no change), DELETE expands window, UPDATE changes ranking,
+  multiple DML in transaction, aggregate TopK, OFFSET TopK, GUC threshold rejection,
+  mode switch from DIFFERENTIAL to IMMEDIATE.
+
+### Prioritized Remaining Work (v0.2.2)
+
+All IMMEDIATE mode parity items are complete. The remaining v0.2.2 roadmap
+items, in priority order:
+
+1. **Edge Case Hardening**
+   - EC1: `max_grouping_set_branches` GUC — cap CUBE/ROLLUP branch explosion (4h)
+   - EC2: Post-restart CDC TRANSITIONING health check (1d)
+   - EC3: Foreign table polling-based change detection (2–3d)
+
+2. **Documentation Sweep**
+   - DS1: DDL-during-refresh behaviour documentation (2h)
+   - DS2: Replication/standby limitations (3h)
+   - DS3: PgBouncer configuration guide (2h)
+
+3. **WAL CDC Hardening**
+   - W1: WAL mode E2E test suite (8–12h)
+   - W2: WAL→trigger automatic fallback hardening (4–6h)
+   - W3: Promote `cdc_mode = 'auto'` to recommended (~1h)
+

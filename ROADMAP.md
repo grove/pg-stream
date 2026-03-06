@@ -269,7 +269,7 @@ tests). The `topk_offset` catalog column was pre-provisioned in v0.2.1.
 | UG1 | Version mismatch check — scheduler warns if `.so` version ≠ SQL version | ✅ Done | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) §5.2 |
 | UG2 | FAQ upgrade section — 3 new entries with UPGRADING.md cross-links | ✅ Done | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) §5.4 |
 
-### IMMEDIATE Mode Parity
+### IMMEDIATE Mode Parity ✅
 
 Close the gap between DIFFERENTIAL and IMMEDIATE mode SQL coverage for the
 two remaining high-risk patterns — recursive CTEs and TopK queries.
@@ -277,9 +277,9 @@ two remaining high-risk patterns — recursive CTEs and TopK queries.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | IM1 | Validate recursive CTE semi-naive in IMMEDIATE mode; add stack-depth guard for deeply recursive defining queries | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.1 | ✅ Done — `check_for_delete_changes` handles `TransitionTable`; `generate_change_buffer_from` uses NEW transition table in IMMEDIATE mode; `ivm_recursive_max_depth` GUC (default 100) injects `__pgt_depth` counter into semi-naive SQL |
-| IM2 | TopK in IMMEDIATE mode: statement-level micro-refresh + `ivm_topk_max_limit` GUC | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.2 |
+| IM2 | TopK in IMMEDIATE mode: statement-level micro-refresh + `ivm_topk_max_limit` GUC | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.2 | ✅ Done — `apply_topk_micro_refresh()` in ivm.rs; GUC threshold check in api.rs; 10 E2E tests (basic, insert, delete, update, aggregate, offset, multi-DML, threshold rejection, mode switch) |
 
-> **IMMEDIATE parity subtotal: IM1 complete; IM2 pending (~2–3 days)**
+> **IMMEDIATE parity subtotal: ✅ Complete (IM1 + IM2)**
 
 ### Edge Case Hardening
 
@@ -323,7 +323,7 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 - [ ] Upgrade completeness check passes for 0.2.1→0.2.2
 - [x] Version check fires at scheduler startup if `.so`/SQL versions diverge
 - [x] IMMEDIATE mode: recursive CTE semi-naive validated; `ivm_recursive_max_depth` depth guard added
-- [ ] IMMEDIATE mode: TopK micro-refresh fully tested end-to-end
+- [x] IMMEDIATE mode: TopK micro-refresh fully tested end-to-end (10 E2E tests)
 - [ ] `max_grouping_set_branches` GUC guards CUBE/ROLLUP explosion
 - [ ] Post-restart CDC TRANSITIONING health check in place
 - [ ] DDL-during-refresh and standby/replication limitations documented
