@@ -25,7 +25,7 @@ troubleshooting. Use the table of contents below to jump to a specific topic.
 - [Tables Without Primary Keys](#tables-without-primary-keys) — Content-based row identity
 
 **Internals & architecture**
-- [Change Data Capture (CDC)](#change-data-capture-cdc) — Triggers, WAL transition, why `auto` is not the default, change buffers
+- [Change Data Capture (CDC)](#change-data-capture-cdc) — Triggers, WAL transition, why `auto` is the default, change buffers
 - [Diamond Dependencies & DAG Scheduling](#diamond-dependencies--dag-scheduling) — Topological ordering, atomic groups
 - [Schema Changes & DDL Events](#schema-changes--ddl-events) — Reinitialize, event triggers
 
@@ -1177,45 +1177,43 @@ Because these are independent concerns, you can freely add, modify, or remove tr
 
 A trigger added between two refresh cycles will simply be picked up on the next cycle. The only (theoretical) edge case is adding a trigger in the tiny window *during* a single refresh transaction, between the trigger-detection check and the MERGE execution — but since both happen within the same transaction, this is virtually impossible in practice.
 
-### Why does pg_trickle default to triggers instead of logical replication?
+### Why does pg_trickle use triggers instead of logical replication for initial CDC?
 
-pg_trickle defaults to row-level AFTER triggers because they provide **single-transaction atomicity** — the change record is written in the same transaction as the source DML, so: 
+pg_trickle always bootstraps CDC with row-level AFTER triggers because they provide **single-transaction atomicity** — the change record is written in the same transaction as the source DML, so: 
 
 1. **No commit-order ambiguity.** The change buffer always reflects committed data; rolled-back transactions never produce partial change records.
-2. **No replication slot management.** Logical replication requires creating and monitoring replication slots, which can bloat WAL if the subscriber falls behind. Triggers have no WAL retention side effects.
-3. **Works on all hosting providers.** Some managed PostgreSQL services restrict `wal_level = logical` or limit the number of replication slots. Triggers work everywhere, with no configuration changes.
-4. **Simpler deployment.** No need for `wal_level = logical`, no publication/subscription setup, and no extra connections for WAL senders.
+2. **No replication slot management at creation time.** Logical replication requires creating and monitoring replication slots, which can bloat WAL if the subscriber falls behind. Trigger-based bootstrap avoids this complexity.
+3. **Works on all hosting providers.** Some managed PostgreSQL services restrict `wal_level = logical` or limit the number of replication slots. Trigger bootstrap works everywhere, with no configuration changes.
+4. **Simpler initial deployment.** No need for `wal_level = logical`, no publication/subscription setup, and no extra connections for WAL senders.
 
-The trade-off is slightly higher per-row latency (~20–55 μs) compared to WAL decoding (~5–15 μs). For high-throughput workloads, pg_trickle supports an automatic transition to WAL-based CDC via `pg_trickle.cdc_mode = 'auto'`. See ADR-001 and ADR-002 in the architecture documentation for the full rationale.
+With `pg_trickle.cdc_mode = 'auto'` (the default since v0.3.0), pg_trickle uses triggers initially and then transparently transitions to WAL-based CDC if `wal_level = logical` is available. If WAL is not available, triggers are kept permanently — no degradation, no errors. Set `pg_trickle.cdc_mode = 'trigger'` if you want to disable WAL transitions entirely. See ADR-001 and ADR-002 in the architecture documentation for the full rationale.
 
-### Why is `auto` not the default `pg_trickle.cdc_mode`?
+### Why is `auto` the default `pg_trickle.cdc_mode`?
 
-`auto` mode (hybrid CDC: trigger bootstrap → WAL steady-state) is powerful, but making it the default would cause more problems than it solves on a typical PostgreSQL install. The `trigger` default was chosen because it is safe, deterministic, and works everywhere without any preconditions.
+As of v0.3.0, `auto` is the default CDC mode. This was changed from `trigger` based on the following considerations:
 
-Here are the specific reasons `auto` is not the default:
+**1. Safe no-op on standard installs.**
+PostgreSQL ships with `wal_level = replica` by default. In this configuration, `auto` simply stays on trigger-based CDC permanently — it does not create replication slots, publications, or any WAL infrastructure. There is no error, warning, or user-visible difference from the old `trigger` default. `auto` only activates the WAL transition path when `wal_level = logical` is explicitly configured by the operator.
 
-**1. Silent failure on the majority of installs.**
-PostgreSQL ships with `wal_level = replica` by default. `auto` mode requires `wal_level = logical` before it can create a replication slot and transition a table to WAL capture. On a standard install, `auto` would silently remain stuck in `TRIGGER` mode indefinitely — producing no error, no warning, and no visible indication that the intended WAL transition never happened. Users would believe they had WAL-based CDC when they actually had trigger-based CDC.
+**2. Automatic fallback hardening.**
+The WAL transition and steady-state polling now include robust automatic fallback:
+- Consecutive poll errors (5 failures) trigger automatic revert to triggers.
+- `check_decoder_health()` validates slot existence, WAL lag, and `wal_level` on every tick.
+- The `TRANSITIONING` phase has a progressive timeout with informative warnings.
+- Post-restart health checks (`check_cdc_transition_health()`) automatically clean up stale transitions.
 
-**2. Unexpected replication slot creation.**
-When conditions are finally met, `auto` creates a logical replication slot (`pg_trickle_slot_<oid>`). Replication slots prevent WAL segment recycling: if your pg_trickle worker falls behind, pauses, or crashes, the slot causes WAL to accumulate on disk. On a busy server this can exhaust disk space and bring the entire cluster down. This risk is significant enough that it should always be explicitly opted into, not imposed by default.
+**3. Zero overhead for trigger-only deployments.**
+When `wal_level != logical`, the `auto` scheduler branch takes a fast-path exit after a single GUC check and `pg_replication_slots` query. The overhead compared to `trigger` mode is negligible (<1 ms per scheduler tick).
 
-**3. Managed PostgreSQL incompatibility.**
-Many managed hosting providers (AWS RDS, Azure Database for PostgreSQL, Supabase, Neon, etc.) either restrict `wal_level = logical`, cap the number of replication slots, or both. Making `auto` the default would mean pg_trickle is broken-by-default on a large share of real-world deployment targets.
+**4. Progressive optimisation without config changes.**
+When an operator later enables `wal_level = logical` (e.g., for other replication needs), pg_trickle automatically benefits from lower per-row CDC overhead (~5–15 μs vs ~20–55 μs) without any configuration change. This aligns with the principle of least surprise.
 
-**4. REPLICA IDENTITY requirement for keyless tables.**
-WAL-based capture (used in the WAL phase of `auto`) requires `REPLICA IDENTITY FULL` on source tables that lack a primary key, so that the WAL decoder can reconstruct the full old row for UPDATE and DELETE events. Trigger-mode CDC does not have this requirement because it accesses `OLD` and `NEW` directly in the trigger function. Making `auto` the default would silently break CDC for any keyless table that doesn't have `REPLICA IDENTITY FULL` set.
+**When to use `trigger` instead:** Set `pg_trickle.cdc_mode = 'trigger'` if you want fully deterministic trigger-only behaviour, need to minimize any replication slot management, or are on a restricted managed PostgreSQL that caps replication slots. This reverts to the pre-v0.3.0 default.
 
-**5. Non-deterministic, environment-dependent behaviour.**
-The same `pg_trickle.cdc_mode = 'auto'` configuration produces fundamentally different runtime behaviour depending on whether `wal_level = logical` is set. A configuration that works correctly in production might behave differently in staging, CI, or on a developer laptop — and vice versa. The `trigger` default is fully deterministic: it works the same way everywhere.
-
-**6. Increased operational surface.**
-Once a table transitions to WAL mode, operators must monitor replication slot lag (`pgtrickle.pg_trickle_monitor()` → `lag_bytes`), slot invalidation events, and WAL retention pressure — in addition to all the usual pg_trickle metrics. Trigger mode has no such operational overhead. Exposing this complexity to all users by default, even those whose workloads never need WAL-level throughput, is not a good trade-off.
-
-**7. Dual-capture window correctness risk.**
-The `TRANSITIONING` phase (where both triggers and WAL decoding capture changes simultaneously) relies on LSN-based deduplication to ensure each change is applied exactly once. This window is well-tested, but it is inherently more complex than pure trigger capture. If anything goes wrong during the transition — slot creation failure, timeout, crash — pg_trickle rolls back to triggers. Making this complexity active by default on every installation increases the blast radius of any edge case.
-
-**When to use `auto`:** Set `pg_trickle.cdc_mode = 'auto'` explicitly when you have high-throughput source tables (>10K writes/sec), `wal_level = logical` is confirmed, you're on self-hosted or fully-permissive managed PostgreSQL, and you're comfortable monitoring replication slot health. It is a deliberate performance optimisation, not a better default.
+**Caveats to be aware of in `auto` mode:**
+- Keyless tables (no PRIMARY KEY) stay on triggers permanently — WAL mode requires a PK for `pk_hash` computation.
+- Replication slots prevent WAL recycling: if the decoder falls behind, WAL accumulates. The health check warns at >1 GB lag.
+- The `TRANSITIONING` phase runs both trigger and WAL decoder simultaneously; LSN-based deduplication handles correctness. If anything goes wrong, the system rolls back to triggers.
 
 ### How does the trigger-to-WAL automatic transition work?
 

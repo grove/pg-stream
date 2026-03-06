@@ -309,11 +309,11 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 
 > WAL decoder F2–F3 fixes (keyless pk_hash, `old_*` columns for UPDATE) landed in v0.1.3.
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| W1 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W2 | WAL→trigger automatic fallback hardening | 4–6h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
-| W3 | Promote `pg_trickle.cdc_mode = 'auto'` to recommended | ~1h | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| W1 | WAL mode E2E test suite (parallel to trigger suite) | 8–12h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W2 | WAL→trigger automatic fallback hardening | 4–6h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
+| W3 | Promote `pg_trickle.cdc_mode = 'auto'` to default | ~1h | ✅ Done | [PLAN_HYBRID_CDC.md](plans/sql/PLAN_HYBRID_CDC.md) |
 
 > **WAL CDC subtotal: ~13–19 hours**
 
@@ -328,7 +328,7 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 - [x] Post-restart CDC TRANSITIONING health check in place
 - [x] Foreign table polling-based CDC implemented (3 E2E tests)
 - [ ] DDL-during-refresh and standby/replication limitations documented
-- [ ] WAL CDC mode passes full E2E suite
+- [x] WAL CDC mode passes full E2E suite
 - [ ] E2E tests pass (`just build-e2e-image && just test-e2e`)
 
 ---
