@@ -91,7 +91,7 @@ test-e2e-fast:
 # Package the extension for light-E2E tests (cargo pgrx package)
 [group: "test"]
 package-extension:
-    cargo pgrx package --pg-config "$(pg_config --bindir)/pg_config"
+    cargo pgrx package --pg-config "$(command -v pg_config 2>/dev/null || cargo pgrx info pg-config pg18 2>/dev/null || cat ~/.pgrx/config.toml | grep '^pg18' | cut -d'"' -f2)"
 
 # Run light-E2E tests (stock postgres container, no custom Docker image)
 # Only works on Linux — macOS produces .dylib that can't run in a Linux container.
