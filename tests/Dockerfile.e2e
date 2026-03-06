@@ -91,7 +91,9 @@ COPY --from=builder \
 # Append to postgresql.conf.sample which is the template for new clusters.
 RUN echo "" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "# pg_trickle E2E test configuration" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "shared_preload_libraries = 'pg_trickle'" >> /usr/share/postgresql/postgresql.conf.sample
+    echo "shared_preload_libraries = 'pg_trickle'" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample
 
 # Verify the extension files are in place
 RUN ls -la /usr/share/postgresql/18/extension/pg_trickle* && \
