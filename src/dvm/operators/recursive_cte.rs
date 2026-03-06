@@ -174,13 +174,49 @@ pub fn diff_recursive_cte(
 }
 
 /// Check if any of the given source tables have DELETE or UPDATE changes
-/// in the change buffer within the current frontier interval.
+/// within the current change interval.
+///
+/// For DIFFERENTIAL mode (`DeltaSource::ChangeBuffer`), queries the change
+/// buffer tables using LSN-range filtering.
+///
+/// For IMMEDIATE mode (`DeltaSource::TransitionTable`), checks whether the
+/// OLD transition table (`__pgt_oldtable_<oid>`) has any rows — its presence
+/// indicates that the triggering statement produced DELETE or UPDATE rows.
 fn check_for_delete_changes(
     ctx: &DiffContext,
     source_oids: &[u32],
 ) -> Result<bool, PgTrickleError> {
+    use crate::dvm::diff::DeltaSource;
     use pgrx::Spi;
 
+    // ── IMMEDIATE mode: inspect OLD transition tables ─────────────────
+    if let DeltaSource::TransitionTable { tables } = &ctx.delta_source {
+        for &oid in source_oids {
+            if let Some(tt) = tables.get(&oid)
+                && let Some(old_table) = &tt.old_name
+            {
+                // The OLD transition table exists when the triggering DML
+                // was a DELETE or UPDATE.  Check whether it has any rows
+                // (the table is always created but may be empty for
+                // no-op UPDATEs).
+                let check_sql = format!("SELECT EXISTS(SELECT 1 FROM {old_table} LIMIT 1)");
+                let has_rows: Option<bool> = Spi::connect(|client| {
+                    client
+                        .select(&check_sql, None, &[])
+                        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                        .first()
+                        .get::<bool>(1)
+                        .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+                })?;
+                if has_rows == Some(true) {
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(false);
+    }
+
+    // ── DIFFERENTIAL mode: query change buffer tables via LSN ─────────
     for &oid in source_oids {
         let change_table = format!("{}.changes_{}", quote_ident(&ctx.change_buffer_schema), oid,);
         let prev_lsn = ctx.prev_frontier.get_lsn(oid);
@@ -557,13 +593,13 @@ fn generate_semi_naive_ins_only(
     let delta_cte = ctx.next_cte_name(&format!("dred_ins_{alias}"));
 
     // Seed: base case delta INSERT rows only
-    let seed_from_base = format!(
+    let seed_from_base_raw = format!(
         "SELECT {col_list_str} FROM {base_cte} WHERE __pgt_action = 'I'",
         base_cte = base_delta.cte_name,
     );
 
     // Seed from existing storage (new rows joining ST storage)
-    let seed_from_existing = generate_seed_from_existing(ctx, recursive, &st_table, columns)?;
+    let seed_from_existing_raw = generate_seed_from_existing(ctx, recursive, &st_table, columns)?;
 
     // Non-linear seeds for multiple self-reference positions
     let self_ref_aliases = collect_self_ref_aliases(recursive);
@@ -575,8 +611,34 @@ fn generate_semi_naive_ins_only(
         columns,
     )?;
 
-    // Propagation through recursive term
-    let propagation = generate_query_sql(recursive, Some(&delta_cte))?;
+    // ── Depth guard (IMMEDIATE mode only) ────────────────────────────
+    use crate::dvm::diff::DeltaSource;
+    let max_depth = if matches!(ctx.delta_source, DeltaSource::TransitionTable { .. }) {
+        crate::config::pg_trickle_ivm_recursive_max_depth()
+    } else {
+        None
+    };
+
+    let (seed_from_base, seed_from_existing, propagation) = if let Some(depth_limit) = max_depth {
+        let depth_seed_suffix = ", 0::int AS __pgt_depth";
+        let sb = format!("{seed_from_base_raw}{depth_seed_suffix}");
+        let se = seed_from_existing_raw.map(|s| format!("{s}{depth_seed_suffix}"));
+        let prop = match try_generate_propagation_with_depth(recursive, &delta_cte, depth_limit)? {
+            Some(sql) => sql,
+            None => {
+                pgrx::debug1!(
+                    "[pg_trickle] recursive CTE '{}' (DRed ins): depth guard not supported \
+                     for this recursive term pattern.",
+                    alias,
+                );
+                generate_query_sql(recursive, Some(&delta_cte))?
+            }
+        };
+        (sb, se, prop)
+    } else {
+        let prop = generate_query_sql(recursive, Some(&delta_cte))?;
+        (seed_from_base_raw, seed_from_existing_raw, prop)
+    };
 
     let mut parts = vec![seed_from_base];
     if let Some(existing_seed) = seed_from_existing {
@@ -588,7 +650,8 @@ fn generate_semi_naive_ins_only(
 
     ctx.add_recursive_cte(delta_cte.clone(), recursive_sql);
 
-    // Wrap with __pgt_row_id and __pgt_action = 'I'
+    // Wrap with __pgt_row_id and __pgt_action = 'I'.
+    // Explicitly select only user columns so __pgt_depth is excluded.
     let ins_final_cte = ctx.next_cte_name(&format!("dred_ifin_{alias}"));
     let ins_final_sql = format!(
         "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
@@ -767,6 +830,109 @@ fn collect_cascade_cols(op: &OpTree, out: &mut Vec<String>) {
     }
 }
 
+/// Try to generate depth-guarded propagation SQL for the semi-naive recursive step.
+///
+/// When `max_depth` is active in IMMEDIATE mode, the propagation term of the
+/// recursive delta CTE must:
+/// 1. Carry a `__pgt_depth` counter (incremented from the self-reference row).
+/// 2. Guard via `WHERE {sr_alias}.__pgt_depth < max_depth`.
+///
+/// Handles the common patterns for a recursive CTE's recursive term:
+/// - `Project { child: InnerJoin/LeftJoin { ..., RecursiveSelfRef } }`
+/// - `Filter { child: Project { child: InnerJoin/LeftJoin { ..., RecursiveSelfRef } } }`
+///
+/// Returns `Ok(Some(sql))` on success, `Ok(None)` if the pattern is not
+/// recognised (caller falls back to depth-unguarded propagation).
+fn try_generate_propagation_with_depth(
+    op: &OpTree,
+    delta_cte: &str,
+    max_depth: i32,
+) -> Result<Option<String>, PgTrickleError> {
+    // Peel off an optional outer Filter wrapper.
+    let (filter_pred, inner) = match op {
+        OpTree::Filter { predicate, child } => (Some(predicate.to_sql()), child.as_ref()),
+        other => (None, other),
+    };
+
+    // Expect Project over InnerJoin or LeftJoin.
+    let (proj_exprs, proj_aliases, join_cond, left, right, is_left_join) = match inner {
+        OpTree::Project {
+            expressions,
+            aliases,
+            child,
+        } => match child.as_ref() {
+            OpTree::InnerJoin {
+                condition,
+                left,
+                right,
+            } => (
+                expressions,
+                aliases,
+                condition,
+                left.as_ref(),
+                right.as_ref(),
+                false,
+            ),
+            OpTree::LeftJoin {
+                condition,
+                left,
+                right,
+            } => (
+                expressions,
+                aliases,
+                condition,
+                left.as_ref(),
+                right.as_ref(),
+                true,
+            ),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    // Identify which join side is the RecursiveSelfRef and get its alias.
+    let sr_alias = match (left, right) {
+        (_, OpTree::RecursiveSelfRef { alias, .. }) => alias.as_str(),
+        (OpTree::RecursiveSelfRef { alias, .. }, _) => alias.as_str(),
+        _ => return Ok(None),
+    };
+    let sr_alias_q = quote_ident(sr_alias);
+
+    // Generate FROM clause fragments.
+    let left_from = generate_from_sql(left, Some(delta_cte))?;
+    let right_from = generate_from_sql(right, Some(delta_cte))?;
+
+    // Build projected columns WITH depth increment from the self-ref.
+    let mut result_exprs: Vec<String> = proj_exprs
+        .iter()
+        .zip(proj_aliases.iter())
+        .map(|(e, a)| {
+            let esql = e.to_sql();
+            if esql == *a {
+                quote_ident(a)
+            } else {
+                format!("{esql} AS {}", quote_ident(a))
+            }
+        })
+        .collect();
+    result_exprs.push(format!("{sr_alias_q}.__pgt_depth + 1 AS __pgt_depth"));
+
+    let join_kw = if is_left_join { "LEFT JOIN" } else { "JOIN" };
+
+    let mut sql = format!(
+        "SELECT {projs}\nFROM {left_from}\n{join_kw} {right_from}\n  ON {cond}\nWHERE {sr_alias_q}.__pgt_depth < {max_depth}",
+        projs = result_exprs.join(", "),
+        cond = join_cond.to_sql(),
+    );
+
+    // Re-wrap with the outer filter if present.
+    if let Some(pred) = filter_pred {
+        sql = format!("SELECT * FROM (\n{sql}\n) __flt\nWHERE {pred}");
+    }
+
+    Ok(Some(sql))
+}
+
 /// Generate the semi-naive delta for INSERT-only changes.
 ///
 /// Builds a `WITH RECURSIVE` delta query that:
@@ -821,11 +987,89 @@ fn generate_semi_naive_delta(
         columns,
     )?;
 
-    // Generate the propagation SQL: recursive term with self_ref = delta_cte
-    let propagation = generate_query_sql(recursive, Some(&delta_cte))?;
+    // ── Depth guard (IMMEDIATE mode only) ────────────────────────────
+    //
+    // In IMMEDIATE mode (TransitionTable delta source), inject a
+    // `__pgt_depth` counter into seeds (0) and propagation (depth+1)
+    // to prevent infinite loops from cyclic data.  Bounded by the
+    // `pg_trickle.ivm_recursive_max_depth` GUC.
+    use crate::dvm::diff::DeltaSource;
+    let max_depth = if matches!(ctx.delta_source, DeltaSource::TransitionTable { .. }) {
+        crate::config::pg_trickle_ivm_recursive_max_depth()
+    } else {
+        None
+    };
 
+    let (seed_from_base, seed_from_existing, propagation) = if let Some(depth_limit) = max_depth {
+        // Append `, 0::int AS __pgt_depth` to all seeds.
+        let depth_seed_suffix = ", 0::int AS __pgt_depth";
+        let seeded_from_base = format!("{seed_from_base}{depth_seed_suffix}");
+
+        // Generate depth-guarded propagation SQL.
+        let prop = match try_generate_propagation_with_depth(recursive, &delta_cte, depth_limit)? {
+            Some(sql) => sql,
+            None => {
+                // Pattern not recognised — fall back to depth-unguarded propagation
+                // and strip the depth column from seeds to keep column counts consistent.
+                pgrx::debug1!(
+                    "[pg_trickle] recursive CTE '{}': depth guard not supported for this \
+                     recursive term pattern; proceeding without depth limit.",
+                    alias,
+                );
+                let prop_plain = generate_query_sql(recursive, Some(&delta_cte))?;
+                return build_semi_naive_result(
+                    ctx,
+                    alias,
+                    columns,
+                    &col_list_str,
+                    &delta_cte,
+                    seed_from_base,
+                    seed_from_existing,
+                    nonlinear_seeds,
+                    prop_plain,
+                );
+            }
+        };
+
+        // Only reach here when depth-guarded propagation succeeded — safe to
+        // consume seed_from_existing now.
+        let seeded_from_existing = seed_from_existing.map(|s| format!("{s}{depth_seed_suffix}"));
+
+        (seeded_from_base, seeded_from_existing, prop)
+    } else {
+        // Depth guard disabled — plain propagation.
+        let prop = generate_query_sql(recursive, Some(&delta_cte))?;
+        (seed_from_base, seed_from_existing, prop)
+    };
+
+    build_semi_naive_result(
+        ctx,
+        alias,
+        columns,
+        &col_list_str,
+        &delta_cte,
+        seed_from_base,
+        seed_from_existing,
+        nonlinear_seeds,
+        propagation,
+    )
+}
+
+/// Assemble the recursive delta CTE and final wrapper CTE from the
+/// pre-built parts generated by `generate_semi_naive_delta`.
+#[allow(clippy::too_many_arguments)]
+fn build_semi_naive_result(
+    ctx: &mut DiffContext,
+    alias: &str,
+    columns: &[String],
+    col_list_str: &str,
+    delta_cte: &str,
+    seed_from_base: String,
+    seed_from_existing: Option<String>,
+    nonlinear_seeds: Vec<String>,
+    propagation: String,
+) -> Result<DiffResult, PgTrickleError> {
     // Build the complete recursive delta CTE.
-    // Combine all seeds (base delta + existing storage + non-linear) with propagation.
     let mut parts = vec![seed_from_base];
     if let Some(existing_seed) = seed_from_existing {
         parts.push(existing_seed);
@@ -834,13 +1078,12 @@ fn generate_semi_naive_delta(
     parts.push(propagation);
     let recursive_sql = parts.join("\nUNION ALL\n");
 
-    // We need to register this as a RECURSIVE CTE in the WITH clause.
-    // The DiffContext's add_cte treats it as a normal CTE, but we need
-    // the WITH RECURSIVE keyword. We'll mark it specially.
-    ctx.add_recursive_cte(delta_cte.clone(), recursive_sql);
+    ctx.add_recursive_cte(delta_cte.to_string(), recursive_sql);
 
-    // Wrap with __pgt_row_id and __pgt_action
-    let final_cte = ctx.next_cte_name(&format!("rc_final_{alias}"));
+    // Wrap with __pgt_row_id and __pgt_action.
+    // The final SELECT explicitly picks only the user columns from delta_cte,
+    // dropping the hidden __pgt_depth counter column when it is present.
+    let final_cte_name = ctx.next_cte_name(&format!("rc_final_{alias}"));
     let final_sql = format!(
         "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
                 row_number() OVER ()::text) AS __pgt_row_id,\n\
@@ -848,10 +1091,10 @@ fn generate_semi_naive_delta(
                {col_list_str}\n\
          FROM {delta_cte} sub",
     );
-    ctx.add_cte(final_cte.clone(), final_sql);
+    ctx.add_cte(final_cte_name.clone(), final_sql);
 
     Ok(DiffResult {
-        cte_name: final_cte,
+        cte_name: final_cte_name,
         columns: columns.to_vec(),
         is_deduplicated: false,
     })
@@ -1230,13 +1473,23 @@ fn generate_query_sql_with_change_buffers(
     }
 }
 
-/// Generate a FROM-clause fragment that reads INSERTs from the change
-/// buffer for Scan nodes, or references st_table for RecursiveSelfRef.
+/// Generate a FROM-clause fragment that reads INSERT-only rows from the
+/// appropriate source for Scan nodes, or references st_table for
+/// RecursiveSelfRef.
+///
+/// In DIFFERENTIAL mode, reads INSERT rows from the change buffer table
+/// (filtering by action = 'I' and LSN range).
+///
+/// In IMMEDIATE mode, reads from the NEW transition table
+/// (`__pgt_newtable_<oid>`), which has the same schema as the source
+/// table and contains only the newly inserted/updated rows.
 fn generate_change_buffer_from(
     ctx: &DiffContext,
     op: &OpTree,
     st_table: &str,
 ) -> Result<String, PgTrickleError> {
+    use crate::dvm::diff::DeltaSource;
+
     match op {
         OpTree::Scan {
             table_oid,
@@ -1244,6 +1497,43 @@ fn generate_change_buffer_from(
             columns,
             ..
         } => {
+            // ── IMMEDIATE mode: read from NEW transition table ────────
+            if let DeltaSource::TransitionTable { tables } = &ctx.delta_source {
+                if let Some(tt) = tables.get(table_oid)
+                    && let Some(new_table) = &tt.new_name
+                {
+                    // The transition table has the same schema as the
+                    // source table (created via `SELECT * FROM __pgt_newtable`).
+                    let col_refs: Vec<String> = columns
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "{alias_q}.{}",
+                                quote_ident(&c.name),
+                                alias_q = quote_ident(alias),
+                            )
+                        })
+                        .collect();
+                    return Ok(format!(
+                        "(SELECT {cols} FROM {new_table} AS {alias_q}) AS {alias_q}",
+                        cols = col_refs.join(", "),
+                        alias_q = quote_ident(alias),
+                    ));
+                }
+                // No NEW table for this OID — source had no inserts/updates.
+                // Return an empty relation with the correct columns.
+                let col_refs: Vec<String> = columns
+                    .iter()
+                    .map(|c| format!("NULL::text AS {}", quote_ident(&c.name)))
+                    .collect();
+                let alias_q = quote_ident(alias);
+                return Ok(format!(
+                    "(SELECT {cols} WHERE false) AS {alias_q}",
+                    cols = col_refs.join(", "),
+                ));
+            }
+
+            // ── DIFFERENTIAL mode: read INSERT rows from change buffer ──
             let change_table = format!(
                 "{}.changes_{}",
                 quote_ident(&ctx.change_buffer_schema),

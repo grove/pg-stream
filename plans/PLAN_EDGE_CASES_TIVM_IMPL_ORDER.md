@@ -150,15 +150,20 @@ until the engine is stable post-Stage 5.
 
 | # | Item | Effort | Status |
 |---|------|--------|--------|
-| 27 | **Part 2 Task 5.1 / EC-09** — Recursive CTEs in IMMEDIATE mode: validate semi-naive with `DeltaSource::TransitionTable`; add stack-depth guard | 2–3 days | ✅ Done — `check_immediate_support()` changed from rejection to warning; recursion into `base` + `recursive` fields validated |
+| 27 | **Part 2 Task 5.1 / EC-09** — Recursive CTEs in IMMEDIATE mode: validate semi-naive with `DeltaSource::TransitionTable`; add stack-depth guard | 2–3 days | ✅ Done — `check_for_delete_changes()` extended for `TransitionTable` (OLD transition table row check); `generate_change_buffer_from()` uses `__pgt_newtable_<oid>` in IMMEDIATE context; `PGS_IVM_RECURSIVE_MAX_DEPTH` GUC (default 100) injects `__pgt_depth` counter + guard into semi-naive SQL via `try_generate_propagation_with_depth()`; `build_semi_naive_result()` helper extracts shared logic; warning updated to reference GUC |
 | 28 | **Part 2 Task 5.2 / EC-09** — TopK in IMMEDIATE mode: statement-level micro-refresh; `ivm_topk_max_limit` GUC | 2–3 days | ✅ Done — `apply_topk_micro_refresh()` in ivm.rs; `PGS_IVM_TOPK_MAX_LIMIT` GUC (default 1000); threshold check in api.rs |
 
 **Completion gate:** `just test-all` green + dedicated IMMEDIATE + recursive CTE E2E test passing.
 
-**Stage 6 is COMPLETE.** Both IMMEDIATE mode parity items are implemented:
-- Task 5.1: RecursiveCte no longer rejected in `check_immediate_support()`. A warning
-  is emitted about potential stack-depth issues. The semi-naive evaluation path with
-  transition tables proceeds as normal.
+**Stage 6 is COMPLETE.** Both IMMEDIATE mode parity items are fully implemented:
+- Task 5.1 (fully landed): `check_for_delete_changes()` inspects OLD transition
+  table rows (not change buffer) in IMMEDIATE mode to correctly select DRed vs
+  semi-naive. `generate_change_buffer_from()` reads from `__pgt_newtable_<oid>`
+  (same schema as source table) instead of change buffer INSERT rows. Depth guard
+  GUC `pg_trickle.ivm_recursive_max_depth` (default 100) injects `__pgt_depth`
+  counter into seeds and a `WHERE depth < max` guard into propagation SQL for
+  IMMEDIATE mode via `try_generate_propagation_with_depth()`.  Logic extracted into
+  `build_semi_naive_result()` helper shared by both semi-naive and DRed paths.
 - Task 5.2: `apply_topk_micro_refresh()` added to `ivm.rs` — materializes top-K into
   a temp table, then applies DELETE + INSERT ON CONFLICT to update the stream table.
   Bounded by `pg_trickle.ivm_topk_max_limit` GUC (default 1000); queries above the
@@ -205,11 +210,18 @@ until the engine is stable post-Stage 5.
 
 ## Prioritized Remaining Work
 
-All seven stages are complete. No items remain.
+All seven stages are now complete.  The one item that needed a full correctness
+pass — IMMEDIATE mode + `WITH RECURSIVE` — has been fully resolved:
 
-**Task 2.3 — ROWS FROM()** was the last deferred item and is now implemented:
-- `rewrite_rows_from()` in `src/dvm/parser.rs` (auto-rewrite pass)
-- All-unnest optimisation: `ROWS FROM(unnest(A), unnest(B))` → `unnest(A, B)`
-- General case: ordinal-based LEFT JOIN LATERAL chain with `generate_series` +
-  `row_number() OVER ()`
-- 7 E2E tests in `tests/e2e_rows_from_tests.rs`
+**Task 5.1 landing (March 2026):**
+- `check_for_delete_changes()` now inspects OLD transition table rows in IMMEDIATE
+  mode, correctly routing DELETE/UPDATE triggers to the DRed strategy.
+- `generate_change_buffer_from()` uses `__pgt_newtable_<oid>` (same schema as source)
+  in IMMEDIATE mode, fixing the "seed from existing storage" step.
+- `PGS_IVM_RECURSIVE_MAX_DEPTH` GUC (default 100) adds a depth counter and guard to
+  the generated semi-naive SQL via `try_generate_propagation_with_depth()`.
+- `build_semi_naive_result()` helper DRYs up both the semi-naive and DRed insert
+  propagation paths.
+- E2E tests added: INSERT-only (semi-naive), DELETE (DRed), and depth guard.
+- Docs updated: SQL_REFERENCE.md, README.md, ROADMAP.md.
+

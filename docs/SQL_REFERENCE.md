@@ -1542,14 +1542,27 @@ The `'IMMEDIATE'` refresh mode supports nearly all SQL constructs supported by `
 - `LATERAL` set-returning functions (`unnest()`, `jsonb_array_elements()`, etc.)
 - Scalar subqueries in `SELECT`
 - Cascading IMMEDIATE stream tables (ST depending on another IMMEDIATE ST)
+- Recursive CTEs (`WITH RECURSIVE`) — uses semi-naive evaluation (INSERT-only) or
+  Delete-and-Rederive (DELETE/UPDATE); bounded by `pg_trickle.ivm_recursive_max_depth`
+  (default 100) to guard against infinite loops from cyclic data
 
-**Not yet supported in IMMEDIATE mode** (use `'DIFFERENTIAL'` instead):
+**Not yet supported in IMMEDIATE mode:**
 
-| Construct | Reason |
-|-----------|--------|
-| Recursive CTEs (`WITH RECURSIVE`) | Semi-naive evaluation with fixpoint iteration not yet validated with transition tables |
+None — all constructs that work in `'DIFFERENTIAL'` mode are now also available in
+`'IMMEDIATE'` mode.
 
-Attempting to create or switch to IMMEDIATE mode with an unsupported construct produces a clear error message suggesting `'DIFFERENTIAL'` mode.
+**Notes on `WITH RECURSIVE` in IMMEDIATE mode:**
+
+- A `__pgt_depth` counter is injected into the generated semi-naive SQL.  Propagation
+  stops when the counter reaches `ivm_recursive_max_depth` (default 100).  Raise this
+  GUC for deeper hierarchies or set it to 0 to disable the guard.
+- A WARNING is emitted at stream table creation time reminding operators to monitor
+  for `stack depth limit exceeded` errors on very deep hierarchies.
+- Non-linear recursion (multiple self-references) is rejected — PostgreSQL itself
+  enforces this restriction.
+
+Attempting to create a stream table with an unsupported construct produces a clear
+error message.
 
 ### Logical Replication Targets
 

@@ -252,7 +252,6 @@ The following SQL features are **rejected with clear error messages** explaining
 | Window functions in expressions | Window functions inside `CASE`, `COALESCE`, arithmetic, etc. cannot be differentially maintained | Move window function to a separate column |
 | `LIMIT` / `OFFSET` without `ORDER BY` | Stream tables materialize the full result set; arbitrary row subsets are non-deterministic | Use `ORDER BY ... LIMIT N` for TopK, or apply LIMIT when querying the stream table |
 | `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
-| Recursive CTEs in IMMEDIATE mode | Semi-naive fixpoint iteration not validated with transition tables | Use DIFFERENTIAL mode for recursive CTEs |
 
 ### Stream Table Restrictions
 
@@ -296,6 +295,8 @@ When `refresh_mode = 'IMMEDIATE'`, the stream table is maintained **within the s
 4. The delta is applied to the stream table via DELETE + INSERT ON CONFLICT.
 
 No change buffer tables, no scheduler, no WAL infrastructure. The stream table is always up-to-date within the current transaction.
+
+Supported SQL features include all DIFFERENTIAL-mode constructs: JOINs, aggregates, window functions, LATERAL, scalar subqueries, `WITH RECURSIVE`, and more. `WITH RECURSIVE` uses semi-naive evaluation (INSERT-only) or Delete-and-Rederive (DELETE/UPDATE) and is bounded by `pg_trickle.ivm_recursive_max_depth` (default 100).
 
 ## Architecture
 

@@ -127,6 +127,18 @@ pub static PGS_MAX_GROUPING_SET_BRANCHES: GucSetting<i32> = GucSetting::<i32>::n
 /// latency to the trigger path. Set to 0 to disable TopK in IMMEDIATE mode.
 pub static PGS_IVM_TOPK_MAX_LIMIT: GucSetting<i32> = GucSetting::<i32>::new(1000);
 
+/// Maximum recursion depth for `WITH RECURSIVE` CTEs in IMMEDIATE mode.
+///
+/// The semi-naive delta query generated for an IMMEDIATE-mode recursive
+/// CTE includes a `__pgt_depth` counter.  Propagation stops when this
+/// counter reaches the configured limit, preventing infinite loops caused
+/// by cyclic data or deeply recursive hierarchies that would otherwise
+/// exhaust PostgreSQL's `max_stack_depth` inside a trigger body.
+///
+/// Set to 0 to disable the depth guard (allow unlimited recursion).
+/// The default (100) is sufficient for virtually all practical hierarchies.
+pub static PGS_IVM_RECURSIVE_MAX_DEPTH: GucSetting<i32> = GucSetting::<i32>::new(100);
+
 /// Buffer table partitioning mode (Task 3.3).
 ///
 /// Controls whether change buffer tables use `PARTITION BY RANGE (lsn)`:
@@ -359,6 +371,19 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_int_guc(
+        c"pg_trickle.ivm_recursive_max_depth",
+        c"Maximum recursion depth for WITH RECURSIVE CTEs in IMMEDIATE mode.",
+        c"Limits the depth counter injected into semi-naive delta queries to guard \
+           against infinite loops from cyclic data or very deep hierarchies inside \
+           trigger bodies. Set to 0 to disable the guard (allow unlimited recursion).",
+        &PGS_IVM_RECURSIVE_MAX_DEPTH,
+        0,
+        100_000,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_string_guc(
         c"pg_trickle.buffer_partitioning",
         c"Buffer table partitioning mode: off, on, or auto.",
@@ -490,4 +515,11 @@ pub fn pg_trickle_buffer_partitioning() -> String {
 /// Returns whether foreign table polling CDC is enabled.
 pub fn pg_trickle_foreign_table_polling() -> bool {
     PGS_FOREIGN_TABLE_POLLING.get()
+}
+
+/// Returns the maximum recursion depth for WITH RECURSIVE in IMMEDIATE mode.
+/// Returns `None` when the guard is disabled (value = 0).
+pub fn pg_trickle_ivm_recursive_max_depth() -> Option<i32> {
+    let v = PGS_IVM_RECURSIVE_MAX_DEPTH.get();
+    if v > 0 { Some(v) } else { None }
 }

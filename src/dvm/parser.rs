@@ -2752,8 +2752,10 @@ fn check_immediate_support(tree: &OpTree) -> Result<(), PgTrickleError> {
         } => {
             pgrx::warning!(
                 "pg_trickle: WITH RECURSIVE in IMMEDIATE mode uses semi-naive evaluation \
-                 inside the trigger. Deep recursion may approach PostgreSQL's max_stack_depth \
-                 limit. Monitor for 'stack depth limit exceeded' errors."
+                 inside the trigger.  A depth counter guards against infinite loops \
+                 (pg_trickle.ivm_recursive_max_depth, default 100).  For very deep \
+                 hierarchies, raise this GUC or watch for \
+                 'stack depth limit exceeded' errors."
             );
             check_immediate_support(base)?;
             check_immediate_support(recursive)

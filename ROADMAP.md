@@ -345,10 +345,10 @@ two remaining high-risk patterns — recursive CTEs and TopK queries.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| IM1 | Validate recursive CTE semi-naive in IMMEDIATE mode; add stack-depth guard for deeply recursive defining queries | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.1 |
+| IM1 | Validate recursive CTE semi-naive in IMMEDIATE mode; add stack-depth guard for deeply recursive defining queries | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.1 | ✅ Done — `check_for_delete_changes` handles `TransitionTable`; `generate_change_buffer_from` uses NEW transition table in IMMEDIATE mode; `ivm_recursive_max_depth` GUC (default 100) injects `__pgt_depth` counter into semi-naive SQL |
 | IM2 | TopK in IMMEDIATE mode: statement-level micro-refresh + `ivm_topk_max_limit` GUC | 2–3d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 6 §5.2 |
 
-> **IMMEDIATE parity subtotal: ~4–6 days** (IM1 must land before IM2)
+> **IMMEDIATE parity subtotal: IM1 complete; IM2 pending (~2–3 days)**
 
 ### Edge Case Hardening
 
@@ -394,7 +394,8 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 - [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
 - [ ] WAL CDC mode passes full E2E suite
-- [ ] IMMEDIATE mode: recursive CTE semi-naive validated; TopK micro-refresh implemented
+- [x] IMMEDIATE mode: recursive CTE semi-naive validated; `ivm_recursive_max_depth` depth guard added
+- [ ] IMMEDIATE mode: TopK micro-refresh fully tested end-to-end
 - [ ] `max_grouping_set_branches` GUC guards CUBE/ROLLUP explosion
 - [ ] Post-restart CDC TRANSITIONING health check in place
 - [ ] DDL-during-refresh and standby/replication limitations documented
