@@ -365,6 +365,7 @@ Key lifecycle properties:
 | **Config reload** | Handles `SIGHUP` — re-reads GUC values on the next latch wake |
 | **Crash recovery** | On startup, any `pgt_refresh_history` rows stuck in `RUNNING` status are marked `FAILED` (the transaction that wrote them was rolled back by PostgreSQL, but the status row may have been committed in a prior transaction) |
 | **Database** | Connects to the `postgres` database via SPI |
+| **Standby / replica** | On standby servers (`pg_is_in_recovery() = true`), the worker enters a sleep loop and does **not** attempt refreshes. Stream tables are still readable on standbys — they are regular heap tables replicated via physical streaming replication. After promotion the scheduler resumes automatically. See the [FAQ § Replication](FAQ.md#ec-21-22-23) for details on logical replication and subscriber limitations. |
 
 #### Scheduler Tick
 

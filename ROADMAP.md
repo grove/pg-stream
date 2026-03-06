@@ -297,13 +297,13 @@ Self-contained items from Stage 7 of the edge-cases/TIVM implementation plan.
 
 Remaining documentation gaps identified in Stage 7 of the gap analysis.
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| DS1 | DDL-during-refresh behaviour: document safe patterns and races | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-17 |
-| DS2 | Replication/standby limitations: document in FAQ and Architecture | 3h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-21/22/23 |
-| DS3 | PgBouncer configuration guide: session-mode requirements and known incompatibilities | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| DS1 | DDL-during-refresh behaviour: document safe patterns and races | 2h | ✅ Done | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-17 |
+| DS2 | Replication/standby limitations: document in FAQ and Architecture | 3h | ✅ Done | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-21/22/23 |
+| DS3 | PgBouncer configuration guide: session-mode requirements and known incompatibilities | 2h | ✅ Done | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
 
-> **Documentation sweep subtotal: ~1 day**
+> **Documentation sweep subtotal: ✅ Complete**
 
 ### WAL CDC Hardening
 
@@ -326,7 +326,7 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 - [x] IMMEDIATE mode: TopK micro-refresh fully tested end-to-end (10 E2E tests)
 - [ ] `max_grouping_set_branches` GUC guards CUBE/ROLLUP explosion
 - [x] Post-restart CDC TRANSITIONING health check in place
-- [ ] DDL-during-refresh and standby/replication limitations documented
+- [x] DDL-during-refresh and standby/replication limitations documented
 - [x] WAL CDC mode passes full E2E suite
 - [ ] E2E tests pass (`just build-e2e-image && just test-e2e`)
 
