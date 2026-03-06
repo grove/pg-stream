@@ -21,7 +21,7 @@
 # For CI it can be pushed to ghcr.io to skip the builder build entirely.
 # =============================================================================
 
-FROM postgres:18.1
+FROM postgres:18.3
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
