@@ -219,6 +219,11 @@ pub fn get_slot_lag_bytes(slot_name: &str) -> Result<i64, PgTrickleError> {
 /// Remaining changes are picked up in the next cycle.
 const MAX_CHANGES_PER_POLL: i64 = 10_000;
 
+/// Number of consecutive WAL poll errors before automatically falling back
+/// to trigger-based CDC. Prevents a permanently broken WAL decoder from
+/// blocking change capture indefinitely.
+const MAX_CONSECUTIVE_WAL_ERRORS: u32 = 5;
+
 /// Poll WAL changes from a replication slot and write them to the buffer table.
 ///
 /// Uses `pg_logical_slot_get_changes()` with the `pgoutput` plugin to
@@ -923,14 +928,46 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError
             CdcMode::Wal => {
                 // Poll WAL changes (steady-state WAL mode)
                 if let Err(e) = poll_source_changes(dep, change_schema) {
-                    warning!(
-                        "pg_trickle: WAL poll error for source OID {} — may need fallback: {}",
-                        source_key,
-                        e
-                    );
-                    // In WAL mode, a persistent poll error is serious —
-                    // the scheduler should consider falling back to triggers.
-                    // For now, log the error; a health check can escalate.
+                    let count = bump_wal_error_count(source_key);
+                    if count >= MAX_CONSECUTIVE_WAL_ERRORS {
+                        warning!(
+                            "pg_trickle: WAL poll failed {} consecutive times for source OID {} \
+                             — falling back to triggers. Last error: {}",
+                            count,
+                            source_key,
+                            e
+                        );
+                        reset_wal_error_count(source_key);
+                        if let Err(fb_err) =
+                            abort_wal_transition(dep.source_relid, dep.pgt_id, change_schema)
+                        {
+                            warning!(
+                                "pg_trickle: fallback to triggers also failed for source OID {}: {}",
+                                source_key,
+                                fb_err
+                            );
+                        }
+                    } else {
+                        warning!(
+                            "pg_trickle: WAL poll error for source OID {} ({}/{} before fallback): {}",
+                            source_key,
+                            count,
+                            MAX_CONSECUTIVE_WAL_ERRORS,
+                            e
+                        );
+                    }
+                } else {
+                    reset_wal_error_count(source_key);
+                    // Check decoder health periodically (slot existence, lag)
+                    if let Err(e) =
+                        check_decoder_health(dep.source_relid, dep.pgt_id, change_schema)
+                    {
+                        log!(
+                            "pg_trickle: health check error for WAL source OID {}: {}",
+                            source_key,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -988,6 +1025,31 @@ fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), P
     start_wal_transition(dep.source_relid, dep.pgt_id, change_schema)?;
 
     Ok(())
+}
+
+// ── Consecutive WAL error tracking ─────────────────────────────────────────
+
+use std::sync::Mutex;
+
+/// Shared consecutive-error counters per source OID.
+static WAL_ERROR_COUNTS: Mutex<Option<std::collections::HashMap<u32, u32>>> = Mutex::new(None);
+
+/// Increment the consecutive error counter for a WAL source and return the
+/// new count.
+fn bump_wal_error_count(source_oid: u32) -> u32 {
+    let mut guard = WAL_ERROR_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let entry = map.entry(source_oid).or_insert(0);
+    *entry += 1;
+    *entry
+}
+
+/// Reset the consecutive error counter for a source after a successful poll.
+fn reset_wal_error_count(source_oid: u32) {
+    let mut guard = WAL_ERROR_COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(&source_oid);
+    }
 }
 
 /// EC-18: Rate-limited LOG explaining why `auto` CDC mode is stuck in TRIGGER
@@ -1093,14 +1155,32 @@ fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), Pg
 
 /// Check health of a WAL decoder for a source in WAL mode.
 ///
-/// Verifies the replication slot exists and lag is within bounds.
-/// If the slot is missing or lag is excessive, attempts recovery.
+/// Verifies the replication slot exists, `wal_level` is still `logical`,
+/// and lag is within bounds.
+/// If the slot is missing, `wal_level` changed, or lag is excessive,
+/// attempts recovery or fallback.
 pub fn check_decoder_health(
     source_oid: pg_sys::Oid,
     pgt_id: i64,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
     let slot_name = slot_name_for_source(source_oid);
+
+    // Check wal_level hasn't been changed (takes effect after restart)
+    let wal_level = Spi::get_one::<String>("SELECT current_setting('wal_level')")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .unwrap_or_default();
+    if wal_level != "logical" {
+        warning!(
+            "pg_trickle: wal_level changed from 'logical' to '{}' — \
+             WAL decoder for source OID {} will fail after next restart. \
+             Falling back to triggers now.",
+            wal_level,
+            source_oid.to_u32()
+        );
+        abort_wal_transition(source_oid, pgt_id, change_schema)?;
+        return Ok(());
+    }
 
     // Check if the slot still exists
     let slot_exists = Spi::get_one_with_args::<bool>(

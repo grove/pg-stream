@@ -45,7 +45,7 @@ shared_preload_libraries = 'pg_trickle'
 
 The extension **must** be loaded via `shared_preload_libraries` because it registers GUC variables and a background worker at startup.
 
-> **Note:** `wal_level = logical` and `max_replication_slots` are **not** required by default. The default CDC mode (`trigger`) uses lightweight row-level triggers. If you set `pg_trickle.cdc_mode = 'auto'` or `'wal'`, then `wal_level = logical` is needed for WAL-based capture (see [pg_trickle.cdc_mode](#pg_tricklecdc_mode)).
+> **Note:** `wal_level = logical` and `max_replication_slots` are recommended but **not** required. The default CDC mode (`auto`) uses lightweight row-level triggers initially and transparently transitions to WAL-based capture if `wal_level = logical` is available. If `wal_level` is not `logical`, pg_trickle stays on triggers permanently — no degradation, no errors. Set `pg_trickle.cdc_mode = 'trigger'` to disable WAL transitions entirely (see [pg_trickle.cdc_mode](#pg_tricklecdc_mode)).
 
 ---
 
@@ -430,18 +430,18 @@ CDC (Change Data Capture) mechanism selection.
 
 | Value | Description |
 |-------|-------------|
-| `'trigger'` | **(default)** Always use row-level triggers for change capture |
-| `'auto'` | Use triggers for creation; transition to WAL-based CDC if `wal_level = logical` |
+| `'auto'` | **(default)** Use triggers for creation; transition to WAL-based CDC if `wal_level = logical`. Falls back to triggers automatically on error. |
+| `'trigger'` | Always use row-level triggers for change capture |
 | `'wal'` | Require WAL-based CDC (fails if `wal_level != logical`) |
 
-**Default:** `'trigger'`
+**Default:** `'auto'`
 
 ```sql
--- Always use triggers (default, zero-config)
-SET pg_trickle.cdc_mode = 'trigger';
-
--- Enable automatic trigger → WAL transition
+-- Enable automatic trigger → WAL transition (default)
 SET pg_trickle.cdc_mode = 'auto';
+
+-- Force trigger-only CDC (disable WAL transitions)
+SET pg_trickle.cdc_mode = 'trigger';
 
 -- Require WAL-based CDC (error if wal_level != logical)
 SET pg_trickle.cdc_mode = 'wal';
@@ -451,9 +451,8 @@ SET pg_trickle.cdc_mode = 'wal';
 
 ### pg_trickle.wal_transition_timeout
 
-> **Note:** WAL-based CDC is pre-production in v0.2.0. This setting is only
-> relevant when `pg_trickle.cdc_mode = 'auto'` or `'wal'`. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) for status.
+> **Note:** This setting is only relevant when `pg_trickle.cdc_mode = 'auto'` or `'wal'`. See
+> [ARCHITECTURE.md](ARCHITECTURE.md) for the full CDC transition lifecycle.
 
 Maximum time (seconds) to wait for the WAL decoder to catch up during
 the transition from trigger-based to WAL-based CDC. If the decoder has
@@ -540,7 +539,7 @@ pg_trickle.merge_work_mem_mb = 64
 pg_trickle.use_prepared_statements = true
 pg_trickle.user_triggers = 'auto'
 pg_trickle.block_source_ddl = false
-pg_trickle.cdc_mode = 'trigger'
+pg_trickle.cdc_mode = 'auto'
 pg_trickle.wal_transition_timeout = 300
 pg_trickle.buffer_alert_threshold = 1000000
 pg_trickle.max_grouping_set_branches = 64
