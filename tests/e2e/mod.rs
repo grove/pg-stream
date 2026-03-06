@@ -60,6 +60,30 @@ fn coverage_mount() -> Option<Mount> {
     }
 }
 
+/// Verify an image exists locally before attempting to start a container.
+///
+/// testcontainers falls back to a Docker Hub pull when the image is not
+/// found locally.  For local-only image names (like `pg_trickle_e2e`) that
+/// produces a confusing "pull access denied" 404.  This check panics early
+/// with a clear, actionable message instead.
+async fn assert_docker_image_exists(name: &str, tag: &str) {
+    let status = tokio::process::Command::new("docker")
+        .args(["image", "inspect", &format!("{}:{}", name, tag)])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .expect("Failed to run `docker image inspect` — is Docker running?");
+    if !status.success() {
+        panic!(
+            "Docker image {name}:{tag} not found locally.\n\
+             Build it first:\n\
+             • E2E tests:     just build-e2e-image\n\
+             • Upgrade tests: just build-upgrade-image"
+        );
+    }
+}
+
 /// A test database backed by a PostgreSQL 18.1 container with
 /// the compiled pg_trickle extension installed and
 /// `shared_preload_libraries` configured.
@@ -117,6 +141,7 @@ impl E2eDb {
     /// Internal: start a container using the given database name.
     async fn new_with_db(db_name: &str) -> Self {
         let (img_name, img_tag) = e2e_image();
+        assert_docker_image_exists(&img_name, &img_tag).await;
         let mut image = GenericImage::new(img_name, img_tag)
             .with_exposed_port(5432_u16.tcp())
             .with_wait_for(WaitFor::message_on_stderr(
@@ -157,6 +182,7 @@ impl E2eDb {
     /// Internal: start a bench-specific container with SHM and PG tuning.
     async fn new_with_db_bench(db_name: &str) -> Self {
         let (img_name, img_tag) = e2e_image();
+        assert_docker_image_exists(&img_name, &img_tag).await;
         let mut image = GenericImage::new(img_name, img_tag)
             .with_exposed_port(5432_u16.tcp())
             .with_wait_for(WaitFor::message_on_stderr(

@@ -27,6 +27,14 @@ TO_VERSION="${2:-0.2.1}"
 shift 2 2>/dev/null || true
 EXTRA_ARGS="${*:-}"
 
+# ── Native-platform note ──────────────────────────────────────────────────────
+# Do NOT pass --platform to docker build.  On Docker Desktop 4.60+ with the
+# containerd image store, --platform causes images to land in the containerd
+# namespace rather than the Docker daemon's classic store.  The classic store
+# is required by docker run and by testcontainers (via bollard).  Building
+# without --platform defaults to the native OS/arch of the host, which is
+# correct for local developer and CI builds alike.
+
 IMAGE_NAME="pg_trickle_upgrade_e2e"
 IMAGE_TAG="latest"
 BASE_IMAGE="${PGS_E2E_BASE_IMAGE:-pg_trickle_e2e:latest}"
