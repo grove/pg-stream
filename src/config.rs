@@ -89,11 +89,12 @@ pub static PGS_USER_TRIGGERS: GucSetting<Option<std::ffi::CString>> =
 
 /// CDC mechanism selection.
 ///
-/// - `"trigger"` (default): Always use row-level triggers for CDC.
-/// - `"auto"`: Use triggers for creation, transition to WAL if available.
+/// - `"auto"` (default): Use triggers for creation, transition to WAL if
+///   `wal_level = logical` is available. Falls back to triggers automatically.
+/// - `"trigger"`: Always use row-level triggers for CDC.
 /// - `"wal"`: Require WAL-based CDC (fail if `wal_level != logical`).
 pub static PGS_CDC_MODE: GucSetting<Option<std::ffi::CString>> =
-    GucSetting::<Option<std::ffi::CString>>::new(Some(c"trigger"));
+    GucSetting::<Option<std::ffi::CString>>::new(Some(c"auto"));
 
 /// Maximum time (seconds) to wait for the WAL decoder to catch up during
 /// transition from triggers to WAL-based CDC before falling back to triggers.
@@ -300,9 +301,10 @@ pub fn register_gucs() {
 
     GucRegistry::define_string_guc(
         c"pg_trickle.cdc_mode",
-        c"CDC mechanism: trigger, auto, or wal.",
-        c"'trigger' always uses row-level triggers for change capture. \
-           'auto' uses triggers initially and transitions to WAL-based CDC if wal_level=logical. \
+        c"CDC mechanism: auto (default), trigger, or wal.",
+        c"'auto' (default) uses triggers initially and transitions to WAL-based CDC \
+           if wal_level=logical, falling back to triggers on error. \
+           'trigger' always uses row-level triggers for change capture. \
            'wal' requires wal_level=logical (fails otherwise).",
         &PGS_CDC_MODE,
         GucContext::Suset,
@@ -314,8 +316,7 @@ pub fn register_gucs() {
         c"Max seconds for WAL decoder catch-up during CDC transition.",
         c"When transitioning from trigger-based to WAL-based CDC, the WAL decoder must catch up \
            past the trigger's last captured LSN. If it hasn't caught up within this timeout, \
-           the system falls back to trigger-based CDC. \
-           NOTE: WAL-based CDC is pre-production in v0.2.0 and not recommended for production use.",
+           the system falls back to trigger-based CDC.",
         &PGS_WAL_TRANSITION_TIMEOUT,
         10,    // min: 10 seconds
         3_600, // max: 1 hour
@@ -481,12 +482,12 @@ pub fn pg_trickle_user_triggers() -> String {
         .unwrap_or_else(|| "auto".to_string())
 }
 
-/// Returns the CDC mode: `"trigger"`, `"auto"`, or `"wal"`.
+/// Returns the CDC mode: `"auto"`, `"trigger"`, or `"wal"`.
 pub fn pg_trickle_cdc_mode() -> String {
     PGS_CDC_MODE
         .get()
-        .map(|cs| cs.to_str().unwrap_or("trigger").to_string())
-        .unwrap_or_else(|| "trigger".to_string())
+        .map(|cs| cs.to_str().unwrap_or("auto").to_string())
+        .unwrap_or_else(|| "auto".to_string())
 }
 
 /// Returns the WAL transition timeout in seconds.
