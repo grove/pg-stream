@@ -8,25 +8,30 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 - [Overview](#overview)
 - [GUC Variables](#guc-variables)
-  - [pg\_trickle.enabled](#pg_trickleenabled)
-  - [pg\_trickle.scheduler\_interval\_ms](#pg_tricklescheduler_interval_ms)
-  - [pg\_trickle.min\_schedule\_seconds](#pg_tricklemin_schedule_seconds)
-  - [pg\_trickle.default\_schedule\_seconds](#pg_trickledefault_schedule_seconds)
-  - [pg\_trickle.max\_consecutive\_errors](#pg_tricklemax_consecutive_errors)
-  - [pg\_trickle.change\_buffer\_schema](#pg_tricklechange_buffer_schema)
-  - [pg\_trickle.max\_concurrent\_refreshes](#pg_tricklemax_concurrent_refreshes)
-  - [pg\_trickle.differential\_max\_change\_ratio](#pg_trickledifferential_max_change_ratio)
-  - [pg\_trickle.cleanup\_use\_truncate](#pg_tricklecleanup_use_truncate)
-  - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints)
-  - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
-  - [pg\_trickle.use\_prepared\_statements](#pg_trickleuse_prepared_statements)
-  - [pg\_trickle.user\_triggers](#pg_trickleuser_triggers)
-  - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
-  - [pg\_trickle.cdc\_mode](#pg_tricklecdc_mode)
-  - [pg\_trickle.wal\_transition\_timeout](#pg_tricklewal_transition_timeout)
-  - [pg\_trickle.buffer\_alert\_threshold](#pg_ticklebuffer_alert_threshold)
-  - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
-  - [pg\_trickle.ivm\_topk\_max\_limit](#pg_trickleivm_topk_max_limit)
+  - [Essential](#essential)
+    - [pg\_trickle.enabled](#pg_trickleenabled)
+    - [pg\_trickle.cdc\_mode](#pg_tricklecdc_mode)
+    - [pg\_trickle.scheduler\_interval\_ms](#pg_tricklescheduler_interval_ms)
+    - [pg\_trickle.min\_schedule\_seconds](#pg_tricklemin_schedule_seconds)
+    - [pg\_trickle.default\_schedule\_seconds](#pg_trickledefault_schedule_seconds)
+    - [pg\_trickle.max\_consecutive\_errors](#pg_tricklemax_consecutive_errors)
+  - [WAL CDC](#wal-cdc)
+    - [pg\_trickle.wal\_transition\_timeout](#pg_tricklewal_transition_timeout)
+  - [Refresh Performance](#refresh-performance)
+    - [pg\_trickle.differential\_max\_change\_ratio](#pg_trickledifferential_max_change_ratio)
+    - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints)
+    - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
+    - [pg\_trickle.cleanup\_use\_truncate](#pg_tricklecleanup_use_truncate)
+    - [pg\_trickle.use\_prepared\_statements](#pg_trickleuse_prepared_statements)
+    - [pg\_trickle.user\_triggers](#pg_trickleuser_triggers)
+  - [Guardrails & Limits](#guardrails--limits)
+    - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
+    - [pg\_trickle.buffer\_alert\_threshold](#pg_tricklebuffer_alert_threshold)
+    - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
+    - [pg\_trickle.ivm\_topk\_max\_limit](#pg_trickleivm_topk_max_limit)
+  - [Advanced / Internal](#advanced--internal)
+    - [pg\_trickle.change\_buffer\_schema](#pg_tricklechange_buffer_schema)
+    - [pg\_trickle.max\_concurrent\_refreshes](#pg_tricklemax_concurrent_refreshes)
 - [Complete postgresql.conf Example](#complete-postgresqlconf-example)
 - [Runtime Configuration](#runtime-configuration)
 - [Further Reading](#further-reading)
@@ -51,6 +56,12 @@ The extension **must** be loaded via `shared_preload_libraries` because it regis
 
 ## GUC Variables
 
+### Essential
+
+The settings most users configure at install time.
+
+---
+
 ### pg_trickle.enabled
 
 Enable or disable the pg_trickle extension.
@@ -70,6 +81,31 @@ SET pg_trickle.enabled = false;
 
 -- Re-enable
 SET pg_trickle.enabled = true;
+```
+
+---
+
+### pg_trickle.cdc_mode
+
+CDC (Change Data Capture) mechanism selection.
+
+| Value | Description |
+|-------|-------------|
+| `'auto'` | **(default)** Use triggers for creation; transition to WAL-based CDC if `wal_level = logical`. Falls back to triggers automatically on error. |
+| `'trigger'` | Always use row-level triggers for change capture |
+| `'wal'` | Require WAL-based CDC (fails if `wal_level != logical`) |
+
+**Default:** `'auto'`
+
+```sql
+-- Enable automatic trigger → WAL transition (default)
+SET pg_trickle.cdc_mode = 'auto';
+
+-- Force trigger-only CDC (disable WAL transitions)
+SET pg_trickle.cdc_mode = 'trigger';
+
+-- Require WAL-based CDC (error if wal_level != logical)
+SET pg_trickle.cdc_mode = 'wal';
 ```
 
 ---
@@ -176,51 +212,33 @@ SET pg_trickle.max_consecutive_errors = 5;
 
 ---
 
-### pg_trickle.change_buffer_schema
+### WAL CDC
 
-Schema where CDC change buffer tables are created.
+Settings specific to WAL-based CDC. Only relevant when `pg_trickle.cdc_mode = 'auto'` or `'wal'`.
 
-| Property | Value |
-|---|---|
-| Type | `text` |
-| Default | `'pgtrickle_changes'` |
-| Context | `SUSET` |
-| Restart Required | No (but existing change buffers remain in the old schema) |
+---
 
-Change buffer tables are named `<schema>.changes_<oid>` where `<oid>` is the source table's OID. Placing them in a dedicated schema keeps them out of the `public` namespace.
+### pg_trickle.wal_transition_timeout
 
-**Tuning Guidance:**
-- Generally leave at the default. Change only if `pgtrickle_changes` conflicts with an existing schema in your database.
+> **Note:** This setting is only relevant when `pg_trickle.cdc_mode = 'auto'` or `'wal'`. See
+> [ARCHITECTURE.md](ARCHITECTURE.md) for the full CDC transition lifecycle.
+
+Maximum time (seconds) to wait for the WAL decoder to catch up during
+the transition from trigger-based to WAL-based CDC. If the decoder has
+not caught up within this timeout, the system falls back to triggers.
+
+**Default:** `300` (5 minutes)  
+**Range:** `10` – `3600`
 
 ```sql
-SET pg_trickle.change_buffer_schema = 'my_change_buffers';
+SET pg_trickle.wal_transition_timeout = 300;
 ```
 
 ---
 
-### pg_trickle.max_concurrent_refreshes
+### Refresh Performance
 
-> **Reserved for future use.** This setting is accepted and stored but has no
-> effect in v0.2.0. Parallel refresh is planned for v0.3.0.
-
-Maximum number of stream tables that can be refreshed simultaneously.
-
-| Property | Value |
-|---|---|
-| Type | `int` |
-| Default | `4` |
-| Range | `1` – `32` |
-| Context | `SUSET` |
-| Restart Required | No |
-
-The scheduler currently processes stream tables sequentially in topological
-order. This GUC is reserved for v0.3.0 when parallel scheduling is
-implemented. Setting it has no effect in v0.2.0.
-
-```sql
--- Accepted but has no effect in v0.2.0
-SET pg_trickle.max_concurrent_refreshes = 8;
-```
+Fine-grained tuning for the differential refresh engine.
 
 ---
 
@@ -397,6 +415,12 @@ SET pg_trickle.user_triggers = 'off';
 
 ---
 
+### Guardrails & Limits
+
+Safety controls and hard limits.
+
+---
+
 ### pg_trickle.block_source_ddl
 
 When enabled, column-affecting DDL (e.g., `ALTER TABLE ... DROP COLUMN`,
@@ -421,49 +445,6 @@ SET pg_trickle.block_source_ddl = false;
 
 > **Note:** Only column-affecting changes are blocked. Benign DDL (adding
 > indexes, comments, constraints) is always allowed regardless of this setting.
-
----
-
-### pg_trickle.cdc_mode
-
-CDC (Change Data Capture) mechanism selection.
-
-| Value | Description |
-|-------|-------------|
-| `'auto'` | **(default)** Use triggers for creation; transition to WAL-based CDC if `wal_level = logical`. Falls back to triggers automatically on error. |
-| `'trigger'` | Always use row-level triggers for change capture |
-| `'wal'` | Require WAL-based CDC (fails if `wal_level != logical`) |
-
-**Default:** `'auto'`
-
-```sql
--- Enable automatic trigger → WAL transition (default)
-SET pg_trickle.cdc_mode = 'auto';
-
--- Force trigger-only CDC (disable WAL transitions)
-SET pg_trickle.cdc_mode = 'trigger';
-
--- Require WAL-based CDC (error if wal_level != logical)
-SET pg_trickle.cdc_mode = 'wal';
-```
-
----
-
-### pg_trickle.wal_transition_timeout
-
-> **Note:** This setting is only relevant when `pg_trickle.cdc_mode = 'auto'` or `'wal'`. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) for the full CDC transition lifecycle.
-
-Maximum time (seconds) to wait for the WAL decoder to catch up during
-the transition from trigger-based to WAL-based CDC. If the decoder has
-not caught up within this timeout, the system falls back to triggers.
-
-**Default:** `300` (5 minutes)  
-**Range:** `10` – `3600`
-
-```sql
-SET pg_trickle.wal_transition_timeout = 300;
-```
 
 ---
 
@@ -517,33 +498,95 @@ SET pg_trickle.ivm_topk_max_limit = 5000;
 
 ---
 
+### Advanced / Internal
+
+Rarely changed. Leave at defaults unless you have a specific reason to adjust.
+
+---
+
+### pg_trickle.change_buffer_schema
+
+Schema where CDC change buffer tables are created.
+
+| Property | Value |
+|---|---|
+| Type | `text` |
+| Default | `'pgtrickle_changes'` |
+| Context | `SUSET` |
+| Restart Required | No (but existing change buffers remain in the old schema) |
+
+Change buffer tables are named `<schema>.changes_<oid>` where `<oid>` is the source table's OID. Placing them in a dedicated schema keeps them out of the `public` namespace.
+
+**Tuning Guidance:**
+- Generally leave at the default. Change only if `pgtrickle_changes` conflicts with an existing schema in your database.
+
+```sql
+SET pg_trickle.change_buffer_schema = 'my_change_buffers';
+```
+
+---
+
+### pg_trickle.max_concurrent_refreshes
+
+> **Reserved for future use.** This setting is accepted and stored but has no
+> effect in v0.2.0. Parallel refresh is planned for v0.3.0.
+
+Maximum number of stream tables that can be refreshed simultaneously.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `4` |
+| Range | `1` – `32` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+The scheduler currently processes stream tables sequentially in topological
+order. This GUC is reserved for v0.3.0 when parallel scheduling is
+implemented. Setting it has no effect in v0.2.0.
+
+```sql
+-- Accepted but has no effect in v0.2.0
+SET pg_trickle.max_concurrent_refreshes = 8;
+```
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
 # Required
 shared_preload_libraries = 'pg_trickle'
 
-# Optional tuning
+# Essential
 pg_trickle.enabled = true
+pg_trickle.cdc_mode = 'auto'
 pg_trickle.scheduler_interval_ms = 1000
 pg_trickle.min_schedule_seconds = 1
 pg_trickle.default_schedule_seconds = 1
 pg_trickle.max_consecutive_errors = 3
-pg_trickle.change_buffer_schema = 'pgtrickle_changes'
-pg_trickle.max_concurrent_refreshes = 4   # reserved; no effect in v0.2.0
+
+# WAL CDC
+pg_trickle.wal_transition_timeout = 300
+
+# Refresh performance
 pg_trickle.differential_max_change_ratio = 0.15
-pg_trickle.cleanup_use_truncate = true
 pg_trickle.merge_planner_hints = true
 pg_trickle.merge_work_mem_mb = 64
-# pg_trickle.merge_strategy removed in v0.2.0
+pg_trickle.cleanup_use_truncate = true
 pg_trickle.use_prepared_statements = true
 pg_trickle.user_triggers = 'auto'
+
+# Guardrails & limits
 pg_trickle.block_source_ddl = false
-pg_trickle.cdc_mode = 'auto'
-pg_trickle.wal_transition_timeout = 300
 pg_trickle.buffer_alert_threshold = 1000000
 pg_trickle.max_grouping_set_branches = 64
 pg_trickle.ivm_topk_max_limit = 1000
+
+# Advanced / internal
+pg_trickle.change_buffer_schema = 'pgtrickle_changes'
+pg_trickle.max_concurrent_refreshes = 4   # reserved; no effect in v0.2.0
+# pg_trickle.merge_strategy removed in v0.2.0
 ```
 
 ---

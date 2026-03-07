@@ -7,27 +7,32 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
 ## Table of Contents
 
 - [Functions](#functions)
-  - [pgtrickle.create\_stream\_table](#pgtricklecreate_stream_table)
-  - [pgtrickle.alter\_stream\_table](#pgtricklealter_stream_table)
-  - [pgtrickle.drop\_stream\_table](#pgtrickledrop_stream_table)
-  - [pgtrickle.resume\_stream\_table](#pgtrickleresume_stream_table)
-  - [pgtrickle.refresh\_stream\_table](#pgtricklerefresh_stream_table)
-  - [pgtrickle.pgt\_status](#pgtricklepgt_status)
-  - [pgtrickle.st\_refresh\_stats](#pgtricklest_refresh_stats)
-  - [pgtrickle.get\_refresh\_history](#pgtrickleget_refresh_history)
-  - [pgtrickle.get\_staleness](#pgtrickleget_staleness)
-  - [pgtrickle.slot\_health](#pgtrickleslot_health)
-  - [pgtrickle.check\_cdc\_health](#pgtricklecheck_cdc_health)
-  - [pgtrickle.diamond\_groups](#pgtricklediamond_groups)
-  - [pgtrickle.explain\_st](#pgtrickleexplain_st)
-  - [pgtrickle.change\_buffer\_sizes](#pgtricklechange_buffer_sizes)
-  - [pgtrickle.list\_sources](#pgtricklelist_sources)
-  - [pgtrickle.health\_check](#pgtricklehealth_check)
-  - [pgtrickle.refresh\_timeline](#pgtricklerefresh_timeline)
-  - [pgtrickle.trigger\_inventory](#pgtrickletrigger_inventory)
-  - [pgtrickle.dependency\_tree](#pgtrickledependency_tree)
-  - [pgtrickle.pg\_trickle\_hash](#pgtricklepg_trickle_hash)
-  - [pgtrickle.pg\_trickle\_hash\_multi](#pgtricklepg_trickle_hash_multi)
+  - [Core Lifecycle](#core-lifecycle)
+    - [pgtrickle.create\_stream\_table](#pgtricklecreate_stream_table)
+    - [pgtrickle.alter\_stream\_table](#pgtricklealter_stream_table)
+    - [pgtrickle.drop\_stream\_table](#pgtrickledrop_stream_table)
+    - [pgtrickle.resume\_stream\_table](#pgtrickleresume_stream_table)
+    - [pgtrickle.refresh\_stream\_table](#pgtricklerefresh_stream_table)
+  - [Status & Monitoring](#status--monitoring)
+    - [pgtrickle.pgt\_status](#pgtricklepgt_status)
+    - [pgtrickle.health\_check](#pgtricklehealth_check)
+    - [pgtrickle.refresh\_timeline](#pgtricklerefresh_timeline)
+    - [pgtrickle.st\_refresh\_stats](#pgtricklest_refresh_stats)
+    - [pgtrickle.get\_refresh\_history](#pgtrickleget_refresh_history)
+    - [pgtrickle.get\_staleness](#pgtrickleget_staleness)
+  - [CDC Diagnostics](#cdc-diagnostics)
+    - [pgtrickle.slot\_health](#pgtrickleslot_health)
+    - [pgtrickle.check\_cdc\_health](#pgtricklecheck_cdc_health)
+    - [pgtrickle.change\_buffer\_sizes](#pgtricklechange_buffer_sizes)
+    - [pgtrickle.trigger\_inventory](#pgtrickletrigger_inventory)
+  - [Dependency & Inspection](#dependency--inspection)
+    - [pgtrickle.dependency\_tree](#pgtrickledependency_tree)
+    - [pgtrickle.diamond\_groups](#pgtricklediamond_groups)
+    - [pgtrickle.explain\_st](#pgtrickleexplain_st)
+    - [pgtrickle.list\_sources](#pgtricklelist_sources)
+  - [Utilities](#utilities)
+    - [pgtrickle.pg\_trickle\_hash](#pgtricklepg_trickle_hash)
+    - [pgtrickle.pg\_trickle\_hash\_multi](#pgtricklepg_trickle_hash_multi)
 - [Expression Support](#expression-support)
   - [Conditional Expressions](#conditional-expressions)
   - [Comparison Operators](#comparison-operators)
@@ -67,6 +72,12 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
 ---
 
 ## Functions
+
+### Core Lifecycle
+
+Create, modify, and manage the lifecycle of stream tables.
+
+---
 
 ### pgtrickle.create_stream_table
 
@@ -748,6 +759,12 @@ SELECT pgtrickle.refresh_stream_table('order_totals');
 
 ---
 
+### Status & Monitoring
+
+Query the state of stream tables, view refresh statistics, and diagnose problems.
+
+---
+
 ### pgtrickle.pgt_status
 
 Get the status of all stream tables.
@@ -774,6 +791,63 @@ SELECT * FROM pgtrickle.pgt_status();
 | name | status | refresh_mode | is_populated | consecutive_errors | schedule | data_timestamp | staleness |
 |---|---|---|---|---|---|---|---|
 | public.order_totals | ACTIVE | DIFFERENTIAL | true | 0 | 5m | 2026-02-21 12:00:00+00 | 00:02:30 |
+
+---
+
+### pgtrickle.health_check
+
+Run a set of health checks against the pg_trickle installation and return one row per check.
+
+```sql
+pgtrickle.health_check() → SETOF record(
+    check_name  text,   -- identifier for the check
+    severity    text,   -- 'OK', 'WARN', or 'ERROR'
+    detail      text    -- human-readable explanation
+)
+```
+
+Filter to problems only:
+
+```sql
+SELECT check_name, severity, detail
+FROM pgtrickle.health_check()
+WHERE severity != 'OK';
+```
+
+Checks: `scheduler_running`, `error_tables`, `stale_tables`, `needs_reinit`,
+`consecutive_errors`, `buffer_growth` (> 10 000 pending rows), `slot_lag` (> 100 MB).
+
+---
+
+### pgtrickle.refresh_timeline
+
+Return recent refresh records across **all** stream tables in a single chronological view.
+
+```sql
+pgtrickle.refresh_timeline(
+    max_rows int  DEFAULT 50
+) → SETOF record(
+    start_time      timestamptz,
+    stream_table    text,
+    action          text,
+    status          text,
+    rows_inserted   bigint,
+    rows_deleted    bigint,
+    duration_ms     float8,
+    error_message   text
+)
+```
+
+**Example:**
+
+```sql
+-- Most recent 20 events across all stream tables:
+SELECT start_time, stream_table, action, status, round(duration_ms::numeric,1) AS ms
+FROM pgtrickle.refresh_timeline(20);
+
+-- Just failures in the last 100 events:
+SELECT * FROM pgtrickle.refresh_timeline(100) WHERE status = 'ERROR';
+```
 
 ---
 
@@ -861,6 +935,12 @@ SELECT pgtrickle.get_staleness('order_totals');
 
 ---
 
+### CDC Diagnostics
+
+Inspect CDC pipeline health, replication slots, change buffers, and trigger coverage.
+
+---
+
 ### pgtrickle.slot_health
 
 Check replication slot health for all tracked CDC slots.
@@ -925,6 +1005,110 @@ SELECT * FROM pgtrickle.check_cdc_health();
 |---|---|---|---|---|---|---|
 | 16384 | public.orders | TRIGGER | | | | |
 | 16390 | public.events | WAL | pg_trickle_slot_16390 | 524288 | 0/1A8B000 | |
+
+---
+
+### pgtrickle.change_buffer_sizes
+
+Show pending change counts and estimated on-disk sizes for all CDC-tracked
+source tables.
+
+Returns one row per `(stream_table, source_table)` pair.
+
+```sql
+pgtrickle.change_buffer_sizes() → SETOF record(
+    stream_table  text,     -- qualified stream table name
+    source_table  text,     -- qualified source table name
+    source_oid    bigint,
+    cdc_mode      text,     -- 'trigger', 'wal', or 'transitioning'
+    pending_rows  bigint,   -- rows in buffer not yet consumed
+    buffer_bytes  bigint    -- estimated buffer table size in bytes
+)
+```
+
+**Example:**
+
+```sql
+SELECT * FROM pgtrickle.change_buffer_sizes()
+ORDER BY pending_rows DESC;
+```
+
+Useful for spotting a source table whose CDC buffer is growing unexpectedly
+(which may indicate a stalled differential refresh or a high-write source that
+has outpaced the schedule).
+
+---
+
+### pgtrickle.trigger_inventory
+
+List all CDC triggers that pg_trickle should have installed, and verify each one exists and is enabled in `pg_catalog`.
+
+```sql
+pgtrickle.trigger_inventory() → SETOF record(
+    source_table  text,    -- qualified source table name
+    source_oid    bigint,
+    trigger_name  text,    -- expected trigger name
+    trigger_type  text,    -- 'DML' or 'TRUNCATE'
+    present       bool,    -- trigger exists in pg_catalog
+    enabled       bool     -- trigger is not disabled
+)
+```
+
+A `present = false` row means change capture is broken for that source.
+
+**Example:**
+
+```sql
+-- Show only missing or disabled triggers:
+SELECT source_table, trigger_type, trigger_name
+FROM pgtrickle.trigger_inventory()
+WHERE NOT present OR NOT enabled;
+```
+
+---
+
+### Dependency & Inspection
+
+Visualize dependencies, understand query plans, and audit source table relationships.
+
+---
+
+### pgtrickle.dependency_tree
+
+Render all stream table dependencies as an indented ASCII tree.
+
+```sql
+pgtrickle.dependency_tree() → SETOF record(
+    tree_line    text,    -- indented visual line (├──, └──, │ characters)
+    node         text,    -- qualified name (schema.table)
+    node_type    text,    -- 'stream_table' or 'source_table'
+    depth        int,
+    status       text,    -- NULL for source_table nodes
+    refresh_mode text     -- NULL for source_table nodes
+)
+```
+
+Roots (stream tables with no stream-table parents) appear at depth 0. Each
+dependent is indented beneath its parent. Plain source tables are rendered as
+leaf nodes tagged `[src]`.
+
+**Example:**
+
+```sql
+SELECT tree_line, status, refresh_mode
+FROM pgtrickle.dependency_tree();
+```
+
+```
+tree_line                               status   refresh_mode
+----------------------------------------+---------+--------------
+report_summary                          ACTIVE   DIFFERENTIAL
+├── orders_by_region                    ACTIVE   DIFFERENTIAL
+│   ├── public.orders [src]
+│   └── public.customers [src]
+└── revenue_totals                      ACTIVE   DIFFERENTIAL
+    └── public.orders [src]
+```
 
 ---
 
@@ -1002,37 +1186,6 @@ SELECT * FROM pgtrickle.explain_st('order_totals');
 
 ---
 
-### pgtrickle.change_buffer_sizes
-
-Show pending change counts and estimated on-disk sizes for all CDC-tracked
-source tables.
-
-Returns one row per `(stream_table, source_table)` pair.
-
-```sql
-pgtrickle.change_buffer_sizes() → SETOF record(
-    stream_table  text,     -- qualified stream table name
-    source_table  text,     -- qualified source table name
-    source_oid    bigint,
-    cdc_mode      text,     -- 'trigger', 'wal', or 'transitioning'
-    pending_rows  bigint,   -- rows in buffer not yet consumed
-    buffer_bytes  bigint    -- estimated buffer table size in bytes
-)
-```
-
-**Example:**
-
-```sql
-SELECT * FROM pgtrickle.change_buffer_sizes()
-ORDER BY pending_rows DESC;
-```
-
-Useful for spotting a source table whose CDC buffer is growing unexpectedly
-(which may indicate a stalled differential refresh or a high-write source that
-has outpaced the schedule).
-
----
-
 ### pgtrickle.list_sources
 
 List the source tables that a stream table depends on.
@@ -1059,127 +1212,9 @@ not refreshing or to audit which source tables are being trigger-tracked.
 
 ---
 
-### pgtrickle.health_check
+### Utilities
 
-Run a set of health checks against the pg_trickle installation and return one row per check.
-
-```sql
-pgtrickle.health_check() → SETOF record(
-    check_name  text,   -- identifier for the check
-    severity    text,   -- 'OK', 'WARN', or 'ERROR'
-    detail      text    -- human-readable explanation
-)
-```
-
-Filter to problems only:
-
-```sql
-SELECT check_name, severity, detail
-FROM pgtrickle.health_check()
-WHERE severity != 'OK';
-```
-
-Checks: `scheduler_running`, `error_tables`, `stale_tables`, `needs_reinit`,
-`consecutive_errors`, `buffer_growth` (> 10 000 pending rows), `slot_lag` (> 100 MB).
-
----
-
-### pgtrickle.refresh_timeline
-
-Return recent refresh records across **all** stream tables in a single chronological view.
-
-```sql
-pgtrickle.refresh_timeline(
-    max_rows int  DEFAULT 50
-) → SETOF record(
-    start_time      timestamptz,
-    stream_table    text,
-    action          text,
-    status          text,
-    rows_inserted   bigint,
-    rows_deleted    bigint,
-    duration_ms     float8,
-    error_message   text
-)
-```
-
-**Example:**
-
-```sql
--- Most recent 20 events across all stream tables:
-SELECT start_time, stream_table, action, status, round(duration_ms::numeric,1) AS ms
-FROM pgtrickle.refresh_timeline(20);
-
--- Just failures in the last 100 events:
-SELECT * FROM pgtrickle.refresh_timeline(100) WHERE status = 'ERROR';
-```
-
----
-
-### pgtrickle.trigger_inventory
-
-List all CDC triggers that pg_trickle should have installed, and verify each one exists and is enabled in `pg_catalog`.
-
-```sql
-pgtrickle.trigger_inventory() → SETOF record(
-    source_table  text,    -- qualified source table name
-    source_oid    bigint,
-    trigger_name  text,    -- expected trigger name
-    trigger_type  text,    -- 'DML' or 'TRUNCATE'
-    present       bool,    -- trigger exists in pg_catalog
-    enabled       bool     -- trigger is not disabled
-)
-```
-
-A `present = false` row means change capture is broken for that source.
-
-**Example:**
-
-```sql
--- Show only missing or disabled triggers:
-SELECT source_table, trigger_type, trigger_name
-FROM pgtrickle.trigger_inventory()
-WHERE NOT present OR NOT enabled;
-```
-
----
-
-### pgtrickle.dependency_tree
-
-Render all stream table dependencies as an indented ASCII tree.
-
-```sql
-pgtrickle.dependency_tree() → SETOF record(
-    tree_line    text,    -- indented visual line (├──, └──, │ characters)
-    node         text,    -- qualified name (schema.table)
-    node_type    text,    -- 'stream_table' or 'source_table'
-    depth        int,
-    status       text,    -- NULL for source_table nodes
-    refresh_mode text     -- NULL for source_table nodes
-)
-```
-
-Roots (stream tables with no stream-table parents) appear at depth 0. Each
-dependent is indented beneath its parent. Plain source tables are rendered as
-leaf nodes tagged `[src]`.
-
-**Example:**
-
-```sql
-SELECT tree_line, status, refresh_mode
-FROM pgtrickle.dependency_tree();
-```
-
-```
-tree_line                               status   refresh_mode
-----------------------------------------+---------+--------------
-report_summary                          ACTIVE   DIFFERENTIAL
-├── orders_by_region                    ACTIVE   DIFFERENTIAL
-│   ├── public.orders [src]
-│   └── public.customers [src]
-└── revenue_totals                      ACTIVE   DIFFERENTIAL
-    └── public.orders [src]
-```
+Low-level hashing functions used internally for row identity.
 
 ---
 
