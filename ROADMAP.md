@@ -1,6 +1,6 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-06
+> **Last updated:** 2026-03-07
 > **Current version:** 0.2.2
 
 For a concise description of what pg_trickle is and why it exists, read
@@ -394,6 +394,23 @@ partitioned storage tables are deferred to a future release.
 
 > **Partitioning subtotal: ~18–32 hours**
 
+### CDC / Refresh Mode Interaction Gaps
+
+Six gaps between the four CDC modes and four refresh modes — missing
+validations, resource leaks, and observability holes. Phased from quick wins
+(pure Rust) to a larger feature (per-table `cdc_mode` override).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| G6 | Defensive `is_populated` + empty-frontier check in `execute_differential_refresh()` | 2h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G6 |
+| G2 | Validate `IMMEDIATE` + `cdc_mode='wal'` — reject explicit combination, INFO for implicit | 2–3h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G2 |
+| G3 | Advance WAL replication slot after FULL refresh; flush change buffers | 4–6h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G3 |
+| G4 | Flush change buffers after AUTO→FULL adaptive fallback (prevents ping-pong) | 3–4h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G4 |
+| G5 | `pgtrickle.pgt_cdc_status` view + NOTIFY on CDC transitions | 4–6h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G5 |
+| G1 | Per-table `cdc_mode` override (SQL API, catalog, dbt, migration) | 2–3d | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G1 |
+
+> **CDC/refresh mode gaps subtotal: ~4–6 days**
+
 ### Operational
 
 | Item | Description | Effort | Ref |
@@ -405,13 +422,19 @@ partitioned storage tables are deferred to a future release.
 
 > **Operational subtotal: ~9–12 hours**
 
-> **v0.3.0 total: ~75–115 hours**
+> **v0.3.0 total: ~105–160 hours**
 
 **Exit criteria:**
 - [ ] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
 - [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
 - [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
+- [ ] DIFFERENTIAL on unpopulated ST returns error (G6)
+- [ ] IMMEDIATE + explicit `cdc_mode='wal'` rejected with clear error (G2)
+- [ ] WAL slot advanced after FULL refresh; change buffers flushed (G3)
+- [ ] Adaptive fallback flushes change buffers; no ping-pong cycles (G4)
+- [ ] `pgtrickle.pgt_cdc_status` view available; NOTIFY on CDC transitions (G5)
+- [ ] Per-table `cdc_mode` override functional in SQL API and dbt adapter (G1)
 - [ ] Extension upgrade path tested (`0.2.x → 0.3.0`)
 - [ ] Zero P0/P1 gaps remaining
 
@@ -592,11 +615,11 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Released |
 | v0.2.1 — Upgrade Infrastructure & Documentation | ~8h | 70–86h | ✅ Released |
 | v0.2.2 — OFFSET Support, ALTER QUERY & Upgrade Tooling | ~50–70h | 120–156h | |
-| v0.3.0 — Correctness, Security & Operations | 75–115h | 195–271h | |
-| v0.4.0 — Backward Compatibility, Cloud & Scale | 200–280h | 395–541h | |
-| v0.5.0 — Observability & Integration | 14–21h | 409–562h | |
-| v1.0.0 — Stable release | 18–27h | 427–589h | |
-| Post-1.0 (ecosystem) | 88–134h | 515–723h | |
+| v0.3.0 — Correctness, Security & Operations | 105–160h | 225–316h | |
+| v0.4.0 — Backward Compatibility, Cloud & Scale | 200–280h | 425–596h | |
+| v0.5.0 — Observability & Integration | 14–21h | 439–617h | |
+| v1.0.0 — Stable release | 18–27h | 457–644h | |
+| Post-1.0 (ecosystem) | 88–134h | 545–778h | |
 | Post-1.0 (scale) | 6+ months | — | |
 
 ---
