@@ -768,7 +768,99 @@ Measure at least:
 
 ---
 
-## 12. Acceptance Criteria
+## 12. Expected Performance Envelope
+
+This plan should improve **refresh throughput** and **freshness latency** for
+independent work inside one database. It should not be treated as a primary
+solution for improving **source-table write throughput**.
+
+### 12.1 What Should Improve
+
+In the current scheduler, cycle time is approximately the sum of all due
+refresh durations:
+
+`T_serial ~= sum(t_i)`
+
+With this plan, cycle time should move toward the larger of:
+
+- the DAG critical-path time, and
+- total due work divided by the effective worker count,
+
+plus worker-spawn and coordination overhead.
+
+In practical terms:
+
+- Wide DAG layers with many independent singleton units should see the largest
+   gains.
+- Mixed workloads with a few long refreshes and many short refreshes should see
+   better throughput than a strict level barrier because the ready queue can
+   release downstream work as soon as prerequisites finish.
+- Tenant-like independent subgraphs in one database should stop blocking each
+   other behind one long-running refresh.
+
+### 12.2 Best-Case Shape
+
+The best case is:
+
+- many independent singleton execution units,
+- enough cluster worker headroom,
+- little IMMEDIATE-induced collapsing, and
+- little time spent in atomic consistency groups.
+
+Example:
+
+- 50 independent stream tables
+- each refresh takes about 200 ms
+- effective worker count of 4
+
+Current serial cycle: about 10 s.
+
+Expected parallel cycle after this plan: roughly 2.5-3.5 s, depending on spawn
+overhead and scheduling gaps.
+
+This is not a guarantee, but it is the right order of magnitude for a balanced,
+parallelizable workload.
+
+### 12.3 Moderate-Gain Shape
+
+Moderate gains are more likely than ideal speedups in real deployments.
+
+Expected outcome:
+
+- total wall-clock cycle time decreases,
+- short independent refreshes complete earlier,
+- one failing or slow branch stops blocking unrelated branches, and
+- `pg_trickle.max_concurrent_refreshes` starts affecting observed throughput.
+
+This is the most realistic outcome for deployments with partially independent
+DAGs and mixed refresh sizes.
+
+### 12.4 Low-Gain or No-Gain Shape
+
+This plan will provide little benefit when the workload is dominated by:
+
+- one long linear dependency chain,
+- large atomic consistency groups,
+- IMMEDIATE-connected closures that must be collapsed into one unit,
+- tiny refreshes where worker-spawn overhead dominates, or
+- a saturated cluster worker budget.
+
+In those cases the system remains correctness-limited or resource-limited, not
+scheduler-limited.
+
+### 12.5 What This Plan Does Not Fix
+
+This plan does **not** materially raise the write-throughput ceiling of the
+current trigger-based CDC path.
+
+It should improve how quickly accumulated changes are processed once refreshes
+run, but it does not remove per-row trigger overhead on source tables. If the
+main problem is sustained DML throughput on tracked sources, that remains a CDC
+architecture issue rather than a scheduler issue.
+
+---
+
+## 13. Acceptance Criteria
 
 This plan is complete when all of the following are true:
 
@@ -784,7 +876,7 @@ This plan is complete when all of the following are true:
 
 ---
 
-## 13. Risks and Mitigations
+## 14. Risks and Mitigations
 
 | Risk | Why it matters | Mitigation |
 |---|---|---|
@@ -796,7 +888,7 @@ This plan is complete when all of the following are true:
 
 ---
 
-## 14. Follow-On Work After v1
+## 15. Follow-On Work After v1
 
 Once this plan is stable, the next optimizations are:
 
