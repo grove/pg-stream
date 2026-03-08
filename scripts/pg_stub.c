@@ -22,7 +22,7 @@
  *
  * Regenerate the symbol list with:
  *   nm target/debug/deps/pg_trickle-* | grep ' U _' | awk '{print $NF}' \
- *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|Is|Mem|Message|PG_|pfree|Portal|Postmaster|SPI_|Top)'
+ *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|Is|Mem|Message|PG_|parse_|pfree|Portal|Postmaster|raw_|SPI_|Top)'
  */
 
 #include <stddef.h>
@@ -80,6 +80,22 @@ uint32_t GetCurrentTransactionIdIfAny(void)     { return 0; }
 int   IsBinaryCoercible(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }
 char *format_type_extended(uint32_t oid, int32_t typmod, int flags) {
     (void)oid; (void)typmod; (void)flags;
+    return NULL;
+}
+
+/* ── Parser entry points ─────────────────────────────────────────────── */
+void *raw_parser(const char *str, int mode) {
+    (void)str; (void)mode;
+    return NULL;
+}
+
+void *parse_analyze_fixedparams(void *parse_tree,
+                                const char *source_text,
+                                const uint32_t *param_types,
+                                int num_params,
+                                void *query_env) {
+    (void)parse_tree; (void)source_text;
+    (void)param_types; (void)num_params; (void)query_env;
     return NULL;
 }
 
