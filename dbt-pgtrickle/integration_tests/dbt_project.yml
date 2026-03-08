@@ -11,7 +11,19 @@ test-paths: ["tests"]
 seeds:
   dbt_pgtrickle_integration_tests:
     raw_orders:
-      +post-hook: "ALTER TABLE {{ this }} ADD PRIMARY KEY (id)"
+      +post-hook: |
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid = to_regclass('{{ this }}')
+              AND contype = 'p'
+          ) THEN
+            EXECUTE 'ALTER TABLE {{ this }} ADD PRIMARY KEY (id)';
+          END IF;
+        END
+        $$;
 
 clean-targets:
   - "target"
