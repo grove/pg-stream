@@ -1349,6 +1349,9 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
                                 e
                             );
                         }
+                        // G3+G4: advance WAL slots and flush change buffers
+                        // now that the new frontier is stored.
+                        refresh::post_full_refresh_cleanup(st);
                         Ok((ins, del))
                     }
                     Err(e) => Err(e),
@@ -1367,6 +1370,9 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
                                 e
                             );
                         }
+                        // G3+G4: advance WAL slots and flush change buffers
+                        // now that the new frontier is stored.
+                        refresh::post_full_refresh_cleanup(st);
                         Ok((ins, del))
                     }
                     Err(e) => Err(e),
@@ -1390,6 +1396,9 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
                             {
                                 log!("pg_trickle: failed to store frontier: {}", e);
                             }
+                            // G3+G4: advance WAL slots and flush change buffers
+                            // now that the new frontier is stored.
+                            refresh::post_full_refresh_cleanup(st);
                             Ok((ins, del))
                         }
                         Err(e) => Err(e),

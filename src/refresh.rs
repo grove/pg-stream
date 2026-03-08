@@ -1118,6 +1118,70 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
     Ok((rows_inserted as i64, 0))
 }
 
+/// Post-full-refresh cleanup helper (G3 + G4).
+///
+/// Intended to be called immediately after any FULL or REINITIALIZE refresh
+/// completes successfully, from both the scheduled refresh path and from the
+/// adaptive fallback path inside `execute_differential_refresh`.
+///
+/// 1. **G3 — WAL slot advancement**: For each WAL-mode source dependency,
+///    advances the replication slot's `confirmed_flush_lsn` to the current WAL
+///    LSN. This lets PostgreSQL reclaim WAL segments that the full refresh
+///    already materialized, preventing unbounded `pg_wal/` growth on servers
+///    that do repeated FULL refreshes.
+///
+/// 2. **G4 — Change buffer flush**: Deletes stale change buffer rows up to the
+///    minimum stored frontier across all stream tables sharing each source.
+///    This prevents the next differential tick from re-examining rows that are
+///    already materialized, breaking the "adaptive fallback ping-pong" pattern.
+///
+/// Multi-ST safety: `cleanup_change_buffers_by_frontier` queries the catalog
+/// for the minimum frontier across *all* STs that share each source OID, so
+/// rows that another ST still needs are never deleted.
+pub fn post_full_refresh_cleanup(st: &StreamTableMeta) {
+    let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
+    let deps = crate::catalog::StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+    let source_oids: Vec<u32> = deps
+        .iter()
+        .filter(|d| d.source_type == "TABLE" || d.source_type == "FOREIGN_TABLE")
+        .map(|d| d.source_relid.to_u32())
+        .collect();
+
+    // G3: Advance WAL slots past the current LSN so WAL segments produced
+    // before and during the full refresh can be reclaimed by PostgreSQL.
+    for slot in deps
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.cdc_mode,
+                crate::catalog::CdcMode::Wal | crate::catalog::CdcMode::Transitioning
+            )
+        })
+        .filter_map(|d| d.slot_name.as_deref())
+    {
+        match crate::wal_decoder::advance_slot_to_current(slot) {
+            Ok(()) => {
+                pgrx::debug1!(
+                    "[pg_trickle] post_full_refresh_cleanup: advanced WAL slot '{}' to current LSN",
+                    slot,
+                );
+            }
+            Err(e) => {
+                pgrx::debug1!(
+                    "[pg_trickle] post_full_refresh_cleanup: failed to advance slot '{}': {}",
+                    slot,
+                    e,
+                );
+            }
+        }
+    }
+
+    // G4: Flush change buffer rows that are now irrelevant because the full
+    // refresh already captured them.  Prevents the next differential cycle
+    // from re-examining them and re-triggering another adaptive fallback.
+    cleanup_change_buffers_by_frontier(&change_schema, &source_oids);
+}
+
 /// Execute a NO_DATA refresh: just advance the data timestamp.
 pub fn execute_no_data_refresh(st: &StreamTableMeta) -> Result<(), PgTrickleError> {
     // Record that we checked — but do NOT update data_timestamp.
@@ -1482,7 +1546,11 @@ pub fn execute_differential_refresh(
             schema,
             name,
         );
-        return execute_full_refresh(st);
+        let truncate_full_result = execute_full_refresh(st);
+        if truncate_full_result.is_ok() {
+            post_full_refresh_cleanup(st);
+        }
+        return truncate_full_result;
     }
 
     // ── P2: Capped-count threshold check (only when changes exist) ───────
@@ -1575,6 +1643,11 @@ pub fn execute_differential_refresh(
             Some(full_ms),
         ) {
             pgrx::debug1!("[pg_trickle] Failed to update last_full_ms: {}", e);
+        }
+        // G4: Flush stale change buffer rows to prevent the next differential
+        // tick from re-examining rows already materialized by this FULL refresh.
+        if result.is_ok() {
+            post_full_refresh_cleanup(st);
         }
         return result;
     }

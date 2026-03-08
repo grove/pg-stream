@@ -174,6 +174,33 @@ pub fn get_existing_slot_lsn(slot_name: &str) -> Result<Option<String>, PgTrickl
     Ok(Some(lsn))
 }
 
+/// Advance a logical replication slot's `confirmed_flush_lsn` to the current
+/// WAL LSN (`pg_current_wal_lsn()`).
+///
+/// Called after a FULL refresh to allow PostgreSQL to reclaim WAL segments
+/// that the full refresh has already materialized (G3). Returns `Ok(())`
+/// immediately if the slot does not exist (e.g., trigger-based sources).
+pub fn advance_slot_to_current(slot_name: &str) -> Result<(), PgTrickleError> {
+    // Guard against missing slot before issuing the advance,
+    // which would otherwise raise a PostgreSQL ERROR.
+    let exists = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        &[slot_name.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or(false);
+
+    if !exists {
+        return Ok(());
+    }
+
+    Spi::run_with_args(
+        "SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())",
+        &[slot_name.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("advance slot '{}': {}", slot_name, e)))
+}
+
 /// Create a logical replication slot via the PostgreSQL C API.
 ///
 /// Replicates the logic of `pg_create_logical_replication_slot()` from
