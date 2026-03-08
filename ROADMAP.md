@@ -445,7 +445,6 @@ validations, resource leaks, and observability holes. Phased from quick wins
 - [x] Adaptive fallback flushes change buffers; no ping-pong cycles (G4)
 - [x] `pgtrickle.pgt_cdc_status` view available; NOTIFY on CDC transitions (G5)
 - [x] Prepared statement cache cleanup works after invalidation
-- [ ] Extension upgrade path tested (`0.2.2 → 0.2.3`)
 - [x] Per-table `cdc_mode` override functional in SQL API and dbt adapter (G1)
 - [x] Extension upgrade path tested (`0.2.2 → 0.2.3`)
 
