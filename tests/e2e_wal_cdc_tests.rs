@@ -266,12 +266,11 @@ async fn test_wal_cdc_captures_delete() {
 #[tokio::test]
 async fn test_trigger_mode_no_wal_transition() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+    let default_cdc_mode: String = db.query_scalar("SHOW pg_trickle.cdc_mode").await;
 
     // Force trigger-only mode
-    db.execute("ALTER SYSTEM SET pg_trickle.cdc_mode = 'trigger'")
+    db.alter_system_set_and_wait("pg_trickle.cdc_mode", "'trigger'", "trigger")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     db.execute("CREATE TABLE trig_only (id INT PRIMARY KEY, val TEXT)")
         .await;
@@ -300,8 +299,8 @@ async fn test_trigger_mode_no_wal_transition() {
     );
 
     // Reset for other tests
-    db.execute("ALTER SYSTEM RESET pg_trickle.cdc_mode").await;
-    db.execute("SELECT pg_reload_conf()").await;
+    db.alter_system_reset_and_wait("pg_trickle.cdc_mode", &default_cdc_mode)
+        .await;
 }
 
 // ── W2: Fallback hardening ────────────────────────────────────────────

@@ -111,10 +111,8 @@ async fn test_guc_block_source_ddl_on() {
 
     // Use ALTER SYSTEM + reload so the GUC applies to all pool connections,
     // not just the current session which the pool may not reuse.
-    db.execute("ALTER SYSTEM SET pg_trickle.block_source_ddl = true")
+    db.alter_system_set_and_wait("pg_trickle.block_source_ddl", "true", "on")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     // Column-altering DDL should be blocked
     let result = db
@@ -365,10 +363,8 @@ async fn test_guc_foreign_table_polling_on_allows_differential() {
     .await;
 
     // Enable polling-based CDC (cluster-wide so it applies across pool connections).
-    db.execute("ALTER SYSTEM SET pg_trickle.foreign_table_polling = on")
+    db.alter_system_set_and_wait("pg_trickle.foreign_table_polling", "on", "on")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let query = "SELECT grp, SUM(val) AS total FROM ft_poll_remote GROUP BY grp";
     db.create_st("ft_poll_st", query, "1m", "DIFFERENTIAL")
@@ -382,7 +378,6 @@ async fn test_guc_foreign_table_polling_on_allows_differential() {
     db.refresh_st("ft_poll_st").await;
     db.assert_st_matches_query("ft_poll_st", query).await;
 
-    db.execute("ALTER SYSTEM RESET pg_trickle.foreign_table_polling")
+    db.alter_system_reset_and_wait("pg_trickle.foreign_table_polling", "off")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
 }

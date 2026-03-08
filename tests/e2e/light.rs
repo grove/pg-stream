@@ -269,6 +269,42 @@ impl E2eDb {
         sqlx::query(sql).execute(&self.pool).await.map(|_| ())
     }
 
+    /// Reload PostgreSQL configuration and wait briefly for SIGHUP settings to apply.
+    pub async fn reload_config_and_wait(&self) {
+        self.execute("SELECT pg_reload_conf()").await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// Wait until `SHOW <setting>` reports the expected value.
+    pub async fn wait_for_setting(&self, setting: &str, expected: &str) {
+        let show_sql = format!("SHOW {setting}");
+        for _ in 0..10 {
+            let current: String = self.query_scalar(&show_sql).await;
+            if current == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let current: String = self.query_scalar(&show_sql).await;
+        panic!("{setting} did not reload to {expected}; current value is {current}");
+    }
+
+    /// Apply `ALTER SYSTEM SET` and wait for the new value to become visible.
+    pub async fn alter_system_set_and_wait(&self, setting: &str, value_sql: &str, expected: &str) {
+        self.execute(&format!("ALTER SYSTEM SET {setting} = {value_sql}"))
+            .await;
+        self.reload_config_and_wait().await;
+        self.wait_for_setting(setting, expected).await;
+    }
+
+    /// Apply `ALTER SYSTEM RESET` and wait for the default value to become visible.
+    pub async fn alter_system_reset_and_wait(&self, setting: &str, expected: &str) {
+        self.execute(&format!("ALTER SYSTEM RESET {setting}")).await;
+        self.reload_config_and_wait().await;
+        self.wait_for_setting(setting, expected).await;
+    }
+
     /// Get a single scalar value from a query.
     pub async fn query_scalar<T>(&self, sql: &str) -> T
     where

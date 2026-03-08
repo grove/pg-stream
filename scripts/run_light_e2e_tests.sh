@@ -9,7 +9,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Curated allowlist for tests that run against the light harness.
 LIGHT_E2E_TESTS=(
     e2e_aggregate_coverage_tests
-    e2e_alter_tests
+    light_group_mutation_tests
     e2e_cdc_tests
     e2e_concurrent_tests
     e2e_coverage_error_tests
@@ -17,40 +17,38 @@ LIGHT_E2E_TESTS=(
     e2e_create_tests
     e2e_cte_tests
     e2e_dag_concurrent_tests
-    e2e_dag_error_tests
     e2e_dag_immediate_tests
     e2e_dag_operations_tests
+    e2e_dag_error_tests
     e2e_dag_topology_tests
     e2e_diamond_tests
     e2e_drop_tests
     e2e_error_tests
     e2e_expression_tests
-    e2e_full_join_tests
     e2e_getting_started_tests
-    e2e_guard_trigger_tests
+    e2e_keyless_duplicate_tests
     e2e_having_transition_tests
     e2e_ivm_tests
-    e2e_keyless_duplicate_tests
     e2e_lateral_subquery_tests
     e2e_lateral_tests
     e2e_lifecycle_tests
+    light_group_foundation_tests
     e2e_mixed_mode_dag_tests
-    e2e_monitoring_tests
     e2e_multi_cycle_dag_tests
     e2e_multi_window_tests
     e2e_pipeline_dag_tests
     e2e_property_tests
     e2e_refresh_tests
-    e2e_rows_from_tests
+    light_group_setops_tests
     e2e_scalar_subquery_tests
-    e2e_set_operation_tests
-    e2e_smoke_tests
     e2e_snapshot_consistency_tests
-    e2e_sublink_or_tests
     e2e_topk_tests
     e2e_view_tests
     e2e_window_tests
 )
+
+# The list order is intentionally interleaved so round-robin sharding with
+# `--shard-count 3` reproduces the curated three-shard split used in CI.
 
 usage() {
     cat <<'EOF'

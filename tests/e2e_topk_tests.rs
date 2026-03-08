@@ -9,22 +9,6 @@
 mod e2e;
 
 use e2e::E2eDb;
-use std::time::Duration;
-
-async fn wait_for_topk_limit(db: &E2eDb, expected: i32) {
-    for _ in 0..10 {
-        let current: i32 = db.query_scalar("SHOW pg_trickle.ivm_topk_max_limit").await;
-        if current == expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let current: i32 = db.query_scalar("SHOW pg_trickle.ivm_topk_max_limit").await;
-    panic!(
-        "pg_trickle.ivm_topk_max_limit did not reload to {expected}; current value is {current}"
-    );
-}
 
 // ── Creation ───────────────────────────────────────────────────────────
 
@@ -1352,16 +1336,15 @@ async fn test_topk_immediate_with_offset() {
 #[tokio::test]
 async fn test_topk_immediate_threshold_rejection() {
     let db = E2eDb::new().await.with_extension().await;
+    let default_limit: String = db.query_scalar("SHOW pg_trickle.ivm_topk_max_limit").await;
 
     db.execute("CREATE TABLE topk_imm_rej (id INT PRIMARY KEY, val INT)")
         .await;
     db.execute("INSERT INTO topk_imm_rej VALUES (1,1)").await;
 
     // Set the GUC to a very low limit (system-wide so it applies across pool connections)
-    db.execute("ALTER SYSTEM SET pg_trickle.ivm_topk_max_limit = 5")
+    db.alter_system_set_and_wait("pg_trickle.ivm_topk_max_limit", "5", "5")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    wait_for_topk_limit(&db, 5).await;
 
     // Creating a TopK with LIMIT > threshold should fail
     let result = db
@@ -1373,10 +1356,8 @@ async fn test_topk_immediate_threshold_rejection() {
         .await;
 
     // Clean up the system-wide GUC before asserting
-    db.execute("ALTER SYSTEM RESET pg_trickle.ivm_topk_max_limit")
+    db.alter_system_reset_and_wait("pg_trickle.ivm_topk_max_limit", &default_limit)
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    wait_for_topk_limit(&db, 1000).await;
 
     assert!(
         result.is_err(),

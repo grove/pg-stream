@@ -30,9 +30,13 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         .await;
     db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 1")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
+    db.reload_config_and_wait().await;
+    db.wait_for_setting("pg_trickle.scheduler_interval_ms", "100")
+        .await;
+    db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
+        .await;
     // Give the bgworker a moment to pick up new config
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
 /// Wait until a ST has been auto-refreshed by checking pgt_refresh_history.
@@ -152,10 +156,8 @@ async fn test_gucs_can_be_altered() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
 
     // Change scheduler_interval_ms
-    db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 200")
+    db.alter_system_set_and_wait("pg_trickle.scheduler_interval_ms", "200", "200")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let interval: String = db
         .query_scalar("SHOW pg_trickle.scheduler_interval_ms")
@@ -166,10 +168,8 @@ async fn test_gucs_can_be_altered() {
     );
 
     // Change min_schedule_seconds
-    db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 5")
+    db.alter_system_set_and_wait("pg_trickle.min_schedule_seconds", "5", "5")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let min_schedule: String = db
         .query_scalar("SHOW pg_trickle.min_schedule_seconds")
@@ -180,18 +180,15 @@ async fn test_gucs_can_be_altered() {
     );
 
     // Change enabled
-    db.execute("ALTER SYSTEM SET pg_trickle.enabled = false")
+    db.alter_system_set_and_wait("pg_trickle.enabled", "false", "off")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let enabled: String = db.query_scalar("SHOW pg_trickle.enabled").await;
     assert_eq!(enabled, "off", "pg_trickle.enabled should be 'off'");
 
     // Reset back
-    db.execute("ALTER SYSTEM SET pg_trickle.enabled = true")
+    db.alter_system_set_and_wait("pg_trickle.enabled", "true", "on")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
 }
 
 /// Create a ST with a short schedule (after lowering the minimum),
