@@ -1217,14 +1217,22 @@ async fn test_topk_immediate_multiple_dml_in_transaction() {
     assert_eq!(db.count("public.topk_imm_tx_st").await, 2);
 
     // Multiple DML in a single transaction — each triggers micro-refresh
-    db.execute(
-        "BEGIN; \
-         INSERT INTO topk_imm_tx VALUES (4, 50); \
-         DELETE FROM topk_imm_tx WHERE id = 3; \
-         INSERT INTO topk_imm_tx VALUES (5, 40); \
-         COMMIT",
-    )
-    .await;
+    {
+        let mut tx = db.pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO topk_imm_tx VALUES (4, 50)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM topk_imm_tx WHERE id = 3")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO topk_imm_tx VALUES (5, 40)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
 
     assert_eq!(db.count("public.topk_imm_tx_st").await, 2);
 
@@ -1333,8 +1341,10 @@ async fn test_topk_immediate_threshold_rejection() {
         .await;
     db.execute("INSERT INTO topk_imm_rej VALUES (1,1)").await;
 
-    // Set the GUC to a very low limit
-    db.execute("SET pg_trickle.ivm_topk_max_limit = 5").await;
+    // Set the GUC to a very low limit (system-wide so it applies across pool connections)
+    db.execute("ALTER SYSTEM SET pg_trickle.ivm_topk_max_limit = 5")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
 
     // Creating a TopK with LIMIT > threshold should fail
     let result = db
@@ -1344,6 +1354,11 @@ async fn test_topk_immediate_threshold_rejection() {
              NULL, 'IMMEDIATE')",
         )
         .await;
+
+    // Clean up the system-wide GUC before asserting
+    db.execute("ALTER SYSTEM RESET pg_trickle.ivm_topk_max_limit")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
 
     assert!(
         result.is_err(),

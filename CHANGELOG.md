@@ -41,12 +41,46 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   table preservation guidance. Cross-links to the full
   [Upgrading Guide](docs/UPGRADING.md).
 
+- **IMMEDIATE mode: WITH RECURSIVE support (IM1)** — Recursive CTEs now work
+  in IMMEDIATE mode using semi-naive evaluation with transition tables. A new
+  `pg_trickle.ivm_recursive_max_depth` GUC (default 100) injects a depth
+  counter into the semi-naive SQL to prevent infinite recursion. The
+  `check_for_delete_changes` path handles `TransitionTable` source and
+  `generate_change_buffer_from` uses the NEW transition table.
+
+- **IMMEDIATE mode: TopK micro-refresh (IM2)** — `ORDER BY ... LIMIT N`
+  queries now work in IMMEDIATE mode via `apply_topk_micro_refresh()`. A new
+  `pg_trickle.ivm_topk_max_limit` GUC (default 1000) caps the maximum LIMIT
+  value allowed for IMMEDIATE TopK to prevent expensive per-statement
+  refreshes. Ten E2E tests cover basic operations, aggregates, offset,
+  multi-DML, threshold rejection, and mode switching.
+
+- **Edge case hardening (EC1–EC3):**
+  - `pg_trickle.max_grouping_set_branches` GUC (default 64) — caps
+    CUBE/ROLLUP branch-count explosion at parse time.
+  - Post-restart CDC `TRANSITIONING` health check — detects stuck CDC
+    transitions after crash or restart and rolls back to TRIGGER mode.
+  - Foreign table polling-based change detection — new
+    `pg_trickle.foreign_table_polling` GUC enables periodic re-execution
+    with snapshot comparison (`EXCEPT ALL` deltas) for foreign tables.
+
+- **WAL CDC hardening (W1–W3):**
+  - WAL mode E2E test suite mirroring the trigger-based suite.
+  - WAL→trigger automatic fallback hardening for edge cases.
+  - `pg_trickle.cdc_mode` default promoted to `'auto'`.
+
+- **Documentation sweep (DS1–DS3):**
+  - DDL-during-refresh behaviour: safe patterns and race conditions.
+  - Replication/standby limitations in FAQ and Architecture docs.
+  - PgBouncer configuration guide: session-mode requirements.
+
 ### Changed
 
 - `create_stream_table` default `refresh_mode` changed from `'DIFFERENTIAL'`
   to `'AUTO'`.
 - `create_stream_table` default `schedule` changed from `'1m'` to
   `'calculated'`.
+- `pg_trickle.cdc_mode` default changed from `'trigger'` to `'auto'`.
 
 ---
 

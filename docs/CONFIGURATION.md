@@ -27,6 +27,8 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [pg\_trickle.buffer\_alert\_threshold](#pg_ticklebuffer_alert_threshold)
   - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
   - [pg\_trickle.ivm\_topk\_max\_limit](#pg_trickleivm_topk_max_limit)
+  - [pg\_trickle.ivm\_recursive\_max\_depth](#pg_trickleivm_recursive_max_depth)
+  - [pg\_trickle.foreign\_table\_polling](#pg_trickleforeign_table_polling)
 - [Complete postgresql.conf Example](#complete-postgresqlconf-example)
 - [Runtime Configuration](#runtime-configuration)
 - [Further Reading](#further-reading)
@@ -35,7 +37,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
 
 ## Overview
 
-pg_trickle exposes nineteen configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
+pg_trickle exposes twenty-one configuration variables in the `pg_trickle` namespace. All can be set in `postgresql.conf` or at runtime via `SET` / `ALTER SYSTEM`.
 
 **Required `postgresql.conf` settings:**
 
@@ -517,6 +519,40 @@ SET pg_trickle.ivm_topk_max_limit = 5000;
 
 ---
 
+### pg_trickle.ivm_recursive_max_depth
+
+Maximum recursion depth for `WITH RECURSIVE` queries in **IMMEDIATE** mode.
+The semi-naive evaluation injects a `__pgt_depth` counter column into the
+recursive SQL; iteration stops when the counter reaches this limit. Protects
+against infinite recursion in pathological graphs.
+
+**Default:** `100`  
+**Range:** `1` – `10000`
+
+```sql
+-- Allow deeper recursion for large hierarchies
+SET pg_trickle.ivm_recursive_max_depth = 500;
+```
+
+---
+
+### pg_trickle.foreign_table_polling
+
+Enable polling-based change detection for foreign table sources. When
+enabled, the scheduler periodically re-executes the foreign table query
+and computes deltas via snapshot comparison (`EXCEPT ALL`). Foreign tables
+cannot use trigger or WAL-based CDC, so this is the only mechanism for
+incremental maintenance.
+
+**Default:** `false`
+
+```sql
+-- Enable foreign table polling
+SET pg_trickle.foreign_table_polling = true;
+```
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -544,6 +580,8 @@ pg_trickle.wal_transition_timeout = 300
 pg_trickle.buffer_alert_threshold = 1000000
 pg_trickle.max_grouping_set_branches = 64
 pg_trickle.ivm_topk_max_limit = 1000
+pg_trickle.ivm_recursive_max_depth = 100
+pg_trickle.foreign_table_polling = false
 ```
 
 ---

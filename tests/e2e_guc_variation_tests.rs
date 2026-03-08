@@ -207,7 +207,7 @@ async fn test_guc_max_grouping_set_branches_allows_within_limit() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("SET pg_trickle.max_grouping_set_branches = 4")
         .await;
-    db.execute("CREATE TABLE gs_ok_src (a TEXT, b TEXT, val INT)")
+    db.execute("CREATE TABLE gs_ok_src (id SERIAL PRIMARY KEY, a TEXT, b TEXT, val INT)")
         .await;
 
     let result = db
@@ -230,7 +230,7 @@ async fn test_guc_max_grouping_set_branches_raised_allows_large_cube() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("SET pg_trickle.max_grouping_set_branches = 128")
         .await;
-    db.execute("CREATE TABLE gs_big_src (a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, val INT)")
+    db.execute("CREATE TABLE gs_big_src (id SERIAL PRIMARY KEY, a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, val INT)")
         .await;
 
     let result = db
@@ -264,7 +264,7 @@ async fn test_guc_foreign_table_polling_off_rejects_differential() {
         .await;
     db.execute(
         "CREATE SERVER loopback FOREIGN DATA WRAPPER postgres_fdw \
-         OPTIONS (dbname 'postgres', host '127.0.0.1', port '5432')",
+         OPTIONS (dbname 'pg_trickle_test', host '127.0.0.1', port '5432')",
     )
     .await;
     db.execute(
@@ -309,7 +309,7 @@ async fn test_guc_foreign_table_polling_full_mode_no_guc_needed() {
         .await;
     db.execute(
         "CREATE SERVER loopback_full FOREIGN DATA WRAPPER postgres_fdw \
-         OPTIONS (dbname 'postgres', host '127.0.0.1', port '5432')",
+         OPTIONS (dbname 'pg_trickle_test', host '127.0.0.1', port '5432')",
     )
     .await;
     db.execute(
@@ -350,7 +350,7 @@ async fn test_guc_foreign_table_polling_on_allows_differential() {
         .await;
     db.execute(
         "CREATE SERVER loopback_poll FOREIGN DATA WRAPPER postgres_fdw \
-         OPTIONS (dbname 'postgres', host '127.0.0.1', port '5432')",
+         OPTIONS (dbname 'pg_trickle_test', host '127.0.0.1', port '5432')",
     )
     .await;
     db.execute(
@@ -364,9 +364,11 @@ async fn test_guc_foreign_table_polling_on_allows_differential() {
     )
     .await;
 
-    // Enable polling-based CDC.
-    db.execute("SET pg_trickle.foreign_table_polling = on")
+    // Enable polling-based CDC (cluster-wide so it applies across pool connections).
+    db.execute("ALTER SYSTEM SET pg_trickle.foreign_table_polling = on")
         .await;
+    db.execute("SELECT pg_reload_conf()").await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let query = "SELECT grp, SUM(val) AS total FROM ft_poll_remote GROUP BY grp";
     db.create_st("ft_poll_st", query, "1m", "DIFFERENTIAL")
@@ -379,4 +381,8 @@ async fn test_guc_foreign_table_polling_on_allows_differential() {
     db.execute("DELETE FROM ft_poll_src WHERE grp = 'b'").await;
     db.refresh_st("ft_poll_st").await;
     db.assert_st_matches_query("ft_poll_st", query).await;
+
+    db.execute("ALTER SYSTEM RESET pg_trickle.foreign_table_polling")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
 }

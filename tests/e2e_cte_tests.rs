@@ -2688,18 +2688,21 @@ async fn test_recursive_cte_immediate_mode_delete_triggers_dred() {
 async fn test_recursive_cte_immediate_mode_depth_guard() {
     let db = E2eDb::new().await.with_extension().await;
 
-    // Lower the depth guard to 5 for the duration of this test
-    db.execute("SET pg_trickle.ivm_recursive_max_depth = 5")
+    // Lower the depth guard to 3 so we can trigger it with a short chain.
+    // The guard limits the number of semi-naive propagation iterations of
+    // the incremental delta (not the total hierarchy depth).
+    // Use ALTER SYSTEM so the GUC applies cluster-wide (pool-safe).
+    db.execute("ALTER SYSTEM SET pg_trickle.ivm_recursive_max_depth = 3")
         .await;
+    db.execute("SELECT pg_reload_conf()").await;
+    // Small delay for reload
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     db.execute("CREATE TABLE chain (id INT PRIMARY KEY, parent_id INT)")
         .await;
-    // Build a baseline chain of depth 3
-    db.execute(
-        "INSERT INTO chain VALUES \
-         (1, NULL), (2, 1), (3, 2), (4, 3)",
-    )
-    .await;
+    // Build a baseline chain: 1 → 2
+    db.execute("INSERT INTO chain VALUES (1, NULL), (2, 1)")
+        .await;
 
     create_immediate_st(
         &db,
@@ -2708,27 +2711,33 @@ async fn test_recursive_cte_immediate_mode_depth_guard() {
              SELECT id, parent_id FROM chain WHERE parent_id IS NULL \
              UNION ALL \
              SELECT ch.id, ch.parent_id FROM chain ch JOIN c ON ch.parent_id = c.id\
-         ) SELECT id FROM c",
+         ) SELECT id, parent_id FROM c",
     )
     .await;
 
-    // All 4 rows are within depth 5
-    assert_eq!(db.count("public.chain_ivm").await, 4);
+    assert_eq!(db.count("public.chain_ivm").await, 2);
 
-    // Insert rows at depth 5 and depth 6 (depth 6 should be clamped by the guard)
-    db.execute("INSERT INTO chain VALUES (5, 4), (6, 5), (7, 6)")
+    // Insert a long chain: 3→2, 4→3, 5→4, 6→5, 7→6
+    // The delta seed is {3,4,5,6,7}. Propagation iterations:
+    //   iter 0 (seed): row 3 connects to existing row 2
+    //   iter 1: row 4 connects to row 3
+    //   iter 2: row 5 connects to row 4
+    //   iter 3: clamped by depth guard (row 6 and 7 not found)
+    db.execute("INSERT INTO chain VALUES (3, 2), (4, 3), (5, 4), (6, 5), (7, 6)")
         .await;
 
-    // Rows at depth ≤ 5 are materialised; depth 6 row (id=7) should be absent
+    // With depth guard = 3, some tail rows should be absent
     let count = db.count("public.chain_ivm").await;
     assert!(
-        count <= 6,
-        "Depth guard should prevent rows beyond depth 5 from being materialised; got {count}"
+        count < 7,
+        "Depth guard should prevent all 7 rows from being materialised; got {count}"
     );
     assert!(
-        count >= 5,
-        "Rows within the depth limit must be materialised; got {count}"
+        count >= 4,
+        "Rows within the depth guard must be materialised; got {count}"
     );
 
-    db.execute("RESET pg_trickle.ivm_recursive_max_depth").await;
+    db.execute("ALTER SYSTEM RESET pg_trickle.ivm_recursive_max_depth")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
 }

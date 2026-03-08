@@ -1778,7 +1778,7 @@ Core metadata for each stream table.
 | `functions_used` | `text[]` | Function names used in the defining query (for DDL tracking) |
 | `topk_limit` | `int` | LIMIT value for TopK stream tables (`NULL` if not TopK) |
 | `topk_order_by` | `text` | ORDER BY clause SQL for TopK stream tables |
-| `topk_offset` | `int` | OFFSET value for paged TopK queries (pre-provisioned for v0.2.2) |
+| `topk_offset` | `int` | OFFSET value for paged TopK queries (`NULL` if not paged) |
 | `diamond_consistency` | `text` | Diamond consistency mode: `none` or `atomic` |
 | `diamond_schedule_policy` | `text` | Diamond schedule policy: `fastest` or `slowest` |
 | `has_keyless_source` | `bool` | Whether any source table lacks a PRIMARY KEY (EC-06) |

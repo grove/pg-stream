@@ -21,6 +21,7 @@ async fn test_keyless_duplicate_rows_basic() {
     // Keyless: no PRIMARY KEY — pgtrickle uses ctid-based row identity
     db.execute("CREATE TABLE kl_dup (val INT, label TEXT)")
         .await;
+    db.execute("ALTER TABLE kl_dup REPLICA IDENTITY FULL").await;
     db.execute("INSERT INTO kl_dup VALUES (1, 'a'), (1, 'a'), (1, 'a'), (2, 'b')")
         .await;
 
@@ -43,6 +44,7 @@ async fn test_keyless_delete_one_duplicate() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_del (val INT, label TEXT)")
         .await;
+    db.execute("ALTER TABLE kl_del REPLICA IDENTITY FULL").await;
     db.execute("INSERT INTO kl_del VALUES (1, 'x'), (1, 'x'), (2, 'y')")
         .await;
 
@@ -70,6 +72,7 @@ async fn test_keyless_update_one_duplicate() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_upd (val INT, label TEXT)")
         .await;
+    db.execute("ALTER TABLE kl_upd REPLICA IDENTITY FULL").await;
     db.execute("INSERT INTO kl_upd VALUES (1, 'x'), (1, 'x'), (1, 'x')")
         .await;
 
@@ -95,6 +98,7 @@ async fn test_keyless_update_one_duplicate() {
 async fn test_keyless_aggregate_with_duplicates() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_agg (cat TEXT, val INT)").await;
+    db.execute("ALTER TABLE kl_agg REPLICA IDENTITY FULL").await;
     db.execute("INSERT INTO kl_agg VALUES ('a', 1), ('a', 1), ('a', 2), ('b', 1)")
         .await;
 
@@ -126,6 +130,8 @@ async fn test_keyless_unique_content() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_uniq (val INT, label TEXT)")
         .await;
+    db.execute("ALTER TABLE kl_uniq REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO kl_uniq VALUES (1, 'a'), (2, 'b'), (3, 'c')")
         .await;
 
@@ -155,6 +161,8 @@ async fn test_keyless_unique_content() {
 async fn test_keyless_delete_all_then_reinsert() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_cycle (val INT)").await;
+    db.execute("ALTER TABLE kl_cycle REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO kl_cycle VALUES (1), (1), (1)")
         .await;
 
@@ -181,6 +189,8 @@ async fn test_keyless_delete_all_then_reinsert() {
 async fn test_keyless_mixed_dml_stress() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE kl_stress (cat TEXT, val INT)")
+        .await;
+    db.execute("ALTER TABLE kl_stress REPLICA IDENTITY FULL")
         .await;
     db.execute(
         "INSERT INTO kl_stress \

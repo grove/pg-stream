@@ -535,8 +535,10 @@ async fn test_grouping_sets_accepted_via_rewrite() {
     // columns that aren't in the select list, which may produce errors.
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("CREATE TABLE gs_src (dept TEXT, region TEXT, amount NUMERIC)")
-        .await;
+    db.execute(
+        "CREATE TABLE gs_src (id SERIAL PRIMARY KEY, dept TEXT, region TEXT, amount NUMERIC)",
+    )
+    .await;
 
     // Use a simpler GROUPING SETS that only references columns in select list.
     let result = db
@@ -558,8 +560,10 @@ async fn test_rollup_accepted_via_rewrite() {
     // ROLLUP is auto-rewritten to UNION ALL of plain GROUP BY queries.
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("CREATE TABLE rollup_src (dept TEXT, region TEXT, amount NUMERIC)")
-        .await;
+    db.execute(
+        "CREATE TABLE rollup_src (id SERIAL PRIMARY KEY, dept TEXT, region TEXT, amount NUMERIC)",
+    )
+    .await;
 
     let result = db
         .try_execute(
@@ -580,8 +584,10 @@ async fn test_cube_accepted_via_rewrite() {
     // CUBE is auto-rewritten to UNION ALL of plain GROUP BY queries.
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("CREATE TABLE cube_src (dept TEXT, region TEXT, amount NUMERIC)")
-        .await;
+    db.execute(
+        "CREATE TABLE cube_src (id SERIAL PRIMARY KEY, dept TEXT, region TEXT, amount NUMERIC)",
+    )
+    .await;
 
     let result = db
         .try_execute(
@@ -602,7 +608,7 @@ async fn test_grouping_sets_differential_mode_also_rewritten() {
     // GROUPING SETS are auto-rewritten to UNION ALL even in DIFFERENTIAL mode.
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("CREATE TABLE gsd_src (dept TEXT, amount NUMERIC)")
+    db.execute("CREATE TABLE gsd_src (id SERIAL PRIMARY KEY, dept TEXT, amount NUMERIC)")
         .await;
 
     let result = db
@@ -675,9 +681,9 @@ async fn test_tablesample_system_rejected() {
 async fn test_percentile_cont_now_supported_in_differential_mode() {
     let db = E2eDb::new().await.with_extension().await;
 
-    db.execute("CREATE TABLE pct_src (dept TEXT, amount NUMERIC)")
+    db.execute("CREATE TABLE pct_src (id SERIAL PRIMARY KEY, dept TEXT, amount NUMERIC)")
         .await;
-    db.execute("INSERT INTO pct_src VALUES ('A', 100), ('A', 200), ('B', 300)")
+    db.execute("INSERT INTO pct_src (dept, amount) VALUES ('A', 100), ('A', 200), ('B', 300)")
         .await;
 
     let result = db

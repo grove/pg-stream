@@ -320,7 +320,7 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 **Exit criteria:**
 - [x] `ORDER BY + LIMIT + OFFSET` defining queries accepted, refreshed, and E2E-tested
 - [x] `sql/pg_trickle--0.2.1--0.2.2.sql` exists (column pre-provisioned in 0.2.1; function signature updates)
-- [ ] Upgrade completeness check passes for 0.2.1→0.2.2
+- [x] Upgrade completeness check passes for 0.2.1→0.2.2
 - [x] Version check fires at scheduler startup if `.so`/SQL versions diverge
 - [x] IMMEDIATE mode: recursive CTE semi-naive validated; `ivm_recursive_max_depth` depth guard added
 - [x] IMMEDIATE mode: TopK micro-refresh fully tested end-to-end (10 E2E tests)
@@ -329,7 +329,7 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 - [x] Foreign table polling-based CDC implemented (3 E2E tests)
 - [x] DDL-during-refresh and standby/replication limitations documented
 - [x] WAL CDC mode passes full E2E suite
-- [ ] E2E tests pass (`just build-e2e-image && just test-e2e`)
+- [x] E2E tests pass (`just build-e2e-image && just test-e2e`)
 
 ---
 

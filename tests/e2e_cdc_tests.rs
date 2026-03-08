@@ -386,7 +386,8 @@ async fn test_trigger_captures_partitioned_table_dml() {
         "CREATE TABLE orders (
             id INT NOT NULL,
             region TEXT NOT NULL,
-            amount NUMERIC
+            amount NUMERIC,
+            PRIMARY KEY (id, region)
         ) PARTITION BY LIST (region)",
     )
     .await;
@@ -465,7 +466,8 @@ async fn test_full_refresh_partitioned_table() {
     db.execute(
         "CREATE TABLE pt_full (
             id INT NOT NULL,
-            cat TEXT NOT NULL
+            cat TEXT NOT NULL,
+            PRIMARY KEY (id, cat)
         ) PARTITION BY LIST (cat)",
     )
     .await;

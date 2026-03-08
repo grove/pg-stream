@@ -103,6 +103,8 @@ async fn test_wal_transition_lifecycle() {
 
     db.execute("CREATE TABLE wal_src (id INT PRIMARY KEY, val TEXT)")
         .await;
+    db.execute("ALTER TABLE wal_src REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO wal_src VALUES (1, 'initial')")
         .await;
 
@@ -147,6 +149,8 @@ async fn test_wal_cdc_captures_insert() {
 
     db.execute("CREATE TABLE wal_ins (id INT PRIMARY KEY, val TEXT)")
         .await;
+    db.execute("ALTER TABLE wal_ins REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO wal_ins VALUES (1, 'a')").await;
 
     db.create_st(
@@ -160,7 +164,8 @@ async fn test_wal_cdc_captures_insert() {
     assert_eq!(db.count("public.wal_ins_st").await, 1);
 
     // Wait for WAL transition
-    wait_for_cdc_mode(&db, "wal_ins", "WAL", Duration::from_secs(30)).await;
+    let mode = wait_for_cdc_mode(&db, "wal_ins", "WAL", Duration::from_secs(30)).await;
+    assert_eq!(mode, "WAL", "Should transition to WAL mode");
 
     // Insert new rows — WAL decoder should capture them
     db.execute("INSERT INTO wal_ins VALUES (2, 'b'), (3, 'c')")
@@ -186,6 +191,8 @@ async fn test_wal_cdc_captures_update() {
 
     db.execute("CREATE TABLE wal_upd (id INT PRIMARY KEY, val TEXT)")
         .await;
+    db.execute("ALTER TABLE wal_upd REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO wal_upd VALUES (1, 'old')").await;
 
     db.create_st(
@@ -196,7 +203,8 @@ async fn test_wal_cdc_captures_update() {
     )
     .await;
 
-    wait_for_cdc_mode(&db, "wal_upd", "WAL", Duration::from_secs(30)).await;
+    let mode = wait_for_cdc_mode(&db, "wal_upd", "WAL", Duration::from_secs(30)).await;
+    assert_eq!(mode, "WAL", "Should transition to WAL mode");
 
     db.execute("UPDATE wal_upd SET val = 'new' WHERE id = 1")
         .await;
@@ -219,6 +227,8 @@ async fn test_wal_cdc_captures_delete() {
 
     db.execute("CREATE TABLE wal_del (id INT PRIMARY KEY, val TEXT)")
         .await;
+    db.execute("ALTER TABLE wal_del REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO wal_del VALUES (1, 'keep'), (2, 'remove')")
         .await;
 
@@ -232,7 +242,8 @@ async fn test_wal_cdc_captures_delete() {
 
     assert_eq!(db.count("public.wal_del_st").await, 2);
 
-    wait_for_cdc_mode(&db, "wal_del", "WAL", Duration::from_secs(30)).await;
+    let mode = wait_for_cdc_mode(&db, "wal_del", "WAL", Duration::from_secs(30)).await;
+    assert_eq!(mode, "WAL", "Should transition to WAL mode");
 
     db.execute("DELETE FROM wal_del WHERE id = 2").await;
 
@@ -303,6 +314,7 @@ async fn test_wal_fallback_on_missing_slot() {
 
     db.execute("CREATE TABLE wal_fb (id INT PRIMARY KEY, val TEXT)")
         .await;
+    db.execute("ALTER TABLE wal_fb REPLICA IDENTITY FULL").await;
     db.execute("INSERT INTO wal_fb VALUES (1, 'x')").await;
 
     db.create_st(
@@ -348,6 +360,8 @@ async fn test_wal_cleanup_on_drop() {
 
     db.execute("CREATE TABLE wal_drop (id INT PRIMARY KEY, val TEXT)")
         .await;
+    db.execute("ALTER TABLE wal_drop REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO wal_drop VALUES (1, 'a')").await;
 
     db.create_st(
@@ -391,8 +405,10 @@ async fn test_wal_cleanup_on_drop() {
 async fn test_wal_keyless_table_stays_on_triggers() {
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
 
-    // Table without primary key
+    // Table without primary key — need REPLICA IDENTITY FULL for cdc_mode='auto'
     db.execute("CREATE TABLE wal_keyless (val TEXT)").await;
+    db.execute("ALTER TABLE wal_keyless REPLICA IDENTITY FULL")
+        .await;
     db.execute("INSERT INTO wal_keyless VALUES ('a'), ('b')")
         .await;
 
