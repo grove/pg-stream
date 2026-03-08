@@ -612,20 +612,20 @@ Use IMMEDIATE when:
 
 Stick with DIFFERENTIAL when:
 - Staleness of a few seconds to minutes is acceptable.
-- The defining query uses unsupported IMMEDIATE constructs (recursive CTEs, TopK).
+- The defining query uses unsupported IMMEDIATE constructs (materialized-view sources, foreign-table sources).
 - Write-side performance is critical (high-throughput OLTP).
 - You need to decouple write latency from view maintenance.
 
 ### What SQL features are NOT supported in IMMEDIATE mode?
 
-IMMEDIATE mode supports nearly all constructs that DIFFERENTIAL supports. The exceptions are:
+IMMEDIATE mode supports **all** constructs that DIFFERENTIAL supports, with two source-type exceptions:
 
-| Feature | Why not supported | Alternative |
+| Feature | Status | Notes |
 |---|---|---|
-| Recursive CTEs (`WITH RECURSIVE`) | Not yet validated with transition tables | Use DIFFERENTIAL mode |
-| TopK (`ORDER BY … LIMIT N`) | Scoped recomputation requires scheduled refresh | Use DIFFERENTIAL mode |
-| Materialized views as sources | Stale-snapshot prevents trigger-based capture | Use the underlying query |
-| Foreign tables as sources | No triggers on foreign tables | Use FULL mode |
+| `WITH RECURSIVE` | ✅ Supported (IM1) | Semi-naive evaluation inside the trigger. A depth counter guards against infinite loops (`pg_trickle.ivm_recursive_max_depth`, default 100). A warning is emitted at create time for very deep hierarchies. |
+| TopK (`ORDER BY … LIMIT N [OFFSET M]`) | ✅ Supported (IM2) | Micro-refresh: recomputes the top-N rows on every DML statement. Gated by `pg_trickle.ivm_topk_max_limit` to prevent unbounded scans. |
+| Materialized views as sources | ❌ Rejected | Stale-snapshot prevents trigger-based capture — use the underlying query instead. |
+| Foreign tables as sources | ❌ Rejected | No triggers on foreign tables — use FULL mode instead. |
 
 Attempting to create or switch to IMMEDIATE mode with an unsupported construct produces a clear error message.
 
@@ -717,6 +717,7 @@ The following are rejected with clear error messages and suggested rewrites:
 | Window functions in expressions | Cannot be differentially maintained | Move window function to a separate column |
 | `LIMIT` / `OFFSET` (without `ORDER BY`) | Stream tables materialize the full result set; `ORDER BY … LIMIT N [OFFSET M]` *is* supported as [TopK](#topk-order-by--limit) | Apply when querying the stream table, or add `ORDER BY` + `LIMIT` to use the TopK pattern |
 | `FOR UPDATE` / `FOR SHARE` | Row-level locking not applicable | Remove the locking clause |
+| `RANGE_AGG` / `RANGE_INTERSECT_AGG` | No incremental delta decomposition exists for range aggregates | Use FULL mode, or compute range unions in the consuming query |
 
 Each rejected feature is explained in detail in the [Why Are These SQL Features Not Supported?](#why-are-these-sql-features-not-supported) section below.
 
