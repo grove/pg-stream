@@ -22,7 +22,7 @@
  *
  * Regenerate the symbol list with:
  *   nm target/debug/deps/pg_trickle-* | grep ' U _' | awk '{print $NF}' \
- *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|get_|Is|Mem|Message|PG_|parse_|pfree|pg_|Portal|Postmaster|raw_|SPI_|Top)'
+ *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|get_|Is|Mem|Message|palloc|palloc_|pfree|PG_|parse_|pg_|Portal|Postmaster|raw_|repalloc|SPI_|Top)'
  */
 
 #include <stddef.h>
@@ -44,7 +44,10 @@ void *error_context_stack       = NULL;
 void *PG_exception_stack        = NULL;
 
 /* ── Memory allocation functions ──────────────────────────────────────── */
+void *palloc(size_t size)                       { (void)size; return NULL; }
 void *palloc0(size_t size)                      { (void)size; return NULL; }
+void *palloc_extended(size_t size, int flags)   { (void)size; (void)flags; return NULL; }
+void *repalloc(void *pointer, size_t size)      { (void)pointer; (void)size; return NULL; }
 
 /* ── MemoryContext functions ──────────────────────────────────────────── */
 void *AllocSetContextCreateInternal(void *parent, const char *name,
