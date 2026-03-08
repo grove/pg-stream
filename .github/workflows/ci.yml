@@ -159,6 +159,8 @@ jobs:
 
       - name: Setup pgrx environment
         uses: ./.github/actions/setup-pgrx
+        with:
+          pg-install-mode: download
 
       - name: Pull postgres:18.1 image
         run: docker pull postgres:18.1
