@@ -23,9 +23,9 @@ pg_trickle brings declarative, automatically-refreshing materialized views to Po
 - **Declarative** — define a query and a schedule bound (or cron expression); the extension schedules and executes refreshes automatically.
 - **Three refresh modes** — `DIFFERENTIAL` (incremental delta), `FULL` (complete recomputation), and `IMMEDIATE` (synchronous in-transaction maintenance via statement-level triggers with transition tables).
 - **Differential View Maintenance (DVM)** — only processes changed rows, not the entire base table. Delta queries are derived automatically from the defining query's operator tree.
-- **Transactional IVM (IMMEDIATE mode)** — stream tables can be maintained **within the same transaction** as the base table DML, providing read-your-writes consistency. Supports window functions, LATERAL joins, scalar subqueries, cascading IMMEDIATE stream tables, and all DVM operators except recursive CTEs.
-- **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in both FULL and DIFFERENTIAL modes.
-- **TopK support** — `ORDER BY ... LIMIT N` queries are accepted and refreshed correctly via scoped recomputation.
+- **Transactional IVM (IMMEDIATE mode)** — stream tables can be maintained **within the same transaction** as the base table DML, providing read-your-writes consistency. Supports window functions, LATERAL joins, scalar subqueries, recursive CTEs, TopK queries, and cascading IMMEDIATE stream tables.
+- **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in FULL, DIFFERENTIAL, and IMMEDIATE modes.
+- **TopK support** — `ORDER BY ... LIMIT N [OFFSET M]` queries are accepted and refreshed correctly via scoped recomputation.
 - **Trigger-based CDC** — lightweight `AFTER` row-level triggers capture changes into buffer tables. No logical replication slots or `wal_level = logical` required. Triggers are created and dropped automatically.
 - **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_trickle.cdc_mode` GUC (`trigger` / `auto` / `wal`).
 - **DAG-aware scheduling** — stream tables that depend on other stream tables are refreshed in topological order. `CALCULATED` schedule propagation is supported.
@@ -138,7 +138,7 @@ CREATE EXTENSION pg_trickle;
 pg_trickle is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
 
 ```bash
-docker pull ghcr.io/grove/pg_trickle-ext:0.2.0
+docker pull ghcr.io/grove/pg_trickle-ext:0.2.2
 ```
 
 Deploy with the official CNPG PostgreSQL 18 operand image:
@@ -152,7 +152,7 @@ spec:
     extensions:
       - name: pg-trickle
         image:
-          reference: ghcr.io/grove/pg_trickle-ext:0.2.0
+          reference: ghcr.io/grove/pg_trickle-ext:0.2.2
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and [cnpg/database-example.yaml](cnpg/database-example.yaml) for complete examples. Requires Kubernetes 1.33+ and CNPG 1.28+.
@@ -223,7 +223,7 @@ SELECT pgtrickle.drop_stream_table('regional_totals');
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
-| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (v0.2.0 → v1.0.0 → post-1.0) |
+| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.3.0) |
 
 ### Research & Plans
 

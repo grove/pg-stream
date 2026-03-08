@@ -44,12 +44,12 @@ The method depends on how you originally installed pg_trickle.
 
 ```bash
 # Download the new release
-curl -LO https://github.com/getretake/pg_trickle/releases/download/v0.2.0/pg_trickle-0.2.0-pg18-linux-amd64.tar.gz
-tar xzf pg_trickle-0.2.0-pg18-linux-amd64.tar.gz
+curl -LO https://github.com/getretake/pg_trickle/releases/download/v0.2.2/pg_trickle-0.2.2-pg18-linux-amd64.tar.gz
+tar xzf pg_trickle-0.2.2-pg18-linux-amd64.tar.gz
 
 # Copy files to PostgreSQL directories
-sudo cp pg_trickle-0.2.0-pg18-linux-amd64/lib/* $(pg_config --pkglibdir)/
-sudo cp pg_trickle-0.2.0-pg18-linux-amd64/extension/* $(pg_config --sharedir)/extension/
+sudo cp pg_trickle-0.2.2-pg18-linux-amd64/lib/* $(pg_config --pkglibdir)/
+sudo cp pg_trickle-0.2.2-pg18-linux-amd64/extension/* $(pg_config --sharedir)/extension/
 ```
 
 **From source (cargo-pgrx):**
@@ -78,9 +78,10 @@ Connect to **each database** where pg_trickle is installed and run:
 ALTER EXTENSION pg_trickle UPDATE;
 ```
 
-This executes the upgrade migration scripts in order (e.g.,
-`pg_trickle--0.1.3--0.2.0.sql`). PostgreSQL automatically determines
-the upgrade chain from your current version to the new `default_version`.
+This executes the upgrade migration scripts in order (for example,
+`pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` →
+`pg_trickle--0.2.1--0.2.2.sql`). PostgreSQL automatically determines the
+upgrade chain from your current version to the new `default_version`.
 
 ### 5. Verify the Upgrade
 
@@ -144,6 +145,35 @@ continue to work as before.
 - GitHub Pages book expansion (6 new documentation pages)
 - User-facing upgrade guide (this document)
 
+### 0.2.1 → 0.2.2
+
+**No catalog table DDL changes.** The `topk_offset` column needed for paged
+TopK was already added in v0.2.1.
+
+**Two SQL function updates** are applied by
+`pg_trickle--0.2.1--0.2.2.sql`:
+
+- `pgtrickle.create_stream_table(...)`
+  - default `schedule` changes from `'1m'` to `'calculated'`
+  - default `refresh_mode` changes from `'DIFFERENTIAL'` to `'AUTO'`
+- `pgtrickle.alter_stream_table(...)`
+  - adds the optional `query` parameter used by ALTER QUERY support
+
+Because PostgreSQL stores argument defaults and function signatures in
+`pg_proc`, the migration script must `DROP FUNCTION` and recreate both
+signatures during `ALTER EXTENSION ... UPDATE`.
+
+**Behavioral notes:**
+
+- Existing stream tables keep their current catalog values. The migration only
+  changes the defaults used by future `create_stream_table(...)` calls.
+- Existing applications can opt a table into the new defaults explicitly via
+  `pgtrickle.alter_stream_table(...)` after the upgrade.
+- After installing the new binary and restarting PostgreSQL, the scheduler now
+  warns if the shared library version and SQL-installed extension version do
+  not match. This helps detect stale `.so`/`.dylib` files after partial
+  upgrades.
+
 ---
 
 ## Supported Upgrade Paths
@@ -154,11 +184,14 @@ The following upgrade chains are supported:
 |------|----|-------------|
 | 0.1.3 | 0.2.0 | `pg_trickle--0.1.3--0.2.0.sql` |
 | 0.1.3 | 0.2.1 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` |
+| 0.1.3 | 0.2.2 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` |
 | 0.2.0 | 0.2.1 | `pg_trickle--0.2.0--0.2.1.sql` |
+| 0.2.0 | 0.2.2 | `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` |
+| 0.2.1 | 0.2.2 | `pg_trickle--0.2.1--0.2.2.sql` |
 
 PostgreSQL automatically chains migration scripts. Running
-`ALTER EXTENSION pg_trickle UPDATE` from v0.1.3 will apply both scripts
-in sequence.
+`ALTER EXTENSION pg_trickle UPDATE` from v0.1.3 will apply all required
+scripts in sequence.
 
 ---
 

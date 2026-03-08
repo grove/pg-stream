@@ -104,8 +104,8 @@ Once the workflow completes:
 - [ ] Optionally verify the extension image layout:
 
 ```bash
-docker pull ghcr.io/grove/pg_trickle-ext:0.2.0
-ID=$(docker create ghcr.io/grove/pg_trickle-ext:0.2.0)
+docker pull ghcr.io/grove/pg_trickle-ext:<version>
+ID=$(docker create ghcr.io/grove/pg_trickle-ext:<version>)
 docker cp "$ID:/lib/" /tmp/ext-lib/
 docker cp "$ID:/share/" /tmp/ext-share/
 docker rm "$ID"
@@ -127,8 +127,8 @@ Each release produces:
 ### Installing from an archive
 
 ```bash
-tar xzf pg_trickle-0.2.0-pg18-linux-amd64.tar.gz
-cd pg_trickle-0.2.0-pg18-linux-amd64
+tar xzf pg_trickle-<version>-pg18-linux-amd64.tar.gz
+cd pg_trickle-<version>-pg18-linux-amd64
 
 sudo cp lib/*.so "$(pg_config --pkglibdir)/"
 sudo cp extension/*.control extension/*.sql "$(pg_config --sharedir)/extension/"
@@ -173,9 +173,12 @@ Every release requires manual updates to the files below. Missing any of them le
 |------|----------------|-----|
 | `Cargo.toml` | `version = "x.y.z"` field | The canonical version source. pgrx reads this at build time and substitutes it into `pg_trickle.control` via `@CARGO_VERSION@`. The git tag must match. |
 | `CHANGELOG.md` | Rename `## [Unreleased]` → `## [x.y.z] — YYYY-MM-DD`; add a new empty `## [Unreleased]` at the top | Keeps the public changelog accurate and gives downstream users a dated record of changes. |
-| `ROADMAP.md` | Update `**Current version:**` in the preamble; move the released milestone to a collapsed "Released" section or delete it; advance the "We are here" pointer to the next milestone | Keeps the forward-looking plan aligned with reality. Leaves no confusion about which milestone is current. |
+| `ROADMAP.md` | Update the preamble's latest-release/current-milestone lines; mark the released milestone done; advance the "We are here" pointer to the next milestone | Keeps the forward-looking plan aligned with reality. Leaves no confusion about what just shipped versus what is next. |
 | `README.md` | Update test-count line (`~N unit tests + M E2E tests`) if test counts changed significantly | The README is the first thing users read; stale numbers erode trust. |
 | `INSTALL.md` | Update any version numbers in install commands or example URLs | Users copy-paste installation commands; stale versions cause failures. |
+| `docs/UPGRADING.md` | Add the new version-specific migration notes and extend the supported upgrade-path table | Documents exactly what `ALTER EXTENSION ... UPDATE` will do and which chains are supported. |
+| `sql/pg_trickle--<old>--<new>.sql` | Add or update the hand-authored upgrade script for every SQL-surface change (new objects, changed signatures, changed defaults, view changes) | `ALTER EXTENSION ... UPDATE` only applies what is explicitly scripted; function defaults and signatures stored in `pg_proc` do not update themselves. |
+| `sql/archive/pg_trickle--<new>.sql` | Commit the generated full-install SQL baseline for the new version | Future upgrade-completeness checks and upgrade E2E tests need an exact baseline for the released version. |
 | `pg_trickle.control` | **No manual edit needed** — `default_version` is set to `'@CARGO_VERSION@'` and pgrx substitutes it at build time. Verify the substitution in the built artifact. | Ensures the SQL `CREATE EXTENSION` command installs the right version. |
 
 ### Checklist summary
@@ -183,9 +186,12 @@ Every release requires manual updates to the files below. Missing any of them le
 ```
 [ ] Cargo.toml — version bumped
 [ ] CHANGELOG.md — [Unreleased] renamed to [x.y.z] with date; new empty [Unreleased] added
-[ ] ROADMAP.md — current version updated; released milestone marked done
+[ ] ROADMAP.md — preamble updated; released milestone marked done
 [ ] README.md — test counts current (if materially changed)
 [ ] INSTALL.md — version references current
+[ ] docs/UPGRADING.md — latest migration notes and supported chains added
+[ ] sql/pg_trickle--<old>--<new>.sql — covers every SQL-surface change
+[ ] sql/archive/pg_trickle--<new>.sql — archived full install SQL committed
 [ ] git tag matches Cargo.toml version
 ```
 

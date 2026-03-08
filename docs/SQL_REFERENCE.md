@@ -329,7 +329,7 @@ SELECT pgtrickle.create_stream_table(
 );
 ```
 
-Recursive CTEs work with both FULL and DIFFERENTIAL modes:
+Recursive CTEs work with FULL, DIFFERENTIAL, and IMMEDIATE modes:
 
 ```sql
 -- Recursive CTE (hierarchy traversal)
@@ -360,6 +360,19 @@ SELECT pgtrickle.create_stream_table(
     SELECT * FROM reports',
     schedule     => '2m',
     refresh_mode => 'DIFFERENTIAL'  -- Uses semi-naive, DRed, or recomputation (auto-selected)
+);
+
+-- Recursive CTE with IMMEDIATE mode (same-transaction maintenance)
+SELECT pgtrickle.create_stream_table(
+    name         => 'org_chart_live',
+    query        => 'WITH RECURSIVE reports AS (
+        SELECT id, name, manager_id FROM employees WHERE manager_id IS NULL
+        UNION ALL
+        SELECT e.id, e.name, e.manager_id
+        FROM employees e JOIN reports r ON e.manager_id = r.id
+    )
+    SELECT * FROM reports',
+    refresh_mode => 'IMMEDIATE'  -- Uses transition tables with semi-naive / DRed maintenance
 );
 ```
 
@@ -611,7 +624,7 @@ pgtrickle.alter_stream_table(
 | `name` | `text` | — | Name of the stream table (schema-qualified or unqualified). |
 | `query` | `text` | `NULL` | New defining query. Pass `NULL` to leave unchanged. When set, the function validates the new query, migrates the storage table schema if needed, updates catalog entries and dependencies, and runs a full refresh. Schema changes are classified as **same** (no DDL), **compatible** (ALTER TABLE ADD/DROP COLUMN), or **incompatible** (full storage rebuild with OID change). |
 | `schedule` | `text` | `NULL` | New schedule as a duration string (e.g., `'5m'`). Pass `NULL` to leave unchanged. Pass `'calculated'` to switch to CALCULATED mode. |
-| `refresh_mode` | `text` | `NULL` | New refresh mode (`'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`). Pass `NULL` to leave unchanged. Switching to/from `'IMMEDIATE'` migrates trigger infrastructure (IVM triggers ↔ CDC triggers), clears or restores the schedule, and runs a full refresh. |
+| `refresh_mode` | `text` | `NULL` | New refresh mode (`'AUTO'`, `'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`). Pass `NULL` to leave unchanged. Switching to/from `'IMMEDIATE'` migrates trigger infrastructure (IVM triggers ↔ CDC triggers), clears or restores the schedule, and runs a full refresh. |
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
 | `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |
 | `diamond_schedule_policy` | `text` | `NULL` | New schedule policy for atomic diamond groups (`'fastest'` or `'slowest'`). Pass `NULL` to leave unchanged. |

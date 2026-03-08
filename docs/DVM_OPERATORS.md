@@ -492,7 +492,7 @@ If column aliases are present, a thin renaming CTE is added on top of the cached
 
 ### Recursive CTEs
 
-Recursive CTEs (`WITH RECURSIVE`) are supported via two strategies depending on the refresh mode:
+Recursive CTEs (`WITH RECURSIVE`) are supported in FULL, DIFFERENTIAL, and IMMEDIATE modes, with different execution paths depending on the refresh mode:
 
 #### FULL Mode
 
@@ -538,6 +538,17 @@ When the change buffer contains DELETE or UPDATE changes, simple propagation is 
 4. **Combine** — final delta = inserts + (over-deletions − rederived rows)
 
 This avoids full recomputation while correctly handling deletions with alternative derivation paths.
+
+#### IMMEDIATE Mode
+
+Recursive CTEs with `refresh_mode = 'IMMEDIATE'` use the same semi-naive and
+Delete-and-Rederive machinery as DIFFERENTIAL mode, but the base changes come
+from PostgreSQL statement transition tables instead of the background change
+buffer. This keeps the stream table transactionally up to date within the same
+statement. To guard against cyclic data or unexpectedly deep recursion, the
+semi-naive SQL injects a depth counter capped by
+`pg_trickle.ivm_recursive_max_depth` (default `100`; set to `0` to disable the
+guard).
 
 ##### Strategy 3: Recomputation Fallback
 
