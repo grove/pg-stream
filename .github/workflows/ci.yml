@@ -45,9 +45,26 @@ env:
   PG_VERSION: "18"
 
 jobs:
-  # ── Unit tests (cross-platform) ─────────────────────────────────────────
+  # ── Unit tests (Linux PR gate) ──────────────────────────────────────────
   unit-tests:
+    name: Unit tests (linux-amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Run unit tests
+        run: ./scripts/run_unit_tests.sh pg18
+
+  # ── Unit tests (extra platforms) ───────────────────────────────────────
+  # Keep macOS/Windows coverage off the PR path; Linux remains the merge gate
+  # while the wider platform matrix runs on schedule or manual dispatch.
+  unit-tests-extra-platforms:
     name: Unit tests (${{ matrix.artifact_suffix }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     continue-on-error: ${{ matrix.os == 'windows-2022' }}
@@ -55,8 +72,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact_suffix: linux-amd64
           - os: macos-14
             artifact_suffix: macos-arm64
           - os: windows-2022
@@ -67,7 +82,7 @@ jobs:
       - name: Setup pgrx environment
         uses: ./.github/actions/setup-pgrx
 
-      - name: Run unit tests (Linux / macOS)
+      - name: Run unit tests (macOS)
         if: runner.os != 'Windows'
         run: ./scripts/run_unit_tests.sh pg18
 
