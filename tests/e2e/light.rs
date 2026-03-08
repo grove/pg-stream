@@ -34,11 +34,30 @@
 //!   instead.
 
 use sqlx::PgPool;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{ExecCommand, IntoContainerPort, Mount, WaitFor},
     runners::AsyncRunner,
 };
+
+static SHARED_DB_COUNTER: AtomicUsize = AtomicUsize::new(1);
+static SHARED_CONTAINER: tokio::sync::OnceCell<SharedContainer> =
+    tokio::sync::OnceCell::const_new();
+
+struct SharedContainer {
+    admin_pool: PgPool,
+    port: u16,
+    container_id: String,
+    _container: Mutex<ContainerAsync<GenericImage>>,
+}
+
+enum ContainerLease {
+    Shared { _shared: &'static SharedContainer },
+}
 
 /// Find the `cargo pgrx package` output directory.
 ///
@@ -65,6 +84,71 @@ fn find_extension_dir() -> String {
     );
 }
 
+fn shared_db_name(prefix: &str) -> String {
+    let sequence = SHARED_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}_{}_{}", std::process::id(), sequence)
+}
+
+fn connection_string(port: u16, db_name: &str) -> String {
+    format!("postgres://postgres:postgres@127.0.0.1:{port}/{db_name}")
+}
+
+async fn create_database(admin_pool: &PgPool, db_name: &str) {
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(admin_pool)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to CREATE DATABASE {db_name}: {e}"));
+}
+
+async fn shared_container() -> &'static SharedContainer {
+    SHARED_CONTAINER
+        .get_or_init(|| async {
+            let ext_dir = find_extension_dir();
+
+            let container = GenericImage::new("postgres", "18.1")
+                .with_exposed_port(5432_u16.tcp())
+                .with_wait_for(WaitFor::message_on_stderr(
+                    "database system is ready to accept connections",
+                ))
+                .with_env_var("POSTGRES_PASSWORD", "postgres")
+                .with_env_var("POSTGRES_DB", "postgres")
+                .with_mount(Mount::bind_mount(ext_dir, "/tmp/pg_ext"))
+                .start()
+                .await
+                .expect(
+                    "Failed to start shared light-e2e container.\n\
+                     Ensure Docker is running and postgres:18.1 is available.",
+                );
+
+            container
+                .exec(ExecCommand::new(vec![
+                    "sh",
+                    "-c",
+                    "cp /tmp/pg_ext/usr/share/postgresql/18/extension/pg_trickle* \
+                        /usr/share/postgresql/18/extension/ && \
+                     cp /tmp/pg_ext/usr/lib/postgresql/18/lib/pg_trickle* \
+                        /usr/lib/postgresql/18/lib/",
+                ]))
+                .await
+                .expect("Failed to copy extension files into shared light-e2e container");
+
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("Failed to get mapped port");
+            let admin_pool =
+                E2eDb::connect_with_retry(&connection_string(port, "postgres"), 15).await;
+
+            SharedContainer {
+                admin_pool,
+                port,
+                container_id: container.id().to_string(),
+                _container: Mutex::new(container),
+            }
+        })
+        .await
+}
+
 /// A test database backed by a stock PostgreSQL 18.1 container with
 /// the compiled pg_trickle extension bind-mounted and installed
 /// **without** `shared_preload_libraries`.
@@ -74,7 +158,8 @@ fn find_extension_dir() -> String {
 /// available.
 pub struct E2eDb {
     pub pool: PgPool,
-    _container: ContainerAsync<GenericImage>,
+    container_id: String,
+    _container: ContainerLease,
 }
 
 #[allow(dead_code)]
@@ -82,7 +167,16 @@ impl E2eDb {
     /// Start a fresh PostgreSQL 18.1 container, install the extension
     /// artifacts via bind-mount, and create the extension.
     pub async fn new() -> Self {
-        Self::new_with_db("pg_trickle_test").await
+        let shared = shared_container().await;
+        let db_name = shared_db_name("pgt_light_e2e");
+        create_database(&shared.admin_pool, &db_name).await;
+        let pool = Self::connect_with_retry(&connection_string(shared.port, &db_name), 15).await;
+
+        E2eDb {
+            pool,
+            container_id: shared.container_id.clone(),
+            _container: ContainerLease::Shared { _shared: shared },
+        }
     }
 
     /// Light harness does not support the background worker.
@@ -104,58 +198,7 @@ impl E2eDb {
 
     /// Get the Docker container ID.
     pub fn container_id(&self) -> &str {
-        self._container.id()
-    }
-
-    /// Internal: start a container, mount extension, install it.
-    async fn new_with_db(db_name: &str) -> Self {
-        let ext_dir = find_extension_dir();
-
-        let container = GenericImage::new("postgres", "18.1")
-            .with_exposed_port(5432_u16.tcp())
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
-            ))
-            .with_env_var("POSTGRES_PASSWORD", "postgres")
-            .with_env_var("POSTGRES_DB", db_name)
-            .with_mount(Mount::bind_mount(ext_dir, "/tmp/pg_ext"))
-            .start()
-            .await
-            .expect(
-                "Failed to start light-e2e container.\n\
-                 Ensure Docker is running and postgres:18.1 is available.",
-            );
-
-        // Copy extension files from the bind-mounted staging area to
-        // the PostgreSQL extension directories.
-        container
-            .exec(ExecCommand::new(vec![
-                "sh",
-                "-c",
-                "cp /tmp/pg_ext/usr/share/postgresql/18/extension/pg_trickle* \
-                    /usr/share/postgresql/18/extension/ && \
-                 cp /tmp/pg_ext/usr/lib/postgresql/18/lib/pg_trickle* \
-                    /usr/lib/postgresql/18/lib/",
-            ]))
-            .await
-            .expect("Failed to copy extension files into container");
-
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("Failed to get mapped port");
-
-        let connection_string = format!(
-            "postgres://postgres:postgres@127.0.0.1:{}/{}",
-            port, db_name,
-        );
-
-        let pool = Self::connect_with_retry(&connection_string, 15).await;
-
-        E2eDb {
-            pool,
-            _container: container,
-        }
+        &self.container_id
     }
 
     /// Retry connection with backoff.

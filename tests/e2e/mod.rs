@@ -35,6 +35,11 @@ pub use light::E2eDb;
 #[cfg(not(feature = "light-e2e"))]
 use sqlx::PgPool;
 #[cfg(not(feature = "light-e2e"))]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+#[cfg(not(feature = "light-e2e"))]
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, Mount, WaitFor},
@@ -45,6 +50,29 @@ use testcontainers::{
 const IMAGE_NAME: &str = "pg_trickle_e2e";
 #[cfg(not(feature = "light-e2e"))]
 const IMAGE_TAG: &str = "latest";
+#[cfg(not(feature = "light-e2e"))]
+static SHARED_DB_COUNTER: AtomicUsize = AtomicUsize::new(1);
+#[cfg(not(feature = "light-e2e"))]
+static SHARED_CONTAINER: tokio::sync::OnceCell<SharedContainer> =
+    tokio::sync::OnceCell::const_new();
+
+#[cfg(not(feature = "light-e2e"))]
+struct SharedContainer {
+    admin_pool: PgPool,
+    port: u16,
+    container_id: String,
+    _container: Mutex<ContainerAsync<GenericImage>>,
+}
+
+#[cfg(not(feature = "light-e2e"))]
+enum ContainerLease {
+    Shared {
+        _shared: &'static SharedContainer,
+    },
+    Dedicated {
+        _container: Box<ContainerAsync<GenericImage>>,
+    },
+}
 
 #[cfg(not(feature = "light-e2e"))]
 fn e2e_image() -> (String, String) {
@@ -94,6 +122,81 @@ async fn assert_docker_image_exists(name: &str, tag: &str) {
     }
 }
 
+#[cfg(not(feature = "light-e2e"))]
+fn shared_db_name(prefix: &str) -> String {
+    let sequence = SHARED_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}_{}_{}", std::process::id(), sequence)
+}
+
+#[cfg(not(feature = "light-e2e"))]
+fn connection_string(port: u16, db_name: &str) -> String {
+    format!("postgres://postgres:postgres@127.0.0.1:{port}/{db_name}")
+}
+
+#[cfg(not(feature = "light-e2e"))]
+async fn create_database(admin_pool: &PgPool, db_name: &str) {
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(admin_pool)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to CREATE DATABASE {db_name}: {e}"));
+}
+
+#[cfg(not(feature = "light-e2e"))]
+async fn reset_postgres_database(pool: &PgPool) {
+    for sql in [
+        "DROP EXTENSION IF EXISTS pg_trickle CASCADE",
+        "DROP SCHEMA IF EXISTS public CASCADE",
+        "CREATE SCHEMA public",
+        "GRANT ALL ON SCHEMA public TO postgres",
+        "GRANT ALL ON SCHEMA public TO public",
+    ] {
+        sqlx::query(sql).execute(pool).await.unwrap_or_else(|e| {
+            panic!("Failed to reset shared postgres database with `{sql}`: {e}")
+        });
+    }
+}
+
+#[cfg(not(feature = "light-e2e"))]
+async fn shared_container() -> &'static SharedContainer {
+    SHARED_CONTAINER
+        .get_or_init(|| async {
+            let (img_name, img_tag) = e2e_image();
+            assert_docker_image_exists(&img_name, &img_tag).await;
+
+            let mut image = GenericImage::new(img_name, img_tag)
+                .with_exposed_port(5432_u16.tcp())
+                .with_wait_for(WaitFor::message_on_stderr(
+                    "database system is ready to accept connections",
+                ))
+                .with_env_var("POSTGRES_PASSWORD", "postgres")
+                .with_env_var("POSTGRES_DB", "postgres");
+
+            if let Some(mount) = coverage_mount() {
+                image = image.with_mount(mount);
+            }
+
+            let container = image.start().await.expect(
+                "Failed to start shared pg_trickle E2E container. \
+                 Did you run ./tests/build_e2e_image.sh first?",
+            );
+
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("Failed to get mapped port");
+            let admin_pool =
+                E2eDb::connect_with_retry(&connection_string(port, "postgres"), 15).await;
+
+            SharedContainer {
+                admin_pool,
+                port,
+                container_id: container.id().to_string(),
+                _container: Mutex::new(container),
+            }
+        })
+        .await
+}
+
 /// A test database backed by a PostgreSQL 18.1 container with
 /// the compiled pg_trickle extension installed and
 /// `shared_preload_libraries` configured.
@@ -102,7 +205,8 @@ async fn assert_docker_image_exists(name: &str, tag: &str) {
 #[cfg(not(feature = "light-e2e"))]
 pub struct E2eDb {
     pub pool: PgPool,
-    _container: ContainerAsync<GenericImage>,
+    container_id: String,
+    _container: ContainerLease,
 }
 
 #[cfg(not(feature = "light-e2e"))]
@@ -113,7 +217,16 @@ impl E2eDb {
     /// The container is ready to accept connections but the extension is NOT
     /// yet created. Call [`with_extension`] to run `CREATE EXTENSION`.
     pub async fn new() -> Self {
-        Self::new_with_db("pg_trickle_test").await
+        let shared = shared_container().await;
+        let db_name = shared_db_name("pgt_e2e");
+        create_database(&shared.admin_pool, &db_name).await;
+        let pool = Self::connect_with_retry(&connection_string(shared.port, &db_name), 15).await;
+
+        E2eDb {
+            pool,
+            container_id: shared.container_id.clone(),
+            _container: ContainerLease::Shared { _shared: shared },
+        }
     }
 
     /// Start a container and connect to the `postgres` database.
@@ -123,7 +236,14 @@ impl E2eDb {
     /// so the extension + STs must live in the `postgres` database for the
     /// scheduler to see them.
     pub async fn new_on_postgres_db() -> Self {
-        Self::new_with_db("postgres").await
+        let shared = shared_container().await;
+        reset_postgres_database(&shared.admin_pool).await;
+
+        E2eDb {
+            pool: shared.admin_pool.clone(),
+            container_id: shared.container_id.clone(),
+            _container: ContainerLease::Shared { _shared: shared },
+        }
     }
 
     /// Start a container configured for benchmarking with resource
@@ -147,7 +267,7 @@ impl E2eDb {
 
     /// Get the Docker container ID (for `docker logs` and profile capture).
     pub fn container_id(&self) -> &str {
-        self._container.id()
+        &self.container_id
     }
 
     /// Internal: start a container using the given database name.
@@ -187,7 +307,10 @@ impl E2eDb {
 
         E2eDb {
             pool,
-            _container: container,
+            container_id: container.id().to_string(),
+            _container: ContainerLease::Dedicated {
+                _container: Box::new(container),
+            },
         }
     }
 
@@ -229,7 +352,10 @@ impl E2eDb {
 
         let db = E2eDb {
             pool,
-            _container: container,
+            container_id: container.id().to_string(),
+            _container: ContainerLease::Dedicated {
+                _container: Box::new(container),
+            },
         };
 
         // Apply runtime PostgreSQL tuning for stable benchmarks.
