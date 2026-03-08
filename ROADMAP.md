@@ -486,6 +486,10 @@ Detailed implementation is now tracked in
 [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md)
 remains the options-analysis precursor.
 
+This milestone is expected to improve refresh throughput and freshness latency
+for independent work, but not materially raise source-table write throughput on
+the current trigger-based CDC path.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | P1 | Phase 0–1: instrumentation, `dry_run`, and execution-unit DAG (atomic groups + IMMEDIATE closures) | 12–20h | [PLAN_PARALLELISM.md §10](plans/sql/PLAN_PARALLELISM.md) |
