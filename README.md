@@ -93,7 +93,7 @@ Every operator listed here works in `DIFFERENTIAL` mode (incremental delta compu
 | **Expressions** | `CURRENT_DATE`, `CURRENT_TIMESTAMP`, etc. | ✅ Full | All SQL value functions |
 | **Expressions** | Array subscript, field access | ✅ Full | `arr[1]`, `(rec).field`, `(data).*` |
 | **Grouping** | `GROUPING SETS` / `CUBE` / `ROLLUP` | ✅ Full | Auto-rewritten to `UNION ALL` of `GROUP BY` queries |
-| **Safety** | Volatile function/operator detection | ✅ Full | Rejected in DIFFERENTIAL; warned for STABLE functions |
+| **Safety** | Volatile function/operator detection | ✅ Full | VOLATILE expressions rejected in DIFFERENTIAL and IMMEDIATE; STABLE functions warned |
 | **Source tables** | Tables without primary key | ✅ Full | Content-hash row identity via all columns |
 | **Source tables** | Views as sources | ✅ Full | Auto-inlined as subqueries; CDC triggers land on base tables |
 | **Source tables** | Materialized views | ❌ DIFF / ✅ FULL | Rejected in DIFFERENTIAL (stale snapshot); allowed in FULL |
@@ -234,7 +234,7 @@ SELECT pgtrickle.drop_stream_table('regional_totals');
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
-| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.3.0) |
+| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.2.3) |
 
 ### Research & Plans
 

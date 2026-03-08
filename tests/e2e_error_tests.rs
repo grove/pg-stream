@@ -700,6 +700,123 @@ async fn test_percentile_cont_now_supported_in_differential_mode() {
     );
 }
 
+// ── Non-deterministic function handling ───────────────────────────────
+
+#[tokio::test]
+async fn test_volatile_function_rejected_in_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE nd_vol_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO nd_vol_src VALUES (1, 10), (2, 20)")
+        .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('nd_vol_st', \
+             $$ SELECT id, random() AS sample, val FROM nd_vol_src $$, '1m', 'DIFFERENTIAL')",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "VOLATILE functions in DIFFERENTIAL mode should be rejected"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("volatile"),
+        "Error should mention volatility, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("random") || err_msg.contains("deterministic"),
+        "Error should point at the volatile function or deterministic alternative, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_immutable_function_allowed_in_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE nd_imm_src (id INT PRIMARY KEY, name TEXT, qty INT)")
+        .await;
+    db.execute("INSERT INTO nd_imm_src VALUES (1, 'Alpha', 2), (2, 'Beta', 3)")
+        .await;
+
+    let defining_query =
+        "SELECT id, lower(name) AS normalized_name, qty * 2 AS doubled_qty FROM nd_imm_src";
+
+    db.create_st("nd_imm_st", defining_query, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("public.nd_imm_st", defining_query)
+        .await;
+
+    db.execute("UPDATE nd_imm_src SET name = 'GAMMA', qty = 4 WHERE id = 2")
+        .await;
+    db.refresh_st("nd_imm_st").await;
+
+    db.assert_st_matches_query("public.nd_imm_st", defining_query)
+        .await;
+}
+
+#[tokio::test]
+async fn test_stable_function_warned_in_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE nd_stable_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO nd_stable_src VALUES (1, 10), (2, 20)")
+        .await;
+
+    let notices = db
+        .try_execute_with_notices(
+            "SELECT pgtrickle.create_stream_table('nd_stable_st', \
+             $$ SELECT id, CURRENT_TIMESTAMP AS created_at, val FROM nd_stable_src $$, \
+             '1m', 'DIFFERENTIAL')",
+        )
+        .await
+        .expect("stable-function create_stream_table call should succeed");
+
+    let saw_warning = notices
+        .iter()
+        .any(|notice| notice.contains("Defining query contains stable functions"));
+    assert!(
+        saw_warning,
+        "Expected stable-function warning notice, got: {notices:?}"
+    );
+
+    let count = db.count("public.nd_stable_st").await;
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn test_nested_volatile_where_expression_rejected_in_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE nd_where_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO nd_where_src VALUES (1, 5), (2, 15), (3, 25)")
+        .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('nd_where_st', \
+             $$ SELECT id, val FROM nd_where_src \
+                WHERE CASE WHEN random() > 0.5 THEN true ELSE val > 10 END $$, \
+             '1m', 'DIFFERENTIAL')",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Nested VOLATILE expressions in WHERE should be rejected in DIFFERENTIAL mode"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("volatile"),
+        "Error should mention volatility, got: {err_msg}"
+    );
+}
+
 // ── Volatile operator detection (G7.2) ──────────────────────────────────
 
 /// Verify that a custom volatile operator is detected and rejected in

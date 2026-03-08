@@ -1415,9 +1415,9 @@ SELECT pgtrickle.create_stream_table(
 
 pg_trickle checks all functions and operators in the defining query against `pg_proc.provolatile`:
 
-- **VOLATILE** functions (e.g., `random()`, `now()`, `gen_random_uuid()`) are **rejected** in DIFFERENTIAL mode because they produce different results on each evaluation, breaking delta correctness.
+- **VOLATILE** functions (e.g., `random()`, `clock_timestamp()`, `gen_random_uuid()`) are **rejected** in DIFFERENTIAL and IMMEDIATE modes because they produce different results on each evaluation, breaking delta correctness.
 - **VOLATILE operators** — custom operators backed by volatile functions are also detected. The check resolves the operator’s implementation function via `pg_operator.oprcode` and checks its volatility in `pg_proc`.
-- **STABLE** functions (e.g., `current_setting()`) produce a **warning** — they are consistent within a single transaction but may differ between refreshes.
+- **STABLE** functions (e.g., `now()`, `current_timestamp`, `current_setting()`) produce a **warning** in DIFFERENTIAL and IMMEDIATE modes — they are consistent within a single refresh but may differ between refreshes.
 - **IMMUTABLE** functions are always safe and produce no warnings.
 
 FULL mode accepts all volatility classes since it re-evaluates the entire query each time.

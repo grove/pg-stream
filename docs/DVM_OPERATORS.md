@@ -37,6 +37,8 @@ The general contract:
 
 Updates are modeled as a delete of the old row followed by an insert of the new row.
 
+DIFFERENTIAL and IMMEDIATE maintenance require deterministic expressions. VOLATILE functions and custom operators such as `random()` or `clock_timestamp()` are rejected during stream table creation because re-evaluation would corrupt delta semantics. STABLE functions such as `now()` and `current_timestamp` are allowed with a warning; FULL mode accepts all volatility classes because it recomputes the full result on each refresh.
+
 ---
 
 ## Operators

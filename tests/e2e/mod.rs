@@ -223,6 +223,7 @@ async fn shared_container() -> &'static SharedContainer {
 #[cfg(not(feature = "light-e2e"))]
 pub struct E2eDb {
     pub pool: PgPool,
+    connection_string: String,
     container_id: String,
     _container: ContainerLease,
 }
@@ -239,9 +240,11 @@ impl E2eDb {
         let db_name = shared_db_name("pgt_e2e");
         create_database(&shared.admin_connection_string, &db_name).await;
         let pool = Self::connect_with_retry(&connection_string(shared.port, &db_name), 15).await;
+        let connection_string = connection_string(shared.port, &db_name);
 
         E2eDb {
             pool,
+            connection_string,
             container_id: shared.container_id.clone(),
             _container: ContainerLease::Shared { _shared: shared },
         }
@@ -260,6 +263,7 @@ impl E2eDb {
 
         E2eDb {
             pool,
+            connection_string: shared.admin_connection_string.clone(),
             container_id: shared.container_id.clone(),
             _container: ContainerLease::Shared { _shared: shared },
         }
@@ -287,6 +291,41 @@ impl E2eDb {
     /// Get the Docker container ID (for `docker logs` and profile capture).
     pub fn container_id(&self) -> &str {
         &self.container_id
+    }
+
+    /// Execute SQL on a dedicated connection and collect PostgreSQL notices.
+    pub async fn try_execute_with_notices(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<String>, tokio_postgres::Error> {
+        let (client, mut connection) =
+            tokio_postgres::connect(&self.connection_string, tokio_postgres::NoTls).await?;
+
+        let notices = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let notices_task = notices.clone();
+
+        let connection_task = tokio::spawn(async move {
+            while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+                match message {
+                    Ok(tokio_postgres::AsyncMessage::Notice(notice)) => {
+                        notices_task.lock().await.push(notice.to_string());
+                    }
+                    Ok(_) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok::<(), tokio_postgres::Error>(())
+        });
+
+        let execute_result = client.batch_execute(sql).await;
+        drop(client);
+
+        connection_task
+            .await
+            .unwrap_or_else(|e| panic!("notice collector task failed: {e}"))?;
+        execute_result?;
+
+        Ok(notices.lock().await.clone())
     }
 
     /// Internal: start a container using the given database name.
@@ -326,6 +365,7 @@ impl E2eDb {
 
         E2eDb {
             pool,
+            connection_string,
             container_id: container.id().to_string(),
             _container: ContainerLease::Dedicated {
                 _container: Box::new(container),
@@ -371,6 +411,7 @@ impl E2eDb {
 
         let db = E2eDb {
             pool,
+            connection_string,
             container_id: container.id().to_string(),
             _container: ContainerLease::Dedicated {
                 _container: Box::new(container),

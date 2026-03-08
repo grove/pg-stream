@@ -1,6 +1,6 @@
 # PLAN: Non-Deterministic Function Handling
 
-**Status:** Not started (future work)
+**Status:** Completed
 
 ## Problem Statement
 
@@ -25,10 +25,18 @@ The DVM engine computes deltas by comparing "what changed in the source" against
 
 ### Current state
 
-- `node_to_expr()` in `parser.rs` parses `FuncCall` nodes and stores them as `Expr::FuncCall { func_name, args }`
-- No volatility check is performed anywhere
-- No warning or error is emitted for volatile functions
-- Both FULL and DIFFERENTIAL modes accept any function silently
+- Volatility lookup, expression scanning, and OpTree walking are implemented in
+    `parser.rs`, including `Expr::Raw` re-parsing and custom-operator lookup via
+    `pg_operator` → `pg_proc`.
+- SQL value functions such as `CURRENT_TIMESTAMP` are classified directly so
+    STABLE warnings are preserved even when they round-trip through `Expr::Raw`.
+- `create_stream_table()` enforces volatility rules for parsed
+    `DIFFERENTIAL` and `IMMEDIATE` queries: VOLATILE expressions are rejected and
+    STABLE expressions emit a warning.
+- E2E coverage exists for volatile rejection, immutable acceptance, nested
+    volatile expressions in `WHERE`, volatile custom operators, and STABLE
+    warning emission.
+- The core roadmap scope is complete.
 
 ---
 
@@ -215,12 +223,12 @@ Some SQL operators implicitly call functions with specific volatility:
 
 | File | Change |
 |---|---|
-| `src/dvm/parser.rs` | Add `lookup_function_volatility()`, `worst_volatility()`, `tree_worst_volatility()` |
-| `src/api.rs` | Add volatility check after `parse_query()` in `create_stream_table()` |
+| `src/dvm/parser.rs` | Implemented: lookup helpers, recursive scanners, raw-expression walker, and tree-level volatility checks |
+| `src/api.rs` | Implemented: volatility enforcement during `create_stream_table()` |
 | `src/error.rs` | No changes needed — `UnsupportedOperator` already covers this |
-| `docs/SQL_REFERENCE.md` | Document volatile function behavior |
-| `docs/DVM_OPERATORS.md` | Add a "Function Volatility" section |
-| `README.md` | Update limitations table |
+| `docs/SQL_REFERENCE.md` | Implemented: volatility behavior documented |
+| `docs/DVM_OPERATORS.md` | Implemented: deterministic-expression note added |
+| `README.md` | Implemented: support matrix clarified |
 
 ## Unit Tests
 
@@ -320,6 +328,14 @@ async fn test_gen_random_uuid_rejected_in_differential() {
     assert!(result.is_err());
 }
 ```
+
+Implemented so far:
+
+- `test_volatile_function_rejected_in_differential_mode`
+- `test_stable_function_warned_in_differential_mode`
+- `test_immutable_function_allowed_in_differential_mode`
+- `test_nested_volatile_where_expression_rejected_in_differential_mode`
+- Custom volatile operator coverage in `test_volatile_operator_rejected_in_differential`
 
 ---
 
