@@ -33,7 +33,7 @@
 //!   won't work inside a Linux container.  Use `just test-e2e-fast`
 //!   instead.
 
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::sync::{
     Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -49,7 +49,7 @@ static SHARED_CONTAINER: tokio::sync::OnceCell<SharedContainer> =
     tokio::sync::OnceCell::const_new();
 
 struct SharedContainer {
-    admin_pool: PgPool,
+    admin_connection_string: String,
     port: u16,
     container_id: String,
     _container: Mutex<ContainerAsync<GenericImage>>,
@@ -93,11 +93,19 @@ fn connection_string(port: u16, db_name: &str) -> String {
     format!("postgres://postgres:postgres@127.0.0.1:{port}/{db_name}")
 }
 
-async fn create_database(admin_pool: &PgPool, db_name: &str) {
+async fn create_database(admin_connection_string: &str, db_name: &str) {
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_connection_string)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect for CREATE DATABASE {db_name}: {e}"));
+
     sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(admin_pool)
+        .execute(&admin_pool)
         .await
         .unwrap_or_else(|e| panic!("Failed to CREATE DATABASE {db_name}: {e}"));
+
+    admin_pool.close().await;
 }
 
 async fn shared_container() -> &'static SharedContainer {
@@ -136,11 +144,10 @@ async fn shared_container() -> &'static SharedContainer {
                 .get_host_port_ipv4(5432)
                 .await
                 .expect("Failed to get mapped port");
-            let admin_pool =
-                E2eDb::connect_with_retry(&connection_string(port, "postgres"), 15).await;
+            let admin_connection_string = connection_string(port, "postgres");
 
             SharedContainer {
-                admin_pool,
+                admin_connection_string,
                 port,
                 container_id: container.id().to_string(),
                 _container: Mutex::new(container),
@@ -169,7 +176,7 @@ impl E2eDb {
     pub async fn new() -> Self {
         let shared = shared_container().await;
         let db_name = shared_db_name("pgt_light_e2e");
-        create_database(&shared.admin_pool, &db_name).await;
+        create_database(&shared.admin_connection_string, &db_name).await;
         let pool = Self::connect_with_retry(&connection_string(shared.port, &db_name), 15).await;
 
         E2eDb {
