@@ -8,6 +8,11 @@ model-paths: ["models"]
 seed-paths: ["seeds"]
 test-paths: ["tests"]
 
+seeds:
+  dbt_pgtrickle_integration_tests:
+    raw_orders:
+      +post-hook: "ALTER TABLE {{ this }} ADD PRIMARY KEY (id)"
+
 clean-targets:
   - "target"
   - "dbt_packages"

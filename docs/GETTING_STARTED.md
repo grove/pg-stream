@@ -83,7 +83,9 @@ No additional configuration is needed. pg_trickle automatically discovers all da
 
 ## Step 1: Create the Base Tables
 
-These are ordinary PostgreSQL tables — pg_trickle doesn't require any special column types, annotations, or schema conventions. The only requirement is that tables have a **primary key** (pg_trickle uses it internally to track which rows changed).
+These are ordinary PostgreSQL tables — pg_trickle doesn't require any special column types, annotations, or schema conventions.
+
+Tables without a primary key work, but pg_trickle will emit a `WARNING` at stream table creation time: change detection falls back to a content-based hash across all columns, which is slower for wide tables and cannot distinguish between identical duplicate rows. Adding a primary key gives the best performance and most reliable change detection. A primary key is also required for automatic transition to WAL-based CDC (`cdc_mode = 'auto'`); without one the source table stays on trigger-based CDC.
 
 ```sql
 -- Department hierarchy (self-referencing tree)

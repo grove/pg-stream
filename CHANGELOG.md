@@ -21,12 +21,6 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   Compatible schema changes preserve the storage table OID (views, policies,
   and publications remain valid).
 
-- **ORDER BY + LIMIT + OFFSET (Paged TopK)** — `OFFSET` is now supported in
-  defining queries with `ORDER BY ... LIMIT N OFFSET M`. Nine E2E tests
-  validate paging, catalog metadata storage, aggregate queries, and rejection
-  of invalid patterns (OFFSET without LIMIT, dynamic OFFSET, negative OFFSET).
-  The `topk_offset` catalog column was pre-provisioned in v0.2.1.
-
 - **AUTO refresh mode** — New default refresh mode for `create_stream_table`.
   AUTO uses differential maintenance when the query supports it and
   automatically falls back to FULL when it doesn't (unsupported constructs,
@@ -43,38 +37,51 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   table preservation guidance. Cross-links to the full
   [Upgrading Guide](docs/UPGRADING.md).
 
-- **IMMEDIATE mode: WITH RECURSIVE support (IM1)** — Recursive CTEs now work
-  in IMMEDIATE mode using semi-naive evaluation with transition tables. A new
-  `pg_trickle.ivm_recursive_max_depth` GUC (default 100) injects a depth
-  counter into the semi-naive SQL to prevent infinite recursion. The
-  `check_for_delete_changes` path handles `TransitionTable` source and
-  `generate_change_buffer_from` uses the NEW transition table.
+- **ORDER BY + LIMIT + OFFSET (Paged TopK)** — `OFFSET` is now supported in
+  defining queries with `ORDER BY ... LIMIT N OFFSET M`. Nine E2E tests
+  validate paging, catalog metadata storage, aggregate queries, and rejection
+  of invalid patterns (OFFSET without LIMIT, dynamic OFFSET, negative OFFSET).
+  The `topk_offset` catalog column was pre-provisioned in v0.2.1.
 
-- **IMMEDIATE mode: TopK micro-refresh (IM2)** — `ORDER BY ... LIMIT N`
-  queries now work in IMMEDIATE mode via `apply_topk_micro_refresh()`. A new
-  `pg_trickle.ivm_topk_max_limit` GUC (default 1000) caps the maximum LIMIT
-  value allowed for IMMEDIATE TopK to prevent expensive per-statement
-  refreshes. Ten E2E tests cover basic operations, aggregates, offset,
-  multi-DML, threshold rejection, and mode switching.
+- **IMMEDIATE mode — WITH RECURSIVE (IM1)** — `WITH RECURSIVE` queries are now
+  fully supported in IMMEDIATE refresh mode. The delta engine applies the
+  base-case delta first, then iterates the recursive step until no new rows
+  are produced (semi-naive evaluation). A depth counter prevents infinite loops;
+  the limit is controlled by `pg_trickle.ivm_recursive_max_depth` (default 100).
+  A warning is emitted at stream table creation time for very deep hierarchy
+  queries so you know the recursion guard is active.
 
-- **Edge case hardening (EC1–EC3):**
-  - `pg_trickle.max_grouping_set_branches` GUC (default 64) — caps
-    CUBE/ROLLUP branch-count explosion at parse time.
-  - Post-restart CDC `TRANSITIONING` health check — detects stuck CDC
-    transitions after crash or restart and rolls back to TRIGGER mode.
-  - Foreign table polling-based change detection — new
-    `pg_trickle.foreign_table_polling` GUC enables periodic re-execution
-    with snapshot comparison (`EXCEPT ALL` deltas) for foreign tables.
+- **IMMEDIATE mode — TopK micro-refresh (IM2)** — `ORDER BY ... LIMIT N`
+  queries are now fully supported in IMMEDIATE refresh mode. On each DML
+  statement the top-N rows are recomputed and merged into the stream table.
+  Ten E2E tests validate INSERT/UPDATE/DELETE propagation, paged TopK,
+  aggregate TopK, threshold rejection, and mode switching between IMMEDIATE
+  and DIFFERENTIAL. The maximum N is controlled by
+  `pg_trickle.ivm_topk_max_limit` (default 1000).
 
-- **WAL CDC hardening (W1–W3):**
-  - WAL mode E2E test suite mirroring the trigger-based suite.
-  - WAL→trigger automatic fallback hardening for edge cases.
-  - `pg_trickle.cdc_mode` default promoted to `'auto'`.
+- **Edge case hardening (EC1–EC3)** — New operational guardrails and coverage:
+  - `pg_trickle.max_grouping_set_branches` GUC (default 64) caps
+    CUBE/ROLLUP branch-count explosion at parse time, with three E2E tests.
+  - Post-restart CDC `TRANSITIONING` health checks detect stuck transitions
+    after crash or restart and roll them back to TRIGGER mode.
+  - `pg_trickle.foreign_table_polling` enables polling-based differential
+    maintenance for foreign tables via snapshot comparison (`EXCEPT ALL`), with
+    three E2E tests.
 
-- **Documentation sweep (DS1–DS3):**
-  - DDL-during-refresh behaviour: safe patterns and race conditions.
-  - Replication/standby limitations in FAQ and Architecture docs.
-  - PgBouncer configuration guide: session-mode requirements.
+- **WAL CDC hardening (W1/W2/W3):**
+  - WAL mode E2E coverage now mirrors the trigger-based suite for slot
+    creation, DML capture, fallback, cleanup, and keyless-table handling.
+  - Automatic fallback is hardened with consecutive-error tracking and
+    `wal_level` revalidation on each poll cycle.
+  - `pg_trickle.cdc_mode` default is promoted from `'trigger'` to `'auto'`.
+
+- **Documentation sweep and reorganization (DS1/DS2/DS3):**
+  - DDL-during-refresh behaviour, replication/standby limitations, and
+    PgBouncer constraints are now documented.
+  - `CONFIGURATION.md` and `SQL_REFERENCE.md` are reorganized around practical
+    operator workflows instead of flat lists.
+  - `GETTING_STARTED.md` now clarifies that trigger-based CDC supports source
+    tables without a primary key; a PK is only required for WAL auto-transition.
 
 ### Changed
 
@@ -82,7 +89,9 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   to `'AUTO'`.
 - `create_stream_table` default `schedule` changed from `'1m'` to
   `'calculated'`.
-- `pg_trickle.cdc_mode` default changed from `'trigger'` to `'auto'`.
+- `pg_trickle.cdc_mode` default changed from `'trigger'` to `'auto'` — the
+  scheduler now starts WAL-based CDC automatically when `wal_level = logical`;
+  it falls back to trigger-based CDC on replicas or when WAL is unavailable.
 
 ---
 
@@ -114,9 +123,10 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
     - `function_hashes TEXT` (EC-16): stores the last-seen MD5 hash of each
       function body referenced in the defining query; differential refreshes
       detect silent `ALTER FUNCTION` body changes and force a full refresh.
-    - `topk_offset INT` (OS2 / EC-14): column pre-provisioned for the paged
-      TopK (`ORDER BY … LIMIT … OFFSET`) feature shipping in v0.2.2; always
-      NULL in this release, wired up in the next one.
+    - `topk_offset INT` (OS2 / EC-14): stores the `OFFSET` value for paged
+      TopK queries (`ORDER BY … LIMIT … OFFSET`). Both the column and the full
+      OFFSET implementation ship in this release (see
+      **ORDER BY + LIMIT + OFFSET** below).
 
 - **GitHub Pages book expansion** — Six new documentation pages across
   three new sections:
@@ -125,6 +135,119 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   - *Research:* pg_ivm comparison, Triggers vs Replication analysis.
   - Book grew from 14 to 20 pages across 6 sections.
 
+- **ORDER BY + LIMIT + OFFSET (Paged TopK)** — `OFFSET` is now supported in
+  defining queries that use `ORDER BY … LIMIT N OFFSET M`. This lets you
+  create a stream table over a paginated result (for example, "the second page
+  of the top-100 products by revenue"). Refreshes use the same scoped
+  recomputation as regular TopK, so adding OFFSET has no additional cost.
+  Eight new E2E tests cover paging, catalog storage, aggregate TopK with
+  OFFSET, and rejection of invalid patterns (OFFSET without LIMIT, dynamic
+  OFFSET, negative OFFSET).
+
+- **`'calculated'` schedule keyword** — `create_stream_table` and
+  `alter_stream_table` now accept `'calculated'` as the schedule value to
+  request automatic schedule derivation. Previously you had to pass SQL `NULL`,
+  which was confusing; SQL `NULL` now returns a helpful error message suggesting
+  `'calculated'` instead. New `pg_trickle.default_schedule_seconds` GUC
+  (default 1 s) sets the target refresh interval for isolated CALCULATED stream
+  tables (those not driven by an upstream stream table's refresh).
+
+- **Diamond GUC simplification** — The cluster-wide
+  `pg_trickle.diamond_consistency` and `pg_trickle.diamond_schedule_policy`
+  GUCs have been removed. Per-stream-table `diamond_consistency` and
+  `diamond_schedule_policy` parameters on `create_stream_table` /
+  `alter_stream_table` are still fully supported and now default to `'atomic'`
+  / `'fastest'`. Diamond detection, atomic-group scheduling, and the
+  `pgtrickle.diamond_groups()` monitoring function all continue to work.
+
+- **Edge case hardening — correctness + operational safety** — Nine issues
+  addressed across the refresh pipeline:
+  - **EC-01** — Inner/left/full join delta operators now evaluate deletes
+    against the pre-change right-side state (R₀) rather than the current state.
+    This prevents stale partner rows from contaminating results when a left-key
+    change and a right-row deletion happen in the same transaction.
+  - **EC-06** — Warning emitted at `create_stream_table` time when any source
+    table lacks a primary key. The `has_keyless_source` catalog flag switches
+    the row-apply strategy to a counted DELETE that handles duplicate rows
+    safely.
+  - **EC-11** — `scheduler_falling_behind` NOTIFY alert when the refresh queue
+    exceeds 80 % capacity, giving operators early warning before refreshes start
+    queuing up.
+  - **EC-13** — `diamond_consistency` now defaults to `'atomic'` for new
+    stream tables (was `'none'`). The atomic-group scheduling logic was fixed
+    to correctly identify and batch all diamond members.
+  - **EC-15** — Warning at `create_stream_table` time when the defining query
+    uses `SELECT *`. Star expansion silently picks up new columns after
+    `ALTER TABLE ADD COLUMN`, which can break differential maintenance.
+  - **EC-18** — Rate-limited log message explaining when and why CDC
+    auto-transition is stuck in the trigger phase (e.g. no replication slot
+    available), so the situation is diagnosable without reading source code.
+  - **EC-19** — Hard error at `create_stream_table` time when WAL CDC is
+    requested for a keyless table that has not set `REPLICA IDENTITY FULL`.
+  - **EC-25/26** — Guard triggers on stream table storage tables block
+    accidental direct DML outside a pg_trickle refresh. A new
+    `pg_trickle.internal_refresh` GUC bypass lets the refresh executor through.
+  - **EC-34** — Scheduler auto-detects a missing WAL replication slot and falls
+    back to trigger-based CDC rather than entering an error loop.
+
+- **DVM parser improvements — three new rewrite passes:** These expand the set
+  of queries that can be maintained differentially without any changes to your
+  SQL:
+  - *Nested window functions in expressions* — queries like
+    `SELECT ABS(ROW_NUMBER() OVER (ORDER BY score) - 5) AS dist FROM t` are
+    auto-rewritten by lifting the window call into an inner subquery before
+    the DVM parser analyzes the query.
+  - *NULL-safe ALL subqueries* — `WHERE col > ALL(SELECT …)` now correctly
+    excludes NULLs in the subquery result per SQL standard semantics.
+  - *Deep AND/OR with SubLinks* — `WHERE (a AND b) OR EXISTS (SELECT …)` at
+    arbitrary depth is correctly rewritten to the semi-join/anti-join form the
+    DVM delta pipeline expects.
+
+- **IMMEDIATE mode parity — initial infrastructure** — Foundation for full
+  IMMEDIATE mode parity with DIFFERENTIAL (completed and hardened with E2E
+  tests in v0.2.2):
+  - *`WITH RECURSIVE` in IMMEDIATE* — the parser allows recursive CTEs and the
+    delta engine applies the base-case delta followed by the recursive step.
+  - *TopK in IMMEDIATE* via `apply_topk_micro_refresh()` — recomputes the top-N
+    rows on each DML statement. Bounded by the new
+    `pg_trickle.ivm_topk_max_limit` GUC (default 1000).
+  - *`pg_trickle.max_grouping_set_branches`* GUC (default 64, range 1–65536)
+    limits `GROUPING SETS` / `CUBE` / `ROLLUP` expansion to avoid query plan
+    explosion.
+  - *Foreign table polling* (`pg_trickle.foreign_table_polling = on`) — lets
+    stream tables use foreign tables as sources. Changes are detected by
+    comparing the foreign table against a snapshot using `EXCEPT ALL`.
+  - *Change buffer partitioning* (`pg_trickle.buffer_partitioning`) — enables
+    LSN-range RANGE partitioning of CDC change buffer tables. Processed
+    partitions can be detached and dropped in O(1) time.
+  - *Column pruning* — the DVM scan operator now omits source columns that are
+    not referenced in the defining query, reducing I/O and memory usage for
+    wide tables.
+
+- **E2E pipeline DAG tests** — 21 new E2E tests across four test files covering
+  realistic multi-layer stream table pipelines. Scenarios include multi-cycle
+  delta drift over 10 refresh cycles, mixed FULL/DIFFERENTIAL/IMMEDIATE modes
+  in a single pipeline, auto-refresh cascade propagation through 3+ DAG layers,
+  4-leaf fan-out and 5-layer-deep chains, and IMMEDIATE cascades. Schemas are
+  drawn from Nexmark, e-commerce, and IoT domains.
+
+- **CI / developer-experience improvements:**
+  - `just test-bench-e2e` and `just test-bench-e2e-fast` convenience targets
+    for running benchmark tests inside the E2E Docker container.
+  - E2E Docker image cold-build time reduced from ~10 min to ~2–3 min using
+    BuildKit cache mounts for the Cargo registry and incremental compile
+    artifacts, plus a pre-built `pg_trickle_builder:pg18` base image.
+  - E2E test suite timeout raised to 60 minutes.
+
+### Changed
+
+- `create_stream_table` default `schedule` changed from `'1m'` to
+  `'calculated'`.
+- `pg_trickle.min_schedule_seconds` default lowered from 60 s to 1 s.
+- `pg_trickle.diamond_consistency` and `pg_trickle.diamond_schedule_policy`
+  cluster-wide GUCs removed; per-table parameters remain and default to
+  `'atomic'` / `'fastest'`.
+
 ### Fixed
 
 - **Upgrade script completeness** — The `pg_trickle--0.1.3--0.2.0.sql`
@@ -132,6 +255,11 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   to silently skip 11 new functions. Fixed by adding all missing
   `CREATE OR REPLACE FUNCTION` statements. Validated by the new completeness
   check script.
+
+- **CTE WITH clause in UNION ALL** — The query parser failed to extract source
+  tables from queries that combined a `WITH` (CTE) clause with `UNION ALL`
+  because it did not strip the `WITH` clause before recursing into the union
+  branches. Stream table creation on such queries now works correctly.
 
 ---
 
@@ -281,6 +409,26 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - **dbt test script: `psql` not on PATH** — added auto-detection of
   Homebrew-keg PostgreSQL `bin/` directories so `wait_for_populated.sh` can
   connect without requiring a globally linked `psql`.
+
+- **`LIMIT ALL` handling** — PostgreSQL 18 represents `LIMIT ALL` internally
+  as a null-constant node (`A_Const{isnull=true}`). The TopK detector and
+  LIMIT rejection code now correctly treat this as "no limit specified", so
+  queries with an explicit `LIMIT ALL` are not incorrectly rejected or tagged
+  as TopK queries.
+
+- **False stable-function warnings** — Common arithmetic expressions like
+  `depth + 1` or `path || name` sometimes triggered a spurious
+  `WARNING: query may produce incorrect incremental results`. This happened
+  because the operator volatility check found a more volatile overload of the
+  same operator symbol (e.g. `timestamp + interval` is STABLE, even though
+  `integer + integer` is IMMUTABLE). Fixed by filtering out temporal and
+  pseudo-type operand overloads before computing worst-case volatility.
+
+- **GROUP BY alias resolution in auto-index creation** — When the defining
+  query renamed a GROUP BY column (e.g. `SELECT id AS department_id, …`), the
+  auto-created composite index referenced the raw source-table name (`"id"`)
+  instead of the storage-table alias (`"department_id"`), producing
+  `ERROR: column "id" does not exist`. Fixed.
 
 ---
 
