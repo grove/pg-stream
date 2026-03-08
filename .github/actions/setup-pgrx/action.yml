@@ -91,6 +91,17 @@ runs:
         # Make pg_config available on PATH
         echo "/usr/lib/postgresql/${{ inputs.pg-version }}/bin" >> "$GITHUB_PATH"
 
+    - name: Install PostgreSQL source build dependencies (Linux)
+      if: runner.os == 'Linux' && inputs.pg-install-mode == 'download'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+          bison \
+          flex \
+          libreadline-dev \
+          zlib1g-dev >/dev/null
+
     # ── PostgreSQL headers (macOS) ────────────────────────────────────────
     - name: Install PostgreSQL ${{ inputs.pg-version }} (macOS)
       if: runner.os == 'macOS' && inputs.pg-install-mode == 'system'
