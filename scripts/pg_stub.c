@@ -153,10 +153,26 @@ int      SPI_execute_with_args(const char *cmd, int nargs,
     (void)nulls; (void)ro; (void)cnt;
     return -1;
 }
+int      SPI_fnumber(void *tupdesc, const char *fname) {
+    (void)tupdesc; (void)fname;
+    return -1;
+}
+char    *SPI_fname(void *tupdesc, int fnumber) {
+    (void)tupdesc; (void)fnumber;
+    return NULL;
+}
+char    *SPI_getvalue(void *tuple, void *tupdesc, int fnumber) {
+    (void)tuple; (void)tupdesc; (void)fnumber;
+    return NULL;
+}
 void    *SPI_getbinval(void *tuple, void *tupdesc, int fnumber,
                        int *isnull) {
     (void)tuple; (void)tupdesc; (void)fnumber;
     if (isnull) *isnull = 1;
+    return NULL;
+}
+char    *SPI_gettype(void *tupdesc, int fnumber) {
+    (void)tupdesc; (void)fnumber;
     return NULL;
 }
 uint32_t SPI_gettypeid(void *tupdesc, int fnumber) {
