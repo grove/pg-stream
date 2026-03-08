@@ -21,17 +21,19 @@ pg_trickle brings declarative, automatically-refreshing materialized views to Po
 ## Key Features
 
 - **Declarative** — define a query and a schedule bound (or cron expression); the extension schedules and executes refreshes automatically.
-- **Three refresh modes** — `DIFFERENTIAL` (incremental delta), `FULL` (complete recomputation), and `IMMEDIATE` (synchronous in-transaction maintenance via statement-level triggers with transition tables).
+- **Four refresh modes** — `AUTO` (smart default: DIFFERENTIAL when possible, FULL fallback), `DIFFERENTIAL` (incremental delta), `FULL` (complete recomputation), and `IMMEDIATE` (synchronous in-transaction maintenance via statement-level triggers with transition tables).
 - **Differential View Maintenance (DVM)** — only processes changed rows, not the entire base table. Delta queries are derived automatically from the defining query's operator tree.
-- **Transactional IVM (IMMEDIATE mode)** — stream tables can be maintained **within the same transaction** as the base table DML, providing read-your-writes consistency. Supports window functions, LATERAL joins, scalar subqueries, cascading IMMEDIATE stream tables, and all DVM operators except recursive CTEs.
-- **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in both FULL and DIFFERENTIAL modes.
-- **TopK support** — `ORDER BY ... LIMIT N` queries are accepted and refreshed correctly via scoped recomputation.
+- **Transactional IVM (IMMEDIATE mode)** — stream tables can be maintained **within the same transaction** as the base table DML, providing read-your-writes consistency. Supports all DVM operators including window functions, LATERAL joins, scalar subqueries, cascading IMMEDIATE stream tables, WITH RECURSIVE, and TopK micro-refresh.
+- **CTE Support** — full support for Common Table Expressions. Non-recursive CTEs are inlined and differentiated algebraically. Multi-reference CTEs share delta computation. Recursive CTEs (`WITH RECURSIVE`) work in FULL, DIFFERENTIAL, and IMMEDIATE modes.
+- **TopK support** — `ORDER BY ... LIMIT N [OFFSET M]` queries are accepted and refreshed correctly via scoped recomputation. Paged TopK (`OFFSET M`) supports server-side pagination.
+- **ALTER QUERY** — change the defining query of an existing stream table online. The engine classifies schema changes (same / compatible / incompatible), migrates the storage table, updates the dependency graph, and runs a full refresh. Compatible changes preserve the storage table OID so views and publications remain valid.
 - **Trigger-based CDC** — lightweight `AFTER` row-level triggers capture changes into buffer tables. No logical replication slots or `wal_level = logical` required. Triggers are created and dropped automatically.
 - **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_trickle.cdc_mode` GUC (`trigger` / `auto` / `wal`).
 - **DAG-aware scheduling** — stream tables that depend on other stream tables are refreshed in topological order. `CALCULATED` schedule propagation is supported.
 - **Diamond dependency consistency** — diamond-shaped DAGs (A→B→D, A→C→D) can be refreshed atomically to prevent split-version reads.
+- **Multi-database auto-discovery** — a single launcher worker automatically spawns per-database scheduler workers for every database that has the extension installed. No manual per-database configuration needed.
 - **Crash-safe** — advisory locks prevent concurrent refreshes; crash recovery marks in-flight refreshes as failed and resumes normal operation.
-- **Observable** — built-in monitoring views (`pgtrickle.pg_stat_stream_tables`), refresh history, slot health checks, staleness reporting, and `NOTIFY`-based alerting.
+- **Observable** — built-in monitoring views (`pgtrickle.pg_stat_stream_tables`), refresh history, slot health checks, staleness reporting, `NOTIFY`-based alerting, and seven dedicated observability functions (`health_check`, `change_buffer_sizes`, `dependency_tree`, `refresh_timeline`, `trigger_inventory`, `list_sources`, `diamond_groups`).
 
 ## SQL Support
 
@@ -138,7 +140,7 @@ CREATE EXTENSION pg_trickle;
 pg_trickle is distributed as a minimal OCI extension image for [CloudNativePG Image Volume Extensions](https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/). The image is `scratch`-based (< 10 MB) and contains only the extension files — no PostgreSQL server, no OS.
 
 ```bash
-docker pull ghcr.io/grove/pg_trickle-ext:0.2.0
+docker pull ghcr.io/grove/pg_trickle-ext:0.2.1
 ```
 
 Deploy with the official CNPG PostgreSQL 18 operand image:
@@ -152,7 +154,7 @@ spec:
     extensions:
       - name: pg-trickle
         image:
-          reference: ghcr.io/grove/pg_trickle-ext:0.2.0
+          reference: ghcr.io/grove/pg_trickle-ext:0.2.1
 ```
 
 See [cnpg/cluster-example.yaml](cnpg/cluster-example.yaml) and [cnpg/database-example.yaml](cnpg/database-example.yaml) for complete examples. Requires Kubernetes 1.33+ and CNPG 1.28+.
@@ -171,30 +173,29 @@ INSERT INTO orders VALUES
     (1, 'US', 100), (2, 'EU', 200),
     (3, 'US', 300), (4, 'APAC', 50);
 
--- Create a stream table with 1-minute schedule (DIFFERENTIAL mode)
+-- Create a stream table — AUTO mode (default): DIFFERENTIAL when possible, FULL fallback.
+-- Schedule defaults to 'calculated' (derived from consumer refresh cycles).
 SELECT pgtrickle.create_stream_table(
     'regional_totals',
     'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
-     FROM orders GROUP BY region',
-    '1m',
-    'DIFFERENTIAL'
+     FROM orders GROUP BY region'
 );
 
--- Or use IMMEDIATE mode: updated within the same transaction as DML
+-- Explicit IMMEDIATE mode: updated within the same transaction as DML
 SELECT pgtrickle.create_stream_table(
     'regional_totals_live',
     'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
      FROM orders GROUP BY region',
-    NULL,          -- no schedule needed
-    'IMMEDIATE'
+    schedule     => NULL,
+    refresh_mode => 'IMMEDIATE'
 );
 
--- Or use a cron schedule with FULL refresh
+-- Explicit schedule and mode
 SELECT pgtrickle.create_stream_table(
     'hourly_totals',
     'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
-    '@hourly',
-    'FULL'
+    schedule     => '@hourly',
+    refresh_mode => 'FULL'
 );
 
 -- Query the stream table like any regular table
@@ -203,11 +204,21 @@ SELECT * FROM regional_totals;
 -- Manual refresh (scheduler also refreshes automatically)
 SELECT pgtrickle.refresh_stream_table('regional_totals');
 
--- Check status
+-- Change the defining query online (ALTER QUERY)
+SELECT pgtrickle.alter_stream_table(
+    'regional_totals',
+    query => 'SELECT region, SUM(amount) AS total, COUNT(*) AS cnt
+              FROM orders WHERE active GROUP BY region'
+);
+
+-- Check status and overall health
 SELECT * FROM pgtrickle.pgt_status();
+SELECT * FROM pgtrickle.health_check();  -- OK/WARN/ERROR triage
 
 -- View monitoring stats
 SELECT * FROM pgtrickle.pg_stat_stream_tables;
+SELECT * FROM pgtrickle.dependency_tree();  -- ASCII DAG view
+SELECT * FROM pgtrickle.change_buffer_sizes();  -- CDC buffer health
 
 -- Drop when no longer needed
 SELECT pgtrickle.drop_stream_table('regional_totals');
@@ -296,7 +307,7 @@ When `refresh_mode = 'IMMEDIATE'`, the stream table is maintained **within the s
 
 No change buffer tables, no scheduler, no WAL infrastructure. The stream table is always up-to-date within the current transaction.
 
-Supported SQL features include all DIFFERENTIAL-mode constructs: JOINs, aggregates, window functions, LATERAL, scalar subqueries, `WITH RECURSIVE`, and more. `WITH RECURSIVE` uses semi-naive evaluation (INSERT-only) or Delete-and-Rederive (DELETE/UPDATE) and is bounded by `pg_trickle.ivm_recursive_max_depth` (default 100).
+Supported SQL features include all DIFFERENTIAL-mode constructs: JOINs, aggregates, window functions, LATERAL, scalar subqueries, `WITH RECURSIVE`, TopK, and more. `WITH RECURSIVE` in IMMEDIATE mode uses semi-naive evaluation (INSERT-only) or Delete-and-Rederive (DELETE/UPDATE), bounded by `pg_trickle.ivm_recursive_max_depth` (default 100). TopK stream tables in IMMEDIATE mode use micro-refresh (recompute top-K on every DML), gated by `pg_trickle.ivm_topk_max_limit`.
 
 ## Architecture
 
@@ -358,7 +369,7 @@ cargo test
 cargo bench
 ```
 
-**Test counts:** ~992 unit tests + 32 integration tests + 40+ E2E test suites (~510 E2E tests).
+**Test counts:** ~1,042 unit tests + integration tests + 819 E2E tests.
 
 ### Code Coverage
 
