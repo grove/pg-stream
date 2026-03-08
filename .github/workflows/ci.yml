@@ -62,32 +62,33 @@ jobs:
   # ── Unit tests (extra platforms) ───────────────────────────────────────
   # Keep macOS/Windows coverage off the PR path; Linux remains the merge gate
   # while the wider platform matrix runs on schedule or manual dispatch.
-  unit-tests-extra-platforms:
-    name: Unit tests (scheduled/manual, ${{ matrix.artifact_suffix }})
+  unit-tests-macos:
+    name: Unit tests (scheduled/manual, macos-arm64)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
     timeout-minutes: 15
-    continue-on-error: ${{ matrix.os == 'windows-2022' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            artifact_suffix: macos-arm64
-          - os: windows-2022
-            artifact_suffix: windows-amd64
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup pgrx environment
         uses: ./.github/actions/setup-pgrx
 
-      - name: Run unit tests (macOS)
-        if: runner.os != 'Windows'
+      - name: Run unit tests
         run: ./scripts/run_unit_tests.sh pg18
 
+  unit-tests-windows:
+    name: Unit tests (scheduled/manual, windows-amd64)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
       - name: Compile-check unit tests (Windows)
-        if: runner.os == 'Windows'
         run: cargo test --lib --features pg18 --no-run
 
   # ── Integration tests (testcontainers, Linux only) ──────────────────────
