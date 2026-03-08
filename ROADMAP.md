@@ -457,7 +457,7 @@ partitioned storage tables are deferred to a future release.
 ## v0.4.0 — Backward Compatibility, Cloud & Scale
 
 **Goal:** Widen the deployment target from PG 18-only to PG 16–18, enable
-parallel refresh across DAG levels, achieve compatibility with connection
+true parallel refresh within a database, achieve compatibility with connection
 poolers (PgBouncer transaction mode), and validate correctness against
 external test corpora. After this milestone the extension is suitable for
 production use on mainstream PostgreSQL deployments including cloud providers.
@@ -481,12 +481,18 @@ PG 14–15 support can follow in a later release.
 
 ### Parallel Refresh
 
+Detailed implementation is now tracked in
+[PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md). The older
+[REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md)
+remains the options-analysis precursor.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| P1 | DAG level extraction (`topological_levels()`) | 2–4h | [REPORT_PARALLELIZATION.md §B](plans/performance/REPORT_PARALLELIZATION.md) |
-| P2 | Dynamic background worker dispatch per level | 12–16h | [REPORT_PARALLELIZATION.md §A+B](plans/performance/REPORT_PARALLELIZATION.md) |
+| P1 | Phase 0–1: instrumentation, `dry_run`, and execution-unit DAG (atomic groups + IMMEDIATE closures) | 12–20h | [PLAN_PARALLELISM.md §10](plans/sql/PLAN_PARALLELISM.md) |
+| P2 | Phase 2–4: job table, worker budget, dynamic refresh workers, and ready-queue dispatch | 16–28h | [PLAN_PARALLELISM.md §10](plans/sql/PLAN_PARALLELISM.md) |
+| P3 | Phase 5–7: composite units, observability, rollout gating, and CI validation | 12–24h | [PLAN_PARALLELISM.md §10](plans/sql/PLAN_PARALLELISM.md) |
 
-> **Parallel refresh subtotal: ~14–20 hours**
+> **Parallel refresh subtotal: ~40–72 hours**
 
 ### Connection Pooler Compatibility
 
@@ -520,7 +526,7 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 **Exit criteria:**
 - [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
-- [ ] `max_concurrent_refreshes` drives real parallel refresh via DAG levels
+- [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
 - [ ] WAL decoder validated against PG 16–17 `pgoutput` format
 - [ ] CI matrix covers PG 16, 17, 18
 - [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
@@ -646,6 +652,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | [CHANGELOG.md](CHANGELOG.md) | What's been built |
 | [plans/PLAN.md](plans/PLAN.md) | Original 13-phase design plan |
 | [plans/sql/SQL_GAPS_7.md](plans/sql/SQL_GAPS_7.md) | 53 known gaps, prioritized |
+| [plans/sql/PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) | Detailed implementation plan for true parallel refresh |
 | [plans/performance/REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md) | Parallelization options analysis |
 | [plans/performance/STATUS_PERFORMANCE.md](plans/performance/STATUS_PERFORMANCE.md) | Benchmark results |
 | [plans/ecosystem/PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) | Ecosystem project catalog |
