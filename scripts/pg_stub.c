@@ -76,6 +76,7 @@ void  errfinish(const char *filename, int lineno, const char *funcname) {
 }
 
 /* ── Transaction / type helpers ───────────────────────────────────────── */
+int      GetDatabaseEncoding(void)             { return 0; }
 uint32_t GetCurrentTransactionIdIfAny(void)     { return 0; }
 uint32_t get_array_type(uint32_t typid)         { (void)typid; return 0; }
 int   IsBinaryCoercible(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }
