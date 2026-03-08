@@ -31,6 +31,11 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   table (e.g. `{wal}`, `{trigger,wal}`, `{transitioning,wal}`). Populated via
   a correlated subquery on `pgt_dependencies`.
 
+- **`0.2.2 -> 0.2.3` upgrade SQL** — added
+  `sql/pg_trickle--0.2.2--0.2.3.sql` so `ALTER EXTENSION pg_trickle UPDATE`
+  picks up the `pgtrickle.pgt_cdc_status` view and the updated
+  `pgtrickle.pg_stat_stream_tables` definition with `cdc_modes`.
+
 ### Documentation
 
 - Clarified volatility semantics across the SQL reference, DVM operator docs,

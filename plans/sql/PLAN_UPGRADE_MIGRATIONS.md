@@ -421,6 +421,7 @@ jumps for common paths to minimize downtime.
 | 0.1.3 | 0.2.0 | `pg_trickle--0.1.3--0.2.0.sql` | ✅ Done |
 | 0.2.0 | 0.2.1 | `pg_trickle--0.2.0--0.2.1.sql` | ✅ Done |
 | 0.2.1 | 0.2.2 | `pg_trickle--0.2.1--0.2.2.sql` | ✅ Done |
+| 0.2.2 | 0.2.3 | `pg_trickle--0.2.2--0.2.3.sql` | ✅ Done |
 | 0.2.2 | 0.3.0 | `pg_trickle--0.2.2--0.3.0.sql` | Not started |
 | 0.1.3 | 0.2.2 | Chained via 0.1.3→0.2.0→0.2.1→0.2.2 | Automatic |
 | 0.3.0 | 1.0.0 | `pg_trickle--0.3.0--1.0.0.sql` | Not started |

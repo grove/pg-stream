@@ -408,6 +408,12 @@ validations, resource leaks, and observability holes. Phased from quick wins
 > (TRIGGER → TRANSITIONING → WAL) was already implemented via
 > `emit_cdc_transition_notify()` in `wal_decoder.rs`.
 
+> **Progress:** The SQL upgrade path for these monitoring changes is now in
+> place via `sql/pg_trickle--0.2.2--0.2.3.sql`, which recreates
+> `pgtrickle.pg_stat_stream_tables` and adds `pgtrickle.pgt_cdc_status` for
+> `ALTER EXTENSION ... UPDATE` users. End-to-end upgrade E2E coverage remains
+> pending, so the release exit criterion stays unchecked.
+
 ### Operational
 
 | Item | Description | Effort | Ref |
@@ -430,7 +436,7 @@ validations, resource leaks, and observability holes. Phased from quick wins
 - [x] `pgtrickle.pgt_cdc_status` view available; NOTIFY on CDC transitions (G5)
 - [ ] Per-table `cdc_mode` override functional in SQL API and dbt adapter (G1)
 - [ ] Prepared statement cache cleanup works after invalidation
-- [ ] Extension upgrade path tested (`0.2.2 → 0.2.3`)
+- [ ] Extension upgrade path tested (`0.2.2 → 0.2.3`) — upgrade SQL added; E2E validation pending
 
 ---
 
