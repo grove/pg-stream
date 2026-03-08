@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-03-08
-> **Latest release:** 0.2.1 (2026-03-05)
-> **Current milestone:** 0.2.2
+> **Latest release:** 0.2.2 (2026-03-08)
+> **Current milestone:** 0.2.3
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -20,13 +20,13 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                      We are here
-                                       │
-                                       ▼
+                                                   We are here
+                                                    │
+                                                    ▼
  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
  │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
- │Released│─│Released│─│Released│─│Ready  │─│Mode & │─│Security│─│Compat │─│Observ-│─│Stable │─│Scale &│
- │ ✅      │ │ ✅      │ │ ✅      │ │Soon   │ │Ops Gap│ │& Part.│ │& Cloud│ │ability│ │Release│ │Ecosys.│
+ │Released│─│Released│─│Released│─│Released│─│Mode & │─│Security│─│Compat │─│Observ-│─│Stable │─│Scale &│
+ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Ops Gap│ │& Part.│ │& Cloud│ │ability│ │Release│ │Ecosys.│
  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
 ```
 
@@ -230,7 +230,7 @@ GitHub Pages book grew from 14 to 20 pages:
 
 ## v0.2.2 — OFFSET, AUTO Mode, ALTER QUERY, Edge Cases & CDC Hardening
 
-**Status: Ready for release (2026-03-08).**
+**Status: Released (2026-03-08).**
 
 This milestone shipped paged TopK OFFSET support, AUTO-by-default refresh
 selection, ALTER QUERY, the remaining upgrade-tooling work, edge-case and WAL
@@ -643,7 +643,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.1.x — Core engine + correctness | ~30h actual | 30h | ✅ Released |
 | v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Released |
 | v0.2.1 — Upgrade Infrastructure & Documentation | ~8h | 70–86h | ✅ Released |
-| v0.2.2 — OFFSET Support, ALTER QUERY & Upgrade Tooling | ~50–70h | 120–156h | Ready for release |
+| v0.2.2 — OFFSET Support, ALTER QUERY & Upgrade Tooling | ~50–70h | 120–156h | ✅ Released |
 | v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | |
 | v0.3.0 — Security & Partitioning | 26–44h | 191–266h | |
 | v0.4.0 — Backward Compatibility, Cloud & Scale | 200–280h | 391–546h | |

@@ -55,7 +55,7 @@ pg_trickle retains its 30+ unique features.
 |---|---|---|
 | Repository | [sraoss/pg_ivm](https://github.com/sraoss/pg_ivm) | [grove/pg-trickle](https://github.com/grove/pg-trickle) |
 | Language | C | Rust (pgrx 0.17) |
-| Latest release | 1.13 (2025-10-20) | 0.2.1 (2026-03-05); 0.2.2 in dev |
+| Latest release | 1.13 (2025-10-20) | 0.2.2 (2026-03-08) |
 | Stars | ~1,400 | early stage |
 | License | PostgreSQL License | Apache 2.0 |
 | PG versions | 13 – 18 | 18 only; **PG 14–18 planned** |
@@ -199,7 +199,7 @@ COMMIT;
 | **Row Level Security** | Yes (with limitations) | Not documented / not tested | pg_ivm |
 | **Concurrency model** | ExclusiveLock on IMMV during maintenance | Advisory locks, non-blocking reads | **pg_trickle** |
 | **Data type restrictions** | Must have btree opclass (no json, xml, point) | No documented type restrictions | **pg_trickle** |
-| **Maturity / ecosystem** | 4 years, 1.4k stars, PGXN, yum packages | v0.2.1 released, 1,042 unit tests + 819 E2E tests, dbt integration | pg_ivm |
+| **Maturity / ecosystem** | 4 years, 1.4k stars, PGXN, yum packages | v0.2.2 released, 1,042 unit tests + 819 E2E tests, dbt integration | pg_ivm |
 
 ### 4.1 Areas Where pg_ivm Wins
 
@@ -577,7 +577,7 @@ refreshed after its upstream dependencies.
 | CNPG / Kubernetes | ❌ (no OCI image) | ✅ OCI extension image |
 | Docker local dev | Manual | ✅ documented |
 | `shared_preload_libraries` | Required (or `session_preload_libraries`) | Required |
-| Extension upgrade scripts | ✅ (1.0 → 1.1 → … → 1.13) | ✅ (0.1.3 → 0.2.0 → 0.2.1, CI completeness check, upgrade E2E tests) |
+| Extension upgrade scripts | ✅ (1.0 → 1.1 → … → 1.13) | ✅ (0.1.3 → 0.2.0 → 0.2.1 → 0.2.2, CI completeness check, upgrade E2E tests) |
 | `pg_dump` / restore | Manual IMMV recreation required | Standard pg_dump supported |
 
 ---
