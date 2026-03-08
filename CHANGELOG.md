@@ -9,6 +9,8 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-03-08
+
 ### Added
 
 - **Non-deterministic function handling** — defining queries are now
@@ -18,6 +20,32 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   coverage verifies volatile rejection, stable-function warnings,
   immutable-function acceptance, and nested volatile detection inside `WHERE`
   expressions.
+
+- **Per-table `cdc_mode` override (G1)** — `pgtrickle.create_stream_table(...)`
+  and `pgtrickle.alter_stream_table(...)` now accept an optional `cdc_mode`
+  parameter (`'auto'`, `'trigger'`, or `'wal'`). The requested override is
+  stored in `pgtrickle.pgt_stream_tables.requested_cdc_mode`, dbt exposes the
+  same setting, and WAL transition eligibility is now resolved per source from
+  the effective requests of all deferred stream tables that depend on it.
+
+- **`pgtrickle.pgt_cdc_status` view (G5)** — new convenience view that joins
+  `pgt_dependencies`, `pgt_stream_tables`, `pg_class`, and `pg_namespace` to
+  expose per-source CDC state in one place. Columns: `pgt_schema`, `pgt_name`,
+  `source_relid`, `source_name`, `source_schema`, `cdc_mode`, `slot_name`,
+  `decoder_confirmed_lsn`, `transition_started_at`. Useful for tracking
+  in-progress TRIGGER→WAL transitions.
+
+- **`cdc_modes` column in `pgtrickle.pg_stat_stream_tables` (G5)** — text
+  array of distinct CDC modes across all TABLE-type sources of each stream
+  table (e.g. `{wal}`, `{trigger,wal}`, `{transitioning,wal}`). Populated via
+  a correlated subquery on `pgt_dependencies`.
+
+- **`0.2.2 -> 0.2.3` upgrade SQL** — added
+  `sql/pg_trickle--0.2.2--0.2.3.sql` so `ALTER EXTENSION pg_trickle UPDATE`
+  picks up the `requested_cdc_mode` catalog column, the updated
+  `create_stream_table` / `alter_stream_table` signatures, the
+  `pgtrickle.pgt_cdc_status` view, and the revised
+  `pgtrickle.pg_stat_stream_tables` definition with `cdc_modes`.
 
 - **Configurable WAL slot lag thresholds** — Added
   `pg_trickle.slot_lag_warning_threshold_mb` (default 100 MB) and
@@ -44,13 +72,38 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Changed
 
+- **WAL slot advancement after FULL refresh (G3)** — `wal_decoder.rs` gains a
+  new `advance_slot_to_current()` helper that calls
+  `pg_replication_slot_advance($1, pg_current_wal_lsn())` (skips gracefully if
+  the slot does not exist). The shared `post_full_refresh_cleanup()` helper in
+  `refresh.rs` calls it for every WAL/TRANSITIONING dependency after each FULL
+  refresh, preventing WAL segment bloat and replication-lag false alarms.
+
+- **Change buffer flush after adaptive FULL fallback (G4)** — the
+  `post_full_refresh_cleanup()` helper (see G3 above) also calls
+  `cleanup_change_buffers_by_frontier()` after every FULL refresh. This
+  eliminates the change-ratio ping-pong cycle where bulk-loaded tables caused
+  the AUTO scheduler to alternate between DIFFERENTIAL and FULL indefinitely.
+  The helper is invoked from `scheduler.rs` after `store_frontier()` in the
+  `Full`, `Reinitialize`, and empty-prev-frontier `Differential` arms, and from
+  the adaptive fallback path inside `execute_differential_refresh()`.
+
+- **Differential refresh now rejects missing baselines defensively** —
+  `execute_differential_refresh()` now returns a user error if it is invoked
+  for an unpopulated stream table or without a previous frontier. Manual
+  refresh still falls back to FULL for `initialize => false` stream tables,
+  and unit plus E2E coverage now lock in both the low-level guard and the
+  public fallback behavior.
+
 - **IMMEDIATE/WAL CDC interaction clarified** — `create_stream_table()` and
   `alter_stream_table()` now emit an INFO message when
   `pg_trickle.cdc_mode = 'wal'` is in effect but the requested
   `refresh_mode = 'IMMEDIATE'`. IMMEDIATE mode continues to use
   statement-level IVM triggers and does not install CDC triggers or create WAL
-  replication slots. Unit tests and E2E coverage now lock in that behavior for
-  both create and alter flows.
+  replication slots. Explicit per-table `cdc_mode => 'wal'` requests are now
+  rejected for `IMMEDIATE` mode with a clear user error, while the global-GUC
+  path continues to log INFO and proceed with IVM triggers. Unit tests and E2E
+  coverage now lock in both behaviors.
 
 - **Prepared statement invalidation completed** — backends now explicitly
   `DEALLOCATE` tracked `__pgt_merge_*` prepared statements when the shared
@@ -70,6 +123,8 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   critical path and continue to run on push-to-main, schedule, or manual
   dispatch. The shared CI setup action now caches the `cargo-pgrx` binary,
   cutting Linux setup time substantially on warm runs.
+
+---
 
 ## [0.2.2] — 2026-03-08
 

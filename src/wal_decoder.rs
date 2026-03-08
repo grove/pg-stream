@@ -174,6 +174,33 @@ pub fn get_existing_slot_lsn(slot_name: &str) -> Result<Option<String>, PgTrickl
     Ok(Some(lsn))
 }
 
+/// Advance a logical replication slot's `confirmed_flush_lsn` to the current
+/// WAL LSN (`pg_current_wal_lsn()`).
+///
+/// Called after a FULL refresh to allow PostgreSQL to reclaim WAL segments
+/// that the full refresh has already materialized (G3). Returns `Ok(())`
+/// immediately if the slot does not exist (e.g., trigger-based sources).
+pub fn advance_slot_to_current(slot_name: &str) -> Result<(), PgTrickleError> {
+    // Guard against missing slot before issuing the advance,
+    // which would otherwise raise a PostgreSQL ERROR.
+    let exists = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+        &[slot_name.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or(false);
+
+    if !exists {
+        return Ok(());
+    }
+
+    Spi::run_with_args(
+        "SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())",
+        &[slot_name.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(format!("advance slot '{}': {}", slot_name, e)))
+}
+
 /// Create a logical replication slot via the PostgreSQL C API.
 ///
 /// Replicates the logic of `pg_create_logical_replication_slot()` from
@@ -841,7 +868,7 @@ pub fn check_and_complete_transition(
 /// Called when the WAL decoder has caught up past the handoff point.
 fn complete_wal_transition(
     source_oid: pg_sys::Oid,
-    pgt_id: i64,
+    _pgt_id: i64,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
@@ -850,7 +877,7 @@ fn complete_wal_transition(
     cdc::drop_change_trigger(source_oid, change_schema)?;
 
     // Step 2: Update catalog to WAL mode
-    StDependency::update_cdc_mode(pgt_id, source_oid, CdcMode::Wal, None, None)?;
+    StDependency::update_cdc_mode_for_source(source_oid, CdcMode::Wal, None, None)?;
 
     info!(
         "pg_trickle: completed WAL transition for source OID {} — trigger dropped, WAL active",
@@ -875,7 +902,7 @@ fn complete_wal_transition(
 /// Cleans up WAL decoder resources and reverts to trigger mode.
 pub fn abort_wal_transition(
     source_oid: pg_sys::Oid,
-    pgt_id: i64,
+    _pgt_id: i64,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
@@ -900,7 +927,8 @@ pub fn abort_wal_transition(
     }
 
     // Step 3: Revert catalog to trigger mode
-    StDependency::update_cdc_mode(pgt_id, source_oid, CdcMode::Trigger, None, None)?;
+    // Step 3: Revert catalog to trigger mode for all dependents of this source.
+    StDependency::update_cdc_mode_for_source(source_oid, CdcMode::Trigger, None, None)?;
 
     // Step 4: Verify the trigger still exists — recreate if lost
     if !cdc::trigger_exists(source_oid)? {
@@ -920,6 +948,59 @@ pub fn abort_wal_transition(
 
     // Emit NOTIFY for transition abort (fallback to triggers)
     monitor::emit_cdc_transition_notify(source_oid, CdcMode::Wal, CdcMode::Trigger, None);
+
+    Ok(())
+}
+
+/// Force a source back to trigger-based CDC to satisfy a conservative request.
+pub fn force_source_to_trigger(
+    source_oid: pg_sys::Oid,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    let deps = StDependency::get_all()?;
+    let source_deps: Vec<_> = deps
+        .into_iter()
+        .filter(|dep| dep.source_relid == source_oid && dep.source_type == "TABLE")
+        .collect();
+
+    let previous_mode = if source_deps.iter().any(|dep| dep.cdc_mode == CdcMode::Wal) {
+        Some(CdcMode::Wal)
+    } else if source_deps
+        .iter()
+        .any(|dep| dep.cdc_mode == CdcMode::Transitioning)
+    {
+        Some(CdcMode::Transitioning)
+    } else {
+        None
+    };
+
+    let slot_name = slot_name_for_source(source_oid);
+    if let Err(e) = drop_replication_slot(&slot_name) {
+        warning!(
+            "pg_trickle: failed to drop replication slot {} while forcing trigger CDC: {}",
+            slot_name,
+            e
+        );
+    }
+    if let Err(e) = drop_publication(source_oid) {
+        warning!(
+            "pg_trickle: failed to drop publication while forcing trigger CDC for OID {}: {}",
+            source_oid.to_u32(),
+            e
+        );
+    }
+
+    StDependency::update_cdc_mode_for_source(source_oid, CdcMode::Trigger, None, None)?;
+
+    if !cdc::trigger_exists(source_oid)? {
+        let pk_columns = cdc::resolve_pk_columns(source_oid)?;
+        let columns = cdc::resolve_source_column_defs(source_oid)?;
+        cdc::create_change_trigger(source_oid, change_schema, &pk_columns, &columns)?;
+    }
+
+    if let Some(prev) = previous_mode {
+        monitor::emit_cdc_transition_notify(source_oid, prev, CdcMode::Trigger, None);
+    }
 
     Ok(())
 }
@@ -987,10 +1068,25 @@ pub fn advance_wal_transitions_phase1(change_schema: &str) -> Result<Phase1Resul
             continue;
         }
 
+        let requested_mode = StDependency::effective_requested_mode_for_source(dep.source_relid)?;
+        match requested_mode.as_deref() {
+            None | Some("trigger") => {
+                if dep.cdc_mode != CdcMode::Trigger {
+                    pending_aborts.push(PendingAbort {
+                        source_relid: dep.source_relid,
+                        pgt_id: dep.pgt_id,
+                    });
+                }
+                continue;
+            }
+            Some("auto") | Some("wal") => {}
+            Some(_) => continue,
+        }
+
         match dep.cdc_mode {
             CdcMode::Trigger => {
                 // Check if this source is eligible for WAL transition
-                match check_transition_eligible(dep) {
+                match check_transition_eligible(dep, requested_mode.as_deref().unwrap_or("auto")) {
                     Ok(true) => {
                         let slot_name = slot_name_for_source(dep.source_relid);
                         // Check if slot already exists (SPI read — fine in Phase 1)
@@ -1150,10 +1246,11 @@ pub fn advance_wal_transitions_phase3(
     Ok(())
 }
 
-/// Check if a source in TRIGGER mode is eligible for WAL transition.
-/// Returns `true` if all prerequisites are met.
-fn check_transition_eligible(dep: &StDependency) -> Result<bool, PgTrickleError> {
-    if !cdc::can_use_logical_replication()? {
+fn check_transition_eligible(
+    dep: &StDependency,
+    requested_mode: &str,
+) -> Result<bool, PgTrickleError> {
+    if !cdc::can_use_logical_replication_for_mode(requested_mode)? {
         return Ok(false);
     }
 
@@ -1181,7 +1278,7 @@ fn check_transition_eligible(dep: &StDependency) -> Result<bool, PgTrickleError>
 /// transaction.
 pub fn finish_wal_transition(
     source_oid: pg_sys::Oid,
-    pgt_id: i64,
+    _pgt_id: i64,
     slot_name: &str,
     slot_lsn: &str,
 ) -> Result<(), PgTrickleError> {
@@ -1189,8 +1286,7 @@ pub fn finish_wal_transition(
     create_publication(source_oid)?;
 
     // Update catalog — mark as TRANSITIONING
-    StDependency::update_cdc_mode(
-        pgt_id,
+    StDependency::update_cdc_mode_for_source(
         source_oid,
         CdcMode::Transitioning,
         Some(slot_name),
@@ -1325,8 +1421,7 @@ fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), Pg
 
     // Update the decoder confirmed LSN in the catalog
     if let Some(ref lsn) = last_lsn {
-        StDependency::update_cdc_mode(
-            dep.pgt_id,
+        StDependency::update_cdc_mode_for_source(
             dep.source_relid,
             dep.cdc_mode,
             dep.slot_name.as_deref(),

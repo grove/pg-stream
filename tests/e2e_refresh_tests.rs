@@ -227,6 +227,40 @@ async fn test_refresh_idempotent() {
         .await;
 }
 
+#[tokio::test]
+async fn test_refresh_uninitialized_differential_stream_table_falls_back_to_full() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE rf_noinit (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO rf_noinit VALUES (1, 'a'), (2, 'b')")
+        .await;
+
+    db.create_st_with_init(
+        "rf_noinit_st",
+        "SELECT id, val FROM rf_noinit",
+        "1m",
+        "DIFFERENTIAL",
+        false,
+    )
+    .await;
+
+    let result = db
+        .try_execute("SELECT pgtrickle.refresh_stream_table('rf_noinit_st')")
+        .await;
+    assert!(result.is_ok(), "manual refresh should fall back to FULL");
+
+    db.assert_st_matches_query("public.rf_noinit_st", "SELECT id, val FROM rf_noinit")
+        .await;
+
+    let (_, refresh_mode, populated, _) = db.pgt_status("rf_noinit_st").await;
+    assert_eq!(refresh_mode, "DIFFERENTIAL");
+    assert!(
+        populated,
+        "manual refresh should initialize the stream table"
+    );
+}
+
 // ── Metadata Updates ───────────────────────────────────────────────────
 
 #[tokio::test]

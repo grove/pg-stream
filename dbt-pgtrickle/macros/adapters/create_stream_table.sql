@@ -1,5 +1,5 @@
 {#
-  pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize)
+  pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode)
 
   Creates a new stream table via pgtrickle.create_stream_table().
   Called by the stream_table materialization on first run.
@@ -12,7 +12,7 @@
     refresh_mode (str): 'FULL' or 'DIFFERENTIAL'
     initialize (bool): Whether to populate immediately on creation
 #}
-{% macro pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize) %}
+{% macro pgtrickle_create_stream_table(name, query, schedule, refresh_mode, initialize, cdc_mode=none) %}
   {#
     Run create_stream_table() outside of dbt's model transaction.
     dbt wraps the model's main statement in BEGIN...ROLLBACK (for testing /
@@ -27,7 +27,10 @@
       {{ dbt.string_literal(query) }},
       {% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %},
       {{ dbt.string_literal(refresh_mode) }},
-      {{ initialize }}
+      {{ initialize }},
+      NULL,
+      NULL,
+      {% if cdc_mode is none %}NULL{% else %}{{ dbt.string_literal(cdc_mode) }}{% endif %}
     );
     COMMIT;
   {% endcall %}

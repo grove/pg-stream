@@ -122,6 +122,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
                      CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
     has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE,
     function_hashes TEXT,
+    requested_cdc_mode TEXT
+                     CHECK (requested_cdc_mode IN ('auto', 'trigger', 'wal')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -268,7 +270,10 @@ SELECT
     COALESCE(stats.total_rows_deleted, 0) AS total_rows_deleted,
     stats.avg_duration_ms,
     stats.last_action,
-    stats.last_status
+    stats.last_status,
+    (SELECT array_agg(DISTINCT d.cdc_mode ORDER BY d.cdc_mode)
+     FROM pgtrickle.pgt_dependencies d
+     WHERE d.pgt_id = st.pgt_id AND d.source_type = 'TABLE') AS cdc_modes
 FROM pgtrickle.pgt_stream_tables st
 LEFT JOIN LATERAL (
     SELECT
@@ -293,6 +298,25 @@ LEFT JOIN LATERAL (
     FROM pgtrickle.pgt_refresh_history h
     WHERE h.pgt_id = st.pgt_id
 ) stats ON true;
+
+-- Per-source CDC status view (G5): exposes cdc_mode, slot names, and
+-- transition timestamps for every TABLE dependency of a stream table.
+CREATE OR REPLACE VIEW pgtrickle.pgt_cdc_status AS
+SELECT
+    st.pgt_schema,
+    st.pgt_name,
+    d.source_relid,
+    c.relname        AS source_name,
+    n.nspname        AS source_schema,
+    d.cdc_mode,
+    d.slot_name,
+    d.decoder_confirmed_lsn,
+    d.transition_started_at
+FROM pgtrickle.pgt_dependencies d
+JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = d.pgt_id
+JOIN pg_class c ON c.oid = d.source_relid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE d.source_type = 'TABLE';
 "#,
     name = "pg_trickle_monitoring_views",
     requires = [parse_duration_seconds],

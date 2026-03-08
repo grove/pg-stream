@@ -1233,8 +1233,12 @@ pub fn trigger_name_for_source(source_oid: pg_sys::Oid) -> String {
 /// When `cdc_mode = "wal"` and `wal_level != logical`, returns an error
 /// instead of `false` (hard requirement).
 pub fn can_use_logical_replication() -> Result<bool, PgTrickleError> {
-    let cdc_mode = config::pg_trickle_cdc_mode();
-    if cdc_mode == "trigger" {
+    can_use_logical_replication_for_mode(&config::pg_trickle_cdc_mode())
+}
+
+/// Check if the server supports logical replication for a requested CDC mode.
+pub fn can_use_logical_replication_for_mode(cdc_mode: &str) -> Result<bool, PgTrickleError> {
+    if cdc_mode.eq_ignore_ascii_case("trigger") {
         return Ok(false);
     }
 
@@ -1243,7 +1247,7 @@ pub fn can_use_logical_replication() -> Result<bool, PgTrickleError> {
         .unwrap_or_default();
 
     if wal_level != "logical" {
-        if cdc_mode == "wal" {
+        if cdc_mode.eq_ignore_ascii_case("wal") {
             return Err(PgTrickleError::InvalidArgument(
                 "pg_trickle.cdc_mode = 'wal' requires wal_level = logical".into(),
             ));

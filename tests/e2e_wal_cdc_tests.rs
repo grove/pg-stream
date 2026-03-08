@@ -89,6 +89,90 @@ async fn test_wal_level_is_logical() {
     );
 }
 
+#[tokio::test]
+async fn test_explicit_wal_override_transitions_even_with_global_trigger() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("ALTER SYSTEM SET pg_trickle.cdc_mode = 'trigger'")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    db.execute("CREATE TABLE wal_override_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("ALTER TABLE wal_override_src REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO wal_override_src VALUES (1, 'initial')")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            name => 'wal_override_st',\
+            query => $$SELECT id, val FROM wal_override_src$$,\
+            schedule => '1s',\
+            refresh_mode => 'DIFFERENTIAL',\
+            cdc_mode => 'wal'\
+        )",
+    )
+    .await;
+
+    let requested_cdc_mode: String = db
+        .query_scalar(
+            "SELECT requested_cdc_mode FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'wal_override_st'",
+        )
+        .await;
+    assert_eq!(requested_cdc_mode, "wal");
+
+    let final_mode =
+        wait_for_cdc_mode(&db, "wal_override_src", "WAL", Duration::from_secs(30)).await;
+    assert_eq!(
+        final_mode, "WAL",
+        "Explicit wal override should transition to WAL mode"
+    );
+}
+
+#[tokio::test]
+async fn test_explicit_trigger_override_blocks_wal_transition() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("CREATE TABLE wal_trigger_override_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("ALTER TABLE wal_trigger_override_src REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO wal_trigger_override_src VALUES (1, 'initial')")
+        .await;
+
+    db.execute(
+        "SELECT pgtrickle.create_stream_table(\
+            name => 'wal_trigger_override_st',\
+            query => $$SELECT id, val FROM wal_trigger_override_src$$,\
+            schedule => '1s',\
+            refresh_mode => 'DIFFERENTIAL',\
+            cdc_mode => 'trigger'\
+        )",
+    )
+    .await;
+
+    let requested_cdc_mode: String = db
+        .query_scalar(
+            "SELECT requested_cdc_mode FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'wal_trigger_override_st'",
+        )
+        .await;
+    assert_eq!(requested_cdc_mode, "trigger");
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mode = get_cdc_mode(&db, "wal_trigger_override_src").await;
+    assert_eq!(
+        mode, "TRIGGER",
+        "Explicit trigger override should keep trigger CDC"
+    );
+    assert!(
+        !slot_exists(&db, "wal_trigger_override_src").await,
+        "Explicit trigger override should prevent WAL slot creation"
+    );
+}
+
 // ── W1: WAL Transition Lifecycle ──────────────────────────────────────
 
 /// Test the full TRIGGER → TRANSITIONING → WAL lifecycle.

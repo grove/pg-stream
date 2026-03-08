@@ -1,8 +1,13 @@
 # Plan: CDC Mode / Refresh Mode Interaction Gaps
 
 Date: 2026-03-07
-Status: IN PROGRESS
+Status: DONE
 Last Updated: 2026-03-08
+
+> **G1–G6 implemented** — per-table `cdc_mode` override, explicit
+> IMMEDIATE+`cdc_mode => 'wal'` rejection, WAL slot advancement,
+> adaptive-fallback cleanup, `pgt_cdc_status`, and the defensive
+> differential-baseline guard all shipped in v0.2.3.
 
 ---
 
@@ -69,7 +74,7 @@ This plan addresses six specific gaps, ordered by user impact.
 
 ---
 
-### G1: Per-Table `cdc_mode` Override
+### G1: Per-Table `cdc_mode` Override ✅
 
 **Problem.** `cdc_mode` is a cluster-wide GUC (`pg_trickle.cdc_mode`). In
 mixed environments — some tables have a PK (WAL-capable), others don't — users
@@ -142,7 +147,7 @@ tables of that stream table. When `NULL` (default), the global GUC applies
 
 ---
 
-### G2: Explicit Validation of `IMMEDIATE` + WAL CDC
+### G2: Explicit Validation of `IMMEDIATE` + WAL CDC ✅
 
 **Problem.** If a user sets `pg_trickle.cdc_mode = 'wal'` and creates a stream
 table with `refresh_mode = 'IMMEDIATE'`, the system silently bypasses WAL
@@ -275,6 +280,15 @@ This causes:
      check `pg_replication_slots.confirmed_flush_lsn` has advanced.
    - Integration test: verify change buffer is empty after FULL refresh.
 
+**Progress (2026-03-08).** Implemented in `Unreleased`. `advance_slot_to_current(slot_name)`
+added to `src/wal_decoder.rs`; uses `pg_replication_slot_advance($1, pg_current_wal_lsn())`
+and silently skips if the slot does not exist. The shared
+`post_full_refresh_cleanup()` helper in `src/refresh.rs` iterates all
+WAL/TRANSITIONING `StDependency` entries, calls `advance_slot_to_current()` for
+each, then calls `cleanup_change_buffers_by_frontier()`. It is invoked from
+`scheduler.rs` after `store_frontier()` in the `Full`, `Reinitialize`, and
+empty-prev `Differential` arms.
+
 ---
 
 ### G4: AUTO→FULL Adaptive Fallback — Change Buffer Cleanup
@@ -324,6 +338,13 @@ ratio over threshold).
      change buffer is empty after refresh.
    - Integration test: after fallback FULL, insert one row → next cycle should
      succeed as DIFFERENTIAL without hitting the ratio threshold.
+
+**Progress (2026-03-08).** Implemented in `Unreleased`. G3 and G4 share the
+`post_full_refresh_cleanup()` helper in `src/refresh.rs`. In the adaptive
+fallback path inside `execute_differential_refresh()`, the helper is called
+after a successful adaptive FULL (TRUNCATE-needed path and ratio-threshold
+path). This prevents stale change-buffer rows from pushing the ratio over the
+threshold again on the next scheduler tick, eliminating the ping-pong cycle.
 
 ---
 
@@ -384,9 +405,23 @@ This makes it difficult to debug slow transitions or stuck states.
      cluster → verify `pgt_cdc_status` shows `TRANSITIONING` then `WAL`.
    - Integration test: verify NOTIFY payload is emitted.
 
+**Progress (2026-03-08).** Implemented in `Unreleased`. `pgtrickle.pgt_cdc_status`
+view added to `src/lib.rs` (the `pg_trickle_monitoring_views` extension_sql!
+block) alongside a `cdc_modes` text-array column in `pg_stat_stream_tables`.
+NOTIFY on transitions (TRIGGER → TRANSITIONING via `finish_wal_transition()`
+and TRANSITIONING → WAL via `complete_wal_transition()`) was already
+implemented by `emit_cdc_transition_notify()` in `src/wal_decoder.rs` in
+prior work.
+
 ---
 
 ### G6: DIFFERENTIAL Without Initialization Baseline
+
+**Progress (2026-03-08).** Completed in `Unreleased`. The low-level
+`execute_differential_refresh()` path now rejects unpopulated stream tables
+and empty previous frontiers before any SPI work begins, and E2E coverage
+continues to verify that manual refresh for `initialize => false` falls back
+to FULL rather than surfacing that internal guard.
 
 **Problem.** If `execute_differential_refresh()` is called on a stream table
 that has `is_populated = false` (never initialized), the frontier defaults to
@@ -407,7 +442,7 @@ trusts its callers. A future caller could skip the check.
 
 #### Implementation Steps
 
-1. **Defensive check in `execute_differential_refresh()`** (`src/refresh.rs:1260`)
+1. **Defensive check in `execute_differential_refresh()`** (`src/refresh.rs`)
    - Add an early return at the top of the function:
      ```rust
      if !st.is_populated {
@@ -433,11 +468,12 @@ trusts its callers. A future caller could skip the check.
      ```
 
 3. **Tests**
-   - Unit test: call `execute_differential_refresh()` with
-     `is_populated = false` → returns error.
-   - Integration test: create ST with `initialize => false`, attempt manual
-     DIFFERENTIAL refresh → verify it falls back to FULL (existing behavior,
-     but now explicitly guarded).
+   - Unit tests: call `execute_differential_refresh()` with
+     `is_populated = false` and with `prev_frontier.is_empty()` → both return
+     `InvalidArgument` before SPI work.
+   - Integration/E2E test: create ST with `initialize => false`, attempt
+     manual DIFFERENTIAL refresh → verify it still falls back to FULL and
+     populates the stream table.
 
 ---
 

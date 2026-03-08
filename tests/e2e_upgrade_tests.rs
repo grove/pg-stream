@@ -53,6 +53,7 @@ async fn test_upgrade_catalog_schema_stability() {
         ("pgt_name", "text"),
         ("pgt_relid", "oid"),
         ("pgt_schema", "text"),
+        ("requested_cdc_mode", "text"),
         ("refresh_mode", "text"),
         ("schedule", "text"),
         ("status", "text"),
@@ -290,6 +291,7 @@ async fn test_upgrade_monitoring_views_present() {
     let views = vec![
         "pgtrickle.stream_tables_info",
         "pgtrickle.pg_stat_stream_tables",
+        "pgtrickle.pgt_cdc_status",
     ];
 
     for view in &views {
@@ -333,7 +335,7 @@ async fn test_upgrade_chain_new_functions_exist() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.2".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.2.3".into());
 
     // Start container WITHOUT auto-extension, install old version manually
     let db = E2eDb::new().await;

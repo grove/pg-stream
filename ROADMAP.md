@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-03-08
-> **Latest release:** 0.2.2 (2026-03-08)
-> **Current milestone:** 0.2.3
+> **Latest release:** 0.2.3 (2026-03-08)
+> **Current milestone:** 0.3.0
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -365,7 +365,7 @@ correctness gap.
 
 > **Non-determinism subtotal: ~4–6 hours**
 
-### CDC / Refresh Mode Interaction Gaps
+### CDC / Refresh Mode Interaction Gaps ✅
 
 Six gaps between the four CDC modes and four refresh modes — missing
 validations, resource leaks, and observability holes. Phased from quick wins
@@ -373,20 +373,49 @@ validations, resource leaks, and observability holes. Phased from quick wins
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G6 | Defensive `is_populated` + empty-frontier check in `execute_differential_refresh()` | 2h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G6 |
-| G2 | Validate `IMMEDIATE` + `cdc_mode='wal'` — INFO for implicit global-GUC path shipped; explicit per-table rejection pending G1 | 2–3h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G2 |
-| G3 | Advance WAL replication slot after FULL refresh; flush change buffers | 4–6h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G3 |
-| G4 | Flush change buffers after AUTO→FULL adaptive fallback (prevents ping-pong) | 3–4h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G4 |
-| G5 | `pgtrickle.pgt_cdc_status` view + NOTIFY on CDC transitions | 4–6h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G5 |
-| G1 | Per-table `cdc_mode` override (SQL API, catalog, dbt, migration) | 2–3d | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G1 |
+| G6 | Defensive `is_populated` + empty-frontier check in `execute_differential_refresh()` | Done | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G6 |
+| G2 | Validate `IMMEDIATE` + `cdc_mode='wal'` — global-GUC path logs INFO; explicit per-table override is rejected with a clear error | Done | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G2 |
+| G3 | Advance WAL replication slot after FULL refresh; flush change buffers | Done | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G3 |
+| G4 | Flush change buffers after AUTO→FULL adaptive fallback (prevents ping-pong) | Done | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G4 |
+| G5 | `pgtrickle.pgt_cdc_status` view + NOTIFY on CDC transitions | Done | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G5 |
+| G1 | Per-table `cdc_mode` override (SQL API, catalog, dbt, migration) | Done | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G1 |
 
-> **CDC/refresh mode gaps subtotal: ~4–6 days**
+> **CDC/refresh mode gaps subtotal: ✅ Complete**
 >
-> **Progress:** G2 phase 1 is now implemented in `Unreleased`: when the
-> cluster-wide `pg_trickle.cdc_mode` is `'wal'`, creating or switching a
-> stream table to `refresh_mode = 'IMMEDIATE'` logs an INFO and continues with
-> statement-level IVM triggers. The explicit rejection path depends on the
-> per-table `cdc_mode` override tracked as G1.
+> **Progress:** G6 is now implemented in `Unreleased`: the low-level
+> differential executor rejects unpopulated stream tables and missing
+> frontiers before it can scan from `0/0`, while the public manual-refresh
+> path continues to fall back to FULL for `initialize => false` stream tables.
+>
+> **Progress:** G1 and G2 are now complete: `create_stream_table()` and
+> `alter_stream_table()` accept an optional per-table `cdc_mode` override,
+> the requested value is stored in `pgt_stream_tables.requested_cdc_mode`, dbt
+> forwards the setting, and shared-source WAL transition eligibility is now
+> resolved conservatively from all dependent deferred stream tables. The
+> cluster-wide `pg_trickle.cdc_mode = 'wal'` path still logs INFO for
+> `refresh_mode = 'IMMEDIATE'`, while explicit per-table `cdc_mode => 'wal'`
+> requests are rejected for IMMEDIATE mode with a clear error.
+>
+> **Progress:** G3 and G4 are now implemented in `Unreleased`:
+> `advance_slot_to_current()` in `wal_decoder.rs` advances WAL slots after
+> each FULL refresh; the shared `post_full_refresh_cleanup()` helper in
+> `refresh.rs` advances all WAL/TRANSITIONING slots and flushes change buffers,
+> called from `scheduler.rs` after every Full/Reinitialize execution and from
+> the adaptive fallback path. This prevents change-buffer ping-pong on
+> bulk-loaded tables.
+>
+> **Progress:** G5 is now implemented in `Unreleased`: the
+> `pgtrickle.pgt_cdc_status` convenience view has been added, and a
+> `cdc_modes` text-array column surfaces per-source CDC modes in
+> `pgtrickle.pg_stat_stream_tables`. NOTIFY on CDC transitions
+> (TRIGGER → TRANSITIONING → WAL) was already implemented via
+> `emit_cdc_transition_notify()` in `wal_decoder.rs`.
+
+> **Progress:** The SQL upgrade path for these CDC and monitoring changes is in
+> place via `sql/pg_trickle--0.2.2--0.2.3.sql`, which adds
+> `requested_cdc_mode`, updates the `create_stream_table` /
+> `alter_stream_table` signatures, recreates `pgtrickle.pg_stat_stream_tables`,
+> and adds `pgtrickle.pgt_cdc_status` for `ALTER EXTENSION ... UPDATE` users.
 
 ### Operational
 
@@ -410,14 +439,16 @@ validations, resource leaks, and observability holes. Phased from quick wins
 
 **Exit criteria:**
 - [x] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
-- [ ] DIFFERENTIAL on unpopulated ST returns error (G6)
-- [ ] IMMEDIATE + explicit `cdc_mode='wal'` rejected with clear error (G2)
-- [ ] WAL slot advanced after FULL refresh; change buffers flushed (G3)
-- [ ] Adaptive fallback flushes change buffers; no ping-pong cycles (G4)
-- [ ] `pgtrickle.pgt_cdc_status` view available; NOTIFY on CDC transitions (G5)
-- [ ] Per-table `cdc_mode` override functional in SQL API and dbt adapter (G1)
+- [x] DIFFERENTIAL on unpopulated ST returns error (G6)
+- [x] IMMEDIATE + explicit `cdc_mode='wal'` rejected with clear error (G2)
+- [x] WAL slot advanced after FULL refresh; change buffers flushed (G3)
+- [x] Adaptive fallback flushes change buffers; no ping-pong cycles (G4)
+- [x] `pgtrickle.pgt_cdc_status` view available; NOTIFY on CDC transitions (G5)
 - [x] Prepared statement cache cleanup works after invalidation
-- [ ] Extension upgrade path tested (`0.2.2 → 0.2.3`)
+- [x] Per-table `cdc_mode` override functional in SQL API and dbt adapter (G1)
+- [x] Extension upgrade path tested (`0.2.2 → 0.2.3`)
+
+**Status: Released (2026-03-08).**
 
 ---
 

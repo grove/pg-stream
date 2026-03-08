@@ -1,8 +1,8 @@
 # PLAN_UPGRADE_MIGRATIONS.md — Extension Upgrade Migrations
 
-> **Status:** Phases 1–5 implemented — Pending E2E validation  
+> **Status:** Phases 1–5 implemented and validated through v0.2.3  
 > **Related:** GAP_SQL_PHASE_7.md F40 (G8.3), PLAN_VERSIONING.md  
-> **Last updated:** 2026-03-05
+> **Last updated:** 2026-03-08
 
 ---
 
@@ -422,6 +422,7 @@ jumps for common paths to minimize downtime.
 | 0.1.3 | 0.2.0 | `pg_trickle--0.1.3--0.2.0.sql` | ✅ Done |
 | 0.2.0 | 0.2.1 | `pg_trickle--0.2.0--0.2.1.sql` | ✅ Done |
 | 0.2.1 | 0.2.2 | `pg_trickle--0.2.1--0.2.2.sql` | ✅ Done |
+| 0.2.2 | 0.2.3 | `pg_trickle--0.2.2--0.2.3.sql` | ✅ Done |
 | 0.2.2 | 0.3.0 | `pg_trickle--0.2.2--0.3.0.sql` | Not started |
 | 0.1.3 | 0.2.2 | Chained via 0.1.3→0.2.0→0.2.1→0.2.2 | Automatic |
 | 0.3.0 | 1.0.0 | `pg_trickle--0.3.0--1.0.0.sql` | Not started |
@@ -582,16 +583,13 @@ For every version bump, complete all items before merging:
 
 ## 13. Remaining Work (Prioritized)
 
-1. **Run upgrade E2E tests** — Build the Docker images and validate all 6 new
-   tests pass (`just test-upgrade 0.1.3 0.2.0`). Currently tests are written
-   but not yet executed against the Docker image.
-2. ~~**Phase 5.2: Version check at CREATE EXTENSION**~~ — ✅ Done in v0.2.2.
-   Implemented as a scheduler startup check in `check_extension_version_match()`.
-3. **DIFFERENTIAL compat test (3.8)** — Requires building a real v0.1.3
+1. **DIFFERENTIAL compat test (3.8)** — Requires building a real v0.1.3
    binary from source to test CDC trigger compatibility across versions.
-4. **Chained upgrade test (3.9)** — Blocked until v0.3.0 exists.
-5. ~~**Phase 5.4: FAQ upgrade section**~~ — ✅ Done in v0.2.2.
-   Three new FAQ entries with cross-links to UPGRADING.md.
+2. **Chained upgrade test (3.9)** — Blocked until v0.3.0 exists.
+
+Upgrade validation for the released v0.2.3 path is complete: the migration
+chain and upgrade E2E suite have been exercised through the current release,
+including `just check-upgrade 0.2.2 0.2.3` and `just test-upgrade 0.1.3 0.2.3`.
 
 ---
 

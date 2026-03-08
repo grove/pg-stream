@@ -55,6 +55,9 @@ pub struct StreamTableMeta {
     /// None means no hashes have been recorded yet (baseline will be taken on
     /// the next differential refresh).
     pub function_hashes: Option<String>,
+    /// User-requested CDC mode override for this stream table.
+    /// None means "follow the global pg_trickle.cdc_mode GUC".
+    pub requested_cdc_mode: Option<String>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -158,13 +161,14 @@ impl StreamTableMeta {
         diamond_consistency: DiamondConsistency,
         diamond_schedule_policy: DiamondSchedulePolicy,
         has_keyless_source: bool,
+        requested_cdc_mode: Option<&str>,
     ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
                     "INSERT INTO pgtrickle.pgt_stream_tables \
-                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -182,6 +186,7 @@ impl StreamTableMeta {
                         diamond_consistency.as_str().into(),
                         diamond_schedule_policy.as_str().into(),
                         has_keyless_source.into(),
+                        requested_cdc_mode.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -203,7 +208,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes \
+                     has_keyless_source, function_hashes, requested_cdc_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -229,7 +234,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes \
+                     has_keyless_source, function_hashes, requested_cdc_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -260,7 +265,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes \
+                     has_keyless_source, function_hashes, requested_cdc_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -286,7 +291,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes \
+                     has_keyless_source, function_hashes, requested_cdc_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -521,6 +526,20 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// Update the per-stream-table requested CDC mode override.
+    pub fn update_requested_cdc_mode(
+        pgt_id: i64,
+        requested_cdc_mode: Option<&str>,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET requested_cdc_mode = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[requested_cdc_mode.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the per-ST adaptive fallback threshold and last FULL refresh time.
     ///
     /// Called after each differential or adaptive-fallback refresh to track
@@ -676,6 +695,7 @@ impl StreamTableMeta {
 
         let has_keyless_source = table.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
         let function_hashes = table.get::<String>(24).map_err(map_spi)?;
+        let requested_cdc_mode = table.get::<String>(25).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -702,6 +722,7 @@ impl StreamTableMeta {
             diamond_schedule_policy,
             has_keyless_source,
             function_hashes,
+            requested_cdc_mode,
         })
     }
 
@@ -783,6 +804,7 @@ impl StreamTableMeta {
 
         let has_keyless_source = row.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
         let function_hashes = row.get::<String>(24).map_err(map_spi)?;
+        let requested_cdc_mode = row.get::<String>(25).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -809,6 +831,7 @@ impl StreamTableMeta {
             diamond_schedule_policy,
             has_keyless_source,
             function_hashes,
+            requested_cdc_mode,
         })
     }
 }
@@ -890,6 +913,61 @@ impl StDependency {
                 pgt_id.into(),
                 source_relid.into(),
             ],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// Update the CDC mode and related fields for all dependencies of a source.
+    pub fn update_cdc_mode_for_source(
+        source_relid: pg_sys::Oid,
+        cdc_mode: CdcMode,
+        slot_name: Option<&str>,
+        decoder_confirmed_lsn: Option<&str>,
+    ) -> Result<(), PgTrickleError> {
+        let transition_started = if cdc_mode == CdcMode::Transitioning {
+            "now()"
+        } else {
+            "NULL"
+        };
+        Spi::run_with_args(
+            &format!(
+                "UPDATE pgtrickle.pgt_dependencies \
+                 SET cdc_mode = $1, slot_name = $2, decoder_confirmed_lsn = $3::pg_lsn, \
+                     transition_started_at = {} \
+                 WHERE source_relid = $4",
+                transition_started
+            ),
+            &[
+                cdc_mode.as_str().into(),
+                slot_name.into(),
+                decoder_confirmed_lsn.into(),
+                source_relid.into(),
+            ],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// Resolve the effective CDC request for a source across all deferred STs.
+    ///
+    /// Precedence is conservative: if any dependent ST requests `trigger`, the
+    /// source remains trigger-based. Otherwise `wal` wins over `auto`.
+    /// Returns `None` when no deferred TABLE dependencies exist.
+    pub fn effective_requested_mode_for_source(
+        source_relid: pg_sys::Oid,
+    ) -> Result<Option<String>, PgTrickleError> {
+        Spi::get_one_with_args::<String>(
+            "SELECT CASE \
+                    WHEN bool_or(lower(COALESCE(st.requested_cdc_mode, current_setting('pg_trickle.cdc_mode'))) = 'trigger') THEN 'trigger' \
+                    WHEN bool_or(lower(COALESCE(st.requested_cdc_mode, current_setting('pg_trickle.cdc_mode'))) = 'wal') THEN 'wal' \
+                    WHEN bool_or(lower(COALESCE(st.requested_cdc_mode, current_setting('pg_trickle.cdc_mode'))) = 'auto') THEN 'auto' \
+                    ELSE NULL \
+                END \
+             FROM pgtrickle.pgt_dependencies d \
+             JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = d.pgt_id \
+             WHERE d.source_relid = $1 \
+               AND d.source_type = 'TABLE' \
+               AND st.refresh_mode <> 'IMMEDIATE'",
+            &[source_relid.into()],
         )
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }

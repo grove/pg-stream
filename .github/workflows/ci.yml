@@ -228,6 +228,7 @@ jobs:
           scripts/check_upgrade_completeness.sh 0.1.3 0.2.0
           scripts/check_upgrade_completeness.sh 0.2.0 0.2.1
           scripts/check_upgrade_completeness.sh 0.2.1 0.2.2
+          scripts/check_upgrade_completeness.sh 0.2.2 0.2.3
 
   # ── Upgrade E2E tests (push-to-main + daily) ───────────────────────────
   # True version-to-version upgrade tests: install old version, populate
@@ -248,13 +249,13 @@ jobs:
         run: ./tests/build_e2e_image.sh
 
       - name: Build upgrade E2E Docker image
-        run: ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.2
+        run: ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.3
 
       - name: Run upgrade E2E tests
         env:
           PGS_E2E_IMAGE: pg_trickle_upgrade_e2e:latest
           PGS_UPGRADE_FROM: "0.1.3"
-          PGS_UPGRADE_TO: "0.2.2"
+          PGS_UPGRADE_TO: "0.2.3"
         run: |
           cargo test --test e2e_upgrade_tests -- \
             --ignored --test-threads=1 --nocapture

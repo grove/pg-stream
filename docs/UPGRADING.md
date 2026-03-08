@@ -44,12 +44,12 @@ The method depends on how you originally installed pg_trickle.
 
 ```bash
 # Download the new release
-curl -LO https://github.com/getretake/pg_trickle/releases/download/v0.2.2/pg_trickle-0.2.2-pg18-linux-amd64.tar.gz
-tar xzf pg_trickle-0.2.2-pg18-linux-amd64.tar.gz
+curl -LO https://github.com/getretake/pg_trickle/releases/download/v0.2.3/pg_trickle-0.2.3-pg18-linux-amd64.tar.gz
+tar xzf pg_trickle-0.2.3-pg18-linux-amd64.tar.gz
 
 # Copy files to PostgreSQL directories
-sudo cp pg_trickle-0.2.2-pg18-linux-amd64/lib/* $(pg_config --pkglibdir)/
-sudo cp pg_trickle-0.2.2-pg18-linux-amd64/extension/* $(pg_config --sharedir)/extension/
+sudo cp pg_trickle-0.2.3-pg18-linux-amd64/lib/* $(pg_config --pkglibdir)/
+sudo cp pg_trickle-0.2.3-pg18-linux-amd64/extension/* $(pg_config --sharedir)/extension/
 ```
 
 **From source (cargo-pgrx):**
@@ -80,7 +80,7 @@ ALTER EXTENSION pg_trickle UPDATE;
 
 This executes the upgrade migration scripts in order (for example,
 `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` →
-`pg_trickle--0.2.1--0.2.2.sql`). PostgreSQL automatically determines the
+`pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql`). PostgreSQL automatically determines the
 upgrade chain from your current version to the new `default_version`.
 
 ### 5. Verify the Upgrade
@@ -174,6 +174,30 @@ signatures during `ALTER EXTENSION ... UPDATE`.
   not match. This helps detect stale `.so`/`.dylib` files after partial
   upgrades.
 
+### 0.2.2 → 0.2.3
+
+**One new catalog column** is added to `pgtrickle.pgt_stream_tables`:
+
+| Column | Type | Default | Purpose |
+|--------|------|---------|--------|
+| `requested_cdc_mode` | `TEXT` | `NULL` | Optional per-stream-table CDC override (`'auto'`, `'trigger'`, `'wal'`) |
+
+**The upgrade script also recreates two SQL functions**:
+
+- `pgtrickle.create_stream_table(...)`
+  - adds the optional `cdc_mode` parameter
+- `pgtrickle.alter_stream_table(...)`
+  - adds the optional `cdc_mode` parameter
+
+**Monitoring view updates:**
+
+- `pgtrickle.pg_stat_stream_tables` gains the `cdc_modes` column
+- `pgtrickle.pgt_cdc_status` is added for per-source CDC visibility
+
+Because PostgreSQL stores function signatures and defaults in `pg_proc`, the
+upgrade script drops and recreates both lifecycle functions during
+`ALTER EXTENSION ... UPDATE`.
+
 ---
 
 ## Supported Upgrade Paths
@@ -185,9 +209,13 @@ The following upgrade chains are supported:
 | 0.1.3 | 0.2.0 | `pg_trickle--0.1.3--0.2.0.sql` |
 | 0.1.3 | 0.2.1 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` |
 | 0.1.3 | 0.2.2 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` |
+| 0.1.3 | 0.2.3 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql` |
 | 0.2.0 | 0.2.1 | `pg_trickle--0.2.0--0.2.1.sql` |
 | 0.2.0 | 0.2.2 | `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` |
+| 0.2.0 | 0.2.3 | `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql` |
 | 0.2.1 | 0.2.2 | `pg_trickle--0.2.1--0.2.2.sql` |
+| 0.2.1 | 0.2.3 | `pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql` |
+| 0.2.2 | 0.2.3 | `pg_trickle--0.2.2--0.2.3.sql` |
 
 PostgreSQL automatically chains migration scripts. Running
 `ALTER EXTENSION pg_trickle UPDATE` from v0.1.3 will apply all required

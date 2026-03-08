@@ -22,7 +22,7 @@
  *
  * Regenerate the symbol list with:
  *   nm target/debug/deps/pg_trickle-* | grep ' U _' | awk '{print $NF}' \
- *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|Is|Mem|Message|PG_|pfree|Portal|Postmaster|SPI_|Top)'
+ *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|get_|Is|Mem|Message|palloc|palloc_|pfree|PG_|parse_|pg_|Portal|Postmaster|raw_|repalloc|SPI_|Top)'
  */
 
 #include <stddef.h>
@@ -44,7 +44,10 @@ void *error_context_stack       = NULL;
 void *PG_exception_stack        = NULL;
 
 /* ── Memory allocation functions ──────────────────────────────────────── */
+void *palloc(size_t size)                       { (void)size; return NULL; }
 void *palloc0(size_t size)                      { (void)size; return NULL; }
+void *palloc_extended(size_t size, int flags)   { (void)size; (void)flags; return NULL; }
+void *repalloc(void *pointer, size_t size)      { (void)pointer; (void)size; return NULL; }
 
 /* ── MemoryContext functions ──────────────────────────────────────────── */
 void *AllocSetContextCreateInternal(void *parent, const char *name,
@@ -59,6 +62,12 @@ void *AllocSetContextCreateInternal(void *parent, const char *name,
 void  MemoryContextDelete(void *ctx)            { (void)ctx; }
 void *MemoryContextGetParent(void *ctx)         { (void)ctx; return NULL; }
 void  pfree(void *ptr)                          { (void)ptr; }
+
+/* ── List helpers ─────────────────────────────────────────────────────── */
+void *lappend(void *list, void *datum)          { (void)datum; return list; }
+void *lcons(void *datum, void *list)            { (void)datum; return list; }
+void  list_free(void *list)                     { (void)list; }
+void  list_free_deep(void *list)                { (void)list; }
 
 /* ── Error data ──────────────────────────────────────────────────────── */
 void *CopyErrorData(void)                       { return NULL; }
@@ -76,10 +85,69 @@ void  errfinish(const char *filename, int lineno, const char *funcname) {
 }
 
 /* ── Transaction / type helpers ───────────────────────────────────────── */
+int      GetDatabaseEncoding(void)             { return 0; }
+uint32_t GetCurrentTransactionId(void)          { return 0; }
 uint32_t GetCurrentTransactionIdIfAny(void)     { return 0; }
+int16_t  get_typlen(uint32_t typid)            { (void)typid; return -1; }
+_Bool    get_typbyval(uint32_t typid)          { (void)typid; return 0; }
+void     get_typlenbyval(uint32_t typid, int16_t *typlen, _Bool *typbyval) {
+    (void)typid;
+    if (typlen) {
+        *typlen = -1;
+    }
+    if (typbyval) {
+        *typbyval = 0;
+    }
+}
+void     get_typlenbyvalalign(uint32_t typid, int16_t *typlen,
+                              _Bool *typbyval, char *typalign) {
+    (void)typid;
+    if (typlen) {
+        *typlen = -1;
+    }
+    if (typbyval) {
+        *typbyval = 0;
+    }
+    if (typalign) {
+        *typalign = 'i';
+    }
+}
+uint32_t get_array_type(uint32_t typid)         { (void)typid; return 0; }
 int   IsBinaryCoercible(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }
 char *format_type_extended(uint32_t oid, int32_t typmod, int flags) {
     (void)oid; (void)typmod; (void)flags;
+    return NULL;
+}
+
+/* ── Toast helpers ────────────────────────────────────────────────────── */
+void *pg_detoast_datum(void *datum)             { return datum; }
+void *pg_detoast_datum_copy(void *datum)        { return datum; }
+void *pg_detoast_datum_slice(void *datum, int32_t first, int32_t count) {
+    (void)first;
+    (void)count;
+    return datum;
+}
+void *pg_detoast_datum_packed(void *datum)      { return datum; }
+
+/* ── Type output helpers ──────────────────────────────────────────────── */
+uintptr_t byteaout(void *fcinfo)                { (void)fcinfo; return 0; }
+uintptr_t textout(void *fcinfo)                 { (void)fcinfo; return 0; }
+uintptr_t json_out(void *fcinfo)                { (void)fcinfo; return 0; }
+uintptr_t jsonb_out(void *fcinfo)               { (void)fcinfo; return 0; }
+
+/* ── Parser entry points ─────────────────────────────────────────────── */
+void *raw_parser(const char *str, int mode) {
+    (void)str; (void)mode;
+    return NULL;
+}
+
+void *parse_analyze_fixedparams(void *parse_tree,
+                                const char *source_text,
+                                const uint32_t *param_types,
+                                int num_params,
+                                void *query_env) {
+    (void)parse_tree; (void)source_text;
+    (void)param_types; (void)num_params; (void)query_env;
     return NULL;
 }
 
@@ -97,10 +165,26 @@ int      SPI_execute_with_args(const char *cmd, int nargs,
     (void)nulls; (void)ro; (void)cnt;
     return -1;
 }
+int      SPI_fnumber(void *tupdesc, const char *fname) {
+    (void)tupdesc; (void)fname;
+    return -1;
+}
+char    *SPI_fname(void *tupdesc, int fnumber) {
+    (void)tupdesc; (void)fnumber;
+    return NULL;
+}
+char    *SPI_getvalue(void *tuple, void *tupdesc, int fnumber) {
+    (void)tuple; (void)tupdesc; (void)fnumber;
+    return NULL;
+}
 void    *SPI_getbinval(void *tuple, void *tupdesc, int fnumber,
                        int *isnull) {
     (void)tuple; (void)tupdesc; (void)fnumber;
     if (isnull) *isnull = 1;
+    return NULL;
+}
+char    *SPI_gettype(void *tupdesc, int fnumber) {
+    (void)tupdesc; (void)fnumber;
     return NULL;
 }
 uint32_t SPI_gettypeid(void *tupdesc, int fnumber) {

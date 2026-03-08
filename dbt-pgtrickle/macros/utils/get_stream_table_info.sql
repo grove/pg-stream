@@ -3,7 +3,7 @@
 
   Returns metadata for a stream table from the pg_trickle catalog.
   Returns a row dict with pgt_name, pgt_schema, defining_query, schedule,
-  refresh_mode, status — or none if the stream table does not exist.
+  refresh_mode, status, requested_cdc_mode — or none if the stream table does not exist.
 
   Args:
     name (str): Stream table name. May be schema-qualified ('analytics.order_totals')
@@ -21,7 +21,7 @@
     {% endif %}
 
     {% set query %}
-      SELECT pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status
+      SELECT pgt_name, pgt_schema, defining_query, schedule, refresh_mode, status, requested_cdc_mode
       FROM pgtrickle.pgt_stream_tables
       WHERE pgt_schema = {{ dbt.string_literal(lookup_schema) }}
         AND pgt_name = {{ dbt.string_literal(lookup_name) }}

@@ -128,6 +128,45 @@ async fn test_alter_to_immediate_ignores_wal_cdc_guc() {
 }
 
 #[tokio::test]
+async fn test_alter_to_immediate_rejects_explicit_wal_cdc_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE al_mode_explicit_wal_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO al_mode_explicit_wal_src VALUES (1, 'a')")
+        .await;
+
+    db.create_st(
+        "al_mode_explicit_wal_st",
+        "SELECT id, val FROM al_mode_explicit_wal_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.alter_stream_table(\
+                'al_mode_explicit_wal_st',\
+                refresh_mode => 'IMMEDIATE',\
+                cdc_mode => 'wal'\
+            )",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "Explicit wal CDC must be rejected for IMMEDIATE mode switches"
+    );
+
+    let error = format!("{}", result.unwrap_err());
+    assert!(
+        error.contains("incompatible with cdc_mode = 'wal'"),
+        "Expected explicit IMMEDIATE+wal incompatibility error, got: {error}"
+    );
+}
+
+#[tokio::test]
 async fn test_alter_suspend() {
     let db = E2eDb::new().await.with_extension().await;
 

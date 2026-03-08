@@ -22,6 +22,7 @@
   {# -- Model config -- #}
   {%- set schedule = config.get('schedule', '1m') -%}
   {%- set refresh_mode = config.get('refresh_mode', 'AUTO') -%}
+  {%- set cdc_mode = config.get('cdc_mode', none) -%}
   {%- set initialize = config.get('initialize', true) -%}
   {%- set status = config.get('status', none) -%}
   {%- set st_name = config.get('stream_table_name', target_relation.identifier) -%}
@@ -54,7 +55,7 @@
   {% if not st_exists %}
     {# -- CREATE: stream table does not exist yet -- #}
     {{ dbt_pgtrickle.pgtrickle_create_stream_table(
-         qualified_name, defining_query, schedule, refresh_mode, initialize
+          qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode
        ) }}
   {% else %}
     {# -- UPDATE: stream table exists — check if query changed -- #}
@@ -65,7 +66,8 @@
       {{ log("pg_trickle: query changed — altering '" ~ qualified_name ~ "' in place", info=true) }}
       {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
            qualified_name, schedule, refresh_mode,
-           status=status, current_info=current_info,
+         status=status, current_info=current_info,
+         cdc_mode=cdc_mode,
            query=defining_query
          ) }}
     {% else %}
@@ -73,7 +75,8 @@
          Pass current_info to avoid redundant catalog lookup. #}
       {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
            qualified_name, schedule, refresh_mode,
-           status=status, current_info=current_info
+         status=status, current_info=current_info,
+         cdc_mode=cdc_mode
          ) }}
     {% endif %}
   {% endif %}

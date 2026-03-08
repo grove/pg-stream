@@ -5,11 +5,11 @@
 #   - The old version's full install SQL (so CREATE EXTENSION VERSION 'X' works)
 #   - All upgrade scripts in the chain (so ALTER EXTENSION UPDATE can chain)
 #
-# Supports multi-hop upgrade chains. For example, upgrading 0.1.3 → 0.2.2:
+# Supports multi-hop upgrade chains. For example, upgrading 0.1.3 → 0.2.3:
 #   1. CREATE EXTENSION pg_trickle VERSION '0.1.3'
 #   2. Populate data under the old schema
-#   3. ALTER EXTENSION pg_trickle UPDATE TO '0.2.2'
-#      (PostgreSQL auto-chains: 0.1.3→0.2.0→0.2.1→0.2.2)
+#   3. ALTER EXTENSION pg_trickle UPDATE TO '0.2.3'
+#      (PostgreSQL auto-chains: 0.1.3→0.2.0→0.2.1→0.2.2→0.2.3)
 #   4. Verify all objects exist and data is intact
 #
 # The old SQL runs against the new .so binary — this works because:
@@ -19,7 +19,7 @@
 # Usage:
 #   docker build -t pg_trickle_upgrade_e2e:latest \
 #     --build-arg FROM_VERSION=0.1.3 \
-#     --build-arg TO_VERSION=0.2.2 \
+#     --build-arg TO_VERSION=0.2.3 \
 #     -f tests/Dockerfile.e2e-upgrade .
 #
 # Prerequisites: pg_trickle_e2e:latest must be built first.
@@ -29,7 +29,7 @@ ARG BASE_IMAGE=pg_trickle_e2e:latest
 FROM ${BASE_IMAGE}
 
 ARG FROM_VERSION=0.1.3
-ARG TO_VERSION=0.2.2
+ARG TO_VERSION=0.2.3
 
 LABEL org.opencontainers.image.title="pg_trickle upgrade E2E test image"
 LABEL org.opencontainers.image.description="PostgreSQL 18.1 with pg_trickle for upgrade path testing (${FROM_VERSION} → ${TO_VERSION})"

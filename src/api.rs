@@ -29,6 +29,7 @@ use crate::wal_decoder;
 /// - `initialize`: Whether to populate the table immediately.
 /// - `diamond_consistency`: `'none'` (default) or `'atomic'`.
 /// - `diamond_schedule_policy`: `'fastest'` (default) or `'slowest'`.
+#[allow(clippy::too_many_arguments)]
 #[pg_extern(schema = "pgtrickle")]
 fn create_stream_table(
     name: &str,
@@ -38,6 +39,7 @@ fn create_stream_table(
     initialize: default!(bool, true),
     diamond_consistency: default!(Option<&str>, "NULL"),
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
+    cdc_mode: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -47,6 +49,7 @@ fn create_stream_table(
         initialize,
         diamond_consistency,
         diamond_schedule_policy,
+        cdc_mode,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -150,6 +153,74 @@ fn enforce_cdc_refresh_mode_interaction(
                 .to_string(),
         )),
     }
+}
+
+fn normalize_requested_cdc_mode(
+    requested_cdc_mode: Option<&str>,
+) -> Result<Option<String>, PgTrickleError> {
+    requested_cdc_mode
+        .map(|mode| {
+            let normalized = mode.trim().to_lowercase();
+            match normalized.as_str() {
+                "auto" | "trigger" | "wal" => Ok(normalized),
+                other => Err(PgTrickleError::InvalidArgument(format!(
+                    "invalid cdc_mode value: '{}' (expected 'auto', 'trigger', or 'wal')",
+                    other
+                ))),
+            }
+        })
+        .transpose()
+}
+
+fn resolve_requested_cdc_mode(
+    requested_cdc_mode: Option<&str>,
+) -> Result<(Option<String>, String, CdcModeRequestSource), PgTrickleError> {
+    let requested_override = normalize_requested_cdc_mode(requested_cdc_mode)?;
+    let source = if requested_override.is_some() {
+        CdcModeRequestSource::ExplicitOverride
+    } else {
+        CdcModeRequestSource::GlobalGuc
+    };
+    let effective = requested_override
+        .clone()
+        .unwrap_or_else(config::pg_trickle_cdc_mode);
+    Ok((requested_override, effective, source))
+}
+
+fn resolve_requested_cdc_mode_for_st(
+    st: &StreamTableMeta,
+    requested_cdc_mode: Option<&str>,
+) -> Result<(Option<String>, String, CdcModeRequestSource), PgTrickleError> {
+    let requested_override = match normalize_requested_cdc_mode(requested_cdc_mode)? {
+        Some(mode) => Some(mode),
+        None => st.requested_cdc_mode.clone(),
+    };
+    let source = if requested_override.is_some() {
+        CdcModeRequestSource::ExplicitOverride
+    } else {
+        CdcModeRequestSource::GlobalGuc
+    };
+    let effective = requested_override
+        .clone()
+        .unwrap_or_else(config::pg_trickle_cdc_mode);
+    Ok((requested_override, effective, source))
+}
+
+fn validate_requested_cdc_mode_requirements(
+    requested_cdc_mode: &str,
+) -> Result<(), PgTrickleError> {
+    if requested_cdc_mode != "wal" {
+        return Ok(());
+    }
+
+    if !cdc::can_use_logical_replication_for_mode(requested_cdc_mode)? {
+        return Err(PgTrickleError::InvalidArgument(
+            "cdc_mode = 'wal' requires wal_level = logical and an available replication slot"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Validate a rewritten query and parse it for DVM. This runs the LIMIT 0
@@ -432,6 +503,7 @@ fn insert_catalog_and_deps(
     vq: &ValidatedQuery,
     dc: DiamondConsistency,
     dsp: DiamondSchedulePolicy,
+    requested_cdc_mode: Option<&str>,
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = StreamTableMeta::insert(
         pgt_relid,
@@ -450,6 +522,7 @@ fn insert_catalog_and_deps(
         dc,
         dsp,
         vq.has_keyless_source,
+        requested_cdc_mode,
     )?;
 
     // Build per-source column usage map
@@ -1139,6 +1212,7 @@ fn get_storage_table_columns(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_stream_table_impl(
     name: &str,
     query: &str,
@@ -1147,6 +1221,7 @@ fn create_stream_table_impl(
     initialize: bool,
     diamond_consistency: Option<&str>,
     diamond_schedule_policy: Option<&str>,
+    requested_cdc_mode: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -1204,13 +1279,17 @@ fn create_stream_table_impl(
         }
     };
 
-    let requested_cdc_mode = config::pg_trickle_cdc_mode();
+    let (requested_cdc_mode_override, effective_requested_cdc_mode, cdc_mode_source) =
+        resolve_requested_cdc_mode(requested_cdc_mode)?;
     enforce_cdc_refresh_mode_interaction(
         &qualified_name,
         refresh_mode,
-        &requested_cdc_mode,
-        CdcModeRequestSource::GlobalGuc,
+        &effective_requested_cdc_mode,
+        cdc_mode_source,
     )?;
+    if !refresh_mode.is_immediate() {
+        validate_requested_cdc_mode_requirements(&effective_requested_cdc_mode)?;
+    }
 
     // ── Query rewrite pipeline ─────────────────────────────────────
     let original_query = query.to_string();
@@ -1273,6 +1352,7 @@ fn create_stream_table_impl(
         &vq,
         dc,
         dsp,
+        requested_cdc_mode_override.as_deref(),
     )?;
 
     // ── Phase 2: CDC / IVM trigger setup ──
@@ -1345,6 +1425,7 @@ fn create_stream_table_impl(
 }
 
 /// Alter properties of an existing stream table.
+#[allow(clippy::too_many_arguments)]
 #[pg_extern(schema = "pgtrickle")]
 fn alter_stream_table(
     name: &str,
@@ -1354,6 +1435,7 @@ fn alter_stream_table(
     status: default!(Option<&str>, "NULL"),
     diamond_consistency: default!(Option<&str>, "NULL"),
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
+    cdc_mode: default!(Option<&str>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -1363,12 +1445,14 @@ fn alter_stream_table(
         status,
         diamond_consistency,
         diamond_schedule_policy,
+        cdc_mode,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn alter_stream_table_impl(
     name: &str,
     query: Option<&str>,
@@ -1377,14 +1461,41 @@ fn alter_stream_table_impl(
     status: Option<&str>,
     diamond_consistency: Option<&str>,
     diamond_schedule_policy: Option<&str>,
+    cdc_mode: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
-    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
     let qualified_name = format!("{schema}.{table_name}");
 
     // ── Query migration (must run first, before other parameter changes) ──
     if let Some(new_query) = query {
         alter_stream_table_query(&st, &schema, &table_name, new_query)?;
+        st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    }
+
+    let (requested_cdc_mode_override, effective_requested_cdc_mode, cdc_mode_source) =
+        resolve_requested_cdc_mode_for_st(&st, cdc_mode)?;
+    let target_refresh_mode = match refresh_mode {
+        Some(mode_str) => RefreshMode::from_str(mode_str)?,
+        None => st.refresh_mode,
+    };
+
+    enforce_cdc_refresh_mode_interaction(
+        &qualified_name,
+        target_refresh_mode,
+        &effective_requested_cdc_mode,
+        cdc_mode_source,
+    )?;
+    if !target_refresh_mode.is_immediate() {
+        validate_requested_cdc_mode_requirements(&effective_requested_cdc_mode)?;
+    }
+
+    if requested_cdc_mode_override != st.requested_cdc_mode {
+        StreamTableMeta::update_requested_cdc_mode(
+            st.pgt_id,
+            requested_cdc_mode_override.as_deref(),
+        )?;
+        st.requested_cdc_mode = requested_cdc_mode_override.clone();
     }
 
     if let Some(val) = schedule {
@@ -1407,18 +1518,10 @@ fn alter_stream_table_impl(
     }
 
     if let Some(mode_str) = refresh_mode {
-        let new_mode = RefreshMode::from_str(mode_str)?;
+        let new_mode = target_refresh_mode;
         let old_mode = st.refresh_mode;
 
         if new_mode != old_mode {
-            let requested_cdc_mode = config::pg_trickle_cdc_mode();
-            enforce_cdc_refresh_mode_interaction(
-                &qualified_name,
-                new_mode,
-                &requested_cdc_mode,
-                CdcModeRequestSource::GlobalGuc,
-            )?;
-
             // ── Validate mode switch ────────────────────────────────
             // TopK tables: check limit threshold for IMMEDIATE mode.
             if let (true, Some(topk_limit)) = (new_mode.is_immediate(), st.topk_limit) {
@@ -1561,6 +1664,22 @@ fn alter_stream_table_impl(
             )
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         }
+    }
+
+    if cdc_mode.is_some() && !target_refresh_mode.is_immediate() {
+        let deps = StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+        let change_schema = config::pg_trickle_change_buffer_schema();
+        for dep in &deps {
+            if dep.source_type == "TABLE" {
+                setup_cdc_for_source(dep.source_relid, st.pgt_id, &change_schema)?;
+            }
+        }
+        pgrx::info!(
+            "Stream table {}.{} updated requested cdc_mode to {}",
+            schema,
+            table_name,
+            effective_requested_cdc_mode,
+        );
     }
 
     if let Some(status_str) = status {
@@ -2401,6 +2520,9 @@ fn setup_cdc_for_source(
     pgt_id: i64,
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
+    let requested_cdc_mode = StDependency::effective_requested_mode_for_source(source_oid)?
+        .unwrap_or_else(|| "trigger".to_string());
+
     // Check if already tracked
     let already_tracked = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_change_tracking WHERE source_relid = $1)",
@@ -2408,6 +2530,10 @@ fn setup_cdc_for_source(
     )
     .unwrap_or(Some(false))
     .unwrap_or(false);
+
+    if requested_cdc_mode == "wal" {
+        validate_requested_cdc_mode_requirements(&requested_cdc_mode)?;
+    }
 
     if !already_tracked {
         // Resolve PK columns for trigger pk_hash computation
@@ -2417,30 +2543,27 @@ fn setup_cdc_for_source(
         // primary key, verify REPLICA IDENTITY FULL. Without it, WAL-based
         // CDC cannot produce correct old-row values for UPDATE/DELETE, leading
         // to silent data corruption.
-        if pk_columns.is_empty() {
-            let cdc_mode = config::pg_trickle_cdc_mode();
-            if cdc_mode == "wal" || cdc_mode == "auto" {
-                let identity = cdc::get_replica_identity_mode(source_oid)?;
-                if identity != "full" {
-                    let table_name = Spi::get_one_with_args::<String>(
-                        "SELECT format('%I.%I', n.nspname, c.relname) \
-                         FROM pg_class c \
-                         JOIN pg_namespace n ON n.oid = c.relnamespace \
-                         WHERE c.oid = $1",
-                        &[source_oid.into()],
-                    )
-                    .unwrap_or(None)
-                    .unwrap_or_else(|| format!("OID {}", source_oid.to_u32()));
+        if pk_columns.is_empty() && requested_cdc_mode == "wal" {
+            let identity = cdc::get_replica_identity_mode(source_oid)?;
+            if identity != "full" {
+                let table_name = Spi::get_one_with_args::<String>(
+                    "SELECT format('%I.%I', n.nspname, c.relname) \
+                     FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.oid = $1",
+                    &[source_oid.into()],
+                )
+                .unwrap_or(None)
+                .unwrap_or_else(|| format!("OID {}", source_oid.to_u32()));
 
-                    return Err(PgTrickleError::InvalidArgument(format!(
-                        "Source table {} has no PRIMARY KEY and REPLICA IDENTITY is '{}'. \
-                         WAL-based CDC (cdc_mode = '{}') requires either a PRIMARY KEY \
-                         or REPLICA IDENTITY FULL on keyless tables. \
-                         Fix: ALTER TABLE {} REPLICA IDENTITY FULL; \
-                         or set pg_trickle.cdc_mode = 'trigger'.",
-                        table_name, identity, cdc_mode, table_name
-                    )));
-                }
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "Source table {} has no PRIMARY KEY and REPLICA IDENTITY is '{}'. \
+                     WAL-based CDC (cdc_mode = '{}') requires either a PRIMARY KEY \
+                     or REPLICA IDENTITY FULL on keyless tables. \
+                     Fix: ALTER TABLE {} REPLICA IDENTITY FULL; \
+                     or use cdc_mode = 'trigger'/'auto'.",
+                    table_name, identity, requested_cdc_mode, table_name
+                )));
             }
         }
 
@@ -2474,6 +2597,10 @@ fn setup_cdc_for_source(
             &[pgt_id.into(), source_oid.into()],
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
+    if requested_cdc_mode == "trigger" {
+        wal_decoder::force_source_to_trigger(source_oid, change_schema)?;
     }
 
     Ok(())

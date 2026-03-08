@@ -107,6 +107,14 @@ always uses statement-level IVM triggers. If the GUC is set to `'wal'` when a
 stream table is created or altered to `IMMEDIATE`, pg_trickle logs an INFO and
 continues with IVM triggers instead of creating CDC triggers or WAL slots.
 
+Per-stream-table overrides take precedence over the GUC when you pass
+`cdc_mode => 'auto' | 'trigger' | 'wal'` to
+`pgtrickle.create_stream_table(...)` or `pgtrickle.alter_stream_table(...)`.
+The override is stored in `pgtrickle.pgt_stream_tables.requested_cdc_mode`.
+For shared source tables, pg_trickle resolves the effective source-level CDC
+mechanism conservatively: any dependent stream table that requests `'trigger'`
+keeps the source on trigger CDC; otherwise `'wal'` wins over `'auto'`.
+
 ```sql
 -- Enable automatic trigger → WAL transition (default)
 SET pg_trickle.cdc_mode = 'auto';

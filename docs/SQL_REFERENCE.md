@@ -63,6 +63,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
 - [Views](#views)
   - [pgtrickle.stream\_tables\_info](#pgtricklestream_tables_info)
   - [pgtrickle.pg\_stat\_stream\_tables](#pgtricklepg_stat_stream_tables)
+  - [pgtrickle.pgt\_cdc\_status](#pgtricklepgt_cdc_status)
 - [Catalog Tables](#catalog-tables)
   - [pgtrickle.pgt\_stream\_tables](#pgtricklepgt_stream_tables)
   - [pgtrickle.pgt\_dependencies](#pgtricklepgt_dependencies)
@@ -91,7 +92,8 @@ pgtrickle.create_stream_table(
     refresh_mode          text      DEFAULT 'AUTO',
     initialize            bool      DEFAULT true,
     diamond_consistency   text      DEFAULT NULL,
-    diamond_schedule_policy text    DEFAULT NULL
+    diamond_schedule_policy text    DEFAULT NULL,
+    cdc_mode              text      DEFAULT NULL
 ) → void
 ```
 
@@ -106,10 +108,14 @@ pgtrickle.create_stream_table(
 | `initialize` | `bool` | `true` | If `true`, populates the table immediately via a full refresh. If `false`, creates the table empty. |
 | `diamond_consistency` | `text` | `NULL` (defaults to `'none'`) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). |
 | `diamond_schedule_policy` | `text` | `NULL` (defaults to `'fastest'`) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. |
+| `cdc_mode` | `text` | `NULL` (use `pg_trickle.cdc_mode`) | Optional per-stream-table CDC override: `'auto'`, `'trigger'`, or `'wal'`. This affects all deferred TABLE sources of the stream table. |
 
 When `refresh_mode => 'IMMEDIATE'`, the cluster-wide `pg_trickle.cdc_mode`
 setting is ignored. IMMEDIATE mode always uses statement-level IVM triggers
-instead of CDC triggers or WAL replication slots.
+instead of CDC triggers or WAL replication slots. If you explicitly pass
+`cdc_mode => 'wal'` together with `refresh_mode => 'IMMEDIATE'`, pg_trickle
+rejects the call because WAL CDC is asynchronous and incompatible with
+in-transaction maintenance.
 
 **Duration format:**
 
@@ -170,6 +176,15 @@ SELECT pgtrickle.create_stream_table(
     name         => 'live_totals',
     query        => 'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
     refresh_mode => 'IMMEDIATE'
+);
+
+-- Force WAL CDC for this stream table even if the global GUC is 'trigger'
+SELECT pgtrickle.create_stream_table(
+    name         => 'wal_orders',
+    query        => 'SELECT id, amount FROM orders',
+    schedule     => '1s',
+    refresh_mode => 'DIFFERENTIAL',
+    cdc_mode     => 'wal'
 );
 ```
 
@@ -628,7 +643,8 @@ pgtrickle.alter_stream_table(
     refresh_mode          text      DEFAULT NULL,
     status                text      DEFAULT NULL,
     diamond_consistency   text      DEFAULT NULL,
-    diamond_schedule_policy text    DEFAULT NULL
+    diamond_schedule_policy text    DEFAULT NULL,
+    cdc_mode              text      DEFAULT NULL
 ) → void
 ```
 
@@ -643,10 +659,14 @@ pgtrickle.alter_stream_table(
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
 | `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |
 | `diamond_schedule_policy` | `text` | `NULL` | New schedule policy for atomic diamond groups (`'fastest'` or `'slowest'`). Pass `NULL` to leave unchanged. |
+| `cdc_mode` | `text` | `NULL` | New requested CDC mode override (`'auto'`, `'trigger'`, or `'wal'`). Pass `NULL` to leave unchanged. |
 
 If you switch a stream table to `refresh_mode => 'IMMEDIATE'` while the
 cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle logs an
 INFO and proceeds with IVM triggers. WAL CDC does not apply to IMMEDIATE mode.
+If the stream table has an explicit `cdc_mode => 'wal'` override, switching to
+`IMMEDIATE` is rejected until you change the requested CDC mode back to
+`'auto'` or `'trigger'`.
 
 **Examples:**
 
@@ -676,6 +696,9 @@ SELECT pgtrickle.alter_stream_table('order_totals', refresh_mode => 'IMMEDIATE')
 -- Switch from immediate back to differential — re-creates CDC triggers, restores schedule
 SELECT pgtrickle.alter_stream_table('order_totals',
     refresh_mode => 'DIFFERENTIAL', schedule => '5m');
+
+-- Pin a deferred stream table to trigger CDC even when the global GUC is 'auto'
+SELECT pgtrickle.alter_stream_table('order_totals', cdc_mode => 'trigger');
 
 -- Suspend a stream table
 SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');
@@ -1807,6 +1830,35 @@ Key columns:
 | `failed_refreshes` | `bigint` | Failed refresh count |
 | `avg_duration_ms` | `float8` | Average refresh duration |
 | `consecutive_errors` | `int` | Current error streak |
+| `cdc_modes` | `text[]` | Distinct CDC modes across TABLE-type sources (e.g. `{wal}`, `{trigger,wal}`, `{transitioning,wal}`) |
+
+---
+
+### pgtrickle.pgt_cdc_status
+
+Convenience view for inspecting the CDC mode and WAL slot state of every
+TABLE-type source for all stream tables. Useful for monitoring in-progress
+TRIGGER→WAL transitions.
+
+```sql
+SELECT * FROM pgtrickle.pgt_cdc_status;
+```
+
+| Column | Type | Description |
+|---|---|---|
+| `pgt_schema` | `text` | Schema of the stream table |
+| `pgt_name` | `text` | Name of the stream table |
+| `source_relid` | `oid` | OID of the source table |
+| `source_name` | `text` | Name of the source table |
+| `source_schema` | `text` | Schema of the source table |
+| `cdc_mode` | `text` | Current CDC mode: `trigger`, `transitioning`, or `wal` |
+| `slot_name` | `text` | Replication slot name (`NULL` for trigger mode) |
+| `decoder_confirmed_lsn` | `pg_lsn` | Last WAL position decoded (`NULL` for trigger mode) |
+| `transition_started_at` | `timestamptz` | When the trigger→WAL transition began (`NULL` if not transitioning) |
+
+Subscribe to the `pgtrickle_cdc_transition` NOTIFY channel to receive real-time
+events when a source moves between CDC modes (payload is a JSON object with
+`source_oid`, `from`, and `to` fields).
 
 ---
 

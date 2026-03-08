@@ -12150,6 +12150,7 @@ unsafe fn is_agg_node(node: *mut pg_sys::Node) -> bool {
 /// # Safety
 /// Called by PostgreSQL's `raw_expression_tree_walker_impl` with valid
 /// raw parse tree node pointers.
+#[cfg(not(test))]
 unsafe extern "C-unwind" fn agg_check_walker(
     node: *mut pg_sys::Node,
     _context: *mut std::ffi::c_void,
@@ -12173,6 +12174,7 @@ unsafe extern "C-unwind" fn agg_check_walker(
 ///
 /// Uses PostgreSQL's `raw_expression_tree_walker_impl` for correct
 /// recursion into all node types (A_Expr, CaseExpr, BoolExpr, etc.).
+#[cfg(not(test))]
 unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
@@ -12185,6 +12187,14 @@ unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
     unsafe {
         pg_sys::raw_expression_tree_walker_impl(node, Some(agg_check_walker), std::ptr::null_mut())
     }
+}
+
+#[cfg(test)]
+unsafe fn expr_contains_agg(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    unsafe { is_agg_node(node) }
 }
 
 /// Check if a function name is a user-defined aggregate via `pg_proc.prokind`.
