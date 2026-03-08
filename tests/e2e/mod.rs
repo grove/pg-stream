@@ -157,6 +157,19 @@ async fn reset_postgres_database(admin_connection_string: &str) {
         .await
         .unwrap_or_else(|e| panic!("Failed to connect for postgres reset: {e}"));
 
+    // Background-worker tests share the `postgres` database and use
+    // `ALTER SYSTEM` to speed up the scheduler. Those changes persist in
+    // `postgresql.auto.conf`, so clear them before recreating the extension
+    // to keep each test independent of execution order.
+    sqlx::query("ALTER SYSTEM RESET ALL")
+        .execute(&admin_pool)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to reset shared postgres ALTER SYSTEM state: {e}"));
+    sqlx::query("SELECT pg_reload_conf()")
+        .execute(&admin_pool)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to reload config during postgres reset: {e}"));
+
     for sql in [
         "DROP EXTENSION IF EXISTS pg_trickle CASCADE",
         "DROP SCHEMA IF EXISTS public CASCADE",

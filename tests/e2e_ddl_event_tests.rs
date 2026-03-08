@@ -559,6 +559,9 @@ async fn test_block_source_ddl_guc_prevents_alter() {
         result.is_err(),
         "ALTER on monitored source should be blocked when block_source_ddl = true"
     );
+
+    db.alter_system_reset_and_wait("pg_trickle.block_source_ddl", "off")
+        .await;
 }
 
 // ══════════════════════════════════════════════════════════════════════
