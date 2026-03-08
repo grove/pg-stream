@@ -371,6 +371,57 @@ async fn test_create_cdc_trigger_installed() {
 }
 
 #[tokio::test]
+async fn test_create_immediate_ignores_wal_cdc_guc() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE imm_wal_src (id INT, val TEXT)")
+        .await;
+    db.execute("INSERT INTO imm_wal_src VALUES (1, 'a'), (2, 'b')")
+        .await;
+
+    db.execute(
+        "WITH wal_mode AS (\
+            SELECT set_config('pg_trickle.cdc_mode', 'wal', true)\
+         )\
+         SELECT pgtrickle.create_stream_table(\
+            name => 'imm_wal_st',\
+            query => $$SELECT id, val FROM imm_wal_src$$,\
+            refresh_mode => 'IMMEDIATE'\
+         )\
+         FROM wal_mode",
+    )
+    .await;
+
+    let (status, mode, populated, errors) = db.pgt_status("imm_wal_st").await;
+    assert_eq!(status, "ACTIVE");
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(
+        populated,
+        "IMMEDIATE ST should still initialize successfully"
+    );
+    assert_eq!(errors, 0);
+    assert_eq!(db.count("public.imm_wal_st").await, 2);
+
+    let source_oid = db.table_oid("imm_wal_src").await;
+    let cdc_trigger_name = format!("pg_trickle_cdc_{}", source_oid);
+    assert!(
+        !db.trigger_exists(&cdc_trigger_name, "imm_wal_src").await,
+        "IMMEDIATE mode should not install CDC triggers even when cdc_mode='wal'"
+    );
+
+    let slot_exists: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'pgtrickle_{}')",
+            source_oid
+        ))
+        .await;
+    assert!(
+        !slot_exists,
+        "IMMEDIATE mode should not create a WAL replication slot"
+    );
+}
+
+#[tokio::test]
 async fn test_create_change_buffer_exists() {
     let db = E2eDb::new().await.with_extension().await;
 

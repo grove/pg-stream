@@ -11,6 +11,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Changed
 
+- **IMMEDIATE/WAL CDC interaction clarified** — `create_stream_table()` and
+  `alter_stream_table()` now emit an INFO message when
+  `pg_trickle.cdc_mode = 'wal'` is in effect but the requested
+  `refresh_mode = 'IMMEDIATE'`. IMMEDIATE mode continues to use
+  statement-level IVM triggers and does not install CDC triggers or create WAL
+  replication slots. Unit tests and E2E coverage now lock in that behavior for
+  both create and alter flows.
+
 - **CI test pyramid rebalanced** — PRs now run a faster three-tier gate:
   Linux unit tests, integration tests, and a curated Light E2E tier split
   across three shards against stock `postgres:18.1`. The heavier full E2E,

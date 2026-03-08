@@ -99,6 +99,12 @@ CDC (Change Data Capture) mechanism selection.
 
 **Default:** `'auto'`
 
+`pg_trickle.cdc_mode` only affects deferred refresh modes (`'AUTO'`, `'FULL'`,
+and `'DIFFERENTIAL'`). `refresh_mode = 'IMMEDIATE'` bypasses CDC entirely and
+always uses statement-level IVM triggers. If the GUC is set to `'wal'` when a
+stream table is created or altered to `IMMEDIATE`, pg_trickle logs an INFO and
+continues with IVM triggers instead of creating CDC triggers or WAL slots.
+
 ```sql
 -- Enable automatic trigger → WAL transition (default)
 SET pg_trickle.cdc_mode = 'auto';

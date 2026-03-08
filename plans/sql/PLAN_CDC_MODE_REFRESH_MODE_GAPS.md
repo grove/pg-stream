@@ -1,8 +1,8 @@
 # Plan: CDC Mode / Refresh Mode Interaction Gaps
 
 Date: 2026-03-07
-Status: PROPOSED
-Last Updated: 2026-03-07
+Status: IN PROGRESS
+Last Updated: 2026-03-08
 
 ---
 
@@ -159,10 +159,27 @@ has an `if refresh_mode.is_immediate() { ... } else { ... }` branch. The
 `else` branch calls `setup_cdc_for_source()`. The `if` branch calls
 `ivm::setup_ivm_triggers()`. No validation rejects the combination.
 
+**Progress (2026-03-08).** Phase 1 is implemented: when the cluster-wide
+`pg_trickle.cdc_mode` GUC is `'wal'` and a stream table is created or altered
+to `refresh_mode = 'IMMEDIATE'`, pg_trickle now emits an INFO explaining that
+WAL CDC is ignored and that statement-level IVM triggers will be used instead.
+The explicit rejection path is still pending because there is not yet a
+per-table `cdc_mode` override surface; that arrives with G1.
+
 #### Implementation Steps
 
-1. **Validation in `create_stream_table_impl()`** (`src/api.rs:1090`)
-   - After parsing `refresh_mode` and determining effective `cdc_mode`:
+1. **Phase 1 — INFO for implicit global-GUC mismatch** (`src/api.rs`)
+   - If `refresh_mode = 'IMMEDIATE'` and the effective `cdc_mode` comes from
+     the global GUC with value `'wal'`, emit:
+     ```text
+     INFO: cdc_mode 'wal' has no effect for IMMEDIATE refresh mode — using IVM triggers
+     ```
+   - Implement in both `create_stream_table_impl()` and
+     `alter_stream_table_impl()`.
+
+2. **Phase 2 — Explicit rejection once G1 exists** (`src/api.rs`)
+   - After parsing `refresh_mode` and determining an explicit per-table
+     `cdc_mode` override:
      ```rust
      if refresh_mode.is_immediate() && effective_cdc_mode == "wal" {
          return Err(PgTrickleError::InvalidArgument(
@@ -173,17 +190,15 @@ has an `if refresh_mode.is_immediate() { ... } else { ... }` branch. The
          ));
      }
      ```
-   - Same check in `alter_stream_table_impl()` when altering refresh mode
-     or cdc mode.
-
-2. **INFO log for implicit override**
-   - When `cdc_mode` GUC is `wal` but refresh mode is `IMMEDIATE` (and no
-     explicit per-table override), emit:
-     ```
-     INFO: cdc_mode 'wal' has no effect for IMMEDIATE refresh mode — using IVM triggers
-     ```
+   - Same check in `alter_stream_table_impl()` when altering refresh mode or
+     cdc mode.
 
 3. **Tests**
+   - Phase 1 E2E test: GUC `wal` + `IMMEDIATE` create path succeeds and does
+     not install CDC triggers or WAL slots.
+   - Phase 1 E2E test: GUC `wal` + `ALTER ... refresh_mode='IMMEDIATE'`
+     succeeds, leaves no WAL slots behind, and preserves synchronous
+     IMMEDIATE propagation on subsequent DML.
    - Integration test: explicit `cdc_mode => 'wal'` + `IMMEDIATE` → error.
    - Integration test: GUC `wal` + `IMMEDIATE` (no per-table override) → 
      success with INFO log.

@@ -371,13 +371,19 @@ validations, resource leaks, and observability holes. Phased from quick wins
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | G6 | Defensive `is_populated` + empty-frontier check in `execute_differential_refresh()` | 2h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G6 |
-| G2 | Validate `IMMEDIATE` + `cdc_mode='wal'` — reject explicit combination, INFO for implicit | 2–3h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G2 |
+| G2 | Validate `IMMEDIATE` + `cdc_mode='wal'` — INFO for implicit global-GUC path shipped; explicit per-table rejection pending G1 | 2–3h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G2 |
 | G3 | Advance WAL replication slot after FULL refresh; flush change buffers | 4–6h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G3 |
 | G4 | Flush change buffers after AUTO→FULL adaptive fallback (prevents ping-pong) | 3–4h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G4 |
 | G5 | `pgtrickle.pgt_cdc_status` view + NOTIFY on CDC transitions | 4–6h | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G5 |
 | G1 | Per-table `cdc_mode` override (SQL API, catalog, dbt, migration) | 2–3d | [PLAN_CDC_MODE_REFRESH_MODE_GAPS.md](plans/sql/PLAN_CDC_MODE_REFRESH_MODE_GAPS.md) §G1 |
 
 > **CDC/refresh mode gaps subtotal: ~4–6 days**
+>
+> **Progress:** G2 phase 1 is now implemented in `Unreleased`: when the
+> cluster-wide `pg_trickle.cdc_mode` is `'wal'`, creating or switching a
+> stream table to `refresh_mode = 'IMMEDIATE'` logs an INFO and continues with
+> statement-level IVM triggers. The explicit rejection path depends on the
+> per-table `cdc_mode` override tracked as G1.
 
 ### Operational
 

@@ -107,6 +107,10 @@ pgtrickle.create_stream_table(
 | `diamond_consistency` | `text` | `NULL` (defaults to `'none'`) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). |
 | `diamond_schedule_policy` | `text` | `NULL` (defaults to `'fastest'`) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. |
 
+When `refresh_mode => 'IMMEDIATE'`, the cluster-wide `pg_trickle.cdc_mode`
+setting is ignored. IMMEDIATE mode always uses statement-level IVM triggers
+instead of CDC triggers or WAL replication slots.
+
 **Duration format:**
 
 | Unit | Suffix | Example |
@@ -639,6 +643,10 @@ pgtrickle.alter_stream_table(
 | `status` | `text` | `NULL` | New status (`'ACTIVE'`, `'SUSPENDED'`). Pass `NULL` to leave unchanged. Resuming resets consecutive errors to 0. |
 | `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |
 | `diamond_schedule_policy` | `text` | `NULL` | New schedule policy for atomic diamond groups (`'fastest'` or `'slowest'`). Pass `NULL` to leave unchanged. |
+
+If you switch a stream table to `refresh_mode => 'IMMEDIATE'` while the
+cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle logs an
+INFO and proceeds with IVM triggers. WAL CDC does not apply to IMMEDIATE mode.
 
 **Examples:**
 

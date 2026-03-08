@@ -100,6 +100,58 @@ struct ValidatedQuery {
     source_relids: Vec<(pg_sys::Oid, String)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdcModeRequestSource {
+    GlobalGuc,
+    ExplicitOverride,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CdcRefreshModeInteraction {
+    None,
+    IgnoreWalForImmediate,
+    RejectWalForImmediate,
+}
+
+fn classify_cdc_refresh_mode_interaction(
+    refresh_mode: RefreshMode,
+    requested_cdc_mode: &str,
+    source: CdcModeRequestSource,
+) -> CdcRefreshModeInteraction {
+    if !refresh_mode.is_immediate() || !requested_cdc_mode.eq_ignore_ascii_case("wal") {
+        return CdcRefreshModeInteraction::None;
+    }
+
+    match source {
+        CdcModeRequestSource::GlobalGuc => CdcRefreshModeInteraction::IgnoreWalForImmediate,
+        CdcModeRequestSource::ExplicitOverride => CdcRefreshModeInteraction::RejectWalForImmediate,
+    }
+}
+
+fn enforce_cdc_refresh_mode_interaction(
+    stream_table_name: &str,
+    refresh_mode: RefreshMode,
+    requested_cdc_mode: &str,
+    source: CdcModeRequestSource,
+) -> Result<(), PgTrickleError> {
+    match classify_cdc_refresh_mode_interaction(refresh_mode, requested_cdc_mode, source) {
+        CdcRefreshModeInteraction::None => Ok(()),
+        CdcRefreshModeInteraction::IgnoreWalForImmediate => {
+            pgrx::info!(
+                "pg_trickle: cdc_mode 'wal' has no effect for IMMEDIATE refresh mode on {} — using IVM triggers instead of CDC.",
+                stream_table_name,
+            );
+            Ok(())
+        }
+        CdcRefreshModeInteraction::RejectWalForImmediate => Err(PgTrickleError::InvalidArgument(
+            "refresh_mode = 'IMMEDIATE' is incompatible with cdc_mode = 'wal'. \
+             IMMEDIATE uses in-transaction IVM triggers; WAL-based CDC is async. \
+             Use cdc_mode = 'trigger' or 'auto', or choose a deferred refresh_mode."
+                .to_string(),
+        )),
+    }
+}
+
 /// Validate a rewritten query and parse it for DVM. This runs the LIMIT 0
 /// check, TopK detection, unsupported construct rejection, DVM parsing,
 /// volatility checks, and source relation extraction.
@@ -804,7 +856,7 @@ fn alter_stream_table_query(
             } else {
                 let old_dep = old_deps.iter().find(|d| d.source_relid == *source_oid);
                 let cdc_mode = old_dep.map(|d| d.cdc_mode).unwrap_or(CdcMode::Trigger);
-                if let Err(e) = cleanup_cdc_for_source(*source_oid, cdc_mode) {
+                if let Err(e) = cleanup_cdc_for_source(*source_oid, cdc_mode, Some(st.pgt_id)) {
                     pgrx::warning!(
                         "Failed to clean up CDC for removed source {}: {}",
                         source_oid.to_u32(),
@@ -1132,6 +1184,7 @@ fn create_stream_table_impl(
 
     // Parse schema.name
     let (schema, table_name) = parse_qualified_name(name)?;
+    let qualified_name = format!("{schema}.{table_name}");
 
     // Parse and validate schedule
     let schedule_str = if refresh_mode.is_immediate() {
@@ -1150,6 +1203,14 @@ fn create_stream_table_impl(
             }
         }
     };
+
+    let requested_cdc_mode = config::pg_trickle_cdc_mode();
+    enforce_cdc_refresh_mode_interaction(
+        &qualified_name,
+        refresh_mode,
+        &requested_cdc_mode,
+        CdcModeRequestSource::GlobalGuc,
+    )?;
 
     // ── Query rewrite pipeline ─────────────────────────────────────
     let original_query = query.to_string();
@@ -1319,6 +1380,7 @@ fn alter_stream_table_impl(
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+    let qualified_name = format!("{schema}.{table_name}");
 
     // ── Query migration (must run first, before other parameter changes) ──
     if let Some(new_query) = query {
@@ -1349,6 +1411,14 @@ fn alter_stream_table_impl(
         let old_mode = st.refresh_mode;
 
         if new_mode != old_mode {
+            let requested_cdc_mode = config::pg_trickle_cdc_mode();
+            enforce_cdc_refresh_mode_interaction(
+                &qualified_name,
+                new_mode,
+                &requested_cdc_mode,
+                CdcModeRequestSource::GlobalGuc,
+            )?;
+
             // ── Validate mode switch ────────────────────────────────
             // TopK tables: check limit threshold for IMMEDIATE mode.
             if let (true, Some(topk_limit)) = (new_mode.is_immediate(), st.topk_limit) {
@@ -1396,8 +1466,11 @@ fn alter_stream_table_impl(
                     if new_mode.is_immediate() {
                         for dep in &deps {
                             if dep.source_type == "TABLE"
-                                && let Err(e) =
-                                    cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode)
+                                && let Err(e) = cleanup_cdc_for_source(
+                                    dep.source_relid,
+                                    dep.cdc_mode,
+                                    Some(st.pgt_id),
+                                )
                             {
                                 pgrx::warning!(
                                     "Failed to clean up CDC for oid {}: {}",
@@ -1604,7 +1677,7 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
                     );
                 }
             } else {
-                cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode)?;
+                cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode, None)?;
             }
         }
     }
@@ -2414,16 +2487,31 @@ fn setup_cdc_for_source(
 fn cleanup_cdc_for_source(
     source_oid: pg_sys::Oid,
     cdc_mode: CdcMode,
+    excluding_pgt_id: Option<i64>,
 ) -> Result<(), PgTrickleError> {
-    // Check if any other STs still reference this source
-    let still_referenced = Spi::get_one_with_args::<bool>(
-        "SELECT EXISTS( \
-            SELECT 1 FROM pgtrickle.pgt_dependencies WHERE source_relid = $1 \
-        )",
-        &[source_oid.into()],
-    )
-    .unwrap_or(Some(false))
-    .unwrap_or(false);
+    // Check if any other STs still reference this source. During ALTER flows,
+    // the current ST's dependency row still exists while cleanup runs, so it
+    // must be excluded from the reference check.
+    let still_referenced = if let Some(pgt_id) = excluding_pgt_id {
+        Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS( \
+                SELECT 1 FROM pgtrickle.pgt_dependencies \
+                WHERE source_relid = $1 AND pgt_id <> $2 \
+            )",
+            &[source_oid.into(), pgt_id.into()],
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false)
+    } else {
+        Spi::get_one_with_args::<bool>(
+            "SELECT EXISTS( \
+                SELECT 1 FROM pgtrickle.pgt_dependencies WHERE source_relid = $1 \
+            )",
+            &[source_oid.into()],
+        )
+        .unwrap_or(Some(false))
+        .unwrap_or(false)
+    };
 
     if !still_referenced {
         let change_schema = config::pg_trickle_change_buffer_schema();
@@ -4160,5 +4248,53 @@ mod tests {
     fn test_detect_select_star_no_from() {
         // No FROM clause — should not crash, just return false
         assert!(!detect_select_star("SELECT 1"));
+    }
+
+    #[test]
+    fn test_classify_cdc_refresh_mode_interaction_global_wal_immediate() {
+        assert_eq!(
+            classify_cdc_refresh_mode_interaction(
+                RefreshMode::Immediate,
+                "wal",
+                CdcModeRequestSource::GlobalGuc,
+            ),
+            CdcRefreshModeInteraction::IgnoreWalForImmediate
+        );
+    }
+
+    #[test]
+    fn test_classify_cdc_refresh_mode_interaction_explicit_wal_immediate() {
+        assert_eq!(
+            classify_cdc_refresh_mode_interaction(
+                RefreshMode::Immediate,
+                "wal",
+                CdcModeRequestSource::ExplicitOverride,
+            ),
+            CdcRefreshModeInteraction::RejectWalForImmediate
+        );
+    }
+
+    #[test]
+    fn test_classify_cdc_refresh_mode_interaction_non_immediate_is_none() {
+        assert_eq!(
+            classify_cdc_refresh_mode_interaction(
+                RefreshMode::Differential,
+                "wal",
+                CdcModeRequestSource::GlobalGuc,
+            ),
+            CdcRefreshModeInteraction::None
+        );
+    }
+
+    #[test]
+    fn test_classify_cdc_refresh_mode_interaction_immediate_non_wal_is_none() {
+        assert_eq!(
+            classify_cdc_refresh_mode_interaction(
+                RefreshMode::Immediate,
+                "auto",
+                CdcModeRequestSource::GlobalGuc,
+            ),
+            CdcRefreshModeInteraction::None
+        );
     }
 }
