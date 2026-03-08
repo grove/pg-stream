@@ -56,9 +56,10 @@ runs:
       with:
         path: |
           ~/.cargo/bin/cargo-pgrx
+          ~/.cargo/bin/cargo-pgrx.exe
           ~/.cargo/.crates2.json
           ~/.cargo/.crates.toml
-        key: v1-cargo-pgrx-bin-0.17.0-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}
+        key: v2-cargo-pgrx-bin-0.17.0-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}
 
     - name: Cache pgrx home directory (~/.pgrx)
       id: cache-pgrx-home
@@ -116,10 +117,16 @@ runs:
     # which compiles PostgreSQL from source inside ~/.pgrx (cached above).
 
     # ── cargo-pgrx ────────────────────────────────────────────────────────
-    - name: Install cargo-pgrx
-      if: steps.cache-cargo-pgrx.outputs.cache-hit != 'true'
+    - name: Ensure cargo-pgrx is available
       shell: bash
-      run: cargo install --locked cargo-pgrx --version 0.17.0
+      run: |
+        if command -v cargo-pgrx >/dev/null 2>&1; then
+          cargo pgrx --version
+          exit 0
+        fi
+
+        cargo install --locked cargo-pgrx --version 0.17.0
+        cargo pgrx --version
 
     # ── pgrx init ─────────────────────────────────────────────────────────
     - name: Initialize pgrx for PostgreSQL ${{ inputs.pg-version }}
