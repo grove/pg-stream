@@ -479,7 +479,7 @@ async fn test_guc_auto_detects_triggers() {
     db.refresh_st("st_guc_auto").await;
 
     // GUC should default to 'auto'
-    let guc_val: String = db.query_scalar("SHOW pg_trickle.user_triggers").await;
+    let guc_val = db.show_setting("pg_trickle.user_triggers").await;
     assert_eq!(guc_val, "auto", "Default GUC should be 'auto'");
 
     // Attach trigger — auto mode should detect it

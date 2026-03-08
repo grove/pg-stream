@@ -1336,15 +1336,15 @@ async fn test_topk_immediate_with_offset() {
 #[tokio::test]
 async fn test_topk_immediate_threshold_rejection() {
     let db = E2eDb::new().await.with_extension().await;
+    let default_limit = db.show_setting("pg_trickle.ivm_topk_max_limit").await;
 
     db.execute("CREATE TABLE topk_imm_rej (id INT PRIMARY KEY, val INT)")
         .await;
     db.execute("INSERT INTO topk_imm_rej VALUES (1,1)").await;
 
     // Set the GUC to a very low limit (system-wide so it applies across pool connections)
-    db.execute("ALTER SYSTEM SET pg_trickle.ivm_topk_max_limit = 5")
+    db.alter_system_set_and_wait("pg_trickle.ivm_topk_max_limit", "5", "5")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
 
     // Creating a TopK with LIMIT > threshold should fail
     let result = db
@@ -1356,9 +1356,8 @@ async fn test_topk_immediate_threshold_rejection() {
         .await;
 
     // Clean up the system-wide GUC before asserting
-    db.execute("ALTER SYSTEM RESET pg_trickle.ivm_topk_max_limit")
+    db.alter_system_reset_and_wait("pg_trickle.ivm_topk_max_limit", &default_limit)
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
 
     assert!(
         result.is_err(),

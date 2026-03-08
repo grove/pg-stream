@@ -2687,16 +2687,14 @@ async fn test_recursive_cte_immediate_mode_delete_triggers_dred() {
 #[tokio::test]
 async fn test_recursive_cte_immediate_mode_depth_guard() {
     let db = E2eDb::new().await.with_extension().await;
+    let default_depth = db.show_setting("pg_trickle.ivm_recursive_max_depth").await;
 
     // Lower the depth guard to 3 so we can trigger it with a short chain.
     // The guard limits the number of semi-naive propagation iterations of
     // the incremental delta (not the total hierarchy depth).
     // Use ALTER SYSTEM so the GUC applies cluster-wide (pool-safe).
-    db.execute("ALTER SYSTEM SET pg_trickle.ivm_recursive_max_depth = 3")
+    db.alter_system_set_and_wait("pg_trickle.ivm_recursive_max_depth", "3", "3")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    // Small delay for reload
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     db.execute("CREATE TABLE chain (id INT PRIMARY KEY, parent_id INT)")
         .await;
@@ -2737,7 +2735,6 @@ async fn test_recursive_cte_immediate_mode_depth_guard() {
         "Rows within the depth guard must be materialised; got {count}"
     );
 
-    db.execute("ALTER SYSTEM RESET pg_trickle.ivm_recursive_max_depth")
+    db.alter_system_reset_and_wait("pg_trickle.ivm_recursive_max_depth", &default_depth)
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
 }

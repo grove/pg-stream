@@ -25,6 +25,7 @@ path = "./src/bin/pgrx_embed.rs"
 default = ["pg18"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
+light-e2e = []
 
 [dependencies]
 pgrx = "=0.17.0"

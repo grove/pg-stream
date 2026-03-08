@@ -150,6 +150,83 @@ pub fn invalidate_ivm_delta_cache(pgt_id: i64) {
     });
 }
 
+// ── IVM trigger / function naming ────────────────────────────────────────
+
+/// All trigger and function names used by IVM for a single
+/// (pgt_id, source_oid) pair.
+///
+/// Extracted as a pure struct so naming is unit-testable and consistent
+/// between `setup_ivm_triggers` and `cleanup_ivm_triggers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IvmTriggerNames {
+    // BEFORE triggers (statement-level)
+    pub before_insert: String,
+    pub before_update: String,
+    pub before_delete: String,
+    pub before_trunc: String,
+
+    // AFTER triggers (statement-level, with transition tables)
+    pub after_ins: String,
+    pub after_upd: String,
+    pub after_del: String,
+    pub after_trunc: String,
+
+    // Trigger functions (PL/pgSQL)
+    pub before_fn: String,
+    pub after_ins_fn: String,
+    pub after_upd_fn: String,
+    pub after_del_fn: String,
+    pub after_trunc_fn: String,
+}
+
+impl IvmTriggerNames {
+    /// Generate all names for a given stream table / source table pair.
+    pub fn new(pgt_id: i64, source_oid_u32: u32) -> Self {
+        Self {
+            before_insert: format!("pgt_ivm_before_insert_{pgt_id}"),
+            before_update: format!("pgt_ivm_before_update_{pgt_id}"),
+            before_delete: format!("pgt_ivm_before_delete_{pgt_id}"),
+            before_trunc: format!("pgt_ivm_before_trunc_{pgt_id}"),
+
+            after_ins: format!("pgt_ivm_after_ins_{pgt_id}"),
+            after_upd: format!("pgt_ivm_after_upd_{pgt_id}"),
+            after_del: format!("pgt_ivm_after_del_{pgt_id}"),
+            after_trunc: format!("pgt_ivm_after_trunc_{pgt_id}"),
+
+            before_fn: format!("pgtrickle.pgt_ivm_before_fn_{pgt_id}_{source_oid_u32}"),
+            after_ins_fn: format!("pgtrickle.pgt_ivm_after_ins_fn_{pgt_id}_{source_oid_u32}"),
+            after_upd_fn: format!("pgtrickle.pgt_ivm_after_upd_fn_{pgt_id}_{source_oid_u32}"),
+            after_del_fn: format!("pgtrickle.pgt_ivm_after_del_fn_{pgt_id}_{source_oid_u32}"),
+            after_trunc_fn: format!("pgtrickle.pgt_ivm_after_trunc_fn_{pgt_id}_{source_oid_u32}"),
+        }
+    }
+
+    /// All trigger names (for DROP TRIGGER).
+    pub fn all_triggers(&self) -> [&str; 8] {
+        [
+            &self.before_insert,
+            &self.before_update,
+            &self.before_delete,
+            &self.before_trunc,
+            &self.after_ins,
+            &self.after_upd,
+            &self.after_del,
+            &self.after_trunc,
+        ]
+    }
+
+    /// All function names (for DROP FUNCTION).
+    pub fn all_functions(&self) -> [&str; 5] {
+        [
+            &self.before_fn,
+            &self.after_ins_fn,
+            &self.after_upd_fn,
+            &self.after_del_fn,
+            &self.after_trunc_fn,
+        ]
+    }
+}
+
 /// Install IVM triggers on a source table for an IMMEDIATE-mode stream table.
 ///
 /// Creates statement-level BEFORE and AFTER triggers for INSERT, UPDATE,
@@ -170,6 +247,7 @@ pub fn setup_ivm_triggers(
 ) -> Result<(), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
     let st_oid_u32 = st_relid.to_u32();
+    let names = IvmTriggerNames::new(pgt_id, oid_u32);
 
     // Resolve the fully-qualified source table name.
     let source_table =
@@ -180,12 +258,6 @@ pub fn setup_ivm_triggers(
             })?;
 
     // ── BEFORE triggers (statement-level) ────────────────────────────
-    // Acquire a lock on the stream table to prevent concurrent conflicting
-    // updates. The lock mode depends on the query complexity:
-    // - Exclusive (advisory lock): for queries with aggregates, DISTINCT,
-    //   or multi-table joins where concurrent writes can conflict.
-    // - RowExclusive: for simple single-table scans where row_ids are
-    //   independent and concurrent inserts are safe.
     let lock_body = match lock_mode {
         IvmLockMode::Exclusive => format!("PERFORM pg_advisory_xact_lock({st_oid_u32}::BIGINT);"),
         IvmLockMode::RowExclusive => {
@@ -193,38 +265,34 @@ pub fn setup_ivm_triggers(
         }
     };
 
-    for op in &["INSERT", "UPDATE", "DELETE"] {
-        let trigger_name = format!(
-            "pgt_ivm_before_{op}_{pgt_id}",
-            op = op.to_lowercase(),
-            pgt_id = pgt_id,
-        );
+    let before_fn = &names.before_fn;
+    let create_fn_sql = format!(
+        "CREATE OR REPLACE FUNCTION {before_fn}()
+         RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             -- Lock stream table for IVM ({lock_mode:?} mode).
+             {lock_body}
+             RETURN NULL;
+         END;
+         $$"
+    );
+    Spi::run(&create_fn_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!(
+            "Failed to create IVM BEFORE trigger function: {}",
+            e
+        ))
+    })?;
 
-        // The BEFORE trigger function acquires a lock on the stream table.
-        let fn_name = format!("pgtrickle.pgt_ivm_before_fn_{pgt_id}_{oid_u32}");
-
-        let create_fn_sql = format!(
-            "CREATE OR REPLACE FUNCTION {fn_name}()
-             RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN
-                 -- Lock stream table for IVM ({lock_mode:?} mode).
-                 {lock_body}
-                 RETURN NULL;
-             END;
-             $$"
-        );
-        Spi::run(&create_fn_sql).map_err(|e| {
-            PgTrickleError::SpiError(format!(
-                "Failed to create IVM BEFORE trigger function: {}",
-                e
-            ))
-        })?;
-
+    for (op, trigger_name) in [
+        ("INSERT", &names.before_insert),
+        ("UPDATE", &names.before_update),
+        ("DELETE", &names.before_delete),
+    ] {
         let create_trigger_sql = format!(
             "CREATE TRIGGER {trigger_name}
              BEFORE {op} ON {source_table}
              FOR EACH STATEMENT
-             EXECUTE FUNCTION {fn_name}()"
+             EXECUTE FUNCTION {before_fn}()"
         );
         Spi::run(&create_trigger_sql).map_err(|e| {
             PgTrickleError::SpiError(format!(
@@ -235,14 +303,12 @@ pub fn setup_ivm_triggers(
     }
 
     // ── BEFORE TRUNCATE trigger ──────────────────────────────────────
-    let trunc_before_trigger = format!("pgt_ivm_before_trunc_{pgt_id}");
-    let trunc_before_fn = format!("pgtrickle.pgt_ivm_before_fn_{pgt_id}_{oid_u32}");
-    // Reuse the same lock function for TRUNCATE.
     let create_trunc_before_sql = format!(
-        "CREATE TRIGGER {trunc_before_trigger}
+        "CREATE TRIGGER {trunc_trig}
          BEFORE TRUNCATE ON {source_table}
          FOR EACH STATEMENT
-         EXECUTE FUNCTION {trunc_before_fn}()"
+         EXECUTE FUNCTION {before_fn}()",
+        trunc_trig = names.before_trunc,
     );
     Spi::run(&create_trunc_before_sql).map_err(|e| {
         PgTrickleError::SpiError(format!(
@@ -252,42 +318,33 @@ pub fn setup_ivm_triggers(
     })?;
 
     // ── AFTER triggers (statement-level, with transition tables) ─────
-    // Each DML operation has its own AFTER trigger with the appropriate
-    // REFERENCING clause. The PL/pgSQL body:
-    // 1. Creates temp tables from the transition tables
-    // 2. Calls the Rust pgt_ivm_apply_delta function
-    // 3. Drops the temp tables
 
     // AFTER INSERT: only NEW table
-    let after_ins_fn = format!("pgtrickle.pgt_ivm_after_ins_fn_{pgt_id}_{oid_u32}");
     let create_after_ins_fn = format!(
-        "CREATE OR REPLACE FUNCTION {after_ins_fn}()
+        "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
-             -- Copy transition table to temp table for SPI access
              CREATE TEMP TABLE __pgt_newtable_{oid_u32} ON COMMIT DROP AS
                  SELECT * FROM __pgt_newtable;
-
-             -- Apply delta via the DVM engine
              PERFORM pgtrickle.pgt_ivm_apply_delta({pgt_id}, {oid_u32}, true, false);
-
-             -- Clean up temp table
              DROP TABLE IF EXISTS __pgt_newtable_{oid_u32};
              RETURN NULL;
          END;
-         $$"
+         $$",
+        fn = names.after_ins_fn,
     );
     Spi::run(&create_after_ins_fn).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create IVM AFTER INSERT function: {}", e))
     })?;
 
-    let after_ins_trigger = format!("pgt_ivm_after_ins_{pgt_id}");
     let create_after_ins_trigger = format!(
-        "CREATE TRIGGER {after_ins_trigger}
+        "CREATE TRIGGER {trig}
          AFTER INSERT ON {source_table}
          REFERENCING NEW TABLE AS __pgt_newtable
          FOR EACH STATEMENT
-         EXECUTE FUNCTION {after_ins_fn}()"
+         EXECUTE FUNCTION {fn}()",
+        trig = names.after_ins,
+        fn = names.after_ins_fn,
     );
     Spi::run(&create_after_ins_trigger).map_err(|e| {
         PgTrickleError::SpiError(format!(
@@ -297,35 +354,34 @@ pub fn setup_ivm_triggers(
     })?;
 
     // AFTER UPDATE: both OLD and NEW tables
-    let after_upd_fn = format!("pgtrickle.pgt_ivm_after_upd_fn_{pgt_id}_{oid_u32}");
     let create_after_upd_fn = format!(
-        "CREATE OR REPLACE FUNCTION {after_upd_fn}()
+        "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_newtable_{oid_u32} ON COMMIT DROP AS
                  SELECT * FROM __pgt_newtable;
              CREATE TEMP TABLE __pgt_oldtable_{oid_u32} ON COMMIT DROP AS
                  SELECT * FROM __pgt_oldtable;
-
              PERFORM pgtrickle.pgt_ivm_apply_delta({pgt_id}, {oid_u32}, true, true);
-
              DROP TABLE IF EXISTS __pgt_newtable_{oid_u32};
              DROP TABLE IF EXISTS __pgt_oldtable_{oid_u32};
              RETURN NULL;
          END;
-         $$"
+         $$",
+        fn = names.after_upd_fn,
     );
     Spi::run(&create_after_upd_fn).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create IVM AFTER UPDATE function: {}", e))
     })?;
 
-    let after_upd_trigger = format!("pgt_ivm_after_upd_{pgt_id}");
     let create_after_upd_trigger = format!(
-        "CREATE TRIGGER {after_upd_trigger}
+        "CREATE TRIGGER {trig}
          AFTER UPDATE ON {source_table}
          REFERENCING OLD TABLE AS __pgt_oldtable NEW TABLE AS __pgt_newtable
          FOR EACH STATEMENT
-         EXECUTE FUNCTION {after_upd_fn}()"
+         EXECUTE FUNCTION {fn}()",
+        trig = names.after_upd,
+        fn = names.after_upd_fn,
     );
     Spi::run(&create_after_upd_trigger).map_err(|e| {
         PgTrickleError::SpiError(format!(
@@ -335,32 +391,31 @@ pub fn setup_ivm_triggers(
     })?;
 
     // AFTER DELETE: only OLD table
-    let after_del_fn = format!("pgtrickle.pgt_ivm_after_del_fn_{pgt_id}_{oid_u32}");
     let create_after_del_fn = format!(
-        "CREATE OR REPLACE FUNCTION {after_del_fn}()
+        "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_oldtable_{oid_u32} ON COMMIT DROP AS
                  SELECT * FROM __pgt_oldtable;
-
              PERFORM pgtrickle.pgt_ivm_apply_delta({pgt_id}, {oid_u32}, false, true);
-
              DROP TABLE IF EXISTS __pgt_oldtable_{oid_u32};
              RETURN NULL;
          END;
-         $$"
+         $$",
+        fn = names.after_del_fn,
     );
     Spi::run(&create_after_del_fn).map_err(|e| {
         PgTrickleError::SpiError(format!("Failed to create IVM AFTER DELETE function: {}", e))
     })?;
 
-    let after_del_trigger = format!("pgt_ivm_after_del_{pgt_id}");
     let create_after_del_trigger = format!(
-        "CREATE TRIGGER {after_del_trigger}
+        "CREATE TRIGGER {trig}
          AFTER DELETE ON {source_table}
          REFERENCING OLD TABLE AS __pgt_oldtable
          FOR EACH STATEMENT
-         EXECUTE FUNCTION {after_del_fn}()"
+         EXECUTE FUNCTION {fn}()",
+        trig = names.after_del,
+        fn = names.after_del_fn,
     );
     Spi::run(&create_after_del_trigger).map_err(|e| {
         PgTrickleError::SpiError(format!(
@@ -370,16 +425,15 @@ pub fn setup_ivm_triggers(
     })?;
 
     // AFTER TRUNCATE: no transition tables, full refresh
-    let after_trunc_fn = format!("pgtrickle.pgt_ivm_after_trunc_fn_{pgt_id}_{oid_u32}");
     let create_after_trunc_fn = format!(
-        "CREATE OR REPLACE FUNCTION {after_trunc_fn}()
+        "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
-             -- TRUNCATE: fully refresh the stream table
              PERFORM pgtrickle.pgt_ivm_handle_truncate({pgt_id});
              RETURN NULL;
          END;
-         $$"
+         $$",
+        fn = names.after_trunc_fn,
     );
     Spi::run(&create_after_trunc_fn).map_err(|e| {
         PgTrickleError::SpiError(format!(
@@ -388,12 +442,13 @@ pub fn setup_ivm_triggers(
         ))
     })?;
 
-    let after_trunc_trigger = format!("pgt_ivm_after_trunc_{pgt_id}");
     let create_after_trunc_trigger = format!(
-        "CREATE TRIGGER {after_trunc_trigger}
+        "CREATE TRIGGER {trig}
          AFTER TRUNCATE ON {source_table}
          FOR EACH STATEMENT
-         EXECUTE FUNCTION {after_trunc_fn}()"
+         EXECUTE FUNCTION {fn}()",
+        trig = names.after_trunc,
+        fn = names.after_trunc_fn,
     );
     Spi::run(&create_after_trunc_trigger).map_err(|e| {
         PgTrickleError::SpiError(format!(
@@ -417,6 +472,7 @@ pub fn setup_ivm_triggers(
 /// created by `setup_ivm_triggers`.
 pub fn cleanup_ivm_triggers(source_relid: pg_sys::Oid, pgt_id: i64) -> Result<(), PgTrickleError> {
     let oid_u32 = source_relid.to_u32();
+    let names = IvmTriggerNames::new(pgt_id, oid_u32);
 
     // Get the source table name for trigger drop.
     let source_table =
@@ -424,34 +480,14 @@ pub fn cleanup_ivm_triggers(source_relid: pg_sys::Oid, pgt_id: i64) -> Result<()
             .unwrap_or(None);
 
     if let Some(ref table) = source_table {
-        // Drop all triggers for this pgt_id on this source table.
-        let trigger_names = [
-            format!("pgt_ivm_before_insert_{pgt_id}"),
-            format!("pgt_ivm_before_update_{pgt_id}"),
-            format!("pgt_ivm_before_delete_{pgt_id}"),
-            format!("pgt_ivm_before_trunc_{pgt_id}"),
-            format!("pgt_ivm_after_ins_{pgt_id}"),
-            format!("pgt_ivm_after_upd_{pgt_id}"),
-            format!("pgt_ivm_after_del_{pgt_id}"),
-            format!("pgt_ivm_after_trunc_{pgt_id}"),
-        ];
-
-        for trigger in &trigger_names {
+        for trigger in &names.all_triggers() {
             let drop_sql = format!("DROP TRIGGER IF EXISTS {trigger} ON {table}");
             let _ = Spi::run(&drop_sql);
         }
     }
 
     // Drop the trigger functions (CASCADE to be safe).
-    let fn_names = [
-        format!("pgtrickle.pgt_ivm_before_fn_{pgt_id}_{oid_u32}"),
-        format!("pgtrickle.pgt_ivm_after_ins_fn_{pgt_id}_{oid_u32}"),
-        format!("pgtrickle.pgt_ivm_after_upd_fn_{pgt_id}_{oid_u32}"),
-        format!("pgtrickle.pgt_ivm_after_del_fn_{pgt_id}_{oid_u32}"),
-        format!("pgtrickle.pgt_ivm_after_trunc_fn_{pgt_id}_{oid_u32}"),
-    ];
-
-    for fn_name in &fn_names {
+    for fn_name in &names.all_functions() {
         let drop_sql = format!("DROP FUNCTION IF EXISTS {fn_name}() CASCADE");
         let _ = Spi::run(&drop_sql);
     }
@@ -531,54 +567,12 @@ fn pgt_ivm_apply_delta(
         .unwrap_or(0);
 
     if delta_count > 0 {
-        // Build column list for the merge/apply.
-        let col_list = user_columns
-            .iter()
-            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(", ");
-
         // DELETE: remove rows that were deleted or updated (action = 'D').
         //
         // EC-06: For keyless sources, use counted DELETE (ROW_NUMBER
         // matching) to avoid deleting ALL duplicates when only a subset
         // should be removed.
-        let delete_sql = if st.has_keyless_source {
-            format!(
-                "DELETE FROM {st_qualified} \
-                 WHERE ctid IN (\
-                   SELECT numbered_st.st_ctid \
-                   FROM (\
-                     SELECT st2.ctid AS st_ctid, \
-                            st2.__pgt_row_id, \
-                            ROW_NUMBER() OVER (\
-                              PARTITION BY st2.__pgt_row_id ORDER BY st2.ctid\
-                            ) AS st_rn \
-                     FROM {st_qualified} st2 \
-                     WHERE st2.__pgt_row_id IN (\
-                       SELECT DISTINCT __pgt_row_id \
-                       FROM {delta_table} \
-                       WHERE __pgt_action = 'D'\
-                     )\
-                   ) numbered_st \
-                   JOIN (\
-                     SELECT __pgt_row_id, \
-                            COUNT(*)::INT AS del_count \
-                     FROM {delta_table} \
-                     WHERE __pgt_action = 'D' \
-                     GROUP BY __pgt_row_id\
-                   ) dc ON numbered_st.__pgt_row_id = dc.__pgt_row_id \
-                   WHERE numbered_st.st_rn <= dc.del_count\
-                 )"
-            )
-        } else {
-            format!(
-                "DELETE FROM {st_qualified} AS t
-                 USING {delta_table} AS d
-                 WHERE d.__pgt_action = 'D'
-                   AND t.__pgt_row_id = d.__pgt_row_id"
-            )
-        };
+        let delete_sql = build_ivm_delete_sql(&st_qualified, &delta_table, st.has_keyless_source);
         Spi::run(&delete_sql)
             .map_err(|e| PgTrickleError::SpiError(format!("IVM delta DELETE failed: {e}")))?;
 
@@ -586,40 +580,12 @@ fn pgt_ivm_apply_delta(
         //
         // EC-06: For keyless sources, use plain INSERT (no ON CONFLICT)
         // since duplicate __pgt_row_id values are expected.
-        let insert_sql = if st.has_keyless_source {
-            format!(
-                "INSERT INTO {st_qualified} (__pgt_row_id, {col_list})
-                 SELECT d.__pgt_row_id, {d_col_list}
-                 FROM {delta_table} d
-                 WHERE d.__pgt_action = 'I'",
-                d_col_list = user_columns
-                    .iter()
-                    .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-        } else {
-            format!(
-                "INSERT INTO {st_qualified} (__pgt_row_id, {col_list})
-                 SELECT d.__pgt_row_id, {d_col_list}
-                 FROM {delta_table} d
-                 WHERE d.__pgt_action = 'I'
-                 ON CONFLICT (__pgt_row_id) DO UPDATE SET {update_set}",
-                d_col_list = user_columns
-                    .iter()
-                    .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                update_set = user_columns
-                    .iter()
-                    .map(|c| {
-                        let quoted = format!("\"{}\"", c.replace('"', "\"\""));
-                        format!("{quoted} = EXCLUDED.{quoted}")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-        };
+        let insert_sql = build_ivm_insert_sql(
+            &st_qualified,
+            &delta_table,
+            &user_columns,
+            st.has_keyless_source,
+        );
         Spi::run(&insert_sql)
             .map_err(|e| PgTrickleError::SpiError(format!("IVM delta INSERT failed: {e}")))?;
     }
@@ -936,4 +902,494 @@ fn pgt_ivm_handle_truncate(pgt_id: i64) -> Result<(), PgTrickleError> {
     pgrx::log!("[pg_trickle] IVM TRUNCATE handled for pgt_id={}", pgt_id,);
 
     Ok(())
+}
+
+// ── Extracted SQL Builders (unit-testable) ──────────────────────────────────
+
+/// Build the DELETE SQL for IVM delta application.
+///
+/// Keyless sources use counted-DELETE (ROW_NUMBER matching) to avoid
+/// deleting ALL duplicates when only a subset should be removed.
+fn build_ivm_delete_sql(st_qualified: &str, delta_table: &str, has_keyless_source: bool) -> String {
+    if has_keyless_source {
+        format!(
+            "DELETE FROM {st_qualified} \
+             WHERE ctid IN (\
+               SELECT numbered_st.st_ctid \
+               FROM (\
+                 SELECT st2.ctid AS st_ctid, \
+                        st2.__pgt_row_id, \
+                        ROW_NUMBER() OVER (\
+                          PARTITION BY st2.__pgt_row_id ORDER BY st2.ctid\
+                        ) AS st_rn \
+                 FROM {st_qualified} st2 \
+                 WHERE st2.__pgt_row_id IN (\
+                   SELECT DISTINCT __pgt_row_id \
+                   FROM {delta_table} \
+                   WHERE __pgt_action = 'D'\
+                 )\
+               ) numbered_st \
+               JOIN (\
+                 SELECT __pgt_row_id, \
+                        COUNT(*)::INT AS del_count \
+                 FROM {delta_table} \
+                 WHERE __pgt_action = 'D' \
+                 GROUP BY __pgt_row_id\
+               ) dc ON numbered_st.__pgt_row_id = dc.__pgt_row_id \
+               WHERE numbered_st.st_rn <= dc.del_count\
+             )"
+        )
+    } else {
+        format!(
+            "DELETE FROM {st_qualified} AS t
+                 USING {delta_table} AS d
+                 WHERE d.__pgt_action = 'D'
+                   AND t.__pgt_row_id = d.__pgt_row_id"
+        )
+    }
+}
+
+/// Build the INSERT SQL for IVM delta application.
+///
+/// Keyless sources use plain INSERT (no ON CONFLICT) since duplicate
+/// `__pgt_row_id` values are expected.
+fn build_ivm_insert_sql(
+    st_qualified: &str,
+    delta_table: &str,
+    user_columns: &[String],
+    has_keyless_source: bool,
+) -> String {
+    let col_list = user_columns
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let d_col_list = user_columns
+        .iter()
+        .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if has_keyless_source {
+        format!(
+            "INSERT INTO {st_qualified} (__pgt_row_id, {col_list})
+                 SELECT d.__pgt_row_id, {d_col_list}
+                 FROM {delta_table} d
+                 WHERE d.__pgt_action = 'I'"
+        )
+    } else {
+        let update_set = user_columns
+            .iter()
+            .map(|c| {
+                let quoted = format!("\"{}\"", c.replace('"', "\"\""));
+                format!("{quoted} = EXCLUDED.{quoted}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        format!(
+            "INSERT INTO {st_qualified} (__pgt_row_id, {col_list})
+                 SELECT d.__pgt_row_id, {d_col_list}
+                 FROM {delta_table} d
+                 WHERE d.__pgt_action = 'I'
+                 ON CONFLICT (__pgt_row_id) DO UPDATE SET {update_set}"
+        )
+    }
+}
+
+/// Build the three column-list fragments used in IVM delta application:
+/// `(col_list, d_col_list, update_set)`.
+fn build_column_lists(user_columns: &[String]) -> (String, String, String) {
+    let col_list = user_columns
+        .iter()
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let d_col_list = user_columns
+        .iter()
+        .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let update_set = user_columns
+        .iter()
+        .map(|c| {
+            let quoted = format!("\"{}\"", c.replace('"', "\"\""));
+            format!("{quoted} = EXCLUDED.{quoted}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    (col_list, d_col_list, update_set)
+}
+
+// ── Unit Tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── hash_str tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_hash_str_deterministic() {
+        let h1 = hash_str("SELECT * FROM t");
+        let h2 = hash_str("SELECT * FROM t");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_str_different_inputs() {
+        let h1 = hash_str("SELECT * FROM t");
+        let h2 = hash_str("SELECT * FROM u");
+        assert_ne!(h1, h2);
+    }
+
+    // ── is_simple_scan_chain tests ──────────────────────────────────
+
+    #[test]
+    fn test_scan_is_simple_chain() {
+        use crate::dvm::parser::{Column, OpTree};
+        let tree = OpTree::Scan {
+            table_oid: 1,
+            table_name: "t".into(),
+            schema: "public".into(),
+            columns: vec![Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            }],
+            pk_columns: vec!["id".into()],
+            alias: "t".into(),
+        };
+        assert!(IvmLockMode::is_simple_scan_chain(&tree));
+    }
+
+    #[test]
+    fn test_filter_over_scan_is_simple_chain() {
+        use crate::dvm::parser::{Column, Expr, OpTree};
+        let tree = OpTree::Filter {
+            predicate: Expr::Literal("true".into()),
+            child: Box::new(OpTree::Scan {
+                table_oid: 1,
+                table_name: "t".into(),
+                schema: "public".into(),
+                columns: vec![Column {
+                    name: "id".into(),
+                    type_oid: 23,
+                    is_nullable: false,
+                }],
+                pk_columns: vec![],
+                alias: "t".into(),
+            }),
+        };
+        assert!(IvmLockMode::is_simple_scan_chain(&tree));
+    }
+
+    #[test]
+    fn test_project_over_filter_over_scan_is_simple_chain() {
+        use crate::dvm::parser::{Column, Expr, OpTree};
+        let scan = OpTree::Scan {
+            table_oid: 1,
+            table_name: "t".into(),
+            schema: "public".into(),
+            columns: vec![Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            }],
+            pk_columns: vec![],
+            alias: "t".into(),
+        };
+        let filter = OpTree::Filter {
+            predicate: Expr::Literal("true".into()),
+            child: Box::new(scan),
+        };
+        let project = OpTree::Project {
+            expressions: vec![],
+            aliases: vec![],
+            child: Box::new(filter),
+        };
+        assert!(IvmLockMode::is_simple_scan_chain(&project));
+    }
+
+    #[test]
+    fn test_aggregate_is_not_simple_chain() {
+        use crate::dvm::parser::{Column, OpTree};
+        let scan = OpTree::Scan {
+            table_oid: 1,
+            table_name: "t".into(),
+            schema: "public".into(),
+            columns: vec![Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            }],
+            pk_columns: vec![],
+            alias: "t".into(),
+        };
+        let agg = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![],
+            child: Box::new(scan),
+        };
+        assert!(!IvmLockMode::is_simple_scan_chain(&agg));
+    }
+
+    #[test]
+    fn test_join_is_not_simple_chain() {
+        use crate::dvm::parser::{Column, Expr, OpTree};
+        let scan_a = OpTree::Scan {
+            table_oid: 1,
+            table_name: "a".into(),
+            schema: "public".into(),
+            columns: vec![Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            }],
+            pk_columns: vec![],
+            alias: "a".into(),
+        };
+        let scan_b = OpTree::Scan {
+            table_oid: 2,
+            table_name: "b".into(),
+            schema: "public".into(),
+            columns: vec![Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            }],
+            pk_columns: vec![],
+            alias: "b".into(),
+        };
+        let join = OpTree::InnerJoin {
+            condition: Expr::Literal("true".into()),
+            left: Box::new(scan_a),
+            right: Box::new(scan_b),
+        };
+        assert!(!IvmLockMode::is_simple_scan_chain(&join));
+    }
+
+    #[test]
+    fn test_distinct_is_not_simple_chain() {
+        use crate::dvm::parser::{Column, OpTree};
+        let scan = OpTree::Scan {
+            table_oid: 1,
+            table_name: "t".into(),
+            schema: "public".into(),
+            columns: vec![Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            }],
+            pk_columns: vec![],
+            alias: "t".into(),
+        };
+        let distinct = OpTree::Distinct {
+            child: Box::new(scan),
+        };
+        assert!(!IvmLockMode::is_simple_scan_chain(&distinct));
+    }
+
+    // ── build_ivm_delete_sql tests ──────────────────────────────────
+
+    #[test]
+    fn test_keyed_delete_uses_simple_join() {
+        let sql = build_ivm_delete_sql(r#""public"."my_st""#, "__delta_1", false);
+        assert!(sql.contains("USING"), "keyed DELETE should use USING");
+        assert!(
+            sql.contains("__pgt_action = 'D'"),
+            "should filter on action D"
+        );
+        assert!(
+            !sql.contains("ROW_NUMBER"),
+            "keyed DELETE should NOT use ROW_NUMBER"
+        );
+    }
+
+    #[test]
+    fn test_keyless_delete_uses_row_number() {
+        let sql = build_ivm_delete_sql(r#""public"."my_st""#, "__delta_1", true);
+        assert!(
+            sql.contains("ROW_NUMBER"),
+            "keyless DELETE should use ROW_NUMBER"
+        );
+        assert!(
+            sql.contains("st_rn <= dc.del_count"),
+            "should limit deletes by count"
+        );
+        assert!(
+            sql.contains("__pgt_action = 'D'"),
+            "should filter on action D"
+        );
+    }
+
+    #[test]
+    fn test_delete_sql_includes_table_names() {
+        let sql = build_ivm_delete_sql(r#""myschema"."orders_st""#, "__delta_42", false);
+        assert!(sql.contains(r#""myschema"."orders_st""#));
+        assert!(sql.contains("__delta_42"));
+    }
+
+    // ── build_ivm_insert_sql tests ──────────────────────────────────
+
+    #[test]
+    fn test_keyed_insert_uses_on_conflict() {
+        let cols = vec!["id".to_string(), "val".to_string()];
+        let sql = build_ivm_insert_sql(r#""public"."st""#, "__delta", &cols, false);
+        assert!(
+            sql.contains("ON CONFLICT (__pgt_row_id) DO UPDATE SET"),
+            "keyed INSERT should use ON CONFLICT"
+        );
+        assert!(sql.contains(r#""id""#));
+        assert!(sql.contains(r#""val""#));
+        assert!(sql.contains(r#""id" = EXCLUDED."id""#));
+    }
+
+    #[test]
+    fn test_keyless_insert_no_on_conflict() {
+        let cols = vec!["name".to_string()];
+        let sql = build_ivm_insert_sql(r#""public"."st""#, "__delta", &cols, true);
+        assert!(
+            !sql.contains("ON CONFLICT"),
+            "keyless INSERT should NOT have ON CONFLICT"
+        );
+        assert!(sql.contains("__pgt_action = 'I'"));
+    }
+
+    #[test]
+    fn test_insert_sql_quotes_special_chars() {
+        let cols = vec![r#"col"name"#.to_string()];
+        let sql = build_ivm_insert_sql(r#""public"."st""#, "__delta", &cols, false);
+        assert!(
+            sql.contains(r#""col""name""#),
+            "should double-quote embedded quotes: {sql}"
+        );
+    }
+
+    // ── build_column_lists tests ────────────────────────────────────
+
+    #[test]
+    fn test_column_lists_basic() {
+        let cols = vec!["id".to_string(), "val".to_string()];
+        let (col_list, d_col_list, update_set) = build_column_lists(&cols);
+        assert_eq!(col_list, r#""id", "val""#);
+        assert_eq!(d_col_list, r#"d."id", d."val""#);
+        assert!(update_set.contains(r#""id" = EXCLUDED."id""#));
+        assert!(update_set.contains(r#""val" = EXCLUDED."val""#));
+    }
+
+    #[test]
+    fn test_column_lists_empty() {
+        let (col_list, d_col_list, update_set) = build_column_lists(&[]);
+        assert_eq!(col_list, "");
+        assert_eq!(d_col_list, "");
+        assert_eq!(update_set, "");
+    }
+
+    #[test]
+    fn test_column_lists_special_chars() {
+        let cols = vec![r#"my"col"#.to_string()];
+        let (col_list, d_col_list, _) = build_column_lists(&cols);
+        assert_eq!(col_list, r#""my""col""#);
+        assert_eq!(d_col_list, r#"d."my""col""#);
+    }
+
+    // ── IvmTriggerNames tests ───────────────────────────────────────
+
+    #[test]
+    fn test_trigger_names_before_triggers() {
+        let names = IvmTriggerNames::new(42, 12345);
+        assert_eq!(names.before_insert, "pgt_ivm_before_insert_42");
+        assert_eq!(names.before_update, "pgt_ivm_before_update_42");
+        assert_eq!(names.before_delete, "pgt_ivm_before_delete_42");
+        assert_eq!(names.before_trunc, "pgt_ivm_before_trunc_42");
+    }
+
+    #[test]
+    fn test_trigger_names_after_triggers() {
+        let names = IvmTriggerNames::new(42, 12345);
+        assert_eq!(names.after_ins, "pgt_ivm_after_ins_42");
+        assert_eq!(names.after_upd, "pgt_ivm_after_upd_42");
+        assert_eq!(names.after_del, "pgt_ivm_after_del_42");
+        assert_eq!(names.after_trunc, "pgt_ivm_after_trunc_42");
+    }
+
+    #[test]
+    fn test_trigger_names_functions_include_both_ids() {
+        let names = IvmTriggerNames::new(7, 99999);
+        assert_eq!(names.before_fn, "pgtrickle.pgt_ivm_before_fn_7_99999");
+        assert_eq!(names.after_ins_fn, "pgtrickle.pgt_ivm_after_ins_fn_7_99999");
+        assert_eq!(names.after_upd_fn, "pgtrickle.pgt_ivm_after_upd_fn_7_99999");
+        assert_eq!(names.after_del_fn, "pgtrickle.pgt_ivm_after_del_fn_7_99999");
+        assert_eq!(
+            names.after_trunc_fn,
+            "pgtrickle.pgt_ivm_after_trunc_fn_7_99999"
+        );
+    }
+
+    #[test]
+    fn test_trigger_names_all_triggers_returns_8() {
+        let names = IvmTriggerNames::new(1, 100);
+        let all = names.all_triggers();
+        assert_eq!(all.len(), 8);
+        // Verify no duplicates
+        let set: std::collections::HashSet<&str> = all.iter().copied().collect();
+        assert_eq!(set.len(), 8);
+    }
+
+    #[test]
+    fn test_trigger_names_all_functions_returns_5() {
+        let names = IvmTriggerNames::new(1, 100);
+        let all = names.all_functions();
+        assert_eq!(all.len(), 5);
+        let set: std::collections::HashSet<&str> = all.iter().copied().collect();
+        assert_eq!(set.len(), 5);
+    }
+
+    #[test]
+    fn test_trigger_names_different_pgt_ids_differ() {
+        let a = IvmTriggerNames::new(1, 100);
+        let b = IvmTriggerNames::new(2, 100);
+        assert_ne!(a.before_insert, b.before_insert);
+        assert_ne!(a.after_ins_fn, b.after_ins_fn);
+    }
+
+    #[test]
+    fn test_trigger_names_different_oids_differ() {
+        let a = IvmTriggerNames::new(1, 100);
+        let b = IvmTriggerNames::new(1, 200);
+        // Trigger names only depend on pgt_id, so they match
+        assert_eq!(a.before_insert, b.before_insert);
+        // Function names include both IDs, so they differ
+        assert_ne!(a.before_fn, b.before_fn);
+    }
+
+    #[test]
+    fn test_trigger_names_all_triggers_matches_fields() {
+        let names = IvmTriggerNames::new(5, 777);
+        let all = names.all_triggers();
+        assert!(all.contains(&names.before_insert.as_str()));
+        assert!(all.contains(&names.before_update.as_str()));
+        assert!(all.contains(&names.before_delete.as_str()));
+        assert!(all.contains(&names.before_trunc.as_str()));
+        assert!(all.contains(&names.after_ins.as_str()));
+        assert!(all.contains(&names.after_upd.as_str()));
+        assert!(all.contains(&names.after_del.as_str()));
+        assert!(all.contains(&names.after_trunc.as_str()));
+    }
+
+    #[test]
+    fn test_trigger_names_all_functions_matches_fields() {
+        let names = IvmTriggerNames::new(5, 777);
+        let all = names.all_functions();
+        assert!(all.contains(&names.before_fn.as_str()));
+        assert!(all.contains(&names.after_ins_fn.as_str()));
+        assert!(all.contains(&names.after_upd_fn.as_str()));
+        assert!(all.contains(&names.after_del_fn.as_str()));
+        assert!(all.contains(&names.after_trunc_fn.as_str()));
+    }
 }

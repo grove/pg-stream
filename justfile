@@ -88,6 +88,22 @@ test-e2e: build-e2e-image
 test-e2e-fast:
     cargo test --test 'e2e_*' -- --test-threads=1
 
+# Package the extension for light-E2E tests (cargo pgrx package)
+[group: "test"]
+package-extension:
+    bash ./scripts/run_light_e2e_tests.sh --package-only
+
+# Run light-E2E tests (stock postgres container, no custom Docker image)
+# Only works on Linux — macOS produces .dylib that can't run in a Linux container.
+[group: "test"]
+test-light-e2e:
+    bash ./scripts/run_light_e2e_tests.sh --package
+
+# Run light-E2E tests, skip extension packaging
+[group: "test"]
+test-light-e2e-fast:
+    bash ./scripts/run_light_e2e_tests.sh
+
 # Run tests via pgrx against a pgrx-managed postgres
 [group: "test"]
 test-pgrx:

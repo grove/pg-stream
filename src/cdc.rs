@@ -333,6 +333,21 @@ pub fn build_changed_cols_bitmask_expr(
     Some(parts.join(" |\n        "))
 }
 
+/// Build typed column definitions for a change buffer table.
+///
+/// Produces SQL fragments like `,\"new_col\" TYPE,\"old_col\" TYPE` for each
+/// column in the input.
+fn build_typed_col_defs(columns: &[(String, String)]) -> String {
+    columns
+        .iter()
+        .map(|(name, type_name)| {
+            let qname = name.replace('"', "\"\"");
+            format!(",\"new_{qname}\" {type_name},\"old_{qname}\" {type_name}")
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 pub fn create_change_buffer_table(
     source_oid: pg_sys::Oid,
     change_schema: &str,
@@ -344,14 +359,7 @@ pub fn create_change_buffer_table(
     let pk_col = ",pk_hash BIGINT,changed_cols BIGINT";
 
     // Build typed column definitions: "new_col" TYPE, "old_col" TYPE
-    let typed_col_defs: String = columns
-        .iter()
-        .map(|(name, type_name)| {
-            let qname = name.replace('"', "\"\"");
-            format!(",\"new_{qname}\" {type_name},\"old_{qname}\" {type_name}")
-        })
-        .collect::<Vec<_>>()
-        .join("");
+    let typed_col_defs = build_typed_col_defs(columns);
 
     // Task 3.3: Determine whether to use partitioned buffer tables.
     let partitioning_mode = crate::config::pg_trickle_buffer_partitioning();
@@ -1608,5 +1616,147 @@ mod tests {
         // The embedded quote should be doubled
         assert!(new_expr.contains(r#"col""name"#), "Got: {new_expr}");
         assert!(old_expr.contains(r#"col""name"#), "Got: {old_expr}");
+    }
+
+    // ── build_changed_cols_bitmask_expr tests ────────────────────────
+
+    #[test]
+    fn test_bitmask_none_when_empty_pk() {
+        let cols = vec![("a".to_string(), "int".to_string())];
+        assert!(build_changed_cols_bitmask_expr(&[], &cols).is_none());
+    }
+
+    #[test]
+    fn test_bitmask_none_when_over_63_cols() {
+        let pk = vec!["id".to_string()];
+        let cols: Vec<_> = (0..64)
+            .map(|i| (format!("c{i}"), "int".to_string()))
+            .collect();
+        assert!(build_changed_cols_bitmask_expr(&pk, &cols).is_none());
+    }
+
+    #[test]
+    fn test_bitmask_63_cols_is_ok() {
+        let pk = vec!["id".to_string()];
+        let cols: Vec<_> = (0..63)
+            .map(|i| (format!("c{i}"), "int".to_string()))
+            .collect();
+        assert!(build_changed_cols_bitmask_expr(&pk, &cols).is_some());
+    }
+
+    #[test]
+    fn test_bitmask_single_non_pk_col() {
+        let pk = vec!["id".to_string()];
+        let cols = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("val".to_string(), "text".to_string()),
+        ];
+        let expr = build_changed_cols_bitmask_expr(&pk, &cols).unwrap();
+        // Each column gets a CASE expression with its bit value
+        assert!(
+            expr.contains("IS DISTINCT FROM"),
+            "should use IS DISTINCT FROM: {expr}"
+        );
+        assert!(expr.contains("NEW."), "should reference NEW: {expr}");
+        assert!(expr.contains("OLD."), "should reference OLD: {expr}");
+    }
+
+    #[test]
+    fn test_bitmask_bit_values_are_powers_of_two() {
+        let pk = vec!["id".to_string()];
+        let cols = vec![
+            ("a".to_string(), "int".to_string()),
+            ("b".to_string(), "int".to_string()),
+            ("c".to_string(), "int".to_string()),
+        ];
+        let expr = build_changed_cols_bitmask_expr(&pk, &cols).unwrap();
+        // Bit 0 = 1, bit 1 = 2, bit 2 = 4
+        assert!(expr.contains("1::BIGINT"), "should have bit 0 = 1: {expr}");
+        assert!(expr.contains("2::BIGINT"), "should have bit 1 = 2: {expr}");
+        assert!(expr.contains("4::BIGINT"), "should have bit 2 = 4: {expr}");
+    }
+
+    #[test]
+    fn test_bitmask_quotes_column_names() {
+        let pk = vec!["id".to_string()];
+        let cols = vec![
+            ("id".to_string(), "int".to_string()),
+            (r#"has"quote"#.to_string(), "text".to_string()),
+        ];
+        let expr = build_changed_cols_bitmask_expr(&pk, &cols).unwrap();
+        assert!(
+            expr.contains(r#"has""quote"#),
+            "should double-quote: {expr}"
+        );
+    }
+
+    // ── parse_partition_upper_bound tests ────────────────────────────
+
+    #[test]
+    fn test_parse_valid_range() {
+        assert_eq!(
+            parse_partition_upper_bound("FOR VALUES FROM ('0/0') TO ('1/A3F')"),
+            Some("1/A3F".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_parse_no_match() {
+        assert_eq!(parse_partition_upper_bound("LIST (1, 2, 3)"), None);
+    }
+
+    #[test]
+    fn test_parse_empty_string() {
+        assert_eq!(parse_partition_upper_bound(""), None);
+    }
+
+    #[test]
+    fn test_parse_only_from_no_to() {
+        assert_eq!(parse_partition_upper_bound("FOR VALUES FROM ('0/0')"), None,);
+    }
+
+    #[test]
+    fn test_parse_realistic_lsn_bounds() {
+        assert_eq!(
+            parse_partition_upper_bound("FOR VALUES FROM ('0/15B3D20') TO ('0/2A7C640')"),
+            Some("0/2A7C640".to_string()),
+        );
+    }
+
+    // ── build_typed_col_defs tests ──────────────────────────────────
+
+    #[test]
+    fn test_typed_col_defs_basic() {
+        let cols = vec![
+            ("id".to_string(), "integer".to_string()),
+            ("name".to_string(), "text".to_string()),
+        ];
+        let result = build_typed_col_defs(&cols);
+        assert!(result.contains(r#","new_id" integer"#));
+        assert!(result.contains(r#","old_id" integer"#));
+        assert!(result.contains(r#","new_name" text"#));
+        assert!(result.contains(r#","old_name" text"#));
+    }
+
+    #[test]
+    fn test_typed_col_defs_empty() {
+        assert_eq!(build_typed_col_defs(&[]), "");
+    }
+
+    #[test]
+    fn test_typed_col_defs_quotes_special_chars() {
+        let cols = vec![(r#"my"col"#.to_string(), "varchar(100)".to_string())];
+        let result = build_typed_col_defs(&cols);
+        assert!(
+            result.contains(r#""new_my""col""#),
+            "should double-quote: {result}"
+        );
+    }
+
+    #[test]
+    fn test_typed_col_defs_preserves_type() {
+        let cols = vec![("ts".to_string(), "timestamp with time zone".to_string())];
+        let result = build_typed_col_defs(&cols);
+        assert!(result.contains("timestamp with time zone"));
     }
 }

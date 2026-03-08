@@ -125,15 +125,20 @@ See [plans/PLAN.md](plans/PLAN.md) for the full design plan.
 
 ## Testing
 
-Five test tiers, each with its own infrastructure:
+Six test tiers, each with its own infrastructure:
 
 | Tier | Location | Runner | Needs DB? |
 |------|----------|--------|----------|
 | Unit | `src/**` (`#[cfg(test)]`) | `just test-unit` | No |
 | Integration | `tests/*_tests.rs` (not `e2e_*`) | `just test-integration` | Yes (Testcontainers) |
-| E2E | `tests/e2e_*_tests.rs` | `just test-e2e` | Yes (custom Docker image) |
+| Light E2E | `tests/e2e_*_tests.rs` (most) | `just test-light-e2e` | Yes (stock postgres:18.1) |
+| Full E2E | `tests/e2e_*_tests.rs` (10 files) | `just test-e2e` | Yes (custom Docker image) |
 | TPC-H | `tests/e2e_tpch_tests.rs` (`#[ignore]`) | see below | Yes (custom Docker image) |
 | dbt | `dbt-pgtrickle/integration_tests/` | `just test-dbt` | Yes (Docker + dbt) |
+
+Light E2E uses `cargo pgrx package` output bind-mounted into a stock postgres
+container (no custom Docker image build). 42 test files (~570 tests) are
+light-eligible; 10 files (~90 tests) require the full E2E image.
 
 - Shared helpers live in `tests/common/mod.rs`.
 - E2E Docker images are built from `tests/Dockerfile.e2e`.
@@ -149,16 +154,18 @@ Five test tiers, each with its own infrastructure:
 | Unit (Linux) | ✅ | ✅ | ✅ | ✅ |
 | Unit (macOS + Windows) | ❌ | ❌ | ✅ | ✅ |
 | Integration | ✅ | ✅ | ✅ | ✅ |
-| E2E + TPC-H | ❌ | ✅ | ✅ | ✅ |
+| Light E2E | ✅ | ✅ | ✅ | ✅ |
+| Full E2E + TPC-H | ❌ | ✅ | ✅ | ✅ |
 | Upgrade completeness | ✅ | ✅ | ✅ | ✅ |
 | Upgrade E2E | ❌ | ✅ | ✅ | ✅ |
 | Benchmarks | ❌ | ❌ | ✅ | ✅ |
 | dbt integration | ❌ | ❌ | ✅ | ✅ |
 | CNPG smoke test | ❌ | ❌ | ✅ | ✅ |
 
-> **Note:** E2E and TPC-H tests are **skipped on PRs** (the Docker build is
-> ~20 min). They run automatically on push to main and daily. To run the full
-> CI matrix on a PR branch, use manual dispatch (see below).
+> **Note:** Full E2E and TPC-H tests are **skipped on PRs** (the Docker build
+> is ~20 min). Light E2E tests run on every PR using `cargo pgrx package` +
+> stock postgres container. To run the full CI matrix on a PR branch, use
+> manual dispatch (see below).
 
 ### Running All Tests Locally
 

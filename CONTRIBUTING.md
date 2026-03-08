@@ -40,6 +40,7 @@ just lint
 # Run tests
 just test-unit          # fast, no DB
 just test-integration   # Testcontainers
+just test-light-e2e     # PR-equivalent Light E2E tier (stock postgres)
 just test-e2e           # full E2E (builds Docker image)
 ```
 
@@ -103,9 +104,17 @@ The PR template will walk you through the checklist.
 
 ### CI Coverage on PRs
 
-PR CI runs **unit tests (Linux only) and integration tests**. E2E tests,
-TPC-H tests, benchmarks, dbt, and CNPG smoke tests are skipped on PRs to
-keep the feedback loop fast (~15 min).
+PR CI runs a three-tier gate:
+
+- **Unit tests (Linux only)**
+- **Integration tests**
+- **Light E2E** — curated PR-friendly end-to-end coverage split across three
+  shards and executed against stock `postgres:18.1`
+
+Full E2E, TPC-H tests, benchmarks, dbt, CNPG smoke, and the extra macOS /
+Windows unit jobs stay off the PR critical path and run on push-to-main,
+schedule, or manual dispatch. This keeps typical PR feedback closer to the
+single-digit-minute range while preserving broader scheduled coverage.
 
 To trigger the **full CI matrix** on your PR branch (recommended for DVM
 engine, refresh, or CDC changes):
@@ -118,6 +127,11 @@ To run all tests locally before pushing:
 
 ```bash
 just test-all          # unit + integration + e2e
+
+# PR-equivalent fast path:
+just test-unit
+just test-integration
+just test-light-e2e
 
 # TPC-H correctness tests (requires e2e Docker image):
 cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture

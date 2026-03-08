@@ -1,13 +1,14 @@
 //! E2E test harness that boots a PostgreSQL 18.1 container with
 //! the pg_trickle extension pre-installed.
 //!
-//! # Prerequisites
+//! # Harness Selection
 //!
-//! The Docker image must be built before running E2E tests:
-//!
-//! ```bash
-//! ./tests/build_e2e_image.sh
-//! ```
+//! - **Full (default)**: Custom Docker image with `shared_preload_libraries`,
+//!   background worker, and shared memory.  Requires
+//!   `./tests/build_e2e_image.sh`.
+//! - **Light** (`--features light-e2e`): Stock `postgres:18.1` container with
+//!   bind-mounted extension artifacts.  No background worker or scheduler.
+//!   Much faster to build — only needs `cargo pgrx package`.
 //!
 //! # Usage
 //!
@@ -22,21 +23,58 @@
 //! }
 //! ```
 
-use sqlx::PgPool;
+// ── Light-E2E feature gate ─────────────────────────────────────────────
+// When the `light-e2e` feature is active, use the lightweight harness that
+// bind-mounts `cargo pgrx package` output into a stock PostgreSQL container.
+#[cfg(feature = "light-e2e")]
+mod light;
+#[cfg(feature = "light-e2e")]
+pub use light::E2eDb;
+
+// ── Full E2E harness (default) ─────────────────────────────────────────
+#[cfg(not(feature = "light-e2e"))]
+use sqlx::{PgPool, postgres::PgPoolOptions};
+#[cfg(not(feature = "light-e2e"))]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
+#[cfg(not(feature = "light-e2e"))]
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, Mount, WaitFor},
     runners::AsyncRunner,
 };
 
+#[cfg(not(feature = "light-e2e"))]
 const IMAGE_NAME: &str = "pg_trickle_e2e";
+#[cfg(not(feature = "light-e2e"))]
 const IMAGE_TAG: &str = "latest";
+#[cfg(not(feature = "light-e2e"))]
+static SHARED_DB_COUNTER: AtomicUsize = AtomicUsize::new(1);
+#[cfg(not(feature = "light-e2e"))]
+static SHARED_CONTAINER: tokio::sync::OnceCell<SharedContainer> =
+    tokio::sync::OnceCell::const_new();
 
-/// Return the Docker image name to use for E2E containers.
-///
-/// Reads `PGS_E2E_IMAGE` env var. If set, it is expected to be in
-/// `name:tag` form (e.g. `pg_trickle_e2e_cov:latest`).
-/// Falls back to `IMAGE_NAME:IMAGE_TAG`.
+#[cfg(not(feature = "light-e2e"))]
+struct SharedContainer {
+    admin_connection_string: String,
+    port: u16,
+    container_id: String,
+    _container: Mutex<ContainerAsync<GenericImage>>,
+}
+
+#[cfg(not(feature = "light-e2e"))]
+enum ContainerLease {
+    Shared {
+        _shared: &'static SharedContainer,
+    },
+    Dedicated {
+        _container: Box<ContainerAsync<GenericImage>>,
+    },
+}
+
+#[cfg(not(feature = "light-e2e"))]
 fn e2e_image() -> (String, String) {
     match std::env::var("PGS_E2E_IMAGE") {
         Ok(val) if !val.is_empty() => {
@@ -51,8 +89,7 @@ fn e2e_image() -> (String, String) {
     }
 }
 
-/// If `PGS_E2E_COVERAGE_DIR` is set, return a bind mount that maps
-/// that host directory to `/coverage` inside the container.
+#[cfg(not(feature = "light-e2e"))]
 fn coverage_mount() -> Option<Mount> {
     match std::env::var("PGS_E2E_COVERAGE_DIR") {
         Ok(dir) if !dir.is_empty() => Some(Mount::bind_mount(dir, "/coverage")),
@@ -60,6 +97,7 @@ fn coverage_mount() -> Option<Mount> {
     }
 }
 
+#[cfg(not(feature = "light-e2e"))]
 /// Verify an image exists locally before attempting to start a container.
 ///
 /// testcontainers falls back to a Docker Hub pull when the image is not
@@ -84,17 +122,113 @@ async fn assert_docker_image_exists(name: &str, tag: &str) {
     }
 }
 
+#[cfg(not(feature = "light-e2e"))]
+fn shared_db_name(prefix: &str) -> String {
+    let sequence = SHARED_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}_{}_{}", std::process::id(), sequence)
+}
+
+#[cfg(not(feature = "light-e2e"))]
+fn connection_string(port: u16, db_name: &str) -> String {
+    format!("postgres://postgres:postgres@127.0.0.1:{port}/{db_name}")
+}
+
+#[cfg(not(feature = "light-e2e"))]
+async fn create_database(admin_connection_string: &str, db_name: &str) {
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_connection_string)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect for CREATE DATABASE {db_name}: {e}"));
+
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+        .execute(&admin_pool)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to CREATE DATABASE {db_name}: {e}"));
+
+    admin_pool.close().await;
+}
+
+#[cfg(not(feature = "light-e2e"))]
+async fn reset_postgres_database(admin_connection_string: &str) {
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(admin_connection_string)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to connect for postgres reset: {e}"));
+
+    for sql in [
+        "DROP EXTENSION IF EXISTS pg_trickle CASCADE",
+        "DROP SCHEMA IF EXISTS public CASCADE",
+        "CREATE SCHEMA public",
+        "GRANT ALL ON SCHEMA public TO postgres",
+        "GRANT ALL ON SCHEMA public TO public",
+    ] {
+        sqlx::query(sql)
+            .execute(&admin_pool)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("Failed to reset shared postgres database with `{sql}`: {e}")
+            });
+    }
+
+    admin_pool.close().await;
+}
+
+#[cfg(not(feature = "light-e2e"))]
+async fn shared_container() -> &'static SharedContainer {
+    SHARED_CONTAINER
+        .get_or_init(|| async {
+            let (img_name, img_tag) = e2e_image();
+            assert_docker_image_exists(&img_name, &img_tag).await;
+
+            let mut image = GenericImage::new(img_name, img_tag)
+                .with_exposed_port(5432_u16.tcp())
+                .with_wait_for(WaitFor::message_on_stderr(
+                    "database system is ready to accept connections",
+                ))
+                .with_env_var("POSTGRES_PASSWORD", "postgres")
+                .with_env_var("POSTGRES_DB", "postgres");
+
+            if let Some(mount) = coverage_mount() {
+                image = image.with_mount(mount);
+            }
+
+            let container = image.start().await.expect(
+                "Failed to start shared pg_trickle E2E container. \
+                 Did you run ./tests/build_e2e_image.sh first?",
+            );
+
+            let port = container
+                .get_host_port_ipv4(5432)
+                .await
+                .expect("Failed to get mapped port");
+            let admin_connection_string = connection_string(port, "postgres");
+
+            SharedContainer {
+                admin_connection_string,
+                port,
+                container_id: container.id().to_string(),
+                _container: Mutex::new(container),
+            }
+        })
+        .await
+}
+
 /// A test database backed by a PostgreSQL 18.1 container with
 /// the compiled pg_trickle extension installed and
 /// `shared_preload_libraries` configured.
 ///
 /// The container is automatically cleaned up when `E2eDb` is dropped.
+#[cfg(not(feature = "light-e2e"))]
 pub struct E2eDb {
     pub pool: PgPool,
     connection_string: String,
-    _container: ContainerAsync<GenericImage>,
+    container_id: String,
+    _container: ContainerLease,
 }
 
+#[cfg(not(feature = "light-e2e"))]
 #[allow(dead_code)]
 impl E2eDb {
     /// Start a fresh PostgreSQL 18.1 container with the extension installed.
@@ -102,7 +236,18 @@ impl E2eDb {
     /// The container is ready to accept connections but the extension is NOT
     /// yet created. Call [`with_extension`] to run `CREATE EXTENSION`.
     pub async fn new() -> Self {
-        Self::new_with_db("pg_trickle_test").await
+        let shared = shared_container().await;
+        let db_name = shared_db_name("pgt_e2e");
+        create_database(&shared.admin_connection_string, &db_name).await;
+        let pool = Self::connect_with_retry(&connection_string(shared.port, &db_name), 15).await;
+        let connection_string = connection_string(shared.port, &db_name);
+
+        E2eDb {
+            pool,
+            connection_string,
+            container_id: shared.container_id.clone(),
+            _container: ContainerLease::Shared { _shared: shared },
+        }
     }
 
     /// Start a container and connect to the `postgres` database.
@@ -112,7 +257,16 @@ impl E2eDb {
     /// so the extension + STs must live in the `postgres` database for the
     /// scheduler to see them.
     pub async fn new_on_postgres_db() -> Self {
-        Self::new_with_db("postgres").await
+        let shared = shared_container().await;
+        reset_postgres_database(&shared.admin_connection_string).await;
+        let pool = Self::connect_with_retry(&shared.admin_connection_string, 15).await;
+
+        E2eDb {
+            pool,
+            connection_string: shared.admin_connection_string.clone(),
+            container_id: shared.container_id.clone(),
+            _container: ContainerLease::Shared { _shared: shared },
+        }
     }
 
     /// Start a container configured for benchmarking with resource
@@ -136,7 +290,7 @@ impl E2eDb {
 
     /// Get the Docker container ID (for `docker logs` and profile capture).
     pub fn container_id(&self) -> &str {
-        self._container.id()
+        &self.container_id
     }
 
     /// Execute SQL on a dedicated connection and collect PostgreSQL notices.
@@ -212,7 +366,10 @@ impl E2eDb {
         E2eDb {
             pool,
             connection_string,
-            _container: container,
+            container_id: container.id().to_string(),
+            _container: ContainerLease::Dedicated {
+                _container: Box::new(container),
+            },
         }
     }
 
@@ -255,7 +412,10 @@ impl E2eDb {
         let db = E2eDb {
             pool,
             connection_string,
-            _container: container,
+            container_id: container.id().to_string(),
+            _container: ContainerLease::Dedicated {
+                _container: Box::new(container),
+            },
         };
 
         // Apply runtime PostgreSQL tuning for stable benchmarks.
@@ -292,9 +452,7 @@ impl E2eDb {
         // Enable INFO logging so [PGS_PROFILE] lines appear in server stderr
         db.execute("ALTER SYSTEM SET log_min_messages = 'info'")
             .await;
-        db.execute("SELECT pg_reload_conf()").await;
-        // Allow settings to propagate
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        db.reload_config_and_wait().await;
 
         db
     }
@@ -359,6 +517,46 @@ impl E2eDb {
     /// Execute a SQL statement, returning Ok/Err instead of panicking.
     pub async fn try_execute(&self, sql: &str) -> Result<(), sqlx::Error> {
         sqlx::query(sql).execute(&self.pool).await.map(|_| ())
+    }
+
+    /// Reload PostgreSQL configuration and wait briefly for SIGHUP settings to apply.
+    pub async fn reload_config_and_wait(&self) {
+        self.execute("SELECT pg_reload_conf()").await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// Read a GUC value via `SHOW`.
+    pub async fn show_setting(&self, setting: &str) -> String {
+        self.query_scalar(&format!("SHOW {setting}")).await
+    }
+
+    /// Wait until `SHOW <setting>` reports the expected value.
+    pub async fn wait_for_setting(&self, setting: &str, expected: &str) {
+        for _ in 0..10 {
+            let current = self.show_setting(setting).await;
+            if current == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        let current = self.show_setting(setting).await;
+        panic!("{setting} did not reload to {expected}; current value is {current}");
+    }
+
+    /// Apply `ALTER SYSTEM SET` and wait for the new value to become visible.
+    pub async fn alter_system_set_and_wait(&self, setting: &str, value_sql: &str, expected: &str) {
+        self.execute(&format!("ALTER SYSTEM SET {setting} = {value_sql}"))
+            .await;
+        self.reload_config_and_wait().await;
+        self.wait_for_setting(setting, expected).await;
+    }
+
+    /// Apply `ALTER SYSTEM RESET` and wait for the default value to become visible.
+    pub async fn alter_system_reset_and_wait(&self, setting: &str, expected: &str) {
+        self.execute(&format!("ALTER SYSTEM RESET {setting}")).await;
+        self.reload_config_and_wait().await;
+        self.wait_for_setting(setting, expected).await;
     }
 
     /// Get a single scalar value from a query.

@@ -120,62 +120,68 @@ fn collect_ddl_commands() -> Result<Vec<DdlCommand>, PgTrickleError> {
     })
 }
 
+/// Classification of a DDL event based on object type and command tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DdlEventKind {
+    AlterTable,
+    CreateTable,
+    ViewChange,
+    CreateTrigger,
+    FunctionChange,
+    TypeChange,
+    DomainChange,
+    PolicyChange,
+    Ignored,
+}
+
+/// Classify a DDL event purely from its object type and command tag strings.
+fn classify_ddl_event(object_type: &str, command_tag: &str) -> DdlEventKind {
+    match (object_type, command_tag) {
+        ("table", "ALTER TABLE") => DdlEventKind::AlterTable,
+        ("table", "CREATE TABLE") => DdlEventKind::CreateTable,
+        ("view", "CREATE VIEW") | ("view", "ALTER VIEW") => DdlEventKind::ViewChange,
+        ("trigger", "CREATE TRIGGER") => DdlEventKind::CreateTrigger,
+        ("function", "CREATE FUNCTION") | ("function", "ALTER FUNCTION") => {
+            DdlEventKind::FunctionChange
+        }
+        ("type", "ALTER TYPE") => DdlEventKind::TypeChange,
+        ("domain", "ALTER DOMAIN") | ("domain", "CREATE DOMAIN") => DdlEventKind::DomainChange,
+        ("policy", "CREATE POLICY") | ("policy", "ALTER POLICY") | ("policy", "DROP POLICY") => {
+            DdlEventKind::PolicyChange
+        }
+        _ => DdlEventKind::Ignored,
+    }
+}
+
 /// Process a single DDL command: check for upstream/ST impact and react.
 fn handle_ddl_command(cmd: &DdlCommand) {
-    match (cmd.object_type.as_str(), cmd.command_tag.as_str()) {
-        // ── Table DDL ─────────────────────────────────────────────────
-        ("table", "ALTER TABLE") => {
+    match classify_ddl_event(&cmd.object_type, &cmd.command_tag) {
+        DdlEventKind::AlterTable => {
             let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
             handle_alter_table(cmd.objid, identity);
         }
-        ("table", "CREATE TABLE") => {
+        DdlEventKind::CreateTable => {
             // New tables can't be upstream of any existing ST yet.
         }
-
-        // ── View DDL ──────────────────────────────────────────────────
-        // CREATE OR REPLACE VIEW changes a view definition. If any stream
-        // table inlined this view, the stored defining_query is now stale
-        // and the ST needs reinit.
-        ("view", "CREATE VIEW") | ("view", "ALTER VIEW") => {
+        DdlEventKind::ViewChange => {
             handle_view_change(cmd);
         }
-
-        // ── CREATE TRIGGER on a stream table → warning ────────────────
-        ("trigger", "CREATE TRIGGER") => {
+        DdlEventKind::CreateTrigger => {
             handle_create_trigger(cmd);
         }
-
-        // ── Function DDL ──────────────────────────────────────────────
-        // CREATE OR REPLACE FUNCTION / ALTER FUNCTION / DROP FUNCTION
-        // may change the behaviour of functions referenced in stream
-        // table defining queries. Mark affected STs for reinit.
-        ("function", "CREATE FUNCTION") | ("function", "ALTER FUNCTION") => {
+        DdlEventKind::FunctionChange => {
             handle_function_change(cmd);
         }
-
-        // ── Type DDL (G3.1) ───────────────────────────────────────────
-        // ALTER TYPE can rename enum values, add enum values, or modify
-        // composite types. If a source column uses the affected type,
-        // the stream table's defining query may produce different results.
-        ("type", "ALTER TYPE") => {
+        DdlEventKind::TypeChange => {
             handle_type_change(cmd);
         }
-
-        // ── Domain DDL (G3.2) ─────────────────────────────────────────
-        // ALTER DOMAIN can add/drop constraints. A new constraint may
-        // cause the next refresh to fail if delta rows violate it.
-        ("domain", "ALTER DOMAIN") | ("domain", "CREATE DOMAIN") => {
+        DdlEventKind::DomainChange => {
             handle_domain_change(cmd);
         }
-
-        // ── Row-Level Security (G3.3) ─────────────────────────────────
-        // CREATE/ALTER/DROP POLICY and ENABLE/DISABLE RLS on source tables
-        // can silently change the result set of the defining query.
-        ("policy", "CREATE POLICY") | ("policy", "ALTER POLICY") | ("policy", "DROP POLICY") => {
+        DdlEventKind::PolicyChange => {
             handle_policy_change(cmd);
         }
-
-        _ => {}
+        DdlEventKind::Ignored => {}
     }
 }
 
@@ -1448,6 +1454,16 @@ fn detect_from_snapshot(
         Ok(map)
     })?;
 
+    compare_snapshot_with_current(stored_entries, &current_cols)
+}
+
+/// Pure comparison of stored column snapshot against current column state.
+///
+/// Detects: columns dropped, columns added, type OID changed.
+fn compare_snapshot_with_current(
+    stored_entries: &[serde_json::Value],
+    current_cols: &std::collections::HashMap<String, i64>,
+) -> Result<SchemaChangeKind, PgTrickleError> {
     // Check each stored column still exists with the same type.
     for entry in stored_entries {
         let name = entry["name"].as_str().unwrap_or("");
@@ -1577,6 +1593,185 @@ mod tests {
         assert_eq!(
             extract_function_name("public.MyMixedCase(INT)"),
             "mymixedcase"
+        );
+    }
+
+    // ── classify_ddl_event tests ────────────────────────────────────
+
+    #[test]
+    fn test_classify_alter_table() {
+        assert_eq!(
+            classify_ddl_event("table", "ALTER TABLE"),
+            DdlEventKind::AlterTable,
+        );
+    }
+
+    #[test]
+    fn test_classify_create_table() {
+        assert_eq!(
+            classify_ddl_event("table", "CREATE TABLE"),
+            DdlEventKind::CreateTable,
+        );
+    }
+
+    #[test]
+    fn test_classify_create_view() {
+        assert_eq!(
+            classify_ddl_event("view", "CREATE VIEW"),
+            DdlEventKind::ViewChange,
+        );
+    }
+
+    #[test]
+    fn test_classify_alter_view() {
+        assert_eq!(
+            classify_ddl_event("view", "ALTER VIEW"),
+            DdlEventKind::ViewChange,
+        );
+    }
+
+    #[test]
+    fn test_classify_create_trigger() {
+        assert_eq!(
+            classify_ddl_event("trigger", "CREATE TRIGGER"),
+            DdlEventKind::CreateTrigger,
+        );
+    }
+
+    #[test]
+    fn test_classify_function_change() {
+        assert_eq!(
+            classify_ddl_event("function", "CREATE FUNCTION"),
+            DdlEventKind::FunctionChange,
+        );
+        assert_eq!(
+            classify_ddl_event("function", "ALTER FUNCTION"),
+            DdlEventKind::FunctionChange,
+        );
+    }
+
+    #[test]
+    fn test_classify_type_change() {
+        assert_eq!(
+            classify_ddl_event("type", "ALTER TYPE"),
+            DdlEventKind::TypeChange,
+        );
+    }
+
+    #[test]
+    fn test_classify_domain_change() {
+        assert_eq!(
+            classify_ddl_event("domain", "ALTER DOMAIN"),
+            DdlEventKind::DomainChange,
+        );
+        assert_eq!(
+            classify_ddl_event("domain", "CREATE DOMAIN"),
+            DdlEventKind::DomainChange,
+        );
+    }
+
+    #[test]
+    fn test_classify_policy_change() {
+        assert_eq!(
+            classify_ddl_event("policy", "CREATE POLICY"),
+            DdlEventKind::PolicyChange,
+        );
+        assert_eq!(
+            classify_ddl_event("policy", "ALTER POLICY"),
+            DdlEventKind::PolicyChange,
+        );
+        assert_eq!(
+            classify_ddl_event("policy", "DROP POLICY"),
+            DdlEventKind::PolicyChange,
+        );
+    }
+
+    #[test]
+    fn test_classify_unknown_is_ignored() {
+        assert_eq!(
+            classify_ddl_event("index", "CREATE INDEX"),
+            DdlEventKind::Ignored,
+        );
+        assert_eq!(
+            classify_ddl_event("table", "DROP TABLE"),
+            DdlEventKind::Ignored,
+        );
+    }
+
+    // ── compare_snapshot_with_current tests ─────────────────────────
+
+    #[test]
+    fn test_snapshot_identical_is_constraint_change() {
+        let stored = vec![
+            serde_json::json!({"name": "id", "type_oid": 23}),
+            serde_json::json!({"name": "val", "type_oid": 25}),
+        ];
+        let mut current = std::collections::HashMap::new();
+        current.insert("id".to_string(), 23i64);
+        current.insert("val".to_string(), 25i64);
+
+        assert_eq!(
+            compare_snapshot_with_current(&stored, &current).unwrap(),
+            SchemaChangeKind::ConstraintChange,
+        );
+    }
+
+    #[test]
+    fn test_snapshot_column_dropped() {
+        let stored = vec![
+            serde_json::json!({"name": "id", "type_oid": 23}),
+            serde_json::json!({"name": "old_col", "type_oid": 25}),
+        ];
+        let mut current = std::collections::HashMap::new();
+        current.insert("id".to_string(), 23i64);
+        // old_col is missing
+
+        assert_eq!(
+            compare_snapshot_with_current(&stored, &current).unwrap(),
+            SchemaChangeKind::ColumnChange,
+        );
+    }
+
+    #[test]
+    fn test_snapshot_column_type_changed() {
+        let stored = vec![
+            serde_json::json!({"name": "id", "type_oid": 23}),
+            serde_json::json!({"name": "val", "type_oid": 25}), // was text
+        ];
+        let mut current = std::collections::HashMap::new();
+        current.insert("id".to_string(), 23i64);
+        current.insert("val".to_string(), 1043i64); // now varchar
+
+        assert_eq!(
+            compare_snapshot_with_current(&stored, &current).unwrap(),
+            SchemaChangeKind::ColumnChange,
+        );
+    }
+
+    #[test]
+    fn test_snapshot_column_added() {
+        let stored = vec![serde_json::json!({"name": "id", "type_oid": 23})];
+        let mut current = std::collections::HashMap::new();
+        current.insert("id".to_string(), 23i64);
+        current.insert("new_col".to_string(), 25i64);
+
+        assert_eq!(
+            compare_snapshot_with_current(&stored, &current).unwrap(),
+            SchemaChangeKind::AddColumnOnly,
+        );
+    }
+
+    #[test]
+    fn test_snapshot_empty_stored_with_current_cols() {
+        let stored: Vec<serde_json::Value> = vec![];
+        let mut current = std::collections::HashMap::new();
+        current.insert("id".to_string(), 23i64);
+
+        // No stored entries → nothing to compare → no column dropped/changed
+        // But current has cols that stored doesn't know about
+        assert_eq!(
+            compare_snapshot_with_current(&stored, &current).unwrap(),
+            SchemaChangeKind::AddColumnOnly,
         );
     }
 }
