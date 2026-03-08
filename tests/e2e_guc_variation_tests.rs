@@ -125,6 +125,9 @@ async fn test_guc_block_source_ddl_on() {
 
     // Data DML should still work
     mutate_and_verify(&db).await;
+
+    db.alter_system_reset_and_wait("pg_trickle.block_source_ddl", "off")
+        .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -254,16 +257,17 @@ async fn test_guc_foreign_table_polling_off_rejects_differential() {
     // With polling disabled (default), foreign tables should be rejected
     // in DIFFERENTIAL mode.
     let db = E2eDb::new().await.with_extension().await;
+    let db_name: String = db.query_scalar("SELECT current_database()").await;
 
     // Set up a loopback foreign server via postgres_fdw.
     db.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw")
         .await;
     db.execute("CREATE TABLE ft_local_src (id SERIAL PRIMARY KEY, val INT)")
         .await;
-    db.execute(
+    db.execute(&format!(
         "CREATE SERVER loopback FOREIGN DATA WRAPPER postgres_fdw \
-         OPTIONS (dbname 'pg_trickle_test', host '127.0.0.1', port '5432')",
-    )
+         OPTIONS (dbname '{db_name}', host '127.0.0.1', port '5432')"
+    ))
     .await;
     db.execute(
         "CREATE USER MAPPING FOR CURRENT_USER SERVER loopback \
@@ -298,6 +302,7 @@ async fn test_guc_foreign_table_polling_off_rejects_differential() {
 async fn test_guc_foreign_table_polling_full_mode_no_guc_needed() {
     // In FULL mode, foreign tables should always be accepted (no polling needed).
     let db = E2eDb::new().await.with_extension().await;
+    let db_name: String = db.query_scalar("SELECT current_database()").await;
 
     db.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw")
         .await;
@@ -305,10 +310,10 @@ async fn test_guc_foreign_table_polling_full_mode_no_guc_needed() {
         .await;
     db.execute("INSERT INTO ft_full_src (val) VALUES (10), (20), (30)")
         .await;
-    db.execute(
+    db.execute(&format!(
         "CREATE SERVER loopback_full FOREIGN DATA WRAPPER postgres_fdw \
-         OPTIONS (dbname 'pg_trickle_test', host '127.0.0.1', port '5432')",
-    )
+         OPTIONS (dbname '{db_name}', host '127.0.0.1', port '5432')"
+    ))
     .await;
     db.execute(
         "CREATE USER MAPPING FOR CURRENT_USER SERVER loopback_full \
@@ -339,6 +344,7 @@ async fn test_guc_foreign_table_polling_on_allows_differential() {
     // With polling enabled, foreign tables should be accepted in DIFFERENTIAL mode
     // and the snapshot-based CDC should produce correct results.
     let db = E2eDb::new().await.with_extension().await;
+    let db_name: String = db.query_scalar("SELECT current_database()").await;
 
     db.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw")
         .await;
@@ -346,10 +352,10 @@ async fn test_guc_foreign_table_polling_on_allows_differential() {
         .await;
     db.execute("INSERT INTO ft_poll_src (grp, val) VALUES ('a', 10), ('a', 20), ('b', 30)")
         .await;
-    db.execute(
+    db.execute(&format!(
         "CREATE SERVER loopback_poll FOREIGN DATA WRAPPER postgres_fdw \
-         OPTIONS (dbname 'pg_trickle_test', host '127.0.0.1', port '5432')",
-    )
+         OPTIONS (dbname '{db_name}', host '127.0.0.1', port '5432')"
+    ))
     .await;
     db.execute(
         "CREATE USER MAPPING FOR CURRENT_USER SERVER loopback_poll \
