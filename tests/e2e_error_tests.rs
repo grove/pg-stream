@@ -759,6 +759,36 @@ async fn test_immutable_function_allowed_in_differential_mode() {
 }
 
 #[tokio::test]
+async fn test_stable_function_warned_in_differential_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE nd_stable_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO nd_stable_src VALUES (1, 10), (2, 20)")
+        .await;
+
+    let notices = db
+        .try_execute_with_notices(
+            "SELECT pgtrickle.create_stream_table('nd_stable_st', \
+             $$ SELECT id, CURRENT_TIMESTAMP AS created_at, val FROM nd_stable_src $$, \
+             '1m', 'DIFFERENTIAL')",
+        )
+        .await
+        .expect("stable-function create_stream_table call should succeed");
+
+    let saw_warning = notices
+        .iter()
+        .any(|notice| notice.contains("Defining query contains stable functions"));
+    assert!(
+        saw_warning,
+        "Expected stable-function warning notice, got: {notices:?}"
+    );
+
+    let count = db.count("public.nd_stable_st").await;
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
 async fn test_nested_volatile_where_expression_rejected_in_differential_mode() {
     let db = E2eDb::new().await.with_extension().await;
 

@@ -2182,6 +2182,48 @@ fn collect_raw_expr_volatility(_raw_sql: &str, worst: &mut char) -> Result<(), P
     Ok(())
 }
 
+fn sql_value_function_name(op: pg_sys::SQLValueFunctionOp::Type) -> &'static str {
+    match op {
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_DATE => "CURRENT_DATE",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIME => "CURRENT_TIME",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIME_N => "CURRENT_TIME",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIMESTAMP => "CURRENT_TIMESTAMP",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIMESTAMP_N => "CURRENT_TIMESTAMP",
+        pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIME => "LOCALTIME",
+        pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIME_N => "LOCALTIME",
+        pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIMESTAMP => "LOCALTIMESTAMP",
+        pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIMESTAMP_N => "LOCALTIMESTAMP",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_ROLE => "CURRENT_ROLE",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_USER => "CURRENT_USER",
+        pg_sys::SQLValueFunctionOp::SVFOP_USER => "USER",
+        pg_sys::SQLValueFunctionOp::SVFOP_SESSION_USER => "SESSION_USER",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_CATALOG => "CURRENT_CATALOG",
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_SCHEMA => "CURRENT_SCHEMA",
+        _ => "CURRENT_TIMESTAMP",
+    }
+}
+
+fn sql_value_function_volatility(op: pg_sys::SQLValueFunctionOp::Type) -> char {
+    match op {
+        pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_DATE
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIME
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIME_N
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIMESTAMP
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIMESTAMP_N
+        | pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIME
+        | pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIME_N
+        | pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIMESTAMP
+        | pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIMESTAMP_N
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_ROLE
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_USER
+        | pg_sys::SQLValueFunctionOp::SVFOP_USER
+        | pg_sys::SQLValueFunctionOp::SVFOP_SESSION_USER
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_CATALOG
+        | pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_SCHEMA => 's',
+        _ => 's',
+    }
+}
+
 /// Recursively walk a pg_sys::Node tree looking for FuncCall nodes and
 /// update `worst` with the volatility of each function found.
 #[cfg(not(test))]
@@ -2208,6 +2250,9 @@ fn walk_node_for_volatility(
         if !fcall.agg_filter.is_null() {
             walk_node_for_volatility(fcall.agg_filter, worst)?;
         }
+    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SQLValueFunction) } {
+        let svf = unsafe { &*(node as *const pg_sys::SQLValueFunction) };
+        *worst = max_volatility(*worst, sql_value_function_volatility(svf.op));
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
         let stmt = unsafe { &*(node as *const pg_sys::SelectStmt) };
         // Walk target list
@@ -10233,24 +10278,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SQLValueFunction) } {
         // CURRENT_TIMESTAMP, CURRENT_USER, etc.
         let svf = unsafe { &*(node as *const pg_sys::SQLValueFunction) };
-        let kw = match svf.op {
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_DATE => "CURRENT_DATE",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIME => "CURRENT_TIME",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIME_N => "CURRENT_TIME",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIMESTAMP => "CURRENT_TIMESTAMP",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_TIMESTAMP_N => "CURRENT_TIMESTAMP",
-            pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIME => "LOCALTIME",
-            pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIME_N => "LOCALTIME",
-            pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIMESTAMP => "LOCALTIMESTAMP",
-            pg_sys::SQLValueFunctionOp::SVFOP_LOCALTIMESTAMP_N => "LOCALTIMESTAMP",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_ROLE => "CURRENT_ROLE",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_USER => "CURRENT_USER",
-            pg_sys::SQLValueFunctionOp::SVFOP_USER => "USER",
-            pg_sys::SQLValueFunctionOp::SVFOP_SESSION_USER => "SESSION_USER",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_CATALOG => "CURRENT_CATALOG",
-            pg_sys::SQLValueFunctionOp::SVFOP_CURRENT_SCHEMA => "CURRENT_SCHEMA",
-            _ => "CURRENT_TIMESTAMP", // safe fallback
-        };
+        let kw = sql_value_function_name(svf.op);
         Ok(Expr::Raw(kw.to_string()))
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BooleanTest) } {
         // x IS [NOT] TRUE/FALSE/UNKNOWN

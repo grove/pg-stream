@@ -11,12 +11,13 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Added
 
-- **Non-deterministic function handling (partial)** — defining queries are now
+- **Non-deterministic function handling** — defining queries are now
   scanned for function and operator volatility before stream table creation.
   VOLATILE functions and custom operators are rejected in `DIFFERENTIAL` and
-  `IMMEDIATE` modes, while STABLE functions continue with a warning. Initial
-  E2E coverage now verifies volatile rejection, immutable-function acceptance,
-  and nested volatile detection inside `WHERE` expressions.
+  `IMMEDIATE` modes, while STABLE functions continue with a warning. E2E
+  coverage verifies volatile rejection, stable-function warnings,
+  immutable-function acceptance, and nested volatile detection inside `WHERE`
+  expressions.
 
 ### Documentation
 

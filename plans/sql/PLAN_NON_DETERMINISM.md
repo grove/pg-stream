@@ -1,6 +1,6 @@
 # PLAN: Non-Deterministic Function Handling
 
-**Status:** In progress
+**Status:** Completed
 
 ## Problem Statement
 
@@ -28,13 +28,15 @@ The DVM engine computes deltas by comparing "what changed in the source" against
 - Volatility lookup, expression scanning, and OpTree walking are implemented in
     `parser.rs`, including `Expr::Raw` re-parsing and custom-operator lookup via
     `pg_operator` → `pg_proc`.
+- SQL value functions such as `CURRENT_TIMESTAMP` are classified directly so
+    STABLE warnings are preserved even when they round-trip through `Expr::Raw`.
 - `create_stream_table()` enforces volatility rules for parsed
     `DIFFERENTIAL` and `IMMEDIATE` queries: VOLATILE expressions are rejected and
     STABLE expressions emit a warning.
 - E2E coverage exists for volatile rejection, immutable acceptance, nested
-    volatile expressions in `WHERE`, and volatile custom operators.
-- Remaining work is centered on better coverage for STABLE warning paths and
-    any follow-on ergonomic refinements.
+    volatile expressions in `WHERE`, volatile custom operators, and STABLE
+    warning emission.
+- The core roadmap scope is complete.
 
 ---
 
@@ -330,15 +332,10 @@ async fn test_gen_random_uuid_rejected_in_differential() {
 Implemented so far:
 
 - `test_volatile_function_rejected_in_differential_mode`
+- `test_stable_function_warned_in_differential_mode`
 - `test_immutable_function_allowed_in_differential_mode`
 - `test_nested_volatile_where_expression_rejected_in_differential_mode`
 - Custom volatile operator coverage in `test_volatile_operator_rejected_in_differential`
-
-Still desirable:
-
-- Direct assertion that STABLE-function warnings are emitted. The current E2E
-    harness does not expose PostgreSQL warnings/notices, so this likely needs
-    harness support before it can be covered cleanly.
 
 ---
 

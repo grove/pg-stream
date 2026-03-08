@@ -91,6 +91,7 @@ async fn assert_docker_image_exists(name: &str, tag: &str) {
 /// The container is automatically cleaned up when `E2eDb` is dropped.
 pub struct E2eDb {
     pub pool: PgPool,
+    connection_string: String,
     _container: ContainerAsync<GenericImage>,
 }
 
@@ -138,6 +139,41 @@ impl E2eDb {
         self._container.id()
     }
 
+    /// Execute SQL on a dedicated connection and collect PostgreSQL notices.
+    pub async fn try_execute_with_notices(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<String>, tokio_postgres::Error> {
+        let (client, mut connection) =
+            tokio_postgres::connect(&self.connection_string, tokio_postgres::NoTls).await?;
+
+        let notices = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let notices_task = notices.clone();
+
+        let connection_task = tokio::spawn(async move {
+            while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+                match message {
+                    Ok(tokio_postgres::AsyncMessage::Notice(notice)) => {
+                        notices_task.lock().await.push(notice.to_string());
+                    }
+                    Ok(_) => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok::<(), tokio_postgres::Error>(())
+        });
+
+        let execute_result = client.batch_execute(sql).await;
+        drop(client);
+
+        connection_task
+            .await
+            .unwrap_or_else(|e| panic!("notice collector task failed: {e}"))?;
+        execute_result?;
+
+        Ok(notices.lock().await.clone())
+    }
+
     /// Internal: start a container using the given database name.
     async fn new_with_db(db_name: &str) -> Self {
         let (img_name, img_tag) = e2e_image();
@@ -175,6 +211,7 @@ impl E2eDb {
 
         E2eDb {
             pool,
+            connection_string,
             _container: container,
         }
     }
@@ -217,6 +254,7 @@ impl E2eDb {
 
         let db = E2eDb {
             pool,
+            connection_string,
             _container: container,
         };
 

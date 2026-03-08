@@ -348,10 +348,8 @@ observe, and removes one silent correctness hazard in DIFFERENTIAL mode.
 
 ### Non-Deterministic Function Handling
 
-Status: In progress. Core volatility lookup and enforcement are implemented,
-the initial E2E coverage is in place, and the user-facing docs have been
-updated. Remaining work is primarily around broader warning-path coverage for
-STABLE functions.
+Status: Done. Volatility lookup, OpTree enforcement, E2E coverage, and
+documentation are complete.
 
 Volatile functions (`random()`, `gen_random_uuid()`, `clock_timestamp()`) break
 delta computation in DIFFERENTIAL mode — values change on each evaluation,
@@ -362,7 +360,7 @@ correctness gap.
 |------|-------------|--------|-----|
 | ND1 | Volatility lookup via `pg_proc.provolatile` + recursive `Expr` scanner | Done | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Part 1 |
 | ND2 | OpTree volatility walker + enforcement policy (reject volatile in DIFFERENTIAL, warn for stable) | Done | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Part 2 |
-| ND3 | E2E tests (volatile rejected, stable warned, immutable allowed, nested volatile in WHERE) | In progress | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §E2E Tests |
+| ND3 | E2E tests (volatile rejected, stable warned, immutable allowed, nested volatile in WHERE) | Done | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §E2E Tests |
 | ND4 | Documentation (`SQL_REFERENCE.md`, `DVM_OPERATORS.md`) | Done | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) §Files |
 
 > **Non-determinism subtotal: ~4–6 hours**
@@ -398,7 +396,7 @@ validations, resource leaks, and observability holes. Phased from quick wins
 > **v0.2.3 total: ~45–66 hours**
 
 **Exit criteria:**
-- [~] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
+- [x] Volatile functions rejected in DIFFERENTIAL mode; stable functions warned
 - [ ] DIFFERENTIAL on unpopulated ST returns error (G6)
 - [ ] IMMEDIATE + explicit `cdc_mode='wal'` rejected with clear error (G2)
 - [ ] WAL slot advanced after FULL refresh; change buffers flushed (G3)
