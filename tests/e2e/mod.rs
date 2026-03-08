@@ -150,12 +150,68 @@ async fn create_database(admin_connection_string: &str, db_name: &str) {
 }
 
 #[cfg(not(feature = "light-e2e"))]
+async fn terminate_other_backends(admin_pool: &PgPool) {
+    // Shared-db tests reuse `postgres`, so the previous test's sqlx pool and
+    // the per-database scheduler worker can still hold locks when the next
+    // test starts its reset. Terminate them first to keep cleanup deterministic.
+    sqlx::query(
+        "SELECT pg_terminate_backend(pid) \
+         FROM pg_stat_activity \
+         WHERE datname = current_database() \
+                     AND pid <> pg_backend_pid() \
+                     AND (backend_type = 'client backend' \
+                                OR application_name = 'pg_trickle scheduler')",
+    )
+    .execute(admin_pool)
+    .await
+    .unwrap_or_else(|e| panic!("Failed to terminate shared postgres backends: {e}"));
+
+    for _ in 0..20 {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+             FROM pg_stat_activity \
+             WHERE datname = current_database() \
+                             AND pid <> pg_backend_pid() \
+                             AND (backend_type = 'client backend' \
+                                        OR application_name = 'pg_trickle scheduler')",
+        )
+        .fetch_one(admin_pool)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to count shared postgres backends: {e}"));
+
+        if remaining == 0 {
+            return;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) \
+         FROM pg_stat_activity \
+         WHERE datname = current_database() \
+                     AND pid <> pg_backend_pid() \
+                     AND (backend_type = 'client backend' \
+                                OR application_name = 'pg_trickle scheduler')",
+    )
+    .fetch_one(admin_pool)
+    .await
+    .unwrap_or_else(|e| panic!("Failed to count shared postgres backends: {e}"));
+
+    panic!(
+        "Timed out waiting for shared postgres backends to exit before reset; {remaining} backend(s) still active"
+    );
+}
+
+#[cfg(not(feature = "light-e2e"))]
 async fn reset_postgres_database(admin_connection_string: &str) {
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(admin_connection_string)
         .await
         .unwrap_or_else(|e| panic!("Failed to connect for postgres reset: {e}"));
+
+    terminate_other_backends(&admin_pool).await;
 
     // Background-worker tests share the `postgres` database and use
     // `ALTER SYSTEM` to speed up the scheduler. Those changes persist in
