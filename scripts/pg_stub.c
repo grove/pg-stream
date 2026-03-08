@@ -22,7 +22,7 @@
  *
  * Regenerate the symbol list with:
  *   nm target/debug/deps/pg_trickle-* | grep ' U _' | awk '{print $NF}' \
- *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|Is|Mem|Message|PG_|parse_|pfree|Portal|Postmaster|raw_|SPI_|Top)'
+ *     | grep -E '^_(Alloc|Cache|Copy|Cur|Current|err|Error|format_type|Free|Get|get_array_type|Is|Mem|Message|PG_|parse_|pfree|Portal|Postmaster|raw_|SPI_|Top)'
  */
 
 #include <stddef.h>
@@ -77,6 +77,7 @@ void  errfinish(const char *filename, int lineno, const char *funcname) {
 
 /* ── Transaction / type helpers ───────────────────────────────────────── */
 uint32_t GetCurrentTransactionIdIfAny(void)     { return 0; }
+uint32_t get_array_type(uint32_t typid)         { (void)typid; return 0; }
 int   IsBinaryCoercible(uint32_t a, uint32_t b) { (void)a; (void)b; return 0; }
 char *format_type_extended(uint32_t oid, int32_t typmod, int flags) {
     (void)oid; (void)typmod; (void)flags;
