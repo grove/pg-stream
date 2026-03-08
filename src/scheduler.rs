@@ -401,6 +401,82 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
 
         let now_ms = current_epoch_ms();
 
+        // WAL transition processing — three phases with separate transactions
+        // to ensure slot creation happens in a pristine transaction (no prior
+        // SPI reads that could assign an XID via hint-bit WAL writes).
+        //
+        // Phase 1: Check eligibility, poll WAL sources, collect pending slots
+        // Phase 2: Create replication slots (NO SPI — pristine transaction)
+        // Phase 3: Finish transitions (publication + catalog update)
+        let mut pending_slots = Vec::new();
+        let mut pending_aborts = Vec::new();
+        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            let change_schema = config::pg_trickle_change_buffer_schema();
+            match wal_decoder::advance_wal_transitions_phase1(&change_schema) {
+                Ok(result) => {
+                    pending_slots = result.pending_slots;
+                    pending_aborts = result.pending_aborts;
+                }
+                Err(e) => log!("pg_trickle: WAL transition phase 1 error: {}", e),
+            }
+            monitor::check_slot_health_and_alert();
+        }));
+
+        // Phase 2: Create each pending slot in its own pristine transaction.
+        // No SPI calls — just the C replication API.
+        let mut created_slots = Vec::new();
+        for pending in pending_slots {
+            let slot_name = pending.slot_name.clone();
+            let mut slot_lsn = None;
+            BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                match wal_decoder::create_replication_slot_pristine(&slot_name) {
+                    Ok(lsn) => {
+                        log!("pg_trickle: created replication slot '{}'", slot_name);
+                        slot_lsn = Some(lsn);
+                    }
+                    Err(e) => {
+                        log!(
+                            "pg_trickle: failed to create replication slot '{}': {}",
+                            slot_name,
+                            e
+                        );
+                    }
+                }
+            }));
+            if let Some(lsn) = slot_lsn {
+                created_slots.push((pending, lsn));
+            }
+        }
+
+        // Phase 3: Finish transitions (publications + catalog updates)
+        if !created_slots.is_empty() {
+            BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                if let Err(e) = wal_decoder::advance_wal_transitions_phase3(&created_slots) {
+                    log!("pg_trickle: WAL transition phase 3 error: {}", e);
+                }
+            }));
+        }
+
+        // Phase 4: Abort WAL transitions that need fallback to triggers.
+        // Each abort runs in its own transaction because Phase 1's SPI may
+        // be broken after a caught panic from a missing slot.
+        for abort in pending_aborts {
+            BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                let change_schema = config::pg_trickle_change_buffer_schema();
+                if let Err(e) = wal_decoder::abort_wal_transition(
+                    abort.source_relid,
+                    abort.pgt_id,
+                    &change_schema,
+                ) {
+                    warning!(
+                        "pg_trickle: WAL abort (fallback to triggers) failed for OID {}: {}",
+                        abort.source_relid.to_u32(),
+                        e
+                    );
+                }
+            }));
+        }
+
         // Run the scheduler tick inside a transaction
         BackgroundWorker::transaction(AssertUnwindSafe(|| {
             // Step A: Check if DAG needs rebuild
@@ -583,19 +659,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 }
             }
 
-            // Step D: Advance WAL transitions (trigger → WAL migration)
-            // Check and progress any CDC mode transitions for source tables.
-            // This polls WAL changes for TRANSITIONING/WAL sources and checks
-            // transition completion or timeout.
-            {
-                let change_schema = config::pg_trickle_change_buffer_schema();
-                if let Err(e) = wal_decoder::advance_wal_transitions(&change_schema) {
-                    log!("pg_trickle: WAL transition advancement error: {}", e);
-                }
-            }
-
-            // Step E: Check replication slot health and emit alerts
-            monitor::check_slot_health_and_alert();
+            // Step D & E: Handled in the pre-refresh transaction above.
 
             // Step F: Prune retry states for STs that no longer exist
             // (avoid accumulating stale state)

@@ -887,14 +887,13 @@ fn check_wal_slot_existence() {
                 dep.source_relid.to_u32(),
             );
 
-            // Fall back to TRIGGER mode
-            if let Err(e) = StDependency::update_cdc_mode(
-                dep.pgt_id,
-                dep.source_relid,
-                CdcMode::Trigger,
-                None,
-                None,
-            ) {
+            // Fall back to TRIGGER mode — abort_wal_transition handles
+            // slot cleanup, publication removal, catalog update, AND
+            // trigger recreation.
+            let change_schema = crate::config::pg_trickle_change_buffer_schema();
+            if let Err(e) =
+                wal_decoder::abort_wal_transition(dep.source_relid, dep.pgt_id, &change_schema)
+            {
                 pgrx::warning!(
                     "pg_trickle: failed to fall back to TRIGGER mode for source OID {}: {}",
                     dep.source_relid.to_u32(),

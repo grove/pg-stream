@@ -124,8 +124,35 @@ pub fn drop_publication(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
 ///
 /// The slot captures WAL from the moment of creation, ensuring no changes
 /// are missed between slot creation and the first poll.
-pub fn create_replication_slot(slot_name: &str) -> Result<String, PgTrickleError> {
-    // Check if slot already exists
+///
+/// # Implementation Note
+///
+/// This uses the low-level C replication API (`ReplicationSlotCreate`,
+/// `CreateInitDecodingContext`, etc.) instead of the SQL function
+/// `pg_create_logical_replication_slot()`.
+///
+/// Both the SQL wrapper and `CreateInitDecodingContext` reject calls from
+/// transactions that have an assigned XID (transaction ID).  With
+/// `wal_level = logical`, even read-only SPI queries can trigger hint-bit
+/// WAL writes that assign an XID.
+///
+/// **CRITICAL**: This function must be called in a transaction that has not
+/// done ANY prior SPI queries or catalog reads.  The prerequisite checks
+/// (wal_level, permissions, replica identity) must be done in a *separate,
+/// earlier* transaction.  `CheckSlotPermissions` and
+/// `CheckLogicalDecodingRequirements` are intentionally skipped here because
+/// they access the catalog (which could assign an XID); instead the caller
+/// must verify prerequisites before calling this function.
+pub fn create_replication_slot_pristine(slot_name: &str) -> Result<String, PgTrickleError> {
+    create_replication_slot_internal(slot_name)
+}
+
+/// Check if a replication slot already exists and return its confirmed_flush_lsn.
+///
+/// Returns `Some(lsn)` if the slot exists, `None` if it doesn't.
+/// This function does SPI reads and must NOT be called in the same
+/// transaction as `create_replication_slot_pristine`.
+pub fn get_existing_slot_lsn(slot_name: &str) -> Result<Option<String>, PgTrickleError> {
     let exists = Spi::get_one_with_args::<bool>(
         "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
         &[slot_name.into()],
@@ -133,32 +160,127 @@ pub fn create_replication_slot(slot_name: &str) -> Result<String, PgTrickleError
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or(false);
 
-    if exists {
-        // Return the existing slot's confirmed_flush_lsn
-        let lsn = Spi::get_one_with_args::<String>(
-            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
-            &[slot_name.into()],
-        )
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-        .unwrap_or_else(|| "0/0".to_string());
-
-        return Ok(lsn);
+    if !exists {
+        return Ok(None);
     }
 
-    // Create the logical replication slot
     let lsn = Spi::get_one_with_args::<String>(
-        "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+        "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
         &[slot_name.into()],
     )
-    .map_err(|e| {
-        PgTrickleError::ReplicationSlotError(format!(
-            "Failed to create replication slot '{}': {}",
-            slot_name, e
-        ))
-    })?
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
     .unwrap_or_else(|| "0/0".to_string());
 
-    Ok(lsn)
+    Ok(Some(lsn))
+}
+
+/// Create a logical replication slot via the PostgreSQL C API.
+///
+/// Replicates the logic of `pg_create_logical_replication_slot()` from
+/// `replicationfuncs.c` but skips the `XactHasPerformedWrites()` guard
+/// AND the catalog-touching permission/requirement checks.  Those checks
+/// must be done by the caller in a prior transaction.
+///
+/// **CRITICAL**: Must run in a pristine transaction with NO prior SPI
+/// calls or catalog access, otherwise `CreateInitDecodingContext` will
+/// fail because the transaction has an assigned XID.
+fn create_replication_slot_internal(slot_name: &str) -> Result<String, PgTrickleError> {
+    use std::ffi::CString;
+
+    let c_slot_name = CString::new(slot_name)
+        .map_err(|e| PgTrickleError::ReplicationSlotError(format!("Invalid slot name: {}", e)))?;
+    let c_plugin = CString::new("test_decoding").unwrap();
+
+    // SAFETY: Calling PostgreSQL C API functions for replication slot management.
+    // These are the same functions called by pg_create_logical_replication_slot(),
+    // minus the XactHasPerformedWrites guard and minus CheckSlotPermissions /
+    // CheckLogicalDecodingRequirements (which do catalog reads that would assign
+    // an XID).  The caller guarantees prerequisites were checked in a prior
+    // transaction.
+    //
+    // Sequence: ReplicationSlotCreate (ephemeral) → CreateInitDecodingContext →
+    // DecodingContextFindStartpoint → persist → release.
+    unsafe {
+        // Create as ephemeral first — if anything fails, PG cleans up automatically.
+        pg_sys::ReplicationSlotCreate(
+            c_slot_name.as_ptr(),
+            true, // db_specific
+            pg_sys::ReplicationSlotPersistency::RS_EPHEMERAL,
+            false, // two_phase
+            false, // failover
+            false, // synced
+        );
+
+        // Set up the XLogReaderRoutine with the standard local WAL readers.
+        // We use thin wrappers because Rust edition 2024 does not implicitly
+        // coerce function items across ABI boundaries.
+        unsafe extern "C-unwind" fn page_read_wrapper(
+            state: *mut pg_sys::XLogReaderState,
+            target: pg_sys::XLogRecPtr,
+            req_len: std::ffi::c_int,
+            target_rec: pg_sys::XLogRecPtr,
+            cur_page: *mut std::ffi::c_char,
+        ) -> std::ffi::c_int {
+            // SAFETY: Delegating to the PG-provided read_local_xlog_page with
+            // the same arguments the caller passed.
+            unsafe { pg_sys::read_local_xlog_page(state, target, req_len, target_rec, cur_page) }
+        }
+        unsafe extern "C-unwind" fn segment_open_wrapper(
+            state: *mut pg_sys::XLogReaderState,
+            next_seg_no: pg_sys::XLogSegNo,
+            tli_p: *mut pg_sys::TimeLineID,
+        ) {
+            // SAFETY: Delegating to the PG-provided wal_segment_open.
+            unsafe { pg_sys::wal_segment_open(state, next_seg_no, tli_p) }
+        }
+        unsafe extern "C-unwind" fn segment_close_wrapper(state: *mut pg_sys::XLogReaderState) {
+            // SAFETY: Delegating to the PG-provided wal_segment_close.
+            unsafe { pg_sys::wal_segment_close(state) }
+        }
+        let mut xl_routine = pg_sys::XLogReaderRoutine {
+            page_read: Some(page_read_wrapper),
+            segment_open: Some(segment_open_wrapper),
+            segment_close: Some(segment_close_wrapper),
+        };
+
+        // Create the initial decoding context — this finds the starting LSN
+        let ctx = pg_sys::CreateInitDecodingContext(
+            c_plugin.as_ptr(),
+            std::ptr::null_mut(), // output_plugin_options (NIL)
+            false,                // need_full_snapshot
+            pg_sys::InvalidXLogRecPtr as u64,
+            &mut xl_routine,
+            None, // prepare_write
+            None, // do_write
+            None, // update_progress
+        );
+
+        // Build the initial snapshot and find the start point
+        pg_sys::DecodingContextFindStartpoint(ctx);
+
+        // Read the confirmed_flush LSN before releasing
+        let confirmed_flush = (*pg_sys::MyReplicationSlot).data.confirmed_flush;
+
+        // Clean up the decoding context
+        pg_sys::FreeDecodingContext(ctx);
+
+        // Persist the slot (it was created as ephemeral)
+        pg_sys::ReplicationSlotMarkDirty();
+        pg_sys::ReplicationSlotSave();
+        pg_sys::ReplicationSlotPersist();
+
+        // Release the slot
+        pg_sys::ReplicationSlotRelease();
+
+        // Format LSN as "X/Y"
+        let lsn_str = format!(
+            "{:X}/{:X}",
+            (confirmed_flush >> 32) as u32,
+            confirmed_flush as u32
+        );
+
+        Ok(lsn_str)
+    }
 }
 
 /// Drop a logical replication slot.
@@ -226,42 +348,41 @@ const MAX_CONSECUTIVE_WAL_ERRORS: u32 = 5;
 
 /// Poll WAL changes from a replication slot and write them to the buffer table.
 ///
-/// Uses `pg_logical_slot_get_changes()` with the `pgoutput` plugin to
+/// Uses `pg_logical_slot_get_changes()` with the `test_decoding` plugin to
 /// retrieve decoded WAL changes. Each change is parsed and inserted into
 /// the appropriate `pgtrickle_changes.changes_<oid>` buffer table.
 ///
-/// The `pgoutput` data format provides structured output that we parse
-/// to extract action type, column values, and LSN information.
+/// The `test_decoding` output format provides structured text output that
+/// we parse to extract action type, column values, and LSN information.
+/// Since `test_decoding` decodes ALL tables (not just the source), we
+/// filter by matching the qualified table name in each row.
 ///
-/// **Schema-change detection**: When the pgoutput output contains a
-/// `Relation` keyword (indicating the source table's schema metadata
-/// changed), this function returns `Err(WalTransitionError)` so the
-/// caller can abort the WAL transition and fall back to triggers.
-/// The DDL event trigger in `hooks.rs` handles the reinitialize.
+/// **Schema-change detection**: When the decoded column set doesn't match
+/// our expected columns, this function returns `Err(WalTransitionError)`
+/// so the caller can abort the WAL transition and fall back to triggers.
 ///
 /// Returns the number of changes processed and the last confirmed LSN.
 pub fn poll_wal_changes(
     source_oid: pg_sys::Oid,
     slot_name: &str,
+    source_table_name: &str,
     change_schema: &str,
     pk_columns: &[String],
     columns: &[(String, String)],
 ) -> Result<(i64, Option<String>), PgTrickleError> {
     let oid_u32 = source_oid.to_u32();
-    let pub_name = publication_name_for_source(source_oid);
 
     // Poll changes from the logical replication slot.
-    // pg_logical_slot_get_changes() advances the slot position automatically.
+    // pg_logical_slot_get_changes() advances the slot position
+    // automatically.  We use test_decoding which produces text output
+    // in the format: "table schema.table: ACTION: col[type]:val ..."
     let poll_sql = format!(
         "SELECT lsn::text, xid, data \
          FROM pg_logical_slot_get_changes(\
-             '{slot_name}', NULL, {max_changes}, \
-             'proto_version', '1', \
-             'publication_names', '{pub_name}'\
+             '{slot_name}', NULL, {max_changes}\
          )",
         slot_name = slot_name,
         max_changes = MAX_CHANGES_PER_POLL,
-        pub_name = pub_name,
     );
 
     let mut count: i64 = 0;
@@ -282,7 +403,16 @@ pub fn poll_wal_changes(
                 .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
                 .unwrap_or_default();
 
-            // Parse the pgoutput data and determine if it's relevant to our source
+            // Parse the test_decoding data and determine if it's relevant to our source.
+            // test_decoding decodes ALL tables, so filter by matching the
+            // qualified table name (e.g. "table public.orders: INSERT: ...").
+            let table_prefix = format!("table {}: ", source_table_name);
+            if !data.starts_with(&table_prefix) {
+                // Row is for a different table — skip but still track LSN
+                last_lsn = Some(lsn);
+                continue;
+            }
+
             if let Some(action) = parse_pgoutput_action(&data) {
                 // Schema-change detection: when pgoutput emits a DML message
                 // whose column set doesn't match our expected columns, a DDL
@@ -603,65 +733,6 @@ fn mark_downstream_for_reinit(source_oid: pg_sys::Oid) -> Result<(), PgTrickleEr
 
 // ── Transition Orchestration ───────────────────────────────────────────────
 
-/// Start the transition from trigger-based to WAL-based CDC for a source table.
-///
-/// This is called by the scheduler when it detects that:
-/// - `pg_trickle.cdc_mode` is `'auto'` or `'wal'`
-/// - `wal_level = logical`
-/// - The source has adequate REPLICA IDENTITY
-/// - The source is currently using trigger-based CDC
-///
-/// Steps:
-/// 1. Create a publication for the source table
-/// 2. Record the current WAL LSN (handoff point)
-/// 3. Create a logical replication slot
-/// 4. Update the dependency catalog to TRANSITIONING mode
-pub fn start_wal_transition(
-    source_oid: pg_sys::Oid,
-    pgt_id: i64,
-    _change_schema: &str,
-) -> Result<(), PgTrickleError> {
-    let oid_u32 = source_oid.to_u32();
-    let slot_name = slot_name_for_source(source_oid);
-
-    // Step 1: Create publication for this source table
-    create_publication(source_oid)?;
-
-    // Step 2: Record the current WAL LSN — this is the "handoff point".
-    // The trigger captures everything up to this point.
-    // The WAL decoder starts reading from this point.
-    let handoff_lsn = cdc::get_current_wal_lsn()?;
-
-    // Step 3: Create the replication slot at the current position.
-    // The slot ensures no WAL is recycled before we consume it.
-    let slot_lsn = create_replication_slot(&slot_name)?;
-
-    // Step 4: Update catalog — mark as TRANSITIONING
-    StDependency::update_cdc_mode(
-        pgt_id,
-        source_oid,
-        CdcMode::Transitioning,
-        Some(&slot_name),
-        Some(&slot_lsn),
-    )?;
-
-    info!(
-        "pg_trickle: started WAL transition for source OID {} \
-         (slot: {}, handoff LSN: {}, slot LSN: {})",
-        oid_u32, slot_name, handoff_lsn, slot_lsn
-    );
-
-    // Emit NOTIFY so clients can track the transition
-    monitor::emit_cdc_transition_notify(
-        source_oid,
-        CdcMode::Trigger,
-        CdcMode::Transitioning,
-        Some(&slot_name),
-    );
-
-    Ok(())
-}
-
 /// Check if the WAL transition is complete and finalize if so.
 ///
 /// Called by the scheduler on each tick for sources in TRANSITIONING mode.
@@ -855,19 +926,45 @@ pub fn abort_wal_transition(
 
 // ── Scheduler Integration ──────────────────────────────────────────────────
 
-/// Advance WAL transitions and poll changes for WAL-mode sources.
+/// Pending slot creation request, collected in Phase 1 and executed in Phase 2.
+pub struct PendingSlotCreation {
+    pub source_relid: pg_sys::Oid,
+    pub pgt_id: i64,
+    pub slot_name: String,
+}
+
+/// WAL source that reached the error threshold and needs to be aborted
+/// (reverted to trigger CDC) in a separate transaction.
+pub struct PendingAbort {
+    pub source_relid: pg_sys::Oid,
+    pub pgt_id: i64,
+}
+
+/// Result from Phase 1: pending slot creations and pending aborts.
+pub struct Phase1Result {
+    pub pending_slots: Vec<PendingSlotCreation>,
+    pub pending_aborts: Vec<PendingAbort>,
+}
+
+/// Phase 1: Check eligibility, collect pending slot creations, and handle
+/// already-transitioned/WAL sources.
 ///
-/// Called from the scheduler tick when `pg_trickle.cdc_mode != 'trigger'`.
-/// Processes all dependency edges and handles each CDC mode:
+/// This phase does SPI reads (catalog, pg_replication_slots).
+/// Must run in its own transaction BEFORE Phase 2.
 ///
-/// - **TRIGGER**: Check if transition should start
-/// - **TRANSITIONING**: Poll WAL changes + check completion/timeout
-/// - **WAL**: Poll WAL changes + check decoder health
-pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError> {
+/// Returns pending slot creations (Phase 2) and pending aborts (Phase 4).
+/// WAL poll panics (from missing slots) are caught and counted. Sources
+/// that exceed `MAX_CONSECUTIVE_WAL_ERRORS` are queued for abort in a
+/// separate transaction (because the SPI connection is broken after a
+/// caught panic).
+pub fn advance_wal_transitions_phase1(change_schema: &str) -> Result<Phase1Result, PgTrickleError> {
     // Only process if CDC mode allows WAL
     let cdc_mode = config::pg_trickle_cdc_mode();
     if cdc_mode == "trigger" {
-        return Ok(());
+        return Ok(Phase1Result {
+            pending_slots: vec![],
+            pending_aborts: vec![],
+        });
     }
 
     // Get all dependencies to check their CDC mode
@@ -875,6 +972,8 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError
 
     // Group by source_relid to avoid processing the same source multiple times
     let mut processed_sources = std::collections::HashSet::new();
+    let mut pending_slots = Vec::new();
+    let mut pending_aborts: Vec<PendingAbort> = Vec::new();
 
     for dep in &all_deps {
         // Only process TABLE sources (not STREAM_TABLE or VIEW)
@@ -890,19 +989,58 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError
 
         match dep.cdc_mode {
             CdcMode::Trigger => {
-                // Check if we should start a WAL transition
-                if let Err(e) = try_start_transition(dep, change_schema) {
-                    log!(
-                        "pg_trickle: failed to start WAL transition for source OID {}: {}",
-                        source_key,
-                        e
-                    );
-                }
-                // EC-18: If cdc_mode is "auto" and we're still on triggers,
-                // log WHY we can't transition. Rate-limit to avoid log spam
-                // (every ~60 scheduler ticks ≈ once per minute at default interval).
-                if cdc_mode == "auto" {
-                    emit_auto_cdc_stuck_log(dep);
+                // Check if this source is eligible for WAL transition
+                match check_transition_eligible(dep) {
+                    Ok(true) => {
+                        let slot_name = slot_name_for_source(dep.source_relid);
+                        // Check if slot already exists (SPI read — fine in Phase 1)
+                        match get_existing_slot_lsn(&slot_name)? {
+                            Some(slot_lsn) => {
+                                // Slot already exists — go straight to Phase 3
+                                log!(
+                                    "pg_trickle: slot '{}' already exists, finishing transition",
+                                    slot_name
+                                );
+                                if let Err(e) = finish_wal_transition(
+                                    dep.source_relid,
+                                    dep.pgt_id,
+                                    &slot_name,
+                                    &slot_lsn,
+                                ) {
+                                    log!(
+                                        "pg_trickle: failed to finish WAL transition for OID {}: {}",
+                                        source_key,
+                                        e
+                                    );
+                                }
+                            }
+                            None => {
+                                // Slot needs creation — queue for Phase 2
+                                log!(
+                                    "pg_trickle: source OID {} eligible for WAL transition, queuing slot creation",
+                                    source_key
+                                );
+                                pending_slots.push(PendingSlotCreation {
+                                    source_relid: dep.source_relid,
+                                    pgt_id: dep.pgt_id,
+                                    slot_name,
+                                });
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        // Not eligible — stay on triggers
+                        if cdc_mode == "auto" {
+                            emit_auto_cdc_stuck_log(dep);
+                        }
+                    }
+                    Err(e) => {
+                        log!(
+                            "pg_trickle: failed to check WAL transition eligibility for source OID {}: {}",
+                            source_key,
+                            e
+                        );
+                    }
                 }
             }
             CdcMode::Transitioning => {
@@ -926,8 +1064,19 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError
                 }
             }
             CdcMode::Wal => {
-                // Poll WAL changes (steady-state WAL mode)
-                if let Err(e) = poll_source_changes(dep, change_schema) {
+                // Poll WAL changes (steady-state WAL mode).
+                // Use catch_unwind because a missing/invalid slot causes a
+                // PG ERROR → Rust panic that would bypass the error counter.
+                let poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    poll_source_changes(dep, change_schema)
+                }));
+                let poll_err = match poll_result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(_panic) => Some("PG error during WAL poll (likely missing slot)".into()),
+                };
+
+                if let Some(err_msg) = poll_err {
                     let count = bump_wal_error_count(source_key);
                     if count >= MAX_CONSECUTIVE_WAL_ERRORS {
                         warning!(
@@ -935,25 +1084,23 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError
                              — falling back to triggers. Last error: {}",
                             count,
                             source_key,
-                            e
+                            err_msg
                         );
                         reset_wal_error_count(source_key);
-                        if let Err(fb_err) =
-                            abort_wal_transition(dep.source_relid, dep.pgt_id, change_schema)
-                        {
-                            warning!(
-                                "pg_trickle: fallback to triggers also failed for source OID {}: {}",
-                                source_key,
-                                fb_err
-                            );
-                        }
+                        // Defer abort to Phase 4 (separate transaction) because
+                        // after catch_unwind of a PG ERROR the SPI connection
+                        // is broken in this transaction.
+                        pending_aborts.push(PendingAbort {
+                            source_relid: dep.source_relid,
+                            pgt_id: dep.pgt_id,
+                        });
                     } else {
                         warning!(
                             "pg_trickle: WAL poll error for source OID {} ({}/{} before fallback): {}",
                             source_key,
                             count,
                             MAX_CONSECUTIVE_WAL_ERRORS,
-                            e
+                            err_msg
                         );
                     }
                 } else {
@@ -973,56 +1120,98 @@ pub fn advance_wal_transitions(change_schema: &str) -> Result<(), PgTrickleError
         }
     }
 
+    Ok(Phase1Result {
+        pending_slots,
+        pending_aborts,
+    })
+}
+
+/// Phase 3: Finish WAL transitions for slots that were created in Phase 2.
+///
+/// Creates publications and updates the catalog for each successfully created slot.
+/// This phase does SPI writes and must run in its own transaction AFTER Phase 2.
+pub fn advance_wal_transitions_phase3(
+    created_slots: &[(PendingSlotCreation, String)],
+) -> Result<(), PgTrickleError> {
+    for (pending, slot_lsn) in created_slots {
+        if let Err(e) = finish_wal_transition(
+            pending.source_relid,
+            pending.pgt_id,
+            &pending.slot_name,
+            slot_lsn,
+        ) {
+            log!(
+                "pg_trickle: failed to finish WAL transition for OID {}: {}",
+                pending.source_relid.to_u32(),
+                e
+            );
+        }
+    }
     Ok(())
 }
 
-/// Try to start a WAL transition for a source currently using triggers.
-fn try_start_transition(dep: &StDependency, change_schema: &str) -> Result<(), PgTrickleError> {
-    // Check prerequisites
+/// Check if a source in TRIGGER mode is eligible for WAL transition.
+/// Returns `true` if all prerequisites are met.
+fn check_transition_eligible(dep: &StDependency) -> Result<bool, PgTrickleError> {
     if !cdc::can_use_logical_replication()? {
-        return Ok(()); // WAL not available, stay on triggers
+        return Ok(false);
     }
 
     if !cdc::check_replica_identity(dep.source_relid)? {
-        log!(
-            "pg_trickle: source OID {} has inadequate REPLICA IDENTITY for WAL CDC — staying on triggers",
-            dep.source_relid.to_u32()
-        );
-        return Ok(());
+        return Ok(false);
     }
 
-    // G2.1: Require PRIMARY KEY for WAL mode. Keyless tables use content-based
-    // hashing in trigger mode, which cannot be reproduced from raw WAL bytes.
-    // The pk_hash mismatch between trigger (content hash) and WAL ("0") would
-    // cause duplicate rows during transition.
     let pk_columns = cdc::resolve_pk_columns(dep.source_relid)?;
     if pk_columns.is_empty() {
-        log!(
-            "pg_trickle: source OID {} has no PRIMARY KEY — WAL-based CDC requires a PK. \
-             Staying on trigger-based CDC.",
-            dep.source_relid.to_u32()
-        );
-        return Ok(());
+        return Ok(false);
     }
 
-    // G2.2: Require REPLICA IDENTITY FULL for WAL mode. Without it, UPDATE
-    // events only contain PK columns as old values — non-PK old_* columns
-    // would be NULL, breaking filter boundary detection and JOIN delta
-    // computation.
     let identity = cdc::get_replica_identity_mode(dep.source_relid)?;
     if identity != "full" {
-        log!(
-            "pg_trickle: source OID {} has REPLICA IDENTITY '{}' (need FULL) — \
-             WAL-based CDC requires REPLICA IDENTITY FULL for correct UPDATE old values. \
-             Run: ALTER TABLE ... REPLICA IDENTITY FULL. Staying on triggers.",
-            dep.source_relid.to_u32(),
-            identity
-        );
-        return Ok(());
+        return Ok(false);
     }
 
-    // All prerequisites met — start the transition
-    start_wal_transition(dep.source_relid, dep.pgt_id, change_schema)?;
+    Ok(true)
+}
+
+/// Finish a WAL transition after the replication slot has been created.
+///
+/// Creates the publication and updates the catalog to TRANSITIONING mode.
+/// Called from the scheduler after slot creation succeeds in a separate
+/// transaction.
+pub fn finish_wal_transition(
+    source_oid: pg_sys::Oid,
+    pgt_id: i64,
+    slot_name: &str,
+    slot_lsn: &str,
+) -> Result<(), PgTrickleError> {
+    // Create publication for this source table
+    create_publication(source_oid)?;
+
+    // Update catalog — mark as TRANSITIONING
+    StDependency::update_cdc_mode(
+        pgt_id,
+        source_oid,
+        CdcMode::Transitioning,
+        Some(slot_name),
+        Some(slot_lsn),
+    )?;
+
+    info!(
+        "pg_trickle: started WAL transition for source OID {} \
+         (slot: {}, slot LSN: {})",
+        source_oid.to_u32(),
+        slot_name,
+        slot_lsn
+    );
+
+    // Emit NOTIFY so clients can track the transition
+    monitor::emit_cdc_transition_notify(
+        source_oid,
+        CdcMode::Trigger,
+        CdcMode::Transitioning,
+        Some(slot_name),
+    );
 
     Ok(())
 }
@@ -1117,6 +1306,9 @@ fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), Pg
         None => slot_name_for_source(dep.source_relid),
     };
 
+    // Resolve qualified source table name for filtering test_decoding output
+    let source_table_name = cdc::get_qualified_table_name(dep.source_relid)?;
+
     // Resolve source column definitions for decoding
     let pk_columns = cdc::resolve_pk_columns(dep.source_relid)?;
     let columns = cdc::resolve_source_column_defs(dep.source_relid)?;
@@ -1125,6 +1317,7 @@ fn poll_source_changes(dep: &StDependency, change_schema: &str) -> Result<(), Pg
     let (count, last_lsn) = poll_wal_changes(
         dep.source_relid,
         &slot_name,
+        &source_table_name,
         change_schema,
         &pk_columns,
         &columns,
