@@ -123,6 +123,12 @@ void *pg_detoast_datum_slice(void *datum, int32_t first, int32_t count) {
 }
 void *pg_detoast_datum_packed(void *datum)      { return datum; }
 
+/* ── Type output helpers ──────────────────────────────────────────────── */
+uintptr_t byteaout(void *fcinfo)                { (void)fcinfo; return 0; }
+uintptr_t textout(void *fcinfo)                 { (void)fcinfo; return 0; }
+uintptr_t json_out(void *fcinfo)                { (void)fcinfo; return 0; }
+uintptr_t jsonb_out(void *fcinfo)               { (void)fcinfo; return 0; }
+
 /* ── Parser entry points ─────────────────────────────────────────────── */
 void *raw_parser(const char *str, int mode) {
     (void)str; (void)mode;
