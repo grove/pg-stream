@@ -909,6 +909,12 @@ fn is_group_due(
         })
         .collect();
 
+    is_group_due_pure(&member_due, policy)
+}
+
+/// Pure decision logic: given member-due flags and a policy, decide if the
+/// group is due for refresh.
+fn is_group_due_pure(member_due: &[bool], policy: DiamondSchedulePolicy) -> bool {
     if member_due.is_empty() {
         return false;
     }
@@ -917,6 +923,17 @@ fn is_group_due(
         DiamondSchedulePolicy::Fastest => member_due.iter().any(|&d| d),
         DiamondSchedulePolicy::Slowest => member_due.iter().all(|&d| d),
     }
+}
+
+/// Check if the refresh is falling behind the schedule.
+///
+/// Returns `Some(ratio)` when `elapsed_ms / schedule_ms >= 0.8`.
+fn is_falling_behind(elapsed_ms: i64, schedule_ms: i64) -> Option<f64> {
+    if schedule_ms <= 0 {
+        return None;
+    }
+    let ratio = elapsed_ms as f64 / schedule_ms as f64;
+    if ratio >= 0.8 { Some(ratio) } else { None }
 }
 
 /// Load a stream table by its pgt_id, or return None if not found.
@@ -1483,26 +1500,23 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
             // refresh cannot keep up with the configured schedule.
             if let Some(secs) = schedule_secs {
                 let schedule_ms = (secs * 1000) as i64;
-                if schedule_ms > 0 {
-                    let ratio = elapsed_ms as f64 / schedule_ms as f64;
-                    if ratio >= 0.8 {
-                        monitor::alert_falling_behind(
-                            &st.pgt_schema,
-                            &st.pgt_name,
-                            elapsed_ms,
-                            schedule_ms,
-                            ratio,
-                        );
-                        pgrx::warning!(
-                            "pg_trickle: refresh of {}.{} took {}ms ({:.0}% of {}ms schedule). \
-                             The scheduler may not be able to keep up with the configured interval.",
-                            st.pgt_schema,
-                            st.pgt_name,
-                            elapsed_ms,
-                            ratio * 100.0,
-                            schedule_ms,
-                        );
-                    }
+                if let Some(ratio) = is_falling_behind(elapsed_ms, schedule_ms) {
+                    monitor::alert_falling_behind(
+                        &st.pgt_schema,
+                        &st.pgt_name,
+                        elapsed_ms,
+                        schedule_ms,
+                        ratio,
+                    );
+                    pgrx::warning!(
+                        "pg_trickle: refresh of {}.{} took {}ms ({:.0}% of {}ms schedule). \
+                         The scheduler may not be able to keep up with the configured interval.",
+                        st.pgt_schema,
+                        st.pgt_name,
+                        elapsed_ms,
+                        ratio * 100.0,
+                        schedule_ms,
+                    );
                 }
             }
 
@@ -1670,5 +1684,83 @@ mod tests {
         let outcome = RefreshOutcome::RetryableFailure;
         let cloned = outcome;
         assert_eq!(outcome, cloned);
+    }
+
+    // ── is_group_due_pure tests ─────────────────────────────────────
+
+    #[test]
+    fn test_group_due_empty_is_false() {
+        assert!(!is_group_due_pure(&[], DiamondSchedulePolicy::Fastest));
+        assert!(!is_group_due_pure(&[], DiamondSchedulePolicy::Slowest));
+    }
+
+    #[test]
+    fn test_group_due_fastest_any_true() {
+        assert!(is_group_due_pure(
+            &[false, true, false],
+            DiamondSchedulePolicy::Fastest,
+        ));
+    }
+
+    #[test]
+    fn test_group_due_fastest_all_false() {
+        assert!(!is_group_due_pure(
+            &[false, false],
+            DiamondSchedulePolicy::Fastest,
+        ));
+    }
+
+    #[test]
+    fn test_group_due_slowest_all_true() {
+        assert!(is_group_due_pure(
+            &[true, true, true],
+            DiamondSchedulePolicy::Slowest,
+        ));
+    }
+
+    #[test]
+    fn test_group_due_slowest_not_all_true() {
+        assert!(!is_group_due_pure(
+            &[true, false, true],
+            DiamondSchedulePolicy::Slowest,
+        ));
+    }
+
+    #[test]
+    fn test_group_due_single_member() {
+        assert!(is_group_due_pure(&[true], DiamondSchedulePolicy::Fastest,));
+        assert!(is_group_due_pure(&[true], DiamondSchedulePolicy::Slowest,));
+        assert!(!is_group_due_pure(&[false], DiamondSchedulePolicy::Fastest,));
+    }
+
+    // ── is_falling_behind tests ─────────────────────────────────────
+
+    #[test]
+    fn test_falling_behind_at_80_percent() {
+        let result = is_falling_behind(800, 1000);
+        assert!(result.is_some());
+        assert!((result.unwrap() - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_falling_behind_over_100_percent() {
+        let result = is_falling_behind(1500, 1000);
+        assert!(result.is_some());
+        assert!((result.unwrap() - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_not_falling_behind() {
+        assert!(is_falling_behind(500, 1000).is_none());
+    }
+
+    #[test]
+    fn test_falling_behind_zero_schedule() {
+        assert!(is_falling_behind(100, 0).is_none());
+    }
+
+    #[test]
+    fn test_falling_behind_negative_schedule() {
+        assert!(is_falling_behind(100, -1).is_none());
     }
 }

@@ -69,6 +69,22 @@ impl AlertEvent {
 /// The payload is a JSON object with at minimum an `event` field.
 /// Callers can add arbitrary key-value pairs for context.
 pub fn emit_alert(event: AlertEvent, pgt_schema: &str, pgt_name: &str, extra: &str) {
+    let safe_payload = build_alert_payload(event, pgt_schema, pgt_name, extra);
+
+    // Escape single quotes for SQL
+    let escaped = safe_payload.replace('\'', "''");
+    let sql = format!("NOTIFY pg_trickle_alert, '{}'", escaped);
+
+    if let Err(e) = Spi::run(&sql) {
+        pgrx::warning!("pg_trickle: failed to emit alert {}: {}", event.as_str(), e);
+    }
+}
+
+/// Build a JSON alert payload for a NOTIFY event.
+///
+/// The payload is truncated to 7900 bytes if it exceeds PostgreSQL's
+/// NOTIFY payload limit (~8000 bytes).
+fn build_alert_payload(event: AlertEvent, pgt_schema: &str, pgt_name: &str, extra: &str) -> String {
     let payload = format!(
         r#"{{"event":"{}","pgt_schema":"{}","pgt_name":"{}","st":"{}",{}}}"#,
         event.as_str(),
@@ -79,18 +95,10 @@ pub fn emit_alert(event: AlertEvent, pgt_schema: &str, pgt_name: &str, extra: &s
     );
 
     // NOTIFY payloads are limited to ~8000 bytes; truncate if needed
-    let safe_payload = if payload.len() > 7900 {
+    if payload.len() > 7900 {
         format!("{}...}}", &payload[..7890])
     } else {
         payload
-    };
-
-    // Escape single quotes for SQL
-    let escaped = safe_payload.replace('\'', "''");
-    let sql = format!("NOTIFY pg_trickle_alert, '{}'", escaped);
-
-    if let Err(e) = Spi::run(&sql) {
-        pgrx::warning!("pg_trickle: failed to emit alert {}: {}", event.as_str(), e);
     }
 }
 
@@ -1216,6 +1224,28 @@ fn dependency_tree() -> TableIterator<
     });
 
     // ── 3. Find roots (stream tables that are not the child of any other ST) ─
+    let output = render_dependency_tree(&st_info, &st_children, &st_sources);
+
+    TableIterator::new(output)
+}
+
+/// Context for the dependency tree DFS traversal.
+struct DagCtx<'a> {
+    st_info: &'a std::collections::HashMap<String, (String, String)>,
+    st_children: &'a std::collections::HashMap<String, Vec<String>>,
+    st_sources: &'a std::collections::HashMap<String, Vec<String>>,
+}
+
+/// Render a dependency tree from pre-loaded ST metadata.
+///
+/// Pure function: takes three `HashMap`s describing the graph topology
+/// and returns formatted tree rows with box-drawing prefixes.
+#[allow(clippy::type_complexity)]
+fn render_dependency_tree(
+    st_info: &std::collections::HashMap<String, (String, String)>,
+    st_children: &std::collections::HashMap<String, Vec<String>>,
+    st_sources: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<(String, String, String, i32, Option<String>, Option<String>)> {
     let all_children: std::collections::HashSet<String> = st_children
         .values()
         .flat_map(|v| v.iter().cloned())
@@ -1228,96 +1258,13 @@ fn dependency_tree() -> TableIterator<
         .collect();
     roots.sort();
 
-    // ── 4. DFS to emit rows with proper tree-drawing prefixes ──────────────
-    // `prefix_stack` carries, per depth level, whether there are more siblings
-    // at that level still to be printed (so we know where to draw │).
+    // DFS to emit rows with proper tree-drawing prefixes.
     let mut output: Vec<(String, String, String, i32, Option<String>, Option<String>)> = Vec::new();
 
-    struct DagCtx<'a> {
-        st_info: &'a std::collections::HashMap<String, (String, String)>,
-        st_children: &'a std::collections::HashMap<String, Vec<String>>,
-        st_sources: &'a std::collections::HashMap<String, Vec<String>>,
-    }
-
-    fn dfs(
-        node: &str,
-        depth: i32,
-        connector: &str,    // "├── " | "└── " | ""
-        continuation: &str, // prefix inherited from parent
-        ctx: &DagCtx<'_>,
-        output: &mut Vec<(String, String, String, i32, Option<String>, Option<String>)>,
-    ) {
-        let tree_line = format!("{}{}{}", continuation, connector, node);
-
-        let (status, mode, node_type) = if let Some((s, m)) = ctx.st_info.get(node) {
-            (Some(s.clone()), Some(m.clone()), "stream_table".to_string())
-        } else {
-            (None, None, "source_table".to_string())
-        };
-
-        output.push((tree_line, node.to_string(), node_type, depth, status, mode));
-
-        // Children of this node: ST dependents + plain source tables
-        let mut st_kids = ctx.st_children.get(node).cloned().unwrap_or_default();
-        st_kids.sort();
-
-        let mut src_kids = ctx.st_sources.get(node).cloned().unwrap_or_default();
-        src_kids.sort();
-
-        // Plain source nodes come after ST children so the ST sub-tree
-        // is rendered contiguously.
-        let all_kids: Vec<(String, bool)> = st_kids
-            .iter()
-            .map(|n| (n.clone(), true))
-            .chain(src_kids.iter().map(|n| (n.clone(), false)))
-            .collect();
-
-        let child_continuation = format!(
-            "{}{}",
-            continuation,
-            if connector == "└── " || connector.is_empty() {
-                "    "
-            } else {
-                "│   "
-            }
-        );
-
-        let total = all_kids.len();
-        for (i, (child, is_st_child)) in all_kids.iter().enumerate() {
-            let is_last = i == total - 1;
-            let child_connector = if is_last { "└── " } else { "├── " };
-
-            if *is_st_child {
-                dfs(
-                    child,
-                    depth + 1,
-                    child_connector,
-                    &child_continuation,
-                    ctx,
-                    output,
-                );
-            } else {
-                // Leaf source node — emit directly without recursing into
-                // its own dependencies (those are tracked by its own ST entry
-                // if it is also a stream table).
-                let src_label = format!("{} [src]", child);
-                let src_line = format!("{}{}{}", child_continuation, child_connector, src_label);
-                output.push((
-                    src_line,
-                    child.clone(),
-                    "source_table".to_string(),
-                    depth + 1,
-                    None,
-                    None,
-                ));
-            }
-        }
-    }
-
     let ctx = DagCtx {
-        st_info: &st_info,
-        st_children: &st_children,
-        st_sources: &st_sources,
+        st_info,
+        st_children,
+        st_sources,
     };
 
     for (i, root) in roots.iter().enumerate() {
@@ -1332,7 +1279,83 @@ fn dependency_tree() -> TableIterator<
         dfs(root, 0, root_connector, "", &ctx, &mut output);
     }
 
-    TableIterator::new(output)
+    output
+}
+
+#[allow(clippy::type_complexity)]
+fn dfs(
+    node: &str,
+    depth: i32,
+    connector: &str,    // "├── " | "└── " | ""
+    continuation: &str, // prefix inherited from parent
+    ctx: &DagCtx<'_>,
+    output: &mut Vec<(String, String, String, i32, Option<String>, Option<String>)>,
+) {
+    let tree_line = format!("{}{}{}", continuation, connector, node);
+
+    let (status, mode, node_type) = if let Some((s, m)) = ctx.st_info.get(node) {
+        (Some(s.clone()), Some(m.clone()), "stream_table".to_string())
+    } else {
+        (None, None, "source_table".to_string())
+    };
+
+    output.push((tree_line, node.to_string(), node_type, depth, status, mode));
+
+    // Children of this node: ST dependents + plain source tables
+    let mut st_kids = ctx.st_children.get(node).cloned().unwrap_or_default();
+    st_kids.sort();
+
+    let mut src_kids = ctx.st_sources.get(node).cloned().unwrap_or_default();
+    src_kids.sort();
+
+    // Plain source nodes come after ST children so the ST sub-tree
+    // is rendered contiguously.
+    let all_kids: Vec<(String, bool)> = st_kids
+        .iter()
+        .map(|n| (n.clone(), true))
+        .chain(src_kids.iter().map(|n| (n.clone(), false)))
+        .collect();
+
+    let child_continuation = format!(
+        "{}{}",
+        continuation,
+        if connector == "└── " || connector.is_empty() {
+            "    "
+        } else {
+            "│   "
+        }
+    );
+
+    let total = all_kids.len();
+    for (i, (child, is_st_child)) in all_kids.iter().enumerate() {
+        let is_last = i == total - 1;
+        let child_connector = if is_last { "└── " } else { "├── " };
+
+        if *is_st_child {
+            dfs(
+                child,
+                depth + 1,
+                child_connector,
+                &child_continuation,
+                ctx,
+                output,
+            );
+        } else {
+            // Leaf source node — emit directly without recursing into
+            // its own dependencies (those are tracked by its own ST entry
+            // if it is also a stream table).
+            let src_label = format!("{} [src]", child);
+            let src_line = format!("{}{}{}", child_continuation, child_connector, src_label);
+            output.push((
+                src_line,
+                child.clone(),
+                "source_table".to_string(),
+                depth + 1,
+                None,
+                None,
+            ));
+        }
+    }
 }
 
 /// A single-query health overview of the pg_trickle installation.
@@ -1830,5 +1853,212 @@ mod tests {
             debug.contains("StaleData"),
             "Debug should contain variant name: {debug}"
         );
+    }
+
+    // ── build_alert_payload tests ───────────────────────────────────
+
+    #[test]
+    fn test_alert_payload_basic_structure() {
+        let payload = build_alert_payload(
+            AlertEvent::StaleData,
+            "public",
+            "orders_st",
+            r#""extra_key":"extra_val""#,
+        );
+        assert!(payload.contains(r#""event":"stale_data""#));
+        assert!(payload.contains(r#""pgt_schema":"public""#));
+        assert!(payload.contains(r#""pgt_name":"orders_st""#));
+        assert!(payload.contains(r#""st":"public.orders_st""#));
+        assert!(payload.contains(r#""extra_key":"extra_val""#));
+    }
+
+    #[test]
+    fn test_alert_payload_escapes_quotes() {
+        let payload = build_alert_payload(
+            AlertEvent::RefreshFailed,
+            r#"my"schema"#,
+            r#"my"table"#,
+            r#""err":"test""#,
+        );
+        assert!(payload.contains(r#"my\"schema"#));
+        assert!(payload.contains(r#"my\"table"#));
+    }
+
+    #[test]
+    fn test_alert_payload_truncation() {
+        let long_extra = "x".repeat(8000);
+        let payload = build_alert_payload(
+            AlertEvent::BufferGrowthWarning,
+            "public",
+            "test",
+            &format!(r#""data":"{}""#, long_extra),
+        );
+        assert!(
+            payload.len() <= 7900,
+            "payload should be truncated: len={}",
+            payload.len()
+        );
+        assert!(
+            payload.ends_with("...}"),
+            "should end with truncation marker, got: ...{}",
+            &payload[payload.len().saturating_sub(10)..],
+        );
+    }
+
+    #[test]
+    fn test_alert_payload_short_not_truncated() {
+        let payload = build_alert_payload(
+            AlertEvent::Resumed,
+            "public",
+            "test",
+            r#""reason":"manual""#,
+        );
+        assert!(!payload.contains("...}}"));
+    }
+
+    // ── render_dependency_tree tests ────────────────────────────────
+
+    #[test]
+    fn test_tree_single_root_no_children() {
+        let mut st_info = std::collections::HashMap::new();
+        st_info.insert(
+            "public.orders_st".to_string(),
+            ("ACTIVE".to_string(), "DEFERRED".to_string()),
+        );
+        let st_children = std::collections::HashMap::new();
+        let st_sources = std::collections::HashMap::new();
+
+        let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "public.orders_st"); // tree_line
+        assert_eq!(rows[0].1, "public.orders_st"); // node
+        assert_eq!(rows[0].2, "stream_table"); // node_type
+        assert_eq!(rows[0].3, 0); // depth
+        assert_eq!(rows[0].4, Some("ACTIVE".to_string()));
+    }
+
+    #[test]
+    fn test_tree_with_source_leaf() {
+        let mut st_info = std::collections::HashMap::new();
+        st_info.insert(
+            "public.orders_st".to_string(),
+            ("ACTIVE".to_string(), "DEFERRED".to_string()),
+        );
+        let st_children = std::collections::HashMap::new();
+        let mut st_sources = std::collections::HashMap::new();
+        st_sources.insert(
+            "public.orders_st".to_string(),
+            vec!["public.orders".to_string()],
+        );
+
+        let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "public.orders_st");
+        assert_eq!(rows[1].1, "public.orders");
+        assert_eq!(rows[1].2, "source_table");
+        assert!(rows[1].0.contains("[src]"));
+    }
+
+    #[test]
+    fn test_tree_st_chain() {
+        let mut st_info = std::collections::HashMap::new();
+        st_info.insert(
+            "public.base_st".to_string(),
+            ("ACTIVE".to_string(), "DEFERRED".to_string()),
+        );
+        st_info.insert(
+            "public.derived_st".to_string(),
+            ("ACTIVE".to_string(), "DEFERRED".to_string()),
+        );
+        let mut st_children = std::collections::HashMap::new();
+        st_children.insert(
+            "public.base_st".to_string(),
+            vec!["public.derived_st".to_string()],
+        );
+        let st_sources = std::collections::HashMap::new();
+
+        let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "public.base_st");
+        assert_eq!(rows[0].3, 0); // depth
+        assert_eq!(rows[1].1, "public.derived_st");
+        assert_eq!(rows[1].3, 1); // depth
+    }
+
+    #[test]
+    fn test_tree_multiple_roots_sorted() {
+        let mut st_info = std::collections::HashMap::new();
+        st_info.insert(
+            "public.b_st".to_string(),
+            ("ACTIVE".to_string(), "DEFERRED".to_string()),
+        );
+        st_info.insert(
+            "public.a_st".to_string(),
+            ("ACTIVE".to_string(), "DEFERRED".to_string()),
+        );
+        let st_children = std::collections::HashMap::new();
+        let st_sources = std::collections::HashMap::new();
+
+        let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
+        assert_eq!(rows.len(), 2);
+        // Roots should be alphabetically sorted
+        assert_eq!(rows[0].1, "public.a_st");
+        assert_eq!(rows[1].1, "public.b_st");
+    }
+
+    #[test]
+    fn test_tree_diamond_topology() {
+        // base_st -> mid_a_st -> leaf_st
+        // base_st -> mid_b_st -> leaf_st
+        let mut st_info = std::collections::HashMap::new();
+        for name in &["public.base_st", "public.mid_a_st", "public.mid_b_st"] {
+            st_info.insert(
+                name.to_string(),
+                ("ACTIVE".to_string(), "DEFERRED".to_string()),
+            );
+        }
+        let mut st_children = std::collections::HashMap::new();
+        st_children.insert(
+            "public.base_st".to_string(),
+            vec!["public.mid_a_st".to_string(), "public.mid_b_st".to_string()],
+        );
+        let st_sources = std::collections::HashMap::new();
+
+        let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1, "public.base_st");
+        // Children should be sorted
+        assert_eq!(rows[1].1, "public.mid_a_st");
+        assert_eq!(rows[2].1, "public.mid_b_st");
+    }
+
+    #[test]
+    fn test_tree_source_not_in_st_info() {
+        let mut st_info = std::collections::HashMap::new();
+        st_info.insert(
+            "public.my_st".to_string(),
+            ("ACTIVE".to_string(), "IMMEDIATE".to_string()),
+        );
+        let st_children = std::collections::HashMap::new();
+        let mut st_sources = std::collections::HashMap::new();
+        st_sources.insert(
+            "public.my_st".to_string(),
+            vec!["public.raw_table".to_string()],
+        );
+
+        let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
+        let src_row = rows.iter().find(|r| r.1 == "public.raw_table").unwrap();
+        assert_eq!(src_row.4, None); // no status for source tables
+        assert_eq!(src_row.5, None); // no mode for source tables
+    }
+
+    #[test]
+    fn test_tree_empty_graph() {
+        let st_info = std::collections::HashMap::new();
+        let st_children = std::collections::HashMap::new();
+        let st_sources = std::collections::HashMap::new();
+
+        let rows = render_dependency_tree(&st_info, &st_children, &st_sources);
+        assert!(rows.is_empty());
     }
 }

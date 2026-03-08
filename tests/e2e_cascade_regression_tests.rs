@@ -248,8 +248,12 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         .await;
     db.execute("ALTER SYSTEM SET pg_trickle.min_schedule_seconds = 1")
         .await;
-    db.execute("SELECT pg_reload_conf()").await;
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    db.reload_config_and_wait().await;
+    db.wait_for_setting("pg_trickle.scheduler_interval_ms", "100")
+        .await;
+    db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 }
 
 // ── Test 3: 0-row DIFFERENTIAL must not bump data_timestamp ─────────────────

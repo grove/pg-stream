@@ -9,6 +9,16 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Changed
+
+- **CI test pyramid rebalanced** — PRs now run a faster three-tier gate:
+  Linux unit tests, integration tests, and a curated Light E2E tier split
+  across three shards against stock `postgres:18.1`. The heavier full E2E,
+  TPC-H, dbt, CNPG smoke, and extra-platform unit jobs remain off the PR
+  critical path and continue to run on push-to-main, schedule, or manual
+  dispatch. The shared CI setup action now caches the `cargo-pgrx` binary,
+  cutting Linux setup time substantially on warm runs.
+
 ## [0.2.2] — 2026-03-08
 
 ### Added
