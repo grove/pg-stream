@@ -111,6 +111,13 @@ char *format_type_extended(uint32_t oid, int32_t typmod, int flags) {
 
 /* ── Toast helpers ────────────────────────────────────────────────────── */
 void *pg_detoast_datum(void *datum)             { return datum; }
+void *pg_detoast_datum_copy(void *datum)        { return datum; }
+void *pg_detoast_datum_slice(void *datum, int32_t first, int32_t count) {
+    (void)first;
+    (void)count;
+    return datum;
+}
+void *pg_detoast_datum_packed(void *datum)      { return datum; }
 
 /* ── Parser entry points ─────────────────────────────────────────────── */
 void *raw_parser(const char *str, int mode) {
