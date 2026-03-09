@@ -3553,9 +3553,16 @@ fn initialize_st(
     // table participates in shared change-buffer bookkeeping immediately.
     // Without this, one branch of a diamond can remain frontier-less after the
     // initial populate and later miss source changes that a sibling consumes.
+    //
+    // FOREIGN_TABLE sources are included so that the frontier is never empty
+    // for FT-only stream tables.  An empty frontier causes
+    // `execute_manual_differential_refresh` to treat every manual refresh as a
+    // no-op (it assumes empty frontiers belong to ST-on-ST dependencies).
+    // Including the FT OID with the current WAL LSN gives differential refresh
+    // a valid lower bound from which to compare polled change-buffer rows.
     let source_oids: Vec<pg_sys::Oid> = StDependency::get_for_st(pgt_id)?
         .into_iter()
-        .filter(|dep| dep.source_type == "TABLE")
+        .filter(|dep| dep.source_type == "TABLE" || dep.source_type == "FOREIGN_TABLE")
         .map(|dep| dep.source_relid)
         .collect();
     let slot_positions = cdc::get_slot_positions(&source_oids)?;

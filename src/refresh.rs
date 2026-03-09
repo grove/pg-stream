@@ -300,13 +300,15 @@ fn cleanup_change_buffers_by_frontier(change_schema: &str, source_oids: &[u32]) 
         }
 
         // Compute the minimum frontier LSN across ALL stream tables that
-        // depend on this source OID.
+        // depend on this source OID.  Both TABLE and FOREIGN_TABLE sources
+        // are included: FT change buffers are written by polling and must be
+        // cleaned up once all consumers have advanced their frontier past them.
         let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
             "SELECT MIN((st.frontier->'sources'->'{oid}'->>'lsn')::pg_lsn)::TEXT \
              FROM pgtrickle.pgt_stream_tables st \
              JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
              WHERE dep.source_relid = {oid} \
-               AND dep.source_type = 'TABLE' \
+               AND dep.source_type IN ('TABLE', 'FOREIGN_TABLE') \
                AND st.frontier IS NOT NULL \
                AND st.frontier->'sources'->'{oid}'->>'lsn' IS NOT NULL",
         ))
