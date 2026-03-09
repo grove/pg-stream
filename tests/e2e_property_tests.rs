@@ -137,20 +137,48 @@ async fn assert_invariant(db: &E2eDb, pgt_name: &str, query: &str, seed: u64, cy
         ))
         .await;
 
+    // INTERSECT/EXCEPT STs keep invisible rows for multiplicity tracking.
+    // Compare only the user-visible subset, matching the main E2E harness.
+    let has_dual_counts: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'public' AND table_name = '{pgt_name}' \
+                  AND column_name = '__pgt_count_l')"
+        ))
+        .await;
+
+    let dq_upper = query.to_uppercase();
+    let set_op_filter = if has_dual_counts {
+        if dq_upper.contains("INTERSECT ALL") {
+            " WHERE LEAST(__pgt_count_l, __pgt_count_r) > 0"
+        } else if dq_upper.contains("INTERSECT") {
+            " WHERE __pgt_count_l > 0 AND __pgt_count_r > 0"
+        } else if dq_upper.contains("EXCEPT ALL") {
+            " WHERE __pgt_count_l > __pgt_count_r"
+        } else if dq_upper.contains("EXCEPT") {
+            " WHERE __pgt_count_l > 0 AND __pgt_count_r = 0"
+        } else {
+            ""
+        }
+    } else {
+        ""
+    };
+
     // Multiset equality: symmetric EXCEPT ALL must be empty
     let matches: bool = db
         .query_scalar(&format!(
             "SELECT NOT EXISTS ( \
-                (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) \
+                (SELECT {cols} FROM {st_table}{set_op_filter} EXCEPT ALL ({query})) \
                 UNION ALL \
-                (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) \
+                (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}{set_op_filter}) \
             )"
         ))
         .await;
 
     if !matches {
         let st_count: i64 = db
-            .query_scalar(&format!("SELECT count(*) FROM {st_table}"))
+            .query_scalar(&format!("SELECT count(*) FROM {st_table}{set_op_filter}"))
             .await;
         let q_count: i64 = db
             .query_scalar(&format!("SELECT count(*) FROM ({query}) _q"))
@@ -158,13 +186,13 @@ async fn assert_invariant(db: &E2eDb, pgt_name: &str, query: &str, seed: u64, cy
         let extra: i64 = db
             .query_scalar(&format!(
                 "SELECT count(*) FROM \
-                 (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) _x"
+                 (SELECT {cols} FROM {st_table}{set_op_filter} EXCEPT ALL ({query})) _x"
             ))
             .await;
         let missing: i64 = db
             .query_scalar(&format!(
                 "SELECT count(*) FROM \
-                 (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) _x"
+                 (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}{set_op_filter}) _x"
             ))
             .await;
 
