@@ -1698,7 +1698,21 @@ pub fn execute_differential_refresh(
         hasher.finish()
     };
 
+    let has_any_cte = dvm::query_has_cte(&st.defining_query)?;
     let has_recursive_cte = dvm::query_has_recursive_cte(&st.defining_query)?;
+
+    if has_any_cte {
+        pgrx::info!(
+            "[pg_trickle] CTE-backed differential refresh fallback: using FULL refresh for {}.{}",
+            schema,
+            name,
+        );
+        let result = execute_full_refresh(st);
+        if result.is_ok() {
+            post_full_refresh_cleanup(st);
+        }
+        return result;
+    }
 
     let cached = if has_recursive_cte {
         None

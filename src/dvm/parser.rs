@@ -2928,6 +2928,44 @@ pub fn query_has_recursive_cte(query: &str) -> Result<bool, PgTrickleError> {
     unsafe { query_has_recursive_cte_inner(query) }
 }
 
+/// Lightweight check for any top-level WITH clause in a defining query.
+///
+/// Returns true for both recursive and non-recursive CTEs. This is used by
+/// refresh planning to select safe fallback strategies without building the
+/// full OpTree.
+pub fn query_has_cte(query: &str) -> Result<bool, PgTrickleError> {
+    unsafe { query_has_cte_inner(query) }
+}
+
+unsafe fn query_has_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
+
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Err(PgTrickleError::QueryParseError(
+            "raw_parser returned NULL".into(),
+        ));
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(stmt) => stmt,
+        None => return Ok(false),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(false);
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    Ok(!select.withClause.is_null())
+}
+
 unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
     use std::ffi::CString;
 

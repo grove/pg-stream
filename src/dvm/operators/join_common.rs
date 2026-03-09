@@ -42,6 +42,7 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                 table_name.replace('"', "\"\""),
             )
         }
+        OpTree::CteScan { alias, .. } => quote_ident(alias),
         OpTree::InnerJoin {
             condition,
             left,
@@ -638,6 +639,7 @@ fn rewrite_raw_alias_refs(sql: &str, old_alias: &str, new_alias: &str) -> String
 pub fn has_source_alias(op: &OpTree, alias: &str) -> bool {
     match op {
         OpTree::Scan { alias: a, .. } => a == alias,
+        OpTree::CteScan { alias: a, .. } => a == alias,
         OpTree::InnerJoin { left, right, .. }
         | OpTree::LeftJoin { left, right, .. }
         | OpTree::FullJoin { left, right, .. }
@@ -671,6 +673,26 @@ fn find_column_source(op: &OpTree, column_name: &str) -> Option<String> {
     match op {
         OpTree::Scan { alias, columns, .. } => {
             if columns.iter().any(|c| c.name == column_name) {
+                Some(alias.clone())
+            } else {
+                None
+            }
+        }
+        OpTree::CteScan {
+            alias,
+            columns,
+            cte_def_aliases,
+            column_aliases,
+            ..
+        } => {
+            let visible_cols = if !column_aliases.is_empty() {
+                column_aliases
+            } else if !cte_def_aliases.is_empty() {
+                cte_def_aliases
+            } else {
+                columns
+            };
+            if visible_cols.iter().any(|c| c == column_name) {
                 Some(alias.clone())
             } else {
                 None
@@ -711,6 +733,7 @@ fn resolve_disambiguated_column(
             // Found the target scan — return alias__column_name
             Some(format!("{alias}__{column_name}"))
         }
+        OpTree::CteScan { alias, .. } if alias == table_alias => Some(column_name.to_string()),
         OpTree::InnerJoin { left, right, .. }
         | OpTree::LeftJoin { left, right, .. }
         | OpTree::FullJoin { left, right, .. } => {
@@ -758,6 +781,7 @@ fn resolve_disambiguated_column(
 pub fn is_simple_source(op: &OpTree, alias: &str) -> bool {
     match op {
         OpTree::Scan { alias: a, .. } => a == alias,
+        OpTree::CteScan { alias: a, .. } => a == alias,
         OpTree::Filter { child, .. } | OpTree::Project { child, .. } => {
             is_simple_source(child, alias)
         }

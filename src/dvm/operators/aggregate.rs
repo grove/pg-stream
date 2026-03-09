@@ -153,6 +153,13 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             Some(format!("{l} FULL JOIN {r} ON {}", condition.to_sql()))
         }
         OpTree::Project { child, .. } => child_to_from_sql(child),
+        OpTree::CteScan { alias, .. } => {
+            // CTE scans behave like simple named sources in downstream
+            // differential SQL. Use their visible alias so filters and joins
+            // above them can resolve references positionally against the
+            // current-query reconstruction.
+            Some(quote_ident(alias))
+        }
         OpTree::Subquery {
             child,
             alias,
