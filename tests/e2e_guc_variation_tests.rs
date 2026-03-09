@@ -10,6 +10,15 @@
 mod e2e;
 
 use e2e::E2eDb;
+use std::sync::{Arc, LazyLock};
+
+/// Mutex that serialises tests touching the `foreign_table_polling` GUC.
+///
+/// `ALTER SYSTEM` changes are cluster-wide (all databases in the shared
+/// container), so two tests that each modify this GUC must not run in
+/// parallel — one could observe the other's interim value.
+static FOREIGN_TABLE_POLLING_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 /// Helper: create a standard table, seed data, create ST, verify.
 async fn setup_guc_test(db: &E2eDb) {
@@ -256,8 +265,17 @@ async fn test_guc_max_grouping_set_branches_raised_allows_large_cube() {
 async fn test_guc_foreign_table_polling_off_rejects_differential() {
     // With polling disabled (default), foreign tables should be rejected
     // in DIFFERENTIAL mode.
+    //
+    // Acquire the cluster-wide GUC lock to prevent this test from running
+    // concurrently with test_guc_foreign_table_polling_on_allows_differential,
+    // which sets foreign_table_polling = on via ALTER SYSTEM.
+    let _polling_lock = FOREIGN_TABLE_POLLING_LOCK.lock().await;
     let db = E2eDb::new().await.with_extension().await;
     let db_name: String = db.query_scalar("SELECT current_database()").await;
+
+    // Ensure the GUC is off (guards against a previous test leaving it on).
+    db.alter_system_set_and_wait("pg_trickle.foreign_table_polling", "off", "off")
+        .await;
 
     // Set up a loopback foreign server via postgres_fdw.
     db.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw")
@@ -343,6 +361,11 @@ async fn test_guc_foreign_table_polling_full_mode_no_guc_needed() {
 async fn test_guc_foreign_table_polling_on_allows_differential() {
     // With polling enabled, foreign tables should be accepted in DIFFERENTIAL mode
     // and the snapshot-based CDC should produce correct results.
+    //
+    // Acquire the cluster-wide GUC lock to prevent this test from running
+    // concurrently with test_guc_foreign_table_polling_off_rejects_differential,
+    // which relies on foreign_table_polling being off.
+    let _polling_lock = FOREIGN_TABLE_POLLING_LOCK.lock().await;
     let db = E2eDb::new().await.with_extension().await;
     let db_name: String = db.query_scalar("SELECT current_database()").await;
 
