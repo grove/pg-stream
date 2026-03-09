@@ -3421,12 +3421,19 @@ fn initialize_st(
     Spi::run(&insert_sql)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to initialize ST: {}", e)))?;
 
-    // Update catalog
-    let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-        .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
-
-    StreamTableMeta::update_after_refresh(pgt_id, now, 0)?;
+    // Seed the initial frontier at creation time so every initialized stream
+    // table participates in shared change-buffer bookkeeping immediately.
+    // Without this, one branch of a diamond can remain frontier-less after the
+    // initial populate and later miss source changes that a sibling consumes.
+    let source_oids: Vec<pg_sys::Oid> = StDependency::get_for_st(pgt_id)?
+        .into_iter()
+        .filter(|dep| dep.source_type == "TABLE")
+        .map(|dep| dep.source_relid)
+        .collect();
+    let slot_positions = cdc::get_slot_positions(&source_oids)?;
+    let data_ts = get_data_timestamp_str();
+    let frontier = version::compute_initial_frontier(&slot_positions, &data_ts);
+    StreamTableMeta::store_frontier_and_complete_refresh(pgt_id, &frontier, 0)?;
     Ok(())
 }
 
