@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-08
-> **Latest release:** 0.2.3 (2026-03-08)
-> **Current milestone:** 0.3.0
+> **Last updated:** 2026-03-09
+> **Latest release:** 0.2.2 (2026-03-08)
+> **Current milestone:** 0.2.3
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -382,7 +382,7 @@ validations, resource leaks, and observability holes. Phased from quick wins
 
 > **CDC/refresh mode gaps subtotal: ✅ Complete**
 >
-> **Progress:** G6 is now implemented in `Unreleased`: the low-level
+> **Progress:** G6 is now implemented in `v0.2.3`: the low-level
 > differential executor rejects unpopulated stream tables and missing
 > frontiers before it can scan from `0/0`, while the public manual-refresh
 > path continues to fall back to FULL for `initialize => false` stream tables.
@@ -396,7 +396,7 @@ validations, resource leaks, and observability holes. Phased from quick wins
 > `refresh_mode = 'IMMEDIATE'`, while explicit per-table `cdc_mode => 'wal'`
 > requests are rejected for IMMEDIATE mode with a clear error.
 >
-> **Progress:** G3 and G4 are now implemented in `Unreleased`:
+> **Progress:** G3 and G4 are now implemented in `v0.2.3`:
 > `advance_slot_to_current()` in `wal_decoder.rs` advances WAL slots after
 > each FULL refresh; the shared `post_full_refresh_cleanup()` helper in
 > `refresh.rs` advances all WAL/TRANSITIONING slots and flushes change buffers,
@@ -404,7 +404,7 @@ validations, resource leaks, and observability holes. Phased from quick wins
 > the adaptive fallback path. This prevents change-buffer ping-pong on
 > bulk-loaded tables.
 >
-> **Progress:** G5 is now implemented in `Unreleased`: the
+> **Progress:** G5 is now implemented in `v0.2.3`: the
 > `pgtrickle.pgt_cdc_status` convenience view has been added, and a
 > `cdc_modes` text-array column surfaces per-source CDC modes in
 > `pgtrickle.pg_stat_stream_tables`. NOTIFY on CDC transitions
@@ -428,7 +428,7 @@ validations, resource leaks, and observability holes. Phased from quick wins
 
 > **Operational subtotal: Done**
 >
-> **Progress:** All four operational items are now shipped in `Unreleased`.
+> **Progress:** All four operational items are now shipped in `v0.2.3`.
 > Warning-level and critical WAL slot lag thresholds are configurable,
 > prepared `__pgt_merge_*` statements are cleaned up on shared cache
 > invalidation, `pg_trickle.user_triggers` is simplified to canonical
@@ -448,7 +448,7 @@ validations, resource leaks, and observability holes. Phased from quick wins
 - [x] Per-table `cdc_mode` override functional in SQL API and dbt adapter (G1)
 - [x] Extension upgrade path tested (`0.2.2 → 0.2.3`)
 
-**Status: Released (2026-03-08).**
+**Status: Ready for release (tag pending).**
 
 ---
 

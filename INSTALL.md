@@ -265,12 +265,13 @@ Connect to every database where pg_trickle is installed and run:
 ALTER EXTENSION pg_trickle UPDATE;
 
 -- Or upgrade to a specific version
-ALTER EXTENSION pg_trickle UPDATE TO '0.2.2';
+ALTER EXTENSION pg_trickle UPDATE TO '<new-version>';
 ```
 
 PostgreSQL uses the versioned SQL migration scripts bundled with the release
-(e.g. `pg_trickle--0.1.3--0.2.0.sql`, `pg_trickle--0.2.0--0.2.1.sql`, and
-`pg_trickle--0.2.1--0.2.2.sql`) to apply catalog and SQL-surface changes.
+(e.g. `pg_trickle--0.1.3--0.2.0.sql`, `pg_trickle--0.2.0--0.2.1.sql`,
+`pg_trickle--0.2.1--0.2.2.sql`, and `pg_trickle--0.2.2--0.2.3.sql`) to
+apply catalog and SQL-surface changes.
 PostgreSQL automatically chains these scripts when you run `ALTER EXTENSION
 pg_trickle UPDATE`. The command is a no-op when no migration script is needed
 for a given release.

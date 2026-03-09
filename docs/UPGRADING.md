@@ -43,13 +43,13 @@ The method depends on how you originally installed pg_trickle.
 **From release tarball:**
 
 ```bash
-# Download the new release
-curl -LO https://github.com/getretake/pg_trickle/releases/download/v0.2.3/pg_trickle-0.2.3-pg18-linux-amd64.tar.gz
-tar xzf pg_trickle-0.2.3-pg18-linux-amd64.tar.gz
+# Replace <new-version> with the target release, for example 0.2.3
+curl -LO https://github.com/getretake/pg_trickle/releases/download/v<new-version>/pg_trickle-<new-version>-pg18-linux-amd64.tar.gz
+tar xzf pg_trickle-<new-version>-pg18-linux-amd64.tar.gz
 
 # Copy files to PostgreSQL directories
-sudo cp pg_trickle-0.2.3-pg18-linux-amd64/lib/* $(pg_config --pkglibdir)/
-sudo cp pg_trickle-0.2.3-pg18-linux-amd64/extension/* $(pg_config --sharedir)/extension/
+sudo cp pg_trickle-<new-version>-pg18-linux-amd64/lib/* $(pg_config --pkglibdir)/
+sudo cp pg_trickle-<new-version>-pg18-linux-amd64/extension/* $(pg_config --sharedir)/extension/
 ```
 
 **From source (cargo-pgrx):**

@@ -9,7 +9,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-## [0.2.3] — 2026-03-08
+## [0.2.3]
 
 ### Added
 
@@ -123,6 +123,17 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   critical path and continue to run on push-to-main, schedule, or manual
   dispatch. The shared CI setup action now caches the `cargo-pgrx` binary,
   cutting Linux setup time substantially on warm runs.
+
+- **Test harness hardening for shared PostgreSQL E2E runs** — the shared
+  full-E2E harness now resets `ALTER SYSTEM` state during teardown,
+  terminates lingering scheduler/client backends before cleanup, and
+  serializes shared-`postgres` resets so parallel test processes do not fight
+  over the same database state.
+
+- **Windows CI restores the cached `cargo-pgrx` toolchain reliably again** —
+  the setup action now handles the cached binary path correctly on Windows,
+  and the test harness changes that accompanied the fix avoid shared-postgres
+  reset deadlocks in E2E runs.
 
 ---
 

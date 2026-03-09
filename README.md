@@ -234,7 +234,7 @@ SELECT pgtrickle.drop_stream_table('regional_totals');
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
-| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.2.3) |
+| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.2.3, tag pending) |
 
 ### Research & Plans
 
