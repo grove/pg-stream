@@ -1213,14 +1213,26 @@ impl OpTree {
                 // the output. E.g., Aggregate GROUP BY "name" → Project
                 // alias "region" at the same position.
                 let child_out = child.output_columns();
-                // When the child has more output columns than the Project
-                // has aliases (e.g., SELECT id, name FROM cte where cte
-                // produces [id, parent_id, name]), positional mapping is
-                // unreliable — child_out[1] is "parent_id" but aliases[1]
-                // is "name". Fall back to content-hashing all projected
+                // When a Project narrows a CTE scan (e.g., SELECT id, name
+                // FROM cte where the CTE produces [id, parent_id, name]),
+                // positional mapping is unreliable — child_out[1] is
+                // "parent_id" but aliases[1] is "name". In that specific
+                // CTE case, fall back to content-hashing the projected
                 // columns, which matches the CteScan wrapper's formula.
+                //
+                // For other narrowing projections (notably the EC-03 window
+                // subquery-lift rewrite), hashing only the projected aliases
+                // is unsafe because the derived output may not be unique
+                // (e.g., CASE/CAST/COALESCE over row_number()) and initial
+                // population would hit duplicate __pgt_row_id values. Those
+                // shapes must fall back to the generic row_number()-based
+                // hash via `None` instead.
                 if child_out.len() != aliases.len() {
-                    return Some(aliases.clone());
+                    return if matches!(unwrapped, OpTree::CteScan { .. }) {
+                        Some(aliases.clone())
+                    } else {
+                        None
+                    };
                 }
                 match child.row_id_key_columns() {
                     Some(keys) => {
