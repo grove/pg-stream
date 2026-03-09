@@ -200,6 +200,8 @@ fn resolve_predicate_for_child(predicate: &Expr, child_cols: &[String]) -> Strin
 /// replaces names that appear as word boundaries (not inside other
 /// identifiers or string literals).
 pub fn replace_column_refs_in_raw(sql: &str, child_cols: &[String]) -> String {
+    let mut result = replace_qualified_column_refs(sql, child_cols);
+
     // Build column name mapping: base_name → disambiguated_name
     // For "customer__c_custkey", base_name = "c_custkey"
     // For "join__customer__c_custkey", base_name = "c_custkey"
@@ -229,7 +231,6 @@ pub fn replace_column_refs_in_raw(sql: &str, child_cols: &[String]) -> String {
             .push(full.clone());
     }
 
-    let mut result = sql.to_string();
     for (base, fulls) in &seen_bases {
         if fulls.len() != 1 {
             continue; // Ambiguous — skip
@@ -240,6 +241,116 @@ pub fn replace_column_refs_in_raw(sql: &str, child_cols: &[String]) -> String {
         result = replace_word_boundary(&result, base, &quote_ident(full));
     }
     result
+}
+
+fn replace_qualified_column_refs(sql: &str, child_cols: &[String]) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut result = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_string = false;
+
+    while i < chars.len() {
+        if chars[i] == '\'' {
+            result.push(chars[i]);
+            if in_string && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                result.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            in_string = !in_string;
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        if let Some((alias, alias_end)) = parse_sql_identifier(&chars, i)
+            && alias_end < chars.len()
+            && chars[alias_end] == '.'
+            && let Some((column, column_end)) = parse_sql_identifier(&chars, alias_end + 1)
+        {
+            if let Some(replacement) = resolve_qualified_column_ref(&alias, &column, child_cols) {
+                result.push_str(&replacement);
+                i = column_end;
+                continue;
+            }
+
+            result.push_str(&chars[i..column_end].iter().collect::<String>());
+            i = column_end;
+            continue;
+        }
+
+        result.push(chars[i]);
+        i += 1;
+    }
+
+    result
+}
+
+fn parse_sql_identifier(chars: &[char], start: usize) -> Option<(String, usize)> {
+    if start >= chars.len() {
+        return None;
+    }
+
+    if chars[start] == '"' {
+        let mut ident = String::new();
+        let mut i = start + 1;
+        while i < chars.len() {
+            if chars[i] == '"' {
+                if i + 1 < chars.len() && chars[i + 1] == '"' {
+                    ident.push('"');
+                    i += 2;
+                } else {
+                    return Some((ident, i + 1));
+                }
+            } else {
+                ident.push(chars[i]);
+                i += 1;
+            }
+        }
+        return None;
+    }
+
+    if !chars[start].is_ascii_alphabetic() && chars[start] != '_' {
+        return None;
+    }
+
+    let mut i = start + 1;
+    while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+        i += 1;
+    }
+
+    Some((chars[start..i].iter().collect(), i))
+}
+
+fn resolve_qualified_column_ref(
+    alias: &str,
+    column: &str,
+    child_cols: &[String],
+) -> Option<String> {
+    let disambiguated = format!("{alias}__{column}");
+    if child_cols.contains(&disambiguated) {
+        return Some(quote_ident(&disambiguated));
+    }
+
+    let nested_suffix = format!("__{alias}__{column}");
+    if let Some(found) = child_cols.iter().find(|c| c.ends_with(&nested_suffix)) {
+        return Some(quote_ident(found));
+    }
+
+    if child_cols.contains(&column.to_string()) {
+        return Some(quote_ident(column));
+    }
+
+    if child_cols.contains(&alias.to_string()) && !child_cols.contains(&column.to_string()) {
+        return Some(quote_ident(alias));
+    }
+
+    None
 }
 
 /// Replace all occurrences of `word` in `text` that appear at word
@@ -399,6 +510,29 @@ mod tests {
         assert_sql_contains(&sql, "\"id\"");
         assert_sql_contains(&sql, "\"name\"");
         assert_eq!(result.columns, vec!["id", "name", "status"]);
+    }
+
+    #[test]
+    fn test_replace_column_refs_in_raw_rewrites_qualified_lateral_columns() {
+        let sql = "CAST(\"e\".\"value\" AS integer) > 12";
+        let child_cols = vec!["id".to_string(), "value".to_string()];
+
+        let result = replace_column_refs_in_raw(sql, &child_cols);
+
+        assert_eq!(result, "CAST(\"value\" AS integer) > 12");
+    }
+
+    #[test]
+    fn test_replace_column_refs_in_raw_preserves_strings() {
+        let sql = "CASE WHEN 'e.value' = 'x' THEN \"e\".\"value\" ELSE NULL END";
+        let child_cols = vec!["value".to_string()];
+
+        let result = replace_column_refs_in_raw(sql, &child_cols);
+
+        assert_eq!(
+            result,
+            "CASE WHEN 'e.value' = 'x' THEN \"value\" ELSE NULL END"
+        );
     }
 
     #[test]

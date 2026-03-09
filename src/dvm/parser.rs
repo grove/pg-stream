@@ -239,6 +239,48 @@ pub enum AggFunc {
     ComplexExpression(String),
 }
 
+/// Determine the effective output column names for a LATERAL SRF.
+///
+/// When the query provides `AS alias(c1, c2, ...)`, those names win.
+/// Otherwise we infer PostgreSQL's default names for common built-ins that
+/// expose structured results through field references like `e.value` or
+/// `kv.key` / `kv.value`. For everything else we preserve the existing
+/// fallback of using the table alias as the single column name.
+pub fn lateral_function_output_columns(
+    func_sql: &str,
+    alias: &str,
+    column_aliases: &[String],
+) -> Vec<String> {
+    if !column_aliases.is_empty() {
+        return column_aliases.to_vec();
+    }
+
+    infer_default_lateral_function_columns(func_sql).unwrap_or_else(|| vec![alias.to_string()])
+}
+
+fn infer_default_lateral_function_columns(func_sql: &str) -> Option<Vec<String>> {
+    let open_paren = func_sql.find('(')?;
+    let func_head = func_sql[..open_paren].trim();
+    let func_name = func_head
+        .rsplit('.')
+        .next()
+        .unwrap_or(func_head)
+        .replace('"', "")
+        .to_ascii_lowercase();
+
+    match func_name.as_str() {
+        "json_each" | "json_each_text" | "jsonb_each" | "jsonb_each_text" => {
+            Some(vec!["key".to_string(), "value".to_string()])
+        }
+        "json_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements"
+        | "jsonb_array_elements_text" => Some(vec!["value".to_string()]),
+        "json_object_keys" | "jsonb_object_keys" => Some(vec!["key".to_string()]),
+        _ => None,
+    }
+}
+
 impl AggFunc {
     /// Name of the aggregate function for SQL generation.
     pub fn sql_name(&self) -> &'static str {
@@ -1309,6 +1351,7 @@ impl OpTree {
                 cols
             }
             OpTree::LateralFunction {
+                func_sql,
                 alias,
                 column_aliases,
                 with_ordinality,
@@ -1317,12 +1360,11 @@ impl OpTree {
             } => {
                 // Output = child columns + SRF result columns + optional ordinality
                 let mut cols = child.output_columns();
-                if column_aliases.is_empty() {
-                    // No explicit aliases — use the alias name as a single column
-                    cols.push(alias.clone());
-                } else {
-                    cols.extend(column_aliases.clone());
-                }
+                cols.extend(lateral_function_output_columns(
+                    func_sql,
+                    alias,
+                    column_aliases,
+                ));
                 if *with_ordinality {
                     cols.push("ordinality".to_string());
                 }
