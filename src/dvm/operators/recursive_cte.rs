@@ -323,10 +323,19 @@ fn generate_recomputation_delta(
     // When using the defining query, the recomputed CTE only has
     // the outer-projection columns. Some CTE columns (like parent_id)
     // may not exist in the recomputed result. Use sub.* to be safe.
+    //
+    // The __pgt_row_id must use the same hash formula as the initial
+    // populate (content-hash of output columns) so that the anti-join
+    // against the ST correctly identifies unchanged rows.
+    let hash_exprs: Vec<String> = out_cols
+        .iter()
+        .map(|c| format!("sub.{}::TEXT", quote_ident(c)))
+        .collect();
+    let row_id_hash = crate::dvm::operators::scan::build_hash_expr(&hash_exprs);
+
     let recomp_cte = ctx.next_cte_name(&format!("rc_recomp_{alias}"));
     let recomp_sql = format!(
-        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
-               row_number() OVER ()::text) AS __pgt_row_id, sub.*\n\
+        "SELECT {row_id_hash} AS __pgt_row_id, sub.*\n\
          FROM ({recomp_inner_sql}) sub",
     );
     ctx.add_cte(recomp_cte.clone(), recomp_sql);
@@ -678,10 +687,16 @@ fn generate_semi_naive_ins_only(
 
     // Wrap with __pgt_row_id and __pgt_action = 'I'.
     // Explicitly select only user columns so __pgt_depth is excluded.
+    // Use content-hash of output columns matching the initial populate.
+    let dred_hash_exprs: Vec<String> = columns
+        .iter()
+        .map(|c| format!("sub.{}::TEXT", quote_ident(c)))
+        .collect();
+    let dred_row_id_hash = crate::dvm::operators::scan::build_hash_expr(&dred_hash_exprs);
+
     let ins_final_cte = ctx.next_cte_name(&format!("dred_ifin_{alias}"));
     let ins_final_sql = format!(
-        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
-                row_number() OVER ()::text) AS __pgt_row_id,\n\
+        "SELECT {dred_row_id_hash} AS __pgt_row_id,\n\
                'I'::text AS __pgt_action,\n\
                {col_list_str}\n\
          FROM {delta_cte} sub",
@@ -1112,10 +1127,16 @@ fn build_semi_naive_result(
     // Wrap with __pgt_row_id and __pgt_action.
     // The final SELECT explicitly picks only the user columns from delta_cte,
     // dropping the hidden __pgt_depth counter column when it is present.
+    // Use content-hash of output columns matching the initial populate.
+    let sn_hash_exprs: Vec<String> = columns
+        .iter()
+        .map(|c| format!("sub.{}::TEXT", quote_ident(c)))
+        .collect();
+    let sn_row_id_hash = crate::dvm::operators::scan::build_hash_expr(&sn_hash_exprs);
+
     let final_cte_name = ctx.next_cte_name(&format!("rc_final_{alias}"));
     let final_sql = format!(
-        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
-                row_number() OVER ()::text) AS __pgt_row_id,\n\
+        "SELECT {sn_row_id_hash} AS __pgt_row_id,\n\
                'I'::text AS __pgt_action,\n\
                {col_list_str}\n\
          FROM {delta_cte} sub",

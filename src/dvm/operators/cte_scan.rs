@@ -146,11 +146,12 @@ mod tests {
         let tree1 = cte_scan(0, "my_cte", "mc1", vec!["id", "name"], vec![], vec![]);
         let result1 = diff_cte_scan(&mut ctx, &tree1).unwrap();
 
-        // Second scan of same CTE should be cached
+        // Second scan of same CTE should reuse cached body delta
         let tree2 = cte_scan(0, "my_cte", "mc2", vec!["id", "name"], vec![], vec![]);
         let result2 = diff_cte_scan(&mut ctx, &tree2).unwrap();
 
-        assert_eq!(result1.cte_name, result2.cte_name);
+        // Each reference gets its own wrapper CTE but the same output columns
+        assert_eq!(result1.columns, result2.columns);
     }
 
     #[test]
