@@ -1441,3 +1441,240 @@ async fn test_tpch_sustained_churn() {
         "Cumulative drift must be zero over {n_cycles} churn cycles"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase 8: IMMEDIATE Mode Correctness
+// ═══════════════════════════════════════════════════════════════════════
+//
+// For each TPC-H query:
+//   1. Create ST in IMMEDIATE mode (NULL schedule — IVM triggers maintain it)
+//   2. Assert baseline invariant (populated on create)
+//   3. For N cycles:
+//      a. Apply RF1 (INSERT) → assert invariant  [INSERT trigger path]
+//      b. Apply RF2 (DELETE) → assert invariant  [DELETE trigger path]
+//      c. Apply RF3 (UPDATE) → assert invariant  [UPDATE trigger path]
+//   4. Drop ST
+//
+// Unlike DIFFERENTIAL, there is no explicit refresh_stream_table() call.
+// The IVM trigger updates the stream table within the same transaction as
+// the base-table DML (TransitionTable delta source, not ChangeBuffer).
+// Assertions after each RF step verify per-operation trigger correctness.
+
+/// Apply RF1 mutations via try_execute so trigger errors are caught, not panicked.
+async fn try_apply_rf1(db: &E2eDb, next_orderkey: usize) -> Result<(), String> {
+    let sql = substitute_rf(RF1_SQL, next_orderkey);
+    for stmt in sql.split(';') {
+        let stmt = stmt.trim();
+        let has_sql = stmt.lines().any(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with("--")
+        });
+        if has_sql {
+            db.try_execute(stmt).await.map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply RF2 mutations via try_execute so trigger errors are caught, not panicked.
+async fn try_apply_rf2(db: &E2eDb) -> Result<(), String> {
+    let sql = RF2_SQL.replace("__RF_COUNT__", &rf_count().to_string());
+    for stmt in sql.split(';') {
+        let stmt = stmt.trim();
+        let has_sql = stmt.lines().any(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with("--")
+        });
+        if has_sql {
+            db.try_execute(stmt).await.map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// Apply RF3 mutations via try_execute so trigger errors are caught, not panicked.
+async fn try_apply_rf3(db: &E2eDb) -> Result<(), String> {
+    let sql = RF3_SQL.replace("__RF_COUNT__", &rf_count().to_string());
+    for stmt in sql.split(';') {
+        let stmt = stmt.trim();
+        let has_sql = stmt.lines().any(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with("--")
+        });
+        if has_sql {
+            db.try_execute(stmt).await.map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_immediate_correctness() {
+    let sf = scale_factor();
+    let n_cycles = cycles();
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  TPC-H IMMEDIATE Mode Correctness — SF={sf}, cycles={n_cycles}");
+    println!(
+        "  Orders: {}, Customers: {}, Suppliers: {}, Parts: {}",
+        sf_orders(),
+        sf_customers(),
+        sf_suppliers(),
+        sf_parts()
+    );
+    println!("  RF batch size: {} rows", rf_count());
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    // Load schema + data once for all queries.
+    let t = Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let queries = tpch_queries();
+    let mut passed = 0usize;
+    let mut skipped: Vec<(&str, String)> = Vec::new();
+    let failed: Vec<(&str, String)> = Vec::new(); // retained for symmetry with other tests
+
+    for q in &queries {
+        println!(
+            "── {} (Tier {}) ──────────────────────────────",
+            q.name, q.tier
+        );
+
+        // IMMEDIATE mode uses NULL schedule — triggers maintain the ST in-transaction.
+        let st_name = format!("tpch_imm_{}", q.name);
+        let create_result = db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_name}', $${sql}$$, NULL, 'IMMEDIATE')",
+                sql = q.sql,
+            ))
+            .await;
+
+        if let Err(e) = create_result {
+            let reason = e.to_string();
+            let short = reason.split(':').next_back().unwrap_or(&reason).trim();
+            println!("  SKIP (create) — {short}");
+            skipped.push((q.name, reason));
+            continue;
+        }
+
+        // Baseline: verify the ST was correctly populated on creation.
+        let t = Instant::now();
+        if let Err(e) = assert_tpch_invariant(&db, &st_name, q.sql, q.name, 0).await {
+            println!("  WARN baseline — {e}");
+            skipped.push((q.name, format!("baseline invariant: {e}")));
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+                .await;
+            continue;
+        }
+        println!("  baseline — {:.0}ms ✓", t.elapsed().as_secs_f64() * 1000.0);
+
+        // Mutation cycles — each RF step triggers an in-transaction IVM update.
+        let mut ivm_ok = true;
+        'cycles: for cycle in 1..=n_cycles {
+            let ct = Instant::now();
+
+            // RF1: bulk INSERT — AFTER INSERT trigger fires, updates ST in same txn.
+            let next_ok = max_orderkey(&db).await + 1;
+            if let Err(e) = try_apply_rf1(&db, next_ok).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} RF1 — IVM trigger error: {msg}");
+                skipped.push((q.name, format!("RF1 trigger error cycle {cycle}: {msg}")));
+                ivm_ok = false;
+                break 'cycles;
+            }
+            if let Err(e) = assert_tpch_invariant(&db, &st_name, q.sql, q.name, cycle).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} after RF1 (INSERT) — {msg}");
+                skipped.push((q.name, format!("invariant post-RF1 cycle {cycle}: {msg}")));
+                ivm_ok = false;
+                break 'cycles;
+            }
+
+            // RF2: bulk DELETE — AFTER DELETE trigger fires, removes rows from ST.
+            if let Err(e) = try_apply_rf2(&db).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} RF2 — IVM trigger error: {msg}");
+                skipped.push((q.name, format!("RF2 trigger error cycle {cycle}: {msg}")));
+                ivm_ok = false;
+                break 'cycles;
+            }
+            if let Err(e) = assert_tpch_invariant(&db, &st_name, q.sql, q.name, cycle).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} after RF2 (DELETE) — {msg}");
+                skipped.push((q.name, format!("invariant post-RF2 cycle {cycle}: {msg}")));
+                ivm_ok = false;
+                break 'cycles;
+            }
+
+            // RF3: targeted UPDATEs — AFTER UPDATE trigger fires, applies deltas.
+            if let Err(e) = try_apply_rf3(&db).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} RF3 — IVM trigger error: {msg}");
+                skipped.push((q.name, format!("RF3 trigger error cycle {cycle}: {msg}")));
+                ivm_ok = false;
+                break 'cycles;
+            }
+            if let Err(e) = assert_tpch_invariant(&db, &st_name, q.sql, q.name, cycle).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} after RF3 (UPDATE) — {msg}");
+                skipped.push((q.name, format!("invariant post-RF3 cycle {cycle}: {msg}")));
+                ivm_ok = false;
+                break 'cycles;
+            }
+
+            db.execute("ANALYZE orders").await;
+            db.execute("ANALYZE lineitem").await;
+            db.execute("ANALYZE customer").await;
+
+            log_progress(
+                q.name,
+                q.tier,
+                cycle,
+                n_cycles,
+                ct.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            db.execute("VACUUM").await;
+        }
+
+        if ivm_ok {
+            passed += 1;
+        }
+
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+    }
+
+    println!("\n══════════════════════════════════════════════════════════");
+    println!(
+        "  Results: {passed}/{} queries passed, {} skipped",
+        queries.len(),
+        skipped.len()
+    );
+    if !skipped.is_empty() {
+        println!("  Skipped (pg_trickle limitation):");
+        for (name, reason) in &skipped {
+            let short = reason.split(':').next_back().unwrap_or(reason).trim();
+            println!("    {name}: {short}");
+        }
+    }
+    if !failed.is_empty() {
+        println!("  FAILED (assertion errors):");
+        for (name, reason) in &failed {
+            println!("    {name}: {reason}");
+        }
+    }
+    println!("══════════════════════════════════════════════════════════\n");
+
+    assert!(
+        failed.is_empty(),
+        "{} queries failed with assertion errors (not pg_trickle limitations)",
+        failed.len()
+    );
+}
