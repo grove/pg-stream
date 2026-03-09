@@ -9,7 +9,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-## [0.2.3]
+## [0.2.3] — 2026-03-09
 
 ### Added
 
