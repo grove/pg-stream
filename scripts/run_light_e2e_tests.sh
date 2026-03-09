@@ -8,6 +8,36 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILDER_IMAGE="pg_trickle_builder:pg18"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}"
 LIGHT_E2E_PACKAGE_DIR="${PROJECT_DIR}/target/light-e2e/pg_trickle-pg18"
+LIGHT_E2E_LABEL_TEST="com.pgtrickle.test=true"
+LIGHT_E2E_LABEL_SUITE="com.pgtrickle.suite=light-e2e"
+
+make_light_e2e_run_id() {
+    printf 'light-e2e-%s-%s' "$$" "$(date +%s)"
+}
+
+cleanup_light_e2e_containers() {
+    local status=$?
+    local ids
+
+    trap - EXIT INT TERM
+    set +e
+
+    if [[ -z "${PGT_LIGHT_E2E_RUN_ID:-}" ]]; then
+        exit "$status"
+    fi
+
+    ids="$(docker ps -aq \
+        --filter "label=${LIGHT_E2E_LABEL_TEST}" \
+        --filter "label=${LIGHT_E2E_LABEL_SUITE}" \
+        --filter "label=com.pgtrickle.run-id=${PGT_LIGHT_E2E_RUN_ID}")"
+
+    if [[ -n "$ids" ]]; then
+        echo "Cleaning up light-E2E containers for run ${PGT_LIGHT_E2E_RUN_ID}"
+        docker rm -fv $ids >/dev/null 2>&1 || true
+    fi
+
+    exit "$status"
+}
 
 # Curated allowlist for tests that run against the light harness.
 LIGHT_E2E_TESTS=(
@@ -273,6 +303,11 @@ printf '  %s\n' "${selected_tests[@]}"
 if [[ "$list_only" == true ]]; then
     exit 0
 fi
+
+export PGT_LIGHT_E2E_RUN_ID="${PGT_LIGHT_E2E_RUN_ID:-$(make_light_e2e_run_id)}"
+trap cleanup_light_e2e_containers EXIT INT TERM
+
+echo "Light-E2E run id: ${PGT_LIGHT_E2E_RUN_ID}"
 
 cargo_args=(--features light-e2e)
 for test_name in "${selected_tests[@]}"; do

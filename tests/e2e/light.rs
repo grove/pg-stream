@@ -111,8 +111,9 @@ async fn shared_container() -> &'static SharedContainer {
     SHARED_CONTAINER
         .get_or_init(|| async {
             let ext_dir = find_extension_dir();
+            let run_id = std::env::var("PGT_LIGHT_E2E_RUN_ID").ok();
 
-            let container = GenericImage::new("postgres", "18.1")
+            let mut image = GenericImage::new("postgres", "18.1")
                 .with_exposed_port(5432_u16.tcp())
                 .with_wait_for(WaitFor::message_on_stderr(
                     "database system is ready to accept connections",
@@ -120,12 +121,18 @@ async fn shared_container() -> &'static SharedContainer {
                 .with_env_var("POSTGRES_PASSWORD", "postgres")
                 .with_env_var("POSTGRES_DB", "postgres")
                 .with_mount(Mount::bind_mount(ext_dir, "/tmp/pg_ext"))
-                .start()
-                .await
-                .expect(
-                    "Failed to start shared light-e2e container.\n\
+                .with_label("com.pgtrickle.test", "true")
+                .with_label("com.pgtrickle.suite", "light-e2e")
+                .with_label("com.pgtrickle.repo", "pg-stream");
+
+            if let Some(run_id) = run_id {
+                image = image.with_label("com.pgtrickle.run-id", run_id);
+            }
+
+            let container = image.start().await.expect(
+                "Failed to start shared light-e2e container.\n\
                      Ensure Docker is running and postgres:18.1 is available.",
-                );
+            );
 
             container
                 .exec(ExecCommand::new(vec![
