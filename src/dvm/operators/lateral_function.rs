@@ -15,7 +15,7 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, col_list, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
-use crate::dvm::parser::OpTree;
+use crate::dvm::parser::{OpTree, lateral_function_output_columns};
 use crate::error::PgTrickleError;
 
 /// Differentiate a LateralFunction node via row-scoped recomputation.
@@ -52,11 +52,7 @@ pub fn diff_lateral_function(
     let outer_alias = child.alias().to_string();
 
     // SRF result column names
-    let srf_cols: Vec<String> = if column_aliases.is_empty() {
-        vec![alias.clone()]
-    } else {
-        column_aliases.clone()
-    };
+    let srf_cols = lateral_function_output_columns(func_sql, alias, column_aliases);
 
     let mut srf_cols_with_ord = srf_cols.clone();
     if *with_ordinality {
@@ -79,30 +75,12 @@ pub fn diff_lateral_function(
 
     // ── Build shared SRF components ────────────────────────────────────
 
-    // Build the SRF column references from the lateral alias.
-    // When column_aliases are explicitly provided (e.g. `AS e(key, value)`),
-    // reference them as `"e"."key"`, `"e"."value"`.
-    // When column_aliases are empty (e.g. `jsonb_array_elements(x) AS e`),
-    // the SRF result is a single value accessed by the unqualified alias
-    // name — just `"e"`, not `"e"."e"`.
-    let srf_col_refs: Vec<String> = if column_aliases.is_empty() {
-        // Single-column SRF with no explicit column aliases.
-        // Use unqualified alias name; ordinality still gets table-qualified.
-        let mut refs = vec![quote_ident(alias)];
-        if *with_ordinality {
-            refs.push(format!(
-                "{}.{}",
-                quote_ident(alias),
-                quote_ident("ordinality")
-            ));
-        }
-        refs
-    } else {
-        srf_cols_with_ord
-            .iter()
-            .map(|c| format!("{}.{}", quote_ident(alias), quote_ident(c)))
-            .collect()
-    };
+    // Always name the SRF output columns explicitly so upstream operators can
+    // resolve references like `e.value` and `kv.key` against the delta CTE.
+    let srf_col_refs: Vec<String> = srf_cols_with_ord
+        .iter()
+        .map(|c| format!("{}.{}", quote_ident(alias), quote_ident(c)))
+        .collect();
     let srf_col_refs_str = srf_col_refs.join(", ");
 
     let outer_alias_q = quote_ident(&outer_alias);
@@ -113,26 +91,15 @@ pub fn diff_lateral_function(
     let child_col_refs_str = child_col_refs.join(", ");
 
     // Build hash expression for the row ID: hash all output columns.
-    // Same rule: use unqualified alias for single-col SRFs, qualified for multi-col.
     let hash_exprs: Vec<String> = child_cols
         .iter()
         .map(|c| format!("{outer_alias_q}.{}::TEXT", quote_ident(c)))
-        .chain(if column_aliases.is_empty() {
-            let mut exprs = vec![format!("{}::TEXT", quote_ident(alias))];
-            if *with_ordinality {
-                exprs.push(format!(
-                    "{}.{}::TEXT",
-                    quote_ident(alias),
-                    quote_ident("ordinality")
-                ));
-            }
-            exprs
-        } else {
+        .chain(
             srf_cols_with_ord
                 .iter()
                 .map(|c| format!("{}.{}::TEXT", quote_ident(alias), quote_ident(c)))
-                .collect()
-        })
+                .collect::<Vec<_>>(),
+        )
         .collect();
     let row_id_expr = build_hash_expr(&hash_exprs);
 
@@ -143,19 +110,15 @@ pub fn diff_lateral_function(
         ""
     };
 
-    let srf_alias_clause = if column_aliases.is_empty() {
-        format!("{}{ordinality_clause}", quote_ident(alias))
-    } else {
-        let col_alias_list = srf_cols_with_ord
-            .iter()
-            .map(|c| quote_ident(c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{}{ordinality_clause} ({col_alias_list})",
-            quote_ident(alias),
-        )
-    };
+    let col_alias_list = srf_cols_with_ord
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let srf_alias_clause = format!(
+        "{}{ordinality_clause} ({col_alias_list})",
+        quote_ident(alias),
+    );
 
     // ── CTE 2: Re-expand SRF for deleted/updated source rows (DELETE) ──
     // Instead of reading from the stream table (which may not have
@@ -308,6 +271,32 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_lateral_function_infers_jsonb_each_columns() {
+        let mut ctx = test_ctx_with_st("public", "st");
+        let child = scan(1, "t", "public", "t", &["id", "props"]);
+        let tree = lateral_func("jsonb_each(t.props)", "kv", vec![], false, child);
+        let result = diff_lateral_function(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        assert!(result.columns.contains(&"key".to_string()));
+        assert!(result.columns.contains(&"value".to_string()));
+        assert_sql_contains(&sql, "AS \"kv\" (\"key\", \"value\")");
+    }
+
+    #[test]
+    fn test_diff_lateral_function_infers_jsonb_array_value_column() {
+        let mut ctx = test_ctx_with_st("public", "st");
+        let child = scan(1, "t", "public", "t", &["id", "data"]);
+        let tree = lateral_func("jsonb_array_elements(t.data)", "e", vec![], false, child);
+        let result = diff_lateral_function(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        assert!(result.columns.contains(&"value".to_string()));
+        assert!(!result.columns.contains(&"e".to_string()));
+        assert_sql_contains(&sql, "AS \"e\" (\"value\")");
+    }
+
+    #[test]
     fn test_diff_lateral_function_old_rows_reexpands_with_delete_action() {
         let mut ctx = test_ctx_with_st("public", "my_st");
         let child = scan(1, "parent", "public", "p", &["id", "data"]);
@@ -422,6 +411,20 @@ mod tests {
         let child = scan(1, "t", "public", "t", &["id", "tags"]);
         let tree = lateral_func("unnest(t.tags)", "tag", vec![], false, child);
         assert_eq!(tree.output_columns(), vec!["id", "tags", "tag"]);
+    }
+
+    #[test]
+    fn test_lateral_function_output_columns_infer_jsonb_each_defaults() {
+        let child = scan(1, "t", "public", "t", &["id", "props"]);
+        let tree = lateral_func("jsonb_each(t.props)", "kv", vec![], false, child);
+        assert_eq!(tree.output_columns(), vec!["id", "props", "key", "value"]);
+    }
+
+    #[test]
+    fn test_lateral_function_output_columns_infer_jsonb_array_defaults() {
+        let child = scan(1, "t", "public", "t", &["id", "data"]);
+        let tree = lateral_func("jsonb_array_elements(t.data)", "e", vec![], false, child);
+        assert_eq!(tree.output_columns(), vec!["id", "data", "value"]);
     }
 
     #[test]

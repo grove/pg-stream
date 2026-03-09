@@ -157,16 +157,32 @@ pub fn diff_recursive_cte(
     let has_deletes = check_for_delete_changes(ctx, &source_oids)?;
 
     if has_deletes {
-        // Mixed INSERT/DELETE/UPDATE changes → DRed algorithm.
-        generate_dred_delta(
-            ctx,
-            alias,
-            columns,
-            &base_delta,
-            base,
-            recursive,
-            *union_all,
-        )
+        // Deferred DIFFERENTIAL refreshes read mixed changes from the WAL-backed
+        // change buffer. Recursive inserts from non-base rows are handled
+        // incrementally, but recursive DELETE/UPDATE propagation in that mode is
+        // still not complete for derived-column changes (for example path rebuilds
+        // under a renamed ancestor). Fall back to recomputation for correctness.
+        if matches!(
+            ctx.delta_source,
+            crate::dvm::diff::DeltaSource::ChangeBuffer
+        ) {
+            pgrx::info!(
+                "Recursive CTE \"{}\" has mixed deferred changes; using recomputation strategy for correctness.",
+                alias,
+            );
+            generate_recomputation_delta(ctx, alias, columns, base, recursive, *union_all)
+        } else {
+            // Mixed INSERT/DELETE/UPDATE changes → DRed algorithm.
+            generate_dred_delta(
+                ctx,
+                alias,
+                columns,
+                &base_delta,
+                base,
+                recursive,
+                *union_all,
+            )
+        }
     } else {
         // INSERT-only changes → semi-naive propagation.
         generate_semi_naive_delta(ctx, alias, columns, &base_delta, recursive, *union_all)
@@ -307,10 +323,19 @@ fn generate_recomputation_delta(
     // When using the defining query, the recomputed CTE only has
     // the outer-projection columns. Some CTE columns (like parent_id)
     // may not exist in the recomputed result. Use sub.* to be safe.
+    //
+    // The __pgt_row_id must use the same hash formula as the initial
+    // populate (content-hash of output columns) so that the anti-join
+    // against the ST correctly identifies unchanged rows.
+    let hash_exprs: Vec<String> = out_cols
+        .iter()
+        .map(|c| format!("sub.{}::TEXT", quote_ident(c)))
+        .collect();
+    let row_id_hash = crate::dvm::operators::scan::build_hash_expr(&hash_exprs);
+
     let recomp_cte = ctx.next_cte_name(&format!("rc_recomp_{alias}"));
     let recomp_sql = format!(
-        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
-               row_number() OVER ()::text) AS __pgt_row_id, sub.*\n\
+        "SELECT {row_id_hash} AS __pgt_row_id, sub.*\n\
          FROM ({recomp_inner_sql}) sub",
     );
     ctx.add_cte(recomp_cte.clone(), recomp_sql);
@@ -466,10 +491,20 @@ fn generate_dred_delta(
     // by matching the recursive term's join condition against storage.
 
     let del_seed_cte = ctx.next_cte_name(&format!("dred_dseed_{alias}"));
-    let del_seed_sql = format!(
-        "SELECT {col_list_str} FROM {base_cte} WHERE __pgt_action = 'D'",
-        base_cte = base_delta.cte_name,
-    );
+    let recursive_del_seed = generate_old_seed_from_existing(ctx, recursive, &st_table, columns)?;
+    let del_seed_sql = if let Some(recursive_seed) = recursive_del_seed {
+        format!(
+            "SELECT {col_list_str} FROM {base_cte} WHERE __pgt_action = 'D'\n\
+             UNION ALL\n\
+             {recursive_seed}",
+            base_cte = base_delta.cte_name,
+        )
+    } else {
+        format!(
+            "SELECT {col_list_str} FROM {base_cte} WHERE __pgt_action = 'D'",
+            base_cte = base_delta.cte_name,
+        )
+    };
     ctx.add_cte(del_seed_cte.clone(), del_seed_sql);
 
     // Build the over-deletion cascade.
@@ -535,7 +570,7 @@ fn generate_dred_delta(
     let del_final_cte = ctx.next_cte_name(&format!("dred_dfin_{alias}"));
     let del_match_cols = columns
         .iter()
-        .map(|c| format!("d.{col} = s.{col}", col = quote_ident(c)))
+        .map(|c| format!("d.{col} IS NOT DISTINCT FROM s.{col}", col = quote_ident(c)))
         .collect::<Vec<_>>()
         .join(" AND ");
     let del_final_sql = format!(
@@ -652,10 +687,16 @@ fn generate_semi_naive_ins_only(
 
     // Wrap with __pgt_row_id and __pgt_action = 'I'.
     // Explicitly select only user columns so __pgt_depth is excluded.
+    // Use content-hash of output columns matching the initial populate.
+    let dred_hash_exprs: Vec<String> = columns
+        .iter()
+        .map(|c| format!("sub.{}::TEXT", quote_ident(c)))
+        .collect();
+    let dred_row_id_hash = crate::dvm::operators::scan::build_hash_expr(&dred_hash_exprs);
+
     let ins_final_cte = ctx.next_cte_name(&format!("dred_ifin_{alias}"));
     let ins_final_sql = format!(
-        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
-                row_number() OVER ()::text) AS __pgt_row_id,\n\
+        "SELECT {dred_row_id_hash} AS __pgt_row_id,\n\
                'I'::text AS __pgt_action,\n\
                {col_list_str}\n\
          FROM {delta_cte} sub",
@@ -1086,10 +1127,16 @@ fn build_semi_naive_result(
     // Wrap with __pgt_row_id and __pgt_action.
     // The final SELECT explicitly picks only the user columns from delta_cte,
     // dropping the hidden __pgt_depth counter column when it is present.
+    // Use content-hash of output columns matching the initial populate.
+    let sn_hash_exprs: Vec<String> = columns
+        .iter()
+        .map(|c| format!("sub.{}::TEXT", quote_ident(c)))
+        .collect();
+    let sn_row_id_hash = crate::dvm::operators::scan::build_hash_expr(&sn_hash_exprs);
+
     let final_cte_name = ctx.next_cte_name(&format!("rc_final_{alias}"));
     let final_sql = format!(
-        "SELECT pgtrickle.pg_trickle_hash(row_to_json(sub)::text || '/' || \
-                row_number() OVER ()::text) AS __pgt_row_id,\n\
+        "SELECT {sn_row_id_hash} AS __pgt_row_id,\n\
                'I'::text AS __pgt_action,\n\
                {col_list_str}\n\
          FROM {delta_cte} sub",
@@ -1122,6 +1169,26 @@ fn generate_seed_from_existing(
     // by the existing ST storage table, and base table scans replaced
     // by their change buffer deltas (INSERT rows only).
     let sql = generate_query_sql_with_change_buffers(ctx, recursive, st_table)?;
+
+    match sql {
+        Some(s) => Ok(Some(s)),
+        None => Ok(None),
+    }
+}
+
+/// Generate the seed SQL for old/deleted rows joining existing ST storage.
+///
+/// This is the DRed counterpart to `generate_seed_from_existing()`: it reads
+/// DELETE rows and OLD values from UPDATEs in the recursive term's base-table
+/// scans, joins them against existing ST storage, and produces the directly
+/// affected old recursive rows that must seed the over-deletion cascade.
+fn generate_old_seed_from_existing(
+    ctx: &DiffContext,
+    recursive: &OpTree,
+    st_table: &str,
+    _columns: &[String],
+) -> Result<Option<String>, PgTrickleError> {
+    let sql = generate_query_sql_with_old_change_buffers(ctx, recursive, st_table)?;
 
     match sql {
         Some(s) => Ok(Some(s)),
@@ -1385,7 +1452,7 @@ fn generate_query_sql_with_change_buffers(
             // The recursive term is typically a JOIN between a base table
             // scan and the self-reference. We need to:
             // - Replace self-ref with st_table (existing storage)
-            // - Replace base table with change buffer (INSERT rows only)
+            // - Replace base table with change buffer (INSERT + UPDATE new rows)
             let left_from = generate_change_buffer_from(ctx, left, st_table)?;
             let right_from = generate_change_buffer_from(ctx, right, st_table)?;
 
@@ -1476,12 +1543,115 @@ fn generate_query_sql_with_change_buffers(
     }
 }
 
-/// Generate a FROM-clause fragment that reads INSERT-only rows from the
+/// Generate the recursive term SQL with self-ref replaced by `st_table`
+/// (existing storage) and base table scans reading from OLD change rows.
+/// Used by the DRed over-delete seed to find old recursive rows affected by
+/// DELETEs and UPDATEs in recursive-term source tables.
+fn generate_query_sql_with_old_change_buffers(
+    ctx: &DiffContext,
+    op: &OpTree,
+    st_table: &str,
+) -> Result<Option<String>, PgTrickleError> {
+    match op {
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_old_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_old_change_buffer_from(ctx, right, st_table)?;
+
+            let mut all_cols = Vec::new();
+            collect_select_cols(left, &mut all_cols);
+            collect_select_cols(right, &mut all_cols);
+
+            Ok(Some(format!(
+                "SELECT {cols}\nFROM {left_from}\nJOIN {right_from}\n  ON {cond}",
+                cols = all_cols.join(", "),
+                cond = condition.to_sql(),
+            )))
+        }
+
+        OpTree::Project {
+            expressions,
+            aliases,
+            child,
+        } => {
+            let proj_exprs: Vec<String> = expressions
+                .iter()
+                .zip(aliases.iter())
+                .map(|(e, a)| {
+                    let esql = e.to_sql();
+                    if esql == *a {
+                        quote_ident(a)
+                    } else {
+                        format!("{esql} AS {}", quote_ident(a))
+                    }
+                })
+                .collect();
+
+            match child.as_ref() {
+                OpTree::InnerJoin {
+                    condition,
+                    left,
+                    right,
+                } => {
+                    let left_from = generate_old_change_buffer_from(ctx, left, st_table)?;
+                    let right_from = generate_old_change_buffer_from(ctx, right, st_table)?;
+                    Ok(Some(format!(
+                        "SELECT {projs}\nFROM {left_from}\nJOIN {right_from}\n  ON {cond}",
+                        projs = proj_exprs.join(", "),
+                        cond = condition.to_sql(),
+                    )))
+                }
+                OpTree::LeftJoin {
+                    condition,
+                    left,
+                    right,
+                } => {
+                    let left_from = generate_old_change_buffer_from(ctx, left, st_table)?;
+                    let right_from = generate_old_change_buffer_from(ctx, right, st_table)?;
+                    Ok(Some(format!(
+                        "SELECT {projs}\nFROM {left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                        projs = proj_exprs.join(", "),
+                        cond = condition.to_sql(),
+                    )))
+                }
+                _ => {
+                    let child_sql =
+                        generate_query_sql_with_old_change_buffers(ctx, child, st_table)?;
+                    match child_sql {
+                        Some(inner) => Ok(Some(format!(
+                            "SELECT {projs}\nFROM (\n{inner}\n) __p",
+                            projs = proj_exprs.join(", "),
+                        ))),
+                        None => Ok(None),
+                    }
+                }
+            }
+        }
+
+        OpTree::Filter { predicate, child } => {
+            let child_sql = generate_query_sql_with_old_change_buffers(ctx, child, st_table)?;
+            match child_sql {
+                Some(inner) => Ok(Some(format!(
+                    "SELECT * FROM (\n{inner}\n) __f\nWHERE {pred}",
+                    pred = predicate.to_sql(),
+                ))),
+                None => Ok(None),
+            }
+        }
+
+        _ => Ok(None),
+    }
+}
+
+/// Generate a FROM-clause fragment that reads inserted/updated NEW rows from the
 /// appropriate source for Scan nodes, or references st_table for
 /// RecursiveSelfRef.
 ///
-/// In DIFFERENTIAL mode, reads INSERT rows from the change buffer table
-/// (filtering by action = 'I' and LSN range).
+/// In DIFFERENTIAL mode, reads INSERT rows and UPDATE NEW rows from the change
+/// buffer table (filtering by `action IN ('I', 'U')` and LSN range).
 ///
 /// In IMMEDIATE mode, reads from the NEW transition table
 /// (`__pgt_newtable_<oid>`), which has the same schema as the source
@@ -1536,7 +1706,7 @@ fn generate_change_buffer_from(
                 ));
             }
 
-            // ── DIFFERENTIAL mode: read INSERT rows from change buffer ──
+            // ── DIFFERENTIAL mode: read INSERT + UPDATE NEW rows ─────────
             let change_table = format!(
                 "{}.changes_{}",
                 quote_ident(&ctx.change_buffer_schema),
@@ -1560,7 +1730,7 @@ fn generate_change_buffer_from(
 
             Ok(format!(
                 "(SELECT {cols} FROM {change_table} c \
-                 WHERE c.action = 'I' AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
+                 WHERE c.action IN ('I', 'U') AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
                 cols = col_refs.join(", "),
                 alias_q = quote_ident(alias),
             ))
@@ -1576,6 +1746,93 @@ fn generate_change_buffer_from(
 
         _ => {
             // For other node types, fall back to normal SQL generation
+            let sql = generate_query_sql(op, Some(st_table))?;
+            Ok(format!("(\n{sql}\n) AS __sub"))
+        }
+    }
+}
+
+/// Generate a FROM-clause fragment that reads deleted/updated OLD rows from
+/// the appropriate source for Scan nodes, or references st_table for
+/// RecursiveSelfRef.
+fn generate_old_change_buffer_from(
+    ctx: &DiffContext,
+    op: &OpTree,
+    st_table: &str,
+) -> Result<String, PgTrickleError> {
+    use crate::dvm::diff::DeltaSource;
+
+    match op {
+        OpTree::Scan {
+            table_oid,
+            alias,
+            columns,
+            ..
+        } => {
+            if let DeltaSource::TransitionTable { tables } = &ctx.delta_source {
+                if let Some(tt) = tables.get(table_oid)
+                    && let Some(old_table) = &tt.old_name
+                {
+                    let col_refs: Vec<String> = columns
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "{alias_q}.{}",
+                                quote_ident(&c.name),
+                                alias_q = quote_ident(alias),
+                            )
+                        })
+                        .collect();
+                    return Ok(format!(
+                        "(SELECT {cols} FROM {old_table} AS {alias_q}) AS {alias_q}",
+                        cols = col_refs.join(", "),
+                        alias_q = quote_ident(alias),
+                    ));
+                }
+
+                let col_refs: Vec<String> = columns
+                    .iter()
+                    .map(|c| format!("NULL::text AS {}", quote_ident(&c.name)))
+                    .collect();
+                let alias_q = quote_ident(alias);
+                return Ok(format!(
+                    "(SELECT {cols} WHERE false) AS {alias_q}",
+                    cols = col_refs.join(", "),
+                ));
+            }
+
+            let change_table = format!(
+                "{}.changes_{}",
+                quote_ident(&ctx.change_buffer_schema),
+                table_oid,
+            );
+            let prev_lsn = ctx.get_prev_lsn(*table_oid);
+
+            let col_refs: Vec<String> = columns
+                .iter()
+                .map(|c| {
+                    format!(
+                        "c.{} AS {}",
+                        quote_ident(&format!("old_{}", c.name)),
+                        quote_ident(&c.name),
+                    )
+                })
+                .collect();
+
+            Ok(format!(
+                "(SELECT {cols} FROM {change_table} c \
+                 WHERE c.action IN ('D', 'U') AND c.lsn > '{prev_lsn}'::pg_lsn) AS {alias_q}",
+                cols = col_refs.join(", "),
+                alias_q = quote_ident(alias),
+            ))
+        }
+
+        OpTree::RecursiveSelfRef { alias, .. } => Ok(format!(
+            "{st_table} AS {alias_q}",
+            alias_q = quote_ident(alias),
+        )),
+
+        _ => {
             let sql = generate_query_sql(op, Some(st_table))?;
             Ok(format!("(\n{sql}\n) AS __sub"))
         }
@@ -3071,6 +3328,79 @@ mod tests {
             !sql.contains("__p"),
             "Should NOT wrap in __p subquery (inlined)"
         );
+    }
+
+    #[test]
+    fn test_generate_change_buffer_from_includes_update_new_rows() {
+        let scan = make_scan(100, "nodes", "public", "n", &["id", "parent_id", "name"]);
+        let ctx = test_ctx();
+
+        let sql = generate_change_buffer_from(&ctx, &scan, "\"public\".\"st\"").unwrap();
+
+        assert!(
+            sql.contains("c.action IN ('I', 'U')"),
+            "Recursive insert seed should treat UPDATE new rows like inserts"
+        );
+        assert!(sql.contains("c.\"new_name\" AS \"name\""));
+    }
+
+    #[test]
+    fn test_generate_old_change_buffer_from_includes_update_old_rows() {
+        let scan = make_scan(100, "nodes", "public", "n", &["id", "parent_id", "name"]);
+        let ctx = test_ctx();
+
+        let sql = generate_old_change_buffer_from(&ctx, &scan, "\"public\".\"st\"").unwrap();
+
+        assert!(
+            sql.contains("c.action IN ('D', 'U')"),
+            "Recursive delete seed should read DELETEs and UPDATE old rows"
+        );
+        assert!(sql.contains("c.\"old_name\" AS \"name\""));
+    }
+
+    #[test]
+    fn test_old_change_buffer_project_over_join_inlines() {
+        let scan = make_scan(100, "nodes", "public", "n", &["id", "parent_id", "label"]);
+        let self_ref = make_self_ref("tree", "t", &["id", "parent_id", "label"]);
+        let join = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "parent_id".to_string(),
+                }),
+                right: Box::new(Expr::ColumnRef {
+                    table_alias: Some("t".to_string()),
+                    column_name: "id".to_string(),
+                }),
+            },
+            left: Box::new(scan),
+            right: Box::new(self_ref),
+        };
+        let project = OpTree::Project {
+            expressions: vec![
+                Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "id".to_string(),
+                },
+                Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "label".to_string(),
+                },
+            ],
+            aliases: vec!["id".to_string(), "label".to_string()],
+            child: Box::new(join),
+        };
+
+        let ctx = test_ctx();
+        let sql = generate_query_sql_with_old_change_buffers(&ctx, &project, "\"public\".\"st\"")
+            .unwrap()
+            .expect("Should produce SQL for old-row Project-over-InnerJoin");
+
+        assert!(sql.contains("c.\"old_label\" AS \"label\""));
+        assert!(sql.contains("\"public\".\"st\" AS \"t\""));
+        assert!(sql.contains("JOIN"));
+        assert!(!sql.contains("__p"));
     }
 
     // ── Strategy selection: column matching ──────────────────────────

@@ -153,6 +153,13 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             Some(format!("{l} FULL JOIN {r} ON {}", condition.to_sql()))
         }
         OpTree::Project { child, .. } => child_to_from_sql(child),
+        OpTree::CteScan { alias, .. } => {
+            // CTE scans behave like simple named sources in downstream
+            // differential SQL. Use their visible alias so filters and joins
+            // above them can resolve references positionally against the
+            // current-query reconstruction.
+            Some(quote_ident(alias))
+        }
         OpTree::Subquery {
             child,
             alias,
@@ -335,6 +342,10 @@ pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
 /// Only COUNT, COUNT_STAR, and SUM are algebraically invertible.
 /// MIN/MAX/AVG and group-rescan aggregates require a full rescan of old data.
 fn is_algebraically_invertible(agg: &AggExpr) -> bool {
+    if agg.is_distinct {
+        return false;
+    }
+
     matches!(
         agg.function,
         AggFunc::CountStar | AggFunc::Count | AggFunc::Sum
@@ -791,7 +802,9 @@ fn build_rescan_cte(
     let rescan_aggs: Vec<&AggExpr> = aggregates
         .iter()
         .filter(|a| {
-            a.function.is_group_rescan() || matches!(a.function, AggFunc::Min | AggFunc::Max)
+            a.is_distinct
+                || a.function.is_group_rescan()
+                || matches!(a.function, AggFunc::Min | AggFunc::Max)
         })
         .collect();
     if rescan_aggs.is_empty() {
@@ -1108,6 +1121,10 @@ WHERE c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn
 ///
 /// References VALUES alias columns `v."val_{col}"` and `v.side`.
 fn direct_agg_delta_exprs(agg: &AggExpr) -> (String, String) {
+    if agg.is_distinct {
+        unreachable!("P5 bypass does not support DISTINCT aggregates")
+    }
+
     match &agg.function {
         AggFunc::CountStar => (
             "SUM(CASE WHEN v.side = 'I' THEN 1 ELSE 0 END)::bigint".to_string(),
@@ -1503,7 +1520,7 @@ END AS __pgt_meta_action"
     let mut change_checks = vec!["m.new_count IS DISTINCT FROM m.old_count".to_string()];
     for agg in aggregates {
         change_checks.push(format!(
-            "m.{new} IS DISTINCT FROM m.{old}",
+            "m.{new}::text IS DISTINCT FROM m.{old}::text",
             new = quote_ident(&format!("new_{}", agg.alias)),
             old = quote_ident(&format!("old_{}", agg.alias)),
         ));
@@ -1539,6 +1556,13 @@ WHERE m.__pgt_meta_action IN ('I', 'D')
 /// AND guard in all CASE WHEN expressions, so only rows passing the filter
 /// contribute to the aggregate delta.
 fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
+    if agg.is_distinct {
+        return (
+            "SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE 0 END)".to_string(),
+            "SUM(CASE WHEN __pgt_action = 'D' THEN 1 ELSE 0 END)".to_string(),
+        );
+    }
+
     let filter_sql = agg
         .filter
         .as_ref()
@@ -1626,6 +1650,25 @@ fn agg_merge_expr_mapped(agg: &AggExpr, has_rescan: bool, st_col: &str) -> Strin
     let alias = &agg.alias;
     let qt = quote_ident(st_col);
     let r_qt = quote_ident(alias);
+
+    if agg.is_distinct {
+        let ins = quote_ident(&format!("__ins_{alias}"));
+        let del = quote_ident(&format!("__del_{alias}"));
+        if has_rescan {
+            return format!(
+                "CASE WHEN COALESCE(d.{ins}, 0) > 0 OR COALESCE(d.{del}, 0) > 0 \
+                 THEN r.{r_qt} \
+                 ELSE st.{qt} END"
+            );
+        }
+
+        return format!(
+            "CASE WHEN COALESCE(d.{ins}, 0) > 0 OR COALESCE(d.{del}, 0) > 0 \
+             THEN NULL \
+             ELSE st.{qt} END"
+        );
+    }
+
     match &agg.function {
         AggFunc::CountStar | AggFunc::Count => {
             format!(
@@ -1908,6 +1951,23 @@ mod tests {
         let (ins, del) = agg_delta_exprs(&agg, &child_cols);
         assert!(ins.contains("IS NOT NULL"));
         assert!(del.contains("IS NOT NULL"));
+    }
+
+    #[test]
+    fn test_agg_delta_exprs_count_distinct_uses_change_sentinel() {
+        let agg = AggExpr {
+            function: AggFunc::Count,
+            argument: Some(colref("name")),
+            alias: "uniq".to_string(),
+            is_distinct: true,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        };
+        let child_cols = vec!["name".to_string()];
+        let (ins, del) = agg_delta_exprs(&agg, &child_cols);
+        assert_eq!(ins, "SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE 0 END)");
+        assert_eq!(del, "SUM(CASE WHEN __pgt_action = 'D' THEN 1 ELSE 0 END)");
     }
 
     // ── agg_merge_expr tests ────────────────────────────────────────

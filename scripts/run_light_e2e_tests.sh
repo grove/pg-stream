@@ -5,6 +5,47 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUILDER_IMAGE="pg_trickle_builder:pg18"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}"
+LIGHT_E2E_PACKAGE_DIR="${PROJECT_DIR}/target/light-e2e/pg_trickle-pg18"
+LIGHT_E2E_LABEL_TEST="com.pgtrickle.test=true"
+LIGHT_E2E_LABEL_SUITE="com.pgtrickle.suite=light-e2e"
+
+is_valid_light_e2e_package_dir() {
+    local dir="$1"
+
+    [[ -n "$dir" ]] || return 1
+    [[ -f "$dir/usr/share/postgresql/18/extension/pg_trickle.control" ]] || return 1
+    [[ -f "$dir/usr/lib/postgresql/18/lib/pg_trickle.so" ]] || return 1
+}
+
+make_light_e2e_run_id() {
+    printf 'light-e2e-%s-%s' "$$" "$(date +%s)"
+}
+
+cleanup_light_e2e_containers() {
+    local status=$?
+    local ids
+
+    trap - EXIT INT TERM
+    set +e
+
+    if [[ -z "${PGT_LIGHT_E2E_RUN_ID:-}" ]]; then
+        exit "$status"
+    fi
+
+    ids="$(docker ps -aq \
+        --filter "label=${LIGHT_E2E_LABEL_TEST}" \
+        --filter "label=${LIGHT_E2E_LABEL_SUITE}" \
+        --filter "label=com.pgtrickle.run-id=${PGT_LIGHT_E2E_RUN_ID}")"
+
+    if [[ -n "$ids" ]]; then
+        echo "Cleaning up light-E2E containers for run ${PGT_LIGHT_E2E_RUN_ID}"
+        docker rm -fv $ids >/dev/null 2>&1 || true
+    fi
+
+    exit "$status"
+}
 
 # Curated allowlist for tests that run against the light harness.
 LIGHT_E2E_TESTS=(
@@ -101,12 +142,81 @@ resolve_pg_config() {
     exit 1
 }
 
+ensure_builder_image() {
+    local builder_platform
+    builder_platform="$(docker image inspect "${BUILDER_IMAGE}" --format='{{.Os}}/{{.Architecture}}' 2>/dev/null || echo "")"
+
+    if [[ "$builder_platform" == "$DOCKER_PLATFORM" ]]; then
+        echo "  Builder image present (${builder_platform}): ${BUILDER_IMAGE}"
+        return
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [[ -z "$builder_platform" ]]; then
+        echo "  Builder image not found: ${BUILDER_IMAGE}"
+    else
+        echo "  Builder image platform mismatch: got ${builder_platform}, need ${DOCKER_PLATFORM}"
+    fi
+    echo "  Building it now for Light E2E packaging …"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    docker build \
+        -t "${BUILDER_IMAGE}" \
+        -f "${PROJECT_DIR}/tests/Dockerfile.builder" \
+        "${PROJECT_DIR}"
+}
+
+package_extension_in_builder() {
+    local package_parent archive_path
+    package_parent="$(dirname "${LIGHT_E2E_PACKAGE_DIR}")"
+    archive_path="${package_parent}/pg_trickle-pg18.tar"
+
+    ensure_builder_image
+
+    mkdir -p "$package_parent"
+    rm -rf "$LIGHT_E2E_PACKAGE_DIR" "$archive_path"
+
+    echo "Packaging Linux extension artifacts in builder image: ${BUILDER_IMAGE}"
+    docker run --rm \
+        -v "${PROJECT_DIR}:/build" \
+        -w /build \
+        "${BUILDER_IMAGE}" \
+        bash -lc 'set -euo pipefail
+            export CARGO_TARGET_DIR=/tmp/pgt-light-target
+            cargo pgrx package --pg-config /usr/bin/pg_config >/tmp/pgt-light-e2e-package.log
+            tar -C /tmp/pgt-light-target/release -cf - pg_trickle-pg18' > "$archive_path"
+
+    tar -xf "$archive_path" -C "$package_parent"
+    rm -f "$archive_path"
+    export PGT_EXTENSION_DIR="$LIGHT_E2E_PACKAGE_DIR"
+}
+
 package_extension() {
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        package_extension_in_builder
+        return
+    fi
+
     local pg_config_path
     pg_config_path="$(resolve_pg_config)"
 
     echo "Packaging extension with pg_config: $pg_config_path"
     cargo pgrx package --pg-config "$pg_config_path"
+    export PGT_EXTENSION_DIR="${PROJECT_DIR}/target/release/pg_trickle-pg18"
+}
+
+set_existing_extension_dir() {
+    if is_valid_light_e2e_package_dir "${PGT_EXTENSION_DIR:-}"; then
+        return
+    fi
+
+    if is_valid_light_e2e_package_dir "${LIGHT_E2E_PACKAGE_DIR}"; then
+        export PGT_EXTENSION_DIR="${LIGHT_E2E_PACKAGE_DIR}"
+        return
+    fi
+
+    if is_valid_light_e2e_package_dir "${PROJECT_DIR}/target/release/pg_trickle-pg18"; then
+        export PGT_EXTENSION_DIR="${PROJECT_DIR}/target/release/pg_trickle-pg18"
+    fi
 }
 
 validate_positive_integer() {
@@ -189,6 +299,13 @@ if [[ "$package_before_run" == true ]]; then
     package_extension
 fi
 
+set_existing_extension_dir
+
+if [[ "$package_before_run" != true ]] && ! is_valid_light_e2e_package_dir "${PGT_EXTENSION_DIR:-}"; then
+    echo "No valid Linux light-E2E package found; packaging extension artifacts now"
+    package_extension
+fi
+
 if [[ "$package_only" == true ]]; then
     exit 0
 fi
@@ -199,6 +316,11 @@ printf '  %s\n' "${selected_tests[@]}"
 if [[ "$list_only" == true ]]; then
     exit 0
 fi
+
+export PGT_LIGHT_E2E_RUN_ID="${PGT_LIGHT_E2E_RUN_ID:-$(make_light_e2e_run_id)}"
+trap cleanup_light_e2e_containers EXIT INT TERM
+
+echo "Light-E2E run id: ${PGT_LIGHT_E2E_RUN_ID}"
 
 cargo_args=(--features light-e2e)
 for test_name in "${selected_tests[@]}"; do

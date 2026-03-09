@@ -239,6 +239,48 @@ pub enum AggFunc {
     ComplexExpression(String),
 }
 
+/// Determine the effective output column names for a LATERAL SRF.
+///
+/// When the query provides `AS alias(c1, c2, ...)`, those names win.
+/// Otherwise we infer PostgreSQL's default names for common built-ins that
+/// expose structured results through field references like `e.value` or
+/// `kv.key` / `kv.value`. For everything else we preserve the existing
+/// fallback of using the table alias as the single column name.
+pub fn lateral_function_output_columns(
+    func_sql: &str,
+    alias: &str,
+    column_aliases: &[String],
+) -> Vec<String> {
+    if !column_aliases.is_empty() {
+        return column_aliases.to_vec();
+    }
+
+    infer_default_lateral_function_columns(func_sql).unwrap_or_else(|| vec![alias.to_string()])
+}
+
+fn infer_default_lateral_function_columns(func_sql: &str) -> Option<Vec<String>> {
+    let open_paren = func_sql.find('(')?;
+    let func_head = func_sql[..open_paren].trim();
+    let func_name = func_head
+        .rsplit('.')
+        .next()
+        .unwrap_or(func_head)
+        .replace('"', "")
+        .to_ascii_lowercase();
+
+    match func_name.as_str() {
+        "json_each" | "json_each_text" | "jsonb_each" | "jsonb_each_text" => {
+            Some(vec!["key".to_string(), "value".to_string()])
+        }
+        "json_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements"
+        | "jsonb_array_elements_text" => Some(vec!["value".to_string()]),
+        "json_object_keys" | "jsonb_object_keys" => Some(vec!["key".to_string()]),
+        _ => None,
+    }
+}
+
 impl AggFunc {
     /// Name of the aggregate function for SQL generation.
     pub fn sql_name(&self) -> &'static str {
@@ -1171,6 +1213,27 @@ impl OpTree {
                 // the output. E.g., Aggregate GROUP BY "name" → Project
                 // alias "region" at the same position.
                 let child_out = child.output_columns();
+                // When a Project narrows a CTE scan (e.g., SELECT id, name
+                // FROM cte where the CTE produces [id, parent_id, name]),
+                // positional mapping is unreliable — child_out[1] is
+                // "parent_id" but aliases[1] is "name". In that specific
+                // CTE case, fall back to content-hashing the projected
+                // columns, which matches the CteScan wrapper's formula.
+                //
+                // For other narrowing projections (notably the EC-03 window
+                // subquery-lift rewrite), hashing only the projected aliases
+                // is unsafe because the derived output may not be unique
+                // (e.g., CASE/CAST/COALESCE over row_number()) and initial
+                // population would hit duplicate __pgt_row_id values. Those
+                // shapes must fall back to the generic row_number()-based
+                // hash via `None` instead.
+                if child_out.len() != aliases.len() {
+                    return if matches!(unwrapped, OpTree::CteScan { .. }) {
+                        Some(aliases.clone())
+                    } else {
+                        None
+                    };
+                }
                 match child.row_id_key_columns() {
                     Some(keys) => {
                         let mapped: Vec<String> = keys
@@ -1234,6 +1297,19 @@ impl OpTree {
                 // Use content-hash for row IDs so that the initial population
                 // and differential refresh produce consistent __pgt_row_id values.
                 let cols = self.output_columns();
+                if cols.is_empty() { None } else { Some(cols) }
+            }
+            OpTree::ScalarSubquery { child, .. } => {
+                // Scalar subquery row identity comes from the visible outer
+                // child columns only. The scalar value itself changes for all
+                // rows simultaneously and is not part of row identity.
+                //
+                // Use the outer child's visible output columns rather than
+                // its internal row-id strategy, because the full-refresh path
+                // can only hash columns present in the outer SELECT. The
+                // differential operator recomputes the same visible-column
+                // hash for both outer-row deltas and scalar-change rewrites.
+                let cols = child.output_columns();
                 if cols.is_empty() { None } else { Some(cols) }
             }
             // Join, UnionAll, RecursiveCte: complex hash, no simple column list
@@ -1309,6 +1385,7 @@ impl OpTree {
                 cols
             }
             OpTree::LateralFunction {
+                func_sql,
                 alias,
                 column_aliases,
                 with_ordinality,
@@ -1317,12 +1394,11 @@ impl OpTree {
             } => {
                 // Output = child columns + SRF result columns + optional ordinality
                 let mut cols = child.output_columns();
-                if column_aliases.is_empty() {
-                    // No explicit aliases — use the alias name as a single column
-                    cols.push(alias.clone());
-                } else {
-                    cols.extend(column_aliases.clone());
-                }
+                cols.extend(lateral_function_output_columns(
+                    func_sql,
+                    alias,
+                    column_aliases,
+                ));
                 if *with_ordinality {
                     cols.push("ordinality".to_string());
                 }
@@ -2884,6 +2960,44 @@ pub fn query_has_recursive_cte(query: &str) -> Result<bool, PgTrickleError> {
     // SAFETY: raw_parser is safe when called within a PostgreSQL backend
     // with a valid memory context.
     unsafe { query_has_recursive_cte_inner(query) }
+}
+
+/// Lightweight check for any top-level WITH clause in a defining query.
+///
+/// Returns true for both recursive and non-recursive CTEs. This is used by
+/// refresh planning to select safe fallback strategies without building the
+/// full OpTree.
+pub fn query_has_cte(query: &str) -> Result<bool, PgTrickleError> {
+    unsafe { query_has_cte_inner(query) }
+}
+
+unsafe fn query_has_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
+
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Err(PgTrickleError::QueryParseError(
+            "raw_parser returned NULL".into(),
+        ));
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(stmt) => stmt,
+        None => return Ok(false),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(false);
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    Ok(!select.withClause.is_null())
 }
 
 unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
@@ -9022,13 +9136,19 @@ unsafe fn parse_select_stmt(
                 "HAVING clause requires GROUP BY or aggregate functions".into(),
             ));
         }
-        let (expressions, aliases) = unsafe { parse_target_list(&target_list)? };
-        if !is_star_only(&expressions) {
-            tree = OpTree::Project {
-                expressions,
-                aliases,
-                child: Box::new(tree),
-            };
+        if let Some(scalar_tree) =
+            unsafe { parse_appended_scalar_target_subqueries(&target_list, tree.clone(), cte_ctx)? }
+        {
+            tree = scalar_tree;
+        } else {
+            let (expressions, aliases) = unsafe { parse_target_list(&target_list)? };
+            if !is_star_only(&expressions) {
+                tree = OpTree::Project {
+                    expressions,
+                    aliases,
+                    child: Box::new(tree),
+                };
+            }
         }
     }
 
@@ -9084,6 +9204,192 @@ unsafe fn parse_select_stmt(
     }
 
     Ok(tree)
+}
+
+/// Parse simple appended scalar subqueries in the SELECT list.
+///
+/// Supported shape:
+/// - Zero or more non-star target expressions first
+/// - One or more bare scalar subquery targets last
+///
+/// Example:
+/// `SELECT customer, amount, (SELECT val FROM cfg) AS tax_rate FROM orders`
+///
+/// This lowers the query to:
+/// - a Project over the outer FROM tree for the non-scalar columns, then
+/// - one ScalarSubquery wrapper per appended scalar target.
+///
+/// More complex target-list shapes (interleaved scalar targets, `*`, or
+/// scalar subqueries nested inside larger expressions) fall back to the
+/// generic Project path.
+unsafe fn parse_appended_scalar_target_subqueries(
+    target_list: &pgrx::PgList<pg_sys::Node>,
+    mut tree: OpTree,
+    cte_ctx: &mut CteParseContext,
+) -> Result<Option<OpTree>, PgTrickleError> {
+    struct ScalarTarget {
+        alias: String,
+        subquery: OpTree,
+        source_oids: Vec<u32>,
+    }
+
+    let mut plain_exprs = Vec::new();
+    let mut plain_aliases = Vec::new();
+    let mut scalar_targets = Vec::new();
+    let mut saw_scalar_target = false;
+
+    for node_ptr in target_list.iter_ptr() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+
+        let alias =
+            unsafe { target_alias_for_res_target(rt, plain_exprs.len() + scalar_targets.len()) };
+
+        if let Some((subquery, source_oids)) =
+            unsafe { parse_scalar_target_subquery(rt.val, cte_ctx)? }
+        {
+            scalar_targets.push(ScalarTarget {
+                alias,
+                subquery,
+                source_oids,
+            });
+            saw_scalar_target = true;
+            continue;
+        }
+
+        if saw_scalar_target {
+            return Ok(None);
+        }
+
+        let expr = unsafe { node_to_expr(rt.val)? };
+        if matches!(expr, Expr::Star { .. }) {
+            return Ok(None);
+        }
+
+        plain_exprs.push(expr);
+        plain_aliases.push(alias);
+    }
+
+    if scalar_targets.is_empty() || plain_exprs.is_empty() {
+        return Ok(None);
+    }
+
+    tree = OpTree::Project {
+        expressions: plain_exprs,
+        aliases: plain_aliases,
+        child: Box::new(tree),
+    };
+
+    for scalar in scalar_targets {
+        tree = OpTree::ScalarSubquery {
+            subquery: Box::new(scalar.subquery),
+            alias: scalar.alias,
+            subquery_source_oids: scalar.source_oids,
+            child: Box::new(tree),
+        };
+    }
+
+    Ok(Some(tree))
+}
+
+/// Parse a bare scalar subquery target into an OpTree.
+///
+/// Accepts both:
+/// - raw parser `T_SubLink` nodes for `EXPR_SUBLINK`, and
+/// - `Expr::Raw("(SELECT ...)")` fallback expressions produced by `node_to_expr()`.
+unsafe fn parse_scalar_target_subquery(
+    node: *mut pg_sys::Node,
+    cte_ctx: &mut CteParseContext,
+) -> Result<Option<(OpTree, Vec<u32>)>, PgTrickleError> {
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
+        let sublink = unsafe { &*(node as *const pg_sys::SubLink) };
+        if sublink.subLinkType != pg_sys::SubLinkType::EXPR_SUBLINK {
+            return Ok(None);
+        }
+        if sublink.subselect.is_null()
+            || !unsafe { pgrx::is_a(sublink.subselect, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            return Err(PgTrickleError::QueryParseError(
+                "Scalar subquery target must contain a SELECT".into(),
+            ));
+        }
+
+        let inner_select = unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
+        let subquery = if inner_select.op != pg_sys::SetOperation::SETOP_NONE {
+            unsafe { parse_set_operation(inner_select, cte_ctx)? }
+        } else {
+            unsafe { parse_select_stmt(inner_select, "", cte_ctx)? }
+        };
+
+        let mut source_oids = subquery.source_oids();
+        source_oids.sort_unstable();
+        source_oids.dedup();
+        return Ok(Some((subquery, source_oids)));
+    }
+
+    let expr = unsafe { node_to_expr(node)? };
+    let Expr::Raw(raw_sql) = expr else {
+        return Ok(None);
+    };
+
+    let Some(inner_sql) = extract_bare_scalar_subquery_sql(&raw_sql) else {
+        return Ok(None);
+    };
+
+    let c_sql = std::ffi::CString::new(inner_sql.as_str()).map_err(|_| {
+        PgTrickleError::QueryParseError("Scalar subquery contains null bytes".into())
+    })?;
+
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_sql.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Err(PgTrickleError::QueryParseError(
+            "Failed to parse scalar subquery target".into(),
+        ));
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = list.head().ok_or_else(|| {
+        PgTrickleError::QueryParseError("Scalar subquery target parse tree is empty".into())
+    })?;
+    let stmt = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(stmt, pg_sys::NodeTag::T_SelectStmt) } {
+        return Err(PgTrickleError::QueryParseError(
+            "Scalar subquery target must parse to a SELECT".into(),
+        ));
+    }
+
+    let inner_select = unsafe { &*(stmt as *const pg_sys::SelectStmt) };
+    let subquery = if inner_select.op != pg_sys::SetOperation::SETOP_NONE {
+        unsafe { parse_set_operation(inner_select, cte_ctx)? }
+    } else {
+        unsafe { parse_select_stmt(inner_select, "", cte_ctx)? }
+    };
+
+    let mut source_oids = subquery.source_oids();
+    source_oids.sort_unstable();
+    source_oids.dedup();
+    Ok(Some((subquery, source_oids)))
+}
+
+fn extract_bare_scalar_subquery_sql(raw_sql: &str) -> Option<String> {
+    let trimmed = raw_sql.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return None;
+    }
+
+    let inner = trimmed[1..trimmed.len() - 1].trim();
+    if inner.len() < 6 || !inner[..6].eq_ignore_ascii_case("SELECT") {
+        return None;
+    }
+
+    Some(inner.to_string())
 }
 
 /// Parse a FROM clause item (RangeVar, JoinExpr, or RangeSubselect) into an OpTree.
@@ -10535,14 +10841,15 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             };
             parts.push(format!("{} : {}", key.to_sql(), val.to_sql()));
         }
-        let mut sql = format!("JSON_OBJECTAGG({})", parts.join(", "));
+        let mut inner = parts.join(", ");
         if joa.absent_on_null {
-            sql.push_str(" ABSENT ON NULL");
+            inner.push_str(" ABSENT ON NULL");
         }
         if joa.unique {
-            sql.push_str(" WITH UNIQUE KEYS");
+            inner.push_str(" WITH UNIQUE KEYS");
         }
-        unsafe { append_json_agg_clauses(&mut sql, joa.constructor) };
+        unsafe { append_json_agg_clauses(&mut inner, joa.constructor) };
+        let sql = format!("JSON_OBJECTAGG({inner})");
         Ok(Expr::Raw(sql))
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayAgg) } {
         // ── F10/F11: JSON_ARRAYAGG(expr [ORDER BY ...]) ──
@@ -10555,11 +10862,12 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         } else {
             Expr::Raw("NULL".to_string())
         };
-        let mut sql = format!("JSON_ARRAYAGG({})", arg.to_sql());
+        let mut inner = arg.to_sql();
         if jaa.absent_on_null {
-            sql.push_str(" ABSENT ON NULL");
+            inner.push_str(" ABSENT ON NULL");
         }
-        unsafe { append_json_agg_clauses(&mut sql, jaa.constructor) };
+        unsafe { append_json_agg_clauses(&mut inner, jaa.constructor) };
+        let sql = format!("JSON_ARRAYAGG({inner})");
         Ok(Expr::Raw(sql))
     } else {
         // Catch-all: reject with clear error instead of silently producing broken SQL
@@ -12576,24 +12884,7 @@ unsafe fn parse_target_list(
         }
         let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
 
-        let alias = if !rt.name.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("?column?")
-                .to_string()
-        } else if !rt.val.is_null() {
-            if let Ok(e) = unsafe { node_to_expr(rt.val) } {
-                match &e {
-                    Expr::ColumnRef { column_name, .. } => column_name.clone(),
-                    Expr::Star { .. } => "*".to_string(),
-                    _ => format!("col_{}", expressions.len()),
-                }
-            } else {
-                format!("col_{}", expressions.len())
-            }
-        } else {
-            format!("col_{}", expressions.len())
-        };
+        let alias = unsafe { target_alias_for_res_target(rt, expressions.len()) };
 
         if rt.val.is_null() {
             expressions.push(Expr::Star { table_alias: None });
@@ -12606,6 +12897,31 @@ unsafe fn parse_target_list(
     }
 
     Ok((expressions, aliases))
+}
+
+/// Determine the output alias for a SELECT target.
+///
+/// Matches the aliasing used by [`parse_target_list`]: explicit alias first,
+/// then simple column name / `*`, else a synthetic `col_N` fallback.
+unsafe fn target_alias_for_res_target(rt: &pg_sys::ResTarget, ordinal: usize) -> String {
+    if !rt.name.is_null() {
+        return unsafe { std::ffi::CStr::from_ptr(rt.name) }
+            .to_str()
+            .unwrap_or("?column?")
+            .to_string();
+    }
+
+    if !rt.val.is_null()
+        && let Ok(expr) = unsafe { node_to_expr(rt.val) }
+    {
+        return match &expr {
+            Expr::ColumnRef { column_name, .. } => column_name.clone(),
+            Expr::Star { .. } => "*".to_string(),
+            _ => format!("col_{ordinal}"),
+        };
+    }
+
+    format!("col_{ordinal}")
 }
 
 /// Rewrite aggregate function calls in a HAVING predicate to their output column aliases.

@@ -510,13 +510,31 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             let groups = dag_ref.compute_consistency_groups();
 
             for group in &groups {
+                let initial_table_changes: HashMap<i64, bool> = group
+                    .members
+                    .iter()
+                    .filter_map(|member| match member {
+                        NodeId::StreamTable(id) => {
+                            load_st_by_id(*id).map(|st| (*id, has_table_source_changes(&st)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
                 if group.is_singleton() {
                     // Fast path: no SAVEPOINT overhead for non-diamond STs.
                     let pgt_id = match &group.members[0] {
                         NodeId::StreamTable(id) => *id,
                         _ => continue,
                     };
-                    refresh_single_st(pgt_id, dag_ref, now_ms, &mut retry_states, &retry_policy);
+                    refresh_single_st(
+                        pgt_id,
+                        dag_ref,
+                        now_ms,
+                        &mut retry_states,
+                        &retry_policy,
+                        initial_table_changes.get(&pgt_id).copied(),
+                    );
                     continue;
                 }
 
@@ -544,6 +562,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                             now_ms,
                             &mut retry_states,
                             &retry_policy,
+                            initial_table_changes.get(&pgt_id).copied(),
                         );
                     }
                     continue;
@@ -605,8 +624,9 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         continue;
                     }
 
-                    let has_changes = check_upstream_changes(&st);
-                    let action = if has_changes && has_stream_table_source_changes(&st) {
+                    let (has_changes, has_stream_table_changes) =
+                        upstream_change_state(&st, initial_table_changes.get(&pgt_id).copied());
+                    let action = if has_changes && has_stream_table_changes {
                         RefreshAction::Full
                     } else {
                         refresh::determine_refresh_action(&st, has_changes)
@@ -1076,6 +1096,29 @@ fn check_upstream_changes(st: &StreamTableMeta) -> bool {
     has_table_source_changes(st) || has_stream_table_source_changes(st)
 }
 
+/// Resolve upstream change state for a scheduler decision.
+///
+/// For multi-member diamond groups we can freeze TABLE-source visibility
+/// before any sibling refresh runs, because one member may otherwise make the
+/// shared change buffer look empty to a later sibling in the same cycle.
+/// STREAM_TABLE staleness is always evaluated live so convergence nodes still
+/// see freshly-updated upstream timestamps from earlier group members.
+fn upstream_change_state(
+    st: &StreamTableMeta,
+    table_change_snapshot: Option<bool>,
+) -> (bool, bool) {
+    if !st.is_populated {
+        return (true, false);
+    }
+
+    let has_table_changes = table_change_snapshot.unwrap_or_else(|| has_table_source_changes(st));
+    let has_stream_table_changes = has_stream_table_source_changes(st);
+    (
+        has_table_changes || has_stream_table_changes,
+        has_stream_table_changes,
+    )
+}
+
 /// Returns `true` if any TABLE-type upstream source has rows in its CDC change
 /// buffer that have not yet been consumed by a differential refresh.
 fn has_table_source_changes(st: &StreamTableMeta) -> bool {
@@ -1145,6 +1188,7 @@ fn refresh_single_st(
     now_ms: u64,
     retry_states: &mut HashMap<i64, RetryState>,
     retry_policy: &RetryPolicy,
+    table_change_snapshot: Option<bool>,
 ) {
     let st = match load_st_by_id(pgt_id) {
         Some(st) => st,
@@ -1175,7 +1219,7 @@ fn refresh_single_st(
         return;
     }
 
-    let has_changes = check_upstream_changes(&st);
+    let (has_changes, has_stream_table_changes) = upstream_change_state(&st, table_change_snapshot);
 
     // STREAM_TABLE upstream sources have no CDC change buffer.  When an
     // upstream stream table has newer data (detected via data_timestamp
@@ -1183,7 +1227,7 @@ fn refresh_single_st(
     // a DIFFERENTIAL refresh would be a no-op — there are no buffer rows to
     // merge.  Force a FULL refresh instead so the data actually incorporates
     // the upstream's latest rows.
-    let action = if has_changes && has_stream_table_source_changes(&st) {
+    let action = if has_changes && has_stream_table_changes {
         RefreshAction::Full
     } else {
         refresh::determine_refresh_action(&st, has_changes)

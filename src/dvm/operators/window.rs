@@ -253,23 +253,50 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
             parts.join("")
         };
 
-        // Match surviving old rows against child delta DELETEs using
-        // pass-through columns, not __pgt_row_id. The ST stores row IDs
-        // based on row_to_json+row_number from initial population,
-        // while the child (scan) delta uses PK-based hashes. These differ,
-        // so __pgt_row_id cannot be used for the exclusion filter.
+        // Match surviving old rows against child delta rows using the most
+        // stable child key we can recover. This is critical for Window over
+        // Aggregate: aggregate updates arrive as replacement rows keyed by the
+        // GROUP BY columns, not necessarily as full-row DELETE+INSERT pairs.
+        // When key columns are available, ANY child delta row for the same key
+        // should replace the previous input row.
+        let child_key_cols = child.row_id_key_columns().and_then(|keys| {
+            if !keys.is_empty() && keys.iter().all(|key| pt_aliases.contains(key)) {
+                Some(keys)
+            } else {
+                None
+            }
+        });
+        let key_match_cond = child_key_cols.as_ref().map(|keys| {
+            keys.iter()
+                .map(|c| {
+                    let qc = quote_ident(c);
+                    format!("d2.{qc} IS NOT DISTINCT FROM o.{qc}")
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        });
+
+        // Fallback: match surviving old rows against explicit child DELETEs
+        // using full pass-through columns, not __pgt_row_id. The ST stores row
+        // IDs based on row_to_json+row_number from initial population, while
+        // many child operators use different row-id formulas.
         let delete_match_cond = if pt_aliases.is_empty() {
-            // No pass-through columns: match on dummy (all rows excluded)
             "TRUE".to_string()
         } else {
             pt_aliases
                 .iter()
                 .map(|c| {
                     let qc = quote_ident(c);
-                    format!("d2.{qc} = o.{qc}")
+                    format!("d2.{qc} IS NOT DISTINCT FROM o.{qc}")
                 })
                 .collect::<Vec<_>>()
                 .join(" AND ")
+        };
+
+        let exclusion_predicate = if let Some(key_cond) = key_match_cond {
+            key_cond
+        } else {
+            format!("d2.\"__pgt_action\" = 'D' AND {delete_match_cond}")
         };
 
         format!(
@@ -278,7 +305,7 @@ pub fn diff_window(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
              FROM {old_rows_cte} o\n\
              WHERE NOT EXISTS (\n\
                  SELECT 1 FROM {child_delta} d2\n\
-                 WHERE d2.\"__pgt_action\" = 'D' AND {delete_match_cond}\n\
+                 WHERE {exclusion_predicate}\n\
              )\n\
              UNION ALL\n\
              -- Newly inserted rows\n\

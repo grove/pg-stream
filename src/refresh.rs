@@ -563,7 +563,12 @@ const WIDE_TABLE_HASH_THRESHOLD: usize = 50;
 /// Build the IS DISTINCT FROM clause for the MERGE `WHEN MATCHED` guard.
 ///
 /// For tables with ≤ [`WIDE_TABLE_HASH_THRESHOLD`] columns, generates
-/// per-column `st."col" IS DISTINCT FROM d."col"` checks joined with `OR`.
+/// per-column text comparisons joined with `OR`.
+///
+/// The text cast avoids PostgreSQL's requirement that the underlying type
+/// implement `=` for `IS DISTINCT FROM` to work. This matters for `json`
+/// aggregate outputs, which intentionally do not have a native equality
+/// operator.
 ///
 /// For wider tables (F41), generates a single `md5()` hash comparison:
 /// ```sql
@@ -576,7 +581,7 @@ fn build_is_distinct_clause(user_cols: &[String]) -> String {
             .iter()
             .map(|c| {
                 let qc = format!("\"{}\"", c.replace('"', "\"\""));
-                format!("st.{qc} IS DISTINCT FROM d.{qc}")
+                format!("st.{qc}::text IS DISTINCT FROM d.{qc}::text")
             })
             .collect::<Vec<_>>()
             .join(" OR ")
@@ -648,6 +653,15 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
 
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
+
+    if matches!(dvm::query_has_recursive_cte(&st.defining_query), Ok(true)) {
+        pgrx::debug1!(
+            "[pg_trickle] cache pre-warm skipped for {}.{}: recursive CTEs choose refresh strategy at runtime",
+            schema,
+            name,
+        );
+        return;
+    }
 
     // Use dummy frontiers — placeholders will be embedded in the template
     let dummy = Frontier::new();
@@ -972,7 +986,7 @@ pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
     } else {
         col_list
             .iter()
-            .map(|c| format!("{quoted_table}.{c} IS DISTINCT FROM __pgt_topk_src.{c}"))
+            .map(|c| format!("{quoted_table}.{c}::text IS DISTINCT FROM __pgt_topk_src.{c}::text"))
             .collect::<Vec<_>>()
             .join(" OR ")
     };
@@ -1684,12 +1698,32 @@ pub fn execute_differential_refresh(
         hasher.finish()
     };
 
-    let cached = MERGE_TEMPLATE_CACHE.with(|cache| {
-        let map = cache.borrow();
-        map.get(&st.pgt_id)
-            .filter(|entry| entry.defining_query_hash == query_hash)
-            .cloned()
-    });
+    let has_any_cte = dvm::query_has_cte(&st.defining_query)?;
+    let has_recursive_cte = dvm::query_has_recursive_cte(&st.defining_query)?;
+
+    if has_any_cte {
+        pgrx::info!(
+            "[pg_trickle] CTE-backed differential refresh fallback: using FULL refresh for {}.{}",
+            schema,
+            name,
+        );
+        let result = execute_full_refresh(st);
+        if result.is_ok() {
+            post_full_refresh_cleanup(st);
+        }
+        return result;
+    }
+
+    let cached = if has_recursive_cte {
+        None
+    } else {
+        MERGE_TEMPLATE_CACHE.with(|cache| {
+            let map = cache.borrow();
+            map.get(&st.pgt_id)
+                .filter(|entry| entry.defining_query_hash == query_hash)
+                .cloned()
+        })
+    };
 
     let was_cache_hit = cached.is_some();
 
@@ -1740,14 +1774,24 @@ pub fn execute_differential_refresh(
     } else {
         // ── Cache miss: full pipeline + PREPARE + cache ──────────────
         pgrx::debug1!("[pg_trickle] cache MISS for pgt_id={}", st.pgt_id);
-        let delta_result = dvm::generate_delta_query_cached(
-            st.pgt_id,
-            &st.defining_query,
-            prev_frontier,
-            new_frontier,
-            schema,
-            name,
-        )?;
+        let delta_result = if has_recursive_cte {
+            dvm::generate_delta_query(
+                &st.defining_query,
+                prev_frontier,
+                new_frontier,
+                schema,
+                name,
+            )?
+        } else {
+            dvm::generate_delta_query_cached(
+                st.pgt_id,
+                &st.defining_query,
+                prev_frontier,
+                new_frontier,
+                schema,
+                name,
+            )?
+        };
 
         let delta_sql = delta_result.delta_sql;
         let user_cols = delta_result.output_columns;
@@ -1797,8 +1841,11 @@ pub fn execute_differential_refresh(
 
         // Build the MERGE template using the raw delta SQL template
         // (with __PGS_PREV_LSN_* / __PGS_NEW_LSN_* placeholder tokens).
-        let delta_sql_template =
-            dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_sql.clone());
+        let delta_sql_template = if has_recursive_cte {
+            delta_sql.clone()
+        } else {
+            dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_sql.clone())
+        };
 
         // Build template USING clause — skip DISTINCT ON when deduplicated (G-M1)
         // EC-06: For keyless sources, never collapse with DISTINCT ON.
@@ -1886,22 +1933,24 @@ pub fn execute_differential_refresh(
         };
 
         // Store templates in the cache for subsequent refreshes.
-        MERGE_TEMPLATE_CACHE.with(|cache| {
-            cache.borrow_mut().insert(
-                st.pgt_id,
-                CachedMergeTemplate {
-                    defining_query_hash: query_hash,
-                    merge_sql_template: merge_template.clone(),
-                    source_oids: source_oids.clone(),
-                    cleanup_sql_template: cleanup_template,
-                    parameterized_merge_sql: parameterized_merge_sql.clone(),
-                    trigger_delete_template: trigger_delete_template.clone(),
-                    trigger_update_template: trigger_update_template.clone(),
-                    trigger_insert_template: trigger_insert_template.clone(),
-                    trigger_using_template: template_using.clone(),
-                },
-            );
-        });
+        if !has_recursive_cte {
+            MERGE_TEMPLATE_CACHE.with(|cache| {
+                cache.borrow_mut().insert(
+                    st.pgt_id,
+                    CachedMergeTemplate {
+                        defining_query_hash: query_hash,
+                        merge_sql_template: merge_template.clone(),
+                        source_oids: source_oids.clone(),
+                        cleanup_sql_template: cleanup_template,
+                        parameterized_merge_sql: parameterized_merge_sql.clone(),
+                        trigger_delete_template: trigger_delete_template.clone(),
+                        trigger_update_template: trigger_update_template.clone(),
+                        trigger_insert_template: trigger_insert_template.clone(),
+                        trigger_using_template: template_using.clone(),
+                    },
+                );
+            });
+        }
 
         // Resolve LSN placeholders for this execution.
         ResolvedSql {

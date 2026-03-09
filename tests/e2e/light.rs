@@ -29,9 +29,8 @@
 //! - No auto-refresh (`wait_for_auto_refresh` will always time out).
 //! - Custom GUCs (`SET pg_trickle.*`) may not be available in all
 //!   connections (registered only when `.so` is first loaded).
-//! - Locally on macOS, `cargo pgrx package` produces a `.dylib` that
-//!   won't work inside a Linux container.  Use `just test-e2e-fast`
-//!   instead.
+//! - On macOS, the Light E2E runner must package Linux artifacts via the
+//!   Docker builder image and pass them through `PGT_EXTENSION_DIR`.
 
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::sync::{
@@ -63,9 +62,19 @@ enum ContainerLease {
 ///
 /// Checks `PGT_EXTENSION_DIR` env var first, then falls back to the
 /// default pgrx package output path.
+fn is_valid_light_e2e_package_dir(dir: &str) -> bool {
+    let base = std::path::Path::new(dir);
+    base.join("usr/share/postgresql/18/extension/pg_trickle.control")
+        .exists()
+        && base
+            .join("usr/lib/postgresql/18/lib/pg_trickle.so")
+            .exists()
+}
+
 fn find_extension_dir() -> String {
     if let Ok(dir) = std::env::var("PGT_EXTENSION_DIR")
         && !dir.is_empty()
+        && is_valid_light_e2e_package_dir(&dir)
     {
         return dir;
     }
@@ -73,14 +82,16 @@ fn find_extension_dir() -> String {
     // Default: cargo pgrx package output
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let default_path = format!("{}/target/release/pg_trickle-pg18", manifest_dir);
-    if std::path::Path::new(&default_path).exists() {
+    if is_valid_light_e2e_package_dir(&default_path) {
         return default_path;
     }
 
     panic!(
-        "Extension package directory not found.\n\
-         Run `cargo pgrx package --pg-config $(pg_config --bindir)/pg_config` first,\n\
-         or set PGT_EXTENSION_DIR to the package output directory."
+        "Valid Linux light-E2E extension package directory not found.\n\
+         Expected packaged artifacts under usr/share/postgresql/18/extension and\n\
+         usr/lib/postgresql/18/lib.\n\
+         Run `bash ./scripts/run_light_e2e_tests.sh --package-only` first,\n\
+         or set PGT_EXTENSION_DIR to a valid Linux package output directory."
     );
 }
 
@@ -112,8 +123,9 @@ async fn shared_container() -> &'static SharedContainer {
     SHARED_CONTAINER
         .get_or_init(|| async {
             let ext_dir = find_extension_dir();
+            let run_id = std::env::var("PGT_LIGHT_E2E_RUN_ID").ok();
 
-            let container = GenericImage::new("postgres", "18.1")
+            let mut image = GenericImage::new("postgres", "18.1")
                 .with_exposed_port(5432_u16.tcp())
                 .with_wait_for(WaitFor::message_on_stderr(
                     "database system is ready to accept connections",
@@ -121,12 +133,18 @@ async fn shared_container() -> &'static SharedContainer {
                 .with_env_var("POSTGRES_PASSWORD", "postgres")
                 .with_env_var("POSTGRES_DB", "postgres")
                 .with_mount(Mount::bind_mount(ext_dir, "/tmp/pg_ext"))
-                .start()
-                .await
-                .expect(
-                    "Failed to start shared light-e2e container.\n\
+                .with_label("com.pgtrickle.test", "true")
+                .with_label("com.pgtrickle.suite", "light-e2e")
+                .with_label("com.pgtrickle.repo", "pg-stream");
+
+            if let Some(run_id) = run_id {
+                image = image.with_label("com.pgtrickle.run-id", run_id);
+            }
+
+            let container = image.start().await.expect(
+                "Failed to start shared light-e2e container.\n\
                      Ensure Docker is running and postgres:18.1 is available.",
-                );
+            );
 
             container
                 .exec(ExecCommand::new(vec![
@@ -209,6 +227,11 @@ impl E2eDb {
     /// Get the Docker container ID.
     pub fn container_id(&self) -> &str {
         &self.container_id
+    }
+
+    /// Get the connection string for this database.
+    pub fn connection_string(&self) -> &str {
+        &self.connection_string
     }
 
     /// Execute SQL on a dedicated connection and collect PostgreSQL notices.
@@ -486,11 +509,24 @@ impl E2eDb {
             ))
             .await;
 
-        let except_filter = if has_dual_counts && defining_query.to_uppercase().contains("EXCEPT") {
-            if defining_query.to_uppercase().contains("EXCEPT ALL") {
+        // Build a visibility filter for set operation STs.
+        // INTERSECT/EXCEPT STs keep invisible rows for multiplicity tracking.
+        // - INTERSECT (set): visible iff LEAST(count_l, count_r) > 0
+        // - INTERSECT ALL:   visible rows = LEAST(count_l, count_r), expanded
+        // - EXCEPT (set):    visible iff count_l > 0 AND count_r = 0
+        // - EXCEPT ALL:      visible iff count_l > count_r
+        let dq_upper = defining_query.to_uppercase();
+        let set_op_filter = if has_dual_counts {
+            if dq_upper.contains("INTERSECT ALL") {
+                " WHERE LEAST(__pgt_count_l, __pgt_count_r) > 0"
+            } else if dq_upper.contains("INTERSECT") {
+                " WHERE __pgt_count_l > 0 AND __pgt_count_r > 0"
+            } else if dq_upper.contains("EXCEPT ALL") {
                 " WHERE __pgt_count_l > __pgt_count_r"
-            } else {
+            } else if dq_upper.contains("EXCEPT") {
                 " WHERE __pgt_count_l > 0 AND __pgt_count_r = 0"
+            } else {
+                ""
             }
         } else {
             ""
@@ -499,21 +535,21 @@ impl E2eDb {
         let sql = if raw_cols != cast_cols {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {cast_cols} FROM {st_table}{except_filter} \
+                    (SELECT {cast_cols} FROM {st_table}{set_op_filter} \
                      EXCEPT \
                      SELECT {cast_cols} FROM ({defining_query}) __pgt_dq) \
                     UNION ALL \
                     (SELECT {cast_cols} FROM ({defining_query}) __pgt_dq2 \
                      EXCEPT \
-                     SELECT {cast_cols} FROM {st_table}{except_filter}) \
+                     SELECT {cast_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         } else {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {raw_cols} FROM {st_table}{except_filter} EXCEPT ({defining_query})) \
+                    (SELECT {raw_cols} FROM {st_table}{set_op_filter} EXCEPT ({defining_query})) \
                     UNION ALL \
-                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}{except_filter}) \
+                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         };

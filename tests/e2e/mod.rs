@@ -155,15 +155,15 @@ async fn create_database(admin_connection_string: &str, db_name: &str) {
 #[cfg(not(feature = "light-e2e"))]
 async fn terminate_other_backends(admin_pool: &PgPool) {
     // Shared-db tests reuse `postgres`, so the previous test's sqlx pool and
-    // pg_trickle background workers can still hold locks when the next test
-    // starts its reset. Terminate them first to keep cleanup deterministic.
+    // the per-database scheduler worker can still hold locks when the next
+    // test starts its reset. Terminate them first to keep cleanup deterministic.
     sqlx::query(
         "SELECT pg_terminate_backend(pid) \
          FROM pg_stat_activity \
          WHERE datname = current_database() \
                      AND pid <> pg_backend_pid() \
                      AND (backend_type = 'client backend' \
-                                OR application_name IN ('pg_trickle scheduler', 'pg_trickle launcher'))",
+                                OR application_name = 'pg_trickle scheduler')",
     )
     .execute(admin_pool)
     .await
@@ -176,7 +176,7 @@ async fn terminate_other_backends(admin_pool: &PgPool) {
              WHERE datname = current_database() \
                              AND pid <> pg_backend_pid() \
                              AND (backend_type = 'client backend' \
-                                        OR application_name IN ('pg_trickle scheduler', 'pg_trickle launcher'))",
+                                        OR application_name = 'pg_trickle scheduler')",
         )
         .fetch_one(admin_pool)
         .await
@@ -195,7 +195,7 @@ async fn terminate_other_backends(admin_pool: &PgPool) {
          WHERE datname = current_database() \
                      AND pid <> pg_backend_pid() \
                      AND (backend_type = 'client backend' \
-                                OR application_name IN ('pg_trickle scheduler', 'pg_trickle launcher'))",
+                                OR application_name = 'pg_trickle scheduler')",
     )
     .fetch_one(admin_pool)
     .await
@@ -216,6 +216,11 @@ async fn reset_postgres_database(admin_connection_string: &str) {
 
     terminate_other_backends(&admin_pool).await;
 
+    // Background-worker tests share the `postgres` database and use
+    // `ALTER SYSTEM` to speed up the scheduler. Those changes persist in
+    // `postgresql.auto.conf`, so clear them during reset to keep each test
+    // independent of execution order.
+    //
     // Drop the extension before reloading config. A pre-drop pg_reload_conf()
     // wakes the shared launcher worker, which can respawn a scheduler for
     // `postgres` while reset is still in progress.
@@ -245,6 +250,7 @@ async fn shared_container() -> &'static SharedContainer {
         .get_or_init(|| async {
             let (img_name, img_tag) = e2e_image();
             assert_docker_image_exists(&img_name, &img_tag).await;
+            let run_id = std::env::var("PGT_E2E_RUN_ID").ok();
 
             let mut image = GenericImage::new(img_name, img_tag)
                 .with_exposed_port(5432_u16.tcp())
@@ -252,7 +258,14 @@ async fn shared_container() -> &'static SharedContainer {
                     "database system is ready to accept connections",
                 ))
                 .with_env_var("POSTGRES_PASSWORD", "postgres")
-                .with_env_var("POSTGRES_DB", "postgres");
+                .with_env_var("POSTGRES_DB", "postgres")
+                .with_label("com.pgtrickle.test", "true")
+                .with_label("com.pgtrickle.suite", "full-e2e")
+                .with_label("com.pgtrickle.repo", "pg-stream");
+
+            if let Some(run_id) = run_id {
+                image = image.with_label("com.pgtrickle.run-id", run_id);
+            }
 
             if let Some(mount) = coverage_mount() {
                 image = image.with_mount(mount);
@@ -404,13 +417,21 @@ impl E2eDb {
     async fn new_with_db(db_name: &str) -> Self {
         let (img_name, img_tag) = e2e_image();
         assert_docker_image_exists(&img_name, &img_tag).await;
+        let run_id = std::env::var("PGT_E2E_RUN_ID").ok();
         let mut image = GenericImage::new(img_name, img_tag)
             .with_exposed_port(5432_u16.tcp())
             .with_wait_for(WaitFor::message_on_stderr(
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_PASSWORD", "postgres")
-            .with_env_var("POSTGRES_DB", db_name);
+            .with_env_var("POSTGRES_DB", db_name)
+            .with_label("com.pgtrickle.test", "true")
+            .with_label("com.pgtrickle.suite", "full-e2e")
+            .with_label("com.pgtrickle.repo", "pg-stream");
+
+        if let Some(run_id) = run_id {
+            image = image.with_label("com.pgtrickle.run-id", run_id);
+        }
 
         // When running under the coverage harness, bind-mount a host
         // directory at /coverage so profraw files are written to the host.
@@ -450,6 +471,7 @@ impl E2eDb {
     async fn new_with_db_bench(db_name: &str) -> Self {
         let (img_name, img_tag) = e2e_image();
         assert_docker_image_exists(&img_name, &img_tag).await;
+        let run_id = std::env::var("PGT_E2E_RUN_ID").ok();
         let mut image = GenericImage::new(img_name, img_tag)
             .with_exposed_port(5432_u16.tcp())
             .with_wait_for(WaitFor::message_on_stderr(
@@ -457,7 +479,14 @@ impl E2eDb {
             ))
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_env_var("POSTGRES_DB", db_name)
+            .with_label("com.pgtrickle.test", "true")
+            .with_label("com.pgtrickle.suite", "full-e2e")
+            .with_label("com.pgtrickle.repo", "pg-stream")
             .with_shm_size(268_435_456); // 256 MB shared memory
+
+        if let Some(run_id) = run_id {
+            image = image.with_label("com.pgtrickle.run-id", run_id);
+        }
 
         // When running under the coverage harness, bind-mount a host
         // directory at /coverage so profraw files are written to the host.
@@ -777,15 +806,24 @@ impl E2eDb {
             ))
             .await;
 
-        // Build a visibility filter for EXCEPT STs.
-        // - EXCEPT (set): visible iff count_l > 0 AND count_r = 0
-        // - EXCEPT ALL:   visible iff count_l > count_r
-        // INTERSECT STs don't need this (invisible rows are deleted).
-        let except_filter = if has_dual_counts && defining_query.to_uppercase().contains("EXCEPT") {
-            if defining_query.to_uppercase().contains("EXCEPT ALL") {
+        // Build a visibility filter for set operation STs.
+        // INTERSECT/EXCEPT STs keep invisible rows for multiplicity tracking.
+        // - INTERSECT (set): visible iff LEAST(count_l, count_r) > 0
+        // - INTERSECT ALL:   visible rows = LEAST(count_l, count_r), expanded
+        // - EXCEPT (set):    visible iff count_l > 0 AND count_r = 0
+        // - EXCEPT ALL:      visible iff count_l > count_r
+        let dq_upper = defining_query.to_uppercase();
+        let set_op_filter = if has_dual_counts {
+            if dq_upper.contains("INTERSECT ALL") {
+                " WHERE LEAST(__pgt_count_l, __pgt_count_r) > 0"
+            } else if dq_upper.contains("INTERSECT") {
+                " WHERE __pgt_count_l > 0 AND __pgt_count_r > 0"
+            } else if dq_upper.contains("EXCEPT ALL") {
                 " WHERE __pgt_count_l > __pgt_count_r"
-            } else {
+            } else if dq_upper.contains("EXCEPT") {
                 " WHERE __pgt_count_l > 0 AND __pgt_count_r = 0"
+            } else {
+                ""
             }
         } else {
             ""
@@ -797,21 +835,21 @@ impl E2eDb {
             // json columns present: cast them on both sides of EXCEPT
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {cast_cols} FROM {st_table}{except_filter} \
+                    (SELECT {cast_cols} FROM {st_table}{set_op_filter} \
                      EXCEPT \
                      SELECT {cast_cols} FROM ({defining_query}) __pgt_dq) \
                     UNION ALL \
                     (SELECT {cast_cols} FROM ({defining_query}) __pgt_dq2 \
                      EXCEPT \
-                     SELECT {cast_cols} FROM {st_table}{except_filter}) \
+                     SELECT {cast_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         } else {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {raw_cols} FROM {st_table}{except_filter} EXCEPT ({defining_query})) \
+                    (SELECT {raw_cols} FROM {st_table}{set_op_filter} EXCEPT ({defining_query})) \
                     UNION ALL \
-                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}{except_filter}) \
+                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         };

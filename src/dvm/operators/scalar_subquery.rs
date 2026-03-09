@@ -35,6 +35,7 @@
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::join_common::build_snapshot_sql;
+use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::OpTree;
 use crate::error::PgTrickleError;
 
@@ -135,10 +136,15 @@ pub fn diff_scalar_subquery(
             .iter()
             .map(|c| format!("cs.{}::TEXT", quote_ident(c)))
             .collect();
-        format!(
-            "pgtrickle.pg_trickle_hash_multi(ARRAY[{}])",
-            key_exprs.join(", ")
-        )
+        build_hash_expr(&key_exprs)
+    };
+
+    let hash_delta_child = {
+        let key_exprs: Vec<String> = child_cols
+            .iter()
+            .map(|c| format!("dc.{}::TEXT", quote_ident(c)))
+            .collect();
+        build_hash_expr(&key_exprs)
     };
 
     // ── Pre-change outer child snapshot (C₀) for Part 2 ────────────
@@ -170,7 +176,7 @@ pub fn diff_scalar_subquery(
     let sql = format!(
         "\
 -- Part 1: outer child delta rows with current scalar value (ΔC × S₁)
-SELECT dc.__pgt_row_id,
+SELECT {hash_delta_child} AS __pgt_row_id,
        dc.__pgt_action,
        {dc_cols},
        {scalar_sql} AS {alias_ident}
@@ -200,6 +206,7 @@ WHERE EXISTS (SELECT 1 FROM {delta_subquery} WHERE 1=1)
         dc_cols = dc_col_refs.join(", "),
         cs_cols = cs_col_refs.join(", "),
         alias_ident = quote_ident(alias),
+        hash_delta_child = hash_delta_child,
         delta_child = child_result.cte_name,
         delta_subquery = subquery_result.cte_name,
     );

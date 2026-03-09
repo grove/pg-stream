@@ -81,20 +81,20 @@ build-e2e-image:
 # Run E2E tests (rebuilds Docker image first)
 [group: "test"]
 test-e2e: build-e2e-image
-    cargo test --test 'e2e_*' -- --test-threads=1
+    ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
 
 # Run E2E tests, skip Docker image rebuild
 [group: "test"]
 test-e2e-fast:
-    cargo test --test 'e2e_*' -- --test-threads=1
+    ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
 
 # Package the extension for light-E2E tests (cargo pgrx package)
 [group: "test"]
 package-extension:
     bash ./scripts/run_light_e2e_tests.sh --package-only
 
-# Run light-E2E tests (stock postgres container, no custom Docker image)
-# Only works on Linux — macOS produces .dylib that can't run in a Linux container.
+# Run light-E2E tests (stock postgres container, no custom Docker image).
+# On macOS the runner builds Linux package artifacts in the Docker builder image.
 [group: "test"]
 test-light-e2e:
     bash ./scripts/run_light_e2e_tests.sh --package
@@ -118,29 +118,29 @@ test-all: test-unit test-integration test-e2e test-pgrx
 # Run multi-level DAG pipeline tests (rebuilds Docker image)
 [group: "test"]
 test-pipeline: build-e2e-image
-    cargo test --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
 
 # Run pipeline DAG tests, skip Docker image rebuild
 [group: "test"]
 test-pipeline-fast:
-    cargo test --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
 
 # ── TPC-H Tests ───────────────────────────────────────────────────────────
 
 # Run TPC-H correctness tests at SF-0.01 (~2 min, rebuilds Docker image)
 [group: "tpch"]
 test-tpch: build-e2e-image
-    cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
 # Run TPC-H tests, skip Docker image rebuild
 [group: "tpch"]
 test-tpch-fast:
-    cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
 # Run TPC-H tests at larger scale: SF-0.1 (~5 min, rebuilds Docker image)
 [group: "tpch"]
 test-tpch-large: build-e2e-image
-    TPCH_SCALE=0.1 cargo test --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    TPCH_SCALE=0.1 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
 # ── dbt Tests ─────────────────────────────────────────────────────────────
 
@@ -171,7 +171,7 @@ build-upgrade-image from="0.1.3" to="0.2.3": build-e2e-image
 test-upgrade from="0.1.3" to="0.2.3": (build-upgrade-image from to)
     PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
-        cargo test --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture
+        ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture
 
 # ── Benchmarks ────────────────────────────────────────────────────────────
 
@@ -183,12 +183,12 @@ bench:
 # Run database-level E2E benchmark suite (rebuilds Docker image)
 [group: "bench"]
 test-bench-e2e: build-e2e-image
-    cargo test --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
 
 # Run E2E benchmarks, skip Docker image rebuild
 [group: "bench"]
 test-bench-e2e-fast:
-    cargo test --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
 
 # Run diff-operator benchmarks only
 [group: "bench"]

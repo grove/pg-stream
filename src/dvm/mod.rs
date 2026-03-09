@@ -58,12 +58,12 @@ pub mod row_id;
 pub use diff::DiffContext;
 pub use parser::{
     CteRegistry, ParseResult, TopKInfo, check_ivm_support, check_ivm_support_with_registry,
-    detect_topk_pattern, parse_defining_query, parse_defining_query_full, query_has_recursive_cte,
-    reject_limit_offset, reject_materialized_views, reject_unsupported_constructs,
-    rewrite_distinct_on, rewrite_grouping_sets, rewrite_nested_window_exprs, rewrite_rows_from,
-    rewrite_scalar_subquery_in_where, rewrite_sublinks_in_or, rewrite_views_inline,
-    tree_worst_volatility_with_registry, validate_immediate_mode_support,
-    warn_limit_without_order_in_subqueries,
+    detect_topk_pattern, parse_defining_query, parse_defining_query_full, query_has_cte,
+    query_has_recursive_cte, reject_limit_offset, reject_materialized_views,
+    reject_unsupported_constructs, rewrite_distinct_on, rewrite_grouping_sets,
+    rewrite_nested_window_exprs, rewrite_rows_from, rewrite_scalar_subquery_in_where,
+    rewrite_sublinks_in_or, rewrite_views_inline, tree_worst_volatility_with_registry,
+    validate_immediate_mode_support, warn_limit_without_order_in_subqueries,
 };
 
 use crate::error::PgTrickleError;
@@ -871,49 +871,35 @@ pub fn try_set_op_refresh_sql(defining_query: &str, column_names: &[String]) -> 
     let quoted_cols: Vec<String> = column_names.iter().map(|c| diff::quote_ident(c)).collect();
     let col_list = quoted_cols.join(", ");
 
-    let l_cols: Vec<String> = column_names
-        .iter()
-        .map(|c| format!("l.{}", diff::quote_ident(c)))
-        .collect();
-    let l_col_list = l_cols.join(", ");
-
-    // Hash expression for __pgt_row_id (using l.* prefix)
-    let l_hash_items: Vec<String> = column_names
-        .iter()
-        .map(|c| format!("l.{}::TEXT", diff::quote_ident(c)))
-        .collect();
-
     let (join_type, where_clause) = match parts.kind {
-        SetOpKind::Intersect => ("INNER JOIN", String::new()),
-        SetOpKind::IntersectAll => ("INNER JOIN", String::new()),
-        // EXCEPT: use FULL OUTER JOIN to populate ALL unique values from
-        // both branches with their per-branch counts. Invisible rows
-        // (count_l = 0 or count_r > 0) are kept so that the differential
-        // engine can track multiplicity changes correctly across refreshes.
-        SetOpKind::Except | SetOpKind::ExceptAll => ("FULL OUTER JOIN", String::new()),
+        // INTERSECT/EXCEPT: use FULL OUTER JOIN to populate ALL unique
+        // values from both branches with their per-branch counts.
+        // Invisible rows are kept so that the differential engine can
+        // track multiplicity changes correctly across refreshes.
+        SetOpKind::Intersect
+        | SetOpKind::IntersectAll
+        | SetOpKind::Except
+        | SetOpKind::ExceptAll => ("FULL OUTER JOIN", String::new()),
     };
 
-    // For FULL OUTER JOIN (EXCEPT), columns from one side may be NULL.
+    // For FULL OUTER JOIN, columns from one side may be NULL.
     // Use COALESCE to pick from whichever side matched.
-    let (select_cols, hash_items_final) =
-        if matches!(parts.kind, SetOpKind::Except | SetOpKind::ExceptAll) {
-            let coalesced: Vec<String> = column_names
-                .iter()
-                .map(|c| {
-                    format!(
-                        "COALESCE(l.{qc}, r.{qc}) AS {qc}",
-                        qc = diff::quote_ident(c)
-                    )
-                })
-                .collect();
-            let hash_items_c: Vec<String> = column_names
-                .iter()
-                .map(|c| format!("COALESCE(l.{qc}, r.{qc})::TEXT", qc = diff::quote_ident(c)))
-                .collect();
-            (coalesced.join(",\n       "), hash_items_c)
-        } else {
-            (l_col_list.clone(), l_hash_items.clone())
-        };
+    let (select_cols, hash_items_final) = {
+        let coalesced: Vec<String> = column_names
+            .iter()
+            .map(|c| {
+                format!(
+                    "COALESCE(l.{qc}, r.{qc}) AS {qc}",
+                    qc = diff::quote_ident(c)
+                )
+            })
+            .collect();
+        let hash_items_c: Vec<String> = column_names
+            .iter()
+            .map(|c| format!("COALESCE(l.{qc}, r.{qc})::TEXT", qc = diff::quote_ident(c)))
+            .collect();
+        (coalesced.join(",\n       "), hash_items_c)
+    };
 
     let hash_expr_final = if hash_items_final.len() == 1 {
         format!("pgtrickle.pg_trickle_hash({})", hash_items_final[0])

@@ -9,6 +9,7 @@
 //! renaming CTE is emitted on top of the cached delta output.
 
 use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
+use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::OpTree;
 use crate::error::PgTrickleError;
 
@@ -66,13 +67,18 @@ pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
         base_result.columns.clone()
     };
 
-    // If no renaming needed, pass through
-    if effective_cols == base_result.columns {
-        return Ok(base_result);
-    }
+    // CteScan rows use the CTE's visible output columns as their content-hash
+    // row identity, even when the body delta uses a different row_id strategy.
+    let row_id_expr = build_hash_expr(
+        &effective_cols
+            .iter()
+            .map(|col| format!("{}::TEXT", quote_ident(col)))
+            .collect::<Vec<_>>(),
+    );
 
-    // Build a thin renaming CTE
-    let rename_exprs: Vec<String> = base_result
+    // Build a wrapper CTE that applies visible column names positionally and
+    // recomputes __pgt_row_id to match the CteScan initial population.
+    let select_exprs: Vec<String> = base_result
         .columns
         .iter()
         .zip(effective_cols.iter())
@@ -90,9 +96,9 @@ pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
     let cte_name_str = ctx.next_cte_name(&format!("ctescan_{alias}"));
 
     let sql = format!(
-        "SELECT __pgt_row_id, __pgt_action, {cols}\n\
+        "SELECT {row_id_expr} AS __pgt_row_id, __pgt_action, {cols}\n\
          FROM {child_cte}",
-        cols = rename_exprs.join(", "),
+        cols = select_exprs.join(", "),
         child_cte = base_result.cte_name,
     );
 
@@ -140,11 +146,12 @@ mod tests {
         let tree1 = cte_scan(0, "my_cte", "mc1", vec!["id", "name"], vec![], vec![]);
         let result1 = diff_cte_scan(&mut ctx, &tree1).unwrap();
 
-        // Second scan of same CTE should be cached
+        // Second scan of same CTE should reuse cached body delta
         let tree2 = cte_scan(0, "my_cte", "mc2", vec!["id", "name"], vec![], vec![]);
         let result2 = diff_cte_scan(&mut ctx, &tree2).unwrap();
 
-        assert_eq!(result1.cte_name, result2.cte_name);
+        // Each reference gets its own wrapper CTE but the same output columns
+        assert_eq!(result1.columns, result2.columns);
     }
 
     #[test]
