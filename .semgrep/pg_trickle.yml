@@ -109,3 +109,11 @@ rules:
     paths:
       include:
         - src/**
+      exclude:
+        # DVM engine is internal computation; not a direct SQL entry point.
+        # Semgrep cannot detect #[cfg(test)] boundaries inside a file, so
+        # operator and parser unit tests would flood this rule. Use CodeQL
+        # taint analysis (Phase 5) to track panics through the call graph.
+        - src/dvm/**
+        # Standalone CLI binary — not loaded into the PostgreSQL process
+        - src/bin/**
