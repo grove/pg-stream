@@ -764,6 +764,19 @@ impl E2eDb {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
+    /// Nudge the launcher so it re-probes this database promptly.
+    ///
+    /// `pg_reload_conf()` wakes the launcher from `wait_latch()`, but it does
+    /// not change `last_attempt`. `pgtrickle._signal_launcher_rescan()` bumps
+    /// the shared DAG version, which lets the launcher evict stale
+    /// `last_attempt` entries on its next loop iteration.
+    pub async fn nudge_launcher_rescan(&self) {
+        let _ = self
+            .try_execute("SELECT pgtrickle._signal_launcher_rescan()")
+            .await;
+        self.execute("SELECT pg_reload_conf()").await;
+    }
+
     /// Read a GUC value via `SHOW`.
     pub async fn show_setting(&self, setting: &str) -> String {
         self.query_scalar(&format!("SHOW {setting}")).await
@@ -1042,11 +1055,13 @@ impl E2eDb {
     /// or produce a meaningful failure message rather than a generic timeout.
     pub async fn wait_for_scheduler(&self, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
+        let nudge_interval = std::time::Duration::from_secs(10);
+        let mut last_nudge = std::time::Instant::now();
         loop {
             if start.elapsed() > timeout {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
             let running: bool = self
                 .query_scalar(
                     "SELECT EXISTS(\
@@ -1059,6 +1074,13 @@ impl E2eDb {
             if running {
                 return true;
             }
+
+            if last_nudge.elapsed() >= nudge_interval {
+                self.nudge_launcher_rescan().await;
+                last_nudge = std::time::Instant::now();
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 

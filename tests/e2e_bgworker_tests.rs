@@ -36,8 +36,9 @@ use std::time::Duration;
 /// (instead of `skip_ttl = 300 s`) when respawning the scheduler after the
 /// DROP/CREATE EXTENSION cycle, so the scheduler reappears within ~15–25 s.
 ///
-/// The nudge via `pg_reload_conf()` every 10 s during the wait wakes the
-/// launcher from its latch sleep so it retries as soon as the TTL expires.
+/// The wait helper nudges the launcher every 10 s via both
+/// `pgtrickle._signal_launcher_rescan()` and `pg_reload_conf()`, so stale
+/// `last_attempt` entries are re-evaluated and the launcher wakes promptly.
 async fn configure_fast_scheduler(db: &E2eDb) {
     db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
         .await;
@@ -49,42 +50,7 @@ async fn configure_fast_scheduler(db: &E2eDb) {
     db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
         .await;
 
-    // Ensure the scheduler BGW is running before tests depend on it.
-    // Nudge the launcher every 10 s via pg_reload_conf() (SIGHUP) so it
-    // wakes from its latch sleep and re-tries spawn more promptly.
-    // Timeout: 90 s — enough for three full 25 s respawn cycles.
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(90);
-    let nudge_interval = Duration::from_secs(10);
-    let mut last_nudge = std::time::Instant::now();
-
-    let sched_running = loop {
-        if start.elapsed() >= timeout {
-            break false;
-        }
-
-        let running: bool = db
-            .query_scalar(
-                "SELECT EXISTS(\
-                     SELECT 1 FROM pg_stat_activity \
-                     WHERE application_name = 'pg_trickle scheduler' \
-                       AND datname = current_database()\
-                 )",
-            )
-            .await;
-
-        if running {
-            break true;
-        }
-
-        // Periodically send SIGHUP to wake the launcher.
-        if last_nudge.elapsed() >= nudge_interval {
-            db.execute("SELECT pg_reload_conf()").await;
-            last_nudge = std::time::Instant::now();
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    let sched_running = db.wait_for_scheduler(Duration::from_secs(90)).await;
 
     assert!(
         sched_running,
@@ -95,7 +61,7 @@ async fn configure_fast_scheduler(db: &E2eDb) {
          prevent this, but check that terminate_other_backends() preserves advisory-lock \
          connections (application_name = 'pg_trickle_test_lock'); \
          (2) launcher retry back-off (retry_ttl=15 s + poll=10 s = 25 s) exceeded \
-         the timeout — this fits in 90 s if there is no interference; \
+         the timeout even after periodic launcher rescan nudges; \
          (3) pg_trickle.enabled GUC is false; \
          (4) max_worker_processes exhausted — E2E image sets it to 128 (rebuild with \
          `just build-e2e-image` if using an older image)."

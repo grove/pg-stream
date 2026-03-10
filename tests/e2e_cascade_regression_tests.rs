@@ -245,8 +245,8 @@ async fn test_st_on_st_cascade_propagates_delete() {
 /// - `pg_trickle.min_schedule_seconds = 1` (allow 1-second schedule)
 ///
 /// Also waits for the pg_trickle scheduler BGW to appear in pg_stat_activity.
-/// Nudges the launcher every 10 s via `pg_reload_conf()` (SIGHUP) to reduce
-/// wake latency when max_worker_processes pressure causes spawn failures.
+/// The wait helper periodically bumps the launcher rescan signal and sends
+/// SIGHUP so stale `last_attempt` entries are retried promptly.
 async fn configure_fast_scheduler(db: &E2eDb) {
     db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
         .await;
@@ -258,41 +258,9 @@ async fn configure_fast_scheduler(db: &E2eDb) {
     db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
         .await;
 
-    // Ensure the scheduler BGW is running before tests depend on it.
-    // Nudge the launcher every 10 s via pg_reload_conf() (SIGHUP) so it
-    // wakes from its latch sleep and re-tries spawn more promptly.
-    // Timeout: 90 s — enough for three full 25 s respawn cycles.
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(90);
-    let nudge_interval = std::time::Duration::from_secs(10);
-    let mut last_nudge = std::time::Instant::now();
-
-    let sched_running = loop {
-        if start.elapsed() >= timeout {
-            break false;
-        }
-
-        let running: bool = db
-            .query_scalar(
-                "SELECT EXISTS(\
-                     SELECT 1 FROM pg_stat_activity \
-                     WHERE application_name = 'pg_trickle scheduler' \
-                       AND datname = current_database()\
-                 )",
-            )
-            .await;
-
-        if running {
-            break true;
-        }
-
-        if last_nudge.elapsed() >= nudge_interval {
-            db.execute("SELECT pg_reload_conf()").await;
-            last_nudge = std::time::Instant::now();
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    };
+    let sched_running = db
+        .wait_for_scheduler(std::time::Duration::from_secs(90))
+        .await;
 
     assert!(
         sched_running,
