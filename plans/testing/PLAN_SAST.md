@@ -11,20 +11,121 @@ surfaces, dependency risk, and extension-specific SQL/security-context hazards.
 
 ## Table of Contents
 
-1. [Motivation](#motivation)
-2. [Threat Model and Security Surfaces](#threat-model-and-security-surfaces)
-3. [Current State](#current-state)
-4. [Goals and Non-Goals](#goals-and-non-goals)
-5. [Proposed SAST Stack](#proposed-sast-stack)
-6. [Phase Plan](#phase-plan)
-7. [Semgrep Rules Roadmap](#semgrep-rules-roadmap)
-8. [Unsafe / FFI Review Strategy](#unsafe--ffi-review-strategy)
-9. [CI Integration Strategy](#ci-integration-strategy)
-10. [Finding Triage and Policy](#finding-triage-and-policy)
-11. [Validation Plan](#validation-plan)
-12. [Success Criteria](#success-criteria)
-13. [Implementation Checklist](#implementation-checklist)
-14. [Open Questions](#open-questions)
+1. [Security Newbie Checklist](#security-newbie-checklist)
+2. [Motivation](#motivation)
+3. [Threat Model and Security Surfaces](#threat-model-and-security-surfaces)
+4. [Current State](#current-state)
+5. [Goals and Non-Goals](#goals-and-non-goals)
+6. [Proposed SAST Stack](#proposed-sast-stack)
+7. [Phase Plan](#phase-plan)
+8. [Semgrep Rules Roadmap](#semgrep-rules-roadmap)
+9. [Unsafe / FFI Review Strategy](#unsafe--ffi-review-strategy)
+10. [CI Integration Strategy](#ci-integration-strategy)
+11. [Finding Triage and Policy](#finding-triage-and-policy)
+12. [Validation Plan](#validation-plan)
+13. [Success Criteria](#success-criteria)
+14. [Implementation Checklist](#implementation-checklist)
+15. [Open Questions](#open-questions)
+
+---
+
+## Security Newbie Checklist
+
+> **Not a security expert? Start here.**  
+> This section explains what this PR does and what you need to know as a
+> reviewer or contributor, without requiring a deep background in static
+> analysis or PostgreSQL security.
+
+### What is SAST and why are we adding it?
+
+**SAST** (Static Application Security Testing) means running automated tools
+over source code to spot likely security problems before the code ever runs.
+Think of it as a spell-checker, but for security patterns.
+
+`pg_trickle` is a PostgreSQL extension that runs inside the Postgres server
+process with elevated privileges. A bug here can affect the database itself,
+not just some isolated application. That means the bar for security hygiene is
+higher than a typical Rust CLI or web service.
+
+The existing tooling (clippy, cargo audit, unit / E2E tests) is great for
+correctness. SAST adds a complementary layer that looks specifically for
+security-relevant patterns: unsafe pointer use, dynamic SQL that could be
+abused, privilege escalation helpers, and risky dependency sources.
+
+### What files does this PR actually add?
+
+| File | Plain-English purpose |
+|------|-----------------------|
+| `.github/workflows/codeql.yml` | Runs GitHub's CodeQL scanner on Rust code. Findings appear in the repo's Security tab. |
+| `.github/workflows/dependency-policy.yml` | Runs `cargo deny` to block known-bad or off-registry dependencies. |
+| `deny.toml` | Configuration file that tells `cargo deny` what is and isn't allowed. |
+| `.github/workflows/semgrep.yml` | Runs Semgrep to detect pg_trickle-specific patterns (see below). |
+| `.semgrep/pg_trickle.yml` | Custom Semgrep rules written for this codebase. Currently advisory only. |
+
+### Will any of these new checks block my PR?
+
+**Right now:** CodeQL and `cargo deny` are blocking. Semgrep is advisory only
+(it uploads findings but will not fail a PR).
+
+| Check | Breaks the build? | What it catches |
+|-------|-------------------|-----------------|
+| CodeQL | Yes | Rust dataflow / security bug classes |
+| `cargo deny` | Yes | Banned, unlicensed, or sketchy dependencies |
+| `cargo audit` (existing) | Yes | Known CVE advisories |
+| Semgrep | **No** (advisory) | Extension-specific patterns like dynamic SQL |
+
+> **Note:** Semgrep warnings are meant to prompt a review conversation, not
+> to require an immediate code change. If you see a Semgrep annotation on your
+> PR, read the message, decide if it applies, and comment on your decision.
+> You do not need to suppress it unless the pattern is a confirmed false
+> positive.
+
+### What does "advisory" mean in practice?
+
+Advisory means the tool will report findings but will not make CI red. You
+(or a reviewer) can choose to ignore them, leave a comment, or address them —
+but the PR will not be blocked. The plan is to move from advisory to blocking
+only after rules have been tuned and false-positive rates are acceptable.
+
+### What should I do if CodeQL or cargo-deny flags something?
+
+1. **Read the message.** It usually says what pattern was detected and why it
+   can be risky.
+2. **Check if it is a real issue.** Is dynamic SQL actually taking unchecked
+   user input? Is a crate actually disallowed or from an untrusted source?
+3. **Fix it if it is real.** Common fixes: use a quoting helper, replace
+   `format!()` with bound parameters, or swap a dependency.
+4. **Suppress with a justification if it is a false positive.** For CodeQL,
+   use a `// lgtm` or `// codeql` inline suppression. For `cargo deny`, add
+   an `allow` entry to `deny.toml`. Always include a comment explaining why
+   the pattern is safe here.
+5. **Never add a blanket ignore.** Suppressions should be as narrow as
+   possible — scoped to the specific line or crate, not the whole file.
+
+### The two things most likely to confuse reviewers
+
+1. **Dynamic SPI SQL hits in Semgrep.**  
+   The extension legitimately builds SQL strings to interact with PostgreSQL
+   internals. Not all of these are bugs. The Semgrep rules are designed to
+   surface them for review, not to declare them wrong. Ask yourself: "Is the
+   interpolated value validated or quoted before it reaches the database?"
+   If yes, leave a comment and move on.
+
+2. **`unsafe` blocks.**  
+   We use `unsafe` to cross the Rust / PostgreSQL FFI boundary. Every unsafe
+   block should have a `// SAFETY:` comment explaining the invariant being
+   upheld. If you add or touch an unsafe block and the comment is missing,
+   add it. This is not optional.
+
+### Quick review checklist for this PR
+
+- [ ] The new workflow files trigger at sensible times (PR, push to main,
+      weekly schedule) and do not run on every trivial commit.
+- [ ] `deny.toml` does not accidentally ban anything already in `Cargo.toml`.
+- [ ] Semgrep rules have clear, human-readable `message` fields.
+- [ ] All new `unsafe` blocks have a `// SAFETY:` comment.
+- [ ] Nothing in the Semgrep or CodeQL advisory output represents an obvious
+      real vulnerability that should be fixed before merging.
 
 ---
 
