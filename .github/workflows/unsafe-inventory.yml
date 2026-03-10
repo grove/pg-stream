@@ -1,0 +1,55 @@
+# =============================================================================
+# Unsafe Inventory Workflow — surface unsafe block growth in PRs.
+#
+# Counts `unsafe {` blocks per .rs file and compares against the committed
+# baseline in .unsafe-baseline. Fails if any file exceeds its baseline count.
+#
+# This is an advisory signal: the workflow posts a per-file table as a step
+# summary so reviewers can see unsafe growth at a glance. It is not a required
+# check for PR merge (add it to branch protection once the team adopts the
+# policy).
+#
+# To update the baseline after a justified unsafe addition:
+#   scripts/unsafe_inventory.sh --update > .unsafe-baseline
+#   git add .unsafe-baseline && git commit -m "chore: update unsafe baseline"
+# =============================================================================
+name: Unsafe inventory
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.unsafe-baseline'
+      - 'scripts/unsafe_inventory.sh'
+      - '.github/workflows/unsafe-inventory.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - '.unsafe-baseline'
+      - 'scripts/unsafe_inventory.sh'
+      - '.github/workflows/unsafe-inventory.yml'
+  schedule:
+    - cron: '15 9 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unsafe-inventory:
+    name: Unsafe block inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run unsafe inventory
+        run: |
+          chmod +x scripts/unsafe_inventory.sh
+          scripts/unsafe_inventory.sh

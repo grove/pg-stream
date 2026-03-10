@@ -172,6 +172,42 @@ run without `#[ignore]`:
 
 ### Added
 
+- **SAST Phase 2 + 3 — Privilege-context rules and unsafe inventory**
+  (`sast-review-1` branch):
+
+  - **Phase 2 — Extension-specific Semgrep rules** (`.semgrep/pg_trickle.yml`):
+    - `sql.row-security.disabled` — flags `SET LOCAL row_security = off` in
+      `src/**` and `sql/**`. Alerts reviewers when the extension disables RLS,
+      which can bypass per-user policies in a `SECURITY DEFINER` context.
+    - `sql.set-role.present` — flags `SET ROLE` / `RESET ROLE` patterns. Role
+      transitions in extension code can widen or narrow privileges unexpectedly.
+    - Updated `sql.security-definer.present` message to explicitly require
+      `SET search_path = schema, pg_catalog, pg_temp` alongside every
+      `SECURITY DEFINER` declaration. Prevents search-path hijacking.
+    - All three rules are advisory (WARNING/INFO, SARIF upload only, no CI gate).
+    - No current hits in source — rules are proactive, will fire when these
+      patterns are added during the RLS and privilege-hardening work in v0.3.0.
+
+  - **Phase 3 — Unsafe block inventory** (`scripts/unsafe_inventory.sh`):
+    - New `scripts/unsafe_inventory.sh` counts `unsafe {` blocks per `.rs` file
+      and compares against the committed baseline in `.unsafe-baseline`.
+    - `.unsafe-baseline` records the 2026-03-10 snapshot: 1309 total `unsafe {`
+      blocks across 6 files (`api.rs`:10, `dvm/parser.rs`:1286, `lib.rs`:1,
+      `scheduler.rs`:5, `shmem.rs`:3, `wal_decoder.rs`:4).
+    - New `.github/workflows/unsafe-inventory.yml` runs the script on PRs that
+      touch `src/**`. Posts a per-file delta table to `GITHUB_STEP_SUMMARY`.
+      Fails if any file exceeds its baseline count.
+    - New `just unsafe-inventory` recipe for local use.
+    - `clippy::undocumented_unsafe_blocks` deferred: `src/dvm/parser.rs` has
+      1286 mechanical pgrx FFI blocks needing a `#![allow]` first.
+
+  - **CI workflow trigger tightening** (`.github/workflows/codeql.yml` and
+    `semgrep.yml`): removed `pull_request` trigger from both CodeQL and
+    Semgrep. CodeQL output lands in the Security tab only (no inline PR
+    annotations), so running it on every PR added ~25 min cost with no
+    faster feedback. Semgrep is advisory-only and never blocks merge.
+    Both workflows still run on push-to-main and weekly Monday schedule.
+
 - **SAST / static security analysis baseline** — new security tooling on the
   `codeql-workflow` branch, now merged:
   - **GitHub CodeQL** (`.github/workflows/codeql.yml`) — runs 16 Rust security

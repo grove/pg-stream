@@ -476,6 +476,34 @@ DIFFERENTIAL baseline. No `src/` changes — test-only additions.
 
 ---
 
+## SAST Program (Phases 1–3)
+
+**Branch:** `sast-review-1`  
+**Status:** Phases 1–3 complete.  
+**Ref:** [plans/testing/PLAN_SAST.md](plans/testing/PLAN_SAST.md)
+
+Incremental SAST (Static Application Security Testing) rollout. Phases 0–1
+(CodeQL, cargo deny, initial Semgrep, first alert triage) merged via the
+`codeql-workflow` branch and were detailed in the v0.2.3 changelog. This
+branch implements Phases 2–3 and CI workflow tuning.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| S1 | Remove `pull_request` trigger from CodeQL + Semgrep workflows | ✅ Done |
+| S2 | `sql.row-security.disabled` Semgrep rule | ✅ Done |
+| S3 | `sql.set-role.present` Semgrep rule | ✅ Done |
+| S4 | Updated `sql.security-definer.present` message: explicit `SET search_path` guidance | ✅ Done |
+| S5 | `scripts/unsafe_inventory.sh` — per-file `unsafe {` counter | ✅ Done |
+| S6 | `.unsafe-baseline` — committed baseline (1309 blocks across 6 files) | ✅ Done |
+| S7 | `.github/workflows/unsafe-inventory.yml` — advisory CI workflow | ✅ Done |
+| S8 | `just unsafe-inventory` recipe | ✅ Done |
+
+**Next (Phase 4):** promote high-confidence Semgrep rules from advisory to
+blocking after the privilege-context rules have been validated against v0.3.0
+RLS/SECURITY DEFINER work.
+
+---
+
 ## v0.3.0 — Parallel Refresh, Security & Partitioning
 
 **Goal:** Deliver true parallel refresh first, then harden security (RLS) and

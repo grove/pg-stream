@@ -34,9 +34,10 @@ rules:
       - generic
     severity: INFO
     message: >-
-      SECURITY DEFINER requires explicit review. Pin search_path and verify the
-      function body cannot be influenced by attacker-controlled identifiers or
-      SQL fragments.
+      SECURITY DEFINER requires explicit review. Always pin the search path:
+      SET search_path = pgtrickle, pg_catalog, pg_temp; — otherwise an
+      unprivileged user can pre-create objects in a schema earlier on the path
+      and intercept calls made by the privileged function.
     paths:
       include:
         - src/**
@@ -46,3 +47,45 @@ rules:
         - plans/**
         - docs/**
     pattern-regex: SECURITY\s+DEFINER
+
+  # ── Phase 2: Extension-specific privilege-context rules ─────────────────────
+
+  - id: sql.row-security.disabled
+    languages:
+      - generic
+    severity: WARNING
+    message: >-
+      SET LOCAL row_security = off disables PostgreSQL row-level security for
+      the current transaction. In a SECURITY DEFINER extension context this can
+      allow privileged code to bypass per-user RLS policies. Verify the context
+      is appropriate and this path is not reachable from an unprivileged caller
+      via the extension API.
+    paths:
+      include:
+        - src/**
+        - sql/**
+      exclude:
+        - "**/*.md"
+        - plans/**
+        - docs/**
+    pattern-regex: 'SET\s+LOCAL\s+row_security\s*=\s*off'
+
+  - id: sql.set-role.present
+    languages:
+      - generic
+    severity: WARNING
+    message: >-
+      SET ROLE or RESET ROLE modifies the current session role context. In a
+      SECURITY DEFINER extension context this can widen or narrow privileges
+      unexpectedly. Verify the role transition is intentional, bounded by a
+      matching RESET ROLE or transaction boundary, and that the target role is
+      the one you intend.
+    paths:
+      include:
+        - src/**
+        - sql/**
+      exclude:
+        - "**/*.md"
+        - plans/**
+        - docs/**
+    pattern-regex: '(SET\s+ROLE\b|RESET\s+ROLE\b)'

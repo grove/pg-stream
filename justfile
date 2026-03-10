@@ -44,6 +44,11 @@ clippy:
 [group: "lint"]
 lint: fmt-check clippy
 
+# Audit unsafe block counts against the committed baseline (.unsafe-baseline)
+[group: "lint"]
+unsafe-inventory:
+    bash scripts/unsafe_inventory.sh
+
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 # Run pure-Rust unit tests (no Docker needed)
