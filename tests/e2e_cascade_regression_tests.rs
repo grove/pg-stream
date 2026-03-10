@@ -245,10 +245,8 @@ async fn test_st_on_st_cascade_propagates_delete() {
 /// - `pg_trickle.min_schedule_seconds = 1` (allow 1-second schedule)
 ///
 /// Also waits for the pg_trickle scheduler BGW to appear in pg_stat_activity.
-/// The launcher spawns per-database schedulers dynamically; when many test
-/// databases are active simultaneously the launcher may take up to ~10 s to
-/// notice a freshly-installed extension. Waiting here prevents spurious
-/// "timed out waiting for scheduler cycle" failures in the tests below.
+/// Nudges the launcher every 10 s via `pg_reload_conf()` (SIGHUP) to reduce
+/// wake latency when max_worker_processes pressure causes spawn failures.
 async fn configure_fast_scheduler(db: &E2eDb) {
     db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
         .await;
@@ -259,21 +257,51 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         .await;
     db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
         .await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Ensure the scheduler BGW is actually running before tests depend on it.
-    // The launcher wakes at most every 10 s; give it 30 s to spawn.
-    let sched_running = db
-        .wait_for_scheduler(std::time::Duration::from_secs(60))
-        .await;
+    // Ensure the scheduler BGW is running before tests depend on it.
+    // Nudge the launcher every 10 s via pg_reload_conf() (SIGHUP) so it
+    // wakes from its latch sleep and re-tries spawn more promptly.
+    // Timeout: 90 s — enough for three full 25 s respawn cycles.
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(90);
+    let nudge_interval = std::time::Duration::from_secs(10);
+    let mut last_nudge = std::time::Instant::now();
+
+    let sched_running = loop {
+        if start.elapsed() >= timeout {
+            break false;
+        }
+
+        let running: bool = db
+            .query_scalar(
+                "SELECT EXISTS(\
+                     SELECT 1 FROM pg_stat_activity \
+                     WHERE application_name = 'pg_trickle scheduler' \
+                       AND datname = current_database()\
+                 )",
+            )
+            .await;
+
+        if running {
+            break true;
+        }
+
+        if last_nudge.elapsed() >= nudge_interval {
+            db.execute("SELECT pg_reload_conf()").await;
+            last_nudge = std::time::Instant::now();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    };
+
     assert!(
         sched_running,
-        "pg_trickle scheduler did not appear in pg_stat_activity within 60 s. \
-         Possible causes: (1) max_worker_processes exhausted — check that the \
-         E2E Docker image sets max_worker_processes = 32; \
-         (2) launcher retry back-off not yet expired — the launcher waits up to \
-         retry_ttl (15 s) + poll interval (10 s) = 25 s after the last failed \
-         spawn attempt before retrying; \
+        "pg_trickle scheduler did not appear in pg_stat_activity within 90 s. \
+         Possible causes: (1) max_worker_processes exhausted — the E2E Docker \
+         image now sets max_worker_processes = 128; rebuild with \
+         `just build-e2e-image` if using an older image; \
+         (2) launcher retry back-off (retry_ttl=15 s + poll=10 s = 25 s) exceeded \
+         the timeout — three full cycles allowed by 90 s window; \
          (3) pg_trickle.enabled GUC is false."
     );
 }
