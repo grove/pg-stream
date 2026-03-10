@@ -9,6 +9,65 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Fixed
+
+#### HAVING Clause Differential Correctness (5 tests un-ignored)
+
+Fixed two DVM bugs that caused HAVING threshold-crossing transitions to produce
+incorrect stream table contents in DIFFERENTIAL mode:
+
+- **`COUNT(*)` in HAVING predicate rewrite:** PostgreSQL parses `COUNT(*)` in
+  HAVING as `FuncCall { agg_star: true, args: [] }`, but the expression
+  normalizer converts it to `FuncCall { func_name: "count", args: [Raw("*")] }`.
+  `rewrite_having_expr` checked `args.is_empty()` to detect CountStar, which
+  was `false` for the normalized `[Raw("*")]` form. The unmatched call leaked
+  into the WHERE clause of the HAVING-filter CTE, producing a "syntax error at
+  or near `*`" PostgreSQL error. Fixed by extending the CountStar check to also
+  accept a single `Raw("*")` argument. Same fix applied in
+  `extract_aggregates_from_expr_inner`.
+
+- **Threshold crossing upward — missing aggregate baseline:** When a group is
+  below the HAVING threshold it is absent from the stream table (ST). The
+  algebraic merge used `COALESCE(st.col, 0)` as the pre-existing aggregate
+  base, which evaluates to `0` for absent groups. This made the new aggregate
+  value equal to the per-cycle delta only, ignoring all pre-existing source
+  rows. For example, a group with 10 existing rows getting 15 new rows would
+  produce `SUM = 15` instead of `25`. Fixed by forcing a full re-aggregation
+  rescan when `ctx.having_filter = true`: for groups where `st.col IS NULL`
+  (new groups entering the ST), the rescan CTE's re-aggregated value is used
+  instead of `0 + delta`. Existing groups (already in ST) continue to use the
+  algebraic merge path.
+
+Five previously-ignored E2E tests in `tests/e2e_having_transition_tests.rs`
+now run without `#[ignore]`:
+
+- `test_group_enters_having_threshold` — group crosses upward via SUM
+- `test_group_exits_having_threshold` — group drops below threshold
+- `test_having_count_star_threshold` — `COUNT(*) > N` threshold crossing
+- `test_having_with_multiple_groups` — multiple groups transitioning simultaneously
+- `test_having_threshold_with_nulls` — NULL-handling in HAVING aggregate
+
+### Changed
+
+- **Test count:** 8 DVM-correctness E2E tests remain `#[ignore]`d (down from
+  18 at the v0.2.3 release). The 5 HAVING tests above plus the 5 keyless-table
+  duplicate tests (already un-ignored before this release) account for the 10
+  recovered tests. Remaining: `e2e_full_join_tests` (5),
+  `e2e_scalar_subquery_tests` (2), `e2e_sublink_or_tests` (1).
+
+### Known Limitations
+
+8 E2E tests are currently marked `#[ignore]` due to DVM correctness bugs that
+will be addressed in future releases:
+
+| Suite | Ignored | Reason |
+|---|---|---|
+| `e2e_full_join_tests` | 5/5 | FULL OUTER JOIN differential produces incorrect boundary results |
+| `e2e_scalar_subquery_tests` | 2/4 | Correlated scalar subquery differential generates invalid SQL |
+| `e2e_sublink_or_tests` | 1/4 | Correlated EXISTS with HAVING loses aggregate state |
+
+---
+
 ### Added
 
 - **TPC-H test suite enhancements (T1–T6)** — second wave of TPC-H correctness
@@ -765,22 +824,26 @@ test compilation.
 ### Changed
 
 - **Test count:** ~1,455 total tests (up from ~1,138): 963 unit + 32 integration
-  + 460 E2E across 34 test files (up from ~22). 18 E2E tests are `#[ignore]`d
-  pending DVM correctness fixes (see Known Limitations below).
+  + 460 E2E across 34 test files (up from ~22). At release, 18 E2E tests were
+  `#[ignore]`d pending DVM correctness fixes (reduced to 8 in later releases;
+  see [Unreleased] Known Limitations).
 - **1 new GUC variable** — `buffer_alert_threshold` added. Total: 16 GUCs.
 
 ### Known Limitations
 
-18 E2E tests are marked `#[ignore]` due to pre-existing DVM differential logic
-bugs that will be addressed in future releases:
+> **Note:** Five HAVING tests (listed below) were subsequently fixed in the
+> next release. See [Unreleased] Known Limitations for the current state.
 
-| Suite | Ignored | Reason |
+18 E2E tests were marked `#[ignore]` at v0.2.3 release due to pre-existing DVM
+differential logic bugs:
+
+| Suite | Ignored | Status |
 |---|---|---|
-| `e2e_full_join_tests` | 5/5 | FULL OUTER JOIN differential produces incorrect results |
-| `e2e_having_transition_tests` | 5/7 | HAVING threshold crossing differential incorrect |
-| `e2e_keyless_duplicate_tests` | 5/7 | Keyless table duplicate-row row_id hash collision |
-| `e2e_scalar_subquery_tests` | 2/4 | Correlated scalar subquery differential generates invalid SQL |
-| `e2e_sublink_or_tests` | 1/4 | Correlated EXISTS with HAVING loses aggregate state |
+| `e2e_full_join_tests` | 5/5 | Still open — FULL OUTER JOIN differential |
+| `e2e_having_transition_tests` | 5/7 | **Fixed** — see [Unreleased] Fixed section |
+| `e2e_keyless_duplicate_tests` | 5/7 | **Fixed** — un-ignored as part of F48 |
+| `e2e_scalar_subquery_tests` | 2/4 | Still open — correlated subquery diff |
+| `e2e_sublink_or_tests` | 1/4 | Still open — correlated EXISTS with HAVING |
 
 ---
 

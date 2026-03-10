@@ -1,9 +1,54 @@
 # PLAN_IGNORED_E2E_TESTS.md — Re-enable Ignored E2E Coverage
 
-**Status:** Proposed  
+**Status:** In Progress  
 **Date:** 2026-03-09  
-**Branch:** `main`  
+**Branch:** `plan-ignored-e2e-tests`  
 **Scope:** Reconcile the stale changelog note about 18 ignored E2E tests, re-enable the suites that are already supportable, and implement the remaining DVM fixes needed to bring the still-failing ignored tests back into normal E2E coverage.
+
+---
+
+## Implementation Progress
+
+| Workstream | Status | Notes |
+|---|---|---|
+| A1 — Keyless duplicate suite | ✅ Complete | Already done before this plan; docs updated |
+| A2 — HAVING transition suite | ✅ Complete | 2 DVM bugs fixed; 5 tests un-ignored |
+| B1 — Correlated scalar subquery | 🔴 Keep ignored | Still fails with two distinct errors — see below |
+| C1 — FULL JOIN differential | ⬜ Not started | Real DVM bugs remain |
+| C2 — Correlated EXISTS with HAVING | ⬜ Not started | Real DVM bug remains |
+| D1 — Changelog/docs re-baseline | ✅ Complete | CHANGELOG + Known Limitations updated |
+
+### A2 Root Causes Fixed
+
+**Bug 1:** `COUNT(*)` in HAVING predicate rewrite caused "syntax error at or near `*`".
+- Root cause: PostgreSQL normalizes `COUNT(*)` in HAVING to `FuncCall { args: [Raw("*")] }`, but
+  `rewrite_having_expr` checked `args.is_empty()` for CountStar detection.
+- Fix: Extended the CountStar check in `rewrite_having_expr` and
+  `extract_aggregates_from_expr_inner` to also accept `[Raw("*")]`.
+- Files: `src/dvm/parser.rs`
+
+**Bug 2:** Threshold crossing upward produced wrong aggregate value for groups absent from ST.
+- Root cause: Algebraic merge used `COALESCE(st.col, 0) + delta` for absent groups, which
+  ignores all pre-existing source rows. A group with 10 existing rows getting 15 new rows
+  would produce `SUM = 15` instead of `25`.
+- Fix: Added `having_filter: bool` flag to `DiffContext`. `diff_filter` sets the flag before
+  calling `diff_aggregate`. `build_rescan_cte` extended with `force_all_aggs` param that
+  includes all aggregates + `COUNT(*) AS __pgt_count`. `agg_merge_expr_mapped` uses
+  `CASE WHEN st.col IS NULL THEN COALESCE(r.col, 0) ELSE algebraic_expr END` when
+  `having_rescan = true`, using the full rescan value for new groups.
+- Files: `src/dvm/diff.rs`, `src/dvm/operators/filter.rs`, `src/dvm/operators/aggregate.rs`
+
+### B1 Scalar Subquery — Still Failing
+
+Clean re-run confirms both ignored tests still fail:
+- `test_correlated_scalar_subquery_differential` → "column `d.name` must appear in the GROUP BY
+  clause or be used in an aggregate function" (invalid SQL generation in scalar subquery diff)
+- `test_scalar_subquery_null_result_differential` → "missing FROM-clause entry for table `m`"
+  (alias resolution error during refresh)
+
+Decision: Keep `#[ignore]` per the plan's decision rule ("fails once reproducibly → move into
+Workstream C-style bugfix work and keep ignored until fixed"). These require dedicated DVM
+operator work in `src/dvm/operators/scalar_subquery.rs`.
 
 ---
 
