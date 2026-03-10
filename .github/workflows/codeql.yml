@@ -8,21 +8,9 @@
 name: CodeQL
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-      - 'PLAN*.md'
-      - 'REPORT*.md'
-      - 'adrs/**'
-      - 'plans/**'
-      - 'coverage/**'
-  # No pull_request trigger: CodeQL output goes to the Security tab only
-  # (never inline PR annotations), so running it on every PR adds ~25 min of
-  # CI cost with no faster feedback. Weekly schedule + push-to-main is enough.
+  # No push or pull_request trigger: CodeQL output goes to the Security tab
+  # only (never inline PR annotations), so running it on every push/PR adds
+  # ~25 min of CI cost with no faster feedback. Weekly schedule is enough.
   schedule:
     - cron: '0 9 * * 1'
   workflow_dispatch:
