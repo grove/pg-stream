@@ -22,9 +22,6 @@ allow = [
 version = 2
 yanked = "warn"
 ignore = [
-  # Pulled in transitively via sqlx's mysql support; not compiled for this
-  # PostgreSQL-only extension build.
-  "RUSTSEC-2023-0071",
   # paste is used internally by pgrx macros; we have no upstream control over
   # this dep. Not a vulnerability, only a maintenance status notice.
   "RUSTSEC-2024-0436",
@@ -41,6 +38,36 @@ ignore = [
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
+# These duplicate versions come from pgrx pulling one version and
+# testcontainers/bollard pulling another. We have no direct control over these
+# version skews; they are dev-only or cross-compilation stubs.
+skip = [
+  # thiserror: pgrx uses v1, our code and testcontainers use v2
+  { name = "thiserror",      version = "=1.0.69" },
+  { name = "thiserror-impl", version = "=1.0.69" },
+  # getrandom: split between pgrx (0.3) and newer crates (0.4)
+  { name = "getrandom", version = "=0.3.4" },
+  # hashbrown: multiple major versions pulled by indexmap and others
+  { name = "hashbrown", version = "=0.15.5" },
+  # wasi: 0.11 from older crates, 0.14 from newer wasmtime-based stack
+  { name = "wasi", version = "=0.11.1+wasi-snapshot-preview1" },
+  # windows-* crates: version skew between ring (0.52) and socket2/hyper-util
+  # (0.53+) pulled by bollard/testcontainers
+  { name = "windows-core",      version = "=0.57.0" },
+  { name = "windows-implement", version = "=0.57.0" },
+  { name = "windows-interface", version = "=0.57.0" },
+  { name = "windows-result",    version = "=0.1.2"  },
+  { name = "windows-sys",     version = "=0.60.2" },
+  { name = "windows-targets", version = "=0.52.6" },
+  { name = "windows_aarch64_gnullvm", version = "=0.52.6" },
+  { name = "windows_aarch64_msvc",    version = "=0.52.6" },
+  { name = "windows_i686_gnu",     version = "=0.52.6" },
+  { name = "windows_i686_gnullvm", version = "=0.52.6" },
+  { name = "windows_i686_msvc",    version = "=0.52.6" },
+  { name = "windows_x86_64_gnu",     version = "=0.52.6" },
+  { name = "windows_x86_64_gnullvm", version = "=0.52.6" },
+  { name = "windows_x86_64_msvc",    version = "=0.52.6" },
+]
 
 [sources]
 unknown-registry = "deny"
