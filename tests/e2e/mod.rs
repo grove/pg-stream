@@ -50,6 +50,17 @@ use testcontainers::{
 const IMAGE_NAME: &str = "pg_trickle_e2e";
 #[cfg(not(feature = "light-e2e"))]
 const IMAGE_TAG: &str = "latest";
+// Server-wide PostgreSQL advisory lock key that serialises all concurrent test
+// binaries sharing the `postgres` database.  All four binaries that call
+// `new_on_postgres_db()` (bgworker, cascade, dag_autorefresh, wal_cdc) compete
+// on this key — only one can hold the lock at a time, preventing cross-binary
+// reset/scheduler interference.
+#[cfg(not(feature = "light-e2e"))]
+const POSTGRES_DB_ADVISORY_LOCK_KEY: i64 = 0x7067_7472_6963_6b6c_u64 as i64; // "pgtrickl"
+// application_name used by the advisory-lock-holder connection so that
+// terminate_other_backends() can exclude it from the pg_terminate_backend() sweep.
+#[cfg(not(feature = "light-e2e"))]
+const ADVISORY_LOCK_APP_NAME: &str = "pg_trickle_test_lock";
 #[cfg(not(feature = "light-e2e"))]
 static SHARED_DB_COUNTER: AtomicUsize = AtomicUsize::new(1);
 #[cfg(not(feature = "light-e2e"))]
@@ -157,13 +168,21 @@ async fn terminate_other_backends(admin_pool: &PgPool) {
     // Shared-db tests reuse `postgres`, so the previous test's sqlx pool and
     // the per-database scheduler worker can still hold locks when the next
     // test starts its reset. Terminate them first to keep cleanup deterministic.
+    //
+    // Connections with application_name = ADVISORY_LOCK_APP_NAME hold the
+    // server-wide advisory lock that serialises concurrent test binaries.
+    // They MUST NOT be terminated — doing so would release the lock and allow
+    // another binary to race in.  The waiting binaries' advisory-lock
+    // connections also carry this name, so excluding it prevents killing
+    // processes that are legitimately waiting for their turn.
     sqlx::query(
         "SELECT pg_terminate_backend(pid) \
          FROM pg_stat_activity \
          WHERE datname = current_database() \
-                     AND pid <> pg_backend_pid() \
-                     AND (backend_type = 'client backend' \
-                                OR application_name = 'pg_trickle scheduler')",
+           AND pid <> pg_backend_pid() \
+           AND application_name <> 'pg_trickle_test_lock' \
+           AND (backend_type = 'client backend' \
+                OR application_name = 'pg_trickle scheduler')",
     )
     .execute(admin_pool)
     .await
@@ -174,9 +193,10 @@ async fn terminate_other_backends(admin_pool: &PgPool) {
             "SELECT count(*) \
              FROM pg_stat_activity \
              WHERE datname = current_database() \
-                             AND pid <> pg_backend_pid() \
-                             AND (backend_type = 'client backend' \
-                                        OR application_name = 'pg_trickle scheduler')",
+               AND pid <> pg_backend_pid() \
+               AND application_name <> 'pg_trickle_test_lock' \
+               AND (backend_type = 'client backend' \
+                    OR application_name = 'pg_trickle scheduler')",
         )
         .fetch_one(admin_pool)
         .await
@@ -193,9 +213,10 @@ async fn terminate_other_backends(admin_pool: &PgPool) {
         "SELECT count(*) \
          FROM pg_stat_activity \
          WHERE datname = current_database() \
-                     AND pid <> pg_backend_pid() \
-                     AND (backend_type = 'client backend' \
-                                OR application_name = 'pg_trickle scheduler')",
+           AND pid <> pg_backend_pid() \
+           AND application_name <> 'pg_trickle_test_lock' \
+           AND (backend_type = 'client backend' \
+                OR application_name = 'pg_trickle scheduler')",
     )
     .fetch_one(admin_pool)
     .await
@@ -378,6 +399,10 @@ pub struct E2eDb {
     connection_string: String,
     container_id: String,
     _shared_postgres_db_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Holds the server-wide advisory lock for the `postgres` database.
+    /// `None` for tests that use a fresh per-test database instead.
+    /// Dropped (and the advisory lock released) when `E2eDb` is dropped.
+    _advisory_lock_pool: Option<PgPool>,
     _container: ContainerLease,
 }
 
@@ -400,6 +425,7 @@ impl E2eDb {
             connection_string,
             container_id: shared.container_id.clone(),
             _shared_postgres_db_guard: None,
+            _advisory_lock_pool: None,
             _container: ContainerLease::Shared { _shared: shared },
         }
     }
@@ -413,6 +439,34 @@ impl E2eDb {
     pub async fn new_on_postgres_db() -> Self {
         let shared_postgres_db_guard = SHARED_POSTGRES_DB_LOCK.clone().lock_owned().await;
         let shared = shared_container().await;
+
+        // Acquire a server-wide PostgreSQL advisory lock before touching the
+        // `postgres` database.  Four test binaries (bgworker, cascade,
+        // dag_autorefresh, wal_cdc) all call new_on_postgres_db() and each
+        // runs reset_postgres_database() + configure_fast_scheduler().
+        // Running them concurrently creates a thundering-herd: one binary's
+        // reset kills the scheduler that another binary's configure_fast_scheduler
+        // is waiting for, causing repeated 15–25 s back-offs that exceed the
+        // 90 s timeout.
+        //
+        // pg_advisory_lock() is server-wide (not per-database), so this lock
+        // coordinates across all processes on the same PostgreSQL server.
+        // The connection uses application_name = ADVISORY_LOCK_APP_NAME so
+        // that terminate_other_backends() can identify and preserve it.
+        let advisory_lock_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&format!(
+                "{}?application_name={}",
+                shared.admin_connection_string, ADVISORY_LOCK_APP_NAME,
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("Failed to connect for postgres advisory lock: {e}"));
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(POSTGRES_DB_ADVISORY_LOCK_KEY)
+            .execute(&advisory_lock_pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to acquire postgres advisory lock: {e}"));
+
         // Ensure had_scheduler["postgres"] is set in the launcher before
         // reset_postgres_database kills the scheduler.  See the function
         // documentation for the full explanation of why this is needed.
@@ -425,6 +479,7 @@ impl E2eDb {
             connection_string: shared.admin_connection_string.clone(),
             container_id: shared.container_id.clone(),
             _shared_postgres_db_guard: Some(shared_postgres_db_guard),
+            _advisory_lock_pool: Some(advisory_lock_pool),
             _container: ContainerLease::Shared { _shared: shared },
         }
     }
@@ -540,6 +595,7 @@ impl E2eDb {
             connection_string,
             container_id: container.id().to_string(),
             _shared_postgres_db_guard: None,
+            _advisory_lock_pool: None,
             _container: ContainerLease::Dedicated {
                 _container: Box::new(container),
             },
@@ -595,6 +651,7 @@ impl E2eDb {
             connection_string,
             container_id: container.id().to_string(),
             _shared_postgres_db_guard: None,
+            _advisory_lock_pool: None,
             _container: ContainerLease::Dedicated {
                 _container: Box::new(container),
             },
