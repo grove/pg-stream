@@ -56,6 +56,10 @@ static SHARED_DB_COUNTER: AtomicUsize = AtomicUsize::new(1);
 static SHARED_CONTAINER: tokio::sync::OnceCell<SharedContainer> =
     tokio::sync::OnceCell::const_new();
 #[cfg(not(feature = "light-e2e"))]
+// Serialises tests that use ALTER SYSTEM against the process-local shared
+// container. `cargo test --test <name>` runs each test binary in its own
+// process, and each process owns its own shared container via SHARED_CONTAINER,
+// so cross-binary locking is unnecessary here.
 static SHARED_POSTGRES_DB_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
     LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
@@ -153,92 +157,18 @@ async fn create_database(admin_connection_string: &str, db_name: &str) {
 }
 
 #[cfg(not(feature = "light-e2e"))]
-async fn terminate_other_backends(admin_pool: &PgPool) {
-    // Shared-db tests reuse `postgres`, so the previous test's sqlx pool and
-    // the per-database scheduler worker can still hold locks when the next
-    // test starts its reset. Terminate them first to keep cleanup deterministic.
-    sqlx::query(
-        "SELECT pg_terminate_backend(pid) \
-         FROM pg_stat_activity \
-         WHERE datname = current_database() \
-                     AND pid <> pg_backend_pid() \
-                     AND (backend_type = 'client backend' \
-                                OR application_name = 'pg_trickle scheduler')",
-    )
-    .execute(admin_pool)
-    .await
-    .unwrap_or_else(|e| panic!("Failed to terminate shared postgres backends: {e}"));
-
-    for _ in 0..20 {
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT count(*) \
-             FROM pg_stat_activity \
-             WHERE datname = current_database() \
-                             AND pid <> pg_backend_pid() \
-                             AND (backend_type = 'client backend' \
-                                        OR application_name = 'pg_trickle scheduler')",
-        )
-        .fetch_one(admin_pool)
-        .await
-        .unwrap_or_else(|e| panic!("Failed to count shared postgres backends: {e}"));
-
-        if remaining == 0 {
-            return;
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    let remaining: i64 = sqlx::query_scalar(
-        "SELECT count(*) \
-         FROM pg_stat_activity \
-         WHERE datname = current_database() \
-                     AND pid <> pg_backend_pid() \
-                     AND (backend_type = 'client backend' \
-                                OR application_name = 'pg_trickle scheduler')",
-    )
-    .fetch_one(admin_pool)
-    .await
-    .unwrap_or_else(|e| panic!("Failed to count shared postgres backends: {e}"));
-
-    panic!(
-        "Timed out waiting for shared postgres backends to exit before reset; {remaining} backend(s) still active"
-    );
-}
-
-#[cfg(not(feature = "light-e2e"))]
-async fn reset_postgres_database(admin_connection_string: &str) {
+async fn reset_server_configuration(admin_connection_string: &str) {
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(admin_connection_string)
         .await
-        .unwrap_or_else(|e| panic!("Failed to connect for postgres reset: {e}"));
+        .unwrap_or_else(|e| panic!("Failed to connect for server config reset: {e}"));
 
-    terminate_other_backends(&admin_pool).await;
-
-    // Background-worker tests share the `postgres` database and use
-    // `ALTER SYSTEM` to speed up the scheduler. Those changes persist in
-    // `postgresql.auto.conf`, so clear them during reset to keep each test
-    // independent of execution order.
-    //
-    // Drop the extension before reloading config. A pre-drop pg_reload_conf()
-    // wakes the shared launcher worker, which can respawn a scheduler for
-    // `postgres` while reset is still in progress.
-    for sql in [
-        "DROP EXTENSION IF EXISTS pg_trickle CASCADE",
-        "ALTER SYSTEM RESET ALL",
-        "SELECT pg_reload_conf()",
-        "DROP SCHEMA IF EXISTS public CASCADE",
-        "CREATE SCHEMA public",
-        "GRANT ALL ON SCHEMA public TO postgres",
-        "GRANT ALL ON SCHEMA public TO public",
-    ] {
+    for sql in ["ALTER SYSTEM RESET ALL", "SELECT pg_reload_conf()"] {
         sqlx::query(sql)
             .execute(&admin_pool)
             .await
-            .unwrap_or_else(|e| {
-                panic!("Failed to reset shared postgres database with `{sql}`: {e}")
-            });
+            .unwrap_or_else(|e| panic!("Failed to reset server config with `{sql}`: {e}"));
     }
 
     admin_pool.close().await;
@@ -302,7 +232,7 @@ pub struct E2eDb {
     pub pool: PgPool,
     connection_string: String,
     container_id: String,
-    _shared_postgres_db_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _shared_scheduler_test_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     _container: ContainerLease,
 }
 
@@ -324,28 +254,35 @@ impl E2eDb {
             pool,
             connection_string,
             container_id: shared.container_id.clone(),
-            _shared_postgres_db_guard: None,
+            _shared_scheduler_test_guard: None,
             _container: ContainerLease::Shared { _shared: shared },
         }
     }
 
-    /// Start a container and connect to the `postgres` database.
+    /// Historical compatibility helper for scheduler-focused tests.
     ///
-    /// Use this for background-worker / scheduler tests: the scheduler
-    /// bgworker hard-codes `connect_worker_to_spi(Some("postgres"), ...)`,
-    /// so the extension + STs must live in the `postgres` database for the
-    /// scheduler to see them.
+    /// Dynamic scheduler workers now connect to the database name supplied in
+    /// `bgw_extra`, so these tests no longer need to run inside `postgres`
+    /// itself. The remaining isolation concern is server-level state:
+    /// scheduler tests use `ALTER SYSTEM`, which affects the whole shared
+    /// container. This helper therefore resets server config, creates a fresh
+    /// per-test database, and holds a process-local guard for the test's
+    /// lifetime so parallel tests in the same binary cannot interfere.
     pub async fn new_on_postgres_db() -> Self {
-        let shared_postgres_db_guard = SHARED_POSTGRES_DB_LOCK.clone().lock_owned().await;
+        let shared_scheduler_test_guard = SHARED_POSTGRES_DB_LOCK.clone().lock_owned().await;
         let shared = shared_container().await;
-        reset_postgres_database(&shared.admin_connection_string).await;
-        let pool = Self::connect_with_retry(&shared.admin_connection_string, 15).await;
+        reset_server_configuration(&shared.admin_connection_string).await;
+
+        let db_name = shared_db_name("pgt_sched_e2e");
+        create_database(&shared.admin_connection_string, &db_name).await;
+        let connection_string = connection_string(shared.port, &db_name);
+        let pool = Self::connect_with_retry(&connection_string, 15).await;
 
         E2eDb {
             pool,
-            connection_string: shared.admin_connection_string.clone(),
+            connection_string,
             container_id: shared.container_id.clone(),
-            _shared_postgres_db_guard: Some(shared_postgres_db_guard),
+            _shared_scheduler_test_guard: Some(shared_scheduler_test_guard),
             _container: ContainerLease::Shared { _shared: shared },
         }
     }
@@ -460,7 +397,7 @@ impl E2eDb {
             pool,
             connection_string,
             container_id: container.id().to_string(),
-            _shared_postgres_db_guard: None,
+            _shared_scheduler_test_guard: None,
             _container: ContainerLease::Dedicated {
                 _container: Box::new(container),
             },
@@ -515,7 +452,7 @@ impl E2eDb {
             pool,
             connection_string,
             container_id: container.id().to_string(),
-            _shared_postgres_db_guard: None,
+            _shared_scheduler_test_guard: None,
             _container: ContainerLease::Dedicated {
                 _container: Box::new(container),
             },
@@ -626,6 +563,19 @@ impl E2eDb {
     pub async fn reload_config_and_wait(&self) {
         self.execute("SELECT pg_reload_conf()").await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    /// Nudge the launcher so it re-probes this database promptly.
+    ///
+    /// `pg_reload_conf()` wakes the launcher from `wait_latch()`, but it does
+    /// not change `last_attempt`. `pgtrickle._signal_launcher_rescan()` bumps
+    /// the shared DAG version, which lets the launcher evict stale
+    /// `last_attempt` entries on its next loop iteration.
+    pub async fn nudge_launcher_rescan(&self) {
+        let _ = self
+            .try_execute("SELECT pgtrickle._signal_launcher_rescan()")
+            .await;
+        self.execute("SELECT pg_reload_conf()").await;
     }
 
     /// Read a GUC value via `SHOW`.
@@ -906,16 +856,19 @@ impl E2eDb {
     /// or produce a meaningful failure message rather than a generic timeout.
     pub async fn wait_for_scheduler(&self, timeout: std::time::Duration) -> bool {
         let start = std::time::Instant::now();
+        let nudge_interval = std::time::Duration::from_secs(10);
+        // Trigger the first nudge immediately rather than waiting 10 s.
+        let mut last_nudge = start - nudge_interval;
         loop {
             if start.elapsed() > timeout {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
             let running: bool = self
                 .query_scalar(
                     "SELECT EXISTS(\
                          SELECT 1 FROM pg_stat_activity \
-                         WHERE application_name = 'pg_trickle scheduler' \
+                         WHERE backend_type = 'pg_trickle scheduler' \
                            AND datname = current_database()\
                      )",
                 )
@@ -923,6 +876,13 @@ impl E2eDb {
             if running {
                 return true;
             }
+
+            if last_nudge.elapsed() >= nudge_interval {
+                self.nudge_launcher_rescan().await;
+                last_nudge = std::time::Instant::now();
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 

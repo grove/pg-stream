@@ -182,7 +182,8 @@ async fn test_explicit_trigger_override_blocks_wal_transition() {
 /// once the WAL decoder catches up.
 #[tokio::test]
 async fn test_wal_transition_lifecycle() {
-    // Use postgres db so the scheduler bgworker picks up the STs
+    // new_on_postgres_db() now creates an isolated per-test database while
+    // still resetting server-level scheduler GUCs before the test starts.
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
 
     db.execute("CREATE TABLE wal_src (id INT PRIMARY KEY, val TEXT)")

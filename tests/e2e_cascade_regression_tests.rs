@@ -245,10 +245,8 @@ async fn test_st_on_st_cascade_propagates_delete() {
 /// - `pg_trickle.min_schedule_seconds = 1` (allow 1-second schedule)
 ///
 /// Also waits for the pg_trickle scheduler BGW to appear in pg_stat_activity.
-/// The launcher spawns per-database schedulers dynamically; when many test
-/// databases are active simultaneously the launcher may take up to ~10 s to
-/// notice a freshly-installed extension. Waiting here prevents spurious
-/// "timed out waiting for scheduler cycle" failures in the tests below.
+/// The wait helper periodically bumps the launcher rescan signal and sends
+/// SIGHUP so stale `last_attempt` entries are retried promptly.
 async fn configure_fast_scheduler(db: &E2eDb) {
     db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
         .await;
@@ -259,22 +257,21 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         .await;
     db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
         .await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Ensure the scheduler BGW is actually running before tests depend on it.
-    // The launcher wakes at most every 10 s; give it 30 s to spawn.
     let sched_running = db
-        .wait_for_scheduler(std::time::Duration::from_secs(60))
+        .wait_for_scheduler(std::time::Duration::from_secs(90))
         .await;
+
     assert!(
         sched_running,
-        "pg_trickle scheduler did not appear in pg_stat_activity within 60 s. \
-         Possible causes: (1) max_worker_processes exhausted — check that the \
-         E2E Docker image sets max_worker_processes = 32; \
-         (2) launcher retry back-off not yet expired — the launcher waits up to \
-         retry_ttl (15 s) + poll interval (10 s) = 25 s after the last failed \
-         spawn attempt before retrying; \
-         (3) pg_trickle.enabled GUC is false."
+        "pg_trickle scheduler did not appear in pg_stat_activity within 90 s. \
+         Possible causes: \
+         (1) the launcher never re-probed the fresh test database after CREATE EXTENSION, \
+         despite periodic launcher rescan nudges; \
+         (2) launcher retry back-off (retry_ttl=15 s + poll=10 s = 25 s) exceeded \
+         the timeout; \
+         (3) pg_trickle.enabled GUC is false; \
+         (4) max_worker_processes exhausted — E2E image sets it to 128."
     );
 }
 
@@ -293,7 +290,8 @@ async fn configure_fast_scheduler(db: &E2eDb) {
 /// the test uses auto-refresh via a short schedule rather than manual refresh.
 #[tokio::test]
 async fn test_zero_row_differential_preserves_data_timestamp() {
-    // Must use postgres database — the scheduler bgworker only connects to it.
+    // new_on_postgres_db() now creates an isolated per-test database while
+    // still resetting server-level scheduler GUCs before the test starts.
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
     // configure_fast_scheduler also waits for the scheduler BGW to appear.
     configure_fast_scheduler(&db).await;
@@ -426,7 +424,8 @@ async fn test_zero_row_differential_preserves_data_timestamp() {
 /// where the 0-row DIFFERENTIAL fix lives.
 #[tokio::test]
 async fn test_no_spurious_cascade_after_noop_upstream_refresh() {
-    // Must use postgres database — the scheduler bgworker only connects to it.
+    // new_on_postgres_db() now creates an isolated per-test database while
+    // still resetting server-level scheduler GUCs before the test starts.
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
     configure_fast_scheduler(&db).await;
 

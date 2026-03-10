@@ -13,8 +13,8 @@
 //!
 //! ## Important
 //!
-//! All tests use `E2eDb::new_on_postgres_db()` because the background
-//! worker only connects to the `postgres` database.
+//! These tests use `E2eDb::new_on_postgres_db()`, which now creates a fresh
+//! per-test database and resets server-level scheduler config before the test.
 //!
 //! Prerequisites: `./tests/build_e2e_image.sh`
 
@@ -38,7 +38,11 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         .await;
     db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
         .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        db.wait_for_scheduler(Duration::from_secs(90)).await,
+        "pg_trickle scheduler did not appear in pg_stat_activity within 90 s"
+    );
 }
 
 /// Wait until `last_refresh_at` advances for a given ST.

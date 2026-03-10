@@ -96,8 +96,11 @@ RUN echo "" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "# Each test database spawns one pg_trickle scheduler BGW via the launcher." >> /usr/share/postgresql/postgresql.conf.sample && \
     echo "# Default max_worker_processes=8 is too tight when many test databases run" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "# concurrently (1 launcher + N test-DB schedulers + 1 postgres scheduler)." >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "max_worker_processes = 32" >> /usr/share/postgresql/postgresql.conf.sample
+    echo "# concurrently. The full E2E suite runs ~55 test binaries in parallel, each" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "# with its own scheduler BGW (e.g. 1 launcher + 55 scheduler workers +  " >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "# autovacuum workers). 32 was too low, causing load_dynamic() failures for" >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "# the shared 'postgres' DB scheduler used by bgworker/cascade tests." >> /usr/share/postgresql/postgresql.conf.sample && \
+    echo "max_worker_processes = 128" >> /usr/share/postgresql/postgresql.conf.sample
 
 # Verify the extension files are in place
 RUN ls -la /usr/share/postgresql/18/extension/pg_trickle* && \

@@ -154,7 +154,7 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
                 match client.select(
                     "SELECT datname::text \
                      FROM pg_stat_activity \
-                     WHERE application_name = 'pg_trickle scheduler' \
+                     WHERE backend_type = 'pg_trickle scheduler' \
                        AND datname IS NOT NULL",
                     None,
                     &[],
@@ -174,25 +174,27 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
             })
         }));
 
-        // If any backend bumped the DAG signal (create_st, alter, drop, etc.)
-        // since our last loop, evict stale skip-cache entries so we re-probe
-        // affected databases promptly.
+        // If any backend bumped the DAG signal (create_st, alter, drop,
+        // CREATE EXTENSION finalize, manual rescan nudge, etc.) since our last
+        // loop, clear the skip-cache so we re-probe promptly.
         //
-        // We deliberately keep entries that were set WITHIN the last retry_ttl
-        // window.  Without this guard, every DAG bump from a concurrent test
-        // database can clear `last_attempt` for ALL databases — including ones
-        // (e.g. `postgres`) that were probed just moments ago and found to have
-        // no extension yet.  Each probe resets the timestamp, so the TTL never
-        // expires and the scheduler for that database never gets spawned.
+        // This is intentionally unconditional. A CREATE EXTENSION in a newly
+        // created database can race with the launcher's first probe of that
+        // database: the launcher may spawn a scheduler before the extension
+        // transaction commits, observe "not installed", and cache a fresh
+        // `last_attempt` entry. If we preserve that fresh entry on the very DAG
+        // signal emitted by CREATE EXTENSION, the database remains classified as
+        // a long-backoff `skip_ttl` database and the scheduler may not appear
+        // for minutes.
         //
-        // Retaining fresh entries preserves the intended back-off: databases
-        // probed recently (timed out or found no extension) wait out the full
-        // `retry_ttl` before being retried, while databases with stale entries
-        // (≥ retry_ttl ago) are cleared and retried immediately.
+        // DDL-driven DAG bumps are relatively rare and semantically important,
+        // so favor immediate correctness over preserving the old skip-cache on
+        // those events. Non-DDL steady-state operation still uses the normal
+        // skip_ttl / retry_ttl back-off between signals.
         let dag_version = shmem::current_dag_version();
         if dag_version != last_dag_version {
             last_dag_version = dag_version;
-            last_attempt.retain(|_, t| t.elapsed() < retry_ttl);
+            last_attempt.clear();
         }
 
         for db in &databases {
