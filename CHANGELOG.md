@@ -172,6 +172,18 @@ run without `#[ignore]`:
 
 ### Added
 
+- **SAST — Narrow `rust.panic-in-sql-path` scope** (`sast-review-2` branch):
+  Semgrep cannot detect `#[cfg(test)]` block boundaries inside Rust files,
+  causing the `rust.panic-in-sql-path` rule to fire on every `.unwrap()` /
+  `.expect()` / `panic!()` call inside inline test modules — 351 false-positive
+  alerts (numbers 48–398). Fixed by adding `paths.exclude: [src/dvm/**,
+  src/bin/**]` to the rule. `src/dvm/**` contains the DVM computation engine
+  with large inline test modules; `src/bin/**` is the standalone CLI, not the
+  PostgreSQL extension. All 351 alerts triaged and dismissed as `false positive`.
+  10 genuine production hits (`expect("unreachable after error!()")` idiom in
+  `monitor.rs`, `api.rs`, `wal_decoder.rs`) are known safe and tracked as Phase
+  4 cleanup (replace with `unreachable!()`).
+
 - **SAST Phase 2 + 3 — Privilege-context rules and unsafe inventory**
   (`sast-review-1` branch):
 

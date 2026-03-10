@@ -1,8 +1,8 @@
 # PLAN: Static Application Security Testing (SAST)
 
-**Status:** Phase 2 + 3 complete  
-**Date:** 2026-03-10  
-**Branch:** `codeql-workflow` (merged), `sast-review-1` (Phase 1–3)  
+**Status:** Phase 2 + 3 complete; Phase 2 rule triage complete (sast-review-2)  
+**Date:** 2026-03-11  
+**Branch:** `codeql-workflow` (merged), `sast-review-1` (Phase 1–3), `sast-review-2` (Phase 2 rule refinement)  
 **Scope:** Establish a practical SAST program for the `pg_trickle` PostgreSQL
 extension that covers Rust application code, PostgreSQL extension attack
 surfaces, dependency risk, and extension-specific SQL/security-context hazards.
@@ -698,6 +698,55 @@ check is aspirational with Semgrep generic mode; message guidance covers it for 
 ---
 
 ## Triage Log
+
+### 2026-03-11 — Second triage pass (Phase 2 rule refinement, sast-review-2)
+
+**Total new alerts:** 351 (all `semgrep.rust.panic-in-sql-path`, numbers 48–398)
+
+**Root cause:** The `rust.panic-in-sql-path` rule was scoped to `src/**`.
+Semgrep's Rust parser cannot detect `#[cfg(test)]` block boundaries inside a
+file. Each `src/dvm/operators/*.rs` file has a large inline test module
+(starting anywhere from line 638 to line 1902). Semgrep fired on every
+`.expect()`/`.unwrap()`/`panic!()` inside those test blocks.
+
+**Decision:** All 351 dismissed as `false positive`.
+
+**Breakdown of dismissed alerts:**
+
+| Source | Count | Reason |
+|--------|-------|--------|
+| `src/dvm/operators/*.rs` — test blocks | ~320 | Semgrep can't detect `#[cfg(test)]` scope |
+| `src/dvm/{scan,aggregate,join,...}.rs` — test blocks | ~15 | Same |
+| `src/bin/pg_trickle_dump.rs` | 1 | Standalone CLI, not loaded into PostgreSQL process |
+| Other `src/*.rs` — test blocks | ~15 | Same #[cfg(test)] issue |
+
+**Genuine production hits (all safe):**
+- `src/monitor.rs`: 8 × `expect("unreachable after error!()")` — post-`pgrx::error!()` idiom; the macro invokes `ereport()` which longjmps before `.expect()` executes.
+- `src/api.rs:2323`: 1 × same idiom.
+- `src/wal_decoder.rs:219`: 1 × same idiom.
+
+These 10 production hits are known safe. The idiomatic Rust alternative is
+`unreachable!()`, which is better because `unreachable!()` is optimized away in
+release builds. Tracked as phase 4 cleanup.
+
+**Rule fix applied** (`.semgrep/pg_trickle.yml`):
+```yaml
+paths:
+  include:
+    - src/**
+  exclude:
+    - src/dvm/**   # inline test modules flood the rule; use CodeQL taint (Phase 5) instead
+    - src/bin/**   # standalone CLI — not loaded into the PostgreSQL process
+```
+
+**`#[cfg(test)]` limitation note:** Semgrep cannot distinguish code inside
+`#[cfg(test)]` blocks from production code at the file level. The workaround is
+to exclude directories where test code is co-located with production code in
+large inline modules. For the top-level `src/*.rs` files the smaller test
+blocks at the end of each file are acceptable noise after the DVM exclusion
+reduces volume to near-zero.
+
+---
 
 ### 2026-03-10 — First triage pass (Phase 1)
 
