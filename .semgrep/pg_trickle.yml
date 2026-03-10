@@ -89,3 +89,23 @@ rules:
         - plans/**
         - docs/**
     pattern-regex: '(SET\s+ROLE\b|RESET\s+ROLE\b)'
+
+  - id: rust.panic-in-sql-path
+    languages:
+      - rust
+    severity: WARNING
+    message: >-
+      .unwrap(), .expect(), or panic!() will crash the PostgreSQL backend
+      process if reached from a SQL-callable function. Propagate errors via
+      Result<T, PgTrickleError> and convert at the API boundary with
+      pgrx::error!() or ereport!() instead. If this code path is genuinely
+      unreachable, use pgrx::error!("unreachable: ...") so PostgreSQL can
+      clean up the session gracefully rather than aborting the backend.
+    patterns:
+      - pattern-either:
+          - pattern: $X.unwrap()
+          - pattern: $X.expect($MSG)
+          - pattern: panic!(...)
+    paths:
+      include:
+        - src/**

@@ -181,6 +181,11 @@ run without `#[ignore]`:
       which can bypass per-user policies in a `SECURITY DEFINER` context.
     - `sql.set-role.present` — flags `SET ROLE` / `RESET ROLE` patterns. Role
       transitions in extension code can widen or narrow privileges unexpectedly.
+    - `rust.panic-in-sql-path` — flags `.unwrap()`, `.expect(…)`, and
+      `panic!(…)` in `src/**`. These crash the PostgreSQL backend process if
+      reached from a SQL-callable function. Hits ~37 existing callsites
+      (mostly `expect("unreachable after error!()")` idiom in `monitor.rs` and
+      `api.rs`); all advisory, documented as Phase 2 triage backlog.
     - Updated `sql.security-definer.present` message to explicitly require
       `SET search_path = schema, pg_catalog, pg_temp` alongside every
       `SECURITY DEFINER` declaration. Prevents search-path hijacking.

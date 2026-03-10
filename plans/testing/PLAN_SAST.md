@@ -489,6 +489,7 @@ deserve intentional review.
 | `sql.security-definer.present` | Surface `SECURITY DEFINER` for review (message includes `search_path` guidance) | Advisory |
 | `sql.row-security.disabled` | Detect `SET LOCAL row_security = off` | Advisory |
 | `sql.set-role.present` | Detect `SET ROLE` / `RESET ROLE` | Advisory |
+| `rust.panic-in-sql-path` | Flag `.unwrap()`, `.expect()`, `panic!()` in `src/**` | Advisory |
 
 ### Planned next rules
 
@@ -496,9 +497,9 @@ deserve intentional review.
 |----------|----------------|------|
 | SQL quoting | Detect string interpolation into SPI SQL without quoting helper | High |
 | Privilege context | `SECURITY DEFINER` without `SET search_path` | High |
-| Role changes | `SET ROLE`, `RESET ROLE`, `row_security = off` | High |
+| Role changes | `SET ROLE`, `RESET ROLE`, `row_security = off` | High — ✅ Added Phase 2 |
 | Unsafe docs | `unsafe` without nearby `SAFETY:` comment | Medium |
-| Panics in SQL path | `unwrap()` / `expect()` / `panic!()` in non-test SQL-reachable code | Medium |
+| Panics in SQL path | `unwrap()` / `expect()` / `panic!()` in non-test SQL-reachable code | Medium — ✅ Added Phase 2 |
 | GUC-sensitive SQL | direct `SET LOCAL work_mem`, `SET LOCAL row_security` review hooks | Medium |
 
 ### False-positive strategy
@@ -659,6 +660,7 @@ This plan is successful when all of the following are true:
 
 - [x] Add Semgrep rule: `SET LOCAL row_security = off` (`sql.row-security.disabled`)
 - [x] Add Semgrep rule: `SET ROLE` / `RESET ROLE` (`sql.set-role.present`)
+- [x] Add Semgrep rule: `.unwrap()` / `.expect()` / `panic!()` in `src/**` (`rust.panic-in-sql-path`)
 - [x] Update `sql.security-definer.present` message with explicit `SET search_path` guidance
 - [x] Proactive rules scoped to `src/**` + `sql/**`, excluding `*.md`/`plans/**`/`docs/**`
 
