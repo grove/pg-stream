@@ -5,8 +5,8 @@
 > "TPC-H" and "TPC Benchmark" are trademarks of the Transaction Processing
 > Performance Council ([tpc.org](https://www.tpc.org/)).
 
-**Status:** In Progress  
-**Date:** 2026-03-09  
+**Status:** Complete (T2 IMMEDIATE allowlist pending population from a real run)  
+**Date:** 2026-03-09 (updated 2026-03-10)  
 **Branch:** `test-suite-tpc-h-gaps`  
 **Scope:** Second wave of TPC-H test suite improvements, building on the
 complete 22/22 passing baseline from `PLAN_TEST_SUITE_TPC_H.md`.
@@ -67,7 +67,8 @@ rather than new DVM fixes:
 3. Strengthen `assert_tpch_invariant` with a `__pgt_count` sanity check.
    *(DONE — T1)*
 4. Add a skip-set regression guard to `test_tpch_differential_correctness`
-   and `test_tpch_immediate_correctness`. *(DONE — T2)*
+   and `test_tpch_immediate_correctness`. *(DONE — T2; DIFFERENTIAL guard is tight,
+   IMMEDIATE allowlist is still a catch-all — needs population from a real run)*
 5. Add `test_tpch_differential_vs_immediate` — side-by-side mode comparison.
    *(DONE — T4)*
 6. Add `test_tpch_single_row_mutations` — single-row INSERT/DELETE/UPDATE in
@@ -183,6 +184,13 @@ the guard is enabled. The initial population step is:
 2. Collect the actual skipped set from the output.
 3. Populate the allowlist.
 4. Re-enable the assert and commit.
+
+**Current state (2026-03-10):** The DIFFERENTIAL guard is tight (empty allowlist
+— all 22 queries pass). The IMMEDIATE allowlist is still a **catch-all with all
+22 queries** because the initial population step has not been run yet. The guard
+structure and assert are in place in `tests/e2e_tpch_tests.rs`; this step is
+blocked on running `test_tpch_immediate_correctness` against the E2E container
+and collecting the actual skip set.
 
 ---
 
@@ -405,7 +413,7 @@ fan-in.
 
 | File | Change | Status |
 |------|--------|--------|
-| `tests/e2e_tpch_tests.rs` | T1 (`__pgt_count` check), T2 (skip guard), T3 (`test_tpch_immediate_rollback`), T4 (`test_tpch_differential_vs_immediate`), T5 (`test_tpch_single_row_mutations`) | ✅ Done |
+| `tests/e2e_tpch_tests.rs` | T1 (`__pgt_count` check), T2 (skip guard), T3 (`test_tpch_immediate_rollback`), T4 (`test_tpch_differential_vs_immediate`), T5 (`test_tpch_single_row_mutations`) | ✅ Done (T2 IMMEDIATE allowlist is a catch-all; needs population from a real run — see §T2) |
 | `tests/tpch/single_row_insert.sql` | New — single-row INSERT for T5 | ✅ Done |
 | `tests/tpch/single_row_update.sql` | New — single-row UPDATE for T5 | ✅ Done |
 | `tests/tpch/single_row_delete.sql` | New — single-row DELETE for T5 | ✅ Done |
@@ -444,7 +452,7 @@ Recommended sequence — each item is independently shippable:
 | Test | Pass Condition |
 |------|---------------|
 | T1 (`__pgt_count` guard) | All existing TPC-H tests continue to pass; a query that introduces negative `__pgt_count` now fails fast instead of masking. |
-| T2 (skip guard) | A DVM regression that causes a previously-passing query to be skipped is caught and reported by name. |
+| T2 (skip guard) | A DVM regression that causes a previously-passing query to be skipped is caught and reported by name. DIFFERENTIAL guard: ✅ tight (empty allowlist). IMMEDIATE guard: ⚠️ catch-all — allowlist needs population from a real run of `test_tpch_immediate_correctness`. |
 | T3 (`rollback`) | All 4 representative queries pass all 3 RF-type rollback assertions, or are soft-skipped with a documented reason. |
 | T4 (`diff vs imm`) | Queries that succeed in both modes produce identical results for all cycles. |
 | T5 (`single row`) | All 3 representative queries pass all 3 single-row mutation assertions in IMMEDIATE mode. |
