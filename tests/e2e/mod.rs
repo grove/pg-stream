@@ -541,14 +541,6 @@ impl E2eDb {
             .execute(&self.pool)
             .await
             .expect("Failed to CREATE EXTENSION pg_trickle");
-
-        // Signal the launcher BGW to re-probe this database immediately.
-        // Without this, the launcher may have already cached the database
-        // as "no extension" (5-minute skip TTL) during its regular poll
-        // between CREATE DATABASE and CREATE EXTENSION.
-        // Harmless no-op when shared_preload_libraries is not configured.
-        self.nudge_launcher_rescan().await;
-
         self
     }
 
@@ -876,7 +868,7 @@ impl E2eDb {
                 .query_scalar(
                     "SELECT EXISTS(\
                          SELECT 1 FROM pg_stat_activity \
-                         WHERE application_name = 'pg_trickle scheduler' \
+                         WHERE backend_type = 'pg_trickle scheduler' \
                            AND datname = current_database()\
                      )",
                 )

@@ -154,7 +154,7 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
                 match client.select(
                     "SELECT datname::text \
                      FROM pg_stat_activity \
-                     WHERE application_name = 'pg_trickle scheduler' \
+                     WHERE backend_type = 'pg_trickle scheduler' \
                        AND datname IS NOT NULL",
                     None,
                     &[],

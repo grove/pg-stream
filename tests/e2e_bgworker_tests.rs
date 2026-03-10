@@ -56,13 +56,13 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         let launcher_count: i64 = db
             .query_scalar(
                 "SELECT count(*) FROM pg_stat_activity \
-                 WHERE application_name = 'pg_trickle launcher'",
+                 WHERE backend_type = 'pg_trickle launcher'",
             )
             .await;
         let sched_count: i64 = db
             .query_scalar(
                 "SELECT count(*) FROM pg_stat_activity \
-                 WHERE application_name = 'pg_trickle scheduler'",
+                 WHERE backend_type = 'pg_trickle scheduler'",
             )
             .await;
         let db_name: String = db.query_scalar("SELECT current_database()").await;

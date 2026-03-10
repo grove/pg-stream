@@ -1442,7 +1442,7 @@ fn health_check() -> TableIterator<
         let scheduler_count = client
             .select(
                 "SELECT count(*)::int FROM pg_stat_activity \
-                 WHERE application_name = 'pg_trickle scheduler'",
+                 WHERE backend_type = 'pg_trickle scheduler'",
                 None,
                 &[],
             )
