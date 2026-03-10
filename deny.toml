@@ -1,6 +1,23 @@
 [graph]
 all-features = true
 
+[licenses]
+# Allow the standard permissive and weak-copyleft open-source licenses used
+# across the dependency tree. Unicode-3.0 is required by the icu_* crates;
+# BSL-1.0 is used by Boost-derived crates pulled in by pgrx internals.
+version = 2
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unlicense",
+  "Zlib",
+  "BSL-1.0",
+  "Unicode-3.0",
+]
+
 [advisories]
 version = 2
 yanked = "warn"
@@ -8,6 +25,16 @@ ignore = [
   # Pulled in transitively via sqlx's mysql support; not compiled for this
   # PostgreSQL-only extension build.
   "RUSTSEC-2023-0071",
+  # paste is used internally by pgrx macros; we have no upstream control over
+  # this dep. Not a vulnerability, only a maintenance status notice.
+  "RUSTSEC-2024-0436",
+  # rustls-pemfile v2 is pulled in by testcontainers/bollard (dev-only path).
+  # Maintenance moved to rustls-pki-types; will be resolved when bollard updates.
+  "RUSTSEC-2025-0134",
+  # serde_cbor is pulled in transitively (dev path). Not a security vulnerability,
+  # only unmaintained. Use of ciborium is the upstream recommendation but we
+  # have no direct control over this dep.
+  "RUSTSEC-2021-0127",
 ]
 
 [bans]
