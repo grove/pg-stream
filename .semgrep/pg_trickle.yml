@@ -1,0 +1,44 @@
+rules:
+  - id: rust.spi.run.dynamic-format
+    languages:
+      - rust
+    severity: WARNING
+    message: >-
+      Dynamic SQL passed to Spi::run() should be reviewed for quoting,
+      privilege context, and user-controlled interpolation. Prefer fixed SQL
+      with parameters when possible; otherwise ensure identifiers and literals
+      are escaped with the repo's quoting helpers.
+    patterns:
+      - pattern-either:
+          - pattern: Spi::run(&format!($FMT, ...))
+          - pattern: pgrx::Spi::run(&format!($FMT, ...))
+
+  - id: rust.spi.query.dynamic-format
+    languages:
+      - rust
+    severity: WARNING
+    message: >-
+      Dynamic SQL passed to SPI query helpers should be reviewed for SQL
+      injection risk, quoting discipline, and object-name construction.
+    patterns:
+      - pattern-either:
+          - pattern: Spi::get_one::<$T>(&format!($FMT, ...))
+          - pattern: Spi::get_two::<$T1, $T2>(&format!($FMT, ...))
+          - pattern: Spi::get_three::<$T1, $T2, $T3>(&format!($FMT, ...))
+          - pattern: pgrx::Spi::get_one::<$T>(&format!($FMT, ...))
+          - pattern: pgrx::Spi::get_two::<$T1, $T2>(&format!($FMT, ...))
+          - pattern: pgrx::Spi::get_three::<$T1, $T2, $T3>(&format!($FMT, ...))
+
+  - id: sql.security-definer.present
+    languages:
+      - generic
+    severity: INFO
+    message: >-
+      SECURITY DEFINER requires explicit review. Pin search_path and verify the
+      function body cannot be influenced by attacker-controlled identifiers or
+      SQL fragments.
+    paths:
+      include:
+        - src/**
+        - sql/**
+    pattern-regex: SECURITY\s+DEFINER

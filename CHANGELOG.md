@@ -172,6 +172,29 @@ run without `#[ignore]`:
 
 ### Added
 
+- **SAST / static security analysis baseline** — new security tooling on the
+  `codeql-workflow` branch, now merged:
+  - **GitHub CodeQL** (`.github/workflows/codeql.yml`) — runs 16 Rust security
+    queries (SQL injection, path injection, SSRF, cleartext logging, weak
+    crypto, uncontrolled allocation, invalid pointer access, and more) on every
+    PR and push to `main`. First scan completed with **zero findings** across
+    all 115 Rust source files. Uses `build-mode: none` (the only mode supported
+    for Rust) and the `v4` action.
+  - **`cargo deny`** (`.github/workflows/dependency-policy.yml` + `deny.toml`)
+    — enforces an explicit license allow-list (Apache-2.0, MIT, BSD-2-Clause,
+    BSD-3-Clause, ISC, Unlicense, Zlib, BSL-1.0, Unicode-3.0), blocks unknown
+    registries and git sources, and surfaces unmaintained/yanked crates as
+    warnings. Duplicate-version skews from upstream pgrx / testcontainers
+    version mismatches are suppressed via `skip` entries.
+  - **Semgrep** (`.github/workflows/semgrep.yml` + `.semgrep/pg_trickle.yml`)
+    — repo-specific rules flagging dynamic SQL passed to `Spi::run` /
+    `Spi::get_*` and `SECURITY DEFINER` occurrences. Advisory-only (SARIF
+    upload, no CI failure) until rules are tuned.
+  - **`plans/testing/PLAN_SAST.md`** — full SAST strategy document including
+    threat model, five-phase rollout plan, Semgrep rules roadmap, unsafe/FFI
+    review policy, CI posture table, and a **Security Newbie Checklist** for
+    reviewers unfamiliar with extension-specific security patterns.
+
 - **TPC-H test suite enhancements (T1–T6)** — second wave of TPC-H correctness
   coverage, building on the 22/22 passing DIFFERENTIAL baseline:
   - **T1 — `__pgt_count` guard** in `assert_tpch_invariant`: detects

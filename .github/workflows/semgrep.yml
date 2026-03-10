@@ -1,0 +1,60 @@
+# =============================================================================
+# Semgrep Workflow — repository-specific static checks for extension security
+# hotspots such as dynamic SPI SQL and SECURITY DEFINER SQL.
+#
+# This first pass is advisory: findings are uploaded as SARIF but do not fail
+# CI yet. That keeps the initial rollout useful without immediately blocking on
+# the existing dynamic-SPI surface area.
+# =============================================================================
+name: Semgrep
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'sql/**'
+      - '.semgrep/**'
+      - '.github/workflows/semgrep.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'sql/**'
+      - '.semgrep/**'
+      - '.github/workflows/semgrep.yml'
+  schedule:
+    - cron: '0 10 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    name: Semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Semgrep
+        run: python -m pip install --upgrade semgrep
+
+      - name: Run Semgrep ruleset
+        run: semgrep scan --config .semgrep/pg_trickle.yml --sarif --output semgrep.sarif
+
+      - name: Upload SARIF report
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
