@@ -83,7 +83,7 @@ docker run --rm \
   -v $PWD/lib/pg_trickle.so:/usr/lib/postgresql/18/lib/pg_trickle.so:ro \
   -v $PWD/extension/:/tmp/ext/:ro \
   -e POSTGRES_PASSWORD=postgres \
-  postgres:18.1 \
+  postgres:18.3 \
   sh -c 'cp /tmp/ext/* /usr/share/postgresql/18/extension/ && \
          exec postgres -c shared_preload_libraries=pg_trickle'
 ```

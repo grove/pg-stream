@@ -109,7 +109,7 @@ PR CI runs a three-tier gate:
 - **Unit tests (Linux only)**
 - **Integration tests**
 - **Light E2E** — curated PR-friendly end-to-end coverage split across three
-  shards and executed against stock `postgres:18.1`
+  shards and executed against stock `postgres:18.3`
 
 Full E2E, TPC-H tests, benchmarks, dbt, CNPG smoke, and the extra macOS /
 Windows unit jobs stay off the PR critical path and run on push-to-main,

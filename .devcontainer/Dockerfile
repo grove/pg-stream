@@ -1,10 +1,10 @@
 # =============================================================================
 # Devcontainer Dockerfile for pg_trickle development
 #
-# Based on postgres:18.1 to get matching PG headers + pg_config, then layers
+# Based on postgres:18.3 to get matching PG headers + pg_config, then layers
 # Rust toolchain, cargo-pgrx, and development tools on top.
 # =============================================================================
-FROM postgres:18.1
+FROM postgres:18.3
 
 ARG USERNAME=vscode
 ARG USER_UID=1000

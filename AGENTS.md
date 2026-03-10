@@ -131,7 +131,7 @@ Six test tiers, each with its own infrastructure:
 |------|----------|--------|----------|
 | Unit | `src/**` (`#[cfg(test)]`) | `just test-unit` | No |
 | Integration | `tests/*_tests.rs` (not `e2e_*`) | `just test-integration` | Yes (Testcontainers) |
-| Light E2E | `tests/e2e_*_tests.rs` (most) | `just test-light-e2e` | Yes (stock postgres:18.1) |
+| Light E2E | `tests/e2e_*_tests.rs` (most) | `just test-light-e2e` | Yes (stock postgres:18.3) |
 | Full E2E | `tests/e2e_*_tests.rs` (10 files) | `just test-e2e` | Yes (custom Docker image) |
 | TPC-H | `tests/e2e_tpch_tests.rs` (`#[ignore]`) | see below | Yes (custom Docker image) |
 | dbt | `dbt-pgtrickle/integration_tests/` | `just test-dbt` | Yes (Docker + dbt) |
