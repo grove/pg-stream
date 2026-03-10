@@ -893,6 +893,39 @@ impl E2eDb {
             .await
     }
 
+    /// Wait for any pg_trickle scheduler background worker to appear in
+    /// `pg_stat_activity` for the current database.
+    ///
+    /// The launcher spawns schedulers dynamically; on a freshly-installed
+    /// database the scheduler may not start for up to the launcher's 10-second
+    /// polling interval. Call this after `with_extension()` + GUC setup to
+    /// ensure the scheduler is running before relying on auto-refresh behaviour.
+    ///
+    /// Returns `true` if the scheduler was detected within `timeout`, or
+    /// `false` if it never appeared. In the latter case the caller can assert
+    /// or produce a meaningful failure message rather than a generic timeout.
+    pub async fn wait_for_scheduler(&self, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed() > timeout {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let running: bool = self
+                .query_scalar(
+                    "SELECT EXISTS(\
+                         SELECT 1 FROM pg_stat_activity \
+                         WHERE application_name = 'pg_trickle scheduler' \
+                           AND datname = current_database()\
+                     )",
+                )
+                .await;
+            if running {
+                return true;
+            }
+        }
+    }
+
     /// Wait for the background scheduler to auto-refresh a ST.
     ///
     /// Polls `data_timestamp` until it advances past the initial value

@@ -243,6 +243,12 @@ async fn test_st_on_st_cascade_propagates_delete() {
 /// Configure the scheduler for fast testing:
 /// - `pg_trickle.scheduler_interval_ms = 100` (wake every 100ms)
 /// - `pg_trickle.min_schedule_seconds = 1` (allow 1-second schedule)
+///
+/// Also waits for the pg_trickle scheduler BGW to appear in pg_stat_activity.
+/// The launcher spawns per-database schedulers dynamically; when many test
+/// databases are active simultaneously the launcher may take up to ~10 s to
+/// notice a freshly-installed extension. Waiting here prevents spurious
+/// "timed out waiting for scheduler cycle" failures in the tests below.
 async fn configure_fast_scheduler(db: &E2eDb) {
     db.execute("ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 100")
         .await;
@@ -254,6 +260,18 @@ async fn configure_fast_scheduler(db: &E2eDb) {
     db.wait_for_setting("pg_trickle.min_schedule_seconds", "1")
         .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Ensure the scheduler BGW is actually running before tests depend on it.
+    // The launcher wakes at most every 10 s; give it 30 s to spawn.
+    let sched_running = db
+        .wait_for_scheduler(std::time::Duration::from_secs(30))
+        .await;
+    assert!(
+        sched_running,
+        "pg_trickle scheduler did not appear in pg_stat_activity within 30 s. \
+         This usually means max_worker_processes is exhausted. \
+         Check that the E2E Docker image sets max_worker_processes = 32."
+    );
 }
 
 // ── Test 3: 0-row DIFFERENTIAL must not bump data_timestamp ─────────────────
@@ -273,6 +291,7 @@ async fn configure_fast_scheduler(db: &E2eDb) {
 async fn test_zero_row_differential_preserves_data_timestamp() {
     // Must use postgres database — the scheduler bgworker only connects to it.
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+    // configure_fast_scheduler also waits for the scheduler BGW to appear.
     configure_fast_scheduler(&db).await;
 
     db.execute("CREATE TABLE ts_src (id INT PRIMARY KEY, val TEXT)")
@@ -281,29 +300,37 @@ async fn test_zero_row_differential_preserves_data_timestamp() {
         .await;
 
     // create_st with initialize=true populates the ST and sets timestamps.
+    // The source rows were inserted before the CDC trigger was installed, so
+    // there are no stale change-buffer entries after initialization.
     db.create_st("ts_st", "SELECT id, val FROM ts_src", "1s", "DIFFERENTIAL")
         .await;
 
-    // The scheduler's first cycle after creation may legitimately bump
-    // data_timestamp (stale change buffer entries from the initial INSERT).
-    // Wait for that first scheduler cycle to complete by polling last_refresh_at.
+    // Record last_refresh_at immediately after creation. Use COALESCE so the
+    // comparison is safe even if the column is NULL for any reason.
     let initial_last_refresh: String = db
         .query_scalar(
-            "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+            "SELECT COALESCE(last_refresh_at::text, 'never') \
+             FROM pgtrickle.pgt_stream_tables \
              WHERE pgt_name = 'ts_st'",
         )
         .await;
 
-    // Wait for first scheduler cycle
+    // Wait for the first scheduler cycle (last_refresh_at will advance when
+    // the scheduler runs, even if it finds no new rows — NoData path).
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > std::time::Duration::from_secs(30) {
-            panic!("Timed out waiting for first scheduler cycle");
+            panic!(
+                "Timed out waiting for first scheduler cycle \
+                 (initial last_refresh_at = {})",
+                initial_last_refresh
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let lr: String = db
             .query_scalar(
-                "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+                "SELECT COALESCE(last_refresh_at::text, 'never') \
+                 FROM pgtrickle.pgt_stream_tables \
                  WHERE pgt_name = 'ts_st'",
             )
             .await;
@@ -312,8 +339,7 @@ async fn test_zero_row_differential_preserves_data_timestamp() {
         }
     }
 
-    // Now record data_timestamp after the first scheduler cycle.
-    // All stale buffer entries should be consumed by now.
+    // Record data_timestamp and last_refresh_at after the first scheduler cycle.
     let ts_after_first_cycle: String = db
         .query_scalar(
             "SELECT data_timestamp::text FROM pgtrickle.pgt_stream_tables
@@ -322,7 +348,8 @@ async fn test_zero_row_differential_preserves_data_timestamp() {
         .await;
     let lr_after_first_cycle: String = db
         .query_scalar(
-            "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+            "SELECT COALESCE(last_refresh_at::text, 'never') \
+             FROM pgtrickle.pgt_stream_tables \
              WHERE pgt_name = 'ts_st'",
         )
         .await;
@@ -331,12 +358,17 @@ async fn test_zero_row_differential_preserves_data_timestamp() {
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > std::time::Duration::from_secs(30) {
-            panic!("Timed out waiting for second scheduler cycle");
+            panic!(
+                "Timed out waiting for second scheduler cycle \
+                 (lr_after_first_cycle = {})",
+                lr_after_first_cycle
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let lr: String = db
             .query_scalar(
-                "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+                "SELECT COALESCE(last_refresh_at::text, 'never') \
+                 FROM pgtrickle.pgt_stream_tables \
                  WHERE pgt_name = 'ts_st'",
             )
             .await;
@@ -430,26 +462,31 @@ async fn test_no_spurious_cascade_after_noop_upstream_refresh() {
     .await;
 
     // Both STs are populated from create_st/create_stream_table.
-    // The scheduler's first cycle may legitimately bump data_timestamp
-    // (stale change buffer entries from initial INSERT). Wait for the
-    // first two scheduler cycles on noop_report to stabilize.
+    // Wait for first scheduler cycle on noop_report. Use COALESCE so the
+    // comparison is safe even if last_refresh_at is NULL for any reason.
 
     // Wait for first scheduler cycle on noop_report
     let lr_initial: String = db
         .query_scalar(
-            "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+            "SELECT COALESCE(last_refresh_at::text, 'never') \
+             FROM pgtrickle.pgt_stream_tables \
              WHERE pgt_name = 'noop_report'",
         )
         .await;
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > std::time::Duration::from_secs(30) {
-            panic!("Timed out waiting for 1st noop_report scheduler cycle");
+            panic!(
+                "Timed out waiting for 1st noop_report scheduler cycle \
+                 (lr_initial = {})",
+                lr_initial
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let lr: String = db
             .query_scalar(
-                "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+                "SELECT COALESCE(last_refresh_at::text, 'never') \
+                 FROM pgtrickle.pgt_stream_tables \
                  WHERE pgt_name = 'noop_report'",
             )
             .await;
@@ -467,7 +504,8 @@ async fn test_no_spurious_cascade_after_noop_upstream_refresh() {
         .await;
     let lr_after_cycle1: String = db
         .query_scalar(
-            "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+            "SELECT COALESCE(last_refresh_at::text, 'never') \
+             FROM pgtrickle.pgt_stream_tables \
              WHERE pgt_name = 'noop_report'",
         )
         .await;
@@ -476,12 +514,17 @@ async fn test_no_spurious_cascade_after_noop_upstream_refresh() {
     let start = std::time::Instant::now();
     loop {
         if start.elapsed() > std::time::Duration::from_secs(30) {
-            panic!("Timed out waiting for 2nd noop_report scheduler cycle");
+            panic!(
+                "Timed out waiting for 2nd noop_report scheduler cycle \
+                 (lr_after_cycle1 = {})",
+                lr_after_cycle1
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let lr: String = db
             .query_scalar(
-                "SELECT last_refresh_at::text FROM pgtrickle.pgt_stream_tables
+                "SELECT COALESCE(last_refresh_at::text, 'never') \
+                 FROM pgtrickle.pgt_stream_tables \
                  WHERE pgt_name = 'noop_report'",
             )
             .await;

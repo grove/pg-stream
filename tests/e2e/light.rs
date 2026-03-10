@@ -593,6 +593,14 @@ impl E2eDb {
             .await
     }
 
+    /// Wait for any pg_trickle scheduler background worker to appear.
+    ///
+    /// **Not supported in light-e2e mode** — always returns `false`
+    /// because background worker is not running.
+    pub async fn wait_for_scheduler(&self, _timeout: std::time::Duration) -> bool {
+        false
+    }
+
     /// Wait for the background scheduler to auto-refresh a ST.
     ///
     /// **Not supported in light-e2e mode** — always returns `false`
