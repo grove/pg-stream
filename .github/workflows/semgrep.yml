@@ -16,13 +16,9 @@ on:
       - 'sql/**'
       - '.semgrep/**'
       - '.github/workflows/semgrep.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'src/**'
-      - 'sql/**'
-      - '.semgrep/**'
-      - '.github/workflows/semgrep.yml'
+  # No pull_request trigger: Semgrep rules are advisory-only and won't block
+  # a merge, so running on every PR provides no gate value. Weekly schedule
+  # + push-to-main covers main-branch drift.
   schedule:
     - cron: '0 10 * * 1'
   workflow_dispatch:
