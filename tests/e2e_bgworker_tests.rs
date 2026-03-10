@@ -30,11 +30,10 @@ use std::time::Duration;
 ///
 /// ## Why this is needed
 ///
-/// `new_on_postgres_db()` calls `prime_postgres_had_scheduler()` before
-/// `reset_postgres_database()` to ensure the launcher's `had_scheduler` set
-/// contains `"postgres"`.  With that set the launcher uses `retry_ttl = 15 s`
-/// (instead of `skip_ttl = 300 s`) when respawning the scheduler after the
-/// DROP/CREATE EXTENSION cycle, so the scheduler reappears within ~15–25 s.
+/// `new_on_postgres_db()` now creates a fresh database for each test while
+/// still resetting server-level `ALTER SYSTEM` state up front. That avoids
+/// the brittle shared-`postgres` reset/bootstrap path while keeping tests
+/// independent of execution order.
 ///
 /// The wait helper nudges the launcher every 10 s via both
 /// `pgtrickle._signal_launcher_rescan()` and `pg_reload_conf()`, so stale
@@ -56,10 +55,8 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         sched_running,
         "pg_trickle scheduler did not appear in pg_stat_activity within 90 s. \
          Possible causes: \
-         (1) cross-binary interference — another test binary called reset_postgres_database() \
-         while this test was waiting; the advisory lock in new_on_postgres_db() should \
-         prevent this, but check that terminate_other_backends() preserves advisory-lock \
-         connections (application_name = 'pg_trickle_test_lock'); \
+         (1) the launcher never re-probed the fresh test database after CREATE EXTENSION, \
+         despite periodic launcher rescan nudges; \
          (2) launcher retry back-off (retry_ttl=15 s + poll=10 s = 25 s) exceeded \
          the timeout even after periodic launcher rescan nudges; \
          (3) pg_trickle.enabled GUC is false; \

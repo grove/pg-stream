@@ -266,8 +266,8 @@ async fn configure_fast_scheduler(db: &E2eDb) {
         sched_running,
         "pg_trickle scheduler did not appear in pg_stat_activity within 90 s. \
          Possible causes: \
-         (1) prime_postgres_had_scheduler() did not run before reset — the launcher \
-         may be using skip_ttl (300 s) instead of retry_ttl (15 s); \
+         (1) the launcher never re-probed the fresh test database after CREATE EXTENSION, \
+         despite periodic launcher rescan nudges; \
          (2) launcher retry back-off (retry_ttl=15 s + poll=10 s = 25 s) exceeded \
          the timeout; \
          (3) pg_trickle.enabled GUC is false; \
@@ -290,7 +290,8 @@ async fn configure_fast_scheduler(db: &E2eDb) {
 /// the test uses auto-refresh via a short schedule rather than manual refresh.
 #[tokio::test]
 async fn test_zero_row_differential_preserves_data_timestamp() {
-    // Must use postgres database — the scheduler bgworker only connects to it.
+    // new_on_postgres_db() now creates an isolated per-test database while
+    // still resetting server-level scheduler GUCs before the test starts.
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
     // configure_fast_scheduler also waits for the scheduler BGW to appear.
     configure_fast_scheduler(&db).await;
@@ -423,7 +424,8 @@ async fn test_zero_row_differential_preserves_data_timestamp() {
 /// where the 0-row DIFFERENTIAL fix lives.
 #[tokio::test]
 async fn test_no_spurious_cascade_after_noop_upstream_refresh() {
-    // Must use postgres database — the scheduler bgworker only connects to it.
+    // new_on_postgres_db() now creates an isolated per-test database while
+    // still resetting server-level scheduler GUCs before the test starts.
     let db = E2eDb::new_on_postgres_db().await.with_extension().await;
     configure_fast_scheduler(&db).await;
 

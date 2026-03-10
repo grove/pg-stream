@@ -13,8 +13,8 @@
 //!
 //! ## Important
 //!
-//! All tests use `E2eDb::new_on_postgres_db()` because the background
-//! worker only connects to the `postgres` database.
+//! These tests use `E2eDb::new_on_postgres_db()`, which now creates a fresh
+//! per-test database and resets server-level scheduler config before the test.
 //!
 //! Prerequisites: `./tests/build_e2e_image.sh`
 
