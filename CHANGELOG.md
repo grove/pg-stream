@@ -47,6 +47,55 @@ now run without `#[ignore]`:
 - `test_having_with_multiple_groups` — multiple groups transitioning simultaneously
 - `test_having_threshold_with_nulls` — NULL-handling in HAVING aggregate
 
+#### FULL OUTER JOIN Differential Correctness (5 tests un-ignored)
+
+Fixed five DVM bugs that caused `FULL OUTER JOIN` stream tables to produce
+incorrect results in DIFFERENTIAL mode:
+
+- **`project.rs` — row-id mismatch:** FULL refresh computes `__pgt_row_id` as
+  `hash(output_columns)`. Differential for FullJoin was passing through raw
+  part row-ids (PK hashes or `0::BIGINT`) instead. Fixed by adding
+  `OpTree::FullJoin { .. }` to the `is_join_child` match in `diff_project` so
+  the row-id is always recomputed from output columns.
+
+- **`aggregate.rs` — compound GROUP BY expression resolution:** `resolve_group_col`
+  called `resolve_col_for_child` which only handles `ColumnRef` atoms. A
+  compound expression such as `COALESCE(l.dept, r.dept)` hit the fallback
+  `strip_qualifier()` path producing `COALESCE(dept, dept)` (ambiguous column
+  error). Fixed by calling `resolve_expr_for_child` so FuncCall arguments are
+  recursively resolved against child CTE column names.
+
+- **`aggregate.rs` — compound GROUP BY expression quoting:** GROUP BY clause
+  building and the delta SELECT used `quote_ident(expr_sql)` for resolved
+  expressions, turning `COALESCE(l__dept, r__dept)` into the identifier
+  `"COALESCE(l__dept, r__dept)"`. Added `col_ref_or_sql_expr` helper:
+  simple bare names are quoted; expressions containing `(` are emitted as-is.
+
+- **`aggregate.rs` — SUM NULL semantics over FULL JOIN:** After a
+  matched→unmatched row transition, `COALESCE(old,0) + COALESCE(ins,0) −
+  COALESCE(del,0)` evaluates to `0` even when all remaining group rows have
+  `NULL` for the aggregated column — PostgreSQL `SUM` of NULLs should be
+  `NULL`. Fixed by building a group-rescan CTE for non-DISTINCT `SUM`
+  aggregates when the child tree contains a `FullJoin`, and using the rescanned
+  value in the merge formula when `has_rescan = true`.
+
+- **`aggregate.rs` — rescan CTE SELECT list for FuncCall group-by columns:**
+  `build_rescan_cte` (and `build_intermediate_agg_delta`) selected the
+  output-name string as a bare column identifier when `expr_sql == output_name`.
+  For `COALESCE(…)` group-by columns, PostgreSQL interpreted `"COALESCE(…)"` as
+  a column name rather than a function call. Fixed by adding an
+  `!expr_sql.contains('(')` guard so FuncCall expressions use `expr AS alias`
+  form.
+
+Five previously-ignored E2E tests in `tests/e2e_full_join_tests.rs` now run
+without `#[ignore]`:
+
+- `test_full_join_basic_differential` — basic matched/unmatched transitions
+- `test_full_join_null_keys_differential` — NULL join keys
+- `test_full_join_key_update_migration` — key value updates
+- `test_full_join_with_aggregate_differential` — SUM over FULL JOIN with COALESCE GROUP BY
+- `test_full_join_multi_column_key_differential` — composite join keys
+
 ### Changed
 
 - **Test count:** 8 DVM-correctness E2E tests remain `#[ignore]`d (down from
