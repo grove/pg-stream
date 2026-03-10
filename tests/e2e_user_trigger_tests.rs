@@ -437,8 +437,10 @@ async fn test_guc_off_suppresses_triggers() {
     }
     db.execute("TRUNCATE audit_log").await;
 
-    // Set GUC to 'off' — should suppress triggers (use MERGE path)
-    db.execute("SET pg_trickle.user_triggers = 'off'").await;
+    // Set GUC to 'off' globally — session-level SET is unreliable with
+    // connection pools (the refresh may run on a different connection).
+    db.alter_system_set_and_wait("pg_trickle.user_triggers", "'off'", "off")
+        .await;
 
     // Modify source and refresh
     db.execute("INSERT INTO src_guc_off VALUES (2, 'b')").await;
@@ -455,6 +457,10 @@ async fn test_guc_off_suppresses_triggers() {
         "Audit log should be empty when GUC is 'off', got {} entries",
         audit_count
     );
+
+    // Reset to default so other tests are not affected.
+    db.alter_system_reset_and_wait("pg_trickle.user_triggers", "auto")
+        .await;
 }
 
 // ── GUC: auto detects triggers ─────────────────────────────────────────
@@ -528,7 +534,9 @@ async fn test_guc_on_alias_detects_triggers() {
     }
     db.execute("TRUNCATE audit_log").await;
 
-    db.execute("SET pg_trickle.user_triggers = 'on'").await;
+    // Use ALTER SYSTEM SET so the value is visible across all pool connections.
+    db.alter_system_set_and_wait("pg_trickle.user_triggers", "'on'", "on")
+        .await;
 
     db.execute("INSERT INTO src_guc_on VALUES (2, 'b')").await;
     db.refresh_st("st_guc_on").await;
@@ -541,6 +549,10 @@ async fn test_guc_on_alias_detects_triggers() {
         "Deprecated 'on' alias should still detect trigger and fire it, got {} INSERT entries",
         insert_count
     );
+
+    // Reset to default so other tests are not affected.
+    db.alter_system_reset_and_wait("pg_trickle.user_triggers", "auto")
+        .await;
 }
 
 // ── FULL refresh suppresses row-level triggers ─────────────────────────
