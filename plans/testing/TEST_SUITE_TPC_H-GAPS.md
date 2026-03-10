@@ -5,9 +5,9 @@
 > "TPC-H" and "TPC Benchmark" are trademarks of the Transaction Processing
 > Performance Council ([tpc.org](https://www.tpc.org/)).
 
-**Status:** Proposed  
+**Status:** In Progress  
 **Date:** 2026-03-09  
-**Branch:** `test-suite-tpc-h-part-2`  
+**Branch:** `test-suite-tpc-h-gaps`  
 **Scope:** Second wave of TPC-H test suite improvements, building on the
 complete 22/22 passing baseline from `PLAN_TEST_SUITE_TPC_H.md`.
 
@@ -63,15 +63,18 @@ rather than new DVM fixes:
    correctness test with per-operation trigger assertions. *(DONE — merged
    in PR #135)*
 2. Add `test_tpch_immediate_rollback` — verifies that a rolled-back DML
-   transaction leaves the IVM stream table unchanged.
+   transaction leaves the IVM stream table unchanged. *(DONE — T3)*
 3. Strengthen `assert_tpch_invariant` with a `__pgt_count` sanity check.
+   *(DONE — T1)*
 4. Add a skip-set regression guard to `test_tpch_differential_correctness`
-   and `test_tpch_immediate_correctness`.
+   and `test_tpch_immediate_correctness`. *(DONE — T2)*
 5. Add `test_tpch_differential_vs_immediate` — side-by-side mode comparison.
+   *(DONE — T4)*
 6. Add `test_tpch_single_row_mutations` — single-row INSERT/DELETE/UPDATE in
-   IMMEDIATE mode on a representative subset of queries.
+   IMMEDIATE mode on a representative subset of queries. *(DONE — T5)*
 7. Add `test_tpch_dag_chain` — a two-level DAG chain using two TPC-H queries,
-   verifying end-to-end DAG correctness under mutations.
+   verifying end-to-end DAG correctness under mutations. *(DONE — T6,
+   includes T6a basic chain + T6b multi-parent fan-in)*
 
 ---
 
@@ -400,16 +403,13 @@ fan-in.
 
 ## File Changes Summary
 
-| File | Change |
-|------|--------|
-| `tests/e2e_tpch_tests.rs` | Add T1 (`__pgt_count` check), T2 (skip guard), T3 (`test_tpch_immediate_rollback`), T4 (`test_tpch_differential_vs_immediate`), T5 (`test_tpch_single_row_mutations`) |
-| `tests/tpch/single_row_insert.sql` | New — single-row INSERT for T5 |
-| `tests/tpch/single_row_update.sql` | New — single-row UPDATE for T5 |
-| `tests/tpch/single_row_delete.sql` | New — single-row DELETE for T5 |
-| `tests/e2e_tpch_dag_tests.rs` | New (optional, may go in main file) — T6 |
-
-No changes to `src/`, `.github/workflows/ci.yml`, `justfile`, or any SQL
-upgrade scripts.
+| File | Change | Status |
+|------|--------|--------|
+| `tests/e2e_tpch_tests.rs` | T1 (`__pgt_count` check), T2 (skip guard), T3 (`test_tpch_immediate_rollback`), T4 (`test_tpch_differential_vs_immediate`), T5 (`test_tpch_single_row_mutations`) | ✅ Done |
+| `tests/tpch/single_row_insert.sql` | New — single-row INSERT for T5 | ✅ Done |
+| `tests/tpch/single_row_update.sql` | New — single-row UPDATE for T5 | ✅ Done |
+| `tests/tpch/single_row_delete.sql` | New — single-row DELETE for T5 | ✅ Done |
+| `tests/e2e_tpch_dag_tests.rs` | New — T6a (basic two-level chain) + T6b (multi-parent fan-in) | ✅ Done |
 
 ---
 

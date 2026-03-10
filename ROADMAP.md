@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-09
-> **Latest release:** 0.2.2 (2026-03-08)
-> **Current milestone:** 0.2.3
+> **Last updated:** 2026-03-10
+> **Latest release:** 0.2.3 (scheduled)
+> **Current milestone:** TPC-H Test Suite Enhancements (T1–T6)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -450,6 +450,29 @@ validations, resource leaks, and observability holes. Phased from quick wins
 - [x] Extension upgrade path tested (`0.2.2 → 0.2.3`)
 
 **Status: Ready for release (tag pending).**
+
+---
+
+## TPC-H Test Suite Enhancements (T1–T6)
+
+**Branch:** `test-suite-tpc-h-gaps`  
+**Status:** In Progress — all T1–T6 items implemented.  
+**Ref:** [plans/testing/TEST_SUITE_TPC_H-GAPS.md](plans/testing/TEST_SUITE_TPC_H-GAPS.md)
+
+Second wave of TPC-H correctness coverage, building on the 22/22 passing
+DIFFERENTIAL baseline. No `src/` changes — test-only additions.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| T1 | `__pgt_count < 0` guard in `assert_tpch_invariant` (over-retraction detector) | ✅ Done |
+| T2 | Skip-set regression guard in DIFFERENTIAL + IMMEDIATE tests (allowlist-based) | ✅ Done |
+| T3 | `test_tpch_immediate_rollback` — verify ROLLBACK restores IVM ST atomically | ✅ Done |
+| T4 | `test_tpch_differential_vs_immediate` — compare both incremental modes directly | ✅ Done |
+| T5 | `test_tpch_single_row_mutations` + SQL fixtures — single-row IVM trigger paths | ✅ Done |
+| T6a | `test_tpch_dag_chain` — two-level DAG (Q01 → filtered projection), DIFFERENTIAL | ✅ Done |
+| T6b | `test_tpch_dag_multi_parent` — multi-parent fan-in (Q01 + Q06 → union), DIFFERENTIAL | ✅ Done |
+
+> No changes to `src/`, `.github/workflows/ci.yml`, `justfile`, or upgrade scripts.
 
 ---
 

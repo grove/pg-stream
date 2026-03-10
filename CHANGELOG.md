@@ -9,6 +9,41 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Added
+
+- **TPC-H test suite enhancements (T1–T6)** — second wave of TPC-H correctness
+  coverage, building on the 22/22 passing DIFFERENTIAL baseline:
+  - **T1 — `__pgt_count` guard** in `assert_tpch_invariant`: detects
+    over-retraction bugs (negative multiplicity) before the EXCEPT ALL check,
+    so they surface even when extra and missing rows cancel out. Applies
+    automatically to all existing TPC-H tests.
+  - **T2 — Skip-set regression guard** in `test_tpch_differential_correctness`
+    and `test_tpch_immediate_correctness`: any query newly skipped that is not
+    in the per-mode allowlist causes the test to fail with a clear diagnostic.
+    Prevents silent regressions as DVM evolves.
+  - **T3 — `test_tpch_immediate_rollback`**: verifies that a rolled-back DML
+    transaction leaves an IMMEDIATE-mode stream table in exactly the same state
+    as before. Covers q01, q06, q03, q05 across RF1/RF2/RF3 mutation types.
+    Uses sqlx's `pool.begin()` + `txn.rollback()` to span real PostgreSQL
+    transactions.
+  - **T4 — `test_tpch_differential_vs_immediate`**: side-by-side comparison of
+    DIFFERENTIAL and IMMEDIATE modes. For each query that succeeds in both
+    modes, verifies that both STs produce identical results after shared RF
+    mutations. Catches cases where both incremental paths agree with each other
+    but diverge from ground truth in the same way.
+  - **T5 — `test_tpch_single_row_mutations`**: validates the IVM trigger path
+    for single-row INSERT, UPDATE, and DELETE (1-row `NEW TABLE`/`OLD TABLE`)
+    on q01, q06, q03 in IMMEDIATE mode. Includes three new SQL fixtures:
+    `tests/tpch/single_row_insert.sql`, `single_row_update.sql`,
+    `single_row_delete.sql` (fixed order key 9999991 to avoid data collisions).
+  - **T6 — `tests/e2e_tpch_dag_tests.rs`** — new test file with two DAG tests:
+    - `test_tpch_dag_chain`: two-level DAG (Q01 as level-0, filtered projection
+      as level-1). Refreshes in topological order and asserts both STs after
+      each RF cycle.
+    - `test_tpch_dag_multi_parent`: multi-parent fan-in (Q01 + Q06 as level-0,
+      aggregated UNION ALL as level-1). Validates the DAG refresh scheduler
+      with two independent parent STs sharing a downstream dependent.
+
 ## [0.2.3] — 2026-03-09
 
 ### Added
