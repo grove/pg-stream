@@ -34,7 +34,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
     review policy, CI posture table, and a **Security Newbie Checklist** for
     reviewers unfamiliar with extension-specific security patterns.
 
-
+- **TPC-H test suite enhancements (T1–T6)** — second wave of TPC-H correctness
   coverage, building on the 22/22 passing DIFFERENTIAL baseline:
   - **T1 — `__pgt_count` guard** in `assert_tpch_invariant`: detects
     over-retraction bugs (negative multiplicity) before the EXCEPT ALL check,
