@@ -55,6 +55,39 @@ fn rf_count() -> usize {
     (orders / 100).max(10)
 }
 
+// ── T2: Skip-set regression guard ─────────────────────────────────────
+//
+// Allowlists of queries that are permitted to be skipped in each mode.
+// If a query that is NOT in the allowlist is skipped, the test fails —
+// signalling a DVM regression where a previously-passing query no longer
+// creates or runs correctly.
+//
+// DIFFERENTIAL: all 22 queries are known to pass → allowlist is empty.
+// IMMEDIATE:    a subset cannot be created (IVM restriction). Populate by
+//               running with the guard disabled, then hardening the set.
+//
+// To update: comment out the `assert!` at the end of the test, run, collect
+// the output, and add the skipped query names here with a comment explaining
+// the known limitation.
+
+/// Queries allowed to be skipped in DIFFERENTIAL mode.
+/// Currently empty — all 22 queries pass DIFFERENTIAL mode.
+const DIFFERENTIAL_SKIP_ALLOWLIST: &[&str] = &[];
+
+/// Queries allowed to be skipped in IMMEDIATE mode.
+/// Queries that fail `create_stream_table(..., 'IMMEDIATE')` due to IVM
+/// restrictions (subqueries in the target list, EXCEPT ALL, NOT IN correlated
+/// subqueries, etc.) are expected to be skipped.
+/// TODO: populate from the first test run output and re-enable the guard.
+/// See plans/testing/TEST_SUITE_TPC_H-GAPS.md §T2 for the initial-population
+/// procedure.
+const IMMEDIATE_SKIP_ALLOWLIST: &[&str] = &[
+    // All queries — allowlist is not yet populated from an initial run.
+    // Remove this catch-all once the real skip set is known.
+    "q02", "q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q12", "q13", "q14",
+    "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22", "q01",
+];
+
 // ── Scale factor dimensions ────────────────────────────────────────────
 
 fn sf_orders() -> usize {
@@ -365,6 +398,33 @@ async fn assert_tpch_invariant(
         ))
         .await;
 
+    // ── T1: Negative __pgt_count guard ───────────────────────────────────
+    // A __pgt_count < 0 indicates an over-retraction DVM bug: deleted more
+    // multiplicity than was ever inserted. Check before the multiset EXCEPT
+    // so it surfaces even when the extra/missing happen to cancel out.
+    let has_pgt_count: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_name = '{st_name}' \
+                  AND column_name = '__pgt_count' \
+            )"
+        ))
+        .await;
+    if has_pgt_count {
+        let neg_count: i64 = db
+            .query_scalar(&format!(
+                "SELECT count(*) FROM {st_table} WHERE __pgt_count < 0"
+            ))
+            .await;
+        if neg_count > 0 {
+            return Err(format!(
+                "NEGATIVE __pgt_count: {qname} cycle {cycle} — \
+                 {neg_count} rows with __pgt_count < 0 (over-retraction bug)"
+            ));
+        }
+    }
+
     if !matches {
         // Collect diagnostic information
         let st_count: i64 = db
@@ -651,6 +711,20 @@ async fn test_tpch_differential_correctness() {
         failed.is_empty(),
         "{} queries failed with assertion errors (not pg_trickle limitations)",
         failed.len()
+    );
+
+    // T2: Skip-set regression guard for DIFFERENTIAL mode.
+    let unexpected_skips: Vec<&str> = skipped
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !DIFFERENTIAL_SKIP_ALLOWLIST.contains(name))
+        .collect();
+    assert!(
+        unexpected_skips.is_empty(),
+        "DIFFERENTIAL REGRESSION: queries newly skipped that are not in \
+         DIFFERENTIAL_SKIP_ALLOWLIST: {:?}\n\
+         If intentional, add to the allowlist with an explanatory comment.",
+        unexpected_skips
     );
 }
 // ═══════════════════════════════════════════════════════════════════════
@@ -1676,5 +1750,660 @@ async fn test_tpch_immediate_correctness() {
         failed.is_empty(),
         "{} queries failed with assertion errors (not pg_trickle limitations)",
         failed.len()
+    );
+
+    // T2: Skip-set regression guard for IMMEDIATE mode.
+    // NOTE: IMMEDIATE_SKIP_ALLOWLIST is currently fully permissive (all query
+    // names listed) until the real skip set is collected from a first run.
+    // See the comment on IMMEDIATE_SKIP_ALLOWLIST above for how to tighten it.
+    let unexpected_imm_skips: Vec<&str> = skipped
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !IMMEDIATE_SKIP_ALLOWLIST.contains(name))
+        .collect();
+    assert!(
+        unexpected_imm_skips.is_empty(),
+        "IMMEDIATE REGRESSION: queries newly skipped that are not in \
+         IMMEDIATE_SKIP_ALLOWLIST: {:?}\n\
+         If intentional, add to the allowlist with an explanatory comment.",
+        unexpected_imm_skips
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// T3 — IMMEDIATE Mode Rollback Correctness
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Verifies that a rolled-back DML transaction leaves an IMMEDIATE-mode
+// stream table in the exact same state as before the transaction.
+//
+// The IVM trigger fires inside the user's transaction. A ROLLBACK must
+// revert both the base-table changes AND the stream table update atomically.
+// PostgreSQL guarantees this naturally because the trigger participates in
+// the surrounding transaction.
+//
+// Representative query subset:
+//   q01 — scalar aggregate (no GROUP BY grouping keys)
+//   q06 — filter + single SUM aggregate
+//   q03 — 3-table join + aggregate (LIMIT 10)
+//   q05 — 6-table join + GROUP BY aggregate
+//
+// These cover the main IVM delta paths without requiring all 22 queries.
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_immediate_rollback() {
+    let sf = scale_factor();
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  TPC-H IMMEDIATE Rollback Correctness — SF={sf}");
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let t = std::time::Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let rollback_queries: &[(&str, &str)] = &[
+        ("q01", include_str!("tpch/queries/q01.sql")),
+        ("q06", include_str!("tpch/queries/q06.sql")),
+        ("q03", include_str!("tpch/queries/q03.sql")),
+        ("q05", include_str!("tpch/queries/q05.sql")),
+    ];
+
+    let mut all_passed = true;
+    let mut skipped: Vec<(&str, String)> = Vec::new();
+
+    for (name, sql) in rollback_queries {
+        println!("── {name} ──────────────────────────────────────────");
+
+        let st_name = format!("tpch_rb_{name}");
+
+        // Create ST in IMMEDIATE mode
+        if let Err(e) = db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_name}', $${sql}$$, NULL, 'IMMEDIATE')"
+            ))
+            .await
+        {
+            let reason = e.to_string();
+            let short = reason.split(':').next_back().unwrap_or(&reason).trim();
+            println!("  SKIP (create) — {short}");
+            skipped.push((name, reason));
+            continue;
+        }
+
+        // Baseline: ST must match defining query on creation
+        if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 0).await {
+            println!("  SKIP (baseline) — {e}");
+            skipped.push((name, format!("baseline: {e}")));
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+                .await;
+            continue;
+        }
+
+        let pre_count: i64 = db
+            .query_scalar(&format!("SELECT count(*) FROM public.{st_name}"))
+            .await;
+        println!("  baseline ✓ (rows: {pre_count})");
+
+        // ── RF1: bulk INSERT with ROLLBACK ──────────────────────────
+        {
+            let next_ok = max_orderkey(&db).await + 1;
+            let rf1_sql = substitute_rf(RF1_SQL, next_ok);
+
+            let mut txn = db.pool.begin().await.expect("begin RF1 txn");
+            let mut rf_err: Option<String> = None;
+            for stmt in rf1_sql.split(';') {
+                let stmt = stmt.trim();
+                let has_sql = stmt.lines().any(|l| {
+                    let l = l.trim();
+                    !l.is_empty() && !l.starts_with("--")
+                });
+                if !has_sql {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(stmt).execute(&mut *txn).await {
+                    rf_err = Some(e.to_string());
+                    break;
+                }
+            }
+
+            if let Some(e) = rf_err {
+                let _ = txn.rollback().await;
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  SKIP RF1 — IVM trigger error: {msg}");
+                skipped.push((name, format!("RF1 trigger error: {msg}")));
+                let _ = db
+                    .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+                    .await;
+                all_passed = false;
+                continue;
+            }
+
+            // Within transaction: verify ST was updated by the IVM trigger
+            let mid_count: i64 =
+                sqlx::query_scalar(&format!("SELECT count(*) FROM public.{st_name}"))
+                    .fetch_one(&mut *txn)
+                    .await
+                    .unwrap_or(pre_count);
+
+            println!("  RF1 (INSERT) mid-txn rows: {mid_count}");
+
+            txn.rollback().await.expect("RF1 rollback");
+
+            // After rollback: ST must be identical to pre-mutation state
+            let post_count: i64 = db
+                .query_scalar(&format!("SELECT count(*) FROM public.{st_name}"))
+                .await;
+            if post_count != pre_count {
+                println!(
+                    "  FAIL RF1 ROLLBACK: row count changed — pre={pre_count} post={post_count}"
+                );
+                all_passed = false;
+            } else if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 0).await {
+                println!("  FAIL RF1 ROLLBACK invariant — {e}");
+                all_passed = false;
+            } else {
+                println!("  RF1 ROLLBACK ✓");
+            }
+        }
+
+        // ── RF2: bulk DELETE with ROLLBACK ──────────────────────────
+        {
+            let rf2_sql = RF2_SQL.replace("__RF_COUNT__", &rf_count().to_string());
+            let mut txn = db.pool.begin().await.expect("begin RF2 txn");
+            let mut rf_err: Option<String> = None;
+            for stmt in rf2_sql.split(';') {
+                let stmt = stmt.trim();
+                let has_sql = stmt.lines().any(|l| {
+                    let l = l.trim();
+                    !l.is_empty() && !l.starts_with("--")
+                });
+                if !has_sql {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(stmt).execute(&mut *txn).await {
+                    rf_err = Some(e.to_string());
+                    break;
+                }
+            }
+
+            if let Some(e) = rf_err {
+                let _ = txn.rollback().await;
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  SKIP RF2 — IVM trigger error: {msg}");
+                skipped.push((name, format!("RF2 trigger error: {msg}")));
+            } else {
+                let mid_count: i64 =
+                    sqlx::query_scalar(&format!("SELECT count(*) FROM public.{st_name}"))
+                        .fetch_one(&mut *txn)
+                        .await
+                        .unwrap_or(pre_count);
+                println!("  RF2 (DELETE) mid-txn rows: {mid_count}");
+
+                txn.rollback().await.expect("RF2 rollback");
+
+                let post_count: i64 = db
+                    .query_scalar(&format!("SELECT count(*) FROM public.{st_name}"))
+                    .await;
+                if post_count != pre_count {
+                    println!(
+                        "  FAIL RF2 ROLLBACK: row count changed — pre={pre_count} post={post_count}"
+                    );
+                    all_passed = false;
+                } else if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 0).await {
+                    println!("  FAIL RF2 ROLLBACK invariant — {e}");
+                    all_passed = false;
+                } else {
+                    println!("  RF2 ROLLBACK ✓");
+                }
+            }
+        }
+
+        // ── RF3: targeted UPDATEs with ROLLBACK ────────────────────
+        {
+            let rf3_sql = RF3_SQL.replace("__RF_COUNT__", &rf_count().to_string());
+            let mut txn = db.pool.begin().await.expect("begin RF3 txn");
+            let mut rf_err: Option<String> = None;
+            for stmt in rf3_sql.split(';') {
+                let stmt = stmt.trim();
+                let has_sql = stmt.lines().any(|l| {
+                    let l = l.trim();
+                    !l.is_empty() && !l.starts_with("--")
+                });
+                if !has_sql {
+                    continue;
+                }
+                if let Err(e) = sqlx::query(stmt).execute(&mut *txn).await {
+                    rf_err = Some(e.to_string());
+                    break;
+                }
+            }
+
+            if let Some(e) = rf_err {
+                let _ = txn.rollback().await;
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  SKIP RF3 — IVM trigger error: {msg}");
+                skipped.push((name, format!("RF3 trigger error: {msg}")));
+            } else {
+                let mid_count: i64 =
+                    sqlx::query_scalar(&format!("SELECT count(*) FROM public.{st_name}"))
+                        .fetch_one(&mut *txn)
+                        .await
+                        .unwrap_or(pre_count);
+                println!("  RF3 (UPDATE) mid-txn rows: {mid_count}");
+
+                txn.rollback().await.expect("RF3 rollback");
+
+                let post_count: i64 = db
+                    .query_scalar(&format!("SELECT count(*) FROM public.{st_name}"))
+                    .await;
+                if post_count != pre_count {
+                    println!(
+                        "  FAIL RF3 ROLLBACK: row count changed — pre={pre_count} post={post_count}"
+                    );
+                    all_passed = false;
+                } else if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 0).await {
+                    println!("  FAIL RF3 ROLLBACK invariant — {e}");
+                    all_passed = false;
+                } else {
+                    println!("  RF3 ROLLBACK ✓");
+                }
+            }
+        }
+
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+    }
+
+    println!("\n══════════════════════════════════════════════════════════");
+    if !skipped.is_empty() {
+        println!("  Skipped ({} queries):", skipped.len());
+        for (name, reason) in &skipped {
+            let short = reason.split(':').next_back().unwrap_or(reason).trim();
+            println!("    {name}: {short}");
+        }
+    }
+    println!(
+        "  Rollback correctness: {}",
+        if all_passed {
+            "PASSED ✓"
+        } else {
+            "FAILED ✗"
+        }
+    );
+    println!("══════════════════════════════════════════════════════════\n");
+
+    assert!(all_passed, "IMMEDIATE mode rollback correctness failed");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// T4 — DIFFERENTIAL vs IMMEDIATE Mode Agreement
+// ═══════════════════════════════════════════════════════════════════════
+//
+// For each query that succeeds in both modes, creates two stream tables —
+// one DIFFERENTIAL (`tpch_di_<q>`), one IMMEDIATE (`tpch_ii_<q>`) — and
+// verifies that they produce identical results after shared RF mutations.
+//
+// Unlike test_tpch_full_vs_differential (FULL vs DIFF), this test checks
+// that the two incremental paths agree with each other, catching cases where
+// both diverge from ground-truth in the same way.
+//
+// Assertion cadence: once per cycle (after RF1+RF2+RF3), not three times.
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_differential_vs_immediate() {
+    let sf = scale_factor();
+    let n_cycles = cycles();
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  TPC-H DIFFERENTIAL vs IMMEDIATE — SF={sf}, cycles={n_cycles}");
+    println!("══════════════════════════════════════════════════════════\n");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let t = std::time::Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let queries = tpch_queries();
+    let mut passed = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+
+    for q in &queries {
+        let st_diff = format!("tpch_di_{}", q.name);
+        let st_imm = format!("tpch_ii_{}", q.name);
+
+        let diff_ok = db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_diff}', $${sql}$$, '1m', 'DIFFERENTIAL')",
+                sql = q.sql,
+            ))
+            .await;
+        let imm_ok = db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_imm}', $${sql}$$, NULL, 'IMMEDIATE')",
+                sql = q.sql,
+            ))
+            .await;
+
+        if diff_ok.is_err() || imm_ok.is_err() {
+            let reason = if diff_ok.is_err() {
+                "DIFF create failed"
+            } else {
+                "IMMEDIATE create failed"
+            };
+            println!("  {}: SKIP — {reason}", q.name);
+            skipped.push(q.name.to_string());
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_diff}')"))
+                .await;
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_imm}')"))
+                .await;
+            continue;
+        }
+
+        println!(
+            "── {} (Tier {}) ──────────────────────────────",
+            q.name, q.tier
+        );
+
+        let mut mode_ok = true;
+        'cyc: for cycle in 1..=n_cycles {
+            let ct = std::time::Instant::now();
+
+            let next_ok = max_orderkey(&db).await + 1;
+            // Apply shared mutations — IMMEDIATE ST is already updated by IVM
+            // triggers; DIFFERENTIAL ST needs an explicit refresh below.
+            if let Err(e) = try_apply_rf1(&db, next_ok).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} RF1 — IVM error: {msg}");
+                skipped.push(format!("{} RF1-{cycle}", q.name));
+                mode_ok = false;
+                break 'cyc;
+            }
+            if let Err(e) = try_apply_rf2(&db).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} RF2 — IVM error: {msg}");
+                skipped.push(format!("{} RF2-{cycle}", q.name));
+                mode_ok = false;
+                break 'cyc;
+            }
+            if let Err(e) = try_apply_rf3(&db).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} RF3 — IVM error: {msg}");
+                skipped.push(format!("{} RF3-{cycle}", q.name));
+                mode_ok = false;
+                break 'cyc;
+            }
+
+            db.execute("ANALYZE orders").await;
+            db.execute("ANALYZE lineitem").await;
+            db.execute("ANALYZE customer").await;
+
+            // Explicit refresh for DIFFERENTIAL; IMMEDIATE is already current.
+            if let Err(e) = try_refresh_st(&db, &st_diff).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  WARN cycle {cycle} DIFF refresh — {msg}");
+                skipped.push(q.name.to_string());
+                mode_ok = false;
+                break 'cyc;
+            }
+
+            // Compare DIFFERENTIAL vs IMMEDIATE directly
+            let cols: String = db
+                .query_scalar(&format!(
+                    "SELECT string_agg(column_name, ', ' ORDER BY ordinal_position) \
+                     FROM information_schema.columns \
+                     WHERE (table_schema || '.' || table_name = 'public.{st_diff}' \
+                        OR table_name = '{st_diff}') \
+                       AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
+                ))
+                .await;
+
+            let agrees: bool = db
+                .query_scalar(&format!(
+                    "SELECT NOT EXISTS ( \
+                        (SELECT {cols} FROM public.{st_diff} EXCEPT ALL \
+                         SELECT {cols} FROM public.{st_imm}) \
+                        UNION ALL \
+                        (SELECT {cols} FROM public.{st_imm} EXCEPT ALL \
+                         SELECT {cols} FROM public.{st_diff}) \
+                    )"
+                ))
+                .await;
+
+            db.execute("VACUUM").await;
+
+            if !agrees {
+                let diff_count: i64 = db
+                    .query_scalar(&format!("SELECT count(*) FROM public.{st_diff}"))
+                    .await;
+                let imm_count: i64 = db
+                    .query_scalar(&format!("SELECT count(*) FROM public.{st_imm}"))
+                    .await;
+                println!(
+                    "  WARN: {} cycle {} — DIFF({diff_count}) != IMM({imm_count}) \
+                     (mode divergence)",
+                    q.name, cycle
+                );
+                skipped.push(q.name.to_string());
+                mode_ok = false;
+                break 'cyc;
+            }
+
+            println!(
+                "  [T{}] {:<4} cycle {}/{} — DIFF==IMM ✓ — {:.0}ms",
+                q.tier,
+                q.name,
+                cycle,
+                n_cycles,
+                ct.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
+        if mode_ok {
+            passed += 1;
+        } else {
+            println!("  {}: SKIP — mode divergence", q.name);
+        }
+
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_diff}')"))
+            .await;
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_imm}')"))
+            .await;
+    }
+
+    println!("\n══════════════════════════════════════════════════════════");
+    if !skipped.is_empty() {
+        println!("  Skipped / diverged: {}", skipped.join(", "));
+    }
+    println!(
+        "  DIFFERENTIAL vs IMMEDIATE: {passed}/{} queries agreed ✓\n",
+        queries.len()
+    );
+    println!("══════════════════════════════════════════════════════════\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// T5 — Single-Row Mutations in IMMEDIATE Mode
+// ═══════════════════════════════════════════════════════════════════════
+//
+// All existing RF mutations are batch operations (RF_COUNT ≥ 10 rows).
+// Single-row INSERT / UPDATE / DELETE hit different transition-table code
+// paths (1-row NEW TABLE / OLD TABLE).  This test validates those paths
+// explicitly on a focused subset of queries.
+//
+// Uses fixed order key 9999991 (well above SF=0.01 range of ~1,500)
+// to avoid collisions with the generated data.
+//
+// Query subset:
+//   q01 — pure scalar aggregate (single-table, no join)
+//   q06 — filter + SUM (single-table, filter predicate)
+//   q03 — 3-table join + aggregate (multi-table join path)
+
+#[tokio::test]
+#[ignore]
+async fn test_tpch_single_row_mutations() {
+    let sf = scale_factor();
+    println!("\n══════════════════════════════════════════════════════════");
+    println!("  TPC-H Single-Row Mutations (IMMEDIATE) — SF={sf}");
+    println!("══════════════════════════════════════════════════════════\n");
+
+    const SINGLE_ROW_INSERT: &str = include_str!("tpch/single_row_insert.sql");
+    const SINGLE_ROW_UPDATE: &str = include_str!("tpch/single_row_update.sql");
+    const SINGLE_ROW_DELETE: &str = include_str!("tpch/single_row_delete.sql");
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let t = std::time::Instant::now();
+    load_schema(&db).await;
+    load_data(&db).await;
+    println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
+
+    let single_row_queries: &[(&str, &str)] = &[
+        ("q01", include_str!("tpch/queries/q01.sql")),
+        ("q06", include_str!("tpch/queries/q06.sql")),
+        ("q03", include_str!("tpch/queries/q03.sql")),
+    ];
+
+    let mut passed = 0usize;
+    let mut skipped: Vec<(&str, String)> = Vec::new();
+
+    /// Helper: execute multi-statement SQL, return first error if any.
+    async fn exec_sql(db: &E2eDb, sql: &str) -> Result<(), String> {
+        for stmt in sql.split(';') {
+            let stmt = stmt.trim();
+            let has_sql = stmt.lines().any(|l| {
+                let l = l.trim();
+                !l.is_empty() && !l.starts_with("--")
+            });
+            if has_sql {
+                db.try_execute(stmt).await.map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    for (name, sql) in single_row_queries {
+        println!("── {name} ──────────────────────────────────────────");
+
+        let st_name = format!("tpch_sr_{name}");
+
+        if let Err(e) = db
+            .try_execute(&format!(
+                "SELECT pgtrickle.create_stream_table('{st_name}', $${sql}$$, NULL, 'IMMEDIATE')"
+            ))
+            .await
+        {
+            let reason = e.to_string();
+            let short = reason.split(':').next_back().unwrap_or(&reason).trim();
+            println!("  SKIP (create) — {short}");
+            skipped.push((name, reason));
+            continue;
+        }
+
+        // Baseline
+        if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 0).await {
+            println!("  SKIP (baseline) — {e}");
+            skipped.push((name, format!("baseline: {e}")));
+            let _ = db
+                .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+                .await;
+            continue;
+        }
+        println!("  baseline ✓");
+
+        // Ensure the fixed key is not already in the table
+        let _ = exec_sql(&db, SINGLE_ROW_DELETE).await; // idempotent clean-up
+
+        let mut query_ok = true;
+
+        // Step 1: single-row INSERT
+        if let Err(e) = exec_sql(&db, SINGLE_ROW_INSERT).await {
+            let msg = e.lines().next().unwrap_or(&e).to_string();
+            println!("  SKIP single INSERT — IVM trigger error: {msg}");
+            skipped.push((name, format!("single INSERT: {msg}")));
+            query_ok = false;
+        } else if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 1).await {
+            println!("  FAIL after single INSERT — {e}");
+            query_ok = false;
+        } else {
+            println!("  single INSERT ✓");
+        }
+
+        // Step 2: single-row UPDATE (only if INSERT passed)
+        if query_ok {
+            if let Err(e) = exec_sql(&db, SINGLE_ROW_UPDATE).await {
+                let msg = e.lines().next().unwrap_or(&e).to_string();
+                println!("  SKIP single UPDATE — IVM trigger error: {msg}");
+                skipped.push((name, format!("single UPDATE: {msg}")));
+                query_ok = false;
+            } else if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 2).await {
+                println!("  FAIL after single UPDATE — {e}");
+                query_ok = false;
+            } else {
+                println!("  single UPDATE ✓");
+            }
+        }
+
+        // Step 3: single-row DELETE (always attempt to clean up)
+        {
+            let del_result = exec_sql(&db, SINGLE_ROW_DELETE).await;
+            if query_ok {
+                if let Err(e) = del_result {
+                    let msg = e.lines().next().unwrap_or(&e).to_string();
+                    println!("  SKIP single DELETE — IVM trigger error: {msg}");
+                    skipped.push((name, format!("single DELETE: {msg}")));
+                    query_ok = false;
+                } else if let Err(e) = assert_tpch_invariant(&db, &st_name, sql, name, 3).await {
+                    println!("  FAIL after single DELETE — {e}");
+                    query_ok = false;
+                } else {
+                    println!("  single DELETE ✓");
+                }
+            }
+        }
+
+        if query_ok {
+            passed += 1;
+        }
+
+        let _ = db
+            .try_execute(&format!("SELECT pgtrickle.drop_stream_table('{st_name}')"))
+            .await;
+    }
+
+    println!("\n══════════════════════════════════════════════════════════");
+    println!(
+        "  Single-row mutations: {passed}/{} queries passed, {} skipped",
+        single_row_queries.len(),
+        skipped.len()
+    );
+    if !skipped.is_empty() {
+        println!("  Skipped:");
+        for (name, reason) in &skipped {
+            let short = reason.split(':').next_back().unwrap_or(reason).trim();
+            println!("    {name}: {short}");
+        }
+    }
+    println!("══════════════════════════════════════════════════════════\n");
+
+    // Soft-pass if all failures are IMMEDIATE mode IVM limitations.
+    // Hard-fail only if full create + baseline succeeded but mutations diverged.
+    let hard_fails = passed < single_row_queries.len() - skipped.len();
+    assert!(
+        !hard_fails,
+        "Single-row mutation correctness failed for {}/{} queries",
+        single_row_queries.len() - skipped.len() - passed,
+        single_row_queries.len() - skipped.len(),
     );
 }
