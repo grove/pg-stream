@@ -1394,8 +1394,9 @@ pg_trickle transparently rewrites certain SQL constructs before parsing. These r
 | #1 | `DISTINCT ON (expr)` | Convert to `ROW_NUMBER() OVER (PARTITION BY expr ORDER BY ...) = 1` subquery |
 | #2 | `GROUPING SETS` / `CUBE` / `ROLLUP` | Decompose into `UNION ALL` of separate `GROUP BY` queries |
 | #3 | Scalar subquery in `WHERE` | Convert to `CROSS JOIN` with inline view |
-| #4 | `EXISTS`/`IN` inside `OR` | Split into `UNION` of separate filtered queries |
-| #5 | Multiple `PARTITION BY` clauses | Split into joined subqueries, one per distinct partitioning |
+| #4 | Correlated scalar subquery in `SELECT` | Convert to `LEFT JOIN` with grouped inline view |
+| #5 | `EXISTS`/`IN` inside `OR` | Split into `UNION` of separate filtered queries |
+| #6 | Multiple `PARTITION BY` clauses | Split into joined subqueries, one per distinct partitioning |
 
 ### HAVING Clause
 

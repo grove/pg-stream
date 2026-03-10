@@ -115,12 +115,13 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
     let unwrapped = unwrap_transparent(child);
     let is_join_child = matches!(
         unwrapped,
-        OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. }
+        OpTree::InnerJoin { .. } | OpTree::LeftJoin { .. } | OpTree::FullJoin { .. }
     );
     let is_lateral_child = matches!(
         unwrapped,
         OpTree::LateralFunction { .. } | OpTree::LateralSubquery { .. }
     );
+    let is_semijoin_child = matches!(unwrapped, OpTree::SemiJoin { .. } | OpTree::AntiJoin { .. });
 
     let row_id_select = if is_join_child {
         // Use PK-corresponding expressions for hashing — PK-based row_ids
@@ -138,9 +139,12 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
             .map(|expr| resolve_expr_to_child(expr, child_cols))
             .collect();
         format!("{} AS __pgt_row_id", build_hash_expr(&hash_cols))
-    } else if is_lateral_child {
+    } else if is_lateral_child || is_semijoin_child {
         // Hash all projected columns — matches row_id_key_columns()
-        // which returns all aliases for lateral children.
+        // which returns all aliases for lateral children and semi/anti-join
+        // children.  For EXISTS/IN queries, this ensures the FULL refresh and
+        // DIFFERENTIAL refresh produce identical __pgt_row_id values so that
+        // MERGE can correctly DELETE rows that no longer satisfy the semi-join.
         let hash_cols: Vec<String> = expressions
             .iter()
             .map(|expr| resolve_expr_to_child(expr, child_cols))

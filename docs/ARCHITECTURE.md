@@ -59,7 +59,7 @@ For a high-level description of what pg_trickle does and why, read [ESSENCE.md](
 
 The public entry point for users. All operations are exposed as `#[pg_extern]` functions in the `pgtrickle` schema:
 
-- **create_stream_table** — Applies a chain of auto-rewrite passes (view inlining → DISTINCT ON → GROUPING SETS → scalar subquery → SubLinks in OR → multi-PARTITION BY windows), parses the defining query, builds an operator tree, creates the storage table, registers CDC slots, populates the catalog, and optionally performs an initial full refresh.
+- **create_stream_table** — Applies a chain of auto-rewrite passes (view inlining → DISTINCT ON → GROUPING SETS → scalar subquery in WHERE → correlated scalar subquery in SELECT → SubLinks in OR → multi-PARTITION BY windows), parses the defining query, builds an operator tree, creates the storage table, registers CDC slots, populates the catalog, and optionally performs an initial full refresh.
 - **alter_stream_table** — Modifies schedule, refresh mode, status (ACTIVE/SUSPENDED), or defining query. Query changes trigger schema migration, dependency updates, and a full refresh within a single transaction.
 - **drop_stream_table** — Removes the storage table, catalog entries, and cleans up CDC slots.
 - **refresh_stream_table** — Triggers a manual refresh (same path as automatic scheduling).

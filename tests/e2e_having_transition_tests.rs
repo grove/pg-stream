@@ -14,7 +14,6 @@ use e2e::E2eDb;
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: HAVING threshold crossing requires pre-HAVING aggregate state tracking (ROADMAP)"]
 async fn test_having_group_crosses_threshold_up() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE hv_up (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
@@ -69,7 +68,6 @@ async fn test_having_group_crosses_threshold_down() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: HAVING threshold crossing requires pre-HAVING aggregate state tracking (ROADMAP)"]
 async fn test_having_threshold_oscillation() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE hv_osc (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
@@ -104,7 +102,6 @@ async fn test_having_threshold_oscillation() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: HAVING threshold crossing requires pre-HAVING aggregate state tracking (ROADMAP)"]
 async fn test_having_row_group_migration() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE hv_mig (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
@@ -134,7 +131,6 @@ async fn test_having_row_group_migration() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: HAVING threshold crossing requires pre-HAVING aggregate state tracking (ROADMAP)"]
 async fn test_having_count_threshold() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE hv_cnt (id SERIAL PRIMARY KEY, grp TEXT, val TEXT)")
@@ -164,7 +160,6 @@ async fn test_having_count_threshold() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: HAVING threshold crossing requires pre-HAVING aggregate state tracking (ROADMAP)"]
 async fn test_having_multiple_conditions() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE hv_multi (id SERIAL PRIMARY KEY, grp TEXT, val INT)")

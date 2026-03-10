@@ -22,8 +22,20 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
         ));
     };
 
+    // Detect HAVING context (Filter directly over Aggregate) before diffing
+    // the child, so diff_aggregate can build a full-rescan CTE for groups
+    // that cross the HAVING threshold from below.
+    let is_having = matches!(child.as_ref(), OpTree::Aggregate { .. });
+    let prev_having_filter = ctx.having_filter;
+    if is_having {
+        ctx.having_filter = true;
+    }
+
     // First, differentiate the child
     let child_result = ctx.diff_node(child)?;
+
+    // Restore the having_filter flag after the child diff.
+    ctx.having_filter = prev_having_filter;
 
     let cte_name = ctx.next_cte_name("filter");
 
@@ -51,7 +63,6 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
     //
     // Without this, groups that cross the HAVING threshold from above to
     // below would remain in the ST with stale data.
-    let is_having = matches!(child.as_ref(), OpTree::Aggregate { .. });
     let has_st = ctx.st_qualified_name.is_some();
 
     let sql = if is_having && has_st {

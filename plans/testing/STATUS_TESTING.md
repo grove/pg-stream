@@ -8,11 +8,11 @@ What we've learned about testing the pg_trickle extension, the current state of 
 
 | Category | Tests | Runner | Requires Docker? |
 |----------|------:|--------|:----------------:|
-| **Unit tests** (in `src/`) | 854 | `just test-unit` | No |
+| **Unit tests** (in `src/`) | 1194 | `just test-unit` | No |
 | **Integration tests** (in `tests/`) | 101 | `just test-integration` | Yes (bare PG 18.x containers) |
 | **E2E tests** (in `tests/e2e_*.rs`) | 340 | `just test-e2e` | Yes (custom Docker image with extension) |
 | **Benchmarks** | 16 | `just test-e2e` (ignored) | Yes |
-| **Total** | **1,311** | `just test-all` | |
+| **Total** | **1,651** | `just test-all` | |
 
 ### Unit Tests by Module
 

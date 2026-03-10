@@ -1208,6 +1208,19 @@ impl OpTree {
                 ) {
                     return Some(aliases.clone());
                 }
+                // For semi-join/anti-join children (EXISTS / NOT EXISTS / IN),
+                // use all projected output columns as a content hash.  A semi-join
+                // filters the left side without changing its cardinality or
+                // introducing new columns, so the projected output is a stable
+                // identifier as long as it is unique — which it typically is
+                // (the left table's PK columns are usually projected).  Both the
+                // FULL refresh (hash from projected columns) and  the DIFFERENTIAL
+                // refresh (row_id recomputed in diff_project) then use the same
+                // formula, preventing the row_id mismatch that would leave stale
+                // rows in the stream table after a differential refresh.
+                if matches!(unwrapped, OpTree::SemiJoin { .. } | OpTree::AntiJoin { .. }) {
+                    return Some(aliases.clone());
+                }
                 // Project may drop or rename columns — map child's key
                 // column names through the aliasing, then verify they're in
                 // the output. E.g., Aggregate GROUP BY "name" → Project
@@ -4924,6 +4937,461 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     Ok(rewritten)
 }
 
+// ── Correlated scalar subquery in SELECT → LEFT JOIN rewrite ───────
+
+/// Rewrite correlated scalar subqueries in the SELECT list into LEFT JOINs.
+///
+/// ```sql
+/// -- Input:
+/// SELECT d.name, (SELECT MAX(e.salary) FROM emp e WHERE e.dept_id = d.id) AS max_sal
+/// FROM dept d
+/// -- Rewrite to:
+/// SELECT d.name, "__pgt_sq_1"."__pgt_scalar_1" AS max_sal
+/// FROM dept d
+/// LEFT JOIN (SELECT e.dept_id AS "__pgt_corr_key_1", MAX(e.salary) AS "__pgt_scalar_1"
+///            FROM emp e GROUP BY e.dept_id) AS "__pgt_sq_1"
+/// ON d.id = "__pgt_sq_1"."__pgt_corr_key_1"
+/// ```
+///
+/// Non-correlated scalar subqueries are left untouched — they are handled
+/// by the `ScalarSubquery` OpTree path during parsing.
+///
+/// This must run **before** the DVM parser so that the downstream operator
+/// tree sees a standard LEFT JOIN instead of a correlated scalar subquery.
+pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTrickleError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = list.head().ok_or_else(|| {
+        PgTrickleError::QueryParseError("Empty parse tree for scalar subquery rewrite".into())
+    })?;
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(query.to_string());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    // Skip set operations
+    if select.op != pg_sys::SetOperation::SETOP_NONE {
+        return Ok(query.to_string());
+    }
+
+    // Skip if no FROM clause (can't have correlation without outer tables)
+    if select.fromClause.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+
+    // Collect scalar subqueries from the SELECT list
+    struct SelectScalarSubquery {
+        target_idx: usize,
+        inner_select: *const pg_sys::SelectStmt,
+        subquery_sql: String,
+        alias: Option<String>,
+    }
+
+    let mut scalar_targets: Vec<SelectScalarSubquery> = Vec::new();
+    for (idx, node_ptr) in target_list.iter_ptr().enumerate() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+        if rt.val.is_null() {
+            continue;
+        }
+        if !unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_SubLink) } {
+            continue;
+        }
+        let sublink = unsafe { &*(rt.val as *const pg_sys::SubLink) };
+        if sublink.subLinkType != pg_sys::SubLinkType::EXPR_SUBLINK {
+            continue;
+        }
+        if sublink.subselect.is_null()
+            || !unsafe { pgrx::is_a(sublink.subselect, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            continue;
+        }
+        let inner = unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
+        // Only handle simple SELECTs (no set operations)
+        if inner.op != pg_sys::SetOperation::SETOP_NONE {
+            continue;
+        }
+        let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
+        let alias = if !rt.name.is_null() {
+            unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                .to_str()
+                .ok()
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        scalar_targets.push(SelectScalarSubquery {
+            target_idx: idx,
+            inner_select: inner,
+            subquery_sql: inner_sql,
+            alias,
+        });
+    }
+
+    if scalar_targets.is_empty() {
+        return Ok(query.to_string());
+    }
+
+    // Collect outer FROM table names for correlation detection
+    let outer_tables = unsafe { collect_from_clause_table_names(select) };
+
+    // For each scalar target, detect correlation and build decorrelation
+    struct SelectScalarDecorrelation {
+        target_idx: usize,
+        left_join_sql: String,
+        scalar_ref: String,
+        alias: Option<String>,
+    }
+
+    let mut decorrelations: Vec<SelectScalarDecorrelation> = Vec::new();
+    let mut next_sq_idx = 1usize;
+
+    for st in &scalar_targets {
+        let inner = unsafe { &*st.inner_select };
+
+        // Collect inner FROM table names
+        let inner_tables = unsafe { collect_from_clause_table_names(inner) };
+
+        // Build ScalarSubqueryExtract for correlation detection
+        let sq_extract = ScalarSubqueryExtract {
+            subquery_sql: st.subquery_sql.clone(),
+            expr_sql: format!("({})", st.subquery_sql),
+            inner_tables: inner_tables.clone(),
+        };
+
+        // Check dot-qualified correlation first (e.g., "d.id" in subquery)
+        if !sq_extract.is_correlated(&outer_tables) {
+            // Also check bare-column correlation via catalog
+            let outer_cols = detect_correlation_columns(&sq_extract, &outer_tables);
+            if outer_cols.is_empty() {
+                continue; // Not correlated — skip, handled by ScalarSubquery OpTree path
+            }
+        }
+
+        // ── Decorrelate this correlated scalar subquery ──────────────
+
+        // Parse the inner WHERE to separate correlation from inner conditions
+        if inner.whereClause.is_null() {
+            continue; // No WHERE → no correlation conditions to extract
+        }
+
+        let inner_where_expr = unsafe { node_to_expr(inner.whereClause) }.map_err(|_| {
+            PgTrickleError::QueryParseError("Failed to parse inner scalar subquery WHERE".into())
+        })?;
+
+        let (corr_pairs, remaining_where) =
+            split_exists_correlation(&inner_where_expr, &inner_tables);
+
+        if corr_pairs.is_empty() {
+            continue; // Could not extract correlation conditions
+        }
+
+        let sq_alias = format!("__pgt_sq_{next_sq_idx}");
+        let scalar_alias = format!("__pgt_scalar_{next_sq_idx}");
+        next_sq_idx += 1;
+
+        // Extract inner target expressions
+        let inner_target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner.targetList) };
+        let mut inner_target_exprs: Vec<String> = Vec::new();
+        for node_ptr in inner_target_list.iter_ptr() {
+            if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) }
+            {
+                continue;
+            }
+            let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+            if rt.val.is_null() {
+                continue;
+            }
+            let expr = unsafe { node_to_expr(rt.val) }
+                .map(|e| e.strip_qualifier().to_sql())
+                .unwrap_or_else(|_| "NULL".to_string());
+            inner_target_exprs.push(expr);
+        }
+
+        let scalar_expr = inner_target_exprs.join(", ");
+
+        // Detect if the inner query has aggregates (determines GROUP BY strategy)
+        let has_group_by = !inner.groupClause.is_null();
+        let has_having = !inner.havingClause.is_null();
+        let is_aggregate = has_group_by || has_having || expr_has_aggregate(&scalar_expr);
+
+        // Build SELECT items for decorrelated subquery
+        let mut select_items: Vec<String> = Vec::new();
+        let mut group_by_items: Vec<String> = Vec::new();
+        let mut on_conditions: Vec<String> = Vec::new();
+
+        for (j, (outer_expr, inner_col_name)) in corr_pairs.iter().enumerate() {
+            let key_alias = format!("__pgt_corr_key_{}", j + 1);
+            let inner_col_unqualified = strip_table_qualifier(inner_col_name);
+            select_items.push(format!("{inner_col_unqualified} AS \"{key_alias}\""));
+            if is_aggregate {
+                group_by_items.push(inner_col_unqualified);
+            }
+            on_conditions.push(format!(
+                "{} = \"{sq_alias}\".\"{key_alias}\"",
+                outer_expr.to_sql()
+            ));
+        }
+
+        select_items.push(format!("{scalar_expr} AS \"{scalar_alias}\""));
+
+        // Inner FROM clause
+        let inner_from_sql = extract_from_clause_sql(inner)?;
+
+        // Inner WHERE (non-correlation conditions only)
+        let where_sql = if let Some(ref remaining) = remaining_where {
+            format!(" WHERE {}", remaining.to_sql())
+        } else {
+            String::new()
+        };
+
+        // GROUP BY
+        let group_by_sql = if is_aggregate && !group_by_items.is_empty() {
+            // If inner already has GROUP BY, prepend correlation keys
+            if has_group_by {
+                let existing_groups =
+                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner.groupClause) };
+                let mut groups = group_by_items;
+                for node_ptr in existing_groups.iter_ptr() {
+                    let expr = unsafe { node_to_expr(node_ptr) }
+                        .map(|e| e.to_sql())
+                        .unwrap_or_else(|_| "?".to_string());
+                    groups.push(expr);
+                }
+                format!(" GROUP BY {}", groups.join(", "))
+            } else {
+                format!(" GROUP BY {}", group_by_items.join(", "))
+            }
+        } else {
+            String::new()
+        };
+
+        // HAVING (preserve from inner if present)
+        let having_sql = if has_having {
+            let having_expr = unsafe { node_to_expr(inner.havingClause) }
+                .map(|e| e.to_sql())
+                .unwrap_or_else(|_| "TRUE".to_string());
+            format!(" HAVING {having_expr}")
+        } else {
+            String::new()
+        };
+
+        // Build LEFT JOIN clause
+        let decorrelated_sql = format!(
+            "SELECT {selects} FROM {from}{where_clause}{group_by}{having}",
+            selects = select_items.join(", "),
+            from = inner_from_sql,
+            where_clause = where_sql,
+            group_by = group_by_sql,
+            having = having_sql,
+        );
+
+        let left_join_sql = format!(
+            "LEFT JOIN ({decorrelated_sql}) AS \"{sq_alias}\" ON {on_cond}",
+            on_cond = on_conditions.join(" AND "),
+        );
+
+        let scalar_ref = format!("\"{sq_alias}\".\"{scalar_alias}\"");
+
+        decorrelations.push(SelectScalarDecorrelation {
+            target_idx: st.target_idx,
+            left_join_sql,
+            scalar_ref,
+            alias: st.alias.clone(),
+        });
+    }
+
+    if decorrelations.is_empty() {
+        return Ok(query.to_string());
+    }
+
+    // ── Reconstruct the query ────────────────────────────────────────
+
+    // Build target list, replacing decorrelated scalar targets
+    let mut targets = Vec::new();
+    let decc_map: std::collections::HashMap<usize, &SelectScalarDecorrelation> =
+        decorrelations.iter().map(|d| (d.target_idx, d)).collect();
+
+    for (idx, node_ptr) in target_list.iter_ptr().enumerate() {
+        if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
+            continue;
+        }
+        if let Some(dec) = decc_map.get(&idx) {
+            let alias_part = if let Some(ref a) = dec.alias {
+                format!(" AS \"{}\"", a.replace('"', "\"\""))
+            } else {
+                String::new()
+            };
+            targets.push(format!("{}{alias_part}", dec.scalar_ref));
+        } else {
+            let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
+            if rt.val.is_null() {
+                continue;
+            }
+            let expr = unsafe { node_to_expr(rt.val) }
+                .map(|e| e.to_sql())
+                .unwrap_or_else(|_| "NULL".to_string());
+            let alias_part = if !rt.name.is_null() {
+                let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
+                    .to_str()
+                    .unwrap_or("?");
+                format!(" AS \"{}\"", name.replace('"', "\"\""))
+            } else {
+                String::new()
+            };
+            targets.push(format!("{expr}{alias_part}"));
+        }
+    }
+
+    // FROM clause + LEFT JOINs
+    let from_sql = extract_from_clause_sql(select)?;
+    let left_joins: String = decorrelations
+        .iter()
+        .map(|d| d.left_join_sql.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // WHERE clause (outer, unchanged)
+    let where_sql = if select.whereClause.is_null() {
+        String::new()
+    } else {
+        let w = unsafe { node_to_expr(select.whereClause) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "TRUE".to_string());
+        format!(" WHERE {w}")
+    };
+
+    // GROUP BY (outer)
+    let group_sql = if select.groupClause.is_null() {
+        String::new()
+    } else {
+        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        if group_list.is_empty() {
+            String::new()
+        } else {
+            let mut groups = Vec::new();
+            for node_ptr in group_list.iter_ptr() {
+                let expr = unsafe { node_to_expr(node_ptr) }
+                    .map(|e| e.to_sql())
+                    .unwrap_or_else(|_| "?".to_string());
+                groups.push(expr);
+            }
+            format!(" GROUP BY {}", groups.join(", "))
+        }
+    };
+
+    // HAVING (outer)
+    let having_sql = if select.havingClause.is_null() {
+        String::new()
+    } else {
+        let h = unsafe { node_to_expr(select.havingClause) }
+            .map(|e| e.to_sql())
+            .unwrap_or_else(|_| "TRUE".to_string());
+        format!(" HAVING {h}")
+    };
+
+    // ORDER BY (outer)
+    let order_sql = if select.sortClause.is_null() {
+        String::new()
+    } else {
+        let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
+        if sort_list.is_empty() {
+            String::new()
+        } else {
+            let mut sorts = Vec::new();
+            for node_ptr in sort_list.iter_ptr() {
+                if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_SortBy) }
+                {
+                    continue;
+                }
+                let sb = unsafe { &*(node_ptr as *const pg_sys::SortBy) };
+                if sb.node.is_null() {
+                    continue;
+                }
+                let expr = unsafe { node_to_expr(sb.node) }
+                    .map(|e| e.to_sql())
+                    .unwrap_or_else(|_| "?".to_string());
+                let dir = match sb.sortby_dir {
+                    pg_sys::SortByDir::SORTBY_ASC => " ASC",
+                    pg_sys::SortByDir::SORTBY_DESC => " DESC",
+                    _ => "",
+                };
+                let nulls = match sb.sortby_nulls {
+                    pg_sys::SortByNulls::SORTBY_NULLS_FIRST => " NULLS FIRST",
+                    pg_sys::SortByNulls::SORTBY_NULLS_LAST => " NULLS LAST",
+                    _ => "",
+                };
+                sorts.push(format!("{expr}{dir}{nulls}"));
+            }
+            if sorts.is_empty() {
+                String::new()
+            } else {
+                format!(" ORDER BY {}", sorts.join(", "))
+            }
+        }
+    };
+
+    // DISTINCT (outer)
+    let distinct_sql = if select.distinctClause.is_null() {
+        String::new()
+    } else {
+        " DISTINCT".to_string()
+    };
+
+    let rewritten = format!(
+        "SELECT{distinct_sql} {targets} FROM {from_sql} {left_joins}{where_sql}{group_sql}{having_sql}{order_sql}",
+        targets = targets.join(", "),
+    );
+
+    pgrx::debug1!(
+        "[pg_trickle] Rewrote correlated scalar subquery in SELECT: {}",
+        rewritten
+    );
+
+    Ok(rewritten)
+}
+
+/// Check whether a SQL expression string contains common aggregate function calls.
+fn expr_has_aggregate(expr: &str) -> bool {
+    let lower = expr.to_lowercase();
+    const AGG_PREFIXES: &[&str] = &[
+        "max(",
+        "min(",
+        "sum(",
+        "count(",
+        "avg(",
+        "array_agg(",
+        "string_agg(",
+        "bool_and(",
+        "bool_or(",
+        "every(",
+        "jsonb_agg(",
+        "json_agg(",
+        "xmlagg(",
+        "bit_and(",
+        "bit_or(",
+    ];
+    AGG_PREFIXES.iter().any(|p| lower.contains(p))
+}
+
 /// Information about a scalar subquery extracted from the WHERE clause.
 struct ScalarSubqueryExtract {
     /// The inner SELECT statement as SQL (e.g., `SELECT avg(amount) FROM orders`).
@@ -8127,10 +8595,21 @@ unsafe fn parse_sublink_to_wrapper(
 
 /// Parse an EXISTS SubLink into a SublinkWrapper.
 ///
+/// Simple form (no GROUP BY / HAVING):
 /// `EXISTS (SELECT ... FROM inner_table WHERE correlation_cond AND inner_filter)`
+/// → The inner WHERE becomes the semi/anti-join condition.
 ///
-/// The inner SELECT's FROM clause becomes the right side of the semi/anti-join.
-/// The inner SELECT's WHERE clause becomes the join condition.
+/// Grouped form (with GROUP BY / HAVING):
+/// `EXISTS (SELECT 1 FROM T WHERE inner.k = outer.k GROUP BY inner.k HAVING agg > threshold)`
+///
+/// This is semantically equivalent to:
+/// `outer.k IN (SELECT inner.k FROM T GROUP BY inner.k HAVING agg > threshold)`
+///
+/// The correlation predicate (`inner.k = outer.k`) is extracted from the inner WHERE
+/// and converted to the SemiJoin join condition. The remaining (non-correlated)
+/// inner WHERE predicates are applied as a pre-aggregate filter. The inner tree is
+/// wrapped in `Aggregate → Filter(HAVING) → Subquery`, matching the `parse_any_sublink`
+/// GROUP BY treatment.
 ///
 /// # Safety
 /// Caller must ensure `sublink` points to a valid `pg_sys::SubLink`.
@@ -8169,7 +8648,137 @@ unsafe fn parse_exists_sublink(
         }
     }
 
-    // The inner WHERE clause becomes the semi/anti-join condition
+    // ── GROUP BY / HAVING handling ──────────────────────────────────
+    //
+    // When the inner SELECT has GROUP BY or HAVING, a flat SemiJoin on the
+    // raw scan would lose the aggregation semantics entirely. We restructure
+    // the inner tree to:
+    //
+    //   Subquery(
+    //     Filter(HAVING, Aggregate(GROUP BY inner.k, ..., child=Scan(T))))
+    //
+    // and derive the SemiJoin join condition by extracting the correlation
+    // predicate from the inner WHERE clause.
+    //
+    // A correlation predicate has the form `inner.col = outer.col` (or the
+    // reverse), where `inner.col` refers to one of the inner FROM aliases
+    // and `outer.col` refers to an alias from the enclosing query.
+    //
+    // Example transformation:
+    //   EXISTS (SELECT 1 FROM eh_ord o
+    //           WHERE o.cust_id = c.id
+    //           GROUP BY o.cust_id
+    //           HAVING SUM(o.amount) > 100)
+    // →
+    //   SemiJoin(cond  = c.id = __pgt_in_sub.cust_id,
+    //            left  = Scan(eh_cust c),
+    //            right = Subquery(Filter(HAVING sum > 100,
+    //                      Aggregate(GROUP BY o.cust_id,
+    //                        Scan(eh_ord o)))))
+    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.groupClause) };
+    let has_group_by = !group_list.is_empty();
+    let has_having = !inner_select.havingClause.is_null();
+
+    if has_group_by || has_having {
+        // Collect the inner FROM aliases to distinguish correlated references.
+        let inner_aliases = collect_tree_source_aliases(&inner_tree);
+
+        // Split the inner WHERE into:
+        //   corr_pairs  — (outer_expr, inner_group_key_output_name)
+        //   inner_filter — everything else (applied before aggregation)
+        let (corr_pairs, inner_filter) = if !inner_select.whereClause.is_null() {
+            let where_expr = unsafe { node_to_expr(inner_select.whereClause)? };
+            split_exists_correlation(&where_expr, &inner_aliases)
+        } else {
+            (Vec::new(), None)
+        };
+
+        // Apply the non-correlated inner WHERE as a pre-aggregate filter.
+        if let Some(filter_expr) = inner_filter {
+            inner_tree = OpTree::Filter {
+                predicate: filter_expr,
+                child: Box::new(inner_tree),
+            };
+        }
+
+        // Parse GROUP BY expressions.
+        let mut group_by = Vec::new();
+        for node_ptr in group_list.iter_ptr() {
+            let expr = unsafe { node_to_expr(node_ptr)? };
+            group_by.push(expr);
+        }
+
+        // Extract aggregates from the HAVING clause (SELECT 1 has no agg targets).
+        let mut aggregates: Vec<AggExpr> = Vec::new();
+        if has_having {
+            let having_expr = unsafe { node_to_expr(inner_select.havingClause)? };
+            let having_aggs = extract_aggregates_from_expr(&having_expr, 0);
+            aggregates.extend(having_aggs);
+        }
+
+        // Build the Aggregate node.
+        inner_tree = OpTree::Aggregate {
+            group_by,
+            aggregates: aggregates.clone(),
+            child: Box::new(inner_tree),
+        };
+
+        // Apply HAVING as Filter on top of Aggregate.
+        if has_having {
+            let having_expr = unsafe { node_to_expr(inner_select.havingClause)? };
+            let rewritten = rewrite_having_expr(&having_expr, &aggregates);
+            inner_tree = OpTree::Filter {
+                predicate: rewritten,
+                child: Box::new(inner_tree),
+            };
+        }
+
+        // Wrap in Subquery so the SemiJoin sees it as a derived table.
+        let sub_alias = format!("__pgt_in_sub_{}", inner_tree.alias());
+        inner_tree = OpTree::Subquery {
+            alias: sub_alias.clone(),
+            column_aliases: Vec::new(),
+            child: Box::new(inner_tree),
+        };
+
+        // Build the SemiJoin condition from extracted correlation pairs.
+        // Each pair produces: outer_expr = subquery_alias.inner_col_output_name.
+        let condition = if !corr_pairs.is_empty() {
+            let equalities: Vec<Expr> = corr_pairs
+                .into_iter()
+                .map(|(outer_expr, inner_col_name)| Expr::BinaryOp {
+                    op: "=".to_string(),
+                    left: Box::new(outer_expr),
+                    right: Box::new(Expr::ColumnRef {
+                        table_alias: Some(sub_alias.clone()),
+                        column_name: inner_col_name,
+                    }),
+                })
+                .collect();
+            equalities
+                .into_iter()
+                .reduce(|acc, eq| Expr::BinaryOp {
+                    op: "AND".to_string(),
+                    left: Box::new(acc),
+                    right: Box::new(eq),
+                })
+                .unwrap()
+        } else {
+            // No correlation found — let the pre-aggregate filter handle
+            // all filtering; the SemiJoin condition is a tautology.
+            Expr::Literal("TRUE".into())
+        };
+
+        return Ok(SublinkWrapper {
+            negated,
+            condition,
+            inner_tree,
+        });
+    }
+
+    // ── Simple form: no GROUP BY / HAVING ───────────────────────────
+
+    // The inner WHERE clause becomes the semi/anti-join condition.
     let condition = if inner_select.whereClause.is_null() {
         Expr::Literal("TRUE".into())
     } else {
@@ -8181,6 +8790,124 @@ unsafe fn parse_exists_sublink(
         condition,
         inner_tree,
     })
+}
+
+/// Collect all base-table Scan aliases from an OpTree.
+///
+/// Used by `parse_exists_sublink` to identify which column references in an
+/// EXISTS inner WHERE clause belong to the inner subquery vs. the outer query.
+fn collect_tree_source_aliases(tree: &OpTree) -> Vec<String> {
+    match tree {
+        OpTree::Scan { alias, .. } | OpTree::CteScan { alias, .. } => vec![alias.clone()],
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            let mut aliases = collect_tree_source_aliases(left);
+            aliases.extend(collect_tree_source_aliases(right));
+            aliases
+        }
+        OpTree::Filter { child, .. }
+        | OpTree::Project { child, .. }
+        | OpTree::Distinct { child, .. }
+        | OpTree::Aggregate { child, .. } => collect_tree_source_aliases(child),
+        OpTree::Subquery { alias, .. } => vec![alias.clone()],
+        _ => vec![],
+    }
+}
+
+/// Split an EXISTS inner WHERE expression into correlation predicates and
+/// inner-only predicates.
+///
+/// Walks the conjuncts of `where_expr` (splitting on `AND`) and classifies
+/// each conjunct:
+///
+/// - Correlation predicate: an equality `inner_alias.col = outer_ref` (or the
+///   reverse) where `inner_alias` is in `inner_aliases` and the other side is
+///   a column reference from an alias NOT in `inner_aliases` (i.e., an outer
+///   reference). Each such predicate is extracted as `(outer_expr, inner_col_name)`.
+///
+/// - Inner-only predicate: everything else; left in the filter applied before
+///   aggregation.
+///
+/// Returns `(corr_pairs, remaining_filter)`.
+fn split_exists_correlation(
+    where_expr: &Expr,
+    inner_aliases: &[String],
+) -> (Vec<(Expr, String)>, Option<Expr>) {
+    match where_expr {
+        Expr::BinaryOp { op, left, right } if op == "AND" => {
+            let (mut lc, lr) = split_exists_correlation(left, inner_aliases);
+            let (rc, rr) = split_exists_correlation(right, inner_aliases);
+            lc.extend(rc);
+            let remaining = match (lr, rr) {
+                (Some(l), Some(r)) => Some(Expr::BinaryOp {
+                    op: "AND".to_string(),
+                    left: Box::new(l),
+                    right: Box::new(r),
+                }),
+                (Some(l), None) | (None, Some(l)) => Some(l),
+                (None, None) => None,
+            };
+            (lc, remaining)
+        }
+        _ => {
+            if let Some(pair) = try_extract_exists_corr_pair(where_expr, inner_aliases) {
+                (vec![pair], None)
+            } else {
+                (vec![], Some(where_expr.clone()))
+            }
+        }
+    }
+}
+
+/// Try to extract `(outer_expr, inner_col_output_name)` from an equality predicate.
+///
+/// Succeeds when:
+/// - The expression is `A = B`
+/// - Exactly one of A, B is a `ColumnRef` with a qualifier in `inner_aliases`
+/// - The other is a `ColumnRef` with a qualifier NOT in `inner_aliases` (outer ref)
+///
+/// Returns `None` for non-equality predicates or predicates where both / neither
+/// side is an inner reference.
+fn try_extract_exists_corr_pair(pred: &Expr, inner_aliases: &[String]) -> Option<(Expr, String)> {
+    let Expr::BinaryOp { op, left, right } = pred else {
+        return None;
+    };
+    if op != "=" {
+        return None;
+    }
+
+    let left_qualifier = match left.as_ref() {
+        Expr::ColumnRef {
+            table_alias: Some(a),
+            ..
+        } => Some(a.as_str()),
+        _ => None,
+    };
+    let right_qualifier = match right.as_ref() {
+        Expr::ColumnRef {
+            table_alias: Some(a),
+            ..
+        } => Some(a.as_str()),
+        _ => None,
+    };
+
+    match (left_qualifier, right_qualifier) {
+        (Some(la), Some(ra)) => {
+            let left_is_inner = inner_aliases.iter().any(|a| a == la);
+            let right_is_inner = inner_aliases.iter().any(|a| a == ra);
+            if left_is_inner && !right_is_inner {
+                // inner.col = outer.ref → outer_expr=right, inner_col=left.output_name()
+                Some((*right.clone(), left.output_name()))
+            } else if !left_is_inner && right_is_inner {
+                // outer.ref = inner.col → outer_expr=left, inner_col=right.output_name()
+                Some((*left.clone(), right.output_name()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Parse an ANY SubLink (IN / = ANY) into a SublinkWrapper.
@@ -8398,7 +9125,11 @@ fn extract_aggregates_from_expr_inner(expr: &Expr, start_idx: usize, out: &mut V
             let name_lower = func_name.to_lowercase();
             let agg_func = match name_lower.as_str() {
                 "count" => {
-                    if args.is_empty() {
+                    // COUNT(*) from HAVING arrives as FuncCall { args: [Raw("*")] };
+                    // treat it as CountStar with no argument (same as target list).
+                    if args.is_empty()
+                        || (args.len() == 1 && matches!(&args[0], Expr::Raw(s) if s == "*"))
+                    {
                         Some(AggFunc::CountStar)
                     } else {
                         Some(AggFunc::Count)
@@ -8411,7 +9142,12 @@ fn extract_aggregates_from_expr_inner(expr: &Expr, start_idx: usize, out: &mut V
                 _ => None,
             };
             if let Some(func) = agg_func {
-                let argument = args.first().cloned();
+                // CountStar has no argument (even if the parse produced [Raw("*")]).
+                let argument = if matches!(func, AggFunc::CountStar) {
+                    None
+                } else {
+                    args.first().cloned()
+                };
                 let alias = format!("__pgt_having_{}", start_idx + out.len());
                 out.push(AggExpr {
                     function: func,
@@ -12941,8 +13677,13 @@ fn rewrite_having_expr(expr: &Expr, aggregates: &[AggExpr]) -> Expr {
                     continue;
                 }
                 // Match by argument SQL representation.
+                // COUNT(*) is represented as FuncCall { args: [Raw("*")] } when parsed
+                // from a HAVING clause, but as argument = None in the target-list AggExpr.
                 let args_match = match &agg.argument {
-                    None => args.is_empty(), // COUNT(*)
+                    None => {
+                        args.is_empty()
+                            || (args.len() == 1 && matches!(&args[0], Expr::Raw(s) if s == "*"))
+                    }
                     Some(agg_arg) => args.len() == 1 && args[0].to_sql() == agg_arg.to_sql(),
                 };
                 if args_match {
@@ -17954,5 +18695,108 @@ mod tests {
         let mut worst = 'i';
         collect_volatilities(&expr, &mut worst).unwrap();
         assert_eq!(worst, 'i');
+    }
+
+    // ── split_exists_correlation / try_extract_exists_corr_pair tests
+
+    fn qcol(table: &str, name: &str) -> Expr {
+        Expr::ColumnRef {
+            table_alias: Some(table.to_string()),
+            column_name: name.to_string(),
+        }
+    }
+
+    fn eq_pred(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    fn and_pred(left: Expr, right: Expr) -> Expr {
+        Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(left),
+            right: Box::new(right),
+        }
+    }
+
+    #[test]
+    fn test_split_exists_correlation_simple() {
+        // WHERE o.cust_id = c.id (inner=o, outer=c)
+        let pred = eq_pred(qcol("o", "cust_id"), qcol("c", "id"));
+        let (corr, remaining) = split_exists_correlation(&pred, &["o".to_string()]);
+        assert_eq!(corr.len(), 1);
+        let (outer_expr, inner_col) = &corr[0];
+        assert_eq!(inner_col, "cust_id");
+        assert!(matches!(outer_expr, Expr::ColumnRef { column_name, .. } if column_name == "id"));
+        assert!(remaining.is_none());
+    }
+
+    #[test]
+    fn test_split_exists_correlation_reversed() {
+        // WHERE c.id = o.cust_id (outer=c, inner=o)
+        let pred = eq_pred(qcol("c", "id"), qcol("o", "cust_id"));
+        let (corr, remaining) = split_exists_correlation(&pred, &["o".to_string()]);
+        assert_eq!(corr.len(), 1);
+        let (outer_expr, inner_col) = &corr[0];
+        assert_eq!(inner_col, "cust_id");
+        assert!(matches!(outer_expr, Expr::ColumnRef { column_name, .. } if column_name == "id"));
+        assert!(remaining.is_none());
+    }
+
+    #[test]
+    fn test_split_exists_correlation_with_inner_only() {
+        // WHERE o.cust_id = c.id AND o.status = 'active'
+        let pred = and_pred(
+            eq_pred(qcol("o", "cust_id"), qcol("c", "id")),
+            eq_pred(qcol("o", "status"), Expr::Literal("'active'".to_string())),
+        );
+        let (corr, remaining) = split_exists_correlation(&pred, &["o".to_string()]);
+        assert_eq!(corr.len(), 1, "should extract one correlation pair");
+        assert!(
+            remaining.is_some(),
+            "inner-only predicate should be in remaining"
+        );
+    }
+
+    #[test]
+    fn test_split_exists_correlation_no_correlation() {
+        // WHERE o.status = 'active' (no outer reference)
+        let pred = eq_pred(qcol("o", "status"), Expr::Literal("'active'".to_string()));
+        let (corr, remaining) = split_exists_correlation(&pred, &["o".to_string()]);
+        assert!(corr.is_empty(), "no correlation pair expected");
+        assert!(remaining.is_some(), "inner-only pred should remain");
+    }
+
+    #[test]
+    fn test_split_exists_correlation_multi_key() {
+        // WHERE o.a = c.x AND o.b = c.y
+        let pred = and_pred(
+            eq_pred(qcol("o", "a"), qcol("c", "x")),
+            eq_pred(qcol("o", "b"), qcol("c", "y")),
+        );
+        let (corr, remaining) = split_exists_correlation(&pred, &["o".to_string()]);
+        assert_eq!(corr.len(), 2, "should extract two correlation pairs");
+        assert!(remaining.is_none());
+    }
+
+    #[test]
+    fn test_collect_tree_source_aliases_scan() {
+        let tree = scan_node("o", 1, &["id"]);
+        assert_eq!(collect_tree_source_aliases(&tree), vec!["o"]);
+    }
+
+    #[test]
+    fn test_collect_tree_source_aliases_join() {
+        let tree = OpTree::InnerJoin {
+            condition: Expr::Literal("TRUE".to_string()),
+            left: Box::new(scan_node("a", 1, &["id"])),
+            right: Box::new(scan_node("b", 2, &["id"])),
+        };
+        let aliases = collect_tree_source_aliases(&tree);
+        assert!(aliases.contains(&"a".to_string()));
+        assert!(aliases.contains(&"b".to_string()));
     }
 }

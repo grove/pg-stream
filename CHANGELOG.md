@@ -9,6 +9,167 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Fixed
+
+#### HAVING Clause Differential Correctness (5 tests un-ignored)
+
+Fixed two DVM bugs that caused HAVING threshold-crossing transitions to produce
+incorrect stream table contents in DIFFERENTIAL mode:
+
+- **`COUNT(*)` in HAVING predicate rewrite:** PostgreSQL parses `COUNT(*)` in
+  HAVING as `FuncCall { agg_star: true, args: [] }`, but the expression
+  normalizer converts it to `FuncCall { func_name: "count", args: [Raw("*")] }`.
+  `rewrite_having_expr` checked `args.is_empty()` to detect CountStar, which
+  was `false` for the normalized `[Raw("*")]` form. The unmatched call leaked
+  into the WHERE clause of the HAVING-filter CTE, producing a "syntax error at
+  or near `*`" PostgreSQL error. Fixed by extending the CountStar check to also
+  accept a single `Raw("*")` argument. Same fix applied in
+  `extract_aggregates_from_expr_inner`.
+
+- **Threshold crossing upward — missing aggregate baseline:** When a group is
+  below the HAVING threshold it is absent from the stream table (ST). The
+  algebraic merge used `COALESCE(st.col, 0)` as the pre-existing aggregate
+  base, which evaluates to `0` for absent groups. This made the new aggregate
+  value equal to the per-cycle delta only, ignoring all pre-existing source
+  rows. For example, a group with 10 existing rows getting 15 new rows would
+  produce `SUM = 15` instead of `25`. Fixed by forcing a full re-aggregation
+  rescan when `ctx.having_filter = true`: for groups where `st.col IS NULL`
+  (new groups entering the ST), the rescan CTE's re-aggregated value is used
+  instead of `0 + delta`. Existing groups (already in ST) continue to use the
+  algebraic merge path.
+
+Five previously-ignored E2E tests in `tests/e2e_having_transition_tests.rs`
+now run without `#[ignore]`:
+
+- `test_group_enters_having_threshold` — group crosses upward via SUM
+- `test_group_exits_having_threshold` — group drops below threshold
+- `test_having_count_star_threshold` — `COUNT(*) > N` threshold crossing
+- `test_having_with_multiple_groups` — multiple groups transitioning simultaneously
+- `test_having_threshold_with_nulls` — NULL-handling in HAVING aggregate
+
+#### FULL OUTER JOIN Differential Correctness (5 tests un-ignored)
+
+Fixed five DVM bugs that caused `FULL OUTER JOIN` stream tables to produce
+incorrect results in DIFFERENTIAL mode:
+
+- **`project.rs` — row-id mismatch:** FULL refresh computes `__pgt_row_id` as
+  `hash(output_columns)`. Differential for FullJoin was passing through raw
+  part row-ids (PK hashes or `0::BIGINT`) instead. Fixed by adding
+  `OpTree::FullJoin { .. }` to the `is_join_child` match in `diff_project` so
+  the row-id is always recomputed from output columns.
+
+- **`aggregate.rs` — compound GROUP BY expression resolution:** `resolve_group_col`
+  called `resolve_col_for_child` which only handles `ColumnRef` atoms. A
+  compound expression such as `COALESCE(l.dept, r.dept)` hit the fallback
+  `strip_qualifier()` path producing `COALESCE(dept, dept)` (ambiguous column
+  error). Fixed by calling `resolve_expr_for_child` so FuncCall arguments are
+  recursively resolved against child CTE column names.
+
+- **`aggregate.rs` — compound GROUP BY expression quoting:** GROUP BY clause
+  building and the delta SELECT used `quote_ident(expr_sql)` for resolved
+  expressions, turning `COALESCE(l__dept, r__dept)` into the identifier
+  `"COALESCE(l__dept, r__dept)"`. Added `col_ref_or_sql_expr` helper:
+  simple bare names are quoted; expressions containing `(` are emitted as-is.
+
+- **`aggregate.rs` — SUM NULL semantics over FULL JOIN:** After a
+  matched→unmatched row transition, `COALESCE(old,0) + COALESCE(ins,0) −
+  COALESCE(del,0)` evaluates to `0` even when all remaining group rows have
+  `NULL` for the aggregated column — PostgreSQL `SUM` of NULLs should be
+  `NULL`. Fixed by building a group-rescan CTE for non-DISTINCT `SUM`
+  aggregates when the child tree contains a `FullJoin`, and using the rescanned
+  value in the merge formula when `has_rescan = true`.
+
+- **`aggregate.rs` — rescan CTE SELECT list for FuncCall group-by columns:**
+  `build_rescan_cte` (and `build_intermediate_agg_delta`) selected the
+  output-name string as a bare column identifier when `expr_sql == output_name`.
+  For `COALESCE(…)` group-by columns, PostgreSQL interpreted `"COALESCE(…)"` as
+  a column name rather than a function call. Fixed by adding an
+  `!expr_sql.contains('(')` guard so FuncCall expressions use `expr AS alias`
+  form.
+
+Five previously-ignored E2E tests in `tests/e2e_full_join_tests.rs` now run
+without `#[ignore]`:
+
+- `test_full_join_basic_differential` — basic matched/unmatched transitions
+- `test_full_join_null_keys_differential` — NULL join keys
+- `test_full_join_key_update_migration` — key value updates
+- `test_full_join_with_aggregate_differential` — SUM over FULL JOIN with COALESCE GROUP BY
+- `test_full_join_multi_column_key_differential` — composite join keys
+
+#### Correlated EXISTS with HAVING Differential Correctness (1 test un-ignored)
+
+Fixed three DVM bugs that caused `EXISTS(... GROUP BY ... HAVING ...)` stream
+tables to produce incorrect results in DIFFERENTIAL mode:
+
+- **`parser.rs` — `parse_exists_sublink` ignored GROUP BY / HAVING:** The
+  EXISTS sublink parser discarded GROUP BY and HAVING from the inner subquery,
+  treating `EXISTS(SELECT 1 FROM T WHERE T.k=outer.k GROUP BY T.k HAVING agg>N)`
+  as a plain "does any row exist?" check. Fixed by detecting `GROUP BY`/`HAVING`
+  in the inner SELECT and restructuring to:
+  `SemiJoin(cond=outer.k=sub.T.k, right=Subquery(Filter(HAVING, Aggregate(GROUP BY, Scan(T)))))`.
+  New helpers `collect_tree_source_aliases`, `split_exists_correlation`, and
+  `try_extract_exists_corr_pair` support the correlation-predicate extraction
+  (7 new unit tests).
+
+- **`parser.rs` — row ID mismatch for `Project(SemiJoin)` trees:** For a
+  defining query `SELECT c.name FROM eh_cust WHERE EXISTS(...)`,
+  `row_id_key_columns()` returned `None` when `aliases.len() ≠ child.output_columns().len()`.
+  FULL refresh fell to the `row_to_json(sub)::TEXT || '/' || row_number()` hash,
+  while differential passed through `hash_multi(left_cols)` from `diff_semi_join`.
+  The MERGE `ON st.__pgt_row_id = d.__pgt_row_id` never matched existing rows,
+  so `DELETE` mutations were silently discarded. Fixed by returning
+  `Some(aliases.clone())` for `SemiJoin`/`AntiJoin` children — the same
+  treatment already given to `LateralFunction`/`LateralSubquery`.
+
+- **`project.rs` — `diff_project` row-id recomputation for SemiJoin children:**
+  `diff_project` must recompute `__pgt_row_id` from the projected output columns
+  for `SemiJoin`/`AntiJoin` children (matching the FULL refresh formula).
+  Added `is_semijoin_child` detection alongside the existing `is_lateral_child`
+  branch so both share the `build_hash_expr(projected_cols)` recomputation path.
+
+One previously-ignored E2E test in `tests/e2e_sublink_or_tests.rs` now runs
+without `#[ignore]`:
+
+- `test_exists_with_having_in_subquery_differential` — EXISTS with GROUP BY /
+  HAVING threshold crossing (insert brings group above threshold; delete drops
+  it back below)
+
+#### Correlated Scalar Subquery Differential Correctness (2 tests un-ignored)
+
+Fixed correlated scalar subqueries in the SELECT list by decorrelating them
+into LEFT JOINs before DVM parsing:
+
+- **`parser.rs` — `rewrite_correlated_scalar_in_select` rewrite:** Correlated
+  scalar subqueries (e.g., `(SELECT MAX(e.salary) FROM emp e WHERE e.dept_id =
+  d.id)`) were not supported by the DVM's `ScalarSubquery` operator. Added a
+  pre-parser rewrite that detects correlation conditions, extracts them into
+  JOIN-ON clauses, and rewrites the subquery as a `LEFT JOIN` with GROUP BY
+  aggregation. The rewrite runs before `parse_defining_query` so the DVM tree
+  sees a standard LEFT JOIN.
+
+- **`parser.rs` — inner table qualifier leak:** The rewrite initially preserved
+  inner table qualifiers (`MAX(e.salary)`). The DVM's intermediate aggregate
+  delta engine wraps FROM in EXCEPT ALL subqueries where the original inner
+  alias is invisible. Fixed by stripping inner table qualifiers during the
+  rewrite (`strip_qualifier()`), producing `MAX(salary)`.
+
+Two previously-ignored E2E tests in `tests/e2e_scalar_subquery_tests.rs` now
+run without `#[ignore]`:
+
+- `test_correlated_scalar_subquery_differential` — correlated MAX in SELECT
+  with insert/delete of top earner and new department
+- `test_scalar_subquery_null_result_differential` — correlated SUM with
+  NULL-producing category that has no lookup match
+
+### Changed
+
+- **Test count:** All 18 previously-ignored DVM-correctness E2E tests have been
+  re-enabled (0 remaining). The 5 HAVING tests, 5 keyless-table duplicate tests
+  (already un-ignored before this release), 5 FULL JOIN tests, 1 EXISTS+HAVING
+  test, and 2 correlated scalar subquery tests account for the full recovery.
+
+---
+
 ### Added
 
 - **TPC-H test suite enhancements (T1–T6)** — second wave of TPC-H correctness
@@ -765,22 +926,26 @@ test compilation.
 ### Changed
 
 - **Test count:** ~1,455 total tests (up from ~1,138): 963 unit + 32 integration
-  + 460 E2E across 34 test files (up from ~22). 18 E2E tests are `#[ignore]`d
-  pending DVM correctness fixes (see Known Limitations below).
+  + 460 E2E across 34 test files (up from ~22). At release, 18 E2E tests were
+  `#[ignore]`d pending DVM correctness fixes (reduced to 8 in later releases;
+  see [Unreleased] Known Limitations).
 - **1 new GUC variable** — `buffer_alert_threshold` added. Total: 16 GUCs.
 
 ### Known Limitations
 
-18 E2E tests are marked `#[ignore]` due to pre-existing DVM differential logic
-bugs that will be addressed in future releases:
+> **Note:** Five HAVING tests (listed below) were subsequently fixed in the
+> next release. See [Unreleased] Known Limitations for the current state.
 
-| Suite | Ignored | Reason |
+18 E2E tests were marked `#[ignore]` at v0.2.3 release due to pre-existing DVM
+differential logic bugs:
+
+| Suite | Ignored | Status |
 |---|---|---|
-| `e2e_full_join_tests` | 5/5 | FULL OUTER JOIN differential produces incorrect results |
-| `e2e_having_transition_tests` | 5/7 | HAVING threshold crossing differential incorrect |
-| `e2e_keyless_duplicate_tests` | 5/7 | Keyless table duplicate-row row_id hash collision |
-| `e2e_scalar_subquery_tests` | 2/4 | Correlated scalar subquery differential generates invalid SQL |
-| `e2e_sublink_or_tests` | 1/4 | Correlated EXISTS with HAVING loses aggregate state |
+| `e2e_full_join_tests` | 5/5 | Still open — FULL OUTER JOIN differential |
+| `e2e_having_transition_tests` | 5/7 | **Fixed** — see [Unreleased] Fixed section |
+| `e2e_keyless_duplicate_tests` | 5/7 | **Fixed** — un-ignored as part of F48 |
+| `e2e_scalar_subquery_tests` | 2/4 | Still open — correlated subquery diff |
+| `e2e_sublink_or_tests` | 1/4 | Still open — correlated EXISTS with HAVING |
 
 ---
 

@@ -83,7 +83,6 @@ async fn test_scalar_subquery_where_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: correlated scalar subquery differential generates invalid SQL (ROADMAP)"]
 async fn test_correlated_scalar_subquery_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE ss_dept (id SERIAL PRIMARY KEY, name TEXT)")
@@ -124,7 +123,6 @@ async fn test_correlated_scalar_subquery_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: correlated scalar subquery differential generates invalid SQL (ROADMAP)"]
 async fn test_scalar_subquery_null_result_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE ss_main (id SERIAL PRIMARY KEY, cat TEXT, val INT)")

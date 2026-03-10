@@ -129,7 +129,7 @@ SELECT customer_id, total FROM order_totals;  -- omit __pgt_row_id
 
 ### What is the auto-rewrite pipeline and how does it affect my queries?
 
-Before parsing a defining query into the DVM operator tree, pg_trickle runs five automatic rewrite passes:
+Before parsing a defining query into the DVM operator tree, pg_trickle runs six automatic rewrite passes:
 
 | # | Pass | What it does |
 |---|------|-------------|
@@ -137,7 +137,8 @@ Before parsing a defining query into the DVM operator tree, pg_trickle runs five
 | 1 | DISTINCT ON | Converts to `ROW_NUMBER() OVER (PARTITION BY … ORDER BY …) = 1` subquery |
 | 2 | GROUPING SETS / CUBE / ROLLUP | Decomposes into `UNION ALL` of separate `GROUP BY` queries |
 | 3 | Scalar subquery in WHERE | Rewrites `WHERE col > (SELECT …)` to `CROSS JOIN` |
-| 4 | SubLinks in OR | Splits `WHERE a OR EXISTS (…)` into `UNION` branches |
+| 4 | Correlated scalar subquery in SELECT | Rewrites to `LEFT JOIN` with grouped inline view |
+| 5 | SubLinks in OR | Splits `WHERE a OR EXISTS (…)` into `UNION` branches |
 
 The rewrites are transparent — your original query is preserved in the catalog (`original_query` column) while the rewritten version is stored in `defining_query`. The DVM engine only sees standard SQL operators after rewriting.
 

@@ -127,7 +127,6 @@ async fn test_not_exists_or_exists_differential() {
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-#[ignore = "DVM: correlated EXISTS with HAVING uses recomputation diff that loses aggregate state (ROADMAP)"]
 async fn test_exists_with_having_in_subquery_differential() {
     let db = E2eDb::new().await.with_extension().await;
     db.execute("CREATE TABLE eh_cust (id SERIAL PRIMARY KEY, name TEXT)")

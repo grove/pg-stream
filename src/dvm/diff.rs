@@ -129,6 +129,12 @@ pub struct DiffContext {
     /// use this to reference the correct ST column names in JOIN
     /// conditions and SELECT lists.
     pub st_column_alias_map: Option<HashMap<String, String>>,
+    /// Set to `true` immediately before differentiating the child of a HAVING
+    /// `Filter` node.  Consumed by `diff_aggregate` to force a full-rescan CTE
+    /// that supplies correct aggregate values for groups that were below the
+    /// HAVING threshold (absent from the ST) and are now crossing it upward.
+    /// Reset to `false` after the child diff returns.
+    pub having_filter: bool,
 }
 
 impl DiffContext {
@@ -152,6 +158,7 @@ impl DiffContext {
             st_has_pgt_count: false,
             delta_source: DeltaSource::ChangeBuffer,
             st_column_alias_map: None,
+            having_filter: false,
         }
     }
 
@@ -178,6 +185,7 @@ impl DiffContext {
             st_has_pgt_count: false,
             delta_source: DeltaSource::ChangeBuffer,
             st_column_alias_map: None,
+            having_filter: false,
         }
     }
 

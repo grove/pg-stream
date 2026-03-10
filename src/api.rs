@@ -74,6 +74,8 @@ fn run_query_rewrite_pipeline(query: &str) -> Result<String, PgTrickleError> {
     let query = crate::dvm::rewrite_grouping_sets(&query)?;
     // Scalar subquery in WHERE → CROSS JOIN
     let query = crate::dvm::rewrite_scalar_subquery_in_where(&query)?;
+    // Correlated scalar subquery in SELECT → LEFT JOIN
+    let query = crate::dvm::rewrite_correlated_scalar_in_select(&query)?;
     // SubLinks inside OR → UNION branches
     let query = crate::dvm::rewrite_sublinks_in_or(&query)?;
     // ROWS FROM() multi-function rewrite
