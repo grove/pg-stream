@@ -174,13 +174,25 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
             })
         }));
 
-        // If any backend bumped the DAG signal (CREATE EXTENSION, create_st,
-        // etc.) since our last loop, clear the skip cache so we re-probe all
-        // databases immediately.
+        // If any backend bumped the DAG signal (create_st, alter, drop, etc.)
+        // since our last loop, evict stale skip-cache entries so we re-probe
+        // affected databases promptly.
+        //
+        // We deliberately keep entries that were set WITHIN the last retry_ttl
+        // window.  Without this guard, every DAG bump from a concurrent test
+        // database can clear `last_attempt` for ALL databases — including ones
+        // (e.g. `postgres`) that were probed just moments ago and found to have
+        // no extension yet.  Each probe resets the timestamp, so the TTL never
+        // expires and the scheduler for that database never gets spawned.
+        //
+        // Retaining fresh entries preserves the intended back-off: databases
+        // probed recently (timed out or found no extension) wait out the full
+        // `retry_ttl` before being retried, while databases with stale entries
+        // (≥ retry_ttl ago) are cleared and retried immediately.
         let dag_version = shmem::current_dag_version();
         if dag_version != last_dag_version {
             last_dag_version = dag_version;
-            last_attempt.clear();
+            last_attempt.retain(|_, t| t.elapsed() < retry_ttl);
         }
 
         for db in &databases {

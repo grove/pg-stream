@@ -264,13 +264,17 @@ async fn configure_fast_scheduler(db: &E2eDb) {
     // Ensure the scheduler BGW is actually running before tests depend on it.
     // The launcher wakes at most every 10 s; give it 30 s to spawn.
     let sched_running = db
-        .wait_for_scheduler(std::time::Duration::from_secs(30))
+        .wait_for_scheduler(std::time::Duration::from_secs(60))
         .await;
     assert!(
         sched_running,
-        "pg_trickle scheduler did not appear in pg_stat_activity within 30 s. \
-         This usually means max_worker_processes is exhausted. \
-         Check that the E2E Docker image sets max_worker_processes = 32."
+        "pg_trickle scheduler did not appear in pg_stat_activity within 60 s. \
+         Possible causes: (1) max_worker_processes exhausted — check that the \
+         E2E Docker image sets max_worker_processes = 32; \
+         (2) launcher retry back-off not yet expired — the launcher waits up to \
+         retry_ttl (15 s) + poll interval (10 s) = 25 s after the last failed \
+         spawn attempt before retrying; \
+         (3) pg_trickle.enabled GUC is false."
     );
 }
 
