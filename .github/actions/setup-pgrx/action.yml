@@ -45,10 +45,10 @@ runs:
       uses: actions/cache@v4
       with:
         path: target
-        key: v1-cargo-build-pgrx0.17-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
+        key: v2-cargo-build-pgrx0.17-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          v1-cargo-build-pgrx0.17-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-
-          v1-cargo-build-pgrx0.17-${{ runner.os }}-
+          v2-cargo-build-pgrx0.17-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-
+          v2-cargo-build-pgrx0.17-${{ runner.os }}-${{ runner.arch }}-
 
     - name: Cache cargo-pgrx binary
       id: cache-cargo-pgrx
@@ -59,14 +59,14 @@ runs:
           ~/.cargo/bin/cargo-pgrx.exe
           ~/.cargo/.crates2.json
           ~/.cargo/.crates.toml
-        key: v2-cargo-pgrx-bin-0.17.0-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}
+        key: v3-cargo-pgrx-bin-0.17.0-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}
 
     - name: Cache pgrx home directory (~/.pgrx)
       id: cache-pgrx-home
       uses: actions/cache@v4
       with:
         path: ~/.pgrx
-        key: pgrx-home-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-pg${{ inputs.pg-version }}-${{ inputs.pg-install-mode }}-pgrx0.17.0
+        key: pgrx-home-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-pg${{ inputs.pg-version }}-${{ inputs.pg-install-mode }}-pgrx0.17.0
 
     # ── PostgreSQL headers (Linux) ────────────────────────────────────────
     - name: Install PostgreSQL ${{ inputs.pg-version }} (Linux)
