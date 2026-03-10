@@ -41,4 +41,8 @@ rules:
       include:
         - src/**
         - sql/**
+      exclude:
+        - "**/*.md"
+        - plans/**
+        - docs/**
     pattern-regex: SECURITY\s+DEFINER
