@@ -93,6 +93,27 @@ engine for true parallel refresh.
 
 See [PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) for the full design.
 
+#### Parallel Refresh — Phase 5 (Composite Unit Execution)
+
+Proper atomic-group and IMMEDIATE-closure execution inside dynamic refresh
+workers, replacing the Phase 3 serial placeholder.
+
+- **`execute_worker_atomic_group()`**: wraps all group members in a C-level
+  sub-transaction (`BeginInternalSubTransaction`). On any member failure the
+  entire group is rolled back (`RollbackAndReleaseCurrentSubTransaction`);
+  on success the sub-transaction is committed
+  (`ReleaseCurrentSubTransaction`). Retains all-or-nothing semantics.
+- **`execute_worker_immediate_closure()`**: refreshes only the root stream
+  table. Downstream IMMEDIATE-mode triggers fire synchronously within the
+  same worker transaction, so no explicit member iteration is needed.
+- **Worker dispatch routing**: the worker entry point now routes
+  `atomic_group` and `immediate_closure` to their dedicated functions
+  instead of the former serial `execute_worker_composite()` placeholder.
+- Coordinator already prevents double-scheduling of unit members via the
+  `ExecutionUnitDag` membership index.
+
+See [PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) for the full design.
+
 ---
 
 ## [0.3.0] — 2026-03-11

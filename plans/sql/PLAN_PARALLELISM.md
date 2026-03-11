@@ -19,22 +19,17 @@ Related:
 | 2 | Job Table and Worker Budget | ✅ Done |
 | 3 | Dynamic Worker Entry Point | ✅ Done |
 | 4 | Coordinator Dispatch Loop | ✅ Done |
-| 5 | Composite Units | Not started |
+| 5 | Composite Units | ✅ Done |
 | 6 | Observability and Tuning | Not started |
 | 7 | Rollout and Default Change | Not started |
 
 ### Prioritized Remaining Work
 
-1. **Phase 5 — Composite Units** (next)
-   - Atomic group execution inside refresh workers
-   - IMMEDIATE-closure execution inside workers
-   - Coordinator awareness of collapsed-unit membership
-
-2. **Phase 6 — Observability** (after core parallel path works)
+1. **Phase 6 — Observability** (next)
    - Monitoring functions for active workers, queue depth, blocked units
    - Documentation updates
 
-3. **Phase 7 — Rollout** (last)
+2. **Phase 7 — Rollout** (after observability)
    - CI coverage with parallel mode enabled
    - Benchmark comparison serial vs. parallel
    - Consider defaulting `parallel_refresh_mode = on`
@@ -684,7 +679,7 @@ This avoids leaked capacity after abnormal exits.
 - Downstream units begin as soon as prerequisites complete.
 - Unrelated work continues even when one branch is failing.
 
-### Phase 5 — Composite Units
+### Phase 5 — Composite Units ✅
 
 #### Scope
 
@@ -695,17 +690,24 @@ This avoids leaked capacity after abnormal exits.
 #### Files
 
 - `src/scheduler.rs`
-- `src/dag.rs`
-- `src/ivm.rs`
-- `src/refresh.rs`
 
 #### Task List
 
-- Move existing atomic-group execution into worker-owned unit execution.
-- Add composite-unit dispatch payloads with member `pgt_id` arrays.
-- Make coordinator scheduling aware of collapsed-unit membership.
-- Add IMMEDIATE-closure execution path that preserves same-transaction effects.
-- Add E2E tests for atomic diamonds and IMMEDIATE chains under parallel mode.
+- [x] Replace Phase 3 serial placeholder `execute_worker_composite()` with
+  dedicated `execute_worker_atomic_group()` and
+  `execute_worker_immediate_closure()` functions.
+- [x] `execute_worker_atomic_group()`: C-level sub-transaction
+  (`BeginInternalSubTransaction` / `ReleaseCurrentSubTransaction` /
+  `RollbackAndReleaseCurrentSubTransaction`) wrapping all members serially
+  with all-or-nothing rollback on any member failure.
+- [x] `execute_worker_immediate_closure()`: refresh only the root stream
+  table; downstream IMMEDIATE triggers fire synchronously in the same
+  transaction.
+- [x] Coordinator dispatch already prevents double-scheduling of unit
+  members (unit membership tracked via `pgt_to_unit` in `ExecutionUnitDag`;
+  each member belongs to exactly one execution unit).
+- [ ] Add E2E tests for atomic diamonds and IMMEDIATE chains under parallel
+  mode (deferred — requires `parallel_refresh_mode = 'on'` in E2E harness).
 
 #### Acceptance Criteria
 
