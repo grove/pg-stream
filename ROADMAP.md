@@ -581,7 +581,7 @@ updated in the same transaction from producing an inconsistent stream table.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| COV | Codecov integration: move token to `with:`, add `codecov.yml` with patch targets for `src/dvm/`, add README badge, verify first upload | 1–2h | [PLAN_CODECOV.md](plans/infra/PLAN_CODECOV.md) |
+| ~~COV~~ | ~~Codecov integration: move token to `with:`, add `codecov.yml` with patch targets for `src/dvm/`, add README badge, verify first upload~~ | ~~1–2h~~ | ✅ Done — reports live at [app.codecov.io/github/grove/pg-trickle](https://app.codecov.io/github/grove/pg-trickle) |
 
 > **v0.4.0 total: ~60–94 hours**
 
@@ -589,7 +589,7 @@ updated in the same transaction from producing an inconsistent stream table.
 - [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
 - [ ] Statement-level CDC triggers pass full E2E suite; write overhead benchmarked
 - [ ] LSN tick watermark active by default; no interleaved-source inconsistency in E2E tests
-- [ ] Codecov badge on README; coverage report uploading
+- [x] Codecov badge on README; coverage report uploading
 - [ ] Extension upgrade path tested (`0.3.0 → 0.4.0`)
 
 ---
