@@ -2,7 +2,8 @@
 
 ## Status
 
-**All five tasks implemented** (2026-03-05). See git history for details.
+**All five original tasks implemented** (2026-03-05). Three v0.4.0 ergonomic-hardening
+items implemented 2026-03-11. See git history for details.
 
 | Task | Status |
 |------|--------|
@@ -11,12 +12,17 @@
 | Task 3 — Add `default_schedule_seconds` GUC | ✅ Done |
 | Task 4 — Remove diamond GUCs | ✅ Done |
 | Task 5 — Add TOC to SQL_REFERENCE.md and CONFIGURATION.md | ✅ Done |
+| ERG-B — Warn at `_PG_init` when `cdc_mode='auto'` but `wal_level != 'logical'` | ✅ Done |
+| ERG-C — Warn at `create_stream_table` when source has no PRIMARY KEY | ✅ Done (pre-existing) |
+| ERG-F — Emit `WARNING` when `alter_stream_table` triggers implicit full refresh | ✅ Done |
 
 ### Remaining follow-up (not blocking)
 
 - E2E tests for `'calculated'` as schedule input (verify `NULL` input is rejected)
 - E2E test that `SHOW pg_trickle.diamond_consistency` returns an error
 - Update CHANGELOG.md with breaking behavioural changes (default schedule, NULL rejection)
+- E2E test for ERG-B warning (assert WARNING appears in server log when `wal_level != logical`)
+- E2E test for ERG-F warning (assert WARNING in client output when `alter_stream_table` with `query =>`)
 
 ---
 

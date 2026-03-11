@@ -571,11 +571,11 @@ updated in the same transaction from producing an inconsistent stream table.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| ERG-B | Warn at `_PG_init` when `cdc_mode='auto'` but `wal_level != 'logical'` — prevents silent trigger-only operation | 30min | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §B |
-| ERG-C | Warn at `create_stream_table` when source has no primary key — surfaces keyless duplicate-row risk | 1h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §C |
-| ERG-F | Emit `WARNING` when `alter_stream_table` triggers an implicit full refresh | 1h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §F |
+| ~~ERG-B~~ | ~~Warn at `_PG_init` when `cdc_mode='auto'` but `wal_level != 'logical'` — prevents silent trigger-only operation~~ | ~~30min~~ | ✅ Done |
+| ~~ERG-C~~ | ~~Warn at `create_stream_table` when source has no primary key — surfaces keyless duplicate-row risk~~ | ~~1h~~ | ✅ Done (pre-existing in `warn_source_table_properties`) |
+| ~~ERG-F~~ | ~~Emit `WARNING` when `alter_stream_table` triggers an implicit full refresh~~ | ~~1h~~ | ✅ Done |
 
-> **Ergonomic hardening subtotal: ~2.5 hours**
+> **Ergonomic hardening subtotal: ✅ All done**
 
 ### Code Coverage
 
