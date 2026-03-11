@@ -25,15 +25,15 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
                                                                      ▼
  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
  │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │
- │Released│─│Released│─│Released│─│Released│─│Mode & │─│DVM Fix │─│Parallel│─│RLS &  │─│Partition│
- │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Ops Gap│ │SAST&TPC│ │Refresh │ │Observ.│ │Support  │
+ │Released│─│Released│─│Released│─│Released│─│Mode & │─│DVM Fix │─│Parallel│─│  RLS  │─│Partition│
+ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Ops Gap│ │SAST&TPC│ │Refresh │ │       │ │Support  │
  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
       │
       └─ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
-         │ 0.7.0  │ │ 0.8.0  │ │ 1.0.0  │ │ 1.x+   │
-         │PG 16-18│─│Pooler &│─│Stable  │─│Scale & │
-         │Compat  │ │ExtTests│ │Release │ │Ecosys. │
-         └────────┘ └────────┘ └────────┘ └────────┘
+         │ 0.7.0  │ │ 0.8.0  │ │ 0.9.0  │ │ 1.0.0  │ │ 1.x+   │
+         │PG 16-18│─│Pooler &│─│Observ. │─│Stable  │─│Scale & │
+         │Compat  │ │ExtTests│ │& Integ.│ │Release │ │Ecosys. │
+         └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -544,12 +544,10 @@ remains the options-analysis precursor.
 
 ---
 
-## v0.5.0 — Row-Level Security & Observability
+## v0.5.0 — Row-Level Security (RLS)
 
-**Goal:** Harden the security context for stream tables and IVM triggers (RLS),
-deliver Prometheus/Grafana observability, release dbt-pgtrickle formally, and
-complete documentation review. After this milestone the product is deployable
-in multi-tenant environments and externally visible.
+**Goal:** Harden the security context for stream tables and IVM triggers so the
+extension is safe to deploy in multi-tenant environments.
 
 ### Row-Level Security (RLS) Support
 
@@ -573,29 +571,12 @@ tracking. Phase 4 (per-role `security_invoker`) is deferred to post-1.0.
 
 > **RLS subtotal: ~8–12 hours** (Phase 4 `security_invoker` deferred to post-1.0)
 
-### Observability
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
-| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
-
-### Integration & Release prep
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| I1 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
-| I2 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
-
-> **v0.5.0 total: ~22–33 hours**
+> **v0.5.0 total: ~8–12 hours**
 
 **Exit criteria:**
 - [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
 - [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
-- [ ] Grafana dashboard published
-- [ ] dbt-pgtrickle 0.1.0 on PyPI
-- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.4.0 → 0.5.0`)
-- [ ] All public documentation current and reviewed
+- [ ] Extension upgrade path tested (`0.4.0 → 0.5.0`)
 
 ---
 
@@ -695,6 +676,36 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 ---
 
+## v0.9.0 — Observability & Integration
+
+**Goal:** Prometheus/Grafana observability, dbt-pgtrickle formal release, and
+complete documentation review. After this milestone the product is externally
+visible and monitored.
+
+### Observability
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
+| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+
+### Integration & Release prep
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| I1 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
+| I2 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
+
+> **v0.9.0 total: ~14–21 hours**
+
+**Exit criteria:**
+- [ ] Grafana dashboard published
+- [ ] dbt-pgtrickle 0.1.0 on PyPI
+- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.8.0 → 0.9.0`)
+- [ ] All public documentation current and reviewed
+
+---
+
 ## v1.0.0 — Stable Release
 
 **Goal:** First officially supported release. Semantic versioning locks in.
@@ -716,7 +727,7 @@ distribution — getting pg_trickle onto package registries.
 - [ ] Published on PGXN and Docker Hub
 - [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
-- [ ] Upgrade path from v0.8.0 tested
+- [ ] Upgrade path from v0.9.0 tested
 - [ ] Semantic versioning policy in effect
 
 ---
@@ -769,10 +780,11 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | ✅ Released |
 | v0.3.0 — DVM Correctness, SAST & Test Coverage | ~20–30h | 185–252h | |
 | v0.4.0 — Parallel Refresh | 40–72h | 225–324h | |
-| v0.5.0 — Row-Level Security & Observability | 22–33h | 247–357h | |
-| v0.6.0 — Partitioning Support (Source Tables) | 18–32h | 265–389h | |
-| v0.7.0 — PostgreSQL Backward Compatibility (PG 16–18) | 38–56h | 303–445h | |
-| v0.8.0 — Connection Pooler Compatibility & External Test Suites | 160–208h | 463–653h | |
+| v0.5.0 — Row-Level Security (RLS) | 8–12h | 233–336h | |
+| v0.6.0 — Partitioning Support (Source Tables) | 18–32h | 251–368h | |
+| v0.7.0 — PostgreSQL Backward Compatibility (PG 16–18) | 38–56h | 289–424h | |
+| v0.8.0 — Connection Pooler Compatibility & External Test Suites | 160–208h | 449–632h | |
+| v0.9.0 — Observability & Integration | 14–21h | 463–653h | |
 | v1.0.0 — Stable release | 18–27h | 481–680h | |
 | Post-1.0 (ecosystem) | 88–134h | 569–814h | |
 | Post-1.0 (scale) | 6+ months | — | |
