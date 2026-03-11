@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-10
+> **Last updated:** 2026-03-11
 > **Latest release:** 0.2.3 (scheduled)
-> **Current milestone:** TPC-H Test Suite Enhancements (T1–T6)
+> **Current milestone:** v0.3.0 — DVM Correctness, SAST & Test Coverage
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -20,14 +20,20 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                                   We are here
-                                                    │
-                                                    ▼
- ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
- │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
- │Released│─│Released│─│Released│─│Released│─│Mode & │─│Parallel│─│Compat │─│Observ-│─│Stable │─│Scale &│
- │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Ops Gap│ │Sec/Part│ │& Cloud│ │ability│ │Release│ │Ecosys.│
- └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+                                                                    We are here
+                                                                     │
+                                                                     ▼
+ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+ │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │
+ │Released│─│Released│─│Released│─│Released│─│Mode & │─│DVM Fix │─│Parallel│─│RLS &  │─│Partition│
+ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Ops Gap│ │SAST&TPC│ │Refresh │ │Observ.│ │Support  │
+ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+      │
+      └─ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+         │ 0.7.0  │ │ 0.8.0  │ │ 1.0.0  │ │ 1.x+   │
+         │PG 16-18│─│Pooler &│─│Stable  │─│Scale & │
+         │Compat  │ │ExtTests│ │Release │ │Ecosys. │
+         └────────┘ └────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -453,73 +459,76 @@ validations, resource leaks, and observability holes. Phased from quick wins
 
 ---
 
-## TPC-H Test Suite Enhancements (T1–T6)
+## v0.3.0 — DVM Correctness, SAST & Test Coverage
 
-**Branch:** `test-suite-tpc-h-gaps`  
-**Status:** In Progress — all T1–T6 items implemented.  
-**Ref:** [plans/testing/TEST_SUITE_TPC_H-GAPS.md](plans/testing/TEST_SUITE_TPC_H-GAPS.md)
+**Goal:** Re-enable all 18 previously-ignored DVM correctness E2E tests by
+fixing HAVING, FULL OUTER JOIN, correlated EXISTS+HAVING, and correlated scalar
+subquery differential computation bugs. Harden the SAST toolchain with
+privilege-context rules and an unsafe-block baseline. Expand TPC-H coverage
+with rollback, mode-comparison, single-row, and DAG tests.
 
-Second wave of TPC-H correctness coverage, building on the 22/22 passing
-DIFFERENTIAL baseline. No `src/` changes — test-only additions.
-
-| Item | Description | Status |
-|------|-------------|--------|
-| T1 | `__pgt_count < 0` guard in `assert_tpch_invariant` (over-retraction detector) | ✅ Done |
-| T2 | Skip-set regression guard in DIFFERENTIAL + IMMEDIATE tests (allowlist-based) | ✅ Done |
-| T3 | `test_tpch_immediate_rollback` — verify ROLLBACK restores IVM ST atomically | ✅ Done |
-| T4 | `test_tpch_differential_vs_immediate` — compare both incremental modes directly | ✅ Done |
-| T5 | `test_tpch_single_row_mutations` + SQL fixtures — single-row IVM trigger paths | ✅ Done |
-| T6a | `test_tpch_dag_chain` — two-level DAG (Q01 → filtered projection), DIFFERENTIAL | ✅ Done |
-| T6b | `test_tpch_dag_multi_parent` — multi-parent fan-in (Q01 + Q06 → union), DIFFERENTIAL | ✅ Done |
-
-> No changes to `src/`, `.github/workflows/ci.yml`, `justfile`, or upgrade scripts.
-
----
-
-## SAST Program (Phases 1–3)
-
-**Branch:** `sast-review-1`  
-**Status:** Phases 1–3 complete.  
-**Ref:** [plans/testing/PLAN_SAST.md](plans/testing/PLAN_SAST.md)
-
-Incremental SAST (Static Application Security Testing) rollout. Phases 0–1
-(CodeQL, cargo deny, initial Semgrep, first alert triage) merged via the
-`codeql-workflow` branch and were detailed in the v0.2.3 changelog. This
-branch implements Phases 2–3 and CI workflow tuning.
+### DVM Correctness Fixes
 
 | Item | Description | Status |
 |------|-------------|--------|
-| S1 | Remove `pull_request` trigger from CodeQL + Semgrep workflows | ✅ Done |
-| S2 | `sql.row-security.disabled` Semgrep rule | ✅ Done |
-| S3 | `sql.set-role.present` Semgrep rule | ✅ Done |
-| S4 | Updated `sql.security-definer.present` message: explicit `SET search_path` guidance | ✅ Done |
-| S5 | `scripts/unsafe_inventory.sh` — per-file `unsafe {` counter | ✅ Done |
-| S6 | `.unsafe-baseline` — committed baseline (1309 blocks across 6 files) | ✅ Done |
-| S7 | `.github/workflows/unsafe-inventory.yml` — advisory CI workflow | ✅ Done |
-| S8 | `just unsafe-inventory` recipe | ✅ Done |
+| DC1 | HAVING clause differential correctness — fix `COUNT(*)` rewrite and threshold-crossing upward rescan (5 tests un-ignored) | ✅ Done |
+| DC2 | FULL OUTER JOIN differential correctness — fix row-id mismatch, compound GROUP BY expressions, SUM NULL semantics, and rescan CTE SELECT list (5 tests un-ignored) | ✅ Done |
+| DC3 | Correlated EXISTS with HAVING differential correctness — fix EXISTS sublink parser discarding GROUP BY/HAVING, row-id mismatch for `Project(SemiJoin)`, and `diff_project` row-id recomputation (1 test un-ignored) | ✅ Done |
+| DC4 | Correlated scalar subquery differential correctness — `rewrite_correlated_scalar_in_select` rewrites correlated scalar subqueries to LEFT JOINs before DVM parsing (2 tests un-ignored) | ✅ Done |
 
-**Next (Phase 4):** promote high-confidence Semgrep rules from advisory to
-blocking after the privilege-context rules have been validated against v0.3.0
-RLS/SECURITY DEFINER work.
+> **DVM correctness subtotal: 18 previously-ignored E2E tests re-enabled (0 remaining)**
+
+### SAST Program (Phases 1–3)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| S1 | CodeQL + `cargo deny` + initial Semgrep baseline — zero findings across 115 Rust source files | ✅ Done |
+| S2 | Narrow `rust.panic-in-sql-path` scope — exclude `src/dvm/**` and `src/bin/**` to eliminate 351 false-positive alerts | ✅ Done |
+| S3 | `sql.row-security.disabled` Semgrep rule — flag `SET LOCAL row_security = off` | ✅ Done |
+| S4 | `sql.set-role.present` Semgrep rule — flag `SET ROLE` / `RESET ROLE` patterns | ✅ Done |
+| S5 | Updated `sql.security-definer.present` message to require explicit `SET search_path` | ✅ Done |
+| S6 | `scripts/unsafe_inventory.sh` + `.unsafe-baseline` — per-file `unsafe {` counter with committed baseline (1309 blocks across 6 files) | ✅ Done |
+| S7 | `.github/workflows/unsafe-inventory.yml` — advisory CI workflow; fails if any file exceeds its baseline | ✅ Done |
+| S8 | Remove `pull_request` trigger from CodeQL + Semgrep workflows (no inline PR annotations; runs on push-to-main + weekly schedule) | ✅ Done |
+
+> **SAST subtotal: Phases 1–3 complete; Phase 4 rule promotion tracked as post-v0.3.0 cleanup**
+
+### TPC-H Test Suite Enhancements (T1–T6)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| T1 | `__pgt_count < 0` guard in `assert_tpch_invariant` — over-retraction detector, applies to all existing TPC-H tests | ✅ Done |
+| T2 | Skip-set regression guard in DIFFERENTIAL + IMMEDIATE tests — any newly skipped query not in the allowlist fails CI | ✅ Done |
+| T3 | `test_tpch_immediate_rollback` — verify ROLLBACK restores IVM stream table atomically across RF mutations | ✅ Done |
+| T4 | `test_tpch_differential_vs_immediate` — side-by-side comparison: both incremental modes produce identical results after shared mutations | ✅ Done |
+| T5 | `test_tpch_single_row_mutations` + SQL fixtures — single-row INSERT/UPDATE/DELETE IVM trigger paths on Q01/Q06/Q03 | ✅ Done |
+| T6a | `test_tpch_dag_chain` — two-level DAG (Q01 → filtered projection), refreshed in topological order | ✅ Done |
+| T6b | `test_tpch_dag_multi_parent` — multi-parent fan-in (Q01 + Q06 → UNION ALL), DIFFERENTIAL mode | ✅ Done |
+
+> **TPC-H subtotal: T1–T6 complete; 22/22 TPC-H queries passing**
+
+**Exit criteria:**
+- [x] All 18 previously-ignored DVM correctness E2E tests re-enabled
+- [x] SAST Phases 1–3 deployed; unsafe baseline committed; CodeQL zero findings
+- [x] TPC-H T1–T6 implemented; rollback, differential-vs-immediate, single-row, and DAG tests pass
+- [ ] Extension upgrade path tested (`0.2.3 → 0.3.0`)
 
 ---
 
-## v0.3.0 — Parallel Refresh, Security & Partitioning
+## v0.4.0 — Parallel Refresh
 
-**Goal:** Deliver true parallel refresh first, then harden security (RLS) and
-validate partitioned sources so the extension is safer to deploy in
-multi-tenant and real-world schemas.
+**Goal:** Deliver true parallel refresh via a coordinator/worker model,
+improving refresh throughput and freshness latency for independent stream
+tables. This milestone is expected to materially reduce end-to-end staleness
+for large DAGs but does not raise source-table write throughput on the current
+trigger-based CDC path.
 
 ### Parallel Refresh
 
-Detailed implementation is now tracked in
+Detailed implementation is tracked in
 [PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md). The older
 [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md)
 remains the options-analysis precursor.
-
-This milestone is expected to improve refresh throughput and freshness latency
-for independent work, but not materially raise source-table write throughput on
-the current trigger-based CDC path.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -528,6 +537,19 @@ the current trigger-based CDC path.
 | P3 | Phase 5–7: composite units, observability, rollout gating, and CI validation | 12–24h | [PLAN_PARALLELISM.md §10](plans/sql/PLAN_PARALLELISM.md) |
 
 > **Parallel refresh subtotal: ~40–72 hours**
+
+**Exit criteria:**
+- [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
+- [ ] Extension upgrade path tested (`0.3.0 → 0.4.0`)
+
+---
+
+## v0.5.0 — Row-Level Security & Observability
+
+**Goal:** Harden the security context for stream tables and IVM triggers (RLS),
+deliver Prometheus/Grafana observability, release dbt-pgtrickle formally, and
+complete documentation review. After this milestone the product is deployable
+in multi-tenant environments and externally visible.
 
 ### Row-Level Security (RLS) Support
 
@@ -551,12 +573,40 @@ tracking. Phase 4 (per-role `security_invoker`) is deferred to post-1.0.
 
 > **RLS subtotal: ~8–12 hours** (Phase 4 `security_invoker` deferred to post-1.0)
 
-### Partitioning Support (Source Tables)
+### Observability
 
-Partitioned source tables already work with trigger-based CDC (PG 13+ trigger
-propagation), but there are validation gaps, missing tests, and an ATTACH
-PARTITION detection hole. This section addresses the near-term items only;
-partitioned storage tables are deferred to a future release.
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
+| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+
+### Integration & Release prep
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| I1 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
+| I2 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
+
+> **v0.5.0 total: ~22–33 hours**
+
+**Exit criteria:**
+- [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
+- [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
+- [ ] Grafana dashboard published
+- [ ] dbt-pgtrickle 0.1.0 on PyPI
+- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.4.0 → 0.5.0`)
+- [ ] All public documentation current and reviewed
+
+---
+
+## v0.6.0 — Partitioning Support (Source Tables)
+
+**Goal:** Validate and harden partitioned source table support. Trigger-based
+CDC already propagates to child partitions (PG 13+ trigger propagation), but
+there are validation gaps, missing tests, and an ATTACH PARTITION detection
+hole. Partitioned stream table *storage* is deferred to post-1.0.
+
+### Partitioning Support (Source Tables)
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -568,31 +618,21 @@ partitioned storage tables are deferred to a future release.
 
 > **Partitioning subtotal: ~18–32 hours**
 
-> **v0.3.0 total: ~66–116 hours**
-
 **Exit criteria:**
-- [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
-- [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
-- [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
-- [ ] Extension upgrade path tested (`0.2.3 → 0.3.0`)
+- [ ] WAL mode works with `publish_via_partition_root = true`
+- [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
 ---
 
-## v0.4.0 — Backward Compatibility, Cloud & Scale
+## v0.7.0 — PostgreSQL Backward Compatibility (PG 16–18)
 
-**Goal:** Widen the deployment target from PG 18-only to PG 16–18, enable
-compatibility with connection poolers (PgBouncer transaction mode), and
-validate correctness against external test corpora. After this milestone the
-extension is suitable for production use on mainstream PostgreSQL deployments
-including cloud providers.
+**Goal:** Widen the deployment target from PG 18-only to PG 16–18. pgrx 0.17.0
+supports PG 13–18 via feature flags. Starting with PG 16–18 minimizes scope
+(only JSON_TABLE gating needed) while widening the deployment target. PG 14–15
+support can follow in a later release.
 
 ### PostgreSQL Backward Compatibility (PG 16–18)
-
-pg_trickle currently targets PG 18 only. pgrx 0.17.0 supports PG 13–18 via
-feature flags. Starting with PG 16–18 minimizes scope (only JSON_TABLE gating
-needed) while widening the deployment target for the production-ready release.
-PG 14–15 support can follow in a later release.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -604,13 +644,27 @@ PG 14–15 support can follow in a later release.
 
 > **Backward compatibility subtotal: ~38–56 hours**
 
+**Exit criteria:**
+- [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
+- [ ] WAL decoder validated against PG 16–17 `pgoutput` format
+- [ ] CI matrix covers PG 16, 17, 18
+- [ ] Extension upgrade path tested (`0.6.0 → 0.7.0`)
+
+---
+
+## v0.8.0 — Connection Pooler Compatibility & External Test Suites
+
+**Goal:** Enable cloud-native deployments by supporting PgBouncer
+transaction-mode pooling (the default at RDS Proxy, Supabase, Neon). Validate
+correctness against independent query corpora (sqllogictest, JOB, Nexmark)
+beyond TPC-H. After this milestone the extension is suitable for production
+use on mainstream cloud PostgreSQL deployments.
+
 ### Connection Pooler Compatibility
 
-PgBouncer transaction-mode pooling is the default at many cloud providers
-(RDS Proxy, Supabase, Neon). pg_trickle uses session-level advisory locks and
-`PREPARE` statements that are incompatible with transaction-mode pooling.
-This section replaces all session-scoped state with transaction-scoped
-equivalents to enable cloud-native deployments.
+pg_trickle uses session-level advisory locks and `PREPARE` statements that are
+incompatible with PgBouncer transaction-mode pooling. This section replaces all
+session-scoped state with transaction-scoped equivalents.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -632,44 +686,12 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **External test suites subtotal: ~4–7 days**
 
-> **v0.4.0 total: ~160–208 hours**
+> **v0.8.0 total: ~160–208 hours**
 
 **Exit criteria:**
-- [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
-- [ ] WAL decoder validated against PG 16–17 `pgoutput` format
-- [ ] CI matrix covers PG 16, 17, 18
 - [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
 - [ ] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
-
----
-
-## v0.5.0 — Observability & Integration
-
-**Goal:** Prometheus/Grafana observability, dbt-pgtrickle formal release,
-complete documentation review, and validated upgrade path. After this
-milestone the product is externally visible and monitored.
-
-### Observability
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
-| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
-
-### Integration & Release prep
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| R5 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
-| R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
-
-> **v0.5.0 total: ~14–21 hours**
-
-**Exit criteria:**
-- [ ] Grafana dashboard published
-- [ ] dbt-pgtrickle 0.1.0 on PyPI
-- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.4.0 → 0.5.0`)
-- [ ] All public documentation current and reviewed
+- [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
 
 ---
 
@@ -694,7 +716,7 @@ distribution — getting pg_trickle onto package registries.
 - [ ] Published on PGXN and Docker Hub
 - [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
-- [ ] Upgrade path from v0.5.0 tested
+- [ ] Upgrade path from v0.8.0 tested
 - [ ] Semantic versioning policy in effect
 
 ---
@@ -744,12 +766,15 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Released |
 | v0.2.1 — Upgrade Infrastructure & Documentation | ~8h | 70–86h | ✅ Released |
 | v0.2.2 — OFFSET Support, ALTER QUERY & Upgrade Tooling | ~50–70h | 120–156h | ✅ Released |
-| v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | |
-| v0.3.0 — Parallel Refresh, Security & Partitioning | 66–116h | 231–338h | |
-| v0.4.0 — Backward Compatibility, Cloud & Scale | 160–208h | 391–546h | |
-| v0.5.0 — Observability & Integration | 14–21h | 405–567h | |
-| v1.0.0 — Stable release | 18–27h | 423–594h | |
-| Post-1.0 (ecosystem) | 88–134h | 511–728h | |
+| v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | ✅ Released |
+| v0.3.0 — DVM Correctness, SAST & Test Coverage | ~20–30h | 185–252h | |
+| v0.4.0 — Parallel Refresh | 40–72h | 225–324h | |
+| v0.5.0 — Row-Level Security & Observability | 22–33h | 247–357h | |
+| v0.6.0 — Partitioning Support (Source Tables) | 18–32h | 265–389h | |
+| v0.7.0 — PostgreSQL Backward Compatibility (PG 16–18) | 38–56h | 303–445h | |
+| v0.8.0 — Connection Pooler Compatibility & External Test Suites | 160–208h | 463–653h | |
+| v1.0.0 — Stable release | 18–27h | 481–680h | |
+| Post-1.0 (ecosystem) | 88–134h | 569–814h | |
 | Post-1.0 (scale) | 6+ months | — | |
 
 ---
