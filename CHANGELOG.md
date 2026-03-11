@@ -132,6 +132,28 @@ Monitoring functions and health checks for the parallel refresh subsystem.
 
 See [PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) for the full design.
 
+#### Parallel Refresh — Phase 7 (Rollout and Default Change)
+
+Documentation, CI validation, and rollout gating for the parallel refresh
+feature. All seven implementation phases are now complete.
+
+- **GUC documentation** (`docs/CONFIGURATION.md`): Full reference for
+  `parallel_refresh_mode`, `max_dynamic_refresh_workers`, and updated
+  `max_concurrent_refreshes` (now documented as the per-database dispatch
+  cap). Includes worker-budget planning formula and tuning guidance.
+- **Architecture documentation** (`docs/ARCHITECTURE.md`): New "Parallel
+  Refresh" subsection describing the execution-unit DAG, ready queue,
+  dynamic worker lifecycle, and how it relates to `max_worker_processes`.
+- **CI coverage**: E2E test suite now runs a second pass with
+  `PGT_PARALLEL_MODE=on` to validate correctness under parallel dispatch.
+  The test harness (`tests/e2e/mod.rs`) reads the environment variable and
+  applies `ALTER SYSTEM SET pg_trickle.parallel_refresh_mode` accordingly.
+- **Default remains `off`**: The feature is gated behind the
+  `parallel_refresh_mode` GUC through initial releases. Defaulting to `on`
+  is deferred until real-world operational evidence is collected.
+
+See [PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md) for the full design.
+
 --- — 2026-03-11
 
 ### Fixed

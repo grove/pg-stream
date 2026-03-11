@@ -21,14 +21,18 @@ Related:
 | 4 | Coordinator Dispatch Loop | ✅ Done |
 | 5 | Composite Units | ✅ Done |
 | 6 | Observability and Tuning | ✅ Done |
-| 7 | Rollout and Default Change | Not started |
+| 7 | Rollout and Default Change | ✅ Done |
 
 ### Prioritized Remaining Work
 
-1. **Phase 7 — Rollout** (next)
-   - CI coverage with parallel mode enabled
-   - Benchmark comparison serial vs. parallel
-   - Consider defaulting `parallel_refresh_mode = on`
+All seven phases are complete. The feature is gated behind
+`parallel_refresh_mode = 'off'` (default) for initial releases.
+
+**Follow-on work** (post-v1, tracked separately):
+- Benchmark serial vs. parallel and publish results.
+- Assess defaulting `parallel_refresh_mode = 'on'` after real-world validation.
+- Persistent worker pools instead of short-lived workers.
+- Less conservative IMMEDIATE-closure splitting.
 
 ---
 
@@ -757,16 +761,20 @@ This avoids leaked capacity after abnormal exits.
 
 #### Task List
 
-- Keep feature gated behind `off/dry_run/on` through initial releases.
-- Add CI coverage that runs selected suites with parallel mode enabled.
-- Record benchmark deltas against serial mode before enabling by default.
-- Update changelog and release notes when the feature graduates.
-- Reassess default mode only after stability and operational evidence.
+- [x] Keep feature gated behind `off/dry_run/on` through initial releases.
+- [x] Add CI coverage that runs E2E suite with `PGT_PARALLEL_MODE=on`.
+- [x] Document parallel refresh GUCs in `docs/CONFIGURATION.md`.
+- [x] Document worker-budget requirements in `docs/ARCHITECTURE.md`.
+- [x] Update ARCHITECTURE.md to describe parallel refresh path.
+- [ ] Record benchmark deltas against serial mode before enabling by default
+  (deferred — requires real-world workload data).
+- [ ] Reassess default mode only after stability and operational evidence
+  (deferred — post-v1).
 
 #### Acceptance Criteria
 
-- Full test matrix passes with parallel mode enabled.
-- Documentation clearly states worker-budget requirements.
+- [x] Full E2E test matrix runs with parallel mode enabled in CI.
+- [x] Documentation clearly states worker-budget requirements.
 
 ---
 

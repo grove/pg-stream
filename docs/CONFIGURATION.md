@@ -32,10 +32,13 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
     - [pg\_trickle.ivm\_topk\_max\_limit](#pg_trickleivm_topk_max_limit)
     - [pg\_trickle.ivm\_recursive\_max\_depth](#pg_trickleivm_recursive_max_depth)
+  - [Parallel Refresh](#parallel-refresh)
+    - [pg\_trickle.parallel\_refresh\_mode](#pg_trickleparallel_refresh_mode)
+    - [pg\_trickle.max\_dynamic\_refresh\_workers](#pg_tricklemax_dynamic_refresh_workers)
+    - [pg\_trickle.max\_concurrent\_refreshes](#pg_tricklemax_concurrent_refreshes)
   - [Advanced / Internal](#advanced--internal)
     - [pg\_trickle.change\_buffer\_schema](#pg_tricklechange_buffer_schema)
     - [pg\_trickle.foreign\_table\_polling](#pg_trickleforeign_table_polling)
-    - [pg\_trickle.max\_concurrent\_refreshes](#pg_tricklemax_concurrent_refreshes)
 - [Complete postgresql.conf Example](#complete-postgresqlconf-example)
 - [Runtime Configuration](#runtime-configuration)
 - [Further Reading](#further-reading)
@@ -581,27 +584,133 @@ SET pg_trickle.ivm_recursive_max_depth = 500;
 
 ---
 
-### Advanced / Internal
+## Parallel Refresh
 
-Rarely changed. Leave at defaults unless you have a specific reason to adjust.
+These settings control whether and how the scheduler dispatches refresh
+work to multiple dynamic background workers instead of processing
+stream tables sequentially. See
+[PLAN_PARALLELISM.md](../plans/sql/PLAN_PARALLELISM.md) for the design.
 
----
+> **Note:** Parallel refresh is new in v0.4.0 and defaults to `off`. Enable
+> it via `pg_trickle.parallel_refresh_mode` after validating your workload.
 
-### pg_trickle.change_buffer_schema
+### pg_trickle.parallel_refresh_mode
 
-Schema where CDC change buffer tables are created.
+Controls whether the scheduler dispatches refresh work to dynamic
+background workers.
 
 | Property | Value |
 |---|---|
 | Type | `text` |
-| Default | `'pgtrickle_changes'` |
+| Default | `'off'` |
+| Values | `'off'`, `'dry_run'`, `'on'` |
 | Context | `SUSET` |
-| Restart Required | No (but existing change buffers remain in the old schema) |
+| Restart Required | No |
 
-Change buffer tables are named `<schema>.changes_<oid>` where `<oid>` is the source table's OID. Placing them in a dedicated schema keeps them out of the `public` namespace.
+- **`off`** (default): Sequential execution. All stream tables are
+  refreshed one at a time in topological order by the single scheduler
+  background worker. This is the proven, stable default.
+- **`dry_run`**: The scheduler computes execution units, logs dispatch
+  decisions (unit keys, ready-queue contents, budget), but still executes
+  refreshes inline. Useful for previewing parallel behaviour without
+  actually spawning workers.
+- **`on`**: True parallel refresh. The coordinator builds an execution-unit
+  DAG, dispatches ready units to dynamic background workers, and respects
+  both the per-database cap (`max_concurrent_refreshes`) and the
+  cluster-wide cap (`max_dynamic_refresh_workers`).
 
-**Tuning Guidance:**
-- Generally leave at the default. Change only if `pgtrickle_changes` conflicts with an existing schema in your database.
+```sql
+-- Preview parallel dispatch decisions without changing runtime behaviour
+SET pg_trickle.parallel_refresh_mode = 'dry_run';
+
+-- Enable parallel refresh
+SET pg_trickle.parallel_refresh_mode = 'on';
+```
+
+---
+
+### pg_trickle.max_dynamic_refresh_workers
+
+Cluster-wide cap on concurrently active pg_trickle dynamic refresh workers.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `4` |
+| Range | `0` – `64` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+This is distinct from `pg_trickle.max_concurrent_refreshes` (per-database
+cap). When multiple databases each have their own scheduler, this GUC
+prevents them from overcommitting the shared PostgreSQL
+`max_worker_processes` budget.
+
+**Worker-budget planning:** Each dynamic refresh worker consumes one
+`max_worker_processes` slot. In addition, pg_trickle uses one slot for
+the launcher and one per-database scheduler. Ensure:
+
+```
+max_worker_processes >= pg_trickle launchers (1)
+                      + pg_trickle schedulers (1 per database)
+                      + max_dynamic_refresh_workers
+                      + autovacuum workers
+                      + parallel query workers
+                      + other extensions
+```
+
+A typical small deployment (1–2 databases, 4 parallel workers) needs at
+least `max_worker_processes = 16`. The E2E test Docker image uses 128.
+
+```sql
+-- Allow up to 8 concurrent refresh workers cluster-wide
+SET pg_trickle.max_dynamic_refresh_workers = 8;
+```
+
+---
+
+### pg_trickle.max_concurrent_refreshes
+
+Per-database dispatch cap for parallel refresh workers.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `4` |
+| Range | `1` – `32` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When `parallel_refresh_mode = 'on'`, this limits how many execution units
+a single database coordinator may have in-flight at the same time. In
+sequential mode (`parallel_refresh_mode = 'off'`), this setting has no
+effect.
+
+The effective concurrent refreshes for a database is:
+
+```
+min(max_concurrent_refreshes, max_dynamic_refresh_workers - workers_used_by_other_dbs)
+```
+
+```sql
+-- Allow up to 8 concurrent refreshes in this database
+SET pg_trickle.max_concurrent_refreshes = 8;
+```
+
+---
+
+## Advanced / Internal
+
+### pg_trickle.change_buffer_schema
+
+Schema name for change-buffer tables created by the trigger-based CDC
+pipeline.
+
+**Default:** `'pgtrickle_changes'`
+
+Change buffer tables are named `<schema>.changes_<oid>` where `<oid>` is
+the source table's OID. Placing them in a dedicated schema keeps them out
+of the `public` namespace.
 
 ```sql
 SET pg_trickle.change_buffer_schema = 'my_change_buffers';
@@ -620,34 +729,7 @@ incremental maintenance.
 **Default:** `false`
 
 ```sql
--- Enable foreign table polling
 SET pg_trickle.foreign_table_polling = true;
-```
-
----
-
-### pg_trickle.max_concurrent_refreshes
-
-> **Reserved for future use.** This setting is accepted and stored but has no
-> effect in v0.2.x. Parallel refresh is planned for v0.3.0.
-
-Maximum number of stream tables that can be refreshed simultaneously.
-
-| Property | Value |
-|---|---|
-| Type | `int` |
-| Default | `4` |
-| Range | `1` – `32` |
-| Context | `SUSET` |
-| Restart Required | No |
-
-The scheduler currently processes stream tables sequentially in topological
-order. This GUC is reserved for future parallel scheduling work and has no
-effect in v0.2.2.
-
-```sql
--- Accepted but has no effect in v0.2.2
-SET pg_trickle.max_concurrent_refreshes = 8;
 ```
 
 ---
@@ -686,11 +768,14 @@ pg_trickle.max_grouping_set_branches = 64
 pg_trickle.ivm_topk_max_limit = 1000
 pg_trickle.ivm_recursive_max_depth = 100
 
+# Parallel refresh (v0.4.0+, default off)
+pg_trickle.parallel_refresh_mode = 'off'        # 'off' | 'dry_run' | 'on'
+pg_trickle.max_dynamic_refresh_workers = 4       # cluster-wide worker cap
+pg_trickle.max_concurrent_refreshes = 4          # per-database dispatch cap
+
 # Advanced / internal
 pg_trickle.change_buffer_schema = 'pgtrickle_changes'
 pg_trickle.foreign_table_polling = false
-pg_trickle.max_concurrent_refreshes = 4   # reserved; no effect in v0.2.2
-# pg_trickle.merge_strategy removed in v0.2.0
 ```
 
 ---
@@ -702,10 +787,10 @@ All GUC variables can be changed at runtime by a superuser:
 ```sql
 -- View current settings
 SHOW pg_trickle.enabled;
-SHOW pg_trickle.scheduler_interval_ms;
+SHOW pg_trickle.parallel_refresh_mode;
 
--- Change for current session
-SET pg_trickle.max_concurrent_refreshes = 8;  -- no effect in v0.2.0
+-- Enable parallel refresh for current session
+SET pg_trickle.parallel_refresh_mode = 'on';
 
 -- Change persistently (requires reload)
 ALTER SYSTEM SET pg_trickle.scheduler_interval_ms = 500;

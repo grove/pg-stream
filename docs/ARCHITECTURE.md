@@ -383,11 +383,44 @@ Each tick of the main loop performs the following steps inside a single transact
 6. **Slot health** — Check replication slot health and emit `NOTIFY` alerts.
 7. **Prune retry state** — Remove backoff entries for STs that no longer exist.
 
-#### Sequential Processing
+#### Sequential Processing (Default)
 
-**The scheduler processes stream tables sequentially within a single background worker.** Although `pg_trickle.max_concurrent_refreshes` (default 4) exists as a GUC, it currently only prevents a manual `pgtrickle.refresh_stream_table()` call from overlapping with the scheduler on the *same* ST — it does not spawn additional workers. All STs are refreshed one at a time in topological order.
+**By default (`parallel_refresh_mode = 'off`), the scheduler processes
+stream tables sequentially within a single background worker.** All STs
+are refreshed one at a time in topological order.
+`pg_trickle.max_concurrent_refreshes` (default 4) only prevents a manual
+`pgtrickle.refresh_stream_table()` call from overlapping with the
+scheduler on the *same* ST — it does not spawn additional workers.
 
-The PostgreSQL GUC `max_worker_processes` (default 8) sets the server-wide budget for *all* background workers (autovacuum, parallel query, logical replication, extensions). pg_trickle consumes **one** slot from that budget.
+The PostgreSQL GUC `max_worker_processes` (default 8) sets the server-wide budget for *all* background workers (autovacuum, parallel query, logical replication, extensions). In sequential mode pg_trickle consumes **one** slot from that budget.
+
+#### Parallel Refresh (`parallel_refresh_mode = 'on'`)
+
+When enabled, the scheduler builds an **execution-unit DAG** from the
+stream-table dependency graph and dispatches independent units to
+dynamic background workers:
+
+1. **Execution units** — Each independent stream table becomes a
+   *singleton* unit. Atomic consistency groups and IMMEDIATE-trigger
+   closures are collapsed into composite units that run in a single
+   worker for correctness.
+2. **Ready queue** — Units whose upstream dependencies have all
+   completed enter the ready queue. The coordinator dispatches them
+   subject to a per-database cap (`max_concurrent_refreshes`) and a
+   cluster-wide cap (`max_dynamic_refresh_workers`).
+3. **Dynamic workers** — Each dispatched unit spawns a short-lived
+   background worker via `BackgroundWorkerBuilder::load_dynamic()`.
+   Workers claim a job from the `pgtrickle.pgt_scheduler_jobs` catalog
+   table, execute the refresh, and exit.
+
+The parallel path respects the same topological ordering as the
+sequential path — downstream units only become ready after all upstream
+units succeed. The worker-budget caps ensure pg_trickle does not exhaust
+`max_worker_processes`.
+
+See [PLAN_PARALLELISM.md](../plans/sql/PLAN_PARALLELISM.md) for the full
+design and [CONFIGURATION.md](CONFIGURATION.md#parallel-refresh) for
+tuning guidance.
 
 #### Retry & Error Handling
 
