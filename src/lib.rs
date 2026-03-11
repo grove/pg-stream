@@ -181,6 +181,36 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_change_tracking (
     tracked_by_pgt_ids   BIGINT[]
 );
 
+-- Scheduler job table for parallel refresh dispatch
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_scheduler_jobs (
+    job_id          BIGSERIAL PRIMARY KEY,
+    dag_version     BIGINT NOT NULL,
+    unit_key        TEXT NOT NULL,
+    unit_kind       TEXT NOT NULL
+                     CHECK (unit_kind IN ('singleton', 'atomic_group', 'immediate_closure')),
+    member_pgt_ids  BIGINT[] NOT NULL,
+    root_pgt_id     BIGINT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'QUEUED'
+                     CHECK (status IN ('QUEUED', 'RUNNING', 'SUCCEEDED',
+                                       'RETRYABLE_FAILED', 'PERMANENT_FAILED', 'CANCELLED')),
+    scheduler_pid   INT NOT NULL,
+    worker_pid      INT,
+    attempt_no      INT NOT NULL DEFAULT 1,
+    enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,
+    finished_at     TIMESTAMPTZ,
+    outcome_detail  TEXT,
+    retryable       BOOLEAN
+);
+
+CREATE INDEX IF NOT EXISTS idx_sched_jobs_status_enqueued
+    ON pgtrickle.pgt_scheduler_jobs (status, enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_sched_jobs_unit_status
+    ON pgtrickle.pgt_scheduler_jobs (unit_key, status);
+CREATE INDEX IF NOT EXISTS idx_sched_jobs_finished
+    ON pgtrickle.pgt_scheduler_jobs (finished_at)
+    WHERE finished_at IS NOT NULL;
+
 "#,
     name = "pg_trickle_catalog",
     bootstrap,

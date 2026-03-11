@@ -5,7 +5,7 @@
 
 use pgrx::prelude::*;
 use pgrx::{PGRXSharedMemory, PgAtomic, PgLwLock, pg_shmem_init};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 /// Shared state visible to both the scheduler and user backends.
 ///
@@ -49,11 +49,29 @@ pub static DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64> =
 pub static CACHE_GENERATION: PgAtomic<AtomicU64> =
     unsafe { PgAtomic::new(c"pg_trickle_cache_gen") };
 
+/// Cluster-wide counter of active dynamic refresh workers.
+///
+/// Coordinators increment this before spawning a worker and workers decrement
+/// on exit. Used together with the `max_dynamic_refresh_workers` GUC to
+/// enforce a cluster-wide worker budget.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static ACTIVE_REFRESH_WORKERS: PgAtomic<AtomicU32> =
+    unsafe { PgAtomic::new(c"pg_trickle_active_workers") };
+
+/// Epoch counter incremented each time worker tokens are reconciled after a
+/// crash or abnormal exit. Allows coordinators to detect that reconciliation
+/// happened and re-check their in-flight job state.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static RECONCILE_EPOCH: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_reconcile_epoch") };
+
 /// Register shared memory allocations. Called from `_PG_init()`.
 pub fn init_shared_memory() {
     pg_shmem_init!(PGS_STATE);
     pg_shmem_init!(DAG_REBUILD_SIGNAL);
     pg_shmem_init!(CACHE_GENERATION);
+    pg_shmem_init!(ACTIVE_REFRESH_WORKERS);
+    pg_shmem_init!(RECONCILE_EPOCH);
     SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -120,6 +138,106 @@ pub fn current_cache_generation() -> u64 {
 fn is_shmem_available() -> bool {
     // Use a simple flag set during init_shared_memory()
     SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ── Worker token management (Phase 2: parallel refresh) ───────────────────
+
+/// Try to acquire a cluster-wide refresh worker token.
+///
+/// Returns `true` if a token was acquired (active count incremented),
+/// `false` if the budget is exhausted.
+///
+/// The caller **must** call [`release_worker_token`] when the worker
+/// finishes, regardless of success or failure.
+pub fn try_acquire_worker_token(max_workers: u32) -> bool {
+    if !is_shmem_available() {
+        return false;
+    }
+    // CAS loop: increment only if below the cap.
+    let atomic = ACTIVE_REFRESH_WORKERS.get();
+    loop {
+        let current = atomic.load(std::sync::atomic::Ordering::Acquire);
+        if current >= max_workers {
+            return false;
+        }
+        match atomic.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(_) => continue, // spurious failure — retry
+        }
+    }
+}
+
+/// Release a cluster-wide refresh worker token (decrement active count).
+///
+/// Called by workers on exit and by reconciliation logic for leaked tokens.
+pub fn release_worker_token() {
+    if !is_shmem_available() {
+        return;
+    }
+    // Saturating decrement — never go below 0.
+    let atomic = ACTIVE_REFRESH_WORKERS.get();
+    loop {
+        let current = atomic.load(std::sync::atomic::Ordering::Acquire);
+        if current == 0 {
+            return;
+        }
+        match atomic.compare_exchange_weak(
+            current,
+            current - 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Read the current number of active dynamic refresh workers.
+pub fn active_worker_count() -> u32 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    ACTIVE_REFRESH_WORKERS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Force-set the active worker count to a specific value.
+///
+/// Used by reconciliation logic to correct the count after a crash.
+pub fn set_active_worker_count(count: u32) {
+    if !is_shmem_available() {
+        return;
+    }
+    ACTIVE_REFRESH_WORKERS
+        .get()
+        .store(count, std::sync::atomic::Ordering::Release);
+}
+
+/// Bump the reconcile epoch (signals that token count was corrected).
+pub fn bump_reconcile_epoch() {
+    if !is_shmem_available() {
+        return;
+    }
+    RECONCILE_EPOCH
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current reconcile epoch.
+pub fn current_reconcile_epoch() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    RECONCILE_EPOCH
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Flag indicating whether shared memory was initialized via _PG_init.

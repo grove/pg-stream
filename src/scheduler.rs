@@ -38,6 +38,7 @@ use pgrx::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 
+use crate::catalog::{JobStatus, SchedulerJob};
 use crate::catalog::{RefreshRecord, StreamTableMeta};
 use crate::cdc;
 use crate::config;
@@ -275,6 +276,341 @@ pub fn register_scheduler_worker() {
         .load();
 }
 
+// ── Dynamic Refresh Worker (Phase 3) ──────────────────────────────────────
+
+/// Spawn a dynamic refresh worker for a specific job.
+///
+/// The coordinator calls this after enqueuing a job and acquiring a worker
+/// token from shared memory. The database name and job_id are packed into
+/// `bgw_extra` as `"<db_name>\0<job_id>"`.
+///
+/// Returns `Ok(())` on successful spawn, `Err(...)` if the dynamic worker
+/// could not be registered.
+pub fn spawn_refresh_worker(
+    db_name: &str,
+    job_id: i64,
+) -> Result<(), crate::error::PgTrickleError> {
+    // Pack db_name + job_id into bgw_extra (max 128 bytes).
+    let extra = format!("{}\0{}", db_name, job_id);
+    if extra.len() > 128 {
+        return Err(crate::error::PgTrickleError::InternalError(format!(
+            "bgw_extra too long ({} bytes) for db='{}' job_id={}",
+            extra.len(),
+            db_name,
+            job_id
+        )));
+    }
+
+    BackgroundWorkerBuilder::new("pg_trickle refresh worker")
+        .set_function("pg_trickle_refresh_worker_main")
+        .set_library("pg_trickle")
+        .enable_spi_access()
+        .set_extra(&extra)
+        .set_restart_time(None) // no auto-restart — coordinator handles retries
+        .load_dynamic()
+        .map_err(|_| {
+            crate::error::PgTrickleError::InternalError(
+                "Failed to register dynamic refresh worker".into(),
+            )
+        })?;
+
+    Ok(())
+}
+
+/// Main entry point for a dynamic refresh worker (Phase 3).
+///
+/// Each refresh worker:
+/// 1. Parses `db_name` and `job_id` from `bgw_extra`.
+/// 2. Connects to the target database.
+/// 3. Claims the job (QUEUED → RUNNING).
+/// 4. Executes the execution unit (singleton for now, composite later).
+/// 5. Persists the outcome to the job table.
+/// 6. Releases the worker token from shared memory.
+///
+/// # Safety
+/// Called directly by PostgreSQL as a background worker entry point.
+#[pg_guard]
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
+    BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
+
+    // Parse bgw_extra: "db_name\0job_id"
+    let extra = BackgroundWorker::get_extra();
+    let (db_name, job_id) = match parse_worker_extra(extra) {
+        Some(pair) => pair,
+        None => {
+            warning!(
+                "pg_trickle refresh worker: malformed bgw_extra '{}', exiting",
+                extra
+            );
+            shmem::release_worker_token();
+            return;
+        }
+    };
+
+    BackgroundWorker::connect_worker_to_spi(Some(&db_name), None);
+
+    // Get our own PID for logging and job claiming.
+    let my_pid = BackgroundWorker::transaction(AssertUnwindSafe(|| -> i32 {
+        Spi::get_one::<i32>("SELECT pg_backend_pid()")
+            .unwrap_or(Some(0))
+            .unwrap_or(0)
+    }));
+
+    log!(
+        "pg_trickle refresh worker: started (db='{}', job_id={}, pid={})",
+        db_name,
+        job_id,
+        my_pid,
+    );
+
+    // Claim the job: QUEUED → RUNNING
+    let claimed = BackgroundWorker::transaction(AssertUnwindSafe(|| -> bool {
+        SchedulerJob::claim(job_id, my_pid).unwrap_or(false)
+    }));
+
+    if !claimed {
+        log!(
+            "pg_trickle refresh worker: job {} already claimed or cancelled, exiting",
+            job_id
+        );
+        shmem::release_worker_token();
+        return;
+    }
+
+    // Load the job details
+    let job = BackgroundWorker::transaction(AssertUnwindSafe(|| -> Option<SchedulerJob> {
+        SchedulerJob::get_by_id(job_id).ok().flatten()
+    }));
+
+    let job = match job {
+        Some(j) => j,
+        None => {
+            log!(
+                "pg_trickle refresh worker: job {} not found after claim, exiting",
+                job_id
+            );
+            BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                let _ = SchedulerJob::cancel(job_id, "Job row disappeared after claim");
+            }));
+            shmem::release_worker_token();
+            return;
+        }
+    };
+
+    // Validate: DAG version hasn't become obsolete
+    let current_dag_version = shmem::current_dag_version();
+    if (current_dag_version as i64) > job.dag_version + 1 {
+        log!(
+            "pg_trickle refresh worker: job {} dag_version={} is stale (current={}), cancelling",
+            job_id,
+            job.dag_version,
+            current_dag_version,
+        );
+        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            let _ = SchedulerJob::cancel(job_id, "DAG version obsolete");
+        }));
+        shmem::release_worker_token();
+        return;
+    }
+
+    // Execute the unit.
+    // For Phase 3, only singleton units are supported.
+    // Composite units (atomic_group, immediate_closure) will be added in Phase 5.
+    let outcome = BackgroundWorker::transaction(AssertUnwindSafe(|| -> RefreshOutcome {
+        match job.unit_kind.as_str() {
+            "singleton" => execute_worker_singleton(&job),
+            "atomic_group" | "immediate_closure" => {
+                // Phase 5 placeholder — for now, execute each member serially
+                // as if it were a sequence of singletons.
+                log!(
+                    "pg_trickle refresh worker: composite unit '{}' — executing members serially",
+                    job.unit_kind
+                );
+                execute_worker_composite(&job)
+            }
+            _ => {
+                warning!(
+                    "pg_trickle refresh worker: unknown unit_kind '{}' for job {}",
+                    job.unit_kind,
+                    job_id,
+                );
+                RefreshOutcome::PermanentFailure
+            }
+        }
+    }));
+
+    // Persist outcome to the job table
+    let (status, retryable) = match outcome {
+        RefreshOutcome::Success => (JobStatus::Succeeded, None),
+        RefreshOutcome::RetryableFailure => (JobStatus::RetryableFailed, Some(true)),
+        RefreshOutcome::PermanentFailure => (JobStatus::PermanentFailed, Some(false)),
+    };
+
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        let _ = SchedulerJob::complete(job_id, status, None, retryable);
+    }));
+
+    log!(
+        "pg_trickle refresh worker: job {} finished with {} (db='{}')",
+        job_id,
+        status,
+        db_name,
+    );
+
+    // Release the cluster-wide worker token
+    shmem::release_worker_token();
+}
+
+/// Parse the worker's bgw_extra string: "db_name\0job_id".
+fn parse_worker_extra(extra: &str) -> Option<(String, i64)> {
+    let parts: Vec<&str> = extra.splitn(2, '\0').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let db_name = parts[0].to_string();
+    let job_id = parts[1].parse::<i64>().ok()?;
+    if db_name.is_empty() || job_id <= 0 {
+        return None;
+    }
+    Some((db_name, job_id))
+}
+
+/// Execute a singleton unit: refresh a single stream table using the existing inline path.
+fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
+    let pgt_id = job.root_pgt_id;
+    let st = match load_st_by_id(pgt_id) {
+        Some(st) => st,
+        None => {
+            log!(
+                "pg_trickle refresh worker: stream table pgt_id={} not found for job {}",
+                pgt_id,
+                job.job_id,
+            );
+            return RefreshOutcome::PermanentFailure;
+        }
+    };
+
+    if st.status != StStatus::Active && st.status != StStatus::Initializing {
+        log!(
+            "pg_trickle refresh worker: {}.{} is not active (status={}), skipping",
+            st.pgt_schema,
+            st.pgt_name,
+            st.status.as_str(),
+        );
+        return RefreshOutcome::RetryableFailure;
+    }
+
+    let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
+    let has_st_changes = has_stream_table_source_changes(&st);
+    let action = if has_changes && has_st_changes {
+        RefreshAction::Full
+    } else {
+        refresh::determine_refresh_action(&st, has_changes)
+    };
+
+    execute_scheduled_refresh(&st, action)
+}
+
+/// Execute a composite unit (atomic_group or immediate_closure) by refreshing
+/// each member in order. For Phase 3, this is a simple serial execution.
+/// Phase 5 will add proper sub-transaction / SAVEPOINT handling.
+fn execute_worker_composite(job: &SchedulerJob) -> RefreshOutcome {
+    for &pgt_id in &job.member_pgt_ids {
+        let st = match load_st_by_id(pgt_id) {
+            Some(st) => st,
+            None => continue,
+        };
+
+        if st.status != StStatus::Active && st.status != StStatus::Initializing {
+            continue;
+        }
+
+        let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
+        let has_st_changes = has_stream_table_source_changes(&st);
+        let action = if has_changes && has_st_changes {
+            RefreshAction::Full
+        } else {
+            refresh::determine_refresh_action(&st, has_changes)
+        };
+
+        let result = execute_scheduled_refresh(&st, action);
+        match result {
+            RefreshOutcome::Success => continue,
+            RefreshOutcome::RetryableFailure | RefreshOutcome::PermanentFailure => {
+                log!(
+                    "pg_trickle refresh worker: composite unit member {}.{} failed in job {}",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    job.job_id,
+                );
+                return result;
+            }
+        }
+    }
+    RefreshOutcome::Success
+}
+
+/// Reconcile orphaned jobs and worker tokens at scheduler startup.
+///
+/// Called once during per-database scheduler initialization:
+/// 1. Cancels orphaned QUEUED/RUNNING jobs whose PID is no longer alive.
+/// 2. Computes the true active worker count from `pg_stat_activity`.
+/// 3. Corrects the shared-memory token counter if it diverged.
+pub fn reconcile_parallel_state() {
+    // Step 1: Cancel orphaned jobs
+    match SchedulerJob::cancel_orphaned_jobs() {
+        Ok(count) if count > 0 => {
+            log!(
+                "pg_trickle: parallel reconciliation — cancelled {} orphaned job(s)",
+                count
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log!(
+                "pg_trickle: parallel reconciliation — orphan cleanup error: {}",
+                e
+            );
+        }
+    }
+
+    // Step 2: Count live refresh workers from pg_stat_activity
+    let live_workers: u32 = Spi::get_one::<i64>(
+        "SELECT COUNT(*)::bigint FROM pg_stat_activity \
+         WHERE backend_type = 'pg_trickle refresh worker'",
+    )
+    .unwrap_or(Some(0))
+    .unwrap_or(0)
+    .max(0) as u32;
+
+    // Step 3: Correct shared-memory counter if needed
+    let shmem_count = shmem::active_worker_count();
+    if shmem_count != live_workers {
+        log!(
+            "pg_trickle: parallel reconciliation — correcting worker count: shmem={} → live={}",
+            shmem_count,
+            live_workers,
+        );
+        shmem::set_active_worker_count(live_workers);
+        shmem::bump_reconcile_epoch();
+    }
+
+    // Step 4: Prune old completed jobs (keep last 1 hour)
+    match SchedulerJob::prune_completed(3600) {
+        Ok(count) if count > 0 => {
+            log!(
+                "pg_trickle: parallel reconciliation — pruned {} old job(s)",
+                count
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log!("pg_trickle: parallel reconciliation — prune error: {}", e);
+        }
+    }
+}
+
 /// Main entry point for the scheduler background worker.
 ///
 /// # Safety
@@ -366,6 +702,11 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     // Phase 10: Crash recovery — mark any interrupted RUNNING records
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         recover_from_crash();
+    }));
+
+    // Phase 2: Reconcile parallel refresh state (orphaned jobs, worker tokens)
+    BackgroundWorker::transaction(AssertUnwindSafe(|| {
+        reconcile_parallel_state();
     }));
 
     // EC-20: Post-restart CDC TRANSITIONING health check.
@@ -1865,5 +2206,55 @@ mod tests {
     #[test]
     fn test_falling_behind_negative_schedule() {
         assert!(is_falling_behind(100, -1).is_none());
+    }
+
+    // ── parse_worker_extra tests (Phase 3) ──────────────────────────
+
+    #[test]
+    fn test_parse_worker_extra_valid() {
+        let result = parse_worker_extra("mydb\x0042");
+        assert!(result.is_some());
+        let (db, id) = result.unwrap();
+        assert_eq!(db, "mydb");
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn test_parse_worker_extra_long_db_name() {
+        let result = parse_worker_extra("my_production_database\x00999999");
+        assert!(result.is_some());
+        let (db, id) = result.unwrap();
+        assert_eq!(db, "my_production_database");
+        assert_eq!(id, 999999);
+    }
+
+    #[test]
+    fn test_parse_worker_extra_empty() {
+        assert!(parse_worker_extra("").is_none());
+    }
+
+    #[test]
+    fn test_parse_worker_extra_no_separator() {
+        assert!(parse_worker_extra("mydb42").is_none());
+    }
+
+    #[test]
+    fn test_parse_worker_extra_empty_db_name() {
+        assert!(parse_worker_extra("\x0042").is_none());
+    }
+
+    #[test]
+    fn test_parse_worker_extra_invalid_job_id() {
+        assert!(parse_worker_extra("mydb\x00abc").is_none());
+    }
+
+    #[test]
+    fn test_parse_worker_extra_negative_job_id() {
+        assert!(parse_worker_extra("mydb\x00-1").is_none());
+    }
+
+    #[test]
+    fn test_parse_worker_extra_zero_job_id() {
+        assert!(parse_worker_extra("mydb\x000").is_none());
     }
 }

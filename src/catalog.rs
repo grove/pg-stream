@@ -1327,6 +1327,297 @@ impl RefreshRecord {
     }
 }
 
+// ── Scheduler Job (Phase 2: parallel refresh) ─────────────────────────────
+
+/// Status of a scheduler job in the parallel refresh pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    RetryableFailed,
+    PermanentFailed,
+    Cancelled,
+}
+
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Queued => "QUEUED",
+            JobStatus::Running => "RUNNING",
+            JobStatus::Succeeded => "SUCCEEDED",
+            JobStatus::RetryableFailed => "RETRYABLE_FAILED",
+            JobStatus::PermanentFailed => "PERMANENT_FAILED",
+            JobStatus::Cancelled => "CANCELLED",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "QUEUED" => JobStatus::Queued,
+            "RUNNING" => JobStatus::Running,
+            "SUCCEEDED" => JobStatus::Succeeded,
+            "RETRYABLE_FAILED" => JobStatus::RetryableFailed,
+            "PERMANENT_FAILED" => JobStatus::PermanentFailed,
+            "CANCELLED" => JobStatus::Cancelled,
+            _ => JobStatus::Cancelled,
+        }
+    }
+
+    /// Whether this status represents a terminal state.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            JobStatus::Succeeded
+                | JobStatus::RetryableFailed
+                | JobStatus::PermanentFailed
+                | JobStatus::Cancelled
+        )
+    }
+}
+
+impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// A scheduler job row from `pgtrickle.pgt_scheduler_jobs`.
+#[derive(Debug, Clone)]
+pub struct SchedulerJob {
+    pub job_id: i64,
+    pub dag_version: i64,
+    pub unit_key: String,
+    pub unit_kind: String,
+    pub member_pgt_ids: Vec<i64>,
+    pub root_pgt_id: i64,
+    pub status: JobStatus,
+    pub scheduler_pid: i32,
+    pub worker_pid: Option<i32>,
+    pub attempt_no: i32,
+    pub enqueued_at: TimestampWithTimeZone,
+    pub started_at: Option<TimestampWithTimeZone>,
+    pub finished_at: Option<TimestampWithTimeZone>,
+    pub outcome_detail: Option<String>,
+    pub retryable: Option<bool>,
+}
+
+impl SchedulerJob {
+    /// Enqueue a new job in QUEUED status. Returns the assigned `job_id`.
+    pub fn enqueue(
+        dag_version: i64,
+        unit_key: &str,
+        unit_kind: &str,
+        member_pgt_ids: &[i64],
+        root_pgt_id: i64,
+        scheduler_pid: i32,
+        attempt_no: i32,
+    ) -> Result<i64, PgTrickleError> {
+        Spi::connect_mut(|client| {
+            let row = client
+                .update(
+                    "INSERT INTO pgtrickle.pgt_scheduler_jobs \
+                     (dag_version, unit_key, unit_kind, member_pgt_ids, root_pgt_id, \
+                      scheduler_pid, attempt_no) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     RETURNING job_id",
+                    None,
+                    &[
+                        dag_version.into(),
+                        unit_key.into(),
+                        unit_kind.into(),
+                        member_pgt_ids.into(),
+                        root_pgt_id.into(),
+                        scheduler_pid.into(),
+                        attempt_no.into(),
+                    ],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+                .first();
+
+            row.get_one::<i64>()
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+                .ok_or_else(|| {
+                    PgTrickleError::InternalError("INSERT job did not return job_id".into())
+                })
+        })
+    }
+
+    /// Claim a QUEUED job: transition QUEUED → RUNNING and set worker_pid.
+    ///
+    /// Returns `Ok(true)` if the claim succeeded (row was updated),
+    /// `Ok(false)` if the job was already claimed or no longer QUEUED.
+    pub fn claim(job_id: i64, worker_pid: i32) -> Result<bool, PgTrickleError> {
+        Spi::connect_mut(|client| {
+            let result = client
+                .update(
+                    "UPDATE pgtrickle.pgt_scheduler_jobs \
+                     SET status = 'RUNNING', worker_pid = $2, started_at = now() \
+                     WHERE job_id = $1 AND status = 'QUEUED'",
+                    None,
+                    &[job_id.into(), worker_pid.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+            Ok(!result.is_empty())
+        })
+    }
+
+    /// Complete a job: set terminal status, outcome detail, and retryability.
+    pub fn complete(
+        job_id: i64,
+        status: JobStatus,
+        outcome_detail: Option<&str>,
+        retryable: Option<bool>,
+    ) -> Result<(), PgTrickleError> {
+        Spi::connect_mut(|client| {
+            client
+                .update(
+                    "UPDATE pgtrickle.pgt_scheduler_jobs \
+                     SET status = $2, finished_at = now(), \
+                         outcome_detail = $3, retryable = $4 \
+                     WHERE job_id = $1",
+                    None,
+                    &[
+                        job_id.into(),
+                        status.as_str().into(),
+                        outcome_detail.into(),
+                        retryable.into(),
+                    ],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Cancel a job (force to CANCELLED).
+    pub fn cancel(job_id: i64, reason: &str) -> Result<(), PgTrickleError> {
+        Self::complete(job_id, JobStatus::Cancelled, Some(reason), None)
+    }
+
+    /// Load a job by its ID. Returns `None` if not found.
+    pub fn get_by_id(job_id: i64) -> Result<Option<Self>, PgTrickleError> {
+        Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT job_id, dag_version, unit_key, unit_kind, member_pgt_ids, \
+                     root_pgt_id, status, scheduler_pid, worker_pid, attempt_no, \
+                     enqueued_at, started_at, finished_at, outcome_detail, retryable \
+                     FROM pgtrickle.pgt_scheduler_jobs \
+                     WHERE job_id = $1",
+                    None,
+                    &[job_id.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+            if table.is_empty() {
+                return Ok(None);
+            }
+
+            Self::from_spi_table_row(&table.first()).map(Some)
+        })
+    }
+
+    /// Cancel all QUEUED/RUNNING jobs whose worker_pid or scheduler_pid is no
+    /// longer alive. Used for crash recovery / orphaned job cleanup.
+    ///
+    /// Returns the number of jobs cancelled.
+    pub fn cancel_orphaned_jobs() -> Result<i64, PgTrickleError> {
+        Spi::connect_mut(|client| {
+            let result = client
+                .update(
+                    "UPDATE pgtrickle.pgt_scheduler_jobs \
+                     SET status = 'CANCELLED', \
+                         finished_at = now(), \
+                         outcome_detail = 'Cancelled: orphaned after crash recovery' \
+                     WHERE status IN ('QUEUED', 'RUNNING') \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM pg_stat_activity \
+                           WHERE pid = pgt_scheduler_jobs.worker_pid \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM pg_stat_activity \
+                           WHERE pid = pgt_scheduler_jobs.scheduler_pid \
+                       )",
+                    None,
+                    &[],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+            Ok(result.len() as i64)
+        })
+    }
+
+    /// Prune completed/failed/cancelled jobs older than the given age.
+    ///
+    /// Returns the number of rows deleted.
+    pub fn prune_completed(max_age_seconds: i64) -> Result<i64, PgTrickleError> {
+        Spi::connect_mut(|client| {
+            let result = client
+                .update(
+                    "DELETE FROM pgtrickle.pgt_scheduler_jobs \
+                     WHERE status IN ('SUCCEEDED', 'RETRYABLE_FAILED', 'PERMANENT_FAILED', 'CANCELLED') \
+                       AND finished_at < now() - make_interval(secs => $1::float8)",
+                    None,
+                    &[max_age_seconds.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+            Ok(result.len() as i64)
+        })
+    }
+
+    /// Check whether an in-flight (QUEUED or RUNNING) job already exists for
+    /// the given unit_key.
+    pub fn has_inflight_job(unit_key: &str) -> Result<bool, PgTrickleError> {
+        Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT 1 FROM pgtrickle.pgt_scheduler_jobs \
+                     WHERE unit_key = $1 AND status IN ('QUEUED', 'RUNNING') \
+                     LIMIT 1",
+                    None,
+                    &[unit_key.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+            Ok(!table.is_empty())
+        })
+    }
+
+    /// Parse a job row from SPI query results (ordinal column access).
+    ///
+    /// Column order must match the SELECT in `get_by_id`:
+    /// 1=job_id, 2=dag_version, 3=unit_key, 4=unit_kind, 5=member_pgt_ids,
+    /// 6=root_pgt_id, 7=status, 8=scheduler_pid, 9=worker_pid, 10=attempt_no,
+    /// 11=enqueued_at, 12=started_at, 13=finished_at, 14=outcome_detail, 15=retryable
+    fn from_spi_table_row(table: &SpiTupleTable<'_>) -> Result<Self, PgTrickleError> {
+        let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+
+        let status_str: String = table.get::<String>(7).map_err(map_spi)?.unwrap_or_default();
+
+        Ok(Self {
+            job_id: table.get::<i64>(1).map_err(map_spi)?.unwrap_or(0),
+            dag_version: table.get::<i64>(2).map_err(map_spi)?.unwrap_or(0),
+            unit_key: table.get::<String>(3).map_err(map_spi)?.unwrap_or_default(),
+            unit_kind: table.get::<String>(4).map_err(map_spi)?.unwrap_or_default(),
+            member_pgt_ids: table
+                .get::<Vec<i64>>(5)
+                .map_err(map_spi)?
+                .unwrap_or_default(),
+            root_pgt_id: table.get::<i64>(6).map_err(map_spi)?.unwrap_or(0),
+            status: JobStatus::from_str(&status_str),
+            scheduler_pid: table.get::<i32>(8).map_err(map_spi)?.unwrap_or(0),
+            worker_pid: table.get::<i32>(9).map_err(map_spi)?,
+            attempt_no: table.get::<i32>(10).map_err(map_spi)?.unwrap_or(1),
+            enqueued_at: table
+                .get::<TimestampWithTimeZone>(11)
+                .map_err(map_spi)?
+                .ok_or_else(|| PgTrickleError::InternalError("NULL enqueued_at".into()))?,
+            started_at: table.get::<TimestampWithTimeZone>(12).map_err(map_spi)?,
+            finished_at: table.get::<TimestampWithTimeZone>(13).map_err(map_spi)?,
+            outcome_detail: table.get::<String>(14).map_err(map_spi)?,
+            retryable: table.get::<bool>(15).map_err(map_spi)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1388,5 +1679,70 @@ mod tests {
         let mode = CdcMode::Wal;
         let cloned = mode;
         assert_eq!(mode, cloned);
+    }
+
+    // ── JobStatus tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_job_status_as_str() {
+        assert_eq!(JobStatus::Queued.as_str(), "QUEUED");
+        assert_eq!(JobStatus::Running.as_str(), "RUNNING");
+        assert_eq!(JobStatus::Succeeded.as_str(), "SUCCEEDED");
+        assert_eq!(JobStatus::RetryableFailed.as_str(), "RETRYABLE_FAILED");
+        assert_eq!(JobStatus::PermanentFailed.as_str(), "PERMANENT_FAILED");
+        assert_eq!(JobStatus::Cancelled.as_str(), "CANCELLED");
+    }
+
+    #[test]
+    fn test_job_status_from_str_valid() {
+        assert_eq!(JobStatus::from_str("QUEUED"), JobStatus::Queued);
+        assert_eq!(JobStatus::from_str("RUNNING"), JobStatus::Running);
+        assert_eq!(JobStatus::from_str("SUCCEEDED"), JobStatus::Succeeded);
+        assert_eq!(
+            JobStatus::from_str("RETRYABLE_FAILED"),
+            JobStatus::RetryableFailed
+        );
+        assert_eq!(
+            JobStatus::from_str("PERMANENT_FAILED"),
+            JobStatus::PermanentFailed
+        );
+        assert_eq!(JobStatus::from_str("CANCELLED"), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_job_status_from_str_unknown_defaults_to_cancelled() {
+        assert_eq!(JobStatus::from_str(""), JobStatus::Cancelled);
+        assert_eq!(JobStatus::from_str("UNKNOWN"), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_job_status_roundtrip() {
+        for status in [
+            JobStatus::Queued,
+            JobStatus::Running,
+            JobStatus::Succeeded,
+            JobStatus::RetryableFailed,
+            JobStatus::PermanentFailed,
+            JobStatus::Cancelled,
+        ] {
+            assert_eq!(JobStatus::from_str(status.as_str()), status);
+        }
+    }
+
+    #[test]
+    fn test_job_status_is_terminal() {
+        assert!(!JobStatus::Queued.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+        assert!(JobStatus::Succeeded.is_terminal());
+        assert!(JobStatus::RetryableFailed.is_terminal());
+        assert!(JobStatus::PermanentFailed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn test_job_status_display() {
+        assert_eq!(format!("{}", JobStatus::Queued), "QUEUED");
+        assert_eq!(format!("{}", JobStatus::Running), "RUNNING");
+        assert_eq!(format!("{}", JobStatus::Succeeded), "SUCCEEDED");
     }
 }
