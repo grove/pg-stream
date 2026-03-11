@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-10
+> **Last updated:** 2026-03-11
 > **Latest release:** 0.2.3 (scheduled)
-> **Current milestone:** TPC-H Test Suite Enhancements (T1–T6)
+> **Current milestone:** v0.3.0 — DVM Correctness, SAST & Test Coverage
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -20,14 +20,20 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                                   We are here
-                                                    │
-                                                    ▼
- ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
- │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 1.0.0  │ │ 1.x+   │
- │Released│─│Released│─│Released│─│Released│─│Mode & │─│Parallel│─│Compat │─│Observ-│─│Stable │─│Scale &│
- │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Ops Gap│ │Sec/Part│ │& Cloud│ │ability│ │Release│ │Ecosys.│
- └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+                                                                    We are here
+                                                                     │
+                                                                     ▼
+ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+ │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │
+ │Released│─│Released│─│Released│─│Released│─│Mode & │─│DVM Fix │─│Parallel│─│  RLS & │─│Partn., │
+ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Ops Gap│ │SAST&TPC│ │&Perf.  │ │Op.Ctrl │ │DDL&Fuse│
+ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+      │
+      └─ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+         │ 0.7.0  │ │ 0.8.0  │ │ 0.9.0  │ │ 1.0.0  │ │ 1.x+   │
+         │PG16-18,│─│Pooler, │─│Observ. │─│Stable  │─│Scale & │
+         │WM,Cycl.│ │Ext,DDL │ │&Integ. │ │Release │ │Ecosys. │
+         └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
 ```
 
 ---
@@ -453,73 +459,76 @@ validations, resource leaks, and observability holes. Phased from quick wins
 
 ---
 
-## TPC-H Test Suite Enhancements (T1–T6)
+## v0.3.0 — DVM Correctness, SAST & Test Coverage
 
-**Branch:** `test-suite-tpc-h-gaps`  
-**Status:** In Progress — all T1–T6 items implemented.  
-**Ref:** [plans/testing/TEST_SUITE_TPC_H-GAPS.md](plans/testing/TEST_SUITE_TPC_H-GAPS.md)
+**Goal:** Re-enable all 18 previously-ignored DVM correctness E2E tests by
+fixing HAVING, FULL OUTER JOIN, correlated EXISTS+HAVING, and correlated scalar
+subquery differential computation bugs. Harden the SAST toolchain with
+privilege-context rules and an unsafe-block baseline. Expand TPC-H coverage
+with rollback, mode-comparison, single-row, and DAG tests.
 
-Second wave of TPC-H correctness coverage, building on the 22/22 passing
-DIFFERENTIAL baseline. No `src/` changes — test-only additions.
-
-| Item | Description | Status |
-|------|-------------|--------|
-| T1 | `__pgt_count < 0` guard in `assert_tpch_invariant` (over-retraction detector) | ✅ Done |
-| T2 | Skip-set regression guard in DIFFERENTIAL + IMMEDIATE tests (allowlist-based) | ✅ Done |
-| T3 | `test_tpch_immediate_rollback` — verify ROLLBACK restores IVM ST atomically | ✅ Done |
-| T4 | `test_tpch_differential_vs_immediate` — compare both incremental modes directly | ✅ Done |
-| T5 | `test_tpch_single_row_mutations` + SQL fixtures — single-row IVM trigger paths | ✅ Done |
-| T6a | `test_tpch_dag_chain` — two-level DAG (Q01 → filtered projection), DIFFERENTIAL | ✅ Done |
-| T6b | `test_tpch_dag_multi_parent` — multi-parent fan-in (Q01 + Q06 → union), DIFFERENTIAL | ✅ Done |
-
-> No changes to `src/`, `.github/workflows/ci.yml`, `justfile`, or upgrade scripts.
-
----
-
-## SAST Program (Phases 1–3)
-
-**Branch:** `sast-review-1`  
-**Status:** Phases 1–3 complete.  
-**Ref:** [plans/testing/PLAN_SAST.md](plans/testing/PLAN_SAST.md)
-
-Incremental SAST (Static Application Security Testing) rollout. Phases 0–1
-(CodeQL, cargo deny, initial Semgrep, first alert triage) merged via the
-`codeql-workflow` branch and were detailed in the v0.2.3 changelog. This
-branch implements Phases 2–3 and CI workflow tuning.
+### DVM Correctness Fixes
 
 | Item | Description | Status |
 |------|-------------|--------|
-| S1 | Remove `pull_request` trigger from CodeQL + Semgrep workflows | ✅ Done |
-| S2 | `sql.row-security.disabled` Semgrep rule | ✅ Done |
-| S3 | `sql.set-role.present` Semgrep rule | ✅ Done |
-| S4 | Updated `sql.security-definer.present` message: explicit `SET search_path` guidance | ✅ Done |
-| S5 | `scripts/unsafe_inventory.sh` — per-file `unsafe {` counter | ✅ Done |
-| S6 | `.unsafe-baseline` — committed baseline (1309 blocks across 6 files) | ✅ Done |
-| S7 | `.github/workflows/unsafe-inventory.yml` — advisory CI workflow | ✅ Done |
-| S8 | `just unsafe-inventory` recipe | ✅ Done |
+| DC1 | HAVING clause differential correctness — fix `COUNT(*)` rewrite and threshold-crossing upward rescan (5 tests un-ignored) | ✅ Done |
+| DC2 | FULL OUTER JOIN differential correctness — fix row-id mismatch, compound GROUP BY expressions, SUM NULL semantics, and rescan CTE SELECT list (5 tests un-ignored) | ✅ Done |
+| DC3 | Correlated EXISTS with HAVING differential correctness — fix EXISTS sublink parser discarding GROUP BY/HAVING, row-id mismatch for `Project(SemiJoin)`, and `diff_project` row-id recomputation (1 test un-ignored) | ✅ Done |
+| DC4 | Correlated scalar subquery differential correctness — `rewrite_correlated_scalar_in_select` rewrites correlated scalar subqueries to LEFT JOINs before DVM parsing (2 tests un-ignored) | ✅ Done |
 
-**Next (Phase 4):** promote high-confidence Semgrep rules from advisory to
-blocking after the privilege-context rules have been validated against v0.3.0
-RLS/SECURITY DEFINER work.
+> **DVM correctness subtotal: 18 previously-ignored E2E tests re-enabled (0 remaining)**
+
+### SAST Program (Phases 1–3)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| S1 | CodeQL + `cargo deny` + initial Semgrep baseline — zero findings across 115 Rust source files | ✅ Done |
+| S2 | Narrow `rust.panic-in-sql-path` scope — exclude `src/dvm/**` and `src/bin/**` to eliminate 351 false-positive alerts | ✅ Done |
+| S3 | `sql.row-security.disabled` Semgrep rule — flag `SET LOCAL row_security = off` | ✅ Done |
+| S4 | `sql.set-role.present` Semgrep rule — flag `SET ROLE` / `RESET ROLE` patterns | ✅ Done |
+| S5 | Updated `sql.security-definer.present` message to require explicit `SET search_path` | ✅ Done |
+| S6 | `scripts/unsafe_inventory.sh` + `.unsafe-baseline` — per-file `unsafe {` counter with committed baseline (1309 blocks across 6 files) | ✅ Done |
+| S7 | `.github/workflows/unsafe-inventory.yml` — advisory CI workflow; fails if any file exceeds its baseline | ✅ Done |
+| S8 | Remove `pull_request` trigger from CodeQL + Semgrep workflows (no inline PR annotations; runs on push-to-main + weekly schedule) | ✅ Done |
+
+> **SAST subtotal: Phases 1–3 complete; Phase 4 rule promotion tracked as post-v0.3.0 cleanup**
+
+### TPC-H Test Suite Enhancements (T1–T6)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| T1 | `__pgt_count < 0` guard in `assert_tpch_invariant` — over-retraction detector, applies to all existing TPC-H tests | ✅ Done |
+| T2 | Skip-set regression guard in DIFFERENTIAL + IMMEDIATE tests — any newly skipped query not in the allowlist fails CI | ✅ Done |
+| T3 | `test_tpch_immediate_rollback` — verify ROLLBACK restores IVM stream table atomically across RF mutations | ✅ Done |
+| T4 | `test_tpch_differential_vs_immediate` — side-by-side comparison: both incremental modes produce identical results after shared mutations | ✅ Done |
+| T5 | `test_tpch_single_row_mutations` + SQL fixtures — single-row INSERT/UPDATE/DELETE IVM trigger paths on Q01/Q06/Q03 | ✅ Done |
+| T6a | `test_tpch_dag_chain` — two-level DAG (Q01 → filtered projection), refreshed in topological order | ✅ Done |
+| T6b | `test_tpch_dag_multi_parent` — multi-parent fan-in (Q01 + Q06 → UNION ALL), DIFFERENTIAL mode | ✅ Done |
+
+> **TPC-H subtotal: T1–T6 complete; 22/22 TPC-H queries passing**
+
+**Exit criteria:**
+- [x] All 18 previously-ignored DVM correctness E2E tests re-enabled
+- [x] SAST Phases 1–3 deployed; unsafe baseline committed; CodeQL zero findings
+- [x] TPC-H T1–T6 implemented; rollback, differential-vs-immediate, single-row, and DAG tests pass
+- [ ] Extension upgrade path tested (`0.2.3 → 0.3.0`)
 
 ---
 
-## v0.3.0 — Parallel Refresh, Security & Partitioning
+## v0.4.0 — Parallel Refresh & Performance Hardening
 
-**Goal:** Deliver true parallel refresh first, then harden security (RLS) and
-validate partitioned sources so the extension is safer to deploy in
-multi-tenant and real-world schemas.
+**Goal:** Deliver true parallel refresh, cut write-side CDC overhead with
+statement-level triggers, close a cross-source snapshot consistency gap, and
+ship quick ergonomic and infrastructure improvements. Together these close the
+main performance and operational gaps before the security and partitioning
+work begins.
 
 ### Parallel Refresh
 
-Detailed implementation is now tracked in
+Detailed implementation is tracked in
 [PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md). The older
 [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md)
 remains the options-analysis precursor.
-
-This milestone is expected to improve refresh throughput and freshness latency
-for independent work, but not materially raise source-table write throughput on
-the current trigger-based CDC path.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -528,6 +537,66 @@ the current trigger-based CDC path.
 | P3 | Phase 5–7: composite units, observability, rollout gating, and CI validation | 12–24h | [PLAN_PARALLELISM.md §10](plans/sql/PLAN_PARALLELISM.md) |
 
 > **Parallel refresh subtotal: ~40–72 hours**
+
+### Statement-Level CDC Triggers
+
+Replace per-row AFTER triggers with statement-level triggers using
+`NEW TABLE AS __pgt_new` / `OLD TABLE AS __pgt_old`. Expected write-side
+trigger overhead reduction of 50–80% for bulk DML; neutral for single-row.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| B1 | Replace per-row triggers with statement-level triggers; INSERT/UPDATE/DELETE via set-based buffer fill | 8h | [PLAN_PERFORMANCE_PART_9.md](plans/performance/PLAN_PERFORMANCE_PART_9.md) §Session 3 |
+| B2 | `pg_trickle.cdc_trigger_mode = 'statement'\|'row'` GUC + migration to replace row-level triggers on `ALTER EXTENSION UPDATE` | 4h | [PLAN_PERFORMANCE_PART_9.md](plans/performance/PLAN_PERFORMANCE_PART_9.md) §Session 3 |
+| B3 | Write-side benchmark matrix (narrow/medium/wide tables × bulk/single DML) | 2h | [PLAN_PERFORMANCE_PART_9.md](plans/performance/PLAN_PERFORMANCE_PART_9.md) §Session 3 |
+
+> **Statement-level CDC subtotal: ~14 hours**
+
+### Cross-Source Snapshot Consistency (Phase 1)
+
+At start of each scheduler tick, snapshot `pg_current_wal_lsn()` as a
+`tick_watermark` and cap all CDC consumption to that LSN. Zero user
+configuration — prevents interleaved reads from two sources that were
+updated in the same transaction from producing an inconsistent stream table.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| CSS1 | LSN tick watermark: snapshot `pg_current_wal_lsn()` per tick; cap frontier advance; log in `pgt_refresh_history`; `pg_trickle.tick_watermark_enabled` GUC (default `on`) | 3–4h | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) §Approach C |
+
+> **Cross-source consistency subtotal: ~3–4 hours**
+
+### Ergonomic Hardening
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ERG-B | Warn at `_PG_init` when `cdc_mode='auto'` but `wal_level != 'logical'` — prevents silent trigger-only operation | 30min | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §B |
+| ERG-C | Warn at `create_stream_table` when source has no primary key — surfaces keyless duplicate-row risk | 1h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §C |
+| ERG-F | Emit `WARNING` when `alter_stream_table` triggers an implicit full refresh | 1h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §F |
+
+> **Ergonomic hardening subtotal: ~2.5 hours**
+
+### Code Coverage
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| COV | Codecov integration: move token to `with:`, add `codecov.yml` with patch targets for `src/dvm/`, add README badge, verify first upload | 1–2h | [PLAN_CODECOV.md](plans/infra/PLAN_CODECOV.md) |
+
+> **v0.4.0 total: ~60–94 hours**
+
+**Exit criteria:**
+- [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
+- [ ] Statement-level CDC triggers pass full E2E suite; write overhead benchmarked
+- [ ] LSN tick watermark active by default; no interleaved-source inconsistency in E2E tests
+- [ ] Codecov badge on README; coverage report uploading
+- [ ] Extension upgrade path tested (`0.3.0 → 0.4.0`)
+
+---
+
+## v0.5.0 — Row-Level Security & Operational Controls
+
+**Goal:** Harden the security context for stream tables and IVM triggers,
+add source-level pause/resume gating for bulk-load coordination, and deliver
+small ergonomic improvements.
 
 ### Row-Level Security (RLS) Support
 
@@ -551,12 +620,54 @@ tracking. Phase 4 (per-role `security_invoker`) is deferred to post-1.0.
 
 > **RLS subtotal: ~8–12 hours** (Phase 4 `security_invoker` deferred to post-1.0)
 
-### Partitioning Support (Source Tables)
+### Bootstrap Source Gating
 
-Partitioned source tables already work with trigger-based CDC (PG 13+ trigger
-propagation), but there are validation gaps, missing tests, and an ATTACH
-PARTITION detection hole. This section addresses the near-term items only;
-partitioned storage tables are deferred to a future release.
+Allow operators to pause CDC consumption for specific source tables (e.g.
+during bulk loads or ETL windows) without dropping and recreating stream
+tables. The scheduler skips any stream table whose transitive source set
+intersects the current gated set.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| BOOT-1 | `pgtrickle.pgt_source_gates` catalog table (`source_relid`, `gated`, `gated_at`, `gated_by`) | 30min | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-2 | `gate_source(source TEXT)` SQL function — sets gate, pg_notify scheduler | 1h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-3 | `ungate_source(source TEXT)` + `source_gates()` introspection view | 30min | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-4 | Scheduler integration: load gated-source set per tick; skip and log `SKIP` in `pgt_refresh_history` | 2–3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-5 | E2E tests: single-source gate, coordinated multi-source, partial DAG, bootstrap with `initialize => false` | 3–4h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+
+> **Bootstrap source gating subtotal: ~7–9 hours**
+
+### Ergonomics & API Polish
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ERG-D | Record manual `refresh_stream_table()` calls in `pgt_refresh_history` with `initiated_by='MANUAL'` | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §D |
+| ERG-E | `pgtrickle.quick_health` view — single-row status summary (`total_stream_tables`, `error_tables`, `stale_tables`, `scheduler_running`, `status`) | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §E |
+| COR-2 | `create_stream_table_if_not_exists()` convenience wrapper | 30min | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) §COR-2 |
+| NAT-CALL | `CREATE PROCEDURE` wrappers for all four main SQL functions — enables `CALL pgtrickle.create_stream_table(...)` syntax | 1h | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §Tier 1.5 |
+
+> **Ergonomics subtotal: ~5.5–6 hours**
+
+> **v0.5.0 total: ~21–27 hours**
+
+**Exit criteria:**
+- [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
+- [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
+- [ ] `gate_source` / `ungate_source` operational; scheduler skips gated sources correctly
+- [ ] `quick_health` view and `create_stream_table_if_not_exists` available
+- [ ] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
+- [ ] Extension upgrade path tested (`0.4.0 → 0.5.0`)
+
+---
+
+## v0.6.0 — Partitioning, Idempotent DDL & Anomaly Detection
+
+**Goal:** Validate partitioned source tables, add `create_or_replace_stream_table`
+for idempotent deployments (critical for dbt and migration workflows), protect
+against anomalous change spikes with a configurable fuse, and lay the
+foundation for circular stream table DAGs.
+
+### Partitioning Support (Source Tables)
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -568,31 +679,73 @@ partitioned storage tables are deferred to a future release.
 
 > **Partitioning subtotal: ~18–32 hours**
 
-> **v0.3.0 total: ~66–116 hours**
+### Idempotent DDL (`create_or_replace`)
+
+`create_or_replace_stream_table()` performs a smart diff: no-op if identical,
+in-place alter for config-only changes, schema migration for ADD/DROP column,
+full rebuild for incompatible changes. Eliminates the drop-and-recreate
+pattern used by the dbt materialization macro.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| COR-1 | `create_or_replace_stream_table()` core + `compute_config_diff()` utility | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| COR-3 | dbt materialization macro updated to use `create_or_replace` instead of drop+create | 2h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| COR-4 | Upgrade SQL + documentation (SQL_REFERENCE, FAQ) | 2.5h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| COR-5 | 13 E2E tests in `e2e_create_or_replace_tests.rs` | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+
+> **Idempotent DDL subtotal: ~12–13 hours**
+
+### Anomalous Change Detection (Fuse)
+
+Per-stream-table fuse that blows when the change buffer row count exceeds a
+configurable fixed ceiling or an adaptive μ+kσ threshold derived from
+`pgt_refresh_history`. A blown fuse halts refresh and emits a
+`pgtrickle_alert` NOTIFY; `reset_fuse()` resumes with a chosen recovery
+action.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| FUSE-1 | Catalog: fuse state columns on `pgt_stream_tables` (`fuse_mode`, `fuse_state`, `fuse_ceiling`, `fuse_sensitivity`, `blown_at`, `blow_reason`) | 1–2h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-2 | `alter_stream_table()` new params: `fuse`, `fuse_ceiling`, `fuse_sensitivity` | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-3 | `reset_fuse(name, action => 'apply'\|'reinitialize'\|'skip_changes')` SQL function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-4 | `fuse_status()` introspection function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-5 | Scheduler pre-check: count change buffer rows; evaluate threshold; blow fuse + NOTIFY if exceeded | 2–3h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-6 | E2E tests: normal baseline, spike → blow, reset, diamond/DAG interaction | 4–6h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+
+> **Anomalous change detection subtotal: ~10–14 hours**
+
+### Circular Dependency Foundation
+
+Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| CYC-1 | Tarjan's SCC algorithm in `src/dag.rs`: `Scc` struct, `compute_sccs()`, `condensation_order()` | ~2h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 1 |
+| CYC-2 | Monotonicity checker in `src/dvm/parser.rs`: `check_monotonicity(OpTree)` rejects non-monotone cycles (AGG, EXCEPT, WINDOW, AntiJoin, DISTINCT) | ~1h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 2 |
+| CYC-3 | Catalog: `scc_id INT` on `pgt_stream_tables`; `fixpoint_iteration INT` on `pgt_refresh_history`; migration SQL | ~1h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 3 |
+| CYC-4 | GUCs: `pg_trickle.max_fixpoint_iterations` (default 100), `pg_trickle.allow_circular` (default false) | ~30min | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 4 |
+
+> **Circular dependency foundation subtotal: ~4.5 hours**
+
+> **v0.6.0 total: ~45–62 hours**
 
 **Exit criteria:**
-- [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
-- [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
-- [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
-- [ ] Extension upgrade path tested (`0.2.3 → 0.3.0`)
+- [ ] WAL mode works with `publish_via_partition_root = true`
+- [ ] `create_or_replace_stream_table` deployed; dbt macro updated
+- [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers
+- [ ] SCC algorithm in place; monotonicity checker rejects non-monotone cycles
+- [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
 ---
 
-## v0.4.0 — Backward Compatibility, Cloud & Scale
+## v0.7.0 — PostgreSQL Backward Compatibility, Watermarks & Circular DAGs
 
-**Goal:** Widen the deployment target from PG 18-only to PG 16–18, enable
-compatibility with connection poolers (PgBouncer transaction mode), and
-validate correctness against external test corpora. After this milestone the
-extension is suitable for production use on mainstream PostgreSQL deployments
-including cloud providers.
+**Goal:** Widen the deployment target to PG 16–18, add user-injected temporal
+watermark gating for batch-ETL coordination, and complete the fixpoint
+scheduler for circular stream table DAGs.
 
 ### PostgreSQL Backward Compatibility (PG 16–18)
-
-pg_trickle currently targets PG 18 only. pgrx 0.17.0 supports PG 13–18 via
-feature flags. Starting with PG 16–18 minimizes scope (only JSON_TABLE gating
-needed) while widening the deployment target for the production-ready release.
-PG 14–15 support can follow in a later release.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -604,13 +757,64 @@ PG 14–15 support can follow in a later release.
 
 > **Backward compatibility subtotal: ~38–56 hours**
 
+### Watermark Gating
+
+Let producers signal their progress so the scheduler only refreshes stream
+tables when all contributing sources are aligned within a configurable
+tolerance. The primary use case is nightly batch ETL pipelines where multiple
+source tables are populated on different schedules.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| WM-1 | Catalog: `pgt_watermarks` table (`source_relid`, `current_watermark`, `updated_at`, `wal_lsn_at_advance`); `pgt_watermark_groups` table (`group_name`, `sources`, `tolerance`) | 2h | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
+| WM-2 | `advance_watermark(source, watermark)` — monotonicity check, store LSN alongside watermark, lightweight scheduler signal | 2h | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
+| WM-3 | `create_watermark_group(name, sources[], tolerance)` / `drop_watermark_group()` | 2h | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
+| WM-4 | Scheduler pre-check: evaluate watermark alignment predicate; skip + log `SKIP(watermark_misaligned)` if not aligned | 3–4h | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
+| WM-5 | `watermarks()`, `watermark_groups()`, `watermark_status()` introspection functions | 2h | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
+| WM-6 | E2E tests: nightly ETL, micro-batch tolerance, multiple pipelines, mixed external+internal sources | 6–8h | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
+
+> **Watermark gating subtotal: ~17–20 hours**
+
+### Circular Dependencies — Scheduler Integration
+
+Completes the SCC foundation from v0.6.0 with a working fixpoint iteration
+loop. Stream tables in a monotone cycle are refreshed repeatedly until
+convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| CYC-5 | Scheduler fixpoint iteration: `iterate_to_fixpoint()`, convergence detection from `(rows_inserted, rows_deleted)`, non-convergence → `ERROR` status | ~8h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 5 |
+| CYC-6 | Creation-time validation: allow monotone cycles when `allow_circular=true`; assign `scc_id`; recompute SCCs on `drop_stream_table` | ~3h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 6 |
+| CYC-7 | Monitoring: `scc_id` + `last_fixpoint_iterations` in views; `pgtrickle.pgt_scc_status()` function | ~2h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 7 |
+| CYC-8 | Documentation + E2E tests (`e2e_circular_tests.rs`): 6 scenarios (monotone cycle, non-monotone reject, convergence, non-convergence→ERROR, drop breaks cycle, `allow_circular=false` default) | ~6h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 8 |
+
+> **Circular dependencies subtotal: ~19 hours**
+
+> **v0.7.0 total: ~74–95 hours**
+
+**Exit criteria:**
+- [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
+- [ ] WAL decoder validated against PG 16–17 `pgoutput` format
+- [ ] CI matrix covers PG 16, 17, 18
+- [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
+- [ ] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
+- [ ] Extension upgrade path tested (`0.6.0 → 0.7.0`)
+
+---
+
+## v0.8.0 — Connection Pooler, External Tests & Native DDL Syntax
+
+**Goal:** Enable cloud-native PgBouncer transaction-mode deployments, validate
+correctness against independent query corpora, and add `CREATE MATERIALIZED
+VIEW … WITH (pgtrickle.stream = true)` DDL syntax so stream tables feel native
+to PostgreSQL tooling (pg_dump, ORMs, `\dm`). Requires
+`shared_preload_libraries`.
+
 ### Connection Pooler Compatibility
 
-PgBouncer transaction-mode pooling is the default at many cloud providers
-(RDS Proxy, Supabase, Neon). pg_trickle uses session-level advisory locks and
-`PREPARE` statements that are incompatible with transaction-mode pooling.
-This section replaces all session-scoped state with transaction-scoped
-equivalents to enable cloud-native deployments.
+pg_trickle uses session-level advisory locks and `PREPARE` statements that are
+incompatible with PgBouncer transaction-mode pooling. This section replaces all
+session-scoped state with transaction-scoped equivalents.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -632,22 +836,37 @@ Validate correctness against independent query corpora beyond TPC-H.
 
 > **External test suites subtotal: ~4–7 days**
 
-> **v0.4.0 total: ~160–208 hours**
+### Native DDL Syntax
+
+Intercept `CREATE/DROP/REFRESH MATERIALIZED VIEW` via `ProcessUtility_hook`
+and route stream-table variants through the existing internal implementations.
+Allows existing SQL tooling — pg_dump, `\dm`, ORMs — to interact with stream
+tables naturally without calling `pgtrickle.create_stream_table()`.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| NAT-1 | `ProcessUtility_hook` infrastructure: register in `_PG_init()`, dispatch+passthrough, hook chaining with TimescaleDB/pg_stat_statements | 3–5d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §Tier 2 |
+| NAT-2 | CREATE/DROP/REFRESH interception: parse `CreateTableAsStmt` reloptions, route to internal impls, IF EXISTS handling, CONCURRENTLY no-op | 8–13d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §Tier 2 |
+| NAT-3 | E2E tests: CREATE/DROP/REFRESH via DDL syntax, hook chaining, non-pg_trickle matview passthrough | 2–3d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §Tier 2 |
+
+> **Native DDL syntax subtotal: ~13–21 days**
+
+> **v0.8.0 total: ~200–300+ hours**
 
 **Exit criteria:**
-- [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
-- [ ] WAL decoder validated against PG 16–17 `pgoutput` format
-- [ ] CI matrix covers PG 16, 17, 18
 - [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
 - [ ] At least one external test corpus (sqllogictest, JOB, or Nexmark) passes
+- [ ] `CREATE MATERIALIZED VIEW … WITH (pgtrickle.stream = true)` creates a stream table
+- [ ] Hook chaining verified with TimescaleDB; non-pgtrickle matviews pass through unchanged
+- [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
 
 ---
 
-## v0.5.0 — Observability & Integration
+## v0.9.0 — Observability & Integration
 
-**Goal:** Prometheus/Grafana observability, dbt-pgtrickle formal release,
-complete documentation review, and validated upgrade path. After this
-milestone the product is externally visible and monitored.
+**Goal:** Prometheus/Grafana observability, dbt-pgtrickle formal release, and
+complete documentation review. After this milestone the product is externally
+visible and monitored.
 
 ### Observability
 
@@ -660,15 +879,29 @@ milestone the product is externally visible and monitored.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| R5 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
-| R6 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
+| I1 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
+| I2 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
 
-> **v0.5.0 total: ~14–21 hours**
+### pg_dump / pg_restore Support
+
+Complete the native DDL story: teach pg_dump to emit `CREATE MATERIALIZED VIEW
+… WITH (pgtrickle.stream = true)` for stream tables and add an event trigger
+that re-links orphaned catalog entries on extension restore.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| NAT-DUMP | `generate_dump()` + `restore_stream_tables()` companion functions; event trigger on extension load for orphaned catalog entries | 3–4d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
+| NAT-TEST | E2E tests: pg_dump round-trip, restore from backup, orphaned-entry recovery | 2–3d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
+
+> **pg_dump support subtotal: ~5–7 days**
+
+> **v0.9.0 total: ~54–77 hours**
 
 **Exit criteria:**
 - [ ] Grafana dashboard published
 - [ ] dbt-pgtrickle 0.1.0 on PyPI
-- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.4.0 → 0.5.0`)
+- [ ] pg_dump round-trip produces valid, restorable SQL for stream tables
+- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.8.0 → 0.9.0`)
 - [ ] All public documentation current and reviewed
 
 ---
@@ -694,7 +927,7 @@ distribution — getting pg_trickle onto package registries.
 - [ ] Published on PGXN and Docker Hub
 - [x] CNPG extension image published to GHCR (`pg_trickle-ext`)
 - [x] CNPG cluster-example.yaml validated (Image Volume approach)
-- [ ] Upgrade path from v0.5.0 tested
+- [ ] Upgrade path from v0.9.0 tested
 - [ ] Semantic versioning policy in effect
 
 ---
@@ -744,12 +977,16 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.2.0 — TopK, Diamond & Transactional IVM | ✔️ Complete | 62–78h | ✅ Released |
 | v0.2.1 — Upgrade Infrastructure & Documentation | ~8h | 70–86h | ✅ Released |
 | v0.2.2 — OFFSET Support, ALTER QUERY & Upgrade Tooling | ~50–70h | 120–156h | ✅ Released |
-| v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | |
-| v0.3.0 — Parallel Refresh, Security & Partitioning | 66–116h | 231–338h | |
-| v0.4.0 — Backward Compatibility, Cloud & Scale | 160–208h | 391–546h | |
-| v0.5.0 — Observability & Integration | 14–21h | 405–567h | |
-| v1.0.0 — Stable release | 18–27h | 423–594h | |
-| Post-1.0 (ecosystem) | 88–134h | 511–728h | |
+| v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | ✅ Released |
+| v0.3.0 — DVM Correctness, SAST & Test Coverage | ~20–30h | 185–252h | |
+| v0.4.0 — Parallel Refresh & Performance Hardening | ~60–94h | 245–346h | |
+| v0.5.0 — Row-Level Security & Operational Controls | ~21–27h | 266–373h | |
+| v0.6.0 — Partitioning, Idempotent DDL & Anomaly Detection | ~45–62h | 311–435h | |
+| v0.7.0 — PostgreSQL Backward Compatibility, Watermarks & Circular DAGs | ~74–95h | 385–530h | |
+| v0.8.0 — Connection Pooler, External Tests & Native DDL Syntax | ~200–300h | 585–830h | |
+| v0.9.0 — Observability, Integration & pg_dump Support | ~54–77h | 639–907h | |
+| v1.0.0 — Stable release | 18–27h | 657–934h | |
+| Post-1.0 (ecosystem) | 88–134h | 569–814h | |
 | Post-1.0 (scale) | 6+ months | — | |
 
 ---
