@@ -546,11 +546,29 @@ impl E2eDb {
     ///
     /// This creates all catalog tables, views, event triggers, and
     /// SQL functions in the `pg_trickle` schema.
+    ///
+    /// If the `PGT_PARALLEL_MODE` environment variable is set to `on` or
+    /// `dry_run`, the parallel refresh mode GUC is enabled for this
+    /// database after extension creation.
     pub async fn with_extension(self) -> Self {
         sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE")
             .execute(&self.pool)
             .await
             .expect("Failed to CREATE EXTENSION pg_trickle");
+
+        if let Ok(mode) = std::env::var("PGT_PARALLEL_MODE") {
+            let mode = mode.to_ascii_lowercase();
+            if mode == "on" || mode == "dry_run" {
+                let sql = format!(
+                    "ALTER SYSTEM SET pg_trickle.parallel_refresh_mode = '{}'",
+                    mode
+                );
+                self.execute(&sql).await;
+                self.execute("SELECT pg_reload_conf()").await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
         self
     }
 

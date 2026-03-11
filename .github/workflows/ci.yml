@@ -212,6 +212,12 @@ jobs:
           cargo test --test e2e_tpch_tests -- \
             --ignored --test-threads=1 --nocapture
 
+      - name: Run E2E tests with parallel refresh mode
+        env:
+          PGT_PARALLEL_MODE: "on"
+        run: |
+          cargo test --test 'e2e_*' -- --test-threads=1
+
   # ── Upgrade completeness check (every PR) ───────────────────────────────
   # Lightweight: validates that the upgrade SQL script covers all objects
   # in the pgrx-generated full install script. No Docker needed.
