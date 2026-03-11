@@ -691,12 +691,11 @@ async fn test_tpch_differential_correctness() {
             );
 
             // CHECKPOINT flushes WAL so it can be recycled.
-            // VACUUM FULL compacts table files and returns dead-tuple space
-            // to the OS — plain VACUUM only marks space as reusable within
-            // PostgreSQL's files, which causes the data directory to grow
-            // unboundedly across the 22-query loop.
+            // VACUUM ANALYZE reclaims dead tuples and updates statistics.
+            // At SF=0.01 with 2-3 cycles the disk growth is negligible, so
+            // the full table rewrite of VACUUM FULL is not needed here.
             db.execute("CHECKPOINT").await;
-            db.execute("VACUUM (FULL, ANALYZE)").await;
+            db.execute("VACUUM ANALYZE").await;
         }
 
         if dvm_ok {
@@ -881,10 +880,11 @@ async fn test_tpch_cross_query_consistency() {
         }
         active = next_active;
 
-        // Final VACUUM FULL compacts table files and returns dead-tuple
-        // space to the OS after all refreshes in this cycle are done.
+        // VACUUM ANALYZE reclaims dead tuples and updates statistics after
+        // all refreshes in this cycle. At SF=0.01 with few cycles, full
+        // compaction via VACUUM FULL is not needed.
         db.execute("CHECKPOINT").await;
-        db.execute("VACUUM (FULL, ANALYZE)").await;
+        db.execute("VACUUM ANALYZE").await;
 
         println!(
             "  Cycle {}/{} — {} STs verified — {:.0}ms ✓",
@@ -1024,10 +1024,11 @@ async fn test_tpch_full_vs_differential() {
                 ))
                 .await;
 
-            // Reclaim dead-tuple bloat between cycles. VACUUM FULL compacts
-            // files and returns space to the OS; plain VACUUM does not.
+            // Reclaim dead-tuple bloat between cycles with VACUUM ANALYZE.
+            // At SF=0.01 with few cycles, the full rewrite of VACUUM FULL
+            // is unnecessary overhead.
             db.execute("CHECKPOINT").await;
-            db.execute("VACUUM (FULL, ANALYZE)").await;
+            db.execute("VACUUM ANALYZE").await;
 
             if !matches {
                 let full_count: i64 = db
@@ -1159,7 +1160,7 @@ async fn test_tpch_q07_isolation() {
             }
         }
         db.execute("CHECKPOINT").await;
-        db.execute("VACUUM (FULL, ANALYZE)").await;
+        db.execute("VACUUM ANALYZE").await;
     }
 
     let _ = db
@@ -1277,7 +1278,7 @@ async fn test_tpch_performance_comparison() {
             diff_times.push(t_diff.elapsed().as_secs_f64() * 1000.0);
 
             db.execute("CHECKPOINT").await;
-            db.execute("VACUUM (FULL, ANALYZE)").await;
+            db.execute("VACUUM ANALYZE").await;
         }
 
         if ok {
@@ -1784,7 +1785,7 @@ async fn test_tpch_immediate_correctness() {
             );
 
             db.execute("CHECKPOINT").await;
-            db.execute("VACUUM (FULL, ANALYZE)").await;
+            db.execute("VACUUM ANALYZE").await;
         }
 
         if ivm_ok {
@@ -2262,7 +2263,7 @@ async fn test_tpch_differential_vs_immediate() {
                 .await;
 
             db.execute("CHECKPOINT").await;
-            db.execute("VACUUM (FULL, ANALYZE)").await;
+            db.execute("VACUUM ANALYZE").await;
 
             if !agrees {
                 let diff_count: i64 = db
