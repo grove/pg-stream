@@ -1162,8 +1162,10 @@ fn alter_stream_table_query(
         refresh::prewarm_merge_cache(&st);
     }
 
-    pgrx::info!(
-        "Stream table {}.{} ALTER QUERY completed (schema change: {})",
+    // ERG-F: warn so the client sees the full refresh regardless of log_min_messages.
+    pgrx::warning!(
+        "pg_trickle: stream table {}.{} ALTER QUERY applied a full refresh \
+         (schema change: {}). This may take time on large tables.",
         schema,
         table_name,
         match &schema_change {
@@ -1650,8 +1652,10 @@ fn alter_stream_table_impl(
             let updated_st = StreamTableMeta::get_by_name(&schema, &table_name)?;
             execute_manual_full_refresh(&updated_st, &schema, &table_name, &source_oids)?;
 
-            pgrx::info!(
-                "Stream table {}.{} switched from {} to {} mode (full refresh applied)",
+            // ERG-F: warn so the client sees the implicit full refresh regardless of log_min_messages.
+            pgrx::warning!(
+                "pg_trickle: stream table {}.{} refresh mode changed from {} to {}; \
+                 a full refresh was applied. This may take time on large tables.",
                 schema,
                 table_name,
                 old_mode.as_str(),
