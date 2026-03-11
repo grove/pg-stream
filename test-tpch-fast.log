@@ -1,0 +1,872 @@
+./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+Full E2E run id: full-e2e-56225-1773236599
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.64s
+     Running tests/e2e_tpch_tests.rs (target/debug/deps/e2e_tpch_tests-1adb76e95229a675)
+
+running 10 tests
+test test_tpch_cross_query_consistency ... 
+══════════════════════════════════════════════════════════
+  TPC-H Cross-Query Consistency — SF=0.01, cycles=3
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.6s
+
+  Creating stream tables...
+    q02: created ✓
+    q21: created ✓
+    q13: created ✓
+    q11: created ✓
+    q08: created ✓
+    q01: created ✓
+    q05: created ✓
+    q07: created ✓
+    q09: created ✓
+    q16: created ✓
+    q22: created ✓
+    q03: created ✓
+    q04: created ✓
+    q06: created ✓
+    q10: created ✓
+    q12: created ✓
+    q14: created ✓
+    q15: created ✓
+    q17: created ✓
+    q18: created ✓
+    q19: created ✓
+    q20: created ✓
+  22 / 22 stream tables created
+
+  Baseline assertions: 22/22 passed ✓
+
+  WARN: q08 refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: q05 refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: q07 refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: q09 refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    EXTRA rows (in ST but not query):
+      {"l_shipmode":"MAIL","high_line_count":3,"low_line_count":6}
+    MISSING rows (in query but not ST):
+      {"l_shipmode":"MAIL","high_line_count":3,"low_line_count":7}
+  WARN: q12 invariant cycle 1: INVARIANT VIOLATION: q12 cycle 1 — ST rows: 2, Q rows: 2, extra: 1, missing: 1
+  Cycle 1/3 — 17 STs verified — 135620ms ✓
+  Cycle 2/3 — 17 STs verified — 6418ms ✓
+  Cycle 3/3 — 17 STs verified — 6738ms ✓
+
+  Cross-query consistency: PASSED ✓ (17/22 STs survived all cycles)
+
+ok
+test test_tpch_differential_correctness ... 
+══════════════════════════════════════════════════════════
+  TPC-H Differential Correctness — SF=0.01, cycles=3
+  Orders: 1500, Customers: 150, Suppliers: 10, Parts: 200
+  RF batch size: 15 rows
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.5s
+
+── q02 (Tier 1) ──────────────────────────────
+  deps: region(16530), nation(16539), supplier(16549), part(16562), partsupp(16577)
+  change_buffers: changes_16530, changes_16539, changes_16549, changes_16562, changes_16577
+  baseline — 29ms ✓
+  [T1] q02  cycle 1/3 — 129ms ✓
+  [T1] q02  cycle 2/3 — 106ms ✓
+  [T1] q02  cycle 3/3 — 89ms ✓
+── q21 (Tier 1) ──────────────────────────────
+  deps: nation(16539), supplier(16549), orders(16602), lineitem(16617)
+  change_buffers: changes_16539, changes_16549, changes_16602, changes_16617
+  baseline — 22ms ✓
+  [T1] q21  cycle 1/3 — 116ms ✓
+  [T1] q21  cycle 2/3 — 113ms ✓
+  [T1] q21  cycle 3/3 — 101ms ✓
+── q13 (Tier 1) ──────────────────────────────
+  deps: customer(16588), orders(16602)
+  change_buffers: changes_16588, changes_16602
+  baseline — 17ms ✓
+  [T1] q13  cycle 1/3 — 288ms ✓
+  [T1] q13  cycle 2/3 — 155ms ✓
+  [T1] q13  cycle 3/3 — 167ms ✓
+── q11 (Tier 1) ──────────────────────────────
+  deps: nation(16539), supplier(16549), partsupp(16577)
+  change_buffers: changes_16539, changes_16549, changes_16577
+  baseline — 14ms ✓
+  [T1] q11  cycle 1/3 — 91ms ✓
+  [T1] q11  cycle 2/3 — 89ms ✓
+  [T1] q11  cycle 3/3 — 103ms ✓
+── q08 (Tier 1) ──────────────────────────────
+  deps: region(16530), nation(16539), supplier(16549), part(16562), customer(16588), orders(16602), lineitem(16617)
+  change_buffers: changes_16530, changes_16539, changes_16549, changes_16562, changes_16588, changes_16602, changes_16617
+  baseline — 19ms ✓
+  WARN cycle 1 — pg_trickle DVM error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    change_buffers_at_error: changes_16530, changes_16539, changes_16549, changes_16562, changes_16588, changes_16602, changes_16617
+── q01 (Tier 2) ──────────────────────────────
+  deps: lineitem(16617)
+  change_buffers: changes_16617
+  baseline — 25ms ✓
+  [T2] q01  cycle 1/3 — 130ms ✓
+  [T2] q01  cycle 2/3 — 125ms ✓
+  [T2] q01  cycle 3/3 — 123ms ✓
+── q05 (Tier 2) ──────────────────────────────
+  deps: region(16530), nation(16539), supplier(16549), customer(16588), orders(16602), lineitem(16617)
+  change_buffers: changes_16530, changes_16539, changes_16549, changes_16588, changes_16602, changes_16617
+  baseline — 14ms ✓
+  WARN cycle 1 — pg_trickle DVM error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    change_buffers_at_error: changes_16530, changes_16539, changes_16549, changes_16588, changes_16602, changes_16617
+── q07 (Tier 2) ──────────────────────────────
+  deps: nation(16539), supplier(16549), customer(16588), orders(16602), lineitem(16617)
+  change_buffers: changes_16539, changes_16549, changes_16588, changes_16602, changes_16617
+  baseline — 17ms ✓
+  WARN cycle 1 — pg_trickle DVM error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    change_buffers_at_error: changes_16539, changes_16549, changes_16588, changes_16602, changes_16617
+── q09 (Tier 2) ──────────────────────────────
+  deps: nation(16539), supplier(16549), part(16562), partsupp(16577), orders(16602), lineitem(16617)
+  change_buffers: changes_16539, changes_16549, changes_16562, changes_16577, changes_16602, changes_16617
+  baseline — 13ms ✓
+  WARN cycle 1 — pg_trickle DVM error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    change_buffers_at_error: changes_16539, changes_16549, changes_16562, changes_16577, changes_16602, changes_16617
+── q16 (Tier 2) ──────────────────────────────
+  deps: supplier(16549), part(16562), partsupp(16577)
+  change_buffers: changes_16549, changes_16562, changes_16577
+  baseline — 11ms ✓
+  [T2] q16  cycle 1/3 — 88ms ✓
+  [T2] q16  cycle 2/3 — 86ms ✓
+  [T2] q16  cycle 3/3 — 86ms ✓
+── q22 (Tier 2) ──────────────────────────────
+  deps: customer(16588), orders(16602)
+  change_buffers: changes_16588, changes_16602
+  baseline — 15ms ✓
+  [T2] q22  cycle 1/3 — 96ms ✓
+  [T2] q22  cycle 2/3 — 96ms ✓
+  [T2] q22  cycle 3/3 — 97ms ✓
+── q03 (Tier 3) ──────────────────────────────
+  deps: customer(16588), orders(16602), lineitem(16617)
+  change_buffers: changes_16588, changes_16602, changes_16617
+  baseline — 21ms ✓
+  [T3] q03  cycle 1/3 — 94ms ✓
+  [T3] q03  cycle 2/3 — 94ms ✓
+  [T3] q03  cycle 3/3 — 103ms ✓
+── q04 (Tier 3) ──────────────────────────────
+  deps: orders(16602), lineitem(16617)
+  change_buffers: changes_16602, changes_16617
+  baseline — 16ms ✓
+  [T3] q04  cycle 1/3 — 105ms ✓
+  [T3] q04  cycle 2/3 — 102ms ✓
+  [T3] q04  cycle 3/3 — 109ms ✓
+── q06 (Tier 3) ──────────────────────────────
+  deps: lineitem(16617)
+  change_buffers: changes_16617
+  baseline — 14ms ✓
+  [T3] q06  cycle 1/3 — 99ms ✓
+  [T3] q06  cycle 2/3 — 94ms ✓
+  [T3] q06  cycle 3/3 — 99ms ✓
+── q10 (Tier 3) ──────────────────────────────
+  deps: nation(16539), customer(16588), orders(16602), lineitem(16617)
+  change_buffers: changes_16539, changes_16588, changes_16602, changes_16617
+  baseline — 15ms ✓
+  [T3] q10  cycle 1/3 — 94ms ✓
+  [T3] q10  cycle 2/3 — 90ms ✓
+  [T3] q10  cycle 3/3 — 90ms ✓
+── q12 (Tier 3) ──────────────────────────────
+  deps: orders(16602), lineitem(16617)
+  change_buffers: changes_16602, changes_16617
+  baseline — 25ms ✓
+    EXTRA rows (in ST but not query):
+      {"l_shipmode":"MAIL","high_line_count":0,"low_line_count":5}
+      {"l_shipmode":"SHIP","high_line_count":4,"low_line_count":4}
+    MISSING rows (in query but not ST):
+      {"l_shipmode":"SHIP","high_line_count":4,"low_line_count":5}
+      {"l_shipmode":"MAIL","high_line_count":1,"low_line_count":5}
+  WARN cycle 1 — INVARIANT VIOLATION: q12 cycle 1 — ST rows: 2, Q rows: 2, extra: 2, missing: 2
+── q14 (Tier 3) ──────────────────────────────
+  deps: part(16562), lineitem(16617)
+  change_buffers: changes_16562, changes_16617
+  baseline — 13ms ✓
+  [T3] q14  cycle 1/3 — 99ms ✓
+  [T3] q14  cycle 2/3 — 102ms ✓
+  [T3] q14  cycle 3/3 — 108ms ✓
+── q15 (Tier 3) ──────────────────────────────
+  deps: supplier(16549), lineitem(16617)
+  change_buffers: changes_16549, changes_16617
+  baseline — 14ms ✓
+  [T3] q15  cycle 1/3 — 127ms ✓
+  [T3] q15  cycle 2/3 — 113ms ✓
+  [T3] q15  cycle 3/3 — 110ms ✓
+── q17 (Tier 3) ──────────────────────────────
+  deps: part(16562), lineitem(16617)
+  change_buffers: changes_16562, changes_16617
+  baseline — 16ms ✓
+  [T3] q17  cycle 1/3 — 6786ms ✓
+  [T3] q17  cycle 2/3 — 7050ms ✓
+  [T3] q17  cycle 3/3 — 7435ms ✓
+── q18 (Tier 3) ──────────────────────────────
+  deps: customer(16588), orders(16602), lineitem(16617)
+  change_buffers: changes_16588, changes_16602, changes_16617
+  baseline — 17ms ✓
+  [T3] q18  cycle 1/3 — 96ms ✓
+  [T3] q18  cycle 2/3 — 93ms ✓
+  [T3] q18  cycle 3/3 — 92ms ✓
+── q19 (Tier 3) ──────────────────────────────
+  deps: part(16562), lineitem(16617)
+  change_buffers: changes_16562, changes_16617
+  baseline — 20ms ✓
+  [T3] q19  cycle 1/3 — 95ms ✓
+  [T3] q19  cycle 2/3 — 111ms ✓
+  [T3] q19  cycle 3/3 — 107ms ✓
+── q20 (Tier 3) ──────────────────────────────
+  deps: nation(16539), supplier(16549), part(16562), partsupp(16577), lineitem(16617)
+  change_buffers: changes_16539, changes_16549, changes_16562, changes_16577, changes_16617
+  baseline — 19ms ✓
+  [T3] q20  cycle 1/3 — 3520ms ✓
+  [T3] q20  cycle 2/3 — 3476ms ✓
+  [T3] q20  cycle 3/3 — 3481ms ✓
+
+══════════════════════════════════════════════════════════
+  Results: 17/22 queries passed, 5 skipped
+  Skipped (pg_trickle limitation):
+    q08: temporary file size exceeds "temp_file_limit" (4194304kB)
+    q05: temporary file size exceeds "temp_file_limit" (4194304kB)
+    q07: temporary file size exceeds "temp_file_limit" (4194304kB)
+    q09: temporary file size exceeds "temp_file_limit" (4194304kB)
+    q12: 2
+══════════════════════════════════════════════════════════
+
+ok
+test test_tpch_differential_vs_immediate ... 
+══════════════════════════════════════════════════════════
+  TPC-H DIFFERENTIAL vs IMMEDIATE — SF=0.01, cycles=3
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.5s
+
+── q02 (Tier 1) ──────────────────────────────
+  [T1] q02  cycle 1/3 — DIFF==IMM ✓ — 475ms
+  [T1] q02  cycle 2/3 — DIFF==IMM ✓ — 605ms
+  [T1] q02  cycle 3/3 — DIFF==IMM ✓ — 562ms
+── q21 (Tier 1) ──────────────────────────────
+  [T1] q21  cycle 1/3 — DIFF==IMM ✓ — 651ms
+  [T1] q21  cycle 2/3 — DIFF==IMM ✓ — 650ms
+  [T1] q21  cycle 3/3 — DIFF==IMM ✓ — 657ms
+── q13 (Tier 1) ──────────────────────────────
+  [T1] q13  cycle 1/3 — DIFF==IMM ✓ — 641ms
+  [T1] q13  cycle 2/3 — DIFF==IMM ✓ — 856ms
+  WARN: q13 cycle 3 — DIFF(3) != IMM(3) (mode divergence)
+  q13: SKIP — mode divergence
+── q11 (Tier 1) ──────────────────────────────
+  [T1] q11  cycle 1/3 — DIFF==IMM ✓ — 610ms
+  [T1] q11  cycle 2/3 — DIFF==IMM ✓ — 594ms
+  [T1] q11  cycle 3/3 — DIFF==IMM ✓ — 591ms
+── q08 (Tier 1) ──────────────────────────────
+  WARN cycle 1 RF1 — IVM error: error returned from database: deadlock detected
+  q08: SKIP — mode divergence
+── q01 (Tier 2) ──────────────────────────────
+  [T2] q01  cycle 1/3 — DIFF==IMM ✓ — 612ms
+  WARN: q01 cycle 2 — DIFF(6) != IMM(6) (mode divergence)
+  q01: SKIP — mode divergence
+── q05 (Tier 2) ──────────────────────────────
+  WARN cycle 1 RF1 — IVM error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  q05: SKIP — mode divergence
+── q07 (Tier 2) ──────────────────────────────
+  WARN cycle 1 RF1 — IVM error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  q07: SKIP — mode divergence
+── q09 (Tier 2) ──────────────────────────────
+  WARN cycle 1 RF1 — IVM error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  q09: SKIP — mode divergence
+── q16 (Tier 2) ──────────────────────────────
+  [T2] q16  cycle 1/3 — DIFF==IMM ✓ — 583ms
+  [T2] q16  cycle 2/3 — DIFF==IMM ✓ — 626ms
+  [T2] q16  cycle 3/3 — DIFF==IMM ✓ — 633ms
+── q22 (Tier 2) ──────────────────────────────
+  WARN cycle 1 RF1 — IVM error: error returned from database: deadlock detected
+  q22: SKIP — mode divergence
+── q03 (Tier 3) ──────────────────────────────
+  [T3] q03  cycle 1/3 — DIFF==IMM ✓ — 629ms
+  [T3] q03  cycle 2/3 — DIFF==IMM ✓ — 637ms
+  [T3] q03  cycle 3/3 — DIFF==IMM ✓ — 622ms
+── q04 (Tier 3) ──────────────────────────────
+  [T3] q04  cycle 1/3 — DIFF==IMM ✓ — 626ms
+  [T3] q04  cycle 2/3 — DIFF==IMM ✓ — 604ms
+  [T3] q04  cycle 3/3 — DIFF==IMM ✓ — 607ms
+── q06 (Tier 3) ──────────────────────────────
+  [T3] q06  cycle 1/3 — DIFF==IMM ✓ — 570ms
+  [T3] q06  cycle 2/3 — DIFF==IMM ✓ — 577ms
+  [T3] q06  cycle 3/3 — DIFF==IMM ✓ — 578ms
+── q10 (Tier 3) ──────────────────────────────
+  [T3] q10  cycle 1/3 — DIFF==IMM ✓ — 608ms
+  [T3] q10  cycle 2/3 — DIFF==IMM ✓ — 605ms
+  [T3] q10  cycle 3/3 — DIFF==IMM ✓ — 612ms
+── q12 (Tier 3) ──────────────────────────────
+  [T3] q12  cycle 1/3 — DIFF==IMM ✓ — 641ms
+  WARN: q12 cycle 2 — DIFF(2) != IMM(2) (mode divergence)
+  q12: SKIP — mode divergence
+── q14 (Tier 3) ──────────────────────────────
+  [T3] q14  cycle 1/3 — DIFF==IMM ✓ — 592ms
+  [T3] q14  cycle 2/3 — DIFF==IMM ✓ — 604ms
+  [T3] q14  cycle 3/3 — DIFF==IMM ✓ — 595ms
+── q15 (Tier 3) ──────────────────────────────
+  [T3] q15  cycle 1/3 — DIFF==IMM ✓ — 692ms
+  [T3] q15  cycle 2/3 — DIFF==IMM ✓ — 680ms
+  [T3] q15  cycle 3/3 — DIFF==IMM ✓ — 750ms
+── q17 (Tier 3) ──────────────────────────────
+  [T3] q17  cycle 1/3 — DIFF==IMM ✓ — 25531ms
+  [T3] q17  cycle 2/3 — DIFF==IMM ✓ — 26184ms
+  [T3] q17  cycle 3/3 — DIFF==IMM ✓ — 30270ms
+── q18 (Tier 3) ──────────────────────────────
+  [T3] q18  cycle 1/3 — DIFF==IMM ✓ — 732ms
+  [T3] q18  cycle 2/3 — DIFF==IMM ✓ — 732ms
+  [T3] q18  cycle 3/3 — DIFF==IMM ✓ — 651ms
+── q19 (Tier 3) ──────────────────────────────
+  [T3] q19  cycle 1/3 — DIFF==IMM ✓ — 667ms
+  [T3] q19  cycle 2/3 — DIFF==IMM ✓ — 728ms
+  [T3] q19  cycle 3/3 — DIFF==IMM ✓ — 745ms
+── q20 (Tier 3) ──────────────────────────────
+  [T3] q20  cycle 1/3 — DIFF==IMM ✓ — 9351ms
+  [T3] q20  cycle 2/3 — DIFF==IMM ✓ — 7776ms
+  [T3] q20  cycle 3/3 — DIFF==IMM ✓ — 7436ms
+
+══════════════════════════════════════════════════════════
+  Skipped / diverged: q13, q08 RF1-1, q01, q05 RF1-1, q07 RF1-1, q09 RF1-1, q22 RF1-1, q12
+  DIFFERENTIAL vs IMMEDIATE: 14/22 queries agreed ✓
+
+══════════════════════════════════════════════════════════
+
+ok
+test test_tpch_full_vs_differential ... 
+══════════════════════════════════════════════════════════
+  TPC-H FULL vs DIFFERENTIAL — SF=0.01, cycles=3
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.5s
+
+── q02 (Tier 1) ──────────────────────────────
+  [T1] q02  cycle 1/3 — FULL==DIFF ✓ — 503ms
+  [T1] q02  cycle 2/3 — FULL==DIFF ✓ — 582ms
+  [T1] q02  cycle 3/3 — FULL==DIFF ✓ — 593ms
+── q21 (Tier 1) ──────────────────────────────
+  [T1] q21  cycle 1/3 — FULL==DIFF ✓ — 608ms
+  [T1] q21  cycle 2/3 — FULL==DIFF ✓ — 581ms
+  [T1] q21  cycle 3/3 — FULL==DIFF ✓ — 582ms
+── q13 (Tier 1) ──────────────────────────────
+  [T1] q13  cycle 1/3 — FULL==DIFF ✓ — 590ms
+  [T1] q13  cycle 2/3 — FULL==DIFF ✓ — 554ms
+  [T1] q13  cycle 3/3 — FULL==DIFF ✓ — 730ms
+── q11 (Tier 1) ──────────────────────────────
+  [T1] q11  cycle 1/3 — FULL==DIFF ✓ — 560ms
+  [T1] q11  cycle 2/3 — FULL==DIFF ✓ — 571ms
+  [T1] q11  cycle 3/3 — FULL==DIFF ✓ — 560ms
+── q08 (Tier 1) ──────────────────────────────
+  WARN: DIFF refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  SKIP: q08 — DVM error (known pg_trickle limitation)
+── q01 (Tier 2) ──────────────────────────────
+  [T2] q01  cycle 1/3 — FULL==DIFF ✓ — 553ms
+  [T2] q01  cycle 2/3 — FULL==DIFF ✓ — 606ms
+  [T2] q01  cycle 3/3 — FULL==DIFF ✓ — 623ms
+── q05 (Tier 2) ──────────────────────────────
+  WARN: DIFF refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  SKIP: q05 — DVM error (known pg_trickle limitation)
+── q07 (Tier 2) ──────────────────────────────
+  WARN: DIFF refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  SKIP: q07 — DVM error (known pg_trickle limitation)
+── q09 (Tier 2) ──────────────────────────────
+  WARN: DIFF refresh error cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  SKIP: q09 — DVM error (known pg_trickle limitation)
+── q16 (Tier 2) ──────────────────────────────
+  [T2] q16  cycle 1/3 — FULL==DIFF ✓ — 533ms
+  [T2] q16  cycle 2/3 — FULL==DIFF ✓ — 603ms
+  [T2] q16  cycle 3/3 — FULL==DIFF ✓ — 595ms
+── q22 (Tier 2) ──────────────────────────────
+  [T2] q22  cycle 1/3 — FULL==DIFF ✓ — 566ms
+  [T2] q22  cycle 2/3 — FULL==DIFF ✓ — 570ms
+  [T2] q22  cycle 3/3 — FULL==DIFF ✓ — 605ms
+── q03 (Tier 3) ──────────────────────────────
+  [T3] q03  cycle 1/3 — FULL==DIFF ✓ — 602ms
+  [T3] q03  cycle 2/3 — FULL==DIFF ✓ — 580ms
+  [T3] q03  cycle 3/3 — FULL==DIFF ✓ — 594ms
+── q04 (Tier 3) ──────────────────────────────
+  [T3] q04  cycle 1/3 — FULL==DIFF ✓ — 632ms
+  [T3] q04  cycle 2/3 — FULL==DIFF ✓ — 590ms
+  [T3] q04  cycle 3/3 — FULL==DIFF ✓ — 574ms
+── q06 (Tier 3) ──────────────────────────────
+  [T3] q06  cycle 1/3 — FULL==DIFF ✓ — 560ms
+  [T3] q06  cycle 2/3 — FULL==DIFF ✓ — 577ms
+  [T3] q06  cycle 3/3 — FULL==DIFF ✓ — 551ms
+── q10 (Tier 3) ──────────────────────────────
+  [T3] q10  cycle 1/3 — FULL==DIFF ✓ — 579ms
+  [T3] q10  cycle 2/3 — FULL==DIFF ✓ — 564ms
+  [T3] q10  cycle 3/3 — FULL==DIFF ✓ — 580ms
+── q12 (Tier 3) ──────────────────────────────
+  WARN: q12 cycle 1 — FULL(2) != DIFF(2) (DVM data mismatch)
+  SKIP: q12 — DVM error (known pg_trickle limitation)
+── q14 (Tier 3) ──────────────────────────────
+  [T3] q14  cycle 1/3 — FULL==DIFF ✓ — 585ms
+  [T3] q14  cycle 2/3 — FULL==DIFF ✓ — 561ms
+  [T3] q14  cycle 3/3 — FULL==DIFF ✓ — 576ms
+── q15 (Tier 3) ──────────────────────────────
+  [T3] q15  cycle 1/3 — FULL==DIFF ✓ — 591ms
+  [T3] q15  cycle 2/3 — FULL==DIFF ✓ — 583ms
+  [T3] q15  cycle 3/3 — FULL==DIFF ✓ — 558ms
+── q17 (Tier 3) ──────────────────────────────
+  [T3] q17  cycle 1/3 — FULL==DIFF ✓ — 7333ms
+  [T3] q17  cycle 2/3 — FULL==DIFF ✓ — 7472ms
+  [T3] q17  cycle 3/3 — FULL==DIFF ✓ — 7836ms
+── q18 (Tier 3) ──────────────────────────────
+  [T3] q18  cycle 1/3 — FULL==DIFF ✓ — 575ms
+  [T3] q18  cycle 2/3 — FULL==DIFF ✓ — 582ms
+  [T3] q18  cycle 3/3 — FULL==DIFF ✓ — 569ms
+── q19 (Tier 3) ──────────────────────────────
+  [T3] q19  cycle 1/3 — FULL==DIFF ✓ — 592ms
+  [T3] q19  cycle 2/3 — FULL==DIFF ✓ — 611ms
+  [T3] q19  cycle 3/3 — FULL==DIFF ✓ — 562ms
+── q20 (Tier 3) ──────────────────────────────
+  [T3] q20  cycle 1/3 — FULL==DIFF ✓ — 3915ms
+  [T3] q20  cycle 2/3 — FULL==DIFF ✓ — 3916ms
+  [T3] q20  cycle 3/3 — FULL==DIFF ✓ — 4126ms
+
+  Skipped (pg_trickle limitation): q08, q05, q07, q09, q12
+
+  FULL vs DIFFERENTIAL: 17/22 queries passed ✓
+
+ok
+test test_tpch_immediate_correctness ... 
+══════════════════════════════════════════════════════════
+  TPC-H IMMEDIATE Mode Correctness — SF=0.01, cycles=3
+  Orders: 1500, Customers: 150, Suppliers: 10, Parts: 200
+  RF batch size: 15 rows
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.5s
+
+── q02 (Tier 1) ──────────────────────────────
+  baseline — 34ms ✓
+  [T1] q02  cycle 1/3 — 127ms ✓
+  [T1] q02  cycle 2/3 — 104ms ✓
+  [T1] q02  cycle 3/3 — 93ms ✓
+── q21 (Tier 1) ──────────────────────────────
+  baseline — 14ms ✓
+  [T1] q21  cycle 1/3 — 191ms ✓
+  [T1] q21  cycle 2/3 — 152ms ✓
+  [T1] q21  cycle 3/3 — 165ms ✓
+── q13 (Tier 1) ──────────────────────────────
+  baseline — 17ms ✓
+  [T1] q13  cycle 1/3 — 132ms ✓
+  [T1] q13  cycle 2/3 — 114ms ✓
+  [T1] q13  cycle 3/3 — 108ms ✓
+── q11 (Tier 1) ──────────────────────────────
+  baseline — 13ms ✓
+  [T1] q11  cycle 1/3 — 101ms ✓
+  [T1] q11  cycle 2/3 — 86ms ✓
+  [T1] q11  cycle 3/3 — 98ms ✓
+── q08 (Tier 1) ──────────────────────────────
+  baseline — 13ms ✓
+  WARN cycle 1 RF1 — IVM trigger error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+── q01 (Tier 2) ──────────────────────────────
+  baseline — 30ms ✓
+  [T2] q01  cycle 1/3 — 217ms ✓
+  [T2] q01  cycle 2/3 — 153ms ✓
+  [T2] q01  cycle 3/3 — 167ms ✓
+── q05 (Tier 2) ──────────────────────────────
+  baseline — 15ms ✓
+  WARN cycle 1 RF1 — IVM trigger error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+── q07 (Tier 2) ──────────────────────────────
+  baseline — 15ms ✓
+  WARN cycle 1 RF1 — IVM trigger error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+── q09 (Tier 2) ──────────────────────────────
+  baseline — 15ms ✓
+  WARN cycle 1 RF1 — IVM trigger error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+── q16 (Tier 2) ──────────────────────────────
+  baseline — 12ms ✓
+  [T2] q16  cycle 1/3 — 103ms ✓
+  [T2] q16  cycle 2/3 — 96ms ✓
+  [T2] q16  cycle 3/3 — 95ms ✓
+── q22 (Tier 2) ──────────────────────────────
+  baseline — 15ms ✓
+  [T2] q22  cycle 1/3 — 108ms ✓
+  [T2] q22  cycle 2/3 — 117ms ✓
+  [T2] q22  cycle 3/3 — 98ms ✓
+── q03 (Tier 3) ──────────────────────────────
+  baseline — 14ms ✓
+  [T3] q03  cycle 1/3 — 147ms ✓
+  [T3] q03  cycle 2/3 — 136ms ✓
+  [T3] q03  cycle 3/3 — 144ms ✓
+── q04 (Tier 3) ──────────────────────────────
+  baseline — 26ms ✓
+  [T3] q04  cycle 1/3 — 151ms ✓
+  [T3] q04  cycle 2/3 — 127ms ✓
+  [T3] q04  cycle 3/3 — 142ms ✓
+── q06 (Tier 3) ──────────────────────────────
+  baseline — 23ms ✓
+  [T3] q06  cycle 1/3 — 123ms ✓
+  [T3] q06  cycle 2/3 — 111ms ✓
+  [T3] q06  cycle 3/3 — 113ms ✓
+── q10 (Tier 3) ──────────────────────────────
+  baseline — 15ms ✓
+  [T3] q10  cycle 1/3 — 150ms ✓
+  [T3] q10  cycle 2/3 — 147ms ✓
+  [T3] q10  cycle 3/3 — 141ms ✓
+── q12 (Tier 3) ──────────────────────────────
+  baseline — 16ms ✓
+  [T3] q12  cycle 1/3 — 162ms ✓
+  [T3] q12  cycle 2/3 — 146ms ✓
+  [T3] q12  cycle 3/3 — 137ms ✓
+── q14 (Tier 3) ──────────────────────────────
+  baseline — 17ms ✓
+  [T3] q14  cycle 1/3 — 125ms ✓
+  [T3] q14  cycle 2/3 — 116ms ✓
+  [T3] q14  cycle 3/3 — 121ms ✓
+── q15 (Tier 3) ──────────────────────────────
+  baseline — 18ms ✓
+  [T3] q15  cycle 1/3 — 184ms ✓
+  [T3] q15  cycle 2/3 — 185ms ✓
+  [T3] q15  cycle 3/3 — 170ms ✓
+── q17 (Tier 3) ──────────────────────────────
+  baseline — 16ms ✓
+  [T3] q17  cycle 1/3 — 23530ms ✓
+  [T3] q17  cycle 2/3 — 23992ms ✓
+  [T3] q17  cycle 3/3 — 24796ms ✓
+── q18 (Tier 3) ──────────────────────────────
+  baseline — 15ms ✓
+  [T3] q18  cycle 1/3 — 149ms ✓
+  [T3] q18  cycle 2/3 — 139ms ✓
+  [T3] q18  cycle 3/3 — 145ms ✓
+── q19 (Tier 3) ──────────────────────────────
+  baseline — 21ms ✓
+  [T3] q19  cycle 1/3 — 123ms ✓
+  [T3] q19  cycle 2/3 — 112ms ✓
+  [T3] q19  cycle 3/3 — 125ms ✓
+── q20 (Tier 3) ──────────────────────────────
+  baseline — 20ms ✓
+  [T3] q20  cycle 1/3 — 4242ms ✓
+  [T3] q20  cycle 2/3 — 3532ms ✓
+  [T3] q20  cycle 3/3 — 3575ms ✓
+
+══════════════════════════════════════════════════════════
+  Results: 18/22 queries passed, 4 skipped
+  Skipped (pg_trickle limitation):
+    q08: temporary file size exceeds "temp_file_limit" (4194304kB)
+    q05: temporary file size exceeds "temp_file_limit" (4194304kB)
+    q07: temporary file size exceeds "temp_file_limit" (4194304kB)
+    q09: temporary file size exceeds "temp_file_limit" (4194304kB)
+══════════════════════════════════════════════════════════
+
+ok
+test test_tpch_immediate_rollback ... 
+══════════════════════════════════════════════════════════
+  TPC-H IMMEDIATE Rollback Correctness — SF=0.01
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.6s
+
+── q01 ──────────────────────────────────────────
+  baseline ✓ (rows: 6)
+  RF1 (INSERT) mid-txn rows: 6
+  RF1 ROLLBACK ✓
+  RF2 (DELETE) mid-txn rows: 6
+  RF2 ROLLBACK ✓
+  RF3 (UPDATE) mid-txn rows: 6
+  RF3 ROLLBACK ✓
+── q06 ──────────────────────────────────────────
+  baseline ✓ (rows: 1)
+  RF1 (INSERT) mid-txn rows: 1
+  RF1 ROLLBACK ✓
+  RF2 (DELETE) mid-txn rows: 1
+  RF2 ROLLBACK ✓
+  RF3 (UPDATE) mid-txn rows: 1
+  RF3 ROLLBACK ✓
+── q03 ──────────────────────────────────────────
+  baseline ✓ (rows: 9)
+  RF1 (INSERT) mid-txn rows: 9
+  RF1 ROLLBACK ✓
+  RF2 (DELETE) mid-txn rows: 9
+  RF2 ROLLBACK ✓
+  RF3 (UPDATE) mid-txn rows: 9
+  RF3 ROLLBACK ✓
+── q05 ──────────────────────────────────────────
+  baseline ✓ (rows: 0)
+  SKIP RF1 — IVM trigger error: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+
+══════════════════════════════════════════════════════════
+  Skipped (1 queries):
+    q05: temporary file size exceeds "temp_file_limit" (4194304kB)
+  Rollback correctness: PASSED ✓
+══════════════════════════════════════════════════════════
+
+ok
+test test_tpch_performance_comparison ... 
+══════════════════════════════════════════════════════════
+  TPC-H T1-B Performance — SF=0.01, cycles=3
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.7s
+
+  WARN: q08 DIFF cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: q05 DIFF cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: q07 DIFF cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: q09 DIFF cycle 1: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+
+┌──────┬──────┬────────────┬────────────┬──────────┐
+│ Query│ Tier │  FULL (ms) │  DIFF (ms) │ Speedup  │
+├──────┼──────┼────────────┼────────────┼──────────┤
+│ q02  │  T1  │     23.2   │     14.1   │   1.64x  │
+│ q21  │  T1  │     14.1   │     12.7   │   1.11x  │
+│ q13  │  T1  │     11.2   │     24.5   │   0.46x  │
+│ q11  │  T1  │     30.5   │     10.0   │   3.05x  │
+│ q01  │  T2  │     14.8   │     24.2   │   0.61x  │
+│ q16  │  T2  │     11.4   │      5.7   │   2.00x  │
+│ q22  │  T2  │     10.0   │     15.8   │   0.63x  │
+│ q03  │  T3  │      9.1   │      5.9   │   1.55x  │
+│ q04  │  T3  │     10.8   │     18.8   │   0.57x  │
+│ q06  │  T3  │      9.2   │      9.8   │   0.94x  │
+│ q10  │  T3  │      8.9   │      7.1   │   1.25x  │
+│ q12  │  T3  │     10.3   │     18.8   │   0.55x  │
+│ q14  │  T3  │     10.3   │     15.6   │   0.66x  │
+│ q15  │  T3  │     12.6   │     32.5   │   0.39x  │
+│ q17  │  T3  │     11.7   │   7626.0   │   0.00x  │
+│ q18  │  T3  │     12.0   │      7.7   │   1.55x  │
+│ q19  │  T3  │      9.9   │     14.8   │   0.67x  │
+│ q20  │  T3  │     11.0   │   3580.9   │   0.00x  │
+├──────┼──────┼────────────┼────────────┼──────────┤
+│ Total│      │    230.9   │  11445.0   │   0.02x  │
+└──────┴──────┴────────────┴────────────┴──────────┘
+
+  Skipped (DVM limitation): q08, q05, q07, q09
+
+  T1-B Performance: 18/22 queries benchmarked ✓
+
+ok
+test test_tpch_q07_isolation ... 
+══════════════════════════════════════════════════════════
+  Q07 Isolation Test — SF=0.01, cycles=3
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.6s
+
+  Q07 ST created ✓
+  baseline ✓
+  WARN cycle 1: temp_file_limit hit — known Docker constraint, skipping remaining cycles
+
+  Q07 isolation test complete
+
+ok
+test test_tpch_single_row_mutations ... 
+══════════════════════════════════════════════════════════
+  TPC-H Single-Row Mutations (IMMEDIATE) — SF=0.01
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.6s
+
+── q01 ──────────────────────────────────────────
+  baseline ✓
+  single INSERT ✓
+  single UPDATE ✓
+  single DELETE ✓
+── q06 ──────────────────────────────────────────
+  baseline ✓
+  single INSERT ✓
+  single UPDATE ✓
+  single DELETE ✓
+── q03 ──────────────────────────────────────────
+  baseline ✓
+  single INSERT ✓
+  single UPDATE ✓
+  single DELETE ✓
+
+══════════════════════════════════════════════════════════
+  Single-row mutations: 3/3 queries passed, 0 skipped
+══════════════════════════════════════════════════════════
+
+ok
+test test_tpch_sustained_churn ... 
+══════════════════════════════════════════════════════════
+  TPC-H T1-C Sustained Churn — SF=0.01, cycles=50, check every 10
+══════════════════════════════════════════════════════════
+
+  TPC-H table OIDs:
+    region: 16530
+    nation: 16539
+    supplier: 16549
+    part: 16562
+    partsupp: 16577
+    customer: 16588
+    orders: 16602
+    lineitem: 16617
+  Data loaded in 0.5s
+
+  q01: stream table created ✓
+  q03: stream table created ✓
+  q05: stream table created ✓
+  q06: stream table created ✓
+  q10: stream table created ✓
+  q14: stream table created ✓
+  WARN: cycle 1 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 2 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 3 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 4 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 5 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle   5/50 —   28136ms
+  WARN: cycle 6 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 7 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 9 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 10 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  10/50 —   29377ms — buf≈3195 — check ✓
+  WARN: cycle 11 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 12 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 13 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 14 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 15 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  15/50 —   28495ms
+  WARN: cycle 17 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 18 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 19 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 20 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  20/50 —   28872ms — buf≈6668 — check ✓
+  WARN: cycle 21 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 22 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 23 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 25 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  25/50 —   29021ms
+  WARN: cycle 26 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 27 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 28 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 29 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 30 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  30/50 —   28836ms — buf≈9861 — check ✓
+  WARN: cycle 32 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 33 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 34 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 35 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  35/50 —   28585ms
+  WARN: cycle 36 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 37 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 39 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 40 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  40/50 —   28417ms — buf≈13021 — check ✓
+  WARN: cycle 41 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 42 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 43 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 44 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  45/50 —     140ms
+  WARN: cycle 46 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 47 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 48 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 49 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  WARN: cycle 50 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+  cycle  50/50 —   29016ms — buf≈16261 — check ✓
+
+┌────────────────────────────────────────────────────────────┐
+│ TPC-H T1-C Sustained Churn Results                        │
+├────────────────────────────────────────────────────────────┤
+│ STs active:  6 /  6                                       │
+│ Cycles:       50                                           │
+│ Avg cycle:   25532.3 ms                                    │
+│ Min/Max:       125.4 /  31680.2 ms                         │
+│ Drift:         0 detected                                  │
+│ Errors:       44 refresh failures                          │
+│ Verdict:    ⚠️  WARN (refresh errors but no drift)                                          │
+└────────────────────────────────────────────────────────────┘
+
+  Errors:
+    1: cycle 1 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    2: cycle 2 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    3: cycle 3 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    4: cycle 4 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    5: cycle 5 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    6: cycle 6 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    7: cycle 7 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    8: cycle 9 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    9: cycle 10 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    10: cycle 11 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    11: cycle 12 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    12: cycle 13 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    13: cycle 14 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    14: cycle 15 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    15: cycle 17 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    16: cycle 18 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    17: cycle 19 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    18: cycle 20 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    19: cycle 21 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+    20: cycle 22 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
+
+  T1-C Sustained Churn: zero drift in 50 cycles
+
+ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2698.12s
+
