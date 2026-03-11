@@ -25,6 +25,7 @@ use pgrx::prelude::*;
 use crate::catalog::{CdcMode, StDependency};
 use crate::config;
 use crate::error::PgTrickleError;
+use crate::shmem;
 use crate::wal_decoder;
 
 // ── NOTIFY Alerting ────────────────────────────────────────────────────────
@@ -1647,6 +1648,65 @@ fn health_check() -> TableIterator<
 
         let (sev, detail) = build_slot_lag_health_detail(&lagging, threshold_bytes);
         rows.push(("slot_lag".to_string(), sev, detail));
+
+        // ── 8. Worker pool utilization (parallel refresh) ───────────────────
+        let mode = config::pg_trickle_parallel_refresh_mode();
+        if mode != config::ParallelRefreshMode::Off {
+            let active = shmem::active_worker_count();
+            let max_workers = config::pg_trickle_max_dynamic_refresh_workers().max(1) as u32;
+
+            let (sev, detail) = if active >= max_workers {
+                (
+                    "WARN".to_string(),
+                    format!(
+                        "Worker pool saturated: {}/{} tokens in use — \
+                         new refresh jobs will be queued until a worker finishes. \
+                         Consider increasing pg_trickle.max_dynamic_refresh_workers.",
+                        active, max_workers,
+                    ),
+                )
+            } else {
+                (
+                    "OK".to_string(),
+                    format!(
+                        "{}/{} worker tokens in use (mode={})",
+                        active, max_workers, mode,
+                    ),
+                )
+            };
+            rows.push(("worker_pool".to_string(), sev, detail));
+
+            // ── 9. Queued job backlog (parallel refresh) ────────────────────
+            let queued_count = client
+                .select(
+                    "SELECT count(*)::int FROM pgtrickle.pgt_scheduler_jobs \
+                     WHERE status = 'QUEUED'",
+                    None,
+                    &[],
+                )
+                .ok()
+                .and_then(|r| r.first().get::<i32>(1).unwrap_or(None))
+                .unwrap_or(0);
+
+            let (sev, detail) = if queued_count > 10 {
+                (
+                    "WARN".to_string(),
+                    format!(
+                        "{} jobs queued — refresh work is backing up. \
+                         Workers may be overloaded or failing.",
+                        queued_count,
+                    ),
+                )
+            } else if queued_count > 0 {
+                (
+                    "OK".to_string(),
+                    format!("{} job(s) waiting in queue", queued_count),
+                )
+            } else {
+                ("OK".to_string(), "No jobs queued".to_string())
+            };
+            rows.push(("job_queue".to_string(), sev, detail));
+        }
     });
 
     TableIterator::new(rows)
@@ -1818,6 +1878,127 @@ fn trigger_inventory() -> TableIterator<
             ));
         }
         out
+    });
+
+    TableIterator::new(rows)
+}
+
+// ── Parallel Refresh Observability (Phase 6) ──────────────────────────────
+
+/// Worker pool utilization snapshot.
+///
+/// Returns a single row with:
+/// - active workers (from shared memory),
+/// - cluster-wide worker budget (from GUC),
+/// - per-database dispatch cap (from GUC),
+/// - current parallel refresh mode (from GUC).
+///
+/// Exposed as `pgtrickle.worker_pool_status()`.
+#[pg_extern(schema = "pgtrickle", name = "worker_pool_status")]
+fn worker_pool_status() -> TableIterator<
+    'static,
+    (
+        name!(active_workers, i32),
+        name!(max_workers, i32),
+        name!(per_db_cap, i32),
+        name!(parallel_mode, String),
+    ),
+> {
+    let active = shmem::active_worker_count() as i32;
+    let max_workers = config::pg_trickle_max_dynamic_refresh_workers();
+    let per_db = config::pg_trickle_max_concurrent_refreshes();
+    let mode = config::pg_trickle_parallel_refresh_mode().to_string();
+
+    TableIterator::new(vec![(active, max_workers, per_db, mode)])
+}
+
+/// Active and recent scheduler jobs.
+///
+/// Returns one row per job in `pgt_scheduler_jobs` that is currently queued,
+/// running, or recently completed (within the last `max_age_seconds`).
+///
+/// Exposed as `pgtrickle.parallel_job_status(max_age_seconds)`.
+#[pg_extern(schema = "pgtrickle", name = "parallel_job_status")]
+#[allow(clippy::type_complexity)]
+fn parallel_job_status(
+    max_age_seconds: default!(i32, 300),
+) -> TableIterator<
+    'static,
+    (
+        name!(job_id, i64),
+        name!(unit_key, String),
+        name!(unit_kind, String),
+        name!(status, String),
+        name!(member_count, i32),
+        name!(attempt_no, i32),
+        name!(scheduler_pid, i32),
+        name!(worker_pid, Option<i32>),
+        name!(enqueued_at, TimestampWithTimeZone),
+        name!(started_at, Option<TimestampWithTimeZone>),
+        name!(finished_at, Option<TimestampWithTimeZone>),
+        name!(duration_ms, Option<f64>),
+    ),
+> {
+    let mut rows = Vec::new();
+
+    Spi::connect(|client| {
+        let result = client.select(
+            &format!(
+                "SELECT job_id, unit_key, unit_kind, status, \
+                        array_length(member_pgt_ids, 1), attempt_no, \
+                        scheduler_pid, worker_pid, enqueued_at, started_at, \
+                        finished_at, \
+                        CASE WHEN started_at IS NOT NULL AND finished_at IS NOT NULL \
+                             THEN EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000.0 \
+                        END AS duration_ms \
+                 FROM pgtrickle.pgt_scheduler_jobs \
+                 WHERE status IN ('QUEUED', 'RUNNING') \
+                    OR (finished_at > now() - interval '{} seconds') \
+                 ORDER BY enqueued_at DESC",
+                max_age_seconds.max(0)
+            ),
+            None,
+            &[],
+        );
+
+        if let Ok(tup_table) = result {
+            for row in tup_table {
+                let job_id = row.get::<i64>(1).unwrap_or(None).unwrap_or(0);
+                let unit_key = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+                let unit_kind = row.get::<String>(3).unwrap_or(None).unwrap_or_default();
+                let status = row.get::<String>(4).unwrap_or(None).unwrap_or_default();
+                let member_count = row.get::<i32>(5).unwrap_or(None).unwrap_or(0);
+                let attempt_no = row.get::<i32>(6).unwrap_or(None).unwrap_or(1);
+                let scheduler_pid = row.get::<i32>(7).unwrap_or(None).unwrap_or(0);
+                let worker_pid = row.get::<i32>(8).unwrap_or(None);
+                let enqueued_at = row
+                    .get::<TimestampWithTimeZone>(9)
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| {
+                        TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
+                            pgrx::error!("parallel_job_status: failed to construct epoch timestamp")
+                        })
+                    });
+                let started_at = row.get::<TimestampWithTimeZone>(10).unwrap_or(None);
+                let finished_at = row.get::<TimestampWithTimeZone>(11).unwrap_or(None);
+                let duration_ms = row.get::<f64>(12).unwrap_or(None);
+
+                rows.push((
+                    job_id,
+                    unit_key,
+                    unit_kind,
+                    status,
+                    member_count,
+                    attempt_no,
+                    scheduler_pid,
+                    worker_pid,
+                    enqueued_at,
+                    started_at,
+                    finished_at,
+                    duration_ms,
+                ));
+            }
+        }
     });
 
     TableIterator::new(rows)
