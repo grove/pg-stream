@@ -137,10 +137,10 @@ test-pipeline-fast:
 test-tpch: build-e2e-image
     ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
-# Run TPC-H tests, skip Docker image rebuild
+# Run TPC-H tests, skip Docker image rebuild (TPCH_CHURN_CYCLES=20 to keep churn fast)
 [group: "tpch"]
 test-tpch-fast:
-    ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    TPCH_CHURN_CYCLES=20 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
 
 # Run TPC-H tests at larger scale: SF-0.1 (~5 min, rebuilds Docker image)
 [group: "tpch"]
