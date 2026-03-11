@@ -139,6 +139,11 @@ pub fn lsn_gte(a: &str, b: &str) -> bool {
     a == b || lsn_gt(a, b)
 }
 
+/// Return the lower of two LSN strings.
+pub fn lsn_min<'a>(a: &'a str, b: &'a str) -> &'a str {
+    if lsn_gt(a, b) { b } else { a }
+}
+
 // ── Data Timestamp Selection ───────────────────────────────────────────────
 
 /// Select the canonical period for a given effective schedule.

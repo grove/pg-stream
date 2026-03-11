@@ -1,8 +1,8 @@
 # Plan: Cross-Source Snapshot Consistency
 
 Date: 2026-03-02
-Status: PROPOSED
-Last Updated: 2026-03-02
+Status: Phase 1 DONE — Phase 2 PENDING
+Last Updated: 2026-07-07
 
 ---
 
@@ -393,21 +393,30 @@ the per-group `isolation` parameter is the sole control surface.
 
 ## 6. Implementation Plan
 
-### Phase 1: LSN Watermark (Approach C)
+### Phase 1: LSN Watermark (Approach C) ✅ DONE
 
-**Files:** `scheduler.rs`, `refresh.rs`, `wal_decoder.rs`
+**Files changed:** `src/scheduler.rs`, `src/config.rs`, `src/catalog.rs`,
+`src/version.rs`, `src/lib.rs`, `sql/pg_trickle--0.3.0--0.4.0.sql`
 
-1. At the start of `run_scheduler_tick()`, query
-   `pg_current_wal_lsn()::text` and store it as `tick_watermark: String`.
-2. Thread `tick_watermark` through to `execute_refresh()` (or equivalent)
-   as a parameter.
-3. In the WAL/CDC change buffer consumption, cap the LSN consumed to
-   `min(available_lsn, tick_watermark)`.
-4. Changes with LSN > `tick_watermark` remain in the buffer and are
-   consumed on the next tick.
-5. Log `tick_watermark` in `pgt_refresh_history` for observability.
+**Implementation summary:**
 
-**Tests:**
+1. Added `pg_trickle.tick_watermark_enabled` GUC (bool, default `true`) in
+   `config.rs` — allows disabling without a code change.
+2. At the start of each scheduler tick's `BackgroundWorker::transaction` block
+   in `scheduler.rs`, queries `pg_current_wal_lsn()::text` and stores it as
+   `tick_watermark: Option<String>`.
+3. `tick_watermark` is threaded as `Option<&str>` through `refresh_single_st()`
+   and `execute_scheduled_refresh()`.
+4. After `get_slot_positions()` in `execute_scheduled_refresh()`, each slot LSN
+   is capped: `if lsn_gt(lsn, watermark) { *lsn = watermark }`.  Changes above
+   the watermark remain in the buffer for the next tick.
+5. `tick_watermark_lsn` column added to `pgtrickle.pgt_refresh_history`
+   (DDL in `src/lib.rs`; upgrade path in `sql/pg_trickle--0.3.0--0.4.0.sql`).
+6. `RefreshRecord::insert()` in `catalog.rs` accepts the watermark as an
+   optional 13th parameter and persists it for observability.
+7. Added `version::lsn_min()` helper.
+
+**Tests still needed (tracked in backlog):**
 - `test_watermark_caps_lsn_consumption` (unit): mock change buffer with
   LSNs above and below watermark; confirm only sub-watermark changes are
   applied.

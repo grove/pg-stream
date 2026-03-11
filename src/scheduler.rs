@@ -493,6 +493,15 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
 
         // Run the scheduler tick inside a transaction
         BackgroundWorker::transaction(AssertUnwindSafe(|| {
+            // CSS1: Capture tick watermark for cross-source snapshot consistency.
+            // All refreshes in this tick will cap their LSN consumption to this value,
+            // ensuring every stream table in the tick shares the same consistent LSN view.
+            let tick_watermark: Option<String> = if config::pg_trickle_tick_watermark_enabled() {
+                Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
+            } else {
+                None
+            };
+
             // Step A: Check if DAG needs rebuild
             let current_version = shmem::current_dag_version();
             if current_version != dag_version || dag.is_none() {
@@ -548,6 +557,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         &mut retry_states,
                         &retry_policy,
                         initial_table_changes.get(&pgt_id).copied(),
+                        tick_watermark.as_deref(),
                     );
                     continue;
                 }
@@ -577,6 +587,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                             &mut retry_states,
                             &retry_policy,
                             initial_table_changes.get(&pgt_id).copied(),
+                            tick_watermark.as_deref(),
                         );
                     }
                     continue;
@@ -645,7 +656,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     } else {
                         refresh::determine_refresh_action(&st, has_changes)
                     };
-                    let result = execute_scheduled_refresh(&st, action);
+                    let result = execute_scheduled_refresh(&st, action, tick_watermark.as_deref());
 
                     match result {
                         RefreshOutcome::Success => {
@@ -1212,6 +1223,7 @@ fn refresh_single_st(
     retry_states: &mut HashMap<i64, RetryState>,
     retry_policy: &RetryPolicy,
     table_change_snapshot: Option<bool>,
+    tick_watermark: Option<&str>,
 ) {
     let st = match load_st_by_id(pgt_id) {
         Some(st) => st,
@@ -1255,7 +1267,7 @@ fn refresh_single_st(
     } else {
         refresh::determine_refresh_action(&st, has_changes)
     };
-    let result = execute_scheduled_refresh(&st, action);
+    let result = execute_scheduled_refresh(&st, action, tick_watermark);
 
     let retry = retry_states.entry(pgt_id).or_default();
     match result {
@@ -1295,7 +1307,11 @@ fn refresh_single_st(
 /// - Retryable errors (SPI, lock, slot): backoff and retry on next cycle
 /// - Schema errors: flag for reinitialize, count toward suspension
 /// - User/internal errors: permanent failure, count toward suspension
-fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> RefreshOutcome {
+fn execute_scheduled_refresh(
+    st: &StreamTableMeta,
+    action: RefreshAction,
+    tick_watermark: Option<&str>,
+) -> RefreshOutcome {
     let start_instant = std::time::Instant::now();
 
     let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
@@ -1341,6 +1357,7 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
         0,     // delta_row_count — updated on completion
         None,  // merge_strategy_used — updated on completion
         false, // was_full_fallback — updated on completion
+        tick_watermark,
     );
 
     let refresh_id = match refresh_id {
@@ -1359,7 +1376,7 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
 
     // Compute frontier information for this refresh
     let source_oids = get_source_oids_for_st(st.pgt_id);
-    let slot_positions = match cdc::get_slot_positions(&source_oids) {
+    let mut slot_positions = match cdc::get_slot_positions(&source_oids) {
         Ok(pos) => pos,
         Err(e) => {
             log!(
@@ -1371,6 +1388,17 @@ fn execute_scheduled_refresh(st: &StreamTableMeta, action: RefreshAction) -> Ref
             std::collections::HashMap::new()
         }
     };
+
+    // CSS1: Cap each slot position to the tick watermark so no refresh in this
+    // tick consumes WAL changes beyond the snapshot point captured at tick start.
+    // Changes beyond the watermark remain in the buffer and are consumed next tick.
+    if let Some(wm) = tick_watermark {
+        for lsn in slot_positions.values_mut() {
+            if version::lsn_gt(lsn, wm) {
+                *lsn = wm.to_string();
+            }
+        }
+    }
 
     // Select target data timestamp
     let schedule_secs = st

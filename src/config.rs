@@ -189,6 +189,17 @@ pub static PGS_BUFFER_PARTITIONING: GucSetting<Option<std::ffi::CString>> =
 /// deltas against the previous snapshot.
 pub static PGS_FOREIGN_TABLE_POLLING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// CSS1: Cap CDC consumption to the WAL LSN captured at scheduler tick start.
+///
+/// When enabled (default), each scheduler tick calls `pg_current_wal_lsn()`
+/// at its start to obtain a *tick watermark*. Every refresh within that tick
+/// is prevented from consuming WAL changes beyond that watermark, ensuring
+/// all stream tables in the same tick share the same consistent LSN view.
+///
+/// Disable only if you need stream tables to always advance to the very
+/// latest available LSN regardless of cross-source consistency.
+pub static PGS_TICK_WATERMARK_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -460,6 +471,18 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.tick_watermark_enabled",
+        c"Cap CDC consumption to the WAL LSN at scheduler tick start.",
+        c"When on (default), each scheduler tick captures pg_current_wal_lsn() at its \
+           start and prevents any refresh from consuming WAL changes beyond that LSN. \
+           This bounds cross-source staleness without requiring user configuration. \
+           Disable only if you need STs to always advance to the latest available LSN.",
+        &PGS_TICK_WATERMARK_ENABLED,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -592,6 +615,11 @@ pub fn pg_trickle_buffer_partitioning() -> String {
 /// Returns whether foreign table polling CDC is enabled.
 pub fn pg_trickle_foreign_table_polling() -> bool {
     PGS_FOREIGN_TABLE_POLLING.get()
+}
+
+/// Returns whether the tick watermark (CSS1) feature is enabled.
+pub fn pg_trickle_tick_watermark_enabled() -> bool {
+    PGS_TICK_WATERMARK_ENABLED.get()
 }
 
 /// Returns the maximum recursion depth for WITH RECURSIVE in IMMEDIATE mode.

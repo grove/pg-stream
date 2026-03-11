@@ -186,7 +186,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
                      CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')),
     initiated_by    TEXT
                      CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL')),
-    freshness_deadline TIMESTAMPTZ
+    freshness_deadline TIMESTAMPTZ,
+    tick_watermark_lsn PG_LSN
 );
 
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);

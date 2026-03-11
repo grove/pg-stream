@@ -563,9 +563,9 @@ updated in the same transaction from producing an inconsistent stream table.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| CSS1 | LSN tick watermark: snapshot `pg_current_wal_lsn()` per tick; cap frontier advance; log in `pgt_refresh_history`; `pg_trickle.tick_watermark_enabled` GUC (default `on`) | 3–4h | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) §Approach C |
+| ~~CSS1~~ | ~~LSN tick watermark: snapshot `pg_current_wal_lsn()` per tick; cap frontier advance; log in `pgt_refresh_history`; `pg_trickle.tick_watermark_enabled` GUC (default `on`)~~ | ~~3–4h~~ | ✅ Done |
 
-> **Cross-source consistency subtotal: ~3–4 hours**
+> **Cross-source consistency subtotal: ✅ All done**
 
 ### Ergonomic Hardening
 
