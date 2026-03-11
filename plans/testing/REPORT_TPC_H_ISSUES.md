@@ -5,10 +5,13 @@
 > "TPC-H" and "TPC Benchmark" are trademarks of the Transaction Processing
 > Performance Council ([tpc.org](https://www.tpc.org/)).
 
-**Date:** 2026-03-11  
+**Last updated:** 2026-03-11  
 **Branch:** `e2e-test-failure-part-6` (PR #157)  
-**Source log:** `test-tpch-fast.log` (output of `just test-tpch-fast`, SF=0.01, 3 cycles)  
-**Test suite:** `tests/e2e_tpch_tests.rs` — 10 tests, all pass  
+**Source logs:**
+- `test-tpch-fast.log` — run 1: `just test-tpch-fast` before churn optimisations (SF=0.01, 3 cycles, TPCH_CHURN_CYCLES=50)
+- `test-tpch-fast-2.log` — run 2: `just test-tpch-fast` after churn optimisations (SF=0.01, 3 cycles, TPCH_CHURN_CYCLES=20)
+
+**Test suite:** `tests/e2e_tpch_tests.rs` — 10 tests, all pass both runs  
 **Related plans:**
 - [`PLAN_TEST_SUITE_TPC_H.md`](PLAN_TEST_SUITE_TPC_H.md) — original TPC-H suite design (22/22 baseline)
 - [`TEST_SUITE_TPC_H-GAPS.md`](TEST_SUITE_TPC_H-GAPS.md) — additional test tiers (IMMEDIATE, rollback, single-row, DAG)
@@ -18,27 +21,19 @@
 
 ## Executive Summary
 
-All 10 TPC-H tests pass (`test result: ok. 10 passed; 0 failed`). However,
-the logs reveal four distinct categories of issue that currently result in
-per-query skips or degraded coverage. Two of these were diagnosed before this
-run (RC-1: advisory lock cascade, RC-2: temp file spill — both fixed per
-[`PLAN_TEST_SUITE_TPC_H-INFRASTRUCTURE.md`](PLAN_TEST_SUITE_TPC_H-INFRASTRUCTURE.md))
-and two are newly characterised here:
+All 10 TPC-H tests pass in both runs (`test result: ok. 10 passed; 0 failed`). The
+logs reveal six distinct issue categories. Run 2 (after fixes in commit `fbf9dae`)
+confirms three issues resolved and adds one new observation:
 
 | # | Issue | Queries | Severity | Status |
 |---|-------|---------|----------|--------|
-| 1 | DVM intermediate sort spill exceeds `temp_file_limit` | q05, q07, q08, q09 | Known limitation | Skipped gracefully; q05 still floods churn with noise |
-| 2 | q12 `SUM(CASE WHEN …)` differential value mismatch | q12 | DVM correctness bug | Active — see RC-3 in infrastructure plan |
-| 3 | Deadlocks in `differential_vs_immediate` concurrent refresh | q08, q22 | Test design issue | New finding |
-| 4 | DIFF ≠ IMM mode divergence (non-deterministic RF ordering) | q01, q13 | Test design issue | New finding |
-
-In addition, two performance observations are noted that do not affect test
-correctness but are architecturally important:
-
-| # | Issue | Queries | Severity |
-|---|-------|---------|----------|
-| 5 | q17/q20 DIFFERENTIAL is 300–650× slower than FULL refresh | q17, q20 | Performance regression |
-| 6 | `test_tpch_sustained_churn` emits 44 WARN lines per run for q05 | q05 | Test noise |
+| 1 | DVM intermediate sort spill exceeds `temp_file_limit` | q05, q07, q08, q09 | Known limitation | Deferred — skipped gracefully in all tests |
+| 2 | q12 `SUM(CASE WHEN …)` differential value mismatch | q12 | DVM correctness bug | **Open** — reproduced identically in run 2 |
+| 3 | Deadlocks in `differential_vs_immediate` — q08 | q08 | Test design issue | **Open** — q22 no longer deadlocks (run 2) |
+| 4 | DIFF ≠ IMM mode divergence (non-deterministic RF ordering) | q01, q13 | Test design issue | **Open** — reproduced in run 2 (q13 diverges) |
+| 5 | q17/q20 DIFFERENTIAL is 300–650× slower than FULL refresh | q17, q20 | Performance regression | Known architectural limitation |
+| 6 | `test_tpch_sustained_churn` WARN noise from q05 | q05 | Test noise | ✅ **Fixed** in commit `fbf9dae` |
+| 7 | `buf≈-2` sentinel value in churn buffer-size report | — | Cosmetic display bug | **New** — found in run 2 |
 
 ---
 
@@ -91,9 +86,9 @@ for background.
 
 ### Recommended Action
 
-Remove q05 from `test_tpch_sustained_churn`'s active query list (see Issue 6
-below). No change needed for multi-query tests where q05/q07/q08/q09 already
-skip cleanly.
+No change needed for multi-query tests where q05/q07/q08/q09 already skip
+cleanly. The q05 churn noise was resolved by replacing q05 with q22 (see
+Issue 6 — ✅ Fixed).
 
 ---
 
@@ -192,6 +187,7 @@ removes it from the skip list.
 IMMEDIATE stream table for the same query side-by-side in each cycle. Two
 queries produce deadlocks on the very first RF cycle:
 
+Run 1:
 ```
 WARN cycle 1 RF1 — IVM error: error returned from database: deadlock detected
 q08: SKIP — mode divergence
@@ -200,8 +196,10 @@ WARN cycle 1 RF1 — IVM error: error returned from database: deadlock detected
 q22: SKIP — mode divergence
 ```
 
-q05, q07, q09 skip for a different reason (temp_file_limit) before reaching
-the potential deadlock point.
+Run 2: q08 still deadlocks on cycle 1 RF1. **q22 no longer deadlocks** — the
+lock ordering happened to be safe this run. q22's deadlock in run 1 appears
+flaky (depends on scheduler timing). q05, q07, q09 skip for a different reason
+(temp_file_limit) before reaching the potential deadlock point.
 
 ### Root Cause
 
@@ -223,9 +221,10 @@ refresh is inconsistent, producing a classic deadlock cycle.
 
 ### Status
 
-**New finding — test design issue.** The tests still pass (deadlocked queries
-are skipped) but the skip reduces the value of the comparison: q08 and q22
-never produce a DIFF==IMM result.
+**Open — test design issue.** q08 deadlocks reliably (both runs); q22
+deadlocked in run 1 but not run 2 (flaky, scheduler-timing-dependent).
+Deadlocked queries are skipped so tests still pass, but q08 never produces a
+DIFF==IMM result. Run 2 improves the pass rate to 16/22 (up from 14/22).
 
 ### Recommended Action
 
@@ -353,50 +352,100 @@ roadmap as part of the DVM adaptive refresh planner.
 
 ---
 
-## Issue 6 — `test_tpch_sustained_churn` Emits Excessive q05 Warning Noise
+## Issue 6 — `test_tpch_sustained_churn` Emits Excessive q05 Warning Noise ✅ FIXED
 
-### Symptom
+### Symptom (run 1 — before fix)
 
-q05 is included in the `test_tpch_sustained_churn` active query set (q01,
-q03, q05, q06, q10, q14). Since q05 hits `temp_file_limit` on every
-DIFFERENTIAL cycle, the 50-cycle churn test emits **44 WARN lines** for
-`churn_q05`, one per cycle where the RF batch causes a spill:
+q05 was included in the `test_tpch_sustained_churn` active query set. Since
+q05 hits `temp_file_limit` on every DIFFERENTIAL cycle, the 50-cycle churn
+test emitted **44 WARN lines** for `churn_q05` and reported:
 
 ```
-WARN: cycle 1 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
-WARN: cycle 2 churn_q05: error returned from database: temporary file size exceeds "temp_file_limit" (4194304kB)
-... (repeats 44 times across 50 cycles)
+Verdict: ⚠️  WARN (refresh errors but no drift)
 ```
 
-This dominates the test output and masks any genuine new issues.
+Total test time: ~22 minutes, dominated by q05 disk spill (~28 s × 44 cycles
+= ~1,230 s).
 
-The final verdict `⚠️  WARN (refresh errors but no drift)` is correct — there
-is genuinely no data drift — but the volume of warnings makes the output
-difficult to read.
+### Fix applied (commit `fbf9dae`)
+
+Three changes made together:
+
+1. **Replaced q05 with q22** in `churn_queries` list — q22 is a clean,
+   fast `customer × orders` aggregate that completes every DIFFERENTIAL
+   cycle in ~70–100 ms.
+2. **Downgraded `VACUUM (FULL, ANALYZE)` → `VACUUM ANALYZE`** at each
+   check-point cycle — removes the exclusive-lock full table rewrite,
+   saving ~5–10 s per check interval.
+3. **Set `TPCH_CHURN_CYCLES=20` as the default** in `just test-tpch-fast`
+   (was 50). 20 cycles covers two correctness checkpoints (cycle 10, 20),
+   sufficient to detect drift accumulation. Full 50-cycle run still
+   available via `TPCH_CHURN_CYCLES=50`.
+
+### Result (run 2 — after fix)
+
+```
+STs active:  6 /  6
+Cycles:       20
+Avg cycle:      98.6 ms
+Errors:        0 refresh failures
+Verdict:    ✅ PASS
+```
+
+Test time: **~2 s** of measured cycle work (down from ~1,230 s).
+
+---
+
+## Issue 7 — `buf≈-2` Negative Sentinel in Churn Buffer-Size Report
+
+### Symptom (run 2 — new finding)
+
+```
+cycle  10/20 —      74ms — buf≈-2 — check ✓
+```
+
+The buffer-size estimate printed at each correctness checkpoint shows `-2`,
+which is physically impossible (a table cannot have a negative row count).
 
 ### Root Cause
 
-q05 was included in the churn test to exercise broad query coverage. It
-always fails DIFFERENTIAL refresh at this `temp_file_limit` setting, making
-its inclusion counterproductive: it validates nothing useful beyond what the
-failure-skip mechanism in other tests already covers, while generating
-substantial log noise.
+The reporting query sums `pg_class.reltuples`:
+
+```sql
+SELECT COALESCE(SUM(c.reltuples), 0)::bigint
+FROM pg_class c JOIN pg_namespace n ...
+WHERE n.nspname = 'pgtrickle_changes'
+```
+
+`reltuples` is a `float4` estimate updated by ANALYZE from a random page
+sample. PostgreSQL uses `-1` as a sentinel meaning "statistics not yet
+collected". After switching from `VACUUM (FULL, ANALYZE)` to `VACUUM
+ANALYZE` (Issue 6 fix), some change-buffer tables that were recently emptied
+have not yet been sampled by the new ANALYZE pass, so their `reltuples`
+remains at `-1`. `SUM(-1 + -1)` = `-2`.
 
 ### Status
 
-**Test quality issue.** No functional impact; all assertions pass.
+**Open — cosmetic display bug.** No correctness impact; the `check ✓` on
+the same line confirms the invariant hold. The number is just misleading.
 
 ### Recommended Action
 
-Remove q05 from `test_tpch_sustained_churn`'s query list. Replace it with
-q04 or q22, which are similarly-scoped aggregate queries over `orders` +
-`lineitem` that complete cleanly in DIFFERENTIAL mode. This reduces the
-expected error count from ~44 to 0 and changes the verdict from `WARN` to
-`Verdict: ✅ PASS`.
+Clamp the sentinel in the reporting query:
+
+```sql
+SELECT COALESCE(SUM(GREATEST(c.reltuples, 0)), 0)::bigint
+FROM pg_class c ...
+```
+
+This is a one-line change in `tests/e2e_tpch_tests.rs` in the
+`test_tpch_sustained_churn` function.
 
 ---
 
 ## Test Coverage Summary
+
+Run 2 results (after fixes):
 
 | Test | Queries passing | Queries skipped | Notes |
 |------|----------------|-----------------|-------|
@@ -405,21 +454,22 @@ expected error count from ~44 to 0 and changes the verdict from `WARN` to
 | `test_tpch_full_vs_differential` | 17/22 | 5 (same set) | All skips are expected |
 | `test_tpch_immediate_correctness` | 18/22 | 4 (q05, q07, q08, q09 only) | q12 passes IMMEDIATE correctly |
 | `test_tpch_immediate_rollback` | 3/4 sampled | 1 (q05) | q05 trips on first RF in IMMEDIATE too |
-| `test_tpch_differential_vs_immediate` | 14/22 agree | 8 diverged/skipped | Issues 3 & 4 affect this count |
+| `test_tpch_differential_vs_immediate` | **16/22** agree | 6 diverged/skipped | Improved from 14/22; q22 no longer deadlocks |
 | `test_tpch_single_row_mutations` | 3/3 | 0 | Full pass |
 | `test_tpch_performance_comparison` | 18/22 benchmarked | 4 skipped | q17/q20 show regression speedup |
 | `test_tpch_q07_isolation` | 0/1 cycles | 0 (but only cycle 1 runs) | Isolation confirmed |
-| `test_tpch_sustained_churn` | 6/6 active STs, 0 drift | — | WARN due to Issue 6 |
+| `test_tpch_sustained_churn` | **6/6, 0 errors** | — | ✅ PASS (was WARN); avg 98.6 ms/cycle |
 
 ---
 
 ## Action Item Prioritisation
 
-| Priority | Issue | Action | File(s) |
-|----------|-------|--------|---------|
-| P1 (correctness) | Issue 2 — q12 SUM(CASE WHEN) wrong values | Fix `replace_column_refs_in_raw` for CASE aggregates | `src/dvm/operators/aggregate.rs` |
-| P2 (test quality) | Issue 6 — q05 noise in churn test | Replace q05 with q04 or q22 | `tests/e2e_tpch_tests.rs` |
-| P3 (test reliability) | Issue 3 — deadlocks in diff_vs_imm | Serialize DIFF/IMM refreshes per cycle | `tests/e2e_tpch_tests.rs` |
-| P4 (test reliability) | Issue 4 — mode divergence q01/q13 | Add ORDER BY to comparison in those queries | `tests/e2e_tpch_tests.rs` |
-| P5 (docs/observability) | Issue 5 — q17/q20 DVM performance regression | Document anti-pattern; add create-time warning | `docs/DVM_OPERATORS.md`, `src/api.rs` |
-| Deferred | Issue 1 — q05/q07/q08/q09 temp spill | DVM wide-join refactor | `src/dvm/operators/join_common.rs` |
+| Priority | Issue | Action | File(s) | Status |
+|----------|-------|--------|---------|--------|
+| ✅ Done | Issue 6 — q05 noise in churn test | Replace q05→q22; VACUUM ANALYZE; cycles=20 | `tests/e2e_tpch_tests.rs`, `justfile` | Fixed (commit `fbf9dae`) |
+| P1 (correctness) | Issue 2 — q12 SUM(CASE WHEN) wrong values | Fix `replace_column_refs_in_raw` for CASE aggregates | `src/dvm/operators/aggregate.rs` | Open |
+| P2 (test reliability) | Issue 3 — deadlocks in diff_vs_imm | Serialize DIFF/IMM refreshes per cycle | `tests/e2e_tpch_tests.rs` | Open |
+| P3 (test reliability) | Issue 4 — mode divergence q01/q13 | Add ORDER BY to comparison queries | `tests/e2e_tpch_tests.rs` | Open |
+| P4 (cosmetic) | Issue 7 — `buf≈-2` sentinel in churn report | `GREATEST(reltuples, 0)` in buffer-size query | `tests/e2e_tpch_tests.rs` | Open (new) |
+| P5 (docs/observability) | Issue 5 — q17/q20 DVM performance regression | Document anti-pattern; add create-time warning | `docs/DVM_OPERATORS.md`, `src/api.rs` | Open |
+| Deferred | Issue 1 — q05/q07/q08/q09 temp spill | DVM wide-join refactor | `src/dvm/operators/join_common.rs` | Deferred |

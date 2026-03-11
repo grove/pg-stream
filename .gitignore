@@ -17,3 +17,6 @@ book/
 
 # dbt separate venv (Python 3.13, not committed)
 .venv-dbt/
+
+# TPC-H test run logs (local artefacts, not for VCS)
+test-tpch*.log
