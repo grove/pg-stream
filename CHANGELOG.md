@@ -11,6 +11,44 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Fixed
 
+#### TPC-H Test Infrastructure Hardening
+
+Fixed three root causes of TPC-H benchmark test failures and hangs
+(`e2e-test-failure-part-6`, PR #157):
+
+- **Scheduler `'calculated'` schedule causes test lock contention** — The
+  `'calculated'` schedule string stores `NULL` in the catalog and maps to
+  `ScheduleMode::Calculated` (auto-refresh on any pending CDC changes), not
+  "no auto-refresh" as earlier comments assumed. During the RF mutation phase
+  all 22 stream tables accumulate CDC changes; the scheduler starts a single
+  background transaction refreshing all 22 STs (~5 minutes), blocking the
+  test's explicit refreshes and causing `test_tpch_cross_query_consistency`
+  to effectively hang. Fixed by using `'24h'` schedules in
+  `test_tpch_cross_query_consistency` and `test_tpch_sustained_churn`
+  (time-based schedules never fire within the test window), raising
+  `pg_trickle.scheduler_interval_ms` to 60 000 ms in `new_bench()`, and
+  adding a 60-second `lock_timeout` to `try_refresh_st()`. Result:
+  `test_tpch_cross_query_consistency` completes in ~152 s (was 5+ min / hung).
+
+- **Advisory lock not released on transaction abort** (`src/api.rs`) —
+  `pg_try_advisory_lock` is session-level: it survives transaction rollback.
+  When `execute_manual_refresh()` triggered a PostgreSQL error (e.g.
+  `temp_file_limit exceeded`), pgrx aborted the transaction and the subsequent
+  `pg_advisory_unlock()` SPI call silently no-oped (no SPI call executes in
+  an aborted transaction). The lock remained held on the pooled connection,
+  causing all subsequent `refresh_stream_table()` calls for that stream table
+  to return `RefreshSkipped — another refresh is already in progress`. Fixed
+  by replacing with `pg_try_advisory_xact_lock`: PostgreSQL automatically
+  releases transaction-level advisory locks at transaction end (commit or
+  rollback). Explicit unlock call removed.
+
+- **Bench container memory limits** (`tests/e2e/mod.rs`) — `work_mem` raised
+  from 64 MB to 256 MB to reduce sort/hash spills for multi-join delta CTEs
+  at SF=0.01; Docker SHM raised from 256 MB to 512 MB. `temp_file_limit`
+  kept at 4 GB: raising to 16 GB caused q05 (5-table join) to write 16 GB
+  before aborting, slowing cycles ~4×; fast-fail at 4 GB is preferable for
+  known-DVM-limited queries.
+
 #### HAVING Clause Differential Correctness (5 tests un-ignored)
 
 Fixed two DVM bugs that caused HAVING threshold-crossing transitions to produce

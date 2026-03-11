@@ -5,9 +5,9 @@
 > "TPC-H" and "TPC Benchmark" are trademarks of the Transaction Processing
 > Performance Council ([tpc.org](https://www.tpc.org/)).
 
-**Status:** Proposed  
+**Status:** RC-1 and RC-2 fixed; RC-3 deferred  
 **Date:** 2026-03-09  
-**Branch:** `fix-tpch-infrastructure`  
+**Branch:** `e2e-test-failure-part-6` (PR #157)  
 **Scope:** Resolution of the failures and skips observed in
 `/tmp/tpch_run.log`. Three root causes were identified across two
 infrastructure issues and one DVM correctness regression.
@@ -185,6 +185,12 @@ transaction cannot call `refresh_stream_table` on the same table twice (the
 lock would be held for the entire transaction). This pattern is not used
 anywhere in the codebase and is not a supported use-case.
 
+> **Implementation Status (PR #157):** ✅ **Fixed** (commit `47f9271`).
+> `pg_try_advisory_xact_lock` replaces session-level `pg_try_advisory_lock`;
+> the explicit `pg_advisory_unlock` call was removed. Verified: after a
+> cycle where `temp_file_limit` aborts a refresh, subsequent cycles see the
+> expected `temp_file_limit exceeded` error — not `RefreshSkipped`.
+
 ---
 
 ### Fix 2 — Raise bench container memory and temp-file limits (MEDIUM PRIORITY)
@@ -237,6 +243,17 @@ grows with `work_mem` × `max_connections`. Raise to at least 512 MB:
 joins become more likely). If any test has plan-sensitive assertions, they may
 need updating. In practice all TPC-H invariant checks are multiset-equality
 assertions against the live query, so plan changes are fine.
+
+> **Implementation Status (PR #157):** ✅ **Partially fixed** (commit `47f9271`).
+> `work_mem` raised 64 MB → 256 MB; SHM raised 256 MB → 512 MB.
+> `temp_file_limit` was intentionally left at 4 GB (not raised to 16 GB as
+> originally planned): raising it to 16 GB caused q05 to write 16 GB before
+> aborting, slowing each affected cycle by ~4×. At SF=0.01 the fast-fail at
+> 4 GB is preferable for known-DVM-limited queries (q05 and other 5+ table
+> joins). Additionally, `pg_trickle.scheduler_interval_ms` is now set to
+> 60 000 ms in `new_bench()` and `lock_timeout = '60s'` is set in
+> `try_refresh_st()` as defence-in-depth against scheduler lock contention
+> (separate root cause — see scheduler `'calculated'` schedule fix below).
 
 ---
 
@@ -342,6 +359,13 @@ same PR.
 MEDIUM (Option B) — textual SQL manipulation is fragile; changes must be
 covered by unit tests.
 
+> **Implementation Status (PR #157):** ⏳ **Deferred.** Root-cause
+> investigation for `SUM(CASE WHEN …)` has not been performed. Option A
+> (disable algebraic path for `Raw` arguments) and Option B (fix
+> `replace_qualified_column_refs` for double-quoted identifiers) are both
+> tracked separately. This item should be addressed in a follow-up PR once
+> the scheduler and advisory lock fixes from this PR are merged.
+
 ---
 
 ## Sequencing
@@ -358,6 +382,39 @@ Suggested branch order:
 3. `fix-sum-case-algebraic`  — Fix 3; investigation + unit test + code change
 
 Each branch can be PR'd independently.
+
+> **Implementation note (PR #157):** All three fixes (and the additional
+> scheduler root cause below) were implemented together in branch
+> `e2e-test-failure-part-6` rather than in separate branches.
+
+---
+
+## Additional Root Cause (discovered during PR #157)
+
+### RC-4 — Scheduler `'calculated'` schedule causes test lock contention
+
+**Files:** `tests/e2e_tpch_tests.rs`, `tests/e2e/mod.rs`
+
+The `'calculated'` schedule string stores `NULL` in the catalog and maps to
+`ScheduleMode::Calculated` in the background worker. In this mode the
+scheduler calls `check_upstream_changes()` and auto-refreshes **all 22
+stream tables** whenever any CDC changes are pending — in a single background
+transaction that can run for 5+ minutes. During `test_tpch_cross_query_consistency`
+and `test_tpch_sustained_churn`, the RF mutation phase fills the CDC change
+buffers for all 22 tables. The scheduler fires, acquires refresh locks on all
+22 STs, and blocks the test's explicit `try_refresh_st()` calls, causing the
+test to appear hung.
+
+**Fix (PR #157):**
+- Changed `'calculated'` → `'24h'` for the two long-running tests. A 24-hour
+  time-based schedule never fires within the test window.
+- Added `pg_trickle.scheduler_interval_ms = 60000` (1 minute) to `new_bench()`
+  as defence-in-depth.
+- Added `lock_timeout = '60s'` in `try_refresh_st()` so a lock-blocked refresh
+  surfaces a clear timeout error rather than hanging indefinitely.
+
+**Result:** `test_tpch_cross_query_consistency` now completes in ~152 s (was
+5+ minutes / effectively hung).
 
 ---
 
