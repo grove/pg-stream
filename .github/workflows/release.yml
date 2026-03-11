@@ -36,11 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install just
-        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to /usr/local/bin
-
       - name: Check version references are in sync
-        run: just check-version-sync
+        run: ./scripts/check_version_sync.sh
 
   # ── Build release artifacts for each platform ───────────────────────────
   build-release:
