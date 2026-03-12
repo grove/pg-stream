@@ -61,25 +61,61 @@ async fn test_stmt_cdc_default_trigger_is_statement_level() {
     .await;
 
     let source_oid = db.table_oid("stmt_type_src").await;
-    let trigger_name = format!("pg_trickle_cdc_{}", source_oid);
+    let ins_trigger = format!("pg_trickle_cdc_ins_{}", source_oid);
+    let upd_trigger = format!("pg_trickle_cdc_upd_{}", source_oid);
+    let del_trigger = format!("pg_trickle_cdc_del_{}", source_oid);
 
-    // tgtype bit 0 = 0 → FOR EACH STATEMENT
+    // All three per-event triggers must be statement-level (tgtype & 1 = 0).
     assert_eq!(
-        trigger_row_bit(&db, &trigger_name).await,
+        trigger_row_bit(&db, &ins_trigger).await,
         0,
-        "CDC trigger should be statement-level (tgtype & 1 = 0)"
+        "INSERT CDC trigger should be statement-level (tgtype & 1 = 0)"
+    );
+    assert_eq!(
+        trigger_row_bit(&db, &upd_trigger).await,
+        0,
+        "UPDATE CDC trigger should be statement-level (tgtype & 1 = 0)"
+    );
+    assert_eq!(
+        trigger_row_bit(&db, &del_trigger).await,
+        0,
+        "DELETE CDC trigger should be statement-level (tgtype & 1 = 0)"
     );
 
-    // Transition table aliases must be recorded in the catalog.
+    // INSERT trigger references only __pgt_new.
     assert_eq!(
-        trigger_new_table(&db, &trigger_name).await,
+        trigger_new_table(&db, &ins_trigger).await,
         "__pgt_new",
-        "Transition NEW TABLE should be __pgt_new"
+        "INSERT trigger: tgnewtable should be __pgt_new"
     );
     assert_eq!(
-        trigger_old_table(&db, &trigger_name).await,
+        trigger_old_table(&db, &ins_trigger).await,
+        "",
+        "INSERT trigger should not reference __pgt_old"
+    );
+
+    // UPDATE trigger references both __pgt_new and __pgt_old.
+    assert_eq!(
+        trigger_new_table(&db, &upd_trigger).await,
+        "__pgt_new",
+        "UPDATE trigger: tgnewtable should be __pgt_new"
+    );
+    assert_eq!(
+        trigger_old_table(&db, &upd_trigger).await,
         "__pgt_old",
-        "Transition OLD TABLE should be __pgt_old"
+        "UPDATE trigger: tgoldtable should be __pgt_old"
+    );
+
+    // DELETE trigger references only __pgt_old.
+    assert_eq!(
+        trigger_new_table(&db, &del_trigger).await,
+        "",
+        "DELETE trigger should not reference __pgt_new"
+    );
+    assert_eq!(
+        trigger_old_table(&db, &del_trigger).await,
+        "__pgt_old",
+        "DELETE trigger: tgoldtable should be __pgt_old"
     );
 }
 
@@ -372,11 +408,13 @@ async fn test_stmt_cdc_rebuild_cdc_triggers_migrates_to_statement() {
     .await;
 
     let source_oid = db.table_oid("rebuild_src").await;
-    let trigger_name = format!("pg_trickle_cdc_{}", source_oid);
+    let row_trigger = format!("pg_trickle_cdc_{}", source_oid);
+    let ins_trigger = format!("pg_trickle_cdc_ins_{}", source_oid);
+    let upd_trigger = format!("pg_trickle_cdc_upd_{}", source_oid);
 
     // Confirm row-level trigger before migration.
     assert_eq!(
-        trigger_row_bit(&db, &trigger_name).await,
+        trigger_row_bit(&db, &row_trigger).await,
         1,
         "Should start as row-level trigger (bit = 1)"
     );
@@ -386,16 +424,26 @@ async fn test_stmt_cdc_rebuild_cdc_triggers_migrates_to_statement() {
         .await;
     db.execute("SELECT pgtrickle.rebuild_cdc_triggers()").await;
 
-    // 3. Trigger should now be statement-level.
+    // 3. Per-event statement-level triggers should now exist.
     assert_eq!(
-        trigger_row_bit(&db, &trigger_name).await,
+        trigger_row_bit(&db, &ins_trigger).await,
         0,
-        "After rebuild_cdc_triggers() trigger should be statement-level (bit = 0)"
+        "After rebuild_cdc_triggers() INSERT trigger should be statement-level (bit = 0)"
     );
     assert_eq!(
-        trigger_new_table(&db, &trigger_name).await,
+        trigger_new_table(&db, &ins_trigger).await,
         "__pgt_new",
-        "Rebuilt trigger should reference __pgt_new transition table"
+        "Rebuilt INSERT trigger should reference __pgt_new transition table"
+    );
+    assert_eq!(
+        trigger_new_table(&db, &upd_trigger).await,
+        "__pgt_new",
+        "Rebuilt UPDATE trigger should reference __pgt_new transition table"
+    );
+    assert_eq!(
+        trigger_old_table(&db, &upd_trigger).await,
+        "__pgt_old",
+        "Rebuilt UPDATE trigger should reference __pgt_old transition table"
     );
 
     // 4. DML is still captured correctly after the trigger rebuild.
@@ -436,14 +484,14 @@ async fn test_stmt_cdc_mixed_dml_in_transaction() {
     db.execute(&format!("TRUNCATE {buf}")).await;
 
     // Mix of DML in a single transaction.
-    db.execute(
-        "BEGIN; \
-         DELETE FROM mixed_dml WHERE id IN (1, 2, 3); \
-         UPDATE mixed_dml SET val = 'updated' WHERE id IN (4, 5); \
-         INSERT INTO mixed_dml VALUES (11, 'new11'), (12, 'new12'); \
-         COMMIT",
-    )
-    .await;
+    db.execute("BEGIN").await;
+    db.execute("DELETE FROM mixed_dml WHERE id IN (1, 2, 3)")
+        .await;
+    db.execute("UPDATE mixed_dml SET val = 'updated' WHERE id IN (4, 5)")
+        .await;
+    db.execute("INSERT INTO mixed_dml VALUES (11, 'new11'), (12, 'new12')")
+        .await;
+    db.execute("COMMIT").await;
 
     // 3 deletes + 2 updates + 2 inserts = 7 change rows.
     let total: i64 = db.count(&buf).await;
