@@ -750,11 +750,11 @@ updated in the same transaction from producing an inconsistent stream table.
 > **v0.4.0 total: ~60–94 hours**
 
 **Exit criteria:**
-- [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
+- [x] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
 - [x] Statement-level CDC triggers implemented (B1/B2/B3); benchmark harness in `bench_stmt_vs_row_cdc_matrix`
 - [x] LSN tick watermark active by default; no interleaved-source inconsistency in E2E tests
 - [x] Codecov badge on README; coverage report uploading
-- [ ] Extension upgrade path tested (`0.3.0 → 0.4.0`)
+- [x] Extension upgrade path tested (`0.3.0 → 0.4.0`)
 
 ---
 

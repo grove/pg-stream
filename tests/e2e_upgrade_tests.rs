@@ -639,3 +639,98 @@ async fn test_upgrade_chain_function_parity_with_fresh_install() {
         fresh_count - upgraded_count
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// L14 — 0.3.0 → 0.4.0 specific schema additions
+// ══════════════════════════════════════════════════════════════════════
+
+/// After upgrading 0.3.0 → 0.4.0, verify:
+/// - `pgtrickle.pgt_scheduler_jobs` table exists with key columns
+/// - `tick_watermark_lsn` column added to `pgt_refresh_history`
+/// - `pgtrickle.rebuild_cdc_triggers()` function exists
+///
+/// Skipped automatically when `PGS_UPGRADE_TO` is not `0.4.0`.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_030_to_040_schema_additions() {
+    if !upgrade_image_available() {
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or_default();
+    if to_version != "0.4.0" {
+        eprintln!(
+            "SKIP: test_upgrade_030_to_040_schema_additions only applies to \
+             0.3.0→0.4.0 (got {from_version}→{to_version})"
+        );
+        return;
+    }
+
+    let db = E2eDb::new().await;
+
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    // 1. pgt_scheduler_jobs table exists with key columns
+    for col in &[
+        "job_id",
+        "unit_key",
+        "unit_kind",
+        "status",
+        "member_pgt_ids",
+        "enqueued_at",
+    ] {
+        let exists: bool = db
+            .query_scalar(&format!(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM information_schema.columns \
+                    WHERE table_schema = 'pgtrickle' \
+                      AND table_name = 'pgt_scheduler_jobs' \
+                      AND column_name = '{col}' \
+                )"
+            ))
+            .await;
+        assert!(
+            exists,
+            "pgt_scheduler_jobs.{col} not found after upgrade to 0.4.0"
+        );
+    }
+
+    // 2. tick_watermark_lsn column on pgt_refresh_history
+    let has_watermark: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'pgtrickle' \
+                  AND table_name = 'pgt_refresh_history' \
+                  AND column_name = 'tick_watermark_lsn' \
+            )",
+        )
+        .await;
+    assert!(
+        has_watermark,
+        "tick_watermark_lsn not found in pgt_refresh_history after upgrade to 0.4.0"
+    );
+
+    // 3. rebuild_cdc_triggers() function exists (was called by upgrade script)
+    let has_fn: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM pg_proc p \
+                JOIN pg_namespace n ON p.pronamespace = n.oid \
+                WHERE n.nspname = 'pgtrickle' \
+                  AND p.proname = 'rebuild_cdc_triggers' \
+            )",
+        )
+        .await;
+    assert!(
+        has_fn,
+        "pgtrickle.rebuild_cdc_triggers() not found after upgrade to 0.4.0"
+    );
+}
