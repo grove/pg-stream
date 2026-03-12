@@ -52,6 +52,7 @@ LIGHT_E2E_TESTS=(
     e2e_aggregate_coverage_tests
     e2e_alter_tests
     e2e_cdc_tests
+    e2e_stmt_cdc_tests
     e2e_concurrent_tests
     e2e_coverage_error_tests
     e2e_coverage_parser_tests

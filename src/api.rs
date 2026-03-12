@@ -1162,8 +1162,10 @@ fn alter_stream_table_query(
         refresh::prewarm_merge_cache(&st);
     }
 
-    pgrx::info!(
-        "Stream table {}.{} ALTER QUERY completed (schema change: {})",
+    // ERG-F: warn so the client sees the full refresh regardless of log_min_messages.
+    pgrx::warning!(
+        "pg_trickle: stream table {}.{} ALTER QUERY applied a full refresh \
+         (schema change: {}). This may take time on large tables.",
         schema,
         table_name,
         match &schema_change {
@@ -1650,8 +1652,10 @@ fn alter_stream_table_impl(
             let updated_st = StreamTableMeta::get_by_name(&schema, &table_name)?;
             execute_manual_full_refresh(&updated_st, &schema, &table_name, &source_oids)?;
 
-            pgrx::info!(
-                "Stream table {}.{} switched from {} to {} mode (full refresh applied)",
+            // ERG-F: warn so the client sees the implicit full refresh regardless of log_min_messages.
+            pgrx::warning!(
+                "pg_trickle: stream table {}.{} refresh mode changed from {} to {}; \
+                 a full refresh was applied. This may take time on large tables.",
                 schema,
                 table_name,
                 old_mode.as_str(),
@@ -2289,6 +2293,56 @@ fn version() -> &'static str {
 #[pg_extern(schema = "pgtrickle")]
 fn _signal_launcher_rescan() {
     crate::shmem::signal_dag_rebuild();
+}
+
+/// Rebuild all CDC triggers (function body + trigger DDL) for every source
+/// table tracked by pg_trickle.
+///
+/// Called automatically during `ALTER EXTENSION pg_trickle UPDATE` (0.3.0 →
+/// 0.4.0) to migrate existing row-level CDC triggers to statement-level.
+/// Can also be called manually after changing `pg_trickle.cdc_trigger_mode`.
+///
+/// Returns `'done'` on success. Emits a `WARNING` per table on error and
+/// continues processing remaining sources.
+#[pg_extern(schema = "pgtrickle")]
+fn rebuild_cdc_triggers() -> &'static str {
+    let change_schema = config::pg_trickle_change_buffer_schema();
+
+    let source_oids: Vec<pg_sys::Oid> = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT DISTINCT source_relid \
+                 FROM pgtrickle.pgt_dependencies \
+                 WHERE source_type = 'TABLE'",
+                None,
+                &[],
+            )
+            .map_err(|e| crate::error::PgTrickleError::SpiError(e.to_string()))?;
+        let mut oids = Vec::new();
+        for row in result {
+            let oid = row
+                .get::<pg_sys::Oid>(1)
+                .unwrap_or(None)
+                .unwrap_or(pg_sys::InvalidOid);
+            if oid != pg_sys::InvalidOid {
+                oids.push(oid);
+            }
+        }
+        Ok::<_, crate::error::PgTrickleError>(oids)
+    })
+    .unwrap_or_default();
+
+    for source_oid in source_oids {
+        if let Err(e) = cdc::rebuild_cdc_trigger(source_oid, &change_schema) {
+            pgrx::warning!(
+                "pg_trickle: rebuild_cdc_triggers: failed for OID {}: {}",
+                source_oid.to_u32(),
+                e
+            );
+        }
+    }
+
+    "done"
 }
 
 /// Parse a Prometheus/GNU-style duration string and return seconds.

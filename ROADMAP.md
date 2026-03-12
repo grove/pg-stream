@@ -107,6 +107,11 @@ multiple mutation cycles (`just test-tpch`, SF=0.01).
 
 ### ORDER BY / LIMIT / OFFSET — TopK Support ✅
 
+> **In plain terms:** Stream tables can now be defined with `ORDER BY ... LIMIT N`
+> — for example "keep the top 10 best-selling products". When the underlying data
+> changes, only the top-N slot is updated incrementally rather than recomputing
+> the entire sorted list from scratch every tick.
+
 `ORDER BY ... LIMIT N` defining queries are accepted and refreshed correctly.
 All 9 plan items (TK1–TK9) implemented, including 5 TPC-H queries with ORDER BY
 restored (Q2, Q3, Q10, Q18, Q21).
@@ -127,6 +132,12 @@ See [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md).
 
 ### Diamond Dependency Consistency ✅
 
+> **In plain terms:** A "diamond" is when two stream tables share the same source
+> (A → B, A → C) and a third (D) reads from both B and C. Without special
+> handling, updating A could refresh B before C, leaving D briefly in an
+> inconsistent state where it sees new-B but old-C. This groups B and C into an
+> atomic refresh unit so D always sees them change together in a single step.
+
 Atomic refresh groups eliminate the inconsistency window in diamond DAGs
 (A→B→D, A→C→D). All 8 plan items (D1–D8) implemented.
 
@@ -144,6 +155,12 @@ Atomic refresh groups eliminate the inconsistency window in diamond DAGs
 See [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](plans/sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md).
 
 ### Transactional IVM — IMMEDIATE Mode ✅
+
+> **In plain terms:** Normally stream tables refresh on a schedule (every N
+> seconds). IMMEDIATE mode updates the stream table *inside the same database
+> transaction* as the source table change — so by the time your INSERT/UPDATE/
+> DELETE commits, the stream table is already up to date. Zero lag, at the cost
+> of a slightly slower write.
 
 New `IMMEDIATE` refresh mode that updates stream tables **within the same
 transaction** as base table DML, using statement-level AFTER triggers with
@@ -200,6 +217,12 @@ schema additions via `sql/pg_trickle--0.2.0--0.2.1.sql`:
 
 ### Upgrade Migration Infrastructure ✅
 
+> **In plain terms:** When you run `ALTER EXTENSION pg_trickle UPDATE`, all your
+> stream tables should survive intact. This adds the safety net that makes that
+> true: automated scripts that check every upgrade script covers all database
+> objects, real end-to-end tests that actually perform the upgrade in a test
+> container, and CI gates that catch regressions before they reach users.
+
 Complete safety net for `ALTER EXTENSION pg_trickle UPDATE`:
 
 | Item | Description | Status |
@@ -214,6 +237,11 @@ Complete safety net for `ALTER EXTENSION pg_trickle UPDATE`:
 | U8 | Fixed 0.1.3→0.2.0 upgrade script (was no-op placeholder) | ✅ Done |
 
 ### Documentation Expansion ✅
+
+> **In plain terms:** Added six new pages to the documentation book: a dbt
+> integration guide, contributing guide, security policy, release process, a
+> comparison with the pg_ivm extension, and a deep-dive explaining why
+> row-level triggers were chosen over logical replication for CDC.
 
 GitHub Pages book grew from 14 to 20 pages:
 
@@ -245,6 +273,11 @@ sweep.
 
 ### ORDER BY + LIMIT + OFFSET (Paged TopK) — Finalization ✅
 
+> **In plain terms:** Extends TopK to support OFFSET — so you can define a
+> stream table as "rows 11–20 of the top-20 best-selling products" (page 2 of
+> a ranked list). Useful for paginated leaderboards, ranked feeds, or any
+> use case where you want a specific window into a sorted result.
+
 Core implementation is complete (parser, catalog, refresh path, docs, 9 E2E
 tests). The `topk_offset` catalog column shipped in v0.2.1 and is exercised
 by the paged TopK feature here.
@@ -256,6 +289,12 @@ by the paged TopK feature here.
 
 ### AUTO Refresh Mode ✅
 
+> **In plain terms:** Changes the default from "always try differential
+> (incremental) refresh" to a smart automatic selection: use differential when
+> the query supports it, fall back to a full re-scan when it doesn't. New stream
+> tables also get a calculated schedule interval instead of a hardcoded
+> 1-minute default.
+
 | Item | Description | Status | Ref |
 |------|-------------|--------|-----|
 | AM1 | `RefreshMode::Auto` — uses DIFFERENTIAL when supported, falls back to FULL | ✅ Done | [PLAN_REFRESH_MODE_DEFAULT.md](plans/sql/PLAN_REFRESH_MODE_DEFAULT.md) |
@@ -263,6 +302,13 @@ by the paged TopK feature here.
 | AM3 | `create_stream_table` schedule default changed from `'1m'` to `'calculated'` | ✅ Done | — |
 
 ### ALTER QUERY ✅
+
+> **In plain terms:** Lets you change the SQL query of an existing stream table
+> without dropping and recreating it. pg_trickle inspects the old and new
+> queries, determines what type of change was made (added a column, dropped a
+> column, or fundamentally incompatible change), and performs the most minimal
+> migration possible — updating in place where it can, rebuilding only when it
+> must.
 
 | Item | Description | Status | Ref |
 |------|-------------|--------|-----|
@@ -274,6 +320,11 @@ by the paged TopK feature here.
 
 ### Upgrade Tooling ✅
 
+> **In plain terms:** If the compiled extension library (`.so` file) is a
+> different version than the SQL objects in the database, the scheduler now
+> warns loudly at startup instead of failing in confusing ways later. Also
+> adds FAQ entries and cross-links for common upgrade questions.
+
 | Item | Description | Status | Ref |
 |------|-------------|--------|-----|
 | UG1 | Version mismatch check — scheduler warns if `.so` version ≠ SQL version | ✅ Done | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) §5.2 |
@@ -281,6 +332,13 @@ by the paged TopK feature here.
 | UG3 | CI and local upgrade automation now target 0.2.2 (`upgrade-check`, upgrade-image defaults, upgrade E2E env) | ✅ Done | [PLAN_UPGRADE_MIGRATIONS.md](plans/sql/PLAN_UPGRADE_MIGRATIONS.md) |
 
 ### IMMEDIATE Mode Parity ✅
+
+> **In plain terms:** Closes two remaining SQL patterns that worked in
+> DIFFERENTIAL mode but not in IMMEDIATE mode. Recursive CTEs (queries that
+> reference themselves to compute e.g. graph reachability or org-chart
+> hierarchies) now work in IMMEDIATE mode with a configurable depth guard.
+> TopK (ORDER BY + LIMIT) queries also get a dedicated fast micro-refresh path
+> in IMMEDIATE mode.
 
 Close the gap between DIFFERENTIAL and IMMEDIATE mode SQL coverage for the
 two remaining high-risk patterns — recursive CTEs and TopK queries.
@@ -294,6 +352,13 @@ two remaining high-risk patterns — recursive CTEs and TopK queries.
 
 ### Edge Case Hardening ✅
 
+> **In plain terms:** Three targeted fixes for uncommon-but-real scenarios:
+> a cap on CUBE/ROLLUP combinatorial explosion (which can generate thousands
+> of grouping variants from a single query and crash the database); automatic
+> recovery when CDC gets stuck in a "transitioning" state after a database
+> restart; and polling-based change detection for foreign tables (tables in
+> external databases) that can't use triggers or WAL.
+
 Self-contained items from Stage 7 of the edge-cases/TIVM implementation plan.
 
 | Item | Description | Effort | Ref |
@@ -306,6 +371,12 @@ Self-contained items from Stage 7 of the edge-cases/TIVM implementation plan.
 
 ### Documentation Sweep
 
+> **In plain terms:** Filled three documentation gaps: what happens to an
+> in-flight refresh if you run DDL (ALTER TABLE, DROP INDEX) at the same time;
+> limitations when using pg_trickle on standby replicas; and a PgBouncer
+> configuration guide explaining the session-mode requirement and incompatible
+> settings.
+
 Remaining documentation gaps identified in Stage 7 of the gap analysis.
 
 | Item | Description | Effort | Status | Ref |
@@ -317,6 +388,13 @@ Remaining documentation gaps identified in Stage 7 of the gap analysis.
 > **Documentation sweep subtotal: ✅ Complete**
 
 ### WAL CDC Hardening
+
+> **In plain terms:** WAL (Write-Ahead Log) mode tracks changes by reading
+> PostgreSQL's internal replication stream rather than using row-level triggers
+> — which is more efficient and works across concurrent sessions. This work
+> added a complete E2E test suite for WAL mode, hardened the automatic fallback
+> from WAL to trigger mode when WAL isn't available, and promoted `cdc_mode =
+> 'auto'` (try WAL first, fall back to triggers) as the default.
 
 > WAL decoder F2–F3 fixes (keyless pk_hash, `old_*` columns for UPDATE) landed in v0.1.3.
 
@@ -355,6 +433,14 @@ observe, and removes one silent correctness hazard in DIFFERENTIAL mode.
 
 ### Non-Deterministic Function Handling
 
+> **In plain terms:** Functions like `random()`, `gen_random_uuid()`, and
+> `clock_timestamp()` return a different value every time they're called. In
+> DIFFERENTIAL mode, pg_trickle computes *what changed* between the old and
+> new result — but if a function changes on every call, the "change" is
+> meaningless and produces phantom rows. This detects such functions at
+> stream-table creation time and rejects them in DIFFERENTIAL mode (they still
+> work fine in FULL or IMMEDIATE mode).
+
 Status: Done. Volatility lookup, OpTree enforcement, E2E coverage, and
 documentation are complete.
 
@@ -373,6 +459,15 @@ correctness gap.
 > **Non-determinism subtotal: ~4–6 hours**
 
 ### CDC / Refresh Mode Interaction Gaps ✅
+
+> **In plain terms:** pg_trickle has four CDC modes (trigger, WAL, auto,
+> per-table override) and four refresh modes (FULL, DIFFERENTIAL, IMMEDIATE,
+> AUTO). Not every combination makes sense, and some had silent bugs. This
+> fixed six specific gaps: stale change buffers not being flushed after FULL
+> refreshes (so they got replayed again on the next tick), a missing error for
+> the IMMEDIATE + WAL combination, a new `pgt_cdc_status` monitoring view,
+> per-table CDC mode overrides, and a guard against refreshing stream tables
+> that haven't been populated yet.
 
 Six gaps between the four CDC modes and four refresh modes — missing
 validations, resource leaks, and observability holes. Phased from quick wins
@@ -426,6 +521,13 @@ validations, resource leaks, and observability holes. Phased from quick wins
 
 ### Operational
 
+> **In plain terms:** Four housekeeping improvements: clean up prepared
+> statements when the database catalog changes (prevents stale caches after
+> DDL); make WAL slot lag alert thresholds configurable rather than hardcoded;
+> simplify a confusing GUC setting (`user_triggers`) with a deprecated alias;
+> and add a `pg_trickle_dump` tool that exports all stream table definitions
+> to a replayable SQL file — useful as a backup before running an upgrade.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | O1 | Prepared statement cleanup on cache invalidation | Done | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) G4.4 |
@@ -469,6 +571,14 @@ with rollback, mode-comparison, single-row, and DAG tests.
 
 ### DVM Correctness Fixes
 
+> **In plain terms:** The Differential View Maintenance engine — the core
+> algorithm that computes *what changed* incrementally — had four correctness
+> bugs in specific SQL patterns. Queries using these patterns were silently
+> producing wrong results and had their tests marked "ignored". This release
+> fixes all four: HAVING clauses on aggregates, FULL OUTER JOINs, correlated
+> EXISTS subqueries combined with HAVING, and correlated scalar subqueries in
+> SELECT lists. All 18 previously-ignored E2E tests now pass.
+
 | Item | Description | Status |
 |------|-------------|--------|
 | DC1 | HAVING clause differential correctness — fix `COUNT(*)` rewrite and threshold-crossing upward rescan (5 tests un-ignored) | ✅ Done |
@@ -479,6 +589,13 @@ with rollback, mode-comparison, single-row, and DAG tests.
 > **DVM correctness subtotal: 18 previously-ignored E2E tests re-enabled (0 remaining)**
 
 ### SAST Program (Phases 1–3)
+
+> **In plain terms:** Adds formal static security analysis (SAST) to every
+> build. CodeQL and Semgrep scan for known vulnerability patterns — for
+> example, using SECURITY DEFINER functions without locking down `search_path`,
+> or calling `SET ROLE` in ways that could be abused. Separately, every Rust
+> `unsafe {}` block is inventoried and counted; any PR that adds new unsafe
+> blocks beyond the committed baseline fails CI automatically.
 
 | Item | Description | Status |
 |------|-------------|--------|
@@ -494,6 +611,15 @@ with rollback, mode-comparison, single-row, and DAG tests.
 > **SAST subtotal: Phases 1–3 complete; Phase 4 rule promotion tracked as post-v0.3.0 cleanup**
 
 ### TPC-H Test Suite Enhancements (T1–T6)
+
+> **In plain terms:** TPC-H is an industry-standard analytical query benchmark
+> — 22 queries against a simulated supply-chain database. This extends the
+> pg_trickle TPC-H test suite to verify four additional scenarios that the
+> basic correctness checks didn't cover: that ROLLBACK atomically undoes an
+> IVM stream table update; that DIFFERENTIAL and IMMEDIATE mode produce
+> *identical* answers for the same data; that single-row mutations work
+> correctly (not just bulk changes); and that multi-level stream table DAGs
+> refresh in the correct topological order.
 
 | Item | Description | Status |
 |------|-------------|--------|
@@ -527,6 +653,11 @@ work begins.
 
 ### Parallel Refresh
 
+> **In plain terms:** Right now the scheduler refreshes stream tables one at
+> a time. This feature lets multiple stream tables refresh simultaneously —
+> like running several errands at once instead of in a queue. When you have
+> dozens of stream tables, this can cut total refresh latency dramatically.
+
 Detailed implementation is tracked in
 [PLAN_PARALLELISM.md](plans/sql/PLAN_PARALLELISM.md). The older
 [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md)
@@ -549,19 +680,34 @@ remains the options-analysis precursor.
 
 ### Statement-Level CDC Triggers
 
+> **In plain terms:** Previously, when you updated 1,000 rows in a source
+> table, the database fired a "row changed" notification 1,000 times — once
+> per row. Now it fires once per statement, handing off all 1,000 changed
+> rows in a single batch. For bulk operations like data imports or batch
+> updates this is 50–80% cheaper; for single-row changes you won't notice a
+> difference.
+
 Replace per-row AFTER triggers with statement-level triggers using
 `NEW TABLE AS __pgt_new` / `OLD TABLE AS __pgt_old`. Expected write-side
 trigger overhead reduction of 50–80% for bulk DML; neutral for single-row.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| B1 | Replace per-row triggers with statement-level triggers; INSERT/UPDATE/DELETE via set-based buffer fill | 8h | [PLAN_PERFORMANCE_PART_9.md](plans/performance/PLAN_PERFORMANCE_PART_9.md) §Session 3 |
-| B2 | `pg_trickle.cdc_trigger_mode = 'statement'\|'row'` GUC + migration to replace row-level triggers on `ALTER EXTENSION UPDATE` | 4h | [PLAN_PERFORMANCE_PART_9.md](plans/performance/PLAN_PERFORMANCE_PART_9.md) §Session 3 |
+| ~~B1~~ | ~~Replace per-row triggers with statement-level triggers; INSERT/UPDATE/DELETE via set-based buffer fill~~ | ~~8h~~ | ✅ Done — `build_stmt_trigger_fn_sql` in cdc.rs; `REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old FOR EACH STATEMENT` created by `create_change_trigger` |
+| ~~B2~~ | ~~`pg_trickle.cdc_trigger_mode = 'statement'\|'row'` GUC + migration to replace row-level triggers on `ALTER EXTENSION UPDATE`~~ | ~~4h~~ | ✅ Done — `CdcTriggerMode` enum in config.rs; `rebuild_cdc_triggers()` in api.rs; 0.3.0→0.4.0 upgrade script migrates existing triggers |
 | B3 | Write-side benchmark matrix (narrow/medium/wide tables × bulk/single DML) | 2h | [PLAN_PERFORMANCE_PART_9.md](plans/performance/PLAN_PERFORMANCE_PART_9.md) §Session 3 |
 
-> **Statement-level CDC subtotal: ~14 hours**
+> **Statement-level CDC subtotal: ~12h done, ~2h remaining (B3)**
 
 ### Cross-Source Snapshot Consistency (Phase 1)
+
+> **In plain terms:** Imagine a stream table that joins `orders` and
+> `customers`. If a single transaction updates both tables, the old scheduler
+> could read the new `orders` data but the old `customers` data — a
+> half-applied, internally inconsistent snapshot. This fix takes a "freeze
+> frame" of the change log at the start of each scheduler tick and only
+> processes changes up to that point, so all sources are always read from the
+> same moment in time. Zero configuration required.
 
 At start of each scheduler tick, snapshot `pg_current_wal_lsn()` as a
 `tick_watermark` and cap all CDC consumption to that LSN. Zero user
@@ -570,33 +716,44 @@ updated in the same transaction from producing an inconsistent stream table.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| CSS1 | LSN tick watermark: snapshot `pg_current_wal_lsn()` per tick; cap frontier advance; log in `pgt_refresh_history`; `pg_trickle.tick_watermark_enabled` GUC (default `on`) | 3–4h | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) §Approach C |
+| ~~CSS1~~ | ~~LSN tick watermark: snapshot `pg_current_wal_lsn()` per tick; cap frontier advance; log in `pgt_refresh_history`; `pg_trickle.tick_watermark_enabled` GUC (default `on`)~~ | ~~3–4h~~ | ✅ Done |
 
-> **Cross-source consistency subtotal: ~3–4 hours**
+> **Cross-source consistency subtotal: ✅ All done**
 
 ### Ergonomic Hardening
 
+> **In plain terms:** Added helpful warning messages for common mistakes:
+> "your WAL level isn't configured for logical replication", "this source
+> table has no primary key — duplicate rows may appear", "this change will
+> trigger a full re-scan of all source data". Think of these as friendly
+> guardrails that explain *why* something might not work as expected.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| ERG-B | Warn at `_PG_init` when `cdc_mode='auto'` but `wal_level != 'logical'` — prevents silent trigger-only operation | 30min | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §B |
-| ERG-C | Warn at `create_stream_table` when source has no primary key — surfaces keyless duplicate-row risk | 1h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §C |
-| ERG-F | Emit `WARNING` when `alter_stream_table` triggers an implicit full refresh | 1h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §F |
+| ~~ERG-B~~ | ~~Warn at `_PG_init` when `cdc_mode='auto'` but `wal_level != 'logical'` — prevents silent trigger-only operation~~ | ~~30min~~ | ✅ Done |
+| ~~ERG-C~~ | ~~Warn at `create_stream_table` when source has no primary key — surfaces keyless duplicate-row risk~~ | ~~1h~~ | ✅ Done (pre-existing in `warn_source_table_properties`) |
+| ~~ERG-F~~ | ~~Emit `WARNING` when `alter_stream_table` triggers an implicit full refresh~~ | ~~1h~~ | ✅ Done |
 
-> **Ergonomic hardening subtotal: ~2.5 hours**
+> **Ergonomic hardening subtotal: ✅ All done**
 
 ### Code Coverage
 
+> **In plain terms:** Every pull request now automatically reports what
+> percentage of the code is exercised by tests, and which specific lines are
+> never touched. It's like a map that highlights the unlit corners — helpful
+> for spotting blind spots before they become bugs.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| COV | Codecov integration: move token to `with:`, add `codecov.yml` with patch targets for `src/dvm/`, add README badge, verify first upload | 1–2h | [PLAN_CODECOV.md](plans/infra/PLAN_CODECOV.md) |
+| ~~COV~~ | ~~Codecov integration: move token to `with:`, add `codecov.yml` with patch targets for `src/dvm/`, add README badge, verify first upload~~ | ~~1–2h~~ | ✅ Done — reports live at [app.codecov.io/github/grove/pg-trickle](https://app.codecov.io/github/grove/pg-trickle) |
 
 > **v0.4.0 total: ~60–94 hours**
 
 **Exit criteria:**
 - [ ] `max_concurrent_refreshes` drives real parallel refresh via coordinator + dynamic refresh workers
-- [ ] Statement-level CDC triggers pass full E2E suite; write overhead benchmarked
+- [x] Statement-level CDC triggers implemented (B1/B2); write overhead benchmark (B3) pending
 - [ ] LSN tick watermark active by default; no interleaved-source inconsistency in E2E tests
-- [ ] Codecov badge on README; coverage report uploading
+- [x] Codecov badge on README; coverage report uploading
 - [ ] Extension upgrade path tested (`0.3.0 → 0.4.0`)
 
 ---
@@ -608,6 +765,15 @@ add source-level pause/resume gating for bulk-load coordination, and deliver
 small ergonomic improvements.
 
 ### Row-Level Security (RLS) Support
+
+> **In plain terms:** Row-level security lets you write policies like "user
+> Alice can only see rows where `tenant_id = 'alice'`". Stream tables already
+> honour these policies when users query them. What this work fixes is the
+> *machinery behind the scenes* — the triggers and refresh functions that
+> build the stream table need to see *all* rows regardless of who is running
+> them, otherwise they'd produce an incomplete result. This phase hardens
+> those internal components so they always have full visibility, while
+> end-users still see only their filtered slice.
 
 Stream tables materialize the full result set (like `MATERIALIZED VIEW`). RLS
 is applied on the stream table itself for read-side filtering. Phase 1
@@ -631,6 +797,14 @@ tracking. Phase 4 (per-role `security_invoker`) is deferred to post-1.0.
 
 ### Bootstrap Source Gating
 
+> **In plain terms:** A pause/resume switch for individual source tables.
+> If you're bulk-loading 10 million rows into a source table (a nightly ETL
+> import, for example), you can "gate" it first — the scheduler will skip
+> refreshing any stream table that reads from it. Once the load is done you
+> "ungate" it and a single clean refresh runs. Without gating, the CDC system
+> would frantically process millions of intermediate changes during the load,
+> most of which get immediately overwritten anyway.
+
 Allow operators to pause CDC consumption for specific source tables (e.g.
 during bulk loads or ETL windows) without dropping and recreating stream
 tables. The scheduler skips any stream table whose transitive source set
@@ -647,6 +821,15 @@ intersects the current gated set.
 > **Bootstrap source gating subtotal: ~7–9 hours**
 
 ### Ergonomics & API Polish
+
+> **In plain terms:** A handful of quality-of-life improvements: track when
+> someone manually triggered a refresh and log it in the history table; a
+> one-row `quick_health` view that tells you at a glance whether the
+> extension is healthy (total tables, any errors, any stale tables, scheduler
+> running); a `create_stream_table_if_not_exists()` helper so deployment
+> scripts don't crash if the table was already created; and `CALL` syntax
+> wrappers so the functions feel like native PostgreSQL commands rather than
+> extension functions.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
@@ -678,6 +861,15 @@ foundation for circular stream table DAGs.
 
 ### Partitioning Support (Source Tables)
 
+> **In plain terms:** PostgreSQL lets you split large tables into smaller
+> "partitions" — for example one partition per month for an `orders` table.
+> This is a common technique for managing very large datasets. This work
+> teaches pg_trickle to track all those partitions as a unit, so adding a
+> new monthly partition doesn't silently break stream tables that depend on
+> `orders`. It also handles the special case of foreign tables (tables that
+> live in another database), restricting them to full-scan refresh since they
+> can't be change-tracked the normal way.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | PT1 | E2E tests for partitioned source tables (RANGE, basic CRUD, differential refresh) | 8–12h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §7 |
@@ -689,6 +881,16 @@ foundation for circular stream table DAGs.
 > **Partitioning subtotal: ~18–32 hours**
 
 ### Idempotent DDL (`create_or_replace`)
+
+> **In plain terms:** Right now if you run `create_stream_table()` twice with
+> the same name it errors out, and changing the query means
+> `drop_stream_table()` followed by `create_stream_table()` — which loses all
+> the data in between. `create_or_replace_stream_table()` does the right
+> thing automatically: if nothing changed it's a no-op, if only settings
+> changed it updates in place, if the query changed it rebuilds. This is the
+> same pattern as `CREATE OR REPLACE FUNCTION` in PostgreSQL — and it's
+> exactly what the dbt materialization macro needs so every `dbt run` doesn't
+> drop and recreate tables from scratch.
 
 `create_or_replace_stream_table()` performs a smart diff: no-op if identical,
 in-place alter for config-only changes, schema migration for ADD/DROP column,
@@ -705,6 +907,16 @@ pattern used by the dbt materialization macro.
 > **Idempotent DDL subtotal: ~12–13 hours**
 
 ### Anomalous Change Detection (Fuse)
+
+> **In plain terms:** Imagine a source table suddenly receives a
+> million-row batch delete — a bug, runaway script, or intentional purge.
+> Without a fuse, pg_trickle would try to process all of it and potentially
+> overload the database. This adds a circuit breaker: you set a ceiling
+> (e.g. "never process more than 50,000 changes at once"), and if that
+> limit is hit the stream table pauses and sends a notification. You
+> investigate, fix the root cause, then resume with `reset_fuse()` and
+> choose how to recover (apply the changes, reinitialize from scratch, or
+> skip them entirely).
 
 Per-stream-table fuse that blows when the change buffer row count exceeds a
 configurable fixed ceiling or an adaptive μ+kσ threshold derived from
@@ -724,6 +936,14 @@ action.
 > **Anomalous change detection subtotal: ~10–14 hours**
 
 ### Circular Dependency Foundation
+
+> **In plain terms:** Normally stream tables form a one-way chain: A feeds
+> B, B feeds C. A circular dependency means A feeds B which feeds A —
+> usually a mistake, but occasionally useful for iterative computations like
+> graph reachability or recursive aggregations. This lays the groundwork —
+> the algorithms, catalog columns, and GUC settings — to eventually allow
+> controlled circular stream tables. The actual live execution is completed
+> in v0.7.0.
 
 Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
@@ -756,6 +976,13 @@ scheduler for circular stream table DAGs.
 
 ### PostgreSQL Backward Compatibility (PG 16–18)
 
+> **In plain terms:** pg_trickle currently only targets PostgreSQL 18. This
+> work adds support for PG 16 and PG 17 so teams that haven't yet upgraded
+> can still use the extension. Each PostgreSQL major version has subtly
+> different internal APIs — especially around query parsing and the WAL
+> format used for change-data-capture — so each version needs its own
+> feature flags, build path, and CI test run.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | BC1 | Cargo.toml feature flags (`pg16`, `pg17`, `pg18`) + `cfg_aliases` | 4–8h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) §5.2 Phase 1 |
@@ -767,6 +994,15 @@ scheduler for circular stream table DAGs.
 > **Backward compatibility subtotal: ~38–56 hours**
 
 ### Watermark Gating
+
+> **In plain terms:** A scheduling control for ETL pipelines where multiple
+> source tables are populated by separate jobs that finish at different
+> times. For example, `orders` might be loaded by a job that finishes at
+> 02:00 and `products` by one that finishes at 03:00. Without watermarks,
+> the scheduler might refresh a stream table that joins the two at 02:30,
+> producing a half-complete result. Watermarks let each ETL job declare "I'm
+> done up to timestamp X", and the scheduler waits until all sources are
+> caught up within a configurable tolerance before proceeding.
 
 Let producers signal their progress so the scheduler only refreshes stream
 tables when all contributing sources are aligned within a configurable
@@ -785,6 +1021,14 @@ source tables are populated on different schedules.
 > **Watermark gating subtotal: ~17–20 hours**
 
 ### Circular Dependencies — Scheduler Integration
+
+> **In plain terms:** Completes the circular DAG work started in v0.6.0.
+> When stream tables reference each other in a cycle (A → B → A), the
+> scheduler now runs them repeatedly until the result stabilises — no more
+> changes flowing through the cycle. This is called "fixpoint iteration",
+> like solving a system of equations by re-running it until the numbers stop
+> moving. If it doesn't converge within a configurable number of rounds
+> (default 100) it surfaces an error rather than looping forever.
 
 Completes the SCC foundation from v0.6.0 with a working fixpoint iteration
 loop. Stream tables in a monotone cycle are refreshed repeatedly until
@@ -821,6 +1065,15 @@ to PostgreSQL tooling (pg_dump, ORMs, `\dm`). Requires
 
 ### Connection Pooler Compatibility
 
+> **In plain terms:** PgBouncer is the most widely used PostgreSQL connection
+> pooler — it sits in front of the database and reuses connections across
+> many application threads. In its common "transaction mode" it hands a
+> different physical connection to each transaction, which breaks anything
+> that assumes the same connection persists between calls (session locks,
+> prepared statements). This work replaces all such session-scoped state in
+> pg_trickle so it works correctly in cloud deployments — Supabase, Railway,
+> Neon, and similar platforms that route through PgBouncer by default.
+
 pg_trickle uses session-level advisory locks and `PREPARE` statements that are
 incompatible with PgBouncer transaction-mode pooling. This section replaces all
 session-scoped state with transaction-scoped equivalents.
@@ -835,6 +1088,14 @@ session-scoped state with transaction-scoped equivalents.
 
 ### External Test Suite Integration
 
+> **In plain terms:** pg_trickle's own tests were written by the pg_trickle
+> team, which means they can have the same blind spots as the code. This
+> adds validation against three independent public benchmarks: PostgreSQL's
+> own SQL conformance suite (sqllogictest), the Join Order Benchmark (a
+> realistic analytical query workload), and Nexmark (a streaming data
+> benchmark). If pg_trickle produces a different answer than PostgreSQL does
+> on the same query, these external suites will catch it.
+
 Validate correctness against independent query corpora beyond TPC-H.
 
 | Item | Description | Effort | Ref |
@@ -846,6 +1107,14 @@ Validate correctness against independent query corpora beyond TPC-H.
 > **External test suites subtotal: ~4–7 days**
 
 ### Native DDL Syntax
+
+> **In plain terms:** Currently you create stream tables by calling a
+> function: `SELECT pgtrickle.create_stream_table(...)`. This adds support
+> for standard PostgreSQL DDL syntax: `CREATE MATERIALIZED VIEW my_view
+> WITH (pgtrickle.stream = true) AS SELECT ...`. That single change means
+> `pg_dump` can back them up properly, `\dm` in psql lists them, ORMs can
+> introspect them, and migration tools like Flyway treat them like ordinary
+> database objects. Stream tables finally look native to PostgreSQL tooling.
 
 Intercept `CREATE/DROP/REFRESH MATERIALIZED VIEW` via `ProcessUtility_hook`
 and route stream-table variants through the existing internal implementations.
@@ -879,6 +1148,13 @@ visible and monitored.
 
 ### Observability
 
+> **In plain terms:** Adds ready-made dashboards and metrics exports so you
+> can see pg_trickle's health in existing monitoring systems without
+> building them yourself. The Grafana dashboard gives you a live graph of
+> refresh latency, how "stale" each stream table is, and how far behind CDC
+> is — the same kind of operational visibility you'd expect from any
+> production component.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
@@ -886,12 +1162,25 @@ visible and monitored.
 
 ### Integration & Release prep
 
+> **In plain terms:** Ships the dbt integration as a proper
+> pip-installable Python package on PyPI so `pip install dbt-pgtrickle`
+> works — no manual git cloning required. Alongside that, a full
+> documentation review polishes everything so the product is ready to be
+> announced to the wider PostgreSQL community.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | I1 | dbt-pgtrickle 0.1.0 formal release (PyPI) | 2–3h | [dbt-pgtrickle/](dbt-pgtrickle/) · [PLAN_DBT_MACRO.md](plans/dbt/PLAN_DBT_MACRO.md) |
 | I2 | Complete documentation review & polish | 4–6h | [docs/](docs/) |
 
 ### pg_dump / pg_restore Support
+
+> **In plain terms:** `pg_dump` is the standard PostgreSQL backup tool.
+> Without this, a dump of a database containing stream tables may not
+> capture them correctly — and restoring from that dump would require
+> manually recreating them by hand. This teaches `pg_dump` to emit valid
+> SQL for every stream table, and adds logic to automatically re-link
+> orphaned catalog entries when restoring an extension from a backup.
 
 Complete the native DDL story: teach pg_dump to emit `CREATE MATERIALIZED VIEW
 … WITH (pgtrickle.stream = true)` for stream tables and add an event trigger
@@ -923,6 +1212,14 @@ distribution — getting pg_trickle onto package registries.
 
 ### Release engineering
 
+> **In plain terms:** The 1.0 release is the official "we stand behind this
+> API" declaration — from this point on the function names, catalog schema,
+> and configuration settings won't change without a major version bump. The
+> practical work is getting pg_trickle onto standard package registries
+> (PGXN, apt, rpm) so it can be installed with the same commands as any
+> other PostgreSQL extension, and hardening the CloudNativePG integration
+> for Kubernetes deployments.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | R1 | Semantic versioning policy + compatibility guarantees | 2–3h | [PLAN_VERSIONING.md](plans/infra/PLAN_VERSIONING.md) |
@@ -947,6 +1244,14 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 ### Ecosystem expansion
 
+> **In plain terms:** Building first-class integrations with the tools most
+> data teams already use — a proper dbt adapter (beyond just a
+> materialization macro), an Airflow provider so you can trigger stream
+> table refreshes from Airflow DAGs, a `pgtrickle` command-line tool for
+> managing stream tables without writing SQL, and integration guides for
+> popular ORMs and migration frameworks like Django, SQLAlchemy, Flyway, and
+> Liquibase.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | E1 | dbt full adapter (`dbt-pgtrickle` extending `dbt-postgres`) | 20–30h | [PLAN_DBT_ADAPTER.md](plans/dbt/PLAN_DBT_ADAPTER.md) |
@@ -957,6 +1262,13 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 ### Scale
 
+> **In plain terms:** When you have hundreds of stream tables or a very
+> large cluster, the single background worker that drives pg_trickle today
+> can become a bottleneck. These items explore running the scheduler as an
+> external sidecar process (outside the database itself), distributing
+> stream tables across Citus shards for horizontal scale-out, and managing
+> stream tables that span multiple databases in the same PostgreSQL cluster.
+
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | S1 | External orchestrator sidecar for 100+ STs | 20–40h | [REPORT_PARALLELIZATION.md](plans/performance/REPORT_PARALLELIZATION.md) §D |
@@ -964,6 +1276,15 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | S3 | Multi-database support (beyond `postgres` DB) | TBD | [PLAN_MULTI_DATABASE.md](plans/infra/PLAN_MULTI_DATABASE.md) |
 
 ### Advanced SQL
+
+> **In plain terms:** A collection of longer-horizon features that each
+> require significant research and implementation — full circular dependency
+> execution, the remaining pieces of true in-transaction IVM (C-level
+> triggers, transition table sharing), backward-compatibility all the way to
+> PG 14/15, forward-compatibility with PostgreSQL 19, partitioned stream
+> table storage, and several query-planner improvements that reduce the cost
+> of computing incremental updates for wide tables and functions with many
+> columns.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|

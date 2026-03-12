@@ -139,6 +139,8 @@ pub struct RefreshRecord {
     pub initiated_by: Option<String>,
     /// SLA deadline at the time of refresh (duration-based schedules only).
     pub freshness_deadline: Option<TimestampWithTimeZone>,
+    /// CSS1: WAL LSN watermark captured at scheduler tick start (NULL when feature disabled).
+    pub tick_watermark_lsn: Option<String>,
 }
 
 // ── StreamTableMeta CRUD ──────────────────────────────────────────────────
@@ -1251,6 +1253,8 @@ impl RefreshRecord {
     ///
     /// `freshness_deadline` is the SLA deadline for duration-based schedules
     /// (NULL for cron-based schedules).
+    ///
+    /// `tick_watermark_lsn` is the WAL LSN watermark at tick start (CSS1; NULL when disabled).
     #[allow(clippy::too_many_arguments)]
     pub fn insert(
         pgt_id: i64,
@@ -1265,14 +1269,15 @@ impl RefreshRecord {
         delta_row_count: i64,
         merge_strategy_used: Option<&str>,
         was_full_fallback: bool,
+        tick_watermark_lsn: Option<&str>,
     ) -> Result<i64, PgTrickleError> {
         Spi::get_one_with_args::<i64>(
             "INSERT INTO pgtrickle.pgt_refresh_history \
              (pgt_id, data_timestamp, start_time, action, status, \
               rows_inserted, rows_deleted, error_message, \
               initiated_by, freshness_deadline, \
-              delta_row_count, merge_strategy_used, was_full_fallback) \
-             VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+              delta_row_count, merge_strategy_used, was_full_fallback, tick_watermark_lsn) \
+             VALUES ($1, $2, now(), $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::pg_lsn) \
              RETURNING refresh_id",
             &[
                 pgt_id.into(),
@@ -1287,6 +1292,7 @@ impl RefreshRecord {
                 delta_row_count.into(),
                 merge_strategy_used.into(),
                 was_full_fallback.into(),
+                tick_watermark_lsn.into(),
             ],
         )
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?

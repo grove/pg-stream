@@ -76,7 +76,7 @@ async fn test_alter_to_immediate_ignores_wal_cdc_guc() {
     .await;
 
     let source_oid = db.table_oid("al_mode_wal_src").await;
-    let cdc_trigger_name = format!("pg_trickle_cdc_{}", source_oid);
+    let cdc_trigger_name = format!("pg_trickle_cdc_ins_{}", source_oid);
     assert!(
         db.trigger_exists(&cdc_trigger_name, "al_mode_wal_src")
             .await,

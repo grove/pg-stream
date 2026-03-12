@@ -329,52 +329,46 @@ caching parsed LSN values as `(u32, u32)` pairs.
 
 ## 5. Phase B: CDC Architecture — Statement-Level Triggers
 
+> **Status: B1 ✅ Done · B2 ✅ Done · B3 pending**
+
 This is the highest-ROI write-side optimization identified across all
 performance plans.
 
-### B-1: Statement-Level Trigger Implementation
+### B-1: Statement-Level Trigger Implementation ✅ Done
 
 Replace the per-row AFTER trigger with a statement-level trigger using
-transition tables:
+transition tables. **Implemented in v0.4.0:**
+
+- `build_stmt_trigger_fn_sql()` in `src/cdc.rs` generates the PL/pgSQL
+  trigger function using `INSERT … SELECT FROM __pgt_new/old`.
+- `create_change_trigger()` dispatches on `config::pg_trickle_cdc_trigger_mode()`
+  and creates either:
+  - Statement: `REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old FOR EACH STATEMENT`
+  - Row (legacy): `FOR EACH ROW`
+- **Keyless table UPDATE** handled as DELETE from `__pgt_old` + INSERT from
+  `__pgt_new` (no PK join possible).
+- Trigger function name: `pg_trickle_cdc_fn_{oid}` in both modes (same name
+  allows `CREATE OR REPLACE` to switch bodies without touching the DDL).
+
+Final DDL (statement mode):
 
 ```sql
-CREATE TRIGGER pg_trickle_cdc_tr_{oid}
+CREATE TRIGGER pg_trickle_cdc_{oid}
 AFTER INSERT OR UPDATE OR DELETE ON {schema}.{table}
 REFERENCING NEW TABLE AS __pgt_new OLD TABLE AS __pgt_old
-FOR EACH STATEMENT
-EXECUTE FUNCTION pgtrickle_changes.pg_trickle_cdc_stmt_fn_{oid}();
+FOR EACH STATEMENT EXECUTE FUNCTION pgtrickle_changes.pg_trickle_cdc_fn_{oid}();
 ```
 
-The trigger function:
+### B-2: Backward Compatibility & Migration ✅ Done
 
-```sql
--- For INSERT:
-INSERT INTO pgtrickle_changes.changes_{oid} (lsn, action, pk_hash, new_*)
-SELECT pg_current_wal_lsn(), 'I',
-       pg_trickle.pg_trickle_hash(n."pk"::text), n.*
-FROM __pgt_new n;
-
--- For UPDATE:
-INSERT INTO pgtrickle_changes.changes_{oid} (lsn, action, pk_hash, new_*, old_*)
-SELECT pg_current_wal_lsn(), 'U',
-       pg_trickle.pg_trickle_hash(n."pk"::text), n.*, o.*
-FROM __pgt_new n JOIN __pgt_old o ON n.pk = o.pk;
-
--- For DELETE:
-INSERT INTO pgtrickle_changes.changes_{oid} (lsn, action, pk_hash, old_*)
-SELECT pg_current_wal_lsn(), 'D',
-       pg_trickle.pg_trickle_hash(o."pk"::text), o.*
-FROM __pgt_old o;
-```
-
-### B-2: Backward Compatibility
-
-- Keep the row-level trigger as a fallback behind a GUC
-  (`pg_trickle.cdc_trigger_mode = 'statement'|'row'`, default `'statement'`)
-- The row-level trigger handles edge cases: `COPY FROM` with
-  `-trigger` options, row-level trigger ordering requirements
-- Migration: on ALTER EXTENSION UPDATE, replace row-level triggers with
-  statement-level triggers for existing STs
+- `pg_trickle.cdc_trigger_mode = 'statement'|'row'` GUC (default `'statement'`)
+  in `src/config.rs` (`CdcTriggerMode` enum + `PGS_CDC_TRIGGER_MODE` static).
+- `rebuild_cdc_trigger()` in `src/cdc.rs`: drops + recreates the trigger DDL
+  using the current GUC mode (fn body + trigger DDL).
+- `pgtrickle.rebuild_cdc_triggers()` in `src/api.rs`: iterates all source
+  tables and calls `rebuild_cdc_trigger()` for each.
+- `sql/pg_trickle--0.3.0--0.4.0.sql`: declares the compiled function and
+  calls it to migrate existing row-level triggers on `ALTER EXTENSION UPDATE`.
 
 ### B-3: Benchmark Write-Side Improvement
 
@@ -386,7 +380,7 @@ Use the PLAN_TRIGGERS_OVERHEAD.md benchmark design to measure:
 **Expected outcome:** 50–80% overhead reduction for bulk DML; neutral for
 single-row DML.
 
-**Effort:** 12–16 hours (implementation + testing + benchmarking).
+**Effort:** ~2 hours (benchmarking only — implementation complete).
 
 ---
 

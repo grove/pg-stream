@@ -68,6 +68,24 @@ pub extern "C-unwind" fn _PG_init() {
         // spawns a per-database scheduler for each one with pg_trickle installed.
         scheduler::register_launcher_worker();
 
+        // ERG-B: Warn if cdc_mode='auto' but wal_level is not 'logical'.
+        // In this state the extension silently stays in TRIGGER-only CDC mode,
+        // which is correct but may surprise users who expect WAL-based CDC.
+        // SAFETY: `pg_sys::wal_level` is a PostgreSQL global written from
+        // postgresql.conf before shared_preload_libraries are processed.
+        let cdc_mode = config::pg_trickle_cdc_mode();
+        if cdc_mode.eq_ignore_ascii_case("auto") {
+            let current_wal_level = unsafe { pg_sys::wal_level };
+            if current_wal_level != pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32 {
+                warning!(
+                    "pg_trickle: cdc_mode='auto' but wal_level is not 'logical'. \
+                     WAL-based CDC will not activate until wal_level = logical is \
+                     set in postgresql.conf and PostgreSQL is restarted. \
+                     The extension will use trigger-based CDC in the meantime."
+                );
+            }
+        }
+
         log!("pg_trickle: initialized (shared_preload_libraries)");
     } else {
         warning!(
@@ -168,7 +186,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
                      CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')),
     initiated_by    TEXT
                      CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL')),
-    freshness_deadline TIMESTAMPTZ
+    freshness_deadline TIMESTAMPTZ,
+    tick_watermark_lsn PG_LSN
 );
 
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);
