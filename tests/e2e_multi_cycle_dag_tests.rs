@@ -80,10 +80,11 @@ async fn setup_3_layer_pipeline(db: &E2eDb) {
 }
 
 /// Refresh the 3-layer pipeline in topological order.
+/// Uses retry helper to tolerate background scheduler advisory-lock races.
 async fn refresh_pipeline(db: &E2eDb) {
-    db.refresh_st("mc_l1").await;
-    db.refresh_st("mc_l2").await;
-    db.refresh_st("mc_l3").await;
+    db.refresh_st_with_retry("mc_l1").await;
+    db.refresh_st_with_retry("mc_l2").await;
+    db.refresh_st_with_retry("mc_l3").await;
 }
 
 /// Ground-truth validation queries (written against base table `mc_src`).
