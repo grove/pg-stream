@@ -27,12 +27,13 @@ else
     PASS=false
 fi
 
-# 3. CI PGS_UPGRADE_TO must match
-CI_TO=$(grep 'PGS_UPGRADE_TO:' .github/workflows/ci.yml | sed 's/.*"\([^"]*\)".*/\1/' | head -1)
+# 3. CI upgrade matrix latest 'to:' must match current version
+# The upgrade-e2e-tests job uses a strategy matrix; extract the last 'to:' entry.
+CI_TO=$(grep -E '^\s+to:\s+' .github/workflows/ci.yml | sed 's/.*"\([^"]*\)".*/\1/' | tail -1)
 if [[ "$CI_TO" == "$VERSION" ]]; then
-    echo "  OK  ci.yml PGS_UPGRADE_TO = $CI_TO"
+    echo "  OK  ci.yml upgrade matrix latest to = $CI_TO"
 else
-    echo "  FAIL ci.yml PGS_UPGRADE_TO is '$CI_TO', expected '$VERSION'"
+    echo "  FAIL ci.yml upgrade matrix latest to is '$CI_TO', expected '$VERSION'"
     PASS=false
 fi
 

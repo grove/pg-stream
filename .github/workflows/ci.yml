@@ -239,6 +239,7 @@ jobs:
           scripts/check_upgrade_completeness.sh 0.2.1 0.2.2
           scripts/check_upgrade_completeness.sh 0.2.2 0.2.3
           scripts/check_upgrade_completeness.sh 0.2.3 0.3.0
+          scripts/check_upgrade_completeness.sh 0.3.0 0.4.0
 
   # ── Upgrade E2E tests (push-to-main + daily) ───────────────────────────
   # True version-to-version upgrade tests: install old version, populate

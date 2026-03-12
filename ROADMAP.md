@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-11
-> **Latest release:** 0.3.0 (2026-03-11)
-> **Current milestone:** v0.4.0 — Parallel Refresh & Performance Hardening
+> **Last updated:** 2026-03-12
+> **Latest release:** 0.4.0 (2026-03-12)
+> **Current milestone:** v0.5.0 — Row-Level Security & Operational Controls
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH

@@ -9,6 +9,10 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+---
+
+## [0.4.0] — 2026-03-12
+
 ### Added
 
 #### Parallel Refresh — Phase 0 + Phase 1 (Foundation)

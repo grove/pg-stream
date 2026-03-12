@@ -52,10 +52,42 @@ ALTER TABLE pgtrickle.pgt_refresh_history
 -- once to migrate all existing row-level CDC triggers to statement-level.
 -- The function is retained as pgtrickle.rebuild_cdc_triggers() for manual use
 -- (e.g. after changing pg_trickle.cdc_trigger_mode).
-CREATE OR REPLACE FUNCTION pgtrickle.rebuild_cdc_triggers()
+CREATE OR REPLACE FUNCTION pgtrickle."rebuild_cdc_triggers"()
     RETURNS text
     STRICT
     LANGUAGE c /* Rust */
     AS 'MODULE_PATHNAME', 'rebuild_cdc_triggers_wrapper';
 
 SELECT pgtrickle.rebuild_cdc_triggers();
+
+-- P4/P5: Parallel refresh observability functions (new in 0.4.0)
+CREATE OR REPLACE FUNCTION pgtrickle."worker_pool_status"()
+    RETURNS TABLE (
+        "active_workers" INT,
+        "max_workers" INT,
+        "per_db_cap" INT,
+        "parallel_mode" TEXT
+    )
+    STRICT
+    LANGUAGE c /* Rust */
+    AS 'MODULE_PATHNAME', 'worker_pool_status_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."parallel_job_status"(
+        "max_age_seconds" INT DEFAULT 300
+    ) RETURNS TABLE (
+        "job_id" bigint,
+        "unit_key" TEXT,
+        "unit_kind" TEXT,
+        "status" TEXT,
+        "member_count" INT,
+        "attempt_no" INT,
+        "scheduler_pid" INT,
+        "worker_pid" INT,
+        "enqueued_at" timestamp with time zone,
+        "started_at" timestamp with time zone,
+        "finished_at" timestamp with time zone,
+        "duration_ms" double precision
+    )
+    STRICT
+    LANGUAGE c /* Rust */
+    AS 'MODULE_PATHNAME', 'parallel_job_status_wrapper';
