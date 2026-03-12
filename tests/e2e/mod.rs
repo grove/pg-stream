@@ -55,6 +55,17 @@ static SHARED_DB_COUNTER: AtomicUsize = AtomicUsize::new(1);
 #[cfg(not(feature = "light-e2e"))]
 static SHARED_CONTAINER: tokio::sync::OnceCell<SharedContainer> =
     tokio::sync::OnceCell::const_new();
+
+/// Container ID registered for `atexit` cleanup.
+///
+/// `SHARED_CONTAINER` lives in a `static OnceCell` whose `Drop` is never
+/// called (Rust does not run destructors for statics on process exit).
+/// Ryuk — testcontainers' normal reaper — may not work in all environments
+/// (e.g. macOS Docker Desktop, where the Docker socket is not reachable from
+/// inside the Ryuk container). Storing the ID here lets a C-level `atexit`
+/// handler stop and remove the container when the test binary exits normally.
+#[cfg(not(feature = "light-e2e"))]
+static SHARED_CONTAINER_CLEANUP_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 #[cfg(not(feature = "light-e2e"))]
 // Serialises tests that use ALTER SYSTEM against the process-local shared
 // container. `cargo test --test <name>` runs each test binary in its own
@@ -205,6 +216,37 @@ async fn shared_container() -> &'static SharedContainer {
                 "Failed to start shared pg_trickle E2E container. \
                  Did you run ./tests/build_e2e_image.sh first?",
             );
+
+            // Register an atexit handler to stop+remove the shared container
+            // when the test binary exits.  This complements Ryuk in case Ryuk
+            // cannot reach the Docker socket (common on macOS Docker Desktop).
+            {
+                let _ = SHARED_CONTAINER_CLEANUP_ID.set(container.id().to_string());
+
+                unsafe extern "C" fn rm_shared_container_at_exit() {
+                    if let Some(id) = SHARED_CONTAINER_CLEANUP_ID.get() {
+                        // -f: stop if running; -v: also remove anonymous volumes
+                        let _ = std::process::Command::new("docker")
+                            .args(["rm", "-fv", id])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                }
+
+                unsafe extern "C" {
+                    fn atexit(func: unsafe extern "C" fn()) -> i32;
+                }
+
+                // SAFETY: `rm_shared_container_at_exit` is a plain C function
+                // pointer that only touches `SHARED_CONTAINER_CLEANUP_ID`, a
+                // `static OnceLock` safe to read after the async runtime is
+                // torn down.  `std::process::Command` uses fork+exec and is
+                // safe to call from an atexit handler.
+                unsafe {
+                    atexit(rm_shared_container_at_exit);
+                }
+            }
 
             let port = container
                 .get_host_port_ipv4(5432)

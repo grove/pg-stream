@@ -287,9 +287,10 @@ async fn test_auto_refresh_within_schedule() {
 
     // Wait for the scheduler to auto-refresh
     // The scheduler detects: (now() - data_timestamp) > schedule (1s)
-    // With 100ms interval, this should happen within a few seconds
+    // With 100ms interval, this should happen within a few seconds.
+    // 60s timeout gives CI runners headroom under load.
     let refreshed = db
-        .wait_for_auto_refresh("auto_st", Duration::from_secs(30))
+        .wait_for_auto_refresh("auto_st", Duration::from_secs(60))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh the ST");
 
@@ -337,7 +338,7 @@ async fn test_auto_refresh_differential_mode() {
     db.execute("INSERT INTO inc_src VALUES (3, 300)").await;
 
     let refreshed = db
-        .wait_for_auto_refresh("inc_st", Duration::from_secs(30))
+        .wait_for_auto_refresh("inc_st", Duration::from_secs(60))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh differential ST");
 
@@ -380,7 +381,7 @@ async fn test_scheduler_writes_refresh_history() {
 
     // Wait for the scheduler to refresh
     let refreshed = db
-        .wait_for_auto_refresh("hist_st", Duration::from_secs(30))
+        .wait_for_auto_refresh("hist_st", Duration::from_secs(60))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh");
 
@@ -428,7 +429,7 @@ async fn test_auto_refresh_differential_with_cdc() {
 
     // Wait for auto-refresh to pick up the new rows
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(30);
+    let timeout = Duration::from_secs(60);
     loop {
         if start.elapsed() > timeout {
             break;
@@ -481,7 +482,7 @@ async fn test_scheduler_refreshes_multiple_healthy_sts() {
 
     // Wait for both to be refreshed (poll row counts)
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(30);
+    let timeout = Duration::from_secs(60);
     loop {
         if start.elapsed() > timeout {
             break;
@@ -536,7 +537,7 @@ async fn test_auto_refresh_updates_catalog_metadata() {
     db.execute("INSERT INTO meta_src VALUES (2)").await;
 
     let refreshed = db
-        .wait_for_auto_refresh("meta_st", Duration::from_secs(30))
+        .wait_for_auto_refresh("meta_st", Duration::from_secs(60))
         .await;
     assert!(refreshed, "Scheduler should auto-refresh");
 

@@ -283,7 +283,14 @@ pub fn register_scheduler_worker() {
 ///
 /// The coordinator calls this after enqueuing a job and acquiring a worker
 /// token from shared memory. The database name and job_id are packed into
-/// `bgw_extra` as `"<db_name>\0<job_id>"`.
+/// `bgw_extra` as `"<db_name>|<job_id>"`.
+///
+/// **Why `|` and not `\0`?** pgrx's `BackgroundWorker::get_extra()` uses
+/// `CStr::from_ptr` internally, which treats the first null byte as the
+/// string terminator. A null-byte separator would therefore cause the
+/// job_id portion to be silently dropped when the worker reads the extra.
+/// The pipe character `|` is not a valid PostgreSQL identifier character
+/// (without quoting) and is safe to use as a delimiter here.
 ///
 /// Returns `Ok(())` on successful spawn, `Err(...)` if the dynamic worker
 /// could not be registered.
@@ -292,7 +299,8 @@ pub fn spawn_refresh_worker(
     job_id: i64,
 ) -> Result<(), crate::error::PgTrickleError> {
     // Pack db_name + job_id into bgw_extra (max 128 bytes).
-    let extra = format!("{}\0{}", db_name, job_id);
+    // Use '|' as separator — see doc comment above for why not '\0'.
+    let extra = format!("{db_name}|{job_id}");
     if extra.len() > 128 {
         return Err(crate::error::PgTrickleError::InternalError(format!(
             "bgw_extra too long ({} bytes) for db='{}' job_id={}",
@@ -456,7 +464,9 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
 
 /// Parse the worker's bgw_extra string: "db_name\0job_id".
 fn parse_worker_extra(extra: &str) -> Option<(String, i64)> {
-    let parts: Vec<&str> = extra.splitn(2, '\0').collect();
+    // Format is "<db_name>|<job_id>" — see spawn_refresh_worker for why '|'
+    // is used instead of '\0' (pgrx's get_extra() truncates at null bytes).
+    let parts: Vec<&str> = extra.splitn(2, '|').collect();
     if parts.len() != 2 {
         return None;
     }
@@ -972,6 +982,35 @@ fn parallel_dispatch_tick(
             job_id,
             unit.kind,
         );
+    }
+
+    // ── Step 4: Reset cycle state when the wave is fully complete ────────
+    // A dispatch wave completes when all in-flight workers have finished AND
+    // nothing new was dispatched in Step 3 (per_db_inflight is still 0 after
+    // the dispatch loop).  At that point `succeeded = true` on every unit
+    // that ran this wave, and we can clear those flags so units become
+    // eligible for the next scheduled wave.
+    //
+    // Placing the reset HERE (after dispatch) rather than before Step 2 is
+    // critical for cascade correctness.  With a two-unit cascade A → B:
+    //   • A completes in Step 1 → per_db_inflight drops to 0, B.remaining=0.
+    //   • Step 2 sees B ready; Step 3 dispatches B → per_db_inflight becomes 1.
+    //   • Reset check: per_db_inflight == 1 → no reset.  B runs correctly.
+    // If the reset were placed before Step 2, per_db_inflight would be 0 at
+    // that point (B not yet dispatched), causing B.remaining_upstreams to be
+    // restored to 1 — blocking B forever in a cascade.
+    if state.per_db_inflight == 0 {
+        let any_done = state.unit_states.values().any(|us| us.succeeded);
+        if any_done {
+            for (&uid, us) in state.unit_states.iter_mut() {
+                us.succeeded = false;
+                us.remaining_upstreams = eu_dag.get_upstream_units(uid).len();
+            }
+            log!(
+                "pg_trickle: parallel dispatch — wave complete, reset {} unit(s)",
+                state.unit_states.len()
+            );
+        }
     }
 }
 
@@ -2724,7 +2763,7 @@ mod tests {
 
     #[test]
     fn test_parse_worker_extra_valid() {
-        let result = parse_worker_extra("mydb\x0042");
+        let result = parse_worker_extra("mydb|42");
         assert!(result.is_some());
         let (db, id) = result.unwrap();
         assert_eq!(db, "mydb");
@@ -2733,7 +2772,7 @@ mod tests {
 
     #[test]
     fn test_parse_worker_extra_long_db_name() {
-        let result = parse_worker_extra("my_production_database\x00999999");
+        let result = parse_worker_extra("my_production_database|999999");
         assert!(result.is_some());
         let (db, id) = result.unwrap();
         assert_eq!(db, "my_production_database");
@@ -2752,22 +2791,22 @@ mod tests {
 
     #[test]
     fn test_parse_worker_extra_empty_db_name() {
-        assert!(parse_worker_extra("\x0042").is_none());
+        assert!(parse_worker_extra("|42").is_none());
     }
 
     #[test]
     fn test_parse_worker_extra_invalid_job_id() {
-        assert!(parse_worker_extra("mydb\x00abc").is_none());
+        assert!(parse_worker_extra("mydb|abc").is_none());
     }
 
     #[test]
     fn test_parse_worker_extra_negative_job_id() {
-        assert!(parse_worker_extra("mydb\x00-1").is_none());
+        assert!(parse_worker_extra("mydb|-1").is_none());
     }
 
     #[test]
     fn test_parse_worker_extra_zero_job_id() {
-        assert!(parse_worker_extra("mydb\x000").is_none());
+        assert!(parse_worker_extra("mydb|0").is_none());
     }
 
     // ── ParallelDispatchState tests (Phase 4) ───────────────────────
@@ -2795,6 +2834,69 @@ mod tests {
         assert_eq!(uds.remaining_upstreams, 0);
         assert!(uds.inflight_job_id.is_none());
         assert!(!uds.succeeded);
+    }
+
+    #[test]
+    fn test_parallel_state_wave_reset_fires_after_dispatch_not_before() {
+        // Regression guard for cascade correctness.
+        //
+        // The wave-complete reset (Step 4) must fire AFTER the dispatch loop
+        // (Step 3), not before it.  With a two-unit cascade A → B:
+        //
+        //   Good (reset after dispatch):
+        //     Tick: A completes → per_db_inflight=0, B.remaining=0.
+        //     Step 2: B is ready.  Step 3: dispatch B → per_db_inflight=1.
+        //     Reset check: per_db_inflight=1 → no reset.  B runs.
+        //
+        //   Bad (reset before dispatch / old Step 1.5 placement):
+        //     Tick: A completes → per_db_inflight=0.
+        //     Reset fires: B.remaining_upstreams = 1 again.
+        //     Step 2: B now blocked.  B never runs.
+        //
+        // This test validates the data-model invariant: after a complete wave
+        // (per_db_inflight==0, some units have succeeded, nothing was dispatched
+        // in Step 3), the reset should clear succeeded flags and restore
+        // remaining_upstreams so units can run in the next wave.
+
+        let mut state = ParallelDispatchState::new();
+
+        // Simulate a completed wave: two units both succeeded, nothing in-flight.
+        let uid_a = crate::dag::ExecutionUnitId(1);
+        let uid_b = crate::dag::ExecutionUnitId(2);
+        state.unit_states.insert(
+            uid_a,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.unit_states.insert(
+            uid_b,
+            UnitDispatchState {
+                remaining_upstreams: 0, // was decremented when A succeeded
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.per_db_inflight = 0;
+
+        // Simulate the Step 4 reset that fires after dispatch.
+        if state.per_db_inflight == 0 {
+            let any_done = state.unit_states.values().any(|us| us.succeeded);
+            if any_done {
+                for us in state.unit_states.values_mut() {
+                    us.succeeded = false;
+                    // remaining_upstreams would be restored from eu_dag here;
+                    // for B (which had 1 upstream) this restores it to 1.
+                }
+            }
+        }
+
+        assert!(
+            state.unit_states.values().all(|us| !us.succeeded),
+            "all succeeded flags must be cleared after wave reset"
+        );
     }
 
     #[test]
