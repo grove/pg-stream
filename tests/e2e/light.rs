@@ -449,6 +449,30 @@ impl E2eDb {
             .await;
     }
 
+    /// Like [`refresh_st`] but retries on "another refresh is already in
+    /// progress" — tolerates advisory-lock races with the background scheduler.
+    pub async fn refresh_st_with_retry(&self, name: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match self
+                .try_execute(&format!("SELECT pgtrickle.refresh_stream_table('{name}')"))
+                .await
+            {
+                Ok(_) => return,
+                Err(e) if e.to_string().contains("already in progress") => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!(
+                            "refresh_st_with_retry: timed out waiting for \
+                             concurrent refresh of '{name}' to complete"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => panic!("refresh_stream_table('{name}') failed: {e:?}"),
+            }
+        }
+    }
+
     /// Drop a stream table via `pgtrickle.drop_stream_table()`.
     pub async fn drop_st(&self, name: &str) {
         self.execute(&format!("SELECT pgtrickle.drop_stream_table('{name}')"))
