@@ -864,6 +864,30 @@ fn parallel_dispatch_tick(
         }
     }
 
+    // ── Step 1.5: Reset cycle when all prior work is done ───────────────
+    // Once per_db_inflight drops to zero, the previous dispatch cycle is
+    // complete.  Any units still marked `succeeded` are leftovers from that
+    // cycle.  Reset them (and restore remaining_upstreams from the EU DAG)
+    // so they can be dispatched again when their schedule next fires.
+    //
+    // Without this reset, `succeeded = true` would persist across ticks and
+    // units would never be dispatched a second time, causing `last_refresh_at`
+    // to stop advancing after the first cycle (all scheduler-dependent tests
+    // would time out waiting for the second refresh).
+    if state.per_db_inflight == 0 {
+        let any_done = state.unit_states.values().any(|us| us.succeeded);
+        if any_done {
+            for (&uid, us) in state.unit_states.iter_mut() {
+                us.succeeded = false;
+                us.remaining_upstreams = eu_dag.get_upstream_units(uid).len();
+            }
+            log!(
+                "pg_trickle: parallel dispatch — cycle complete, reset {} unit(s)",
+                state.unit_states.len()
+            );
+        }
+    }
+
     // ── Step 2: Build ready queue ────────────────────────────────────────
     let mut ready_queue: VecDeque<ExecutionUnitId> = VecDeque::new();
 
@@ -2805,6 +2829,59 @@ mod tests {
         assert_eq!(uds.remaining_upstreams, 0);
         assert!(uds.inflight_job_id.is_none());
         assert!(!uds.succeeded);
+    }
+
+    #[test]
+    fn test_parallel_state_succeeded_flag_resets_when_cycle_complete() {
+        // Regression guard: after a full dispatch cycle completes (per_db_inflight==0,
+        // all units succeeded), unit_states must be resettable so that the next
+        // scheduler tick can dispatch them again.
+        //
+        // This test validates the reset precondition that parallel_dispatch_tick
+        // relies on (Step 1.5).  It does not call the tick function directly
+        // (that requires a live SPI), but verifies the data model invariant:
+        // a state where every unit has succeeded=true and per_db_inflight==0
+        // represents a "completed cycle" and should have no in-flight units.
+        let mut state = ParallelDispatchState::new();
+        state.per_db_inflight = 0;
+
+        let uid = crate::dag::ExecutionUnitId(42);
+        state.unit_states.insert(
+            uid,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: None,
+                succeeded: true, // Simulates end-of-cycle state
+            },
+        );
+
+        // Verify end-of-cycle preconditions
+        assert_eq!(state.per_db_inflight, 0, "no workers in flight");
+        assert!(
+            state.unit_states.values().any(|us| us.succeeded),
+            "at least one unit has succeeded flag set"
+        );
+        assert!(
+            state.unit_states.values().all(|us| us.inflight_job_id.is_none()),
+            "no in-flight jobs remain"
+        );
+
+        // Simulate the Step 1.5 reset that parallel_dispatch_tick performs
+        if state.per_db_inflight == 0 {
+            let any_done = state.unit_states.values().any(|us| us.succeeded);
+            if any_done {
+                for us in state.unit_states.values_mut() {
+                    us.succeeded = false;
+                    // remaining_upstreams would be restored from eu_dag here
+                }
+            }
+        }
+
+        // After reset, no unit should have succeeded=true
+        assert!(
+            state.unit_states.values().all(|us| !us.succeeded),
+            "all succeeded flags must be cleared after cycle reset"
+        );
     }
 
     #[test]
