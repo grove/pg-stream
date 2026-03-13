@@ -273,7 +273,7 @@ pub fn setup_ivm_triggers(
         "CREATE OR REPLACE FUNCTION {before_fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
          AS $$
          BEGIN
              -- Lock stream table for IVM ({lock_mode:?} mode).
@@ -330,7 +330,7 @@ pub fn setup_ivm_triggers(
         "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
          AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_newtable_{oid_u32} ON COMMIT DROP AS
@@ -367,7 +367,7 @@ pub fn setup_ivm_triggers(
         "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
          AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_newtable_{oid_u32} ON COMMIT DROP AS
@@ -407,7 +407,7 @@ pub fn setup_ivm_triggers(
         "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
          AS $$
          BEGIN
              CREATE TEMP TABLE __pgt_oldtable_{oid_u32} ON COMMIT DROP AS
@@ -444,7 +444,7 @@ pub fn setup_ivm_triggers(
         "CREATE OR REPLACE FUNCTION {fn}()
          RETURNS trigger LANGUAGE plpgsql
          SECURITY DEFINER
-         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes
+         SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
          AS $$
          BEGIN
              PERFORM pgtrickle.pgt_ivm_handle_truncate({pgt_id});

@@ -225,7 +225,7 @@ CREATE OR REPLACE FUNCTION pgt_ivm_after_ins_<oid>()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog, pgtrickle, pgtrickle_changes
+SET search_path = pg_catalog, pgtrickle, pgtrickle_changes, public
 AS $$ ... $$;
 ```
 

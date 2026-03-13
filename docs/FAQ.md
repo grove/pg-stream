@@ -1965,8 +1965,9 @@ is still subject to the user's own RLS policies — only the stream table
 maintenance runs with elevated privileges.
 
 The trigger functions also set `search_path = pg_catalog, pgtrickle,
-pgtrickle_changes` to prevent search_path hijacking — a security best practice
-for all `SECURITY DEFINER` functions.
+pgtrickle_changes, public` to prevent search_path hijacking — a security best
+practice for all `SECURITY DEFINER` functions. The `public` schema is included
+because the delta SQL references user tables that typically reside there.
 
 ---
 

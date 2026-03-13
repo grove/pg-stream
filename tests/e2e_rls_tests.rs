@@ -306,7 +306,7 @@ async fn test_ivm_trigger_functions_security_definer() {
                 SELECT 1 FROM pg_proc \
                 WHERE proname LIKE 'pgt_ivm_%' \
                 AND prosecdef = true \
-                AND proconfig @> ARRAY['search_path=pg_catalog, pgtrickle, pgtrickle_changes'] \
+                AND proconfig @> ARRAY['search_path=pg_catalog, pgtrickle, pgtrickle_changes, public'] \
              )",
         )
         .await;
