@@ -179,6 +179,46 @@ test-dbt-getting-started-fast:
 check-upgrade from to:
     scripts/check_upgrade_completeness.sh {{from}} {{to}}
 
+# Validate all upgrade scripts cover their new SQL objects (no Docker needed)
+[group: "upgrade"]
+check-upgrade-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    pairs=()
+    for f in sql/pg_trickle--*--*.sql; do
+        base=$(basename "$f" .sql)
+        from=${base#pg_trickle--}
+        to=${from#*--}
+        from=${from%%--*}
+        pairs+=("$from $to")
+    done
+    # Verify the chain reaches the current Cargo.toml version
+    last_to=$(printf '%s\n' "${pairs[@]}" | awk '{print $2}' | sort -V | tail -1)
+    if [[ "$last_to" != "$current_version" ]]; then
+        echo "ERROR: Latest upgrade script target ($last_to) does not match Cargo.toml version ($current_version)."
+        echo "       Did you forget to create sql/pg_trickle--${last_to}--${current_version}.sql?"
+        exit 1
+    fi
+    echo "Found ${#pairs[@]} upgrade step(s) ending at v${current_version}"
+    failed=0
+    for pair in "${pairs[@]}"; do
+        from=${pair%% *}
+        to=${pair##* }
+        echo ""
+        echo "━━━ Checking upgrade: ${from} → ${to} ━━━"
+        if ! scripts/check_upgrade_completeness.sh "$from" "$to"; then
+            failed=1
+        fi
+    done
+    if [[ $failed -ne 0 ]]; then
+        echo ""
+        echo "FAILED: One or more upgrade completeness checks failed."
+        exit 1
+    fi
+    echo ""
+    echo "All ${#pairs[@]} upgrade step(s) passed completeness checks."
+
 # Build the upgrade Docker image for testing FROM→TO migrations
 [group: "upgrade"]
 build-upgrade-image from="0.4.0" to="0.5.0": build-e2e-image
@@ -190,6 +230,58 @@ test-upgrade from="0.4.0" to="0.5.0": (build-upgrade-image from to)
     PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
         ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture
+
+# Run upgrade E2E tests for every adjacent version pair and the full chain
+# (builds the base E2E image once, then an upgrade image per pair)
+[group: "upgrade"]
+test-upgrade-all: build-e2e-image
+    #!/usr/bin/env bash
+    set -euo pipefail
+    current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    pairs=()
+    for f in sql/pg_trickle--*--*.sql; do
+        base=$(basename "$f" .sql)
+        from=${base#pg_trickle--}
+        to=${from#*--}
+        from=${from%%--*}
+        pairs+=("$from $to")
+    done
+    # Verify the chain reaches the current Cargo.toml version
+    last_to=$(printf '%s\n' "${pairs[@]}" | awk '{print $2}' | sort -V | tail -1)
+    if [[ "$last_to" != "$current_version" ]]; then
+        echo "ERROR: Latest upgrade script target ($last_to) does not match Cargo.toml version ($current_version)."
+        echo "       Did you forget to create sql/pg_trickle--${last_to}--${current_version}.sql?"
+        exit 1
+    fi
+    # Also test the full chain from oldest archive to current version
+    oldest=$(ls sql/archive/pg_trickle--*.sql | sed 's/.*--\(.*\)\.sql/\1/' | sort -V | head -1)
+    if [[ "$oldest" != "$current_version" ]]; then
+        pairs+=("$oldest $current_version")
+    fi
+    echo "Will test ${#pairs[@]} upgrade path(s) ending at v${current_version}"
+    failed=0
+    for pair in "${pairs[@]}"; do
+        from=${pair%% *}
+        to=${pair##* }
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Testing upgrade: ${from} → ${to}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        ./tests/build_e2e_upgrade_image.sh "$from" "$to"
+        if ! PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
+             PGS_UPGRADE_FROM="$from" PGS_UPGRADE_TO="$to" \
+             ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture; then
+            echo "FAILED: upgrade ${from} → ${to}"
+            failed=1
+        fi
+    done
+    if [[ $failed -ne 0 ]]; then
+        echo ""
+        echo "FAILED: One or more upgrade tests failed."
+        exit 1
+    fi
+    echo ""
+    echo "All ${#pairs[@]} upgrade path(s) passed."
 
 # Check that all version-related files and references are in sync with Cargo.toml
 [group: "upgrade"]

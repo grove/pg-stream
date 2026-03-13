@@ -671,30 +671,24 @@ async fn test_upgrade_chain_function_parity_with_fresh_install() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// L14 — 0.3.0 → 0.4.0 specific schema additions
+// L14 — Upgrade script schema additions verified automatically
 // ══════════════════════════════════════════════════════════════════════
 
-/// After upgrading 0.3.0 → 0.4.0, verify:
-/// - `pgtrickle.pgt_scheduler_jobs` table exists with key columns
-/// - `tick_watermark_lsn` column added to `pgt_refresh_history`
-/// - `pgtrickle.rebuild_cdc_triggers()` function exists
+/// After upgrading FROM → TO, parse each intermediate upgrade SQL script
+/// in the chain and verify that every `CREATE TABLE`, `ADD COLUMN`,
+/// `CREATE FUNCTION`, and `CREATE VIEW` it declares actually exists in the
+/// database.
 ///
-/// Skipped automatically when `PGS_UPGRADE_TO` is not `0.4.0`.
+/// This is data-driven: adding a new `pg_trickle--X--Y.sql` file
+/// automatically gets coverage — no new test function required.
 #[tokio::test]
 #[ignore]
-async fn test_upgrade_030_to_040_schema_additions() {
+async fn test_upgrade_schema_additions_from_sql() {
     if !upgrade_image_available() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or_default();
-    if to_version != "0.4.0" {
-        eprintln!(
-            "SKIP: test_upgrade_030_to_040_schema_additions only applies to \
-             0.3.0→0.4.0 (got {from_version}→{to_version})"
-        );
-        return;
-    }
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
     let db = E2eDb::new().await;
 
@@ -707,189 +701,158 @@ async fn test_upgrade_030_to_040_schema_additions() {
     ))
     .await;
 
-    // 1. pgt_scheduler_jobs table exists with key columns
-    for col in &[
-        "job_id",
-        "unit_key",
-        "unit_kind",
-        "status",
-        "member_pgt_ids",
-        "enqueued_at",
-    ] {
-        let exists: bool = db
-            .query_scalar(&format!(
-                "SELECT EXISTS( \
-                    SELECT 1 FROM information_schema.columns \
-                    WHERE table_schema = 'pgtrickle' \
-                      AND table_name = 'pgt_scheduler_jobs' \
-                      AND column_name = '{col}' \
-                )"
-            ))
-            .await;
-        assert!(
-            exists,
-            "pgt_scheduler_jobs.{col} not found after upgrade to 0.4.0"
-        );
+    // Walk the upgrade chain and collect all intermediate SQL scripts
+    let mut current = from_version.clone();
+    let mut sql_files: Vec<String> = Vec::new();
+    while current != to_version {
+        // Find the next step from `current`
+        let pattern = format!("sql/pg_trickle--{}--", current);
+        let mut found = false;
+        for entry in std::fs::read_dir("sql").expect("sql/ directory") {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&format!("pg_trickle--{}--", current)) && name.ends_with(".sql") {
+                let next = name
+                    .strip_prefix(&format!("pg_trickle--{}--", current))
+                    .unwrap()
+                    .strip_suffix(".sql")
+                    .unwrap()
+                    .to_string();
+                sql_files.push(entry.path().to_string_lossy().to_string());
+                current = next;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            panic!(
+                "No upgrade script found for {pattern}*.sql — cannot reach {to_version} from {from_version}"
+            );
+        }
     }
 
-    // 2. tick_watermark_lsn column on pgt_refresh_history
-    let has_watermark: bool = db
-        .query_scalar(
-            "SELECT EXISTS( \
-                SELECT 1 FROM information_schema.columns \
-                WHERE table_schema = 'pgtrickle' \
-                  AND table_name = 'pgt_refresh_history' \
-                  AND column_name = 'tick_watermark_lsn' \
-            )",
-        )
-        .await;
-    assert!(
-        has_watermark,
-        "tick_watermark_lsn not found in pgt_refresh_history after upgrade to 0.4.0"
+    eprintln!(
+        "Checking schema additions from {} upgrade script(s) ({} → {})",
+        sql_files.len(),
+        from_version,
+        to_version
     );
 
-    // 3. rebuild_cdc_triggers() function exists (was called by upgrade script)
-    let has_fn: bool = db
-        .query_scalar(
-            "SELECT EXISTS( \
-                SELECT 1 FROM pg_proc p \
-                JOIN pg_namespace n ON p.pronamespace = n.oid \
-                WHERE n.nspname = 'pgtrickle' \
-                  AND p.proname = 'rebuild_cdc_triggers' \
-            )",
-        )
-        .await;
-    assert!(
-        has_fn,
-        "pgtrickle.rebuild_cdc_triggers() not found after upgrade to 0.4.0"
-    );
-}
+    let mut checks = 0;
 
-// ══════════════════════════════════════════════════════════════════════
-// L15 — 0.4.0 → 0.5.0 specific schema additions
-// ══════════════════════════════════════════════════════════════════════
+    for sql_path in &sql_files {
+        let sql_content =
+            std::fs::read_to_string(sql_path).unwrap_or_else(|e| panic!("read {sql_path}: {e}"));
+        let sql_lower = sql_content.to_lowercase();
 
-/// After upgrading 0.4.0 → 0.5.0, verify:
-/// - `pgtrickle.pgt_source_gates` table exists with key columns
-/// - `is_append_only` column added to `pgt_stream_tables`
-/// - `pgtrickle.gate_source()` and `pgtrickle.ungate_source()` functions exist
-/// - `pgtrickle.quick_health` view exists
-/// - `pgtrickle.create_stream_table_if_not_exists()` function exists
-///
-/// Skipped automatically when `PGS_UPGRADE_TO` is not `0.5.0`.
-#[tokio::test]
-#[ignore]
-async fn test_upgrade_040_to_050_schema_additions() {
-    if !upgrade_image_available() {
-        return;
-    }
-    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or_default();
-    if to_version != "0.5.0" {
-        eprintln!(
-            "SKIP: test_upgrade_040_to_050_schema_additions only applies to \
-             0.4.0→0.5.0 (got {from_version}→{to_version})"
-        );
-        return;
-    }
+        // Extract CREATE TABLE declarations (schema.table)
+        for cap in
+            regex_lite::Regex::new(r"(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\.(\w+)")
+                .unwrap()
+                .captures_iter(&sql_content)
+        {
+            let schema = cap.get(1).unwrap().as_str().to_lowercase();
+            let table = cap.get(2).unwrap().as_str().to_lowercase();
+            let exists: bool = db
+                .query_scalar(&format!(
+                    "SELECT EXISTS( \
+                        SELECT 1 FROM information_schema.tables \
+                        WHERE table_schema = '{schema}' AND table_name = '{table}' \
+                    )"
+                ))
+                .await;
+            assert!(
+                exists,
+                "Table {schema}.{table} declared in {sql_path} not found after upgrade"
+            );
+            checks += 1;
+        }
 
-    let db = E2eDb::new().await;
+        // Extract ADD COLUMN declarations
+        for cap in regex_lite::Regex::new(r"(?i)ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)")
+            .unwrap()
+            .captures_iter(&sql_content)
+        {
+            let col = cap.get(1).unwrap().as_str().to_lowercase();
+            // Find the nearest preceding ALTER TABLE to get the table name
+            let col_pos = cap.get(0).unwrap().start();
+            let preceding = &sql_lower[..col_pos];
+            if let Some(table_cap) =
+                regex_lite::Regex::new(r"(?i)alter\s+table\s+(?:if\s+exists\s+)?(\w+)\.(\w+)")
+                    .unwrap()
+                    .captures_iter(preceding)
+                    .last()
+            {
+                let schema = table_cap.get(1).unwrap().as_str();
+                let table = table_cap.get(2).unwrap().as_str();
+                let exists: bool = db
+                    .query_scalar(&format!(
+                        "SELECT EXISTS( \
+                            SELECT 1 FROM information_schema.columns \
+                            WHERE table_schema = '{schema}' \
+                              AND table_name = '{table}' \
+                              AND column_name = '{col}' \
+                        )"
+                    ))
+                    .await;
+                assert!(
+                    exists,
+                    "Column {schema}.{table}.{col} declared in {sql_path} not found after upgrade"
+                );
+                checks += 1;
+            }
+        }
 
-    db.execute(&format!(
-        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
-    ))
-    .await;
-    db.execute(&format!(
-        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
-    ))
-    .await;
+        // Extract CREATE [OR REPLACE] FUNCTION declarations
+        for cap in
+            regex_lite::Regex::new(r#"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\."(\w+)""#)
+                .unwrap()
+                .captures_iter(&sql_content)
+        {
+            let schema = cap.get(1).unwrap().as_str().to_lowercase();
+            let func = cap.get(2).unwrap().as_str().to_lowercase();
+            let exists: bool = db
+                .query_scalar(&format!(
+                    "SELECT EXISTS( \
+                        SELECT 1 FROM pg_proc p \
+                        JOIN pg_namespace n ON p.pronamespace = n.oid \
+                        WHERE n.nspname = '{schema}' AND p.proname = '{func}' \
+                    )"
+                ))
+                .await;
+            assert!(
+                exists,
+                "Function {schema}.{func}() declared in {sql_path} not found after upgrade"
+            );
+            checks += 1;
+        }
 
-    // 1. pgt_source_gates table exists with key columns
-    for col in &[
-        "source_relid",
-        "gated",
-        "gated_at",
-        "ungated_at",
-        "gated_by",
-    ] {
-        let exists: bool = db
-            .query_scalar(&format!(
-                "SELECT EXISTS( \
-                    SELECT 1 FROM information_schema.columns \
-                    WHERE table_schema = 'pgtrickle' \
-                      AND table_name = 'pgt_source_gates' \
-                      AND column_name = '{col}' \
-                )"
-            ))
-            .await;
-        assert!(
-            exists,
-            "pgt_source_gates.{col} not found after upgrade to 0.5.0"
-        );
-    }
-
-    // 2. is_append_only column on pgt_stream_tables
-    let has_append_only: bool = db
-        .query_scalar(
-            "SELECT EXISTS( \
-                SELECT 1 FROM information_schema.columns \
-                WHERE table_schema = 'pgtrickle' \
-                  AND table_name = 'pgt_stream_tables' \
-                  AND column_name = 'is_append_only' \
-            )",
-        )
-        .await;
-    assert!(
-        has_append_only,
-        "is_append_only not found in pgt_stream_tables after upgrade to 0.5.0"
-    );
-
-    // 3. gate_source() and ungate_source() functions exist
-    for fn_name in &["gate_source", "ungate_source"] {
-        let has_fn: bool = db
-            .query_scalar(&format!(
-                "SELECT EXISTS( \
-                    SELECT 1 FROM pg_proc p \
-                    JOIN pg_namespace n ON p.pronamespace = n.oid \
-                    WHERE n.nspname = 'pgtrickle' \
-                      AND p.proname = '{fn_name}' \
-                )"
-            ))
-            .await;
-        assert!(
-            has_fn,
-            "pgtrickle.{fn_name}() not found after upgrade to 0.5.0"
-        );
+        // Extract CREATE [OR REPLACE] VIEW declarations
+        for cap in regex_lite::Regex::new(r"(?i)CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(\w+)\.(\w+)")
+            .unwrap()
+            .captures_iter(&sql_content)
+        {
+            let schema = cap.get(1).unwrap().as_str().to_lowercase();
+            let view = cap.get(2).unwrap().as_str().to_lowercase();
+            let exists: bool = db
+                .query_scalar(&format!(
+                    "SELECT EXISTS( \
+                        SELECT 1 FROM information_schema.views \
+                        WHERE table_schema = '{schema}' AND table_name = '{view}' \
+                    )"
+                ))
+                .await;
+            assert!(
+                exists,
+                "View {schema}.{view} declared in {sql_path} not found after upgrade"
+            );
+            checks += 1;
+        }
     }
 
-    // 4. quick_health view exists
-    let has_view: bool = db
-        .query_scalar(
-            "SELECT EXISTS( \
-                SELECT 1 FROM information_schema.views \
-                WHERE table_schema = 'pgtrickle' \
-                  AND table_name = 'quick_health' \
-            )",
-        )
-        .await;
     assert!(
-        has_view,
-        "pgtrickle.quick_health view not found after upgrade to 0.5.0"
+        checks > 0,
+        "No schema additions found in upgrade scripts — is the upgrade chain correct?"
     );
-
-    // 5. create_stream_table_if_not_exists() function exists
-    let has_fn: bool = db
-        .query_scalar(
-            "SELECT EXISTS( \
-                SELECT 1 FROM pg_proc p \
-                JOIN pg_namespace n ON p.pronamespace = n.oid \
-                WHERE n.nspname = 'pgtrickle' \
-                  AND p.proname = 'create_stream_table_if_not_exists' \
-            )",
-        )
-        .await;
-    assert!(
-        has_fn,
-        "pgtrickle.create_stream_table_if_not_exists() not found after upgrade to 0.5.0"
-    );
+    eprintln!("Verified {checks} schema object(s) from upgrade SQL scripts");
 }
