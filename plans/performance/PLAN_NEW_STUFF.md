@@ -985,18 +985,17 @@ implementation, with dynamic column management as a follow-on.
 ### Recommended Implementation Order
 
 **Wave 1 (Quick Wins — v0.5.0):**
-- D-1: UNLOGGED Change Buffers ← Already planned (O-3 in TPC-H plan)
 - A-3a: MERGE Bypass — Append-Only INSERT path only (1–2 wk, low risk)
   - Expose `APPEND ONLY` declaration on `CREATE STREAM TABLE`
   - CDC heuristic fallback: use fast path until first DELETE/UPDATE seen
   - **Not** the TopK TRUNCATE sub-path (not worth doing — see A-3 analysis)
   - **Not** the Bulk COPY sub-path (infeasible via SPI — see A-3 analysis)
 - A-4: Index-Aware MERGE Planning
+- B-2: Delta Predicate Pushdown (moved from Wave 2; Low risk, High impact)
+- C-4: Change Buffer Compaction (moved from Wave 2; fix `ctid` → `seq` bug before implementing)
 
 **Wave 2 (Core Optimizations — v0.6.0):**
-- B-2: Delta Predicate Pushdown
 - B-4: Cost-Based Refresh Strategy Selection
-- C-4: Change Buffer Compaction
 
 **Wave 3 (Scalability — v0.7.0):**
 - A-2: Columnar Change Tracking
