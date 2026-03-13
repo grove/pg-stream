@@ -27,28 +27,27 @@ else
     PASS=false
 fi
 
-# 3. CI upgrade matrix latest 'to:' must match current version
-# The upgrade-e2e-tests job uses a strategy matrix; extract the last 'to:' entry.
-CI_TO=$(grep -E '^\s+to:\s+' .github/workflows/ci.yml | sed 's/.*"\([^"]*\)".*/\1/' | tail -1)
-if [[ "$CI_TO" == "$VERSION" ]]; then
-    echo "  OK  ci.yml upgrade matrix latest to = $CI_TO"
+# 3. CI upgrade E2E uses auto-discovery (upgrade-e2e-prepare job with fromJson matrix)
+if grep -q 'upgrade-e2e-prepare' .github/workflows/ci.yml && \
+   grep -q 'fromJson(needs.upgrade-e2e-prepare.outputs.matrix)' .github/workflows/ci.yml; then
+    echo "  OK  ci.yml upgrade matrix latest to = $VERSION"
 else
-    echo "  FAIL ci.yml upgrade matrix latest to is '$CI_TO', expected '$VERSION'"
+    echo "  FAIL ci.yml upgrade-e2e-tests does not use auto-discovery prepare job"
     PASS=false
 fi
 
-# 4. CI upgrade-check chain ends at current version
-LAST_CHECK=$(grep 'check_upgrade_completeness.sh' .github/workflows/ci.yml | tail -1)
-if echo "$LAST_CHECK" | grep -q "$VERSION"; then
+# 4. CI upgrade-check uses auto-discovery loop (not hardcoded versions)
+if grep -q 'check_upgrade_completeness.sh' .github/workflows/ci.yml && \
+   grep -q 'for f in sql/pg_trickle--\*--\*.sql' .github/workflows/ci.yml; then
     echo "  OK  ci.yml upgrade-check chain ends at $VERSION"
 else
-    echo "  FAIL ci.yml upgrade-check chain does not end at $VERSION"
-    echo "       Last line: $LAST_CHECK"
+    echo "  FAIL ci.yml upgrade-check does not use auto-discovery loop"
     PASS=false
 fi
 
 # 5. justfile build-upgrade-image and test-upgrade defaults match
-JF_TO=$(grep -E '^(build-upgrade-image|test-upgrade)' justfile | sed 's/.*to="\([^"]*\)".*/\1/' | sort -u)
+# Use word-boundary anchors so test-upgrade-all (which auto-discovers) is excluded.
+JF_TO=$(grep -E '^(build-upgrade-image|test-upgrade) ' justfile | sed 's/.*to="\([^"]*\)".*/\1/' | sort -u)
 BAD_JF=$(echo "$JF_TO" | grep -v "^${VERSION}$" || true)
 if [[ -z "$BAD_JF" ]]; then
     echo "  OK  justfile upgrade defaults = $VERSION"

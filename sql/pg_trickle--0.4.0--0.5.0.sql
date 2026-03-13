@@ -26,6 +26,40 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_source_gates (
 ALTER TABLE pgtrickle.pgt_stream_tables
   ADD COLUMN IF NOT EXISTS is_append_only BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Phase 5: Re-create create_stream_table with new append_only parameter
+DROP FUNCTION IF EXISTS pgtrickle."create_stream_table"(text, text, text, text, bool, text, text, text);
+
+CREATE FUNCTION pgtrickle."create_stream_table"(
+    "name"                    TEXT,
+    "query"                   TEXT,
+    "schedule"                TEXT    DEFAULT 'calculated',
+    "refresh_mode"            TEXT    DEFAULT 'AUTO',
+    "initialize"              bool    DEFAULT true,
+    "diamond_consistency"     TEXT    DEFAULT NULL,
+    "diamond_schedule_policy" TEXT    DEFAULT NULL,
+    "cdc_mode"                TEXT    DEFAULT NULL,
+    "append_only"             bool    DEFAULT false
+) RETURNS void
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'create_stream_table_wrapper';
+
+-- Phase 5: Re-create alter_stream_table with new append_only parameter
+DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(text, text, text, text, text, text, text, text);
+
+CREATE FUNCTION pgtrickle."alter_stream_table"(
+    "name"                    TEXT,
+    "query"                   TEXT    DEFAULT NULL,
+    "schedule"                TEXT    DEFAULT NULL,
+    "refresh_mode"            TEXT    DEFAULT NULL,
+    "status"                  TEXT    DEFAULT NULL,
+    "diamond_consistency"     TEXT    DEFAULT NULL,
+    "diamond_schedule_policy" TEXT    DEFAULT NULL,
+    "cdc_mode"                TEXT    DEFAULT NULL,
+    "append_only"             bool    DEFAULT NULL
+) RETURNS void
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';
+
 -- Phase 3: gate_source() — mark a source as gated, notify scheduler
 CREATE OR REPLACE FUNCTION pgtrickle."gate_source"(
     "source" TEXT

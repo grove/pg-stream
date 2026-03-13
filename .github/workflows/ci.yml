@@ -233,36 +233,74 @@ jobs:
 
       - name: Validate upgrade script completeness
         run: |
-          # Check each upgrade step in the chain
-          scripts/check_upgrade_completeness.sh 0.1.3 0.2.0
-          scripts/check_upgrade_completeness.sh 0.2.0 0.2.1
-          scripts/check_upgrade_completeness.sh 0.2.1 0.2.2
-          scripts/check_upgrade_completeness.sh 0.2.2 0.2.3
-          scripts/check_upgrade_completeness.sh 0.2.3 0.3.0
-          scripts/check_upgrade_completeness.sh 0.3.0 0.4.0
-          scripts/check_upgrade_completeness.sh 0.4.0 0.5.0
+          # Auto-discovers all upgrade steps from sql/pg_trickle--X--Y.sql files.
+          # Fails if the chain doesn't reach the current Cargo.toml version.
+          current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          pairs=()
+          for f in sql/pg_trickle--*--*.sql; do
+            base=$(basename "$f" .sql)
+            from=${base#pg_trickle--}
+            to=${from#*--}
+            from=${from%%--*}
+            pairs+=("$from $to")
+          done
+          last_to=$(printf '%s\n' "${pairs[@]}" | awk '{print $2}' | sort -V | tail -1)
+          if [[ "$last_to" != "$current_version" ]]; then
+            echo "ERROR: Latest upgrade script target ($last_to) != Cargo.toml ($current_version)"
+            exit 1
+          fi
+          echo "Checking ${#pairs[@]} upgrade step(s) ending at v${current_version}"
+          for pair in "${pairs[@]}"; do
+            from=${pair%% *}
+            to=${pair##* }
+            echo "━━━ Checking: ${from} → ${to}"
+            scripts/check_upgrade_completeness.sh "$from" "$to"
+          done
 
   # ── Upgrade E2E tests (daily + manual) ─────────────────────────────────
   # True version-to-version upgrade tests: install old version, populate
   # data, run ALTER EXTENSION UPDATE, verify everything works.
-  # Matrix covers every supported upgrade hop so regressions in any path
-  # are caught before they ship.
-  upgrade-e2e-tests:
-    name: Upgrade E2E tests (${{ matrix.from }} → ${{ matrix.to }})
+  # A prepare job discovers all upgrade pairs from sql/pg_trickle--X--Y.sql
+  # files plus the full oldest→current chain, then fans out to a matrix.
+  upgrade-e2e-prepare:
+    name: Discover upgrade pairs
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [e2e-tests]
+    outputs:
+      matrix: ${{ steps.pairs.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: pairs
+        run: |
+          current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          items='['
+          first=true
+          for f in sql/pg_trickle--*--*.sql; do
+            base=$(basename "$f" .sql)
+            from=${base#pg_trickle--}
+            to=${from#*--}
+            from=${from%%--*}
+            if [ "$first" = true ]; then first=false; else items="$items,"; fi
+            items="$items{\"from\":\"$from\",\"to\":\"$to\"}"
+          done
+          # Add full chain: oldest archive → current version
+          oldest=$(ls sql/archive/pg_trickle--*.sql | sed 's/.*--\(.*\)\.sql/\1/' | sort -V | head -1)
+          if [ "$oldest" != "$current_version" ]; then
+            items="$items,{\"from\":\"$oldest\",\"to\":\"$current_version\"}"
+          fi
+          items="$items]"
+          echo "matrix={\"include\":$items}" >> "$GITHUB_OUTPUT"
+          echo "Discovered upgrade pairs: $items"
+
+  upgrade-e2e-tests:
+    name: Upgrade E2E (${{ matrix.from }} → ${{ matrix.to }})
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [e2e-tests, upgrade-e2e-prepare]
     timeout-minutes: 35
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - from: "0.1.3"
-            to: "0.3.0"
-          - from: "0.3.0"
-            to: "0.4.0"
-          - from: "0.4.0"
-            to: "0.5.0"
+      matrix: ${{ fromJson(needs.upgrade-e2e-prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v5
 
