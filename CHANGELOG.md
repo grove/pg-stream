@@ -175,6 +175,15 @@ statement-level CDC triggers (v0.4.0 default) vs the legacy row-level triggers.
   percentages and a single-row neutrality check (±10% target).
 - ROADMAP B3 and PLAN_PERFORMANCE_PART_9 §B-3 marked ✅ Done.
 
+#### dbt Getting Started Example
+
+- **New `examples/dbt_getting_started/` project** — end-to-end dbt example
+  with org-chart seed data, staging views, and three stream table models
+  (`department_tree`, `department_stats`, `department_report`). Includes
+  automated test script (`just test-dbt-getting-started`) that builds the
+  E2E Docker image, runs the full dbt flow, and validates stream table
+  population and dbt data tests.
+
 --- — 2026-03-11
 
 ### Fixed
@@ -392,6 +401,26 @@ infinite loop preventing the 15 s retry TTL from ever expiring.
 Fixed by retaining `last_attempt` entries whose elapsed time is still within
 `retry_ttl` on a DAG signal. Only entries older than `retry_ttl` (already
 expired) are evicted, so recently-failed probes stay protected by back-off.
+
+#### dbt Getting Started Fixes
+
+- **dbt macro: query quoting breakage** — `dbt.string_literal(query)` wraps
+  values in single quotes without escaping internal quotes. Queries containing
+  single-quoted strings (e.g., `' > '` in string concatenation) broke the SQL
+  parsing, causing PostgreSQL to misinterpret the function call arguments.
+  Fixed by using PostgreSQL dollar-quoting (`$pgtrickle$...$pgtrickle$`) in
+  both `create_stream_table` and `alter_stream_table` macros.
+- **dbt macro: `schedule = none` mapped to SQL NULL** — The Rust function
+  rejects NULL for the schedule parameter and expects `'calculated'` instead.
+  Fixed by mapping dbt `none` to `'calculated'` in the create macro.
+- **View inlining: alias lost when same view used with different aliases** —
+  When a query referenced the same view multiple times with different aliases
+  (e.g., `FROM stg_departments` and `FROM stg_departments d`), the inliner
+  always used the first occurrence's alias. Fixed by using the explicit alias
+  from each RangeVar being inlined.
+- **`wait_for_populated.sh`: schema-qualified name mismatch** — The script
+  queried `WHERE pgt_name = 'public.table'` but the catalog stores unqualified
+  names. Fixed by matching on `pgt_schema || '.' || pgt_name`.
 
 ### Changed
 

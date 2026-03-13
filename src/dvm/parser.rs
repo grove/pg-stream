@@ -3679,8 +3679,11 @@ unsafe fn deparse_from_item_with_view_subs(
                 && (schema.as_deref() == Some(&s.schema)
                     || (schema.is_none() && !s.schema.is_empty()))
         }) {
-            // Replace with inline subquery
-            return Ok(format!("({}) AS {}", sub.view_sql, sub.alias));
+            // Replace with inline subquery — use the alias from this specific
+            // RangeVar, not from the substitution (which may come from a
+            // different occurrence of the same view with a different alias).
+            let alias = explicit_alias.as_deref().unwrap_or(&relname);
+            return Ok(format!("({}) AS {alias}", sub.view_sql));
         }
 
         // Not a view — deparse normally

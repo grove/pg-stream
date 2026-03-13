@@ -45,7 +45,7 @@
         BEGIN;
         SELECT pgtrickle.alter_stream_table(
           {{ dbt.string_literal(name) }},
-          query => {% if query is not none and current.defining_query != query %}{{ dbt.string_literal(query) }}{% else %}NULL{% endif %},
+          query => {% if query is not none and current.defining_query != query %}$pgtrickle${{ query }}$pgtrickle${% else %}NULL{% endif %},
           schedule => {% if current.schedule != schedule %}{% if schedule is none %}NULL{% else %}{{ dbt.string_literal(schedule) }}{% endif %}{% else %}NULL{% endif %},
           refresh_mode => {% if current.refresh_mode != refresh_mode %}{% if refresh_mode is none %}NULL{% else %}{{ dbt.string_literal(refresh_mode) }}{% endif %}{% else %}NULL{% endif %},
           status => {% if status is not none and current.status != status %}{{ dbt.string_literal(status) }}{% else %}NULL{% endif %},
