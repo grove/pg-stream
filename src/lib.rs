@@ -430,7 +430,7 @@ extension_sql!(
 -- PostgreSQL resolves CALL to procedures and SELECT to functions,
 -- so both syntaxes work without conflict.
 
-CREATE OR REPLACE PROCEDURE pgtrickle.create_stream_table(
+CREATE PROCEDURE pgtrickle.create_stream_table(
     name          text,
     query         text,
     schedule      text DEFAULT 'calculated',
@@ -448,7 +448,7 @@ AS $$
     );
 $$;
 
-CREATE OR REPLACE PROCEDURE pgtrickle.create_stream_table_if_not_exists(
+CREATE PROCEDURE pgtrickle.create_stream_table_if_not_exists(
     name          text,
     query         text,
     schedule      text DEFAULT 'calculated',
@@ -466,7 +466,7 @@ AS $$
     );
 $$;
 
-CREATE OR REPLACE PROCEDURE pgtrickle.drop_stream_table(
+CREATE PROCEDURE pgtrickle.drop_stream_table(
     name text
 )
 LANGUAGE sql
@@ -474,7 +474,7 @@ AS $$
     SELECT pgtrickle.drop_stream_table(name);
 $$;
 
-CREATE OR REPLACE PROCEDURE pgtrickle.refresh_stream_table(
+CREATE PROCEDURE pgtrickle.refresh_stream_table(
     name text
 )
 LANGUAGE sql
@@ -482,7 +482,7 @@ AS $$
     SELECT pgtrickle.refresh_stream_table(name);
 $$;
 
-CREATE OR REPLACE PROCEDURE pgtrickle.alter_stream_table(
+CREATE PROCEDURE pgtrickle.alter_stream_table(
     name                    text,
     query                   text DEFAULT NULL,
     schedule                text DEFAULT NULL,
