@@ -858,7 +858,9 @@ async fn test_upgrade_schema_additions_from_sql() {
     }
 
     if checks == 0 {
-        eprintln!("No schema additions found in upgrade scripts (empty/no-op upgrade) — skipping object checks");
+        eprintln!(
+            "No schema additions found in upgrade scripts (empty/no-op upgrade) — skipping object checks"
+        );
     } else {
         eprintln!("Verified {checks} schema object(s) from upgrade SQL scripts");
     }
