@@ -9,6 +9,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
 - [Functions](#functions)
   - [Core Lifecycle](#core-lifecycle)
     - [pgtrickle.create\_stream\_table](#pgtricklecreate_stream_table)
+    - [pgtrickle.create\_stream\_table\_if\_not\_exists](#pgtricklecreate_stream_table_if_not_exists)
     - [pgtrickle.alter\_stream\_table](#pgtricklealter_stream_table)
     - [pgtrickle.drop\_stream\_table](#pgtrickledrop_stream_table)
     - [pgtrickle.resume\_stream\_table](#pgtrickleresume_stream_table)
@@ -64,6 +65,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
 - [Views](#views)
   - [pgtrickle.stream\_tables\_info](#pgtricklestream_tables_info)
   - [pgtrickle.pg\_stat\_stream\_tables](#pgtricklepg_stat_stream_tables)
+  - [pgtrickle.quick\_health](#pgtricklequick_health)
   - [pgtrickle.pgt\_cdc\_status](#pgtricklepgt_cdc_status)
 - [Catalog Tables](#catalog-tables)
   - [pgtrickle.pgt\_stream\_tables](#pgtricklepgt_stream_tables)
@@ -642,6 +644,45 @@ SELECT pgtrickle.create_stream_table(
 
 ---
 
+### pgtrickle.create_stream_table_if_not_exists
+
+Create a stream table if it does not already exist. If a stream table with the
+given name already exists, this is a silent no-op (an `INFO` message is logged).
+The existing definition is never modified.
+
+```sql
+pgtrickle.create_stream_table_if_not_exists(
+    name                    text,
+    query                   text,
+    schedule                text      DEFAULT 'calculated',
+    refresh_mode            text      DEFAULT 'AUTO',
+    initialize              bool      DEFAULT true,
+    diamond_consistency     text      DEFAULT NULL,
+    diamond_schedule_policy text      DEFAULT NULL,
+    cdc_mode                text      DEFAULT NULL
+) → void
+```
+
+**Parameters:** Same as [`create_stream_table`](#pgtricklecreate_stream_table).
+
+**Example:**
+
+```sql
+-- Safe to re-run in migrations:
+SELECT pgtrickle.create_stream_table_if_not_exists(
+    'order_totals',
+    'SELECT customer_id, sum(amount) AS total FROM orders GROUP BY customer_id',
+    '1m',
+    'DIFFERENTIAL'
+);
+```
+
+**Notes:**
+- Useful for deployment / migration scripts that should be safe to re-run.
+- If the stream table already exists, the provided `query`, `schedule`, and other parameters are ignored — the existing definition is preserved.
+
+---
+
 ### pgtrickle.alter_stream_table
 
 Alter properties of an existing stream table.
@@ -815,7 +856,7 @@ SELECT pgtrickle.refresh_stream_table('order_totals');
 - Blocked if the ST is `SUSPENDED` — use `pgtrickle.resume_stream_table(name)` first.
 - Uses an advisory lock to prevent concurrent refreshes of the same ST.
 - For `DIFFERENTIAL` mode, generates and applies a delta query. For `FULL` mode, truncates and reloads.
-- Records the refresh in `pgtrickle.pgt_refresh_history`.
+- Records the refresh in `pgtrickle.pgt_refresh_history` with `initiated_by = 'MANUAL'`.
 
 ---
 
@@ -1951,6 +1992,31 @@ Key columns:
 | `avg_duration_ms` | `float8` | Average refresh duration |
 | `consecutive_errors` | `int` | Current error streak |
 | `cdc_modes` | `text[]` | Distinct CDC modes across TABLE-type sources (e.g. `{wal}`, `{trigger,wal}`, `{transitioning,wal}`) |
+
+---
+
+### pgtrickle.quick_health
+
+Single-row health summary for dashboards and alerting. Returns the overall
+health status of the pg_trickle extension at a glance.
+
+```sql
+SELECT * FROM pgtrickle.quick_health;
+```
+
+| Column | Type | Description |
+|---|---|---|
+| `total_stream_tables` | `bigint` | Total number of stream tables |
+| `error_tables` | `bigint` | Stream tables with `status = 'ERROR'` or `consecutive_errors > 0` |
+| `stale_tables` | `bigint` | Stream tables whose data is older than their schedule interval |
+| `scheduler_running` | `boolean` | Whether a pg_trickle scheduler backend is detected in `pg_stat_activity` |
+| `status` | `text` | Overall status: `EMPTY`, `OK`, `WARNING`, or `CRITICAL` |
+
+**Status values:**
+- `EMPTY` — No stream tables exist.
+- `OK` — All stream tables are healthy and up-to-date.
+- `WARNING` — Some tables have errors or are stale.
+- `CRITICAL` — At least one stream table is `SUSPENDED`.
 
 ---
 

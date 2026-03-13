@@ -15,6 +15,8 @@ items implemented 2026-03-11. See git history for details.
 | ERG-B — Warn at `_PG_init` when `cdc_mode='auto'` but `wal_level != 'logical'` | ✅ Done |
 | ERG-C — Warn at `create_stream_table` when source has no PRIMARY KEY | ✅ Done (pre-existing) |
 | ERG-F — Emit `WARNING` when `alter_stream_table` triggers implicit full refresh | ✅ Done |
+| ERG-D — Record manual `refresh_stream_table()` in pgt_refresh_history with `initiated_by='MANUAL'` | ✅ Done |
+| ERG-E — `pgtrickle.quick_health` view (single-row status summary) | ✅ Done |
 
 ### Remaining follow-up (not blocking)
 

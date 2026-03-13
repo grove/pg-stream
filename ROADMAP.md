@@ -867,8 +867,8 @@ intersects the current gated set.
 - [x] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
 - [x] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
 - [x] `gate_source` / `ungate_source` operational; scheduler skips gated sources correctly
-- [ ] `quick_health` view and `create_stream_table_if_not_exists` available
-- [ ] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
+- [x] `quick_health` view and `create_stream_table_if_not_exists` available
+- [x] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
 - [x] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables
 - [ ] Extension upgrade path tested (`0.4.0 → 0.5.0`)
 

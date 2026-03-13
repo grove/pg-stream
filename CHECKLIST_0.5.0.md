@@ -58,12 +58,12 @@ parallel with Phase 1 if work is shared across contributors.
 
 All items are ≤ 2 h each and independent — fill gaps between the larger phases.
 
-- [ ] **ERG-D** — Record manual `refresh_stream_table()` calls in `pgt_refresh_history`
+- [x] **ERG-D** — Record manual `refresh_stream_table()` calls in `pgt_refresh_history`
   with `initiated_by='MANUAL'`
-- [ ] **ERG-E** — `pgtrickle.quick_health` view
+- [x] **ERG-E** — `pgtrickle.quick_health` view
   (`total_stream_tables`, `error_tables`, `stale_tables`, `scheduler_running`, `status`)
-- [ ] **COR-2** — `create_stream_table_if_not_exists()` convenience wrapper
-- [ ] **NAT-CALL** — `CREATE PROCEDURE` wrappers enabling `CALL pgtrickle.create_stream_table(…)` syntax
+- [x] **COR-2** — `create_stream_table_if_not_exists()` convenience wrapper
+- [ ] ~~**NAT-CALL**~~ — Deferred: PostgreSQL does not allow procedures and functions with the same name and argument types
 
 ---
 

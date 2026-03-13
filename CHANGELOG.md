@@ -108,7 +108,22 @@ reducing per-refresh latency significantly.
 - **Upgrade script.** `sql/pg_trickle--0.4.0--0.5.0.sql` adds
   `is_append_only` column.
 
+#### Ergonomics & API Polish — Phase 4 (v0.5.0)
 
+Quality-of-life improvements for operators, deployment scripts, and dashboards.
+
+- **ERG-D: Manual refresh history.** `refresh_stream_table()` now records every
+  manual refresh in `pgt_refresh_history` with `initiated_by = 'MANUAL'`,
+  including `start_time`, `end_time`, `status`, and `action`.
+- **ERG-E: `pgtrickle.quick_health` view.** New single-row health summary view
+  returning `total_stream_tables`, `error_tables`, `stale_tables`,
+  `scheduler_running`, and an overall `status` (`EMPTY` / `OK` / `WARNING` /
+  `CRITICAL`). Ideal for monitoring dashboards and alerting integrations.
+- **COR-2: `create_stream_table_if_not_exists()`.** New convenience function
+  that silently no-ops when a stream table with the given name already exists.
+  Useful for idempotent migration scripts and deployment automation.
+
+---
 
 ## [0.4.0] — 2026-03-12
 

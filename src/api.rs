@@ -6,7 +6,7 @@
 use pgrx::prelude::*;
 use std::time::Instant;
 
-use crate::catalog::{CdcMode, StDependency, StreamTableMeta};
+use crate::catalog::{CdcMode, RefreshRecord, StDependency, StreamTableMeta};
 use crate::cdc;
 use crate::config;
 use crate::dag::{
@@ -55,6 +55,79 @@ fn create_stream_table(
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
+    }
+}
+
+/// Create a stream table if it does not already exist.
+///
+/// If a stream table with the given name already exists, this is a silent no-op
+/// (an INFO message is logged). The existing definition is never modified.
+///
+/// This is useful for migration scripts that should be safe to re-run.
+#[allow(clippy::too_many_arguments)]
+#[pg_extern(schema = "pgtrickle")]
+fn create_stream_table_if_not_exists(
+    name: &str,
+    query: &str,
+    schedule: default!(Option<&str>, "'calculated'"),
+    refresh_mode: default!(&str, "'AUTO'"),
+    initialize: default!(bool, true),
+    diamond_consistency: default!(Option<&str>, "NULL"),
+    diamond_schedule_policy: default!(Option<&str>, "NULL"),
+    cdc_mode: default!(Option<&str>, "NULL"),
+    append_only: default!(bool, false),
+) {
+    let result = create_stream_table_if_not_exists_impl(
+        name,
+        query,
+        schedule,
+        refresh_mode,
+        initialize,
+        diamond_consistency,
+        diamond_schedule_policy,
+        cdc_mode,
+        append_only,
+    );
+    if let Err(e) = result {
+        pgrx::error!("{}", e);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_stream_table_if_not_exists_impl(
+    name: &str,
+    query: &str,
+    schedule: Option<&str>,
+    refresh_mode: &str,
+    initialize: bool,
+    diamond_consistency: Option<&str>,
+    diamond_schedule_policy: Option<&str>,
+    cdc_mode: Option<&str>,
+    append_only: bool,
+) -> Result<(), PgTrickleError> {
+    let (schema, table_name) = parse_qualified_name(name)?;
+
+    match StreamTableMeta::get_by_name(&schema, &table_name) {
+        Ok(_) => {
+            pgrx::info!(
+                "Stream table {}.{} already exists — skipping creation.",
+                schema,
+                table_name,
+            );
+            Ok(())
+        }
+        Err(PgTrickleError::NotFound(_)) => create_stream_table_impl(
+            name,
+            query,
+            schedule,
+            refresh_mode,
+            initialize,
+            diamond_consistency,
+            diamond_schedule_policy,
+            cdc_mode,
+            append_only,
+        ),
+        Err(e) => Err(e),
     }
 }
 
@@ -1997,6 +2070,9 @@ fn refresh_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
 ///
 /// Dispatches to FULL or DIFFERENTIAL depending on the ST's refresh mode.
 /// `source_oids` are pre-fetched to avoid redundant SPI calls (G-N3).
+///
+/// ERG-D: Records the refresh in `pgt_refresh_history` with
+/// `initiated_by = 'MANUAL'`.
 fn execute_manual_refresh(
     st: &StreamTableMeta,
     schema: &str,
@@ -2015,32 +2091,103 @@ fn execute_manual_refresh(
     Spi::run("SET LOCAL row_security = off")
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
+    // ERG-D: Determine the action label for history recording.
+    let action = if st.topk_limit.is_some() {
+        "FULL"
+    } else {
+        match st.refresh_mode {
+            RefreshMode::Full | RefreshMode::Immediate => "FULL",
+            RefreshMode::Differential => {
+                if st.frontier.is_none() {
+                    "FULL"
+                } else {
+                    "DIFFERENTIAL"
+                }
+            }
+        }
+    };
+
+    // ERG-D: Record refresh start in pgt_refresh_history.
+    let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::InternalError("now() returned NULL".into()))?;
+
+    let refresh_id = RefreshRecord::insert(
+        st.pgt_id,
+        now,
+        action,
+        "RUNNING",
+        0,
+        0,
+        None,
+        Some("MANUAL"),
+        None, // no freshness_deadline for manual refreshes
+        0,
+        None,
+        false,
+        None, // no tick_watermark_lsn for manual refreshes
+    )?;
+
     // TopK tables use the scoped-recomputation refresh path regardless of
     // refresh_mode (they always do ORDER BY … LIMIT N via MERGE).
-    if st.topk_limit.is_some() {
-        let (rows_inserted, rows_deleted) = refresh::execute_topk_refresh(st)?;
-        pgrx::info!(
-            "Stream table {}.{} refreshed (TopK MERGE: +{} -{})",
-            schema,
-            table_name,
-            rows_inserted,
-            rows_deleted,
-        );
-        return Ok(());
+    let result = if st.topk_limit.is_some() {
+        refresh::execute_topk_refresh(st).map(|(ins, del)| {
+            pgrx::info!(
+                "Stream table {}.{} refreshed (TopK MERGE: +{} -{})",
+                schema,
+                table_name,
+                ins,
+                del,
+            );
+            (ins, del)
+        })
+    } else {
+        match st.refresh_mode {
+            RefreshMode::Full => execute_manual_full_refresh(st, schema, table_name, source_oids)
+                .map(|_| (0i64, 0i64)),
+            RefreshMode::Differential => {
+                execute_manual_differential_refresh(st, schema, table_name, source_oids)
+                    .map(|_| (0i64, 0i64))
+            }
+            RefreshMode::Immediate => {
+                // For IMMEDIATE mode, manual refresh does a FULL refresh
+                // (re-populate from the defining query), same as pg_ivm's
+                // refresh_immv(name, true).
+                execute_manual_full_refresh(st, schema, table_name, source_oids)
+                    .map(|_| (0i64, 0i64))
+            }
+        }
+    };
+
+    // ERG-D: Complete the refresh history record.
+    match &result {
+        Ok((rows_inserted, rows_deleted)) => {
+            let _ = RefreshRecord::complete(
+                refresh_id,
+                "COMPLETED",
+                *rows_inserted,
+                *rows_deleted,
+                None,
+                0,
+                None,
+                false,
+            );
+        }
+        Err(e) => {
+            let _ = RefreshRecord::complete(
+                refresh_id,
+                "FAILED",
+                0,
+                0,
+                Some(&e.to_string()),
+                0,
+                None,
+                false,
+            );
+        }
     }
 
-    match st.refresh_mode {
-        RefreshMode::Full => execute_manual_full_refresh(st, schema, table_name, source_oids),
-        RefreshMode::Differential => {
-            execute_manual_differential_refresh(st, schema, table_name, source_oids)
-        }
-        RefreshMode::Immediate => {
-            // For IMMEDIATE mode, manual refresh does a FULL refresh
-            // (re-populate from the defining query), same as pg_ivm's
-            // refresh_immv(name, true).
-            execute_manual_full_refresh(st, schema, table_name, source_oids)
-        }
-    }
+    result.map(|_| ())
 }
 
 /// Execute a FULL manual refresh: truncate + repopulate from the defining query.

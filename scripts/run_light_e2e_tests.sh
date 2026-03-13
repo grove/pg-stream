@@ -80,6 +80,7 @@ LIGHT_E2E_TESTS=(
     e2e_monitoring_tests
     e2e_multi_cycle_dag_tests
     e2e_multi_window_tests
+    e2e_phase4_ergonomics_tests
     e2e_pipeline_dag_tests
     e2e_property_tests
     e2e_refresh_tests
