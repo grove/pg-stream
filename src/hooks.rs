@@ -768,6 +768,28 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
                 }
                 reinit_pgt_ids.push(*pgt_id);
             }
+            SchemaChangeKind::RlsChange => {
+                // R9: RLS state changed on source table (ENABLE/DISABLE ROW
+                // LEVEL SECURITY or FORCE/NO FORCE ROW LEVEL SECURITY).
+                // Stream tables always materialize the full result set
+                // (bypassing RLS), but the state change should trigger a
+                // reinit to update the stored snapshot and acknowledge the
+                // new security posture.
+                pgrx::info!(
+                    "pg_trickle: RLS state changed on {} — stream table {} marked for reinit",
+                    identity,
+                    pgt_id,
+                );
+                if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+                    pgrx::warning!(
+                        "pg_trickle_ddl_tracker: failed to mark ST {} for reinit \
+                         after RLS change: {}",
+                        pgt_id,
+                        e,
+                    );
+                }
+                reinit_pgt_ids.push(*pgt_id);
+            }
         }
     }
 
@@ -1353,6 +1375,8 @@ pub enum SchemaChangeKind {
     AddColumnOnly,
     /// Constraint or index change — may not require reinitialize.
     ConstraintChange,
+    /// RLS state changed (ENABLE/DISABLE ROW LEVEL SECURITY or FORCE/NO FORCE).
+    RlsChange,
     /// Other DDL (comment, owner change, etc.) — no reinitialize needed.
     Benign,
 }
@@ -1373,7 +1397,8 @@ pub fn detect_schema_change_kind(
     pgt_id: i64,
 ) -> Result<SchemaChangeKind, PgTrickleError> {
     // Fast path: compare schema fingerprints.
-    // If the stored fingerprint matches the current one, nothing column-related changed.
+    // If the stored fingerprint matches the current one, nothing changed
+    // (neither columns nor RLS state).
     if let Ok(Some(stored_fp)) = crate::catalog::get_schema_fingerprint(pgt_id, source_oid)
         && !stored_fp.is_empty()
         && let Ok((_, current_fp)) = crate::catalog::build_column_snapshot(source_oid)
@@ -1383,11 +1408,46 @@ pub fn detect_schema_change_kind(
     }
 
     // Detailed path: compare stored column snapshot against current pg_attribute.
-    if let Ok(Some(snapshot)) = crate::catalog::get_column_snapshot(pgt_id, source_oid)
-        && let serde_json::Value::Array(ref entries) = snapshot.0
-        && !entries.is_empty()
-    {
-        return detect_from_snapshot(source_oid, entries);
+    if let Ok(Some(snapshot)) = crate::catalog::get_column_snapshot(pgt_id, source_oid) {
+        match &snapshot.0 {
+            // New format (v0.5.0+): Object with "columns", "rls_enabled", "rls_forced".
+            serde_json::Value::Object(obj) => {
+                if let Some(serde_json::Value::Array(entries)) = obj.get("columns")
+                    && !entries.is_empty()
+                {
+                    let col_kind = detect_from_snapshot(source_oid, entries)?;
+
+                    // Column-level changes take priority.
+                    if matches!(
+                        col_kind,
+                        SchemaChangeKind::ColumnChange | SchemaChangeKind::AddColumnOnly
+                    ) {
+                        return Ok(col_kind);
+                    }
+
+                    // Columns unchanged — check if RLS state changed.
+                    let stored_rls = obj
+                        .get("rls_enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let stored_force = obj
+                        .get("rls_forced")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let (current_rls, current_force) = crate::catalog::query_rls_flags(source_oid)?;
+                    if stored_rls != current_rls || stored_force != current_force {
+                        return Ok(SchemaChangeKind::RlsChange);
+                    }
+
+                    return Ok(col_kind);
+                }
+            }
+            // Legacy format (pre-v0.5.0): plain Array of column entries.
+            serde_json::Value::Array(entries) if !entries.is_empty() => {
+                return detect_from_snapshot(source_oid, entries);
+            }
+            _ => {}
+        }
     }
 
     // Legacy fallback: no snapshot available — use columns_used presence check.
@@ -1535,6 +1595,13 @@ mod tests {
         assert_eq!(
             SchemaChangeKind::AddColumnOnly,
             SchemaChangeKind::AddColumnOnly
+        );
+        assert_eq!(SchemaChangeKind::RlsChange, SchemaChangeKind::RlsChange);
+        assert_ne!(SchemaChangeKind::RlsChange, SchemaChangeKind::Benign);
+        assert_ne!(SchemaChangeKind::RlsChange, SchemaChangeKind::ColumnChange);
+        assert_ne!(
+            SchemaChangeKind::RlsChange,
+            SchemaChangeKind::ConstraintChange
         );
     }
 

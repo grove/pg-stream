@@ -4,6 +4,7 @@
 //! - R5: RLS on source tables does not affect stream table content
 //! - R7: RLS on stream tables filters reads per role
 //! - R8: IMMEDIATE mode + RLS on stream table
+//! - R10: ENABLE/DISABLE RLS on source table triggers reinit
 //!
 //! Prerequisites: `just build-e2e-image`
 
@@ -313,5 +314,140 @@ async fn test_ivm_trigger_functions_security_definer() {
     assert!(
         has_search_path,
         "IVM SECURITY DEFINER functions should have a locked search_path"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// R10 — ENABLE/DISABLE RLS on source table triggers reinit
+// ══════════════════════════════════════════════════════════════════════
+
+/// R10: ENABLE ROW LEVEL SECURITY on a source table should mark stream tables
+/// for reinit via the DDL event trigger hook.
+#[tokio::test]
+async fn test_enable_rls_on_source_triggers_reinit() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE rls_ddl_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO rls_ddl_src VALUES (1, 'a'), (2, 'b')")
+        .await;
+
+    db.create_st(
+        "rls_ddl_st",
+        "SELECT id, val FROM rls_ddl_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Initial refresh so the snapshot is stored.
+    db.refresh_st("rls_ddl_st").await;
+
+    let count: i64 = db.count("pgtrickle.rls_ddl_st").await;
+    assert_eq!(count, 2, "initial refresh should populate 2 rows");
+
+    // Verify not marked for reinit before the DDL.
+    let before: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rls_ddl_st'",
+        )
+        .await;
+    assert!(!before, "ST should NOT need reinit before ENABLE RLS");
+
+    // ENABLE RLS on the source table — should trigger reinit.
+    db.execute("ALTER TABLE rls_ddl_src ENABLE ROW LEVEL SECURITY")
+        .await;
+
+    let after: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rls_ddl_st'",
+        )
+        .await;
+    assert!(
+        after,
+        "ST should be marked for reinit after ENABLE RLS on source"
+    );
+
+    // Reinit (refresh) should succeed and the stream table should still
+    // contain all rows (superuser context bypasses RLS).
+    db.refresh_st("rls_ddl_st").await;
+
+    let count: i64 = db.count("pgtrickle.rls_ddl_st").await;
+    assert_eq!(
+        count, 2,
+        "stream table should still contain all rows after reinit"
+    );
+}
+
+/// R10 variant: DISABLE ROW LEVEL SECURITY on a source table that previously
+/// had RLS enabled should also trigger reinit.
+#[tokio::test]
+async fn test_disable_rls_on_source_triggers_reinit() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE rls_dis_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO rls_dis_src VALUES (1, 'x'), (2, 'y')")
+        .await;
+
+    // Enable RLS first, then create the ST so the snapshot stores rls_enabled=true.
+    db.execute("ALTER TABLE rls_dis_src ENABLE ROW LEVEL SECURITY")
+        .await;
+
+    db.create_st(
+        "rls_dis_st",
+        "SELECT id, val FROM rls_dis_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.refresh_st("rls_dis_st").await;
+
+    // DISABLE RLS — snapshot had rls_enabled=true, now it's false.
+    db.execute("ALTER TABLE rls_dis_src DISABLE ROW LEVEL SECURITY")
+        .await;
+
+    let reinit: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rls_dis_st'",
+        )
+        .await;
+    assert!(
+        reinit,
+        "ST should be marked for reinit after DISABLE RLS on source"
+    );
+}
+
+/// R10 variant: FORCE ROW LEVEL SECURITY on a source table triggers reinit.
+#[tokio::test]
+async fn test_force_rls_on_source_triggers_reinit() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE rls_force_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO rls_force_src VALUES (1, 'p')")
+        .await;
+
+    db.create_st(
+        "rls_force_st",
+        "SELECT id, val FROM rls_force_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+    db.refresh_st("rls_force_st").await;
+
+    // FORCE ROW LEVEL SECURITY — should trigger reinit.
+    db.execute("ALTER TABLE rls_force_src FORCE ROW LEVEL SECURITY")
+        .await;
+
+    let reinit: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'rls_force_st'",
+        )
+        .await;
+    assert!(
+        reinit,
+        "ST should be marked for reinit after FORCE RLS on source"
     );
 }

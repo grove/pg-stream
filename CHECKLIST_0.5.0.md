@@ -30,10 +30,10 @@ is in play.
 Extends the DDL event-trigger hook to react when an operator enables or disables
 RLS on a source table.
 
-- [ ] **R9** — Track `ENABLE`/`DISABLE ROW LEVEL SECURITY` DDL on source tables in
+- [x] **R9** — Track `ENABLE`/`DISABLE ROW LEVEL SECURITY` DDL on source tables in
   `hooks.rs` (`AT_EnableRowSecurity` et al. → set `needs_reinit`)
-- [ ] **R10** — E2E test: `ENABLE RLS` on source table triggers stream table reinit
-- [ ] **R6** — Tutorial: per-tenant RLS policies on stream tables
+- [x] **R10** — E2E test: `ENABLE RLS` on source table triggers stream table reinit
+- [x] **R6** — Tutorial: per-tenant RLS policies on stream tables
   *(write after all code is working and tested)*
 
 ---
