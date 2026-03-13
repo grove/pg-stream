@@ -44,6 +44,7 @@ async fn test_upgrade_catalog_schema_stability() {
         ("function_hashes", "text"),
         ("functions_used", "ARRAY"),
         ("has_keyless_source", "boolean"),
+        ("is_append_only", "boolean"),
         ("is_populated", "boolean"),
         ("last_full_ms", "double precision"),
         ("last_refresh_at", "timestamp with time zone"),
