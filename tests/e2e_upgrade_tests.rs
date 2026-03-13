@@ -335,7 +335,7 @@ async fn test_upgrade_chain_new_functions_exist() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.4.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
     // Start container WITHOUT auto-extension, install old version manually
     let db = E2eDb::new().await;
@@ -407,7 +407,7 @@ async fn test_upgrade_chain_stream_tables_survive() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.4.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -468,7 +468,7 @@ async fn test_upgrade_chain_views_queryable() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.4.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -511,7 +511,7 @@ async fn test_upgrade_chain_event_triggers_present() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.4.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -554,7 +554,7 @@ async fn test_upgrade_chain_version_consistency() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.4.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -598,7 +598,7 @@ async fn test_upgrade_chain_function_parity_with_fresh_install() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.4.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
     let db = E2eDb::new().await;
 
@@ -740,5 +740,134 @@ async fn test_upgrade_030_to_040_schema_additions() {
     assert!(
         has_fn,
         "pgtrickle.rebuild_cdc_triggers() not found after upgrade to 0.4.0"
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// L15 — 0.4.0 → 0.5.0 specific schema additions
+// ══════════════════════════════════════════════════════════════════════
+
+/// After upgrading 0.4.0 → 0.5.0, verify:
+/// - `pgtrickle.pgt_source_gates` table exists with key columns
+/// - `is_append_only` column added to `pgt_stream_tables`
+/// - `pgtrickle.gate_source()` and `pgtrickle.ungate_source()` functions exist
+/// - `pgtrickle.quick_health` view exists
+/// - `pgtrickle.create_stream_table_if_not_exists()` function exists
+///
+/// Skipped automatically when `PGS_UPGRADE_TO` is not `0.5.0`.
+#[tokio::test]
+#[ignore]
+async fn test_upgrade_040_to_050_schema_additions() {
+    if !upgrade_image_available() {
+        return;
+    }
+    let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or_default();
+    if to_version != "0.5.0" {
+        eprintln!(
+            "SKIP: test_upgrade_040_to_050_schema_additions only applies to \
+             0.4.0→0.5.0 (got {from_version}→{to_version})"
+        );
+        return;
+    }
+
+    let db = E2eDb::new().await;
+
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
+    ))
+    .await;
+    db.execute(&format!(
+        "ALTER EXTENSION pg_trickle UPDATE TO '{to_version}'"
+    ))
+    .await;
+
+    // 1. pgt_source_gates table exists with key columns
+    for col in &[
+        "source_relid",
+        "gated",
+        "gated_at",
+        "ungated_at",
+        "gated_by",
+    ] {
+        let exists: bool = db
+            .query_scalar(&format!(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM information_schema.columns \
+                    WHERE table_schema = 'pgtrickle' \
+                      AND table_name = 'pgt_source_gates' \
+                      AND column_name = '{col}' \
+                )"
+            ))
+            .await;
+        assert!(
+            exists,
+            "pgt_source_gates.{col} not found after upgrade to 0.5.0"
+        );
+    }
+
+    // 2. is_append_only column on pgt_stream_tables
+    let has_append_only: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_schema = 'pgtrickle' \
+                  AND table_name = 'pgt_stream_tables' \
+                  AND column_name = 'is_append_only' \
+            )",
+        )
+        .await;
+    assert!(
+        has_append_only,
+        "is_append_only not found in pgt_stream_tables after upgrade to 0.5.0"
+    );
+
+    // 3. gate_source() and ungate_source() functions exist
+    for fn_name in &["gate_source", "ungate_source"] {
+        let has_fn: bool = db
+            .query_scalar(&format!(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM pg_proc p \
+                    JOIN pg_namespace n ON p.pronamespace = n.oid \
+                    WHERE n.nspname = 'pgtrickle' \
+                      AND p.proname = '{fn_name}' \
+                )"
+            ))
+            .await;
+        assert!(
+            has_fn,
+            "pgtrickle.{fn_name}() not found after upgrade to 0.5.0"
+        );
+    }
+
+    // 4. quick_health view exists
+    let has_view: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM information_schema.views \
+                WHERE table_schema = 'pgtrickle' \
+                  AND table_name = 'quick_health' \
+            )",
+        )
+        .await;
+    assert!(
+        has_view,
+        "pgtrickle.quick_health view not found after upgrade to 0.5.0"
+    );
+
+    // 5. create_stream_table_if_not_exists() function exists
+    let has_fn: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM pg_proc p \
+                JOIN pg_namespace n ON p.pronamespace = n.oid \
+                WHERE n.nspname = 'pgtrickle' \
+                  AND p.proname = 'create_stream_table_if_not_exists' \
+            )",
+        )
+        .await;
+    assert!(
+        has_fn,
+        "pgtrickle.create_stream_table_if_not_exists() not found after upgrade to 0.5.0"
     );
 }

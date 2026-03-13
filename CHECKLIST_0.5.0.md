@@ -82,11 +82,13 @@ v0.6.0 where they fit better alongside the Wave 2 optimizations.
 
 ## Phase 6 — Upgrade path & release
 
-- [ ] Write `sql/pg_trickle--0.4.0--0.5.0.sql` incrementally as each phase lands:
+- [x] Write `sql/pg_trickle--0.4.0--0.5.0.sql` incrementally as each phase lands:
   - New catalog tables (`pgt_source_gates`, `is_append_only` column, etc.)
-  - Updated function signatures
-- [ ] Run `just check-upgrade` — completeness check must pass
-- [ ] E2E upgrade test: install at 0.4.0 → `ALTER EXTENSION pg_trickle UPDATE` →
+  - Updated function signatures (`gate_source`, `ungate_source`, `source_gates`, `create_stream_table_if_not_exists`)
+  - New views (`quick_health`)
+- [x] Run `just check-upgrade` — completeness check must pass
+- [x] E2E upgrade test: install at 0.4.0 → `ALTER EXTENSION pg_trickle UPDATE` →
   verify all stream tables, gates, and RLS configuration survive intact
-- [ ] Update `CHANGELOG.md` and bump version in `Cargo.toml` / `pg_trickle.control`
+  (`test_upgrade_040_to_050_schema_additions` in `e2e_upgrade_tests.rs`)
+- [x] Update `CHANGELOG.md` and bump version in `Cargo.toml` / `pg_trickle.control`
 - [ ] Tag `v0.5.0`
