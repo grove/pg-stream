@@ -34,11 +34,12 @@ ARG TO_VERSION=0.2.3
 LABEL org.opencontainers.image.title="pg_trickle upgrade E2E test image"
 LABEL org.opencontainers.image.description="PostgreSQL 18.3 with pg_trickle for upgrade path testing (${FROM_VERSION} → ${TO_VERSION})"
 
-# Copy the old version's full install SQL so that
-#   CREATE EXTENSION pg_trickle VERSION '<FROM_VERSION>'
-# finds the script.
-COPY sql/archive/pg_trickle--${FROM_VERSION}.sql \
-     /usr/share/postgresql/18/extension/pg_trickle--${FROM_VERSION}.sql
+# Copy ALL archived install SQL files. This overwrites pgrx-generated
+# install scripts (which contain functions from the *current* source) with
+# the historical snapshots that match each version's actual function set.
+# Without this, CREATE EXTENSION VERSION '0.3.0' would get 0.4.0 functions.
+COPY sql/archive/pg_trickle--*.sql \
+     /usr/share/postgresql/18/extension/
 
 # Copy ALL upgrade scripts so PostgreSQL can automatically chain through
 # intermediate versions (e.g. 0.1.3→0.2.0→0.2.1→0.2.2 via BFS path-finding).

@@ -574,9 +574,14 @@ async fn test_upgrade_chain_version_consistency() {
         .await;
     assert_eq!(ext_version, to_version);
 
-    // pgtrickle.version() must match
+    // pgtrickle.version() returns the compiled .so version, which always
+    // equals CARGO_PKG_VERSION regardless of SQL extension version.
     let fn_version: String = db.query_scalar("SELECT pgtrickle.version()").await;
-    assert_eq!(fn_version, to_version);
+    let lib_version = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        fn_version, lib_version,
+        "pgtrickle.version() should return the compiled library version"
+    );
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -616,10 +621,13 @@ async fn test_upgrade_chain_function_parity_with_fresh_install() {
         )
         .await;
 
-    // Now do a fresh install in the same DB for comparison:
+    // Now do a fresh install *at the same SQL version* for comparison:
     // Drop and recreate to get fresh install counts
     db.execute("DROP EXTENSION pg_trickle CASCADE").await;
-    db.execute("CREATE EXTENSION pg_trickle CASCADE").await;
+    db.execute(&format!(
+        "CREATE EXTENSION pg_trickle VERSION '{to_version}' CASCADE"
+    ))
+    .await;
 
     let fresh_count: i64 = db
         .query_scalar(
