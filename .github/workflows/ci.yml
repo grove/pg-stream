@@ -240,6 +240,7 @@ jobs:
           scripts/check_upgrade_completeness.sh 0.2.2 0.2.3
           scripts/check_upgrade_completeness.sh 0.2.3 0.3.0
           scripts/check_upgrade_completeness.sh 0.3.0 0.4.0
+          scripts/check_upgrade_completeness.sh 0.4.0 0.5.0
 
   # ── Upgrade E2E tests (daily + manual) ─────────────────────────────────
   # True version-to-version upgrade tests: install old version, populate
@@ -260,6 +261,8 @@ jobs:
             to: "0.3.0"
           - from: "0.3.0"
             to: "0.4.0"
+          - from: "0.4.0"
+            to: "0.5.0"
     steps:
       - uses: actions/checkout@v5
 
