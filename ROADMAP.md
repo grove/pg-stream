@@ -854,7 +854,6 @@ intersects the current gated set.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| D-1 | UNLOGGED Change Buffers — create change buffers as `UNLOGGED` to halve CDC write amplification; `pg_trickle.unlogged_buffers` GUC (default `true`); crash recovery triggers FULL refresh | 1–2 wk | [PLAN_NEW_STUFF.md §D-1](plans/performance/PLAN_NEW_STUFF.md) |
 | A-3a | MERGE bypass — Append-Only INSERT path: expose `APPEND ONLY` declaration on `CREATE STREAM TABLE`; CDC heuristic fallback (fast-path until first DELETE/UPDATE seen) | 1–2 wk | [PLAN_NEW_STUFF.md §A-3](plans/performance/PLAN_NEW_STUFF.md) |
 | A-4 | Index-Aware MERGE Planning — planner hint injection (`enable_seqscan = off` for small-delta / large-target); covering index auto-creation on `__pgt_row_id` | 1–2 wk | [PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
 
@@ -868,7 +867,6 @@ intersects the current gated set.
 - [ ] `gate_source` / `ungate_source` operational; scheduler skips gated sources correctly
 - [ ] `quick_health` view and `create_stream_table_if_not_exists` available
 - [ ] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
-- [ ] D-1: UNLOGGED change buffers active by default; crash-recovery FULL-refresh path tested
 - [ ] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables
 - [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta
 - [ ] Extension upgrade path tested (`0.4.0 → 0.5.0`)
@@ -1464,12 +1462,25 @@ implementation.
 
 > **D-2 research spike subtotal: ~2–3 weeks**
 
-> **v0.12.0 total: ~7–11 weeks**
+### UNLOGGED Change Buffers — Opt-In (D-1)
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| D-1 | UNLOGGED Change Buffers — create change buffers as `UNLOGGED` to reduce CDC WAL amplification; `pg_trickle.unlogged_buffers` GUC (default `false`, opt-in); crash recovery and standby promotion trigger FULL refresh | 1–2 wk | [PLAN_NEW_STUFF.md §D-1](plans/performance/PLAN_NEW_STUFF.md) |
+
+> Moved from v0.5.0. Default flipped to `false` (opt-in only) to avoid forced FULL
+> refreshes on all stream tables for users who have not explicitly accepted the
+> crash/standby tradeoff.
+
+> **D-1 subtotal: ~1–2 weeks**
+
+> **v0.12.0 total: ~8–13 weeks**
 
 **Exit criteria:**
 - [ ] Intra-query delta-branch pruning: zero-change sources produce no UNION ALL branch
 - [ ] Merged-delta path passes property-based correctness tests for simultaneous multi-source changes
 - [ ] D-2 spike: prototype exists; SPI-in-commit-callback constraint validated; RFC written
+- [ ] D-1: UNLOGGED change buffers opt-in (`unlogged_buffers = false` by default); crash-recovery FULL-refresh path tested
 - [ ] Extension upgrade path tested (`0.11.0 → 0.12.0`)
 
 ---
