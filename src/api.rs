@@ -2501,6 +2501,121 @@ fn diamond_groups() -> TableIterator<
     TableIterator::new(rows)
 }
 
+// ── Bootstrap Source Gating (v0.5.0, Phase 3) ─────────────────────────────
+
+/// Mark a source table as "gated" so that all stream tables depending on it
+/// are skipped by the scheduler until `ungate_source()` is called.
+///
+/// This is useful when loading bulk historical data into a source table:
+/// gate it first, load the data, then ungate it so the scheduler picks it up
+/// in one atomic refresh instead of refreshing repeatedly mid-load.
+///
+/// `source` is the source table name, optionally schema-qualified.
+#[pg_extern(schema = "pgtrickle")]
+fn gate_source(source: &str) -> Result<(), PgTrickleError> {
+    let source_relid = resolve_source_oid(source)?;
+    crate::catalog::upsert_gate(source_relid, Some("gate_source"))?;
+
+    // Signal the scheduler that the gate set has changed.
+    let payload = format!("{}", source_relid.to_u32());
+    Spi::run(&format!(
+        "SELECT pg_notify('pgtrickle_source_gate', {})",
+        &payload
+    ))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    pgrx::info!(
+        "pg_trickle: source {} (oid={}) is now gated",
+        source,
+        source_relid.to_u32()
+    );
+    Ok(())
+}
+
+/// Ungate a previously gated source table, allowing the scheduler to resume
+/// refreshing stream tables that depend on it.
+///
+/// `source` is the source table name, optionally schema-qualified.
+#[pg_extern(schema = "pgtrickle")]
+fn ungate_source(source: &str) -> Result<(), PgTrickleError> {
+    let source_relid = resolve_source_oid(source)?;
+    crate::catalog::set_ungated(source_relid)?;
+
+    // Signal the scheduler that the gate set has changed.
+    let payload = format!("{}", source_relid.to_u32());
+    Spi::run(&format!(
+        "SELECT pg_notify('pgtrickle_source_gate', {})",
+        &payload
+    ))
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+    pgrx::info!(
+        "pg_trickle: source {} (oid={}) is now ungated",
+        source,
+        source_relid.to_u32()
+    );
+    Ok(())
+}
+
+/// Return the current gate status of all registered source gates.
+///
+/// Only rows that have ever been gated appear in this view (one row per
+/// source_relid in `pgt_source_gates`).
+#[pg_extern(schema = "pgtrickle", name = "source_gates")]
+#[allow(clippy::type_complexity)]
+fn source_gates_fn() -> TableIterator<
+    'static,
+    (
+        name!(source_table, String),
+        name!(schema_name, String),
+        name!(gated, bool),
+        name!(gated_at, Option<TimestampWithTimeZone>),
+        name!(ungated_at, Option<TimestampWithTimeZone>),
+        name!(gated_by, Option<String>),
+    ),
+> {
+    let rows: Vec<_> = Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT c.relname::text, n.nspname::text, \
+                        g.gated, g.gated_at, g.ungated_at, g.gated_by \
+                 FROM pgtrickle.pgt_source_gates g \
+                 JOIN pg_class c ON c.oid = g.source_relid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 ORDER BY n.nspname, c.relname",
+                None,
+                &[],
+            )
+            .unwrap_or_else(|e| {
+                pgrx::warning!("source_gates: SPI error: {}", e);
+                // Return an empty iterator-compatible value via an empty Vec
+                panic!("source_gates: SPI error: {}", e)
+            });
+
+        let mut out = Vec::new();
+        for row in table {
+            let relname: String = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let nspname: String = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+            let gated: bool = row.get::<bool>(3).unwrap_or(None).unwrap_or(false);
+            let gated_at = row.get::<TimestampWithTimeZone>(4).unwrap_or(None);
+            let ungated_at = row.get::<TimestampWithTimeZone>(5).unwrap_or(None);
+            let gated_by = row.get::<String>(6).unwrap_or(None);
+            out.push((relname, nspname, gated, gated_at, ungated_at, gated_by));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
+/// Resolve a (possibly schema-qualified) table name to its OID.
+fn resolve_source_oid(source: &str) -> Result<pg_sys::Oid, PgTrickleError> {
+    let oid = Spi::get_one_with_args::<pg_sys::Oid>("SELECT $1::regclass::oid", &[source.into()])
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| PgTrickleError::NotFound(format!("relation '{}' does not exist", source)))?;
+    Ok(oid)
+}
+
 // ── Helper functions ───────────────────────────────────────────────────────
 
 /// EC-25/EC-26: Install a guard trigger that blocks direct DML on a stream

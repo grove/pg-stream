@@ -503,6 +503,19 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
         return RefreshOutcome::RetryableFailure;
     }
 
+    // BOOT-4: Check bootstrap source gates — skip if any source is gated.
+    let gated_oids = load_gated_source_oids();
+    if is_any_source_gated(pgt_id, &gated_oids) {
+        log!(
+            "pg_trickle refresh worker: skipping {}.{} — source gated (job {})",
+            st.pgt_schema,
+            st.pgt_name,
+            job.job_id,
+        );
+        log_gated_skip(&st);
+        return RefreshOutcome::Success;
+    }
+
     let tick_watermark: Option<String> = if config::pg_trickle_tick_watermark_enabled() {
         Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
     } else {
@@ -549,6 +562,9 @@ fn execute_worker_atomic_group(job: &SchedulerJob) -> RefreshOutcome {
     };
     let mut refreshed_count: usize = 0;
 
+    // BOOT-4: Build gated-source set once for the whole group.
+    let gated_oids = load_gated_source_oids();
+
     for &pgt_id in &job.member_pgt_ids {
         let st = match load_st_by_id(pgt_id) {
             Some(st) => st,
@@ -556,6 +572,18 @@ fn execute_worker_atomic_group(job: &SchedulerJob) -> RefreshOutcome {
         };
 
         if st.status != StStatus::Active && st.status != StStatus::Initializing {
+            continue;
+        }
+
+        // BOOT-4: skip if any source is gated.
+        if is_any_source_gated(pgt_id, &gated_oids) {
+            log!(
+                "pg_trickle refresh worker: skipping {}.{} — source gated (atomic group job {})",
+                st.pgt_schema,
+                st.pgt_name,
+                job.job_id,
+            );
+            log_gated_skip(&st);
             continue;
         }
 
@@ -2602,6 +2630,74 @@ fn execute_scheduled_refresh(
 /// Release an advisory lock held during refresh.
 fn release_advisory_lock(lock_key: i64) {
     let _ = Spi::get_one_with_args::<bool>("SELECT pg_advisory_unlock($1)", &[lock_key.into()]);
+}
+
+// ── Bootstrap Source Gating helpers (v0.5.0, Phase 3) ─────────────────────
+
+/// Load the set of currently gated source OIDs from `pgt_source_gates`.
+///
+/// Called once per worker invocation to build an immutable gate set for the
+/// duration of the tick, avoiding repeated SPI round-trips.
+fn load_gated_source_oids() -> std::collections::HashSet<pg_sys::Oid> {
+    crate::catalog::get_gated_source_oids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Check whether any of the stream table's declared source OIDs appear in
+/// the caller-supplied gated set.  Returns `true` if the ST should be
+/// skipped this tick.
+fn is_any_source_gated(pgt_id: i64, gated: &std::collections::HashSet<pg_sys::Oid>) -> bool {
+    if gated.is_empty() {
+        return false;
+    }
+    get_source_oids_for_st(pgt_id)
+        .into_iter()
+        .any(|oid| gated.contains(&oid))
+}
+
+/// Insert a SKIP record into `pgt_refresh_history` for a gated stream table.
+///
+/// This lets operators see which STs were skipped and why by querying the
+/// history table.  Errors are logged as warnings rather than bubbling up,
+/// because a failure to write the history record must not abort the tick.
+fn log_gated_skip(st: &StreamTableMeta) {
+    let now = Spi::get_one::<TimestampWithTimeZone>("SELECT now()")
+        .unwrap_or(None)
+        .unwrap_or_else(|| {
+            pgrx::warning!(
+                "log_gated_skip: now() returned NULL for {}.{}",
+                st.pgt_schema,
+                st.pgt_name
+            );
+            TimestampWithTimeZone::try_from(0i64).unwrap_or_else(|_| {
+                pgrx::error!("scheduler: failed to create epoch TimestampWithTimeZone")
+            })
+        });
+
+    if let Err(e) = crate::catalog::RefreshRecord::insert(
+        st.pgt_id,
+        now,
+        "SKIP",
+        "SKIPPED",
+        0,
+        0,
+        Some("source gated"),
+        Some("SCHEDULER"),
+        None,
+        0,
+        None,
+        false,
+        None,
+    ) {
+        pgrx::warning!(
+            "pg_trickle: failed to log SKIP for {}.{}: {}",
+            st.pgt_schema,
+            st.pgt_name,
+            e
+        );
+    }
 }
 
 /// Get the source OIDs (base table OIDs) for a given ST.
