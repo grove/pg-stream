@@ -131,6 +131,59 @@ Append-only path eliminates MERGE entirely for event-sourced architectures.
 **Prior Art.** Snowflake's MERGE vs INSERT OVERWRITE cost-based selection;
 DuckDB's bulk COPY path; Redshift's MERGE alternatives.
 
+**Safety Analysis — Full-Replacement Window (TRUNCATE + INSERT).**
+
+The `TRUNCATE st; INSERT INTO st ...` pattern for TopK tables is
+**correct under PostgreSQL's MVCC** — external readers see the old
+snapshot until the transaction commits, so there is no "empty table"
+visibility window for concurrent sessions. The existing
+`execute_full_refresh` path in `refresh.rs` already uses this pattern
+and handles the required guard work:
+
+- Sets `SET LOCAL pg_trickle.internal_refresh = 'true'` before TRUNCATE
+  so DML-guard triggers allow the modification.
+- Disables user triggers via `DISABLE TRIGGER USER` / `ENABLE TRIGGER USER`
+  around the TRUNCATE + INSERT window.
+
+However, the following concerns must be addressed before implementing
+this path:
+
+1. **`ACCESS EXCLUSIVE` lock starvation.** `TRUNCATE` acquires
+   `ACCESS EXCLUSIVE` on the stream table, which blocks *all* concurrent
+   readers (`SELECT`) for the entire duration including the INSERT phase.
+   By contrast, MERGE acquires only row-level locks and allows reads to
+   proceed against the pre-MERGE snapshot. For TopK tables refreshed
+   sub-second this is a significant regression. **Mitigation:** gate
+   the TRUNCATE path on a minimum `refresh_interval` (e.g., ≥ 5 s), or
+   expose a GUC `pg_trickle.topk_bypass_mode = 'merge' | 'truncate'`
+   so operators can opt in explicitly.
+
+2. **Change-buffer LSN reset required.** After a TRUNCATE+INSERT full
+   replacement, buffered change-buffer entries for the source table must
+   not be applied in the next differential refresh — that would
+   double-count them. `execute_full_refresh` avoids this because the
+   scheduler resets the change-frontier LSN after a full refresh.
+   The TRUNCATE path for TopK must trigger the same LSN reset; omitting
+   it would silently corrupt the stream table.
+
+3. **No-op guard missing.** TRUNCATE+INSERT always rewrites the table and
+   holds `ACCESS EXCLUSIVE` even when the TopK result is unchanged.
+   MERGE's `WHEN MATCHED AND (IS DISTINCT FROM ...)` clause naturally
+   skips unchanged rows. The implementation should check whether the
+   source delta contains any changes before issuing the TRUNCATE, or
+   keep MERGE as the default and only fall back to TRUNCATE+INSERT when
+   the delta exceeds a size threshold where MERGE wins.
+
+4. **`__pgt_row_id` stability.** TRUNCATE+INSERT regenerates all row IDs.
+   Since `row_id_expr_for_query` produces a deterministic content hash,
+   IDs are stable across refreshes for unchanged rows. No correctness
+   issue, but this should be verified by tests that assert row-ID
+   continuity across a TRUNCATE-path refresh cycle.
+
+5. **No RETURNING from TRUNCATE.** TRUNCATE has no `RETURNING` clause,
+   so per-row counts for `pgtrickle_refresh` NOTIFY payloads and
+   monitoring metrics must be derived from the INSERT's row count only.
+
 ---
 
 ### A-4: Index-Aware MERGE Planning
