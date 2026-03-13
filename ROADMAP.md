@@ -818,11 +818,11 @@ intersects the current gated set.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| BOOT-1 | `pgtrickle.pgt_source_gates` catalog table (`source_relid`, `gated`, `gated_at`, `gated_by`) | 30min | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
-| BOOT-2 | `gate_source(source TEXT)` SQL function — sets gate, pg_notify scheduler | 1h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
-| BOOT-3 | `ungate_source(source TEXT)` + `source_gates()` introspection view | 30min | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
-| BOOT-4 | Scheduler integration: load gated-source set per tick; skip and log `SKIP` in `pgt_refresh_history` | 2–3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
-| BOOT-5 | E2E tests: single-source gate, coordinated multi-source, partial DAG, bootstrap with `initialize => false` | 3–4h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-1 | `pgtrickle.pgt_source_gates` catalog table (`source_relid`, `gated`, `gated_at`, `gated_by`) | 30min | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| BOOT-2 | `gate_source(source TEXT)` SQL function — sets gate, pg_notify scheduler | 1h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| BOOT-3 | `ungate_source(source TEXT)` + `source_gates()` introspection view | 30min | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| BOOT-4 | Scheduler integration: load gated-source set per tick; skip and log `SKIP` in `pgt_refresh_history` | 2–3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| BOOT-5 | E2E tests: single-source gate, coordinated multi-source, partial DAG, bootstrap with `initialize => false` | 3–4h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
 
 > **Bootstrap source gating subtotal: ~7–9 hours**
 
@@ -864,9 +864,9 @@ intersects the current gated set.
 > **v0.5.0 total: ~51–97h**
 
 **Exit criteria:**
-- [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
-- [ ] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
-- [ ] `gate_source` / `ungate_source` operational; scheduler skips gated sources correctly
+- [x] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
+- [x] RLS on stream table E2E-tested (DIFFERENTIAL + IMMEDIATE)
+- [x] `gate_source` / `ungate_source` operational; scheduler skips gated sources correctly
 - [ ] `quick_health` view and `create_stream_table_if_not_exists` available
 - [x] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
 - [ ] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables

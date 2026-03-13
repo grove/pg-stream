@@ -2125,3 +2125,76 @@ CDC slot tracking per source table.
 | `slot_name` | `text` | Logical replication slot name |
 | `last_consumed_lsn` | `pg_lsn` | Last consumed WAL position |
 | `tracked_by_pgt_ids` | `bigint[]` | Array of ST IDs depending on this source |
+
+### pgtrickle.pgt_source_gates
+
+Bootstrap source gate registry. One row per source table that has ever been
+gated. Only sources with `gated = true` are actively blocking scheduler
+refreshes.
+
+| Column | Type | Description |
+|---|---|---|
+| `source_relid` | `oid` | OID of the gated source table (PK) |
+| `gated` | `boolean` | `true` while the source is gated; `false` after `ungate_source()` |
+| `gated_at` | `timestamptz` | When the gate was most recently set |
+| `ungated_at` | `timestamptz` | When the gate was cleared (`NULL` if still active) |
+| `gated_by` | `text` | Actor that set the gate (e.g. `'gate_source'`) |
+
+---
+
+## Bootstrap Source Gating (v0.5.0)
+
+These functions let operators pause and resume scheduler-driven refreshes for
+individual source tables — useful during large bulk loads or ETL windows.
+
+### pgtrickle.gate_source(source TEXT)
+
+Mark a source table as gated. The scheduler will skip any stream table that
+reads from this source until `ungate_source()` is called.
+
+```sql
+SELECT pgtrickle.gate_source('my_schema.big_source');
+```
+
+Manual `refresh_stream_table()` calls are **not** affected by gates.
+
+### pgtrickle.ungate_source(source TEXT)
+
+Clear a gate set by `gate_source()`. After this call the scheduler resumes
+normal refresh scheduling for dependent stream tables.
+
+```sql
+SELECT pgtrickle.ungate_source('my_schema.big_source');
+```
+
+### pgtrickle.source_gates()
+
+Table function returning the current gate status for all registered sources.
+
+```sql
+SELECT * FROM pgtrickle.source_gates();
+-- source_table | schema_name | gated | gated_at | ungated_at | gated_by
+```
+
+| Column | Type | Description |
+|---|---|---|
+| `source_table` | `text` | Relation name |
+| `schema_name` | `text` | Schema name |
+| `gated` | `boolean` | Whether the source is currently gated |
+| `gated_at` | `timestamptz` | When the gate was set |
+| `ungated_at` | `timestamptz` | When the gate was cleared (`NULL` if active) |
+| `gated_by` | `text` | Which function set the gate |
+
+**Typical workflow**
+
+```sql
+-- 1. Gate the source before a bulk load.
+SELECT pgtrickle.gate_source('orders');
+
+-- 2. Load historical data (scheduler sits idle for orders-based STs).
+COPY orders FROM '/data/historical_orders.csv';
+
+-- 3. Ungate — the next scheduler tick refreshes everything cleanly.
+SELECT pgtrickle.ungate_source('orders');
+```
+

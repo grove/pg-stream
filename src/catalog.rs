@@ -1381,6 +1381,64 @@ impl RefreshRecord {
     }
 }
 
+// ── Source gate CRUD (v0.5.0, Phase 3 — Bootstrap Source Gating) ──────────
+
+/// Returns the OIDs of all currently gated source relations.
+///
+/// Used by the scheduler once per tick to build the gated-source set before
+/// deciding whether to skip a stream table refresh.
+pub fn get_gated_source_oids() -> Result<Vec<pg_sys::Oid>, PgTrickleError> {
+    Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT source_relid \
+                 FROM pgtrickle.pgt_source_gates \
+                 WHERE gated = true",
+                None,
+                &[],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        let mut oids: Vec<pg_sys::Oid> = Vec::new();
+        for row in table {
+            if let Some(oid) = row
+                .get::<pg_sys::Oid>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+            {
+                oids.push(oid);
+            }
+        }
+        Ok(oids)
+    })
+}
+
+/// UPSERT a source gate: mark the given source OID as gated.
+pub fn upsert_gate(
+    source_relid: pg_sys::Oid,
+    gated_by: Option<&str>,
+) -> Result<(), PgTrickleError> {
+    Spi::run_with_args(
+        "INSERT INTO pgtrickle.pgt_source_gates \
+             (source_relid, gated, gated_at, ungated_at, gated_by) \
+         VALUES ($1, true, now(), NULL, $2) \
+         ON CONFLICT (source_relid) DO UPDATE SET \
+             gated = true, gated_at = now(), ungated_at = NULL, \
+             gated_by = EXCLUDED.gated_by",
+        &[source_relid.into(), gated_by.into()],
+    )
+    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+}
+
+/// Mark a source gate as ungated (sets gated=false and records ungated_at).
+pub fn set_ungated(source_relid: pg_sys::Oid) -> Result<(), PgTrickleError> {
+    Spi::run_with_args(
+        "UPDATE pgtrickle.pgt_source_gates \
+         SET gated = false, ungated_at = now() \
+         WHERE source_relid = $1",
+        &[source_relid.into()],
+    )
+    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+}
+
 // ── Scheduler Job (Phase 2: parallel refresh) ─────────────────────────────
 
 /// Status of a scheduler job in the parallel refresh pipeline.

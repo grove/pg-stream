@@ -51,6 +51,37 @@ read time via RLS policies on the stream table itself.
 - **R6: RLS tutorial.** New `docs/tutorials/ROW_LEVEL_SECURITY.md` showing
   per-tenant RLS policies on stream tables with step-by-step examples.
 
+#### Bootstrap Source Gating — Phase 3 (v0.5.0)
+
+New operational control for bulk-load workflows. When loading large amounts
+of historical data into a source table, gate it first so the scheduler does
+not fire mid-load, then ungate it to pick up all the data in a single refresh.
+
+- **BOOT-1: `pgtrickle.pgt_source_gates` catalog table.** Tracks which source
+  tables are currently gated (`source_relid`, `gated`, `gated_at`, `ungated_at`,
+  `gated_by`).
+- **BOOT-2: `pgtrickle.gate_source(source TEXT)`.** Marks a source table as
+  gated (UPSERT into `pgt_source_gates`) and emits a `pg_notify` on
+  `pgtrickle_source_gate` so the scheduler can react immediately.
+- **BOOT-3: `pgtrickle.ungate_source(source TEXT)`.** Clears the gate
+  (`gated = false`, records `ungated_at`) and emits the same notify. The
+  `pgtrickle.source_gates()` table function returns the current gate status
+  for all registered sources, with schema name, gated flag, timestamps, and
+  the gating actor.
+- **BOOT-4: Scheduler skip integration.** At the start of every
+  refresh-worker invocation the scheduler loads all currently gated source
+  OIDs. If any direct source of a stream table is gated the refresh is
+  skipped and a `SKIP` / `SKIPPED` record is written to
+  `pgtrickle.pgt_refresh_history` with `initiated_by = 'SCHEDULER'`.
+  Manual `refresh_stream_table()` calls are not affected — operators can always
+  force a refresh out-of-band.
+- **BOOT-5: E2E tests.** New `e2e_bootstrap_gating_tests.rs` with 9 tests
+  covering: catalog insert/read, ungate, idempotency, re-gate, non-existent
+  table error, multiple simultaneous gates, manual refresh not blocked by
+  gate, and scheduler SKIP + resume flow.
+- **Upgrade script.** `sql/pg_trickle--0.4.0--0.5.0.sql` adds the
+  `pgt_source_gates` table for incremental upgrades.
+
 #### Ergonomics & API Polish — Phase 4 (v0.5.0)
 
 Quality-of-life improvements for operators, deployment scripts, and dashboards.
@@ -72,6 +103,7 @@ Quality-of-life improvements for operators, deployment scripts, and dashboards.
   `CALL pgtrickle.drop_stream_table(...)`,
   `CALL pgtrickle.alter_stream_table(...)`, and
   `CALL pgtrickle.create_stream_table_if_not_exists(...)`.
+
 ---
 
 ## [0.4.0] — 2026-03-12

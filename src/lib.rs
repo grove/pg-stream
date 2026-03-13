@@ -230,6 +230,18 @@ CREATE INDEX IF NOT EXISTS idx_sched_jobs_finished
     ON pgtrickle.pgt_scheduler_jobs (finished_at)
     WHERE finished_at IS NOT NULL;
 
+-- Bootstrap source gates (v0.5.0, Phase 3)
+-- Records which source tables are currently "gated" (bootstrapping in progress).
+-- When a source is gated, all stream tables that depend on it are skipped by
+-- the scheduler until pgtrickle.ungate_source() is called.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_source_gates (
+    source_relid    OID PRIMARY KEY,
+    gated           BOOLEAN NOT NULL DEFAULT true,
+    gated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ungated_at      TIMESTAMPTZ,
+    gated_by        TEXT
+);
+
 "#,
     name = "pg_trickle_catalog",
     bootstrap,

@@ -43,13 +43,13 @@ RLS on a source table.
 Self-contained new feature; no dependency on the RLS phases. Can be started in
 parallel with Phase 1 if work is shared across contributors.
 
-- [ ] **BOOT-1** — `pgtrickle.pgt_source_gates` catalog table
+- [x] **BOOT-1** — `pgtrickle.pgt_source_gates` catalog table
   (`source_relid`, `gated`, `gated_at`, `gated_by`)
-- [ ] **BOOT-2** — `gate_source(source TEXT)` SQL function + `pg_notify` scheduler signal
-- [ ] **BOOT-3** — `ungate_source(source TEXT)` + `source_gates()` introspection view
-- [ ] **BOOT-4** — Scheduler integration: load gated-source set per tick; skip dependent
+- [x] **BOOT-2** — `gate_source(source TEXT)` SQL function + `pg_notify` scheduler signal
+- [x] **BOOT-3** — `ungate_source(source TEXT)` + `source_gates()` introspection view
+- [x] **BOOT-4** — Scheduler integration: load gated-source set per tick; skip dependent
   STs and log `SKIP` in `pgt_refresh_history`
-- [ ] **BOOT-5** — E2E tests: single-source gate, coordinated multi-source, partial DAG,
+- [x] **BOOT-5** — E2E tests: single-source gate, coordinated multi-source, partial DAG,
   bootstrap with `initialize => false`
 
 ---
