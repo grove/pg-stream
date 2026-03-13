@@ -9,6 +9,10 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+---
+
+## [0.5.0] — 2026-03-13
+
 ### Added
 
 #### Row-Level Security (RLS) Hardening — Phase 1 (v0.5.0)
@@ -122,6 +126,23 @@ Quality-of-life improvements for operators, deployment scripts, and dashboards.
 - **COR-2: `create_stream_table_if_not_exists()`.** New convenience function
   that silently no-ops when a stream table with the given name already exists.
   Useful for idempotent migration scripts and deployment automation.
+
+#### Upgrade Path — Phase 6 (v0.5.0)
+
+- **`sql/pg_trickle--0.4.0--0.5.0.sql` upgrade script.** Covers all schema
+  additions shipped in v0.5.0: `pgtrickle.pgt_source_gates` table,
+  `is_append_only` column on `pgt_stream_tables`, `gate_source()`,
+  `ungate_source()`, `source_gates()` functions, and the `quick_health` view.
+  Existing installations can upgrade with `ALTER EXTENSION pg_trickle UPDATE`.
+- **Upgrade completeness check passes.** All 40 SQL objects (36 functions,
+  4 views, 2 event triggers) in the fresh install script are covered by the
+  upgrade script.
+- **L15 upgrade E2E test.** New `test_upgrade_040_to_050_schema_additions`
+  test verifies `pgt_source_gates` columns, `is_append_only`, `gate_source()`,
+  `ungate_source()`, `quick_health`, and `create_stream_table_if_not_exists()`
+  all survive `ALTER EXTENSION pg_trickle UPDATE TO '0.5.0'` intact.
+- **Version sync.** CI upgrade matrix, `justfile` defaults, and upgrade test
+  fallbacks all updated to target `0.4.0 → 0.5.0`.
 
 ---
 

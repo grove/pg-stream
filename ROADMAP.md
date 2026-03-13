@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-03-13
-> **Latest release:** 0.4.0 (2026-03-12)
-> **Current milestone:** v0.5.0 — Row-Level Security & Operational Controls
+> **Latest release:** 0.5.0 (2026-03-13)
+> **Current milestone:** v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -20,13 +20,13 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                                                               We are here
-                                                                                │
-                                                                                ▼
+                                                                                          We are here
+                                                                                               │
+                                                                                               ▼
  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
  │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │
- │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Parallel│─│  RLS & │─│Partn., │
- │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │&Perf.  │ │Op.Ctrl │ │DDL&Cyc.│
+ │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Partn., │
+ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │DDL&Cyc.│
  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
       │
       └─ ┌────────┐ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
@@ -839,12 +839,12 @@ intersects the current gated set.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| ERG-D | Record manual `refresh_stream_table()` calls in `pgt_refresh_history` with `initiated_by='MANUAL'` | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §D |
-| ERG-E | `pgtrickle.quick_health` view — single-row status summary (`total_stream_tables`, `error_tables`, `stale_tables`, `scheduler_running`, `status`) | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §E |
-| COR-2 | `create_stream_table_if_not_exists()` convenience wrapper | 30min | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) §COR-2 |
-| NAT-CALL | `CREATE PROCEDURE` wrappers for all four main SQL functions — enables `CALL pgtrickle.create_stream_table(...)` syntax | 1h | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §Tier 1.5 |
+| ERG-D | Record manual `refresh_stream_table()` calls in `pgt_refresh_history` with `initiated_by='MANUAL'` | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §D | ✅ Done |
+| ERG-E | `pgtrickle.quick_health` view — single-row status summary (`total_stream_tables`, `error_tables`, `stale_tables`, `scheduler_running`, `status`) | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §E | ✅ Done |
+| COR-2 | `create_stream_table_if_not_exists()` convenience wrapper | 30min | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) §COR-2 | ✅ Done |
+| ~~NAT-CALL~~ | ~~`CREATE PROCEDURE` wrappers for all four main SQL functions — enables `CALL pgtrickle.create_stream_table(...)` syntax~~ | ~~1h~~ | Deferred — PostgreSQL does not allow procedures and functions with the same name and argument types |
 
-> **Ergonomics subtotal: ~5.5–6 hours**
+> **Ergonomics subtotal: ~5–5.5 hours (NAT-CALL deferred)**
 
 ### Performance Foundations (Wave 1)
 
@@ -870,7 +870,9 @@ intersects the current gated set.
 - [x] `quick_health` view and `create_stream_table_if_not_exists` available
 - [x] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
 - [x] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables
-- [ ] Extension upgrade path tested (`0.4.0 → 0.5.0`)
+- [x] Extension upgrade path tested (`0.4.0 → 0.5.0`)
+
+**Status: Released (2026-03-13).**
 
 ---
 
@@ -1617,8 +1619,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.2.2 — OFFSET Support, ALTER QUERY & Upgrade Tooling | ~50–70h | 120–156h | ✅ Released |
 | v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | ✅ Released |
 | v0.3.0 — DVM Correctness, SAST & Test Coverage | ~20–30h | 185–252h | ✅ Released |
-| v0.4.0 — Parallel Refresh & Performance Hardening | ~60–94h | 245–346h | |
-| v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | |
+| v0.4.0 — Parallel Refresh & Performance Hardening | ~60–94h | 245–346h | ✅ Released |
+| v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | ✅ Released |
 | v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | |
 | v0.7.0 — Watermarks & Circular DAG Execution | ~36–39h | 367–532h | |
 | v0.8.0 — Connection Pooler Compatibility | ~56–80h | 423–612h | |
