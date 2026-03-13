@@ -69,33 +69,14 @@ All items are ≤ 2 h each and independent — fill gaps between the larger phas
 
 ## Phase 5 — Performance Wave 1
 
-Largest effort; tackle after Phases 1–4 are stable and the test suite is fuller.
-Within this phase, implement in the order listed: A-4 requires no schema change,
-A-3a touches the most components, B-2 and C-4 are optimizer/buffer improvements.
-
-- [ ] **A-4** — Index-aware MERGE planning
-  - Auto-create covering index on `__pgt_row_id` at stream table creation
-  - Inject `SET LOCAL enable_seqscan = off` when `delta_row_count < 0.01 × target_row_count`
-  - Benchmark: confirm planner chooses index scan on small-delta / large-target
+Scoped to the append-only fast path only. A-4, B-2, and C-4 are deferred to
+v0.6.0 where they fit better alongside the Wave 2 optimizations.
 
 - [ ] **A-3a** — Append-Only INSERT path (MERGE bypass)
   - `APPEND ONLY` declaration on `CREATE STREAM TABLE`
   - CDC heuristic fallback: use fast-path until first DELETE/UPDATE seen, then revert to MERGE
   - Catalog: `is_append_only BOOLEAN` column + upgrade SQL
   - Benchmark: INSERT vs MERGE throughput on event-sourced workload
-
-- [ ] **B-2** — Delta Predicate Pushdown
-  - Push WHERE predicates from defining query into change-buffer `delta_scan` CTE
-  - `OR old_col` handling for deletions
-  - 5–10× delta-row-volume reduction for selective queries
-  - [PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md)
-
-- [ ] **C-4** — Change Buffer Compaction
-  - Net-change compaction (INSERT+DELETE=no-op; UPDATE+UPDATE=single row)
-  - Run when buffer exceeds `pg_trickle.compact_threshold`
-  - Use advisory lock to serialise with refresh
-  - ⚠️ Must use `seq` (sequence PK) not `ctid` — see corrected SQL in
-    [PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md)
 
 ---
 
@@ -104,7 +85,6 @@ A-3a touches the most components, B-2 and C-4 are optimizer/buffer improvements.
 - [ ] Write `sql/pg_trickle--0.4.0--0.5.0.sql` incrementally as each phase lands:
   - New catalog tables (`pgt_source_gates`, `is_append_only` column, etc.)
   - Updated function signatures
-  - Compaction catalog/GUC additions (if C-4 included)
 - [ ] Run `just check-upgrade` — completeness check must pass
 - [ ] E2E upgrade test: install at 0.4.0 → `ALTER EXTENSION pg_trickle UPDATE` →
   verify all stream tables, gates, and RLS configuration survive intact

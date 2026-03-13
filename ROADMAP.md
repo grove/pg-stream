@@ -855,17 +855,13 @@ intersects the current gated set.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | A-3a | MERGE bypass — Append-Only INSERT path: expose `APPEND ONLY` declaration on `CREATE STREAM TABLE`; CDC heuristic fallback (fast-path until first DELETE/UPDATE seen) | 1–2 wk | [PLAN_NEW_STUFF.md §A-3](plans/performance/PLAN_NEW_STUFF.md) |
-| A-4 | Index-Aware MERGE Planning — planner hint injection (`enable_seqscan = off` for small-delta / large-target); covering index auto-creation on `__pgt_row_id` | 1–2 wk | [PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
-| B-2 | Delta Predicate Pushdown — push WHERE predicates from defining query into change-buffer `delta_scan` CTE; `OR old_col` handling for deletions; 5–10× delta-row-volume reduction for selective queries | 2–3 wk | [PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
-| C-4 | Change Buffer Compaction — net-change compaction (INSERT+DELETE=no-op; UPDATE+UPDATE=single row); run when buffer exceeds `pg_trickle.compact_threshold`; use advisory lock to serialise with refresh | 2–3 wk | [PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
 
-> ⚠️ C-4: The compaction DELETE **must use `seq` (the sequence primary key) not `ctid`** as
-> the stable row identifier. `ctid` changes under VACUUM and will silently delete the wrong
-> rows. See the corrected SQL and risk analysis in PLAN_NEW_STUFF.md §C-4.
+> A-4, B-2, and C-4 deferred to v0.6.0 Performance Wave 2 (scope mismatch with the
+> RLS/operational-controls theme; correctness risk warrants a dedicated wave).
 
-> **Performance foundations subtotal: ~30–80h (A-3a, A-4) + ~40–80h (B-2, C-4)**
+> **Performance foundations subtotal: ~10–20h (A-3a only)**
 
-> **v0.5.0 total: ~91–187h**
+> **v0.5.0 total: ~51–97h**
 
 **Exit criteria:**
 - [ ] RLS semantics documented; change buffers RLS-hardened; IVM triggers SECURITY DEFINER
@@ -874,9 +870,6 @@ intersects the current gated set.
 - [ ] `quick_health` view and `create_stream_table_if_not_exists` available
 - [ ] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
 - [ ] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables
-- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta
-- [ ] B-2: Predicate pushdown reduces delta volume for selective queries (E2E benchmark)
-- [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
 - [ ] Extension upgrade path tested (`0.4.0 → 0.5.0`)
 
 ---
@@ -987,16 +980,25 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 ### Core Refresh Optimizations (Wave 2)
 
-> B-2 and C-4 moved to v0.5.0. Only B-4 remains here.
-> Read risk analyses in [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) before implementing.
+> A-4, B-2, and C-4 moved here from v0.5.0 (deferred — correctness risk and scope
+> mismatch). B-4 was already here. Read the risk analyses in
+> [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) before implementing.
+> Implement in this order: A-4 (no schema change), B-2, C-4, then B-4.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
+| A-4 | Index-Aware MERGE Planning — planner hint injection (`enable_seqscan = off` for small-delta / large-target); covering index auto-creation on `__pgt_row_id` | 1–2 wk | [PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
+| B-2 | Delta Predicate Pushdown — push WHERE predicates from defining query into change-buffer `delta_scan` CTE; `OR old_col` handling for deletions; 5–10× delta-row-volume reduction for selective queries | 2–3 wk | [PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C-4 | Change Buffer Compaction — net-change compaction (INSERT+DELETE=no-op; UPDATE+UPDATE=single row); run when buffer exceeds `pg_trickle.compact_threshold`; use advisory lock to serialise with refresh | 2–3 wk | [PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
 | B-4 | Cost-Based Refresh Strategy — replace fixed `differential_max_change_ratio` with a history-driven cost model fitted on `pgt_refresh_history`; cold-start fallback to fixed threshold | 2–3 wk | [PLAN_NEW_STUFF.md §B-4](plans/performance/PLAN_NEW_STUFF.md) |
 
-> **Core refresh optimizations subtotal: ~20–40h**
+> ⚠️ C-4: The compaction DELETE **must use `seq` (the sequence primary key) not `ctid`** as
+> the stable row identifier. `ctid` changes under VACUUM and will silently delete the wrong
+> rows. See the corrected SQL and risk analysis in PLAN_NEW_STUFF.md §C-4.
 
-> **v0.6.0 total: ~65–104h**
+> **Core refresh optimizations subtotal: ~60–130h (A-4, B-2, C-4, B-4)**
+
+> **v0.6.0 total: ~105–194h**
 
 **Exit criteria:**
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
@@ -1004,6 +1006,9 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [ ] `create_or_replace_stream_table` deployed; dbt macro updated
 - [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers
 - [ ] SCC algorithm in place; monotonicity checker rejects non-monotone cycles
+- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta
+- [ ] B-2: Predicate pushdown reduces delta volume for selective queries (E2E benchmark)
+- [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
 - [ ] B-4: Cost model self-calibrates from refresh history; correctly selects FULL for join_agg at 10% change rate
 - [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
@@ -1586,8 +1591,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish | 45–66h | 165–222h | ✅ Released |
 | v0.3.0 — DVM Correctness, SAST & Test Coverage | ~20–30h | 185–252h | ✅ Released |
 | v0.4.0 — Parallel Refresh & Performance Hardening | ~60–94h | 245–346h | |
-| v0.5.0 — RLS, Operational Controls + Perf Wave 1 | ~51–107h | 296–453h | |
-| v0.6.0 — Partitioning, Idempotent DDL, Anomaly Detection + Perf Wave 2 | ~105–182h | 401–635h | |
+| v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | |
+| v0.6.0 — Partitioning, Idempotent DDL, Anomaly Detection + Perf Wave 2 (A-4, B-2, C-4, B-4) | ~105–194h | 401–637h | |
 | v0.7.0 — PG Backward Compat, Watermarks, Circular DAGs + Perf Wave 3 | ~134–215h | 535–850h | |
 | v0.8.0 — Connection Pooler, External Tests & Native DDL Syntax | ~200–300h | 735–1150h | |
 | v0.9.0 — Observability, Integration & pg_dump Support | ~54–77h | 789–1227h | |

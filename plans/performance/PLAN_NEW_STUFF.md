@@ -990,11 +990,11 @@ implementation, with dynamic column management as a follow-on.
   - CDC heuristic fallback: use fast path until first DELETE/UPDATE seen
   - **Not** the TopK TRUNCATE sub-path (not worth doing — see A-3 analysis)
   - **Not** the Bulk COPY sub-path (infeasible via SPI — see A-3 analysis)
-- A-4: Index-Aware MERGE Planning
-- B-2: Delta Predicate Pushdown (moved from Wave 2; Low risk, High impact)
-- C-4: Change Buffer Compaction (moved from Wave 2; fix `ctid` → `seq` bug before implementing)
 
 **Wave 2 (Core Optimizations — v0.6.0):**
+- A-4: Index-Aware MERGE Planning (deferred from v0.5.0 — blunt `enable_seqscan` hint; better after PG18 hint infra is stable)
+- B-2: Delta Predicate Pushdown (deferred from v0.5.0 — DVM engine correctness risk; requires dedicated wave)
+- C-4: Change Buffer Compaction (deferred from v0.5.0 — advisory lock races + `ctid` bug; fix `ctid` → `seq` before implementing)
 - B-4: Cost-Based Refresh Strategy Selection
 
 **Wave 3 (Scalability — v0.7.0):**
