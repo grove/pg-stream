@@ -1159,15 +1159,53 @@ pub fn build_column_snapshot(
         Ok(out)
     })?;
 
-    let json_str = serde_json::to_string(&entries)
+    // Include RLS state so the fingerprint changes when RLS is toggled.
+    let (rls_enabled, rls_forced) = query_rls_flags(source_oid)?;
+
+    let snapshot_obj = serde_json::json!({
+        "columns": entries,
+        "rls_enabled": rls_enabled,
+        "rls_forced": rls_forced,
+    });
+
+    let json_str = serde_json::to_string(&snapshot_obj)
         .map_err(|e| PgTrickleError::InternalError(format!("JSON serialization failed: {e}")))?;
 
     let mut hasher = Sha256::new();
     hasher.update(json_str.as_bytes());
     let fingerprint = format!("{:x}", hasher.finalize());
 
-    let snapshot = pgrx::JsonB(serde_json::Value::Array(entries));
+    let snapshot = pgrx::JsonB(snapshot_obj);
     Ok((snapshot, fingerprint))
+}
+
+/// Query the current RLS state of a table from `pg_class`.
+///
+/// Returns `(relrowsecurity, relforcerowsecurity)`.
+#[cfg(not(test))]
+pub fn query_rls_flags(source_oid: pg_sys::Oid) -> Result<(bool, bool), PgTrickleError> {
+    Spi::connect(|client| {
+        let sql = format!(
+            "SELECT relrowsecurity, relforcerowsecurity \
+             FROM pg_class WHERE oid = {}",
+            source_oid.to_u32(),
+        );
+        let mut result = client
+            .select(&sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        if let Some(row) = result.next() {
+            let rls: bool = row
+                .get(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or(false);
+            let force: bool = row
+                .get(2)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or(false);
+            return Ok((rls, force));
+        }
+        Ok((false, false))
+    })
 }
 
 /// Test-only stub: SPI is unavailable in unit tests.
@@ -1175,8 +1213,18 @@ pub fn build_column_snapshot(
 pub fn build_column_snapshot(
     _source_oid: pg_sys::Oid,
 ) -> Result<(pgrx::JsonB, String), PgTrickleError> {
-    let empty = serde_json::Value::Array(vec![]);
-    Ok((pgrx::JsonB(empty), String::new()))
+    let obj = serde_json::json!({
+        "columns": [],
+        "rls_enabled": false,
+        "rls_forced": false,
+    });
+    Ok((pgrx::JsonB(obj), String::new()))
+}
+
+/// Test-only stub for `query_rls_flags`.
+#[cfg(test)]
+pub fn query_rls_flags(_source_oid: pg_sys::Oid) -> Result<(bool, bool), PgTrickleError> {
+    Ok((false, false))
 }
 
 /// Get the stored column snapshot for a dependency pair.

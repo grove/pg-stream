@@ -1,6 +1,6 @@
 # PLAN: Row-Level Security (RLS) Support in pg_trickle
 
-**Status:** Phase 1 implemented (v0.5.0-phase-1)
+**Status:** Phases 1–3 implemented (v0.5.0-phase-2)
 **Priority:** Low (P4) — niche feature, but important for pg_ivm parity
 **Effort:** ~12–20 hours total across 4 phases
 **Last updated:** 2026-03-13

@@ -37,6 +37,19 @@ read time via RLS policies on the stream table itself.
   RLS on source table (FULL + DIFFERENTIAL), RLS on stream table, IMMEDIATE
   mode + RLS, change buffer RLS verification, and SECURITY DEFINER verification.
 
+#### Row-Level Security (RLS) DDL Tracking — Phase 2 (v0.5.0)
+
+- **R9: ENABLE/DISABLE RLS detection.** The DDL event trigger hook now detects
+  `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `DISABLE ROW LEVEL SECURITY`,
+  `FORCE ROW LEVEL SECURITY`, and `NO FORCE ROW LEVEL SECURITY` on source
+  tables. Affected stream tables are marked for reinit. The column snapshot
+  now includes RLS state (`rls_enabled`, `rls_forced`) so the schema
+  fingerprint changes when RLS is toggled.
+- **R10: E2E tests for RLS DDL tracking.** Three new tests in
+  `e2e_rls_tests.rs` covering ENABLE RLS, DISABLE RLS, and FORCE RLS
+  triggering reinit on downstream stream tables.
+- **R6: RLS tutorial.** New `docs/tutorials/ROW_LEVEL_SECURITY.md` showing
+  per-tenant RLS policies on stream tables with step-by-step examples.
 ---
 
 ## [0.4.0] — 2026-03-12
