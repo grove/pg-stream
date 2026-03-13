@@ -5,6 +5,7 @@
 --   Phase 2: RLS-aware refresh executor.
 --   Phase 3 (Bootstrap Source Gating): gate_source() / ungate_source() /
 --            source_gates() + scheduler skip logic.
+--   Phase 5: Append-only INSERT fast path (MERGE bypass).
 --
 -- New catalog table: pgtrickle.pgt_source_gates
 -- Tracks which source tables are currently "gated" (bootstrapping in progress).
@@ -20,3 +21,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_source_gates (
     ungated_at      TIMESTAMPTZ,
     gated_by        TEXT
 );
+
+-- Phase 5: Append-only INSERT fast path
+ALTER TABLE pgtrickle.pgt_stream_tables
+  ADD COLUMN IF NOT EXISTS is_append_only BOOLEAN NOT NULL DEFAULT FALSE;

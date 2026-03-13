@@ -854,7 +854,7 @@ intersects the current gated set.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| A-3a | MERGE bypass — Append-Only INSERT path: expose `APPEND ONLY` declaration on `CREATE STREAM TABLE`; CDC heuristic fallback (fast-path until first DELETE/UPDATE seen) | 1–2 wk | [PLAN_NEW_STUFF.md §A-3](plans/performance/PLAN_NEW_STUFF.md) |
+| A-3a | MERGE bypass — Append-Only INSERT path: expose `APPEND ONLY` declaration on `CREATE STREAM TABLE`; CDC heuristic fallback (fast-path until first DELETE/UPDATE seen) | 1–2 wk | [PLAN_NEW_STUFF.md §A-3](plans/performance/PLAN_NEW_STUFF.md) | ✅ Done |
 
 > A-4, B-2, and C-4 deferred to v0.6.0 Performance Wave 2 (scope mismatch with the
 > RLS/operational-controls theme; correctness risk warrants a dedicated wave).
@@ -869,7 +869,7 @@ intersects the current gated set.
 - [x] `gate_source` / `ungate_source` operational; scheduler skips gated sources correctly
 - [ ] `quick_health` view and `create_stream_table_if_not_exists` available
 - [ ] Manual refresh calls recorded in history with `initiated_by='MANUAL'`
-- [ ] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables
+- [x] A-3a: Append-Only INSERT path eliminates MERGE for event-sourced stream tables
 - [ ] Extension upgrade path tested (`0.4.0 → 0.5.0`)
 
 ---

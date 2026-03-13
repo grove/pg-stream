@@ -82,6 +82,32 @@ not fire mid-load, then ungate it to pick up all the data in a single refresh.
 - **Upgrade script.** `sql/pg_trickle--0.4.0--0.5.0.sql` adds the
   `pgt_source_gates` table for incremental upgrades.
 
+#### Append-Only INSERT Fast Path — Phase 5 (v0.5.0)
+
+Performance optimization for event-sourced / append-only workloads. Stream
+tables marked as append-only skip the full MERGE pipeline (DELETE, UPDATE,
+IS DISTINCT FROM checks) and use a simple `INSERT … SELECT` from the delta,
+reducing per-refresh latency significantly.
+
+- **A-3a: `append_only` parameter.** `create_stream_table()` and
+  `alter_stream_table()` accept a new `append_only` boolean (default `false`).
+  When `true`, differential refreshes use a direct INSERT instead of MERGE.
+- **Catalog: `is_append_only` column.** New `BOOLEAN NOT NULL DEFAULT FALSE`
+  column on `pgtrickle.pgt_stream_tables`.
+- **CDC heuristic fallback.** At the start of each differential refresh, the
+  engine checks the change buffers for DELETE or UPDATE actions. If any are
+  found, `is_append_only` is reverted to `false` automatically and the
+  current refresh falls through to the standard MERGE path. A warning is
+  logged.
+- **Validation.** `append_only` is rejected for FULL, IMMEDIATE, and keyless
+  source stream tables at both creation and ALTER time.
+- **E2E tests.** New `e2e_append_only_tests.rs` with 9 tests covering:
+  basic INSERT path, data correctness, DELETE/UPDATE fallback, ALTER toggle,
+  FULL/IMMEDIATE/keyless rejection, and no-data cycles.
+- **Unit tests.** `build_append_only_insert_sql()` SQL builder tests.
+- **Upgrade script.** `sql/pg_trickle--0.4.0--0.5.0.sql` adds
+  `is_append_only` column.
+
 
 
 ## [0.4.0] — 2026-03-12

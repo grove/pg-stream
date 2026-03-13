@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     function_hashes TEXT,
     requested_cdc_mode TEXT
                      CHECK (requested_cdc_mode IN ('auto', 'trigger', 'wal')),
+    is_append_only  BOOLEAN NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

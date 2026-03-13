@@ -58,6 +58,11 @@ pub struct StreamTableMeta {
     /// User-requested CDC mode override for this stream table.
     /// None means "follow the global pg_trickle.cdc_mode GUC".
     pub requested_cdc_mode: Option<String>,
+    /// Whether this stream table uses the append-only INSERT fast path.
+    /// When true, differential refresh uses INSERT instead of MERGE,
+    /// bypassing DELETE and UPDATE handling for better throughput.
+    /// Automatically reverted to false if a DELETE/UPDATE is detected.
+    pub is_append_only: bool,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -164,13 +169,14 @@ impl StreamTableMeta {
         diamond_schedule_policy: DiamondSchedulePolicy,
         has_keyless_source: bool,
         requested_cdc_mode: Option<&str>,
+        is_append_only: bool,
     ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
                     "INSERT INTO pgtrickle.pgt_stream_tables \
-                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode, is_append_only) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -189,6 +195,7 @@ impl StreamTableMeta {
                         diamond_schedule_policy.as_str().into(),
                         has_keyless_source.into(),
                         requested_cdc_mode.into(),
+                        is_append_only.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -210,7 +217,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes, requested_cdc_mode \
+                     has_keyless_source, function_hashes, requested_cdc_mode, is_append_only \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -236,7 +243,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes, requested_cdc_mode \
+                     has_keyless_source, function_hashes, requested_cdc_mode, is_append_only \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -267,7 +274,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes, requested_cdc_mode \
+                     has_keyless_source, function_hashes, requested_cdc_mode, is_append_only \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -293,7 +300,7 @@ impl StreamTableMeta {
                      data_timestamp, consecutive_errors, needs_reinit, frontier, \
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
-                     has_keyless_source, function_hashes, requested_cdc_mode \
+                     has_keyless_source, function_hashes, requested_cdc_mode, is_append_only \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -542,6 +549,20 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// Update the append-only flag for a stream table.
+    ///
+    /// Called by the CDC heuristic fallback when a DELETE or UPDATE is
+    /// detected on an append-only stream table, reverting it to MERGE.
+    pub fn update_append_only(pgt_id: i64, is_append_only: bool) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET is_append_only = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[is_append_only.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the per-ST adaptive fallback threshold and last FULL refresh time.
     ///
     /// Called after each differential or adaptive-fallback refresh to track
@@ -698,6 +719,7 @@ impl StreamTableMeta {
         let has_keyless_source = table.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
         let function_hashes = table.get::<String>(24).map_err(map_spi)?;
         let requested_cdc_mode = table.get::<String>(25).map_err(map_spi)?;
+        let is_append_only = table.get::<bool>(26).map_err(map_spi)?.unwrap_or(false);
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -725,6 +747,7 @@ impl StreamTableMeta {
             has_keyless_source,
             function_hashes,
             requested_cdc_mode,
+            is_append_only,
         })
     }
 
@@ -807,6 +830,7 @@ impl StreamTableMeta {
         let has_keyless_source = row.get::<bool>(23).map_err(map_spi)?.unwrap_or(false);
         let function_hashes = row.get::<String>(24).map_err(map_spi)?;
         let requested_cdc_mode = row.get::<String>(25).map_err(map_spi)?;
+        let is_append_only = row.get::<bool>(26).map_err(map_spi)?.unwrap_or(false);
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -834,6 +858,7 @@ impl StreamTableMeta {
             has_keyless_source,
             function_hashes,
             requested_cdc_mode,
+            is_append_only,
         })
     }
 }

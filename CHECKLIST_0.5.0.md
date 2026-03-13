@@ -72,7 +72,7 @@ All items are ≤ 2 h each and independent — fill gaps between the larger phas
 Scoped to the append-only fast path only. A-4, B-2, and C-4 are deferred to
 v0.6.0 where they fit better alongside the Wave 2 optimizations.
 
-- [ ] **A-3a** — Append-Only INSERT path (MERGE bypass)
+- [x] **A-3a** — Append-Only INSERT path (MERGE bypass)
   - `APPEND ONLY` declaration on `CREATE STREAM TABLE`
   - CDC heuristic fallback: use fast-path until first DELETE/UPDATE seen, then revert to MERGE
   - Catalog: `is_append_only BOOLEAN` column + upgrade SQL

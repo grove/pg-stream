@@ -40,6 +40,7 @@ fn create_stream_table(
     diamond_consistency: default!(Option<&str>, "NULL"),
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
     cdc_mode: default!(Option<&str>, "NULL"),
+    append_only: default!(bool, false),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -50,6 +51,7 @@ fn create_stream_table(
         diamond_consistency,
         diamond_schedule_policy,
         cdc_mode,
+        append_only,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -506,6 +508,7 @@ fn insert_catalog_and_deps(
     dc: DiamondConsistency,
     dsp: DiamondSchedulePolicy,
     requested_cdc_mode: Option<&str>,
+    is_append_only: bool,
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = StreamTableMeta::insert(
         pgt_relid,
@@ -525,6 +528,7 @@ fn insert_catalog_and_deps(
         dsp,
         vq.has_keyless_source,
         requested_cdc_mode,
+        is_append_only,
     )?;
 
     // Build per-source column usage map
@@ -1226,6 +1230,7 @@ fn create_stream_table_impl(
     diamond_consistency: Option<&str>,
     diamond_schedule_policy: Option<&str>,
     requested_cdc_mode: Option<&str>,
+    append_only: bool,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -1305,6 +1310,31 @@ fn create_stream_table_impl(
     warn_source_table_properties(&vq.source_relids);
     warn_select_star(query);
 
+    // Validate append_only flag
+    if append_only {
+        if refresh_mode == RefreshMode::Full {
+            return Err(PgTrickleError::InvalidArgument(
+                "append_only is not supported with FULL refresh mode. \
+                 Use DIFFERENTIAL or AUTO refresh mode."
+                    .to_string(),
+            ));
+        }
+        if refresh_mode.is_immediate() {
+            return Err(PgTrickleError::InvalidArgument(
+                "append_only is not supported with IMMEDIATE refresh mode. \
+                 Use DIFFERENTIAL or AUTO refresh mode."
+                    .to_string(),
+            ));
+        }
+        if vq.has_keyless_source {
+            return Err(PgTrickleError::InvalidArgument(
+                "append_only is not supported for stream tables with keyless sources. \
+                 Add a PRIMARY KEY to all source tables first."
+                    .to_string(),
+            ));
+        }
+    }
+
     // Check for duplicate
     if StreamTableMeta::get_by_name(&schema, &table_name).is_ok() {
         return Err(PgTrickleError::AlreadyExists(format!(
@@ -1357,6 +1387,7 @@ fn create_stream_table_impl(
         dc,
         dsp,
         requested_cdc_mode_override.as_deref(),
+        append_only,
     )?;
 
     // ── Phase 2: CDC / IVM trigger setup ──
@@ -1440,6 +1471,7 @@ fn alter_stream_table(
     diamond_consistency: default!(Option<&str>, "NULL"),
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
     cdc_mode: default!(Option<&str>, "NULL"),
+    append_only: default!(Option<bool>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -1450,6 +1482,7 @@ fn alter_stream_table(
         diamond_consistency,
         diamond_schedule_policy,
         cdc_mode,
+        append_only,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -1466,6 +1499,7 @@ fn alter_stream_table_impl(
     diamond_consistency: Option<&str>,
     diamond_schedule_policy: Option<&str>,
     cdc_mode: Option<&str>,
+    append_only: Option<bool>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -1729,6 +1763,32 @@ fn alter_stream_table_impl(
                 )));
             }
         }
+    }
+
+    if let Some(ao) = append_only {
+        let effective_mode = match refresh_mode {
+            Some(mode_str) => RefreshMode::from_str(mode_str)?,
+            None => st.refresh_mode,
+        };
+        if ao {
+            if effective_mode == RefreshMode::Full {
+                return Err(PgTrickleError::InvalidArgument(
+                    "append_only is not supported with FULL refresh mode.".to_string(),
+                ));
+            }
+            if effective_mode.is_immediate() {
+                return Err(PgTrickleError::InvalidArgument(
+                    "append_only is not supported with IMMEDIATE refresh mode.".to_string(),
+                ));
+            }
+            if st.has_keyless_source {
+                return Err(PgTrickleError::InvalidArgument(
+                    "append_only is not supported for stream tables with keyless sources."
+                        .to_string(),
+                ));
+            }
+        }
+        StreamTableMeta::update_append_only(st.pgt_id, ao)?;
     }
 
     shmem::signal_dag_rebuild();

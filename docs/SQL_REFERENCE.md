@@ -94,7 +94,8 @@ pgtrickle.create_stream_table(
     initialize            bool      DEFAULT true,
     diamond_consistency   text      DEFAULT NULL,
     diamond_schedule_policy text    DEFAULT NULL,
-    cdc_mode              text      DEFAULT NULL
+    cdc_mode              text      DEFAULT NULL,
+    append_only           bool      DEFAULT false
 ) → void
 ```
 
@@ -110,6 +111,7 @@ pgtrickle.create_stream_table(
 | `diamond_consistency` | `text` | `NULL` (defaults to `'none'`) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). |
 | `diamond_schedule_policy` | `text` | `NULL` (defaults to `'fastest'`) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. |
 | `cdc_mode` | `text` | `NULL` (use `pg_trickle.cdc_mode`) | Optional per-stream-table CDC override: `'auto'`, `'trigger'`, or `'wal'`. This affects all deferred TABLE sources of the stream table. |
+| `append_only` | `bool` | `false` | When `true`, differential refreshes use a fast INSERT path instead of MERGE. Skips DELETE/UPDATE/IS DISTINCT FROM checks. If a DELETE or UPDATE is later detected in the change buffer, the flag is automatically reverted to `false`. Not compatible with `FULL`, `IMMEDIATE`, or keyless sources. |
 
 When `refresh_mode => 'IMMEDIATE'`, the cluster-wide `pg_trickle.cdc_mode`
 setting is ignored. IMMEDIATE mode always uses statement-level IVM triggers
@@ -357,6 +359,14 @@ SELECT pgtrickle.create_stream_table(
     FROM totals t1
     JOIN totals t2 ON t1.user_id = t2.user_id + 1',
     schedule => '1m'
+);
+
+-- Append-only stream table (INSERT-only fast path)
+SELECT pgtrickle.create_stream_table(
+    name        => 'event_log_st',
+    query       => 'SELECT id, event_type, payload, created_at FROM events',
+    schedule    => '30s',
+    append_only => true
 );
 ```
 
@@ -645,7 +655,8 @@ pgtrickle.alter_stream_table(
     status                text      DEFAULT NULL,
     diamond_consistency   text      DEFAULT NULL,
     diamond_schedule_policy text    DEFAULT NULL,
-    cdc_mode              text      DEFAULT NULL
+    cdc_mode              text      DEFAULT NULL,
+    append_only           bool      DEFAULT NULL
 ) → void
 ```
 
@@ -661,6 +672,7 @@ pgtrickle.alter_stream_table(
 | `diamond_consistency` | `text` | `NULL` | New diamond consistency mode (`'none'` or `'atomic'`). Pass `NULL` to leave unchanged. |
 | `diamond_schedule_policy` | `text` | `NULL` | New schedule policy for atomic diamond groups (`'fastest'` or `'slowest'`). Pass `NULL` to leave unchanged. |
 | `cdc_mode` | `text` | `NULL` | New requested CDC mode override (`'auto'`, `'trigger'`, or `'wal'`). Pass `NULL` to leave unchanged. |
+| `append_only` | `bool` | `NULL` | Enable or disable the append-only INSERT fast path. Pass `NULL` to leave unchanged. When `true`, rejected for FULL, IMMEDIATE, or keyless source stream tables. |
 
 If you switch a stream table to `refresh_mode => 'IMMEDIATE'` while the
 cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle logs an
@@ -700,6 +712,9 @@ SELECT pgtrickle.alter_stream_table('order_totals',
 
 -- Pin a deferred stream table to trigger CDC even when the global GUC is 'auto'
 SELECT pgtrickle.alter_stream_table('order_totals', cdc_mode => 'trigger');
+
+-- Enable append-only INSERT fast path
+SELECT pgtrickle.alter_stream_table('event_log_st', append_only => true);
 
 -- Suspend a stream table
 SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');

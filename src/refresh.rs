@@ -641,6 +641,69 @@ fn build_keyless_delete_template(quoted_table: &str, pgt_id: i64) -> String {
     )
 }
 
+/// Build an INSERT SQL statement for append-only stream tables.
+///
+/// Extracts the USING clause from the MERGE template and rewrites it as:
+///   INSERT INTO "schema"."table" (__pgt_row_id, user_cols...)
+///   SELECT d.__pgt_row_id, d.user_cols...
+///   FROM (...delta...) AS d
+///   WHERE d.__pgt_action = 'I'
+///
+/// This is significantly faster than MERGE for append-only workloads
+/// because it skips the DELETE, UPDATE, and IS DISTINCT FROM checks.
+fn build_append_only_insert_sql(schema: &str, name: &str, merge_sql: &str) -> String {
+    let quoted_table = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        name.replace('"', "\"\""),
+    );
+
+    // Parse the MERGE SQL to extract:
+    // 1. The USING clause (delta subquery)
+    // 2. The INSERT column list
+    //
+    // MERGE INTO "schema"."table" AS st USING (...) AS d ON ...
+    // ... WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN
+    //   INSERT (__pgt_row_id, col1, col2, ...)
+    //   VALUES (d.__pgt_row_id, d.col1, d.col2, ...)
+
+    // Extract USING clause: between "USING " and " AS d ON"
+    let using_start = merge_sql.find("USING ").map(|p| p + 6).unwrap_or(0);
+    let using_end = merge_sql.find(" AS d ON ").unwrap_or(merge_sql.len());
+    let using_clause = &merge_sql[using_start..using_end];
+
+    // Extract column list from INSERT clause
+    let insert_marker = "INSERT (";
+    let insert_start = merge_sql
+        .rfind(insert_marker)
+        .map(|p| p + insert_marker.len())
+        .unwrap_or(0);
+    let insert_end = merge_sql[insert_start..]
+        .find(')')
+        .map(|p| insert_start + p)
+        .unwrap_or(merge_sql.len());
+    let col_list = &merge_sql[insert_start..insert_end];
+
+    // Extract VALUES column list (d.col prefixed)
+    let values_marker = "VALUES (";
+    let values_start = merge_sql
+        .rfind(values_marker)
+        .map(|p| p + values_marker.len())
+        .unwrap_or(0);
+    let values_end = merge_sql[values_start..]
+        .find(')')
+        .map(|p| values_start + p)
+        .unwrap_or(merge_sql.len());
+    let d_col_list = &merge_sql[values_start..values_end];
+
+    format!(
+        "INSERT INTO {quoted_table} ({col_list}) \
+         SELECT {d_col_list} \
+         FROM {using_clause} AS d \
+         WHERE d.__pgt_action = 'I'"
+    )
+}
+
 /// Pre-warm the delta SQL + MERGE template caches for a stream table.
 ///
 /// Called after `create_stream_table()` to avoid a cold-start penalty on
@@ -1518,6 +1581,49 @@ pub fn execute_differential_refresh(
         return Ok((0, 0));
     }
 
+    // ── A-3a: Append-only heuristic fallback ─────────────────────────
+    // When the stream table is marked append-only, check whether any
+    // DELETE or UPDATE actions appeared in the change buffers. If so,
+    // revert the flag and fall through to the normal MERGE path.
+    let mut is_append_only = st.is_append_only;
+    if is_append_only {
+        let has_non_insert = catalog_source_oids.iter().any(|oid| {
+            let prev_lsn = prev_frontier.get_lsn(*oid);
+            let new_lsn = new_frontier.get_lsn(*oid);
+            Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS(\
+                   SELECT 1 FROM \"{change_schema}\".changes_{oid} \
+                   WHERE lsn > '{prev_lsn}'::pg_lsn \
+                   AND lsn <= '{new_lsn}'::pg_lsn \
+                   AND action IN ('D', 'U') \
+                   LIMIT 1\
+                 )",
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false)
+        });
+
+        if has_non_insert {
+            pgrx::info!(
+                "[pg_trickle] Append-only stream table {}.{} received DELETE/UPDATE — \
+                 reverting to MERGE path.",
+                schema,
+                name,
+            );
+            is_append_only = false;
+            if let Err(e) = StreamTableMeta::update_append_only(st.pgt_id, false) {
+                pgrx::warning!(
+                    "[pg_trickle] Failed to clear is_append_only for {}.{}: {}",
+                    schema,
+                    name,
+                    e,
+                );
+            }
+            // Flush MERGE template cache so next cycle rebuilds with MERGE path.
+            crate::shmem::bump_cache_generation();
+        }
+    }
+
     // ── S2: TRUNCATE detection ───────────────────────────────────────
     // If any source table was TRUNCATEd, the change buffer contains a
     // marker row with action='T'. Differential deltas cannot represent
@@ -2040,6 +2146,58 @@ pub fn execute_differential_refresh(
     // SET LOCAL hints that are automatically reset at transaction end.
     apply_planner_hints(total_change_count);
 
+    // ── A-3a: Append-only INSERT fast path ───────────────────────────
+    // When the stream table is marked append-only (and hasn't been
+    // reverted by the heuristic check above), skip MERGE entirely and
+    // use a simple INSERT … SELECT from the delta. This avoids the
+    // DELETE, UPDATE, and IS DISTINCT FROM overhead of the MERGE path.
+    if is_append_only {
+        let t_insert_start = Instant::now();
+
+        // Build INSERT SQL from the resolved MERGE SQL's USING clause.
+        // The MERGE SQL has the form:
+        //   MERGE INTO "schema"."table" AS st USING (...delta...) AS d ON ...
+        // We extract the delta subquery and wrap it in INSERT INTO.
+        let insert_sql = build_append_only_insert_sql(schema, name, &resolved.merge_sql);
+
+        let rows_inserted = Spi::connect_mut(|client| {
+            let result = client
+                .update(&insert_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<i64, PgTrickleError>(result.len() as i64)
+        })?;
+
+        let t_insert = t_insert_start.elapsed();
+        pgrx::debug1!(
+            "[pg_trickle] append-only INSERT for {}.{}: {} rows in {:.1}ms",
+            schema,
+            name,
+            rows_inserted,
+            t_insert.as_secs_f64() * 1000.0,
+        );
+
+        // C-1: Defer cleanup of consumed change buffer rows.
+        let cleanup_source_oids = resolved.source_oids.clone();
+        if !cleanup_source_oids.is_empty() {
+            PENDING_CLEANUP.with(|q| {
+                q.borrow_mut().push(PendingCleanup {
+                    change_schema: change_schema.clone(),
+                    source_oids: cleanup_source_oids,
+                });
+            });
+        }
+
+        pgrx::info!(
+            "[PGS_PROFILE] decision={:.2}ms insert_exec={:.2}ms total={:.2}ms affected={} mode=APPEND_ONLY",
+            t_decision.as_secs_f64() * 1000.0,
+            t_insert.as_secs_f64() * 1000.0,
+            (t_decision + t_insert).as_secs_f64() * 1000.0,
+            rows_inserted,
+        );
+
+        return Ok((rows_inserted, 0));
+    }
+
     // ── User-trigger detection ───────────────────────────────────────
     // Determine whether to use the explicit DML path based on the GUC
     // and the presence of user-defined row-level triggers on the ST.
@@ -2405,6 +2563,7 @@ mod tests {
             has_keyless_source: false,
             function_hashes: None,
             requested_cdc_mode: None,
+            is_append_only: false,
         }
     }
 
@@ -2883,5 +3042,30 @@ mod tests {
         }
         // Should converge upward toward the cap
         assert!((threshold - 0.80).abs() < 0.01, "got {threshold}");
+    }
+
+    // ── build_append_only_insert_sql() ──────────────────────────────
+
+    #[test]
+    fn test_build_append_only_insert_sql_basic() {
+        let merge_sql = r#"MERGE INTO "public"."test_st" AS st USING (SELECT * FROM delta) AS d ON st.__pgt_row_id = d.__pgt_row_id WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE WHEN MATCHED AND d.__pgt_action = 'I' AND (st."val"::text IS DISTINCT FROM d."val"::text) THEN UPDATE SET "val" = d."val" WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN INSERT (__pgt_row_id, "val") VALUES (d.__pgt_row_id, d."val")"#;
+
+        let result = build_append_only_insert_sql("public", "test_st", merge_sql);
+        assert!(result.contains(r#"INSERT INTO "public"."test_st""#));
+        assert!(result.contains("__pgt_row_id"));
+        assert!(result.contains("WHERE d.__pgt_action = 'I'"));
+        assert!(!result.contains("MERGE"));
+        assert!(!result.contains("DELETE"));
+        assert!(!result.contains("UPDATE SET"));
+    }
+
+    #[test]
+    fn test_build_append_only_insert_sql_multi_column() {
+        let merge_sql = r#"MERGE INTO "myschema"."events" AS st USING (SELECT * FROM changes) AS d ON st.__pgt_row_id = d.__pgt_row_id WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN INSERT (__pgt_row_id, "id", "type", "payload") VALUES (d.__pgt_row_id, d."id", d."type", d."payload")"#;
+
+        let result = build_append_only_insert_sql("myschema", "events", merge_sql);
+        assert!(result.contains(r#"INSERT INTO "myschema"."events""#));
+        assert!(result.contains(r#"__pgt_row_id, "id", "type", "payload""#));
+        assert!(result.contains(r#"d.__pgt_row_id, d."id", d."type", d."payload""#));
     }
 }
