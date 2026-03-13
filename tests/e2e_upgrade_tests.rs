@@ -337,6 +337,17 @@ async fn test_upgrade_chain_new_functions_exist() {
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
     let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
 
+    // The .so binary is always the current version. Calling pg_trickle functions
+    // requires the SQL catalog to match — skip when upgrading to an older version.
+    let lib_version = env!("CARGO_PKG_VERSION");
+    if to_version != lib_version {
+        eprintln!(
+            "SKIP: test_upgrade_chain_new_functions_exist requires SQL version to match \
+             binary version ({lib_version}), got PGS_UPGRADE_TO={to_version}"
+        );
+        return;
+    }
+
     // Start container WITHOUT auto-extension, install old version manually
     let db = E2eDb::new().await;
 
@@ -408,6 +419,17 @@ async fn test_upgrade_chain_stream_tables_survive() {
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
     let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.5.0".into());
+
+    // The .so binary is always the current version. Calling pg_trickle functions
+    // requires the SQL catalog to match — skip when upgrading to an older version.
+    let lib_version = env!("CARGO_PKG_VERSION");
+    if to_version != lib_version {
+        eprintln!(
+            "SKIP: test_upgrade_chain_stream_tables_survive requires SQL version to match \
+             binary version ({lib_version}), got PGS_UPGRADE_TO={to_version}"
+        );
+        return;
+    }
 
     let db = E2eDb::new().await;
     db.execute(&format!(
