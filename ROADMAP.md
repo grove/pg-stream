@@ -10,6 +10,33 @@ MATERIALIZED VIEW` recomputation), how the differential dataflow approach
 solves it, the hybrid trigger→WAL CDC architecture, and the broad SQL
 coverage, all in plain language.
 
+## Table of Contents
+
+<!-- TOC start -->
+- [Overview](#overview)
+- [v0.1.x Series — Released](#v01x-series--released)
+- [v0.2.0 — TopK, Diamond Consistency & Transactional IVM](#v020--topk-diamond-consistency--transactional-ivm)
+- [v0.2.1 — Upgrade Infrastructure & Documentation](#v021--upgrade-infrastructure--documentation)
+- [v0.2.2 — OFFSET, AUTO Mode, ALTER QUERY, Edge Cases & CDC Hardening](#v022--offset-auto-mode-alter-query-edge-cases--cdc-hardening)
+- [v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish](#v023--non-determinism-cdcmode-gaps--operational-polish)
+- [v0.3.0 — DVM Correctness, SAST & Test Coverage](#v030--dvm-correctness-sast--test-coverage)
+- [v0.4.0 — Parallel Refresh & Performance Hardening](#v040--parallel-refresh--performance-hardening)
+- [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
+- [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
+- [v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--watermarks-circular-dag-execution-observability--infrastructure)
+- [v0.8.0 — Connection Pooler Compatibility](#v080--connection-pooler-compatibility)
+- [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
+- [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
+- [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
+- [v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compatibility](#v0120--multi-source-delta-batching-cdc-research--pg-backward-compatibility)
+- [v0.13.0 — Core Refresh Optimizations, Scalability Foundations & UNLOGGED Buffers](#v0130--core-refresh-optimizations-scalability-foundations--unlogged-buffers)
+- [v0.14.0 — Native DDL Syntax, External Test Suites & Integration](#v0140--native-ddl-syntax-external-test-suites--integration)
+- [v1.0.0 — Stable Release](#v100--stable-release)
+- [Post-1.0 — Scale & Ecosystem](#post-10--scale--ecosystem)
+- [Effort Summary](#effort-summary)
+- [References](#references)
+<!-- TOC end -->
+
 ---
 
 ## Overview
