@@ -106,6 +106,12 @@ new entries when creating documents.
 | [GAP_SQL_PHASE_7.md](sql/GAP_SQL_PHASE_7.md) | GAP | In progress | SQL gaps — phase 7 (deep analysis) |
 | [GAP_SQL_PHASE_7_QUESTIONS.md](sql/GAP_SQL_PHASE_7_QUESTIONS.md) | GAP | — | Open questions from GAP_SQL_PHASE_7 |
 
+## safety/
+
+| File | Type | Status | Summary |
+|------|------|--------|---------|
+| [PLAN_REDUCED_UNSAFE.md](safety/PLAN_REDUCED_UNSAFE.md) | PLAN | Proposed | Reduce unsafe code surface via safe abstractions and macros |
+
 ## testing/
 
 | File | Type | Status | Summary |
