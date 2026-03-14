@@ -155,6 +155,25 @@ engine to handle CTEs wrapping window functions — an untested path. The
 subquery produces a nested `Scan → Window → Project` chain that the existing
 DVM path already handles correctly.
 
+**Test coverage:** 9 E2E tests (`e2e_window_tests.rs`):
+- 6 creation-acceptance tests: `test_window_in_case_expression_rejected`,
+  `test_window_in_coalesce_rejected`, `test_window_in_arithmetic_rejected`,
+  `test_window_in_cast_rejected`, `test_window_deeply_nested_rejected`,
+  `test_top_level_window_still_works` (regression).
+- 3 data-correctness tests: `test_ec03_case_window_data_correctness` —
+  CASE + ROW_NUMBER() produces correct tier labels;
+  `test_ec03_arithmetic_window_data_correctness` — ROW_NUMBER() * 10
+  verified with a FULL refresh after INSERT;
+  `test_ec03_coalesce_window_data_correctness` — COALESCE(SUM() OVER, 0)
+  produces correct partition sums.
+
+**Known limitation:** Window-in-expression queries are accepted in
+DIFFERENTIAL mode (creation succeeds), but differential *refresh* fails with
+a `column st.* does not exist` error. The DVM delta engine cannot currently
+resolve the `st.*` alias inside the inner subquery introduced by the rewrite.
+FULL refresh works correctly. Differential support for the rewritten form is
+deferred.
+
 ---
 
 ### EC-04 — Non-monotone recursive CTEs rejected
@@ -471,6 +490,15 @@ Polling via `pg_proc` on each differential refresh:
 - On following calls: recompute hashes. If any differ → `mark_for_reinitialize` + NOTICE. The next scheduler cycle performs a full refresh.
 - Uses `md5(string_agg(prosrc || coalesce(probin::text,''), ',' ORDER BY oid))` to handle polymorphic overloads robustly.
 
+**Test coverage:** 3 E2E tests (`e2e_multi_cycle_tests.rs`):
+- `test_ec16_function_body_change_marks_reinit` — verifies that
+  `CREATE OR REPLACE FUNCTION` triggers `needs_reinit = true` on the next
+  differential refresh.
+- `test_ec16_function_change_full_refresh_recovery` — verifies that after
+  reinit, a full refresh produces correct results with the new function logic.
+- `test_ec16_no_functions_unaffected` — verifies that stream tables without
+  user-defined functions are never affected by the hash polling mechanism.
+
 ---
 
 ### EC-17 — Schema change during active refresh
@@ -510,6 +538,15 @@ sneaks in between lock acquisition and first read.
 2. **Medium term:** Add a `check_cdc_health()` finding for "auto mode stuck
    in TRIGGER phase for > 1 hour".
 
+**Test coverage:** 2 E2E tests (`e2e_wal_cdc_tests.rs`) + 1 existing test:
+- `test_ec18_check_cdc_health_shows_trigger_for_stuck_auto` — verifies
+  `check_cdc_health()` reports TRIGGER mode for a keyless auto-CDC source
+  and no alert fires for healthy TRIGGER-mode sources.
+- `test_ec18_health_check_ok_with_trigger_auto_sources` — verifies
+  `health_check()` does not flag TRIGGER-mode auto-CDC sources as errors.
+- `test_wal_keyless_table_stays_on_triggers` (pre-existing) — verifies
+  keyless tables remain on TRIGGER mode in auto-CDC configuration.
+
 ---
 
 ### EC-19 — WAL mode + keyless tables need REPLICA IDENTITY FULL
@@ -531,6 +568,13 @@ sneaks in between lock acquisition and first read.
    (full). This prevents the silent data loss entirely.
 2. **Medium term:** Automatically issue `ALTER TABLE … REPLICA IDENTITY
    FULL` for keyless tables when entering WAL mode (with a NOTICE).
+
+**Test coverage:** 2 E2E tests (`e2e_wal_cdc_tests.rs`):
+- `test_ec19_wal_keyless_without_replica_identity_full_rejected` — verifies
+  that `create_stream_table(cdc_mode => 'wal')` on a keyless table without
+  REPLICA IDENTITY FULL is rejected with a clear error.
+- `test_ec19_wal_keyless_with_replica_identity_full_accepted` — verifies
+  that the same combination succeeds once REPLICA IDENTITY FULL is set.
 
 ---
 
@@ -782,6 +826,21 @@ wrong results. Fixed by changing the condition to
 `(col IS NULL OR NOT (x op col))`, which correctly excludes the outer row
 whenever any subquery row is NULL or fails the comparison.
 
+**Test coverage:** 8 E2E tests (`e2e_all_subquery_tests.rs`):
+- `test_all_subquery_less_than_differential` — basic `price < ALL` filter
+  matching the SQL Reference worked example.
+- `test_all_subquery_differential_inner_insert` — differential refresh after
+  inserting a cheaper competitor price that disqualifies a product.
+- `test_all_subquery_differential_outer_change` — outer INSERT + inner DELETE
+  with recomputation.
+- `test_all_subquery_null_in_inner` — NULL-safety: ALL returns false when
+  subquery contains NULL; removing NULL re-qualifies rows.
+- `test_all_subquery_empty_inner` — empty subquery: ALL against empty set
+  yields true (SQL standard); inserting reduces result.
+- `test_all_subquery_full_refresh` — `>= ALL` with FULL refresh mode.
+- `test_all_subquery_equals_operator` — `= ALL` (value equals every row).
+- `test_all_subquery_not_equals_operator` — `<> ALL` (equivalent to NOT IN).
+
 ---
 
 ### EC-33 — Statistical aggregates (CORR, COVAR_*, REGR_*)
@@ -839,6 +898,15 @@ insufficient for very large groups.
 2. **Medium term:** On scheduler startup, when a source's `cdc_phase` is
    `WAL` but the slot is missing, automatically fall back to TRIGGER mode
    with a WARNING log and a NOTIFY.
+
+**Test coverage:** 2 E2E tests (`e2e_wal_cdc_tests.rs`):
+- `test_wal_fallback_on_missing_slot` (pre-existing) — full lifecycle test:
+  creates WAL-mode ST, drops replication slot externally, waits for automatic
+  fallback to TRIGGER, verifies data integrity after fallback.
+- `test_ec34_check_cdc_health_detects_missing_slot` — verifies
+  `check_cdc_health()` surfaces `replication_slot_missing` alert immediately
+  after slot drop, then confirms fallback to TRIGGER and post-fallback
+  data integrity.
 
 ---
 
@@ -944,14 +1012,14 @@ surfaces.
 - ✅ EC-11: `scheduler_falling_behind` alert (NOTIFY at 80% threshold)
 - ✅ EC-13: Default `diamond_consistency = 'atomic'` + scheduler SAVEPOINT → `pg_sys::BeginInternalSubTransaction` fix
 
-**Sprint 3 — Remaining P1 + P2 starts:**
-- EC-18: Rate-limited LOG for stuck auto mode (1 day)
-- EC-34: Auto-detect missing WAL slot (1 day)
-- EC-16: `pg_proc` hash polling for function changes (2 days)
-- EC-03: Window function CTE extraction (3–5 days)
+**Sprint 3 — Remaining P1 + P2 starts:** ✅ DONE (v0.6.0)
+- ✅ EC-18: Rate-limited LOG for stuck auto mode (1 day)
+- ✅ EC-34: Auto-detect missing WAL slot (1 day)
+- ✅ EC-16: `pg_proc` hash polling for function changes (2 days)
+- ✅ EC-03: Window function CTE extraction (3–5 days)
 
-**Sprint 4+ — P2 + P3 long-term:**
-- EC-05, EC-32: Foreign table change detection; `ALL (subquery)` → `NOT EXISTS (… EXCEPT …)` rewrite
+**Sprint 4+ — P2 + P3 long-term:** ✅ DONE (v0.6.0)
+- ✅ EC-05, EC-32: Foreign table change detection; `ALL (subquery)` → `NOT EXISTS (… EXCEPT …)` rewrite
 - EC-33: Statistical aggregates via auxiliary accumulator columns
 - Documentation sweep for all remaining P3 items
 

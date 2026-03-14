@@ -9,202 +9,145 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+No changes yet.
+
+---
+
+## [0.6.0] — 2026-03-14
+
 ### Added
 
 #### Idempotent DDL (`create_or_replace`)
 
-- **`pgtrickle.create_or_replace_stream_table()`** — declarative, idempotent
-  stream table deployment. One function call replaces the drop-and-recreate
-  pattern used by dbt and migration scripts:
-  - **Creates** if the stream table does not exist.
-  - **No-op** if the query and all config parameters are identical (INFO logged).
-  - **Alters config** (schedule, refresh_mode, diamond settings, cdc_mode,
-    append_only) when only settings changed.
-  - **Replaces query** via the ALTER QUERY path when the defining query
-    changed — includes in-place schema migration and full refresh.
-  - Mirrors PostgreSQL's `CREATE OR REPLACE` convention.
-  - Upgrade SQL migration: `sql/pg_trickle--0.5.0--0.6.0.sql`.
-- **dbt materialization uses `create_or_replace`** — the `stream_table`
-  materialization now calls `create_or_replace_stream_table()` when
-  pg_trickle ≥ 0.6.0 is detected, with automatic fallback to the legacy
-  check-then-decide pattern for older versions.
-- **13 E2E tests** covering create, no-op, config-only alter, query replace
-  (same schema, compatible schema, incompatible schema), combined changes,
-  mode switches, IMMEDIATE mode, whitespace normalization, and
-  `create_stream_table_if_not_exists` variants.
-- **Deployment docs** — FAQ section on idempotent deployment patterns;
+New one-call function for deploying stream tables without worrying about
+whether they already exist. Replaces the old "check if it exists, then drop
+and recreate" pattern.
 
-#### dbt Integration Enhancements (DBT-1 through DBT-3)
+- **`create_or_replace_stream_table()`** — a single function that does the
+  right thing automatically:
+  - **Creates** the stream table if it doesn't exist yet.
+  - **Does nothing** if the stream table already exists with the same query
+    and settings (logs an INFO so you know it was a no-op).
+  - **Updates settings** (schedule, refresh mode, etc.) if only config changed.
+  - **Replaces the query** if the defining query changed — including
+    automatic schema migration and a full refresh.
+- **dbt uses it automatically.** The `stream_table` materialization now calls
+  `create_or_replace_stream_table()` when running against pg_trickle 0.6.0+,
+  with automatic fallback for older versions.
+- **Whitespace-insensitive.** Cosmetic SQL differences (extra spaces, tabs,
+  newlines) are correctly treated as no-ops — won't trigger unnecessary
+  rebuilds.
 
-- **`stream_table_status()` macro (DBT-1).** New
-  `pgtrickle_stream_table_status()` utility macro returns the health status of
-  a stream table as a dict (`status`, `staleness_seconds`,
-  `consecutive_errors`, `total_refreshes`, etc.). Status is one of `healthy`,
-  `stale`, `erroring`, `paused`, or `not_found`. Configurable `warn_seconds`
-  threshold (default 300s).
-- **`stream_table_healthy` generic test (DBT-1).** Built-in dbt test that
-  fails when a stream table is stale, erroring, or paused. Use in
-  `schema.yml`: `- dbt_pgtrickle.stream_table_healthy: {warn_seconds: 300}`.
-- **`refresh_all_stream_tables` operation (DBT-2).** New run-operation that
-  refreshes all dbt-managed stream tables in topological (dependency) order.
-  Queries the pg_trickle dependency catalog to compute depth, refreshing
-  upstream tables first. Designed for CI: run after `dbt run` and before
-  `dbt test`. Supports optional schema filter.
-- **Alter flow integration tests (DBT-3).** New `order_extremes` (FULL refresh
-  mode) and `customer_stats` models exercise create, idempotent no-op re-run,
-  config change, and full-refresh paths through the dbt materialization.
-  Integration test script updated to test `refresh_all_stream_tables` and
-  the `stream_table_healthy` generic test.
-  Getting Started guide with SQL migration and dbt best practices.
+#### dbt Integration Enhancements
 
-#### SQL Documentation Gaps (DOC-1 through DOC-3)
+- **Check stream table health from dbt.** New `pgtrickle_stream_table_status()`
+  macro returns whether a stream table is healthy, stale, erroring, or paused.
+  Pair it with the new built-in `stream_table_healthy` test in your
+  `schema.yml` to fail CI when a stream table is behind or broken.
+- **Refresh everything in the right order.** New `refresh_all_stream_tables`
+  run-operation refreshes all dbt-managed stream tables in dependency order.
+  Run it after `dbt run` and before `dbt test` in your CI pipeline.
 
-- **ALL (subquery) documentation (DOC-1).** SQL Reference "Subquery
-  Expressions" section now includes `ALL (subquery)` in the operator table
-  with a complete worked example: source table setup, sample data, stream
-  table creation, expected results, and explanation of the NULL-safe
-  anti-join rewrite (`col IS NULL OR NOT (x op col)`). Common patterns
-  (salary comparisons, rating thresholds) are also shown.
-- **Window functions in expressions documentation (DOC-2).** SQL Reference
-  "Auto-Rewrite Pipeline" section now documents pass #7 — automatic
-  subquery-lift of window functions nested inside expressions (e.g.,
-  `CASE WHEN ROW_NUMBER() ...`, `ABS(RANK() ...)`). Before/after examples
-  show the user's original query and the internal rewrite with synthetic
-  `__pgt_wf_N` columns. The "Unsupported Expression Types" table is updated
-  to reflect that window-in-expression is now supported.
-- **Foreign table sources tutorial (DOC-3).** New
-  `docs/tutorials/FOREIGN_TABLE_SOURCES.md` tutorial with a step-by-step
-  walkthrough: `postgres_fdw` setup, `CREATE FOREIGN TABLE`, stream table
-  creation with FULL refresh, optional polling-based CDC via
-  `pg_trickle.foreign_table_polling`, monitoring commands, a worked
-  inventory dashboard example, constraints table, and FAQ entries. SQL
-  Reference updated with a "Foreign Tables as Sources" section in
-  Restrictions & Interoperability.
+#### Partitioned Source Tables
 
-#### Partitioning Support (Source Tables)
+Stream tables now work with PostgreSQL's declarative table partitioning —
+RANGE, LIST, and HASH partitioned tables all work as sources out of the box.
 
-Stream tables now work with PostgreSQL's declarative table partitioning.
+- **Changes in any partition are captured automatically.** CDC triggers fire
+  on the parent table so inserts, updates, and deletes in any child partition
+  are picked up.
+- **ATTACH PARTITION triggers automatic rebuild.** When you attach a new
+  partition, pg_trickle detects the structural change and rebuilds affected
+  stream tables to include the new partition's pre-existing data.
+- **WAL mode works with partitions.** Publications are configured with
+  `publish_via_partition_root = true`, so all partitions report changes under
+  the parent table's identity.
+- **New tutorial** covering partitioned source tables, ATTACH/DETACH behavior,
+  and known caveats (`docs/tutorials/PARTITIONED_TABLES.md`).
 
-- **Partitioned source tables work out of the box.** RANGE, LIST, and HASH
-  partitioned tables work as stream table sources. CDC triggers fire on the
-  parent and capture changes from all child partitions. E2E tests cover all
-  three partition types with both FULL and DIFFERENTIAL refresh.
+#### Circular Dependency Foundation
 
-- **ATTACH PARTITION triggers automatic reinitialize.** When you run
-  `ALTER TABLE parent ATTACH PARTITION child ...`, pg_trickle detects the
-  partition structure change and marks affected stream tables for
-  reinitialize. This ensures pre-existing rows in the newly attached
-  partition are picked up on the next refresh. DETACH PARTITION is also
-  detected.
+Lays the groundwork for stream tables that reference each other in a cycle
+(A → B → A). The actual cyclic refresh execution is planned for v0.7.0 —
+this release adds the detection, validation, and safety infrastructure.
 
-- **WAL-based CDC configured for partitions.** When using WAL mode,
-  publications are created with `publish_via_partition_root = true` so
-  changes from all child partitions appear under the parent table's
-  identity, matching trigger-mode behavior.
+- **Cycle detection.** pg_trickle can now identify groups of stream tables
+  that form circular dependencies.
+- **Safety checks at creation time.** Queries that can't safely participate
+  in a cycle (those using aggregates, EXCEPT, window functions, or NOT EXISTS)
+  are rejected with a clear error explaining why.
+- **New settings:**
+  - `pg_trickle.allow_circular` (default: off) — master switch for circular
+    dependencies.
+  - `pg_trickle.max_fixpoint_iterations` (default: 100) — prevents runaway
+    loops.
 
-- **Foreign table info message.** When a foreign table (via `postgres_fdw`)
-  is used as a source, pg_trickle now emits a clear info message explaining
-  that only FULL refresh mode or polling-based CDC is supported.
+#### Source Gating Improvements
 
-- **Partitioned table tutorial.** New user-facing guide
-  (`docs/tutorials/PARTITIONED_TABLES.md`) covering RANGE, LIST, and HASH
-  partitioned source tables, ATTACH/DETACH PARTITION behavior, foreign
-  tables, and known caveats.
+- **`bootstrap_gate_status()` function.** Shows which sources are currently
+  gated, when they were gated, how long the gate has been active, and which
+  stream tables are waiting. Useful for debugging "why isn't my stream table
+  refreshing?"
+- **ETL coordination cookbook.** SQL Reference now includes five step-by-step
+  recipes for common bulk-load patterns.
 
-#### Circular Dependency Foundation (CYC-1 through CYC-4)
+#### More SQL Patterns Supported
 
-Lays the groundwork for allowing controlled circular stream table
-dependencies. The actual fixed-point refresh execution is planned for v0.7.0;
-this release delivers the detection, validation, catalog, and configuration
-infrastructure.
+Two query patterns that previously required workarounds now just work:
 
-- **Tarjan's SCC algorithm (CYC-1).** `StDag::compute_sccs()` decomposes
-  the dependency graph into strongly connected components in O(V+E) time.
-  `condensation_order()` returns SCCs in topological order — the future
-  replacement for `topological_order()` when circular dependencies are
-  allowed. Includes self-loop detection.
+- **Window functions inside expressions.** Queries like
+  `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN 'top' ELSE 'other' END` or
+  `COALESCE(SUM() OVER (...), 0)` are now accepted and produce correct
+  results. Use **FULL** refresh mode for these queries — incremental
+  (DIFFERENTIAL) refresh of window-in-expression patterns is not yet
+  supported. Previously, the query was rejected entirely at creation time.
 
-- **Monotonicity checker (CYC-2).** `check_monotonicity()` performs static
-  analysis on an `OpTree` to determine whether a query is safe for cyclic
-  fixed-point iteration. Monotone operators (Scan, Filter, Project, Join,
-  UNION ALL, INTERSECT, EXISTS) are allowed; non-monotone operators
-  (Aggregate, EXCEPT, Window functions, NOT EXISTS) are rejected with
-  descriptive error messages explaining why convergence cannot be guaranteed.
+- **`ALL (subquery)` comparisons.** Queries like
+  `WHERE price < ALL (SELECT price FROM competitors)` are now accepted in
+  both FULL and DIFFERENTIAL modes. Supports all comparison operators
+  (`>`, `>=`, `<`, `<=`, `=`, `<>`) and correctly handles NULL values per
+  the SQL standard.
 
-- **Catalog tracking columns (CYC-3).** Two new columns:
-  - `pgtrickle.pgt_stream_tables.scc_id INT` — identifies which cycle group
-    a stream table belongs to (NULL for non-cyclic STs).
-  - `pgtrickle.pgt_refresh_history.fixpoint_iteration INT` — records which
-    iteration of the fixed-point loop produced a given refresh (NULL for
-    non-cyclic refreshes).
-  - Upgrade SQL script (`pg_trickle--0.5.0--0.6.0.sql`) adds both columns.
+#### Operational Safety Improvements
 
-- **Safety GUCs (CYC-4).** Two new configuration variables:
-  - `pg_trickle.max_fixpoint_iterations` (default 100) — maximum iterations
-    per SCC before declaring non-convergence and marking members as ERROR.
-  - `pg_trickle.allow_circular` (default false) — master switch; circular
-    dependencies are rejected unless explicitly enabled.
+- **Function changes detected automatically.** If a stream table's query
+  calls a user-defined function and you update that function with
+  `CREATE OR REPLACE FUNCTION`, pg_trickle detects the change and
+  automatically rebuilds the stream table on the next cycle. No manual
+  intervention needed.
 
-#### Bootstrap Source Gating Follow-Up
+- **WAL mode explains why it isn't activating.** When `cdc_mode = 'auto'`
+  and the system stays on trigger-based tracking, the scheduler now
+  periodically logs the exact reason (e.g., "`wal_level` is not `logical`")
+  and `check_cdc_health()` reports the current mode so you can diagnose the
+  issue.
 
-- **`bootstrap_gate_status()` introspection function (BOOT-F3).** New
-  `pgtrickle.bootstrap_gate_status()` returns a rich view of all source
-  gates including computed `gate_duration` (how long each gate has been
-  active) and `affected_stream_tables` (which stream tables are blocked).
-  Useful for debugging "why isn't my stream table refreshing?" situations.
-  Upgrade SQL migration: `sql/pg_trickle--0.5.0--0.6.0.sql`.
+- **WAL + keyless tables rejected early.** Creating a stream table with
+  `cdc_mode = 'wal'` on a table that has no primary key and no
+  `REPLICA IDENTITY FULL` is now rejected at creation time with a clear
+  error — instead of silently producing incomplete results later.
 
-- **Enhanced idempotency tests (BOOT-F1).** Verified that calling
-  `gate_source()` twice refreshes the `gated_at` timestamp, preserves
-  `gated_by`, and keeps `ungated_at` NULL. Confirms the UPSERT behavior
-  is safe for retrying ETL scripts.
+- **Automatic recovery after backup/restore.** When a PostgreSQL server is
+  restored from `pg_basebackup`, WAL replication slots are lost. pg_trickle
+  now detects the missing slot, automatically falls back to trigger-based
+  tracking, and logs a WARNING so you know what happened.
 
-- **Full gate lifecycle tests (BOOT-F2).** Verified the complete
-  gate → ungate → re-gate cycle: `ungated_at` is cleared on re-gate,
-  manual refresh works at every lifecycle stage, and the mechanism is
-  reusable across multiple load cycles.
+#### Documentation
 
-- **ETL coordination cookbook (BOOT-F4).** SQL Reference now includes
-  five step-by-step recipes: single source bulk load, coordinated
-  multi-source load, gate + deferred initialization, nightly batch
-  pattern, and monitoring during gated loads.
-
-#### Ergonomics Follow-Up (ERG-T1 through ERG-T5)
-
-Regression tests and documentation for ergonomic improvements shipped in
-v0.4.0 and v0.5.0.
-
-- **ERG-T1: Smart schedule default tests.** E2E tests verify that
-  `schedule => 'calculated'` is accepted, `schedule => NULL` is rejected
-  with a clear error, the default schedule omission works, and
-  `alter_stream_table` can switch to CALCULATED mode.
-
-- **ERG-T2: Removed GUC tests.** E2E tests confirm that
-  `SHOW pg_trickle.diamond_consistency` and
-  `SHOW pg_trickle.diamond_schedule_policy` return "unrecognized
-  configuration parameter" errors — preventing these removed GUCs from
-  silently reappearing.
-
-- **ERG-T3: Full-refresh warning tests.** E2E tests verify that changing
-  a stream table's refresh mode or defining query via `alter_stream_table`
-  emits a WARNING about the implicit full refresh, and that same-mode alters
-  do not.
-
-- **ERG-T4: WAL configuration warning test.** E2E test confirms that no
-  spurious WAL-level warning is emitted when `wal_level = logical`.
-
-- **ERG-T5: Breaking changes documented.** v0.4.0 CHANGELOG updated with a
-  "Breaking Changes" section covering the schedule default change, NULL
-  schedule rejection, and diamond GUC removal.
+- **ALL (subquery) worked example** in the SQL Reference with sample data
+  and expected results.
+- **Window-in-expression documentation** showing before/after examples of
+  the automatic rewrite.
+- **Foreign table sources tutorial** — step-by-step guide for using
+  `postgres_fdw` foreign tables as stream table sources.
 
 ### Fixed
 
-- **`create_or_replace` whitespace normalization.** Cosmetic SQL differences
-  (extra spaces, tabs, newlines) are now correctly treated as no-ops instead
-  of triggering unnecessary ALTER QUERY operations.
-- **`create_or_replace` incompatible schema test.** Fixed E2E test to use a
-  truly incompatible type change (same column name, text→integer) rather than
-  a column rename (which is a compatible add+remove migration).
+- **`create_or_replace` whitespace handling.** Extra spaces, tabs, and
+  newlines in queries no longer trigger unnecessary rebuilds.
+- **`create_or_replace` schema incompatibility detection.** Incompatible
+  column type changes (e.g., text → integer) are now properly detected
+  and handled.
 
 ---
 

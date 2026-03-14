@@ -512,3 +512,218 @@ async fn test_wal_keyless_table_stays_on_triggers() {
         "Keyless table should stay on TRIGGER mode (WAL requires PK)"
     );
 }
+
+// ── EC-18: Auto CDC mode stuck — health visibility ────────────────────
+
+/// EC-18: When auto CDC is stuck on TRIGGER (because a table has no PK),
+/// check_cdc_health() should report the source as TRIGGER mode so the
+/// operator can diagnose why WAL hasn't activated.
+#[tokio::test]
+async fn test_ec18_check_cdc_health_shows_trigger_for_stuck_auto() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    // Keyless table with REPLICA IDENTITY FULL — auto CDC can't upgrade to WAL
+    db.execute("CREATE TABLE ec18_src (val TEXT)").await;
+    db.execute("ALTER TABLE ec18_src REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO ec18_src VALUES ('a')").await;
+
+    db.create_st("ec18_st", "SELECT val FROM ec18_src", "1s", "DIFFERENTIAL")
+        .await;
+
+    // Give the scheduler a few seconds to attempt WAL transition
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // check_cdc_health() should show TRIGGER mode for this source
+    let cdc_mode: String = db
+        .query_scalar(
+            "SELECT cdc_mode FROM pgtrickle.check_cdc_health() \
+             WHERE source_table = 'ec18_src'",
+        )
+        .await;
+    assert_eq!(
+        cdc_mode, "TRIGGER",
+        "check_cdc_health() should report TRIGGER for keyless auto-CDC source"
+    );
+
+    // No alert should fire for a healthy TRIGGER-mode source
+    let alert_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.check_cdc_health() \
+             WHERE source_table = 'ec18_src' AND alert IS NOT NULL",
+        )
+        .await;
+    assert_eq!(
+        alert_count, 0,
+        "TRIGGER-mode source should not have a CDC health alert"
+    );
+}
+
+/// EC-18: health_check() should not report errors for sources stuck on
+/// TRIGGER mode via auto CDC — the system is functioning correctly, just
+/// not using WAL.
+#[tokio::test]
+async fn test_ec18_health_check_ok_with_trigger_auto_sources() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("CREATE TABLE ec18_hc (val TEXT)").await;
+    db.execute("ALTER TABLE ec18_hc REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO ec18_hc VALUES ('x')").await;
+
+    db.create_st(
+        "ec18_hc_st",
+        "SELECT val FROM ec18_hc",
+        "1s",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // health_check() should not have ERROR severity for stream tables
+    // that are ACTIVE but using TRIGGER mode
+    let error_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.health_check() \
+             WHERE check_name = 'error_tables' AND severity = 'ERROR'",
+        )
+        .await;
+    assert_eq!(
+        error_count, 0,
+        "health_check() should not flag TRIGGER-mode auto-CDC sources as errors"
+    );
+}
+
+// ── EC-34: Missing WAL slot detection via health check ────────────────
+
+/// EC-34: When a WAL replication slot is externally dropped,
+/// check_cdc_health() should surface a 'replication_slot_missing' alert
+/// before the automatic fallback to TRIGGER kicks in.
+#[tokio::test]
+async fn test_ec34_check_cdc_health_detects_missing_slot() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("CREATE TABLE ec34_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("ALTER TABLE ec34_src REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO ec34_src VALUES (1, 'a')").await;
+
+    db.create_st(
+        "ec34_st",
+        "SELECT id, val FROM ec34_src",
+        "1s",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Wait for WAL transition to complete
+    let mode = wait_for_cdc_mode(&db, "ec34_src", "WAL", Duration::from_secs(30)).await;
+    assert_eq!(mode, "WAL", "Should be in WAL mode before dropping slot");
+
+    // Drop the replication slot externally to simulate backup/restore
+    let oid = db.table_oid("ec34_src").await;
+    let slot_name = format!("pgtrickle_{}", oid);
+    db.execute(&format!("SELECT pg_drop_replication_slot('{slot_name}')"))
+        .await;
+
+    // Immediately check CDC health — before the scheduler's fallback runs.
+    // The check should detect the missing slot.
+    let alert: String = db
+        .query_scalar(
+            "SELECT coalesce(alert, '') FROM pgtrickle.check_cdc_health() \
+             WHERE source_table = 'ec34_src'",
+        )
+        .await;
+    assert_eq!(
+        alert, "replication_slot_missing",
+        "check_cdc_health() should report replication_slot_missing after slot drop"
+    );
+
+    // After fallback completes, verify data integrity
+    let fallback_mode =
+        wait_for_cdc_mode(&db, "ec34_src", "TRIGGER", Duration::from_secs(30)).await;
+    assert_eq!(
+        fallback_mode, "TRIGGER",
+        "Should fall back to TRIGGER after slot is dropped"
+    );
+
+    // Insert data and verify refresh still works post-fallback
+    db.execute("INSERT INTO ec34_src VALUES (2, 'b')").await;
+    let refreshed = db
+        .wait_for_auto_refresh("ec34_st", Duration::from_secs(15))
+        .await;
+    assert!(refreshed, "Trigger CDC should resume after fallback");
+    assert_eq!(db.count("public.ec34_st").await, 2);
+}
+
+// ── EC-19: WAL + keyless without REPLICA IDENTITY FULL ─────────────────
+
+/// EC-19: Creating a stream table with cdc_mode='wal' on a keyless table
+/// without REPLICA IDENTITY FULL must be rejected at creation time to
+/// prevent silent data corruption (WAL cannot send old-row values).
+/// Requires wal_level=logical (full E2E harness).
+#[tokio::test]
+async fn test_ec19_wal_keyless_without_replica_identity_full_rejected() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    // Keyless table with default REPLICA IDENTITY (not FULL)
+    db.execute("CREATE TABLE ec19_keyless (val TEXT)").await;
+    db.execute("INSERT INTO ec19_keyless VALUES ('a')").await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table(\
+                name => 'ec19_keyless_st',\
+                query => $$SELECT val FROM ec19_keyless$$,\
+                schedule => '1m',\
+                refresh_mode => 'DIFFERENTIAL',\
+                cdc_mode => 'wal'\
+            )",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "WAL CDC on keyless table without REPLICA IDENTITY FULL must be rejected"
+    );
+
+    let error = format!("{}", result.unwrap_err());
+    assert!(
+        error.contains("REPLICA IDENTITY FULL"),
+        "Error should mention REPLICA IDENTITY FULL, got: {error}"
+    );
+}
+
+/// EC-19: After setting REPLICA IDENTITY FULL, the same keyless table
+/// should be accepted with cdc_mode='wal'.
+/// Requires wal_level=logical (full E2E harness).
+#[tokio::test]
+async fn test_ec19_wal_keyless_with_replica_identity_full_accepted() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("CREATE TABLE ec19_ri_full (val TEXT)").await;
+    db.execute("ALTER TABLE ec19_ri_full REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO ec19_ri_full VALUES ('a')").await;
+
+    // Should succeed — REPLICA IDENTITY FULL is set, explicit WAL mode
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table(\
+                name => 'ec19_ri_full_st',\
+                query => $$SELECT val FROM ec19_ri_full$$,\
+                schedule => '1m',\
+                refresh_mode => 'DIFFERENTIAL',\
+                cdc_mode => 'wal'\
+            )",
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "WAL CDC on keyless table WITH REPLICA IDENTITY FULL should succeed: {:?}",
+        result.unwrap_err()
+    );
+}

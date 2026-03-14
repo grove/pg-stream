@@ -50,6 +50,7 @@ cleanup_light_e2e_containers() {
 # Curated allowlist for tests that run against the light harness.
 LIGHT_E2E_TESTS=(
     e2e_aggregate_coverage_tests
+    e2e_all_subquery_tests
     e2e_alter_tests
     e2e_cdc_tests
     e2e_stmt_cdc_tests
