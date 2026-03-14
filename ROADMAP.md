@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-03-13
 > **Latest release:** 0.5.0 (2026-03-13)
-> **Current milestone:** v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation
+> **Current milestone:** v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -26,7 +26,7 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
  ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
  │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │
  │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Partn., │
- │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │DDL&Cyc.│
+ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │DDL&EC  │
  └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
       │
       └─ ┌────────┐ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
@@ -876,11 +876,12 @@ intersects the current gated set.
 
 ---
 
-## v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation
+## v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation
 
 **Goal:** Validate partitioned source tables, add `create_or_replace_stream_table`
-for idempotent deployments (critical for dbt and migration workflows), and lay
-the foundation for circular stream table DAGs.
+for idempotent deployments (critical for dbt and migration workflows), close all
+remaining P0/P1 edge cases and two usability-tier gaps, and lay the foundation
+for circular stream table DAGs.
 
 ### Partitioning Support (Source Tables)
 
@@ -950,13 +951,50 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 > **Circular dependency foundation subtotal: ~4.5 hours**
 
-> **v0.6.0 total: ~35–50h**
+### Edge Case Hardening
+
+> **In plain terms:** Six remaining edge cases from the
+> [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) catalogue — one data
+> correctness issue (P0), three operational-surprise items (P1), and two
+> usability gaps (P2). Together they close every open edge case above
+> "accepted trade-off" status.
+
+#### P0 — Data Correctness
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| EC-19 | WAL + keyless table without `REPLICA IDENTITY FULL` — reject at stream table creation with a clear error instead of silently producing wrong deltas | 0.5 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-19 |
+
+#### P1 — Operational Safety
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| EC-16 | `ALTER FUNCTION` body change undetected — poll `pg_proc` hash on each refresh cycle to catch silent function redefinitions | 2 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-16 |
+| EC-18 | `cdc_mode = 'auto'` stuck in TRIGGER mode — emit a rate-limited LOG explaining why WAL transition hasn't happened, and surface a `health_check()` finding | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-18 |
+| EC-34 | WAL replication slots lost after `pg_basebackup` restore — auto-detect missing slot and fall back to TRIGGER mode with a WARNING | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-34 |
+
+#### P2 — Usability Gaps
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| EC-03 | Window functions inside expressions (e.g. `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN ...`) — extract nested window calls into a CTE so the outer expression references a plain column | 3–5 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
+| EC-32 | `x op ALL (subquery)` — rewrite to `NOT EXISTS (... EXCEPT ...)` so ALL-subqueries work in DIFFERENTIAL mode | 2–3 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-32 |
+
+> **Edge case hardening subtotal: ~9.5–13.5 days**
+
+> **v0.6.0 total: ~45–65h**
 
 **Exit criteria:**
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
 - [ ] WAL mode works with `publish_via_partition_root = true`
 - [ ] `create_or_replace_stream_table` deployed; dbt macro updated
 - [ ] SCC algorithm in place; monotonicity checker rejects non-monotone cycles
+- [ ] WAL + keyless without REPLICA IDENTITY FULL rejected at creation (EC-19)
+- [ ] `ALTER FUNCTION` body changes detected via `pg_proc` hash polling (EC-16)
+- [ ] Stuck `auto` CDC mode surfaces explanation in logs and health check (EC-18)
+- [ ] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)
+- [ ] Window functions in expressions supported via CTE extraction (EC-03)
+- [ ] `ALL (subquery)` rewritten to `NOT EXISTS (... EXCEPT ...)` (EC-32)
 - [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
 ---
