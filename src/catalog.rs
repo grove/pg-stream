@@ -1187,10 +1187,15 @@ pub fn build_column_snapshot(
     // Include RLS state so the fingerprint changes when RLS is toggled.
     let (rls_enabled, rls_forced) = query_rls_flags(source_oid)?;
 
+    // PT2: Include partition child count so the fingerprint changes when
+    // ATTACH/DETACH PARTITION modifies the partition structure.
+    let partition_child_count = query_partition_child_count(source_oid)?;
+
     let snapshot_obj = serde_json::json!({
         "columns": entries,
         "rls_enabled": rls_enabled,
         "rls_forced": rls_forced,
+        "partition_child_count": partition_child_count,
     });
 
     let json_str = serde_json::to_string(&snapshot_obj)
@@ -1250,6 +1255,26 @@ pub fn build_column_snapshot(
 #[cfg(test)]
 pub fn query_rls_flags(_source_oid: pg_sys::Oid) -> Result<(bool, bool), PgTrickleError> {
     Ok((false, false))
+}
+
+/// Query the number of child partitions of a table.
+///
+/// Returns 0 for non-partitioned tables. For partitioned tables (`relkind = 'p'`),
+/// returns the count of rows in `pg_inherits` where this table is the parent.
+#[cfg(not(test))]
+pub fn query_partition_child_count(source_oid: pg_sys::Oid) -> Result<i64, PgTrickleError> {
+    Spi::get_one_with_args::<i64>(
+        "SELECT count(*)::bigint FROM pg_inherits WHERE inhparent = $1",
+        &[source_oid.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+    .map(|opt| opt.unwrap_or(0))
+}
+
+/// Test-only stub for `query_partition_child_count`.
+#[cfg(test)]
+pub fn query_partition_child_count(_source_oid: pg_sys::Oid) -> Result<i64, PgTrickleError> {
+    Ok(0)
 }
 
 /// Get the stored column snapshot for a dependency pair.
