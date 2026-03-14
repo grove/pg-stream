@@ -880,8 +880,9 @@ intersects the current gated set.
 
 **Goal:** Validate partitioned source tables, add `create_or_replace_stream_table`
 for idempotent deployments (critical for dbt and migration workflows), close all
-remaining P0/P1 edge cases and two usability-tier gaps, and lay the foundation
-for circular stream table DAGs.
+remaining P0/P1 edge cases and two usability-tier gaps, harden ergonomics and
+source gating, expand the dbt integration, fill SQL documentation gaps, and lay
+the foundation for circular stream table DAGs.
 
 ### Partitioning Support (Source Tables)
 
@@ -896,11 +897,11 @@ for circular stream table DAGs.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| PT1 | E2E tests for partitioned source tables (RANGE, basic CRUD, differential refresh) | 8–12h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §7 |
-| PT2 | ATTACH PARTITION detection in DDL hook → force `needs_reinit` | 4–8h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §3.3 |
-| PT3 | WAL publication: set `publish_via_partition_root = true` for partitioned sources | 2–4h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §3.4 |
-| PT4 | Foreign table source detection (`relkind = 'f'`) → restrict to FULL mode | 2–4h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §6.3 |
-| PT5 | Documentation: partitioned source table support & caveats | 2–4h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §8 |
+| PT1 | **Verify partitioned tables work end-to-end.** Create stream tables over RANGE-partitioned source tables, insert/update/delete rows, refresh, and confirm results match — proving that pg_trickle handles partitions correctly out of the box. | 8–12h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §7 |
+| PT2 | **Detect new partitions automatically.** When someone runs `ALTER TABLE orders ATTACH PARTITION orders_2026_04 ...`, pg_trickle notices and rebuilds affected stream tables so the new partition's data is included. Without this, the new partition would be silently ignored. | 4–8h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §3.3 |
+| PT3 | **Make WAL-based change tracking work with partitions.** PostgreSQL's logical replication normally sends changes tagged with the child partition name, not the parent. This configures it to report changes under the parent table name so pg_trickle's WAL decoder can match them correctly. | 2–4h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §3.4 |
+| PT4 | **Handle foreign tables gracefully.** Tables that live in another database (via `postgres_fdw`) can't have triggers or WAL tracking. pg_trickle now detects them and automatically uses full-scan refresh mode instead of failing with a confusing error. | 2–4h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §6.3 |
+| PT5 | **Document partitioned table support.** User-facing guide covering which partition types work, what happens when you add/remove partitions, and known caveats. | 2–4h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §8 |
 
 > **Partitioning subtotal: ~18–32 hours**
 
@@ -923,10 +924,10 @@ pattern used by the dbt materialization macro.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| COR-1 | `create_or_replace_stream_table()` core + `compute_config_diff()` utility | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
-| COR-3 | dbt materialization macro updated to use `create_or_replace` instead of drop+create | 2h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
-| COR-4 | Upgrade SQL + documentation (SQL_REFERENCE, FAQ) | 2.5h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
-| COR-5 | 13 E2E tests in `e2e_create_or_replace_tests.rs` | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| COR-1 | **The core function.** `create_or_replace_stream_table()` compares the new definition against the existing one and picks the cheapest path: no-op if identical, settings-only update if just config changed, column migration if columns were added/dropped, or full rebuild if the query is fundamentally different. One function call replaces the drop-and-recreate dance. | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| COR-3 | **dbt just works.** Updates the `stream_table` dbt materialization macro to call `create_or_replace` instead of dropping and recreating on every `dbt run`. Existing data survives deployments; only genuinely changed stream tables get rebuilt. | 2h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| COR-4 | **Upgrade path and documentation.** Upgrade SQL script so existing installations get the new function via `ALTER EXTENSION UPDATE`. SQL Reference and FAQ updated with usage examples. | 2.5h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| COR-5 | **Thorough test coverage.** 13 end-to-end tests covering: identical no-op, config-only change, query change with compatible columns, query change with incompatible columns, mode switches, and error cases. | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
 
 > **Idempotent DDL subtotal: ~12–13 hours**
 
@@ -944,10 +945,10 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| CYC-1 | Tarjan's SCC algorithm in `src/dag.rs`: `Scc` struct, `compute_sccs()`, `condensation_order()` | ~2h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 1 |
-| CYC-2 | Monotonicity checker in `src/dvm/parser.rs`: `check_monotonicity(OpTree)` rejects non-monotone cycles (AGG, EXCEPT, WINDOW, AntiJoin, DISTINCT) | ~1h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 2 |
-| CYC-3 | Catalog: `scc_id INT` on `pgt_stream_tables`; `fixpoint_iteration INT` on `pgt_refresh_history`; migration SQL | ~1h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 3 |
-| CYC-4 | GUCs: `pg_trickle.max_fixpoint_iterations` (default 100), `pg_trickle.allow_circular` (default false) | ~30min | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 4 |
+| CYC-1 | **Find cycles in the dependency graph.** Implement Tarjan's algorithm to efficiently detect which stream tables form circular groups. This tells the scheduler "these three stream tables reference each other — they need special handling." | ~2h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 1 |
+| CYC-2 | **Block unsafe cycles.** Not all queries can safely participate in a cycle — aggregates, EXCEPT, window functions, and NOT EXISTS can't converge to a stable answer when run in a loop. This checker rejects those at creation time with a clear error explaining why. | ~1h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 2 |
+| CYC-3 | **Track cycles in the catalog.** Add columns to the internal tables that record which cycle group each stream table belongs to and how many iterations the last refresh took. Needed for monitoring and the scheduler logic in v0.7.0. | ~1h | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 3 |
+| CYC-4 | **Safety knobs.** Two new settings: `max_fixpoint_iterations` (default 100) prevents runaway loops, and `allow_circular` (default off) is the master switch — circular dependencies are rejected unless you explicitly opt in. | ~30min | [PLAN_CIRCULAR_REFERENCES.md](plans/sql/PLAN_CIRCULAR_REFERENCES.md) Part 4 |
 
 > **Circular dependency foundation subtotal: ~4.5 hours**
 
@@ -963,26 +964,102 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC-19 | WAL + keyless table without `REPLICA IDENTITY FULL` — reject at stream table creation with a clear error instead of silently producing wrong deltas | 0.5 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-19 |
+| EC-19 | **Prevent silent data corruption with WAL + keyless tables.** If you use WAL-based change tracking on a table without a primary key, PostgreSQL needs `REPLICA IDENTITY FULL` to send complete row data. Without it, deltas are silently incomplete. This rejects the combination at creation time with a clear error instead of producing wrong results. | 0.5 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-19 |
 
 #### P1 — Operational Safety
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC-16 | `ALTER FUNCTION` body change undetected — poll `pg_proc` hash on each refresh cycle to catch silent function redefinitions | 2 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-16 |
-| EC-18 | `cdc_mode = 'auto'` stuck in TRIGGER mode — emit a rate-limited LOG explaining why WAL transition hasn't happened, and surface a `health_check()` finding | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-18 |
-| EC-34 | WAL replication slots lost after `pg_basebackup` restore — auto-detect missing slot and fall back to TRIGGER mode with a WARNING | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-34 |
+| EC-16 | **Detect when someone silently changes a function your query uses.** If a stream table's query calls `calculate_discount()` and someone does `CREATE OR REPLACE FUNCTION calculate_discount(...)` with new logic, the stream table's cached computation plan becomes stale. This checks function body hashes on each refresh and triggers a rebuild when a change is detected. | 2 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-16 |
+| EC-18 | **Explain why WAL mode isn't activating.** When `cdc_mode = 'auto'`, pg_trickle is supposed to upgrade from trigger-based to WAL-based change tracking when possible. If it stays stuck on triggers (e.g. because `wal_level` isn't set to `logical`), there's no feedback. This adds a periodic log message explaining the reason and surfaces it in the `health_check()` output. | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-18 |
+| EC-34 | **Recover gracefully after restoring from backup.** When you restore a PostgreSQL server from `pg_basebackup`, replication slots are lost. pg_trickle's WAL decoder would fail trying to read from a slot that no longer exists. This detects the missing slot, automatically falls back to trigger-based tracking, and logs a WARNING so you know what happened. | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-34 |
 
 #### P2 — Usability Gaps
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC-03 | Window functions inside expressions (e.g. `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN ...`) — extract nested window calls into a CTE so the outer expression references a plain column | 3–5 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
-| EC-32 | `x op ALL (subquery)` — rewrite to `NOT EXISTS (... EXCEPT ...)` so ALL-subqueries work in DIFFERENTIAL mode | 2–3 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-32 |
+| EC-03 | **Support window functions inside expressions.** Queries like `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN 'first' ELSE 'other' END` are currently rejected because the incremental engine can't handle a window function nested inside a CASE. This automatically extracts the window function into a preliminary step and rewrites the outer query to reference the precomputed result — so the query pattern just works. | 3–5 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
+| EC-32 | **Support `ALL (subquery)` comparisons.** Queries like `WHERE price > ALL (SELECT price FROM competitors)` (meaning "greater than every row in the subquery") are currently rejected in incremental mode. This rewrites them into an equivalent form the engine can handle, removing a Known Limitation from the changelog. | 2–3 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-32 |
 
 > **Edge case hardening subtotal: ~9.5–13.5 days**
 
-> **v0.6.0 total: ~45–65h**
+### Ergonomics Follow-Up
+
+> **In plain terms:** Several test gaps and a documentation item were left
+> over from the v0.5.0 ergonomics work. These are all small E2E tests that
+> confirm existing features actually produce the warnings and errors they're
+> supposed to — catching regressions before users hit them. The changelog
+> entry documents breaking behavioural changes (the default schedule changed
+> from a fixed "every 1 minute" to an auto-calculated interval, and `NULL`
+> schedule input is now rejected).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ERG-T1 | **Test the smart schedule default.** Verify that passing `'calculated'` as a schedule works (pg_trickle picks an interval based on table size) and that passing `NULL` gives a clear error instead of silently breaking. Catches regressions in the schedule parser. | 4h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T2 | **Test that removed settings stay removed.** The `diamond_consistency` GUC was removed in v0.4.0. Verify that `SHOW pg_trickle.diamond_consistency` returns an error — not a stale value from a previous installation that confuses users. | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T3 | **Test the "heads up, this will do a full refresh" warning.** When you change a stream table's query via `alter_stream_table(query => ...)`, it may trigger an expensive full re-scan. Verify the WARNING appears so users aren't surprised by a sudden spike in load. | 3h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T4 | **Test the WAL configuration warning.** When `cdc_mode = 'auto'` but PostgreSQL's `wal_level` isn't set to `logical`, pg_trickle can't use WAL-based tracking and silently falls back to triggers. Verify the startup WARNING appears so operators know they need to change `wal_level`. | 3h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T5 | **Document breaking changes in the changelog.** In v0.4.0 the default schedule changed from "every 1 minute" to auto-calculated, and `NULL` schedule input started being rejected. These behavioural changes need explicit CHANGELOG entries so upgrading users aren't caught off guard. | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+
+> **Ergonomics follow-up subtotal: ~14 hours**
+
+### Bootstrap Source Gating Follow-Up
+
+> **In plain terms:** Source gating (pause/resume for bulk loads) shipped in
+> v0.5.0 with the core API and scheduler integration. This follow-up adds
+> robustness tests for edge cases that real-world ETL pipelines will hit:
+> What happens if you gate a source twice? What if you re-gate it after
+> ungating? It also adds a dedicated introspection function that shows the
+> full gate lifecycle (when gated, who gated it, how long it's been gated),
+> and documentation showing common ETL coordination patterns like
+> "gate → bulk load → ungate → single clean refresh."
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| BOOT-F1 | **Calling gate twice is safe.** Verify that calling `gate_source('orders')` when `orders` is already gated is a harmless no-op — not an error. Important for ETL scripts that may retry on failure. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-F2 | **Gate → ungate → gate again works correctly.** Verify the full lifecycle: gate a source (scheduler skips it), ungate it (scheduler resumes), gate it again (scheduler skips again). Proves the mechanism is reusable across multiple load cycles. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-F3 | **See your gates at a glance.** A new `bootstrap_gate_status()` function that shows which sources are gated, when they were gated, who gated them, and how long they've been paused. Useful for debugging when the scheduler seems to be "doing nothing" — it might just be waiting for a gate. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-F4 | **Cookbook for common ETL patterns.** Documentation with step-by-step recipes: gating a single source during a bulk load, coordinating multiple source loads that must finish together, gating only part of a stream table DAG, and the classic "nightly batch → gate → load → ungate → single clean refresh" workflow. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+
+> **Bootstrap gating follow-up subtotal: ~12 hours**
+
+### dbt Integration Enhancements
+
+> **In plain terms:** The dbt macro package (`dbt-pgtrickle`) shipped in
+> v0.4.0 with the core `stream_table` materialization. This adds three
+> improvements: a `stream_table_status` macro that lets dbt models query
+> health information (stale? erroring? how many refreshes?) so you can build
+> dbt tests that fail when a stream table is unhealthy; a bulk
+> `refresh_all_stream_tables` operation for CI pipelines that need everything
+> fresh before running tests; and expanded integration tests covering the
+> `alter_stream_table` flow (which gets more important once
+> `create_or_replace` lands in the same release).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DBT-1 | **Check stream table health from dbt.** A new `stream_table_status()` macro that returns whether a stream table is healthy, stale, or erroring — so you can write dbt tests like "fail if the orders summary hasn't refreshed in the last 5 minutes." Makes pg_trickle a first-class citizen in dbt's testing framework. | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+| DBT-2 | **Refresh everything in one command.** A `dbt run-operation refresh_all_stream_tables` command that refreshes all stream tables in the correct dependency order. Designed for CI pipelines: run it after `dbt run` and before `dbt test` to make sure all materialized data is current. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+| DBT-3 | **Test the dbt ↔ alter flow.** Integration tests that verify query changes, config changes, and mode switches all work correctly when made through dbt's `stream_table` materialization. Especially important now that `create_or_replace` is landing in the same release. | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+
+> **dbt integration subtotal: ~8 hours**
+
+### SQL Documentation Gaps
+
+> **In plain terms:** Once EC-03 (window functions in expressions) and EC-32
+> (`ALL (subquery)`) are implemented in this release, the documentation needs
+> to explain the new patterns with examples. The foreign table polling CDC
+> feature (shipped in v0.2.2) also needs a worked example showing common
+> setups like `postgres_fdw` source tables with periodic polling.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DOC-1 | **Show users how ALL-subqueries work.** Once EC-32 lands, add a SQL Reference section explaining `WHERE price > ALL (SELECT ...)`, how pg_trickle rewrites it internally, and a complete worked example with sample data and expected output. | 2h | [GAP_SQL_OVERVIEW.md](plans/sql/GAP_SQL_OVERVIEW.md) |
+| DOC-2 | **Show the window-in-expression pattern.** Once EC-03 lands, add a before/after example to the SQL Reference: "Here's your original query with `CASE WHEN ROW_NUMBER() ...`, and here's what pg_trickle does under the hood to make it work incrementally." | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
+| DOC-3 | **Walkthrough for foreign table sources.** A step-by-step recipe showing how to create a `postgres_fdw` foreign table, use it as a stream table source with polling-based change detection, and what to expect in terms of refresh behaviour. This feature shipped in v0.2.2 but was never properly documented with an example. | 1h | Existing feature (v0.2.2) |
+
+> **SQL documentation subtotal: ~5 hours**
+
+> **v0.6.0 total: ~77–92h**
 
 **Exit criteria:**
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
@@ -995,15 +1072,20 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [ ] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)
 - [ ] Window functions in expressions supported via CTE extraction (EC-03)
 - [ ] `ALL (subquery)` rewritten to `NOT EXISTS (... EXCEPT ...)` (EC-32)
+- [ ] Ergonomics E2E tests for calculated schedule, warnings, and removed GUCs pass
+- [ ] `gate_source()` idempotency and re-gating tested; `bootstrap_gate_status()` available
+- [ ] dbt `stream_table_status()` and `refresh_all_stream_tables` macros shipped
+- [ ] SQL Reference updated for EC-03, EC-32, and foreign table polling patterns
 - [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
 ---
 
-## v0.7.0 — Watermarks & Circular DAG Execution
+## v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure
 
 **Goal:** Add user-injected temporal watermark gating for batch-ETL
-coordination and complete the fixpoint scheduler for circular stream table
-DAGs.
+coordination, complete the fixpoint scheduler for circular stream table
+DAGs, ship ready-made Prometheus/Grafana monitoring, and prepare the
+1.0 packaging and deployment infrastructure.
 
 ### Watermark Gating
 
@@ -1055,11 +1137,57 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 
 > **Circular dependencies subtotal: ~19 hours**
 
-> **v0.7.0 total: ~36–39h**
+### Prometheus & Grafana Observability
+
+> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
+> their databases. This ships ready-to-use configuration files — no custom
+> code, no extension changes — that plug into the standard `postgres_exporter`
+> and light up a Grafana dashboard showing refresh latency, staleness, error
+> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
+> alerting rules so you get paged when a stream table goes stale or starts
+> error-looping. A Docker Compose file lets you try the full observability
+> stack with a single `docker compose up`.
+
+Zero-code monitoring integration. All config files live in a new
+`monitoring/` directory in the main repo (or a separate
+`pgtrickle-monitoring` repo). Queries use existing views
+(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+
+> **Observability subtotal: ~12 hours**
+
+### Pre-1.0 Infrastructure Prep
+
+> **In plain terms:** Three preparatory tasks that make the eventual 1.0
+> release smoother. A draft Docker Hub image workflow (tests the build but
+> doesn't publish yet); a PGXN metadata file so the extension can eventually
+> be installed with `pgxn install pg_trickle`; and a basic CNPG integration
+> test that verifies the extension image loads correctly in a CloudNativePG
+> cluster. None of these ship user-facing features — they're CI and
+> packaging scaffolding.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| INFRA-1 | **Prove the Docker image builds.** Set up a CI workflow that builds the official Docker Hub image (PostgreSQL 18 + pg_trickle pre-installed), runs a smoke test (create extension, create a stream table, refresh it), but doesn't publish anywhere yet. When 1.0 arrives, publishing is just flipping a switch. | 5h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
+| INFRA-2 | **Prepare for `pgxn install pg_trickle`.** PGXN is PostgreSQL's official extension registry. Drafting the `META.json` metadata file now means publishing to PGXN at 1.0 is a single command — no scrambling to figure out the required fields and version constraints at release time. | 2h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| INFRA-3 | **Verify Kubernetes deployment works.** A CI smoke test that deploys the pg_trickle extension image into a CloudNativePG (CNPG) Kubernetes cluster, creates a stream table, and confirms a refresh cycle completes. Catches packaging and compatibility issues before they reach Kubernetes users. | 4h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+
+> **Infrastructure prep subtotal: ~11 hours**
+
+> **v0.7.0 total: ~59–62h**
 
 **Exit criteria:**
 - [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
 - [ ] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
+- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
+- [ ] Docker Hub image draft workflow passes; PGXN `META.json` drafted
+- [ ] CNPG integration smoke test passes in CI
 - [ ] Extension upgrade path tested (`0.6.0 → 0.7.0`)
 
 ---
