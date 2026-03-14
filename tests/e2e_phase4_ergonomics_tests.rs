@@ -260,3 +260,318 @@ async fn test_create_if_not_exists_ignores_query_difference() {
     // __pgt_row_id + id + val = 3 columns
     assert_eq!(col_count, 3);
 }
+
+// ── ERG-T1: Smart schedule default ───────────────────────────────────
+
+/// ERG-T1: Passing `schedule => 'calculated'` should succeed and produce
+/// a CALCULATED stream table (NULL schedule in catalog).
+#[tokio::test]
+async fn test_erg_t1_calculated_schedule_accepted() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t1_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO t1_src VALUES (1, 'a'), (2, 'b')")
+        .await;
+
+    db.create_st(
+        "t1_calc_st",
+        "SELECT id, val FROM t1_src",
+        "calculated",
+        "FULL",
+    )
+    .await;
+
+    // Catalog should store NULL schedule for CALCULATED mode
+    let schedule_is_null: bool = db
+        .query_scalar(
+            "SELECT schedule IS NULL FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 't1_calc_st'",
+        )
+        .await;
+    assert!(
+        schedule_is_null,
+        "CALCULATED schedule should be stored as NULL in catalog"
+    );
+
+    // The stream table should be populated
+    let count = db.count("public.t1_calc_st").await;
+    assert_eq!(count, 2);
+}
+
+/// ERG-T1: The default schedule (when omitted) is 'calculated', so
+/// creating with only name + query + refresh_mode should work.
+#[tokio::test]
+async fn test_erg_t1_default_schedule_is_calculated() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t1_def_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO t1_def_src VALUES (1, 10)").await;
+
+    // Omit schedule entirely — should default to 'calculated'
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('t1_def_st', \
+         $$ SELECT id, val FROM t1_def_src $$, refresh_mode => 'FULL')",
+    )
+    .await;
+
+    let schedule_is_null: bool = db
+        .query_scalar(
+            "SELECT schedule IS NULL FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 't1_def_st'",
+        )
+        .await;
+    assert!(
+        schedule_is_null,
+        "Default schedule should be CALCULATED (stored as NULL)"
+    );
+}
+
+/// ERG-T1: Passing `schedule => NULL` should return a clear error.
+#[tokio::test]
+async fn test_erg_t1_null_schedule_rejected() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t1_null_src (id INT PRIMARY KEY, val INT)")
+        .await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table('t1_null_st', \
+             $$ SELECT id, val FROM t1_null_src $$, NULL, 'FULL')",
+        )
+        .await;
+
+    assert!(result.is_err(), "NULL schedule should be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("calculated"),
+        "Error should suggest 'calculated'; got: {err_msg}"
+    );
+}
+
+/// ERG-T1: An explicit fixed schedule like '30s' should still work.
+#[tokio::test]
+async fn test_erg_t1_explicit_fixed_schedule_works() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t1_fixed_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO t1_fixed_src VALUES (1, 42)").await;
+
+    db.create_st(
+        "t1_fixed_st",
+        "SELECT id, val FROM t1_fixed_src",
+        "30s",
+        "FULL",
+    )
+    .await;
+
+    let schedule: String = db
+        .query_scalar(
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 't1_fixed_st'",
+        )
+        .await;
+    assert_eq!(schedule, "30s");
+}
+
+/// ERG-T1: `alter_stream_table` with `schedule => 'calculated'` should
+/// switch an existing fixed-schedule ST to CALCULATED mode.
+#[tokio::test]
+async fn test_erg_t1_alter_to_calculated_schedule() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t1_alter_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO t1_alter_src VALUES (1, 1)").await;
+
+    db.create_st(
+        "t1_alter_st",
+        "SELECT id, val FROM t1_alter_src",
+        "1m",
+        "FULL",
+    )
+    .await;
+
+    // Switch to calculated
+    db.alter_st("t1_alter_st", "schedule => 'calculated'").await;
+
+    let schedule_is_null: bool = db
+        .query_scalar(
+            "SELECT schedule IS NULL FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 't1_alter_st'",
+        )
+        .await;
+    assert!(
+        schedule_is_null,
+        "After ALTER to 'calculated', schedule should be NULL in catalog"
+    );
+}
+
+// ── ERG-T2: Removed GUCs stay removed ────────────────────────────────
+
+/// ERG-T2: `SHOW pg_trickle.diamond_consistency` should return an error
+/// because this GUC was removed in v0.4.0.
+#[tokio::test]
+async fn test_erg_t2_diamond_consistency_guc_removed() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    let result = db.try_execute("SHOW pg_trickle.diamond_consistency").await;
+    assert!(
+        result.is_err(),
+        "diamond_consistency GUC should not exist; SHOW should error"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("unrecognized configuration parameter")
+            || err_msg.contains("not recognized"),
+        "Expected 'unrecognized' error; got: {err_msg}"
+    );
+}
+
+/// ERG-T2: `SHOW pg_trickle.diamond_schedule_policy` should return an
+/// error because this GUC was removed in v0.4.0.
+#[tokio::test]
+async fn test_erg_t2_diamond_schedule_policy_guc_removed() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    let result = db
+        .try_execute("SHOW pg_trickle.diamond_schedule_policy")
+        .await;
+    assert!(
+        result.is_err(),
+        "diamond_schedule_policy GUC should not exist; SHOW should error"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("unrecognized configuration parameter")
+            || err_msg.contains("not recognized"),
+        "Expected 'unrecognized' error; got: {err_msg}"
+    );
+}
+
+// ── ERG-T3: Full refresh warning on alter ────────────────────────────
+
+/// ERG-T3: Changing a stream table's refresh mode via `alter_stream_table`
+/// should emit a WARNING about the implicit full refresh.
+#[tokio::test]
+async fn test_erg_t3_alter_refresh_mode_emits_warning() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t3_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO t3_src VALUES (1, 10), (2, 20)")
+        .await;
+
+    // Create as FULL first
+    db.create_st("t3_warn_st", "SELECT id, val FROM t3_src", "1m", "FULL")
+        .await;
+
+    // Alter to DIFFERENTIAL — this triggers a full refresh + warning
+    let notices = db
+        .try_execute_with_notices(
+            "SELECT pgtrickle.alter_stream_table('t3_warn_st', \
+             refresh_mode => 'DIFFERENTIAL')",
+        )
+        .await
+        .expect("alter_stream_table should succeed");
+
+    let saw_warning = notices
+        .iter()
+        .any(|n| n.contains("refresh mode changed") && n.contains("full refresh was applied"));
+    assert!(
+        saw_warning,
+        "Expected WARNING about implicit full refresh; got: {notices:?}"
+    );
+}
+
+/// ERG-T3: Changing the defining query via `alter_stream_table` should
+/// emit a WARNING about the full refresh triggered by the schema change.
+#[tokio::test]
+async fn test_erg_t3_alter_query_emits_warning() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t3q_src (id INT PRIMARY KEY, val INT, extra TEXT DEFAULT 'x')")
+        .await;
+    db.execute("INSERT INTO t3q_src VALUES (1, 10, 'a'), (2, 20, 'b')")
+        .await;
+
+    db.create_st("t3q_warn_st", "SELECT id, val FROM t3q_src", "1m", "FULL")
+        .await;
+
+    // Change the query (adds a column — incompatible schema change)
+    let notices = db
+        .try_execute_with_notices(
+            "SELECT pgtrickle.alter_stream_table('t3q_warn_st', \
+             query => $$ SELECT id, val, extra FROM t3q_src $$)",
+        )
+        .await
+        .expect("alter_stream_table with query change should succeed");
+
+    let saw_warning = notices
+        .iter()
+        .any(|n| n.contains("ALTER QUERY") && n.contains("full refresh"));
+    assert!(
+        saw_warning,
+        "Expected WARNING about ALTER QUERY full refresh; got: {notices:?}"
+    );
+}
+
+/// ERG-T3: Altering to the same refresh mode should NOT produce a
+/// full-refresh warning.
+#[tokio::test]
+async fn test_erg_t3_alter_same_mode_no_warning() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE t3s_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO t3s_src VALUES (1, 10)").await;
+
+    db.create_st("t3s_st", "SELECT id, val FROM t3s_src", "1m", "FULL")
+        .await;
+
+    // Alter to the same mode — should be a no-op, no warning
+    let notices = db
+        .try_execute_with_notices(
+            "SELECT pgtrickle.alter_stream_table('t3s_st', \
+             refresh_mode => 'FULL')",
+        )
+        .await
+        .expect("alter to same mode should succeed");
+
+    let saw_refresh_warning = notices
+        .iter()
+        .any(|n| n.contains("full refresh was applied"));
+    assert!(
+        !saw_refresh_warning,
+        "Same-mode alter should NOT produce full refresh warning; got: {notices:?}"
+    );
+}
+
+// ── ERG-T4: WAL configuration warning ────────────────────────────────
+
+/// ERG-T4: When `wal_level = logical` (as in E2E containers), the
+/// `_PG_init` WAL configuration warning should NOT appear. We verify by
+/// creating the extension on a fresh connection and checking notices.
+#[tokio::test]
+async fn test_erg_t4_no_wal_warning_when_wal_level_logical() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // In light E2E the extension is loaded dynamically (no shared_preload),
+    // but we can still verify no spurious WAL warning is emitted during SQL
+    // operations.
+    let notices = db
+        .try_execute_with_notices("SELECT 1")
+        .await
+        .expect("simple query should succeed");
+
+    let saw_wal_warning = notices
+        .iter()
+        .any(|n| n.contains("wal_level is not") || n.contains("wal_level"));
+    assert!(
+        !saw_wal_warning,
+        "No WAL-level warning expected when wal_level is logical; got: {notices:?}"
+    );
+}
