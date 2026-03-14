@@ -33,6 +33,28 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   mode switches, IMMEDIATE mode, whitespace normalization, and
   `create_stream_table_if_not_exists` variants.
 - **Deployment docs** — FAQ section on idempotent deployment patterns;
+
+#### dbt Integration Enhancements (DBT-1 through DBT-3)
+
+- **`stream_table_status()` macro (DBT-1).** New
+  `pgtrickle_stream_table_status()` utility macro returns the health status of
+  a stream table as a dict (`status`, `staleness_seconds`,
+  `consecutive_errors`, `total_refreshes`, etc.). Status is one of `healthy`,
+  `stale`, `erroring`, `paused`, or `not_found`. Configurable `warn_seconds`
+  threshold (default 300s).
+- **`stream_table_healthy` generic test (DBT-1).** Built-in dbt test that
+  fails when a stream table is stale, erroring, or paused. Use in
+  `schema.yml`: `- dbt_pgtrickle.stream_table_healthy: {warn_seconds: 300}`.
+- **`refresh_all_stream_tables` operation (DBT-2).** New run-operation that
+  refreshes all dbt-managed stream tables in topological (dependency) order.
+  Queries the pg_trickle dependency catalog to compute depth, refreshing
+  upstream tables first. Designed for CI: run after `dbt run` and before
+  `dbt test`. Supports optional schema filter.
+- **Alter flow integration tests (DBT-3).** New `order_extremes` (FULL refresh
+  mode) and `customer_stats` models exercise create, idempotent no-op re-run,
+  config change, and full-refresh paths through the dbt materialization.
+  Integration test script updated to test `refresh_all_stream_tables` and
+  the `stream_table_healthy` generic test.
   Getting Started guide with SQL migration and dbt best practices.
 
 #### Partitioning Support (Source Tables)

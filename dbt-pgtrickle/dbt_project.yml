@@ -5,6 +5,7 @@ config-version: 2
 require-dbt-version: [">=1.9.0", "<2.0.0"]
 
 macro-paths: ["macros"]
+test-paths: ["tests"]
 clean-targets:
   - "target"
   - "dbt_packages"

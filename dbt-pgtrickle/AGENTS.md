@@ -22,17 +22,26 @@ macros/
 │   └── stream_table.sql           # Core custom materialization — entry point for dbt run
 ├── adapters/
 │   ├── create_stream_table.sql    # Wraps pgtrickle.create_stream_table()
+│   ├── create_or_replace_stream_table.sql  # Wraps pgtrickle.create_or_replace_stream_table() (≥ 0.6.0)
 │   ├── alter_stream_table.sql     # Wraps pgtrickle.alter_stream_table()
 │   ├── drop_stream_table.sql      # Wraps pgtrickle.drop_stream_table()
 │   └── refresh_stream_table.sql   # Wraps pgtrickle.refresh_stream_table()
 ├── hooks/
 │   └── source_freshness.sql       # Source freshness via pg_stat_stream_tables
 ├── operations/
-│   ├── refresh.sql                # Manual refresh run-operation
-│   └── drop_all.sql              # Drop all stream tables run-operation
+│   ├── refresh.sql                # Manual refresh run-operation (single table)
+│   ├── refresh_all.sql            # Refresh all stream tables in dependency order
+│   ├── drop_all.sql               # Drop all stream tables run-operation
+│   └── check_cdc_health.sql       # CDC health check run-operation
 └── utils/
     ├── stream_table_exists.sql    # Check catalog for stream table existence
-    └── get_stream_table_info.sql  # Read stream table metadata from catalog
+    ├── get_stream_table_info.sql  # Read stream table metadata from catalog
+    ├── stream_table_status.sql    # Health status (healthy/stale/erroring/paused)
+    └── has_create_or_replace.sql  # Detect pg_trickle ≥ 0.6.0
+
+tests/
+└── generic/
+    └── stream_table_healthy.sql   # Generic dbt test for stream table health
 
 integration_tests/                 # Standalone dbt project for testing
 ├── dbt_project.yml

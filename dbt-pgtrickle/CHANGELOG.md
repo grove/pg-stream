@@ -7,9 +7,14 @@ All notable changes to the dbt-pgtrickle package will be documented in this file
 ### Added
 - `pgtrickle_create_or_replace_stream_table()` adapter macro — wraps pg_trickle 0.6.0's idempotent DDL function
 - `pgtrickle_has_create_or_replace()` utility macro — detects pg_trickle ≥ 0.6.0
+- `pgtrickle_stream_table_status()` utility macro — returns health status (healthy/stale/erroring/paused/not_found) with staleness and error counts for a stream table (DBT-1)
+- `stream_table_healthy` generic dbt test — fails if a stream table is stale, erroring, or paused; configurable `warn_seconds` threshold (DBT-1)
+- `refresh_all_stream_tables` run-operation — refreshes all dbt-managed stream tables in dependency order using pg_trickle's catalog for topological ordering; designed for CI pipelines (DBT-2)
+- Integration tests for alter flow — `order_extremes` (FULL mode) and `customer_stats` (config change) models exercise create, no-op idempotent re-run, config-only alter, and full-refresh paths (DBT-3)
 
 ### Changed
 - `stream_table` materialization now uses `create_or_replace_stream_table()` when pg_trickle ≥ 0.6.0 is detected, with automatic fallback to the legacy check-then-decide pattern for older versions
+- Integration test suite expanded: tests `stream_table_healthy` generic test, `refresh_all_stream_tables` operation, idempotent no-op re-run, and multiple stream table models
 
 ## [0.1.0] - 2026-XX-XX
 

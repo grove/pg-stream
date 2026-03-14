@@ -92,6 +92,20 @@ models:
 dbt run-operation pgtrickle_refresh --args '{"model_name": "order_totals"}'
 ```
 
+### `refresh_all_stream_tables` — Refresh all in dependency order
+
+Refreshes all dbt-managed stream tables in topological (dependency) order.
+Upstream tables are refreshed before downstream ones. Designed for CI pipelines:
+run after `dbt run` and before `dbt test` to ensure all data is current.
+
+```bash
+# Refresh all dbt-managed stream tables
+dbt run-operation refresh_all_stream_tables
+
+# Refresh only stream tables in a specific schema
+dbt run-operation refresh_all_stream_tables --args '{"schema": "analytics"}'
+```
+
 ### `drop_all_stream_tables` — Drop dbt-managed stream tables
 
 Drops only stream tables defined as dbt models (safe in shared environments):
@@ -161,6 +175,33 @@ models:
         tests:
           - not_null
           - unique
+```
+
+### Stream Table Health Test
+
+Use the built-in `stream_table_healthy` generic test to fail your dbt test suite
+when a stream table is stale, erroring, or paused:
+
+```yaml
+models:
+  - name: order_totals
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 300  # fail if stale for more than 5 minutes
+```
+
+The test queries `pgtrickle.pg_stat_stream_tables` and returns rows for any
+unhealthy condition. An empty result set means the stream table is healthy.
+
+### Stream Table Status Macro
+
+For more programmatic control, use the `pgtrickle_stream_table_status()` macro
+directly in custom tests or run-operations:
+
+```sql
+{%- set st = dbt_pgtrickle.pgtrickle_stream_table_status('order_totals', warn_seconds=300) -%}
+{# st.status is one of: 'healthy', 'stale', 'erroring', 'paused', 'not_found' #}
+{# st.staleness_seconds, st.consecutive_errors, st.total_refreshes, etc. #}
 ```
 
 ## `__pgt_row_id` Column

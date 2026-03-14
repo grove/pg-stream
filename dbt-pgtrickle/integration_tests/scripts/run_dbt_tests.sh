@@ -173,27 +173,40 @@ echo "── dbt run (initial create) ──"
 dbt run
 
 echo ""
-echo "── Waiting for stream table to populate ──"
+echo "── Waiting for stream tables to populate ──"
 ./scripts/wait_for_populated.sh order_totals 30
+./scripts/wait_for_populated.sh order_extremes 30
+./scripts/wait_for_populated.sh customer_stats 30
 
 echo ""
-echo "── dbt test ──"
+echo "── dbt test (initial) ──"
 dbt test
+
+echo ""
+echo "── dbt run (idempotent no-op — same config, same query) ──"
+dbt run
+echo "  (no-op should succeed without errors)"
 
 echo ""
 echo "── dbt run --full-refresh (drop + recreate) ──"
 dbt run --full-refresh
 
 echo ""
-echo "── Waiting for stream table to populate (after recreate) ──"
+echo "── Waiting for stream tables to populate (after recreate) ──"
 ./scripts/wait_for_populated.sh order_totals 30
+./scripts/wait_for_populated.sh order_extremes 30
+./scripts/wait_for_populated.sh customer_stats 30
 
 echo ""
 echo "── dbt test (after full-refresh) ──"
 dbt test
 
 echo ""
-echo "── dbt run-operation pgtrickle_refresh ──"
+echo "── dbt run-operation refresh_all_stream_tables ──"
+dbt run-operation refresh_all_stream_tables
+
+echo ""
+echo "── dbt run-operation pgtrickle_refresh (single table) ──"
 dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
 
 echo ""
