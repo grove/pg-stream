@@ -505,6 +505,40 @@ SELECT pgtrickle.alter_stream_table('order_totals',
     refresh_mode => 'FULL');
 ```
 
+### How do I deploy stream tables idempotently?
+
+Use `create_or_replace_stream_table()` — one function call that does the right
+thing automatically:
+
+```sql
+-- Safe to run on every deploy — creates, updates, or no-ops as needed:
+SELECT pgtrickle.create_or_replace_stream_table(
+    name         => 'order_totals',
+    query        => 'SELECT region, SUM(amount) AS total FROM orders GROUP BY region',
+    schedule     => '2m',
+    refresh_mode => 'DIFFERENTIAL'
+);
+```
+
+**What happens on each deploy:**
+
+| Situation | Action |
+|---|---|
+| First deploy (stream table doesn't exist) | Creates it, populates data |
+| Nothing changed since last deploy | No-op — logs INFO, returns instantly |
+| You changed the schedule or mode | Updates config in place (no data loss) |
+| You changed the query | Migrates storage schema + runs a full refresh |
+
+This mirrors PostgreSQL's `CREATE OR REPLACE VIEW` / `CREATE OR REPLACE FUNCTION` pattern.
+
+**When to use which function:**
+
+| Function | Use case |
+|---|---|
+| `create_or_replace_stream_table()` | **Recommended for most deployments.** Declarative, idempotent — handles all cases automatically. |
+| `create_stream_table_if_not_exists()` | Safe re-run, but **never modifies** an existing definition. Good for one-time seed migrations. |
+| `create_stream_table()` | **Strict mode** — errors if the stream table already exists. Use when you want an explicit failure on duplicates. |
+
 ### How do I trigger a manual refresh?
 
 Call `refresh_stream_table()` to immediately refresh a stream table without waiting for the next scheduled cycle:

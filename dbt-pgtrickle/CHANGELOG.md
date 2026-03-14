@@ -4,6 +4,13 @@ All notable changes to the dbt-pgtrickle package will be documented in this file
 
 ## [Unreleased]
 
+### Added
+- `pgtrickle_create_or_replace_stream_table()` adapter macro — wraps pg_trickle 0.6.0's idempotent DDL function
+- `pgtrickle_has_create_or_replace()` utility macro — detects pg_trickle ≥ 0.6.0
+
+### Changed
+- `stream_table` materialization now uses `create_or_replace_stream_table()` when pg_trickle ≥ 0.6.0 is detected, with automatic fallback to the legacy check-then-decide pattern for older versions
+
 ## [0.1.0] - 2026-XX-XX
 
 ### Added

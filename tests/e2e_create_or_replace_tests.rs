@@ -363,3 +363,189 @@ async fn test_cor_mode_switch_differential_to_full() {
     let count = db.count("public.mode_snap").await;
     assert_eq!(count, 2);
 }
+
+// ── 10. Incompatible schema change → full rebuild ──────────────────────
+
+#[tokio::test]
+async fn test_cor_replaces_query_incompatible() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE incompat (id INT PRIMARY KEY, val TEXT, num NUMERIC)")
+        .await;
+    db.execute("INSERT INTO incompat VALUES (1, 'hello', 42), (2, 'world', 99)")
+        .await;
+
+    // Create with TEXT column
+    create_or_replace(
+        &db,
+        "incompat_snap",
+        "SELECT id, val FROM incompat",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count1 = db.count("public.incompat_snap").await;
+    assert_eq!(count1, 2);
+
+    // Capture OID before the replace
+    let oid_before: i64 = db
+        .query_scalar(
+            "SELECT pgt_relid::bigint FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'incompat_snap'",
+        )
+        .await;
+
+    // Replace with a NUMERIC column instead of TEXT — incompatible type change
+    // (text → numeric has no implicit cast)
+    create_or_replace(
+        &db,
+        "incompat_snap",
+        "SELECT id, num FROM incompat",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let count2 = db.count("public.incompat_snap").await;
+    assert_eq!(count2, 2);
+
+    // Verify the data is correct after rebuild
+    let val: i64 = db
+        .query_scalar("SELECT num::bigint FROM public.incompat_snap WHERE id = 1")
+        .await;
+    assert_eq!(val, 42);
+
+    // pgt_id should be preserved (catalog entry not dropped)
+    let pgt_id_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'incompat_snap'",
+        )
+        .await;
+    assert_eq!(pgt_id_count, 1, "Catalog entry should be preserved");
+
+    // OID may change for incompatible rebuilds
+    let oid_after: i64 = db
+        .query_scalar(
+            "SELECT pgt_relid::bigint FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'incompat_snap'",
+        )
+        .await;
+    assert_ne!(
+        oid_before, oid_after,
+        "Incompatible schema change should rebuild storage (new OID)"
+    );
+}
+
+// ── 11. IMMEDIATE mode ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_cor_immediate_mode() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE imm_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO imm_src VALUES (1, 10), (2, 20)")
+        .await;
+
+    // Create with IMMEDIATE mode (no schedule needed)
+    let sql = "SELECT pgtrickle.create_or_replace_stream_table(\
+               'imm_snap', $$SELECT id, val FROM imm_src$$, \
+               'calculated', 'IMMEDIATE')";
+    db.execute(sql).await;
+
+    let (status, mode, populated, _) = db.pgt_status("imm_snap").await;
+    assert_eq!(status, "ACTIVE");
+    assert_eq!(mode, "IMMEDIATE");
+    assert!(populated);
+
+    let count = db.count("public.imm_snap").await;
+    assert_eq!(count, 2);
+
+    // Verify IMMEDIATE semantics: INSERT into source is reflected immediately
+    db.execute("INSERT INTO imm_src VALUES (3, 30)").await;
+    let count_after = db.count("public.imm_snap").await;
+    assert_eq!(
+        count_after, 3,
+        "IMMEDIATE mode should reflect INSERTs immediately"
+    );
+}
+
+// ── 12. create_stream_table_if_not_exists — creates ────────────────────
+
+#[tokio::test]
+async fn test_if_not_exists_creates() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE ifne_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO ifne_src VALUES (1, 'a'), (2, 'b')")
+        .await;
+
+    // First call — should create
+    db.execute(
+        "SELECT pgtrickle.create_stream_table_if_not_exists(\
+         'ifne_snap', $$SELECT id, val FROM ifne_src$$, '1m', 'DIFFERENTIAL')",
+    )
+    .await;
+
+    let (status, mode, populated, _) = db.pgt_status("ifne_snap").await;
+    assert_eq!(status, "ACTIVE");
+    assert_eq!(mode, "DIFFERENTIAL");
+    assert!(populated);
+
+    let count = db.count("public.ifne_snap").await;
+    assert_eq!(count, 2);
+}
+
+// ── 13. create_stream_table_if_not_exists — noop ───────────────────────
+
+#[tokio::test]
+async fn test_if_not_exists_noop() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE ifne2_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO ifne2_src VALUES (1, 'x'), (2, 'y')")
+        .await;
+
+    // Create the stream table normally first
+    db.create_st(
+        "ifne2_snap",
+        "SELECT id, val FROM ifne2_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let sched_before: String = db
+        .query_scalar(
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'ifne2_snap'",
+        )
+        .await;
+    assert_eq!(sched_before, "1m");
+
+    // Call if_not_exists with DIFFERENT schedule — should be no-op
+    db.execute(
+        "SELECT pgtrickle.create_stream_table_if_not_exists(\
+         'ifne2_snap', $$SELECT id, val FROM ifne2_src$$, '99m', 'FULL')",
+    )
+    .await;
+
+    // Schedule and mode should NOT have changed
+    let (_, mode_after, _, _) = db.pgt_status("ifne2_snap").await;
+    assert_eq!(mode_after, "DIFFERENTIAL", "Mode should not change");
+
+    let sched_after: String = db
+        .query_scalar(
+            "SELECT schedule FROM pgtrickle.pgt_stream_tables \
+             WHERE pgt_name = 'ifne2_snap'",
+        )
+        .await;
+    assert_eq!(
+        sched_after, "1m",
+        "Schedule should not change on if_not_exists"
+    );
+}

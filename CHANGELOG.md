@@ -24,6 +24,16 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
     changed — includes in-place schema migration and full refresh.
   - Mirrors PostgreSQL's `CREATE OR REPLACE` convention.
   - Upgrade SQL migration: `sql/pg_trickle--0.5.0--0.6.0.sql`.
+- **dbt materialization uses `create_or_replace`** — the `stream_table`
+  materialization now calls `create_or_replace_stream_table()` when
+  pg_trickle ≥ 0.6.0 is detected, with automatic fallback to the legacy
+  check-then-decide pattern for older versions.
+- **13 E2E tests** covering create, no-op, config-only alter, query replace
+  (same schema, compatible schema, incompatible schema), combined changes,
+  mode switches, IMMEDIATE mode, whitespace normalization, and
+  `create_stream_table_if_not_exists` variants.
+- **Deployment docs** — FAQ section on idempotent deployment patterns;
+  Getting Started guide with SQL migration and dbt best practices.
 
 ---
 

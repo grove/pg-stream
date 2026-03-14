@@ -790,6 +790,64 @@ The key takeaway: you write to base tables — **pg_trickle does the rest**. Dat
 
 ---
 
+## Deployment Best Practices
+
+Once you've built your stream tables interactively, you'll want to deploy them
+reliably — via SQL migration scripts, dbt, or GitOps pipelines.
+
+### Idempotent SQL Migrations
+
+Use `create_or_replace_stream_table()` in your migration scripts. It's safe to
+run on every deploy:
+
+```sql
+-- migrations/V003__stream_tables.sql
+-- Creates if absent, updates if definition changed, no-op if identical.
+
+SELECT pgtrickle.create_or_replace_stream_table(
+    name         => 'employee_salaries',
+    query        => 'SELECT e.id, e.name, d.name AS department, e.salary
+                     FROM employees e JOIN departments d ON e.department_id = d.id',
+    schedule     => '2m',
+    refresh_mode => 'DIFFERENTIAL'
+);
+
+SELECT pgtrickle.create_or_replace_stream_table(
+    name         => 'department_stats',
+    query        => 'SELECT department, COUNT(*) AS headcount, AVG(salary) AS avg_salary
+                     FROM employee_salaries GROUP BY department',
+    schedule     => '2m',
+    refresh_mode => 'DIFFERENTIAL'
+);
+```
+
+If someone changes the query in a later migration, `create_or_replace` detects
+the difference and migrates the storage table in place — no need to drop and
+recreate.
+
+### dbt Integration
+
+With the [dbt-pgtrickle](https://github.com/grove/pg-trickle/tree/main/dbt-pgtrickle)
+package, stream tables are just dbt models with `materialized='stream_table'`:
+
+```sql
+-- models/department_stats.sql
+{{ config(
+    materialized='stream_table',
+    schedule='2m',
+    refresh_mode='DIFFERENTIAL'
+) }}
+
+SELECT department, COUNT(*) AS headcount, AVG(salary) AS avg_salary
+FROM {{ ref('employee_salaries') }}
+GROUP BY department
+```
+
+Every `dbt run` calls `create_or_replace_stream_table()` under the hood,
+so deployments are always idempotent.
+
+---
+
 ## What's Next?
 
 - **[SQL_REFERENCE.md](SQL_REFERENCE.md)** — Full API reference for all functions, views, and configuration

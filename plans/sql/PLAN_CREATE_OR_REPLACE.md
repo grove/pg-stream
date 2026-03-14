@@ -1,6 +1,6 @@
 # Plan: `create_or_replace_stream_table`
 
-**Status:** In Progress (Step 1 complete)  
+**Status:** Complete (Steps 1–7 done)  
 **Author:** Copilot  
 **Date:** 2026-03-05  
 **Depends on:** [PLAN_ALTER_QUERY.md](PLAN_ALTER_QUERY.md)

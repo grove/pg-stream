@@ -1,10 +1,13 @@
 {#
   stream_table materialization
 
-  Custom dbt materialization that maps dbt's lifecycle onto pg_trickle's SQL API:
-    - First run:      create_stream_table()
-    - Subsequent run: alter_stream_table() if config changed; drop/recreate if query changed
-    - Full refresh:   drop_stream_table() + create_stream_table()
+  Custom dbt materialization that maps dbt's lifecycle onto pg_trickle's SQL API.
+
+  When pg_trickle ≥ 0.6.0 is available, uses the idempotent
+  create_or_replace_stream_table() — one function call handles create, no-op,
+  config-only alter, and full query replacement automatically.
+
+  Falls back to the legacy check-then-decide pattern for pg_trickle < 0.6.0.
 
   Config keys:
     materialized: 'stream_table'
@@ -14,6 +17,7 @@
     status: 'ACTIVE' or 'PAUSED' or null (default null — no change)
     stream_table_name: str (default model name)
     stream_table_schema: str (default target schema)
+    cdc_mode: 'auto', 'trigger', 'wal', or null (default null — use GUC)
 #}
 {% materialization stream_table, adapter='postgres' %}
 
@@ -52,32 +56,56 @@
   {# -- Get the compiled SQL (the defining query) -- #}
   {%- set defining_query = sql -%}
 
-  {% if not st_exists %}
-    {# -- CREATE: stream table does not exist yet -- #}
-    {{ dbt_pgtrickle.pgtrickle_create_stream_table(
-          qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode
-       ) }}
-  {% else %}
-    {# -- UPDATE: stream table exists — check if query changed -- #}
-    {%- set current_info = dbt_pgtrickle.pgtrickle_get_stream_table_info(qualified_name) -%}
+  {# -- Detect whether create_or_replace_stream_table() is available (≥ 0.6.0).
+       Cache the result per invocation so we only probe once. -- #}
+  {%- set has_cor = dbt_pgtrickle.pgtrickle_has_create_or_replace() -%}
 
-    {% if current_info and current_info.defining_query != defining_query %}
-      {# Query changed: use ALTER ... query => to migrate in place #}
-      {{ log("pg_trickle: query changed — altering '" ~ qualified_name ~ "' in place", info=true) }}
-      {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
-           qualified_name, schedule, refresh_mode,
-         status=status, current_info=current_info,
-         cdc_mode=cdc_mode,
-           query=defining_query
+  {% if has_cor and not full_refresh_mode %}
+    {# ── Fast path: idempotent create_or_replace (pg_trickle ≥ 0.6.0) ── #}
+    {{ dbt_pgtrickle.pgtrickle_create_or_replace_stream_table(
+         qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode
+       ) }}
+
+    {# Handle status changes separately — create_or_replace doesn't accept status #}
+    {% if status is not none and st_exists %}
+      {%- set current_info = dbt_pgtrickle.pgtrickle_get_stream_table_info(qualified_name) -%}
+      {% if current_info and current_info.status != status %}
+        {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
+             qualified_name, schedule, refresh_mode,
+             status=status, current_info=current_info,
+             cdc_mode=cdc_mode
+           ) }}
+      {% endif %}
+    {% endif %}
+  {% else %}
+    {# ── Legacy path: check-then-decide (pg_trickle < 0.6.0 or --full-refresh) ── #}
+    {% if not st_exists %}
+      {# -- CREATE: stream table does not exist yet -- #}
+      {{ dbt_pgtrickle.pgtrickle_create_stream_table(
+            qualified_name, defining_query, schedule, refresh_mode, initialize, cdc_mode
          ) }}
     {% else %}
-      {# Query unchanged: update schedule/mode/status if they differ.
-         Pass current_info to avoid redundant catalog lookup. #}
-      {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
-           qualified_name, schedule, refresh_mode,
-         status=status, current_info=current_info,
-         cdc_mode=cdc_mode
-         ) }}
+      {# -- UPDATE: stream table exists — check if query changed -- #}
+      {%- set current_info = dbt_pgtrickle.pgtrickle_get_stream_table_info(qualified_name) -%}
+
+      {% if current_info and current_info.defining_query != defining_query %}
+        {# Query changed: use ALTER ... query => to migrate in place #}
+        {{ log("pg_trickle: query changed — altering '" ~ qualified_name ~ "' in place", info=true) }}
+        {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
+             qualified_name, schedule, refresh_mode,
+           status=status, current_info=current_info,
+           cdc_mode=cdc_mode,
+             query=defining_query
+           ) }}
+      {% else %}
+        {# Query unchanged: update schedule/mode/status if they differ.
+           Pass current_info to avoid redundant catalog lookup. #}
+        {{ dbt_pgtrickle.pgtrickle_alter_stream_table(
+             qualified_name, schedule, refresh_mode,
+           status=status, current_info=current_info,
+           cdc_mode=cdc_mode
+           ) }}
+      {% endif %}
     {% endif %}
   {% endif %}
 
