@@ -205,8 +205,10 @@ v0.4.0 and v0.5.0.
   `create_stream_table()` now rejects with a clear error explaining the fix
   (`ALTER TABLE ... REPLICA IDENTITY FULL`). Without this guard, WAL-based
   CDC silently produces incomplete deltas for UPDATE/DELETE operations on
-  keyless tables, leading to data corruption. Two new E2E tests verify both
-  the rejection path and the acceptance path with REPLICA IDENTITY FULL set.
+  keyless tables, leading to data corruption. Two new E2E tests in
+  `e2e_wal_cdc_tests.rs` verify both the rejection path and the acceptance
+  path with REPLICA IDENTITY FULL set (these tests require the full E2E
+  harness with `wal_level = logical`).
 
 #### Edge Case Hardening — P1 Operational Safety
 

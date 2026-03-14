@@ -657,3 +657,73 @@ async fn test_ec34_check_cdc_health_detects_missing_slot() {
     assert!(refreshed, "Trigger CDC should resume after fallback");
     assert_eq!(db.count("public.ec34_st").await, 2);
 }
+
+// ── EC-19: WAL + keyless without REPLICA IDENTITY FULL ─────────────────
+
+/// EC-19: Creating a stream table with cdc_mode='wal' on a keyless table
+/// without REPLICA IDENTITY FULL must be rejected at creation time to
+/// prevent silent data corruption (WAL cannot send old-row values).
+/// Requires wal_level=logical (full E2E harness).
+#[tokio::test]
+async fn test_ec19_wal_keyless_without_replica_identity_full_rejected() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    // Keyless table with default REPLICA IDENTITY (not FULL)
+    db.execute("CREATE TABLE ec19_keyless (val TEXT)").await;
+    db.execute("INSERT INTO ec19_keyless VALUES ('a')").await;
+
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table(\
+                name => 'ec19_keyless_st',\
+                query => $$SELECT val FROM ec19_keyless$$,\
+                schedule => '1m',\
+                refresh_mode => 'DIFFERENTIAL',\
+                cdc_mode => 'wal'\
+            )",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "WAL CDC on keyless table without REPLICA IDENTITY FULL must be rejected"
+    );
+
+    let error = format!("{}", result.unwrap_err());
+    assert!(
+        error.contains("REPLICA IDENTITY FULL"),
+        "Error should mention REPLICA IDENTITY FULL, got: {error}"
+    );
+}
+
+/// EC-19: After setting REPLICA IDENTITY FULL, the same keyless table
+/// should be accepted with cdc_mode='wal'.
+/// Requires wal_level=logical (full E2E harness).
+#[tokio::test]
+async fn test_ec19_wal_keyless_with_replica_identity_full_accepted() {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+
+    db.execute("CREATE TABLE ec19_ri_full (val TEXT)").await;
+    db.execute("ALTER TABLE ec19_ri_full REPLICA IDENTITY FULL")
+        .await;
+    db.execute("INSERT INTO ec19_ri_full VALUES ('a')").await;
+
+    // Should succeed — REPLICA IDENTITY FULL is set, explicit WAL mode
+    let result = db
+        .try_execute(
+            "SELECT pgtrickle.create_stream_table(\
+                name => 'ec19_ri_full_st',\
+                query => $$SELECT val FROM ec19_ri_full$$,\
+                schedule => '1m',\
+                refresh_mode => 'DIFFERENTIAL',\
+                cdc_mode => 'wal'\
+            )",
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "WAL CDC on keyless table WITH REPLICA IDENTITY FULL should succeed: {:?}",
+        result.unwrap_err()
+    );
+}
