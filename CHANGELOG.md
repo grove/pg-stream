@@ -97,8 +97,10 @@ Two query patterns that previously required workarounds now just work:
 
 - **Window functions inside expressions.** Queries like
   `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN 'top' ELSE 'other' END` or
-  `COALESCE(SUM() OVER (...), 0)` are now accepted in DIFFERENTIAL mode.
-  Previously you had to keep window functions as top-level columns.
+  `COALESCE(SUM() OVER (...), 0)` are now accepted and produce correct
+  results. Use **FULL** refresh mode for these queries — incremental
+  (DIFFERENTIAL) refresh of window-in-expression patterns is not yet
+  supported. Previously, the query was rejected entirely at creation time.
 
 - **`ALL (subquery)` comparisons.** Queries like
   `WHERE price < ALL (SELECT price FROM competitors)` are now accepted in
