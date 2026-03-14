@@ -39,6 +39,9 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [Advanced / Internal](#advanced--internal)
     - [pg\_trickle.change\_buffer\_schema](#pg_tricklechange_buffer_schema)
     - [pg\_trickle.foreign\_table\_polling](#pg_trickleforeign_table_polling)
+  - [Circular Dependencies](#circular-dependencies)
+    - [pg\_trickle.allow\_circular](#pg_trickleallow_circular)
+    - [pg\_trickle.max\_fixpoint\_iterations](#pg_tricklemax_fixpoint_iterations)
 - [Complete postgresql.conf Example](#complete-postgresqlconf-example)
 - [Runtime Configuration](#runtime-configuration)
 - [Further Reading](#further-reading)
@@ -734,6 +737,50 @@ SET pg_trickle.foreign_table_polling = true;
 
 ---
 
+### Circular Dependencies
+
+> **v0.6.0+** — Foundation settings for circular stream table dependencies.
+> The actual fixed-point refresh execution is planned for v0.7.0. These
+> settings control whether cycle creation is allowed and set iteration
+> safety limits.
+
+### pg_trickle.allow_circular
+
+Master switch for circular (cyclic) stream table dependencies. When `false`
+(default), creating a stream table that would introduce a cycle in the
+dependency graph is rejected with a `CycleDetected` error. When `true`,
+monotone cycles — those containing only safe operators (joins, filters,
+projections, UNION ALL, INTERSECT, EXISTS) — are allowed.
+
+Non-monotone operators (Aggregate, EXCEPT, Window functions, NOT EXISTS)
+always block cycle creation regardless of this setting, because they cannot
+guarantee convergence to a fixed point.
+
+**Default:** `false`
+
+```sql
+SET pg_trickle.allow_circular = true;
+```
+
+### pg_trickle.max_fixpoint_iterations
+
+Maximum number of iterations per strongly connected component (SCC) before
+the scheduler declares non-convergence and marks all SCC members as ERROR.
+Prevents runaway loops in circular dependency chains.
+
+For most practical use cases (transitive closure, graph reachability),
+convergence happens in 2–5 iterations. The default of 100 provides ample
+headroom.
+
+**Default:** `100`  
+**Range:** `1` – `10000`
+
+```sql
+SET pg_trickle.max_fixpoint_iterations = 50;
+```
+
+---
+
 ## Complete postgresql.conf Example
 
 ```ini
@@ -767,6 +814,10 @@ pg_trickle.buffer_alert_threshold = 1000000
 pg_trickle.max_grouping_set_branches = 64
 pg_trickle.ivm_topk_max_limit = 1000
 pg_trickle.ivm_recursive_max_depth = 100
+
+# Circular dependencies (v0.6.0+, foundation only)
+pg_trickle.allow_circular = false                # master switch
+pg_trickle.max_fixpoint_iterations = 100         # convergence limit
 
 # Parallel refresh (v0.4.0+, default off)
 pg_trickle.parallel_refresh_mode = 'off'        # 'off' | 'dry_run' | 'on'

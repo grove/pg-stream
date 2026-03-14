@@ -2093,6 +2093,7 @@ Core metadata for each stream table.
 | `diamond_schedule_policy` | `text` | Diamond schedule policy: `fastest` or `slowest` |
 | `has_keyless_source` | `bool` | Whether any source table lacks a PRIMARY KEY (EC-06) |
 | `function_hashes` | `text` | MD5 hashes of referenced function bodies for change detection (EC-16) |
+| `scc_id` | `int` | SCC group identifier for circular dependencies (`NULL` if not in a cycle) |
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last modification timestamp |
 
@@ -2134,6 +2135,7 @@ Audit log of all refresh operations.
 | `status` | `text` | RUNNING, COMPLETED, FAILED, SKIPPED |
 | `initiated_by` | `text` | What triggered: SCHEDULER, MANUAL, or INITIAL |
 | `freshness_deadline` | `timestamptz` | SLA deadline (duration schedules only; NULL for cron) |
+| `fixpoint_iteration` | `int` | Iteration of the fixed-point loop (`NULL` for non-cyclic refreshes) |
 
 ### pgtrickle.pgt_change_tracking
 

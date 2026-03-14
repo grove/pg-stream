@@ -2564,6 +2564,7 @@ mod tests {
             function_hashes: None,
             requested_cdc_mode: None,
             is_append_only: false,
+            scc_id: None,
         }
     }
 

@@ -41,6 +41,40 @@ Stream tables now work with PostgreSQL's declarative table partitioning.
   partitioned source tables, ATTACH/DETACH PARTITION behavior, foreign
   tables, and known caveats.
 
+#### Circular Dependency Foundation (CYC-1 through CYC-4)
+
+Lays the groundwork for allowing controlled circular stream table
+dependencies. The actual fixed-point refresh execution is planned for v0.7.0;
+this release delivers the detection, validation, catalog, and configuration
+infrastructure.
+
+- **Tarjan's SCC algorithm (CYC-1).** `StDag::compute_sccs()` decomposes
+  the dependency graph into strongly connected components in O(V+E) time.
+  `condensation_order()` returns SCCs in topological order — the future
+  replacement for `topological_order()` when circular dependencies are
+  allowed. Includes self-loop detection.
+
+- **Monotonicity checker (CYC-2).** `check_monotonicity()` performs static
+  analysis on an `OpTree` to determine whether a query is safe for cyclic
+  fixed-point iteration. Monotone operators (Scan, Filter, Project, Join,
+  UNION ALL, INTERSECT, EXISTS) are allowed; non-monotone operators
+  (Aggregate, EXCEPT, Window functions, NOT EXISTS) are rejected with
+  descriptive error messages explaining why convergence cannot be guaranteed.
+
+- **Catalog tracking columns (CYC-3).** Two new columns:
+  - `pgtrickle.pgt_stream_tables.scc_id INT` — identifies which cycle group
+    a stream table belongs to (NULL for non-cyclic STs).
+  - `pgtrickle.pgt_refresh_history.fixpoint_iteration INT` — records which
+    iteration of the fixed-point loop produced a given refresh (NULL for
+    non-cyclic refreshes).
+  - Upgrade SQL script (`pg_trickle--0.5.0--0.6.0.sql`) adds both columns.
+
+- **Safety GUCs (CYC-4).** Two new configuration variables:
+  - `pg_trickle.max_fixpoint_iterations` (default 100) — maximum iterations
+    per SCC before declaring non-convergence and marking members as ERROR.
+  - `pg_trickle.allow_circular` (default false) — master switch; circular
+    dependencies are rejected unless explicitly enabled.
+
 ---
 
 ## [0.5.0] — 2026-03-13
