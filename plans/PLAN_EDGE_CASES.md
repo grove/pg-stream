@@ -162,10 +162,17 @@ DVM path already handles correctly.
   `test_top_level_window_still_works` (regression).
 - 3 data-correctness tests: `test_ec03_case_window_data_correctness` —
   CASE + ROW_NUMBER() produces correct tier labels;
-  `test_ec03_arithmetic_window_differential_refresh` — ROW_NUMBER() * 10
-  verified with differential refresh after INSERT;
+  `test_ec03_arithmetic_window_data_correctness` — ROW_NUMBER() * 10
+  verified with a FULL refresh after INSERT;
   `test_ec03_coalesce_window_data_correctness` — COALESCE(SUM() OVER, 0)
   produces correct partition sums.
+
+**Known limitation:** Window-in-expression queries are accepted in
+DIFFERENTIAL mode (creation succeeds), but differential *refresh* fails with
+a `column st.* does not exist` error. The DVM delta engine cannot currently
+resolve the `st.*` alias inside the inner subquery introduced by the rewrite.
+FULL refresh works correctly. Differential support for the rewritten form is
+deferred.
 
 ---
 
