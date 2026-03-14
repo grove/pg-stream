@@ -880,9 +880,9 @@ intersects the current gated set.
 
 **Goal:** Validate partitioned source tables, add `create_or_replace_stream_table`
 for idempotent deployments (critical for dbt and migration workflows), close all
-remaining P0/P1 edge cases and two usability-tier gaps, ship ready-made
-Prometheus/Grafana monitoring, harden ergonomics and source gating, expand the
-dbt integration, and lay the foundation for circular stream table DAGs.
+remaining P0/P1 edge cases and two usability-tier gaps, harden ergonomics and
+source gating, expand the dbt integration, fill SQL documentation gaps, and lay
+the foundation for circular stream table DAGs.
 
 ### Partitioning Support (Source Tables)
 
@@ -983,31 +983,6 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 > **Edge case hardening subtotal: ~9.5–13.5 days**
 
-### Prometheus & Grafana Observability
-
-> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
-> their databases. This ships ready-to-use configuration files — no custom
-> code, no extension changes — that plug into the standard `postgres_exporter`
-> and light up a Grafana dashboard showing refresh latency, staleness, error
-> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
-> alerting rules so you get paged when a stream table goes stale or starts
-> error-looping. A Docker Compose file lets you try the full observability
-> stack with a single `docker compose up`.
-
-Zero-code monitoring integration. All config files live in a new
-`monitoring/` directory in the main repo (or a separate
-`pgtrickle-monitoring` repo). Queries use existing views
-(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
-| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
-
-> **Observability subtotal: ~12 hours**
-
 ### Ergonomics Follow-Up
 
 > **In plain terms:** Several test gaps and a documentation item were left
@@ -1084,25 +1059,7 @@ Zero-code monitoring integration. All config files live in a new
 
 > **SQL documentation subtotal: ~5 hours**
 
-### Pre-1.0 Infrastructure Prep
-
-> **In plain terms:** Three preparatory tasks that make the eventual 1.0
-> release smoother. A draft Docker Hub image workflow (tests the build but
-> doesn't publish yet); a PGXN metadata file so the extension can eventually
-> be installed with `pgxn install pg_trickle`; and a basic CNPG integration
-> test that verifies the extension image loads correctly in a CloudNativePG
-> cluster. None of these ship user-facing features — they're CI and
-> packaging scaffolding.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| INFRA-1 | **Prove the Docker image builds.** Set up a CI workflow that builds the official Docker Hub image (PostgreSQL 18 + pg_trickle pre-installed), runs a smoke test (create extension, create a stream table, refresh it), but doesn't publish anywhere yet. When 1.0 arrives, publishing is just flipping a switch. | 5h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
-| INFRA-2 | **Prepare for `pgxn install pg_trickle`.** PGXN is PostgreSQL's official extension registry. Drafting the `META.json` metadata file now means publishing to PGXN at 1.0 is a single command — no scrambling to figure out the required fields and version constraints at release time. | 2h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
-| INFRA-3 | **Verify Kubernetes deployment works.** A CI smoke test that deploys the pg_trickle extension image into a CloudNativePG (CNPG) Kubernetes cluster, creates a stream table, and confirms a refresh cycle completes. Catches packaging and compatibility issues before they reach Kubernetes users. | 4h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
-
-> **Infrastructure prep subtotal: ~11 hours**
-
-> **v0.6.0 total: ~100–115h**
+> **v0.6.0 total: ~77–92h**
 
 **Exit criteria:**
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
@@ -1115,21 +1072,20 @@ Zero-code monitoring integration. All config files live in a new
 - [ ] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)
 - [ ] Window functions in expressions supported via CTE extraction (EC-03)
 - [ ] `ALL (subquery)` rewritten to `NOT EXISTS (... EXCEPT ...)` (EC-32)
-- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
 - [ ] Ergonomics E2E tests for calculated schedule, warnings, and removed GUCs pass
 - [ ] `gate_source()` idempotency and re-gating tested; `bootstrap_gate_status()` available
 - [ ] dbt `stream_table_status()` and `refresh_all_stream_tables` macros shipped
 - [ ] SQL Reference updated for EC-03, EC-32, and foreign table polling patterns
-- [ ] Docker Hub image draft workflow passes; PGXN `META.json` drafted
 - [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
 ---
 
-## v0.7.0 — Watermarks & Circular DAG Execution
+## v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure
 
 **Goal:** Add user-injected temporal watermark gating for batch-ETL
-coordination and complete the fixpoint scheduler for circular stream table
-DAGs.
+coordination, complete the fixpoint scheduler for circular stream table
+DAGs, ship ready-made Prometheus/Grafana monitoring, and prepare the
+1.0 packaging and deployment infrastructure.
 
 ### Watermark Gating
 
@@ -1181,11 +1137,57 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 
 > **Circular dependencies subtotal: ~19 hours**
 
-> **v0.7.0 total: ~36–39h**
+### Prometheus & Grafana Observability
+
+> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
+> their databases. This ships ready-to-use configuration files — no custom
+> code, no extension changes — that plug into the standard `postgres_exporter`
+> and light up a Grafana dashboard showing refresh latency, staleness, error
+> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
+> alerting rules so you get paged when a stream table goes stale or starts
+> error-looping. A Docker Compose file lets you try the full observability
+> stack with a single `docker compose up`.
+
+Zero-code monitoring integration. All config files live in a new
+`monitoring/` directory in the main repo (or a separate
+`pgtrickle-monitoring` repo). Queries use existing views
+(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+
+> **Observability subtotal: ~12 hours**
+
+### Pre-1.0 Infrastructure Prep
+
+> **In plain terms:** Three preparatory tasks that make the eventual 1.0
+> release smoother. A draft Docker Hub image workflow (tests the build but
+> doesn't publish yet); a PGXN metadata file so the extension can eventually
+> be installed with `pgxn install pg_trickle`; and a basic CNPG integration
+> test that verifies the extension image loads correctly in a CloudNativePG
+> cluster. None of these ship user-facing features — they're CI and
+> packaging scaffolding.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| INFRA-1 | **Prove the Docker image builds.** Set up a CI workflow that builds the official Docker Hub image (PostgreSQL 18 + pg_trickle pre-installed), runs a smoke test (create extension, create a stream table, refresh it), but doesn't publish anywhere yet. When 1.0 arrives, publishing is just flipping a switch. | 5h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
+| INFRA-2 | **Prepare for `pgxn install pg_trickle`.** PGXN is PostgreSQL's official extension registry. Drafting the `META.json` metadata file now means publishing to PGXN at 1.0 is a single command — no scrambling to figure out the required fields and version constraints at release time. | 2h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| INFRA-3 | **Verify Kubernetes deployment works.** A CI smoke test that deploys the pg_trickle extension image into a CloudNativePG (CNPG) Kubernetes cluster, creates a stream table, and confirms a refresh cycle completes. Catches packaging and compatibility issues before they reach Kubernetes users. | 4h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+
+> **Infrastructure prep subtotal: ~11 hours**
+
+> **v0.7.0 total: ~59–62h**
 
 **Exit criteria:**
 - [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
 - [ ] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
+- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
+- [ ] Docker Hub image draft workflow passes; PGXN `META.json` drafted
+- [ ] CNPG integration smoke test passes in CI
 - [ ] Extension upgrade path tested (`0.6.0 → 0.7.0`)
 
 ---
