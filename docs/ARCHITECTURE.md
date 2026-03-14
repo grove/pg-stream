@@ -255,8 +255,11 @@ Generates the final diff SQL that:
 
 Stream tables can depend on other stream tables (cascading), forming a Directed Acyclic Graph:
 
-- **Cycle detection** — Prevents circular dependencies at creation time using DFS.
+- **Cycle detection** — Prevents circular dependencies at creation time using Kahn's algorithm (BFS topological sort).
+- **SCC decomposition** — Tarjan's algorithm decomposes the graph into strongly connected components. Singleton SCCs are acyclic; multi-node SCCs contain cycles. This is the foundation for fixed-point iteration (v0.7.0).
+- **Monotonicity analysis** — Static check (`check_monotonicity()` in `src/dvm/parser.rs`) determines whether a query's operators are safe for cyclic fixed-point iteration. Non-monotone operators (Aggregate, EXCEPT, Window, NOT EXISTS) block cycle creation.
 - **Topological ordering** — Determines refresh order: upstream STs must be refreshed before downstream STs.
+- **Condensation order** — `condensation_order()` returns SCCs in topological order, grouping cyclic STs for future fixed-point iteration.
 - **Cascade operations** — When a source table changes, all transitive dependents are identified for refresh.
 
 ### 6. Version / Frontier Tracking (`src/version.rs`)
@@ -646,7 +649,7 @@ src/
 ├── catalog.rs       # Catalog CRUD operations
 ├── cdc.rs           # Change data capture (triggers + WAL transition)
 ├── config.rs        # GUC variable registration
-├── dag.rs           # Dependency graph (cycle detection, topo sort)
+├── dag.rs           # Dependency graph (cycle detection, SCC decomposition, topo sort)
 ├── error.rs         # Centralized error types
 ├── hash.rs          # xxHash row ID generation (pg_trickle_hash / pg_trickle_hash_multi)
 ├── hooks.rs         # DDL event trigger handlers (_on_ddl_end, _on_sql_drop)

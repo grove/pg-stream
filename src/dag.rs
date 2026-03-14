@@ -171,6 +171,22 @@ impl ConsistencyGroup {
 #[cfg(feature = "pg18")]
 use pgrx::prelude::*;
 
+// ── Strongly Connected Components ──────────────────────────────────────────
+
+/// A strongly connected component of the dependency graph.
+///
+/// Used by the circular dependency foundation (CYC-1) to group nodes that
+/// form mutual dependencies (cycles). Singleton SCCs represent acyclic
+/// nodes; multi-node SCCs contain cycles that require fixed-point iteration.
+#[derive(Debug, Clone)]
+pub struct Scc {
+    /// Node IDs in this SCC.
+    pub nodes: Vec<NodeId>,
+    /// True if this SCC contains a cycle (either a multi-node SCC or a
+    /// self-loop).
+    pub is_cyclic: bool,
+}
+
 /// Identifies a node in the dependency graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NodeId {
@@ -863,6 +879,141 @@ impl StDag {
         }
 
         merged
+    }
+
+    // ── Strongly Connected Components (CYC-1) ──────────────────────────
+
+    /// Compute SCCs using Tarjan's algorithm (1972).
+    ///
+    /// Returns SCCs in **reverse topological order** of the condensation
+    /// graph (i.e., upstream SCCs appear first). This is the natural output
+    /// order of Tarjan's algorithm — SCCs are emitted in the order they are
+    /// completed, which is reverse topological.
+    ///
+    /// Runs in O(V + E) time, same as Kahn's algorithm.
+    ///
+    /// # References
+    ///
+    /// - Tarjan, R.E. (1972). "Depth-first search and linear graph
+    ///   algorithms." SIAM Journal on Computing, 1(2), 146–160.
+    pub fn compute_sccs(&self) -> Vec<Scc> {
+        let mut index_counter: u32 = 0;
+        let mut stack: Vec<NodeId> = Vec::new();
+        let mut on_stack: HashSet<NodeId> = HashSet::new();
+        let mut indices: HashMap<NodeId, u32> = HashMap::new();
+        let mut lowlinks: HashMap<NodeId, u32> = HashMap::new();
+        let mut result: Vec<Scc> = Vec::new();
+
+        for &node in &self.all_nodes {
+            if !indices.contains_key(&node) {
+                self.tarjan_strongconnect(
+                    node,
+                    &mut index_counter,
+                    &mut stack,
+                    &mut on_stack,
+                    &mut indices,
+                    &mut lowlinks,
+                    &mut result,
+                );
+            }
+        }
+
+        // Tarjan's emits SCCs in reverse topological order of the condensation
+        // graph. Reverse so upstream SCCs come first.
+        result.reverse();
+        result
+    }
+
+    /// Recursive DFS helper for Tarjan's algorithm.
+    #[allow(clippy::too_many_arguments)]
+    fn tarjan_strongconnect(
+        &self,
+        v: NodeId,
+        index_counter: &mut u32,
+        stack: &mut Vec<NodeId>,
+        on_stack: &mut HashSet<NodeId>,
+        indices: &mut HashMap<NodeId, u32>,
+        lowlinks: &mut HashMap<NodeId, u32>,
+        result: &mut Vec<Scc>,
+    ) {
+        // Set the depth index and lowlink for v.
+        indices.insert(v, *index_counter);
+        lowlinks.insert(v, *index_counter);
+        *index_counter += 1;
+        stack.push(v);
+        on_stack.insert(v);
+
+        // Consider successors of v.
+        if let Some(successors) = self.edges.get(&v) {
+            for &w in successors {
+                if !indices.contains_key(&w) {
+                    // Successor w has not yet been visited; recurse.
+                    self.tarjan_strongconnect(
+                        w,
+                        index_counter,
+                        stack,
+                        on_stack,
+                        indices,
+                        lowlinks,
+                        result,
+                    );
+                    let w_lowlink = lowlinks[&w];
+                    let v_lowlink = lowlinks.get_mut(&v).unwrap();
+                    if w_lowlink < *v_lowlink {
+                        *v_lowlink = w_lowlink;
+                    }
+                } else if on_stack.contains(&w) {
+                    // Successor w is on the stack → it's in the current SCC.
+                    let w_index = indices[&w];
+                    let v_lowlink = lowlinks.get_mut(&v).unwrap();
+                    if w_index < *v_lowlink {
+                        *v_lowlink = w_index;
+                    }
+                }
+            }
+        }
+
+        // If v is a root node, pop the stack and generate an SCC.
+        if lowlinks[&v] == indices[&v] {
+            let mut scc_nodes = Vec::new();
+            loop {
+                let w = stack.pop().unwrap();
+                on_stack.remove(&w);
+                scc_nodes.push(w);
+                if w == v {
+                    break;
+                }
+            }
+
+            // An SCC is cyclic if it has more than one node, or if the
+            // single node has a self-loop.
+            let is_cyclic = if scc_nodes.len() > 1 {
+                true
+            } else {
+                // Check for self-loop.
+                let node = scc_nodes[0];
+                self.edges
+                    .get(&node)
+                    .is_some_and(|succs| succs.contains(&node))
+            };
+
+            result.push(Scc {
+                nodes: scc_nodes,
+                is_cyclic,
+            });
+        }
+    }
+
+    /// Return SCCs in refresh order (upstream first), with cyclic SCCs
+    /// grouped for fixed-point iteration.
+    ///
+    /// Singleton SCCs (no cycle) are returned as single-node groups.
+    /// Multi-node SCCs contain all members that must be iterated together.
+    ///
+    /// This is the condensation DAG in topological order — the replacement
+    /// for `topological_order()` when circular dependencies are allowed.
+    pub fn condensation_order(&self) -> Vec<Scc> {
+        self.compute_sccs()
     }
 }
 
@@ -2831,5 +2982,203 @@ mod tests {
         };
         // Same kind + same members → same stable key, regardless of ID/label.
         assert_eq!(unit1.stable_key(), unit2.stable_key());
+    }
+
+    // ── SCC (Tarjan's algorithm) tests (CYC-1) ─────────────────────────
+
+    #[test]
+    fn test_scc_no_cycles() {
+        // A → B → C: three singleton SCCs.
+        let mut dag = StDag::new();
+        let a = NodeId::BaseTable(1);
+        let b = NodeId::StreamTable(1);
+        let c = NodeId::StreamTable(2);
+
+        dag.add_st_node(make_st(1, "B"));
+        dag.add_st_node(make_st(2, "C"));
+
+        dag.add_edge(a, b);
+        dag.add_edge(b, c);
+
+        let sccs = dag.compute_sccs();
+        // All SCCs should be singletons (no cycle).
+        assert!(
+            sccs.iter().all(|scc| !scc.is_cyclic),
+            "linear chain should have no cyclic SCCs"
+        );
+        // Total nodes across all SCCs = 3 (a, b, c).
+        let total_nodes: usize = sccs.iter().map(|scc| scc.nodes.len()).sum();
+        assert_eq!(total_nodes, 3);
+    }
+
+    #[test]
+    fn test_scc_simple_cycle() {
+        // A → B → A: one SCC {A, B}.
+        let mut dag = StDag::new();
+        let a = NodeId::StreamTable(1);
+        let b = NodeId::StreamTable(2);
+
+        dag.add_st_node(make_st(1, "A"));
+        dag.add_st_node(make_st(2, "B"));
+
+        dag.add_edge(a, b);
+        dag.add_edge(b, a);
+
+        let sccs = dag.compute_sccs();
+        let cyclic_sccs: Vec<_> = sccs.iter().filter(|scc| scc.is_cyclic).collect();
+        assert_eq!(cyclic_sccs.len(), 1, "expected one cyclic SCC");
+        assert_eq!(cyclic_sccs[0].nodes.len(), 2, "SCC should contain A and B");
+
+        // Both nodes should be in the cyclic SCC.
+        let node_set: HashSet<NodeId> = cyclic_sccs[0].nodes.iter().copied().collect();
+        assert!(node_set.contains(&a));
+        assert!(node_set.contains(&b));
+    }
+
+    #[test]
+    fn test_scc_mixed() {
+        // {A, B} cycle → C singleton → {D, E} cycle
+        let mut dag = StDag::new();
+        let a = NodeId::StreamTable(1);
+        let b = NodeId::StreamTable(2);
+        let c = NodeId::StreamTable(3);
+        let d = NodeId::StreamTable(4);
+        let e = NodeId::StreamTable(5);
+
+        for (id, name) in [(1, "A"), (2, "B"), (3, "C"), (4, "D"), (5, "E")] {
+            dag.add_st_node(make_st(id, name));
+        }
+
+        // Cycle 1: A ↔ B
+        dag.add_edge(a, b);
+        dag.add_edge(b, a);
+        // A,B → C
+        dag.add_edge(b, c);
+        // C → D, E; cycle 2: D ↔ E
+        dag.add_edge(c, d);
+        dag.add_edge(c, e);
+        dag.add_edge(d, e);
+        dag.add_edge(e, d);
+
+        let sccs = dag.compute_sccs();
+        let cyclic_sccs: Vec<_> = sccs.iter().filter(|scc| scc.is_cyclic).collect();
+        assert_eq!(cyclic_sccs.len(), 2, "expected two cyclic SCCs");
+
+        // Verify condensation order: {A,B} SCC before C before {D,E} SCC.
+        let scc_of = |node: NodeId| -> usize {
+            sccs.iter()
+                .position(|scc| scc.nodes.contains(&node))
+                .unwrap()
+        };
+        assert!(scc_of(a) < scc_of(c), "SCC(A,B) should come before SCC(C)");
+        assert!(scc_of(c) < scc_of(d), "SCC(C) should come before SCC(D,E)");
+    }
+
+    #[test]
+    fn test_scc_self_loop() {
+        // A → A: one SCC {A} (is_cyclic = true).
+        let mut dag = StDag::new();
+        let a = NodeId::StreamTable(1);
+        dag.add_st_node(make_st(1, "A"));
+        dag.add_edge(a, a);
+
+        let sccs = dag.compute_sccs();
+        assert_eq!(sccs.len(), 1);
+        assert!(sccs[0].is_cyclic, "self-loop should be cyclic");
+        assert_eq!(sccs[0].nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_scc_three_node_cycle() {
+        // A → B → C → A.
+        let mut dag = StDag::new();
+        let a = NodeId::StreamTable(1);
+        let b = NodeId::StreamTable(2);
+        let c = NodeId::StreamTable(3);
+
+        for (id, name) in [(1, "A"), (2, "B"), (3, "C")] {
+            dag.add_st_node(make_st(id, name));
+        }
+
+        dag.add_edge(a, b);
+        dag.add_edge(b, c);
+        dag.add_edge(c, a);
+
+        let sccs = dag.compute_sccs();
+        let cyclic_sccs: Vec<_> = sccs.iter().filter(|scc| scc.is_cyclic).collect();
+        assert_eq!(cyclic_sccs.len(), 1);
+        assert_eq!(cyclic_sccs[0].nodes.len(), 3);
+    }
+
+    #[test]
+    fn test_condensation_order_is_topological() {
+        // base → A → B, A → C (no cycles → all singletons in topological order).
+        let mut dag = StDag::new();
+        let base = NodeId::BaseTable(1);
+        let a = NodeId::StreamTable(1);
+        let b = NodeId::StreamTable(2);
+        let c = NodeId::StreamTable(3);
+
+        for (id, name) in [(1, "A"), (2, "B"), (3, "C")] {
+            dag.add_st_node(make_st(id, name));
+        }
+
+        dag.add_edge(base, a);
+        dag.add_edge(a, b);
+        dag.add_edge(a, c);
+
+        let sccs = dag.condensation_order();
+        // base should appear in an SCC before A, and A before B/C.
+        let pos_of = |node: NodeId| -> usize {
+            sccs.iter()
+                .position(|scc| scc.nodes.contains(&node))
+                .unwrap()
+        };
+        assert!(pos_of(base) < pos_of(a));
+        assert!(pos_of(a) < pos_of(b));
+        assert!(pos_of(a) < pos_of(c));
+    }
+
+    #[test]
+    fn test_scc_empty_dag() {
+        let dag = StDag::new();
+        let sccs = dag.compute_sccs();
+        assert!(sccs.is_empty());
+    }
+
+    #[test]
+    fn test_scc_cycle_with_tail() {
+        // base → A → B → C → B (B-C form a cycle, A is upstream).
+        let mut dag = StDag::new();
+        let base = NodeId::BaseTable(1);
+        let a = NodeId::StreamTable(1);
+        let b = NodeId::StreamTable(2);
+        let c = NodeId::StreamTable(3);
+
+        for (id, name) in [(1, "A"), (2, "B"), (3, "C")] {
+            dag.add_st_node(make_st(id, name));
+        }
+
+        dag.add_edge(base, a);
+        dag.add_edge(a, b);
+        dag.add_edge(b, c);
+        dag.add_edge(c, b);
+
+        let sccs = dag.compute_sccs();
+        let cyclic_sccs: Vec<_> = sccs.iter().filter(|scc| scc.is_cyclic).collect();
+        assert_eq!(cyclic_sccs.len(), 1, "B-C should form one cyclic SCC");
+        assert_eq!(cyclic_sccs[0].nodes.len(), 2);
+
+        // A (and base) should be non-cyclic singletons.
+        let a_scc = sccs.iter().find(|scc| scc.nodes.contains(&a)).unwrap();
+        assert!(!a_scc.is_cyclic);
+
+        // A should come before B-C in condensation order.
+        let pos_of = |node: NodeId| -> usize {
+            sccs.iter()
+                .position(|scc| scc.nodes.contains(&node))
+                .unwrap()
+        };
+        assert!(pos_of(a) < pos_of(b));
     }
 }

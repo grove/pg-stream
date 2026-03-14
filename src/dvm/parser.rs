@@ -2897,6 +2897,287 @@ fn check_immediate_support(tree: &OpTree) -> Result<(), PgTrickleError> {
     }
 }
 
+// ── Monotonicity Checker (CYC-2) ──────────────────────────────────────────
+
+/// Check if an OpTree is monotone (safe for cyclic fixed-point iteration).
+///
+/// A monotone query is one where adding input rows can only add output rows,
+/// never remove them. This property guarantees convergence when stream tables
+/// form circular dependencies, because:
+/// - Each iteration can only add rows (monotonicity)
+/// - The result set is bounded (finite input → finite output)
+/// - The sequence must reach a fixed point in finite steps
+///
+/// Returns `Ok(())` if all operators are monotone. Returns `Err` with a
+/// descriptive error if a non-monotone operator is found.
+///
+/// # Non-monotone operators
+///
+/// - **Aggregate**: COUNT/SUM can decrease when rows are deleted
+/// - **Except**: adding rows to the right branch removes output
+/// - **Window functions**: rank can change, causing rows to appear/disappear
+/// - **AntiJoin** (NOT EXISTS/NOT IN): adding right rows removes output
+///
+/// # References
+///
+/// - Datalog stratification theory
+/// - DBSP (Dynamic Batch Stream Processing) monotone fragment
+pub fn check_monotonicity(tree: &OpTree) -> Result<(), PgTrickleError> {
+    match tree {
+        // Leaf nodes — always monotone.
+        OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => Ok(()),
+
+        // Transparent wrappers — monotonicity depends on child.
+        OpTree::Project { child, .. }
+        | OpTree::Filter { child, .. }
+        | OpTree::Distinct { child }
+        | OpTree::Subquery { child, .. } => check_monotonicity(child),
+
+        // Joins (inner, left, full) — monotone if both sides are.
+        OpTree::InnerJoin { left, right, .. }
+        | OpTree::LeftJoin { left, right, .. }
+        | OpTree::FullJoin { left, right, .. } => {
+            check_monotonicity(left)?;
+            check_monotonicity(right)
+        }
+
+        // UNION ALL — monotone if all children are.
+        OpTree::UnionAll { children } => {
+            for child in children {
+                check_monotonicity(child)?;
+            }
+            Ok(())
+        }
+
+        // INTERSECT — monotone (adding rows to either side can only add output).
+        OpTree::Intersect { left, right, .. } => {
+            check_monotonicity(left)?;
+            check_monotonicity(right)
+        }
+
+        // SemiJoin (EXISTS/IN) — monotone (adding right rows adds left matches).
+        OpTree::SemiJoin { left, right, .. } => {
+            check_monotonicity(left)?;
+            check_monotonicity(right)
+        }
+
+        // Recursive CTEs — monotone if both terms are.
+        OpTree::RecursiveCte {
+            base, recursive, ..
+        } => {
+            check_monotonicity(base)?;
+            check_monotonicity(recursive)
+        }
+
+        // LATERAL — monotonicity depends on child.
+        OpTree::LateralFunction { child, .. } | OpTree::LateralSubquery { child, .. } => {
+            check_monotonicity(child)
+        }
+
+        // Scalar subqueries — monotonicity depends on both.
+        OpTree::ScalarSubquery {
+            child, subquery, ..
+        } => {
+            check_monotonicity(child)?;
+            check_monotonicity(subquery)
+        }
+
+        // ── Non-monotone operators ────────────────────────────────────
+        OpTree::Aggregate { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "Aggregate is not monotone — cannot participate in a circular dependency. \
+             Aggregates (COUNT, SUM, AVG, etc.) can decrease when input rows are removed, \
+             which prevents fixed-point convergence."
+                .into(),
+        )),
+
+        OpTree::Except { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "EXCEPT is not monotone — cannot participate in a circular dependency. \
+             Adding rows to the right branch of EXCEPT removes output rows, \
+             which prevents fixed-point convergence."
+                .into(),
+        )),
+
+        OpTree::Window { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "Window functions are not monotone — cannot participate in a circular dependency. \
+             Window function results (ROW_NUMBER, RANK, etc.) change when input rows are \
+             added or removed, which prevents fixed-point convergence."
+                .into(),
+        )),
+
+        OpTree::AntiJoin { .. } => Err(PgTrickleError::UnsupportedOperator(
+            "NOT EXISTS / NOT IN is not monotone — cannot participate in a circular dependency. \
+             Adding rows to the subquery side removes output rows, which prevents \
+             fixed-point convergence."
+                .into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod monotonicity_tests {
+    use super::*;
+
+    /// Helper: create a minimal Scan node.
+    fn scan() -> OpTree {
+        OpTree::Scan {
+            table_oid: 1,
+            table_name: "t".to_string(),
+            schema: "public".to_string(),
+            columns: vec![],
+            pk_columns: vec![],
+            alias: "t".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_scan_is_monotone() {
+        assert!(check_monotonicity(&scan()).is_ok());
+    }
+
+    #[test]
+    fn test_filter_project_is_monotone() {
+        let tree = OpTree::Filter {
+            predicate: Expr::Literal("true".into()),
+            child: Box::new(OpTree::Project {
+                expressions: vec![],
+                aliases: vec![],
+                child: Box::new(scan()),
+            }),
+        };
+        assert!(check_monotonicity(&tree).is_ok());
+    }
+
+    #[test]
+    fn test_inner_join_is_monotone() {
+        let tree = OpTree::InnerJoin {
+            condition: Expr::Literal("true".into()),
+            left: Box::new(scan()),
+            right: Box::new(scan()),
+        };
+        assert!(check_monotonicity(&tree).is_ok());
+    }
+
+    #[test]
+    fn test_left_join_is_monotone() {
+        let tree = OpTree::LeftJoin {
+            condition: Expr::Literal("true".into()),
+            left: Box::new(scan()),
+            right: Box::new(scan()),
+        };
+        assert!(check_monotonicity(&tree).is_ok());
+    }
+
+    #[test]
+    fn test_union_all_is_monotone() {
+        let tree = OpTree::UnionAll {
+            children: vec![scan(), scan()],
+        };
+        assert!(check_monotonicity(&tree).is_ok());
+    }
+
+    #[test]
+    fn test_distinct_is_monotone() {
+        let tree = OpTree::Distinct {
+            child: Box::new(scan()),
+        };
+        assert!(check_monotonicity(&tree).is_ok());
+    }
+
+    #[test]
+    fn test_semi_join_is_monotone() {
+        let tree = OpTree::SemiJoin {
+            condition: Expr::Literal("true".into()),
+            left: Box::new(scan()),
+            right: Box::new(scan()),
+        };
+        assert!(check_monotonicity(&tree).is_ok());
+    }
+
+    #[test]
+    fn test_intersect_is_monotone() {
+        let tree = OpTree::Intersect {
+            left: Box::new(scan()),
+            right: Box::new(scan()),
+            all: false,
+        };
+        assert!(check_monotonicity(&tree).is_ok());
+    }
+
+    #[test]
+    fn test_aggregate_is_not_monotone() {
+        let tree = OpTree::Aggregate {
+            group_by: vec![],
+            aggregates: vec![],
+            child: Box::new(scan()),
+        };
+        let err = check_monotonicity(&tree).unwrap_err();
+        assert!(format!("{}", err).contains("Aggregate"));
+    }
+
+    #[test]
+    fn test_except_is_not_monotone() {
+        let tree = OpTree::Except {
+            left: Box::new(scan()),
+            right: Box::new(scan()),
+            all: false,
+        };
+        let err = check_monotonicity(&tree).unwrap_err();
+        assert!(format!("{}", err).contains("EXCEPT"));
+    }
+
+    #[test]
+    fn test_window_is_not_monotone() {
+        let tree = OpTree::Window {
+            window_exprs: vec![],
+            partition_by: vec![],
+            pass_through: vec![],
+            child: Box::new(scan()),
+        };
+        let err = check_monotonicity(&tree).unwrap_err();
+        assert!(format!("{}", err).contains("Window"));
+    }
+
+    #[test]
+    fn test_anti_join_is_not_monotone() {
+        let tree = OpTree::AntiJoin {
+            condition: Expr::Literal("true".into()),
+            left: Box::new(scan()),
+            right: Box::new(scan()),
+        };
+        let err = check_monotonicity(&tree).unwrap_err();
+        assert!(format!("{}", err).contains("NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_nested_non_monotone_detected() {
+        // Filter { child: Aggregate { ... } } → non-monotone.
+        let tree = OpTree::Filter {
+            predicate: Expr::Literal("true".into()),
+            child: Box::new(OpTree::Aggregate {
+                group_by: vec![],
+                aggregates: vec![],
+                child: Box::new(scan()),
+            }),
+        };
+        assert!(check_monotonicity(&tree).is_err());
+    }
+
+    #[test]
+    fn test_join_with_non_monotone_child() {
+        // InnerJoin where right side has an Aggregate → non-monotone.
+        let tree = OpTree::InnerJoin {
+            condition: Expr::Literal("true".into()),
+            left: Box::new(scan()),
+            right: Box::new(OpTree::Aggregate {
+                group_by: vec![],
+                aggregates: vec![],
+                child: Box::new(scan()),
+            }),
+        };
+        assert!(check_monotonicity(&tree).is_err());
+    }
+}
+
 // ── Query Parsing ──────────────────────────────────────────────────────────
 
 /// Context threaded through the parser for CTE handling.

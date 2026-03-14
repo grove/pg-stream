@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     requested_cdc_mode TEXT
                      CHECK (requested_cdc_mode IN ('auto', 'trigger', 'wal')),
     is_append_only  BOOLEAN NOT NULL DEFAULT FALSE,
+    scc_id          INT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -188,7 +189,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
     initiated_by    TEXT
                      CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL')),
     freshness_deadline TIMESTAMPTZ,
-    tick_watermark_lsn PG_LSN
+    tick_watermark_lsn PG_LSN,
+    fixpoint_iteration INT
 );
 
 CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);

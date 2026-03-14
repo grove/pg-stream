@@ -247,6 +247,22 @@ impl CdcTriggerMode {
 /// latest available LSN regardless of cross-source consistency.
 pub static PGS_TICK_WATERMARK_ENABLED: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+/// CYC-4: Maximum iterations per SCC before declaring non-convergence.
+///
+/// When stream tables form a cyclic dependency (circular reference),
+/// the scheduler iterates to a fixed point. If convergence is not
+/// reached within this many iterations, all members of the SCC are
+/// marked as ERROR.
+pub static PGS_MAX_FIXPOINT_ITERATIONS: GucSetting<i32> = GucSetting::<i32>::new(100);
+
+/// CYC-4: Master switch for circular dependency support.
+///
+/// When `false` (default), cycle detection rejects any stream table
+/// creation that would introduce a cycle in the dependency graph.
+/// When `true`, monotone cycles (those containing only safe operators)
+/// are allowed and scheduled with fixed-point iteration.
+pub static PGS_ALLOW_CIRCULAR: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -569,6 +585,33 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    // CYC-4: Circular dependency GUCs.
+    GucRegistry::define_int_guc(
+        c"pg_trickle.max_fixpoint_iterations",
+        c"Maximum iterations per SCC before declaring non-convergence.",
+        c"When circular stream table dependencies are iterated to a fixed point, \
+           this limits the maximum number of iterations. If convergence is not \
+           reached within this limit, all members of the SCC are marked ERROR. \
+           Only meaningful when pg_trickle.allow_circular = true.",
+        &PGS_MAX_FIXPOINT_ITERATIONS,
+        1,      // min
+        10_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.allow_circular",
+        c"Allow circular (cyclic) stream table dependencies.",
+        c"When false (default), creating a stream table that would introduce a cycle \
+           in the dependency graph is rejected. When true, monotone cycles \
+           (containing only safe operators like joins, filters, and projections) \
+           are allowed and refreshed via fixed-point iteration.",
+        &PGS_ALLOW_CIRCULAR,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -770,4 +813,14 @@ pub fn pg_trickle_parallel_refresh_mode() -> ParallelRefreshMode {
 /// Returns the cluster-wide cap on dynamic refresh workers.
 pub fn pg_trickle_max_dynamic_refresh_workers() -> i32 {
     PGS_MAX_DYNAMIC_REFRESH_WORKERS.get()
+}
+
+/// Returns the maximum fixpoint iterations for SCC convergence (CYC-4).
+pub fn pg_trickle_max_fixpoint_iterations() -> i32 {
+    PGS_MAX_FIXPOINT_ITERATIONS.get()
+}
+
+/// Returns whether circular (cyclic) dependencies are allowed (CYC-4).
+pub fn pg_trickle_allow_circular() -> bool {
+    PGS_ALLOW_CIRCULAR.get()
 }

@@ -1,6 +1,6 @@
 # PLAN: Circular References in the Stream Table Dependency Graph
 
-**Status:** Not started (future work)
+**Status:** Foundation complete (Parts 1–4 implemented in v0.6.0)
 
 ## Objective
 
