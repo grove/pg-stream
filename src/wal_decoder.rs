@@ -84,10 +84,28 @@ pub fn create_publication(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError>
     .unwrap_or(false);
 
     if !exists {
+        // PT3: For partitioned tables, use publish_via_partition_root = true
+        // so child partition changes are published under the parent table's
+        // identity, matching trigger-mode CDC behavior.
+        let is_partitioned = Spi::get_one_with_args::<String>(
+            "SELECT relkind::text FROM pg_class WHERE oid = $1",
+            &[source_oid.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .map(|rk| rk == "p")
+        .unwrap_or(false);
+
+        let with_clause = if is_partitioned {
+            " WITH (publish_via_partition_root = true)"
+        } else {
+            ""
+        };
+
         let sql = format!(
-            "CREATE PUBLICATION {} FOR TABLE {}",
+            "CREATE PUBLICATION {} FOR TABLE {}{}",
             quote_ident(&pub_name),
             source_table,
+            with_clause,
         );
         Spi::run(&sql).map_err(|e| {
             PgTrickleError::WalTransitionError(format!(

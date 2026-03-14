@@ -1,7 +1,8 @@
 # PLAN_PARTITIONING_SHARDING.md — PostgreSQL Partitioning & Sharding Compatibility
 
-**Status:** Plan  
+**Status:** Implemented (PT1–PT5 in v0.6.0)  
 **Date:** 2026-03-01  
+**Updated:** 2026-03-14 — PT1–PT5 implemented. E2E tests, ATTACH PARTITION detection, WAL publish_via_partition_root, foreign table info, and user-facing tutorial all shipped.  
 **Related:** [PLAN_CITUS.md](PLAN_CITUS.md) · [REPORT_TIMESCALEDB.md](../ecosystem/REPORT_TIMESCALEDB.md) · [REPORT_TRIGGERS_VS_REPLICATION.md](../sql/REPORT_TRIGGERS_VS_REPLICATION.md)
 
 ---

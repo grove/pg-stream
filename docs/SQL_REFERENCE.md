@@ -1744,6 +1744,18 @@ SELECT pgtrickle.create_stream_table(
 );
 ```
 
+**ATTACH PARTITION detection:** When a new partition is attached to a tracked
+source table via `ALTER TABLE parent ATTACH PARTITION child ...`, pg_trickle's
+DDL event trigger detects the change in partition structure and automatically
+marks affected stream tables for reinitialize. This ensures pre-existing rows
+in the newly attached partition are included on the next refresh. DETACH
+PARTITION is also detected and triggers reinitialization.
+
+**WAL mode:** When using WAL-based CDC (`cdc_mode = 'wal'`), publications for
+partitioned source tables are created with `publish_via_partition_root = true`.
+This ensures changes from child partitions are published under the parent
+table's identity, matching trigger-mode CDC behavior.
+
 > **Note:** pg_trickle targets PostgreSQL 18. On PostgreSQL 12 or earlier (not supported), parent triggers do **not** fire for partition-routed rows, which would cause silent data loss.
 
 ### IMMEDIATE Mode Query Restrictions

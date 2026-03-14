@@ -790,6 +790,26 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str) {
                 }
                 reinit_pgt_ids.push(*pgt_id);
             }
+            SchemaChangeKind::PartitionChange => {
+                // PT2: ATTACH/DETACH PARTITION on a partitioned source table.
+                // Pre-existing rows in newly attached partitions are not
+                // captured by CDC triggers, so reinitialize to pick up all data.
+                pgrx::info!(
+                    "pg_trickle: partition structure changed on {} — \
+                     stream table {} marked for reinit",
+                    identity,
+                    pgt_id,
+                );
+                if let Err(e) = StreamTableMeta::mark_for_reinitialize(*pgt_id) {
+                    pgrx::warning!(
+                        "pg_trickle_ddl_tracker: failed to mark ST {} for reinit \
+                         after partition change: {}",
+                        pgt_id,
+                        e,
+                    );
+                }
+                reinit_pgt_ids.push(*pgt_id);
+            }
         }
     }
 
@@ -1377,6 +1397,10 @@ pub enum SchemaChangeKind {
     ConstraintChange,
     /// RLS state changed (ENABLE/DISABLE ROW LEVEL SECURITY or FORCE/NO FORCE).
     RlsChange,
+    /// Partition structure changed (ATTACH/DETACH PARTITION) — requires reinitialize
+    /// because pre-existing rows in newly attached partitions are not captured by
+    /// CDC triggers.
+    PartitionChange,
     /// Other DDL (comment, owner change, etc.) — no reinitialize needed.
     Benign,
 }
@@ -1398,7 +1422,8 @@ pub fn detect_schema_change_kind(
 ) -> Result<SchemaChangeKind, PgTrickleError> {
     // Fast path: compare schema fingerprints.
     // If the stored fingerprint matches the current one, nothing changed
-    // (neither columns nor RLS state).
+    // (neither columns, RLS state, nor partition structure).
+    // Since v0.6.0, the fingerprint includes partition_child_count.
     if let Ok(Some(stored_fp)) = crate::catalog::get_schema_fingerprint(pgt_id, source_oid)
         && !stored_fp.is_empty()
         && let Ok((_, current_fp)) = crate::catalog::build_column_snapshot(source_oid)
@@ -1437,6 +1462,17 @@ pub fn detect_schema_change_kind(
                     let (current_rls, current_force) = crate::catalog::query_rls_flags(source_oid)?;
                     if stored_rls != current_rls || stored_force != current_force {
                         return Ok(SchemaChangeKind::RlsChange);
+                    }
+
+                    // PT2: Check if partition structure changed.
+                    let stored_child_count = obj
+                        .get("partition_child_count")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let current_child_count =
+                        crate::catalog::query_partition_child_count(source_oid).unwrap_or(0);
+                    if stored_child_count != current_child_count {
+                        return Ok(SchemaChangeKind::PartitionChange);
                     }
 
                     return Ok(col_kind);
@@ -1598,6 +1634,15 @@ mod tests {
         );
         assert_eq!(SchemaChangeKind::RlsChange, SchemaChangeKind::RlsChange);
         assert_ne!(SchemaChangeKind::RlsChange, SchemaChangeKind::Benign);
+        assert_eq!(
+            SchemaChangeKind::PartitionChange,
+            SchemaChangeKind::PartitionChange
+        );
+        assert_ne!(SchemaChangeKind::PartitionChange, SchemaChangeKind::Benign);
+        assert_ne!(
+            SchemaChangeKind::PartitionChange,
+            SchemaChangeKind::ColumnChange
+        );
         assert_ne!(SchemaChangeKind::RlsChange, SchemaChangeKind::ColumnChange);
         assert_ne!(
             SchemaChangeKind::RlsChange,

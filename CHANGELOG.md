@@ -9,6 +9,38 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Added
+
+#### Partitioning Support (Source Tables)
+
+Stream tables now work with PostgreSQL's declarative table partitioning.
+
+- **Partitioned source tables work out of the box.** RANGE, LIST, and HASH
+  partitioned tables work as stream table sources. CDC triggers fire on the
+  parent and capture changes from all child partitions. E2E tests cover all
+  three partition types with both FULL and DIFFERENTIAL refresh.
+
+- **ATTACH PARTITION triggers automatic reinitialize.** When you run
+  `ALTER TABLE parent ATTACH PARTITION child ...`, pg_trickle detects the
+  partition structure change and marks affected stream tables for
+  reinitialize. This ensures pre-existing rows in the newly attached
+  partition are picked up on the next refresh. DETACH PARTITION is also
+  detected.
+
+- **WAL-based CDC configured for partitions.** When using WAL mode,
+  publications are created with `publish_via_partition_root = true` so
+  changes from all child partitions appear under the parent table's
+  identity, matching trigger-mode behavior.
+
+- **Foreign table info message.** When a foreign table (via `postgres_fdw`)
+  is used as a source, pg_trickle now emits a clear info message explaining
+  that only FULL refresh mode or polling-based CDC is supported.
+
+- **Partitioned table tutorial.** New user-facing guide
+  (`docs/tutorials/PARTITIONED_TABLES.md`) covering RANGE, LIST, and HASH
+  partitioned source tables, ATTACH/DETACH PARTITION behavior, foreign
+  tables, and known caveats.
+
 ---
 
 ## [0.5.0] — 2026-03-13

@@ -36,6 +36,7 @@
 - [What Happens on DELETE](tutorials/WHAT_HAPPENS_ON_DELETE.md)
 - [What Happens on TRUNCATE](tutorials/WHAT_HAPPENS_ON_TRUNCATE.md)
 - [Row-Level Security (RLS)](tutorials/ROW_LEVEL_SECURITY.md)
+- [Partitioned Tables](tutorials/PARTITIONED_TABLES.md)
 
 ---
 

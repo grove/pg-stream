@@ -3536,7 +3536,19 @@ fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String)]) {
             pgrx::info!(
                 "pg_trickle: source table {} is a partitioned table. \
                  CDC triggers on the parent fire for all DML routed to \
-                 child partitions (PostgreSQL 13+).",
+                 child partitions (PostgreSQL 13+). If you ATTACH PARTITION \
+                 with pre-existing data, pg_trickle will automatically \
+                 reinitialize affected stream tables.",
+                table_name,
+            );
+        }
+
+        // PT4: Foreign table info
+        if relkind == "f" {
+            pgrx::info!(
+                "pg_trickle: source table {} is a foreign table. Foreign tables \
+                 cannot use trigger-based or WAL-based CDC — only FULL refresh \
+                 mode or polling-based change detection is supported.",
                 table_name,
             );
         }
