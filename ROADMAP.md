@@ -905,7 +905,7 @@ the foundation for circular stream table DAGs.
 
 > **Partitioning subtotal: ~18–32 hours**
 
-### Idempotent DDL (`create_or_replace`)
+### ~~Idempotent DDL (`create_or_replace`)~~ ✅
 
 > **In plain terms:** Right now if you run `create_stream_table()` twice with
 > the same name it errors out, and changing the query means
@@ -924,10 +924,10 @@ pattern used by the dbt materialization macro.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| COR-1 | **The core function.** `create_or_replace_stream_table()` compares the new definition against the existing one and picks the cheapest path: no-op if identical, settings-only update if just config changed, column migration if columns were added/dropped, or full rebuild if the query is fundamentally different. One function call replaces the drop-and-recreate dance. | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) | ✅ Done |
-| COR-3 | **dbt just works.** Updates the `stream_table` dbt materialization macro to call `create_or_replace` instead of dropping and recreating on every `dbt run`. Existing data survives deployments; only genuinely changed stream tables get rebuilt. | 2h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) | ✅ Done |
-| COR-4 | **Upgrade path and documentation.** Upgrade SQL script so existing installations get the new function via `ALTER EXTENSION UPDATE`. SQL Reference and FAQ updated with usage examples. | 2.5h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) | ✅ Done |
-| COR-5 | **Thorough test coverage.** 13 end-to-end tests covering: identical no-op, config-only change, query change with compatible columns, query change with incompatible columns, mode switches, and error cases. | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) | ✅ Done |
+| ~~COR-1~~ | ~~**The core function.** `create_or_replace_stream_table()` compares the new definition against the existing one and picks the cheapest path: no-op if identical, settings-only update if just config changed, column migration if columns were added/dropped, or full rebuild if the query is fundamentally different. One function call replaces the drop-and-recreate dance.~~ | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| ~~COR-3~~ | ~~**dbt just works.** Updates the `stream_table` dbt materialization macro to call `create_or_replace` instead of dropping and recreating on every `dbt run`. Existing data survives deployments; only genuinely changed stream tables get rebuilt.~~ | 2h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| ~~COR-4~~ | ~~**Upgrade path and documentation.** Upgrade SQL script so existing installations get the new function via `ALTER EXTENSION UPDATE`. SQL Reference and FAQ updated with usage examples.~~ | 2.5h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
+| ~~COR-5~~ | ~~**Thorough test coverage.** 13 end-to-end tests covering: identical no-op, config-only change, query change with compatible columns, query change with incompatible columns, mode switches, and error cases.~~ | 4h | [PLAN_CREATE_OR_REPLACE.md](plans/sql/PLAN_CREATE_OR_REPLACE.md) |
 
 > **Idempotent DDL subtotal: ~12–13 hours**
 
@@ -971,8 +971,8 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~EC-16~~ ✅ | ~~**Detect when someone silently changes a function your query uses.** If a stream table's query calls `calculate_discount()` and someone does `CREATE OR REPLACE FUNCTION calculate_discount(...)` with new logic, the stream table's cached computation plan becomes stale. This checks function body hashes on each refresh and triggers a rebuild when a change is detected.~~ | 2 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-16 |
-| EC-18 | **Explain why WAL mode isn't activating.** When `cdc_mode = 'auto'`, pg_trickle is supposed to upgrade from trigger-based to WAL-based change tracking when possible. If it stays stuck on triggers (e.g. because `wal_level` isn't set to `logical`), there's no feedback. This adds a periodic log message explaining the reason and surfaces it in the `health_check()` output. | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-18 |
-| EC-34 | **Recover gracefully after restoring from backup.** When you restore a PostgreSQL server from `pg_basebackup`, replication slots are lost. pg_trickle's WAL decoder would fail trying to read from a slot that no longer exists. This detects the missing slot, automatically falls back to trigger-based tracking, and logs a WARNING so you know what happened. | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-34 |
+| ~~EC-18~~ ✅ | ~~**Explain why WAL mode isn't activating.** When `cdc_mode = 'auto'`, pg_trickle is supposed to upgrade from trigger-based to WAL-based change tracking when possible. If it stays stuck on triggers (e.g. because `wal_level` isn't set to `logical`), there's no feedback. This adds a periodic log message explaining the reason and surfaces it in the `health_check()` output.~~ | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-18 |
+| ~~EC-34~~ ✅ | ~~**Recover gracefully after restoring from backup.** When you restore a PostgreSQL server from `pg_basebackup`, replication slots are lost. pg_trickle's WAL decoder would fail trying to read from a slot that no longer exists. This detects the missing slot, automatically falls back to trigger-based tracking, and logs a WARNING so you know what happened.~~ | 1 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-34 |
 
 #### P2 — Usability Gaps
 
@@ -1003,7 +1003,7 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 > **Ergonomics follow-up subtotal: ~14 hours**
 
-### Bootstrap Source Gating Follow-Up
+### ~~Bootstrap Source Gating Follow-Up~~ ✅
 
 > **In plain terms:** Source gating (pause/resume for bulk loads) shipped in
 > v0.5.0 with the core API and scheduler integration. This follow-up adds
@@ -1016,14 +1016,14 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| BOOT-F1 | **Calling gate twice is safe.** Verify that calling `gate_source('orders')` when `orders` is already gated is a harmless no-op — not an error. Important for ETL scripts that may retry on failure. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
-| BOOT-F2 | **Gate → ungate → gate again works correctly.** Verify the full lifecycle: gate a source (scheduler skips it), ungate it (scheduler resumes), gate it again (scheduler skips again). Proves the mechanism is reusable across multiple load cycles. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
-| BOOT-F3 | **See your gates at a glance.** A new `bootstrap_gate_status()` function that shows which sources are gated, when they were gated, who gated them, and how long they've been paused. Useful for debugging when the scheduler seems to be "doing nothing" — it might just be waiting for a gate. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
-| BOOT-F4 | **Cookbook for common ETL patterns.** Documentation with step-by-step recipes: gating a single source during a bulk load, coordinating multiple source loads that must finish together, gating only part of a stream table DAG, and the classic "nightly batch → gate → load → ungate → single clean refresh" workflow. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| ~~BOOT-F1~~ | ~~**Calling gate twice is safe.** Verify that calling `gate_source('orders')` when `orders` is already gated is a harmless no-op — not an error. Important for ETL scripts that may retry on failure.~~ | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| ~~BOOT-F2~~ | ~~**Gate → ungate → gate again works correctly.** Verify the full lifecycle: gate a source (scheduler skips it), ungate it (scheduler resumes), gate it again (scheduler skips again). Proves the mechanism is reusable across multiple load cycles.~~ | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| ~~BOOT-F3~~ | ~~**See your gates at a glance.** A new `bootstrap_gate_status()` function that shows which sources are gated, when they were gated, who gated them, and how long they've been paused. Useful for debugging when the scheduler seems to be "doing nothing" — it might just be waiting for a gate.~~ | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| ~~BOOT-F4~~ | ~~**Cookbook for common ETL patterns.** Documentation with step-by-step recipes: gating a single source during a bulk load, coordinating multiple source loads that must finish together, gating only part of a stream table DAG, and the classic "nightly batch → gate → load → ungate → single clean refresh" workflow.~~ | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
 
 > **Bootstrap gating follow-up subtotal: ~12 hours**
 
-### dbt Integration Enhancements
+### ~~dbt Integration Enhancements~~ ✅
 
 > **In plain terms:** The dbt macro package (`dbt-pgtrickle`) shipped in
 > v0.4.0 with the core `stream_table` materialization. This adds three
@@ -1037,13 +1037,13 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DBT-1 | **Check stream table health from dbt.** A new `stream_table_status()` macro that returns whether a stream table is healthy, stale, or erroring — so you can write dbt tests like "fail if the orders summary hasn't refreshed in the last 5 minutes." Makes pg_trickle a first-class citizen in dbt's testing framework. | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 | ✅ Done |
-| DBT-2 | **Refresh everything in one command.** A `dbt run-operation refresh_all_stream_tables` command that refreshes all stream tables in the correct dependency order. Designed for CI pipelines: run it after `dbt run` and before `dbt test` to make sure all materialized data is current. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 | ✅ Done |
-| DBT-3 | **Test the dbt ↔ alter flow.** Integration tests that verify query changes, config changes, and mode switches all work correctly when made through dbt's `stream_table` materialization. Especially important now that `create_or_replace` is landing in the same release. | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 | ✅ Done |
+| ~~DBT-1~~ | ~~**Check stream table health from dbt.** A new `stream_table_status()` macro that returns whether a stream table is healthy, stale, or erroring — so you can write dbt tests like "fail if the orders summary hasn't refreshed in the last 5 minutes." Makes pg_trickle a first-class citizen in dbt's testing framework.~~ | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+| ~~DBT-2~~ | ~~**Refresh everything in one command.** A `dbt run-operation refresh_all_stream_tables` command that refreshes all stream tables in the correct dependency order. Designed for CI pipelines: run it after `dbt run` and before `dbt test` to make sure all materialized data is current.~~ | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+| ~~DBT-3~~ | ~~**Test the dbt ↔ alter flow.** Integration tests that verify query changes, config changes, and mode switches all work correctly when made through dbt's `stream_table` materialization. Especially important now that `create_or_replace` is landing in the same release.~~ | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
 
 > **dbt integration subtotal: ~8 hours**
 
-### SQL Documentation Gaps
+### ~~SQL Documentation Gaps~~ ✅
 
 > **In plain terms:** Once EC-03 (window functions in expressions) and EC-32
 > (`ALL (subquery)`) are implemented in this release, the documentation needs
@@ -1053,9 +1053,9 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DOC-1 | **Show users how ALL-subqueries work.** Once EC-32 lands, add a SQL Reference section explaining `WHERE price > ALL (SELECT ...)`, how pg_trickle rewrites it internally, and a complete worked example with sample data and expected output. | 2h | [GAP_SQL_OVERVIEW.md](plans/sql/GAP_SQL_OVERVIEW.md) | ✅ Done |
-| DOC-2 | **Show the window-in-expression pattern.** Once EC-03 lands, add a before/after example to the SQL Reference: "Here's your original query with `CASE WHEN ROW_NUMBER() ...`, and here's what pg_trickle does under the hood to make it work incrementally." | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 | ✅ Done |
-| DOC-3 | **Walkthrough for foreign table sources.** A step-by-step recipe showing how to create a `postgres_fdw` foreign table, use it as a stream table source with polling-based change detection, and what to expect in terms of refresh behaviour. This feature shipped in v0.2.2 but was never properly documented with an example. | 1h | Existing feature (v0.2.2) | ✅ Done |
+| ~~DOC-1~~ | ~~**Show users how ALL-subqueries work.** Once EC-32 lands, add a SQL Reference section explaining `WHERE price > ALL (SELECT ...)`, how pg_trickle rewrites it internally, and a complete worked example with sample data and expected output.~~ | 2h | [GAP_SQL_OVERVIEW.md](plans/sql/GAP_SQL_OVERVIEW.md) |
+| ~~DOC-2~~ | ~~**Show the window-in-expression pattern.** Once EC-03 lands, add a before/after example to the SQL Reference: "Here's your original query with `CASE WHEN ROW_NUMBER() ...`, and here's what pg_trickle does under the hood to make it work incrementally."~~ | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
+| ~~DOC-3~~ | ~~**Walkthrough for foreign table sources.** A step-by-step recipe showing how to create a `postgres_fdw` foreign table, use it as a stream table source with polling-based change detection, and what to expect in terms of refresh behaviour. This feature shipped in v0.2.2 but was never properly documented with an example.~~ | 1h | Existing feature (v0.2.2) |
 
 > **SQL documentation subtotal: ~5 hours**
 
@@ -1068,8 +1068,8 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [ ] SCC algorithm in place; monotonicity checker rejects non-monotone cycles
 - [x] WAL + keyless without REPLICA IDENTITY FULL rejected at creation (EC-19)
 - [x] `ALTER FUNCTION` body changes detected via `pg_proc` hash polling (EC-16)
-- [ ] Stuck `auto` CDC mode surfaces explanation in logs and health check (EC-18)
-- [ ] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)
+- [x] Stuck `auto` CDC mode surfaces explanation in logs and health check (EC-18)
+- [x] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)
 - [ ] Window functions in expressions supported via CTE extraction (EC-03)
 - [ ] `ALL (subquery)` rewritten to `NOT EXISTS (... EXCEPT ...)` (EC-32)
 - [ ] Ergonomics E2E tests for calculated schedule, warnings, and removed GUCs pass
