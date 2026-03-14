@@ -42,7 +42,9 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
   - [SQL Value Functions](#sql-value-functions)
   - [Array and Row Expressions](#array-and-row-expressions)
   - [Subquery Expressions](#subquery-expressions)
+    - [ALL (subquery) — Worked Example](#all-subquery--worked-example)
   - [Auto-Rewrite Pipeline](#auto-rewrite-pipeline)
+    - [Window Functions in Expressions (Auto-Rewrite)](#window-functions-in-expressions-auto-rewrite)
   - [HAVING Clause](#having-clause)
   - [Tables Without Primary Keys (Keyless Tables)](#tables-without-primary-keys-keyless-tables)
   - [Volatile Function Detection](#volatile-function-detection)
@@ -55,6 +57,7 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
   - [Referencing Other Stream Tables](#referencing-other-stream-tables)
   - [Views as Sources in Defining Queries](#views-as-sources-in-defining-queries)
   - [Partitioned Tables as Sources](#partitioned-tables-as-sources)
+  - [Foreign Tables as Sources](#foreign-tables-as-sources)
   - [IMMEDIATE Mode Query Restrictions](#immediate-mode-query-restrictions)
   - [Logical Replication Targets](#logical-replication-targets)
   - [Views on Stream Tables](#views-on-stream-tables)
@@ -1549,13 +1552,75 @@ Subqueries are supported in the `WHERE` clause and `SELECT` list. They are parse
 | `NOT EXISTS (subquery)` | `WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.cid = c.id)` | Anti-Join |
 | `IN (subquery)` | `WHERE id IN (SELECT product_id FROM order_items)` | Semi-Join (rewritten as equality) |
 | `NOT IN (subquery)` | `WHERE id NOT IN (SELECT product_id FROM order_items)` | Anti-Join |
+| `ALL (subquery)` | `WHERE price > ALL (SELECT price FROM competitors)` | Anti-Join (NULL-safe) |
 | Scalar subquery (SELECT) | `SELECT (SELECT max(price) FROM products) AS max_p` | Scalar Subquery |
 
 **Notes:**
 - `EXISTS` and `IN (subquery)` in the `WHERE` clause are transformed into semi-join operators. `NOT EXISTS` and `NOT IN (subquery)` become anti-join operators.
 - Multiple subqueries in the same `WHERE` clause are supported when combined with `AND`. Subqueries combined with `OR` are also supported — they are automatically rewritten into `UNION` of separate filtered queries.
 - Scalar subqueries in the `SELECT` list are supported as long as they return exactly one row and one column.
-- `ALL (subquery)` is supported — it is automatically rewritten to an anti-join via `NOT EXISTS` with the negated condition.
+- `ALL (subquery)` is supported — see the worked example below.
+
+#### ALL (subquery) — Worked Example
+
+`ALL (subquery)` tests whether a comparison holds against **every** row returned
+by the subquery. pg_trickle rewrites it to a NULL-safe anti-join so it can be
+maintained incrementally.
+
+**Comparison operators supported:** `>`, `>=`, `<`, `<=`, `=`, `<>`
+
+**Example — products cheaper than all competitors:**
+
+```sql
+-- Source tables
+CREATE TABLE products (
+    id    INT PRIMARY KEY,
+    name  TEXT,
+    price NUMERIC
+);
+CREATE TABLE competitor_prices (
+    id          INT PRIMARY KEY,
+    product_id  INT,
+    price       NUMERIC
+);
+
+-- Sample data
+INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 24.99), (3, 'Gizmo', 14.99);
+INSERT INTO competitor_prices VALUES (1, 1, 12.99), (2, 1, 11.50), (3, 2, 19.99), (4, 3, 14.99);
+
+-- Stream table: find products priced below ALL competitor prices
+SELECT pgtrickle.create_stream_table(
+    name  => 'cheapest_products',
+    query => $$
+        SELECT p.id, p.name, p.price
+        FROM products p
+        WHERE p.price < ALL (
+            SELECT cp.price
+            FROM competitor_prices cp
+            WHERE cp.product_id = p.id
+        )
+    $$,
+    schedule => '1m'
+);
+```
+
+**Result:** Widget (9.99 < all of [12.99, 11.50]) is included. Gadget (24.99 ≮ 19.99) is excluded. Gizmo (14.99 ≮ 14.99) is excluded.
+
+**How pg_trickle handles it internally:**
+
+1. `WHERE price < ALL (SELECT ...)` is parsed into an anti-join with a NULL-safe condition.
+2. The condition `NOT (x op col)` is wrapped as `(col IS NULL OR NOT (x op col))` to correctly handle NULL values in the subquery — if any subquery row is NULL, the ALL comparison fails (standard SQL semantics).
+3. The anti-join uses the same incremental delta computation as `NOT EXISTS`, so changes to either `products` or `competitor_prices` are propagated efficiently.
+
+**Other common patterns:**
+
+```sql
+-- Employees whose salary meets or exceeds all department maximums
+WHERE salary >= ALL (SELECT max_salary FROM department_caps)
+
+-- Orders with ratings better than all thresholds
+WHERE rating > ALL (SELECT min_rating FROM quality_thresholds)
+```
 
 ### Auto-Rewrite Pipeline
 
@@ -1570,6 +1635,72 @@ pg_trickle transparently rewrites certain SQL constructs before parsing. These r
 | #4 | Correlated scalar subquery in `SELECT` | Convert to `LEFT JOIN` with grouped inline view |
 | #5 | `EXISTS`/`IN` inside `OR` | Split into `UNION` of separate filtered queries |
 | #6 | Multiple `PARTITION BY` clauses | Split into joined subqueries, one per distinct partitioning |
+| #7 | Window functions inside expressions | Lift to inner subquery with synthetic `__pgt_wf_N` columns (see below) |
+
+#### Window Functions in Expressions (Auto-Rewrite)
+
+Window functions nested inside expressions (e.g., `CASE WHEN ROW_NUMBER() ...`,
+`ABS(RANK() OVER (...) - 5)`) are automatically rewritten. pg_trickle lifts
+each window function call into a synthetic column in an inner subquery, then
+applies the original expression in the outer SELECT.
+
+This rewrite is transparent — you write your query naturally and pg_trickle
+handles it:
+
+**Your query:**
+
+```sql
+SELECT
+    id,
+    name,
+    CASE WHEN ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) = 1
+         THEN 'top earner'
+         ELSE 'other'
+    END AS rank_label
+FROM employees
+```
+
+**What pg_trickle generates internally:**
+
+```sql
+SELECT
+    "__pgt_wf_inner".id,
+    "__pgt_wf_inner".name,
+    CASE WHEN "__pgt_wf_inner"."__pgt_wf_1" = 1
+         THEN 'top earner'
+         ELSE 'other'
+    END AS "rank_label"
+FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS "__pgt_wf_1"
+    FROM employees
+) "__pgt_wf_inner"
+```
+
+The inner subquery produces the window function result as a plain column
+(`__pgt_wf_1`), which the DVM engine can maintain incrementally using its
+existing window function support. The outer expression is then a simple
+column reference.
+
+**More examples:**
+
+```sql
+-- Arithmetic with window functions
+SELECT id, ABS(RANK() OVER (ORDER BY score) - 5) AS adjusted_rank
+FROM players
+
+-- COALESCE with window function
+SELECT id, COALESCE(LAG(value) OVER (ORDER BY ts), 0) AS prev_value
+FROM sensor_readings
+
+-- Multiple window functions in expressions
+SELECT id,
+       ROW_NUMBER() OVER (ORDER BY created_at) * 100 AS seq,
+       SUM(amount) OVER (ORDER BY created_at) / COUNT(*) OVER (ORDER BY created_at) AS running_avg
+FROM transactions
+```
+
+All of these are handled automatically — each distinct window function call
+is extracted to its own `__pgt_wf_N` synthetic column.
 
 ### HAVING Clause
 
@@ -1723,9 +1854,10 @@ The following are **rejected with clear error messages** rather than producing b
 | Expression | Error Behavior | Suggested Rewrite |
 |---|---|---|
 | `TABLESAMPLE` | Rejected — stream tables materialize the complete result set | Use `WHERE random() < 0.1` if sampling is needed |
-| Window functions in expressions | Rejected — e.g., `CASE WHEN ROW_NUMBER() OVER (...) ...` | Move window function to a separate column |
 | `FOR UPDATE` / `FOR SHARE` | Rejected — stream tables do not support row-level locking | Remove the locking clause |
 | Unknown node types | Rejected with type information | — |
+
+> **Note:** Window functions inside expressions (e.g., `CASE WHEN ROW_NUMBER() OVER (...) ...`) were unsupported in earlier versions but are now **automatically rewritten** — see [Auto-Rewrite Pipeline § Window Functions in Expressions](#window-functions-in-expressions-auto-rewrite).
 
 ---
 
@@ -1813,6 +1945,42 @@ This ensures changes from child partitions are published under the parent
 table's identity, matching trigger-mode CDC behavior.
 
 > **Note:** pg_trickle targets PostgreSQL 18. On PostgreSQL 12 or earlier (not supported), parent triggers do **not** fire for partition-routed rows, which would cause silent data loss.
+
+### Foreign Tables as Sources
+
+Foreign tables (via `postgres_fdw` or other FDWs) can be used as stream table
+sources with these constraints:
+
+| CDC Method | Supported? | Why |
+|------------|-----------|-----|
+| Trigger-based | ❌ No | Foreign tables don't support row-level triggers |
+| WAL-based | ❌ No | Foreign tables don't generate local WAL entries |
+| FULL refresh | ✅ Yes | Re-executes the remote query each cycle |
+| Polling-based | ✅ Yes | When `pg_trickle.foreign_table_polling = on` |
+
+```sql
+-- Foreign table source — FULL refresh only
+SELECT pgtrickle.create_stream_table(
+    name         => 'remote_summary',
+    query        => 'SELECT region, SUM(amount) FROM remote_orders GROUP BY region',
+    schedule     => '5m',
+    refresh_mode => 'FULL'
+);
+```
+
+When pg_trickle detects a foreign table source, it emits an INFO message
+explaining the constraints. If you attempt to use DIFFERENTIAL mode without
+polling enabled, the creation will succeed but the refresh falls back to FULL.
+
+**Polling-based CDC** creates a local snapshot table and computes `EXCEPT ALL`
+differences on each refresh. Enable with:
+
+```sql
+SET pg_trickle.foreign_table_polling = on;
+```
+
+> For a complete step-by-step setup guide, see the
+> [Foreign Table Sources tutorial](tutorials/FOREIGN_TABLE_SOURCES.md).
 
 ### IMMEDIATE Mode Query Restrictions
 

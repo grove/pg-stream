@@ -1053,9 +1053,9 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DOC-1 | **Show users how ALL-subqueries work.** Once EC-32 lands, add a SQL Reference section explaining `WHERE price > ALL (SELECT ...)`, how pg_trickle rewrites it internally, and a complete worked example with sample data and expected output. | 2h | [GAP_SQL_OVERVIEW.md](plans/sql/GAP_SQL_OVERVIEW.md) |
-| DOC-2 | **Show the window-in-expression pattern.** Once EC-03 lands, add a before/after example to the SQL Reference: "Here's your original query with `CASE WHEN ROW_NUMBER() ...`, and here's what pg_trickle does under the hood to make it work incrementally." | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
-| DOC-3 | **Walkthrough for foreign table sources.** A step-by-step recipe showing how to create a `postgres_fdw` foreign table, use it as a stream table source with polling-based change detection, and what to expect in terms of refresh behaviour. This feature shipped in v0.2.2 but was never properly documented with an example. | 1h | Existing feature (v0.2.2) |
+| DOC-1 | **Show users how ALL-subqueries work.** Once EC-32 lands, add a SQL Reference section explaining `WHERE price > ALL (SELECT ...)`, how pg_trickle rewrites it internally, and a complete worked example with sample data and expected output. | 2h | [GAP_SQL_OVERVIEW.md](plans/sql/GAP_SQL_OVERVIEW.md) | ✅ Done |
+| DOC-2 | **Show the window-in-expression pattern.** Once EC-03 lands, add a before/after example to the SQL Reference: "Here's your original query with `CASE WHEN ROW_NUMBER() ...`, and here's what pg_trickle does under the hood to make it work incrementally." | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 | ✅ Done |
+| DOC-3 | **Walkthrough for foreign table sources.** A step-by-step recipe showing how to create a `postgres_fdw` foreign table, use it as a stream table source with polling-based change detection, and what to expect in terms of refresh behaviour. This feature shipped in v0.2.2 but was never properly documented with an example. | 1h | Existing feature (v0.2.2) | ✅ Done |
 
 > **SQL documentation subtotal: ~5 hours**
 
@@ -1075,7 +1075,7 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [ ] Ergonomics E2E tests for calculated schedule, warnings, and removed GUCs pass
 - [x] `gate_source()` idempotency and re-gating tested; `bootstrap_gate_status()` available
 - [x] dbt `stream_table_status()` and `refresh_all_stream_tables` macros shipped
-- [ ] SQL Reference updated for EC-03, EC-32, and foreign table polling patterns
+- [x] SQL Reference updated for EC-03, EC-32, and foreign table polling patterns
 - [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
 ---

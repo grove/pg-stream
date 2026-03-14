@@ -57,6 +57,30 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   the `stream_table_healthy` generic test.
   Getting Started guide with SQL migration and dbt best practices.
 
+#### SQL Documentation Gaps (DOC-1 through DOC-3)
+
+- **ALL (subquery) documentation (DOC-1).** SQL Reference "Subquery
+  Expressions" section now includes `ALL (subquery)` in the operator table
+  with a complete worked example: source table setup, sample data, stream
+  table creation, expected results, and explanation of the NULL-safe
+  anti-join rewrite (`col IS NULL OR NOT (x op col)`). Common patterns
+  (salary comparisons, rating thresholds) are also shown.
+- **Window functions in expressions documentation (DOC-2).** SQL Reference
+  "Auto-Rewrite Pipeline" section now documents pass #7 — automatic
+  subquery-lift of window functions nested inside expressions (e.g.,
+  `CASE WHEN ROW_NUMBER() ...`, `ABS(RANK() ...)`). Before/after examples
+  show the user's original query and the internal rewrite with synthetic
+  `__pgt_wf_N` columns. The "Unsupported Expression Types" table is updated
+  to reflect that window-in-expression is now supported.
+- **Foreign table sources tutorial (DOC-3).** New
+  `docs/tutorials/FOREIGN_TABLE_SOURCES.md` tutorial with a step-by-step
+  walkthrough: `postgres_fdw` setup, `CREATE FOREIGN TABLE`, stream table
+  creation with FULL refresh, optional polling-based CDC via
+  `pg_trickle.foreign_table_polling`, monitoring commands, a worked
+  inventory dashboard example, constraints table, and FAQ entries. SQL
+  Reference updated with a "Foreign Tables as Sources" section in
+  Restrictions & Interoperability.
+
 #### Partitioning Support (Source Tables)
 
 Stream tables now work with PostgreSQL's declarative table partitioning.
