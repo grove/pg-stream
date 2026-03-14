@@ -230,6 +230,15 @@ v0.4.0 and v0.5.0.
   the source as TRIGGER mode so operators can diagnose why WAL hasn't
   activated. Two new E2E tests verify the health-check output and confirm
   `health_check()` does not flag TRIGGER-mode auto-CDC sources as errors.
+- **EC-03: Window functions inside expressions supported via subquery-lift
+  rewrite.** Queries like `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN 'top'
+  ELSE 'other' END`, `COALESCE(SUM() OVER (...), 0)`, and
+  `ROW_NUMBER() OVER (...) * 10` are now accepted in DIFFERENTIAL mode.
+  The `rewrite_nested_window_exprs()` pass lifts nested window functions
+  into a synthetic inner subquery before the DVM engine processes the query.
+  Nine E2E tests cover CASE, COALESCE, arithmetic, CAST, deeply nested
+  patterns, and data correctness with both FULL and DIFFERENTIAL refresh
+  modes including incremental updates.
 - **EC-34: Missing WAL slot after backup/restore auto-detected with TRIGGER
   fallback.** When a replication slot is lost (e.g. after `pg_basebackup`
   restore), the health check detects the missing slot and

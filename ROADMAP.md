@@ -978,7 +978,7 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC-03 | **Support window functions inside expressions.** Queries like `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN 'first' ELSE 'other' END` are currently rejected because the incremental engine can't handle a window function nested inside a CASE. This automatically extracts the window function into a preliminary step and rewrites the outer query to reference the precomputed result — so the query pattern just works. | 3–5 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
+| ~~EC-03~~ ✅ | ~~**Support window functions inside expressions.** Queries like `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN 'first' ELSE 'other' END` are currently rejected because the incremental engine can't handle a window function nested inside a CASE. This automatically extracts the window function into a preliminary step and rewrites the outer query to reference the precomputed result — so the query pattern just works.~~ | 3–5 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
 | EC-32 | **Support `ALL (subquery)` comparisons.** Queries like `WHERE price > ALL (SELECT price FROM competitors)` (meaning "greater than every row in the subquery") are currently rejected in incremental mode. This rewrites them into an equivalent form the engine can handle, removing a Known Limitation from the changelog. | 2–3 days | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-32 |
 
 > **Edge case hardening subtotal: ~9.5–13.5 days**
@@ -1070,7 +1070,7 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [x] `ALTER FUNCTION` body changes detected via `pg_proc` hash polling (EC-16)
 - [x] Stuck `auto` CDC mode surfaces explanation in logs and health check (EC-18)
 - [x] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)
-- [ ] Window functions in expressions supported via CTE extraction (EC-03)
+- [x] Window functions in expressions supported via subquery-lift rewrite (EC-03)
 - [ ] `ALL (subquery)` rewritten to `NOT EXISTS (... EXCEPT ...)` (EC-32)
 - [ ] Ergonomics E2E tests for calculated schedule, warnings, and removed GUCs pass
 - [x] `gate_source()` idempotency and re-gating tested; `bootstrap_gate_status()` available

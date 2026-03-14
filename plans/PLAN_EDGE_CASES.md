@@ -155,6 +155,18 @@ engine to handle CTEs wrapping window functions — an untested path. The
 subquery produces a nested `Scan → Window → Project` chain that the existing
 DVM path already handles correctly.
 
+**Test coverage:** 9 E2E tests (`e2e_window_tests.rs`):
+- 6 creation-acceptance tests: `test_window_in_case_expression_rejected`,
+  `test_window_in_coalesce_rejected`, `test_window_in_arithmetic_rejected`,
+  `test_window_in_cast_rejected`, `test_window_deeply_nested_rejected`,
+  `test_top_level_window_still_works` (regression).
+- 3 data-correctness tests: `test_ec03_case_window_data_correctness` —
+  CASE + ROW_NUMBER() produces correct tier labels;
+  `test_ec03_arithmetic_window_differential_refresh` — ROW_NUMBER() * 10
+  verified with differential refresh after INSERT;
+  `test_ec03_coalesce_window_data_correctness` — COALESCE(SUM() OVER, 0)
+  produces correct partition sums.
+
 ---
 
 ### EC-04 — Non-monotone recursive CTEs rejected

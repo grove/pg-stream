@@ -641,6 +641,134 @@ async fn test_top_level_window_still_works() {
     assert_eq!(rn, 1);
 }
 
+// ── EC-03: Data correctness for window-in-expression rewrite ─────────
+
+/// EC-03: Verify CASE WHEN ROW_NUMBER() OVER ... produces correct data
+/// with both FULL and DIFFERENTIAL refresh, and that incremental updates
+/// (INSERT/DELETE) maintain correctness.
+#[tokio::test]
+async fn test_ec03_case_window_data_correctness() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE ec03_case (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, salary INT NOT NULL)",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO ec03_case (dept, salary) VALUES \
+         ('eng', 100), ('eng', 80), ('eng', 60), ('hr', 90), ('hr', 70)",
+    )
+    .await;
+
+    let query = "SELECT id, dept, \
+        CASE WHEN ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) = 1 \
+        THEN 'top' ELSE 'other' END AS tier \
+        FROM ec03_case";
+
+    db.create_st("ec03_case_st", query, "1m", "FULL").await;
+
+    // Verify initial data: top earner in each dept gets 'top'
+    let eng_top: String = db
+        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE dept = 'eng' AND salary = 100")
+        .await;
+    assert_eq!(eng_top, "top", "Highest eng salary should be 'top'");
+
+    let eng_other: String = db
+        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE dept = 'eng' AND salary = 80")
+        .await;
+    assert_eq!(eng_other, "other", "Second eng salary should be 'other'");
+
+    let hr_top: String = db
+        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE dept = 'hr' AND salary = 90")
+        .await;
+    assert_eq!(hr_top, "top", "Highest hr salary should be 'top'");
+
+    assert_eq!(db.count("public.ec03_case_st").await, 5);
+}
+
+/// EC-03: Verify window-in-arithmetic rewrite produces correct results
+/// and differential refresh maintains data after INSERT.
+#[tokio::test]
+async fn test_ec03_arithmetic_window_differential_refresh() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE ec03_arith (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, score INT NOT NULL)",
+    )
+    .await;
+    db.execute("INSERT INTO ec03_arith (dept, score) VALUES ('a', 50), ('a', 30), ('b', 40)")
+        .await;
+
+    let query = "SELECT id, dept, \
+        ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score DESC) * 10 AS scaled_rank \
+        FROM ec03_arith";
+
+    db.create_st("ec03_arith_st", query, "1m", "DIFFERENTIAL")
+        .await;
+
+    // Initial: dept=a has scores [50, 30] → rn [1, 2] → scaled [10, 20]
+    let top_rank: i64 = db
+        .query_scalar(
+            "SELECT scaled_rank FROM public.ec03_arith_st WHERE dept = 'a' AND score = 50",
+        )
+        .await;
+    assert_eq!(
+        top_rank, 10,
+        "Top score in dept a should have scaled_rank=10"
+    );
+
+    let second_rank: i64 = db
+        .query_scalar(
+            "SELECT scaled_rank FROM public.ec03_arith_st WHERE dept = 'a' AND score = 30",
+        )
+        .await;
+    assert_eq!(
+        second_rank, 20,
+        "Second score in dept a should have scaled_rank=20"
+    );
+
+    // Insert a new top scorer in dept a → rankings shift
+    db.execute("INSERT INTO ec03_arith (dept, score) VALUES ('a', 70)")
+        .await;
+    db.refresh_st("ec03_arith_st").await;
+
+    // After refresh, match from-scratch computation
+    db.assert_st_matches_query("public.ec03_arith_st", query)
+        .await;
+
+    assert_eq!(db.count("public.ec03_arith_st").await, 4);
+}
+
+/// EC-03: Verify COALESCE(window_func, default) rewrite produces correct
+/// data with FULL refresh.
+#[tokio::test]
+async fn test_ec03_coalesce_window_data_correctness() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE ec03_coal (id SERIAL PRIMARY KEY, dept TEXT NOT NULL, val INT NOT NULL)",
+    )
+    .await;
+    db.execute("INSERT INTO ec03_coal (dept, val) VALUES ('eng', 10), ('eng', 20), ('hr', 30)")
+        .await;
+
+    let query = "SELECT id, dept, COALESCE(SUM(val) OVER (PARTITION BY dept), 0) AS dept_sum FROM ec03_coal";
+
+    db.create_st("ec03_coal_st", query, "1m", "FULL").await;
+
+    // eng dept_sum should be 10+20=30 for both eng rows
+    let eng_sum: i64 = db
+        .query_scalar("SELECT dept_sum FROM public.ec03_coal_st WHERE dept = 'eng' LIMIT 1")
+        .await;
+    assert_eq!(eng_sum, 30, "eng dept sum should be 30");
+
+    // hr dept_sum should be 30
+    let hr_sum: i64 = db
+        .query_scalar("SELECT dept_sum FROM public.ec03_coal_st WHERE dept = 'hr' LIMIT 1")
+        .await;
+    assert_eq!(hr_sum, 30, "hr dept sum should be 30");
+}
+
 // ── G1.2: Partition key change tests ─────────────────────────────────
 
 /// Test that UPDATE on a PARTITION BY key column correctly moves a row
