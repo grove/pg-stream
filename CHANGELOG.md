@@ -127,12 +127,12 @@ end-to-end refresh latency when you have many independent stream tables.
 - **Self-healing.** On startup, the scheduler automatically cleans up orphaned
   jobs and reclaims leaked worker slots from previous crashes.
 
-#### CDC Benchmark Harness
+#### Statement-Level CDC Triggers
 
-New benchmark tests to measure the write-side overhead of change tracking.
-Compares statement-level triggers (v0.4.0 default) against the older
-row-level triggers across different table widths and DML patterns. Useful for
-validating performance on your own hardware.
+Change tracking triggers have been upgraded from row-level to statement-level,
+reducing write-side overhead for bulk INSERT and UPDATE operations. This is
+now the default for all new and existing stream tables. A benchmark harness is
+included so you can measure the difference on your own hardware.
 
 #### dbt Getting Started Example
 
@@ -151,35 +151,52 @@ refreshes for that stream table to report "another refresh is already in
 progress". Refresh locks are now transaction-level, so they are automatically
 released when the transaction ends — whether it succeeds or fails.
 
-#### HAVING Clause Correctness
+#### dbt Integration Fixes
 
-Fixed incremental maintenance of queries with `HAVING` filters (e.g.
-`HAVING SUM(amount) > 100`). Two bugs caused wrong results when groups
-crossed the threshold — for example, a group gaining enough rows to meet the
-HAVING condition would show only the newly added values instead of the
-correct total. Both issues are now fixed, and 5 previously-disabled tests
-have been re-enabled.
+- Fixed query quoting in dbt macros that broke when queries contained single
+  quotes.
+- Fixed `schedule = none` in dbt being incorrectly mapped to SQL NULL.
+- Fixed view inlining when the same view was referenced with different aliases.
 
-#### FULL OUTER JOIN Correctness
+### Changed
 
-Fixed five bugs affecting incremental updates for `FULL OUTER JOIN` queries.
-Problems included mismatched row identifiers between full and incremental
-refreshes, incorrect handling of compound GROUP BY expressions like
-`COALESCE(left.col, right.col)`, and wrong NULL handling for SUM aggregates.
-Five previously-disabled tests have been re-enabled.
+- Updated to PostgreSQL 18.3 across CI and test infrastructure.
+- Dependency updates: `tokio` 1.49 → 1.50 and several GitHub Actions bumps.
 
-#### EXISTS with HAVING Subqueries
+---
 
-Fixed incremental maintenance of queries using `WHERE EXISTS(... GROUP BY ...
-HAVING ...)`. The inner GROUP BY and HAVING were being silently discarded,
-producing wrong results. One previously-disabled test has been re-enabled.
+## [0.3.0] — 2026-03-11
 
-#### Correlated Scalar Subqueries
+This is a correctness and hardening release. No new SQL functions, tables, or
+views were added — all changes are in the compiled extension code.
+`ALTER EXTENSION pg_trickle UPDATE` is safe and a no-op for schema objects.
 
-Fixed incremental maintenance of correlated scalar subqueries in SELECT, like
-`(SELECT MAX(e.salary) FROM emp e WHERE e.dept_id = d.id)`. These are now
-automatically rewritten into LEFT JOINs so the incremental engine can handle
-them correctly. Two previously-disabled tests have been re-enabled.
+### Fixed
+
+#### Incremental Correctness Fixes
+
+All 18 previously-disabled correctness tests have been re-enabled (0
+remaining). The following query patterns now produce correct results during
+incremental (non-full) refreshes:
+
+- **HAVING clause threshold crossing.** Queries with `HAVING` filters (e.g.
+  `HAVING SUM(amount) > 100`) now produce correct totals when groups cross
+  the threshold. Previously, a group gaining enough rows to meet the condition
+  would show only the newly added values instead of the correct total.
+
+- **FULL OUTER JOIN.** Five bugs affecting incremental updates for
+  `FULL OUTER JOIN` queries are fixed: mismatched row identifiers, incorrect
+  handling of compound GROUP BY expressions like
+  `COALESCE(left.col, right.col)`, and wrong NULL handling for SUM aggregates.
+
+- **EXISTS with HAVING subqueries.** Queries using
+  `WHERE EXISTS(... GROUP BY ... HAVING ...)` now work correctly — the inner
+  GROUP BY and HAVING were previously being silently discarded.
+
+- **Correlated scalar subqueries.** Correlated subqueries in SELECT like
+  `(SELECT MAX(e.salary) FROM emp e WHERE e.dept_id = d.id)` are now
+  automatically rewritten into LEFT JOINs so the incremental engine can
+  handle them correctly.
 
 #### Background Worker Detection on PostgreSQL 18
 
@@ -191,19 +208,7 @@ workers on PostgreSQL 18 due to a column name change in system views.
 Fixed a loop where the scheduler launcher could get stuck retrying failed
 database probes indefinitely instead of backing off properly.
 
-#### dbt Integration Fixes
-
-- Fixed query quoting in dbt macros that broke when queries contained single
-  quotes.
-- Fixed `schedule = none` in dbt being incorrectly mapped to SQL NULL.
-- Fixed view inlining when the same view was referenced with different aliases.
-
-### Changed
-
-- All 18 previously-disabled correctness tests have been re-enabled (0
-  remaining).
-- Updated to PostgreSQL 18.3 across CI and test infrastructure.
-- Dependency updates: `tokio` 1.49 → 1.50 and several GitHub Actions bumps.
+### Added
 
 #### Security Tooling
 
@@ -216,6 +221,9 @@ Added static security analysis to the CI pipeline:
 - **Semgrep** — custom rules that flag potentially dangerous patterns such as
   dynamic SQL construction and privilege escalation. Advisory-only (does not
   block merges).
+- **Unsafe block inventory** — CI tracks the count of unsafe code blocks per
+  file and fails if any file exceeds its baseline, preventing unreviewed
+  growth of low-level code.
 
 ## [0.2.3] — 2026-03-09
 
