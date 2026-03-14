@@ -99,6 +99,34 @@ infrastructure.
   - `pg_trickle.allow_circular` (default false) — master switch; circular
     dependencies are rejected unless explicitly enabled.
 
+#### Ergonomics Follow-Up (ERG-T1 through ERG-T5)
+
+Regression tests and documentation for ergonomic improvements shipped in
+v0.4.0 and v0.5.0.
+
+- **ERG-T1: Smart schedule default tests.** E2E tests verify that
+  `schedule => 'calculated'` is accepted, `schedule => NULL` is rejected
+  with a clear error, the default schedule omission works, and
+  `alter_stream_table` can switch to CALCULATED mode.
+
+- **ERG-T2: Removed GUC tests.** E2E tests confirm that
+  `SHOW pg_trickle.diamond_consistency` and
+  `SHOW pg_trickle.diamond_schedule_policy` return "unrecognized
+  configuration parameter" errors — preventing these removed GUCs from
+  silently reappearing.
+
+- **ERG-T3: Full-refresh warning tests.** E2E tests verify that changing
+  a stream table's refresh mode or defining query via `alter_stream_table`
+  emits a WARNING about the implicit full refresh, and that same-mode alters
+  do not.
+
+- **ERG-T4: WAL configuration warning test.** E2E test confirms that no
+  spurious WAL-level warning is emitted when `wal_level = logical`.
+
+- **ERG-T5: Breaking changes documented.** v0.4.0 CHANGELOG updated with a
+  "Breaking Changes" section covering the schedule default change, NULL
+  schedule rejection, and diamond GUC removal.
+
 ### Fixed
 
 - **`create_or_replace` whitespace normalization.** Cosmetic SQL differences
@@ -261,6 +289,27 @@ released when the transaction ends — whether it succeeds or fails.
 
 - Updated to PostgreSQL 18.3 across CI and test infrastructure.
 - Dependency updates: `tokio` 1.49 → 1.50 and several GitHub Actions bumps.
+
+### Breaking Changes
+
+These behavioural changes shipped in v0.4.0. They improve usability but may
+require action from users upgrading from v0.3.0.
+
+- **Schedule default changed from `'1m'` to `'calculated'`.**
+  `create_stream_table` now defaults to `schedule => 'calculated'`, which
+  auto-computes the refresh interval from downstream dependents instead of
+  refreshing every 1 minute. If you relied on the implicit 1-minute default,
+  explicitly pass `schedule => '1m'` to preserve the old behaviour.
+
+- **`NULL` schedule input rejected.** Passing `schedule => NULL` to
+  `create_stream_table` now returns an error. Use `schedule => 'calculated'`
+  instead — it's explicit and self-documenting.
+
+- **Diamond GUCs removed.** The cluster-wide GUCs
+  `pg_trickle.diamond_consistency` and `pg_trickle.diamond_schedule_policy`
+  have been removed. Diamond behaviour is now controlled per-table via
+  parameters on `create_stream_table()` / `alter_stream_table()`:
+  `diamond_consistency => 'atomic'`, `diamond_schedule_policy => 'slowest'`.
 
 ---
 

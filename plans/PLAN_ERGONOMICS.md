@@ -18,13 +18,13 @@ items implemented 2026-03-11. See git history for details.
 | ERG-D — Record manual `refresh_stream_table()` in pgt_refresh_history with `initiated_by='MANUAL'` | ✅ Done |
 | ERG-E — `pgtrickle.quick_health` view (single-row status summary) | ✅ Done |
 
-### Remaining follow-up (not blocking)
+### Remaining follow-up ✅ (completed 2026-03-14)
 
-- E2E tests for `'calculated'` as schedule input (verify `NULL` input is rejected)
-- E2E test that `SHOW pg_trickle.diamond_consistency` returns an error
-- Update CHANGELOG.md with breaking behavioural changes (default schedule, NULL rejection)
-- E2E test for ERG-B warning (assert WARNING appears in server log when `wal_level != logical`)
-- E2E test for ERG-F warning (assert WARNING in client output when `alter_stream_table` with `query =>`)
+- ✅ E2E tests for `'calculated'` as schedule input (verify `NULL` input is rejected) — ERG-T1
+- ✅ E2E test that `SHOW pg_trickle.diamond_consistency` returns an error — ERG-T2
+- ✅ Update CHANGELOG.md with breaking behavioural changes (default schedule, NULL rejection) — ERG-T5
+- ✅ E2E test for ERG-B warning (assert WARNING appears in server log when `wal_level != logical`) — ERG-T4
+- ✅ E2E test for ERG-F warning (assert WARNING in client output when `alter_stream_table` with `query =>`) — ERG-T3
 
 ---
 
