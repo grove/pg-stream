@@ -667,21 +667,32 @@ async fn test_ec03_case_window_data_correctness() {
 
     db.create_st("ec03_case_st", query, "1m", "FULL").await;
 
-    // Verify initial data: top earner in each dept gets 'top'
+    // Verify initial data: top earner in each dept gets 'top'.
+    // Use id (which is in the SELECT) rather than salary (not selected).
+    // INSERT order: id=1 eng/100, id=2 eng/80, id=3 eng/60, id=4 hr/90, id=5 hr/70
     let eng_top: String = db
-        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE dept = 'eng' AND salary = 100")
+        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE id = 1")
         .await;
-    assert_eq!(eng_top, "top", "Highest eng salary should be 'top'");
+    assert_eq!(
+        eng_top, "top",
+        "Highest eng salary (id=1, salary=100) should be 'top'"
+    );
 
     let eng_other: String = db
-        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE dept = 'eng' AND salary = 80")
+        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE id = 2")
         .await;
-    assert_eq!(eng_other, "other", "Second eng salary should be 'other'");
+    assert_eq!(
+        eng_other, "other",
+        "Second eng salary (id=2, salary=80) should be 'other'"
+    );
 
     let hr_top: String = db
-        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE dept = 'hr' AND salary = 90")
+        .query_scalar("SELECT tier FROM public.ec03_case_st WHERE id = 4")
         .await;
-    assert_eq!(hr_top, "top", "Highest hr salary should be 'top'");
+    assert_eq!(
+        hr_top, "top",
+        "Highest hr salary (id=4, salary=90) should be 'top'"
+    );
 
     assert_eq!(db.count("public.ec03_case_st").await, 5);
 }
@@ -707,24 +718,22 @@ async fn test_ec03_arithmetic_window_differential_refresh() {
         .await;
 
     // Initial: dept=a has scores [50, 30] → rn [1, 2] → scaled [10, 20]
+    // Use id (which is in the SELECT) rather than score (not selected).
+    // INSERT order: id=1 a/50, id=2 a/30, id=3 b/40
     let top_rank: i64 = db
-        .query_scalar(
-            "SELECT scaled_rank FROM public.ec03_arith_st WHERE dept = 'a' AND score = 50",
-        )
+        .query_scalar("SELECT scaled_rank FROM public.ec03_arith_st WHERE id = 1")
         .await;
     assert_eq!(
         top_rank, 10,
-        "Top score in dept a should have scaled_rank=10"
+        "Top score in dept a (id=1, score=50) should have scaled_rank=10"
     );
 
     let second_rank: i64 = db
-        .query_scalar(
-            "SELECT scaled_rank FROM public.ec03_arith_st WHERE dept = 'a' AND score = 30",
-        )
+        .query_scalar("SELECT scaled_rank FROM public.ec03_arith_st WHERE id = 2")
         .await;
     assert_eq!(
         second_rank, 20,
-        "Second score in dept a should have scaled_rank=20"
+        "Second score in dept a (id=2, score=30) should have scaled_rank=20"
     );
 
     // Insert a new top scorer in dept a → rankings shift

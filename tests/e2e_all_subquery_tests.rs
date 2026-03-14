@@ -162,12 +162,12 @@ async fn test_all_subquery_null_in_inner() {
         "No rows should match when subquery contains NULL"
     );
 
-    // Remove the NULL row — now val=100 qualifies again
+    // Remove the NULL row — now both val=100 and val=50 qualify (> 30)
     db.execute("DELETE FROM all_nullt WHERE id = 2").await;
     db.refresh_st("all_null_st").await;
 
     db.assert_st_matches_query("public.all_null_st", q).await;
-    assert_eq!(db.count("public.all_null_st").await, 1);
+    assert_eq!(db.count("public.all_null_st").await, 2);
 }
 
 /// EC-32: ALL with empty subquery — per SQL standard, `x > ALL (empty)` is true.

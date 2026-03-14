@@ -526,7 +526,12 @@ fn rewrite_expr_for_join(
 
                 if is_simple {
                     // Simple: replace alias.col → new_alias.col
-                    // Match both alias."col" and alias.col patterns
+                    // Match both alias."col" and alias.col patterns.
+                    // Also handle quoted form: "alias"."col" → "new_alias"."col"
+                    // (Expr::ColumnRef::to_sql() emits double-quoted identifiers)
+                    let quoted_pattern = format!("\"{}\".", alias.replace('"', "\"\""));
+                    let quoted_replacement = format!("\"{}\".", new_alias.replace('"', "\"\""));
+                    result = result.replace(&quoted_pattern, &quoted_replacement);
                     let pattern = format!("{}.", alias);
                     let replacement = format!("{}.", new_alias);
                     result = result.replace(&pattern, &replacement);
@@ -535,6 +540,11 @@ fn rewrite_expr_for_join(
                     // This is harder in raw SQL — we do a conservative
                     // pattern replacement for alias."col" → new_alias."alias__col"
                     // and alias.col → new_alias."alias__col"
+                    // Also handle quoted form "alias"."col"
+                    let quoted_prefix = format!("\"{}\".", alias.replace('"', "\"\""));
+                    if result.contains(&quoted_prefix) {
+                        result = rewrite_raw_quoted_alias_refs(&result, &alias, new_alias);
+                    }
                     let dot_prefix = format!("{}.", alias);
                     if result.contains(&dot_prefix) {
                         // Replace qualified references carefully
@@ -628,6 +638,54 @@ fn rewrite_raw_alias_refs(sql: &str, old_alias: &str, new_alias: &str) -> String
     }
 
     // Append the rest
+    result.push_str(remaining);
+    result
+}
+
+/// Rewrite `"alias"."col"` patterns (double-quoted form from `Expr::to_sql()`)
+/// to `new_alias."alias__col"` for nested join disambiguation.
+fn rewrite_raw_quoted_alias_refs(sql: &str, bare_alias: &str, new_alias: &str) -> String {
+    let prefix = format!("\"{}\".", bare_alias.replace('"', "\"\""));
+    let mut result = String::with_capacity(sql.len());
+    let mut remaining = sql;
+
+    while let Some(pos) = remaining.find(&prefix) {
+        result.push_str(&remaining[..pos]);
+        remaining = &remaining[pos + prefix.len()..];
+
+        // After "alias"., expect a quoted column name "col"
+        let col_name = if remaining.starts_with('"') {
+            if let Some(end) = remaining[1..].find('"') {
+                let name = &remaining[1..1 + end];
+                remaining = &remaining[2 + end..];
+                name.to_string()
+            } else {
+                result.push_str(&prefix);
+                continue;
+            }
+        } else {
+            // Unquoted identifier after quoted alias
+            let end = remaining
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(remaining.len());
+            if end == 0 {
+                result.push_str(&prefix);
+                continue;
+            }
+            let name = &remaining[..end];
+            remaining = &remaining[end..];
+            name.to_string()
+        };
+
+        // Emit: new_alias."bare_alias__col"
+        result.push_str(&format!(
+            "{}.\"{}__{}\"",
+            new_alias,
+            bare_alias.replace('"', "\"\""),
+            col_name.replace('"', "\"\""),
+        ));
+    }
+
     result.push_str(remaining);
     result
 }
@@ -1200,5 +1258,52 @@ mod tests {
         let node = inner_join(eq_cond("a", "id", "b", "id"), o, c);
         let exprs = build_base_table_key_exprs(&node, "l");
         assert_eq!(exprs, vec!["row_to_json(l)::text"]);
+    }
+
+    // ── Raw SQL alias rewriting (quoted identifiers) ────────────
+
+    #[test]
+    fn test_rewrite_raw_with_quoted_aliases() {
+        // Simulates the Expr::Raw produced by parse_all_sublink:
+        // Expr::ColumnRef::to_sql() emits "alias"."col" (double-quoted).
+        let left = scan(1, "products", "public", "p", &["id", "price"]);
+        let right = scan(2, "competitors", "public", "c", &["price"]);
+        let raw_cond =
+            Expr::Raw(r#"(("c"."price") IS NULL OR NOT ("p"."price" < "c"."price"))"#.to_string());
+        let rewritten = rewrite_join_condition(&raw_cond, &left, "dl", &right, "r");
+        // "p" → "dl", "c" → "r"
+        assert!(
+            rewritten.contains("\"dl\".\"price\""),
+            "expected dl.price, got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("\"r\".\"price\""),
+            "expected r.price, got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("\"p\"."),
+            "should not contain old alias p, got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("\"c\"."),
+            "should not contain old alias c, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_raw_with_mixed_quoted_and_unquoted() {
+        let left = scan(1, "t1", "public", "a", &["id"]);
+        let right = scan(2, "t2", "public", "b", &["val"]);
+        // Mix of quoted and unquoted references
+        let raw = Expr::Raw(r#"("a"."id" = b.val AND a.id > 0)"#.to_string());
+        let rewritten = rewrite_join_condition(&raw, &left, "dl", &right, "r");
+        assert!(
+            !rewritten.contains("\"a\"."),
+            "should not contain old alias a (quoted), got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("b."),
+            "should not contain old alias b, got: {rewritten}"
+        );
     }
 }
