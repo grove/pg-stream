@@ -880,8 +880,9 @@ intersects the current gated set.
 
 **Goal:** Validate partitioned source tables, add `create_or_replace_stream_table`
 for idempotent deployments (critical for dbt and migration workflows), close all
-remaining P0/P1 edge cases and two usability-tier gaps, and lay the foundation
-for circular stream table DAGs.
+remaining P0/P1 edge cases and two usability-tier gaps, ship ready-made
+Prometheus/Grafana monitoring, harden ergonomics and source gating, expand the
+dbt integration, and lay the foundation for circular stream table DAGs.
 
 ### Partitioning Support (Source Tables)
 
@@ -982,7 +983,126 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 > **Edge case hardening subtotal: ~9.5–13.5 days**
 
-> **v0.6.0 total: ~45–65h**
+### Prometheus & Grafana Observability
+
+> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
+> their databases. This ships ready-to-use configuration files — no custom
+> code, no extension changes — that plug into the standard `postgres_exporter`
+> and light up a Grafana dashboard showing refresh latency, staleness, error
+> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
+> alerting rules so you get paged when a stream table goes stale or starts
+> error-looping. A Docker Compose file lets you try the full observability
+> stack with a single `docker compose up`.
+
+Zero-code monitoring integration. All config files live in a new
+`monitoring/` directory in the main repo (or a separate
+`pgtrickle-monitoring` repo). Queries use existing views
+(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OBS-1 | `pgtrickle_queries.yml` — `postgres_exporter` custom queries config exposing refresh stats, staleness, CDC lag, and CDC alerts as Prometheus metrics | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-2 | `alerts.yml` — Prometheus alerting rules: `PgTrickleTableStale` (5m), `PgTrickleConsecutiveErrors` (≥3), `PgTrickleCdcLagHigh` (>1 GB), `PgTrickleCdcAlert` | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-3 | Grafana dashboard JSON — 5 rows: overview stats, refresh performance, staleness trends, CDC health, and per-table drill-down with a `$stream_table` variable | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+| OBS-4 | `docker-compose.yml` — one-command demo stack (PostgreSQL + pg_trickle + postgres_exporter + Prometheus + Grafana) for quick evaluation | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+
+> **Observability subtotal: ~12 hours**
+
+### Ergonomics Follow-Up
+
+> **In plain terms:** Several test gaps and a documentation item were left
+> over from the v0.5.0 ergonomics work. These are all small E2E tests that
+> confirm existing features actually produce the warnings and errors they're
+> supposed to — catching regressions before users hit them. The changelog
+> entry documents breaking behavioural changes (the default schedule changed
+> from a fixed "every 1 minute" to an auto-calculated interval, and `NULL`
+> schedule input is now rejected).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ERG-T1 | E2E test: verify `'calculated'` is accepted as schedule input and `NULL` is rejected with a clear error | 4h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T2 | E2E test: verify `SHOW pg_trickle.diamond_consistency` returns an error (GUC was removed in v0.4.0; users shouldn't see a stale setting) | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T3 | E2E test: verify `alter_stream_table(query => ...)` emits a WARNING when triggering an implicit full refresh (ERG-F) | 3h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T4 | E2E test: verify startup WARNING appears when `cdc_mode='auto'` but `wal_level != 'logical'` (ERG-B) | 3h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+| ERG-T5 | CHANGELOG: document breaking behavioural changes from v0.4.0+ (default schedule changed to `'calculated'`, `NULL` schedule rejected) | 2h | [PLAN_ERGONOMICS.md](plans/PLAN_ERGONOMICS.md) §Remaining follow-up |
+
+> **Ergonomics follow-up subtotal: ~14 hours**
+
+### Bootstrap Source Gating Follow-Up
+
+> **In plain terms:** Source gating (pause/resume for bulk loads) shipped in
+> v0.5.0 with the core API and scheduler integration. This follow-up adds
+> robustness tests for edge cases that real-world ETL pipelines will hit:
+> What happens if you gate a source twice? What if you re-gate it after
+> ungating? It also adds a dedicated introspection function that shows the
+> full gate lifecycle (when gated, who gated it, how long it's been gated),
+> and documentation showing common ETL coordination patterns like
+> "gate → bulk load → ungate → single clean refresh."
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| BOOT-F1 | E2E tests: verify `gate_source()` is idempotent — calling it twice is a safe no-op, not an error | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-F2 | E2E tests: re-gating scenario — gate a source, ungate it, gate it again; verify scheduler skips correctly each time | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-F3 | `bootstrap_gate_status()` introspection function returning gate state, duration, and lifecycle timestamps per source | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-F4 | Documentation: ETL coordination patterns — single-source gate, multi-source coordinated gate, partial DAG gating, nightly-batch recipe | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+
+> **Bootstrap gating follow-up subtotal: ~12 hours**
+
+### dbt Integration Enhancements
+
+> **In plain terms:** The dbt macro package (`dbt-pgtrickle`) shipped in
+> v0.4.0 with the core `stream_table` materialization. This adds three
+> improvements: a `stream_table_status` macro that lets dbt models query
+> health information (stale? erroring? how many refreshes?) so you can build
+> dbt tests that fail when a stream table is unhealthy; a bulk
+> `refresh_all_stream_tables` operation for CI pipelines that need everything
+> fresh before running tests; and expanded integration tests covering the
+> `alter_stream_table` flow (which gets more important once
+> `create_or_replace` lands in the same release).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DBT-1 | `stream_table_status()` macro — queries `pg_stat_stream_tables` and returns status, staleness, error count, and refresh mode for a named stream table. Enables dbt tests like `{{ assert_not_stale('my_st') }}` | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+| DBT-2 | `refresh_all_stream_tables` run-operation — refreshes all stream tables in DAG order; useful in CI where every model needs to be fresh before assertions run | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+| DBT-3 | Integration tests: `alter_stream_table` scenarios — verify query changes, config changes, and mode switches work correctly through the dbt materialization macro | 3h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 1 |
+
+> **dbt integration subtotal: ~8 hours**
+
+### SQL Documentation Gaps
+
+> **In plain terms:** Once EC-03 (window functions in expressions) and EC-32
+> (`ALL (subquery)`) are implemented in this release, the documentation needs
+> to explain the new patterns with examples. The foreign table polling CDC
+> feature (shipped in v0.2.2) also needs a worked example showing common
+> setups like `postgres_fdw` source tables with periodic polling.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DOC-1 | SQL Reference: document `ALL (subquery)` semantics, rewrite mechanics, and worked example (post-EC-32) | 2h | [GAP_SQL_OVERVIEW.md](plans/sql/GAP_SQL_OVERVIEW.md) |
+| DOC-2 | SQL Reference: document window-function-in-expression CTE extraction with before/after examples (post-EC-03) | 2h | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-03 |
+| DOC-3 | FAQ / Getting Started: worked example of `postgres_fdw` foreign table as source with polling-based CDC | 1h | Existing feature (v0.2.2) |
+
+> **SQL documentation subtotal: ~5 hours**
+
+### Pre-1.0 Infrastructure Prep
+
+> **In plain terms:** Three preparatory tasks that make the eventual 1.0
+> release smoother. A draft Docker Hub image workflow (tests the build but
+> doesn't publish yet); a PGXN metadata file so the extension can eventually
+> be installed with `pgxn install pg_trickle`; and a basic CNPG integration
+> test that verifies the extension image loads correctly in a CloudNativePG
+> cluster. None of these ship user-facing features — they're CI and
+> packaging scaffolding.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| INFRA-1 | Draft Docker Hub image workflow — builds the image, runs a smoke test (`CREATE EXTENSION`, basic stream table), but does **not** publish. Validates the Dockerfile and build matrix. | 5h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
+| INFRA-2 | Draft `META.json` for PGXN — fill in the metadata structure so publishing is a one-command step when 1.0 is ready | 2h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| INFRA-3 | CNPG integration smoke test — CI job that deploys the extension image into a CNPG cluster, creates a stream table, and verifies a refresh cycle completes | 4h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+
+> **Infrastructure prep subtotal: ~11 hours**
+
+> **v0.6.0 total: ~100–115h**
 
 **Exit criteria:**
 - [ ] Partitioned source tables E2E-tested; ATTACH PARTITION detected
@@ -995,6 +1115,12 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [ ] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)
 - [ ] Window functions in expressions supported via CTE extraction (EC-03)
 - [ ] `ALL (subquery)` rewritten to `NOT EXISTS (... EXCEPT ...)` (EC-32)
+- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
+- [ ] Ergonomics E2E tests for calculated schedule, warnings, and removed GUCs pass
+- [ ] `gate_source()` idempotency and re-gating tested; `bootstrap_gate_status()` available
+- [ ] dbt `stream_table_status()` and `refresh_all_stream_tables` macros shipped
+- [ ] SQL Reference updated for EC-03, EC-32, and foreign table polling patterns
+- [ ] Docker Hub image draft workflow passes; PGXN `META.json` drafted
 - [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)
 
 ---
