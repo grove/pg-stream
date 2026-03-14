@@ -532,6 +532,13 @@ sneaks in between lock acquisition and first read.
 2. **Medium term:** Automatically issue `ALTER TABLE … REPLICA IDENTITY
    FULL` for keyless tables when entering WAL mode (with a NOTICE).
 
+**Test coverage:** 2 E2E tests (`e2e_create_tests.rs`):
+- `test_ec19_wal_keyless_without_replica_identity_full_rejected` — verifies
+  that `create_stream_table(cdc_mode => 'wal')` on a keyless table without
+  REPLICA IDENTITY FULL is rejected with a clear error.
+- `test_ec19_wal_keyless_with_replica_identity_full_accepted` — verifies
+  that the same combination succeeds once REPLICA IDENTITY FULL is set.
+
 ---
 
 ### EC-20 — CDC TRANSITIONING phase complexity

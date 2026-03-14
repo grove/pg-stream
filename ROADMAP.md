@@ -964,7 +964,7 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| EC-19 | **Prevent silent data corruption with WAL + keyless tables.** If you use WAL-based change tracking on a table without a primary key, PostgreSQL needs `REPLICA IDENTITY FULL` to send complete row data. Without it, deltas are silently incomplete. This rejects the combination at creation time with a clear error instead of producing wrong results. | 0.5 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-19 |
+| ~~EC-19~~ ✅ | ~~**Prevent silent data corruption with WAL + keyless tables.** If you use WAL-based change tracking on a table without a primary key, PostgreSQL needs `REPLICA IDENTITY FULL` to send complete row data. Without it, deltas are silently incomplete. This rejects the combination at creation time with a clear error instead of producing wrong results.~~ | 0.5 day | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-19 |
 
 #### P1 — Operational Safety
 
@@ -1066,7 +1066,7 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [x] WAL mode works with `publish_via_partition_root = true`
 - [x] `create_or_replace_stream_table` deployed; dbt macro updated
 - [ ] SCC algorithm in place; monotonicity checker rejects non-monotone cycles
-- [ ] WAL + keyless without REPLICA IDENTITY FULL rejected at creation (EC-19)
+- [x] WAL + keyless without REPLICA IDENTITY FULL rejected at creation (EC-19)
 - [ ] `ALTER FUNCTION` body changes detected via `pg_proc` hash polling (EC-16)
 - [ ] Stuck `auto` CDC mode surfaces explanation in logs and health check (EC-18)
 - [ ] Missing WAL slot after restore auto-detected with TRIGGER fallback (EC-34)

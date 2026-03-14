@@ -197,6 +197,17 @@ v0.4.0 and v0.5.0.
   "Breaking Changes" section covering the schedule default change, NULL
   schedule rejection, and diamond GUC removal.
 
+#### Edge Case Hardening — P0 Data Correctness
+
+- **EC-19: WAL + keyless tables without REPLICA IDENTITY FULL rejected at
+  creation time.** When `cdc_mode = 'wal'` is requested for a source table
+  that has no primary key and does not have `REPLICA IDENTITY FULL`,
+  `create_stream_table()` now rejects with a clear error explaining the fix
+  (`ALTER TABLE ... REPLICA IDENTITY FULL`). Without this guard, WAL-based
+  CDC silently produces incomplete deltas for UPDATE/DELETE operations on
+  keyless tables, leading to data corruption. Two new E2E tests verify both
+  the rejection path and the acceptance path with REPLICA IDENTITY FULL set.
+
 ### Fixed
 
 - **`create_or_replace` whitespace normalization.** Cosmetic SQL differences
