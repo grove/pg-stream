@@ -121,6 +121,30 @@ infrastructure.
   - `pg_trickle.allow_circular` (default false) — master switch; circular
     dependencies are rejected unless explicitly enabled.
 
+#### Bootstrap Source Gating Follow-Up
+
+- **`bootstrap_gate_status()` introspection function (BOOT-F3).** New
+  `pgtrickle.bootstrap_gate_status()` returns a rich view of all source
+  gates including computed `gate_duration` (how long each gate has been
+  active) and `affected_stream_tables` (which stream tables are blocked).
+  Useful for debugging "why isn't my stream table refreshing?" situations.
+  Upgrade SQL migration: `sql/pg_trickle--0.5.0--0.6.0.sql`.
+
+- **Enhanced idempotency tests (BOOT-F1).** Verified that calling
+  `gate_source()` twice refreshes the `gated_at` timestamp, preserves
+  `gated_by`, and keeps `ungated_at` NULL. Confirms the UPSERT behavior
+  is safe for retrying ETL scripts.
+
+- **Full gate lifecycle tests (BOOT-F2).** Verified the complete
+  gate → ungate → re-gate cycle: `ungated_at` is cleared on re-gate,
+  manual refresh works at every lifecycle stage, and the mechanism is
+  reusable across multiple load cycles.
+
+- **ETL coordination cookbook (BOOT-F4).** SQL Reference now includes
+  five step-by-step recipes: single source bulk load, coordinated
+  multi-source load, gate + deferred initialization, nightly batch
+  pattern, and monitoring during gated loads.
+
 #### Ergonomics Follow-Up (ERG-T1 through ERG-T5)
 
 Regression tests and documentation for ergonomic improvements shipped in

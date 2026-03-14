@@ -1,10 +1,13 @@
-//! E2E tests for Bootstrap Source Gating (v0.5.0, Phase 3).
+//! E2E tests for Bootstrap Source Gating (v0.5.0, Phase 3) and Follow-Up (v0.6.0).
 //!
 //! Validates:
 //! - BOOT-2: `gate_source()` inserts into `pgt_source_gates`
 //! - BOOT-3: `ungate_source()` marks gated=false; `source_gates()` returns current status
 //! - BOOT-4: Scheduler logs SKIP in `pgt_refresh_history` for gated sources;
 //!   manual refresh is NOT blocked by gates
+//! - BOOT-F1: Idempotent `gate_source()` refreshes timestamp and preserves state
+//! - BOOT-F2: Full gate → ungate → re-gate lifecycle with manual refresh
+//! - BOOT-F3: `bootstrap_gate_status()` introspection function
 //! - Edge cases: idempotent gating, re-gating after ungate, non-existent table
 //!
 //! Prerequisites: `just build-e2e-image` (for scheduler tests)
@@ -183,6 +186,313 @@ async fn test_multiple_sources_gated() {
         .await;
 
     assert_eq!(gated_count, 2, "both sources should appear as gated");
+}
+
+// ── BOOT-F1: Enhanced idempotency tests ────────────────────────────────────
+
+/// BOOT-F1: Double-gating refreshes gated_at timestamp and gated_by.
+///
+/// When gate_source() is called twice, the second call should update
+/// gated_at to a newer timestamp (proving it's an UPSERT, not a skip).
+#[tokio::test]
+async fn test_idempotent_gate_refreshes_timestamp() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE idem_ts_src (id INT PRIMARY KEY)")
+        .await;
+
+    db.execute("SELECT pgtrickle.gate_source('idem_ts_src')")
+        .await;
+
+    let first_gated_at: String = db
+        .query_scalar(
+            "SELECT g.gated_at::text \
+             FROM pgtrickle.pgt_source_gates g \
+             JOIN pg_class c ON c.oid = g.source_relid \
+             WHERE c.relname = 'idem_ts_src'",
+        )
+        .await;
+
+    // Small delay so that now() advances.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Second gate call — should update gated_at.
+    db.execute("SELECT pgtrickle.gate_source('idem_ts_src')")
+        .await;
+
+    let second_gated_at: String = db
+        .query_scalar(
+            "SELECT g.gated_at::text \
+             FROM pgtrickle.pgt_source_gates g \
+             JOIN pg_class c ON c.oid = g.source_relid \
+             WHERE c.relname = 'idem_ts_src'",
+        )
+        .await;
+
+    assert_ne!(
+        first_gated_at, second_gated_at,
+        "idempotent gate_source() should refresh gated_at timestamp"
+    );
+}
+
+/// BOOT-F1: Double-gating preserves exactly one row (no duplicates).
+///
+/// Extends the existing test_gate_source_is_idempotent with additional verifications:
+/// gated remains true, ungated_at stays NULL, gated_by is preserved.
+#[tokio::test]
+async fn test_idempotent_gate_preserves_state() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE idem_st_src (id INT PRIMARY KEY)")
+        .await;
+
+    db.execute("SELECT pgtrickle.gate_source('idem_st_src')")
+        .await;
+    db.execute("SELECT pgtrickle.gate_source('idem_st_src')")
+        .await;
+
+    let gated: bool = db
+        .query_scalar(
+            "SELECT g.gated \
+             FROM pgtrickle.pgt_source_gates g \
+             JOIN pg_class c ON c.oid = g.source_relid \
+             WHERE c.relname = 'idem_st_src'",
+        )
+        .await;
+
+    let ungated_at_is_null: bool = db
+        .query_scalar(
+            "SELECT g.ungated_at IS NULL \
+             FROM pgtrickle.pgt_source_gates g \
+             JOIN pg_class c ON c.oid = g.source_relid \
+             WHERE c.relname = 'idem_st_src'",
+        )
+        .await;
+
+    let gated_by: String = db
+        .query_scalar(
+            "SELECT g.gated_by \
+             FROM pgtrickle.pgt_source_gates g \
+             JOIN pg_class c ON c.oid = g.source_relid \
+             WHERE c.relname = 'idem_st_src'",
+        )
+        .await;
+
+    assert!(gated, "double-gated source should still be gated");
+    assert!(
+        ungated_at_is_null,
+        "double-gated source should have NULL ungated_at"
+    );
+    assert_eq!(gated_by, "gate_source", "gated_by should be 'gate_source'");
+}
+
+// ── BOOT-F2: Enhanced lifecycle tests ──────────────────────────────────────
+
+/// BOOT-F2: Full lifecycle — gate → ungate → re-gate preserves correct state.
+///
+/// Verifies that after re-gating, ungated_at is NULL again (cleared by the
+/// UPSERT) and gated_at is updated.
+#[tokio::test]
+async fn test_regate_lifecycle_clears_ungated_at() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE lc_src (id INT PRIMARY KEY)").await;
+
+    // Gate
+    db.execute("SELECT pgtrickle.gate_source('lc_src')").await;
+
+    // Ungate
+    db.execute("SELECT pgtrickle.ungate_source('lc_src')").await;
+
+    let ungated_at_after_ungate: bool = db
+        .query_scalar(
+            "SELECT ungated_at IS NOT NULL \
+             FROM pgtrickle.source_gates() WHERE source_table = 'lc_src'",
+        )
+        .await;
+    assert!(
+        ungated_at_after_ungate,
+        "ungated_at should be set after ungate"
+    );
+
+    // Re-gate: ungated_at should be cleared
+    db.execute("SELECT pgtrickle.gate_source('lc_src')").await;
+
+    let gated: bool = db
+        .query_scalar(
+            "SELECT gated FROM pgtrickle.source_gates() \
+             WHERE source_table = 'lc_src'",
+        )
+        .await;
+    let ungated_at_is_null: bool = db
+        .query_scalar(
+            "SELECT ungated_at IS NULL \
+             FROM pgtrickle.source_gates() WHERE source_table = 'lc_src'",
+        )
+        .await;
+
+    assert!(gated, "re-gated source should be gated");
+    assert!(
+        ungated_at_is_null,
+        "re-gating should clear ungated_at back to NULL"
+    );
+}
+
+/// BOOT-F2: Manual refresh works correctly throughout the full gate lifecycle.
+///
+/// Verifies: gated → manual refresh OK → ungate → manual refresh OK →
+/// re-gate → manual refresh still OK. Manual refresh must never be blocked.
+#[tokio::test]
+async fn test_manual_refresh_works_through_full_lifecycle() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE lc_man_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO lc_man_src VALUES (1, 'a')").await;
+    db.create_st("lc_man_st", "SELECT id, val FROM lc_man_src", "5m", "FULL")
+        .await;
+
+    // Gate → manual refresh should still work.
+    db.execute("SELECT pgtrickle.gate_source('lc_man_src')")
+        .await;
+    db.refresh_st("lc_man_st").await;
+    let c1: i64 = db.count("public.lc_man_st").await;
+    assert_eq!(c1, 1, "manual refresh while gated should work");
+
+    // Ungate → insert → manual refresh.
+    db.execute("SELECT pgtrickle.ungate_source('lc_man_src')")
+        .await;
+    db.execute("INSERT INTO lc_man_src VALUES (2, 'b')").await;
+    db.refresh_st("lc_man_st").await;
+    let c2: i64 = db.count("public.lc_man_st").await;
+    assert_eq!(c2, 2, "manual refresh after ungate should work");
+
+    // Re-gate → insert → manual refresh still works.
+    db.execute("SELECT pgtrickle.gate_source('lc_man_src')")
+        .await;
+    db.execute("INSERT INTO lc_man_src VALUES (3, 'c')").await;
+    db.refresh_st("lc_man_st").await;
+    let c3: i64 = db.count("public.lc_man_st").await;
+    assert_eq!(c3, 3, "manual refresh after re-gate should work");
+}
+
+// ── BOOT-F3: bootstrap_gate_status() tests ─────────────────────────────────
+
+/// BOOT-F3: bootstrap_gate_status() returns the expected columns.
+#[tokio::test]
+async fn test_bootstrap_gate_status_returns_expected_columns() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE bgs_src (id INT PRIMARY KEY)")
+        .await;
+    db.execute("SELECT pgtrickle.gate_source('bgs_src')").await;
+
+    let gated: bool = db
+        .query_scalar(
+            "SELECT gated FROM pgtrickle.bootstrap_gate_status() \
+             WHERE source_table = 'bgs_src'",
+        )
+        .await;
+    assert!(gated, "bootstrap_gate_status() should show source as gated");
+
+    let has_duration: bool = db
+        .query_scalar(
+            "SELECT gate_duration IS NOT NULL \
+             FROM pgtrickle.bootstrap_gate_status() \
+             WHERE source_table = 'bgs_src'",
+        )
+        .await;
+    assert!(
+        has_duration,
+        "bootstrap_gate_status() should compute gate_duration for gated source"
+    );
+}
+
+/// BOOT-F3: bootstrap_gate_status() shows gate_duration for ungated sources.
+#[tokio::test]
+async fn test_bootstrap_gate_status_ungated_duration() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE bgs_ug_src (id INT PRIMARY KEY)")
+        .await;
+    db.execute("SELECT pgtrickle.gate_source('bgs_ug_src')")
+        .await;
+    // Small delay so duration is nonzero.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    db.execute("SELECT pgtrickle.ungate_source('bgs_ug_src')")
+        .await;
+
+    let gated: bool = db
+        .query_scalar(
+            "SELECT gated FROM pgtrickle.bootstrap_gate_status() \
+             WHERE source_table = 'bgs_ug_src'",
+        )
+        .await;
+    assert!(
+        !gated,
+        "bootstrap_gate_status() should show source as ungated"
+    );
+
+    let has_duration: bool = db
+        .query_scalar(
+            "SELECT gate_duration IS NOT NULL \
+             FROM pgtrickle.bootstrap_gate_status() \
+             WHERE source_table = 'bgs_ug_src'",
+        )
+        .await;
+    assert!(
+        has_duration,
+        "bootstrap_gate_status() should show historic gate_duration for ungated source"
+    );
+}
+
+/// BOOT-F3: bootstrap_gate_status() shows affected_stream_tables.
+#[tokio::test]
+async fn test_bootstrap_gate_status_affected_stream_tables() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE bgs_dep_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    db.execute("INSERT INTO bgs_dep_src VALUES (1, 'x')").await;
+    db.create_st(
+        "bgs_dep_st",
+        "SELECT id, val FROM bgs_dep_src",
+        "5m",
+        "FULL",
+    )
+    .await;
+
+    db.execute("SELECT pgtrickle.gate_source('bgs_dep_src')")
+        .await;
+
+    let affected: String = db
+        .query_scalar(
+            "SELECT affected_stream_tables \
+             FROM pgtrickle.bootstrap_gate_status() \
+             WHERE source_table = 'bgs_dep_src'",
+        )
+        .await;
+
+    assert!(
+        affected.contains("bgs_dep_st"),
+        "affected_stream_tables should list the dependent stream table, got: {}",
+        affected
+    );
+}
+
+/// BOOT-F3: bootstrap_gate_status() returns empty when no gates registered.
+#[tokio::test]
+async fn test_bootstrap_gate_status_empty_by_default() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    let count: i64 = db
+        .query_scalar("SELECT count(*) FROM pgtrickle.bootstrap_gate_status()")
+        .await;
+
+    assert_eq!(
+        count, 0,
+        "bootstrap_gate_status() should be empty when nothing is gated"
+    );
 }
 
 // ── Manual refresh not blocked (BOOT-4 boundary) ──────────────────────────

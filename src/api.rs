@@ -3051,6 +3051,79 @@ fn source_gates_fn() -> TableIterator<
     TableIterator::new(rows)
 }
 
+/// Rich introspection of bootstrap gate status.
+///
+/// Returns one row per registered source gate with additional computed fields:
+/// - `gate_duration`: how long the source has been in its current state
+///   (if gated: `now() - gated_at`; if ungated: `ungated_at - gated_at`)
+/// - `affected_stream_tables`: comma-separated list of stream tables whose
+///   scheduler-driven refreshes are blocked by this gate
+///
+/// BOOT-F3: Designed for debugging "why isn't my stream table refreshing?"
+/// situations by showing the full gate lifecycle at a glance.
+#[pg_extern(schema = "pgtrickle", name = "bootstrap_gate_status")]
+#[allow(clippy::type_complexity)]
+fn bootstrap_gate_status_fn() -> TableIterator<
+    'static,
+    (
+        name!(source_table, String),
+        name!(schema_name, String),
+        name!(gated, bool),
+        name!(gated_at, Option<TimestampWithTimeZone>),
+        name!(ungated_at, Option<TimestampWithTimeZone>),
+        name!(gated_by, Option<String>),
+        name!(gate_duration, Option<pgrx::datum::Interval>),
+        name!(affected_stream_tables, Option<String>),
+    ),
+> {
+    let rows: Vec<_> = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT c.relname::text, \
+                        n.nspname::text, \
+                        g.gated, \
+                        g.gated_at, \
+                        g.ungated_at, \
+                        g.gated_by, \
+                        CASE WHEN g.gated THEN now() - g.gated_at \
+                             ELSE g.ungated_at - g.gated_at \
+                        END AS gate_duration, \
+                        ( \
+                          SELECT string_agg(st.pgt_schema || '.' || st.pgt_name, ', ' ORDER BY st.pgt_schema, st.pgt_name) \
+                          FROM pgtrickle.pgt_stream_tables st \
+                          JOIN pgtrickle.pgt_dependencies d ON d.pgt_id = st.pgt_id \
+                          WHERE d.source_relid = g.source_relid \
+                        ) AS affected_stream_tables \
+                 FROM pgtrickle.pgt_source_gates g \
+                 JOIN pg_class c ON c.oid = g.source_relid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 ORDER BY g.gated DESC, n.nspname, c.relname",
+                None,
+                &[],
+            )
+            .map_err(|e| pgrx::error!("bootstrap_gate_status: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
+
+        let mut out = Vec::new();
+        for row in result {
+            let relname = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+            let nspname = row.get::<String>(2).unwrap_or(None).unwrap_or_default();
+            let gated = row.get::<bool>(3).unwrap_or(None).unwrap_or(false);
+            let gated_at = row.get::<TimestampWithTimeZone>(4).unwrap_or(None);
+            let ungated_at = row.get::<TimestampWithTimeZone>(5).unwrap_or(None);
+            let gated_by = row.get::<String>(6).unwrap_or(None);
+            let duration = row.get::<pgrx::datum::Interval>(7).unwrap_or(None);
+            let affected = row.get::<String>(8).unwrap_or(None);
+            out.push((
+                relname, nspname, gated, gated_at, ungated_at, gated_by, duration, affected,
+            ));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
 /// Resolve a (possibly schema-qualified) table name to its OID.
 fn resolve_source_oid(source: &str) -> Result<pg_sys::Oid, PgTrickleError> {
     let oid = Spi::get_one_with_args::<pg_sys::Oid>("SELECT $1::regclass::oid", &[source.into()])

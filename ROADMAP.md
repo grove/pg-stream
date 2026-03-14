@@ -1016,10 +1016,10 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| BOOT-F1 | **Calling gate twice is safe.** Verify that calling `gate_source('orders')` when `orders` is already gated is a harmless no-op — not an error. Important for ETL scripts that may retry on failure. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
-| BOOT-F2 | **Gate → ungate → gate again works correctly.** Verify the full lifecycle: gate a source (scheduler skips it), ungate it (scheduler resumes), gate it again (scheduler skips again). Proves the mechanism is reusable across multiple load cycles. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
-| BOOT-F3 | **See your gates at a glance.** A new `bootstrap_gate_status()` function that shows which sources are gated, when they were gated, who gated them, and how long they've been paused. Useful for debugging when the scheduler seems to be "doing nothing" — it might just be waiting for a gate. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
-| BOOT-F4 | **Cookbook for common ETL patterns.** Documentation with step-by-step recipes: gating a single source during a bulk load, coordinating multiple source loads that must finish together, gating only part of a stream table DAG, and the classic "nightly batch → gate → load → ungate → single clean refresh" workflow. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) |
+| BOOT-F1 | **Calling gate twice is safe.** Verify that calling `gate_source('orders')` when `orders` is already gated is a harmless no-op — not an error. Important for ETL scripts that may retry on failure. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| BOOT-F2 | **Gate → ungate → gate again works correctly.** Verify the full lifecycle: gate a source (scheduler skips it), ungate it (scheduler resumes), gate it again (scheduler skips again). Proves the mechanism is reusable across multiple load cycles. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| BOOT-F3 | **See your gates at a glance.** A new `bootstrap_gate_status()` function that shows which sources are gated, when they were gated, who gated them, and how long they've been paused. Useful for debugging when the scheduler seems to be "doing nothing" — it might just be waiting for a gate. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
+| BOOT-F4 | **Cookbook for common ETL patterns.** Documentation with step-by-step recipes: gating a single source during a bulk load, coordinating multiple source loads that must finish together, gating only part of a stream table DAG, and the classic "nightly batch → gate → load → ungate → single clean refresh" workflow. | 3h | [PLAN_BOOTSTRAP_GATING.md](plans/sql/PLAN_BOOTSTRAP_GATING.md) | ✅ Done |
 
 > **Bootstrap gating follow-up subtotal: ~12 hours**
 
@@ -1073,7 +1073,7 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 - [ ] Window functions in expressions supported via CTE extraction (EC-03)
 - [ ] `ALL (subquery)` rewritten to `NOT EXISTS (... EXCEPT ...)` (EC-32)
 - [ ] Ergonomics E2E tests for calculated schedule, warnings, and removed GUCs pass
-- [ ] `gate_source()` idempotency and re-gating tested; `bootstrap_gate_status()` available
+- [x] `gate_source()` idempotency and re-gating tested; `bootstrap_gate_status()` available
 - [x] dbt `stream_table_status()` and `refresh_all_stream_tables` macros shipped
 - [ ] SQL Reference updated for EC-03, EC-32, and foreign table polling patterns
 - [ ] Extension upgrade path tested (`0.5.0 → 0.6.0`)

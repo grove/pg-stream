@@ -2276,3 +2276,147 @@ COPY orders FROM '/data/historical_orders.csv';
 SELECT pgtrickle.ungate_source('orders');
 ```
 
+### pgtrickle.bootstrap_gate_status() (v0.6.0)
+
+Rich introspection of bootstrap gate lifecycle.  Returns the same columns as
+`source_gates()` plus computed fields for debugging.
+
+```sql
+SELECT * FROM pgtrickle.bootstrap_gate_status();
+-- source_table | schema_name | gated | gated_at | ungated_at | gated_by | gate_duration | affected_stream_tables
+```
+
+| Column | Type | Description |
+|---|---|---|
+| `source_table` | `text` | Relation name |
+| `schema_name` | `text` | Schema name |
+| `gated` | `boolean` | Whether the source is currently gated |
+| `gated_at` | `timestamptz` | When the gate was set (updated on re-gate) |
+| `ungated_at` | `timestamptz` | When the gate was cleared (`NULL` if active) |
+| `gated_by` | `text` | Which function set the gate |
+| `gate_duration` | `interval` | How long the gate has been active (gated: `now() - gated_at`; ungated: `ungated_at - gated_at`) |
+| `affected_stream_tables` | `text` | Comma-separated list of stream tables whose scheduler refreshes are blocked by this gate |
+
+Rows are sorted with currently-gated sources first, then alphabetically.
+
+## ETL Coordination Cookbook (v0.6.0)
+
+Step-by-step recipes for common bulk-load patterns using source gating.
+
+### Recipe 1 — Single Source Bulk Load
+
+Gate one source table during a large data import.  The scheduler pauses
+refreshes for all stream tables that depend on this source.
+
+```sql
+-- 1. Gate the source before loading.
+SELECT pgtrickle.gate_source('orders');
+
+-- 2. Load the data.  The scheduler sits idle for orders-dependent STs.
+COPY orders FROM '/data/orders_2026.csv' WITH (FORMAT csv, HEADER);
+
+-- 3. Ungate.  On the next tick the scheduler refreshes everything cleanly.
+SELECT pgtrickle.ungate_source('orders');
+```
+
+### Recipe 2 — Coordinated Multi-Source Load
+
+When multiple sources feed into a shared downstream stream table,
+gate them all before loading so no intermediate refreshes occur.
+
+```sql
+-- 1. Gate all sources that will be loaded.
+SELECT pgtrickle.gate_source('orders');
+SELECT pgtrickle.gate_source('order_lines');
+
+-- 2. Load each source (can be parallel, any order).
+COPY orders FROM '/data/orders.csv' WITH (FORMAT csv, HEADER);
+COPY order_lines FROM '/data/lines.csv' WITH (FORMAT csv, HEADER);
+
+-- 3. Ungate all sources.  The scheduler refreshes downstream STs once.
+SELECT pgtrickle.ungate_source('orders');
+SELECT pgtrickle.ungate_source('order_lines');
+```
+
+### Recipe 3 — Gate + Deferred Initialization
+
+Combine gating with `initialize => false` to prevent incomplete initial
+population when sources are loaded asynchronously.
+
+```sql
+-- 1. Gate sources before creating any stream tables.
+SELECT pgtrickle.gate_source('orders');
+SELECT pgtrickle.gate_source('order_lines');
+
+-- 2. Create stream tables without initial population.
+SELECT pgtrickle.create_stream_table(
+    'order_summary',
+    'SELECT region, SUM(amount) FROM orders GROUP BY region',
+    '1m', initialize => false
+);
+SELECT pgtrickle.create_stream_table(
+    'order_report',
+    'SELECT s.region, s.total, l.line_count
+     FROM order_summary s
+     JOIN (SELECT region, COUNT(*) AS line_count FROM order_lines GROUP BY region) l
+       USING (region)',
+    '1m', initialize => false
+);
+
+-- 3. Run ETL processes (can be in separate transactions).
+BEGIN;
+  COPY orders FROM 's3://warehouse/orders.parquet';
+  SELECT pgtrickle.ungate_source('orders');
+COMMIT;
+
+BEGIN;
+  COPY order_lines FROM 's3://warehouse/lines.parquet';
+  SELECT pgtrickle.ungate_source('order_lines');
+COMMIT;
+
+-- 4. Once all sources are ungated, the scheduler initializes and refreshes
+--    all stream tables in dependency order.
+```
+
+### Recipe 4 — Nightly Batch Pattern
+
+For scheduled ETL that runs overnight, gate sources before the batch starts
+and ungate after the batch completes.
+
+```sql
+-- Nightly ETL script:
+
+-- Gate all sources that will be refreshed.
+SELECT pgtrickle.gate_source('sales');
+SELECT pgtrickle.gate_source('inventory');
+
+-- Truncate and reload (or use COPY, INSERT...SELECT, etc.).
+TRUNCATE sales;
+COPY sales FROM '/data/nightly/sales.csv' WITH (FORMAT csv, HEADER);
+
+TRUNCATE inventory;
+COPY inventory FROM '/data/nightly/inventory.csv' WITH (FORMAT csv, HEADER);
+
+-- All data loaded — ungate and let the scheduler handle the rest.
+SELECT pgtrickle.ungate_source('sales');
+SELECT pgtrickle.ungate_source('inventory');
+
+-- Verify: check the gate status to confirm everything is ungated.
+SELECT * FROM pgtrickle.bootstrap_gate_status();
+```
+
+### Recipe 5 — Monitoring During a Gated Load
+
+Use `bootstrap_gate_status()` to monitor progress when streams appear stalled.
+
+```sql
+-- Check which sources are currently gated and how long they've been paused.
+SELECT source_table, gate_duration, affected_stream_tables
+FROM pgtrickle.bootstrap_gate_status()
+WHERE gated = true;
+
+-- If a gate has been active too long (e.g. ETL failed), ungate manually.
+SELECT pgtrickle.ungate_source('stale_source');
+```
+
+
