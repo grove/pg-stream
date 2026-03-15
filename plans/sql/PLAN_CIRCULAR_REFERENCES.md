@@ -494,7 +494,12 @@ When any member of an SCC exceeds its schedule, the **entire SCC** is refreshed 
 
 ---
 
-### Part 6 — Validation at Creation Time
+### Part 6 — Validation at Creation Time ✅ Done
+
+> **Implemented in CYC-6 commit.** `check_for_cycles()` and
+> `check_for_cycles_alter()` now conditionally allow monotone cycles via
+> `validate_cycle_allowed()`. SCC IDs are assigned/recomputed by
+> `assign_scc_ids_from_dag()` on create, alter, and drop.
 
 Modify `check_for_cycles()` in `src/api.rs` to conditionally allow cycles.
 

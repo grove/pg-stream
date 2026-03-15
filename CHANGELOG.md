@@ -145,6 +145,14 @@ reducing the surface area where memory-safety bugs could theoretically hide.
   is supported in cyclic SCCs; FULL mode is rejected at iteration start.
   Requires `pg_trickle.allow_circular = true` (default `false`).
 
+- **Creation-time validation for circular dependencies (CYC-6).** When
+  `pg_trickle.allow_circular = true`, creating or altering a stream table
+  that introduces a cycle is allowed only if all cycle members use
+  DIFFERENTIAL refresh mode and have monotone defining queries (no
+  aggregates, EXCEPT, window functions, or anti-joins). SCC IDs are
+  automatically assigned to cycle members and recomputed when members are
+  dropped or queries are altered.
+
 - **`last_fixpoint_iterations` catalog column.** New column on
   `pgtrickle.pgt_stream_tables` that records how many fixpoint iterations the
   last SCC convergence took. Useful for monitoring convergence speed and

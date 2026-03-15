@@ -1867,7 +1867,9 @@ Stream tables are standard PostgreSQL heap tables stored in the `pgtrickle` sche
 
 ### Referencing Other Stream Tables
 
-Stream tables **can** reference other stream tables in their defining query. This creates a dependency edge in the internal DAG, and the scheduler refreshes upstream tables before downstream ones. Cycles are detected and rejected at creation time.
+Stream tables **can** reference other stream tables in their defining query. This creates a dependency edge in the internal DAG, and the scheduler refreshes upstream tables before downstream ones. By default, cycles are detected and rejected at creation time.
+
+When `pg_trickle.allow_circular = true`, circular dependencies are allowed for stream tables that use DIFFERENTIAL refresh mode and have **monotone** defining queries (no aggregates, EXCEPT, window functions, or NOT EXISTS/NOT IN). Cycle members are assigned an `scc_id` and the scheduler iterates them to a fixed point. Non-monotone operators are rejected because they prevent convergence.
 
 ```sql
 -- ST1 reads from a base table

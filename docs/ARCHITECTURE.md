@@ -255,7 +255,7 @@ Generates the final diff SQL that:
 
 Stream tables can depend on other stream tables (cascading), forming a Directed Acyclic Graph:
 
-- **Cycle detection** — Prevents circular dependencies at creation time using Kahn's algorithm (BFS topological sort).
+- **Cycle detection** — Detects circular dependencies at creation time using Kahn's algorithm (BFS topological sort). When `pg_trickle.allow_circular = true`, monotone cycles (queries using only safe operators — joins, filters, UNION ALL, etc.) are allowed; non-monotone cycles (aggregates, EXCEPT, window functions, anti-joins) are rejected. SCC IDs are automatically assigned to cycle members and recomputed on drop/alter.
 - **SCC decomposition** — Tarjan's algorithm decomposes the graph into strongly connected components. Singleton SCCs are acyclic; multi-node SCCs contain cycles that are handled by fixed-point iteration in the scheduler.
 - **Monotonicity analysis** — Static check (`check_monotonicity()` in `src/dvm/parser.rs`) determines whether a query's operators are safe for cyclic fixed-point iteration. Non-monotone operators (Aggregate, EXCEPT, Window, NOT EXISTS) block cycle creation.
 - **Topological ordering** — Determines refresh order: upstream STs must be refreshed before downstream STs.

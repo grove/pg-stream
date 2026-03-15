@@ -1486,6 +1486,14 @@ fn alter_stream_table_query(
         refresh::prewarm_merge_cache(&st);
     }
 
+    // CYC-6: Recompute SCC assignments — the query change may have created
+    // or broken a cycle.
+    if config::pg_trickle_allow_circular()
+        && let Err(e) = assign_scc_ids_from_dag()
+    {
+        pgrx::warning!("Failed to recompute SCCs after ALTER QUERY: {}", e);
+    }
+
     // ERG-F: warn so the client sees the full refresh regardless of log_min_messages.
     pgrx::warning!(
         "pg_trickle: stream table {}.{} ALTER QUERY applied a full refresh \
@@ -1712,6 +1720,11 @@ fn create_stream_table_impl(
 
     // ── Phase 2: CDC / IVM trigger setup ──
     setup_trigger_infrastructure(&vq.source_relids, refresh_mode, pgt_id, pgt_relid, query)?;
+
+    // ── Phase 2a: CYC-6 — Assign SCC IDs when circular dependencies exist ──
+    if config::pg_trickle_allow_circular() {
+        assign_scc_ids_from_dag()?;
+    }
 
     // ── Phase 2b: Register view soft-dependencies for DDL tracking ──
     if original_query_opt.is_some()
@@ -2185,6 +2198,16 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
                 cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode, None)?;
             }
         }
+    }
+
+    // CYC-6: Recompute SCC assignments when a cycle member is dropped.
+    // The dropped ST's catalog entry is already gone, so rebuild the DAG
+    // from the remaining STs and reassign scc_id values. Former cycle
+    // members that are no longer in a cycle will have their scc_id cleared.
+    if st.scc_id.is_some()
+        && let Err(e) = assign_scc_ids_from_dag()
+    {
+        pgrx::warning!("Failed to recompute SCCs after drop: {}", e);
     }
 
     // Signal scheduler
@@ -4080,7 +4103,75 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgTri
     }
 
     // Run cycle detection
-    dag.detect_cycles()
+    match dag.detect_cycles() {
+        Ok(()) => Ok(()),
+        Err(PgTrickleError::CycleDetected(nodes)) => {
+            // CYC-6: Conditionally allow monotone cycles
+            validate_cycle_allowed(&nodes)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// CYC-6: Validate that a detected cycle is allowed.
+///
+/// A cycle is allowed only when:
+/// 1. `pg_trickle.allow_circular` GUC is enabled
+/// 2. All existing cycle members use DIFFERENTIAL refresh mode
+/// 3. All existing cycle members have monotone defining queries
+///
+/// The proposed (not-yet-created) ST is excluded from checks since its
+/// catalog entry doesn't exist yet — it will be validated by the normal
+/// `validate_and_parse_query` flow and its refresh mode is checked by
+/// the caller after creation.
+fn validate_cycle_allowed(cycle_nodes: &[String]) -> Result<(), PgTrickleError> {
+    if !config::pg_trickle_allow_circular() {
+        return Err(PgTrickleError::CycleDetected(cycle_nodes.to_vec()));
+    }
+
+    // Check existing cycle members (skip the sentinel "<proposed>" node)
+    for node_name in cycle_nodes {
+        if node_name == "<proposed>" {
+            continue;
+        }
+
+        // Parse "schema.name" to look up the stream table
+        let (schema, name) = match node_name.split_once('.') {
+            Some((s, n)) => (s, n),
+            None => {
+                // Shouldn't happen, but treat as error
+                return Err(PgTrickleError::InternalError(format!(
+                    "cannot parse cycle member name: {}",
+                    node_name
+                )));
+            }
+        };
+
+        let meta = StreamTableMeta::get_by_name(schema, name)?;
+
+        // All cycle members must use DIFFERENTIAL mode
+        if meta.refresh_mode != RefreshMode::Differential {
+            return Err(PgTrickleError::InvalidArgument(format!(
+                "stream table '{}' must use DIFFERENTIAL refresh mode \
+                 to participate in a circular dependency (current mode: {})",
+                node_name,
+                meta.refresh_mode.as_str(),
+            )));
+        }
+
+        // All cycle members must have monotone queries
+        match crate::dvm::parse_defining_query_full(&meta.defining_query) {
+            Ok(pr) => crate::dvm::check_monotonicity(&pr.tree)?,
+            Err(e) => {
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "cannot verify monotonicity of '{}': {}",
+                    node_name, e,
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Cycle detection variant for ALTER QUERY.
@@ -4127,7 +4218,43 @@ fn check_for_cycles_alter(
     // Replace the ST's incoming edges with the proposed new ones
     dag.replace_incoming_edges(target_node, new_sources);
 
-    dag.detect_cycles()
+    match dag.detect_cycles() {
+        Ok(()) => Ok(()),
+        Err(PgTrickleError::CycleDetected(nodes)) => validate_cycle_allowed(&nodes),
+        Err(e) => Err(e),
+    }
+}
+
+/// CYC-6: Recompute SCCs from the current DAG and persist `scc_id` for all
+/// stream tables.
+///
+/// Cyclic SCC members get a positive `scc_id` (1, 2, …); acyclic singletons
+/// get `scc_id = NULL`. This is called after CREATE and ALTER to keep SCC
+/// assignments consistent.
+fn assign_scc_ids_from_dag() -> Result<(), PgTrickleError> {
+    let dag = StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds())?;
+    let sccs = dag.compute_sccs();
+
+    let mut next_scc_id: i32 = 1;
+    for scc in &sccs {
+        if scc.is_cyclic {
+            for node_id in &scc.nodes {
+                if let NodeId::StreamTable(pgt_id) = node_id {
+                    StreamTableMeta::update_scc_id(*pgt_id, Some(next_scc_id))?;
+                }
+            }
+            next_scc_id += 1;
+        } else {
+            // Acyclic singleton — clear any stale scc_id
+            for node_id in &scc.nodes {
+                if let NodeId::StreamTable(pgt_id) = node_id {
+                    StreamTableMeta::update_scc_id(*pgt_id, None)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Build CREATE TABLE DDL for the storage table.
