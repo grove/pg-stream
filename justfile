@@ -329,6 +329,11 @@ bench-docker: build-e2e-image
         "$IMAGE" \
         bash -c 'cargo bench --features pg18 2>&1'
 
+# Compare two benchmark JSON result files (I-4)
+[group: "bench"]
+bench-compare baseline candidate:
+    ./scripts/bench_compare.sh {{baseline}} {{candidate}}
+
 # ── Coverage ──────────────────────────────────────────────────────────────
 
 # Generate HTML + LCOV coverage report
