@@ -23,7 +23,7 @@ coverage, all in plain language.
 - [v0.4.0 — Parallel Refresh & Performance Hardening](#v040--parallel-refresh--performance-hardening)
 - [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
 - [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
-- [v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--watermarks-circular-dag-execution-observability--infrastructure)
+- [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
 - [v0.8.0 — Connection Pooler Compatibility](#v080--connection-pooler-compatibility)
 - [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
 - [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
@@ -1109,12 +1109,14 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 ---
 
-## v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure
+## v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure
 
-**Goal:** Add user-injected temporal watermark gating for batch-ETL
-coordination, complete the fixpoint scheduler for circular stream table
-DAGs, ship ready-made Prometheus/Grafana monitoring, and prepare the
-1.0 packaging and deployment infrastructure.
+**Goal:** Land Part 9 performance improvements (parallel refresh
+scheduling, MERGE strategy optimization, advanced benchmarks), add
+user-injected temporal watermark gating for batch-ETL coordination,
+complete the fixpoint scheduler for circular stream table DAGs, ship
+ready-made Prometheus/Grafana monitoring, and prepare the 1.0 packaging
+and deployment infrastructure.
 
 ### Watermark Gating
 
@@ -1209,9 +1211,44 @@ Zero-code monitoring integration. All config files live in a new
 
 > **Infrastructure prep subtotal: ~11 hours**
 
+### Performance — Regression Fixes & Benchmark Infrastructure (Part 9 S1–S2) ✅ Done
+
+> Fixes Criterion benchmark regressions identified in Part 9 and ships five
+> benchmark infrastructure improvements to support data-driven performance
+> decisions.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| A-3 | Fix `prefixed_col_list/20` +34% regression — eliminate intermediate `Vec` allocation | ✅ Done |
+| A-4 | Fix `lsn_gt` +22% regression — use `split_once` instead of `split().collect()` | ✅ Done |
+| I-1c | `just bench-docker` target for running Criterion inside Docker builder image | ✅ Done |
+| I-2 | Per-cycle `[BENCH_CYCLE]` CSV output in E2E benchmarks for external analysis | ✅ Done |
+| I-3 | EXPLAIN ANALYZE capture mode (`PGS_BENCH_EXPLAIN=true`) for delta query plans | ✅ Done |
+| I-6 | 1M-row benchmark tier (`bench_*_1m_*` + `bench_large_matrix`) | ✅ Done |
+| I-8 | Criterion noise reduction (`sample_size(200)`, `measurement_time(10s)`) | ✅ Done |
+
+### Performance — Parallel Refresh, MERGE Optimization & Advanced Benchmarks (Part 9 S4–S6) ✅ Done
+
+> DAG level-parallel scheduling, improved MERGE strategy selection (xxh64
+> hashing, aggregate saturation bypass, cost-based threshold), and expanded
+> benchmark suite (JSON comparison, concurrent writers, window/lateral/CTE).
+
+| Item | Description | Status |
+|------|-------------|--------|
+| C-1 | DAG level extraction (`topological_levels()` on `StDag` and `ExecutionUnitDag`) | ✅ Done |
+| C-2 | Level-parallel dispatch (existing `parallel_dispatch_tick` infrastructure sufficient) | ✅ Done |
+| C-3 | Result communication (existing `SchedulerJob` + `pgt_refresh_history` sufficient) | ✅ Done |
+| D-1 | xxh64 hash-based change detection for wide tables (≥50 cols) | ✅ Done |
+| D-2 | Aggregate saturation FULL bypass (changes ≥ groups → FULL) | ✅ Done |
+| D-3 | Cost-based strategy selection from `pgt_refresh_history` data | ✅ Done |
+| I-4 | Cross-run comparison tool (`just bench-compare`, JSON output) | ✅ Done |
+| I-5 | Concurrent writer benchmarks (1/2/4/8 writers) | ✅ Done |
+| I-7 | Window / lateral / CTE / UNION ALL operator benchmarks | ✅ Done |
+
 > **v0.7.0 total: ~59–62h**
 
 **Exit criteria:**
+- [x] Part 9 performance: DAG levels, xxh64 hashing, aggregate saturation bypass, cost-based threshold, advanced benchmarks
 - [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
 - [ ] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped

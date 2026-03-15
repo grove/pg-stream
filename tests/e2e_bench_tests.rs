@@ -163,6 +163,38 @@ fn query_scenarios() -> Vec<QueryScenario> {
                     GROUP BY d.region_name",
             needs_dim: true,
         },
+        // I-7: Window / lateral / CTE / UNION ALL operator scenarios
+        QueryScenario {
+            name: "window",
+            query: "SELECT id, region, amount, \
+                    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn \
+                    FROM src",
+            needs_dim: false,
+        },
+        QueryScenario {
+            name: "lateral",
+            query: "SELECT s.id, s.region, s.amount, l.top_score \
+                    FROM src s, \
+                    LATERAL (SELECT MAX(score) AS top_score FROM src s2 \
+                             WHERE s2.region = s.region) l",
+            needs_dim: false,
+        },
+        QueryScenario {
+            name: "cte",
+            query: "WITH regional AS ( \
+                        SELECT region, SUM(amount) AS total FROM src GROUP BY region \
+                    ) \
+                    SELECT s.id, s.region, s.amount, r.total \
+                    FROM src s JOIN regional r ON s.region = r.region",
+            needs_dim: false,
+        },
+        QueryScenario {
+            name: "union_all",
+            query: "SELECT id, amount, 'high' AS tier FROM src WHERE amount > 5000 \
+                    UNION ALL \
+                    SELECT id, amount, 'low' AS tier FROM src WHERE amount <= 5000",
+            needs_dim: false,
+        },
     ]
 }
 
@@ -260,7 +292,82 @@ fn parse_profile_line(line: &str) -> Option<ProfileData> {
     })
 }
 
+/// I-4: Write benchmark results to a JSON file for cross-run comparison.
+///
+/// Output path determined by `PGS_BENCH_JSON` env var, or defaults to
+/// `target/bench_results/<timestamp>.json`.
+fn write_results_json(results: &[BenchResult]) {
+    use std::io::Write;
+
+    let out_dir =
+        std::env::var("PGS_BENCH_JSON_DIR").unwrap_or_else(|_| "target/bench_results".to_string());
+    let _ = std::fs::create_dir_all(&out_dir);
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H%M%S");
+    let path = format!("{}/{}.json", out_dir, timestamp);
+
+    // Build JSON manually to avoid serde dependency
+    let mut entries = Vec::new();
+    for r in results {
+        let profile_json = if let Some(ref p) = r.profile {
+            format!(
+                r#"{{"decision_ms":{:.3},"generate_ms":{:.3},"merge_ms":{:.3},"cleanup_ms":{:.3},"total_ms":{:.3},"affected":{},"path":"{}"}}"#,
+                p.decision_ms,
+                p.generate_ms,
+                p.merge_ms,
+                p.cleanup_ms,
+                p.total_ms,
+                p.affected,
+                p.path,
+            )
+        } else {
+            "null".to_string()
+        };
+        entries.push(format!(
+            r#"  {{"scenario":"{}","table_size":{},"change_pct":{},"mode":"{}","cycle":{},"refresh_ms":{:.3},"st_row_count":{},"profile":{}}}"#,
+            r.scenario, r.table_size, r.change_pct, r.mode, r.cycle,
+            r.refresh_ms, r.st_row_count, profile_json,
+        ));
+    }
+
+    let json = format!("[\n{}\n]\n", entries.join(",\n"));
+    match std::fs::File::create(&path) {
+        Ok(mut f) => {
+            let _ = f.write_all(json.as_bytes());
+            eprintln!("[BENCH_JSON] Results written to {}", path);
+        }
+        Err(e) => {
+            eprintln!("[BENCH_JSON] WARN: Could not write {}: {}", path, e);
+        }
+    }
+}
+
 fn print_results_table(results: &[BenchResult]) {
+    // ── Per-cycle machine-parseable output (I-2) ───────────────────
+    // Format: [BENCH_CYCLE] scenario=X rows=N pct=P cycle=C mode=M ms=T
+    // Enables external analysis (histograms, trend detection) without changing
+    // the human-readable tables below.
+    for r in results {
+        eprintln!(
+            "[BENCH_CYCLE] scenario={} rows={} pct={:.2} cycle={} mode={} ms={:.3}{}",
+            r.scenario,
+            r.table_size,
+            r.change_pct,
+            r.cycle,
+            r.mode,
+            r.refresh_ms,
+            if let Some(ref p) = r.profile {
+                format!(
+                    " decision={:.2} gen_build={:.2} merge={:.2} cleanup={:.2} path={}",
+                    p.decision_ms, p.generate_ms, p.merge_ms, p.cleanup_ms, p.path
+                )
+            } else {
+                String::new()
+            },
+        );
+    }
+    eprintln!();
+
     println!();
     println!(
         "╔══════════════════════════════════════════════════════════════════════════════════════╗"
@@ -295,6 +402,9 @@ fn print_results_table(results: &[BenchResult]) {
 
     // Print summary: avg refresh time per (scenario, size, rate, mode)
     print_summary(results);
+
+    // I-4: Write JSON results for cross-run comparison
+    write_results_json(results);
 }
 
 /// Benchmark summary grouped by scenario key.
@@ -484,6 +594,56 @@ fn print_phase_breakdown(results: &[BenchResult]) {
 
 // ── Benchmark runner ───────────────────────────────────────────────────
 
+/// Whether EXPLAIN ANALYZE plan capture is enabled via `PGS_BENCH_EXPLAIN=true`.
+fn explain_capture_enabled() -> bool {
+    std::env::var("PGS_BENCH_EXPLAIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Capture EXPLAIN ANALYZE output for a stream table's defining query.
+///
+/// Runs `EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)` on the defining query
+/// and writes the plan to `/tmp/bench_plans/<scenario>_<size>_<pct>.txt`.
+async fn capture_explain_plan(
+    db: &E2eDb,
+    scenario_name: &str,
+    table_size: usize,
+    change_pct: f64,
+    defining_query: &str,
+) {
+    let plan_dir = "/tmp/bench_plans";
+    let _ = std::fs::create_dir_all(plan_dir);
+    let plan_file = format!(
+        "{}/{}_{}_{}pct.txt",
+        plan_dir,
+        scenario_name,
+        table_size,
+        (change_pct * 100.0) as u32
+    );
+
+    let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS) {defining_query}");
+    match db.query_text(&explain_sql).await {
+        Some(plan_text) => {
+            let _ = std::fs::write(&plan_file, &plan_text);
+            eprintln!(
+                "[BENCH_EXPLAIN] scenario={} rows={} pct={:.2} plan_file={}",
+                scenario_name, table_size, change_pct, plan_file
+            );
+            // Print first 20 lines to console for quick inspection
+            for (i, line) in plan_text.lines().take(20).enumerate() {
+                eprintln!("[BENCH_EXPLAIN]   {}: {}", i + 1, line);
+            }
+        }
+        None => {
+            eprintln!(
+                "[BENCH_EXPLAIN] WARN: Could not capture plan for {}",
+                scenario_name
+            );
+        }
+    }
+}
+
 /// Run one full benchmark for a given (scenario, table_size, change_rate).
 ///
 /// Creates one container with bench-tuned resource constraints, sets up
@@ -578,6 +738,14 @@ async fn run_benchmark(
     for _ in 0..WARMUP_CYCLES {
         apply_changes(&db, table_size, change_pct).await;
         db.execute("ANALYZE src").await;
+        db.refresh_st(&inc_pgt_name).await;
+    }
+
+    // I-3: Capture EXPLAIN ANALYZE plan on first measured cycle if enabled
+    if explain_capture_enabled() {
+        apply_changes(&db, table_size, change_pct).await;
+        db.execute("ANALYZE src").await;
+        capture_explain_plan(&db, scenario.name, table_size, change_pct, scenario.query).await;
         db.refresh_st(&inc_pgt_name).await;
     }
 
@@ -678,6 +846,44 @@ async fn bench_join_agg_10k_1pct() {
     print_results_table(&results);
 }
 
+// ── I-7: Window / lateral / CTE / UNION ALL benchmarks (10K) ──────────
+
+#[tokio::test]
+#[ignore]
+async fn bench_window_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[5]; // window
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_lateral_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[6]; // lateral
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_cte_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[7]; // cte
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_union_all_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[8]; // union_all
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
 // ── 100K row benchmarks ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -727,6 +933,15 @@ async fn bench_aggregate_100k_10pct() {
 
 #[tokio::test]
 #[ignore]
+async fn bench_join_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[3]; // join
+    let results = run_benchmark(s, 100_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
 async fn bench_join_agg_100k_1pct() {
     let scenarios = query_scenarios();
     let s = &scenarios[4];
@@ -741,6 +956,94 @@ async fn bench_join_agg_100k_10pct() {
     let s = &scenarios[4];
     let results = run_benchmark(s, 100_000, 0.10).await;
     print_results_table(&results);
+}
+
+// ── 1M row benchmarks (I-6) ───────────────────────────────────────────
+//
+// Tests at production-scale table sizes. The delta is larger (10K changes
+// at 1% of 1M rows) and MERGE touches more stream table rows.
+// Run separately from the standard suite due to longer run time.
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0]; // scan
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_filter_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[1]; // filter
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_aggregate_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[2]; // aggregate
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[3]; // join
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_agg_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[4]; // join_agg
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+// ── Large matrix benchmark (I-6) ──────────────────────────────────────
+//
+// Includes the 1M-row tier in addition to 10K and 100K. Uses only 1% change
+// rate at 1M to keep run time reasonable. Expect ~45-90 minutes total.
+
+#[tokio::test]
+#[ignore]
+async fn bench_large_matrix() {
+    let scenarios = query_scenarios();
+    let mut all_results = Vec::new();
+    let large_sizes: &[usize] = &[10_000, 100_000, 1_000_000];
+    let large_rates: &[f64] = &[0.01, 0.10];
+
+    for &table_size in large_sizes {
+        // At 1M rows, only test 1% change rate to keep run time sane
+        let rates: &[f64] = if table_size >= 1_000_000 {
+            &[0.01]
+        } else {
+            large_rates
+        };
+        for &change_pct in rates {
+            for scenario in &scenarios {
+                eprintln!(
+                    "▶ Benchmarking: {} | {} rows | {:.0}% changes ...",
+                    scenario.name,
+                    table_size,
+                    change_pct * 100.0,
+                );
+                let results = run_benchmark(scenario, table_size, change_pct).await;
+                all_results.extend(results);
+            }
+        }
+    }
+
+    print_results_table(&all_results);
 }
 
 // ── Full matrix benchmark ──────────────────────────────────────────────
@@ -1695,5 +1998,159 @@ async fn bench_stmt_vs_row_cdc_quick() {
         },
     );
     println!("└──────────────────────────────────────────────────────────┘");
+    println!();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// I-5: Concurrent Writer Benchmarks
+//
+// Measures CDC trigger overhead under concurrent writer load. Multiple
+// tokio tasks perform DML simultaneously on the same source table,
+// stress-testing BIGSERIAL contention, change buffer index lock
+// contention, and WAL write serialization.
+//
+// Writer concurrency sweep: 1, 2, 4, 8 connections.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Run concurrent writer benchmark for a given writer count.
+///
+/// Each writer performs `iterations` INSERT batches of `batch_size` rows.
+/// Returns (total_elapsed_ms, per_writer_avg_ms).
+async fn run_concurrent_writers(
+    db: &E2eDb,
+    n_writers: usize,
+    batch_size: usize,
+    iterations: usize,
+) -> (f64, Vec<f64>) {
+    let conn_str = db.connection_string().to_string();
+
+    let total_start = Instant::now();
+
+    let handles: Vec<_> = (0..n_writers)
+        .map(|writer_id| {
+            let cs = conn_str.clone();
+            tokio::spawn(async move {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&cs)
+                    .await
+                    .expect("writer pool connect");
+
+                let mut times_ms = Vec::new();
+                for _ in 0..iterations {
+                    let sql = format!(
+                        "INSERT INTO cw_src (region, amount) \
+                         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                                WHEN 3 THEN 'w' ELSE 'c' END, \
+                                (i * {} + 13) % 10000 \
+                         FROM generate_series(1, {}) AS s(i)",
+                        17 + writer_id,
+                        batch_size,
+                    );
+                    let start = Instant::now();
+                    sqlx::query(&sql)
+                        .execute(&pool)
+                        .await
+                        .expect("writer insert");
+                    times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                pool.close().await;
+                times_ms
+            })
+        })
+        .collect();
+
+    let mut all_writer_avgs = Vec::new();
+    for handle in handles {
+        let times = handle.await.expect("writer task");
+        let avg = times.iter().sum::<f64>() / times.len() as f64;
+        all_writer_avgs.push(avg);
+    }
+
+    let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+    (total_ms, all_writer_avgs)
+}
+
+/// I-5: Concurrent writer benchmark — sweep 1, 2, 4, 8 writers.
+///
+/// Run explicitly:
+/// ```bash
+/// cargo test --test e2e_bench_tests -- --ignored bench_concurrent_writers --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn bench_concurrent_writers() {
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let base_rows = 50_000usize;
+    let batch_size = 1_000usize;
+    let iterations = 10usize;
+    let writer_counts: &[usize] = &[1, 2, 4, 8];
+
+    // Setup: source table + stream table (installs CDC triggers)
+    db.execute(
+        "CREATE TABLE cw_src (id SERIAL PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL)",
+    )
+    .await;
+    db.execute(&format!(
+        "INSERT INTO cw_src (region, amount) \
+         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                WHEN 3 THEN 'w' ELSE 'c' END, (i * 17) % 10000 \
+         FROM generate_series(1, {base_rows}) AS s(i)"
+    ))
+    .await;
+    db.create_st(
+        "cw_st",
+        "SELECT id, region, amount FROM cw_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.execute("ANALYZE cw_src").await;
+
+    println!();
+    println!("┌───────────────────────────────────────────────────────────────┐");
+    println!("│ I-5: Concurrent Writer CDC Overhead Benchmark                 │");
+    println!("├───────────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Base rows: {} · Batch: {} · Iterations: {}                │",
+        base_rows, batch_size, iterations
+    );
+    println!("│                                                               │");
+    println!("│ Writers  Total ms    Per-writer avg ms   Throughput rows/s     │");
+    println!("├───────────────────────────────────────────────────────────────┤");
+
+    let mut baseline_throughput = 0.0f64;
+
+    for &n_writers in writer_counts {
+        // Drain change buffer before each run
+        db.refresh_st("cw_st").await;
+
+        let (total_ms, writer_avgs) =
+            run_concurrent_writers(&db, n_writers, batch_size, iterations).await;
+
+        let per_writer_avg = writer_avgs.iter().sum::<f64>() / writer_avgs.len() as f64;
+        let total_rows = (n_writers * batch_size * iterations) as f64;
+        let throughput = total_rows / (total_ms / 1000.0);
+
+        if n_writers == 1 {
+            baseline_throughput = throughput;
+        }
+        let scaling = if baseline_throughput > 0.0 {
+            throughput / baseline_throughput
+        } else {
+            1.0
+        };
+
+        println!(
+            "│ {:>7}  {:>10.1}  {:>18.1}  {:>10.0} ({:.2}x)     │",
+            n_writers, total_ms, per_writer_avg, throughput, scaling,
+        );
+
+        // Drain after each run
+        db.refresh_st("cw_st").await;
+    }
+
+    println!("└───────────────────────────────────────────────────────────────┘");
     println!();
 }

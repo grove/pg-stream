@@ -712,6 +712,22 @@ impl E2eDb {
             .await
     }
 
+    /// Execute a query and return all result rows as a single text string.
+    ///
+    /// Useful for capturing EXPLAIN output where each row is a text line.
+    pub async fn query_text(&self, sql: &str) -> Option<String> {
+        let rows: Vec<(String,)> = sqlx::query_as(sql).fetch_all(&self.pool).await.ok()?;
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            rows.into_iter()
+                .map(|(line,)| line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     // ── Extension API Helpers ──────────────────────────────────────────
 
     /// Create a stream table via `pgtrickle.create_stream_table()`.
