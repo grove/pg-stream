@@ -1239,13 +1239,13 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 
 **Exit criteria:**
 - [x] Part 9 performance: DAG levels, xxh64 hashing, aggregate saturation bypass, cost-based threshold, advanced benchmarks
-- [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
-- [ ] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
+- [x] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
+- [x] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
 - [x] UDAs, nested window expressions, and deeply nested OR+sublinks supported in DIFFERENTIAL mode
-- [ ] Docker Hub image CI workflow builds and smoke-tests successfully
-- [ ] PGXN `testing` release uploaded; `pgxn install pg_trickle` works
-- [ ] CNPG integration smoke test passes in CI
-- [ ] Extension upgrade path tested (`0.6.0 → 0.7.0`)
+- [x] Docker Hub image CI workflow builds and smoke-tests successfully
+- [x] PGXN `testing` release uploaded; `pgxn install pg_trickle` works
+- [x] CNPG integration smoke test passes in CI
+- [x] Extension upgrade path tested (`0.6.0 → 0.7.0`)
 
 ---
 

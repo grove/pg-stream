@@ -132,7 +132,7 @@ reducing the surface area where memory-safety bugs could theoretically hide.
 
 ---
 
-## [0.7.0] — Unreleased
+## [0.7.0] — 2026-03-15
 
 ### Added
 
