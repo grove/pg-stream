@@ -933,6 +933,15 @@ async fn bench_aggregate_100k_10pct() {
 
 #[tokio::test]
 #[ignore]
+async fn bench_join_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[3]; // join
+    let results = run_benchmark(s, 100_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
 async fn bench_join_agg_100k_1pct() {
     let scenarios = query_scenarios();
     let s = &scenarios[4];
