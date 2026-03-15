@@ -842,6 +842,41 @@ AS 'MODULE_PATHNAME', 'explain_st_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- pg_trickle::api::bootstrap_gate_status
+CREATE  FUNCTION pgtrickle."bootstrap_gate_status"() RETURNS TABLE (
+	"source_table" TEXT,  /* alloc::string::String */
+	"schema_name" TEXT,  /* alloc::string::String */
+	"gated" bool,  /* bool */
+	"gated_at" timestamp with time zone,  /* core::option::Option<pgrx::datetime::time_stamp_with_timezone::TimestampWithTimeZone> */
+	"ungated_at" timestamp with time zone,  /* core::option::Option<pgrx::datetime::time_stamp_with_timezone::TimestampWithTimeZone> */
+	"gated_by" TEXT,  /* core::option::Option<alloc::string::String> */
+	"gate_duration" interval,  /* core::option::Option<pgrx::datetime::interval::Interval> */
+	"affected_stream_tables" TEXT  /* core::option::Option<alloc::string::String> */
+)
+STRICT  
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bootstrap_gate_status_fn_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- pg_trickle::api::create_or_replace_stream_table
+CREATE  FUNCTION pgtrickle."create_or_replace_stream_table"(
+	"name" TEXT, /* &str */
+	"query" TEXT, /* &str */
+	"schedule" TEXT DEFAULT 'calculated', /* core::option::Option<&str> */
+	"refresh_mode" TEXT DEFAULT 'AUTO', /* &str */
+	"initialize" bool DEFAULT true, /* bool */
+	"diamond_consistency" TEXT DEFAULT NULL, /* core::option::Option<&str> */
+	"diamond_schedule_policy" TEXT DEFAULT NULL, /* core::option::Option<&str> */
+	"cdc_mode" TEXT DEFAULT NULL, /* core::option::Option<&str> */
+	"append_only" bool DEFAULT false /* bool */
+) RETURNS void
+
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'create_or_replace_stream_table_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/lib.rs:436
 -- requires:
 --   _signal_launcher_rescan
