@@ -46,6 +46,7 @@ async fn test_upgrade_catalog_schema_stability() {
         ("has_keyless_source", "boolean"),
         ("is_append_only", "boolean"),
         ("is_populated", "boolean"),
+        ("last_fixpoint_iterations", "integer"),
         ("last_full_ms", "double precision"),
         ("last_refresh_at", "timestamp with time zone"),
         ("needs_reinit", "boolean"),
@@ -386,6 +387,7 @@ async fn test_upgrade_chain_new_functions_exist() {
         "SELECT * FROM pgtrickle.refresh_timeline(50)",
         "SELECT pgtrickle.version()",
         "SELECT * FROM pgtrickle.diamond_groups()",
+        "SELECT * FROM pgtrickle.pgt_scc_status()",
     ];
 
     for func_call in &new_functions {

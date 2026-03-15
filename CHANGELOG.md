@@ -134,7 +134,42 @@ reducing the surface area where memory-safety bugs could theoretically hide.
 
 ## [0.7.0] — Unreleased
 
-No changes yet.
+### Added
+
+- **Circular dependency scheduler integration (CYC-5).** When stream tables
+  form cyclic dependencies (A → B → A), the scheduler now iterates them to a
+  fixed point — refreshing all members of the strongly connected component
+  (SCC) repeatedly until convergence (zero net changes) or the configurable
+  `pg_trickle.max_fixpoint_iterations` limit (default 100) is reached.
+  Non-convergence marks all SCC members as `ERROR`. Only DIFFERENTIAL mode
+  is supported in cyclic SCCs; FULL mode is rejected at iteration start.
+  Requires `pg_trickle.allow_circular = true` (default `false`).
+
+- **Creation-time validation for circular dependencies (CYC-6).** When
+  `pg_trickle.allow_circular = true`, creating or altering a stream table
+  that introduces a cycle is allowed only if all cycle members use
+  DIFFERENTIAL refresh mode and have monotone defining queries (no
+  aggregates, EXCEPT, window functions, or anti-joins). SCC IDs are
+  automatically assigned to cycle members and recomputed when members are
+  dropped or queries are altered.
+
+- **Circular dependency monitoring (CYC-7).** The `pg_stat_stream_tables`
+  view now includes `scc_id` and `last_fixpoint_iterations` columns.
+  `pgtrickle.pgt_status()` includes `scc_id`. New
+  `pgtrickle.pgt_scc_status()` function returns one row per cyclic SCC
+  with member count, member names, last iteration count, and last
+  convergence time.
+
+- **Circular dependency E2E tests (CYC-8).** New `e2e_circular_tests.rs`
+  with 6 test scenarios: monotone cycle convergence, non-monotone cycle
+  rejection, convergence iteration tracking, non-convergence → ERROR
+  status, drop-member SCC cleanup, and default `allow_circular=false`
+  rejection. Updated README limitations table.
+
+- **`last_fixpoint_iterations` catalog column.** New column on
+  `pgtrickle.pgt_stream_tables` that records how many fixpoint iterations the
+  last SCC convergence took. Useful for monitoring convergence speed and
+  detecting near-non-convergence patterns.
 
 ---
 

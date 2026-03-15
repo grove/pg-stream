@@ -1,6 +1,6 @@
 # PLAN: Circular References in the Stream Table Dependency Graph
 
-**Status:** Foundation complete (Parts 1–4 implemented in v0.6.0)
+**Status:** Parts 1–5 implemented (v0.6.0 foundation + v0.7.0 scheduler integration)
 
 ## Objective
 
@@ -494,7 +494,12 @@ When any member of an SCC exceeds its schedule, the **entire SCC** is refreshed 
 
 ---
 
-### Part 6 — Validation at Creation Time
+### Part 6 — Validation at Creation Time ✅ Done
+
+> **Implemented in CYC-6 commit.** `check_for_cycles()` and
+> `check_for_cycles_alter()` now conditionally allow monotone cycles via
+> `validate_cycle_allowed()`. SCC IDs are assigned/recomputed by
+> `assign_scc_ids_from_dag()` on create, alter, and drop.
 
 Modify `check_for_cycles()` in `src/api.rs` to conditionally allow cycles.
 
@@ -553,7 +558,11 @@ fn check_for_cycles(source_relids: &[(Oid, String)]) -> Result<(), PgTrickleErro
 
 ---
 
-### Part 7 — Monitoring and Observability
+### Part 7 — Monitoring and Observability ✅ Done
+
+> **Implemented in CYC-7 commit.** `pg_stat_stream_tables` view now includes
+> `scc_id` and `last_fixpoint_iterations`. `pgt_status()` returns `scc_id`.
+> New `pgt_scc_status()` function exposes SCC topology and convergence metrics.
 
 Surface cycle and convergence information in the monitoring infrastructure.
 
@@ -596,7 +605,11 @@ pgtrickle.pgt_scc_status() → SETOF record(
 
 ---
 
-### Part 8 — Documentation and E2E Tests
+### Part 8 — Documentation and E2E Tests ✅ Done
+
+> **Implemented in CYC-8 commit.** New `tests/e2e_circular_tests.rs` with 6
+> test scenarios covering all circular dependency paths. README limitations
+> table updated.
 
 #### E2E Tests
 
@@ -720,11 +733,11 @@ Spawn a dedicated background worker per cyclic SCC that iterates independently o
 
 | Part | Description | Status |
 |------|------------|--------|
-| 1 | Tarjan's SCC algorithm | ❌ Not started |
-| 2 | Monotonicity checker | ❌ Not started |
-| 3 | Catalog changes | ❌ Not started |
-| 4 | GUC configuration | ❌ Not started |
-| 5 | Scheduler fixed-point iteration | ❌ Not started |
+| 1 | Tarjan's SCC algorithm | ✅ Done (v0.6.0) |
+| 2 | Monotonicity checker | ✅ Done (v0.6.0) |
+| 3 | Catalog changes | ✅ Done (v0.6.0) |
+| 4 | GUC configuration | ✅ Done (v0.6.0) |
+| 5 | Scheduler fixed-point iteration | ✅ Done (v0.7.0) |
 | 6 | Creation-time validation | ❌ Not started |
 | 7 | Monitoring and observability | ❌ Not started |
 | 8 | Documentation and E2E tests | ❌ Not started |

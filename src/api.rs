@@ -1486,6 +1486,14 @@ fn alter_stream_table_query(
         refresh::prewarm_merge_cache(&st);
     }
 
+    // CYC-6: Recompute SCC assignments — the query change may have created
+    // or broken a cycle.
+    if config::pg_trickle_allow_circular()
+        && let Err(e) = assign_scc_ids_from_dag()
+    {
+        pgrx::warning!("Failed to recompute SCCs after ALTER QUERY: {}", e);
+    }
+
     // ERG-F: warn so the client sees the full refresh regardless of log_min_messages.
     pgrx::warning!(
         "pg_trickle: stream table {}.{} ALTER QUERY applied a full refresh \
@@ -1712,6 +1720,11 @@ fn create_stream_table_impl(
 
     // ── Phase 2: CDC / IVM trigger setup ──
     setup_trigger_infrastructure(&vq.source_relids, refresh_mode, pgt_id, pgt_relid, query)?;
+
+    // ── Phase 2a: CYC-6 — Assign SCC IDs when circular dependencies exist ──
+    if config::pg_trickle_allow_circular() {
+        assign_scc_ids_from_dag()?;
+    }
 
     // ── Phase 2b: Register view soft-dependencies for DDL tracking ──
     if original_query_opt.is_some()
@@ -2185,6 +2198,16 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
                 cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode, None)?;
             }
         }
+    }
+
+    // CYC-6: Recompute SCC assignments when a cycle member is dropped.
+    // The dropped ST's catalog entry is already gone, so rebuild the DAG
+    // from the remaining STs and reassign scc_id values. Former cycle
+    // members that are no longer in a cycle will have their scc_id cleared.
+    if st.scc_id.is_some()
+        && let Err(e) = assign_scc_ids_from_dag()
+    {
+        pgrx::warning!("Failed to recompute SCCs after drop: {}", e);
     }
 
     // Signal scheduler
@@ -2843,6 +2866,7 @@ fn pgt_status() -> TableIterator<
         name!(schedule, Option<String>),
         name!(data_timestamp, Option<TimestampWithTimeZone>),
         name!(staleness, Option<pgrx::datum::Interval>),
+        name!(scc_id, Option<i32>),
     ),
 > {
     let rows: Vec<_> = Spi::connect(|client| {
@@ -2850,7 +2874,7 @@ fn pgt_status() -> TableIterator<
             .select(
                 "SELECT pgt_schema || '.' || pgt_name, status, refresh_mode, \
                  is_populated, consecutive_errors, schedule, data_timestamp, \
-                 now() - data_timestamp AS staleness \
+                 now() - data_timestamp AS staleness, scc_id \
                  FROM pgtrickle.pgt_stream_tables ORDER BY pgt_schema, pgt_name",
                 None,
                 &[],
@@ -2868,8 +2892,68 @@ fn pgt_status() -> TableIterator<
             let schedule = row.get::<String>(6).unwrap_or(None);
             let data_ts = row.get::<TimestampWithTimeZone>(7).unwrap_or(None);
             let staleness = row.get::<pgrx::datum::Interval>(8).unwrap_or(None);
+            let scc_id = row.get::<i32>(9).unwrap_or(None);
             out.push((
-                name, status, mode, populated, errors, schedule, data_ts, staleness,
+                name, status, mode, populated, errors, schedule, data_ts, staleness, scc_id,
+            ));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
+/// CYC-7: Show the status of all cyclic strongly connected components.
+///
+/// Returns one row per SCC, summarising its members, most recent fixpoint
+/// iteration count, and last convergence time.
+#[pg_extern(schema = "pgtrickle", name = "pgt_scc_status")]
+#[allow(clippy::type_complexity)]
+fn pgt_scc_status() -> TableIterator<
+    'static,
+    (
+        name!(scc_id, i32),
+        name!(member_count, i32),
+        name!(members, Vec<String>),
+        name!(last_iterations, Option<i32>),
+        name!(last_converged_at, Option<TimestampWithTimeZone>),
+    ),
+> {
+    let rows: Vec<_> = Spi::connect(|client| {
+        let result = client
+            .select(
+                "SELECT \
+                     st.scc_id, \
+                     count(*)::int AS member_count, \
+                     array_agg(st.pgt_schema || '.' || st.pgt_name ORDER BY st.pgt_name) AS members, \
+                     max(st.last_fixpoint_iterations) AS last_iterations, \
+                     max(st.last_refresh_at) AS last_converged_at \
+                 FROM pgtrickle.pgt_stream_tables st \
+                 WHERE st.scc_id IS NOT NULL \
+                 GROUP BY st.scc_id \
+                 ORDER BY st.scc_id",
+                None,
+                &[],
+            )
+            .map_err(|e| pgrx::error!("pgt_scc_status: SPI select failed: {e}"))
+            .expect("unreachable after error!()");
+
+        let mut out = Vec::new();
+        for row in result {
+            let scc_id = row.get::<i32>(1).unwrap_or(None).unwrap_or(0);
+            let member_count = row.get::<i32>(2).unwrap_or(None).unwrap_or(0);
+            let members = row
+                .get::<Vec<String>>(3)
+                .unwrap_or(None)
+                .unwrap_or_default();
+            let last_iterations = row.get::<i32>(4).unwrap_or(None);
+            let last_converged_at = row.get::<TimestampWithTimeZone>(5).unwrap_or(None);
+            out.push((
+                scc_id,
+                member_count,
+                members,
+                last_iterations,
+                last_converged_at,
             ));
         }
         out
@@ -4080,7 +4164,75 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgTri
     }
 
     // Run cycle detection
-    dag.detect_cycles()
+    match dag.detect_cycles() {
+        Ok(()) => Ok(()),
+        Err(PgTrickleError::CycleDetected(nodes)) => {
+            // CYC-6: Conditionally allow monotone cycles
+            validate_cycle_allowed(&nodes)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// CYC-6: Validate that a detected cycle is allowed.
+///
+/// A cycle is allowed only when:
+/// 1. `pg_trickle.allow_circular` GUC is enabled
+/// 2. All existing cycle members use DIFFERENTIAL refresh mode
+/// 3. All existing cycle members have monotone defining queries
+///
+/// The proposed (not-yet-created) ST is excluded from checks since its
+/// catalog entry doesn't exist yet — it will be validated by the normal
+/// `validate_and_parse_query` flow and its refresh mode is checked by
+/// the caller after creation.
+fn validate_cycle_allowed(cycle_nodes: &[String]) -> Result<(), PgTrickleError> {
+    if !config::pg_trickle_allow_circular() {
+        return Err(PgTrickleError::CycleDetected(cycle_nodes.to_vec()));
+    }
+
+    // Check existing cycle members (skip the sentinel "<proposed>" node)
+    for node_name in cycle_nodes {
+        if node_name == "<proposed>" {
+            continue;
+        }
+
+        // Parse "schema.name" to look up the stream table
+        let (schema, name) = match node_name.split_once('.') {
+            Some((s, n)) => (s, n),
+            None => {
+                // Shouldn't happen, but treat as error
+                return Err(PgTrickleError::InternalError(format!(
+                    "cannot parse cycle member name: {}",
+                    node_name
+                )));
+            }
+        };
+
+        let meta = StreamTableMeta::get_by_name(schema, name)?;
+
+        // All cycle members must use DIFFERENTIAL mode
+        if meta.refresh_mode != RefreshMode::Differential {
+            return Err(PgTrickleError::InvalidArgument(format!(
+                "stream table '{}' must use DIFFERENTIAL refresh mode \
+                 to participate in a circular dependency (current mode: {})",
+                node_name,
+                meta.refresh_mode.as_str(),
+            )));
+        }
+
+        // All cycle members must have monotone queries
+        match crate::dvm::parse_defining_query_full(&meta.defining_query) {
+            Ok(pr) => crate::dvm::check_monotonicity(&pr.tree)?,
+            Err(e) => {
+                return Err(PgTrickleError::InvalidArgument(format!(
+                    "cannot verify monotonicity of '{}': {}",
+                    node_name, e,
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Cycle detection variant for ALTER QUERY.
@@ -4127,7 +4279,43 @@ fn check_for_cycles_alter(
     // Replace the ST's incoming edges with the proposed new ones
     dag.replace_incoming_edges(target_node, new_sources);
 
-    dag.detect_cycles()
+    match dag.detect_cycles() {
+        Ok(()) => Ok(()),
+        Err(PgTrickleError::CycleDetected(nodes)) => validate_cycle_allowed(&nodes),
+        Err(e) => Err(e),
+    }
+}
+
+/// CYC-6: Recompute SCCs from the current DAG and persist `scc_id` for all
+/// stream tables.
+///
+/// Cyclic SCC members get a positive `scc_id` (1, 2, …); acyclic singletons
+/// get `scc_id = NULL`. This is called after CREATE and ALTER to keep SCC
+/// assignments consistent.
+fn assign_scc_ids_from_dag() -> Result<(), PgTrickleError> {
+    let dag = StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds())?;
+    let sccs = dag.compute_sccs();
+
+    let mut next_scc_id: i32 = 1;
+    for scc in &sccs {
+        if scc.is_cyclic {
+            for node_id in &scc.nodes {
+                if let NodeId::StreamTable(pgt_id) = node_id {
+                    StreamTableMeta::update_scc_id(*pgt_id, Some(next_scc_id))?;
+                }
+            }
+            next_scc_id += 1;
+        } else {
+            // Acyclic singleton — clear any stale scc_id
+            for node_id in &scc.nodes {
+                if let NodeId::StreamTable(pgt_id) = node_id {
+                    StreamTableMeta::update_scc_id(*pgt_id, None)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Build CREATE TABLE DDL for the storage table.
@@ -5199,6 +5387,7 @@ mod tests {
             requested_cdc_mode: None,
             is_append_only: false,
             scc_id: None,
+            last_fixpoint_iterations: None,
         }
     }
 

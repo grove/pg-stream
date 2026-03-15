@@ -44,7 +44,7 @@ use crate::cdc;
 use crate::config;
 use crate::dag::{
     DiamondConsistency, DiamondSchedulePolicy, ExecutionUnit, ExecutionUnitDag, ExecutionUnitId,
-    NodeId, StDag, StStatus,
+    NodeId, RefreshMode, Scc, StDag, StStatus,
 };
 use crate::error::{RetryPolicy, RetryState};
 use crate::monitor;
@@ -1416,7 +1416,11 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             };
 
             // Step B: Validate topological order (detect cycles)
-            if let Err(e) = dag_ref.topological_order() {
+            // When circular dependencies are allowed (allow_circular=true),
+            // we use the condensation order (SCC-based) instead of rejecting
+            // cycles outright. Cyclic SCCs are handled by fixpoint iteration.
+            let allow_circular = config::pg_trickle_allow_circular();
+            if !allow_circular && let Err(e) = dag_ref.topological_order() {
                 log!("pg_trickle: DAG has cycles: {}", e);
                 return;
             }
@@ -1473,6 +1477,54 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 }
             }
 
+            // Step B3: Handle cyclic SCCs via fixpoint iteration.
+            // Process cyclic SCCs before the regular consistency group refresh
+            // so that SCC members are up-to-date when downstream STs check
+            // for upstream changes.
+            // Collect SCC member IDs so Step C can skip them.
+            let mut scc_member_ids: HashSet<i64> = HashSet::new();
+            if allow_circular {
+                let sccs = dag_ref.condensation_order();
+                for scc in &sccs {
+                    if !scc.is_cyclic {
+                        continue; // Singletons handled below in Step C
+                    }
+                    // Record members so Step C skips them.
+                    for node in &scc.nodes {
+                        if let NodeId::StreamTable(id) = node {
+                            scc_member_ids.insert(*id);
+                        }
+                    }
+                    // Check if any SCC member needs refresh
+                    let any_due = scc.nodes.iter().any(|node| {
+                        if let NodeId::StreamTable(id) = node {
+                            load_st_by_id(*id)
+                                .map(|st| {
+                                    (st.status == StStatus::Active
+                                        || st.status == StStatus::Initializing)
+                                        && (check_schedule(&st, dag_ref)
+                                            || check_upstream_changes(&st)
+                                            || st.needs_reinit)
+                                })
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    });
+                    if !any_due {
+                        continue;
+                    }
+                    iterate_to_fixpoint(
+                        scc,
+                        dag_ref,
+                        &mut retry_states,
+                        &retry_policy,
+                        now_ms,
+                        tick_watermark.as_deref(),
+                    );
+                }
+            }
+
             // Step C: Compute consistency groups and refresh group-by-group
             let groups = dag_ref.compute_consistency_groups();
 
@@ -1494,6 +1546,10 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         NodeId::StreamTable(id) => *id,
                         _ => continue,
                     };
+                    // Skip SCC members already handled by fixpoint iteration.
+                    if scc_member_ids.contains(&pgt_id) {
+                        continue;
+                    }
                     refresh_single_st(
                         pgt_id,
                         dag_ref,
@@ -1507,6 +1563,22 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 }
 
                 // Multi-member group: check if all members have diamond_consistency = 'atomic'.
+                // Skip groups where all members are SCC-handled.
+                let non_scc_members: Vec<&NodeId> = group
+                    .members
+                    .iter()
+                    .filter(|m| {
+                        if let NodeId::StreamTable(id) = m {
+                            !scc_member_ids.contains(id)
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+                if non_scc_members.is_empty() {
+                    continue;
+                }
+
                 let all_atomic = group.members.iter().all(|m| {
                     if let NodeId::StreamTable(id) = m {
                         load_st_by_id(*id)
@@ -2178,6 +2250,219 @@ fn has_stream_table_source_changes(st: &StreamTableMeta) -> bool {
         }
     }
     false
+}
+
+// ── Fixpoint Iteration for Cyclic SCCs (CYC-5) ───────────────────────────
+
+/// Iterate a cyclic SCC to a fixed point.
+///
+/// Refreshes all members of the SCC repeatedly until convergence (zero net
+/// changes across all members in a full pass) or `max_fixpoint_iterations`
+/// is exceeded.
+///
+/// Each member must use DIFFERENTIAL mode — FULL mode truncates and re-inserts
+/// all rows every iteration, which would never converge to zero changes.
+///
+/// All SCC members are wrapped in an internal sub-transaction so that a
+/// failure in any member rolls back the entire iteration.
+fn iterate_to_fixpoint(
+    scc: &Scc,
+    _dag: &StDag,
+    retry_states: &mut HashMap<i64, RetryState>,
+    retry_policy: &RetryPolicy,
+    now_ms: u64,
+    tick_watermark: Option<&str>,
+) {
+    let max_iter = config::pg_trickle_max_fixpoint_iterations();
+    let gated_oids = load_gated_source_oids();
+
+    // Collect ST pgt_ids from the SCC.
+    let member_ids: Vec<i64> = scc
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            NodeId::StreamTable(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+
+    if member_ids.is_empty() {
+        return;
+    }
+
+    // Build member names for logging.
+    let member_names: Vec<String> = member_ids
+        .iter()
+        .filter_map(|id| load_st_by_id(*id).map(|st| format!("{}.{}", st.pgt_schema, st.pgt_name)))
+        .collect();
+
+    log!(
+        "pg_trickle: SCC fixpoint — starting iteration for {} members [{}]",
+        member_ids.len(),
+        member_names.join(", "),
+    );
+
+    // Validate all members use DIFFERENTIAL mode.
+    for &pgt_id in &member_ids {
+        if let Some(st) = load_st_by_id(pgt_id)
+            && st.refresh_mode != RefreshMode::Differential
+        {
+            pgrx::warning!(
+                "pg_trickle: SCC fixpoint — {}.{} uses {} mode, \
+                     but only DIFFERENTIAL is supported in cyclic dependencies",
+                st.pgt_schema,
+                st.pgt_name,
+                st.refresh_mode.as_str(),
+            );
+            return;
+        }
+    }
+
+    for iteration in 0..max_iter {
+        let subtxn = SubTransaction::begin();
+        let mut total_changes: i64 = 0;
+        let mut iteration_ok = true;
+
+        for &pgt_id in &member_ids {
+            let st = match load_st_by_id(pgt_id) {
+                Some(st) => st,
+                None => continue,
+            };
+
+            if st.status != StStatus::Active && st.status != StStatus::Initializing {
+                continue;
+            }
+
+            // Skip gated sources.
+            if is_any_source_gated(pgt_id, &gated_oids) {
+                log_gated_skip(&st);
+                continue;
+            }
+
+            // Check retry backoff.
+            let retry = retry_states.entry(pgt_id).or_default();
+            if retry.is_in_backoff(now_ms) {
+                emit_stale_alert_if_needed(&st);
+                continue;
+            }
+
+            // In a fixpoint loop, every iteration must use DIFFERENTIAL.
+            // On the first iteration (or if not yet populated), use FULL to seed.
+            let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
+            let action = if !st.is_populated || iteration == 0 {
+                if has_changes || !st.is_populated {
+                    refresh::determine_refresh_action(&st, has_changes)
+                } else {
+                    RefreshAction::NoData
+                }
+            } else {
+                // Subsequent iterations: always DIFFERENTIAL for convergence.
+                if has_changes || has_stream_table_source_changes(&st) {
+                    RefreshAction::Differential
+                } else {
+                    RefreshAction::NoData
+                }
+            };
+
+            if action == RefreshAction::NoData && iteration > 0 {
+                // Member has converged — no upstream changes.
+                continue;
+            }
+
+            let result = execute_scheduled_refresh(&st, action, tick_watermark);
+
+            match result {
+                RefreshOutcome::Success => {
+                    // Read back the rows from the most recent refresh record.
+                    let (ins, del) = last_refresh_row_counts(pgt_id);
+                    total_changes += ins + del;
+
+                    let retry = retry_states.entry(pgt_id).or_default();
+                    retry.reset();
+                }
+                RefreshOutcome::RetryableFailure | RefreshOutcome::PermanentFailure => {
+                    log!(
+                        "pg_trickle: SCC fixpoint aborted — {}.{} failed at iteration {}",
+                        st.pgt_schema,
+                        st.pgt_name,
+                        iteration + 1,
+                    );
+                    iteration_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if !iteration_ok {
+            subtxn.rollback();
+            // Record failure for retry tracking on all members.
+            for &pgt_id in &member_ids {
+                let retry = retry_states.entry(pgt_id).or_default();
+                retry.record_failure(retry_policy, now_ms);
+            }
+            return;
+        }
+
+        subtxn.commit();
+
+        if total_changes == 0 {
+            log!(
+                "pg_trickle: SCC converged after {} iteration(s) [{}]",
+                iteration + 1,
+                member_names.join(", "),
+            );
+            // Record convergence metadata in the catalog.
+            for &pgt_id in &member_ids {
+                let _ = StreamTableMeta::update_last_fixpoint_iterations(pgt_id, iteration + 1);
+            }
+            return;
+        }
+
+        log!(
+            "pg_trickle: SCC fixpoint iteration {} — {} total changes",
+            iteration + 1,
+            total_changes,
+        );
+    }
+
+    // Non-convergence: mark all SCC members as ERROR.
+    pgrx::warning!(
+        "pg_trickle: SCC did not converge after {} iterations — marking {} members as ERROR [{}]",
+        max_iter,
+        member_ids.len(),
+        member_names.join(", "),
+    );
+    for &pgt_id in &member_ids {
+        let _ = StreamTableMeta::update_status(pgt_id, StStatus::Error);
+        let _ = StreamTableMeta::update_last_fixpoint_iterations(pgt_id, max_iter);
+    }
+}
+
+/// Read the rows_inserted and rows_deleted from the most recent completed
+/// refresh record for a stream table. Used by fixpoint iteration to detect
+/// convergence without modifying the `execute_scheduled_refresh` return type.
+fn last_refresh_row_counts(pgt_id: i64) -> (i64, i64) {
+    Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT rows_inserted, rows_deleted \
+                 FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = $1 AND status = 'COMPLETED' \
+                 ORDER BY refresh_id DESC LIMIT 1",
+                None,
+                &[pgt_id.into()],
+            )
+            .ok();
+        match table {
+            Some(t) if !t.is_empty() => {
+                let first = t.first();
+                let ins = first.get::<i64>(1).ok().flatten().unwrap_or(0);
+                let del = first.get::<i64>(2).ok().flatten().unwrap_or(0);
+                (ins, del)
+            }
+            _ => (0, 0),
+        }
+    })
 }
 
 /// Refresh a single (non-group) stream table with full retry handling.
