@@ -1225,6 +1225,24 @@ Zero-code monitoring integration. All config files live in a new
 | I-6 | 1M-row benchmark tier (`bench_*_1m_*` + `bench_large_matrix`) | ✅ Done |
 | I-8 | Criterion noise reduction (`sample_size(200)`, `measurement_time(10s)`) | ✅ Done |
 
+### Performance — Parallel Refresh, MERGE Optimization & Advanced Benchmarks (Part 9 S4–S6) ✅ Done
+
+> DAG level-parallel scheduling, improved MERGE strategy selection (xxh64
+> hashing, aggregate saturation bypass, cost-based threshold), and expanded
+> benchmark suite (JSON comparison, concurrent writers, window/lateral/CTE).
+
+| Item | Description | Status |
+|------|-------------|--------|
+| C-1 | DAG level extraction (`topological_levels()` on `StDag` and `ExecutionUnitDag`) | ✅ Done |
+| C-2 | Level-parallel dispatch (existing `parallel_dispatch_tick` infrastructure sufficient) | ✅ Done |
+| C-3 | Result communication (existing `SchedulerJob` + `pgt_refresh_history` sufficient) | ✅ Done |
+| D-1 | xxh64 hash-based change detection for wide tables (≥50 cols) | ✅ Done |
+| D-2 | Aggregate saturation FULL bypass (changes ≥ groups → FULL) | ✅ Done |
+| D-3 | Cost-based strategy selection from `pgt_refresh_history` data | ✅ Done |
+| I-4 | Cross-run comparison tool (`just bench-compare`, JSON output) | ✅ Done |
+| I-5 | Concurrent writer benchmarks (1/2/4/8 writers) | ✅ Done |
+| I-7 | Window / lateral / CTE / UNION ALL operator benchmarks | ✅ Done |
+
 > **v0.7.0 total: ~59–62h**
 
 **Exit criteria:**

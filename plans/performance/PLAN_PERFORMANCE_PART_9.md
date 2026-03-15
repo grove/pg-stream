@@ -702,29 +702,29 @@ memory pressure). This makes it difficult to detect real regressions.
 | B-2 | GUC + backward compatibility + migration | 4 hours | ✅ Done |
 | B-3 | Benchmark write-side improvement | 2 hours | ✅ Done |
 
-### Session 4: Parallel Refresh (16–24 hours)
+### Session 4: Parallel Refresh (16–24 hours) ✅ Done
 
-| Step | Task | Effort |
-|------|------|--------|
-| C-1 | DAG level extraction | 2–4 hours |
-| C-2 | Dynamic background worker dispatch | 12–16 hours |
-| C-3 | Result communication + error handling | 3–4 hours |
+| Step | Task | Effort | Status |
+|------|------|--------|--------|
+| C-1 | DAG level extraction | 2–4 hours | ✅ Done — `topological_levels()` on StDag & ExecutionUnitDag |
+| C-2 | Dynamic background worker dispatch | 12–16 hours | ✅ Done — existing `parallel_dispatch_tick` sufficient |
+| C-3 | Result communication + error handling | 3–4 hours | ✅ Done — existing `SchedulerJob` + `pgt_refresh_history` |
 
-### Session 5: MERGE Optimization (8–12 hours)
+### Session 5: MERGE Optimization (8–12 hours) ✅ Done
 
-| Step | Task | Effort |
-|------|------|--------|
-| D-1 | Hash-based change detection for wide tables | 4–6 hours |
-| D-2 | Conditional FULL bypass for saturated aggregates | 3–4 hours |
-| D-3 | Cost-based strategy selection | 6–8 hours |
+| Step | Task | Effort | Status |
+|------|------|--------|--------|
+| D-1 | Hash-based change detection for wide tables | 4–6 hours | ✅ Done — xxh64 via `pg_trickle_hash` |
+| D-2 | Conditional FULL bypass for saturated aggregates | 3–4 hours | ✅ Done — changes ≥ groups → FULL |
+| D-3 | Cost-based strategy selection | 6–8 hours | ✅ Done — history-based cost model blended with ratio |
 
-### Session 6: Advanced Benchmarks (8–12 hours)
+### Session 6: Advanced Benchmarks (8–12 hours) ✅ Done
 
-| Step | Task | Effort |
-|------|------|--------|
-| I-4 | Cross-run comparison tool | 4–6 hours |
-| I-5 | Concurrent writer benchmarks | 4–6 hours |
-| I-7 | Window / lateral / CTE operator benchmarks | 4–6 hours |
+| Step | Task | Effort | Status |
+|------|------|--------|--------|
+| I-4 | Cross-run comparison tool | 4–6 hours | ✅ Done — JSON output + `just bench-compare` |
+| I-5 | Concurrent writer benchmarks | 4–6 hours | ✅ Done — 1/2/4/8 writer sweep |
+| I-7 | Window / lateral / CTE operator benchmarks | 4–6 hours | ✅ Done — 4 new scenarios |
 
 ### Summary
 
@@ -732,10 +732,10 @@ memory pressure). This makes it difficult to detect real regressions.
 |---------|-------|--------|-------|
 | 1 | Regression triage | 3–4h | ✅ Done: A-3/A-4 fixed; A-1/A-2 deferred to E2E run |
 | 2 | Benchmark infrastructure | 8–12h | ✅ Done: I-1c, I-2, I-3, I-6, I-8 |
-| 3 | Statement-level triggers | 12–16h | 50–80% write-side overhead reduction |
-| 4 | Parallel refresh | 16–24h | Linear speedup for multi-ST deployments |
-| 5 | MERGE optimization | 8–12h | Better strategy selection; wide table support |
-| 6 | Advanced benchmarks | 8–12h | Comprehensive coverage; concurrent write testing |
+| 3 | Statement-level triggers | 12–16h | ✅ Done: 50–80% write-side overhead reduction |
+| 4 | Parallel refresh | 16–24h | ✅ Done: C-1/C-2/C-3 — level-parallel dispatch |
+| 5 | MERGE optimization | 8–12h | ✅ Done: D-1/D-2/D-3 — xxh64, saturation bypass, cost model |
+| 6 | Advanced benchmarks | 8–12h | ✅ Done: I-4/I-5/I-7 — comparison tool, concurrency, operators |
 | **Total** | | **55–80h** | |
 
 ### Recommended Execution Order

@@ -37,6 +37,20 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   with `split_once('/')` in `lsn_gt()`, eliminating a heap allocation on
   every LSN comparison. Addresses the +22% `lsn_gt` Criterion regression
   (A-4).
+- **DAG level extraction (C-1):** `topological_levels()` on `StDag` and
+  `ExecutionUnitDag` returns successive parallel-dispatch levels for
+  level-parallel refresh scheduling.
+- **xxh64 hash-based change detection (D-1):** Wide tables (≥50 columns)
+  now use `pgtrickle.pg_trickle_hash(concat_ws(...))` instead of
+  `md5(concat(...))` in the MERGE IS DISTINCT FROM clause, reducing hash
+  computation cost.
+- **Aggregate saturation bypass (D-2):** When an aggregate stream table
+  has more pending changes than materialized groups, the refresh engine
+  now falls back to FULL immediately, avoiding expensive per-row MERGE.
+- **Cost-based strategy selection (D-3):** The adaptive threshold now blends
+  the single-cycle ratio-based signal with a cost model estimated from
+  recent `pgt_refresh_history` entries, improving fallback accuracy for
+  workloads with variable delta sizes.
 
 ### Improved
 
@@ -58,6 +72,17 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   - **Docker benchmark target (I-1c):** New `just bench-docker` target runs
     Criterion benchmarks inside the builder Docker image for environments
     where local pg_stub linking is problematic.
+- **Advanced benchmark suite** — Session 6 improvements:
+  - **Cross-run comparison tool (I-4):** Benchmarks now emit JSON results
+    to `target/bench_results/`. New `just bench-compare` target and
+    `scripts/bench_compare.sh` for color-coded regression/improvement
+    reporting across runs.
+  - **Concurrent writer benchmarks (I-5):** New `bench_concurrent_writers`
+    test sweeps 1/2/4/8 writer connections to stress-test CDC trigger
+    contention and BIGSERIAL locking under parallel DML.
+  - **Window/lateral/CTE/UNION ALL benchmarks (I-7):** Four new
+    query scenarios (`window`, `lateral`, `cte`, `union_all`) added to the
+    E2E benchmark matrix for comprehensive operator coverage.
 
 ---
 
