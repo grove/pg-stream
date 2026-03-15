@@ -14,6 +14,113 @@ use crate::error::PgTrickleError;
 use pgrx::prelude::*;
 use std::collections::HashMap;
 
+// ── Safe FFI helpers ───────────────────────────────────────────────────
+//
+// These helpers encapsulate the most common unsafe patterns when walking
+// PostgreSQL parse-tree nodes, concentrating the `// SAFETY:` reasoning
+// into a handful of well-documented functions and macros.
+//
+// See plans/safety/PLAN_REDUCED_UNSAFE.md for the full rationale.
+
+/// Convert a PostgreSQL C string pointer to a Rust `&str`.
+///
+/// Returns `Err` if the pointer is null or the bytes are not valid UTF-8.
+fn pg_cstr_to_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, PgTrickleError> {
+    if ptr.is_null() {
+        return Err(PgTrickleError::QueryParseError(
+            "NULL C string pointer".into(),
+        ));
+    }
+    // SAFETY: Caller verified non-null. PostgreSQL identifiers and SQL
+    // fragments stored in parse-tree nodes are always NUL-terminated C
+    // strings allocated in a valid memory context.
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| PgTrickleError::QueryParseError("Invalid UTF-8 in C string".into()))
+}
+
+/// Convert a PostgreSQL `List *` to a safe `PgList<T>`.
+///
+/// Null pointers yield an empty list (consistent with pgrx behaviour).
+fn pg_list<T>(raw: *mut pg_sys::List) -> pgrx::PgList<T> {
+    // SAFETY: `PgList::from_pg` is safe for both null and valid list pointers
+    // returned from the PostgreSQL parser. Null produces an empty list.
+    unsafe { pgrx::PgList::<T>::from_pg(raw) }
+}
+
+/// Attempt to downcast a `*mut pg_sys::Node` to a concrete parse-tree type.
+///
+/// Returns `Some(&T)` if the node's tag matches, `None` if the pointer is
+/// null or the tag does not match.
+macro_rules! cast_node {
+    ($node:expr, $tag:ident, $ty:ty) => {{
+        let __n = $node;
+        // SAFETY: `pgrx::is_a` reads the node's tag field, which is valid
+        // for any non-null `Node*` allocated by the PostgreSQL parser.
+        // The pointer cast is sound because `is_a` verified the concrete
+        // type matches `$tag`.
+        if !__n.is_null() && unsafe { pgrx::is_a(__n, pg_sys::NodeTag::$tag) } {
+            Some(unsafe { &*(__n as *const $ty) })
+        } else {
+            None
+        }
+    }};
+}
+
+/// Parse a SQL string into a list of `RawStmt` nodes.
+///
+/// Must be called within a PostgreSQL backend with a valid memory context.
+#[cfg(not(test))]
+fn parse_query(sql: &str) -> Result<pgrx::PgList<pg_sys::RawStmt>, PgTrickleError> {
+    let c_sql = std::ffi::CString::new(sql)
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
+    // SAFETY: raw_parser is a PostgreSQL C function that is safe to call
+    // within a backend process with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_sql.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Err(PgTrickleError::QueryParseError(
+            "raw_parser returned NULL".into(),
+        ));
+    }
+    Ok(pg_list::<pg_sys::RawStmt>(raw_list))
+}
+
+/// Parse SQL and extract the first top-level `SelectStmt`.
+///
+/// Returns `Ok(None)` if the query is empty or the first statement is not
+/// a SELECT.
+#[cfg(not(test))]
+fn parse_first_select(sql: &str) -> Result<Option<*const pg_sys::SelectStmt>, PgTrickleError> {
+    let stmts = parse_query(sql)?;
+    let raw_stmt = match stmts.head() {
+        Some(rs) => rs,
+        None => return Ok(None),
+    };
+    // SAFETY: raw_stmt is a valid pointer from the parser.
+    let node = unsafe { (*raw_stmt).stmt };
+    match cast_node!(node, T_SelectStmt, pg_sys::SelectStmt) {
+        Some(select) => Ok(Some(select as *const pg_sys::SelectStmt)),
+        None => Ok(None),
+    }
+}
+
+/// Test stub: `parse_query` is unavailable without a PostgreSQL backend.
+#[cfg(test)]
+fn parse_query(_sql: &str) -> Result<pgrx::PgList<pg_sys::RawStmt>, PgTrickleError> {
+    Err(PgTrickleError::QueryParseError(
+        "parse_query unavailable in unit tests".into(),
+    ))
+}
+
+/// Test stub: `parse_first_select` is unavailable without a PostgreSQL backend.
+#[cfg(test)]
+fn parse_first_select(_sql: &str) -> Result<Option<*const pg_sys::SelectStmt>, PgTrickleError> {
+    Err(PgTrickleError::QueryParseError(
+        "parse_first_select unavailable in unit tests".into(),
+    ))
+}
+
 /// Column metadata.
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -2243,29 +2350,19 @@ fn collect_raw_expr_volatility(raw_sql: &str, worst: &mut char) -> Result<(), Pg
     }
 
     let wrapper = format!("SELECT ({})", raw_sql);
-    let c_query = match std::ffi::CString::new(wrapper.as_str()) {
-        Ok(c) => c,
-        Err(_) => return Ok(()), // NUL byte in SQL — can't parse, assume safe
+    let list = match parse_query(wrapper.as_str()) {
+        Ok(l) => l,
+        Err(_) => {
+            // Parsing failed — conservatively assume volatile.
+            *worst = max_volatility(*worst, 'v');
+            return Ok(());
+        }
     };
-
-    // SAFETY: raw_parser is safe when called within a PostgreSQL backend
-    // with a valid memory context.
-    let parse_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-
-    if parse_list.is_null() {
-        // Parsing failed — conservatively assume volatile.
-        *worst = max_volatility(*worst, 'v');
-        return Ok(());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(parse_list) };
-    for node in list.iter_ptr() {
-        if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RawStmt) } {
-            let raw_stmt = unsafe { &*(node as *const pg_sys::RawStmt) };
-            if !raw_stmt.stmt.is_null() {
-                walk_node_for_volatility(raw_stmt.stmt, worst)?;
-            }
+    for raw_stmt in list.iter_ptr() {
+        // SAFETY: raw_stmt is a valid pointer from parse_query.
+        let stmt = unsafe { (*raw_stmt).stmt };
+        if !stmt.is_null() {
+            walk_node_for_volatility(stmt, worst)?;
         }
     }
 
@@ -2333,14 +2430,13 @@ fn walk_node_for_volatility(
         return Ok(());
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
-        let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
+    if let Some(fcall) = cast_node!(node, T_FuncCall, pg_sys::FuncCall) {
         if let Ok(func_name) = unsafe { extract_func_name(fcall.funcname) } {
             let vol = lookup_function_volatility(&func_name)?;
             *worst = max_volatility(*worst, vol);
         }
         // Also walk function arguments
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+        let args_list = pg_list::<pg_sys::Node>(fcall.args);
         for n in args_list.iter_ptr() {
             walk_node_for_volatility(n, worst)?;
         }
@@ -2348,13 +2444,11 @@ fn walk_node_for_volatility(
         if !fcall.agg_filter.is_null() {
             walk_node_for_volatility(fcall.agg_filter, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SQLValueFunction) } {
-        let svf = unsafe { &*(node as *const pg_sys::SQLValueFunction) };
+    } else if let Some(svf) = cast_node!(node, T_SQLValueFunction, pg_sys::SQLValueFunction) {
         *worst = max_volatility(*worst, sql_value_function_volatility(svf.op));
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        let stmt = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    } else if let Some(stmt) = cast_node!(node, T_SelectStmt, pg_sys::SelectStmt) {
         // Walk target list
-        let tlist = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(stmt.targetList) };
+        let tlist = pg_list::<pg_sys::Node>(stmt.targetList);
         for n in tlist.iter_ptr() {
             walk_node_for_volatility(n, worst)?;
         }
@@ -2366,13 +2460,11 @@ fn walk_node_for_volatility(
         if !stmt.havingClause.is_null() {
             walk_node_for_volatility(stmt.havingClause, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_ResTarget) } {
-        let rt = unsafe { &*(node as *const pg_sys::ResTarget) };
+    } else if let Some(rt) = cast_node!(node, T_ResTarget, pg_sys::ResTarget) {
         if !rt.val.is_null() {
             walk_node_for_volatility(rt.val, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
-        let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+    } else if let Some(aexpr) = cast_node!(node, T_A_Expr, pg_sys::A_Expr) {
         // G7.2: Check the operator's implementing function volatility.
         if !aexpr.name.is_null()
             && let Ok(op_name) = unsafe { extract_operator_name(aexpr.name) }
@@ -2386,55 +2478,47 @@ fn walk_node_for_volatility(
         if !aexpr.rexpr.is_null() {
             walk_node_for_volatility(aexpr.rexpr, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let bexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(bexpr.args) };
+    } else if let Some(bexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr) {
+        let args_list = pg_list::<pg_sys::Node>(bexpr.args);
         for n in args_list.iter_ptr() {
             walk_node_for_volatility(n, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
-        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
+    } else if let Some(tc) = cast_node!(node, T_TypeCast, pg_sys::TypeCast) {
         if !tc.arg.is_null() {
             walk_node_for_volatility(tc.arg, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseExpr) } {
-        let ce = unsafe { &*(node as *const pg_sys::CaseExpr) };
+    } else if let Some(ce) = cast_node!(node, T_CaseExpr, pg_sys::CaseExpr) {
         if !ce.arg.is_null() {
             walk_node_for_volatility(ce.arg as *mut pg_sys::Node, worst)?;
         }
-        let whens = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(ce.args) };
+        let whens = pg_list::<pg_sys::Node>(ce.args);
         for w in whens.iter_ptr() {
             walk_node_for_volatility(w, worst)?;
         }
         if !ce.defresult.is_null() {
             walk_node_for_volatility(ce.defresult as *mut pg_sys::Node, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseWhen) } {
-        let cw = unsafe { &*(node as *const pg_sys::CaseWhen) };
+    } else if let Some(cw) = cast_node!(node, T_CaseWhen, pg_sys::CaseWhen) {
         if !cw.expr.is_null() {
             walk_node_for_volatility(cw.expr as *mut pg_sys::Node, worst)?;
         }
         if !cw.result.is_null() {
             walk_node_for_volatility(cw.result as *mut pg_sys::Node, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CoalesceExpr) } {
-        let ce = unsafe { &*(node as *const pg_sys::CoalesceExpr) };
-        let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(ce.args) };
+    } else if let Some(ce) = cast_node!(node, T_CoalesceExpr, pg_sys::CoalesceExpr) {
+        let args = pg_list::<pg_sys::Node>(ce.args);
         for n in args.iter_ptr() {
             walk_node_for_volatility(n, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullTest) } {
-        let nt = unsafe { &*(node as *const pg_sys::NullTest) };
+    } else if let Some(nt) = cast_node!(node, T_NullTest, pg_sys::NullTest) {
         if !nt.arg.is_null() {
             walk_node_for_volatility(nt.arg as *mut pg_sys::Node, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CollateClause) } {
-        let cc = unsafe { &*(node as *const pg_sys::CollateClause) };
+    } else if let Some(cc) = cast_node!(node, T_CollateClause, pg_sys::CollateClause) {
         if !cc.arg.is_null() {
             walk_node_for_volatility(cc.arg, worst)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
-        let sl = unsafe { &*(node as *const pg_sys::SubLink) };
+    } else if let Some(sl) = cast_node!(node, T_SubLink, pg_sys::SubLink) {
         if !sl.testexpr.is_null() {
             walk_node_for_volatility(sl.testexpr, worst)?;
         }
@@ -3263,7 +3347,7 @@ impl CteParseContext {
 pub fn query_has_recursive_cte(query: &str) -> Result<bool, PgTrickleError> {
     // SAFETY: raw_parser is safe when called within a PostgreSQL backend
     // with a valid memory context.
-    unsafe { query_has_recursive_cte_inner(query) }
+    query_has_recursive_cte_inner(query)
 }
 
 /// Lightweight check for any top-level WITH clause in a defining query.
@@ -3272,64 +3356,26 @@ pub fn query_has_recursive_cte(query: &str) -> Result<bool, PgTrickleError> {
 /// refresh planning to select safe fallback strategies without building the
 /// full OpTree.
 pub fn query_has_cte(query: &str) -> Result<bool, PgTrickleError> {
-    unsafe { query_has_cte_inner(query) }
+    query_has_cte_inner(query)
 }
 
-unsafe fn query_has_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Err(PgTrickleError::QueryParseError(
-            "raw_parser returned NULL".into(),
-        ));
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(stmt) => stmt,
+fn query_has_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
+    let select_ptr = match parse_first_select(query)? {
+        Some(s) => s,
         None => return Ok(false),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(false);
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    // SAFETY: pointer is valid for the duration of the current memory context.
+    let select = unsafe { &*select_ptr };
     Ok(!select.withClause.is_null())
 }
 
-unsafe fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Err(PgTrickleError::QueryParseError(
-            "raw_parser returned NULL".into(),
-        ));
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(stmt) => stmt,
+fn query_has_recursive_cte_inner(query: &str) -> Result<bool, PgTrickleError> {
+    let select_ptr = match parse_first_select(query)? {
+        Some(s) => s,
         None => return Ok(false),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(false);
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    // SAFETY: pointer is valid for the duration of the current memory context.
+    let select = unsafe { &*select_ptr };
     if select.withClause.is_null() {
         return Ok(false);
     }
@@ -3376,44 +3422,24 @@ pub fn rewrite_views_inline(query: &str) -> Result<String, PgTrickleError> {
 ///
 /// Returns the original string unchanged if no views are found.
 fn rewrite_views_inline_once(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Build a substitution map: views found in FROM → their definitions
     let mut subs = Vec::new();
     let mut found_view = false;
 
     // Walk the FROM clause to find views. Also walk set-operation arms and CTEs.
-    unsafe { collect_view_substitutions(select, &mut subs, &mut found_view)? };
+    collect_view_substitutions(select, &mut subs, &mut found_view)?;
 
     if !found_view {
         return Ok(query.to_string());
     }
 
     // Deparse the full query with view substitutions applied
-    unsafe { deparse_select_stmt_with_view_subs(select, &subs) }
+    deparse_select_stmt_with_view_subs(select, &subs)
 }
 
 /// Information about a view found in the FROM clause that should be
@@ -3494,9 +3520,7 @@ fn strip_view_definition_suffix(raw: &str) -> String {
 /// names, subquery aliases, or function-call ranges).
 fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgTrickleError> {
     if !rv.schemaname.is_null() {
-        let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
-            .to_str()
-            .map_err(|_| PgTrickleError::QueryParseError("Invalid schema name encoding".into()))?;
+        let schema = pg_cstr_to_str(rv.schemaname)?;
         return Ok(Some(schema.to_string()));
     }
 
@@ -3504,9 +3528,7 @@ fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgTr
     if rv.relname.is_null() {
         return Ok(None);
     }
-    let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-        .to_str()
-        .map_err(|_| PgTrickleError::QueryParseError("Invalid relation name encoding".into()))?;
+    let relname = pg_cstr_to_str(rv.relname)?;
 
     let sql = format!(
         "SELECT n.nspname::text FROM pg_class c \
@@ -3536,7 +3558,7 @@ fn resolve_rangevar_schema(rv: &pg_sys::RangeVar) -> Result<Option<String>, PgTr
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `SelectStmt`.
-unsafe fn collect_view_substitutions(
+fn collect_view_substitutions(
     select: *const pg_sys::SelectStmt,
     subs: &mut Vec<ViewSubstitution>,
     found_view: &mut bool,
@@ -3546,38 +3568,34 @@ unsafe fn collect_view_substitutions(
     // Handle set operations: recurse into larg/rarg
     if s.op != pg_sys::SetOperation::SETOP_NONE {
         if !s.larg.is_null() {
-            unsafe { collect_view_substitutions(s.larg, subs, found_view)? };
+            collect_view_substitutions(s.larg, subs, found_view)?;
         }
         if !s.rarg.is_null() {
-            unsafe { collect_view_substitutions(s.rarg, subs, found_view)? };
+            collect_view_substitutions(s.rarg, subs, found_view)?;
         }
         return Ok(());
     }
 
     // Walk the FROM clause
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(s.fromClause);
     for node_ptr in from_list.iter_ptr() {
-        unsafe { collect_view_subs_from_item(node_ptr, subs, found_view)? };
+        collect_view_subs_from_item(node_ptr, subs, found_view)?;
     }
 
     // Walk CTE bodies if present
     if !s.withClause.is_null() {
         let wc = unsafe { &*s.withClause };
-        let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
+        let cte_list = pg_list::<pg_sys::Node>(wc.ctes);
         for node_ptr in cte_list.iter_ptr() {
-            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
-                let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
-                if !cte.ctequery.is_null()
-                    && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
-                {
-                    unsafe {
-                        collect_view_substitutions(
-                            cte.ctequery as *const pg_sys::SelectStmt,
-                            subs,
-                            found_view,
-                        )?
-                    };
-                }
+            if let Some(cte) = cast_node!(node_ptr, T_CommonTableExpr, pg_sys::CommonTableExpr)
+                && !cte.ctequery.is_null()
+                && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
+            {
+                collect_view_substitutions(
+                    cte.ctequery as *const pg_sys::SelectStmt,
+                    subs,
+                    found_view,
+                )?;
             }
         }
     }
@@ -3589,7 +3607,7 @@ unsafe fn collect_view_substitutions(
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree node.
-unsafe fn collect_view_subs_from_item(
+fn collect_view_subs_from_item(
     node: *mut pg_sys::Node,
     subs: &mut Vec<ViewSubstitution>,
     found_view: &mut bool,
@@ -3598,17 +3616,12 @@ unsafe fn collect_view_subs_from_item(
         return Ok(());
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
-
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         // Get relname
         if rv.relname.is_null() {
             return Ok(());
         }
-        let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-            .to_str()
-            .map_err(|_| PgTrickleError::QueryParseError("Invalid relation name encoding".into()))?
-            .to_string();
+        let relname = pg_cstr_to_str(rv.relname)?.to_string();
 
         // Resolve schema — if not found, this is a CTE/subquery alias, skip.
         let schema = match resolve_rangevar_schema(rv)? {
@@ -3626,10 +3639,7 @@ unsafe fn collect_view_subs_from_item(
                 // Determine alias: explicit alias or view name
                 let alias = if !rv.alias.is_null() {
                     let a = unsafe { &*(rv.alias) };
-                    unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                        .to_str()
-                        .unwrap_or(&relname)
-                        .to_string()
+                    pg_cstr_to_str(a.aliasname).unwrap_or(&relname).to_string()
                 } else {
                     relname.clone()
                 };
@@ -3646,23 +3656,14 @@ unsafe fn collect_view_subs_from_item(
                 // Not a view — leave as-is
             }
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        unsafe { collect_view_subs_from_item(join.larg, subs, found_view)? };
-        unsafe { collect_view_subs_from_item(join.rarg, subs, found_view)? };
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
-        if !sub.subquery.is_null()
-            && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
-        {
-            unsafe {
-                collect_view_substitutions(
-                    sub.subquery as *const pg_sys::SelectStmt,
-                    subs,
-                    found_view,
-                )?
-            };
-        }
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        collect_view_subs_from_item(join.larg, subs, found_view)?;
+        collect_view_subs_from_item(join.rarg, subs, found_view)?;
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect)
+        && !sub.subquery.is_null()
+        && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+    {
+        collect_view_substitutions(sub.subquery as *const pg_sys::SelectStmt, subs, found_view)?;
     }
     // JSON_TABLE: skip — it doesn't reference tables that could be views.
     // The context item expression references the left-hand table which is
@@ -3676,7 +3677,7 @@ unsafe fn collect_view_subs_from_item(
 ///
 /// # Safety
 /// Caller must ensure `stmt` points to a valid `SelectStmt`.
-unsafe fn deparse_select_stmt_with_view_subs(
+fn deparse_select_stmt_with_view_subs(
     stmt: *const pg_sys::SelectStmt,
     subs: &[ViewSubstitution],
 ) -> Result<String, PgTrickleError> {
@@ -3710,12 +3711,12 @@ unsafe fn deparse_select_stmt_with_view_subs(
         };
 
         let left = if !s.larg.is_null() {
-            unsafe { deparse_select_stmt_with_view_subs(s.larg, subs)? }
+            deparse_select_stmt_with_view_subs(s.larg, subs)?
         } else {
             String::new()
         };
         let right = if !s.rarg.is_null() {
-            unsafe { deparse_select_stmt_with_view_subs(s.rarg, subs)? }
+            deparse_select_stmt_with_view_subs(s.rarg, subs)?
         } else {
             String::new()
         };
@@ -3726,12 +3727,12 @@ unsafe fn deparse_select_stmt_with_view_subs(
         // The CTE definitions live here, NOT on larg/rarg, so they must be
         // prepended after the arms have been recursively processed.
         if !s.withClause.is_null() {
-            let with_sql = unsafe { deparse_with_clause_with_view_subs(s.withClause, subs)? };
+            let with_sql = deparse_with_clause_with_view_subs(s.withClause, subs)?;
             result = format!("{with_sql} {result}");
         }
 
         // Top-level ORDER BY / LIMIT / OFFSET on set operations
-        let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.sortClause) };
+        let sort_list = pg_list::<pg_sys::Node>(s.sortClause);
         if !sort_list.is_empty() {
             let sorts = unsafe { deparse_sort_clause(&sort_list)? };
             result.push_str(&format!(" ORDER BY {sorts}"));
@@ -3753,12 +3754,12 @@ unsafe fn deparse_select_stmt_with_view_subs(
 
     // WITH clause (CTEs) — deparse CTE bodies with view subs too
     if !s.withClause.is_null() {
-        let with_sql = unsafe { deparse_with_clause_with_view_subs(s.withClause, subs)? };
+        let with_sql = deparse_with_clause_with_view_subs(s.withClause, subs)?;
         parts.push(with_sql);
     }
 
     // DISTINCT
-    let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.distinctClause) };
+    let distinct_list = pg_list::<pg_sys::Node>(s.distinctClause);
     let select_kw = if !distinct_list.is_empty() {
         // Check if it's DISTINCT ON or plain DISTINCT
         let has_real_exprs = distinct_list.iter_ptr().any(|ptr| !ptr.is_null());
@@ -3784,11 +3785,11 @@ unsafe fn deparse_select_stmt_with_view_subs(
     parts.push(format!("{select_kw} {targets}"));
 
     // FROM clause with view substitutions
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(s.fromClause);
     if !from_list.is_empty() {
         let mut from_items = Vec::new();
         for node_ptr in from_list.iter_ptr() {
-            let item = unsafe { deparse_from_item_with_view_subs(node_ptr, subs)? };
+            let item = deparse_from_item_with_view_subs(node_ptr, subs)?;
             from_items.push(item);
         }
         parts.push(format!("FROM {}", from_items.join(", ")));
@@ -3801,7 +3802,7 @@ unsafe fn deparse_select_stmt_with_view_subs(
     }
 
     // GROUP BY
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.groupClause) };
+    let group_list = pg_list::<pg_sys::Node>(s.groupClause);
     if !group_list.is_empty() {
         let mut groups = Vec::new();
         for node_ptr in group_list.iter_ptr() {
@@ -3818,21 +3819,17 @@ unsafe fn deparse_select_stmt_with_view_subs(
     }
 
     // WINDOW clause
-    let window_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.windowClause) };
+    let window_list = pg_list::<pg_sys::Node>(s.windowClause);
     if !window_list.is_empty() {
         let mut window_parts = Vec::new();
         for node_ptr in window_list.iter_ptr() {
-            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_WindowDef) } {
-                let wdef = unsafe { &*(node_ptr as *const pg_sys::WindowDef) };
+            if let Some(wdef) = cast_node!(node_ptr, T_WindowDef, pg_sys::WindowDef) {
                 let wname = if !wdef.name.is_null() {
-                    unsafe { std::ffi::CStr::from_ptr(wdef.name) }
-                        .to_str()
-                        .unwrap_or("w")
-                        .to_string()
+                    pg_cstr_to_str(wdef.name).unwrap_or("w").to_string()
                 } else {
                     continue;
                 };
-                let wspec = unsafe { deparse_window_def(wdef)? };
+                let wspec = deparse_window_def(wdef)?;
                 window_parts.push(format!("{wname} AS ({wspec})"));
             }
         }
@@ -3842,7 +3839,7 @@ unsafe fn deparse_select_stmt_with_view_subs(
     }
 
     // ORDER BY
-    let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.sortClause) };
+    let sort_list = pg_list::<pg_sys::Node>(s.sortClause);
     if !sort_list.is_empty() {
         let sorts = unsafe { deparse_sort_clause(&sort_list)? };
         parts.push(format!("ORDER BY {sorts}"));
@@ -3867,12 +3864,12 @@ unsafe fn deparse_select_stmt_with_view_subs(
 ///
 /// # Safety
 /// Caller must ensure `with_clause` points to a valid `WithClause`.
-unsafe fn deparse_with_clause_with_view_subs(
+fn deparse_with_clause_with_view_subs(
     with_clause: *mut pg_sys::WithClause,
     subs: &[ViewSubstitution],
 ) -> Result<String, PgTrickleError> {
     let wc = unsafe { &*with_clause };
-    let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
+    let cte_list = pg_list::<pg_sys::Node>(wc.ctes);
     let mut cte_parts = Vec::new();
 
     for node_ptr in cte_list.iter_ptr() {
@@ -3880,10 +3877,7 @@ unsafe fn deparse_with_clause_with_view_subs(
             continue;
         }
         let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
-        let cte_name = unsafe { std::ffi::CStr::from_ptr(cte.ctename) }
-            .to_str()
-            .unwrap_or("cte")
-            .to_string();
+        let cte_name = pg_cstr_to_str(cte.ctename).unwrap_or("cte").to_string();
 
         // Column aliases
         let col_aliases = extract_cte_def_colnames(cte)?;
@@ -3897,9 +3891,7 @@ unsafe fn deparse_with_clause_with_view_subs(
         let body_sql = if !cte.ctequery.is_null()
             && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
         {
-            unsafe {
-                deparse_select_stmt_with_view_subs(cte.ctequery as *const pg_sys::SelectStmt, subs)?
-            }
+            deparse_select_stmt_with_view_subs(cte.ctequery as *const pg_sys::SelectStmt, subs)?
         } else {
             // Fallback: shouldn't happen for valid queries
             "SELECT 1".to_string()
@@ -3916,7 +3908,7 @@ unsafe fn deparse_with_clause_with_view_subs(
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree node.
-unsafe fn deparse_from_item_with_view_subs(
+fn deparse_from_item_with_view_subs(
     node: *mut pg_sys::Node,
     subs: &[ViewSubstitution],
 ) -> Result<String, PgTrickleError> {
@@ -3926,27 +3918,17 @@ unsafe fn deparse_from_item_with_view_subs(
         ));
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
-
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         // Get relname
         let relname = if !rv.relname.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-                .to_str()
-                .unwrap_or("")
-                .to_string()
+            pg_cstr_to_str(rv.relname).unwrap_or("").to_string()
         } else {
             return Ok("?".to_string());
         };
 
         // Get schema (may be NULL for unqualified names)
         let schema = if !rv.schemaname.is_null() {
-            Some(
-                unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
-                    .to_str()
-                    .unwrap_or("")
-                    .to_string(),
-            )
+            Some(pg_cstr_to_str(rv.schemaname).unwrap_or("").to_string())
         } else {
             None
         };
@@ -3954,12 +3936,7 @@ unsafe fn deparse_from_item_with_view_subs(
         // Get explicit alias
         let explicit_alias = if !rv.alias.is_null() {
             let a = unsafe { &*(rv.alias) };
-            Some(
-                unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                    .to_str()
-                    .unwrap_or("")
-                    .to_string(),
-            )
+            Some(pg_cstr_to_str(a.aliasname).unwrap_or("").to_string())
         } else {
             None
         };
@@ -3991,10 +3968,9 @@ unsafe fn deparse_from_item_with_view_subs(
             name.push_str(a);
         }
         Ok(name)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        let left = unsafe { deparse_from_item_with_view_subs(join.larg, subs)? };
-        let right = unsafe { deparse_from_item_with_view_subs(join.rarg, subs)? };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        let left = deparse_from_item_with_view_subs(join.larg, subs)?;
+        let right = deparse_from_item_with_view_subs(join.rarg, subs)?;
 
         let join_type = match join.jointype {
             pg_sys::JoinType::JOIN_INNER => {
@@ -4037,8 +4013,7 @@ unsafe fn deparse_from_item_with_view_subs(
                 condition.to_sql()
             ))
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect) {
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
@@ -4048,15 +4023,13 @@ unsafe fn deparse_from_item_with_view_subs(
         }
         let sub_stmt = sub.subquery as *const pg_sys::SelectStmt;
         // Recurse into the subquery to replace any view references there too
-        let inner_sql = unsafe { deparse_select_stmt_with_view_subs(sub_stmt, subs)? };
+        let inner_sql = deparse_select_stmt_with_view_subs(sub_stmt, subs)?;
 
         let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
         let mut result = format!("{lateral_kw}({inner_sql})");
         if !sub.alias.is_null() {
             let a = unsafe { &*(sub.alias) };
-            let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
-                .unwrap_or("");
+            let alias_name = pg_cstr_to_str(a.aliasname).unwrap_or("");
             result.push_str(&format!(" AS {alias_name}"));
         }
         Ok(result)
@@ -4076,11 +4049,11 @@ unsafe fn deparse_from_item_with_view_subs(
 ///
 /// # Safety
 /// Caller must ensure `wdef` points to a valid `WindowDef`.
-unsafe fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgTrickleError> {
+fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgTrickleError> {
     let mut parts = Vec::new();
 
     // PARTITION BY
-    let part_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wdef.partitionClause) };
+    let part_list = pg_list::<pg_sys::Node>(wdef.partitionClause);
     if !part_list.is_empty() {
         let mut exprs = Vec::new();
         for node_ptr in part_list.iter_ptr() {
@@ -4091,7 +4064,7 @@ unsafe fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgTrick
     }
 
     // ORDER BY
-    let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wdef.orderClause) };
+    let sort_list = pg_list::<pg_sys::Node>(wdef.orderClause);
     if !sort_list.is_empty() {
         let sorts = unsafe { deparse_sort_clause(&sort_list)? };
         parts.push(format!("ORDER BY {sorts}"));
@@ -4106,31 +4079,11 @@ unsafe fn deparse_window_def(wdef: &pg_sys::WindowDef) -> Result<String, PgTrick
 /// `REFRESH MATERIALIZED VIEW`. The user should use the underlying query
 /// directly or switch to FULL refresh mode.
 pub fn reject_materialized_views(query: &str) -> Result<(), PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
-    unsafe { check_for_matviews_or_foreign(select) }
+    check_for_matviews_or_foreign(select)
 }
 
 /// Reject foreign tables in the defining query for DIFFERENTIAL mode.
@@ -4147,25 +4100,23 @@ pub fn reject_foreign_tables(query: &str) -> Result<(), PgTrickleError> {
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `SelectStmt`.
-unsafe fn check_for_matviews_or_foreign(
-    select: *const pg_sys::SelectStmt,
-) -> Result<(), PgTrickleError> {
+fn check_for_matviews_or_foreign(select: *const pg_sys::SelectStmt) -> Result<(), PgTrickleError> {
     let s = unsafe { &*select };
 
     // Handle set operations
     if s.op != pg_sys::SetOperation::SETOP_NONE {
         if !s.larg.is_null() {
-            unsafe { check_for_matviews_or_foreign(s.larg)? };
+            check_for_matviews_or_foreign(s.larg)?;
         }
         if !s.rarg.is_null() {
-            unsafe { check_for_matviews_or_foreign(s.rarg)? };
+            check_for_matviews_or_foreign(s.rarg)?;
         }
         return Ok(());
     }
 
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(s.fromClause);
     for node_ptr in from_list.iter_ptr() {
-        unsafe { check_from_item_for_matview_or_foreign(node_ptr)? };
+        check_from_item_for_matview_or_foreign(node_ptr)?;
     }
 
     Ok(())
@@ -4175,22 +4126,16 @@ unsafe fn check_for_matviews_or_foreign(
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree node.
-unsafe fn check_from_item_for_matview_or_foreign(
-    node: *mut pg_sys::Node,
-) -> Result<(), PgTrickleError> {
+fn check_from_item_for_matview_or_foreign(node: *mut pg_sys::Node) -> Result<(), PgTrickleError> {
     if node.is_null() {
         return Ok(());
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         if rv.relname.is_null() {
             return Ok(());
         }
-        let relname = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-            .to_str()
-            .unwrap_or("")
-            .to_string();
+        let relname = pg_cstr_to_str(rv.relname).unwrap_or("").to_string();
 
         // Skip CTE names / subquery aliases that are not real relations.
         let schema = match resolve_rangevar_schema(rv)? {
@@ -4223,19 +4168,14 @@ unsafe fn check_from_item_for_matview_or_foreign(
             }
             _ => {}
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        unsafe { check_from_item_for_matview_or_foreign(join.larg)? };
-        unsafe { check_from_item_for_matview_or_foreign(join.rarg)? };
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
-        if !sub.subquery.is_null()
-            && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
-        {
-            unsafe {
-                check_for_matviews_or_foreign(sub.subquery as *const pg_sys::SelectStmt)?;
-            }
-        }
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        check_from_item_for_matview_or_foreign(join.larg)?;
+        check_from_item_for_matview_or_foreign(join.rarg)?;
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect)
+        && !sub.subquery.is_null()
+        && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+    {
+        check_for_matviews_or_foreign(sub.subquery as *const pg_sys::SelectStmt)?;
     }
 
     Ok(())
@@ -4266,36 +4206,16 @@ unsafe fn check_from_item_for_matview_or_foreign(
 ///
 /// Returns the original query unchanged if it does not use DISTINCT ON.
 pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Only rewrite if DISTINCT ON (not plain DISTINCT or no DISTINCT)
     if select.distinctClause.is_null() {
         return Ok(query.to_string());
     }
-    let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.distinctClause) };
+    let distinct_list = pg_list::<pg_sys::Node>(select.distinctClause);
     let has_real_exprs = distinct_list.iter_ptr().any(|ptr| !ptr.is_null());
     if !has_real_exprs {
         // Plain DISTINCT (all NULLs in distinctClause) — no rewrite needed
@@ -4342,30 +4262,29 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
 
     // Extract ORDER BY clause as SQL text (if any)
     let order_by_sql = if !select.sortClause.is_null() {
-        let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
+        let sort_list = pg_list::<pg_sys::Node>(select.sortClause);
         let mut order_parts = Vec::new();
         for node_ptr in sort_list.iter_ptr() {
             if node_ptr.is_null() {
                 continue;
             }
-            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_SortBy) } {
-                let sort_by = unsafe { &*(node_ptr as *const pg_sys::SortBy) };
-                if !sort_by.node.is_null() {
-                    let expr_sql = unsafe { node_to_expr(sort_by.node) }
-                        .map(|e| e.to_sql())
-                        .unwrap_or_else(|_| "?".to_string());
-                    let dir = match sort_by.sortby_dir {
-                        pg_sys::SortByDir::SORTBY_DESC => " DESC",
-                        pg_sys::SortByDir::SORTBY_ASC => " ASC",
-                        _ => "",
-                    };
-                    let nulls = match sort_by.sortby_nulls {
-                        pg_sys::SortByNulls::SORTBY_NULLS_FIRST => " NULLS FIRST",
-                        pg_sys::SortByNulls::SORTBY_NULLS_LAST => " NULLS LAST",
-                        _ => "",
-                    };
-                    order_parts.push(format!("{expr_sql}{dir}{nulls}"));
-                }
+            if let Some(sort_by) = cast_node!(node_ptr, T_SortBy, pg_sys::SortBy)
+                && !sort_by.node.is_null()
+            {
+                let expr_sql = unsafe { node_to_expr(sort_by.node) }
+                    .map(|e| e.to_sql())
+                    .unwrap_or_else(|_| "?".to_string());
+                let dir = match sort_by.sortby_dir {
+                    pg_sys::SortByDir::SORTBY_DESC => " DESC",
+                    pg_sys::SortByDir::SORTBY_ASC => " ASC",
+                    _ => "",
+                };
+                let nulls = match sort_by.sortby_nulls {
+                    pg_sys::SortByNulls::SORTBY_NULLS_FIRST => " NULLS FIRST",
+                    pg_sys::SortByNulls::SORTBY_NULLS_LAST => " NULLS LAST",
+                    _ => "",
+                };
+                order_parts.push(format!("{expr_sql}{dir}{nulls}"));
             }
         }
         if order_parts.is_empty() {
@@ -4378,7 +4297,7 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
     };
 
     // Extract target list column names/aliases for the outer SELECT
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
     let mut outer_cols = Vec::new();
     let mut inner_target_parts = Vec::new();
     for node_ptr in target_list.iter_ptr() {
@@ -4389,9 +4308,7 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
 
         // Extract alias name
         let alias = if !rt.name.is_null() {
-            let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("?col");
+            let name = pg_cstr_to_str(rt.name).unwrap_or("?col");
             Some(name.to_string())
         } else {
             None
@@ -4452,7 +4369,7 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
     let group_sql = if select.groupClause.is_null() {
         String::new()
     } else {
-        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        let group_list = pg_list::<pg_sys::Node>(select.groupClause);
         let mut parts = Vec::new();
         for node_ptr in group_list.iter_ptr() {
             if node_ptr.is_null() {
@@ -4518,30 +4435,10 @@ pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
 ///
 /// If the query contains no grouping sets, it is returned unchanged.
 pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Set operations — don't rewrite
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -4554,7 +4451,7 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgTrickleError> {
     }
 
     // ── Scan groupClause to find GroupingSet nodes ──────────────────
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+    let group_list = pg_list::<pg_sys::Node>(select.groupClause);
     let mut has_grouping_sets = false;
     for node_ptr in group_list.iter_ptr() {
         if !node_ptr.is_null() && unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_GroupingSet) } {
@@ -4574,9 +4471,7 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgTrickleError> {
         if node_ptr.is_null() {
             continue;
         }
-        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_GroupingSet) } {
-            // SAFETY: confirmed T_GroupingSet above
-            let gs = unsafe { &*(node_ptr as *const pg_sys::GroupingSet) };
+        if let Some(gs) = cast_node!(node_ptr, T_GroupingSet, pg_sys::GroupingSet) {
             let expanded = expand_grouping_set(gs)?;
             grouping_set_specs.push(expanded);
         } else {
@@ -4661,7 +4556,7 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgTrickleError> {
     };
 
     // ── Parse target list ──────────────────────────────────────────
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
     let mut targets: Vec<TargetEntry> = Vec::new();
 
     for node_ptr in target_list.iter_ptr() {
@@ -4674,12 +4569,7 @@ pub fn rewrite_grouping_sets(query: &str) -> Result<String, PgTrickleError> {
         }
 
         let alias = if !rt.name.is_null() {
-            Some(
-                unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                    .to_str()
-                    .unwrap_or("?")
-                    .to_string(),
-            )
+            Some(pg_cstr_to_str(rt.name).unwrap_or("?").to_string())
         } else {
             None
         };
@@ -4848,15 +4738,13 @@ fn expand_grouping_set(gs: &pg_sys::GroupingSet) -> Result<Vec<Vec<String>>, PgT
             if gs.content.is_null() {
                 return Ok(vec![vec![]]);
             }
-            let content_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(gs.content) };
+            let content_list = pg_list::<pg_sys::Node>(gs.content);
             let mut sets = Vec::new();
             for node_ptr in content_list.iter_ptr() {
                 if node_ptr.is_null() {
                     continue;
                 }
-                if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_GroupingSet) } {
-                    // Nested grouping set (SIMPLE, EMPTY, or nested ROLLUP/CUBE)
-                    let inner = unsafe { &*(node_ptr as *const pg_sys::GroupingSet) };
+                if let Some(inner) = cast_node!(node_ptr, T_GroupingSet, pg_sys::GroupingSet) {
                     let inner_sets = expand_grouping_set(inner)?;
                     sets.extend(inner_sets);
                 } else {
@@ -4882,7 +4770,7 @@ fn extract_grouping_set_columns(gs: &pg_sys::GroupingSet) -> Result<Vec<String>,
     if gs.content.is_null() {
         return Ok(vec![]);
     }
-    let content_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(gs.content) };
+    let content_list = pg_list::<pg_sys::Node>(gs.content);
     let mut cols = Vec::new();
     for node_ptr in content_list.iter_ptr() {
         if node_ptr.is_null() {
@@ -4902,7 +4790,7 @@ fn extract_grouping_func_args(gf: &pg_sys::GroupingFunc) -> Result<Vec<String>, 
     if gf.args.is_null() {
         return Ok(vec![]);
     }
-    let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(gf.args) };
+    let args_list = pg_list::<pg_sys::Node>(gf.args);
     let mut names = Vec::new();
     for node_ptr in args_list.iter_ptr() {
         if node_ptr.is_null() {
@@ -4951,30 +4839,10 @@ fn compute_grouping_value(args: &[String], current_set: &[String]) -> i64 {
 /// (both bare and under AND/OR conjunctions). Correlated scalar subqueries
 /// are NOT rewritten (they reference outer columns).
 pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Set operations — don't rewrite (the individual branches are separate SELECTs)
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -4988,9 +4856,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
 
     // Collect scalar subqueries from WHERE clause
     let mut scalar_subqueries: Vec<ScalarSubqueryExtract> = Vec::new();
-    unsafe {
-        collect_scalar_sublinks_in_where(select.whereClause, &mut scalar_subqueries)?;
-    }
+    collect_scalar_sublinks_in_where(select.whereClause, &mut scalar_subqueries)?;
 
     if scalar_subqueries.is_empty() {
         return Ok(query.to_string());
@@ -5000,7 +4866,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     // outer columns and can't be trivially cross-joined).
     // Detect correlation by checking if the subquery's WHERE references
     // column names from tables in the outer FROM clause.
-    let outer_tables = unsafe { collect_from_clause_table_names(select) };
+    let outer_tables = collect_from_clause_table_names(select);
 
     // Classify each scalar subquery:
     //   1. Dot-qualified correlated (existing heuristic) → skip entirely
@@ -5110,7 +4976,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     }
 
     // Target list
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
     let mut targets = Vec::new();
     for node_ptr in target_list.iter_ptr() {
         if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
@@ -5124,9 +4990,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
             .map(|e| e.to_sql())
             .unwrap_or_else(|_| "NULL".to_string());
         let alias_part = if !rt.name.is_null() {
-            let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("?");
+            let name = pg_cstr_to_str(rt.name).unwrap_or("?");
             format!(" AS \"{}\"", name.replace('"', "\"\""))
         } else {
             String::new()
@@ -5138,7 +5002,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     let group_sql = if select.groupClause.is_null() {
         String::new()
     } else {
-        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        let group_list = pg_list::<pg_sys::Node>(select.groupClause);
         if group_list.is_empty() {
             String::new()
         } else {
@@ -5167,7 +5031,7 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
     let order_sql = if select.sortClause.is_null() {
         String::new()
     } else {
-        let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
+        let sort_list = pg_list::<pg_sys::Node>(select.sortClause);
         if sort_list.is_empty() {
             String::new()
         } else {
@@ -5253,29 +5117,10 @@ pub fn rewrite_scalar_subquery_in_where(query: &str) -> Result<String, PgTrickle
 /// This must run **before** the DVM parser so that the downstream operator
 /// tree sees a standard LEFT JOIN instead of a correlated scalar subquery.
 pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = list.head().ok_or_else(|| {
-        PgTrickleError::QueryParseError("Empty parse tree for scalar subquery rewrite".into())
-    })?;
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
+        None => return Ok(query.to_string()),
+    };
 
     // Skip set operations
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -5287,7 +5132,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
         return Ok(query.to_string());
     }
 
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
 
     // Collect scalar subqueries from the SELECT list
     struct SelectScalarSubquery {
@@ -5323,12 +5168,9 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
         if inner.op != pg_sys::SetOperation::SETOP_NONE {
             continue;
         }
-        let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
+        let inner_sql = deparse_select_to_sql(sublink.subselect)?;
         let alias = if !rt.name.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .ok()
-                .map(|s| s.to_string())
+            pg_cstr_to_str(rt.name).ok().map(|s| s.to_string())
         } else {
             None
         };
@@ -5345,7 +5187,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
     }
 
     // Collect outer FROM table names for correlation detection
-    let outer_tables = unsafe { collect_from_clause_table_names(select) };
+    let outer_tables = collect_from_clause_table_names(select);
 
     // For each scalar target, detect correlation and build decorrelation
     struct SelectScalarDecorrelation {
@@ -5362,7 +5204,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
         let inner = unsafe { &*st.inner_select };
 
         // Collect inner FROM table names
-        let inner_tables = unsafe { collect_from_clause_table_names(inner) };
+        let inner_tables = collect_from_clause_table_names(inner);
 
         // Build ScalarSubqueryExtract for correlation detection
         let sq_extract = ScalarSubqueryExtract {
@@ -5403,7 +5245,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
         next_sq_idx += 1;
 
         // Extract inner target expressions
-        let inner_target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner.targetList) };
+        let inner_target_list = pg_list::<pg_sys::Node>(inner.targetList);
         let mut inner_target_exprs: Vec<String> = Vec::new();
         for node_ptr in inner_target_list.iter_ptr() {
             if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) }
@@ -5461,8 +5303,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
         let group_by_sql = if is_aggregate && !group_by_items.is_empty() {
             // If inner already has GROUP BY, prepend correlation keys
             if has_group_by {
-                let existing_groups =
-                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner.groupClause) };
+                let existing_groups = pg_list::<pg_sys::Node>(inner.groupClause);
                 let mut groups = group_by_items;
                 for node_ptr in existing_groups.iter_ptr() {
                     let expr = unsafe { node_to_expr(node_ptr) }
@@ -5544,9 +5385,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
                 .map(|e| e.to_sql())
                 .unwrap_or_else(|_| "NULL".to_string());
             let alias_part = if !rt.name.is_null() {
-                let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                    .to_str()
-                    .unwrap_or("?");
+                let name = pg_cstr_to_str(rt.name).unwrap_or("?");
                 format!(" AS \"{}\"", name.replace('"', "\"\""))
             } else {
                 String::new()
@@ -5577,7 +5416,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
     let group_sql = if select.groupClause.is_null() {
         String::new()
     } else {
-        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        let group_list = pg_list::<pg_sys::Node>(select.groupClause);
         if group_list.is_empty() {
             String::new()
         } else {
@@ -5606,7 +5445,7 @@ pub fn rewrite_correlated_scalar_in_select(query: &str) -> Result<String, PgTric
     let order_sql = if select.sortClause.is_null() {
         String::new()
     } else {
-        let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
+        let sort_list = pg_list::<pg_sys::Node>(select.sortClause);
         if sort_list.is_empty() {
             String::new()
         } else {
@@ -5739,15 +5578,15 @@ impl ScalarSubqueryExtract {
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
-unsafe fn collect_from_clause_table_names(select: &pg_sys::SelectStmt) -> Vec<String> {
+fn collect_from_clause_table_names(select: &pg_sys::SelectStmt) -> Vec<String> {
     let mut names = Vec::new();
     if select.fromClause.is_null() {
         return names;
     }
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(select.fromClause);
     for node_ptr in from_list.iter_ptr() {
         if !node_ptr.is_null() {
-            unsafe { collect_table_names_from_node(node_ptr, &mut names) };
+            collect_table_names_from_node(node_ptr, &mut names);
         }
     }
     names
@@ -5757,47 +5596,38 @@ unsafe fn collect_from_clause_table_names(select: &pg_sys::SelectStmt) -> Vec<St
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn collect_table_names_from_node(node: *mut pg_sys::Node, out: &mut Vec<String>) {
+fn collect_table_names_from_node(node: *mut pg_sys::Node, out: &mut Vec<String>) {
     if node.is_null() {
         return;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
-        if !rv.relname.is_null()
-            && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(rv.relname) }.to_str()
-        {
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
+        if let Ok(s) = pg_cstr_to_str(rv.relname) {
             out.push(s.to_lowercase());
         }
         if !rv.alias.is_null() {
             let a = unsafe { &*(rv.alias) };
-            if !a.aliasname.is_null()
-                && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }.to_str()
-            {
+            if let Ok(s) = pg_cstr_to_str(a.aliasname) {
                 let lower = s.to_lowercase();
                 if !out.contains(&lower) {
                     out.push(lower);
                 }
             }
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         if !join.larg.is_null() {
-            unsafe { collect_table_names_from_node(join.larg, out) };
+            collect_table_names_from_node(join.larg, out);
         }
         if !join.rarg.is_null() {
-            unsafe { collect_table_names_from_node(join.rarg, out) };
+            collect_table_names_from_node(join.rarg, out);
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
-        if !sub.alias.is_null() {
-            let a = unsafe { &*(sub.alias) };
-            if !a.aliasname.is_null()
-                && let Ok(s) = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }.to_str()
-            {
-                let lower = s.to_lowercase();
-                if !out.contains(&lower) {
-                    out.push(lower);
-                }
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect)
+        && !sub.alias.is_null()
+    {
+        let a = unsafe { &*(sub.alias) };
+        if let Ok(s) = pg_cstr_to_str(a.aliasname) {
+            let lower = s.to_lowercase();
+            if !out.contains(&lower) {
+                out.push(lower);
             }
         }
     }
@@ -5807,7 +5637,7 @@ unsafe fn collect_table_names_from_node(node: *mut pg_sys::Node, out: &mut Vec<S
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn collect_scalar_sublinks_in_where(
+fn collect_scalar_sublinks_in_where(
     node: *mut pg_sys::Node,
     out: &mut Vec<ScalarSubqueryExtract>,
 ) -> Result<(), PgTrickleError> {
@@ -5815,24 +5645,22 @@ unsafe fn collect_scalar_sublinks_in_where(
         return Ok(());
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
-        let sublink = unsafe { &*(node as *const pg_sys::SubLink) };
+    if let Some(sublink) = cast_node!(node, T_SubLink, pg_sys::SubLink) {
         if sublink.subLinkType == pg_sys::SubLinkType::EXPR_SUBLINK {
             // Scalar subquery — extract it
             if !sublink.subselect.is_null() {
-                let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
+                let inner_sql = deparse_select_to_sql(sublink.subselect)?;
                 let expr_sql = format!("({inner_sql})");
 
                 // Collect table names from the subquery's FROM clause
                 // for correlation detection.
-                let inner_tables =
-                    if unsafe { pgrx::is_a(sublink.subselect, pg_sys::NodeTag::T_SelectStmt) } {
-                        let inner_select =
-                            unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
-                        unsafe { collect_from_clause_table_names(inner_select) }
-                    } else {
-                        Vec::new()
-                    };
+                let inner_tables = if let Some(inner_select) =
+                    cast_node!(sublink.subselect, T_SelectStmt, pg_sys::SelectStmt)
+                {
+                    collect_from_clause_table_names(inner_select)
+                } else {
+                    Vec::new()
+                };
 
                 out.push(ScalarSubqueryExtract {
                     subquery_sql: inner_sql,
@@ -5846,31 +5674,25 @@ unsafe fn collect_scalar_sublinks_in_where(
     }
 
     // Recurse into BoolExpr (AND/OR/NOT)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
-        if !boolexpr.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
-            for arg_ptr in args.iter_ptr() {
-                if !arg_ptr.is_null() {
-                    unsafe { collect_scalar_sublinks_in_where(arg_ptr, out)? };
-                }
+    if let Some(boolexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr)
+        && !boolexpr.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(boolexpr.args);
+        for arg_ptr in args.iter_ptr() {
+            if !arg_ptr.is_null() {
+                collect_scalar_sublinks_in_where(arg_ptr, out)?;
             }
         }
     }
 
     // Recurse into comparison operators (A_Expr) since scalar subqueries
     // are typically inside comparisons: `col > (SELECT ...)`
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
-        let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+    if let Some(aexpr) = cast_node!(node, T_A_Expr, pg_sys::A_Expr) {
         if !aexpr.lexpr.is_null() {
-            unsafe {
-                collect_scalar_sublinks_in_where(aexpr.lexpr, out)?;
-            }
+            collect_scalar_sublinks_in_where(aexpr.lexpr, out)?;
         }
         if !aexpr.rexpr.is_null() {
-            unsafe {
-                collect_scalar_sublinks_in_where(aexpr.rexpr, out)?;
-            }
+            collect_scalar_sublinks_in_where(aexpr.rexpr, out)?;
         }
     }
 
@@ -6008,21 +5830,21 @@ fn contains_word_boundary(text: &str, word: &str) -> bool {
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree `Node`.
-unsafe fn flatten_and_conditions(node: *mut pg_sys::Node, out: &mut Vec<*mut pg_sys::Node>) {
+fn flatten_and_conditions(node: *mut pg_sys::Node, out: &mut Vec<*mut pg_sys::Node>) {
     if node.is_null() {
         return;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
-        if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR && !boolexpr.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
-            for arg_ptr in args.iter_ptr() {
-                if !arg_ptr.is_null() {
-                    unsafe { flatten_and_conditions(arg_ptr, out) };
-                }
+    if let Some(boolexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr)
+        && boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR
+        && !boolexpr.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(boolexpr.args);
+        for arg_ptr in args.iter_ptr() {
+            if !arg_ptr.is_null() {
+                flatten_and_conditions(arg_ptr, out);
             }
-            return;
         }
+        return;
     }
     out.push(node);
 }
@@ -6032,7 +5854,7 @@ unsafe fn flatten_and_conditions(node: *mut pg_sys::Node, out: &mut Vec<*mut pg_
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree `Node`.
-unsafe fn check_correlation_condition(
+fn check_correlation_condition(
     node: *mut pg_sys::Node,
     outer_columns: &std::collections::HashMap<String, String>,
 ) -> Option<CorrelationCondition> {
@@ -6098,38 +5920,23 @@ fn decorrelate_scalar_subquery(
     outer_columns: &std::collections::HashMap<String, String>,
     idx: usize,
 ) -> Result<DecorrelatedSubquery, PgTrickleError> {
-    use std::ffi::CString;
-
     let sq_alias = format!("__pgt_sq_{idx}");
     let scalar_alias = format!("__pgt_scalar_{idx}");
 
     // Re-parse the inner subquery to get AST access
-    let c_sql = CString::new(sq.subquery_sql.as_str())
-        .map_err(|_| PgTrickleError::QueryParseError("Subquery contains null bytes".into()))?;
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_sql.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Err(PgTrickleError::QueryParseError(
-            "Failed to re-parse scalar subquery for decorrelation".into(),
-        ));
-    }
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = list.head().ok_or_else(|| {
-        PgTrickleError::QueryParseError("Empty parse tree for scalar subquery".into())
-    })?;
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Err(PgTrickleError::QueryParseError(
-            "Scalar subquery is not a SelectStmt".into(),
-        ));
-    }
-    let inner_select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+    let inner_select = match parse_first_select(sq.subquery_sql.as_str())? {
+        Some(s) => unsafe { &*s },
+        None => {
+            return Err(PgTrickleError::QueryParseError(
+                "Scalar subquery is not a SelectStmt".into(),
+            ));
+        }
+    };
 
     // ── Flatten WHERE into AND-ed conditions ─────────────────────────
     let mut conditions: Vec<*mut pg_sys::Node> = Vec::new();
     if !inner_select.whereClause.is_null() {
-        unsafe { flatten_and_conditions(inner_select.whereClause, &mut conditions) };
+        flatten_and_conditions(inner_select.whereClause, &mut conditions);
     }
 
     // ── Separate correlation vs. regular conditions ──────────────────
@@ -6137,7 +5944,7 @@ fn decorrelate_scalar_subquery(
     let mut regular_conditions: Vec<String> = Vec::new();
 
     for cond_node in &conditions {
-        if let Some(corr) = unsafe { check_correlation_condition(*cond_node, outer_columns) } {
+        if let Some(corr) = check_correlation_condition(*cond_node, outer_columns) {
             correlations.push(corr);
         } else {
             let expr = unsafe { node_to_expr(*cond_node) }
@@ -6154,7 +5961,7 @@ fn decorrelate_scalar_subquery(
     }
 
     // ── Extract the original target list (scalar expression) ─────────
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(inner_select.targetList);
     let mut original_target_exprs: Vec<String> = Vec::new();
     for node_ptr in target_list.iter_ptr() {
         if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
@@ -6327,7 +6134,7 @@ unsafe fn where_has_not_demorgan_opportunity(node: *mut pg_sys::Node) -> bool {
             {
                 let inner_be = unsafe { &*(inner as *const pg_sys::BoolExpr) };
                 // NOT(AND/OR with sublinks) or NOT(NOT with sublinks)
-                if unsafe { node_tree_contains_sublink(inner) } {
+                if node_tree_contains_sublink(inner) {
                     return matches!(
                         inner_be.boolop,
                         pg_sys::BoolExprType::AND_EXPR
@@ -6381,7 +6188,7 @@ unsafe fn deparse_with_demorgan(node: *mut pg_sys::Node) -> Result<String, PgTri
 
                 // NOT(AND(a,b,...)) → (NOT a) OR (NOT b) OR ...
                 if inner_be.boolop == pg_sys::BoolExprType::AND_EXPR
-                    && unsafe { node_tree_contains_sublink(inner) }
+                    && node_tree_contains_sublink(inner)
                 {
                     let inner_args =
                         unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_be.args) };
@@ -6394,7 +6201,7 @@ unsafe fn deparse_with_demorgan(node: *mut pg_sys::Node) -> Result<String, PgTri
 
                 // NOT(OR(a,b,...)) → (NOT a) AND (NOT b) AND ...
                 if inner_be.boolop == pg_sys::BoolExprType::OR_EXPR
-                    && unsafe { node_tree_contains_sublink(inner) }
+                    && node_tree_contains_sublink(inner)
                 {
                     let inner_args =
                         unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_be.args) };
@@ -6483,30 +6290,10 @@ unsafe fn negate_node_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleEr
 /// The UNION (not UNION ALL) handles deduplication of rows that match
 /// multiple OR arms.
 pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Set operations — don't rewrite
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -6534,7 +6321,7 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
         // deparsed and round-tripped through node_to_expr, losing
         // information like agg_star on COUNT(*).
         if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR
-            && unsafe { and_contains_or_with_sublink(select.whereClause) }
+            && and_contains_or_with_sublink(select.whereClause)
         {
             return rewrite_and_with_or_sublinks(select, select.whereClause);
         }
@@ -6542,12 +6329,12 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
     }
 
     // Top-level OR — check if it contains sublinks
-    if !unsafe { node_tree_contains_sublink(select.whereClause) } {
+    if !node_tree_contains_sublink(select.whereClause) {
         return Ok(query.to_string());
     }
 
     // ── Extract OR arms ────────────────────────────────────────────
-    let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
+    let args = pg_list::<pg_sys::Node>(boolexpr.args);
     let mut arm_exprs: Vec<String> = Vec::new();
     for arg_ptr in args.iter_ptr() {
         if arg_ptr.is_null() {
@@ -6567,7 +6354,7 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
     let from_sql = extract_from_clause_sql(select)?;
 
     let target_sql = {
-        let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+        let target_list = pg_list::<pg_sys::Node>(select.targetList);
         let mut targets = Vec::new();
         for node_ptr in target_list.iter_ptr() {
             if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) }
@@ -6582,9 +6369,7 @@ pub fn rewrite_sublinks_in_or(query: &str) -> Result<String, PgTrickleError> {
                 .map(|e| e.to_sql())
                 .unwrap_or_else(|_| "NULL".to_string());
             let alias_part = if !rt.name.is_null() {
-                let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                    .to_str()
-                    .unwrap_or("?");
+                let name = pg_cstr_to_str(rt.name).unwrap_or("?");
                 format!(" AS \"{}\"", name.replace('"', "\"\""))
             } else {
                 String::new()
@@ -6657,7 +6442,7 @@ fn rewrite_and_with_or_sublinks(
     // Flatten the entire AND chain into a list of atomic conjuncts.
     // AND(a, AND(b, OR(...))) → [a, b, OR(...)]
     let mut conjuncts: Vec<*mut pg_sys::Node> = Vec::new();
-    unsafe { flatten_and_conjuncts(where_node, &mut conjuncts) };
+    flatten_and_conjuncts(where_node, &mut conjuncts);
 
     // Separate OR+sublink conjuncts from plain conjuncts.
     let mut or_arms_list: Vec<Vec<String>> = Vec::new();
@@ -6670,7 +6455,7 @@ fn rewrite_and_with_or_sublinks(
         if unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_BoolExpr) } {
             let inner_bool = unsafe { &*(arg_ptr as *const pg_sys::BoolExpr) };
             if inner_bool.boolop == pg_sys::BoolExprType::OR_EXPR
-                && unsafe { node_tree_contains_sublink(arg_ptr) }
+                && node_tree_contains_sublink(arg_ptr)
             {
                 let or_args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_bool.args) };
                 let mut arms = Vec::new();
@@ -6778,7 +6563,7 @@ fn deparse_full_select(select: &pg_sys::SelectStmt) -> Result<String, PgTrickleE
 
 /// Deparse target list to SQL text (from a SelectStmt reference).
 fn deparse_select_target_list(select: &pg_sys::SelectStmt) -> String {
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
     let mut targets = Vec::new();
     for node_ptr in target_list.iter_ptr() {
         if node_ptr.is_null() || !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
@@ -6792,9 +6577,7 @@ fn deparse_select_target_list(select: &pg_sys::SelectStmt) -> String {
             .map(|e| e.to_sql())
             .unwrap_or_else(|_| "NULL".to_string());
         let alias_part = if !rt.name.is_null() {
-            let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("?");
+            let name = pg_cstr_to_str(rt.name).unwrap_or("?");
             format!(" AS \"{}\"", name.replace('"', "\"\""))
         } else {
             String::new()
@@ -6809,7 +6592,7 @@ fn deparse_group_clause(select: &pg_sys::SelectStmt) -> String {
     if select.groupClause.is_null() {
         return String::new();
     }
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+    let group_list = pg_list::<pg_sys::Node>(select.groupClause);
     if group_list.is_empty() {
         return String::new();
     }
@@ -6839,7 +6622,7 @@ fn deparse_order_clause(select: &pg_sys::SelectStmt) -> String {
     if select.sortClause.is_null() {
         return String::new();
     }
-    let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
+    let sort_list = pg_list::<pg_sys::Node>(select.sortClause);
     if sort_list.is_empty() {
         return String::new();
     }
@@ -6894,30 +6677,10 @@ fn deparse_order_clause(select: &pg_sys::SelectStmt) -> String {
 /// with a `WHERE __pgt_f0.ord IS NOT NULL OR __pgt_f1.ord IS NOT NULL`
 /// filter to stop the infinite `generate_series` once all SRFs are exhausted.
 pub fn rewrite_rows_from(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Set operations — recurse into each branch.
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -6929,13 +6692,13 @@ pub fn rewrite_rows_from(query: &str) -> Result<String, PgTrickleError> {
         return Ok(query.to_string());
     }
 
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(select.fromClause);
     let mut found_rows_from = false;
     for node_ptr in from_list.iter_ptr() {
         if node_ptr.is_null() {
             continue;
         }
-        if unsafe { has_multi_rows_from(node_ptr) } {
+        if has_multi_rows_from(node_ptr) {
             found_rows_from = true;
             break;
         }
@@ -6959,7 +6722,7 @@ pub fn rewrite_rows_from(query: &str) -> Result<String, PgTrickleError> {
     };
 
     // GROUP BY
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+    let group_list = pg_list::<pg_sys::Node>(select.groupClause);
     let group_sql = if group_list.is_empty() {
         None
     } else {
@@ -6995,7 +6758,7 @@ pub fn rewrite_rows_from(query: &str) -> Result<String, PgTrickleError> {
     };
 
     // DISTINCT
-    let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.distinctClause) };
+    let distinct_list = pg_list::<pg_sys::Node>(select.distinctClause);
     let distinct_prefix = if !distinct_list.is_empty() {
         "SELECT DISTINCT"
     } else {
@@ -7008,7 +6771,7 @@ pub fn rewrite_rows_from(query: &str) -> Result<String, PgTrickleError> {
         if node_ptr.is_null() {
             continue;
         }
-        let sql = unsafe { rewrite_from_item_rows_from(node_ptr)? };
+        let sql = rewrite_from_item_rows_from(node_ptr)?;
         from_parts.push(sql);
     }
 
@@ -7044,18 +6807,16 @@ pub fn rewrite_rows_from(query: &str) -> Result<String, PgTrickleError> {
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree Node.
-unsafe fn has_multi_rows_from(node: *mut pg_sys::Node) -> bool {
+fn has_multi_rows_from(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
-        let rf = unsafe { &*(node as *const pg_sys::RangeFunction) };
-        let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
+    if let Some(rf) = cast_node!(node, T_RangeFunction, pg_sys::RangeFunction) {
+        let func_list = pg_list::<pg_sys::Node>(rf.functions);
         return rf.is_rowsfrom && func_list.len() > 1;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        return unsafe { has_multi_rows_from(join.larg) || has_multi_rows_from(join.rarg) };
+    if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        return has_multi_rows_from(join.larg) || has_multi_rows_from(join.rarg);
     }
     false
 }
@@ -7065,14 +6826,13 @@ unsafe fn has_multi_rows_from(node: *mut pg_sys::Node) -> bool {
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree Node.
-unsafe fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
+fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if node.is_null() {
         return Ok("".to_string());
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
-        let rf = unsafe { &*(node as *const pg_sys::RangeFunction) };
-        let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
+    if let Some(rf) = cast_node!(node, T_RangeFunction, pg_sys::RangeFunction) {
+        let func_list = pg_list::<pg_sys::Node>(rf.functions);
 
         if !rf.is_rowsfrom || func_list.len() <= 1 {
             // Single function — deparse normally.
@@ -7089,8 +6849,7 @@ unsafe fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String,
             if inner_node.is_null() {
                 continue;
             }
-            let inner_list =
-                unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_node as *mut pg_sys::List) };
+            let inner_list = pg_list::<pg_sys::Node>(inner_node as *mut pg_sys::List);
             if inner_list.is_empty() {
                 continue;
             }
@@ -7102,7 +6861,7 @@ unsafe fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String,
             let name = unsafe { extract_func_name(fcall.funcname)? };
             let sql = unsafe { deparse_func_call(func_node as *const pg_sys::FuncCall)? };
 
-            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let args_list = pg_list::<pg_sys::Node>(fcall.args);
             let mut args = Vec::new();
             for n in args_list.iter_ptr() {
                 let expr = unsafe { node_to_expr(n)? };
@@ -7121,8 +6880,7 @@ unsafe fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String,
         // Extract alias + column aliases from the ROWS FROM node.
         let rows_alias = if !rf.alias.is_null() {
             let a = unsafe { &*(rf.alias) };
-            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
+            pg_cstr_to_str(a.aliasname)
                 .unwrap_or("__pgt_rf")
                 .to_string()
         } else {
@@ -7224,11 +6982,9 @@ unsafe fn rewrite_from_item_rows_from(node: *mut pg_sys::Node) -> Result<String,
         }
 
         Ok(result)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        // Recurse into join children.
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        let left = unsafe { rewrite_from_item_rows_from(join.larg)? };
-        let right = unsafe { rewrite_from_item_rows_from(join.rarg)? };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        let left = rewrite_from_item_rows_from(join.larg)?;
+        let right = rewrite_from_item_rows_from(join.rarg)?;
         let join_type = match join.jointype {
             pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
             pg_sys::JoinType::JOIN_FULL => "FULL JOIN",
@@ -7316,7 +7072,7 @@ fn rewrite_rows_from_in_set_op(select: &pg_sys::SelectStmt) -> Result<String, Pg
     if !select.withClause.is_null() {
         // SAFETY: withClause is non-null and points to a valid WithClause node
         // obtained from the raw parse tree of a validated SQL string.
-        let with_sql = unsafe { deparse_with_clause_with_view_subs(select.withClause, &[])? };
+        let with_sql = deparse_with_clause_with_view_subs(select.withClause, &[])?;
         Ok(format!("{with_sql} {body}"))
     } else {
         Ok(body)
@@ -7358,30 +7114,10 @@ fn rewrite_rows_from_in_set_op(select: &pg_sys::SelectStmt) -> Result<String, Pg
 /// PARTITION BY, plus a row marker for joining. The final query selects
 /// pass-through columns from the first subquery and window columns from each.
 pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Set operations — don't rewrite
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -7394,14 +7130,14 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
     }
 
     // ── Extract window function info from the target list ───────────
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
-    let has_windows = unsafe { target_list_has_windows(&target_list) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
+    let has_windows = target_list_has_windows(&target_list);
     if !has_windows {
         return Ok(query.to_string());
     }
 
     // Parse window expressions to check PARTITION BY diversity
-    let window_infos = unsafe { extract_window_info_from_targets(&target_list, select)? };
+    let window_infos = extract_window_info_from_targets(&target_list, select)?;
 
     if window_infos.is_empty() {
         return Ok(query.to_string());
@@ -7443,12 +7179,7 @@ pub fn rewrite_multi_partition_windows(query: &str) -> Result<String, PgTrickleE
             .map(|e| e.to_sql())
             .unwrap_or_else(|_| "NULL".to_string());
         let alias = if !rt.name.is_null() {
-            Some(
-                unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                    .to_str()
-                    .unwrap_or("?")
-                    .to_string(),
-            )
+            Some(pg_cstr_to_str(rt.name).unwrap_or("?").to_string())
         } else {
             None
         };
@@ -7609,7 +7340,7 @@ struct WindowInfo {
 ///
 /// # Safety
 /// Caller must ensure target_list and select are valid.
-unsafe fn extract_window_info_from_targets(
+fn extract_window_info_from_targets(
     target_list: &pgrx::PgList<pg_sys::Node>,
     _select: &pg_sys::SelectStmt,
 ) -> Result<Vec<WindowInfo>, PgTrickleError> {
@@ -7639,7 +7370,7 @@ unsafe fn extract_window_info_from_targets(
         let partition_key = if over.partitionClause.is_null() {
             String::new()
         } else {
-            let parts = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(over.partitionClause) };
+            let parts = pg_list::<pg_sys::Node>(over.partitionClause);
             let mut keys: Vec<String> = Vec::new();
             for p in parts.iter_ptr() {
                 let expr = unsafe { node_to_expr(p) }
@@ -7653,9 +7384,7 @@ unsafe fn extract_window_info_from_targets(
 
         // Check if the OVER clause references a named window definition
         if !over.name.is_null() {
-            let _win_name = unsafe { std::ffi::CStr::from_ptr(over.name) }
-                .to_str()
-                .unwrap_or("?");
+            let _win_name = pg_cstr_to_str(over.name).unwrap_or("?");
             // Look up the named window definition in windowClause to get
             // the full PARTITION BY. For simplicity, we include the name
             // as the partition key (named windows with same name share PARTITION BY).
@@ -7670,10 +7399,7 @@ unsafe fn extract_window_info_from_targets(
 
         // Get alias
         let alias = if !rt.name.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("?")
-                .to_string()
+            pg_cstr_to_str(rt.name).unwrap_or("?").to_string()
         } else {
             // Generate a default alias
             format!("__pgt_wfn_{}", infos.len() + 1)
@@ -7695,29 +7421,23 @@ unsafe fn extract_window_info_from_targets(
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `SelectStmt`.
-unsafe fn deparse_select_window_clause(
-    select: &pg_sys::SelectStmt,
-) -> Result<String, PgTrickleError> {
+fn deparse_select_window_clause(select: &pg_sys::SelectStmt) -> Result<String, PgTrickleError> {
     if select.windowClause.is_null() {
         return Ok(String::new());
     }
-    let window_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.windowClause) };
+    let window_list = pg_list::<pg_sys::Node>(select.windowClause);
     if window_list.is_empty() {
         return Ok(String::new());
     }
     let mut parts = Vec::new();
     for node_ptr in window_list.iter_ptr() {
-        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_WindowDef) } {
-            let wdef = unsafe { &*(node_ptr as *const pg_sys::WindowDef) };
+        if let Some(wdef) = cast_node!(node_ptr, T_WindowDef, pg_sys::WindowDef) {
             let wname = if !wdef.name.is_null() {
-                unsafe { std::ffi::CStr::from_ptr(wdef.name) }
-                    .to_str()
-                    .unwrap_or("w")
-                    .to_string()
+                pg_cstr_to_str(wdef.name).unwrap_or("w").to_string()
             } else {
                 continue;
             };
-            let wspec = unsafe { deparse_window_def(wdef)? };
+            let wspec = deparse_window_def(wdef)?;
             parts.push(format!("{wname} AS ({wspec})"));
         }
     }
@@ -7748,30 +7468,10 @@ unsafe fn deparse_select_window_clause(
 /// - `GROUP BY` is present (interaction with window functions is complex)
 /// - No nested window function expressions are found
 pub fn rewrite_nested_window_exprs(query: &str) -> Result<String, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(query.to_string());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(query.to_string());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Set operations — don't rewrite; the union/intersect/except paths handle those
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -7780,7 +7480,7 @@ pub fn rewrite_nested_window_exprs(query: &str) -> Result<String, PgTrickleError
 
     // GROUP BY present — bail; window-over-aggregate interactions are non-trivial
     if !select.groupClause.is_null() {
-        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        let group_list = pg_list::<pg_sys::Node>(select.groupClause);
         if !group_list.is_empty() {
             return Ok(query.to_string());
         }
@@ -7790,7 +7490,7 @@ pub fn rewrite_nested_window_exprs(query: &str) -> Result<String, PgTrickleError
         return Ok(query.to_string());
     }
 
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
 
     // ── Detect targets with nested window function expressions ───────────
     // "Nested" means: the ResTarget val is NOT a bare FuncCall-with-OVER,
@@ -7805,11 +7505,10 @@ pub fn rewrite_nested_window_exprs(query: &str) -> Result<String, PgTrickleError
             continue;
         }
         // Skip bare window functions (direct FuncCall-with-OVER, not nested)
-        if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_FuncCall) } {
-            let fc = unsafe { &*(rt.val as *const pg_sys::FuncCall) };
-            if !fc.over.is_null() {
-                continue;
-            }
+        if let Some(fc) = cast_node!(rt.val, T_FuncCall, pg_sys::FuncCall)
+            && !fc.over.is_null()
+        {
+            continue;
         }
         if unsafe { node_contains_window_func(rt.val) } {
             has_nested = true;
@@ -7866,7 +7565,7 @@ pub fn rewrite_nested_window_exprs(query: &str) -> Result<String, PgTrickleError
 
     // Carry the WINDOW clause into the inner SELECT so named window
     // references (OVER w) are still resolvable there.
-    let window_clause_sql = unsafe { deparse_select_window_clause(select)? };
+    let window_clause_sql = deparse_select_window_clause(select)?;
     let window_sql = if window_clause_sql.is_empty() {
         String::new()
     } else {
@@ -7921,9 +7620,7 @@ pub fn rewrite_nested_window_exprs(query: &str) -> Result<String, PgTrickleError
         }
 
         let alias_part = if !rt.name.is_null() {
-            let a = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("col");
+            let a = pg_cstr_to_str(rt.name).unwrap_or("col");
             format!(" AS \"{}\"", a.replace('"', "\"\""))
         } else {
             String::new()
@@ -7952,13 +7649,13 @@ fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgTric
             "DISTINCT ON query must have a FROM clause".into(),
         ));
     }
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(select.fromClause);
     let mut parts = Vec::new();
     for node_ptr in from_list.iter_ptr() {
         if node_ptr.is_null() {
             continue;
         }
-        parts.push(unsafe { from_item_to_sql(node_ptr)? });
+        parts.push(from_item_to_sql(node_ptr)?);
     }
     if parts.is_empty() {
         return Err(PgTrickleError::QueryParseError(
@@ -7972,43 +7669,35 @@ fn extract_from_clause_sql(select: &pg_sys::SelectStmt) -> Result<String, PgTric
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree Node.
-unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         let mut name = String::new();
         if !rv.schemaname.is_null() {
-            let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
-                .to_str()
-                .unwrap_or("public");
+            let schema = pg_cstr_to_str(rv.schemaname).unwrap_or("public");
             name.push_str(&format!("\"{}\".", schema.replace('"', "\"\"")));
         }
         if !rv.relname.is_null() {
-            let rel = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-                .to_str()
-                .unwrap_or("?");
+            let rel = pg_cstr_to_str(rv.relname).unwrap_or("?");
             name.push_str(&format!("\"{}\"", rel.replace('"', "\"\"")));
         }
         if !rv.alias.is_null() {
             let alias_struct = unsafe { &*rv.alias };
             if !alias_struct.aliasname.is_null() {
-                let alias = unsafe { std::ffi::CStr::from_ptr(alias_struct.aliasname) }
-                    .to_str()
-                    .unwrap_or("?");
+                let alias = pg_cstr_to_str(alias_struct.aliasname).unwrap_or("?");
                 name.push_str(&format!(" AS \"{}\"", alias.replace('"', "\"\"")));
             }
         }
         Ok(name)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         let left = if join.larg.is_null() {
             "?".to_string()
         } else {
-            unsafe { from_item_to_sql(join.larg)? }
+            from_item_to_sql(join.larg)?
         };
         let right = if join.rarg.is_null() {
             "?".to_string()
         } else {
-            unsafe { from_item_to_sql(join.rarg)? }
+            from_item_to_sql(join.rarg)?
         };
         let join_type = match join.jointype {
             pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
@@ -8030,23 +7719,19 @@ unsafe fn from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleE
             format!(" ON {}", cond.to_sql())
         };
         Ok(format!("{left} {join_type} {right}{on_clause}"))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        // Derived table / inline subquery in FROM: (SELECT ...) AS alias
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect) {
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
             return Ok("?".to_string());
         }
-        let inner_sql = unsafe { deparse_select_to_sql(sub.subquery)? };
+        let inner_sql = deparse_select_to_sql(sub.subquery)?;
         let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
         let mut result = format!("{lateral_kw}({inner_sql})");
         if !sub.alias.is_null() {
             let a = unsafe { &*(sub.alias) };
             if !a.aliasname.is_null() {
-                let alias = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                    .to_str()
-                    .unwrap_or("?");
+                let alias = pg_cstr_to_str(a.aliasname).unwrap_or("?");
                 result.push_str(&format!(" AS \"{}\"", alias.replace('"', "\"\"")));
             }
         }
@@ -8066,37 +7751,15 @@ pub fn reject_limit_offset(query: &str) -> Result<(), PgTrickleError> {
         return Ok(());
     }
 
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid
-    // memory context. We only read from the returned parse tree.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        // Parse error — will be caught by validate_defining_query later.
-        return Ok(());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     if !select.limitCount.is_null() {
         // LIMIT ALL is semantically equivalent to no LIMIT — don't reject.
         // SAFETY: limit node is non-null and points to a valid Node.
-        if !unsafe { is_limit_all_node(select.limitCount) } {
+        if !is_limit_all_node(select.limitCount) {
             return Err(PgTrickleError::UnsupportedOperator(
                 "LIMIT is not supported in defining queries without ORDER BY. \
                  Use ORDER BY + LIMIT for TopK stream tables, or omit LIMIT \
@@ -8147,30 +7810,10 @@ pub struct TopKInfo {
 /// - `LIMIT (SELECT ...)` → error (require constant integer)
 /// - Set operations (UNION, INTERSECT, EXCEPT) → not TopK
 pub fn detect_topk_pattern(query: &str) -> Result<Option<TopKInfo>, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(None);
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(None),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(None);
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // Not TopK if it's a set operation (UNION, INTERSECT, EXCEPT)
     if select.op != pg_sys::SetOperation::SETOP_NONE {
@@ -8186,14 +7829,14 @@ pub fn detect_topk_pattern(query: &str) -> Result<Option<TopKInfo>, PgTrickleErr
     if select.sortClause.is_null() {
         return Ok(None);
     }
-    let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.sortClause) };
+    let sort_list = pg_list::<pg_sys::Node>(select.sortClause);
     if sort_list.is_empty() {
         return Ok(None);
     }
 
     // Extract OFFSET value if present (must be a constant non-negative integer).
     let offset_value = if !select.limitOffset.is_null() {
-        match unsafe { extract_const_int_from_node(select.limitOffset) } {
+        match extract_const_int_from_node(select.limitOffset) {
             Some(v) if v >= 0 => {
                 if v == 0 {
                     None
@@ -8221,13 +7864,13 @@ pub fn detect_topk_pattern(query: &str) -> Result<Option<TopKInfo>, PgTrickleErr
 
     // Extract LIMIT value — must be a constant integer.
     let limit_node = select.limitCount;
-    let limit_value = unsafe { extract_const_int_from_node(limit_node) };
+    let limit_value = extract_const_int_from_node(limit_node);
     let limit_value = match limit_value {
         Some(v) => v,
         None => {
             // Check if this is LIMIT ALL (A_Const with isnull=true) — treat as
             // "no LIMIT" → not a TopK table.
-            if unsafe { is_limit_all_node(limit_node) } {
+            if is_limit_all_node(limit_node) {
                 return Ok(None);
             }
             // Otherwise it's a non-constant expression like LIMIT (SELECT ...).
@@ -8267,15 +7910,13 @@ pub fn detect_topk_pattern(query: &str) -> Result<Option<TopKInfo>, PgTrickleErr
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid Node.
-unsafe fn extract_const_int_from_node(node: *mut pg_sys::Node) -> Option<i64> {
+fn extract_const_int_from_node(node: *mut pg_sys::Node) -> Option<i64> {
     if node.is_null() {
         return None;
     }
 
     // Check for A_Const (Integer constant in raw parse tree)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Const) } {
-        let a_const = unsafe { &*(node as *const pg_sys::A_Const) };
-
+    if let Some(a_const) = cast_node!(node, T_A_Const, pg_sys::A_Const) {
         // In PostgreSQL 18, A_Const uses a union `val` with a `node.type` tag field.
         // Check if it's an Integer type.
         // SAFETY: accessing union fields of A_Const requires unsafe; we check
@@ -8298,9 +7939,8 @@ unsafe fn extract_const_int_from_node(node: *mut pg_sys::Node) -> Option<i64> {
     }
 
     // TypeCast wrapping an integer constant (e.g., LIMIT 5::bigint)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
-        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
-        return unsafe { extract_const_int_from_node(tc.arg) };
+    if let Some(tc) = cast_node!(node, T_TypeCast, pg_sys::TypeCast) {
+        return extract_const_int_from_node(tc.arg);
     }
 
     None
@@ -8313,12 +7953,11 @@ unsafe fn extract_const_int_from_node(node: *mut pg_sys::Node) -> Option<i64> {
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid Node (or is null).
-unsafe fn is_limit_all_node(node: *mut pg_sys::Node) -> bool {
+fn is_limit_all_node(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Const) } {
-        let a_const = unsafe { &*(node as *const pg_sys::A_Const) };
+    if let Some(a_const) = cast_node!(node, T_A_Const, pg_sys::A_Const) {
         return a_const.isnull;
     }
     false
@@ -8399,33 +8038,11 @@ fn strip_order_by_and_limit(query: &str) -> String {
 /// Emits a `pgrx::warning!()` for each such occurrence. Does **not** reject
 /// the query — LIMIT with ORDER BY is a legitimate, deterministic pattern.
 pub fn warn_limit_without_order_in_subqueries(query: &str) {
-    use std::ffi::CString;
-
-    let c_query = match CString::new(query) {
-        Ok(c) => c,
-        Err(_) => return,
+    let select = match parse_first_select(query) {
+        Ok(Some(s)) => unsafe { &*s },
+        _ => return,
     };
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return;
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
-        None => return,
-    };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return;
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
-    unsafe { walk_from_for_limit_warning(select) };
+    walk_from_for_limit_warning(select);
 }
 
 /// Walk a SelectStmt's FROM clause looking for subqueries with LIMIT but
@@ -8433,39 +8050,35 @@ pub fn warn_limit_without_order_in_subqueries(query: &str) {
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `SelectStmt`.
-unsafe fn walk_from_for_limit_warning(select: *const pg_sys::SelectStmt) {
+fn walk_from_for_limit_warning(select: *const pg_sys::SelectStmt) {
     let s = unsafe { &*select };
 
     // Handle set operations
     if s.op != pg_sys::SetOperation::SETOP_NONE {
         if !s.larg.is_null() {
-            unsafe { walk_from_for_limit_warning(s.larg) };
+            walk_from_for_limit_warning(s.larg);
         }
         if !s.rarg.is_null() {
-            unsafe { walk_from_for_limit_warning(s.rarg) };
+            walk_from_for_limit_warning(s.rarg);
         }
         return;
     }
 
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(s.fromClause);
     for node_ptr in from_list.iter_ptr() {
-        unsafe { check_from_item_limit_warning(node_ptr) };
+        check_from_item_limit_warning(node_ptr);
     }
 
     // Also check CTEs
     if !s.withClause.is_null() {
         let wc = unsafe { &*s.withClause };
-        let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
+        let cte_list = pg_list::<pg_sys::Node>(wc.ctes);
         for node_ptr in cte_list.iter_ptr() {
-            if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
-                let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
-                if !cte.ctequery.is_null()
-                    && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
-                {
-                    unsafe {
-                        walk_from_for_limit_warning(cte.ctequery as *const pg_sys::SelectStmt)
-                    };
-                }
+            if let Some(cte) = cast_node!(node_ptr, T_CommonTableExpr, pg_sys::CommonTableExpr)
+                && !cte.ctequery.is_null()
+                && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
+            {
+                walk_from_for_limit_warning(cte.ctequery as *const pg_sys::SelectStmt);
             }
         }
     }
@@ -8475,25 +8088,24 @@ unsafe fn walk_from_for_limit_warning(select: *const pg_sys::SelectStmt) {
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse tree node.
-unsafe fn check_from_item_limit_warning(node: *mut pg_sys::Node) {
+fn check_from_item_limit_warning(node: *mut pg_sys::Node) {
     if node.is_null() {
         return;
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+    if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect) {
         if !sub.subquery.is_null()
             && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
             let inner = unsafe { &*(sub.subquery as *const pg_sys::SelectStmt) };
             let has_order_by = !inner.sortClause.is_null() && {
-                let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner.sortClause) };
+                let sort_list = pg_list::<pg_sys::Node>(inner.sortClause);
                 !sort_list.is_empty()
             };
 
             // Check: has LIMIT but no ORDER BY
             if !inner.limitCount.is_null() && !has_order_by {
-                let alias = unsafe { resolve_range_subselect_alias(sub) };
+                let alias = resolve_range_subselect_alias(sub);
                 pgrx::warning!(
                     "pg_trickle: subquery '{}' uses LIMIT without ORDER BY. \
                      This produces non-deterministic results that may differ between \
@@ -8503,7 +8115,7 @@ unsafe fn check_from_item_limit_warning(node: *mut pg_sys::Node) {
             }
             // G2: Check: has OFFSET but no ORDER BY
             if !inner.limitOffset.is_null() && !has_order_by {
-                let alias = unsafe { resolve_range_subselect_alias(sub) };
+                let alias = resolve_range_subselect_alias(sub);
                 pgrx::warning!(
                     "pg_trickle: subquery '{}' uses OFFSET without ORDER BY. \
                      This produces non-deterministic results that may differ between \
@@ -8512,12 +8124,11 @@ unsafe fn check_from_item_limit_warning(node: *mut pg_sys::Node) {
                 );
             }
             // Recurse into the subquery's FROM clause
-            unsafe { walk_from_for_limit_warning(sub.subquery as *const pg_sys::SelectStmt) };
+            walk_from_for_limit_warning(sub.subquery as *const pg_sys::SelectStmt);
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        unsafe { check_from_item_limit_warning(join.larg) };
-        unsafe { check_from_item_limit_warning(join.rarg) };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        check_from_item_limit_warning(join.larg);
+        check_from_item_limit_warning(join.rarg);
     }
 }
 
@@ -8525,12 +8136,11 @@ unsafe fn check_from_item_limit_warning(node: *mut pg_sys::Node) {
 ///
 /// # Safety
 /// Caller must ensure `sub` points to a valid `RangeSubselect`.
-unsafe fn resolve_range_subselect_alias(sub: &pg_sys::RangeSubselect) -> String {
+fn resolve_range_subselect_alias(sub: &pg_sys::RangeSubselect) -> String {
     if !sub.alias.is_null() {
         let a = unsafe { &*(sub.alias) };
         if !a.aliasname.is_null() {
-            return unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
+            return pg_cstr_to_str(a.aliasname)
                 .unwrap_or("(subquery)")
                 .to_string();
         }
@@ -8550,53 +8160,33 @@ unsafe fn resolve_range_subselect_alias(sub: &pg_sys::RangeSubselect) -> String 
 /// This avoids running the full DVM parser (which resolves table OIDs,
 /// builds the operator tree, etc.) for queries that would fail anyway.
 pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    // SAFETY: raw_parser is safe within a PostgreSQL backend.
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Ok(());
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = match list.head() {
-        Some(rs) => rs,
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
         None => return Ok(()),
     };
-
-    let node = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
-        return Ok(());
-    }
-
-    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
 
     // For set operations (UNION/INTERSECT/EXCEPT), recurse into both sides
     if select.op != pg_sys::SetOperation::SETOP_NONE {
         if !select.larg.is_null() {
             // SAFETY: larg points to a valid SelectStmt
-            unsafe { check_select_unsupported(&*select.larg)? };
+            check_select_unsupported(unsafe { &*select.larg })?;
         }
         if !select.rarg.is_null() {
             // SAFETY: rarg points to a valid SelectStmt
-            unsafe { check_select_unsupported(&*select.rarg)? };
+            check_select_unsupported(unsafe { &*select.rarg })?;
         }
         return Ok(());
     }
 
     // SAFETY: select is a valid SelectStmt
-    unsafe { check_select_unsupported(select) }
+    check_select_unsupported(select)
 }
 
 /// Check a single SelectStmt for unsupported constructs.
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
-unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickleError> {
+fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickleError> {
     // ── DISTINCT ON ─────────────────────────────────────────────────
     // DISTINCT ON is handled by auto-rewriting to a ROW_NUMBER() window
     // function in the DVM parser (`rewrite_distinct_on()`). No rejection
@@ -8604,11 +8194,11 @@ unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), Pg
 
     // ── Unsupported join features (currently: NATURAL JOIN) ─────────
     if !select.fromClause.is_null() {
-        let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+        let from_list = pg_list::<pg_sys::Node>(select.fromClause);
         for node_ptr in from_list.iter_ptr() {
             if !node_ptr.is_null() {
                 // SAFETY: node_ptr is valid from the from_list
-                unsafe { check_from_item_unsupported(node_ptr)? };
+                check_from_item_unsupported(node_ptr)?;
             }
         }
     }
@@ -8620,7 +8210,7 @@ unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), Pg
     // since that's not yet supported.
     if !select.whereClause.is_null() {
         // SAFETY: whereClause is valid from the SelectStmt
-        unsafe { check_where_for_unsupported_sublinks(select.whereClause)? };
+        check_where_for_unsupported_sublinks(select.whereClause)?;
     }
 
     // ── FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE ──
@@ -8651,17 +8241,16 @@ unsafe fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), Pg
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgTrickleError> {
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgTrickleError> {
+    if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         // Recursively check join children
         if !join.larg.is_null() {
             // SAFETY: larg is valid from JoinExpr
-            unsafe { check_from_item_unsupported(join.larg)? };
+            check_from_item_unsupported(join.larg)?;
         }
         if !join.rarg.is_null() {
             // SAFETY: rarg is valid from JoinExpr
-            unsafe { check_from_item_unsupported(join.rarg)? };
+            check_from_item_unsupported(join.rarg)?;
         }
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeTableSample) } {
         // TABLESAMPLE: SELECT * FROM t TABLESAMPLE BERNOULLI(10)
@@ -8686,23 +8275,20 @@ unsafe fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgT
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn check_where_for_unsupported_sublinks(
-    node: *mut pg_sys::Node,
-) -> Result<(), PgTrickleError> {
+fn check_where_for_unsupported_sublinks(node: *mut pg_sys::Node) -> Result<(), PgTrickleError> {
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
         // EXISTS, ANY (IN), ALL, and EXPR SubLinks are handled during parsing
         return Ok(());
     }
     // Check inside BoolExpr (AND/OR/NOT) which commonly wraps SubLinks
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
-        if !boolexpr.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
-            for arg_ptr in args.iter_ptr() {
-                if !arg_ptr.is_null() {
-                    // SAFETY: arg_ptr is valid from BoolExpr args list
-                    unsafe { check_where_for_unsupported_sublinks(arg_ptr)? };
-                }
+    if let Some(boolexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr)
+        && !boolexpr.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(boolexpr.args);
+        for arg_ptr in args.iter_ptr() {
+            if !arg_ptr.is_null() {
+                // SAFETY: arg_ptr is valid from BoolExpr args list
+                check_where_for_unsupported_sublinks(arg_ptr)?;
             }
         }
     }
@@ -8735,27 +8321,25 @@ struct SublinkWrapper {
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn extract_where_sublinks(
+fn extract_where_sublinks(
     node: *mut pg_sys::Node,
     cte_ctx: &mut CteParseContext,
 ) -> Result<(Vec<SublinkWrapper>, Option<Expr>), PgTrickleError> {
     // Case 1: The node itself is a SubLink
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
-        let wrapper = unsafe { parse_sublink_to_wrapper(node, false, cte_ctx)? };
+        let wrapper = parse_sublink_to_wrapper(node, false, cte_ctx)?;
         return Ok((vec![wrapper], None));
     }
 
     // Case 2: BoolExpr
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
-
+    if let Some(boolexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr) {
         // Case 2a: NOT wrapping a SubLink → negated
         if boolexpr.boolop == pg_sys::BoolExprType::NOT_EXPR {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
+            let args = pg_list::<pg_sys::Node>(boolexpr.args);
             if args.len() == 1 {
                 let arg = args.head().unwrap();
                 if unsafe { pgrx::is_a(arg, pg_sys::NodeTag::T_SubLink) } {
-                    let wrapper = unsafe { parse_sublink_to_wrapper(arg, true, cte_ctx)? };
+                    let wrapper = parse_sublink_to_wrapper(arg, true, cte_ctx)?;
                     return Ok((vec![wrapper], None));
                 }
             }
@@ -8763,7 +8347,7 @@ unsafe fn extract_where_sublinks(
 
         // Case 2b: AND conjunction — extract SubLinks from each arg
         if boolexpr.boolop == pg_sys::BoolExprType::AND_EXPR {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
+            let args = pg_list::<pg_sys::Node>(boolexpr.args);
             let mut wrappers = Vec::new();
             let mut remaining_exprs = Vec::new();
 
@@ -8774,19 +8358,16 @@ unsafe fn extract_where_sublinks(
 
                 if unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_SubLink) } {
                     // Direct SubLink under AND
-                    let wrapper = unsafe { parse_sublink_to_wrapper(arg_ptr, false, cte_ctx)? };
+                    let wrapper = parse_sublink_to_wrapper(arg_ptr, false, cte_ctx)?;
                     wrappers.push(wrapper);
-                } else if unsafe { pgrx::is_a(arg_ptr, pg_sys::NodeTag::T_BoolExpr) } {
-                    let inner_bool = unsafe { &*(arg_ptr as *const pg_sys::BoolExpr) };
+                } else if let Some(inner_bool) = cast_node!(arg_ptr, T_BoolExpr, pg_sys::BoolExpr) {
                     // NOT SubLink under AND → negated
                     if inner_bool.boolop == pg_sys::BoolExprType::NOT_EXPR {
-                        let inner_args =
-                            unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_bool.args) };
+                        let inner_args = pg_list::<pg_sys::Node>(inner_bool.args);
                         if inner_args.len() == 1 {
                             let inner_arg = inner_args.head().unwrap();
                             if unsafe { pgrx::is_a(inner_arg, pg_sys::NodeTag::T_SubLink) } {
-                                let wrapper =
-                                    unsafe { parse_sublink_to_wrapper(inner_arg, true, cte_ctx)? };
+                                let wrapper = parse_sublink_to_wrapper(inner_arg, true, cte_ctx)?;
                                 wrappers.push(wrapper);
                                 continue;
                             }
@@ -8796,7 +8377,7 @@ unsafe fn extract_where_sublinks(
                     // rewritten to UNION by rewrite_sublinks_in_or().
                     // If still present, it's a deeply nested case.
                     if inner_bool.boolop == pg_sys::BoolExprType::OR_EXPR
-                        && unsafe { node_tree_contains_sublink(arg_ptr) }
+                        && node_tree_contains_sublink(arg_ptr)
                     {
                         return Err(PgTrickleError::UnsupportedOperator(
                             "Subquery expressions (EXISTS, IN) inside OR conditions are not \
@@ -8834,9 +8415,7 @@ unsafe fn extract_where_sublinks(
         // Case 2c: OR containing SubLinks — should have been
         // rewritten to UNION by rewrite_sublinks_in_or().
         // If still present, it's a deeply nested case.
-        if boolexpr.boolop == pg_sys::BoolExprType::OR_EXPR
-            && unsafe { node_tree_contains_sublink(node) }
-        {
+        if boolexpr.boolop == pg_sys::BoolExprType::OR_EXPR && node_tree_contains_sublink(node) {
             return Err(PgTrickleError::UnsupportedOperator(
                 "Subquery expressions (EXISTS, IN) inside OR conditions are not \
                  supported in this nesting pattern. Consider rewriting \
@@ -8855,21 +8434,20 @@ unsafe fn extract_where_sublinks(
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn node_tree_contains_sublink(node: *mut pg_sys::Node) -> bool {
+fn node_tree_contains_sublink(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
     }
     if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
         return true;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let boolexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
-        if !boolexpr.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(boolexpr.args) };
-            for arg_ptr in args.iter_ptr() {
-                if !arg_ptr.is_null() && unsafe { node_tree_contains_sublink(arg_ptr) } {
-                    return true;
-                }
+    if let Some(boolexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr)
+        && !boolexpr.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(boolexpr.args);
+        for arg_ptr in args.iter_ptr() {
+            if !arg_ptr.is_null() && node_tree_contains_sublink(arg_ptr) {
+                return true;
             }
         }
     }
@@ -8882,19 +8460,19 @@ unsafe fn node_tree_contains_sublink(node: *mut pg_sys::Node) -> bool {
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid parse-tree Node.
-unsafe fn flatten_and_conjuncts(node: *mut pg_sys::Node, result: &mut Vec<*mut pg_sys::Node>) {
+fn flatten_and_conjuncts(node: *mut pg_sys::Node, result: &mut Vec<*mut pg_sys::Node>) {
     if node.is_null() {
         return;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let be = unsafe { &*(node as *const pg_sys::BoolExpr) };
-        if be.boolop == pg_sys::BoolExprType::AND_EXPR && !be.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
-            for arg_ptr in args.iter_ptr() {
-                unsafe { flatten_and_conjuncts(arg_ptr, result) };
-            }
-            return;
+    if let Some(be) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr)
+        && be.boolop == pg_sys::BoolExprType::AND_EXPR
+        && !be.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(be.args);
+        for arg_ptr in args.iter_ptr() {
+            flatten_and_conjuncts(arg_ptr, result);
         }
+        return;
     }
     result.push(node);
 }
@@ -8908,7 +8486,7 @@ unsafe fn flatten_and_conjuncts(node: *mut pg_sys::Node, result: &mut Vec<*mut p
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
+fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
     if node.is_null() {
         return false;
     }
@@ -8922,13 +8500,11 @@ unsafe fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
     // Flatten the whole AND tree then check whether any conjunct is
     // an OR containing SubLink nodes.
     let mut conjuncts: Vec<*mut pg_sys::Node> = Vec::new();
-    unsafe { flatten_and_conjuncts(node, &mut conjuncts) };
+    flatten_and_conjuncts(node, &mut conjuncts);
     for conj in conjuncts {
         if !conj.is_null() && unsafe { pgrx::is_a(conj, pg_sys::NodeTag::T_BoolExpr) } {
             let inner = unsafe { &*(conj as *const pg_sys::BoolExpr) };
-            if inner.boolop == pg_sys::BoolExprType::OR_EXPR
-                && unsafe { node_tree_contains_sublink(conj) }
-            {
+            if inner.boolop == pg_sys::BoolExprType::OR_EXPR && node_tree_contains_sublink(conj) {
                 return true;
             }
         }
@@ -8945,7 +8521,7 @@ unsafe fn and_contains_or_with_sublink(node: *mut pg_sys::Node) -> bool {
 /// # Safety
 /// Caller must ensure `select_node` points to a valid pg_sys::Node
 /// (typically a SelectStmt).
-unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
+fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if select_node.is_null() {
         return Err(PgTrickleError::QueryParseError(
             "NULL node in deparse_select_to_sql".into(),
@@ -8963,22 +8539,19 @@ unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String
     let mut sql = String::from("SELECT ");
 
     // Deparse target list
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
     let mut targets = Vec::new();
     for node_ptr in target_list.iter_ptr() {
-        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
-            let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
-            if !rt.val.is_null() {
-                let expr = unsafe { node_to_expr(rt.val)? };
-                let expr_sql = expr.to_sql();
-                if !rt.name.is_null() {
-                    let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                        .to_str()
-                        .unwrap_or("?");
-                    targets.push(format!("{expr_sql} AS \"{name}\""));
-                } else {
-                    targets.push(expr_sql);
-                }
+        if let Some(rt) = cast_node!(node_ptr, T_ResTarget, pg_sys::ResTarget)
+            && !rt.val.is_null()
+        {
+            let expr = unsafe { node_to_expr(rt.val)? };
+            let expr_sql = expr.to_sql();
+            if !rt.name.is_null() {
+                let name = pg_cstr_to_str(rt.name).unwrap_or("?");
+                targets.push(format!("{expr_sql} AS \"{name}\""));
+            } else {
+                targets.push(expr_sql);
             }
         }
     }
@@ -8986,12 +8559,12 @@ unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String
 
     // Deparse FROM clause
     if !select.fromClause.is_null() {
-        let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+        let from_list = pg_list::<pg_sys::Node>(select.fromClause);
         if !from_list.is_empty() {
             sql.push_str(" FROM ");
             let mut from_items = Vec::new();
             for node_ptr in from_list.iter_ptr() {
-                from_items.push(unsafe { deparse_from_item(node_ptr)? });
+                from_items.push(deparse_from_item(node_ptr)?);
             }
             sql.push_str(&from_items.join(", "));
         }
@@ -9005,7 +8578,7 @@ unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String
 
     // Deparse GROUP BY
     if !select.groupClause.is_null() {
-        let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
+        let group_list = pg_list::<pg_sys::Node>(select.groupClause);
         if !group_list.is_empty() {
             let mut groups = Vec::new();
             for node_ptr in group_list.iter_ptr() {
@@ -9029,42 +8602,34 @@ unsafe fn deparse_select_to_sql(select_node: *mut pg_sys::Node) -> Result<String
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-unsafe fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
+fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
     if node.is_null() {
         return Err(PgTrickleError::QueryParseError(
             "NULL node in deparse_from_item".into(),
         ));
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         let mut sql = String::new();
         if !rv.schemaname.is_null() {
-            let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
-                .to_str()
-                .unwrap_or("public");
+            let schema = pg_cstr_to_str(rv.schemaname).unwrap_or("public");
             sql.push_str(&format!("\"{schema}\"."));
         }
         if !rv.relname.is_null() {
-            let table = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-                .to_str()
-                .unwrap_or("?");
+            let table = pg_cstr_to_str(rv.relname).unwrap_or("?");
             sql.push_str(&format!("\"{table}\""));
         }
         if !rv.alias.is_null() {
             let alias_node = unsafe { &*rv.alias };
             if !alias_node.aliasname.is_null() {
-                let alias = unsafe { std::ffi::CStr::from_ptr(alias_node.aliasname) }
-                    .to_str()
-                    .unwrap_or("?");
+                let alias = pg_cstr_to_str(alias_node.aliasname).unwrap_or("?");
                 sql.push_str(&format!(" \"{alias}\""));
             }
         }
         Ok(sql)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
-        let left = unsafe { deparse_from_item(join.larg)? };
-        let right = unsafe { deparse_from_item(join.rarg)? };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        let left = deparse_from_item(join.larg)?;
+        let right = deparse_from_item(join.rarg)?;
         let join_type = match join.jointype {
             pg_sys::JoinType::JOIN_INNER => "JOIN",
             pg_sys::JoinType::JOIN_LEFT => "LEFT JOIN",
@@ -9078,23 +8643,19 @@ unsafe fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickle
             sql.push_str(&format!(" ON {}", quals.to_sql()));
         }
         Ok(sql)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        // Derived table / inline subquery in FROM: (SELECT ...) AS alias
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect) {
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
             return Ok("/* unsupported RangeSubselect */".to_string());
         }
-        let inner_sql = unsafe { deparse_select_to_sql(sub.subquery)? };
+        let inner_sql = deparse_select_to_sql(sub.subquery)?;
         let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
         let mut result = format!("{lateral_kw}({inner_sql})");
         if !sub.alias.is_null() {
             let a = unsafe { &*(sub.alias) };
             if !a.aliasname.is_null() {
-                let alias = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                    .to_str()
-                    .unwrap_or("?");
+                let alias = pg_cstr_to_str(a.aliasname).unwrap_or("?");
                 result.push_str(&format!(" \"{}\"", alias.replace('"', "\"\"")));
             }
         }
@@ -9109,7 +8670,7 @@ unsafe fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickle
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::SubLink` (T_SubLink node).
-unsafe fn parse_sublink_to_wrapper(
+fn parse_sublink_to_wrapper(
     node: *mut pg_sys::Node,
     negated: bool,
     cte_ctx: &mut CteParseContext,
@@ -9117,18 +8678,16 @@ unsafe fn parse_sublink_to_wrapper(
     let sublink = unsafe { &*(node as *const pg_sys::SubLink) };
 
     match sublink.subLinkType {
-        pg_sys::SubLinkType::EXISTS_SUBLINK => unsafe {
-            parse_exists_sublink(sublink, negated, cte_ctx)
-        },
+        pg_sys::SubLinkType::EXISTS_SUBLINK => parse_exists_sublink(sublink, negated, cte_ctx),
         pg_sys::SubLinkType::ANY_SUBLINK => {
             // ANY_SUBLINK is used for both `x IN (SELECT ...)` and `x = ANY (SELECT ...)`
-            unsafe { parse_any_sublink(sublink, negated, cte_ctx) }
+            parse_any_sublink(sublink, negated, cte_ctx)
         }
         pg_sys::SubLinkType::ALL_SUBLINK => {
             // ALL_SUBLINK: `x op ALL (SELECT col FROM ...)`.
             // Rewritten as AntiJoin with negated condition:
             // NOT EXISTS (SELECT 1 FROM ... WHERE NOT (x op col))
-            unsafe { parse_all_sublink(sublink, negated, cte_ctx) }
+            parse_all_sublink(sublink, negated, cte_ctx)
         }
         pg_sys::SubLinkType::EXPR_SUBLINK => {
             // Scalar subquery in WHERE — should have been rewritten to
@@ -9171,7 +8730,7 @@ unsafe fn parse_sublink_to_wrapper(
 ///
 /// # Safety
 /// Caller must ensure `sublink` points to a valid `pg_sys::SubLink`.
-unsafe fn parse_exists_sublink(
+fn parse_exists_sublink(
     sublink: &pg_sys::SubLink,
     negated: bool,
     cte_ctx: &mut CteParseContext,
@@ -9185,7 +8744,7 @@ unsafe fn parse_exists_sublink(
     let inner_select = unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
 
     // Parse the inner FROM clause into an OpTree
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(inner_select.fromClause);
     if from_list.is_empty() {
         return Err(PgTrickleError::QueryParseError(
             "EXISTS subquery must have a FROM clause".into(),
@@ -9233,7 +8792,7 @@ unsafe fn parse_exists_sublink(
     //            right = Subquery(Filter(HAVING sum > 100,
     //                      Aggregate(GROUP BY o.cust_id,
     //                        Scan(eh_ord o)))))
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.groupClause) };
+    let group_list = pg_list::<pg_sys::Node>(inner_select.groupClause);
     let has_group_by = !group_list.is_empty();
     let has_having = !inner_select.havingClause.is_null();
 
@@ -9483,7 +9042,7 @@ fn try_extract_exists_corr_pair(pred: &Expr, inner_aliases: &[String]) -> Option
 ///
 /// # Safety
 /// Caller must ensure `sublink` points to a valid `pg_sys::SubLink`.
-unsafe fn parse_any_sublink(
+fn parse_any_sublink(
     sublink: &pg_sys::SubLink,
     negated: bool,
     cte_ctx: &mut CteParseContext,
@@ -9497,7 +9056,7 @@ unsafe fn parse_any_sublink(
     let inner_select = unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
 
     // Parse the inner FROM clause
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(inner_select.fromClause);
     if from_list.is_empty() {
         return Err(PgTrickleError::QueryParseError(
             "IN subquery must have a FROM clause".into(),
@@ -9526,7 +9085,7 @@ unsafe fn parse_any_sublink(
     };
 
     // Extract the inner SELECT target (the column being compared)
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(inner_select.targetList);
     if target_list.is_empty() {
         return Err(PgTrickleError::QueryParseError(
             "IN subquery SELECT list is empty".into(),
@@ -9534,8 +9093,8 @@ unsafe fn parse_any_sublink(
     }
 
     let first_target = target_list.head().unwrap();
-    let inner_col_expr = if unsafe { pgrx::is_a(first_target, pg_sys::NodeTag::T_ResTarget) } {
-        let rt = unsafe { &*(first_target as *const pg_sys::ResTarget) };
+    let inner_col_expr = if let Some(rt) = cast_node!(first_target, T_ResTarget, pg_sys::ResTarget)
+    {
         if rt.val.is_null() {
             return Err(PgTrickleError::QueryParseError(
                 "IN subquery target column is NULL".into(),
@@ -9554,7 +9113,7 @@ unsafe fn parse_any_sublink(
     // rewrite would lose the grouping semantics. Instead, wrap the inner
     // tree in Aggregate + Filter(HAVING) so only qualifying groups are
     // considered for the semi-join match.
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.groupClause) };
+    let group_list = pg_list::<pg_sys::Node>(inner_select.groupClause);
     let has_group_by = !group_list.is_empty();
     let has_having = !inner_select.havingClause.is_null();
 
@@ -9742,7 +9301,7 @@ fn extract_aggregates_from_expr_inner(expr: &Expr, start_idx: usize, out: &mut V
 ///
 /// # Safety
 /// Caller must ensure `sublink` points to a valid `pg_sys::SubLink`.
-unsafe fn parse_all_sublink(
+fn parse_all_sublink(
     sublink: &pg_sys::SubLink,
     negated: bool,
     cte_ctx: &mut CteParseContext,
@@ -9756,7 +9315,7 @@ unsafe fn parse_all_sublink(
     let inner_select = unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
 
     // Parse the inner FROM clause
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(inner_select.fromClause);
     if from_list.is_empty() {
         return Err(PgTrickleError::QueryParseError(
             "ALL subquery must have a FROM clause".into(),
@@ -9785,7 +9344,7 @@ unsafe fn parse_all_sublink(
     };
 
     // Extract the inner SELECT target column
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_select.targetList) };
+    let target_list = pg_list::<pg_sys::Node>(inner_select.targetList);
     if target_list.is_empty() {
         return Err(PgTrickleError::QueryParseError(
             "ALL subquery SELECT list is empty".into(),
@@ -9793,8 +9352,8 @@ unsafe fn parse_all_sublink(
     }
 
     let first_target = target_list.head().unwrap();
-    let inner_col_expr = if unsafe { pgrx::is_a(first_target, pg_sys::NodeTag::T_ResTarget) } {
-        let rt = unsafe { &*(first_target as *const pg_sys::ResTarget) };
+    let inner_col_expr = if let Some(rt) = cast_node!(first_target, T_ResTarget, pg_sys::ResTarget)
+    {
         if rt.val.is_null() {
             return Err(PgTrickleError::QueryParseError(
                 "ALL subquery target column is NULL".into(),
@@ -9879,20 +9438,7 @@ pub fn parse_defining_query_full(query: &str) -> Result<ParseResult, PgTrickleEr
 }
 
 unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrickleError> {
-    use std::ffi::CString;
-
-    let c_query = CString::new(query)
-        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
-
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Err(PgTrickleError::QueryParseError(
-            "raw_parser returned NULL".into(),
-        ));
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let list = parse_query(query)?;
     if list.len() != 1 {
         return Err(PgTrickleError::QueryParseError(format!(
             "Expected 1 statement, got {}",
@@ -10157,7 +9703,7 @@ unsafe fn parse_select_stmt(
     cte_ctx: &mut CteParseContext,
 ) -> Result<OpTree, PgTrickleError> {
     // ── Step 1: Parse FROM clause into Scan/Join tree ──────────────────
-    let from_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.fromClause) };
+    let from_list = pg_list::<pg_sys::Node>(select.fromClause);
     if from_list.is_empty() {
         return Err(PgTrickleError::QueryParseError(format!(
             "Defining query must have a FROM clause (op={}, all={}, larg_null={}, rarg_null={}, target_len={}, where_null={})",
@@ -10165,7 +9711,7 @@ unsafe fn parse_select_stmt(
             select.all,
             select.larg.is_null(),
             select.rarg.is_null(),
-            unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) }.len(),
+            pg_list::<pg_sys::Node>(select.targetList).len(),
             select.whereClause.is_null(),
         )));
     }
@@ -10229,7 +9775,7 @@ unsafe fn parse_select_stmt(
     // non-SubLink predicates become a Filter node.
     if !select.whereClause.is_null() {
         let (sublink_wrappers, remaining_predicate) =
-            unsafe { extract_where_sublinks(select.whereClause, cte_ctx)? };
+            extract_where_sublinks(select.whereClause, cte_ctx)?;
 
         // Apply SubLink wrappers (SemiJoin/AntiJoin) bottom-up
         for wrapper in sublink_wrappers {
@@ -10279,11 +9825,11 @@ unsafe fn parse_select_stmt(
     }
 
     // ── Step 3: Parse GROUP BY + aggregates ─────────────────────────────
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.groupClause) };
-    let target_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.targetList) };
+    let group_list = pg_list::<pg_sys::Node>(select.groupClause);
+    let target_list = pg_list::<pg_sys::Node>(select.targetList);
 
     let has_aggregates = unsafe { target_list_has_aggregates(&target_list) };
-    let has_windows = unsafe { target_list_has_windows(&target_list) };
+    let has_windows = target_list_has_windows(&target_list);
 
     if has_windows {
         // ── Window function path ───────────────────────────────────────
@@ -10455,7 +10001,7 @@ unsafe fn parse_select_stmt(
     // We detect DISTINCT ON by checking whether any list entry is a
     // non-null node pointer.
     if !select.distinctClause.is_null() {
-        let distinct_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(select.distinctClause) };
+        let distinct_list = pg_list::<pg_sys::Node>(select.distinctClause);
         let has_real_exprs = distinct_list.iter_ptr().any(|ptr| !ptr.is_null());
         if has_real_exprs {
             // DISTINCT ON (expr, ...) — reject
@@ -10601,8 +10147,7 @@ unsafe fn parse_scalar_target_subquery(
     node: *mut pg_sys::Node,
     cte_ctx: &mut CteParseContext,
 ) -> Result<Option<(OpTree, Vec<u32>)>, PgTrickleError> {
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
-        let sublink = unsafe { &*(node as *const pg_sys::SubLink) };
+    if let Some(sublink) = cast_node!(node, T_SubLink, pg_sys::SubLink) {
         if sublink.subLinkType != pg_sys::SubLinkType::EXPR_SUBLINK {
             return Ok(None);
         }
@@ -10636,30 +10181,14 @@ unsafe fn parse_scalar_target_subquery(
         return Ok(None);
     };
 
-    let c_sql = std::ffi::CString::new(inner_sql.as_str()).map_err(|_| {
-        PgTrickleError::QueryParseError("Scalar subquery contains null bytes".into())
-    })?;
-
-    let raw_list =
-        unsafe { pg_sys::raw_parser(c_sql.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
-    if raw_list.is_null() {
-        return Err(PgTrickleError::QueryParseError(
-            "Failed to parse scalar subquery target".into(),
-        ));
-    }
-
-    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
-    let raw_stmt = list.head().ok_or_else(|| {
-        PgTrickleError::QueryParseError("Scalar subquery target parse tree is empty".into())
-    })?;
-    let stmt = unsafe { (*raw_stmt).stmt };
-    if !unsafe { pgrx::is_a(stmt, pg_sys::NodeTag::T_SelectStmt) } {
-        return Err(PgTrickleError::QueryParseError(
-            "Scalar subquery target must parse to a SELECT".into(),
-        ));
-    }
-
-    let inner_select = unsafe { &*(stmt as *const pg_sys::SelectStmt) };
+    let inner_select = match parse_first_select(inner_sql.as_str())? {
+        Some(s) => unsafe { &*s },
+        None => {
+            return Err(PgTrickleError::QueryParseError(
+                "Scalar subquery target must parse to a SELECT".into(),
+            ));
+        }
+    };
     let subquery = if inner_select.op != pg_sys::SetOperation::SETOP_NONE {
         unsafe { parse_set_operation(inner_select, cte_ctx)? }
     } else {
@@ -10691,24 +10220,18 @@ unsafe fn parse_from_item(
     node: *mut pg_sys::Node,
     cte_ctx: &mut CteParseContext,
 ) -> Result<OpTree, PgTrickleError> {
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         let schema_name = if rv.schemaname.is_null() {
             "public".to_string()
         } else {
-            unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
-                .to_str()
+            pg_cstr_to_str(rv.schemaname)
                 .unwrap_or("public")
                 .to_string()
         };
-        let table_name = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-            .to_str()
-            .map_err(|_| PgTrickleError::QueryParseError("Invalid table name encoding".into()))?
-            .to_string();
+        let table_name = pg_cstr_to_str(rv.relname)?.to_string();
         let alias = if !rv.alias.is_null() {
             let a = unsafe { &*(rv.alias) };
-            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
+            pg_cstr_to_str(a.aliasname)
                 .unwrap_or(&table_name)
                 .to_string()
         } else {
@@ -10722,8 +10245,7 @@ unsafe fn parse_from_item(
         {
             let self_alias = if !rv.alias.is_null() {
                 let a = unsafe { &*(rv.alias) };
-                unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                    .to_str()
+                pg_cstr_to_str(a.aliasname)
                     .unwrap_or(&table_name)
                     .to_string()
             } else {
@@ -10796,8 +10318,7 @@ unsafe fn parse_from_item(
             pk_columns,
             alias,
         })
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         let left = unsafe { parse_from_item(join.larg, cte_ctx)? };
         let right = unsafe { parse_from_item(join.rarg, cte_ctx)? };
 
@@ -10998,9 +10519,7 @@ unsafe fn parse_from_item(
                 "Join type {other:?} not supported for differential mode",
             ))),
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        // Subquery in FROM: SELECT ... FROM (SELECT ...) AS alias(c1, c2)
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect) {
         if sub.subquery.is_null() {
             return Err(PgTrickleError::QueryParseError(
                 "RangeSubselect with NULL subquery".into(),
@@ -11019,8 +10538,7 @@ unsafe fn parse_from_item(
         // Extract alias name
         let alias = if !sub.alias.is_null() {
             let a = unsafe { &*(sub.alias) };
-            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
+            pg_cstr_to_str(a.aliasname)
                 .unwrap_or("subquery")
                 .to_string()
         } else {
@@ -11079,12 +10597,10 @@ unsafe fn parse_from_item(
             column_aliases: col_aliases,
             child: Box::new(sub_tree),
         })
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
-        let rf = unsafe { &*(node as *const pg_sys::RangeFunction) };
-
+    } else if let Some(rf) = cast_node!(node, T_RangeFunction, pg_sys::RangeFunction) {
         // Extract the function call from rf.functions (a List of Lists).
         // Each element is a two-element List: [FuncCall, column_def_list].
-        let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
+        let func_list = pg_list::<pg_sys::Node>(rf.functions);
         if func_list.is_empty() {
             return Err(PgTrickleError::QueryParseError(
                 "RangeFunction with no functions".into(),
@@ -11103,8 +10619,7 @@ unsafe fn parse_from_item(
         // The first element is a List node; its first element is the FuncCall.
         // SAFETY: func_list is non-empty, head is a List node containing the FuncCall.
         let inner_list_node = func_list.head().unwrap();
-        let inner_list =
-            unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_list_node as *mut pg_sys::List) };
+        let inner_list = pg_list::<pg_sys::Node>(inner_list_node as *mut pg_sys::List);
         if inner_list.is_empty() {
             return Err(PgTrickleError::QueryParseError(
                 "RangeFunction inner list is empty".into(),
@@ -11124,10 +10639,7 @@ unsafe fn parse_from_item(
         // Extract alias name
         let alias = if !rf.alias.is_null() {
             let a = unsafe { &*(rf.alias) };
-            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
-                .unwrap_or("srf")
-                .to_string()
+            pg_cstr_to_str(a.aliasname).unwrap_or("srf").to_string()
         } else {
             "srf".to_string()
         };
@@ -11158,21 +10670,13 @@ unsafe fn parse_from_item(
                 alias: String::new(),
             }),
         })
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonTable) } {
-        // ── F12: JSON_TABLE() in FROM clause ──────────────────────────
-        // JSON_TABLE is a row-generating FROM item similar to LATERAL SRFs.
-        // We deparse it to SQL and model it as a LateralFunction so the
-        // diff engine can apply row-scoped recomputation.
-        let jt = unsafe { &*(node as *const pg_sys::JsonTable) };
+    } else if let Some(jt) = cast_node!(node, T_JsonTable, pg_sys::JsonTable) {
         let func_sql = unsafe { deparse_json_table(jt as *const pg_sys::JsonTable)? };
 
         // Extract alias
         let alias = if !jt.alias.is_null() {
             let a = unsafe { &*(jt.alias) };
-            unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
-                .unwrap_or("jt")
-                .to_string()
+            pg_cstr_to_str(a.aliasname).unwrap_or("jt").to_string()
         } else {
             "jt".to_string()
         };
@@ -11249,7 +10753,7 @@ unsafe fn extract_cte_map_with_recursive(
     with_clause: *const pg_sys::WithClause,
 ) -> Result<RecursiveCteMapResult, PgTrickleError> {
     let wc = unsafe { &*with_clause };
-    let cte_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(wc.ctes) };
+    let cte_list = pg_list::<pg_sys::Node>(wc.ctes);
     let mut map = HashMap::new();
     let mut def_aliases_map = HashMap::new();
     let mut recursive_stmts = Vec::new();
@@ -11262,10 +10766,7 @@ unsafe fn extract_cte_map_with_recursive(
         let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
 
         // Extract CTE name
-        let cte_name = unsafe { std::ffi::CStr::from_ptr(cte.ctename) }
-            .to_str()
-            .map_err(|_| PgTrickleError::QueryParseError("Invalid CTE name encoding".into()))?
-            .to_string();
+        let cte_name = pg_cstr_to_str(cte.ctename)?.to_string();
 
         // The CTE body is ctequery, which must be a SelectStmt
         if cte.ctequery.is_null() {
@@ -11330,7 +10831,7 @@ unsafe fn extract_cte_map_with_recursive(
 ///
 /// Returns an empty `Vec` if no column aliases are specified.
 fn extract_cte_def_colnames(cte: &pg_sys::CommonTableExpr) -> Result<Vec<String>, PgTrickleError> {
-    let colnames = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(cte.aliascolnames) };
+    let colnames = pg_list::<pg_sys::Node>(cte.aliascolnames);
     let mut names = Vec::new();
     for node_ptr in colnames.iter_ptr() {
         let name = unsafe { node_to_string(node_ptr)? };
@@ -11347,7 +10848,7 @@ fn extract_cte_def_colnames(cte: &pg_sys::CommonTableExpr) -> Result<Vec<String>
 /// # Safety
 /// Caller must ensure `alias` points to a valid `Alias` struct.
 fn extract_alias_colnames(alias: &pg_sys::Alias) -> Result<Vec<String>, PgTrickleError> {
-    let colnames = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(alias.colnames) };
+    let colnames = pg_list::<pg_sys::Node>(alias.colnames);
     let mut names = Vec::new();
     for node_ptr in colnames.iter_ptr() {
         let name = unsafe { node_to_string(node_ptr)? };
@@ -11455,9 +10956,8 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         ));
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_ColumnRef) } {
-        let cref = unsafe { &*(node as *const pg_sys::ColumnRef) };
-        let fields = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(cref.fields) };
+    if let Some(cref) = cast_node!(node, T_ColumnRef, pg_sys::ColumnRef) {
+        let fields = pg_list::<pg_sys::Node>(cref.fields);
 
         match fields.len() {
             1 => {
@@ -11508,8 +11008,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         }
     } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Const) } {
         Ok(Expr::Raw(unsafe { deparse_node(node) }))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
-        let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+    } else if let Some(aexpr) = cast_node!(node, T_A_Expr, pg_sys::A_Expr) {
         match aexpr.kind {
             pg_sys::A_Expr_Kind::AEXPR_OP => {
                 let op_name = unsafe { extract_operator_name(aexpr.name)? };
@@ -11549,8 +11048,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             pg_sys::A_Expr_Kind::AEXPR_IN => {
                 // x IN (v1, v2, v3)
                 let left = unsafe { node_to_expr(aexpr.lexpr)? };
-                let right_list =
-                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(aexpr.rexpr as *mut _) };
+                let right_list = pg_list::<pg_sys::Node>(aexpr.rexpr as *mut _);
                 let mut vals = Vec::new();
                 for n in right_list.iter_ptr() {
                     vals.push(unsafe { node_to_expr(n)? }.to_sql());
@@ -11574,8 +11072,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             pg_sys::A_Expr_Kind::AEXPR_BETWEEN => {
                 // x BETWEEN a AND b
                 let tested = unsafe { node_to_expr(aexpr.lexpr)? };
-                let bounds =
-                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(aexpr.rexpr as *mut _) };
+                let bounds = pg_list::<pg_sys::Node>(aexpr.rexpr as *mut _);
                 let low = unsafe { node_to_expr(bounds.get_ptr(0).unwrap())? };
                 let high = unsafe { node_to_expr(bounds.get_ptr(1).unwrap())? };
                 Ok(Expr::Raw(format!(
@@ -11587,8 +11084,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             }
             pg_sys::A_Expr_Kind::AEXPR_NOT_BETWEEN => {
                 let tested = unsafe { node_to_expr(aexpr.lexpr)? };
-                let bounds =
-                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(aexpr.rexpr as *mut _) };
+                let bounds = pg_list::<pg_sys::Node>(aexpr.rexpr as *mut _);
                 let low = unsafe { node_to_expr(bounds.get_ptr(0).unwrap())? };
                 let high = unsafe { node_to_expr(bounds.get_ptr(1).unwrap())? };
                 Ok(Expr::Raw(format!(
@@ -11600,8 +11096,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             }
             pg_sys::A_Expr_Kind::AEXPR_BETWEEN_SYM => {
                 let tested = unsafe { node_to_expr(aexpr.lexpr)? };
-                let bounds =
-                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(aexpr.rexpr as *mut _) };
+                let bounds = pg_list::<pg_sys::Node>(aexpr.rexpr as *mut _);
                 let low = unsafe { node_to_expr(bounds.get_ptr(0).unwrap())? };
                 let high = unsafe { node_to_expr(bounds.get_ptr(1).unwrap())? };
                 Ok(Expr::Raw(format!(
@@ -11613,8 +11108,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             }
             pg_sys::A_Expr_Kind::AEXPR_NOT_BETWEEN_SYM => {
                 let tested = unsafe { node_to_expr(aexpr.lexpr)? };
-                let bounds =
-                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(aexpr.rexpr as *mut _) };
+                let bounds = pg_list::<pg_sys::Node>(aexpr.rexpr as *mut _);
                 let low = unsafe { node_to_expr(bounds.get_ptr(0).unwrap())? };
                 let high = unsafe { node_to_expr(bounds.get_ptr(1).unwrap())? };
                 Ok(Expr::Raw(format!(
@@ -11662,9 +11156,8 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                 _other,
             ))),
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let bexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(bexpr.args) };
+    } else if let Some(bexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr) {
+        let args_list = pg_list::<pg_sys::Node>(bexpr.args);
         let mut args = Vec::new();
         for n in args_list.iter_ptr() {
             if let Ok(e) = unsafe { node_to_expr(n) } {
@@ -11716,8 +11209,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             }
             _ => Ok(Expr::Raw("/* unknown bool expr */".to_string())),
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
-        let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
+    } else if let Some(fcall) = cast_node!(node, T_FuncCall, pg_sys::FuncCall) {
         let func_name = unsafe { extract_func_name(fcall.funcname)? };
 
         // Handle COUNT(*) and other agg_star calls.
@@ -11726,7 +11218,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         let base_args_str = if fcall.agg_star {
             "*".to_string()
         } else {
-            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let args_list = pg_list::<pg_sys::Node>(fcall.args);
             let mut args = Vec::new();
             for n in args_list.iter_ptr() {
                 if let Ok(e) = unsafe { node_to_expr(n) } {
@@ -11743,8 +11235,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
 
             // PARTITION BY
             if !over.partitionClause.is_null() {
-                let parts_list =
-                    unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(over.partitionClause) };
+                let parts_list = pg_list::<pg_sys::Node>(over.partitionClause);
                 let mut pk = Vec::new();
                 for p in parts_list.iter_ptr() {
                     pk.push(unsafe { node_to_expr(p) }?.to_sql());
@@ -11754,7 +11245,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
 
             // ORDER BY
             if !over.orderClause.is_null() {
-                let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(over.orderClause) };
+                let sort_list = pg_list::<pg_sys::Node>(over.orderClause);
                 let sort_sql = unsafe { deparse_sort_clause(&sort_list)? };
                 over_parts.push(format!("ORDER BY {}", sort_sql));
             }
@@ -11776,7 +11267,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                 args: vec![Expr::Raw("*".to_string())],
             })
         } else {
-            let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let args_list = pg_list::<pg_sys::Node>(fcall.args);
             let mut args = Vec::new();
             for n in args_list.iter_ptr() {
                 if let Ok(e) = unsafe { node_to_expr(n) } {
@@ -11785,8 +11276,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             }
             Ok(Expr::FuncCall { func_name, args })
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
-        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
+    } else if let Some(tc) = cast_node!(node, T_TypeCast, pg_sys::TypeCast) {
         let inner = unsafe { node_to_expr(tc.arg)? };
         let type_name = unsafe { deparse_typename(tc.typeName) };
         Ok(Expr::Raw(format!(
@@ -11794,8 +11284,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             inner.to_sql(),
             type_name,
         )))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullTest) } {
-        let nt = unsafe { &*(node as *const pg_sys::NullTest) };
+    } else if let Some(nt) = cast_node!(node, T_NullTest, pg_sys::NullTest) {
         let arg = unsafe { node_to_expr(nt.arg as *mut pg_sys::Node)? };
         let op = if nt.nulltesttype == pg_sys::NullTestType::IS_NULL {
             "IS NULL"
@@ -11803,9 +11292,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             "IS NOT NULL"
         };
         Ok(Expr::Raw(format!("{} {op}", arg.to_sql())))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseExpr) } {
-        // CASE WHEN ... THEN ... ELSE ... END
-        let case_expr = unsafe { &*(node as *const pg_sys::CaseExpr) };
+    } else if let Some(case_expr) = cast_node!(node, T_CaseExpr, pg_sys::CaseExpr) {
         let mut sql = String::from("CASE");
 
         // Simple CASE: CASE <arg> WHEN ...
@@ -11814,7 +11301,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             sql.push_str(&format!(" {}", arg.to_sql()));
         }
 
-        let when_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(case_expr.args) };
+        let when_list = pg_list::<pg_sys::Node>(case_expr.args);
         for w in when_list.iter_ptr() {
             let case_when = unsafe { &*(w as *const pg_sys::CaseWhen) };
             let cond = unsafe { node_to_expr(case_when.expr as *mut pg_sys::Node)? };
@@ -11829,13 +11316,8 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
 
         sql.push_str(" END");
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CoalesceExpr) } {
-        // COALESCE(a, b, ...) — emit as FuncCall so that
-        // resolve_expr_to_child can properly resolve column refs
-        // in each argument (avoids Raw-string replacement issues
-        // with qualified column refs like "b"."bonus").
-        let coalesce = unsafe { &*(node as *const pg_sys::CoalesceExpr) };
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(coalesce.args) };
+    } else if let Some(coalesce) = cast_node!(node, T_CoalesceExpr, pg_sys::CoalesceExpr) {
+        let args_list = pg_list::<pg_sys::Node>(coalesce.args);
         let mut args = Vec::new();
         for n in args_list.iter_ptr() {
             args.push(unsafe { node_to_expr(n)? });
@@ -11844,11 +11326,8 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             func_name: "COALESCE".to_string(),
             args,
         })
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullIfExpr) } {
-        // NULLIF(a, b) — emit as FuncCall for proper column
-        // resolution in resolve_expr_to_child.
-        let nullif = unsafe { &*(node as *const pg_sys::NullIfExpr) };
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(nullif.args) };
+    } else if let Some(nullif) = cast_node!(node, T_NullIfExpr, pg_sys::NullIfExpr) {
+        let args_list = pg_list::<pg_sys::Node>(nullif.args);
         let mut args = Vec::new();
         for n in args_list.iter_ptr() {
             args.push(unsafe { node_to_expr(n)? });
@@ -11857,16 +11336,13 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             func_name: "NULLIF".to_string(),
             args,
         })
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_MinMaxExpr) } {
-        // GREATEST(...) / LEAST(...) — emit as FuncCall for proper
-        // column resolution in resolve_expr_to_child.
-        let mmexpr = unsafe { &*(node as *const pg_sys::MinMaxExpr) };
+    } else if let Some(mmexpr) = cast_node!(node, T_MinMaxExpr, pg_sys::MinMaxExpr) {
         let func_name = if mmexpr.op == pg_sys::MinMaxOp::IS_GREATEST {
             "GREATEST"
         } else {
             "LEAST"
         };
-        let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(mmexpr.args) };
+        let args_list = pg_list::<pg_sys::Node>(mmexpr.args);
         let mut args = Vec::new();
         for n in args_list.iter_ptr() {
             args.push(unsafe { node_to_expr(n)? });
@@ -11875,14 +11351,10 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             func_name: func_name.to_string(),
             args,
         })
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SQLValueFunction) } {
-        // CURRENT_TIMESTAMP, CURRENT_USER, etc.
-        let svf = unsafe { &*(node as *const pg_sys::SQLValueFunction) };
+    } else if let Some(svf) = cast_node!(node, T_SQLValueFunction, pg_sys::SQLValueFunction) {
         let kw = sql_value_function_name(svf.op);
         Ok(Expr::Raw(kw.to_string()))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BooleanTest) } {
-        // x IS [NOT] TRUE/FALSE/UNKNOWN
-        let bt = unsafe { &*(node as *const pg_sys::BooleanTest) };
+    } else if let Some(bt) = cast_node!(node, T_BooleanTest, pg_sys::BooleanTest) {
         let arg = unsafe { node_to_expr(bt.arg as *mut pg_sys::Node)? };
         let test = match bt.booltesttype {
             pg_sys::BoolTestType::IS_TRUE => "IS TRUE",
@@ -11894,13 +11366,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             _ => "IS TRUE",
         };
         Ok(Expr::Raw(format!("{} {test}", arg.to_sql())))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
-        // Subquery expressions encountered during expression parsing.
-        // EXISTS and IN SubLinks should have been extracted from WHERE
-        // by extract_where_sublinks(). If we reach here, it's either:
-        // 1. A scalar subquery in the target list (EXPR_SUBLINK) — preserve as Raw SQL
-        // 2. A SubLink in a context we can't handle — error
-        let sublink = unsafe { &*(node as *const pg_sys::SubLink) };
+    } else if let Some(sublink) = cast_node!(node, T_SubLink, pg_sys::SubLink) {
         match sublink.subLinkType {
             pg_sys::SubLinkType::EXPR_SUBLINK => {
                 // Scalar subquery — reconstruct as Raw SQL
@@ -11910,7 +11376,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                         "Scalar subquery has NULL subselect".into(),
                     ));
                 }
-                let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
+                let inner_sql = deparse_select_to_sql(sublink.subselect)?;
                 Ok(Expr::Raw(format!("({inner_sql})")))
             }
             pg_sys::SubLinkType::EXISTS_SUBLINK => {
@@ -11921,7 +11387,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                         "EXISTS subquery has NULL subselect".into(),
                     ));
                 }
-                let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
+                let inner_sql = deparse_select_to_sql(sublink.subselect)?;
                 Ok(Expr::Raw(format!("EXISTS ({inner_sql})")))
             }
             pg_sys::SubLinkType::ANY_SUBLINK => {
@@ -11932,7 +11398,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                     ));
                 }
                 let test = unsafe { node_to_expr(sublink.testexpr)? };
-                let inner_sql = unsafe { deparse_select_to_sql(sublink.subselect)? };
+                let inner_sql = deparse_select_to_sql(sublink.subselect)?;
                 Ok(Expr::Raw(format!("{} IN ({inner_sql})", test.to_sql())))
             }
             _ => {
@@ -11946,54 +11412,42 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                 )))
             }
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_ArrayExpr) } {
-        // ARRAY[a, b, c]
-        let arrexpr = unsafe { &*(node as *const pg_sys::ArrayExpr) };
-        let elems = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(arrexpr.elements) };
+    } else if let Some(arrexpr) = cast_node!(node, T_ArrayExpr, pg_sys::ArrayExpr) {
+        let elems = pg_list::<pg_sys::Node>(arrexpr.elements);
         let mut elem_sql = Vec::new();
         for n in elems.iter_ptr() {
             elem_sql.push(unsafe { node_to_expr(n)? }.to_sql());
         }
         Ok(Expr::Raw(format!("ARRAY[{}]", elem_sql.join(", "))))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RowExpr) } {
-        // ROW(a, b, c)
-        let rowexpr = unsafe { &*(node as *const pg_sys::RowExpr) };
-        let fields = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rowexpr.args) };
+    } else if let Some(rowexpr) = cast_node!(node, T_RowExpr, pg_sys::RowExpr) {
+        let fields = pg_list::<pg_sys::Node>(rowexpr.args);
         let mut field_sql = Vec::new();
         for n in fields.iter_ptr() {
             field_sql.push(unsafe { node_to_expr(n)? }.to_sql());
         }
         Ok(Expr::Raw(format!("ROW({})", field_sql.join(", "))))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Indirection) } {
-        // Array subscript / field access: arr[1], (rec).field, data->'key'->>'name'
-        let indir = unsafe { &*(node as *const pg_sys::A_Indirection) };
+    } else if let Some(indir) = cast_node!(node, T_A_Indirection, pg_sys::A_Indirection) {
         let base = unsafe { node_to_expr(indir.arg)? };
         let mut sql = base.to_sql();
-        let indirection_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(indir.indirection) };
+        let indirection_list = pg_list::<pg_sys::Node>(indir.indirection);
         for ind_node in indirection_list.iter_ptr() {
-            if unsafe { pgrx::is_a(ind_node, pg_sys::NodeTag::T_A_Indices) } {
-                let indices = unsafe { &*(ind_node as *const pg_sys::A_Indices) };
+            if let Some(indices) = cast_node!(ind_node, T_A_Indices, pg_sys::A_Indices) {
                 if !indices.uidx.is_null() {
                     let idx = unsafe { node_to_expr(indices.uidx)? };
                     sql = format!("{sql}[{}]", idx.to_sql());
                 }
-            } else if unsafe { pgrx::is_a(ind_node, pg_sys::NodeTag::T_String) } {
-                let s = unsafe { &*(ind_node as *const pg_sys::String) };
-                let field_name = unsafe { std::ffi::CStr::from_ptr(s.sval) }
-                    .to_str()
-                    .unwrap_or("");
+            } else if let Some(s) = cast_node!(ind_node, T_String, pg_sys::String) {
+                let field_name = pg_cstr_to_str(s.sval).unwrap_or("");
                 sql = format!("({sql}).{field_name}");
             } else if unsafe { pgrx::is_a(ind_node, pg_sys::NodeTag::T_A_Star) } {
                 sql = format!("({sql}).*");
             }
         }
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CollateClause) } {
-        // COLLATE clause: expr COLLATE "collation_name"
-        let cc = unsafe { &*(node as *const pg_sys::CollateClause) };
+    } else if let Some(cc) = cast_node!(node, T_CollateClause, pg_sys::CollateClause) {
         let arg = unsafe { node_to_expr(cc.arg)? };
         // Extract collation name from the name list
-        let coll_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(cc.collname) };
+        let coll_list = pg_list::<pg_sys::Node>(cc.collname);
         let mut coll_parts = Vec::new();
         for n in coll_list.iter_ptr() {
             if let Ok(s) = unsafe { node_to_string(n) } {
@@ -12012,11 +11466,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         Ok(Expr::Raw(
             format!("{} COLLATE {}", arg.to_sql(), coll_name,),
         ))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonIsPredicate) } {
-        // ── F5: IS JSON predicate (PostgreSQL 16+) ──
-        // expr IS [NOT] JSON [SCALAR|ARRAY|OBJECT] [WITH UNIQUE KEYS]
-        // Note: IS NOT JSON is represented as BoolExpr(NOT) wrapping this node.
-        let jip = unsafe { &*(node as *const pg_sys::JsonIsPredicate) };
+    } else if let Some(jip) = cast_node!(node, T_JsonIsPredicate, pg_sys::JsonIsPredicate) {
         let arg = unsafe { node_to_expr(jip.expr)? };
         let type_str = match jip.item_type {
             pg_sys::JsonValueType::JS_TYPE_OBJECT => "JSON OBJECT",
@@ -12030,14 +11480,13 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             ""
         };
         Ok(Expr::Raw(format!("{} IS {type_str}{unique}", arg.to_sql())))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectConstructor) } {
-        // ── F10: JSON_OBJECT('key': value, ...) ──
-        let joc = unsafe { &*(node as *const pg_sys::JsonObjectConstructor) };
-        let exprs = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(joc.exprs) };
+    } else if let Some(joc) =
+        cast_node!(node, T_JsonObjectConstructor, pg_sys::JsonObjectConstructor)
+    {
+        let exprs = pg_list::<pg_sys::Node>(joc.exprs);
         let mut pairs = Vec::new();
         for n in exprs.iter_ptr() {
-            if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_JsonKeyValue) } {
-                let kv = unsafe { &*(n as *const pg_sys::JsonKeyValue) };
+            if let Some(kv) = cast_node!(n, T_JsonKeyValue, pg_sys::JsonKeyValue) {
                 let key = unsafe { node_to_expr(kv.key as *mut pg_sys::Node)? };
                 let val = if !kv.value.is_null() {
                     let jve = unsafe { &*kv.value };
@@ -12054,15 +11503,13 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         }
         unsafe { append_json_output(&mut sql, joc.output) };
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayConstructor) } {
-        // ── F10: JSON_ARRAY(expr, ...) ──
-        let jac = unsafe { &*(node as *const pg_sys::JsonArrayConstructor) };
-        let exprs = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(jac.exprs) };
+    } else if let Some(jac) = cast_node!(node, T_JsonArrayConstructor, pg_sys::JsonArrayConstructor)
+    {
+        let exprs = pg_list::<pg_sys::Node>(jac.exprs);
         let mut elems = Vec::new();
         for n in exprs.iter_ptr() {
             // Elements may be JsonValueExpr or plain exprs
-            if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_JsonValueExpr) } {
-                let jve = unsafe { &*(n as *const pg_sys::JsonValueExpr) };
+            if let Some(jve) = cast_node!(n, T_JsonValueExpr, pg_sys::JsonValueExpr) {
                 elems.push(unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }.to_sql());
             } else {
                 elems.push(unsafe { node_to_expr(n)? }.to_sql());
@@ -12074,20 +11521,20 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         }
         unsafe { append_json_output(&mut sql, jac.output) };
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayQueryConstructor) } {
-        // ── F10: JSON_ARRAY(SELECT ...) ──
-        let jaqc = unsafe { &*(node as *const pg_sys::JsonArrayQueryConstructor) };
+    } else if let Some(jaqc) = cast_node!(
+        node,
+        T_JsonArrayQueryConstructor,
+        pg_sys::JsonArrayQueryConstructor
+    ) {
         let inner_sql = if !jaqc.query.is_null() {
-            unsafe { deparse_select_to_sql(jaqc.query)? }
+            deparse_select_to_sql(jaqc.query)?
         } else {
             "SELECT NULL".to_string()
         };
         let mut sql = format!("JSON_ARRAY({inner_sql})");
         unsafe { append_json_output(&mut sql, jaqc.output) };
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonParseExpr) } {
-        // ── F10: JSON('text') ──
-        let jpe = unsafe { &*(node as *const pg_sys::JsonParseExpr) };
+    } else if let Some(jpe) = cast_node!(node, T_JsonParseExpr, pg_sys::JsonParseExpr) {
         let arg = if !jpe.expr.is_null() {
             let jve = unsafe { &*jpe.expr };
             unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
@@ -12097,16 +11544,12 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         let mut sql = format!("JSON({})", arg.to_sql());
         unsafe { append_json_output(&mut sql, jpe.output) };
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonScalarExpr) } {
-        // ── F10: JSON_SCALAR(value) ──
-        let jse = unsafe { &*(node as *const pg_sys::JsonScalarExpr) };
+    } else if let Some(jse) = cast_node!(node, T_JsonScalarExpr, pg_sys::JsonScalarExpr) {
         let arg = unsafe { node_to_expr(jse.expr as *mut pg_sys::Node)? };
         let mut sql = format!("JSON_SCALAR({})", arg.to_sql());
         unsafe { append_json_output(&mut sql, jse.output) };
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonSerializeExpr) } {
-        // ── F10: JSON_SERIALIZE(value) ──
-        let jse = unsafe { &*(node as *const pg_sys::JsonSerializeExpr) };
+    } else if let Some(jse) = cast_node!(node, T_JsonSerializeExpr, pg_sys::JsonSerializeExpr) {
         let arg = if !jse.expr.is_null() {
             let jve = unsafe { &*jse.expr };
             unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
@@ -12116,13 +11559,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         let mut sql = format!("JSON_SERIALIZE({})", arg.to_sql());
         unsafe { append_json_output(&mut sql, jse.output) };
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonObjectAgg) } {
-        // ── F10/F11: JSON_OBJECTAGG(key: value) ──
-        // An aggregate function in the raw parse tree that bypasses T_FuncCall.
-        // In aggregate context (GROUP BY), extract_aggregates() handles this via
-        // AggFunc::JsonObjectAggStd. This Expr::Raw fallback is used in
-        // non-aggregate context (e.g., FULL mode, nested expressions).
-        let joa = unsafe { &*(node as *const pg_sys::JsonObjectAgg) };
+    } else if let Some(joa) = cast_node!(node, T_JsonObjectAgg, pg_sys::JsonObjectAgg) {
         let mut parts = Vec::new();
         if !joa.arg.is_null() {
             let kv = unsafe { &*joa.arg };
@@ -12145,11 +11582,7 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
         unsafe { append_json_agg_clauses(&mut inner, joa.constructor) };
         let sql = format!("JSON_OBJECTAGG({inner})");
         Ok(Expr::Raw(sql))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonArrayAgg) } {
-        // ── F10/F11: JSON_ARRAYAGG(expr [ORDER BY ...]) ──
-        // Same aggregate caveat as JSON_OBJECTAGG above: in GROUP BY context,
-        // extract_aggregates() handles this via AggFunc::JsonArrayAggStd.
-        let jaa = unsafe { &*(node as *const pg_sys::JsonArrayAgg) };
+    } else if let Some(jaa) = cast_node!(node, T_JsonArrayAgg, pg_sys::JsonArrayAgg) {
         let arg = if !jaa.arg.is_null() {
             let jve = unsafe { &*jaa.arg };
             unsafe { node_to_expr(jve.raw_expr as *mut pg_sys::Node)? }
@@ -12203,25 +11636,24 @@ unsafe fn append_json_agg_clauses(
     let ctor = unsafe { &*constructor };
 
     // ORDER BY
-    let order_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(ctor.agg_order) };
+    let order_list = pg_list::<pg_sys::Node>(ctor.agg_order);
     if !order_list.is_empty() {
         let mut order_parts = Vec::new();
         for n in order_list.iter_ptr() {
-            if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_SortBy) } {
-                let sb = unsafe { &*(n as *const pg_sys::SortBy) };
-                if let Ok(expr) = unsafe { node_to_expr(sb.node) } {
-                    let dir = match sb.sortby_dir {
-                        pg_sys::SortByDir::SORTBY_DESC => " DESC",
-                        pg_sys::SortByDir::SORTBY_ASC => " ASC",
-                        _ => "",
-                    };
-                    let nulls = match sb.sortby_nulls {
-                        pg_sys::SortByNulls::SORTBY_NULLS_FIRST => " NULLS FIRST",
-                        pg_sys::SortByNulls::SORTBY_NULLS_LAST => " NULLS LAST",
-                        _ => "",
-                    };
-                    order_parts.push(format!("{}{dir}{nulls}", expr.to_sql()));
-                }
+            if let Some(sb) = cast_node!(n, T_SortBy, pg_sys::SortBy)
+                && let Ok(expr) = unsafe { node_to_expr(sb.node) }
+            {
+                let dir = match sb.sortby_dir {
+                    pg_sys::SortByDir::SORTBY_DESC => " DESC",
+                    pg_sys::SortByDir::SORTBY_ASC => " ASC",
+                    _ => "",
+                };
+                let nulls = match sb.sortby_nulls {
+                    pg_sys::SortByNulls::SORTBY_NULLS_FIRST => " NULLS FIRST",
+                    pg_sys::SortByNulls::SORTBY_NULLS_LAST => " NULLS LAST",
+                    _ => "",
+                };
+                order_parts.push(format!("{}{dir}{nulls}", expr.to_sql()));
             }
         }
         if !order_parts.is_empty() {
@@ -12299,7 +11731,7 @@ unsafe fn deparse_json_table_passing(passing: *mut pg_sys::List) -> Result<Strin
     if passing.is_null() {
         return Ok(String::new());
     }
-    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(passing) };
+    let list = pg_list::<pg_sys::Node>(passing);
     if list.is_empty() {
         return Ok(String::new());
     }
@@ -12322,7 +11754,7 @@ unsafe fn deparse_json_table_columns(columns: *mut pg_sys::List) -> Result<Strin
     if columns.is_null() {
         return Ok(String::new());
     }
-    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(columns) };
+    let list = pg_list::<pg_sys::Node>(columns);
     let mut parts = Vec::new();
     for node_ptr in list.iter_ptr() {
         let col_sql = unsafe { deparse_json_table_column(node_ptr)? };
@@ -12344,10 +11776,7 @@ unsafe fn deparse_json_table_column(node: *mut pg_sys::Node) -> Result<String, P
     let col = unsafe { &*(node as *const pg_sys::JsonTableColumn) };
 
     let name = if !col.name.is_null() {
-        unsafe { std::ffi::CStr::from_ptr(col.name) }
-            .to_str()
-            .unwrap_or("col")
-            .to_string()
+        pg_cstr_to_str(col.name).unwrap_or("col").to_string()
     } else {
         "col".to_string()
     };
@@ -12508,7 +11937,7 @@ unsafe fn deparse_json_behavior(behavior: *const pg_sys::JsonBehavior, suffix: &
 
 /// Extract operator name from an A_Expr name list.
 unsafe fn extract_operator_name(name_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
-    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(name_list) };
+    let list = pg_list::<pg_sys::Node>(name_list);
     if let Some(node) = list.head() {
         unsafe { node_to_string(node) }
     } else {
@@ -12518,7 +11947,7 @@ unsafe fn extract_operator_name(name_list: *mut pg_sys::List) -> Result<String, 
 
 /// Extract function name from funcname list (possibly schema-qualified).
 unsafe fn extract_func_name(name_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
-    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(name_list) };
+    let list = pg_list::<pg_sys::Node>(name_list);
     let mut parts = Vec::new();
     for n in list.iter_ptr() {
         if let Ok(s) = unsafe { node_to_string(n) } {
@@ -12540,7 +11969,7 @@ unsafe fn deparse_func_call(fcall: *const pg_sys::FuncCall) -> Result<String, Pg
     let fcall_ref = unsafe { &*fcall };
     let func_name = unsafe { extract_func_name(fcall_ref.funcname)? };
 
-    let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall_ref.args) };
+    let args_list = pg_list::<pg_sys::Node>(fcall_ref.args);
     let mut arg_sqls = Vec::new();
     for n in args_list.iter_ptr() {
         let expr = unsafe { node_to_expr(n)? };
@@ -12570,7 +11999,7 @@ unsafe fn deparse_select_stmt_to_sql(
     let mut parts = Vec::new();
 
     // DISTINCT
-    let distinct_clause = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.distinctClause) };
+    let distinct_clause = pg_list::<pg_sys::Node>(s.distinctClause);
     let distinct_prefix = if !distinct_clause.is_empty() {
         "SELECT DISTINCT"
     } else {
@@ -12594,7 +12023,7 @@ unsafe fn deparse_select_stmt_to_sql(
     }
 
     // GROUP BY clause
-    let group_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.groupClause) };
+    let group_list = pg_list::<pg_sys::Node>(s.groupClause);
     if !group_list.is_empty() {
         let mut groups = Vec::new();
         for node_ptr in group_list.iter_ptr() {
@@ -12611,7 +12040,7 @@ unsafe fn deparse_select_stmt_to_sql(
     }
 
     // ORDER BY clause (SortBy nodes)
-    let sort_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(s.sortClause) };
+    let sort_list = pg_list::<pg_sys::Node>(s.sortClause);
     if !sort_list.is_empty() {
         let sorts = unsafe { deparse_sort_clause(&sort_list)? };
         parts.push(format!("ORDER BY {sorts}"));
@@ -12639,7 +12068,7 @@ unsafe fn deparse_select_stmt_to_sql(
 /// # Safety
 /// Caller must ensure `target_list` points to a valid `pg_sys::List`.
 unsafe fn deparse_target_list(target_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
-    let targets = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(target_list) };
+    let targets = pg_list::<pg_sys::Node>(target_list);
     let mut items = Vec::new();
     for node_ptr in targets.iter_ptr() {
         if !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
@@ -12652,9 +12081,7 @@ unsafe fn deparse_target_list(target_list: *mut pg_sys::List) -> Result<String, 
         let expr = unsafe { node_to_expr(rt.val)? };
         let expr_sql = expr.to_sql();
         if !rt.name.is_null() {
-            let alias = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("");
+            let alias = pg_cstr_to_str(rt.name).unwrap_or("");
             items.push(format!("{expr_sql} AS {alias}"));
         } else {
             items.push(expr_sql);
@@ -12668,7 +12095,7 @@ unsafe fn deparse_target_list(target_list: *mut pg_sys::List) -> Result<String, 
 /// # Safety
 /// Caller must ensure `from_list` points to a valid `pg_sys::List`.
 unsafe fn deparse_from_clause(from_list: *mut pg_sys::List) -> Result<String, PgTrickleError> {
-    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(from_list) };
+    let list = pg_list::<pg_sys::Node>(from_list);
     let mut items = Vec::new();
     for node_ptr in list.iter_ptr() {
         let item = unsafe { deparse_from_item_to_sql(node_ptr)? };
@@ -12688,34 +12115,26 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
         ));
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         let mut name = String::new();
         if !rv.schemaname.is_null() {
-            let schema = unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
-                .to_str()
-                .unwrap_or("");
+            let schema = pg_cstr_to_str(rv.schemaname).unwrap_or("");
             name.push_str(schema);
             name.push('.');
         }
         if !rv.relname.is_null() {
-            let rel = unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-                .to_str()
-                .unwrap_or("");
+            let rel = pg_cstr_to_str(rv.relname).unwrap_or("");
             name.push_str(rel);
         }
         if !rv.alias.is_null() {
             let a = unsafe { &*(rv.alias) };
-            let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
-                .unwrap_or("");
+            let alias_name = pg_cstr_to_str(a.aliasname).unwrap_or("");
             if alias_name != name {
                 name.push_str(&format!(" {alias_name}"));
             }
         }
         Ok(name)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         let left = unsafe { deparse_from_item_to_sql(join.larg)? };
         let right = unsafe { deparse_from_item_to_sql(join.rarg)? };
         let join_type = match join.jointype {
@@ -12732,8 +12151,7 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
             expr.to_sql()
         };
         Ok(format!("{left} {join_type} {right} ON {condition}"))
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect) {
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
@@ -12746,23 +12164,19 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
         let mut result = format!("({inner_sql})");
         if !sub.alias.is_null() {
             let a = unsafe { &*(sub.alias) };
-            let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
-                .unwrap_or("");
+            let alias_name = pg_cstr_to_str(a.aliasname).unwrap_or("");
             result.push_str(&format!(" AS {alias_name}"));
         }
         Ok(result)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeFunction) } {
-        let rf = unsafe { &*(node as *const pg_sys::RangeFunction) };
-        let func_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(rf.functions) };
+    } else if let Some(rf) = cast_node!(node, T_RangeFunction, pg_sys::RangeFunction) {
+        let func_list = pg_list::<pg_sys::Node>(rf.functions);
         if func_list.is_empty() {
             return Err(PgTrickleError::QueryParseError(
                 "RangeFunction with no functions in deparse".into(),
             ));
         }
         let inner_list_node = func_list.head().unwrap();
-        let inner_list =
-            unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_list_node as *mut pg_sys::List) };
+        let inner_list = pg_list::<pg_sys::Node>(inner_list_node as *mut pg_sys::List);
         if inner_list.is_empty() {
             return Err(PgTrickleError::QueryParseError(
                 "RangeFunction inner list empty in deparse".into(),
@@ -12773,21 +12187,15 @@ unsafe fn deparse_from_item_to_sql(node: *mut pg_sys::Node) -> Result<String, Pg
         let mut result = func_sql;
         if !rf.alias.is_null() {
             let a = unsafe { &*(rf.alias) };
-            let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
-                .unwrap_or("");
+            let alias_name = pg_cstr_to_str(a.aliasname).unwrap_or("");
             result.push_str(&format!(" AS {alias_name}"));
         }
         Ok(result)
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JsonTable) } {
-        // ── F12: JSON_TABLE deparse ──
-        let jt = unsafe { &*(node as *const pg_sys::JsonTable) };
+    } else if let Some(jt) = cast_node!(node, T_JsonTable, pg_sys::JsonTable) {
         let mut result = unsafe { deparse_json_table(jt as *const pg_sys::JsonTable)? };
         if !jt.alias.is_null() {
             let a = unsafe { &*(jt.alias) };
-            let alias_name = unsafe { std::ffi::CStr::from_ptr(a.aliasname) }
-                .to_str()
-                .unwrap_or("");
+            let alias_name = pg_cstr_to_str(a.aliasname).unwrap_or("");
             result.push_str(&format!(" AS {alias_name}"));
         }
         Ok(result)
@@ -12846,7 +12254,7 @@ unsafe fn deparse_sort_by(node: *const pg_sys::SortBy) -> Result<String, PgTrick
 unsafe fn extract_select_output_cols(
     target_list: *mut pg_sys::List,
 ) -> Result<Vec<String>, PgTrickleError> {
-    let targets = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(target_list) };
+    let targets = pg_list::<pg_sys::Node>(target_list);
     let mut cols = Vec::new();
     for (i, node_ptr) in targets.iter_ptr().enumerate() {
         if !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
@@ -12855,9 +12263,7 @@ unsafe fn extract_select_output_cols(
         }
         let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
         if !rt.name.is_null() {
-            let name = unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("");
+            let name = pg_cstr_to_str(rt.name).unwrap_or("");
             cols.push(name.to_string());
         } else if !rt.val.is_null() {
             if let Ok(expr) = unsafe { node_to_expr(rt.val) } {
@@ -12880,7 +12286,7 @@ unsafe fn extract_select_output_cols(
 /// # Safety
 /// Caller must ensure `from_list` points to a valid `pg_sys::List`.
 unsafe fn extract_from_oids(from_list: *mut pg_sys::List) -> Result<Vec<u32>, PgTrickleError> {
-    let list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(from_list) };
+    let list = pg_list::<pg_sys::Node>(from_list);
     let mut oids = Vec::new();
     for node_ptr in list.iter_ptr() {
         unsafe { collect_from_item_oids(node_ptr, &mut oids)? };
@@ -12900,19 +12306,14 @@ unsafe fn collect_from_item_oids(
         return Ok(());
     }
 
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeVar) } {
-        let rv = unsafe { &*(node as *const pg_sys::RangeVar) };
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
         let table_name = if !rv.relname.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(rv.relname) }
-                .to_str()
-                .unwrap_or("")
-                .to_string()
+            pg_cstr_to_str(rv.relname).unwrap_or("").to_string()
         } else {
             return Ok(());
         };
         let schema = if !rv.schemaname.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(rv.schemaname) }
-                .to_str()
+            pg_cstr_to_str(rv.schemaname)
                 .unwrap_or("public")
                 .to_string()
         } else {
@@ -12941,19 +12342,16 @@ unsafe fn collect_from_item_oids(
         if oid > 0 {
             oids.push(oid);
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_JoinExpr) } {
-        let join = unsafe { &*(node as *const pg_sys::JoinExpr) };
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         unsafe { collect_from_item_oids(join.larg, oids)? };
         unsafe { collect_from_item_oids(join.rarg, oids)? };
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeSubselect) } {
-        let sub = unsafe { &*(node as *const pg_sys::RangeSubselect) };
-        if !sub.subquery.is_null()
-            && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
-        {
-            let sub_stmt = unsafe { &*(sub.subquery as *const pg_sys::SelectStmt) };
-            let inner_oids = unsafe { extract_from_oids(sub_stmt.fromClause)? };
-            oids.extend(inner_oids);
-        }
+    } else if let Some(sub) = cast_node!(node, T_RangeSubselect, pg_sys::RangeSubselect)
+        && !sub.subquery.is_null()
+        && unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
+    {
+        let sub_stmt = unsafe { &*(sub.subquery as *const pg_sys::SelectStmt) };
+        let inner_oids = unsafe { extract_from_oids(sub_stmt.fromClause)? };
+        oids.extend(inner_oids);
     }
     // RangeFunction: no table OIDs to extract (SRFs don't reference tables directly)
     Ok(())
@@ -12964,12 +12362,8 @@ unsafe fn node_to_string(node: *mut pg_sys::Node) -> Result<String, PgTrickleErr
     if node.is_null() {
         return Err(PgTrickleError::QueryParseError("NULL node".into()));
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_String) } {
-        let s = unsafe { &*(node as *const pg_sys::String) };
-        Ok(unsafe { std::ffi::CStr::from_ptr(s.sval) }
-            .to_str()
-            .unwrap_or("")
-            .to_string())
+    if let Some(s) = cast_node!(node, T_String, pg_sys::String) {
+        Ok(pg_cstr_to_str(s.sval).unwrap_or("").to_string())
     } else {
         Ok(format!("node_{:?}", unsafe { (*node).type_ }))
     }
@@ -12980,16 +12374,14 @@ unsafe fn deparse_node(node: *mut pg_sys::Node) -> String {
     if node.is_null() {
         return "NULL".to_string();
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Const) } {
-        let aconst = unsafe { &*(node as *const pg_sys::A_Const) };
+    if let Some(aconst) = cast_node!(node, T_A_Const, pg_sys::A_Const) {
         if aconst.isnull {
             return "NULL".to_string();
         }
         let val_ptr = &aconst.val as *const _ as *const pg_sys::Node;
         if unsafe { pgrx::is_a(val_ptr as *mut _, pg_sys::NodeTag::T_String) } {
             let s = unsafe { &*(val_ptr as *const pg_sys::String) };
-            let cstr = unsafe { std::ffi::CStr::from_ptr(s.sval) };
-            return format!("'{}'", cstr.to_str().unwrap_or(""));
+            return format!("'{}'", pg_cstr_to_str(s.sval).unwrap_or(""));
         }
         if unsafe { pgrx::is_a(val_ptr as *mut _, pg_sys::NodeTag::T_Integer) } {
             let i = unsafe { &*(val_ptr as *const pg_sys::Integer) };
@@ -12997,8 +12389,7 @@ unsafe fn deparse_node(node: *mut pg_sys::Node) -> String {
         }
         if unsafe { pgrx::is_a(val_ptr as *mut _, pg_sys::NodeTag::T_Float) } {
             let f = unsafe { &*(val_ptr as *const pg_sys::Float) };
-            let cstr = unsafe { std::ffi::CStr::from_ptr(f.fval) };
-            return cstr.to_str().unwrap_or("0").to_string();
+            return pg_cstr_to_str(f.fval).unwrap_or("0").to_string();
         }
         if unsafe { pgrx::is_a(val_ptr as *mut _, pg_sys::NodeTag::T_Boolean) } {
             let b = unsafe { &*(val_ptr as *const pg_sys::Boolean) };
@@ -13037,13 +12428,13 @@ unsafe fn deparse_typename(tn: *mut pg_sys::TypeName) -> String {
 
 /// Check if the target list contains any window function calls (FuncCall with non-null `over`),
 /// including window functions nested inside CASE, COALESCE, function args, etc.
-unsafe fn target_list_has_windows(target_list: &pgrx::PgList<pg_sys::Node>) -> bool {
+fn target_list_has_windows(target_list: &pgrx::PgList<pg_sys::Node>) -> bool {
     for node_ptr in target_list.iter_ptr() {
-        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
-            let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
-            if !rt.val.is_null() && unsafe { node_contains_window_func(rt.val) } {
-                return true;
-            }
+        if let Some(rt) = cast_node!(node_ptr, T_ResTarget, pg_sys::ResTarget)
+            && !rt.val.is_null()
+            && unsafe { node_contains_window_func(rt.val) }
+        {
+            return true;
         }
     }
     false
@@ -13064,14 +12455,13 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // Direct hit: FuncCall with OVER clause
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
-        let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
+    if let Some(fcall) = cast_node!(node, T_FuncCall, pg_sys::FuncCall) {
         if !fcall.over.is_null() {
             return true;
         }
         // Check function arguments recursively
         if !fcall.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+            let args = pg_list::<pg_sys::Node>(fcall.args);
             for arg in args.iter_ptr() {
                 if unsafe { node_contains_window_func(arg) } {
                     return true;
@@ -13082,8 +12472,7 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // CASE WHEN ... THEN ... ELSE ... END
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseExpr) } {
-        let case_expr = unsafe { &*(node as *const pg_sys::CaseExpr) };
+    if let Some(case_expr) = cast_node!(node, T_CaseExpr, pg_sys::CaseExpr) {
         // Check the optional test expression (simple CASE)
         if !case_expr.arg.is_null()
             && unsafe { node_contains_window_func(case_expr.arg as *mut pg_sys::Node) }
@@ -13092,10 +12481,9 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
         }
         // Check each WHEN clause
         if !case_expr.args.is_null() {
-            let whens = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(case_expr.args) };
+            let whens = pg_list::<pg_sys::Node>(case_expr.args);
             for when_ptr in whens.iter_ptr() {
-                if unsafe { pgrx::is_a(when_ptr, pg_sys::NodeTag::T_CaseWhen) } {
-                    let cw = unsafe { &*(when_ptr as *const pg_sys::CaseWhen) };
+                if let Some(cw) = cast_node!(when_ptr, T_CaseWhen, pg_sys::CaseWhen) {
                     if unsafe { node_contains_window_func(cw.expr as *mut pg_sys::Node) } {
                         return true;
                     }
@@ -13115,10 +12503,9 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // COALESCE(a, b, ...)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CoalesceExpr) } {
-        let coalesce = unsafe { &*(node as *const pg_sys::CoalesceExpr) };
+    if let Some(coalesce) = cast_node!(node, T_CoalesceExpr, pg_sys::CoalesceExpr) {
         if !coalesce.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(coalesce.args) };
+            let args = pg_list::<pg_sys::Node>(coalesce.args);
             for arg in args.iter_ptr() {
                 if unsafe { node_contains_window_func(arg) } {
                     return true;
@@ -13129,10 +12516,9 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // NULLIF(a, b)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullIfExpr) } {
-        let nullif = unsafe { &*(node as *const pg_sys::NullIfExpr) };
+    if let Some(nullif) = cast_node!(node, T_NullIfExpr, pg_sys::NullIfExpr) {
         if !nullif.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(nullif.args) };
+            let args = pg_list::<pg_sys::Node>(nullif.args);
             for arg in args.iter_ptr() {
                 if unsafe { node_contains_window_func(arg) } {
                     return true;
@@ -13143,10 +12529,9 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // GREATEST / LEAST
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_MinMaxExpr) } {
-        let minmax = unsafe { &*(node as *const pg_sys::MinMaxExpr) };
+    if let Some(minmax) = cast_node!(node, T_MinMaxExpr, pg_sys::MinMaxExpr) {
         if !minmax.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(minmax.args) };
+            let args = pg_list::<pg_sys::Node>(minmax.args);
             for arg in args.iter_ptr() {
                 if unsafe { node_contains_window_func(arg) } {
                     return true;
@@ -13157,10 +12542,9 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // AND / OR / NOT
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let bexpr = unsafe { &*(node as *const pg_sys::BoolExpr) };
+    if let Some(bexpr) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr) {
         if !bexpr.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(bexpr.args) };
+            let args = pg_list::<pg_sys::Node>(bexpr.args);
             for arg in args.iter_ptr() {
                 if unsafe { node_contains_window_func(arg) } {
                     return true;
@@ -13171,8 +12555,7 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // Binary/unary ops: a + b, -a, a BETWEEN x AND y, etc.
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
-        let aexpr = unsafe { &*(node as *const pg_sys::A_Expr) };
+    if let Some(aexpr) = cast_node!(node, T_A_Expr, pg_sys::A_Expr) {
         if !aexpr.lexpr.is_null() && unsafe { node_contains_window_func(aexpr.lexpr) } {
             return true;
         }
@@ -13183,8 +12566,7 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // CAST(x AS type)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
-        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
+    if let Some(tc) = cast_node!(node, T_TypeCast, pg_sys::TypeCast) {
         if !tc.arg.is_null() {
             return unsafe { node_contains_window_func(tc.arg) };
         }
@@ -13192,8 +12574,7 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // IS [NOT] NULL
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullTest) } {
-        let nt = unsafe { &*(node as *const pg_sys::NullTest) };
+    if let Some(nt) = cast_node!(node, T_NullTest, pg_sys::NullTest) {
         if !nt.arg.is_null() {
             return unsafe { node_contains_window_func(nt.arg as *mut pg_sys::Node) };
         }
@@ -13201,8 +12582,7 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // IS [NOT] TRUE / FALSE / UNKNOWN
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BooleanTest) } {
-        let bt = unsafe { &*(node as *const pg_sys::BooleanTest) };
+    if let Some(bt) = cast_node!(node, T_BooleanTest, pg_sys::BooleanTest) {
         if !bt.arg.is_null() {
             return unsafe { node_contains_window_func(bt.arg as *mut pg_sys::Node) };
         }
@@ -13210,10 +12590,9 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // ARRAY[a, b, c]
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_ArrayExpr) } {
-        let arr = unsafe { &*(node as *const pg_sys::ArrayExpr) };
+    if let Some(arr) = cast_node!(node, T_ArrayExpr, pg_sys::ArrayExpr) {
         if !arr.elements.is_null() {
-            let elems = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(arr.elements) };
+            let elems = pg_list::<pg_sys::Node>(arr.elements);
             for elem in elems.iter_ptr() {
                 if unsafe { node_contains_window_func(elem) } {
                     return true;
@@ -13224,10 +12603,9 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // ROW(a, b, c)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RowExpr) } {
-        let row = unsafe { &*(node as *const pg_sys::RowExpr) };
+    if let Some(row) = cast_node!(node, T_RowExpr, pg_sys::RowExpr) {
         if !row.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(row.args) };
+            let args = pg_list::<pg_sys::Node>(row.args);
             for arg in args.iter_ptr() {
                 if unsafe { node_contains_window_func(arg) } {
                     return true;
@@ -13238,8 +12616,7 @@ unsafe fn node_contains_window_func(node: *mut pg_sys::Node) -> bool {
     }
 
     // SubLink — check testexpr and subselect target list
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SubLink) } {
-        let sub = unsafe { &*(node as *const pg_sys::SubLink) };
+    if let Some(sub) = cast_node!(node, T_SubLink, pg_sys::SubLink) {
         if !sub.testexpr.is_null() && unsafe { node_contains_window_func(sub.testexpr) } {
             return true;
         }
@@ -13266,15 +12643,14 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // FuncCall with OVER → window function: collect and stop descent
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
-        let func = unsafe { &*(node as *const pg_sys::FuncCall) };
+    if let Some(func) = cast_node!(node, T_FuncCall, pg_sys::FuncCall) {
         if !func.over.is_null() {
             result.push(node);
             return;
         }
         // Regular function call — recurse into args
         if !func.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(func.args) };
+            let args = pg_list::<pg_sys::Node>(func.args);
             for arg in args.iter_ptr() {
                 unsafe { collect_all_window_func_nodes(arg, result) };
             }
@@ -13283,8 +12659,7 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // A_Expr: binary/unary/subscript operators
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_A_Expr) } {
-        let expr = unsafe { &*(node as *const pg_sys::A_Expr) };
+    if let Some(expr) = cast_node!(node, T_A_Expr, pg_sys::A_Expr) {
         if !expr.lexpr.is_null() {
             unsafe { collect_all_window_func_nodes(expr.lexpr, result) };
         }
@@ -13295,8 +12670,7 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // TypeCast: (expr)::type
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_TypeCast) } {
-        let tc = unsafe { &*(node as *const pg_sys::TypeCast) };
+    if let Some(tc) = cast_node!(node, T_TypeCast, pg_sys::TypeCast) {
         if !tc.arg.is_null() {
             unsafe { collect_all_window_func_nodes(tc.arg, result) };
         }
@@ -13304,13 +12678,12 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // CaseExpr: CASE [arg] WHEN ... THEN ... ELSE ... END
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CaseExpr) } {
-        let case = unsafe { &*(node as *const pg_sys::CaseExpr) };
+    if let Some(case) = cast_node!(node, T_CaseExpr, pg_sys::CaseExpr) {
         if !case.arg.is_null() {
             unsafe { collect_all_window_func_nodes(case.arg as *mut pg_sys::Node, result) };
         }
         if !case.args.is_null() {
-            let when_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(case.args) };
+            let when_list = pg_list::<pg_sys::Node>(case.args);
             for w in when_list.iter_ptr() {
                 if !w.is_null() && unsafe { pgrx::is_a(w, pg_sys::NodeTag::T_CaseWhen) } {
                     let cw = unsafe { &*(w as *const pg_sys::CaseWhen) };
@@ -13334,10 +12707,9 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // CoalesceExpr: COALESCE(a, b, ...)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_CoalesceExpr) } {
-        let coalesce = unsafe { &*(node as *const pg_sys::CoalesceExpr) };
+    if let Some(coalesce) = cast_node!(node, T_CoalesceExpr, pg_sys::CoalesceExpr) {
         if !coalesce.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(coalesce.args) };
+            let args = pg_list::<pg_sys::Node>(coalesce.args);
             for arg in args.iter_ptr() {
                 unsafe { collect_all_window_func_nodes(arg, result) };
             }
@@ -13346,10 +12718,9 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // NullIfExpr: NULLIF(a, b) — `args` list
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullIfExpr) } {
-        let nif = unsafe { &*(node as *const pg_sys::NullIfExpr) };
+    if let Some(nif) = cast_node!(node, T_NullIfExpr, pg_sys::NullIfExpr) {
         if !nif.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(nif.args) };
+            let args = pg_list::<pg_sys::Node>(nif.args);
             for arg in args.iter_ptr() {
                 unsafe { collect_all_window_func_nodes(arg, result) };
             }
@@ -13358,10 +12729,9 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // MinMaxExpr: GREATEST / LEAST
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_MinMaxExpr) } {
-        let mm = unsafe { &*(node as *const pg_sys::MinMaxExpr) };
+    if let Some(mm) = cast_node!(node, T_MinMaxExpr, pg_sys::MinMaxExpr) {
         if !mm.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(mm.args) };
+            let args = pg_list::<pg_sys::Node>(mm.args);
             for arg in args.iter_ptr() {
                 unsafe { collect_all_window_func_nodes(arg, result) };
             }
@@ -13370,10 +12740,9 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // BoolExpr: AND / OR / NOT
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
-        let be = unsafe { &*(node as *const pg_sys::BoolExpr) };
+    if let Some(be) = cast_node!(node, T_BoolExpr, pg_sys::BoolExpr) {
         if !be.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            let args = pg_list::<pg_sys::Node>(be.args);
             for arg in args.iter_ptr() {
                 unsafe { collect_all_window_func_nodes(arg, result) };
             }
@@ -13382,8 +12751,7 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // NullTest: IS NULL / IS NOT NULL
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_NullTest) } {
-        let nt = unsafe { &*(node as *const pg_sys::NullTest) };
+    if let Some(nt) = cast_node!(node, T_NullTest, pg_sys::NullTest) {
         if !nt.arg.is_null() {
             unsafe { collect_all_window_func_nodes(nt.arg as *mut pg_sys::Node, result) };
         }
@@ -13391,13 +12759,12 @@ unsafe fn collect_all_window_func_nodes(
     }
 
     // RowExpr: ROW(a, b, c)
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RowExpr) } {
-        let row = unsafe { &*(node as *const pg_sys::RowExpr) };
-        if !row.args.is_null() {
-            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(row.args) };
-            for arg in args.iter_ptr() {
-                unsafe { collect_all_window_func_nodes(arg, result) };
-            }
+    if let Some(row) = cast_node!(node, T_RowExpr, pg_sys::RowExpr)
+        && !row.args.is_null()
+    {
+        let args = pg_list::<pg_sys::Node>(row.args);
+        for arg in args.iter_ptr() {
+            unsafe { collect_all_window_func_nodes(arg, result) };
         }
     }
 
@@ -13428,13 +12795,12 @@ unsafe fn extract_window_exprs(
         }
 
         // Check if this target is a FuncCall with OVER clause
-        if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_FuncCall) } {
-            let fcall = unsafe { &*(rt.val as *const pg_sys::FuncCall) };
-            if !fcall.over.is_null() {
-                let wexpr = unsafe { parse_window_func_call(fcall, rt, window_clause)? };
-                window_exprs.push(wexpr);
-                continue;
-            }
+        if let Some(fcall) = cast_node!(rt.val, T_FuncCall, pg_sys::FuncCall)
+            && !fcall.over.is_null()
+        {
+            let wexpr = unsafe { parse_window_func_call(fcall, rt, window_clause)? };
+            window_exprs.push(wexpr);
+            continue;
         }
 
         // Check if a window function is nested inside an expression (CASE, COALESCE, etc.)
@@ -13451,10 +12817,7 @@ unsafe fn extract_window_exprs(
 
         // Not a window function — pass-through column
         let alias = if !rt.name.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                .to_str()
-                .unwrap_or("?column?")
-                .to_string()
+            pg_cstr_to_str(rt.name).unwrap_or("?column?").to_string()
         } else if let Ok(e) = unsafe { node_to_expr(rt.val) } {
             match &e {
                 Expr::ColumnRef { column_name, .. } => column_name.clone(),
@@ -13484,7 +12847,7 @@ unsafe fn parse_window_func_call(
     let func_name = unsafe { extract_func_name(fcall.funcname)? };
 
     // Function arguments
-    let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+    let args_list = pg_list::<pg_sys::Node>(fcall.args);
     let mut args = Vec::new();
     for n in args_list.iter_ptr() {
         if let Ok(e) = unsafe { node_to_expr(n) } {
@@ -13498,22 +12861,17 @@ unsafe fn parse_window_func_call(
 
     // Resolve named window reference: OVER w → look up from WINDOW clause
     let resolved_wdef = if !wdef.refname.is_null() && !window_clause.is_null() {
-        let ref_name = unsafe { std::ffi::CStr::from_ptr(wdef.refname) }
-            .to_str()
-            .unwrap_or("");
-        let wclause = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(window_clause) };
+        let ref_name = pg_cstr_to_str(wdef.refname).unwrap_or("");
+        let wclause = pg_list::<pg_sys::Node>(window_clause);
         let mut found: Option<&pg_sys::WindowDef> = None;
         for n in wclause.iter_ptr() {
-            if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_WindowDef) } {
-                let wd = unsafe { &*(n as *const pg_sys::WindowDef) };
-                if !wd.name.is_null() {
-                    let wd_name = unsafe { std::ffi::CStr::from_ptr(wd.name) }
-                        .to_str()
-                        .unwrap_or("");
-                    if wd_name == ref_name {
-                        found = Some(wd);
-                        break;
-                    }
+            if let Some(wd) = cast_node!(n, T_WindowDef, pg_sys::WindowDef)
+                && !wd.name.is_null()
+            {
+                let wd_name = pg_cstr_to_str(wd.name).unwrap_or("");
+                if wd_name == ref_name {
+                    found = Some(wd);
+                    break;
                 }
             }
         }
@@ -13549,7 +12907,7 @@ unsafe fn parse_window_func_call(
     };
 
     // PARTITION BY
-    let part_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(effective_part_clause) };
+    let part_list = pg_list::<pg_sys::Node>(effective_part_clause);
     let mut partition_by = Vec::new();
     for n in part_list.iter_ptr() {
         if let Ok(e) = unsafe { node_to_expr(n) } {
@@ -13558,11 +12916,10 @@ unsafe fn parse_window_func_call(
     }
 
     // ORDER BY (list of SortBy nodes)
-    let ord_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(effective_ord_clause) };
+    let ord_list = pg_list::<pg_sys::Node>(effective_ord_clause);
     let mut order_by = Vec::new();
     for n in ord_list.iter_ptr() {
-        if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_SortBy) } {
-            let sb = unsafe { &*(n as *const pg_sys::SortBy) };
+        if let Some(sb) = cast_node!(n, T_SortBy, pg_sys::SortBy) {
             let expr = unsafe { node_to_expr(sb.node)? };
             let ascending = sb.sortby_dir != pg_sys::SortByDir::SORTBY_DESC;
             let nulls_first = match sb.sortby_nulls {
@@ -13583,10 +12940,7 @@ unsafe fn parse_window_func_call(
 
     // Alias
     let alias = if !rt.name.is_null() {
-        unsafe { std::ffi::CStr::from_ptr(rt.name) }
-            .to_str()
-            .unwrap_or(&func_name)
-            .to_string()
+        pg_cstr_to_str(rt.name).unwrap_or(&func_name).to_string()
     } else {
         func_name.clone()
     };
@@ -13695,11 +13049,11 @@ unsafe fn deparse_frame_bound(opts: u32, is_start: bool, offset: *mut pg_sys::No
 /// Check if the target list contains any aggregate function calls.
 unsafe fn target_list_has_aggregates(target_list: &pgrx::PgList<pg_sys::Node>) -> bool {
     for node_ptr in target_list.iter_ptr() {
-        if unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_ResTarget) } {
-            let rt = unsafe { &*(node_ptr as *const pg_sys::ResTarget) };
-            if !rt.val.is_null() && unsafe { expr_contains_agg(rt.val) } {
-                return true;
-            }
+        if let Some(rt) = cast_node!(node_ptr, T_ResTarget, pg_sys::ResTarget)
+            && !rt.val.is_null()
+            && unsafe { expr_contains_agg(rt.val) }
+        {
+            return true;
         }
     }
     false
@@ -13718,8 +13072,7 @@ unsafe fn is_agg_node(node: *mut pg_sys::Node) -> bool {
     {
         return true;
     }
-    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_FuncCall) } {
-        let fcall = unsafe { &*(node as *const pg_sys::FuncCall) };
+    if let Some(fcall) = cast_node!(node, T_FuncCall, pg_sys::FuncCall) {
         // Window functions (FuncCall with OVER clause) are NOT aggregates,
         // even if they use aggregate function names like SUM, COUNT.
         if !fcall.over.is_null() {
@@ -13900,9 +13253,7 @@ unsafe fn extract_aggregates(
             continue;
         }
 
-        if unsafe { pgrx::is_a(rt.val, pg_sys::NodeTag::T_FuncCall) } {
-            let fcall = unsafe { &*(rt.val as *const pg_sys::FuncCall) };
-
+        if let Some(fcall) = cast_node!(rt.val, T_FuncCall, pg_sys::FuncCall) {
             // Window functions (FuncCall with OVER clause) are NOT aggregates.
             // Treat them as plain expressions — they'll be handled by the
             // window operator path in parse_select_stmt.
@@ -13916,10 +13267,7 @@ unsafe fn extract_aggregates(
             let name_lower = func_name.to_lowercase();
 
             let alias = if !rt.name.is_null() {
-                unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                    .to_str()
-                    .unwrap_or(&func_name)
-                    .to_string()
+                pg_cstr_to_str(rt.name).unwrap_or(&func_name).to_string()
             } else {
                 func_name.clone()
             };
@@ -13969,7 +13317,7 @@ unsafe fn extract_aggregates(
                 "cume_dist" => Some(AggFunc::HypCumeDist),
                 _ => None,
             } {
-                let args_list = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.args) };
+                let args_list = pg_list::<pg_sys::Node>(fcall.args);
                 let argument = args_list
                     .head()
                     .and_then(|n| unsafe { node_to_expr(n).ok() });
@@ -13995,12 +13343,10 @@ unsafe fn extract_aggregates(
                 // Both are stored in order_within_group; agg_to_rescan_sql distinguishes
                 // between WITHIN GROUP and regular ORDER BY based on the AggFunc type.
                 let order_within_group = if !fcall.agg_order.is_null() {
-                    let ord_list =
-                        unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(fcall.agg_order) };
+                    let ord_list = pg_list::<pg_sys::Node>(fcall.agg_order);
                     let mut sorts = Vec::new();
                     for n in ord_list.iter_ptr() {
-                        if unsafe { pgrx::is_a(n, pg_sys::NodeTag::T_SortBy) } {
-                            let sb = unsafe { &*(n as *const pg_sys::SortBy) };
+                        if let Some(sb) = cast_node!(n, T_SortBy, pg_sys::SortBy) {
                             let expr = unsafe { node_to_expr(sb.node)? };
                             let ascending = sb.sortby_dir != pg_sys::SortByDir::SORTBY_DESC;
                             let nulls_first = match sb.sortby_nulls {
@@ -14070,8 +13416,7 @@ unsafe fn extract_aggregates(
 
             let joa = unsafe { &*(rt.val as *const pg_sys::JsonObjectAgg) };
             let alias = if !rt.name.is_null() {
-                unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                    .to_str()
+                pg_cstr_to_str(rt.name)
                     .unwrap_or("json_objectagg")
                     .to_string()
             } else {
@@ -14107,8 +13452,7 @@ unsafe fn extract_aggregates(
 
             let jaa = unsafe { &*(rt.val as *const pg_sys::JsonArrayAgg) };
             let alias = if !rt.name.is_null() {
-                unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                    .to_str()
+                pg_cstr_to_str(rt.name)
                     .unwrap_or("json_arrayagg")
                     .to_string()
             } else {
@@ -14145,10 +13489,7 @@ unsafe fn extract_aggregates(
                 let raw_sql = raw_expr.to_sql();
 
                 let alias = if !rt.name.is_null() {
-                    unsafe { std::ffi::CStr::from_ptr(rt.name) }
-                        .to_str()
-                        .unwrap_or("complex_agg")
-                        .to_string()
+                    pg_cstr_to_str(rt.name).unwrap_or("complex_agg").to_string()
                 } else {
                     format!("complex_agg_{}", aggs.len())
                 };
@@ -14206,10 +13547,7 @@ unsafe fn parse_target_list(
 /// then simple column name / `*`, else a synthetic `col_N` fallback.
 unsafe fn target_alias_for_res_target(rt: &pg_sys::ResTarget, ordinal: usize) -> String {
     if !rt.name.is_null() {
-        return unsafe { std::ffi::CStr::from_ptr(rt.name) }
-            .to_str()
-            .unwrap_or("?column?")
-            .to_string();
+        return pg_cstr_to_str(rt.name).unwrap_or("?column?").to_string();
     }
 
     if !rt.val.is_null()

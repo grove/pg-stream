@@ -53,6 +53,72 @@ use crate::shmem;
 use crate::version;
 use crate::wal_decoder;
 
+// ── Sub-transaction RAII guard ─────────────────────────────────────────
+
+/// RAII guard for a PostgreSQL internal sub-transaction.
+///
+/// Automatically rolls back on drop if neither [`commit()`](SubTransaction::commit)
+/// nor [`rollback()`](SubTransaction::rollback) was called (panic safety).
+struct SubTransaction {
+    old_cxt: pg_sys::MemoryContext,
+    old_owner: pg_sys::ResourceOwner,
+    finished: bool,
+}
+
+impl SubTransaction {
+    /// Begin a new sub-transaction within the current worker transaction.
+    fn begin() -> Self {
+        // SAFETY: Called within a PostgreSQL worker transaction. The current
+        // memory context and resource owner are valid.
+        let old_cxt = unsafe { pg_sys::CurrentMemoryContext };
+        let old_owner = unsafe { pg_sys::CurrentResourceOwner };
+        // SAFETY: BeginInternalSubTransaction sets up a sub-transaction
+        // using PostgreSQL's resource-owner mechanism.
+        unsafe { pg_sys::BeginInternalSubTransaction(std::ptr::null()) };
+        Self {
+            old_cxt,
+            old_owner,
+            finished: false,
+        }
+    }
+
+    /// Commit the sub-transaction and restore the outer context.
+    fn commit(mut self) {
+        // SAFETY: Commits the sub-transaction, restores context.
+        unsafe {
+            pg_sys::ReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(self.old_cxt);
+            pg_sys::CurrentResourceOwner = self.old_owner;
+        }
+        self.finished = true;
+    }
+
+    /// Roll back the sub-transaction and restore the outer context.
+    fn rollback(mut self) {
+        // SAFETY: Rolls back the sub-transaction, restores context.
+        unsafe {
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(self.old_cxt);
+            pg_sys::CurrentResourceOwner = self.old_owner;
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for SubTransaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Auto-rollback on drop for panic safety.
+            // SAFETY: Same invariants as rollback().
+            unsafe {
+                pg_sys::RollbackAndReleaseCurrentSubTransaction();
+                pg_sys::MemoryContextSwitchTo(self.old_cxt);
+                pg_sys::CurrentResourceOwner = self.old_owner;
+            }
+        }
+    }
+}
+
 /// Register the launcher background worker.
 ///
 /// Called from `_PG_init()` when loaded via `shared_preload_libraries`.
@@ -545,15 +611,7 @@ fn execute_worker_atomic_group(job: &SchedulerJob) -> RefreshOutcome {
         job.job_id,
     );
 
-    // SAFETY: Save memory context and resource owner so we can restore them
-    // after the sub-transaction commits or rolls back.  These are always valid
-    // inside a worker transaction.
-    let old_cxt = unsafe { pg_sys::CurrentMemoryContext };
-    let old_owner = unsafe { pg_sys::CurrentResourceOwner };
-
-    // SAFETY: BeginInternalSubTransaction sets up a sub-transaction within the
-    // current worker transaction using PostgreSQL's resource-owner mechanism.
-    unsafe { pg_sys::BeginInternalSubTransaction(std::ptr::null()) };
+    let subtxn = SubTransaction::begin();
 
     let tick_watermark: Option<String> = if config::pg_trickle_tick_watermark_enabled() {
         Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
@@ -612,24 +670,14 @@ fn execute_worker_atomic_group(job: &SchedulerJob) -> RefreshOutcome {
                     st.pgt_name,
                     job.job_id,
                 );
-                // SAFETY: Rolls back the sub-transaction and restores context.
-                unsafe {
-                    pg_sys::RollbackAndReleaseCurrentSubTransaction();
-                    pg_sys::MemoryContextSwitchTo(old_cxt);
-                    pg_sys::CurrentResourceOwner = old_owner;
-                }
+                subtxn.rollback();
                 return result;
             }
         }
     }
 
     // All members succeeded — commit the sub-transaction.
-    // SAFETY: Commits the sub-transaction and restores context.
-    unsafe {
-        pg_sys::ReleaseCurrentSubTransaction();
-        pg_sys::MemoryContextSwitchTo(old_cxt);
-        pg_sys::CurrentResourceOwner = old_owner;
-    }
+    subtxn.commit();
 
     log!(
         "pg_trickle refresh worker: atomic group committed ({} members, job {})",
@@ -1510,9 +1558,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 // inside is done through SPI (which handles its own C-level exception
                 // boundaries), so a Rust-visible panic from this block is not
                 // expected.
-                let old_cxt = unsafe { pg_sys::CurrentMemoryContext };
-                let old_owner = unsafe { pg_sys::CurrentResourceOwner };
-                unsafe { pg_sys::BeginInternalSubTransaction(std::ptr::null()) };
+                let subtxn = SubTransaction::begin();
 
                 let mut group_ok = true;
                 let mut refreshed_ids: Vec<i64> = Vec::new();
@@ -1583,23 +1629,13 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 }
 
                 if group_ok {
-                    // SAFETY: Commits the sub-transaction and restores context.
-                    unsafe {
-                        pg_sys::ReleaseCurrentSubTransaction();
-                        pg_sys::MemoryContextSwitchTo(old_cxt);
-                        pg_sys::CurrentResourceOwner = old_owner;
-                    }
+                    subtxn.commit();
                     // Reset retry states for all refreshed members
                     for id in &refreshed_ids {
                         retry_states.entry(*id).or_default().reset();
                     }
                 } else {
-                    // SAFETY: Rolls back the sub-transaction and restores context.
-                    unsafe {
-                        pg_sys::RollbackAndReleaseCurrentSubTransaction();
-                        pg_sys::MemoryContextSwitchTo(old_cxt);
-                        pg_sys::CurrentResourceOwner = old_owner;
-                    }
+                    subtxn.rollback();
                     // Record failure for retry tracking on all attempted members
                     for id in &refreshed_ids {
                         let retry = retry_states.entry(*id).or_default();
