@@ -9,7 +9,22 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-No changes yet.
+### Changed
+
+#### Internal Code Quality: Safer Low-Level Code
+
+Halved the amount of low-level "unsafe" code that interacts directly with
+PostgreSQL's internal C libraries. This doesn't change any user-facing
+behavior, but makes the codebase easier to audit, review, and maintain —
+reducing the surface area where memory-safety bugs could theoretically hide.
+
+- **51% reduction** in unsafe code blocks (1,309 → 641).
+- All repeated low-level patterns are now consolidated into 6 well-documented
+  helper functions, so safety reasoning lives in one place instead of being
+  scattered across thousands of lines.
+- 37 internal functions that were previously marked as "unsafe" have been
+  verified safe and reclassified, removing unnecessary risk markers.
+- Zero functional changes — all 1,274 unit tests pass unchanged.
 
 ---
 
