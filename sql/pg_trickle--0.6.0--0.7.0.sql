@@ -1,8 +1,13 @@
 -- pg_trickle 0.6.0 -> 0.7.0 upgrade script
 --
 -- v0.7.0 adds:
---   - Watermark gating: pgt_watermarks, pgt_watermark_groups catalog tables
+--   CYC-5: last_fixpoint_iterations column for SCC convergence tracking
+--   Watermark gating: pgt_watermarks, pgt_watermark_groups catalog tables
 --     and SQL functions for cross-source temporal alignment
+
+-- CYC-5: Track the number of fixpoint iterations in the last SCC convergence.
+ALTER TABLE pgtrickle.pgt_stream_tables
+    ADD COLUMN IF NOT EXISTS last_fixpoint_iterations INT;
 
 -- Per-source watermark state: tracks how far each external source has been loaded.
 CREATE TABLE IF NOT EXISTS pgtrickle.pgt_watermarks (

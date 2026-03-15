@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
                      CHECK (requested_cdc_mode IN ('auto', 'trigger', 'wal')),
     is_append_only  BOOLEAN NOT NULL DEFAULT FALSE,
     scc_id          INT,
+    last_fixpoint_iterations INT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -355,7 +356,9 @@ SELECT
     stats.last_status,
     (SELECT array_agg(DISTINCT d.cdc_mode ORDER BY d.cdc_mode)
      FROM pgtrickle.pgt_dependencies d
-     WHERE d.pgt_id = st.pgt_id AND d.source_type = 'TABLE') AS cdc_modes
+     WHERE d.pgt_id = st.pgt_id AND d.source_type = 'TABLE') AS cdc_modes,
+    st.scc_id,
+    st.last_fixpoint_iterations
 FROM pgtrickle.pgt_stream_tables st
 LEFT JOIN LATERAL (
     SELECT

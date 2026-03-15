@@ -280,7 +280,7 @@ Stream tables are regular PostgreSQL heap tables, but their contents are managed
 
 | Operation | Allowed? | Notes |
 |---|---|---|
-| ST references other STs | ✅ Yes | DAG-ordered refresh; cycles are rejected |
+| ST references other STs | ✅ Yes | DAG-ordered refresh; monotone cycles supported via `pg_trickle.allow_circular` |
 | Views reference STs | ✅ Yes | Standard PostgreSQL views work normally |
 | Materialized views reference STs | ✅ Yes | Requires separate `REFRESH MATERIALIZED VIEW` |
 | Logical replication of STs | ✅ Yes | `__pgt_row_id` column is replicated; subscribers receive materialized data only |

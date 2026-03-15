@@ -67,6 +67,9 @@ pub struct StreamTableMeta {
     /// `None` means this stream table is not part of a cyclic SCC.
     /// When set, all members of the same cycle share the same `scc_id`.
     pub scc_id: Option<i32>,
+    /// Number of fixpoint iterations in the last SCC convergence (CYC-5).
+    /// `None` for non-cyclic stream tables or if never iterated.
+    pub last_fixpoint_iterations: Option<i32>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -225,7 +228,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id \
+                     scc_id, last_fixpoint_iterations \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -252,7 +255,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id \
+                     scc_id, last_fixpoint_iterations \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -284,7 +287,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id \
+                     scc_id, last_fixpoint_iterations \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -311,7 +314,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id \
+                     scc_id, last_fixpoint_iterations \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -592,6 +595,23 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// Update the last fixpoint iteration count for a stream table (CYC-5).
+    ///
+    /// Recorded after a successful fixpoint convergence so monitoring can
+    /// track how many iterations each SCC member required.
+    pub fn update_last_fixpoint_iterations(
+        pgt_id: i64,
+        iterations: i32,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET last_fixpoint_iterations = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[iterations.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the per-ST adaptive fallback threshold and last FULL refresh time.
     ///
     /// Called after each differential or adaptive-fallback refresh to track
@@ -750,6 +770,7 @@ impl StreamTableMeta {
         let requested_cdc_mode = table.get::<String>(25).map_err(map_spi)?;
         let is_append_only = table.get::<bool>(26).map_err(map_spi)?.unwrap_or(false);
         let scc_id = table.get::<i32>(27).map_err(map_spi)?;
+        let last_fixpoint_iterations = table.get::<i32>(28).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -779,6 +800,7 @@ impl StreamTableMeta {
             requested_cdc_mode,
             is_append_only,
             scc_id,
+            last_fixpoint_iterations,
         })
     }
 
@@ -863,6 +885,7 @@ impl StreamTableMeta {
         let requested_cdc_mode = row.get::<String>(25).map_err(map_spi)?;
         let is_append_only = row.get::<bool>(26).map_err(map_spi)?.unwrap_or(false);
         let scc_id = row.get::<i32>(27).map_err(map_spi)?;
+        let last_fixpoint_iterations = row.get::<i32>(28).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -892,6 +915,7 @@ impl StreamTableMeta {
             requested_cdc_mode,
             is_append_only,
             scc_id,
+            last_fixpoint_iterations,
         })
     }
 }
