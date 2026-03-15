@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-03-14
 > **Latest release:** 0.6.0 (2026-03-14)
-> **Current milestone:** v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure
+> **Current milestone:** v0.7.0 — Watermarks, Circular DAG Execution, Last Differential Gaps & Infrastructure
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -23,7 +23,7 @@ coverage, all in plain language.
 - [v0.4.0 — Parallel Refresh & Performance Hardening](#v040--parallel-refresh--performance-hardening)
 - [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
 - [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
-- [v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--watermarks-circular-dag-execution-observability--infrastructure)
+- [v0.7.0 — Watermarks, Circular DAG Execution, Last Differential Gaps & Infrastructure](#v070--watermarks-circular-dag-execution-observability--infrastructure)
 - [v0.8.0 — Connection Pooler Compatibility](#v080--connection-pooler-compatibility)
 - [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
 - [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
@@ -1109,12 +1109,13 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 ---
 
-## v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure
+## v0.7.0 — Watermarks, Circular DAG Execution, Last Differential Gaps & Infrastructure
 
 **Goal:** Add user-injected temporal watermark gating for batch-ETL
 coordination, complete the fixpoint scheduler for circular stream table
-DAGs, ship ready-made Prometheus/Grafana monitoring, and prepare the
-1.0 packaging and deployment infrastructure.
+DAGs, close the last three DIFFERENTIAL-mode parser gaps, ship ready-made
+Prometheus/Grafana monitoring, and prepare the 1.0 packaging and deployment
+infrastructure.
 
 ### Watermark Gating
 
@@ -1209,7 +1210,26 @@ Zero-code monitoring integration. All config files live in a new
 
 > **Infrastructure prep subtotal: ~11 hours**
 
-> **v0.7.0 total: ~59–62h**
+### Last Differential Mode Gaps
+
+> **In plain terms:** Three query patterns that currently fall back to `FULL`
+> refresh even in `AUTO` mode — or hard-error in explicit `DIFFERENTIAL` mode
+> — despite the DVM engine already having the infrastructure to handle them.
+> Closing these gaps means more queries get cheap incremental refreshes instead
+> of expensive full recomputes.
+
+Three small parser-level gaps prevent DIFFERENTIAL mode from covering patterns
+it could otherwise handle efficiently:
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DG-1 | **User-Defined Aggregates (UDAs).** PostGIS (`ST_Union`, `ST_Collect`), pgvector vector averages, and any `CREATE AGGREGATE` function are rejected. Fix: classify unknown aggregates as `AggFunc::UserDefined` and route them through the existing group-rescan strategy — no new delta math required. | ~3h | [PLAN_LAST_DIFFERENTIAL_GAPS.md](plans/sql/PLAN_LAST_DIFFERENTIAL_GAPS.md) §G1 |
+| DG-2 | **Window functions nested in expressions.** `RANK() OVER (...) + 1`, `CASE WHEN ROW_NUMBER() OVER (...) <= 10`, `COALESCE(LAG(v) OVER (...), 0)` etc. are rejected. Fix: extract the window function into a CTE subquery and rewrite the outer expression to reference the CTE column, then apply the existing `diff_window()` operator. | ~7h | [PLAN_LAST_DIFFERENTIAL_GAPS.md](plans/sql/PLAN_LAST_DIFFERENTIAL_GAPS.md) §G2 |
+| DG-3 | **Sublinks in deeply nested OR.** The two-stage rewrite pipeline handles flat `EXISTS(...) OR …` and `AND(EXISTS OR …)` but gives up on `OR(AND(AND(…EXISTS)))` patterns. Fix: add a multi-pass AND-flattening loop, multi-conjunct OR handler, and optional De Morgan normalization. | ~2h | [PLAN_LAST_DIFFERENTIAL_GAPS.md](plans/sql/PLAN_LAST_DIFFERENTIAL_GAPS.md) §G3 |
+
+> **Last differential gaps subtotal: ~12 hours**
+
+> **v0.7.0 total: ~71–74h**
 
 **Exit criteria:**
 - [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
@@ -1217,6 +1237,7 @@ Zero-code monitoring integration. All config files live in a new
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
 - [ ] Docker Hub image draft workflow passes; PGXN `META.json` drafted
 - [ ] CNPG integration smoke test passes in CI
+- [ ] UDAs, nested window expressions, and deeply nested OR+sublinks supported in DIFFERENTIAL mode
 - [ ] Extension upgrade path tested (`0.6.0 → 0.7.0`)
 
 ---
@@ -1817,7 +1838,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.4.0 — Parallel Refresh & Performance Hardening | ~60–94h | 245–346h | ✅ Released |
 | v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | ✅ Released |
 | v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | |
-| v0.7.0 — Watermarks & Circular DAG Execution | ~36–39h | 367–532h | |
+| v0.7.0 — Watermarks, Circular DAG Execution & Last Differential Gaps | ~48–51h | 379–544h | |
 | v0.8.0 — Connection Pooler Compatibility | ~56–80h | 423–612h | |
 | v0.9.0 — Observability, Anomaly Detection & pg_dump Support | ~58–82h | 481–694h | |
 | v0.10.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
