@@ -572,10 +572,12 @@ const WIDE_TABLE_HASH_THRESHOLD: usize = 50;
 /// aggregate outputs, which intentionally do not have a native equality
 /// operator.
 ///
-/// For wider tables (F41), generates a single `md5()` hash comparison:
+/// For wider tables (F41), generates a single xxh64 hash comparison using
+/// `pgtrickle.pg_trickle_hash()`:
 /// ```sql
-/// md5(concat(COALESCE(st."c1"::text,''), ...)) IS DISTINCT FROM
-/// md5(concat(COALESCE(d."c1"::text,''), ...))
+/// pgtrickle.pg_trickle_hash(concat_ws('\x1E', COALESCE(st."c1"::text,''), ...))
+/// IS DISTINCT FROM
+/// pgtrickle.pg_trickle_hash(concat_ws('\x1E', COALESCE(d."c1"::text,''), ...))
 /// ```
 fn build_is_distinct_clause(user_cols: &[String]) -> String {
     if user_cols.len() <= WIDE_TABLE_HASH_THRESHOLD {
@@ -588,7 +590,8 @@ fn build_is_distinct_clause(user_cols: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" OR ")
     } else {
-        // Hash-based comparison for wide tables
+        // Hash-based comparison for wide tables using xxh64 (faster than md5).
+        // Uses pgtrickle.pg_trickle_hash() which is IMMUTABLE + PARALLEL SAFE.
         let hash_expr = |prefix: &str| -> String {
             let parts: Vec<String> = user_cols
                 .iter()
@@ -597,7 +600,11 @@ fn build_is_distinct_clause(user_cols: &[String]) -> String {
                     format!("COALESCE({prefix}.{qc}::text, '')")
                 })
                 .collect();
-            format!("md5(concat({}))", parts.join(", "))
+            format!(
+                "pgtrickle.pg_trickle_hash(concat_ws({sep}, {cols}))",
+                sep = "'\\x1E'",
+                cols = parts.join(", ")
+            )
         };
         format!("{} IS DISTINCT FROM {}", hash_expr("st"), hash_expr("d"))
     }
@@ -1782,6 +1789,55 @@ pub fn execute_differential_refresh(
         return result;
     }
 
+    // ── D-2: Aggregate saturation check ─────────────────────────────
+    // For aggregate stream tables (GROUP BY queries), if the number of
+    // changes exceeds the number of groups (= rows in the materialized
+    // stream table), all groups are likely affected.  In that case FULL
+    // refresh is cheaper than MERGE because it avoids per-row IS DISTINCT
+    // FROM checks.  This catches the common "few groups, many changes"
+    // pattern that falls below the global ratio threshold.
+    if !should_fallback
+        && total_change_count > 0
+        && st.defining_query.to_ascii_uppercase().contains("GROUP BY")
+    {
+        // Try pg_class.reltuples first (cheap); fall back to COUNT(*) if
+        // the stream table has never been analyzed (reltuples = -1 or 0).
+        let st_group_count: i64 = Spi::get_one::<i64>(&format!(
+            "SELECT CASE WHEN reltuples >= 1 THEN reltuples::bigint \
+                    ELSE (SELECT COUNT(*) FROM \"{}\".\"{}\" ) END \
+             FROM pg_class WHERE oid = {}::oid",
+            schema.replace('"', "\"\""),
+            name.replace('"', "\"\""),
+            st.pgt_relid.to_u32(),
+        ))
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+
+        if st_group_count > 0 && total_change_count >= st_group_count {
+            pgrx::info!(
+                "[pg_trickle] Aggregate saturation: {} changes >= {} groups — using FULL refresh for {}.{}",
+                total_change_count,
+                st_group_count,
+                schema,
+                name,
+            );
+            let t_full_start = Instant::now();
+            let result = execute_full_refresh(st);
+            let full_ms = t_full_start.elapsed().as_secs_f64() * 1000.0;
+            if let Err(e) = StreamTableMeta::update_adaptive_threshold(
+                st.pgt_id,
+                st.auto_threshold,
+                Some(full_ms),
+            ) {
+                pgrx::debug1!("[pg_trickle] Failed to update last_full_ms: {}", e);
+            }
+            if result.is_ok() {
+                post_full_refresh_cleanup(st);
+            }
+            return result;
+        }
+    }
+
     let t_decision = t_decision_start.elapsed();
     let t0 = Instant::now();
 
@@ -2451,7 +2507,22 @@ pub fn execute_differential_refresh(
         && last_full > 0.0
     {
         let current_threshold = st.auto_threshold.unwrap_or(global_ratio);
-        let new_threshold = compute_adaptive_threshold(current_threshold, incr_total_ms, last_full);
+        let ratio_threshold =
+            compute_adaptive_threshold(current_threshold, incr_total_ms, last_full);
+
+        // ── D-3: Cost-based threshold from historical data ──────────
+        // Blend the ratio-based threshold with a cost-model estimate
+        // derived from recent refresh history.  The cost model computes
+        // the crossover delta ratio where INCR cost equals FULL cost.
+        let new_threshold = match estimate_cost_based_threshold(st.pgt_id) {
+            Some(cost_threshold) => {
+                // Weighted blend: 60% ratio-based, 40% cost-based.
+                let blended = ratio_threshold * 0.6 + cost_threshold * 0.4;
+                blended.clamp(0.01, 0.80)
+            }
+            None => ratio_threshold,
+        };
+
         if (new_threshold - current_threshold).abs() > 0.001 {
             pgrx::debug1!(
                 "[pg_trickle] Adaptive threshold: INCR={:.1}ms vs FULL={:.1}ms (ratio={:.2}), threshold {:.3} → {:.3}",
@@ -2477,6 +2548,96 @@ pub fn execute_differential_refresh(
     let effective_count = (merge_count as i64).max(1);
 
     Ok((effective_count, 0))
+}
+
+/// D-3: Estimate a cost-based fallback threshold from refresh history.
+///
+/// Queries the last N DIFFERENTIAL and FULL refreshes for a stream table
+/// and computes the crossover delta ratio where incremental cost equals
+/// full cost.  Returns `None` if insufficient history is available (fewer
+/// than 3 DIFFERENTIAL or no FULL refresh recorded).
+///
+/// The model:
+///   incr_cost(delta_ratio) ≈ avg_incr_cost_per_delta_row × delta_ratio × table_size
+///   full_cost              ≈ avg_full_ms
+///   crossover_ratio        = avg_full_ms / (avg_cost_per_delta_row × table_size)
+///
+/// Clamped to [0.01, 0.80].
+fn estimate_cost_based_threshold(pgt_id: i64) -> Option<f64> {
+    // Query recent completed DIFFERENTIAL refreshes with non-zero delta.
+    let stats: Option<(f64, f64, f64)> = Spi::connect(|client| {
+        // avg_ms_per_delta: average milliseconds per delta row
+        // avg_full_ms:      average FULL refresh time
+        //
+        // We use a lateral subquery to get both INCR and FULL stats.
+        let sql = format!(
+            "SELECT incr.avg_ms_per_delta, full_r.avg_full_ms, \
+                    GREATEST(incr.avg_delta, 1)::double precision AS avg_delta \
+             FROM ( \
+               SELECT AVG(EXTRACT(EPOCH FROM (end_time - start_time)) * 1000.0 \
+                          / GREATEST(delta_row_count, 1)) AS avg_ms_per_delta, \
+                      AVG(delta_row_count)::double precision AS avg_delta, \
+                      COUNT(*)::int AS cnt \
+               FROM ( \
+                 SELECT end_time, start_time, delta_row_count \
+                 FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = {pgt_id} \
+                   AND action = 'DIFFERENTIAL' \
+                   AND status = 'COMPLETED' \
+                   AND delta_row_count > 0 \
+                   AND end_time IS NOT NULL \
+                 ORDER BY refresh_id DESC LIMIT 10 \
+               ) __pgt_incr \
+             ) incr, ( \
+               SELECT AVG(EXTRACT(EPOCH FROM (end_time - start_time)) * 1000.0) AS avg_full_ms \
+               FROM ( \
+                 SELECT end_time, start_time \
+                 FROM pgtrickle.pgt_refresh_history \
+                 WHERE pgt_id = {pgt_id} \
+                   AND action = 'FULL' \
+                   AND status = 'COMPLETED' \
+                   AND end_time IS NOT NULL \
+                 ORDER BY refresh_id DESC LIMIT 5 \
+               ) __pgt_full \
+             ) full_r \
+             WHERE incr.cnt >= 3 \
+               AND full_r.avg_full_ms IS NOT NULL \
+               AND full_r.avg_full_ms > 0 \
+               AND incr.avg_ms_per_delta IS NOT NULL \
+               AND incr.avg_ms_per_delta > 0",
+        );
+
+        let result: Option<(f64, f64, f64)> = (|| {
+            let row = client.select(&sql, None, &[]).ok()?.first();
+            let avg_ms_per_delta: f64 = row.get::<f64>(1).ok()??;
+            let avg_full_ms: f64 = row.get::<f64>(2).ok()??;
+            let avg_delta: f64 = row.get::<f64>(3).ok()??;
+            Some((avg_ms_per_delta, avg_full_ms, avg_delta))
+        })();
+        Ok::<_, pgrx::spi::SpiError>(result)
+    })
+    .unwrap_or(None);
+
+    let (avg_ms_per_delta, avg_full_ms, avg_delta) = stats?;
+
+    // crossover_delta = avg_full_ms / avg_ms_per_delta
+    // Simplified: if we know the average delta and the crossover delta,
+    // the threshold ratio is crossover_delta / source_table_size.
+    // Since we don't have source_table_size here, we use the ratio of
+    // crossover_delta to the historical average delta as a scaling factor.
+    let crossover_delta = avg_full_ms / avg_ms_per_delta;
+    if avg_delta <= 0.0 {
+        return None;
+    }
+
+    // If crossover is much higher than typical delta, current threshold is fine;
+    // if crossover is near or below typical delta, we should lower the threshold.
+    // Scale the global default (0.15) by how far the crossover is from the average.
+    let global_ratio = crate::config::pg_trickle_differential_max_change_ratio();
+    let scaling: f64 = crossover_delta / avg_delta;
+    let suggested: f64 = (global_ratio * scaling).clamp(0.01, 0.80);
+
+    Some(suggested)
 }
 
 /// Compute a new adaptive fallback threshold based on observed performance.

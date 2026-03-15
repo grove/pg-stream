@@ -9,6 +9,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use pg_trickle::dvm::diff::DiffContext;
 use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree, SortExpr, WindowExpr};
 use pg_trickle::version::Frontier;
+use std::time::Duration;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -63,6 +64,8 @@ fn test_ctx() -> DiffContext {
 
 fn bench_diff_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("diff_scan");
+    group.sample_size(200);
+    group.measurement_time(Duration::from_secs(10));
 
     for ncols in [3, 10, 20] {
         let cols: Vec<String> = (0..ncols).map(|i| format!("col_{i}")).collect();

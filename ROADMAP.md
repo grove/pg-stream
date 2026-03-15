@@ -23,9 +23,9 @@ coverage, all in plain language.
 - [v0.4.0 — Parallel Refresh & Performance Hardening](#v040--parallel-refresh--performance-hardening)
 - [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
 - [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
-- [v0.7.0 — Watermarks, Circular DAG Execution & Last Differential Gaps](#v070--watermarks-circular-dag-execution--last-differential-gaps)
-- [v0.8.0 — Connection Pooler Compatibility & pg_dump Support](#v080--connection-pooler-compatibility--pg_dump-support)
-- [v0.9.0 — Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep](#v090--prometheus--grafana-observability-anomaly-detection--infrastructure-prep)
+- [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
+- [v0.8.0 — Connection Pooler Compatibility](#v080--connection-pooler-compatibility)
+- [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
 - [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
 - [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
 - [v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compatibility](#v0120--multi-source-delta-batching-cdc-research--pg-backward-compatibility)
@@ -1109,11 +1109,14 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 ---
 
-## v0.7.0 — Watermarks, Circular DAG Execution & Last Differential Gaps
+## v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure
 
-**Goal:** Add user-injected temporal watermark gating for batch-ETL
-coordination, complete the fixpoint scheduler for circular stream table
-DAGs, and close the last three DIFFERENTIAL-mode parser gaps.
+**Goal:** Land Part 9 performance improvements (parallel refresh
+scheduling, MERGE strategy optimization, advanced benchmarks), add
+user-injected temporal watermark gating for batch-ETL coordination,
+complete the fixpoint scheduler for circular stream table DAGs, ship
+ready-made Prometheus/Grafana monitoring, and prepare the 1.0 packaging
+and deployment infrastructure.
 
 ### Watermark Gating
 
@@ -1180,9 +1183,62 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 
 > **Last differential gaps: ✅ Complete**
 
-> **v0.7.0 total: ~36–39h** (remaining: Watermarks + Circular Dependencies)
+### Pre-1.0 Infrastructure Prep
+
+> **In plain terms:** Three preparatory tasks that make the eventual 1.0
+> release smoother. A draft Docker Hub image workflow (tests the build but
+> doesn't publish yet); a PGXN metadata file so the extension can eventually
+> be installed with `pgxn install pg_trickle`; and a basic CNPG integration
+> test that verifies the extension image loads correctly in a CloudNativePG
+> cluster. None of these ship user-facing features — they're CI and
+> packaging scaffolding.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| INFRA-1 | **Prove the Docker image builds.** Set up a CI workflow that builds the official Docker Hub image (PostgreSQL 18 + pg_trickle pre-installed), runs a smoke test (create extension, create a stream table, refresh it), but doesn't publish anywhere yet. When 1.0 arrives, publishing is just flipping a switch. | 5h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
+| INFRA-2 | **Prepare for `pgxn install pg_trickle`.** PGXN is PostgreSQL's official extension registry. Drafting the `META.json` metadata file now means publishing to PGXN at 1.0 is a single command — no scrambling to figure out the required fields and version constraints at release time. | 2h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| INFRA-3 | **Verify Kubernetes deployment works.** A CI smoke test that deploys the pg_trickle extension image into a CloudNativePG (CNPG) Kubernetes cluster, creates a stream table, and confirms a refresh cycle completes. Catches packaging and compatibility issues before they reach Kubernetes users. | 4h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+
+> **Infrastructure prep subtotal: ~11 hours**
+
+### Performance — Regression Fixes & Benchmark Infrastructure (Part 9 S1–S2) ✅ Done
+
+> Fixes Criterion benchmark regressions identified in Part 9 and ships five
+> benchmark infrastructure improvements to support data-driven performance
+> decisions.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| A-3 | Fix `prefixed_col_list/20` +34% regression — eliminate intermediate `Vec` allocation | ✅ Done |
+| A-4 | Fix `lsn_gt` +22% regression — use `split_once` instead of `split().collect()` | ✅ Done |
+| I-1c | `just bench-docker` target for running Criterion inside Docker builder image | ✅ Done |
+| I-2 | Per-cycle `[BENCH_CYCLE]` CSV output in E2E benchmarks for external analysis | ✅ Done |
+| I-3 | EXPLAIN ANALYZE capture mode (`PGS_BENCH_EXPLAIN=true`) for delta query plans | ✅ Done |
+| I-6 | 1M-row benchmark tier (`bench_*_1m_*` + `bench_large_matrix`) | ✅ Done |
+| I-8 | Criterion noise reduction (`sample_size(200)`, `measurement_time(10s)`) | ✅ Done |
+
+### Performance — Parallel Refresh, MERGE Optimization & Advanced Benchmarks (Part 9 S4–S6) ✅ Done
+
+> DAG level-parallel scheduling, improved MERGE strategy selection (xxh64
+> hashing, aggregate saturation bypass, cost-based threshold), and expanded
+> benchmark suite (JSON comparison, concurrent writers, window/lateral/CTE).
+
+| Item | Description | Status |
+|------|-------------|--------|
+| C-1 | DAG level extraction (`topological_levels()` on `StDag` and `ExecutionUnitDag`) | ✅ Done |
+| C-2 | Level-parallel dispatch (existing `parallel_dispatch_tick` infrastructure sufficient) | ✅ Done |
+| C-3 | Result communication (existing `SchedulerJob` + `pgt_refresh_history` sufficient) | ✅ Done |
+| D-1 | xxh64 hash-based change detection for wide tables (≥50 cols) | ✅ Done |
+| D-2 | Aggregate saturation FULL bypass (changes ≥ groups → FULL) | ✅ Done |
+| D-3 | Cost-based strategy selection from `pgt_refresh_history` data | ✅ Done |
+| I-4 | Cross-run comparison tool (`just bench-compare`, JSON output) | ✅ Done |
+| I-5 | Concurrent writer benchmarks (1/2/4/8 writers) | ✅ Done |
+| I-7 | Window / lateral / CTE / UNION ALL operator benchmarks | ✅ Done |
+
+> **v0.7.0 total: ~59–62h**
 
 **Exit criteria:**
+- [x] Part 9 performance: DAG levels, xxh64 hashing, aggregate saturation bypass, cost-based threshold, advanced benchmarks
 - [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
 - [ ] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
 - [x] UDAs, nested window expressions, and deeply nested OR+sublinks supported in DIFFERENTIAL mode
@@ -1818,10 +1874,10 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.3.0 — DVM Correctness, SAST & Test Coverage | ~20–30h | 185–252h | ✅ Released |
 | v0.4.0 — Parallel Refresh & Performance Hardening | ~60–94h | 245–346h | ✅ Released |
 | v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | ✅ Released |
-| v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | |
-| v0.7.0 — Watermarks, Circular DAG Execution & Last Differential Gaps | ~36–39h | 367–532h | |
-| v0.8.0 — Connection Pooler Compatibility & pg_dump Support | ~12–17d | 475–680h | |
-| v0.9.0 — Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep | ~33–37h | 508–717h | |
+| v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | ✅ Released |
+| v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
+| v0.8.0 — Connection Pooler Compatibility | ~12–17d | — | |
+| v0.9.0 — Observability, Anomaly Detection & pg_dump Support | ~33–37h | — | |
 | v0.10.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
 | v0.11.0 — Partitioned Stream Tables & Operational Scale (A-1, C-2, C-3) | ~9–13 wk | — | |
 | v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compat | ~13–19 wk | — | |

@@ -502,6 +502,79 @@ impl StDag {
             .collect())
     }
 
+    /// Return ST nodes grouped by parallelism level (upstream first).
+    ///
+    /// Level 0 contains all zero-indegree nodes (no upstream ST dependencies),
+    /// level 1 contains nodes whose dependencies are all in level 0, etc.
+    /// Nodes within the same level have no dependency edges between them and
+    /// can be refreshed in parallel.
+    ///
+    /// Only returns `NodeId::StreamTable` entries; base tables are excluded.
+    pub fn topological_levels(&self) -> Result<Vec<Vec<NodeId>>, PgTrickleError> {
+        // Compute in-degrees (same start as Kahn's algorithm).
+        let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
+        for &node in &self.all_nodes {
+            in_degree.entry(node).or_insert(0);
+        }
+        for targets in self.edges.values() {
+            for &target in targets {
+                *in_degree.entry(target).or_insert(0) += 1;
+            }
+        }
+
+        let mut levels: Vec<Vec<NodeId>> = Vec::new();
+        let mut processed = 0usize;
+
+        // Seed: all zero-indegree nodes form level 0.
+        let mut current_level: Vec<NodeId> = in_degree
+            .iter()
+            .filter(|&(_, &deg)| deg == 0)
+            .map(|(&node, _)| node)
+            .collect();
+
+        while !current_level.is_empty() {
+            // Filter to ST nodes for the output level.
+            let st_level: Vec<NodeId> = current_level
+                .iter()
+                .filter(|n| matches!(n, NodeId::StreamTable(_)))
+                .copied()
+                .collect();
+            if !st_level.is_empty() {
+                levels.push(st_level);
+            }
+
+            processed += current_level.len();
+
+            // Compute next level: decrement in-degrees for downstream nodes.
+            let mut next_level = Vec::new();
+            for node in &current_level {
+                if let Some(downstream) = self.edges.get(node) {
+                    for &d in downstream {
+                        if let Some(deg) = in_degree.get_mut(&d) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                next_level.push(d);
+                            }
+                        }
+                    }
+                }
+            }
+            current_level = next_level;
+        }
+
+        if processed < self.all_nodes.len() {
+            let cycle_nodes: Vec<String> = self
+                .all_nodes
+                .iter()
+                .filter(|n| in_degree.get(n).is_some_and(|&d| d > 0))
+                .map(|n| self.node_name(n))
+                .collect();
+            return Err(PgTrickleError::CycleDetected(cycle_nodes));
+        }
+
+        Ok(levels)
+    }
+
     /// Resolve CALCULATED schedules.
     ///
     /// For STs with `schedule = None` (CALCULATED), compute the effective schedule
@@ -1404,6 +1477,60 @@ impl ExecutionUnitDag {
             .collect()
     }
 
+    /// Return execution units grouped by parallelism level (upstream first).
+    ///
+    /// Level 0 contains all zero-indegree units (no upstream dependencies),
+    /// level 1 contains units whose dependencies are all in level 0, etc.
+    /// Units within the same level can be dispatched in parallel.
+    pub fn topological_levels(&self) -> Result<Vec<Vec<ExecutionUnitId>>, PgTrickleError> {
+        let mut in_degree: HashMap<ExecutionUnitId, usize> = HashMap::new();
+        for &uid in self.units.keys() {
+            in_degree.entry(uid).or_insert(0);
+        }
+        for targets in self.edges.values() {
+            for &t in targets {
+                *in_degree.entry(t).or_insert(0) += 1;
+            }
+        }
+
+        let mut levels: Vec<Vec<ExecutionUnitId>> = Vec::new();
+        let mut processed = 0usize;
+
+        let mut current_level: Vec<ExecutionUnitId> = in_degree
+            .iter()
+            .filter(|&(_, &d)| d == 0)
+            .map(|(&id, _)| id)
+            .collect();
+
+        while !current_level.is_empty() {
+            levels.push(current_level.clone());
+            processed += current_level.len();
+
+            let mut next_level = Vec::new();
+            for &uid in &current_level {
+                if let Some(downstream) = self.edges.get(&uid) {
+                    for &ds in downstream {
+                        if let Some(deg) = in_degree.get_mut(&ds) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                next_level.push(ds);
+                            }
+                        }
+                    }
+                }
+            }
+            current_level = next_level;
+        }
+
+        if processed < self.units.len() {
+            Err(PgTrickleError::CycleDetected(vec![
+                "execution unit DAG".to_string(),
+            ]))
+        } else {
+            Ok(levels)
+        }
+    }
+
     /// Format a human-readable summary of the execution unit DAG for logging.
     pub fn summary(&self) -> String {
         let mut singletons = 0u32;
@@ -1422,15 +1549,17 @@ impl ExecutionUnitDag {
 
         let ready = self.initial_ready_set().len();
         let edges: usize = self.edges.values().map(|v| v.len()).sum();
+        let n_levels = self.topological_levels().map(|l| l.len()).unwrap_or(0);
 
         format!(
-            "{} units ({} singleton, {} atomic, {} immediate), {} STs, {} edges, {} initially ready",
+            "{} units ({} singleton, {} atomic, {} immediate), {} STs, {} edges, {} levels, {} initially ready",
             self.units.len(),
             singletons,
             atomic_groups,
             immediate_closures,
             total_sts,
             edges,
+            n_levels,
             ready,
         )
     }
@@ -3180,5 +3309,118 @@ mod tests {
                 .unwrap()
         };
         assert!(pos_of(a) < pos_of(b));
+    }
+
+    // ── topological_levels tests ────────────────────────────────
+
+    fn make_dag_node(id: i64) -> DagNode {
+        DagNode {
+            id: NodeId::StreamTable(id),
+            schedule: Some(Duration::from_secs(60)),
+            effective_schedule: Duration::from_secs(60),
+            name: format!("st_{id}"),
+            status: StStatus::Active,
+            schedule_raw: None,
+        }
+    }
+
+    #[test]
+    fn test_topological_levels_linear_chain() {
+        // base → st1 → st2 → st3  →  3 levels (one ST each)
+        let mut dag = StDag::new();
+        let base = NodeId::BaseTable(1);
+        let st1 = NodeId::StreamTable(1);
+        let st2 = NodeId::StreamTable(2);
+        let st3 = NodeId::StreamTable(3);
+
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_st_node(make_dag_node(3));
+        dag.add_edge(base, st1);
+        dag.add_edge(st1, st2);
+        dag.add_edge(st2, st3);
+
+        let levels = dag.topological_levels().unwrap();
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![st1]);
+        assert_eq!(levels[1], vec![st2]);
+        assert_eq!(levels[2], vec![st3]);
+    }
+
+    #[test]
+    fn test_topological_levels_wide_fan_out() {
+        // base → st1, base → st2, base → st3  →  1 level with 3 STs
+        let mut dag = StDag::new();
+        let base = NodeId::BaseTable(1);
+        let st1 = NodeId::StreamTable(1);
+        let st2 = NodeId::StreamTable(2);
+        let st3 = NodeId::StreamTable(3);
+
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_st_node(make_dag_node(3));
+        dag.add_edge(base, st1);
+        dag.add_edge(base, st2);
+        dag.add_edge(base, st3);
+
+        let levels = dag.topological_levels().unwrap();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].len(), 3);
+    }
+
+    #[test]
+    fn test_topological_levels_diamond() {
+        // base → st1 → st3
+        // base → st2 → st3
+        // Level 0: [st1, st2], Level 1: [st3]
+        let mut dag = StDag::new();
+        let base = NodeId::BaseTable(1);
+        let st1 = NodeId::StreamTable(1);
+        let st2 = NodeId::StreamTable(2);
+        let st3 = NodeId::StreamTable(3);
+
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_st_node(make_dag_node(3));
+        dag.add_edge(base, st1);
+        dag.add_edge(base, st2);
+        dag.add_edge(st1, st3);
+        dag.add_edge(st2, st3);
+
+        let levels = dag.topological_levels().unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].len(), 2); // st1 and st2
+        assert_eq!(levels[1], vec![st3]);
+    }
+
+    #[test]
+    fn test_topological_levels_empty() {
+        let dag = StDag::new();
+        let levels = dag.topological_levels().unwrap();
+        assert!(levels.is_empty());
+    }
+
+    #[test]
+    fn test_eu_dag_topological_levels_simple() {
+        // base → st1, base → st2, st1 → st3
+        // Level 0: [units for st1, st2], Level 1: [unit for st3]
+        let mut dag = StDag::new();
+        let base = NodeId::BaseTable(1);
+        let st1 = NodeId::StreamTable(1);
+        let st2 = NodeId::StreamTable(2);
+        let st3 = NodeId::StreamTable(3);
+
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_st_node(make_dag_node(3));
+        dag.add_edge(base, st1);
+        dag.add_edge(base, st2);
+        dag.add_edge(st1, st3);
+
+        let eu_dag = ExecutionUnitDag::build_from_st_dag(&dag, |_| Some(RefreshMode::Differential));
+        let levels = eu_dag.topological_levels().unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].len(), 2); // st1 and st2 units
+        assert_eq!(levels[1].len(), 1); // st3 unit
     }
 }
