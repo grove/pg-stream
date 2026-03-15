@@ -94,6 +94,7 @@ LIGHT_E2E_TESTS=(
     e2e_sublink_or_tests
     e2e_topk_tests
     e2e_view_tests
+    e2e_watermark_gating_tests
     e2e_window_tests
 )
 

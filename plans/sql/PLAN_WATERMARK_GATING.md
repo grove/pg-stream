@@ -1,7 +1,7 @@
 # Plan: User-Provided Watermarks for Cross-Source Gating
 
 Date: 2026-03-02
-Status: IN PROGRESS (WM-1 through WM-5 implemented; WM-6 E2E tests pending)
+Status: COMPLETE (WM-1 through WM-6 implemented; hold-back mode deferred)
 Last Updated: 2026-03-15
 
 ---

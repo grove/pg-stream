@@ -165,6 +165,11 @@ downstream stream tables.
     lag in seconds, aligned flag, and source counts.
 - **Catalog tables:** `pgt_watermarks` (per-source watermark state) and
   `pgt_watermark_groups` (group definitions with tolerance).
+- **E2E test suite** (`e2e_watermark_gating_tests.rs`) — 28 tests covering
+  watermark advancement (monotonicity, idempotency, error handling), group CRUD
+  (create, drop, validation), introspection functions (alignment, tolerance,
+  source counts), intermediate ST behavior, and scheduler integration (skip on
+  misalignment, resume after alignment, tolerance-based gating).
 
 ---
 

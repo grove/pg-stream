@@ -1141,9 +1141,9 @@ source tables are populated on different schedules.
 | ~~WM-3~~ | ~~`create_watermark_group(name, sources[], tolerance)` / `drop_watermark_group()`~~ | ✅ Done | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
 | ~~WM-4~~ | ~~Scheduler pre-check: evaluate watermark alignment predicate; skip + log `SKIP(watermark_misaligned)` if not aligned~~ | ✅ Done | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
 | ~~WM-5~~ | ~~`watermarks()`, `watermark_groups()`, `watermark_status()` introspection functions~~ | ✅ Done | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
-| WM-6 | E2E tests: nightly ETL, micro-batch tolerance, multiple pipelines, mixed external+internal sources | 6–8h | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
+| ~~WM-6~~ | ~~E2E tests: nightly ETL, micro-batch tolerance, multiple pipelines, mixed external+internal sources~~ | ✅ Done | [PLAN_WATERMARK_GATING.md](plans/sql/PLAN_WATERMARK_GATING.md) |
 
-> **Watermark gating subtotal: ~17–20 hours**
+> **Watermark gating: ✅ Complete**
 
 ### Circular Dependencies — Scheduler Integration
 
