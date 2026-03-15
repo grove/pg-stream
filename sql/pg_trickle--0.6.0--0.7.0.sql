@@ -1,0 +1,4 @@
+-- pg_trickle 0.6.0 -> 0.7.0 upgrade script
+--
+-- v0.7.0 adds:
+--   (placeholder — add new objects here as they are implemented)

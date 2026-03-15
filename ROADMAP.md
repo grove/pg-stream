@@ -1,6 +1,6 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-14
+> **Last updated:** 2026-03-15
 > **Latest release:** 0.6.0 (2026-03-14)
 > **Current milestone:** v0.7.0 — Watermarks, Circular DAG Execution & Last Differential Gaps
 
