@@ -134,7 +134,21 @@ reducing the surface area where memory-safety bugs could theoretically hide.
 
 ## [0.7.0] — Unreleased
 
-No changes yet.
+### Added
+
+- **Circular dependency scheduler integration (CYC-5).** When stream tables
+  form cyclic dependencies (A → B → A), the scheduler now iterates them to a
+  fixed point — refreshing all members of the strongly connected component
+  (SCC) repeatedly until convergence (zero net changes) or the configurable
+  `pg_trickle.max_fixpoint_iterations` limit (default 100) is reached.
+  Non-convergence marks all SCC members as `ERROR`. Only DIFFERENTIAL mode
+  is supported in cyclic SCCs; FULL mode is rejected at iteration start.
+  Requires `pg_trickle.allow_circular = true` (default `false`).
+
+- **`last_fixpoint_iterations` catalog column.** New column on
+  `pgtrickle.pgt_stream_tables` that records how many fixpoint iterations the
+  last SCC convergence took. Useful for monitoring convergence speed and
+  detecting near-non-convergence patterns.
 
 ---
 

@@ -256,10 +256,10 @@ Generates the final diff SQL that:
 Stream tables can depend on other stream tables (cascading), forming a Directed Acyclic Graph:
 
 - **Cycle detection** — Prevents circular dependencies at creation time using Kahn's algorithm (BFS topological sort).
-- **SCC decomposition** — Tarjan's algorithm decomposes the graph into strongly connected components. Singleton SCCs are acyclic; multi-node SCCs contain cycles. This is the foundation for fixed-point iteration (v0.7.0).
+- **SCC decomposition** — Tarjan's algorithm decomposes the graph into strongly connected components. Singleton SCCs are acyclic; multi-node SCCs contain cycles that are handled by fixed-point iteration in the scheduler.
 - **Monotonicity analysis** — Static check (`check_monotonicity()` in `src/dvm/parser.rs`) determines whether a query's operators are safe for cyclic fixed-point iteration. Non-monotone operators (Aggregate, EXCEPT, Window, NOT EXISTS) block cycle creation.
 - **Topological ordering** — Determines refresh order: upstream STs must be refreshed before downstream STs.
-- **Condensation order** — `condensation_order()` returns SCCs in topological order, grouping cyclic STs for future fixed-point iteration.
+- **Condensation order** — `condensation_order()` returns SCCs in topological order, grouping cyclic STs for fixed-point iteration. The scheduler's `iterate_to_fixpoint()` processes multi-node SCCs by refreshing all members repeatedly until convergence (zero net changes) or `max_fixpoint_iterations` is exceeded.
 - **Cascade operations** — When a source table changes, all transitive dependents are identified for refresh.
 
 ### 6. Version / Frontier Tracking (`src/version.rs`)

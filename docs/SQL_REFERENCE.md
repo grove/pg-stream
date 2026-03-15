@@ -2318,6 +2318,7 @@ Core metadata for each stream table.
 | `has_keyless_source` | `bool` | Whether any source table lacks a PRIMARY KEY (EC-06) |
 | `function_hashes` | `text` | MD5 hashes of referenced function bodies for change detection (EC-16) |
 | `scc_id` | `int` | SCC group identifier for circular dependencies (`NULL` if not in a cycle) |
+| `last_fixpoint_iterations` | `int` | Number of iterations in the last SCC fixpoint convergence (`NULL` if never iterated) |
 | `created_at` | `timestamptz` | Creation timestamp |
 | `updated_at` | `timestamptz` | Last modification timestamp |
 

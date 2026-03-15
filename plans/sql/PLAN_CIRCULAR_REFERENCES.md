@@ -1,6 +1,6 @@
 # PLAN: Circular References in the Stream Table Dependency Graph
 
-**Status:** Foundation complete (Parts 1–4 implemented in v0.6.0)
+**Status:** Parts 1–5 implemented (v0.6.0 foundation + v0.7.0 scheduler integration)
 
 ## Objective
 
@@ -720,11 +720,11 @@ Spawn a dedicated background worker per cyclic SCC that iterates independently o
 
 | Part | Description | Status |
 |------|------------|--------|
-| 1 | Tarjan's SCC algorithm | ❌ Not started |
-| 2 | Monotonicity checker | ❌ Not started |
-| 3 | Catalog changes | ❌ Not started |
-| 4 | GUC configuration | ❌ Not started |
-| 5 | Scheduler fixed-point iteration | ❌ Not started |
+| 1 | Tarjan's SCC algorithm | ✅ Done (v0.6.0) |
+| 2 | Monotonicity checker | ✅ Done (v0.6.0) |
+| 3 | Catalog changes | ✅ Done (v0.6.0) |
+| 4 | GUC configuration | ✅ Done (v0.6.0) |
+| 5 | Scheduler fixed-point iteration | ✅ Done (v0.7.0) |
 | 6 | Creation-time validation | ❌ Not started |
 | 7 | Monitoring and observability | ❌ Not started |
 | 8 | Documentation and E2E tests | ❌ Not started |
