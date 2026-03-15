@@ -6229,6 +6229,239 @@ fn decorrelate_scalar_subquery(
     })
 }
 
+// ── De Morgan normalization for sublink-bearing NOT(AND/OR) ─────────
+
+/// Apply De Morgan's law to expose OR+sublink patterns hidden behind NOT.
+///
+/// ```sql
+/// -- Input:
+/// SELECT * FROM t WHERE NOT (x AND NOT EXISTS (SELECT 1 FROM vip WHERE vip.id = t.id))
+/// -- Rewrite to:
+/// SELECT * FROM t WHERE (NOT (x) OR EXISTS (SELECT 1 FROM vip WHERE vip.id = t.id))
+/// ```
+///
+/// The transformation rules are:
+/// - `NOT (a AND b)` → `(NOT a) OR (NOT b)`
+/// - `NOT (a OR b)` → `(NOT a) AND (NOT b)`
+/// - `NOT NOT a` → `a`
+///
+/// Only applied when the NOT wraps AND/OR nodes containing SubLink nodes,
+/// so that the subsequent `rewrite_sublinks_in_or` pass can convert the
+/// resulting OR+sublink into UNION branches.
+pub fn rewrite_demorgan_sublinks(query: &str) -> Result<String, PgTrickleError> {
+    use std::ffi::CString;
+
+    let c_query = CString::new(query)
+        .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
+
+    // SAFETY: raw_parser is safe within a PostgreSQL backend with a valid memory context.
+    let raw_list =
+        unsafe { pg_sys::raw_parser(c_query.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT) };
+    if raw_list.is_null() {
+        return Ok(query.to_string());
+    }
+
+    let list = unsafe { pgrx::PgList::<pg_sys::RawStmt>::from_pg(raw_list) };
+    let raw_stmt = match list.head() {
+        Some(rs) => rs,
+        None => return Ok(query.to_string()),
+    };
+
+    let node = unsafe { (*raw_stmt).stmt };
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_SelectStmt) } {
+        return Ok(query.to_string());
+    }
+
+    let select = unsafe { &*(node as *const pg_sys::SelectStmt) };
+
+    if select.op != pg_sys::SetOperation::SETOP_NONE {
+        return Ok(query.to_string());
+    }
+
+    if select.whereClause.is_null() {
+        return Ok(query.to_string());
+    }
+
+    // Quick check: does the WHERE clause contain any NOT(AND/OR+sublink)?
+    if !unsafe { where_has_not_demorgan_opportunity(select.whereClause) } {
+        return Ok(query.to_string());
+    }
+
+    // Deparse the WHERE clause with De Morgan applied.
+    let new_where_sql = unsafe { deparse_with_demorgan(select.whereClause)? };
+
+    // Reconstruct the query with the normalized WHERE clause.
+    let from_sql = extract_from_clause_sql(select)?;
+    let target_sql = deparse_select_target_list(select);
+    let group_sql = deparse_group_clause(select);
+    let having_sql = deparse_having_clause(select);
+    let order_sql = deparse_order_clause(select);
+
+    let result = format!(
+        "SELECT {target_sql} FROM {from_sql} WHERE {new_where_sql}{group_sql}{having_sql}{order_sql}"
+    );
+
+    pgrx::debug1!("[pg_trickle] De Morgan normalization: {}", result);
+
+    Ok(result)
+}
+
+/// Check whether a WHERE clause tree contains NOT(AND/OR) patterns where
+/// De Morgan normalization would expose sublinks for the UNION rewrite.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn where_has_not_demorgan_opportunity(node: *mut pg_sys::Node) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        return false;
+    }
+    let be = unsafe { &*(node as *const pg_sys::BoolExpr) };
+    match be.boolop {
+        pg_sys::BoolExprType::NOT_EXPR => {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            if let Some(inner) = args.head()
+                && unsafe { pgrx::is_a(inner, pg_sys::NodeTag::T_BoolExpr) }
+            {
+                let inner_be = unsafe { &*(inner as *const pg_sys::BoolExpr) };
+                // NOT(AND/OR with sublinks) or NOT(NOT with sublinks)
+                if unsafe { node_tree_contains_sublink(inner) } {
+                    return matches!(
+                        inner_be.boolop,
+                        pg_sys::BoolExprType::AND_EXPR
+                            | pg_sys::BoolExprType::OR_EXPR
+                            | pg_sys::BoolExprType::NOT_EXPR
+                    );
+                }
+            }
+            false
+        }
+        pg_sys::BoolExprType::AND_EXPR | pg_sys::BoolExprType::OR_EXPR => {
+            // Recurse into children.
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            for arg in args.iter_ptr() {
+                if unsafe { where_has_not_demorgan_opportunity(arg) } {
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Deparse a WHERE clause node, applying De Morgan normalization to any
+/// NOT(AND/OR) nodes that contain sublinks.
+///
+/// Non-NOT nodes are recursed into (for AND/OR) or deparsed normally.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn deparse_with_demorgan(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
+    if node.is_null() {
+        return Ok("TRUE".to_string());
+    }
+
+    if !unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        return unsafe { node_to_expr(node) }.map(|e| e.to_sql());
+    }
+
+    let be = unsafe { &*(node as *const pg_sys::BoolExpr) };
+    match be.boolop {
+        pg_sys::BoolExprType::NOT_EXPR => {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            let inner = args
+                .head()
+                .ok_or_else(|| PgTrickleError::QueryParseError("Empty NOT expression".into()))?;
+
+            if unsafe { pgrx::is_a(inner, pg_sys::NodeTag::T_BoolExpr) } {
+                let inner_be = unsafe { &*(inner as *const pg_sys::BoolExpr) };
+
+                // NOT(AND(a,b,...)) → (NOT a) OR (NOT b) OR ...
+                if inner_be.boolop == pg_sys::BoolExprType::AND_EXPR
+                    && unsafe { node_tree_contains_sublink(inner) }
+                {
+                    let inner_args =
+                        unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_be.args) };
+                    let mut parts: Vec<String> = Vec::new();
+                    for arg in inner_args.iter_ptr() {
+                        parts.push(unsafe { negate_node_sql(arg)? });
+                    }
+                    return Ok(format!("({})", parts.join(" OR ")));
+                }
+
+                // NOT(OR(a,b,...)) → (NOT a) AND (NOT b) AND ...
+                if inner_be.boolop == pg_sys::BoolExprType::OR_EXPR
+                    && unsafe { node_tree_contains_sublink(inner) }
+                {
+                    let inner_args =
+                        unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_be.args) };
+                    let mut parts: Vec<String> = Vec::new();
+                    for arg in inner_args.iter_ptr() {
+                        parts.push(unsafe { negate_node_sql(arg)? });
+                    }
+                    return Ok(format!("({})", parts.join(" AND ")));
+                }
+
+                // NOT(NOT(x)) → x
+                if inner_be.boolop == pg_sys::BoolExprType::NOT_EXPR {
+                    let inner_args =
+                        unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(inner_be.args) };
+                    if let Some(x) = inner_args.head() {
+                        return unsafe { deparse_with_demorgan(x) };
+                    }
+                }
+            }
+
+            // NOT without applicable De Morgan — deparse normally.
+            unsafe { node_to_expr(node) }.map(|e| e.to_sql())
+        }
+        pg_sys::BoolExprType::AND_EXPR => {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            let mut parts: Vec<String> = Vec::new();
+            for arg in args.iter_ptr() {
+                parts.push(unsafe { deparse_with_demorgan(arg)? });
+            }
+            Ok(parts.join(" AND "))
+        }
+        pg_sys::BoolExprType::OR_EXPR => {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            let mut parts: Vec<String> = Vec::new();
+            for arg in args.iter_ptr() {
+                parts.push(unsafe { deparse_with_demorgan(arg)? });
+            }
+            Ok(parts.join(" OR "))
+        }
+        _ => unsafe { node_to_expr(node) }.map(|e| e.to_sql()),
+    }
+}
+
+/// Negate a node for De Morgan: NOT(NOT(x)) → x, otherwise NOT (x).
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn negate_node_sql(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> {
+    if node.is_null() {
+        return Ok("TRUE".to_string());
+    }
+
+    // Double negation elimination: NOT(NOT(x)) → x
+    if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_BoolExpr) } {
+        let be = unsafe { &*(node as *const pg_sys::BoolExpr) };
+        if be.boolop == pg_sys::BoolExprType::NOT_EXPR {
+            let args = unsafe { pgrx::PgList::<pg_sys::Node>::from_pg(be.args) };
+            if let Some(inner) = args.head() {
+                return unsafe { deparse_with_demorgan(inner) };
+            }
+        }
+    }
+
+    let expr = unsafe { deparse_with_demorgan(node)? };
+    Ok(format!("NOT ({expr})"))
+}
+
 // ── SubLinks inside OR → OR-to-UNION rewrite ───────────────────────
 
 /// Rewrite queries where SubLinks (EXISTS/IN) appear inside OR conditions

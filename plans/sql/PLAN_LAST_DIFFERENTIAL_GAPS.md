@@ -1,7 +1,7 @@
 # Plan: Last Differential Mode Gaps
 
 Date: 2026-03-15
-Status: G1 + G3 implemented; G2 was done in a prior release
+Status: Complete — G1 + G3 fully implemented (including De Morgan + multi-pass); G2 was done in a prior release
 
 ---
 

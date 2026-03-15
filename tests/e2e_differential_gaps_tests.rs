@@ -4,7 +4,9 @@
 //! in a group triggers full re-aggregation from source data.
 //!
 //! G3: Multiple OR+sublink conjuncts in AND are expanded to a cartesian
-//! product of UNION branches so all patterns are handled in DIFFERENTIAL mode.
+//! product of UNION branches. De Morgan normalization (NOT(AND/OR) →
+//! OR/AND of negated arms) exposes hidden OR+sublink patterns for the
+//! UNION rewrite.
 //!
 //! G2 (nested window expressions) was already implemented in a prior release.
 
@@ -287,4 +289,238 @@ async fn test_nested_or_cdc_cycle() {
         .await;
     db.refresh_st("noc_st").await;
     db.assert_st_matches_query("noc_st", q).await;
+}
+
+#[tokio::test]
+async fn test_nested_or_demorgan_not_and() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE dm_main (id SERIAL PRIMARY KEY, val INT)")
+        .await;
+    db.execute("CREATE TABLE dm_ref (id INT PRIMARY KEY)").await;
+    db.execute("INSERT INTO dm_main (val) VALUES (1), (2), (3), (4), (5)")
+        .await;
+    db.execute("INSERT INTO dm_ref VALUES (2), (4)").await;
+
+    // NOT (a AND NOT EXISTS(s))  →  De Morgan  →  (NOT a) OR EXISTS(s)
+    let q = "SELECT dm_main.id, dm_main.val FROM dm_main \
+             WHERE NOT (dm_main.val > 3 AND NOT EXISTS (SELECT 1 FROM dm_ref WHERE dm_ref.id = dm_main.id))";
+    db.create_st("dm_not_and_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("dm_not_and_st", q).await;
+
+    let (_, mode, _, _) = db.pgt_status("dm_not_and_st").await;
+    assert_eq!(
+        mode, "DIFFERENTIAL",
+        "De Morgan pattern should be DIFFERENTIAL"
+    );
+
+    // INSERT
+    db.execute("INSERT INTO dm_main (val) VALUES (6)").await;
+    db.refresh_st("dm_not_and_st").await;
+    db.assert_st_matches_query("dm_not_and_st", q).await;
+
+    // Change EXISTS result
+    db.execute("INSERT INTO dm_ref VALUES (5)").await;
+    db.refresh_st("dm_not_and_st").await;
+    db.assert_st_matches_query("dm_not_and_st", q).await;
+
+    // DELETE
+    db.execute("DELETE FROM dm_ref WHERE id = 2").await;
+    db.refresh_st("dm_not_and_st").await;
+    db.assert_st_matches_query("dm_not_and_st", q).await;
+}
+
+#[tokio::test]
+async fn test_nested_or_demorgan_and_prefix() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE dm2_src (id SERIAL PRIMARY KEY, val INT)")
+        .await;
+    db.execute("CREATE TABLE dm2_ref (id INT PRIMARY KEY)")
+        .await;
+    db.execute("INSERT INTO dm2_src (val) VALUES (1), (2), (3), (4), (5)")
+        .await;
+    db.execute("INSERT INTO dm2_ref VALUES (1), (3)").await;
+
+    // AND prefix + NOT(AND+sublink):
+    // val < 5 AND NOT (val > 2 AND NOT EXISTS (...))
+    let q = "SELECT dm2_src.id, dm2_src.val FROM dm2_src \
+             WHERE dm2_src.val < 5 AND NOT (dm2_src.val > 2 AND NOT EXISTS (SELECT 1 FROM dm2_ref WHERE dm2_ref.id = dm2_src.id))";
+    db.create_st("dm2_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("dm2_st", q).await;
+
+    let (_, mode, _, _) = db.pgt_status("dm2_st").await;
+    assert_eq!(mode, "DIFFERENTIAL");
+
+    db.execute("INSERT INTO dm2_src (val) VALUES (2)").await;
+    db.refresh_st("dm2_st").await;
+    db.assert_st_matches_query("dm2_st", q).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// G1 additional: UDA edge cases
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_uda_with_filter_clause() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE FUNCTION fcat_sfunc(state TEXT, val TEXT) \
+         RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$ \
+         SELECT CASE WHEN state IS NULL THEN val ELSE state || ',' || val END $$",
+    )
+    .await;
+    db.execute("CREATE AGGREGATE fcat_agg(TEXT) (SFUNC = fcat_sfunc, STYPE = TEXT)")
+        .await;
+
+    db.execute("CREATE TABLE uda_filt (id SERIAL PRIMARY KEY, grp TEXT, val TEXT, active BOOL)")
+        .await;
+    db.execute(
+        "INSERT INTO uda_filt (grp, val, active) VALUES \
+         ('a', 'x', true), ('a', 'y', false), ('a', 'z', true), ('b', 'w', true)",
+    )
+    .await;
+
+    let q = "SELECT grp, fcat_agg(val) FILTER (WHERE active) AS filtered \
+             FROM uda_filt GROUP BY grp";
+    db.create_st("uda_filt_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("uda_filt_st", q).await;
+
+    let (_, mode, _, _) = db.pgt_status("uda_filt_st").await;
+    assert_eq!(mode, "DIFFERENTIAL");
+
+    db.execute("INSERT INTO uda_filt (grp, val, active) VALUES ('a', 'v', true)")
+        .await;
+    db.refresh_st("uda_filt_st").await;
+    db.assert_st_matches_query("uda_filt_st", q).await;
+
+    db.execute("UPDATE uda_filt SET active = false WHERE val = 'z'")
+        .await;
+    db.refresh_st("uda_filt_st").await;
+    db.assert_st_matches_query("uda_filt_st", q).await;
+}
+
+#[tokio::test]
+async fn test_uda_with_order_by_in_agg() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE FUNCTION ocat_sfunc(state TEXT, val TEXT) \
+         RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$ \
+         SELECT CASE WHEN state IS NULL THEN val ELSE state || ',' || val END $$",
+    )
+    .await;
+    db.execute("CREATE AGGREGATE ocat_agg(TEXT) (SFUNC = ocat_sfunc, STYPE = TEXT)")
+        .await;
+
+    db.execute("CREATE TABLE uda_ord (id SERIAL PRIMARY KEY, grp TEXT, val TEXT, priority INT)")
+        .await;
+    db.execute(
+        "INSERT INTO uda_ord (grp, val, priority) VALUES \
+         ('a', 'x', 3), ('a', 'y', 1), ('a', 'z', 2), ('b', 'w', 1)",
+    )
+    .await;
+
+    let q = "SELECT grp, ocat_agg(val ORDER BY priority) AS ordered \
+             FROM uda_ord GROUP BY grp";
+    db.create_st("uda_ord_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("uda_ord_st", q).await;
+
+    let (_, mode, _, _) = db.pgt_status("uda_ord_st").await;
+    assert_eq!(mode, "DIFFERENTIAL");
+
+    db.execute("INSERT INTO uda_ord (grp, val, priority) VALUES ('a', 'v', 0)")
+        .await;
+    db.refresh_st("uda_ord_st").await;
+    db.assert_st_matches_query("uda_ord_st", q).await;
+}
+
+#[tokio::test]
+async fn test_uda_schema_qualified() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE SCHEMA uda_ns").await;
+    db.execute(
+        "CREATE FUNCTION uda_ns.mysum_sfunc(state NUMERIC, val NUMERIC) \
+         RETURNS NUMERIC LANGUAGE sql IMMUTABLE AS $$ SELECT COALESCE(state, 0) + val $$",
+    )
+    .await;
+    db.execute(
+        "CREATE AGGREGATE uda_ns.mysum(NUMERIC) ( \
+         SFUNC = uda_ns.mysum_sfunc, STYPE = NUMERIC, INITCOND = '0')",
+    )
+    .await;
+
+    db.execute("CREATE TABLE uda_sq (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC)")
+        .await;
+    db.execute("INSERT INTO uda_sq (grp, val) VALUES ('a', 10), ('a', 20), ('b', 5)")
+        .await;
+
+    let q = "SELECT grp, uda_ns.mysum(val) AS total FROM uda_sq GROUP BY grp";
+    db.create_st("uda_sq_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("uda_sq_st", q).await;
+
+    let (_, mode, _, _) = db.pgt_status("uda_sq_st").await;
+    assert_eq!(mode, "DIFFERENTIAL");
+
+    db.execute("INSERT INTO uda_sq (grp, val) VALUES ('a', 30)")
+        .await;
+    db.refresh_st("uda_sq_st").await;
+    db.assert_st_matches_query("uda_sq_st", q).await;
+}
+
+#[tokio::test]
+async fn test_uda_insert_delete_update_full_cycle() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE FUNCTION cmin_sfunc(state INT, val INT) \
+         RETURNS INT LANGUAGE sql IMMUTABLE AS $$ \
+         SELECT CASE WHEN state IS NULL OR val < state THEN val ELSE state END $$",
+    )
+    .await;
+    db.execute("CREATE AGGREGATE cust_min(INT) (SFUNC = cmin_sfunc, STYPE = INT)")
+        .await;
+
+    db.execute("CREATE TABLE uda_crud (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
+        .await;
+    db.execute(
+        "INSERT INTO uda_crud (grp, val) VALUES \
+         ('a', 10), ('a', 20), ('a', 5), ('b', 30), ('b', 15)",
+    )
+    .await;
+
+    let q = "SELECT grp, cust_min(val) AS m, COUNT(*) AS n FROM uda_crud GROUP BY grp";
+    db.create_st("uda_crud_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("uda_crud_st", q).await;
+
+    // INSERT — adds new minimum
+    db.execute("INSERT INTO uda_crud (grp, val) VALUES ('a', 1)")
+        .await;
+    db.refresh_st("uda_crud_st").await;
+    db.assert_st_matches_query("uda_crud_st", q).await;
+
+    // UPDATE — changes existing minimum
+    db.execute("UPDATE uda_crud SET val = 100 WHERE grp = 'a' AND val = 1")
+        .await;
+    db.refresh_st("uda_crud_st").await;
+    db.assert_st_matches_query("uda_crud_st", q).await;
+
+    // DELETE — removes a row
+    db.execute("DELETE FROM uda_crud WHERE grp = 'b' AND val = 15")
+        .await;
+    db.refresh_st("uda_crud_st").await;
+    db.assert_st_matches_query("uda_crud_st", q).await;
+
+    // DELETE all in group — group disappears
+    db.execute("DELETE FROM uda_crud WHERE grp = 'b'").await;
+    db.refresh_st("uda_crud_st").await;
+    db.assert_st_matches_query("uda_crud_st", q).await;
+
+    // INSERT into empty group — group reappears
+    db.execute("INSERT INTO uda_crud (grp, val) VALUES ('b', 42)")
+        .await;
+    db.refresh_st("uda_crud_st").await;
+    db.assert_st_matches_query("uda_crud_st", q).await;
 }

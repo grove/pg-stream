@@ -387,8 +387,19 @@ fn run_query_rewrite_pipeline(query: &str) -> Result<String, PgTrickleError> {
     let query = crate::dvm::rewrite_scalar_subquery_in_where(&query)?;
     // Correlated scalar subquery in SELECT → LEFT JOIN
     let query = crate::dvm::rewrite_correlated_scalar_in_select(&query)?;
-    // SubLinks inside OR → UNION branches
-    let query = crate::dvm::rewrite_sublinks_in_or(&query)?;
+    // SubLinks inside OR → UNION branches (with De Morgan normalization).
+    // Multiple passes handle patterns exposed after the first rewrite,
+    // e.g. NOT(AND(…)) → OR(…) → UNION in pass 2.  Cap at 3 iterations.
+    let mut query = query;
+    for _ in 0..3 {
+        let prev = query.clone();
+        let q = crate::dvm::rewrite_demorgan_sublinks(&query)?;
+        let q = crate::dvm::rewrite_sublinks_in_or(&q)?;
+        if q == prev {
+            break;
+        }
+        query = q;
+    }
     // ROWS FROM() multi-function rewrite
     let query = crate::dvm::rewrite_rows_from(&query)?;
     Ok(query)
