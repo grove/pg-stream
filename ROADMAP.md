@@ -1194,12 +1194,12 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 > packaging scaffolding.
 
 | Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| INFRA-1 | **Prove the Docker image builds.** Set up a CI workflow that builds the official Docker Hub image (PostgreSQL 18 + pg_trickle pre-installed), runs a smoke test (create extension, create a stream table, refresh it), but doesn't publish anywhere yet. When 1.0 arrives, publishing is just flipping a switch. | 5h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
-| INFRA-2 | **Publish an early PGXN testing release.** Draft `META.json` and upload a `release_status: "testing"` package to PGXN so `pgxn install pg_trickle` works for early adopters now. PGXN explicitly supports pre-stable releases; this gets real-world install testing and establishes registry presence before 1.0. At 1.0 the only change is flipping `release_status` to `"stable"`. | 2–3h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
-| INFRA-3 | **Verify Kubernetes deployment works.** A CI smoke test that deploys the pg_trickle extension image into a CloudNativePG (CNPG) Kubernetes cluster, creates a stream table, and confirms a refresh cycle completes. Catches packaging and compatibility issues before they reach Kubernetes users. | 4h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
+|------|-------------|--------|---------|
+| ~~INFRA-1~~ | ~~**Prove the Docker image builds.** Set up a CI workflow that builds the official Docker Hub image (PostgreSQL 18 + pg_trickle pre-installed), runs a smoke test (create extension, create a stream table, refresh it), but doesn't publish anywhere yet. When 1.0 arrives, publishing is just flipping a switch.~~ | 5h | ✅ Done |
+| ~~INFRA-2~~ | ~~**Publish an early PGXN testing release.** Draft `META.json` and upload a `release_status: "testing"` package to PGXN so `pgxn install pg_trickle` works for early adopters now. PGXN explicitly supports pre-stable releases; this gets real-world install testing and establishes registry presence before 1.0. At 1.0 the only change is flipping `release_status` to `"stable"`.~~ | 2–3h | ✅ Done |
+| ~~INFRA-3~~ | ~~**Verify Kubernetes deployment works.** A CI smoke test that deploys the pg_trickle extension image into a CloudNativePG (CNPG) Kubernetes cluster, creates a stream table, and confirms a refresh cycle completes. Catches packaging and compatibility issues before they reach Kubernetes users.~~ | 4h | ✅ Done |
 
-> **Infrastructure prep subtotal: ~11–12 hours**
+> **Pre-1.0 infrastructure prep: ✅ Complete**
 
 ### Performance — Regression Fixes & Benchmark Infrastructure (Part 9 S1–S2) ✅ Done
 

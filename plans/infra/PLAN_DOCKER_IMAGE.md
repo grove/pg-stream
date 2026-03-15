@@ -1,8 +1,13 @@
 # PLAN_DOCKER_IMAGE.md — Official Docker Image
 
-> **Status:** Draft  
-> **Target version:** v1.0.0  
+> **Status:** INFRA-1 implemented (build CI + smoke test, no push yet)
+> **Target version:** v1.0.0 (push to Docker Hub)
 > **Author:** pg_trickle project
+>
+> **Implemented in v0.7.0:** `Dockerfile.hub` (end-user image based on
+> `postgres:18-bookworm`) and `.github/workflows/docker-hub.yml` (weekly
+> build + smoke test, no push). At v1.0.0 set `push: true` and add
+> `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` secrets.
 
 ---
 

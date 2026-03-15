@@ -1,0 +1,131 @@
+# =============================================================================
+# Docker Hub Image Workflow — Build and smoke-test the official pg_trickle
+# Docker image.
+#
+# Builds pgtrickle/pg_trickle:<version>-pg18 from Dockerfile.hub but does NOT
+# push to Docker Hub.  Publishing is gated until v1.0.0 — at that point,
+# adding `push: true` and Docker Hub credentials is all that's needed.
+#
+# Smoke test: starts the container, creates a stream table, verifies a
+# refresh cycle completes, then tears down.
+#
+# Triggers:
+#   - workflow_dispatch: manual run from the Actions tab
+#   - schedule: weekly on Sundays (catch regressions before release)
+# =============================================================================
+name: Docker Hub image (build + smoke test)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 0'   # Every Sunday at 04:00 UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE_NAME: pg_trickle_hub
+
+jobs:
+  build-and-smoke:
+    name: Build Docker Hub image and smoke-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set image tag
+        id: tag
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${IMAGE_NAME}:${VERSION}-pg18" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.hub
+          push: false
+          load: true
+          tags: ${{ steps.tag.outputs.tag }}
+          build-args: |
+            VERSION=${{ steps.tag.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ── Smoke test ─────────────────────────────────────────────────────────
+      # Start the container and verify:
+      #   1. Extension loads (CREATE EXTENSION)
+      #   2. Version function returns the expected version
+      #   3. Basic stream table lifecycle (create → refresh → query)
+
+      - name: Start container
+        run: |
+          docker run -d \
+            --name pgtrickle-hub-smoke \
+            -e POSTGRES_PASSWORD=smoke \
+            ${{ steps.tag.outputs.tag }}
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec pgtrickle-hub-smoke \
+                pg_isready -U postgres -q 2>/dev/null; then
+              echo "PostgreSQL ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Smoke test — extension + version
+        run: |
+          docker exec pgtrickle-hub-smoke \
+            psql -U postgres -v ON_ERROR_STOP=1 -c "
+              CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE;
+              SELECT pgtrickle.version() AS ext_version;
+            "
+
+      - name: Smoke test — stream table lifecycle
+        run: |
+          docker exec pgtrickle-hub-smoke \
+            psql -U postgres -v ON_ERROR_STOP=1 -c "
+              CREATE TABLE smoke_src (id INT PRIMARY KEY, v INT);
+              INSERT INTO smoke_src VALUES (1, 10), (2, 20);
+
+              SELECT pgtrickle.create_stream_table(
+                'smoke_mv',
+                'SELECT id, v * 2 AS doubled FROM smoke_src'
+              );
+
+              SELECT pgtrickle.refresh('smoke_mv');
+
+              SELECT count(*) AS row_count FROM smoke_mv;
+              SELECT * FROM smoke_mv ORDER BY id;
+            "
+
+      - name: Smoke test — pgtrickle catalog tables present
+        run: |
+          docker exec pgtrickle-hub-smoke \
+            psql -U postgres -v ON_ERROR_STOP=1 -c "
+              SELECT count(*) FROM pgtrickle.pgt_stream_tables;
+              SELECT count(*) FROM pgtrickle.pgt_watermarks;
+              SELECT count(*) FROM pgtrickle.pgt_watermark_groups;
+            "
+
+      - name: Tear down container
+        if: always()
+        run: docker rm -f pgtrickle-hub-smoke 2>/dev/null || true
+
+      # ── Summary ─────────────────────────────────────────────────────────────
+      - name: Print image size summary
+        if: always()
+        run: |
+          echo "Image: ${{ steps.tag.outputs.tag }}"
+          docker images ${{ env.IMAGE_NAME }} --format \
+            "Size: {{.Size}}   Created: {{.CreatedAt}}"

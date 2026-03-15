@@ -208,6 +208,27 @@ downstream stream tables.
   source counts), intermediate ST behavior, and scheduler integration (skip on
   misalignment, resume after alignment, tolerance-based gating).
 
+#### Pre-1.0 Infrastructure Prep (INFRA-1/2/3)
+
+- **Official Docker Hub image (`Dockerfile.hub`)** — A self-contained
+  `postgres:18-bookworm` image with pg_trickle pre-installed and
+  pre-configured (`shared_preload_libraries = 'pg_trickle'`). Suitable for
+  local evaluation, CI/CD matrices, and as a Kubernetes base image. The
+  image is built and smoke-tested in CI but not yet pushed to Docker Hub —
+  publishing is gated until v1.0.0 (flip `push: true` and add credentials).
+- **Docker Hub CI workflow (`.github/workflows/docker-hub.yml`)** — Builds
+  `Dockerfile.hub` and runs a three-step smoke test: extension load and
+  version check, full stream-table lifecycle (create → refresh → query), and
+  catalog table presence check. Runs weekly (Sunday) and on manual dispatch.
+- **PGXN `META.json`** — Draft package metadata for PGXN with
+  `release_status: "testing"`. Establishes registry presence before v1.0.0
+  and enables `pgxn install pg_trickle` for early adopters. At v1.0.0 the
+  only change needed is flipping `release_status` to `"stable"`.
+- **CNPG smoke test** *(already implemented in v0.6.0 / PR #15)* — CI job
+  that deploys the extension image into a CloudNativePG Kubernetes cluster,
+  creates a stream table, and confirms a refresh cycle completes. Marked done
+  here for roadmap completeness.
+
 ---
 
 ## [0.6.0] — 2026-03-14

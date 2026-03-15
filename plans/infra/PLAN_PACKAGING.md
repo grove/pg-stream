@@ -1,8 +1,12 @@
 # PLAN_PACKAGING.md — Distribution Packaging
 
-> **Status:** Draft  
-> **Target version:** v1.0.0  
+> **Status:** INFRA-2 implemented (META.json with release_status: testing)
+> **Target version:** v1.0.0 (flip to stable + upload .deb/.rpm)
 > **Author:** pg_trickle project
+>
+> **Implemented in v0.7.0:** `META.json` at the project root with
+> `release_status: "testing"` and version `0.7.0`. At v1.0.0 update the
+> version and flip `release_status` to `"stable"`, then run `pgxn upload`.
 
 ---
 

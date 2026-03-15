@@ -1,0 +1,33 @@
+{
+  "name": "pg_trickle",
+  "abstract": "Streaming tables with incremental view maintenance for PostgreSQL 18",
+  "version": "0.7.0",
+  "maintainer": "pg_trickle contributors",
+  "license": "apache_2_0",
+  "provides": {
+    "pg_trickle": {
+      "abstract": "Streaming tables with differential view maintenance",
+      "file": "pg_trickle.control",
+      "docfile": "README.md",
+      "version": "0.7.0"
+    }
+  },
+  "prereqs": {
+    "runtime": {
+      "requires": { "PostgreSQL": "18.0.0" }
+    }
+  },
+  "resources": {
+    "homepage": "https://github.com/grove/pg-trickle",
+    "repository": {
+      "url": "https://github.com/grove/pg-trickle",
+      "web": "https://github.com/grove/pg-trickle",
+      "type": "git"
+    },
+    "bugtracker": {
+      "web": "https://github.com/grove/pg-trickle/issues"
+    }
+  },
+  "tags": ["ivm", "streaming", "materialized view", "cdc", "rust", "differential-dataflow"],
+  "release_status": "testing"
+}
