@@ -293,10 +293,10 @@ pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
             };
             return format!("{raw}{filter}");
         }
-        AggFunc::ComplexExpression(raw) => {
-            // Complex expression with nested aggregates: the stored raw SQL
-            // already contains the full expression (including aggregate calls).
-            // The rescan CTE evaluates it against source data directly.
+        AggFunc::ComplexExpression(raw) | AggFunc::UserDefined(raw) => {
+            // Complex expression / user-defined aggregate: the stored raw SQL
+            // already contains the full call. The rescan CTE evaluates it
+            // against source data directly.
             return raw.clone();
         }
         _ => {}
@@ -2522,6 +2522,71 @@ mod tests {
             agg_to_rescan_sql(&agg),
             "JSON_ARRAYAGG(x) FILTER (WHERE x > 0)"
         );
+    }
+
+    #[test]
+    fn test_uda_classified_as_group_rescan() {
+        let uda = AggFunc::UserDefined("my_custom_agg(x)".into());
+        assert!(uda.is_group_rescan());
+        assert_eq!(uda.sql_name(), "USER_DEFINED");
+    }
+
+    #[test]
+    fn test_uda_rescan_sql_rendering() {
+        let agg = AggExpr {
+            function: AggFunc::UserDefined("my_custom_agg(x)".into()),
+            argument: None,
+            alias: "custom".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        };
+        assert_eq!(agg_to_rescan_sql(&agg), "my_custom_agg(x)");
+    }
+
+    #[test]
+    fn test_uda_rescan_sql_schema_qualified() {
+        let agg = AggExpr {
+            function: AggFunc::UserDefined("myschema.my_agg(x, y)".into()),
+            argument: None,
+            alias: "result".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        };
+        assert_eq!(agg_to_rescan_sql(&agg), "myschema.my_agg(x, y)");
+    }
+
+    #[test]
+    fn test_uda_rescan_sql_with_filter_clause() {
+        // UDA with FILTER: the raw SQL is stored directly, FILTER handled
+        // by the UserDefined variant returning the raw SQL as-is.
+        let agg = AggExpr {
+            function: AggFunc::UserDefined("my_agg(x) FILTER (WHERE x > 0)".into()),
+            argument: None,
+            alias: "filtered".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        };
+        assert_eq!(agg_to_rescan_sql(&agg), "my_agg(x) FILTER (WHERE x > 0)");
+    }
+
+    #[test]
+    fn test_uda_rescan_sql_with_order_by() {
+        let agg = AggExpr {
+            function: AggFunc::UserDefined("my_agg(x ORDER BY y)".into()),
+            argument: None,
+            alias: "ordered".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        };
+        assert_eq!(agg_to_rescan_sql(&agg), "my_agg(x ORDER BY y)");
     }
 
     #[test]

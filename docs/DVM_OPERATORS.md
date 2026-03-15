@@ -290,6 +290,7 @@ Where:
 | `ANY_VALUE(expr)` | Group-rescan | PostgreSQL 16+; affected groups re-aggregated |
 | `JSON_ARRAYAGG(expr ...)` | Group-rescan | SQL-standard JSON aggregation (PostgreSQL 16+); full deparsed SQL preserved |
 | `JSON_OBJECTAGG(key: value ...)` | Group-rescan | SQL-standard JSON aggregation (PostgreSQL 16+); full deparsed SQL preserved |
+| User-defined aggregates (`CREATE AGGREGATE`) | Group-rescan | Any custom aggregate is supported via group-rescan; full aggregate call SQL preserved verbatim |
 
 **FILTER Clause:**
 

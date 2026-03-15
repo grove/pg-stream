@@ -122,16 +122,20 @@ impl Frontier {
 /// LSN format is `X/Y` where X and Y are hex numbers.
 /// We parse both parts and compare numerically.
 pub fn lsn_gt(a: &str, b: &str) -> bool {
-    let parse_lsn = |s: &str| -> u64 {
-        let parts: Vec<&str> = s.split('/').collect();
-        if parts.len() != 2 {
-            return 0;
-        }
-        let hi = u64::from_str_radix(parts[0], 16).unwrap_or(0);
-        let lo = u64::from_str_radix(parts[1], 16).unwrap_or(0);
-        (hi << 32) | lo
-    };
     parse_lsn(a) > parse_lsn(b)
+}
+
+/// Parse a PostgreSQL LSN string (`"X/Y"`) into a `u64`.
+#[inline]
+fn parse_lsn(s: &str) -> u64 {
+    match s.split_once('/') {
+        Some((hi_s, lo_s)) => {
+            let hi = u64::from_str_radix(hi_s, 16).unwrap_or(0);
+            let lo = u64::from_str_radix(lo_s, 16).unwrap_or(0);
+            (hi << 32) | lo
+        }
+        None => 0,
+    }
 }
 
 /// Compare two LSN strings. Returns true if `a >= b`.

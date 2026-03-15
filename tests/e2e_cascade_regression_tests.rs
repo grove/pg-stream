@@ -195,9 +195,10 @@ async fn test_st_on_st_cascade_propagates_insert() {
     db.execute("INSERT INTO orders (region, amount) VALUES ('East', 150)")
         .await;
 
-    // Refresh in topological order (upstream first)
-    db.refresh_st("order_summary").await;
-    db.refresh_st("order_report").await;
+    // Refresh in topological order (upstream first).
+    // Use retry variant: background scheduler may race for the advisory lock.
+    db.refresh_st_with_retry("order_summary").await;
+    db.refresh_st_with_retry("order_report").await;
 
     // Verify the change cascaded
     let post_east_amount: String = db
@@ -224,8 +225,8 @@ async fn test_st_on_st_cascade_propagates_delete() {
     // Delete the West order
     db.execute("DELETE FROM orders WHERE region = 'West'").await;
 
-    db.refresh_st("order_summary").await;
-    db.refresh_st("order_report").await;
+    db.refresh_st_with_retry("order_summary").await;
+    db.refresh_st_with_retry("order_report").await;
 
     // West had order_count=1; after delete it's 0, so the WHERE clause
     // in order_report (order_count > 0) will exclude it
@@ -631,7 +632,7 @@ async fn test_three_layer_cascade_insert_propagates() {
     // Use refresh_st_with_retry for cascade layers: the background scheduler
     // may detect upstream data_timestamp has advanced and start a concurrent
     // refresh before the test's explicit call.
-    db.refresh_st("category_totals").await;
+    db.refresh_st_with_retry("category_totals").await;
     db.refresh_st_with_retry("category_flags").await;
     db.refresh_st_with_retry("big_categories").await;
 
@@ -706,8 +707,8 @@ async fn test_three_layer_cascade_update_propagates() {
     db.execute("UPDATE products SET price = 250 WHERE category = 'Y' AND price = 50")
         .await;
 
-    db.refresh_st("prod_summary").await;
-    db.refresh_st("prod_labels").await;
+    db.refresh_st_with_retry("prod_summary").await;
+    db.refresh_st_with_retry("prod_labels").await;
     // Use refresh_st_with_retry: background scheduler may start a concurrent
     // refresh of premium_categories after prod_labels.data_timestamp advances.
     db.refresh_st_with_retry("premium_categories").await;

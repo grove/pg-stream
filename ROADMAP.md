@@ -1,14 +1,41 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-14
+> **Last updated:** 2026-03-15
 > **Latest release:** 0.6.0 (2026-03-14)
-> **Current milestone:** v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure
+> **Current milestone:** v0.7.0 — Watermarks, Circular DAG Execution & Last Differential Gaps
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
 MATERIALIZED VIEW` recomputation), how the differential dataflow approach
 solves it, the hybrid trigger→WAL CDC architecture, and the broad SQL
 coverage, all in plain language.
+
+## Table of Contents
+
+<!-- TOC start -->
+- [Overview](#overview)
+- [v0.1.x Series — Released](#v01x-series--released)
+- [v0.2.0 — TopK, Diamond Consistency & Transactional IVM](#v020--topk-diamond-consistency--transactional-ivm)
+- [v0.2.1 — Upgrade Infrastructure & Documentation](#v021--upgrade-infrastructure--documentation)
+- [v0.2.2 — OFFSET, AUTO Mode, ALTER QUERY, Edge Cases & CDC Hardening](#v022--offset-auto-mode-alter-query-edge-cases--cdc-hardening)
+- [v0.2.3 — Non-Determinism, CDC/Mode Gaps & Operational Polish](#v023--non-determinism-cdcmode-gaps--operational-polish)
+- [v0.3.0 — DVM Correctness, SAST & Test Coverage](#v030--dvm-correctness-sast--test-coverage)
+- [v0.4.0 — Parallel Refresh & Performance Hardening](#v040--parallel-refresh--performance-hardening)
+- [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
+- [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
+- [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
+- [v0.8.0 — Connection Pooler Compatibility](#v080--connection-pooler-compatibility)
+- [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
+- [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
+- [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
+- [v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compatibility](#v0120--multi-source-delta-batching-cdc-research--pg-backward-compatibility)
+- [v0.13.0 — Core Refresh Optimizations, Scalability Foundations & UNLOGGED Buffers](#v0130--core-refresh-optimizations-scalability-foundations--unlogged-buffers)
+- [v0.14.0 — Native DDL Syntax, External Test Suites & Integration](#v0140--native-ddl-syntax-external-test-suites--integration)
+- [v1.0.0 — Stable Release](#v100--stable-release)
+- [Post-1.0 — Scale & Ecosystem](#post-10--scale--ecosystem)
+- [Effort Summary](#effort-summary)
+- [References](#references)
+<!-- TOC end -->
 
 ---
 
@@ -1082,12 +1109,14 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 ---
 
-## v0.7.0 — Watermarks, Circular DAG Execution, Observability & Infrastructure
+## v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure
 
-**Goal:** Add user-injected temporal watermark gating for batch-ETL
-coordination, complete the fixpoint scheduler for circular stream table
-DAGs, ship ready-made Prometheus/Grafana monitoring, and prepare the
-1.0 packaging and deployment infrastructure.
+**Goal:** Land Part 9 performance improvements (parallel refresh
+scheduling, MERGE strategy optimization, advanced benchmarks), add
+user-injected temporal watermark gating for batch-ETL coordination,
+complete the fixpoint scheduler for circular stream table DAGs, ship
+ready-made Prometheus/Grafana monitoring, and prepare the 1.0 packaging
+and deployment infrastructure.
 
 ### Watermark Gating
 
@@ -1139,30 +1168,20 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 
 > **Circular dependencies subtotal: ~19 hours**
 
-### Prometheus & Grafana Observability
+### Last Differential Mode Gaps
 
-> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
-> their databases. This ships ready-to-use configuration files — no custom
-> code, no extension changes — that plug into the standard `postgres_exporter`
-> and light up a Grafana dashboard showing refresh latency, staleness, error
-> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
-> alerting rules so you get paged when a stream table goes stale or starts
-> error-looping. A Docker Compose file lets you try the full observability
-> stack with a single `docker compose up`.
-
-Zero-code monitoring integration. All config files live in a new
-`monitoring/` directory in the main repo (or a separate
-`pgtrickle-monitoring` repo). Queries use existing views
-(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
+> **In plain terms:** Three query patterns that previously fell back to `FULL`
+> refresh in `AUTO` mode — or hard-errored in explicit `DIFFERENTIAL` mode
+> — despite the DVM engine having the infrastructure to handle them.
+> All three gaps are now closed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
-| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+| ~~DG-1~~ | ~~**User-Defined Aggregates (UDAs).** PostGIS (`ST_Union`, `ST_Collect`), pgvector vector averages, and any `CREATE AGGREGATE` function are rejected. Fix: classify unknown aggregates as `AggFunc::UserDefined` and route them through the existing group-rescan strategy — no new delta math required.~~ | ✅ Done | [PLAN_LAST_DIFFERENTIAL_GAPS.md](plans/sql/PLAN_LAST_DIFFERENTIAL_GAPS.md) §G1 |
+| ~~DG-2~~ | ~~**Window functions nested in expressions.** `RANK() OVER (...) + 1`, `CASE WHEN ROW_NUMBER() OVER (...) <= 10`, `COALESCE(LAG(v) OVER (...), 0)` etc. are rejected.~~ | ✅ Done (v0.6.0) | [PLAN_LAST_DIFFERENTIAL_GAPS.md](plans/sql/PLAN_LAST_DIFFERENTIAL_GAPS.md) §G2 |
+| ~~DG-3~~ | ~~**Sublinks in deeply nested OR.** The two-stage rewrite pipeline handles flat `EXISTS(...) OR …` and `AND(EXISTS OR …)` but gives up on multiple OR+sublink conjuncts. Fix: expand all OR+sublink conjuncts in AND to a cartesian product of UNION branches with a 16-branch explosion guard.~~ | ✅ Done | [PLAN_LAST_DIFFERENTIAL_GAPS.md](plans/sql/PLAN_LAST_DIFFERENTIAL_GAPS.md) §G3 |
 
-> **Observability subtotal: ~12 hours**
+> **Last differential gaps: ✅ Complete**
 
 ### Pre-1.0 Infrastructure Prep
 
@@ -1182,22 +1201,56 @@ Zero-code monitoring integration. All config files live in a new
 
 > **Infrastructure prep subtotal: ~11 hours**
 
+### Performance — Regression Fixes & Benchmark Infrastructure (Part 9 S1–S2) ✅ Done
+
+> Fixes Criterion benchmark regressions identified in Part 9 and ships five
+> benchmark infrastructure improvements to support data-driven performance
+> decisions.
+
+| Item | Description | Status |
+|------|-------------|--------|
+| A-3 | Fix `prefixed_col_list/20` +34% regression — eliminate intermediate `Vec` allocation | ✅ Done |
+| A-4 | Fix `lsn_gt` +22% regression — use `split_once` instead of `split().collect()` | ✅ Done |
+| I-1c | `just bench-docker` target for running Criterion inside Docker builder image | ✅ Done |
+| I-2 | Per-cycle `[BENCH_CYCLE]` CSV output in E2E benchmarks for external analysis | ✅ Done |
+| I-3 | EXPLAIN ANALYZE capture mode (`PGS_BENCH_EXPLAIN=true`) for delta query plans | ✅ Done |
+| I-6 | 1M-row benchmark tier (`bench_*_1m_*` + `bench_large_matrix`) | ✅ Done |
+| I-8 | Criterion noise reduction (`sample_size(200)`, `measurement_time(10s)`) | ✅ Done |
+
+### Performance — Parallel Refresh, MERGE Optimization & Advanced Benchmarks (Part 9 S4–S6) ✅ Done
+
+> DAG level-parallel scheduling, improved MERGE strategy selection (xxh64
+> hashing, aggregate saturation bypass, cost-based threshold), and expanded
+> benchmark suite (JSON comparison, concurrent writers, window/lateral/CTE).
+
+| Item | Description | Status |
+|------|-------------|--------|
+| C-1 | DAG level extraction (`topological_levels()` on `StDag` and `ExecutionUnitDag`) | ✅ Done |
+| C-2 | Level-parallel dispatch (existing `parallel_dispatch_tick` infrastructure sufficient) | ✅ Done |
+| C-3 | Result communication (existing `SchedulerJob` + `pgt_refresh_history` sufficient) | ✅ Done |
+| D-1 | xxh64 hash-based change detection for wide tables (≥50 cols) | ✅ Done |
+| D-2 | Aggregate saturation FULL bypass (changes ≥ groups → FULL) | ✅ Done |
+| D-3 | Cost-based strategy selection from `pgt_refresh_history` data | ✅ Done |
+| I-4 | Cross-run comparison tool (`just bench-compare`, JSON output) | ✅ Done |
+| I-5 | Concurrent writer benchmarks (1/2/4/8 writers) | ✅ Done |
+| I-7 | Window / lateral / CTE / UNION ALL operator benchmarks | ✅ Done |
+
 > **v0.7.0 total: ~59–62h**
 
 **Exit criteria:**
+- [x] Part 9 performance: DAG levels, xxh64 hashing, aggregate saturation bypass, cost-based threshold, advanced benchmarks
 - [ ] `advance_watermark` + scheduler gating operational; ETL E2E tests pass
 - [ ] Monotone circular DAGs converge to fixpoint; non-convergence surfaces as `ERROR`
-- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
-- [ ] Docker Hub image draft workflow passes; PGXN `META.json` drafted
-- [ ] CNPG integration smoke test passes in CI
+- [x] UDAs, nested window expressions, and deeply nested OR+sublinks supported in DIFFERENTIAL mode
 - [ ] Extension upgrade path tested (`0.6.0 → 0.7.0`)
 
 ---
 
-## v0.8.0 — Connection Pooler Compatibility
+## v0.8.0 — Connection Pooler Compatibility & pg_dump Support
 
-**Goal:** Enable cloud-native PgBouncer transaction-mode deployments. Requires
-`shared_preload_libraries`.
+**Goal:** Enable cloud-native PgBouncer transaction-mode deployments and
+complete the pg_dump round-trip story so stream tables survive
+`pg_dump`/`pg_restore` cycles.
 
 ### Connection Pooler Compatibility
 
@@ -1222,33 +1275,66 @@ session-scoped state with transaction-scoped equivalents.
 
 > **PgBouncer compatibility subtotal: ~7–10 days**
 
-> **v0.8.0 total: ~56–80 hours**
+### pg_dump / pg_restore Support
+
+> **In plain terms:** `pg_dump` is the standard PostgreSQL backup tool.
+> Without this, a dump of a database containing stream tables may not
+> capture them correctly — and restoring from that dump would require
+> manually recreating them by hand. This teaches `pg_dump` to emit valid
+> SQL for every stream table, and adds logic to automatically re-link
+> orphaned catalog entries when restoring an extension from a backup.
+
+Complete the native DDL story: teach pg_dump to emit `CREATE MATERIALIZED VIEW
+… WITH (pgtrickle.stream = true)` for stream tables and add an event trigger
+that re-links orphaned catalog entries on extension restore.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| NAT-DUMP | `generate_dump()` + `restore_stream_tables()` companion functions; event trigger on extension load for orphaned catalog entries | 3–4d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
+| NAT-TEST | E2E tests: pg_dump round-trip, restore from backup, orphaned-entry recovery | 2–3d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
+
+> **pg_dump support subtotal: ~5–7 days**
+
+> **v0.8.0 total: ~12–17 days**
 
 **Exit criteria:**
 - [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
+- [ ] pg_dump round-trip produces valid, restorable SQL for stream tables
 - [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
 
 ---
 
-## v0.9.0 — Observability, Anomaly Detection & pg_dump Support
+## v0.9.0 — Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
 
-**Goal:** Prometheus/Grafana observability, protect against anomalous change
-spikes with a configurable fuse, and complete the pg_dump round-trip story.
-After this milestone the product is externally visible and monitored.
+**Goal:** Ship ready-made Prometheus/Grafana monitoring so the product is
+externally visible and monitored; protect against anomalous change spikes
+with a configurable fuse; and complete the pre-1.0 packaging and
+deployment infrastructure.
 
-### Observability
+### Prometheus & Grafana Observability
 
-> **In plain terms:** Adds ready-made dashboards and metrics exports so you
-> can see pg_trickle's health in existing monitoring systems without
-> building them yourself. The Grafana dashboard gives you a live graph of
-> refresh latency, how "stale" each stream table is, and how far behind CDC
-> is — the same kind of operational visibility you'd expect from any
-> production component.
+> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
+> their databases. This ships ready-to-use configuration files — no custom
+> code, no extension changes — that plug into the standard `postgres_exporter`
+> and light up a Grafana dashboard showing refresh latency, staleness, error
+> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
+> alerting rules so you get paged when a stream table goes stale or starts
+> error-looping. A Docker Compose file lets you try the full observability
+> stack with a single `docker compose up`.
+
+Zero-code monitoring integration. All config files live in a new
+`monitoring/` directory in the main repo (or a separate
+`pgtrickle-monitoring` repo). Queries use existing views
+(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| M1 | Prometheus exporter configuration guide | 4–6h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §1 |
-| M2 | Grafana dashboard (refresh latency, staleness, CDC lag) | 4–6h | [PLAN_ECO_SYSTEM.md §1](plans/ecosystem/PLAN_ECO_SYSTEM.md) |
+| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+
+> **Observability subtotal: ~12 hours**
 
 ### Anomalous Change Detection (Fuse)
 
@@ -1279,32 +1365,31 @@ action.
 
 > **Anomalous change detection subtotal: ~10–14 hours**
 
-### pg_dump / pg_restore Support
+### Pre-1.0 Infrastructure Prep
 
-> **In plain terms:** `pg_dump` is the standard PostgreSQL backup tool.
-> Without this, a dump of a database containing stream tables may not
-> capture them correctly — and restoring from that dump would require
-> manually recreating them by hand. This teaches `pg_dump` to emit valid
-> SQL for every stream table, and adds logic to automatically re-link
-> orphaned catalog entries when restoring an extension from a backup.
-
-Complete the native DDL story: teach pg_dump to emit `CREATE MATERIALIZED VIEW
-… WITH (pgtrickle.stream = true)` for stream tables and add an event trigger
-that re-links orphaned catalog entries on extension restore.
+> **In plain terms:** Three preparatory tasks that make the eventual 1.0
+> release smoother. A draft Docker Hub image workflow (tests the build but
+> doesn't publish yet); a PGXN metadata file so the extension can eventually
+> be installed with `pgxn install pg_trickle`; and a basic CNPG integration
+> test that verifies the extension image loads correctly in a CloudNativePG
+> cluster. None of these ship user-facing features — they're CI and
+> packaging scaffolding.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| NAT-DUMP | `generate_dump()` + `restore_stream_tables()` companion functions; event trigger on extension load for orphaned catalog entries | 3–4d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
-| NAT-TEST | E2E tests: pg_dump round-trip, restore from backup, orphaned-entry recovery | 2–3d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
+| INFRA-1 | **Prove the Docker image builds.** Set up a CI workflow that builds the official Docker Hub image (PostgreSQL 18 + pg_trickle pre-installed), runs a smoke test (create extension, create a stream table, refresh it), but doesn't publish anywhere yet. When 1.0 arrives, publishing is just flipping a switch. | 5h | [PLAN_DOCKER_IMAGE.md](plans/infra/PLAN_DOCKER_IMAGE.md) |
+| INFRA-2 | **Prepare for `pgxn install pg_trickle`.** PGXN is PostgreSQL's official extension registry. Drafting the `META.json` metadata file now means publishing to PGXN at 1.0 is a single command — no scrambling to figure out the required fields and version constraints at release time. | 2h | [PLAN_PACKAGING.md](plans/infra/PLAN_PACKAGING.md) |
+| INFRA-3 | **Verify Kubernetes deployment works.** A CI smoke test that deploys the pg_trickle extension image into a CloudNativePG (CNPG) Kubernetes cluster, creates a stream table, and confirms a refresh cycle completes. Catches packaging and compatibility issues before they reach Kubernetes users. | 4h | [PLAN_CLOUDNATIVEPG.md](plans/ecosystem/PLAN_CLOUDNATIVEPG.md) |
 
-> **pg_dump support subtotal: ~5–7 days**
+> **Infrastructure prep subtotal: ~11 hours**
 
-> **v0.9.0 total: ~58–82 hours**
+> **v0.9.0 total: ~33–37 hours**
 
 **Exit criteria:**
-- [ ] Grafana dashboard published
+- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
 - [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers
-- [ ] pg_dump round-trip produces valid, restorable SQL for stream tables
+- [ ] Docker Hub image draft workflow passes; PGXN `META.json` drafted
+- [ ] CNPG integration smoke test passes in CI
 - [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.8.0 → 0.9.0`)
 - [ ] All public documentation current and reviewed
 
@@ -1789,10 +1874,10 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.3.0 — DVM Correctness, SAST & Test Coverage | ~20–30h | 185–252h | ✅ Released |
 | v0.4.0 — Parallel Refresh & Performance Hardening | ~60–94h | 245–346h | ✅ Released |
 | v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | ✅ Released |
-| v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | |
-| v0.7.0 — Watermarks & Circular DAG Execution | ~36–39h | 367–532h | |
-| v0.8.0 — Connection Pooler Compatibility | ~56–80h | 423–612h | |
-| v0.9.0 — Observability, Anomaly Detection & pg_dump Support | ~58–82h | 481–694h | |
+| v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | ✅ Released |
+| v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
+| v0.8.0 — Connection Pooler Compatibility | ~12–17d | — | |
+| v0.9.0 — Observability, Anomaly Detection & pg_dump Support | ~33–37h | — | |
 | v0.10.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
 | v0.11.0 — Partitioned Stream Tables & Operational Scale (A-1, C-2, C-3) | ~9–13 wk | — | |
 | v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compat | ~13–19 wk | — | |

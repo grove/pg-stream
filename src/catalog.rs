@@ -393,11 +393,16 @@ impl StreamTableMeta {
     /// to detect when a full refresh is needed) do not see a spurious "upstream
     /// changed" signal after a pure no-data verification pass.
     pub fn update_after_no_data_refresh(pgt_id: i64) -> Result<(), PgTrickleError> {
+        // NOTE: intentionally does NOT clear needs_reinit.  A no-data refresh
+        // means no rows were written — it must not overwrite a needs_reinit=true
+        // flag set by EC-16 function-body-change detection or DDL hooks.  The
+        // flag is cleared only by update_after_refresh / store_frontier_and_complete_refresh
+        // after an actual full reinitialization succeeds.
         Spi::run_with_args(
             "UPDATE pgtrickle.pgt_stream_tables \
              SET is_populated = true, \
              last_refresh_at = now(), consecutive_errors = 0, \
-             status = 'ACTIVE', needs_reinit = false, updated_at = now() \
+             status = 'ACTIVE', updated_at = now() \
              WHERE pgt_id = $1",
             &[pgt_id.into()],
         )

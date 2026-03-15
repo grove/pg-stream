@@ -25,6 +25,8 @@ fn bench_quote_ident(c: &mut Criterion) {
     ];
 
     let mut group = c.benchmark_group("quote_ident");
+    group.sample_size(200);
+    group.measurement_time(Duration::from_secs(10));
     for name in &names {
         group.bench_with_input(BenchmarkId::from_parameter(name), name, |b, name| {
             b.iter(|| quote_ident(black_box(name)));
@@ -37,6 +39,8 @@ fn bench_quote_ident(c: &mut Criterion) {
 
 fn bench_col_list(c: &mut Criterion) {
     let mut group = c.benchmark_group("col_list");
+    group.sample_size(200);
+    group.measurement_time(Duration::from_secs(10));
     for size in [1, 5, 10, 20, 50] {
         let cols: Vec<String> = (0..size).map(|i| format!("column_{i}")).collect();
         group.bench_with_input(BenchmarkId::from_parameter(size), &cols, |b, cols| {
@@ -50,6 +54,8 @@ fn bench_col_list(c: &mut Criterion) {
 
 fn bench_prefixed_col_list(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefixed_col_list");
+    group.sample_size(200);
+    group.measurement_time(Duration::from_secs(10));
     for size in [1, 5, 10, 20] {
         let cols: Vec<String> = (0..size).map(|i| format!("col_{i}")).collect();
         group.bench_with_input(BenchmarkId::from_parameter(size), &cols, |b, cols| {
@@ -228,6 +234,8 @@ fn bench_lsn_comparison(c: &mut Criterion) {
     ];
 
     let mut group = c.benchmark_group("lsn_gt");
+    group.sample_size(200);
+    group.measurement_time(Duration::from_secs(10));
     for (a, b) in &pairs {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{a}_vs_{b}")),

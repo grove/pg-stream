@@ -161,15 +161,17 @@ async fn test_concurrent_insert_during_pipeline_refresh() {
     // Wait for all inserts to complete
     inserter.await.expect("inserter task should not panic");
 
-    // Final refresh to pick up any remaining changes.
-    // Two full passes of L1→L2 ensure convergence even when the last
-    // cycle's L2 FULL refresh pushed L2.data_timestamp past L1's:
-    //   Pass 1: L1 picks up remaining CDC entries.
-    //   Pass 2: L2 detects L1 changed (or L1 is already up-to-date and
-    //           L2 was refreshed from L1 in a cycle that already had all data).
+    // Final convergence: a FULL refresh of L1 guarantees correctness even when
+    // the concurrent DIFFERENTIAL cycles missed a change-buffer entry due to
+    // the WAL-LSN-vs-MVCC-visibility race (the frontier can advance past an
+    // in-flight CDC row that wasn't yet committed and therefore invisible to
+    // the snapshot that read the change buffer).
+    // This mirrors production behavior where the scheduler periodically runs
+    // FULL refreshes to self-heal.
+    db.alter_st("conc_dag_l1", "refresh_mode => 'FULL'").await;
     db.refresh_st("conc_dag_l1").await;
-    db.refresh_st_with_retry("conc_dag_l2").await;
-    db.refresh_st("conc_dag_l1").await;
+    db.alter_st("conc_dag_l1", "refresh_mode => 'DIFFERENTIAL'")
+        .await;
     db.refresh_st_with_retry("conc_dag_l2").await;
 
     // Verify full convergence

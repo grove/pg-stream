@@ -315,8 +315,9 @@ async fn test_multi_cycle_group_elimination_revival() {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// EC-16: Replacing a function used in a stream table's defining query
-/// triggers `needs_reinit = true` on the next differential refresh, so the
-/// scheduler will force a full reinitialization with the new function logic.
+/// is detected by the DDL event trigger which marks `needs_reinit = true`.
+/// The next manual refresh automatically performs a FULL reinitialization
+/// and produces correct results using the new function logic.
 #[tokio::test]
 async fn test_ec16_function_body_change_marks_reinit() {
     let db = E2eDb::new().await.with_extension().await;
@@ -366,30 +367,54 @@ async fn test_ec16_function_body_change_marks_reinit() {
         "needs_reinit should be false before function change"
     );
 
-    // Replace the function: now triples instead of doubling
+    // Replace the function: now triples instead of doubling.
+    // The DDL event trigger fires and sets needs_reinit = true.
     db.execute(
         "CREATE OR REPLACE FUNCTION ec16_calc(v INT) RETURNS INT LANGUAGE SQL IMMUTABLE AS $$ SELECT v * 3 $$",
     )
     .await;
 
-    // Insert data + refresh — should detect function hash change
-    db.execute("INSERT INTO ec16_src VALUES (4, 1)").await;
-    db.refresh_st("ec16_fn_st").await;
-
-    // The refresh should have set needs_reinit = true
-    let reinit_after: bool = db
+    // DDL hook should have set needs_reinit = true
+    let reinit_after_ddl: bool = db
         .query_scalar(
             "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'ec16_fn_st'",
         )
         .await;
     assert!(
-        reinit_after,
-        "needs_reinit should be true after function body change (EC-16)"
+        reinit_after_ddl,
+        "needs_reinit should be true after CREATE OR REPLACE FUNCTION (DDL hook)"
+    );
+
+    // Insert data + refresh — should automatically perform a FULL reinit
+    // because needs_reinit is set, then clear the flag.
+    db.execute("INSERT INTO ec16_src VALUES (4, 1)").await;
+    db.refresh_st("ec16_fn_st").await;
+
+    // After full reinit with new function (v*3):
+    // id=1: 10*3=30, id=2: 20*3=60, id=3: 5*3=15, id=4: 1*3=3
+    let sum3: i64 = db
+        .query_scalar("SELECT SUM(computed) FROM public.ec16_fn_st")
+        .await;
+    assert_eq!(
+        sum3, 108,
+        "After reinit with new function: 30+60+15+3 = 108"
+    );
+
+    // needs_reinit should be cleared after the successful FULL reinit
+    let reinit_after_refresh: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'ec16_fn_st'",
+        )
+        .await;
+    assert!(
+        !reinit_after_refresh,
+        "needs_reinit should be false after successful FULL reinitialization"
     );
 }
 
-/// EC-16: After function change detection marks needs_reinit, a subsequent
-/// full refresh produces correct results using the new function logic.
+/// EC-16: After function change, a refresh automatically performs a FULL
+/// reinitialization and produces correct results using the new function logic.
+/// Verifies the complete recovery flow including data correctness.
 #[tokio::test]
 async fn test_ec16_function_change_full_refresh_recovery() {
     let db = E2eDb::new().await.with_extension().await;
@@ -423,38 +448,51 @@ async fn test_ec16_function_change_full_refresh_recovery() {
     db.execute("INSERT INTO ec16r_src VALUES (3, 20)").await;
     db.refresh_st("ec16r_fn_st").await;
 
-    // Replace function: now adds 200 instead of 100
+    // Replace function: now adds 200 instead of 100.
+    // The DDL event trigger sets needs_reinit = true.
     db.execute(
         "CREATE OR REPLACE FUNCTION ec16r_calc(v INT) RETURNS INT LANGUAGE SQL IMMUTABLE AS $$ SELECT v + 200 $$",
     )
     .await;
 
-    // Trigger differential refresh — detects hash change, marks needs_reinit
+    // Insert more data
     db.execute("INSERT INTO ec16r_src VALUES (4, 1)").await;
+
+    // The next refresh detects needs_reinit and performs a FULL reinit
+    // automatically, using the new function logic.
     db.refresh_st("ec16r_fn_st").await;
 
-    let reinit: bool = db
-        .query_scalar(
-            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'ec16r_fn_st'",
-        )
-        .await;
-    assert!(reinit, "needs_reinit should be true after function change");
-
-    // Simulate what the scheduler would do: alter to FULL mode + refresh
-    // (In production, the scheduler calls execute_full_refresh which clears
-    // needs_reinit. For testing, we do a manual full_refresh_stream_table.)
-    db.execute("SELECT pgtrickle.alter_stream_table('ec16r_fn_st', refresh_mode => 'FULL')")
-        .await;
-    db.refresh_st("ec16r_fn_st").await;
-
-    // After full refresh with new function (v+200):
+    // After full reinit with new function (v+200):
     // id=1: 5+200=205, id=2: 10+200=210, id=3: 20+200=220, id=4: 1+200=201
     let sum_after: i64 = db
         .query_scalar("SELECT SUM(computed) FROM public.ec16r_fn_st")
         .await;
     assert_eq!(
         sum_after, 836,
-        "After full refresh with new function: 205+210+220+201 = 836"
+        "After full reinit with new function: 205+210+220+201 = 836"
+    );
+
+    // needs_reinit should be cleared after the successful reinit
+    let reinit: bool = db
+        .query_scalar(
+            "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'ec16r_fn_st'",
+        )
+        .await;
+    assert!(
+        !reinit,
+        "needs_reinit should be cleared after successful FULL reinitialization"
+    );
+
+    // The stream table should still be in DIFFERENTIAL mode (the reinit
+    // was transparent — it doesn't change the configured refresh mode)
+    let mode: String = db
+        .query_scalar(
+            "SELECT refresh_mode FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'ec16r_fn_st'",
+        )
+        .await;
+    assert_eq!(
+        mode, "DIFFERENTIAL",
+        "Refresh mode should remain DIFFERENTIAL after automatic reinit"
     );
 }
 

@@ -221,12 +221,12 @@ check-upgrade-all:
 
 # Build the upgrade Docker image for testing FROM→TO migrations
 [group: "upgrade"]
-build-upgrade-image from="0.5.0" to="0.6.0": build-e2e-image
+build-upgrade-image from="0.6.0" to="0.7.0": build-e2e-image
     ./tests/build_e2e_upgrade_image.sh {{from}} {{to}}
 
 # Run upgrade E2E tests (builds base + upgrade Docker images first)
 [group: "upgrade"]
-test-upgrade from="0.5.0" to="0.6.0": (build-upgrade-image from to)
+test-upgrade from="0.6.0" to="0.7.0": (build-upgrade-image from to)
     PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
         ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture
@@ -314,6 +314,25 @@ bench-diff:
 [group: "bench"]
 bench-bencher:
     ./scripts/run_benchmarks.sh -- --output-format bencher
+
+# Run Criterion benchmarks inside the E2E Docker builder (for environments
+# where local pg_stub linking fails, e.g. missing PG server symbols)
+[group: "bench"]
+bench-docker: build-e2e-image
+    #!/usr/bin/env bash
+    set -euo pipefail
+    IMAGE="${BUILDER_IMAGE:-pg_trickle_builder:pg18}"
+    echo "Running Criterion benchmarks inside Docker ($IMAGE)..."
+    docker run --rm -t \
+        -v "$(pwd)":/workspace \
+        -w /workspace \
+        "$IMAGE" \
+        bash -c 'cargo bench --features pg18 2>&1'
+
+# Compare two benchmark JSON result files (I-4)
+[group: "bench"]
+bench-compare baseline candidate:
+    ./scripts/bench_compare.sh {{baseline}} {{candidate}}
 
 # ── Coverage ──────────────────────────────────────────────────────────────
 

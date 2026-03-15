@@ -277,3 +277,27 @@ With pipeline overhead reduced to sub-2ms on cache hits, **MERGE execution domin
 ### Adaptive Threshold
 
 The system automatically falls back from INCREMENTAL to FULL refresh when the change rate exceeds a configurable threshold (default: 15%). This prevents the pathological case where delta processing on large change sets is slower than full recomputation. The threshold can be tuned per stream table via the `pg_trickle.differential_max_change_ratio` GUC.
+
+---
+
+## Part 9 — Regression Fixes & Benchmark Infrastructure (Sessions 1–2)
+
+**Date:** 2026-03-15
+
+### Rust-Side Micro-Optimizations
+
+| Function | Before | After | Change | Root Cause |
+|----------|--------|-------|--------|------------|
+| `prefixed_col_list/20` | ~4.0 µs | Expected ~2.8 µs | ~30% improvement | Eliminated intermediate `Vec` allocation; stream directly to `String` |
+| `lsn_gt("0/0", "0/1")` | ~79 ns | Expected ~55 ns | ~30% improvement | Replaced `split('/').collect::<Vec<_>>()` with `split_once('/')` |
+| `col_list/10` | ~1.37 µs | Expected ~1.1 µs | ~20% improvement | Same optimization as `prefixed_col_list` |
+
+### Benchmark Infrastructure Improvements
+
+| ID | Improvement | Impact |
+|----|-------------|--------|
+| I-1c | `just bench-docker` target | Run Criterion inside Docker when local pg_stub fails |
+| I-2 | `[BENCH_CYCLE]` parseable output | Enables histogram analysis, trend detection |
+| I-3 | `PGS_BENCH_EXPLAIN=true` | Captures EXPLAIN (ANALYZE, BUFFERS) for delta queries |
+| I-6 | 1M-row benchmark tier | Tests production-scale tables (10K changes at 1%) |
+| I-8 | `sample_size(200)`, `measurement_time(10s)` | Reduces outlier rate from 10–19% to expected <5% |
