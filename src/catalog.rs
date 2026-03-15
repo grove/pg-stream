@@ -1554,54 +1554,75 @@ pub fn advance_watermark(
     watermark: TimestampWithTimeZone,
     advanced_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
-    // Check monotonicity: reject backward movement.
-    let current: Option<TimestampWithTimeZone> = Spi::get_one_with_args(
-        "SELECT watermark FROM pgtrickle.pgt_watermarks WHERE source_relid = $1",
-        &[source_relid.into()],
-    )
-    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    Spi::connect_mut(|client| {
+        // Check monotonicity: reject backward movement.
+        // Use client.select + into_iter().next() to safely handle zero rows.
+        let table = client
+            .select(
+                "SELECT watermark FROM pgtrickle.pgt_watermarks WHERE source_relid = $1",
+                None,
+                &[source_relid.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-    if let Some(current_wm) = current {
-        // Compare via SQL to use PostgreSQL's TIMESTAMPTZ comparison.
-        let is_backward: bool = Spi::get_one_with_args(
-            "SELECT $1::timestamptz < $2::timestamptz",
-            &[watermark.into(), current_wm.into()],
-        )
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-        .unwrap_or(false);
+        let current: Option<TimestampWithTimeZone> = if let Some(row) = table.into_iter().next() {
+            row.get::<TimestampWithTimeZone>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        } else {
+            None
+        };
 
-        if is_backward {
-            return Err(PgTrickleError::WatermarkBackwardMovement(format!(
-                "new watermark is older than current for source OID {}",
-                source_relid.to_u32()
-            )));
+        if let Some(current_wm) = current {
+            // Compare via SQL to use PostgreSQL's TIMESTAMPTZ comparison.
+            let cmp_table = client
+                .select(
+                    "SELECT $1::timestamptz < $2::timestamptz AS is_backward, \
+                            $1::timestamptz = $2::timestamptz AS is_equal",
+                    None,
+                    &[watermark.into(), current_wm.into()],
+                )
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+            if let Some(cmp_row) = cmp_table.into_iter().next() {
+                let is_backward = cmp_row
+                    .get::<bool>(1)
+                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                    .unwrap_or(false);
+
+                if is_backward {
+                    return Err(PgTrickleError::WatermarkBackwardMovement(format!(
+                        "new watermark is older than current for source OID {}",
+                        source_relid.to_u32()
+                    )));
+                }
+
+                let is_equal = cmp_row
+                    .get::<bool>(2)
+                    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                    .unwrap_or(false);
+
+                if is_equal {
+                    return Ok(());
+                }
+            }
         }
 
-        // Same value is a no-op (idempotent).
-        let is_equal: bool = Spi::get_one_with_args(
-            "SELECT $1::timestamptz = $2::timestamptz",
-            &[watermark.into(), current_wm.into()],
-        )
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-        .unwrap_or(false);
-
-        if is_equal {
-            return Ok(());
-        }
-    }
-
-    Spi::run_with_args(
-        "INSERT INTO pgtrickle.pgt_watermarks \
-             (source_relid, watermark, updated_at, advanced_by, wal_lsn_at_advance) \
-         VALUES ($1, $2, now(), $3, pg_current_wal_insert_lsn()::text) \
-         ON CONFLICT (source_relid) DO UPDATE SET \
-             watermark = EXCLUDED.watermark, \
-             updated_at = EXCLUDED.updated_at, \
-             advanced_by = EXCLUDED.advanced_by, \
-             wal_lsn_at_advance = EXCLUDED.wal_lsn_at_advance",
-        &[source_relid.into(), watermark.into(), advanced_by.into()],
-    )
-    .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+        client
+            .update(
+                "INSERT INTO pgtrickle.pgt_watermarks \
+                     (source_relid, watermark, updated_at, advanced_by, wal_lsn_at_advance) \
+                 VALUES ($1, $2, now(), $3, pg_current_wal_insert_lsn()::text) \
+                 ON CONFLICT (source_relid) DO UPDATE SET \
+                     watermark = EXCLUDED.watermark, \
+                     updated_at = EXCLUDED.updated_at, \
+                     advanced_by = EXCLUDED.advanced_by, \
+                     wal_lsn_at_advance = EXCLUDED.wal_lsn_at_advance",
+                None,
+                &[source_relid.into(), watermark.into(), advanced_by.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok(())
+    })
 }
 
 /// Get all current watermark states.
