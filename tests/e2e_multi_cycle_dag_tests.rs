@@ -174,9 +174,9 @@ async fn setup_diamond_pipeline(db: &E2eDb) {
 
 /// Refresh the diamond pipeline in topological order.
 async fn refresh_diamond(db: &E2eDb) {
-    db.refresh_st("dm_l1a").await;
-    db.refresh_st("dm_l1b").await;
-    db.refresh_st("dm_l2").await;
+    db.refresh_st_with_retry("dm_l1a").await;
+    db.refresh_st_with_retry("dm_l1b").await;
+    db.refresh_st_with_retry("dm_l2").await;
 }
 
 /// Ground-truth query for the diamond apex.
