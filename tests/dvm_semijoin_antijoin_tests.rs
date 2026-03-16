@@ -1,5 +1,3 @@
-
-
 //! Execution-backed tests for semi-join and anti-join DVM SQL.
 //!
 //! These tests exercise the generated delta SQL directly against a live
