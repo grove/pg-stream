@@ -156,6 +156,18 @@ Completed a full hardening pass of the unit test suite, bringing all Priority 0/
 - **DAG fix** — `topological_order()` no longer silently skips nodes trapped in
   cycles; it now returns an error variant, detected and fixed by
   property-based fuzz tests.
+- **Targeted P3 coverage (17 new tests)** — Completed all remaining
+  untested-file items:
+  - `src/dvm/row_id.rs`: cross-variant inequality, `Debug` for unit variants
+    (`CombineChildren`, `PassThrough`), empty-column edge cases, `Clone`
+    equality for data-carrying variants.
+  - `src/shmem.rs`: worker-token acquire/release cycle, over-release
+    saturation (counter never goes below zero), epoch monotonicity, and
+    single-budget mutex semantics.
+  - `src/config.rs`: `as_str()` round-trips for all three mode enums
+    (`UserTriggersMode`, `CdcTriggerMode`, `ParallelRefreshMode`), negative
+    megabyte threshold, case-insensitive `\"ON\"` parsing, and
+    normalize ↔ `as_str` consistency.
 
 #### Internal Code Quality: Safer Low-Level Code
 

@@ -44,13 +44,18 @@ The initial hardening slice from this report has been started and validated on b
   - `src/dvm/mod.rs`: `prop_split_top_level_union_all_no_panic`, `prop_split_top_level_set_op_no_panic`. These tests **discovered and fixed real char-boundary panic bugs** in `split_top_level_union_all`, `split_top_level_set_op`, and `replace_top_level_union_with_union_all` — all three functions used `query[i..i+N].eq_ignore_ascii_case("KEYWORD")` which panics when `i+N` lands on a non–char-boundary inside a multi-byte UTF-8 sequence. Fixed by replacing all such slices with the byte-level `bytes[i..i+N].eq_ignore_ascii_case(b"KEYWORD")`.
   - `src/wal_decoder.rs`: `prop_parse_pgoutput_action_no_panic` (also validates result ∈ {None, Some('I'/'U'/'D'/'T')}), `prop_parse_pgoutput_columns_no_panic`, `prop_parse_pgoutput_old_columns_no_panic`, `prop_build_pk_hash_empty_pk_returns_zero`, `prop_build_pk_hash_no_panic`, `prop_detect_schema_mismatch_empty_parsed_is_false`, `prop_detect_schema_mismatch_no_panic`.
 
-This closes the previously identified zero-coverage gap for `row_id.rs`, `shmem.rs`, `config.rs`, and `lib.rs`, extends the execution-backed hardening track across all four initially identified thin operators, broadens aggregate execution coverage across algebraic, extremum, object-aggregate, and ordered-set families, adds the first backend-backed parser summary tests, adds inner-join, left-join, full-outer-join, three-table nested-join, nested-left-join, nested-full-join, and natural-join-style execution-backed coverage, and completes the P2 property/fuzz tier (16 proptest cases across `api.rs`, `dvm/mod.rs`, `wal_decoder.rs` — additionally discovering and fixing latent char-boundary panic bugs in the set-op splitter functions). The macOS-compatible DVM test harness is now complete (`scripts/run_dvm_integration_tests.sh`, `just test-dvm`). All P0, P1, and P2 tasks are complete.
+- Added P3 targeted coverage with 17 new unit tests completing all three remaining untested-file items:
+  - `src/dvm/row_id.rs` (+5): cross-variant inequality (`PrimaryKey ≠ AllColumns ≠ GroupByKey`, `CombineChildren ≠ PassThrough`), `Debug` output for unit variants, empty-column edge cases for all three data-carrying variants, `Clone` equality for `PrimaryKey` and `AllColumns`.
+  - `src/shmem.rs` (+4): acquire/release cycle (increment then decrement round-trip), over-release saturation (extra decrements stay at zero), epoch monotonicity over 10 bumps, single-budget mutex semaphore (budget=1 serialises access).
+  - `src/config.rs` (+8): `as_str()` round-trips for `UserTriggersMode`, `CdcTriggerMode`, and all three `ParallelRefreshMode` variants; negative-input to `threshold_mb_to_bytes`; case-insensitive `"ON"` → `ParallelRefreshMode::On`; `normalize` ↔ `as_str` round-trip consistency for both trigger-mode enums.
+
+This closes the previously identified zero-coverage gap for `row_id.rs`, `shmem.rs`, `config.rs`, and `lib.rs`, extends the execution-backed hardening track across all four initially identified thin operators, broadens aggregate execution coverage across algebraic, extremum, object-aggregate, and ordered-set families, adds the first backend-backed parser summary tests, adds inner-join, left-join, full-outer-join, three-table nested-join, nested-left-join, nested-full-join, and natural-join-style execution-backed coverage, completes the P2 property/fuzz tier (16 proptest cases across `api.rs`, `dvm/mod.rs`, `wal_decoder.rs` — additionally discovering and fixing latent char-boundary panic bugs in the set-op splitter functions), and completes the P3 targeted coverage tier (17 additional tests across `dvm/row_id.rs`, `shmem.rs`, `config.rs`). The macOS-compatible DVM test harness is now complete (`scripts/run_dvm_integration_tests.sh`, `just test-dvm`). **All P0, P1, P2, and P3 tasks are complete.**
 
 ## Remaining Work Summary
 
 Still not started:
 
-- (none — all P0, P1, and P2 tasks complete; macOS DVM harness delivered)
+- (none — all P0, P1, P2, and P3 tasks complete; macOS DVM harness delivered)
 
 Substantially Completed (Follow-up only):
 
@@ -273,10 +278,10 @@ The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `
 
 ### Priority 3: Cover currently untested files
 
-1. `src/dvm/row_id.rs`: test each enum variant and any strategy-selection helper added around it.
-2. `src/shmem.rs`: extract pure compare-and-swap logic behind a trait or helper and test token-acquire/release/reconcile invariants. Completed for the pure helper layer; shared-memory runtime integration still needs higher-tier coverage.
-3. `src/config.rs`: add table-driven tests around string-to-mode parsing and default values if exposed by helper functions. Started with direct normalization/threshold helper tests.
-4. `src/lib.rs`: extract preload decision logic into a pure helper so `_PG_init()` behavior can be unit tested. Completed.
+1. `src/dvm/row_id.rs`: **DONE.** Added cross-variant inequality, `Debug` for unit variants, empty-column edge cases, `Clone` equality for data-carrying variants.
+2. `src/shmem.rs`: **DONE for pure helpers.** Added acquire/release cycle, over-release saturation, epoch monotonicity, single-budget mutex semantics. Shared-memory runtime integration still needs higher-tier (integration/E2E) coverage.
+3. `src/config.rs`: **DONE.** Added `as_str()` roundtrips for all three mode enums, negative-input threshold, case-insensitive normalize edge cases, normalize↔as_str consistency.
+4. `src/lib.rs`: **DONE** (completed in earlier session).
 
 ## Recommended Hardening Backlog By File
 
@@ -292,10 +297,10 @@ The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `
 | P0 | `src/dvm/operators/join.rs` | Linux/CI-only execution-backed tests in `tests/dvm_join_tests.rs` now cover left-insert, left-delete (R₀ path), right-delete fan-out, right-insert no-match, simultaneous left-and-right, EC-01 regression (concurrent left+right DELETE), three-table nested chain insert (innermost delta flows through to outer Part 1a), and three-table nested chain delete (outermost delta triggers outer Part 2 via inner join L₀ snapshot). Remaining work: natural join execution. (COMPLETED) (COMPLETED) |
 | P1 (Done) | `src/dvm/operators/outer_join.rs` | Linux/CI-only result-level tests in `tests/dvm_outer_join_tests.rs` cover all Part 1–5 paths and EC-01. Nested left join tests in `tests/dvm_nested_left_join_tests.rs` (3-table chain, Parts 1a/3a/2+5). Natural left join in `tests/dvm_natural_join_tests.rs`. (COMPLETED) |
 | P1 (Done) | `src/dvm/operators/full_join.rs` | Linux/CI-only result-level tests in `tests/dvm_full_join_tests.rs` cover all Part 1–7 paths (including the symmetric right-side Parts 6-7 unique to FULL JOIN) and EC-01. Nested full join tests in `tests/dvm_nested_full_join_tests.rs` (3-table chain, Parts 1a/6). Natural full join in `tests/dvm_natural_join_tests.rs`. (COMPLETED) |
-| P1 | `src/dvm/row_id.rs` | Direct unit tests for strategy enum and selection rules. Initial direct coverage completed. |
+| P1 | `src/dvm/row_id.rs` | Direct unit tests for strategy enum and selection rules. Initial direct coverage completed. P3 complete: cross-variant inequality, Debug for unit variants, empty column edge cases, Clone equality. |
 | P1 (Done) | `src/cdc.rs` | Integration tests for trigger-generated rows, keyless and wide-row cases (COMPLETED) |
 | P1 (Done) | `src/ivm.rs` | Executed keyed/keyless DML SQL behavior tests (COMPLETED) |
-| P1 | `src/config.rs` | Direct normalization/default-value tests. Initial helper coverage completed; broader accessor/default coverage remains optional. |
+| P1 | `src/config.rs` | Direct normalization/default-value tests. Initial helper coverage completed; P3 complete: `as_str()` roundtrips for all mode enums, negative threshold, case-insensitive normalize, normalize↔as_str consistency. |
 | P1 | `src/lib.rs` | `_PG_init()` preload/warning decision helper tests. Initial coverage completed. |
 | P2 (Done) | `src/api.rs` | Property tests for SQL scanners and duration/cron boundary fuzzing |
 | P2 (Done) | `src/dvm/mod.rs` | Fuzz/property tests for set-op splitters and quoted-string nesting — discovered+fixed char-boundary panic bugs |
@@ -340,3 +345,6 @@ We should **not** trust it as the primary proof layer for:
 - **P0 (Done)**: macOS-compatible DVM integration test harness: Added `scripts/run_dvm_integration_tests.sh` and `just test-dvm`. Removed `#![cfg(not(target_os = "macos"))]` gates from all 8 DVM test files; they now run on macOS via the pg_stub preload mechanism. This unblocks local macOS development for `window.rs`, `scalar_subquery.rs`, `semi_join.rs`, `anti_join.rs`, and all join operator execution tests.
 - **P1 (Done)**: `src/dvm/operators/outer_join.rs` nested left join: Added `tests/dvm_nested_left_join_tests.rs` with three-table (A LEFT JOIN B) LEFT JOIN C execution tests covering innermost insert fully matched, cascaded NULL-padding when no dept matches, and outermost delete emitting D(matched) + I(NULL-padded m). Natural left join covered in `tests/dvm_natural_join_tests.rs`.
 - **P1 (Done)**: `src/dvm/operators/full_join.rs` nested full join: Added `tests/dvm_nested_full_join_tests.rs` with three-table (A FULL JOIN B) FULL JOIN C execution tests covering innermost insert fully matched and outermost right insert unmatched (Part 6 — NULL left, c columns set). Natural full join covered in `tests/dvm_natural_join_tests.rs`.
+- **P3 (Done)**: `src/dvm/row_id.rs`: Added 5 new tests — cross-variant inequality (all four variants ≠ each other), `Debug` output for `CombineChildren`/`PassThrough`, empty-column edge cases for `PrimaryKey`/`AllColumns`/`GroupByKey`, `Clone` equality for `PrimaryKey` and `AllColumns`.
+- **P3 (Done)**: `src/shmem.rs`: Added 4 new pure-helper tests — acquire/release round-trip, over-release saturation (no underflow below 0), epoch monotonicity over 10 bumps, single-budget mutex semantics (budget=1 serialises concurrent acquisition attempts).
+- **P3 (Done)**: `src/config.rs`: Added 8 new tests — `UserTriggersMode::as_str()`, `CdcTriggerMode::as_str()`, `ParallelRefreshMode::as_str()` all-variants, `threshold_mb_to_bytes` negative input, case-insensitive `\"ON\"` → `ParallelRefreshMode::On`, `normalize` ↔ `as_str` roundtrip consistency for both trigger-mode enums.
