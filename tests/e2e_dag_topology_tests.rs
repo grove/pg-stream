@@ -522,7 +522,7 @@ const FANOUT_INVARIANTS: [(&str, &str); 4] = [
 #[tokio::test]
 async fn test_prop_fanout_leaf_independence() {
     let config = TraceConfig::from_env();
-    for seed in config.seeds(0xF0_F0_0001) {
+    for seed in config.seeds(0xF0F0_0001) {
         run_fanout_trace(seed, &config).await;
     }
 }
@@ -643,7 +643,7 @@ const DEEP_CHAIN_INVARIANTS: [(&str, &str); 4] = [
 #[tokio::test]
 async fn test_prop_deep_chain_small_trace() {
     let config = TraceConfig::from_env();
-    for seed in config.seeds(0xDC_DC_0001) {
+    for seed in config.seeds(0xDCDC_0001) {
         run_deep_chain_trace(seed, &config).await;
     }
 }
