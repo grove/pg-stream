@@ -83,6 +83,19 @@ fn make_scalar_ctx() -> DiffContext {
     DiffContext::new_standalone(prev_frontier, new_frontier)
 }
 
+fn make_shared_source_ctx() -> DiffContext {
+    // Only OID 1 — both the outer scan and the inner Filter reference the same
+    // source table (orders / OID 1).  This exercises the DBSP C₀ formula where
+    // the outer child and inner subquery share the same change buffer.
+    let mut prev_frontier = Frontier::new();
+    prev_frontier.set_source(1, "0/0".to_string(), "2025-01-01T00:00:00Z".to_string());
+
+    let mut new_frontier = Frontier::new();
+    new_frontier.set_source(1, "0/10".to_string(), "2025-01-01T00:00:10Z".to_string());
+
+    DiffContext::new_standalone(prev_frontier, new_frontier)
+}
+
 fn build_row_number_window_tree() -> OpTree {
     let child = scan_with_pk(
         1,
@@ -191,6 +204,49 @@ fn build_scalar_subquery_tree() -> OpTree {
         subquery: Box::new(inner),
         alias: "current_tax".to_string(),
         subquery_source_oids: vec![2],
+        child: Box::new(outer),
+    }
+}
+
+fn build_shared_source_scalar_tree() -> OpTree {
+    // Outer: all rows from orders (OID 1).
+    // Inner: the `amount` of the single row with id=2 from orders (same OID 1).
+    //
+    // Using a Filter over the same table forces the inner to be deterministic
+    // (exactly one row) while sharing the change buffer with the outer child.
+    // This models the Q15-style scalar-subquery pattern.
+    //
+    // Column layout: put `amount` first so it becomes scalar_col (index 0)
+    // picked up by diff_scalar_subquery.
+    let outer = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), int_col("amount")],
+        &["id"],
+    );
+    let inner_scan = scan_with_pk(
+        1,
+        "orders",
+        "l",
+        vec![int_col("amount"), int_col("id")], // amount first → becomes scalar_col
+        &["id"],
+    );
+    let inner_filter = OpTree::Filter {
+        predicate: Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("l".to_string()),
+                column_name: "id".to_string(),
+            }),
+            right: Box::new(Expr::Literal("2".to_string())),
+        },
+        child: Box::new(inner_scan),
+    };
+    OpTree::ScalarSubquery {
+        subquery: Box::new(inner_filter),
+        alias: "ref_amount".to_string(),
+        subquery_source_oids: vec![1],
         child: Box::new(outer),
     }
 }
@@ -368,6 +424,15 @@ async fn query_scalar_rows(db: &TestDb, sql: &str) -> Vec<(String, i32, i32, i32
     .fetch_all(&db.pool)
     .await
     .expect("failed to execute generated scalar-subquery delta SQL")
+}
+
+async fn query_shared_scalar_rows(db: &TestDb, sql: &str) -> Vec<(String, i32, i32, i32)> {
+    sqlx::query_as::<_, (String, i32, i32, i32)>(&format!(
+        "SELECT __pgt_action, id, amount, ref_amount FROM ({sql}) delta ORDER BY __pgt_action, id"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .expect("failed to execute generated shared-source scalar-subquery delta SQL")
 }
 
 #[tokio::test]
@@ -676,5 +741,47 @@ async fn test_diff_scalar_subquery_executes_simultaneous_outer_and_inner_change(
             ("I".to_string(), 2, 200, 20),
             ("I".to_string(), 3, 300, 20),
         ]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_scalar_subquery_executes_shared_source_outer_insert_stable_scalar() {
+    // Both the outer scan (orders) and the inner Filter(id=2, orders) reference
+    // source OID 1 — the same change buffer (changes_1).  This exercises the
+    // shared-source path: the diff engine must correctly split one change buffer
+    // into an outer delta CTE and an inner delta CTE, and the C₀ EXCEPT ALL must
+    // exclude newly inserted outer rows so Part-2 does not fire when the inner
+    // scalar is stable.
+    let db = setup_scalar_db().await;
+    let sql = make_shared_source_ctx()
+        .differentiate(&build_shared_source_scalar_tree())
+        .expect("shared-source scalar-subquery differentiation should succeed");
+
+    db.execute(
+        "TRUNCATE TABLE pgtrickle_changes.changes_1, pgtrickle_changes.changes_2, \
+         public.orders, public.config RESTART IDENTITY",
+    )
+    .await;
+
+    // Initial (post-change) state: orders {(1,100),(2,200),(3,999)}.
+    // Inner scalar = amount WHERE id=2 = 200 (stable — id=3 does not match filter id=2).
+    db.execute("INSERT INTO public.orders VALUES (1, 100), (2, 200), (3, 999)")
+        .await;
+
+    // Outer change only: INSERT order (3, 999).
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, new_id, new_amount) \
+         VALUES ('0/1', 'I', 3, 3, 999)",
+    )
+    .await;
+
+    // Only Part 1 fires (inner delta is empty — filter id=2 passes nothing from
+    // the insert of id=3).  C₀ EXCEPT ALL correctly excludes row 3 from the
+    // outer pre-change snapshot, confirming the shared-source path does not
+    // accidentally include the new row in a spurious Part-2 DELETE.
+    assert_eq!(
+        query_shared_scalar_rows(&db, &sql).await,
+        vec![("I".to_string(), 3, 999, 200)]
     );
 }
