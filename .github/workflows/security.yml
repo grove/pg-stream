@@ -26,16 +26,36 @@ on:
     - cron: "0 8 * * 1"
   workflow_dispatch:  # Allow manual runs from the Actions tab
 
-permissions:
-  contents: read
-  checks: write  # rustsec/audit-check posts results as a GitHub Check Run
-  issues: write  # scheduled rustsec/audit-check runs open issues for new advisories
-
 jobs:
   audit:
+    if: github.event_name != 'schedule'
     name: cargo audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write  # rustsec/audit-check posts results as a GitHub Check Run
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # RUSTSEC-2023-0071: rsa Marvin Attack — pulled in transitively via
+          # sqlx -> sqlx-mysql -> rsa, but pg_trickle only uses the "postgres"
+          # feature of sqlx. sqlx-mysql is never compiled into the extension.
+          # Suppress until an upstream fix is available.
+          ignore: RUSTSEC-2023-0071
+
+  scheduled_audit:
+    if: github.event_name == 'schedule'
+    name: cargo audit (scheduled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write  # scheduled rustsec/audit-check runs open issues for new advisories
     steps:
       - uses: actions/checkout@v5
 
