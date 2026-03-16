@@ -3481,3 +3481,63 @@ mod tests {
         assert!(!result);
     }
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod pg_tests {
+    use super::*;
+    use crate::catalog::SchedulerJob;
+    use pgrx::prelude::*;
+
+    #[pg_test]
+    fn test_scheduler_job_lifecycle() {
+        // E2E realistic state transition test for job enqueue, claim, complete and crash recovery.
+        Spi::run("CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE").unwrap();
+
+        let scheduler_pid = 99998;
+        let worker_pid = 99999;
+
+        // 1. Enqueue
+        let job_id = SchedulerJob::enqueue(1, "unit_x", "singleton", &[123], 123, scheduler_pid, 0)
+            .expect("should enqueue");
+        assert!(job_id > 0);
+
+        // 2. Claim
+        let claimed = SchedulerJob::claim(job_id, worker_pid).expect("should claim");
+        assert!(claimed);
+
+        // Attempting to claim again should yield false (since it's not QUEUED anymore)
+        let claimed_again = SchedulerJob::claim(job_id, worker_pid).expect("second claim");
+        assert!(!claimed_again);
+
+        // 3. Complete (Success)
+        SchedulerJob::complete_job(job_id, "Success message").expect("should complete");
+
+        // Query status directly
+        let status = Spi::get_one::<String>(&format!(
+            "SELECT status::text FROM pgtrickle.pgt_scheduler_jobs WHERE job_id = {}",
+            job_id
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(status, "SUCCESS");
+
+        // 4. Crash Recovery (Orphaned jobs)
+        let orphan_id = SchedulerJob::enqueue(1, "unit_y", "singleton", &[124], 124, 9999999, 0)
+            .expect("should enqueue orphan");
+        let claimed_orphan = SchedulerJob::claim(orphan_id, 9999998).unwrap();
+        assert!(claimed_orphan);
+
+        // This should cancel the job because the PIDs 9999999 and 9999998 do not exist in pg_stat_activity
+        let canceled = SchedulerJob::cancel_orphaned_jobs().expect("should cancel orphans");
+        assert!(canceled >= 1, "Should cancel at least 1 orphan");
+
+        let orphan_status = Spi::get_one::<String>(&format!(
+            "SELECT status::text FROM pgtrickle.pgt_scheduler_jobs WHERE job_id = {}",
+            orphan_id
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(orphan_status, "CANCELLED");
+    }
+}
