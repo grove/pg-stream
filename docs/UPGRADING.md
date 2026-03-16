@@ -79,9 +79,9 @@ ALTER EXTENSION pg_trickle UPDATE;
 ```
 
 This executes the upgrade migration scripts in order (for example,
-`pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` →
-`pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql`). PostgreSQL automatically determines the
-upgrade chain from your current version to the new `default_version`.
+`pg_trickle--0.5.0--0.6.0.sql` → `pg_trickle--0.6.0--0.7.0.sql`).
+PostgreSQL automatically determines the full upgrade chain from your current
+version to the new `default_version`.
 
 ### 5. Verify the Upgrade
 
@@ -198,28 +198,64 @@ Because PostgreSQL stores function signatures and defaults in `pg_proc`, the
 upgrade script drops and recreates both lifecycle functions during
 `ALTER EXTENSION ... UPDATE`.
 
+### 0.6.0 → 0.7.0
+
+**One new catalog column** is added to `pgtrickle.pgt_stream_tables`:
+
+| Column | Type | Default | Purpose |
+|--------|------|---------|--------|
+| `last_fixpoint_iterations` | `INT` | `NULL` | Records how many rounds the last circular-dependency fixpoint run required |
+
+**Two new catalog tables** are added:
+
+| Table | Purpose |
+|------|---------|
+| `pgtrickle.pgt_watermarks` | Stores per-source watermark progress reported by external loaders |
+| `pgtrickle.pgt_watermark_groups` | Stores groups of sources that must stay temporally aligned before refresh |
+
+**The upgrade script also updates and adds SQL functions**:
+
+- Recreates `pgtrickle.pgt_status()` so the result includes `scc_id`
+- Adds `pgtrickle.pgt_scc_status()` for circular-dependency monitoring
+- Adds `pgtrickle.advance_watermark(source, watermark)`
+- Adds `pgtrickle.create_watermark_group(name, sources[], tolerance_secs)`
+- Adds `pgtrickle.drop_watermark_group(name)`
+- Adds `pgtrickle.watermarks()`
+- Adds `pgtrickle.watermark_groups()`
+- Adds `pgtrickle.watermark_status()`
+
+**Behavioral notes:**
+
+- Circular stream table dependencies can now run to convergence when
+  `pg_trickle.allow_circular = true` and every member of the cycle is safe for
+  monotone DIFFERENTIAL refresh.
+- The scheduler can now hold back refreshes until related source tables are
+  aligned within a configured watermark tolerance.
+- Existing non-circular stream tables continue to work as before. The new
+  catalog objects are additive.
+
 ---
 
 ## Supported Upgrade Paths
 
-The following upgrade chains are supported:
+The following migration hops are available. PostgreSQL chains them
+automatically when you run `ALTER EXTENSION pg_trickle UPDATE`.
 
-| From | To | Scripts used |
-|------|----|-------------|
+| From | To | Script |
+|------|----|--------|
 | 0.1.3 | 0.2.0 | `pg_trickle--0.1.3--0.2.0.sql` |
-| 0.1.3 | 0.2.1 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` |
-| 0.1.3 | 0.2.2 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` |
-| 0.1.3 | 0.2.3 | `pg_trickle--0.1.3--0.2.0.sql` → `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql` |
 | 0.2.0 | 0.2.1 | `pg_trickle--0.2.0--0.2.1.sql` |
-| 0.2.0 | 0.2.2 | `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` |
-| 0.2.0 | 0.2.3 | `pg_trickle--0.2.0--0.2.1.sql` → `pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql` |
 | 0.2.1 | 0.2.2 | `pg_trickle--0.2.1--0.2.2.sql` |
-| 0.2.1 | 0.2.3 | `pg_trickle--0.2.1--0.2.2.sql` → `pg_trickle--0.2.2--0.2.3.sql` |
 | 0.2.2 | 0.2.3 | `pg_trickle--0.2.2--0.2.3.sql` |
+| 0.2.3 | 0.3.0 | `pg_trickle--0.2.3--0.3.0.sql` |
+| 0.3.0 | 0.4.0 | `pg_trickle--0.3.0--0.4.0.sql` |
+| 0.4.0 | 0.5.0 | `pg_trickle--0.4.0--0.5.0.sql` |
+| 0.5.0 | 0.6.0 | `pg_trickle--0.5.0--0.6.0.sql` |
+| 0.6.0 | 0.7.0 | `pg_trickle--0.6.0--0.7.0.sql` |
 
-PostgreSQL automatically chains migration scripts. Running
-`ALTER EXTENSION pg_trickle UPDATE` from v0.1.3 will apply all required
-scripts in sequence.
+That means any installation currently on 0.1.3 through 0.6.0 can upgrade to
+0.7.0 in one step after the new binaries are installed and PostgreSQL has been
+restarted.
 
 ---
 

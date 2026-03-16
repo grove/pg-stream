@@ -197,7 +197,7 @@ fn handle_view_change(cmd: &DdlCommand) {
     let identity = cmd.object_identity.as_deref().unwrap_or("unknown");
 
     // Check if any ST depends on this view OID via pgt_dependencies.
-    let affected_pgt_ids = match find_downstream_pgt_ids(cmd.objid) {
+    let affected_pgt_ids = match find_view_downstream_pgt_ids(cmd.objid) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
@@ -1166,7 +1166,7 @@ fn handle_st_storage_dropped(relid: pg_sys::Oid, identity: &str) {
 fn handle_dropped_view(obj: &DroppedObject) {
     let identity = obj.object_identity.as_deref().unwrap_or("unknown");
 
-    let affected_pgt_ids = match find_downstream_pgt_ids(obj.objid) {
+    let affected_pgt_ids = match find_view_downstream_pgt_ids(obj.objid) {
         Ok(ids) => ids,
         Err(e) => {
             pgrx::warning!(
@@ -1299,14 +1299,48 @@ fn handle_dropped_function(obj: &DroppedObject) {
 
 // ── Dependency queries ─────────────────────────────────────────────────────
 
-/// Find ST IDs that directly depend on a given source OID.
+/// Find ST IDs that directly depend on a given base or foreign-table source OID.
+///
+/// Stream-table dependencies are handled separately by DAG/SCC logic. They
+/// must not be treated as CDC-backed source-table dependencies here, or DDL on
+/// a stream table's storage relation during refresh would incorrectly try to
+/// rebuild change-buffer infrastructure for that stream table.
 fn find_downstream_pgt_ids(source_oid: pg_sys::Oid) -> Result<Vec<i64>, PgTrickleError> {
     Spi::connect(|client| {
         let table = client
             .select(
-                "SELECT pgt_id FROM pgtrickle.pgt_dependencies WHERE source_relid = $1",
+                "SELECT pgt_id FROM pgtrickle.pgt_dependencies \
+                 WHERE source_relid = $1 \
+                   AND source_type IN ('TABLE', 'FOREIGN_TABLE')",
                 None,
                 &[source_oid.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        let mut ids = Vec::new();
+        for row in table {
+            if let Ok(Some(id)) = row.get::<i64>(1) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    })
+}
+
+/// Find ST IDs that directly depend on a given view OID.
+///
+/// Used when a view is altered or dropped: views are recorded as
+/// `source_type = 'VIEW'` in `pgt_dependencies` and are not covered by
+/// the CDC-focused `find_downstream_pgt_ids`.
+fn find_view_downstream_pgt_ids(view_oid: pg_sys::Oid) -> Result<Vec<i64>, PgTrickleError> {
+    Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT pgt_id FROM pgtrickle.pgt_dependencies \
+                 WHERE source_relid = $1 \
+                   AND source_type = 'VIEW'",
+                None,
+                &[view_oid.into()],
             )
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 

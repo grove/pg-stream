@@ -2304,9 +2304,18 @@ pub fn collect_volatilities(expr: &Expr, worst: &mut char) -> Result<(), PgTrick
             // don't appear in pg_proc. They are inherently immutable — their
             // result depends only on their arguments. Skip the pg_proc lookup
             // and just check argument volatility.
+            //
+            // NOT is also a builtin boolean operator (BoolExpr::NOT_EXPR in the
+            // parse tree, mapped to Expr::FuncCall { func_name: "NOT" }). The
+            // pg_proc entry is named "boolnot", not "not", so a proname lookup
+            // for "NOT" returns 0 rows and the conservative 'v' default would
+            // be applied incorrectly. Boolean NOT is immutable; its volatility
+            // is purely that of its argument.
             let upper = func_name.to_uppercase();
-            let is_builtin_construct =
-                matches!(upper.as_str(), "COALESCE" | "NULLIF" | "GREATEST" | "LEAST");
+            let is_builtin_construct = matches!(
+                upper.as_str(),
+                "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" | "NOT"
+            );
             if !is_builtin_construct {
                 let vol = lookup_function_volatility(func_name)?;
                 *worst = max_volatility(*worst, vol);
@@ -13391,16 +13400,82 @@ unsafe fn extract_aggregates(
                 )));
             } else if is_user_defined_aggregate(&name_lower) {
                 // User-defined aggregate (CREATE AGGREGATE) — treat as group-rescan.
-                // Deparse the full call so agg_to_rescan_sql can emit it verbatim.
-                let raw_expr = unsafe { node_to_expr(rt.val)? };
-                let raw_sql = raw_expr.to_sql();
+                // Build the complete call SQL (including ORDER BY and FILTER) so that
+                // agg_to_rescan_sql can emit it verbatim and produce correct results.
+                // Also populate `argument` and `filter` so agg_delta_exprs can apply
+                // the FILTER predicate when counting insert/delete events.
+
+                let args_list = pg_list::<pg_sys::Node>(fcall.args);
+                let argument = args_list
+                    .head()
+                    .and_then(|n| unsafe { node_to_expr(n).ok() });
+
+                // Build the argument SQL, respecting DISTINCT.
+                let distinct_str = if fcall.agg_distinct { "DISTINCT " } else { "" };
+                let base_args: Vec<String> = {
+                    let mut v = Vec::new();
+                    for n in args_list.iter_ptr() {
+                        if let Ok(e) = unsafe { node_to_expr(n) } {
+                            v.push(e.to_sql());
+                        }
+                    }
+                    v
+                };
+                let args_sql = if base_args.is_empty() {
+                    String::new()
+                } else {
+                    format!("{distinct_str}{}", base_args.join(", "))
+                };
+
+                // Parse ORDER BY inside the aggregate call (e.g., my_agg(val ORDER BY x)).
+                let order_sql = if !fcall.agg_order.is_null() {
+                    let ord_list = pg_list::<pg_sys::Node>(fcall.agg_order);
+                    let mut sorts = Vec::new();
+                    for n in ord_list.iter_ptr() {
+                        if let Some(sb) = cast_node!(n, T_SortBy, pg_sys::SortBy) {
+                            let expr = unsafe { node_to_expr(sb.node)? };
+                            let dir = if sb.sortby_dir == pg_sys::SortByDir::SORTBY_DESC {
+                                " DESC"
+                            } else {
+                                ""
+                            };
+                            sorts.push(format!("{}{dir}", expr.to_sql()));
+                        }
+                    }
+                    if sorts.is_empty() {
+                        None
+                    } else {
+                        Some(sorts.join(", "))
+                    }
+                } else {
+                    None
+                };
+
+                let call_sql = match &order_sql {
+                    Some(ord) => format!("{func_name}({args_sql} ORDER BY {ord})"),
+                    None => format!("{func_name}({args_sql})"),
+                };
+
+                // Parse FILTER (WHERE ...) clause — stored both in `filter` (for delta
+                // tracking) and appended to `raw_sql` (for rescan correctness).
+                let filter = if !fcall.agg_filter.is_null() {
+                    Some(unsafe { node_to_expr(fcall.agg_filter)? })
+                } else {
+                    None
+                };
+
+                let raw_sql = match &filter {
+                    Some(f) => format!("{call_sql} FILTER (WHERE {})", f.to_sql()),
+                    None => call_sql,
+                };
+
                 aggs.push(AggExpr {
                     function: AggFunc::UserDefined(raw_sql),
-                    argument: None,
+                    argument,
                     alias,
-                    is_distinct: false,
+                    is_distinct: fcall.agg_distinct,
                     second_arg: None,
-                    filter: None,
+                    filter,
                     order_within_group: None,
                 });
             } else {

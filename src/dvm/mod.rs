@@ -265,7 +265,7 @@ pub fn generate_delta_query(
         delta_sql,
         output_columns,
         source_oids,
-        is_deduplicated: is_scan_chain || diff_dedup,
+        is_deduplicated: diff_dedup,
     })
 }
 
@@ -356,7 +356,7 @@ pub fn generate_delta_query_cached(
         delta_sql_template: template_sql.clone(),
         output_columns: output_columns.clone(),
         source_oids: source_oids.clone(),
-        is_deduplicated: is_scan_chain || diff_dedup,
+        is_deduplicated: diff_dedup,
     };
     DELTA_TEMPLATE_CACHE.with(|cache| {
         cache.borrow_mut().insert(pgt_id, entry);
@@ -370,7 +370,7 @@ pub fn generate_delta_query_cached(
         delta_sql,
         output_columns,
         source_oids,
-        is_deduplicated: is_scan_chain || diff_dedup,
+        is_deduplicated: diff_dedup,
     })
 }
 
