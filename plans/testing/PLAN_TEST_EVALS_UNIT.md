@@ -21,8 +21,9 @@ The initial hardening slice from this report has been started and validated on b
 - Extracted and unit-tested pure worker-token helpers in `src/shmem.rs`
 - Added direct normalization/helper tests in `src/config.rs`
 - Extracted `_PG_init()` decision logic into a pure helper and tested it in `src/lib.rs`
+- Added initial execution-backed integration tests for `semi_join` and `anti_join` that run the generated DVM SQL against a standalone PostgreSQL container on Linux/CI; these tests are gated off on macOS because importing `pg_trickle` internals into an integration-test binary currently aborts with a pgrx flat-namespace symbol lookup failure
 
-This closes the previously identified zero-coverage gap for `row_id.rs`, `shmem.rs`, `config.rs`, and `lib.rs`. The remaining highest-value work is still execution-backed testing for thin DVM operators and a successful `execute_differential_refresh()` path.
+This closes the previously identified zero-coverage gap for `row_id.rs`, `shmem.rs`, `config.rs`, and `lib.rs`, and starts the execution-backed hardening track for the highest-risk thin operators. The remaining highest-value work is execution-backed testing for `window` and `scalar_subquery`, plus a successful `execute_differential_refresh()` path. The semi/anti-join execution-backed tests still need a macOS-compatible harness if we want them to run locally on this platform.
 
 My overall confidence in the unit suite is **moderate-high for pure Rust logic, but only moderate as a standalone signal for end-to-end correctness**.
 
@@ -211,7 +212,7 @@ The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `
 
 ### Priority 0: Highest-value hardening
 
-1. Add execution-backed tests for `SEMI JOIN`, `ANTI JOIN`, `WINDOW`, `SCALAR SUBQUERY`, and representative `AGGREGATE` families.
+1. Extend execution-backed coverage from `SEMI JOIN` / `ANTI JOIN` to `WINDOW`, `SCALAR SUBQUERY`, and representative `AGGREGATE` families.
 2. Add a success-path test for `execute_differential_refresh()`.
 3. Add direct unit coverage for `src/dvm/row_id.rs` and `src/shmem.rs`. Completed in the initial hardening slice.
 4. Add parser integration tests that validate real SQL-to-`OpTree` summaries, since unit tests cannot prove that today.
@@ -239,8 +240,8 @@ The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `
 
 | Priority | File | Suggested additions |
 |---|---|---|
-| P0 | `src/dvm/operators/semi_join.rs` | Match gain/loss execution tests; simultaneous left/right deltas; nested source case |
-| P0 | `src/dvm/operators/anti_join.rs` | Regain/loss execution tests; null/unmatched transitions; nested source case |
+| P0 | `src/dvm/operators/semi_join.rs` | Initial match gain/loss execution tests completed in a Linux/CI-only integration harness. Remaining work: simultaneous left/right deltas, nested source case, and a macOS-compatible local harness. |
+| P0 | `src/dvm/operators/anti_join.rs` | Initial regain/loss execution tests completed in a Linux/CI-only integration harness. Remaining work: null/unmatched transitions, nested source case, and a macOS-compatible local harness. |
 | P0 | `src/dvm/operators/window.rs` | Executed ranking and frame tests; multi-window, multi-partition updates |
 | P0 | `src/refresh.rs` | Success-path differential refresh test; prepared statement parameter-order test |
 | P0 | `src/dvm/parser.rs` | SQL-to-tree integration summary tests using real PostgreSQL parsing |
@@ -278,7 +279,7 @@ We should **not** trust it as the primary proof layer for:
 
 ## Recommended Next Actions
 
-1. Add execution-backed unit or integration tests for the thin DVM operators first: `semi_join`, `anti_join`, `window`, `scalar_subquery`.
+1. Add execution-backed tests for the remaining thin DVM operators first: `window` and `scalar_subquery`.
 2. Add a success-path `execute_differential_refresh` test.
 3. Add parser integration summary tests so `parser.rs` coverage matches the apparent confidence implied by its test count.
 4. Add a fake-repository or similar seam for higher-value `scheduler.rs` lifecycle tests.
