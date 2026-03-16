@@ -93,6 +93,16 @@ test-e2e: build-e2e-image
 test-e2e-fast:
     ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
 
+# Run E2E tests with parallel refresh mode enabled (rebuilds Docker image first)
+[group: "test"]
+test-e2e-parallel: build-e2e-image
+    PGT_PARALLEL_MODE=on ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
+
+# Run E2E tests with parallel refresh mode enabled, skip Docker image rebuild
+[group: "test"]
+test-e2e-parallel-fast:
+    PGT_PARALLEL_MODE=on ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
+
 # Package the extension for light-E2E tests (cargo pgrx package)
 [group: "test"]
 package-extension:

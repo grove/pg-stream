@@ -188,15 +188,19 @@ impl TestDb {
     }
 
     /// Get an optional scalar value from a query.
+    ///
+    /// Returns `None` both when no rows are returned *and* when the single
+    /// returned value is `NULL` (e.g. `max()` / `min()` over an empty set).
     pub async fn query_scalar_opt<T>(&self, sql: &str) -> Option<T>
     where
         T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + Send + Unpin,
         (T,): for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow>,
     {
-        sqlx::query_scalar(sql)
+        sqlx::query_scalar::<_, Option<T>>(sql)
             .fetch_optional(&self.pool)
             .await
             .unwrap_or_else(|e| panic!("Scalar query failed: {}\nSQL: {}", e, sql))
+            .flatten()
     }
 
     /// Count rows in a table.
