@@ -29,6 +29,7 @@ on:
 permissions:
   contents: read
   checks: write  # rustsec/audit-check posts results as a GitHub Check Run
+  issues: write  # scheduled rustsec/audit-check runs open issues for new advisories
 
 jobs:
   audit:
