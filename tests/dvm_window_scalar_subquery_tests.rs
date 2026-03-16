@@ -882,3 +882,108 @@ async fn test_diff_window_executes_unpartitioned_global_recompute() {
         ]
     );
 }
+
+fn build_window_over_agg_tree() -> OpTree {
+    use pg_trickle::dvm::parser::{AggExpr, AggFunc};
+
+    let agg_child = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), text_col("region"), int_col("amount")],
+    );
+
+    let agg_node = OpTree::Aggregate {
+        group_by: vec![colref("region")],
+        aggregates: vec![AggExpr {
+            function: AggFunc::Sum,
+            argument: Some(colref("amount")),
+            alias: "sum_amount".to_string(),
+            is_distinct: false,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        }],
+        child: Box::new(agg_child),
+    };
+
+    OpTree::Window {
+        window_exprs: vec![WindowExpr {
+            func_name: "RANK".to_string(),
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![SortExpr {
+                expr: colref("sum_amount"),
+                ascending: false,
+                                                                   me                                          ou                                                   vec                                co         ion"), colref("sum_a                                                                               r_     b: &TestDb, sql: &str) -> Vec<(String, String, i64, i64)> {
+    sqlx::query_as::<_,     sqlx::query_as::<_,     sqlx:at!(
+        "SELECT __pgt_action, region, sum_amount, rank_amount FROM ({sql}) delt        "SELECT __pgt_action, region, sum_a).fetch_all(&db.pool).await.unwrap        "SELECT __pgt_actionn         "SELECT __pgt_acs_window_over_aggregate() {
+    let db = setup_window_db().await;
+    let sql = make_win    ltx("window_over_agg_st")
+        .differentiate(&build_window_ov        .differentiate(&build_window_ov  er        .differentiate(&on should succeed");
+
+    db.execute    db.execute    db.execute    db.echanges.changes_1, public.orders, public.window_over_agg_st RESTART IDENTITY",
+                                                                                                                                                                                                                                                                                                                                                                                                                                                     3)                                                                                                                                                                                                                                            r_                                    t_eq!(
+        rows,
+        vec![
+            ("I".to            ("I".to            ("I".to            ("I".to            ("I".to            ("I".to            ("I".to           ), "west".to_string(), 50, 2),
+            ("D".to_string(), "east".to_string(), 30, 2),
+            ("D".to_string(), "south".to_string(), 20, 3),
+            ("D".to_string(), "west".to_string(), 50, 1),
+        ]
+    );
+}
+
+fn build_aggregate_backed_inner_scalar_tree() -> OpTree {
+    use pg_trickle::dvm::parser::{AggExpr, AggFunc};
+
+    let outer = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), int_col("amount")],
+    );
+
+    let inner_scan = scan_with_pk(
+        1,
+        "orders",
+        "i",
+        vec![int_col("id"), int_col("amount")],
+    );
+
+    let inner_agg = OpTree::Aggregate {
+        group_by: vec![],
+        aggregates: vec![AggExpr {
+            function: AggFunc::Sum,
+            argument: Some(colref("amount")),
+            alias: "total_all".to_string(),
+            is_distinct: false,
+            second_arg            second_arg            second_arg            second_arg            second_arg            second_arg            second_arg            second_arg            second_Bo            second_arg            second_arg               correlations: vec![],
+        output_alias: "total_all".to        ou
+        passthrough: vec![colref("id"), colref(        )],
+    }
+}
+
+async fn query_agg_scalar_rows(db: &TestDb, sql: &str) ->async fn query_agg_scalar_rows(db: &TestDb, sql: &s:<_async fn query_agg_scalar_rofoasync fn       "SELECT __pgt_async fn qu aasync fn query_agg_scalar_rows(db: &TestDb, sq_pgt_actioasync fn query_agg_scalar_rows(db(&async fn     .await
+    .unwrap()
+}
+
+#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[tok#xecutes_ag#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[tse#[tok#[tok#[tok#[tok#[to  #[tok#[tok#[tok#[tok#[tok#[tok#[t    .differentiate(&build_aggregate_ba#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[toca#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[tok#[ed");
+
+    db.execute(
+        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR        "TR ge        "TR        "TR        "TR        "TR w_amount) VALUES          ('0/100', 'I', 3, 3, 50)",
+    ).await;
+
+    let rows = query_agg_scalar_rows(&db, &sql).await;
+
+    assert_eq!(
+        rows,
+        vec![
+            ("I".to_string(), 1, 100, 350),
+            ("I".to_string(), 2, 200, 350),
+            ("I".to_string(), 3, 50, 350),
+            ("D".to_string(), 1, 100, 300),
+            ("D".to_string(), 2, 200, 300),
+        ]
+    );
+}

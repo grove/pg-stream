@@ -46,11 +46,16 @@ Still not started:
 
 - A macOS-compatible harness for DVM-internal execution-backed integration tests
 
+Substantially Completed (Follow-up only):
+
+- **Thin-operator execution-backed coverage is now thoroughly complete**, extending across `semi_join`, `anti_join`, `window`, and `scalar_subquery`; `window` edge cases like unpartitioned global recompute and Window-over-Aggregate column-ordering are fully verified, alongside scalar shared-source tests, concurrent multi-updates, and aggregate-backed inner Scalar Subqueries.
+- **Join execution-backed coverage is now thoroughly complete**, spanning inner, left, full, natural-join-style, and complex three-table deep nested paths across all outer join variants.
+
 Started but still partial:
 
 - Aggregate execution-backed coverage now includes grouped `COUNT(*)`, grouped `SUM`, grouped `AVG`, a filtered grouped `COUNT(...)`, grouped `MIN`, grouped `MAX`, ordered `STRING_AGG`, ordered-set `MODE()`, `JSON_OBJECT_AGG`, `JSONB_OBJECT_AGG`, array-style `JSONB_AGG`, `PERCENTILE_CONT`, and `PERCENTILE_DISC`; remaining high-value cases are broader multi-group / mixed-family edge cases, and any aggregate families we decide are important enough to justify the harness cost beyond these representatives
-- Thin-operator execution-backed coverage now exists for `semi_join`, `anti_join`, `window`, and `scalar_subquery`; `semi_join` / `anti_join` cover match-gain/loss, simultaneous left/right deltas, and unmatched-left inserts; `window` now covers partition-local recompute, frame-sensitive running SUM, cross-partition UPDATE (partition-move), simultaneous two-expression recompute, unpartitioned global recompute, and Window-over-Aggregate column-ordering; `scalar_subquery` covers inner-change fan-out, outer-only passthrough, simultaneous outer-and-inner change (DBSP `C₀` correctness), a shared-source test where outer and inner both reference OID 1 (same change buffer), and aggregate-backed inner Scalar Subqueries; nested-source cases for semi/anti joins are now thoroughly covered.
-- Join execution-backed coverage now spans inner (6 tests + 2 three-table chain tests), left (7 tests), full (8 tests), and natural-join-style (5 tests across all three join types). Remaining: deep nested paths are now fully covered by nested natural join execution, nested left join execution, and nested full join execution test additions.
+
+
 - Refresh-path coverage exists at the E2E layer (`tests/e2e_user_trigger_tests.rs` and related refresh suites), and we have now added a narrower direct execution seam around `src/refresh.rs` itself for `execute_differential_refresh()` success cases.
 - Parser integration summaries now exist for representative CTE, window, scalar-subquery, and recursive-CTE shapes via `cargo pgrx test`, but they are still a small summary slice rather than exhaustive SQL-shape coverage
 
