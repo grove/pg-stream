@@ -5038,6 +5038,7 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use proptest::prelude::*;
 
     proptest! {

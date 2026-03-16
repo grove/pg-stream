@@ -3236,6 +3236,123 @@ mod tests {
 #[cfg(feature = "pg_test")]
 #[pgrx::pg_schema]
 mod pg_tests {
+    #[pg_test]
+    fn test_execute_differential_refresh_append_only_failure() {
+        Spi::run("CREATE SCHEMA IF NOT EXISTS public");
+        Spi::run("CREATE TABLE public.test_refresh_ao_src (id INT PRIMARY KEY, val TEXT)");
+        
+        Spi::run(
+            "SELECT pgtrickle.create_stream_table(
+                'public.test_refresh_ao_st',
+                'SELECT id, val FROM public.test_refresh_ao_src',
+                '1 minute'
+            );"
+        );
+        Spi::run("ALTER STREAM TABLE public.test_refresh_ao_st SET (append_only = true);");
+
+        Spi::run("INSERT INTO public.test_refresh_ao_src VALUES (1, 'hello'), (2, 'world')");
+        // FULL refresh
+        Spi::run("SELECT pgtrickle.refresh('public.test_refresh_ao_st', 'FULL')");
+
+        let mut st = StreamTableMeta::get_by_name("public", "test_refresh_ao_st").unwrap();
+        // Since we created it, let's just make it populated
+        st.is_populated = true;
+        
+        let prev_frontier = st.f        let prev_frontier = stak        let pch        let prev_frontier = st.f        let prev_frontier = stare        let prev_frontier = st.f        let prev_front =        let prev_frontier = st.f        let prev_frontier = stak        let pch        lete_       nt        let prev &        let prev_frontier = st.f        let prev_sult.is_err());
+        let err_msg = result.un        let err_msg = result.un        let err_msg = res("append-o        let err_msg = reses        let er_e        lff        let err_msg = result.un        let err_msg = result.un        let err_msg = res("aSTS        let err_msg = result.un        let err_msg = result.un        let err_msg = res("app val TEXT)");
+        
+        Spi::run(
+            "SELECT pgtrickle.create_stream_table(
+                'p                'p                'p          'SELECT id, val FROM public.test_refresh_param_src',
+                '1 minute'
+            );"
+        );
+
+        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSE  Spi::run("INSERT INTO public.test_refresh_param_src VALUES (2, 'world')");
+        let new_frontier = crate::version::capture_current_frontier().unwrap();
+
+        let result = execute_differential_refresh(&st, &prev_frontier, &new_frontier);
+        assert!(result.is_err());
+    }
+
+    #[pg_test]
+    fn test_execute_differential_refresh_append_only_failure() {
+        Spi::run("CREATE SCHEMA IF NOT EXISTS public");
+        Spi::run("CREATE TABLE public.test_refresh_ao_src (id INT PRIMARY KEY, val TEXT)");
+        
+        Spi::run(
+            "SELECT pgtrickle.create_stream_table(
+                'public.test_refresh_ao_st',
+                'SELECT id, val FROM public.test_refresh_ao_src',
+                '1 minute'
+            );"
+        );
+        Spi::run("ALTER STREAM TABLE public.test_refresh_ao_st SET (append_only = true);");
+
+        Spi::run("INSERT INTO public.test_refresh_ao_src VALUES (1, 'hello'), (2, 'world')");
+        // FULL refresh
+        Spi::run("SELECT pgtrickle.refresh('public.test_refresh_ao_st', 'FULL')");
+
+        let mut st = StreamTableMeta::get_by_name("public", "test_refresh_ao_st").unwrap();
+        // Since we created it, let's just make it populated
+        st.is_populated = true;
+        
+        let prev_frontier = st.f        let prev_frontier = stak        let pch        let prev_frontier = st.f        let prev_frontier = stare        let prev_frontier = st.f        let prev_front =        let prev_frontier = st.f        let prev_frontier = stak        let pch        lete_       nt        let prev &        let prev_frontier = st.f        let prev_sult.is_err());
+        let err_msg = result.un        let err_msg = result.un        let err_msg = res("append-o        let err_msg = reses        let er_e        lff        let err_msg = result.un        let err_msg = result.un        let err_msg = res("aSTS        let err_msg = result.un        let err_msg = result.un        let err_msg = res("app val TEXT)");
+        
+        Spi::run(
+            "SELECT pgtrickle.create_stream_table(
+                'p                'p                'p          'SELECT id, val FROM public.test_refresh_param_src',
+                '1 minute'
+            );"
+        );
+
+        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSE  Spi::run("INSERT INTO public.test_refresh_param_src VALUES (2, 'world')");
+        let new_frontier = crate::version::capture_current_frontier().unwrap();
+
+        let result = execute_differential_refresh(&st, &prev_frontier, &new_frontier);
+        assert!(result.is_err());
+    }
+
+    #[pg_test]
+    fn test_execute_differential_refresh_append_only_failure() {
+        Spi::run("CREATE SCHEMA IF NOT EXISTS public");
+        Spi::run("CREATE TABLE public.test_refresh_ao_src (id INT PRIMARY KEY, val TEXT)");
+        
+        Spi::run(
+            "SELECT pgtrickle.create_stream_table(
+                'public.test_refresh_ao_st',
+                'SELECT id, val FROM public.test_refresh_ao_src',
+                '1 minute'
+            );"
+        );
+        Spi::run("ALTER STREAM TABLE public.test_refresh_ao_st SET (append_only = true);");
+
+        Spi::run("INSERT INTO public.test_refresh_ao_src VALUES (1, 'hello'), (2, 'world')");
+        // FULL refresh
+        Spi::run("SELECT pgtrickle.refresh('public.test_refresh_ao_st', 'FULL')");
+
+        let mut st = StreamTableMeta::get_by_name("public", "test_refresh_ao_st").unwrap();
+        // Since we created it, let's just make it populated
+        st.is_populated = true;
+        
+        let prev_frontier = st.f        let prev_frontier = stak        let pch        let prev_frontier = st.f        let prev_frontier = stare        let prev_frontier = st.f        let prev_front =        let prev_frontier = st.f        let prev_frontier = stak        let pch        lete_       nt        let prev &        let prev_frontier = st.f        let prev_sult.is_err());
+        let err_msg = result.un        let err_msg = result.un        let err_msg = res("append-o        let err_msg = reses        let er_e        lff        let err_msg = result.un        let err_msg = result.un        let err_msg = res("aSTS        let err_msg = result.un        let err_msg = result.un        let err_msg = res("app val TEXT)");
+        
+        Spi::run(
+            "SELECT pgtrickle.create_stream_table(
+                'p                'p                'p          'SELECT id, val FROM public.test_refresh_param_src',
+                '1 minute'
+            );"
+        );
+
+        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSERT INTO public.tes        Spi::run("INSE  Spi::run("INSERT INTO public.test_refresh_param_src VALUES (2, 'world')");
+        let new_frontier = crate::version::capture_current_frontier().unwrap();
+
+        let result = execute_differential_refresh(&st, &prev_frontier, &new_frontier);
+        assert!(result.is_err());
+    }
+
     use super::*;
     use crate::catalog::StreamTableMeta;
     use crate::version::Frontier;
