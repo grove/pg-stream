@@ -10,7 +10,7 @@ mod common;
 
 use common::TestDb;
 use pg_trickle::dvm::DiffContext;
-use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree};
+use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree, SortExpr};
 use pg_trickle::version::Frontier;
 
 fn int_col(name: &str) -> Column {
@@ -36,6 +36,14 @@ fn colref(name: &str) -> Expr {
     }
 }
 
+fn sort_asc(name: &str) -> SortExpr {
+    SortExpr {
+        expr: colref(name),
+        ascending: true,
+        nulls_first: false,
+    }
+}
+
 fn lit(value: &str) -> Expr {
     Expr::Literal(value.to_string())
 }
@@ -53,7 +61,12 @@ fn scan_orders() -> OpTree {
         table_oid: 1,
         table_name: "orders".to_string(),
         schema: "public".to_string(),
-        columns: vec![int_col("id"), text_col("region"), int_col("amount")],
+        columns: vec![
+            int_col("id"),
+            text_col("region"),
+            int_col("amount"),
+            text_col("label"),
+        ],
         pk_columns: vec!["id".to_string()],
         alias: "o".to_string(),
     }
@@ -95,6 +108,54 @@ fn avg_col(column: &str, alias: &str) -> AggExpr {
     }
 }
 
+fn min_col(column: &str, alias: &str) -> AggExpr {
+    AggExpr {
+        function: AggFunc::Min,
+        argument: Some(colref(column)),
+        alias: alias.to_string(),
+        is_distinct: false,
+        second_arg: None,
+        filter: None,
+        order_within_group: None,
+    }
+}
+
+fn max_col(column: &str, alias: &str) -> AggExpr {
+    AggExpr {
+        function: AggFunc::Max,
+        argument: Some(colref(column)),
+        alias: alias.to_string(),
+        is_distinct: false,
+        second_arg: None,
+        filter: None,
+        order_within_group: None,
+    }
+}
+
+fn string_agg_col(column: &str, alias: &str) -> AggExpr {
+    AggExpr {
+        function: AggFunc::StringAgg,
+        argument: Some(colref(column)),
+        alias: alias.to_string(),
+        is_distinct: false,
+        second_arg: Some(lit("', '")),
+        filter: None,
+        order_within_group: Some(vec![sort_asc("amount")]),
+    }
+}
+
+fn mode_col(column: &str, alias: &str) -> AggExpr {
+    AggExpr {
+        function: AggFunc::Mode,
+        argument: None,
+        alias: alias.to_string(),
+        is_distinct: false,
+        second_arg: None,
+        filter: None,
+        order_within_group: Some(vec![sort_asc(column)]),
+    }
+}
+
 fn filtered_count_col(column: &str, alias: &str, filter: Expr) -> AggExpr {
     AggExpr {
         function: AggFunc::Count,
@@ -124,7 +185,7 @@ fn make_aggregate_ctx(st_name: &str, st_user_columns: &[&str]) -> DiffContext {
 
     let mut ctx = DiffContext::new_standalone(prev_frontier, new_frontier)
         .with_pgt_name("public", st_name)
-        .with_defining_query("SELECT region, amount FROM public.orders");
+        .with_defining_query("SELECT region, amount, label FROM public.orders");
     ctx.st_user_columns = Some(st_user_columns.iter().map(|c| (*c).to_string()).collect());
     ctx.st_has_pgt_count = true;
     ctx
@@ -157,7 +218,8 @@ $$;
 CREATE TABLE public.orders (
     id INT PRIMARY KEY,
     region TEXT NOT NULL,
-    amount INT NOT NULL
+    amount INT NOT NULL,
+    label TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE public.agg_count_st (
@@ -181,6 +243,34 @@ CREATE TABLE public.agg_avg_st (
     avg_amount NUMERIC NOT NULL
 );
 
+CREATE TABLE public.agg_min_st (
+    __pgt_row_id BIGINT PRIMARY KEY,
+    region TEXT NOT NULL,
+    __pgt_count BIGINT NOT NULL,
+    min_amount INT NOT NULL
+);
+
+CREATE TABLE public.agg_max_st (
+    __pgt_row_id BIGINT PRIMARY KEY,
+    region TEXT NOT NULL,
+    __pgt_count BIGINT NOT NULL,
+    max_amount INT NOT NULL
+);
+
+CREATE TABLE public.agg_string_st (
+    __pgt_row_id BIGINT PRIMARY KEY,
+    region TEXT NOT NULL,
+    __pgt_count BIGINT NOT NULL,
+    member_labels TEXT NOT NULL
+);
+
+CREATE TABLE public.agg_mode_st (
+    __pgt_row_id BIGINT PRIMARY KEY,
+    region TEXT NOT NULL,
+    __pgt_count BIGINT NOT NULL,
+    mode_amount INT NOT NULL
+);
+
 CREATE TABLE public.agg_filtered_st (
     __pgt_row_id BIGINT PRIMARY KEY,
     region TEXT NOT NULL,
@@ -196,9 +286,11 @@ CREATE TABLE pgtrickle_changes.changes_1 (
     new_id INT,
     new_region TEXT,
     new_amount INT,
+    new_label TEXT,
     old_id INT,
     old_region TEXT,
-    old_amount INT
+    old_amount INT,
+    old_label TEXT
 );
 "#,
     )
@@ -217,6 +309,10 @@ async fn reset_aggregate_fixture(db: &TestDb) {
          public.agg_count_st, \
          public.agg_sum_st, \
          public.agg_avg_st, \
+         public.agg_min_st, \
+         public.agg_max_st, \
+         public.agg_string_st, \
+         public.agg_mode_st, \
          public.agg_filtered_st \
          RESTART IDENTITY",
     )
@@ -244,6 +340,20 @@ async fn query_numeric_aggregate_rows(
 ) -> Vec<(String, String, i64, String)> {
     sqlx::query_as::<_, (String, String, i64, String)>(&format!(
         "SELECT __pgt_action, region, __pgt_count, ({aggregate_column})::numeric(10,2)::text \
+         FROM ({sql}) delta ORDER BY __pgt_action, region"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .expect("failed to execute generated aggregate delta SQL")
+}
+
+async fn query_text_aggregate_rows(
+    db: &TestDb,
+    sql: &str,
+    aggregate_column: &str,
+) -> Vec<(String, String, i64, String)> {
+    sqlx::query_as::<_, (String, String, i64, String)>(&format!(
+        "SELECT __pgt_action, region, __pgt_count, ({aggregate_column})::text \
          FROM ({sql}) delta ORDER BY __pgt_action, region"
     ))
     .fetch_all(&db.pool)
@@ -390,5 +500,132 @@ async fn test_diff_aggregate_executes_filtered_count_update() {
     assert_eq!(
         query_bigint_aggregate_rows(&db, &sql, "high_value_count").await,
         vec![("I".to_string(), "east".to_string(), 2, 2)]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_aggregate_executes_min_rescan_on_deleted_extremum() {
+    let db = setup_aggregate_db().await;
+    let sql = make_aggregate_ctx("agg_min_st", &["region", "min_amount"])
+        .differentiate(&grouped_aggregate(min_col("amount", "min_amount")))
+        .expect("min aggregate differentiation should succeed");
+
+    reset_aggregate_fixture(&db).await;
+    db.execute(
+        "INSERT INTO public.orders VALUES \
+         (2, 'east', 20, 'b'), \
+         (3, 'east', 30, 'c')",
+    )
+    .await;
+    db.execute("INSERT INTO public.agg_min_st VALUES (100, 'east', 3, 10)")
+        .await;
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, old_id, old_region, old_amount, old_label) \
+         VALUES ('0/1', 'D', 1, 1, 'east', 10, 'a')",
+    )
+    .await;
+
+    assert_eq!(
+        query_bigint_aggregate_rows(&db, &sql, "(min_amount)::bigint").await,
+        vec![("I".to_string(), "east".to_string(), 2, 20)]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_aggregate_executes_max_rescan_on_deleted_extremum() {
+    let db = setup_aggregate_db().await;
+    let sql = make_aggregate_ctx("agg_max_st", &["region", "max_amount"])
+        .differentiate(&grouped_aggregate(max_col("amount", "max_amount")))
+        .expect("max aggregate differentiation should succeed");
+
+    reset_aggregate_fixture(&db).await;
+    db.execute(
+        "INSERT INTO public.orders VALUES \
+         (1, 'east', 10, 'a'), \
+         (2, 'east', 20, 'b')",
+    )
+    .await;
+    db.execute("INSERT INTO public.agg_max_st VALUES (100, 'east', 3, 30)")
+        .await;
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, old_id, old_region, old_amount, old_label) \
+         VALUES ('0/1', 'D', 3, 3, 'east', 30, 'c')",
+    )
+    .await;
+
+    assert_eq!(
+        query_bigint_aggregate_rows(&db, &sql, "(max_amount)::bigint").await,
+        vec![("I".to_string(), "east".to_string(), 2, 20)]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_aggregate_executes_string_agg_rescan_update() {
+    let db = setup_aggregate_db().await;
+    let sql = make_aggregate_ctx("agg_string_st", &["region", "member_labels"])
+        .differentiate(&grouped_aggregate(string_agg_col("label", "member_labels")))
+        .expect("string_agg differentiation should succeed");
+
+    reset_aggregate_fixture(&db).await;
+    db.execute(
+        "INSERT INTO public.orders VALUES \
+         (1, 'east', 10, 'a'), \
+         (2, 'east', 15, 'b'), \
+         (3, 'east', 20, 'c')",
+    )
+    .await;
+    db.execute("INSERT INTO public.agg_string_st VALUES (100, 'east', 2, 'a, c')")
+        .await;
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, new_id, new_region, new_amount, new_label) \
+         VALUES ('0/1', 'I', 2, 2, 'east', 15, 'b')",
+    )
+    .await;
+
+    assert_eq!(
+        query_text_aggregate_rows(&db, &sql, "member_labels").await,
+        vec![(
+            "I".to_string(),
+            "east".to_string(),
+            3,
+            "a, b, c".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_aggregate_executes_mode_rescan_update() {
+    let db = setup_aggregate_db().await;
+    let sql = make_aggregate_ctx("agg_mode_st", &["region", "mode_amount"])
+        .differentiate(&grouped_aggregate(mode_col("amount", "mode_amount")))
+        .expect("mode differentiation should succeed");
+
+    reset_aggregate_fixture(&db).await;
+    db.execute(
+        "INSERT INTO public.orders VALUES \
+         (1, 'east', 10, 'a'), \
+         (2, 'east', 10, 'b'), \
+         (3, 'east', 20, 'c'), \
+         (4, 'east', 20, 'd'), \
+         (5, 'east', 20, 'e')",
+    )
+    .await;
+    db.execute("INSERT INTO public.agg_mode_st VALUES (100, 'east', 3, 10)")
+        .await;
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, new_id, new_region, new_amount, new_label) \
+         VALUES \
+         ('0/1', 'I', 4, 4, 'east', 20, 'd'), \
+         ('0/2', 'I', 5, 5, 'east', 20, 'e')",
+    )
+    .await;
+
+    assert_eq!(
+        query_bigint_aggregate_rows(&db, &sql, "(mode_amount)::bigint").await,
+        vec![("I".to_string(), "east".to_string(), 5, 20)]
     );
 }
