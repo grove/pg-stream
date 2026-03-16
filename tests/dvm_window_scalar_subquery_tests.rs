@@ -139,6 +139,44 @@ fn build_running_sum_window_tree() -> OpTree {
     }
 }
 
+fn build_multi_window_tree() -> OpTree {
+    let child = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), text_col("region"), int_col("amount")],
+        &["id"],
+    );
+
+    OpTree::Window {
+        window_exprs: vec![
+            WindowExpr {
+                func_name: "ROW_NUMBER".to_string(),
+                args: vec![],
+                partition_by: vec![colref("region")],
+                order_by: vec![sort_asc("amount")],
+                frame_clause: None,
+                alias: "rn".to_string(),
+            },
+            WindowExpr {
+                func_name: "SUM".to_string(),
+                args: vec![colref("amount")],
+                partition_by: vec![colref("region")],
+                order_by: vec![sort_asc("amount")],
+                frame_clause: Some("ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW".to_string()),
+                alias: "running_total".to_string(),
+            },
+        ],
+        partition_by: vec![colref("region")],
+        pass_through: vec![
+            (colref("id"), "id".to_string()),
+            (colref("region"), "region".to_string()),
+            (colref("amount"), "amount".to_string()),
+        ],
+        child: Box::new(child),
+    }
+}
+
 fn build_scalar_subquery_tree() -> OpTree {
     let outer = scan_with_pk(
         1,
@@ -200,6 +238,15 @@ CREATE TABLE public.window_running_sum_st (
     id INT NOT NULL,
     region TEXT NOT NULL,
     amount INT NOT NULL,
+    running_total BIGINT NOT NULL
+);
+
+CREATE TABLE public.window_multi_st (
+    __pgt_row_id BIGINT PRIMARY KEY,
+    id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount INT NOT NULL,
+    rn BIGINT NOT NULL,
     running_total BIGINT NOT NULL
 );
 
@@ -299,6 +346,19 @@ async fn query_window_rows(
     .fetch_all(&db.pool)
     .await
     .expect("failed to execute generated window delta SQL")
+}
+
+async fn query_multi_window_rows(
+    db: &TestDb,
+    sql: &str,
+) -> Vec<(String, i32, String, i32, i64, i64)> {
+    sqlx::query_as::<_, (String, i32, String, i32, i64, i64)>(&format!(
+        "SELECT __pgt_action, id, region, amount, rn, running_total \
+         FROM ({sql}) delta ORDER BY __pgt_action, id"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .expect("failed to execute generated multi-window delta SQL")
 }
 
 async fn query_scalar_rows(db: &TestDb, sql: &str) -> Vec<(String, i32, i32, i32)> {
@@ -458,5 +518,163 @@ async fn test_diff_scalar_subquery_executes_outer_insert_with_current_scalar() {
     assert_eq!(
         query_scalar_rows(&db, &sql).await,
         vec![("I".to_string(), 3, 300, 10)]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_window_executes_partition_move_recomputes_both_partitions() {
+    let db = setup_window_db().await;
+    let sql = make_window_ctx("window_row_number_st")
+        .differentiate(&build_row_number_window_tree())
+        .expect("window differentiation should succeed");
+
+    db.execute(
+        "TRUNCATE TABLE pgtrickle_changes.changes_1, public.window_row_number_st, public.orders RESTART IDENTITY",
+    )
+    .await;
+
+    // Seed the current (post-update) state of orders: order 2 has moved east→west.
+    db.execute(
+        "INSERT INTO public.orders VALUES \
+         (1, 'east', 10), \
+         (2, 'west', 20), \
+         (3, 'west', 15)",
+    )
+    .await;
+
+    // Storage table reflects the pre-update window state.
+    db.execute(
+        "INSERT INTO public.window_row_number_st VALUES \
+         (1, 1, 'east', 10, 1), \
+         (2, 2, 'east', 20, 2), \
+         (3, 3, 'west', 15, 1)",
+    )
+    .await;
+
+    // UPDATE: order 2 moves from 'east' to 'west' (amount unchanged).
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, new_id, new_region, new_amount, old_id, old_region, old_amount) \
+         VALUES ('0/1', 'U', 2, 2, 'west', 20, 2, 'east', 20)",
+    )
+    .await;
+
+    // Both partitions are affected: east loses row 2, west gains row 2.
+    // East new state: {(1,10)} → rn=1.  West new state: {(3,15),(2,20)} → rn=1,2.
+    assert_eq!(
+        query_window_rows(&db, &sql, "rn").await,
+        vec![
+            ("D".to_string(), 1, "east".to_string(), 10, 1),
+            ("D".to_string(), 2, "east".to_string(), 20, 2),
+            ("D".to_string(), 3, "west".to_string(), 15, 1),
+            ("I".to_string(), 1, "east".to_string(), 10, 1),
+            ("I".to_string(), 2, "west".to_string(), 20, 2),
+            ("I".to_string(), 3, "west".to_string(), 15, 1),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_window_executes_multi_window_expression_recompute() {
+    let db = setup_window_db().await;
+    let sql = make_window_ctx("window_multi_st")
+        .differentiate(&build_multi_window_tree())
+        .expect("multi-window differentiation should succeed");
+
+    db.execute(
+        "TRUNCATE TABLE pgtrickle_changes.changes_1, public.window_multi_st, public.orders RESTART IDENTITY",
+    )
+    .await;
+
+    // Initial east partition: orders 1 (amount=10) and 2 (amount=20).
+    db.execute(
+        "INSERT INTO public.orders VALUES \
+         (1, 'east', 10), \
+         (2, 'east', 20), \
+         (3, 'east', 15)",
+    )
+    .await;
+
+    // Storage reflects pre-insert window state for east: two rows.
+    db.execute(
+        "INSERT INTO public.window_multi_st VALUES \
+         (1, 1, 'east', 10, 1, 10), \
+         (2, 2, 'east', 20, 2, 30)",
+    )
+    .await;
+
+    // INSERT order 3 into east partition (new current state already seeded above).
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, new_id, new_region, new_amount) \
+         VALUES ('0/1', 'I', 3, 3, 'east', 15)",
+    )
+    .await;
+
+    // After insert, east sorted by amount: (1,10)→rn=1,rt=10, (3,15)→rn=2,rt=25, (2,20)→rn=3,rt=45.
+    // Both ROW_NUMBER and the running SUM update for the whole partition.
+    assert_eq!(
+        query_multi_window_rows(&db, &sql).await,
+        vec![
+            ("D".to_string(), 1, "east".to_string(), 10, 1_i64, 10_i64),
+            ("D".to_string(), 2, "east".to_string(), 20, 2_i64, 30_i64),
+            ("I".to_string(), 1, "east".to_string(), 10, 1_i64, 10_i64),
+            ("I".to_string(), 2, "east".to_string(), 20, 3_i64, 45_i64),
+            ("I".to_string(), 3, "east".to_string(), 15, 2_i64, 25_i64),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_scalar_subquery_executes_simultaneous_outer_and_inner_change() {
+    // Exercises the DBSP cross-product formula Δ(C × S) = (ΔC × S₁) + (C₀ × ΔS)
+    // when both the outer child (orders) and inner scalar source (config) change
+    // in the same batch.  The C₀ pre-image (computed via EXCEPT ALL) must exclude
+    // the newly inserted order row from the Part-2 DELETE output.
+    let db = setup_scalar_db().await;
+    let sql = make_scalar_ctx()
+        .differentiate(&build_scalar_subquery_tree())
+        .expect("scalar-subquery differentiation should succeed");
+
+    db.execute(
+        "TRUNCATE TABLE pgtrickle_changes.changes_1, pgtrickle_changes.changes_2, public.orders, public.config RESTART IDENTITY",
+    )
+    .await;
+
+    // Post-change state: order 3 inserted, config tax_rate updated to 20.
+    db.execute("INSERT INTO public.orders VALUES (1, 100), (2, 200), (3, 300)")
+        .await;
+    db.execute("INSERT INTO public.config VALUES (1, 20)").await;
+
+    // Outer change: INSERT order (3, 300).
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 \
+         (lsn, action, pk_hash, new_id, new_amount) \
+         VALUES ('0/1', 'I', 3, 3, 300)",
+    )
+    .await;
+
+    // Inner change: UPDATE config tax_rate from 10 → 20.
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_2 \
+         (lsn, action, pk_hash, new_id, new_tax_rate, old_id, old_tax_rate) \
+         VALUES ('0/2', 'U', 1, 1, 20, 1, 10)",
+    )
+    .await;
+
+    // Part 1 (ΔC × S₁): new outer row (3,300) with new scalar 20 → I(3,300,20).
+    // Part 2 (C₀ × ΔS): C₀ = {(1,100),(2,200)} (excludes the inserted row 3).
+    //   Emits D(1,100,10), D(2,200,10) and I(1,100,20), I(2,200,20).
+    // Row (3,300) must NOT appear in any Part-2 DELETE — that would indicate
+    // the implementation is incorrectly using C₁ instead of C₀.
+    assert_eq!(
+        query_scalar_rows(&db, &sql).await,
+        vec![
+            ("D".to_string(), 1, 100, 10),
+            ("D".to_string(), 2, 200, 10),
+            ("I".to_string(), 1, 100, 20),
+            ("I".to_string(), 2, 200, 20),
+            ("I".to_string(), 3, 300, 20),
+        ]
     );
 }
