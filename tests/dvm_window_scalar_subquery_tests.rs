@@ -10,7 +10,7 @@ mod common;
 
 use common::TestDb;
 use pg_trickle::dvm::DiffContext;
-use pg_trickle::dvm::parser::{Column, Expr, OpTree, SortExpr, WindowExpr};
+use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree, SortExpr, WindowExpr};
 use pg_trickle::version::Frontier;
 
 fn int_col(name: &str) -> Column {
@@ -279,6 +279,22 @@ CREATE TABLE public.orders (
     id INT PRIMARY KEY,
     region TEXT NOT NULL,
     amount INT NOT NULL
+);
+
+CREATE TABLE public.window_unpartitioned_st (
+    __pgt_row_id BIGINT PRIMARY KEY,
+    id INT NOT NULL,
+    region TEXT NOT NULL,
+    amount INT NOT NULL,
+    rn BIGINT NOT NULL
+);
+
+CREATE TABLE public.window_over_agg_st (
+    __pgt_row_id BIGINT PRIMARY KEY,
+    region TEXT NOT NULL,
+    sum_amount BIGINT NOT NULL,
+    __pgt_count BIGINT NOT NULL,
+    rank_amount BIGINT NOT NULL
 );
 
 CREATE TABLE public.window_row_number_st (
