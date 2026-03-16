@@ -41,9 +41,11 @@ We also do not think the use of AI should lower the standard for trust. If anyth
 - **Hybrid CDC (optional)** — when `wal_level = logical` is available, the system can automatically transition from triggers to WAL-based (logical replication) capture for lower write-side overhead. Controlled by the `pg_trickle.cdc_mode` GUC (`trigger` / `auto` / `wal`).
 - **DAG-aware scheduling** — stream tables that depend on other stream tables are refreshed in topological order. `CALCULATED` schedule propagation is supported.
 - **Diamond dependency consistency** — diamond-shaped DAGs (A→B→D, A→C→D) can be refreshed atomically to prevent split-version reads.
+- **Circular dependency support** — monotone dependency cycles can be enabled explicitly and are refreshed to a fixed point with convergence guardrails and monitoring.
+- **Watermark gating** — external loaders can publish per-source watermarks so downstream refreshes wait until related sources are aligned.
 - **Multi-database auto-discovery** — a single launcher worker automatically spawns per-database scheduler workers for every database that has the extension installed. No manual per-database configuration needed.
 - **Crash-safe** — advisory locks prevent concurrent refreshes; crash recovery marks in-flight refreshes as failed and resumes normal operation.
-- **Observable** — built-in monitoring views (`pgtrickle.pg_stat_stream_tables`), refresh history, slot health checks, staleness reporting, `NOTIFY`-based alerting, and seven dedicated observability functions (`health_check`, `change_buffer_sizes`, `dependency_tree`, `refresh_timeline`, `trigger_inventory`, `list_sources`, `diamond_groups`).
+- **Observable** — built-in monitoring views, refresh history, slot health checks, staleness reporting, SCC status, watermark status, `NOTIFY`-based alerting, and dedicated helper functions such as `health_check`, `change_buffer_sizes`, `dependency_tree`, `refresh_timeline`, `trigger_inventory`, `list_sources`, `diamond_groups`, and `pgt_scc_status`.
 
 ## SQL Support
 
@@ -244,7 +246,7 @@ SELECT pgtrickle.drop_stream_table('regional_totals');
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
 | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) | Supported operators and differentiation rules |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | GUC variables and tuning guide |
-| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.4.0) |
+| [ROADMAP.md](ROADMAP.md) | Release milestones and future plans (current milestone: v0.8.0) |
 
 ### Research & Plans
 

@@ -739,10 +739,10 @@ SET pg_trickle.foreign_table_polling = true;
 
 ### Circular Dependencies
 
-> **v0.6.0+** — Foundation settings for circular stream table dependencies.
-> The actual fixed-point refresh execution is planned for v0.7.0. These
-> settings control whether cycle creation is allowed and set iteration
-> safety limits.
+> **v0.7.0+** — Circular dependency support is now fully available for safe
+> monotone cycles in DIFFERENTIAL mode. These settings control whether cycles
+> are allowed at all and how many fixpoint iterations the scheduler will try
+> before surfacing a non-convergence error.
 
 ### pg_trickle.allow_circular
 
@@ -815,7 +815,7 @@ pg_trickle.max_grouping_set_branches = 64
 pg_trickle.ivm_topk_max_limit = 1000
 pg_trickle.ivm_recursive_max_depth = 100
 
-# Circular dependencies (v0.6.0+, foundation only)
+# Circular dependencies (v0.7.0+)
 pg_trickle.allow_circular = false                # master switch
 pg_trickle.max_fixpoint_iterations = 100         # convergence limit
 

@@ -882,20 +882,24 @@ impl E2eDb {
         // - EXCEPT (set):    visible iff count_l > 0 AND count_r = 0
         // - EXCEPT ALL:      visible iff count_l > count_r
         let dq_upper = defining_query.to_uppercase();
-        let set_op_filter = if has_dual_counts {
+        let st_relation = if has_dual_counts {
             if dq_upper.contains("INTERSECT ALL") {
-                " WHERE LEAST(__pgt_count_l, __pgt_count_r) > 0"
+                format!(
+                    "{st_table} CROSS JOIN generate_series(1, LEAST(__pgt_count_l, __pgt_count_r)::integer) WHERE LEAST(__pgt_count_l, __pgt_count_r) > 0"
+                )
             } else if dq_upper.contains("INTERSECT") {
-                " WHERE __pgt_count_l > 0 AND __pgt_count_r > 0"
+                format!("{st_table} WHERE __pgt_count_l > 0 AND __pgt_count_r > 0")
             } else if dq_upper.contains("EXCEPT ALL") {
-                " WHERE __pgt_count_l > __pgt_count_r"
+                format!(
+                    "{st_table} CROSS JOIN generate_series(1, GREATEST(0, __pgt_count_l - __pgt_count_r)::integer) WHERE GREATEST(0, __pgt_count_l - __pgt_count_r) > 0"
+                )
             } else if dq_upper.contains("EXCEPT") {
-                " WHERE __pgt_count_l > 0 AND __pgt_count_r = 0"
+                format!("{st_table} WHERE __pgt_count_l > 0 AND __pgt_count_r = 0")
             } else {
-                ""
+                st_table.to_string()
             }
         } else {
-            ""
+            st_table.to_string()
         };
 
         // If there are json columns, wrap both sides to cast consistently.
@@ -906,21 +910,21 @@ impl E2eDb {
             // json columns present: cast them on both sides of EXCEPT ALL
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {cast_cols} FROM {st_table}{set_op_filter} \
+                    (SELECT {cast_cols} FROM {st_relation} \
                      EXCEPT ALL \
                      SELECT {cast_cols} FROM ({defining_query}) __pgt_dq) \
                     UNION ALL \
                     (SELECT {cast_cols} FROM ({defining_query}) __pgt_dq2 \
                      EXCEPT ALL \
-                     SELECT {cast_cols} FROM {st_table}{set_op_filter}) \
+                     SELECT {cast_cols} FROM {st_relation}) \
                 )"
             )
         } else {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {raw_cols} FROM {st_table}{set_op_filter} EXCEPT ALL ({defining_query})) \
+                    (SELECT {raw_cols} FROM {st_relation} EXCEPT ALL ({defining_query})) \
                     UNION ALL \
-                    (({defining_query}) EXCEPT ALL SELECT {raw_cols} FROM {st_table}{set_op_filter}) \
+                    (({defining_query}) EXCEPT ALL SELECT {raw_cols} FROM {st_relation}) \
                 )"
             )
         };

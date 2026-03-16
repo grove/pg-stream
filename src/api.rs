@@ -4,6 +4,7 @@
 //! interface for creating, altering, dropping, and refreshing stream tables.
 
 use pgrx::prelude::*;
+use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::catalog::{CdcMode, RefreshRecord, StDependency, StreamTableMeta};
@@ -559,7 +560,7 @@ fn validate_and_parse_query(
     refresh_mode: &mut RefreshMode,
     is_auto: bool,
 ) -> Result<ValidatedQuery, PgTrickleError> {
-    // Validate the defining query by running LIMIT 0
+    // Validate the defining query and extract output columns
     let columns = validate_defining_query(query)?;
 
     // TopK detection — must run BEFORE reject_limit_offset
@@ -719,7 +720,7 @@ fn validate_and_parse_query(
         .is_some_and(|pr| pr.tree.needs_union_dedup_count());
 
     // Extract source dependencies
-    let source_relids = extract_source_relations(q)?;
+    let source_relids = normalize_source_relations(extract_source_relations(q)?);
 
     // EC-06: Detect keyless sources
     let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
@@ -2142,8 +2143,20 @@ fn drop_stream_table(name: &str) {
 }
 
 fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
+    let mut visited_pgt_ids = HashSet::new();
+    drop_stream_table_impl_inner(name, &mut visited_pgt_ids)
+}
+
+fn drop_stream_table_impl_inner(
+    name: &str,
+    visited_pgt_ids: &mut HashSet<i64>,
+) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
+    if !visited_pgt_ids.insert(st.pgt_id) {
+        return Ok(());
+    }
 
     // CASCADE: drop all stream tables that depend on this one first.
     // `get_downstream_pgt_ids` finds STs whose defining queries read from
@@ -2153,7 +2166,7 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     for downstream_id in downstream_ids {
         if let Some(downstream_st) = StreamTableMeta::get_by_id(downstream_id)? {
             let qualified = format!("{}.{}", downstream_st.pgt_schema, downstream_st.pgt_name);
-            drop_stream_table_impl(&qualified)?;
+            drop_stream_table_impl_inner(&qualified, visited_pgt_ids)?;
         }
     }
 
@@ -3804,30 +3817,76 @@ pub struct ColumnDef {
     pub type_oid: PgOid,
 }
 
-/// Validate a defining query by executing `SELECT ... LIMIT 0`.
+/// Validate a defining query and extract its output columns via parse analysis.
+///
+/// This avoids executing the query body during validation, which is important
+/// for stream-table cycles where a plain `SELECT ... LIMIT 0` can still reach
+/// change-buffer-dependent paths for upstream stream tables.
 fn validate_defining_query(query: &str) -> Result<Vec<ColumnDef>, PgTrickleError> {
-    let check_sql = format!("SELECT * FROM ({query}) sub LIMIT 0");
+    use pgrx::PgList;
+    use std::ffi::{CStr, CString};
 
-    // Execute to verify syntax and extract columns
-    Spi::connect(|client| {
-        let result = client
-            .select(&check_sql, None, &[])
-            .map_err(|e| PgTrickleError::QueryParseError(format!("{}", e)))?;
+    let c_sql = CString::new(query)
+        .map_err(|e| PgTrickleError::QueryParseError(format!("Query contains null byte: {}", e)))?;
 
-        // Extract column info from the result tuple descriptor
-        let ncols = result
-            .columns()
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    // SAFETY: We call PostgreSQL's raw parser and analyzer with a valid query
+    // string inside a backend. The returned parse/analyze nodes remain valid
+    // for the duration of this function.
+    unsafe {
+        let raw_list = pg_sys::raw_parser(c_sql.as_ptr(), pg_sys::RawParseMode::RAW_PARSE_DEFAULT);
+        let stmts = PgList::<pg_sys::RawStmt>::from_pg(raw_list);
+
+        if stmts.len() != 1 {
+            return Err(PgTrickleError::QueryParseError(format!(
+                "Expected 1 statement, got {}",
+                stmts.len()
+            )));
+        }
+
+        let raw_stmt = stmts.get_ptr(0).ok_or_else(|| {
+            PgTrickleError::QueryParseError("Query produced no parse tree nodes".into())
+        })?;
+
+        let query_node = pg_sys::parse_analyze_fixedparams(
+            raw_stmt,
+            c_sql.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+        );
+
+        if query_node.is_null() {
+            return Err(PgTrickleError::QueryParseError(
+                "Query analysis returned null".into(),
+            ));
+        }
+
+        let target_list = PgList::<pg_sys::TargetEntry>::from_pg((*query_node).targetList);
         let mut columns = Vec::new();
-        for i in 1..=ncols {
-            let col_name = result
-                .column_name(i)
-                .unwrap_or_else(|_| format!("column_{}", i));
-            let col_type_oid = result.column_type_oid(i).unwrap_or(PgOid::Invalid);
-            columns.push(ColumnDef {
-                name: col_name,
-                type_oid: col_type_oid,
-            });
+
+        for (index, tle_ptr) in target_list.iter_ptr().enumerate() {
+            if tle_ptr.is_null() {
+                continue;
+            }
+
+            let tle = &*tle_ptr;
+            if tle.resjunk {
+                continue;
+            }
+
+            let name = if !tle.resname.is_null() {
+                CStr::from_ptr(tle.resname).to_string_lossy().into_owned()
+            } else {
+                format!("column_{}", index + 1)
+            };
+
+            let type_oid = if tle.expr.is_null() {
+                PgOid::Invalid
+            } else {
+                PgOid::from(pg_sys::exprType(tle.expr as *const pg_sys::Node))
+            };
+
+            columns.push(ColumnDef { name, type_oid });
         }
 
         if columns.is_empty() {
@@ -3837,7 +3896,7 @@ fn validate_defining_query(query: &str) -> Result<Vec<ColumnDef>, PgTrickleError
         }
 
         Ok(columns)
-    })
+    }
 }
 
 /// Parsed schedule specification — either a duration-based schedule
@@ -4393,6 +4452,15 @@ fn classify_source_relation(oid: pg_sys::Oid) -> String {
         "f" => "FOREIGN_TABLE".to_string(),
         _ => "TABLE".to_string(),
     }
+}
+
+fn normalize_source_relations(
+    source_relids: Vec<(pg_sys::Oid, String)>,
+) -> Vec<(pg_sys::Oid, String)> {
+    source_relids
+        .into_iter()
+        .map(|(oid, _)| (oid, classify_source_relation(oid)))
+        .collect()
 }
 
 /// Check for cycles after adding the proposed dependency edges.

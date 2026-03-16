@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-15
-> **Latest release:** 0.6.0 (2026-03-14)
-> **Current milestone:** v0.7.0 — Watermarks, Circular DAG Execution & Last Differential Gaps
+> **Last updated:** 2026-03-16
+> **Latest release:** 0.7.0 (2026-03-16)
+> **Current milestone:** v0.8.0 — Connection Pooler Compatibility & pg_dump Support
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -24,7 +24,7 @@ coverage, all in plain language.
 - [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
 - [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
 - [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
-- [v0.8.0 — Connection Pooler Compatibility](#v080--connection-pooler-compatibility)
+- [v0.8.0 — Connection Pooler Compatibility & pg_dump Support](#v080--connection-pooler-compatibility--pg_dump-support)
 - [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
 - [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
 - [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
@@ -47,20 +47,20 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
 1.0 and beyond.
 
 ```
-                                                                                                            We are here
-                                                                                                                 │
-                                                                                                                 ▼
- ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
- │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │ │ 0.7.0  │
- │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│WM &   │
- │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │Cycl.  │
- └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
-      │
-      └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
-         │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │
-         │Pooler  │─│Observ.,│─│Incr.Agg │─│Partn.   │─│Delta,   │
-         │Compat. │ │Fuse&Dmp│ │IVM      │ │&Scale   │ │CDC&PGBk │
-         └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘
+                                                                                                                   We are here
+                                                                                                                     │
+                                                                                                                     ▼
+                                                                   ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+                                                                   │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │ │ 0.7.0  │
+                                                                   │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│
+                                                                   │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │ │ ✅      │
+                                                                   └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+                                                                     │
+                                                                     └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
+                                                                        │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │
+                                                                        │Pooler  │─│Observ.,│─│Incr.Agg │─│Partn.   │─│Delta,   │
+                                                                        │Compat. │ │Fuse&Dmp│ │IVM      │ │&Scale   │ │CDC&PGBk │
+                                                                        └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘
               │
               └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
                  │ 0.13.0  │ │ 0.14.0  │ │ 1.0.0  │ │ 1.x+   │
@@ -1111,6 +1111,8 @@ Forms the prerequisite for full SCC-based fixpoint refresh in v0.7.0.
 
 ## v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure
 
+**Status: Released (2026-03-16).**
+
 **Goal:** Land Part 9 performance improvements (parallel refresh
 scheduling, MERGE strategy optimization, advanced benchmarks), add
 user-injected temporal watermark gating for batch-ETL coordination,
@@ -1860,7 +1862,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | ✅ Released |
 | v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | ✅ Released |
 | v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
-| v0.8.0 — Connection Pooler Compatibility | ~12–17d | — | |
+| v0.8.0 — Connection Pooler Compatibility & pg_dump Support | ~12–17d | — | |
 | v0.9.0 — Observability, Anomaly Detection & pg_dump Support | ~33–37h | — | |
 | v0.10.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
 | v0.11.0 — Partitioned Stream Tables & Operational Scale (A-1, C-2, C-3) | ~9–13 wk | — | |
