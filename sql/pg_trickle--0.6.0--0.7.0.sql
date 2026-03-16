@@ -100,7 +100,7 @@ RETURNS TABLE (
     "wal_lsn"      TEXT
 )
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'watermarks_wrapper';
+AS 'MODULE_PATHNAME', 'watermarks_fn_wrapper';
 
 -- watermark_groups(): all watermark group definitions.
 CREATE FUNCTION pgtrickle."watermark_groups"()
@@ -111,7 +111,7 @@ RETURNS TABLE (
     "created_at"     TIMESTAMPTZ
 )
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'watermark_groups_wrapper';
+AS 'MODULE_PATHNAME', 'watermark_groups_fn_wrapper';
 
 -- watermark_status(): live alignment status per group.
 CREATE FUNCTION pgtrickle."watermark_status"()
@@ -125,4 +125,4 @@ RETURNS TABLE (
     "sources_total"          INT
 )
 LANGUAGE c
-AS 'MODULE_PATHNAME', 'watermark_status_wrapper';
+AS 'MODULE_PATHNAME', 'watermark_status_fn_wrapper';

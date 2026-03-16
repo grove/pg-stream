@@ -8,22 +8,22 @@
 #   ALTER EXTENSION pg_trickle UPDATE TO '<to>';
 #
 # Multi-hop upgrade chains are supported automatically. For example, when
-# upgrading 0.1.3 → 0.2.3, this script validates that the full chain exists
-# (0.1.3→0.2.0, 0.2.0→0.2.1, 0.2.1→0.2.2, and 0.2.2→0.2.3), then the Dockerfile copies all upgrade
-# scripts so PostgreSQL can chain them automatically via BFS path-finding.
+# upgrading 0.1.3 → 0.7.0, this script validates that the full chain exists,
+# then the Dockerfile copies all upgrade scripts so PostgreSQL can chain them
+# automatically via BFS path-finding.
 #
 # Prerequisites: the base E2E image must be built first.
 #   ./tests/build_e2e_image.sh
 #
 # Usage:
-#   ./tests/build_e2e_upgrade_image.sh                  # defaults: 0.1.3 → 0.2.3
-#   ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.3     # explicit versions
-#   ./tests/build_e2e_upgrade_image.sh 0.1.3 0.2.3 --no-cache
+#   ./tests/build_e2e_upgrade_image.sh                  # defaults: 0.6.0 → 0.7.0
+#   ./tests/build_e2e_upgrade_image.sh 0.6.0 0.7.0     # explicit versions
+#   ./tests/build_e2e_upgrade_image.sh 0.6.0 0.7.0 --no-cache
 # =============================================================================
 set -euo pipefail
 
-FROM_VERSION="${1:-0.1.3}"
-TO_VERSION="${2:-0.2.3}"
+FROM_VERSION="${1:-0.6.0}"
+TO_VERSION="${2:-0.7.0}"
 shift 2 2>/dev/null || true
 EXTRA_ARGS="${*:-}"
 
@@ -55,7 +55,7 @@ if [[ ! -f "$ARCHIVE_SQL" ]]; then
     exit 1
 fi
 
-# Validate the upgrade chain exists (supports multi-hop, e.g. 0.1.3→0.2.0→0.2.1→0.2.2).
+# Validate the upgrade chain exists (supports multi-hop, e.g. 0.1.3→0.7.0).
 # Walks the chain by following available pg_trickle--<V>--<NEXT>.sql files.
 echo "Validating upgrade chain: ${FROM_VERSION} → ${TO_VERSION}"
 current="$FROM_VERSION"
