@@ -213,7 +213,7 @@ async fn test_multi_window_lag_lead_nulls() {
     db.execute("INSERT INTO mwin_ll_src VALUES (1, 1, NULL), (2, 1, 10), (3, 1, NULL)")
         .await;
 
-    let q = "SELECT id, grp, LAG(val) OVER (PARTITION BY grp ORDER BY id) as l1, LEAD(val) OVER (PARTITION BY grp ORDER BY id) as l2 FROM mwin_ll_src";
+    let q = "SELECT id, grp, val, LAG(val) OVER (PARTITION BY grp ORDER BY id) as l1, LEAD(val) OVER (PARTITION BY grp ORDER BY id) as l2 FROM mwin_ll_src";
 
     db.create_st("mwin_ll_st", q, "1m", "DIFFERENTIAL").await;
 
