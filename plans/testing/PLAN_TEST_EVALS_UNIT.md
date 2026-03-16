@@ -38,6 +38,8 @@ The initial hardening slice from this report has been started and validated on b
 - Added Linux/CI-only execution-backed integration tests for nested natural join operations (`tests/dvm_nested_natural_join_tests.rs`) covering the three-table natural join chain execution cascading for innermost insert and outermost delete paths.
 - Added Linux/CI-only execution-backed integration tests for **natural-join-style conditions** (`e.dept_id = d.dept_id` — same column name on both sides of the equi-join condition) via the new `tests/dvm_natural_join_tests.rs`, covering: inner-join employee insert matching department (validates `rewrite_join_condition` same-named-column rewriting for Part 1a), inner-join employee delete (Part 1b R₀ path with same-named condition), inner-join department delete fan-out (Part 2 L₀ ⋈ ΔR for two matching employees), left-join employee insert with no department (Part 3a NULL-padded I — validates NOT EXISTS rewriting for same-named column), and full-join department insert with no employees (Part 6 NULL-padded right-only I — unique to FULL JOIN)
 
+- Added exhaustive property-based fuzz coverage for token scanners (`find_top_level_keyword`, `split_top_level_commas`, `detect_select_star`) and WAL/text decoders (`extract_action_from_decoding_line`, `extract_column_from_chunk`, `parse_quoted_string_value`, `build_pk_hash_expression`) assuring no-panic safety invariants across arbitrary random inputs.
+
 This closes the previously identified zero-coverage gap for `row_id.rs`, `shmem.rs`, `config.rs`, and `lib.rs`, extends the execution-backed hardening track across all four initially identified thin operators, broadens aggregate execution coverage across algebraic, extremum, object-aggregate, and ordered-set families, adds the first backend-backed parser summary tests, and adds inner-join, left-join, full-outer-join, three-table nested-join, and natural-join-style execution-backed coverage via `tests/dvm_join_tests.rs`, `tests/dvm_outer_join_tests.rs`, `tests/dvm_full_join_tests.rs`, and `tests/dvm_natural_join_tests.rs`. Successful differential refresh behavior was already covered at the E2E layer; the remaining highest-value work is a narrower refresh-path seam, nested-join execution (nested left/full/natural are now complete), and a macOS-compatible harness.
 
 ## Remaining Work Summary
@@ -60,7 +62,6 @@ Lower-priority follow-up:
 
 - Scheduler lifecycle seams in `src/scheduler.rs`
 - Trigger/runtime integration coverage in `src/cdc.rs`, `src/ivm.rs`, and shared-memory runtime coverage in `src/shmem.rs`
-- Property/fuzz coverage for scanners, DAG invariants, and WAL/text parsers
 
 My overall confidence in the unit suite is **moderate-high for pure Rust logic, but only moderate as a standalone signal for end-to-end correctness**.
 

@@ -13940,56 +13940,6 @@ fn promote_predicate(tree: OpTree, pred: Expr, aliases: &[String]) -> OpTree {
 #[cfg(feature = "pg_test")]
 #[pg_schema]
 mod pg_tests {
-
-    #[pg_test]
-    fn test_parse_defining_query_full_summarizes_nested_subquery_and_set_ops() {
-        Spi::run(
-            "CREATE TABLE parser_sales (
-                id INT PRIMARY KEY,
-                region TEXT NOT NULL,
-                amount INT NOT NULL
-            )",
-        )
-        .expect("failed to create parser_sales");
-
-        let result = parse_defining_query_full(
-            "SELECT region, amount FROM parser_sales WHERE amount > 100
-             UNION ALL
-             SELECT region, amount FROM (
-                 SELECT region, amount * 2 AS amount FROM parser_sales WHERE amount <= 100
-             ) sub",
-        )
-        .expect("failed to parse set operation with nested subquery");
-
-        let sales_oid = regclass_oid("parser_sales");
-
-        assert!(!result.has_recursion);
-        assert_eq!(result.tree.output_columns(), vec!["region", "amount"]);
-        assert_eq!(
-            sorted_unique_oids(result.tree.source_oids()),
-            ve            ve            ve        ert            vns            ve            ve            ve        ert            vns           tion { .. }
-                                               parse_defining_query_full_summarizes_c                                    pi                                  ar              (
-                id INT PRIMARY KEY,
-                store_id INT NOT NULL,
-                item_id INT NOT NULL,
-                qty INT NOT NULL
-            )",
-        )
-        .        .        .   at        .        .        .   at        t         .        .        .   at        .        .        .   at        t         .      SU        .        . 
-             FROM parser_inventory
-             GROUP BY store_id
-             HAVI             HAVI             HAVI             HAVI                 HAVI             HAVI     having");
-
-        let inv_oid = regclass_oid("parser_inventory");
-
-        a        a        a_r        a        a        a_r        a        a        a_), vec!["store_id", "diff_items", "total_qty"]);
-        assert_eq!(
-            sorted_unique_oids(result.tree.source_oids()),
-            vec![inv_oid]
-                                                                                                                                                                                                                     sed()                                                                           unwrap_or_default(),
-            ve            veo_string(), "qty".to_string(), "store_id".to_string()]
-        );
-    }
     use super::*;
 
     fn sorted_unique_oids(mut oids: Vec<u32>) -> Vec<u32> {

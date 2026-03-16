@@ -1573,6 +1573,30 @@ fn detect_schema_mismatch(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_extract_action_never_panics(s in ".*") {
+            let _ = extract_action_from_decoding_line(&s);
+        }
+
+        #[test]
+        fn prop_extract_column_never_panics(s in ".*", col in "[a-zA-Z0-9_]+") {
+            let _ = extract_column_from_chunk(&s, &col);
+        }
+
+        #[test]
+        fn prop_parse_quoted_string_never_panics(s in ".*") {
+            let _ = parse_quoted_string_value(&s);
+        }
+
+        #[test]
+        fn prop_build_pk_hash_expression_never_panics(cols in proptest::collection::vec("[a-zA-Z0-9_]+", 0..10)) {
+            let _ = build_pk_hash_expression(&cols);
+        }
+    }
+
     use super::*;
 
     // ── Naming convention tests ────────────────────────────────────

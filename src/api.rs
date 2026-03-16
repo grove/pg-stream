@@ -5038,6 +5038,25 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_split_top_level_commas_never_panics(s in ".*") {
+            let _ = split_top_level_commas(&s);
+        }
+
+        #[test]
+        fn prop_find_top_level_keyword_never_panics(s in ".*", kw in "[A-Za-z]+") {
+            let _ = find_top_level_keyword(&s, &kw);
+        }
+
+        #[test]
+        fn prop_detect_select_star_never_panics(s in ".*") {
+            let _ = detect_select_star(&s);
+        }
+    }
+
     use super::*;
 
     #[test]
