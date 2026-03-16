@@ -884,11 +884,11 @@ impl E2eDb {
         let dq_upper = defining_query.to_uppercase();
         let set_op_filter = if has_dual_counts {
             if dq_upper.contains("INTERSECT ALL") {
-                " WHERE LEAST(__pgt_count_l, __pgt_count_r) > 0"
+                ", generate_series(1, LEAST(__pgt_count_l, __pgt_count_r)) WHERE LEAST(__pgt_count_l, __pgt_count_r) > 0"
             } else if dq_upper.contains("INTERSECT") {
                 " WHERE __pgt_count_l > 0 AND __pgt_count_r > 0"
             } else if dq_upper.contains("EXCEPT ALL") {
-                " WHERE __pgt_count_l > __pgt_count_r"
+                ", generate_series(1, __pgt_count_l - __pgt_count_r) WHERE __pgt_count_l > __pgt_count_r"
             } else if dq_upper.contains("EXCEPT") {
                 " WHERE __pgt_count_l > 0 AND __pgt_count_r = 0"
             } else {
