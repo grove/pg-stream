@@ -9,7 +9,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
-- [0.7.0 — Unreleased](#070--unreleased)
+- [0.7.0 — 2026-03-16](#070--2026-03-16)
 - [0.6.0 — 2026-03-14](#060--2026-03-14)
 - [0.5.0 — 2026-03-13](#050--2026-03-13)
 - [0.4.0 — 2026-03-12](#040--2026-03-12)
@@ -28,206 +28,121 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-### Added
-
-- **User-defined aggregates (UDAs) in DIFFERENTIAL mode.** Custom aggregates
-  created with `CREATE AGGREGATE` (including PostGIS, pgvector, and user-created
-  functions) are now supported in DIFFERENTIAL and AUTO modes using the
-  group-rescan strategy. Previously these fell back to FULL refresh in AUTO mode
-  or produced errors in explicit DIFFERENTIAL mode.
-
-- **Multiple OR+sublink conjuncts in WHERE clauses.** Queries with two or more
-  `(a OR EXISTS(...))` patterns combined with AND are now rewritten to UNION
-  branches for DIFFERENTIAL mode. A combinatorial guard limits expansion to
-  16 UNION branches. Previously only the first OR+sublink conjunct was handled;
-  additional ones caused FULL fallback or errors.
-
-- **De Morgan normalization for NOT+sublink patterns.** `NOT (a AND NOT EXISTS(...))`
-  is now automatically rewritten to `(NOT a) OR EXISTS(...)` using De Morgan's
-  law, exposing previously hidden OR+sublink patterns for the UNION rewrite.
-  Handles NOT(AND), NOT(OR), and NOT(NOT) with double-negation elimination.
-
-- **Multi-pass OR+sublink rewrite pipeline.** The De Morgan normalization and
-  UNION rewrite now run in a fixed-point loop (up to 3 iterations), correctly
-  handling patterns that require multiple transformation passes.
-
-- **E2E tests for differential mode gaps.** New test file
-  `e2e_differential_gaps_tests.rs` with 14 tests covering UDA creation,
-  FILTER/ORDER BY/schema-qualified UDAs, full CDC cycles, AUTO mode resolution,
-  De Morgan normalization, and multi-OR-sublink patterns.
-
-### Performance
-
-- **Optimized `prefixed_col_list` and `col_list`** — eliminated intermediate
-  `Vec` allocation by streaming directly into a pre-allocated `String`.
-  Addresses the +34% `prefixed_col_list/20` Criterion regression identified
-  in Part 9 Session 1 (A-3).
-- **Optimized LSN comparison** — replaced `split('/').collect::<Vec<_>>()`
-  with `split_once('/')` in `lsn_gt()`, eliminating a heap allocation on
-  every LSN comparison. Addresses the +22% `lsn_gt` Criterion regression
-  (A-4).
-- **DAG level extraction (C-1):** `topological_levels()` on `StDag` and
-  `ExecutionUnitDag` returns successive parallel-dispatch levels for
-  level-parallel refresh scheduling.
-- **xxh64 hash-based change detection (D-1):** Wide tables (≥50 columns)
-  now use `pgtrickle.pg_trickle_hash(concat_ws(...))` instead of
-  `md5(concat(...))` in the MERGE IS DISTINCT FROM clause, reducing hash
-  computation cost.
-- **Aggregate saturation bypass (D-2):** When an aggregate stream table
-  has more pending changes than materialized groups, the refresh engine
-  now falls back to FULL immediately, avoiding expensive per-row MERGE.
-- **Cost-based strategy selection (D-3):** The adaptive threshold now blends
-  the single-cycle ratio-based signal with a cost model estimated from
-  recent `pgt_refresh_history` entries, improving fallback accuracy for
-  workloads with variable delta sizes.
-
-### Improved
-
-- **Benchmark infrastructure** — five improvements from PLAN_PERFORMANCE_PART_9
-  Session 2:
-  - **Per-cycle CSV output (I-2):** E2E benchmarks now emit machine-parseable
-    `[BENCH_CYCLE]` lines to stderr, enabling external histogram analysis
-    and trend detection without changing the human-readable tables.
-  - **EXPLAIN ANALYZE capture (I-3):** Set `PGS_BENCH_EXPLAIN=true` to
-    capture EXPLAIN (ANALYZE, BUFFERS) plans for the defining query on the
-    first measured cycle. Plans are saved to `/tmp/bench_plans/`.
-  - **1M-row benchmark tier (I-6):** New `bench_*_1m_*` individual tests
-    and `bench_large_matrix` that includes 10K, 100K, and 1M-row tiers for
-    production-scale performance validation.
-  - **Criterion noise reduction (I-8):** Critical benchmarks (`quote_ident`,
-    `col_list`, `prefixed_col_list`, `lsn_gt`, `diff_scan`) now use
-    `sample_size(200)` and `measurement_time(10s)` for more reliable
-    comparisons.
-  - **Docker benchmark target (I-1c):** New `just bench-docker` target runs
-    Criterion benchmarks inside the builder Docker image for environments
-    where local pg_stub linking is problematic.
-- **Advanced benchmark suite** — Session 6 improvements:
-  - **Cross-run comparison tool (I-4):** Benchmarks now emit JSON results
-    to `target/bench_results/`. New `just bench-compare` target and
-    `scripts/bench_compare.sh` for color-coded regression/improvement
-    reporting across runs.
-  - **Concurrent writer benchmarks (I-5):** New `bench_concurrent_writers`
-    test sweeps 1/2/4/8 writer connections to stress-test CDC trigger
-    contention and BIGSERIAL locking under parallel DML.
-  - **Window/lateral/CTE/UNION ALL benchmarks (I-7):** Four new
-    query scenarios (`window`, `lateral`, `cte`, `union_all`) added to the
-    E2E benchmark matrix for comprehensive operator coverage.
-
-### Changed
-
-#### Internal Code Quality: Safer Low-Level Code
-
-Halved the amount of low-level "unsafe" code that interacts directly with
-PostgreSQL's internal C libraries. This doesn't change any user-facing
-behavior, but makes the codebase easier to audit, review, and maintain —
-reducing the surface area where memory-safety bugs could theoretically hide.
-
-- **51% reduction** in unsafe code blocks (1,309 → 641).
-- All repeated low-level patterns are now consolidated into 6 well-documented
-  helper functions, so safety reasoning lives in one place instead of being
-  scattered across thousands of lines.
-- 37 internal functions that were previously marked as "unsafe" have been
-  verified safe and reclassified, removing unnecessary risk markers.
-- Zero functional changes — all 1,274 unit tests pass unchanged.
+No unreleased changes yet.
 
 ---
 
-## [0.7.0] — 2026-03-15
+## [0.7.0] — 2026-03-16
+
+0.7.0 makes pg_trickle easier to trust in real-world data pipelines. The big
+theme of this release is fewer surprises: the scheduler can now wait for late
+arriving source data, some circular pipelines can run safely instead of being
+blocked, more queries stay on incremental refresh, and the system does a better
+job of deciding when incremental work is no longer worth it.
 
 ### Added
 
-#### Circular Dependencies — Fixed-Point Scheduling (CYC-5/6/7/8)
+#### Multi-source data can wait until it is actually ready
 
-- **Circular dependency scheduler integration (CYC-5).** When stream tables
-  form cyclic dependencies (A → B → A), the scheduler now iterates them to a
-  fixed point — refreshing all members of the strongly connected component
-  (SCC) repeatedly until convergence (zero net changes) or the configurable
-  `pg_trickle.max_fixpoint_iterations` limit (default 100) is reached.
-  Non-convergence marks all SCC members as `ERROR`. Only DIFFERENTIAL mode
-  is supported in cyclic SCCs; FULL mode is rejected at iteration start.
-  Requires `pg_trickle.allow_circular = true` (default `false`).
+pg_trickle can now delay a refresh until related source tables have all caught
+up to roughly the same point in time. This is useful for ETL jobs where, for
+example, `orders` arrives before `order_lines` and refreshing too early would
+produce a half-finished report.
 
-- **Creation-time validation for circular dependencies (CYC-6).** When
-  `pg_trickle.allow_circular = true`, creating or altering a stream table
-  that introduces a cycle is allowed only if all cycle members use
-  DIFFERENTIAL refresh mode and have monotone defining queries (no
-  aggregates, EXCEPT, window functions, or anti-joins). SCC IDs are
-  automatically assigned to cycle members and recomputed when members are
-  dropped or queries are altered.
+- New watermark APIs: `advance_watermark(source, watermark)`,
+  `create_watermark_group(name, sources[], tolerance_secs)`, and
+  `drop_watermark_group(name)`.
+- New status helpers: `watermarks()`, `watermark_groups()`, and
+  `watermark_status()`.
+- The scheduler now skips gated refreshes when grouped sources are too far
+  apart and records the reason in refresh history.
+- New catalog tables store per-source watermarks and watermark group
+  definitions.
+- 28 end-to-end tests cover normal operation, bad input, tolerance windows,
+  and scheduler behavior.
 
-- **Circular dependency monitoring (CYC-7).** The `pg_stat_stream_tables`
-  view now includes `scc_id` and `last_fixpoint_iterations` columns.
-  `pgtrickle.pgt_status()` includes `scc_id`. New
-  `pgtrickle.pgt_scc_status()` function returns one row per cyclic SCC
-  with member count, member names, last iteration count, and last
-  convergence time.
+#### Some circular pipelines can now run safely
 
-- **Circular dependency E2E tests (CYC-8).** New `e2e_circular_tests.rs`
-  with 6 test scenarios: monotone cycle convergence, non-monotone cycle
-  rejection, convergence iteration tracking, non-convergence → ERROR
-  status, drop-member SCC cleanup, and default `allow_circular=false`
-  rejection. Updated README limitations table.
+Stream tables that depend on each other in a loop are no longer always blocked.
+If the cycle is monotone and uses DIFFERENTIAL mode, pg_trickle can now keep
+refreshing the group until it stops changing.
 
-- **`last_fixpoint_iterations` catalog column.** New column on
-  `pgtrickle.pgt_stream_tables` that records how many fixpoint iterations the
-  last SCC convergence took. Useful for monitoring convergence speed and
-  detecting near-non-convergence patterns.
+- Circular refreshes run to a fixed point, with `pg_trickle.max_fixpoint_iterations`
+  as a safety limit.
+- Cycle creation and ALTER validation now check that every member is safe for
+  convergence before allowing the loop.
+- `pgtrickle.pgt_status()` now reports `scc_id`, and
+  `pgtrickle.pgt_scc_status()` shows per-cycle-group status.
+- `pgtrickle.pgt_stream_tables` now tracks `last_fixpoint_iterations` so it is
+  easier to spot slow or unstable cycles.
+- 6 end-to-end tests cover convergence, rejection of unsafe cycles,
+  non-convergence handling, and cleanup.
 
-#### Watermark Gating for Cross-Source Temporal Alignment
+#### More queries stay on incremental refresh
 
-New scheduling control for ETL pipelines where multiple source tables are
-populated by separate jobs that finish at different times. External processes
-declare "how far" each source has been loaded via a timestamp watermark, and
-the scheduler waits until all sources in a group are aligned before refreshing
-downstream stream tables.
+Several query shapes that used to fall back to FULL refresh, or fail outright,
+now keep working in DIFFERENTIAL and AUTO mode.
 
-- **`advance_watermark(source, watermark)`** — Signal that a source table's
-  data is complete through the given timestamp. Enforces monotonicity (rejects
-  backward timestamps) and is idempotent (same value is a no-op). Records
-  `pg_current_wal_insert_lsn()` alongside the watermark for future hold-back
-  support. Transactional — the watermark only becomes visible when the caller's
-  transaction commits.
-- **`create_watermark_group(name, sources[], tolerance_secs)`** — Declare that
-  a set of sources must be temporally aligned within `tolerance_secs` seconds
-  before gated stream tables refresh. Requires at least 2 sources.
-- **`drop_watermark_group(name)`** — Remove a watermark group.
-- **Scheduler integration** — Before each refresh, the scheduler checks whether
-  all overlapping watermark groups are aligned. If any group's watermarks differ
-  by more than the configured tolerance, the stream table is skipped with a
-  logged `SKIP(watermark misaligned)` reason in `pgt_refresh_history`.
-- **Introspection functions:**
-  - `watermarks()` — Current watermark state for all registered sources.
-  - `watermark_groups()` — All group definitions with source count and tolerance.
-  - `watermark_status()` — Live alignment status per group: min/max watermark,
-    lag in seconds, aligned flag, and source counts.
-- **Catalog tables:** `pgt_watermarks` (per-source watermark state) and
-  `pgt_watermark_groups` (group definitions with tolerance).
-- **E2E test suite** (`e2e_watermark_gating_tests.rs`) — 28 tests covering
-  watermark advancement (monotonicity, idempotency, error handling), group CRUD
-  (create, drop, validation), introspection functions (alignment, tolerance,
-  source counts), intermediate ST behavior, and scheduler integration (skip on
-  misalignment, resume after alignment, tolerance-based gating).
+- User-defined aggregates created with `CREATE AGGREGATE` now work through the
+  existing group-rescan strategy, including common extension-provided
+  aggregates.
+- More complex `OR` plus subquery patterns are now rewritten correctly,
+  including cases that need De Morgan normalization and multiple rewrite passes.
+- The rewrite pipeline has a guardrail to stop runaway branch explosion.
+- A dedicated 14-test end-to-end suite covers these previously missing cases.
 
-#### Pre-1.0 Infrastructure Prep (INFRA-1/2/3)
+#### Easier packaging ahead of 1.0
 
-- **Official Docker Hub image (`Dockerfile.hub`)** — A self-contained
-  `postgres:18-bookworm` image with pg_trickle pre-installed and
-  pre-configured (`shared_preload_libraries = 'pg_trickle'`). Suitable for
-  local evaluation, CI/CD matrices, and as a Kubernetes base image. The
-  image is built and smoke-tested in CI but not yet pushed to Docker Hub —
-  publishing is gated until v1.0.0 (flip `push: true` and add credentials).
-- **Docker Hub CI workflow (`.github/workflows/docker-hub.yml`)** — Builds
-  `Dockerfile.hub` and runs a three-step smoke test: extension load and
-  version check, full stream-table lifecycle (create → refresh → query), and
-  catalog table presence check. Runs weekly (Sunday) and on manual dispatch.
-- **PGXN `META.json`** — Draft package metadata for PGXN with
-  `release_status: "testing"`. Establishes registry presence before v1.0.0
-  and enables `pgxn install pg_trickle` for early adopters. At v1.0.0 the
-  only change needed is flipping `release_status` to `"stable"`.
-- **CNPG smoke test** *(already implemented in v0.6.0 / PR #15)* — CI job
-  that deploys the extension image into a CloudNativePG Kubernetes cluster,
-  creates a stream table, and confirms a refresh cycle completes. Marked done
-  here for roadmap completeness.
+The release also adds infrastructure that makes evaluation and future
+distribution simpler.
+
+- `Dockerfile.hub` and a dedicated CI workflow can build and smoke-test a
+  ready-to-run PostgreSQL 18 image with pg_trickle preinstalled.
+- `META.json` adds PGXN package metadata with `release_status: "testing"`.
+- CNPG smoke testing is now part of the documented pre-1.0 packaging story.
+
+### Improved
+
+#### Refresh strategy and performance decisions are smarter
+
+The scheduler and refresh engine now make better choices when incremental work
+is likely to help and back off sooner when it is not.
+
+- Wide tables now use xxh64-based change detection instead of slower MD5-based
+  comparisons.
+- Aggregate stream tables can skip expensive incremental work and jump straight
+  to FULL refresh when the pending change set is obviously too large.
+- Strategy selection now combines a change-ratio signal with recent refresh
+  history, which helps on workloads with uneven batch sizes.
+- DAG levels are extracted explicitly, enabling level-parallel refresh
+  scheduling.
+- Small internal hot paths such as column-list building and LSN comparison were
+  tightened to remove avoidable allocations.
+
+#### Benchmarking is much easier to use and compare
+
+The performance toolchain was expanded so regressions are easier to spot and
+large-scale behavior is easier to study.
+
+- Benchmarks now support per-cycle output, optional `EXPLAIN ANALYZE` capture,
+  larger 1M-row runs, and more stable Criterion settings.
+- New tooling covers cross-run comparison, concurrent writers, and extra query
+  shapes such as window, lateral, CTE, and `UNION ALL` workloads.
+- `just bench-docker` makes it easier to run Criterion inside the builder image
+  when local linking is awkward.
+
+### Changed
+
+#### Internal low-level code is much safer to audit
+
+This release cuts the amount of low-level `unsafe` Rust in half without
+changing behavior.
+
+- Unsafe blocks were reduced by 51%, from 1,309 to 641.
+- Repeated patterns were consolidated into a small set of documented helper
+  functions.
+- 37 internal functions no longer need to be marked `unsafe`.
+- Existing unit tests continued to pass unchanged after the refactor.
 
 ---
 
