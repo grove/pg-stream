@@ -2135,15 +2135,20 @@ fn alter_stream_table_impl(
 /// Drop a stream table, removing the storage table and all catalog entries.
 #[pg_extern(schema = "pgtrickle")]
 fn drop_stream_table(name: &str) {
-    let result = drop_stream_table_impl(name);
+    let mut visited = std::collections::HashSet::new();
+    let result = drop_stream_table_impl(name, &mut visited);
     if let Err(e) = result {
         pgrx::error!("{}", e);
     }
 }
 
-fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
+fn drop_stream_table_impl(name: &str, visited: &mut std::collections::HashSet<i64>) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
+    if !visited.insert(st.pgt_id) {
+        return Ok(()); // Avoid infinite recursion in cyclical graphs
+    }
 
     // CASCADE: drop all stream tables that depend on this one first.
     // `get_downstream_pgt_ids` finds STs whose defining queries read from
@@ -2153,7 +2158,7 @@ fn drop_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     for downstream_id in downstream_ids {
         if let Some(downstream_st) = StreamTableMeta::get_by_id(downstream_id)? {
             let qualified = format!("{}.{}", downstream_st.pgt_schema, downstream_st.pgt_name);
-            drop_stream_table_impl(&qualified)?;
+            drop_stream_table_impl(&qualified, visited)?;
         }
     }
 

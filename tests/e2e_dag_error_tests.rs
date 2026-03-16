@@ -14,7 +14,10 @@
 
 mod e2e;
 
-use e2e::E2eDb;
+use e2e::{
+    E2eDb,
+    property_support::{SeededRng, TraceConfig, TrackedIds, assert_st_query_invariant},
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test 6.1 — Error in middle layer does not corrupt siblings
@@ -314,4 +317,302 @@ async fn test_error_in_leaf_does_not_affect_upstream() {
     db.refresh_st("err_leaf_b").await;
     db.assert_st_matches_query("err_leaf_a", a_q).await;
     db.assert_st_matches_query("err_leaf_b", b_q).await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Property trace tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ERR_GROUPS: [&str; 3] = ["a", "b", "c"];
+
+// ─── Test P1 — Sibling isolation across random mutation traces ───────────────
+
+/// Diamond with a healthy branch (SUM) and a failure-prone branch (SUM with
+/// division).  For each seeded mutation trace, sometimes a row with `denom=0`
+/// is inserted, causing the failing branch's refresh to fail.
+///
+/// **Invariant:** the healthy branch always matches its ground-truth query
+/// regardless of whether the other branch succeeds or fails.
+#[tokio::test]
+async fn test_prop_sibling_failure_does_not_corrupt_healthy_branch() {
+    let config = TraceConfig::from_env();
+    for seed in config.seeds(0xE110_1001) {
+        run_sibling_isolation_trace(seed, config).await;
+    }
+}
+
+async fn run_sibling_isolation_trace(seed: u64, config: TraceConfig) {
+    let db = E2eDb::new().await.with_extension().await;
+    let mut rng = SeededRng::new(seed);
+    let mut ids = TrackedIds::new();
+
+    db.execute(
+        "CREATE TABLE err_prop_src (
+            id    INT PRIMARY KEY,
+            grp   TEXT NOT NULL,
+            val   INT NOT NULL,
+            denom INT NOT NULL
+        )",
+    )
+    .await;
+
+    // Seed the table with safe rows (denom > 0).
+    for _ in 0..config.initial_rows {
+        let id = ids.alloc();
+        let grp = *rng.choose(&ERR_GROUPS);
+        let val = rng.i32_range(1, 50);
+        let denom = rng.i32_range(1, 10);
+        db.execute(&format!(
+            "INSERT INTO err_prop_src (id, grp, val, denom) VALUES ({id}, '{grp}', {val}, {denom})"
+        ))
+        .await;
+    }
+
+    let ok_q = "SELECT grp, SUM(val) AS total FROM err_prop_src GROUP BY grp";
+    db.create_st("err_prop_ok", ok_q, "1m", "DIFFERENTIAL")
+        .await;
+    db.create_st(
+        "err_prop_fail",
+        "SELECT grp, SUM(val / denom) AS ratio FROM err_prop_src GROUP BY grp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    for cycle in 1..=config.cycles {
+        // Roll: 0=insert bad row(denom=0), 1-3=insert good row
+        let roll = rng.usize_range(0, 3);
+        let step;
+        if roll == 0 {
+            let id = ids.alloc();
+            let grp = *rng.choose(&ERR_GROUPS);
+            let val = rng.i32_range(1, 50);
+            db.execute(&format!(
+                "INSERT INTO err_prop_src (id, grp, val, denom) VALUES ({id}, '{grp}', {val}, 0)"
+            ))
+            .await;
+            step = format!("ins-bad(id={id})");
+        } else {
+            let id = ids.alloc();
+            let grp = *rng.choose(&ERR_GROUPS);
+            let val = rng.i32_range(1, 50);
+            let denom = rng.i32_range(1, 10);
+            db.execute(&format!(
+                "INSERT INTO err_prop_src (id, grp, val, denom) \
+                 VALUES ({id}, '{grp}', {val}, {denom})"
+            ))
+            .await;
+            step = format!("ins-good(id={id})");
+        }
+
+        // Healthy branch must always succeed.
+        db.refresh_st("err_prop_ok").await;
+        // Failing branch may or may not succeed — ignore the outcome.
+        let _ = db
+            .try_execute("SELECT pgtrickle.refresh_stream_table('err_prop_fail')")
+            .await;
+
+        // INVARIANT: healthy branch always equals ground truth.
+        assert_st_query_invariant(&db, "err_prop_ok", ok_q, seed, cycle, &step).await;
+    }
+}
+
+// ─── Test P2 — Repair reconverges after failure ──────────────────────────────
+
+/// After introducing a row that causes refresh failures (denom=0), fixing
+/// the row and re-refreshing must bring the ST back to full correctness.
+/// Subsequent normal cycles must then continue to be correct.
+#[tokio::test]
+async fn test_prop_failure_then_repair_reconverges() {
+    let config = TraceConfig::from_env();
+    for seed in config.seeds(0xE110_2001) {
+        run_repair_trace(seed, config).await;
+    }
+}
+
+async fn run_repair_trace(seed: u64, config: TraceConfig) {
+    let db = E2eDb::new().await.with_extension().await;
+    let mut rng = SeededRng::new(seed);
+    let mut ids = TrackedIds::new();
+
+    db.execute(
+        "CREATE TABLE err_rep_src (
+            id    INT PRIMARY KEY,
+            grp   TEXT NOT NULL,
+            val   INT NOT NULL,
+            denom INT NOT NULL
+        )",
+    )
+    .await;
+
+    for _ in 0..config.initial_rows {
+        let id = ids.alloc();
+        let grp = *rng.choose(&ERR_GROUPS);
+        let val = rng.i32_range(1, 50);
+        let denom = rng.i32_range(1, 10);
+        db.execute(&format!(
+            "INSERT INTO err_rep_src (id, grp, val, denom) VALUES ({id}, '{grp}', {val}, {denom})"
+        ))
+        .await;
+    }
+
+    let q = "SELECT grp, SUM(val / denom) AS ratio FROM err_rep_src GROUP BY grp";
+    db.create_st("err_rep_st", q, "1m", "DIFFERENTIAL").await;
+
+    // Phase 1 — introduce a bad row.
+    let bad_id = ids.alloc();
+    let bad_grp = *rng.choose(&ERR_GROUPS);
+    db.execute(&format!(
+        "INSERT INTO err_rep_src (id, grp, val, denom) VALUES ({bad_id}, '{bad_grp}', 1, 0)"
+    ))
+    .await;
+    let _ = db
+        .try_execute("SELECT pgtrickle.refresh_stream_table('err_rep_st')")
+        .await;
+
+    // Phase 2 — repair the bad row and re-refresh.
+    db.execute(&format!(
+        "UPDATE err_rep_src SET denom = 1 WHERE id = {bad_id}"
+    ))
+    .await;
+    db.refresh_st("err_rep_st").await;
+
+    // After repair + refresh, the ST must match its defining query.
+    assert_st_query_invariant(&db, "err_rep_st", q, seed, 0, "after repair").await;
+
+    // Phase 3 — subsequent normal cycles must stay correct.
+    for cycle in 1..=config.cycles {
+        let id = ids.alloc();
+        let grp = *rng.choose(&ERR_GROUPS);
+        let val = rng.i32_range(1, 50);
+        let denom = rng.i32_range(1, 10);
+        db.execute(&format!(
+            "INSERT INTO err_rep_src (id, grp, val, denom) VALUES ({id}, '{grp}', {val}, {denom})"
+        ))
+        .await;
+        db.refresh_st("err_rep_st").await;
+        assert_st_query_invariant(
+            &db,
+            "err_rep_st",
+            q,
+            seed,
+            cycle,
+            "post-repair normal cycle",
+        )
+        .await;
+    }
+}
+
+// ─── Test P3 — Repeated failures never corrupt the healthy branch ─────────────
+
+/// Randomly add and remove rows with `denom=0` across many cycles.  The
+/// healthy branch (SUM without division) must always remain correct.  When
+/// all bad rows have been removed, the failing branch must also converge.
+#[tokio::test]
+async fn test_prop_repeated_failure_sequences_preserve_invariants() {
+    let config = TraceConfig::from_env();
+    for seed in config.seeds(0xE110_3001) {
+        run_repeated_failure_trace(seed, config).await;
+    }
+}
+
+async fn run_repeated_failure_trace(seed: u64, config: TraceConfig) {
+    let db = E2eDb::new().await.with_extension().await;
+    let mut rng = SeededRng::new(seed);
+    let mut ids = TrackedIds::new();
+    let mut bad_ids: Vec<i32> = Vec::new();
+
+    db.execute(
+        "CREATE TABLE err_rep2_src (
+            id    INT PRIMARY KEY,
+            grp   TEXT NOT NULL,
+            val   INT NOT NULL,
+            denom INT NOT NULL
+        )",
+    )
+    .await;
+
+    for _ in 0..config.initial_rows {
+        let id = ids.alloc();
+        let grp = *rng.choose(&ERR_GROUPS);
+        let val = rng.i32_range(1, 50);
+        let denom = rng.i32_range(1, 10);
+        db.execute(&format!(
+            "INSERT INTO err_rep2_src (id, grp, val, denom) \
+             VALUES ({id}, '{grp}', {val}, {denom})"
+        ))
+        .await;
+    }
+
+    let ok_q = "SELECT grp, SUM(val) AS total FROM err_rep2_src GROUP BY grp";
+    let fail_q = "SELECT grp, SUM(val / denom) AS ratio FROM err_rep2_src GROUP BY grp";
+    db.create_st("err_rep2_ok", ok_q, "1m", "DIFFERENTIAL")
+        .await;
+    db.create_st("err_rep2_fail", fail_q, "1m", "DIFFERENTIAL")
+        .await;
+
+    for cycle in 1..=config.cycles {
+        let step = match rng.usize_range(0, 3) {
+            0 => {
+                // Add a bad row.
+                let id = ids.alloc();
+                let grp = *rng.choose(&ERR_GROUPS);
+                let val = rng.i32_range(1, 50);
+                db.execute(&format!(
+                    "INSERT INTO err_rep2_src (id, grp, val, denom) \
+                     VALUES ({id}, '{grp}', {val}, 0)"
+                ))
+                .await;
+                bad_ids.push(id);
+                format!("add-bad(id={id})")
+            }
+            1 if !bad_ids.is_empty() => {
+                // Fix a bad row.
+                let idx = rng.usize_range(0, bad_ids.len() - 1);
+                let id = bad_ids.swap_remove(idx);
+                db.execute(&format!(
+                    "UPDATE err_rep2_src SET denom = 1 WHERE id = {id}"
+                ))
+                .await;
+                format!("fix-bad(id={id})")
+            }
+            _ => {
+                // Add a good row.
+                let id = ids.alloc();
+                let grp = *rng.choose(&ERR_GROUPS);
+                let val = rng.i32_range(1, 50);
+                let denom = rng.i32_range(1, 10);
+                db.execute(&format!(
+                    "INSERT INTO err_rep2_src (id, grp, val, denom) \
+                     VALUES ({id}, '{grp}', {val}, {denom})"
+                ))
+                .await;
+                format!("add-good(id={id})")
+            }
+        };
+
+        // Healthy branch must always succeed.
+        db.refresh_st("err_rep2_ok").await;
+        // Failing branch: may fail if bad rows are present.
+        let fail_result = db
+            .try_execute("SELECT pgtrickle.refresh_stream_table('err_rep2_fail')")
+            .await;
+
+        // INVARIANT: healthy branch is always correct.
+        assert_st_query_invariant(
+            &db,
+            "err_rep2_ok",
+            ok_q,
+            seed,
+            cycle,
+            &format!("{step} bad_live={}", bad_ids.len()),
+        )
+        .await;
+
+        // INVARIANT: when no bad rows exist and the last refresh succeeded,
+        // the failing branch is also correct.
+        if bad_ids.is_empty() && fail_result.is_ok() {
+            assert_st_query_invariant(&db, "err_rep2_fail", fail_q, seed, cycle, "all-clean").await;
+        }
+    }
 }
