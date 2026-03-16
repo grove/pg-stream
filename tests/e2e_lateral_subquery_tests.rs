@@ -41,17 +41,15 @@ async fn test_lateral_subquery_top_n_full() {
     )
     .await;
 
-    db.create_st(
-        "lsq_top_item",
-        "SELECT o.id, o.customer, latest.amount \
+    let query_lsq_top_item = "SELECT o.id, o.customer, latest.amount \
          FROM lsq_orders o, \
          LATERAL (SELECT li.amount FROM lsq_items li \
                   WHERE li.order_id = o.id \
-                  ORDER BY li.created_at DESC LIMIT 1) AS latest",
-        "1m",
-        "FULL",
-    )
-    .await;
+                  ORDER BY li.created_at DESC LIMIT 1) AS latest";
+    db.create_st("lsq_top_item", query_lsq_top_item, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("lsq_top_item", query_lsq_top_item)
+        .await;
 
     assert_eq!(db.count("public.lsq_top_item").await, 2);
 
@@ -82,19 +80,17 @@ async fn test_lateral_subquery_left_join_full() {
         .await;
 
     // LEFT JOIN LATERAL: 'Empty' dept should appear with NULLs
-    db.create_st(
-        "lsq_dept_stats",
-        "SELECT d.id, d.name, stats.total, stats.cnt \
+    let query_lsq_dept_stats = "SELECT d.id, d.name, stats.total, stats.cnt \
          FROM lsq_depts d \
          LEFT JOIN LATERAL (\
              SELECT SUM(e.salary) AS total, COUNT(*) AS cnt \
              FROM lsq_emps e \
              WHERE e.dept_id = d.id\
-         ) AS stats ON true",
-        "1m",
-        "FULL",
-    )
-    .await;
+         ) AS stats ON true";
+    db.create_st("lsq_dept_stats", query_lsq_dept_stats, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("lsq_dept_stats", query_lsq_dept_stats)
+        .await;
 
     assert_eq!(db.count("public.lsq_dept_stats").await, 3);
 
@@ -124,17 +120,15 @@ async fn test_lateral_subquery_correlated_agg_full() {
     db.execute("INSERT INTO lsq_child VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)")
         .await;
 
-    db.create_st(
-        "lsq_parent_totals",
-        "SELECT p.id, p.name, agg.total \
+    let query_lsq_parent_totals = "SELECT p.id, p.name, agg.total \
          FROM lsq_parent p, \
          LATERAL (SELECT SUM(c.val) AS total \
                   FROM lsq_child c \
-                  WHERE c.parent_id = p.id) AS agg",
-        "1m",
-        "FULL",
-    )
-    .await;
+                  WHERE c.parent_id = p.id) AS agg";
+    db.create_st("lsq_parent_totals", query_lsq_parent_totals, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("lsq_parent_totals", query_lsq_parent_totals)
+        .await;
 
     assert_eq!(db.count("public.lsq_parent_totals").await, 2);
 
@@ -157,16 +151,14 @@ async fn test_lateral_subquery_full_mode_refresh() {
     db.execute("INSERT INTO lsq_rf_items VALUES (1, 1, 100)")
         .await;
 
-    db.create_st(
-        "lsq_rf_top",
-        "SELECT o.id, o.customer, sub.amount \
+    let query_lsq_rf_top = "SELECT o.id, o.customer, sub.amount \
          FROM lsq_rf_orders o, \
          LATERAL (SELECT li.amount FROM lsq_rf_items li \
-                  WHERE li.order_id = o.id LIMIT 1) AS sub",
-        "1m",
-        "FULL",
-    )
-    .await;
+                  WHERE li.order_id = o.id LIMIT 1) AS sub";
+    db.create_st("lsq_rf_top", query_lsq_rf_top, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("lsq_rf_top", query_lsq_rf_top)
+        .await;
 
     assert_eq!(db.count("public.lsq_rf_top").await, 1);
 
@@ -176,6 +168,8 @@ async fn test_lateral_subquery_full_mode_refresh() {
     db.execute("INSERT INTO lsq_rf_items VALUES (2, 2, 250)")
         .await;
     db.refresh_st("lsq_rf_top").await;
+    db.assert_st_matches_query("lsq_rf_top", query_lsq_rf_top)
+        .await;
 
     assert_eq!(db.count("public.lsq_rf_top").await, 2);
 }
@@ -197,16 +191,14 @@ async fn test_lateral_subquery_differential_initial() {
     db.execute("INSERT INTO lsq_di_items VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)")
         .await;
 
-    db.create_st(
-        "lsq_di_top",
-        "SELECT o.id, o.customer, sub.amount \
+    let query_lsq_di_top = "SELECT o.id, o.customer, sub.amount \
          FROM lsq_di_orders o, \
          LATERAL (SELECT li.amount FROM lsq_di_items li \
-                  WHERE li.order_id = o.id LIMIT 1) AS sub",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+                  WHERE li.order_id = o.id LIMIT 1) AS sub";
+    db.create_st("lsq_di_top", query_lsq_di_top, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("lsq_di_top", query_lsq_di_top)
+        .await;
 
     // Initial load should produce correct results
     assert_eq!(db.count("public.lsq_di_top").await, 2);
@@ -225,22 +217,22 @@ async fn test_lateral_subquery_differential_outer_insert() {
     db.execute("INSERT INTO lsq_oi_items VALUES (1, 1, 100), (10, 2, 250)")
         .await;
 
-    db.create_st(
-        "lsq_oi_top",
-        "SELECT o.id, o.customer, sub.amount \
+    let query_lsq_oi_top = "SELECT o.id, o.customer, sub.amount \
          FROM lsq_oi_orders o, \
          LATERAL (SELECT li.amount FROM lsq_oi_items li \
-                  WHERE li.order_id = o.id LIMIT 1) AS sub",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+                  WHERE li.order_id = o.id LIMIT 1) AS sub";
+    db.create_st("lsq_oi_top", query_lsq_oi_top, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("lsq_oi_top", query_lsq_oi_top)
+        .await;
     assert_eq!(db.count("public.lsq_oi_top").await, 1);
 
     // Insert new outer row → subquery runs for new row → expanded rows added
     db.execute("INSERT INTO lsq_oi_orders VALUES (2, 'Bob')")
         .await;
     db.refresh_st("lsq_oi_top").await;
+    db.assert_st_matches_query("lsq_oi_top", query_lsq_oi_top)
+        .await;
 
     assert_eq!(db.count("public.lsq_oi_top").await, 2);
 
@@ -263,21 +255,21 @@ async fn test_lateral_subquery_differential_outer_delete() {
     db.execute("INSERT INTO lsq_od_items VALUES (1, 1, 100), (2, 2, 200)")
         .await;
 
-    db.create_st(
-        "lsq_od_top",
-        "SELECT o.id, o.customer, sub.amount \
+    let query_lsq_od_top = "SELECT o.id, o.customer, sub.amount \
          FROM lsq_od_orders o, \
          LATERAL (SELECT li.amount FROM lsq_od_items li \
-                  WHERE li.order_id = o.id LIMIT 1) AS sub",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+                  WHERE li.order_id = o.id LIMIT 1) AS sub";
+    db.create_st("lsq_od_top", query_lsq_od_top, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("lsq_od_top", query_lsq_od_top)
+        .await;
     assert_eq!(db.count("public.lsq_od_top").await, 2);
 
     // Delete outer row → all expanded rows for that outer row removed
     db.execute("DELETE FROM lsq_od_orders WHERE id = 1").await;
     db.refresh_st("lsq_od_top").await;
+    db.assert_st_matches_query("lsq_od_top", query_lsq_od_top)
+        .await;
 
     assert_eq!(db.count("public.lsq_od_top").await, 1);
 
@@ -300,19 +292,17 @@ async fn test_lateral_subquery_left_join_differential() {
     db.execute("INSERT INTO lsq_lj_emps VALUES (1, 1, 100)")
         .await;
 
-    db.create_st(
-        "lsq_lj_stats",
-        "SELECT d.id, d.name, stats.total \
+    let query_lsq_lj_stats = "SELECT d.id, d.name, stats.total \
          FROM lsq_lj_depts d \
          LEFT JOIN LATERAL (\
              SELECT SUM(e.salary) AS total \
              FROM lsq_lj_emps e \
              WHERE e.dept_id = d.id\
-         ) AS stats ON true",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+         ) AS stats ON true";
+    db.create_st("lsq_lj_stats", query_lsq_lj_stats, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("lsq_lj_stats", query_lsq_lj_stats)
+        .await;
 
     // Both depts should be present (LEFT JOIN preserves outer rows)
     assert_eq!(db.count("public.lsq_lj_stats").await, 2);
@@ -330,6 +320,8 @@ async fn test_lateral_subquery_left_join_differential() {
     db.execute("INSERT INTO lsq_lj_depts VALUES (3, 'Marketing')")
         .await;
     db.refresh_st("lsq_lj_stats").await;
+    db.assert_st_matches_query("lsq_lj_stats", query_lsq_lj_stats)
+        .await;
 
     assert_eq!(db.count("public.lsq_lj_stats").await, 3);
 }
@@ -347,16 +339,14 @@ async fn test_lateral_subquery_differential_mixed_dml() {
     db.execute("INSERT INTO lsq_mx_items VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300)")
         .await;
 
-    db.create_st(
-        "lsq_mx_top",
-        "SELECT o.id, o.customer, sub.amount \
+    let query_lsq_mx_top = "SELECT o.id, o.customer, sub.amount \
          FROM lsq_mx_orders o, \
          LATERAL (SELECT li.amount FROM lsq_mx_items li \
-                  WHERE li.order_id = o.id LIMIT 1) AS sub",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+                  WHERE li.order_id = o.id LIMIT 1) AS sub";
+    db.create_st("lsq_mx_top", query_lsq_mx_top, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("lsq_mx_top", query_lsq_mx_top)
+        .await;
     assert_eq!(db.count("public.lsq_mx_top").await, 3);
 
     // Mixed DML: insert + update + delete in one batch
@@ -368,6 +358,8 @@ async fn test_lateral_subquery_differential_mixed_dml() {
         .await;
     db.execute("DELETE FROM lsq_mx_orders WHERE id = 1").await;
     db.refresh_st("lsq_mx_top").await;
+    db.assert_st_matches_query("lsq_mx_top", query_lsq_mx_top)
+        .await;
 
     assert_eq!(db.count("public.lsq_mx_top").await, 3);
 
@@ -398,16 +390,14 @@ async fn test_lateral_subquery_multi_row_result() {
     db.execute("INSERT INTO lsq_mr_child VALUES (1, 1, 'a'), (2, 1, 'b'), (3, 2, 'c')")
         .await;
 
-    db.create_st(
-        "lsq_mr_expanded",
-        "SELECT p.id, p.name, sub.val \
+    let query_lsq_mr_expanded = "SELECT p.id, p.name, sub.val \
          FROM lsq_mr_parent p, \
          LATERAL (SELECT c.val FROM lsq_mr_child c \
-                  WHERE c.parent_id = p.id) AS sub",
-        "1m",
-        "FULL",
-    )
-    .await;
+                  WHERE c.parent_id = p.id) AS sub";
+    db.create_st("lsq_mr_expanded", query_lsq_mr_expanded, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("lsq_mr_expanded", query_lsq_mr_expanded)
+        .await;
 
     // P1 has 2 children, P2 has 1 → total 3 rows
     assert_eq!(db.count("public.lsq_mr_expanded").await, 3);
@@ -427,16 +417,14 @@ async fn test_lateral_subquery_empty_result_cross_join() {
     db.execute("INSERT INTO lsq_empty_child VALUES (1, 1, 'x')")
         .await;
 
-    db.create_st(
-        "lsq_empty_st",
-        "SELECT p.id, p.name, sub.val \
+    let query_lsq_empty_st = "SELECT p.id, p.name, sub.val \
          FROM lsq_empty_parent p, \
          LATERAL (SELECT c.val FROM lsq_empty_child c \
-                  WHERE c.parent_id = p.id) AS sub",
-        "1m",
-        "FULL",
-    )
-    .await;
+                  WHERE c.parent_id = p.id) AS sub";
+    db.create_st("lsq_empty_st", query_lsq_empty_st, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("lsq_empty_st", query_lsq_empty_st)
+        .await;
 
     // Only 'HasChild' should appear (CROSS JOIN excludes empty results)
     assert_eq!(db.count("public.lsq_empty_st").await, 1);
@@ -467,18 +455,16 @@ async fn test_lateral_subquery_with_group_by() {
     )
     .await;
 
-    db.create_st(
-        "lsq_gb_summary",
-        "SELECT o.id, o.customer, sub.category, sub.total \
+    let query_lsq_gb_summary = "SELECT o.id, o.customer, sub.category, sub.total \
          FROM lsq_gb_orders o, \
          LATERAL (SELECT li.category, SUM(li.amount) AS total \
                   FROM lsq_gb_items li \
                   WHERE li.order_id = o.id \
-                  GROUP BY li.category) AS sub",
-        "1m",
-        "FULL",
-    )
-    .await;
+                  GROUP BY li.category) AS sub";
+    db.create_st("lsq_gb_summary", query_lsq_gb_summary, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("lsq_gb_summary", query_lsq_gb_summary)
+        .await;
 
     // Alice has 2 categories: A(30) and B(30)
     assert_eq!(db.count("public.lsq_gb_summary").await, 2);

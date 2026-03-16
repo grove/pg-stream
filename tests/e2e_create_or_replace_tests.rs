@@ -549,3 +549,22 @@ async fn test_if_not_exists_noop() {
         "Schedule should not change on if_not_exists"
     );
 }
+#[tokio::test]
+async fn test_cor_invalid_query_fails() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE source_tbl (id INT PRIMARY KEY, val TEXT)").await;
+
+    create_or_replace(&db, "test_st_1", "SELECT id, val FROM source_tbl", "1m", "DIFFERENTIAL").await;
+
+    let res = sqlx::query("SELECT pgtrickle.create_or_replace_stream_table('test_st_1', $$SELECT non_existent FROM source_tbl$$, '1m', 'DIFFERENTIAL')")
+        .execute(&db.pool)
+        .await;
+
+    assert!(res.is_err(), "Replacing with invalid query should fail");
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("column \\"non_existent\\" does not exist"),
+        "Unexpected error: {}", err_msg
+    );
+}
