@@ -2142,7 +2142,10 @@ fn drop_stream_table(name: &str) {
     }
 }
 
-fn drop_stream_table_impl(name: &str, visited: &mut std::collections::HashSet<i64>) -> Result<(), PgTrickleError> {
+fn drop_stream_table_impl(
+    name: &str,
+    visited: &mut std::collections::HashSet<i64>,
+) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
 

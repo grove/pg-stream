@@ -403,7 +403,10 @@ async fn run_break_cycle_trace(seed: u64) {
         ("prop_brk_st_b", "prop_brk_st_a")
     };
 
-    db.execute("ALTER SYSTEM SET pg_trickle.enabled = off; SELECT pg_reload_conf(); SELECT pg_sleep(1);").await;
+    db.execute(
+        "ALTER SYSTEM SET pg_trickle.enabled = off; SELECT pg_reload_conf(); SELECT pg_sleep(1);",
+    )
+    .await;
     db.drop_st(drop_name).await;
 
     // The survivor must have scc_id cleared (no longer in a cycle).

@@ -547,10 +547,11 @@ proptest! {
 
 fn arb_frontier() -> impl Strategy<Value = Frontier> {
     proptest::collection::hash_map(
-        1000..1010u32, // OIDs
+        1000..1010u32,                                  // OIDs
         (0..100u32).prop_map(|l| format!("1/{:X}", l)), // LSNs
-        0..10
-    ).prop_map(|map| {
+        0..10,
+    )
+    .prop_map(|map| {
         let mut f = Frontier::new();
         for (oid, lsn) in map {
             f.set_source(oid, lsn, "ts".to_string());
@@ -564,7 +565,7 @@ proptest! {
     fn prop_frontier_merge_monotonic(f1 in arb_frontier(), f2 in arb_frontier()) {
         let mut f_merged = f1.clone();
         f_merged.merge_from(&f2);
-        
+
         for oid in f1.source_oids() {
             prop_assert!(lsn_gte(&f_merged.get_lsn(oid), &f1.get_lsn(oid)));
         }

@@ -448,22 +448,31 @@ async fn test_autorefresh_staggered_schedules() {
         .await;
 }
 
-
-
 // Property-Based Invariant Traces
 // ═══════════════════════════════════════════════════════════════════════════
-use crate::e2e::property_support::{TraceConfig, SeededRng, TrackedIds, assert_st_query_invariants};
+use crate::e2e::property_support::{
+    SeededRng, TraceConfig, TrackedIds, assert_st_query_invariants,
+};
 
 const AUTO_INVARIANTS: [(&str, &str); 3] = [
-    ("prop_auto_l1", "SELECT id, val FROM prop_auto_src WHERE val > 1"),
-    ("prop_auto_l2", "SELECT id, val FROM prop_auto_l1 WHERE val > 2"),
-    ("prop_auto_l3", "SELECT id, val FROM prop_auto_l2 WHERE val > 3"),
+    (
+        "prop_auto_l1",
+        "SELECT id, val FROM prop_auto_src WHERE val > 1",
+    ),
+    (
+        "prop_auto_l2",
+        "SELECT id, val FROM prop_auto_l1 WHERE val > 2",
+    ),
+    (
+        "prop_auto_l3",
+        "SELECT id, val FROM prop_auto_l2 WHERE val > 3",
+    ),
 ];
 
 #[tokio::test]
 async fn test_prop_autorefresh_no_spurious_changes() {
     let config = TraceConfig::from_env();
-    for seed in config.seeds(0xAA_11_0001) {
+    for seed in config.seeds(0xAA11_0001) {
         run_autorefresh_trace(seed, &config).await;
     }
 }
@@ -475,7 +484,8 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
     let mut rng = SeededRng::new(seed);
     let mut ids = TrackedIds::new();
 
-    db.execute("CREATE TABLE prop_auto_src (id INT PRIMARY KEY, val INT NOT NULL)").await;
+    db.execute("CREATE TABLE prop_auto_src (id INT PRIMARY KEY, val INT NOT NULL)")
+        .await;
 
     for (st, query) in AUTO_INVARIANTS {
         db.create_st(st, query, "1s", "DIFFERENTIAL").await;
@@ -483,7 +493,8 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
 
     for _ in 0..config.initial_rows {
         let (id, val) = (ids.alloc(), rng.i32_range(0, 10));
-        db.execute(&format!("INSERT INTO prop_auto_src VALUES ({id}, {val})")).await;
+        db.execute(&format!("INSERT INTO prop_auto_src VALUES ({id}, {val})"))
+            .await;
     }
 
     // Wait for the cascade
@@ -493,15 +504,20 @@ async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
         let op = rng.usize_range(0, 100);
         if op < 40 {
             let (id, val) = (ids.alloc(), rng.i32_range(0, 10));
-            db.execute(&format!("INSERT INTO prop_auto_src VALUES ({id}, {val})")).await;
+            db.execute(&format!("INSERT INTO prop_auto_src VALUES ({id}, {val})"))
+                .await;
         } else if op < 70 {
             if let Some(id) = ids.pick(&mut rng) {
                 let new_val = rng.i32_range(0, 10);
-                db.execute(&format!("UPDATE prop_auto_src SET val = {new_val} WHERE id = {id}")).await;
+                db.execute(&format!(
+                    "UPDATE prop_auto_src SET val = {new_val} WHERE id = {id}"
+                ))
+                .await;
             }
         } else {
             if let Some(id) = ids.remove_random(&mut rng) {
-                db.execute(&format!("DELETE FROM prop_auto_src WHERE id = {id}")).await;
+                db.execute(&format!("DELETE FROM prop_auto_src WHERE id = {id}"))
+                    .await;
             }
         }
 
