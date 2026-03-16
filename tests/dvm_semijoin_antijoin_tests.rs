@@ -124,6 +124,14 @@ async fn setup_operator_db() -> TestDb {
 CREATE SCHEMA IF NOT EXISTS pgtrickle;
 CREATE SCHEMA IF NOT EXISTS pgtrickle_changes;
 
+CREATE OR REPLACE FUNCTION pgtrickle.pg_trickle_hash(val ANYELEMENT)
+RETURNS BIGINT
+LANGUAGE SQL
+IMMUTABLE
+AS $$
+    SELECT hashtextextended(COALESCE(val::text, '<NULL>'), 0)::BIGINT
+$$;
+
 CREATE OR REPLACE FUNCTION pgtrickle.pg_trickle_hash_multi(vals TEXT[])
 RETURNS BIGINT
 LANGUAGE SQL
@@ -375,5 +383,234 @@ async fn test_diff_anti_join_emits_unmatched_left_insert() {
     assert_eq!(
         query_rows(&db, &sql).await,
         vec![("I".to_string(), 3, 30, 300)]
+    );
+}
+
+fn make_nested_ctx() -> DiffContext {
+    let mut prev_frontier = Frontier::new();
+    prev_frontier.set_source(1, "0/0".to_string(), "2025-01-01T00:00:00Z".to_string());
+    prev_frontier.set_source(2, "0/0".to_string(), "2025-01-01T00:00:00Z".to_string());
+    prev_frontier.set_source(3, "0/0".to_string(), "2025-01-01T00:00:00Z".to_string());
+
+    let mut new_frontier = Frontier::new();
+    new_frontier.set_source(1, "0/10".to_string(), "2025-01-01T00:00:10Z".to_string());
+    new_frontier.set_source(2, "0/10".to_string(), "2025-01-01T00:00:10Z".to_string());
+    new_frontier.set_source(3, "0/10".to_string(), "2025-01-01T00:00:10Z".to_string());
+
+    DiffContext::new_standalone(prev_frontier, new_frontier)
+}
+
+fn build_nested_semi_join_tree() -> OpTree {
+    let left = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), int_col("cust_id"), int_col("amount")],
+        &["id"],
+    );
+    let right_outer = scan_with_pk(
+        2,
+        "customers",
+        "c",
+        vec![int_col("id"), text_col("name")],
+        &["id"],
+    );
+    let right_inner = scan_with_pk(
+        3,
+        "vips",
+        "v",
+        vec![int_col("customer_id")],
+        &["customer_id"],
+    );
+
+    let right = OpTree::SemiJoin {
+        condition: Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("c".to_string()),
+                column_name: "id".to_string(),
+            }),
+            right: Box::new(Expr::ColumnRef {
+                table_alias: Some("v".to_string()),
+                column_name: "customer_id".to_string(),
+            }),
+        },
+        left: Box::new(right_outer),
+        right: Box::new(right_inner),
+    };
+
+    OpTree::SemiJoin {
+        condition: Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".to_string()),
+                column_name: "cust_id".to_string(),
+            }),
+            right: Box::new(Expr::ColumnRef {
+                table_alias: Some("c".to_string()),
+                column_name: "id".to_string(),
+            }),
+        },
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+fn build_nested_anti_join_tree() -> OpTree {
+    let left = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), int_col("cust_id"), int_col("amount")],
+        &["id"],
+    );
+    let right_outer = scan_with_pk(
+        2,
+        "customers",
+        "c",
+        vec![int_col("id"), text_col("name")],
+        &["id"],
+    );
+    let right_inner = scan_with_pk(
+        3,
+        "vips",
+        "v",
+        vec![int_col("customer_id")],
+        &["customer_id"],
+    );
+
+    let right = OpTree::SemiJoin {
+        condition: Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("c".to_string()),
+                column_name: "id".to_string(),
+            }),
+            right: Box::new(Expr::ColumnRef {
+                table_alias: Some("v".to_string()),
+                column_name: "customer_id".to_string(),
+            }),
+        },
+        left: Box::new(right_outer),
+        right: Box::new(right_inner),
+    };
+
+    OpTree::AntiJoin {
+        condition: Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".to_string()),
+                column_name: "cust_id".to_string(),
+            }),
+            right: Box::new(Expr::ColumnRef {
+                table_alias: Some("c".to_string()),
+                column_name: "id".to_string(),
+            }),
+        },
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+#[tokio::test]
+async fn test_diff_semi_join_executes_nested() {
+    let db = setup_operator_db().await;
+    let sql = make_nested_ctx()
+        .differentiate(&build_nested_semi_join_tree())
+        .expect("nested semi-join differentiation should succeed");
+
+    reset_semijoin_fixture(&db).await;
+
+    // Create new structures inside test schema
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS public.vips (
+            customer_id INT PRIMARY KEY
+        )",
+    )
+    .await;
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS pgtrickle_changes.changes_3 (
+            change_id BIGSERIAL PRIMARY KEY,
+            lsn PG_LSN NOT NULL,
+            action CHAR(1) NOT NULL,
+            pk_hash BIGINT,
+            new_customer_id INT,
+            old_customer_id INT
+        )",
+    )
+    .await;
+
+    db.execute("TRUNCATE TABLE pgtrickle_changes.changes_3, public.vips RESTART IDENTITY")
+        .await;
+    db.execute("TRUNCATE TABLE public.customers RESTART IDENTITY")
+        .await;
+
+    // insert required rows into customers. Note: `reset_semijoin_fixture` already inserted base orders [1, 2].
+    db.execute("INSERT INTO public.customers VALUES (10, 'Alice'), (20, 'Bob')")
+        .await;
+
+    // set up `vips` with [10] only, making order 1 match and order 2 fail.
+    db.execute("INSERT INTO public.vips VALUES (10)").await;
+
+    // insert VIP 20 AND log change into changes_3 simultaneously
+    db.execute("INSERT INTO public.vips VALUES (20)").await;
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_3 (lsn, action, pk_hash, new_customer_id)          VALUES ('0/1', 'I', pgtrickle.pg_trickle_hash(20::text), 20);"
+    ).await;
+
+    assert_eq!(
+        query_rows(&db, &sql).await,
+        vec![("I".to_string(), 2, 20, 200)]
+    );
+}
+
+#[tokio::test]
+async fn test_diff_anti_join_executes_nested() {
+    let db = setup_operator_db().await;
+    let sql = make_nested_ctx()
+        .differentiate(&build_nested_anti_join_tree())
+        .expect("nested anti-join differentiation should succeed");
+
+    reset_semijoin_fixture(&db).await;
+
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS public.vips (
+            customer_id INT PRIMARY KEY
+        )",
+    )
+    .await;
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS pgtrickle_changes.changes_3 (
+            change_id BIGSERIAL PRIMARY KEY,
+            lsn PG_LSN NOT NULL,
+            action CHAR(1) NOT NULL,
+            pk_hash BIGINT,
+            new_customer_id INT,
+            old_customer_id INT
+        )",
+    )
+    .await;
+
+    db.execute("TRUNCATE TABLE pgtrickle_changes.changes_3, public.vips RESTART IDENTITY")
+        .await;
+    db.execute("TRUNCATE TABLE public.customers RESTART IDENTITY")
+        .await;
+
+    db.execute("INSERT INTO public.customers VALUES (10, 'Alice'), (20, 'Bob')")
+        .await;
+
+    // Base state: both match. We delete VIP 20!
+    db.execute("INSERT INTO public.vips VALUES (10), (20)")
+        .await;
+    db.execute("DELETE FROM public.vips WHERE customer_id = 20")
+        .await;
+
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_3 (lsn, action, pk_hash, old_customer_id)          VALUES ('0/1', 'D', pgtrickle.pg_trickle_hash(20::text), 20);"
+    ).await;
+
+    assert_eq!(
+        query_rows(&db, &sql).await,
+        vec![("I".to_string(), 2, 20, 200)]
     );
 }
