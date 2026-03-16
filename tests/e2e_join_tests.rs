@@ -1,3 +1,5 @@
+mod common;
+use crate::common::*;
 #[tokio::test]
 async fn test_full_join_multi_row_unmatched() {
     let db = E2eDb::new().await.with_extension().await;
