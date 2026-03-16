@@ -660,7 +660,8 @@ async fn test_scheduler_skips_misaligned_watermark() {
     .await;
 
     // Trigger CDC so the scheduler has changes to process for the auto-refresh.
-    db.execute("INSERT INTO sched_wm_a VALUES (2, 'a2')").await;
+    db.execute("INSERT INTO sched_wm_a VALUES (99, 'a99')")
+        .await;
 
     // Wait for initial COMPLETED refresh.
     let refreshed = db
@@ -761,7 +762,7 @@ async fn test_scheduler_resumes_after_watermark_alignment() {
     .await;
 
     // Trigger CDC so the scheduler has changes to process for the auto-refresh.
-    db.execute("INSERT INTO res_a VALUES (2, 'a2')").await;
+    db.execute("INSERT INTO res_a VALUES (99, 'a99')").await;
 
     // Wait for initial COMPLETED refresh.
     let refreshed = db
@@ -862,7 +863,7 @@ async fn test_scheduler_respects_tolerance() {
     .await;
 
     // Trigger CDC so the scheduler has changes to process for the auto-refresh.
-    db.execute("INSERT INTO tol_sa VALUES (2, 'a2')").await;
+    db.execute("INSERT INTO tol_sa VALUES (99, 'a99')").await;
 
     // Wait for initial refresh.
     let refreshed = db
