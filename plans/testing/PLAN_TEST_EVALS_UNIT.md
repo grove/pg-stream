@@ -16,6 +16,7 @@ The unit test suite is currently green and substantial:
 ## Implementation Status
 
 The initial hardening slice from this report has been started and validated on branch `test-evals-unit-1`:
+- Added execution-backed integration tests for `cdc.rs` trigger installation and log decoding paths, using `pgrx::pg_test` to simulate basic CDC generation, keyless table replication (REPLICA IDENTITY FULL), and wide-row handling against a live backend.
 
 - Added a success-path unit seam via `execute_differential_refresh()` execution test in `src/refresh.rs`
 - Added direct unit coverage to `src/dvm/row_id.rs`
