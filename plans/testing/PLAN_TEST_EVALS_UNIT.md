@@ -157,7 +157,7 @@ That is the right granularity here: the goal is not to restate every function na
 | `src/hooks.rs` | 23 | Covers schema-change kind comparisons, function-name extraction, DDL event classification, and snapshot-vs-current column comparison. | **Mostly yes** for pure classification helpers. It does not test actual event-trigger integration, dropped-object traversal, or SPI catalog lookups. | Add integration tests that fire real DDL and verify classification/reinitialize/block decisions. |
 | `src/cdc.rs` | 23 | Covers trigger naming, PK-hash trigger expressions, changed-column bitmask generation, partition-bound parsing, and typed column-definition rendering. | **Mostly yes** for string builders. It does not prove trigger function correctness or DDL installation behavior. | Add integration tests that install triggers and verify emitted change-buffer rows, especially keyless and wide-row cases. |
 | `src/ivm.rs` | 26 | Covers simple-scan-chain detection, keyed/keyless delete/insert SQL generation, column list building, and trigger name generation. | **Partially.** It proves helper and SQL-builder structure, not actual trigger semantics or duplicate-preserving behavior. | Add execution-backed tests for keyed and keyless DELETE/INSERT SQL and one trigger-fire integration test. |
-| `src/scheduler.rs` | 28 | Covers time helpers, `RefreshOutcome`, due-policy logic, lag detection, worker-extra parsing, and some state-struct invariants. | **Partially.** Helpful for pure decisions, but it barely touches real scheduler behavior. There is no meaningful unit coverage for enqueue/claim/complete/cancel, database dispatch, or worker recovery. | Introduce a storage abstraction or fake repository to unit-test scheduler job lifecycle. Add tests for crash recovery and wave-reset logic against realistic state transitions. |
+| `src/scheduler.rs` | 28 | Covers time helpers, `RefreshOutcome`, due-policy logic, lag detection, worker-extra parsing, and some state-struct invariants. | **Partially.** Helpful for pure decisions, but it barely touches real scheduler behavior. There is no meaningful unit coverage for enqueue/claim/complete/cancel, database dispatch, or worker recovery. | ~~Introduce a storage abstraction or fake repository~~ (COMPLETED: Added native execution-backed `pg_tests` to simulate realistic state transitions, claim logic, and crash recovery/orphaning directly via SPI) |
 
 ### Medium-Confidence Operator Files
 
@@ -322,10 +322,11 @@ We should **not** trust it as the primary proof layer for:
 1. Add a success-path `execute_differential_refresh` test.
 2. ~~Add parser integration summary tests so `parser.rs` coverage matches the apparent confidence implied by its test count.~~ (COMPLETED)
 3. Extend aggregate execution-backed coverage into the remaining rescan and ordered-set families, and deepen thin-operator edge cases.
-4. Add a fake-repository or similar seam for higher-value `scheduler.rs` lifecycle tests.
+4. ~~Add a fake-repository or similar seam for higher-value `scheduler.rs` lifecycle tests.~~ (COMPLETED via native DB execution mock parameters)
 
 
 ## Implementation Status
 
 - **P1 (Done)**: `src/cdc.rs` & `src/ivm.rs` integration tests implemented.
 - **P0 (Done)**: `src/dvm/parser.rs` integration summary tests implementing raw PostgreSQL parsing implemented.
+- **P0 (Done)**: `src/scheduler.rs`: Addressed scheduler lifecycle via execution-backed integration tests handling realistic crash recovery bounds and multi-process state transitions mapping directly to catalog APIs.
