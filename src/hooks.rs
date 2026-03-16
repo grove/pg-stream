@@ -1299,12 +1299,19 @@ fn handle_dropped_function(obj: &DroppedObject) {
 
 // ── Dependency queries ─────────────────────────────────────────────────────
 
-/// Find ST IDs that directly depend on a given source OID.
+/// Find ST IDs that directly depend on a given base or foreign-table source OID.
+///
+/// Stream-table dependencies are handled separately by DAG/SCC logic. They
+/// must not be treated as CDC-backed source-table dependencies here, or DDL on
+/// a stream table's storage relation during refresh would incorrectly try to
+/// rebuild change-buffer infrastructure for that stream table.
 fn find_downstream_pgt_ids(source_oid: pg_sys::Oid) -> Result<Vec<i64>, PgTrickleError> {
     Spi::connect(|client| {
         let table = client
             .select(
-                "SELECT pgt_id FROM pgtrickle.pgt_dependencies WHERE source_relid = $1",
+                "SELECT pgt_id FROM pgtrickle.pgt_dependencies \
+                 WHERE source_relid = $1 \
+                   AND source_type IN ('TABLE', 'FOREIGN_TABLE')",
                 None,
                 &[source_oid.into()],
             )

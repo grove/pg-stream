@@ -726,6 +726,19 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
 
+    let has_stream_table_source = StDependency::get_for_st(st.pgt_id)
+        .map(|deps| deps.iter().any(|dep| dep.source_type == "STREAM_TABLE"))
+        .unwrap_or(false);
+
+    if has_stream_table_source {
+        pgrx::debug1!(
+            "[pg_trickle] cache pre-warm skipped for {}.{}: upstream stream tables use full-refresh fallback",
+            schema,
+            name,
+        );
+        return;
+    }
+
     if matches!(dvm::query_has_recursive_cte(&st.defining_query), Ok(true)) {
         pgrx::debug1!(
             "[pg_trickle] cache pre-warm skipped for {}.{}: recursive CTEs choose refresh strategy at runtime",
