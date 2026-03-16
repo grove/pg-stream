@@ -1213,8 +1213,10 @@ fn alter_stream_table_query(
     let vq = validate_and_parse_query(&rewritten_query, &mut refresh_mode, false)?;
 
     // Cycle detection on the new dependency set (ALTER-aware: replaces
-    // the existing ST's edges rather than creating a sentinel node)
-    check_for_cycles_alter(st.pgt_id, &vq.source_relids)?;
+    // the existing ST's edges rather than creating a sentinel node).
+    // Pass the proposed query so monotonicity of the altered ST's new
+    // query is checked when it participates in a cycle.
+    check_for_cycles_alter(st.pgt_id, &vq.source_relids, &rewritten_query)?;
 
     // Get the current storage table columns (excluding internal __pgt_* columns)
     let old_columns = get_storage_table_columns(schema, table_name)?;
@@ -4463,6 +4465,32 @@ fn check_for_cycles(source_relids: &[(pg_sys::Oid, String)]) -> Result<(), PgTri
 /// `validate_and_parse_query` flow and its refresh mode is checked by
 /// the caller after creation.
 fn validate_cycle_allowed(cycle_nodes: &[String]) -> Result<(), PgTrickleError> {
+    validate_cycle_allowed_inner(cycle_nodes, None, None)
+}
+
+/// CYC-6: Variant of [`validate_cycle_allowed`] for the ALTER QUERY path.
+///
+/// Unlike `validate_cycle_allowed`, the ST being altered (`target_pgt_id`)
+/// already has a catalog entry, but its query is being replaced. The
+/// `proposed_query` is checked for monotonicity instead of the stored
+/// catalog entry so that non-monotone cycles are correctly rejected.
+fn validate_cycle_allowed_alter(
+    cycle_nodes: &[String],
+    target_pgt_id: i64,
+    proposed_query: &str,
+) -> Result<(), PgTrickleError> {
+    validate_cycle_allowed_inner(cycle_nodes, Some(target_pgt_id), Some(proposed_query))
+}
+
+/// Internal shared implementation for cycle-allowed checks.
+///
+/// `proposed_pgt_id` and `proposed_query` together override the defining
+/// query used for monotonicity checks of a specific ST (ALTER path).
+fn validate_cycle_allowed_inner(
+    cycle_nodes: &[String],
+    proposed_pgt_id: Option<i64>,
+    proposed_query: Option<&str>,
+) -> Result<(), PgTrickleError> {
     if !config::pg_trickle_allow_circular() {
         return Err(PgTrickleError::CycleDetected(cycle_nodes.to_vec()));
     }
@@ -4497,8 +4525,18 @@ fn validate_cycle_allowed(cycle_nodes: &[String]) -> Result<(), PgTrickleError> 
             )));
         }
 
+        // For the ALTER path: if this node is the one being altered,
+        // check the proposed (new) query for monotonicity instead of the
+        // stored defining_query — the stored query is the old one and
+        // would give a false pass.
+        let query_to_check = if proposed_pgt_id == Some(meta.pgt_id) {
+            proposed_query.unwrap_or(&meta.defining_query)
+        } else {
+            &meta.defining_query
+        };
+
         // All cycle members must have monotone queries
-        match crate::dvm::parse_defining_query_full(&meta.defining_query) {
+        match crate::dvm::parse_defining_query_full(query_to_check) {
             Ok(pr) => crate::dvm::check_monotonicity(&pr.tree)?,
             Err(e) => {
                 return Err(PgTrickleError::InvalidArgument(format!(
@@ -4518,9 +4556,15 @@ fn validate_cycle_allowed(cycle_nodes: &[String]) -> Result<(), PgTrickleError> 
 /// this function re-uses the existing ST's node in the DAG and replaces its
 /// incoming edges with the proposed new source dependencies. This correctly
 /// detects cycles like A → B → A that a sentinel node would miss.
+///
+/// `proposed_query` is the new defining query being applied to `pgt_id`.
+/// It is passed to the cycle validation so the monotonicity of the altered
+/// ST's new query is checked — not the old stored query — when it would
+/// participate in a cycle.
 fn check_for_cycles_alter(
     pgt_id: i64,
     source_relids: &[(pg_sys::Oid, String)],
+    proposed_query: &str,
 ) -> Result<(), PgTrickleError> {
     if source_relids.is_empty() {
         return Ok(());
@@ -4558,7 +4602,9 @@ fn check_for_cycles_alter(
 
     match dag.detect_cycles() {
         Ok(()) => Ok(()),
-        Err(PgTrickleError::CycleDetected(nodes)) => validate_cycle_allowed(&nodes),
+        Err(PgTrickleError::CycleDetected(nodes)) => {
+            validate_cycle_allowed_alter(&nodes, pgt_id, proposed_query)
+        }
         Err(e) => Err(e),
     }
 }

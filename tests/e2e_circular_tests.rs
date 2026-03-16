@@ -97,27 +97,40 @@ async fn test_circular_monotone_cycle_converges() {
     db.execute("INSERT INTO cyc_edges VALUES (1,2), (2,3), (3,4)")
         .await;
 
-    // cyc_reach_a: direct edges plus paths through cyc_reach_b
+    // Create both STs with non-cyclic initial queries to avoid forward-reference
+    // validation failures, then ALTER them into a cycle.
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_reach_a', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_edges e \
-           UNION ALL \
-           SELECT DISTINCT e.src, rb.dst \
-           FROM cyc_edges e \
-           INNER JOIN cyc_reach_b rb ON e.dst = rb.src$$, \
+         $$SELECT DISTINCT e.src, e.dst FROM cyc_edges e$$, \
+         '1s', 'DIFFERENTIAL', false)",
+    )
+    .await;
+    db.execute(
+        "SELECT pgtrickle.create_stream_table('cyc_reach_b', \
+         $$SELECT DISTINCT e.src, e.dst FROM cyc_edges e$$, \
          '1s', 'DIFFERENTIAL', false)",
     )
     .await;
 
-    // cyc_reach_b: direct edges plus paths through cyc_reach_a
+    // cyc_reach_a: direct edges plus paths through cyc_reach_b
     db.execute(
-        "SELECT pgtrickle.create_stream_table('cyc_reach_b', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_edges e \
+        "SELECT pgtrickle.alter_stream_table('cyc_reach_a', \
+         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_edges e \
+           UNION ALL \
+           SELECT DISTINCT e.src, rb.dst \
+           FROM cyc_edges e \
+           INNER JOIN cyc_reach_b rb ON e.dst = rb.src$$)",
+    )
+    .await;
+
+    // cyc_reach_b: direct edges plus paths through cyc_reach_a (forms the cycle)
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_reach_b', \
+         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_edges e \
            UNION ALL \
            SELECT DISTINCT ra.src, e.dst \
            FROM cyc_reach_a ra \
-           INNER JOIN cyc_edges e ON ra.dst = e.src$$, \
-         '1s', 'DIFFERENTIAL', false)",
+           INNER JOIN cyc_edges e ON ra.dst = e.src$$)",
     )
     .await;
 
@@ -319,21 +332,35 @@ async fn test_circular_convergence_records_iterations() {
     db.execute("INSERT INTO cyc_conv_src VALUES (1, 10), (2, 20)")
         .await;
 
-    // Simple cycle: A references B, B references A (both monotone passthrough)
+    // Create both STs with non-cyclic initial queries to avoid forward-reference
+    // validation failures, then ALTER them into a cycle.
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_conv_a', \
-         $$SELECT id, val FROM cyc_conv_src \
-           UNION ALL \
-           SELECT DISTINCT b.id, b.val FROM cyc_conv_b b$$, \
+         $$SELECT id, val FROM cyc_conv_src$$, \
          '1s', 'DIFFERENTIAL', false)",
     )
     .await;
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_conv_b', \
-         $$SELECT id, val FROM cyc_conv_src \
-           UNION ALL \
-           SELECT DISTINCT a.id, a.val FROM cyc_conv_a a$$, \
+         $$SELECT id, val FROM cyc_conv_src$$, \
          '1s', 'DIFFERENTIAL', false)",
+    )
+    .await;
+
+    // Simple cycle: A references B
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_conv_a', \
+         query => $$SELECT id, val FROM cyc_conv_src \
+           UNION ALL \
+           SELECT DISTINCT b.id, b.val FROM cyc_conv_b b$$)",
+    )
+    .await;
+    // B references A (completes the cycle)
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_conv_b', \
+         query => $$SELECT id, val FROM cyc_conv_src \
+           UNION ALL \
+           SELECT DISTINCT a.id, a.val FROM cyc_conv_a a$$)",
     )
     .await;
 
@@ -399,25 +426,38 @@ async fn test_circular_nonconvergence_error_status() {
     db.execute("INSERT INTO cyc_nc_edges VALUES (1,2), (2,3), (3,1)")
         .await;
 
-    // Transitive closure cycle (needs multiple iterations for 3-node graph)
+    // Create both STs with non-cyclic initial queries to avoid forward-reference
+    // validation failures, then ALTER them into a cycle.
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_nc_a', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
-           UNION ALL \
-           SELECT DISTINCT e.src, b.dst \
-           FROM cyc_nc_edges e \
-           INNER JOIN cyc_nc_b b ON e.dst = b.src$$, \
+         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e$$, \
          '1s', 'DIFFERENTIAL', false)",
     )
     .await;
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_nc_b', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
+         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e$$, \
+         '1s', 'DIFFERENTIAL', false)",
+    )
+    .await;
+
+    // Transitive closure cycle (needs multiple iterations for 3-node graph)
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_nc_a', \
+         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
+           UNION ALL \
+           SELECT DISTINCT e.src, b.dst \
+           FROM cyc_nc_edges e \
+           INNER JOIN cyc_nc_b b ON e.dst = b.src$$)",
+    )
+    .await;
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_nc_b', \
+         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
            UNION ALL \
            SELECT DISTINCT a.src, e.dst \
            FROM cyc_nc_a a \
-           INNER JOIN cyc_nc_edges e ON a.dst = e.src$$, \
-         '1s', 'DIFFERENTIAL', false)",
+           INNER JOIN cyc_nc_edges e ON a.dst = e.src$$)",
     )
     .await;
 
@@ -456,21 +496,35 @@ async fn test_circular_drop_member_clears_scc_id() {
         .await;
     db.execute("INSERT INTO cyc_drop_src VALUES (1, 10)").await;
 
-    // Create two STs forming a cycle
+    // Create two STs with non-cyclic initial queries to avoid forward-reference
+    // validation failures, then ALTER them into a cycle.
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_drop_a', \
-         $$SELECT id, val FROM cyc_drop_src \
-           UNION ALL \
-           SELECT DISTINCT b.id, b.val FROM cyc_drop_b b$$, \
+         $$SELECT id, val FROM cyc_drop_src$$, \
          '1m', 'DIFFERENTIAL', false)",
     )
     .await;
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_drop_b', \
-         $$SELECT id, val FROM cyc_drop_src \
-           UNION ALL \
-           SELECT DISTINCT a.id, a.val FROM cyc_drop_a a$$, \
+         $$SELECT id, val FROM cyc_drop_src$$, \
          '1m', 'DIFFERENTIAL', false)",
+    )
+    .await;
+
+    // ALTER A to reference B
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_drop_a', \
+         query => $$SELECT id, val FROM cyc_drop_src \
+           UNION ALL \
+           SELECT DISTINCT b.id, b.val FROM cyc_drop_b b$$)",
+    )
+    .await;
+    // ALTER B to reference A (completes the cycle)
+    db.execute(
+        "SELECT pgtrickle.alter_stream_table('cyc_drop_b', \
+         query => $$SELECT id, val FROM cyc_drop_src \
+           UNION ALL \
+           SELECT DISTINCT a.id, a.val FROM cyc_drop_a a$$)",
     )
     .await;
 
@@ -513,7 +567,9 @@ async fn test_circular_drop_member_clears_scc_id() {
 #[tokio::test]
 async fn test_circular_default_rejects_cycles() {
     let db = E2eDb::new().await.with_extension().await;
-    // Default: allow_circular = false (do NOT set it)
+    // Explicitly enforce the default to prevent GUC pollution from other tests
+    // that may have set allow_circular=true via ALTER SYSTEM.
+    db.execute("SET pg_trickle.allow_circular = false").await;
 
     db.execute("CREATE TABLE cyc_def_src (id INT PRIMARY KEY, val INT NOT NULL)")
         .await;
