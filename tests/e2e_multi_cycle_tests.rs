@@ -158,7 +158,10 @@ async fn test_multi_cycle_prepared_statement_cache() {
         .await;
     db.execute("CREATE TABLE mc_prep (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
         .await;
-    db.execute("INSERT INTO mc_prep (grp, val) VALUES ('a', 1)")
+    // Insert multiple groups to prevent the differential refresh from falling back
+    // to a FULL refresh due to the "aggregate saturation threshold" (where total_changes >= group_count).
+    // A FULL refresh bypasses the MERGE path entirely, so prepared statements would never be used.
+    db.execute("INSERT INTO mc_prep (grp, val) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4), ('e', 5)")
         .await;
 
     let q = "SELECT grp, SUM(val) AS total FROM mc_prep GROUP BY grp";
@@ -195,7 +198,9 @@ async fn test_prepared_statements_cleared_after_cache_invalidation() {
         .batch_execute(
             "SET pg_trickle.use_prepared_statements = on;
              CREATE TABLE mc_prep_invalidate (id SERIAL PRIMARY KEY, grp TEXT, val INT);
-             INSERT INTO mc_prep_invalidate (grp, val) VALUES ('a', 1);",
+             -- Insert multiple groups to avoid the aggregate saturation threshold
+             -- forcing a fall back to FULL refresh, which skirts the MERGE path.
+             INSERT INTO mc_prep_invalidate (grp, val) VALUES ('a', 1), ('b', 2), ('c', 3), ('d', 4), ('e', 5);",
         )
         .await
         .expect("Failed to set up prepared-statement invalidation test");
