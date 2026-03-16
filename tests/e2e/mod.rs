@@ -31,6 +31,8 @@ mod light;
 #[cfg(feature = "light-e2e")]
 pub use light::E2eDb;
 
+pub mod property_support;
+
 // ── Full E2E harness (default) ─────────────────────────────────────────
 #[cfg(not(feature = "light-e2e"))]
 use sqlx::{PgPool, postgres::PgPoolOptions};

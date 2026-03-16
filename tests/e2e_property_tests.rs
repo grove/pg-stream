@@ -19,104 +19,15 @@
 
 mod e2e;
 
-use e2e::E2eDb;
+use e2e::{
+    E2eDb,
+    property_support::{SeededRng as Rng, TrackedIds},
+};
 
 // ── Configuration ──────────────────────────────────────────────────────
 
 const INITIAL_ROWS: usize = 15;
 const CYCLES: usize = 5;
-
-// ── Deterministic PRNG (SplitMix64) ───────────────────────────────────
-
-struct Rng {
-    state: u64,
-}
-
-impl Rng {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn usize_range(&mut self, min: usize, max: usize) -> usize {
-        if min >= max {
-            return min;
-        }
-        min + (self.next_u64() as usize) % (max - min + 1)
-    }
-
-    fn i32_range(&mut self, min: i32, max: i32) -> i32 {
-        if min >= max {
-            return min;
-        }
-        let span = (max as i64 - min as i64 + 1) as u64;
-        min + (self.next_u64() % span) as i32
-    }
-
-    fn choose<'a, T>(&mut self, items: &'a [T]) -> &'a T {
-        assert!(!items.is_empty());
-        &items[self.usize_range(0, items.len() - 1)]
-    }
-
-    fn gen_alpha(&mut self, len: usize) -> String {
-        (0..len)
-            .map(|_| (b'a' + (self.next_u64() % 26) as u8) as char)
-            .collect()
-    }
-
-    fn gen_bool(&mut self) -> bool {
-        self.next_u64().is_multiple_of(2)
-    }
-}
-
-// ── ID tracker for source tables ───────────────────────────────────────
-
-struct TrackedIds {
-    next_id: i32,
-    live: Vec<i32>,
-}
-
-impl TrackedIds {
-    fn new() -> Self {
-        Self {
-            next_id: 1,
-            live: Vec::new(),
-        }
-    }
-
-    /// Allocate the next sequential ID and record it as live.
-    fn alloc(&mut self) -> i32 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.live.push(id);
-        id
-    }
-
-    /// Pick a random existing ID (non-destructive).
-    fn pick(&self, rng: &mut Rng) -> Option<i32> {
-        if self.live.is_empty() {
-            None
-        } else {
-            Some(*rng.choose(&self.live))
-        }
-    }
-
-    /// Remove and return a random existing ID.
-    fn remove_random(&mut self, rng: &mut Rng) -> Option<i32> {
-        if self.live.is_empty() {
-            return None;
-        }
-        let idx = rng.usize_range(0, self.live.len() - 1);
-        Some(self.live.swap_remove(idx))
-    }
-}
 
 // ── Invariant assertion ────────────────────────────────────────────────
 
@@ -683,7 +594,7 @@ async fn test_property_left_join_differential() {
         let n_ins = rng.usize_range(1, 3);
         for _ in 0..n_ins {
             let id = r_ids.alloc();
-            let left_id = rng.i32_range(1, l_ids.next_id + 3);
+            let left_id = rng.i32_range(1, l_ids.next_unused_id() + 3);
             let detail = rng.gen_alpha(3);
             db.execute(&format!(
                 "INSERT INTO prop_ljr VALUES ({id}, {left_id}, '{detail}')"
@@ -870,7 +781,7 @@ async fn test_property_join_aggregate_differential() {
     let mut o_ids = TrackedIds::new();
     for _ in 0..INITIAL_ROWS {
         let id = o_ids.alloc();
-        let cust_id = rng.i32_range(1, c_ids.next_id - 1);
+        let cust_id = rng.i32_range(1, c_ids.next_unused_id() - 1);
         let amount = rng.i32_range(10, 500);
         db.execute(&format!(
             "INSERT INTO prop_ja_ord VALUES ({id}, {cust_id}, {amount})"
@@ -890,7 +801,7 @@ async fn test_property_join_aggregate_differential() {
         let n_ins = rng.usize_range(2, 4);
         for _ in 0..n_ins {
             let id = o_ids.alloc();
-            let cust_id = rng.i32_range(1, c_ids.next_id - 1);
+            let cust_id = rng.i32_range(1, c_ids.next_unused_id() - 1);
             let amount = rng.i32_range(10, 500);
             db.execute(&format!(
                 "INSERT INTO prop_ja_ord VALUES ({id}, {cust_id}, {amount})"
