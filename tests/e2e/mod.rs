@@ -826,13 +826,16 @@ impl E2eDb {
         .unwrap_or_else(|e| panic!("pgt_status query failed for '{}': {}", name, e))
     }
 
-    /// Verify a ST's contents match its defining query exactly (set equality).
+    /// Verify a ST's contents match its defining query exactly (multiset equality).
     ///
     /// Ignores the internal `__pgt_row_id` column by comparing only the
     /// user-visible columns produced by the defining query.
     ///
+    /// Uses `EXCEPT ALL` (not `EXCEPT`) so that duplicate rows are
+    /// correctly accounted for — a bag/multiset comparison.
+    ///
     /// Columns of type `json` are cast to `text` because the `json` type
-    /// does not have an equality operator (needed by `EXCEPT`).
+    /// does not have an equality operator (needed by `EXCEPT ALL`).
     ///
     /// For EXCEPT STs (which keep invisible rows with dual-count tracking),
     /// the comparison filters to visible rows only.
@@ -897,25 +900,27 @@ impl E2eDb {
 
         // If there are json columns, wrap both sides to cast consistently.
         // Otherwise use the simpler direct comparison.
+        // Use EXCEPT ALL (not EXCEPT) for multiset/bag comparison so
+        // that duplicate rows are properly detected.
         let sql = if raw_cols != cast_cols {
-            // json columns present: cast them on both sides of EXCEPT
+            // json columns present: cast them on both sides of EXCEPT ALL
             format!(
                 "SELECT NOT EXISTS ( \
                     (SELECT {cast_cols} FROM {st_table}{set_op_filter} \
-                     EXCEPT \
+                     EXCEPT ALL \
                      SELECT {cast_cols} FROM ({defining_query}) __pgt_dq) \
                     UNION ALL \
                     (SELECT {cast_cols} FROM ({defining_query}) __pgt_dq2 \
-                     EXCEPT \
+                     EXCEPT ALL \
                      SELECT {cast_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         } else {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {raw_cols} FROM {st_table}{set_op_filter} EXCEPT ({defining_query})) \
+                    (SELECT {raw_cols} FROM {st_table}{set_op_filter} EXCEPT ALL ({defining_query})) \
                     UNION ALL \
-                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}{set_op_filter}) \
+                    (({defining_query}) EXCEPT ALL SELECT {raw_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         };

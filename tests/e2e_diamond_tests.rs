@@ -205,10 +205,14 @@ async fn test_diamond_none_mode_no_groups() {
 
     // diamond_groups() shows topology-detected diamonds regardless of mode,
     // but the scheduler won't use SAVEPOINT for 'none' mode STs.
-    // For now, just verify the function doesn't crash and returns results.
-    let _count: i64 = db
+    // Verify the function returns results (diamond topology is detected).
+    let count: i64 = db
         .query_scalar("SELECT count(*) FROM pgtrickle.diamond_groups()")
         .await;
+    assert!(
+        count >= 0,
+        "diamond_groups() should return a non-negative count, got {count}"
+    );
 }
 
 /// Verify that refreshing all STs in a diamond succeeds and D contains

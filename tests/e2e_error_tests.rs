@@ -23,6 +23,13 @@ async fn test_invalid_sql_in_defining_query() {
         )
         .await;
     assert!(result.is_err(), "Typo in SQL should produce a clear error");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.to_lowercase().contains("syntax")
+            || err_msg.contains("FORM")
+            || err_msg.contains("orders"),
+        "Error should indicate a SQL syntax issue, got: {err_msg}"
+    );
 }
 
 #[tokio::test]
@@ -40,6 +47,13 @@ async fn test_self_referencing_query_fails() {
     assert!(
         result.is_err(),
         "Self-referencing defining query should fail"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("self_ref_st")
+            || err_msg.to_lowercase().contains("does not exist")
+            || err_msg.to_lowercase().contains("self-referenc"),
+        "Error should reference the ST name or indicate it doesn't exist, got: {err_msg}"
     );
 }
 
@@ -140,6 +154,14 @@ async fn test_create_with_negative_schedule() {
     // Negative durations should be rejected by the parser
     // '-1m' has a '-' which is not a valid digit or unit
     assert!(result.is_err(), "Negative schedule should be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.to_lowercase().contains("schedule")
+            || err_msg.to_lowercase().contains("duration")
+            || err_msg.to_lowercase().contains("invalid")
+            || err_msg.contains("-1m"),
+        "Error should indicate the schedule is invalid, got: {err_msg}"
+    );
 }
 
 // ── Source Table DDL ───────────────────────────────────────────────────
@@ -333,6 +355,11 @@ async fn test_limit_offset_combined_returns_error() {
         result.is_err(),
         "LIMIT + OFFSET together should be rejected"
     );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("OFFSET") || err_msg.contains("LIMIT"),
+        "Error should mention LIMIT or OFFSET, got: {err_msg}"
+    );
 }
 
 // ── FETCH FIRST / FETCH NEXT rejection (G1) ────────────────────────────
@@ -370,6 +397,11 @@ async fn test_fetch_next_returns_unsupported_error() {
         )
         .await;
     assert!(result.is_err(), "FETCH NEXT should be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("LIMIT") || err_msg.contains("FETCH"),
+        "Error should mention LIMIT or FETCH, got: {err_msg}"
+    );
 }
 
 // ── FOR UPDATE / FOR SHARE rejection ───────────────────────────────────
@@ -435,6 +467,13 @@ async fn test_for_no_key_update_rejected() {
         )
         .await;
     assert!(result.is_err(), "FOR NO KEY UPDATE should be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("FOR UPDATE")
+            || err_msg.contains("FOR SHARE")
+            || err_msg.contains("row-level locking"),
+        "Error should mention row-level locking clause, got: {err_msg}"
+    );
 }
 
 #[tokio::test]
@@ -451,6 +490,13 @@ async fn test_for_key_share_rejected() {
         )
         .await;
     assert!(result.is_err(), "FOR KEY SHARE should be rejected");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("FOR UPDATE")
+            || err_msg.contains("FOR SHARE")
+            || err_msg.contains("row-level locking"),
+        "Error should mention row-level locking clause, got: {err_msg}"
+    );
 }
 
 #[tokio::test]

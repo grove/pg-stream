@@ -1083,6 +1083,11 @@ async fn test_tpch_full_vs_differential() {
         "\n  FULL vs DIFFERENTIAL: {passed}/{} queries passed ✓\n",
         queries.len()
     );
+
+    assert!(
+        passed > 0,
+        "Expected at least one TPC-H query to pass FULL vs DIFFERENTIAL comparison"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1363,6 +1368,11 @@ async fn test_tpch_performance_comparison() {
         "\n  T1-B Performance: {}/{} queries benchmarked ✓\n",
         results.len(),
         queries.len()
+    );
+
+    assert!(
+        !results.is_empty(),
+        "Expected at least one TPC-H query to produce benchmark results"
     );
 }
 
@@ -2331,6 +2341,11 @@ async fn test_tpch_differential_vs_immediate() {
         queries.len()
     );
     println!("══════════════════════════════════════════════════════════\n");
+
+    assert!(
+        passed > 0,
+        "Expected at least one TPC-H query to agree between DIFFERENTIAL and IMMEDIATE"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
