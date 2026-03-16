@@ -3263,7 +3263,7 @@ mod pg_tests {
         let st = StreamTableMeta::get_by_name("public", "test_refresh_st").expect("st must exist");
         assert!(st.is_populated, "ST should be populated after FULL");
 
-        let prev_frontier = st.frontier.clone();
+        let prev_frontier = st.frontier.clone().unwrap();
         assert!(
             !prev_frontier.is_empty(),
             "Frontier should not be empty after FULL refresh"
@@ -3274,7 +3274,17 @@ mod pg_tests {
         Spi::run("UPDATE public.test_refresh_src SET val = 'bar' WHERE id = 1");
         Spi::run("DELETE FROM public.test_refresh_src WHERE id = 2");
 
-        let new_frontier = crate::version::capture_current_frontier().expect("new frontier");
+        let source_oids: Vec<pg_sys::Oid> = st
+            .frontier
+            .as_ref()
+            .unwrap()
+            .source_oids()
+            .into_iter()
+            .map(pg_sys::Oid::from)
+            .collect();
+        let slot_positions = crate::cdc::get_slot_positions(&source_oids).unwrap();
+        let new_frontier =
+            crate::version::compute_new_frontier(&slot_positions, "1970-01-01T00:00:00Z");
 
         let (inserted, deleted) = execute_differential_refresh(&st, &prev_frontier, &new_frontier)
             .expect("differential refresh should succeed");
