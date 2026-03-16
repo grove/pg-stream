@@ -22,8 +22,9 @@ The initial hardening slice from this report has been started and validated on b
 - Added direct normalization/helper tests in `src/config.rs`
 - Extracted `_PG_init()` decision logic into a pure helper and tested it in `src/lib.rs`
 - Added initial execution-backed integration tests for `semi_join` and `anti_join` that run the generated DVM SQL against a standalone PostgreSQL container on Linux/CI; these tests are gated off on macOS because importing `pg_trickle` internals into an integration-test binary currently aborts with a pgrx flat-namespace symbol lookup failure
+- Added Linux/CI-only execution-backed integration tests for `window` and `scalar_subquery`, covering partition-local `ROW_NUMBER` recomputation, frame-sensitive running `SUM(...) OVER (...)` recomputation, scalar-subquery inner-change fan-out, and outer-only passthrough behavior
 
-This closes the previously identified zero-coverage gap for `row_id.rs`, `shmem.rs`, `config.rs`, and `lib.rs`, and starts the execution-backed hardening track for the highest-risk thin operators. The remaining highest-value work is execution-backed testing for `window` and `scalar_subquery`, plus a successful `execute_differential_refresh()` path. The semi/anti-join execution-backed tests still need a macOS-compatible harness if we want them to run locally on this platform.
+This closes the previously identified zero-coverage gap for `row_id.rs`, `shmem.rs`, `config.rs`, and `lib.rs`, and extends the execution-backed hardening track across all four initially identified thin operators. The remaining highest-value work is a successful `execute_differential_refresh()` path, representative aggregate execution-backed coverage, and a macOS-compatible harness for the new operator integration tests.
 
 My overall confidence in the unit suite is **moderate-high for pure Rust logic, but only moderate as a standalone signal for end-to-end correctness**.
 
@@ -202,7 +203,7 @@ This is visible in:
 
 ### 4. Thin operators are the easiest place for subtle bugs to survive
 
-The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `ANTI JOIN`, `WINDOW`, and `SCALAR SUBQUERY` have tricky semantics but thin unit coverage. That is the highest-value unit hardening area.
+The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `ANTI JOIN`, `WINDOW`, and `SCALAR SUBQUERY` have tricky semantics but thin unit coverage. Initial execution-backed coverage now exists for all four, but the remaining scenarios in those operators are still high-value because most of the current operator suites remain structural rather than result-level.
 
 ### 5. Untested small modules still matter
 
@@ -212,7 +213,7 @@ The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `
 
 ### Priority 0: Highest-value hardening
 
-1. Extend execution-backed coverage from `SEMI JOIN` / `ANTI JOIN` to `WINDOW`, `SCALAR SUBQUERY`, and representative `AGGREGATE` families.
+1. Extend execution-backed coverage from the initial `SEMI JOIN` / `ANTI JOIN` / `WINDOW` / `SCALAR SUBQUERY` slices to representative `AGGREGATE` families and deeper operator edge cases.
 2. Add a success-path test for `execute_differential_refresh()`.
 3. Add direct unit coverage for `src/dvm/row_id.rs` and `src/shmem.rs`. Completed in the initial hardening slice.
 4. Add parser integration tests that validate real SQL-to-`OpTree` summaries, since unit tests cannot prove that today.
@@ -242,7 +243,8 @@ The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `
 |---|---|---|
 | P0 | `src/dvm/operators/semi_join.rs` | Initial match gain/loss execution tests completed in a Linux/CI-only integration harness. Remaining work: simultaneous left/right deltas, nested source case, and a macOS-compatible local harness. |
 | P0 | `src/dvm/operators/anti_join.rs` | Initial regain/loss execution tests completed in a Linux/CI-only integration harness. Remaining work: null/unmatched transitions, nested source case, and a macOS-compatible local harness. |
-| P0 | `src/dvm/operators/window.rs` | Executed ranking and frame tests; multi-window, multi-partition updates |
+| P0 | `src/dvm/operators/window.rs` | Initial executed ranking and frame-sensitive tests completed in a Linux/CI-only integration harness. Remaining work: multi-window expressions, updates that move rows across partitions, and a macOS-compatible local harness. |
+| P0 | `src/dvm/operators/scalar_subquery.rs` | Initial executed inner-change fan-out and outer-only passthrough tests completed in a Linux/CI-only integration harness. Remaining work: shared-source overlap cases, aggregate-backed scalar subqueries, and a macOS-compatible local harness. |
 | P0 | `src/refresh.rs` | Success-path differential refresh test; prepared statement parameter-order test |
 | P0 | `src/dvm/parser.rs` | SQL-to-tree integration summary tests using real PostgreSQL parsing |
 | P0 | `src/dvm/operators/aggregate.rs` | Result-level tests for `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, filtered agg, one JSON agg |
@@ -279,7 +281,7 @@ We should **not** trust it as the primary proof layer for:
 
 ## Recommended Next Actions
 
-1. Add execution-backed tests for the remaining thin DVM operators first: `window` and `scalar_subquery`.
-2. Add a success-path `execute_differential_refresh` test.
+1. Add a success-path `execute_differential_refresh` test.
+2. Extend execution-backed operator coverage into representative aggregate families and deeper thin-operator edge cases.
 3. Add parser integration summary tests so `parser.rs` coverage matches the apparent confidence implied by its test count.
 4. Add a fake-repository or similar seam for higher-value `scheduler.rs` lifecycle tests.
