@@ -53,11 +53,8 @@ Substantially Completed (Follow-up only):
 
 Started but still partial:
 
-- Aggregate execution-backed coverage now includes grouped `COUNT(*)`, grouped `SUM`, grouped `AVG`, a filtered grouped `COUNT(...)`, grouped `MIN`, grouped `MAX`, ordered `STRING_AGG`, ordered-set `MODE()`, `JSON_OBJECT_AGG`, `JSONB_OBJECT_AGG`, array-style `JSONB_AGG`, `PERCENTILE_CONT`, and `PERCENTILE_DISC`; remaining high-value cases are broader multi-group / mixed-family edge cases, and any aggregate families we decide are important enough to justify the harness cost beyond these representatives
-
 
 - Refresh-path coverage exists at the E2E layer (`tests/e2e_user_trigger_tests.rs` and related refresh suites), and we have now added a narrower direct execution seam around `src/refresh.rs` itself for `execute_differential_refresh()` success cases.
-- Parser integration summaries now exist for representative CTE, window, scalar-subquery, and recursive-CTE shapes via `cargo pgrx test`, but they are still a small summary slice rather than exhaustive SQL-shape coverage
 
 Lower-priority follow-up:
 
