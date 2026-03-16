@@ -9,6 +9,7 @@
 mod e2e;
 
 use e2e::E2eDb;
+use e2e::property_support::{SeededRng, TraceConfig, TrackedIds, assert_st_query_invariants};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test 5.1 — Wide fan-out: 1 base → 4 leaf STs
@@ -493,5 +494,163 @@ async fn test_wide_fanout_deletion_isolation() {
         let name = format!("wf_l{}", i + 1);
         let q = format!("SELECT id, grp, val FROM wf_src WHERE grp = '{g}'");
         db.assert_st_matches_query(&name, &q).await;
+    }
+}
+// ═══════════════════════════════════════════════════════════════════════════
+// Property-Based Invariant Traces
+// ═══════════════════════════════════════════════════════════════════════════
+
+const FANOUT_INVARIANTS: [(&str, &str); 4] = [
+    (
+        "prop_fo_leaf1",
+        "SELECT id, val FROM prop_fo_src WHERE val % 2 = 0",
+    ),
+    (
+        "prop_fo_leaf2",
+        "SELECT id, val FROM prop_fo_src WHERE val % 2 = 1",
+    ),
+    (
+        "prop_fo_leaf3",
+        "SELECT val, COUNT(*) as cnt, SUM(val) as sm FROM prop_fo_src GROUP BY val",
+    ),
+    (
+        "prop_fo_leaf4",
+        "SELECT val, MIN(id) as mn FROM prop_fo_src GROUP BY val",
+    ),
+];
+
+#[tokio::test]
+async fn test_prop_fanout_leaf_independence() {
+    let config = TraceConfig::from_env();
+    for seed in config.seeds(0xF0_F0_0001) {
+        run_fanout_trace(seed, &config).await;
+    }
+}
+
+async fn run_fanout_trace(seed: u64, config: &TraceConfig) {
+    let db = E2eDb::new().await.with_extension().await;
+    let mut rng = SeededRng::new(seed);
+    let mut ids = TrackedIds::new();
+
+    db.execute("CREATE TABLE prop_fo_src (id INT PRIMARY KEY, val INT NOT NULL)").await;
+
+    // Create leaves
+    for (st, query) in FANOUT_INVARIANTS {
+        db.create_st(st, query, "1m", "DIFFERENTIAL").await;
+    }
+
+    let st_names = ["prop_fo_leaf1", "prop_fo_leaf2", "prop_fo_leaf3", "prop_fo_leaf4"];
+
+    // Initial setup
+    for _ in 0..config.initial_rows {
+        let (id, val) = (ids.alloc(), rng.i32_range(1, 10));
+        db.execute(&format!("INSERT INTO prop_fo_src VALUES ({id}, {val})")).await;
+    }
+    
+    for st in st_names {
+        db.refresh_st_with_retry(st).await;
+    }
+
+    for cycle in 1..=config.cycles {
+        let op = rng.usize_range(0, 100);
+        if op < 40 {
+            // insert
+            let (id, val) = (ids.alloc(), rng.i32_range(1, 10));
+            db.execute(&format!("INSERT INTO prop_fo_src VALUES ({id}, {val})")).await;
+        } else if op < 70 && !ids.is_empty() {
+            // update
+            let id = ids.pick(&mut rng).unwrap();
+            let new_val = rng.i32_range(1, 10);
+            db.execute(&format!("UPDATE prop_fo_src SET val = {new_val} WHERE id = {id}")).await;
+        } else if !ids.is_empty() {
+            // delete
+            let id = ids.remove_random(&mut rng).unwrap();
+            db.execute(&format!("DELETE FROM prop_fo_src WHERE id = {id}")).await;
+        }
+
+        // Random refresh sequences to test independence and overlapping intervals
+        let refresh_order = match rng.usize_range(0, 3) {
+            0 => vec!["prop_fo_leaf1", "prop_fo_leaf2", "prop_fo_leaf3", "prop_fo_leaf4"],
+            1 => vec!["prop_fo_leaf4", "prop_fo_leaf3", "prop_fo_leaf2", "prop_fo_leaf1"],
+            2 => vec!["prop_fo_leaf2", "prop_fo_leaf4", "prop_fo_leaf1", "prop_fo_leaf3"],
+            _ => vec!["prop_fo_leaf3", "prop_fo_leaf1", "prop_fo_leaf4", "prop_fo_leaf2"], 
+        };
+        
+        for st in &refresh_order {
+            db.refresh_st_with_retry(st).await;
+        }
+
+        let check_list = if refresh_order.len() == 4 {
+            FANOUT_INVARIANTS.to_vec()
+        } else {
+            vec![]
+        };
+
+        if !check_list.is_empty() {
+            assert_st_query_invariants(&db, &check_list, seed, cycle, "cycle").await;
+        }
+    }
+    
+    // Final convergence refresh
+    for st in st_names {
+        db.refresh_st_with_retry(st).await;
+    }
+    assert_st_query_invariants(&db, &FANOUT_INVARIANTS, seed, config.cycles + 1, "final").await;
+}
+
+const DEEP_CHAIN_INVARIANTS: [(&str, &str); 4] = [
+    ("prop_dc_l1", "SELECT id, val FROM prop_dc_src WHERE val > 0"),
+    ("prop_dc_l2", "SELECT id, val FROM prop_dc_l1 WHERE val > 1"),
+    ("prop_dc_l3", "SELECT id, val FROM prop_dc_l2 WHERE val > 2"),
+    ("prop_dc_l4", "SELECT id, val FROM prop_dc_l3 WHERE val > 3"),
+];
+
+#[tokio::test]
+async fn test_prop_deep_chain_small_trace() {
+    let config = TraceConfig::from_env();
+    for seed in config.seeds(0xDC_DC_0001) {
+        run_deep_chain_trace(seed, &config).await;
+    }
+}
+
+async fn run_deep_chain_trace(seed: u64, config: &TraceConfig) {
+    let db = E2eDb::new().await.with_extension().await;
+    let mut rng = SeededRng::new(seed);
+    let mut ids = TrackedIds::new();
+
+    db.execute("CREATE TABLE prop_dc_src (id INT PRIMARY KEY, val INT NOT NULL)").await;
+
+    for (st, query) in DEEP_CHAIN_INVARIANTS {
+        db.create_st(st, query, "1m", "DIFFERENTIAL").await;
+    }
+
+    for _ in 0..config.initial_rows {
+        let (id, val) = (ids.alloc(), rng.i32_range(0, 5));
+        db.execute(&format!("INSERT INTO prop_dc_src VALUES ({id}, {val})")).await;
+    }
+    
+    for (st, _) in DEEP_CHAIN_INVARIANTS {
+        db.refresh_st_with_retry(st).await;
+    }
+
+    for cycle in 1..=config.cycles {
+        let op = rng.usize_range(0, 100);
+        if op < 40 {
+            let (id, val) = (ids.alloc(), rng.i32_range(0, 5));
+            db.execute(&format!("INSERT INTO prop_dc_src VALUES ({id}, {val})")).await;
+        } else if op < 70 && !ids.is_empty() {
+            let id = ids.pick(&mut rng).unwrap();
+            let new_val = rng.i32_range(0, 5);
+            db.execute(&format!("UPDATE prop_dc_src SET val = {new_val} WHERE id = {id}")).await;
+        } else if !ids.is_empty() {
+            let id = ids.remove_random(&mut rng).unwrap();
+            db.execute(&format!("DELETE FROM prop_dc_src WHERE id = {id}")).await;
+        }
+
+        for (st, _) in DEEP_CHAIN_INVARIANTS {
+            db.refresh_st_with_retry(st).await;
+        }
+
+        assert_st_query_invariants(&db, &DEEP_CHAIN_INVARIANTS, seed, cycle, "cycle").await;
     }
 }

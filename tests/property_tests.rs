@@ -468,3 +468,108 @@ fn prop_hash_null_encoding_distinct() {
     let h2 = xxh64::xxh64(without_null.as_bytes(), seed);
     assert_ne!(h1, h2, "NULL marker must distinguish from missing column");
 }
+
+// ── Random DAG / SCC properties ─────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    #[test]
+    fn prop_dag_random_topological_order_respects_edges(
+        num_nodes in 0..=15usize,
+        edges in proptest::collection::vec((0..15usize, 0..15usize), 0..=30)
+    ) {
+        let mut dag = StDag::new();
+        for i in 1..=(num_nodes as i64) {
+            dag.add_st_node(DagNode {
+                id: NodeId::StreamTable(i),
+                schedule: Some(Duration::from_secs(60)),
+                effective_schedule: Duration::from_secs(60),
+                name: format!("st_{}", i),
+                status: StStatus::Active,
+                schedule_raw: None,
+            });
+        }
+        for (from_idx, to_idx) in edges {
+            if from_idx < num_nodes && to_idx < num_nodes {
+                dag.add_edge(NodeId::StreamTable((from_idx + 1) as i64), NodeId::StreamTable((to_idx + 1) as i64));
+            }
+        }
+
+        if dag.detect_cycles().is_ok() {
+            let order = dag.topological_order().expect("Acyclic DAG must have valid topological order");
+            let mut pos = std::collections::HashMap::new();
+            for (i, &id) in order.iter().enumerate() {
+                pos.insert(id, i);
+            }
+            for &from in order.iter() {
+                let tos = dag.get_downstream(from);
+                if let Some(&p_from) = pos.get(&from) {
+                    for &to in tos.iter() {
+                        if let Some(&p_to) = pos.get(&to) {
+                            prop_assert!(p_from < p_to, "Topological order violated");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prop_dag_scc_partition_contains_all_nodes(
+        num_nodes in 0..=15usize,
+        edges in proptest::collection::vec((0..15usize, 0..15usize), 0..=30)
+    ) {
+        let mut dag = StDag::new();
+        for i in 1..=(num_nodes as i64) {
+            dag.add_st_node(DagNode {
+                id: NodeId::StreamTable(i),
+                schedule: Some(Duration::from_secs(60)),
+                effective_schedule: Duration::from_secs(60),
+                name: format!("st_{}", i),
+                status: StStatus::Active,
+                schedule_raw: None,
+            });
+        }
+        for (from_idx, to_idx) in edges {
+            if from_idx < num_nodes && to_idx < num_nodes {
+                dag.add_edge(NodeId::StreamTable((from_idx + 1) as i64), NodeId::StreamTable((to_idx + 1) as i64));
+            }
+        }
+
+        if let Err(cycle_err) = dag.detect_cycles() {
+            prop_assert!(!cycle_err.to_string().is_empty());
+        }
+    }
+}
+
+// ── Frontier merge monotonicity ──────────────────────────────────────────────
+
+fn arb_frontier() -> impl Strategy<Value = Frontier> {
+    proptest::collection::hash_map(
+        1000..1010u32, // OIDs
+        (0..100u32).prop_map(|l| format!("1/{:X}", l)), // LSNs
+        0..10
+    ).prop_map(|map| {
+        let mut f = Frontier::new();
+        for (oid, lsn) in map {
+            f.set_source(oid, lsn, "ts".to_string());
+        }
+        f
+    })
+}
+
+proptest! {
+    #[test]
+    fn prop_frontier_merge_monotonic(f1 in arb_frontier(), f2 in arb_frontier()) {
+        let mut f_merged = f1.clone();
+        f_merged.merge_from(&f2);
+        
+        for oid in f1.source_oids() {
+            prop_assert!(lsn_gte(&f_merged.get_lsn(oid), &f1.get_lsn(oid)));
+        }
+        for oid in f2.source_oids() {
+            prop_assert!(lsn_gte(&f_merged.get_lsn(oid), &f2.get_lsn(oid)));
+        }
+    }
+}

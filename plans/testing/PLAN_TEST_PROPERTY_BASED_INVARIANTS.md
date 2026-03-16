@@ -561,7 +561,7 @@ Nightly/manual:
 
 ---
 
-## Phase 6 — Topology / Scheduler Property Traces
+## Phase 6 — Topology / Scheduler Property Traces (Completed)
 
 **Priority:** P2  
 **Estimated effort:** 2–4 days
@@ -583,7 +583,7 @@ Nightly/manual:
 
 ---
 
-## Phase 7 — Pure Rust Property Expansion
+## Phase 7 — Pure Rust Property Expansion (Completed)
 
 **Priority:** P2  
 **Estimated effort:** 2–3 days

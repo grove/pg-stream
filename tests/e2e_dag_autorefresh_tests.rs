@@ -447,3 +447,67 @@ async fn test_autorefresh_staggered_schedules() {
     db.assert_st_matches_query("ars_l3", "SELECT id, val * 2 + 1 AS result FROM ars_src")
         .await;
 }
+
+
+
+// Property-Based Invariant Traces
+// ═══════════════════════════════════════════════════════════════════════════
+use crate::e2e::property_support::{TraceConfig, SeededRng, TrackedIds, assert_st_query_invariants};
+
+const AUTO_INVARIANTS: [(&str, &str); 3] = [
+    ("prop_auto_l1", "SELECT id, val FROM prop_auto_src WHERE val > 1"),
+    ("prop_auto_l2", "SELECT id, val FROM prop_auto_l1 WHERE val > 2"),
+    ("prop_auto_l3", "SELECT id, val FROM prop_auto_l2 WHERE val > 3"),
+];
+
+#[tokio::test]
+async fn test_prop_autorefresh_no_spurious_changes() {
+    let config = TraceConfig::from_env();
+    for seed in config.seeds(0xAA_11_0001) {
+        run_autorefresh_trace(seed, &config).await;
+    }
+}
+
+async fn run_autorefresh_trace(seed: u64, config: &TraceConfig) {
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+    configure_fast_scheduler(&db).await;
+
+    let mut rng = SeededRng::new(seed);
+    let mut ids = TrackedIds::new();
+
+    db.execute("CREATE TABLE prop_auto_src (id INT PRIMARY KEY, val INT NOT NULL)").await;
+
+    for (st, query) in AUTO_INVARIANTS {
+        db.create_st(st, query, "1s", "DIFFERENTIAL").await;
+    }
+
+    for _ in 0..config.initial_rows {
+        let (id, val) = (ids.alloc(), rng.i32_range(0, 10));
+        db.execute(&format!("INSERT INTO prop_auto_src VALUES ({id}, {val})")).await;
+    }
+
+    // Wait for the cascade
+    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+
+    for cycle in 1..=(config.cycles / 2).max(1) {
+        let op = rng.usize_range(0, 100);
+        if op < 40 {
+            let (id, val) = (ids.alloc(), rng.i32_range(0, 10));
+            db.execute(&format!("INSERT INTO prop_auto_src VALUES ({id}, {val})")).await;
+        } else if op < 70 {
+            if let Some(id) = ids.pick(&mut rng) {
+                let new_val = rng.i32_range(0, 10);
+                db.execute(&format!("UPDATE prop_auto_src SET val = {new_val} WHERE id = {id}")).await;
+            }
+        } else {
+            if let Some(id) = ids.remove_random(&mut rng) {
+                db.execute(&format!("DELETE FROM prop_auto_src WHERE id = {id}")).await;
+            }
+        }
+
+        // Wait to allow auto-refresh
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+
+        assert_st_query_invariants(&db, &AUTO_INVARIANTS, seed, cycle, "auto").await;
+    }
+}

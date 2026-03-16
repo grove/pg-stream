@@ -126,6 +126,10 @@ impl TrackedIds {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
     pub fn alloc(&mut self) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
