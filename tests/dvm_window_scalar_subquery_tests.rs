@@ -10,7 +10,7 @@ mod common;
 
 use common::TestDb;
 use pg_trickle::dvm::DiffContext;
-use pg_trickle::dvm::parser::{AggExpr, AggFunc, Column, Expr, OpTree, SortExpr, WindowExpr};
+use pg_trickle::dvm::parser::{AggFunc, Column, Expr, OpTree, SortExpr, WindowExpr};
 use pg_trickle::version::Frontier;
 
 fn int_col(name: &str) -> Column {
@@ -803,22 +803,30 @@ async fn test_diff_scalar_subquery_executes_shared_source_outer_insert_stable_sc
 }
 
 fn build_unpartitioned_window_tree() -> OpTree {
-    let window_expr = WindowExpr {
-        function: AggFunc::RowNumber,
-        argument: None,
-        partition_by: vec![],
-        order_by: vec![sort_asc("amount")],
-        frame: None,
-    };
+    let child = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), text_col("region"), int_col("amount")],
+        &["id"],
+    );
+
     OpTree::Window {
-        source: Box::new(scan_with_pk(
-            1,
-            "orders",
-            "o",
-            vec![int_col("id"), text_col("region"), int_col("amount")],
-            &["id"],
-        )),
-        windows: vec![(window_expr, "global_rn".to_string())],
+        window_exprs: vec![WindowExpr {
+            func_name: "ROW_NUMBER".to_string(),
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![sort_asc("amount")],
+            frame_clause: None,
+            alias: "global_rn".to_string(),
+        }],
+        partition_by: vec![],
+        pass_through: vec![
+            (colref("id"), "id".to_string()),
+            (colref("region"), "region".to_string()),
+            (colref("amount"), "amount".to_string()),
+        ],
+        child: Box::new(child),
     }
 }
 
