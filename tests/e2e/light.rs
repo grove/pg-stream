@@ -560,20 +560,20 @@ impl E2eDb {
             format!(
                 "SELECT NOT EXISTS ( \
                     (SELECT {cast_cols} FROM {st_table}{set_op_filter} \
-                     EXCEPT \
+                     EXCEPT ALL \
                      SELECT {cast_cols} FROM ({defining_query}) __pgt_dq) \
                     UNION ALL \
                     (SELECT {cast_cols} FROM ({defining_query}) __pgt_dq2 \
-                     EXCEPT \
+                     EXCEPT ALL \
                      SELECT {cast_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         } else {
             format!(
                 "SELECT NOT EXISTS ( \
-                    (SELECT {raw_cols} FROM {st_table}{set_op_filter} EXCEPT ({defining_query})) \
+                    (SELECT {raw_cols} FROM {st_table}{set_op_filter} EXCEPT ALL ({defining_query})) \
                     UNION ALL \
-                    (({defining_query}) EXCEPT SELECT {raw_cols} FROM {st_table}{set_op_filter}) \
+                    (({defining_query}) EXCEPT ALL SELECT {raw_cols} FROM {st_table}{set_op_filter}) \
                 )"
             )
         };

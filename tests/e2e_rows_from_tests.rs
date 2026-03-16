@@ -46,7 +46,10 @@ async fn test_rows_from_dual_unnest_full() {
 
     // id=1: 3 rows (alice/90, bob/85, carol/70)
     // id=2: 2 rows (dave/60, NULL/95)
-    assert_eq!(db.count("public.rf_dual_unnest").await, 5);
+    let query = "SELECT rf.id, u.name, u.score \
+         FROM rf_src rf, \
+         ROWS FROM(unnest(rf.names), unnest(rf.scores)) AS u(name, score)";
+    db.assert_st_matches_query("rf_dual_unnest", query).await;
 }
 
 #[tokio::test]
@@ -77,7 +80,10 @@ async fn test_rows_from_triple_unnest_full() {
     assert_eq!(errors, 0);
 
     // Longest array has 3 elements, so 3 rows total (shorter arrays padded with NULL)
-    assert_eq!(db.count("public.rf_tri_unnest").await, 3);
+    let query = "SELECT t.id, u.col_a, u.col_b, u.col_c \
+         FROM rf_tri t, \
+         ROWS FROM(unnest(t.a), unnest(t.b), unnest(t.c)) AS u(col_a, col_b, col_c)";
+    db.assert_st_matches_query("rf_tri_unnest", query).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -115,7 +121,10 @@ async fn test_rows_from_mixed_srfs_full() {
 
     // unnest produces 3 rows, generate_series produces 5 rows.
     // ROWS FROM zips them → 5 rows (the longer of the two).
-    assert_eq!(db.count("public.rf_mixed_srfs").await, 5);
+    let query = "SELECT m.id, u.val, u.n \
+         FROM rf_mixed m, \
+         ROWS FROM(unnest(m.arr), generate_series(1, 5)) AS u(val, n)";
+    db.assert_st_matches_query("rf_mixed_srfs", query).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -131,17 +140,14 @@ async fn test_rows_from_dual_unnest_differential_insert() {
     db.execute("INSERT INTO rf_diff VALUES (1, ARRAY[10, 20], ARRAY[100, 200])")
         .await;
 
-    db.create_st(
-        "rf_diff_view",
-        "SELECT d.id, u.x, u.y \
+    let query = "SELECT d.id, u.x, u.y \
          FROM rf_diff d, \
-         ROWS FROM(unnest(d.xs), unnest(d.ys)) AS u(x, y)",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+         ROWS FROM(unnest(d.xs), unnest(d.ys)) AS u(x, y)";
 
-    assert_eq!(db.count("public.rf_diff_view").await, 2);
+    db.create_st("rf_diff_view", query, "1m", "DIFFERENTIAL")
+        .await;
+
+    db.assert_st_matches_query("rf_diff_view", query).await;
 
     // Insert a new row
     db.execute("INSERT INTO rf_diff VALUES (2, ARRAY[30, 40, 50], ARRAY[300])")
@@ -149,7 +155,7 @@ async fn test_rows_from_dual_unnest_differential_insert() {
     db.refresh_st("rf_diff_view").await;
 
     // id=1: 2 rows, id=2: 3 rows = 5 total
-    assert_eq!(db.count("public.rf_diff_view").await, 5);
+    db.assert_st_matches_query("rf_diff_view", query).await;
 }
 
 #[tokio::test]
@@ -165,24 +171,21 @@ async fn test_rows_from_dual_unnest_differential_delete() {
     )
     .await;
 
-    db.create_st(
-        "rf_del_view",
-        "SELECT d.id, u.x, u.y \
+    let query = "SELECT d.id, u.x, u.y \
          FROM rf_del d, \
-         ROWS FROM(unnest(d.xs), unnest(d.ys)) AS u(x, y)",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+         ROWS FROM(unnest(d.xs), unnest(d.ys)) AS u(x, y)";
+
+    db.create_st("rf_del_view", query, "1m", "DIFFERENTIAL")
+        .await;
 
     // id=1: 2 rows, id=2: 1 row = 3
-    assert_eq!(db.count("public.rf_del_view").await, 3);
+    db.assert_st_matches_query("rf_del_view", query).await;
 
     db.execute("DELETE FROM rf_del WHERE id = 1").await;
     db.refresh_st("rf_del_view").await;
 
     // Only id=2 remains: 1 row
-    assert_eq!(db.count("public.rf_del_view").await, 1);
+    db.assert_st_matches_query("rf_del_view", query).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -198,20 +201,16 @@ async fn test_rows_from_single_function_passthrough() {
     db.execute("INSERT INTO rf_single VALUES (1, ARRAY[10, 20, 30])")
         .await;
 
-    // Single-function ROWS FROM — should pass through without rewriting
-    db.create_st(
-        "rf_single_view",
-        "SELECT s.id, u.val \
+    let query = "SELECT s.id, u.val \
          FROM rf_single s, \
-         ROWS FROM(unnest(s.arr)) AS u(val)",
-        "1m",
-        "FULL",
-    )
-    .await;
+         ROWS FROM(unnest(s.arr)) AS u(val)";
+
+    // Single-function ROWS FROM — should pass through without rewriting
+    db.create_st("rf_single_view", query, "1m", "FULL").await;
 
     let (status, _, populated, errors) = db.pgt_status("rf_single_view").await;
     assert_eq!(status, "ACTIVE");
     assert!(populated);
     assert_eq!(errors, 0);
-    assert_eq!(db.count("public.rf_single_view").await, 3);
+    db.assert_st_matches_query("rf_single_view", query).await;
 }

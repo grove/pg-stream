@@ -1202,10 +1202,10 @@ light-E2E limitations).
 
 | # | Action | Impact | Effort |
 |---|--------|--------|--------|
-| 1 | Fix `tests/e2e/light.rs` `assert_st_matches_query` to use `EXCEPT ALL` | All keyless/set-op tests gain multiset verification | Small |
-| 2 | Add `assert_st_matches_query` to `rows_from_tests` (6 tests) | 6 smoke tests → 6 correctness tests | Small |
-| 3 | Add `assert_st_matches_query` to `expression_tests` (41 tests) | 41 smoke tests → 41 correctness tests | Medium |
-| 4 | Add `assert_st_matches_query` to `ivm_tests` (26 tests) | Core IVM loop fully validated | Medium |
+| 1 | ~~Fix `tests/e2e/light.rs` `assert_st_matches_query` to use `EXCEPT ALL`~~ | DONE | Small |
+| 2 | ~~Add `assert_st_matches_query` to `rows_from_tests` (6 tests)~~ | DONE | Small |
+| 3 | ~~Add `assert_st_matches_query` to `expression_tests` (41 tests)~~ | DONE | Medium |
+| 4 | ~~Add `assert_st_matches_query` to `ivm_tests` (26 tests)~~ | DONE | Medium |
 
 ### P1 — High (should address soon)
 

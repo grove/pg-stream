@@ -37,7 +37,9 @@ async fn test_ivm_create_simple_select() {
     db.execute("INSERT INTO orders VALUES (1, 'Alice', 100), (2, 'Bob', 200)")
         .await;
 
-    create_immediate_st(&db, "order_imm", "SELECT id, customer, amount FROM orders").await;
+    let query = "SELECT id, customer, amount FROM orders";
+    create_immediate_st(&db, "order_imm", query).await;
+    db.assert_st_matches_query("order_imm", query).await;
 
     // Verify catalog entry
     let (status, mode, populated, errors) = db.pgt_status("order_imm").await;
@@ -70,7 +72,9 @@ async fn test_ivm_insert_propagates_immediately() {
     db.execute("INSERT INTO products VALUES (1, 'Widget', 10.00)")
         .await;
 
-    create_immediate_st(&db, "product_imm", "SELECT id, name, price FROM products").await;
+    let query = "SELECT id, name, price FROM products";
+    create_immediate_st(&db, "product_imm", query).await;
+    db.assert_st_matches_query("product_imm", query).await;
 
     let count_before = db.count("public.product_imm").await;
     assert_eq!(count_before, 1);
@@ -90,6 +94,7 @@ async fn test_ivm_insert_propagates_immediately() {
         .query_scalar("SELECT price::text FROM public.product_imm WHERE name = 'Gadget'")
         .await;
     assert_eq!(gadget_price, "25.00");
+    db.assert_st_matches_query("product_imm", query).await;
 }
 
 #[tokio::test]
@@ -99,7 +104,9 @@ async fn test_ivm_multi_row_insert() {
     db.execute("CREATE TABLE items (id INT PRIMARY KEY, val TEXT)")
         .await;
 
-    create_immediate_st(&db, "items_imm", "SELECT id, val FROM items").await;
+    let query = "SELECT id, val FROM items";
+    create_immediate_st(&db, "items_imm", query).await;
+    db.assert_st_matches_query("items_imm", query).await;
 
     // Insert multiple rows in one statement.
     db.execute("INSERT INTO items VALUES (1, 'a'), (2, 'b'), (3, 'c')")
@@ -120,7 +127,9 @@ async fn test_ivm_update_propagates_immediately() {
     db.execute("INSERT INTO inventory VALUES (1, 'Bolts', 100), (2, 'Nuts', 200)")
         .await;
 
-    create_immediate_st(&db, "inv_imm", "SELECT id, product, qty FROM inventory").await;
+    let query = "SELECT id, product, qty FROM inventory";
+    create_immediate_st(&db, "inv_imm", query).await;
+    db.assert_st_matches_query("inv_imm", query).await;
 
     // Update a row.
     db.execute("UPDATE inventory SET qty = 150 WHERE id = 1")
@@ -149,7 +158,9 @@ async fn test_ivm_delete_propagates_immediately() {
     db.execute("INSERT INTO tasks VALUES (1, 'Task A'), (2, 'Task B'), (3, 'Task C')")
         .await;
 
-    create_immediate_st(&db, "tasks_imm", "SELECT id, title FROM tasks").await;
+    let query = "SELECT id, title FROM tasks";
+    create_immediate_st(&db, "tasks_imm", query).await;
+    db.assert_st_matches_query("tasks_imm", query).await;
 
     let count_before = db.count("public.tasks_imm").await;
     assert_eq!(count_before, 3);
@@ -181,7 +192,9 @@ async fn test_ivm_truncate_clears_and_repopulates() {
     db.execute("INSERT INTO logs VALUES (1, 'Entry 1'), (2, 'Entry 2')")
         .await;
 
-    create_immediate_st(&db, "logs_imm", "SELECT id, msg FROM logs").await;
+    let query = "SELECT id, msg FROM logs";
+    create_immediate_st(&db, "logs_imm", query).await;
+    db.assert_st_matches_query("logs_imm", query).await;
     assert_eq!(db.count("public.logs_imm").await, 2);
 
     // TRUNCATE the base table — ST should be emptied.
@@ -201,7 +214,9 @@ async fn test_ivm_drop_cleans_up_triggers() {
         .await;
     db.execute("INSERT INTO cleanup_test VALUES (1, 'x')").await;
 
-    create_immediate_st(&db, "cleanup_imm", "SELECT id, val FROM cleanup_test").await;
+    let query = "SELECT id, val FROM cleanup_test";
+    create_immediate_st(&db, "cleanup_imm", query).await;
+    db.assert_st_matches_query("cleanup_imm", query).await;
 
     // Drop the stream table.
     db.drop_st("cleanup_imm").await;
@@ -257,7 +272,9 @@ async fn test_ivm_manual_refresh_does_full_refresh() {
     db.execute("INSERT INTO refresh_test VALUES (1, 10), (2, 20)")
         .await;
 
-    create_immediate_st(&db, "refresh_imm", "SELECT id, val FROM refresh_test").await;
+    let query = "SELECT id, val FROM refresh_test";
+    create_immediate_st(&db, "refresh_imm", query).await;
+    db.assert_st_matches_query("refresh_imm", query).await;
     assert_eq!(db.count("public.refresh_imm").await, 2);
 
     // Manual refresh should work (does a full refresh)
@@ -276,7 +293,9 @@ async fn test_ivm_mixed_operations_in_sequence() {
     db.execute("CREATE TABLE accounts (id INT PRIMARY KEY, name TEXT, balance NUMERIC)")
         .await;
 
-    create_immediate_st(&db, "acct_imm", "SELECT id, name, balance FROM accounts").await;
+    let query = "SELECT id, name, balance FROM accounts";
+    create_immediate_st(&db, "acct_imm", query).await;
+    db.assert_st_matches_query("acct_imm", query).await;
     assert_eq!(db.count("public.acct_imm").await, 0);
 
     // INSERT
@@ -352,7 +371,9 @@ async fn test_ivm_alter_immediate_to_differential() {
         .await;
     db.execute("INSERT INTO sw_i2d VALUES (1, 'x')").await;
 
-    create_immediate_st(&db, "sw_i2d_st", "SELECT id, val FROM sw_i2d").await;
+    let query = "SELECT id, val FROM sw_i2d";
+    create_immediate_st(&db, "sw_i2d_st", query).await;
+    db.assert_st_matches_query("sw_i2d_st", query).await;
 
     let (_, mode, _, _) = db.pgt_status("sw_i2d_st").await;
     assert_eq!(mode, "IMMEDIATE");
@@ -377,6 +398,7 @@ async fn test_ivm_alter_immediate_to_differential() {
         1,
         "INSERT should NOT propagate in DIFFERENTIAL mode"
     );
+    db.assert_st_matches_query("sw_i2d_st", query).await;
 }
 
 #[tokio::test]
@@ -419,7 +441,9 @@ async fn test_ivm_alter_immediate_to_full() {
         .await;
     db.execute("INSERT INTO sw_i2f VALUES (1, 'z')").await;
 
-    create_immediate_st(&db, "sw_i2f_st", "SELECT id, val FROM sw_i2f").await;
+    let query = "SELECT id, val FROM sw_i2f";
+    create_immediate_st(&db, "sw_i2f_st", query).await;
+    db.assert_st_matches_query("sw_i2f_st", query).await;
 
     // Switch to FULL.
     db.execute(
@@ -814,7 +838,9 @@ async fn test_ivm_concurrent_inserts_immediate() {
     db.execute("CREATE TABLE conc_src (id INT PRIMARY KEY, val INT)")
         .await;
 
-    create_immediate_st(&db, "conc_imm", "SELECT id, val FROM conc_src").await;
+    let query = "SELECT id, val FROM conc_src";
+    create_immediate_st(&db, "conc_imm", query).await;
+    db.assert_st_matches_query("conc_imm", query).await;
 
     // Perform concurrent inserts using separate connections from the pool.
     let pool = db.pool.clone();
@@ -845,4 +871,5 @@ async fn test_ivm_concurrent_inserts_immediate() {
         50,
         "IMMEDIATE ST should have 50 rows after concurrent inserts"
     );
+    db.assert_st_matches_query("conc_imm", query).await;
 }

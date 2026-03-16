@@ -27,13 +27,11 @@ async fn test_case_when_expression_full_mode() {
     )
     .await;
 
-    db.create_st(
-        "order_labels",
-        "SELECT id, CASE WHEN amount > 150 THEN 'high' WHEN amount > 75 THEN 'medium' ELSE 'low' END AS label FROM orders",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_order_labels = "SELECT id, CASE WHEN amount > 150 THEN 'high' WHEN amount > 75 THEN 'medium' ELSE 'low' END AS label FROM orders";
+    db.create_st("order_labels", query_order_labels, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("order_labels", query_order_labels)
+        .await;
 
     let count = db.count("public.order_labels").await;
     assert_eq!(count, 3);
@@ -53,13 +51,11 @@ async fn test_simple_case_expression_full_mode() {
     db.execute("INSERT INTO tickets VALUES (1, 1), (2, 2), (3, 3)")
         .await;
 
-    db.create_st(
-        "ticket_labels",
-        "SELECT id, CASE priority WHEN 1 THEN 'urgent' WHEN 2 THEN 'normal' ELSE 'low' END AS prio_label FROM tickets",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_ticket_labels = "SELECT id, CASE priority WHEN 1 THEN 'urgent' WHEN 2 THEN 'normal' ELSE 'low' END AS prio_label FROM tickets";
+    db.create_st("ticket_labels", query_ticket_labels, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("ticket_labels", query_ticket_labels)
+        .await;
 
     let label: String = db
         .query_scalar("SELECT prio_label FROM public.ticket_labels WHERE id = 1")
@@ -78,13 +74,12 @@ async fn test_coalesce_expression_full_mode() {
     )
     .await;
 
-    db.create_st(
-        "contact_info",
-        "SELECT id, COALESCE(phone, email, 'no-contact') AS best_contact FROM contacts",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_contact_info =
+        "SELECT id, COALESCE(phone, email, 'no-contact') AS best_contact FROM contacts";
+    db.create_st("contact_info", query_contact_info, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("contact_info", query_contact_info)
+        .await;
 
     let c1: String = db
         .query_scalar("SELECT best_contact FROM public.contact_info WHERE id = 1")
@@ -106,13 +101,11 @@ async fn test_nullif_expression_full_mode() {
     db.execute("INSERT INTO vals VALUES (1, 0), (2, 5), (3, 0)")
         .await;
 
-    db.create_st(
-        "safe_vals",
-        "SELECT id, NULLIF(v, 0) AS safe_v FROM vals",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_safe_vals = "SELECT id, NULLIF(v, 0) AS safe_v FROM vals";
+    db.create_st("safe_vals", query_safe_vals, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("safe_vals", query_safe_vals)
+        .await;
 
     let count = db.count("public.safe_vals").await;
     assert_eq!(count, 3);
@@ -138,13 +131,12 @@ async fn test_greatest_least_expression_full_mode() {
     db.execute("INSERT INTO scores VALUES (1, 10, 20, 5), (2, 30, 15, 25)")
         .await;
 
-    db.create_st(
-        "score_bounds",
-        "SELECT id, GREATEST(a, b, c) AS max_score, LEAST(a, b, c) AS min_score FROM scores",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_score_bounds =
+        "SELECT id, GREATEST(a, b, c) AS max_score, LEAST(a, b, c) AS min_score FROM scores";
+    db.create_st("score_bounds", query_score_bounds, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("score_bounds", query_score_bounds)
+        .await;
 
     let max1: i32 = db
         .query_scalar("SELECT max_score FROM public.score_bounds WHERE id = 1")
@@ -166,13 +158,11 @@ async fn test_in_list_expression_full_mode() {
     db.execute("INSERT INTO items VALUES (1, 'books'), (2, 'toys'), (3, 'food'), (4, 'books')")
         .await;
 
-    db.create_st(
-        "filtered_items",
-        "SELECT id, category FROM items WHERE category IN ('books', 'food')",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_filtered_items = "SELECT id, category FROM items WHERE category IN ('books', 'food')";
+    db.create_st("filtered_items", query_filtered_items, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("filtered_items", query_filtered_items)
+        .await;
 
     let count = db.count("public.filtered_items").await;
     assert_eq!(count, 3); // items 1, 3, 4
@@ -187,13 +177,11 @@ async fn test_between_expression_full_mode() {
     db.execute("INSERT INTO products VALUES (1, 10), (2, 50), (3, 100), (4, 200)")
         .await;
 
-    db.create_st(
-        "mid_priced",
-        "SELECT id, price FROM products WHERE price BETWEEN 20 AND 150",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_mid_priced = "SELECT id, price FROM products WHERE price BETWEEN 20 AND 150";
+    db.create_st("mid_priced", query_mid_priced, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("mid_priced", query_mid_priced)
+        .await;
 
     let count = db.count("public.mid_priced").await;
     assert_eq!(count, 2); // products 2, 3
@@ -208,13 +196,11 @@ async fn test_is_distinct_from_expression_full_mode() {
     db.execute("INSERT INTO nulltest VALUES (1, 1, 1), (2, 1, 2), (3, NULL, NULL), (4, 1, NULL)")
         .await;
 
-    db.create_st(
-        "distinct_check",
-        "SELECT id, a IS DISTINCT FROM b AS is_diff FROM nulltest",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_distinct_check = "SELECT id, a IS DISTINCT FROM b AS is_diff FROM nulltest";
+    db.create_st("distinct_check", query_distinct_check, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("distinct_check", query_distinct_check)
+        .await;
 
     let count = db.count("public.distinct_check").await;
     assert_eq!(count, 4);
@@ -240,13 +226,11 @@ async fn test_boolean_test_expression_full_mode() {
     db.execute("INSERT INTO flags VALUES (1, true), (2, false), (3, NULL)")
         .await;
 
-    db.create_st(
-        "active_items",
-        "SELECT id FROM flags WHERE active IS TRUE",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_active_items = "SELECT id FROM flags WHERE active IS TRUE";
+    db.create_st("active_items", query_active_items, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("active_items", query_active_items)
+        .await;
 
     let count = db.count("public.active_items").await;
     assert_eq!(count, 1);
@@ -264,13 +248,11 @@ async fn test_sql_value_function_current_date_full_mode() {
     db.execute("INSERT INTO events VALUES (1, CURRENT_DATE), (2, CURRENT_DATE - 1)")
         .await;
 
-    db.create_st(
-        "recent_events",
-        "SELECT id, event_date FROM events WHERE event_date >= CURRENT_DATE",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_recent_events = "SELECT id, event_date FROM events WHERE event_date >= CURRENT_DATE";
+    db.create_st("recent_events", query_recent_events, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("recent_events", query_recent_events)
+        .await;
 
     let count = db.count("public.recent_events").await;
     assert!(count >= 1);
@@ -285,13 +267,11 @@ async fn test_array_expression_full_mode() {
     db.execute("INSERT INTO data VALUES (1, 10), (2, 20), (3, 30)")
         .await;
 
-    db.create_st(
-        "array_test",
-        "SELECT id, ARRAY[val, val * 2] AS doubled FROM data",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_array_test = "SELECT id, ARRAY[val, val * 2] AS doubled FROM data";
+    db.create_st("array_test", query_array_test, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("array_test", query_array_test)
+        .await;
 
     let count = db.count("public.array_test").await;
     assert_eq!(count, 3);
@@ -311,13 +291,11 @@ async fn test_case_when_in_select_differential_mode() {
         .await;
 
     // CASE in WHERE clause with GROUP BY — DIFFERENTIAL mode
-    db.create_st(
-        "dept_summary",
-        "SELECT dept, COUNT(*) AS cnt, SUM(salary) AS total FROM emp WHERE CASE WHEN salary > 70000 THEN TRUE ELSE FALSE END GROUP BY dept",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+    let query_dept_summary = "SELECT dept, COUNT(*) AS cnt, SUM(salary) AS total FROM emp WHERE CASE WHEN salary > 70000 THEN TRUE ELSE FALSE END GROUP BY dept";
+    db.create_st("dept_summary", query_dept_summary, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("dept_summary", query_dept_summary)
+        .await;
 
     let count = db.count("public.dept_summary").await;
     assert_eq!(count, 1); // only 1 employee has salary > 70000 (id=2, dept=eng)
@@ -337,13 +315,16 @@ async fn test_coalesce_in_select_differential_mode() {
     db.execute("INSERT INTO orders2 VALUES (1, 1, 10), (2, 1, NULL), (3, 2, 5), (4, 2, NULL)")
         .await;
 
+    let query_customer_discounts = "SELECT customer_id, SUM(COALESCE(discount, 0)) AS total_discount FROM orders2 GROUP BY customer_id";
     db.create_st(
         "customer_discounts",
-        "SELECT customer_id, SUM(COALESCE(discount, 0)) AS total_discount FROM orders2 GROUP BY customer_id",
+        query_customer_discounts,
         "1m",
         "DIFFERENTIAL",
     )
     .await;
+    db.assert_st_matches_query("customer_discounts", query_customer_discounts)
+        .await;
 
     let d1: i64 = db
         .query_scalar(
@@ -439,13 +420,11 @@ async fn test_filter_clause_supported() {
     db.execute("INSERT INTO sales2 VALUES (1, 200, 'east'), (2, 50, 'east'), (3, 300, 'west')")
         .await;
 
-    db.create_st(
-        "filter_st",
-        "SELECT region, COUNT(*) FILTER (WHERE amount > 100) AS big_count FROM sales2 GROUP BY region",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+    let query_filter_st = "SELECT region, COUNT(*) FILTER (WHERE amount > 100) AS big_count FROM sales2 GROUP BY region";
+    db.create_st("filter_st", query_filter_st, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("filter_st", query_filter_st)
+        .await;
 
     let count: i64 = db
         .query_scalar("SELECT big_count FROM public.filter_st WHERE region = 'east'")
@@ -464,13 +443,11 @@ async fn test_exists_subquery_in_where() {
         .await;
 
     // EXISTS subquery should now be supported via SemiJoin
-    db.create_st(
-        "exists_st",
-        "SELECT id, name FROM parent_tbl WHERE EXISTS (SELECT 1 FROM child_tbl WHERE child_tbl.parent_id = parent_tbl.id)",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_exists_st = "SELECT id, name FROM parent_tbl WHERE EXISTS (SELECT 1 FROM child_tbl WHERE child_tbl.parent_id = parent_tbl.id)";
+    db.create_st("exists_st", query_exists_st, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("exists_st", query_exists_st)
+        .await;
 
     // Insert data
     db.execute("INSERT INTO parent_tbl VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
@@ -507,14 +484,12 @@ async fn test_right_join_converted_to_left_join() {
         .await;
 
     // RIGHT JOIN should be silently converted to LEFT JOIN with swapped operands
-    db.create_st(
-        "dept_employees",
-        "SELECT d.id AS dept_id, d.name AS dept_name, e.name AS emp_name \
-         FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_dept_employees = "SELECT d.id AS dept_id, d.name AS dept_name, e.name AS emp_name \
+         FROM employees e RIGHT JOIN departments d ON e.dept_id = d.id";
+    db.create_st("dept_employees", query_dept_employees, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("dept_employees", query_dept_employees)
+        .await;
 
     let count = db.count("public.dept_employees").await;
     assert_eq!(count, 4); // eng(Alice,Bob), sales(Charlie), hr(NULL)
@@ -540,13 +515,11 @@ async fn test_window_frame_rows_between() {
     .await;
 
     // Window function with explicit frame clause
-    db.create_st(
-        "running_avg",
-        "SELECT id, ts, val, AVG(val) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_avg FROM timeseries",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_running_avg = "SELECT id, ts, val, AVG(val) OVER (ORDER BY ts ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_avg FROM timeseries";
+    db.create_st("running_avg", query_running_avg, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("running_avg", query_running_avg)
+        .await;
 
     let count = db.count("public.running_avg").await;
     assert_eq!(count, 5);
@@ -562,13 +535,12 @@ async fn test_three_field_column_ref() {
         .await;
 
     // 3-field column reference: public.schema_test.id
-    db.create_st(
-        "schema_ref_st",
-        "SELECT public.schema_test.id, public.schema_test.val FROM schema_test",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_schema_ref_st =
+        "SELECT public.schema_test.id, public.schema_test.val FROM schema_test";
+    db.create_st("schema_ref_st", query_schema_ref_st, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("schema_ref_st", query_schema_ref_st)
+        .await;
 
     let count = db.count("public.schema_ref_st").await;
     assert_eq!(count, 2);
@@ -590,16 +562,14 @@ async fn test_combined_case_coalesce_between() {
     )
     .await;
 
-    db.create_st(
-        "txn_summary",
-        "SELECT id, \
+    let query_txn_summary = "SELECT id, \
          CASE WHEN amount > 200 THEN 'high' ELSE 'low' END AS tier, \
          COALESCE(note, 'no-note') AS description \
-         FROM transactions WHERE amount BETWEEN 50 AND 300",
-        "1m",
-        "FULL",
-    )
-    .await;
+         FROM transactions WHERE amount BETWEEN 50 AND 300";
+    db.create_st("txn_summary", query_txn_summary, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("txn_summary", query_txn_summary)
+        .await;
 
     let count = db.count("public.txn_summary").await;
     assert_eq!(count, 3); // ids 1, 2, 3
@@ -624,13 +594,11 @@ async fn test_not_between_expression_full_mode() {
     db.execute("INSERT INTO nums VALUES (1, 5), (2, 50), (3, 100), (4, 200)")
         .await;
 
-    db.create_st(
-        "excluded_range",
-        "SELECT id, val FROM nums WHERE val NOT BETWEEN 10 AND 150",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_excluded_range = "SELECT id, val FROM nums WHERE val NOT BETWEEN 10 AND 150";
+    db.create_st("excluded_range", query_excluded_range, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("excluded_range", query_excluded_range)
+        .await;
 
     let count = db.count("public.excluded_range").await;
     assert_eq!(count, 2); // ids 1 (5) and 4 (200)
@@ -645,13 +613,12 @@ async fn test_not_in_expression_full_mode() {
     db.execute("INSERT INTO colors VALUES (1, 'red'), (2, 'blue'), (3, 'green'), (4, 'yellow')")
         .await;
 
-    db.create_st(
-        "non_primary_colors",
-        "SELECT id, name FROM colors WHERE name NOT IN ('red', 'blue', 'yellow')",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_non_primary_colors =
+        "SELECT id, name FROM colors WHERE name NOT IN ('red', 'blue', 'yellow')";
+    db.create_st("non_primary_colors", query_non_primary_colors, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("non_primary_colors", query_non_primary_colors)
+        .await;
 
     let count = db.count("public.non_primary_colors").await;
     assert_eq!(count, 1);
@@ -666,13 +633,11 @@ async fn test_is_not_true_and_is_unknown() {
     db.execute("INSERT INTO bool_data VALUES (1, TRUE), (2, FALSE), (3, NULL)")
         .await;
 
-    db.create_st(
-        "not_true_items",
-        "SELECT id FROM bool_data WHERE flag IS NOT TRUE",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_not_true_items = "SELECT id FROM bool_data WHERE flag IS NOT TRUE";
+    db.create_st("not_true_items", query_not_true_items, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("not_true_items", query_not_true_items)
+        .await;
 
     let count = db.count("public.not_true_items").await;
     assert_eq!(count, 2); // FALSE and NULL
@@ -691,13 +656,16 @@ async fn test_between_filter_differential_with_inserts() {
     db.execute("INSERT INTO sensor VALUES (1, 50), (2, 75)")
         .await;
 
+    let query_sensor_in_range = "SELECT id, reading FROM sensor WHERE reading BETWEEN 40 AND 80";
     db.create_st(
         "sensor_in_range",
-        "SELECT id, reading FROM sensor WHERE reading BETWEEN 40 AND 80",
+        query_sensor_in_range,
         "1m",
         "DIFFERENTIAL",
     )
     .await;
+    db.assert_st_matches_query("sensor_in_range", query_sensor_in_range)
+        .await;
 
     let count = db.count("public.sensor_in_range").await;
     assert_eq!(count, 2);
@@ -721,13 +689,11 @@ async fn test_in_list_filter_differential_with_inserts() {
     db.execute("INSERT INTO items2 VALUES (1, 'A'), (2, 'B')")
         .await;
 
-    db.create_st(
-        "cat_filter_st",
-        "SELECT id, cat FROM items2 WHERE cat IN ('A', 'C')",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+    let query_cat_filter_st = "SELECT id, cat FROM items2 WHERE cat IN ('A', 'C')";
+    db.create_st("cat_filter_st", query_cat_filter_st, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("cat_filter_st", query_cat_filter_st)
+        .await;
 
     let count = db.count("public.cat_filter_st").await;
     assert_eq!(count, 1);
@@ -755,13 +721,11 @@ async fn test_plain_distinct_still_works() {
         .await;
 
     // Plain DISTINCT (not DISTINCT ON) should still be accepted
-    db.create_st(
-        "unique_cats",
-        "SELECT DISTINCT category FROM dup_data",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_unique_cats = "SELECT DISTINCT category FROM dup_data";
+    db.create_st("unique_cats", query_unique_cats, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("unique_cats", query_unique_cats)
+        .await;
 
     let count = db.count("public.unique_cats").await;
     assert_eq!(count, 3); // A, B, C
@@ -781,13 +745,12 @@ async fn test_unsupported_aggregate_works_in_full_mode() {
         .await;
 
     // string_agg is a recognized but unsupported aggregate — should work in FULL mode
-    db.create_st(
-        "string_concat",
-        "SELECT grp, STRING_AGG(val::text, ', ' ORDER BY val) AS vals FROM numbers GROUP BY grp",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_string_concat =
+        "SELECT grp, STRING_AGG(val::text, ', ' ORDER BY val) AS vals FROM numbers GROUP BY grp";
+    db.create_st("string_concat", query_string_concat, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("string_concat", query_string_concat)
+        .await;
 
     let count = db.count("public.string_concat").await;
     assert_eq!(count, 2);
@@ -812,13 +775,11 @@ async fn test_is_json_predicate_full_mode() {
     )
     .await;
 
-    db.create_st(
-        "json_check",
-        "SELECT id, payload, payload IS JSON AS is_json FROM json_data",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_json_check = "SELECT id, payload, payload IS JSON AS is_json FROM json_data";
+    db.create_st("json_check", query_json_check, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("json_check", query_json_check)
+        .await;
 
     let count = db.count("public.json_check").await;
     assert_eq!(count, 4);
@@ -852,13 +813,11 @@ async fn test_is_json_type_variants_full_mode() {
     .await;
 
     // IS JSON OBJECT
-    db.create_st(
-        "json_obj_test",
-        "SELECT id, payload IS JSON OBJECT AS is_obj FROM json_types",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_json_obj_test = "SELECT id, payload IS JSON OBJECT AS is_obj FROM json_types";
+    db.create_st("json_obj_test", query_json_obj_test, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("json_obj_test", query_json_obj_test)
+        .await;
 
     let is_obj: bool = db
         .query_scalar("SELECT is_obj FROM public.json_obj_test WHERE id = 1")
@@ -884,13 +843,16 @@ async fn test_is_json_in_where_differential() {
     )
     .await;
 
+    let query_valid_json_only = "SELECT id, data FROM json_filter WHERE data IS JSON";
     db.create_st(
         "valid_json_only",
-        "SELECT id, data FROM json_filter WHERE data IS JSON",
+        query_valid_json_only,
         "1m",
         "DIFFERENTIAL",
     )
     .await;
+    db.assert_st_matches_query("valid_json_only", query_valid_json_only)
+        .await;
 
     let count = db.count("public.valid_json_only").await;
     assert_eq!(count, 2, "Only 2 rows have valid JSON data");
@@ -899,6 +861,8 @@ async fn test_is_json_in_where_differential() {
     db.execute("INSERT INTO json_filter VALUES (4, '{\"new\": true}'), (5, 'nope')")
         .await;
     db.refresh_st("valid_json_only").await;
+    db.assert_st_matches_query("valid_json_only", query_valid_json_only)
+        .await;
 
     let count = db.count("public.valid_json_only").await;
     assert_eq!(count, 3, "Should have 3 valid JSON rows after insert");
@@ -917,13 +881,11 @@ async fn test_json_object_constructor_full_mode() {
     db.execute("INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25)")
         .await;
 
-    db.create_st(
-        "user_json",
-        "SELECT id, JSON_OBJECT('name' : name, 'age' : age) AS data FROM users",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_user_json = "SELECT id, JSON_OBJECT('name' : name, 'age' : age) AS data FROM users";
+    db.create_st("user_json", query_user_json, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("user_json", query_user_json)
+        .await;
 
     let count = db.count("public.user_json").await;
     assert_eq!(count, 2);
@@ -937,13 +899,11 @@ async fn test_json_array_constructor_full_mode() {
         .await;
     db.execute("INSERT INTO vals VALUES (1, 10, 20, 30)").await;
 
-    db.create_st(
-        "val_arrays",
-        "SELECT id, JSON_ARRAY(a, b, c) AS arr FROM vals",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_val_arrays = "SELECT id, JSON_ARRAY(a, b, c) AS arr FROM vals";
+    db.create_st("val_arrays", query_val_arrays, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("val_arrays", query_val_arrays)
+        .await;
 
     let count = db.count("public.val_arrays").await;
     assert_eq!(count, 1);
@@ -958,13 +918,12 @@ async fn test_json_constructors_in_differential_mode() {
     db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)")
         .await;
 
-    db.create_st(
-        "product_json",
-        "SELECT id, JSON_OBJECT('name' : name, 'price' : price) AS data FROM products",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+    let query_product_json =
+        "SELECT id, JSON_OBJECT('name' : name, 'price' : price) AS data FROM products";
+    db.create_st("product_json", query_product_json, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("product_json", query_product_json)
+        .await;
 
     let count = db.count("public.product_json").await;
     assert_eq!(count, 2);
@@ -973,6 +932,8 @@ async fn test_json_constructors_in_differential_mode() {
     db.execute("INSERT INTO products VALUES (3, 'Doohickey', 29.99)")
         .await;
     db.refresh_st("product_json").await;
+    db.assert_st_matches_query("product_json", query_product_json)
+        .await;
 
     let count = db.count("public.product_json").await;
     assert_eq!(count, 3);
@@ -998,13 +959,9 @@ async fn test_json_objectagg_full_mode() {
     )
     .await;
 
-    db.create_st(
-        "kv_obj",
-        "SELECT grp, JSON_OBJECTAGG(key : val) AS obj FROM kvs GROUP BY grp",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_kv_obj = "SELECT grp, JSON_OBJECTAGG(key : val) AS obj FROM kvs GROUP BY grp";
+    db.create_st("kv_obj", query_kv_obj, "1m", "FULL").await;
+    db.assert_st_matches_query("kv_obj", query_kv_obj).await;
 
     let count = db.count("public.kv_obj").await;
     assert_eq!(count, 2, "Should have 2 groups");
@@ -1024,13 +981,9 @@ async fn test_json_arrayagg_full_mode() {
     )
     .await;
 
-    db.create_st(
-        "tag_arr",
-        "SELECT grp, JSON_ARRAYAGG(tag) AS tags FROM tags GROUP BY grp",
-        "1m",
-        "FULL",
-    )
-    .await;
+    let query_tag_arr = "SELECT grp, JSON_ARRAYAGG(tag) AS tags FROM tags GROUP BY grp";
+    db.create_st("tag_arr", query_tag_arr, "1m", "FULL").await;
+    db.assert_st_matches_query("tag_arr", query_tag_arr).await;
 
     let count = db.count("public.tag_arr").await;
     assert_eq!(count, 2, "Should have 2 groups");
@@ -1053,13 +1006,12 @@ async fn test_json_objectagg_differential_mode() {
     .await;
 
     // Create with DIFFERENTIAL mode — should now be recognized as an aggregate
-    db.create_st(
-        "dept_props_std",
-        "SELECT dept, JSON_OBJECTAGG(prop : val) AS props FROM jobj_std GROUP BY dept",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+    let query_dept_props_std =
+        "SELECT dept, JSON_OBJECTAGG(prop : val) AS props FROM jobj_std GROUP BY dept";
+    db.create_st("dept_props_std", query_dept_props_std, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("dept_props_std", query_dept_props_std)
+        .await;
 
     let count = db.count("public.dept_props_std").await;
     assert_eq!(count, 2, "Should have 2 departments after initial load");
@@ -1068,6 +1020,8 @@ async fn test_json_objectagg_differential_mode() {
     db.execute("INSERT INTO jobj_std (dept, prop, val) VALUES ('eng', 'db', 'postgres')")
         .await;
     db.refresh_st("dept_props_std").await;
+    db.assert_st_matches_query("dept_props_std", query_dept_props_std)
+        .await;
 
     let count = db.count("public.dept_props_std").await;
     assert_eq!(count, 2, "Should still have 2 departments after insert");
@@ -1089,13 +1043,17 @@ async fn test_json_arrayagg_differential_mode() {
     )
     .await;
 
+    let query_dept_skills_std =
+        "SELECT dept, JSON_ARRAYAGG(skill) AS skills FROM jarr_std GROUP BY dept";
     db.create_st(
         "dept_skills_std",
-        "SELECT dept, JSON_ARRAYAGG(skill) AS skills FROM jarr_std GROUP BY dept",
+        query_dept_skills_std,
         "1m",
         "DIFFERENTIAL",
     )
     .await;
+    db.assert_st_matches_query("dept_skills_std", query_dept_skills_std)
+        .await;
 
     let count = db.count("public.dept_skills_std").await;
     assert_eq!(count, 2, "Should have 2 departments after initial load");
@@ -1104,6 +1062,8 @@ async fn test_json_arrayagg_differential_mode() {
     db.execute("INSERT INTO jarr_std (dept, skill) VALUES ('eng', 'debugging')")
         .await;
     db.refresh_st("dept_skills_std").await;
+    db.assert_st_matches_query("dept_skills_std", query_dept_skills_std)
+        .await;
 
     let count = db.count("public.dept_skills_std").await;
     assert_eq!(count, 2, "Should still have 2 departments after insert");
@@ -1127,19 +1087,17 @@ async fn test_json_table_full_mode() {
     )
     .await;
 
-    db.create_st(
-        "api_items",
-        "SELECT d.id, jt.name, jt.score
+    let query_api_items = "SELECT d.id, jt.name, jt.score
          FROM api_data d,
               JSON_TABLE(d.payload, '$.items[*]'
                 COLUMNS (
                   name TEXT PATH '$.name',
                   score INT PATH '$.score'
-                )) AS jt",
-        "1m",
-        "FULL",
-    )
-    .await;
+                )) AS jt";
+    db.create_st("api_items", query_api_items, "1m", "FULL")
+        .await;
+    db.assert_st_matches_query("api_items", query_api_items)
+        .await;
 
     let count = db.count("public.api_items").await;
     assert_eq!(count, 3, "Should expand to 3 rows (2 + 1)");
@@ -1159,16 +1117,14 @@ async fn test_json_table_differential_mode() {
     )
     .await;
 
-    db.create_st(
-        "event_tags",
-        "SELECT e.id, jt.tag
+    let query_event_tags = "SELECT e.id, jt.tag
          FROM events e,
               JSON_TABLE(e.data, '$.tags[*]'
-                COLUMNS (tag TEXT PATH '$')) AS jt",
-        "1m",
-        "DIFFERENTIAL",
-    )
-    .await;
+                COLUMNS (tag TEXT PATH '$')) AS jt";
+    db.create_st("event_tags", query_event_tags, "1m", "DIFFERENTIAL")
+        .await;
+    db.assert_st_matches_query("event_tags", query_event_tags)
+        .await;
 
     let count = db.count("public.event_tags").await;
     assert_eq!(count, 3, "Should expand to 3 tag rows");
@@ -1177,6 +1133,8 @@ async fn test_json_table_differential_mode() {
     db.execute("INSERT INTO events (data) VALUES ('{\"tags\": [\"d\", \"e\"]}')")
         .await;
     db.refresh_st("event_tags").await;
+    db.assert_st_matches_query("event_tags", query_event_tags)
+        .await;
 
     let count = db.count("public.event_tags").await;
     assert_eq!(count, 5, "Should have 5 tags after insert");
