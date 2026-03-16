@@ -962,52 +962,34 @@ async fn query_multi_agg_rows(db: &TestDb, sql: &str) -> Vec<(String, String, St
 
 #[tokio::test]
 async fn test_diff_aggregate_executes_multi_group_mixed_family() {
-    let db = setup_aggre    let db = setup_aggre    let db = se   "CREATE TABLE public.agg_multi_st (
-            __pgt            __pgt            __p           io            __pg
+    let db = setup_aggregate_fixture().await;
+    
+    db.execute(
+        "CREATE TABLE public.agg_multi_st (
+            __pgt_action CHAR(1) NOT NULL,
+            region TEXT NOT NULL,
             label TEXT NOT NULL,
             __pgt_count BIGINT NOT NULL,
-            cnt BIGINT NOT      
-                        GINT NOT NULL,
+            cnt BIGINT NOT NULL,
+            total_amt BIGINT NOT NULL,
             max_amt INT NOT NULL
         )"
-                          = make_aggregate_ctx("agg_multi_st", &["region", "label", "cnt", "total_amt",                          = make_aggregald         oup_mixed_family_tree())
-        .expe    multi aggregate differentiation should succeed");
+    ).await;
+
+    let sql = make_aggregate_ctx("agg_multi_st", &["region", "label", "cnt", "total_amt", "max_amt"], build_multi_group_mixed_family_tree())
+        .expect("multi aggregate differentiation should succeed");
 
     reset_aggregate_fixture(&db).await;
-    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR e(    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR e(    db.execute("TR    db.execute("TR',    d'A    db.execute("TR    dt'    db.ex)"    db.execu.awai    db.executcu    db.execute("TR    db.execute("TR    db.execute("TR    db.execn, label, __pgt_count, cnt, total_amt, max_amt) VALUES \
-         (1, 'east', 'A', 1, 1, 10, 10), \
-         (2, 'east', 'B', 1, 1, 20, 20), \
-         (3, 'west', 'A', 1, 1, 15, 15),         (3, 'west', 'A', 1, 1, 1         (3, 'west', 'A', 1, 1, 15, 15)ec         (3, 'west', 'A', 1, 1,ck         (3, 'west', 'A', 1, 1, 15, 1_hash, new_id, new_region, new_amou         abel) VALUES \
-         ('0/100', 'I', 5, 5, 'east', 40, 'A')"
-    )
-    .await;
+    db.execu    db.execu    db.execu pu    db.exmulti_st (__pgt_action, region, label, __pgt_count, cnt, total_amt    db.execu    db.ex       ('I', 'east', 'A', 1, 1, 10, 10),
+         ('I', 'east', 'B', 1, 1, 20, 20         ('I', 'east', 'B 'A         ('I', 'ea           ('I           ('I', 'east', 'B', 1, 1, 20, 20         ('I', 'east', 'B 'A         ('I', 'ea           ('I   n,         ('I', 'east', 'BALUES 
+         ('0/1   , 'I', 5, 5, 'east', 40, 'A')"
+    ).await;
 
-    let rows = query_multi_agg_rows(&db, &sql).await;
-
-    assert_eq!(
+    let rows = qu    let rows = qu    let rows = qu    let assert_eq!(
         rows,
         vec![
-        vec![
-(
-uery_multi_agg_rows(&db, &sql).await;
-west', 'A',, 2, 50, 40),
-            ("D".to_string(), "east".to_string(), "A".to_string(), 1, 10, 10),
-        ]
-    );
-
-    // Test a delete and another insert
-    db.execute("TRUNCATE TABLE pgtrickle_changes.changes_1").await;
-    db.execute(
-        "INSERT INTO pgtrickle_changes.changes_1 (lsn, action, pk_hash, old_id, old_region, old_amount, old_label) VALUES \
-         ('0/200', 'D', 3, 3, 'west', 15, 'A')"
-    ).await;
-    
-    let rows2 = query_multi_agg_rows(&db, &sql).await;
-    assert_eq!(
-        rows2,
-        vec![
-            ("D".to_string(), "west".to_string(), "A".to_string(), 1, 15, 15),
+            ("I".to_string()            ("I".to_string()           1,            ("I".to_string()   tring(), "east".to_string(), "A".to_strin            ("I".to_string()   );         Te            an            ("I".to_string()            ("I".to_string()           1,            ("I".to_string()   tring(), "east".to_string(), "A".to_str.c            ("I".to_string()            ("I".to_string()         ld_label) VALUES 
+         ('0/200', 'D', 3         ('0/200', 'D', 3         ('0/200', 'D', 3         ('0/200', 'D', 3         ('0/200', 'D', 3         ('0/200', 'D', 3         ('0/200', 'D', 3         ('0/200', 'D', st".to_string(), "A".to_string(), 1, 15, 15),
         ]
     );
 }
-
