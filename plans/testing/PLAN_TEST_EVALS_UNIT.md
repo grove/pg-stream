@@ -33,6 +33,7 @@ The initial hardening slice from this report has been started and validated on b
 - Extended `tests/dvm_join_tests.rs` with two three-table nested-join execution tests covering the `(A ⋈ B) ⋈ C` chain: innermost insert (orders INSERT flows through the inner join’s delta to the outer join’s Part 1a ⋊ categories) and outermost delete (category DELETE drives the outer join’s Part 2 via the L₀ snapshot of the inner join ⋊ the category delta)
 - Added Linux/CI-only execution-backed integration tests for nested left join operations (`tests/dvm_nested_left_join_tests.rs`) covering the (A LEFT JOIN B) LEFT JOIN C chain execution paths: innermost insert matching all levels, outermost delete removing matching category but padding the left side, and middle delete destroying the inner join emitting D(matched) and I(NULL-padded)
 - Added Linux/CI-only execution-backed integration tests for nested full join operations (`tests/dvm_nested_full_join_tests.rs`) covering (A FULL JOIN B) FULL JOIN C execution paths: outermost right insert unmatched emitting NULL_left padded row, and innermost left insert matched emitting right-only NULL padded row.
+- Implemented property-based fuzz testing for DAG cycle detection and topological ordering (`tests/property_tests.rs`), discovering and fixing a bug in `topological_order()` where nodes trapped in cycles were silently skipped instead of terminating fast with an error variant.
 - Added Linux/CI-only execution-backed integration tests for nested natural join operations (`tests/dvm_nested_natural_join_tests.rs`) covering the three-table natural join chain execution cascading for innermost insert and outermost delete paths.
 - Added Linux/CI-only execution-backed integration tests for **natural-join-style conditions** (`e.dept_id = d.dept_id` — same column name on both sides of the equi-join condition) via the new `tests/dvm_natural_join_tests.rs`, covering: inner-join employee insert matching department (validates `rewrite_join_condition` same-named-column rewriting for Part 1a), inner-join employee delete (Part 1b R₀ path with same-named condition), inner-join department delete fan-out (Part 2 L₀ ⋈ ΔR for two matching employees), left-join employee insert with no department (Part 3a NULL-padded I — validates NOT EXISTS rewriting for same-named column), and full-join department insert with no employees (Part 6 NULL-padded right-only I — unique to FULL JOIN)
 
@@ -293,7 +294,6 @@ The least-tested operators are not necessarily the simplest ones. `SEMI JOIN`, `
 | P2 | `src/api.rs` | Property tests for SQL scanners and duration/cron boundary fuzzing |
 | P2 | `src/dvm/mod.rs` | Fuzz/property tests for set-op splitters and quoted-string nesting |
 | P2 | `src/wal_decoder.rs` | Decoder fuzzing and real fixture corpus |
-| P2 | `src/dag.rs` | Random DAG invariant checks |
 
 ## Suggested Confidence Statement For Planning Purposes
 
