@@ -906,7 +906,7 @@ async fn test_window_with_nulls() {
 
     db.execute("INSERT INTO window_null_src VALUES (1, NULL, 10), (2, 1, NULL), (3, NULL, NULL), (4, 1, 20)").await;
 
-    let q = "SELECT id, grp, SUM(val) OVER (PARTITION BY grp) as s FROM window_null_src";
+    let q = "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp) as s FROM window_null_src";
 
     db.create_st("window_null_st", q, "1m", "DIFFERENTIAL")
         .await;
