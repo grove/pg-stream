@@ -931,3 +931,83 @@ async fn test_diff_aggregate_executes_jsonb_agg_rescan_update() {
     assert!(json_str.contains("20"));
     assert!(json_str.contains("30"));
 }
+
+fn build_multi_group_mixed_family_tree() -> OpTree {
+    let agg_child = scan_with_pk(
+        1,
+        "orders",
+        "o",
+        vec![int_col("id"), text_col("region"), int_col("amount"), text_col("label")],
+    );
+
+    OpTree::Aggregate {
+        group_by: vec![colref("region"), colref("label")],
+        aggregates: vec![
+            count_star("cnt"),
+            sum_col("amount", "total_amt"),
+            max_col("amount", "max_amt"),
+        ],
+        child: Box::new(agg_child),
+    }
+}
+
+async fn query_multi_agg_rows(db: &TestDb, sql: &str) -> Vec<(String, String, String, i64, i64, i32)> {
+    sqlx::query_as::<_, (String, String, String, i64, i64, i32)>(&format!(
+        "SELECT __pgt_action, region, label, cnt, total_amt, max_amt FROM ({sql}) delta ORDER BY __pgt_action DESC, region, label"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_diff_aggregate_executes_multi_group_mixed_family() {
+    let db = setup_aggre    let db = setup_aggre    let db = se   "CREATE TABLE public.agg_multi_st (
+            __pgt            __pgt            __p           io            __pg
+            label TEXT NOT NULL,
+            __pgt_count BIGINT NOT NULL,
+            cnt BIGINT NOT      
+                        GINT NOT NULL,
+            max_amt INT NOT NULL
+        )"
+                          = make_aggregate_ctx("agg_multi_st", &["region", "label", "cnt", "total_amt",                          = make_aggregald         oup_mixed_family_tree())
+        .expe    multi aggregate differentiation should succeed");
+
+    reset_aggregate_fixture(&db).await;
+    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR e(    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR    db.execute("TR e(    db.execute("TR    db.execute("TR',    d'A    db.execute("TR    dt'    db.ex)"    db.execu.awai    db.executcu    db.execute("TR    db.execute("TR    db.execute("TR    db.execn, label, __pgt_count, cnt, total_amt, max_amt) VALUES \
+         (1, 'east', 'A', 1, 1, 10, 10), \
+         (2, 'east', 'B', 1, 1, 20, 20), \
+         (3, 'west', 'A', 1, 1, 15, 15),         (3, 'west', 'A', 1, 1, 1         (3, 'west', 'A', 1, 1, 15, 15)ec         (3, 'west', 'A', 1, 1,ck         (3, 'west', 'A', 1, 1, 15, 1_hash, new_id, new_region, new_amou         abel) VALUES \
+         ('0/100', 'I', 5, 5, 'east', 40, 'A')"
+    )
+    .await;
+
+    let rows = query_multi_agg_rows(&db, &sql).await;
+
+    assert_eq!(
+        rows,
+        vec![
+        vec![
+(
+uery_multi_agg_rows(&db, &sql).await;
+west', 'A',, 2, 50, 40),
+            ("D".to_string(), "east".to_string(), "A".to_string(), 1, 10, 10),
+        ]
+    );
+
+    // Test a delete and another insert
+    db.execute("TRUNCATE TABLE pgtrickle_changes.changes_1").await;
+    db.execute(
+        "INSERT INTO pgtrickle_changes.changes_1 (lsn, action, pk_hash, old_id, old_region, old_amount, old_label) VALUES \
+         ('0/200', 'D', 3, 3, 'west', 15, 'A')"
+    ).await;
+    
+    let rows2 = query_multi_agg_rows(&db, &sql).await;
+    assert_eq!(
+        rows2,
+        vec![
+            ("D".to_string(), "west".to_string(), "A".to_string(), 1, 15, 15),
+        ]
+    );
+}
+
