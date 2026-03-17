@@ -25,8 +25,8 @@ coverage, all in plain language.
 - [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
 - [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
 - [v0.8.0 — pg_dump Support & Test Hardening](#v080--pg_dump-support--test-hardening)
-- [v0.9.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep](#v090--connection-pooler-compatibility-prometheus--grafana-observability-anomaly-detection--infrastructure-prep)
-- [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
+- [v0.9.0 — Incremental Aggregate Maintenance](#v090--incremental-aggregate-maintenance)
+- [v0.10.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep](#v0100--connection-pooler-compatibility-prometheus--grafana-observability-anomaly-detection--infrastructure-prep)
 - [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
 - [v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compatibility](#v0120--multi-source-delta-batching-cdc-research--pg-backward-compatibility)
 - [v0.13.0 — Core Refresh Optimizations, Scalability Foundations & UNLOGGED Buffers](#v0130--core-refresh-optimizations-scalability-foundations--unlogged-buffers)
@@ -58,8 +58,8 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
                                                                      │
                                                                      └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
                                                                         │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │
-                                                                        │Pooler  │─│Observ.,│─│Incr.Agg │─│Partn.   │─│Delta,   │
-                                                                        │Compat. │ │Fuse&Dmp│ │IVM      │ │&Scale   │ │CDC&PGBk │
+                                                                        │Pooler  │─│Incr.Agg│─│Observ., │─│Partn.   │─│Delta,   │
+                                                                        │Compat. │ │IVM     │ │Fuse&Dmp │ │&Scale   │ │CDC&PGBk │
                                                                         └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘
               │
               └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
@@ -1303,7 +1303,7 @@ that re-links orphaned catalog entries on extension restore.
 
 ---
 
-## v0.9.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
+## v0.10.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
 
 **Goal:** Enable cloud-native PgBouncer transaction-mode deployments via an opt-in compatibility mode, ship ready-made Prometheus/Grafana monitoring so the product is
 externally visible and monitored; protect against anomalous change spikes
@@ -1386,17 +1386,17 @@ action.
 
 > **Anomalous change detection subtotal: ~10–14 hours**
 
-> **v0.9.0 total: ~22–26 hours**
+> **v0.10.0 total: ~22–26 hours**
 
 **Exit criteria:**
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
 - [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers
-- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.8.0 → 0.9.0`)
+- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.9.0 → 0.10.0`)
 - [ ] All public documentation current and reviewed
 
 ---
 
-## v0.10.0 — Incremental Aggregate Maintenance
+## v0.9.0 — Incremental Aggregate Maintenance
 
 **Goal:** Implement algebraic incremental maintenance for decomposable aggregates
 (COUNT, SUM, AVG, MIN, MAX, STDDEV), reducing per-group refresh from O(group_size)
@@ -1426,7 +1426,7 @@ per group.
 > on the most common OLTP delete pattern. See the corrected table and risk analysis
 > in PLAN_NEW_STUFF.md §B-1.
 
-> **Retraction consideration (B-1):** Keep in v0.10.0, but item B1-5 (property-based
+> **Retraction consideration (B-1):** Keep in v0.9.0, but item B1-5 (property-based
 > tests covering the MIN/MAX boundary case) is a **hard prerequisite** for B1-1, not
 > optional follow-on work. The MIN/MAX rule was stated backwards in the original spec;
 > the corrected rule is now in PLAN_NEW_STUFF.md. Do not merge any MIN/MAX algebraic
@@ -1436,7 +1436,7 @@ per group.
 
 > **Algebraic aggregates subtotal: ~7–9 weeks**
 
-> **v0.10.0 total: ~7–9 weeks**
+> **v0.9.0 total: ~7–9 weeks**
 
 **Exit criteria:**
 - [ ] COUNT/SUM/AVG/STDDEV algebraic paths implemented and benchmarked vs. full-group recompute
@@ -1444,7 +1444,7 @@ per group.
 - [ ] Auxiliary columns hidden from user queries via view wrapper
 - [ ] Migration path for existing aggregate stream tables tested
 - [ ] Floating-point drift reset mechanism in place (periodic recompute)
-- [ ] Extension upgrade path tested (`0.9.0 → 0.10.0`)
+- [ ] Extension upgrade path tested (`0.8.0 → 0.9.0`)
 
 ---
 
@@ -1879,8 +1879,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | ✅ Released |
 | v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
 | v0.8.0 — pg_dump Support & Test Hardening | ~16–21d | — | |
-| v0.9.0 — Connection Pooler Compatibility, Observability & Anomaly Detection | ~7–10d + ~22–26h | — | |
-| v0.10.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
+| v0.9.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
+| v0.10.0 — Connection Pooler Compatibility, Observability & Anomaly Detection | ~7–10d + ~22–26h | — | |
 | v0.11.0 — Partitioned Stream Tables & Operational Scale (A-1, C-2, C-3) | ~9–13 wk | — | |
 | v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compat | ~13–19 wk | — | |
 | v0.13.0 — Core Refresh Opt., Scalability Foundations & UNLOGGED Buffers | ~16–31 wk | — | |
