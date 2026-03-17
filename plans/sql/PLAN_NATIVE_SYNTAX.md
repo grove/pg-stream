@@ -735,7 +735,7 @@ for registered stream tables.
 
 ### Phase 5: pg_dump / Restore Support (InProgress)
 
-**Status:** Started. `generate_dump()` and `StreamTableMeta::get_all` are implemented. `restore_stream_tables()` is currently stubbed out pending full event trigger behavior implementation.
+**Status:** In Progress. `generate_dump()` and `restore_stream_tables()` are fully implemented. Next is the event-trigger behavior.
 
 **Scope:** Implement `pgtrickle.generate_dump()` and
 `pgtrickle.restore_stream_tables()` functions.

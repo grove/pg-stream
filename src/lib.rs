@@ -369,6 +369,13 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_watermark_groups (
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_stream_tables', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_dependencies', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_source_gates', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermarks', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermark_groups', '');
+
+
 "#,
     name = "pg_trickle_catalog",
     bootstrap,

@@ -1296,7 +1296,7 @@ that re-links orphaned catalog entries on extension restore.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| NAT-DUMP | `generate_dump()` + `restore_stream_tables()` companion functions; event trigger on extension load for orphaned catalog entries | 3–4d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
+| NAT-DUMP | `generate_dump()` + `restore_stream_tables()` companion functions (done); event trigger on extension load for orphaned catalog entries | 3–4d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
 | NAT-TEST | E2E tests: pg_dump round-trip, restore from backup, orphaned-entry recovery | 2–3d | [PLAN_NATIVE_SYNTAX.md](plans/sql/PLAN_NATIVE_SYNTAX.md) §pg_dump |
 
 > **pg_dump support subtotal: ~5–7 days**
@@ -1323,7 +1323,7 @@ that re-links orphaned catalog entries on extension restore.
 - [x] Test infrastructure hardened with exact mathematical multiset validation
 - [ ] Test harness migrated to `cargo-nextest` to fix speed and CI flake regressions
 - [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
-- [ ] pg_dump round-trip produces valid, restorable SQL for stream tables *(Started: `generate_dump()` and `restore_stream_tables()` functions implemented)*
+- [ ] pg_dump round-trip produces valid, restorable SQL for stream tables *(InProgress: `restore_stream_tables()` fully implemented)*
 - [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
 
 ---

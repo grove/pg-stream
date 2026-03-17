@@ -5237,7 +5237,54 @@ fn generate_dump() -> Result<impl std::iter::Iterator<Item = String>, crate::err
 /// and internal wiring will be missing. This function re-establishes them.
 #[pg_extern(schema = "pgtrickle")]
 fn restore_stream_tables() -> Result<(), crate::error::PgTrickleError> {
-    pgrx::info!("restore_stream_tables() called. This is a stub for the 0.8.0 pg_dump support.");
+    pgrx::info!("Starting pgtrickle environment restoration...");
+
+    // 1. Fetch all stream table declarations from the restored catalog.
+    let tables = crate::catalog::StreamTableMeta::get_all()?;
+    if tables.is_empty() {
+        pgrx::info!("No stream tables found in catalog to restore.");
+        return Ok(());
+    }
+
+    // 2. Drop all stray triggers that came from pg_dump (they carry old OIDs in their names).
+    pgrx::spi::Spi::run(
+        r#"
+        DO $$
+        DECLARE
+            r RECORD;
+        BEGIN
+            FOR r IN (
+                SELECT t.tgname, c.relname, n.nspname
+                FROM pg_trigger t
+                JOIN pg_class c ON t.tgrelid = c.oid
+                JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE t.tgname LIKE 'pg_trickle_cdc_%' OR t.tgname LIKE 'pg_trickle_ivm_%' OR t.tgname = 'pg_trickle_dml_gua                WHERE t.tgname LI                  WHTRIGGER IF EXISTS ' || quote_ident(r.tgname) || ' ON ' || quote_ident(r.nspname) || '.' || quote_ident(r.relname);
+            END LOOP;
+        END
+        $$;
+        "#,
+    ).map_err(|e| crate::error::PgTrickleError::SpiError(format!("Failed to drop old triggers: {}", e)))?;
+
+    // 3. Clear    // 3. Clear    // 3. T pgt_stream_tables so we can reconstruct them cleanly.
+    pgrx::spi::Spi::run("TRUNCATE TABLE pgtrickle.pgt_dependencies, pgtrickle.pgt_change_tracking, pgtrickle.pgt_watermarks, pgtrickle.pgt_watermark_groups, pgtrickle    pgrx::e_    pgrx::spck    pgrx::spi:er    pgrx::spi::Spi::_e    pgrx::sp::    pgrx::spi::Spi::r::SpiError(e.to_string()))?;
+    
+    // We delete every    // We delete every    // We , so create_stream_table_impl can insert them anew with    // We delete every    // We delete every    // We , so cck    // We delete every    // We delete every    // We , so create_stream_table_impl can insert them anew with    // We delete every    // We delete every    // We , so cck    // We delete every    // We delete every    // We , so create_stream_table_impl can insert them anew with    // We );
+        pgrx::info!("        pgst        pg:         pg;
+        pgrx::info!("        pgst        pg:         pg;
+o create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them ogo create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them ogo create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them Coo csto create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them ogo create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them ogo create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them anew Auto create_stream_table_impl can insert them Coo csto create_stream_a is already restored!
+            Some(diamond_const),
+                                                          cdc_mode.as_deref(),
+            st.is_append_only,
+            true, // skip_storage_ddl!
+        )?;
+        
+        // Restore active status
+        pgrx::spi::Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables SET status = 'ACTIVE', is_populated = true WHERE pgt_schema = $1 AND pgt_name = $2",
+            &[st.pgt_schema.into(), st.pgt_name.into()]
+        ).map_err(|e| crate::error::PgTrickleError::SpiError(e.to_string()))?;
+    }
+
     Ok(())
 }
 
