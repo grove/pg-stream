@@ -340,14 +340,16 @@ async fn test_prop_break_cycle_clears_scc_ids() {
 }
 
 async fn run_break_cycle_trace(seed: u64) {
-    // Use E2eDb::new() — same as the existing test_circular_drop_member_clears_scc_id
-    // which is proven to work for cycle-member drops.  new_on_postgres_db() can leave
-    // residual scheduler state (fast interval from configure_circular_scheduler) that
-    // races with the drop_st call and triggers a stack-depth overflow in PostgreSQL.
-    let db = E2eDb::new().await.with_extension().await;
-    // Session-level enable — scheduler still reads the system-level false and will not
-    // concurrently process cycle members, avoiding the DROP deadlock/overflow.
-    db.execute("SET pg_trickle.allow_circular = true").await;
+    // new_on_postgres_db() resets server config (ALTER SYSTEM RESET ALL) and
+    // holds the per-process scheduler lock, preventing a fast scheduler from
+    // racing with the DROP call.
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+    // Use ALTER SYSTEM SET so every connection in the sqlx PgPool sees the
+    // GUC change.  Session-level SET is not reliable with PgPool because
+    // subsequent queries may be dispatched to a different backend connection.
+    db.execute("ALTER SYSTEM SET pg_trickle.allow_circular = true")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
 
     let mut rng = SeededRng::new(seed);
 
@@ -403,10 +405,10 @@ async fn run_break_cycle_trace(seed: u64) {
         ("prop_brk_st_b", "prop_brk_st_a")
     };
 
-    db.execute(
-        "ALTER SYSTEM SET pg_trickle.enabled = off; SELECT pg_reload_conf(); SELECT pg_sleep(1);",
-    )
-    .await;
+    db.execute("ALTER SYSTEM SET pg_trickle.enabled = off")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     db.drop_st(drop_name).await;
 
     // The survivor must have scc_id cleared (no longer in a cycle).
