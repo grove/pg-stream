@@ -1327,7 +1327,7 @@ incompatible with PgBouncer transaction-mode pooling. This section introduces an
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | PB1 | Replace `pg_advisory_lock()` with catalog row-level locking (`FOR UPDATE SKIP LOCKED`) | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
-| PB2 | Add `pg_trickle.pooler_compatibility_mode` GUC to bypass `PREPARE` statements and skip `NOTIFY` | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
+| PB2 | Add `pooler_compatibility_mode` catalog column directly to `pgt_stream_tables` via `CREATE STREAM TABLE ... WITH (...)` or `alter_stream_table()` to bypass `PREPARE` statements and skip `NOTIFY` locally | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
 | PB3 | E2E validation against PgBouncer transaction-mode (Docker Compose with pooler sidecar) | 1–2d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
 
 > **PgBouncer compatibility subtotal: ~7–10 days**

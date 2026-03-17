@@ -44,23 +44,24 @@ Eradicate all session state. Replace `pg_advisory_lock` with `FOR UPDATE SKIP LO
 - **Cons:** Requires a massive refactoring effort. Harms the runtime efficiency for users who run self-hosted setups and *don't* require transaction mode pooling. 
 
 ### Option C: Graceful Degradation / Opt-In Mode (Recommended)
-We introduce a GUC: `pg_trickle.pooler_compatibility_mode = true` (default `false`).
-- When `false`: Behavior remains exactly as it is today — performing fast, utilizing session-level state, and emitting notifications.
-- When `true`: The system gracefully degrades. It shifts concurrency logic to `FOR UPDATE SKIP LOCKED`, disables prepared statements within the refresh engine and generates inline SQL instead, and completely bypasses `LISTEN`/`NOTIFY` emissions.
-- **Pros:** Cloud users get a robust engine without breaking existing performance expectations for dedicated-server users.
-- **Cons:** Expanded testing surface (the CI needs to run the E2E matrix with both GUC variations).
+Instead of a global GUC, we introduce this as a stream table property (e.g. `WITH (pooler_compatibility_mode = true)` in native syntax, or via `alter_stream_table()`).
+- When `false` (default): Behavior remains exactly as it is today — performing fast, utilizing session-level state, and emitting notifications for that specific table.
+- When `true`: The system gracefully degrades. It shifts concurrency logic to `FOR UPDATE SKIP LOCKED` universally, disables prepared statements within the refresh engine and generates inline SQL for that specific table, and completely bypasses `LISTEN`/`NOTIFY` emissions.
+- **Pros:** Cloud users get a robust engine without breaking existing performance expectations for dedicated-server users. Enables a hybrid setup where internal tables are fast and external-facing tables operate nicely through standard poolers.
+- **Cons:** Expanded testing surface (the CI needs to run the E2E matrix with both variations).
 
 ## Detailed Implementation Plan (v0.9.0)
 
 We will proceed with **Option C: Graceful Degradation / Opt-In Mode**.
 
 ### Phase 1: Catalog Concurrency Modernization
-Before handling prepared statements, we must solve concurrency. Instead of relying on `pg_advisory_lock()` across the scheduler, we will transition to `SELECT ... FOR UPDATE SKIP LOCKED` on the `pg_catalog.pgt_stream_tables` rows. This naturally guarantees safe cross-transaction boundaries as long as the worker keeps the master transaction open, or we use transaction boundaries strategically. This is functionally better regardless of PgBouncer.
+Before handling prepared statements, we must solve concurrency. Instead of relying on `pg_advisory_lock()` across the scheduler, we will transition to `SELECT ... FOR UPDATE SKIP LOCKED` on the `pg_catalog.pgt_stream_tables` rows. This naturally guarantees safe cross-transaction boundaries as long as the worker keeps the master transaction open, or we use transaction boundaries strategically. This is functionally better regardless of PgBouncer and will apply to ALL stream tables safely.
 
-### Phase 2: Introduce Opt-In Compatibility GUC
-We will add a new GUC: `pg_trickle.pooler_compatibility_mode`.
-- Modify `refresh.rs` and `diff.rs` to check this GUC. If enabled, skip the `SPI_prepare` flows and use inline strings for DML execution.
-- Modify the event bus to skip `NOTIFY` emissions when the GUC is true.
+### Phase 2: Introduce Opt-In Compatibility Toggle
+We will add a new catalog column `pooler_compatibility_mode` to `pgt_stream_tables`.
+- Modify `create_stream_table` / `alter_stream_table` to pass this option.
+- Modify `refresh.rs` and `diff.rs` to check this flag on the target stream table. If enabled, skip the `SPI_prepare` flows and use inline strings for DML execution.
+- Modify the event bus to skip `NOTIFY` emissions when the flag is true.
 
 ### Phase 3: Hardware and Dependency Testing
 Update the E2E infrastructure to include a Docker Compose configuration that injects PgBouncer in transaction mode natively. We will run the entire light E2E suite through this port to validate the absence of session states and prove mathematical integrity remains under connection multiplexing.
