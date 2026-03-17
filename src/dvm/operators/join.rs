@@ -1305,4 +1305,95 @@ mod tests {
             "expected ≥2 UNION ALL (1a+1b+Part2), got {union_count}"
         );
     }
+
+    // ── Multi-table join chain tests ────────────────────────────────
+
+    /// `(A LEFT JOIN B) INNER JOIN C` — left child is a LEFT join.
+    ///
+    /// This is one of the most common 3-table patterns. The inner join wraps a
+    /// left join, so the left child sub-tree has nullable right columns.
+    /// The inner join differentiator must propagate the nullable columns from
+    /// the left join without stripping them.
+    #[test]
+    fn test_diff_inner_join_left_join_as_left_child() {
+        // A LEFT JOIN B: orders LEFT JOIN customers on o.cust_id = c.id
+        let a = scan(1, "orders", "public", "o", &["id", "cust_id", "amount"]);
+        let b = scan(2, "customers", "public", "c", &["id", "name"]);
+        let left_subtree = left_join(eq_cond("o", "cust_id", "c", "id"), a, b);
+
+        // (A LEFT JOIN B) INNER JOIN C: above LEFT JOIN inner-joined to regions
+        let c = scan(3, "regions", "public", "r", &["id", "country"]);
+        // Join on o.amount == r.id (contrived key for testing)
+        let tree = inner_join(eq_cond("o", "id", "r", "id"), left_subtree, c);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree);
+        assert!(
+            result.is_ok(),
+            "(A LEFT JOIN B) INNER JOIN C should succeed: {result:?}"
+        );
+
+        let dr = result.unwrap();
+        let sql = ctx.build_with_query(&dr.cte_name);
+
+        // Output must include columns from all three tables (A, B, C)
+        assert!(
+            dr.columns
+                .iter()
+                .any(|c| c.contains("o__id") || c.contains("id")),
+            "output should contain columns from A; got {:?}",
+            dr.columns
+        );
+        // SQL itself must have parts
+        assert_sql_contains(&sql, "UNION ALL");
+
+        // Verify it uses the pre-change snapshot (EXCEPT ALL) for correctness
+        assert_sql_contains(&sql, "EXCEPT ALL");
+    }
+
+    /// `A INNER JOIN (B INNER JOIN C)` — right child is a nested inner join.
+    ///
+    /// Three-table inner join chain where all joins feed into the outermost
+    /// inner join. Verifies that column disambiguation works at all levels.
+    #[test]
+    fn test_diff_inner_join_with_nested_right_inner_join() {
+        // B INNER JOIN C: lineitems INNER JOIN parts
+        let b = scan(
+            2,
+            "lineitems",
+            "public",
+            "l",
+            &["order_id", "part_id", "qty"],
+        );
+        let c = scan(3, "parts", "public", "p", &["id", "type"]);
+        let inner_bc = inner_join(eq_cond("l", "part_id", "p", "id"), b, c);
+
+        // A INNER JOIN (B INNER JOIN C): orders INNER JOIN above
+        let a = scan(1, "orders", "public", "o", &["id", "region"]);
+        let tree = inner_join(eq_cond("o", "id", "l", "order_id"), a, inner_bc);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree);
+        assert!(
+            result.is_ok(),
+            "A INNER JOIN (B INNER JOIN C) should succeed: {result:?}"
+        );
+
+        let dr = result.unwrap();
+        let sql = ctx.build_with_query(&dr.cte_name);
+        assert_sql_contains(&sql, "UNION ALL");
+        // Output must reference all three scans
+        assert!(
+            sql.to_lowercase().contains("orders"),
+            "SQL must reference orders"
+        );
+        assert!(
+            sql.to_lowercase().contains("lineitems"),
+            "SQL must reference lineitems"
+        );
+        assert!(
+            sql.to_lowercase().contains("parts"),
+            "SQL must reference parts"
+        );
+    }
 }

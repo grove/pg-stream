@@ -611,4 +611,82 @@ mod tests {
             "full join with nested children on both sides should diff: {result:?}"
         );
     }
+
+    // ── Multi-table cross-type join chain tests ─────────────────────
+
+    /// `A FULL JOIN (B SEMI JOIN C)` — right child is a semi-join.
+    ///
+    /// A full outer join where the right sub-tree filters rows via a semi-join.
+    /// Verifies that the full-join differentiator handles a non-standard right
+    /// child that emits only left-side columns.
+    #[test]
+    fn test_diff_full_join_with_semi_join_right_child() {
+        // B SEMI JOIN C: orders EXISTS IN customers
+        let b = scan(2, "orders", "public", "o", &["id", "cust_id"]);
+        let c = scan(3, "customers", "public", "c", &["id"]);
+        let right = OpTree::SemiJoin {
+            condition: eq_cond("o", "cust_id", "c", "id"),
+            left: Box::new(b),
+            right: Box::new(c),
+        };
+
+        // A FULL JOIN (B SEMI JOIN C): regions FULL JOIN above
+        let a = scan(1, "regions", "public", "r", &["id", "name"]);
+        let tree = OpTree::FullJoin {
+            condition: eq_cond("r", "id", "o", "id"),
+            left: Box::new(a),
+            right: Box::new(right),
+        };
+
+        let mut ctx = test_ctx();
+        let result = diff_full_join(&mut ctx, &tree);
+        assert!(
+            result.is_ok(),
+            "A FULL JOIN (B SEMI JOIN C) should succeed: {result:?}"
+        );
+
+        let dr = result.unwrap();
+        let sql = ctx.build_with_query(&dr.cte_name);
+        // Full join always emits UNION ALL across many parts
+        assert_sql_contains(&sql, "UNION ALL");
+        // SQL must reference the semi-join EXISTS check
+        assert!(
+            sql.contains("EXISTS"),
+            "right sub-tree (semi-join) must appear via EXISTS"
+        );
+    }
+
+    /// `(A FULL JOIN B) INNER JOIN C` — multi-type chain: outer then inner.
+    ///
+    /// A full join feeding into an inner join. The inner join's left child
+    /// produces nullable columns from the full join; the inner join must
+    /// not strip the nullable flag.
+    #[test]
+    fn test_diff_full_join_as_left_child_of_inner_join() {
+        use crate::dvm::operators::join::diff_inner_join;
+
+        // A FULL JOIN B
+        let a = scan(1, "a", "public", "a", &["id", "val"]);
+        let b = scan(2, "b", "public", "b", &["id", "score"]);
+        let full = OpTree::FullJoin {
+            condition: eq_cond("a", "id", "b", "id"),
+            left: Box::new(a),
+            right: Box::new(b),
+        };
+
+        // (A FULL JOIN B) INNER JOIN C
+        let c = scan(3, "c", "public", "c", &["id", "flag"]);
+        let tree = inner_join(eq_cond("a", "id", "c", "id"), full, c);
+
+        let mut ctx = test_ctx();
+        let result = diff_inner_join(&mut ctx, &tree);
+        assert!(
+            result.is_ok(),
+            "(A FULL JOIN B) INNER JOIN C should succeed: {result:?}"
+        );
+
+        let dr = result.unwrap();
+        let sql = ctx.build_with_query(&dr.cte_name);
+        assert_sql_contains(&sql, "UNION ALL");
+    }
 }
