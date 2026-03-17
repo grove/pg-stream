@@ -160,6 +160,40 @@ async fn test_circular_monotone_cycle_converges() {
         "cyc_reach_b should be refreshed by scheduler"
     );
 
+    // Wait for full fixpoint convergence.
+    //
+    // `wait_for_refresh` returns as soon as `last_refresh_at IS NOT NULL`,
+    // which is satisfied after the *first* fixpoint iteration (seed pass with 3
+    // direct-edge rows).  The transitive closure requires 2+ more iterations.
+    // `last_fixpoint_iterations` is only set after all iterations converge, so
+    // polling this column is the correct signal for data-correctness assertions.
+    let fixpoint_converged = {
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(120);
+        loop {
+            if start.elapsed() > timeout {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let done: bool = db
+                .query_scalar(
+                    "SELECT EXISTS( \
+                        SELECT 1 FROM pgtrickle.pgt_stream_tables \
+                        WHERE pgt_name IN ('cyc_reach_a', 'cyc_reach_b') \
+                        AND last_fixpoint_iterations IS NOT NULL \
+                    )",
+                )
+                .await;
+            if done {
+                break true;
+            }
+        }
+    };
+    assert!(
+        fixpoint_converged,
+        "fixpoint did not converge within 120s (last_fixpoint_iterations never set)"
+    );
+
     // Both STs should be ACTIVE after convergence
     let status_a: String = db
         .query_scalar(
