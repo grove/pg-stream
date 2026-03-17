@@ -244,4 +244,199 @@ mod tests {
         let result = diff_anti_join(&mut ctx, &scan_node);
         assert!(result.is_err());
     }
+
+    /// Nested anti-join: (A ANTI JOIN (B ANTI JOIN C)).
+    /// Outer anti-join must still emit only A's columns.
+    #[test]
+    fn test_diff_anti_join_nested() {
+        let mut ctx = test_ctx();
+        let a = scan(1, "orders", "public", "o", &["order_id", "customer_id"]);
+        let b = scan(2, "blacklist", "public", "bl", &["order_id", "reason"]);
+        let c = scan(3, "exemptions", "public", "ex", &["reason", "level"]);
+
+        // Inner: B ANTI JOIN C on bl.reason = ex.reason
+        let inner = OpTree::AntiJoin {
+            condition: eq_cond("bl", "reason", "ex", "reason"),
+            left: Box::new(b),
+            right: Box::new(c),
+        };
+
+        // Outer: A ANTI JOIN (B ▷ C) on o.order_id = bl.order_id
+        let outer = OpTree::AntiJoin {
+            condition: eq_cond("o", "order_id", "bl", "order_id"),
+            left: Box::new(a),
+            right: Box::new(inner),
+        };
+
+        let result = diff_anti_join(&mut ctx, &outer).unwrap();
+
+        // Outer anti-join outputs only A's columns
+        assert_eq!(result.columns, vec!["order_id", "customer_id"]);
+
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "nested anti-join SQL must contain NOT EXISTS"
+        );
+    }
+
+    /// Multi-column condition for anti-join.
+    #[test]
+    fn test_diff_anti_join_multi_column_condition() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "shipments", "public", "s", &["order_id", "wh_id", "qty"]);
+        let right = scan(2, "holds", "public", "h", &["order_id", "wh_id", "reason"]);
+
+        let cond = binop(
+            "AND",
+            eq_cond("s", "order_id", "h", "order_id"),
+            eq_cond("s", "wh_id", "h", "wh_id"),
+        );
+
+        let tree = OpTree::AntiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_anti_join(&mut ctx, &tree).unwrap();
+
+        assert_eq!(result.columns, vec!["order_id", "wh_id", "qty"]);
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "multi-col anti-join needs NOT EXISTS"
+        );
+    }
+
+    /// Anti-join with a filter on the right child (e.g. NOT IN active returns).
+    #[test]
+    fn test_diff_anti_join_with_right_filter() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "orders", "public", "o", &["id", "value"]);
+        let base_right = scan(2, "returns", "public", "r", &["order_id", "status"]);
+        let filtered_right = filter(
+            binop("=", qcolref("r", "status"), lit("'active'")),
+            base_right,
+        );
+        let cond = eq_cond("o", "id", "r", "order_id");
+
+        let tree = OpTree::AntiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(filtered_right),
+        };
+
+        let result = diff_anti_join(&mut ctx, &tree).unwrap();
+
+        assert_eq!(result.columns, vec!["id", "value"]);
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(
+            sql.contains("NOT EXISTS"),
+            "filtered anti-join needs NOT EXISTS"
+        );
+    }
+
+    /// Anti-join output must contain only left columns — right columns must
+    /// never appear in the output SELECT list.
+    #[test]
+    fn test_diff_anti_join_output_columns_match_left_only() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "a", "public", "a", &["x", "y"]);
+        let right = scan(2, "b", "public", "b", &["x", "p", "q", "r", "s"]);
+        let cond = eq_cond("a", "x", "b", "x");
+
+        let tree = OpTree::AntiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_anti_join(&mut ctx, &tree).unwrap();
+
+        assert_eq!(result.columns, vec!["x", "y"]);
+        let sql = ctx.build_with_query(&result.cte_name);
+        // Right-only columns must not be in the main SELECT output
+        assert!(
+            !sql.contains("dl.\"p\""),
+            "right column p must not be in output"
+        );
+        assert!(
+            !sql.contains("l.\"q\""),
+            "right column q must not be in output"
+        );
+    }
+
+    /// R_old CTE must be materialized to prevent redundant re-evaluation.
+    #[test]
+    fn test_diff_anti_join_r_old_cte_materialized() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "orders", "public", "o", &["id", "cust_id"]);
+        let right = scan(2, "cancelled", "public", "c", &["order_id", "ts"]);
+        let cond = eq_cond("o", "id", "c", "order_id");
+
+        let tree = OpTree::AntiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_anti_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        assert!(
+            sql.contains("MATERIALIZED"),
+            "R_old CTE should be MATERIALIZED for performance"
+        );
+        assert!(
+            sql.contains("EXCEPT ALL"),
+            "R_old reconstruction requires EXCEPT ALL"
+        );
+    }
+
+    /// Semi-join and anti-join semantics are complementary: given the same
+    /// inputs, a semi-join emits rows WITH a match and an anti-join emits rows
+    /// WITHOUT. Verify the SQL structure reflects this (EXISTS vs NOT EXISTS).
+    #[test]
+    fn test_semi_and_anti_join_are_complementary() {
+        use crate::dvm::operators::semi_join::diff_semi_join;
+
+        let make_tree = |is_anti: bool| {
+            let left = scan(1, "orders", "public", "o", &["id", "cust"]);
+            let right = scan(2, "returns", "public", "r", &["order_id"]);
+            let cond = eq_cond("o", "id", "r", "order_id");
+            if is_anti {
+                OpTree::AntiJoin {
+                    condition: cond,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            } else {
+                OpTree::SemiJoin {
+                    condition: cond,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                }
+            }
+        };
+
+        let mut ctx_anti = test_ctx();
+        let anti_result = diff_anti_join(&mut ctx_anti, &make_tree(true)).unwrap();
+        let anti_sql = ctx_anti.build_with_query(&anti_result.cte_name);
+
+        let mut ctx_semi = test_ctx();
+        let semi_result = diff_semi_join(&mut ctx_semi, &make_tree(false)).unwrap();
+        let semi_sql = ctx_semi.build_with_query(&semi_result.cte_name);
+
+        // Both output same columns (left side only)
+        assert_eq!(anti_result.columns, semi_result.columns);
+        // Anti uses NOT EXISTS, semi uses EXISTS (without NOT)
+        assert!(anti_sql.contains("NOT EXISTS"));
+        // Semi SQL should have EXISTS but the Part 1 filter should NOT have NOT EXISTS
+        assert!(semi_sql.contains("EXISTS"));
+        assert!(
+            !semi_sql.contains("NOT EXISTS"),
+            "semi-join Part 1 must use EXISTS, not NOT EXISTS"
+        );
+    }
 }

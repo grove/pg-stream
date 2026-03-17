@@ -280,4 +280,178 @@ mod tests {
         let result = diff_semi_join(&mut ctx, &scan_node);
         assert!(result.is_err());
     }
+
+    /// Nested semi-join: (A SEMI JOIN (B SEMI JOIN C)).
+    /// The outer semi-join should still output only A's left-side columns,
+    /// and the generated SQL should build correctly without panicking.
+    #[test]
+    fn test_diff_semi_join_nested() {
+        let mut ctx = test_ctx();
+        let a = scan(1, "orders", "public", "o", &["order_id", "customer_id"]);
+        let b = scan(2, "lineitems", "public", "l", &["order_id", "part_id"]);
+        let c = scan(3, "parts", "public", "p", &["part_id", "type"]);
+
+        // Inner: B SEMI JOIN C on l.part_id = p.part_id
+        let inner = OpTree::SemiJoin {
+            condition: eq_cond("l", "part_id", "p", "part_id"),
+            left: Box::new(b),
+            right: Box::new(c),
+        };
+
+        // Outer: A SEMI JOIN (B ⋉ C) on o.order_id = l.order_id
+        let outer = OpTree::SemiJoin {
+            condition: eq_cond("o", "order_id", "l", "order_id"),
+            left: Box::new(a),
+            right: Box::new(inner),
+        };
+
+        let result = diff_semi_join(&mut ctx, &outer).unwrap();
+
+        // Outer semi-join outputs only A's columns
+        assert_eq!(result.columns, vec!["order_id", "customer_id"]);
+
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(
+            sql.contains("EXISTS"),
+            "nested semi-join SQL must contain EXISTS"
+        );
+        assert!(
+            sql.to_lowercase().contains("orders"),
+            "should reference source table orders"
+        );
+    }
+
+    /// Multi-column equi-join condition on semi-join.
+    /// The delta-key pre-filter extraction path should handle composite keys.
+    #[test]
+    fn test_diff_semi_join_multi_column_condition() {
+        let mut ctx = test_ctx();
+        let left = scan(
+            1,
+            "orders",
+            "public",
+            "o",
+            &["order_id", "region_id", "amount"],
+        );
+        let right = scan(
+            2,
+            "regions",
+            "public",
+            "r",
+            &["region_id", "country", "flag"],
+        );
+
+        // Two-column condition: o.order_id = r.region_id AND o.region_id = r.region_id
+        // (contrived but exercises multi-column code path)
+        let cond = binop(
+            "AND",
+            eq_cond("o", "order_id", "r", "region_id"),
+            eq_cond("o", "region_id", "r", "region_id"),
+        );
+
+        let tree = OpTree::SemiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_semi_join(&mut ctx, &tree).unwrap();
+
+        // Semi-join still outputs only left columns
+        assert_eq!(result.columns, vec!["order_id", "region_id", "amount"]);
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(
+            sql.contains("EXISTS"),
+            "multi-column semi-join needs EXISTS"
+        );
+    }
+
+    /// Semi-join with a filter on the left child.
+    /// Verifies that column propagation works through a Filter node.
+    #[test]
+    fn test_diff_semi_join_with_left_filter() {
+        let mut ctx = test_ctx();
+        let base = scan(1, "orders", "public", "o", &["id", "status", "amount"]);
+        let filtered_left = filter(binop("=", qcolref("o", "status"), lit("'shipped'")), base);
+        let right = scan(2, "shipments", "public", "s", &["order_id", "ship_date"]);
+        let cond = eq_cond("o", "id", "s", "order_id");
+
+        let tree = OpTree::SemiJoin {
+            condition: cond,
+            left: Box::new(filtered_left),
+            right: Box::new(right),
+        };
+
+        let result = diff_semi_join(&mut ctx, &tree).unwrap();
+
+        // Left columns pass through the filter
+        assert_eq!(result.columns, vec!["id", "status", "amount"]);
+        let sql = ctx.build_with_query(&result.cte_name);
+        assert!(sql.contains("EXISTS"), "filtered semi-join needs EXISTS");
+    }
+
+    /// Semi-join: left child has no rows matched (empty delta right).
+    /// The SQL must still be syntactically valid — the WHERE clause in Part 2
+    /// will simply match nothing at runtime.
+    #[test]
+    fn test_diff_semi_join_output_columns_match_left_only() {
+        let mut ctx = test_ctx();
+        // Right has many columns — none should appear in the output
+        let left = scan(1, "a", "public", "a", &["x", "y"]);
+        let right = scan(2, "b", "public", "b", &["x", "p", "q", "r", "s"]);
+        let cond = eq_cond("a", "x", "b", "x");
+
+        let tree = OpTree::SemiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_semi_join(&mut ctx, &tree).unwrap();
+
+        // Only left columns: x, y
+        assert_eq!(result.columns, vec!["x", "y"]);
+        // Right columns must NOT appear in the output list
+        let sql = ctx.build_with_query(&result.cte_name);
+        // The output SELECT lists must not contain right-only columns
+        // (p, q, r, s should only appear in EXISTS sub-selects, not the main SELECT)
+        assert!(
+            !sql.contains("dl.\"p\""),
+            "right column p must not be in output"
+        );
+        assert!(
+            !sql.contains("l.\"q\""),
+            "right column q must not be in output"
+        );
+    }
+
+    /// R_old CTE materialization: the generated SQL must include a materialized
+    /// CTE that represents the pre-change state of the right side.
+    #[test]
+    fn test_diff_semi_join_r_old_cte_materialized() {
+        let mut ctx = test_ctx();
+        let left = scan(1, "orders", "public", "o", &["id", "cust_id"]);
+        let right = scan(2, "customers", "public", "c", &["id", "tier"]);
+        let cond = eq_cond("o", "cust_id", "c", "id");
+
+        let tree = OpTree::SemiJoin {
+            condition: cond,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+
+        let result = diff_semi_join(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // SQL must contain MATERIALIZED to force pre-computation of R_old
+        assert!(
+            sql.contains("MATERIALIZED"),
+            "R_old CTE should be MATERIALIZED for performance"
+        );
+        // SQL must contain EXCEPT ALL (used to reconstruct R_old from snapshot)
+        assert!(
+            sql.contains("EXCEPT ALL"),
+            "R_old reconstruction requires EXCEPT ALL"
+        );
+    }
 }
