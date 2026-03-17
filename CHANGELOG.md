@@ -29,6 +29,18 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## [Unreleased]
 
 ### Added
+- **Native Backup & Restore:** `pg_trickle` now supports logical backups natively through `pg_dump` and `pg_restore`. 
+  - Restoring datasets correctly recreates all change queues, triggers, and dependency structures dynamically.
+  - Implemented `CREATE EXTENSION` event trigger hook that automatically discovers and repairs orphaned `pg_trickle` tracking definitions. 
+  - Added dedicated `BACKUP_AND_RESTORE.md` guide specifying optimal CLI sequences for zero-downtime framework recovery.
+
+### Added
+- **Native Backup & Restore:** `pg_trickle` now supports logical backups natively through `pg_dump` and `pg_restore`. 
+  - Restoring datasets correctly recreates all change queues, triggers, and dependency structures dynamically.
+  - Implemented `CREATE EXTENSION` event trigger hook that automatically discovers and repairs orphaned `pg_trickle` tracking definitions. 
+  - Added dedicated `BACKUP_AND_RESTORE.md` guide specifying optimal CLI sequences for zero-downtime framework recovery.
+
+### Added
 
 #### Full E2E Test Suite Multiset Evaluations
 
