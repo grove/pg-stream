@@ -1323,7 +1323,7 @@ that re-links orphaned catalog entries on extension restore.
 - [x] Test infrastructure hardened with exact mathematical multiset validation
 - [ ] Test harness migrated to `cargo-nextest` to fix speed and CI flake regressions
 - [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
-- [ ] pg_dump round-trip produces valid, restorable SQL for stream tables *(InProgress: `restore_stream_tables()` fully implemented)*
+- [x] pg_dump round-trip produces valid, restorable SQL for stream tables *(InProgress: Event hooks and tests pending)*
 - [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
 
 ---

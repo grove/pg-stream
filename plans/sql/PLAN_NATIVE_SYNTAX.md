@@ -745,7 +745,7 @@ for registered stream tables.
 
 **Tests:**
 - Integration: Round-trip dump → restore → verify stream tables work
-- E2E: Verify restore from pg_dump output
+- [ ] E2E: Verify restore from pg_dump output
 
 ### Phase 6: Documentation + Polish (2–3 days)
 
