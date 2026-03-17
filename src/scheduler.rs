@@ -2521,6 +2521,7 @@ fn last_refresh_row_counts(pgt_id: i64) -> (i64, i64) {
 ///
 /// This is the singleton fast path used by both non-diamond STs and
 /// diamond STs where not all members opted into atomic mode.
+#[allow(clippy::too_many_arguments)]
 fn refresh_single_st(
     pgt_id: i64,
     dag_ref: &StDag,
@@ -2602,19 +2603,17 @@ fn refresh_single_st(
         // Check periodic drift reset
         if base_action == RefreshAction::Differential {
             let max_cycles = config::pg_trickle_algebraic_drift_reset_cycles();
-            if max_cycles > 0 {
-                if let Some(counter) = &drift_counter {
-                    if **counter >= max_cycles {
-                        log!(
-                            "pg_trickle: drift reset triggered for {}.{} ({} differential cycles)",
-                            st.pgt_schema,
-                            st.pgt_name,
-                            counter
-                        );
-                        // Convert action to reinitialize. This will trigger the drift counter reset
-                        // inside execute_scheduled_refresh on success.
-                        base_action = RefreshAction::Reinitialize;
-                    }
+            if let Some(counter) = &drift_counter {
+                if max_cycles > 0 && **counter >= max_cycles {
+                    log!(
+                        "pg_trickle: drift reset triggered for {}.{} ({} differential cycles)",
+                        st.pgt_schema,
+                        st.pgt_name,
+                        counter
+                    );
+                    // Convert action to reinitialize. This will trigger the drift counter reset
+                    // inside execute_scheduled_refresh on success.
+                    base_action = RefreshAction::Reinitialize;
                 }
             }
         }
