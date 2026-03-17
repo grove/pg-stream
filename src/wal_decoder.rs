@@ -1574,6 +1574,7 @@ fn detect_schema_mismatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // ── Naming convention tests ────────────────────────────────────
 
@@ -1844,5 +1845,78 @@ mod tests {
         assert_eq!(old.get("customer_id").map(|s| s.as_str()), Some("5"));
         assert_eq!(old.get("order_id").map(|s| s.as_str()), Some("10"));
         assert_eq!(old.len(), 2);
+    }
+
+    // ── P2 property / fuzz tests ──────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_parse_pgoutput_action_no_panic(input in ".*") {
+            let result = parse_pgoutput_action(&input);
+            if let Some(c) = result {
+                prop_assert!(matches!(c, 'I' | 'U' | 'D' | 'T'));
+            }
+        }
+
+        #[test]
+        fn prop_parse_pgoutput_columns_no_panic(input in ".*") {
+            let _ = parse_pgoutput_columns(&input);
+        }
+
+        #[test]
+        fn prop_parse_pgoutput_old_columns_no_panic(input in ".*") {
+            let _ = parse_pgoutput_old_columns(&input);
+        }
+
+        #[test]
+        fn prop_build_pk_hash_empty_pk_returns_zero(
+            values in proptest::collection::hash_map(
+                "[a-z]{1,10}",
+                "[a-z0-9]{1,20}",
+                0..5usize
+            )
+        ) {
+            let pk_cols: Vec<String> = vec![];
+            let result = build_pk_hash_from_values(&pk_cols, &values);
+            prop_assert_eq!(result, "0".to_string());
+        }
+
+        #[test]
+        fn prop_build_pk_hash_no_panic(
+            pk_cols in proptest::collection::vec("[a-z]{1,10}", 0..5usize),
+            values in proptest::collection::hash_map(
+                "[a-z]{1,10}",
+                "[a-z0-9]{1,20}",
+                0..10usize
+            )
+        ) {
+            let _ = build_pk_hash_from_values(&pk_cols, &values);
+        }
+
+        #[test]
+        fn prop_detect_schema_mismatch_empty_parsed_is_false(
+            expected in proptest::collection::vec(
+                ("[a-z]{1,10}", "[a-z]{1,10}"),
+                0..5usize
+            )
+        ) {
+            let parsed = std::collections::HashMap::<String, String>::new();
+            prop_assert!(!detect_schema_mismatch(&parsed, &expected));
+        }
+
+        #[test]
+        fn prop_detect_schema_mismatch_no_panic(
+            parsed in proptest::collection::hash_map(
+                "[a-z]{1,10}",
+                "[a-z]{1,10}",
+                0..5usize
+            ),
+            expected in proptest::collection::vec(
+                ("[a-z]{1,10}", "[a-z]{1,10}"),
+                0..5usize
+            )
+        ) {
+            let _ = detect_schema_mismatch(&parsed, &expected);
+        }
     }
 }

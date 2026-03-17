@@ -28,7 +28,61 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
-No unreleased changes yet.
+### Fixed
+
+#### Internal: Char-Boundary Panic Bugs in Set-Op SQL Splitters
+
+- **`split_top_level_union_all`, `replace_top_level_union_with_union_all`, and
+  `split_top_level_set_op` panicked on multi-byte UTF-8 input.** All three
+  functions used `query[i..i+N].eq_ignore_ascii_case("KEYWORD")` to scan for
+  SQL keywords, which panics when the byte offset `i+N` falls inside a
+  multi-byte UTF-8 character (e.g. `ᐐEXCEPT`, `ࠀ𐀀`). Fixed by replacing
+  all such slices with the byte-level `bytes[i..i+N].eq_ignore_ascii_case(b"KEYWORD")`
+  equivalent. These paths are only reachable with non-ASCII SQL identifiers or
+  values; standard ASCII SQL was unaffected.
+
+### Changed
+
+#### Internal Code Quality: Comprehensive Unit Test Suite
+
+Completed a full hardening pass of the unit test suite, bringing all Priority 0/1/2/3 items to done:
+
+- **Execution-backed DVM operator tests** — 16 new test files covering every
+  operator path with real PostgreSQL execution via testcontainers: `semi_join`,
+  `anti_join`, `window`, `scalar_subquery`, `join` (inner, left, full, natural),
+  `outer_join`, `full_join`, nested 3-table chains, and aggregate families
+  (COUNT, SUM, AVG, MIN, MAX, STRING_AGG, MODE, JSON_OBJECT_AGG,
+  JSONB_OBJECT_AGG, JSONB_AGG, PERCENTILE_CONT, PERCENTILE_DISC,
+  multi-group mixed-family).
+- **macOS DVM test harness** — Added `scripts/run_dvm_integration_tests.sh`
+  and `just test-dvm`. Removed `#![cfg(not(target_os = "macos"))]` gates from
+  all 8 DVM test files so they run on macOS via the `pg_stub` preload mechanism.
+- **Property/fuzz tests (P2)** — 16 `proptest!` cases in the inline
+  `#[cfg(test)]` modules of `src/api.rs`, `src/dvm/mod.rs`, and
+  `src/wal_decoder.rs`, covering no-panic safety invariants for all private
+  SQL-scanner, set-op splitter, and WAL-decoder helpers against arbitrary
+  string inputs including multi-byte Unicode.
+- **Parser integration tests** — Backend-backed SQL-to-`OpTree` summary tests
+  via `cargo pgrx test` exercising CTE, window, scalar-subquery, and
+  recursive-CTE queries against a real PostgreSQL binary.
+- **Scheduler, refresh, CDC, and IVM seams** — Execution-backed unit seams for
+  `execute_differential_refresh`, scheduler job lifecycle, CDC trigger output,
+  and IVM keyed/keyless DML paths.
+- **DAG fix** — `topological_order()` no longer silently skips nodes trapped in
+  cycles; it now returns an error variant, detected and fixed by
+  property-based fuzz tests.
+- **Targeted P3 coverage (17 new tests)** — Completed all remaining
+  untested-file items:
+  - `src/dvm/row_id.rs`: cross-variant inequality, `Debug` for unit variants
+    (`CombineChildren`, `PassThrough`), empty-column edge cases, `Clone`
+    equality for data-carrying variants.
+  - `src/shmem.rs`: worker-token acquire/release cycle, over-release
+    saturation (counter never goes below zero), epoch monotonicity, and
+    single-budget mutex semantics.
+  - `src/config.rs`: `as_str()` round-trips for all three mode enums
+    (`UserTriggersMode`, `CdcTriggerMode`, `ParallelRefreshMode`), negative
+    megabyte threshold, case-insensitive `"ON"` parsing, and
+    normalize ↔ `as_str` consistency.
 
 ---
 

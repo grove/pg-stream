@@ -44,6 +44,40 @@ mod wal_decoder;
 #[pg_schema]
 mod pgtrickle {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitWarningKind {
+    MissingSharedPreload,
+    AutoCdcWithoutLogicalWal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InitDecision {
+    should_init_runtime: bool,
+    warning: Option<InitWarningKind>,
+}
+
+fn build_init_decision(in_shared_preload: bool, cdc_mode: &str, wal_level: i32) -> InitDecision {
+    if !in_shared_preload {
+        return InitDecision {
+            should_init_runtime: false,
+            warning: Some(InitWarningKind::MissingSharedPreload),
+        };
+    }
+
+    let warning = if cdc_mode.eq_ignore_ascii_case("auto")
+        && wal_level != pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32
+    {
+        Some(InitWarningKind::AutoCdcWithoutLogicalWal)
+    } else {
+        None
+    };
+
+    InitDecision {
+        should_init_runtime: true,
+        warning,
+    }
+}
+
 /// Extension initialization — called when the shared library is loaded.
 ///
 /// Registers GUC variables, shared memory, and background workers.
@@ -58,8 +92,17 @@ pub extern "C-unwind" fn _PG_init() {
     // SAFETY: Reading a global boolean set by PostgreSQL during startup.
     // This is safe because the value is set before any extension code runs.
     let in_shared_preload = unsafe { pg_sys::process_shared_preload_libraries_in_progress };
+    let cdc_mode = config::pg_trickle_cdc_mode();
+    let init_decision = if in_shared_preload {
+        // SAFETY: `pg_sys::wal_level` is a PostgreSQL global written from
+        // postgresql.conf before shared_preload_libraries are processed.
+        let current_wal_level = unsafe { pg_sys::wal_level };
+        build_init_decision(in_shared_preload, &cdc_mode, current_wal_level)
+    } else {
+        build_init_decision(in_shared_preload, &cdc_mode, 0)
+    };
 
-    if in_shared_preload {
+    if init_decision.should_init_runtime {
         // Register shared memory allocations
         shmem::init_shared_memory();
 
@@ -73,17 +116,13 @@ pub extern "C-unwind" fn _PG_init() {
         // which is correct but may surprise users who expect WAL-based CDC.
         // SAFETY: `pg_sys::wal_level` is a PostgreSQL global written from
         // postgresql.conf before shared_preload_libraries are processed.
-        let cdc_mode = config::pg_trickle_cdc_mode();
-        if cdc_mode.eq_ignore_ascii_case("auto") {
-            let current_wal_level = unsafe { pg_sys::wal_level };
-            if current_wal_level != pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32 {
-                warning!(
-                    "pg_trickle: cdc_mode='auto' but wal_level is not 'logical'. \
-                     WAL-based CDC will not activate until wal_level = logical is \
-                     set in postgresql.conf and PostgreSQL is restarted. \
-                     The extension will use trigger-based CDC in the meantime."
-                );
-            }
+        if init_decision.warning == Some(InitWarningKind::AutoCdcWithoutLogicalWal) {
+            warning!(
+                "pg_trickle: cdc_mode='auto' but wal_level is not 'logical'. \
+                 WAL-based CDC will not activate until wal_level = logical is \
+                 set in postgresql.conf and PostgreSQL is restarted. \
+                 The extension will use trigger-based CDC in the meantime."
+            );
         }
 
         log!("pg_trickle: initialized (shared_preload_libraries)");
@@ -94,6 +133,72 @@ pub extern "C-unwind" fn _PG_init() {
              Add 'pg_trickle' to shared_preload_libraries in \
              postgresql.conf for full functionality."
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InitDecision, InitWarningKind, build_init_decision};
+    use pgrx::pg_sys;
+
+    #[test]
+    fn test_build_init_decision_requires_shared_preload() {
+        assert_eq!(
+            build_init_decision(false, "auto", pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32),
+            InitDecision {
+                should_init_runtime: false,
+                warning: Some(InitWarningKind::MissingSharedPreload),
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_init_decision_warns_for_auto_cdc_without_logical_wal() {
+        assert_eq!(
+            build_init_decision(true, "auto", pg_sys::WalLevel::WAL_LEVEL_REPLICA as i32),
+            InitDecision {
+                should_init_runtime: true,
+                warning: Some(InitWarningKind::AutoCdcWithoutLogicalWal),
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_init_decision_accepts_logical_wal_for_auto_cdc() {
+        assert_eq!(
+            build_init_decision(true, "AUTO", pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32),
+            InitDecision {
+                should_init_runtime: true,
+                warning: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_init_decision_does_not_warn_for_explicit_cdc_modes() {
+        assert_eq!(
+            build_init_decision(true, "trigger", pg_sys::WalLevel::WAL_LEVEL_REPLICA as i32),
+            InitDecision {
+                should_init_runtime: true,
+                warning: None,
+            }
+        );
+        assert_eq!(
+            build_init_decision(true, "wal", pg_sys::WalLevel::WAL_LEVEL_REPLICA as i32),
+            InitDecision {
+                should_init_runtime: true,
+                warning: None,
+            }
+        );
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        Vec::new()
     }
 }
 

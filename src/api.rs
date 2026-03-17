@@ -5107,6 +5107,7 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_inject_pgt_count_distinct_basic() {
@@ -5925,5 +5926,60 @@ mod tests {
         let st = make_test_st(); // existing: None
         let diff = compute_config_diff(&st, Some("1m"), "DIFFERENTIAL", None, None, None, false);
         assert!(diff.is_empty());
+    }
+
+    // ── P2 property / fuzz tests ──────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_detect_select_star_no_panic(input in ".*") {
+            let _ = detect_select_star(&input);
+        }
+
+        #[test]
+        fn prop_detect_select_star_false_without_star(input in "[^*]*") {
+            prop_assert!(!detect_select_star(&input));
+        }
+
+        #[test]
+        fn prop_split_top_level_commas_no_panic(input in ".*") {
+            let _ = split_top_level_commas(&input);
+        }
+
+        #[test]
+        fn prop_split_top_level_commas_nonempty_for_nonempty_input(input in ".+") {
+            let parts = split_top_level_commas(&input);
+            // Whitespace-only inputs trim to empty and produce no columns — that is correct
+            // behaviour. Only assert non-empty output when the input contains non-whitespace.
+            if !input.trim().is_empty() {
+                prop_assert!(!parts.is_empty());
+            }
+        }
+
+        #[test]
+        fn prop_find_top_level_keyword_no_panic(
+            sql in ".*",
+            kw in "[A-Za-z]{1,15}"
+        ) {
+            let _ = find_top_level_keyword(&sql, &kw);
+        }
+
+        #[test]
+        fn prop_find_top_level_keyword_pos_in_bounds(
+            sql in ".*",
+            kw in "[A-Za-z]{1,15}"
+        ) {
+            if let Some(pos) = find_top_level_keyword(&sql, &kw) {
+                prop_assert!(pos < sql.len());
+            }
+        }
+
+        #[test]
+        fn prop_cron_is_due_no_panic(
+            cron_expr in ".*",
+            epoch in proptest::option::of(proptest::num::i64::ANY)
+        ) {
+            let _ = cron_is_due(&cron_expr, epoch);
+        }
     }
 }

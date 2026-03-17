@@ -56,6 +56,12 @@ unsafe-inventory:
 test-unit:
     ./scripts/run_unit_tests.sh pg{{pg}}
 
+# Run DVM execution-backed integration tests with pg_stub (macOS + Linux)
+# Requires Docker for testcontainers Postgres.
+[group: "test"]
+test-dvm:
+    ./scripts/run_dvm_integration_tests.sh pg{{pg}}
+
 # Run integration tests (requires Docker)
 [group: "test"]
 test-integration:

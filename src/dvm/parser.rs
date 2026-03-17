@@ -70,7 +70,7 @@ macro_rules! cast_node {
 /// Parse a SQL string into a list of `RawStmt` nodes.
 ///
 /// Must be called within a PostgreSQL backend with a valid memory context.
-#[cfg(not(test))]
+#[cfg(any(not(test), feature = "pg_test"))]
 fn parse_query(sql: &str) -> Result<pgrx::PgList<pg_sys::RawStmt>, PgTrickleError> {
     let c_sql = std::ffi::CString::new(sql)
         .map_err(|_| PgTrickleError::QueryParseError("Query contains null bytes".into()))?;
@@ -90,7 +90,7 @@ fn parse_query(sql: &str) -> Result<pgrx::PgList<pg_sys::RawStmt>, PgTrickleErro
 ///
 /// Returns `Ok(None)` if the query is empty or the first statement is not
 /// a SELECT.
-#[cfg(not(test))]
+#[cfg(any(not(test), feature = "pg_test"))]
 fn parse_first_select(sql: &str) -> Result<Option<*const pg_sys::SelectStmt>, PgTrickleError> {
     let stmts = parse_query(sql)?;
     let raw_stmt = match stmts.head() {
@@ -106,7 +106,7 @@ fn parse_first_select(sql: &str) -> Result<Option<*const pg_sys::SelectStmt>, Pg
 }
 
 /// Test stub: `parse_query` is unavailable without a PostgreSQL backend.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 fn parse_query(_sql: &str) -> Result<pgrx::PgList<pg_sys::RawStmt>, PgTrickleError> {
     Err(PgTrickleError::QueryParseError(
         "parse_query unavailable in unit tests".into(),
@@ -114,7 +114,7 @@ fn parse_query(_sql: &str) -> Result<pgrx::PgList<pg_sys::RawStmt>, PgTrickleErr
 }
 
 /// Test stub: `parse_first_select` is unavailable without a PostgreSQL backend.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 fn parse_first_select(_sql: &str) -> Result<Option<*const pg_sys::SelectStmt>, PgTrickleError> {
     Err(PgTrickleError::QueryParseError(
         "parse_first_select unavailable in unit tests".into(),
@@ -14009,6 +14009,263 @@ fn promote_predicate(tree: OpTree, pred: Expr, aliases: &[String]) -> OpTree {
         },
         // Can't promote further — shouldn't happen in well-formed trees
         other => other,
+    }
+}
+
+#[cfg(feature = "pg_test")]
+#[pg_schema]
+mod pg_tests {
+    use super::*;
+
+    fn sorted_unique_oids(mut oids: Vec<u32>) -> Vec<u32> {
+        oids.sort_unstable();
+        oids.dedup();
+        oids
+    }
+
+    fn regclass_oid(qualified_name: &str) -> u32 {
+        Spi::get_one::<i32>(&format!("SELECT '{}'::regclass::oid::int4", qualified_name))
+            .expect("failed to look up relation oid")
+            .expect("relation oid query returned NULL") as u32
+    }
+
+    fn tree_contains(tree: &OpTree, predicate: &impl Fn(&OpTree) -> bool) -> bool {
+        if predicate(tree) {
+            return true;
+        }
+
+        match tree {
+            OpTree::Scan { .. } | OpTree::CteScan { .. } | OpTree::RecursiveSelfRef { .. } => false,
+            OpTree::Project { child, .. }
+            | OpTree::Filter { child, .. }
+            | OpTree::Aggregate { child, .. }
+            | OpTree::Distinct { child }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. }
+            | OpTree::LateralFunction { child, .. }
+            | OpTree::LateralSubquery { child, .. } => tree_contains(child, predicate),
+            OpTree::InnerJoin { left, right, .. }
+            | OpTree::LeftJoin { left, right, .. }
+            | OpTree::FullJoin { left, right, .. }
+            | OpTree::Intersect { left, right, .. }
+            | OpTree::Except { left, right, .. }
+            | OpTree::SemiJoin { left, right, .. }
+            | OpTree::AntiJoin { left, right, .. } => {
+                tree_contains(left, predicate) || tree_contains(right, predicate)
+            }
+            OpTree::UnionAll { children } => {
+                children.iter().any(|child| tree_contains(child, predicate))
+            }
+            OpTree::RecursiveCte {
+                base, recursive, ..
+            } => tree_contains(base, predicate) || tree_contains(recursive, predicate),
+            OpTree::ScalarSubquery {
+                subquery, child, ..
+            } => tree_contains(subquery, predicate) || tree_contains(child, predicate),
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_defining_query_full_summarizes_cte_join_query() {
+        Spi::run(
+            "CREATE TABLE parser_orders_cte (
+                id INT PRIMARY KEY,
+                customer_id INT NOT NULL,
+                amount INT NOT NULL
+            )",
+        )
+        .expect("failed to create parser_orders_cte");
+        Spi::run(
+            "CREATE TABLE parser_customers_cte (
+                id INT PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+        )
+        .expect("failed to create parser_customers_cte");
+
+        let result = parse_defining_query_full(
+            "WITH totals AS (
+                SELECT customer_id, SUM(amount) AS total
+                FROM parser_orders_cte
+                GROUP BY customer_id
+            )
+            SELECT LOWER(c.name) AS customer_name, t.total
+            FROM parser_customers_cte c
+            JOIN totals t ON c.id = t.customer_id",
+        )
+        .expect("failed to parse CTE join query");
+
+        let customers_oid = regclass_oid("parser_customers_cte");
+        let orders_oid = regclass_oid("parser_orders_cte");
+        let source_oids = sorted_unique_oids({
+            let mut combined = result.tree.source_oids();
+            combined.extend(result.cte_registry.source_oids());
+            combined
+        });
+
+        assert!(!result.has_recursion);
+        assert_eq!(result.cte_registry.entries.len(), 1);
+        assert_eq!(result.tree.output_columns(), vec!["customer_name", "total"]);
+        assert_eq!(source_oids, vec![customers_oid, orders_oid]);
+        assert!(tree_contains(&result.tree, &|node| matches!(
+            node,
+            OpTree::CteScan { .. }
+        )));
+        assert_eq!(result.functions_used(), vec!["lower"]);
+        assert_eq!(
+            result
+                .source_columns_used()
+                .get(&customers_oid)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["id".to_string(), "name".to_string()]
+        );
+        assert_eq!(
+            result
+                .source_columns_used()
+                .get(&orders_oid)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["amount".to_string(), "customer_id".to_string()]
+        );
+        assert!(check_ivm_support_with_registry(&result).is_ok());
+        assert!(query_has_cte(
+            "WITH totals AS (SELECT customer_id, SUM(amount) AS total FROM parser_orders_cte GROUP BY customer_id) SELECT LOWER(c.name) AS customer_name, t.total FROM parser_customers_cte c JOIN totals t ON c.id = t.customer_id"
+        )
+        .expect("failed to detect WITH clause"));
+    }
+
+    #[pg_test]
+    fn test_parse_defining_query_full_summarizes_window_query() {
+        Spi::run(
+            "CREATE TABLE parser_sales_window (
+                id INT PRIMARY KEY,
+                region TEXT NOT NULL,
+                amount INT NOT NULL
+            )",
+        )
+        .expect("failed to create parser_sales_window");
+
+        let result = parse_defining_query_full(
+            "SELECT id, region,
+                    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn
+             FROM parser_sales_window",
+        )
+        .expect("failed to parse window query");
+
+        let sales_oid = regclass_oid("parser_sales_window");
+
+        assert!(!result.has_recursion);
+        assert!(result.cte_registry.entries.is_empty());
+        assert_eq!(result.tree.output_columns(), vec!["id", "region", "rn"]);
+        assert_eq!(
+            sorted_unique_oids(result.tree.source_oids()),
+            vec![sales_oid]
+        );
+        assert!(tree_contains(&result.tree, &|node| matches!(
+            node,
+            OpTree::Window { .. }
+        )));
+        assert_eq!(
+            result
+                .source_columns_used()
+                .get(&sales_oid)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["amount".to_string(), "id".to_string(), "region".to_string()]
+        );
+        assert!(check_ivm_support_with_registry(&result).is_ok());
+        assert!(
+            !query_has_cte(
+                "SELECT id, region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn FROM parser_sales_window"
+            )
+            .expect("failed to detect CTE absence")
+        );
+    }
+
+    #[pg_test]
+    fn test_parse_defining_query_full_summarizes_scalar_subquery() {
+        Spi::run(
+            "CREATE TABLE parser_orders_scalar (
+                id INT PRIMARY KEY,
+                amount INT NOT NULL
+            )",
+        )
+        .expect("failed to create parser_orders_scalar");
+        Spi::run(
+            "CREATE TABLE parser_config_scalar (
+                id INT PRIMARY KEY,
+                tax_rate INT NOT NULL
+            )",
+        )
+        .expect("failed to create parser_config_scalar");
+
+        let result = parse_defining_query_full(
+            "SELECT o.id,
+                    (SELECT c.tax_rate FROM parser_config_scalar c WHERE c.id = 1) AS current_tax
+             FROM parser_orders_scalar o",
+        )
+        .expect("failed to parse scalar subquery");
+
+        let orders_oid = regclass_oid("parser_orders_scalar");
+        let config_oid = regclass_oid("parser_config_scalar");
+
+        assert!(!result.has_recursion);
+        assert!(result.cte_registry.entries.is_empty());
+        assert_eq!(result.tree.output_columns(), vec!["id", "current_tax"]);
+        assert_eq!(
+            sorted_unique_oids(result.tree.source_oids()),
+            vec![config_oid, orders_oid]
+        );
+        assert!(tree_contains(&result.tree, &|node| matches!(
+            node,
+            OpTree::ScalarSubquery { .. }
+        )));
+        assert_eq!(
+            result
+                .source_columns_used()
+                .get(&orders_oid)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["id".to_string()]
+        );
+        assert_eq!(
+            result
+                .source_columns_used()
+                .get(&config_oid)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["id".to_string(), "tax_rate".to_string()]
+        );
+        assert!(check_ivm_support_with_registry(&result).is_ok());
+    }
+
+    #[pg_test]
+    fn test_parse_defining_query_full_detects_recursive_ctes() {
+        Spi::run(
+            "CREATE TABLE parser_nodes_recursive (
+                id INT PRIMARY KEY,
+                parent_id INT
+            )",
+        )
+        .expect("failed to create parser_nodes_recursive");
+
+        let query = "WITH RECURSIVE tree AS (
+                SELECT id, parent_id
+                FROM parser_nodes_recursive
+                WHERE parent_id IS NULL
+                UNION ALL
+                SELECT n.id, n.parent_id
+                FROM parser_nodes_recursive n
+                JOIN tree t ON n.parent_id = t.id
+            )
+            SELECT id, parent_id FROM tree";
+
+        let result = parse_defining_query_full(query).expect("failed to parse recursive CTE");
+
+        assert!(result.has_recursion);
+        assert!(query_has_cte(query).expect("failed to detect recursive WITH"));
+        assert!(query_has_recursive_cte(query).expect("failed to detect recursive WITH"));
     }
 }
 

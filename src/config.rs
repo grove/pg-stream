@@ -102,6 +102,17 @@ impl UserTriggersMode {
     }
 }
 
+fn normalize_user_triggers_mode(value: Option<String>) -> UserTriggersMode {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("off") => UserTriggersMode::Off,
+        _ => UserTriggersMode::Auto,
+    }
+}
+
+fn threshold_mb_to_bytes(megabytes: i32) -> i64 {
+    megabytes as i64 * 1024 * 1024
+}
+
 /// CDC mechanism selection.
 ///
 /// - `"auto"` (default): Use triggers for creation, transition to WAL if
@@ -234,6 +245,17 @@ impl CdcTriggerMode {
             CdcTriggerMode::Row => "row",
         }
     }
+}
+
+fn normalize_cdc_trigger_mode(value: Option<String>) -> CdcTriggerMode {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("row") => CdcTriggerMode::Row,
+        _ => CdcTriggerMode::Statement,
+    }
+}
+
+fn normalize_recursive_max_depth(value: i32) -> Option<i32> {
+    if value > 0 { Some(value) } else { None }
 }
 
 /// CSS1: Cap CDC consumption to the WAL LSN captured at scheduler tick start.
@@ -685,14 +707,11 @@ pub fn pg_trickle_use_prepared_statements() -> bool {
 /// `on` is preserved as a deprecated input alias for backward compatibility
 /// but is normalized to `auto` at runtime.
 pub fn pg_trickle_user_triggers_mode() -> UserTriggersMode {
-    match PGS_USER_TRIGGERS
-        .get()
-        .and_then(|cs| cs.to_str().ok().map(str::to_ascii_lowercase))
-        .as_deref()
-    {
-        Some("off") => UserTriggersMode::Off,
-        _ => UserTriggersMode::Auto,
-    }
+    normalize_user_triggers_mode(
+        PGS_USER_TRIGGERS
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
 }
 
 /// Returns the canonical user-trigger handling mode as a string.
@@ -715,12 +734,12 @@ pub fn pg_trickle_wal_transition_timeout() -> i32 {
 
 /// Returns the WAL slot lag warning threshold in bytes.
 pub fn pg_trickle_slot_lag_warning_threshold_bytes() -> i64 {
-    PGS_SLOT_LAG_WARNING_THRESHOLD_MB.get() as i64 * 1024 * 1024
+    threshold_mb_to_bytes(PGS_SLOT_LAG_WARNING_THRESHOLD_MB.get())
 }
 
 /// Returns the WAL slot lag critical threshold in bytes.
 pub fn pg_trickle_slot_lag_critical_threshold_bytes() -> i64 {
-    PGS_SLOT_LAG_CRITICAL_THRESHOLD_MB.get() as i64 * 1024 * 1024
+    threshold_mb_to_bytes(PGS_SLOT_LAG_CRITICAL_THRESHOLD_MB.get())
 }
 
 /// Returns whether source DDL blocking is enabled.
@@ -753,21 +772,17 @@ pub fn pg_trickle_tick_watermark_enabled() -> bool {
 
 /// Returns the CDC trigger granularity mode.
 pub fn pg_trickle_cdc_trigger_mode() -> CdcTriggerMode {
-    match PGS_CDC_TRIGGER_MODE
-        .get()
-        .and_then(|cs| cs.to_str().ok().map(str::to_ascii_lowercase))
-        .as_deref()
-    {
-        Some("row") => CdcTriggerMode::Row,
-        _ => CdcTriggerMode::Statement,
-    }
+    normalize_cdc_trigger_mode(
+        PGS_CDC_TRIGGER_MODE
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
 }
 
 /// Returns the maximum recursion depth for WITH RECURSIVE in IMMEDIATE mode.
 /// Returns `None` when the guard is disabled (value = 0).
 pub fn pg_trickle_ivm_recursive_max_depth() -> Option<i32> {
-    let v = PGS_IVM_RECURSIVE_MAX_DEPTH.get();
-    if v > 0 { Some(v) } else { None }
+    normalize_recursive_max_depth(PGS_IVM_RECURSIVE_MAX_DEPTH.get())
 }
 
 /// Parallel refresh operating mode.
@@ -797,17 +812,21 @@ impl std::fmt::Display for ParallelRefreshMode {
     }
 }
 
-/// Returns the current parallel refresh mode.
-pub fn pg_trickle_parallel_refresh_mode() -> ParallelRefreshMode {
-    match PGS_PARALLEL_REFRESH_MODE
-        .get()
-        .and_then(|cs| cs.to_str().ok().map(str::to_ascii_lowercase))
-        .as_deref()
-    {
+fn normalize_parallel_refresh_mode(value: Option<String>) -> ParallelRefreshMode {
+    match value.as_deref().map(str::to_ascii_lowercase).as_deref() {
         Some("dry_run") => ParallelRefreshMode::DryRun,
         Some("on") => ParallelRefreshMode::On,
         _ => ParallelRefreshMode::Off,
     }
+}
+
+/// Returns the current parallel refresh mode.
+pub fn pg_trickle_parallel_refresh_mode() -> ParallelRefreshMode {
+    normalize_parallel_refresh_mode(
+        PGS_PARALLEL_REFRESH_MODE
+            .get()
+            .and_then(|cs| cs.to_str().ok().map(str::to_owned)),
+    )
 }
 
 /// Returns the cluster-wide cap on dynamic refresh workers.
@@ -823,4 +842,187 @@ pub fn pg_trickle_max_fixpoint_iterations() -> i32 {
 /// Returns whether circular (cyclic) dependencies are allowed (CYC-4).
 pub fn pg_trickle_allow_circular() -> bool {
     PGS_ALLOW_CIRCULAR.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CdcTriggerMode, ParallelRefreshMode, UserTriggersMode, normalize_cdc_trigger_mode,
+        normalize_parallel_refresh_mode, normalize_recursive_max_depth,
+        normalize_user_triggers_mode, threshold_mb_to_bytes,
+    };
+
+    #[test]
+    fn test_normalize_user_triggers_mode_defaults_to_auto() {
+        assert_eq!(normalize_user_triggers_mode(None), UserTriggersMode::Auto);
+        assert_eq!(
+            normalize_user_triggers_mode(Some("auto".to_string())),
+            UserTriggersMode::Auto
+        );
+        assert_eq!(
+            normalize_user_triggers_mode(Some("on".to_string())),
+            UserTriggersMode::Auto
+        );
+        assert_eq!(
+            normalize_user_triggers_mode(Some("unexpected".to_string())),
+            UserTriggersMode::Auto
+        );
+    }
+
+    #[test]
+    fn test_normalize_user_triggers_mode_accepts_off_case_insensitively() {
+        assert_eq!(
+            normalize_user_triggers_mode(Some("off".to_string())),
+            UserTriggersMode::Off
+        );
+        assert_eq!(
+            normalize_user_triggers_mode(Some("OFF".to_string())),
+            UserTriggersMode::Off
+        );
+    }
+
+    #[test]
+    fn test_threshold_mb_to_bytes_converts_megabytes() {
+        assert_eq!(threshold_mb_to_bytes(0), 0);
+        assert_eq!(threshold_mb_to_bytes(100), 104_857_600);
+        assert_eq!(threshold_mb_to_bytes(1024), 1_073_741_824);
+    }
+
+    #[test]
+    fn test_normalize_cdc_trigger_mode_defaults_to_statement() {
+        assert_eq!(normalize_cdc_trigger_mode(None), CdcTriggerMode::Statement);
+        assert_eq!(
+            normalize_cdc_trigger_mode(Some("statement".to_string())),
+            CdcTriggerMode::Statement
+        );
+        assert_eq!(
+            normalize_cdc_trigger_mode(Some("unexpected".to_string())),
+            CdcTriggerMode::Statement
+        );
+    }
+
+    #[test]
+    fn test_normalize_cdc_trigger_mode_accepts_row_case_insensitively() {
+        assert_eq!(
+            normalize_cdc_trigger_mode(Some("row".to_string())),
+            CdcTriggerMode::Row
+        );
+        assert_eq!(
+            normalize_cdc_trigger_mode(Some("ROW".to_string())),
+            CdcTriggerMode::Row
+        );
+    }
+
+    #[test]
+    fn test_normalize_recursive_max_depth_zero_disables_guard() {
+        assert_eq!(normalize_recursive_max_depth(0), None);
+        assert_eq!(normalize_recursive_max_depth(-5), None);
+        assert_eq!(normalize_recursive_max_depth(100), Some(100));
+    }
+
+    #[test]
+    fn test_parallel_refresh_mode_display_matches_as_str() {
+        assert_eq!(ParallelRefreshMode::Off.as_str(), "off");
+        assert_eq!(ParallelRefreshMode::DryRun.as_str(), "dry_run");
+        assert_eq!(ParallelRefreshMode::On.as_str(), "on");
+        assert_eq!(ParallelRefreshMode::DryRun.to_string(), "dry_run");
+    }
+
+    #[test]
+    fn test_normalize_parallel_refresh_mode_defaults_to_off() {
+        assert_eq!(
+            normalize_parallel_refresh_mode(None),
+            ParallelRefreshMode::Off
+        );
+        assert_eq!(
+            normalize_parallel_refresh_mode(Some("unexpected".to_string())),
+            ParallelRefreshMode::Off
+        );
+    }
+
+    #[test]
+    fn test_normalize_parallel_refresh_mode_accepts_supported_values() {
+        assert_eq!(
+            normalize_parallel_refresh_mode(Some("dry_run".to_string())),
+            ParallelRefreshMode::DryRun
+        );
+        assert_eq!(
+            normalize_parallel_refresh_mode(Some("DRY_RUN".to_string())),
+            ParallelRefreshMode::DryRun
+        );
+        assert_eq!(
+            normalize_parallel_refresh_mode(Some("on".to_string())),
+            ParallelRefreshMode::On
+        );
+    }
+
+    // ── P3: as_str coverage for all enum variants; threshold edge cases ─────
+
+    #[test]
+    fn test_user_triggers_mode_as_str() {
+        assert_eq!(UserTriggersMode::Auto.as_str(), "auto");
+        assert_eq!(UserTriggersMode::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn test_cdc_trigger_mode_as_str() {
+        assert_eq!(CdcTriggerMode::Statement.as_str(), "statement");
+        assert_eq!(CdcTriggerMode::Row.as_str(), "row");
+    }
+
+    #[test]
+    fn test_parallel_refresh_mode_as_str_all_variants() {
+        assert_eq!(ParallelRefreshMode::Off.as_str(), "off");
+        assert_eq!(ParallelRefreshMode::DryRun.as_str(), "dry_run");
+        assert_eq!(ParallelRefreshMode::On.as_str(), "on");
+    }
+
+    #[test]
+    fn test_threshold_mb_to_bytes_negative_input_is_zero_or_negative() {
+        // Negative megabytes should yield a non-positive byte count
+        assert!(threshold_mb_to_bytes(-1) <= 0);
+        assert!(threshold_mb_to_bytes(-100) < 0);
+    }
+
+    #[test]
+    fn test_normalize_parallel_refresh_mode_case_insensitive_on() {
+        assert_eq!(
+            normalize_parallel_refresh_mode(Some("ON".to_string())),
+            ParallelRefreshMode::On
+        );
+    }
+
+    #[test]
+    fn test_normalize_user_triggers_mode_roundtrip_via_as_str() {
+        for (input, expected) in [
+            ("off", UserTriggersMode::Off),
+            ("OFF", UserTriggersMode::Off),
+        ] {
+            assert_eq!(
+                normalize_user_triggers_mode(Some(input.to_string())),
+                expected
+            );
+        }
+        // as_str / normalize should be consistent
+        assert_eq!(
+            normalize_user_triggers_mode(Some(UserTriggersMode::Off.as_str().to_string())),
+            UserTriggersMode::Off
+        );
+        assert_eq!(
+            normalize_user_triggers_mode(Some(UserTriggersMode::Auto.as_str().to_string())),
+            UserTriggersMode::Auto
+        );
+    }
+
+    #[test]
+    fn test_normalize_cdc_trigger_mode_roundtrip_via_as_str() {
+        assert_eq!(
+            normalize_cdc_trigger_mode(Some(CdcTriggerMode::Row.as_str().to_string())),
+            CdcTriggerMode::Row
+        );
+        assert_eq!(
+            normalize_cdc_trigger_mode(Some(CdcTriggerMode::Statement.as_str().to_string())),
+            CdcTriggerMode::Statement
+        );
+    }
 }

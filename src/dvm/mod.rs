@@ -568,8 +568,8 @@ fn split_top_level_union_all(query: &str) -> Option<Vec<String>> {
             b')' => depth -= 1,
             _ if depth == 0 => {
                 // Look for keyword UNION at a word boundary.
-                if query[i..].len() >= 5
-                    && query[i..i + 5].eq_ignore_ascii_case("UNION")
+                if i + 5 <= len
+                    && bytes[i..i + 5].eq_ignore_ascii_case(b"UNION")
                     && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
                 {
                     // Skip whitespace after "UNION"
@@ -579,7 +579,7 @@ fn split_top_level_union_all(query: &str) -> Option<Vec<String>> {
                     }
                     // Check for "ALL" keyword
                     if j + 3 <= len
-                        && query[j..j + 3].eq_ignore_ascii_case("ALL")
+                        && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
                         && (j + 3 >= len
                             || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'))
                     {
@@ -650,7 +650,7 @@ fn replace_top_level_union_with_union_all(query: &str) -> Option<String> {
             _ if depth == 0 => {
                 // Look for UNION keyword at word boundary
                 if i + 5 <= len
-                    && query[i..i + 5].eq_ignore_ascii_case("UNION")
+                    && bytes[i..i + 5].eq_ignore_ascii_case(b"UNION")
                     && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
                     && (i + 5 >= len
                         || !(bytes[i + 5].is_ascii_alphanumeric() || bytes[i + 5] == b'_'))
@@ -662,7 +662,7 @@ fn replace_top_level_union_with_union_all(query: &str) -> Option<String> {
                     }
                     // Check if NOT followed by ALL
                     let has_all = j + 3 <= len
-                        && query[j..j + 3].eq_ignore_ascii_case("ALL")
+                        && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
                         && (j + 3 >= len
                             || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'));
                     if !has_all {
@@ -805,7 +805,7 @@ fn split_top_level_set_op(query: &str) -> Option<SetOpParts> {
                 // Try INTERSECT (9 chars)
                 if is_word_start
                     && i + 9 <= len
-                    && query[i..i + 9].eq_ignore_ascii_case("INTERSECT")
+                    && bytes[i..i + 9].eq_ignore_ascii_case(b"INTERSECT")
                     && (i + 9 >= len
                         || !(bytes[i + 9].is_ascii_alphanumeric() || bytes[i + 9] == b'_'))
                 {
@@ -815,7 +815,7 @@ fn split_top_level_set_op(query: &str) -> Option<SetOpParts> {
                         j += 1;
                     }
                     let (kind, right_start) = if j + 3 <= len
-                        && query[j..j + 3].eq_ignore_ascii_case("ALL")
+                        && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
                         && (j + 3 >= len
                             || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'))
                     {
@@ -830,7 +830,7 @@ fn split_top_level_set_op(query: &str) -> Option<SetOpParts> {
                 // Try EXCEPT (6 chars)
                 if is_word_start
                     && i + 6 <= len
-                    && query[i..i + 6].eq_ignore_ascii_case("EXCEPT")
+                    && bytes[i..i + 6].eq_ignore_ascii_case(b"EXCEPT")
                     && (i + 6 >= len
                         || !(bytes[i + 6].is_ascii_alphanumeric() || bytes[i + 6] == b'_'))
                 {
@@ -840,7 +840,7 @@ fn split_top_level_set_op(query: &str) -> Option<SetOpParts> {
                         j += 1;
                     }
                     let (kind, right_start) = if j + 3 <= len
-                        && query[j..j + 3].eq_ignore_ascii_case("ALL")
+                        && bytes[j..j + 3].eq_ignore_ascii_case(b"ALL")
                         && (j + 3 >= len
                             || !(bytes[j + 3].is_ascii_alphanumeric() || bytes[j + 3] == b'_'))
                     {
@@ -974,6 +974,7 @@ pub fn get_defining_query_columns(defining_query: &str) -> Result<Vec<String>, P
 mod tests {
     use super::*;
     use crate::dvm::operators::test_helpers::*;
+    use proptest::prelude::*;
 
     // ── split_top_level_union_all (existing) ────────────────────────
 
@@ -1353,5 +1354,19 @@ mod tests {
     fn test_not_scalar_aggregate_scan() {
         let s = scan(1, "t", "public", "t", &["id"]);
         assert!(!is_scalar_aggregate_root(&s));
+    }
+
+    // ── P2 property / fuzz tests ──────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_split_top_level_union_all_no_panic(input in ".*") {
+            let _ = split_top_level_union_all(&input);
+        }
+
+        #[test]
+        fn prop_split_top_level_set_op_no_panic(input in ".*") {
+            let _ = split_top_level_set_op(&input);
+        }
     }
 }

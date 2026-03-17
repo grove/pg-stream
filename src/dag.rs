@@ -495,6 +495,7 @@ impl StDag {
     /// Only returns `NodeId::StreamTable` entries; base tables are excluded
     /// from the output since they don't need refreshing.
     pub fn topological_order(&self) -> Result<Vec<NodeId>, PgTrickleError> {
+        self.detect_cycles()?;
         let all = self.topological_sort_inner()?;
         Ok(all
             .into_iter()

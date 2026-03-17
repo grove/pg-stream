@@ -142,6 +142,49 @@ fn is_shmem_available() -> bool {
 
 // ── Worker token management (Phase 2: parallel refresh) ───────────────────
 
+fn try_increment_bounded_counter(atomic: &AtomicU32, max_value: u32) -> bool {
+    loop {
+        let current = atomic.load(std::sync::atomic::Ordering::Acquire);
+        if current >= max_value {
+            return false;
+        }
+
+        match atomic.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(_) => continue,
+        }
+    }
+}
+
+fn saturating_decrement_counter(atomic: &AtomicU32) {
+    loop {
+        let current = atomic.load(std::sync::atomic::Ordering::Acquire);
+        let next = current.saturating_sub(1);
+        if next == current {
+            return;
+        }
+
+        match atomic.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(_) => continue,
+        }
+    }
+}
+
+fn increment_epoch(atomic: &AtomicU64) {
+    atomic.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Try to acquire a cluster-wide refresh worker token.
 ///
 /// Returns `true` if a token was acquired (active count incremented),
@@ -153,23 +196,8 @@ pub fn try_acquire_worker_token(max_workers: u32) -> bool {
     if !is_shmem_available() {
         return false;
     }
-    // CAS loop: increment only if below the cap.
-    let atomic = ACTIVE_REFRESH_WORKERS.get();
-    loop {
-        let current = atomic.load(std::sync::atomic::Ordering::Acquire);
-        if current >= max_workers {
-            return false;
-        }
-        match atomic.compare_exchange_weak(
-            current,
-            current + 1,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(_) => continue, // spurious failure — retry
-        }
-    }
+
+    try_increment_bounded_counter(ACTIVE_REFRESH_WORKERS.get(), max_workers)
 }
 
 /// Release a cluster-wide refresh worker token (decrement active count).
@@ -179,23 +207,8 @@ pub fn release_worker_token() {
     if !is_shmem_available() {
         return;
     }
-    // Saturating decrement — never go below 0.
-    let atomic = ACTIVE_REFRESH_WORKERS.get();
-    loop {
-        let current = atomic.load(std::sync::atomic::Ordering::Acquire);
-        if current == 0 {
-            return;
-        }
-        match atomic.compare_exchange_weak(
-            current,
-            current - 1,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Relaxed,
-        ) {
-            Ok(_) => return,
-            Err(_) => continue,
-        }
-    }
+
+    saturating_decrement_counter(ACTIVE_REFRESH_WORKERS.get());
 }
 
 /// Read the current number of active dynamic refresh workers.
@@ -225,9 +238,8 @@ pub fn bump_reconcile_epoch() {
     if !is_shmem_available() {
         return;
     }
-    RECONCILE_EPOCH
-        .get()
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    increment_epoch(RECONCILE_EPOCH.get());
 }
 
 /// Read the current reconcile epoch.
@@ -242,3 +254,122 @@ pub fn current_reconcile_epoch() -> u64 {
 
 /// Flag indicating whether shared memory was initialized via _PG_init.
 static SHMEM_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod tests {
+    use super::{increment_epoch, saturating_decrement_counter, try_increment_bounded_counter};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    #[test]
+    fn test_try_increment_bounded_counter_increments_until_cap() {
+        let counter = AtomicU32::new(0);
+
+        assert!(try_increment_bounded_counter(&counter, 2));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        assert!(try_increment_bounded_counter(&counter, 2));
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+        assert!(!try_increment_bounded_counter(&counter, 2));
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn test_try_increment_bounded_counter_rejects_zero_budget() {
+        let counter = AtomicU32::new(0);
+
+        assert!(!try_increment_bounded_counter(&counter, 0));
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_saturating_decrement_counter_stops_at_zero() {
+        let counter = AtomicU32::new(2);
+
+        saturating_decrement_counter(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        saturating_decrement_counter(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        saturating_decrement_counter(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_increment_epoch_advances_counter() {
+        let epoch = AtomicU64::new(41);
+
+        increment_epoch(&epoch);
+        increment_epoch(&epoch);
+
+        assert_eq!(epoch.load(Ordering::Relaxed), 43);
+    }
+
+    // ── P3: acquire/release token cycle and invariants ─────────────────────
+
+    #[test]
+    fn test_token_acquire_and_release_cycle() {
+        let counter = AtomicU32::new(0);
+
+        // Acquire two tokens up to budget of 3
+        assert!(try_increment_bounded_counter(&counter, 3));
+        assert!(try_increment_bounded_counter(&counter, 3));
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+        // Release one
+        saturating_decrement_counter(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Can acquire again
+        assert!(try_increment_bounded_counter(&counter, 3));
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+        // Release both
+        saturating_decrement_counter(&counter);
+        saturating_decrement_counter(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_counter_does_not_go_below_zero_on_over_release() {
+        let counter = AtomicU32::new(1);
+
+        // Release once (valid)
+        saturating_decrement_counter(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        // Extra releases are no-ops
+        saturating_decrement_counter(&counter);
+        saturating_decrement_counter(&counter);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_epoch_monotonically_increases() {
+        let epoch = AtomicU64::new(0);
+        let mut last = epoch.load(Ordering::Relaxed);
+
+        for _ in 0..10 {
+            increment_epoch(&epoch);
+            let current = epoch.load(Ordering::Relaxed);
+            assert!(current > last);
+            last = current;
+        }
+    }
+
+    #[test]
+    fn test_bounded_counter_budget_one_acts_as_mutex() {
+        let counter = AtomicU32::new(0);
+
+        // Acquire the single token
+        assert!(try_increment_bounded_counter(&counter, 1));
+        // Second acquire must be rejected
+        assert!(!try_increment_bounded_counter(&counter, 1));
+
+        // Release
+        saturating_decrement_counter(&counter);
+        // Now acquirable again
+        assert!(try_increment_bounded_counter(&counter, 1));
+    }
+}
