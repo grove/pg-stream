@@ -208,4 +208,37 @@ impl TestDb {
         self.query_scalar::<i64>(&format!("SELECT count(*) FROM {}", table))
             .await
     }
+
+    /// Assert that two tables/subqueries contain exactly the same multiset of rows.
+    ///
+    /// Uses the symmetric set-difference pattern:
+    /// ```sql
+    /// SELECT NOT EXISTS (
+    ///   (SELECT cols FROM a EXCEPT ALL SELECT cols FROM b)
+    ///   UNION ALL
+    ///   (SELECT cols FROM b EXCEPT ALL SELECT cols FROM a)
+    /// )
+    /// ```
+    /// This catches: missing rows, extra rows, duplicate discrepancies, and column
+    /// value mutations. Both `table_a` and `table_b` can be table names or
+    /// parenthesized subqueries.
+    pub async fn assert_sets_equal(&self, table_a: &str, table_b: &str, cols: &[&str]) {
+        let col_list = cols.join(", ");
+        let sql = format!(
+            "SELECT NOT EXISTS (
+                (SELECT {col_list} FROM {a} EXCEPT ALL SELECT {col_list} FROM {b})
+                UNION ALL
+                (SELECT {col_list} FROM {b} EXCEPT ALL SELECT {col_list} FROM {a})
+            )",
+            col_list = col_list,
+            a = table_a,
+            b = table_b
+        );
+        let matches: bool = self.query_scalar(&sql).await;
+        assert!(
+            matches,
+            "Set mismatch between {} and {} (columns: {})",
+            table_a, table_b, col_list
+        );
+    }
 }

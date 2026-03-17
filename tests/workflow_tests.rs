@@ -64,6 +64,15 @@ async fn test_full_refresh_workflow() {
     let count = db.count("public.enriched_orders").await;
     assert_eq!(count, 3, "All orders have amount > 50");
 
+    // Strong row-level data validation: storage table must exactly match
+    // the defining query result (multiset comparison via EXCEPT ALL).
+    db.assert_sets_equal(
+        "public.enriched_orders",
+        "(SELECT id, customer, amount FROM orders WHERE amount > 50)",
+        &["id", "customer", "amount"],
+    )
+    .await;
+
     // Update catalog: mark as populated
     db.execute(
         "UPDATE pgtrickle.pgt_stream_tables \
