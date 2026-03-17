@@ -1,7 +1,7 @@
 # Plan: Cross-Source Snapshot Consistency
 
 Date: 2026-03-02
-Status: Phase 1 DONE — Phase 2 PENDING
+Status: Phase 1 DONE — Phase 2 IN PROGRESS
 Last Updated: 2026-07-07
 
 ---
@@ -426,6 +426,13 @@ the per-group `isolation` parameter is the sole control surface.
 ---
 
 ### Phase 2: User-Declared Groups + REPEATABLE READ (Approaches B + A)
+
+**STATUS: IN PROGRESS**
+- ✅ **Step 2.1 (Catalog & API):** Scaffolding and table creation finished.
+- ⬜ **Step 2.2 (DAG Integration):** Loading declared groups from catalog and merging during rebuild is pending.
+- ⬜ **Step 2.3 (Scheduler Execution):** Processing `REPEATABLE READ` transactions inside worker logic is pending.
+- ⬜ **Step 2.4 (Tests):** Scenarios for repeating snapshots and DAG resolution are pending.
+
 
 **Files:** `api.rs`, `catalog.rs`, `dag.rs`, `scheduler.rs`
 
