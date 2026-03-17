@@ -769,3 +769,22 @@ mod tests {
         assert!(ctx.cte_registry.get(0).is_none());
     }
 }
+
+/// Public test helpers for property tests and integration tests.
+///
+/// These expose internal aggregate merge/delta functions so external
+/// tests can verify invariants without needing a PostgreSQL backend.
+pub mod test_helpers {
+    use crate::dvm::operators::aggregate::{agg_delta_exprs, agg_merge_expr};
+    use crate::dvm::parser::AggExpr;
+
+    /// Wrapper around `agg_merge_expr` for external property tests.
+    pub fn agg_merge_expr_for_test(agg: &AggExpr, has_rescan: bool) -> String {
+        agg_merge_expr(agg, has_rescan)
+    }
+
+    /// Wrapper around `agg_delta_exprs` for external property tests.
+    pub fn agg_delta_exprs_for_test(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
+        agg_delta_exprs(agg, child_cols)
+    }
+}

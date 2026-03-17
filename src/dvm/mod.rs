@@ -384,6 +384,16 @@ pub fn query_needs_pgt_count(defining_query: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract AVG auxiliary column definitions from a defining query.
+///
+/// Returns `(sum_col_name, count_col_name, arg_sql)` tuples for each
+/// non-DISTINCT AVG aggregate, or an empty vec if none.
+pub fn query_avg_aux_columns(defining_query: &str) -> Vec<(String, String, String)> {
+    parse_defining_query(defining_query)
+        .map(|tree| tree.avg_aux_columns())
+        .unwrap_or_default()
+}
+
 /// Check whether a defining query is an INTERSECT or EXCEPT that needs
 /// dual-count columns (`__pgt_count_l`, `__pgt_count_r`).
 pub fn query_needs_dual_count(defining_query: &str) -> bool {

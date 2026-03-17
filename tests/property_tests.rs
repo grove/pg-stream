@@ -633,3 +633,204 @@ proptest! {
         }
     }
 }
+
+// ── MIN/MAX boundary property tests (B1-5) ─────────────────────────────
+
+// These verify the critical invariant: deleting the exact current min/max
+// triggers rescan, while deleting a non-extremum uses the algebraic path.
+// This is a hard prerequisite for incremental aggregate maintenance (v0.9.0).
+
+use pg_trickle::dvm::parser::AggExpr;
+
+/// Strategy: generate a simple aggregate argument column name
+fn arb_col_name() -> impl Strategy<Value = String> {
+    "[a-z][a-z0-9_]{0,10}".prop_map(|s| s.to_string())
+}
+
+/// Strategy: generate an AggFunc that is either Min or Max
+fn arb_min_max() -> impl Strategy<Value = AggFunc> {
+    prop_oneof![Just(AggFunc::Min), Just(AggFunc::Max)]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Property: MIN merge expression uses LEAST, MAX uses GREATEST.
+    ///
+    /// The merge function for the algebraic (non-rescan) path must use
+    /// LEAST for MIN and GREATEST for MAX to combine the stored value
+    /// with newly inserted values.
+    #[test]
+    fn prop_min_max_merge_uses_correct_function(
+        func in arb_min_max(),
+        col in arb_col_name(),
+    ) {
+        let alias = format!("{col}_val");
+        let agg = AggExpr {
+            function: func.clone(),
+            argument: Some(Expr::ColumnRef { table_alias: None, column_name: col }),
+            alias: alias.clone(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+        let result = pg_trickle::dvm::diff::test_helpers::agg_merge_expr_for_test(&agg, false);
+
+        match func {
+            AggFunc::Min => {
+                prop_assert!(
+                    result.contains("LEAST"),
+                    "MIN merge must use LEAST: {result}"
+                );
+                prop_assert!(
+                    !result.contains("GREATEST"),
+                    "MIN merge must NOT use GREATEST: {result}"
+                );
+            }
+            AggFunc::Max => {
+                prop_assert!(
+                    result.contains("GREATEST"),
+                    "MAX merge must use GREATEST: {result}"
+                );
+                prop_assert!(
+                    !result.contains("LEAST"),
+                    "MAX merge must NOT use LEAST: {result}"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Property: MIN/MAX merge expression checks if deleted value equals
+    /// the stored extremum (rescan guard).
+    ///
+    /// The CASE WHEN condition must be `d.__del_{alias} = st.{alias}`
+    /// (deleted value equals the stored min/max), NOT `!=` (which was
+    /// the backwards condition in the original spec).
+    #[test]
+    fn prop_min_max_rescan_guard_direction(
+        func in arb_min_max(),
+        col in arb_col_name(),
+    ) {
+        let alias = format!("{col}_val");
+        let agg = AggExpr {
+            function: func,
+            argument: Some(Expr::ColumnRef { table_alias: None, column_name: col }),
+            alias: alias.clone(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+
+        // Without rescan CTE: the merge falls back to insert extremum
+        let no_rescan = pg_trickle::dvm::diff::test_helpers::agg_merge_expr_for_test(&agg, false);
+        // With rescan CTE: the merge uses the rescanned value
+        let with_rescan = pg_trickle::dvm::diff::test_helpers::agg_merge_expr_for_test(&agg, true);
+
+        let del_col = format!("__del_{alias}");
+
+        // Both paths must check: d.__del_{alias} = st.{alias}
+        // (deleted value EQUALS stored extremum → need rescan)
+        prop_assert!(
+            no_rescan.contains(&format!("d.\"{}\" = st.", del_col)),
+            "Rescan guard must check equality (del = stored): {no_rescan}"
+        );
+        prop_assert!(
+            with_rescan.contains(&format!("d.\"{}\" = st.", del_col)),
+            "Rescan guard must check equality (del = stored): {with_rescan}"
+        );
+
+        // With rescan: THEN branch should reference the rescan CTE (r.{alias})
+        prop_assert!(
+            with_rescan.contains(&format!("r.\"{}\"", alias)),
+            "With rescan, THEN branch should use r.{alias}: {with_rescan}"
+        );
+
+        // Without rescan: THEN branch should reference insert extremum (d.__ins_)
+        let ins_col = format!("__ins_{alias}");
+        prop_assert!(
+            no_rescan.contains(&format!("d.\"{}\"", ins_col)),
+            "Without rescan, THEN branch should use d.__ins_: {no_rescan}"
+        );
+    }
+
+    /// Property: MIN/MAX delta expressions track the correct function.
+    ///
+    /// The delta CTE must use MIN() for MIN aggregates and MAX() for MAX
+    /// aggregates when computing the extremum of inserted/deleted values.
+    #[test]
+    fn prop_min_max_delta_uses_matching_function(
+        func in arb_min_max(),
+        col in arb_col_name(),
+    ) {
+        let alias = format!("{col}_val");
+        let agg = AggExpr {
+            function: func.clone(),
+            argument: Some(Expr::ColumnRef { table_alias: None, column_name: col.clone() }),
+            alias,
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+        let child_cols = vec![col];
+        let (ins, del) = pg_trickle::dvm::diff::test_helpers::agg_delta_exprs_for_test(&agg, &child_cols);
+
+        let expected_func = match func {
+            AggFunc::Min => "MIN",
+            AggFunc::Max => "MAX",
+            _ => unreachable!(),
+        };
+        prop_assert!(
+            ins.contains(expected_func),
+            "Delta ins expr should use {expected_func}: {ins}"
+        );
+        prop_assert!(
+            del.contains(expected_func),
+            "Delta del expr should use {expected_func}: {del}"
+        );
+    }
+
+    /// Property: AVG is no longer a group-rescan aggregate.
+    ///
+    /// AVG uses algebraic maintenance via auxiliary columns. The merge
+    /// expression should reference __pgt_aux_sum and __pgt_aux_count.
+    #[test]
+    fn prop_avg_is_algebraic(col in arb_col_name()) {
+        let alias = format!("avg_{col}");
+        let agg = AggExpr {
+            function: AggFunc::Avg,
+            argument: Some(Expr::ColumnRef { table_alias: None, column_name: col }),
+            alias: alias.clone(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+
+        prop_assert!(
+            !agg.function.is_group_rescan(),
+            "AVG should not be group-rescan"
+        );
+        prop_assert!(
+            agg.function.is_algebraic_via_aux(),
+            "AVG should be algebraic via auxiliary columns"
+        );
+
+        let result = pg_trickle::dvm::diff::test_helpers::agg_merge_expr_for_test(&agg, false);
+        prop_assert!(
+            result.contains("__pgt_aux_sum_"),
+            "AVG merge should reference __pgt_aux_sum: {result}"
+        );
+        prop_assert!(
+            result.contains("__pgt_aux_count_"),
+            "AVG merge should reference __pgt_aux_count: {result}"
+        );
+        prop_assert!(
+            result.contains("NULLIF"),
+            "AVG merge should guard against division by zero: {result}"
+        );
+    }
+}

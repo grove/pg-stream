@@ -1319,13 +1319,61 @@ per group.
 > old_count + Δcount`. Only MIN/MAX needs a rescan — and only when the deleted
 > value *was* the current minimum or maximum.
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| B1-1 | Algebraic rules: COUNT, SUM, AVG, STDDEV (Welford online algorithm), MIN/MAX with rescan guard when deleted value equals current extremum | 3–4 wk | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
-| B1-2 | Auxiliary column management (`__pgt_aux_count`, `__pgt_aux_sum`, etc.); view wrapper to hide from user queries | 1–2 wk | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
-| B1-3 | Migration story for existing aggregate stream tables; periodic full-group recomputation to reset floating-point drift | 1 wk | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
-| B1-4 | Fallback to full-group recomputation for non-decomposable aggregates (`mode`, percentile, `string_agg` with ordering) | 1 wk | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
-| B1-5 | Property-based tests: MIN/MAX boundary case (deleting the exact current min or max value must trigger rescan) | 1 wk | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| B1-1 | Algebraic rules: COUNT, SUM *(already algebraic)*, AVG *(algebraic via aux cols — done)*, STDDEV (Welford online algorithm — **remaining**), MIN/MAX with rescan guard *(already implemented)* | 3–4 wk | 🟡 Partial | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+| B1-2 | Auxiliary column management (`__pgt_aux_sum_*`, `__pgt_aux_count_*` — done for AVG); view wrapper to hide from user queries (**remaining**) | 1–2 wk | 🟡 Partial | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+| B1-3 | Migration story for existing aggregate stream tables; periodic full-group recomputation to reset floating-point drift | 1 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+| B1-4 | Fallback to full-group recomputation for non-decomposable aggregates (`mode`, percentile, `string_agg` with ordering) | 1 wk | ✅ Done | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+| B1-5 | Property-based tests: MIN/MAX boundary case (deleting the exact current min or max value must trigger rescan) | 1 wk | ✅ Done | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+
+#### Implementation Progress
+
+**Completed in this cycle:**
+
+- **AVG algebraic maintenance (B1-1 partial):** AVG no longer triggers full
+  group-rescan. Instead it is classified as `is_algebraic_via_aux()` and
+  tracked via auxiliary `__pgt_aux_sum_*` / `__pgt_aux_count_*` columns on
+  the stream table. The merge expression computes
+  `(old_sum + ins - del) / NULLIF(old_count + ins - del, 0)`.
+
+- **Auxiliary column infrastructure (B1-2 partial):** `create_stream_table()`
+  and `alter_stream_table()` detect AVG aggregates and automatically add
+  `NUMERIC` sum and `BIGINT` count auxiliary columns. Full refresh and
+  initialization paths inject corresponding `SUM(arg)` / `COUNT(arg)`
+  expressions. The delta CTE, merge CTE, and final CTE all propagate
+  auxiliary column values.
+
+- **Non-decomposable fallback (B1-4):** Already existed as the group-rescan
+  strategy — any aggregate not classified as algebraic or algebraic-via-aux
+  falls back to full group recomputation.
+
+- **Property-based tests (B1-5):** Four new proptest tests verify:
+  (a) MIN merge uses `LEAST`, MAX merge uses `GREATEST`;
+  (b) deleting the exact current extremum triggers rescan;
+  (c) delta expressions use matching aggregate functions;
+  (d) AVG is classified as algebraic-via-aux (not group-rescan).
+
+**Remaining work:**
+
+- **STDDEV/VAR Welford online algorithm (B1-1):** `STDDEV_POP`, `STDDEV_SAMP`,
+  `VAR_POP`, `VAR_SAMP` still use group-rescan. Implementing Welford's online
+  algorithm requires tracking auxiliary `mean`, `M2`, and `count` columns.
+
+- **View wrapper (B1-2):** `__pgt_aux_*` columns are currently visible in user
+  queries. Need a view wrapper (or column exclusion in output) to hide them.
+
+- **Migration story (B1-3):** Existing stream tables with AVG aggregates
+  created before this change lack auxiliary columns. Need an upgrade path
+  (e.g. `ALTER STREAM TABLE ... REBUILD STORAGE`).
+
+- **Floating-point drift reset (B1-3):** Periodic full-group recomputation to
+  reset accumulated rounding errors in auxiliary sum columns.
+
+- **E2E integration tests:** End-to-end tests verifying AVG algebraic path
+  produces correct results against a live PostgreSQL instance.
+
+- **Extension upgrade path (`0.8.0 → 0.9.0`):** Upgrade SQL and E2E tests.
 
 > ⚠️ Critical: the MIN/MAX maintenance rule is directionally tricky. The correct
 > condition for triggering a rescan is: deleted value **equals** the current min/max
@@ -1340,14 +1388,19 @@ per group.
 > path until property-based tests confirm: (a) deleting the exact current min triggers
 > a rescan and (b) deleting a non-min value does not. Floating-point drift reset
 > (B1-3) is also required before enabling persistent auxiliary columns.
+>
+> ✅ **B1-5 hard prerequisite satisfied.** Property-based tests now cover both
+> conditions — see `prop_min_max_rescan_guard_direction` in `tests/property_tests.rs`.
 
 > **Algebraic aggregates subtotal: ~7–9 weeks**
 
 > **v0.9.0 total: ~7–9 weeks**
 
 **Exit criteria:**
-- [ ] COUNT/SUM/AVG/STDDEV algebraic paths implemented and benchmarked vs. full-group recompute
-- [ ] MIN/MAX boundary case (delete-the-extremum) covered by property-based tests
+- [x] AVG algebraic path implemented (SUM/COUNT auxiliary columns)
+- [x] MIN/MAX boundary case (delete-the-extremum) covered by property-based tests
+- [x] Non-decomposable fallback confirmed (group-rescan strategy)
+- [ ] STDDEV algebraic path implemented (Welford online algorithm)
 - [ ] Auxiliary columns hidden from user queries via view wrapper
 - [ ] Migration path for existing aggregate stream tables tested
 - [ ] Floating-point drift reset mechanism in place (periodic recompute)

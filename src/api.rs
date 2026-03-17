@@ -426,6 +426,9 @@ struct ValidatedQuery {
     has_keyless_source: bool,
     /// Source relation OIDs and types extracted from the query.
     source_relids: Vec<(pg_sys::Oid, String)>,
+    /// AVG auxiliary columns: `(sum_col_name, count_col_name, arg_sql)` tuples
+    /// for algebraic AVG maintenance. Empty if no non-DISTINCT AVG aggregates.
+    avg_aux_columns: Vec<(String, String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,6 +735,11 @@ fn validate_and_parse_query(
             .unwrap_or(false)
     });
 
+    let avg_aux_columns = parsed_tree
+        .as_ref()
+        .map(|pr| pr.tree.avg_aux_columns())
+        .unwrap_or_default();
+
     Ok(ValidatedQuery {
         columns,
         parsed_tree,
@@ -742,6 +750,7 @@ fn validate_and_parse_query(
         needs_union_dedup,
         has_keyless_source,
         source_relids,
+        avg_aux_columns,
     })
 }
 
@@ -757,6 +766,7 @@ fn setup_storage_table(
     has_keyless_source: bool,
     refresh_mode: RefreshMode,
     parsed_tree: Option<&crate::dvm::ParseResult>,
+    avg_aux_columns: &[(String, String, String)],
 ) -> Result<pg_sys::Oid, PgTrickleError> {
     let storage_needs_pgt_count = needs_pgt_count;
     let storage_ddl = build_create_table_sql(
@@ -765,6 +775,7 @@ fn setup_storage_table(
         columns,
         storage_needs_pgt_count,
         needs_dual_count,
+        avg_aux_columns,
     );
     Spi::run(&storage_ddl)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
@@ -1324,6 +1335,7 @@ fn alter_stream_table_query(
                 vq.has_keyless_source,
                 refresh_mode,
                 vq.parsed_tree.as_ref(),
+                &vq.avg_aux_columns,
             )?
         }
     };
@@ -1690,6 +1702,7 @@ fn create_stream_table_impl(
         vq.has_keyless_source,
         refresh_mode,
         vq.parsed_tree.as_ref(),
+        &vq.avg_aux_columns,
     )?;
 
     // Insert catalog entry + dependency edges
@@ -1758,6 +1771,7 @@ fn create_stream_table_impl(
             vq.needs_dual_count,
             vq.needs_union_dedup,
             vq.topk_info.as_ref(),
+            &vq.avg_aux_columns,
         )?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
 
@@ -2597,7 +2611,13 @@ fn execute_manual_full_refresh(
     let effective_query = if st.refresh_mode == RefreshMode::Differential
         && crate::dvm::query_needs_pgt_count(&st.defining_query)
     {
-        inject_pgt_count(&st.defining_query)
+        let mut eq = inject_pgt_count(&st.defining_query);
+        // Also inject AVG auxiliary columns for algebraic AVG maintenance.
+        let avg_aux = crate::dvm::query_avg_aux_columns(&st.defining_query);
+        if !avg_aux.is_empty() {
+            eq = inject_avg_aux(&eq, &avg_aux);
+        }
+        eq
     } else {
         st.defining_query.clone()
     };
@@ -4779,6 +4799,7 @@ fn build_create_table_sql(
     columns: &[ColumnDef],
     needs_pgt_count: bool,
     needs_dual_count: bool,
+    avg_aux_columns: &[(String, String, String)],
 ) -> String {
     let col_defs: Vec<String> = columns
         .iter()
@@ -4810,12 +4831,25 @@ fn build_create_table_sql(
         ""
     };
 
+    // Add AVG auxiliary columns (__pgt_aux_sum_*, __pgt_aux_count_*) for
+    // algebraic AVG maintenance. NUMERIC for sum (matches PostgreSQL AVG
+    // precision), BIGINT for count.
+    let mut avg_aux_sql = String::new();
+    for (sum_col, count_col, _arg_sql) in avg_aux_columns {
+        avg_aux_sql.push_str(&format!(
+            ",\n    {} NUMERIC NOT NULL DEFAULT 0,\n    {} BIGINT NOT NULL DEFAULT 0",
+            quote_identifier(sum_col),
+            quote_identifier(count_col),
+        ));
+    }
+
     format!(
-        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}\n)",
+        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}\n)",
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
         aux_cols,
+        avg_aux_sql,
     )
 }
 
@@ -4847,6 +4881,7 @@ fn initialize_st(
     needs_dual_count: bool,
     needs_union_dedup: bool,
     topk_info: Option<&crate::dvm::TopKInfo>,
+    avg_aux_columns: &[(String, String, String)],
 ) -> Result<(), PgTrickleError> {
     // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
     // allow the initialization INSERT into the storage table.
@@ -4855,11 +4890,17 @@ fn initialize_st(
 
     // For aggregate/distinct STs, inject COUNT(*) AS __pgt_count into the
     // defining query so the auxiliary column is populated correctly.
-    let effective_query = if needs_pgt_count {
+    let mut effective_query = if needs_pgt_count {
         inject_pgt_count(query)
     } else {
         query.to_string()
     };
+
+    // For AVG algebraic maintenance, also inject SUM(arg) and COUNT(arg)
+    // auxiliary columns into the initialization query.
+    if !avg_aux_columns.is_empty() {
+        effective_query = inject_avg_aux(&effective_query, avg_aux_columns);
+    }
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
@@ -4983,6 +5024,31 @@ pub fn inject_pgt_count(query: &str) -> String {
         )
     } else {
         // Fallback: can't inject; return as-is (will leave __pgt_count = DEFAULT 0)
+        query.to_string()
+    }
+}
+
+/// Inject AVG auxiliary columns (`SUM(arg)` and `COUNT(arg)`) into a query.
+///
+/// These populate the `__pgt_aux_sum_*` and `__pgt_aux_count_*` storage columns
+/// during initial population and full refresh. The query must already have
+/// `__pgt_count` injected (if needed) before calling this.
+pub fn inject_avg_aux(query: &str, avg_aux_columns: &[(String, String, String)]) -> String {
+    if avg_aux_columns.is_empty() {
+        return query.to_string();
+    }
+
+    if let Some(pos) = find_top_level_keyword(query, "FROM") {
+        let mut extra = String::new();
+        for (sum_col, count_col, arg_sql) in avg_aux_columns {
+            extra.push_str(&format!(
+                ", SUM({arg_sql}) AS {}, COUNT({arg_sql}) AS {}",
+                quote_identifier(sum_col),
+                quote_identifier(count_col),
+            ));
+        }
+        format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..],)
+    } else {
         query.to_string()
     }
 }

@@ -447,18 +447,22 @@ impl AggFunc {
         }
     }
 
+    /// Returns true for aggregates that are maintained algebraically using
+    /// auxiliary columns on the stream table.
+    ///
+    /// AVG stores running `__pgt_aux_sum_*` and `__pgt_aux_count_*` columns
+    /// so the delta formula `new_avg = (old_sum + Δsum) / (old_count + Δcount)`
+    /// is exact — no precision loss from reconstructing SUM from `AVG * COUNT`.
+    pub fn is_algebraic_via_aux(&self) -> bool {
+        matches!(self, AggFunc::Avg)
+    }
+
     /// Returns true for aggregates that use the group-rescan strategy:
     /// any change in a group triggers full re-aggregation from source data.
-    ///
-    /// AVG uses group-rescan because the algebraic formula
-    /// `old_avg * old_count + delta_sum` loses precision: NUMERIC division
-    /// in PostgreSQL rounds AVG results, so reconstructing the original SUM
-    /// from `AVG * COUNT` is lossy, causing drift across refresh cycles.
     pub fn is_group_rescan(&self) -> bool {
         matches!(
             self,
-            AggFunc::Avg
-                | AggFunc::BoolAnd
+            AggFunc::BoolAnd
                 | AggFunc::BoolOr
                 | AggFunc::StringAgg
                 | AggFunc::ArrayAgg
@@ -1167,6 +1171,45 @@ impl OpTree {
             // INTERSECT/EXCEPT use dual counts, not __pgt_count
             OpTree::Intersect { .. } | OpTree::Except { .. } => false,
             _ => false,
+        }
+    }
+
+    /// Returns the list of AVG auxiliary columns that need to be added to
+    /// the stream table storage for algebraic AVG maintenance.
+    ///
+    /// For each non-DISTINCT AVG aggregate at the top level, returns a tuple
+    /// of `(sum_col_name, count_col_name, arg_sql)`:
+    /// - `sum_col_name`: `__pgt_aux_sum_{alias}` — stores running SUM
+    /// - `count_col_name`: `__pgt_aux_count_{alias}` — stores running COUNT
+    /// - `arg_sql`: the SQL expression for the aggregate argument (e.g. `"amount"`)
+    ///
+    /// Returns an empty vec if the query has no AVG aggregates or if the
+    /// operator tree is not an aggregate query.
+    pub fn avg_aux_columns(&self) -> Vec<(String, String, String)> {
+        match self {
+            OpTree::Aggregate { aggregates, .. } => {
+                let mut aux = Vec::new();
+                for agg in aggregates {
+                    if agg.function.is_algebraic_via_aux() && !agg.is_distinct {
+                        let arg_sql = agg
+                            .argument
+                            .as_ref()
+                            .map(|e| e.to_sql())
+                            .unwrap_or_else(|| "1".to_string());
+                        aux.push((
+                            format!("__pgt_aux_sum_{}", agg.alias),
+                            format!("__pgt_aux_count_{}", agg.alias),
+                            arg_sql,
+                        ));
+                    }
+                }
+                aux
+            }
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.avg_aux_columns(),
+            _ => Vec::new(),
         }
     }
 
@@ -18821,8 +18864,10 @@ mod tests {
     }
 
     #[test]
-    fn test_agg_group_rescan_avg_needs_rescan() {
-        assert!(AggFunc::Avg.is_group_rescan());
+    fn test_agg_avg_is_algebraic_via_aux() {
+        // AVG is now algebraic via auxiliary columns, not group-rescan
+        assert!(!AggFunc::Avg.is_group_rescan());
+        assert!(AggFunc::Avg.is_algebraic_via_aux());
     }
 
     #[test]

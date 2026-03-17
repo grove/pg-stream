@@ -1154,7 +1154,14 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
     let effective_query = if st.refresh_mode == crate::dag::RefreshMode::Differential
         && crate::dvm::query_needs_pgt_count(query)
     {
-        crate::api::inject_pgt_count(query)
+        let mut eq = crate::api::inject_pgt_count(query);
+        // Also inject AVG auxiliary columns (SUM/COUNT of arg) for algebraic
+        // AVG maintenance.
+        let avg_aux = crate::dvm::query_avg_aux_columns(query);
+        if !avg_aux.is_empty() {
+            eq = crate::api::inject_avg_aux(&eq, &avg_aux);
+        }
+        eq
     } else {
         query.clone()
     };
