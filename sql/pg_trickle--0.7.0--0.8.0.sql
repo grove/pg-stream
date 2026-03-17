@@ -1,0 +1,3 @@
+-- pg_trickle 0.7.0 -> 0.8.0 upgrade script
+--
+-- v0.8.0 changes will be documented here as development progresses.
