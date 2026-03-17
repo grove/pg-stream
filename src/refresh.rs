@@ -726,6 +726,19 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
 
+    let has_stream_table_source = StDependency::get_for_st(st.pgt_id)
+        .map(|deps| deps.iter().any(|dep| dep.source_type == "STREAM_TABLE"))
+        .unwrap_or(false);
+
+    if has_stream_table_source {
+        pgrx::debug1!(
+            "[pg_trickle] cache pre-warm skipped for {}.{}: upstream stream tables use full-refresh fallback",
+            schema,
+            name,
+        );
+        return;
+    }
+
     if matches!(dvm::query_has_recursive_cte(&st.defining_query), Ok(true)) {
         pgrx::debug1!(
             "[pg_trickle] cache pre-warm skipped for {}.{}: recursive CTEs choose refresh strategy at runtime",
@@ -2038,6 +2051,7 @@ pub fn execute_differential_refresh(
                INSERT (__pgt_row_id, {user_col_list}) \
                VALUES (d.__pgt_row_id, {d_user_col_list})",
         );
+        println!("MERGE SQL TEMPLATE:\n{}", merge_template);
 
         // ── B-3: DELETE + INSERT template removed (always use MERGE) ─
 
@@ -2047,7 +2061,9 @@ pub fn execute_differential_refresh(
         // ── User-trigger explicit DML templates ──────────────────────
         //
         // EC-06: Keyless sources use counted DELETE + plain INSERT.
-        let trigger_delete_template = if st.has_keyless_source {
+        // But if is_dedup is true, the ST itself has a unique row ID
+        // so we must use standard keyed templates.
+        let trigger_delete_template = if st.has_keyless_source && !is_dedup {
             build_keyless_delete_template(&quoted_table, st.pgt_id)
         } else {
             format!(
@@ -2071,7 +2087,7 @@ pub fn execute_differential_refresh(
             pgt_id = st.pgt_id,
         );
 
-        let trigger_insert_template = if st.has_keyless_source {
+        let trigger_insert_template = if st.has_keyless_source && !is_dedup {
             format!(
                 "INSERT INTO {quoted_table} (__pgt_row_id, {user_col_list}) \
                  SELECT d.__pgt_row_id, {d_user_col_list} \
@@ -2092,6 +2108,14 @@ pub fn execute_differential_refresh(
                 pgt_id = st.pgt_id,
             )
         };
+
+        let _ = std::fs::write(
+            "/tmp/pgtrickle_debug.sql",
+            format!(
+                "MERGE:\n{}\n\nTRIGGER_INSERT:\n{}\n",
+                merge_template, trigger_insert_template
+            ),
+        );
 
         // Store templates in the cache for subsequent refreshes.
         if !has_recursive_cte {
@@ -2266,7 +2290,8 @@ pub fn execute_differential_refresh(
     // EC-06: Keyless sources must use explicit DML because MERGE fails
     // when multiple target rows match a single source row (non-unique
     // __pgt_row_id). Force explicit DML path for counted deletion.
-    let use_explicit_dml = use_explicit_dml || st.has_keyless_source;
+    let is_dedup_flag = crate::dvm::is_delta_deduplicated(st.pgt_id);
+    let use_explicit_dml = use_explicit_dml || (st.has_keyless_source && !is_dedup_flag);
 
     // When user_triggers = 'off' but there ARE user triggers on the ST,
     // suppress them during the MERGE to prevent spurious firing.

@@ -378,7 +378,8 @@ async fn test_circular_convergence_records_iterations() {
         .query_scalar_opt(
             "SELECT max(last_fixpoint_iterations) \
              FROM pgtrickle.pgt_stream_tables \
-             WHERE pgt_name IN ('cyc_conv_a', 'cyc_conv_b')",
+             WHERE pgt_name IN ('cyc_conv_a', 'cyc_conv_b') \
+               AND last_fixpoint_iterations IS NOT NULL",
         )
         .await;
 
