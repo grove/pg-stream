@@ -93,6 +93,13 @@ run_test_suite() {
     echo "═══════════════════════════════════════════════════"
 
     # Compile without running; capture the executable path.
+if command -v cargo-nextest >/dev/null 2>&1; then
+        echo "Running with cargo-nextest (with $(basename "$STUB_LIB"))"
+        export "$PRELOAD_VAR"="$STUB_LIB"
+        cargo nextest run --test "$test_name" --features "$FEATURES" "${@:2}"
+        return $?
+    fi
+
     local cargo_output
     cargo_output=$(cargo test --test "$test_name" --features "$FEATURES" --no-run 2>&1)
     echo "$cargo_output"

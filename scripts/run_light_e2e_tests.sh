@@ -332,4 +332,9 @@ for test_name in "${selected_tests[@]}"; do
     cargo_args+=(--test "$test_name")
 done
 
-cargo test "${cargo_args[@]}" -- --test-threads=1
+
+if command -v cargo-nextest >/dev/null 2>&1; then
+    cargo nextest run "${cargo_args[@]}"
+else
+    cargo test "${cargo_args[@]}" -- --test-threads=1
+fi

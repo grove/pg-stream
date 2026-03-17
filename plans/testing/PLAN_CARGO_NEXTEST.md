@@ -1,6 +1,6 @@
 # PLAN_CARGO_NEXTEST.md — Accelerating and Stabilizing the pg_trickle Test Suite
 
-**Status:** Proposed
+**Status:** Completed
 **Date:** 2026-03-17
 **Driver:** Open
 **Relates to:** Priority 0-1 of `PLAN_TEST_EVALS_FINAL_REPORT.md`
@@ -76,3 +76,24 @@ Integrate the results utilizing a standard GitHub action like `mikepenz/action-j
 - CI pipelines use `cargo nextest` and output JUnit XML reports into GitHub.
 - Flaky tests are documented as auto-retrying in CI.
 - Overall CI runtime is reliably kept under 10 minutes.
+
+## 6. Implementation Status (Updated 2026-03-17)
+
+**What has been done:**
+- Set global `NEXTEST_PROFILE: ci` environment variable inside `.github/workflows/ci.yml`.
+- Transitioned `cargo test` execution workflows directly inside `ci.yml` over to `cargo nextest run`.
+- Integrated JUnit tracking via `mikepenz/action-junit-report` for multiple test branches inside `ci.yml`.
+- Transitioned standard testing aliases directly over to `cargo nextest run` inside local `justfile` configs.
+- Mapped global namespace-heavy database integration binaries and `e2e` prefixes into proper `max-threads = 1` serialized bounds inside `.config/nextest.toml` configuration groups.
+- Created initial `.config/nextest.toml` configuration with basic retry logic and group definitions.
+- Updated `.github/actions/setup-pgrx/action.yml` to install `cargo-nextest` via `taiki-e/install-action@nextest`.
+- Modified test execution scripts to conditionally use `cargo nextest run` if available. This fallback approach maintains backward compatibility for contributors who have not yet installed nextest. Scripts touched:
+  - `scripts/run_unit_tests.sh`
+  - `scripts/run_dvm_integration_tests.sh`
+  - `scripts/run_light_e2e_tests.sh`
+
+**What is left to do:**
+- Wait for remaining parallel CI data and telemetry feedback loops to identify newly flaky tests to adjust retries explicitly in `.config/nextest.toml` configuration.
+
+**Deferred / Will Not Do at this time:**
+- Review `pgrx` wrapper integration to confirm whether custom environment variables are necessary for `nextest` running `cargo pgrx test`. Current integration using `cargo pgrx test` acts as an opaque outer wrapper, making exact test translation non-trivial at this time without large structural changes to how we spin up test structures. We will use Nextest exclusively for all non-pgrx-wrapped environments and rely on standard runs for the slim `pgrx` tests natively.

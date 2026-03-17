@@ -77,6 +77,13 @@ cd "$PROJECT_DIR"
 ensure_stub
 
 # Compile test binary without running it and capture the executable path.
+if command -v cargo-nextest >/dev/null 2>&1; then
+    echo "Running with cargo-nextest (with $(basename "$STUB_LIB"))"
+    export "$PRELOAD_VAR"="$STUB_LIB"
+    cargo nextest run --lib --features "$FEATURES" "${@:2}"
+    exit $?
+fi
+
 echo "Compiling unit tests ..."
 CARGO_OUTPUT=$(cargo test --lib --features "$FEATURES" --no-run 2>&1)
 echo "$CARGO_OUTPUT"

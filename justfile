@@ -65,7 +65,7 @@ test-dvm:
 # Run integration tests (requires Docker)
 [group: "test"]
 test-integration:
-    cargo test \
+    cargo nextest run \
         --test catalog_tests \
         --test catalog_compat_tests \
         --test extension_tests \
@@ -75,8 +75,7 @@ test-integration:
         --test scenario_tests \
         --test trigger_detection_tests \
         --test workflow_tests \
-        --test property_tests \
-        -- --test-threads=1
+        --test property_tests
 
 # Build the pre-compiled builder base image (Rust + cargo-pgrx + pgrx init).
 # Only needed once, or when upgrading the Rust toolchain or pgrx version.

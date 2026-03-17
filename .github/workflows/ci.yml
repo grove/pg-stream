@@ -42,6 +42,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
   PG_VERSION: "18"
 
 jobs:
@@ -58,6 +59,12 @@ jobs:
 
       - name: Run unit tests
         run: ./scripts/run_unit_tests.sh pg18
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
 
   # ── Unit tests (extra platforms) ───────────────────────────────────────
   # Keep macOS/Windows coverage off the PR path; Linux remains the merge gate
@@ -75,6 +82,12 @@ jobs:
 
       - name: Run unit tests
         run: ./scripts/run_unit_tests.sh pg18
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
 
   unit-tests-windows:
     name: Unit tests (scheduled/manual, windows-amd64)
@@ -121,7 +134,8 @@ jobs:
 
       - name: Run integration tests
         run: |
-          cargo test \
+          cargo nextest run \
+            --profile ci \
             --test catalog_tests \
             --test extension_tests \
             --test monitoring_tests \
@@ -129,8 +143,13 @@ jobs:
             --test resilience_tests \
             --test scenario_tests \
             --test workflow_tests \
-            --test property_tests \
-            -- --test-threads=1
+            --test property_tests
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
 
   # ── Light-E2E tests (stock postgres container, PR-friendly) ──────────────
   # Uses `cargo pgrx package` + bind-mount into a stock postgres:18.3
@@ -216,18 +235,23 @@ jobs:
         run: ./tests/build_e2e_image.sh
 
       - name: Run E2E test suite
-        run: cargo test --test 'e2e_*' -- --test-threads=1
+        run: cargo nextest run --profile ci --test 'e2e_*'
 
       - name: Run TPC-H-derived correctness tests
         run: |
-          cargo test --test e2e_tpch_tests -- \
-            --ignored --test-threads=1 --nocapture
+          cargo nextest run --profile ci --test e2e_tpch_tests --run-ignored all
 
       - name: Run E2E tests with parallel refresh mode
         env:
           PGT_PARALLEL_MODE: "on"
         run: |
-          cargo test --test 'e2e_*' -- --test-threads=1
+          cargo nextest run --profile ci --test 'e2e_*'
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
 
   # ── Upgrade completeness check (every PR) ───────────────────────────────
   # Lightweight: validates that the upgrade SQL script covers all objects
@@ -330,8 +354,7 @@ jobs:
           PGS_UPGRADE_FROM: ${{ matrix.from }}
           PGS_UPGRADE_TO: ${{ matrix.to }}
         run: |
-          cargo test --test e2e_upgrade_tests -- \
-            --ignored --test-threads=1 --nocapture
+          cargo nextest run --profile ci --test e2e_upgrade_tests --run-ignored all
 
   # ── Benchmarks (non-blocking, Linux only) ───────────────────────────────
   # Expensive; run on weekly schedule and manual dispatch only.
