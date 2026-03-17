@@ -456,21 +456,28 @@ async fn test_tpch_dag_multi_parent() {
     }
     println!("  level-0 STs created ✓");
 
-    // Create level-1 ST
+    // Create level-1 ST.
+    // P1.6: If both level-0 STs were created successfully, a union failure is
+    // unexpected and should be a hard-fail rather than a soft-skip.  A soft-skip
+    // here would silently hide DAG fan-in bugs introduced by future changes.
     if let Err(e) = db
         .try_execute(&format!(
             "SELECT pgtrickle.create_stream_table('tpch_dag_union', $${UNION_SQL}$$, '1m', 'DIFFERENTIAL')"
         ))
         .await
     {
-        println!("  SKIP — union level-1 create failed: {e}");
+        // Clean up level-0 STs before panicking.
         let _ = db
             .try_execute("SELECT pgtrickle.drop_stream_table('tpch_dag_q01_fp')")
             .await;
         let _ = db
             .try_execute("SELECT pgtrickle.drop_stream_table('tpch_dag_q06_fp')")
             .await;
-        return;
+        panic!(
+            "union level-1 create failed after both level-0 STs were created successfully.\n\
+             This is unexpected — it indicates a DAG fan-in bug, not a known limitation.\n\
+             Error: {e}"
+        );
     }
     println!("  tpch_dag_union created ✓");
 
@@ -481,8 +488,8 @@ async fn test_tpch_dag_multi_parent() {
         .and(assert_invariant(&db, "tpch_dag_union", UNION_GROUND_TRUTH, "dag_union", 0).await);
 
     if let Err(e) = baseline_ok {
-        // Soft-skip if baseline fails — the individual Q01/Q06 tests already validate them.
-        println!("  SKIP — baseline failed (likely union query limitation): {e}");
+        // P1.6: Hard-fail if all three STs were created successfully but baseline fails.
+        // A passing baseline is required for the test to be meaningful.
         let _ = db
             .try_execute("SELECT pgtrickle.drop_stream_table('tpch_dag_union')")
             .await;
@@ -492,7 +499,11 @@ async fn test_tpch_dag_multi_parent() {
         let _ = db
             .try_execute("SELECT pgtrickle.drop_stream_table('tpch_dag_q06_fp')")
             .await;
-        return;
+        panic!(
+            "DAG multi-parent baseline failed — all STs were created but invariant check failed.\n\
+             This indicates a DVM correctness bug, not just a known limitation.\n\
+             Error: {e}"
+        );
     }
     println!("  baseline ✓\n");
 

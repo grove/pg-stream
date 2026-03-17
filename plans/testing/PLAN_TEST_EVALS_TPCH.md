@@ -653,44 +653,77 @@ focused E2E tests, not TPC-H.
 
 ---
 
+## Implementation Status
+
+> **Updated:** 2026-03-17 — initial implementation on branch `test-evals-tpch`
+
+### Implemented in this branch
+
+| # | Priority | Action | Status | Commit notes |
+|---|----------|--------|--------|--------------|
+| 2 | P0 | Replace `assert!(passed > 0)` with minimum thresholds in `full_vs_differential`, `differential_vs_immediate`, and `performance_comparison` | ✅ Done | `full_vs_diff`: `passed >= len - allowed_skips - 2`; `diff_vs_imm`: `passed >= 10`; `perf`: `results.len() >= len - allowed_skips - 2` |
+| 3 | P0 | Add minimum surviving assertion to `test_tpch_cross_query_consistency` | ✅ Done | `active.len() >= created.len() / 2` (50% floor) |
+| 4 | P1 | Add T2-style skip-set guard to `test_tpch_full_vs_differential` | ✅ Done | Unexpected skips (not in `DIFFERENTIAL_SKIP_ALLOWLIST`) now hard-fail |
+| 5 | P1 | Replace q05 with q14 in `test_tpch_immediate_rollback` | ✅ Done | q14 is a 2-table join + CASE aggregate; reliable at SF=0.01 |
+| 6 | P1 | Fix DAG multi-parent soft-skip: hard-fail if level-0 STs created OK but union/baseline fails | ✅ Done | Both `create` and `baseline` failure paths now `panic!` instead of `return` |
+| 7 | P1 | Populate `failed` vector in `test_tpch_differential_correctness` for invariant errors | ✅ Done | Invariant violations → `failed` (hard); DVM engine errors → `skipped` (soft) |
+| 16 | P3 | Fix `buf≈-2` display with `GREATEST(reltuples, 0)` | ✅ Done | `SUM(GREATEST(c.reltuples, 0))` in sustained churn checkpoint query |
+
+### Not yet implemented
+
+| # | Priority | Action | Reason deferred |
+|---|----------|--------|-----------------|
+| 1 | P0 | Populate `IMMEDIATE_SKIP_ALLOWLIST` from actual test run | Requires running the full TPC-H suite against the Docker image; cannot be done without CI infra |
+| 8 | P2 | Add standalone FULL mode correctness test | New test function; medium effort |
+| 9 | P2 | Add deadlock detection to `test_tpch_differential_vs_immediate` | Need to classify lock-timeout errors separately |
+| 10 | P2 | Add churn queries for NOT EXISTS / correlated subquery | Add q22, q02 to churn set |
+| 11 | P2 | Extract shared helpers from `e2e_tpch_dag_tests.rs` | Refactor/code hygiene |
+| 12 | P2 | Add performance regression threshold (3× baseline) | Requires reference baseline file |
+| 13 | P3 | Add nested SAVEPOINT rollback test for IMMEDIATE mode | New test function |
+| 14 | P3 | Make DAG chain level-1 more complex | Change to re-aggregation or join |
+| 15 | P3 | Add `TPCH_STRICT=1` env var | Small but requires plumbing |
+| 17 | P3 | Investigate customer UPDATE DVM bug (LEFT JOIN delta SQL) | Large; root cause unknown |
+
+---
+
 ## Priority Mitigations
 
 ### P0 — Critical (should fix before next release)
 
-| # | Action | Impact | Effort |
-|---|--------|--------|--------|
-| 1 | Populate IMMEDIATE_SKIP_ALLOWLIST from actual test run | T2 guard becomes active for IMMEDIATE mode | Small |
-| 2 | Replace `assert!(passed > 0)` with minimum thresholds in `full_vs_differential` and `differential_vs_immediate` | Prevents passing with 1/22 queries | Small |
-| 3 | Add minimum surviving assertion to `test_tpch_cross_query_consistency` | Prevents silent ST deactivation | Small |
+| # | Action | Impact | Effort | Status |
+|---|--------|--------|--------|--------|
+| 1 | Populate IMMEDIATE_SKIP_ALLOWLIST from actual test run | T2 guard becomes active for IMMEDIATE mode | Small | ⏳ Deferred |
+| 2 | Replace `assert!(passed > 0)` with minimum thresholds in `full_vs_differential` and `differential_vs_immediate` | Prevents passing with 1/22 queries | Small | ✅ Done |
+| 3 | Add minimum surviving assertion to `test_tpch_cross_query_consistency` | Prevents silent ST deactivation | Small | ✅ Done |
 
 ### P1 — High (should address soon)
 
-| # | Action | Impact | Effort |
-|---|--------|--------|--------|
-| 4 | Add T2-style skip-set guard to `test_tpch_full_vs_differential` | Catches FULL-vs-DIFF regressions | Small |
-| 5 | Replace q05 with a reliable query in `test_tpch_immediate_rollback` | Rollback test covers 4 queries instead of 3 | Small |
-| 6 | Fix DAG multi-parent soft-skip: hard-fail if level-0 STs create OK but union fails | Prevents silent test bypass | Small |
-| 7 | Populate `failed` vector in `test_tpch_differential_correctness` for true assertion errors | Distinguishes DVM errors from correctness bugs | Medium |
+| # | Action | Impact | Effort | Status |
+|---|--------|--------|--------|--------|
+| 4 | Add T2-style skip-set guard to `test_tpch_full_vs_differential` | Catches FULL-vs-DIFF regressions | Small | ✅ Done |
+| 5 | Replace q05 with a reliable query in `test_tpch_immediate_rollback` | Rollback test covers 4 queries instead of 3 | Small | ✅ Done |
+| 6 | Fix DAG multi-parent soft-skip: hard-fail if level-0 STs create OK but union fails | Prevents silent test bypass | Small | ✅ Done |
+| 7 | Populate `failed` vector in `test_tpch_differential_correctness` for true assertion errors | Distinguishes DVM errors from correctness bugs | Medium | ✅ Done |
 
 ### P2 — Medium (address during regular maintenance)
 
-| # | Action | Impact | Effort |
-|---|--------|--------|--------|
-| 8 | Add standalone FULL mode correctness test | FULL mode verified independently | Medium |
-| 9 | Add deadlock detection to `test_tpch_differential_vs_immediate` | q08 deadlock classified properly | Medium |
-| 10 | Add churn queries for underrepresented operators (NOT EXISTS, correlated subquery) | Churn covers more operator types | Small |
-| 11 | Extract shared helpers from `e2e_tpch_dag_tests.rs` to avoid duplication | Code hygiene | Small |
-| 12 | Add performance regression threshold (3× baseline) | Catches performance regressions | Medium |
+| # | Action | Impact | Effort | Status |
+|---|--------|--------|--------|--------|
+| 8 | Add standalone FULL mode correctness test | FULL mode verified independently | Medium | ⏳ Deferred |
+| 9 | Add deadlock detection to `test_tpch_differential_vs_immediate` | q08 deadlock classified properly | Medium | ⏳ Deferred |
+| 10 | Add churn queries for underrepresented operators (NOT EXISTS, correlated subquery) | Churn covers more operator types | Small | ⏳ Deferred |
+| 11 | Extract shared helpers from `e2e_tpch_dag_tests.rs` to avoid duplication | Code hygiene | Small | ⏳ Deferred |
+| 12 | Add performance regression threshold (3× baseline) | Catches performance regressions | Medium | ⏳ Deferred |
 
 ### P3 — Low (backlog)
 
-| # | Action | Impact | Effort |
-|---|--------|--------|--------|
-| 13 | Add nested SAVEPOINT rollback test for IMMEDIATE mode | Deeper transactional correctness | Medium |
-| 14 | Make DAG chain level-1 more complex (re-aggregation or join) | Stronger DAG propagation test | Medium |
-| 15 | Add `TPCH_STRICT=1` env var that hard-fails on any skip | Enables strict CI mode | Small |
-| 16 | Fix `buf≈-2` display with `GREATEST(reltuples, 0)` | Cosmetic fix | Trivial |
-| 17 | Investigate customer UPDATE DVM bug (LEFT JOIN delta SQL) | Enables RF3 customer UPDATEs | Large |
+| # | Action | Impact | Effort | Status |
+|---|--------|--------|--------|--------|
+| 13 | Add nested SAVEPOINT rollback test for IMMEDIATE mode | Deeper transactional correctness | Medium | ⏳ Deferred |
+| 14 | Make DAG chain level-1 more complex (re-aggregation or join) | Stronger DAG propagation test | Medium | ⏳ Deferred |
+| 15 | Add `TPCH_STRICT=1` env var that hard-fails on any skip | Enables strict CI mode | Small | ⏳ Deferred |
+| 16 | Fix `buf≈-2` display with `GREATEST(reltuples, 0)` | Cosmetic fix | Trivial | ✅ Done |
+| 17 | Investigate customer UPDATE DVM bug (LEFT JOIN delta SQL) | Enables RF3 customer UPDATEs | Large | ⏳ Deferred |
 
 ---
 

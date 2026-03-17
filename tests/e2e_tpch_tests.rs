@@ -558,7 +558,7 @@ async fn test_tpch_differential_correctness() {
     let queries = tpch_queries();
     let mut passed = 0usize;
     let mut skipped: Vec<(&str, String)> = Vec::new();
-    let failed: Vec<(&str, String)> = Vec::new(); // populated if we add soft-failure logic later
+    let mut failed: Vec<(&str, String)> = Vec::new(); // populated for invariant assertion errors
 
     for q in &queries {
         println!(
@@ -673,11 +673,15 @@ async fn test_tpch_differential_correctness() {
                 break 'cycles;
             }
 
-            // Assert the invariant — soft-fail for known DVM bugs
+            // Assert the invariant.
+            // Invariant violations are hard-failures (DVM correctness bugs),
+            // distinct from DVM engine errors that prevent refresh (which are
+            // soft-skips).  Populate `failed` so the final T2 guard can report
+            // them separately from known infrastructure skips.
             if let Err(e) = assert_tpch_invariant(&db, &st_name, q.sql, q.name, cycle).await {
                 let msg = e.lines().next().unwrap_or(&e).to_string();
-                println!("  WARN cycle {cycle} — {msg}");
-                skipped.push((q.name, format!("invariant cycle {cycle}: {msg}")));
+                println!("  FAIL cycle {cycle} — {msg}");
+                failed.push((q.name, format!("invariant cycle {cycle}: {msg}")));
                 dvm_ok = false;
                 break 'cycles;
             }
@@ -710,9 +714,10 @@ async fn test_tpch_differential_correctness() {
 
     println!("\n══════════════════════════════════════════════════════════");
     println!(
-        "  Results: {passed}/{} queries passed, {} skipped",
+        "  Results: {passed}/{} queries passed, {} skipped, {} failed",
         queries.len(),
-        skipped.len()
+        skipped.len(),
+        failed.len(),
     );
     if !skipped.is_empty() {
         println!("  Skipped (pg_trickle limitation):");
@@ -722,17 +727,19 @@ async fn test_tpch_differential_correctness() {
         }
     }
     if !failed.is_empty() {
-        println!("  FAILED (assertion errors):");
+        println!("  FAILED (assertion errors — correctness bugs):");
         for (name, reason) in &failed {
             println!("    {name}: {reason}");
         }
     }
     println!("══════════════════════════════════════════════════════════\n");
 
+    // P1.7: Hard-fail on invariant violations (distinct from DVM infra errors).
     assert!(
         failed.is_empty(),
-        "{} queries failed with assertion errors (not pg_trickle limitations)",
-        failed.len()
+        "{} queries failed with assertion errors (not pg_trickle limitations): {:?}",
+        failed.len(),
+        failed.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
     );
 
     // T2: Skip-set regression guard for DIFFERENTIAL mode.
@@ -902,10 +909,26 @@ async fn test_tpch_cross_query_consistency() {
             .await;
     }
 
+    // P0.3: Minimum surviving ST assertion — prevents silent complete deactivation.
+    // At least 50% of created STs must survive all cycles (i.e., 8+ if 17 are created).
+    let min_surviving = (created.len() / 2).max(1);
     println!(
-        "\n  Cross-query consistency: PASSED ✓ ({}/{} STs survived all cycles)\n",
+        "\n  Cross-query consistency: {}/{} STs survived all cycles{}\n",
         active.len(),
-        created.len()
+        created.len(),
+        if active.len() >= min_surviving {
+            " ✓"
+        } else {
+            " ✗"
+        },
+    );
+    assert!(
+        active.len() >= min_surviving,
+        "Cross-query consistency: only {}/{} STs survived all cycles \
+         (minimum required: {min_surviving}).\n\
+         Check for CDC fan-out bugs or cascade deactivation.",
+        active.len(),
+        created.len(),
     );
 }
 
@@ -1084,9 +1107,32 @@ async fn test_tpch_full_vs_differential() {
         queries.len()
     );
 
+    // P0.2: Minimum threshold — must pass at least as many as the non-skipped set.
+    // With 5 known DIFFERENTIAL skips, at least 15/22 should pass.
+    let min_passing = queries.len() - DIFFERENTIAL_SKIP_ALLOWLIST.len() - 2; // -2 tolerance
     assert!(
-        passed > 0,
-        "Expected at least one TPC-H query to pass FULL vs DIFFERENTIAL comparison"
+        passed >= min_passing,
+        "FULL vs DIFFERENTIAL: only {passed}/{} queries passed (minimum required: {min_passing}).\n\
+         Expected at most {} skips (the known DIFFERENTIAL limitations).\n\
+         Skipped: {:?}",
+        queries.len(),
+        DIFFERENTIAL_SKIP_ALLOWLIST.len() + 2,
+        skipped,
+    );
+
+    // P1.4: T2-style regression guard — if a query not in the DIFFERENTIAL skip
+    // allowlist is skipped, a DVM regression has occurred.
+    let unexpected_full_skips: Vec<&str> = skipped
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !DIFFERENTIAL_SKIP_ALLOWLIST.contains(name))
+        .collect();
+    assert!(
+        unexpected_full_skips.is_empty(),
+        "FULL vs DIFFERENTIAL REGRESSION: queries newly skipped that are not in \
+         DIFFERENTIAL_SKIP_ALLOWLIST: {:?}\n\
+         If intentional, add to the allowlist with an explanatory comment.",
+        unexpected_full_skips
     );
 }
 
@@ -1370,9 +1416,16 @@ async fn test_tpch_performance_comparison() {
         queries.len()
     );
 
+    // P0.2: Minimum threshold — at least 15 queries must be benchmarked
+    // (22 queries minus the 5 known DIFFERENTIAL skips minus 2 tolerance).
+    let min_benchmarked = queries.len() - DIFFERENTIAL_SKIP_ALLOWLIST.len() - 2;
     assert!(
-        !results.is_empty(),
-        "Expected at least one TPC-H query to produce benchmark results"
+        results.len() >= min_benchmarked,
+        "T1-B Performance: only {}/{} queries benchmarked (minimum required: {min_benchmarked}).\n\
+         Skipped: {:?}",
+        results.len(),
+        queries.len(),
+        skipped,
     );
 }
 
@@ -1513,9 +1566,11 @@ async fn test_tpch_sustained_churn() {
             }
 
             // Report change buffer sizes
+            // P3.16: Use GREATEST(reltuples, 0) to avoid -1 from unanalyzed tables
+            // (PostgreSQL sets reltuples = -1 for tables not yet analyzed by VACUUM).
             let buf_total: i64 = db
                 .query_scalar(
-                    "SELECT COALESCE(SUM(c.reltuples), 0)::bigint \
+                    "SELECT COALESCE(SUM(GREATEST(c.reltuples, 0)), 0)::bigint \
                      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                      WHERE n.nspname = 'pgtrickle_changes'",
                 )
@@ -1903,11 +1958,14 @@ async fn test_tpch_immediate_rollback() {
     load_data(&db).await;
     println!("  Data loaded in {:.1}s\n", t.elapsed().as_secs_f64());
 
+    // P1.5: Replaced q05 (6-table join, reliably exceeds temp_file_limit at SF=0.01)
+    // with q14 (2-table join + CASE aggregate, fast and clean in IMMEDIATE mode).
+    // This ensures the rollback test covers 4 reliable queries instead of 3 effective ones.
     let rollback_queries: &[(&str, &str)] = &[
         ("q01", include_str!("tpch/queries/q01.sql")),
         ("q06", include_str!("tpch/queries/q06.sql")),
         ("q03", include_str!("tpch/queries/q03.sql")),
-        ("q05", include_str!("tpch/queries/q05.sql")),
+        ("q14", include_str!("tpch/queries/q14.sql")),
     ];
 
     let mut all_passed = true;
@@ -2342,9 +2400,16 @@ async fn test_tpch_differential_vs_immediate() {
     );
     println!("══════════════════════════════════════════════════════════\n");
 
+    // P0.2: Minimum threshold — at least 10 queries must agree between DIFF and IMM.
+    // This test is operationally complex (known deadlocks for q08, mode divergence
+    // for q01/q13), so 10 is a conservative lower bound.
     assert!(
-        passed > 0,
-        "Expected at least one TPC-H query to agree between DIFFERENTIAL and IMMEDIATE"
+        passed >= 10,
+        "DIFFERENTIAL vs IMMEDIATE: only {passed}/{} queries agreed \
+         (minimum required: 10).\n\
+         Diverged/skipped: {:?}",
+        queries.len(),
+        skipped,
     );
 }
 
