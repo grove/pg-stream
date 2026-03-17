@@ -10,8 +10,8 @@
 
 ## Implementation Status
 
-> **Updated:** 2026-03-17
-> **Status:** All P0 and P1 items implemented. P2–P3 remain.
+> **Updated:** 2026-03-17 (pass 2)
+> **Status:** All P0, P1, and most P2/P3 items implemented. P2-4, P3-1, P3-3 remain.
 
 | Priority | Item | Status | Notes |
 |----------|------|--------|-------|
@@ -22,12 +22,12 @@
 | P1-1 | Widen Staleness Test Tolerance | ✅ DONE | Changed 59–65s window to 50–120s in `test_staleness_calculation` |
 | P1-2 | Add Column Type Verification | ✅ DONE | Two new tests in `extension_tests.rs` verify column types via `information_schema` |
 | P1-3 | Add Error Escalation Threshold Test | ✅ DONE | `test_error_escalation_exact_threshold` + `test_suspended_to_active_recovery` added to `resilience_tests.rs` |
-| P2-1 | DDL Drift Detection Test | ❌ TODO | Compare hardcoded `CATALOG_DDL` against actual `sql/` files |
-| P2-2 | Multi-Table Join Chain Unit Tests | ❌ TODO | `(A ⋈ B) ⋈ C` compositions for all join types |
-| P2-3 | Scheduler Job Lifecycle Integration Test | ❌ TODO | Enqueue/claim/complete cycle via raw SQL |
-| P2-4 | Extend Property Tests to DVM Operators | ❌ TODO | Proptest for join/aggregate SQL output |
+| P2-1 | DDL Drift Detection Test | ✅ DONE | `test_catalog_ddl_no_phantom_columns` + `test_catalog_ddl_no_phantom_tables` in `catalog_compat_tests.rs`; pure-Rust via `include_str!` |
+| P2-2 | Multi-Table Join Chain Unit Tests | ✅ DONE | `(A LEFT JOIN B) INNER JOIN C`, `A INNER JOIN (B INNER JOIN C)` in `join.rs`; `A FULL JOIN (B SEMI JOIN C)`, `(A FULL JOIN B) INNER JOIN C` in `full_join.rs` |
+| P2-3 | Scheduler Job Lifecycle Integration Test | ✅ DONE | `pgt_scheduler_jobs` added to `CATALOG_DDL`; `test_scheduler_job_lifecycle_queued_to_succeeded` + `test_scheduler_job_lifecycle_retryable_failure` in `workflow_tests.rs` |
+| P2-4 | Extend Property Tests to DVM Operators | ❌ TODO | Proptest for join/aggregate SQL output — complex, deferred |
 | P3-1 | Remove or Fold Smoke Tests | ❌ TODO | Low priority |
-| P3-2 | Add Workflow Test for ST Drop Cascade | ❌ TODO | Verify change buffer/deps/history removed on drop |
+| P3-2 | Add Workflow Test for ST Drop Cascade | ✅ DONE | `test_workflow_st_drop_cascade` in `workflow_tests.rs`; verifies CASCADE on deps, storage table drop |
 | P3-3 | Standardize Test Naming | ❌ TODO | Style consistency across all files |
 
 ---
