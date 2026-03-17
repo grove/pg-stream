@@ -10,3 +10,13 @@
 --
 -- The extension's next refresh of affected stream tables will automatically
 -- detect missing auxiliary columns and perform a full reinitialize.
+
+-- Cross-Source Snapshot Consistency: User-declared groups
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_groups (
+    group_id    SERIAL PRIMARY KEY,
+    group_name  TEXT NOT NULL UNIQUE,
+    member_oids OID[] NOT NULL,
+    isolation   TEXT NOT NULL DEFAULT 'read_committed'
+                CHECK (isolation IN ('read_committed', 'repeatable_read')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
