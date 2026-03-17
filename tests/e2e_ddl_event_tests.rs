@@ -242,6 +242,14 @@ async fn test_function_change_marks_st_for_reinit() {
         needs_reinit,
         "ST should be marked for reinit after function replacement"
     );
+
+    // Trigger reinit by refreshing, then verify data uses the new function body
+    db.refresh_st("evt_func_st").await;
+    db.assert_st_matches_query(
+        "public.evt_func_st",
+        "SELECT id, evt_double(val) AS doubled FROM evt_func_src",
+    )
+    .await;
 }
 
 /// F18: DROP FUNCTION on a function used by a stream table should mark
@@ -321,6 +329,10 @@ async fn test_add_column_on_source_st_still_functional() {
         count, 2,
         "ST should still have all rows after ADD COLUMN + refresh"
     );
+
+    // Verify data correctness — unused column add should not affect ST values
+    db.assert_st_matches_query("public.ddl_add_st", "SELECT id, val FROM ddl_add_src")
+        .await;
 }
 
 #[tokio::test]
@@ -355,6 +367,10 @@ async fn test_add_column_unused_st_survives_refresh() {
         .query_scalar("SELECT a FROM public.ddl_add2_st WHERE id = 1")
         .await;
     assert_eq!(a_val, 1);
+
+    // Verify full data: the new column 'b' must not appear in the ST and values are correct
+    db.assert_st_matches_query("public.ddl_add2_st", "SELECT id, a FROM ddl_add2_src")
+        .await;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -400,6 +416,13 @@ async fn test_drop_unused_column_st_survives() {
         count, 2,
         "ST should still have 2 rows after dropping unused column"
     );
+
+    // Verify data: the dropped 'unused' column must not appear and values are intact
+    db.assert_st_matches_query(
+        "public.ddl_drop_col_st",
+        "SELECT id, used FROM ddl_drop_col_src",
+    )
+    .await;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -436,6 +459,11 @@ async fn test_alter_column_type_triggers_reinit() {
         needs_reinit,
         "ST should be marked for reinit after column type change"
     );
+
+    // Trigger reinit/refresh and verify data is correct with the new column type
+    db.refresh_st("ddl_type_st").await;
+    db.assert_st_matches_query("public.ddl_type_st", "SELECT id, score FROM ddl_type_src")
+        .await;
 }
 
 // ══════════════════════════════════════════════════════════════════════

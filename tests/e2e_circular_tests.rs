@@ -184,6 +184,28 @@ async fn test_circular_monotone_cycle_converges() {
         scc_count >= 1,
         "pgt_scc_status() should report at least 1 SCC"
     );
+
+    // Verify data correctness: edges (1,2),(2,3),(3,4) → transitive closure has 6 pairs.
+    // At minimum the pair (1,4) requires 2+ fixpoint iterations, proving real convergence.
+    let count_a: i64 = db.count("cyc_reach_a").await;
+    assert!(
+        count_a >= 6,
+        "cyc_reach_a should contain ≥6 pairs (full transitive closure), got {count_a}"
+    );
+    let has_transitive_a: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM cyc_reach_a WHERE src = 1 AND dst = 4)")
+        .await;
+    assert!(
+        has_transitive_a,
+        "cyc_reach_a must contain transitive pair (1→4), proving multi-hop fixpoint convergence"
+    );
+    let has_transitive_b: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM cyc_reach_b WHERE src = 1 AND dst = 4)")
+        .await;
+    assert!(
+        has_transitive_b,
+        "cyc_reach_b must contain transitive pair (1→4), proving multi-hop fixpoint convergence"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -418,47 +440,38 @@ async fn test_circular_nonconvergence_error_status() {
         "pg_trickle scheduler did not appear within 90s"
     );
 
-    // Source data that ensures the cycle generates new rows each iteration
-    db.execute(
-        "CREATE TABLE cyc_nc_edges (src INT NOT NULL, dst INT NOT NULL, \
-         PRIMARY KEY (src, dst))",
-    )
-    .await;
-    db.execute("INSERT INTO cyc_nc_edges VALUES (1,2), (2,3), (3,1)")
+    // Source data that ensures the cycle generates new rows each iteration uniformly.
+    // A monotonically increasing counter guarantees non-convergence.
+    db.execute("CREATE TABLE cyc_nc_seed (val INT PRIMARY KEY)")
         .await;
+    db.execute("INSERT INTO cyc_nc_seed VALUES (1)").await;
 
     // Create both STs with non-cyclic initial queries to avoid forward-reference
     // validation failures, then ALTER them into a cycle.
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_nc_a', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e$$, \
+         $$SELECT val FROM cyc_nc_seed$$, \
          '1s', 'DIFFERENTIAL', false)",
     )
     .await;
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_nc_b', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e$$, \
+         $$SELECT val FROM cyc_nc_seed$$, \
          '1s', 'DIFFERENTIAL', false)",
     )
     .await;
 
-    // Transitive closure cycle (needs multiple iterations for 3-node graph)
+    // Monotonically increasing cycle: A adds 1 to B, B reads from A
     db.execute(
         "SELECT pgtrickle.alter_stream_table('cyc_nc_a', \
-         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
+         query => $$SELECT val FROM cyc_nc_seed \
            UNION ALL \
-           SELECT DISTINCT e.src, b.dst \
-           FROM cyc_nc_edges e \
-           INNER JOIN cyc_nc_b b ON e.dst = b.src$$)",
+           SELECT val + 1 FROM cyc_nc_b$$)",
     )
     .await;
     db.execute(
         "SELECT pgtrickle.alter_stream_table('cyc_nc_b', \
-         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
-           UNION ALL \
-           SELECT DISTINCT a.src, e.dst \
-           FROM cyc_nc_a a \
-           INNER JOIN cyc_nc_edges e ON a.dst = e.src$$)",
+         query => $$SELECT val FROM cyc_nc_a$$)",
     )
     .await;
 
@@ -466,8 +479,8 @@ async fn test_circular_nonconvergence_error_status() {
     // With max_fixpoint_iterations=1, it should fail to converge and mark ERROR.
     let got_error = wait_for_status(&db, "cyc_nc_a", "ERROR", Duration::from_secs(60)).await;
 
-    // Note: this may not trigger if the cycle happens to converge in 1 iteration
-    // (e.g. empty initial state converges trivially). The test is best-effort.
+    // Note: Since each iteration generates new rows unconditionally, it is guaranteed
+    // to never converge, making it a reliable test.
     if got_error {
         let status_b: String = db
             .query_scalar(

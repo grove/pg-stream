@@ -126,6 +126,10 @@ async fn test_append_only_fallback_on_delete() {
         count, 2,
         "should have 2 rows after delete and MERGE fallback"
     );
+
+    // Verify row-level correctness after MERGE fallback — deleted row must be absent
+    db.assert_st_matches_query("public.ao_fallback", "SELECT id, val FROM ao_fallback_src")
+        .await;
 }
 
 /// CDC heuristic fallback: UPDATE on source reverts append-only to MERGE.
@@ -171,6 +175,10 @@ async fn test_append_only_fallback_on_update() {
         val, "new",
         "updated value should be reflected after MERGE fallback"
     );
+
+    // Verify full multiset: no stale old-value rows and correct updated-value row
+    db.assert_st_matches_query("public.ao_upd", "SELECT id, val FROM ao_upd_src")
+        .await;
 }
 
 /// ALTER STREAM TABLE: enable append_only on existing stream table.
@@ -208,6 +216,10 @@ async fn test_alter_enable_append_only() {
 
     let count: i64 = db.count("public.ao_alter").await;
     assert_eq!(count, 2);
+
+    // Verify data correctness after INSERT via append-only path
+    db.assert_st_matches_query("public.ao_alter", "SELECT id, val FROM ao_alter_src")
+        .await;
 }
 
 /// Validation: append_only rejected for FULL refresh mode.

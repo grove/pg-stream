@@ -576,3 +576,64 @@ async fn test_alter_query_catalog_updated() {
         .await;
     assert!(populated, "ST should be populated after ALTER QUERY");
 }
+
+// ── Data Correctness Validation ────────────────────────────────────────
+
+#[tokio::test]
+async fn test_alter_query_data_correctness_with_dml_cycle() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE aq_dml_src (id INT PRIMARY KEY, val INT, status TEXT)")
+        .await;
+    db.execute("INSERT INTO aq_dml_src VALUES (1, 10, 'A'), (2, 20, 'B')")
+        .await;
+
+    // Phase 1: Create ST and verify
+    db.create_st(
+        "aq_dml_st",
+        "SELECT id, val FROM aq_dml_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.assert_st_matches_query("aq_dml_st", "SELECT id, val FROM aq_dml_src")
+        .await;
+
+    // Phase 2: DML cycle
+    db.execute("INSERT INTO aq_dml_src VALUES (3, 30, 'C')")
+        .await;
+    db.execute("UPDATE aq_dml_src SET val = 25 WHERE id = 2")
+        .await;
+    db.execute("DELETE FROM aq_dml_src WHERE id = 1").await;
+
+    db.refresh_st("aq_dml_st").await;
+    db.assert_st_matches_query("aq_dml_st", "SELECT id, val FROM aq_dml_src")
+        .await;
+
+    // Phase 3: Alter Query (add aggregation/filtering)
+    db.alter_st(
+        "aq_dml_st",
+        "query => $$ SELECT status, SUM(val) as total_val FROM aq_dml_src WHERE val > 0 GROUP BY status $$",
+    )
+    .await;
+
+    // Phase 4: Verify post-alter match
+    db.assert_st_matches_query(
+        "aq_dml_st",
+        "SELECT status, SUM(val) as total_val FROM aq_dml_src WHERE val > 0 GROUP BY status",
+    )
+    .await;
+
+    // Phase 5: Further DML to ensure differential mode works on the altered ST
+    db.execute("INSERT INTO aq_dml_src VALUES (4, 40, 'B')")
+        .await;
+    db.execute("UPDATE aq_dml_src SET val = 35 WHERE id = 3")
+        .await;
+
+    db.refresh_st("aq_dml_st").await;
+    db.assert_st_matches_query(
+        "aq_dml_st",
+        "SELECT status, SUM(val) as total_val FROM aq_dml_src WHERE val > 0 GROUP BY status",
+    )
+    .await;
+}

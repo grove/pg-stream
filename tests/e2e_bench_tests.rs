@@ -722,6 +722,10 @@ async fn run_benchmark(
         });
     }
 
+    // Verify smoke correctness of the FULL refresh final state
+    db.assert_st_matches_query(&full_pgt_name, scenario.query)
+        .await;
+
     db.drop_st(&full_pgt_name).await;
 
     // ── Re-populate source for DIFFERENTIAL (to have same starting point) ──
@@ -774,6 +778,12 @@ async fn run_benchmark(
             profile,
         });
     }
+
+    // Verify smoke correctness of the final ST state
+    // Note: since DIFFERENTIAL mode is the last one run, this verifies
+    // that after multi-cycle DML, the ST correctly holds the expected multiset.
+    db.assert_st_matches_query(&inc_pgt_name, scenario.query)
+        .await;
 
     results
 }
@@ -1119,6 +1129,10 @@ async fn bench_no_data_refresh_latency() {
     );
     println!("└──────────────────────────────────────────────┘");
     println!();
+
+    // Verify smoke correctness
+    db.assert_st_matches_query("nd_st", "SELECT id, val FROM src_nd")
+        .await;
 }
 // ═══════════════════════════════════════════════════════════════════════
 // F50 / G7.3 — Covering index overhead benchmark
@@ -1263,6 +1277,12 @@ async fn bench_covering_index_overhead() {
     );
     println!("└─────────────────────────────────────────────────────────┘");
     println!();
+
+    db.assert_st_matches_query(
+        "ci_st",
+        "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ci_src GROUP BY grp",
+    )
+    .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1480,6 +1500,11 @@ async fn bench_cdc_trigger_overhead() {
     );
     println!("└───────────────────────────────────────────────────────────┘");
     println!();
+
+    // Verify smoke correctness after operations
+    db.refresh_st("cdc_bench_st").await;
+    db.assert_st_matches_query("cdc_bench_st", "SELECT id, region, amount FROM cdc_src")
+        .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1731,6 +1756,10 @@ async fn run_stmt_vs_row_matrix() {
                 batch_size: SINGLE_BATCH,
                 timings_ms: single_insert_ms,
             });
+
+            // Verify smoke correctness
+            db.refresh_st(&st_name).await;
+            db.assert_st_matches_query(&st_name, &st_query).await;
         }
     }
 
@@ -1964,6 +1993,10 @@ async fn bench_stmt_vs_row_cdc_quick() {
             batch_size: BULK_BATCH,
             timings_ms: ms,
         });
+
+        // Verify smoke correctness
+        db.refresh_st(&st_name).await;
+        db.assert_st_matches_query(&st_name, &st_query).await;
     }
 
     let row = results[0].as_ref().unwrap();
@@ -2153,4 +2186,9 @@ async fn bench_concurrent_writers() {
 
     println!("└───────────────────────────────────────────────────────────────┘");
     println!();
+
+    // Verify smoke correctness after operations
+    db.refresh_st("cw_st").await;
+    db.assert_st_matches_query("cw_st", "SELECT id, region, amount FROM cw_src")
+        .await;
 }

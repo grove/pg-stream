@@ -214,6 +214,13 @@ async fn test_st_on_st_cascade_propagates_insert() {
         .query_scalar("SELECT total_amount::text FROM order_report WHERE region = 'West'")
         .await;
     assert_eq!(west_amount, "300.00", "West should be unaffected");
+
+    // Verify row-level correctness of the cascaded state
+    db.assert_st_matches_query(
+        "order_report",
+        "SELECT region, total_amount FROM order_summary WHERE order_count > 0",
+    )
+    .await;
 }
 
 /// Regression: DELETE on a base table cascades through ST-on-ST chain.
@@ -237,6 +244,14 @@ async fn test_st_on_st_cascade_propagates_delete() {
         !west_exists,
         "West should vanish from order_report after its only order is deleted"
     );
+
+    // Verify full multiset: order_report must exactly match its defining query
+    // applied to the current (post-delete, post-refresh) state of order_summary.
+    db.assert_st_matches_query(
+        "order_report",
+        "SELECT region, total_amount FROM order_summary WHERE order_count > 0",
+    )
+    .await;
 }
 
 // ── Helper: fast scheduler ───────────────────────────────────────────────────
@@ -647,6 +662,15 @@ async fn test_three_layer_cascade_insert_propagates() {
         .query_scalar("SELECT total::text FROM big_categories WHERE category = 'C'")
         .await;
     assert_eq!(c_total, "50.00");
+
+    // Verify row-level correctness of the full 3-layer cascade via multiset comparison.
+    // big_categories defines: SELECT category, total FROM category_flags WHERE is_big = true
+    // category_flags has been refreshed, so this evaluates the ST's live state correctly.
+    db.assert_st_matches_query(
+        "big_categories",
+        "SELECT category, total FROM category_flags WHERE is_big = true",
+    )
+    .await;
 }
 
 /// Regression: UPDATE on a base table cascades correctly through three layers.
@@ -726,6 +750,13 @@ async fn test_three_layer_cascade_update_propagates() {
             .await
             .unwrap();
     assert_eq!(cats, vec!["X", "Y"]);
+
+    // Verify row-level correctness of the full 3-layer cascade
+    db.assert_st_matches_query(
+        "premium_categories",
+        "SELECT category, total FROM prod_labels WHERE tier = 'premium'",
+    )
+    .await;
 }
 
 // ── Test 6: Dependencies catalog for ST-on-ST ───────────────────────────────

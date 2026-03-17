@@ -310,6 +310,10 @@ async fn test_auto_refresh_within_schedule() {
         history_count >= 1,
         "Scheduler should have written at least 1 refresh history record"
     );
+
+    // Verify data correctness: ST must exactly match source after auto-refresh
+    db.assert_st_matches_query("public.auto_st", "SELECT id, val FROM auto_src")
+        .await;
 }
 
 /// Verify that the scheduler fires differential refresh when the ST
@@ -505,6 +509,12 @@ async fn test_scheduler_refreshes_multiple_healthy_sts() {
         2,
         "Second ST should have 2 rows after auto-refresh"
     );
+
+    // Verify data correctness: both STs must exactly match their sources
+    db.assert_st_matches_query("public.h_st1", "SELECT id, val FROM h_src1")
+        .await;
+    db.assert_st_matches_query("public.h_st2", "SELECT id, val FROM h_src2")
+        .await;
 }
 
 /// Verify the scheduler updates catalog metadata after each refresh:
