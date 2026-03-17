@@ -623,7 +623,11 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
 fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> RefreshOutcome {
     log!(
         "pg_trickle refresh worker: {} group — {} members (job {})",
-        if is_repeatable_read { "repeatable_read" } else { "atomic" },
+        if is_repeatable_read {
+            "repeatable_read"
+        } else {
+            "atomic"
+        },
         job.member_pgt_ids.len(),
         job.job_id,
     );
@@ -631,7 +635,10 @@ fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> 
     if is_repeatable_read {
         // Upgrade top-level worker transaction to REPEATABLE READ snapshot isolation
         if let Err(e) = pgrx::Spi::run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ") {
-            pgrx::log!("pg_trickle refresh worker: failed to set REPEATABLE READ isolation: {}", e);
+            pgrx::log!(
+                "pg_trickle refresh worker: failed to set REPEATABLE READ isolation: {}",
+                e
+            );
             return RefreshOutcome::PermanentFailure;
         }
     }
@@ -1624,15 +1631,17 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     continue;
                 }
 
-                let all_atomic = group.isolation_level == crate::dag::IsolationLevel::RepeatableRead || group.members.iter().all(|m| {
-                    if let NodeId::StreamTable(id) = m {
-                        load_st_by_id(*id)
-                            .map(|st| st.diamond_consistency == DiamondConsistency::Atomic)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                });
+                let all_atomic = group.isolation_level
+                    == crate::dag::IsolationLevel::RepeatableRead
+                    || group.members.iter().all(|m| {
+                        if let NodeId::StreamTable(id) = m {
+                            load_st_by_id(*id)
+                                .map(|st| st.diamond_consistency == DiamondConsistency::Atomic)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    });
 
                 if !all_atomic {
                     // Not all members opted in — fall back to independent refreshes.
