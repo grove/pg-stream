@@ -234,3 +234,102 @@ async fn test_pg_lsn_type_works() {
         .await;
     assert!(gt, "LSN 0/2 should be > 0/1");
 }
+
+// ── Column Type Verification ───────────────────────────────────────────────
+
+/// Verify that the catalog table columns have the expected data types.
+///
+/// Column existence tests (test_stream_tables_columns etc.) only check that
+/// a column *exists* — a column named `pgt_status` of type `integer` instead
+/// of `text` would still pass. This test pins both the name and the data type
+/// to catch schema drift between the mock DDL and expectations.
+#[tokio::test]
+async fn test_stream_tables_column_types() {
+    let db = TestDb::with_catalog().await;
+
+    // Fetch (column_name, data_type) pairs from information_schema
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type
+         FROM information_schema.columns
+         WHERE table_schema = 'pgtrickle' AND table_name = 'pgt_stream_tables'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("information_schema query failed");
+
+    let col_map: std::collections::HashMap<String, String> = rows.into_iter().collect();
+
+    // Key columns and their expected information_schema data_type values
+    let expected: &[(&str, &str)] = &[
+        ("pgt_name", "text"),
+        ("pgt_schema", "text"),
+        ("defining_query", "text"),
+        ("original_query", "text"),
+        ("schedule", "text"),
+        ("refresh_mode", "text"),
+        ("status", "text"),
+        ("is_populated", "boolean"),
+        ("consecutive_errors", "integer"),
+        ("needs_reinit", "boolean"),
+        ("frontier", "jsonb"),
+        ("topk_limit", "integer"),
+        ("topk_order_by", "text"),
+        ("requested_cdc_mode", "text"),
+    ];
+
+    for (col_name, expected_type) in expected {
+        let actual = col_map
+            .get(*col_name)
+            .unwrap_or_else(|| panic!("column '{}' missing from pgt_stream_tables", col_name));
+        assert_eq!(
+            actual.as_str(),
+            *expected_type,
+            "column '{}': expected type '{}', got '{}'",
+            col_name,
+            expected_type,
+            actual
+        );
+    }
+}
+
+/// Verify that pgt_refresh_history columns have the expected data types.
+#[tokio::test]
+async fn test_refresh_history_column_types() {
+    let db = TestDb::with_catalog().await;
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, data_type
+         FROM information_schema.columns
+         WHERE table_schema = 'pgtrickle' AND table_name = 'pgt_refresh_history'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("information_schema query failed");
+
+    let col_map: std::collections::HashMap<String, String> = rows.into_iter().collect();
+
+    let expected: &[(&str, &str)] = &[
+        ("action", "text"),
+        ("status", "text"),
+        ("rows_inserted", "bigint"),
+        ("rows_deleted", "bigint"),
+        ("error_message", "text"),
+        ("initiated_by", "text"),
+    ];
+
+    for (col_name, expected_type) in expected {
+        let actual = col_map
+            .get(*col_name)
+            .unwrap_or_else(|| panic!("column '{}' missing from pgt_refresh_history", col_name));
+        assert_eq!(
+            actual.as_str(),
+            *expected_type,
+            "column '{}': expected type '{}', got '{}'",
+            col_name,
+            expected_type,
+            actual
+        );
+    }
+}

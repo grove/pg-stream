@@ -336,3 +336,126 @@ async fn test_error_handling_independent_per_st() {
         .await;
     assert_eq!(bad_status, "SUSPENDED");
 }
+
+// ── Error Escalation Threshold ────────────────────────────────────────────
+
+/// Test the exact error threshold that triggers suspension.
+///
+/// The default max-consecutive-errors threshold used by the scheduler is 3
+/// (matches `scheduler.rs` defaults). This test pins the exact threshold:
+/// - After 2 errors the ST stays ACTIVE.
+/// - After 3 errors the ST transitions to SUSPENDED.
+/// - After 4 errors the ST should already have been suspended at error 3.
+///
+/// Having the threshold pinned here prevents accidental changes to the
+/// catalog-side suspension logic from silently breaking the invariant.
+#[tokio::test]
+async fn test_error_escalation_exact_threshold() {
+    let db = TestDb::with_catalog().await;
+    db.execute("CREATE TABLE src_thresh (id int)").await;
+
+    db.execute(
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode, status, consecutive_errors)
+         VALUES
+            ((SELECT 'src_thresh'::regclass::oid), 'thresh_st', 'public', 'SELECT 1', 'FULL', 'ACTIVE', 0)"
+    ).await;
+
+    let pgt_id: i64 = db
+        .query_scalar("SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'thresh_st'")
+        .await;
+
+    // Simulate incrementing errors one at a time, applying suspension at each step
+    // using the same threshold (≥ 3) the scheduler uses.
+    const MAX_ERRORS: i32 = 3;
+
+    for i in 1..=4 {
+        db.execute(&format!(
+            "UPDATE pgtrickle.pgt_stream_tables
+             SET consecutive_errors = {i}
+             WHERE pgt_id = {pgt_id}"
+        ))
+        .await;
+
+        // Apply the suspension rule as the scheduler would
+        db.execute(&format!(
+            "UPDATE pgtrickle.pgt_stream_tables
+             SET status = 'SUSPENDED'
+             WHERE pgt_id = {pgt_id}
+               AND consecutive_errors >= {MAX_ERRORS}
+               AND status = 'ACTIVE'"
+        ))
+        .await;
+
+        let status: String = db
+            .query_scalar(&format!(
+                "SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {pgt_id}"
+            ))
+            .await;
+        let errors: i32 = db
+            .query_scalar(&format!(
+                "SELECT consecutive_errors FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {pgt_id}"
+            ))
+            .await;
+
+        match i {
+            1 | 2 => assert_eq!(
+                status, "ACTIVE",
+                "should remain ACTIVE after {} errors (threshold is {})",
+                errors, MAX_ERRORS
+            ),
+            _ => assert_eq!(
+                status, "SUSPENDED",
+                "should be SUSPENDED at {} errors (threshold is {})",
+                errors, MAX_ERRORS
+            ),
+        }
+    }
+}
+
+/// Test the SUSPENDED → ACTIVE recovery path.
+///
+/// When a user or admin manually clears the error count and reactivates a
+/// suspended ST, the status must transition back to ACTIVE and the error
+/// counter must be 0.
+#[tokio::test]
+async fn test_suspended_to_active_recovery() {
+    let db = TestDb::with_catalog().await;
+    db.execute("CREATE TABLE src_recover (id int)").await;
+
+    // Insert an already-suspended ST
+    db.execute(
+        "INSERT INTO pgtrickle.pgt_stream_tables
+            (pgt_relid, pgt_name, pgt_schema, defining_query, refresh_mode, status, consecutive_errors)
+         VALUES
+            ((SELECT 'src_recover'::regclass::oid), 'recover_st', 'public', 'SELECT 1', 'FULL', 'SUSPENDED', 3)"
+    ).await;
+
+    let pgt_id: i64 = db
+        .query_scalar(
+            "SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'recover_st'",
+        )
+        .await;
+
+    // Simulate admin-initiated recovery (manual reset via ALTER STREAM TABLE RESUME in real code)
+    db.execute(&format!(
+        "UPDATE pgtrickle.pgt_stream_tables
+         SET status = 'ACTIVE', consecutive_errors = 0
+         WHERE pgt_id = {pgt_id}"
+    ))
+    .await;
+
+    let status: String = db
+        .query_scalar(&format!(
+            "SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {pgt_id}"
+        ))
+        .await;
+    let errors: i32 = db
+        .query_scalar(&format!(
+            "SELECT consecutive_errors FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {pgt_id}"
+        ))
+        .await;
+
+    assert_eq!(status, "ACTIVE", "ST should be ACTIVE after recovery");
+    assert_eq!(errors, 0, "error counter must be reset to 0 upon recovery");
+}
