@@ -1408,12 +1408,12 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| B2-1 | **LIMIT / OFFSET / ORDER BY.** Top-K queries evaluated directly within the DVM engine. | 2–3 wk | ⬜ Todo | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) |
-| B2-2 | **LATERAL Joins.** Expanding the parser and DVM diff engine to handle LATERAL subqueries. | 2 wk | ⬜ Todo | [PLAN_LATERAL_JOINS.md](plans/sql/PLAN_LATERAL_JOINS.md) |
-| B2-3 | **View Inlining.** Allow stream tables to query standard PostgreSQL views natively. | 1-2 wk | ⬜ Todo | [PLAN_VIEW_INLINING.md](plans/sql/PLAN_VIEW_INLINING.md) |
-| B2-4 | **Synchronous / Transactional IVM.** Evaluating DVM diffs synchronously in the same transaction as the DML. | 3 wk | ⬜ Todo | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
-| B2-5 | **Cross-Source Snapshot Consistency.** Improving engine consistency models when joining multiple tables. | 2 wk | ⬜ Todo | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
-| B2-6 | **Non-Determinism Guarding.** Better handling or rejection of non-deterministic functions (`random()`, `now()`). | 1 wk | ⬜ Todo | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) |
+| B2-1 | **LIMIT / OFFSET / ORDER BY.** Top-K queries evaluated directly within the DVM engine. | 2–3 wk | ✅ Done | [PLAN_ORDER_BY_LIMIT_OFFSET.md](plans/sql/PLAN_ORDER_BY_LIMIT_OFFSET.md) |
+| B2-2 | **LATERAL Joins.** Expanding the parser and DVM diff engine to handle LATERAL subqueries. | 2 wk | ✅ Done | [PLAN_LATERAL_JOINS.md](plans/sql/PLAN_LATERAL_JOINS.md) |
+| B2-3 | **View Inlining.** Allow stream tables to query standard PostgreSQL views natively. | 1-2 wk | ✅ Done | [PLAN_VIEW_INLINING.md](plans/sql/PLAN_VIEW_INLINING.md) |
+| B2-4 | **Synchronous / Transactional IVM.** Evaluating DVM diffs synchronously in the same transaction as the DML. | 3 wk | ✅ Done | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
+| B2-5 | **Cross-Source Snapshot Consistency.** Improving engine consistency models when joining multiple tables. | 2 wk | 🟡 In Progress | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
+| B2-6 | **Non-Determinism Guarding.** Better handling or rejection of non-deterministic functions (`random()`, `now()`). | 1 wk | ✅ Done | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) |
 
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 
@@ -1428,12 +1428,12 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 - [x] Migration path for existing aggregate stream tables tested
 - [x] Floating-point drift reset mechanism in place (periodic recompute)
 - [x] E2E integration tests for algebraic aggregate paths
-- [ ] B2-1: Top-K queries (LIMIT/OFFSET/ORDER BY) support
-- [ ] B2-2: LATERAL Joins support
-- [ ] B2-3: View Inlining support
-- [ ] B2-4: Synchronous / Transactional IVM mode
+- [x] B2-1: Top-K queries (LIMIT/OFFSET/ORDER BY) support
+- [x] B2-2: LATERAL Joins support
+- [x] B2-3: View Inlining support
+- [x] B2-4: Synchronous / Transactional IVM mode
 - [ ] B2-5: Cross-Source Snapshot Consistency models
-- [ ] B2-6: Non-Determinism Guarding semantics implemented
+- [x] B2-6: Non-Determinism Guarding semantics implemented
 - [ ] Extension upgrade path tested (`0.8.0 → 0.9.0`)
 
 ---
