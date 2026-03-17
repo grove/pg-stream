@@ -731,6 +731,7 @@ fn get_current_table_ref(op: &OpTree) -> String {
 mod tests {
     use super::*;
     use crate::dvm::operators::test_helpers::*;
+    use proptest::prelude::*;
 
     // ── diff_inner_join tests ───────────────────────────────────────
 
@@ -1395,5 +1396,70 @@ mod tests {
             sql.to_lowercase().contains("parts"),
             "SQL must reference parts"
         );
+    }
+
+    // ── P2-4 property tests ───────────────────────────────────────────────
+    //
+    // Verify structural invariants of diff_inner_join() output SQL for
+    // arbitrarily generated column name sets using proptest.
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(200))]
+
+        /// For any non-empty left/right column sets the output always contains
+        /// UNION ALL (the two-part delta decomposition).
+        #[test]
+        fn prop_diff_inner_join_sql_always_has_union_all(
+            left_cols in proptest::collection::vec("[a-z]{2,6}", 1..4usize),
+            right_cols in proptest::collection::vec("[a-z]{2,6}", 1..4usize),
+        ) {
+            // Prefix ensures left/right column names never collide.
+            let lcols: Vec<String> = left_cols.iter().enumerate()
+                .map(|(i, c)| format!("lc{i}_{c}")).collect();
+            let rcols: Vec<String> = right_cols.iter().enumerate()
+                .map(|(i, c)| format!("rc{i}_{c}")).collect();
+            let lrefs: Vec<&str> = lcols.iter().map(|s| s.as_str()).collect();
+            let rrefs: Vec<&str> = rcols.iter().map(|s| s.as_str()).collect();
+
+            let left  = scan(1, "left_t",  "public", "l", &lrefs);
+            let right = scan(2, "right_t", "public", "r", &rrefs);
+            let tree  = inner_join(eq_cond("l", &lcols[0], "r", &rcols[0]), left, right);
+
+            let mut ctx = test_ctx();
+            let result  = diff_inner_join(&mut ctx, &tree);
+            prop_assert!(result.is_ok(), "diff_inner_join must not fail: {result:?}");
+
+            let sql = ctx.build_with_query(&result.unwrap().cte_name);
+            prop_assert!(sql.contains("UNION ALL"),
+                "inner join delta must contain UNION ALL");
+        }
+
+        /// The output column count equals left.len() + right.len() for a
+        /// 2-table inner join (both sides contribute all columns).
+        #[test]
+        fn prop_diff_inner_join_output_col_count(
+            left_cols in proptest::collection::vec("[a-z]{2,6}", 1..4usize),
+            right_cols in proptest::collection::vec("[a-z]{2,6}", 1..4usize),
+        ) {
+            let lcols: Vec<String> = left_cols.iter().enumerate()
+                .map(|(i, c)| format!("lc{i}_{c}")).collect();
+            let rcols: Vec<String> = right_cols.iter().enumerate()
+                .map(|(i, c)| format!("rc{i}_{c}")).collect();
+            let lrefs: Vec<&str> = lcols.iter().map(|s| s.as_str()).collect();
+            let rrefs: Vec<&str> = rcols.iter().map(|s| s.as_str()).collect();
+
+            let left  = scan(1, "left_t",  "public", "l", &lrefs);
+            let right = scan(2, "right_t", "public", "r", &rrefs);
+            let tree  = inner_join(eq_cond("l", &lcols[0], "r", &rcols[0]), left, right);
+
+            let mut ctx = test_ctx();
+            let result  = diff_inner_join(&mut ctx, &tree).unwrap();
+
+            prop_assert_eq!(
+                result.columns.len(),
+                lcols.len() + rcols.len(),
+                "inner join must output all left + right columns"
+            );
+        }
     }
 }

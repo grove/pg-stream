@@ -195,6 +195,7 @@ WHERE EXISTS (SELECT 1 FROM {delta_right} dr WHERE {cond_part2_dr})
 mod tests {
     use super::*;
     use crate::dvm::operators::test_helpers::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_diff_anti_join_basic() {
@@ -438,5 +439,73 @@ mod tests {
             !semi_sql.contains("NOT EXISTS"),
             "semi-join Part 1 must use EXISTS, not NOT EXISTS"
         );
+    }
+
+    // ── P2-4 property tests ───────────────────────────────────────────────
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(200))]
+
+        /// Anti-join output columns equal the left columns exactly, for any
+        /// combination of column names on both sides.
+        #[test]
+        fn prop_diff_anti_join_output_cols_equal_left_cols(
+            left_cols in proptest::collection::vec("[a-z]{2,6}", 1..4usize),
+            right_cols in proptest::collection::vec("[a-z]{2,6}", 1..4usize),
+        ) {
+            let lcols: Vec<String> = left_cols.iter().enumerate()
+                .map(|(i, c)| format!("lc{i}_{c}")).collect();
+            let rcols: Vec<String> = right_cols.iter().enumerate()
+                .map(|(i, c)| format!("rc{i}_{c}")).collect();
+            let lrefs: Vec<&str> = lcols.iter().map(|s| s.as_str()).collect();
+            let rrefs: Vec<&str> = rcols.iter().map(|s| s.as_str()).collect();
+
+            let left  = scan(1, "left_t",  "public", "l", &lrefs);
+            let right = scan(2, "right_t", "public", "r", &rrefs);
+            let cond  = eq_cond("l", &lcols[0], "r", &rcols[0]);
+            let tree  = OpTree::AntiJoin {
+                condition: cond,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+
+            let mut ctx = test_ctx();
+            let result  = diff_anti_join(&mut ctx, &tree);
+            prop_assert!(result.is_ok(), "diff_anti_join must not fail: {result:?}");
+            prop_assert_eq!(
+                result.unwrap().columns,
+                lcols,
+                "anti-join must output only left columns"
+            );
+        }
+
+        /// Anti-join SQL always contains NOT EXISTS (negation filter).
+        #[test]
+        fn prop_diff_anti_join_sql_contains_not_exists(
+            left_cols in proptest::collection::vec("[a-z]{2,6}", 1..3usize),
+            right_cols in proptest::collection::vec("[a-z]{2,6}", 1..3usize),
+        ) {
+            let lcols: Vec<String> = left_cols.iter().enumerate()
+                .map(|(i, c)| format!("lc{i}_{c}")).collect();
+            let rcols: Vec<String> = right_cols.iter().enumerate()
+                .map(|(i, c)| format!("rc{i}_{c}")).collect();
+            let lrefs: Vec<&str> = lcols.iter().map(|s| s.as_str()).collect();
+            let rrefs: Vec<&str> = rcols.iter().map(|s| s.as_str()).collect();
+
+            let left  = scan(1, "left_t",  "public", "l", &lrefs);
+            let right = scan(2, "right_t", "public", "r", &rrefs);
+            let cond  = eq_cond("l", &lcols[0], "r", &rcols[0]);
+            let tree  = OpTree::AntiJoin {
+                condition: cond,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+
+            let mut ctx = test_ctx();
+            let result  = diff_anti_join(&mut ctx, &tree).unwrap();
+            let sql     = ctx.build_with_query(&result.cte_name);
+            prop_assert!(sql.contains("NOT EXISTS"),
+                "anti-join SQL must contain NOT EXISTS");
+        }
     }
 }
