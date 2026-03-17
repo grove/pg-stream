@@ -24,6 +24,13 @@
 | P1-2 | Add multiset to append-only fallback tests | ✅ Done | `e2e_append_only_tests.rs` |
 | P1-3 | Add multiset to cascade regression tests 3 and 6 | ✅ Done | `e2e_cascade_regression_tests.rs` |
 | P1-4 | Add multiset to bootstrap gating refresh tests 12 and 17 | ✅ Done | `e2e_bootstrap_gating_tests.rs` |
+| P2-1 | Benchmark smoke assertions | ⏳ Deferred | `e2e_bench_tests.rs` |
+| P2-2 | Add multiset after ALTER QUERY | ✅ Done | `e2e_alter_query_tests.rs` |
+| P2-3 | Upgrade survival multiset | ✅ Done | `e2e_upgrade_tests.rs` |
+| P2-4 | Non-convergence guaranteed divergence | ✅ Done | `e2e_circular_tests.rs` |
+| P3-1 | Cascade ad-hoc to multiset | ✅ Done | `e2e_cascade_regression_tests.rs` |
+| P3-2 | DELETE/UPDATE in bootstrap gating | ✅ Done | `e2e_bootstrap_gating_tests.rs` |
+| P3-3 | Standardize bgworker multiset | ✅ Done | `e2e_bgworker_tests.rs` |
 
 #### P0-1 Details (WAL CDC)
 Added `assert_st_matches_query` to four tests:
