@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-03-16
 > **Latest release:** 0.7.0 (2026-03-16)
-> **Current milestone:** v0.8.0 — Connection Pooler Compatibility & pg_dump Support
+> **Current milestone:** v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -24,7 +24,7 @@ coverage, all in plain language.
 - [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
 - [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
 - [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
-- [v0.8.0 — Connection Pooler Compatibility & pg_dump Support](#v080--connection-pooler-compatibility--pg_dump-support)
+- [v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening](#v080--connection-pooler-compatibility-pg_dump-support--test-hardening)
 - [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
 - [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
 - [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
@@ -1251,11 +1251,12 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 
 ---
 
-## v0.8.0 — Connection Pooler Compatibility & pg_dump Support
+## v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening
 
-**Goal:** Enable cloud-native PgBouncer transaction-mode deployments and
+**Goal:** Enable cloud-native PgBouncer transaction-mode deployments,
 complete the pg_dump round-trip story so stream tables survive
-`pg_dump`/`pg_restore` cycles.
+`pg_dump`/`pg_restore` cycles, and comprehensively harden the 
+E2E test suites with multiset invariants to mathematically enforce DVM correctness.
 
 ### Connection Pooler Compatibility
 
@@ -1300,9 +1301,25 @@ that re-links orphaned catalog entries on extension restore.
 
 > **pg_dump support subtotal: ~5–7 days**
 
-> **v0.8.0 total: ~12–17 days**
+### Test Suite Evaluation & Hardening
+
+> **In plain terms:** Replacing legacy, row-count-based assertions with comprehensive, order-independent multiset evaluations (`assert_st_matches_query`) across all testing tiers. This mathematical invariant proving guarantees differential dataflow correctness under highly chaotic multiset interleavings and edge cases.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| TE1 | **Unit Test Hardening:** Full multiset equality testing for pure-Rust DVM operators | Done | [PLAN_EVALS_UNIT](plans/testing/PLAN_TEST_EVALS_UNIT.md) |
+| TE2 | **Light E2E Migration:** Expand speed-optimized E2E pipeline with rigorous symmetric difference checks | Done | [PLAN_EVALS_LIGHT_E2E](plans/testing/PLAN_TEST_EVALS_LIGHT_E2E.md) |
+| TE3 | **Integration Concurrency:** Prove complex orchestration correctness under transaction delays | Done | [PLAN_EVALS_INTEGRATION](plans/testing/PLAN_TEST_EVALS_INTEGRATION.md) |
+| TE4 | **Full E2E Hardening:** Validate cross-boundary, multi-DAG cascades, partition handling, and upgrade paths | Done | [PLAN_EVALS_FULL_E2E](plans/testing/PLAN_TEST_EVALS_FULL_E2E.md) |
+| TE5 | **TPC-H Smoke Test:** Stateful invariant evaluations for heavily randomized DML loads over large matrices | Done | [PLAN_EVALS_TPCH](plans/testing/PLAN_TEST_EVALS_TPCH.md) |
+| TE6 | **Property-Based Invariants:** Chaotic property testing pipelines for topological boundaries and cyclic executions | Done | [PLAN_PROPERTY_BASED_INVARIANTS](plans/testing/PLAN_TEST_PROPERTY_BASED_INVARIANTS.md) |
+
+> **Test evaluation subtotal: ~10-12 days (Completed)**
+
+> **v0.8.0 total: ~22–29 days**
 
 **Exit criteria:**
+- [x] Test infrastructure hardened with exact mathematical multiset validation
 - [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
 - [ ] pg_dump round-trip produces valid, restorable SQL for stream tables
 - [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
@@ -1862,7 +1879,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | ✅ Released |
 | v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | ✅ Released |
 | v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
-| v0.8.0 — Connection Pooler Compatibility & pg_dump Support | ~12–17d | — | |
+| v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening | ~22–29d | — | |
 | v0.9.0 — Observability, Anomaly Detection & pg_dump Support | ~33–37h | — | |
 | v0.10.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
 | v0.11.0 — Partitioned Stream Tables & Operational Scale (A-1, C-2, C-3) | ~9–13 wk | — | |
