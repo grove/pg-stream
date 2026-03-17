@@ -1321,57 +1321,63 @@ per group.
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| B1-1 | Algebraic rules: COUNT, SUM *(already algebraic)*, AVG *(algebraic via aux cols — done)*, STDDEV (Welford online algorithm — **remaining**), MIN/MAX with rescan guard *(already implemented)* | 3–4 wk | 🟡 Partial | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
-| B1-2 | Auxiliary column management (`__pgt_aux_sum_*`, `__pgt_aux_count_*` — done for AVG); view wrapper to hide from user queries (**remaining**) | 1–2 wk | 🟡 Partial | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+| B1-1 | Algebraic rules: COUNT, SUM *(already algebraic)*, AVG *(done — aux cols)*, STDDEV/VAR *(done — sum-of-squares decomposition)*, MIN/MAX with rescan guard *(already implemented)* | 3–4 wk | ✅ Done | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
+| B1-2 | Auxiliary column management (`__pgt_aux_sum_*`, `__pgt_aux_count_*`, `__pgt_aux_sum2_*` — done); hidden via `__pgt_*` naming convention (existing `NOT LIKE '__pgt_%'` filter) | 1–2 wk | ✅ Done | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
 | B1-3 | Migration story for existing aggregate stream tables; periodic full-group recomputation to reset floating-point drift | 1 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
 | B1-4 | Fallback to full-group recomputation for non-decomposable aggregates (`mode`, percentile, `string_agg` with ordering) | 1 wk | ✅ Done | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
 | B1-5 | Property-based tests: MIN/MAX boundary case (deleting the exact current min or max value must trigger rescan) | 1 wk | ✅ Done | [PLAN_NEW_STUFF.md §B-1](plans/performance/PLAN_NEW_STUFF.md) |
 
 #### Implementation Progress
 
-**Completed in this cycle:**
+**Completed:**
 
-- **AVG algebraic maintenance (B1-1 partial):** AVG no longer triggers full
-  group-rescan. Instead it is classified as `is_algebraic_via_aux()` and
-  tracked via auxiliary `__pgt_aux_sum_*` / `__pgt_aux_count_*` columns on
-  the stream table. The merge expression computes
-  `(old_sum + ins - del) / NULLIF(old_count + ins - del, 0)`.
+- **AVG algebraic maintenance (B1-1):** AVG no longer triggers full
+  group-rescan. Classified as `is_algebraic_via_aux()` and tracked via
+  `__pgt_aux_sum_*` / `__pgt_aux_count_*` columns. The merge expression
+  computes `(old_sum + ins - del) / NULLIF(old_count + ins - del, 0)`.
 
-- **Auxiliary column infrastructure (B1-2 partial):** `create_stream_table()`
-  and `alter_stream_table()` detect AVG aggregates and automatically add
-  `NUMERIC` sum and `BIGINT` count auxiliary columns. Full refresh and
-  initialization paths inject corresponding `SUM(arg)` / `COUNT(arg)`
-  expressions. The delta CTE, merge CTE, and final CTE all propagate
-  auxiliary column values.
+- **STDDEV/VAR algebraic maintenance (B1-1):** `STDDEV_POP`, `STDDEV_SAMP`,
+  `VAR_POP`, and `VAR_SAMP` are now algebraic using sum-of-squares
+  decomposition. Auxiliary columns: `__pgt_aux_sum_*` (running SUM),
+  `__pgt_aux_sum2_*` (running SUM(x²)), `__pgt_aux_count_*`.
+  Merge formulas:
+  - `VAR_POP = GREATEST(0, (n·sum2 − sum²) / n²)`
+  - `VAR_SAMP = GREATEST(0, (n·sum2 − sum²) / (n·(n−1)))`
+  - `STDDEV_POP = SQRT(VAR_POP)`, `STDDEV_SAMP = SQRT(VAR_SAMP)`
+  Null guards match PostgreSQL semantics (NULL when count ≤ threshold).
+
+- **Auxiliary column infrastructure (B1-2):** `create_stream_table()` and
+  `alter_stream_table()` detect AVG/STDDEV/VAR aggregates and automatically
+  add `NUMERIC` sum/sum2 and `BIGINT` count columns. Full refresh and
+  initialization paths inject `SUM(arg)`, `COUNT(arg)`, and `SUM(arg*arg)`.
+  All `__pgt_aux_*` columns are automatically hidden by the existing
+  `NOT LIKE '__pgt_%'` convention used throughout the codebase.
 
 - **Non-decomposable fallback (B1-4):** Already existed as the group-rescan
   strategy — any aggregate not classified as algebraic or algebraic-via-aux
   falls back to full group recomputation.
 
-- **Property-based tests (B1-5):** Four new proptest tests verify:
+- **Property-based tests (B1-5):** Seven proptest tests verify:
   (a) MIN merge uses `LEAST`, MAX merge uses `GREATEST`;
   (b) deleting the exact current extremum triggers rescan;
   (c) delta expressions use matching aggregate functions;
-  (d) AVG is classified as algebraic-via-aux (not group-rescan).
+  (d) AVG is classified as algebraic-via-aux (not group-rescan);
+  (e) STDDEV/VAR use sum-of-squares algebraic path with GREATEST guard;
+  (f) STDDEV wraps in SQRT, VAR does not;
+  (g) DISTINCT STDDEV falls back (not algebraic).
 
 **Remaining work:**
 
-- **STDDEV/VAR Welford online algorithm (B1-1):** `STDDEV_POP`, `STDDEV_SAMP`,
-  `VAR_POP`, `VAR_SAMP` still use group-rescan. Implementing Welford's online
-  algorithm requires tracking auxiliary `mean`, `M2`, and `count` columns.
-
-- **View wrapper (B1-2):** `__pgt_aux_*` columns are currently visible in user
-  queries. Need a view wrapper (or column exclusion in output) to hide them.
-
-- **Migration story (B1-3):** Existing stream tables with AVG aggregates
-  created before this change lack auxiliary columns. Need an upgrade path
-  (e.g. `ALTER STREAM TABLE ... REBUILD STORAGE`).
+- **Migration story (B1-3):** Existing stream tables with AVG/STDDEV/VAR
+  aggregates created before this change lack auxiliary columns. Need an
+  upgrade path (e.g. `ALTER STREAM TABLE ... REBUILD STORAGE` or automatic
+  detection during extension upgrade).
 
 - **Floating-point drift reset (B1-3):** Periodic full-group recomputation to
-  reset accumulated rounding errors in auxiliary sum columns.
+  reset accumulated rounding errors in auxiliary sum/sum2 columns.
 
-- **E2E integration tests:** End-to-end tests verifying AVG algebraic path
-  produces correct results against a live PostgreSQL instance.
+- **E2E integration tests:** End-to-end tests verifying AVG and STDDEV/VAR
+  algebraic paths produce correct results against a live PostgreSQL instance.
 
 - **Extension upgrade path (`0.8.0 → 0.9.0`):** Upgrade SQL and E2E tests.
 
@@ -1398,12 +1404,13 @@ per group.
 
 **Exit criteria:**
 - [x] AVG algebraic path implemented (SUM/COUNT auxiliary columns)
+- [x] STDDEV/VAR algebraic path implemented (sum-of-squares decomposition)
 - [x] MIN/MAX boundary case (delete-the-extremum) covered by property-based tests
 - [x] Non-decomposable fallback confirmed (group-rescan strategy)
-- [ ] STDDEV algebraic path implemented (Welford online algorithm)
-- [ ] Auxiliary columns hidden from user queries via view wrapper
+- [x] Auxiliary columns hidden from user queries via `__pgt_*` naming convention
 - [ ] Migration path for existing aggregate stream tables tested
 - [ ] Floating-point drift reset mechanism in place (periodic recompute)
+- [ ] E2E integration tests for algebraic aggregate paths
 - [ ] Extension upgrade path tested (`0.8.0 → 0.9.0`)
 
 ---

@@ -833,4 +833,99 @@ proptest! {
             "AVG merge should guard against division by zero: {result}"
         );
     }
+
+    /// Property: STDDEV_POP/STDDEV_SAMP/VAR_POP/VAR_SAMP are algebraic via
+    /// auxiliary columns (sum, sum2, count).
+    #[test]
+    fn prop_stddev_var_is_algebraic(
+        col in arb_col_name(),
+        variant in prop::sample::select(vec![
+            AggFunc::StddevPop,
+            AggFunc::StddevSamp,
+            AggFunc::VarPop,
+            AggFunc::VarSamp,
+        ])
+    ) {
+        let alias = format!("stat_{col}");
+        let agg = AggExpr {
+            function: variant.clone(),
+            argument: Some(Expr::ColumnRef { table_alias: None, column_name: col }),
+            alias: alias.clone(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+
+        prop_assert!(
+            !agg.function.is_group_rescan(),
+            "{:?} should not be group-rescan", variant
+        );
+        prop_assert!(
+            agg.function.is_algebraic_via_aux(),
+            "{:?} should be algebraic via auxiliary columns", variant
+        );
+        prop_assert!(
+            agg.function.needs_sum_of_squares(),
+            "{:?} should need sum-of-squares", variant
+        );
+
+        let result = pg_trickle::dvm::diff::test_helpers::agg_merge_expr_for_test(&agg, false);
+        prop_assert!(
+            result.contains("__pgt_aux_sum2_"),
+            "{:?} merge should reference __pgt_aux_sum2: {result}", variant
+        );
+        prop_assert!(
+            result.contains("GREATEST"),
+            "{:?} merge should use GREATEST for numerical stability: {result}", variant
+        );
+
+        // STDDEV variants use SQRT, VAR variants do not
+        let is_stddev = matches!(variant, AggFunc::StddevPop | AggFunc::StddevSamp);
+        if is_stddev {
+            prop_assert!(
+                result.contains("SQRT"),
+                "{:?} should wrap in SQRT: {result}", variant
+            );
+        } else {
+            prop_assert!(
+                !result.contains("SQRT"),
+                "{:?} should NOT wrap in SQRT: {result}", variant
+            );
+        }
+
+        // SAMP variants use (n-1) denominator
+        let is_samp = matches!(variant, AggFunc::StddevSamp | AggFunc::VarSamp);
+        if is_samp {
+            prop_assert!(
+                result.contains("- 1"),
+                "{:?} should use (n-1) denominator: {result}", variant
+            );
+        }
+    }
+
+    /// Property: DISTINCT STDDEV/VAR falls back to group-rescan (via
+    /// distinct flag), not algebraic.
+    #[test]
+    fn prop_distinct_stddev_not_algebraic(col in arb_col_name()) {
+        let agg = AggExpr {
+            function: AggFunc::StddevPop,
+            argument: Some(Expr::ColumnRef { table_alias: None, column_name: col }),
+            alias: "sd".to_string(),
+            is_distinct: true,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+
+        // The function itself is algebraic, but with DISTINCT the
+        // aggregate module should NOT use the algebraic path (falls
+        // back to distinct counting / rescan)
+        let result = pg_trickle::dvm::diff::test_helpers::agg_merge_expr_for_test(&agg, false);
+        // Distinct aggregates use the simple ins/del sentinel pattern, not SQRT
+        prop_assert!(
+            !result.contains("SQRT"),
+            "DISTINCT STDDEV_POP merge should NOT use algebraic SQRT formula: {result}"
+        );
+    }
 }

@@ -1161,6 +1161,11 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         if !avg_aux.is_empty() {
             eq = crate::api::inject_avg_aux(&eq, &avg_aux);
         }
+        // Also inject sum-of-squares columns for STDDEV/VAR maintenance.
+        let sum2_aux = crate::dvm::query_sum2_aux_columns(query);
+        if !sum2_aux.is_empty() {
+            eq = crate::api::inject_sum2_aux(&eq, &sum2_aux);
+        }
         eq
     } else {
         query.clone()

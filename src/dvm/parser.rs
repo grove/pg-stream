@@ -450,11 +450,28 @@ impl AggFunc {
     /// Returns true for aggregates that are maintained algebraically using
     /// auxiliary columns on the stream table.
     ///
-    /// AVG stores running `__pgt_aux_sum_*` and `__pgt_aux_count_*` columns
-    /// so the delta formula `new_avg = (old_sum + Δsum) / (old_count + Δcount)`
-    /// is exact — no precision loss from reconstructing SUM from `AVG * COUNT`.
+    /// - **AVG**: stores `__pgt_aux_sum_*` and `__pgt_aux_count_*`;
+    ///   `new_avg = (old_sum + Δsum) / (old_count + Δcount)`.
+    /// - **STDDEV/VAR**: additionally stores `__pgt_aux_sum2_*` (sum of squares);
+    ///   `var_pop = (n·sum2 − sum²) / n²`, etc.
     pub fn is_algebraic_via_aux(&self) -> bool {
-        matches!(self, AggFunc::Avg)
+        matches!(
+            self,
+            AggFunc::Avg
+                | AggFunc::StddevPop
+                | AggFunc::StddevSamp
+                | AggFunc::VarPop
+                | AggFunc::VarSamp
+        )
+    }
+
+    /// Returns true for aggregates that need a sum-of-squares auxiliary
+    /// column (`__pgt_aux_sum2_*`) in addition to sum and count.
+    pub fn needs_sum_of_squares(&self) -> bool {
+        matches!(
+            self,
+            AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp
+        )
     }
 
     /// Returns true for aggregates that use the group-rescan strategy:
@@ -475,10 +492,6 @@ impl AggFunc {
                 | AggFunc::JsonbObjectAgg
                 | AggFunc::JsonObjectAggStd(_)
                 | AggFunc::JsonArrayAggStd(_)
-                | AggFunc::StddevPop
-                | AggFunc::StddevSamp
-                | AggFunc::VarPop
-                | AggFunc::VarSamp
                 | AggFunc::AnyValue
                 | AggFunc::Mode
                 | AggFunc::PercentileCont
@@ -1209,6 +1222,36 @@ impl OpTree {
             | OpTree::Project { child, .. }
             | OpTree::Subquery { child, .. }
             | OpTree::Window { child, .. } => child.avg_aux_columns(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For each non-DISTINCT STDDEV/VAR aggregate, returns a tuple of
+    /// `(sum2_col_name, arg_sql)`:
+    /// - `sum2_col_name`: `__pgt_aux_sum2_{alias}` — stores running SUM(x²)
+    /// - `arg_sql`: the SQL expression for the aggregate argument
+    ///
+    /// These are needed in addition to the sum/count from `avg_aux_columns`.
+    pub fn sum2_aux_columns(&self) -> Vec<(String, String)> {
+        match self {
+            OpTree::Aggregate { aggregates, .. } => {
+                let mut aux = Vec::new();
+                for agg in aggregates {
+                    if agg.function.needs_sum_of_squares() && !agg.is_distinct {
+                        let arg_sql = agg
+                            .argument
+                            .as_ref()
+                            .map(|e| e.to_sql())
+                            .unwrap_or_else(|| "1".to_string());
+                        aux.push((format!("__pgt_aux_sum2_{}", agg.alias), arg_sql));
+                    }
+                }
+                aux
+            }
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.sum2_aux_columns(),
             _ => Vec::new(),
         }
     }
@@ -18887,7 +18930,10 @@ mod tests {
 
     #[test]
     fn test_agg_group_rescan_stddev_pop_needs_rescan() {
-        assert!(AggFunc::StddevPop.is_group_rescan());
+        // STDDEV_POP is now algebraic via auxiliary columns, not group-rescan
+        assert!(!AggFunc::StddevPop.is_group_rescan());
+        assert!(AggFunc::StddevPop.is_algebraic_via_aux());
+        assert!(AggFunc::StddevPop.needs_sum_of_squares());
     }
 
     #[test]
