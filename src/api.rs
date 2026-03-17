@@ -5167,6 +5167,80 @@ fn find_top_level_keyword(sql: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+/// Generate SQL to recreate all stream tables for pg_dump compatibility.
+///
+/// This provides a workaround for `pg_dump`, which does not naturally back up
+/// the function calls used to create stream tables. When run, it outputs
+/// standard `SELECT pgtrickle.create_stream_table(...)` statements for all
+/// active stream tables.
+#[pg_extern(schema = "pgtrickle")]
+fn generate_dump() -> Result<impl std::iter::Iterator<Item = String>, crate::error::PgTrickleError>
+{
+    let mut stmts = Vec::new();
+    let tables = crate::catalog::StreamTableMeta::get_all()?;
+
+    for st in tables {
+        let name = format!("{}.{}", st.pgt_schema, st.pgt_name);
+
+        let query = st.defining_query.replace("'", "''");
+
+        let schedule_arg = if let Some(sched) = st.schedule {
+            format!("'{}'", sched.replace("'", "''"))
+        } else {
+            "NULL".to_string()
+        };
+
+        let refresh_mode = match st.refresh_mode {
+            crate::catalog::RefreshMode::Auto => "AUTO",
+            crate::catalog::RefreshMode::Full => "FULL",
+            crate::catalog::RefreshMode::Differential => "DIFFERENTIAL",
+            crate::catalog::RefreshMode::Immediate => "IMMEDIATE",
+        };
+
+        let diamond_const = match st.diamond_consistency {
+            crate::catalog::DiamondConsistency::None => "NULL",
+            crate::catalog::DiamondConsistency::Atomic => "'atomic'",
+        };
+
+        let diamond_sched = match st.diamond_schedule_policy {
+            crate::catalog::DiamondSchedulePolicy::Fastest => "'fastest'",
+            crate::catalog::DiamondSchedulePolicy::Slowest => "'slowest'",
+        };
+
+        let cdc_mode_arg = if let Some(cdc) = st.requested_cdc_mode {
+            format!("'{}'", cdc.replace("'", "''"))
+        } else {
+            "NULL".to_string()
+        };
+
+        let stmt = format!(
+            "SELECT pgtrickle.create_stream_table(\n    '{}',\n    '{}',\n    {},\n    '{}',\n    false,\n    {},\n    {},\n    {},\n    {}\n);",
+            name,
+            query,
+            schedule_arg,
+            refresh_mode,
+            diamond_const,
+            diamond_sched,
+            cdc_mode_arg,
+            st.is_append_only
+        );
+        stmts.push(stmt);
+    }
+
+    Ok(stmts.into_iter())
+}
+
+/// Restore stream tables from catalog entries after pg_restore.
+///
+/// During a `pg_restore`, `pg_dump` will restore the base storage tables and
+/// the `pgtrickle.pgt_stream_tables` catalog, but the necessary CDC triggers
+/// and internal wiring will be missing. This function re-establishes them.
+#[pg_extern(schema = "pgtrickle")]
+fn restore_stream_tables() -> Result<(), crate::error::PgTrickleError> {
+    pgrx::info!("restore_stream_tables() called. This is a stub for the 0.8.0 pg_dump support.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

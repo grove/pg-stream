@@ -303,6 +303,37 @@ impl StreamTableMeta {
         })
     }
 
+    /// Get all stream tables (including paused/broken).
+    pub fn get_all() -> Result<Vec<Self>, PgTrickleError> {
+        Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT pgt_id, pgt_relid, pgt_name, pgt_schema, defining_query, \
+                     original_query, schedule, refresh_mode, status, is_populated, \
+                     data_timestamp, consecutive_errors, needs_reinit, frontier, \
+                     auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
+                     topk_offset, diamond_consistency, diamond_schedule_policy, \
+                     has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
+                     scc_id, last_fixpoint_iterations \
+                     FROM pgtrickle.pgt_stream_tables",
+                    None,
+                    &[],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in table {
+                match Self::from_spi_heap_tuple(&row) {
+                    Ok(meta) => results.push(meta),
+                    Err(e) => {
+                        pgrx::warning!("Skipping corrupted ST catalog row in get_all: {}", e);
+                    }
+                }
+            }
+            Ok(results)
+        })
+    }
+
     /// Get all active stream tables.
     pub fn get_all_active() -> Result<Vec<Self>, PgTrickleError> {
         Spi::connect(|client| {

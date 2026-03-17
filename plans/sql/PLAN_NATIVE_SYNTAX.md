@@ -733,7 +733,9 @@ for registered stream tables.
 - E2E: `CASCADE` handling
 - E2E: Verify normal matviews are unaffected
 
-### Phase 5: pg_dump / Restore Support (3–4 days)
+### Phase 5: pg_dump / Restore Support (InProgress)
+
+**Status:** Started. `generate_dump()` and `StreamTableMeta::get_all` are implemented. `restore_stream_tables()` is currently stubbed out pending full event trigger behavior implementation.
 
 **Scope:** Implement `pgtrickle.generate_dump()` and
 `pgtrickle.restore_stream_tables()` functions.
