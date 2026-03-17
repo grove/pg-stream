@@ -1415,6 +1415,42 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 | B2-5 | **Cross-Source Snapshot Consistency.** Improving engine consistency models when joining multiple tables. | 2 wk | ✅ Done | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
 | B2-6 | **Non-Determinism Guarding.** Better handling or rejection of non-deterministic functions (`random()`, `now()`). | 1 wk | ✅ Done | [PLAN_NON_DETERMINISM.md](plans/sql/PLAN_NON_DETERMINISM.md) |
 
+### Multi-Table Delta Batching (B-3)
+
+> **In plain terms:** When a join query has three source tables and all three
+> change in the same cycle, today pg_trickle makes three separate passes through
+> the source tables. B-3 merges those passes into one and prunes UNION ALL
+> branches for sources with no changes.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| B3-1 | Intra-query delta-branch pruning: skip UNION ALL branch entirely when a source has zero changes in this cycle | 1–2 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-2 | Merged-delta generation: weight aggregation (`GROUP BY __pgt_row_id, SUM(weight)`) for cross-source deduplication; remove zero-weight rows | 3–4 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-3 | Property-based correctness tests for simultaneous multi-source changes; diamond-flow scenarios | 1–2 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+
+> ⚠️ Cross-delta deduplication **must use weight aggregation (`SUM(weight)` grouped by
+> `__pgt_row_id`), not `DISTINCT ON`**. `DISTINCT ON` silently discards corrections
+> that should be summed and will produce wrong data for diamond-flow queries — the
+> exact scenario this feature targets. Do not merge B3-2 without passing property-based
+> correctness proofs. See PLAN_NEW_STUFF.md §B-3 risk analysis.
+
+> **Retraction candidate (B-3):** The spec contains a correctness bug at the design level
+> — the originally proposed `DISTINCT ON` deduplication produces silently wrong results
+> for diamond-flow delta paths. The corrected approach (Z-set weight aggregation) is
+> conceptually sound but requires formal correctness proofs or exhaustive property-based
+> tests before any code is written. The risk rating is **Very High**. Recommend moving
+> B-3 out of the numbered roadmap into a **post-1.0 research backlog** unless a formal
+> correctness proof for the weight-aggregation path exists prior to v0.12.0 scoping.
+
+> **Multi-source delta batching subtotal: ~5–8 weeks**
+
+### Additional Query Engine Improvements
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
+| A7 | Skip-unchanged-column scanning in delta SQL (requires column-usage demand-propagation pass in DVM parser) | ~1–2d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.4 |
+
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 
 > **v0.9.0 total: ~18–22 weeks**
@@ -1606,35 +1642,6 @@ quotas for multi-tenant environments.
 source tables change simultaneously, conduct a formal research spike for
 the custom logical decoding output plugin (D-2) before committing to a full
 implementation, and widen the deployment target to PG 16–18.
-
-### Multi-Table Delta Batching (B-3)
-
-> **In plain terms:** When a join query has three source tables and all three
-> change in the same cycle, today pg_trickle makes three separate passes through
-> the source tables. B-3 merges those passes into one and prunes UNION ALL
-> branches for sources with no changes.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| B3-1 | Intra-query delta-branch pruning: skip UNION ALL branch entirely when a source has zero changes in this cycle | 1–2 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
-| B3-2 | Merged-delta generation: weight aggregation (`GROUP BY __pgt_row_id, SUM(weight)`) for cross-source deduplication; remove zero-weight rows | 3–4 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
-| B3-3 | Property-based correctness tests for simultaneous multi-source changes; diamond-flow scenarios | 1–2 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
-
-> ⚠️ Cross-delta deduplication **must use weight aggregation (`SUM(weight)` grouped by
-> `__pgt_row_id`), not `DISTINCT ON`**. `DISTINCT ON` silently discards corrections
-> that should be summed and will produce wrong data for diamond-flow queries — the
-> exact scenario this feature targets. Do not merge B3-2 without passing property-based
-> correctness proofs. See PLAN_NEW_STUFF.md §B-3 risk analysis.
-
-> **Retraction candidate (B-3):** The spec contains a correctness bug at the design level
-> — the originally proposed `DISTINCT ON` deduplication produces silently wrong results
-> for diamond-flow delta paths. The corrected approach (Z-set weight aggregation) is
-> conceptually sound but requires formal correctness proofs or exhaustive property-based
-> tests before any code is written. The risk rating is **Very High**. Recommend moving
-> B-3 out of the numbered roadmap into a **post-1.0 research backlog** unless a formal
-> correctness proof for the weight-aggregation path exists prior to v0.12.0 scoping.
-
-> **Multi-source delta batching subtotal: ~5–8 weeks**
 
 ### Async CDC — Research Spike (D-2)
 
@@ -1936,13 +1943,11 @@ These are not gated on 1.0 but represent the longer-term horizon.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
 | A2 | Transactional IVM Phase 4 remaining (ENR-based transition tables, aggregate fast-path, C-level triggers, prepared stmt reuse) | ~36–54h | [PLAN_TRANSACTIONAL_IVM.md](plans/sql/PLAN_TRANSACTIONAL_IVM.md) |
 | A3 | PostgreSQL 19 forward-compatibility | TBD | [PLAN_PG19_COMPAT.md](plans/infra/PLAN_PG19_COMPAT.md) |
 | A4 | PostgreSQL 14–15 backward compatibility | ~40h | [PLAN_PG_BACKCOMPAT.md](plans/infra/PLAN_PG_BACKCOMPAT.md) |
 | A5 | Partitioned stream table storage (opt-in) | ~60–80h | [PLAN_PARTITIONING_SHARDING.md](plans/infra/PLAN_PARTITIONING_SHARDING.md) §4 |
 | A6 | Buffer table partitioning by LSN range (`pg_trickle.buffer_partitioning` GUC) | ~3–4d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.3 |
-| A7 | Skip-unchanged-column scanning in delta SQL (requires column-usage demand-propagation pass in DVM parser) | ~1–2d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.4 |
 | A8 | `ROWS FROM()` with multiple SRF functions — very low demand, deferred | ~1–2d | [PLAN_TRANSACTIONAL_IVM_PART_2.md](plans/sql/PLAN_TRANSACTIONAL_IVM_PART_2.md) Task 2.3 |
 
 ---
