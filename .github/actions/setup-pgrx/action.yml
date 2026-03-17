@@ -25,6 +25,9 @@ runs:
         toolchain: ${{ inputs.rust-toolchain }}
         components: clippy, rustfmt
 
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
     # ── Caching ───────────────────────────────────────────────────────────
     # Note: Swatinem/rust-cache@v2 is NOT used here because it references
     # the 'matrix' context internally, which is unavailable in composite
