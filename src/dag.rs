@@ -1127,6 +1127,8 @@ pub enum ExecutionUnitKind {
     /// An atomic consistency group — all members refreshed serially in one
     /// worker transaction with SAVEPOINT rollback on failure.
     AtomicGroup,
+    /// An atomic consistency group requiring REPEATABLE READ isolation.
+    RepeatableReadGroup,
     /// An IMMEDIATE-trigger closure — the root scheduled refresh fires
     /// synchronous downstream updates inside the same transaction.
     ImmediateClosure,
@@ -1137,6 +1139,7 @@ impl ExecutionUnitKind {
         match self {
             ExecutionUnitKind::Singleton => "singleton",
             ExecutionUnitKind::AtomicGroup => "atomic_group",
+            ExecutionUnitKind::RepeatableReadGroup => "repeatable_read_group",
             ExecutionUnitKind::ImmediateClosure => "immediate_closure",
         }
     }

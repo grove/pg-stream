@@ -429,15 +429,15 @@ the per-group `isolation` parameter is the sole control surface.
 
 **STATUS: IN PROGRESS**
 - ✅ **Step 2.1 (Catalog & API):** Scaffolding and table creation finished.
-- ⬜ **Step 2.2 (DAG Integration):** Loading declared groups from catalog and merging during rebuild is pending.
-- ⬜ **Step 2.3 (Scheduler Execution):** Processing `REPEATABLE READ` transactions inside worker logic is pending.
+- ✅ **Step 2.2 (DAG Integration):** Loading declared groups from catalog and merging during rebuild.
+- ✅ **Step 2.3 (Scheduler Execution):** Processing `REPEATABLE READ` transactions inside worker logic.
 - ⬜ **Step 2.4 (Tests):** Scenarios for repeating snapshots and DAG resolution are pending.
 
 
 **STATUS: IN PROGRESS**
 - ✅ **Step 2.1 (Catalog & API):** Scaffolding and table creation finished.
-- ⬜ **Step 2.2 (DAG Integration):** Loading declared groups from catalog and merging during rebuild is pending.
-- ⬜ **Step 2.3 (Scheduler Execution):** Processing `REPEATABLE READ` transactions inside worker logic is pending.
+- ✅ **Step 2.2 (DAG Integration):** Loading declared groups from catalog and merging during rebuild.
+- ✅ **Step 2.3 (Scheduler Execution):** Processing `REPEATABLE READ` transactions inside worker logic.
 - ⬜ **Step 2.4 (Tests):** Scenarios for repeating snapshots and DAG resolution are pending.
 
 

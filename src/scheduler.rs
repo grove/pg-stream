@@ -493,7 +493,8 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
     let outcome = BackgroundWorker::transaction(AssertUnwindSafe(|| -> RefreshOutcome {
         match job.unit_kind.as_str() {
             "singleton" => execute_worker_singleton(&job),
-            "atomic_group" => execute_worker_atomic_group(&job),
+            "atomic_group" => execute_worker_atomic_group(&job, false),
+            "repeatable_read_group" => execute_worker_atomic_group(&job, true),
             "immediate_closure" => execute_worker_immediate_closure(&job),
             _ => {
                 warning!(
@@ -619,12 +620,21 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
 /// Uses the C-level internal sub-transaction API (`BeginInternalSubTransaction`
 /// / `ReleaseCurrentSubTransaction` / `RollbackAndReleaseCurrentSubTransaction`)
 /// because PostgreSQL rejects transaction-control SQL via SPI.
-fn execute_worker_atomic_group(job: &SchedulerJob) -> RefreshOutcome {
+fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> RefreshOutcome {
     log!(
-        "pg_trickle refresh worker: atomic group — {} members (job {})",
+        "pg_trickle refresh worker: {} group — {} members (job {})",
+        if is_repeatable_read { "repeatable_read" } else { "atomic" },
         job.member_pgt_ids.len(),
         job.job_id,
     );
+
+    if is_repeatable_read {
+        // Upgrade top-level worker transaction to REPEATABLE READ snapshot isolation
+        if let Err(e) = pgrx::Spi::run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ") {
+            pgrx::log!("pg_trickle refresh worker: failed to set REPEATABLE READ isolation: {}", e);
+            return RefreshOutcome::PermanentFailure;
+        }
+    }
 
     let subtxn = SubTransaction::begin();
 
@@ -1614,7 +1624,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     continue;
                 }
 
-                let all_atomic = group.members.iter().all(|m| {
+                let all_atomic = group.isolation_level == crate::dag::IsolationLevel::RepeatableRead || group.members.iter().all(|m| {
                     if let NodeId::StreamTable(id) = m {
                         load_st_by_id(*id)
                             .map(|st| st.diamond_consistency == DiamondConsistency::Atomic)
