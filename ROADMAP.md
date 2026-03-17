@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-16
-> **Latest release:** 0.7.0 (2026-03-16)
-> **Current milestone:** v0.8.0 — pg_dump Support & Test Hardening
+> **Last updated:** 2026-03-17
+> **Latest release:** 0.8.0 (2026-03-17)
+> **Current milestone:** v0.9.0 — Incremental Aggregate Maintenance
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -1252,6 +1252,8 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 ---
 
 ## v0.8.0 — pg_dump Support & Test Hardening
+
+**Status:** Released
 
 **Goal:** Complete the pg_dump round-trip story so stream tables survive
 `pg_dump`/`pg_restore` cycles, and comprehensively harden the 

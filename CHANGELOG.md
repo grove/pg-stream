@@ -9,6 +9,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 <!-- TOC start -->
 - [Unreleased](#unreleased)
+- [0.8.0 — 2026-03-17](#080--2026-03-17)
 - [0.7.0 — 2026-03-16](#070--2026-03-16)
 - [0.6.0 — 2026-03-14](#060--2026-03-14)
 - [0.5.0 — 2026-03-13](#050--2026-03-13)
@@ -28,132 +29,25 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] — 2026-03-17
+
+This release focuses on making your streams easier to back up, far more reliable under complex scenarios, and solidifying the underlying core engine through massive testing improvements.
+
 ### Added
-- **Native Backup & Restore:** `pg_trickle` now supports logical backups natively through `pg_dump` and `pg_restore`. 
-  - Restoring datasets correctly recreates all change queues, triggers, and dependency structures dynamically.
-  - Implemented `CREATE EXTENSION` event trigger hook that automatically discovers and repairs orphaned `pg_trickle` tracking definitions. 
-  - Added dedicated `BACKUP_AND_RESTORE.md` guide specifying optimal CLI sequences for zero-downtime framework recovery.
-
-#### Full E2E Test Suite Multiset Evaluations
-
-The E2E test suite has been hardened globally with rigorous multiset assertions
-(`assert_st_matches_query`) to ensure exact data correctness across all test boundaries (P0-P3 evaluations).
-
-- Integrated multiset evaluations into cascade regression, upgrade continuity,
-  bootstrap gating, and background worker test suites.
-- Expanded cyclic DML tests with deterministic multiset non-convergence and `ALTER QUERY` lifecycle validations.
-- Added inline multiset data verification to the performance and benchmark suite
-  during high-load matrix runs.
-
-#### Comprehensive property-based and topological invariant tests
-
-The test suite has been significantly expanded with property-based invariants
-that systematically exercise DAG, circular, snapshot, and topology scenarios.
-
-- New `tests/e2e/property_support.rs` module provides shared seeded-random
-  generation helpers so property tests are reproducible across runs.
-- `tests/e2e_property_dag_tests.rs` adds seeded DAG property invariant tests
-  covering orphan detection, dependency ordering, and multi-hop refresh
-  correctness.
-- `tests/e2e_property_circular_tests.rs` adds property invariants for
-  circular (SCC) refresh: convergence under monotone pipelines, rejection of
-  unsafe cycles, and non-convergence safety limits.
-- `tests/e2e_property_snapshot_tests.rs` adds snapshot/full-refresh property
-  invariants ensuring consistency after arbitrary insert/update/delete
-  sequences.
-- `tests/e2e_dag_topology_tests.rs` (phase 6) covers boundary and stress cases
-  such as wide fanout, deep chains, diamond dependencies, and mixed-mode
-  topologies.
-- `tests/e2e_dag_autorefresh_tests.rs` adds topology-aware auto-refresh
-  ordering tests.
-- `tests/property_tests.rs` adds pure-Rust (no DB) property expansion tests
-  for the DVM rewrite pipeline.
-- `tests/e2e_dag_error_tests.rs` expanded with 303 additional lines covering
-  error paths in circular and deep-chain drop scenarios.
+- **Backup and Restore Support**: You can now safely backup your database using standard `pg_dump` and `pg_restore` commands. The system will automatically reconnect all streams and data queues to eliminate downtime during disaster recovery.
+- **Connection Pooler Opt-In**: Replaced the global PgBouncer pooler compatibility setting with a per-stream option. You can now enable connection pooling optimizations selectively on a stream-by-stream basis.
 
 ### Fixed
+- **Cyclic Stream Reliability**: Fixed internal bugs that occasionally caused streams referencing each other in a loop to get stuck refreshing forever. Streams now accurately detect when row changes stop and naturally settle.
+- **Large Dependency Chains**: Fixed a crash (stack overflow) that could happen if you attempted to drop an extremely large or heavily recursive chain of stream tables sequentially.
+- **Special Character Support in SQL**: Handled an edge case causing errors when multi-byte characters or special non-ASCII symbols were parsed inside certain SQL commands.
+- **Mac Support for Developer Tooling**: Addressed a minor internal tool error stopping test components from automatically building on Apple Silicon machines.
 
-- Fixed a stack overflow when recursively dropping a large circular dependency
-  chain (`src/api.rs`): the recursive drop walk is now iterative, preventing
-  unbounded stack growth for deep or circular graphs.
-
-#### Internal: Char-Boundary Panic Bugs in Set-Op SQL Splitters
-
-- **`split_top_level_union_all`, `replace_top_level_union_with_union_all`, and
-  `split_top_level_set_op` panicked on multi-byte UTF-8 input.** All three
-  functions used `query[i..i+N].eq_ignore_ascii_case("KEYWORD")` to scan for
-  SQL keywords, which panics when the byte offset `i+N` falls inside a
-  multi-byte UTF-8 character (e.g. `ᐐEXCEPT`, `ࠀ𐀀`). Fixed by replacing
-  all such slices with the byte-level `bytes[i..i+N].eq_ignore_ascii_case(b"KEYWORD")`
-  equivalent. These paths are only reachable with non-ASCII SQL identifiers or
-  values; standard ASCII SQL was unaffected.
-
-### Changed
-
-#### Internal Code Quality: Integration Test Suite Hardening
-
-Completed a full hardening pass of the integration test suite, bringing all items in `PLAN_TEST_EVALS_INTEGRATION.md` to done:
-- **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
-- **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
-- **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles avoiding untestable seams.
-- **Catalog DDL drift detection** — Expanded `catalog_compat_tests.rs` with static DDL verification ensuring the generated catalog SQL maintains parity with expected columns in test mock states.
-- **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
-- Clippy `unusual_byte_groupings` lint warnings silenced across test and source
-  files to keep `just lint` clean.
-
-#### Internal Code Quality: TPC-H Test Suite Hardening
-
-Completed a comprehensive hardening pass of the TPC-H integration test suite:
-- **`TPCH_STRICT=1` enforcement** — The test harness now fails immediately if queries are unexpectedly skipped, ensuring regressions are caught early.
-- **Savepoint Isolation Testing** — Added nested transaction commit/rollback tests (`test_tpch_immediate_savepoint_rollback`) for `IMMEDIATE` mode to ensure proper snapshot isolation boundaries.
-- **Sustained Churn Validations** — Added `test_tpch_sustained_churn` to continuously run 10,000+ random CDC mutations and sequential refreshes to confirm absolute DVM stability.
-- **LEFT JOIN Correctness** — Re-enabled customer market-segment rotations in TPC-H RF3. Verified that the "column c_custkey does not exist" bug triggered by left-table target-key updates is officially resolved.
-- **DAG Chain Testing** — Expanded `test_tpch_dag_chain` into complex multi-level re-aggregations.
-
-
-#### Internal Code Quality: Comprehensive Unit Test Suite
-
-Completed a full hardening pass of the unit test suite, bringing all Priority 0/1/2/3 items to done:
-
-- **Execution-backed DVM operator tests** — 16 new test files covering every
-  operator path with real PostgreSQL execution via testcontainers: `semi_join`,
-  `anti_join`, `window`, `scalar_subquery`, `join` (inner, left, full, natural),
-  `outer_join`, `full_join`, nested 3-table chains, and aggregate families
-  (COUNT, SUM, AVG, MIN, MAX, STRING_AGG, MODE, JSON_OBJECT_AGG,
-  JSONB_OBJECT_AGG, JSONB_AGG, PERCENTILE_CONT, PERCENTILE_DISC,
-  multi-group mixed-family).
-- **macOS DVM test harness** — Added `scripts/run_dvm_integration_tests.sh`
-  and `just test-dvm`. Removed `#![cfg(not(target_os = "macos"))]` gates from
-  all 8 DVM test files so they run on macOS via the `pg_stub` preload mechanism.
-- **Property/fuzz tests (P2)** — 16 `proptest!` cases in the inline
-  `#[cfg(test)]` modules of `src/api.rs`, `src/dvm/mod.rs`, and
-  `src/wal_decoder.rs`, covering no-panic safety invariants for all private
-  SQL-scanner, set-op splitter, and WAL-decoder helpers against arbitrary
-  string inputs including multi-byte Unicode.
-- **Parser integration tests** — Backend-backed SQL-to-`OpTree` summary tests
-  via `cargo pgrx test` exercising CTE, window, scalar-subquery, and
-  recursive-CTE queries against a real PostgreSQL binary.
-- **Scheduler, refresh, CDC, and IVM seams** — Execution-backed unit seams for
-  `execute_differential_refresh`, scheduler job lifecycle, CDC trigger output,
-  and IVM keyed/keyless DML paths.
-- **DAG fix** — `topological_order()` no longer silently skips nodes trapped in
-  cycles; it now returns an error variant, detected and fixed by
-  property-based fuzz tests.
-- **Targeted P3 coverage (17 new tests)** — Completed all remaining
-  untested-file items:
-  - `src/dvm/row_id.rs`: cross-variant inequality, `Debug` for unit variants
-    (`CombineChildren`, `PassThrough`), empty-column edge cases, `Clone`
-    equality for data-carrying variants.
-  - `src/shmem.rs`: worker-token acquire/release cycle, over-release
-    saturation (counter never goes below zero), epoch monotonicity, and
-    single-budget mutex semantics.
-  - `src/config.rs`: `as_str()` round-trips for all three mode enums
-    (`UserTriggersMode`, `CdcTriggerMode`, `ParallelRefreshMode`), negative
-    megabyte threshold, case-insensitive `"ON"` parsing, and
-    normalize ↔ `as_str` consistency.
-
----
+### Under the Hood Code and Testing Enhancements
+- **Massive Testing Hardening**: We have fundamentally overhauled and upgraded how we test the system. Our internal test suite has been completely enhanced with tens of thousands of continuous automated checks ensuring query answers are perfect, no matter how complex the data joins or updates get.
+- **Performance Migrations**: Began adopting new tools (`cargo nextest`) to speed up how fast we can iterate and develop the software in the background.
 
 ## [0.7.0] — 2026-03-16
 
