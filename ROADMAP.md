@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-03-16
 > **Latest release:** 0.7.0 (2026-03-16)
-> **Current milestone:** v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening
+> **Current milestone:** v0.8.0 — pg_dump Support & Test Hardening
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -24,8 +24,8 @@ coverage, all in plain language.
 - [v0.5.0 — Row-Level Security & Operational Controls](#v050--row-level-security--operational-controls)
 - [v0.6.0 — Partitioning, Idempotent DDL, Edge Cases & Circular Dependency Foundation](#v060--partitioning-idempotent-ddl-edge-cases--circular-dependency-foundation)
 - [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
-- [v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening](#v080--connection-pooler-compatibility-pg_dump-support--test-hardening)
-- [v0.9.0 — Observability, Anomaly Detection & pg_dump Support](#v090--observability-anomaly-detection--pg_dump-support)
+- [v0.8.0 — pg_dump Support & Test Hardening](#v080--pg_dump-support--test-hardening)
+- [v0.9.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep](#v090--connection-pooler-compatibility-prometheus--grafana-observability-anomaly-detection--infrastructure-prep)
 - [v0.10.0 — Incremental Aggregate Maintenance](#v0100--incremental-aggregate-maintenance)
 - [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
 - [v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compatibility](#v0120--multi-source-delta-batching-cdc-research--pg-backward-compatibility)
@@ -1251,35 +1251,11 @@ convergence (zero net change) or `max_fixpoint_iterations` is exceeded.
 
 ---
 
-## v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening
+## v0.8.0 — pg_dump Support & Test Hardening
 
-**Goal:** Enable cloud-native PgBouncer transaction-mode deployments,
-complete the pg_dump round-trip story so stream tables survive
+**Goal:** Complete the pg_dump round-trip story so stream tables survive
 `pg_dump`/`pg_restore` cycles, and comprehensively harden the 
 E2E test suites with multiset invariants to mathematically enforce DVM correctness.
-
-### Connection Pooler Compatibility
-
-> **In plain terms:** PgBouncer is the most widely used PostgreSQL connection
-> pooler — it sits in front of the database and reuses connections across
-> many application threads. In its common "transaction mode" it hands a
-> different physical connection to each transaction, which breaks anything
-> that assumes the same connection persists between calls (session locks,
-> prepared statements). This work replaces all such session-scoped state in
-> pg_trickle so it works correctly in cloud deployments — Supabase, Railway,
-> Neon, and similar platforms that route through PgBouncer by default.
-
-pg_trickle uses session-level advisory locks and `PREPARE` statements that are
-incompatible with PgBouncer transaction-mode pooling. This section replaces all
-session-scoped state with transaction-scoped equivalents.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| PB1 | Replace `pg_advisory_lock()` with `pg_advisory_xact_lock()` across refresh, CDC, and scheduler coordination | 3–4d | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) G8.4 |
-| PB2 | Eliminate `PREPARE __pgt_merge_*` prepared statements (replace with inline or per-transaction SQL) | 3–4d | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) G8.4 |
-| PB3 | E2E validation against PgBouncer transaction-mode (Docker Compose with pooler sidecar) | 1–2d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
-
-> **PgBouncer compatibility subtotal: ~7–10 days**
 
 ### pg_dump / pg_restore Support
 
@@ -1317,23 +1293,44 @@ that re-links orphaned catalog entries on extension restore.
 
 > **Test evaluation subtotal: ~11-14 days (Mostly Completed)**
 
-> **v0.8.0 total: ~23–31 days**
+> **v0.8.0 total: ~16–21 days**
 
 **Exit criteria:**
 - [x] Test infrastructure hardened with exact mathematical multiset validation
 - [ ] Test harness migrated to `cargo-nextest` to fix speed and CI flake regressions
-- [ ] pg_trickle works correctly under PgBouncer transaction-mode pooling
 - [ ] pg_dump round-trip produces valid, restorable SQL for stream tables
 - [ ] Extension upgrade path tested (`0.7.0 → 0.8.0`)
 
 ---
 
-## v0.9.0 — Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
+## v0.9.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
 
-**Goal:** Ship ready-made Prometheus/Grafana monitoring so the product is
+**Goal:** Enable cloud-native PgBouncer transaction-mode deployments via an opt-in compatibility mode, ship ready-made Prometheus/Grafana monitoring so the product is
 externally visible and monitored; protect against anomalous change spikes
 with a configurable fuse; and complete the pre-1.0 packaging and
 deployment infrastructure.
+
+### Connection Pooler Compatibility
+
+> **In plain terms:** PgBouncer is the most widely used PostgreSQL connection
+> pooler — it sits in front of the database and reuses connections across
+> many application threads. In its common "transaction mode" it hands a
+> different physical connection to each transaction, which breaks anything
+> that assumes the same connection persists between calls (session locks,
+> prepared statements). This work introduces an opt-in compatibility mode for
+> pg_trickle so it works correctly in cloud deployments — Supabase, Railway,
+> Neon, and similar platforms that route through PgBouncer by default.
+
+pg_trickle uses session-level advisory locks and `PREPARE` statements that are
+incompatible with PgBouncer transaction-mode pooling. This section introduces an opt-in graceful degradation layer for connection pooler compatibility.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PB1 | Replace `pg_advisory_lock()` with catalog row-level locking (`FOR UPDATE SKIP LOCKED`) | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
+| PB2 | Add `pg_trickle.pooler_compatibility_mode` GUC to bypass `PREPARE` statements and skip `NOTIFY` | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
+| PB3 | E2E validation against PgBouncer transaction-mode (Docker Compose with pooler sidecar) | 1–2d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
+
+> **PgBouncer compatibility subtotal: ~7–10 days**
 
 ### Prometheus & Grafana Observability
 
@@ -1881,8 +1878,8 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.5.0 — RLS, Operational Controls + Perf Wave 1 (A-3a only) | ~51–97h | 296–443h | ✅ Released |
 | v0.6.0 — Partitioning, Idempotent DDL & Circular Dependency Foundation | ~35–50h | 331–493h | ✅ Released |
 | v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
-| v0.8.0 — Connection Pooler Compatibility, pg_dump Support & Test Hardening | ~23–31d | — | |
-| v0.9.0 — Observability, Anomaly Detection & pg_dump Support | ~33–37h | — | |
+| v0.8.0 — pg_dump Support & Test Hardening | ~16–21d | — | |
+| v0.9.0 — Connection Pooler Compatibility, Observability & Anomaly Detection | ~7–10d + ~22–26h | — | |
 | v0.10.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
 | v0.11.0 — Partitioned Stream Tables & Operational Scale (A-1, C-2, C-3) | ~9–13 wk | — | |
 | v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compat | ~13–19 wk | — | |
