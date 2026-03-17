@@ -1434,22 +1434,14 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 > exact scenario this feature targets. Do not merge B3-2 without passing property-based
 > correctness proofs. See PLAN_NEW_STUFF.md §B-3 risk analysis.
 
-> **Retraction candidate (B-3):** The spec contains a correctness bug at the design level
-> — the originally proposed `DISTINCT ON` deduplication produces silently wrong results
-> for diamond-flow delta paths. The corrected approach (Z-set weight aggregation) is
-> conceptually sound but requires formal correctness proofs or exhaustive property-based
-> tests before any code is written. The risk rating is **Very High**. Recommend moving
-> B-3 out of the numbered roadmap into a **post-1.0 research backlog** unless a formal
-> correctness proof for the weight-aggregation path exists prior to v0.12.0 scoping.
-
 > **Multi-source delta batching subtotal: ~5–8 weeks**
 
 ### Additional Query Engine Improvements
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
-| A7 | Skip-unchanged-column scanning in delta SQL (requires column-usage demand-propagation pass in DVM parser) | ~1–2d | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.4 |
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | ✅ Done | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
+| A7 | Skip-unchanged-column scanning in delta SQL (requires column-usage demand-propagation pass in DVM parser) | ~1–2d | ✅ Done | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.4 |
 
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 
