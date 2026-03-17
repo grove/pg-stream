@@ -151,18 +151,33 @@ async fn test_rls_on_stream_table_filters_reads() {
     )
     .await;
 
-    // Query as the restricted role — should only see tenant 10 rows
-    let filtered_count: i64 = db
-        .query_scalar(
-            "SELECT count(*) FROM public.rls_st_test \
-             WHERE current_user = current_user", // dummy where just to ensure query executes
-        )
+    // As superuser we still see all rows (superuser bypasses RLS by default)
+    let superuser_count: i64 = db
+        .query_scalar("SELECT count(*) FROM public.rls_st_test")
         .await;
-
-    // As superuser we still see all rows (superuser bypasses RLS)
     assert_eq!(
-        filtered_count, 4,
+        superuser_count, 4,
         "superuser should bypass RLS and see all rows"
+    );
+
+    // Actually query as the restricted role to verify RLS filtering works.
+    // SET LOCAL ROLE within a transaction applies for that transaction only.
+    let filtered_count: i64 = {
+        let mut txn = db.pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE rls_reader")
+            .execute(&mut *txn)
+            .await
+            .unwrap();
+        let cnt: i64 = sqlx::query_scalar("SELECT count(*) FROM public.rls_st_test")
+            .fetch_one(&mut *txn)
+            .await
+            .unwrap();
+        txn.rollback().await.unwrap();
+        cnt
+    };
+    assert_eq!(
+        filtered_count, 2,
+        "rls_reader should only see 2 rows where tenant_id = 10 (RLS policy enforced)"
     );
 
     // Verify the policy exists and is correctly configured

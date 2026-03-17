@@ -267,6 +267,10 @@ async fn test_wal_cdc_captures_insert() {
         3,
         "WAL CDC should capture all INSERTs"
     );
+
+    // Verify data correctness — not just count — through the WAL decoding pipeline
+    db.assert_st_matches_query("public.wal_ins_st", "SELECT id, val FROM wal_ins")
+        .await;
 }
 
 /// Test that UPDATEs are captured correctly through WAL-based CDC.
@@ -303,6 +307,10 @@ async fn test_wal_cdc_captures_update() {
         .query_scalar("SELECT val FROM public.wal_upd_st WHERE id = 1")
         .await;
     assert_eq!(val, "new", "UPDATE should be reflected via WAL CDC");
+
+    // Verify full multiset correctness — ensures no spurious rows or wrong values
+    db.assert_st_matches_query("public.wal_upd_st", "SELECT id, val FROM wal_upd")
+        .await;
 }
 
 /// Test that DELETEs are captured correctly through WAL-based CDC.
@@ -342,6 +350,10 @@ async fn test_wal_cdc_captures_delete() {
         1,
         "DELETE should be reflected via WAL CDC"
     );
+
+    // Verify data correctness — only the kept row should remain
+    db.assert_st_matches_query("public.wal_del_st", "SELECT id, val FROM wal_del")
+        .await;
 }
 
 // ── W1: Transition with trigger-only fallback ─────────────────────────
@@ -434,6 +446,10 @@ async fn test_wal_fallback_on_missing_slot() {
         .await;
     assert!(refreshed, "Trigger-based CDC should resume after fallback");
     assert_eq!(db.count("public.wal_fb_st").await, 2);
+
+    // Verify data correctness after fallback — no rows should be lost or duplicated
+    db.assert_st_matches_query("public.wal_fb_st", "SELECT id, val FROM wal_fb")
+        .await;
 }
 
 /// Cleanup on DROP: dropping a stream table in WAL mode should clean up

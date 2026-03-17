@@ -62,6 +62,10 @@ async fn test_partition_range_full_refresh() {
 
     let count: i64 = db.count("order_totals").await;
     assert_eq!(count, 3, "All rows from all partitions should be visible");
+
+    // Verify row-level correctness — partition pruning must not corrupt individual values
+    db.assert_st_matches_query("order_totals", "SELECT created_at, total FROM orders")
+        .await;
 }
 
 #[tokio::test]
@@ -138,6 +142,10 @@ async fn test_partition_range_differential_refresh() {
         count, 1,
         "Deleted row should be removed after differential refresh"
     );
+
+    // Verify full data correctness after all DML cycles across partitions
+    db.assert_st_matches_query("diff_order_st", "SELECT id, month, amount FROM diff_orders")
+        .await;
 }
 
 #[tokio::test]
@@ -176,6 +184,13 @@ async fn test_partition_list_source() {
 
     let count: i64 = db.count("event_st").await;
     assert_eq!(count, 2, "Both regions should appear in aggregated result");
+
+    // Verify aggregated result correctness across LIST partitions
+    db.assert_st_matches_query(
+        "event_st",
+        "SELECT region, count(*) as cnt FROM events GROUP BY region",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -216,6 +231,10 @@ async fn test_partition_hash_source() {
         count, 4,
         "All rows across hash partitions should be visible"
     );
+
+    // Verify data correctness — hash partitioning must not lose or corrupt rows
+    db.assert_st_matches_query("hash_st", "SELECT id, val FROM hash_data")
+        .await;
 }
 
 // ── PT2: ATTACH PARTITION detection ────────────────────────────────────
@@ -487,6 +506,13 @@ async fn test_partition_with_aggregation() {
         b_total, "300",
         "Category B total should be from H2 partition"
     );
+
+    // Verify full aggregated result correctness spanning both partitions
+    db.assert_st_matches_query(
+        "sales_agg_st",
+        "SELECT category, SUM(amount) AS total, COUNT(*) AS cnt FROM agg_sales GROUP BY category",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -551,4 +577,11 @@ async fn test_partition_differential_with_aggregation() {
         eng_total, "3500",
         "Aggregate should include row from second partition"
     );
+
+    // Verify full result matches the expected aggregation after cross-partition DML
+    db.assert_st_matches_query(
+        "diff_agg_st",
+        "SELECT dept, SUM(revenue) AS total FROM diff_agg GROUP BY dept",
+    )
+    .await;
 }

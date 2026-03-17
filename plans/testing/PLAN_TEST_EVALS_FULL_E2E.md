@@ -7,12 +7,82 @@
 
 ---
 
+## Implementation Status
+
+> **Updated:** 2026-03-17
+> **Branch:** `test-evals-full-e2e`
+
+### Completed Mitigations
+
+| Priority | Item | Status | Files Changed |
+|----------|------|--------|---------------|
+| P0-1 | WAL CDC data capture multiset assertions | ✅ Done | `e2e_wal_cdc_tests.rs` |
+| P0-2 | Partition tests multiset assertions | ✅ Done | `e2e_partition_tests.rs` |
+| P0-3 | DDL event post-reinit data assertions | ✅ Done | `e2e_ddl_event_tests.rs` |
+| P0-4 | Circular ST convergence data assertions | ✅ Done | `e2e_circular_tests.rs` |
+| P1-1 | Fix RLS superuser bypass in test | ✅ Done | `e2e_rls_tests.rs` |
+
+#### P0-1 Details (WAL CDC)
+Added `assert_st_matches_query` to four tests:
+- `test_wal_cdc_captures_insert` — verifies all inserted rows decoded correctly
+- `test_wal_cdc_captures_update` — verifies update reflected via WAL pipeline
+- `test_wal_cdc_captures_delete` — verifies only kept rows remain
+- `test_wal_fallback_on_missing_slot` — verifies no data loss after fallback
+
+#### P0-2 Details (Partitions)
+Added `assert_st_matches_query` to six tests:
+- `test_partition_range_full_refresh` — row-level correctness for RANGE + FULL
+- `test_partition_range_differential_refresh` — correctness after I/U/D across partitions
+- `test_partition_list_source` — aggregated result correctness for LIST partition
+- `test_partition_hash_source` — no row loss/corruption for HASH partition
+- `test_partition_with_aggregation` — full GROUP BY result over both partitions
+- `test_partition_differential_with_aggregation` — GROUP BY result after cross-partition INSERT
+
+#### P0-3 Details (DDL Events)
+Added post-reinit data assertions to five tests:
+- `test_function_change_marks_st_for_reinit` — refreshes after replacement, verifies new function body applies
+- `test_add_column_on_source_st_still_functional` — multiset after ADD COLUMN refresh
+- `test_add_column_unused_st_survives_refresh` — multiset verifies unused column excluded
+- `test_drop_unused_column_st_survives` — multiset after DROP COLUMN refresh
+- `test_alter_column_type_triggers_reinit` — refreshes after type change, verifies correct data
+
+#### P0-4 Details (Circular)
+Added to `test_circular_monotone_cycle_converges`:
+- Row count assertion: ≥6 pairs for transitive closure of 3-node chain
+- Existence assertion: pair `(1,4)` must exist — requires 2+ fixpoint iterations
+
+#### P1-1 Details (RLS)
+Fixed `test_rls_on_stream_table_filters_reads`:
+- Uses `db.pool.begin()` + `SET LOCAL ROLE rls_reader` in a transaction
+- Asserts `count = 2` (only tenant_id=10 rows visible) as restricted role
+- Existing superuser assertion `count = 4` retained
+
+### Remaining Work
+
+| Priority | Item | Status |
+|----------|------|--------|
+| P1-2 | Add multiset to append-only fallback tests | Not started |
+| P1-3 | Add multiset to cascade regression tests 3 and 6 | Not started |
+| P1-4 | Add multiset to bootstrap gating refresh tests 12 and 17 | Not started |
+| P2-1 | Add smoke correctness check to benchmarks (32 tests) | Not started |
+| P2-2 | Add ALTER QUERY + DML cycle tests | Not started |
+| P2-3 | Add upgrade chain data validation | Not started |
+| P2-4 | Add non-convergence test with guaranteed divergence | Not started |
+| P3-1 | Consolidate cascade value checks to multiset | Not started |
+| P3-2 | Add DELETE/UPDATE to bootstrap gating tests | Not started |
+| P3-3 | Standardise bgworker test assertions | Not started |
+
+---
+
 ## Table of Contents
 
-1. [Executive Summary](#executive-summary)
-2. [Test Infrastructure](#test-infrastructure)
-3. [Per-File Analysis](#per-file-analysis)
-4. [Cross-Cutting Findings](#cross-cutting-findings)
+1. [Implementation Status](#implementation-status)
+2. [Executive Summary](#executive-summary)
+3. [Test Infrastructure](#test-infrastructure)
+4. [Per-File Analysis](#per-file-analysis)
+5. [Cross-Cutting Findings](#cross-cutting-findings)
+6. [Priority Mitigations](#priority-mitigations)
+7. [Appendix: Coverage Matrix](#appendix-coverage-matrix)
 5. [Priority Mitigations](#priority-mitigations)
 6. [Appendix: Coverage Matrix](#appendix-coverage-matrix)
 

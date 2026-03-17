@@ -184,6 +184,28 @@ async fn test_circular_monotone_cycle_converges() {
         scc_count >= 1,
         "pgt_scc_status() should report at least 1 SCC"
     );
+
+    // Verify data correctness: edges (1,2),(2,3),(3,4) → transitive closure has 6 pairs.
+    // At minimum the pair (1,4) requires 2+ fixpoint iterations, proving real convergence.
+    let count_a: i64 = db.count("cyc_reach_a").await;
+    assert!(
+        count_a >= 6,
+        "cyc_reach_a should contain ≥6 pairs (full transitive closure), got {count_a}"
+    );
+    let has_transitive_a: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM cyc_reach_a WHERE src = 1 AND dst = 4)")
+        .await;
+    assert!(
+        has_transitive_a,
+        "cyc_reach_a must contain transitive pair (1→4), proving multi-hop fixpoint convergence"
+    );
+    let has_transitive_b: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM cyc_reach_b WHERE src = 1 AND dst = 4)")
+        .await;
+    assert!(
+        has_transitive_b,
+        "cyc_reach_b must contain transitive pair (1→4), proving multi-hop fixpoint convergence"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
