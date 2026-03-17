@@ -214,6 +214,13 @@ async fn test_st_on_st_cascade_propagates_insert() {
         .query_scalar("SELECT total_amount::text FROM order_report WHERE region = 'West'")
         .await;
     assert_eq!(west_amount, "300.00", "West should be unaffected");
+
+    // Verify row-level correctness of the cascaded state
+    db.assert_st_matches_query(
+        "order_report",
+        "SELECT region, total_amount FROM order_summary WHERE order_count > 0",
+    )
+    .await;
 }
 
 /// Regression: DELETE on a base table cascades through ST-on-ST chain.
@@ -743,6 +750,13 @@ async fn test_three_layer_cascade_update_propagates() {
             .await
             .unwrap();
     assert_eq!(cats, vec!["X", "Y"]);
+
+    // Verify row-level correctness of the full 3-layer cascade
+    db.assert_st_matches_query(
+        "premium_categories",
+        "SELECT category, total FROM prod_labels WHERE tier = 'premium'",
+    )
+    .await;
 }
 
 // ── Test 6: Dependencies catalog for ST-on-ST ───────────────────────────────

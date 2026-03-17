@@ -480,6 +480,10 @@ async fn test_upgrade_chain_stream_tables_survive() {
         .await;
     db.refresh_st("upgrade_st").await;
     assert_eq!(db.count("public.upgrade_st").await, 3);
+
+    // Verify data correctness: ST must exactly match source after upgrade + refresh
+    db.assert_st_matches_query("public.upgrade_st", "SELECT id, name FROM upgrade_src")
+        .await;
 }
 
 // ══════════════════════════════════════════════════════════════════════

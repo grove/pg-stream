@@ -359,21 +359,27 @@ async fn test_manual_refresh_works_through_full_lifecycle() {
     let c1: i64 = db.count("public.lc_man_st").await;
     assert_eq!(c1, 1, "manual refresh while gated should work");
 
-    // Ungate → insert → manual refresh.
+    // Ungate → insert/update → manual refresh.
     db.execute("SELECT pgtrickle.ungate_source('lc_man_src')")
         .await;
     db.execute("INSERT INTO lc_man_src VALUES (2, 'b')").await;
+    db.execute("UPDATE lc_man_src SET val = 'b_mod' WHERE id = 2")
+        .await;
     db.refresh_st("lc_man_st").await;
     let c2: i64 = db.count("public.lc_man_st").await;
     assert_eq!(c2, 2, "manual refresh after ungate should work");
 
-    // Re-gate → insert → manual refresh still works.
+    // Re-gate → insert/delete → manual refresh still works.
     db.execute("SELECT pgtrickle.gate_source('lc_man_src')")
         .await;
     db.execute("INSERT INTO lc_man_src VALUES (3, 'c')").await;
+    db.execute("DELETE FROM lc_man_src WHERE id = 1").await;
     db.refresh_st("lc_man_st").await;
     let c3: i64 = db.count("public.lc_man_st").await;
-    assert_eq!(c3, 3, "manual refresh after re-gate should work");
+    assert_eq!(
+        c3, 2,
+        "manual refresh after re-gate should work (1 del, 1 ins)"
+    );
 
     // Verify full data correctness at the end of the gate lifecycle
     db.assert_st_matches_query("public.lc_man_st", "SELECT id, val FROM lc_man_src")

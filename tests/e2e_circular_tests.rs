@@ -440,47 +440,38 @@ async fn test_circular_nonconvergence_error_status() {
         "pg_trickle scheduler did not appear within 90s"
     );
 
-    // Source data that ensures the cycle generates new rows each iteration
-    db.execute(
-        "CREATE TABLE cyc_nc_edges (src INT NOT NULL, dst INT NOT NULL, \
-         PRIMARY KEY (src, dst))",
-    )
-    .await;
-    db.execute("INSERT INTO cyc_nc_edges VALUES (1,2), (2,3), (3,1)")
+    // Source data that ensures the cycle generates new rows each iteration uniformly.
+    // A monotonically increasing counter guarantees non-convergence.
+    db.execute("CREATE TABLE cyc_nc_seed (val INT PRIMARY KEY)")
         .await;
+    db.execute("INSERT INTO cyc_nc_seed VALUES (1)").await;
 
     // Create both STs with non-cyclic initial queries to avoid forward-reference
     // validation failures, then ALTER them into a cycle.
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_nc_a', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e$$, \
+         $$SELECT val FROM cyc_nc_seed$$, \
          '1s', 'DIFFERENTIAL', false)",
     )
     .await;
     db.execute(
         "SELECT pgtrickle.create_stream_table('cyc_nc_b', \
-         $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e$$, \
+         $$SELECT val FROM cyc_nc_seed$$, \
          '1s', 'DIFFERENTIAL', false)",
     )
     .await;
 
-    // Transitive closure cycle (needs multiple iterations for 3-node graph)
+    // Monotonically increasing cycle: A adds 1 to B, B reads from A
     db.execute(
         "SELECT pgtrickle.alter_stream_table('cyc_nc_a', \
-         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
+         query => $$SELECT val FROM cyc_nc_seed \
            UNION ALL \
-           SELECT DISTINCT e.src, b.dst \
-           FROM cyc_nc_edges e \
-           INNER JOIN cyc_nc_b b ON e.dst = b.src$$)",
+           SELECT val + 1 FROM cyc_nc_b$$)",
     )
     .await;
     db.execute(
         "SELECT pgtrickle.alter_stream_table('cyc_nc_b', \
-         query => $$SELECT DISTINCT e.src, e.dst FROM cyc_nc_edges e \
-           UNION ALL \
-           SELECT DISTINCT a.src, e.dst \
-           FROM cyc_nc_a a \
-           INNER JOIN cyc_nc_edges e ON a.dst = e.src$$)",
+         query => $$SELECT val FROM cyc_nc_a$$)",
     )
     .await;
 
@@ -488,8 +479,8 @@ async fn test_circular_nonconvergence_error_status() {
     // With max_fixpoint_iterations=1, it should fail to converge and mark ERROR.
     let got_error = wait_for_status(&db, "cyc_nc_a", "ERROR", Duration::from_secs(60)).await;
 
-    // Note: this may not trigger if the cycle happens to converge in 1 iteration
-    // (e.g. empty initial state converges trivially). The test is best-effort.
+    // Note: Since each iteration generates new rows unconditionally, it is guaranteed
+    // to never converge, making it a reliable test.
     if got_error {
         let status_b: String = db
             .query_scalar(
