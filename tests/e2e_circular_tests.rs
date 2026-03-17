@@ -216,8 +216,14 @@ async fn test_circular_monotone_cycle_converges() {
 /// should be rejected even when allow_circular=true.
 #[tokio::test]
 async fn test_circular_nonmonotone_cycle_rejected() {
-    let db = E2eDb::new().await.with_extension().await;
-    db.execute("SET pg_trickle.allow_circular = true").await;
+    let db = E2eDb::new_on_postgres_db().await.with_extension().await;
+    // ALTER SYSTEM SET + reload so every pool connection sees allow_circular=true.
+    // A session-level SET is unreliable with sqlx PgPool because subsequent
+    // queries may arrive on a different connection where the GUC is still false,
+    // causing the generic CycleDetected error before the monotonicity check.
+    db.execute("ALTER SYSTEM SET pg_trickle.allow_circular = true")
+        .await;
+    db.execute("SELECT pg_reload_conf()").await;
 
     db.execute("CREATE TABLE cyc_nm_src (id INT PRIMARY KEY, grp TEXT, val INT NOT NULL)")
         .await;

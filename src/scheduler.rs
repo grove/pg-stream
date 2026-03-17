@@ -2298,6 +2298,20 @@ fn has_stream_table_source_changes(st: &StreamTableMeta) -> bool {
 
 // ── Fixpoint Iteration for Cyclic SCCs (CYC-5) ───────────────────────────
 
+/// Query the current number of rows in a stream table directly from the DB.
+///
+/// Used by [`iterate_to_fixpoint`] to compute per-pass deltas for convergence
+/// detection without relying on CDC change buffers.
+fn get_st_row_count(pgt_id: i64) -> Option<i64> {
+    let st = load_st_by_id(pgt_id)?;
+    let sql = format!(
+        "SELECT count(*)::bigint FROM \"{}\".\"{}\"",
+        st.pgt_schema.replace('"', "\"\""),
+        st.pgt_name.replace('"', "\"\""),
+    );
+    Spi::get_one::<i64>(&sql).ok().flatten()
+}
+
 /// Iterate a cyclic SCC to a fixed point.
 ///
 /// Refreshes all members of the SCC repeatedly until convergence (zero net
@@ -2362,6 +2376,19 @@ fn iterate_to_fixpoint(
         }
     }
 
+    // Seed per-member row counts from the current DB state.
+    //
+    // Convergence is detected by comparing each member's row count before
+    // and after each pass.  We cannot use CDC change buffers here because
+    // SCC peers are stream tables — they never write to the
+    // `pgtrickle_changes.*` buffers, so DIFFERENTIAL refresh would find
+    // nothing to merge and silently skip re-evaluation on every pass after
+    // the first, leaving the fixpoint stuck at the seed values.
+    let mut prev_row_counts: HashMap<i64, i64> = member_ids
+        .iter()
+        .map(|&id| (id, get_st_row_count(id).unwrap_or(0)))
+        .collect();
+
     for iteration in 0..max_iter {
         let subtxn = SubTransaction::begin();
         let mut total_changes: i64 = 0;
@@ -2390,36 +2417,28 @@ fn iterate_to_fixpoint(
                 continue;
             }
 
-            // In a fixpoint loop, every iteration must use DIFFERENTIAL.
-            // On the first iteration (or if not yet populated), use FULL to seed.
-            let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
-            let action = if !st.is_populated || iteration == 0 {
-                if has_changes || !st.is_populated {
-                    refresh::determine_refresh_action(&st, has_changes)
-                } else {
-                    RefreshAction::NoData
-                }
-            } else {
-                // Subsequent iterations: always DIFFERENTIAL for convergence.
-                if has_changes || has_stream_table_source_changes(&st) {
-                    RefreshAction::Differential
-                } else {
-                    RefreshAction::NoData
-                }
-            };
-
-            if action == RefreshAction::NoData && iteration > 0 {
-                // Member has converged — no upstream changes.
-                continue;
-            }
+            // Always use FULL refresh in the fixpoint loop.
+            //
+            // SCC peers are stream tables with no CDC change buffers.
+            // DIFFERENTIAL refresh short-circuits when the change-buffer
+            // query returns no rows — which is always the case inside a
+            // cyclic SCC where the only upstream changes come from sibling
+            // stream tables.  FULL refresh re-executes the defining query
+            // against the current DB state each pass, which is the correct
+            // semantics for monotone fixpoint iteration.
+            let action = RefreshAction::Full;
 
             let result = execute_scheduled_refresh(&st, action, tick_watermark);
 
             match result {
                 RefreshOutcome::Success => {
-                    // Read back the rows from the most recent refresh record.
-                    let (ins, del) = last_refresh_row_counts(pgt_id);
-                    total_changes += ins + del;
+                    // Convergence metric: net row-count change vs previous pass.
+                    // For monotone queries (the only kind admitted into cyclic
+                    // SCCs) rows only accumulate, so abs() is always the delta.
+                    let new_count = get_st_row_count(pgt_id).unwrap_or(0);
+                    let old_count = *prev_row_counts.get(&pgt_id).unwrap_or(&0);
+                    total_changes += (new_count - old_count).abs();
+                    prev_row_counts.insert(pgt_id, new_count);
 
                     let retry = retry_states.entry(pgt_id).or_default();
                     retry.reset();
