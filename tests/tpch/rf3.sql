@@ -5,11 +5,21 @@
 -- - Price changes (non-key, affects SUM/AVG aggregates)
 -- - Quantity changes (affects filter predicates like l_quantity < threshold)
 --
--- NOTE: customer UPDATE (market-segment rotation) is intentionally omitted.
--- pg_trickle has a known DVM bug where refreshing a LEFT JOIN stream table
--- after an UPDATE to the left-joined table generates invalid SQL on the
--- second+ refresh cycle ("column c_custkey does not exist"). This affects
--- Q13 only. Tracked separately. Do not re-add until the LEFT JOIN DVM is fixed.
+-- Move some customers to a different market segment (GROUP BY key change)
+UPDATE customer
+SET c_mktsegment = CASE c_mktsegment
+        WHEN 'AUTOMOBILE' THEN 'BUILDING'
+        WHEN 'BUILDING'   THEN 'FURNITURE'
+        WHEN 'FURNITURE'  THEN 'HOUSEHOLD'
+        WHEN 'HOUSEHOLD'  THEN 'MACHINERY'
+        WHEN 'MACHINERY'  THEN 'AUTOMOBILE'
+        ELSE 'BUILDING'
+    END
+WHERE c_custkey IN (
+    SELECT c_custkey FROM customer
+    ORDER BY c_custkey DESC
+    LIMIT GREATEST(__RF_COUNT__ / 2, 1)
+);
 
 -- Update extended price on a batch of lineitems (non-key column)
 UPDATE lineitem

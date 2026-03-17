@@ -682,7 +682,7 @@ focused E2E tests, not TPC-H.
 | # | Priority | Action | Reason deferred |
 |---|----------|--------|-----------------|
 | 12 | P2 | Add performance regression threshold (3× baseline) | Requires reference baseline file |
-| 17 | P3 | Investigate customer UPDATE DVM bug (LEFT JOIN delta SQL) | Large; root cause unknown |
+| 17 | P3 | Investigate customer UPDATE DVM bug (LEFT JOIN delta SQL) | ✅ Done | Confirmed bug was fixed in prior engine updates. Re-enabled `customer` updates in `rf3.sql` directly. `test_tpch_differential_correctness` verifies successful delta evaluation without "column does not exist" exceptions. |
 
 ---
 
@@ -723,7 +723,7 @@ focused E2E tests, not TPC-H.
 | 14 | Make DAG chain level-1 more complex (re-aggregation or join) | Stronger DAG propagation test | Medium | ✅ Done |
 | 15 | Add `TPCH_STRICT=1` env var that hard-fails on any skip | Enables strict CI mode | Small | ✅ Done |
 | 16 | Fix `buf≈-2` display with `GREATEST(reltuples, 0)` | Cosmetic fix | Trivial | ✅ Done |
-| 17 | Investigate customer UPDATE DVM bug (LEFT JOIN delta SQL) | Enables RF3 customer UPDATEs | Large | ⏳ Deferred |
+| 17 | Investigate customer UPDATE DVM bug (LEFT JOIN delta SQL) | Enables RF3 customer UPDATEs | Large | ✅ Done |
 
 ---
 
