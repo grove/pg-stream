@@ -30,6 +30,17 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ### Added
 
+#### Full E2E Test Suite Multiset Evaluations
+
+The E2E test suite has been hardened globally with rigorous multiset assertions
+(`assert_st_matches_query`) to ensure exact data correctness across all test boundaries (P0-P3 evaluations).
+
+- Integrated multiset evaluations into cascade regression, upgrade continuity,
+  bootstrap gating, and background worker test suites.
+- Expanded cyclic DML tests with deterministic multiset non-convergence and `ALTER QUERY` lifecycle validations.
+- Added inline multiset data verification to the performance and benchmark suite
+  during high-load matrix runs.
+
 #### Comprehensive property-based and topological invariant tests
 
 The test suite has been significantly expanded with property-based invariants
