@@ -10,8 +10,8 @@
 
 ## Implementation Status
 
-> **Updated:** 2026-03-17 (pass 2)
-> **Status:** All P0, P1, and most P2/P3 items implemented. P2-4, P3-1, P3-3 remain.
+> **Updated:** 2026-03-17 (pass 3)
+> **Status:** All items complete. All P0–P3 items implemented or intentionally resolved.
 
 | Priority | Item | Status | Notes |
 |----------|------|--------|-------|
@@ -25,10 +25,10 @@
 | P2-1 | DDL Drift Detection Test | ✅ DONE | `test_catalog_ddl_no_phantom_columns` + `test_catalog_ddl_no_phantom_tables` in `catalog_compat_tests.rs`; pure-Rust via `include_str!` |
 | P2-2 | Multi-Table Join Chain Unit Tests | ✅ DONE | `(A LEFT JOIN B) INNER JOIN C`, `A INNER JOIN (B INNER JOIN C)` in `join.rs`; `A FULL JOIN (B SEMI JOIN C)`, `(A FULL JOIN B) INNER JOIN C` in `full_join.rs` |
 | P2-3 | Scheduler Job Lifecycle Integration Test | ✅ DONE | `pgt_scheduler_jobs` added to `CATALOG_DDL`; `test_scheduler_job_lifecycle_queued_to_succeeded` + `test_scheduler_job_lifecycle_retryable_failure` in `workflow_tests.rs` |
-| P2-4 | Extend Property Tests to DVM Operators | ❌ TODO | Proptest for join/aggregate SQL output — complex, deferred |
-| P3-1 | Remove or Fold Smoke Tests | ❌ TODO | Low priority |
+| P2-4 | Extend Property Tests to DVM Operators | ✅ DONE | `proptest!` blocks added to `join.rs`, `semi_join.rs`, `anti_join.rs`; 6 new property tests: UNION ALL invariant, output-col-count, left-col-equality, EXISTS/NOT EXISTS presence |
+| P3-1 | Remove or Fold Smoke Tests | ✅ DONE | Kept as first-to-fail diagnostics; updated module doc to explain the intentional redundancy and diagnostic value; test names standardized |
 | P3-2 | Add Workflow Test for ST Drop Cascade | ✅ DONE | `test_workflow_st_drop_cascade` in `workflow_tests.rs`; verifies CASCADE on deps, storage table drop |
-| P3-3 | Standardize Test Naming | ❌ TODO | Style consistency across all files |
+| P3-3 | Standardize Test Naming | ✅ DONE | `workflow_tests.rs` older tests renamed to `test_workflow_*` convention; `smoke_tests.rs` renamed to `test_infra_*` convention |
 
 ---
 

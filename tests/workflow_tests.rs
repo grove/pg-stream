@@ -11,7 +11,7 @@ use common::TestDb;
 // ── Full Refresh Workflow ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_full_refresh_workflow() {
+async fn test_workflow_full_refresh_lifecycle() {
     let db = TestDb::with_catalog().await;
 
     // Create source table with data
@@ -108,7 +108,7 @@ async fn test_full_refresh_workflow() {
 // ── Differential Data Changes ───────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_source_data_changes_tracked() {
+async fn test_workflow_cdc_changes_tracked_in_buffer() {
     let db = TestDb::with_catalog().await;
 
     // Create source and ST
@@ -197,7 +197,7 @@ async fn test_source_data_changes_tracked() {
 // ── DAG-like Dependency Chain ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn test_chained_stream_tables() {
+async fn test_workflow_chained_sts_dependency_dag() {
     let db = TestDb::with_catalog().await;
 
     // Base table -> ST1 -> ST2 (chained)
@@ -274,7 +274,7 @@ async fn test_chained_stream_tables() {
 // ── Error Handling and Suspension ──────────────────────────────────────────
 
 #[tokio::test]
-async fn test_error_escalation_and_suspension() {
+async fn test_workflow_error_escalation_suspends_st() {
     let db = TestDb::with_catalog().await;
 
     db.execute("CREATE TABLE err_src (id INT)").await;

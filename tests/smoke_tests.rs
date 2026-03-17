@@ -1,14 +1,21 @@
-//! Integration tests for basic PostgreSQL connectivity via Testcontainers.
+//! Infrastructure smoke tests for PostgreSQL / Testcontainers connectivity.
 //!
-//! These tests verify the Testcontainers setup works correctly with
-//! PostgreSQL 18.3 before running more complex extension tests.
+//! These tests are intentionally kept as a separate file rather than folded
+//! into other suites. They serve as **first-to-fail diagnostics**: if Docker
+//! is unavailable, the container image is missing, or network routing is
+//! broken, these three tests fail immediately with clear messages before the
+//! more complex test suites even attempt to start.
+//!
+//! They are redundant with respect to data-correctness coverage (every other
+//! integration test that spins up a container proves the same infrastructure
+//! works) but their diagnostic speed and clarity justify their existence.
 
 mod common;
 
 use common::TestDb;
 
 #[tokio::test]
-async fn test_container_starts_and_connects() {
+async fn test_infra_container_connects_to_postgres() {
     let db = TestDb::new().await;
 
     // Verify we can execute a basic query
@@ -21,7 +28,7 @@ async fn test_container_starts_and_connects() {
 }
 
 #[tokio::test]
-async fn test_create_table_and_insert() {
+async fn test_infra_basic_crud_works() {
     let db = TestDb::new().await;
 
     db.execute("CREATE TABLE test_orders (id INT PRIMARY KEY, amount NUMERIC)")
@@ -34,7 +41,7 @@ async fn test_create_table_and_insert() {
 }
 
 #[tokio::test]
-async fn test_schemas_can_be_created() {
+async fn test_infra_schema_creation_works() {
     let db = TestDb::new().await;
 
     db.execute("CREATE SCHEMA IF NOT EXISTS test_schema").await;
