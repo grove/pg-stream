@@ -91,22 +91,22 @@ build-e2e-image:
 # Run E2E tests (rebuilds Docker image first)
 [group: "test"]
 test-e2e: build-e2e-image
-    ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
+    ./scripts/run_e2e_tests.sh --test 'e2e_*' 
 
 # Run E2E tests, skip Docker image rebuild
 [group: "test"]
 test-e2e-fast:
-    ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
+    ./scripts/run_e2e_tests.sh --test 'e2e_*' 
 
 # Run E2E tests with parallel refresh mode enabled (rebuilds Docker image first)
 [group: "test"]
 test-e2e-parallel: build-e2e-image
-    PGT_PARALLEL_MODE=on ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
+    PGT_PARALLEL_MODE=on ./scripts/run_e2e_tests.sh --test 'e2e_*' 
 
 # Run E2E tests with parallel refresh mode enabled, skip Docker image rebuild
 [group: "test"]
 test-e2e-parallel-fast:
-    PGT_PARALLEL_MODE=on ./scripts/run_e2e_tests.sh --test 'e2e_*' -- --test-threads=1
+    PGT_PARALLEL_MODE=on ./scripts/run_e2e_tests.sh --test 'e2e_*' 
 
 # Package the extension for light-E2E tests (cargo pgrx package)
 [group: "test"]
@@ -138,19 +138,19 @@ test-all: test-unit test-integration test-e2e test-pgrx
 # Run multi-level DAG pipeline tests (rebuilds Docker image)
 [group: "test"]
 test-pipeline: build-e2e-image
-    ./scripts/run_e2e_tests.sh --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_pipeline_dag_tests --no-capture
 
 # Run pipeline DAG tests, skip Docker image rebuild
 [group: "test"]
 test-pipeline-fast:
-    ./scripts/run_e2e_tests.sh --test e2e_pipeline_dag_tests -- --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_pipeline_dag_tests --no-capture
 
 # ── TPC-H Tests ───────────────────────────────────────────────────────────
 
 # Run TPC-H correctness tests at SF-0.01 (~2 min, rebuilds Docker image)
 [group: "tpch"]
 test-tpch: build-e2e-image
-    ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture
 
 # Run TPC-H tests, skip Docker image rebuild
 # TPCH_CYCLES=2     — 2 mutations cycles per query (33% fewer than default 3)
@@ -158,12 +158,12 @@ test-tpch: build-e2e-image
 # --skip test_tpch_performance_comparison — benchmarking only, covered by differential_correctness
 [group: "tpch"]
 test-tpch-fast:
-    TPCH_CYCLES=2 TPCH_CHURN_CYCLES=20 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture --skip test_tpch_performance_comparison
+    TPCH_CYCLES=2 TPCH_CHURN_CYCLES=20 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture -E 'not test(test_tpch_performance_comparison)'
 
 # Run TPC-H tests at larger scale: SF-0.1 (~5 min, rebuilds Docker image)
 [group: "tpch"]
 test-tpch-large: build-e2e-image
-    TPCH_SCALE=0.1 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --test-threads=1 --nocapture
+    TPCH_SCALE=0.1 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture
 
 # ── dbt Tests ─────────────────────────────────────────────────────────────
 
@@ -244,7 +244,7 @@ build-upgrade-image from="0.7.0" to="0.8.0": build-e2e-image
 test-upgrade from="0.7.0" to="0.8.0": (build-upgrade-image from to)
     PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
     PGS_UPGRADE_FROM={{from}} PGS_UPGRADE_TO={{to}} \
-        ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture
+        ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests --run-ignored all --no-capture
 
 # Run upgrade E2E tests for every adjacent version pair and the full chain
 # (builds the base E2E image once, then an upgrade image per pair)
@@ -285,7 +285,7 @@ test-upgrade-all: build-e2e-image
         ./tests/build_e2e_upgrade_image.sh "$from" "$to"
         if ! PGS_E2E_IMAGE=pg_trickle_upgrade_e2e:latest \
              PGS_UPGRADE_FROM="$from" PGS_UPGRADE_TO="$to" \
-             ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests -- --ignored --test-threads=1 --nocapture; then
+             ./scripts/run_e2e_tests.sh --test e2e_upgrade_tests --run-ignored all --no-capture; then
             echo "FAILED: upgrade ${from} → ${to}"
             failed=1
         fi
@@ -313,12 +313,12 @@ bench:
 # Run database-level E2E benchmark suite (rebuilds Docker image)
 [group: "bench"]
 test-bench-e2e: build-e2e-image
-    ./scripts/run_e2e_tests.sh --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_bench_tests --features pg18 --run-ignored all --no-capture
 
 # Run E2E benchmarks, skip Docker image rebuild
 [group: "bench"]
 test-bench-e2e-fast:
-    ./scripts/run_e2e_tests.sh --test e2e_bench_tests --features pg18 -- --ignored --test-threads=1 --nocapture
+    ./scripts/run_e2e_tests.sh --test e2e_bench_tests --features pg18 --run-ignored all --no-capture
 
 # Run diff-operator benchmarks only
 [group: "bench"]
