@@ -1,0 +1,30 @@
+name: PGXN Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  pgxn:
+    name: Publish to PGXN
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+        
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install pgxnclient
+        run: pip install pgxnclient
+
+      - name: Package and upload to PGXN
+        run: just pgxn-publish
+        env:
+          PGXN_USERNAME: ${{ secrets.PGXN_USERNAME }}
+          PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}

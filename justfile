@@ -393,6 +393,39 @@ run:
 package:
     cargo pgrx package --features pg{{pg}}
 
+# ── Release ───────────────────────────────────────────────────────────────
+
+# Package the extension into a zip archive and upload it to PGXN
+[group: "release"]
+pgxn-publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    
+    VERSION=$(jq -r '.version' META.json)
+    if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+        echo "Error: Could not read version from META.json"
+        exit 1
+    fi
+    
+    ARCHIVE="pg_trickle-${VERSION}.zip"
+    echo "Creating PGXN archive: $ARCHIVE"
+    git archive --format zip --prefix="pg_trickle-${VERSION}/" -o "$ARCHIVE" HEAD
+    
+    echo "Verifying archive contents..."
+    if ! unzip -l "$ARCHIVE" | grep -q "META.json"; then
+        echo "Error: META.json not found in the archive."
+        exit 1
+    fi
+    
+    if ! command -v pgxn >/dev/null 2>&1; then
+        echo "Error: 'pgxn' command not found. Please install pgxn-utils."
+        exit 1
+    fi
+    
+    echo "Uploading to PGXN..."
+    pgxn upload "$ARCHIVE"
+    echo "Successfully uploaded pg_trickle-$VERSION to PGXN!"
+
 # ── Docker ────────────────────────────────────────────────────────────────
 
 # Build the CNPG extension image (scratch-based, for Image Volumes)
