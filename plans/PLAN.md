@@ -2,8 +2,50 @@
 
 > **Implementation Status (v0.9.0 Cycle)**
 > Most core architectural phases (Phases 1-12) are now implemented. The remaining critical features necessary to fully close out the v0.9.0 milestone are:
-> - **F15**: Selective CDC Column Capture (Phase 6 Integration)
-> - **F40**: Extension Upgrade Migrations & DB Schema Stability (in progress) (Phase 7 & 12 Integration)
+> - **F15**: Selective CDC Column Capture (Phase 6 Integration) - *Core code complete; integration test + monitoring view remain*
+> - **F40**: Extension Upgrade Migrations & DB Schema Stability - *Code complete, awaiting final package*
+
+### F15 Status Update (Selective CDC Column Capture)
+
+**Goal:** Optimize I/O by only tracking columns in the CDC layer which are actually referenced in the query lineage of dependent Stream Tables.
+
+**Implemented for v0.9.0:**
+
+The full column-selection pipeline is now in place end-to-end:
+
+1. **Catalog helper** — `StDependency::union_referenced_columns_for_source(source_oid)` in `src/catalog.rs`:
+   - Queries `pgt_dependencies.columns_used` for all STs that share the given base-table source.
+   - Returns the union as a sorted `Vec<String>`, or `None` when any ST has `columns_used = NULL` (meaning "all columns needed").
+
+2. **CDC resolver** — `cdc::resolve_referenced_column_defs(source_oid)` in `src/cdc.rs`:
+   - Calls the catalog helper to get the union of required columns.
+   - Always adds PK columns (required for `pk_hash` correctness).
+   - Filters `resolve_source_column_defs` to the keep-set, preserving ordinal order.
+   - Falls back to full capture on `None`, empty union, or if the filter would drop all columns.
+
+3. **Monitoring helper** — `cdc::is_selective_capture_active(source_oid)` in `src/cdc.rs`:
+   - Returns `true` when the referenced column set is a strict subset of the full column list.
+
+4. **Wired into creation path** — `setup_cdc_for_source` in `src/api.rs`:
+   - Replaced `resolve_source_column_defs` with `resolve_referenced_column_defs`.
+   - At ST creation time, the dependency rows are already written, so the union query finds them.
+
+5. **Wired into rebuild path** — `rebuild_cdc_trigger_function` and `rebuild_cdc_trigger` in `src/cdc.rs`:
+   - Both now use `resolve_referenced_column_defs` so schema-change rebuilds also respect column pruning.
+
+6. **Unit tests** — 6 pure-Rust tests for `filter_cdc_columns` covering:
+   - `None`/empty referenced → full fallback
+   - Filtering to referenced + PK only
+   - Ordinal order preservation
+   - Case-insensitive column name matching
+   - Empty-result safety fallback
+
+**Remaining for F15 to be fully closed:**
+
+- **Integration test:** create a source table with 5 columns, create an ST that references only 2; after creation verify that `pgtrickle_changes.changes_<oid>` has only `new_<pk>`, `old_<pk>`, `new_<referenced>`, `old_<referenced>` columns (i.e. unreferenced columns not in the buffer). Test that adding a second ST requiring a 3rd column triggers a `alter_change_buffer_add_columns` call.
+- **Monitoring view exposure:** surface `is_selective_capture_active` via `pgtrickle.stream_table_info()` or the monitoring view so operators can see which sources are running in pruned mode.
+
+**Note on `SELECT *` sources:** When a ST's defining query contains `SELECT *`, the parser emits `columns_used = NULL` (no column list) for that source. The catalog stores `NULL` in `pgt_dependencies.columns_used`, and `union_referenced_columns_for_source` returns `None`, triggering full capture for that source. This is correct and safe — selective capture only activates when every downstream ST has an explicit column list.
 
 ### F40 Status Update
 

@@ -1209,6 +1209,59 @@ impl StDependency {
             Ok(result)
         })
     }
+
+    /// Return the **union** of `columns_used` recorded across all stream tables
+    /// that depend on `source_oid` as a base-table source.
+    ///
+    /// This is the catalog read for F15 (Selective CDC Column Capture). When
+    /// every downstream ST has a non-NULL `columns_used`, the result is the
+    /// minimal set of columns that must be present in the CDC change buffer.
+    ///
+    /// Returns `None` when *any* dependency has `columns_used = NULL` (meaning
+    /// "all columns are needed" — the ST was created without AST column
+    /// tracking, e.g. `SELECT *`). Callers must treat `None` as "track
+    /// everything".
+    pub fn union_referenced_columns_for_source(
+        source_oid: pg_sys::Oid,
+    ) -> Result<Option<Vec<String>>, PgTrickleError> {
+        Spi::connect(|client| {
+            let table = client
+                .select(
+                    "SELECT columns_used \
+                     FROM pgtrickle.pgt_dependencies \
+                     WHERE source_relid = $1 \
+                       AND source_type IN ('TABLE', 'FOREIGN_TABLE')",
+                    None,
+                    &[source_oid.into()],
+                )
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+            let mut union: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            let mut found_any = false;
+
+            for row in table {
+                found_any = true;
+                let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+                match row.get::<Vec<String>>(1).map_err(map_spi)? {
+                    // NULL columns_used → ST needs all columns; bail out early.
+                    None => return Ok(None),
+                    Some(cols) => {
+                        for c in cols {
+                            union.insert(c);
+                        }
+                    }
+                }
+            }
+
+            if !found_any {
+                // No dependencies yet (called before the ST insert) — return None
+                // so the caller falls back to full column tracking.
+                return Ok(None);
+            }
+
+            Ok(Some(union.into_iter().collect()))
+        })
+    }
 }
 
 // ── Column snapshot helpers ────────────────────────────────────────────────

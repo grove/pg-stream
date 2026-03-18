@@ -770,6 +770,87 @@ pub fn resolve_source_column_defs(
     })
 }
 
+/// Resolves the subset of columns required by all downstream stream tables for
+/// CDC capture of `source_oid` (F15: Selective CDC Column Capture).
+///
+/// ## Algorithm
+/// 1. Query `pgt_dependencies` for the **union** of `columns_used` across every
+///    ST that lists `source_oid` as a base-table dependency.
+/// 2. If any ST has `columns_used = NULL` (meaning "all columns", e.g. `SELECT *`),
+///    fall back to the full column list to avoid silently dropping needed columns.
+/// 3. Always include PK columns (required for `pk_hash` computation and row
+///    identity in the change buffer — dropping them would break CDC correctness).
+/// 4. Filter `resolve_source_column_defs` to the union ∪ PK set and return only
+///    those (column_name, type) pairs in original table ordinal order.
+///
+/// When the catalog contains no dependencies yet (first-time setup before the
+/// ST row has been written), `union_referenced_columns_for_source` returns `None`
+/// and this function also falls back to full capture.
+pub fn resolve_referenced_column_defs(
+    source_oid: pg_sys::Oid,
+) -> Result<Vec<(String, String)>, PgTrickleError> {
+    // Step 1: ask the catalog for the minimal column set across all downstream STs.
+    let maybe_referenced =
+        crate::catalog::StDependency::union_referenced_columns_for_source(source_oid)?;
+
+    let referenced = match maybe_referenced.as_deref() {
+        // NULL in any row, no rows, or empty list → we cannot safely omit anything.
+        None | Some([]) => return resolve_source_column_defs(source_oid),
+        Some(cols) => cols.to_vec(),
+    };
+
+    // Step 2: always include PK columns.
+    let pk_cols = resolve_pk_columns(source_oid)?;
+
+    // Build a lookup set: referenced names (lower-case for case-insensitive match).
+    let mut keep: std::collections::HashSet<String> =
+        referenced.iter().map(|c| c.to_lowercase()).collect();
+    for pk in &pk_cols {
+        keep.insert(pk.to_lowercase());
+    }
+
+    // Step 3: filter the full column list to the keep set, preserving ordinal order.
+    let all_cols = resolve_source_column_defs(source_oid)?;
+    let filtered: Vec<(String, String)> = all_cols
+        .into_iter()
+        .filter(|(name, _)| keep.contains(&name.to_lowercase()))
+        .collect();
+
+    // Safety: if the filter would drop all columns (should not happen), fall back.
+    if filtered.is_empty() {
+        return resolve_source_column_defs(source_oid);
+    }
+
+    Ok(filtered)
+}
+
+/// Returns `true` when F15 selective capture would restrict the tracked columns
+/// for `source_oid` (i.e. not every column on the source is needed).
+///
+/// Used in monitoring and explain output to indicate that column-level pruning
+/// is active for a given source table.
+pub fn is_selective_capture_active(source_oid: pg_sys::Oid) -> bool {
+    // Selective capture is active when the union of referenced columns is
+    // a strict subset of the full column list.
+    let Ok(Some(referenced)) =
+        crate::catalog::StDependency::union_referenced_columns_for_source(source_oid)
+    else {
+        return false;
+    };
+    let Ok(pk_cols) = resolve_pk_columns(source_oid) else {
+        return false;
+    };
+    let Ok(all_cols) = resolve_source_column_defs(source_oid) else {
+        return false;
+    };
+    let mut keep: std::collections::HashSet<String> =
+        referenced.iter().map(|c| c.to_lowercase()).collect();
+    for pk in &pk_cols {
+        keep.insert(pk.to_lowercase());
+    }
+    keep.len() < all_cols.len()
+}
+
 /// Resolve primary key column names for a source table via `pg_constraint`.
 ///
 /// Returns columns in key order. Returns an empty Vec if no PK exists.
@@ -1274,7 +1355,9 @@ pub fn rebuild_cdc_trigger_function(
     change_schema: &str,
 ) -> Result<(), PgTrickleError> {
     let pk_columns = resolve_pk_columns(source_oid)?;
-    let columns = resolve_source_column_defs(source_oid)?;
+    // F15: use the minimal column set (union of columns_used across all downstream STs,
+    // always including PK columns). Falls back to full capture when any ST uses SELECT *.
+    let columns = resolve_referenced_column_defs(source_oid)?;
 
     // Nothing to rebuild if the table has no user columns.
     if columns.is_empty() {
@@ -1342,7 +1425,9 @@ pub fn rebuild_cdc_trigger(
     change_schema: &str,
 ) -> Result<String, PgTrickleError> {
     let pk_columns = resolve_pk_columns(source_oid)?;
-    let columns = resolve_source_column_defs(source_oid)?;
+    // F15: use the minimal column set (union of columns_used across all downstream STs,
+    // always including PK columns). Falls back to full capture when any ST uses SELECT *.
+    let columns = resolve_referenced_column_defs(source_oid)?;
 
     if columns.is_empty() {
         return Ok(String::new());
@@ -2185,5 +2270,134 @@ mod tests {
         let result = build_typed_col_defs(&cols);
         assert!(result.contains("timestamp with time zone"));
     }
+
+    // ── F15: Selective CDC Column Capture ─────────────────────────────────────
+
+    /// Pure helper that mirrors the filter logic inside `resolve_referenced_column_defs`,
+    /// extracted so it can be unit-tested without a PostgreSQL backend.
+    ///
+    /// Given:
+    /// - `all_cols`   — the full ordered column list of the source table
+    /// - `referenced` — union of `columns_used` across all downstream STs (`None` = keep all)
+    /// - `pk_cols`    — primary key column names (always retained)
+    ///
+    /// Returns the filtered column list, preserving original ordinal order.
+    fn filter_cdc_columns<'a>(
+        all_cols: &'a [(String, String)],
+        referenced: Option<&[String]>,
+        pk_cols: &[String],
+    ) -> Vec<&'a (String, String)> {
+        let referenced = match referenced {
+            None | Some([]) => return all_cols.iter().collect(),
+            Some(r) => r,
+        };
+
+        let mut keep: std::collections::HashSet<String> =
+            referenced.iter().map(|c| c.to_lowercase()).collect();
+        for pk in pk_cols {
+            keep.insert(pk.to_lowercase());
+        }
+
+        let filtered: Vec<&(String, String)> = all_cols
+            .iter()
+            .filter(|(name, _)| keep.contains(&name.to_lowercase()))
+            .collect();
+
+        if filtered.is_empty() {
+            all_cols.iter().collect()
+        } else {
+            filtered
+        }
+    }
+
+    fn s(name: &str, ty: &str) -> (String, String) {
+        (name.to_string(), ty.to_string())
+    }
+
+    #[test]
+    fn test_f15_filter_none_referenced_keeps_all() {
+        // When referenced is None (SELECT * or no deps), all columns are kept.
+        let all = vec![s("id", "int4"), s("name", "text"), s("secret", "text")];
+        let result = filter_cdc_columns(&all, None, &[]);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_f15_filter_empty_referenced_keeps_all() {
+        // Empty referenced slice also falls back to full capture.
+        let all = vec![s("id", "int4"), s("name", "text")];
+        let result = filter_cdc_columns(&all, Some(&[]), &[]);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_f15_filter_restricts_to_referenced_plus_pk() {
+        let all = vec![
+            s("id", "int4"),
+            s("name", "text"),
+            s("email", "text"),
+            s("secret", "text"),
+        ];
+        let referenced = vec!["name".to_string()];
+        let pk = vec!["id".to_string()];
+        let result = filter_cdc_columns(&all, Some(&referenced), &pk);
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        // id (pk) and name (referenced) must be present; email and secret must not.
+        assert!(names.contains(&"id"), "PK column must be retained");
+        assert!(
+            names.contains(&"name"),
+            "referenced column must be retained"
+        );
+        assert!(
+            !names.contains(&"email"),
+            "unreferenced column must be dropped"
+        );
+        assert!(
+            !names.contains(&"secret"),
+            "unreferenced column must be dropped"
+        );
+    }
+
+    #[test]
+    fn test_f15_filter_preserves_ordinal_order() {
+        let all = vec![
+            s("a", "int4"),
+            s("b", "text"),
+            s("c", "boolean"),
+            s("d", "float8"),
+        ];
+        let referenced = vec!["d".to_string(), "b".to_string()];
+        let pk = vec!["a".to_string()];
+        let result = filter_cdc_columns(&all, Some(&referenced), &pk);
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        // Must be in original table ordinal order: a, b, d  (c dropped).
+        assert_eq!(names, vec!["a", "b", "d"]);
+    }
+
+    #[test]
+    fn test_f15_filter_case_insensitive() {
+        let all = vec![s("UserID", "int4"), s("Email", "text"), s("Notes", "text")];
+        let referenced = vec!["email".to_string()];
+        let pk = vec!["userid".to_string()];
+        let result = filter_cdc_columns(&all, Some(&referenced), &pk);
+        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"UserID"), "PK matched case-insensitively");
+        assert!(
+            names.contains(&"Email"),
+            "referenced matched case-insensitively"
+        );
+        assert!(!names.contains(&"Notes"), "unreferenced column dropped");
+    }
+
+    #[test]
+    fn test_f15_filter_fallback_when_filtered_set_empty() {
+        // If the filter accidentally produces zero columns, fall back to all.
+        let all = vec![s("id", "int4"), s("val", "text")];
+        // Referenced and pk contain a column that doesn't exist on the table.
+        let referenced = vec!["nonexistent".to_string()];
+        let pk: Vec<String> = vec![];
+        let result = filter_cdc_columns(&all, Some(&referenced), &pk);
+        // Should fall back to full list because filtered set is empty.
+        assert_eq!(result.len(), 2);
+    }
 }
-// F15: Stub for selective CDC column capture

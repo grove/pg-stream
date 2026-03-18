@@ -3847,8 +3847,11 @@ fn setup_cdc_for_source(
             }
         }
 
-        // Resolve all source columns for typed change buffer
-        let col_defs = cdc::resolve_source_column_defs(source_oid)?;
+        // F15: Resolve the minimal set of columns needed for CDC capture.
+        // Uses the union of `columns_used` across all downstream STs for this
+        // source, always including PK columns. Falls back to full column capture
+        // when any ST uses `SELECT *` (columns_used = NULL) or on first-time setup.
+        let col_defs = cdc::resolve_referenced_column_defs(source_oid)?;
 
         // Create the change buffer table (with typed columns + pk_hash always)
         cdc::create_change_buffer_table(source_oid, change_schema, &col_defs)?;

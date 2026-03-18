@@ -860,15 +860,20 @@ Session 4:  F19–F24 (all documentation)                                   ✅ 
 Session 5:  F13 (partitioned tables) + F14 (replication targets)          ✅ Done
 Session 6:  F5 (IS JSON) + F10 (SQL/JSON constructors)                   ✅ Done
 Session 7:  F11 (JSON agg standard) + F12 (JSON_TABLE)                   ✅ Done
-Session 8+: F15–F18 (operational hardening)                               ✅ Done (F15 deferred)
+Session 8+: F15–F18 (operational hardening)                               ✅ Done (F15 implemented in v0.9.0)
 ```
 
-**F15 note:** Deferred to future work. Selective CDC column capture requires
-full column lineage tracking (walking all expression nodes for ColumnRef
-references with alias resolution). Currently `source_columns_used()` returns
-all table columns. This is a performance optimization, not a correctness
-issue — the current approach captures all columns which is safe but less
-efficient for wide tables.
+**F15 (v0.9.0 implementation note):** F15 is now implemented end-to-end in v0.9.0.
+`source_columns_used()` in the parser already walks all ColumnRef/expression nodes
+and returns per-source column lists. `StDependency::union_referenced_columns_for_source()`
+in `src/catalog.rs` computes the union across all downstream STs.
+`cdc::resolve_referenced_column_defs()` filters the full column list to referenced ∪ PK,
+and this is wired into `setup_cdc_for_source` (creation) and both `rebuild_cdc_trigger*`
+functions (schema-change rebuild).
+
+Two items remain before F15 is fully closed:
+1. **Integration test** — verify the change buffer table has only the expected columns.
+2. **Monitoring view** — expose `is_selective_capture_active` via the monitoring SQL API.
 
 ---
 
