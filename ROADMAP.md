@@ -1436,6 +1436,21 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 
 > **Multi-source delta batching subtotal: ~5–8 weeks**
 
+### Phase 7 Gap Resolutions (DVM Correctness, Syntax & Testing)
+
+These items pull in the remaining correctness edge cases and syntax expansions identified in the Phase 7 SQL Gap Analysis, along with completing exhaustive differential E2E test maturation.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| G1.1 | **JOIN Key Column Changes.** Handle updates that simultaneously modify a JOIN key and right-side tracked columns. | 3–5d | | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
+| G1.2 | **Window Function Partition Drift.** Explicit tracking for updates that cause rows to cross `PARTITION BY` ranges. | 4–6d | | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
+| G1.5/G7.1 | **Keyless Table Duplicate Identity.** Resolve `__pgt_row_id` collisions for non-PK tables with exact duplicate rows. | 3–5d | | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_| G1.5/G7.1 | **Keyless Table J| G1.5/G7 Op| G1.5/G7.1 | **Keyless Table Duppaths when dealing with| G1.5/G7.1 | **Keyless Table Duplicate Identity.** Resolve `__pgt_row_id` /sql/GAP_SQL_PHASE_7.md) |
+| G5.6 | **Range Aggregates.** Support and differentiate `RANGE_AGG` and `RANGE_INTERSECT_AGG`. | 1–2d | | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
+| G5.3 | **XML Expression Parsing.** Native DVM handling for `T_XmlExpr` syntax trees. | 1–2d | || G5.3 | **XML Expression Parsing.** Native DVM handling for `T_XmlExpr` syntax trees. | 1–2d | || G5.3 | **XML Expression Parsing.** Native DVM handling for `T_XmlExpr` syntax trees. |L_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
+| G5.5 | **NATURAL JOIN Drift Tracking.** DVM tracking of schema shifts in `NATURAL JOIN` between refreshes. | 2–3d | | [GAP_SQL_PHASE_7.md](pla| G5.5 | **NATURAL JOIN Drift Tracking.** DVM tracking of schema shifts in `NATURAL JOIN` between refreshes. | 2–3d | | [GAP_SQL_PHASE_7.md](pla| G5.5 | **NATURAL JOIN Drift Tracking.** DVM tracking of schema shifts in `NATURAL JOIN` between refreshes. | 2–3d | | [GAP_SQL_PHASE_7.md](pla| G5.5 | **NATURAL JOIN Drift Tracking.** DVM tracking of schema shifts in `NATURAL JOIN` . | 1–2 wk | | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
+
+> **Phase 7 Gaps subtotal: ~5–7 weeks**
+
 ### Additional Query Engine Improvements
 
 | Item | Description | Effort | Status | Ref |
@@ -1445,7 +1460,7 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 
-> **v0.9.0 total: ~18–22 weeks**
+> **v0.9.0 total: ~23–29 weeks**
 
 **Exit criteria:**
 - [x] AVG algebraic path implemented (SUM/COUNT auxiliary columns)
@@ -1463,6 +1478,9 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 - [x] B2-5: Cross-Source Snapshot Consistency models
 - [x] B2-6: Non-Determinism Guarding semantics implemented
 - [x] Extension upgrade path tested (`0.8.0 → 0.9.0`)
+- [ ] G1 Correctness Gaps addressed (G1.1, G1.2, G1.5, G1.6)
+- [ ] G5 Syntax Gaps addressed (G5.2, G5.3, G5.5, G5.6)
+- [ ] G6 Test Coverage expanded (G6.1, G6.2, G6.3, G6.5)
 
 ---
 
