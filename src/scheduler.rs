@@ -2622,18 +2622,19 @@ fn refresh_single_st(
         // Check periodic drift reset
         if base_action == RefreshAction::Differential {
             let max_cycles = config::pg_trickle_algebraic_drift_reset_cycles();
-            if let Some(counter) = &drift_counter {
-                if max_cycles > 0 && **counter >= max_cycles {
-                    log!(
-                        "pg_trickle: drift reset triggered for {}.{} ({} differential cycles)",
-                        st.pgt_schema,
-                        st.pgt_name,
-                        counter
-                    );
-                    // Convert action to reinitialize. This will trigger the drift counter reset
-                    // inside execute_scheduled_refresh on success.
-                    base_action = RefreshAction::Reinitialize;
-                }
+            if let Some(counter) = &drift_counter
+                && max_cycles > 0
+                && **counter >= max_cycles
+            {
+                log!(
+                    "pg_trickle: drift reset triggered for {}.{} ({} differential cycles)",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    counter
+                );
+                // Convert action to reinitialize. This will trigger the drift counter reset
+                // inside execute_scheduled_refresh on success.
+                base_action = RefreshAction::Reinitialize;
             }
         }
         base_action

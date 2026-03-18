@@ -3,7 +3,22 @@
 > **Implementation Status (v0.9.0 Cycle)**
 > Most core architectural phases (Phases 1-12) are now implemented. The remaining critical features necessary to fully close out the v0.9.0 milestone are:
 > - **F15**: Selective CDC Column Capture (Phase 6 Integration)
-> - **F40**: Extension Upgrade Migrations & DB Schema Stability (Phase 7 & 12 Integration)
+> - **F40**: Extension Upgrade Migrations & DB Schema Stability (in progress) (Phase 7 & 12 Integration)
+
+### F40 Status Update
+
+Current implementation status for F40:
+
+- `sql/pg_trickle--0.8.0--0.9.0.sql` exists and covers the current `v0.9.0` SQL-surface additions.
+- `sql/archive/pg_trickle--0.9.0.sql` is committed, so the upgrade path has an exact full-install baseline.
+- Upgrade E2E coverage already exercises `ALTER EXTENSION pg_trickle UPDATE` through the dedicated upgrade image/tests.
+- The fast upgrade completeness check now validates not only functions/views/event triggers, but also new tables and indexes introduced by a release.
+
+What remains for F40 before it can be marked done:
+
+- Extend automated completeness validation beyond object presence to catch column-level drift, changed signatures, and changed defaults more explicitly.
+- Add explicit upgrade assertions for the `v0.9.0` schema additions in the true upgrade tests so `pgt_refresh_groups` and related index/catalog surfaces are checked after a real upgrade.
+- Finish the release checklist item for `v0.9.0`: package and verify the final release-grade SQL artifacts once the release branch CI is fully green.
 
 ## Streaming tables for PostgreSQL 18 as a Rust Extension
 

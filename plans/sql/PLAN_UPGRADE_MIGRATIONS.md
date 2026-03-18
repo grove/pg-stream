@@ -1,8 +1,31 @@
 # PLAN_UPGRADE_MIGRATIONS.md — Extension Upgrade Migrations
 
-> **Status:** Phases 1–5 implemented and validated through v0.2.3  
+> **Status:** Core infrastructure implemented; v0.9.0 F40 follow-through is in progress  
 > **Related:** GAP_SQL_PHASE_7.md F40 (G8.3), PLAN_VERSIONING.md  
-> **Last updated:** 2026-03-08
+> **Last updated:** 2026-03-18
+
+## Current Status Snapshot
+
+The upgrade-migration framework is already in place: hand-authored upgrade SQL,
+archived full-install SQL baselines, CI completeness validation, and true
+upgrade E2E tests all exist. For `v0.9.0`, F40 is now in the implementation
+follow-through phase rather than the design phase.
+
+Completed for `v0.9.0` so far:
+
+- Added the `0.8.0 -> 0.9.0` upgrade script.
+- Archived the generated full-install SQL baseline for `0.9.0`.
+- Verified that upgrade E2E infrastructure can target `0.9.0`.
+- Extended the fast completeness gate to validate new tables and indexes in
+  addition to functions, views, and event triggers.
+
+Still remaining before F40 is fully done for `v0.9.0`:
+
+- Detect more kinds of schema drift automatically, especially changed column
+  definitions, changed function signatures/defaults, and view-definition drift.
+- Add or tighten true-upgrade assertions for `v0.9.0`-specific schema objects.
+- Complete the release-finalization step that verifies the release-grade SQL
+  artifacts after the final CI pass.
 
 ---
 

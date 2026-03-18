@@ -20,3 +20,10 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_groups (
                 CHECK (isolation IN ('read_committed', 'repeatable_read')),
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- New API functions
+CREATE OR REPLACE FUNCTION pgtrickle."restore_stream_tables"() RETURNS VOID
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'restore_stream_tables_wrapper';
+

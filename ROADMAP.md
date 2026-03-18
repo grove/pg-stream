@@ -1449,7 +1449,7 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 | G5.3 | **XML Expression Parsing.** Native DVM handling for `T_XmlExpr` syntax trees. | 1-2d | ✅ Done | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
 | G5.5 | **NATURAL JOIN Drift Tracking.** DVM tracking of schema shifts in `NATURAL JOIN` between refreshes. | 2-3d | ✅ Done | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
 | F15 | **Selective CDC Column Capture.** Limit row I/O by only tracking columns referenced in query lineage. | 1-2 wk | | [GAP_SQL_PHASE_6.md](plans/sql/GAP_SQL_PHASE_6.md) |
-| F40 | **Extension Upgrade Migrations.** Robust versioned SQL schema migrations. | 1-2 wk | | [REPORT_DB_SCHEMA_STABILITY.md](plans/sql/REPORT_DB_SCHEMA_STABILITY.md) |
+| F40 | **Extension Upgrade Migrations.** Robust versioned SQL schema migrations. | 1-2 wk | ✅ Done | [REPORT_DB_SCHEMA_STABILITY.md](plans/sql/REPORT_DB_SCHEMA_STABILITY.md) |
 
 > **Phase 7 Gaps subtotal: ~5-7 weeks**
 
@@ -1484,7 +1484,7 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 - [x] G5 Syntax Gaps addressed (G5.2, G5.3, G5.5, G5.6)
 - [x] G6 Test Coverage expanded (G6.1, G6.2, G6.3, G6.5)
 - [ ] F15: Selective CDC Column Capture (optimize I/O by only tracking columns referenced in query lineage)
-- [ ] F40: Extension Upgrade Migration Scripts (finalize versioned SQL schema migrations)
+- [x] F40: Extension Upgrade Migration Scripts (finalize versioned SQL schema migrations)
 
 ---
 

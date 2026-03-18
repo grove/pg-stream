@@ -109,6 +109,22 @@ extract_event_triggers() {
         | sort -u
 }
 
+# ── Helper: extract table names from a SQL file ─────────────────────────
+extract_tables() {
+    local sqlfile="$1"
+    grep -oE 'CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?pgtrickle\.[a-z_]+' "$sqlfile" 2>/dev/null \
+        | sed -E 's/.*pgtrickle\.([a-z_]+)/\1/' \
+        | sort -u
+}
+
+# ── Helper: extract index names from a SQL file ─────────────────────────
+extract_indexes() {
+    local sqlfile="$1"
+    grep -oE 'CREATE\s+(UNIQUE\s+)?INDEX\s+(IF\s+NOT\s+EXISTS\s+)?[a-z_][a-z0-9_]*' "$sqlfile" 2>/dev/null \
+        | sed -E 's/CREATE\s+(UNIQUE\s+)?INDEX\s+(IF\s+NOT\s+EXISTS\s+)?//' \
+        | sort -u
+}
+
 # ═══════════════════════════════════════════════════════════════════════
 # CHECK 1: Functions
 # ═══════════════════════════════════════════════════════════════════════
@@ -203,6 +219,66 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
+# CHECK 4: Tables
+# ═══════════════════════════════════════════════════════════════════════
+echo "━━━ Check 4: Tables ━━━"
+
+extract_tables "$FULL_SQL_NEW" > "$TMPDIR/new_tables.txt"
+extract_tables "$UPGRADE_SQL"  > "$TMPDIR/upgrade_tables.txt"
+
+if [[ -n "$FULL_SQL_OLD" ]]; then
+    extract_tables "$FULL_SQL_OLD" > "$TMPDIR/old_tables.txt"
+else
+    : > "$TMPDIR/old_tables.txt"
+fi
+
+comm -23 "$TMPDIR/new_tables.txt" "$TMPDIR/old_tables.txt" > "$TMPDIR/added_tables.txt"
+comm -23 "$TMPDIR/added_tables.txt" "$TMPDIR/upgrade_tables.txt" > "$TMPDIR/missing_tables.txt"
+
+NEW_TABLE_COUNT=$(wc -l < "$TMPDIR/added_tables.txt" | tr -d ' ')
+MISSING_TABLE_COUNT=$(wc -l < "$TMPDIR/missing_tables.txt" | tr -d ' ')
+
+if [[ "$MISSING_TABLE_COUNT" -gt 0 ]]; then
+    echo "  ERROR: ${MISSING_TABLE_COUNT} new table(s) missing from upgrade script:"
+    while IFS= read -r table; do
+        echo "    - pgtrickle.${table}"
+    done < "$TMPDIR/missing_tables.txt"
+    ERRORS=$((ERRORS + MISSING_TABLE_COUNT))
+else
+    echo "  OK: ${NEW_TABLE_COUNT} new table(s) all covered."
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
+# CHECK 5: Indexes
+# ═══════════════════════════════════════════════════════════════════════
+echo "━━━ Check 5: Indexes ━━━"
+
+extract_indexes "$FULL_SQL_NEW" > "$TMPDIR/new_indexes.txt"
+extract_indexes "$UPGRADE_SQL"  > "$TMPDIR/upgrade_indexes.txt"
+
+if [[ -n "$FULL_SQL_OLD" ]]; then
+    extract_indexes "$FULL_SQL_OLD" > "$TMPDIR/old_indexes.txt"
+else
+    : > "$TMPDIR/old_indexes.txt"
+fi
+
+comm -23 "$TMPDIR/new_indexes.txt" "$TMPDIR/old_indexes.txt" > "$TMPDIR/added_indexes.txt"
+comm -23 "$TMPDIR/added_indexes.txt" "$TMPDIR/upgrade_indexes.txt" > "$TMPDIR/missing_indexes.txt"
+
+NEW_INDEX_COUNT=$(wc -l < "$TMPDIR/added_indexes.txt" | tr -d ' ')
+MISSING_INDEX_COUNT=$(wc -l < "$TMPDIR/missing_indexes.txt" | tr -d ' ')
+
+if [[ "$MISSING_INDEX_COUNT" -gt 0 ]]; then
+    echo "  ERROR: ${MISSING_INDEX_COUNT} new index(es) missing from upgrade script:"
+    while IFS= read -r idx; do
+        echo "    - ${idx}"
+    done < "$TMPDIR/missing_indexes.txt"
+    ERRORS=$((ERRORS + MISSING_INDEX_COUNT))
+else
+    echo "  OK: ${NEW_INDEX_COUNT} new index(es) all covered."
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
@@ -219,5 +295,7 @@ else
     echo "  Functions:      $(wc -l < "$TMPDIR/new_functions.txt" | tr -d ' ') total (${NEW_FUNC_COUNT} new)"
     echo "  Views:          $(wc -l < "$TMPDIR/new_views.txt" | tr -d ' ') total (${NEW_VIEW_COUNT} new)"
     echo "  Event triggers: $(wc -l < "$TMPDIR/new_triggers.txt" | tr -d ' ') total (${NEW_TRIG_COUNT} new)"
+    echo "  Tables:         $(wc -l < "$TMPDIR/new_tables.txt" | tr -d ' ') total (${NEW_TABLE_COUNT} new)"
+    echo "  Indexes:        $(wc -l < "$TMPDIR/new_indexes.txt" | tr -d ' ') total (${NEW_INDEX_COUNT} new)"
     exit 0
 fi

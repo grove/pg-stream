@@ -1559,7 +1559,7 @@ impl ExecutionUnitDag {
                 ExecutionUnitKind::Singleton => singletons += 1,
                 ExecutionUnitKind::AtomicGroup => atomic_groups += 1,
                 ExecutionUnitKind::ImmediateClosure => immediate_closures += 1,
-                ExecutionUnitKind::RepeatableReadGroup => {},
+                ExecutionUnitKind::RepeatableReadGroup => {}
             }
         }
 

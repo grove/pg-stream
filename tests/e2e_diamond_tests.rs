@@ -476,8 +476,6 @@ async fn test_diamond_flow_simultaneous_multi_source_update() {
     db.execute("SELECT pgtrickle.refresh_stream_table('st_diamond_tip')")
         .await;
 
-
-
     // DML triggers branches A and B to recalculate
     db.execute("UPDATE root_table SET val = 200 WHERE id = 1")
         .await;
@@ -490,11 +488,9 @@ async fn test_diamond_flow_simultaneous_multi_source_update() {
     db.execute("SELECT pgtrickle.refresh_stream_table('st_diamond_tip')")
         .await;
 
-
-
-
-    db.assert_st_matches_query("st_diamond_tip", 
-        "SELECT 1 as id, 210 as score_a, 190 as score_b"
+    db.assert_st_matches_query(
+        "st_diamond_tip",
+        "SELECT 1 as id, 210 as score_a, 190 as score_b",
     )
     .await;
 }
