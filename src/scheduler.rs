@@ -896,6 +896,9 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
                 "pg_trickle refresh worker: fixpoint reached after {} iteration(s)",
                 iteration + 1
             );
+            for &pgt_id in member_ids {
+                let _ = StreamTableMeta::update_last_fixpoint_iterations(pgt_id, iteration + 1);
+            }
             return RefreshOutcome::Success;
         }
 
@@ -910,6 +913,10 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
         "pg_trickle refresh worker: SCC fixpoint failed to converge after {} iterations",
         max_iter
     );
+    for &pgt_id in member_ids {
+        let _ = StreamTableMeta::update_last_fixpoint_iterations(pgt_id, max_iter);
+        let _ = StreamTableMeta::update_status(pgt_id, StStatus::Error);
+    }
     RefreshOutcome::PermanentFailure
 }
 
