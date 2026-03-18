@@ -1385,6 +1385,8 @@ per group.
 
 - **Extension upgrade path (`0.8.0 → 0.9.0`):** Upgrade SQL stub created. Left as a final pre-release checklist item to generate the final `sql/archive/pg_trickle--0.9.0.sql` with `cargo pgrx package` once all CI checks pass.
 
+- **F15 — Selective CDC Column Capture:** ✅ Complete. Column-selection pipeline, monitoring exposure via `check_cdc_health().selective_capture`, and 3 E2E integration tests done.
+
 > ⚠️ Critical: the MIN/MAX maintenance rule is directionally tricky. The correct
 > condition for triggering a rescan is: deleted value **equals** the current min/max
 > (not when it differs). Getting this backwards silently produces stale aggregates
@@ -1450,7 +1452,7 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 | G5.6 | **Range Aggregates.** Support and differentiate `RANGE_AGG` and `RANGE_INTERSECT_AGG`. | 1-2d | ✅ Done | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
 | G5.3 | **XML Expression Parsing.** Native DVM handling for `T_XmlExpr` syntax trees. | 1-2d | ✅ Done | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
 | G5.5 | **NATURAL JOIN Drift Tracking.** DVM tracking of schema shifts in `NATURAL JOIN` between refreshes. | 2-3d | ✅ Done | [GAP_SQL_PHASE_7.md](plans/sql/GAP_SQL_PHASE_7.md) |
-| F15 | **Selective CDC Column Capture.** Limit row I/O by only tracking columns referenced in query lineage. | 1-2 wk | | [GAP_SQL_PHASE_6.md](plans/sql/GAP_SQL_PHASE_6.md) |
+| F15 | **Selective CDC Column Capture.** Limit row I/O by only tracking columns referenced in query lineage. | 1-2 wk | ✅ Done | [GAP_SQL_PHASE_6.md](plans/sql/GAP_SQL_PHASE_6.md) |
 | F40 | **Extension Upgrade Migrations.** Robust versioned SQL schema migrations. | 1-2 wk | ✅ Done | [REPORT_DB_SCHEMA_STABILITY.md](plans/sql/REPORT_DB_SCHEMA_STABILITY.md) |
 
 > **Phase 7 Gaps subtotal: ~5-7 weeks**

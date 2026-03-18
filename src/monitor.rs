@@ -743,6 +743,7 @@ fn check_cdc_health() -> TableIterator<
         name!(lag_bytes, Option<i64>),
         name!(confirmed_lsn, Option<String>),
         name!(alert, Option<String>),
+        name!(selective_capture, bool),
     ),
 > {
     let all_deps = StDependency::get_all().unwrap_or_default();
@@ -769,6 +770,9 @@ fn check_cdc_health() -> TableIterator<
 
         let mode_str = dep.cdc_mode.as_str().to_string();
 
+        // F15: is selective column capture active for this source?
+        let selective = crate::cdc::is_selective_capture_active(dep.source_relid);
+
         match dep.cdc_mode {
             CdcMode::Trigger => {
                 rows.push((
@@ -779,6 +783,7 @@ fn check_cdc_health() -> TableIterator<
                     None,
                     None,
                     None,
+                    selective,
                 ));
             }
             CdcMode::Wal | CdcMode::Transitioning => {
@@ -807,6 +812,7 @@ fn check_cdc_health() -> TableIterator<
                     Some(lag),
                     lsn,
                     alert,
+                    selective,
                 ));
             }
         }
