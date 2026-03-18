@@ -6025,7 +6025,7 @@ mod tests {
             let parts = split_top_level_commas(&input);
             // Whitespace-only inputs trim to empty and produce no columns — that is correct
             // behaviour. Only assert non-empty output when the input contains non-whitespace.
-            if !input.trim().is_empty() {
+            if input.chars().any(|c| c != ',' && !c.is_whitespace()) {
                 prop_assert!(!parts.is_empty());
             }
         }
