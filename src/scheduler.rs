@@ -322,13 +322,17 @@ pub extern "C-unwind" fn pg_trickle_launcher_main(_arg: pg_sys::Datum) {
         }
 
         // Wake every 10 s or on SIGHUP/SIGTERM.
-        let should_continue = BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(10)));
+        let should_continue =
+            BackgroundWorker::wait_latch(Some(std::time::Duration::from_secs(10)));
 
         unsafe {
             if pg_sys::ConfigReloadPending != 0 {
                 pg_sys::ConfigReloadPending = 0;
                 pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
-pgrx::info!("pg_trickle scheduler: SIGHUP processed, allow_circular is now {}", config::pg_trickle_allow_circular()); 
+                pgrx::info!(
+                    "pg_trickle scheduler: SIGHUP processed, allow_circular is now {}",
+                    config::pg_trickle_allow_circular()
+                );
             }
         }
 
@@ -795,24 +799,30 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
     let gated_oids = load_gated_source_oids();
     let member_ids = &job.member_pgt_ids;
 
-    if member_ids.is_empty() { return RefreshOutcome::Success; }
+    if member_ids.is_empty() {
+        return RefreshOutcome::Success;
+    }
 
     for &pgt_id in member_ids {
-        if let Some(st) = load_st_by_id(pgt_id) {
-            if st.refresh_mode != RefreshMode::Differential {
-                pgrx::warning!(
-                    "pg_trickle refresh worker: SCC fixpoint — {}.{} uses {} mode, \
-                     only DIFFERENTIAL is supported in cyclic dependencies",
-                    st.pgt_schema, st.pgt_name, st.refresh_mode.as_str()
-                );
-                return RefreshOutcome::PermanentFailure;
-            }
+        if let Some(st) = load_st_by_id(pgt_id)
+            && st.refresh_mode != RefreshMode::Differential
+        {
+            pgrx::warning!(
+                "pg_trickle refresh worker: SCC fixpoint — {}.{} uses {} mode, \
+                 only DIFFERENTIAL is supported in cyclic dependencies",
+                st.pgt_schema,
+                st.pgt_name,
+                st.refresh_mode.as_str()
+            );
+            return RefreshOutcome::PermanentFailure;
         }
     }
 
     let tick_watermark: Option<String> = if config::pg_trickle_tick_watermark_enabled() {
         Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
-    } else { None };
+    } else {
+        None
+    };
 
     let mut prev_row_counts: HashMap<i64, i64> = member_ids
         .iter()
@@ -842,13 +852,19 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
                 }
 
                 // Inside SCCs, always use FULL refresh action to evaluate defining query each pass.
-                let outcome = execute_scheduled_refresh(&st, RefreshAction::Full, tick_watermark.as_deref());
+                let outcome =
+                    execute_scheduled_refresh(&st, RefreshAction::Full, tick_watermark.as_deref());
                 match outcome {
                     RefreshOutcome::Success => {
                         any_refreshed = true;
                     }
                     RefreshOutcome::RetryableFailure | RefreshOutcome::PermanentFailure => {
-                        log!("pg_trickle refresh worker: fixpoint iteration {} failed on {}.{}", iteration + 1, st.pgt_schema, st.pgt_name);
+                        log!(
+                            "pg_trickle refresh worker: fixpoint iteration {} failed on {}.{}",
+                            iteration + 1,
+                            st.pgt_schema,
+                            st.pgt_name
+                        );
                         iteration_ok = false;
                         break;
                     }
@@ -863,7 +879,9 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
             subtxn.commit();
         }
 
-        if !any_refreshed { continue; }
+        if !any_refreshed {
+            continue;
+        }
 
         let mut total_changes: i64 = 0;
         for &pgt_id in member_ids {
@@ -874,14 +892,24 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
         }
 
         if total_changes == 0 {
-            log!("pg_trickle refresh worker: fixpoint reached after {} iteration(s)", iteration + 1);
+            log!(
+                "pg_trickle refresh worker: fixpoint reached after {} iteration(s)",
+                iteration + 1
+            );
             return RefreshOutcome::Success;
         }
 
-        log!("pg_trickle refresh worker: fixpoint iteration {} yielded {} change(s), continuing...", iteration + 1, total_changes);
+        log!(
+            "pg_trickle refresh worker: fixpoint iteration {} yielded {} change(s), continuing...",
+            iteration + 1,
+            total_changes
+        );
     }
 
-    pgrx::warning!("pg_trickle refresh worker: SCC fixpoint failed to converge after {} iterations", max_iter);
+    pgrx::warning!(
+        "pg_trickle refresh worker: SCC fixpoint failed to converge after {} iterations",
+        max_iter
+    );
     RefreshOutcome::PermanentFailure
 }
 
@@ -1418,7 +1446,10 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             if pg_sys::ConfigReloadPending != 0 {
                 pg_sys::ConfigReloadPending = 0;
                 pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
-pgrx::info!("pg_trickle scheduler: SIGHUP processed, allow_circular is now {}", config::pg_trickle_allow_circular()); 
+                pgrx::info!(
+                    "pg_trickle scheduler: SIGHUP processed, allow_circular is now {}",
+                    config::pg_trickle_allow_circular()
+                );
             }
         }
 
