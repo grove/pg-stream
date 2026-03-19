@@ -3339,7 +3339,7 @@ fn source_gates_fn() -> TableIterator<
             .unwrap_or_else(|e| {
                 pgrx::warning!("source_gates: SPI error: {}", e);
                 // Return an empty iterator-compatible value via an empty Vec
-                panic!("source_gates: SPI error: {}", e)
+                pgrx::error!("source_gates: SPI error: {}", e)
             });
 
         let mut out = Vec::new();
@@ -3542,7 +3542,7 @@ fn watermarks_fn() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| panic!("watermarks: SPI error: {}", e));
+            .unwrap_or_else(|e| pgrx::error!("watermarks: SPI error: {}", e));
 
         let mut out = Vec::new();
         for row in table {

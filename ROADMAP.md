@@ -1548,9 +1548,9 @@ These items are correct as implemented but scale with data size rather than delt
 - [ ] P3-1: Window partition O(partition_size) cost documented; heuristic downgrade implemented or explicitly deferred
 - [ ] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns implemented or explicitly deferred to v0.10.0+
 - [ ] P3-3: Scalar subquery C₀ EXCEPT ALL scan gated behind inner-source stability check or explicitly deferred
-- [ ] D1: Recursive CTE DIFFERENTIAL mode limitation documented in SQL_REFERENCE.md and DVM_OPERATORS.md
-- [ ] D2: `pgt_refresh_groups` table schema and interim workflow documented in SQL_REFERENCE.md
-- [ ] G-1: `panic!()` replaced with `pgrx::error!()` in `source_gates()` and `watermarks()` SQL functions
+- [x] D1: Recursive CTE DIFFERENTIAL mode limitation documented in SQL_REFERENCE.md and DVM_OPERATORS.md
+- [x] D2: `pgt_refresh_groups` table schema and interim workflow documented in SQL_REFERENCE.md
+- [x] G-1: `panic!()` replaced with `pgrx::error!()` in `source_gates()` and `watermarks()` SQL functions
 - [ ] G-2 (P2-5): `changed_cols` bitmask consumed in delta scan CTE — referenced-column mask filter injected
 - [ ] G-3 (P2-6): LATERAL subquery inner-source change scoped to correlated outer rows (O(delta) not O(|outer|))
 - [ ] G-4 (P2-7): Delta predicate pushdown implemented (pushable predicates injected into change buffer scan CTE)
