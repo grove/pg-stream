@@ -1426,11 +1426,11 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 > the source tables. B-3 merges those passes into one and prunes UNION ALL
 > branches for sources with no changes.
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| B3-1 | Intra-query delta-branch pruning: skip UNION ALL branch entirely when a source has zero changes in this cycle | 1–2 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
-| B3-2 | Merged-delta generation: weight aggregation (`GROUP BY __pgt_row_id, SUM(weight)`) for cross-source deduplication; remove zero-weight rows | 3–4 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
-| B3-3 | Property-based correctness tests for simultaneous multi-source changes; diamond-flow scenarios | 1–2 wk | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| B3-1 | Intra-query delta-branch pruning: skip UNION ALL branch entirely when a source has zero changes in this cycle | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-2 | Merged-delta generation: weight aggregation (`GROUP BY __pgt_row_id, SUM(weight)`) for cross-source deduplication; remove zero-weight rows | 3–4 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-3 | Property-based correctness tests for simultaneous multi-source changes; diamond-flow scenarios | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
 
 > ⚠️ Cross-delta deduplication **must use weight aggregation (`SUM(weight)` grouped by
 > `__pgt_row_id`), not `DISTINCT ON`**. `DISTINCT ON` silently discards corrections
@@ -1463,6 +1463,8 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 |------|-------------|--------|--------|-----|
 | A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | ✅ Done | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
 | A7 | Skip-unchanged-column scanning in delta SQL (requires column-usage demand-propagation pass in DVM parser) | ~1–2d | ✅ Done | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.4 |
+| EC-03 | Window-in-expression DIFFERENTIAL fallback warning: emit a `WARNING` (and eventually an `INFO` hint) when a stream table with `CASE WHEN window_fn() OVER (...) ...` silently falls back from DIFFERENTIAL to FULL refresh mode; currently fails at runtime with `column st.* does not exist` — no user-visible signal exists | ~1d | ⬜ Not started | [PLAN_EDGE_CASES.md §EC-03](plans/PLAN_EDGE_CASES.md) |
+| A8 | `pgt_refresh_groups` SQL API: companion functions (`pgtrickle.pgt_add_refresh_group()`, `pgtrickle.pgt_remove_refresh_group()`, `pgtrickle.pgt_list_refresh_groups()`) for the Cross-Source Snapshot Consistency catalog table introduced in the `0.8.0→0.9.0` upgrade script; table exists but has no user-facing API | ~2–3d | ⬜ Not started | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
 
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 
@@ -1489,6 +1491,11 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 - [x] G6 Test Coverage expanded (G6.1, G6.2, G6.3, G6.5)
 - [x] F15: Selective CDC Column Capture (optimize I/O by only tracking columns referenced in query lineage) 
 - [x] F40: Extension Upgrade Migration Scripts (finalize versioned SQL schema migrations)
+- [ ] B3-1: Delta-branch pruning for zero-change sources (skip UNION ALL branch when source has no changes)
+- [ ] B3-2: Merged-delta weight aggregation (`SUM(weight) GROUP BY __pgt_row_id`) for cross-source deduplication
+- [ ] B3-3: Property-based correctness tests for simultaneous multi-source and diamond-flow scenarios
+- [ ] EC-03: WARNING emitted when window-in-expression query silently falls back from DIFFERENTIAL to FULL refresh mode
+- [ ] A8: `pgt_refresh_groups` SQL API (`pgt_add_refresh_group`, `pgt_remove_refresh_group`, `pgt_list_refresh_groups`)
 
 ---
 
