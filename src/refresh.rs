@@ -419,15 +419,47 @@ const PLANNER_HINT_WORKMEM_THRESHOLD: i64 = 10_000;
 
 /// Apply `SET LOCAL` planner hints based on the estimated delta size.
 ///
-/// - delta < 100 rows: no hints (let planner optimise for small data)
+/// - Small delta (ratio < merge_seqscan_threshold): `SET LOCAL enable_seqscan = off`
+///   to force index lookups on the stream table.
 /// - delta 100–9 999: `SET LOCAL enable_nestloop = off`
 /// - delta >= 10 000: also `SET LOCAL work_mem = '<N>MB'`
 ///
 /// `SET LOCAL` is automatically reset at the end of the current transaction,
 /// so these hints cannot leak to other queries.
-fn apply_planner_hints(estimated_delta: i64) {
+fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid) {
     if !crate::config::pg_trickle_merge_planner_hints() {
         return;
+    }
+
+    // P3-4: For small deltas against large stream tables, disable seqscan
+    // to force index lookups on __pgt_row_id.
+    let seqscan_threshold = crate::config::pg_trickle_merge_seqscan_threshold();
+    if seqscan_threshold > 0.0
+        && estimated_delta > 0
+        && estimated_delta < PLANNER_HINT_NESTLOOP_THRESHOLD
+    {
+        let st_rows: i64 = Spi::get_one_with_args::<i64>(
+            "SELECT GREATEST(reltuples::bigint, 1) FROM pg_class WHERE oid = $1",
+            &[st_relid.into()],
+        )
+        .unwrap_or(Some(1000))
+        .unwrap_or(1000);
+
+        let ratio = estimated_delta as f64 / st_rows as f64;
+        if ratio < seqscan_threshold {
+            if let Err(e) = Spi::run("SET LOCAL enable_seqscan = off") {
+                pgrx::debug1!(
+                    "[pg_trickle] P3-4: failed to SET LOCAL enable_seqscan: {}",
+                    e
+                );
+            } else {
+                pgrx::debug1!(
+                    "[pg_trickle] P3-4: delta/ST ratio {:.6} < threshold {:.4}, disabled seqscan",
+                    ratio,
+                    seqscan_threshold,
+                );
+            }
+        }
     }
 
     if estimated_delta >= PLANNER_HINT_WORKMEM_THRESHOLD {
@@ -2236,7 +2268,7 @@ pub fn execute_differential_refresh(
     // ── D-1: Conditional planner hints based on delta size ───────────
     // Large deltas benefit from hash joins over nested loops. Apply
     // SET LOCAL hints that are automatically reset at transaction end.
-    apply_planner_hints(total_change_count);
+    apply_planner_hints(total_change_count, st.pgt_relid);
 
     // ── A-3a: Append-only INSERT fast path ───────────────────────────
     // When the stream table is marked append-only (and hasn't been

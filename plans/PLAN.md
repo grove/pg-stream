@@ -6,6 +6,8 @@
 > - **F40**: Extension Upgrade Migrations & DB Schema Stability — *Code complete, awaiting final package*
 > - **EC-03**: Window-in-expression DIFFERENTIAL fallback warning — ✅ **Complete**
 > - **A8**: `pgt_refresh_groups` SQL API — ✅ **Complete**
+> - **P3-4**: Index-aware MERGE planning (seqscan disable for small deltas) — ✅ **Complete**
+> - **P3-5**: `auto_backoff` GUC for falling-behind stream tables — ✅ **Complete**
 
 ### F40 Status Update
 
@@ -26,6 +28,8 @@ One item remains before F40 is fully closed:
 > - **F40**: Extension Upgrade Migrations & DB Schema Stability - *Code complete, awaiting final package*
 > - **EC-03**: Window-in-expression DIFFERENTIAL fallback warning — ✅ **Complete**
 > - **A8**: `pgt_refresh_groups` SQL API — ✅ **Complete**
+> - **P3-4**: Index-aware MERGE planning (seqscan disable for small deltas) — ✅ **Complete**
+> - **P3-5**: `auto_backoff` GUC for falling-behind stream tables — ✅ **Complete**
 
 ### F15 Status Update (Selective CDC Column Capture)
 

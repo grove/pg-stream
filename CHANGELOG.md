@@ -38,6 +38,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   - `pgtrickle.refresh_groups()` — returns all declared refresh groups with member counts.
   Validation includes: member existence check, duplicate-membership prevention, and
   isolation level validation. DAG rebuild is signaled on create/drop.
+- **Automatic schedule backoff** (P3-5): New GUC `pg_trickle.auto_backoff` (default `off`).
+  When enabled, the scheduler automatically backs off stream tables that are falling behind
+  their schedule. The backoff factor doubles each cycle (capped at 64×) and resets on the
+  first on-time completion. This prevents runaway refresh storms on overloaded systems.
+- **Index-aware MERGE planner hints** (P3-4): New GUC `pg_trickle.merge_seqscan_threshold`
+  (default `0.001`). When the delta-to-stream-table row ratio is below this threshold,
+  `SET LOCAL enable_seqscan = off` is applied to the MERGE transaction, coercing PostgreSQL
+  into using the `__pgt_row_id` index instead of a full sequential scan.
 
 ### Fixed
 - **Backend crash on SPI error in `source_gates()` and `watermarks()`** (G-1): Both SQL-callable

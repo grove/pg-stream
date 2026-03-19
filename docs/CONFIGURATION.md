@@ -23,6 +23,8 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.differential\_max\_change\_ratio](#pg_trickledifferential_max_change_ratio)
     - [pg\_trickle.merge\_planner\_hints](#pg_tricklemerge_planner_hints)
     - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
+    - [pg\_trickle.merge\_seqscan\_threshold](#pg_tricklemerge_seqscan_threshold)
+    - [pg\_trickle.auto\_backoff](#pg_trickleauto_backoff)
     - [pg\_trickle.cleanup\_use\_truncate](#pg_tricklecleanup_use_truncate)
     - [pg\_trickle.use\_prepared\_statements](#pg_trickleuse_prepared_statements)
     - [pg\_trickle.user\_triggers](#pg_trickleuser_triggers)
@@ -422,6 +424,58 @@ A higher value lets PostgreSQL use larger in-memory hash tables for the MERGE jo
 
 ```sql
 SET pg_trickle.merge_work_mem_mb = 128;
+```
+
+---
+
+### pg_trickle.merge_seqscan_threshold
+
+Delta-to-ST row ratio below which sequential scans are disabled for the MERGE transaction. Requires [planner hints](#pg_tricklemerge_planner_hints) to be enabled.
+
+| Property | Value |
+|---|---|
+| Type | `real` |
+| Default | `0.001` |
+| Range | `0.0` – `1.0` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When the estimated delta row count divided by the stream table's `reltuples` falls below this threshold, the refresh executor issues `SET LOCAL enable_seqscan = off`, coercing PostgreSQL into using the `__pgt_row_id` B-tree index instead of a full sequential scan.
+
+Set to `0.0` to disable the feature entirely.
+
+**Tuning Guidance:**
+- **Default (`0.001`)**: Suitable for most workloads. A 10M-row ST with fewer than 10K delta rows triggers the hint.
+- **High-throughput / small STs**: Increase to `0.01` if your STs are small and you want more aggressive index usage.
+- **Disable**: Set to `0.0` if index-only scans are not beneficial for your access pattern.
+
+```sql
+SET pg_trickle.merge_seqscan_threshold = 0.01;
+```
+
+---
+
+### pg_trickle.auto_backoff
+
+Automatically back off the refresh schedule when a stream table is consistently falling behind.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `off` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, the scheduler tracks a per-stream-table exponential backoff factor. If a refresh cycle takes more than 80% of the scheduled interval, the backoff factor doubles (capped at 64×), effectively stretching the schedule to avoid runaway refresh storms. The factor resets to 1× on the first on-time completion.
+
+This is a safety net for overloaded systems — it prevents a single slow stream table from monopolizing the background worker when operators are not available to intervene.
+
+**Tuning Guidance:**
+- **Leave off** unless you observe `scheduler_falling_behind` NOTIFY alerts on production systems.
+- **Enable** if you run many stream tables with tight schedules and want graceful degradation under load.
+
+```sql
+SET pg_trickle.auto_backoff = on;
 ```
 
 ---

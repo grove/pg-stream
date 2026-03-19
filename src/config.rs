@@ -169,6 +169,29 @@ pub static PGS_MAX_GROUPING_SET_BRANCHES: GucSetting<i32> = GucSetting::<i32>::n
 /// Typical values: 100–1000, depending on workload precision requirements.
 pub static PGS_ALGEBRAIC_DRIFT_RESET_CYCLES: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// P3-5: Automatic schedule backoff for falling-behind stream tables.
+///
+/// When enabled and a stream table's refresh duration exceeds 80% of its
+/// schedule interval (the falling-behind threshold), the scheduler doubles
+/// the effective interval on each consecutive falling-behind cycle. The
+/// backoff factor resets to 1.0 on the first on-time cycle.
+///
+/// This prevents CPU runaway when a stream table's refresh cost exceeds
+/// its schedule budget and an operator is not available to respond manually.
+pub static PGS_AUTO_BACKOFF: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// P3-4: Delta-to-ST-size ratio below which `SET LOCAL enable_seqscan = off`
+/// is applied before MERGE execution.
+///
+/// For small deltas against large stream tables, PostgreSQL's planner often
+/// chooses a sequential scan of the stream table for the MERGE join on
+/// `__pgt_row_id`, yielding O(n) full-table I/O when an index lookup would
+/// be O(log n). When the delta row count is below this fraction of the
+/// stream table's estimated row count, the seqscan is disabled.
+///
+/// Set to 0.0 to disable this optimization.
+pub static PGS_MERGE_SEQSCAN_THRESHOLD: GucSetting<f64> = GucSetting::<f64>::new(0.001);
+
 /// Maximum LIMIT value for TopK stream tables in IMMEDIATE mode.
 ///
 /// TopK queries with `LIMIT > threshold` are rejected in IMMEDIATE mode
@@ -655,6 +678,30 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.auto_backoff",
+        c"Automatically back off schedule for falling-behind stream tables.",
+        c"When enabled and a stream table's refresh duration exceeds 80% of its \
+           schedule interval, the scheduler doubles the effective interval on each \
+           consecutive falling-behind cycle. Resets on the first on-time cycle.",
+        &PGS_AUTO_BACKOFF,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_float_guc(
+        c"pg_trickle.merge_seqscan_threshold",
+        c"Delta-to-ST ratio below which sequential scans are disabled for MERGE.",
+        c"When the delta row count is below this fraction of the stream table size, \
+           SET LOCAL enable_seqscan = off is applied before MERGE to favor index \
+           lookups. Set to 0.0 to disable.",
+        &PGS_MERGE_SEQSCAN_THRESHOLD,
+        0.0, // min (disabled)
+        1.0, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -662,6 +709,16 @@ pub fn register_gucs() {
 /// Returns the number of differential cycles before automatic drift reset.
 pub fn pg_trickle_algebraic_drift_reset_cycles() -> i32 {
     PGS_ALGEBRAIC_DRIFT_RESET_CYCLES.get()
+}
+
+/// Returns whether automatic schedule backoff is enabled for falling-behind STs.
+pub fn pg_trickle_auto_backoff() -> bool {
+    PGS_AUTO_BACKOFF.get()
+}
+
+/// Returns the delta-to-ST ratio threshold for disabling seqscan before MERGE.
+pub fn pg_trickle_merge_seqscan_threshold() -> f64 {
+    PGS_MERGE_SEQSCAN_THRESHOLD.get()
 }
 
 /// Returns the current value of `pg_trickle.enabled`.
