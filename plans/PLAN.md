@@ -14,6 +14,13 @@
 > - **P2-5**: `changed_cols` bitmask filter in delta scan CTE — ✅ **Complete**
 > - **P2-3**: DISTINCT index-driven `__pgt_count` lookup — ✅ **Complete**
 > - **P2-7**: Delta predicate pushdown into scan CTE — ✅ **Complete**
+> - **P2-1**: Recursive CTE DRed for DIFFERENTIAL mode — ⏭️ **Deferred to v0.10.0** (high risk; fallback to recomputation is correct)
+> - **P2-2**: SUM NULL-transition rescan optimization — ⏭️ **Deferred to v0.10.0** (requires auxiliary nonnull-count columns; rescan is correct)
+> - **P2-4**: Materialized view sources in IMMEDIATE mode — ⏭️ **Deferred to v0.10.0** (requires external polling wrapper; out of scope)
+> - **P2-6**: LATERAL subquery inner-source scoping — ⏭️ **Deferred to v0.10.0** (requires correlation predicate extraction; full re-execution is correct)
+> - **P3-2**: Welford auxiliary columns for CORR/COVAR/REGR_* — ⏭️ **Deferred to v0.10.0** (group-rescan strategy already works correctly)
+> - **B3-2**: Merged-delta weight aggregation — ⏭️ **Deferred to v0.10.0** (very high silent-corruption risk; needs property-based proofs)
+> - **B3-3**: Property-based tests for B3-2 — ⏭️ **Deferred to v0.10.0** (blocked on B3-2)
 
 ### F40 Status Update
 
@@ -42,6 +49,13 @@ One item remains before F40 is fully closed:
 > - **P2-5**: `changed_cols` bitmask filter in delta scan CTE — ✅ **Complete**
 > - **P2-3**: DISTINCT index-driven `__pgt_count` lookup — ✅ **Complete**
 > - **P2-7**: Delta predicate pushdown into scan CTE — ✅ **Complete**
+> - **P2-1**: Recursive CTE DRed for DIFFERENTIAL mode — ⏭️ **Deferred to v0.10.0** (high risk; fallback to recomputation is correct)
+> - **P2-2**: SUM NULL-transition rescan optimization — ⏭️ **Deferred to v0.10.0** (requires auxiliary nonnull-count columns; rescan is correct)
+> - **P2-4**: Materialized view sources in IMMEDIATE mode — ⏭️ **Deferred to v0.10.0** (requires external polling wrapper; out of scope)
+> - **P2-6**: LATERAL subquery inner-source scoping — ⏭️ **Deferred to v0.10.0** (requires correlation predicate extraction; full re-execution is correct)
+> - **P3-2**: Welford auxiliary columns for CORR/COVAR/REGR_* — ⏭️ **Deferred to v0.10.0** (group-rescan strategy already works correctly)
+> - **B3-2**: Merged-delta weight aggregation — ⏭️ **Deferred to v0.10.0** (very high silent-corruption risk; needs property-based proofs)
+> - **B3-3**: Property-based tests for B3-2 — ⏭️ **Deferred to v0.10.0** (blocked on B3-2)
 
 ### F15 Status Update (Selective CDC Column Capture)
 

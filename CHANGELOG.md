@@ -98,6 +98,26 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   of window function maintenance. Includes mitigation strategies: use fine-grained
   PARTITION BY keys, restructure as GROUP BY when equivalent, or accept FULL refresh mode.
 
+### Deferred to v0.10.0
+The following stretch-goal items were analysed and explicitly deferred. In all cases the
+current behaviour is **correct** — these are performance optimizations of existing fallback paths:
+- **P2-1** (Recursive CTE DRed in DIFFERENTIAL mode): falls back to full recomputation;
+  porting DRed to ChangeBuffer mode requires old-state reconstruction that is fragile and
+  high-risk.
+- **P2-2** (SUM NULL-transition rescan): rescan CTE gives correct NULL result; the algebraic
+  shortcut requires auxiliary nonnull-count columns — a schema-level change with multi-path
+  impact.
+- **P2-4** (Materialized view sources in IMMEDIATE mode): requires an external
+  polling-change-detection wrapper since materialized views do not fire triggers.
+- **P2-6** (LATERAL subquery inner-source scoping): full re-execution of outer rows is
+  correct; scoping to correlated rows requires correlation predicate extraction from raw SQL.
+- **P3-2** (Welford auxiliary columns for CORR/COVAR/REGR_*): these aggregates already work
+  correctly via the group-rescan strategy; Welford upgrade reduces cost from O(group_size)
+  to O(1) but requires new auxiliary column infrastructure.
+- **B3-2 / B3-3** (Merged-delta weight aggregation + property-based tests): very high
+  silent-corruption risk; weight aggregation with `SUM(weight) GROUP BY __pgt_row_id` must
+  not be merged without comprehensive property-based correctness proofs.
+
 ---
 
 ## [0.8.0] — 2026-03-17
