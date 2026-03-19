@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-19
-> **Latest release:** 0.8.0 (2026-03-17)
-> **Current milestone:** v0.9.0 — Incremental Aggregate Maintenance
+> **Last updated:** 2026-03-20
+> **Latest release:** 0.9.0 (2026-03-20)
+> **Current milestone:** v0.10.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -1306,6 +1306,8 @@ that re-links orphaned catalog entries on extension restore.
 ---
 
 ## v0.9.0 — Incremental Aggregate Maintenance
+
+**Status: Released (2026-03-20).**
 
 **Goal:** Implement algebraic incremental maintenance for decomposable aggregates
 (COUNT, SUM, AVG, MIN, MAX, STDDEV), reducing per-group refresh from O(group_size)
