@@ -1801,6 +1801,11 @@ impl OpTree {
             // Bail out — found Star/Raw that prevent safe pruning.
             return;
         }
+        // If no column refs were collected (e.g. SELECT * with no Project wrapper),
+        // bail out to avoid incorrectly pruning all non-PK columns.
+        if refs.qualified.is_empty() && refs.unqualified.is_empty() {
+            return;
+        }
         self.apply_column_pruning(&refs);
     }
 

@@ -4187,4 +4187,86 @@ mod tests {
             "COALESCE(d.\"__ins_total\", 0) - COALESCE(d.\"__del_total\", 0)",
         );
     }
+
+    #[test]
+    fn test_diff_aggregate_mixed_count_sum_complex_expression() {
+        // Simulates: SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total,
+        //            ROUND(ROUND(STDDEV_POP(amount), 4), 4) AS sd
+        //            FROM mstat_src GROUP BY dept
+        // The ComplexExpression is a group-rescan aggregate; COUNT* and SUM are algebraic.
+        let mut ctx = test_ctx_with_st("public", "mstat_st");
+        let child = scan(
+            1,
+            "mstat_src",
+            "public",
+            "mstat_src",
+            &["id", "dept", "amount"],
+        );
+
+        let complex_sd = AggExpr {
+            function: AggFunc::ComplexExpression(
+                "round(round(stddev_pop(amount), 4), 4)".to_string(),
+            ),
+            argument: None,
+            alias: "sd".to_string(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+
+        let tree = aggregate(
+            vec![colref("dept")],
+            vec![count_star("cnt"), sum_col("amount", "total"), complex_sd],
+            child,
+        );
+
+        let result = diff_aggregate(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Rescan CTE should be present because ComplexExpression requires it
+        assert_sql_contains(&sql, "agg_rescan");
+
+        // ComplexExpression delta tracking should count insertions
+        assert_sql_contains(&sql, "__ins_sd");
+        assert_sql_contains(&sql, "__del_sd");
+
+        // The rescan CTE should compute the ComplexExpression from source
+        assert_sql_contains(&sql, "round(round(stddev_pop(amount), 4), 4)");
+
+        // COUNT* should use algebraic merge
+        assert_sql_contains(
+            &sql,
+            "COALESCE(d.\"__ins_cnt\", 0) - COALESCE(d.\"__del_cnt\", 0)",
+        );
+
+        // SUM should use algebraic merge (no full-join child)
+        assert_sql_contains(
+            &sql,
+            "COALESCE(d.\"__ins_total\", 0) - COALESCE(d.\"__del_total\", 0)",
+        );
+
+        // ComplexExpression should use rescan CTE value when changed
+        assert_sql_contains(&sql, "THEN r.\"sd\"");
+
+        // Output columns should include cnt, total, sd but NOT aux columns
+        assert!(result.columns.contains(&"cnt".to_string()));
+        assert!(result.columns.contains(&"total".to_string()));
+        assert!(result.columns.contains(&"sd".to_string()));
+        assert!(
+            !result.columns.contains(&"__pgt_aux_sum_sd".to_string()),
+            "ComplexExpression should not create aux sum columns"
+        );
+        assert!(
+            !result.columns.contains(&"__pgt_aux_count_sd".to_string()),
+            "ComplexExpression should not create aux count columns"
+        );
+        assert!(
+            !result.columns.contains(&"__pgt_aux_sum2_sd".to_string()),
+            "ComplexExpression should not create aux sum2 columns"
+        );
+
+        // Print SQL for debugging (will only show when test fails or with --nocapture)
+        eprintln!("=== Mixed COUNT* + SUM + ComplexExpression SQL ===\n{sql}");
+    }
 }
