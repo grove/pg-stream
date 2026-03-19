@@ -21,7 +21,7 @@
 //! eliminating `jsonb_populate_record` overhead.
 
 use crate::dvm::diff::{DeltaSource, DiffContext, DiffResult, quote_ident};
-use crate::dvm::parser::OpTree;
+use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
 
 /// Differentiate a Scan node.
@@ -564,6 +564,20 @@ SELECT * FROM {multi_cte}",
     // tables where UPDATE changes ALL columns and thus the hash.
     // INSERT __pgt_row_id uses __pk_hash (from NEW column values).
 
+    // ── P2-7: Build pushed-filter WHERE clauses ──────────────────────
+    //
+    // When a Filter was pushed into this Scan (via DiffContext), inject
+    // the rewritten predicate into the final scan CTE's output branches.
+    // DELETE branch uses `old_` column prefixes, INSERT uses `new_`.
+    let (del_pushed_filter, ins_pushed_filter) =
+        if let Some(ref predicate) = ctx.scan_pushed_predicate {
+            let del = rewrite_predicate_for_scan(predicate, "old_");
+            let ins = rewrite_predicate_for_scan(predicate, "new_");
+            (format!("\nWHERE {del}"), format!("\nWHERE {ins}"))
+        } else {
+            (String::new(), String::new())
+        };
+
     let sql = if ctx.merge_safe_dedup {
         // ── Merge-safe dedup mode ──────────────────────────────────────
         // Emit at most ONE row per PK: DELETE only for true deletes OR
@@ -586,7 +600,7 @@ FROM (
   WHERE s.__first_action != 'I'
     AND (s.__last_action = 'D' OR s.__pk_hash_old != s.__pk_hash)
   ORDER BY s.__pk_hash_old, s.change_id
-) c
+) c{del_pushed_filter}
 
 UNION ALL
 
@@ -600,7 +614,7 @@ FROM (
   FROM {raw_cte_name} s
   WHERE s.__last_action != 'D'
   ORDER BY s.__pk_hash, s.change_id DESC
-) c",
+) c{ins_pushed_filter}",
             old_col_refs = old_col_refs.join(",\n       "),
             new_col_refs = new_col_refs.join(",\n       "),
         )
@@ -623,7 +637,7 @@ FROM (
   FROM {raw_cte_name} s
   WHERE s.action != 'I' AND s.__first_action != 'I'
   ORDER BY s.__pk_hash, s.change_id
-) c
+) c{del_pushed_filter}
 
 UNION ALL
 
@@ -638,7 +652,7 @@ FROM (
   FROM {raw_cte_name} s
   WHERE s.action != 'D' AND s.__last_action != 'D'
   ORDER BY s.__pk_hash, s.change_id DESC
-) c",
+) c{ins_pushed_filter}",
             old_col_refs = old_col_refs.join(",\n       "),
             new_col_refs = new_col_refs.join(",\n       "),
         )
@@ -686,6 +700,69 @@ fn compute_changed_cols_mask(
         }
     }
     mask
+}
+
+// ── P2-7: Predicate pushdown helpers ────────────────────────────────────
+
+/// Check whether a predicate can be pushed into a Scan's final CTE.
+///
+/// A predicate is pushable when every column reference resolves to a column
+/// in `scan_columns` (identified by the scan's alias or unqualified), and
+/// the expression contains no `Raw` or `Star` nodes (which can't be
+/// reliably rewritten to use `old_`/`new_` column prefixes).
+pub fn is_predicate_pushable_to_scan(
+    expr: &Expr,
+    scan_alias: &str,
+    scan_col_names: &[String],
+) -> bool {
+    match expr {
+        Expr::ColumnRef {
+            table_alias,
+            column_name,
+        } => match table_alias {
+            Some(alias) if alias == scan_alias => scan_col_names.contains(column_name),
+            None => scan_col_names.contains(column_name),
+            _ => false,
+        },
+        Expr::Literal(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            is_predicate_pushable_to_scan(left, scan_alias, scan_col_names)
+                && is_predicate_pushable_to_scan(right, scan_alias, scan_col_names)
+        }
+        Expr::FuncCall { args, .. } => args
+            .iter()
+            .all(|a| is_predicate_pushable_to_scan(a, scan_alias, scan_col_names)),
+        Expr::Raw(_) | Expr::Star { .. } => false,
+    }
+}
+
+/// Rewrite a predicate expression for use in a change buffer scan CTE.
+///
+/// Each `ColumnRef` is mapped to `c."<prefix><column_name>"` where
+/// `prefix` is `"old_"` for the DELETE branch or `"new_"` for the
+/// INSERT branch.
+pub fn rewrite_predicate_for_scan(expr: &Expr, prefix: &str) -> String {
+    match expr {
+        Expr::ColumnRef { column_name, .. } => {
+            format!("c.\"{}{}\"", prefix, column_name.replace('"', "\"\""))
+        }
+        Expr::Literal(val) => val.clone(),
+        Expr::BinaryOp { op, left, right } => {
+            format!(
+                "({} {op} {})",
+                rewrite_predicate_for_scan(left, prefix),
+                rewrite_predicate_for_scan(right, prefix),
+            )
+        }
+        Expr::FuncCall { func_name, args } => {
+            let rewritten: Vec<String> = args
+                .iter()
+                .map(|a| rewrite_predicate_for_scan(a, prefix))
+                .collect();
+            format!("{func_name}({})", rewritten.join(", "))
+        }
+        _ => expr.to_sql(),
+    }
 }
 
 /// Build a hash expression from a list of SQL expressions.
@@ -1235,5 +1312,129 @@ mod tests {
 
         // Should NOT have a changed_cols filter
         assert!(!sql.contains("changed_cols"));
+    }
+
+    // ── P2-7: predicate pushdown ────────────────────────────────────
+
+    #[test]
+    fn test_is_predicate_pushable_column_ref_qualified() {
+        let cols = vec!["id".into(), "status".into()];
+        let expr = Expr::BinaryOp {
+            op: "=".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".into()),
+                column_name: "status".into(),
+            }),
+            right: Box::new(Expr::Literal("'shipped'".into())),
+        };
+        assert!(is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_is_predicate_pushable_unqualified() {
+        let cols = vec!["id".into(), "amount".into()];
+        let expr = Expr::BinaryOp {
+            op: ">".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: None,
+                column_name: "amount".into(),
+            }),
+            right: Box::new(Expr::Literal("100".into())),
+        };
+        assert!(is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_is_predicate_not_pushable_wrong_alias() {
+        let cols = vec!["id".into()];
+        let expr = Expr::ColumnRef {
+            table_alias: Some("other".into()),
+            column_name: "id".into(),
+        };
+        assert!(!is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_is_predicate_not_pushable_raw() {
+        let cols = vec!["id".into()];
+        let expr = Expr::Raw("id > 5".into());
+        assert!(!is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_rewrite_predicate_for_scan_old() {
+        let expr = Expr::BinaryOp {
+            op: "=".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".into()),
+                column_name: "status".into(),
+            }),
+            right: Box::new(Expr::Literal("'shipped'".into())),
+        };
+        let sql = rewrite_predicate_for_scan(&expr, "old_");
+        assert_eq!(sql, "(c.\"old_status\" = 'shipped')");
+    }
+
+    #[test]
+    fn test_rewrite_predicate_for_scan_new() {
+        let expr = Expr::BinaryOp {
+            op: "AND".into(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "status".into(),
+                }),
+                right: Box::new(Expr::Literal("'shipped'".into())),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: ">".into(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "amount".into(),
+                }),
+                right: Box::new(Expr::Literal("100".into())),
+            }),
+        };
+        let sql = rewrite_predicate_for_scan(&expr, "new_");
+        assert_eq!(
+            sql,
+            "((c.\"new_status\" = 'shipped') AND (c.\"new_amount\" > 100))"
+        );
+    }
+
+    #[test]
+    fn test_p2_7_pushed_filter_in_sql() {
+        // When a predicate is pushed, the scan CTE should contain
+        // old_/new_ column filters.
+        let mut ctx = test_ctx();
+        ctx.scan_pushed_predicate = Some(Expr::BinaryOp {
+            op: "=".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: None,
+                column_name: "status".into(),
+            }),
+            right: Box::new(Expr::Literal("'shipped'".into())),
+        });
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "status"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // DELETE branch should filter on old_status
+        assert_sql_contains(&sql, "c.\"old_status\" = 'shipped'");
+        // INSERT branch should filter on new_status
+        assert_sql_contains(&sql, "c.\"new_status\" = 'shipped'");
+    }
+
+    #[test]
+    fn test_p2_7_no_pushed_filter_without_predicate() {
+        // Without a pushed predicate, no old_/new_ filter clauses.
+        let mut ctx = test_ctx();
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "status"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        assert!(!sql.contains("old_status\" ="));
+        assert!(!sql.contains("new_status\" ="));
     }
 }

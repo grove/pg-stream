@@ -13,6 +13,7 @@
 > - **P3-1**: Window partition O(partition_size) cost documented — ✅ **Complete**
 > - **P2-5**: `changed_cols` bitmask filter in delta scan CTE — ✅ **Complete**
 > - **P2-3**: DISTINCT index-driven `__pgt_count` lookup — ✅ **Complete**
+> - **P2-7**: Delta predicate pushdown into scan CTE — ✅ **Complete**
 
 ### F40 Status Update
 
@@ -40,6 +41,7 @@ One item remains before F40 is fully closed:
 > - **P3-1**: Window partition O(partition_size) cost documented — ✅ **Complete**
 > - **P2-5**: `changed_cols` bitmask filter in delta scan CTE — ✅ **Complete**
 > - **P2-3**: DISTINCT index-driven `__pgt_count` lookup — ✅ **Complete**
+> - **P2-7**: Delta predicate pushdown into scan CTE — ✅ **Complete**
 
 ### F15 Status Update (Selective CDC Column Capture)
 

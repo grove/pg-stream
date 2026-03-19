@@ -64,6 +64,12 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   uses a correlated scalar subquery instead of LEFT JOIN to fetch the stream table's
   `__pgt_count`. This forces per-row index lookup via the `__pgt_row_id` UNIQUE index,
   guaranteeing O(delta) I/O regardless of PostgreSQL planner cost estimates.
+- **Delta predicate pushdown** (P2-7): WHERE predicates from the defining query are now
+  pushed into the scan operator's final CTE when the Filter sits directly above a Scan.
+  Column references are rewritten to `c."old_col"` / `c."new_col"` for the DELETE/INSERT
+  branches respectively. This filters rows immediately after net-effect computation, before
+  they enter the join/aggregate pipeline. Only applies to PK-based tables with structured
+  (non-Raw) predicates in ChangeBuffer mode.
 
 ### Fixed
 - **Backend crash on SPI error in `source_gates()` and `watermarks()`** (G-1): Both SQL-callable

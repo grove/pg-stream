@@ -143,6 +143,15 @@ pub struct DiffContext {
     /// trigger. Used by `diff_scan_change_buffer` to build a bitmask filter
     /// that skips UPDATE rows where none of the referenced columns changed.
     pub source_cdc_columns: HashMap<u32, Vec<String>>,
+    /// P2-7: Predicate pushed down from a Filter node into the Scan.
+    ///
+    /// When a Filter sits directly above a Scan and the predicate only
+    /// references columns from that Scan, `diff_filter` stores the
+    /// predicate here instead of generating a separate filter CTE.
+    /// `diff_scan_change_buffer` consumes it by injecting rewritten
+    /// `WHERE c."old_col" ...` / `c."new_col" ...` clauses into the
+    /// final scan CTE's DELETE/INSERT branches.
+    pub scan_pushed_predicate: Option<crate::dvm::parser::Expr>,
 }
 
 impl DiffContext {
@@ -168,6 +177,7 @@ impl DiffContext {
             st_column_alias_map: None,
             having_filter: false,
             source_cdc_columns: HashMap::new(),
+            scan_pushed_predicate: None,
         }
     }
 
@@ -196,6 +206,7 @@ impl DiffContext {
             st_column_alias_map: None,
             having_filter: false,
             source_cdc_columns: HashMap::new(),
+            scan_pushed_predicate: None,
         }
     }
 
