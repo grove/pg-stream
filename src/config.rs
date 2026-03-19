@@ -161,6 +161,14 @@ pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(
 /// Maximum allowed grouping set branches for CUBE/ROLLUP expansion (EC-02).
 pub static PGS_MAX_GROUPING_SET_BRANCHES: GucSetting<i32> = GucSetting::<i32>::new(64);
 
+/// Number of differential refresh cycles after which algebraic aggregate
+/// stream tables are automatically reinitialized (full recompute) to reset
+/// accumulated floating-point drift in auxiliary sum/sum2 columns.
+///
+/// Set to 0 to disable periodic drift reset (default).
+/// Typical values: 100–1000, depending on workload precision requirements.
+pub static PGS_ALGEBRAIC_DRIFT_RESET_CYCLES: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 /// Maximum LIMIT value for TopK stream tables in IMMEDIATE mode.
 ///
 /// TopK queries with `LIMIT > threshold` are rejected in IMMEDIATE mode
@@ -634,9 +642,27 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.algebraic_drift_reset_cycles",
+        c"Differential cycles between automatic full recomputes for algebraic aggregates.",
+        c"After this many differential refresh cycles, stream tables with algebraic \
+           aggregates (AVG, STDDEV, VAR) are automatically reinitialized to reset \
+           accumulated floating-point drift in auxiliary columns. 0 disables.",
+        &PGS_ALGEBRAIC_DRIFT_RESET_CYCLES,
+        0,       // min (disabled)
+        100_000, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
+
+/// Returns the number of differential cycles before automatic drift reset.
+pub fn pg_trickle_algebraic_drift_reset_cycles() -> i32 {
+    PGS_ALGEBRAIC_DRIFT_RESET_CYCLES.get()
+}
 
 /// Returns the current value of `pg_trickle.enabled`.
 pub fn pg_trickle_enabled() -> bool {

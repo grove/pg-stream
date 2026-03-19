@@ -1,5 +1,83 @@
 # pg_trickle — Implementation Plan
 
+> **Implementation Status (v0.9.0 Cycle)**
+> Most core architectural phases (Phases 1-12) are now implemented. The remaining critical features necessary to fully close out the v0.9.0 milestone are:
+> - **F15**: Selective CDC Column Capture (Phase 6 Integration) — ✅ **Complete**
+> - **F40**: Extension Upgrade Migrations & DB Schema Stability — *Code complete, awaiting final package*
+
+### F40 Status Update
+
+Implemented for v0.9.0:
+
+- `sql/pg_trickle--0.8.0--0.9.0.sql` covers all new SQL objects (new table `pgt_refresh_groups`, new function `restore_stream_tables`).
+- `sql/archive/pg_trickle--0.9.0.sql` committed as full-install baseline for diff-based checks.
+- Upgrade completeness gate (`scripts/check_upgrade_completeness.sh`) validates functions, views, event triggers, tables, indexes, **and column drift in existing tables** (CHECK 6).
+- `test_upgrade_v090_catalog_additions` (L15) verifies `pgt_refresh_groups` columns, unique constraint, and empty-state after fresh install.
+
+One item remains before F40 is fully closed:
+
+- **Release finalization:** run `cargo pgrx package`, diff the output against `sql/archive/pg_trickle--0.9.0.sql`, resolve any discrepancies, then tag the v0.9.0 release. This is a pre-release checklist step, not a code change.
+
+> **Implementation Status (v0.9.0 Cycle)**
+> Most core architectural phases (Phases 1-12) are now implemented. The remaining critical features necessary to fully close out the v0.9.0 milestone are:
+> - **F15**: Selective CDC Column Capture (Phase 6 Integration) — ✅ **Complete**
+> - **F40**: Extension Upgrade Migrations & DB Schema Stability - *Code complete, awaiting final package*
+
+### F15 Status Update (Selective CDC Column Capture)
+
+**Goal:** Optimize I/O by only tracking columns in the CDC layer which are actually referenced in the query lineage of dependent Stream Tables.
+
+**✅ Fully implemented for v0.9.0.**
+
+All components are in place:
+
+1. **Catalog helper** — `StDependency::union_referenced_columns_for_source(source_oid)` in `src/catalog.rs`:
+   - Queries `pgt_dependencies.columns_used` for all STs that share the given base-table source.
+   - Returns the union as a sorted `Vec<String>`, or `None` when any ST has `columns_used = NULL` (meaning "all columns needed").
+
+2. **CDC resolver** — `cdc::resolve_referenced_column_defs(source_oid)` in `src/cdc.rs`:
+   - Calls the catalog helper to get the union of required columns.
+   - Always adds PK columns (required for `pk_hash` correctness).
+   - Filters `resolve_source_column_defs` to the keep-set, preserving ordinal order.
+   - Falls back to full capture on `None`, empty union, or if the filter would drop all columns.
+
+3. **Monitoring helper** — `cdc::is_selective_capture_active(source_oid)` in `src/cdc.rs`, exposed via `pgtrickle.check_cdc_health()` as the `selective_capture` column:
+   - Returns `true` when the referenced column set is a strict subset of the full column list.
+
+4. **Wired into creation path** — `setup_cdc_for_source` in `src/api.rs`:
+   - Replaced `resolve_source_column_defs` with `resolve_referenced_column_defs`.
+   - At ST creation time, the dependency rows are already written, so the union query finds them.
+
+5. **Wired into rebuild path** — `rebuild_cdc_trigger_function` and `rebuild_cdc_trigger` in `src/cdc.rs`:
+   - Both now use `resolve_referenced_column_defs` so schema-change rebuilds also respect column pruning.
+
+6. **Unit tests** — 6 pure-Rust tests for `filter_cdc_columns` covering:
+   - `None`/empty referenced → full fallback
+   - Filtering to referenced + PK only
+   - Ordinal order preservation
+   - Case-insensitive column name matching
+   - Empty-result safety fallback
+
+7. **E2E integration tests** — 3 tests in `tests/e2e_cdc_tests.rs`:
+   - `test_f15_selective_cdc_buffer_has_only_referenced_columns` — verifies buffer only contains PK + referenced columns; unreferenced columns are pruned; `check_cdc_health()` reports `selective_capture = true`.
+   - `test_f15_selective_cdc_buffer_expands_for_second_stream_table` — verifies that adding a second ST requiring an additional column triggers buffer expansion (union semantics).
+   - `test_f15_select_star_falls_back_to_full_capture` — verifies `SELECT *` sources fall back to full capture; `check_cdc_health()` reports `selective_capture = false`.
+
+**Note on `SELECT *` sources:** When a ST's defining query contains `SELECT *`, the parser emits `columns_used = NULL` (no column list) for that source. The catalog stores `NULL` in `pgt_dependencies.columns_used`, and `union_referenced_columns_for_source` returns `None`, triggering full capture for that source. This is correct and safe — selective capture only activates when every downstream ST has an explicit column list.
+
+### F40 Status Update
+
+Implemented for v0.9.0:
+
+- `sql/pg_trickle--0.8.0--0.9.0.sql` covers all new SQL objects (new table `pgt_refresh_groups`, new function `restore_stream_tables`).
+- `sql/archive/pg_trickle--0.9.0.sql` committed as full-install baseline for diff-based checks.
+- Upgrade completeness gate (`scripts/check_upgrade_completeness.sh`) validates functions, views, event triggers, tables, indexes, **and column drift in existing tables** (CHECK 6).
+- `test_upgrade_v090_catalog_additions` (L15) verifies `pgt_refresh_groups` columns, unique constraint, and empty-state after fresh install.
+
+One item remains before F40 is fully closed:
+
+- **Release finalization:** run `cargo pgrx package`, diff the output against `sql/archive/pg_trickle--0.9.0.sql`, resolve any discrepancies, then tag the v0.9.0 release. This is a pre-release checklist step, not a code change.
+
 ## Streaming tables for PostgreSQL 18 as a Rust Extension
 
 A loadable PostgreSQL 18 extension, written in Rust (pgrx), that provides declarative Stream Tables with automated lag-based scheduling and incremental view maintenance (IVM), implementing Delayed View Semantics (DVS). Users create Stream Tables via SQL functions specifying a defining query, target lag, and refresh mode. A background worker scheduler maintains the DAG of STs, triggers refreshes, and applies incremental deltas computed via a query differentiation engine.

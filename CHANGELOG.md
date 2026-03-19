@@ -29,6 +29,24 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Fixed
+- **Backend crash on SPI error in `source_gates()` and `watermarks()`** (G-1): Both SQL-callable
+  functions previously reached `panic!()` on any SPI failure, which crashes the PostgreSQL backend
+  process. Replaced with `pgrx::error!()` so failures surface as a normal PostgreSQL `ERROR`
+  without terminating the backend.
+
+### Documentation
+- **Recursive CTE DIFFERENTIAL mode limitation** (D1): Corrected [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md)
+  and [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) — the DRed (Delete-and-Rederive) algorithm
+  is only active in `IMMEDIATE` mode. In `DIFFERENTIAL` mode, any cycle with DELETE or UPDATE
+  changes against a recursive CTE source falls back to full recomputation (Strategy 3). The
+  documentation previously implied DRed ran in DIFFERENTIAL mode. A "Known Limitation" callout
+  and updated Strategy Selection table now make this explicit, including the recommended
+  workaround (`refresh_mode = 'IMMEDIATE'`).
+- **`pgt_refresh_groups` catalog table** (D2): Added table schema, column descriptions, and
+  an interim manual INSERT/DELETE workflow to [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md).
+  The user-facing API functions (A8) are not yet implemented.
+
 ---
 
 ## [0.8.0] — 2026-03-17

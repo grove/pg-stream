@@ -1,8 +1,35 @@
 # PLAN_UPGRADE_MIGRATIONS.md — Extension Upgrade Migrations
 
-> **Status:** Phases 1–5 implemented and validated through v0.2.3  
+> **Status:** Core infrastructure implemented; v0.9.0 F40 follow-through is in progress  
 > **Related:** GAP_SQL_PHASE_7.md F40 (G8.3), PLAN_VERSIONING.md  
-> **Last updated:** 2026-03-08
+> **Last updated:** 2026-03-18
+
+## Current Status Snapshot
+
+The upgrade-migration framework is already in place: hand-authored upgrade SQL,
+archived full-install SQL baselines, CI completeness validation, and true
+upgrade E2E tests all exist. For `v0.9.0`, F40 is now in the implementation
+follow-through phase rather than the design phase.
+
+Completed for `v0.9.0` so far:
+
+- Added the `0.8.0 -> 0.9.0` upgrade script.
+- Archived the generated full-install SQL baseline for `0.9.0`.
+- Verified that upgrade E2E infrastructure can target `0.9.0`.
+- Extended the fast completeness gate to validate new tables and indexes in
+  addition to functions, views, and event triggers.
+
+Still remaining before F40 is fully closed for `v0.9.0`:
+
+- **Release finalization only:** run `cargo pgrx package`, verify the output
+  against `sql/archive/pg_trickle--0.9.0.sql` using the completeness script,
+  then tag the release. This is an operational step, not a code change.
+
+All code-level items are now done:
+
+- Column-drift detection added (CHECK 6 in `check_upgrade_completeness.sh`).
+- `test_upgrade_v090_catalog_additions` (L15) asserts the `pgt_refresh_groups`
+  table structure and uniqueness constraint on fresh install.
 
 ---
 

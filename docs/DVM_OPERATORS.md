@@ -583,11 +583,33 @@ The cost is proportional to the full result set size.
 
 ##### Strategy Selection
 
-| CTE columns match ST? | Change type | Strategy |
-|---|---|---|
-| ✅ Match | INSERT-only | Semi-naive (Strategy 1) |
-| ✅ Match | Mixed (INSERT+DELETE/UPDATE) | DRed (Strategy 2) |
-| ❌ Mismatch | Any | Recomputation (Strategy 3) |
+| CTE columns match ST? | Change type | `refresh_mode` / `DeltaSource` | Strategy |
+|---|---|---|---|
+| ✅ Match | INSERT-only | DIFFERENTIAL (ChangeBuffer) | Semi-naive (Strategy 1) |
+| ✅ Match | Mixed (INSERT+DELETE/UPDATE) | DIFFERENTIAL (ChangeBuffer) | **Recomputation (Strategy 3)** |
+| ✅ Match | INSERT-only | IMMEDIATE (TransitionTable) | Semi-naive (Strategy 1) |
+| ✅ Match | Mixed (INSERT+DELETE/UPDATE) | IMMEDIATE (TransitionTable) | DRed (Strategy 2) |
+| ❌ Mismatch | Any | Any | Recomputation (Strategy 3) |
+
+> ⚠️ **Known Limitation — DIFFERENTIAL Mode and Mixed Changes (P2-1)**
+>
+> The DRed (Delete-and-Rederive) algorithm is **only active in IMMEDIATE mode**
+> (`DeltaSource::TransitionTable`). In DIFFERENTIAL mode (`DeltaSource::ChangeBuffer`),
+> any cycle that contains DELETE or UPDATE changes against a recursive CTE source
+> falls back to **full recomputation (Strategy 3)**, not DRed.
+>
+> This means deferred-refresh recursive CTE stream tables with DELETE- or UPDATE-heavy
+> source workloads will run an O(n) full recompute + diff every affected cycle instead
+> of the O(delta) DRed path. FULL refresh mode is more transparent about this cost;
+> DIFFERENTIAL mode silently emits a `pgrx::info!()` message at runtime:
+> ```
+> INFO:  Recursive CTE "<alias>" has mixed deferred changes; using recomputation strategy for correctness.
+> ```
+>
+> **Workaround:** Use `refresh_mode = 'IMMEDIATE'` for recursive CTE stream tables
+> that experience frequent DELETEs or UPDATEs on their source tables. IMMEDIATE mode
+> uses transition tables instead of the change buffer and takes the full DRed path.
+> Tracked as P2-1 in the v0.9.0 roadmap.
 
 **Notes:**
 - Non-linear recursion (multiple self-references in the recursive term) is rejected — PostgreSQL restricts the recursive term to reference the CTE at most once.

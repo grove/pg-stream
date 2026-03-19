@@ -378,7 +378,8 @@ pub fn agg_to_rescan_sql(agg: &AggExpr) -> String {
 /// Returns true if the aggregate's old value can be computed algebraically
 /// from new value + delta counts: `old = new - ins + del`.
 ///
-/// Only COUNT, COUNT_STAR, and SUM are algebraically invertible.
+/// COUNT, COUNT_STAR, and SUM are algebraically invertible.
+/// AVG is algebraic via auxiliary columns (SUM + COUNT) — handled separately.
 /// MIN/MAX/AVG and group-rescan aggregates require a full rescan of old data.
 fn is_algebraically_invertible(agg: &AggExpr) -> bool {
     if agg.is_distinct {
@@ -389,6 +390,16 @@ fn is_algebraically_invertible(agg: &AggExpr) -> bool {
         agg.function,
         AggFunc::CountStar | AggFunc::Count | AggFunc::Sum
     )
+}
+
+/// Returns true if the aggregate uses auxiliary columns for algebraic
+/// maintenance (AVG). These track running SUM and COUNT on the ST so
+/// `new_avg = (old_sum + Δsum) / (old_count + Δcount)` is exact.
+fn is_algebraic_via_aux(agg: &AggExpr) -> bool {
+    if agg.is_distinct {
+        return false;
+    }
+    agg.function.is_algebraic_via_aux()
 }
 
 /// Build delta CTEs for an intermediate aggregate (one whose group-by
@@ -1023,8 +1034,13 @@ fn is_direct_agg_eligible(child: &OpTree, group_by: &[Expr], aggregates: &[AggEx
         return false;
     }
     for agg in aggregates {
-        // P5 only supports decomposable algebraic aggregates without FILTER
-        if matches!(agg.function, AggFunc::Min | AggFunc::Max) || agg.function.is_group_rescan() {
+        // P5 only supports decomposable algebraic aggregates without FILTER.
+        // AVG requires auxiliary column tracking (not P5-compatible),
+        // MIN/MAX and group-rescan aggregates also excluded.
+        if matches!(agg.function, AggFunc::Min | AggFunc::Max)
+            || agg.function.is_group_rescan()
+            || agg.function.is_algebraic_via_aux()
+        {
             return false;
         }
         if agg.is_distinct {
@@ -1311,6 +1327,25 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             let alias_d = format!("__del_{}", agg.alias);
             delta_selects.push(format!("{ins_expr} AS {}", quote_ident(&alias_i)));
             delta_selects.push(format!("{del_expr} AS {}", quote_ident(&alias_d)));
+
+            // AVG/STDDEV/VAR algebraic path: also track non-NULL counts for
+            // the argument so the merge can update __pgt_aux_count_{alias}.
+            if is_algebraic_via_aux(agg) {
+                let (ins_cnt, del_cnt) = agg_avg_count_delta_exprs(agg, child_cols);
+                let cnt_alias_i = format!("__ins_count_{}", agg.alias);
+                let cnt_alias_d = format!("__del_count_{}", agg.alias);
+                delta_selects.push(format!("{ins_cnt} AS {}", quote_ident(&cnt_alias_i)));
+                delta_selects.push(format!("{del_cnt} AS {}", quote_ident(&cnt_alias_d)));
+            }
+
+            // STDDEV/VAR: also track SUM(arg²) for sum-of-squares auxiliary.
+            if agg.function.needs_sum_of_squares() && !agg.is_distinct {
+                let (ins_sum2, del_sum2) = agg_sum2_delta_exprs(agg, child_cols);
+                let sum2_alias_i = format!("__ins_sum2_{}", agg.alias);
+                let sum2_alias_d = format!("__del_sum2_{}", agg.alias);
+                delta_selects.push(format!("{ins_sum2} AS {}", quote_ident(&sum2_alias_i)));
+                delta_selects.push(format!("{del_sum2} AS {}", quote_ident(&sum2_alias_d)));
+            }
         }
 
         let delta_sql = format!(
@@ -1480,6 +1515,40 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             quote_ident(&st_col_name(&agg.alias)),
             quote_ident(&format!("old_{}", agg.alias)),
         ));
+
+        // AVG algebraic path: include auxiliary column updates in the merge CTE.
+        // These flow through to the final CTE and ultimately to the MERGE SET.
+        if is_algebraic_via_aux(agg) {
+            let st_alias = st_col_name(&agg.alias);
+            let aux_sum = quote_ident(&format!("__pgt_aux_sum_{st_alias}"));
+            let aux_cnt = quote_ident(&format!("__pgt_aux_count_{st_alias}"));
+            let ins_sum = quote_ident(&format!("__ins_{}", agg.alias));
+            let del_sum = quote_ident(&format!("__del_{}", agg.alias));
+            let ins_cnt = quote_ident(&format!("__ins_count_{}", agg.alias));
+            let del_cnt = quote_ident(&format!("__del_count_{}", agg.alias));
+
+            merge_selects.push(format!(
+                "COALESCE(st.{aux_sum}, 0) + COALESCE(d.{ins_sum}, 0) - COALESCE(d.{del_sum}, 0) AS {}",
+                quote_ident(&format!("new___pgt_aux_sum_{}", agg.alias)),
+            ));
+            merge_selects.push(format!(
+                "COALESCE(st.{aux_cnt}, 0) + COALESCE(d.{ins_cnt}, 0) - COALESCE(d.{del_cnt}, 0) AS {}",
+                quote_ident(&format!("new___pgt_aux_count_{}", agg.alias)),
+            ));
+        }
+
+        // STDDEV/VAR: also update the sum-of-squares auxiliary column.
+        if agg.function.needs_sum_of_squares() && !agg.is_distinct {
+            let st_alias = st_col_name(&agg.alias);
+            let aux_sum2 = quote_ident(&format!("__pgt_aux_sum2_{st_alias}"));
+            let ins_sum2 = quote_ident(&format!("__ins_sum2_{}", agg.alias));
+            let del_sum2 = quote_ident(&format!("__del_sum2_{}", agg.alias));
+
+            merge_selects.push(format!(
+                "COALESCE(st.{aux_sum2}, 0) + COALESCE(d.{ins_sum2}, 0) - COALESCE(d.{del_sum2}, 0) AS {}",
+                quote_ident(&format!("new___pgt_aux_sum2_{}", agg.alias)),
+            ));
+        }
     }
 
     // ── Scalar-aggregate guard ───────────────────────────────────
@@ -1569,6 +1638,15 @@ END AS __pgt_meta_action"
     output_cols.push("__pgt_count".to_string());
     for agg in aggregates {
         output_cols.push(agg.alias.clone());
+        // AVG/STDDEV/VAR auxiliary columns flow through to the MERGE
+        if is_algebraic_via_aux(agg) {
+            output_cols.push(format!("__pgt_aux_sum_{}", agg.alias));
+            output_cols.push(format!("__pgt_aux_count_{}", agg.alias));
+        }
+        // STDDEV/VAR: also propagate sum-of-squares
+        if agg.function.needs_sum_of_squares() && !agg.is_distinct {
+            output_cols.push(format!("__pgt_aux_sum2_{}", agg.alias));
+        }
     }
 
     let group_col_refs = group_output
@@ -1590,13 +1668,23 @@ END AS __pgt_meta_action"
     for agg in aggregates {
         let new_col = quote_ident(&format!("new_{}", agg.alias));
         let old_col = quote_ident(&format!("old_{}", agg.alias));
-        // For scalar aggregates, SUM (and similar nullable aggs) must return
+        // For scalar aggregates, SUM/AVG (and similar nullable aggs) must return
         // NULL — not 0 — when new_count drops to 0, matching PostgreSQL's
         // `SELECT SUM(x) FROM empty_table` → NULL semantics.  COUNT(*) and
         // COUNT(col) correctly yield 0 from the count arithmetic, so they
         // don't need this override.
-        let needs_null_on_empty =
-            is_scalar_agg && matches!(agg.function, AggFunc::Sum | AggFunc::Min | AggFunc::Max);
+        let needs_null_on_empty = is_scalar_agg
+            && matches!(
+                agg.function,
+                AggFunc::Sum
+                    | AggFunc::Min
+                    | AggFunc::Max
+                    | AggFunc::Avg
+                    | AggFunc::StddevPop
+                    | AggFunc::StddevSamp
+                    | AggFunc::VarPop
+                    | AggFunc::VarSamp
+            );
         if needs_null_on_empty {
             agg_cases.push(format!(
                 "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} \
@@ -1608,6 +1696,33 @@ END AS __pgt_meta_action"
             agg_cases.push(format!(
                 "CASE WHEN m.__pgt_meta_action = 'D' THEN m.{old_col} ELSE m.{new_col} END AS {}",
                 quote_ident(&agg.alias),
+            ));
+        }
+
+        // AVG auxiliary columns: propagate the algebraically computed values
+        if is_algebraic_via_aux(agg) {
+            let new_aux_sum = quote_ident(&format!("new___pgt_aux_sum_{}", agg.alias));
+            let new_aux_cnt = quote_ident(&format!("new___pgt_aux_count_{}", agg.alias));
+            let aux_sum_alias = quote_ident(&format!("__pgt_aux_sum_{}", agg.alias));
+            let aux_cnt_alias = quote_ident(&format!("__pgt_aux_count_{}", agg.alias));
+
+            // D events: emit 0 (the group is being deleted)
+            // I/U events: emit the algebraically computed new values
+            agg_cases.push(format!(
+                "CASE WHEN m.__pgt_meta_action = 'D' THEN 0 ELSE m.{new_aux_sum} END AS {aux_sum_alias}",
+            ));
+            agg_cases.push(format!(
+                "CASE WHEN m.__pgt_meta_action = 'D' THEN 0 ELSE m.{new_aux_cnt} END AS {aux_cnt_alias}",
+            ));
+        }
+
+        // STDDEV/VAR: propagate the sum-of-squares auxiliary column
+        if agg.function.needs_sum_of_squares() && !agg.is_distinct {
+            let new_aux_sum2 = quote_ident(&format!("new___pgt_aux_sum2_{}", agg.alias));
+            let aux_sum2_alias = quote_ident(&format!("__pgt_aux_sum2_{}", agg.alias));
+
+            agg_cases.push(format!(
+                "CASE WHEN m.__pgt_meta_action = 'D' THEN 0 ELSE m.{new_aux_sum2} END AS {aux_sum2_alias}",
             ));
         }
     }
@@ -1668,7 +1783,7 @@ WHERE m.__pgt_meta_action IN ('I', 'D')
 /// When a FILTER clause is present, its condition is added as an additional
 /// AND guard in all CASE WHEN expressions, so only rows passing the filter
 /// contribute to the aggregate delta.
-fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
+pub fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
     if agg.is_distinct {
         return (
             "SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE 0 END)".to_string(),
@@ -1716,6 +1831,33 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
                 format!("SUM(CASE WHEN __pgt_action = 'D'{filter_and} THEN {col} ELSE 0 END)"),
             )
         }
+        // AVG: track SUM of argument values in __ins_/__del_ columns.
+        // A separate call to agg_delta_count_exprs produces the non-NULL
+        // count columns (__ins_count_/__del_count_) needed by the merge.
+        AggFunc::Avg => {
+            let col = agg
+                .argument
+                .as_ref()
+                .map(|e| resolve_expr_for_child(e, child_cols))
+                .unwrap_or("0".into());
+            (
+                format!("SUM(CASE WHEN __pgt_action = 'I'{filter_and} THEN {col} ELSE 0 END)"),
+                format!("SUM(CASE WHEN __pgt_action = 'D'{filter_and} THEN {col} ELSE 0 END)"),
+            )
+        }
+        // STDDEV/VAR: track SUM of argument values (same as AVG). Separate
+        // calls produce the non-NULL count and sum-of-squares columns.
+        AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp => {
+            let col = agg
+                .argument
+                .as_ref()
+                .map(|e| resolve_expr_for_child(e, child_cols))
+                .unwrap_or("0".into());
+            (
+                format!("SUM(CASE WHEN __pgt_action = 'I'{filter_and} THEN {col} ELSE 0 END)"),
+                format!("SUM(CASE WHEN __pgt_action = 'D'{filter_and} THEN {col} ELSE 0 END)"),
+            )
+        }
         AggFunc::Min | AggFunc::Max => {
             let col = agg
                 .argument
@@ -1749,6 +1891,62 @@ fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
         }
         _ => unreachable!("unexpected AggFunc variant in agg_delta_exprs"),
     }
+}
+
+/// Generate non-NULL COUNT expressions for AVG auxiliary count tracking.
+///
+/// Returns `(ins_count_expr, del_count_expr)` — counts of non-NULL argument
+/// values in the insert and delete sides of the delta. AVG needs these to
+/// maintain its `__pgt_aux_count_{alias}` column algebraically.
+fn agg_avg_count_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
+    let filter_sql = agg
+        .filter
+        .as_ref()
+        .map(|f| resolve_expr_for_child(f, child_cols));
+    let filter_and = filter_sql
+        .as_ref()
+        .map(|f| format!(" AND {f}"))
+        .unwrap_or_default();
+
+    let col = agg
+        .argument
+        .as_ref()
+        .map(|e| resolve_expr_for_child(e, child_cols))
+        .unwrap_or("1".into());
+    (
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'I' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'D' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
+        ),
+    )
+}
+
+/// Generate sum-of-squares delta expressions for STDDEV/VAR algebraic tracking.
+///
+/// Returns `(ins_sum2_expr, del_sum2_expr)` — sums of `arg * arg` for the
+/// insert and delete sides. STDDEV/VAR needs these to maintain the
+/// `__pgt_aux_sum2_{alias}` column algebraically.
+fn agg_sum2_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
+    let filter_sql = agg
+        .filter
+        .as_ref()
+        .map(|f| resolve_expr_for_child(f, child_cols));
+    let filter_and = filter_sql
+        .as_ref()
+        .map(|f| format!(" AND {f}"))
+        .unwrap_or_default();
+
+    let col = agg
+        .argument
+        .as_ref()
+        .map(|e| resolve_expr_for_child(e, child_cols))
+        .unwrap_or("1".into());
+    (
+        format!("SUM(CASE WHEN __pgt_action = 'I'{filter_and} THEN ({col}) * ({col}) ELSE 0 END)"),
+        format!("SUM(CASE WHEN __pgt_action = 'D'{filter_and} THEN ({col}) * ({col}) ELSE 0 END)"),
+    )
 }
 
 /// Generate the merge expression for computing the new aggregate value.
@@ -1829,6 +2027,76 @@ fn agg_merge_expr_mapped(
                 format!("COALESCE(st.{qt}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0)",)
             }
         }
+        // AVG: algebraic via auxiliary SUM/COUNT columns on the ST.
+        // new_aux_sum  = old_aux_sum + ins_sum - del_sum
+        // new_aux_count = old_aux_count + ins_count - del_count
+        // new_avg = new_aux_sum / NULLIF(new_aux_count, 0)
+        //
+        // The actual AVG user column is computed from the auxiliary columns
+        // in the final CTE.  This merge expression computes the new AVG
+        // value directly from the algebraically-maintained auxiliaries.
+        AggFunc::Avg => {
+            let ins_sum = quote_ident(&format!("__ins_{alias}"));
+            let del_sum = quote_ident(&format!("__del_{alias}"));
+            let ins_cnt = quote_ident(&format!("__ins_count_{alias}"));
+            let del_cnt = quote_ident(&format!("__del_count_{alias}"));
+            let aux_sum_col = quote_ident(&format!("__pgt_aux_sum_{st_col}"));
+            let aux_count_col = quote_ident(&format!("__pgt_aux_count_{st_col}"));
+
+            // Compute new AVG = new_sum / NULLIF(new_count, 0)
+            // new_sum = old_aux_sum + ins_sum - del_sum
+            // new_count = old_aux_count + ins_count - del_count
+            format!(
+                "(COALESCE(st.{aux_sum_col}, 0) + COALESCE(d.{ins_sum}, 0) - COALESCE(d.{del_sum}, 0)) \
+                 / NULLIF(COALESCE(st.{aux_count_col}, 0) + COALESCE(d.{ins_cnt}, 0) - COALESCE(d.{del_cnt}, 0), 0)",
+            )
+        }
+        // STDDEV/VAR: algebraic via sum, sum-of-squares, and count auxiliaries.
+        //   n = old_count + ins_count - del_count
+        //   s = old_sum + ins_sum - del_sum
+        //   s2 = old_sum2 + ins_sum2 - del_sum2
+        //   VAR_POP  = GREATEST(0, (n*s2 - s*s) / (n*n))
+        //   VAR_SAMP = GREATEST(0, (n*s2 - s*s) / (n*(n-1)))
+        //   STDDEV_* = SQRT(VAR_*)
+        AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp => {
+            let ins_sum = quote_ident(&format!("__ins_{alias}"));
+            let del_sum = quote_ident(&format!("__del_{alias}"));
+            let ins_cnt = quote_ident(&format!("__ins_count_{alias}"));
+            let del_cnt = quote_ident(&format!("__del_count_{alias}"));
+            let ins_sum2 = quote_ident(&format!("__ins_sum2_{alias}"));
+            let del_sum2 = quote_ident(&format!("__del_sum2_{alias}"));
+            let aux_sum_col = quote_ident(&format!("__pgt_aux_sum_{st_col}"));
+            let aux_count_col = quote_ident(&format!("__pgt_aux_count_{st_col}"));
+            let aux_sum2_col = quote_ident(&format!("__pgt_aux_sum2_{st_col}"));
+
+            let n = format!(
+                "(COALESCE(st.{aux_count_col}, 0) + COALESCE(d.{ins_cnt}, 0) - COALESCE(d.{del_cnt}, 0))"
+            );
+            let s = format!(
+                "(COALESCE(st.{aux_sum_col}, 0) + COALESCE(d.{ins_sum}, 0) - COALESCE(d.{del_sum}, 0))"
+            );
+            let s2 = format!(
+                "(COALESCE(st.{aux_sum2_col}, 0) + COALESCE(d.{ins_sum2}, 0) - COALESCE(d.{del_sum2}, 0))"
+            );
+            let numer = format!("({n} * {s2} - {s} * {s})");
+
+            let (denom, null_guard, wrap_sqrt) = match &agg.function {
+                AggFunc::VarPop => (format!("{n} * {n}"), format!("{n} = 0"), false),
+                AggFunc::VarSamp => (format!("{n} * ({n} - 1)"), format!("{n} <= 1"), false),
+                AggFunc::StddevPop => (format!("{n} * {n}"), format!("{n} = 0"), true),
+                AggFunc::StddevSamp => (format!("{n} * ({n} - 1)"), format!("{n} <= 1"), true),
+                _ => unreachable!(),
+            };
+
+            let var_expr = format!("GREATEST(0, {numer} / NULLIF({denom}, 0))");
+            let body = if wrap_sqrt {
+                format!("SQRT({var_expr})")
+            } else {
+                var_expr
+            };
+
+            format!("CASE WHEN {null_guard} THEN NULL ELSE {body} END")
+        }
         AggFunc::Min | AggFunc::Max => {
             // MIN/MAX merge with group-rescan fallback.
             //
@@ -1895,7 +2163,7 @@ fn agg_merge_expr_mapped(
 /// Convenience wrapper: uses the aggregate's own alias as the ST column name.
 ///
 /// Equivalent to `agg_merge_expr_mapped(agg, has_rescan, false, &agg.alias)`.
-fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
+pub fn agg_merge_expr(agg: &AggExpr, has_rescan: bool) -> String {
     agg_merge_expr_mapped(agg, has_rescan, false, &agg.alias)
 }
 
@@ -2115,6 +2383,161 @@ mod tests {
         assert_eq!(del, "SUM(CASE WHEN __pgt_action = 'D' THEN 1 ELSE 0 END)");
     }
 
+    // ── AVG algebraic path tests ────────────────────────────────────
+
+    #[test]
+    fn test_agg_delta_exprs_avg_tracks_sum() {
+        // AVG delta tracking should use SUM of argument values (like SUM does)
+        let agg = avg_col("score", "avg_score");
+        let child_cols = vec!["score".to_string()];
+        let (ins, del) = agg_delta_exprs(&agg, &child_cols);
+        assert!(
+            ins.contains("SUM") && ins.contains("score"),
+            "AVG delta ins should SUM the argument: {ins}"
+        );
+        assert!(
+            del.contains("SUM") && del.contains("score"),
+            "AVG delta del should SUM the argument: {del}"
+        );
+    }
+
+    #[test]
+    fn test_agg_avg_count_delta_exprs() {
+        // The companion count expressions should count non-NULL values
+        let agg = avg_col("score", "avg_score");
+        let child_cols = vec!["score".to_string()];
+        let (ins_cnt, del_cnt) = agg_avg_count_delta_exprs(&agg, &child_cols);
+        assert!(
+            ins_cnt.contains("IS NOT NULL") && ins_cnt.contains("'I'"),
+            "AVG count delta ins should check non-NULL: {ins_cnt}"
+        );
+        assert!(
+            del_cnt.contains("IS NOT NULL") && del_cnt.contains("'D'"),
+            "AVG count delta del should check non-NULL: {del_cnt}"
+        );
+    }
+
+    #[test]
+    fn test_is_algebraic_via_aux_avg() {
+        let agg = avg_col("score", "avg_score");
+        assert!(
+            is_algebraic_via_aux(&agg),
+            "AVG should be algebraic via auxiliary columns"
+        );
+    }
+
+    #[test]
+    fn test_is_algebraic_via_aux_not_for_count() {
+        let agg = count_star("cnt");
+        assert!(
+            !is_algebraic_via_aux(&agg),
+            "COUNT(*) should not be algebraic-via-aux"
+        );
+    }
+
+    #[test]
+    fn test_is_algebraic_via_aux_not_for_distinct_avg() {
+        let agg = AggExpr {
+            function: AggFunc::Avg,
+            argument: Some(colref("score")),
+            alias: "avg_score".to_string(),
+            is_distinct: true,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+        assert!(
+            !is_algebraic_via_aux(&agg),
+            "DISTINCT AVG should not use algebraic path"
+        );
+    }
+
+    #[test]
+    fn test_diff_aggregate_avg_with_group_by() {
+        let mut ctx = test_ctx_with_st("public", "st");
+        let child = scan(1, "orders", "public", "o", &["id", "region", "amount"]);
+        let tree = aggregate(
+            vec![colref("region")],
+            vec![avg_col("amount", "avg_amt")],
+            child,
+        );
+        let result = diff_aggregate(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should include auxiliary columns in output
+        assert!(
+            result
+                .columns
+                .contains(&"__pgt_aux_sum_avg_amt".to_string()),
+            "output should include __pgt_aux_sum_avg_amt: {:?}",
+            result.columns
+        );
+        assert!(
+            result
+                .columns
+                .contains(&"__pgt_aux_count_avg_amt".to_string()),
+            "output should include __pgt_aux_count_avg_amt: {:?}",
+            result.columns
+        );
+        // Should reference the auxiliary column merge formula
+        assert_sql_contains(&sql, "__pgt_aux_sum_avg_amt");
+        assert_sql_contains(&sql, "__pgt_aux_count_avg_amt");
+        // Should track SUM/COUNT delta for AVG
+        assert_sql_contains(&sql, "__ins_count_avg_amt");
+        assert_sql_contains(&sql, "__del_count_avg_amt");
+    }
+
+    #[test]
+    fn test_diff_aggregate_avg_no_group_by() {
+        let mut ctx = test_ctx_with_st("public", "st");
+        let child = scan(1, "t", "public", "t", &["amount"]);
+        let tree = aggregate(vec![], vec![avg_col("amount", "avg_amt")], child);
+        let result = diff_aggregate(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Scalar AVG should use singleton group hash
+        assert_sql_contains(&sql, "__singleton_group");
+        // Should still have auxiliary columns
+        assert!(
+            result
+                .columns
+                .contains(&"__pgt_aux_sum_avg_amt".to_string())
+        );
+        assert!(
+            result
+                .columns
+                .contains(&"__pgt_aux_count_avg_amt".to_string())
+        );
+    }
+
+    #[test]
+    fn test_diff_aggregate_mixed_sum_avg() {
+        // Test a query with both SUM and AVG to ensure they coexist
+        let mut ctx = test_ctx_with_st("public", "st");
+        let child = scan(1, "orders", "public", "o", &["region", "amount"]);
+        let tree = aggregate(
+            vec![colref("region")],
+            vec![sum_col("amount", "total"), avg_col("amount", "avg_amt")],
+            child,
+        );
+        let result = diff_aggregate(&mut ctx, &tree).unwrap();
+
+        // SUM should be in output without aux columns
+        assert!(result.columns.contains(&"total".to_string()));
+        // AVG should have aux columns
+        assert!(result.columns.contains(&"avg_amt".to_string()));
+        assert!(
+            result
+                .columns
+                .contains(&"__pgt_aux_sum_avg_amt".to_string())
+        );
+        assert!(
+            result
+                .columns
+                .contains(&"__pgt_aux_count_avg_amt".to_string())
+        );
+    }
+
     // ── agg_merge_expr tests ────────────────────────────────────────
 
     #[test]
@@ -2136,24 +2559,46 @@ mod tests {
 
     #[test]
     fn test_agg_merge_expr_avg() {
-        // AVG uses group-rescan: merge expression should use NULL sentinel
-        // (no rescan CTE available in this test)
+        // AVG is algebraic via auxiliary columns: the merge expression
+        // computes new_avg = (aux_sum + ins - del) / NULLIF(aux_count + ins - del, 0)
         let agg = avg_col("score", "avg_score");
         let result = agg_merge_expr(&agg, false);
         assert!(
-            result.contains("THEN NULL"),
-            "AVG without rescan should use NULL sentinel: {result}"
+            result.contains("__pgt_aux_sum_avg_score"),
+            "AVG should reference __pgt_aux_sum: {result}"
+        );
+        assert!(
+            result.contains("__pgt_aux_count_avg_score"),
+            "AVG should reference __pgt_aux_count: {result}"
+        );
+        assert!(
+            result.contains("NULLIF"),
+            "AVG should use NULLIF to guard division by zero: {result}"
         );
     }
 
     #[test]
-    fn test_agg_merge_expr_avg_with_rescan() {
-        // AVG uses group-rescan: with rescan CTE, should reference r.{alias}
-        let agg = avg_col("score", "avg_score");
-        let result = agg_merge_expr(&agg, true);
+    fn test_agg_merge_expr_avg_algebraic_formula() {
+        // Verify the full algebraic formula structure
+        let agg = avg_col("amount", "avg_amt");
+        let result = agg_merge_expr(&agg, false);
+        // Should have: (COALESCE(st.aux_sum, 0) + COALESCE(d.ins, 0) - COALESCE(d.del, 0))
+        //            / NULLIF(COALESCE(st.aux_count, 0) + COALESCE(d.ins_count, 0) - COALESCE(d.del_count, 0), 0)
         assert!(
-            result.contains("r."),
-            "AVG with rescan should reference rescan CTE: {result}"
+            result.contains("__ins_avg_amt"),
+            "should reference ins delta: {result}"
+        );
+        assert!(
+            result.contains("__del_avg_amt"),
+            "should reference del delta: {result}"
+        );
+        assert!(
+            result.contains("__ins_count_avg_amt"),
+            "should reference ins count delta: {result}"
+        );
+        assert!(
+            result.contains("__del_count_avg_amt"),
+            "should reference del count delta: {result}"
         );
     }
 
@@ -2444,7 +2889,9 @@ mod tests {
     fn test_is_group_rescan() {
         assert!(!AggFunc::Count.is_group_rescan());
         assert!(!AggFunc::Sum.is_group_rescan());
-        assert!(AggFunc::Avg.is_group_rescan());
+        // AVG is now algebraic via auxiliary columns, not group-rescan
+        assert!(!AggFunc::Avg.is_group_rescan());
+        assert!(AggFunc::Avg.is_algebraic_via_aux());
         assert!(!AggFunc::Min.is_group_rescan());
         assert!(!AggFunc::Max.is_group_rescan());
         assert!(AggFunc::BoolAnd.is_group_rescan());
@@ -2460,10 +2907,19 @@ mod tests {
         assert!(AggFunc::JsonbObjectAgg.is_group_rescan());
         assert!(AggFunc::JsonObjectAggStd("JSON_OBJECTAGG(k : v)".into()).is_group_rescan());
         assert!(AggFunc::JsonArrayAggStd("JSON_ARRAYAGG(x)".into()).is_group_rescan());
-        assert!(AggFunc::StddevPop.is_group_rescan());
-        assert!(AggFunc::StddevSamp.is_group_rescan());
-        assert!(AggFunc::VarPop.is_group_rescan());
-        assert!(AggFunc::VarSamp.is_group_rescan());
+        // STDDEV/VAR are now algebraic via auxiliary columns, not group-rescan
+        assert!(!AggFunc::StddevPop.is_group_rescan());
+        assert!(!AggFunc::StddevSamp.is_group_rescan());
+        assert!(!AggFunc::VarPop.is_group_rescan());
+        assert!(!AggFunc::VarSamp.is_group_rescan());
+        assert!(AggFunc::StddevPop.is_algebraic_via_aux());
+        assert!(AggFunc::StddevSamp.is_algebraic_via_aux());
+        assert!(AggFunc::VarPop.is_algebraic_via_aux());
+        assert!(AggFunc::VarSamp.is_algebraic_via_aux());
+        assert!(AggFunc::StddevPop.needs_sum_of_squares());
+        assert!(AggFunc::StddevSamp.needs_sum_of_squares());
+        assert!(AggFunc::VarPop.needs_sum_of_squares());
+        assert!(AggFunc::VarSamp.needs_sum_of_squares());
         assert!(AggFunc::Mode.is_group_rescan());
         assert!(AggFunc::PercentileCont.is_group_rescan());
         assert!(AggFunc::PercentileDisc.is_group_rescan());
@@ -3123,13 +3579,14 @@ mod tests {
     fn test_agg_delta_exprs_stddev_samp() {
         let agg = stddev_samp_col("amount", "sd_samp");
         let (ins, del) = agg_delta_exprs(&agg, &["amount".to_string()]);
+        // STDDEV_SAMP is now algebraic: tracks SUM(amount) not NULL count
         assert!(
-            ins.contains("amount IS NOT NULL"),
-            "STDDEV_SAMP insert delta should check NOT NULL: {ins}",
+            ins.contains("__pgt_action = 'I'") && ins.contains("amount"),
+            "STDDEV_SAMP insert delta should track SUM of argument: {ins}",
         );
         assert!(
-            del.contains("amount IS NOT NULL"),
-            "STDDEV_SAMP delete delta should check NOT NULL: {del}",
+            del.contains("__pgt_action = 'D'") && del.contains("amount"),
+            "STDDEV_SAMP delete delta should track SUM of argument: {del}",
         );
     }
 
@@ -3150,10 +3607,15 @@ mod tests {
     #[test]
     fn test_agg_delta_exprs_var_samp() {
         let agg = var_samp_col("amount", "v_samp");
-        let (ins, _del) = agg_delta_exprs(&agg, &["amount".to_string()]);
+        let (ins, del) = agg_delta_exprs(&agg, &["amount".to_string()]);
+        // VAR_SAMP is now algebraic: tracks SUM(amount) not NULL count
         assert!(
-            ins.contains("amount IS NOT NULL"),
-            "VAR_SAMP insert delta should check NOT NULL: {ins}",
+            ins.contains("__pgt_action = 'I'") && ins.contains("amount"),
+            "VAR_SAMP insert delta should track SUM of argument: {ins}",
+        );
+        assert!(
+            del.contains("__pgt_action = 'D'") && del.contains("amount"),
+            "VAR_SAMP delete delta should track SUM of argument: {del}",
         );
     }
 
@@ -3161,9 +3623,14 @@ mod tests {
     fn test_agg_merge_expr_stddev_pop_rescan() {
         let agg = stddev_pop_col("amount", "sd_pop");
         let merge = agg_merge_expr(&agg, false);
+        // STDDEV_POP is now algebraic — uses SQRT(GREATEST(0, ...))
         assert!(
-            merge.contains("THEN NULL"),
-            "STDDEV_POP merge should use NULL sentinel: {merge}",
+            merge.contains("SQRT") && merge.contains("GREATEST"),
+            "STDDEV_POP merge should use algebraic SQRT formula: {merge}",
+        );
+        assert!(
+            merge.contains("__pgt_aux_sum2_"),
+            "STDDEV_POP merge should reference sum2 auxiliary column: {merge}",
         );
     }
 
@@ -3171,9 +3638,15 @@ mod tests {
     fn test_agg_merge_expr_stddev_samp_rescan() {
         let agg = stddev_samp_col("amount", "sd_samp");
         let merge = agg_merge_expr(&agg, false);
+        // STDDEV_SAMP is now algebraic — uses SQRT(GREATEST(0, ...))
         assert!(
-            merge.contains("THEN NULL"),
-            "STDDEV_SAMP merge should use NULL sentinel: {merge}",
+            merge.contains("SQRT") && merge.contains("GREATEST"),
+            "STDDEV_SAMP merge should use algebraic SQRT formula: {merge}",
+        );
+        // SAMP variant uses n*(n-1) denominator
+        assert!(
+            merge.contains("- 1"),
+            "STDDEV_SAMP merge should use (n-1) denominator: {merge}",
         );
     }
 
@@ -3181,9 +3654,10 @@ mod tests {
     fn test_agg_merge_expr_var_pop_rescan() {
         let agg = var_pop_col("amount", "v_pop");
         let merge = agg_merge_expr(&agg, false);
+        // VAR_POP is now algebraic — uses GREATEST(0, ...)
         assert!(
-            merge.contains("THEN NULL"),
-            "VAR_POP merge should use NULL sentinel: {merge}",
+            merge.contains("GREATEST") && !merge.contains("SQRT"),
+            "VAR_POP merge should use algebraic formula without SQRT: {merge}",
         );
     }
 
@@ -3191,9 +3665,15 @@ mod tests {
     fn test_agg_merge_expr_var_samp_rescan() {
         let agg = var_samp_col("amount", "v_samp");
         let merge = agg_merge_expr(&agg, false);
+        // VAR_SAMP is now algebraic — uses GREATEST(0, ...)
         assert!(
-            merge.contains("THEN NULL"),
-            "VAR_SAMP merge should use NULL sentinel: {merge}",
+            merge.contains("GREATEST") && !merge.contains("SQRT"),
+            "VAR_SAMP merge should use algebraic formula without SQRT: {merge}",
+        );
+        // SAMP variant uses n*(n-1) denominator
+        assert!(
+            merge.contains("- 1"),
+            "VAR_SAMP merge should use (n-1) denominator: {merge}",
         );
     }
 
@@ -3209,9 +3689,18 @@ mod tests {
         assert!(result.is_ok(), "STDDEV_POP should diff: {result:?}");
         let dr = result.unwrap();
         let sql = ctx.build_with_query(&dr.cte_name);
+        // STDDEV_POP is algebraic — no rescan CTE, uses sum/sum2/count auxiliaries
         assert!(
-            sql.contains("agg_rescan"),
-            "STDDEV_POP diff should generate rescan CTE: {sql}",
+            !sql.contains("agg_rescan"),
+            "STDDEV_POP should NOT generate rescan CTE (algebraic): {sql}",
+        );
+        assert!(
+            sql.contains("__ins_sum2_"),
+            "STDDEV_POP delta should track sum-of-squares: {sql}",
+        );
+        assert!(
+            sql.contains("SQRT"),
+            "STDDEV_POP merge should use SQRT formula: {sql}",
         );
     }
 
@@ -3228,8 +3717,12 @@ mod tests {
         let dr = result.unwrap();
         let sql = ctx.build_with_query(&dr.cte_name);
         assert!(
-            sql.contains("agg_rescan"),
-            "STDDEV_SAMP diff should generate rescan CTE: {sql}",
+            !sql.contains("agg_rescan"),
+            "STDDEV_SAMP should NOT generate rescan CTE (algebraic): {sql}",
+        );
+        assert!(
+            sql.contains("__ins_sum2_"),
+            "STDDEV_SAMP delta should track sum-of-squares: {sql}",
         );
     }
 
@@ -3246,8 +3739,12 @@ mod tests {
         let dr = result.unwrap();
         let sql = ctx.build_with_query(&dr.cte_name);
         assert!(
-            sql.contains("agg_rescan"),
-            "VAR_POP diff should generate rescan CTE: {sql}",
+            !sql.contains("agg_rescan"),
+            "VAR_POP should NOT generate rescan CTE (algebraic): {sql}",
+        );
+        assert!(
+            sql.contains("GREATEST"),
+            "VAR_POP merge should use GREATEST formula: {sql}",
         );
     }
 
@@ -3264,8 +3761,8 @@ mod tests {
         let dr = result.unwrap();
         let sql = ctx.build_with_query(&dr.cte_name);
         assert!(
-            sql.contains("agg_rescan"),
-            "VAR_SAMP diff should generate rescan CTE: {sql}",
+            !sql.contains("agg_rescan"),
+            "VAR_SAMP should NOT generate rescan CTE (algebraic): {sql}",
         );
     }
 
@@ -3315,10 +3812,14 @@ mod tests {
             sql.contains("COALESCE(d.__ins_count, 0) - COALESCE(d.__del_count, 0)"),
             "COUNT should use algebraic merge: {sql}",
         );
-        // STDDEV_POP uses rescan sentinel
+        // STDDEV_POP is now algebraic — no rescan needed
         assert!(
-            sql.contains("agg_rescan"),
-            "STDDEV_POP should generate rescan CTE: {sql}",
+            !sql.contains("agg_rescan"),
+            "All aggregates are algebraic, no rescan CTE needed: {sql}",
+        );
+        assert!(
+            sql.contains("SQRT"),
+            "STDDEV_POP should use algebraic SQRT formula: {sql}",
         );
     }
 
@@ -3611,8 +4112,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rescan_cte_for_avg() {
-        // AVG now uses group-rescan for precision
+    fn test_no_rescan_cte_for_avg() {
+        // AVG is now algebraic via auxiliary columns — no rescan needed
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
@@ -3622,12 +4123,12 @@ mod tests {
         );
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        assert_sql_contains(&sql, "agg_rescan");
+        assert_sql_not_contains(&sql, "agg_rescan");
     }
 
     #[test]
-    fn test_rescan_cte_for_sum_count_avg_combined() {
-        // AVG triggers rescan even when mixed with algebraic SUM/COUNT
+    fn test_no_rescan_cte_for_sum_count_avg_combined() {
+        // All three (SUM, COUNT, AVG) are algebraic — no rescan needed
         let mut ctx = test_ctx_with_st("public", "st");
         let child = scan(1, "t", "public", "t", &["region", "amount"]);
         let tree = aggregate(
@@ -3641,7 +4142,7 @@ mod tests {
         );
         let result = diff_aggregate(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
-        assert_sql_contains(&sql, "agg_rescan");
+        assert_sql_not_contains(&sql, "agg_rescan");
     }
 
     #[test]
@@ -3685,5 +4186,87 @@ mod tests {
             &sql,
             "COALESCE(d.\"__ins_total\", 0) - COALESCE(d.\"__del_total\", 0)",
         );
+    }
+
+    #[test]
+    fn test_diff_aggregate_mixed_count_sum_complex_expression() {
+        // Simulates: SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total,
+        //            ROUND(ROUND(STDDEV_POP(amount), 4), 4) AS sd
+        //            FROM mstat_src GROUP BY dept
+        // The ComplexExpression is a group-rescan aggregate; COUNT* and SUM are algebraic.
+        let mut ctx = test_ctx_with_st("public", "mstat_st");
+        let child = scan(
+            1,
+            "mstat_src",
+            "public",
+            "mstat_src",
+            &["id", "dept", "amount"],
+        );
+
+        let complex_sd = AggExpr {
+            function: AggFunc::ComplexExpression(
+                "round(round(stddev_pop(amount), 4), 4)".to_string(),
+            ),
+            argument: None,
+            alias: "sd".to_string(),
+            is_distinct: false,
+            filter: None,
+            second_arg: None,
+            order_within_group: None,
+        };
+
+        let tree = aggregate(
+            vec![colref("dept")],
+            vec![count_star("cnt"), sum_col("amount", "total"), complex_sd],
+            child,
+        );
+
+        let result = diff_aggregate(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Rescan CTE should be present because ComplexExpression requires it
+        assert_sql_contains(&sql, "agg_rescan");
+
+        // ComplexExpression delta tracking should count insertions
+        assert_sql_contains(&sql, "__ins_sd");
+        assert_sql_contains(&sql, "__del_sd");
+
+        // The rescan CTE should compute the ComplexExpression from source
+        assert_sql_contains(&sql, "round(round(stddev_pop(amount), 4), 4)");
+
+        // COUNT* should use algebraic merge
+        assert_sql_contains(
+            &sql,
+            "COALESCE(d.\"__ins_cnt\", 0) - COALESCE(d.\"__del_cnt\", 0)",
+        );
+
+        // SUM should use algebraic merge (no full-join child)
+        assert_sql_contains(
+            &sql,
+            "COALESCE(d.\"__ins_total\", 0) - COALESCE(d.\"__del_total\", 0)",
+        );
+
+        // ComplexExpression should use rescan CTE value when changed
+        assert_sql_contains(&sql, "THEN r.\"sd\"");
+
+        // Output columns should include cnt, total, sd but NOT aux columns
+        assert!(result.columns.contains(&"cnt".to_string()));
+        assert!(result.columns.contains(&"total".to_string()));
+        assert!(result.columns.contains(&"sd".to_string()));
+        assert!(
+            !result.columns.contains(&"__pgt_aux_sum_sd".to_string()),
+            "ComplexExpression should not create aux sum columns"
+        );
+        assert!(
+            !result.columns.contains(&"__pgt_aux_count_sd".to_string()),
+            "ComplexExpression should not create aux count columns"
+        );
+        assert!(
+            !result.columns.contains(&"__pgt_aux_sum2_sd".to_string()),
+            "ComplexExpression should not create aux sum2 columns"
+        );
+
+        // Print SQL for debugging (will only show when test fails or with --nocapture)
+        eprintln!("=== Mixed COUNT* + SUM + ComplexExpression SQL ===\n{sql}");
     }
 }

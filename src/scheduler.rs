@@ -507,7 +507,8 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
     let outcome = BackgroundWorker::transaction(AssertUnwindSafe(|| -> RefreshOutcome {
         match job.unit_kind.as_str() {
             "singleton" => execute_worker_singleton(&job),
-            "atomic_group" => execute_worker_atomic_group(&job),
+            "atomic_group" => execute_worker_atomic_group(&job, false),
+            "repeatable_read_group" => execute_worker_atomic_group(&job, true),
             "immediate_closure" => execute_worker_immediate_closure(&job),
             "cyclic_scc" => execute_worker_cyclic_scc(&job),
             _ => {
@@ -625,7 +626,7 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
         refresh::determine_refresh_action(&st, has_changes)
     };
 
-    execute_scheduled_refresh(&st, action, tick_watermark.as_deref())
+    execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None)
 }
 
 /// Execute an atomic group unit: refresh all members serially inside a
@@ -634,12 +635,28 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
 /// Uses the C-level internal sub-transaction API (`BeginInternalSubTransaction`
 /// / `ReleaseCurrentSubTransaction` / `RollbackAndReleaseCurrentSubTransaction`)
 /// because PostgreSQL rejects transaction-control SQL via SPI.
-fn execute_worker_atomic_group(job: &SchedulerJob) -> RefreshOutcome {
+fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> RefreshOutcome {
     log!(
-        "pg_trickle refresh worker: atomic group — {} members (job {})",
+        "pg_trickle refresh worker: {} group — {} members (job {})",
+        if is_repeatable_read {
+            "repeatable_read"
+        } else {
+            "atomic"
+        },
         job.member_pgt_ids.len(),
         job.job_id,
     );
+
+    if is_repeatable_read {
+        // Upgrade top-level worker transaction to REPEATABLE READ snapshot isolation
+        if let Err(e) = pgrx::Spi::run("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ") {
+            pgrx::log!(
+                "pg_trickle refresh worker: failed to set REPEATABLE READ isolation: {}",
+                e
+            );
+            return RefreshOutcome::PermanentFailure;
+        }
+    }
 
     let subtxn = SubTransaction::begin();
 
@@ -703,7 +720,7 @@ fn execute_worker_atomic_group(job: &SchedulerJob) -> RefreshOutcome {
             refresh::determine_refresh_action(&st, has_changes)
         };
 
-        let result = execute_scheduled_refresh(&st, action, tick_watermark.as_deref());
+        let result = execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None);
         match result {
             RefreshOutcome::Success => {
                 refreshed_count += 1;
@@ -782,7 +799,7 @@ fn execute_worker_immediate_closure(job: &SchedulerJob) -> RefreshOutcome {
         refresh::determine_refresh_action(&st, has_changes)
     };
 
-    execute_scheduled_refresh(&st, action, tick_watermark.as_deref())
+    execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None)
 }
 
 /// Execute a full cyclic Strongly Connected Component in parallel mode.
@@ -852,8 +869,12 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
                 }
 
                 // Inside SCCs, always use FULL refresh action to evaluate defining query each pass.
-                let outcome =
-                    execute_scheduled_refresh(&st, RefreshAction::Full, tick_watermark.as_deref());
+                let outcome = execute_scheduled_refresh(
+                    &st,
+                    RefreshAction::Full,
+                    tick_watermark.as_deref(),
+                    None,
+                );
                 match outcome {
                     RefreshOutcome::Success => {
                         any_refreshed = true;
@@ -1421,6 +1442,9 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     // Phase 4: Parallel dispatch state (persisted across ticks)
     let mut parallel_state = ParallelDispatchState::new();
 
+    // Per-ST drift reset counters (differential cycles since last reinit)
+    let mut drift_counters: HashMap<i64, i32> = HashMap::new();
+
     // Phase 10: Crash recovery — mark any interrupted RUNNING records
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         recover_from_crash();
@@ -1741,6 +1765,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     if scc_member_ids.contains(&pgt_id) {
                         continue;
                     }
+                    let mut entry = drift_counters.entry(pgt_id).or_insert(0);
                     refresh_single_st(
                         pgt_id,
                         dag_ref,
@@ -1749,6 +1774,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         &retry_policy,
                         initial_table_changes.get(&pgt_id).copied(),
                         tick_watermark.as_deref(),
+                        Some(&mut entry),
                     );
                     continue;
                 }
@@ -1770,15 +1796,17 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     continue;
                 }
 
-                let all_atomic = group.members.iter().all(|m| {
-                    if let NodeId::StreamTable(id) = m {
-                        load_st_by_id(*id)
-                            .map(|st| st.diamond_consistency == DiamondConsistency::Atomic)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                });
+                let all_atomic = group.isolation_level
+                    == crate::dag::IsolationLevel::RepeatableRead
+                    || group.members.iter().all(|m| {
+                        if let NodeId::StreamTable(id) = m {
+                            load_st_by_id(*id)
+                                .map(|st| st.diamond_consistency == DiamondConsistency::Atomic)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    });
 
                 if !all_atomic {
                     // Not all members opted in — fall back to independent refreshes.
@@ -1787,6 +1815,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                             NodeId::StreamTable(id) => *id,
                             _ => continue,
                         };
+                        let mut entry = drift_counters.entry(pgt_id).or_insert(0);
                         refresh_single_st(
                             pgt_id,
                             dag_ref,
@@ -1795,6 +1824,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                             &retry_policy,
                             initial_table_changes.get(&pgt_id).copied(),
                             tick_watermark.as_deref(),
+                            Some(&mut entry),
                         );
                     }
                     continue;
@@ -1887,7 +1917,8 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     } else {
                         refresh::determine_refresh_action(&st, has_changes)
                     };
-                    let result = execute_scheduled_refresh(&st, action, tick_watermark.as_deref());
+                    let result =
+                        execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None);
 
                     match result {
                         RefreshOutcome::Success => {
@@ -2589,7 +2620,7 @@ fn iterate_to_fixpoint(
                 // semantics for monotone fixpoint iteration.
                 let action = RefreshAction::Full;
 
-                let result = execute_scheduled_refresh(&st, action, tick_watermark);
+                let result = execute_scheduled_refresh(&st, action, tick_watermark, None);
 
                 match result {
                     RefreshOutcome::Success => {
@@ -2702,6 +2733,7 @@ fn last_refresh_row_counts(pgt_id: i64) -> (i64, i64) {
 ///
 /// This is the singleton fast path used by both non-diamond STs and
 /// diamond STs where not all members opted into atomic mode.
+#[allow(clippy::too_many_arguments)]
 fn refresh_single_st(
     pgt_id: i64,
     dag_ref: &StDag,
@@ -2710,6 +2742,7 @@ fn refresh_single_st(
     retry_policy: &RetryPolicy,
     table_change_snapshot: Option<bool>,
     tick_watermark: Option<&str>,
+    drift_counter: Option<&mut i32>,
 ) {
     let st = match load_st_by_id(pgt_id) {
         Some(st) => st,
@@ -2777,9 +2810,29 @@ fn refresh_single_st(
     let action = if has_changes && has_stream_table_changes {
         RefreshAction::Full
     } else {
-        refresh::determine_refresh_action(&st, has_changes)
+        let mut base_action = refresh::determine_refresh_action(&st, has_changes);
+
+        // Check periodic drift reset
+        if base_action == RefreshAction::Differential {
+            let max_cycles = config::pg_trickle_algebraic_drift_reset_cycles();
+            if let Some(counter) = &drift_counter
+                && max_cycles > 0
+                && **counter >= max_cycles
+            {
+                log!(
+                    "pg_trickle: drift reset triggered for {}.{} ({} differential cycles)",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    counter
+                );
+                // Convert action to reinitialize. This will trigger the drift counter reset
+                // inside execute_scheduled_refresh on success.
+                base_action = RefreshAction::Reinitialize;
+            }
+        }
+        base_action
     };
-    let result = execute_scheduled_refresh(&st, action, tick_watermark);
+    let result = execute_scheduled_refresh(&st, action, tick_watermark, drift_counter);
 
     let retry = retry_states.entry(pgt_id).or_default();
     match result {
@@ -2823,6 +2876,7 @@ fn execute_scheduled_refresh(
     st: &StreamTableMeta,
     action: RefreshAction,
     tick_watermark: Option<&str>,
+    drift_counter: Option<&mut i32>,
 ) -> RefreshOutcome {
     let start_instant = std::time::Instant::now();
 
@@ -2964,6 +3018,11 @@ fn execute_scheduled_refresh(
                         // G3+G4: advance WAL slots and flush change buffers
                         // now that the new frontier is stored.
                         refresh::post_full_refresh_cleanup(st);
+
+                        if let Some(counter) = drift_counter {
+                            *counter = 0;
+                        }
+
                         Ok((ins, del))
                     }
                     Err(e) => Err(e),
@@ -2985,6 +3044,12 @@ fn execute_scheduled_refresh(
                         // G3+G4: advance WAL slots and flush change buffers
                         // now that the new frontier is stored.
                         refresh::post_full_refresh_cleanup(st);
+
+                        // Drift reset mechanism: reset counter on full reinit
+                        if let Some(counter) = drift_counter {
+                            *counter = 0;
+                        }
+
                         Ok((ins, del))
                     }
                     Err(e) => Err(e),
@@ -3011,6 +3076,11 @@ fn execute_scheduled_refresh(
                             // G3+G4: advance WAL slots and flush change buffers
                             // now that the new frontier is stored.
                             refresh::post_full_refresh_cleanup(st);
+
+                            if let Some(counter) = drift_counter {
+                                *counter = 0;
+                            }
+
                             Ok((ins, del))
                         }
                         Err(e) => Err(e),
@@ -3026,6 +3096,11 @@ fn execute_scheduled_refresh(
                             {
                                 log!("pg_trickle: failed to store frontier: {}", e);
                             }
+
+                            if let Some(counter) = drift_counter {
+                                *counter += 1;
+                            }
+
                             Ok((ins, del))
                         }
                         Err(e) => {

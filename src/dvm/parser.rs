@@ -447,18 +447,39 @@ impl AggFunc {
         }
     }
 
-    /// Returns true for aggregates that use the group-rescan strategy:
-    /// any change in a group triggers full re-aggregation from source data.
+    /// Returns true for aggregates that are maintained algebraically using
+    /// auxiliary columns on the stream table.
     ///
-    /// AVG uses group-rescan because the algebraic formula
-    /// `old_avg * old_count + delta_sum` loses precision: NUMERIC division
-    /// in PostgreSQL rounds AVG results, so reconstructing the original SUM
-    /// from `AVG * COUNT` is lossy, causing drift across refresh cycles.
-    pub fn is_group_rescan(&self) -> bool {
+    /// - **AVG**: stores `__pgt_aux_sum_*` and `__pgt_aux_count_*`;
+    ///   `new_avg = (old_sum + Δsum) / (old_count + Δcount)`.
+    /// - **STDDEV/VAR**: additionally stores `__pgt_aux_sum2_*` (sum of squares);
+    ///   `var_pop = (n·sum2 − sum²) / n²`, etc.
+    pub fn is_algebraic_via_aux(&self) -> bool {
         matches!(
             self,
             AggFunc::Avg
-                | AggFunc::BoolAnd
+                | AggFunc::StddevPop
+                | AggFunc::StddevSamp
+                | AggFunc::VarPop
+                | AggFunc::VarSamp
+        )
+    }
+
+    /// Returns true for aggregates that need a sum-of-squares auxiliary
+    /// column (`__pgt_aux_sum2_*`) in addition to sum and count.
+    pub fn needs_sum_of_squares(&self) -> bool {
+        matches!(
+            self,
+            AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp
+        )
+    }
+
+    /// Returns true for aggregates that use the group-rescan strategy:
+    /// any change in a group triggers full re-aggregation from source data.
+    pub fn is_group_rescan(&self) -> bool {
+        matches!(
+            self,
+            AggFunc::BoolAnd
                 | AggFunc::BoolOr
                 | AggFunc::StringAgg
                 | AggFunc::ArrayAgg
@@ -471,10 +492,6 @@ impl AggFunc {
                 | AggFunc::JsonbObjectAgg
                 | AggFunc::JsonObjectAggStd(_)
                 | AggFunc::JsonArrayAggStd(_)
-                | AggFunc::StddevPop
-                | AggFunc::StddevSamp
-                | AggFunc::VarPop
-                | AggFunc::VarSamp
                 | AggFunc::AnyValue
                 | AggFunc::Mode
                 | AggFunc::PercentileCont
@@ -1170,6 +1187,75 @@ impl OpTree {
         }
     }
 
+    /// Returns the list of AVG auxiliary columns that need to be added to
+    /// the stream table storage for algebraic AVG maintenance.
+    ///
+    /// For each non-DISTINCT AVG aggregate at the top level, returns a tuple
+    /// of `(sum_col_name, count_col_name, arg_sql)`:
+    /// - `sum_col_name`: `__pgt_aux_sum_{alias}` — stores running SUM
+    /// - `count_col_name`: `__pgt_aux_count_{alias}` — stores running COUNT
+    /// - `arg_sql`: the SQL expression for the aggregate argument (e.g. `"amount"`)
+    ///
+    /// Returns an empty vec if the query has no AVG aggregates or if the
+    /// operator tree is not an aggregate query.
+    pub fn avg_aux_columns(&self) -> Vec<(String, String, String)> {
+        match self {
+            OpTree::Aggregate { aggregates, .. } => {
+                let mut aux = Vec::new();
+                for agg in aggregates {
+                    if agg.function.is_algebraic_via_aux() && !agg.is_distinct {
+                        let arg_sql = agg
+                            .argument
+                            .as_ref()
+                            .map(|e| e.to_sql())
+                            .unwrap_or_else(|| "1".to_string());
+                        aux.push((
+                            format!("__pgt_aux_sum_{}", agg.alias),
+                            format!("__pgt_aux_count_{}", agg.alias),
+                            arg_sql,
+                        ));
+                    }
+                }
+                aux
+            }
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.avg_aux_columns(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For each non-DISTINCT STDDEV/VAR aggregate, returns a tuple of
+    /// `(sum2_col_name, arg_sql)`:
+    /// - `sum2_col_name`: `__pgt_aux_sum2_{alias}` — stores running SUM(x²)
+    /// - `arg_sql`: the SQL expression for the aggregate argument
+    ///
+    /// These are needed in addition to the sum/count from `avg_aux_columns`.
+    pub fn sum2_aux_columns(&self) -> Vec<(String, String)> {
+        match self {
+            OpTree::Aggregate { aggregates, .. } => {
+                let mut aux = Vec::new();
+                for agg in aggregates {
+                    if agg.function.needs_sum_of_squares() && !agg.is_distinct {
+                        let arg_sql = agg
+                            .argument
+                            .as_ref()
+                            .map(|e| e.to_sql())
+                            .unwrap_or_else(|| "1".to_string());
+                        aux.push((format!("__pgt_aux_sum2_{}", agg.alias), arg_sql));
+                    }
+                }
+                aux
+            }
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.sum2_aux_columns(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Whether this operator represents a UNION (without ALL) that needs
     /// deduplication counting via `__pgt_count` in a wrapped UNION ALL form.
     pub fn needs_union_dedup_count(&self) -> bool {
@@ -1713,6 +1799,11 @@ impl OpTree {
         let mut refs = ColumnRefSet::default();
         if !self.collect_all_column_refs(&mut refs) {
             // Bail out — found Star/Raw that prevent safe pruning.
+            return;
+        }
+        // If no column refs were collected (e.g. SELECT * with no Project wrapper),
+        // bail out to avoid incorrectly pruning all non-PK columns.
+        if refs.qualified.is_empty() && refs.unqualified.is_empty() {
             return;
         }
         self.apply_column_pruning(&refs);
@@ -13478,6 +13569,28 @@ unsafe fn extract_aggregates(
                     filter,
                     order_within_group: None,
                 });
+            } else if unsafe { expr_contains_agg(rt.val) } {
+                // Non-aggregate function wrapping nested aggregate(s),
+                // e.g. ROUND(STDDEV_POP(amount), 2). Treat as ComplexExpression
+                // so the group-rescan path re-evaluates it correctly.
+                let raw_expr = unsafe { node_to_expr(rt.val)? };
+                let raw_sql = raw_expr.to_sql();
+
+                let alias = if !rt.name.is_null() {
+                    pg_cstr_to_str(rt.name).unwrap_or("complex_agg").to_string()
+                } else {
+                    format!("complex_agg_{}", aggs.len())
+                };
+
+                aggs.push(AggExpr {
+                    function: AggFunc::ComplexExpression(raw_sql),
+                    argument: None,
+                    alias,
+                    is_distinct: false,
+                    second_arg: None,
+                    filter: None,
+                    order_within_group: None,
+                });
             } else {
                 let expr = unsafe { node_to_expr(rt.val)? };
                 non_aggs.push(expr);
@@ -18821,8 +18934,10 @@ mod tests {
     }
 
     #[test]
-    fn test_agg_group_rescan_avg_needs_rescan() {
-        assert!(AggFunc::Avg.is_group_rescan());
+    fn test_agg_avg_is_algebraic_via_aux() {
+        // AVG is now algebraic via auxiliary columns, not group-rescan
+        assert!(!AggFunc::Avg.is_group_rescan());
+        assert!(AggFunc::Avg.is_algebraic_via_aux());
     }
 
     #[test]
@@ -18842,7 +18957,10 @@ mod tests {
 
     #[test]
     fn test_agg_group_rescan_stddev_pop_needs_rescan() {
-        assert!(AggFunc::StddevPop.is_group_rescan());
+        // STDDEV_POP is now algebraic via auxiliary columns, not group-rescan
+        assert!(!AggFunc::StddevPop.is_group_rescan());
+        assert!(AggFunc::StddevPop.is_algebraic_via_aux());
+        assert!(AggFunc::StddevPop.needs_sum_of_squares());
     }
 
     #[test]

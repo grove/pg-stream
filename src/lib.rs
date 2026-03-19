@@ -214,6 +214,16 @@ CREATE SCHEMA IF NOT EXISTS pgtrickle_changes;
 -- injection of bogus changes that would be applied on next refresh.
 REVOKE ALL ON SCHEMA pgtrickle_changes FROM PUBLIC;
 
+-- User-declared refresh groups for snapshot consistency
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_groups (
+    group_id    SERIAL PRIMARY KEY,
+    group_name  TEXT NOT NULL UNIQUE,
+    member_oids OID[] NOT NULL,
+    isolation   TEXT NOT NULL DEFAULT 'read_committed'
+                CHECK (isolation IN ('read_committed', 'repeatable_read')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Core ST metadata
 CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     pgt_id           BIGSERIAL PRIMARY KEY,

@@ -142,6 +142,12 @@ pub struct Diamond {
 ///
 /// When `diamond_consistency = 'atomic'`, all members are wrapped in a single
 /// SAVEPOINT. If any member's refresh fails, the entire group is rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConsistencyGroup {
     /// All members in topological order, including the convergence ST (last).
@@ -151,6 +157,8 @@ pub struct ConsistencyGroup {
     /// Monotonically increasing counter; advances on every successful group
     /// refresh.
     pub epoch: u64,
+    /// The transactional isolation level for this group.
+    pub isolation_level: IsolationLevel,
 }
 
 impl ConsistencyGroup {
@@ -807,6 +815,7 @@ impl StDag {
                 members,
                 convergence_points,
                 epoch: 0,
+                isolation_level: IsolationLevel::ReadCommitted,
             });
         }
 
@@ -817,6 +826,7 @@ impl StDag {
                     members: vec![node],
                     convergence_points: vec![],
                     epoch: 0,
+                    isolation_level: IsolationLevel::ReadCommitted,
                 });
             }
         }
@@ -1117,6 +1127,8 @@ pub enum ExecutionUnitKind {
     /// An atomic consistency group — all members refreshed serially in one
     /// worker transaction with SAVEPOINT rollback on failure.
     AtomicGroup,
+    /// An atomic consistency group requiring REPEATABLE READ isolation.
+    RepeatableReadGroup,
     /// An IMMEDIATE-trigger closure — the root scheduled refresh fires
     /// synchronous downstream updates inside the same transaction.
     ImmediateClosure,
@@ -1130,6 +1142,7 @@ impl ExecutionUnitKind {
         match self {
             ExecutionUnitKind::Singleton => "singleton",
             ExecutionUnitKind::AtomicGroup => "atomic_group",
+            ExecutionUnitKind::RepeatableReadGroup => "repeatable_read_group",
             ExecutionUnitKind::ImmediateClosure => "immediate_closure",
             ExecutionUnitKind::CyclicScc => "cyclic_scc",
         }
@@ -1171,6 +1184,7 @@ impl ExecutionUnit {
             ExecutionUnitKind::Singleton => "s",
             ExecutionUnitKind::AtomicGroup => "a",
             ExecutionUnitKind::ImmediateClosure => "i",
+            ExecutionUnitKind::RepeatableReadGroup => "rg",
             ExecutionUnitKind::CyclicScc => "c",
         };
         // member_pgt_ids are sorted during construction
@@ -1594,6 +1608,7 @@ impl ExecutionUnitDag {
                 ExecutionUnitKind::Singleton => singletons += 1,
                 ExecutionUnitKind::AtomicGroup => atomic_groups += 1,
                 ExecutionUnitKind::ImmediateClosure => immediate_closures += 1,
+                ExecutionUnitKind::RepeatableReadGroup => {}
                 ExecutionUnitKind::CyclicScc => cyclic_sccs += 1,
             }
         }
@@ -2722,6 +2737,7 @@ mod tests {
             members: vec![NodeId::StreamTable(1), NodeId::StreamTable(2)],
             convergence_points: vec![NodeId::StreamTable(2)],
             epoch: 0,
+            isolation_level: IsolationLevel::ReadCommitted,
         };
 
         assert_eq!(group.epoch, 0);
@@ -2737,6 +2753,7 @@ mod tests {
             members: vec![NodeId::StreamTable(1)],
             convergence_points: vec![],
             epoch: 0,
+            isolation_level: IsolationLevel::ReadCommitted,
         };
         assert!(singleton.is_singleton());
 
@@ -2744,6 +2761,7 @@ mod tests {
             members: vec![NodeId::StreamTable(1), NodeId::StreamTable(2)],
             convergence_points: vec![NodeId::StreamTable(2)],
             epoch: 0,
+            isolation_level: IsolationLevel::ReadCommitted,
         };
         assert!(!multi.is_singleton());
     }

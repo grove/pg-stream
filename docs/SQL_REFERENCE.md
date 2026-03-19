@@ -77,6 +77,8 @@ Complete reference for all SQL functions, views, and catalog tables provided by 
   - [pgtrickle.pgt\_dependencies](#pgtricklepgt_dependencies)
   - [pgtrickle.pgt\_refresh\_history](#pgtricklepgt_refresh_history)
   - [pgtrickle.pgt\_change\_tracking](#pgtricklepgt_change_tracking)
+  - [pgtrickle.pgt\_source\_gates](#pgtricklepgt_source_gates)
+  - [pgtrickle.pgt\_refresh\_groups](#pgtricklepgt_refresh_groups)
 
 ---
 
@@ -638,7 +640,14 @@ SELECT pgtrickle.create_stream_table(
 - CDC triggers and change buffer tables are created automatically for each source table.
 - The ST is registered in the dependency DAG; cycles are rejected.
 - Non-recursive CTEs are inlined as subqueries during parsing (Tier 1). Multi-reference CTEs share delta computation (Tier 2).
-- Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **Delete-and-Rederive (DRed)** for mixed changes, and **recomputation fallback** when CTE columns don't match ST storage columns. **Non-monotone recursive terms** (containing EXCEPT, Aggregate, Window, DISTINCT, AntiJoin, or INTERSECT SET) automatically fall back to recomputation to ensure correctness.
+- Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **recomputation fallback** for mixed DELETE/UPDATE changes (see known limitation below), and **recomputation fallback** when CTE columns don’t match ST storage columns. **Non-monotone recursive terms** (containing EXCEPT, Aggregate, Window, DISTINCT, AntiJoin, or INTERSECT SET) automatically fall back to recomputation to ensure correctness.
+
+> ⚠️ **Known Limitation — Recursive CTE DIFFERENTIAL mode and mixed changes**
+> In DIFFERENTIAL mode, when the change buffer contains DELETE or UPDATE rows for a
+> recursive CTE source, pg_trickle falls back to full **recomputation** (Strategy 3),
+> not Delete-and-Rederive. DRed is only active in **IMMEDIATE mode**. Use
+> `refresh_mode = 'IMMEDIATE'` for recursive CTE stream tables with frequent
+> DELETE/UPDATE workloads on their sources. Tracked as P2-1 in the v0.9.0 roadmap.
 - LATERAL SRFs in DIFFERENTIAL mode use row-scoped recomputation: when a source row changes, only the SRF expansions for that row are re-evaluated.
 - LATERAL subqueries in DIFFERENTIAL mode also use row-scoped recomputation: when an outer row changes, the correlated subquery is re-executed only for that row.
 - WHERE subqueries (`EXISTS`, `IN`, scalar) are parsed into dedicated semi-join, anti-join, and scalar subquery operators with specialized delta computation.
@@ -2434,6 +2443,45 @@ refreshes.
 | `gated_at` | `timestamptz` | When the gate was most recently set |
 | `ungated_at` | `timestamptz` | When the gate was cleared (`NULL` if still active) |
 | `gated_by` | `text` | Actor that set the gate (e.g. `'gate_source'`) |
+
+### pgtrickle.pgt_refresh_groups
+
+User-declared Cross-Source Snapshot Consistency groups (v0.9.0). A refresh
+group guarantees that all member stream tables are refreshed against a snapshot
+taken at the same point in time, preventing partial-update visibility (e.g.
+`orders` and `order_lines` both reflecting the same transaction boundary).
+
+| Column | Type | Description |
+|---|---|---|
+| `group_id` | `serial` | Primary key |
+| `group_name` | `text` | Unique human-readable group name |
+| `member_oids` | `oid[]` | OIDs of the stream table storage relations that participate in this group |
+| `isolation` | `text` | Snapshot isolation level for the group: `'read_committed'` (default) or `'repeatable_read'` |
+| `created_at` | `timestamptz` | When the group was created |
+
+> **Note:** The user-facing SQL API functions (`pgt_add_refresh_group()`,
+> `pgt_remove_refresh_group()`, `pgt_list_refresh_groups()`) are tracked as
+> item A8 in the v0.9.0 roadmap and are not yet implemented. In the interim,
+> rows can be managed directly:
+
+```sql
+-- Declare a consistency group so that orders_summary and
+-- order_lines_summary are always refreshed from the same snapshot.
+INSERT INTO pgtrickle.pgt_refresh_groups (group_name, member_oids, isolation)
+SELECT
+    'orders_snapshot',
+    ARRAY[
+        (SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'orders_summary'),
+        (SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'order_lines_summary')
+    ],
+    'repeatable_read';
+
+-- List all groups:
+SELECT group_name, member_oids, isolation FROM pgtrickle.pgt_refresh_groups;
+
+-- Remove a group:
+DELETE FROM pgtrickle.pgt_refresh_groups WHERE group_name = 'orders_snapshot';
+```
 
 ---
 

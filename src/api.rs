@@ -426,6 +426,12 @@ struct ValidatedQuery {
     has_keyless_source: bool,
     /// Source relation OIDs and types extracted from the query.
     source_relids: Vec<(pg_sys::Oid, String)>,
+    /// AVG auxiliary columns: `(sum_col_name, count_col_name, arg_sql)` tuples
+    /// for algebraic AVG maintenance. Empty if no non-DISTINCT AVG aggregates.
+    avg_aux_columns: Vec<(String, String, String)>,
+    /// Sum-of-squares auxiliary columns: `(sum2_col_name, arg_sql)` tuples
+    /// for algebraic STDDEV/VAR maintenance. Empty if no non-DISTINCT STDDEV/VAR.
+    sum2_aux_columns: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,6 +738,16 @@ fn validate_and_parse_query(
             .unwrap_or(false)
     });
 
+    let avg_aux_columns = parsed_tree
+        .as_ref()
+        .map(|pr| pr.tree.avg_aux_columns())
+        .unwrap_or_default();
+
+    let sum2_aux_columns = parsed_tree
+        .as_ref()
+        .map(|pr| pr.tree.sum2_aux_columns())
+        .unwrap_or_default();
+
     Ok(ValidatedQuery {
         columns,
         parsed_tree,
@@ -742,6 +758,8 @@ fn validate_and_parse_query(
         needs_union_dedup,
         has_keyless_source,
         source_relids,
+        avg_aux_columns,
+        sum2_aux_columns,
     })
 }
 
@@ -757,6 +775,8 @@ fn setup_storage_table(
     has_keyless_source: bool,
     refresh_mode: RefreshMode,
     parsed_tree: Option<&crate::dvm::ParseResult>,
+    avg_aux_columns: &[(String, String, String)],
+    sum2_aux_columns: &[(String, String)],
 ) -> Result<pg_sys::Oid, PgTrickleError> {
     let storage_needs_pgt_count = needs_pgt_count;
     let storage_ddl = build_create_table_sql(
@@ -765,6 +785,8 @@ fn setup_storage_table(
         columns,
         storage_needs_pgt_count,
         needs_dual_count,
+        avg_aux_columns,
+        sum2_aux_columns,
     );
     Spi::run(&storage_ddl)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
@@ -1105,8 +1127,10 @@ fn migrate_storage_table_compatible(
     Ok(())
 }
 
-/// Manage auxiliary count columns (__pgt_count, __pgt_count_l, __pgt_count_r)
-/// during ALTER QUERY when the query type changes (e.g., flat → aggregate).
+/// Manage auxiliary columns (__pgt_count, __pgt_count_l/r, __pgt_aux_sum_*,
+/// __pgt_aux_count_*, __pgt_aux_sum2_*) during ALTER QUERY when the query
+/// type or aggregate composition changes.
+#[allow(clippy::too_many_arguments)]
 fn migrate_aux_columns(
     schema: &str,
     table_name: &str,
@@ -1115,6 +1139,10 @@ fn migrate_aux_columns(
     new_needs_pgt_count: bool,
     new_needs_dual_count: bool,
     new_needs_union_dedup: bool,
+    old_avg_aux: &[(String, String, String)],
+    new_avg_aux: &[(String, String, String)],
+    old_sum2_aux: &[(String, String)],
+    new_sum2_aux: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
     let quoted_table = format!(
         "{}.{}",
@@ -1180,6 +1208,78 @@ fn migrate_aux_columns(
         }
     }
 
+    // Transition: AVG auxiliary columns (__pgt_aux_sum_*, __pgt_aux_count_*)
+    let old_avg_names: std::collections::HashSet<(&str, &str)> = old_avg_aux
+        .iter()
+        .map(|(s, c, _)| (s.as_str(), c.as_str()))
+        .collect();
+    let new_avg_names: std::collections::HashSet<(&str, &str)> = new_avg_aux
+        .iter()
+        .map(|(s, c, _)| (s.as_str(), c.as_str()))
+        .collect();
+    // Add new AVG aux columns
+    for (sum_col, count_col, _) in new_avg_aux {
+        if !old_avg_names.contains(&(sum_col.as_str(), count_col.as_str())) {
+            Spi::run(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} NUMERIC NOT NULL DEFAULT 0",
+                quoted_table,
+                quote_identifier(sum_col),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Spi::run(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} BIGINT NOT NULL DEFAULT 0",
+                quoted_table,
+                quote_identifier(count_col),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+    // Drop removed AVG aux columns
+    for (sum_col, count_col, _) in old_avg_aux {
+        if !new_avg_names.contains(&(sum_col.as_str(), count_col.as_str())) {
+            Spi::run(&format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+                quoted_table,
+                quote_identifier(sum_col),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Spi::run(&format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+                quoted_table,
+                quote_identifier(count_col),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+
+    // Transition: sum-of-squares auxiliary columns (__pgt_aux_sum2_*)
+    let old_sum2_names: std::collections::HashSet<&str> =
+        old_sum2_aux.iter().map(|(n, _)| n.as_str()).collect();
+    let new_sum2_names: std::collections::HashSet<&str> =
+        new_sum2_aux.iter().map(|(n, _)| n.as_str()).collect();
+    // Add new sum2 aux columns
+    for (col_name, _) in new_sum2_aux {
+        if !old_sum2_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} NUMERIC NOT NULL DEFAULT 0",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+    // Drop removed sum2 aux columns
+    for (col_name, _) in old_sum2_aux {
+        if !new_sum2_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1232,6 +1332,8 @@ fn alter_stream_table_query(
     // Detect old auxiliary column state from current ST metadata
     let old_needs_pgt_count = crate::dvm::query_needs_pgt_count(&st.defining_query);
     let old_needs_dual_count = crate::dvm::query_needs_dual_count(&st.defining_query);
+    let old_avg_aux = crate::dvm::query_avg_aux_columns(&st.defining_query);
+    let old_sum2_aux = crate::dvm::query_sum2_aux_columns(&st.defining_query);
 
     // ── Phase 1: Suspend ──
     StreamTableMeta::update_status(st.pgt_id, StStatus::Suspended)?;
@@ -1324,6 +1426,8 @@ fn alter_stream_table_query(
                 vq.has_keyless_source,
                 refresh_mode,
                 vq.parsed_tree.as_ref(),
+                &vq.avg_aux_columns,
+                &vq.sum2_aux_columns,
             )?
         }
     };
@@ -1338,6 +1442,10 @@ fn alter_stream_table_query(
             vq.needs_pgt_count,
             vq.needs_dual_count,
             vq.needs_union_dedup,
+            &old_avg_aux,
+            &vq.avg_aux_columns,
+            &old_sum2_aux,
+            &vq.sum2_aux_columns,
         )?;
     }
 
@@ -1690,6 +1798,8 @@ fn create_stream_table_impl(
         vq.has_keyless_source,
         refresh_mode,
         vq.parsed_tree.as_ref(),
+        &vq.avg_aux_columns,
+        &vq.sum2_aux_columns,
     )?;
 
     // Insert catalog entry + dependency edges
@@ -1758,6 +1868,8 @@ fn create_stream_table_impl(
             vq.needs_dual_count,
             vq.needs_union_dedup,
             vq.topk_info.as_ref(),
+            &vq.avg_aux_columns,
+            &vq.sum2_aux_columns,
         )?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
 
@@ -2597,7 +2709,18 @@ fn execute_manual_full_refresh(
     let effective_query = if st.refresh_mode == RefreshMode::Differential
         && crate::dvm::query_needs_pgt_count(&st.defining_query)
     {
-        inject_pgt_count(&st.defining_query)
+        let mut eq = inject_pgt_count(&st.defining_query);
+        // Also inject AVG auxiliary columns for algebraic AVG maintenance.
+        let avg_aux = crate::dvm::query_avg_aux_columns(&st.defining_query);
+        if !avg_aux.is_empty() {
+            eq = inject_avg_aux(&eq, &avg_aux);
+        }
+        // Also inject sum-of-squares columns for STDDEV/VAR maintenance.
+        let sum2_aux = crate::dvm::query_sum2_aux_columns(&st.defining_query);
+        if !sum2_aux.is_empty() {
+            eq = inject_sum2_aux(&eq, &sum2_aux);
+        }
+        eq
     } else {
         st.defining_query.clone()
     };
@@ -3216,7 +3339,7 @@ fn source_gates_fn() -> TableIterator<
             .unwrap_or_else(|e| {
                 pgrx::warning!("source_gates: SPI error: {}", e);
                 // Return an empty iterator-compatible value via an empty Vec
-                panic!("source_gates: SPI error: {}", e)
+                pgrx::error!("source_gates: SPI error: {}", e)
             });
 
         let mut out = Vec::new();
@@ -3419,7 +3542,7 @@ fn watermarks_fn() -> TableIterator<
                 None,
                 &[],
             )
-            .unwrap_or_else(|e| panic!("watermarks: SPI error: {}", e));
+            .unwrap_or_else(|e| pgrx::error!("watermarks: SPI error: {}", e));
 
         let mut out = Vec::new();
         for row in table {
@@ -3724,8 +3847,11 @@ fn setup_cdc_for_source(
             }
         }
 
-        // Resolve all source columns for typed change buffer
-        let col_defs = cdc::resolve_source_column_defs(source_oid)?;
+        // F15: Resolve the minimal set of columns needed for CDC capture.
+        // Uses the union of `columns_used` across all downstream STs for this
+        // source, always including PK columns. Falls back to full column capture
+        // when any ST uses `SELECT *` (columns_used = NULL) or on first-time setup.
+        let col_defs = cdc::resolve_referenced_column_defs(source_oid)?;
 
         // Create the change buffer table (with typed columns + pk_hash always)
         cdc::create_change_buffer_table(source_oid, change_schema, &col_defs)?;
@@ -3754,6 +3880,11 @@ fn setup_cdc_for_source(
             &[pgt_id.into(), source_oid.into()],
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        // F15: The new ST may reference columns not yet in the change buffer.
+        // Rebuild the trigger function + sync change buffer columns so the union
+        // of all downstream ST column sets is reflected in the buffer.
+        cdc::rebuild_cdc_trigger_function(source_oid, change_schema)?;
     }
 
     if requested_cdc_mode == "trigger" {
@@ -4779,6 +4910,8 @@ fn build_create_table_sql(
     columns: &[ColumnDef],
     needs_pgt_count: bool,
     needs_dual_count: bool,
+    avg_aux_columns: &[(String, String, String)],
+    sum2_aux_columns: &[(String, String)],
 ) -> String {
     let col_defs: Vec<String> = columns
         .iter()
@@ -4810,12 +4943,36 @@ fn build_create_table_sql(
         ""
     };
 
+    // Add AVG auxiliary columns (__pgt_aux_sum_*, __pgt_aux_count_*) for
+    // algebraic AVG maintenance. NUMERIC for sum (matches PostgreSQL AVG
+    // precision), BIGINT for count.
+    let mut avg_aux_sql = String::new();
+    for (sum_col, count_col, _arg_sql) in avg_aux_columns {
+        avg_aux_sql.push_str(&format!(
+            ",\n    {} NUMERIC NOT NULL DEFAULT 0,\n    {} BIGINT NOT NULL DEFAULT 0",
+            quote_identifier(sum_col),
+            quote_identifier(count_col),
+        ));
+    }
+
+    // Add sum-of-squares auxiliary columns (__pgt_aux_sum2_*) for
+    // algebraic STDDEV/VAR maintenance.
+    let mut sum2_aux_sql = String::new();
+    for (sum2_col, _arg_sql) in sum2_aux_columns {
+        sum2_aux_sql.push_str(&format!(
+            ",\n    {} NUMERIC NOT NULL DEFAULT 0",
+            quote_identifier(sum2_col),
+        ));
+    }
+
     format!(
-        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}\n)",
+        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}\n)",
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
         aux_cols,
+        avg_aux_sql,
+        sum2_aux_sql,
     )
 }
 
@@ -4847,6 +5004,8 @@ fn initialize_st(
     needs_dual_count: bool,
     needs_union_dedup: bool,
     topk_info: Option<&crate::dvm::TopKInfo>,
+    avg_aux_columns: &[(String, String, String)],
+    sum2_aux_columns: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
     // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
     // allow the initialization INSERT into the storage table.
@@ -4855,11 +5014,23 @@ fn initialize_st(
 
     // For aggregate/distinct STs, inject COUNT(*) AS __pgt_count into the
     // defining query so the auxiliary column is populated correctly.
-    let effective_query = if needs_pgt_count {
+    let mut effective_query = if needs_pgt_count {
         inject_pgt_count(query)
     } else {
         query.to_string()
     };
+
+    // For AVG algebraic maintenance, also inject SUM(arg) and COUNT(arg)
+    // auxiliary columns into the initialization query.
+    if !avg_aux_columns.is_empty() {
+        effective_query = inject_avg_aux(&effective_query, avg_aux_columns);
+    }
+
+    // For STDDEV/VAR algebraic maintenance, inject SUM(arg*arg) auxiliary
+    // columns for sum-of-squares tracking.
+    if !sum2_aux_columns.is_empty() {
+        effective_query = inject_sum2_aux(&effective_query, sum2_aux_columns);
+    }
 
     // Compute row_id using the same hash formula as the delta query so
     // the MERGE ON clause matches during subsequent differential refreshes.
@@ -4983,6 +5154,54 @@ pub fn inject_pgt_count(query: &str) -> String {
         )
     } else {
         // Fallback: can't inject; return as-is (will leave __pgt_count = DEFAULT 0)
+        query.to_string()
+    }
+}
+
+/// Inject AVG auxiliary columns (`SUM(arg)` and `COUNT(arg)`) into a query.
+///
+/// These populate the `__pgt_aux_sum_*` and `__pgt_aux_count_*` storage columns
+/// during initial population and full refresh. The query must already have
+/// `__pgt_count` injected (if needed) before calling this.
+pub fn inject_avg_aux(query: &str, avg_aux_columns: &[(String, String, String)]) -> String {
+    if avg_aux_columns.is_empty() {
+        return query.to_string();
+    }
+
+    if let Some(pos) = find_top_level_keyword(query, "FROM") {
+        let mut extra = String::new();
+        for (sum_col, count_col, arg_sql) in avg_aux_columns {
+            extra.push_str(&format!(
+                ", SUM({arg_sql}) AS {}, COUNT({arg_sql}) AS {}",
+                quote_identifier(sum_col),
+                quote_identifier(count_col),
+            ));
+        }
+        format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..],)
+    } else {
+        query.to_string()
+    }
+}
+
+/// Inject sum-of-squares auxiliary columns (`SUM((arg)*(arg))`) into a query.
+///
+/// Populates `__pgt_aux_sum2_*` columns for STDDEV/VAR algebraic maintenance
+/// during initial population and full refresh. Call after `inject_avg_aux`.
+pub fn inject_sum2_aux(query: &str, sum2_aux_columns: &[(String, String)]) -> String {
+    if sum2_aux_columns.is_empty() {
+        return query.to_string();
+    }
+
+    if let Some(pos) = find_top_level_keyword(query, "FROM") {
+        let mut extra = String::new();
+        for (sum2_col, arg_sql) in sum2_aux_columns {
+            extra.push_str(&format!(
+                ", SUM(({arg_sql}) * ({arg_sql})) AS {}",
+                quote_identifier(sum2_col),
+            ));
+        }
+        format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..],)
+    } else {
         query.to_string()
     }
 }

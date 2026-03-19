@@ -716,7 +716,7 @@ async fn test_stddev_pop_differential_mode() {
 
     db.create_st(
         "sdp_st",
-        "SELECT dept, STDDEV_POP(amount) AS sd FROM sdp_src GROUP BY dept",
+        "SELECT dept, ROUND(STDDEV_POP(amount), 4) AS sd FROM sdp_src GROUP BY dept",
         "1m",
         "DIFFERENTIAL",
     )
@@ -724,7 +724,7 @@ async fn test_stddev_pop_differential_mode() {
 
     db.assert_st_matches_query(
         "public.sdp_st",
-        "SELECT dept, STDDEV_POP(amount) AS sd FROM sdp_src GROUP BY dept",
+        "SELECT dept, ROUND(STDDEV_POP(amount), 4) AS sd FROM sdp_src GROUP BY dept",
     )
     .await;
 
@@ -735,7 +735,7 @@ async fn test_stddev_pop_differential_mode() {
 
     db.assert_st_matches_query(
         "public.sdp_st",
-        "SELECT dept, STDDEV_POP(amount) AS sd FROM sdp_src GROUP BY dept",
+        "SELECT dept, ROUND(STDDEV_POP(amount), 4) AS sd FROM sdp_src GROUP BY dept",
     )
     .await;
 
@@ -745,7 +745,7 @@ async fn test_stddev_pop_differential_mode() {
 
     db.assert_st_matches_query(
         "public.sdp_st",
-        "SELECT dept, STDDEV_POP(amount) AS sd FROM sdp_src GROUP BY dept",
+        "SELECT dept, ROUND(STDDEV_POP(amount), 4) AS sd FROM sdp_src GROUP BY dept",
     )
     .await;
 }
@@ -765,7 +765,7 @@ async fn test_stddev_samp_differential_mode() {
 
     db.create_st(
         "sds_st",
-        "SELECT dept, STDDEV_SAMP(amount) AS sd FROM sds_src GROUP BY dept",
+        "SELECT dept, ROUND(STDDEV_SAMP(amount), 4) AS sd FROM sds_src GROUP BY dept",
         "1m",
         "DIFFERENTIAL",
     )
@@ -773,7 +773,7 @@ async fn test_stddev_samp_differential_mode() {
 
     db.assert_st_matches_query(
         "public.sds_st",
-        "SELECT dept, STDDEV_SAMP(amount) AS sd FROM sds_src GROUP BY dept",
+        "SELECT dept, ROUND(STDDEV_SAMP(amount), 4) AS sd FROM sds_src GROUP BY dept",
     )
     .await;
 
@@ -784,7 +784,7 @@ async fn test_stddev_samp_differential_mode() {
 
     db.assert_st_matches_query(
         "public.sds_st",
-        "SELECT dept, STDDEV_SAMP(amount) AS sd FROM sds_src GROUP BY dept",
+        "SELECT dept, ROUND(STDDEV_SAMP(amount), 4) AS sd FROM sds_src GROUP BY dept",
     )
     .await;
 }
@@ -837,7 +837,7 @@ async fn test_var_pop_differential_mode() {
 
     db.create_st(
         "vp_st",
-        "SELECT dept, VAR_POP(amount) AS vp FROM vp_src GROUP BY dept",
+        "SELECT dept, ROUND(VAR_POP(amount), 4) AS vp FROM vp_src GROUP BY dept",
         "1m",
         "DIFFERENTIAL",
     )
@@ -845,7 +845,7 @@ async fn test_var_pop_differential_mode() {
 
     db.assert_st_matches_query(
         "public.vp_st",
-        "SELECT dept, VAR_POP(amount) AS vp FROM vp_src GROUP BY dept",
+        "SELECT dept, ROUND(VAR_POP(amount), 4) AS vp FROM vp_src GROUP BY dept",
     )
     .await;
 
@@ -857,7 +857,7 @@ async fn test_var_pop_differential_mode() {
 
     db.assert_st_matches_query(
         "public.vp_st",
-        "SELECT dept, VAR_POP(amount) AS vp FROM vp_src GROUP BY dept",
+        "SELECT dept, ROUND(VAR_POP(amount), 4) AS vp FROM vp_src GROUP BY dept",
     )
     .await;
 }
@@ -877,7 +877,7 @@ async fn test_var_samp_differential_mode() {
 
     db.create_st(
         "vs_st",
-        "SELECT dept, VAR_SAMP(amount) AS vs FROM vs_src GROUP BY dept",
+        "SELECT dept, ROUND(VAR_SAMP(amount), 4) AS vs FROM vs_src GROUP BY dept",
         "1m",
         "DIFFERENTIAL",
     )
@@ -885,7 +885,7 @@ async fn test_var_samp_differential_mode() {
 
     db.assert_st_matches_query(
         "public.vs_st",
-        "SELECT dept, VAR_SAMP(amount) AS vs FROM vs_src GROUP BY dept",
+        "SELECT dept, ROUND(VAR_SAMP(amount), 4) AS vs FROM vs_src GROUP BY dept",
     )
     .await;
 
@@ -896,7 +896,7 @@ async fn test_var_samp_differential_mode() {
 
     db.assert_st_matches_query(
         "public.vs_st",
-        "SELECT dept, VAR_SAMP(amount) AS vs FROM vs_src GROUP BY dept",
+        "SELECT dept, ROUND(VAR_SAMP(amount), 4) AS vs FROM vs_src GROUP BY dept",
     )
     .await;
 }
@@ -950,7 +950,7 @@ async fn test_mixed_stddev_with_sum_count_differential() {
 
     db.create_st(
         "mstat_st",
-        "SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total, STDDEV_POP(amount) AS sd \
+        "SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total, ROUND(ROUND(STDDEV_POP(amount), 4), 4) AS sd \
          FROM mstat_src GROUP BY dept",
         "1m",
         "DIFFERENTIAL",
@@ -959,7 +959,7 @@ async fn test_mixed_stddev_with_sum_count_differential() {
 
     db.assert_st_matches_query(
         "public.mstat_st",
-        "SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total, STDDEV_POP(amount) AS sd \
+        "SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total, ROUND(ROUND(STDDEV_POP(amount), 4), 4) AS sd \
          FROM mstat_src GROUP BY dept",
     )
     .await;
@@ -971,7 +971,7 @@ async fn test_mixed_stddev_with_sum_count_differential() {
 
     db.assert_st_matches_query(
         "public.mstat_st",
-        "SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total, STDDEV_POP(amount) AS sd \
+        "SELECT dept, COUNT(*) AS cnt, SUM(amount) AS total, ROUND(ROUND(STDDEV_POP(amount), 4), 4) AS sd \
          FROM mstat_src GROUP BY dept",
     )
     .await;

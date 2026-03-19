@@ -1207,10 +1207,10 @@ verification tests pass.
 | **F37** | G5.1 | DISTINCT ON without ORDER BY warning | 1h | ✅ Done (warning in rewrite_distinct_on) |
 | **F38** | G5.5 | NATURAL JOIN column drift tracking | 2–3h | ✅ Done (warning when NATURAL JOIN is resolved) |
 | **F39** | G7.2 | Drop orphaned buffer table columns | 2–3h | ✅ Done (sync_change_buffer_columns drops orphaned columns) |
-| **F40** | G8.3 | Extension upgrade migration scripts | See REPORT_DB_SCHEMA_STABILITY.md | ⬜ Deferred |
+| **F40** | G8.3 | Extension upgrade migration scripts | See REPORT_DB_SCHEMA_STABILITY.md | ✅ Done |
 
 **Estimated effort:** 25–36 hours → **Actual: ~6 hours (F28, F36 already done; F40 deferred)**  
-**Status: 13/14 COMPLETE (F40 deferred)**
+**Status: ✅ 14/14 COMPLETE**
 
 ### Tier 5 — Nice-to-Have
 

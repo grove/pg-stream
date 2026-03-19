@@ -69,6 +69,7 @@ new entries when creating documents.
 |------|------|--------|---------|
 | [PLAN_PERFORMANCE_PART_8.md](performance/PLAN_PERFORMANCE_PART_8.md) | PLAN | — | Residual bottlenecks & next-wave optimizations |
 | [PLAN_PERFORMANCE_PART_9.md](performance/PLAN_PERFORMANCE_PART_9.md) | PLAN | Planning | Strategic performance roadmap |
+| [PLAN_MULTI_TABLE_DELTA_BATCHING.md](performance/PLAN_MULTI_TABLE_DELTA_BATCHING.md) | PLAN | Planned | Multi-table delta batching (B-3) |
 | [REPORT_PARALLELIZATION.md](performance/REPORT_PARALLELIZATION.md) | REPORT | Planning | Parallelization options analysis |
 | [STATUS_PERFORMANCE.md](performance/STATUS_PERFORMANCE.md) | STATUS | — | Performance benchmark history & trends |
 | [PLAN_TRIGGERS_OVERHEAD.md](performance/PLAN_TRIGGERS_OVERHEAD.md) | PLAN | — | CDC trigger write-side overhead benchmark |
@@ -77,7 +78,7 @@ new entries when creating documents.
 
 | File | Type | Status | Summary |
 |------|------|--------|---------|
-| [PLAN_CIRCULAR_REFERENCES.md](sql/PLAN_CIRCULAR_REFERENCES.md) | PLAN | Not started | Circular references in the dependency graph |
+| [PLAN_CIRCULAR_REFERENCES.md](sql/PLAN_CIRCULAR_REFERENCES.md) | PLAN | Implemented | Circular references in the dependency graph |
 | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) | PLAN | Proposed | Cross-source snapshot consistency for converging independent branches |
 | [PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md](sql/PLAN_DIAMOND_DEPENDENCY_CONSISTENCY.md) | PLAN | Decided | Diamond consistency decision: prioritize atomic refresh groups (with aligned mode fallback) |
 | [PLAN_FUSE.md](sql/PLAN_FUSE.md) | PLAN | Exploration | Fuse — halt refresh on anomalous change volume |

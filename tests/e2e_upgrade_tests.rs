@@ -307,6 +307,89 @@ async fn test_upgrade_monitoring_views_present() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// L15 — v0.9.0 schema additions exist after fresh install
+// ══════════════════════════════════════════════════════════════════════
+
+/// Verify that tables and indexes introduced in v0.9.0 are present after
+/// a fresh CREATE EXTENSION. Specifically asserts the Cross-Source Snapshot
+/// Consistency table (pgt_refresh_groups) and its structure.
+#[tokio::test]
+async fn test_upgrade_v090_catalog_additions() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // pgt_refresh_groups must exist (added in 0.9.0 for Cross-Source Snapshot Consistency)
+    let table_exists: bool = db
+        .query_scalar(
+            "SELECT EXISTS( \
+                SELECT 1 FROM information_schema.tables \
+                WHERE table_schema = 'pgtrickle' \
+                  AND table_name = 'pgt_refresh_groups' \
+            )",
+        )
+        .await;
+    assert!(
+        table_exists,
+        "pgtrickle.pgt_refresh_groups must exist after fresh install"
+    );
+
+    // Verify all expected columns are present
+    let expected_cols = vec![
+        ("group_id", "integer"),
+        ("group_name", "text"),
+        ("member_oids", "ARRAY"),
+        ("isolation", "text"),
+        ("created_at", "timestamp with time zone"),
+    ];
+    for (col, typ) in &expected_cols {
+        let exists: bool = db
+            .query_scalar(&format!(
+                "SELECT EXISTS( \
+                    SELECT 1 FROM information_schema.columns \
+                    WHERE table_schema = 'pgtrickle' \
+                      AND table_name = 'pgt_refresh_groups' \
+                      AND column_name = '{col}' \
+                      AND data_type LIKE '%{typ}%' \
+                )"
+            ))
+            .await;
+        assert!(
+            exists,
+            "pgt_refresh_groups.{col} (type ~'{typ}') missing after fresh install"
+        );
+    }
+
+    // The table should be empty on a fresh install
+    let count: i64 = db
+        .query_scalar("SELECT count(*) FROM pgtrickle.pgt_refresh_groups")
+        .await;
+    assert_eq!(
+        count, 0,
+        "pgt_refresh_groups should be empty after fresh install"
+    );
+
+    // Verify the unique constraint on group_name is functional
+    db.execute(
+        "INSERT INTO pgtrickle.pgt_refresh_groups (group_name, member_oids) \
+         VALUES ('test_group', ARRAY[]::OID[])",
+    )
+    .await;
+    let dup_result = sqlx::query(
+        "INSERT INTO pgtrickle.pgt_refresh_groups (group_name, member_oids) \
+         VALUES ('test_group', ARRAY[]::OID[])",
+    )
+    .execute(&db.pool)
+    .await;
+    assert!(
+        dup_result.is_err(),
+        "Duplicate group_name insert should fail (unique constraint)"
+    );
+
+    // Cleanup
+    db.execute("DELETE FROM pgtrickle.pgt_refresh_groups WHERE group_name = 'test_group'")
+        .await;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // L8–L13 — True version-to-version upgrade tests
 // ══════════════════════════════════════════════════════════════════════
 //
@@ -338,7 +421,7 @@ async fn test_upgrade_chain_new_functions_exist() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.8.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
     // The .so binary is always the current version. Calling pg_trickle functions
     // requires the SQL catalog to match — skip when upgrading to an older version.
@@ -422,7 +505,7 @@ async fn test_upgrade_chain_stream_tables_survive() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.8.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
     // The .so binary is always the current version. Calling pg_trickle functions
     // requires the SQL catalog to match — skip when upgrading to an older version.
@@ -498,7 +581,7 @@ async fn test_upgrade_chain_views_queryable() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.8.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -541,7 +624,7 @@ async fn test_upgrade_chain_event_triggers_present() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.8.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -584,7 +667,7 @@ async fn test_upgrade_chain_version_consistency() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.8.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
     let db = E2eDb::new().await;
     db.execute(&format!(
@@ -628,7 +711,7 @@ async fn test_upgrade_chain_function_parity_with_fresh_install() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.8.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
     let db = E2eDb::new().await;
 
@@ -696,7 +779,7 @@ async fn test_upgrade_schema_additions_from_sql() {
         return;
     }
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
-    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.8.0".into());
+    let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
     let db = E2eDb::new().await;
 

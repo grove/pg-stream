@@ -436,3 +436,61 @@ async fn test_diamond_schedule_policy_invalid_rejected() {
         "expected error for invalid diamond_schedule_policy"
     );
 }
+
+/// B3-3: Diamond flow property test verification setup.
+/// When multiple sources in a complex merge flow update simultaneously,
+/// they emit duplicate correcting rows (`DISTINCT ON` corrupted this by dropping them).
+/// Z-set integration ensures this mathematical accuracy holds up.
+#[tokio::test]
+async fn test_diamond_flow_simultaneous_multi_source_update() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Base table
+    db.execute("CREATE TABLE root_table (id INT PRIMARY KEY, val INT)")
+        .await;
+    db.execute("INSERT INTO root_table VALUES (1, 100)").await;
+
+    db.create_st(
+        "st_branch_a",
+        "SELECT id, val + 10 as score_a FROM root_table",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.create_st(
+        "st_branch_b",
+        "SELECT id, val - 10 as score_b FROM root_table",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Diamond tip: Joins A and B
+    db.create_st(
+        "st_diamond_tip",
+        "SELECT a.id, a.score_a, b.score_b FROM st_branch_a a JOIN st_branch_b b ON a.id = b.id",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.execute("SELECT pgtrickle.refresh_stream_table('st_diamond_tip')")
+        .await;
+
+    // DML triggers branches A and B to recalculate
+    db.execute("UPDATE root_table SET val = 200 WHERE id = 1")
+        .await;
+
+    // Refresh ALL tables systematically
+    db.execute("SELECT pgtrickle.refresh_stream_table('st_branch_a')")
+        .await;
+    db.execute("SELECT pgtrickle.refresh_stream_table('st_branch_b')")
+        .await;
+    db.execute("SELECT pgtrickle.refresh_stream_table('st_diamond_tip')")
+        .await;
+
+    db.assert_st_matches_query(
+        "st_diamond_tip",
+        "SELECT 1 as id, 210 as score_a, 190 as score_b",
+    )
+    .await;
+}

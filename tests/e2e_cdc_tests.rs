@@ -493,3 +493,248 @@ async fn test_full_refresh_partitioned_table() {
     db.assert_st_matches_query("public.pt_full_st", "SELECT id, cat FROM pt_full")
         .await;
 }
+
+// ── F15: Selective CDC Column Capture Tests ────────────────────────────────
+
+/// F15: Verify that the change buffer only contains columns referenced by
+/// the stream table's defining query plus PK columns.
+///
+/// Source has 5 columns (id, name, status, score, notes). The ST only
+/// references id + name. The change buffer must contain new_id, old_id,
+/// new_name, old_name but NOT new_status, old_status, new_score, old_score,
+/// new_notes, old_notes.
+#[tokio::test]
+async fn test_f15_selective_cdc_buffer_has_only_referenced_columns() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    // 5-column source; ST references only id + name
+    db.execute(
+        "CREATE TABLE f15_src (
+            id     INT  PRIMARY KEY,
+            name   TEXT NOT NULL,
+            status TEXT,
+            score  INT,
+            notes  TEXT
+        )",
+    )
+    .await;
+
+    db.create_st(
+        "f15_st",
+        "SELECT id, name FROM f15_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let source_oid = db.table_oid("f15_src").await;
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+
+    // Buffer must have new_id / old_id (PK) and new_name / old_name (referenced).
+    let has_new_id: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = '{buffer_table}'::regclass
+                  AND attname = 'new_id'
+                  AND attnum > 0
+                  AND NOT attisdropped
+            )"
+        ))
+        .await;
+    assert!(has_new_id, "new_id must be present in change buffer");
+
+    let has_new_name: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = '{buffer_table}'::regclass
+                  AND attname = 'new_name'
+                  AND attnum > 0
+                  AND NOT attisdropped
+            )"
+        ))
+        .await;
+    assert!(has_new_name, "new_name must be present in change buffer");
+
+    // Unreferenced columns must NOT be in the buffer.
+    for col in &["new_status", "new_score", "new_notes"] {
+        let present: bool = db
+            .query_scalar(&format!(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = '{buffer_table}'::regclass
+                      AND attname = '{col}'
+                      AND attnum > 0
+                      AND NOT attisdropped
+                )"
+            ))
+            .await;
+        assert!(
+            !present,
+            "Column {col} must NOT be in the change buffer (selective capture should prune it)"
+        );
+    }
+
+    // check_cdc_health() must report selective_capture = true for this source.
+    let selective: bool = db
+        .query_scalar(&format!(
+            "SELECT selective_capture
+             FROM pgtrickle.check_cdc_health()
+             WHERE source_relid = {source_oid}"
+        ))
+        .await;
+    assert!(
+        selective,
+        "check_cdc_health() must report selective_capture = true for f15_src"
+    );
+}
+
+/// F15: When a second ST references an additional column, the change buffer
+/// must be expanded to include that column (union semantics).
+#[tokio::test]
+async fn test_f15_selective_cdc_buffer_expands_for_second_stream_table() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE f15_exp (
+            id     INT  PRIMARY KEY,
+            name   TEXT NOT NULL,
+            status TEXT,
+            extra  TEXT
+        )",
+    )
+    .await;
+
+    // First ST: references id + name only
+    db.create_st(
+        "f15_exp_st1",
+        "SELECT id, name FROM f15_exp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let source_oid = db.table_oid("f15_exp").await;
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+
+    // After first ST: new_status must NOT be present
+    let has_status_before: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = '{buffer_table}'::regclass
+                  AND attname = 'new_status'
+                  AND attnum > 0
+                  AND NOT attisdropped
+            )"
+        ))
+        .await;
+    assert!(
+        !has_status_before,
+        "new_status must not exist before second ST is added"
+    );
+
+    // Add a second ST that also references status
+    db.create_st(
+        "f15_exp_st2",
+        "SELECT id, name, status FROM f15_exp",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // After second ST: new_status must now be present (buffer expanded)
+    let has_status_after: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = '{buffer_table}'::regclass
+                  AND attname = 'new_status'
+                  AND attnum > 0
+                  AND NOT attisdropped
+            )"
+        ))
+        .await;
+    assert!(
+        has_status_after,
+        "new_status must be present after second ST requiring it is added"
+    );
+
+    // extra column (not referenced by either ST) must still not be present
+    let has_extra: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = '{buffer_table}'::regclass
+                  AND attname = 'new_extra'
+                  AND attnum > 0
+                  AND NOT attisdropped
+            )"
+        ))
+        .await;
+    assert!(
+        !has_extra,
+        "new_extra must never be in buffer (no ST references it)"
+    );
+}
+
+/// F15: A source with SELECT * must fall back to full column capture (no pruning).
+#[tokio::test]
+async fn test_f15_select_star_falls_back_to_full_capture() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute(
+        "CREATE TABLE f15_star (
+            id     INT PRIMARY KEY,
+            name   TEXT,
+            extra  TEXT
+        )",
+    )
+    .await;
+
+    // SELECT * — columns_used will be NULL in the catalog
+    db.create_st(
+        "f15_star_st",
+        "SELECT * FROM f15_star",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    let source_oid = db.table_oid("f15_star").await;
+
+    // selective_capture must be false (full column capture)
+    let selective: bool = db
+        .query_scalar(&format!(
+            "SELECT selective_capture
+             FROM pgtrickle.check_cdc_health()
+             WHERE source_relid = {source_oid}"
+        ))
+        .await;
+    assert!(
+        !selective,
+        "SELECT * source must report selective_capture = false"
+    );
+
+    let buffer_table = format!("pgtrickle_changes.changes_{}", source_oid);
+
+    // All columns must be present in buffer
+    for col in &["new_id", "new_name", "new_extra"] {
+        let present: bool = db
+            .query_scalar(&format!(
+                "SELECT EXISTS (
+                    SELECT 1 FROM pg_attribute
+                    WHERE attrelid = '{buffer_table}'::regclass
+                      AND attname = '{col}'
+                      AND attnum > 0
+                      AND NOT attisdropped
+                )"
+            ))
+            .await;
+        assert!(
+            present,
+            "Column {col} must be present for SELECT * source (full capture)"
+        );
+    }
+}

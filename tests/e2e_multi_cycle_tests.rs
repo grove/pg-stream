@@ -58,6 +58,96 @@ async fn test_multi_cycle_aggregate_differential() {
     db.assert_st_matches_query("mc_agg_st", q).await;
 }
 
+#[tokio::test]
+async fn test_multi_cycle_avg_algebraic() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE mc_avg (id SERIAL PRIMARY KEY, grp TEXT, val NUMERIC)")
+        .await;
+    db.execute("INSERT INTO mc_avg (grp, val) VALUES ('a', 10), ('a', 20), ('b', 100)")
+        .await;
+
+    let q = "SELECT grp, AVG(val) AS avg_val FROM mc_avg GROUP BY grp";
+    db.create_st("mc_avg_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("mc_avg_st", q).await;
+
+    // Cycle 1: inserts shift the average
+    db.execute("INSERT INTO mc_avg (grp, val) VALUES ('a', 30), ('b', 200)")
+        .await;
+    db.refresh_st("mc_avg_st").await;
+    db.assert_st_matches_query("mc_avg_st", q).await;
+
+    // Cycle 2: update changes values
+    db.execute("UPDATE mc_avg SET val = 50 WHERE grp = 'a' AND val = 10")
+        .await;
+    db.refresh_st("mc_avg_st").await;
+    db.assert_st_matches_query("mc_avg_st", q).await;
+
+    // Cycle 3: delete reduces group size
+    db.execute("DELETE FROM mc_avg WHERE grp = 'a' AND val = 20")
+        .await;
+    db.refresh_st("mc_avg_st").await;
+    db.assert_st_matches_query("mc_avg_st", q).await;
+
+    // Cycle 4: mixed operations — insert + delete in one cycle
+    db.execute("INSERT INTO mc_avg (grp, val) VALUES ('a', 5), ('c', 42)")
+        .await;
+    db.execute("DELETE FROM mc_avg WHERE grp = 'b' AND val = 100")
+        .await;
+    db.refresh_st("mc_avg_st").await;
+    db.assert_st_matches_query("mc_avg_st", q).await;
+
+    // Cycle 5: no-op refresh
+    db.refresh_st("mc_avg_st").await;
+    db.assert_st_matches_query("mc_avg_st", q).await;
+}
+
+#[tokio::test]
+async fn test_multi_cycle_stddev_algebraic() {
+    let db = E2eDb::new().await.with_extension().await;
+    db.execute("CREATE TABLE mc_sd (id SERIAL PRIMARY KEY, dept TEXT, amount NUMERIC)")
+        .await;
+    db.execute(
+        "INSERT INTO mc_sd (dept, amount) VALUES \
+         ('eng', 100), ('eng', 200), ('eng', 300), \
+         ('sales', 50), ('sales', 150)",
+    )
+    .await;
+
+    let q = "SELECT dept, ROUND(ROUND(STDDEV_POP(amount), 4), 4) AS sd, ROUND(ROUND(VAR_POP(amount), 4), 4) AS vp FROM mc_sd GROUP BY dept";
+    db.create_st("mc_sd_st", q, "1m", "DIFFERENTIAL").await;
+    db.assert_st_matches_query("mc_sd_st", q).await;
+
+    // Cycle 1: insert widens distribution
+    db.execute("INSERT INTO mc_sd (dept, amount) VALUES ('eng', 1000)")
+        .await;
+    db.refresh_st("mc_sd_st").await;
+    db.assert_st_matches_query("mc_sd_st", q).await;
+
+    // Cycle 2: delete narrows it
+    db.execute("DELETE FROM mc_sd WHERE dept = 'eng' AND amount = 1000")
+        .await;
+    db.refresh_st("mc_sd_st").await;
+    db.assert_st_matches_query("mc_sd_st", q).await;
+
+    // Cycle 3: update shifts values
+    db.execute("UPDATE mc_sd SET amount = 250 WHERE dept = 'sales' AND amount = 50")
+        .await;
+    db.refresh_st("mc_sd_st").await;
+    db.assert_st_matches_query("mc_sd_st", q).await;
+
+    // Cycle 4: mixed — add new group + modify existing
+    db.execute("INSERT INTO mc_sd (dept, amount) VALUES ('hr', 80), ('hr', 120)")
+        .await;
+    db.execute("DELETE FROM mc_sd WHERE dept = 'eng' AND amount = 100")
+        .await;
+    db.refresh_st("mc_sd_st").await;
+    db.assert_st_matches_query("mc_sd_st", q).await;
+
+    // Cycle 5: no-op refresh
+    db.refresh_st("mc_sd_st").await;
+    db.assert_st_matches_query("mc_sd_st", q).await;
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Multi-cycle JOIN
 // ═══════════════════════════════════════════════════════════════════════
