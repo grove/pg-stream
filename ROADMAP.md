@@ -1,6 +1,6 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-17
+> **Last updated:** 2026-03-19
 > **Latest release:** 0.8.0 (2026-03-17)
 > **Current milestone:** v0.9.0 — Incremental Aggregate Maintenance
 
@@ -1471,8 +1471,8 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 |------|-------------|--------|--------|-----|
 | A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | ✅ Done | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
 | A7 | Skip-unchanged-column scanning in delta SQL (requires column-usage demand-propagation pass in DVM parser) | ~1–2d | ✅ Done | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.4 |
-| EC-03 | Window-in-expression DIFFERENTIAL fallback warning: emit a `WARNING` (and eventually an `INFO` hint) when a stream table with `CASE WHEN window_fn() OVER (...) ...` silently falls back from DIFFERENTIAL to FULL refresh mode; currently fails at runtime with `column st.* does not exist` — no user-visible signal exists | ~1d | ⬜ Not started | [PLAN_EDGE_CASES.md §EC-03](plans/PLAN_EDGE_CASES.md) |
-| A8 | `pgt_refresh_groups` SQL API: companion functions (`pgtrickle.pgt_add_refresh_group()`, `pgtrickle.pgt_remove_refresh_group()`, `pgtrickle.pgt_list_refresh_groups()`) for the Cross-Source Snapshot Consistency catalog table introduced in the `0.8.0→0.9.0` upgrade script; table exists but has no user-facing API | ~2–3d | ⬜ Not started | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
+| EC-03 | Window-in-expression DIFFERENTIAL fallback warning: emit a `WARNING` (and eventually an `INFO` hint) when a stream table with `CASE WHEN window_fn() OVER (...) ...` silently falls back from DIFFERENTIAL to FULL refresh mode; currently fails at runtime with `column st.* does not exist` — no user-visible signal exists | ~1d | ✅ Done | [PLAN_EDGE_CASES.md §EC-03](plans/PLAN_EDGE_CASES.md) |
+| A8 | `pgt_refresh_groups` SQL API: companion functions (`pgtrickle.create_refresh_group()`, `pgtrickle.drop_refresh_group()`, `pgtrickle.refresh_groups()`) for the Cross-Source Snapshot Consistency catalog table introduced in the `0.8.0→0.9.0` upgrade script | ~2–3d | ✅ Done | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
 
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 

@@ -167,12 +167,15 @@ DVM path already handles correctly.
   `test_ec03_coalesce_window_data_correctness` — COALESCE(SUM() OVER, 0)
   produces correct partition sums.
 
-**Known limitation:** Window-in-expression queries are accepted in
+**Known limitation:** ~~Window-in-expression queries are accepted in
 DIFFERENTIAL mode (creation succeeds), but differential *refresh* fails with
-a `column st.* does not exist` error. The DVM delta engine cannot currently
-resolve the `st.*` alias inside the inner subquery introduced by the rewrite.
-FULL refresh works correctly. Differential support for the rewritten form is
-deferred.
+a `column st.* does not exist` error.~~ **Fixed (EC-03):** AUTO mode now
+correctly falls back to FULL refresh with an informational message. Explicit
+DIFFERENTIAL mode emits a `WARNING` at creation time alerting the user that
+the pattern will fall back to full recomputation at refresh time. The DVM delta
+engine cannot currently resolve the `st.*` alias inside the inner subquery
+introduced by the rewrite. FULL refresh works correctly. Differential support
+for the rewritten form is deferred.
 
 ---
 

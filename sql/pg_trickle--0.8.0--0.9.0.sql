@@ -27,3 +27,30 @@ STRICT
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'restore_stream_tables_wrapper';
 
+-- Refresh group management API (A8)
+CREATE OR REPLACE FUNCTION pgtrickle."create_refresh_group"(
+    "group_name" TEXT,
+    "members" TEXT[],
+    "isolation" TEXT DEFAULT 'read_committed'
+) RETURNS INT
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'create_refresh_group_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."drop_refresh_group"(
+    "group_name" TEXT
+) RETURNS VOID
+STRICT
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'drop_refresh_group_wrapper';
+
+CREATE OR REPLACE FUNCTION pgtrickle."refresh_groups"()
+RETURNS TABLE (
+    "group_id" INT,
+    "group_name" TEXT,
+    "member_count" INT,
+    "isolation" TEXT,
+    "created_at" TIMESTAMPTZ
+)
+LANGUAGE c
+AS 'MODULE_PATHNAME', 'refresh_groups_fn_wrapper';

@@ -2354,6 +2354,133 @@ impl SchedulerJob {
     }
 }
 
+// ── Refresh Group Catalog (A8) ──────────────────────────────────────────────
+
+/// Metadata for a user-declared refresh group, mirrors
+/// `pgtrickle.pgt_refresh_groups`.
+#[derive(Debug, Clone)]
+pub struct RefreshGroupMeta {
+    pub group_id: i32,
+    pub group_name: String,
+    pub member_oids: Vec<pg_sys::Oid>,
+    pub isolation: String,
+    pub created_at: TimestampWithTimeZone,
+}
+
+/// Insert a new refresh group. Returns the assigned `group_id`.
+pub fn create_refresh_group(
+    group_name: &str,
+    member_oids: &[pg_sys::Oid],
+    isolation: &str,
+) -> Result<i32, PgTrickleError> {
+    Spi::connect_mut(|client| {
+        let row = client
+            .update(
+                "INSERT INTO pgtrickle.pgt_refresh_groups \
+                 (group_name, member_oids, isolation) \
+                 VALUES ($1, $2, $3) \
+                 RETURNING group_id",
+                None,
+                &[
+                    group_name.into(),
+                    member_oids.to_vec().into(),
+                    isolation.into(),
+                ],
+            )
+            .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+            .first();
+
+        row.get_one::<i32>()
+            .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+            .ok_or_else(|| PgTrickleError::InternalError("INSERT did not return group_id".into()))
+    })
+}
+
+/// Delete a refresh group by name.
+pub fn drop_refresh_group(group_name: &str) -> Result<(), PgTrickleError> {
+    Spi::connect_mut(|client| {
+        let count = client
+            .update(
+                "DELETE FROM pgtrickle.pgt_refresh_groups WHERE group_name = $1",
+                None,
+                &[group_name.into()],
+            )
+            .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
+            .len();
+
+        if count == 0 {
+            return Err(PgTrickleError::NotFound(format!(
+                "refresh group '{}' does not exist",
+                group_name
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Return all refresh groups.
+pub fn get_all_refresh_groups() -> Result<Vec<RefreshGroupMeta>, PgTrickleError> {
+    Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT group_id, group_name, member_oids, isolation, created_at \
+                 FROM pgtrickle.pgt_refresh_groups \
+                 ORDER BY group_id",
+                None,
+                &[],
+            )
+            .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+        let mut groups = Vec::new();
+        for row in table {
+            let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+            groups.push(RefreshGroupMeta {
+                group_id: row.get::<i32>(1).map_err(map_spi)?.unwrap_or(0),
+                group_name: row.get::<String>(2).map_err(map_spi)?.unwrap_or_default(),
+                member_oids: row
+                    .get::<Vec<pg_sys::Oid>>(3)
+                    .map_err(map_spi)?
+                    .unwrap_or_default(),
+                isolation: row
+                    .get::<String>(4)
+                    .map_err(map_spi)?
+                    .unwrap_or_else(|| "read_committed".to_string()),
+                created_at: row
+                    .get::<TimestampWithTimeZone>(5)
+                    .map_err(map_spi)?
+                    .ok_or_else(|| PgTrickleError::InternalError("NULL created_at".into()))?,
+            });
+        }
+        Ok(groups)
+    })
+}
+
+/// Check whether any existing refresh group already contains the given OID.
+/// Returns the conflicting group name if found.
+pub fn find_group_containing_member(
+    member_oid: pg_sys::Oid,
+) -> Result<Option<String>, PgTrickleError> {
+    Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT group_name FROM pgtrickle.pgt_refresh_groups \
+                 WHERE $1 = ANY(member_oids) LIMIT 1",
+                None,
+                &[member_oid.into()],
+            )
+            .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+        if table.is_empty() {
+            Ok(None)
+        } else {
+            Ok(table
+                .first()
+                .get::<String>(1)
+                .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

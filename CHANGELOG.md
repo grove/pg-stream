@@ -29,11 +29,26 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ## [Unreleased]
 
+### Added
+- **Refresh group management API** (A8): Three new SQL functions for managing cross-source
+  snapshot consistency groups:
+  - `pgtrickle.create_refresh_group(name, members, isolation)` — creates a user-declared
+    refresh group ensuring member stream tables are refreshed together.
+  - `pgtrickle.drop_refresh_group(name)` — removes a refresh group.
+  - `pgtrickle.refresh_groups()` — returns all declared refresh groups with member counts.
+  Validation includes: member existence check, duplicate-membership prevention, and
+  isolation level validation. DAG rebuild is signaled on create/drop.
+
 ### Fixed
 - **Backend crash on SPI error in `source_gates()` and `watermarks()`** (G-1): Both SQL-callable
   functions previously reached `panic!()` on any SPI failure, which crashes the PostgreSQL backend
   process. Replaced with `pgrx::error!()` so failures surface as a normal PostgreSQL `ERROR`
   without terminating the backend.
+- **Silent runtime failure for window-in-expression queries** (EC-03): Defining queries with
+  window functions inside expressions (e.g. `CASE WHEN ROW_NUMBER() OVER (...) > 5 THEN ...`)
+  were silently accepted in DIFFERENTIAL mode but failed at refresh time with cryptic
+  `column st.* does not exist` errors. Now: AUTO mode correctly falls back to FULL refresh
+  with an informational message; explicit DIFFERENTIAL mode emits a WARNING at creation time.
 
 ### Documentation
 - **Recursive CTE DIFFERENTIAL mode limitation** (D1): Corrected [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md)
@@ -45,7 +60,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   workaround (`refresh_mode = 'IMMEDIATE'`).
 - **`pgt_refresh_groups` catalog table** (D2): Added table schema, column descriptions, and
   an interim manual INSERT/DELETE workflow to [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md).
-  The user-facing API functions (A8) are not yet implemented.
+  The user-facing API functions (A8) are now implemented.
 
 ---
 

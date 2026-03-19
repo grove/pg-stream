@@ -291,7 +291,8 @@ fn create_or_replace_stream_table_impl(
     match StreamTableMeta::get_by_name(&schema, &table_name) {
         Ok(existing) => {
             // Stream table exists — determine what changed.
-            let new_query_rewritten = run_query_rewrite_pipeline(query)?;
+            let rw = run_query_rewrite_pipeline(query)?;
+            let new_query_rewritten = rw.query;
 
             // TopK detection: if the new query is TopK, compare against the
             // base query (ORDER BY/LIMIT stripped) since that's what is stored
@@ -368,18 +369,33 @@ fn create_or_replace_stream_table_impl(
     }
 }
 
+/// Metadata about which query rewrites were applied.
+struct RewriteResult {
+    /// The rewritten query string.
+    query: String,
+    /// Whether `rewrite_nested_window_exprs` lifted window functions out of
+    /// expressions (e.g. `CASE WHEN ROW_NUMBER() OVER (...) ...`). This
+    /// rewrite produces a subquery form that DVM parsing accepts but delta
+    /// SQL generation cannot handle — so differential mode must fall back
+    /// to full refresh (EC-03).
+    had_nested_window_rewrite: bool,
+}
+
 /// Run the full query rewrite pipeline: view inlining, nested window
 /// expressions, DISTINCT ON, GROUPING SETS, scalar subqueries, SubLinks
 /// in OR, and ROWS FROM.
 ///
-/// Returns the rewritten query string. The caller should keep the
-/// original query separately if needed for `original_query` tracking.
-fn run_query_rewrite_pipeline(query: &str) -> Result<String, PgTrickleError> {
+/// Returns the rewritten query and metadata about which rewrites fired.
+/// The caller should keep the original query separately if needed for
+/// `original_query` tracking.
+fn run_query_rewrite_pipeline(query: &str) -> Result<RewriteResult, PgTrickleError> {
     // View inlining — must run first so view definitions containing
     // DISTINCT ON, GROUPING SETS, etc. get further rewritten.
     let query = crate::dvm::rewrite_views_inline(query)?;
-    // Nested window expression lift
+    // Nested window expression lift — track whether the rewrite fired
+    let pre_window = query.clone();
     let query = crate::dvm::rewrite_nested_window_exprs(&query)?;
+    let had_nested_window_rewrite = query != pre_window;
     // DISTINCT ON → ROW_NUMBER() window
     let query = crate::dvm::rewrite_distinct_on(&query)?;
     // GROUPING SETS / CUBE / ROLLUP → UNION ALL of GROUP BY
@@ -403,7 +419,10 @@ fn run_query_rewrite_pipeline(query: &str) -> Result<String, PgTrickleError> {
     }
     // ROWS FROM() multi-function rewrite
     let query = crate::dvm::rewrite_rows_from(&query)?;
-    Ok(query)
+    Ok(RewriteResult {
+        query,
+        had_nested_window_rewrite,
+    })
 }
 
 /// Validated query metadata returned by [`validate_and_parse_query`].
@@ -565,6 +584,7 @@ fn validate_and_parse_query(
     query: &str,
     refresh_mode: &mut RefreshMode,
     is_auto: bool,
+    had_nested_window_rewrite: bool,
 ) -> Result<ValidatedQuery, PgTrickleError> {
     // Validate the defining query and extract output columns
     let columns = validate_defining_query(query)?;
@@ -636,6 +656,29 @@ fn validate_and_parse_query(
             *refresh_mode = RefreshMode::Full;
         } else {
             return Err(e);
+        }
+    }
+
+    // EC-03: Nested window expressions (e.g. CASE WHEN ROW_NUMBER() OVER (...) ...)
+    // were rewritten into subqueries. DVM parsing succeeds on the rewritten form,
+    // but delta SQL generation fails at refresh time. Downgrade to FULL in AUTO
+    // mode; emit a warning in explicit DIFFERENTIAL mode.
+    if had_nested_window_rewrite
+        && (*refresh_mode == RefreshMode::Differential || *refresh_mode == RefreshMode::Immediate)
+    {
+        if is_auto {
+            pgrx::info!(
+                "Query contains window functions inside expressions (e.g. CASE WHEN window_fn() ...). \
+                 Differential maintenance is not supported for this pattern; using FULL refresh mode."
+            );
+            *refresh_mode = RefreshMode::Full;
+        } else {
+            pgrx::warning!(
+                "pg_trickle: Query contains window functions inside expressions \
+                 (e.g. CASE WHEN ROW_NUMBER() OVER (...) ...). This pattern is not \
+                 supported by differential maintenance and will fall back to full \
+                 recomputation at refresh time. Consider using FULL or AUTO refresh mode."
+            );
         }
     }
 
@@ -1305,13 +1348,19 @@ fn alter_stream_table_query(
 
     // Run the full rewrite pipeline on the new query
     let original_new_query = new_query.to_string();
-    let rewritten_query = run_query_rewrite_pipeline(new_query)?;
+    let rw = run_query_rewrite_pipeline(new_query)?;
+    let rewritten_query = rw.query;
 
     // Determine the effective refresh mode — use the ST's current mode
     let mut refresh_mode = st.refresh_mode;
 
     // Validate and parse the new query
-    let vq = validate_and_parse_query(&rewritten_query, &mut refresh_mode, false)?;
+    let vq = validate_and_parse_query(
+        &rewritten_query,
+        &mut refresh_mode,
+        false,
+        rw.had_nested_window_rewrite,
+    )?;
 
     // Cycle detection on the new dependency set (ALTER-aware: replaces
     // the existing ST's edges rather than creating a sentinel node).
@@ -1741,10 +1790,16 @@ fn create_stream_table_impl(
 
     // ── Query rewrite pipeline ─────────────────────────────────────
     let original_query = query.to_string();
-    let query = &run_query_rewrite_pipeline(query)?;
+    let rw = run_query_rewrite_pipeline(query)?;
+    let query = &rw.query;
 
     // ── Validate & parse ───────────────────────────────────────────
-    let vq = validate_and_parse_query(query, &mut refresh_mode, is_auto)?;
+    let vq = validate_and_parse_query(
+        query,
+        &mut refresh_mode,
+        is_auto,
+        rw.had_nested_window_rewrite,
+    )?;
     // Warnings
     warn_source_table_properties(&vq.source_relids);
     warn_select_star(query);
@@ -2638,7 +2693,8 @@ pub fn reinit_rewrite_if_needed(st: &StreamTableMeta) -> Result<StreamTableMeta,
         None => return Ok(st.clone()),
     };
 
-    let new_defining = run_query_rewrite_pipeline(&original)?;
+    let rw = run_query_rewrite_pipeline(&original)?;
+    let new_defining = rw.query;
     if new_defining == st.defining_query {
         return Ok(st.clone());
     }
@@ -3705,6 +3761,132 @@ fn watermark_status_fn() -> TableIterator<
         out
     });
 
+    TableIterator::new(rows)
+}
+
+// ── Refresh Group API (A8) ──────────────────────────────────────────────────
+
+/// Create a user-declared refresh group for cross-source snapshot consistency.
+///
+/// Stream tables in the same refresh group are refreshed together in a single
+/// transaction, ensuring they all see consistent source data.
+///
+/// # Arguments
+/// - `group_name`: Unique human-readable name for the group.
+/// - `members`: Array of schema-qualified stream table names to include.
+/// - `isolation`: Transaction isolation level (`'read_committed'` or `'repeatable_read'`).
+#[pg_extern(schema = "pgtrickle")]
+fn create_refresh_group(
+    group_name: &str,
+    members: Vec<String>,
+    isolation: default!(&str, "'read_committed'"),
+) -> Result<i32, PgTrickleError> {
+    // Validate group_name is not empty
+    let group_name = group_name.trim();
+    if group_name.is_empty() {
+        return Err(PgTrickleError::InvalidArgument(
+            "refresh group name must not be empty".into(),
+        ));
+    }
+
+    // Validate at least 2 members
+    if members.len() < 2 {
+        return Err(PgTrickleError::InvalidArgument(
+            "refresh group requires at least 2 members".into(),
+        ));
+    }
+
+    // Validate isolation level
+    let isolation = isolation.trim().to_lowercase();
+    if isolation != "read_committed" && isolation != "repeatable_read" {
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "invalid isolation level: '{}' (expected 'read_committed' or 'repeatable_read')",
+            isolation
+        )));
+    }
+
+    // Resolve member names to OIDs and validate they are stream tables
+    let mut member_oids = Vec::with_capacity(members.len());
+    for member in &members {
+        let (schema, table_name) = parse_qualified_name(member)?;
+        let st = StreamTableMeta::get_by_name(&schema, &table_name).map_err(|e| match e {
+            PgTrickleError::NotFound(_) => {
+                PgTrickleError::InvalidArgument(format!("stream table '{}' does not exist", member))
+            }
+            other => other,
+        })?;
+        member_oids.push(st.pgt_relid);
+    }
+
+    // Validate no member appears in another group
+    for (i, oid) in member_oids.iter().enumerate() {
+        if let Some(existing_group) = crate::catalog::find_group_containing_member(*oid)? {
+            return Err(PgTrickleError::InvalidArgument(format!(
+                "stream table '{}' is already a member of refresh group '{}'",
+                members[i], existing_group
+            )));
+        }
+    }
+
+    // Insert the group
+    let group_id = crate::catalog::create_refresh_group(group_name, &member_oids, &isolation)?;
+
+    // Signal DAG rebuild so the scheduler picks up the new group
+    shmem::signal_dag_rebuild();
+
+    pgrx::info!(
+        "pg_trickle: created refresh group '{}' (id={}) with {} members, isolation={}",
+        group_name,
+        group_id,
+        members.len(),
+        isolation
+    );
+    Ok(group_id)
+}
+
+/// Drop a refresh group by name.
+#[pg_extern(schema = "pgtrickle")]
+fn drop_refresh_group(group_name: &str) -> Result<(), PgTrickleError> {
+    crate::catalog::drop_refresh_group(group_name)?;
+
+    // Signal DAG rebuild so the scheduler removes the group
+    shmem::signal_dag_rebuild();
+
+    pgrx::info!("pg_trickle: dropped refresh group '{}'", group_name);
+    Ok(())
+}
+
+/// Return all user-declared refresh groups with member details.
+#[pg_extern(schema = "pgtrickle", name = "refresh_groups")]
+#[allow(clippy::type_complexity)]
+fn refresh_groups_fn() -> TableIterator<
+    'static,
+    (
+        name!(group_id, i32),
+        name!(group_name, String),
+        name!(member_count, i32),
+        name!(isolation, String),
+        name!(created_at, TimestampWithTimeZone),
+    ),
+> {
+    let rows: Vec<_> = match crate::catalog::get_all_refresh_groups() {
+        Ok(groups) => groups
+            .into_iter()
+            .map(|g| {
+                (
+                    g.group_id,
+                    g.group_name,
+                    g.member_oids.len() as i32,
+                    g.isolation,
+                    g.created_at,
+                )
+            })
+            .collect(),
+        Err(e) => {
+            pgrx::warning!("refresh_groups: {}", e);
+            Vec::new()
+        }
+    };
     TableIterator::new(rows)
 }
 

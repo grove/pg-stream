@@ -4,6 +4,8 @@
 > Most core architectural phases (Phases 1-12) are now implemented. The remaining critical features necessary to fully close out the v0.9.0 milestone are:
 > - **F15**: Selective CDC Column Capture (Phase 6 Integration) — ✅ **Complete**
 > - **F40**: Extension Upgrade Migrations & DB Schema Stability — *Code complete, awaiting final package*
+> - **EC-03**: Window-in-expression DIFFERENTIAL fallback warning — ✅ **Complete**
+> - **A8**: `pgt_refresh_groups` SQL API — ✅ **Complete**
 
 ### F40 Status Update
 
@@ -22,6 +24,8 @@ One item remains before F40 is fully closed:
 > Most core architectural phases (Phases 1-12) are now implemented. The remaining critical features necessary to fully close out the v0.9.0 milestone are:
 > - **F15**: Selective CDC Column Capture (Phase 6 Integration) — ✅ **Complete**
 > - **F40**: Extension Upgrade Migrations & DB Schema Stability - *Code complete, awaiting final package*
+> - **EC-03**: Window-in-expression DIFFERENTIAL fallback warning — ✅ **Complete**
+> - **A8**: `pgt_refresh_groups` SQL API — ✅ **Complete**
 
 ### F15 Status Update (Selective CDC Column Capture)
 
