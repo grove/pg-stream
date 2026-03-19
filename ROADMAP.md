@@ -1468,6 +1468,38 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 
+### DVM Engine Correctness & Performance Hardening (P2)
+
+These items address correctness gaps that silently degrade to full-recompute modes or cause excessive I/O on each differential cycle. All are observable in production workloads.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** Currently, any DELETE or UPDATE against a recursive CTE's source in DIFFERENTIAL mode falls back to O(n) full recompute + diff. The Delete-and-Rederive (DRed) algorithm exists for IMMEDIATE mode only. Implement DRed for `DeltaSource::ChangeBuffer` so recursive CTE stream tables in DIFFERENTIAL mode maintain O(delta) cost. | 2–3 wk | ⬜ Not started | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
+| P2-2 | **SUM NULL-transition rescan for FULL OUTER JOIN aggregates.** When `SUM` sits above a FULL OUTER JOIN and rows transition between matched and unmatched states (matched→NULL), the algebraic formula gives 0 instead of NULL, triggering a `child_has_full_join()` full-group rescan on every cycle where rows cross that boundary. Implement a targeted correction that avoids full-group rescans in the common case. | 1–2 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
+| P2-3 | **DISTINCT multiplicity-count JOIN overhead.** Every differential refresh for `SELECT DISTINCT` queries joins against the stream table's `__pgt_count` column for the full stream table, even when only a tiny delta is being processed. Replace with a per-affected-row lookup pattern to limit this to O(delta) I/O. | 1 wk | ⬜ Not started | [src/dvm/operators/distinct.rs](src/dvm/operators/distinct.rs) |
+| P2-4 | **Materialized view sources in IMMEDIATE mode (EC-09).** Stream tables that use a PostgreSQL materialized view as a source are rejected at creation time when IMMEDIATE mode is requested. Implement a polling-change-detection wrapper (same approach as EC-05 for foreign tables) to support `REFRESH MATERIALIZED VIEW`-sourced queries in IMMEDIATE mode. | 2–3 wk | ⬜ Not started | [plans/PLAN_EDGE_CASES.md §EC-09](plans/PLAN_EDGE_CASES.md) |
+
+> **DVM hardening (P2) subtotal: ~6–9 weeks**
+
+### DVM Performance Trade-offs (P3)
+
+These items are correct as implemented but scale with data size rather than delta size. They are lower priority than P2 but represent solid measurable wins for high-cardinality workloads.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| P3-1 | **Window partition full recompute.** Any single-row change in a window partition triggers recomputation of the entire partition. Add a partition-size heuristic: if the affected partition exceeds a configurable row threshold, downgrade to FULL refresh for that cycle and emit a `pgrx::info!()` message. At minimum, document the O(partition_size) cost prominently. | 1 wk | ⬜ Not started | [src/dvm/operators/window.rs](src/dvm/operators/window.rs) |
+| P3-2 | **Welford auxiliary columns for CORR/COVAR/REGR_\* aggregates.** `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*` currently use O(group_size) group-rescan. Implement Welford-style auxiliary column accumulation (`__pgt_aux_sumx_*`, `__pgt_aux_sumy_*`, `__pgt_aux_sumxy_*`) to reach O(1) algebraic maintenance identical to the STDDEV/VAR path. | 2–3 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
+| P3-3 | **Scalar subquery C₀ EXCEPT ALL scan.** Part 2 of the scalar subquery delta computes `C₀ = C_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes` by scanning the full outer snapshot. For large outer tables with an unstable inner source, this scan is proportional to the outer table size. Profile and gate the scan behind an existence check on inner-source stability to avoid it when possible; the `WHERE EXISTS (SELECT 1 FROM delta_subquery)` guard already handles the trivial case. | 1 wk | ⬜ Not started | [src/dvm/operators/scalar_subquery.rs](src/dvm/operators/scalar_subquery.rs) |
+
+> **DVM performance trade-offs (P3) subtotal: ~4–7 weeks**
+
+### Documentation Gaps (D)
+
+| Item | Description | Effort | Status |
+|------|-------------|--------|--------|
+| D1 | **Recursive CTE DIFFERENTIAL mode limitation.** The O(n) fallback for mixed DELETE/UPDATE against a recursive CTE source is not documented in [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) or [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md). Users hitting DELETE/UPDATE-heavy workloads on recursive CTE stream tables will see unexpectedly slow refresh times with no explanation. Add a "Known Limitations" callout in both files. | ~2h | ⬜ Not started |
+| D2 | **`pgt_refresh_groups` catalog table undocumented.** The catalog table added in the `0.8.0→0.9.0` upgrade script is not described in [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md). Even before the full A8 API lands, document the table schema, its purpose, and the manual INSERT/DELETE workflow users can use in the interim. | ~2h | ⬜ Not started |
+
 > **v0.9.0 total: ~23–29 weeks**
 
 **Exit criteria:**
@@ -1496,6 +1528,15 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 - [ ] B3-3: Property-based correctness tests for simultaneous multi-source and diamond-flow scenarios
 - [ ] EC-03: WARNING emitted when window-in-expression query silently falls back from DIFFERENTIAL to FULL refresh mode
 - [ ] A8: `pgt_refresh_groups` SQL API (`pgt_add_refresh_group`, `pgt_remove_refresh_group`, `pgt_list_refresh_groups`)
+- [ ] P2-1: Recursive CTE DRed implemented for DIFFERENTIAL mode (mixed DELETE/UPDATE no longer triggers O(n) full recompute)
+- [ ] P2-2: SUM NULL-transition rescan eliminated for FULL OUTER JOIN aggregates in the common case
+- [ ] P2-3: DISTINCT `__pgt_count` lookup scoped to O(delta) I/O per cycle
+- [ ] P2-4: Materialized view sources accepted in IMMEDIATE mode via polling-change-detection wrapper
+- [ ] P3-1: Window partition O(partition_size) cost documented; heuristic downgrade implemented or explicitly deferred
+- [ ] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns implemented or explicitly deferred to v0.10.0+
+- [ ] P3-3: Scalar subquery C₀ EXCEPT ALL scan gated behind inner-source stability check or explicitly deferred
+- [ ] D1: Recursive CTE DIFFERENTIAL mode limitation documented in SQL_REFERENCE.md and DVM_OPERATORS.md
+- [ ] D2: `pgt_refresh_groups` table schema and interim workflow documented in SQL_REFERENCE.md
 
 ---
 
