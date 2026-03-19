@@ -52,18 +52,24 @@ pub fn diff_distinct(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
     );
     ctx.add_cte(delta_cte.clone(), delta_sql);
 
-    // CTE 2: Merge with ST state to find boundary crossings
+    // CTE 2: Merge with ST state to find boundary crossings.
+    //
+    // P2-3: Uses a correlated scalar subquery instead of LEFT JOIN to
+    // force per-row index lookup on `__pgt_row_id` (UNIQUE index).
+    // This guarantees O(delta) I/O regardless of planner cost estimates
+    // for the join — the previous LEFT JOIN could degrade to a full
+    // ST scan when the planner misjudged delta cardinality.
     let merge_cte = ctx.next_cte_name("dist_merge");
 
-    // Join on row_id to get old count
     let merge_sql = format!(
         "SELECT d.__pgt_row_id,\n\
          {d_cols},\n\
          d.__net_count,\n\
-         COALESCE(st.__pgt_count, 0) AS old_count,\n\
-         COALESCE(st.__pgt_count, 0) + d.__net_count AS new_count\n\
-         FROM {delta_cte} d\n\
-         LEFT JOIN {st_table} st ON st.__pgt_row_id = d.__pgt_row_id",
+         COALESCE((SELECT st.__pgt_count FROM {st_table} st \
+         WHERE st.__pgt_row_id = d.__pgt_row_id), 0) AS old_count,\n\
+         COALESCE((SELECT st.__pgt_count FROM {st_table} st \
+         WHERE st.__pgt_row_id = d.__pgt_row_id), 0) + d.__net_count AS new_count\n\
+         FROM {delta_cte} d",
         d_cols = cols
             .iter()
             .map(|c| format!("d.{}", quote_ident(c)))
@@ -133,6 +139,10 @@ mod tests {
         assert_sql_contains(&sql, "__net_count");
         assert_sql_contains(&sql, "old_count");
         assert_sql_contains(&sql, "new_count");
+
+        // P2-3: Should use scalar subquery instead of LEFT JOIN
+        assert_sql_contains(&sql, "SELECT st.__pgt_count FROM");
+        assert!(!sql.contains("LEFT JOIN"));
     }
 
     #[test]

@@ -135,6 +135,14 @@ pub struct DiffContext {
     /// HAVING threshold (absent from the ST) and are now crossing it upward.
     /// Reset to `false` after the child diff returns.
     pub having_filter: bool,
+    /// P2-5: CDC column names per source table, ordered by `attnum`.
+    ///
+    /// Maps `table_oid` → ordered CDC column names (from
+    /// `resolve_referenced_column_defs`). The index in this Vec corresponds
+    /// to the bit position in the `changed_cols` bitmask stored by the CDC
+    /// trigger. Used by `diff_scan_change_buffer` to build a bitmask filter
+    /// that skips UPDATE rows where none of the referenced columns changed.
+    pub source_cdc_columns: HashMap<u32, Vec<String>>,
 }
 
 impl DiffContext {
@@ -159,6 +167,7 @@ impl DiffContext {
             delta_source: DeltaSource::ChangeBuffer,
             st_column_alias_map: None,
             having_filter: false,
+            source_cdc_columns: HashMap::new(),
         }
     }
 
@@ -186,6 +195,7 @@ impl DiffContext {
             delta_source: DeltaSource::ChangeBuffer,
             st_column_alias_map: None,
             having_filter: false,
+            source_cdc_columns: HashMap::new(),
         }
     }
 

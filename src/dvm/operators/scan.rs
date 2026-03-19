@@ -342,7 +342,30 @@ fn diff_scan_change_buffer(
     //
     // Used to split single-change PKs (fast path, no window functions)
     // from multi-change PKs (require FIRST_VALUE/LAST_VALUE).
-    let lsn_filter = format!("c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn");
+    let mut lsn_filter = format!("c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn");
+
+    // ── P2-5: changed_cols bitmask filter ────────────────────────────
+    //
+    // For PK-based tables with ≤63 columns, the CDC trigger stores a
+    // bitmask in `changed_cols` indicating which columns were modified
+    // by an UPDATE (NULL for INSERT/DELETE). When column pruning has
+    // reduced the referenced column set, we can skip UPDATE rows where
+    // none of the referenced columns actually changed.
+    if !is_keyless
+        && let Some(cdc_cols) = ctx.source_cdc_columns.get(&table_oid)
+        && cdc_cols.len() <= 63
+    {
+        let mask = compute_changed_cols_mask(columns, cdc_cols);
+        // Only add the filter when the mask is a strict subset
+        // (i.e. we pruned at least one column). A full mask
+        // would match every UPDATE row anyway.
+        let full_mask: i64 = (1i64 << cdc_cols.len()) - 1;
+        if mask != 0 && mask != full_mask {
+            lsn_filter.push_str(&format!(
+                " AND (c.changed_cols IS NULL OR (c.changed_cols & {mask}) != 0)"
+            ));
+        }
+    }
 
     // ── EC-06: Keyless net-counting path ─────────────────────────────
     //
@@ -642,6 +665,27 @@ fn find_pk_columns(pk_columns: &[String], columns: &[crate::dvm::parser::Column]
     }
     // Keyless table: use all columns (matches CDC trigger all-column hash).
     columns.iter().map(|c| c.name.clone()).collect()
+}
+
+/// P2-5: Compute a `changed_cols` bitmask from pruned Scan columns.
+///
+/// For each column in `scan_columns` (the pruned set), finds its index in
+/// `cdc_columns` (the full CDC column list ordered by `attnum`) and sets
+/// the corresponding bit. The resulting mask can be ANDed with the trigger's
+/// `changed_cols` value to determine if any referenced column changed.
+///
+/// Returns 0 if no columns could be mapped (should not happen in practice).
+fn compute_changed_cols_mask(
+    scan_columns: &[crate::dvm::parser::Column],
+    cdc_columns: &[String],
+) -> i64 {
+    let mut mask: i64 = 0;
+    for col in scan_columns {
+        if let Some(idx) = cdc_columns.iter().position(|c| c == &col.name) {
+            mask |= 1i64 << idx;
+        }
+    }
+    mask
 }
 
 /// Build a hash expression from a list of SQL expressions.
@@ -1079,5 +1123,117 @@ mod tests {
         // Should use MAX() to aggregate column values (identical rows
         // have the same content, so MAX picks the correct value).
         assert_sql_contains(&sql, "MAX(");
+    }
+
+    // ── P2-5: changed_cols bitmask ──────────────────────────────────
+
+    #[test]
+    fn test_compute_changed_cols_mask_basic() {
+        use crate::dvm::parser::Column;
+        let cdc_cols = vec!["id".into(), "name".into(), "amount".into(), "region".into()];
+        // Pruned: only "id" and "amount" are referenced.
+        let scan_cols = vec![
+            Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+            Column {
+                name: "amount".into(),
+                type_oid: 23,
+                is_nullable: true,
+            },
+        ];
+        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
+        // id=bit0, amount=bit2 → mask = 0b0101 = 5
+        assert_eq!(mask, 5);
+    }
+
+    #[test]
+    fn test_compute_changed_cols_mask_all_columns() {
+        use crate::dvm::parser::Column;
+        let cdc_cols = vec!["a".into(), "b".into(), "c".into()];
+        let scan_cols = vec![
+            Column {
+                name: "a".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+            Column {
+                name: "b".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+            Column {
+                name: "c".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+        ];
+        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
+        // All columns → mask = 0b111 = 7 = (1 << 3) - 1
+        assert_eq!(mask, 7);
+    }
+
+    #[test]
+    fn test_compute_changed_cols_mask_single_column() {
+        use crate::dvm::parser::Column;
+        let cdc_cols = vec!["id".into(), "name".into(), "status".into()];
+        let scan_cols = vec![Column {
+            name: "status".into(),
+            type_oid: 25,
+            is_nullable: true,
+        }];
+        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
+        // status=bit2 → mask = 0b100 = 4
+        assert_eq!(mask, 4);
+    }
+
+    #[test]
+    fn test_p2_5_bitmask_filter_in_sql() {
+        // When source_cdc_columns is populated and columns are pruned,
+        // the generated SQL should contain a changed_cols bitmask filter.
+        let mut ctx = test_ctx();
+        ctx.source_cdc_columns.insert(
+            100,
+            vec!["id".into(), "name".into(), "amount".into(), "region".into()],
+        );
+        // Scan only references "id" and "amount" (2 of 4 columns).
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should have the bitmask filter: mask = 1|4 = 5
+        assert_sql_contains(&sql, "c.changed_cols IS NULL OR (c.changed_cols & 5) != 0");
+    }
+
+    #[test]
+    fn test_p2_5_bitmask_filter_skipped_when_all_columns() {
+        // When all CDC columns are referenced, no bitmask filter is added.
+        let mut ctx = test_ctx();
+        ctx.source_cdc_columns
+            .insert(100, vec!["id".into(), "amount".into()]);
+        // Scan references ALL CDC columns.
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should NOT have a changed_cols filter
+        assert!(!sql.contains("changed_cols"));
+    }
+
+    #[test]
+    fn test_p2_5_bitmask_filter_skipped_for_keyless() {
+        // Keyless tables should not get a changed_cols filter.
+        let mut ctx = test_ctx();
+        ctx.source_cdc_columns
+            .insert(100, vec!["id".into(), "name".into(), "amount".into()]);
+        // Keyless scan (no pk_columns).
+        let tree = scan(100, "orders", "public", "o", &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should NOT have a changed_cols filter
+        assert!(!sql.contains("changed_cols"));
     }
 }

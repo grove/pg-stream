@@ -55,6 +55,15 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   (`C₀ = C_current EXCEPT ALL ...`) is now gated behind a single-evaluation CTE that checks
   whether the inner subquery has any delta rows. When the inner source is stable, the full
   outer table scan is skipped entirely, avoiding O(|outer table|) I/O per cycle.
+- **Changed-columns bitmask filter** (P2-5): The scan operator now uses the CDC trigger's
+  `changed_cols` bitmask to skip UPDATE rows where none of the columns referenced by the
+  defining query actually changed. For wide tables where only a few columns are used, this
+  can eliminate the majority of UPDATE processing. The filter is only applied to PK-based
+  tables with ≤63 columns and when column pruning has reduced the referenced set.
+- **DISTINCT index-driven lookup** (P2-3): The DISTINCT multiplicity-count merge CTE now
+  uses a correlated scalar subquery instead of LEFT JOIN to fetch the stream table's
+  `__pgt_count`. This forces per-row index lookup via the `__pgt_row_id` UNIQUE index,
+  guaranteeing O(delta) I/O regardless of PostgreSQL planner cost estimates.
 
 ### Fixed
 - **Backend crash on SPI error in `source_gates()` and `watermarks()`** (G-1): Both SQL-callable

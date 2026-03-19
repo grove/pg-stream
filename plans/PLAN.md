@@ -11,6 +11,8 @@
 > - **B3-1**: Delta-branch pruning for zero-change sources — ✅ **Complete**
 > - **P3-3**: Scalar subquery C₀ gating behind inner-delta existence check — ✅ **Complete**
 > - **P3-1**: Window partition O(partition_size) cost documented — ✅ **Complete**
+> - **P2-5**: `changed_cols` bitmask filter in delta scan CTE — ✅ **Complete**
+> - **P2-3**: DISTINCT index-driven `__pgt_count` lookup — ✅ **Complete**
 
 ### F40 Status Update
 
@@ -36,6 +38,8 @@ One item remains before F40 is fully closed:
 > - **B3-1**: Delta-branch pruning for zero-change sources — ✅ **Complete**
 > - **P3-3**: Scalar subquery C₀ gating behind inner-delta existence check — ✅ **Complete**
 > - **P3-1**: Window partition O(partition_size) cost documented — ✅ **Complete**
+> - **P2-5**: `changed_cols` bitmask filter in delta scan CTE — ✅ **Complete**
+> - **P2-3**: DISTINCT index-driven `__pgt_count` lookup — ✅ **Complete**
 
 ### F15 Status Update (Selective CDC Column Capture)
 
