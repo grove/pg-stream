@@ -3880,6 +3880,11 @@ fn setup_cdc_for_source(
             &[pgt_id.into(), source_oid.into()],
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        // F15: The new ST may reference columns not yet in the change buffer.
+        // Rebuild the trigger function + sync change buffer columns so the union
+        // of all downstream ST column sets is reflected in the buffer.
+        cdc::rebuild_cdc_trigger_function(source_oid, change_schema)?;
     }
 
     if requested_cdc_mode == "trigger" {
