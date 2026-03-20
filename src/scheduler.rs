@@ -1445,6 +1445,11 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     // Per-ST drift reset counters (differential cycles since last reinit)
     let mut drift_counters: HashMap<i64, i32> = HashMap::new();
 
+    // P3-5: Per-ST auto-backoff factors (multiplicative schedule stretch).
+    // When auto_backoff is enabled and a ST is falling behind, the factor
+    // doubles each consecutive cycle; resets to 1.0 on the first on-time cycle.
+    let mut backoff_factors: HashMap<i64, f64> = HashMap::new();
+
     // Phase 10: Crash recovery — mark any interrupted RUNNING records
     BackgroundWorker::transaction(AssertUnwindSafe(|| {
         recover_from_crash();
@@ -1765,6 +1770,34 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     if scc_member_ids.contains(&pgt_id) {
                         continue;
                     }
+                    // P3-5: Auto-backoff — skip this tick if the backoff
+                    // factor indicates we should wait longer.
+                    let bf = backoff_factors.get(&pgt_id).copied().unwrap_or(1.0);
+                    if bf > 1.0 {
+                        // Check if enough time has passed since last refresh
+                        // (effective interval = schedule * backoff_factor).
+                        let should_skip = BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                            if let Some(st) = load_st_by_id(pgt_id)
+                                && let Some(ref schedule_str) = st.schedule
+                                && let Ok(max_secs) = crate::api::parse_duration(schedule_str)
+                            {
+                                let effective_secs: f64 = max_secs as f64 * bf;
+                                let stale = Spi::get_one_with_args::<bool>(
+                                    "SELECT CASE WHEN last_refresh_at IS NULL THEN true \
+                                     ELSE EXTRACT(EPOCH FROM (now() - last_refresh_at)) > $2 END \
+                                     FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
+                                    &[st.pgt_id.into(), effective_secs.into()],
+                                )
+                                .unwrap_or(Some(false))
+                                .unwrap_or(false);
+                                return !stale; // skip if not yet due under backoff schedule
+                            }
+                            false
+                        }));
+                        if should_skip {
+                            continue;
+                        }
+                    }
                     let mut entry = drift_counters.entry(pgt_id).or_insert(0);
                     refresh_single_st(
                         pgt_id,
@@ -1776,6 +1809,12 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         tick_watermark.as_deref(),
                         Some(&mut entry),
                     );
+                    // P3-5: Update auto-backoff factor based on last refresh timing.
+                    if config::pg_trickle_auto_backoff() {
+                        BackgroundWorker::transaction(AssertUnwindSafe(|| {
+                            update_backoff_factor(pgt_id, &mut backoff_factors);
+                        }));
+                    }
                     continue;
                 }
 
@@ -2254,6 +2293,65 @@ fn is_falling_behind(elapsed_ms: i64, schedule_ms: i64) -> Option<f64> {
     }
     let ratio = elapsed_ms as f64 / schedule_ms as f64;
     if ratio >= 0.8 { Some(ratio) } else { None }
+}
+
+/// P3-5: Update the auto-backoff factor for a stream table based on its
+/// last refresh timing. Doubles the factor when falling behind; resets to
+/// 1.0 on the first on-time cycle.
+fn update_backoff_factor(pgt_id: i64, backoff_factors: &mut HashMap<i64, f64>) {
+    let st = match load_st_by_id(pgt_id) {
+        Some(st) => st,
+        None => return,
+    };
+    let schedule_str = match &st.schedule {
+        Some(s) => s.clone(),
+        None => return,
+    };
+    let max_secs = match crate::api::parse_duration(&schedule_str) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let schedule_ms = max_secs * 1000;
+    if schedule_ms <= 0 {
+        return;
+    }
+
+    // Check last refresh duration from history
+    let elapsed_ms: Option<i64> = Spi::get_one_with_args::<i64>(
+        "SELECT EXTRACT(EPOCH FROM (finished_at - started_at))::BIGINT * 1000 \
+         FROM pgtrickle.pgt_refresh_history \
+         WHERE pgt_id = $1 AND status = 'COMPLETED' AND finished_at IS NOT NULL \
+         ORDER BY refresh_id DESC LIMIT 1",
+        &[pgt_id.into()],
+    )
+    .unwrap_or(None);
+
+    let elapsed_ms = match elapsed_ms {
+        Some(ms) => ms,
+        None => return,
+    };
+
+    if is_falling_behind(elapsed_ms, schedule_ms).is_some() {
+        // Double the backoff factor, cap at 64x
+        let factor = backoff_factors.get(&pgt_id).copied().unwrap_or(1.0);
+        let new_factor = (factor * 2.0).min(64.0);
+        backoff_factors.insert(pgt_id, new_factor);
+        pgrx::info!(
+            "pg_trickle: auto-backoff for pgt_id={} increased to {:.0}x (refresh {}ms, schedule {}ms)",
+            pgt_id,
+            new_factor,
+            elapsed_ms,
+            schedule_ms,
+        );
+    } else {
+        // On-time: reset backoff
+        if backoff_factors.remove(&pgt_id).is_some() {
+            pgrx::info!(
+                "pg_trickle: auto-backoff for pgt_id={} reset to 1x (on-time)",
+                pgt_id,
+            );
+        }
+    }
 }
 
 /// Load a stream table by its pgt_id, or return None if not found.

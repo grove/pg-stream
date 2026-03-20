@@ -419,15 +419,47 @@ const PLANNER_HINT_WORKMEM_THRESHOLD: i64 = 10_000;
 
 /// Apply `SET LOCAL` planner hints based on the estimated delta size.
 ///
-/// - delta < 100 rows: no hints (let planner optimise for small data)
+/// - Small delta (ratio < merge_seqscan_threshold): `SET LOCAL enable_seqscan = off`
+///   to force index lookups on the stream table.
 /// - delta 100–9 999: `SET LOCAL enable_nestloop = off`
 /// - delta >= 10 000: also `SET LOCAL work_mem = '<N>MB'`
 ///
 /// `SET LOCAL` is automatically reset at the end of the current transaction,
 /// so these hints cannot leak to other queries.
-fn apply_planner_hints(estimated_delta: i64) {
+fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid) {
     if !crate::config::pg_trickle_merge_planner_hints() {
         return;
+    }
+
+    // P3-4: For small deltas against large stream tables, disable seqscan
+    // to force index lookups on __pgt_row_id.
+    let seqscan_threshold = crate::config::pg_trickle_merge_seqscan_threshold();
+    if seqscan_threshold > 0.0
+        && estimated_delta > 0
+        && estimated_delta < PLANNER_HINT_NESTLOOP_THRESHOLD
+    {
+        let st_rows: i64 = Spi::get_one_with_args::<i64>(
+            "SELECT GREATEST(reltuples::bigint, 1) FROM pg_class WHERE oid = $1",
+            &[st_relid.into()],
+        )
+        .unwrap_or(Some(1000))
+        .unwrap_or(1000);
+
+        let ratio = estimated_delta as f64 / st_rows as f64;
+        if ratio < seqscan_threshold {
+            if let Err(e) = Spi::run("SET LOCAL enable_seqscan = off") {
+                pgrx::debug1!(
+                    "[pg_trickle] P3-4: failed to SET LOCAL enable_seqscan: {}",
+                    e
+                );
+            } else {
+                pgrx::debug1!(
+                    "[pg_trickle] P3-4: delta/ST ratio {:.6} < threshold {:.4}, disabled seqscan",
+                    ratio,
+                    seqscan_threshold,
+                );
+            }
+        }
     }
 
     if estimated_delta >= PLANNER_HINT_WORKMEM_THRESHOLD {
@@ -454,22 +486,52 @@ fn apply_planner_hints(estimated_delta: i64) {
 }
 
 /// Resolve LSN placeholders in a SQL template with actual frontier values.
+///
+/// B3-1: When `zero_change_oids` contains a source OID, the entire LSN-range
+/// predicate for that source is replaced with `FALSE`, enabling PostgreSQL's
+/// planner to recognise the scan CTE as empty at plan time and skip
+/// downstream join branches.
 fn resolve_lsn_placeholders(
     template: &str,
     source_oids: &[u32],
     prev_frontier: &Frontier,
     new_frontier: &Frontier,
+    zero_change_oids: &std::collections::HashSet<u32>,
 ) -> String {
     let mut sql = template.to_string();
     for &oid in source_oids {
-        sql = sql.replace(
-            &format!("__PGS_PREV_LSN_{oid}__"),
-            &prev_frontier.get_lsn(oid),
-        );
-        sql = sql.replace(
-            &format!("__PGS_NEW_LSN_{oid}__"),
-            &new_frontier.get_lsn(oid),
-        );
+        if zero_change_oids.contains(&oid) {
+            // B3-1: Replace the full LSN range predicate with FALSE so
+            // PG can prune the change-buffer scan CTE at plan time.
+            let lsn_pred = format!(
+                "'__PGS_PREV_LSN_{oid}__'::pg_lsn AND c.lsn <= '__PGS_NEW_LSN_{oid}__'::pg_lsn"
+            );
+            if sql.contains(&lsn_pred) {
+                sql = sql.replace(
+                    &format!("c.lsn > {lsn_pred}"),
+                    "FALSE /* B3-1: zero-change source pruned */",
+                );
+            } else {
+                // Cleanup SQL or other patterns that don't use `c.lsn` alias.
+                sql = sql.replace(
+                    &format!("__PGS_PREV_LSN_{oid}__"),
+                    &prev_frontier.get_lsn(oid),
+                );
+                sql = sql.replace(
+                    &format!("__PGS_NEW_LSN_{oid}__"),
+                    &new_frontier.get_lsn(oid),
+                );
+            }
+        } else {
+            sql = sql.replace(
+                &format!("__PGS_PREV_LSN_{oid}__"),
+                &prev_frontier.get_lsn(oid),
+            );
+            sql = sql.replace(
+                &format!("__PGS_NEW_LSN_{oid}__"),
+                &new_frontier.get_lsn(oid),
+            );
+        }
     }
     sql
 }
@@ -1726,6 +1788,8 @@ pub fn execute_differential_refresh(
     let mut should_fallback = false;
     let mut total_change_count: i64 = 0;
     let mut _total_table_size: i64 = 0;
+    // B3-1: Track source OIDs with zero changes for delta-branch pruning.
+    let mut zero_change_oids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     for oid in &catalog_source_oids {
         let prev_lsn = prev_frontier.get_lsn(*oid);
@@ -1783,6 +1847,11 @@ pub fn execute_differential_refresh(
 
         total_change_count += change_count;
         _total_table_size += table_size;
+
+        // B3-1: Record sources with zero changes for delta-branch pruning.
+        if change_count == 0 {
+            zero_change_oids.insert(*oid);
+        }
 
         if change_count > threshold_rows {
             should_fallback = true;
@@ -1944,6 +2013,7 @@ pub fn execute_differential_refresh(
                 &entry.source_oids,
                 prev_frontier,
                 new_frontier,
+                &zero_change_oids,
             ),
             source_oids: entry.source_oids.clone(),
             parameterized_merge_sql: entry.parameterized_merge_sql.clone(),
@@ -1955,6 +2025,7 @@ pub fn execute_differential_refresh(
                 &entry.source_oids,
                 prev_frontier,
                 new_frontier,
+                &zero_change_oids,
             ),
         }
     } else {
@@ -2156,6 +2227,7 @@ pub fn execute_differential_refresh(
                 &source_oids,
                 prev_frontier,
                 new_frontier,
+                &zero_change_oids,
             ),
             source_oids: source_oids.clone(),
             parameterized_merge_sql,
@@ -2167,6 +2239,7 @@ pub fn execute_differential_refresh(
                 &source_oids,
                 prev_frontier,
                 new_frontier,
+                &zero_change_oids,
             ),
         }
     };
@@ -2236,7 +2309,7 @@ pub fn execute_differential_refresh(
     // ── D-1: Conditional planner hints based on delta size ───────────
     // Large deltas benefit from hash joins over nested loops. Apply
     // SET LOCAL hints that are automatically reset at transaction end.
-    apply_planner_hints(total_change_count);
+    apply_planner_hints(total_change_count, st.pgt_relid);
 
     // ── A-3a: Append-only INSERT fast path ───────────────────────────
     // When the stream table is marked append-only (and hasn't been
@@ -2903,6 +2976,22 @@ mod tests {
 
     // ── resolve_lsn_placeholders() ──────────────────────────────────
 
+    /// Convenience wrapper for tests — calls resolve_lsn_placeholders with empty zero_change_oids.
+    fn resolve_lsn_placeholders_test(
+        template: &str,
+        source_oids: &[u32],
+        prev: &Frontier,
+        new_f: &Frontier,
+    ) -> String {
+        resolve_lsn_placeholders(
+            template,
+            source_oids,
+            prev,
+            new_f,
+            &std::collections::HashSet::new(),
+        )
+    }
+
     #[test]
     fn test_resolve_lsn_single_oid() {
         let mut prev = Frontier::new();
@@ -2911,7 +3000,7 @@ mod tests {
         new_f.set_source(42, "0/2000".to_string(), "ts".to_string());
 
         let template = "DELETE FROM changes_42 WHERE lsn > '__PGS_PREV_LSN_42__' AND lsn <= '__PGS_NEW_LSN_42__'";
-        let resolved = resolve_lsn_placeholders(template, &[42], &prev, &new_f);
+        let resolved = resolve_lsn_placeholders_test(template, &[42], &prev, &new_f);
         assert!(resolved.contains("0/1000"));
         assert!(resolved.contains("0/2000"));
         assert!(!resolved.contains("__PGS_"));
@@ -2928,7 +3017,7 @@ mod tests {
 
         let template =
             "__PGS_PREV_LSN_10__ __PGS_NEW_LSN_10__ __PGS_PREV_LSN_20__ __PGS_NEW_LSN_20__";
-        let resolved = resolve_lsn_placeholders(template, &[10, 20], &prev, &new_f);
+        let resolved = resolve_lsn_placeholders_test(template, &[10, 20], &prev, &new_f);
         assert_eq!(resolved, "0/AA 0/CC 0/BB 0/DD");
     }
 
@@ -2936,7 +3025,7 @@ mod tests {
     fn test_resolve_lsn_no_placeholders() {
         let prev = Frontier::new();
         let new_f = Frontier::new();
-        let resolved = resolve_lsn_placeholders("SELECT 1", &[], &prev, &new_f);
+        let resolved = resolve_lsn_placeholders_test("SELECT 1", &[], &prev, &new_f);
         assert_eq!(resolved, "SELECT 1");
     }
 
@@ -2944,7 +3033,7 @@ mod tests {
     fn test_resolve_lsn_missing_oid_defaults() {
         let prev = Frontier::new();
         let new_f = Frontier::new();
-        let resolved = resolve_lsn_placeholders("__PGS_PREV_LSN_999__", &[999], &prev, &new_f);
+        let resolved = resolve_lsn_placeholders_test("__PGS_PREV_LSN_999__", &[999], &prev, &new_f);
         assert_eq!(resolved, "0/0");
     }
 
@@ -2956,7 +3045,7 @@ mod tests {
         new_f.set_source(1, "0/20".to_string(), "ts".to_string());
 
         let template = "SELECT * FROM t WHERE x = 42 AND lsn > '__PGS_PREV_LSN_1__'";
-        let resolved = resolve_lsn_placeholders(template, &[1], &prev, &new_f);
+        let resolved = resolve_lsn_placeholders_test(template, &[1], &prev, &new_f);
         assert!(resolved.contains("SELECT * FROM t WHERE x = 42"));
         assert!(resolved.contains("0/10"));
     }
@@ -2966,7 +3055,7 @@ mod tests {
         let template = "DELETE FROM changes_12345 WHERE lsn > '__PGS_PREV_LSN_12345__'::pg_lsn AND lsn <= '__PGS_NEW_LSN_12345__'::pg_lsn";
         let prev = make_frontier(&[(12345, "0/1000")]);
         let new = make_frontier(&[(12345, "0/2000")]);
-        let result = resolve_lsn_placeholders(template, &[12345], &prev, &new);
+        let result = resolve_lsn_placeholders_test(template, &[12345], &prev, &new);
         assert_eq!(
             result,
             "DELETE FROM changes_12345 WHERE lsn > '0/1000'::pg_lsn AND lsn <= '0/2000'::pg_lsn"
@@ -2979,7 +3068,7 @@ mod tests {
                         DELETE FROM changes_200 WHERE lsn > '__PGS_PREV_LSN_200__'::pg_lsn AND lsn <= '__PGS_NEW_LSN_200__'::pg_lsn";
         let prev = make_frontier(&[(100, "0/A"), (200, "0/B")]);
         let new = make_frontier(&[(100, "0/C"), (200, "0/D")]);
-        let result = resolve_lsn_placeholders(template, &[100, 200], &prev, &new);
+        let result = resolve_lsn_placeholders_test(template, &[100, 200], &prev, &new);
         assert!(result.contains("'0/A'"));
         assert!(result.contains("'0/C'"));
         assert!(result.contains("'0/B'"));
@@ -2992,21 +3081,52 @@ mod tests {
         let template = "lsn > '__PGS_PREV_LSN_999__'::pg_lsn";
         let prev = Frontier::new();
         let new = Frontier::new();
-        let result = resolve_lsn_placeholders(template, &[999], &prev, &new);
+        let result = resolve_lsn_placeholders_test(template, &[999], &prev, &new);
         assert_eq!(result, "lsn > '0/0'::pg_lsn");
     }
 
     #[test]
     fn test_resolve_lsn_placeholders_empty_template() {
-        let result = resolve_lsn_placeholders("", &[1], &Frontier::new(), &Frontier::new());
+        let result = resolve_lsn_placeholders_test("", &[1], &Frontier::new(), &Frontier::new());
         assert_eq!(result, "");
     }
 
     #[test]
     fn test_resolve_lsn_placeholders_no_sources() {
         let template = "SELECT 1";
-        let result = resolve_lsn_placeholders(template, &[], &Frontier::new(), &Frontier::new());
+        let result =
+            resolve_lsn_placeholders_test(template, &[], &Frontier::new(), &Frontier::new());
         assert_eq!(result, "SELECT 1");
+    }
+
+    #[test]
+    fn test_resolve_lsn_b3_1_zero_change_pruning() {
+        let template = "SELECT * FROM changes_42 WHERE c.lsn > '__PGS_PREV_LSN_42__'::pg_lsn AND c.lsn <= '__PGS_NEW_LSN_42__'::pg_lsn";
+        let prev = make_frontier(&[(42, "0/1000")]);
+        let new_f = make_frontier(&[(42, "0/2000")]);
+        let mut zero = std::collections::HashSet::new();
+        zero.insert(42u32);
+        let result = resolve_lsn_placeholders(template, &[42], &prev, &new_f, &zero);
+        assert!(result.contains("FALSE"));
+        assert!(!result.contains("__PGS_"));
+        assert!(!result.contains("0/1000"));
+    }
+
+    #[test]
+    fn test_resolve_lsn_b3_1_partial_zero_change() {
+        // Two sources — OID 10 has changes, OID 20 has zero changes
+        let template = "c.lsn > '__PGS_PREV_LSN_10__'::pg_lsn AND c.lsn <= '__PGS_NEW_LSN_10__'::pg_lsn UNION ALL c.lsn > '__PGS_PREV_LSN_20__'::pg_lsn AND c.lsn <= '__PGS_NEW_LSN_20__'::pg_lsn";
+        let prev = make_frontier(&[(10, "0/A"), (20, "0/B")]);
+        let new_f = make_frontier(&[(10, "0/C"), (20, "0/D")]);
+        let mut zero = std::collections::HashSet::new();
+        zero.insert(20u32);
+        let result = resolve_lsn_placeholders(template, &[10, 20], &prev, &new_f, &zero);
+        // OID 10 should be resolved normally
+        assert!(result.contains("'0/A'"));
+        assert!(result.contains("'0/C'"));
+        // OID 20 should be pruned to FALSE
+        assert!(result.contains("FALSE"));
+        assert!(!result.contains("__PGS_"));
     }
 
     // ── CachedMergeTemplate tests ──────────────────────────────────────

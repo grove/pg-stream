@@ -1,8 +1,8 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-17
-> **Latest release:** 0.8.0 (2026-03-17)
-> **Current milestone:** v0.9.0 — Incremental Aggregate Maintenance
+> **Last updated:** 2026-03-20
+> **Latest release:** 0.9.0 (2026-03-20)
+> **Current milestone:** v0.10.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -1307,6 +1307,8 @@ that re-links orphaned catalog entries on extension restore.
 
 ## v0.9.0 — Incremental Aggregate Maintenance
 
+**Status: Released (2026-03-20).**
+
 **Goal:** Implement algebraic incremental maintenance for decomposable aggregates
 (COUNT, SUM, AVG, MIN, MAX, STDDEV), reducing per-group refresh from O(group_size)
 to O(1) for the common case. This is the highest-potential-payoff item in the
@@ -1436,9 +1438,9 @@ These represent expansions of the DVM engine to handle richer SQL constructs and
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| B3-1 | Intra-query delta-branch pruning: skip UNION ALL branch entirely when a source has zero changes in this cycle | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
-| B3-2 | Merged-delta generation: weight aggregation (`GROUP BY __pgt_row_id, SUM(weight)`) for cross-source deduplication; remove zero-weight rows | 3–4 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
-| B3-3 | Property-based correctness tests for simultaneous multi-source changes; diamond-flow scenarios | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-1 | Intra-query delta-branch pruning: skip UNION ALL branch entirely when a source has zero changes in this cycle | 1–2 wk | ✅ Done | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-2 | Merged-delta generation: weight aggregation (`GROUP BY __pgt_row_id, SUM(weight)`) for cross-source deduplication; remove zero-weight rows | 3–4 wk | ⏭️ Deferred to v0.10.0 | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-3 | Property-based correctness tests for simultaneous multi-source changes; diamond-flow scenarios | 1–2 wk | ⏭️ Deferred to v0.10.0 | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
 
 > ⚠️ Cross-delta deduplication **must use weight aggregation (`SUM(weight)` grouped by
 > `__pgt_row_id`), not `DISTINCT ON`**. `DISTINCT ON` silently discards corrections
@@ -1471,8 +1473,8 @@ These items pull in the remaining correctness edge cases and syntax expansions i
 |------|-------------|--------|--------|-----|
 | A1 | Circular dependency support (SCC fixpoint iteration) | ~40h | ✅ Done | [CIRCULAR_REFERENCES.md](plans/sql/CIRCULAR_REFERENCES.md) |
 | A7 | Skip-unchanged-column scanning in delta SQL (requires column-usage demand-propagation pass in DVM parser) | ~1–2d | ✅ Done | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) Stage 4 §3.4 |
-| EC-03 | Window-in-expression DIFFERENTIAL fallback warning: emit a `WARNING` (and eventually an `INFO` hint) when a stream table with `CASE WHEN window_fn() OVER (...) ...` silently falls back from DIFFERENTIAL to FULL refresh mode; currently fails at runtime with `column st.* does not exist` — no user-visible signal exists | ~1d | ⬜ Not started | [PLAN_EDGE_CASES.md §EC-03](plans/PLAN_EDGE_CASES.md) |
-| A8 | `pgt_refresh_groups` SQL API: companion functions (`pgtrickle.pgt_add_refresh_group()`, `pgtrickle.pgt_remove_refresh_group()`, `pgtrickle.pgt_list_refresh_groups()`) for the Cross-Source Snapshot Consistency catalog table introduced in the `0.8.0→0.9.0` upgrade script; table exists but has no user-facing API | ~2–3d | ⬜ Not started | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
+| EC-03 | Window-in-expression DIFFERENTIAL fallback warning: emit a `WARNING` (and eventually an `INFO` hint) when a stream table with `CASE WHEN window_fn() OVER (...) ...` silently falls back from DIFFERENTIAL to FULL refresh mode; currently fails at runtime with `column st.* does not exist` — no user-visible signal exists | ~1d | ✅ Done | [PLAN_EDGE_CASES.md §EC-03](plans/PLAN_EDGE_CASES.md) |
+| A8 | `pgt_refresh_groups` SQL API: companion functions (`pgtrickle.create_refresh_group()`, `pgtrickle.drop_refresh_group()`, `pgtrickle.refresh_groups()`) for the Cross-Source Snapshot Consistency catalog table introduced in the `0.8.0→0.9.0` upgrade script | ~2–3d | ✅ Done | [PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md](plans/sql/PLAN_CROSS_SOURCE_SNAPSHOT_CONSISTENCY.md) |
 
 > **Advanced Capabilities subtotal: ~11–13 weeks**
 
@@ -1482,13 +1484,13 @@ These items address correctness gaps that silently degrade to full-recompute mod
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** Currently, any DELETE or UPDATE against a recursive CTE's source in DIFFERENTIAL mode falls back to O(n) full recompute + diff. The Delete-and-Rederive (DRed) algorithm exists for IMMEDIATE mode only. Implement DRed for `DeltaSource::ChangeBuffer` so recursive CTE stream tables in DIFFERENTIAL mode maintain O(delta) cost. | 2–3 wk | ⬜ Not started | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
-| P2-2 | **SUM NULL-transition rescan for FULL OUTER JOIN aggregates.** When `SUM` sits above a FULL OUTER JOIN and rows transition between matched and unmatched states (matched→NULL), the algebraic formula gives 0 instead of NULL, triggering a `child_has_full_join()` full-group rescan on every cycle where rows cross that boundary. Implement a targeted correction that avoids full-group rescans in the common case. | 1–2 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
-| P2-3 | **DISTINCT multiplicity-count JOIN overhead.** Every differential refresh for `SELECT DISTINCT` queries joins against the stream table's `__pgt_count` column for the full stream table, even when only a tiny delta is being processed. Replace with a per-affected-row lookup pattern to limit this to O(delta) I/O. | 1 wk | ⬜ Not started | [src/dvm/operators/distinct.rs](src/dvm/operators/distinct.rs) |
-| P2-4 | **Materialized view sources in IMMEDIATE mode (EC-09).** Stream tables that use a PostgreSQL materialized view as a source are rejected at creation time when IMMEDIATE mode is requested. Implement a polling-change-detection wrapper (same approach as EC-05 for foreign tables) to support `REFRESH MATERIALIZED VIEW`-sourced queries in IMMEDIATE mode. | 2–3 wk | ⬜ Not started | [plans/PLAN_EDGE_CASES.md §EC-09](plans/PLAN_EDGE_CASES.md) |
-| P2-5 | **`changed_cols` bitmask captured but not consumed in delta scan SQL.** Every CDC change buffer row stores a `changed_cols BIGINT` bitmask recording which source columns were modified by an UPDATE. The DVM delta scan CTE reads every UPDATE row regardless of whether any query-referenced column actually changed. Implement a demand-propagation pass to identify referenced columns per Scan, then inject a `changed_cols & referenced_mask != 0` filter into the delta CTE WHERE clause. For wide source tables (50+ columns) where a typical UPDATE touches 1–3 columns, this eliminates ~98% of UPDATE rows entering the join/aggregate pipeline. | 2–3 wk | ⬜ Not started | [src/dvm/operators/scan.rs](src/dvm/operators/scan.rs) · [plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md §Task 3.1](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) |
-| P2-6 | **LATERAL subquery inner-source change triggers O(\|outer table\|) full re-execution.** When any inner source has CDC entries in the current window, `build_inner_change_branch()` re-materializes the entire outer table snapshot and re-executes the lateral subquery for every outer row — O(\|outer\|) per affected cycle. Gate the outer-table scan behind a join to the inner delta rows so only outer rows correlated with changed inner rows are re-executed. (The analogous scalar subquery fix is P3-3; this is the lateral equivalent.) | 1–2 wk | ⬜ Not started | [src/dvm/operators/lateral_subquery.rs](src/dvm/operators/lateral_subquery.rs) |
-| P2-7 | **Delta predicate pushdown not implemented.** WHERE predicates from the defining query are not pushed into the change buffer scan CTE. A stream table defined as `SELECT … FROM orders WHERE status = 'shipped'` reads all changes from `pgtrickle_changes.changes_<oid>` then filters — for 10K changes/cycle with 50 matching the predicate, 9,950 rows traverse the join/aggregate pipeline needlessly. Collect pushable predicates from the Filter node above the Scan; inject `new_<col> / old_<col>` predicate variants into the delta scan SQL. Care required: UPDATE rows need both old and new column values checked to avoid missing deletions that move rows out of the predicate window. | 2–3 wk | ⬜ Not started | [src/dvm/operators/scan.rs](src/dvm/operators/scan.rs) · [src/dvm/operators/filter.rs](src/dvm/operators/filter.rs) · [plans/performance/PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
+| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** Currently, any DELETE or UPDATE against a recursive CTE's source in DIFFERENTIAL mode falls back to O(n) full recompute + diff. The Delete-and-Rederive (DRed) algorithm exists for IMMEDIATE mode only. Implement DRed for `DeltaSource::ChangeBuffer` so recursive CTE stream tables in DIFFERENTIAL mode maintain O(delta) cost. | 2–3 wk | ⏭️ Deferred to v0.10.0 | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
+| P2-2 | **SUM NULL-transition rescan for FULL OUTER JOIN aggregates.** When `SUM` sits above a FULL OUTER JOIN and rows transition between matched and unmatched states (matched→NULL), the algebraic formula gives 0 instead of NULL, triggering a `child_has_full_join()` full-group rescan on every cycle where rows cross that boundary. Implement a targeted correction that avoids full-group rescans in the common case. | 1–2 wk | ⏭️ Deferred to v0.10.0 | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
+| P2-3 | **DISTINCT multiplicity-count JOIN overhead.** Every differential refresh for `SELECT DISTINCT` queries joins against the stream table's `__pgt_count` column for the full stream table, even when only a tiny delta is being processed. Replace with a per-affected-row lookup pattern to limit this to O(delta) I/O. | 1 wk | ✅ Done | [src/dvm/operators/distinct.rs](src/dvm/operators/distinct.rs) |
+| P2-4 | **Materialized view sources in IMMEDIATE mode (EC-09).** Stream tables that use a PostgreSQL materialized view as a source are rejected at creation time when IMMEDIATE mode is requested. Implement a polling-change-detection wrapper (same approach as EC-05 for foreign tables) to support `REFRESH MATERIALIZED VIEW`-sourced queries in IMMEDIATE mode. | 2–3 wk | ⏭️ Deferred to v0.10.0 | [plans/PLAN_EDGE_CASES.md §EC-09](plans/PLAN_EDGE_CASES.md) |
+| P2-5 | **`changed_cols` bitmask captured but not consumed in delta scan SQL.** Every CDC change buffer row stores a `changed_cols BIGINT` bitmask recording which source columns were modified by an UPDATE. The DVM delta scan CTE reads every UPDATE row regardless of whether any query-referenced column actually changed. Implement a demand-propagation pass to identify referenced columns per Scan, then inject a `changed_cols & referenced_mask != 0` filter into the delta CTE WHERE clause. For wide source tables (50+ columns) where a typical UPDATE touches 1–3 columns, this eliminates ~98% of UPDATE rows entering the join/aggregate pipeline. | 2–3 wk | ✅ Done | [src/dvm/operators/scan.rs](src/dvm/operators/scan.rs) · [plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md §Task 3.1](plans/PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) |
+| P2-6 | **LATERAL subquery inner-source change triggers O(\|outer table\|) full re-execution.** When any inner source has CDC entries in the current window, `build_inner_change_branch()` re-materializes the entire outer table snapshot and re-executes the lateral subquery for every outer row — O(\|outer\|) per affected cycle. Gate the outer-table scan behind a join to the inner delta rows so only outer rows correlated with changed inner rows are re-executed. (The analogous scalar subquery fix is P3-3; this is the lateral equivalent.) | 1–2 wk | ⏭️ Deferred to v0.10.0 | [src/dvm/operators/lateral_subquery.rs](src/dvm/operators/lateral_subquery.rs) |
+| P2-7 | **Delta predicate pushdown not implemented.** WHERE predicates from the defining query are not pushed into the change buffer scan CTE. A stream table defined as `SELECT … FROM orders WHERE status = 'shipped'` reads all changes from `pgtrickle_changes.changes_<oid>` then filters — for 10K changes/cycle with 50 matching the predicate, 9,950 rows traverse the join/aggregate pipeline needlessly. Collect pushable predicates from the Filter node above the Scan; inject `new_<col> / old_<col>` predicate variants into the delta scan SQL. Care required: UPDATE rows need both old and new column values checked to avoid missing deletions that move rows out of the predicate window. | 2–3 wk | ✅ Done | [src/dvm/operators/scan.rs](src/dvm/operators/scan.rs) · [src/dvm/operators/filter.rs](src/dvm/operators/filter.rs) · [plans/performance/PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
 
 > **DVM hardening (P2) subtotal: ~6–9 weeks**
 
@@ -1498,11 +1500,11 @@ These items are correct as implemented but scale with data size rather than delt
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| P3-1 | **Window partition full recompute.** Any single-row change in a window partition triggers recomputation of the entire partition. Add a partition-size heuristic: if the affected partition exceeds a configurable row threshold, downgrade to FULL refresh for that cycle and emit a `pgrx::info!()` message. At minimum, document the O(partition_size) cost prominently. | 1 wk | ⬜ Not started | [src/dvm/operators/window.rs](src/dvm/operators/window.rs) |
-| P3-2 | **Welford auxiliary columns for CORR/COVAR/REGR_\* aggregates.** `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*` currently use O(group_size) group-rescan. Implement Welford-style auxiliary column accumulation (`__pgt_aux_sumx_*`, `__pgt_aux_sumy_*`, `__pgt_aux_sumxy_*`) to reach O(1) algebraic maintenance identical to the STDDEV/VAR path. | 2–3 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
-| P3-3 | **Scalar subquery C₀ EXCEPT ALL scan.** Part 2 of the scalar subquery delta computes `C₀ = C_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes` by scanning the full outer snapshot. For large outer tables with an unstable inner source, this scan is proportional to the outer table size. Profile and gate the scan behind an existence check on inner-source stability to avoid it when possible; the `WHERE EXISTS (SELECT 1 FROM delta_subquery)` guard already handles the trivial case. | 1 wk | ⬜ Not started | [src/dvm/operators/scalar_subquery.rs](src/dvm/operators/scalar_subquery.rs) |
-| P3-4 | **Index-aware MERGE planning.** For small deltas against large stream tables (e.g. 5 delta rows, 10M-row ST), the PostgreSQL planner often chooses a sequential scan of the stream table for the MERGE join on `__pgt_row_id`, yielding O(n) full-table I/O when an index lookup would be O(log n). Emit `SET LOCAL enable_seqscan = off` within the MERGE transaction when the delta row count is below a configurable threshold fraction of the ST row count (`pg_trickle.merge_seqscan_threshold` GUC, default 0.001). | 1–2 wk | ⬜ Not started | [src/refresh.rs](src/refresh.rs) · [src/config.rs](src/config.rs) · [plans/performance/PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
-| P3-5 | **`auto_backoff` GUC for falling-behind stream tables.** EC-11 implemented the `scheduler_falling_behind` NOTIFY alert at 80% of the refresh budget. The companion `auto_backoff` GUC that automatically doubles the effective refresh interval when a stream table consistently runs behind was explicitly deferred. Add a `pg_trickle.auto_backoff` bool GUC (default off); when enabled, track a per-ST exponential backoff factor in scheduler shared state and reset it on the first on-time cycle. Saves CPU runaway when operators are offline to respond manually. | 1–2d | ⬜ Not started | [src/scheduler.rs](src/scheduler.rs) · [src/config.rs](src/config.rs) · [plans/PLAN_EDGE_CASES.md §EC-11](plans/PLAN_EDGE_CASES.md) |
+| P3-1 | **Window partition full recompute.** Any single-row change in a window partition triggers recomputation of the entire partition. Add a partition-size heuristic: if the affected partition exceeds a configurable row threshold, downgrade to FULL refresh for that cycle and emit a `pgrx::info!()` message. At minimum, document the O(partition_size) cost prominently. | 1 wk | ✅ Done (documented) | [src/dvm/operators/window.rs](src/dvm/operators/window.rs) |
+| P3-2 | **Welford auxiliary columns for CORR/COVAR/REGR_\* aggregates.** `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*` currently use O(group_size) group-rescan. Implement Welford-style auxiliary column accumulation (`__pgt_aux_sumx_*`, `__pgt_aux_sumy_*`, `__pgt_aux_sumxy_*`) to reach O(1) algebraic maintenance identical to the STDDEV/VAR path. | 2–3 wk | ⏭️ Deferred to v0.10.0 | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
+| P3-3 | **Scalar subquery C₀ EXCEPT ALL scan.** Part 2 of the scalar subquery delta computes `C₀ = C_current EXCEPT ALL Δ_inserts UNION ALL Δ_deletes` by scanning the full outer snapshot. For large outer tables with an unstable inner source, this scan is proportional to the outer table size. Profile and gate the scan behind an existence check on inner-source stability to avoid it when possible; the `WHERE EXISTS (SELECT 1 FROM delta_subquery)` guard already handles the trivial case. | 1 wk | ✅ Done | [src/dvm/operators/scalar_subquery.rs](src/dvm/operators/scalar_subquery.rs) |
+| P3-4 | **Index-aware MERGE planning.** For small deltas against large stream tables (e.g. 5 delta rows, 10M-row ST), the PostgreSQL planner often chooses a sequential scan of the stream table for the MERGE join on `__pgt_row_id`, yielding O(n) full-table I/O when an index lookup would be O(log n). Emit `SET LOCAL enable_seqscan = off` within the MERGE transaction when the delta row count is below a configurable threshold fraction of the ST row count (`pg_trickle.merge_seqscan_threshold` GUC, default 0.001). | 1–2 wk | ✅ Done | [src/refresh.rs](src/refresh.rs) · [src/config.rs](src/config.rs) · [plans/performance/PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
+| P3-5 | **`auto_backoff` GUC for falling-behind stream tables.** EC-11 implemented the `scheduler_falling_behind` NOTIFY alert at 80% of the refresh budget. The companion `auto_backoff` GUC that automatically doubles the effective refresh interval when a stream table consistently runs behind was explicitly deferred. Add a `pg_trickle.auto_backoff` bool GUC (default off); when enabled, track a per-ST exponential backoff factor in scheduler shared state and reset it on the first on-time cycle. Saves CPU runaway when operators are offline to respond manually. | 1–2d | ✅ Done | [src/scheduler.rs](src/scheduler.rs) · [src/config.rs](src/config.rs) · [plans/PLAN_EDGE_CASES.md §EC-11](plans/PLAN_EDGE_CASES.md) |
 
 > **DVM performance trade-offs (P3) subtotal: ~4–7 weeks**
 
@@ -1536,35 +1538,39 @@ These items are correct as implemented but scale with data size rather than delt
 - [x] G6 Test Coverage expanded (G6.1, G6.2, G6.3, G6.5)
 - [x] F15: Selective CDC Column Capture (optimize I/O by only tracking columns referenced in query lineage) 
 - [x] F40: Extension Upgrade Migration Scripts (finalize versioned SQL schema migrations)
-- [ ] B3-1: Delta-branch pruning for zero-change sources (skip UNION ALL branch when source has no changes)
-- [ ] B3-2: Merged-delta weight aggregation (`SUM(weight) GROUP BY __pgt_row_id`) for cross-source deduplication
-- [ ] B3-3: Property-based correctness tests for simultaneous multi-source and diamond-flow scenarios
-- [ ] EC-03: WARNING emitted when window-in-expression query silently falls back from DIFFERENTIAL to FULL refresh mode
-- [ ] A8: `pgt_refresh_groups` SQL API (`pgt_add_refresh_group`, `pgt_remove_refresh_group`, `pgt_list_refresh_groups`)
-- [ ] P2-1: Recursive CTE DRed implemented for DIFFERENTIAL mode (mixed DELETE/UPDATE no longer triggers O(n) full recompute)
-- [ ] P2-2: SUM NULL-transition rescan eliminated for FULL OUTER JOIN aggregates in the common case
-- [ ] P2-3: DISTINCT `__pgt_count` lookup scoped to O(delta) I/O per cycle
-- [ ] P2-4: Materialized view sources accepted in IMMEDIATE mode via polling-change-detection wrapper
-- [ ] P3-1: Window partition O(partition_size) cost documented; heuristic downgrade implemented or explicitly deferred
-- [ ] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns implemented or explicitly deferred to v0.10.0+
-- [ ] P3-3: Scalar subquery C₀ EXCEPT ALL scan gated behind inner-source stability check or explicitly deferred
+- [x] B3-1: Delta-branch pruning for zero-change sources (skip UNION ALL branch when source has no changes)
+- [x] B3-2: Merged-delta weight aggregation — **deferred to v0.10.0** (very high silent-corruption risk; requires property-based proofs before implementation)
+- [x] B3-3: Property-based correctness tests for B3-2 — **deferred to v0.10.0** (blocked on B3-2)
+- [x] EC-03: WARNING emitted when window-in-expression query silently falls back from DIFFERENTIAL to FULL refresh mode
+- [x] A8: `pgt_refresh_groups` SQL API (`pgt_add_refresh_group`, `pgt_remove_refresh_group`, `pgt_list_refresh_groups`)
+- [x] P2-1: Recursive CTE DRed for DIFFERENTIAL mode — **deferred to v0.10.0** (high risk; ChangeBuffer mode lacks old-state context for safe rederivation; recomputation fallback is correct)
+- [x] P2-2: SUM NULL-transition rescan optimization — **deferred to v0.10.0** (requires auxiliary nonnull-count columns; current rescan approach is correct)
+- [x] P2-3: DISTINCT `__pgt_count` lookup scoped to O(delta) I/O per cycle
+- [x] P2-4: Materialized view sources in IMMEDIATE mode — **deferred to v0.10.0** (requires external polling-change-detection wrapper; out of scope for v0.9.0)
+- [x] P3-1: Window partition O(partition_size) cost documented; heuristic downgrade implemented or explicitly deferred
+- [x] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns — **explicitly deferred to v0.10.0** (group-rescan strategy already works correctly for all regression/correlation aggregates)
+- [x] P3-3: Scalar subquery C₀ EXCEPT ALL scan gated behind inner-source stability check or explicitly deferred
 - [x] D1: Recursive CTE DIFFERENTIAL mode limitation documented in SQL_REFERENCE.md and DVM_OPERATORS.md
 - [x] D2: `pgt_refresh_groups` table schema and interim workflow documented in SQL_REFERENCE.md
 - [x] G-1: `panic!()` replaced with `pgrx::error!()` in `source_gates()` and `watermarks()` SQL functions
-- [ ] G-2 (P2-5): `changed_cols` bitmask consumed in delta scan CTE — referenced-column mask filter injected
-- [ ] G-3 (P2-6): LATERAL subquery inner-source change scoped to correlated outer rows (O(delta) not O(|outer|))
-- [ ] G-4 (P2-7): Delta predicate pushdown implemented (pushable predicates injected into change buffer scan CTE)
-- [ ] G-5 (P3-4): Index-aware MERGE planning: `SET LOCAL enable_seqscan = off` for small deltas against large STs
-- [ ] G-6 (P3-5): `auto_backoff` GUC implemented; scheduler doubles interval when stream table falls behind
+- [x] G-2 (P2-5): `changed_cols` bitmask consumed in delta scan CTE — referenced-column mask filter injected
+- [x] G-3 (P2-6): LATERAL subquery inner-source scoping — **deferred to v0.10.0** (requires correlation predicate extraction from raw SQL; full re-execution is correct)
+- [x] G-4 (P2-7): Delta predicate pushdown implemented (pushable predicates injected into change buffer scan CTE)
+- [x] G-5 (P3-4): Index-aware MERGE planning: `SET LOCAL enable_seqscan = off` for small deltas against large STs
+- [x] G-6 (P3-5): `auto_backoff` GUC implemented; scheduler doubles interval when stream table falls behind
 
 ---
 
-## v0.10.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
+## v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
 
-**Goal:** Enable cloud-native PgBouncer transaction-mode deployments via an opt-in compatibility mode, ship ready-made Prometheus/Grafana monitoring so the product is
-externally visible and monitored; protect against anomalous change spikes
-with a configurable fuse; and complete the pre-1.0 packaging and
-deployment infrastructure.
+**Goal:** Land deferred DVM correctness and performance improvements
+(recursive CTE DRed, FULL OUTER JOIN aggregate fix, LATERAL scoping,
+Welford regression aggregates, multi-source delta merging), enable
+cloud-native PgBouncer transaction-mode deployments via an opt-in
+compatibility mode, ship ready-made Prometheus/Grafana monitoring so the
+product is externally visible and monitored; protect against anomalous
+change spikes with a configurable fuse; and complete the pre-1.0 packaging
+and deployment infrastructure.
 
 ### Connection Pooler Compatibility
 
@@ -1642,7 +1648,31 @@ action.
 
 > **Anomalous change detection subtotal: ~10–14 hours**
 
-> **v0.10.0 total: ~22–26 hours**
+### DVM Correctness & Performance (deferred from v0.9.0)
+
+> **In plain terms:** These items were evaluated during v0.9.0 and deferred
+> because the current implementations are **correct** — they just scale with
+> data size rather than delta size in certain edge cases. All produce correct
+> results today; this work makes them faster.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** DELETE/UPDATE against a recursive CTE source falls back to O(n) full recompute + diff. Implement DRed for `DeltaSource::ChangeBuffer` to maintain O(delta) cost. | 2–3 wk | ⬜ Not started | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
+| P2-2 | **SUM NULL-transition rescan for FULL OUTER JOIN aggregates.** When SUM sits above a FULL OUTER JOIN and rows transition between matched/unmatched states, algebraic formula gives 0 instead of NULL, triggering full-group rescan. Implement targeted correction. | 1–2 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
+| P2-4 | **Materialized view sources in IMMEDIATE mode (EC-09).** Implement polling-change-detection wrapper for `REFRESH MATERIALIZED VIEW`-sourced queries in IMMEDIATE mode. | 2–3 wk | ⬜ Not started | [plans/PLAN_EDGE_CASES.md §EC-09](plans/PLAN_EDGE_CASES.md) |
+| P2-6 | **LATERAL subquery inner-source scoped re-execution.** Gate outer-table scan behind a join to inner delta rows so only correlated outer rows are re-executed, reducing O(\|outer\|) to O(delta). | 1–2 wk | ⬜ Not started | [src/dvm/operators/lateral_subquery.rs](src/dvm/operators/lateral_subquery.rs) |
+| P3-2 | **Welford auxiliary columns for CORR/COVAR/REGR_\* aggregates.** Implement Welford-style accumulation to reach O(1) algebraic maintenance identical to the STDDEV/VAR path. | 2–3 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
+| B3-2 | **Merged-delta weight aggregation.** `GROUP BY __pgt_row_id, SUM(weight)` for cross-source deduplication; remove zero-weight rows. | 3–4 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+| B3-3 | **Property-based correctness tests** for simultaneous multi-source changes; diamond-flow scenarios. Hard prerequisite for B3-2. | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-3](plans/performance/PLAN_NEW_STUFF.md) |
+
+> ⚠️ B3-2 must **not** use `DISTINCT ON` — it silently discards corrections that
+> should be summed. Weight aggregation (`SUM(weight)` grouped by `__pgt_row_id`) is
+> the only correct approach. Do not merge B3-2 without property-based correctness
+> proofs (B3-3).
+
+> **DVM deferred items subtotal: ~12–19 weeks**
+
+> **v0.10.0 total: ~34–48 hours + ~12–19 weeks DVM work**
 
 ### Scheduler & DAG Scalability
 
@@ -1662,6 +1692,13 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [ ] All public documentation current and reviewed
 - [ ] G-7: Tiered scheduling (Hot/Warm/Cold/Frozen) implemented; `pg_trickle.tiered_scheduling` GUC gating the feature
 - [ ] G-8: Incremental DAG rebuild implemented; DDL-triggered edge-delta replaces full O(V+E) re-query
+- [ ] P2-1: Recursive CTE DRed for DIFFERENTIAL mode (O(delta) instead of O(n) recompute)
+- [ ] P2-2: SUM NULL-transition correction for FULL OUTER JOIN aggregates
+- [ ] P2-4: Materialized view sources supported in IMMEDIATE mode
+- [ ] P2-6: LATERAL subquery inner-source scoped re-execution (O(delta) instead of O(|outer|))
+- [ ] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns for O(1) algebraic maintenance
+- [ ] B3-2: Merged-delta weight aggregation passes property-based correctness proofs
+- [ ] B3-3: Property-based tests for simultaneous multi-source changes
 
 ---
 
@@ -1790,8 +1827,6 @@ implementation, and widen the deployment target to PG 16–18.
 > **v0.12.0 total: ~13–19 weeks**
 
 **Exit criteria:**
-- [ ] Intra-query delta-branch pruning: zero-change sources produce no UNION ALL branch
-- [ ] Merged-delta path passes property-based correctness tests for simultaneous multi-source changes
 - [ ] D-2 spike: prototype exists; SPI-in-commit-callback constraint validated; RFC written
 - [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
 - [ ] WAL decoder validated against PG 16–17 `pgoutput` format

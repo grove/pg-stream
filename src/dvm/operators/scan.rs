@@ -21,7 +21,7 @@
 //! eliminating `jsonb_populate_record` overhead.
 
 use crate::dvm::diff::{DeltaSource, DiffContext, DiffResult, quote_ident};
-use crate::dvm::parser::OpTree;
+use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
 
 /// Differentiate a Scan node.
@@ -342,7 +342,30 @@ fn diff_scan_change_buffer(
     //
     // Used to split single-change PKs (fast path, no window functions)
     // from multi-change PKs (require FIRST_VALUE/LAST_VALUE).
-    let lsn_filter = format!("c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn");
+    let mut lsn_filter = format!("c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn");
+
+    // ── P2-5: changed_cols bitmask filter ────────────────────────────
+    //
+    // For PK-based tables with ≤63 columns, the CDC trigger stores a
+    // bitmask in `changed_cols` indicating which columns were modified
+    // by an UPDATE (NULL for INSERT/DELETE). When column pruning has
+    // reduced the referenced column set, we can skip UPDATE rows where
+    // none of the referenced columns actually changed.
+    if !is_keyless
+        && let Some(cdc_cols) = ctx.source_cdc_columns.get(&table_oid)
+        && cdc_cols.len() <= 63
+    {
+        let mask = compute_changed_cols_mask(columns, cdc_cols);
+        // Only add the filter when the mask is a strict subset
+        // (i.e. we pruned at least one column). A full mask
+        // would match every UPDATE row anyway.
+        let full_mask: i64 = (1i64 << cdc_cols.len()) - 1;
+        if mask != 0 && mask != full_mask {
+            lsn_filter.push_str(&format!(
+                " AND (c.changed_cols IS NULL OR (c.changed_cols & {mask}) != 0)"
+            ));
+        }
+    }
 
     // ── EC-06: Keyless net-counting path ─────────────────────────────
     //
@@ -541,6 +564,20 @@ SELECT * FROM {multi_cte}",
     // tables where UPDATE changes ALL columns and thus the hash.
     // INSERT __pgt_row_id uses __pk_hash (from NEW column values).
 
+    // ── P2-7: Build pushed-filter WHERE clauses ──────────────────────
+    //
+    // When a Filter was pushed into this Scan (via DiffContext), inject
+    // the rewritten predicate into the final scan CTE's output branches.
+    // DELETE branch uses `old_` column prefixes, INSERT uses `new_`.
+    let (del_pushed_filter, ins_pushed_filter) =
+        if let Some(ref predicate) = ctx.scan_pushed_predicate {
+            let del = rewrite_predicate_for_scan(predicate, "old_");
+            let ins = rewrite_predicate_for_scan(predicate, "new_");
+            (format!("\nWHERE {del}"), format!("\nWHERE {ins}"))
+        } else {
+            (String::new(), String::new())
+        };
+
     let sql = if ctx.merge_safe_dedup {
         // ── Merge-safe dedup mode ──────────────────────────────────────
         // Emit at most ONE row per PK: DELETE only for true deletes OR
@@ -563,7 +600,7 @@ FROM (
   WHERE s.__first_action != 'I'
     AND (s.__last_action = 'D' OR s.__pk_hash_old != s.__pk_hash)
   ORDER BY s.__pk_hash_old, s.change_id
-) c
+) c{del_pushed_filter}
 
 UNION ALL
 
@@ -577,7 +614,7 @@ FROM (
   FROM {raw_cte_name} s
   WHERE s.__last_action != 'D'
   ORDER BY s.__pk_hash, s.change_id DESC
-) c",
+) c{ins_pushed_filter}",
             old_col_refs = old_col_refs.join(",\n       "),
             new_col_refs = new_col_refs.join(",\n       "),
         )
@@ -600,7 +637,7 @@ FROM (
   FROM {raw_cte_name} s
   WHERE s.action != 'I' AND s.__first_action != 'I'
   ORDER BY s.__pk_hash, s.change_id
-) c
+) c{del_pushed_filter}
 
 UNION ALL
 
@@ -615,7 +652,7 @@ FROM (
   FROM {raw_cte_name} s
   WHERE s.action != 'D' AND s.__last_action != 'D'
   ORDER BY s.__pk_hash, s.change_id DESC
-) c",
+) c{ins_pushed_filter}",
             old_col_refs = old_col_refs.join(",\n       "),
             new_col_refs = new_col_refs.join(",\n       "),
         )
@@ -642,6 +679,90 @@ fn find_pk_columns(pk_columns: &[String], columns: &[crate::dvm::parser::Column]
     }
     // Keyless table: use all columns (matches CDC trigger all-column hash).
     columns.iter().map(|c| c.name.clone()).collect()
+}
+
+/// P2-5: Compute a `changed_cols` bitmask from pruned Scan columns.
+///
+/// For each column in `scan_columns` (the pruned set), finds its index in
+/// `cdc_columns` (the full CDC column list ordered by `attnum`) and sets
+/// the corresponding bit. The resulting mask can be ANDed with the trigger's
+/// `changed_cols` value to determine if any referenced column changed.
+///
+/// Returns 0 if no columns could be mapped (should not happen in practice).
+fn compute_changed_cols_mask(
+    scan_columns: &[crate::dvm::parser::Column],
+    cdc_columns: &[String],
+) -> i64 {
+    let mut mask: i64 = 0;
+    for col in scan_columns {
+        if let Some(idx) = cdc_columns.iter().position(|c| c == &col.name) {
+            mask |= 1i64 << idx;
+        }
+    }
+    mask
+}
+
+// ── P2-7: Predicate pushdown helpers ────────────────────────────────────
+
+/// Check whether a predicate can be pushed into a Scan's final CTE.
+///
+/// A predicate is pushable when every column reference resolves to a column
+/// in `scan_columns` (identified by the scan's alias or unqualified), and
+/// the expression contains no `Raw` or `Star` nodes (which can't be
+/// reliably rewritten to use `old_`/`new_` column prefixes).
+pub fn is_predicate_pushable_to_scan(
+    expr: &Expr,
+    scan_alias: &str,
+    scan_col_names: &[String],
+) -> bool {
+    match expr {
+        Expr::ColumnRef {
+            table_alias,
+            column_name,
+        } => match table_alias {
+            Some(alias) if alias == scan_alias => scan_col_names.contains(column_name),
+            None => scan_col_names.contains(column_name),
+            _ => false,
+        },
+        Expr::Literal(_) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            is_predicate_pushable_to_scan(left, scan_alias, scan_col_names)
+                && is_predicate_pushable_to_scan(right, scan_alias, scan_col_names)
+        }
+        Expr::FuncCall { args, .. } => args
+            .iter()
+            .all(|a| is_predicate_pushable_to_scan(a, scan_alias, scan_col_names)),
+        Expr::Raw(_) | Expr::Star { .. } => false,
+    }
+}
+
+/// Rewrite a predicate expression for use in a change buffer scan CTE.
+///
+/// Each `ColumnRef` is mapped to `c."<prefix><column_name>"` where
+/// `prefix` is `"old_"` for the DELETE branch or `"new_"` for the
+/// INSERT branch.
+pub fn rewrite_predicate_for_scan(expr: &Expr, prefix: &str) -> String {
+    match expr {
+        Expr::ColumnRef { column_name, .. } => {
+            format!("c.\"{}{}\"", prefix, column_name.replace('"', "\"\""))
+        }
+        Expr::Literal(val) => val.clone(),
+        Expr::BinaryOp { op, left, right } => {
+            format!(
+                "({} {op} {})",
+                rewrite_predicate_for_scan(left, prefix),
+                rewrite_predicate_for_scan(right, prefix),
+            )
+        }
+        Expr::FuncCall { func_name, args } => {
+            let rewritten: Vec<String> = args
+                .iter()
+                .map(|a| rewrite_predicate_for_scan(a, prefix))
+                .collect();
+            format!("{func_name}({})", rewritten.join(", "))
+        }
+        _ => expr.to_sql(),
+    }
 }
 
 /// Build a hash expression from a list of SQL expressions.
@@ -1079,5 +1200,241 @@ mod tests {
         // Should use MAX() to aggregate column values (identical rows
         // have the same content, so MAX picks the correct value).
         assert_sql_contains(&sql, "MAX(");
+    }
+
+    // ── P2-5: changed_cols bitmask ──────────────────────────────────
+
+    #[test]
+    fn test_compute_changed_cols_mask_basic() {
+        use crate::dvm::parser::Column;
+        let cdc_cols = vec!["id".into(), "name".into(), "amount".into(), "region".into()];
+        // Pruned: only "id" and "amount" are referenced.
+        let scan_cols = vec![
+            Column {
+                name: "id".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+            Column {
+                name: "amount".into(),
+                type_oid: 23,
+                is_nullable: true,
+            },
+        ];
+        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
+        // id=bit0, amount=bit2 → mask = 0b0101 = 5
+        assert_eq!(mask, 5);
+    }
+
+    #[test]
+    fn test_compute_changed_cols_mask_all_columns() {
+        use crate::dvm::parser::Column;
+        let cdc_cols = vec!["a".into(), "b".into(), "c".into()];
+        let scan_cols = vec![
+            Column {
+                name: "a".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+            Column {
+                name: "b".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+            Column {
+                name: "c".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+        ];
+        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
+        // All columns → mask = 0b111 = 7 = (1 << 3) - 1
+        assert_eq!(mask, 7);
+    }
+
+    #[test]
+    fn test_compute_changed_cols_mask_single_column() {
+        use crate::dvm::parser::Column;
+        let cdc_cols = vec!["id".into(), "name".into(), "status".into()];
+        let scan_cols = vec![Column {
+            name: "status".into(),
+            type_oid: 25,
+            is_nullable: true,
+        }];
+        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
+        // status=bit2 → mask = 0b100 = 4
+        assert_eq!(mask, 4);
+    }
+
+    #[test]
+    fn test_p2_5_bitmask_filter_in_sql() {
+        // When source_cdc_columns is populated and columns are pruned,
+        // the generated SQL should contain a changed_cols bitmask filter.
+        let mut ctx = test_ctx();
+        ctx.source_cdc_columns.insert(
+            100,
+            vec!["id".into(), "name".into(), "amount".into(), "region".into()],
+        );
+        // Scan only references "id" and "amount" (2 of 4 columns).
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should have the bitmask filter: mask = 1|4 = 5
+        assert_sql_contains(&sql, "c.changed_cols IS NULL OR (c.changed_cols & 5) != 0");
+    }
+
+    #[test]
+    fn test_p2_5_bitmask_filter_skipped_when_all_columns() {
+        // When all CDC columns are referenced, no bitmask filter is added.
+        let mut ctx = test_ctx();
+        ctx.source_cdc_columns
+            .insert(100, vec!["id".into(), "amount".into()]);
+        // Scan references ALL CDC columns.
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "amount"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should NOT have a changed_cols filter
+        assert!(!sql.contains("changed_cols"));
+    }
+
+    #[test]
+    fn test_p2_5_bitmask_filter_skipped_for_keyless() {
+        // Keyless tables should not get a changed_cols filter.
+        let mut ctx = test_ctx();
+        ctx.source_cdc_columns
+            .insert(100, vec!["id".into(), "name".into(), "amount".into()]);
+        // Keyless scan (no pk_columns).
+        let tree = scan(100, "orders", "public", "o", &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Should NOT have a changed_cols filter
+        assert!(!sql.contains("changed_cols"));
+    }
+
+    // ── P2-7: predicate pushdown ────────────────────────────────────
+
+    #[test]
+    fn test_is_predicate_pushable_column_ref_qualified() {
+        let cols = vec!["id".into(), "status".into()];
+        let expr = Expr::BinaryOp {
+            op: "=".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".into()),
+                column_name: "status".into(),
+            }),
+            right: Box::new(Expr::Literal("'shipped'".into())),
+        };
+        assert!(is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_is_predicate_pushable_unqualified() {
+        let cols = vec!["id".into(), "amount".into()];
+        let expr = Expr::BinaryOp {
+            op: ">".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: None,
+                column_name: "amount".into(),
+            }),
+            right: Box::new(Expr::Literal("100".into())),
+        };
+        assert!(is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_is_predicate_not_pushable_wrong_alias() {
+        let cols = vec!["id".into()];
+        let expr = Expr::ColumnRef {
+            table_alias: Some("other".into()),
+            column_name: "id".into(),
+        };
+        assert!(!is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_is_predicate_not_pushable_raw() {
+        let cols = vec!["id".into()];
+        let expr = Expr::Raw("id > 5".into());
+        assert!(!is_predicate_pushable_to_scan(&expr, "o", &cols));
+    }
+
+    #[test]
+    fn test_rewrite_predicate_for_scan_old() {
+        let expr = Expr::BinaryOp {
+            op: "=".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: Some("o".into()),
+                column_name: "status".into(),
+            }),
+            right: Box::new(Expr::Literal("'shipped'".into())),
+        };
+        let sql = rewrite_predicate_for_scan(&expr, "old_");
+        assert_eq!(sql, "(c.\"old_status\" = 'shipped')");
+    }
+
+    #[test]
+    fn test_rewrite_predicate_for_scan_new() {
+        let expr = Expr::BinaryOp {
+            op: "AND".into(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".into(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "status".into(),
+                }),
+                right: Box::new(Expr::Literal("'shipped'".into())),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: ">".into(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: None,
+                    column_name: "amount".into(),
+                }),
+                right: Box::new(Expr::Literal("100".into())),
+            }),
+        };
+        let sql = rewrite_predicate_for_scan(&expr, "new_");
+        assert_eq!(
+            sql,
+            "((c.\"new_status\" = 'shipped') AND (c.\"new_amount\" > 100))"
+        );
+    }
+
+    #[test]
+    fn test_p2_7_pushed_filter_in_sql() {
+        // When a predicate is pushed, the scan CTE should contain
+        // old_/new_ column filters.
+        let mut ctx = test_ctx();
+        ctx.scan_pushed_predicate = Some(Expr::BinaryOp {
+            op: "=".into(),
+            left: Box::new(Expr::ColumnRef {
+                table_alias: None,
+                column_name: "status".into(),
+            }),
+            right: Box::new(Expr::Literal("'shipped'".into())),
+        });
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "status"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // DELETE branch should filter on old_status
+        assert_sql_contains(&sql, "c.\"old_status\" = 'shipped'");
+        // INSERT branch should filter on new_status
+        assert_sql_contains(&sql, "c.\"new_status\" = 'shipped'");
+    }
+
+    #[test]
+    fn test_p2_7_no_pushed_filter_without_predicate() {
+        // Without a pushed predicate, no old_/new_ filter clauses.
+        let mut ctx = test_ctx();
+        let tree = scan_with_pk(100, "orders", "public", "o", &["id", "status"], &["id"]);
+        let result = diff_scan(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        assert!(!sql.contains("old_status\" ="));
+        assert!(!sql.contains("new_status\" ="));
     }
 }

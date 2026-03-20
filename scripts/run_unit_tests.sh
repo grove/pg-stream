@@ -87,50 +87,23 @@ cd "$PROJECT_DIR"
 
 ensure_stub
 
-# Compile test binary without running it and capture the executable path.
-if command -v cargo-nextest >/dev/null 2>&1; then
+# Unit tests are pure Rust and complete in < 1 s.  The standard `cargo test`
+# runner executes all tests inside a **single process** (threaded), so the
+# ~1.8 s per-process startup overhead of nextest (which spawns a new process
+# for every test) is avoided entirely.  With ~1 400 tests this makes the
+# difference between sub-second and multi-minute runs.
+#
+# Pass USE_NEXTEST=1 to force nextest (e.g. for filter expressions or CI
+# retry support):
+#   USE_NEXTEST=1 ./scripts/run_unit_tests.sh pg18 -E 'test(foo)'
+
+if [[ "${USE_NEXTEST:-0}" == "1" ]] && command -v cargo-nextest >/dev/null 2>&1; then
     echo "Running with cargo-nextest (with $(basename "$STUB_LIB"))"
     export "$PRELOAD_VAR"="$STUB_LIB"
     cargo nextest run --lib --features "$FEATURES" "${@:2}"
     exit $?
 fi
 
-echo "Compiling unit tests ..."
-CARGO_OUTPUT=$(cargo test --lib --features "$FEATURES" --no-run 2>&1)
-echo "$CARGO_OUTPUT"
-
-# Extract the binary path from cargo output.
-# cargo prints: "Executable unittests src/lib.rs (target/debug/deps/pg_trickle-HASH)"
-TEST_BIN=$(echo "$CARGO_OUTPUT" \
-           | grep -oE 'target/debug/deps/pg_trickle-[a-f0-9]+' \
-           | head -1)
-
-if [[ -n "$TEST_BIN" ]]; then
-    TEST_BIN="$CARGO_TARGET_DIR/${TEST_BIN#target/}"
-fi
-
-if [[ -z "${TEST_BIN:-}" ]] || [[ ! -x "$TEST_BIN" ]]; then
-    # Fallback: pick the newest executable pg_trickle- binary
-    if [[ "$OS" == "Darwin" ]]; then
-        TEST_BIN=$(find "$CARGO_TARGET_DIR/debug/deps" \
-                        -maxdepth 1 -name 'pg_trickle-*' -type f -perm +111 \
-                        2>/dev/null \
-                   | xargs ls -t 2>/dev/null \
-                   | head -1)
-    else
-        TEST_BIN=$(find "$CARGO_TARGET_DIR/debug/deps" \
-                        -maxdepth 1 -name 'pg_trickle-*' -type f -executable \
-                        2>/dev/null \
-                   | xargs ls -t 2>/dev/null \
-                   | head -1)
-    fi
-fi
-
-if [[ -z "${TEST_BIN:-}" ]]; then
-    echo "ERROR: Could not find the test binary in $CARGO_TARGET_DIR/debug/deps/" >&2
-    exit 1
-fi
-
-echo "Running: $(basename "$TEST_BIN") (with $(basename "$STUB_LIB"))"
+echo "Running unit tests with cargo test (with $(basename "$STUB_LIB"))"
 export "$PRELOAD_VAR"="$STUB_LIB"
-"$TEST_BIN" "${@:2}"
+cargo test --lib --features "$FEATURES" "${@:2}"

@@ -8,7 +8,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [Unreleased](#unreleased)
+- [0.9.0 — 2026-03-20](#090--2026-03-20)
 - [0.8.0 — 2026-03-17](#080--2026-03-17)
 - [0.7.0 — 2026-03-16](#070--2026-03-16)
 - [0.6.0 — 2026-03-14](#060--2026-03-14)
@@ -27,25 +27,128 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [Unreleased]
+## [0.9.0] — 2026-03-20
 
-### Fixed
-- **Backend crash on SPI error in `source_gates()` and `watermarks()`** (G-1): Both SQL-callable
-  functions previously reached `panic!()` on any SPI failure, which crashes the PostgreSQL backend
-  process. Replaced with `pgrx::error!()` so failures surface as a normal PostgreSQL `ERROR`
-  without terminating the backend.
+The headline feature of 0.9.0 is **incremental aggregate maintenance**: when a
+single row changes inside a group of 100,000 rows, pg_trickle no longer has to
+re-scan all 100,000 rows to update COUNT, SUM, AVG, STDDEV, or VAR results.
+Instead it keeps running totals and adjusts them in constant time. Only MIN/MAX
+still needs a rescan — and only when the deleted value happens to be the current
+extreme.
+
+Beyond aggregates, this release contains a broad set of performance
+optimizations that reduce wasted I/O during every refresh cycle, two new
+configuration knobs, a refresh-group management API, and several bug fixes.
+
+### Faster Aggregates
+
+- **Constant-time COUNT, SUM, AVG**: Changed rows are now applied
+  algebraically (`new_sum = old_sum + inserted − deleted`) instead of
+  re-aggregating the whole group.  AVG uses hidden auxiliary SUM and COUNT
+  columns maintained automatically on the stream table.
+- **Constant-time STDDEV and VAR**: Standard-deviation and variance
+  aggregates (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`) now
+  use a sum-of-squares decomposition with a hidden auxiliary column,
+  achieving the same constant-time update as COUNT/SUM/AVG.
+- **MIN/MAX safety guard**: Deleting the row that currently holds the
+  minimum (or maximum) value correctly triggers a rescan of that group.
+  Property-based tests verify this boundary.
+- **Floating-point drift reset**: A new setting
+  (`pg_trickle.algebraic_drift_reset_cycles`) periodically forces a full
+  recomputation to correct any floating-point rounding drift that
+  accumulates over many incremental cycles.
+
+### Smarter Refresh Scheduling
+
+- **Automatic backoff for overloaded streams**: Enable
+  `pg_trickle.auto_backoff` (default off) and the scheduler will
+  automatically slow down any stream table that consistently can't keep
+  up with its schedule.  The interval doubles each cycle (up to 64×) and
+  resets the moment the stream catches up.
+- **Index-aware MERGE**: A new threshold setting
+  (`pg_trickle.merge_seqscan_threshold`, default 0.001) tells PostgreSQL
+  to use an index lookup instead of a full table scan when only a tiny
+  fraction of the stream table's rows are changing.
+
+### Less Wasted I/O
+
+- **Skip unchanged columns**: The scan operator now checks the CDC
+  trigger's per-row bitmask to skip UPDATE rows where none of the columns
+  your query actually uses were modified.  For wide tables where you only
+  reference a few columns, most UPDATE processing is eliminated.
+- **Skip unchanged sources in joins**: When a multi-source join query has
+  three source tables but only one of them changed, the delta branches for
+  the two unchanged sources are now replaced with `FALSE` at plan time.
+  PostgreSQL's planner recognises those branches as empty and skips them
+  entirely.
+- **Push WHERE filters into the change scan**: If your stream table's
+  defining query has a WHERE clause (e.g. `WHERE status = 'shipped'`),
+  that filter is now applied immediately after reading the change buffer
+  — before rows enter the join or aggregate pipeline.  Rows that don't
+  match the filter are discarded right away.
+- **Faster DISTINCT counting**: The per-row multiplicity lookup for
+  `SELECT DISTINCT` queries now uses an index-driven scalar subquery
+  instead of a LEFT JOIN, guaranteeing I/O proportional to the number of
+  changed rows regardless of stream table size.
+- **Scalar subquery short-circuit**: When a scalar subquery's inner source
+  has no changes in the current cycle, the expensive outer-table snapshot
+  reconstruction is skipped entirely.
+
+### Refresh Group Management
+
+- **New SQL functions** for grouping stream tables that should always be
+  refreshed together (cross-source snapshot consistency):
+  - `pgtrickle.create_refresh_group(name, members, isolation)`
+  - `pgtrickle.drop_refresh_group(name)`
+  - `pgtrickle.refresh_groups()` — lists all declared groups.
+
+### Bug Fixes
+
+- **Fixed a crash when internal status queries failed**: The
+  `source_gates()` and `watermarks()` SQL functions previously crashed the
+  entire PostgreSQL backend process on any internal error.  They now report
+  a normal SQL error instead.
+- **Clearer handling of window functions in expressions**: Queries like
+  `CASE WHEN ROW_NUMBER() OVER (...) > 5 THEN ...` were silently accepted
+  but failed at refresh time with a confusing error.  pg_trickle now
+  automatically falls back to full refresh mode (in AUTO mode) or warns
+  you at creation time (in explicit DIFFERENTIAL mode).
 
 ### Documentation
-- **Recursive CTE DIFFERENTIAL mode limitation** (D1): Corrected [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md)
-  and [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) — the DRed (Delete-and-Rederive) algorithm
-  is only active in `IMMEDIATE` mode. In `DIFFERENTIAL` mode, any cycle with DELETE or UPDATE
-  changes against a recursive CTE source falls back to full recomputation (Strategy 3). The
-  documentation previously implied DRed ran in DIFFERENTIAL mode. A "Known Limitation" callout
-  and updated Strategy Selection table now make this explicit, including the recommended
-  workaround (`refresh_mode = 'IMMEDIATE'`).
-- **`pgt_refresh_groups` catalog table** (D2): Added table schema, column descriptions, and
-  an interim manual INSERT/DELETE workflow to [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md).
-  The user-facing API functions (A8) are not yet implemented.
+
+- Documented the known limitation that recursive CTE stream tables in
+  DIFFERENTIAL mode fall back to full recomputation when rows are deleted
+  or updated.  Workaround: use `refresh_mode = 'IMMEDIATE'`.
+- Documented the `pgt_refresh_groups` catalog table schema and usage.
+- Documented the O(partition_size) cost of window function maintenance with
+  mitigation strategies.
+
+### Deferred to v0.10.0
+
+The following performance optimizations were evaluated and explicitly deferred.
+In every case the current behaviour is **correct** — these items would make
+certain workloads faster but carry enough implementation risk that they need
+more design work first:
+- Recursive CTE incremental delete/update in DIFFERENTIAL mode (P2-1)
+- SUM NULL-transition shortcut for FULL OUTER JOIN aggregates (P2-2)
+- Materialized view sources in IMMEDIATE mode (P2-4)
+- LATERAL subquery scoped re-execution (P2-6)
+- Welford auxiliary columns for CORR/COVAR/REGR_* aggregates (P3-2)
+- Merged-delta weight aggregation for multi-source deduplication (B3-2/B3-3)
+
+### Upgrade Notes
+
+- **New SQL objects**: The `0.8.0 → 0.9.0` upgrade migration adds the
+  `pgt_refresh_groups` table and the `restore_stream_tables` function.
+  Run `ALTER EXTENSION pg_trickle UPDATE TO '0.9.0'` after replacing the
+  extension files.
+- **Hidden auxiliary columns**: Stream tables using AVG, STDDEV, or VAR
+  aggregates will automatically get hidden `__pgt_aux_*` columns when
+  created or altered.  These columns are invisible to normal queries
+  (filtered by the existing `NOT LIKE '__pgt_%'` convention) and are
+  managed automatically.
+- **PGXN publishing**: Release artifacts are now automatically uploaded to
+  PGXN via GitHub Actions.
 
 ---
 

@@ -2459,29 +2459,28 @@ taken at the same point in time, preventing partial-update visibility (e.g.
 | `isolation` | `text` | Snapshot isolation level for the group: `'read_committed'` (default) or `'repeatable_read'` |
 | `created_at` | `timestamptz` | When the group was created |
 
-> **Note:** The user-facing SQL API functions (`pgt_add_refresh_group()`,
-> `pgt_remove_refresh_group()`, `pgt_list_refresh_groups()`) are tracked as
-> item A8 in the v0.9.0 roadmap and are not yet implemented. In the interim,
-> rows can be managed directly:
+#### Management API
 
 ```sql
--- Declare a consistency group so that orders_summary and
--- order_lines_summary are always refreshed from the same snapshot.
-INSERT INTO pgtrickle.pgt_refresh_groups (group_name, member_oids, isolation)
-SELECT
+-- Create a refresh group
+SELECT pgtrickle.create_refresh_group(
     'orders_snapshot',
-    ARRAY[
-        (SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'orders_summary'),
-        (SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'order_lines_summary')
-    ],
-    'repeatable_read';
+    ARRAY['public.orders_summary', 'public.order_lines_summary'],
+    'repeatable_read'   -- or 'read_committed' (default)
+);
 
 -- List all groups:
-SELECT group_name, member_oids, isolation FROM pgtrickle.pgt_refresh_groups;
+SELECT * FROM pgtrickle.refresh_groups();
 
 -- Remove a group:
-DELETE FROM pgtrickle.pgt_refresh_groups WHERE group_name = 'orders_snapshot';
+SELECT pgtrickle.drop_refresh_group('orders_snapshot');
 ```
+
+**Validation rules:**
+- At least 2 member stream tables are required.
+- All members must exist in `pgt_stream_tables`.
+- No member can appear in more than one refresh group.
+- Valid isolation levels: `'read_committed'` (default), `'repeatable_read'`.
 
 ---
 

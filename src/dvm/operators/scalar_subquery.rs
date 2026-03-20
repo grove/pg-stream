@@ -164,8 +164,20 @@ pub fn diff_scalar_subquery(
         .collect::<Vec<_>>()
         .join(", ");
 
+    // P3-3: Gate C₀ computation behind inner delta existence check.
+    // Add a helper CTE evaluated once that checks if the inner subquery
+    // delta has any rows. Use it to guard the full outer snapshot scan
+    // so the EXCEPT ALL is skipped entirely when the inner source is stable.
+    let gate_cte = ctx.next_cte_name("sq_gate");
+    let gate_sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM {delta_sq}) AS has_changes",
+        delta_sq = subquery_result.cte_name,
+    );
+    ctx.add_cte(gate_cte.clone(), gate_sql);
+
     let child_old_snapshot = format!(
         "(SELECT {child_data_cols} FROM {child_table} __cs_inner \
+         WHERE (SELECT has_changes FROM {gate_cte}) \
          EXCEPT ALL \
          SELECT {child_data_cols} FROM {delta_child} WHERE __pgt_action = 'I' \
          UNION ALL \
@@ -190,7 +202,7 @@ SELECT {hash_child} AS __pgt_row_id,
        {cs_cols},
        {scalar_old_sql} AS {alias_ident}
 FROM {child_old_snapshot} cs
-WHERE EXISTS (SELECT 1 FROM {delta_subquery} WHERE 1=1)
+WHERE (SELECT has_changes FROM {gate_cte})
   AND {scalar_sql} IS DISTINCT FROM {scalar_old_sql}
 
 UNION ALL
@@ -201,14 +213,13 @@ SELECT {hash_child} AS __pgt_row_id,
        {cs_cols},
        {scalar_sql} AS {alias_ident}
 FROM {child_old_snapshot} cs
-WHERE EXISTS (SELECT 1 FROM {delta_subquery} WHERE 1=1)
+WHERE (SELECT has_changes FROM {gate_cte})
   AND {scalar_sql} IS DISTINCT FROM {scalar_old_sql}",
         dc_cols = dc_col_refs.join(", "),
         cs_cols = cs_col_refs.join(", "),
         alias_ident = quote_ident(alias),
         hash_delta_child = hash_delta_child,
         delta_child = child_result.cte_name,
-        delta_subquery = subquery_result.cte_name,
     );
 
     ctx.add_cte(cte_name.clone(), sql);

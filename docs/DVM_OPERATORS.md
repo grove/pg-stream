@@ -680,6 +680,24 @@ SELECT 'I' AS __pgt_action, ...  -- recomputed rows
 - Window functions wrapping aggregates (e.g., `RANK() OVER (ORDER BY SUM(x))`) are supported: the window diff rewrites ORDER BY / PARTITION BY expressions to reference aggregate output aliases via `build_agg_alias_map`.
 - Row IDs are computed from the full row content (`row_to_json`) plus a positional disambiguator (`row_number`) to avoid hash collisions with tied ranking values (DENSE_RANK, RANK).
 
+> **Known Limitation: O(partition_size) Recomputation Cost**
+>
+> Any single-row change within a window partition triggers recomputation of the *entire* partition.
+> For queries with large partitions (e.g., `PARTITION BY region` where a region has 500K rows),
+> a single INSERT into that partition causes all 500K rows to be recomputed and diffed. This is
+> inherent to the partition-based delta strategy — window functions cannot be incrementally
+> maintained at sub-partition granularity because a single row insertion can shift the rank,
+> row number, or running aggregate of every other row in the same partition.
+>
+> **Mitigation strategies:**
+> - Use more granular `PARTITION BY` keys to keep partition sizes small.
+> - For queries without `PARTITION BY`, consider restructuring as a `GROUP BY` aggregate
+>   if the window function is equivalent (e.g., `SUM(x) OVER ()` → `SUM(x)` as a scalar subquery).
+> - Accept the cost for low-change-frequency partitions; the recomputation is still
+>   cheaper than a full table refresh since only *affected* partitions are touched.
+> - If partition sizes routinely exceed 100K rows and changes are frequent, consider
+>   the FULL refresh mode which bypasses the per-partition delta entirely.
+
 **Window Frame Clauses:**
 
 Window frame specifications are fully supported:

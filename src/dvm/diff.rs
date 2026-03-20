@@ -135,6 +135,23 @@ pub struct DiffContext {
     /// HAVING threshold (absent from the ST) and are now crossing it upward.
     /// Reset to `false` after the child diff returns.
     pub having_filter: bool,
+    /// P2-5: CDC column names per source table, ordered by `attnum`.
+    ///
+    /// Maps `table_oid` → ordered CDC column names (from
+    /// `resolve_referenced_column_defs`). The index in this Vec corresponds
+    /// to the bit position in the `changed_cols` bitmask stored by the CDC
+    /// trigger. Used by `diff_scan_change_buffer` to build a bitmask filter
+    /// that skips UPDATE rows where none of the referenced columns changed.
+    pub source_cdc_columns: HashMap<u32, Vec<String>>,
+    /// P2-7: Predicate pushed down from a Filter node into the Scan.
+    ///
+    /// When a Filter sits directly above a Scan and the predicate only
+    /// references columns from that Scan, `diff_filter` stores the
+    /// predicate here instead of generating a separate filter CTE.
+    /// `diff_scan_change_buffer` consumes it by injecting rewritten
+    /// `WHERE c."old_col" ...` / `c."new_col" ...` clauses into the
+    /// final scan CTE's DELETE/INSERT branches.
+    pub scan_pushed_predicate: Option<crate::dvm::parser::Expr>,
 }
 
 impl DiffContext {
@@ -159,6 +176,8 @@ impl DiffContext {
             delta_source: DeltaSource::ChangeBuffer,
             st_column_alias_map: None,
             having_filter: false,
+            source_cdc_columns: HashMap::new(),
+            scan_pushed_predicate: None,
         }
     }
 
@@ -186,6 +205,8 @@ impl DiffContext {
             delta_source: DeltaSource::ChangeBuffer,
             st_column_alias_map: None,
             having_filter: false,
+            source_cdc_columns: HashMap::new(),
+            scan_pushed_predicate: None,
         }
     }
 
@@ -689,7 +710,13 @@ mod tests {
         let pred = binop(">", colref("val"), lit("10"));
         let f = filter(pred, s);
         let result = ctx.diff_node(&f).unwrap();
-        assert!(result.cte_name.contains("filter"));
+        // P2-7: predicate is pushed into the scan CTE, so the result
+        // comes from the scan operator rather than a separate filter CTE.
+        assert!(
+            result.cte_name.contains("scan") || result.cte_name.contains("filter"),
+            "expected scan (pushdown) or filter CTE, got: {}",
+            result.cte_name,
+        );
     }
 
     #[test]

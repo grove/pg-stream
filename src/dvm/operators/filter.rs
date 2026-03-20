@@ -10,7 +10,7 @@
 //! will have its DELETE (old values) filtered out and its INSERT (new values)
 //! kept — net result: INSERT into the ST. The converse is also correct.
 
-use crate::dvm::diff::{DiffContext, DiffResult, quote_ident};
+use crate::dvm::diff::{DeltaSource, DiffContext, DiffResult, quote_ident};
 use crate::dvm::parser::{Expr, OpTree};
 use crate::error::PgTrickleError;
 
@@ -26,6 +26,37 @@ pub fn diff_filter(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, PgT
     // the child, so diff_aggregate can build a full-rescan CTE for groups
     // that cross the HAVING threshold from below.
     let is_having = matches!(child.as_ref(), OpTree::Aggregate { .. });
+
+    // ── P2-7: Predicate pushdown into Scan ───────────────────────────
+    //
+    // When the child is a PK-based Scan in ChangeBuffer mode and the
+    // predicate only references columns from that Scan, push the predicate
+    // into the Scan's final CTE instead of wrapping it in a separate
+    // Filter CTE. This reduces the number of rows entering the
+    // join/aggregate pipeline.
+    //
+    // Not applicable for: HAVING filters, keyless tables, TransitionTable
+    // mode, predicates with Raw/Star nodes or cross-table references.
+    if !is_having
+        && let OpTree::Scan {
+            columns,
+            pk_columns,
+            alias,
+            ..
+        } = child.as_ref()
+        && !pk_columns.is_empty()
+        && matches!(ctx.delta_source, DeltaSource::ChangeBuffer)
+    {
+        let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        if crate::dvm::operators::scan::is_predicate_pushable_to_scan(predicate, alias, &col_names)
+        {
+            ctx.scan_pushed_predicate = Some(predicate.clone());
+            let result = ctx.diff_node(child)?;
+            ctx.scan_pushed_predicate = None;
+            return Ok(result);
+        }
+    }
+
     let prev_having_filter = ctx.having_filter;
     if is_having {
         ctx.having_filter = true;
@@ -498,12 +529,11 @@ mod tests {
         let result = diff_filter(&mut ctx, &tree).unwrap();
         let _sql = ctx.build_with_query(&result.cte_name);
 
-        // No dedup CTE should be added — child is already deduplicated
-        assert!(!result.cte_name.contains("filter_dedup"));
-        assert!(result.is_deduplicated);
-        // CTE name should be plain filter, not filter_dedup
-        assert!(result.cte_name.contains("filter"));
+        // P2-7: predicate is pushed into the scan CTE for PK-based tables
+        // in ChangeBuffer mode, so the result comes from the scan operator.
+        // No dedup CTE should be added — child is already deduplicated.
         assert!(!result.cte_name.contains("dedup"));
+        assert!(result.is_deduplicated);
     }
 
     #[test]
@@ -552,5 +582,68 @@ mod tests {
         let tree = scan(1, "t", "public", "t", &["id"]);
         let result = diff_filter(&mut ctx, &tree);
         assert!(result.is_err());
+    }
+
+    // ── P2-7: predicate pushdown tests ──────────────────────────────
+
+    #[test]
+    fn test_p2_7_filter_pushdown_into_scan() {
+        // Filter with a simple ColumnRef predicate over a PK-based Scan
+        // should be pushed into the scan CTE (no separate filter CTE).
+        let mut ctx = test_ctx();
+        let child = scan_with_pk(1, "orders", "public", "o", &["id", "status"], &["id"]);
+        let tree = filter(
+            binop(
+                "=",
+                Expr::ColumnRef {
+                    table_alias: Some("o".into()),
+                    column_name: "status".into(),
+                },
+                lit("'shipped'"),
+            ),
+            child,
+        );
+        let result = diff_filter(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // The scan CTE should contain pushed filter with old_/new_ prefixes
+        assert_sql_contains(&sql, "old_status");
+        assert_sql_contains(&sql, "new_status");
+        // No separate filter CTE should exist
+        assert!(!result.cte_name.contains("filter"));
+    }
+
+    #[test]
+    fn test_p2_7_no_pushdown_for_keyless_scan() {
+        // Keyless scans (no pk_columns) should NOT get predicate pushdown.
+        let mut ctx = test_ctx();
+        let child = scan(1, "orders", "public", "o", &["id", "status"]);
+        let tree = filter(
+            binop(
+                "=",
+                Expr::ColumnRef {
+                    table_alias: Some("o".into()),
+                    column_name: "status".into(),
+                },
+                lit("'shipped'"),
+            ),
+            child,
+        );
+        let result = diff_filter(&mut ctx, &tree).unwrap();
+
+        // Should have a separate filter CTE (no pushdown)
+        assert!(result.cte_name.contains("filter"));
+    }
+
+    #[test]
+    fn test_p2_7_no_pushdown_for_raw_predicate() {
+        // Raw predicates can't be rewritten → should not be pushed.
+        let mut ctx = test_ctx();
+        let child = scan_with_pk(1, "t", "public", "t", &["id"], &["id"]);
+        let tree = filter(Expr::Raw("id > 5".into()), child);
+        let result = diff_filter(&mut ctx, &tree).unwrap();
+
+        // Should have a separate filter CTE (no pushdown)
+        assert!(result.cte_name.contains("filter"));
     }
 }

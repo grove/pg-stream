@@ -259,6 +259,11 @@ pub fn generate_delta_query(
     ctx.st_user_columns = Some(st_user_cols);
     ctx.merge_safe_dedup = is_scan_chain;
     ctx.st_has_pgt_count = has_pgt_count;
+
+    // P2-5: Resolve CDC column ordinals for each source table so the
+    // scan operator can build a changed_cols bitmask filter.
+    ctx.source_cdc_columns = resolve_cdc_columns_for_sources(&source_oids);
+
     let (delta_sql, output_columns, diff_dedup) = ctx.differentiate_with_columns(&result.tree)?;
 
     Ok(DeltaQueryResult {
@@ -347,6 +352,10 @@ pub fn generate_delta_query_cached(
     ctx.st_user_columns = Some(st_user_cols);
     ctx.merge_safe_dedup = is_scan_chain;
     ctx.st_has_pgt_count = has_pgt_count;
+
+    // P2-5: Resolve CDC column ordinals for bitmask filter.
+    ctx.source_cdc_columns = resolve_cdc_columns_for_sources(&source_oids);
+
     let (template_sql, output_columns, diff_dedup) =
         ctx.differentiate_with_columns(&result.tree)?;
 
@@ -372,6 +381,23 @@ pub fn generate_delta_query_cached(
         source_oids,
         is_deduplicated: diff_dedup,
     })
+}
+
+/// P2-5: Resolve CDC column names for each source table OID.
+///
+/// Returns a map from `table_oid` → ordered CDC column names. The index
+/// in the Vec corresponds to the bit position in the `changed_cols`
+/// bitmask stored by the CDC trigger. If resolution fails for a source
+/// (e.g. the table was dropped), that OID is simply omitted — the scan
+/// operator will skip the bitmask filter for that source.
+fn resolve_cdc_columns_for_sources(source_oids: &[u32]) -> HashMap<u32, Vec<String>> {
+    let mut map = HashMap::new();
+    for &oid in source_oids {
+        if let Ok(cols) = crate::cdc::resolve_referenced_column_defs(pgrx::pg_sys::Oid::from(oid)) {
+            map.insert(oid, cols.into_iter().map(|(name, _)| name).collect());
+        }
+    }
+    map
 }
 
 /// Check whether a defining query needs the `__pgt_count` auxiliary column
