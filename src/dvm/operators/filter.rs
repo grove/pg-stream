@@ -529,12 +529,11 @@ mod tests {
         let result = diff_filter(&mut ctx, &tree).unwrap();
         let _sql = ctx.build_with_query(&result.cte_name);
 
-        // No dedup CTE should be added — child is already deduplicated
-        assert!(!result.cte_name.contains("filter_dedup"));
-        assert!(result.is_deduplicated);
-        // CTE name should be plain filter, not filter_dedup
-        assert!(result.cte_name.contains("filter"));
+        // P2-7: predicate is pushed into the scan CTE for PK-based tables
+        // in ChangeBuffer mode, so the result comes from the scan operator.
+        // No dedup CTE should be added — child is already deduplicated.
         assert!(!result.cte_name.contains("dedup"));
+        assert!(result.is_deduplicated);
     }
 
     #[test]
