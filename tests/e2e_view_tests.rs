@@ -477,22 +477,30 @@ async fn test_view_inline_view_replaced() {
     )
     .await;
 
-    // Give the event trigger a moment to fire
+    // The DDL event trigger fires synchronously within CREATE OR REPLACE VIEW,
+    // setting needs_reinit = true. However, if the background scheduler is
+    // active, it may reinitialize the ST (clearing needs_reinit) before we
+    // can observe the flag. Instead of racing with the scheduler, verify that
+    // the event trigger was effective: either needs_reinit is still true, or
+    // the scheduler already reinited (data matches the new view definition).
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // The ST should be marked for reinit (needs_reinit = true)
     let needs_reinit: bool = db
         .query_scalar(
             "SELECT needs_reinit FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'vi_st_repl'",
         )
         .await;
-    assert!(
-        needs_reinit,
-        "ST should be marked for reinit after view replacement"
-    );
 
-    // After reinit, it should match the new definition
-    db.refresh_st("vi_st_repl").await;
+    if needs_reinit {
+        // Event trigger fired; scheduler hasn't acted yet — manually refresh.
+        db.refresh_st("vi_st_repl").await;
+    } else {
+        // Scheduler already reinited. Wait briefly for it to finish if
+        // it's still in progress, then verify the data below.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // After reinit (manual or scheduler-driven), data must match the new view.
     db.assert_st_matches_query("vi_st_repl", "SELECT id, val FROM vi_repl_view")
         .await;
 }
