@@ -414,13 +414,21 @@ pgxn-publish:
     echo "Verifying archive contents..."
     python3 scripts/verify_pgxn_archive.py "$ARCHIVE"
     
-    if ! command -v pgxn >/dev/null 2>&1; then
-        echo "Error: 'pgxn' command not found. Please install pgxn-utils."
+    if ! command -v pgxn-utils >/dev/null 2>&1; then
+        echo "Error: 'pgxn-utils' command not found. Please install pgxn_utils."
+        exit 1
+    fi
+
+    # pgxn_utils expects PGXN_USER; keep PGXN_USERNAME compatibility for CI secrets.
+    export PGXN_USER="${PGXN_USER:-${PGXN_USERNAME:-}}"
+    if [ -z "${PGXN_USER:-}" ] || [ -z "${PGXN_PASSWORD:-}" ]; then
+        echo "Error: missing PGXN credentials."
+        echo "Set PGXN_USER (or PGXN_USERNAME) and PGXN_PASSWORD."
         exit 1
     fi
     
     echo "Uploading to PGXN..."
-    pgxn upload "$ARCHIVE"
+    pgxn-utils release "$ARCHIVE"
     echo "Successfully uploaded pg_trickle-$VERSION to PGXN!"
 
 # ── Docker ────────────────────────────────────────────────────────────────

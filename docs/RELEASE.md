@@ -30,7 +30,7 @@ under **Settings → Secrets and variables → Actions → New repository secret
 
 | Secret | Used by | Description |
 |--------|---------|-------------|
-| `PGXN_USERNAME` | `pgxn.yml` | Your PGXN account username. Required to authenticate the `pgxn upload` command when publishing source archives to the [PostgreSQL Extension Network](https://pgxn.org/). Register at [pgxn.org](https://pgxn.org/). |
+| `PGXN_USERNAME` | `pgxn.yml` | Your PGXN account username. The workflow maps this to `PGXN_USER` for the `pgxn-utils release` command when publishing source archives to the [PostgreSQL Extension Network](https://pgxn.org/). Register at [pgxn.org](https://pgxn.org/). |
 | `PGXN_PASSWORD` | `pgxn.yml` | Password for the PGXN account above. Never hardcode this — it must be stored as a secret so it is never exposed in logs or committed to the repository. |
 | `CODECOV_TOKEN` | `coverage.yml` | Upload token for [Codecov](https://codecov.io/). Used to publish unit and E2E coverage reports. Obtain it from the Codecov dashboard after linking the repository. The workflow degrades gracefully (`fail_ci_if_error: false`) if absent. |
 | `BENCHER_API_TOKEN` | `benchmarks.yml` | API token for [Bencher](https://bencher.dev/), the continuous benchmarking platform. Used to track Criterion benchmark results on `main` and detect regressions on pull requests. The benchmark steps are **skipped entirely** when this secret is absent, so CI still passes without it. Create a project at bencher.dev and copy the token from the project settings. |
@@ -315,7 +315,7 @@ If the workflow created a draft or partial Release before failing:
 | Build failure | Compilation error in release profile | Fix on `main`, re-tag (Option B) |
 | Docker push failed | Missing permissions | Verify `packages: write` is in the workflow and `GITHUB_TOKEN` has GHCR access, then re-run (Option A) |
 | Smoke test failed | Extension doesn't load in PostgreSQL | Fix the issue, re-tag (Option B) |
-| PGXN upload failed | Missing `PGXN_USERNAME` / `PGXN_PASSWORD` secrets, or `META.json` version not updated | Add the secrets in repository settings; verify `META.json` version matches the tag; re-run the `pgxn.yml` workflow from the Actions tab |
+| PGXN upload failed | Missing `PGXN_USERNAME` / `PGXN_PASSWORD` secrets, `pgxn_utils` installation failure, or `META.json` version not updated | Add the secrets in repository settings, ensure the workflow can install `pgxn_utils`, verify `META.json` version matches the tag, and re-run the `pgxn.yml` workflow from the Actions tab |
 | Rate limited | GitHub API or GHCR throttling | Wait a few minutes, then re-run (Option A) |
 
 ### Yanking a release
