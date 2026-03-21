@@ -421,15 +421,17 @@ pgxn-publish:
     fi
     
     echo "Uploading to PGXN as '${PGXN_USERNAME}'..."
-    HTTP_STATUS=$(curl --silent --show-error --location \
+    HTTP_STATUS=$(curl --silent --show-error \
         --output /tmp/pgxn_response.txt --write-out "%{http_code}" \
-        -X POST \
         -F "archive=@${ARCHIVE};type=application/zip" \
         -u "${PGXN_USERNAME}:${PGXN_PASSWORD}" \
         "https://manager.pgxn.org/upload")
     
-    if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
-        echo "Successfully uploaded pg_trickle-$VERSION to PGXN! (HTTP $HTTP_STATUS)"
+    echo "PGXN responded with HTTP $HTTP_STATUS"
+    
+    # PGXN Manager returns 200 on success or 3xx redirect-after-POST.
+    if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 400 ]; then
+        echo "Successfully uploaded pg_trickle-$VERSION to PGXN!"
     else
         echo "Error: PGXN upload failed with HTTP $HTTP_STATUS"
         echo "Response body:"
