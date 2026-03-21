@@ -414,22 +414,25 @@ pgxn-publish:
     echo "Verifying archive contents..."
     python3 scripts/verify_pgxn_archive.py "$ARCHIVE"
     
-    if ! command -v pgxn-utils >/dev/null 2>&1; then
-        echo "Error: 'pgxn-utils' command not found. Please install pgxn_utils."
-        exit 1
-    fi
-
-    # pgxn_utils expects PGXN_USER; keep PGXN_USERNAME compatibility for CI secrets.
-    export PGXN_USER="${PGXN_USER:-${PGXN_USERNAME:-}}"
-    if [ -z "${PGXN_USER:-}" ] || [ -z "${PGXN_PASSWORD:-}" ]; then
+    if [ -z "${PGXN_USERNAME:-}" ] || [ -z "${PGXN_PASSWORD:-}" ]; then
         echo "Error: missing PGXN credentials."
-        echo "Set PGXN_USER (or PGXN_USERNAME) and PGXN_PASSWORD."
+        echo "Set PGXN_USERNAME and PGXN_PASSWORD environment variables."
         exit 1
     fi
     
     echo "Uploading to PGXN..."
-    pgxn-utils release "$ARCHIVE"
-    echo "Successfully uploaded pg_trickle-$VERSION to PGXN!"
+    HTTP_STATUS=$(curl --silent --output /tmp/pgxn_response.txt --write-out "%{http_code}" \
+        -F "archive=@$ARCHIVE" \
+        -u "${PGXN_USERNAME}:${PGXN_PASSWORD}" \
+        "https://manager.pgxn.org/upload")
+    
+    if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+        echo "Successfully uploaded pg_trickle-$VERSION to PGXN! (HTTP $HTTP_STATUS)"
+    else
+        echo "Error: PGXN upload failed with HTTP $HTTP_STATUS"
+        cat /tmp/pgxn_response.txt
+        exit 1
+    fi
 
 # ── Docker ────────────────────────────────────────────────────────────────
 
