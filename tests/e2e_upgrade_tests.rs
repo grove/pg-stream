@@ -317,6 +317,22 @@ async fn test_upgrade_monitoring_views_present() {
 async fn test_upgrade_v090_catalog_additions() {
     let db = E2eDb::new().await.with_extension().await;
 
+    // This test asserts schema additions introduced in the current development
+    // line (v0.9.0-era features). In upgrade-matrix jobs that intentionally
+    // install an older SQL version (for example 0.2.0), these objects are not
+    // expected to exist. Skip unless installed SQL matches the current binary.
+    let installed_version: String = db
+        .query_scalar("SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'")
+        .await;
+    let lib_version = env!("CARGO_PKG_VERSION");
+    if installed_version != lib_version {
+        eprintln!(
+            "SKIP: test_upgrade_v090_catalog_additions requires installed SQL \
+             version to match binary version ({lib_version}), got {installed_version}"
+        );
+        return;
+    }
+
     // pgt_refresh_groups must exist (added in 0.9.0 for Cross-Source Snapshot Consistency)
     let table_exists: bool = db
         .query_scalar(
@@ -669,6 +685,17 @@ async fn test_upgrade_chain_version_consistency() {
     let from_version = std::env::var("PGS_UPGRADE_FROM").unwrap();
     let to_version = std::env::var("PGS_UPGRADE_TO").unwrap_or("0.9.0".into());
 
+    // This assertion only holds when the SQL extension version being tested
+    // matches the compiled binary version loaded in the container.
+    let lib_version = env!("CARGO_PKG_VERSION");
+    if to_version != lib_version {
+        eprintln!(
+            "SKIP: test_upgrade_chain_version_consistency requires SQL version to match \
+             binary version ({lib_version}), got PGS_UPGRADE_TO={to_version}"
+        );
+        return;
+    }
+
     let db = E2eDb::new().await;
     db.execute(&format!(
         "CREATE EXTENSION pg_trickle VERSION '{from_version}' CASCADE"
@@ -690,7 +717,6 @@ async fn test_upgrade_chain_version_consistency() {
     // pgtrickle.version() returns the compiled .so version, which always
     // equals CARGO_PKG_VERSION regardless of SQL extension version.
     let fn_version: String = db.query_scalar("SELECT pgtrickle.version()").await;
-    let lib_version = env!("CARGO_PKG_VERSION");
     assert_eq!(
         fn_version, lib_version,
         "pgtrickle.version() should return the compiled library version"
