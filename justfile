@@ -420,9 +420,11 @@ pgxn-publish:
         exit 1
     fi
     
-    echo "Uploading to PGXN..."
-    HTTP_STATUS=$(curl --silent --output /tmp/pgxn_response.txt --write-out "%{http_code}" \
-        -F "archive=@$ARCHIVE" \
+    echo "Uploading to PGXN as '${PGXN_USERNAME}'..."
+    HTTP_STATUS=$(curl --silent --show-error --location \
+        --output /tmp/pgxn_response.txt --write-out "%{http_code}" \
+        -X POST \
+        -F "archive=@${ARCHIVE};type=application/zip" \
         -u "${PGXN_USERNAME}:${PGXN_PASSWORD}" \
         "https://manager.pgxn.org/upload")
     
@@ -430,7 +432,14 @@ pgxn-publish:
         echo "Successfully uploaded pg_trickle-$VERSION to PGXN! (HTTP $HTTP_STATUS)"
     else
         echo "Error: PGXN upload failed with HTTP $HTTP_STATUS"
+        echo "Response body:"
         cat /tmp/pgxn_response.txt
+        echo ""
+        if [ "$HTTP_STATUS" = "401" ]; then
+            echo "Hint: HTTP 401 means authentication failed."
+            echo "Verify PGXN_USERNAME and PGXN_PASSWORD secrets are correct."
+            echo "Register at https://manager.pgxn.org/account/register if needed."
+        fi
         exit 1
     fi
 
