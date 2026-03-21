@@ -19,9 +19,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
-      - name: Install pgxnclient
-        run: pip install pgxnclient
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Install pgxn_utils
+        run: gem install pgxn_utils --no-document
 
       - name: Package and upload to PGXN
         run: just pgxn-publish
