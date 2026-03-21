@@ -412,10 +412,7 @@ pgxn-publish:
     git archive --format zip --prefix="pg_trickle-${VERSION}/" -o "$ARCHIVE" HEAD
     
     echo "Verifying archive contents..."
-    if ! unzip -l "$ARCHIVE" | grep -q "META.json"; then
-        echo "Error: META.json not found in the archive."
-        exit 1
-    fi
+    python3 scripts/verify_pgxn_archive.py "$ARCHIVE"
     
     if ! command -v pgxn >/dev/null 2>&1; then
         echo "Error: 'pgxn' command not found. Please install pgxn-utils."
