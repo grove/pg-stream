@@ -410,7 +410,7 @@ async fn assert_tpch_invariant(
              FROM information_schema.columns \
              WHERE (table_schema || '.' || table_name = 'public.{st_name}' \
                 OR table_name = '{st_name}') \
-               AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
+             AND left(column_name, 6) <> '__pgt_'"
         ))
         .await;
 
@@ -1242,7 +1242,7 @@ async fn test_tpch_full_vs_differential() {
                      FROM information_schema.columns \
                      WHERE (table_schema || '.' || table_name = 'public.{st_diff}' \
                         OR table_name = '{st_diff}') \
-                       AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
+                       AND left(column_name, 6) <> '__pgt_'"
                 ))
                 .await;
 
@@ -2551,7 +2551,7 @@ async fn test_tpch_differential_vs_immediate() {
                      FROM information_schema.columns \
                      WHERE (table_schema || '.' || table_name = 'public.{st_diff}' \
                         OR table_name = '{st_diff}') \
-                       AND column_name NOT IN ('__pgt_row_id', '__pgt_count')"
+                       AND left(column_name, 6) <> '__pgt_'"
                 ))
                 .await;
 
