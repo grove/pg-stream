@@ -1565,11 +1565,14 @@ These items are correct as implemented but scale with data size rather than delt
 
 **Goal:** Land deferred DVM correctness and performance improvements
 (recursive CTE DRed, FULL OUTER JOIN aggregate fix, LATERAL scoping,
-Welford regression aggregates, multi-source delta merging), deliver the
-first wave of refresh performance optimizations (index-aware MERGE,
-predicate pushdown, change buffer compaction, cost-based refresh strategy),
-enable cloud-native PgBouncer transaction-mode deployments via an opt-in
-compatibility mode, and complete the pre-1.0 packaging
+Welford regression aggregates, multi-source delta merging), fix a class of
+post-audit DVM safety issues (SQL comment injection as FROM fragments, silent
+wrong aggregate results, EC-01 gap for complex join trees) and CDC correctness
+bug (NULL-unsafe PK join, TRUNCATE+INSERT race, stale WAL publication after
+partitioning), deliver the first wave of refresh performance optimizations
+(index-aware MERGE, predicate pushdown, change buffer compaction, cost-based
+refresh strategy), enable cloud-native PgBouncer transaction-mode deployments
+via an opt-in compatibility mode, and complete the pre-1.0 packaging
 and deployment infrastructure.
 
 ### Connection Pooler Compatibility
@@ -1620,6 +1623,50 @@ incompatible with PgBouncer transaction-mode pooling. This section introduces an
 
 > **DVM deferred items subtotal: ~12–19 weeks**
 
+### DVM Safety Fixes & CDC Correctness Hardening
+
+These items were identified during a post-v0.9.0 audit of the DVM engine and CDC pipeline. **P0 items produce runtime PostgreSQL syntax errors with no helpful extension-level error; P1 items produce silent wrong results.** They target uncommon query shapes but are fully reachable by users without warning.
+
+#### SQL Comment Injection (P0)
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| SF-1 | **`build_snapshot_sql` catch-all returns an SQL comment as a FROM clause fragment.** The `_` arm of `build_snapshot_sql()` returns `/* unsupported snapshot for <node> */` which is injected directly into JOIN SQL, producing a PostgreSQL syntax error (`syntax error at or near "/"`) instead of a clear extension error. Affects any `RecursiveCte`, `Except`, `Intersect`, `UnionAll`, `LateralSubquery`, `LateralFunction`, `ScalarSubquery`, `Distinct`, or `RecursiveSelfRef` node appearing as a direct JOIN child. Replace the catch-all arm with `PgTrickleError::UnsupportedQuery`. | 0.5 d | ⬜ Not started | [src/dvm/operators/join_common.rs](src/dvm/operators/join_common.rs) |
+| SF-2 | **Explicit `/* unsupported snapshot for distinct */` string in join.rs.** Hardcoded variant of SF-1 for the `Distinct`-child case in inner-join snapshot construction. Same fix: return `PgTrickleError::UnsupportedQuery`. | 0.5 d | ⬜ Not started | [src/dvm/operators/join.rs](src/dvm/operators/join.rs) |
+| SF-3 | **`parser.rs` FROM-clause deparser fallbacks inject SQL comments.** `/* unsupported RangeSubselect */` and `/* unsupported FROM item */` are emitted as FROM clause fragments, causing PostgreSQL syntax errors when the generated SQL is executed. Replace with `PgTrickleError::UnsupportedQuery`. | 0.5 d | ⬜ Not started | [src/dvm/parser.rs](src/dvm/parser.rs) |
+
+#### DVM Correctness Bugs (P1)
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| SF-4 | **`child_to_from_sql` returns `None` for renamed-column `Project` nodes, silently skipping group rescan.** When a `Project` with column renames (e.g. `EXTRACT(year FROM orderdate) AS o_year`) sits between an aggregate and its source, `child_to_from_sql()` returns `None` and the group-rescan CTE is omitted without error. Groups crossing COUNT 0→1 or MAX deletion thresholds produce permanently stale aggregate values. Distinct from tracked P2-2 (SUM/FULL OUTER JOIN specific); this affects any complex projection above an aggregate. | 1–2 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
+| SF-5 | **EC-01 fix is incomplete for right-side join subtrees with ≥3 scan nodes.** `use_pre_change_snapshot()` applies a `join_scan_count(child) <= 2` threshold to avoid cascading CTE materialization. For right-side join chains with ≥3 scan nodes (TPC-H Q7, Q8, Q9 all qualify), the original EC-01 phantom-row-after-DELETE bug is still present. The roadmap marks EC-01 as "Done" without noting this remaining boundary. Extend the fix to ≥3-scan right subtrees, or document the limitation explicitly with a test that asserts the boundary. | 2–3 wk | ⬜ Not started | [src/dvm/operators/join_common.rs](src/dvm/operators/join_common.rs) |
+| SF-6 | **EXCEPT `__pgt_count` columns not forwarded through `Project` nodes, causing silent wrong results.** EXCEPT uses a "retain but mark invisible" design (never emits `'D'` events). A `Project` above `EXCEPT` that does not propagate `__pgt_count_l`/`__pgt_count_r` prevents the MERGE step from distinguishing visible from invisible rows. Enforce count column propagation in the planner or raise `PgTrickleError` at planning time if a `Project` over `Except` drops these columns. | 1–2 wk | ⬜ Not started | [src/dvm/operators/except.rs](src/dvm/operators/except.rs) |
+
+#### DVM Edge-Condition Correctness (P2)
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| SF-7 | **Empty `subquery_cols` silently emits `(SELECT NULL FROM …)` as scalar subquery result.** When inner column detection fails (e.g. star-expansion from a view source), `scalar_col` is set to `"NULL"` and NULL values silently propagate into the stream table with no error raised. Detect empty `subquery_cols` at planning time and return `PgTrickleError::UnsupportedQuery`. | 0.5 d | ⬜ Not started | [src/dvm/operators/scalar_subquery.rs](src/dvm/operators/scalar_subquery.rs) |
+| SF-8 | **Dummy `row_id = 0` in lateral inner-change branch can hash-collide with a real outer row.** `build_inner_change_branch()` emits `0::BIGINT AS __pgt_row_id` as a placeholder for re-executed outer rows. Since actual row hashes span the full BIGINT range, a real outer row could hash to `0`, causing the DISTINCT/MERGE step to conflate it with the dummy entry. Use a sentinel outside the hash range (e.g. `(-9223372036854775808)::BIGINT`, i.e. `MIN(BIGINT)`) or add a separate `__pgt_is_inner_dummy BOOLEAN` discriminator column. | 1 wk | ⬜ Not started | [src/dvm/operators/lateral_subquery.rs](src/dvm/operators/lateral_subquery.rs) |
+
+#### CDC Correctness (P1–P2)
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| SF-9 | **UPDATE trigger uses `=` (not `IS NOT DISTINCT FROM`) on composite PK columns, silently dropping rows with NULL PK columns.** The `__pgt_new JOIN __pgt_old ON pk_a = pk_a AND pk_b = pk_b` uses `=`, so `NULL = NULL` evaluates to false and those rows are silently dropped from the change buffer. The stream table permanently diverges from the source with no error. Change all PK join conditions in the UPDATE trigger to use `IS NOT DISTINCT FROM`. | 0.5 d | ⬜ Not started | [src/cdc.rs](src/cdc.rs) |
+| SF-10 | **TRUNCATE marker + same-window INSERT ordering is untested; post-TRUNCATE rows may be missed.** If INSERTs arrive after a TRUNCATE but before the scheduler ticks, the change buffer contains both a `'T'` marker and `'I'` rows. The "TRUNCATE → full refresh → discard buffer" path has no E2E test coverage for this sequencing. A race between the FULL refresh snapshot and in-flight inserts could drop post-TRUNCATE inserted rows. Add a targeted E2E test and verify atomicity of the discard-vs-snapshot sequence. | 0.5 d | ⬜ Not started | [src/cdc.rs](src/cdc.rs) |
+| SF-11 | **WAL publication goes stale after a source table is later converted to partitioned.** `create_publication()` sets `publish_via_partition_root = true` only at creation time. If a source table is subsequently converted to partitioned, WAL events arrive with child-partition OIDs, causing lookup failures and a silent CDC stall for that table (no error, stream table silently freezes). Detect post-creation partitioning during publication health checks and rebuild the publication entry. | 1–2 wk | ⬜ Not started | [src/wal_decoder.rs](src/wal_decoder.rs) |
+
+#### Operational & Documentation Gaps (P3)
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| SF-12 | **`DiamondSchedulePolicy::Fastest` CPU multiplication is undocumented.** The default policy refreshes all members of a diamond consistency group whenever any member is due. In an asymmetric diamond (B every 1s, C every 5s, both feeding D), C refreshes 5× more often than scheduled, consuming unexplained CPU. Add a cost-implication warning to `CONFIGURATION.md` and `ARCHITECTURE.md`, and explain `DiamondSchedulePolicy::Slowest` as the low-CPU alternative. | 0.5 d | ⬜ Not started | [src/dag.rs](src/dag.rs) · [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
+| SF-13 | **ROADMAP inconsistency: B-2 (Delta Predicate Pushdown) listed as ⬜ Not started in v0.10.0 but G-4/P2-7 marked completed in v0.9.0.** The v0.9.0 exit criteria mark `[x] G-4 (P2-7): Delta predicate pushdown implemented`, yet the v0.10.0 table lists `B-2 \| Delta Predicate Pushdown \| ⬜ Not started`. If B-2 has additional scope beyond G-4 (e.g. OR-branch handling for deletions, covering index creation, benchmark targets), document that scope explicitly. If B-2 is fully covered by G-4, remove or mark it done in the v0.10.0 table to avoid double-counting effort. | 0.5 d | ⬜ Not started | [ROADMAP.md](ROADMAP.md) |
+
+> **DVM safety & CDC hardening subtotal: ~3–4 days (SF-1–3, SF-7, SF-9–10, SF-12–13) + ~6–10 weeks (SF-4–6, SF-8, SF-11)**
+
 ### Core Refresh Optimizations (Wave 2)
 
 > Read the risk analyses in
@@ -1658,7 +1705,7 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 
 > **Scheduler & DAG scalability subtotal: ~7–10 weeks**
 
-> **v0.10.0 total: ~34–48 hours + ~26–40 weeks DVM & refresh work**
+> **v0.10.0 total: ~58–84 hours + ~32–50 weeks DVM, refresh & safety work**
 
 **Exit criteria:**
 - [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.9.0 → 0.10.0`)
@@ -1679,6 +1726,19 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
 - [ ] B-4: Cost model self-calibrates from refresh history; correctly selects FULL for join_agg at 10% change rate
 - [ ] PB1: Concurrent-refresh scenario included in PB3 E2E test; `SKIP LOCKED` "not acquired" path skips cycle rather than proceeding — **partially done: row-level locking implemented, scheduler skip path handles zero-row result, PgBouncer E2E harness created; concurrent-refresh stress test deferred to v0.10.0 hardening**
+- [ ] SF-1: `build_snapshot_sql` catch-all arm returns `PgTrickleError::UnsupportedQuery`; no SQL comment injected as FROM fragment
+- [ ] SF-2: Explicit `/* unsupported snapshot for distinct */` string replaced with `PgTrickleError::UnsupportedQuery` in join.rs
+- [ ] SF-3: `parser.rs` FROM-clause deparser fallbacks replaced with `PgTrickleError::UnsupportedQuery`
+- [ ] SF-4: `child_to_from_sql` `None` case for renamed-column `Project` nodes handled; no silent group-rescan skip for aggregates above projections
+- [ ] SF-5: EC-01 coverage extended to ≥3-scan right subtrees, or the ≤2-scan boundary documented with an E2E regression test asserting the boundary behaviour
+- [ ] SF-6: `Project` above `Except` enforces propagation of `__pgt_count_l`/`__pgt_count_r`; incorrect query shape rejected at planning time
+- [ ] SF-7: Empty `subquery_cols` in scalar subquery returns `PgTrickleError::UnsupportedQuery` rather than emitting `NULL`
+- [ ] SF-8: Lateral inner-change branch uses a sentinel outside the hash range (or a discriminator column) instead of `0::BIGINT` as dummy `__pgt_row_id`
+- [ ] SF-9: UPDATE trigger PK join uses `IS NOT DISTINCT FROM` for all PK columns; NULL-PK rows captured correctly
+- [ ] SF-10: TRUNCATE + same-window INSERT E2E test passes; post-TRUNCATE rows not dropped
+- [ ] SF-11: WAL publication health check detects post-creation table partitioning and rebuilds publication entry
+- [ ] SF-12: `DiamondSchedulePolicy::Fastest` cost-multiplication documented in `CONFIGURATION.md` with `Slowest` explanation
+- [ ] SF-13: B-2 / G-4 roadmap inconsistency resolved; entry reflects actual remaining scope (or marked done if fully completed)
 
 ---
 
