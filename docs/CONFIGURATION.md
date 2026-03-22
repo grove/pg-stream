@@ -480,6 +480,51 @@ SET pg_trickle.auto_backoff = on;
 
 ---
 
+### Diamond Schedule Policy (per-stream-table)
+
+Controls how the scheduler fires diamond consistency groups — sets of stream
+tables that share upstream sources through a diamond-shaped DAG topology.
+
+| Property | Value |
+|---|---|
+| Column | `diamond_schedule_policy` in `pgt_stream_tables` |
+| Values | `'fastest'` (default), `'slowest'` |
+| Set via | `create_stream_table(..., diamond_schedule_policy => 'slowest')` |
+| Alter via | `alter_stream_table('name', diamond_schedule_policy => 'slowest')` |
+
+Only meaningful when `diamond_consistency = 'atomic'` is also set.
+
+**`fastest` (default):** The atomic group fires when **any** member is due.
+This maximizes freshness but can cause CPU multiplication. In an asymmetric
+diamond where stream table B refreshes every 1 s and stream table C every 5 s,
+both feeding D with `diamond_consistency = 'atomic'`: C refreshes **5× more
+often than its schedule** because B triggers the group every second. For N
+members with schedules S₁ < S₂ < … < Sₙ, the total refresh count is
+N × (cycle_time / S₁), meaning slower members do up to Sₙ/S₁ times more work
+than their schedule implies.
+
+**`slowest`:** The atomic group fires only when **all** members are due.
+This minimizes CPU cost at the expense of freshness — faster members are held
+back until the slowest member's schedule fires.
+
+**Tuning Guidance:**
+- Use `'fastest'` when freshness of the diamond tip matters and the cost of
+  extra refreshes is acceptable.
+- Use `'slowest'` when CPU budget is tight or members have very different
+  schedules (e.g., 1 s vs 60 s) and the multiplication would be excessive.
+
+```sql
+-- Create with slowest policy to avoid CPU multiplication
+SELECT pgtrickle.create_stream_table(
+    'my_diamond_tip',
+    'SELECT ... FROM a JOIN b ...',
+    diamond_consistency => 'atomic',
+    diamond_schedule_policy => 'slowest'
+);
+```
+
+---
+
 ### pg_trickle.use_prepared_statements
 
 Use SQL `PREPARE` / `EXECUTE` for MERGE statements during differential refresh.

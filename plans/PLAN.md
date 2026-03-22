@@ -21,6 +21,12 @@
 > - **P3-2**: Welford auxiliary columns for CORR/COVAR/REGR_* — ✅ **Done** (5 cross-product aux columns per agg; O(1) algebraic merge formulas for all 12 functions)
 > - **B3-2**: Merged-delta weight aggregation — ✅ **Done** (replaces `DISTINCT ON` with `GROUP BY __pgt_row_id, SUM(weight)` + `HAVING <> 0`; correctness proven by B3-3 property tests)
 > - **B3-3**: Property-based tests for B3-2 — ✅ **Done** (6 diamond-flow E2E property tests: inner join, left join, full join, aggregate, multi-root, deep diamond)
+> - **SF-1/SF-2/SF-3**: SQL comment injection in `build_snapshot_sql` and `deparse_from_item` — ✅ **Done** (replaced with `panic!` / `PgTrickleError::UnsupportedOperator`)
+> - **SF-7**: Empty scalar subquery column guard — ✅ **Done** (panic instead of silent NULL emission)
+> - **SF-9**: NULL-safe PK join in UPDATE trigger — ✅ **Done** (`IS NOT DISTINCT FROM` instead of `=`)
+> - **SF-10**: TRUNCATE + INSERT ordering — ✅ **Done** (verified safe: full refresh reads source directly)
+> - **SF-12**: DiamondSchedulePolicy CPU cost documentation — ✅ **Done** (added to CONFIGURATION.md)
+> - **SF-13**: B-2 roadmap inconsistency — ✅ **Done** (marked as completed by G-4/P2-7 in v0.9.0)
 
 ### F40 Status Update
 
@@ -56,6 +62,12 @@ One item remains before F40 is fully closed:
 > - **P3-2**: Welford auxiliary columns for CORR/COVAR/REGR_* — ✅ **Done** (5 cross-product aux columns per agg; O(1) algebraic merge formulas for all 12 functions)
 > - **B3-2**: Merged-delta weight aggregation — ✅ **Done** (replaces `DISTINCT ON` with `GROUP BY __pgt_row_id, SUM(weight)` + `HAVING <> 0`; correctness proven by B3-3 property tests)
 > - **B3-3**: Property-based tests for B3-2 — ✅ **Done** (6 diamond-flow E2E property tests: inner join, left join, full join, aggregate, multi-root, deep diamond)
+> - **SF-1/SF-2/SF-3**: SQL comment injection in `build_snapshot_sql` and `deparse_from_item` — ✅ **Done** (replaced with `panic!` / `PgTrickleError::UnsupportedOperator`)
+> - **SF-7**: Empty scalar subquery column guard — ✅ **Done** (panic instead of silent NULL emission)
+> - **SF-9**: NULL-safe PK join in UPDATE trigger — ✅ **Done** (`IS NOT DISTINCT FROM` instead of `=`)
+> - **SF-10**: TRUNCATE + INSERT ordering — ✅ **Done** (verified safe: full refresh reads source directly)
+> - **SF-12**: DiamondSchedulePolicy CPU cost documentation — ✅ **Done** (added to CONFIGURATION.md)
+> - **SF-13**: B-2 roadmap inconsistency — ✅ **Done** (marked as completed by G-4/P2-7 in v0.9.0)
 
 ### F15 Status Update (Selective CDC Column Capture)
 

@@ -178,6 +178,44 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   Merge formulas implement the full SQL-standard semantics including
   edge-case handling for REGR_R2 and CORR when denominators are zero.
 
+### DVM Safety Fixes
+
+- **SF-1/SF-2/SF-3: SQL comment injection eliminated** — The catch-all arm
+  of `build_snapshot_sql()` and the `deparse_from_item` fallback paths in
+  `parser.rs` previously returned SQL comment strings (`/* unsupported ... */`)
+  as FROM clause fragments. These caused PostgreSQL syntax errors at runtime
+  instead of clear extension errors. All three sites now abort with a proper
+  error message (`panic!` in `build_snapshot_sql`, `PgTrickleError` in the
+  parser) so unsupported operator combinations fail fast with a descriptive
+  message.
+
+- **SF-7: Scalar subquery empty-column guard** — When a scalar subquery's
+  inner column detection fails (e.g. star-expansion from a view source),
+  `diff_scalar_subquery` previously set `scalar_col = "NULL"` and silently
+  emitted `(SELECT NULL FROM ...)`. Now panics immediately with a descriptive
+  error if `subquery_cols` is empty.
+
+- **SF-9: NULL-safe PK join in UPDATE trigger** — The CDC UPDATE trigger's
+  PK join condition used `=` which evaluates `NULL = NULL` as false, silently
+  dropping rows with NULL primary key columns from the change buffer. Changed
+  to `IS NOT DISTINCT FROM` so NULL-valued PK columns compare correctly.
+
+- **SF-10: TRUNCATE + INSERT ordering verified safe** — Reviewed the TRUNCATE
+  handling path: when the change buffer contains a `'T'` marker, the refresh
+  engine falls back to `execute_full_refresh()` which re-reads the source
+  table directly (not the change buffer). Post-TRUNCATE INSERTs that arrive
+  before the scheduler ticks are captured by the full refresh snapshot.
+  The change buffer is discarded atomically within the same transaction.
+
+- **SF-12: DiamondSchedulePolicy CPU cost documented** — Added documentation
+  to `CONFIGURATION.md` explaining that `diamond_schedule_policy = 'fastest'`
+  (the default) causes CPU multiplication in asymmetric diamonds, with
+  guidance on when to use `'slowest'` as the low-CPU alternative.
+
+- **SF-13: B-2 roadmap inconsistency resolved** — B-2 (Delta Predicate
+  Pushdown) was listed as "Not started" in v0.10.0 but was already completed
+  as G-4/P2-7 in v0.9.0. Marked B-2 as done in the v0.10.0 table.
+
 ---
 
 ## [0.9.0] — 2026-03-20
