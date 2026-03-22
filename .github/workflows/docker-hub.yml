@@ -103,7 +103,7 @@ jobs:
                 'SELECT id, v * 2 AS doubled FROM smoke_src'
               );
 
-              SELECT pgtrickle.refresh('smoke_mv');
+              SELECT pgtrickle.refresh_stream_table('smoke_mv');
 
               SELECT count(*) AS row_count FROM smoke_mv;
               SELECT * FROM smoke_mv ORDER BY id;
