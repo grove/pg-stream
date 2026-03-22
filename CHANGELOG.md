@@ -271,6 +271,17 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   reducing MERGE time 20–50% for small-delta/large-target scenarios.
   Completes the A-4 feature (planner hints were already shipped as P3-4).
 
+- **C2-1: Ring-buffer DAG invalidation** — Replaced the single scalar
+  `DAG_REBUILD_SIGNAL` shared-memory approach with a bounded ring buffer
+  (32 slots) of affected `pgt_id` values inside `PgTrickleSharedState`.
+  DDL hooks and API functions now push specific stream table IDs via
+  `signal_dag_invalidation(pgt_id)`; the scheduler drains the buffer each
+  tick. When the ring overflows (>32 distinct DDL events between ticks),
+  an automatic fallback to full DAG rebuild ensures correctness. This is
+  the hard prerequisite for the future G-8 incremental DAG rebuild.
+  Includes deduplication (same pgt_id pushed twice is stored once) and
+  11 unit tests for push/drain/overflow/reuse semantics.
+
 - **C-4: Change buffer compaction** — New `pg_trickle.compact_threshold`
   GUC (default 100,000 rows) triggers automatic compaction before each
   refresh cycle when pending changes exceed the threshold. Compaction
