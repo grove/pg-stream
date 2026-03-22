@@ -1224,7 +1224,7 @@ fn build_pk_join_condition(pk_columns: &[String]) -> String {
         .iter()
         .map(|col| {
             let qcol = col.replace('"', "\"\"");
-            format!("n.\"{qcol}\" = o.\"{qcol}\"")
+            format!("n.\"{qcol}\" IS NOT DISTINCT FROM o.\"{qcol}\"")
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -2480,5 +2480,39 @@ mod tests {
         let result = filter_cdc_columns(&all, Some(&referenced), &pk);
         // Should fall back to full list because filtered set is empty.
         assert_eq!(result.len(), 2);
+    }
+
+    // ── build_pk_join_condition tests (SF-9) ────────────────────────
+
+    #[test]
+    fn test_pk_join_single_column_uses_is_not_distinct_from() {
+        let pk = vec!["id".to_string()];
+        let result = build_pk_join_condition(&pk);
+        assert!(
+            result.contains("IS NOT DISTINCT FROM"),
+            "should use IS NOT DISTINCT FROM, got: {result}"
+        );
+        assert!(result.contains(r#"n."id""#), "got: {result}");
+        assert!(result.contains(r#"o."id""#), "got: {result}");
+    }
+
+    #[test]
+    fn test_pk_join_composite_key() {
+        let pk = vec!["a".to_string(), "b".to_string()];
+        let result = build_pk_join_condition(&pk);
+        assert!(result.contains(" AND "), "got: {result}");
+        assert!(
+            result.contains(r#"n."a" IS NOT DISTINCT FROM o."a""#),
+            "got: {result}"
+        );
+        assert!(
+            result.contains(r#"n."b" IS NOT DISTINCT FROM o."b""#),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_pk_join_empty_returns_true() {
+        assert_eq!(build_pk_join_condition(&[]), "TRUE");
     }
 }

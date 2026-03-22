@@ -245,8 +245,10 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
             )
         }
         _ => {
-            // Fallback for unsupported node types.
-            format!("/* unsupported snapshot for {} */", op.node_kind())
+            panic!(
+                "pg_trickle: unsupported operator in snapshot SQL: {}",
+                op.node_kind()
+            );
         }
     }
 }

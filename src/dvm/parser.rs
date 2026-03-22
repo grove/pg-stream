@@ -8914,7 +8914,9 @@ fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> 
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
-            return Ok("/* unsupported RangeSubselect */".to_string());
+            return Err(PgTrickleError::UnsupportedOperator(
+                "RangeSubselect with non-SelectStmt subquery is not supported".into(),
+            ));
         }
         let inner_sql = deparse_select_to_sql(sub.subquery)?;
         let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
@@ -8928,8 +8930,9 @@ fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> 
         }
         Ok(result)
     } else {
-        // Fallback: use a placeholder
-        Ok("/* unsupported FROM item */".to_string())
+        Err(PgTrickleError::UnsupportedOperator(
+            "Unsupported FROM item (VALUES clause, tablefunc, or other non-standard source)".into(),
+        ))
     }
 }
 
