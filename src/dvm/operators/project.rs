@@ -154,8 +154,20 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
         "__pgt_row_id".to_string()
     };
 
+    // SF-6: Forward dual-count columns (__pgt_count_l, __pgt_count_r) when
+    // the child result includes them (EXCEPT/INTERSECT operators). Without
+    // this, the MERGE step cannot update the per-branch multiplicity counts
+    // and rows become permanently stale.
+    let has_count_l = child_result.columns.contains(&"__pgt_count_l".to_string());
+    let has_count_r = child_result.columns.contains(&"__pgt_count_r".to_string());
+    let count_cols_select = if has_count_l && has_count_r {
+        ", \"__pgt_count_l\", \"__pgt_count_r\""
+    } else {
+        ""
+    };
+
     let sql = format!(
-        "SELECT {row_id_select}, __pgt_action, {proj_cols}\n\
+        "SELECT {row_id_select}, __pgt_action, {proj_cols}{count_cols_select}\n\
          FROM {child_cte}",
         proj_cols = proj_cols.join(", "),
         child_cte = child_result.cte_name,
@@ -163,9 +175,15 @@ pub fn diff_project(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, Pg
 
     ctx.add_cte(cte_name.clone(), sql);
 
+    let mut output_cols: Vec<String> = aliases.clone();
+    if has_count_l && has_count_r {
+        output_cols.push("__pgt_count_l".to_string());
+        output_cols.push("__pgt_count_r".to_string());
+    }
+
     Ok(DiffResult {
         cte_name,
-        columns: aliases.clone(),
+        columns: output_cols,
         is_deduplicated: child_result.is_deduplicated,
     })
 }
@@ -351,5 +369,51 @@ mod tests {
         };
         let result = resolve_expr_to_child(&expr, &child_cols);
         assert_eq!(result, "upper(\"x\")");
+    }
+
+    // ── SF-6: Dual-count column forwarding ──────────────────────────
+
+    #[test]
+    fn test_diff_project_forwards_dual_count_columns() {
+        // Project over Except: the count columns must be forwarded.
+        let mut ctx = test_ctx_with_st("public", "st");
+        let left = scan(1, "a", "public", "a", &["name"]);
+        let right = scan(2, "b", "public", "b", &["name"]);
+        let except_node = except(left, right, false);
+        let tree = project(vec![colref("name")], vec!["name"], except_node);
+        let result = diff_project(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Output columns must include the dual-count columns
+        assert!(
+            result.columns.contains(&"__pgt_count_l".to_string()),
+            "Project over Except should forward __pgt_count_l: {:?}",
+            result.columns
+        );
+        assert!(
+            result.columns.contains(&"__pgt_count_r".to_string()),
+            "Project over Except should forward __pgt_count_r: {:?}",
+            result.columns
+        );
+
+        // The SQL CTE should SELECT the count columns
+        assert_sql_contains(&sql, "__pgt_count_l");
+        assert_sql_contains(&sql, "__pgt_count_r");
+    }
+
+    #[test]
+    fn test_diff_project_no_count_columns_for_normal_child() {
+        // Project over Scan: no count columns should appear.
+        let mut ctx = test_ctx();
+        let child = scan(1, "t", "public", "t", &["id", "name"]);
+        let tree = project(
+            vec![colref("id"), colref("name")],
+            vec!["id", "name"],
+            child,
+        );
+        let result = diff_project(&mut ctx, &tree).unwrap();
+
+        assert_eq!(result.columns, vec!["id", "name"]);
+        assert!(!result.columns.contains(&"__pgt_count_l".to_string()));
     }
 }

@@ -191,7 +191,35 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             let r = child_to_from_sql(right)?;
             Some(format!("{l} FULL JOIN {r} ON {}", condition.to_sql()))
         }
-        OpTree::Project { child, .. } => child_to_from_sql(child),
+        OpTree::Project {
+            expressions,
+            aliases,
+            child,
+        } => {
+            // Wrap the child's FROM in a subquery that applies the
+            // projection, so aggregate expressions and GROUP BY clauses
+            // that reference the Project's output aliases (e.g., `o_year`
+            // from `EXTRACT(year FROM o_orderdate) AS o_year`) resolve
+            // correctly in the rescan CTE.
+            let inner = child_to_from_sql(child)?;
+            let select_items: Vec<String> = expressions
+                .iter()
+                .zip(aliases.iter())
+                .map(|(expr, alias)| {
+                    let sql = expr.to_sql();
+                    if sql == *alias {
+                        quote_ident(alias)
+                    } else {
+                        format!("{} AS {}", sql, quote_ident(alias))
+                    }
+                })
+                .collect();
+            Some(format!(
+                "(SELECT {} FROM {}) __pgt_proj",
+                select_items.join(", "),
+                inner,
+            ))
+        }
         OpTree::CteScan { alias, .. } => {
             // CTE scans behave like simple named sources in downstream
             // differential SQL. Use their visible alias so filters and joins
@@ -4823,5 +4851,72 @@ mod tests {
 
         // Print SQL for debugging (will only show when test fails or with --nocapture)
         eprintln!("=== Mixed COUNT* + SUM + ComplexExpression SQL ===\n{sql}");
+    }
+
+    // ── child_to_from_sql tests (SF-4) ──────────────────────────────
+
+    #[test]
+    fn test_child_to_from_sql_project_over_scan() {
+        // Project { EXTRACT(year FROM o_orderdate) AS o_year, o_totalprice }
+        // over Scan should produce a subquery with the projected columns.
+        let child = project(
+            vec![
+                Expr::FuncCall {
+                    func_name: "extract_year".to_string(),
+                    args: vec![colref("o_orderdate")],
+                },
+                colref("o_totalprice"),
+            ],
+            vec!["o_year", "o_totalprice"],
+            scan(
+                1,
+                "orders",
+                "public",
+                "orders",
+                &["o_orderdate", "o_totalprice"],
+            ),
+        );
+
+        let result = child_to_from_sql(&child);
+        assert!(result.is_some(), "Project over Scan should return Some");
+        let sql = result.unwrap();
+        // Should be a subquery wrapping the scan
+        assert!(
+            sql.starts_with('('),
+            "Should be wrapped in a subquery: {sql}"
+        );
+        assert!(
+            sql.contains("__pgt_proj"),
+            "Should have __pgt_proj alias: {sql}"
+        );
+        assert!(
+            sql.contains("AS \"o_year\""),
+            "Should alias the expression: {sql}"
+        );
+        assert!(
+            sql.contains("\"o_totalprice\""),
+            "Should include pass-through column: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_child_to_from_sql_project_over_non_agg_subquery_returns_none() {
+        // Project over Subquery { child: Scan } — Subquery returns None
+        // for non-Aggregate children, so Project should also return None.
+        let child = project(
+            vec![colref("id")],
+            vec!["id"],
+            OpTree::Subquery {
+                child: Box::new(scan(1, "t", "public", "t", &["id"])),
+                alias: "sub".to_string(),
+                column_aliases: vec![],
+            },
+        );
+
+        let result = child_to_from_sql(&child);
+        assert!(
+            result.is_none(),
+            "Project over non-Aggregate Subquery should return None"
+        );
     }
 }

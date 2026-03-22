@@ -20,6 +20,14 @@ use crate::dvm::operators::scan::build_hash_expr;
 use crate::dvm::parser::OpTree;
 use crate::error::PgTrickleError;
 
+/// Sentinel row_id for inner-change-branch dummy rows.
+///
+/// Uses `i64::MIN` to minimise collision probability with real
+/// `pg_trickle_hash` values (which span the full i64 range via
+/// bit-pattern cast from xxHash). The previous value `0` was within
+/// the common output range of the hash function.
+const LATERAL_INNER_DUMMY_ROW_ID: i64 = i64::MIN; // -9223372036854775808
+
 /// Differentiate a LateralSubquery node via row-scoped recomputation.
 ///
 /// For each source row that changed (INSERT/UPDATE/DELETE), delete old
@@ -385,7 +393,7 @@ fn build_inner_change_branch(
 
     Some(format!(
         "-- Outer rows affected by inner subquery source changes\n\
-         SELECT 0::BIGINT AS \"__pgt_row_id\",\n\
+         SELECT {LATERAL_INNER_DUMMY_ROW_ID}::BIGINT AS \"__pgt_row_id\",\n\
                 'I'::TEXT AS \"__pgt_action\",\n\
                 {col_refs_str}\n\
          FROM {outer_snap} {outer_alias_q}\n\
@@ -886,5 +894,31 @@ mod tests {
         let inner_branch = sql.split("lat_sq_changed").nth(1).unwrap_or("");
         // The inner-change EXISTS should use correlation, not LIMIT 1
         assert!(inner_branch.contains("\"new_fk\"") || inner_branch.contains("\"old_fk\""));
+    }
+
+    // ── SF-8: Inner-change dummy row_id sentinel ────────────────────
+
+    #[test]
+    fn test_inner_change_branch_uses_min_bigint_sentinel() {
+        let mut ctx = test_ctx_with_st("public", "st");
+        let child = scan(1, "orders", "public", "o", &["id"]);
+        let tree = lateral_subquery(
+            "SELECT amount FROM items i WHERE i.oid = o.id",
+            "items",
+            vec![],
+            vec!["amount"],
+            false,
+            vec![2],
+            child,
+        );
+        let result = diff_lateral_subquery(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // The inner-change branch should use i64::MIN sentinel, not 0
+        assert_sql_contains(&sql, "-9223372036854775808::BIGINT");
+        assert!(
+            !sql.contains("SELECT 0::BIGINT AS \"__pgt_row_id\""),
+            "Should not use 0 as dummy row_id"
+        );
     }
 }
