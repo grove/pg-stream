@@ -475,6 +475,10 @@ struct ValidatedQuery {
     /// Sum-of-squares auxiliary columns: `(sum2_col_name, arg_sql)` tuples
     /// for algebraic STDDEV/VAR maintenance. Empty if no non-DISTINCT STDDEV/VAR.
     sum2_aux_columns: Vec<(String, String)>,
+    /// Cross-product auxiliary columns: `(col_name, arg_sql)` tuples
+    /// for algebraic CORR/COVAR/REGR_* maintenance (P3-2).
+    /// Columns: sumx, sumy, sumxy, sumx2, sumy2 per aggregate.
+    covar_aux_columns: Vec<(String, String)>,
     /// Nonnull-count auxiliary columns: `(nonnull_col_name, arg_sql)` tuples
     /// for non-DISTINCT SUM aggregates above FULL JOIN children (P2-2).
     /// Empty if no such aggregates exist.
@@ -801,7 +805,7 @@ fn validate_and_parse_query(
 
     // EC-06: Detect keyless sources
     let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
-        if source_type != "TABLE" && source_type != "FOREIGN_TABLE" {
+        if source_type != "TABLE" && source_type != "FOREIGN_TABLE" && source_type != "MATVIEW" {
             return false;
         }
         cdc::resolve_pk_columns(*oid)
@@ -817,6 +821,11 @@ fn validate_and_parse_query(
     let sum2_aux_columns = parsed_tree
         .as_ref()
         .map(|pr| pr.tree.sum2_aux_columns())
+        .unwrap_or_default();
+
+    let covar_aux_columns = parsed_tree
+        .as_ref()
+        .map(|pr| pr.tree.covar_aux_columns())
         .unwrap_or_default();
 
     let nonnull_aux_columns = parsed_tree
@@ -836,6 +845,7 @@ fn validate_and_parse_query(
         source_relids,
         avg_aux_columns,
         sum2_aux_columns,
+        covar_aux_columns,
         nonnull_aux_columns,
     })
 }
@@ -854,6 +864,7 @@ fn setup_storage_table(
     parsed_tree: Option<&crate::dvm::ParseResult>,
     avg_aux_columns: &[(String, String, String)],
     sum2_aux_columns: &[(String, String)],
+    covar_aux_columns: &[(String, String)],
     nonnull_aux_columns: &[(String, String)],
 ) -> Result<pg_sys::Oid, PgTrickleError> {
     let storage_needs_pgt_count = needs_pgt_count;
@@ -865,6 +876,7 @@ fn setup_storage_table(
         needs_dual_count,
         avg_aux_columns,
         sum2_aux_columns,
+        covar_aux_columns,
         nonnull_aux_columns,
     );
     Spi::run(&storage_ddl)
@@ -966,21 +978,23 @@ fn insert_catalog_and_deps(
     for (source_oid, source_type) in &vq.source_relids {
         let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
 
-        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
-            match crate::catalog::build_column_snapshot(*source_oid) {
-                Ok((s, f)) => (Some(s), Some(f)),
-                Err(e) => {
-                    pgrx::debug1!(
-                        "pg_trickle: failed to build column snapshot for source {}: {}",
-                        source_oid.to_u32(),
-                        e,
-                    );
-                    (None, None)
+        let (snapshot, fingerprint) =
+            if source_type == "TABLE" || source_type == "FOREIGN_TABLE" || source_type == "MATVIEW"
+            {
+                match crate::catalog::build_column_snapshot(*source_oid) {
+                    Ok((s, f)) => (Some(s), Some(f)),
+                    Err(e) => {
+                        pgrx::debug1!(
+                            "pg_trickle: failed to build column snapshot for source {}: {}",
+                            source_oid.to_u32(),
+                            e,
+                        );
+                        (None, None)
+                    }
                 }
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
 
         StDependency::insert_with_snapshot(
             pgt_id,
@@ -1017,6 +1031,8 @@ fn setup_trigger_infrastructure(
                 setup_cdc_for_source(*source_oid, pgt_id, &change_schema)?;
             } else if source_type == "FOREIGN_TABLE" {
                 cdc::setup_foreign_table_polling(*source_oid, pgt_id, &change_schema)?;
+            } else if source_type == "MATVIEW" {
+                cdc::setup_matview_polling(*source_oid, pgt_id, &change_schema)?;
             }
         }
     }
@@ -1209,8 +1225,8 @@ fn migrate_storage_table_compatible(
 }
 
 /// Manage auxiliary columns (__pgt_count, __pgt_count_l/r, __pgt_aux_sum_*,
-/// __pgt_aux_count_*, __pgt_aux_sum2_*, __pgt_aux_nonnull_*) during ALTER QUERY
-/// when the query type or aggregate composition changes.
+/// __pgt_aux_count_*, __pgt_aux_sum2_*, __pgt_aux_sumx_*, __pgt_aux_nonnull_*)
+/// during ALTER QUERY when the query type or aggregate composition changes.
 #[allow(clippy::too_many_arguments)]
 fn migrate_aux_columns(
     schema: &str,
@@ -1224,6 +1240,8 @@ fn migrate_aux_columns(
     new_avg_aux: &[(String, String, String)],
     old_sum2_aux: &[(String, String)],
     new_sum2_aux: &[(String, String)],
+    old_covar_aux: &[(String, String)],
+    new_covar_aux: &[(String, String)],
     old_nonnull_aux: &[(String, String)],
     new_nonnull_aux: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
@@ -1363,6 +1381,35 @@ fn migrate_aux_columns(
         }
     }
 
+    // Transition: cross-product auxiliary columns (__pgt_aux_sum{x,y,xy,x2,y2}_*)
+    // for CORR/COVAR/REGR_* algebraic maintenance (P3-2).
+    let old_covar_names: std::collections::HashSet<&str> =
+        old_covar_aux.iter().map(|(n, _)| n.as_str()).collect();
+    let new_covar_names: std::collections::HashSet<&str> =
+        new_covar_aux.iter().map(|(n, _)| n.as_str()).collect();
+    // Add new covar aux columns
+    for (col_name, _) in new_covar_aux {
+        if !old_covar_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} NUMERIC NOT NULL DEFAULT 0",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+    // Drop removed covar aux columns
+    for (col_name, _) in old_covar_aux {
+        if !new_covar_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+
     // Transition: nonnull-count auxiliary columns (__pgt_aux_nonnull_*)
     // for SUM NULL-transition correction (P2-2).
     let old_nonnull_names: std::collections::HashSet<&str> =
@@ -1452,6 +1499,7 @@ fn alter_stream_table_query(
     let old_needs_dual_count = crate::dvm::query_needs_dual_count(&st.defining_query);
     let old_avg_aux = crate::dvm::query_avg_aux_columns(&st.defining_query);
     let old_sum2_aux = crate::dvm::query_sum2_aux_columns(&st.defining_query);
+    let old_covar_aux = crate::dvm::query_covar_aux_columns(&st.defining_query);
     let old_nonnull_aux = crate::dvm::query_nonnull_aux_columns(&st.defining_query);
 
     // ── Phase 1: Suspend ──
@@ -1547,6 +1595,7 @@ fn alter_stream_table_query(
                 vq.parsed_tree.as_ref(),
                 &vq.avg_aux_columns,
                 &vq.sum2_aux_columns,
+                &vq.covar_aux_columns,
                 &vq.nonnull_aux_columns,
             )?
         }
@@ -1566,6 +1615,8 @@ fn alter_stream_table_query(
             &vq.avg_aux_columns,
             &old_sum2_aux,
             &vq.sum2_aux_columns,
+            &old_covar_aux,
+            &vq.covar_aux_columns,
             &old_nonnull_aux,
             &vq.nonnull_aux_columns,
         )?;
@@ -1636,21 +1687,23 @@ fn alter_stream_table_query(
 
     for (source_oid, source_type) in &vq.source_relids {
         let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
-        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
-            match crate::catalog::build_column_snapshot(*source_oid) {
-                Ok((s, f)) => (Some(s), Some(f)),
-                Err(e) => {
-                    pgrx::debug1!(
-                        "pg_trickle: failed to build column snapshot for source {}: {}",
-                        source_oid.to_u32(),
-                        e,
-                    );
-                    (None, None)
+        let (snapshot, fingerprint) =
+            if source_type == "TABLE" || source_type == "FOREIGN_TABLE" || source_type == "MATVIEW"
+            {
+                match crate::catalog::build_column_snapshot(*source_oid) {
+                    Ok((s, f)) => (Some(s), Some(f)),
+                    Err(e) => {
+                        pgrx::debug1!(
+                            "pg_trickle: failed to build column snapshot for source {}: {}",
+                            source_oid.to_u32(),
+                            e,
+                        );
+                        (None, None)
+                    }
                 }
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
         StDependency::insert_with_snapshot(
             st.pgt_id,
             *source_oid,
@@ -1673,6 +1726,8 @@ fn alter_stream_table_query(
             }
         } else if source_type == "FOREIGN_TABLE" && !refresh_mode.is_immediate() {
             cdc::setup_foreign_table_polling(*source_oid, st.pgt_id, &change_schema)?;
+        } else if source_type == "MATVIEW" && !refresh_mode.is_immediate() {
+            cdc::setup_matview_polling(*source_oid, st.pgt_id, &change_schema)?;
         }
     }
 
@@ -1956,6 +2011,7 @@ fn create_stream_table_impl(
         vq.parsed_tree.as_ref(),
         &vq.avg_aux_columns,
         &vq.sum2_aux_columns,
+        &vq.covar_aux_columns,
         &vq.nonnull_aux_columns,
     )?;
 
@@ -2028,6 +2084,7 @@ fn create_stream_table_impl(
             vq.topk_info.as_ref(),
             &vq.avg_aux_columns,
             &vq.sum2_aux_columns,
+            &vq.covar_aux_columns,
             &vq.nonnull_aux_columns,
         )?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
@@ -2892,6 +2949,11 @@ fn execute_manual_full_refresh(
         let sum2_aux = crate::dvm::query_sum2_aux_columns(&st.defining_query);
         if !sum2_aux.is_empty() {
             eq = inject_sum2_aux(&eq, &sum2_aux);
+        }
+        // Also inject cross-product columns for CORR/COVAR/REGR maintenance (P3-2).
+        let covar_aux = crate::dvm::query_covar_aux_columns(&st.defining_query);
+        if !covar_aux.is_empty() {
+            eq = inject_covar_aux(&eq, &covar_aux);
         }
         // Also inject nonnull-count columns for SUM NULL-transition correction (P2-2).
         let nonnull_aux = crate::dvm::query_nonnull_aux_columns(&st.defining_query);
@@ -5220,6 +5282,7 @@ fn build_create_table_sql(
     needs_dual_count: bool,
     avg_aux_columns: &[(String, String, String)],
     sum2_aux_columns: &[(String, String)],
+    covar_aux_columns: &[(String, String)],
     nonnull_aux_columns: &[(String, String)],
 ) -> String {
     let col_defs: Vec<String> = columns
@@ -5274,6 +5337,16 @@ fn build_create_table_sql(
         ));
     }
 
+    // Add cross-product auxiliary columns (__pgt_aux_sumx_*, sumy, sumxy,
+    // sumx2, sumy2) for algebraic CORR/COVAR/REGR_* maintenance (P3-2).
+    let mut covar_aux_sql = String::new();
+    for (covar_col, _arg_sql) in covar_aux_columns {
+        covar_aux_sql.push_str(&format!(
+            ",\n    {} NUMERIC NOT NULL DEFAULT 0",
+            quote_identifier(covar_col),
+        ));
+    }
+
     // Add nonnull-count auxiliary columns (__pgt_aux_nonnull_*) for
     // SUM NULL-transition correction (P2-2).
     let mut nonnull_aux_sql = String::new();
@@ -5285,13 +5358,14 @@ fn build_create_table_sql(
     }
 
     format!(
-        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}{}\n)",
+        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}{}{}\n)",
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
         aux_cols,
         avg_aux_sql,
         sum2_aux_sql,
+        covar_aux_sql,
         nonnull_aux_sql,
     )
 }
@@ -5326,6 +5400,7 @@ fn initialize_st(
     topk_info: Option<&crate::dvm::TopKInfo>,
     avg_aux_columns: &[(String, String, String)],
     sum2_aux_columns: &[(String, String)],
+    covar_aux_columns: &[(String, String)],
     nonnull_aux_columns: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
     // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
@@ -5351,6 +5426,12 @@ fn initialize_st(
     // columns for sum-of-squares tracking.
     if !sum2_aux_columns.is_empty() {
         effective_query = inject_sum2_aux(&effective_query, sum2_aux_columns);
+    }
+
+    // P3-2: For CORR/COVAR/REGR_* algebraic maintenance, inject cross-product
+    // auxiliary columns (sumx, sumy, sumxy, sumx2, sumy2).
+    if !covar_aux_columns.is_empty() {
+        effective_query = inject_covar_aux(&effective_query, covar_aux_columns);
     }
 
     // For SUM NULL-transition correction (P2-2), inject COUNT(IS NOT NULL)
@@ -5553,6 +5634,49 @@ pub fn inject_nonnull_aux(query: &str, nonnull_aux_columns: &[(String, String)])
             ));
         }
         format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..],)
+    } else {
+        query.to_string()
+    }
+}
+
+/// Inject cross-product auxiliary columns for CORR/COVAR/REGR algebraic
+/// maintenance (P3-2).
+///
+/// Each covar aux column maps to a specific SQL expression based on its name
+/// prefix and `arg_sql` encoding:
+///   `__pgt_aux_sumx_*`  → `SUM(x)`
+///   `__pgt_aux_sumy_*`  → `SUM(y)`
+///   `__pgt_aux_sumxy_*` → `SUM((x)*(y))`  (arg_sql = "x|y")
+///   `__pgt_aux_sumx2_*` → `SUM((x)*(x))`
+///   `__pgt_aux_sumy2_*` → `SUM((y)*(y))`
+pub fn inject_covar_aux(query: &str, covar_aux_columns: &[(String, String)]) -> String {
+    if covar_aux_columns.is_empty() {
+        return query.to_string();
+    }
+
+    if let Some(pos) = find_top_level_keyword(query, "FROM") {
+        let mut extra = String::new();
+        for (col_name, arg_sql) in covar_aux_columns {
+            let expr = if col_name.starts_with("__pgt_aux_sumxy_") {
+                // arg_sql is "x_expr|y_expr"
+                let parts: Vec<&str> = arg_sql.splitn(2, '|').collect();
+                let (x, y) = if parts.len() == 2 {
+                    (parts[0], parts[1])
+                } else {
+                    (arg_sql.as_str(), arg_sql.as_str())
+                };
+                format!("SUM(({x}) * ({y}))")
+            } else if col_name.starts_with("__pgt_aux_sumx2_")
+                || col_name.starts_with("__pgt_aux_sumy2_")
+            {
+                format!("SUM(({arg_sql}) * ({arg_sql}))")
+            } else {
+                // sumx_ or sumy_ — simple SUM
+                format!("SUM({arg_sql})")
+            };
+            extra.push_str(&format!(", {} AS {}", expr, quote_identifier(col_name)));
+        }
+        format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..])
     } else {
         query.to_string()
     }

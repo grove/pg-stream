@@ -300,15 +300,15 @@ fn cleanup_change_buffers_by_frontier(change_schema: &str, source_oids: &[u32]) 
         }
 
         // Compute the minimum frontier LSN across ALL stream tables that
-        // depend on this source OID.  Both TABLE and FOREIGN_TABLE sources
-        // are included: FT change buffers are written by polling and must be
-        // cleaned up once all consumers have advanced their frontier past them.
+        // depend on this source OID.  TABLE, FOREIGN_TABLE, and MATVIEW sources
+        // are included: FT/matview change buffers are written by polling and must
+        // be cleaned up once all consumers have advanced their frontier past them.
         let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
             "SELECT MIN((st.frontier->'sources'->'{oid}'->>'lsn')::pg_lsn)::TEXT \
              FROM pgtrickle.pgt_stream_tables st \
              JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
              WHERE dep.source_relid = {oid} \
-               AND dep.source_type IN ('TABLE', 'FOREIGN_TABLE') \
+               AND dep.source_type IN ('TABLE', 'FOREIGN_TABLE', 'MATVIEW') \
                AND st.frontier IS NOT NULL \
                AND st.frontier->'sources'->'{oid}'->>'lsn' IS NOT NULL",
         ))
@@ -1358,7 +1358,11 @@ pub fn post_full_refresh_cleanup(st: &StreamTableMeta) {
     let deps = crate::catalog::StDependency::get_for_st(st.pgt_id).unwrap_or_default();
     let source_oids: Vec<u32> = deps
         .iter()
-        .filter(|d| d.source_type == "TABLE" || d.source_type == "FOREIGN_TABLE")
+        .filter(|d| {
+            d.source_type == "TABLE"
+                || d.source_type == "FOREIGN_TABLE"
+                || d.source_type == "MATVIEW"
+        })
         .map(|d| d.source_relid.to_u32())
         .collect();
 
@@ -1397,8 +1401,8 @@ pub fn post_full_refresh_cleanup(st: &StreamTableMeta) {
     cleanup_change_buffers_by_frontier(&change_schema, &source_oids);
 }
 
-/// Poll all FOREIGN_TABLE dependencies for a stream table before selecting a
-/// new differential frontier.
+/// Poll all FOREIGN_TABLE and MATVIEW dependencies for a stream table before
+/// selecting a new differential frontier.
 ///
 /// Polling writes synthetic CDC rows into the local change buffers and updates
 /// the per-source snapshot tables. Callers must do this before capturing the
@@ -1408,9 +1412,13 @@ pub fn poll_foreign_table_sources_for_st(st: &StreamTableMeta) -> Result<(), PgT
 
     for dep in StDependency::get_for_st(st.pgt_id)?
         .into_iter()
-        .filter(|dep| dep.source_type == "FOREIGN_TABLE")
+        .filter(|dep| dep.source_type == "FOREIGN_TABLE" || dep.source_type == "MATVIEW")
     {
-        crate::cdc::poll_foreign_table_changes(dep.source_relid, &change_schema)?;
+        if dep.source_type == "FOREIGN_TABLE" {
+            crate::cdc::poll_foreign_table_changes(dep.source_relid, &change_schema)?;
+        } else {
+            crate::cdc::poll_matview_changes(dep.source_relid, &change_schema)?;
+        }
     }
 
     Ok(())
@@ -1599,7 +1607,11 @@ pub fn execute_differential_refresh(
     let catalog_source_oids: Vec<u32> = StDependency::get_for_st(st.pgt_id)
         .unwrap_or_default()
         .into_iter()
-        .filter(|dep| dep.source_type == "TABLE" || dep.source_type == "FOREIGN_TABLE")
+        .filter(|dep| {
+            dep.source_type == "TABLE"
+                || dep.source_type == "FOREIGN_TABLE"
+                || dep.source_type == "MATVIEW"
+        })
         .map(|dep| dep.source_relid.to_u32())
         .collect();
 

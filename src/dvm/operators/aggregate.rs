@@ -1345,6 +1345,23 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
                 delta_selects.push(format!("{del_sum2} AS {}", quote_ident(&sum2_alias_d)));
             }
 
+            // P3-2: CORR/COVAR/REGR_* — track cross-product auxiliary deltas.
+            if agg.function.needs_cross_products() && !agg.is_distinct {
+                let (ins_exprs, del_exprs) = agg_covar_delta_exprs(agg, child_cols);
+                for (suffix, ins_expr, del_expr) in &[
+                    ("sumx", &ins_exprs.0, &del_exprs.0),
+                    ("sumy", &ins_exprs.1, &del_exprs.1),
+                    ("sumxy", &ins_exprs.2, &del_exprs.2),
+                    ("sumx2", &ins_exprs.3, &del_exprs.3),
+                    ("sumy2", &ins_exprs.4, &del_exprs.4),
+                ] {
+                    let i_alias = format!("__ins_{suffix}_{}", agg.alias);
+                    let d_alias = format!("__del_{suffix}_{}", agg.alias);
+                    delta_selects.push(format!("{ins_expr} AS {}", quote_ident(&i_alias)));
+                    delta_selects.push(format!("{del_expr} AS {}", quote_ident(&d_alias)));
+                }
+            }
+
             // P2-2: SUM over a FULL JOIN child — track nonnull-count delta so the
             // merge can maintain __pgt_aux_nonnull_{alias} algebraically and decide
             // NULL vs algebraic SUM without a full-group rescan.
@@ -1574,6 +1591,20 @@ pub fn diff_aggregate(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, 
             ));
         }
 
+        // P3-2: CORR/COVAR/REGR_* — update cross-product auxiliary columns.
+        if agg.function.needs_cross_products() && !agg.is_distinct {
+            let st_alias = st_col_name(&agg.alias);
+            for suffix in &["sumx", "sumy", "sumxy", "sumx2", "sumy2"] {
+                let aux = quote_ident(&format!("__pgt_aux_{suffix}_{st_alias}"));
+                let ins = quote_ident(&format!("__ins_{suffix}_{}", agg.alias));
+                let del = quote_ident(&format!("__del_{suffix}_{}", agg.alias));
+                merge_selects.push(format!(
+                    "COALESCE(st.{aux}, 0) + COALESCE(d.{ins}, 0) - COALESCE(d.{del}, 0) AS {}",
+                    quote_ident(&format!("new___pgt_aux_{suffix}_{}", agg.alias)),
+                ));
+            }
+        }
+
         // P2-2: SUM over FULL JOIN — update the nonnull-count auxiliary column.
         if agg_has_nonnull_aux {
             let st_alias = st_col_name(&agg.alias);
@@ -1683,6 +1714,12 @@ END AS __pgt_meta_action"
         if agg.function.needs_sum_of_squares() && !agg.is_distinct {
             output_cols.push(format!("__pgt_aux_sum2_{}", agg.alias));
         }
+        // P3-2: CORR/COVAR/REGR_* — propagate cross-product auxiliary columns
+        if agg.function.needs_cross_products() && !agg.is_distinct {
+            for suffix in &["sumx", "sumy", "sumxy", "sumx2", "sumy2"] {
+                output_cols.push(format!("__pgt_aux_{suffix}_{}", agg.alias));
+            }
+        }
         // P2-2: SUM over FULL JOIN — propagate nonnull-count auxiliary column
         if matches!(agg.function, AggFunc::Sum) && !agg.is_distinct && sum_has_full_join_child {
             output_cols.push(format!("__pgt_aux_nonnull_{}", agg.alias));
@@ -1764,6 +1801,17 @@ END AS __pgt_meta_action"
             agg_cases.push(format!(
                 "CASE WHEN m.__pgt_meta_action = 'D' THEN 0 ELSE m.{new_aux_sum2} END AS {aux_sum2_alias}",
             ));
+        }
+
+        // P3-2: CORR/COVAR/REGR_* — propagate cross-product auxiliary columns
+        if agg.function.needs_cross_products() && !agg.is_distinct {
+            for suffix in &["sumx", "sumy", "sumxy", "sumx2", "sumy2"] {
+                let new_col = quote_ident(&format!("new___pgt_aux_{suffix}_{}", agg.alias));
+                let out_alias = quote_ident(&format!("__pgt_aux_{suffix}_{}", agg.alias));
+                agg_cases.push(format!(
+                    "CASE WHEN m.__pgt_meta_action = 'D' THEN 0 ELSE m.{new_col} END AS {out_alias}",
+                ));
+            }
         }
 
         // P2-2: SUM over FULL JOIN — propagate the nonnull-count auxiliary column.
@@ -1910,6 +1958,42 @@ pub fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String)
                 format!("SUM(CASE WHEN __pgt_action = 'D'{filter_and} THEN {col} ELSE 0 END)"),
             )
         }
+        // P3-2: CORR/COVAR/REGR_* — the main delta tracks SUM(Y) for the shared
+        // sum/count auxiliary path. Cross-product columns (sumx, sumy, sumxy, etc.)
+        // are tracked separately by agg_covar_delta_exprs.
+        AggFunc::Corr
+        | AggFunc::CovarPop
+        | AggFunc::CovarSamp
+        | AggFunc::RegrAvgx
+        | AggFunc::RegrAvgy
+        | AggFunc::RegrCount
+        | AggFunc::RegrIntercept
+        | AggFunc::RegrR2
+        | AggFunc::RegrSlope
+        | AggFunc::RegrSxx
+        | AggFunc::RegrSxy
+        | AggFunc::RegrSyy => {
+            let y_col = agg
+                .argument
+                .as_ref()
+                .map(|e| resolve_expr_for_child(e, child_cols))
+                .unwrap_or("0".into());
+            let x_col = agg
+                .second_arg
+                .as_ref()
+                .map(|e| resolve_expr_for_child(e, child_cols))
+                .unwrap_or("0".into());
+            // Only count non-null pairs (both X and Y non-null)
+            let guard = format!("{x_col} IS NOT NULL AND {y_col} IS NOT NULL");
+            (
+                format!(
+                    "SUM(CASE WHEN __pgt_action = 'I' AND {guard}{filter_and} THEN ({y_col}) ELSE 0 END)"
+                ),
+                format!(
+                    "SUM(CASE WHEN __pgt_action = 'D' AND {guard}{filter_and} THEN ({y_col}) ELSE 0 END)"
+                ),
+            )
+        }
         AggFunc::Min | AggFunc::Max => {
             let col = agg
                 .argument
@@ -1950,6 +2034,9 @@ pub fn agg_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String)
 /// Returns `(ins_count_expr, del_count_expr)` — counts of non-NULL argument
 /// values in the insert and delete sides of the delta. AVG needs these to
 /// maintain its `__pgt_aux_count_{alias}` column algebraically.
+///
+/// For CORR/COVAR/REGR_* aggregates: counts non-null PAIRS (both X and Y
+/// must be non-NULL) per the SQL standard for regression function semantics.
 fn agg_avg_count_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, String) {
     let filter_sql = agg
         .filter
@@ -1960,17 +2047,34 @@ fn agg_avg_count_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, S
         .map(|f| format!(" AND {f}"))
         .unwrap_or_default();
 
-    let col = agg
-        .argument
-        .as_ref()
-        .map(|e| resolve_expr_for_child(e, child_cols))
-        .unwrap_or("1".into());
+    // For regression aggregates, both X and Y must be non-null.
+    let non_null_guard = if agg.function.needs_cross_products() {
+        let y_col = agg
+            .argument
+            .as_ref()
+            .map(|e| resolve_expr_for_child(e, child_cols))
+            .unwrap_or_else(|| "0".into());
+        let x_col = agg
+            .second_arg
+            .as_ref()
+            .map(|e| resolve_expr_for_child(e, child_cols))
+            .unwrap_or_else(|| "0".into());
+        format!("{x_col} IS NOT NULL AND {y_col} IS NOT NULL")
+    } else {
+        let col = agg
+            .argument
+            .as_ref()
+            .map(|e| resolve_expr_for_child(e, child_cols))
+            .unwrap_or_else(|| "1".into());
+        format!("{col} IS NOT NULL")
+    };
+
     (
         format!(
-            "SUM(CASE WHEN __pgt_action = 'I' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
+            "SUM(CASE WHEN __pgt_action = 'I' AND {non_null_guard}{filter_and} THEN 1 ELSE 0 END)"
         ),
         format!(
-            "SUM(CASE WHEN __pgt_action = 'D' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)"
+            "SUM(CASE WHEN __pgt_action = 'D' AND {non_null_guard}{filter_and} THEN 1 ELSE 0 END)"
         ),
     )
 }
@@ -2030,6 +2134,84 @@ fn agg_nonnull_delta_exprs(agg: &AggExpr, child_cols: &[String]) -> (String, Str
             "SUM(CASE WHEN __pgt_action = 'D' AND {col} IS NOT NULL{filter_and} THEN 1 ELSE 0 END)::bigint"
         ),
     )
+}
+
+/// Generate cross-product delta expressions for CORR/COVAR/REGR_* (P3-2).
+///
+/// Returns `(insert_exprs, delete_exprs)` where each is a tuple of 5 SQL
+/// expressions: `(sum_x, sum_y, sum_xy, sum_x2, sum_y2)`.
+///
+/// Regression aggregates use `(Y, X)` argument order per the SQL standard:
+/// - `argument` = Y (dependent variable)
+/// - `second_arg` = X (independent variable)
+///
+/// Five-element tuple for cross-product accumulator expressions (sumx, sumy, sumxy, sumx2, sumy2).
+type CovarDeltaTuple = (String, String, String, String, String);
+
+/// Pairs where BOTH X and Y are NULL are excluded (matching PostgreSQL's
+/// REGR_COUNT semantics which only counts non-null pairs).
+fn agg_covar_delta_exprs(
+    agg: &AggExpr,
+    child_cols: &[String],
+) -> (CovarDeltaTuple, CovarDeltaTuple) {
+    let filter_sql = agg
+        .filter
+        .as_ref()
+        .map(|f| resolve_expr_for_child(f, child_cols));
+    let filter_and = filter_sql
+        .as_ref()
+        .map(|f| format!(" AND {f}"))
+        .unwrap_or_default();
+
+    let y_col = agg
+        .argument
+        .as_ref()
+        .map(|e| resolve_expr_for_child(e, child_cols))
+        .unwrap_or_else(|| "0".into());
+    let x_col = agg
+        .second_arg
+        .as_ref()
+        .map(|e| resolve_expr_for_child(e, child_cols))
+        .unwrap_or_else(|| "0".into());
+
+    // Only count rows where BOTH x and y are non-NULL (SQL standard for regression)
+    let non_null_guard = format!("{x_col} IS NOT NULL AND {y_col} IS NOT NULL");
+
+    let ins = (
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'I' AND {non_null_guard}{filter_and} THEN ({x_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'I' AND {non_null_guard}{filter_and} THEN ({y_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'I' AND {non_null_guard}{filter_and} THEN ({x_col}) * ({y_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'I' AND {non_null_guard}{filter_and} THEN ({x_col}) * ({x_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'I' AND {non_null_guard}{filter_and} THEN ({y_col}) * ({y_col}) ELSE 0 END)"
+        ),
+    );
+    let del = (
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'D' AND {non_null_guard}{filter_and} THEN ({x_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'D' AND {non_null_guard}{filter_and} THEN ({y_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'D' AND {non_null_guard}{filter_and} THEN ({x_col}) * ({y_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'D' AND {non_null_guard}{filter_and} THEN ({x_col}) * ({x_col}) ELSE 0 END)"
+        ),
+        format!(
+            "SUM(CASE WHEN __pgt_action = 'D' AND {non_null_guard}{filter_and} THEN ({y_col}) * ({y_col}) ELSE 0 END)"
+        ),
+    );
+    (ins, del)
 }
 
 /// Generate the merge expression for computing the new aggregate value.
@@ -2199,6 +2381,146 @@ fn agg_merge_expr_mapped(
             };
 
             format!("CASE WHEN {null_guard} THEN NULL ELSE {body} END")
+        }
+        // P3-2: CORR/COVAR/REGR_* — algebraic via cross-product auxiliaries.
+        //   n   = old_count + ins_count - del_count
+        //   sx  = old_sumx + ins_sumx - del_sumx
+        //   sy  = old_sumy + ins_sumy - del_sumy
+        //   sxy = old_sumxy + ins_sumxy - del_sumxy
+        //   sx2 = old_sumx2 + ins_sumx2 - del_sumx2
+        //   sy2 = old_sumy2 + ins_sumy2 - del_sumy2
+        AggFunc::Corr
+        | AggFunc::CovarPop
+        | AggFunc::CovarSamp
+        | AggFunc::RegrAvgx
+        | AggFunc::RegrAvgy
+        | AggFunc::RegrCount
+        | AggFunc::RegrIntercept
+        | AggFunc::RegrR2
+        | AggFunc::RegrSlope
+        | AggFunc::RegrSxx
+        | AggFunc::RegrSxy
+        | AggFunc::RegrSyy => {
+            let ins_cnt = quote_ident(&format!("__ins_count_{alias}"));
+            let del_cnt = quote_ident(&format!("__del_count_{alias}"));
+            let aux_count = quote_ident(&format!("__pgt_aux_count_{st_col}"));
+
+            // Helper macro for cross-product auxiliary columns
+            let cv = |suffix: &str| -> (String, String, String) {
+                let ins = quote_ident(&format!("__ins_{suffix}_{alias}"));
+                let del = quote_ident(&format!("__del_{suffix}_{alias}"));
+                let aux = quote_ident(&format!("__pgt_aux_{suffix}_{st_col}"));
+                (ins, del, aux)
+            };
+            let (ins_sx, del_sx, aux_sx) = cv("sumx");
+            let (ins_sy, del_sy, aux_sy) = cv("sumy");
+            let (ins_sxy, del_sxy, aux_sxy) = cv("sumxy");
+            let (ins_sx2, del_sx2, aux_sx2) = cv("sumx2");
+            let (ins_sy2, del_sy2, aux_sy2) = cv("sumy2");
+
+            let n = format!(
+                "(COALESCE(st.{aux_count}, 0) + COALESCE(d.{ins_cnt}, 0) - COALESCE(d.{del_cnt}, 0))"
+            );
+            let sx = format!(
+                "(COALESCE(st.{aux_sx}, 0) + COALESCE(d.{ins_sx}, 0) - COALESCE(d.{del_sx}, 0))"
+            );
+            let sy = format!(
+                "(COALESCE(st.{aux_sy}, 0) + COALESCE(d.{ins_sy}, 0) - COALESCE(d.{del_sy}, 0))"
+            );
+            let sxy = format!(
+                "(COALESCE(st.{aux_sxy}, 0) + COALESCE(d.{ins_sxy}, 0) - COALESCE(d.{del_sxy}, 0))"
+            );
+            let sx2 = format!(
+                "(COALESCE(st.{aux_sx2}, 0) + COALESCE(d.{ins_sx2}, 0) - COALESCE(d.{del_sx2}, 0))"
+            );
+            let sy2 = format!(
+                "(COALESCE(st.{aux_sy2}, 0) + COALESCE(d.{ins_sy2}, 0) - COALESCE(d.{del_sy2}, 0))"
+            );
+
+            match &agg.function {
+                AggFunc::RegrCount => {
+                    // REGR_COUNT = n (number of non-null pairs)
+                    format!("CASE WHEN {n} <= 0 THEN 0 ELSE {n} END")
+                }
+                AggFunc::RegrAvgx => {
+                    // REGR_AVGX = SUM(X) / n
+                    format!("CASE WHEN {n} = 0 THEN NULL ELSE {sx} / {n} END")
+                }
+                AggFunc::RegrAvgy => {
+                    // REGR_AVGY = SUM(Y) / n
+                    format!("CASE WHEN {n} = 0 THEN NULL ELSE {sy} / {n} END")
+                }
+                AggFunc::CovarPop => {
+                    // COVAR_POP = (n*SXY - SX*SY) / (n*n)
+                    let numer = format!("({n} * {sxy} - {sx} * {sy})");
+                    let denom = format!("{n} * {n}");
+                    format!("CASE WHEN {n} = 0 THEN NULL ELSE {numer} / NULLIF({denom}, 0) END")
+                }
+                AggFunc::CovarSamp => {
+                    // COVAR_SAMP = (n*SXY - SX*SY) / (n*(n-1))
+                    let numer = format!("({n} * {sxy} - {sx} * {sy})");
+                    let denom = format!("{n} * ({n} - 1)");
+                    format!("CASE WHEN {n} <= 1 THEN NULL ELSE {numer} / NULLIF({denom}, 0) END")
+                }
+                AggFunc::RegrSxx => {
+                    // REGR_SXX = SUM(X²) - SUM(X)²/n = n*SX2 - SX*SX  (over n)
+                    // Actually: REGR_SXX = SUM((X - avg_x)²) = SX2 - SX²/n
+                    format!("CASE WHEN {n} = 0 THEN NULL ELSE {sx2} - {sx} * {sx} / {n} END")
+                }
+                AggFunc::RegrSyy => {
+                    // REGR_SYY = SUM((Y - avg_y)²) = SY2 - SY²/n
+                    format!("CASE WHEN {n} = 0 THEN NULL ELSE {sy2} - {sy} * {sy} / {n} END")
+                }
+                AggFunc::RegrSxy => {
+                    // REGR_SXY = SUM((X - avg_x)*(Y - avg_y)) = SXY - SX*SY/n
+                    format!("CASE WHEN {n} = 0 THEN NULL ELSE {sxy} - {sx} * {sy} / {n} END")
+                }
+                AggFunc::RegrSlope => {
+                    // REGR_SLOPE = REGR_SXY / REGR_SXX
+                    let sxy_expr = format!("({sxy} - {sx} * {sy} / {n})");
+                    let sxx_expr = format!("({sx2} - {sx} * {sx} / {n})");
+                    format!(
+                        "CASE WHEN {n} = 0 OR {sxx_expr} = 0 THEN NULL ELSE {sxy_expr} / {sxx_expr} END"
+                    )
+                }
+                AggFunc::RegrIntercept => {
+                    // REGR_INTERCEPT = AVG(Y) - REGR_SLOPE * AVG(X)
+                    let avg_y = format!("{sy} / {n}");
+                    let avg_x = format!("{sx} / {n}");
+                    let sxy_expr = format!("({sxy} - {sx} * {sy} / {n})");
+                    let sxx_expr = format!("({sx2} - {sx} * {sx} / {n})");
+                    let slope = format!("{sxy_expr} / NULLIF({sxx_expr}, 0)");
+                    format!(
+                        "CASE WHEN {n} = 0 OR {sxx_expr} = 0 THEN NULL ELSE {avg_y} - {slope} * {avg_x} END"
+                    )
+                }
+                AggFunc::RegrR2 => {
+                    // REGR_R2 = REGR_SXY² / (REGR_SXX * REGR_SYY)
+                    // When SXX = 0 and SYY = 0 → 1.0 (all points identical)
+                    // When SXX = 0 or SYY = 0 → NULL
+                    let sxy_expr = format!("({sxy} - {sx} * {sy} / {n})");
+                    let sxx_expr = format!("({sx2} - {sx} * {sx} / {n})");
+                    let syy_expr = format!("({sy2} - {sy} * {sy} / {n})");
+                    format!(
+                        "CASE WHEN {n} = 0 THEN NULL \
+                         WHEN {sxx_expr} = 0 AND {syy_expr} = 0 THEN 1.0 \
+                         WHEN {sxx_expr} = 0 OR {syy_expr} = 0 THEN NULL \
+                         ELSE ({sxy_expr}) * ({sxy_expr}) / ({sxx_expr} * {syy_expr}) END"
+                    )
+                }
+                AggFunc::Corr => {
+                    // CORR = REGR_SXY / SQRT(REGR_SXX * REGR_SYY)
+                    let sxy_expr = format!("({sxy} - {sx} * {sy} / {n})");
+                    let sxx_expr = format!("({sx2} - {sx} * {sx} / {n})");
+                    let syy_expr = format!("({sy2} - {sy} * {sy} / {n})");
+                    format!(
+                        "CASE WHEN {n} = 0 THEN NULL \
+                         WHEN {sxx_expr} = 0 OR {syy_expr} = 0 THEN NULL \
+                         ELSE {sxy_expr} / SQRT(ABS({sxx_expr} * {syy_expr})) END"
+                    )
+                }
+                _ => unreachable!(),
+            }
         }
         AggFunc::Min | AggFunc::Max => {
             // MIN/MAX merge with group-rescan fallback.

@@ -231,6 +231,11 @@ pub static PGS_BUFFER_PARTITIONING: GucSetting<Option<std::ffi::CString>> =
 /// deltas against the previous snapshot.
 pub static PGS_FOREIGN_TABLE_POLLING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// When `true`, materialized views referenced in DIFFERENTIAL/IMMEDIATE
+/// defining queries will be supported via a snapshot-comparison approach
+/// (same mechanism as foreign table polling).
+pub static PGS_MATVIEW_POLLING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Parallel refresh mode — controls whether the scheduler dispatches
 /// refresh work to dynamic background workers.
 ///
@@ -589,6 +594,18 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.matview_polling",
+        c"Enable polling-based CDC for materialized views.",
+        c"When true, materialized views in defining queries are supported via \
+           snapshot-comparison (same mechanism as foreign table polling). \
+           A local shadow table stores the previous state; EXCEPT ALL computes \
+           the delta on each refresh cycle.",
+        &PGS_MATVIEW_POLLING,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_string_guc(
         c"pg_trickle.parallel_refresh_mode",
         c"Parallel refresh mode: off, dry_run, or on.",
@@ -846,6 +863,11 @@ pub fn pg_trickle_buffer_partitioning() -> String {
 /// Returns whether foreign table polling CDC is enabled.
 pub fn pg_trickle_foreign_table_polling() -> bool {
     PGS_FOREIGN_TABLE_POLLING.get()
+}
+
+/// Returns whether materialized view polling CDC is enabled.
+pub fn pg_trickle_matview_polling() -> bool {
+    PGS_MATVIEW_POLLING.get()
 }
 
 /// Returns whether the tick watermark (CSS1) feature is enabled.

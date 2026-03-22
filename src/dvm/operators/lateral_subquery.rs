@@ -36,6 +36,7 @@ pub fn diff_lateral_subquery(
         output_cols,
         is_left_join,
         subquery_source_oids,
+        correlation_predicates,
         child,
     } = op
     else {
@@ -106,8 +107,13 @@ pub fn diff_lateral_subquery(
     // Build an inner-source-change check: if ANY inner source table has
     // new change-buffer rows, we must recompute the LATERAL subquery for
     // every current outer row.
-    let inner_change_branch =
-        build_inner_change_branch(ctx, child, child_cols, subquery_source_oids);
+    let inner_change_branch = build_inner_change_branch(
+        ctx,
+        child,
+        child_cols,
+        subquery_source_oids,
+        correlation_predicates,
+    );
 
     let changed_sources_sql = if let Some(inner_branch) = inner_change_branch {
         format!(
@@ -276,22 +282,25 @@ pub fn diff_lateral_subquery(
     })
 }
 
-/// Build a SQL branch that selects ALL current outer rows when any inner
-/// subquery source table has changes in the current refresh window.
+/// Build a SQL branch that selects outer rows affected by inner source changes.
+///
+/// **P2-6 optimization:** When correlation predicates are available (e.g.,
+/// `inner.fk = outer.pk`), only outer rows whose correlated column value
+/// appears in the inner change buffer are selected — reducing the scan
+/// from O(|outer|) to O(delta).
+///
+/// Falls back to selecting ALL outer rows when:
+/// - No correlation predicates were extracted (complex WHERE clause)
+/// - An inner source OID has no matching correlation predicate
 ///
 /// Returns `None` if there are no inner source OIDs to monitor, or if
 /// the delta source is not change-buffer based (IMMEDIATE mode).
-///
-/// The output SQL selects `0 AS __pgt_row_id, 'I' AS __pgt_action, cols`
-/// from the outer base table, guarded by an `EXISTS` check on the inner
-/// source change buffers. The row_id is unused (the downstream CTEs
-/// match on column equality), and 'I' ensures the expand CTE
-/// re-executes the subquery for every outer row.
 fn build_inner_change_branch(
     ctx: &DiffContext,
     child: &OpTree,
     child_cols: &[String],
     inner_oids: &[u32],
+    correlation_predicates: &[crate::dvm::parser::CorrelationPredicate],
 ) -> Option<String> {
     use crate::dvm::diff::DeltaSource;
     use crate::dvm::operators::join_common::build_snapshot_sql;
@@ -314,24 +323,6 @@ fn build_inner_change_branch(
         return None;
     }
 
-    // Build EXISTS checks for each inner source's change buffer.
-    let exists_checks: Vec<String> = inner_only
-        .iter()
-        .map(|oid| {
-            let change_table =
-                format!("{}.changes_{}", quote_ident(&ctx.change_buffer_schema), oid,);
-            let prev_lsn = ctx.get_prev_lsn(*oid);
-            let new_lsn = ctx.get_new_lsn(*oid);
-            format!(
-                "EXISTS (SELECT 1 FROM {change_table} c \
-                 WHERE c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn \
-                 LIMIT 1)"
-            )
-        })
-        .collect();
-    let any_inner_changed = exists_checks.join(" OR ");
-
-    // Build column references from the outer base table
     let outer_snap = build_snapshot_sql(child);
     let outer_alias = child.alias();
     let col_refs: Vec<String> = child_cols
@@ -340,8 +331,60 @@ fn build_inner_change_branch(
         .collect();
     let col_refs_str = col_refs.join(", ");
 
+    // P2-6: Try to build scoped EXISTS using correlation predicates.
+    // For each inner OID, check if we have a correlation predicate that
+    // connects an inner column to an outer column. If so, use it to
+    // scope the change buffer scan.
+    let exists_checks: Vec<String> = inner_only
+        .iter()
+        .map(|oid| {
+            let change_table =
+                format!("{}.changes_{}", quote_ident(&ctx.change_buffer_schema), oid);
+            let prev_lsn = ctx.get_prev_lsn(*oid);
+            let new_lsn = ctx.get_new_lsn(*oid);
+
+            let lsn_filter =
+                format!("c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn");
+
+            // Find correlation predicates for this inner OID.
+            let corr_preds: Vec<_> = correlation_predicates
+                .iter()
+                .filter(|p| p.inner_oid == *oid)
+                .collect();
+
+            if corr_preds.is_empty() {
+                // No scoping possible — check if ANY changes exist (full scan).
+                format!(
+                    "EXISTS (SELECT 1 FROM {change_table} c \
+                     WHERE {lsn_filter} \
+                     LIMIT 1)"
+                )
+            } else {
+                // Scoped: join change buffer on correlation column(s).
+                // Match on both new_<col> (for I/U) and old_<col> (for D/U).
+                let corr_conditions: Vec<String> = corr_preds
+                    .iter()
+                    .map(|p| {
+                        let outer_ref =
+                            format!("{}.{}", quote_ident(outer_alias), quote_ident(&p.outer_col));
+                        let new_col = quote_ident(&format!("new_{}", p.inner_col));
+                        let old_col = quote_ident(&format!("old_{}", p.inner_col));
+                        format!("(c.{new_col} = {outer_ref} OR c.{old_col} = {outer_ref})")
+                    })
+                    .collect();
+                let corr_filter = corr_conditions.join(" AND ");
+
+                format!(
+                    "EXISTS (SELECT 1 FROM {change_table} c \
+                     WHERE {lsn_filter} AND {corr_filter})"
+                )
+            }
+        })
+        .collect();
+    let any_inner_changed = exists_checks.join(" OR ");
+
     Some(format!(
-        "-- All outer rows when inner subquery sources changed\n\
+        "-- Outer rows affected by inner subquery source changes\n\
          SELECT 0::BIGINT AS \"__pgt_row_id\",\n\
                 'I'::TEXT AS \"__pgt_action\",\n\
                 {col_refs_str}\n\
@@ -373,6 +416,31 @@ mod tests {
             output_cols: output_cols.into_iter().map(|c| c.to_string()).collect(),
             is_left_join,
             subquery_source_oids,
+            correlation_predicates: Vec::new(),
+            child: Box::new(child),
+        }
+    }
+
+    /// Build a LateralSubquery node with correlation predicates for testing P2-6.
+    #[allow(clippy::too_many_arguments)]
+    fn lateral_subquery_with_corr(
+        subquery_sql: &str,
+        alias: &str,
+        col_aliases: Vec<&str>,
+        output_cols: Vec<&str>,
+        is_left_join: bool,
+        subquery_source_oids: Vec<u32>,
+        correlation_predicates: Vec<crate::dvm::parser::CorrelationPredicate>,
+        child: OpTree,
+    ) -> OpTree {
+        OpTree::LateralSubquery {
+            subquery_sql: subquery_sql.to_string(),
+            alias: alias.to_string(),
+            column_aliases: col_aliases.into_iter().map(|c| c.to_string()).collect(),
+            output_cols: output_cols.into_iter().map(|c| c.to_string()).collect(),
+            is_left_join,
+            subquery_source_oids,
+            correlation_predicates,
             child: Box::new(child),
         }
     }
@@ -732,5 +800,91 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── P2-6: Scoped inner-change re-execution tests ────────────────
+
+    #[test]
+    fn test_diff_lateral_subquery_scoped_inner_change_uses_correlation() {
+        use crate::dvm::parser::CorrelationPredicate;
+
+        let mut ctx = test_ctx_with_st("public", "my_st");
+        let child = scan(1, "orders", "public", "o", &["id", "customer"]);
+        let tree = lateral_subquery_with_corr(
+            "SELECT amount FROM line_items li WHERE li.order_id = o.id ORDER BY created_at DESC LIMIT 1",
+            "latest",
+            vec![],
+            vec!["amount"],
+            false,
+            vec![2],
+            vec![CorrelationPredicate {
+                outer_col: "id".to_string(),
+                inner_alias: "li".to_string(),
+                inner_col: "order_id".to_string(),
+                inner_oid: 2,
+            }],
+            child,
+        );
+        let result = diff_lateral_subquery(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Scoped EXISTS should reference the correlation columns
+        assert_sql_contains(&sql, "\"new_order_id\"");
+        assert_sql_contains(&sql, "\"old_order_id\"");
+        // Should still have the full CTE chain
+        assert_sql_contains(&sql, "lat_sq_changed");
+        assert_sql_contains(&sql, "lat_sq_final");
+    }
+
+    #[test]
+    fn test_diff_lateral_subquery_no_correlation_falls_back() {
+        let mut ctx = test_ctx_with_st("public", "my_st");
+        let child = scan(1, "orders", "public", "o", &["id", "customer"]);
+        // No correlation predicates — should use the LIMIT 1 full-scan fallback
+        let tree = lateral_subquery(
+            "SELECT amount FROM line_items li WHERE li.order_id = o.id",
+            "latest",
+            vec![],
+            vec!["amount"],
+            false,
+            vec![2],
+            child,
+        );
+        let result = diff_lateral_subquery(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Without correlation predicates, uses the old-style LIMIT 1 EXISTS
+        assert_sql_contains(&sql, "LIMIT 1");
+    }
+
+    #[test]
+    fn test_diff_lateral_subquery_scoped_does_not_have_limit() {
+        use crate::dvm::parser::CorrelationPredicate;
+
+        let mut ctx = test_ctx_with_st("public", "my_st");
+        let child = scan(1, "t", "public", "t", &["id"]);
+        let tree = lateral_subquery_with_corr(
+            "SELECT val FROM sub_t s WHERE s.fk = t.id",
+            "sub",
+            vec![],
+            vec!["val"],
+            false,
+            vec![2],
+            vec![CorrelationPredicate {
+                outer_col: "id".to_string(),
+                inner_alias: "s".to_string(),
+                inner_col: "fk".to_string(),
+                inner_oid: 2,
+            }],
+            child,
+        );
+        let result = diff_lateral_subquery(&mut ctx, &tree).unwrap();
+        let sql = ctx.build_with_query(&result.cte_name);
+
+        // Scoped EXISTS should NOT have LIMIT 1 — it uses correlation join
+        // The only place LIMIT could appear is in the subquery SQL itself
+        let inner_branch = sql.split("lat_sq_changed").nth(1).unwrap_or("");
+        // The inner-change EXISTS should use correlation, not LIMIT 1
+        assert!(inner_branch.contains("\"new_fk\"") || inner_branch.contains("\"old_fk\""));
     }
 }

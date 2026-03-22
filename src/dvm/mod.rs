@@ -428,6 +428,14 @@ pub fn query_sum2_aux_columns(defining_query: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Returns `(col_name, arg_sql)` tuples for each cross-product auxiliary
+/// column needed by CORR/COVAR/REGR_* aggregates (P3-2). Empty if none.
+pub fn query_covar_aux_columns(defining_query: &str) -> Vec<(String, String)> {
+    parse_defining_query(defining_query)
+        .map(|tree| tree.covar_aux_columns())
+        .unwrap_or_default()
+}
+
 /// Returns `(nonnull_col_name, arg_sql)` tuples for each non-DISTINCT SUM
 /// aggregate above a FULL JOIN child that needs an auxiliary nonnull-count
 /// column (`__pgt_aux_nonnull_*`) for P2-2 NULL-transition correction.

@@ -2040,6 +2040,87 @@ pub fn poll_foreign_table_changes(
     Ok(())
 }
 
+/// Set up polling-based CDC for a materialized view source (P2-4).
+///
+/// Identical to [`setup_foreign_table_polling`] — creates a snapshot table
+/// and change buffer so that EXCEPT ALL can compute deltas when the matview
+/// is refreshed externally.
+pub fn setup_matview_polling(
+    source_oid: pg_sys::Oid,
+    pgt_id: i64,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    let oid_u32 = source_oid.to_u32();
+
+    let already_tracked = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_change_tracking WHERE source_relid = $1)",
+        &[source_oid.into()],
+    )
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if !already_tracked {
+        let col_defs = resolve_source_column_defs(source_oid)?;
+
+        create_change_buffer_table(source_oid, change_schema, &col_defs)?;
+
+        let snapshot_table = format!("\"{change_schema}\".snapshot_{oid_u32}");
+        let source_table = Spi::get_one_with_args::<String>(
+            "SELECT $1::oid::regclass::text",
+            &[source_oid.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| {
+            PgTrickleError::NotFound(format!("Materialized view with OID {oid_u32} not found"))
+        })?;
+
+        Spi::run(&format!(
+            "CREATE TABLE IF NOT EXISTS {snapshot_table} (LIKE {source_table} INCLUDING ALL)"
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        Spi::run(&format!(
+            "INSERT INTO {snapshot_table} SELECT * FROM {source_table}"
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        Spi::run_with_args(
+            "INSERT INTO pgtrickle.pgt_change_tracking \
+             (source_relid, slot_name, tracked_by_pgt_ids) \
+             VALUES ($1, $2, ARRAY[$3])",
+            &[
+                source_oid.into(),
+                format!("matview_poll_{oid_u32}").as_str().into(),
+                pgt_id.into(),
+            ],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    } else {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_change_tracking \
+             SET tracked_by_pgt_ids = array_append(tracked_by_pgt_ids, $1) \
+             WHERE source_relid = $2 AND NOT ($1 = ANY(tracked_by_pgt_ids))",
+            &[pgt_id.into(), source_oid.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Poll a materialized view source for changes (P2-4).
+///
+/// Identical to [`poll_foreign_table_changes`] — uses EXCEPT ALL between
+/// the current matview contents and the snapshot to detect inserts/deletes.
+pub fn poll_matview_changes(
+    source_oid: pg_sys::Oid,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    // Delegate to the same implementation — the logic is identical regardless
+    // of whether the source is a foreign table or a materialized view.
+    poll_foreign_table_changes(source_oid, change_schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
