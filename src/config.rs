@@ -331,6 +331,14 @@ pub static PGS_MAX_FIXPOINT_ITERATIONS: GucSetting<i32> = GucSetting::<i32>::new
 /// are allowed and scheduled with fixed-point iteration.
 pub static PGS_ALLOW_CIRCULAR: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// G-7: Enable tiered refresh scheduling (Hot/Warm/Cold/Frozen).
+///
+/// When enabled, per-ST `refresh_tier` controls the effective schedule
+/// multiplier. Hot (1×), Warm (2×), Cold (10×), Frozen (skip entirely).
+/// User-set via `ALTER STREAM TABLE ... SET (tier = 'warm')`.
+/// Default tier for new STs is Hot (no change in behavior).
+pub static PGS_TIERED_SCHEDULING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -741,6 +749,18 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.tiered_scheduling",
+        c"Enable tiered refresh scheduling (Hot/Warm/Cold/Frozen).",
+        c"When enabled, per-ST refresh_tier controls the effective schedule \
+           multiplier. Hot refreshes at configured interval, Warm at 2x, \
+           Cold at 10x, Frozen skips entirely. Set per-ST tier via \
+           ALTER STREAM TABLE ... SET (tier = 'warm'). Default is off.",
+        &PGS_TIERED_SCHEDULING,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -975,6 +995,11 @@ pub fn pg_trickle_max_fixpoint_iterations() -> i32 {
 /// Returns whether circular (cyclic) dependencies are allowed (CYC-4).
 pub fn pg_trickle_allow_circular() -> bool {
     PGS_ALLOW_CIRCULAR.get()
+}
+
+/// G-7: Returns whether tiered refresh scheduling is enabled.
+pub fn pg_trickle_tiered_scheduling() -> bool {
+    PGS_TIERED_SCHEDULING.get()
 }
 
 #[cfg(test)]

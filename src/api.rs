@@ -362,6 +362,7 @@ fn create_or_replace_stream_table_impl(
                 config_diff.cdc_mode,
                 config_diff.append_only,
                 config_diff.pooler_compatibility_mode,
+                None, // tier: not set via create_or_replace
             )?;
 
             pgrx::info!(
@@ -2152,6 +2153,7 @@ fn alter_stream_table(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(Option<bool>, "NULL"),
     pooler_compatibility_mode: default!(Option<bool>, "NULL"),
+    tier: default!(Option<&str>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -2164,6 +2166,7 @@ fn alter_stream_table(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        tier,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -2182,6 +2185,7 @@ fn alter_stream_table_impl(
     cdc_mode: Option<&str>,
     append_only: Option<bool>,
     pooler_compatibility_mode: Option<bool>,
+    tier: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -2481,6 +2485,19 @@ fn alter_stream_table_impl(
             // since it will no longer be used.
             crate::refresh::invalidate_merge_cache(st.pgt_id);
         }
+    }
+
+    // G-7: Update refresh tier if explicitly set.
+    if let Some(tier_str) = tier {
+        use crate::scheduler::RefreshTier;
+        if !RefreshTier::is_valid_str(tier_str) {
+            return Err(PgTrickleError::InvalidArgument(format!(
+                "invalid tier value: '{}' (expected 'hot', 'warm', 'cold', or 'frozen')",
+                tier_str
+            )));
+        }
+        let normalized = tier_str.to_lowercase();
+        StreamTableMeta::update_refresh_tier(st.pgt_id, &normalized)?;
     }
 
     shmem::signal_dag_invalidation(st.pgt_id);
@@ -6565,6 +6582,7 @@ mod tests {
             scc_id: None,
             last_fixpoint_iterations: None,
             pooler_compatibility_mode: false,
+            refresh_tier: "hot".to_string(),
         }
     }
 

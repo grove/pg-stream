@@ -2914,6 +2914,7 @@ mod tests {
             scc_id: None,
             last_fixpoint_iterations: None,
             pooler_compatibility_mode: false,
+            refresh_tier: "hot".to_string(),
         }
     }
 

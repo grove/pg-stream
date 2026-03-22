@@ -53,6 +53,74 @@ use crate::shmem;
 use crate::version;
 use crate::wal_decoder;
 
+// ── G-7: Refresh tier classification ───────────────────────────────────
+
+/// G-7: Refresh tier for tiered scheduling.
+///
+/// Controls the effective schedule multiplier when `pg_trickle.tiered_scheduling`
+/// is enabled. User-assignable via `ALTER STREAM TABLE ... SET (tier = 'warm')`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefreshTier {
+    /// Refresh at configured schedule (1× multiplier). Default.
+    #[default]
+    Hot,
+    /// Refresh at 2× configured schedule.
+    Warm,
+    /// Refresh at 10× configured schedule.
+    Cold,
+    /// Skip refresh entirely (manually promoted back to Hot/Warm/Cold).
+    Frozen,
+}
+
+impl RefreshTier {
+    /// Parse from SQL string. Falls back to `Hot` for unknown values.
+    pub fn from_sql_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "hot" => RefreshTier::Hot,
+            "warm" => RefreshTier::Warm,
+            "cold" => RefreshTier::Cold,
+            "frozen" => RefreshTier::Frozen,
+            _ => RefreshTier::Hot,
+        }
+    }
+
+    /// SQL representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefreshTier::Hot => "hot",
+            RefreshTier::Warm => "warm",
+            RefreshTier::Cold => "cold",
+            RefreshTier::Frozen => "frozen",
+        }
+    }
+
+    /// Schedule multiplier for this tier.
+    ///
+    /// Returns `None` for Frozen (skip entirely).
+    pub fn schedule_multiplier(self) -> Option<f64> {
+        match self {
+            RefreshTier::Hot => Some(1.0),
+            RefreshTier::Warm => Some(2.0),
+            RefreshTier::Cold => Some(10.0),
+            RefreshTier::Frozen => None,
+        }
+    }
+
+    /// Validate a tier string. Returns `true` if recognized.
+    pub fn is_valid_str(s: &str) -> bool {
+        matches!(
+            s.to_lowercase().as_str(),
+            "hot" | "warm" | "cold" | "frozen"
+        )
+    }
+}
+
+impl std::fmt::Display for RefreshTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 // ── Sub-transaction RAII guard ─────────────────────────────────────────
 
 /// RAII guard for a PostgreSQL internal sub-transaction.
@@ -2433,10 +2501,21 @@ fn load_st_by_id(pgt_id: i64) -> Option<StreamTableMeta> {
 }
 
 /// Check if a ST is stale (staleness exceeds effective schedule or cron is due).
+///
+/// G-7: When tiered scheduling is enabled, the tier multiplier is applied
+/// to duration-based schedules. Frozen-tier STs always return `false`.
 fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
     // If not yet populated, always needs refresh
     if !st.is_populated {
         return true;
+    }
+
+    // G-7: When tiered scheduling is enabled, check tier first.
+    if config::pg_trickle_tiered_scheduling() {
+        let tier = RefreshTier::from_sql_str(&st.refresh_tier);
+        if tier == RefreshTier::Frozen {
+            return false;
+        }
     }
 
     // Check staleness vs schedule
@@ -2445,6 +2524,7 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
         let trimmed = schedule_str.trim();
         if trimmed.starts_with('@') || trimmed.contains(' ') {
             // Cron-based: check if the cron schedule says we're due
+            // (tier multiplier not applied to cron schedules)
             let last_refresh_epoch = Spi::get_one_with_args::<f64>(
                 "SELECT EXTRACT(EPOCH FROM last_refresh_at) FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
                 &[st.pgt_id.into()],
@@ -2461,11 +2541,20 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
         // This ensures the 1-minute schedule fires at most once per minute
         // regardless of whether the previous run found any data changes.
         if let Ok(max_secs) = crate::api::parse_duration(trimmed) {
+            // G-7: Apply tier multiplier when tiered scheduling is enabled.
+            let effective_secs = if config::pg_trickle_tiered_scheduling() {
+                let tier = RefreshTier::from_sql_str(&st.refresh_tier);
+                // Frozen is handled above; multiplier is always Some here.
+                let mult = tier.schedule_multiplier().unwrap_or(1.0);
+                ((max_secs as f64) * mult) as i64
+            } else {
+                max_secs
+            };
             let stale = Spi::get_one_with_args::<bool>(
                 "SELECT CASE WHEN last_refresh_at IS NULL THEN true \
                  ELSE EXTRACT(EPOCH FROM (now() - last_refresh_at)) > $2 END \
                  FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
-                &[st.pgt_id.into(), max_secs.into()],
+                &[st.pgt_id.into(), effective_secs.into()],
             )
             .unwrap_or(Some(false))
             .unwrap_or(false);
@@ -3902,5 +3991,66 @@ mod tests {
         // With no members, iter().any() returns false → not due.
         let result = unit.member_pgt_ids.iter().any(|_| true);
         assert!(!result);
+    }
+
+    // ── RefreshTier tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_refresh_tier_from_sql_str() {
+        assert_eq!(RefreshTier::from_sql_str("hot"), RefreshTier::Hot);
+        assert_eq!(RefreshTier::from_sql_str("WARM"), RefreshTier::Warm);
+        assert_eq!(RefreshTier::from_sql_str("Cold"), RefreshTier::Cold);
+        assert_eq!(RefreshTier::from_sql_str("FROZEN"), RefreshTier::Frozen);
+        assert_eq!(RefreshTier::from_sql_str("unknown"), RefreshTier::Hot);
+        assert_eq!(RefreshTier::from_sql_str(""), RefreshTier::Hot);
+    }
+
+    #[test]
+    fn test_refresh_tier_as_str() {
+        assert_eq!(RefreshTier::Hot.as_str(), "hot");
+        assert_eq!(RefreshTier::Warm.as_str(), "warm");
+        assert_eq!(RefreshTier::Cold.as_str(), "cold");
+        assert_eq!(RefreshTier::Frozen.as_str(), "frozen");
+    }
+
+    #[test]
+    fn test_refresh_tier_schedule_multiplier() {
+        assert_eq!(RefreshTier::Hot.schedule_multiplier(), Some(1.0));
+        assert_eq!(RefreshTier::Warm.schedule_multiplier(), Some(2.0));
+        assert_eq!(RefreshTier::Cold.schedule_multiplier(), Some(10.0));
+        assert_eq!(RefreshTier::Frozen.schedule_multiplier(), None);
+    }
+
+    #[test]
+    fn test_refresh_tier_is_valid_str() {
+        assert!(RefreshTier::is_valid_str("hot"));
+        assert!(RefreshTier::is_valid_str("WARM"));
+        assert!(RefreshTier::is_valid_str("Cold"));
+        assert!(RefreshTier::is_valid_str("FROZEN"));
+        assert!(!RefreshTier::is_valid_str(""));
+        assert!(!RefreshTier::is_valid_str("invalid"));
+    }
+
+    #[test]
+    fn test_refresh_tier_display() {
+        assert_eq!(format!("{}", RefreshTier::Hot), "hot");
+        assert_eq!(format!("{}", RefreshTier::Frozen), "frozen");
+    }
+
+    #[test]
+    fn test_refresh_tier_default() {
+        assert_eq!(RefreshTier::default(), RefreshTier::Hot);
+    }
+
+    #[test]
+    fn test_refresh_tier_roundtrip() {
+        for tier in [
+            RefreshTier::Hot,
+            RefreshTier::Warm,
+            RefreshTier::Cold,
+            RefreshTier::Frozen,
+        ] {
+            assert_eq!(RefreshTier::from_sql_str(tier.as_str()), tier);
+        }
     }
 }
