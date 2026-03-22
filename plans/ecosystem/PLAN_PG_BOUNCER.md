@@ -1,7 +1,7 @@
 # Plan: Connection Pooler (PgBouncer) Compatibility
 
-**Status:** PROPOSED
-**Target:** v0.9.0
+**Status:** IMPLEMENTED (0.10-adjustments)
+**Target:** v0.10.0
 
 ## Context
 

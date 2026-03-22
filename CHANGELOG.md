@@ -8,6 +8,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [Unreleased — v0.10.0 work-in-progress](#unreleased--v0100-work-in-progress)
 - [0.9.0 — 2026-03-20](#090--2026-03-20)
 - [0.8.0 — 2026-03-17](#080--2026-03-17)
 - [0.7.0 — 2026-03-16](#070--2026-03-16)
@@ -24,6 +25,68 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — 2026-02-26](#011--2026-02-26)
 - [0.1.0 — 2026-02-26](#010--2026-02-26)
 <!-- TOC end -->
+
+---
+
+## [Unreleased] — v0.10.0 work-in-progress
+
+### PgBouncer Compatibility
+
+- **PB1: Row-level locking replaces advisory locks.** The background
+  scheduler now uses `SELECT ... FOR UPDATE SKIP LOCKED` on the
+  `pgt_stream_tables` catalog row instead of `pg_advisory_lock()` /
+  `pg_advisory_unlock()` for concurrency control. This makes lock
+  acquisition transaction-scoped and fully compatible with transaction-mode
+  connection poolers. The `check_skip_needed()` probe uses a subtransaction
+  (via `Spi::connect`) so the lock is released immediately; the actual
+  refresh holds the row lock for its full duration.
+
+- **PB2: Per-stream-table `pooler_compatibility_mode`.** A new boolean
+  column `pooler_compatibility_mode` (default `false`) on
+  `pgt_stream_tables` controls whether a stream table operates in
+  pooler-safe mode:
+  - When `true`: prepared statements (`PREPARE`/`EXECUTE`) are bypassed
+    in the refresh engine (inline SQL used instead), and all `NOTIFY`
+    emissions (alerts, refresh completions) are suppressed for that ST.
+  - When `false` (default): behaviour is unchanged from v0.9.0.
+
+  Set via `create_stream_table(..., pooler_compatibility_mode => true)` or
+  `alter_stream_table('name', pooler_compatibility_mode => true)`.
+
+- **PB3: PgBouncer E2E test suite.** New test file
+  `tests/e2e_pgbouncer_tests.rs` boots a PgBouncer container in
+  transaction-pool mode alongside the pg_trickle E2E image on a shared
+  Docker network. Tests cover: connectivity through PgBouncer, creating
+  stream tables with pooler mode, manual FULL refresh through the pooler,
+  source-change re-refresh, alter to enable pooler mode, NOTIFY
+  suppression verification, and drop through PgBouncer.
+  Run with `just test-pgbouncer`.
+
+### DVM Correctness & Performance
+
+- **P2-1: DRed for DIFFERENTIAL mode** — Recursive CTE stream tables in
+  DIFFERENTIAL mode no longer fall back to O(n) full recomputation when
+  rows are deleted or updated. The Delete-and-Rederive (DRed) algorithm
+  now handles mixed INSERT/DELETE/UPDATE changes in both DIFFERENTIAL
+  (ChangeBuffer) and IMMEDIATE (TransitionTable) modes via the same
+  four-phase algorithm:
+  1. Semi-naive INSERT propagation (insert new rows bottom-up)
+  2. Over-deletion cascade from ST storage (chase all transitively-derived
+     rows via the existing storage graph)
+  3. Rederivation from current source-table data (restore rows that still
+     have an alternative derivation path)
+  4. Combine inserts with net deletions
+
+  This delivers O(delta) refresh cost instead of O(n) for DELETE/UPDATE
+  workloads on recursive CTE stream tables in DIFFERENTIAL mode.
+  Notably, DRed now correctly handles computed derived columns (e.g.
+  `path = ancestor.path || ' > ' || node.name`) — all descendent paths
+  are updated when an ancestor node is renamed.
+
+  Three new targeted E2E tests cover this scenario
+  (`test_dred_differential_update_cascades_derived_path`,
+  `test_dred_differential_reparent_updates_depth`,
+  `test_dred_differential_multi_level_path_cascade`).
 
 ---
 

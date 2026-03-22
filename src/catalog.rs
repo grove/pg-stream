@@ -70,6 +70,10 @@ pub struct StreamTableMeta {
     /// Number of fixpoint iterations in the last SCC convergence (CYC-5).
     /// `None` for non-cyclic stream tables or if never iterated.
     pub last_fixpoint_iterations: Option<i32>,
+    /// PB2: When true, the refresh engine skips `PREPARE`/`EXECUTE` for this
+    /// stream table and suppresses `NOTIFY` emissions, enabling compatibility
+    /// with PgBouncer transaction-mode pooling.
+    pub pooler_compatibility_mode: bool,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -180,13 +184,14 @@ impl StreamTableMeta {
         has_keyless_source: bool,
         requested_cdc_mode: Option<&str>,
         is_append_only: bool,
+        pooler_compatibility_mode: bool,
     ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
                     "INSERT INTO pgtrickle.pgt_stream_tables \
-                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode, is_append_only) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode, is_append_only, pooler_compatibility_mode) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -206,6 +211,7 @@ impl StreamTableMeta {
                         has_keyless_source.into(),
                         requested_cdc_mode.into(),
                         is_append_only.into(),
+                        pooler_compatibility_mode.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -228,7 +234,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -255,7 +261,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -287,7 +293,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -314,7 +320,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -345,7 +351,7 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -613,6 +619,20 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// PB2: Update the pooler compatibility mode flag for a stream table.
+    pub fn update_pooler_compatibility_mode(
+        pgt_id: i64,
+        enabled: bool,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET pooler_compatibility_mode = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[enabled.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the SCC identifier for a stream table (CYC-3).
     ///
     /// `scc_id` — the SCC group identifier, or `None` to clear (no cycle).
@@ -802,6 +822,7 @@ impl StreamTableMeta {
         let is_append_only = table.get::<bool>(26).map_err(map_spi)?.unwrap_or(false);
         let scc_id = table.get::<i32>(27).map_err(map_spi)?;
         let last_fixpoint_iterations = table.get::<i32>(28).map_err(map_spi)?;
+        let pooler_compatibility_mode = table.get::<bool>(29).map_err(map_spi)?.unwrap_or(false);
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -832,6 +853,7 @@ impl StreamTableMeta {
             is_append_only,
             scc_id,
             last_fixpoint_iterations,
+            pooler_compatibility_mode,
         })
     }
 
@@ -917,6 +939,7 @@ impl StreamTableMeta {
         let is_append_only = row.get::<bool>(26).map_err(map_spi)?.unwrap_or(false);
         let scc_id = row.get::<i32>(27).map_err(map_spi)?;
         let last_fixpoint_iterations = row.get::<i32>(28).map_err(map_spi)?;
+        let pooler_compatibility_mode = row.get::<bool>(29).map_err(map_spi)?.unwrap_or(false);
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -947,6 +970,7 @@ impl StreamTableMeta {
             is_append_only,
             scc_id,
             last_fixpoint_iterations,
+            pooler_compatibility_mode,
         })
     }
 }

@@ -2,7 +2,7 @@
 
 > **Last updated:** 2026-03-20
 > **Latest release:** 0.9.0 (2026-03-20)
-> **Current milestone:** v0.10.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
+> **Current milestone:** v0.10.0 — Connection Pooler Compatibility, DVM Hardening & Infrastructure Prep
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -26,10 +26,10 @@ coverage, all in plain language.
 - [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
 - [v0.8.0 — pg_dump Support & Test Hardening](#v080--pg_dump-support--test-hardening)
 - [v0.9.0 — Incremental Aggregate Maintenance](#v090--incremental-aggregate-maintenance)
-- [v0.10.0 — Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep](#v0100--connection-pooler-compatibility-prometheus--grafana-observability-anomaly-detection--infrastructure-prep)
-- [v0.11.0 — Partitioned Stream Tables & Operational Scale](#v0110--partitioned-stream-tables--operational-scale)
-- [v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compatibility](#v0120--multi-source-delta-batching-cdc-research--pg-backward-compatibility)
-- [v0.13.0 — Core Refresh Optimizations, Scalability Foundations & UNLOGGED Buffers](#v0130--core-refresh-optimizations-scalability-foundations--unlogged-buffers)
+- [v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Core Refresh Optimizations & Infrastructure Prep](#v0100--dvm-hardening-connection-pooler-compatibility-core-refresh-optimizations--infrastructure-prep)
+- [v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability & Operational Scale](#v0110--partitioned-stream-tables-prometheus--grafana-observability--operational-scale)
+- [v0.12.0 — Anomalous Change Detection, CDC Research & PG Backward Compatibility](#v0120--anomalous-change-detection-cdc-research--pg-backward-compatibility)
+- [v0.13.0 — Scalability Foundations & UNLOGGED Buffers](#v0130--scalability-foundations--unlogged-buffers)
 - [v0.14.0 — Native DDL Syntax, External Test Suites & Integration](#v0140--native-ddl-syntax-external-test-suites--integration)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale & Ecosystem](#post-10--scale--ecosystem)
@@ -58,8 +58,8 @@ phases are complete. This roadmap tracks the path from the v0.1.x series to
                                                                      │
                                                                      └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
                                                                         │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │
-                                                                        │Pooler  │─│Incr.Agg│─│Observ., │─│Partn.   │─│Delta,   │
-                                                                        │Compat. │ │IVM     │ │Fuse&Dmp │ │&Scale   │ │CDC&PGBk │
+                                                                        │Pooler  │─│Incr.Agg│─│Pooler   │─│Partn.   │─│Fuse,    │
+                                                                        │Compat. │ │IVM     │ │&DVM     │ │Obs.&Sc. │ │CDC&PGBk │
                                                                         └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘
               │
               └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
@@ -1561,15 +1561,15 @@ These items are correct as implemented but scale with data size rather than delt
 
 ---
 
-## v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Prometheus & Grafana Observability, Anomaly Detection & Infrastructure Prep
+## v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Core Refresh Optimizations & Infrastructure Prep
 
 **Goal:** Land deferred DVM correctness and performance improvements
 (recursive CTE DRed, FULL OUTER JOIN aggregate fix, LATERAL scoping,
-Welford regression aggregates, multi-source delta merging), enable
-cloud-native PgBouncer transaction-mode deployments via an opt-in
-compatibility mode, ship ready-made Prometheus/Grafana monitoring so the
-product is externally visible and monitored; protect against anomalous
-change spikes with a configurable fuse; and complete the pre-1.0 packaging
+Welford regression aggregates, multi-source delta merging), deliver the
+first wave of refresh performance optimizations (index-aware MERGE,
+predicate pushdown, change buffer compaction, cost-based refresh strategy),
+enable cloud-native PgBouncer transaction-mode deployments via an opt-in
+compatibility mode, and complete the pre-1.0 packaging
 and deployment infrastructure.
 
 ### Connection Pooler Compatibility
@@ -1586,67 +1586,15 @@ and deployment infrastructure.
 pg_trickle uses session-level advisory locks and `PREPARE` statements that are
 incompatible with PgBouncer transaction-mode pooling. This section introduces an opt-in graceful degradation layer for connection pooler compatibility.
 
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| PB1 | Replace `pg_advisory_lock()` with catalog row-level locking (`FOR UPDATE SKIP LOCKED`) | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
-| PB2 | Add `pooler_compatibility_mode` catalog column directly to `pgt_stream_tables` via `CREATE STREAM TABLE ... WITH (...)` or `alter_stream_table()` to bypass `PREPARE` statements and skip `NOTIFY` locally | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
-| PB3 | E2E validation against PgBouncer transaction-mode (Docker Compose with pooler sidecar) | 1–2d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| PB1 | Replace `pg_advisory_lock()` with catalog row-level locking (`FOR UPDATE SKIP LOCKED`) | 3–4d | ✅ Done (0.10-adjustments) | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
+| PB2 | Add `pooler_compatibility_mode` catalog column directly to `pgt_stream_tables` via `CREATE STREAM TABLE ... WITH (...)` or `alter_stream_table()` to bypass `PREPARE` statements and skip `NOTIFY` locally | 3–4d | ✅ Done (0.10-adjustments) | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
+| PB3 | E2E validation against PgBouncer transaction-mode (Docker Compose with pooler sidecar) | 1–2d | ✅ Done (0.10-adjustments) | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
+
+> ⚠️ PB1 — **`SKIP LOCKED` fails silently, not safely.** `pg_advisory_lock()` blocks until the lock is granted, guaranteeing mutual exclusion. `FOR UPDATE SKIP LOCKED` returns **zero rows immediately** if the row is already locked — meaning a second worker will simply not acquire the lock and proceed as if uncontested, potentially running a concurrent refresh on the same stream table. Before merging PB1, verify that every call site that previously relied on the blocking guarantee now explicitly handles the "lock not acquired" path (e.g. skip this cycle and retry) rather than silently proceeding. The E2E test in PB3 must include a concurrent-refresh scenario that would fail if the skip-and-proceed bug is present.
 
 > **PgBouncer compatibility subtotal: ~7–10 days**
-
-### Prometheus & Grafana Observability
-
-> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
-> their databases. This ships ready-to-use configuration files — no custom
-> code, no extension changes — that plug into the standard `postgres_exporter`
-> and light up a Grafana dashboard showing refresh latency, staleness, error
-> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
-> alerting rules so you get paged when a stream table goes stale or starts
-> error-looping. A Docker Compose file lets you try the full observability
-> stack with a single `docker compose up`.
-
-Zero-code monitoring integration. All config files live in a new
-`monitoring/` directory in the main repo (or a separate
-`pgtrickle-monitoring` repo). Queries use existing views
-(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
-| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
-
-> **Observability subtotal: ~12 hours**
-
-### Anomalous Change Detection (Fuse)
-
-> **In plain terms:** Imagine a source table suddenly receives a
-> million-row batch delete — a bug, runaway script, or intentional purge.
-> Without a fuse, pg_trickle would try to process all of it and potentially
-> overload the database. This adds a circuit breaker: you set a ceiling
-> (e.g. "never process more than 50,000 changes at once"), and if that
-> limit is hit the stream table pauses and sends a notification. You
-> investigate, fix the root cause, then resume with `reset_fuse()` and
-> choose how to recover (apply the changes, reinitialize from scratch, or
-> skip them entirely).
-
-Per-stream-table fuse that blows when the change buffer row count exceeds a
-configurable fixed ceiling or an adaptive μ+kσ threshold derived from
-`pgt_refresh_history`. A blown fuse halts refresh and emits a
-`pgtrickle_alert` NOTIFY; `reset_fuse()` resumes with a chosen recovery
-action.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| FUSE-1 | Catalog: fuse state columns on `pgt_stream_tables` (`fuse_mode`, `fuse_state`, `fuse_ceiling`, `fuse_sensitivity`, `blown_at`, `blow_reason`) | 1–2h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-2 | `alter_stream_table()` new params: `fuse`, `fuse_ceiling`, `fuse_sensitivity` | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-3 | `reset_fuse(name, action => 'apply'\|'reinitialize'\|'skip_changes')` SQL function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-4 | `fuse_status()` introspection function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-5 | Scheduler pre-check: count change buffer rows; evaluate threshold; blow fuse + NOTIFY if exceeded | 2–3h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-6 | E2E tests: normal baseline, spike → blow, reset, diamond/DAG interaction | 4–6h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-
-> **Anomalous change detection subtotal: ~10–14 hours**
 
 ### DVM Correctness & Performance (deferred from v0.9.0)
 
@@ -1657,7 +1605,7 @@ action.
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** DELETE/UPDATE against a recursive CTE source falls back to O(n) full recompute + diff. Implement DRed for `DeltaSource::ChangeBuffer` to maintain O(delta) cost. | 2–3 wk | ⬜ Not started | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
+| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** DELETE/UPDATE against a recursive CTE source falls back to O(n) full recompute + diff. Implement DRed for `DeltaSource::ChangeBuffer` to maintain O(delta) cost. | 2–3 wk | ✅ Done (0.10-adjustments) | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
 | P2-2 | **SUM NULL-transition rescan for FULL OUTER JOIN aggregates.** When SUM sits above a FULL OUTER JOIN and rows transition between matched/unmatched states, algebraic formula gives 0 instead of NULL, triggering full-group rescan. Implement targeted correction. | 1–2 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
 | P2-4 | **Materialized view sources in IMMEDIATE mode (EC-09).** Implement polling-change-detection wrapper for `REFRESH MATERIALIZED VIEW`-sourced queries in IMMEDIATE mode. | 2–3 wk | ⬜ Not started | [plans/PLAN_EDGE_CASES.md §EC-09](plans/PLAN_EDGE_CASES.md) |
 | P2-6 | **LATERAL subquery inner-source scoped re-execution.** Gate outer-table scan behind a join to inner delta rows so only correlated outer rows are re-executed, reducing O(\|outer\|) to O(delta). | 1–2 wk | ⬜ Not started | [src/dvm/operators/lateral_subquery.rs](src/dvm/operators/lateral_subquery.rs) |
@@ -1672,7 +1620,26 @@ action.
 
 > **DVM deferred items subtotal: ~12–19 weeks**
 
-> **v0.10.0 total: ~34–48 hours + ~12–19 weeks DVM work**
+### Core Refresh Optimizations (Wave 2)
+
+> Read the risk analyses in
+> [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) before implementing.
+> Implement in this order: A-4 (no schema change), B-2, C-4, then B-4.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| A-4 | **Index-Aware MERGE Planning.** Planner hint injection (`enable_seqscan = off` for small-delta / large-target); covering index auto-creation on `__pgt_row_id`. No schema changes required. | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
+| B-2 | **Delta Predicate Pushdown.** Push WHERE predicates from defining query into change-buffer `delta_scan` CTE; `OR old_col` handling for deletions; 5–10× delta-row-volume reduction for selective queries. | 2–3 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C-4 | **Change Buffer Compaction.** Net-change compaction (INSERT+DELETE=no-op; UPDATE+UPDATE=single row); run when buffer exceeds `pg_trickle.compact_threshold`; use advisory lock to serialise with refresh. | 2–3 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
+| B-4 | **Cost-Based Refresh Strategy.** Replace fixed `differential_max_change_ratio` with a history-driven cost model fitted on `pgt_refresh_history`; cold-start fallback to fixed threshold. | 2–3 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-4](plans/performance/PLAN_NEW_STUFF.md) |
+
+> ⚠️ C-4: The compaction DELETE **must use `seq` (the sequence primary key) not `ctid`** as
+> the stable row identifier. `ctid` changes under VACUUM and will silently delete the wrong
+> rows. See the corrected SQL and risk analysis in PLAN_NEW_STUFF.md §C-4.
+
+> ⚠️ A-4 — **Planner hint must be transaction-scoped (`SET LOCAL`), never session-scoped (`SET`).** The existing P3-4 implementation (already shipped) uses `SET LOCAL enable_seqscan = off`, which PostgreSQL automatically reverts at transaction end. Any extension of A-4 (e.g. the covering index auto-creation path) must continue to use `SET LOCAL`. Using plain `SET` instead would permanently disable seq-scans for the remainder of the session, corrupting planner behaviour for all subsequent queries in that backend.
+
+> **Core refresh optimizations subtotal: ~7–11 weeks**
 
 ### Scheduler & DAG Scalability
 
@@ -1682,32 +1649,45 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 |------|-------------|--------|--------|-----|
 | G-7 | **Tiered refresh scheduling (Hot/Warm/Cold/Frozen).** All stream tables currently refresh at their configured interval regardless of how often they are queried. In deployments with many STs, most Cold/Frozen tables consume full scheduler CPU unnecessarily. Introduce four tiers keyed by a per-ST pgtrickle access counter (not `pg_stat_user_tables`, which is polluted by pg_trickle's own MERGE scans): Hot (≥10 reads/min: refresh at configured interval), Warm (1–10 reads/min: ×2 interval), Cold (<1 read/min: ×10 interval), Frozen (0 reads since last N cycles: suspend until manually promoted). A single GUC `pg_trickle.tiered_scheduling` (default off) gates the feature. | 3–4 wk | ⬜ Not started | [src/scheduler.rs](src/scheduler.rs) · [plans/performance/PLAN_NEW_STUFF.md §C-1](plans/performance/PLAN_NEW_STUFF.md) |
 | G-8 | **Incremental DAG rebuild on DDL changes.** Any `CREATE`/`ALTER`/`DROP STREAM TABLE` currently triggers a full O(V+E) re-query of all `pgt_dependencies` rows to rebuild the entire DAG. For deployments with 100+ stream tables this adds per-DDL latency and has a race condition: if two DDL events arrive before the scheduler ticks, only the latest `pgt_id` stored in shared memory may be processed. Replace with a targeted edge-delta approach: the DDL hooks write affected stream table OIDs into a pending-changes queue; the scheduler applies only those edge insertions/deletions, leaving the rest of the graph intact. | 2–3 wk | ⬜ Not started | [src/dag.rs](src/dag.rs) · [src/scheduler.rs](src/scheduler.rs) · [plans/performance/PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C2-1 | **Ring-buffer DAG invalidation.** Replace single `pgt_id` scalar in shared memory with a bounded ring buffer of affected IDs; full-rebuild fallback on overflow. Hard prerequisite for correctness of G-8 under rapid DDL changes. | 1 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C2-2 | **Incremental topo-sort.** Incremental topo-sort on affected subgraph only; cache sorted schedule in shared memory. | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
 
-> **Scheduler & DAG scalability subtotal: ~5–7 weeks**
+> ⚠️ A single `pgt_id` scalar in shared memory is vulnerable to overwrite when two DDL
+> changes arrive between scheduler ticks — use a ring buffer (C2-1) or fall back to full rebuild.
+> See PLAN_NEW_STUFF.md §C-2 risk analysis.
+
+> **Scheduler & DAG scalability subtotal: ~7–10 weeks**
+
+> **v0.10.0 total: ~34–48 hours + ~26–40 weeks DVM & refresh work**
 
 **Exit criteria:**
-- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
-- [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers
 - [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.9.0 → 0.10.0`)
 - [ ] All public documentation current and reviewed
 - [ ] G-7: Tiered scheduling (Hot/Warm/Cold/Frozen) implemented; `pg_trickle.tiered_scheduling` GUC gating the feature
 - [ ] G-8: Incremental DAG rebuild implemented; DDL-triggered edge-delta replaces full O(V+E) re-query
-- [ ] P2-1: Recursive CTE DRed for DIFFERENTIAL mode (O(delta) instead of O(n) recompute)
+- [ ] C2-1: Ring-buffer DAG invalidation safe under rapid consecutive DDL changes
+- [ ] C2-2: Incremental topo-sort caches sorted schedule; verified by property-based test
+- [x] P2-1: Recursive CTE DRed for DIFFERENTIAL mode (O(delta) instead of O(n) recompute) — **implemented in 0.10-adjustments**
 - [ ] P2-2: SUM NULL-transition correction for FULL OUTER JOIN aggregates
 - [ ] P2-4: Materialized view sources supported in IMMEDIATE mode
 - [ ] P2-6: LATERAL subquery inner-source scoped re-execution (O(delta) instead of O(|outer|))
 - [ ] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns for O(1) algebraic maintenance
 - [ ] B3-2: Merged-delta weight aggregation passes property-based correctness proofs
 - [ ] B3-3: Property-based tests for simultaneous multi-source changes
+- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta; `SET LOCAL` confirmed (not `SET`) so hint reverts at transaction end
+- [ ] B-2: Predicate pushdown reduces delta volume for selective queries (E2E benchmark)
+- [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
+- [ ] B-4: Cost model self-calibrates from refresh history; correctly selects FULL for join_agg at 10% change rate
+- [ ] PB1: Concurrent-refresh scenario included in PB3 E2E test; `SKIP LOCKED` "not acquired" path skips cycle rather than proceeding — **partially done: row-level locking implemented, scheduler skip path handles zero-row result, PgBouncer E2E harness created; concurrent-refresh stress test deferred to v0.10.0 hardening**
 
 ---
 
-## v0.11.0 — Partitioned Stream Tables & Operational Scale
+## v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability & Operational Scale
 
 **Goal:** Enable stream table storage to be declaratively partitioned (scope MERGE
-to affected partitions for 100× I/O reduction on large tables), make the DAG
-rebuild incremental for large multi-ST deployments, and add per-database worker
-quotas for multi-tenant environments.
+to affected partitions for 100× I/O reduction on large tables), add per-database worker
+quotas for multi-tenant environments, and ship ready-made Prometheus/Grafana
+monitoring so the product is externally visible and monitored.
 
 ### Partitioned Stream Tables — Storage (A-1)
 
@@ -1739,19 +1719,6 @@ quotas for multi-tenant environments.
 
 > **Partitioned stream tables subtotal: ~5–7 weeks**
 
-### Incremental DAG Rebuild (C-2)
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| C2-1 | Replace single `pgt_id` scalar in shared memory with a bounded ring buffer of affected IDs; full-rebuild fallback on overflow | 1 wk | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
-| C2-2 | Incremental topo-sort on affected subgraph; cache sorted schedule in shared memory | 1–2 wk | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
-
-> ⚠️ A single `pgt_id` scalar in shared memory is vulnerable to overwrite when two DDL
-> changes arrive between scheduler ticks — use a ring buffer or fall back to full rebuild.
-> See PLAN_NEW_STUFF.md §C-2 risk analysis.
-
-> **Incremental DAG rebuild subtotal: ~2–3 weeks**
-
 ### Multi-Database Scheduler Isolation (C-3)
 
 | Item | Description | Effort | Ref |
@@ -1760,23 +1727,77 @@ quotas for multi-tenant environments.
 
 > **Multi-DB isolation subtotal: ~2–3 weeks**
 
-> **v0.11.0 total: ~9–13 weeks**
+### Prometheus & Grafana Observability
+
+> **In plain terms:** Most teams already run Prometheus and Grafana to monitor
+> their databases. This ships ready-to-use configuration files — no custom
+> code, no extension changes — that plug into the standard `postgres_exporter`
+> and light up a Grafana dashboard showing refresh latency, staleness, error
+> rates, CDC lag, and per-stream-table detail. Also includes Prometheus
+> alerting rules so you get paged when a stream table goes stale or starts
+> error-looping. A Docker Compose file lets you try the full observability
+> stack with a single `docker compose up`.
+
+Zero-code monitoring integration. All config files live in a new
+`monitoring/` directory in the main repo (or a separate
+`pgtrickle-monitoring` repo). Queries use existing views
+(`pg_stat_stream_tables`, `check_cdc_health()`, `quick_health`).
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
+| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+
+> **Observability subtotal: ~12 hours**
+
+> **v0.11.0 total: ~7–10 weeks + ~12 hours observability**
 
 **Exit criteria:**
 - [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog
 - [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction)
-- [ ] Ring-buffer DAG invalidation safe under rapid consecutive DDL changes (property-based test)
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
+- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
 - [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)
 
 ---
 
-## v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compatibility
+## v0.12.0 — Anomalous Change Detection, CDC Research & PG Backward Compatibility
 
-**Goal:** Implement multi-source delta merging for join queries where multiple
-source tables change simultaneously, conduct a formal research spike for
-the custom logical decoding output plugin (D-2) before committing to a full
-implementation, and widen the deployment target to PG 16–18.
+**Goal:** Protect against anomalous change spikes with a configurable fuse,
+conduct a formal research spike for the custom logical decoding output plugin
+(D-2) before committing to a full implementation, and widen the deployment
+target to PG 16–18.
+
+### Anomalous Change Detection (Fuse)
+
+> **In plain terms:** Imagine a source table suddenly receives a
+> million-row batch delete — a bug, runaway script, or intentional purge.
+> Without a fuse, pg_trickle would try to process all of it and potentially
+> overload the database. This adds a circuit breaker: you set a ceiling
+> (e.g. "never process more than 50,000 changes at once"), and if that
+> limit is hit the stream table pauses and sends a notification. You
+> investigate, fix the root cause, then resume with `reset_fuse()` and
+> choose how to recover (apply the changes, reinitialize from scratch, or
+> skip them entirely).
+
+Per-stream-table fuse that blows when the change buffer row count exceeds a
+configurable fixed ceiling or an adaptive μ+kσ threshold derived from
+`pgt_refresh_history`. A blown fuse halts refresh and emits a
+`pgtrickle_alert` NOTIFY; `reset_fuse()` resumes with a chosen recovery
+action.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| FUSE-1 | Catalog: fuse state columns on `pgt_stream_tables` (`fuse_mode`, `fuse_state`, `fuse_ceiling`, `fuse_sensitivity`, `blown_at`, `blow_reason`) | 1–2h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-2 | `alter_stream_table()` new params: `fuse`, `fuse_ceiling`, `fuse_sensitivity` | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-3 | `reset_fuse(name, action => 'apply'\|'reinitialize'\|'skip_changes')` SQL function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-4 | `fuse_status()` introspection function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-5 | Scheduler pre-check: count change buffer rows; evaluate threshold; blow fuse + NOTIFY if exceeded | 2–3h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| FUSE-6 | E2E tests: normal baseline, spike → blow, reset, diamond/DAG interaction | 4–6h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+
+> **Anomalous change detection subtotal: ~10–14 hours**
 
 ### Async CDC — Research Spike (D-2)
 
@@ -1824,9 +1845,10 @@ implementation, and widen the deployment target to PG 16–18.
 
 > **Backward compatibility subtotal: ~38–56 hours**
 
-> **v0.12.0 total: ~13–19 weeks**
+> **v0.12.0 total: ~13–19 weeks + ~10–14 hours fuse**
 
 **Exit criteria:**
+- [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers
 - [ ] D-2 spike: prototype exists; SPI-in-commit-callback constraint validated; RFC written
 - [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
 - [ ] WAL decoder validated against PG 16–17 `pgoutput` format
@@ -1835,32 +1857,11 @@ implementation, and widen the deployment target to PG 16–18.
 
 ---
 
-## v0.13.0 — Core Refresh Optimizations, Scalability Foundations & UNLOGGED Buffers
+## v0.13.0 — Scalability Foundations & UNLOGGED Buffers
 
-**Goal:** Deliver the second and third waves of performance optimizations —
-index-aware MERGE, predicate pushdown, change buffer compaction, cost-based
-refresh strategy, columnar change tracking, tiered scheduling, and shared
-change buffers — alongside opt-in UNLOGGED change buffers for reduced WAL
-amplification.
-
-### Core Refresh Optimizations (Wave 2)
-
-> Read the risk analyses in
-> [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) before implementing.
-> Implement in this order: A-4 (no schema change), B-2, C-4, then B-4.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| A-4 | Index-Aware MERGE Planning — planner hint injection (`enable_seqscan = off` for small-delta / large-target); covering index auto-creation on `__pgt_row_id` | 1–2 wk | [PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
-| B-2 | Delta Predicate Pushdown — push WHERE predicates from defining query into change-buffer `delta_scan` CTE; `OR old_col` handling for deletions; 5–10× delta-row-volume reduction for selective queries | 2–3 wk | [PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
-| C-4 | Change Buffer Compaction — net-change compaction (INSERT+DELETE=no-op; UPDATE+UPDATE=single row); run when buffer exceeds `pg_trickle.compact_threshold`; use advisory lock to serialise with refresh | 2–3 wk | [PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
-| B-4 | Cost-Based Refresh Strategy — replace fixed `differential_max_change_ratio` with a history-driven cost model fitted on `pgt_refresh_history`; cold-start fallback to fixed threshold | 2–3 wk | [PLAN_NEW_STUFF.md §B-4](plans/performance/PLAN_NEW_STUFF.md) |
-
-> ⚠️ C-4: The compaction DELETE **must use `seq` (the sequence primary key) not `ctid`** as
-> the stable row identifier. `ctid` changes under VACUUM and will silently delete the wrong
-> rows. See the corrected SQL and risk analysis in PLAN_NEW_STUFF.md §C-4.
-
-> **Core refresh optimizations subtotal: ~60–130h (A-4, B-2, C-4, B-4)**
+**Goal:** Deliver the scalability foundations — columnar change tracking, advanced
+tiered scheduling, and shared change buffers — alongside opt-in UNLOGGED change
+buffers for reduced WAL amplification.
 
 ### Scalability Foundations (Wave 3)
 
@@ -1899,13 +1900,9 @@ amplification.
 
 > **D-1 subtotal: ~1–2 weeks**
 
-> **v0.13.0 total: ~16–31 weeks**
+> **v0.13.0 total: ~9–18 weeks**
 
 **Exit criteria:**
-- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta
-- [ ] B-2: Predicate pushdown reduces delta volume for selective queries (E2E benchmark)
-- [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
-- [ ] B-4: Cost model self-calibrates from refresh history; correctly selects FULL for join_agg at 10% change rate
 - [ ] A-2: Bitmask skips irrelevant rows; UPDATE-only path reduces delta volume (benchmarked)
 - [ ] C-1: Tier classification uses delta-based read tracking; Cold STs skip refresh correctly
 - [ ] D-4: Shared buffer serves multiple STs; multi-frontier cleanup prevents premature deletion
@@ -2101,10 +2098,10 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
 | v0.8.0 — pg_dump Support & Test Hardening | ~16–21d | — | |
 | v0.9.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
-| v0.10.0 — Connection Pooler Compatibility, Observability & Anomaly Detection | ~7–10d + ~22–26h | — | |
-| v0.11.0 — Partitioned Stream Tables & Operational Scale (A-1, C-2, C-3) | ~9–13 wk | — | |
-| v0.12.0 — Multi-Source Delta Batching, CDC Research & PG Backward Compat | ~13–19 wk | — | |
-| v0.13.0 — Core Refresh Opt., Scalability Foundations & UNLOGGED Buffers | ~16–31 wk | — | |
+| v0.10.0 — DVM Hardening, Connection Pooler Compat, Core Refresh Opts & Infra Prep | ~7–10d + ~26–40 wk | — | |
+| v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana & Operational Scale | ~7–10 wk + ~12h | — | |
+| v0.12.0 — Anomalous Change Detection, CDC Research & PG Backward Compat | ~13–19 wk + ~10–14h | — | |
+| v0.13.0 — Scalability Foundations & UNLOGGED Buffers | ~9–18 wk | — | |
 | v0.14.0 — Native DDL Syntax, External Test Suites & Integration | ~140–230h | — | |
 | v1.0.0 — Stable release | 18–27h | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |

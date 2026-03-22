@@ -25,7 +25,7 @@
 //! server without any manual configuration.
 //!
 //! # Error Handling & Resilience
-//! - **Advisory locks**: prevent concurrent refreshes of the same ST
+//! - **Row-level catalog locks**: prevent concurrent refreshes of the same ST
 //! - **Retry with backoff**: retryable errors get exponential backoff per ST
 //! - **Skip mechanism**: if a ST refresh is already running, skip it gracefully
 //! - **Crash recovery**: on startup, mark interrupted RUNNING records as FAILED
@@ -707,7 +707,7 @@ fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> 
             continue;
         }
 
-        // Check advisory lock — if another refresh is in progress, skip.
+        // Check catalog row lock — if another refresh is in progress, skip.
         if check_skip_needed(&st) {
             continue;
         }
@@ -1944,7 +1944,7 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         continue;
                     }
 
-                    // Skip if advisory lock held
+                    // Skip if catalog row locked by another session
                     if check_skip_needed(&st) {
                         continue;
                     }
@@ -2192,29 +2192,33 @@ fn check_cdc_transition_health() {
 
 /// Check if a refresh should be skipped because a previous one is still running.
 ///
-/// Uses PostgreSQL advisory locks (non-blocking) to detect concurrent refreshes.
-/// The advisory lock key is derived from the ST's relid to ensure uniqueness.
-/// The lock is NOT held — we just probe to detect if another session holds it.
+/// Uses `SELECT ... FOR UPDATE SKIP LOCKED` on the catalog row to detect
+/// concurrent refreshes.  If another session holds the row lock the query
+/// returns zero rows and we skip.  The probe runs inside `Spi::connect`
+/// (subtransaction) so the lock is released immediately — this is a
+/// lightweight check, not the authoritative lock acquisition.
+///
+/// PB1: replaces the previous `pg_try_advisory_lock` approach for
+/// PgBouncer transaction‐mode compatibility.
 ///
 /// Returns `true` if the refresh should be skipped.
 fn check_skip_needed(st: &StreamTableMeta) -> bool {
-    // Use pgt_id as the advisory lock key (guaranteed unique)
-    let lock_key = st.pgt_id;
+    let pgt_id = st.pgt_id;
 
-    // Try to acquire a non-blocking advisory lock
-    let got_lock =
-        Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_lock($1)", &[lock_key.into()])
-            .unwrap_or(Some(false))
-            .unwrap_or(false);
-
-    if got_lock {
-        // We got the lock — release it immediately. No concurrent refresh.
-        let _ = Spi::get_one_with_args::<bool>("SELECT pg_advisory_unlock($1)", &[lock_key.into()]);
-        false
-    } else {
-        // Another refresh is in progress — skip
-        true
-    }
+    // Probe inside a subtransaction so the row lock is released at the
+    // end of the closure, regardless of the result.
+    Spi::connect(|client| {
+        let row = client
+            .select(
+                "SELECT 1 FROM pgtrickle.pgt_stream_tables \
+                 WHERE pgt_id = $1 FOR UPDATE SKIP LOCKED",
+                None,
+                &[pgt_id.into()],
+            )
+            .unwrap_or_else(|_| panic!("check_skip_needed: SPI select failed"));
+        // Zero rows → the row is locked by another session.
+        row.is_empty()
+    })
 }
 
 // ── Time Helper ────────────────────────────────────────────────────────────
@@ -2443,7 +2447,7 @@ fn check_schedule(st: &StreamTableMeta, _dag: &StDag) -> bool {
 
 /// Emit a StaleData alert if the stream table is currently stale.
 ///
-/// Called when a refresh is skipped (due to backoff, advisory lock, etc.)
+/// Called when a refresh is skipped (due to backoff, row lock, etc.)
 /// so that operators are notified via NOTIFY even when the scheduler
 /// cannot perform the refresh (F31: G9.4).
 fn emit_stale_alert_if_needed(st: &StreamTableMeta) {
@@ -2470,6 +2474,7 @@ fn emit_stale_alert_if_needed(st: &StreamTableMeta) {
                         &st.pgt_name,
                         stale_secs,
                         schedule_f64,
+                        st.pooler_compatibility_mode,
                     );
                 }
             }
@@ -2987,17 +2992,20 @@ fn execute_scheduled_refresh(
             })
         });
 
-    // Acquire advisory lock for this ST (held during refresh execution)
-    let lock_key = st.pgt_id;
-    let got_lock =
-        Spi::get_one_with_args::<bool>("SELECT pg_try_advisory_lock($1)", &[lock_key.into()])
-            .unwrap_or(Some(false))
-            .unwrap_or(false);
+    // PB1: Acquire row-level lock via FOR UPDATE SKIP LOCKED.
+    // The lock is held for the remainder of this transaction (released on commit).
+    let got_lock = Spi::get_one_with_args::<i64>(
+        "SELECT pgt_id FROM pgtrickle.pgt_stream_tables \
+         WHERE pgt_id = $1 FOR UPDATE SKIP LOCKED",
+        &[st.pgt_id.into()],
+    )
+    .unwrap_or(None)
+    .is_some();
 
     if !got_lock {
-        // Another session is refreshing this ST — skip
+        // Another session holds the row lock — skip this cycle
         log!(
-            "pg_trickle: skipping {}.{} — advisory lock held by another session",
+            "pg_trickle: skipping {}.{} — catalog row locked by another session",
             st.pgt_schema,
             st.pgt_name,
         );
@@ -3033,7 +3041,7 @@ fn execute_scheduled_refresh(
                 st.pgt_name,
                 e
             );
-            release_advisory_lock(lock_key);
+            // Row lock is released automatically at transaction end.
             return RefreshOutcome::RetryableFailure;
         }
     };
@@ -3217,8 +3225,7 @@ fn execute_scheduled_refresh(
         }
     }; // close else + let result
 
-    // Release the advisory lock now that refresh is done
-    release_advisory_lock(lock_key);
+    // PB1: Row lock is released automatically when the transaction commits.
 
     let elapsed_ms = start_instant.elapsed().as_millis() as i64;
 
@@ -3273,6 +3280,7 @@ fn execute_scheduled_refresh(
                 rows_inserted,
                 rows_deleted,
                 elapsed_ms,
+                st.pooler_compatibility_mode,
             );
 
             log!(
@@ -3301,6 +3309,7 @@ fn execute_scheduled_refresh(
                         elapsed_ms,
                         schedule_ms,
                         ratio,
+                        st.pooler_compatibility_mode,
                     );
                     pgrx::warning!(
                         "pg_trickle: refresh of {}.{} took {}ms ({:.0}% of {}ms schedule). \
@@ -3333,6 +3342,7 @@ fn execute_scheduled_refresh(
                 &st.pgt_name,
                 action.as_str(),
                 &e.to_string(),
+                st.pooler_compatibility_mode,
             );
 
             let is_retryable = e.is_retryable();
@@ -3341,7 +3351,12 @@ fn execute_scheduled_refresh(
             // Handle schema errors: mark for reinitialize
             if e.requires_reinitialize() {
                 let _ = StreamTableMeta::mark_for_reinitialize(st.pgt_id);
-                monitor::alert_reinitialize_needed(&st.pgt_schema, &st.pgt_name, &e.to_string());
+                monitor::alert_reinitialize_needed(
+                    &st.pgt_schema,
+                    &st.pgt_name,
+                    &e.to_string(),
+                    st.pooler_compatibility_mode,
+                );
             }
 
             // Increment error count only for errors that should count
@@ -3350,7 +3365,12 @@ fn execute_scheduled_refresh(
                     Ok(count) if count >= config::pg_trickle_max_consecutive_errors() => {
                         let _ = StreamTableMeta::update_status(st.pgt_id, StStatus::Suspended);
 
-                        monitor::alert_auto_suspended(&st.pgt_schema, &st.pgt_name, count);
+                        monitor::alert_auto_suspended(
+                            &st.pgt_schema,
+                            &st.pgt_name,
+                            count,
+                            st.pooler_compatibility_mode,
+                        );
 
                         log!(
                             "pg_trickle: suspended {}.{} after {} consecutive errors",
@@ -3392,10 +3412,8 @@ fn execute_scheduled_refresh(
     }
 }
 
-/// Release an advisory lock held during refresh.
-fn release_advisory_lock(lock_key: i64) {
-    let _ = Spi::get_one_with_args::<bool>("SELECT pg_advisory_unlock($1)", &[lock_key.into()]);
-}
+// PB1: Advisory lock release removed — row-level locks (FOR UPDATE SKIP
+// LOCKED) are transaction-scoped and released automatically on commit.
 
 // ── Bootstrap Source Gating helpers (v0.5.0, Phase 3) ─────────────────────
 

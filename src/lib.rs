@@ -260,6 +260,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     is_append_only  BOOLEAN NOT NULL DEFAULT FALSE,
     scc_id          INT,
     last_fixpoint_iterations INT,
+    pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

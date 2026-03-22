@@ -1281,14 +1281,17 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-        // Escape single quotes in the JSON payload.
-        let escaped_name = name.replace('\'', "''");
-        let escaped_schema = schema.replace('\'', "''");
-        Spi::run(&format!(
-            "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
-             \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\", \"rows\": {rows_inserted}}}'"
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        // PB2: Skip NOTIFY when pooler compatibility mode is enabled.
+        if !st.pooler_compatibility_mode {
+            // Escape single quotes in the JSON payload.
+            let escaped_name = name.replace('\'', "''");
+            let escaped_schema = schema.replace('\'', "''");
+            Spi::run(&format!(
+                "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
+                 \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\", \"rows\": {rows_inserted}}}'"
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
 
         pgrx::info!(
             "pg_trickle: FULL refresh of {}.{} with user triggers suppressed ({} rows). \
@@ -2397,7 +2400,10 @@ pub fn execute_differential_refresh(
     // (pg_trickle.merge_strategy GUC removed — C1 cleanup).
 
     // ── D-2: Prepared-statement flag ─────────────────────────────────
-    let use_prepared = crate::config::pg_trickle_use_prepared_statements() && was_cache_hit;
+    // PB2: Disable prepared statements when pooler_compatibility_mode is on.
+    let use_prepared = crate::config::pg_trickle_use_prepared_statements()
+        && was_cache_hit
+        && !st.pooler_compatibility_mode;
 
     let (merge_count, strategy_label) = if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
@@ -2853,6 +2859,7 @@ mod tests {
             is_append_only: false,
             scc_id: None,
             last_fixpoint_iterations: None,
+            pooler_compatibility_mode: false,
         }
     }
 

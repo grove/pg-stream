@@ -42,6 +42,7 @@ fn create_stream_table(
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
+    pooler_compatibility_mode: default!(bool, false),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -53,6 +54,7 @@ fn create_stream_table(
         diamond_schedule_policy,
         cdc_mode,
         append_only,
+        pooler_compatibility_mode,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -77,6 +79,7 @@ fn create_stream_table_if_not_exists(
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
+    pooler_compatibility_mode: default!(bool, false),
 ) {
     let result = create_stream_table_if_not_exists_impl(
         name,
@@ -88,6 +91,7 @@ fn create_stream_table_if_not_exists(
         diamond_schedule_policy,
         cdc_mode,
         append_only,
+        pooler_compatibility_mode,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -105,6 +109,7 @@ fn create_stream_table_if_not_exists_impl(
     diamond_schedule_policy: Option<&str>,
     cdc_mode: Option<&str>,
     append_only: bool,
+    pooler_compatibility_mode: bool,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -127,6 +132,7 @@ fn create_stream_table_if_not_exists_impl(
             diamond_schedule_policy,
             cdc_mode,
             append_only,
+            pooler_compatibility_mode,
         ),
         Err(e) => Err(e),
     }
@@ -156,6 +162,7 @@ fn create_or_replace_stream_table(
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
+    pooler_compatibility_mode: default!(bool, false),
 ) {
     let result = create_or_replace_stream_table_impl(
         name,
@@ -167,6 +174,7 @@ fn create_or_replace_stream_table(
         diamond_schedule_policy,
         cdc_mode,
         append_only,
+        pooler_compatibility_mode,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -182,6 +190,7 @@ struct ConfigDiff<'a> {
     diamond_schedule_policy: Option<&'a str>,
     cdc_mode: Option<&'a str>,
     append_only: Option<bool>,
+    pooler_compatibility_mode: Option<bool>,
 }
 
 impl ConfigDiff<'_> {
@@ -192,11 +201,13 @@ impl ConfigDiff<'_> {
             && self.diamond_schedule_policy.is_none()
             && self.cdc_mode.is_none()
             && self.append_only.is_none()
+            && self.pooler_compatibility_mode.is_none()
     }
 }
 
 /// Compare the requested config parameters against the existing catalog row.
 /// Returns `Some` only for parameters that differ from the stored values.
+#[allow(clippy::too_many_arguments)]
 fn compute_config_diff<'a>(
     existing: &StreamTableMeta,
     new_schedule: Option<&'a str>,
@@ -205,6 +216,7 @@ fn compute_config_diff<'a>(
     new_dsp: Option<&'a str>,
     new_cdc_mode: Option<&'a str>,
     new_append_only: bool,
+    new_pooler_compat: bool,
 ) -> ConfigDiff<'a> {
     // Schedule: compare raw strings.  'calculated' in user input means NULL in catalog.
     let schedule_changed = match new_schedule {
@@ -245,6 +257,9 @@ fn compute_config_diff<'a>(
     // Append-only: compare bools.
     let ao_changed = existing.is_append_only != new_append_only;
 
+    // PB2: Pooler compatibility mode.
+    let pcm_changed = existing.pooler_compatibility_mode != new_pooler_compat;
+
     ConfigDiff {
         schedule: if schedule_changed {
             new_schedule.or(Some("calculated"))
@@ -261,6 +276,11 @@ fn compute_config_diff<'a>(
         cdc_mode: if cdc_changed { new_cdc_mode } else { None },
         append_only: if ao_changed {
             Some(new_append_only)
+        } else {
+            None
+        },
+        pooler_compatibility_mode: if pcm_changed {
+            Some(new_pooler_compat)
         } else {
             None
         },
@@ -285,6 +305,7 @@ fn create_or_replace_stream_table_impl(
     diamond_schedule_policy: Option<&str>,
     cdc_mode: Option<&str>,
     append_only: bool,
+    pooler_compatibility_mode: bool,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -316,6 +337,7 @@ fn create_or_replace_stream_table_impl(
                 diamond_schedule_policy,
                 cdc_mode,
                 append_only,
+                pooler_compatibility_mode,
             );
 
             if !query_changed && config_diff.is_empty() {
@@ -339,6 +361,7 @@ fn create_or_replace_stream_table_impl(
                 config_diff.diamond_schedule_policy,
                 config_diff.cdc_mode,
                 config_diff.append_only,
+                config_diff.pooler_compatibility_mode,
             )?;
 
             pgrx::info!(
@@ -363,6 +386,7 @@ fn create_or_replace_stream_table_impl(
                 diamond_schedule_policy,
                 cdc_mode,
                 append_only,
+                pooler_compatibility_mode,
             )
         }
         Err(e) => Err(e),
@@ -895,6 +919,7 @@ fn insert_catalog_and_deps(
     dsp: DiamondSchedulePolicy,
     requested_cdc_mode: Option<&str>,
     is_append_only: bool,
+    pooler_compatibility_mode: bool,
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = StreamTableMeta::insert(
         pgt_relid,
@@ -915,6 +940,7 @@ fn insert_catalog_and_deps(
         vq.has_keyless_source,
         requested_cdc_mode,
         is_append_only,
+        pooler_compatibility_mode,
     )?;
 
     // Build per-source column usage map
@@ -1746,6 +1772,7 @@ fn create_stream_table_impl(
     diamond_schedule_policy: Option<&str>,
     requested_cdc_mode: Option<&str>,
     append_only: bool,
+    pooler_compatibility_mode: bool,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -1911,6 +1938,7 @@ fn create_stream_table_impl(
         dsp,
         requested_cdc_mode_override.as_deref(),
         append_only,
+        pooler_compatibility_mode,
     )?;
 
     // ── Phase 2: CDC / IVM trigger setup ──
@@ -2002,6 +2030,7 @@ fn alter_stream_table(
     diamond_schedule_policy: default!(Option<&str>, "NULL"),
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(Option<bool>, "NULL"),
+    pooler_compatibility_mode: default!(Option<bool>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -2013,6 +2042,7 @@ fn alter_stream_table(
         diamond_schedule_policy,
         cdc_mode,
         append_only,
+        pooler_compatibility_mode,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -2030,6 +2060,7 @@ fn alter_stream_table_impl(
     diamond_schedule_policy: Option<&str>,
     cdc_mode: Option<&str>,
     append_only: Option<bool>,
+    pooler_compatibility_mode: Option<bool>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -2321,6 +2352,16 @@ fn alter_stream_table_impl(
         StreamTableMeta::update_append_only(st.pgt_id, ao)?;
     }
 
+    // PB2: Update pooler compatibility mode if explicitly set.
+    if let Some(pcm) = pooler_compatibility_mode {
+        StreamTableMeta::update_pooler_compatibility_mode(st.pgt_id, pcm)?;
+        if pcm {
+            // Deallocate any existing prepared MERGE statement for this ST,
+            // since it will no longer be used.
+            crate::refresh::invalidate_merge_cache(st.pgt_id);
+        }
+    }
+
     shmem::signal_dag_rebuild();
     // G8.1: Notify other backends to flush delta/MERGE template caches.
     shmem::bump_cache_generation();
@@ -2464,7 +2505,7 @@ fn resume_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
     )
     .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-    crate::monitor::alert_resumed(&schema, &table_name);
+    crate::monitor::alert_resumed(&schema, &table_name, st.pooler_compatibility_mode);
 
     pgrx::info!(
         "Stream table {}.{} resumed (pgt_id={})",
@@ -2849,13 +2890,16 @@ fn execute_manual_full_refresh(
         Spi::run(&format!("ALTER TABLE {quoted_table} ENABLE TRIGGER USER"))
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
 
-        let escaped_name = table_name.replace('\'', "''");
-        let escaped_schema = schema.replace('\'', "''");
-        Spi::run(&format!(
-            "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
-             \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\"}}'"
-        ))
-        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        // PB2: Skip NOTIFY when pooler compatibility mode is enabled.
+        if !st.pooler_compatibility_mode {
+            let escaped_name = table_name.replace('\'', "''");
+            let escaped_schema = schema.replace('\'', "''");
+            Spi::run(&format!(
+                "NOTIFY pgtrickle_refresh, '{{\"stream_table\": \"{escaped_name}\", \
+                 \"schema\": \"{escaped_schema}\", \"mode\": \"FULL\"}}'"
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
 
         pgrx::info!(
             "pg_trickle: FULL refresh of {}.{} with user triggers suppressed.",
@@ -6282,6 +6326,7 @@ mod tests {
             is_append_only: false,
             scc_id: None,
             last_fixpoint_iterations: None,
+            pooler_compatibility_mode: false,
         }
     }
 
@@ -6322,14 +6367,32 @@ mod tests {
     #[test]
     fn test_config_diff_all_identical() {
         let st = make_test_st();
-        let diff = compute_config_diff(&st, Some("1m"), "DIFFERENTIAL", None, None, None, false);
+        let diff = compute_config_diff(
+            &st,
+            Some("1m"),
+            "DIFFERENTIAL",
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
         assert!(diff.is_empty());
     }
 
     #[test]
     fn test_config_diff_schedule_changed() {
         let st = make_test_st();
-        let diff = compute_config_diff(&st, Some("5m"), "DIFFERENTIAL", None, None, None, false);
+        let diff = compute_config_diff(
+            &st,
+            Some("5m"),
+            "DIFFERENTIAL",
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
         assert!(!diff.is_empty());
         assert_eq!(diff.schedule, Some("5m"));
         assert!(diff.refresh_mode.is_none());
@@ -6345,6 +6408,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
         );
         assert!(!diff.is_empty());
@@ -6363,6 +6427,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(diff.is_empty());
     }
@@ -6370,7 +6435,7 @@ mod tests {
     #[test]
     fn test_config_diff_mode_changed() {
         let st = make_test_st();
-        let diff = compute_config_diff(&st, Some("1m"), "FULL", None, None, None, false);
+        let diff = compute_config_diff(&st, Some("1m"), "FULL", None, None, None, false, false);
         assert!(!diff.is_empty());
         assert_eq!(diff.refresh_mode, Some("FULL"));
     }
@@ -6379,7 +6444,7 @@ mod tests {
     fn test_config_diff_auto_vs_differential() {
         // AUTO resolves to DIFFERENTIAL — should be same as existing DIFFERENTIAL
         let st = make_test_st();
-        let diff = compute_config_diff(&st, Some("1m"), "AUTO", None, None, None, false);
+        let diff = compute_config_diff(&st, Some("1m"), "AUTO", None, None, None, false, false);
         assert!(diff.is_empty());
     }
 
@@ -6394,6 +6459,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         );
         assert!(!diff.is_empty());
         assert_eq!(diff.diamond_consistency, Some("none"));
@@ -6402,7 +6468,16 @@ mod tests {
     #[test]
     fn test_config_diff_append_only_changed() {
         let st = make_test_st(); // existing: false
-        let diff = compute_config_diff(&st, Some("1m"), "DIFFERENTIAL", None, None, None, true);
+        let diff = compute_config_diff(
+            &st,
+            Some("1m"),
+            "DIFFERENTIAL",
+            None,
+            None,
+            None,
+            true,
+            false,
+        );
         assert!(!diff.is_empty());
         assert_eq!(diff.append_only, Some(true));
     }
@@ -6418,6 +6493,7 @@ mod tests {
             None,
             Some("wal"),
             false,
+            false,
         );
         assert!(!diff.is_empty());
         assert_eq!(diff.cdc_mode, Some("wal"));
@@ -6426,7 +6502,16 @@ mod tests {
     #[test]
     fn test_config_diff_cdc_mode_both_none() {
         let st = make_test_st(); // existing: None
-        let diff = compute_config_diff(&st, Some("1m"), "DIFFERENTIAL", None, None, None, false);
+        let diff = compute_config_diff(
+            &st,
+            Some("1m"),
+            "DIFFERENTIAL",
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
         assert!(diff.is_empty());
     }
 

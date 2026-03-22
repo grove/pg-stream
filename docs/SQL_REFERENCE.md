@@ -104,7 +104,8 @@ pgtrickle.create_stream_table(
     diamond_consistency   text      DEFAULT NULL,
     diamond_schedule_policy text    DEFAULT NULL,
     cdc_mode              text      DEFAULT NULL,
-    append_only           bool      DEFAULT false
+    append_only           bool      DEFAULT false,
+    pooler_compatibility_mode bool  DEFAULT false
 ) → void
 ```
 
@@ -120,7 +121,8 @@ pgtrickle.create_stream_table(
 | `diamond_consistency` | `text` | `NULL` (defaults to `'none'`) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). |
 | `diamond_schedule_policy` | `text` | `NULL` (defaults to `'fastest'`) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. |
 | `cdc_mode` | `text` | `NULL` (use `pg_trickle.cdc_mode`) | Optional per-stream-table CDC override: `'auto'`, `'trigger'`, or `'wal'`. This affects all deferred TABLE sources of the stream table. |
-| `append_only` | `bool` | `false` | When `true`, differential refreshes use a fast INSERT path instead of MERGE. Skips DELETE/UPDATE/IS DISTINCT FROM checks. If a DELETE or UPDATE is later detected in the change buffer, the flag is automatically reverted to `false`. Not compatible with `FULL`, `IMMEDIATE`, or keyless sources. |
+| `append_only` | `bool` | `false` | When `true`, differential refreshes use a fast INSERT path instead of MERGE. Skips DELETE/UPDATE/IS DISTINCT FROM checks. If a DELETE or Update is later detected in the change buffer, the flag is automatically reverted to `false`. Not compatible with `FULL`, `IMMEDIATE`, or keyless sources. |
+| `pooler_compatibility_mode` | `bool` | `false` | When `true`, the refresh engine uses inline SQL instead of `PREPARE`/`EXECUTE` and suppresses all `NOTIFY` emissions for this stream table. Enable this when the stream table is accessed through a transaction-mode connection pooler (e.g. PgBouncer). |
 
 When `refresh_mode => 'IMMEDIATE'`, the cluster-wide `pg_trickle.cdc_mode`
 setting is ignored. IMMEDIATE mode always uses statement-level IVM triggers
@@ -324,6 +326,14 @@ SELECT pgtrickle.create_stream_table(
      FROM orders
      GROUP BY region',
     schedule => '1m'
+);
+
+-- PgBouncer compatibility (transaction-mode pooler)
+SELECT pgtrickle.create_stream_table(
+    name                      => 'pooled_orders',
+    query                     => 'SELECT id, amount FROM orders',
+    schedule                  => '5m',
+    pooler_compatibility_mode => true
 );
 ```
 
@@ -640,14 +650,15 @@ SELECT pgtrickle.create_stream_table(
 - CDC triggers and change buffer tables are created automatically for each source table.
 - The ST is registered in the dependency DAG; cycles are rejected.
 - Non-recursive CTEs are inlined as subqueries during parsing (Tier 1). Multi-reference CTEs share delta computation (Tier 2).
-- Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **recomputation fallback** for mixed DELETE/UPDATE changes (see known limitation below), and **recomputation fallback** when CTE columns don’t match ST storage columns. **Non-monotone recursive terms** (containing EXCEPT, Aggregate, Window, DISTINCT, AntiJoin, or INTERSECT SET) automatically fall back to recomputation to ensure correctness.
+- Recursive CTEs in DIFFERENTIAL mode use three strategies, auto-selected per refresh: **semi-naive evaluation** for INSERT-only changes, **DRed (Delete-and-Rederive)** for mixed DELETE/UPDATE changes, and **recomputation fallback** when CTE columns do not match ST storage columns. **Non-monotone recursive terms** (containing EXCEPT, Aggregate, Window, DISTINCT, AntiJoin, or INTERSECT SET) automatically fall back to recomputation to ensure correctness.
 
-> ⚠️ **Known Limitation — Recursive CTE DIFFERENTIAL mode and mixed changes**
-> In DIFFERENTIAL mode, when the change buffer contains DELETE or UPDATE rows for a
-> recursive CTE source, pg_trickle falls back to full **recomputation** (Strategy 3),
-> not Delete-and-Rederive. DRed is only active in **IMMEDIATE mode**. Use
-> `refresh_mode = 'IMMEDIATE'` for recursive CTE stream tables with frequent
-> DELETE/UPDATE workloads on their sources. Tracked as P2-1 in the v0.9.0 roadmap.
+> **Recursive CTE DIFFERENTIAL mode -- DRed algorithm (P2-1)**
+> In DIFFERENTIAL mode, mixed DELETE/UPDATE changes now use the DRed (Delete-and-Rederive)
+> algorithm: (1) semi-naive INSERT propagation; (2) over-deletion cascade from ST storage;
+> (3) rederivation from current source tables; (4) combine net deletions. DRed correctly
+> handles derived-column changes such as path rebuilds under a renamed ancestor node.
+> When CTE output columns differ from ST storage columns (mismatch), recomputation is used.
+> Implemented in v0.10.0 (P2-1).
 - LATERAL SRFs in DIFFERENTIAL mode use row-scoped recomputation: when a source row changes, only the SRF expansions for that row are re-evaluated.
 - LATERAL subqueries in DIFFERENTIAL mode also use row-scoped recomputation: when an outer row changes, the correlated subquery is re-executed only for that row.
 - WHERE subqueries (`EXISTS`, `IN`, scalar) are parsed into dedicated semi-join, anti-join, and scalar subquery operators with specialized delta computation.
@@ -673,7 +684,9 @@ pgtrickle.create_stream_table_if_not_exists(
     initialize              bool      DEFAULT true,
     diamond_consistency     text      DEFAULT NULL,
     diamond_schedule_policy text      DEFAULT NULL,
-    cdc_mode                text      DEFAULT NULL
+    cdc_mode                text      DEFAULT NULL,
+    append_only             bool      DEFAULT false,
+    pooler_compatibility_mode bool    DEFAULT false
 ) → void
 ```
 
@@ -711,7 +724,8 @@ pgtrickle.create_or_replace_stream_table(
     diamond_consistency     text      DEFAULT NULL,
     diamond_schedule_policy text      DEFAULT NULL,
     cdc_mode                text      DEFAULT NULL,
-    append_only             bool      DEFAULT false
+    append_only             bool      DEFAULT false,
+    pooler_compatibility_mode bool    DEFAULT false
 ) → void
 ```
 
@@ -723,7 +737,7 @@ pgtrickle.create_or_replace_stream_table(
 |---|---|
 | Stream table does **not** exist | **Create** — identical to `create_stream_table(...)` |
 | Stream table exists, query **and** all config identical | **No-op** — logs INFO, returns immediately |
-| Stream table exists, query identical but config differs | **Alter config** — delegates to `alter_stream_table(...)` for schedule, refresh_mode, diamond settings, cdc_mode, append_only |
+| Stream table exists, query identical but config differs | **Alter config** — delegates to `alter_stream_table(...)` for schedule, refresh_mode, diamond settings, cdc_mode, append_only, pooler_compatibility_mode |
 | Stream table exists, query differs | **Replace query** — in-place ALTER QUERY migration plus any config changes; a full refresh is applied |
 
 The `initialize` parameter is honoured on **create** only. On replace, the stream table is always repopulated via a full refresh.
@@ -766,7 +780,8 @@ pgtrickle.alter_stream_table(
     diamond_consistency   text      DEFAULT NULL,
     diamond_schedule_policy text    DEFAULT NULL,
     cdc_mode              text      DEFAULT NULL,
-    append_only           bool      DEFAULT NULL
+    append_only           bool      DEFAULT NULL,
+    pooler_compatibility_mode bool  DEFAULT NULL
 ) → void
 ```
 
@@ -783,6 +798,7 @@ pgtrickle.alter_stream_table(
 | `diamond_schedule_policy` | `text` | `NULL` | New schedule policy for atomic diamond groups (`'fastest'` or `'slowest'`). Pass `NULL` to leave unchanged. |
 | `cdc_mode` | `text` | `NULL` | New requested CDC mode override (`'auto'`, `'trigger'`, or `'wal'`). Pass `NULL` to leave unchanged. |
 | `append_only` | `bool` | `NULL` | Enable or disable the append-only INSERT fast path. Pass `NULL` to leave unchanged. When `true`, rejected for FULL, IMMEDIATE, or keyless source stream tables. |
+| `pooler_compatibility_mode` | `bool` | `NULL` | Enable or disable pooler-safe mode. When `true`, prepared statements are bypassed and NOTIFY emissions are suppressed. Pass `NULL` to leave unchanged. |
 
 If you switch a stream table to `refresh_mode => 'IMMEDIATE'` while the
 cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle logs an
@@ -825,6 +841,9 @@ SELECT pgtrickle.alter_stream_table('order_totals', cdc_mode => 'trigger');
 
 -- Enable append-only INSERT fast path
 SELECT pgtrickle.alter_stream_table('event_log_st', append_only => true);
+
+-- Enable pooler compatibility mode (for PgBouncer transaction mode)
+SELECT pgtrickle.alter_stream_table('order_totals', pooler_compatibility_mode => true);
 
 -- Suspend a stream table
 SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');

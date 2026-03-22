@@ -4,9 +4,11 @@
 //! - Tier 1: Non-recursive CTEs (inline expansion) — FULL + DIFFERENTIAL
 //! - Tier 2: Multi-reference CTEs (shared delta) — DIFFERENTIAL
 //! - Tier 3a: Recursive CTEs — FULL mode
-//! - Tier 3b: Recursive CTEs — DIFFERENTIAL via recomputation diff
-//! - Tier 3c: Semi-naive evaluation (INSERT-only) vs recomputation fallback (DELETE/UPDATE)
-//! - Tier 3d: Recursive CTEs — IMMEDIATE mode (semi-naive, DRed, depth guard)
+//! - Tier 3b: Recursive CTEs — DIFFERENTIAL (INSERT-only semi-naive; DELETE/UPDATE → DRed)
+//! - Tier 3c: DRed in DIFFERENTIAL mode — leaf/internal delete + reparent + mixed
+//! - Tier 3d: DRed in DIFFERENTIAL mode — rederivation (multi-path / diamond)
+//! - Tier 3e: DRed in DIFFERENTIAL mode — derived-column propagation (P2-1)
+//! - Tier 3f: Recursive CTEs — IMMEDIATE mode (semi-naive, DRed, depth guard)
 //! - Subqueries in FROM (T_RangeSubselect)
 //!
 //! Prerequisites: `./tests/build_e2e_image.sh`
@@ -631,7 +633,7 @@ async fn test_cte_multi_ref_with_different_filters() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Tier 3a/3b — Recursive CTEs (FULL and DIFFERENTIAL via recomputation)
+//  Tier 3a/3b — Recursive CTEs (FULL; DIFFERENTIAL uses DRed for DELETE/UPDATE)
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1210,7 +1212,7 @@ async fn test_seminaive_matches_full_reexecution() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Tier 3d — DRed (DELETE / UPDATE via Delete-and-Rederive)
+//  Tier 3c — DRed in DIFFERENTIAL mode (DELETE / UPDATE via DRed algorithm)
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// DELETE a leaf node. DRed over-deletes it. No rederivation path exists,
@@ -1733,7 +1735,232 @@ async fn test_dred_sequential_delete_refresh_cycles() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Tier 3e — Non-linear Detection & Linear Transitive Closure
+//  Tier 3e — DRed DIFFERENTIAL: derived-column propagation (P2-1)
+//
+//  These tests cover the key scenario addressed by P2-1: when a source
+//  column that feeds a computed column in the recursive CTE (e.g. `path`)
+//  is updated, the DRed algorithm must correctly propagate the change
+//  through all derived rows (descendants in the tree).
+//
+//  Previously, DELETE/UPDATE in DIFFERENTIAL mode fell back to full
+//  recomputation. After P2-1, the DRed algorithm handles this via:
+//    Phase 1 — semi-naive INSERT propagation
+//    Phase 2 — over-deletion cascade from ST storage
+//    Phase 3 — rederivation from current source tables
+//    Phase 4 — combine (inserts + net deletions)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// UPDATE a non-join column (name) that appears in a computed derived column
+/// (path = ancestor.path || ' > ' || node.name). The DRed algorithm must
+/// update all descendant paths correctly. This is the "path rebuild under
+/// renamed ancestor" scenario that was explicitly cited in the P2-1 deferral
+/// comment.
+#[tokio::test]
+async fn test_dred_differential_update_cascades_derived_path() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE tree_path (id INT PRIMARY KEY, parent_id INT, name TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO tree_path VALUES \
+         (1, NULL, 'root'), \
+         (2, 1, 'Engineering'), \
+         (3, 2, 'Backend'), \
+         (4, 2, 'Frontend')",
+    )
+    .await;
+
+    // The `path` column is computed from ancestor path + node name.
+    let query = "WITH RECURSIVE t AS (\
+                     SELECT id, name, parent_id, name AS path, 0 AS depth \
+                     FROM tree_path WHERE parent_id IS NULL \
+                     UNION ALL \
+                     SELECT n.id, n.name, n.parent_id, \
+                            t.path || ' > ' || n.name AS path, \
+                            t.depth + 1 \
+                     FROM tree_path n JOIN t ON n.parent_id = t.id\
+                 ) SELECT id, name, path, depth FROM t";
+
+    db.create_st("tree_path_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_eq!(db.count("public.tree_path_st").await, 4);
+
+    // Verify initial paths
+    let backend_path: String = db
+        .query_scalar("SELECT path FROM public.tree_path_st WHERE name = 'Backend'")
+        .await;
+    assert_eq!(backend_path, "root > Engineering > Backend");
+
+    // Rename "Engineering" to "R&D". DRed (P2-1) must update ALL derived paths.
+    db.execute("UPDATE tree_path SET name = 'R&D' WHERE id = 2")
+        .await;
+    db.refresh_st("tree_path_st").await;
+
+    // Verify that the old paths are gone and new paths are correct.
+    let old_path_count: i64 = db
+        .query_scalar("SELECT COUNT(*) FROM public.tree_path_st WHERE path LIKE '%Engineering%'")
+        .await;
+    assert_eq!(
+        old_path_count, 0,
+        "No paths should contain old name 'Engineering'"
+    );
+
+    let rnd_count: i64 = db
+        .query_scalar("SELECT COUNT(*) FROM public.tree_path_st WHERE path LIKE '%R&D%'")
+        .await;
+    assert_eq!(
+        rnd_count, 3,
+        "R&D + Backend + Frontend should have 'R&D' in path"
+    );
+
+    let backend_path_new: String = db
+        .query_scalar("SELECT path FROM public.tree_path_st WHERE name = 'Backend'")
+        .await;
+    assert_eq!(backend_path_new, "root > R&D > Backend");
+
+    let frontend_path_new: String = db
+        .query_scalar("SELECT path FROM public.tree_path_st WHERE name = 'Frontend'")
+        .await;
+    assert_eq!(frontend_path_new, "root > R&D > Frontend");
+
+    assert_eq!(
+        db.count("public.tree_path_st").await,
+        4,
+        "Row count unchanged"
+    );
+    db.assert_st_matches_query("public.tree_path_st", query)
+        .await;
+}
+
+/// UPDATE a computed depth column by reparenting. Both the join key and the
+/// derived depth should be updated by DRed in DIFFERENTIAL mode.
+#[tokio::test]
+async fn test_dred_differential_reparent_updates_depth() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE tree_depth (id INT PRIMARY KEY, parent_id INT, name TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO tree_depth VALUES \
+         (1, NULL, 'root'), \
+         (2, 1, 'A'), \
+         (3, 1, 'B'), \
+         (4, 2, 'C')",
+    )
+    .await;
+
+    let query = "WITH RECURSIVE t AS (\
+                     SELECT id, name, parent_id, 0 AS depth \
+                     FROM tree_depth WHERE parent_id IS NULL \
+                     UNION ALL \
+                     SELECT n.id, n.name, n.parent_id, t.depth + 1 \
+                     FROM tree_depth n JOIN t ON n.parent_id = t.id\
+                 ) SELECT id, name, depth FROM t";
+
+    db.create_st("tree_depth_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_eq!(db.count("public.tree_depth_st").await, 4);
+
+    let c_depth: i32 = db
+        .query_scalar("SELECT depth FROM public.tree_depth_st WHERE name = 'C'")
+        .await;
+    assert_eq!(c_depth, 2, "C starts at depth 2 (root→A→C)");
+
+    // Reparent C from A to root — C depth should change from 2 to 1
+    db.execute("UPDATE tree_depth SET parent_id = 1 WHERE id = 4")
+        .await;
+    db.refresh_st("tree_depth_st").await;
+
+    let c_depth_new: i32 = db
+        .query_scalar("SELECT depth FROM public.tree_depth_st WHERE name = 'C'")
+        .await;
+    assert_eq!(
+        c_depth_new, 1,
+        "C moved to depth 1 after reparenting to root"
+    );
+
+    assert_eq!(
+        db.count("public.tree_depth_st").await,
+        4,
+        "Row count unchanged"
+    );
+    db.assert_st_matches_query("public.tree_depth_st", query)
+        .await;
+}
+
+/// Multi-level derived-column cascade. Renaming a second-level node must
+/// update paths for all nodes at depth 3 (grandchildren) as well.
+#[tokio::test]
+async fn test_dred_differential_multi_level_path_cascade() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE tree_multi (id INT PRIMARY KEY, parent_id INT, name TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO tree_multi VALUES \
+         (1, NULL, 'L0'), \
+         (2, 1, 'L1a'), \
+         (3, 1, 'L1b'), \
+         (4, 2, 'L2a'), \
+         (5, 2, 'L2b'), \
+         (6, 4, 'L3a')",
+    )
+    .await;
+
+    let query = "WITH RECURSIVE t AS (\
+                     SELECT id, name, parent_id, name AS path \
+                     FROM tree_multi WHERE parent_id IS NULL \
+                     UNION ALL \
+                     SELECT n.id, n.name, n.parent_id, \
+                            t.path || '/' || n.name AS path \
+                     FROM tree_multi n JOIN t ON n.parent_id = t.id\
+                 ) SELECT id, name, path FROM t";
+
+    db.create_st("tree_multi_st", query, "1m", "DIFFERENTIAL")
+        .await;
+    assert_eq!(db.count("public.tree_multi_st").await, 6);
+
+    let l3a_path: String = db
+        .query_scalar("SELECT path FROM public.tree_multi_st WHERE name = 'L3a'")
+        .await;
+    assert_eq!(l3a_path, "L0/L1a/L2a/L3a");
+
+    // Rename L1a to X. DRed must cascade updates 3 levels deep:
+    //   L1a → X, L2a → X/L2a (→ must become X/L2a), L3a path → L0/X/L2a/L3a
+    db.execute("UPDATE tree_multi SET name = 'X' WHERE id = 2")
+        .await;
+    db.refresh_st("tree_multi_st").await;
+
+    let l3a_path_new: String = db
+        .query_scalar("SELECT path FROM public.tree_multi_st WHERE name = 'L3a'")
+        .await;
+    assert_eq!(
+        l3a_path_new, "L0/X/L2a/L3a",
+        "3-level cascade must update L3a path"
+    );
+
+    let l2a_path: String = db
+        .query_scalar("SELECT path FROM public.tree_multi_st WHERE name = 'L2a'")
+        .await;
+    assert_eq!(l2a_path, "L0/X/L2a");
+
+    // L1b subtree should be unaffected
+    let l1b_path: String = db
+        .query_scalar("SELECT path FROM public.tree_multi_st WHERE name = 'L1b'")
+        .await;
+    assert_eq!(l1b_path, "L0/L1b", "L1b path unchanged");
+
+    assert_eq!(
+        db.count("public.tree_multi_st").await,
+        6,
+        "Row count unchanged"
+    );
+    db.assert_st_matches_query("public.tree_multi_st", query)
+        .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Tier 3f — Non-linear Detection & Linear Transitive Closure
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Linear transitive closure using standard PostgreSQL pattern:
@@ -2584,7 +2811,7 @@ async fn test_cte_large_batch() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Tier 3d — Recursive CTEs in IMMEDIATE mode
+//  Tier 3g — Recursive CTEs in IMMEDIATE mode
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Helper: create an IMMEDIATE-mode stream table (NULL schedule).

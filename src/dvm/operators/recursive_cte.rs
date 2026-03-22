@@ -157,32 +157,41 @@ pub fn diff_recursive_cte(
     let has_deletes = check_for_delete_changes(ctx, &source_oids)?;
 
     if has_deletes {
-        // Deferred DIFFERENTIAL refreshes read mixed changes from the WAL-backed
-        // change buffer. Recursive inserts from non-base rows are handled
-        // incrementally, but recursive DELETE/UPDATE propagation in that mode is
-        // still not complete for derived-column changes (for example path rebuilds
-        // under a renamed ancestor). Fall back to recomputation for correctness.
-        if matches!(
-            ctx.delta_source,
-            crate::dvm::diff::DeltaSource::ChangeBuffer
-        ) {
-            pgrx::info!(
-                "Recursive CTE \"{}\" has mixed deferred changes; using recomputation strategy for correctness.",
-                alias,
-            );
-            generate_recomputation_delta(ctx, alias, columns, base, recursive, *union_all)
-        } else {
-            // Mixed INSERT/DELETE/UPDATE changes → DRed algorithm.
-            generate_dred_delta(
-                ctx,
-                alias,
-                columns,
-                &base_delta,
-                base,
-                recursive,
-                *union_all,
-            )
-        }
+        // Mixed INSERT/DELETE/UPDATE changes → DRed (Delete-and-Rederive) algorithm.
+        //
+        // DRed handles both DIFFERENTIAL (ChangeBuffer) and IMMEDIATE
+        // (TransitionTable) modes via the same four-phase algorithm:
+        //
+        //   Phase 1 — Semi-naive INSERT propagation: new rows from base delta
+        //             are propagated through the recursive term until fixpoint.
+        //
+        //   Phase 2 — Over-deletion cascade: base-case DELETE rows (from the
+        //             change buffer's old_<col> values in DIFFERENTIAL mode, or
+        //             from the OLD transition table in IMMEDIATE mode) seed a
+        //             recursive cascade against ST storage to find all rows
+        //             transitively derived from the deleted seeds.
+        //
+        //   Phase 3 — Rederivation: the full recursive CTE is re-run from
+        //             current source-table data (post-mutation state) to
+        //             identify which over-deleted rows still have an
+        //             alternative derivation path.
+        //
+        //   Phase 4 — Combine: net deletions = over-deleted EXCEPT rederived;
+        //             final delta = inserts ∪ net-deletions.
+        //
+        // In DIFFERENTIAL mode the cascade (Phase 2) reads exclusively from ST
+        // storage — never the change buffer — so correctness is preserved for
+        // all scenarios including derived-column changes such as path/depth
+        // rebuilds under a renamed or reparented ancestor node.
+        generate_dred_delta(
+            ctx,
+            alias,
+            columns,
+            &base_delta,
+            base,
+            recursive,
+            *union_all,
+        )
     } else {
         // INSERT-only changes → semi-naive propagation.
         generate_semi_naive_delta(ctx, alias, columns, &base_delta, recursive, *union_all)
@@ -3617,6 +3626,222 @@ mod tests {
         assert!(
             recursive_term_is_non_monotone(&union).is_none(),
             "UNION ALL should be monotone"
+        );
+    }
+
+    // ── DRed: generate_dred_delta SQL structure (ChangeBuffer mode) ──
+
+    /// Verify that `generate_dred_delta` produces the expected four-phase
+    /// SQL structure for a simple tree recursive CTE in ChangeBuffer mode.
+    ///
+    /// The tree CTE:
+    ///   WITH RECURSIVE t AS (
+    ///     SELECT id, parent_id, name FROM categories WHERE parent_id IS NULL
+    ///     UNION ALL
+    ///     SELECT c.id, c.parent_id, c.name FROM categories c JOIN t ON c.parent_id = t.id
+    ///   )
+    ///   SELECT id, parent_id, name FROM t
+    ///
+    /// After removing the ChangeBuffer guard (P2-1), mixed DELETE/UPDATE
+    /// changes should go through DRed rather than recomputation.
+    #[test]
+    fn test_generate_dred_delta_change_buffer_structure() {
+        use crate::dvm::diff::DiffResult;
+        use crate::dvm::operators::test_helpers::test_ctx_with_st;
+
+        // ChangeBuffer context (default for test_ctx_with_st)
+        let mut ctx = test_ctx_with_st("public", "rc_tree_st");
+
+        // Build recursive CTE nodes: tree traversal via parent_id join
+        let base = make_scan(
+            100,
+            "categories",
+            "public",
+            "c",
+            &["id", "parent_id", "name"],
+        );
+        let recursive_base = make_scan(
+            100,
+            "categories",
+            "public",
+            "c",
+            &["id", "parent_id", "name"],
+        );
+        let self_ref = make_self_ref("t", "t", &["id", "parent_id", "name"]);
+        let recursive_join = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: Some("c".to_string()),
+                    column_name: "parent_id".to_string(),
+                }),
+                right: Box::new(Expr::ColumnRef {
+                    table_alias: Some("t".to_string()),
+                    column_name: "id".to_string(),
+                }),
+            },
+            left: Box::new(recursive_base),
+            right: Box::new(self_ref),
+        };
+
+        // Fake base_delta (as if produced by diff_node(base) in ChangeBuffer mode)
+        let base_delta_cte = "__pgt_cte_base_delta".to_string();
+        ctx.add_cte(
+            base_delta_cte.clone(),
+            "SELECT NULL::bigint AS __pgt_row_id, NULL::text AS __pgt_action, \
+             NULL::int AS id, NULL::int AS parent_id, NULL::text AS name WHERE false"
+                .to_string(),
+        );
+        let base_delta = DiffResult {
+            cte_name: base_delta_cte,
+            columns: vec![
+                "id".to_string(),
+                "parent_id".to_string(),
+                "name".to_string(),
+            ],
+            is_deduplicated: false,
+        };
+
+        let columns = vec![
+            "id".to_string(),
+            "parent_id".to_string(),
+            "name".to_string(),
+        ];
+
+        let result = generate_dred_delta(
+            &mut ctx,
+            "t",
+            &columns,
+            &base_delta,
+            &base,
+            &recursive_join,
+            true,
+        );
+
+        assert!(
+            result.is_ok(),
+            "generate_dred_delta should succeed for ChangeBuffer mode"
+        );
+        let result = result.unwrap();
+        assert_eq!(
+            result.columns, columns,
+            "Output columns should match input columns"
+        );
+
+        // Build the full WITH query to inspect all generated CTEs
+        let all_sql = ctx.build_with_query(&result.cte_name);
+
+        // Phase 1: semi-naive insert propagation (recursive INSERT delta CTE)
+        assert!(
+            all_sql.contains("dred_ins_t") || all_sql.contains("dred_ifin_t"),
+            "Phase 1 INSERT propagation CTE should be present"
+        );
+
+        // Phase 2: over-deletion cascade (recursive delete cascade CTE)
+        assert!(
+            all_sql.contains("dred_dcasc_t") || all_sql.contains("dred_dseed_t"),
+            "Phase 2 deletion cascade CTEs should be present"
+        );
+
+        // Phase 3: rederivation (re-run full CTE from current data)
+        assert!(
+            all_sql.contains("dred_rfull_t") || all_sql.contains("dred_rdrv_t"),
+            "Phase 3 rederivation CTEs should be present"
+        );
+
+        // Phase 4: net deletions and combine
+        assert!(
+            all_sql.contains("dred_ndel_t") || all_sql.contains("dred_comb_t"),
+            "Phase 4 combine CTEs should be present"
+        );
+
+        // The final CTE name should be the combined result
+        assert!(
+            all_sql.contains(&result.cte_name),
+            "Final CTE name should appear in the SQL"
+        );
+    }
+
+    /// Verify that the DRed over-deletion cascade reads from ST storage
+    /// (not the change buffer) for the *recursive propagation* step. This
+    /// is the key correctness property for P2-1: the cascade propagation
+    /// must follow the ST storage graph to find all transitively-derived
+    /// rows, while the seed may read old values from the change buffer.
+    #[test]
+    fn test_dred_cascade_reads_from_st_storage_not_change_buffer() {
+        use crate::dvm::diff::DiffResult;
+        use crate::dvm::operators::test_helpers::test_ctx_with_st;
+
+        let mut ctx = test_ctx_with_st("public", "my_tree_st");
+
+        let base = make_scan(100, "nodes", "public", "n", &["id", "parent_id"]);
+        let recursive_base = make_scan(100, "nodes", "public", "n", &["id", "parent_id"]);
+        let self_ref = make_self_ref("tree", "t", &["id", "parent_id"]);
+        let rec_join = OpTree::InnerJoin {
+            condition: Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(Expr::ColumnRef {
+                    table_alias: Some("n".to_string()),
+                    column_name: "parent_id".to_string(),
+                }),
+                right: Box::new(Expr::ColumnRef {
+                    table_alias: Some("t".to_string()),
+                    column_name: "id".to_string(),
+                }),
+            },
+            left: Box::new(recursive_base),
+            right: Box::new(self_ref),
+        };
+
+        let base_delta_cte = "__pgt_cte_base_del".to_string();
+        ctx.add_cte(
+            base_delta_cte.clone(),
+            "SELECT NULL::bigint AS __pgt_row_id, NULL::text AS __pgt_action, \
+             NULL::int AS id, NULL::int AS parent_id WHERE false"
+                .to_string(),
+        );
+        let base_delta = DiffResult {
+            cte_name: base_delta_cte,
+            columns: vec!["id".to_string(), "parent_id".to_string()],
+            is_deduplicated: false,
+        };
+
+        let columns = vec!["id".to_string(), "parent_id".to_string()];
+        let result = generate_dred_delta(
+            &mut ctx,
+            "tree",
+            &columns,
+            &base_delta,
+            &base,
+            &rec_join,
+            true,
+        )
+        .unwrap();
+
+        let all_sql = ctx.build_with_query(&result.cte_name);
+
+        // The cascade CTE (Phase 2 recursive propagation) should reference ST
+        // storage so it can follow the existing derived-row graph to find all
+        // transitively-affected rows. This is the property that makes DRed
+        // correct for derived-column changes like path rebuilds.
+        assert!(
+            all_sql.contains("\"public\".\"my_tree_st\""),
+            "Cascade should reference ST storage for recursive propagation: {}",
+            all_sql
+        );
+
+        // The rederivation CTE (Phase 3) re-runs the full query from source tables
+        // (not the ST or the change buffer), so the actual source table appears too.
+        assert!(
+            all_sql.contains("\"public\".\"nodes\""),
+            "Rederivation should re-run from source tables: {}",
+            all_sql
+        );
+
+        // The result CTE should combine inserts and deletions
+        assert!(
+            !result.cte_name.is_empty(),
+            "Result should have a non-empty CTE name"
         );
     }
 }

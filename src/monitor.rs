@@ -73,7 +73,19 @@ impl AlertEvent {
 ///
 /// The payload is a JSON object with at minimum an `event` field.
 /// Callers can add arbitrary key-value pairs for context.
-pub fn emit_alert(event: AlertEvent, pgt_schema: &str, pgt_name: &str, extra: &str) {
+///
+/// PB2: When `skip_notify` is true, the NOTIFY is silently suppressed
+/// (for stream tables in pooler compatibility mode).
+pub fn emit_alert(
+    event: AlertEvent,
+    pgt_schema: &str,
+    pgt_name: &str,
+    extra: &str,
+    skip_notify: bool,
+) {
+    if skip_notify {
+        return;
+    }
     let safe_payload = build_alert_payload(event, pgt_schema, pgt_name, extra);
 
     // Escape single quotes for SQL
@@ -108,7 +120,13 @@ fn build_alert_payload(event: AlertEvent, pgt_schema: &str, pgt_name: &str, extr
 }
 
 /// Emit a stale-data alert.
-pub fn alert_stale_data(pgt_schema: &str, pgt_name: &str, staleness_secs: f64, schedule_secs: f64) {
+pub fn alert_stale_data(
+    pgt_schema: &str,
+    pgt_name: &str,
+    staleness_secs: f64,
+    schedule_secs: f64,
+    skip_notify: bool,
+) {
     emit_alert(
         AlertEvent::StaleData,
         pgt_schema,
@@ -123,36 +141,45 @@ pub fn alert_stale_data(pgt_schema: &str, pgt_name: &str, staleness_secs: f64, s
                 0.0
             },
         ),
+        skip_notify,
     );
 }
 
 /// Emit an auto-suspended alert.
-pub fn alert_auto_suspended(pgt_schema: &str, pgt_name: &str, error_count: i32) {
+pub fn alert_auto_suspended(pgt_schema: &str, pgt_name: &str, error_count: i32, skip_notify: bool) {
     emit_alert(
         AlertEvent::AutoSuspended,
         pgt_schema,
         pgt_name,
         &format!(r#""consecutive_errors":{}"#, error_count),
+        skip_notify,
     );
 }
 
 /// Emit a resumed alert (ST cleared from SUSPENDED back to ACTIVE).
-pub fn alert_resumed(pgt_schema: &str, pgt_name: &str) {
+pub fn alert_resumed(pgt_schema: &str, pgt_name: &str, skip_notify: bool) {
     emit_alert(
         AlertEvent::Resumed,
         pgt_schema,
         pgt_name,
         r#""previous_status":"SUSPENDED""#,
+        skip_notify,
     );
 }
 
 /// Emit a reinitialize-needed alert.
-pub fn alert_reinitialize_needed(pgt_schema: &str, pgt_name: &str, reason: &str) {
+pub fn alert_reinitialize_needed(
+    pgt_schema: &str,
+    pgt_name: &str,
+    reason: &str,
+    skip_notify: bool,
+) {
     emit_alert(
         AlertEvent::ReinitializeNeeded,
         pgt_schema,
         pgt_name,
         &format!(r#""reason":"{}""#, reason.replace('"', r#"\""#)),
+        skip_notify,
     );
 }
 
@@ -292,6 +319,7 @@ pub fn alert_refresh_completed(
     rows_inserted: i64,
     rows_deleted: i64,
     duration_ms: i64,
+    skip_notify: bool,
 ) {
     emit_alert(
         AlertEvent::RefreshCompleted,
@@ -301,11 +329,18 @@ pub fn alert_refresh_completed(
             r#""action":"{}","rows_inserted":{},"rows_deleted":{},"duration_ms":{}"#,
             action, rows_inserted, rows_deleted, duration_ms,
         ),
+        skip_notify,
     );
 }
 
 /// Emit a refresh-failed alert.
-pub fn alert_refresh_failed(pgt_schema: &str, pgt_name: &str, action: &str, error: &str) {
+pub fn alert_refresh_failed(
+    pgt_schema: &str,
+    pgt_name: &str,
+    action: &str,
+    error: &str,
+    skip_notify: bool,
+) {
     emit_alert(
         AlertEvent::RefreshFailed,
         pgt_schema,
@@ -315,6 +350,7 @@ pub fn alert_refresh_failed(pgt_schema: &str, pgt_name: &str, action: &str, erro
             action,
             error.replace('"', r#"\""#),
         ),
+        skip_notify,
     );
 }
 
@@ -326,6 +362,7 @@ pub fn alert_falling_behind(
     elapsed_ms: i64,
     schedule_ms: i64,
     ratio: f64,
+    skip_notify: bool,
 ) {
     emit_alert(
         AlertEvent::SchedulerFallingBehind,
@@ -335,6 +372,7 @@ pub fn alert_falling_behind(
             r#""elapsed_ms":{},"schedule_ms":{},"ratio":{:.2}"#,
             elapsed_ms, schedule_ms, ratio,
         ),
+        skip_notify,
     );
 }
 

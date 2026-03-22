@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     topk_order_by   TEXT,
     requested_cdc_mode TEXT
                      CHECK (requested_cdc_mode IN ('auto', 'trigger', 'wal')),
+    pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
