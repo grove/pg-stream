@@ -242,6 +242,26 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   with dummy entries. Changed to `(-9223372036854775808)::BIGINT` (i64::MIN),
   reducing collision probability to ~1/2^64.
 
+- **SF-5: EC-01 pre-change snapshot boundary documented** — The EC-01
+  phantom-row-after-DELETE fix uses `EXCEPT ALL` to reconstruct a pre-change
+  join snapshot, but is limited to join subtrees with ≤2 scan nodes to
+  avoid PostgreSQL temporary file exhaustion. For queries with ≥3-scan
+  right-side join subtrees (e.g. TPC-H Q7/Q8/Q9), the EC-01 fix does not
+  apply and simultaneous DELETEs on both join sides may leave phantom rows
+  until the next full refresh. Added comprehensive `use_pre_change_snapshot()`
+  documentation explaining the CTE materialization trade-off, 5 boundary
+  unit tests, and a limitation note in `DVM_OPERATORS.md`.
+
+### CDC Fixes
+
+- **SF-11: WAL publication health check for post-creation partitioning** —
+  Added `check_publication_health()` to the WAL decoder health check that
+  detects when a source table has been converted to partitioned after its
+  publication was created. When detected, the publication is rebuilt with
+  `publish_via_partition_root = true` so child partition WAL events are
+  correctly attributed to the parent table. Previously, post-creation
+  partitioning caused a silent CDC stall (no error, stream table frozen).
+
 ---
 
 ## [0.9.0] — 2026-03-20

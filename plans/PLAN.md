@@ -30,6 +30,8 @@
 > - **SF-4**: Project node in aggregate rescan FROM clause — ✅ **Done** (`child_to_from_sql` wraps Project in subquery with projected expressions)
 > - **SF-6**: EXCEPT/INTERSECT count columns through Project — ✅ **Done** (`diff_project` forwards `__pgt_count_l`/`__pgt_count_r`)
 > - **SF-8**: Lateral inner-change branch sentinel — ✅ **Done** (changed from `0` to `i64::MIN`)
+> - **SF-5**: EC-01 pre-change snapshot boundary — ✅ **Done** (≤2-scan threshold documented with 5 boundary tests + DVM_OPERATORS.md limitation note)
+> - **SF-11**: WAL publication post-creation partitioning — ✅ **Done** (`check_publication_health()` detects and rebuilds stale publications)
 
 ### F40 Status Update
 
@@ -74,6 +76,8 @@ One item remains before F40 is fully closed:
 > - **SF-4**: Project node in aggregate rescan FROM clause — ✅ **Done** (`child_to_from_sql` wraps Project in subquery with projected expressions)
 > - **SF-6**: EXCEPT/INTERSECT count columns through Project — ✅ **Done** (`diff_project` forwards `__pgt_count_l`/`__pgt_count_r`)
 > - **SF-8**: Lateral inner-change branch sentinel — ✅ **Done** (changed from `0` to `i64::MIN`)
+> - **SF-5**: EC-01 pre-change snapshot boundary — ✅ **Done** (≤2-scan threshold documented with 5 boundary tests + DVM_OPERATORS.md limitation note)
+> - **SF-11**: WAL publication post-creation partitioning — ✅ **Done** (`check_publication_health()` detects and rebuilds stale publications)
 
 ### F15 Status Update (Selective CDC Column Capture)
 
