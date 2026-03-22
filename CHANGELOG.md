@@ -282,6 +282,25 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   Includes deduplication (same pgt_id pushed twice is stored once) and
   11 unit tests for push/drain/overflow/reuse semantics.
 
+- **C2-2: Cached topological sort** — Added a `RefCell`-based topo-sort
+  cache to `StDag`. The Kahn's algorithm result is computed once and
+  reused across the multiple callers within a single scheduler tick
+  (`detect_cycles`, `topological_order`, `compute_consistency_groups`).
+  The cache is automatically invalidated when the graph structure changes
+  (node/edge additions, removals, or incremental rebuild). Eliminates
+  redundant O(V+E) topo-sort recomputation per tick.
+
+- **G-8: Incremental DAG rebuild** — When the C2-1 ring buffer provides
+  specific affected `pgt_id` values (no overflow), the scheduler now
+  applies a targeted incremental rebuild instead of the full O(V+E)
+  catalog scan. The new `StDag::rebuild_incremental()` method removes
+  old nodes/edges for affected IDs, re-queries only those entries from
+  the catalog, re-adds them, and re-resolves CALCULATED schedules.
+  Falls back to full `build_from_catalog()` on overflow or error.
+  Reduces per-DDL scheduler latency from ~50ms to ~1ms at 1000+ STs.
+  Includes `remove_st_node()` with full edge cleanup and 8 unit tests
+  covering removal, re-addition, edge cleanup, and cache invalidation.
+
 - **C-4: Change buffer compaction** — New `pg_trickle.compact_threshold`
   GUC (default 100,000 rows) triggers automatic compaction before each
   refresh cycle when pending changes exceed the threshold. Compaction
