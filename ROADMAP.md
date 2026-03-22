@@ -26,10 +26,10 @@ coverage, all in plain language.
 - [v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure](#v070--performance-watermarks-circular-dag-execution-observability--infrastructure)
 - [v0.8.0 — pg_dump Support & Test Hardening](#v080--pg_dump-support--test-hardening)
 - [v0.9.0 — Incremental Aggregate Maintenance](#v090--incremental-aggregate-maintenance)
-- [v0.10.0 — DVM Hardening, Connection Pooler Compatibility & Infrastructure Prep](#v0100--dvm-hardening-connection-pooler-compatibility--infrastructure-prep)
+- [v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Core Refresh Optimizations & Infrastructure Prep](#v0100--dvm-hardening-connection-pooler-compatibility-core-refresh-optimizations--infrastructure-prep)
 - [v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability & Operational Scale](#v0110--partitioned-stream-tables-prometheus--grafana-observability--operational-scale)
 - [v0.12.0 — Anomalous Change Detection, CDC Research & PG Backward Compatibility](#v0120--anomalous-change-detection-cdc-research--pg-backward-compatibility)
-- [v0.13.0 — Core Refresh Optimizations, Scalability Foundations & UNLOGGED Buffers](#v0130--core-refresh-optimizations-scalability-foundations--unlogged-buffers)
+- [v0.13.0 — Scalability Foundations & UNLOGGED Buffers](#v0130--scalability-foundations--unlogged-buffers)
 - [v0.14.0 — Native DDL Syntax, External Test Suites & Integration](#v0140--native-ddl-syntax-external-test-suites--integration)
 - [v1.0.0 — Stable Release](#v100--stable-release)
 - [Post-1.0 — Scale & Ecosystem](#post-10--scale--ecosystem)
@@ -1561,12 +1561,14 @@ These items are correct as implemented but scale with data size rather than delt
 
 ---
 
-## v0.10.0 — DVM Hardening, Connection Pooler Compatibility & Infrastructure Prep
+## v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Core Refresh Optimizations & Infrastructure Prep
 
 **Goal:** Land deferred DVM correctness and performance improvements
 (recursive CTE DRed, FULL OUTER JOIN aggregate fix, LATERAL scoping,
-Welford regression aggregates, multi-source delta merging), enable
-cloud-native PgBouncer transaction-mode deployments via an opt-in
+Welford regression aggregates, multi-source delta merging), deliver the
+first wave of refresh performance optimizations (index-aware MERGE,
+predicate pushdown, change buffer compaction, cost-based refresh strategy),
+enable cloud-native PgBouncer transaction-mode deployments via an opt-in
 compatibility mode, and complete the pre-1.0 packaging
 and deployment infrastructure.
 
@@ -1601,7 +1603,7 @@ incompatible with PgBouncer transaction-mode pooling. This section introduces an
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** DELETE/UPDATE against a recursive CTE source falls back to O(n) full recompute + diff. Implement DRed for `DeltaSource::ChangeBuffer` to maintain O(delta) cost. | 2–3 wk | ⬜ Not started | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
+| P2-1 | **Recursive CTE DRed in DIFFERENTIAL mode.** DELETE/UPDATE against a recursive CTE source falls back to O(n) full recompute + diff. Implement DRed for `DeltaSource::ChangeBuffer` to maintain O(delta) cost. | 2–3 wk | ✅ Done (0.10-adjustments) | [src/dvm/operators/recursive_cte.rs](src/dvm/operators/recursive_cte.rs) |
 | P2-2 | **SUM NULL-transition rescan for FULL OUTER JOIN aggregates.** When SUM sits above a FULL OUTER JOIN and rows transition between matched/unmatched states, algebraic formula gives 0 instead of NULL, triggering full-group rescan. Implement targeted correction. | 1–2 wk | ⬜ Not started | [src/dvm/operators/aggregate.rs](src/dvm/operators/aggregate.rs) |
 | P2-4 | **Materialized view sources in IMMEDIATE mode (EC-09).** Implement polling-change-detection wrapper for `REFRESH MATERIALIZED VIEW`-sourced queries in IMMEDIATE mode. | 2–3 wk | ⬜ Not started | [plans/PLAN_EDGE_CASES.md §EC-09](plans/PLAN_EDGE_CASES.md) |
 | P2-6 | **LATERAL subquery inner-source scoped re-execution.** Gate outer-table scan behind a join to inner delta rows so only correlated outer rows are re-executed, reducing O(\|outer\|) to O(delta). | 1–2 wk | ⬜ Not started | [src/dvm/operators/lateral_subquery.rs](src/dvm/operators/lateral_subquery.rs) |
@@ -1616,7 +1618,24 @@ incompatible with PgBouncer transaction-mode pooling. This section introduces an
 
 > **DVM deferred items subtotal: ~12–19 weeks**
 
-> **v0.10.0 total: ~34–48 hours + ~12–19 weeks DVM work**
+### Core Refresh Optimizations (Wave 2)
+
+> Read the risk analyses in
+> [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) before implementing.
+> Implement in this order: A-4 (no schema change), B-2, C-4, then B-4.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| A-4 | **Index-Aware MERGE Planning.** Planner hint injection (`enable_seqscan = off` for small-delta / large-target); covering index auto-creation on `__pgt_row_id`. No schema changes required. | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
+| B-2 | **Delta Predicate Pushdown.** Push WHERE predicates from defining query into change-buffer `delta_scan` CTE; `OR old_col` handling for deletions; 5–10× delta-row-volume reduction for selective queries. | 2–3 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C-4 | **Change Buffer Compaction.** Net-change compaction (INSERT+DELETE=no-op; UPDATE+UPDATE=single row); run when buffer exceeds `pg_trickle.compact_threshold`; use advisory lock to serialise with refresh. | 2–3 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
+| B-4 | **Cost-Based Refresh Strategy.** Replace fixed `differential_max_change_ratio` with a history-driven cost model fitted on `pgt_refresh_history`; cold-start fallback to fixed threshold. | 2–3 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §B-4](plans/performance/PLAN_NEW_STUFF.md) |
+
+> ⚠️ C-4: The compaction DELETE **must use `seq` (the sequence primary key) not `ctid`** as
+> the stable row identifier. `ctid` changes under VACUUM and will silently delete the wrong
+> rows. See the corrected SQL and risk analysis in PLAN_NEW_STUFF.md §C-4.
+
+> **Core refresh optimizations subtotal: ~7–11 weeks**
 
 ### Scheduler & DAG Scalability
 
@@ -1626,29 +1645,42 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 |------|-------------|--------|--------|-----|
 | G-7 | **Tiered refresh scheduling (Hot/Warm/Cold/Frozen).** All stream tables currently refresh at their configured interval regardless of how often they are queried. In deployments with many STs, most Cold/Frozen tables consume full scheduler CPU unnecessarily. Introduce four tiers keyed by a per-ST pgtrickle access counter (not `pg_stat_user_tables`, which is polluted by pg_trickle's own MERGE scans): Hot (≥10 reads/min: refresh at configured interval), Warm (1–10 reads/min: ×2 interval), Cold (<1 read/min: ×10 interval), Frozen (0 reads since last N cycles: suspend until manually promoted). A single GUC `pg_trickle.tiered_scheduling` (default off) gates the feature. | 3–4 wk | ⬜ Not started | [src/scheduler.rs](src/scheduler.rs) · [plans/performance/PLAN_NEW_STUFF.md §C-1](plans/performance/PLAN_NEW_STUFF.md) |
 | G-8 | **Incremental DAG rebuild on DDL changes.** Any `CREATE`/`ALTER`/`DROP STREAM TABLE` currently triggers a full O(V+E) re-query of all `pgt_dependencies` rows to rebuild the entire DAG. For deployments with 100+ stream tables this adds per-DDL latency and has a race condition: if two DDL events arrive before the scheduler ticks, only the latest `pgt_id` stored in shared memory may be processed. Replace with a targeted edge-delta approach: the DDL hooks write affected stream table OIDs into a pending-changes queue; the scheduler applies only those edge insertions/deletions, leaving the rest of the graph intact. | 2–3 wk | ⬜ Not started | [src/dag.rs](src/dag.rs) · [src/scheduler.rs](src/scheduler.rs) · [plans/performance/PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C2-1 | **Ring-buffer DAG invalidation.** Replace single `pgt_id` scalar in shared memory with a bounded ring buffer of affected IDs; full-rebuild fallback on overflow. Hard prerequisite for correctness of G-8 under rapid DDL changes. | 1 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
+| C2-2 | **Incremental topo-sort.** Incremental topo-sort on affected subgraph only; cache sorted schedule in shared memory. | 1–2 wk | ⬜ Not started | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
 
-> **Scheduler & DAG scalability subtotal: ~5–7 weeks**
+> ⚠️ A single `pgt_id` scalar in shared memory is vulnerable to overwrite when two DDL
+> changes arrive between scheduler ticks — use a ring buffer (C2-1) or fall back to full rebuild.
+> See PLAN_NEW_STUFF.md §C-2 risk analysis.
+
+> **Scheduler & DAG scalability subtotal: ~7–10 weeks**
+
+> **v0.10.0 total: ~34–48 hours + ~26–40 weeks DVM & refresh work**
 
 **Exit criteria:**
 - [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.9.0 → 0.10.0`)
 - [ ] All public documentation current and reviewed
 - [ ] G-7: Tiered scheduling (Hot/Warm/Cold/Frozen) implemented; `pg_trickle.tiered_scheduling` GUC gating the feature
 - [ ] G-8: Incremental DAG rebuild implemented; DDL-triggered edge-delta replaces full O(V+E) re-query
-- [ ] P2-1: Recursive CTE DRed for DIFFERENTIAL mode (O(delta) instead of O(n) recompute)
+- [ ] C2-1: Ring-buffer DAG invalidation safe under rapid consecutive DDL changes
+- [ ] C2-2: Incremental topo-sort caches sorted schedule; verified by property-based test
+- [x] P2-1: Recursive CTE DRed for DIFFERENTIAL mode (O(delta) instead of O(n) recompute) — **implemented in 0.10-adjustments**
 - [ ] P2-2: SUM NULL-transition correction for FULL OUTER JOIN aggregates
 - [ ] P2-4: Materialized view sources supported in IMMEDIATE mode
 - [ ] P2-6: LATERAL subquery inner-source scoped re-execution (O(delta) instead of O(|outer|))
 - [ ] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns for O(1) algebraic maintenance
 - [ ] B3-2: Merged-delta weight aggregation passes property-based correctness proofs
 - [ ] B3-3: Property-based tests for simultaneous multi-source changes
+- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta
+- [ ] B-2: Predicate pushdown reduces delta volume for selective queries (E2E benchmark)
+- [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
+- [ ] B-4: Cost model self-calibrates from refresh history; correctly selects FULL for join_agg at 10% change rate
 
 ---
 
 ## v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability & Operational Scale
 
 **Goal:** Enable stream table storage to be declaratively partitioned (scope MERGE
-to affected partitions for 100× I/O reduction on large tables), make the DAG
-rebuild incremental for large multi-ST deployments, add per-database worker
+to affected partitions for 100× I/O reduction on large tables), add per-database worker
 quotas for multi-tenant environments, and ship ready-made Prometheus/Grafana
 monitoring so the product is externally visible and monitored.
 
@@ -1681,19 +1713,6 @@ monitoring so the product is externally visible and monitored.
 > additional complexity.
 
 > **Partitioned stream tables subtotal: ~5–7 weeks**
-
-### Incremental DAG Rebuild (C-2)
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| C2-1 | Replace single `pgt_id` scalar in shared memory with a bounded ring buffer of affected IDs; full-rebuild fallback on overflow | 1 wk | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
-| C2-2 | Incremental topo-sort on affected subgraph; cache sorted schedule in shared memory | 1–2 wk | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
-
-> ⚠️ A single `pgt_id` scalar in shared memory is vulnerable to overwrite when two DDL
-> changes arrive between scheduler ticks — use a ring buffer or fall back to full rebuild.
-> See PLAN_NEW_STUFF.md §C-2 risk analysis.
-
-> **Incremental DAG rebuild subtotal: ~2–3 weeks**
 
 ### Multi-Database Scheduler Isolation (C-3)
 
@@ -1728,12 +1747,11 @@ Zero-code monitoring integration. All config files live in a new
 
 > **Observability subtotal: ~12 hours**
 
-> **v0.11.0 total: ~9–13 weeks + ~12 hours observability**
+> **v0.11.0 total: ~7–10 weeks + ~12 hours observability**
 
 **Exit criteria:**
 - [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog
 - [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction)
-- [ ] Ring-buffer DAG invalidation safe under rapid consecutive DDL changes (property-based test)
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
 - [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)
@@ -1834,32 +1852,11 @@ action.
 
 ---
 
-## v0.13.0 — Core Refresh Optimizations, Scalability Foundations & UNLOGGED Buffers
+## v0.13.0 — Scalability Foundations & UNLOGGED Buffers
 
-**Goal:** Deliver the second and third waves of performance optimizations —
-index-aware MERGE, predicate pushdown, change buffer compaction, cost-based
-refresh strategy, columnar change tracking, tiered scheduling, and shared
-change buffers — alongside opt-in UNLOGGED change buffers for reduced WAL
-amplification.
-
-### Core Refresh Optimizations (Wave 2)
-
-> Read the risk analyses in
-> [PLAN_NEW_STUFF.md](plans/performance/PLAN_NEW_STUFF.md) before implementing.
-> Implement in this order: A-4 (no schema change), B-2, C-4, then B-4.
-
-| Item | Description | Effort | Ref |
-|------|-------------|--------|-----|
-| A-4 | Index-Aware MERGE Planning — planner hint injection (`enable_seqscan = off` for small-delta / large-target); covering index auto-creation on `__pgt_row_id` | 1–2 wk | [PLAN_NEW_STUFF.md §A-4](plans/performance/PLAN_NEW_STUFF.md) |
-| B-2 | Delta Predicate Pushdown — push WHERE predicates from defining query into change-buffer `delta_scan` CTE; `OR old_col` handling for deletions; 5–10× delta-row-volume reduction for selective queries | 2–3 wk | [PLAN_NEW_STUFF.md §B-2](plans/performance/PLAN_NEW_STUFF.md) |
-| C-4 | Change Buffer Compaction — net-change compaction (INSERT+DELETE=no-op; UPDATE+UPDATE=single row); run when buffer exceeds `pg_trickle.compact_threshold`; use advisory lock to serialise with refresh | 2–3 wk | [PLAN_NEW_STUFF.md §C-4](plans/performance/PLAN_NEW_STUFF.md) |
-| B-4 | Cost-Based Refresh Strategy — replace fixed `differential_max_change_ratio` with a history-driven cost model fitted on `pgt_refresh_history`; cold-start fallback to fixed threshold | 2–3 wk | [PLAN_NEW_STUFF.md §B-4](plans/performance/PLAN_NEW_STUFF.md) |
-
-> ⚠️ C-4: The compaction DELETE **must use `seq` (the sequence primary key) not `ctid`** as
-> the stable row identifier. `ctid` changes under VACUUM and will silently delete the wrong
-> rows. See the corrected SQL and risk analysis in PLAN_NEW_STUFF.md §C-4.
-
-> **Core refresh optimizations subtotal: ~60–130h (A-4, B-2, C-4, B-4)**
+**Goal:** Deliver the scalability foundations — columnar change tracking, advanced
+tiered scheduling, and shared change buffers — alongside opt-in UNLOGGED change
+buffers for reduced WAL amplification.
 
 ### Scalability Foundations (Wave 3)
 
@@ -1898,13 +1895,9 @@ amplification.
 
 > **D-1 subtotal: ~1–2 weeks**
 
-> **v0.13.0 total: ~16–31 weeks**
+> **v0.13.0 total: ~9–18 weeks**
 
 **Exit criteria:**
-- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta
-- [ ] B-2: Predicate pushdown reduces delta volume for selective queries (E2E benchmark)
-- [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
-- [ ] B-4: Cost model self-calibrates from refresh history; correctly selects FULL for join_agg at 10% change rate
 - [ ] A-2: Bitmask skips irrelevant rows; UPDATE-only path reduces delta volume (benchmarked)
 - [ ] C-1: Tier classification uses delta-based read tracking; Cold STs skip refresh correctly
 - [ ] D-4: Shared buffer serves multiple STs; multi-frontier cleanup prevents premature deletion
@@ -2100,10 +2093,10 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.7.0 — Performance, Watermarks, Circular DAG Execution, Observability & Infrastructure | ~59–62h | 390–555h | |
 | v0.8.0 — pg_dump Support & Test Hardening | ~16–21d | — | |
 | v0.9.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
-| v0.10.0 — DVM Hardening, Connection Pooler Compatibility & Infrastructure Prep | ~7–10d | — | |
-| v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability & Operational Scale | ~9–13 wk + ~12h | — | |
+| v0.10.0 — DVM Hardening, Connection Pooler Compat, Core Refresh Opts & Infra Prep | ~7–10d + ~26–40 wk | — | |
+| v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana & Operational Scale | ~7–10 wk + ~12h | — | |
 | v0.12.0 — Anomalous Change Detection, CDC Research & PG Backward Compat | ~13–19 wk + ~10–14h | — | |
-| v0.13.0 — Core Refresh Opt., Scalability Foundations & UNLOGGED Buffers | ~16–31 wk | — | |
+| v0.13.0 — Scalability Foundations & UNLOGGED Buffers | ~9–18 wk | — | |
 | v0.14.0 — Native DDL Syntax, External Test Suites & Integration | ~140–230h | — | |
 | v1.0.0 — Stable release | 18–27h | — | |
 | Post-1.0 (ecosystem) | 88–134h | — | |
