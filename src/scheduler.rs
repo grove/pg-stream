@@ -1617,30 +1617,60 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             // Step A: Check if DAG needs rebuild
             let current_version = shmem::current_dag_version();
             if current_version != dag_version || dag.is_none() {
-                // C2-1: Drain the invalidation ring buffer. When `None` is
-                // returned the ring overflowed and a full rebuild is needed
-                // (same as before). When `Some(ids)` is returned, the ids
-                // identify *which* stream tables changed — a future
-                // incremental rebuild (G-8) can use them. For now we always
-                // do a full rebuild but log the affected ids for
-                // observability.
+                // C2-1: Drain the invalidation ring buffer.
                 let invalidated = shmem::drain_invalidations();
-                match &invalidated {
-                    None => log!("pg_trickle: DAG invalidation overflow → full rebuild"),
-                    Some(ids) if ids.is_empty() => { /* version bumped but no specific ids */ }
-                    Some(ids) => log!("pg_trickle: DAG invalidated for pgt_ids {:?}", ids,),
-                }
-                match StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds()) {
-                    Ok(new_dag) => {
-                        dag = Some(new_dag);
-                        dag_version = current_version;
-                        log!("pg_trickle: DAG rebuilt (version={})", dag_version);
+
+                // G-8: Try incremental rebuild when we have specific pgt_ids
+                // and an existing DAG. Falls back to full rebuild on overflow,
+                // no existing DAG, or incremental failure.
+                let incremental_ok = if let Some(ids) = &invalidated {
+                    if !ids.is_empty() {
+                        if let Some(ref mut existing_dag) = dag {
+                            match existing_dag.rebuild_incremental(
+                                ids,
+                                config::pg_trickle_default_schedule_seconds(),
+                            ) {
+                                Ok(()) => {
+                                    log!(
+                                        "pg_trickle: DAG incrementally updated for pgt_ids {:?} (version={})",
+                                        ids,
+                                        current_version,
+                                    );
+                                    true
+                                }
+                                Err(e) => {
+                                    log!(
+                                        "pg_trickle: incremental DAG rebuild failed ({}), falling back to full rebuild",
+                                        e,
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
-                    Err(e) => {
-                        log!("pg_trickle: failed to rebuild DAG: {}", e);
-                        return;
+                } else {
+                    // Overflow → full rebuild
+                    log!("pg_trickle: DAG invalidation overflow → full rebuild");
+                    false
+                };
+
+                if !incremental_ok {
+                    match StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds()) {
+                        Ok(new_dag) => {
+                            dag = Some(new_dag);
+                            log!("pg_trickle: DAG rebuilt (version={})", current_version);
+                        }
+                        Err(e) => {
+                            log!("pg_trickle: failed to rebuild DAG: {}", e);
+                            return;
+                        }
                     }
                 }
+                dag_version = current_version;
             }
 
             let dag_ref = match &dag {
