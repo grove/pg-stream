@@ -1592,6 +1592,8 @@ incompatible with PgBouncer transaction-mode pooling. This section introduces an
 | PB2 | Add `pooler_compatibility_mode` catalog column directly to `pgt_stream_tables` via `CREATE STREAM TABLE ... WITH (...)` or `alter_stream_table()` to bypass `PREPARE` statements and skip `NOTIFY` locally | 3–4d | [PLAN_PG_BOUNCER.md](plans/ecosystem/PLAN_PG_BOUNCER.md) |
 | PB3 | E2E validation against PgBouncer transaction-mode (Docker Compose with pooler sidecar) | 1–2d | [PLAN_EDGE_CASES.md](plans/PLAN_EDGE_CASES.md) EC-28 |
 
+> ⚠️ PB1 — **`SKIP LOCKED` fails silently, not safely.** `pg_advisory_lock()` blocks until the lock is granted, guaranteeing mutual exclusion. `FOR UPDATE SKIP LOCKED` returns **zero rows immediately** if the row is already locked — meaning a second worker will simply not acquire the lock and proceed as if uncontested, potentially running a concurrent refresh on the same stream table. Before merging PB1, verify that every call site that previously relied on the blocking guarantee now explicitly handles the "lock not acquired" path (e.g. skip this cycle and retry) rather than silently proceeding. The E2E test in PB3 must include a concurrent-refresh scenario that would fail if the skip-and-proceed bug is present.
+
 > **PgBouncer compatibility subtotal: ~7–10 days**
 
 ### DVM Correctness & Performance (deferred from v0.9.0)
@@ -1635,6 +1637,8 @@ incompatible with PgBouncer transaction-mode pooling. This section introduces an
 > the stable row identifier. `ctid` changes under VACUUM and will silently delete the wrong
 > rows. See the corrected SQL and risk analysis in PLAN_NEW_STUFF.md §C-4.
 
+> ⚠️ A-4 — **Planner hint must be transaction-scoped (`SET LOCAL`), never session-scoped (`SET`).** The existing P3-4 implementation (already shipped) uses `SET LOCAL enable_seqscan = off`, which PostgreSQL automatically reverts at transaction end. Any extension of A-4 (e.g. the covering index auto-creation path) must continue to use `SET LOCAL`. Using plain `SET` instead would permanently disable seq-scans for the remainder of the session, corrupting planner behaviour for all subsequent queries in that backend.
+
 > **Core refresh optimizations subtotal: ~7–11 weeks**
 
 ### Scheduler & DAG Scalability
@@ -1670,10 +1674,11 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [ ] P3-2: CORR/COVAR_*/REGR_* Welford auxiliary columns for O(1) algebraic maintenance
 - [ ] B3-2: Merged-delta weight aggregation passes property-based correctness proofs
 - [ ] B3-3: Property-based tests for simultaneous multi-source changes
-- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta
+- [ ] A-4: Covering index auto-created on `__pgt_row_id`; planner hint prevents seq-scan on small delta; `SET LOCAL` confirmed (not `SET`) so hint reverts at transaction end
 - [ ] B-2: Predicate pushdown reduces delta volume for selective queries (E2E benchmark)
 - [ ] C-4: Compaction uses `seq` PK; correct under concurrent VACUUM; serialised with advisory lock
 - [ ] B-4: Cost model self-calibrates from refresh history; correctly selects FULL for join_agg at 10% change rate
+- [ ] PB1: Concurrent-refresh scenario included in PB3 E2E test; `SKIP LOCKED` "not acquired" path skips cycle rather than proceeding
 
 ---
 
