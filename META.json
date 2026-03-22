@@ -29,7 +29,7 @@
     }
   },
   "tags": ["ivm", "streaming", "materialized view", "cdc", "rust", "differential-dataflow"],
-  "release_status": "testing",
+  "release_status": "stable",
   "generated_by": "pg_trickle contributors",
   "meta-spec": {
     "version": "1.0.0",

@@ -90,6 +90,46 @@ docker run --rm \
 
 ---
 
+## Installing from PGXN
+
+pg_trickle is published on the [PostgreSQL Extension Network (PGXN)](https://pgxn.org/dist/pg_trickle/).
+Installing via PGXN compiles the extension from source, so the Rust toolchain and pgrx are required.
+
+### 1. Install prerequisites
+
+```bash
+# Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# pgrx build tool
+cargo install --locked cargo-pgrx --version 0.17.0
+cargo pgrx init --pg18 "$(pg_config --bindir)/pg_config"
+```
+
+### 2. Install the pgxn client
+
+```bash
+pip install pgxnclient
+```
+
+### 3. Install pg_trickle
+
+```bash
+pgxn install pg_trickle
+```
+
+To install a specific version:
+
+```bash
+pgxn install pg_trickle=0.9.0
+```
+
+> **Note:** After installation, follow the [PostgreSQL Configuration](#postgresql-configuration) and
+> [Extension Installation](#extension-installation) steps below.
+
+---
+
 ## Building from Source
 
 ### 1. Install Rust
