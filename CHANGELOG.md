@@ -301,6 +301,20 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   Includes `remove_st_node()` with full edge cleanup and 8 unit tests
   covering removal, re-addition, edge cleanup, and cache invalidation.
 
+- **G-7: Tiered refresh scheduling (Hot/Warm/Cold/Frozen)** — New
+  user-controlled refresh tier system that reduces scheduler CPU for
+  large deployments. Four tiers control the effective schedule multiplier:
+  Hot (1×, default), Warm (2×), Cold (10×), Frozen (skip entirely).
+  Gated by `pg_trickle.tiered_scheduling` GUC (default off). Set via
+  `ALTER STREAM TABLE ... SET (tier => 'warm')`. Uses explicit user
+  assignment (not auto-classification from `pg_stat_user_tables`, which
+  is polluted by pg_trickle's own MERGE scans). Duration-based schedules
+  are multiplied; cron schedules are unaffected. Frozen-tier STs are
+  skipped entirely until manually promoted. New `refresh_tier` column
+  on `pgt_stream_tables` with CHECK constraint, exposed in
+  `pg_stat_stream_tables` view. 7 unit tests for tier parsing,
+  multiplier logic, validation, and roundtrip.
+
 - **C-4: Change buffer compaction** — New `pg_trickle.compact_threshold`
   GUC (default 100,000 rows) triggers automatic compaction before each
   refresh cycle when pending changes exceed the threshold. Compaction

@@ -1690,7 +1690,7 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 
 | Item | Description | Effort | Status | Ref |
 |------|-------------|--------|--------|-----|
-| G-7 | **Tiered refresh scheduling (Hot/Warm/Cold/Frozen).** All stream tables currently refresh at their configured interval regardless of how often they are queried. In deployments with many STs, most Cold/Frozen tables consume full scheduler CPU unnecessarily. Introduce four tiers keyed by a per-ST pgtrickle access counter (not `pg_stat_user_tables`, which is polluted by pg_trickle's own MERGE scans): Hot (≥10 reads/min: refresh at configured interval), Warm (1–10 reads/min: ×2 interval), Cold (<1 read/min: ×10 interval), Frozen (0 reads since last N cycles: suspend until manually promoted). A single GUC `pg_trickle.tiered_scheduling` (default off) gates the feature. | 3–4 wk | ⬜ Not started | [src/scheduler.rs](src/scheduler.rs) · [plans/performance/PLAN_NEW_STUFF.md §C-1](plans/performance/PLAN_NEW_STUFF.md) |
+| G-7 | **Tiered refresh scheduling (Hot/Warm/Cold/Frozen).** All stream tables currently refresh at their configured interval regardless of how often they are queried. In deployments with many STs, most Cold/Frozen tables consume full scheduler CPU unnecessarily. Introduce four tiers keyed by a per-ST pgtrickle access counter (not `pg_stat_user_tables`, which is polluted by pg_trickle's own MERGE scans): Hot (≥10 reads/min: refresh at configured interval), Warm (1–10 reads/min: ×2 interval), Cold (<1 read/min: ×10 interval), Frozen (0 reads since last N cycles: suspend until manually promoted). A single GUC `pg_trickle.tiered_scheduling` (default off) gates the feature. | 3–4 wk | ✅ Done | [src/scheduler.rs](src/scheduler.rs) · [plans/performance/PLAN_NEW_STUFF.md §C-1](plans/performance/PLAN_NEW_STUFF.md) |
 | G-8 | **Incremental DAG rebuild on DDL changes.** Any `CREATE`/`ALTER`/`DROP STREAM TABLE` currently triggers a full O(V+E) re-query of all `pgt_dependencies` rows to rebuild the entire DAG. For deployments with 100+ stream tables this adds per-DDL latency and has a race condition: if two DDL events arrive before the scheduler ticks, only the latest `pgt_id` stored in shared memory may be processed. Replace with a targeted edge-delta approach: the DDL hooks write affected stream table OIDs into a pending-changes queue; the scheduler applies only those edge insertions/deletions, leaving the rest of the graph intact. | 2–3 wk | ✅ Done | [src/dag.rs](src/dag.rs) · [src/scheduler.rs](src/scheduler.rs) · [plans/performance/PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
 | C2-1 | **Ring-buffer DAG invalidation.** Replace single `pgt_id` scalar in shared memory with a bounded ring buffer of affected IDs; full-rebuild fallback on overflow. Hard prerequisite for correctness of G-8 under rapid DDL changes. | 1 wk | ✅ Done | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
 | C2-2 | **Incremental topo-sort.** Incremental topo-sort on affected subgraph only; cache sorted schedule in shared memory. | 1–2 wk | ✅ Done | [PLAN_NEW_STUFF.md §C-2](plans/performance/PLAN_NEW_STUFF.md) |
@@ -1701,12 +1701,34 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 
 > **Scheduler & DAG scalability subtotal: ~7–10 weeks**
 
-> **v0.10.0 total: ~58–84 hours + ~32–50 weeks DVM, refresh & safety work**
+### "No Surprises" — Principle of Least Astonishment
+
+> **In plain terms:** pg_trickle does a lot of work automatically — rewriting
+> queries, managing auxiliary columns, transitioning CDC modes, falling back
+> between refresh strategies. Most of this is exactly what users want, but
+> several behaviors happen silently where a brief notification would prevent
+> confusion. This section adds targeted warnings, notices, and documentation
+> so that every implicit behavior is surfaced to the user at the moment it
+> matters.
+
+| Item | Description | Effort | Status | Ref |
+|------|-------------|--------|--------|-----|
+| NS-1 | **Warn on ORDER BY without LIMIT.** Emit `WARNING` at `create_stream_table` / `alter_stream_table` time when query contains `ORDER BY` without `LIMIT`: "ORDER BY without LIMIT has no effect on stream tables — storage row order is undefined." | 2–4h | ⬜ Not started | [src/api.rs](src/api.rs) |
+| NS-2 | **Warn on append_only auto-revert.** Upgrade the `info!()` to `warning!()` when `append_only` is automatically reverted due to DELETE/UPDATE. Add a `pgtrickle_alert` NOTIFY with category `append_only_reverted`. | 1–2h | ⬜ Not started | [src/refresh.rs](src/refresh.rs) |
+| NS-3 | **Promote cleanup errors after consecutive failures.** Track consecutive `drain_pending_cleanups()` error count in thread-local state; promote from `debug1` to `WARNING` after 3 consecutive failures for the same source OID. | 2–4h | ⬜ Not started | [src/refresh.rs](src/refresh.rs) |
+| NS-4 | **Document `__pgt_*` auxiliary columns in SQL_REFERENCE.** Add a dedicated subsection listing all implicit columns (`__pgt_row_id`, `__pgt_count`, `__pgt_sum`, `__pgt_sum2`, `__pgt_nonnull`, `__pgt_covar_*`, `__pgt_count_l`, `__pgt_count_r`) with the aggregate functions that trigger each. | 2–4h | ⬜ Not started | [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) |
+| NS-5 | **NOTICE on diamond detection with `diamond_consistency='none'`.** When `create_stream_table` detects a diamond dependency and the user hasn't explicitly set `diamond_consistency`, emit `NOTICE`: "Diamond dependency detected — consider setting diamond_consistency='atomic' for consistent cross-branch reads." | 2–4h | ⬜ Not started | [src/api.rs](src/api.rs) · [src/dag.rs](src/dag.rs) |
+| NS-6 | **NOTICE on differential→full fallback.** Upgrade the existing `info!()` in adaptive fallback to `NOTICE` so it appears at default `client_min_messages` level. | 0.5–1h | ⬜ Not started | [src/refresh.rs](src/refresh.rs) |
+| NS-7 | **NOTICE on isolated CALCULATED schedule.** When `create_stream_table` creates an ST with `schedule='calculated'` that has no downstream dependents, emit `NOTICE`: "No downstream dependents found — schedule will fall back to pg_trickle.default_schedule_seconds (currently Ns)." | 1–2h | ⬜ Not started | [src/api.rs](src/api.rs) |
+
+> **"No Surprises" subtotal: ~10–20 hours**
+
+> **v0.10.0 total: ~58–84 hours + ~32–50 weeks DVM, refresh & safety work + ~10–20 hours "No Surprises"**
 
 **Exit criteria:**
 - [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.9.0 → 0.10.0`)
 - [ ] All public documentation current and reviewed
-- [ ] G-7: Tiered scheduling (Hot/Warm/Cold/Frozen) implemented; `pg_trickle.tiered_scheduling` GUC gating the feature
+- [x] G-7: Tiered scheduling (Hot/Warm/Cold/Frozen) implemented; `pg_trickle.tiered_scheduling` GUC gating the feature
 - [x] G-8: Incremental DAG rebuild implemented; DDL-triggered edge-delta replaces full O(V+E) re-query
 - [x] C2-1: Ring-buffer DAG invalidation safe under rapid consecutive DDL changes
 - [x] C2-2: Incremental topo-sort caches sorted schedule; verified by property-based test
@@ -1735,6 +1757,13 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [x] SF-11: `check_publication_health()` detects post-creation partitioning and rebuilds publication with `publish_via_partition_root = true`
 - [ ] SF-12: `DiamondSchedulePolicy::Fastest` cost-multiplication documented in `CONFIGURATION.md` with `Slowest` explanation
 - [ ] SF-13: B-2 / G-4 roadmap inconsistency resolved; entry reflects actual remaining scope (or marked done if fully completed)
+- [ ] NS-1: `ORDER BY` without `LIMIT` emits `WARNING` at creation time; E2E test verifies message
+- [ ] NS-2: `append_only` auto-revert uses `WARNING` (not `INFO`) and sends `pgtrickle_alert` NOTIFY
+- [ ] NS-3: `drain_pending_cleanups` promotes to `WARNING` after 3 consecutive failures per source OID
+- [ ] NS-4: `__pgt_*` auxiliary columns documented in SQL_REFERENCE with triggering aggregate functions
+- [ ] NS-5: Diamond detection with `diamond_consistency='none'` emits `NOTICE` suggesting `'atomic'`
+- [ ] NS-6: Differential→full adaptive fallback uses `NOTICE` (not `INFO`)
+- [ ] NS-7: Isolated `CALCULATED` schedule emits `NOTICE` with effective fallback interval
 
 ---
 

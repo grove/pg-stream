@@ -781,7 +781,8 @@ pgtrickle.alter_stream_table(
     diamond_schedule_policy text    DEFAULT NULL,
     cdc_mode              text      DEFAULT NULL,
     append_only           bool      DEFAULT NULL,
-    pooler_compatibility_mode bool  DEFAULT NULL
+    pooler_compatibility_mode bool  DEFAULT NULL,
+    tier                  text      DEFAULT NULL
 ) → void
 ```
 
@@ -799,6 +800,7 @@ pgtrickle.alter_stream_table(
 | `cdc_mode` | `text` | `NULL` | New requested CDC mode override (`'auto'`, `'trigger'`, or `'wal'`). Pass `NULL` to leave unchanged. |
 | `append_only` | `bool` | `NULL` | Enable or disable the append-only INSERT fast path. Pass `NULL` to leave unchanged. When `true`, rejected for FULL, IMMEDIATE, or keyless source stream tables. |
 | `pooler_compatibility_mode` | `bool` | `NULL` | Enable or disable pooler-safe mode. When `true`, prepared statements are bypassed and NOTIFY emissions are suppressed. Pass `NULL` to leave unchanged. |
+| `tier` | `text` | `NULL` | Refresh tier for tiered scheduling (`'hot'`, `'warm'`, `'cold'`, or `'frozen'`). Only effective when `pg_trickle.tiered_scheduling` GUC is enabled. Hot (1×), Warm (2×), Cold (10×), Frozen (skip). Pass `NULL` to leave unchanged. |
 
 If you switch a stream table to `refresh_mode => 'IMMEDIATE'` while the
 cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle logs an
@@ -844,6 +846,10 @@ SELECT pgtrickle.alter_stream_table('event_log_st', append_only => true);
 
 -- Enable pooler compatibility mode (for PgBouncer transaction mode)
 SELECT pgtrickle.alter_stream_table('order_totals', pooler_compatibility_mode => true);
+
+-- Set refresh tier (requires pg_trickle.tiered_scheduling = on)
+SELECT pgtrickle.alter_stream_table('order_totals', tier => 'warm');
+SELECT pgtrickle.alter_stream_table('archive_stats', tier => 'frozen');
 
 -- Suspend a stream table
 SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');

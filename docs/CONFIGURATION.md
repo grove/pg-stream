@@ -25,6 +25,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
     - [pg\_trickle.merge\_seqscan\_threshold](#pg_tricklemerge_seqscan_threshold)
     - [pg\_trickle.auto\_backoff](#pg_trickleauto_backoff)
+    - [pg\_trickle.tiered\_scheduling](#pg_trickletiered_scheduling)
     - [pg\_trickle.cleanup\_use\_truncate](#pg_tricklecleanup_use_truncate)
     - [pg\_trickle.use\_prepared\_statements](#pg_trickleuse_prepared_statements)
     - [pg\_trickle.user\_triggers](#pg_trickleuser_triggers)
@@ -478,6 +479,43 @@ This is a safety net for overloaded systems — it prevents a single slow stream
 ```sql
 SET pg_trickle.auto_backoff = on;
 ```
+
+---
+
+### pg_trickle.tiered_scheduling
+
+Enable tiered refresh scheduling (Hot/Warm/Cold/Frozen) for stream tables.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `off` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, the scheduler applies a per-stream-table refresh tier multiplier
+to duration-based schedules. Each stream table has a `refresh_tier` column
+(default `'hot'`) that controls how often it is refreshed relative to its
+configured schedule:
+
+| Tier | Multiplier | Effect |
+|------|-----------|--------|
+| `hot` | 1× | Refresh at configured schedule (default) |
+| `warm` | 2× | Refresh at 2× the configured interval |
+| `cold` | 10× | Refresh at 10× the configured interval |
+| `frozen` | skip | Never refreshed until manually promoted |
+
+Cron-based schedules are not affected by the tier multiplier.
+
+Set the tier via:
+```sql
+SELECT pgtrickle.alter_stream_table('my_table', tier => 'warm');
+SELECT pgtrickle.alter_stream_table('my_table', tier => 'frozen');
+```
+
+**Design note:** Tiers are user-assigned only. Automatic classification from
+`pg_stat_user_tables` was rejected because pg_trickle's own MERGE scans
+pollute the read counters, making auto-classification unreliable.
 
 ---
 
