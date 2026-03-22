@@ -274,7 +274,9 @@ fn handle_view_change(cmd: &DdlCommand) {
         total,
     );
 
-    shmem::signal_dag_rebuild();
+    for &id in affected_pgt_ids.iter().chain(cascade_ids.iter()) {
+        shmem::signal_dag_invalidation(id);
+    }
     // G8.1: Notify other backends to flush their delta/MERGE template caches.
     shmem::bump_cache_generation();
 }
@@ -356,7 +358,9 @@ fn handle_function_change(cmd: &DdlCommand) {
         total,
     );
 
-    shmem::signal_dag_rebuild();
+    for &id in affected_pgt_ids.iter().chain(cascade_ids.iter()) {
+        shmem::signal_dag_invalidation(id);
+    }
     shmem::bump_cache_generation();
 }
 
@@ -457,7 +461,9 @@ fn handle_type_change(cmd: &DdlCommand) {
         total,
     );
 
-    shmem::signal_dag_rebuild();
+    for &id in affected_pgt_ids.iter().chain(cascade_ids.iter()) {
+        shmem::signal_dag_invalidation(id);
+    }
     shmem::bump_cache_generation();
 }
 
@@ -564,7 +570,9 @@ fn handle_domain_change(cmd: &DdlCommand) {
         total,
     );
 
-    shmem::signal_dag_rebuild();
+    for &id in affected_pgt_ids.iter().chain(cascade_ids.iter()) {
+        shmem::signal_dag_invalidation(id);
+    }
     shmem::bump_cache_generation();
 }
 
@@ -653,7 +661,9 @@ fn handle_policy_change(cmd: &DdlCommand) {
         total,
     );
 
-    shmem::signal_dag_rebuild();
+    for &id in affected_pgt_ids.iter().chain(cascade_ids.iter()) {
+        shmem::signal_dag_invalidation(id);
+    }
     shmem::bump_cache_generation();
 }
 
@@ -1169,7 +1179,7 @@ fn handle_st_storage_dropped(relid: pg_sys::Oid, identity: &str) {
     }
 
     // Signal the scheduler to rebuild the DAG.
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(st.pgt_id);
 
     log!(
         "pg_trickle_ddl_tracker: ST storage table {} dropped → catalog cleaned, DAG rebuild signaled",
@@ -1309,7 +1319,9 @@ fn handle_dropped_function(obj: &DroppedObject) {
         total,
     );
 
-    shmem::signal_dag_rebuild();
+    for &id in affected_pgt_ids.iter().chain(cascade_ids.iter()) {
+        shmem::signal_dag_invalidation(id);
+    }
     shmem::bump_cache_generation();
 }
 

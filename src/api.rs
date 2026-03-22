@@ -1790,7 +1790,7 @@ fn alter_stream_table_query(
     }
 
     // Signal DAG rebuild and cache invalidation
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(st.pgt_id);
     shmem::bump_cache_generation();
 
     // ── Phase 5: Repopulate ──
@@ -2124,7 +2124,7 @@ fn create_stream_table_impl(
     }
 
     // Signal scheduler to rebuild DAG
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(pgt_id);
 
     pgrx::info!(
         "Stream table {}.{} created (pgt_id={}, mode={}, initialized={})",
@@ -2483,7 +2483,7 @@ fn alter_stream_table_impl(
         }
     }
 
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(st.pgt_id);
     // G8.1: Notify other backends to flush delta/MERGE template caches.
     shmem::bump_cache_generation();
     Ok(())
@@ -2582,7 +2582,7 @@ fn drop_stream_table_impl_inner(
     }
 
     // Signal scheduler
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(st.pgt_id);
     // G8.1: Notify other backends to flush delta/MERGE template caches.
     shmem::bump_cache_generation();
 

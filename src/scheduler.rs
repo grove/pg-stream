@@ -1617,6 +1617,19 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
             // Step A: Check if DAG needs rebuild
             let current_version = shmem::current_dag_version();
             if current_version != dag_version || dag.is_none() {
+                // C2-1: Drain the invalidation ring buffer. When `None` is
+                // returned the ring overflowed and a full rebuild is needed
+                // (same as before). When `Some(ids)` is returned, the ids
+                // identify *which* stream tables changed — a future
+                // incremental rebuild (G-8) can use them. For now we always
+                // do a full rebuild but log the affected ids for
+                // observability.
+                let invalidated = shmem::drain_invalidations();
+                match &invalidated {
+                    None => log!("pg_trickle: DAG invalidation overflow → full rebuild"),
+                    Some(ids) if ids.is_empty() => { /* version bumped but no specific ids */ }
+                    Some(ids) => log!("pg_trickle: DAG invalidated for pgt_ids {:?}", ids,),
+                }
                 match StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds()) {
                     Ok(new_dag) => {
                         dag = Some(new_dag);
