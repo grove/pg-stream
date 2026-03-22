@@ -9,6 +9,15 @@
 ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE;
 
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_groups (
+    group_id    SERIAL PRIMARY KEY,
+    group_name  TEXT NOT NULL UNIQUE,
+    member_oids OID[] NOT NULL,
+    isolation   TEXT NOT NULL DEFAULT 'read_committed'
+                CHECK (isolation IN ('read_committed', 'repeatable_read')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- ── Updated API Functions (new pooler_compatibility_mode parameter) ─────────
 
 -- The old 9-arg signatures must be dropped before creating the 10-arg versions.
