@@ -1738,7 +1738,36 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         }
                     }
                 }
-                dag_version = current_version;
+
+                // Race-condition guard: verify all invalidated pgt_ids are visible
+                // in the rebuilt DAG.  `signal_dag_invalidation` is called inside
+                // the creating transaction before it commits, so the scheduler can
+                // read the new version while the transaction is still in-flight.
+                // If the SPI snapshot captured at tick start pre-dates that commit,
+                // the catalog query misses the new ST and the DAG is built without
+                // it.  Detect this by checking whether every invalidated id is
+                // present; if not, trigger a full-rebuild signal and skip updating
+                // dag_version so the next tick rebuilds with a fresh snapshot that
+                // includes all committed STs.
+                let stale_snapshot_detected = if let (Some(ids), Some(d)) = (&invalidated, &dag) {
+                    ids.iter().any(|&id| !d.has_st_node(id))
+                } else {
+                    false
+                };
+
+                if stale_snapshot_detected {
+                    log!(
+                        "pg_trickle: DAG rebuild used stale snapshot — some invalidated pgt_ids \
+                         not yet visible (version={}); triggering full rebuild next tick",
+                        current_version
+                    );
+                    // Signal a full rebuild (overflow) so the next tick uses a fresh
+                    // snapshot.  Do NOT update dag_version — the stale tick's version
+                    // is not trusted.
+                    shmem::signal_dag_rebuild();
+                } else {
+                    dag_version = current_version;
+                }
             }
 
             let dag_ref = match &dag {
@@ -2410,7 +2439,11 @@ fn is_falling_behind(elapsed_ms: i64, schedule_ms: i64, threshold: f64) -> Optio
         return None;
     }
     let ratio = elapsed_ms as f64 / schedule_ms as f64;
-    if ratio >= threshold { Some(ratio) } else { None }
+    if ratio >= threshold {
+        Some(ratio)
+    } else {
+        None
+    }
 }
 
 /// P3-5: Update the auto-backoff factor for a stream table based on its

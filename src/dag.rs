@@ -492,6 +492,16 @@ impl StDag {
         self.nodes.values().collect()
     }
 
+    /// Returns `true` if the given pgt_id is present in the DAG.
+    ///
+    /// Used by the scheduler to verify that all invalidated pgt_ids are
+    /// visible after a DAG rebuild.  If any are missing (stale catalog
+    /// snapshot), the scheduler should not update its `dag_version` so the
+    /// next tick rebuilds with a fresh snapshot.
+    pub fn has_st_node(&self, pgt_id: i64) -> bool {
+        self.all_nodes.contains(&NodeId::StreamTable(pgt_id))
+    }
+
     /// Detect cycles using Kahn's algorithm (BFS topological sort).
     ///
     /// Returns `Ok(())` if the graph is acyclic, or `Err(CycleDetected)` with
