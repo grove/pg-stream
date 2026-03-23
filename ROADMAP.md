@@ -1850,7 +1850,7 @@ revert if needed.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | DEF-1 | **Flip `parallel_refresh_mode` default to `'on'`.** The feature has been stable since v0.4.0 (six releases). Keeping it `'off'` forces every operator to discover the opt-in manually. Change the default, update CONFIGURATION.md, and add an E2E test that verifies two independent STs refresh concurrently. | 2–4h | [REPORT_OVERALL_STATUS.md §R1](plans/performance/REPORT_OVERALL_STATUS.md) |
-| DEF-2 | **Flip `auto_backoff` default to `true`.** When a stream table's refresh consistently takes longer than its schedule interval the scheduler silently wastes CPU re-queuing it. Auto-backoff is the safe behavior; the current `false` default leaves operators unaware. Add a `CONFIGURATION.md` note explaining the doubling policy and reset condition. | 1–2h | [REPORT_OVERALL_STATUS.md §R10](plans/performance/REPORT_OVERALL_STATUS.md) |
+| DEF-2 | ~~**Flip `auto_backoff` default to `true`.**~~ ✅ Done in v0.10.0 — default flipped to `true`; trigger threshold raised to 95%, cap reduced to 8×, log level raised to WARNING. CONFIGURATION.md updated. | 1–2h | [REPORT_OVERALL_STATUS.md §R10](plans/performance/REPORT_OVERALL_STATUS.md) |
 | DEF-3 | **SemiJoin delta-key pre-filter (O-1).** SemiJoin Part 2 currently rescans the full left table even when only a handful of left-side rows match the delta. Inject a `WHERE left_key IN (SELECT key FROM delta)` pre-filter before the full join. TPC-H Q18, Q20, Q21 are the canonical slow queries. Effort estimate from PLAN_TPC_H_BENCHMARKING.md: 8–10h, expected 15–26× speedup. | 8–10h | [REPORT_OVERALL_STATUS.md §R4](plans/performance/REPORT_OVERALL_STATUS.md) · [PLAN_TPC_H_BENCHMARKING.md](plans/performance/PLAN_TPC_H_BENCHMARKING.md) §O-1 |
 | DEF-4 | **Increase invalidation ring capacity from 32 to 128 slots.** Deployments with frequent DDL (CI pipelines, dbt model rebuilds, schema migrations) can overflow the 32-slot ring, forcing a full O(V+E) DAG rebuild on every tick. Increasing capacity is a one-line constant change with negligible shared-memory cost. | 0.5h | [REPORT_OVERALL_STATUS.md §R9](plans/performance/REPORT_OVERALL_STATUS.md) |
 
@@ -1864,7 +1864,7 @@ revert if needed.
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
 - [ ] DEF-1: `parallel_refresh_mode` default is `'on'`; concurrent-refresh E2E test passes
-- [ ] DEF-2: `auto_backoff` default is `true`; CONFIGURATION.md updated
+- [x] DEF-2: `auto_backoff` default is `true`; CONFIGURATION.md updated — ✅ Done in v0.10.0
 - [ ] DEF-3: SemiJoin delta-key pre-filter implemented; TPC-H Q18/Q20/Q21 re-benchmarked
 - [ ] DEF-4: Invalidation ring capacity is 128 slots; validated under rapid DDL E2E test
 - [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)

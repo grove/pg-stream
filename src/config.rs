@@ -188,7 +188,7 @@ pub static PGS_ALGEBRAIC_DRIFT_RESET_CYCLES: GucSetting<i32> = GucSetting::<i32>
 ///
 /// This prevents CPU runaway when a stream table's refresh cost exceeds
 /// its schedule budget and an operator is not available to respond manually.
-pub static PGS_AUTO_BACKOFF: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static PGS_AUTO_BACKOFF: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// P3-4: Delta-to-ST-size ratio below which `SET LOCAL enable_seqscan = off`
 /// is applied before MERGE execution.
@@ -728,10 +728,10 @@ pub fn register_gucs() {
 
     GucRegistry::define_bool_guc(
         c"pg_trickle.auto_backoff",
-        c"Automatically back off schedule for falling-behind stream tables.",
-        c"When enabled and a stream table's refresh duration exceeds 80% of its \
-           schedule interval, the scheduler doubles the effective interval on each \
-           consecutive falling-behind cycle. Resets on the first on-time cycle.",
+        c"Automatically back off schedule for falling-behind stream tables (default on).",
+        c"When enabled (the default), the scheduler doubles the effective interval \
+           when a refresh takes more than 95% of the schedule window, capped at 8x. \
+           Emits a WARNING when the factor changes. Resets on the first on-time cycle.",
         &PGS_AUTO_BACKOFF,
         GucContext::Suset,
         GucFlags::default(),

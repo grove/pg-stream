@@ -464,20 +464,32 @@ Automatically back off the refresh schedule when a stream table is consistently 
 | Property | Value |
 |---|---|
 | Type | `bool` |
-| Default | `off` |
+| Default | `on` |
 | Context | `SUSET` |
 | Restart Required | No |
 
-When enabled, the scheduler tracks a per-stream-table exponential backoff factor. If a refresh cycle takes more than 80% of the scheduled interval, the backoff factor doubles (capped at 64×), effectively stretching the schedule to avoid runaway refresh storms. The factor resets to 1× on the first on-time completion.
+When enabled (the default), the scheduler tracks a per-stream-table backoff factor. If a
+refresh cycle takes more than **95%** of the scheduled interval, the backoff factor doubles
+(capped at **8×**), effectively stretching the schedule to avoid runaway refresh storms.
+The factor resets to 1× on the first on-time completion, and a `WARNING` is emitted whenever
+the factor changes so you always know why a stream table is refreshing more slowly than expected.
 
-This is a safety net for overloaded systems — it prevents a single slow stream table from monopolizing the background worker when operators are not available to intervene.
+The 95% trigger threshold means that brief jitter on developer machines (e.g. a 950 ms refresh
+on a 1-second schedule) will correctly engage backoff, while a 900 ms refresh on the same
+schedule will not. The EC-11 operator alert (`scheduler_falling_behind` NOTIFY) continues to
+fire at the lower 80% threshold, giving you advance warning before the scheduler is actually stuck.
+
+This is a safety net for overloaded systems — it prevents a single slow stream table from
+monopolizing the background worker when operators are not available to intervene.
 
 **Tuning Guidance:**
-- **Leave off** unless you observe `scheduler_falling_behind` NOTIFY alerts on production systems.
-- **Enable** if you run many stream tables with tight schedules and want graceful degradation under load.
+- **Leave on** (the default) for both production and development environments.
+- **Disable** only if you are deliberately running stream tables at the limit of their schedule
+  budget and want the scheduler to keep trying at full speed regardless.
 
 ```sql
-SET pg_trickle.auto_backoff = on;
+-- Disable if you want no backoff (not recommended for production)
+SET pg_trickle.auto_backoff = off;
 ```
 
 ---

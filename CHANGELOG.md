@@ -61,6 +61,11 @@ alongside short schedules (e.g. `'1s'`) in developer and CI environments:
   `WARNING` message in your PostgreSQL client, including the new effective
   interval — rather than a silent slowdown with no explanation.
 
+- **`auto_backoff` now defaults to `on`.** With the above improvements in place,
+  the feature is safe in all environments. New installations get CPU runaway
+  protection out of the box. To restore the old opt-in behaviour, set
+  `pg_trickle.auto_backoff = off`.
+
 ### Works Behind PgBouncer
 
 PgBouncer is the most popular PostgreSQL connection pooler. In "transaction
@@ -293,11 +298,9 @@ configuration knobs, a refresh-group management API, and several bug fixes.
 
 ### Smarter Refresh Scheduling
 
-- **Automatic backoff for overloaded streams**: Enable
-  `pg_trickle.auto_backoff` (default off) and the scheduler will
-  automatically slow down any stream table that consistently can't keep
-  up with its schedule.  The interval doubles each cycle (up to 64×) and
-  resets the moment the stream catches up.
+- **Automatic backoff for overloaded streams**: The `pg_trickle.auto_backoff`
+  GUC was introduced here (default off at the time). See the v0.10.0 entry
+  for the improved thresholds, reduced cap, and the flip to `on` by default.
 - **Index-aware MERGE**: A new threshold setting
   (`pg_trickle.merge_seqscan_threshold`, default 0.001) tells PostgreSQL
   to use an index lookup instead of a full table scan when only a tiny
