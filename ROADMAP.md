@@ -1726,7 +1726,7 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 > **v0.10.0 total: ~58–84 hours + ~32–50 weeks DVM, refresh & safety work + ~10–20 hours "No Surprises"**
 
 **Exit criteria:**
-- [ ] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.9.0 → 0.10.0`)
+- [x] `ALTER EXTENSION pg_trickle UPDATE` tested (`0.9.0 → 0.10.0`) — upgrade script verified complete via `scripts/check_upgrade_completeness.sh`; adds `pooler_compatibility_mode`, `refresh_tier`, `pgt_refresh_groups`, and updated API function signatures
 - [ ] All public documentation current and reviewed
 - [x] G-7: Tiered scheduling (Hot/Warm/Cold/Frozen) implemented; `pg_trickle.tiered_scheduling` GUC gating the feature
 - [x] G-8: Incremental DAG rebuild implemented; DDL-triggered edge-delta replaces full O(V+E) re-query
@@ -1753,14 +1753,14 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [x] SF-7: Empty `subquery_cols` in scalar subquery returns `PgTrickleError::UnsupportedQuery` rather than emitting `NULL`
 - [x] SF-8: Lateral inner-change branch uses `i64::MIN` sentinel instead of `0::BIGINT` as dummy `__pgt_row_id`
 - [x] SF-9: UPDATE trigger PK join uses `IS NOT DISTINCT FROM` for all PK columns; NULL-PK rows captured correctly
-- [ ] SF-10: TRUNCATE + same-window INSERT E2E test passes; post-TRUNCATE rows not dropped
+- [x] SF-10: TRUNCATE + same-window INSERT E2E test passes; post-TRUNCATE rows not dropped
 - [x] SF-11: `check_publication_health()` detects post-creation partitioning and rebuilds publication with `publish_via_partition_root = true`
 - [x] SF-12: `DiamondSchedulePolicy::Fastest` cost-multiplication documented in `CONFIGURATION.md` with `Slowest` explanation
 - [x] SF-13: B-2 / G-4 roadmap inconsistency resolved; entry reflects actual remaining scope (or marked done if fully completed)
 - [x] NS-1: `ORDER BY` without `LIMIT` emits `WARNING` at creation time; E2E test verifies message
 - [x] NS-2: `append_only` auto-revert uses `WARNING` (not `INFO`) and sends `pgtrickle_alert` NOTIFY
 - [x] NS-3: `drain_pending_cleanups` promotes to `WARNING` after 3 consecutive failures per source OID
-- [ ] NS-4: `__pgt_*` auxiliary columns documented in SQL_REFERENCE with triggering aggregate functions
+- [x] NS-4: `__pgt_*` auxiliary columns documented in SQL_REFERENCE with triggering aggregate functions
 - [x] NS-5: Diamond detection with `diamond_consistency='none'` emits `NOTICE` suggesting `'atomic'`
 - [x] NS-6: Differential→full adaptive fallback uses `NOTICE` (not `INFO`)
 - [x] NS-7: Isolated `CALCULATED` schedule emits `NOTICE` with effective fallback interval

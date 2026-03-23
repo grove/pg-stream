@@ -200,12 +200,16 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   dropping rows with NULL primary key columns from the change buffer. Changed
   to `IS NOT DISTINCT FROM` so NULL-valued PK columns compare correctly.
 
-- **SF-10: TRUNCATE + INSERT ordering verified safe** — Reviewed the TRUNCATE
-  handling path: when the change buffer contains a `'T'` marker, the refresh
-  engine falls back to `execute_full_refresh()` which re-reads the source
-  table directly (not the change buffer). Post-TRUNCATE INSERTs that arrive
-  before the scheduler ticks are captured by the full refresh snapshot.
-  The change buffer is discarded atomically within the same transaction.
+- **SF-10: TRUNCATE + INSERT ordering verified safe, E2E test added** —
+  Reviewed the TRUNCATE handling path: when the change buffer contains a
+  `'T'` marker, the refresh engine falls back to `execute_full_refresh()`
+  which re-reads the source table directly (not the change buffer).
+  Post-TRUNCATE INSERTs that arrive before the scheduler ticks are captured
+  by the full refresh snapshot. The change buffer is discarded atomically
+  within the same transaction. A new E2E test
+  (`test_sf10_truncate_then_insert_post_truncate_rows_captured`) verifies
+  this exact sequence and asserts that after TRUNCATE + INSERT + refresh the
+  stream table contains only the post-TRUNCATE rows.
 
 - **SF-12: DiamondSchedulePolicy CPU cost documented** — Added documentation
   to `CONFIGURATION.md` explaining that `diamond_schedule_policy = 'fastest'`
@@ -238,6 +242,17 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   (silent in normal operation). From the 3rd consecutive failure onward the
   message is promoted to `WARNING` so operators see the accumulating problem
   in the server log. The counter resets to zero on any successful cleanup.
+
+- **NS-4: `__pgt_*` auxiliary columns documented** — Added a new
+  "Internal `__pgt_*` Auxiliary Columns" section to `SQL_REFERENCE.md`
+  documenting all hidden columns that the refresh engine may add to stream
+  table storage (beyond the always-present `__pgt_row_id` primary key):
+  `__pgt_count`, `__pgt_count_l`/`r`, `__pgt_aux_sum_*`/`count_*` (AVG),
+  `__pgt_aux_sum2_*` (STDDEV/VAR), `__pgt_aux_sumx/y/xy/x2/y2_*`
+  (CORR/COVAR/REGR aggregates), `__pgt_aux_nonnull_*` (SUM + FULL JOIN),
+  `__pgt_wf_<N>` (window-function lift-out), and `__pgt_depth` (recursive
+  CTE depth counter). Each variant lists the SQL constructs that trigger it
+  and a short description of how it is used.
 
 - **NS-5: Diamond consistency NOTICE** — When a stream table is created
   with `diamond_consistency='none'` and the resulting DAG contains a diamond
