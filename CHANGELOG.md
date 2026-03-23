@@ -245,6 +245,21 @@ actionable message at the moment they occur:
   the aggregate-specific auxiliary columns for AVG, STDDEV, CORR, COVAR, REGR_*,
   window functions, and recursive CTE depth.
 
+### Bug Fixes
+
+- **Scheduler no longer permanently misses stream tables created under a
+  stale snapshot.** `signal_dag_invalidation` is called inside the creating
+  transaction before it commits. If the background scheduler happened to
+  start a new tick and capture a catalog snapshot at that exact instant, the
+  DAG rebuild query would not see the new stream table — yet the version
+  counter was already advanced, so the scheduler would never rebuild again.
+  The affected stream table would then never be scheduled for refresh.
+  Fixed by verifying that every invalidated `pgt_id` is present in the
+  rebuilt DAG after each rebuild. If any are missing the scheduler signals
+  a full-rebuild for the next tick (which starts a fresh transaction that
+  includes all committed data) rather than accepting the stale version.
+  Fixes CI test `test_autorefresh_diamond_cascade`.
+
 ### Upgrade Notes
 
 - **New catalog columns.** The `0.9.0 → 0.10.0` upgrade migration adds
@@ -512,7 +527,7 @@ Completed a full hardening pass of the integration test suite, bringing all item
 - **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
 - **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
 - **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across que- **Resilience and edge cases** — Tesat- **Resilience and edge cases** — Test coverage for ST dr_co- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escala mock states.
+- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across queued mock states.
 - **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
 
 
@@ -821,7 +836,7 @@ Completed a full hardening pass of the integration test suite, bringing all item
 - **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
 - **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
 - **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across que- **Resilience and edge cases** — Tesat- **Resilience and edge cases** — Test coverage for ST dr_co- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escala mock states.
+- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across queued mock states.
 - **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
 
 
@@ -950,7 +965,7 @@ Completed a full hardening pass of the integration test suite, bringing all item
 - **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
 - **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
 - **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across que- **Resilience and edge cases** — Tesat- **Resilience and edge cases** — Test coverage for ST dr_co- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escala mock states.
+- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across queued mock states.
 - **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
 
 
@@ -1015,7 +1030,7 @@ Completed a full hardening pass of the integration test suite, bringing all item
 - **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
 - **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
 - **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across que- **Resilience and edge cases** — Tesat- **Resilience and edge cases** — Test coverage for ST dr_co- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escala mock states.
+- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across queued mock states.
 - **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
 
 
@@ -1073,7 +1088,7 @@ Completed a full hardening pass of the integration test suite, bringing all item
 - **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
 - **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
 - **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across que- **Resilience and edge cases** — Tesat- **Resilience and edge cases** — Test coverage for ST dr_co- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escala mock states.
+- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across queued mock states.
 - **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
 
 
@@ -1227,7 +1242,7 @@ Completed a full hardening pass of the integration test suite, bringing all item
 - **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
 - **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
 - **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across que- **Resilience and edge cases** — Tesat- **Resilience and edge cases** — Test coverage for ST dr_co- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escala mock states.
+- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across queued mock states.
 - **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
 
 
@@ -1286,7 +1301,7 @@ Completed a full hardening pass of the integration test suite, bringing all item
 - **Multiset validation** — Extracted `assert_sets_equal()` helper relying on EXCEPT/UNION ALL SQL logic and applied it to workflow tests to ensure storage table state correctly matches the defining query post-refresh.
 - **Round-trip notifications** — `pg_trickle_alert` notifications now verify receipt end-to-end via `sqlx::PgListener`.
 - **DVM operators** — Added unit coverage for complex semi/anti-join behaviors (multi-column, filtered, complementary), multi-table join chains for inner and full joins, and `proptest!` fuzz tests enforcing generated SQL invariants across INNER, SEMI, and ANTI joins.
-- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across que- **Resilience and edge cases** — Tesat- **Resilience and edge cases** — Test coverage for ST dr_co- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escala mock states.
+- **Resilience and edge cases** — Test coverage for ST drop cascades verifying dependent object removal, exact error escalation thresholds, and scheduler job lifecycles across queued mock states.
 - **Cleanups** — Standardized naming practices (`test_workflow_*`, `test_infra_*`) and eliminated clock-bound flakes by widening staleness assertions.
 
 
