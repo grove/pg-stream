@@ -2401,13 +2401,16 @@ fn is_group_due_pure(member_due: &[bool], policy: DiamondSchedulePolicy) -> bool
 
 /// Check if the refresh is falling behind the schedule.
 ///
-/// Returns `Some(ratio)` when `elapsed_ms / schedule_ms >= 0.8`.
-fn is_falling_behind(elapsed_ms: i64, schedule_ms: i64) -> Option<f64> {
+/// Returns `Some(ratio)` when `elapsed_ms / schedule_ms >= threshold`.
+/// Use `threshold = 0.95` for auto-backoff decisions (only back off when
+/// genuinely unable to keep up) and `threshold = 0.80` for EC-11 operator
+/// alerts (warn early so operators have time to react).
+fn is_falling_behind(elapsed_ms: i64, schedule_ms: i64, threshold: f64) -> Option<f64> {
     if schedule_ms <= 0 {
         return None;
     }
     let ratio = elapsed_ms as f64 / schedule_ms as f64;
-    if ratio >= 0.8 { Some(ratio) } else { None }
+    if ratio >= threshold { Some(ratio) } else { None }
 }
 
 /// P3-5: Update the auto-backoff factor for a stream table based on its
@@ -2446,24 +2449,37 @@ fn update_backoff_factor(pgt_id: i64, backoff_factors: &mut HashMap<i64, f64>) {
         None => return,
     };
 
-    if is_falling_behind(elapsed_ms, schedule_ms).is_some() {
-        // Double the backoff factor, cap at 64x
+    // Use a 95% threshold: only back off when refresh genuinely cannot keep
+    // up with the schedule. The lower 80% threshold used by EC-11 alerting
+    // is intentionally more sensitive (early warning), whereas backoff should
+    // only activate when the situation is clearly unsustainable.
+    if is_falling_behind(elapsed_ms, schedule_ms, 0.95).is_some() {
+        // Double the backoff factor, cap at 8x.
+        // An 8x cap limits worst-case slowdown to 8× the configured interval
+        // and self-heals immediately on the first on-time refresh cycle.
         let factor = backoff_factors.get(&pgt_id).copied().unwrap_or(1.0);
-        let new_factor = (factor * 2.0).min(64.0);
+        let new_factor = (factor * 2.0).min(8.0);
         backoff_factors.insert(pgt_id, new_factor);
-        pgrx::info!(
-            "pg_trickle: auto-backoff for pgt_id={} increased to {:.0}x (refresh {}ms, schedule {}ms)",
+        pgrx::warning!(
+            "pg_trickle: auto-backoff for pgt_id={} increased to {:.0}x \
+             (refresh {}ms, schedule {}ms). The effective refresh interval \
+             is now {}ms. It will reset automatically once a refresh completes \
+             within the schedule budget.",
             pgt_id,
             new_factor,
             elapsed_ms,
             schedule_ms,
+            (schedule_ms as f64 * new_factor) as i64,
         );
     } else {
         // On-time: reset backoff
         if backoff_factors.remove(&pgt_id).is_some() {
-            pgrx::info!(
-                "pg_trickle: auto-backoff for pgt_id={} reset to 1x (on-time)",
+            pgrx::warning!(
+                "pg_trickle: auto-backoff for pgt_id={} reset to 1x (refresh \
+                 completed on time at {}ms vs {}ms schedule).",
                 pgt_id,
+                elapsed_ms,
+                schedule_ms,
             );
         }
     }
@@ -3434,7 +3450,7 @@ fn execute_scheduled_refresh(
             // refresh cannot keep up with the configured schedule.
             if let Some(secs) = schedule_secs {
                 let schedule_ms = (secs * 1000) as i64;
-                if let Some(ratio) = is_falling_behind(elapsed_ms, schedule_ms) {
+                if let Some(ratio) = is_falling_behind(elapsed_ms, schedule_ms, 0.80) {
                     monitor::alert_falling_behind(
                         &st.pgt_schema,
                         &st.pgt_name,
@@ -3809,32 +3825,54 @@ mod tests {
     // ── is_falling_behind tests ─────────────────────────────────────
 
     #[test]
-    fn test_falling_behind_at_80_percent() {
-        let result = is_falling_behind(800, 1000);
+    fn test_falling_behind_at_80_percent_ec11_threshold() {
+        // EC-11 alerting uses 0.80 — fires at exactly 80%.
+        let result = is_falling_behind(800, 1000, 0.80);
         assert!(result.is_some());
         assert!((result.unwrap() - 0.8).abs() < 0.001);
     }
 
     #[test]
+    fn test_falling_behind_below_95_percent_no_backoff() {
+        // Auto-backoff uses 0.95 — 900ms on a 1s schedule must NOT trigger.
+        assert!(is_falling_behind(900, 1000, 0.95).is_none());
+    }
+
+    #[test]
+    fn test_falling_behind_at_95_percent_triggers_backoff() {
+        // Exactly at the 0.95 threshold — should trigger.
+        let result = is_falling_behind(950, 1000, 0.95);
+        assert!(result.is_some());
+        assert!((result.unwrap() - 0.95).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_ec11_fires_before_backoff_threshold() {
+        // 800ms on 1s: EC-11 (0.80) fires, but auto-backoff (0.95) does not.
+        assert!(is_falling_behind(800, 1000, 0.80).is_some());
+        assert!(is_falling_behind(800, 1000, 0.95).is_none());
+    }
+
+    #[test]
     fn test_falling_behind_over_100_percent() {
-        let result = is_falling_behind(1500, 1000);
+        let result = is_falling_behind(1500, 1000, 0.80);
         assert!(result.is_some());
         assert!((result.unwrap() - 1.5).abs() < 0.001);
     }
 
     #[test]
     fn test_not_falling_behind() {
-        assert!(is_falling_behind(500, 1000).is_none());
+        assert!(is_falling_behind(500, 1000, 0.80).is_none());
     }
 
     #[test]
     fn test_falling_behind_zero_schedule() {
-        assert!(is_falling_behind(100, 0).is_none());
+        assert!(is_falling_behind(100, 0, 0.80).is_none());
     }
 
     #[test]
     fn test_falling_behind_negative_schedule() {
-        assert!(is_falling_behind(100, -1).is_none());
+        assert!(is_falling_behind(100, -1, 0.80).is_none());
     }
 
     // ── parse_worker_extra tests (Phase 3) ──────────────────────────

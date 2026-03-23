@@ -8,6 +8,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
+- [0.10.1 — 2026-03-23](#0101--2026-03-23)
 - [0.10.0 — 2026-03-23](#0100--2026-03-23)
 - [0.9.0 — 2026-03-20](#090--2026-03-20)
 - [0.8.0 — 2026-03-17](#080--2026-03-17)
@@ -25,6 +26,40 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - [0.1.1 — 2026-02-26](#011--2026-02-26)
 - [0.1.0 — 2026-02-26](#010--2026-02-26)
 <!-- TOC end -->
+
+---
+
+## [0.10.1] — 2026-03-23
+
+### Improved
+
+#### `auto_backoff` is now much friendlier on developer machines
+
+When `pg_trickle.auto_backoff = true` is enabled, the scheduler automatically
+slows down stream tables whose refresh cost exceeds their schedule budget — a
+good safeguard in production. Prior to this release, the feature was
+too aggressive for developer environments with short schedules (e.g. `'1s'`):
+
+- **Trigger threshold raised from 80 % → 95 %.** Backoff now only activates
+  when a refresh consumes more than 95 % of the schedule window. A 900 ms
+  refresh on a 1-second schedule (90 %) used to trigger backoff; it no longer
+  does. EC-11 operator alerting continues to fire at 80 % (unchanged)
+  so you still get an early warning before the scheduler is actually stuck.
+
+- **Maximum slowdown reduced from 64× → 8×.** In the worst case, a stream
+  table's effective refresh interval is now capped at 8× its configured
+  schedule (e.g. 8 seconds for a `'1s'` table) instead of 64 seconds. The
+  cap self-heals immediately: a single on-time refresh resets the factor to 1×.
+
+- **Backoff events now emit `WARNING` instead of `INFO`.** When the scheduler
+  stretches or resets a stream table's effective interval, you will see a
+  `WARNING` message in your PostgreSQL client. This makes it obvious why a
+  stream table has stopped refreshing at the expected rate, rather than leaving
+  developers puzzled by silent slowdowns.
+
+These changes make `auto_backoff = true` safe to enable in local and CI
+environments alongside short schedules, without sacrificing the production
+safety the feature was designed to provide.
 
 ---
 
