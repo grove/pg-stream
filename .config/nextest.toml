@@ -5,6 +5,16 @@ retries = 0
 retries = 2
 junit = { path = "junit.xml" }
 
+[[profile.ci.overrides]]
+# e2e tests need to run sequentially to avoid port collision and db state issues
+filter = 'test(/e2e_/)'
+test-group = "e2e-serial"
+
+[[profile.ci.overrides]]
+# Integration tests need to run sequentially
+filter = 'test(/catalog_tests/) | test(/catalog_compat_tests/) | test(/extension_tests/) | test(/monitoring_tests/) | test(/smoke_tests/) | test(/resilience_tests/) | test(/scenario_tests/) | test(/trigger_detection_tests/) | test(/workflow_tests/) | test(/property_tests/)'
+test-group = "integration-serial"
+
 [test-groups]
 e2e-serial = { max-threads = 1 }
 integration-serial = { max-threads = 1 }

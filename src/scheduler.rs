@@ -1923,24 +1923,27 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                     if bf > 1.0 {
                         // Check if enough time has passed since last refresh
                         // (effective interval = schedule * backoff_factor).
-                        let should_skip = BackgroundWorker::transaction(AssertUnwindSafe(|| {
-                            if let Some(st) = load_st_by_id(pgt_id)
-                                && let Some(ref schedule_str) = st.schedule
-                                && let Ok(max_secs) = crate::api::parse_duration(schedule_str)
-                            {
-                                let effective_secs: f64 = max_secs as f64 * bf;
-                                let stale = Spi::get_one_with_args::<bool>(
-                                    "SELECT CASE WHEN last_refresh_at IS NULL THEN true \
-                                     ELSE EXTRACT(EPOCH FROM (now() - last_refresh_at)) > $2 END \
-                                     FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
-                                    &[st.pgt_id.into(), effective_secs.into()],
-                                )
-                                .unwrap_or(Some(false))
-                                .unwrap_or(false);
-                                return !stale; // skip if not yet due under backoff schedule
-                            }
+                        // NOTE: We are already inside the outer BackgroundWorker::transaction,
+                        // so we must NOT call BackgroundWorker::transaction here — PostgreSQL
+                        // does not allow StartTransactionCommand when already in TBLOCK_STARTED
+                        // state (causes elog(FATAL)). Use Spi directly instead.
+                        let should_skip = if let Some(st) = load_st_by_id(pgt_id)
+                            && let Some(ref schedule_str) = st.schedule
+                            && let Ok(max_secs) = crate::api::parse_duration(schedule_str)
+                        {
+                            let effective_secs: f64 = max_secs as f64 * bf;
+                            let stale = Spi::get_one_with_args::<bool>(
+                                "SELECT CASE WHEN last_refresh_at IS NULL THEN true \
+                                 ELSE EXTRACT(EPOCH FROM (now() - last_refresh_at)) > $2 END \
+                                 FROM pgtrickle.pgt_stream_tables WHERE pgt_id = $1",
+                                &[st.pgt_id.into(), effective_secs.into()],
+                            )
+                            .unwrap_or(Some(false))
+                            .unwrap_or(false);
+                            !stale // skip if not yet due under backoff schedule
+                        } else {
                             false
-                        }));
+                        };
                         if should_skip {
                             continue;
                         }
@@ -1957,10 +1960,11 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         Some(&mut entry),
                     );
                     // P3-5: Update auto-backoff factor based on last refresh timing.
+                    // NOTE: We are already inside the outer BackgroundWorker::transaction,
+                    // so we must NOT call BackgroundWorker::transaction here — calling
+                    // StartTransactionCommand in TBLOCK_STARTED state causes elog(FATAL).
                     if config::pg_trickle_auto_backoff() {
-                        BackgroundWorker::transaction(AssertUnwindSafe(|| {
-                            update_backoff_factor(pgt_id, &mut backoff_factors);
-                        }));
+                        update_backoff_factor(pgt_id, &mut backoff_factors);
                     }
                     continue;
                 }
