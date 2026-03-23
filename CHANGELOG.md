@@ -192,8 +192,8 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - **SF-7: Scalar subquery empty-column guard** — When a scalar subquery's
   inner column detection fails (e.g. star-expansion from a view source),
   `diff_scalar_subquery` previously set `scalar_col = "NULL"` and silently
-  emitted `(SELECT NULL FROM ...)`. Now panics immediately with a descriptive
-  error if `subquery_cols` is empty.
+  emitted `(SELECT NULL FROM ...)`. Now returns
+  `PgTrickleError::UnsupportedOperator` immediately if `subquery_cols` is empty.
 
 - **SF-9: NULL-safe PK join in UPDATE trigger** — The CDC UPDATE trigger's
   PK join condition used `=` which evaluates `NULL = NULL` as false, silently
@@ -215,6 +215,48 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 - **SF-13: B-2 roadmap inconsistency resolved** — B-2 (Delta Predicate
   Pushdown) was listed as "Not started" in v0.10.0 but was already completed
   as G-4/P2-7 in v0.9.0. Marked B-2 as done in the v0.10.0 table.
+
+### No-Surprises Observability (NS-1 – NS-7)
+
+- **NS-1: `ORDER BY` without `LIMIT` warning** — `create_stream_table()` now
+  emits a `WARNING` when the defining query contains an `ORDER BY` clause
+  without a matching `LIMIT`. In a stream table context the underlying storage
+  table has undefined row order, so an ORDER BY has no effect unless paired
+  with a LIMIT (TopK pattern). The warning points users toward the TopK
+  pattern or suggests removing the ORDER BY clause.
+
+- **NS-2: `append_only` auto-revert alert** — When the refresh engine
+  auto-reverts from `append_only` mode to a MERGE-based path (because
+  deletions or updates were detected), the log message is now emitted at
+  `WARNING` level (was `INFO`) and an `append_only_reverted` alert is
+  dispatched via `pgtrickle_alert` NOTIFY (unless `pooler_compatibility_mode`
+  is enabled for that stream table).
+
+- **NS-3: Cleanup failure escalation** — `drain_pending_cleanups()` now
+  tracks consecutive TRUNCATE and DELETE failures per source OID using a
+  per-backend thread-local counter. Failures 1–2 continue to emit `DEBUG1`
+  (silent in normal operation). From the 3rd consecutive failure onward the
+  message is promoted to `WARNING` so operators see the accumulating problem
+  in the server log. The counter resets to zero on any successful cleanup.
+
+- **NS-5: Diamond consistency NOTICE** — When a stream table is created
+  with `diamond_consistency='none'` and the resulting DAG contains a diamond
+  pattern with the new table as the convergence node, a `NOTICE` is emitted
+  advising the user to consider `diamond_consistency='atomic'` for consistent
+  cross-branch reads.
+
+- **NS-6: Adaptive fallback log level changed to NOTICE** — The differential
+  refresh adaptive fallback message ("delta too large, falling back to FULL")
+  is now emitted at `NOTICE` level instead of `INFO` so it appears in the
+  client session by default (PostgreSQL's default `client_min_messages` is
+  `NOTICE`).
+
+- **NS-7: CALCULATED schedule isolation NOTICE** — When a stream table is
+  created with `CALCULATED` schedule (`schedule => 'calculated'`) but no
+  existing stream table references it as a source, a `NOTICE` is emitted
+  explaining that the schedule will fall back to
+  `pg_trickle.default_schedule_seconds`. This helps users who forget to
+  create downstream dependents before activating a CALCULATED stream table.
 
 ### DVM Correctness Fixes
 

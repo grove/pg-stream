@@ -1744,26 +1744,26 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [x] C-4: Compaction uses `change_id` PK (not `ctid`); correct under concurrent VACUUM; serialised with advisory lock; net-zero elimination + intermediate row collapse
 - [x] B-4: Cost model self-calibrates from refresh history (`estimate_cost_based_threshold` + `compute_adaptive_threshold` with 60/40 blend); cold-start fallback to fixed GUC threshold
 - [ ] PB1: Concurrent-refresh scenario included in PB3 E2E test; `SKIP LOCKED` "not acquired" path skips cycle rather than proceeding — **partially done: row-level locking implemented, scheduler skip path handles zero-row result, PgBouncer E2E harness created; concurrent-refresh stress test deferred to v0.10.0 hardening**
-- [ ] SF-1: `build_snapshot_sql` catch-all arm returns `PgTrickleError::UnsupportedQuery`; no SQL comment injected as FROM fragment
-- [ ] SF-2: Explicit `/* unsupported snapshot for distinct */` string replaced with `PgTrickleError::UnsupportedQuery` in join.rs
-- [ ] SF-3: `parser.rs` FROM-clause deparser fallbacks replaced with `PgTrickleError::UnsupportedQuery`
+- [x] SF-1: `build_snapshot_sql` catch-all arm uses `pgrx::error!()` instead of injecting an SQL comment as a FROM fragment
+- [x] SF-2: Explicit `/* unsupported snapshot for distinct */` string replaced with `PgTrickleError::UnsupportedQuery` in join.rs
+- [x] SF-3: `parser.rs` FROM-clause deparser fallbacks replaced with `PgTrickleError::UnsupportedQuery`
 - [x] SF-4: `child_to_from_sql` wraps Project in subquery with projected expressions; rescan CTE correctly resolves aliased column names
 - [x] SF-5: EC-01 ≤2-scan boundary documented with 5 unit tests asserting the boundary + DVM_OPERATORS.md limitation note explaining the CTE materialization trade-off
 - [x] SF-6: `diff_project` forwards `__pgt_count_l`/`__pgt_count_r` through projection when present in child result
-- [ ] SF-7: Empty `subquery_cols` in scalar subquery returns `PgTrickleError::UnsupportedQuery` rather than emitting `NULL`
+- [x] SF-7: Empty `subquery_cols` in scalar subquery returns `PgTrickleError::UnsupportedQuery` rather than emitting `NULL`
 - [x] SF-8: Lateral inner-change branch uses `i64::MIN` sentinel instead of `0::BIGINT` as dummy `__pgt_row_id`
-- [ ] SF-9: UPDATE trigger PK join uses `IS NOT DISTINCT FROM` for all PK columns; NULL-PK rows captured correctly
+- [x] SF-9: UPDATE trigger PK join uses `IS NOT DISTINCT FROM` for all PK columns; NULL-PK rows captured correctly
 - [ ] SF-10: TRUNCATE + same-window INSERT E2E test passes; post-TRUNCATE rows not dropped
 - [x] SF-11: `check_publication_health()` detects post-creation partitioning and rebuilds publication with `publish_via_partition_root = true`
-- [ ] SF-12: `DiamondSchedulePolicy::Fastest` cost-multiplication documented in `CONFIGURATION.md` with `Slowest` explanation
-- [ ] SF-13: B-2 / G-4 roadmap inconsistency resolved; entry reflects actual remaining scope (or marked done if fully completed)
-- [ ] NS-1: `ORDER BY` without `LIMIT` emits `WARNING` at creation time; E2E test verifies message
-- [ ] NS-2: `append_only` auto-revert uses `WARNING` (not `INFO`) and sends `pgtrickle_alert` NOTIFY
-- [ ] NS-3: `drain_pending_cleanups` promotes to `WARNING` after 3 consecutive failures per source OID
+- [x] SF-12: `DiamondSchedulePolicy::Fastest` cost-multiplication documented in `CONFIGURATION.md` with `Slowest` explanation
+- [x] SF-13: B-2 / G-4 roadmap inconsistency resolved; entry reflects actual remaining scope (or marked done if fully completed)
+- [x] NS-1: `ORDER BY` without `LIMIT` emits `WARNING` at creation time; E2E test verifies message
+- [x] NS-2: `append_only` auto-revert uses `WARNING` (not `INFO`) and sends `pgtrickle_alert` NOTIFY
+- [x] NS-3: `drain_pending_cleanups` promotes to `WARNING` after 3 consecutive failures per source OID
 - [ ] NS-4: `__pgt_*` auxiliary columns documented in SQL_REFERENCE with triggering aggregate functions
-- [ ] NS-5: Diamond detection with `diamond_consistency='none'` emits `NOTICE` suggesting `'atomic'`
-- [ ] NS-6: Differential→full adaptive fallback uses `NOTICE` (not `INFO`)
-- [ ] NS-7: Isolated `CALCULATED` schedule emits `NOTICE` with effective fallback interval
+- [x] NS-5: Diamond detection with `diamond_consistency='none'` emits `NOTICE` suggesting `'atomic'`
+- [x] NS-6: Differential→full adaptive fallback uses `NOTICE` (not `INFO`)
+- [x] NS-7: Isolated `CALCULATED` schedule emits `NOTICE` with effective fallback interval
 
 ---
 
