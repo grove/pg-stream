@@ -727,15 +727,38 @@ fn build_is_distinct_clause(user_cols: &[String]) -> String {
 /// - Net weight > 0 → INSERT
 /// - Net weight < 0 → DELETE
 /// - Net weight = 0 → filtered out (no-op)
+///
+/// B3-3: After weight aggregation an outer `DISTINCT ON (__pgt_row_id)` step
+/// resolves the UPDATE case where PK-stable row IDs are used for joins.
+///
+/// When only a non-PK column changes (e.g. category_name), diff_project
+/// produces a D row and an I row that share the same `__pgt_row_id` (because
+/// the hash is over PK columns only).  The weight aggregation groups by
+/// `(row_id, col_list)`, so these two rows land in *different* groups and both
+/// survive the HAVING clause — giving two MERGE source rows targeting the same
+/// ST row, which PostgreSQL rejects with "MERGE command cannot affect row a
+/// second time".
+///
+/// The outer `DISTINCT ON` resolves this: for each `__pgt_row_id` that appears
+/// as both D and I, `ORDER BY … CASE WHEN action='I' THEN 0 ELSE 1 END`
+/// selects the I row (carrying the new column values).  MERGE then performs a
+/// single WHEN MATCHED … UPDATE, which is the correct semantic for a non-PK
+/// column change.
 fn build_weight_agg_using(delta_sql: &str, user_col_list: &str) -> String {
     format!(
-        "(SELECT __pgt_row_id, \
-                CASE WHEN SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) > 0 \
-                     THEN 'I' ELSE 'D' END AS __pgt_action, \
-                {user_col_list} \
-         FROM ({delta_sql}) __raw \
-         GROUP BY __pgt_row_id, {user_col_list} \
-         HAVING SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) <> 0)"
+        "(SELECT DISTINCT ON (\"__pgt_row_id\") \
+                \"__pgt_row_id\", \"__pgt_action\", {user_col_list} \
+         FROM (\
+             SELECT __pgt_row_id, \
+                    CASE WHEN SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) > 0 \
+                         THEN 'I' ELSE 'D' END AS __pgt_action, \
+                    {user_col_list} \
+             FROM ({delta_sql}) __raw \
+             GROUP BY __pgt_row_id, {user_col_list} \
+             HAVING SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) <> 0\
+         ) \"__weighted\" \
+         ORDER BY \"__pgt_row_id\", \
+                  CASE WHEN \"__pgt_action\" = 'I' THEN 0 ELSE 1 END)"
     )
 }
 
