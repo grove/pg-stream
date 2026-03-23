@@ -28,7 +28,7 @@ use crate::wal_decoder;
 /// - `refresh_mode`: `'AUTO'` (default — DIFFERENTIAL with FULL fallback),
 ///   `'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`.
 /// - `initialize`: Whether to populate the table immediately.
-/// - `diamond_consistency`: `'none'` (default) or `'atomic'`.
+/// - `diamond_consistency`: `'atomic'` (default) or `'none'`.
 /// - `diamond_schedule_policy`: `'fastest'` (default) or `'slowest'`.
 #[allow(clippy::too_many_arguments)]
 #[pg_extern(schema = "pgtrickle")]
@@ -1905,7 +1905,7 @@ fn create_stream_table_impl(
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
 
-    // Parse diamond consistency — default to 'none' when not specified
+    // Parse diamond consistency — default to 'atomic' when not specified
     let dc = match diamond_consistency {
         Some(s) => {
             let val = s.to_lowercase();

@@ -188,9 +188,16 @@ actionable message at the moment they occur:
   server log.
 
 - **Diamond dependency with `diamond_consistency='none'` now advises you.** When
-  you create a stream table that forms a diamond in the dependency graph without
-  explicitly setting `diamond_consistency`, a `NOTICE` advises you to consider
+  you create a stream table that forms a diamond in the dependency graph and
+  explicitly set `diamond_consistency='none'`, a `NOTICE` advises you to consider
   `diamond_consistency='atomic'` for consistent cross-branch reads.
+
+- **`diamond_consistency` now defaults to `'atomic'`.** New stream tables get
+  atomic group semantics by default, meaning all branches of a diamond are
+  refreshed together in a single savepoint before the convergence node is
+  updated. This prevents a read from the convergence node seeing one branch
+  partially updated and the other stale. To restore the old independent behavior,
+  pass `diamond_consistency => 'none'` explicitly.
 
 - **Adaptive fallback is visible at the default log level.** When a differential
   refresh falls back to a full refresh because the delta is too large, the

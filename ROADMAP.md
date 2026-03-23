@@ -1766,6 +1766,7 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 - [x] NS-5: Diamond detection with `diamond_consistency='none'` emits `NOTICE` suggesting `'atomic'`
 - [x] NS-6: Differential→full adaptive fallback uses `NOTICE` (not `INFO`)
 - [x] NS-7: Isolated `CALCULATED` schedule emits `NOTICE` with effective fallback interval
+- [x] NS-8: `diamond_consistency` default changed to `'atomic'`; catalog DDL, API code comments, and all documentation updated to match actual runtime behavior (API already resolved `NULL` to `Atomic`)
 
 ---
 

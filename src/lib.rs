@@ -249,7 +249,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     topk_limit      INT,
     topk_order_by   TEXT,
     topk_offset     INT,
-    diamond_consistency TEXT NOT NULL DEFAULT 'none'
+    diamond_consistency TEXT NOT NULL DEFAULT 'atomic'
                      CHECK (diamond_consistency IN ('none', 'atomic')),
     diamond_schedule_policy TEXT NOT NULL DEFAULT 'fastest'
                      CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
