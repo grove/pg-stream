@@ -919,11 +919,17 @@ mod tests {
         let result = diff_lateral_subquery(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // The inner-change branch should use i64::MIN sentinel, not 0
-        assert_sql_contains(&sql, "-9223372036854775808::BIGINT");
+        // The inner-change branch should use i64::MIN+1 sentinel, not 0 or i64::MIN.
+        // i64::MIN (-9223372036854775808) cannot be written as a PostgreSQL bigint
+        // literal without overflow, so i64::MIN+1 (-9223372036854775807) is used.
+        assert_sql_contains(&sql, "-9223372036854775807::BIGINT");
         assert!(
             !sql.contains("SELECT 0::BIGINT AS \"__pgt_row_id\""),
             "Should not use 0 as dummy row_id"
+        );
+        assert!(
+            !sql.contains("-9223372036854775808::BIGINT"),
+            "Should not use i64::MIN (out of range as a PG bigint literal)"
         );
     }
 }
