@@ -1840,13 +1840,33 @@ Zero-code monitoring integration. All config files live in a new
 
 > **Observability subtotal: ~12 hours**
 
-> **v0.11.0 total: ~7–10 weeks + ~12 hours observability**
+### Default Tuning & Safety Defaults (from REPORT_OVERALL_STATUS.md)
+
+These four changes flip conservative defaults to the behavior that is safe and
+correct in production. All underlying features are implemented and tested;
+only the default values change. Each keeps the original GUC so operators can
+revert if needed.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DEF-1 | **Flip `parallel_refresh_mode` default to `'on'`.** The feature has been stable since v0.4.0 (six releases). Keeping it `'off'` forces every operator to discover the opt-in manually. Change the default, update CONFIGURATION.md, and add an E2E test that verifies two independent STs refresh concurrently. | 2–4h | [REPORT_OVERALL_STATUS.md §R1](plans/performance/REPORT_OVERALL_STATUS.md) |
+| DEF-2 | **Flip `auto_backoff` default to `true`.** When a stream table's refresh consistently takes longer than its schedule interval the scheduler silently wastes CPU re-queuing it. Auto-backoff is the safe behavior; the current `false` default leaves operators unaware. Add a `CONFIGURATION.md` note explaining the doubling policy and reset condition. | 1–2h | [REPORT_OVERALL_STATUS.md §R10](plans/performance/REPORT_OVERALL_STATUS.md) |
+| DEF-3 | **SemiJoin delta-key pre-filter (O-1).** SemiJoin Part 2 currently rescans the full left table even when only a handful of left-side rows match the delta. Inject a `WHERE left_key IN (SELECT key FROM delta)` pre-filter before the full join. TPC-H Q18, Q20, Q21 are the canonical slow queries. Effort estimate from PLAN_TPC_H_BENCHMARKING.md: 8–10h, expected 15–26× speedup. | 8–10h | [REPORT_OVERALL_STATUS.md §R4](plans/performance/REPORT_OVERALL_STATUS.md) · [PLAN_TPC_H_BENCHMARKING.md](plans/performance/PLAN_TPC_H_BENCHMARKING.md) §O-1 |
+| DEF-4 | **Increase invalidation ring capacity from 32 to 128 slots.** Deployments with frequent DDL (CI pipelines, dbt model rebuilds, schema migrations) can overflow the 32-slot ring, forcing a full O(V+E) DAG rebuild on every tick. Increasing capacity is a one-line constant change with negligible shared-memory cost. | 0.5h | [REPORT_OVERALL_STATUS.md §R9](plans/performance/REPORT_OVERALL_STATUS.md) |
+
+> **Default tuning subtotal: ~12–17 hours**
+
+> **v0.11.0 total: ~7–10 weeks + ~12 hours observability + ~12–17 hours default tuning**
 
 **Exit criteria:**
 - [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog
 - [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction)
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
+- [ ] DEF-1: `parallel_refresh_mode` default is `'on'`; concurrent-refresh E2E test passes
+- [ ] DEF-2: `auto_backoff` default is `true`; CONFIGURATION.md updated
+- [ ] DEF-3: SemiJoin delta-key pre-filter implemented; TPC-H Q18/Q20/Q21 re-benchmarked
+- [ ] DEF-4: Invalidation ring capacity is 128 slots; validated under rapid DDL E2E test
 - [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)
 
 ---
@@ -1933,7 +1953,22 @@ action.
 
 > **Backward compatibility subtotal: ~38–56 hours**
 
-> **v0.12.0 total: ~13–19 weeks + ~10–14 hours fuse**
+### Performance Defaults & Scalability Improvements (from REPORT_OVERALL_STATUS.md)
+
+Five targeted improvements identified in the overall status report. None require
+large design changes; all build on existing infrastructure.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PERF-1 | **Adaptive scheduler wake interval.** The scheduler wakes every `scheduler_interval_ms` (1 s) even when all sources have zero pending changes. Implement event-driven wake: CDC triggers `pg_notify('pgtrickle_wake', '')` on each buffer INSERT; the scheduler listens and wakes immediately. Coalesces rapid-fire notifications using a 10ms debounce window to prevent thundering herd. Falls back to the configured interval when the channel is idle. Impact: median end-to-end latency drops from ~515ms to ~15ms for low-volume workloads. | 2–3 wk | [REPORT_OVERALL_STATUS.md §R3/R16](plans/performance/REPORT_OVERALL_STATUS.md) |
+| PERF-2 | **Auto-enable `buffer_partitioning` for high-throughput sources.** `buffer_partitioning` is available but off by default. Add heuristic auto-detection: if a source's change buffer grows beyond `compact_threshold` in less than one scheduler tick interval, automatically switch it to RANGE(lsn) partitioned mode. The `pg_trickle.buffer_partitioning` GUC (default `'off'`) gains an `'auto'` option. Manual override per-source still possible. | 1–2 wk | [REPORT_OVERALL_STATUS.md §R7](plans/performance/REPORT_OVERALL_STATUS.md) |
+| PERF-3 | **Flip `tiered_scheduling` default to `true`.** The feature is implemented and tested since v0.10.0. The auto-classification uses a pg_trickle-internal access counter (not `pg_stat_user_tables`) so it is not polluted by internal refresh reads. Changing the default prevents large deployments from wasting CPU refreshing cold STs at full speed indefinitely. Add a CONFIGURATION.md section explaining the Hot/Warm/Cold/Frozen thresholds. | 1–2h | [REPORT_OVERALL_STATUS.md §R11](plans/performance/REPORT_OVERALL_STATUS.md) |
+| PERF-4 | **Flip `block_source_ddl` default to `true`.** Currently source DDL (`ALTER TABLE ... ADD/DROP COLUMN`, `ALTER TYPE`) silently invalidates stream tables — the ST is marked for reinit on its next scheduler tick with no warning at the DDL site. Blocking DDL at the source gives operators an explicit prompt to decide whether to `ALTER STREAM TABLE` before proceeding. Error message must explain the cause and the `block_source_ddl = false` escape hatch. | 2–4h | [REPORT_OVERALL_STATUS.md §R12](plans/performance/REPORT_OVERALL_STATUS.md) |
+| PERF-5 | **Wider changed-column bitmask (>63 columns).** The current `BIGINT` bitmask silently falls back to full-column capture for tables with >63 columns. Extend to an arbitrarily wide bitmask using a `BYTEA` column in the change buffer schema. Preserve backward compatibility via a schema migration for existing change buffer tables; existing tables with <64 columns are unaffected. | 1–2 wk | [REPORT_OVERALL_STATUS.md §R13](plans/performance/REPORT_OVERALL_STATUS.md) |
+
+> **Performance defaults & scalability subtotal: ~5–9 weeks**
+
+> **v0.12.0 total: ~13–19 weeks + ~5–9 weeks defaults/scalability**
 
 **Exit criteria:**
 - [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers
@@ -1941,6 +1976,11 @@ action.
 - [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
 - [ ] WAL decoder validated against PG 16–17 `pgoutput` format
 - [ ] CI matrix covers PG 16, 17, 18
+- [ ] PERF-1: Event-driven scheduler wake implemented; latency E2E test shows sub-50ms median response for single-source workloads
+- [ ] PERF-2: `buffer_partitioning = 'auto'` implemented; auto-promote benchmark passes
+- [ ] PERF-3: `tiered_scheduling` default is `true`; CONFIGURATION.md documents tier thresholds
+- [ ] PERF-4: `block_source_ddl` default is `true`; error message includes escape hatch instructions
+- [ ] PERF-5: Wider bitmask (`BYTEA`) supports >63 columns; schema migration tested
 - [ ] Extension upgrade path tested (`0.11.0 → 0.12.0`)
 
 ---
