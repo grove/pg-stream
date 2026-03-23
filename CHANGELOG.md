@@ -41,6 +41,14 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   (via `Spi::connect`) so the lock is released immediately; the actual
   refresh holds the row lock for its full duration.
 
+  A new concurrent-refresh stress test
+  (`test_pb1_concurrent_refresh_skip_locked_no_corruption` in
+  `tests/e2e_concurrent_tests.rs`) verifies the end-to-end behaviour:
+  two concurrent `refresh_stream_table()` calls on the same stream table
+  complete without error or data corruption; the `SKIP LOCKED` path
+  correctly skips one caller rather than blocking or double-applying
+  the delta.
+
 - **PB2: Per-stream-table `pooler_compatibility_mode`.** A new boolean
   column `pooler_compatibility_mode` (default `false`) on
   `pgt_stream_tables` controls whether a stream table operates in
@@ -380,6 +388,18 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   by 50–90% for high-churn tables. Uses `change_id` (not `ctid`) for
   safe deletion under concurrent VACUUM, and `pg_try_advisory_xact_lock`
   to avoid blocking concurrent refreshes.
+
+- **B-2: Predicate pushdown E2E benchmark** — A new ignored benchmark
+  (`bench_b2_predicate_pushdown` in `tests/e2e_bench_tests.rs`) verifies
+  that delta predicate pushdown keeps differential refresh time proportional
+  to delta size rather than source table size for selective queries. The
+  benchmark creates a 100,000-row source table, a filtered stream table
+  (`WHERE category = 'cat_001'`, ~1,000 matching rows), and an unfiltered
+  control stream table. Per cycle, only 10 rows in `cat_001` are mutated.
+  The assertion requires the filtered ST's median refresh time to be no
+  more than 3× the unfiltered ST's time; in practice pushdown makes the
+  filtered refresh faster. Run with:
+  `cargo test --test e2e_bench_tests -- bench_b2_predicate_pushdown --ignored --nocapture`
 
 - **B-4: Cost-based refresh strategy (verified active)** — Confirmed that
   the cost-based adaptive threshold system (`estimate_cost_based_threshold`
