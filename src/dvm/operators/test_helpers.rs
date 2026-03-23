@@ -209,6 +209,7 @@ pub fn lateral_subquery(
         output_cols: output_cols.into_iter().map(|c| c.to_string()).collect(),
         is_left_join,
         subquery_source_oids,
+        correlation_predicates: Vec::new(),
         child: Box::new(child),
     }
 }

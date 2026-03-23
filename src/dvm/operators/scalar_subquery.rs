@@ -82,12 +82,14 @@ pub fn diff_scalar_subquery(
     let subquery_snapshot = build_snapshot_sql(subquery);
     let subquery_alias = subquery.alias();
     let subquery_cols = &subquery_result.columns;
-    let scalar_col = if subquery_cols.is_empty() {
-        "NULL".to_string()
-    } else {
-        // The scalar subquery should produce exactly one column
-        subquery_cols[0].clone()
-    };
+    if subquery_cols.is_empty() {
+        return Err(PgTrickleError::UnsupportedOperator(format!(
+            "scalar subquery '{}' produced no output columns; \
+             unable to differentiate — wrap it in a CTE or derived table",
+            alias
+        )));
+    }
+    let scalar_col = subquery_cols[0].clone();
 
     let scalar_sql = format!(
         "(SELECT {sq_alias}.{scalar_col} FROM {subquery_snapshot} {sq_alias} LIMIT 1)",
@@ -112,9 +114,7 @@ pub fn diff_scalar_subquery(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let scalar_old_sql = if subquery_cols.is_empty() {
-        "NULL".to_string()
-    } else {
+    let scalar_old_sql = {
         let r_old_snapshot = format!(
             "(SELECT {sq_col_list} FROM {subquery_snapshot} {sq_alias} \
              EXCEPT ALL \

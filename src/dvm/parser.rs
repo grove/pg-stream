@@ -454,6 +454,9 @@ impl AggFunc {
     ///   `new_avg = (old_sum + Δsum) / (old_count + Δcount)`.
     /// - **STDDEV/VAR**: additionally stores `__pgt_aux_sum2_*` (sum of squares);
     ///   `var_pop = (n·sum2 − sum²) / n²`, etc.
+    /// - **CORR/COVAR/REGR_***: stores cross-product auxiliary columns
+    ///   `__pgt_aux_sumx_*`, `__pgt_aux_sumy_*`, `__pgt_aux_sumxy_*`,
+    ///   `__pgt_aux_sumx2_*`, `__pgt_aux_sumy2_*` for O(1) algebraic maintenance.
     pub fn is_algebraic_via_aux(&self) -> bool {
         matches!(
             self,
@@ -462,6 +465,18 @@ impl AggFunc {
                 | AggFunc::StddevSamp
                 | AggFunc::VarPop
                 | AggFunc::VarSamp
+                | AggFunc::Corr
+                | AggFunc::CovarPop
+                | AggFunc::CovarSamp
+                | AggFunc::RegrAvgx
+                | AggFunc::RegrAvgy
+                | AggFunc::RegrCount
+                | AggFunc::RegrIntercept
+                | AggFunc::RegrR2
+                | AggFunc::RegrSlope
+                | AggFunc::RegrSxx
+                | AggFunc::RegrSxy
+                | AggFunc::RegrSyy
         )
     }
 
@@ -471,6 +486,35 @@ impl AggFunc {
         matches!(
             self,
             AggFunc::StddevPop | AggFunc::StddevSamp | AggFunc::VarPop | AggFunc::VarSamp
+        )
+    }
+
+    /// Returns true for two-argument regression/correlation aggregates
+    /// that need cross-product auxiliary columns (P3-2).
+    ///
+    /// These aggregates take `(Y, X)` arguments and require:
+    /// - `__pgt_aux_sumx_*`: running SUM(X)
+    /// - `__pgt_aux_sumy_*`: running SUM(Y)
+    /// - `__pgt_aux_sumxy_*`: running SUM(X*Y)
+    /// - `__pgt_aux_sumx2_*`: running SUM(X²)
+    /// - `__pgt_aux_sumy2_*`: running SUM(Y²)
+    ///
+    /// Count is shared with `__pgt_aux_count_*` from `is_algebraic_via_aux`.
+    pub fn needs_cross_products(&self) -> bool {
+        matches!(
+            self,
+            AggFunc::Corr
+                | AggFunc::CovarPop
+                | AggFunc::CovarSamp
+                | AggFunc::RegrAvgx
+                | AggFunc::RegrAvgy
+                | AggFunc::RegrCount
+                | AggFunc::RegrIntercept
+                | AggFunc::RegrR2
+                | AggFunc::RegrSlope
+                | AggFunc::RegrSxx
+                | AggFunc::RegrSxy
+                | AggFunc::RegrSyy
         )
     }
 
@@ -496,18 +540,6 @@ impl AggFunc {
                 | AggFunc::Mode
                 | AggFunc::PercentileCont
                 | AggFunc::PercentileDisc
-                | AggFunc::Corr
-                | AggFunc::CovarPop
-                | AggFunc::CovarSamp
-                | AggFunc::RegrAvgx
-                | AggFunc::RegrAvgy
-                | AggFunc::RegrCount
-                | AggFunc::RegrIntercept
-                | AggFunc::RegrR2
-                | AggFunc::RegrSlope
-                | AggFunc::RegrSxx
-                | AggFunc::RegrSxy
-                | AggFunc::RegrSyy
                 | AggFunc::XmlAgg
                 | AggFunc::HypRank
                 | AggFunc::HypDenseRank
@@ -542,6 +574,27 @@ pub struct SortExpr {
     pub expr: Expr,
     pub ascending: bool,
     pub nulls_first: bool,
+}
+
+/// A correlation predicate extracted from a LATERAL subquery's WHERE clause.
+///
+/// Represents an equality of the form `inner_alias.inner_col = outer_alias.outer_col`
+/// where the inner alias belongs to a FROM item inside the subquery and the outer
+/// alias references the preceding FROM item (the LATERAL dependency).
+///
+/// Used by P2-6 to scope inner-change re-execution: instead of re-materializing
+/// the entire outer table when inner sources change, we join the change buffer
+/// against the outer table using the correlation column.
+#[derive(Debug, Clone)]
+pub struct CorrelationPredicate {
+    /// Column name on the outer (child) table, unqualified.
+    pub outer_col: String,
+    /// Alias of the inner table inside the subquery.
+    pub inner_alias: String,
+    /// Column name on the inner table.
+    pub inner_col: String,
+    /// OID of the inner table (resolved from `inner_alias`).
+    pub inner_oid: u32,
 }
 
 /// A window function expression: `func(args) OVER (PARTITION BY ... ORDER BY ... frame)`.
@@ -815,6 +868,10 @@ pub enum OpTree {
         /// Source table OIDs referenced by the subquery body.
         /// Needed for CDC trigger setup.
         subquery_source_oids: Vec<u32>,
+        /// Correlation predicates extracted from the subquery WHERE clause (P2-6).
+        /// When available, inner-change re-execution is scoped to only outer rows
+        /// that correlate with changed inner rows, reducing O(|outer|) to O(delta).
+        correlation_predicates: Vec<CorrelationPredicate>,
         /// The left-hand FROM item that this subquery may reference
         /// (LATERAL dependency).
         child: Box<OpTree>,
@@ -1252,6 +1309,112 @@ impl OpTree {
             | OpTree::Project { child, .. }
             | OpTree::Subquery { child, .. }
             | OpTree::Window { child, .. } => child.sum2_aux_columns(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// For each non-DISTINCT CORR/COVAR/REGR_* aggregate, returns tuples of
+    /// `(col_name, arg_sql)` for cross-product auxiliary columns (P3-2):
+    ///
+    /// - `__pgt_aux_sumx_{alias}`:  running SUM(X)
+    /// - `__pgt_aux_sumy_{alias}`:  running SUM(Y)
+    /// - `__pgt_aux_sumxy_{alias}`: running SUM(X*Y)
+    /// - `__pgt_aux_sumx2_{alias}`: running SUM(X²)
+    /// - `__pgt_aux_sumy2_{alias}`: running SUM(Y²)
+    ///
+    /// (Count is shared with `__pgt_aux_count_*` from `avg_aux_columns`.)
+    ///
+    /// For regression aggs, argument = Y (first), second_arg = X (second).
+    pub fn covar_aux_columns(&self) -> Vec<(String, String)> {
+        match self {
+            OpTree::Aggregate { aggregates, .. } => {
+                let mut aux = Vec::new();
+                for agg in aggregates {
+                    if agg.function.needs_cross_products() && !agg.is_distinct {
+                        let y_sql = agg
+                            .argument
+                            .as_ref()
+                            .map(|e| e.to_sql())
+                            .unwrap_or_else(|| "0".to_string());
+                        let x_sql = agg
+                            .second_arg
+                            .as_ref()
+                            .map(|e| e.to_sql())
+                            .unwrap_or_else(|| "0".to_string());
+                        let a = &agg.alias;
+                        // Use a combined key for arg_sql: "x_expr|y_expr"
+                        aux.push((format!("__pgt_aux_sumx_{a}"), x_sql.clone()));
+                        aux.push((format!("__pgt_aux_sumy_{a}"), y_sql.clone()));
+                        aux.push((format!("__pgt_aux_sumxy_{a}"), format!("{x_sql}|{y_sql}")));
+                        aux.push((format!("__pgt_aux_sumx2_{a}"), x_sql.clone()));
+                        aux.push((format!("__pgt_aux_sumy2_{a}"), y_sql));
+                    }
+                }
+                aux
+            }
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.covar_aux_columns(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether this operator tree contains a FULL OUTER JOIN node at any depth.
+    ///
+    /// Used to determine whether SUM aggregates above this tree need
+    /// `__pgt_aux_nonnull_*` auxiliary columns for P2-2 NULL-transition
+    /// correction.
+    pub fn contains_full_join(&self) -> bool {
+        match self {
+            OpTree::FullJoin { .. } => true,
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. } => child.contains_full_join(),
+            OpTree::InnerJoin { left, right, .. } | OpTree::LeftJoin { left, right, .. } => {
+                left.contains_full_join() || right.contains_full_join()
+            }
+            _ => false,
+        }
+    }
+
+    /// For each non-DISTINCT SUM aggregate above a FULL OUTER JOIN child,
+    /// returns a tuple of `(nonnull_col_name, arg_sql)`:
+    /// - `nonnull_col_name`: `__pgt_aux_nonnull_{alias}` — stores running
+    ///   count of non-NULL argument values in the group
+    /// - `arg_sql`: the SQL expression for the aggregate argument
+    ///
+    /// This auxiliary column enables algebraic NULL-transition correction
+    /// (P2-2): when `nonnull_count > 0` the algebraic SUM formula is valid;
+    /// when it drops to 0 the result is definitively NULL without rescanning.
+    ///
+    /// Returns an empty vec if no SUM aggregates sit above a FULL JOIN, or
+    /// if the operator tree is not an aggregate query.
+    pub fn nonnull_aux_columns(&self) -> Vec<(String, String)> {
+        match self {
+            OpTree::Aggregate {
+                aggregates, child, ..
+            } => {
+                if !child.contains_full_join() {
+                    return Vec::new();
+                }
+                let mut aux = Vec::new();
+                for agg in aggregates {
+                    if matches!(agg.function, AggFunc::Sum) && !agg.is_distinct {
+                        let arg_sql = agg
+                            .argument
+                            .as_ref()
+                            .map(|e| e.to_sql())
+                            .unwrap_or_else(|| "0".to_string());
+                        aux.push((format!("__pgt_aux_nonnull_{}", agg.alias), arg_sql));
+                    }
+                }
+                aux
+            }
+            OpTree::Filter { child, .. }
+            | OpTree::Project { child, .. }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. } => child.nonnull_aux_columns(),
             _ => Vec::new(),
         }
     }
@@ -4246,12 +4409,16 @@ fn check_from_item_for_matview_or_foreign(node: *mut pg_sys::Node) -> Result<(),
 
         match relkind.as_deref() {
             Some("m") => {
-                return Err(PgTrickleError::UnsupportedOperator(format!(
-                    "Materialized view '{schema}.{relname}' cannot be used as a source in \
-                     DIFFERENTIAL mode. Materialized views are stale snapshots — CDC triggers \
-                     cannot track REFRESH MATERIALIZED VIEW. Use the underlying query directly, \
-                     or switch to FULL refresh mode."
-                )));
+                if !crate::config::pg_trickle_matview_polling() {
+                    return Err(PgTrickleError::UnsupportedOperator(format!(
+                        "Materialized view '{schema}.{relname}' cannot be used as a source in \
+                         DIFFERENTIAL mode. Materialized views are stale snapshots — CDC triggers \
+                         cannot track REFRESH MATERIALIZED VIEW. Use the underlying query directly, \
+                         or switch to FULL refresh mode. \
+                         Alternatively, enable polling-based CDC with: \
+                         SET pg_trickle.matview_polling = on;"
+                    )));
+                }
             }
             Some("f") => {
                 if !crate::config::pg_trickle_foreign_table_polling() {
@@ -8137,6 +8304,30 @@ fn strip_order_by_and_limit(query: &str) -> String {
 ///
 /// Emits a `pgrx::warning!()` for each such occurrence. Does **not** reject
 /// the query — LIMIT with ORDER BY is a legitimate, deterministic pattern.
+/// NS-1: Returns `true` when the top-level SELECT has an `ORDER BY` clause
+/// but no `LIMIT`. This is a no-op in a stream table context because the
+/// storage table row order is undefined, so the user is likely confused.
+pub fn has_order_by_without_limit(query: &str) -> bool {
+    let select = match parse_first_select(query) {
+        Ok(Some(s)) => unsafe { &*s },
+        _ => return false,
+    };
+    // Only warn for plain (non-set-operation) SELECTs.
+    if select.op != pg_sys::SetOperation::SETOP_NONE {
+        return false;
+    }
+    // Has ORDER BY ...
+    if select.sortClause.is_null() {
+        return false;
+    }
+    let sort_list = pg_list::<pg_sys::Node>(select.sortClause);
+    if sort_list.is_empty() {
+        return false;
+    }
+    // ... but no LIMIT
+    select.limitCount.is_null()
+}
+
 pub fn warn_limit_without_order_in_subqueries(query: &str) {
     let select = match parse_first_select(query) {
         Ok(Some(s)) => unsafe { &*s },
@@ -8747,7 +8938,9 @@ fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> 
         if sub.subquery.is_null()
             || !unsafe { pgrx::is_a(sub.subquery, pg_sys::NodeTag::T_SelectStmt) }
         {
-            return Ok("/* unsupported RangeSubselect */".to_string());
+            return Err(PgTrickleError::UnsupportedOperator(
+                "RangeSubselect with non-SelectStmt subquery is not supported".into(),
+            ));
         }
         let inner_sql = deparse_select_to_sql(sub.subquery)?;
         let lateral_kw = if sub.lateral { "LATERAL " } else { "" };
@@ -8761,8 +8954,9 @@ fn deparse_from_item(node: *mut pg_sys::Node) -> Result<String, PgTrickleError> 
         }
         Ok(result)
     } else {
-        // Fallback: use a placeholder
-        Ok("/* unsupported FROM item */".to_string())
+        Err(PgTrickleError::UnsupportedOperator(
+            "Unsupported FROM item (VALUES clause, tablefunc, or other non-standard source)".into(),
+        ))
     }
 }
 
@@ -9846,6 +10040,7 @@ unsafe fn parse_select_stmt(
                 output_cols,
                 is_left_join,
                 subquery_source_oids,
+                correlation_predicates,
                 ..
             } = right
             {
@@ -9857,6 +10052,7 @@ unsafe fn parse_select_stmt(
                     output_cols,
                     is_left_join,
                     subquery_source_oids,
+                    correlation_predicates,
                     child: Box::new(tree),
                 };
             } else {
@@ -10429,6 +10625,7 @@ unsafe fn parse_from_item(
             column_aliases,
             output_cols,
             subquery_source_oids,
+            correlation_predicates,
             ..
         } = right
         {
@@ -10441,6 +10638,7 @@ unsafe fn parse_from_item(
                         output_cols,
                         is_left_join: false,
                         subquery_source_oids,
+                        correlation_predicates,
                         child: Box::new(left),
                     });
                 }
@@ -10452,6 +10650,7 @@ unsafe fn parse_from_item(
                         output_cols,
                         is_left_join: true,
                         subquery_source_oids,
+                        correlation_predicates,
                         child: Box::new(left),
                     });
                 }
@@ -10664,6 +10863,13 @@ unsafe fn parse_from_item(
             let subquery_source_oids =
                 unsafe { extract_from_oids(sub_stmt.fromClause).unwrap_or_default() };
 
+            // P2-6: Extract alias→OID mapping and correlation predicates
+            // for scoped inner-change re-execution.
+            let inner_alias_oids =
+                unsafe { extract_from_alias_oids(sub_stmt.fromClause).unwrap_or_default() };
+            let correlation_predicates =
+                unsafe { extract_correlation_predicates(sub_stmt.whereClause, &inner_alias_oids) };
+
             // Return a LateralSubquery with a placeholder child.
             // The real child is attached in the FROM-list loop or JoinExpr handler.
             return Ok(OpTree::LateralSubquery {
@@ -10673,6 +10879,7 @@ unsafe fn parse_from_item(
                 output_cols,
                 is_left_join: false,
                 subquery_source_oids,
+                correlation_predicates,
                 child: Box::new(OpTree::Scan {
                     table_oid: 0,
                     table_name: String::new(),
@@ -12455,6 +12662,197 @@ unsafe fn collect_from_item_oids(
     }
     // RangeFunction: no table OIDs to extract (SRFs don't reference tables directly)
     Ok(())
+}
+
+/// Extract alias→OID pairs from a LATERAL subquery's FROM clause.
+///
+/// For each `RangeVar` in the FROM list, resolves the table OID and
+/// collects the effective alias (explicit alias or table name).
+///
+/// # Safety
+/// Caller must ensure `from_list` points to a valid `pg_sys::List`.
+unsafe fn extract_from_alias_oids(
+    from_list: *mut pg_sys::List,
+) -> Result<Vec<(String, u32)>, PgTrickleError> {
+    let list = pg_list::<pg_sys::Node>(from_list);
+    let mut pairs = Vec::new();
+    for node_ptr in list.iter_ptr() {
+        unsafe { collect_from_item_alias_oids(node_ptr, &mut pairs)? };
+    }
+    Ok(pairs)
+}
+
+/// Recursively collect (alias, OID) pairs from a FROM item.
+///
+/// # Safety
+/// Caller must ensure `node` points to a valid `pg_sys::Node`.
+unsafe fn collect_from_item_alias_oids(
+    node: *mut pg_sys::Node,
+    pairs: &mut Vec<(String, u32)>,
+) -> Result<(), PgTrickleError> {
+    if node.is_null() {
+        return Ok(());
+    }
+
+    if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
+        let table_name = if !rv.relname.is_null() {
+            pg_cstr_to_str(rv.relname).unwrap_or("").to_string()
+        } else {
+            return Ok(());
+        };
+
+        // Effective alias: explicit alias > table name
+        let alias = if !rv.alias.is_null() {
+            let a = unsafe { &*(rv.alias) };
+            pg_cstr_to_str(a.aliasname)
+                .unwrap_or(&table_name)
+                .to_string()
+        } else {
+            table_name.clone()
+        };
+
+        let schema = if !rv.schemaname.is_null() {
+            pg_cstr_to_str(rv.schemaname)
+                .unwrap_or("public")
+                .to_string()
+        } else {
+            "public".to_string()
+        };
+
+        let sql = format!(
+            "SELECT c.oid::int4 FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = '{}' AND n.nspname = '{}'",
+            table_name.replace('\'', "''"),
+            schema.replace('\'', "''"),
+        );
+        let oid = pgrx::Spi::connect(|client| {
+            let result = client
+                .select(&sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            for row in result {
+                if let Ok(Some(id)) = row.get::<i32>(1) {
+                    return Ok(id as u32);
+                }
+            }
+            Ok(0u32)
+        })?;
+        if oid > 0 {
+            pairs.push((alias, oid));
+        }
+    } else if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
+        unsafe { collect_from_item_alias_oids(join.larg, pairs)? };
+        unsafe { collect_from_item_alias_oids(join.rarg, pairs)? };
+    }
+    Ok(())
+}
+
+/// Extract correlation predicates from a LATERAL subquery's WHERE clause.
+///
+/// Walks the WHERE expression looking for equality comparisons of the form
+/// `inner_alias.col = outer_ref.col` where `inner_alias` matches a FROM
+/// item inside the subquery and the other side is an outer (correlation)
+/// reference.
+///
+/// Only simple equalities (top-level or under AND) are extracted.
+/// Complex predicates (OR, functions, casts) are skipped — the caller
+/// falls back to full outer-table scanning.
+///
+/// # Safety
+/// Caller must ensure `where_clause` points to a valid expression node.
+unsafe fn extract_correlation_predicates(
+    where_clause: *mut pg_sys::Node,
+    inner_alias_oids: &[(String, u32)],
+) -> Vec<CorrelationPredicate> {
+    if where_clause.is_null() {
+        return Vec::new();
+    }
+    let inner_aliases: Vec<&str> = inner_alias_oids.iter().map(|(a, _)| a.as_str()).collect();
+
+    // Convert to Expr tree — best-effort, ignore errors.
+    // SAFETY: caller guarantees `where_clause` is a valid expression node.
+    let expr = match unsafe { node_to_expr(where_clause) } {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut predicates = Vec::new();
+    collect_correlation_equalities(&expr, &inner_aliases, inner_alias_oids, &mut predicates);
+    predicates
+}
+
+/// Recursively collect equality predicates from an expression tree.
+fn collect_correlation_equalities(
+    expr: &Expr,
+    inner_aliases: &[&str],
+    inner_alias_oids: &[(String, u32)],
+    out: &mut Vec<CorrelationPredicate>,
+) {
+    match expr {
+        Expr::BinaryOp { op, left, right } if op == "=" => {
+            // Check if this is inner.col = outer.col or outer.col = inner.col
+            if let Some(pred) =
+                try_extract_correlation(left, right, inner_aliases, inner_alias_oids)
+            {
+                out.push(pred);
+            } else if let Some(pred) =
+                try_extract_correlation(right, left, inner_aliases, inner_alias_oids)
+            {
+                out.push(pred);
+            }
+        }
+        Expr::BinaryOp { op, left, right } if op == "AND" => {
+            collect_correlation_equalities(left, inner_aliases, inner_alias_oids, out);
+            collect_correlation_equalities(right, inner_aliases, inner_alias_oids, out);
+        }
+        _ => {}
+    }
+}
+
+/// Try to match `(inner_ref, outer_ref)` as a correlation predicate.
+///
+/// Returns `Some(CorrelationPredicate)` if `inner_ref` is a qualified column
+/// reference whose alias matches an inner FROM item and `outer_ref` is a
+/// qualified column reference whose alias does NOT match any inner FROM item.
+fn try_extract_correlation(
+    inner_ref: &Expr,
+    outer_ref: &Expr,
+    inner_aliases: &[&str],
+    inner_alias_oids: &[(String, u32)],
+) -> Option<CorrelationPredicate> {
+    let (inner_alias, inner_col) = match inner_ref {
+        Expr::ColumnRef {
+            table_alias: Some(tbl),
+            column_name,
+        } if inner_aliases.contains(&tbl.as_str()) => (tbl.clone(), column_name.clone()),
+        _ => return None,
+    };
+
+    let outer_col = match outer_ref {
+        Expr::ColumnRef {
+            table_alias: Some(tbl),
+            column_name,
+        } if !inner_aliases.contains(&tbl.as_str()) => column_name.clone(),
+        // Unqualified column that's not in inner aliases — assume outer
+        Expr::ColumnRef {
+            table_alias: None,
+            column_name,
+        } => column_name.clone(),
+        _ => return None,
+    };
+
+    // Resolve inner alias → OID
+    let inner_oid = inner_alias_oids
+        .iter()
+        .find(|(a, _)| a == &inner_alias)
+        .map(|(_, oid)| *oid)?;
+
+    Some(CorrelationPredicate {
+        outer_col,
+        inner_alias,
+        inner_col,
+        inner_oid,
+    })
 }
 
 /// Convert a String/Value node to a Rust String.
@@ -19155,5 +19553,122 @@ mod tests {
         let aliases = collect_tree_source_aliases(&tree);
         assert!(aliases.contains(&"a".to_string()));
         assert!(aliases.contains(&"b".to_string()));
+    }
+
+    // ── P2-6: Correlation predicate extraction tests ────────────────
+
+    #[test]
+    fn test_correlation_extraction_simple_equality() {
+        // WHERE li.order_id = o.id
+        let expr = Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(qualified_col("li", "order_id")),
+            right: Box::new(qualified_col("o", "id")),
+        };
+        let inner_alias_oids = vec![("li".to_string(), 42u32)];
+        let inner_aliases: Vec<&str> = inner_alias_oids.iter().map(|(a, _)| a.as_str()).collect();
+        let mut preds = Vec::new();
+        collect_correlation_equalities(&expr, &inner_aliases, &inner_alias_oids, &mut preds);
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].outer_col, "id");
+        assert_eq!(preds[0].inner_alias, "li");
+        assert_eq!(preds[0].inner_col, "order_id");
+        assert_eq!(preds[0].inner_oid, 42);
+    }
+
+    #[test]
+    fn test_correlation_extraction_reversed_order() {
+        // WHERE o.id = li.order_id (outer on left, inner on right)
+        let expr = Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(qualified_col("o", "id")),
+            right: Box::new(qualified_col("li", "order_id")),
+        };
+        let inner_alias_oids = vec![("li".to_string(), 42u32)];
+        let inner_aliases: Vec<&str> = inner_alias_oids.iter().map(|(a, _)| a.as_str()).collect();
+        let mut preds = Vec::new();
+        collect_correlation_equalities(&expr, &inner_aliases, &inner_alias_oids, &mut preds);
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].outer_col, "id");
+        assert_eq!(preds[0].inner_col, "order_id");
+    }
+
+    #[test]
+    fn test_correlation_extraction_and_conjunction() {
+        // WHERE li.order_id = o.id AND li.status = 'active'
+        let expr = Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(qualified_col("li", "order_id")),
+                right: Box::new(qualified_col("o", "id")),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(qualified_col("li", "status")),
+                right: Box::new(Expr::Literal("'active'".to_string())),
+            }),
+        };
+        let inner_alias_oids = vec![("li".to_string(), 42u32)];
+        let inner_aliases: Vec<&str> = inner_alias_oids.iter().map(|(a, _)| a.as_str()).collect();
+        let mut preds = Vec::new();
+        collect_correlation_equalities(&expr, &inner_aliases, &inner_alias_oids, &mut preds);
+        // Only the correlation equality should be extracted, not li.status = 'active'
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].inner_col, "order_id");
+    }
+
+    #[test]
+    fn test_correlation_extraction_no_inner_alias_match() {
+        // WHERE a.col = b.col — neither matches inner aliases
+        let expr = Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(qualified_col("a", "col")),
+            right: Box::new(qualified_col("b", "col")),
+        };
+        let inner_alias_oids: Vec<(String, u32)> = vec![("x".to_string(), 1)];
+        let inner_aliases: Vec<&str> = inner_alias_oids.iter().map(|(a, _)| a.as_str()).collect();
+        let mut preds = Vec::new();
+        collect_correlation_equalities(&expr, &inner_aliases, &inner_alias_oids, &mut preds);
+        assert!(preds.is_empty());
+    }
+
+    #[test]
+    fn test_correlation_extraction_both_inner() {
+        // WHERE li.col1 = li.col2 — both sides reference inner alias
+        let expr = Expr::BinaryOp {
+            op: "=".to_string(),
+            left: Box::new(qualified_col("li", "col1")),
+            right: Box::new(qualified_col("li", "col2")),
+        };
+        let inner_alias_oids = vec![("li".to_string(), 42u32)];
+        let inner_aliases: Vec<&str> = inner_alias_oids.iter().map(|(a, _)| a.as_str()).collect();
+        let mut preds = Vec::new();
+        collect_correlation_equalities(&expr, &inner_aliases, &inner_alias_oids, &mut preds);
+        // Both sides are inner — no correlation predicate
+        assert!(preds.is_empty());
+    }
+
+    #[test]
+    fn test_correlation_extraction_compound() {
+        // WHERE li.order_id = o.id AND li.region = o.region
+        let expr = Expr::BinaryOp {
+            op: "AND".to_string(),
+            left: Box::new(Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(qualified_col("li", "order_id")),
+                right: Box::new(qualified_col("o", "id")),
+            }),
+            right: Box::new(Expr::BinaryOp {
+                op: "=".to_string(),
+                left: Box::new(qualified_col("li", "region")),
+                right: Box::new(qualified_col("o", "region")),
+            }),
+        };
+        let inner_alias_oids = vec![("li".to_string(), 42u32)];
+        let inner_aliases: Vec<&str> = inner_alias_oids.iter().map(|(a, _)| a.as_str()).collect();
+        let mut preds = Vec::new();
+        collect_correlation_equalities(&expr, &inner_aliases, &inner_alias_oids, &mut preds);
+        assert_eq!(preds.len(), 2);
     }
 }

@@ -2,12 +2,17 @@
 --
 -- Changes:
 --   PB2: Add pooler_compatibility_mode column and update API function signatures.
+--   G-7: Add refresh_tier column for tiered scheduling.
 --   Refresh groups: New create_refresh_group, drop_refresh_group, refresh_groups functions.
 
 -- ── Schema Changes ─────────────────────────────────────────────────────────
 
 ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE pgtrickle.pgt_stream_tables
+    ADD COLUMN IF NOT EXISTS refresh_tier TEXT NOT NULL DEFAULT 'hot'
+    CHECK (refresh_tier IN ('hot', 'warm', 'cold', 'frozen'));
 
 CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_groups (
     group_id    SERIAL PRIMARY KEY,
@@ -75,6 +80,7 @@ LANGUAGE c
 AS 'MODULE_PATHNAME', 'create_or_replace_stream_table_wrapper';
 
 DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, bool);
+DROP FUNCTION IF EXISTS pgtrickle."alter_stream_table"(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, TEXT, bool, bool);
 
 CREATE FUNCTION pgtrickle."alter_stream_table"(
     "name" TEXT,
@@ -86,7 +92,8 @@ CREATE FUNCTION pgtrickle."alter_stream_table"(
     "diamond_schedule_policy" TEXT DEFAULT NULL,
     "cdc_mode" TEXT DEFAULT NULL,
     "append_only" bool DEFAULT NULL,
-    "pooler_compatibility_mode" bool DEFAULT NULL
+    "pooler_compatibility_mode" bool DEFAULT NULL,
+    "tier" TEXT DEFAULT NULL
 ) RETURNS void
 LANGUAGE c
 AS 'MODULE_PATHNAME', 'alter_stream_table_wrapper';

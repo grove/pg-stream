@@ -28,7 +28,7 @@ use crate::wal_decoder;
 /// - `refresh_mode`: `'AUTO'` (default — DIFFERENTIAL with FULL fallback),
 ///   `'FULL'`, `'DIFFERENTIAL'`, or `'IMMEDIATE'`.
 /// - `initialize`: Whether to populate the table immediately.
-/// - `diamond_consistency`: `'none'` (default) or `'atomic'`.
+/// - `diamond_consistency`: `'atomic'` (default) or `'none'`.
 /// - `diamond_schedule_policy`: `'fastest'` (default) or `'slowest'`.
 #[allow(clippy::too_many_arguments)]
 #[pg_extern(schema = "pgtrickle")]
@@ -362,6 +362,7 @@ fn create_or_replace_stream_table_impl(
                 config_diff.cdc_mode,
                 config_diff.append_only,
                 config_diff.pooler_compatibility_mode,
+                None, // tier: not set via create_or_replace
             )?;
 
             pgrx::info!(
@@ -475,6 +476,14 @@ struct ValidatedQuery {
     /// Sum-of-squares auxiliary columns: `(sum2_col_name, arg_sql)` tuples
     /// for algebraic STDDEV/VAR maintenance. Empty if no non-DISTINCT STDDEV/VAR.
     sum2_aux_columns: Vec<(String, String)>,
+    /// Cross-product auxiliary columns: `(col_name, arg_sql)` tuples
+    /// for algebraic CORR/COVAR/REGR_* maintenance (P3-2).
+    /// Columns: sumx, sumy, sumxy, sumx2, sumy2 per aggregate.
+    covar_aux_columns: Vec<(String, String)>,
+    /// Nonnull-count auxiliary columns: `(nonnull_col_name, arg_sql)` tuples
+    /// for non-DISTINCT SUM aggregates above FULL JOIN children (P2-2).
+    /// Empty if no such aggregates exist.
+    nonnull_aux_columns: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,6 +648,16 @@ fn validate_and_parse_query(
         let base = info.base_query.clone();
         (base, Some(info))
     } else {
+        // NS-1: Warn when the query has ORDER BY but no LIMIT.
+        // ORDER BY without LIMIT has no effect on a stream table because
+        // the underlying storage table row order is undefined.
+        if crate::dvm::has_order_by_without_limit(query) {
+            pgrx::warning!(
+                "pg_trickle: ORDER BY without LIMIT has no effect on stream tables — \
+                 storage row order is undefined. Use ORDER BY with LIMIT for TopK, \
+                 or remove ORDER BY."
+            );
+        }
         (query.to_string(), None)
     };
     let q = if topk_info.is_some() {
@@ -797,7 +816,7 @@ fn validate_and_parse_query(
 
     // EC-06: Detect keyless sources
     let has_keyless_source = source_relids.iter().any(|(oid, source_type)| {
-        if source_type != "TABLE" && source_type != "FOREIGN_TABLE" {
+        if source_type != "TABLE" && source_type != "FOREIGN_TABLE" && source_type != "MATVIEW" {
             return false;
         }
         cdc::resolve_pk_columns(*oid)
@@ -815,6 +834,16 @@ fn validate_and_parse_query(
         .map(|pr| pr.tree.sum2_aux_columns())
         .unwrap_or_default();
 
+    let covar_aux_columns = parsed_tree
+        .as_ref()
+        .map(|pr| pr.tree.covar_aux_columns())
+        .unwrap_or_default();
+
+    let nonnull_aux_columns = parsed_tree
+        .as_ref()
+        .map(|pr| pr.tree.nonnull_aux_columns())
+        .unwrap_or_default();
+
     Ok(ValidatedQuery {
         columns,
         parsed_tree,
@@ -827,6 +856,8 @@ fn validate_and_parse_query(
         source_relids,
         avg_aux_columns,
         sum2_aux_columns,
+        covar_aux_columns,
+        nonnull_aux_columns,
     })
 }
 
@@ -844,6 +875,8 @@ fn setup_storage_table(
     parsed_tree: Option<&crate::dvm::ParseResult>,
     avg_aux_columns: &[(String, String, String)],
     sum2_aux_columns: &[(String, String)],
+    covar_aux_columns: &[(String, String)],
+    nonnull_aux_columns: &[(String, String)],
 ) -> Result<pg_sys::Oid, PgTrickleError> {
     let storage_needs_pgt_count = needs_pgt_count;
     let storage_ddl = build_create_table_sql(
@@ -854,6 +887,8 @@ fn setup_storage_table(
         needs_dual_count,
         avg_aux_columns,
         sum2_aux_columns,
+        covar_aux_columns,
+        nonnull_aux_columns,
     );
     Spi::run(&storage_ddl)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
@@ -861,15 +896,30 @@ fn setup_storage_table(
     let pgt_relid = get_table_oid(schema, table_name)?;
 
     // Create index on __pgt_row_id (EC-06: non-unique for keyless sources)
+    //
+    // A-4: When the output schema has <= 8 user columns, create a covering
+    // index with INCLUDE clause to enable index-only scans during MERGE.
+    // This eliminates the heap fetch for matched rows, giving 20-50%
+    // MERGE time reduction for small-delta / large-target scenarios.
+    const COVERING_INDEX_MAX_COLUMNS: usize = 8;
+    let include_clause = if columns.len() <= COVERING_INDEX_MAX_COLUMNS && !columns.is_empty() {
+        let include_cols: Vec<String> = columns
+            .iter()
+            .map(|c| quote_identifier(&c.name).to_string())
+            .collect();
+        format!(" INCLUDE ({})", include_cols.join(", "))
+    } else {
+        String::new()
+    };
     let index_sql = if has_keyless_source {
         format!(
-            "CREATE INDEX ON {}.{} (__pgt_row_id)",
+            "CREATE INDEX ON {}.{} (__pgt_row_id){include_clause}",
             quote_identifier(schema),
             quote_identifier(table_name),
         )
     } else {
         format!(
-            "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id)",
+            "CREATE UNIQUE INDEX ON {}.{} (__pgt_row_id){include_clause}",
             quote_identifier(schema),
             quote_identifier(table_name),
         )
@@ -954,21 +1004,23 @@ fn insert_catalog_and_deps(
     for (source_oid, source_type) in &vq.source_relids {
         let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
 
-        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
-            match crate::catalog::build_column_snapshot(*source_oid) {
-                Ok((s, f)) => (Some(s), Some(f)),
-                Err(e) => {
-                    pgrx::debug1!(
-                        "pg_trickle: failed to build column snapshot for source {}: {}",
-                        source_oid.to_u32(),
-                        e,
-                    );
-                    (None, None)
+        let (snapshot, fingerprint) =
+            if source_type == "TABLE" || source_type == "FOREIGN_TABLE" || source_type == "MATVIEW"
+            {
+                match crate::catalog::build_column_snapshot(*source_oid) {
+                    Ok((s, f)) => (Some(s), Some(f)),
+                    Err(e) => {
+                        pgrx::debug1!(
+                            "pg_trickle: failed to build column snapshot for source {}: {}",
+                            source_oid.to_u32(),
+                            e,
+                        );
+                        (None, None)
+                    }
                 }
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
 
         StDependency::insert_with_snapshot(
             pgt_id,
@@ -1005,6 +1057,8 @@ fn setup_trigger_infrastructure(
                 setup_cdc_for_source(*source_oid, pgt_id, &change_schema)?;
             } else if source_type == "FOREIGN_TABLE" {
                 cdc::setup_foreign_table_polling(*source_oid, pgt_id, &change_schema)?;
+            } else if source_type == "MATVIEW" {
+                cdc::setup_matview_polling(*source_oid, pgt_id, &change_schema)?;
             }
         }
     }
@@ -1197,8 +1251,8 @@ fn migrate_storage_table_compatible(
 }
 
 /// Manage auxiliary columns (__pgt_count, __pgt_count_l/r, __pgt_aux_sum_*,
-/// __pgt_aux_count_*, __pgt_aux_sum2_*) during ALTER QUERY when the query
-/// type or aggregate composition changes.
+/// __pgt_aux_count_*, __pgt_aux_sum2_*, __pgt_aux_sumx_*, __pgt_aux_nonnull_*)
+/// during ALTER QUERY when the query type or aggregate composition changes.
 #[allow(clippy::too_many_arguments)]
 fn migrate_aux_columns(
     schema: &str,
@@ -1212,6 +1266,10 @@ fn migrate_aux_columns(
     new_avg_aux: &[(String, String, String)],
     old_sum2_aux: &[(String, String)],
     new_sum2_aux: &[(String, String)],
+    old_covar_aux: &[(String, String)],
+    new_covar_aux: &[(String, String)],
+    old_nonnull_aux: &[(String, String)],
+    new_nonnull_aux: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
     let quoted_table = format!(
         "{}.{}",
@@ -1349,6 +1407,64 @@ fn migrate_aux_columns(
         }
     }
 
+    // Transition: cross-product auxiliary columns (__pgt_aux_sum{x,y,xy,x2,y2}_*)
+    // for CORR/COVAR/REGR_* algebraic maintenance (P3-2).
+    let old_covar_names: std::collections::HashSet<&str> =
+        old_covar_aux.iter().map(|(n, _)| n.as_str()).collect();
+    let new_covar_names: std::collections::HashSet<&str> =
+        new_covar_aux.iter().map(|(n, _)| n.as_str()).collect();
+    // Add new covar aux columns
+    for (col_name, _) in new_covar_aux {
+        if !old_covar_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} NUMERIC NOT NULL DEFAULT 0",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+    // Drop removed covar aux columns
+    for (col_name, _) in old_covar_aux {
+        if !new_covar_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+
+    // Transition: nonnull-count auxiliary columns (__pgt_aux_nonnull_*)
+    // for SUM NULL-transition correction (P2-2).
+    let old_nonnull_names: std::collections::HashSet<&str> =
+        old_nonnull_aux.iter().map(|(n, _)| n.as_str()).collect();
+    let new_nonnull_names: std::collections::HashSet<&str> =
+        new_nonnull_aux.iter().map(|(n, _)| n.as_str()).collect();
+    // Add new nonnull aux columns
+    for (col_name, _) in new_nonnull_aux {
+        if !old_nonnull_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} BIGINT NOT NULL DEFAULT 0",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+    // Drop removed nonnull aux columns
+    for (col_name, _) in old_nonnull_aux {
+        if !new_nonnull_names.contains(col_name.as_str()) {
+            Spi::run(&format!(
+                "ALTER TABLE {} DROP COLUMN IF EXISTS {}",
+                quoted_table,
+                quote_identifier(col_name),
+            ))
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        }
+    }
+
     Ok(())
 }
 
@@ -1409,6 +1525,8 @@ fn alter_stream_table_query(
     let old_needs_dual_count = crate::dvm::query_needs_dual_count(&st.defining_query);
     let old_avg_aux = crate::dvm::query_avg_aux_columns(&st.defining_query);
     let old_sum2_aux = crate::dvm::query_sum2_aux_columns(&st.defining_query);
+    let old_covar_aux = crate::dvm::query_covar_aux_columns(&st.defining_query);
+    let old_nonnull_aux = crate::dvm::query_nonnull_aux_columns(&st.defining_query);
 
     // ── Phase 1: Suspend ──
     StreamTableMeta::update_status(st.pgt_id, StStatus::Suspended)?;
@@ -1503,6 +1621,8 @@ fn alter_stream_table_query(
                 vq.parsed_tree.as_ref(),
                 &vq.avg_aux_columns,
                 &vq.sum2_aux_columns,
+                &vq.covar_aux_columns,
+                &vq.nonnull_aux_columns,
             )?
         }
     };
@@ -1521,6 +1641,10 @@ fn alter_stream_table_query(
             &vq.avg_aux_columns,
             &old_sum2_aux,
             &vq.sum2_aux_columns,
+            &old_covar_aux,
+            &vq.covar_aux_columns,
+            &old_nonnull_aux,
+            &vq.nonnull_aux_columns,
         )?;
     }
 
@@ -1589,21 +1713,23 @@ fn alter_stream_table_query(
 
     for (source_oid, source_type) in &vq.source_relids {
         let cols = columns_used_map.get(&source_oid.to_u32()).cloned();
-        let (snapshot, fingerprint) = if source_type == "TABLE" || source_type == "FOREIGN_TABLE" {
-            match crate::catalog::build_column_snapshot(*source_oid) {
-                Ok((s, f)) => (Some(s), Some(f)),
-                Err(e) => {
-                    pgrx::debug1!(
-                        "pg_trickle: failed to build column snapshot for source {}: {}",
-                        source_oid.to_u32(),
-                        e,
-                    );
-                    (None, None)
+        let (snapshot, fingerprint) =
+            if source_type == "TABLE" || source_type == "FOREIGN_TABLE" || source_type == "MATVIEW"
+            {
+                match crate::catalog::build_column_snapshot(*source_oid) {
+                    Ok((s, f)) => (Some(s), Some(f)),
+                    Err(e) => {
+                        pgrx::debug1!(
+                            "pg_trickle: failed to build column snapshot for source {}: {}",
+                            source_oid.to_u32(),
+                            e,
+                        );
+                        (None, None)
+                    }
                 }
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
         StDependency::insert_with_snapshot(
             st.pgt_id,
             *source_oid,
@@ -1626,6 +1752,8 @@ fn alter_stream_table_query(
             }
         } else if source_type == "FOREIGN_TABLE" && !refresh_mode.is_immediate() {
             cdc::setup_foreign_table_polling(*source_oid, st.pgt_id, &change_schema)?;
+        } else if source_type == "MATVIEW" && !refresh_mode.is_immediate() {
+            cdc::setup_matview_polling(*source_oid, st.pgt_id, &change_schema)?;
         }
     }
 
@@ -1673,7 +1801,7 @@ fn alter_stream_table_query(
     }
 
     // Signal DAG rebuild and cache invalidation
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(st.pgt_id);
     shmem::bump_cache_generation();
 
     // ── Phase 5: Repopulate ──
@@ -1777,7 +1905,7 @@ fn create_stream_table_impl(
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
 
-    // Parse diamond consistency — default to 'none' when not specified
+    // Parse diamond consistency — default to 'atomic' when not specified
     let dc = match diamond_consistency {
         Some(s) => {
             let val = s.to_lowercase();
@@ -1909,6 +2037,8 @@ fn create_stream_table_impl(
         vq.parsed_tree.as_ref(),
         &vq.avg_aux_columns,
         &vq.sum2_aux_columns,
+        &vq.covar_aux_columns,
+        &vq.nonnull_aux_columns,
     )?;
 
     // Insert catalog entry + dependency edges
@@ -1925,6 +2055,8 @@ fn create_stream_table_impl(
     } else {
         None
     };
+    // Capture before schedule_str is moved into insert_catalog_and_deps.
+    let is_calculated = schedule_str.is_none();
     let pgt_id = insert_catalog_and_deps(
         pgt_relid,
         &schema,
@@ -1943,6 +2075,56 @@ fn create_stream_table_impl(
 
     // ── Phase 2: CDC / IVM trigger setup ──
     setup_trigger_infrastructure(&vq.source_relids, refresh_mode, pgt_id, pgt_relid, query)?;
+
+    // ── NS-5: Diamond consistency NOTICE ──
+    // When the user explicitly opted out of atomic reads (diamond_consistency='none'),
+    // check if this new ST is a diamond convergence point and advise.
+    if dc == DiamondConsistency::None
+        && let Ok(dag) = StDag::build_from_catalog(config::pg_trickle_default_schedule_seconds())
+    {
+        let diamonds = dag.detect_diamonds();
+        if diamonds
+            .iter()
+            .any(|d| d.convergence == NodeId::StreamTable(pgt_id))
+        {
+            pgrx::notice!(
+                "pg_trickle: Diamond dependency detected for \"{}\".\"{}\" and \
+                 diamond_consistency is 'none' — cross-branch reads may be inconsistent. \
+                 Consider diamond_consistency='atomic' for consistent results.",
+                schema,
+                table_name
+            );
+        }
+    }
+
+    // ── NS-7: CALCULATED schedule with no downstream NOTICE ──
+    // CALCULATED stream tables inherit their schedule from downstream dependents.
+    // If none exist yet, their schedule falls back to the default GUC and the user
+    // may not realise rows won't be refreshed on their intended cadence.
+    if is_calculated && !refresh_mode.is_immediate() {
+        let has_downstream = Spi::get_one::<bool>(&format!(
+            "SELECT EXISTS(\
+               SELECT 1 FROM pgtrickle.pgt_dependencies d \
+               WHERE d.source_relid = {relid} AND d.pgt_id != {pid}\
+             )",
+            relid = pgt_relid.to_u32(),
+            pid = pgt_id,
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+        if !has_downstream {
+            let fallback_secs = config::pg_trickle_default_schedule_seconds();
+            pgrx::notice!(
+                "pg_trickle: Stream table \"{}\".\"{}\" uses CALCULATED schedule but has no \
+                 downstream dependents yet — it will fall back to the default schedule \
+                 (pg_trickle.default_schedule_seconds = {}s). Add a downstream stream table \
+                 that references this one to activate the intended schedule.",
+                schema,
+                table_name,
+                fallback_secs
+            );
+        }
+    }
 
     // ── Phase 2a: CYC-6 — Assign SCC IDs when circular dependencies exist ──
     if config::pg_trickle_allow_circular() {
@@ -1980,6 +2162,8 @@ fn create_stream_table_impl(
             vq.topk_info.as_ref(),
             &vq.avg_aux_columns,
             &vq.sum2_aux_columns,
+            &vq.covar_aux_columns,
+            &vq.nonnull_aux_columns,
         )?;
         let init_ms = t_init.elapsed().as_secs_f64() * 1000.0;
 
@@ -2003,7 +2187,7 @@ fn create_stream_table_impl(
     }
 
     // Signal scheduler to rebuild DAG
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(pgt_id);
 
     pgrx::info!(
         "Stream table {}.{} created (pgt_id={}, mode={}, initialized={})",
@@ -2031,6 +2215,7 @@ fn alter_stream_table(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(Option<bool>, "NULL"),
     pooler_compatibility_mode: default!(Option<bool>, "NULL"),
+    tier: default!(Option<&str>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -2043,6 +2228,7 @@ fn alter_stream_table(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        tier,
     );
     if let Err(e) = result {
         pgrx::error!("{}", e);
@@ -2061,6 +2247,7 @@ fn alter_stream_table_impl(
     cdc_mode: Option<&str>,
     append_only: Option<bool>,
     pooler_compatibility_mode: Option<bool>,
+    tier: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -2362,7 +2549,20 @@ fn alter_stream_table_impl(
         }
     }
 
-    shmem::signal_dag_rebuild();
+    // G-7: Update refresh tier if explicitly set.
+    if let Some(tier_str) = tier {
+        use crate::scheduler::RefreshTier;
+        if !RefreshTier::is_valid_str(tier_str) {
+            return Err(PgTrickleError::InvalidArgument(format!(
+                "invalid tier value: '{}' (expected 'hot', 'warm', 'cold', or 'frozen')",
+                tier_str
+            )));
+        }
+        let normalized = tier_str.to_lowercase();
+        StreamTableMeta::update_refresh_tier(st.pgt_id, &normalized)?;
+    }
+
+    shmem::signal_dag_invalidation(st.pgt_id);
     // G8.1: Notify other backends to flush delta/MERGE template caches.
     shmem::bump_cache_generation();
     Ok(())
@@ -2461,7 +2661,7 @@ fn drop_stream_table_impl_inner(
     }
 
     // Signal scheduler
-    shmem::signal_dag_rebuild();
+    shmem::signal_dag_invalidation(st.pgt_id);
     // G8.1: Notify other backends to flush delta/MERGE template caches.
     shmem::bump_cache_generation();
 
@@ -2843,6 +3043,16 @@ fn execute_manual_full_refresh(
         let sum2_aux = crate::dvm::query_sum2_aux_columns(&st.defining_query);
         if !sum2_aux.is_empty() {
             eq = inject_sum2_aux(&eq, &sum2_aux);
+        }
+        // Also inject cross-product columns for CORR/COVAR/REGR maintenance (P3-2).
+        let covar_aux = crate::dvm::query_covar_aux_columns(&st.defining_query);
+        if !covar_aux.is_empty() {
+            eq = inject_covar_aux(&eq, &covar_aux);
+        }
+        // Also inject nonnull-count columns for SUM NULL-transition correction (P2-2).
+        let nonnull_aux = crate::dvm::query_nonnull_aux_columns(&st.defining_query);
+        if !nonnull_aux.is_empty() {
+            eq = inject_nonnull_aux(&eq, &nonnull_aux);
         }
         eq
     } else {
@@ -5157,6 +5367,7 @@ fn assign_scc_ids_from_dag() -> Result<(), PgTrickleError> {
 }
 
 /// Build CREATE TABLE DDL for the storage table.
+#[allow(clippy::too_many_arguments)]
 fn build_create_table_sql(
     schema: &str,
     name: &str,
@@ -5165,6 +5376,8 @@ fn build_create_table_sql(
     needs_dual_count: bool,
     avg_aux_columns: &[(String, String, String)],
     sum2_aux_columns: &[(String, String)],
+    covar_aux_columns: &[(String, String)],
+    nonnull_aux_columns: &[(String, String)],
 ) -> String {
     let col_defs: Vec<String> = columns
         .iter()
@@ -5218,14 +5431,36 @@ fn build_create_table_sql(
         ));
     }
 
+    // Add cross-product auxiliary columns (__pgt_aux_sumx_*, sumy, sumxy,
+    // sumx2, sumy2) for algebraic CORR/COVAR/REGR_* maintenance (P3-2).
+    let mut covar_aux_sql = String::new();
+    for (covar_col, _arg_sql) in covar_aux_columns {
+        covar_aux_sql.push_str(&format!(
+            ",\n    {} NUMERIC NOT NULL DEFAULT 0",
+            quote_identifier(covar_col),
+        ));
+    }
+
+    // Add nonnull-count auxiliary columns (__pgt_aux_nonnull_*) for
+    // SUM NULL-transition correction (P2-2).
+    let mut nonnull_aux_sql = String::new();
+    for (nonnull_col, _arg_sql) in nonnull_aux_columns {
+        nonnull_aux_sql.push_str(&format!(
+            ",\n    {} BIGINT NOT NULL DEFAULT 0",
+            quote_identifier(nonnull_col),
+        ));
+    }
+
     format!(
-        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}\n)",
+        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}{}{}\n)",
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
         aux_cols,
         avg_aux_sql,
         sum2_aux_sql,
+        covar_aux_sql,
+        nonnull_aux_sql,
     )
 }
 
@@ -5259,6 +5494,8 @@ fn initialize_st(
     topk_info: Option<&crate::dvm::TopKInfo>,
     avg_aux_columns: &[(String, String, String)],
     sum2_aux_columns: &[(String, String)],
+    covar_aux_columns: &[(String, String)],
+    nonnull_aux_columns: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
     // EC-25/EC-26: Set the internal_refresh flag so DML guard triggers
     // allow the initialization INSERT into the storage table.
@@ -5283,6 +5520,18 @@ fn initialize_st(
     // columns for sum-of-squares tracking.
     if !sum2_aux_columns.is_empty() {
         effective_query = inject_sum2_aux(&effective_query, sum2_aux_columns);
+    }
+
+    // P3-2: For CORR/COVAR/REGR_* algebraic maintenance, inject cross-product
+    // auxiliary columns (sumx, sumy, sumxy, sumx2, sumy2).
+    if !covar_aux_columns.is_empty() {
+        effective_query = inject_covar_aux(&effective_query, covar_aux_columns);
+    }
+
+    // For SUM NULL-transition correction (P2-2), inject COUNT(IS NOT NULL)
+    // auxiliary columns for nonnull-count tracking.
+    if !nonnull_aux_columns.is_empty() {
+        effective_query = inject_nonnull_aux(&effective_query, nonnull_aux_columns);
     }
 
     // Compute row_id using the same hash formula as the delta query so
@@ -5454,6 +5703,74 @@ pub fn inject_sum2_aux(query: &str, sum2_aux_columns: &[(String, String)]) -> St
             ));
         }
         format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..],)
+    } else {
+        query.to_string()
+    }
+}
+
+/// Inject nonnull-count auxiliary columns (`COUNT(CASE WHEN arg IS NOT NULL ...)`)
+/// for SUM NULL-transition correction (P2-2).
+///
+/// These populate the `__pgt_aux_nonnull_*` storage columns during initial
+/// population and full refresh so the differential path can perform algebraic
+/// NULL-transition correction without rescanning source data.
+pub fn inject_nonnull_aux(query: &str, nonnull_aux_columns: &[(String, String)]) -> String {
+    if nonnull_aux_columns.is_empty() {
+        return query.to_string();
+    }
+
+    if let Some(pos) = find_top_level_keyword(query, "FROM") {
+        let mut extra = String::new();
+        for (nonnull_col, arg_sql) in nonnull_aux_columns {
+            extra.push_str(&format!(
+                ", COUNT(CASE WHEN ({arg_sql}) IS NOT NULL THEN 1 END) AS {}",
+                quote_identifier(nonnull_col),
+            ));
+        }
+        format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..],)
+    } else {
+        query.to_string()
+    }
+}
+
+/// Inject cross-product auxiliary columns for CORR/COVAR/REGR algebraic
+/// maintenance (P3-2).
+///
+/// Each covar aux column maps to a specific SQL expression based on its name
+/// prefix and `arg_sql` encoding:
+///   `__pgt_aux_sumx_*`  → `SUM(x)`
+///   `__pgt_aux_sumy_*`  → `SUM(y)`
+///   `__pgt_aux_sumxy_*` → `SUM((x)*(y))`  (arg_sql = "x|y")
+///   `__pgt_aux_sumx2_*` → `SUM((x)*(x))`
+///   `__pgt_aux_sumy2_*` → `SUM((y)*(y))`
+pub fn inject_covar_aux(query: &str, covar_aux_columns: &[(String, String)]) -> String {
+    if covar_aux_columns.is_empty() {
+        return query.to_string();
+    }
+
+    if let Some(pos) = find_top_level_keyword(query, "FROM") {
+        let mut extra = String::new();
+        for (col_name, arg_sql) in covar_aux_columns {
+            let expr = if col_name.starts_with("__pgt_aux_sumxy_") {
+                // arg_sql is "x_expr|y_expr"
+                let parts: Vec<&str> = arg_sql.splitn(2, '|').collect();
+                let (x, y) = if parts.len() == 2 {
+                    (parts[0], parts[1])
+                } else {
+                    (arg_sql.as_str(), arg_sql.as_str())
+                };
+                format!("SUM(({x}) * ({y}))")
+            } else if col_name.starts_with("__pgt_aux_sumx2_")
+                || col_name.starts_with("__pgt_aux_sumy2_")
+            {
+                format!("SUM(({arg_sql}) * ({arg_sql}))")
+            } else {
+                // sumx_ or sumy_ — simple SUM
+                format!("SUM({arg_sql})")
+            };
+            extra.push_str(&format!(", {} AS {}", expr, quote_identifier(col_name)));
+        }
+        format!("{}{extra} {}", query[..pos].trim_end(), &query[pos..])
     } else {
         query.to_string()
     }
@@ -6327,6 +6644,7 @@ mod tests {
             scc_id: None,
             last_fixpoint_iterations: None,
             pooler_compatibility_mode: false,
+            refresh_tier: "hot".to_string(),
         }
     }
 

@@ -245,8 +245,15 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
             )
         }
         _ => {
-            // Fallback for unsupported node types.
-            format!("/* unsupported snapshot for {} */", op.node_kind())
+            // This node type cannot appear as a direct join child in a snapshot.
+            // Raise a PostgreSQL-level error so the user gets a clear message
+            // instead of a SQL syntax error from an injected comment.
+            pgrx::error!(
+                "pg_trickle: operator '{}' is not supported as a direct join source \
+                 in DIFFERENTIAL/IMMEDIATE mode; rewrite the defining query to \
+                 place this subquery in a named CTE or derived table.",
+                op.node_kind()
+            );
         }
     }
 }
@@ -1050,6 +1057,29 @@ pub fn join_scan_count(op: &OpTree) -> usize {
 ///
 /// When false, the post-change snapshot should be used (possibly with a
 /// correction term for shallow join children).
+///
+/// # EC-01 boundary (SF-5)
+///
+/// The `join_scan_count(child) <= 2` threshold is a **known correctness
+/// trade-off**.  For join subtrees with ≥3 scan nodes (e.g. TPC-H Q7/Q8/Q9),
+/// the pre-change snapshot via EXCEPT ALL can cause PostgreSQL to spill
+/// multiple GB of temporary files — even at small scale factors — because:
+///
+/// 1. The full snapshot of a multi-table join must be materialized
+/// 2. Delta CTEs are materialized within the EXCEPT ALL set operations
+/// 3. PostgreSQL auto-materializes CTEs referenced ≥2 times
+///
+/// With the threshold at 2, queries with wide right-side join chains (≥3
+/// scan nodes) fall back to L₁/R₁ (post-change snapshots). This means the
+/// original EC-01 phantom-row-after-DELETE bug remains present for those
+/// queries: when a left-side row DELETE coincides with its right-side join
+/// partner also being deleted, the DELETE action may be silently dropped
+/// because R₁ no longer contains the partner row.
+///
+/// The `NOT MATERIALIZED` CTE hint (see `diff.rs`) mitigates some cases
+/// but does not fully solve the cascading materialization problem for deep
+/// join trees.  Removing this threshold requires either a PostgreSQL-level
+/// query optimizer change or a fundamentally different snapshot strategy.
 pub fn use_pre_change_snapshot(child: &OpTree, inside_semijoin: bool) -> bool {
     is_simple_child(child)
         || !is_join_child(child)
@@ -1304,6 +1334,70 @@ mod tests {
         assert!(
             !rewritten.contains("b."),
             "should not contain old alias b, got: {rewritten}"
+        );
+    }
+
+    // ── SF-5: EC-01 boundary tests for use_pre_change_snapshot ──────
+
+    #[test]
+    fn test_pre_change_snapshot_simple_scan() {
+        let child = scan(1, "t", "public", "t", &["id"]);
+        assert!(
+            use_pre_change_snapshot(&child, false),
+            "Simple scan should use pre-change snapshot"
+        );
+    }
+
+    #[test]
+    fn test_pre_change_snapshot_2_scan_join() {
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let j = inner_join(eq_cond("a", "id", "b", "id"), a, b);
+        assert!(
+            use_pre_change_snapshot(&j, false),
+            "2-scan join should use pre-change snapshot (EC-01 applies)"
+        );
+    }
+
+    #[test]
+    fn test_pre_change_snapshot_3_scan_join_falls_back() {
+        // SF-5: ≥3 scan join subtree must NOT use pre-change snapshot
+        // to avoid CTE materialization that can exhaust temp_file_limit.
+        // This means EC-01 phantom-row fix does NOT apply for wide joins.
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let j_ab = inner_join(eq_cond("a", "id", "b", "id"), a, b);
+        let j_abc = inner_join(eq_cond("a", "id", "c", "id"), j_ab, c);
+        assert!(
+            !use_pre_change_snapshot(&j_abc, false),
+            "3-scan join should fall back to post-change snapshot (EC-01 boundary)"
+        );
+    }
+
+    #[test]
+    fn test_pre_change_snapshot_semijoin_forces_fallback() {
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let j = inner_join(eq_cond("a", "id", "b", "id"), a, b);
+        // inside_semijoin=true forces fallback regardless of scan count
+        assert!(
+            !use_pre_change_snapshot(&j, true),
+            "Inside semijoin should fall back even for 2-scan join"
+        );
+    }
+
+    #[test]
+    fn test_pre_change_snapshot_non_join_child() {
+        // Aggregate/Subquery children are not join children → safe for snapshot
+        let child = aggregate(
+            vec![colref("region")],
+            vec![count_star("cnt")],
+            scan(1, "t", "public", "t", &["id", "region"]),
+        );
+        assert!(
+            use_pre_change_snapshot(&child, false),
+            "Non-join child (Aggregate) should use pre-change snapshot"
         );
     }
 }

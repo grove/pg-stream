@@ -889,14 +889,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn test_get_current_table_ref_non_scan() {
         let node = OpTree::Distinct {
             child: Box::new(scan(1, "t", "public", "t", &["id"])),
         };
-        assert_eq!(
-            get_current_table_ref(&node),
-            "/* unsupported snapshot for distinct */"
-        );
+        get_current_table_ref(&node);
     }
 
     // ── build_base_table_key_exprs tests ────────────────────────────

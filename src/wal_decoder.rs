@@ -133,6 +133,74 @@ pub fn drop_publication(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
     Ok(())
 }
 
+/// Check if a publication needs to be rebuilt because its source table was
+/// converted to partitioned after publication creation (SF-11).
+///
+/// When a regular table is converted to a partitioned table (via
+/// `CREATE TABLE ... PARTITION OF` or dump/restore), the existing
+/// publication lacks `publish_via_partition_root = true`.  WAL events from
+/// child partitions arrive with child-partition names instead of the parent
+/// table name, causing the WAL decoder's table-name filter to silently skip
+/// all changes — the stream table freezes with no error.
+///
+/// This function detects that condition and rebuilds the publication with
+/// the correct setting.
+pub fn check_publication_health(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
+    let pub_name = publication_name_for_source(source_oid);
+
+    // Check if publication exists at all
+    let pub_exists = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = $1)",
+        &[pub_name.as_str().into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or(false);
+
+    if !pub_exists {
+        return Ok(());
+    }
+
+    // Check current relkind — is the table now partitioned?
+    let is_partitioned = Spi::get_one_with_args::<String>(
+        "SELECT relkind::text FROM pg_class WHERE oid = $1",
+        &[source_oid.into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .map(|rk| rk == "p")
+    .unwrap_or(false);
+
+    if !is_partitioned {
+        return Ok(());
+    }
+
+    // Table is partitioned — check if publication already has PVPR
+    let has_pvpr = Spi::get_one_with_args::<bool>(
+        "SELECT pubviaroot FROM pg_publication WHERE pubname = $1",
+        &[pub_name.as_str().into()],
+    )
+    .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+    .unwrap_or(false);
+
+    if has_pvpr {
+        return Ok(());
+    }
+
+    // Publication exists, table is partitioned, but PVPR is not set.
+    // Rebuild the publication with the correct setting.
+    info!(
+        "pg_trickle: source OID {} is now partitioned but publication '{}' \
+         lacks publish_via_partition_root — rebuilding publication",
+        source_oid.to_u32(),
+        pub_name
+    );
+
+    // Drop and recreate with PVPR
+    drop_publication(source_oid)?;
+    create_publication(source_oid)?;
+
+    Ok(())
+}
+
 // ── Replication Slot Management ────────────────────────────────────────────
 
 /// Create a logical replication slot for WAL decoding.
@@ -1511,6 +1579,10 @@ pub fn check_decoder_health(
             lag_bytes
         );
     }
+
+    // SF-11: Check if the publication needs rebuilding because the source
+    // table was converted to partitioned after publication creation.
+    check_publication_health(source_oid)?;
 
     Ok(())
 }

@@ -219,6 +219,14 @@ JOIN products p ON o.prod_id = p.id
 - FULL OUTER JOIN delta computation can be expensive due to dual-side NULL tracking (8 UNION ALL parts).
 - Performance degrades with high-cardinality join keys.
 - `NATURAL JOIN` is supported — common columns are resolved automatically and synthesized into an explicit equi-join condition.
+- **EC-01 pre-change snapshot boundary (SF-5):** The phantom-row-after-DELETE
+  fix (EC-01) uses `EXCEPT ALL` to reconstruct the pre-change state of a join
+  side. This is limited to join subtrees with **≤ 2 scan nodes** to avoid
+  PostgreSQL temporary file exhaustion on wide join chains. For queries with
+  ≥ 3 base tables on one side of a join (e.g. TPC-H Q7/Q8/Q9), a
+  simultaneous DELETE on both join sides may leave a phantom row in the stream
+  table until the next full refresh. See `use_pre_change_snapshot()` in
+  `join_common.rs` for the full rationale.
 
 ---
 

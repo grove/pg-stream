@@ -58,13 +58,13 @@ pub mod row_id;
 pub use diff::DiffContext;
 pub use parser::{
     CteRegistry, ParseResult, TopKInfo, check_ivm_support, check_ivm_support_with_registry,
-    check_monotonicity, detect_topk_pattern, parse_defining_query, parse_defining_query_full,
-    query_has_cte, query_has_recursive_cte, reject_limit_offset, reject_materialized_views,
-    reject_unsupported_constructs, rewrite_correlated_scalar_in_select, rewrite_demorgan_sublinks,
-    rewrite_distinct_on, rewrite_grouping_sets, rewrite_nested_window_exprs, rewrite_rows_from,
-    rewrite_scalar_subquery_in_where, rewrite_sublinks_in_or, rewrite_views_inline,
-    tree_worst_volatility_with_registry, validate_immediate_mode_support,
-    warn_limit_without_order_in_subqueries,
+    check_monotonicity, detect_topk_pattern, has_order_by_without_limit, parse_defining_query,
+    parse_defining_query_full, query_has_cte, query_has_recursive_cte, reject_limit_offset,
+    reject_materialized_views, reject_unsupported_constructs, rewrite_correlated_scalar_in_select,
+    rewrite_demorgan_sublinks, rewrite_distinct_on, rewrite_grouping_sets,
+    rewrite_nested_window_exprs, rewrite_rows_from, rewrite_scalar_subquery_in_where,
+    rewrite_sublinks_in_or, rewrite_views_inline, tree_worst_volatility_with_registry,
+    validate_immediate_mode_support, warn_limit_without_order_in_subqueries,
 };
 
 use crate::error::PgTrickleError;
@@ -425,6 +425,24 @@ pub fn query_avg_aux_columns(defining_query: &str) -> Vec<(String, String, Strin
 pub fn query_sum2_aux_columns(defining_query: &str) -> Vec<(String, String)> {
     parse_defining_query(defining_query)
         .map(|tree| tree.sum2_aux_columns())
+        .unwrap_or_default()
+}
+
+/// Returns `(col_name, arg_sql)` tuples for each cross-product auxiliary
+/// column needed by CORR/COVAR/REGR_* aggregates (P3-2). Empty if none.
+pub fn query_covar_aux_columns(defining_query: &str) -> Vec<(String, String)> {
+    parse_defining_query(defining_query)
+        .map(|tree| tree.covar_aux_columns())
+        .unwrap_or_default()
+}
+
+/// Returns `(nonnull_col_name, arg_sql)` tuples for each non-DISTINCT SUM
+/// aggregate above a FULL JOIN child that needs an auxiliary nonnull-count
+/// column (`__pgt_aux_nonnull_*`) for P2-2 NULL-transition correction.
+/// Empty if no such aggregates exist.
+pub fn query_nonnull_aux_columns(defining_query: &str) -> Vec<(String, String)> {
+    parse_defining_query(defining_query)
+        .map(|tree| tree.nonnull_aux_columns())
         .unwrap_or_default()
 }
 

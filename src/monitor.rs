@@ -51,6 +51,8 @@ pub enum AlertEvent {
     RefreshFailed,
     /// EC-11: Refresh duration is approaching the schedule interval.
     SchedulerFallingBehind,
+    /// NS-2: append_only flag automatically reverted after DELETE/UPDATE detected.
+    AppendOnlyReverted,
 }
 
 impl AlertEvent {
@@ -65,6 +67,7 @@ impl AlertEvent {
             AlertEvent::RefreshCompleted => "refresh_completed",
             AlertEvent::RefreshFailed => "refresh_failed",
             AlertEvent::SchedulerFallingBehind => "scheduler_falling_behind",
+            AlertEvent::AppendOnlyReverted => "append_only_reverted",
         }
     }
 }

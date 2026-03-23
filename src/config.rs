@@ -158,6 +158,16 @@ pub static PGS_BLOCK_SOURCE_DDL: GucSetting<bool> = GucSetting::<bool>::new(fals
 /// both high-throughput workloads (raise) and small tables (lower).
 pub static PGS_BUFFER_ALERT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(1_000_000);
 
+/// C-4: Change buffer compaction threshold (pending change row count).
+///
+/// When a source table's pending change buffer exceeds this many rows,
+/// compaction is triggered before the next refresh cycle. Compaction
+/// eliminates net-zero INSERT+DELETE pairs and collapses multi-change
+/// groups to first+last rows per pk_hash.
+///
+/// Set to 0 to disable compaction. Typical values: 10_000–1_000_000.
+pub static PGS_COMPACT_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(100_000);
+
 /// Maximum allowed grouping set branches for CUBE/ROLLUP expansion (EC-02).
 pub static PGS_MAX_GROUPING_SET_BRANCHES: GucSetting<i32> = GucSetting::<i32>::new(64);
 
@@ -230,6 +240,11 @@ pub static PGS_BUFFER_PARTITIONING: GucSetting<Option<std::ffi::CString>> =
 /// the foreign table into a local shadow table, then computes EXCEPT ALL
 /// deltas against the previous snapshot.
 pub static PGS_FOREIGN_TABLE_POLLING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// When `true`, materialized views referenced in DIFFERENTIAL/IMMEDIATE
+/// defining queries will be supported via a snapshot-comparison approach
+/// (same mechanism as foreign table polling).
+pub static PGS_MATVIEW_POLLING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Parallel refresh mode — controls whether the scheduler dispatches
 /// refresh work to dynamic background workers.
@@ -315,6 +330,14 @@ pub static PGS_MAX_FIXPOINT_ITERATIONS: GucSetting<i32> = GucSetting::<i32>::new
 /// When `true`, monotone cycles (those containing only safe operators)
 /// are allowed and scheduled with fixed-point iteration.
 pub static PGS_ALLOW_CIRCULAR: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// G-7: Enable tiered refresh scheduling (Hot/Warm/Cold/Frozen).
+///
+/// When enabled, per-ST `refresh_tier` controls the effective schedule
+/// multiplier. Hot (1×), Warm (2×), Cold (10×), Frozen (skip entirely).
+/// User-set via `ALTER STREAM TABLE ... SET (tier = 'warm')`.
+/// Default tier for new STs is Hot (no change in behavior).
+pub static PGS_TIERED_SCHEDULING: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
@@ -531,6 +554,18 @@ pub fn register_gucs() {
     );
 
     GucRegistry::define_int_guc(
+        c"pg_trickle.compact_threshold",
+        c"Change buffer compaction threshold (pending change row count).",
+        c"When a source table's pending changes exceed this count, compaction removes \
+           net-zero INSERT+DELETE pairs and collapses multi-change groups. Set to 0 to disable.",
+        &PGS_COMPACT_THRESHOLD,
+        0,           // min: 0 (disabled)
+        100_000_000, // max: 100M rows
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_int_guc(
         c"pg_trickle.max_grouping_set_branches",
         c"Maximum allowed grouping set branches in CUBE/ROLLUP queries.",
         c"Prevents parsing memory exhaustion during combinatorial expansion. \
@@ -585,6 +620,18 @@ pub fn register_gucs() {
            snapshot-comparison. A local shadow table stores the previous state; \
            EXCEPT ALL computes the delta on each refresh cycle.",
         &PGS_FOREIGN_TABLE_POLLING,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.matview_polling",
+        c"Enable polling-based CDC for materialized views.",
+        c"When true, materialized views in defining queries are supported via \
+           snapshot-comparison (same mechanism as foreign table polling). \
+           A local shadow table stores the previous state; EXCEPT ALL computes \
+           the delta on each refresh cycle.",
+        &PGS_MATVIEW_POLLING,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -699,6 +746,18 @@ pub fn register_gucs() {
         &PGS_MERGE_SEQSCAN_THRESHOLD,
         0.0, // min (disabled)
         1.0, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_bool_guc(
+        c"pg_trickle.tiered_scheduling",
+        c"Enable tiered refresh scheduling (Hot/Warm/Cold/Frozen).",
+        c"When enabled, per-ST refresh_tier controls the effective schedule \
+           multiplier. Hot refreshes at configured interval, Warm at 2x, \
+           Cold at 10x, Frozen skips entirely. Set per-ST tier via \
+           ALTER STREAM TABLE ... SET (tier = 'warm'). Default is off.",
+        &PGS_TIERED_SCHEDULING,
         GucContext::Suset,
         GucFlags::default(),
     );
@@ -835,6 +894,12 @@ pub fn pg_trickle_buffer_alert_threshold() -> i64 {
     PGS_BUFFER_ALERT_THRESHOLD.get() as i64
 }
 
+/// Returns the change buffer compaction threshold (row count).
+/// Returns 0 when compaction is disabled.
+pub fn pg_trickle_compact_threshold() -> i64 {
+    PGS_COMPACT_THRESHOLD.get() as i64
+}
+
 /// Returns the buffer partitioning mode: `"off"`, `"on"`, or `"auto"`.
 pub fn pg_trickle_buffer_partitioning() -> String {
     PGS_BUFFER_PARTITIONING
@@ -846,6 +911,11 @@ pub fn pg_trickle_buffer_partitioning() -> String {
 /// Returns whether foreign table polling CDC is enabled.
 pub fn pg_trickle_foreign_table_polling() -> bool {
     PGS_FOREIGN_TABLE_POLLING.get()
+}
+
+/// Returns whether materialized view polling CDC is enabled.
+pub fn pg_trickle_matview_polling() -> bool {
+    PGS_MATVIEW_POLLING.get()
 }
 
 /// Returns whether the tick watermark (CSS1) feature is enabled.
@@ -925,6 +995,11 @@ pub fn pg_trickle_max_fixpoint_iterations() -> i32 {
 /// Returns whether circular (cyclic) dependencies are allowed (CYC-4).
 pub fn pg_trickle_allow_circular() -> bool {
     PGS_ALLOW_CIRCULAR.get()
+}
+
+/// G-7: Returns whether tiered refresh scheduling is enabled.
+pub fn pg_trickle_tiered_scheduling() -> bool {
+    PGS_TIERED_SCHEDULING.get()
 }
 
 #[cfg(test)]

@@ -249,7 +249,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     topk_limit      INT,
     topk_order_by   TEXT,
     topk_offset     INT,
-    diamond_consistency TEXT NOT NULL DEFAULT 'none'
+    diamond_consistency TEXT NOT NULL DEFAULT 'atomic'
                      CHECK (diamond_consistency IN ('none', 'atomic')),
     diamond_schedule_policy TEXT NOT NULL DEFAULT 'fastest'
                      CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
@@ -261,6 +261,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     scc_id          INT,
     last_fixpoint_iterations INT,
     pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE,
+    refresh_tier    TEXT NOT NULL DEFAULT 'hot'
+                     CHECK (refresh_tier IN ('hot', 'warm', 'cold', 'frozen')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -481,7 +483,8 @@ SELECT
      FROM pgtrickle.pgt_dependencies d
      WHERE d.pgt_id = st.pgt_id AND d.source_type = 'TABLE') AS cdc_modes,
     st.scc_id,
-    st.last_fixpoint_iterations
+    st.last_fixpoint_iterations,
+    st.refresh_tier
 FROM pgtrickle.pgt_stream_tables st
 LEFT JOIN LATERAL (
     SELECT

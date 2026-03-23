@@ -2192,3 +2192,178 @@ async fn bench_concurrent_writers() {
     db.assert_st_matches_query("cw_st", "SELECT id, region, amount FROM cw_src")
         .await;
 }
+
+// ── B-2: Predicate Pushdown Performance ────────────────────────────────────
+
+/// B-2: Verify that delta predicate pushdown keeps differential refresh
+/// time proportional to delta size (not source table size) for selective
+/// queries.
+///
+/// Setup:
+/// - 100,000-row source table with a `category TEXT` column holding 100
+///   distinct category values (each category has ~1,000 rows).
+/// - Two stream tables:
+///   A) `b2_full_st`  — `SELECT * FROM b2_src`           (no WHERE, no pushdown benefit)
+///   B) `b2_filt_st`  — `SELECT * FROM b2_src WHERE category = 'cat_001'` (~1,000 rows)
+///
+/// Per cycle: 10 source rows are mutated (1% of category 'cat_001'),
+/// meaning the predicate matches the entire delta.  The pushed-down scan
+/// should read **only** the matching change-buffer rows, not all 100,000
+/// source rows.
+///
+/// Assertion: median differential refresh time for `b2_filt_st` must not
+/// exceed 3× the time for `b2_full_st` at the same delta rate. In practice,
+/// pushdown typically makes filtered refresh *faster*.
+///
+/// Run:
+/// ```bash
+/// cargo test --test e2e_bench_tests -- bench_b2_predicate_pushdown --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn bench_b2_predicate_pushdown() {
+    const ROWS: usize = 100_000;
+    const CATEGORIES: usize = 100;
+    const DELTA_ROWS: usize = 10; // rows changed per cycle
+    const WARMUP: usize = 2;
+    const CYCLES: usize = 20;
+
+    let db = E2eDb::new().await.with_extension().await;
+
+    // ── Setup ─────────────────────────────────────────────────────────
+    db.execute(
+        "CREATE TABLE b2_src (
+            id       BIGINT PRIMARY KEY,
+            category TEXT   NOT NULL,
+            value    INT    NOT NULL
+        )",
+    )
+    .await;
+
+    // Insert ROWS rows spread across CATEGORIES categories
+    db.execute(&format!(
+        "INSERT INTO b2_src \
+         SELECT g, 'cat_' || LPAD((g % {cats})::text, 3, '0'), g % 1000 \
+         FROM generate_series(1, {rows}) g",
+        cats = CATEGORIES,
+        rows = ROWS,
+    ))
+    .await;
+
+    // Unfiltered stream table (no pushdown benefit)
+    db.create_st(
+        "b2_full_st",
+        "SELECT id, category, value FROM b2_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.refresh_st("b2_full_st").await;
+
+    // Filtered stream table (predicate pushdown: only cat_001)
+    db.create_st(
+        "b2_filt_st",
+        "SELECT id, category, value FROM b2_src WHERE category = 'cat_001'",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.refresh_st("b2_filt_st").await;
+
+    // Helper: mutate DELTA_ROWS rows in cat_001
+    let mutate = |cycle: usize| {
+        let db = &db;
+        async move {
+            db.execute(&format!(
+                "UPDATE b2_src SET value = value + 1 \
+                 WHERE id IN (\
+                   SELECT id FROM b2_src WHERE category = 'cat_001' \
+                   ORDER BY id LIMIT {delta} OFFSET {offset}\
+                 )",
+                delta = DELTA_ROWS,
+                offset = (cycle * DELTA_ROWS) % (ROWS / CATEGORIES),
+            ))
+            .await;
+        }
+    };
+
+    // ── Warm-up ───────────────────────────────────────────────────────
+    for i in 0..WARMUP {
+        mutate(i).await;
+        db.refresh_st("b2_full_st").await;
+        db.refresh_st("b2_filt_st").await;
+    }
+
+    // ── Measured cycles ───────────────────────────────────────────────
+    let mut full_times: Vec<f64> = Vec::with_capacity(CYCLES);
+    let mut filt_times: Vec<f64> = Vec::with_capacity(CYCLES);
+
+    for i in 0..CYCLES {
+        mutate(WARMUP + i).await;
+
+        let t0 = Instant::now();
+        db.refresh_st("b2_full_st").await;
+        full_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+        let t1 = Instant::now();
+        db.refresh_st("b2_filt_st").await;
+        filt_times.push(t1.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // ── Report ────────────────────────────────────────────────────────
+    full_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    filt_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let median_full = full_times[CYCLES / 2];
+    let median_filt = filt_times[CYCLES / 2];
+
+    println!();
+    println!("┌─────────────────────────────────────────────────────────┐");
+    println!("│  B-2: Delta Predicate Pushdown — {ROWS} rows, {DELTA_ROWS} δ/cycle       │");
+    println!("├────────────────────────┬────────────────────────────────┤");
+    println!("│ Stream table           │  Median refresh (ms)           │");
+    println!("├────────────────────────┼────────────────────────────────┤");
+    println!(
+        "│ b2_full_st (no filter) │  {:>8.1} ms                  │",
+        median_full
+    );
+    println!(
+        "│ b2_filt_st (WHERE cat) │  {:>8.1} ms                  │",
+        median_filt
+    );
+    println!(
+        "│ Ratio filt/full        │  {:>8.2}×                    │",
+        median_filt / median_full
+    );
+    println!("└────────────────────────┴────────────────────────────────┘");
+    println!();
+
+    // Correctness: both STs must match ground truth
+    db.assert_st_matches_query(
+        "public.b2_full_st",
+        "SELECT id, category, value FROM b2_src",
+    )
+    .await;
+    db.assert_st_matches_query(
+        "public.b2_filt_st",
+        "SELECT id, category, value FROM b2_src WHERE category = 'cat_001'",
+    )
+    .await;
+
+    // B-2 gate: filtered ST must not be more than 3× slower than unfiltered.
+    // In practice pushdown makes filtered refresh faster or equivalent.
+    assert!(
+        median_filt <= median_full * 3.0,
+        "B-2 FAILED: filtered refresh ({:.1}ms) is more than 3× unfiltered ({:.1}ms) — \
+         predicate pushdown may not be active",
+        median_filt,
+        median_full,
+    );
+
+    println!(
+        "B-2 PASSED: filtered refresh {:.1}ms vs unfiltered {:.1}ms ({:.2}× ratio ≤ 3.0×)",
+        median_filt,
+        median_full,
+        median_filt / median_full
+    );
+}

@@ -318,6 +318,10 @@ pub struct StDag {
     nodes: HashMap<NodeId, DagNode>,
     /// All node IDs in the graph.
     all_nodes: HashSet<NodeId>,
+    /// C2-2: Cached topological sort result (all nodes incl. base tables).
+    /// Populated lazily on first `topological_sort_inner()` call and
+    /// invalidated when edges or nodes change.
+    cached_topo: std::cell::RefCell<Option<Vec<NodeId>>>,
 }
 
 impl StDag {
@@ -328,6 +332,7 @@ impl StDag {
             reverse_edges: HashMap::new(),
             nodes: HashMap::new(),
             all_nodes: HashSet::new(),
+            cached_topo: std::cell::RefCell::new(None),
         }
     }
 
@@ -425,11 +430,19 @@ impl StDag {
         Ok(dag)
     }
 
+    /// C2-2: Invalidate the cached topological sort.
+    ///
+    /// Must be called after any structural change to the graph.
+    fn invalidate_topo_cache(&self) {
+        *self.cached_topo.borrow_mut() = None;
+    }
+
     /// Add a stream table node to the DAG.
     pub fn add_st_node(&mut self, node: DagNode) {
         let id = node.id;
         self.all_nodes.insert(id);
         self.nodes.insert(id, node);
+        self.invalidate_topo_cache();
     }
 
     /// Add an edge from `source` to `downstream_st`.
@@ -441,6 +454,7 @@ impl StDag {
             .entry(downstream_st)
             .or_default()
             .push(source);
+        self.invalidate_topo_cache();
     }
 
     /// Remove all incoming edges for a node and replace them with new ones.
@@ -456,7 +470,8 @@ impl StDag {
                 }
             }
         }
-        // Add new incoming edges
+        self.invalidate_topo_cache();
+        // Add new incoming edges (each add_edge call also invalidates cache)
         for src in new_sources {
             self.add_edge(src, target);
         }
@@ -846,7 +861,16 @@ impl StDag {
     // ── Private helpers ─────────────────────────────────────────────────
 
     /// Kahn's algorithm: BFS topological sort.
+    ///
+    /// C2-2: Results are cached and reused until the graph structure changes.
+    /// This avoids redundant O(V+E) recomputation within the same scheduler
+    /// tick (called by both `detect_cycles` and `topological_order`).
     fn topological_sort_inner(&self) -> Result<Vec<NodeId>, PgTrickleError> {
+        // C2-2: Return cached result if available.
+        if let Some(cached) = self.cached_topo.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+
         // Compute in-degrees.
         let mut in_degree: HashMap<NodeId, usize> = HashMap::new();
         for &node in &self.all_nodes {
@@ -880,6 +904,9 @@ impl StDag {
                 }
             }
         }
+
+        // C2-2: Cache the result for subsequent calls in this tick.
+        *self.cached_topo.borrow_mut() = Some(result.clone());
 
         Ok(result)
     }
@@ -1104,6 +1131,156 @@ impl StDag {
 impl Default for StDag {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── G-8: Incremental DAG rebuild ──────────────────────────────────────────
+
+impl StDag {
+    /// G-8: Remove a stream table node and all its edges from the DAG.
+    ///
+    /// Cleans up forward edges (from this node to downstream dependents),
+    /// reverse edges (from upstream sources to this node), and removes the
+    /// node from metadata and all_nodes. Base table source nodes that become
+    /// orphaned are left in place (harmless, they don't participate in
+    /// scheduling).
+    pub fn remove_st_node(&mut self, pgt_id: i64) {
+        let node = NodeId::StreamTable(pgt_id);
+
+        // Remove forward edges: this node → downstream
+        if let Some(downstream) = self.edges.remove(&node) {
+            for d in &downstream {
+                if let Some(rev) = self.reverse_edges.get_mut(d) {
+                    rev.retain(|n| *n != node);
+                }
+            }
+        }
+
+        // Remove reverse edges: upstream → this node
+        if let Some(upstream) = self.reverse_edges.remove(&node) {
+            for u in &upstream {
+                if let Some(fwd) = self.edges.get_mut(u) {
+                    fwd.retain(|n| *n != node);
+                }
+            }
+        }
+
+        // Remove node metadata and graph membership
+        self.nodes.remove(&node);
+        self.all_nodes.remove(&node);
+        self.invalidate_topo_cache();
+    }
+
+    /// G-8: Incrementally rebuild only the affected stream tables.
+    ///
+    /// Instead of rebuilding the entire DAG from catalog O(V+E), this method:
+    /// 1. Removes old nodes/edges for each affected `pgt_id`
+    /// 2. Re-queries catalog for those specific stream tables and their deps
+    /// 3. Re-adds nodes and edges
+    /// 4. Re-resolves CALCULATED schedules
+    ///
+    /// Returns `Ok(())` on success. The caller should fall back to a full
+    /// `build_from_catalog` if this returns `Err`.
+    #[cfg(feature = "pg18")]
+    pub fn rebuild_incremental(
+        &mut self,
+        affected_ids: &[i64],
+        fallback_schedule_secs: i32,
+    ) -> Result<(), PgTrickleError> {
+        // Phase 1: Remove old nodes and edges for affected IDs.
+        for &pgt_id in affected_ids {
+            self.remove_st_node(pgt_id);
+        }
+
+        // Phase 2: Re-query catalog for only the affected stream tables.
+        Spi::connect(|client| {
+            for &pgt_id in affected_ids {
+                // Re-load this stream table's metadata (if it still exists).
+                let st_table = client
+                    .select(
+                        "SELECT pgt_id, pgt_relid, pgt_name, pgt_schema, \
+                         schedule AS schedule_secs, \
+                         status, refresh_mode, is_populated, needs_reinit \
+                         FROM pgtrickle.pgt_stream_tables \
+                         WHERE pgt_id = $1",
+                        None,
+                        &[pgt_id.into()],
+                    )
+                    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+                for row in st_table {
+                    let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+
+                    let id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
+                    let _pgt_relid = row.get::<pg_sys::Oid>(2).map_err(map_spi)?;
+                    let pgt_name = row.get::<String>(3).map_err(map_spi)?.unwrap_or_default();
+                    let pgt_schema = row.get::<String>(4).map_err(map_spi)?.unwrap_or_default();
+                    let schedule_text = row.get::<String>(5).map_err(map_spi)?;
+                    let status_str = row.get::<String>(6).map_err(map_spi)?.unwrap_or_default();
+
+                    let schedule = schedule_text.as_ref().and_then(|s| {
+                        crate::api::parse_duration(s)
+                            .ok()
+                            .map(|secs| Duration::from_secs(secs.max(0) as u64))
+                    });
+                    let status = StStatus::from_str(&status_str).unwrap_or(StStatus::Error);
+                    let effective_schedule = schedule.unwrap_or(Duration::ZERO);
+
+                    self.add_st_node(DagNode {
+                        id: NodeId::StreamTable(id),
+                        schedule,
+                        effective_schedule,
+                        name: format!("{}.{}", pgt_schema, pgt_name),
+                        status,
+                        schedule_raw: schedule_text,
+                    });
+                }
+                // If the query returns no rows, the ST was dropped and we've
+                // already removed it in Phase 1 — correct behavior.
+
+                // Re-load dependencies for this pgt_id.
+                let dep_table = client
+                    .select(
+                        "SELECT d.pgt_id, d.source_relid, d.source_type, \
+                         st.pgt_id AS source_pgt_id \
+                         FROM pgtrickle.pgt_dependencies d \
+                         LEFT JOIN pgtrickle.pgt_stream_tables st \
+                           ON st.pgt_relid = d.source_relid \
+                         WHERE d.pgt_id = $1",
+                        None,
+                        &[pgt_id.into()],
+                    )
+                    .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?;
+
+                for row in dep_table {
+                    let map_spi = |e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string());
+
+                    let dep_pgt_id = row.get::<i64>(1).map_err(map_spi)?.unwrap_or(0);
+                    let source_relid = row
+                        .get::<pg_sys::Oid>(2)
+                        .map_err(map_spi)?
+                        .unwrap_or(pg_sys::InvalidOid);
+                    let source_pgt_id = row.get::<i64>(4).map_err(map_spi)?;
+
+                    let source_node = match source_pgt_id {
+                        Some(src_pgt_id) => NodeId::StreamTable(src_pgt_id),
+                        None => NodeId::BaseTable(source_relid.to_u32()),
+                    };
+
+                    let downstream_node = NodeId::StreamTable(dep_pgt_id);
+                    self.add_edge(source_node, downstream_node);
+                }
+            }
+
+            Ok::<(), PgTrickleError>(())
+        })?;
+
+        // Phase 3: Re-resolve CALCULATED schedules.
+        // This is O(V) iterations in the worst case but typically converges
+        // in 1-2 passes since most nodes have explicit schedules.
+        self.resolve_calculated_schedule(fallback_schedule_secs);
+
+        Ok(())
     }
 }
 
@@ -3492,5 +3669,153 @@ mod tests {
         assert_eq!(levels.len(), 2);
         assert_eq!(levels[0].len(), 2); // st1 and st2 units
         assert_eq!(levels[1].len(), 1); // st3 unit
+    }
+
+    // ── C2-2: Topo sort caching tests ─────────────────────────────────
+
+    #[test]
+    fn test_topo_cache_populated_after_first_call() {
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+
+        // Cache should be empty initially.
+        assert!(dag.cached_topo.borrow().is_none());
+
+        // First call populates the cache.
+        let order1 = dag.topological_order().unwrap();
+        assert!(dag.cached_topo.borrow().is_some());
+
+        // Second call returns same result (from cache).
+        let order2 = dag.topological_order().unwrap();
+        assert_eq!(order1, order2);
+    }
+
+    #[test]
+    fn test_topo_cache_invalidated_on_add_node() {
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+
+        let _ = dag.topological_order().unwrap();
+        assert!(dag.cached_topo.borrow().is_some());
+
+        // Adding a node invalidates the cache.
+        dag.add_st_node(make_dag_node(2));
+        assert!(dag.cached_topo.borrow().is_none());
+    }
+
+    #[test]
+    fn test_topo_cache_invalidated_on_add_edge() {
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+
+        let _ = dag.topological_order().unwrap();
+        assert!(dag.cached_topo.borrow().is_some());
+
+        // Adding an edge invalidates the cache.
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+        assert!(dag.cached_topo.borrow().is_none());
+    }
+
+    // ── G-8: Remove ST node tests ────────────────────────────────────
+
+    #[test]
+    fn test_remove_st_node_basic() {
+        // base → st1 → st2
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+
+        // Before removal: st1 and st2 exist.
+        let order = dag.topological_order().unwrap();
+        assert_eq!(order.len(), 2);
+
+        // Remove st1.
+        dag.remove_st_node(1);
+
+        // st1 should be gone; st2 remains but with no upstream ST dependency.
+        let order = dag.topological_order().unwrap();
+        assert_eq!(order, vec![NodeId::StreamTable(2)]);
+        assert!(dag.get_upstream(NodeId::StreamTable(2)).is_empty());
+    }
+
+    #[test]
+    fn test_remove_st_node_nonexistent_is_noop() {
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+
+        // Removing a non-existent node is a no-op.
+        dag.remove_st_node(999);
+
+        let order = dag.topological_order().unwrap();
+        assert_eq!(order, vec![NodeId::StreamTable(1)]);
+    }
+
+    #[test]
+    fn test_remove_st_node_cleans_reverse_edges() {
+        // base → st1 → st2
+        //            → st3
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_st_node(make_dag_node(3));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(3));
+
+        dag.remove_st_node(1);
+
+        // st2 and st3 should have no upstream ST dependencies.
+        assert!(dag.get_upstream(NodeId::StreamTable(2)).is_empty());
+        assert!(dag.get_upstream(NodeId::StreamTable(3)).is_empty());
+        // Downstream of base table should be empty (st1 was removed).
+        assert!(dag.get_downstream(NodeId::BaseTable(1)).is_empty());
+    }
+
+    #[test]
+    fn test_remove_and_readd_st_node() {
+        // base → st1 → st2
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+
+        // Remove st1, then re-add with different deps.
+        dag.remove_st_node(1);
+        dag.add_st_node(make_dag_node(1));
+        dag.add_edge(NodeId::BaseTable(2), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+
+        // st1 should now depend on base(2) instead of base(1).
+        let upstream = dag.get_upstream(NodeId::StreamTable(1));
+        assert_eq!(upstream, vec![NodeId::BaseTable(2)]);
+
+        // Chain st1 → st2 should still work.
+        let order = dag.topological_order().unwrap();
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0], NodeId::StreamTable(1));
+        assert_eq!(order[1], NodeId::StreamTable(2));
+    }
+
+    #[test]
+    fn test_topo_cache_invalidated_on_remove() {
+        let mut dag = StDag::new();
+        dag.add_st_node(make_dag_node(1));
+        dag.add_st_node(make_dag_node(2));
+        dag.add_edge(NodeId::BaseTable(1), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+
+        let _ = dag.topological_order().unwrap();
+        assert!(dag.cached_topo.borrow().is_some());
+
+        dag.remove_st_node(1);
+        assert!(dag.cached_topo.borrow().is_none());
     }
 }

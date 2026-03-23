@@ -551,7 +551,7 @@ When `diamond_consistency = 'atomic'` (per-ST or via the `pg_trickle.diamond_con
 3. **If all succeed** — `RELEASE SAVEPOINT` and advance the group epoch.
 4. **If any member fails** — `ROLLBACK TO SAVEPOINT` undoes all members' changes. The failure is logged and the group retries on the next scheduler tick.
 
-With `diamond_consistency = 'none'` (default), members refresh independently in topological order — matching pre-feature behavior.
+With `diamond_consistency = 'none'`, members refresh independently in topological order — matching pre-feature behavior.
 
 #### Schedule Policy
 
@@ -588,7 +588,7 @@ Runtime behavior is controlled by a growing set of GUC (Grand Unified Configurat
 | `pg_trickle.wal_transition_timeout` | `300` | Max seconds to wait for WAL decoder catch-up during transition |
 | `pg_trickle.slot_lag_warning_threshold_mb` | `100` | Warning threshold for WAL slot retention used by `slot_lag_warning` and `health_check()` |
 | `pg_trickle.slot_lag_critical_threshold_mb` | `1024` | Critical threshold for WAL slot retention used by `check_cdc_health()` alerts |
-| `pg_trickle.diamond_consistency` | `'none'` | Diamond dependency consistency mode: `none` or `atomic` |
+| `pg_trickle.diamond_consistency` | `'atomic'` | Diamond dependency consistency mode: `atomic` or `none` |
 | `pg_trickle.diamond_schedule_policy` | `'fastest'` | Schedule policy for atomic diamond groups: `fastest` or `slowest` |
 | `pg_trickle.merge_planner_hints` | `true` | Inject `SET LOCAL` planner hints (disable nestloop, raise work_mem) before MERGE |
 | `pg_trickle.merge_work_mem_mb` | `64` | `work_mem` (MB) applied when delta exceeds 10 000 rows and planner hints enabled |

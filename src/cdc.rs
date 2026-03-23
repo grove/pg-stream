@@ -439,6 +439,116 @@ pub fn create_change_buffer_table(
     Ok(())
 }
 
+/// C-4: Compact a change buffer by eliminating net-zero pk_hash groups
+/// (INSERT followed by DELETE that cancel out) and collapsing multi-change
+/// groups to retain only the first and last entries per pk_hash.
+///
+/// Returns the number of rows deleted, or 0 if compaction was skipped
+/// (buffer below threshold or advisory lock unavailable).
+///
+/// Uses `pg_try_advisory_xact_lock` to serialise with concurrent refresh
+/// operations — if the lock cannot be acquired, compaction is skipped
+/// rather than blocking.
+///
+/// **Safety:** Uses `change_id` (the BIGSERIAL primary key) for deletion,
+/// never `ctid` which is unstable under concurrent VACUUM.
+pub fn compact_change_buffer(
+    change_schema: &str,
+    source_oid: u32,
+    prev_lsn: &str,
+    new_lsn: &str,
+) -> Result<i64, PgTrickleError> {
+    let threshold = crate::config::pg_trickle_compact_threshold();
+    if threshold <= 0 {
+        return Ok(0);
+    }
+
+    // Quick count check — skip if below threshold.
+    let pending_count: i64 = Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::bigint FROM (\
+           SELECT 1 FROM \"{schema}\".changes_{oid} \
+           WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn \
+           LIMIT {limit}\
+         ) __pgt_cnt",
+        schema = change_schema,
+        oid = source_oid,
+        limit = threshold + 1,
+    ))
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    if pending_count <= threshold {
+        return Ok(0);
+    }
+
+    // Advisory lock keyed on source OID to serialise with refresh.
+    // Use a fixed namespace offset to avoid collisions with other locks.
+    let lock_key = 0x5047_5400_i64 | (source_oid as i64);
+    let got_lock = Spi::get_one::<bool>(&format!("SELECT pg_try_advisory_xact_lock({lock_key})"))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+
+    if !got_lock {
+        pgrx::debug1!(
+            "[pg_trickle] C-4: skipping compaction for changes_{} (advisory lock busy)",
+            source_oid,
+        );
+        return Ok(0);
+    }
+
+    // Compact: remove net-zero groups (INSERT→DELETE) and intermediate rows.
+    //
+    // For each pk_hash in the pending LSN range:
+    // - If first_action='I' and last_action='D' → all rows are net no-op
+    // - For remaining groups, keep only first (rn_asc=1) and last (rn_desc=1)
+    //   rows, removing intermediates.
+    //
+    // The delta query pipeline handles 2-row groups (first + last) correctly
+    // via FIRST_VALUE/LAST_VALUE window functions.
+    let compact_sql = format!(
+        "DELETE FROM \"{schema}\".changes_{oid} \
+         WHERE change_id IN (\
+           SELECT change_id FROM (\
+             SELECT change_id, \
+                    ROW_NUMBER() OVER (PARTITION BY pk_hash ORDER BY change_id) AS rn_asc, \
+                    ROW_NUMBER() OVER (PARTITION BY pk_hash ORDER BY change_id DESC) AS rn_desc, \
+                    FIRST_VALUE(action) OVER (\
+                      PARTITION BY pk_hash ORDER BY change_id\
+                    ) AS first_act, \
+                    LAST_VALUE(action) OVER (\
+                      PARTITION BY pk_hash ORDER BY change_id \
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+                    ) AS last_act \
+             FROM \"{schema}\".changes_{oid} \
+             WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn\
+           ) __pgt_ranked \
+           WHERE (first_act = 'I' AND last_act = 'D') \
+              OR (rn_asc > 1 AND rn_desc > 1)\
+         )",
+        schema = change_schema,
+        oid = source_oid,
+    );
+
+    let deleted = Spi::connect_mut(|client| {
+        let result = client
+            .update(&compact_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(format!("C-4 compaction failed: {}", e)))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+
+    if deleted > 0 {
+        pgrx::info!(
+            "[pg_trickle] C-4: compacted changes_{} — removed {} rows ({} pending → {})",
+            source_oid,
+            deleted,
+            pending_count,
+            pending_count - deleted,
+        );
+    }
+
+    Ok(deleted)
+}
+
 /// Task 3.3: Check whether the given source table's effective refresh schedule
 /// warrants auto-partitioning (>= 30 s).
 fn should_auto_partition(source_oid: pg_sys::Oid) -> bool {
@@ -1224,7 +1334,7 @@ fn build_pk_join_condition(pk_columns: &[String]) -> String {
         .iter()
         .map(|col| {
             let qcol = col.replace('"', "\"\"");
-            format!("n.\"{qcol}\" = o.\"{qcol}\"")
+            format!("n.\"{qcol}\" IS NOT DISTINCT FROM o.\"{qcol}\"")
         })
         .collect::<Vec<_>>()
         .join(" AND ")
@@ -2040,6 +2150,87 @@ pub fn poll_foreign_table_changes(
     Ok(())
 }
 
+/// Set up polling-based CDC for a materialized view source (P2-4).
+///
+/// Identical to [`setup_foreign_table_polling`] — creates a snapshot table
+/// and change buffer so that EXCEPT ALL can compute deltas when the matview
+/// is refreshed externally.
+pub fn setup_matview_polling(
+    source_oid: pg_sys::Oid,
+    pgt_id: i64,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    let oid_u32 = source_oid.to_u32();
+
+    let already_tracked = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS(SELECT 1 FROM pgtrickle.pgt_change_tracking WHERE source_relid = $1)",
+        &[source_oid.into()],
+    )
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if !already_tracked {
+        let col_defs = resolve_source_column_defs(source_oid)?;
+
+        create_change_buffer_table(source_oid, change_schema, &col_defs)?;
+
+        let snapshot_table = format!("\"{change_schema}\".snapshot_{oid_u32}");
+        let source_table = Spi::get_one_with_args::<String>(
+            "SELECT $1::oid::regclass::text",
+            &[source_oid.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+        .ok_or_else(|| {
+            PgTrickleError::NotFound(format!("Materialized view with OID {oid_u32} not found"))
+        })?;
+
+        Spi::run(&format!(
+            "CREATE TABLE IF NOT EXISTS {snapshot_table} (LIKE {source_table} INCLUDING ALL)"
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        Spi::run(&format!(
+            "INSERT INTO {snapshot_table} SELECT * FROM {source_table}"
+        ))
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        Spi::run_with_args(
+            "INSERT INTO pgtrickle.pgt_change_tracking \
+             (source_relid, slot_name, tracked_by_pgt_ids) \
+             VALUES ($1, $2, ARRAY[$3])",
+            &[
+                source_oid.into(),
+                format!("matview_poll_{oid_u32}").as_str().into(),
+                pgt_id.into(),
+            ],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    } else {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_change_tracking \
+             SET tracked_by_pgt_ids = array_append(tracked_by_pgt_ids, $1) \
+             WHERE source_relid = $2 AND NOT ($1 = ANY(tracked_by_pgt_ids))",
+            &[pgt_id.into(), source_oid.into()],
+        )
+        .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Poll a materialized view source for changes (P2-4).
+///
+/// Identical to [`poll_foreign_table_changes`] — uses EXCEPT ALL between
+/// the current matview contents and the snapshot to detect inserts/deletes.
+pub fn poll_matview_changes(
+    source_oid: pg_sys::Oid,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    // Delegate to the same implementation — the logic is identical regardless
+    // of whether the source is a foreign table or a materialized view.
+    poll_foreign_table_changes(source_oid, change_schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2399,5 +2590,39 @@ mod tests {
         let result = filter_cdc_columns(&all, Some(&referenced), &pk);
         // Should fall back to full list because filtered set is empty.
         assert_eq!(result.len(), 2);
+    }
+
+    // ── build_pk_join_condition tests (SF-9) ────────────────────────
+
+    #[test]
+    fn test_pk_join_single_column_uses_is_not_distinct_from() {
+        let pk = vec!["id".to_string()];
+        let result = build_pk_join_condition(&pk);
+        assert!(
+            result.contains("IS NOT DISTINCT FROM"),
+            "should use IS NOT DISTINCT FROM, got: {result}"
+        );
+        assert!(result.contains(r#"n."id""#), "got: {result}");
+        assert!(result.contains(r#"o."id""#), "got: {result}");
+    }
+
+    #[test]
+    fn test_pk_join_composite_key() {
+        let pk = vec!["a".to_string(), "b".to_string()];
+        let result = build_pk_join_condition(&pk);
+        assert!(result.contains(" AND "), "got: {result}");
+        assert!(
+            result.contains(r#"n."a" IS NOT DISTINCT FROM o."a""#),
+            "got: {result}"
+        );
+        assert!(
+            result.contains(r#"n."b" IS NOT DISTINCT FROM o."b""#),
+            "got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_pk_join_empty_returns_true() {
+        assert_eq!(build_pk_join_condition(&[]), "TRUE");
     }
 }

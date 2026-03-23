@@ -118,7 +118,7 @@ pgtrickle.create_stream_table(
 | `schedule` | `text` | `'calculated'` | Refresh schedule as a Prometheus/GNU-style duration string (e.g., `'30s'`, `'5m'`, `'1h'`, `'1h30m'`, `'1d'`) **or** a cron expression (e.g., `'*/5 * * * *'`, `'@hourly'`). Use `'calculated'` for CALCULATED mode (inherits schedule from downstream dependents). |
 | `refresh_mode` | `text` | `'AUTO'` | `'AUTO'` (adaptive — uses DIFFERENTIAL when possible, falls back to FULL if the query is not differentiable), `'FULL'` (truncate and reload), `'DIFFERENTIAL'` (apply delta only — errors if the query is not differentiable), or `'IMMEDIATE'` (synchronous in-transaction maintenance via statement-level triggers). |
 | `initialize` | `bool` | `true` | If `true`, populates the table immediately via a full refresh. If `false`, creates the table empty. |
-| `diamond_consistency` | `text` | `NULL` (defaults to `'none'`) | Diamond dependency consistency mode: `'none'` (independent refresh) or `'atomic'` (SAVEPOINT-based atomic group refresh). |
+| `diamond_consistency` | `text` | `NULL` (defaults to `'atomic'`) | Diamond dependency consistency mode: `'atomic'` (SAVEPOINT-based atomic group refresh) or `'none'` (independent refresh). |
 | `diamond_schedule_policy` | `text` | `NULL` (defaults to `'fastest'`) | Schedule policy for atomic diamond groups: `'fastest'` (fire when any member is due) or `'slowest'` (fire when all are due). Set on the convergence node. |
 | `cdc_mode` | `text` | `NULL` (use `pg_trickle.cdc_mode`) | Optional per-stream-table CDC override: `'auto'`, `'trigger'`, or `'wal'`. This affects all deferred TABLE sources of the stream table. |
 | `append_only` | `bool` | `false` | When `true`, differential refreshes use a fast INSERT path instead of MERGE. Skips DELETE/UPDATE/IS DISTINCT FROM checks. If a DELETE or Update is later detected in the change buffer, the flag is automatically reverted to `false`. Not compatible with `FULL`, `IMMEDIATE`, or keyless sources. |
@@ -781,7 +781,8 @@ pgtrickle.alter_stream_table(
     diamond_schedule_policy text    DEFAULT NULL,
     cdc_mode              text      DEFAULT NULL,
     append_only           bool      DEFAULT NULL,
-    pooler_compatibility_mode bool  DEFAULT NULL
+    pooler_compatibility_mode bool  DEFAULT NULL,
+    tier                  text      DEFAULT NULL
 ) → void
 ```
 
@@ -799,6 +800,7 @@ pgtrickle.alter_stream_table(
 | `cdc_mode` | `text` | `NULL` | New requested CDC mode override (`'auto'`, `'trigger'`, or `'wal'`). Pass `NULL` to leave unchanged. |
 | `append_only` | `bool` | `NULL` | Enable or disable the append-only INSERT fast path. Pass `NULL` to leave unchanged. When `true`, rejected for FULL, IMMEDIATE, or keyless source stream tables. |
 | `pooler_compatibility_mode` | `bool` | `NULL` | Enable or disable pooler-safe mode. When `true`, prepared statements are bypassed and NOTIFY emissions are suppressed. Pass `NULL` to leave unchanged. |
+| `tier` | `text` | `NULL` | Refresh tier for tiered scheduling (`'hot'`, `'warm'`, `'cold'`, or `'frozen'`). Only effective when `pg_trickle.tiered_scheduling` GUC is enabled. Hot (1×), Warm (2×), Cold (10×), Frozen (skip). Pass `NULL` to leave unchanged. |
 
 If you switch a stream table to `refresh_mode => 'IMMEDIATE'` while the
 cluster-wide `pg_trickle.cdc_mode` GUC is set to `'wal'`, pg_trickle logs an
@@ -844,6 +846,10 @@ SELECT pgtrickle.alter_stream_table('event_log_st', append_only => true);
 
 -- Enable pooler compatibility mode (for PgBouncer transaction mode)
 SELECT pgtrickle.alter_stream_table('order_totals', pooler_compatibility_mode => true);
+
+-- Set refresh tier (requires pg_trickle.tiered_scheduling = on)
+SELECT pgtrickle.alter_stream_table('order_totals', tier => 'warm');
+SELECT pgtrickle.alter_stream_table('archive_stats', tier => 'frozen');
 
 -- Suspend a stream table
 SELECT pgtrickle.alter_stream_table('order_totals', status => 'SUSPENDED');
@@ -2212,6 +2218,82 @@ SELECT pgtrickle.create_stream_table(
 | `TRUNCATE` on a stream table | ❌ Not supported | Use `pgtrickle.refresh_stream_table()` to reset data. |
 
 > **Tip:** The `__pgt_row_id` column is visible but should be ignored by consuming queries — it is an implementation detail used for delta `MERGE` operations.
+
+### Internal `__pgt_*` Auxiliary Columns
+
+Stream tables may contain additional hidden columns whose names begin with `__pgt_`. These are managed exclusively by the refresh engine — they are **not** part of the user-visible schema and should never be read or written by application queries.
+
+#### `__pgt_row_id` — Row identity (always present)
+
+Every stream table has a `BIGINT PRIMARY KEY` column named `__pgt_row_id`. It is a content hash of all output columns (xxHash3-128 with Fibonacci-mixing of multiple column hashes), updated by the refresh engine on every MERGE. It is used as the MERGE join key to detect inserts/updates/deletes.
+
+#### `__pgt_count` — Group multiplicity (aggregates & DISTINCT)
+
+Added when the defining query contains `GROUP BY`, `DISTINCT`, `UNION ALL ... GROUP BY`, or any aggregate expression that requires tracking how many source rows contribute to each output row.
+
+| Type | Triggers |
+|------|---------|
+| `BIGINT NOT NULL DEFAULT 0` | `GROUP BY`, `DISTINCT`, `COUNT(*)`, `SUM(...)`, `AVG(...)`, `STDDEV(...)`, `VAR(...)`, `UNION` deduplication |
+
+#### `__pgt_count_l` / `__pgt_count_r` — Dual multiplicity (INTERSECT / EXCEPT)
+
+Added when the defining query contains `INTERSECT` or `EXCEPT`. Stores independently the left-branch and right-branch row counts for Z-set delta algebra.
+
+| Type | Triggers |
+|------|---------|
+| `BIGINT NOT NULL DEFAULT 0` each | `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL` |
+
+#### `__pgt_aux_sum_<alias>` / `__pgt_aux_count_<alias>` — Running totals for AVG
+
+Pairs of auxiliary columns added for each `AVG(expr)` in the query. Instead of recomputing the average from scratch on each delta, the refresh engine maintains a running sum and count and derives the average algebraically.
+
+| Type | Triggers |
+|------|---------|
+| `NUMERIC NOT NULL DEFAULT 0` (sum), `BIGINT NOT NULL DEFAULT 0` (count) | Any `AVG(expr)` in `GROUP BY` query |
+
+Named `__pgt_aux_sum_<output_alias>` and `__pgt_aux_count_<output_alias>`, where `<output_alias>` is the column alias for the `AVG` expression in the SELECT list.
+
+#### `__pgt_aux_sum2_<alias>` — Sum-of-squares for STDDEV / VARIANCE
+
+Added alongside the sum/count pair when the query contains `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, or `VAR_SAMP`. Enables O(1) algebraic computation of variance from the Welford identity.
+
+| Type | Triggers |
+|------|---------|
+| `NUMERIC NOT NULL DEFAULT 0` | `STDDEV(...)`, `STDDEV_POP(...)`, `STDDEV_SAMP(...)`, `VARIANCE(...)`, `VAR_POP(...)`, `VAR_SAMP(...)` |
+
+#### `__pgt_aux_sumx_*` / `__pgt_aux_sumy_*` / `__pgt_aux_sumxy_*` / `__pgt_aux_sumx2_*` / `__pgt_aux_sumy2_*` — Cross-product accumulators for regression aggregates
+
+Five auxiliary columns per aggregate, used for O(1) algebraic maintenance of the twelve PostgreSQL regression and correlation aggregates.
+
+| Type | Triggers |
+|------|---------|
+| `NUMERIC NOT NULL DEFAULT 0` (five columns per aggregate) | `CORR(Y,X)`, `COVAR_POP(Y,X)`, `COVAR_SAMP(Y,X)`, `REGR_AVGX(Y,X)`, `REGR_AVGY(Y,X)`, `REGR_COUNT(Y,X)`, `REGR_INTERCEPT(Y,X)`, `REGR_R2(Y,X)`, `REGR_SLOPE(Y,X)`, `REGR_SXX(Y,X)`, `REGR_SXY(Y,X)`, `REGR_SYY(Y,X)` |
+
+The five columns are named with base prefix `__pgt_aux_<kind>_<output_alias>` where `<kind>` is `sumx`, `sumy`, `sumxy`, `sumx2`, or `sumy2`. The shared group count is stored in the companion `__pgt_aux_count_<output_alias>` column.
+
+#### `__pgt_aux_nonnull_<alias>` — Non-NULL count for SUM + FULL OUTER JOIN
+
+Added when the query contains `SUM(expr)` inside a `FULL OUTER JOIN` aggregate. When matched rows transition to unmatched (null-padded), standard algebraic SUM would produce `0` instead of `NULL`. This counter tracks how many non-NULL argument values exist in each group; when it reaches zero the SUM is definitively `NULL` without a full rescan.
+
+| Type | Triggers |
+|------|---------|
+| `BIGINT NOT NULL DEFAULT 0` | `SUM(expr)` in a query with `FULL OUTER JOIN` at the top level |
+
+#### `__pgt_wf_<N>` — Window function lift-out (query rewrite)
+
+Added at query-rewrite time (before storage table creation) when the defining query contains window functions embedded inside larger expressions (e.g. `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN ...`). The engine lifts the window function to a synthetic inner-subquery column so the outer SELECT can reference it by alias.
+
+| Type | Triggers |
+|------|---------|
+| Inherits the window-function return type | Window function inside expression — e.g. `RANK()`, `ROW_NUMBER()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, etc. |
+
+#### `__pgt_depth` — Recursion depth counter (recursive CTE)
+
+Present only inside the DVM-generated SQL for recursive CTE queries. Used to limit unbounded recursion in semi-naive evaluation. Not added as a permanent column to the storage table.
+
+---
+
+> **Rule of thumb:** Unless you see an `ALTER TABLE` query mentioning one of these columns, they are transparent to consuming queries. Never `SELECT __pgt_*` columns in application code — their names, types, and presence may change across minor versions.
 
 ### Row-Level Security (RLS)
 

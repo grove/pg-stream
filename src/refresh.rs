@@ -109,6 +109,14 @@ thread_local! {
     static PENDING_CLEANUP: RefCell<Vec<PendingCleanup>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    // NS-3: Consecutive failure counts for deferred cleanup per source OID.
+    // Emits a WARNING after the 3rd consecutive failure so operators are
+    // alerted to persistent cleanup problems without flooding the log.
+    static CLEANUP_FAILURE_COUNTS: RefCell<std::collections::HashMap<u32, u32>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
 /// Execute any pending cleanups from previous refresh cycles.
 ///
 /// Called at the start of `execute_differential_refresh` to drain the
@@ -241,12 +249,43 @@ fn drain_pending_cleanups() {
             continue;
         }
 
+        // NS-3: record a failed cleanup attempt; warn after 3 consecutive failures.
+        let record_cleanup_failure = |oid: u32, operation: &str, msg: &str| {
+            CLEANUP_FAILURE_COUNTS.with(|m| {
+                let mut m = m.borrow_mut();
+                let count = m.entry(oid).or_insert(0);
+                *count += 1;
+                if *count >= 3 {
+                    pgrx::warning!(
+                        "[pg_trickle] Deferred cleanup {} failed {} consecutive times for \
+                         changes_{}: {}",
+                        operation,
+                        count,
+                        oid,
+                        msg
+                    );
+                } else {
+                    pgrx::debug1!(
+                        "[pg_trickle] Deferred cleanup {} failed (attempt {}): {}",
+                        operation,
+                        count,
+                        msg
+                    );
+                }
+            });
+        };
+
         if can_truncate {
-            if let Err(e) = Spi::run(&format!(
+            match Spi::run(&format!(
                 "TRUNCATE \"{schema}\".changes_{oid}",
                 schema = change_schema,
             )) {
-                pgrx::debug1!("[pg_trickle] Deferred cleanup TRUNCATE failed: {}", e);
+                Ok(()) => {
+                    CLEANUP_FAILURE_COUNTS.with(|m| {
+                        m.borrow_mut().remove(&oid);
+                    });
+                }
+                Err(e) => record_cleanup_failure(oid, "TRUNCATE", &e.to_string()),
             }
         } else {
             let delete_sql = format!(
@@ -254,8 +293,13 @@ fn drain_pending_cleanups() {
                  WHERE lsn <= '{safe_lsn}'::pg_lsn",
                 schema = change_schema,
             );
-            if let Err(e) = Spi::run(&delete_sql) {
-                pgrx::debug1!("[pg_trickle] Deferred cleanup DELETE failed: {}", e);
+            match Spi::run(&delete_sql) {
+                Ok(()) => {
+                    CLEANUP_FAILURE_COUNTS.with(|m| {
+                        m.borrow_mut().remove(&oid);
+                    });
+                }
+                Err(e) => record_cleanup_failure(oid, "DELETE", &e.to_string()),
             }
         }
     }
@@ -300,15 +344,15 @@ fn cleanup_change_buffers_by_frontier(change_schema: &str, source_oids: &[u32]) 
         }
 
         // Compute the minimum frontier LSN across ALL stream tables that
-        // depend on this source OID.  Both TABLE and FOREIGN_TABLE sources
-        // are included: FT change buffers are written by polling and must be
-        // cleaned up once all consumers have advanced their frontier past them.
+        // depend on this source OID.  TABLE, FOREIGN_TABLE, and MATVIEW sources
+        // are included: FT/matview change buffers are written by polling and must
+        // be cleaned up once all consumers have advanced their frontier past them.
         let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
             "SELECT MIN((st.frontier->'sources'->'{oid}'->>'lsn')::pg_lsn)::TEXT \
              FROM pgtrickle.pgt_stream_tables st \
              JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
              WHERE dep.source_relid = {oid} \
-               AND dep.source_type IN ('TABLE', 'FOREIGN_TABLE') \
+               AND dep.source_type IN ('TABLE', 'FOREIGN_TABLE', 'MATVIEW') \
                AND st.frontier IS NOT NULL \
                AND st.frontier->'sources'->'{oid}'->>'lsn' IS NOT NULL",
         ))
@@ -672,6 +716,52 @@ fn build_is_distinct_clause(user_cols: &[String]) -> String {
     }
 }
 
+/// B3-2: Build a USING clause with weight aggregation for cross-source
+/// deduplication.
+///
+/// Replaces the previous `DISTINCT ON (__pgt_row_id)` approach which silently
+/// discarded corrections that should be algebraically combined.  Weight
+/// aggregation correctly handles diamond-flow queries where multiple delta
+/// branches produce overlapping corrections for the same `__pgt_row_id`:
+///
+/// - Net weight > 0 → INSERT
+/// - Net weight < 0 → DELETE
+/// - Net weight = 0 → filtered out (no-op)
+///
+/// B3-3: After weight aggregation an outer `DISTINCT ON (__pgt_row_id)` step
+/// resolves the UPDATE case where PK-stable row IDs are used for joins.
+///
+/// When only a non-PK column changes (e.g. category_name), diff_project
+/// produces a D row and an I row that share the same `__pgt_row_id` (because
+/// the hash is over PK columns only).  The weight aggregation groups by
+/// `(row_id, col_list)`, so these two rows land in *different* groups and both
+/// survive the HAVING clause — giving two MERGE source rows targeting the same
+/// ST row, which PostgreSQL rejects with "MERGE command cannot affect row a
+/// second time".
+///
+/// The outer `DISTINCT ON` resolves this: for each `__pgt_row_id` that appears
+/// as both D and I, `ORDER BY … CASE WHEN action='I' THEN 0 ELSE 1 END`
+/// selects the I row (carrying the new column values).  MERGE then performs a
+/// single WHEN MATCHED … UPDATE, which is the correct semantic for a non-PK
+/// column change.
+fn build_weight_agg_using(delta_sql: &str, user_col_list: &str) -> String {
+    format!(
+        "(SELECT DISTINCT ON (\"__pgt_row_id\") \
+                \"__pgt_row_id\", \"__pgt_action\", {user_col_list} \
+         FROM (\
+             SELECT __pgt_row_id, \
+                    CASE WHEN SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) > 0 \
+                         THEN 'I' ELSE 'D' END AS __pgt_action, \
+                    {user_col_list} \
+             FROM ({delta_sql}) __raw \
+             GROUP BY __pgt_row_id, {user_col_list} \
+             HAVING SUM(CASE WHEN __pgt_action = 'I' THEN 1 ELSE -1 END) <> 0\
+         ) \"__weighted\" \
+         ORDER BY \"__pgt_row_id\", \
+                  CASE WHEN \"__pgt_action\" = 'I' THEN 0 ELSE 1 END)"
+    )
+}
+
 /// EC-06: Build a counted DELETE template for keyless sources.
 ///
 /// For keyless tables, multiple stream table rows can share the same
@@ -868,23 +958,23 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     let delta_sql_template =
         dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_result.delta_sql);
 
-    // Build the USING clause — skip DISTINCT ON when the delta is already
+    // Build the USING clause — skip deduplication when the delta is already
     // deduplicated (G-M1 optimization for scan-chain queries).
     //
     // EC-06: For keyless sources the delta is never deduplicated (multiple
-    // rows can share the same __pgt_row_id). Skip DISTINCT ON unconditionally.
+    // rows can share the same __pgt_row_id). Skip deduplication unconditionally.
+    //
+    // B3-2: For non-deduplicated deltas, use weight aggregation instead of
+    // DISTINCT ON.  Weight aggregation correctly handles diamond-flow queries
+    // where multiple delta branches produce overlapping corrections.
     let using_clause = if delta_result.is_deduplicated {
         format!("({delta_sql_template})")
     } else if st.has_keyless_source {
-        // Keyless: do NOT collapse with DISTINCT ON — duplicate row_ids are
-        // intentional (one per net insert/delete).
+        // Keyless: do NOT collapse — duplicate row_ids are intentional
+        // (one per net insert/delete).
         format!("({delta_sql_template})")
     } else {
-        format!(
-            "(SELECT DISTINCT ON (__pgt_row_id) * \
-             FROM ({delta_sql_template}) __raw \
-             ORDER BY __pgt_row_id, __pgt_action DESC)"
-        )
+        build_weight_agg_using(&delta_sql_template, &user_col_list)
     };
 
     // B-1: IS DISTINCT FROM guard to skip no-op UPDATEs.
@@ -1228,6 +1318,11 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         if !sum2_aux.is_empty() {
             eq = crate::api::inject_sum2_aux(&eq, &sum2_aux);
         }
+        // Also inject nonnull-count columns for SUM NULL-transition correction (P2-2).
+        let nonnull_aux = crate::dvm::query_nonnull_aux_columns(query);
+        if !nonnull_aux.is_empty() {
+            eq = crate::api::inject_nonnull_aux(&eq, &nonnull_aux);
+        }
         eq
     } else {
         query.clone()
@@ -1330,7 +1425,11 @@ pub fn post_full_refresh_cleanup(st: &StreamTableMeta) {
     let deps = crate::catalog::StDependency::get_for_st(st.pgt_id).unwrap_or_default();
     let source_oids: Vec<u32> = deps
         .iter()
-        .filter(|d| d.source_type == "TABLE" || d.source_type == "FOREIGN_TABLE")
+        .filter(|d| {
+            d.source_type == "TABLE"
+                || d.source_type == "FOREIGN_TABLE"
+                || d.source_type == "MATVIEW"
+        })
         .map(|d| d.source_relid.to_u32())
         .collect();
 
@@ -1369,8 +1468,8 @@ pub fn post_full_refresh_cleanup(st: &StreamTableMeta) {
     cleanup_change_buffers_by_frontier(&change_schema, &source_oids);
 }
 
-/// Poll all FOREIGN_TABLE dependencies for a stream table before selecting a
-/// new differential frontier.
+/// Poll all FOREIGN_TABLE and MATVIEW dependencies for a stream table before
+/// selecting a new differential frontier.
 ///
 /// Polling writes synthetic CDC rows into the local change buffers and updates
 /// the per-source snapshot tables. Callers must do this before capturing the
@@ -1380,9 +1479,13 @@ pub fn poll_foreign_table_sources_for_st(st: &StreamTableMeta) -> Result<(), PgT
 
     for dep in StDependency::get_for_st(st.pgt_id)?
         .into_iter()
-        .filter(|dep| dep.source_type == "FOREIGN_TABLE")
+        .filter(|dep| dep.source_type == "FOREIGN_TABLE" || dep.source_type == "MATVIEW")
     {
-        crate::cdc::poll_foreign_table_changes(dep.source_relid, &change_schema)?;
+        if dep.source_type == "FOREIGN_TABLE" {
+            crate::cdc::poll_foreign_table_changes(dep.source_relid, &change_schema)?;
+        } else {
+            crate::cdc::poll_matview_changes(dep.source_relid, &change_schema)?;
+        }
     }
 
     Ok(())
@@ -1571,7 +1674,11 @@ pub fn execute_differential_refresh(
     let catalog_source_oids: Vec<u32> = StDependency::get_for_st(st.pgt_id)
         .unwrap_or_default()
         .into_iter()
-        .filter(|dep| dep.source_type == "TABLE" || dep.source_type == "FOREIGN_TABLE")
+        .filter(|dep| {
+            dep.source_type == "TABLE"
+                || dep.source_type == "FOREIGN_TABLE"
+                || dep.source_type == "MATVIEW"
+        })
         .map(|dep| dep.source_relid.to_u32())
         .collect();
 
@@ -1623,6 +1730,22 @@ pub fn execute_differential_refresh(
     // ensuring stale change buffer rows are removed even when the
     // thread-local queue is empty.
     cleanup_change_buffers_by_frontier(&change_schema, &catalog_source_oids);
+
+    // C-4: Compact change buffers that exceed the configured threshold.
+    // This reduces delta scan overhead by eliminating net-zero changes
+    // (INSERT→DELETE pairs) and collapsing multi-change groups.
+    for &oid in &catalog_source_oids {
+        let prev_lsn = prev_frontier.get_lsn(oid);
+        let new_lsn = new_frontier.get_lsn(oid);
+        if let Err(e) = crate::cdc::compact_change_buffer(&change_schema, oid, &prev_lsn, &new_lsn)
+        {
+            pgrx::debug1!(
+                "[pg_trickle] C-4: compaction failed for changes_{}: {}",
+                oid,
+                e,
+            );
+        }
+    }
 
     let t_decision_start = Instant::now();
 
@@ -1701,7 +1824,7 @@ pub fn execute_differential_refresh(
         });
 
         if has_non_insert {
-            pgrx::info!(
+            pgrx::warning!(
                 "[pg_trickle] Append-only stream table {}.{} received DELETE/UPDATE — \
                  reverting to MERGE path.",
                 schema,
@@ -1718,6 +1841,14 @@ pub fn execute_differential_refresh(
             }
             // Flush MERGE template cache so next cycle rebuilds with MERGE path.
             crate::shmem::bump_cache_generation();
+            // NS-2: Emit NOTIFY alert so operators are informed of the revert.
+            crate::monitor::emit_alert(
+                crate::monitor::AlertEvent::AppendOnlyReverted,
+                schema,
+                name,
+                "",
+                st.pooler_compatibility_mode,
+            );
         }
     }
 
@@ -1863,7 +1994,7 @@ pub fn execute_differential_refresh(
     }
 
     if should_fallback {
-        pgrx::info!(
+        pgrx::notice!(
             "[pg_trickle] Adaptive fallback: change ratio exceeds threshold {:.0}% — using FULL refresh",
             max_ratio * 100.0,
         );
@@ -2107,16 +2238,14 @@ pub fn execute_differential_refresh(
             dvm::get_delta_sql_template(st.pgt_id).unwrap_or(delta_sql.clone())
         };
 
-        // Build template USING clause — skip DISTINCT ON when deduplicated (G-M1)
-        // EC-06: For keyless sources, never collapse with DISTINCT ON.
+        // Build template USING clause — skip deduplication when deduplicated (G-M1)
+        // EC-06: For keyless sources, never collapse.
+        // B3-2: Use weight aggregation instead of DISTINCT ON for correctness
+        // on diamond-flow queries.
         let template_using = if is_dedup || st.has_keyless_source {
             format!("({delta_sql_template})")
         } else {
-            format!(
-                "(SELECT DISTINCT ON (__pgt_row_id) * \
-                 FROM ({delta_sql_template}) __raw \
-                 ORDER BY __pgt_row_id, __pgt_action DESC)"
-            )
+            build_weight_agg_using(&delta_sql_template, &user_col_list)
         };
 
         // ── B-1: IS DISTINCT FROM guard to skip no-op UPDATEs ───────
@@ -2860,6 +2989,7 @@ mod tests {
             scc_id: None,
             last_fixpoint_iterations: None,
             pooler_compatibility_mode: false,
+            refresh_tier: "hot".to_string(),
         }
     }
 

@@ -8,7 +8,7 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [Unreleased — v0.10.0 work-in-progress](#unreleased--v0100-work-in-progress)
+- [0.10.0 — 2026-03-23](#0100--2026-03-23)
 - [0.9.0 — 2026-03-20](#090--2026-03-20)
 - [0.8.0 — 2026-03-17](#080--2026-03-17)
 - [0.7.0 — 2026-03-16](#070--2026-03-16)
@@ -28,65 +28,211 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [Unreleased] — v0.10.0 work-in-progress
+## [0.10.0] — 2026-03-23
 
-### PgBouncer Compatibility
+The headline features of 0.10.0 are **cloud deployment compatibility**, **query
+engine correctness**, and **refresh performance**. pg_trickle now works reliably
+behind PgBouncer — the connection pooler used by default on Supabase, Railway,
+Neon, and other managed PostgreSQL platforms. A broad set of correctness issues
+in the incremental query engine are fixed. And several performance optimizations
+cut refresh time for large tables and busy deployments.
 
-- **PB1: Row-level locking replaces advisory locks.** The background
-  scheduler now uses `SELECT ... FOR UPDATE SKIP LOCKED` on the
-  `pgt_stream_tables` catalog row instead of `pg_advisory_lock()` /
-  `pg_advisory_unlock()` for concurrency control. This makes lock
-  acquisition transaction-scoped and fully compatible with transaction-mode
-  connection poolers. The `check_skip_needed()` probe uses a subtransaction
-  (via `Spi::connect`) so the lock is released immediately; the actual
-  refresh holds the row lock for its full duration.
+### Works Behind PgBouncer
 
-- **PB2: Per-stream-table `pooler_compatibility_mode`.** A new boolean
-  column `pooler_compatibility_mode` (default `false`) on
-  `pgt_stream_tables` controls whether a stream table operates in
-  pooler-safe mode:
-  - When `true`: prepared statements (`PREPARE`/`EXECUTE`) are bypassed
-    in the refresh engine (inline SQL used instead), and all `NOTIFY`
-    emissions (alerts, refresh completions) are suppressed for that ST.
-  - When `false` (default): behaviour is unchanged from v0.9.0.
+PgBouncer is the most popular PostgreSQL connection pooler. In "transaction
+mode" — the default setting on most cloud PostgreSQL platforms — it hands a
+fresh database connection to every transaction, which breaks anything that
+assumes the same connection stays open between calls (session locks, prepared
+statements). pg_trickle previously relied on both. This release makes pg_trickle
+work correctly in such deployments.
 
-  Set via `create_stream_table(..., pooler_compatibility_mode => true)` or
-  `alter_stream_table('name', pooler_compatibility_mode => true)`.
+- **Session locks replaced with row-level locking.** The background scheduler
+  now acquires a short-lived row-level lock on each stream table's catalog entry
+  instead of a session-level advisory lock. Row-level locks are released
+  automatically at transaction end — exactly what PgBouncer transaction mode
+  requires. If a concurrent refresh is already running for a given stream table,
+  the scheduler skips that cycle and retries, rather than blocking.
 
-- **PB3: PgBouncer E2E test suite.** New test file
-  `tests/e2e_pgbouncer_tests.rs` boots a PgBouncer container in
-  transaction-pool mode alongside the pg_trickle E2E image on a shared
-  Docker network. Tests cover: connectivity through PgBouncer, creating
-  stream tables with pooler mode, manual FULL refresh through the pooler,
-  source-change re-refresh, alter to enable pooler mode, NOTIFY
-  suppression verification, and drop through PgBouncer.
-  Run with `just test-pgbouncer`.
+- **New `pooler_compatibility_mode` option per stream table.** Setting
+  `pooler_compatibility_mode => true` when creating or altering a stream table
+  disables prepared statements and NOTIFY emissions for that table. Leave it off
+  (the default) if you're not behind a pooler — behaviour is unchanged from
+  v0.9.0.
 
-### DVM Correctness & Performance
+- **PgBouncer tested end-to-end.** A new automated test suite boots PgBouncer in
+  transaction-pool mode alongside pg_trickle and exercises the full lifecycle:
+  create, refresh, alter, drop — all through the pooler. Run with
+  `just test-pgbouncer`.
 
-- **P2-1: DRed for DIFFERENTIAL mode** — Recursive CTE stream tables in
-  DIFFERENTIAL mode no longer fall back to O(n) full recomputation when
-  rows are deleted or updated. The Delete-and-Rederive (DRed) algorithm
-  now handles mixed INSERT/DELETE/UPDATE changes in both DIFFERENTIAL
-  (ChangeBuffer) and IMMEDIATE (TransitionTable) modes via the same
-  four-phase algorithm:
-  1. Semi-naive INSERT propagation (insert new rows bottom-up)
-  2. Over-deletion cascade from ST storage (chase all transitively-derived
-     rows via the existing storage graph)
-  3. Rederivation from current source-table data (restore rows that still
-     have an alternative derivation path)
-  4. Combine inserts with net deletions
+### Query Engine Correctness Fixes
 
-  This delivers O(delta) refresh cost instead of O(n) for DELETE/UPDATE
-  workloads on recursive CTE stream tables in DIFFERENTIAL mode.
-  Notably, DRed now correctly handles computed derived columns (e.g.
-  `path = ancestor.path || ' > ' || node.name`) — all descendent paths
-  are updated when an ancestor node is renamed.
+Several SQL patterns that appeared to work correctly could produce wrong results
+silently under the incremental query engine. All of the following are now fixed:
 
-  Three new targeted E2E tests cover this scenario
-  (`test_dred_differential_update_cascades_derived_path`,
-  `test_dred_differential_reparent_updates_depth`,
-  `test_dred_differential_multi_level_path_cascade`).
+- **Recursive queries (WITH RECURSIVE) update correctly when rows are deleted.**
+  Recursive queries are used for organisation hierarchies, bill-of-materials
+  roll-ups, graph traversals, and similar structures. In DIFFERENTIAL mode,
+  deleting a row from the source previously caused a full recomputation
+  (correct, but expensive — O(n)). Now pg_trickle uses the Delete-and-Rederive
+  algorithm, updating only affected rows at O(delta) cost. Computed expressions
+  like `ancestor.path || ' > ' || node.name` update correctly when any ancestor
+  is renamed or moved.
+
+- **SUM over a FULL OUTER JOIN no longer returns 0 instead of NULL.** When
+  matched rows on both join sides transition to matched on one side only (creating
+  null-padded rows), the incremental SUM formula previously returned 0 instead of
+  NULL. pg_trickle now tracks how many non-null values exist in each group and
+  produces the correct answer without any full-group rescan.
+
+- **Multi-source delta merging is now correct for diamond-shaped queries.** A
+  "diamond" topology is when two separate paths through the dependency graph both
+  feed into the same stream table (e.g. table A → both B and C → D). Simultaneous
+  changes on both paths could previously cause some corrections to be silently
+  discarded, leaving D with wrong values. Now uses proper weight aggregation
+  (Z-set algebra) so every correction is applied. Six property-based tests verify
+  this for different diamond shapes.
+
+- **Statistical aggregates (CORR, COVAR, REGR_*) now update in constant time.**
+  All twelve SQL correlation and regression functions — `CORR`, `COVAR_POP`,
+  `COVAR_SAMP`, and the ten `REGR_*` variants — now update incrementally using
+  running totals (Welford-style accumulation) instead of rescanning the whole
+  group. Each changed row is processed once regardless of group size.
+
+- **LATERAL subqueries only re-examine correlated rows.** When data changes in
+  the inner part of a LATERAL JOIN, pg_trickle previously re-ran the subquery for
+  every row in the outer table. Now it re-runs it only for outer rows that
+  actually correlate with the changed inner data, reducing work from
+  proportional-to-table-size to proportional-to-changes.
+
+- **Materialized view sources now work in DIFFERENTIAL mode.** Stream tables
+  can use a PostgreSQL materialized view as their data source when
+  `pg_trickle.matview_polling = on` is set. Changes are detected by comparing
+  snapshots, the same mechanism used for foreign table sources.
+
+- **Six correctness bugs in the query rewriting engine fixed.** These all
+  involved edge cases in how the incremental engine translates SQL:
+  - SQL comment fragments such as `/* unsupported ... */` that were being
+    injected into generated SQL and causing runtime syntax errors are now
+    replaced with clear extension-level errors.
+  - When a column-rename step (e.g. `EXTRACT(year FROM orderdate) AS o_year`)
+    sits between an aggregate and its source, GROUP BY and aggregate expressions
+    now resolve correctly.
+  - `EXCEPT` queries wrapped in a projection no longer silently lose their row
+    multiplicity tracking.
+  - A placeholder row identifier value of zero could collide with real row
+    hashes; changed to a sentinel value (`i64::MIN`) outside the normal hash
+    range.
+  - Empty scalar subqueries now raise a clear error instead of silently
+    emitting NULL.
+
+- **Change capture (CDC) fixes.** The UPDATE trigger now correctly handles rows
+  with NULL values in their primary key columns (previously those rows were
+  silently dropped from the change buffer). WAL logical replication publications
+  are automatically rebuilt when a source table is converted to partitioned after
+  the publication was set up — previously this caused the stream table to silently
+  stop updating. TRUNCATE followed by INSERT is handled atomically so
+  post-TRUNCATE inserts are never lost.
+
+### Faster Refreshes
+
+- **Automatic covering index on stream table row IDs.** Stream tables with eight
+  or fewer output columns now automatically get a covering index with `INCLUDE
+  (col1, col2, ...)` on the internal `__pgt_row_id` column. This lets the MERGE
+  step use index-only scans — no heap lookups for matched rows — reducing refresh
+  time by roughly 20–50% in small-delta / large-table scenarios.
+
+- **Change buffer compaction.** When the pending change buffer grows beyond
+  `pg_trickle.compact_threshold` (default 100,000 rows), pg_trickle compacts it
+  before the next refresh cycle. INSERT→DELETE pairs that cancel each other out
+  are eliminated; multiple sequential changes to the same row are collapsed to a
+  single net change. Reduces delta scan overhead by 50–90% for high-churn tables.
+  Uses `change_id` (not `ctid`) for safe operation under concurrent VACUUM.
+
+- **Tiered refresh scheduling.** Large deployments can assign stream tables to
+  one of four tiers: Hot (refresh at the configured interval), Warm (2× interval),
+  Cold (10× interval), or Frozen (skip until manually promoted). Gate the feature
+  with `pg_trickle.tiered_scheduling = on` (default off). Set per stream table
+  via `ALTER STREAM TABLE ... SET (tier => 'warm')`. Frozen stream tables are
+  entirely skipped by the scheduler until you promote them.
+
+- **Incremental dependency-graph updates.** When a stream table is created,
+  altered, or dropped, the internal dependency graph now updates only the affected
+  entries instead of rebuilding the entire graph from scratch. Reduces the latency
+  impact of DDL operations from roughly 50 ms to roughly 1 ms in deployments with
+  1,000+ stream tables.
+
+- **Smarter topo-sort caching inside a scheduler tick.** The ordering in which
+  stream tables are refreshed (topological order through the dependency graph) is
+  now computed once per scheduler tick and reused across all internal callers,
+  eliminating redundant work.
+
+### Better Visibility Into What pg_trickle Is Doing
+
+Several behaviours that previously happened silently now produce a short,
+actionable message at the moment they occur:
+
+- **`ORDER BY` without `LIMIT` warns you at creation time.** Adding `ORDER BY`
+  to a stream table's defining query without also adding `LIMIT` has no effect:
+  stream table storage has no guaranteed row order. pg_trickle now emits a
+  `WARNING` pointing you toward the TopK pattern or suggesting you remove the
+  `ORDER BY`.
+
+- **`append_only` mode reversions are visible.** When pg_trickle automatically
+  exits append-only mode (because deletions or updates were detected in the
+  source), the notice is now emitted at `WARNING` level (was `INFO`, normally
+  suppressed) and also dispatched as a `pgtrickle_alert` notification.
+
+- **Cleanup failures escalate after 3 consecutive attempts.** If the background
+  worker fails to clean up a source table 3 times in a row, the message is
+  promoted from `DEBUG1` (normally invisible) to `WARNING` so it appears in the
+  server log.
+
+- **Diamond dependency with `diamond_consistency='none'` now advises you.** When
+  you create a stream table that forms a diamond in the dependency graph and
+  explicitly set `diamond_consistency='none'`, a `NOTICE` advises you to consider
+  `diamond_consistency='atomic'` for consistent cross-branch reads.
+
+- **`diamond_consistency` now defaults to `'atomic'`.** New stream tables get
+  atomic group semantics by default, meaning all branches of a diamond are
+  refreshed together in a single savepoint before the convergence node is
+  updated. This prevents a read from the convergence node seeing one branch
+  partially updated and the other stale. To restore the old independent behavior,
+  pass `diamond_consistency => 'none'` explicitly.
+
+- **Adaptive fallback is visible at the default log level.** When a differential
+  refresh falls back to a full refresh because the delta is too large, the
+  message is now emitted at `NOTICE` level (the default `client_min_messages`
+  threshold) instead of `INFO` (usually suppressed in the client session).
+
+- **`CALCULATED` schedule without downstream dependents warns you.** When a
+  stream table is created with `schedule='calculated'` but no existing stream
+  table references it as a downstream dependent, a `NOTICE` explains that the
+  schedule will fall back to `pg_trickle.default_schedule_seconds`.
+
+- **Internal `__pgt_*` auxiliary columns are now documented.** The hidden
+  columns that the refresh engine may add to stream table physical storage are
+  described in a new section of [SQL_REFERENCE.md](docs/SQL_REFERENCE.md). This
+  covers all variants from the always-present `__pgt_row_id` primary key through
+  the aggregate-specific auxiliary columns for AVG, STDDEV, CORR, COVAR, REGR_*,
+  window functions, and recursive CTE depth.
+
+### Upgrade Notes
+
+- **New catalog columns.** The `0.9.0 → 0.10.0` upgrade migration adds
+  `pooler_compatibility_mode BOOLEAN` and `refresh_tier TEXT` to
+  `pgt_stream_tables`. Run `ALTER EXTENSION pg_trickle UPDATE TO '0.10.0'`
+  after replacing the extension files. Verification script:
+  `scripts/check_upgrade_completeness.sh`.
+
+- **Hidden auxiliary columns for statistical aggregates.** Stream tables using
+  `CORR`, `COVAR_POP`, `COVAR_SAMP`, or any `REGR_*` aggregate will get hidden
+  `__pgt_aux_*` columns when created or altered under 0.10.0. These are
+  invisible to normal queries (excluded by the `NOT LIKE '__pgt_%'` convention)
+  and managed automatically.
+
+- **`pooler_compatibility_mode` is off by default.** Existing stream tables are
+  unaffected. Enable it only for stream tables accessed through PgBouncer
+  transaction-mode pooling.
 
 ---
 

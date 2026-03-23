@@ -9,6 +9,86 @@ mod e2e;
 
 use e2e::E2eDb;
 
+/// PB1: Verify that concurrent `refresh_stream_table()` calls on the same ST
+/// use `SELECT ... FOR UPDATE SKIP LOCKED` correctly:
+///
+/// - Exactly one caller acquires the row lock and runs the refresh.
+/// - The other caller observes the lock is held, logs a "skipping — catalog
+///   row locked" message, and returns immediately without corrupting data.
+/// - After both calls complete, the stream table contents are correct.
+///
+/// Implementation note: we cannot deterministically observe *which* call
+/// dropped (the scheduler logs to the server log, not to the client), but
+/// we can assert correctness (no duplicates, no data loss) and the absence
+/// of errors from either concurrent call.
+#[tokio::test]
+async fn test_pb1_concurrent_refresh_skip_locked_no_corruption() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE pb1_src (id INT PRIMARY KEY, val INT)")
+        .await;
+    // 500 rows so a refresh takes a measurable amount of time (long enough
+    // that two concurrent callers overlap on a slow CI machine).
+    db.execute("INSERT INTO pb1_src SELECT g, g*10 FROM generate_series(1, 500) g")
+        .await;
+
+    db.create_st(
+        "pb1_st",
+        "SELECT id, val FROM pb1_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Initial refresh to populate the ST
+    db.refresh_st("pb1_st").await;
+    assert_eq!(db.count("public.pb1_st").await, 500);
+
+    // Add 100 more rows so a refresh actually does work
+    db.execute("INSERT INTO pb1_src SELECT g, g*10 FROM generate_series(501, 600) g")
+        .await;
+
+    // Fire two concurrent refresh calls from separate connections.
+    // We clone the pool so each spawned task holds its own connection.
+    let pool1 = db.pool.clone();
+    let pool2 = db.pool.clone();
+
+    let h1 = tokio::spawn(async move {
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('pb1_st')")
+            .execute(&pool1)
+            .await
+    });
+    let h2 = tokio::spawn(async move {
+        // Brief sleep so h1 has time to start and hold the lock first.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sqlx::query("SELECT pgtrickle.refresh_stream_table('pb1_st')")
+            .execute(&pool2)
+            .await
+    });
+
+    let (r1, r2) = tokio::join!(h1, h2);
+
+    // Neither call should return a Rust/task-level error
+    r1.expect("task1 panicked")
+        .expect("refresh 1 returned DB error");
+    r2.expect("task2 panicked")
+        .expect("refresh 2 returned DB error");
+
+    // After both calls: ST must exactly match the source — no duplicates,
+    // no stale rows.  The skipped call will leave some rows temporarily
+    // un-refreshed; a third explicit refresh ensures convergence.
+    db.refresh_st("pb1_st").await;
+
+    let count = db.count("public.pb1_st").await;
+    assert_eq!(
+        count, 600,
+        "ST must contain exactly 600 rows after concurrent refresh + stabilising refresh"
+    );
+
+    db.assert_st_matches_query("public.pb1_st", "SELECT id, val FROM pb1_src")
+        .await;
+}
+
 #[tokio::test]
 async fn test_concurrent_inserts_during_refresh() {
     let db = E2eDb::new().await.with_extension().await;

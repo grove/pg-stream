@@ -74,6 +74,10 @@ pub struct StreamTableMeta {
     /// stream table and suppresses `NOTIFY` emissions, enabling compatibility
     /// with PgBouncer transaction-mode pooling.
     pub pooler_compatibility_mode: bool,
+    /// G-7: Refresh tier for tiered scheduling (hot/warm/cold/frozen).
+    /// Controls the effective schedule multiplier when
+    /// `pg_trickle.tiered_scheduling` is enabled.
+    pub refresh_tier: String,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -234,7 +238,8 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -261,7 +266,8 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -293,7 +299,8 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -320,7 +327,8 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -351,7 +359,8 @@ impl StreamTableMeta {
                      auto_threshold, last_full_ms, functions_used, topk_limit, topk_order_by, \
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
-                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode \
+                     scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -633,6 +642,17 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// G-7: Update the refresh tier for a stream table.
+    pub fn update_refresh_tier(pgt_id: i64, tier: &str) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET refresh_tier = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[tier.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the SCC identifier for a stream table (CYC-3).
     ///
     /// `scc_id` — the SCC group identifier, or `None` to clear (no cycle).
@@ -823,6 +843,10 @@ impl StreamTableMeta {
         let scc_id = table.get::<i32>(27).map_err(map_spi)?;
         let last_fixpoint_iterations = table.get::<i32>(28).map_err(map_spi)?;
         let pooler_compatibility_mode = table.get::<bool>(29).map_err(map_spi)?.unwrap_or(false);
+        let refresh_tier = table
+            .get::<String>(30)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "hot".into());
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -854,6 +878,7 @@ impl StreamTableMeta {
             scc_id,
             last_fixpoint_iterations,
             pooler_compatibility_mode,
+            refresh_tier,
         })
     }
 
@@ -940,6 +965,10 @@ impl StreamTableMeta {
         let scc_id = row.get::<i32>(27).map_err(map_spi)?;
         let last_fixpoint_iterations = row.get::<i32>(28).map_err(map_spi)?;
         let pooler_compatibility_mode = row.get::<bool>(29).map_err(map_spi)?.unwrap_or(false);
+        let refresh_tier = row
+            .get::<String>(30)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "hot".into());
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -971,6 +1000,7 @@ impl StreamTableMeta {
             scc_id,
             last_fixpoint_iterations,
             pooler_compatibility_mode,
+            refresh_tier,
         })
     }
 }

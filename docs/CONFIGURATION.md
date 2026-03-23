@@ -25,12 +25,14 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.merge\_work\_mem\_mb](#pg_tricklemerge_work_mem_mb)
     - [pg\_trickle.merge\_seqscan\_threshold](#pg_tricklemerge_seqscan_threshold)
     - [pg\_trickle.auto\_backoff](#pg_trickleauto_backoff)
+    - [pg\_trickle.tiered\_scheduling](#pg_trickletiered_scheduling)
     - [pg\_trickle.cleanup\_use\_truncate](#pg_tricklecleanup_use_truncate)
     - [pg\_trickle.use\_prepared\_statements](#pg_trickleuse_prepared_statements)
     - [pg\_trickle.user\_triggers](#pg_trickleuser_triggers)
   - [Guardrails & Limits](#guardrails--limits)
     - [pg\_trickle.block\_source\_ddl](#pg_trickleblock_source_ddl)
     - [pg\_trickle.buffer\_alert\_threshold](#pg_tricklebuffer_alert_threshold)
+    - [pg\_trickle.compact\_threshold](#pg_tricklecompact_threshold)
     - [pg\_trickle.max\_grouping\_set\_branches](#pg_tricklemax_grouping_set_branches)
     - [pg\_trickle.ivm\_topk\_max\_limit](#pg_trickleivm_topk_max_limit)
     - [pg\_trickle.ivm\_recursive\_max\_depth](#pg_trickleivm_recursive_max_depth)
@@ -480,6 +482,88 @@ SET pg_trickle.auto_backoff = on;
 
 ---
 
+### pg_trickle.tiered_scheduling
+
+Enable tiered refresh scheduling (Hot/Warm/Cold/Frozen) for stream tables.
+
+| Property | Value |
+|---|---|
+| Type | `bool` |
+| Default | `off` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When enabled, the scheduler applies a per-stream-table refresh tier multiplier
+to duration-based schedules. Each stream table has a `refresh_tier` column
+(default `'hot'`) that controls how often it is refreshed relative to its
+configured schedule:
+
+| Tier | Multiplier | Effect |
+|------|-----------|--------|
+| `hot` | 1× | Refresh at configured schedule (default) |
+| `warm` | 2× | Refresh at 2× the configured interval |
+| `cold` | 10× | Refresh at 10× the configured interval |
+| `frozen` | skip | Never refreshed until manually promoted |
+
+Cron-based schedules are not affected by the tier multiplier.
+
+Set the tier via:
+```sql
+SELECT pgtrickle.alter_stream_table('my_table', tier => 'warm');
+SELECT pgtrickle.alter_stream_table('my_table', tier => 'frozen');
+```
+
+**Design note:** Tiers are user-assigned only. Automatic classification from
+`pg_stat_user_tables` was rejected because pg_trickle's own MERGE scans
+pollute the read counters, making auto-classification unreliable.
+
+---
+
+### Diamond Schedule Policy (per-stream-table)
+
+Controls how the scheduler fires diamond consistency groups — sets of stream
+tables that share upstream sources through a diamond-shaped DAG topology.
+
+| Property | Value |
+|---|---|
+| Column | `diamond_schedule_policy` in `pgt_stream_tables` |
+| Values | `'fastest'` (default), `'slowest'` |
+| Set via | `create_stream_table(..., diamond_schedule_policy => 'slowest')` |
+| Alter via | `alter_stream_table('name', diamond_schedule_policy => 'slowest')` |
+
+Only meaningful when `diamond_consistency = 'atomic'` is also set.
+
+**`fastest` (default):** The atomic group fires when **any** member is due.
+This maximizes freshness but can cause CPU multiplication. In an asymmetric
+diamond where stream table B refreshes every 1 s and stream table C every 5 s,
+both feeding D with `diamond_consistency = 'atomic'`: C refreshes **5× more
+often than its schedule** because B triggers the group every second. For N
+members with schedules S₁ < S₂ < … < Sₙ, the total refresh count is
+N × (cycle_time / S₁), meaning slower members do up to Sₙ/S₁ times more work
+than their schedule implies.
+
+**`slowest`:** The atomic group fires only when **all** members are due.
+This minimizes CPU cost at the expense of freshness — faster members are held
+back until the slowest member's schedule fires.
+
+**Tuning Guidance:**
+- Use `'fastest'` when freshness of the diamond tip matters and the cost of
+  extra refreshes is acceptable.
+- Use `'slowest'` when CPU budget is tight or members have very different
+  schedules (e.g., 1 s vs 60 s) and the multiplication would be excessive.
+
+```sql
+-- Create with slowest policy to avoid CPU multiplication
+SELECT pgtrickle.create_stream_table(
+    'my_diamond_tip',
+    'SELECT ... FROM a JOIN b ...',
+    diamond_consistency => 'atomic',
+    diamond_schedule_policy => 'slowest'
+);
+```
+
+---
+
 ### pg_trickle.use_prepared_statements
 
 Use SQL `PREPARE` / `EXECUTE` for MERGE statements during differential refresh.
@@ -585,6 +669,29 @@ lower for small tables.
 
 ```sql
 SET pg_trickle.buffer_alert_threshold = 500000;
+```
+
+---
+
+### pg_trickle.compact_threshold
+
+When a source table's pending change buffer exceeds this many rows,
+compaction is triggered before the next refresh cycle. Compaction eliminates
+net-zero INSERT+DELETE pairs (rows inserted then deleted within the same
+refresh window) and collapses multi-change groups to first+last rows per
+`pk_hash`, reducing delta scan overhead by 50–90% for high-churn tables.
+
+Set to `0` to disable compaction.
+
+**Default:** `100000` (100K rows)  
+**Range:** `0` – `100000000`
+
+```sql
+-- Trigger compaction at 50K pending rows
+SET pg_trickle.compact_threshold = 50000;
+
+-- Disable compaction
+SET pg_trickle.compact_threshold = 0;
 ```
 
 ---
@@ -865,6 +972,7 @@ pg_trickle.user_triggers = 'auto'
 # Guardrails & limits
 pg_trickle.block_source_ddl = false
 pg_trickle.buffer_alert_threshold = 1000000
+pg_trickle.compact_threshold = 100000
 pg_trickle.max_grouping_set_branches = 64
 pg_trickle.ivm_topk_max_limit = 1000
 pg_trickle.ivm_recursive_max_depth = 100
