@@ -11,6 +11,91 @@ use e2e::E2eDb;
 
 // ── Trigger Capture Tests ──────────────────────────────────────────────
 
+/// SF-10: TRUNCATE on a source table followed by new INSERTs before the
+/// next scheduler tick must not drop the post-TRUNCATE rows.
+///
+/// The change buffer captures a `'T'` (TRUNCATE) marker. When the refresh
+/// engine sees the marker it falls back to `execute_full_refresh()`, which
+/// re-reads the source table directly (not the change buffer). The
+/// post-TRUNCATE INSERTs are therefore captured by the FULL snapshot,
+/// and the change buffer is discarded atomically in the same transaction.
+///
+/// Exit criterion: after TRUNCATE + INSERT + refresh, the stream table
+/// contains *only* the post-TRUNCATE rows.
+#[tokio::test]
+async fn test_sf10_truncate_then_insert_post_truncate_rows_captured() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE sf10_src (id INT PRIMARY KEY, val TEXT)")
+        .await;
+    // Pre-TRUNCATE rows
+    db.execute("INSERT INTO sf10_src VALUES (1, 'old_a'), (2, 'old_b'), (3, 'old_c')")
+        .await;
+
+    db.create_st(
+        "sf10_st",
+        "SELECT id, val FROM sf10_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Initial refresh — stream table should have 3 rows
+    db.refresh_st("sf10_st").await;
+    assert_eq!(
+        db.count("public.sf10_st").await,
+        3,
+        "Initial state: 3 rows expected"
+    );
+
+    // TRUNCATE the source and immediately insert new rows — both operations
+    // happen before the next scheduler tick, simulating the race window
+    // described in SF-10.
+    db.execute("TRUNCATE sf10_src").await;
+    db.execute("INSERT INTO sf10_src VALUES (10, 'new_x'), (20, 'new_y')")
+        .await;
+
+    // Refresh — the engine must detect the 'T' marker and do a full snapshot
+    db.refresh_st("sf10_st").await;
+
+    let count = db.count("public.sf10_st").await;
+    assert_eq!(
+        count, 2,
+        "Stream table must contain exactly the post-TRUNCATE rows"
+    );
+
+    // Old rows must be gone
+    let old_present: bool = db
+        .query_scalar("SELECT EXISTS(SELECT 1 FROM public.sf10_st WHERE id IN (1,2,3))")
+        .await;
+    assert!(
+        !old_present,
+        "Pre-TRUNCATE rows (ids 1,2,3) must not appear in the stream table"
+    );
+
+    // New rows must be present
+    let new_x: Option<String> = db
+        .query_scalar_opt("SELECT val FROM public.sf10_st WHERE id = 10")
+        .await;
+    assert_eq!(
+        new_x.as_deref(),
+        Some("new_x"),
+        "Post-TRUNCATE row id=10 must be present"
+    );
+    let new_y: Option<String> = db
+        .query_scalar_opt("SELECT val FROM public.sf10_st WHERE id = 20")
+        .await;
+    assert_eq!(
+        new_y.as_deref(),
+        Some("new_y"),
+        "Post-TRUNCATE row id=20 must be present"
+    );
+
+    // Final ground-truth check: ST contents must exactly match the source
+    db.assert_st_matches_query("public.sf10_st", "SELECT id, val FROM sf10_src")
+        .await;
+}
+
 #[tokio::test]
 async fn test_trigger_captures_insert() {
     let db = E2eDb::new().await.with_extension().await;
