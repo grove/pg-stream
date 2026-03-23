@@ -2219,6 +2219,82 @@ SELECT pgtrickle.create_stream_table(
 
 > **Tip:** The `__pgt_row_id` column is visible but should be ignored by consuming queries — it is an implementation detail used for delta `MERGE` operations.
 
+### Internal `__pgt_*` Auxiliary Columns
+
+Stream tables may contain additional hidden columns whose names begin with `__pgt_`. These are managed exclusively by the refresh engine — they are **not** part of the user-visible schema and should never be read or written by application queries.
+
+#### `__pgt_row_id` — Row identity (always present)
+
+Every stream table has a `BIGINT PRIMARY KEY` column named `__pgt_row_id`. It is a content hash of all output columns (xxHash3-128 with Fibonacci-mixing of multiple column hashes), updated by the refresh engine on every MERGE. It is used as the MERGE join key to detect inserts/updates/deletes.
+
+#### `__pgt_count` — Group multiplicity (aggregates & DISTINCT)
+
+Added when the defining query contains `GROUP BY`, `DISTINCT`, `UNION ALL ... GROUP BY`, or any aggregate expression that requires tracking how many source rows contribute to each output row.
+
+| Type | Triggers |
+|------|---------|
+| `BIGINT NOT NULL DEFAULT 0` | `GROUP BY`, `DISTINCT`, `COUNT(*)`, `SUM(...)`, `AVG(...)`, `STDDEV(...)`, `VAR(...)`, `UNION` deduplication |
+
+#### `__pgt_count_l` / `__pgt_count_r` — Dual multiplicity (INTERSECT / EXCEPT)
+
+Added when the defining query contains `INTERSECT` or `EXCEPT`. Stores independently the left-branch and right-branch row counts for Z-set delta algebra.
+
+| Type | Triggers |
+|------|---------|
+| `BIGINT NOT NULL DEFAULT 0` each | `INTERSECT`, `INTERSECT ALL`, `EXCEPT`, `EXCEPT ALL` |
+
+#### `__pgt_aux_sum_<alias>` / `__pgt_aux_count_<alias>` — Running totals for AVG
+
+Pairs of auxiliary columns added for each `AVG(expr)` in the query. Instead of recomputing the average from scratch on each delta, the refresh engine maintains a running sum and count and derives the average algebraically.
+
+| Type | Triggers |
+|------|---------|
+| `NUMERIC NOT NULL DEFAULT 0` (sum), `BIGINT NOT NULL DEFAULT 0` (count) | Any `AVG(expr)` in `GROUP BY` query |
+
+Named `__pgt_aux_sum_<output_alias>` and `__pgt_aux_count_<output_alias>`, where `<output_alias>` is the column alias for the `AVG` expression in the SELECT list.
+
+#### `__pgt_aux_sum2_<alias>` — Sum-of-squares for STDDEV / VARIANCE
+
+Added alongside the sum/count pair when the query contains `STDDEV`, `STDDEV_POP`, `STDDEV_SAMP`, `VARIANCE`, `VAR_POP`, or `VAR_SAMP`. Enables O(1) algebraic computation of variance from the Welford identity.
+
+| Type | Triggers |
+|------|---------|
+| `NUMERIC NOT NULL DEFAULT 0` | `STDDEV(...)`, `STDDEV_POP(...)`, `STDDEV_SAMP(...)`, `VARIANCE(...)`, `VAR_POP(...)`, `VAR_SAMP(...)` |
+
+#### `__pgt_aux_sumx_*` / `__pgt_aux_sumy_*` / `__pgt_aux_sumxy_*` / `__pgt_aux_sumx2_*` / `__pgt_aux_sumy2_*` — Cross-product accumulators for regression aggregates
+
+Five auxiliary columns per aggregate, used for O(1) algebraic maintenance of the twelve PostgreSQL regression and correlation aggregates.
+
+| Type | Triggers |
+|------|---------|
+| `NUMERIC NOT NULL DEFAULT 0` (five columns per aggregate) | `CORR(Y,X)`, `COVAR_POP(Y,X)`, `COVAR_SAMP(Y,X)`, `REGR_AVGX(Y,X)`, `REGR_AVGY(Y,X)`, `REGR_COUNT(Y,X)`, `REGR_INTERCEPT(Y,X)`, `REGR_R2(Y,X)`, `REGR_SLOPE(Y,X)`, `REGR_SXX(Y,X)`, `REGR_SXY(Y,X)`, `REGR_SYY(Y,X)` |
+
+The five columns are named with base prefix `__pgt_aux_<kind>_<output_alias>` where `<kind>` is `sumx`, `sumy`, `sumxy`, `sumx2`, or `sumy2`. The shared group count is stored in the companion `__pgt_aux_count_<output_alias>` column.
+
+#### `__pgt_aux_nonnull_<alias>` — Non-NULL count for SUM + FULL OUTER JOIN
+
+Added when the query contains `SUM(expr)` inside a `FULL OUTER JOIN` aggregate. When matched rows transition to unmatched (null-padded), standard algebraic SUM would produce `0` instead of `NULL`. This counter tracks how many non-NULL argument values exist in each group; when it reaches zero the SUM is definitively `NULL` without a full rescan.
+
+| Type | Triggers |
+|------|---------|
+| `BIGINT NOT NULL DEFAULT 0` | `SUM(expr)` in a query with `FULL OUTER JOIN` at the top level |
+
+#### `__pgt_wf_<N>` — Window function lift-out (query rewrite)
+
+Added at query-rewrite time (before storage table creation) when the defining query contains window functions embedded inside larger expressions (e.g. `CASE WHEN ROW_NUMBER() OVER (...) = 1 THEN ...`). The engine lifts the window function to a synthetic inner-subquery column so the outer SELECT can reference it by alias.
+
+| Type | Triggers |
+|------|---------|
+| Inherits the window-function return type | Window function inside expression — e.g. `RANK()`, `ROW_NUMBER()`, `DENSE_RANK()`, `LAG()`, `LEAD()`, etc. |
+
+#### `__pgt_depth` — Recursion depth counter (recursive CTE)
+
+Present only inside the DVM-generated SQL for recursive CTE queries. Used to limit unbounded recursion in semi-naive evaluation. Not added as a permanent column to the storage table.
+
+---
+
+> **Rule of thumb:** Unless you see an `ALTER TABLE` query mentioning one of these columns, they are transparent to consuming queries. Never `SELECT __pgt_*` columns in application code — their names, types, and presence may change across minor versions.
+
 ### Row-Level Security (RLS)
 
 Stream tables follow the same RLS model as PostgreSQL's built-in
