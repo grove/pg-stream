@@ -1990,6 +1990,71 @@ action.
 
 > **Anomalous change detection subtotal: ~10–14 hours**
 
+### Correctness — EC-01 Deep Fix (≥3-Scan Join Right Subtrees)
+
+> **In plain terms:** The phantom-row-after-DELETE bug (EC-01) was fixed for join
+> children with ≤2 scan nodes on the right side. Wider join chains — TPC-H Q7, Q8,
+> Q9 all qualify — are still silently affected: when both sides of a join are deleted
+> in the same batch, the DELETE can be silently dropped. The existing EXCEPT ALL
+> snapshot strategy causes PostgreSQL to spill multi-GB temp files for deep join
+> trees, which is why the threshold exists. This work designs a fundamentally
+> different per-subtree snapshot strategy that removes the cap.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| EC01B-1 | Design and implement a per-subtree CTE-based snapshot strategy to replace EXCEPT ALL for right-side join chains with ≥3 scan nodes; remove the `join_scan_count(child) <= 2` threshold in `use_pre_change_snapshot` | 3–4 wk | [src/dvm/operators/join_common.rs](src/dvm/operators/join_common.rs) · [plans/PLAN_EDGE_CASES.md §EC-01](plans/PLAN_EDGE_CASES.md) |
+| EC01B-2 | TPC-H Q7/Q8/Q9 regression tests: combined left-DELETE + right-DELETE in same cycle; assert no phantom-row drop | 1–2d | `tests/e2e_tpch_tests.rs` |
+
+> **EC-01 deep fix subtotal: ~3–4 weeks**
+
+### CDC Write-Side Overhead Benchmark
+
+> **In plain terms:** Every INSERT/UPDATE/DELETE on a source table fires a PL/pgSQL
+> trigger that writes to the change buffer. We have never measured how much write
+> throughput this costs. These benchmarks quantify it across five scenarios (single-row,
+> bulk INSERT, bulk UPDATE, bulk DELETE, concurrent writers) and gate the decision on
+> whether to implement a `change_buffer_unlogged` GUC that could reduce WAL overhead
+> by ~20–30%.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| BENCH-W1 | Implement `tests/e2e_cdc_write_overhead_tests.rs`: compare source-only vs. source + stream table DML throughput across five scenarios; report write amplification factor | 2–3d | [PLAN_TRIGGERS_OVERHEAD.md](plans/performance/PLAN_TRIGGERS_OVERHEAD.md) |
+| BENCH-W2 | Publish results in `docs/BENCHMARK.md`; if WAL overhead > 30% of trigger cost, implement `pg_trickle.change_buffer_unlogged` GUC (`'off'` default; `'on'` unlogged; `'auto'` for high-throughput sources) | 1–2d | [PLAN_TRIGGERS_OVERHEAD.md](plans/performance/PLAN_TRIGGERS_OVERHEAD.md) |
+
+> **CDC write-side benchmark subtotal: ~3–5 days**
+
+### Differential Fuzzing (SQLancer)
+
+> **In plain terms:** SQLancer is a SQL fuzzer that generates thousands of syntactically
+> valid but structurally unusual queries and uses mathematical oracles (NoREC, TLP) to
+> prove our DVM engine produces exactly the same results as PostgreSQL's native executor.
+> Unlike hand-written tests, it explores the long tail of NULL semantics, nested
+> aggregations, and edge cases no human would write. Any backend crash or result
+> mismatch becomes a permanent regression test seed.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| SQLANCER-1 | Docker-based harness: `just sqlancer` spins up E2E container; crash-test oracle verifies that no SQLancer-generated `create_stream_table` call crashes the backend | 3–4d | [PLAN_SQLANCER.md](plans/testing/PLAN_SQLANCER.md) §Steps 1–2 |
+| SQLANCER-2 | Equivalence oracle: for each generated query Q, assert `create_stream_table` + `refresh` output equals native `SELECT` (multiset comparison); failures auto-committed as proptest regression seeds | 3–4d | [PLAN_SQLANCER.md](plans/testing/PLAN_SQLANCER.md) §Step 3 |
+| SQLANCER-3 | CI `weekly-sqlancer` job (daily schedule + manual dispatch); new proptest seed files committed on any detected correctness failure | 1–2d | [PLAN_SQLANCER.md](plans/testing/PLAN_SQLANCER.md) |
+
+> **SQLancer fuzzing subtotal: ~1–2 weeks**
+
+### Property-Based Invariant Tests (Items 5 & 6)
+
+> **In plain terms:** Items 1–4 of the property test plan are done. These two
+> remaining items add topology/scheduler stress tests (random DAG shapes with
+> multi-source branch interactions) and pure Rust unit-level properties (ordering
+> monotonicity, SCC bookkeeping correctness). Both slot into the existing proptest
+> harness and provide coverage that example-based tests cannot exhaustively explore.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| PROP-5 | Topology / scheduler stress: randomized DAG topologies with multi-source branch interactions; assert no incorrect refresh ordering or spurious suspension | 4–6d | [PLAN_TEST_PROPERTY_BASED_INVARIANTS.md](plans/testing/PLAN_TEST_PROPERTY_BASED_INVARIANTS.md) §Item 5 |
+| PROP-6 | Pure Rust DAG / scheduler helper properties: ordering invariants, monotonic metadata helpers, SCC bookkeeping edge-cases | 2–4d | [PLAN_TEST_PROPERTY_BASED_INVARIANTS.md](plans/testing/PLAN_TEST_PROPERTY_BASED_INVARIANTS.md) §Item 6 |
+
+> **Property testing subtotal: ~6–10 days**
+
 ### Async CDC — Research Spike (D-2)
 
 > **In plain terms:** A custom PostgreSQL logical decoding plugin could write changes
@@ -2054,10 +2119,14 @@ large design changes; all build on existing infrastructure.
 
 > **Performance defaults & scalability subtotal: ~5–9 weeks**
 
-> **v0.12.0 total: ~13–19 weeks + ~5–9 weeks defaults/scalability**
+> **v0.12.0 total: ~18–27 weeks + ~5–9 weeks defaults/scalability**
 
 **Exit criteria:**
 - [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers *(skip if FUSE-1–6 shipped in v0.11.0)*
+- [ ] EC01B: No phantom-row drop for ≥3-scan right-subtree joins; TPC-H Q7/Q8/Q9 DELETE regression tests pass
+- [ ] BENCH-W: Write-side overhead benchmarks published in `docs/BENCHMARK.md`; `change_buffer_unlogged` GUC implemented if WAL overhead > 30% of trigger cost
+- [ ] SQLANCER: Crash-test oracle + equivalence oracle running in weekly CI job; zero correctness mismatches on known test corpus
+- [ ] PROP-5+6: Topology stress and DAG/scheduler helper property tests pass
 - [ ] D-2 spike: prototype exists; SPI-in-commit-callback constraint validated; RFC written
 - [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
 - [ ] WAL decoder validated against PG 16–17 `pgoutput` format
@@ -2318,7 +2387,7 @@ These are not gated on 1.0 but represent the longer-term horizon.
 | v0.9.0 — Incremental Aggregate Maintenance (B-1) | ~7–9 wk | — | |
 | v0.10.0 — DVM Hardening, Connection Pooler Compat, Core Refresh Opts & Infra Prep | ~7–10d + ~26–40 wk | — | |
 | v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana, Safety Hardening & Correctness | ~7–10 wk + ~12h obs + ~14–21h defaults + ~7–12h safety + ~2–4 wk should-ship | — | |
-| v0.12.0 — Anomalous Change Detection, CDC Research & PG Backward Compat | ~13–19 wk + ~10–14h | — | |
+| v0.12.0 — Anomalous Change Detection, CDC Research & PG Backward Compat | ~18–27 wk + ~10–14h | — | |
 | v0.13.0 — Scalability Foundations & UNLOGGED Buffers | ~9–18 wk | — | |
 | v0.14.0 — Native DDL Syntax, External Test Suites & Integration | ~140–230h | — | |
 | v1.0.0 — Stable release | 18–27h | — | |
