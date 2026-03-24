@@ -8,11 +8,11 @@ FULL_E2E_LABEL_SUITE="com.pgtrickle.suite=full-e2e"
 
 usage() {
     cat <<'EOF'
-Usage: scripts/run_e2e_tests.sh <cargo test args...>
+Usage: scripts/run_e2e_tests.sh <cargo nextest args...>
 
 Examples:
   scripts/run_e2e_tests.sh --test 'e2e_*'
-  scripts/run_e2e_tests.sh --test e2e_tpch_tests -- --ignored --nocapture
+  scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture
 EOF
 }
 
@@ -55,5 +55,5 @@ trap cleanup_full_e2e_containers EXIT INT TERM
 echo "Full E2E run id: ${PGT_E2E_RUN_ID}"
 
 
-cargo test "$@" -- --test-threads=1
+cargo nextest run "$@"
 
