@@ -135,7 +135,7 @@ impl PgBouncerTestDb {
         // Default listen port is 5432.
         let pgb_container = GenericImage::new("edoburu/pgbouncer", "latest")
             .with_exposed_port(5432_u16.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("process up"))
+            .with_wait_for(WaitFor::message_on_stderr("process up"))
             .with_env_var("DB_HOST", &pg_hostname)
             .with_env_var("DB_PORT", "5432")
             .with_env_var("DB_USER", "postgres")
