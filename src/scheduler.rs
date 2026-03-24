@@ -2486,9 +2486,9 @@ fn update_backoff_factor(pgt_id: i64, backoff_factors: &mut HashMap<i64, f64>) {
 
     // Check last refresh duration from history
     let elapsed_ms: Option<i64> = Spi::get_one_with_args::<i64>(
-        "SELECT EXTRACT(EPOCH FROM (finished_at - started_at))::BIGINT * 1000 \
+        "SELECT EXTRACT(EPOCH FROM (end_time - start_time))::BIGINT * 1000 \
          FROM pgtrickle.pgt_refresh_history \
-         WHERE pgt_id = $1 AND status = 'COMPLETED' AND finished_at IS NOT NULL \
+         WHERE pgt_id = $1 AND status = 'COMPLETED' AND end_time IS NOT NULL \
          ORDER BY refresh_id DESC LIMIT 1",
         &[pgt_id.into()],
     )

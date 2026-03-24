@@ -8,7 +8,7 @@
     "pg_trickle": {
       "abstract": "Streaming tables with differential view maintenance",
       "file": "pg_trickle.control",
-      "docfile": "README.md",
+      "docfile": "doc/pg_trickle.md",
       "version": "0.10.0"
     }
   },
