@@ -10491,10 +10491,23 @@ unsafe fn parse_scalar_target_subquery(
         }
 
         let inner_select = unsafe { &*(sublink.subselect as *const pg_sys::SelectStmt) };
-        let subquery = if inner_select.op != pg_sys::SetOperation::SETOP_NONE {
-            unsafe { parse_set_operation(inner_select, cte_ctx)? }
+        // If the inner SELECT contains constructs that the DVM pipeline cannot
+        // parse fully (e.g. LIMIT/OFFSET, correlated sub-expressions with OR),
+        // fall back to `Ok(None)` so the caller's `node_to_expr` path deparsed
+        // the sublink as an opaque `Expr::Raw`.  This is safe because:
+        //   1. `extract_source_relations` uses the full PostgreSQL analyzer and
+        //      still records every inner table reference for dependency tracking.
+        //   2. The scheduler forces a FULL refresh whenever upstream stream-table
+        //      sources have newer data, so the raw-SQL expression is only exercised
+        //      for base-table-CDC differentials, where it is re-evaluated correctly
+        //      for each affected row.
+        let subquery = match if inner_select.op != pg_sys::SetOperation::SETOP_NONE {
+            unsafe { parse_set_operation(inner_select, cte_ctx) }
         } else {
-            unsafe { parse_select_stmt(inner_select, "", cte_ctx)? }
+            unsafe { parse_select_stmt(inner_select, "", cte_ctx) }
+        } {
+            Ok(tree) => tree,
+            Err(_) => return Ok(None),
         };
 
         let mut source_oids = subquery.source_oids();
@@ -10520,10 +10533,14 @@ unsafe fn parse_scalar_target_subquery(
             ));
         }
     };
-    let subquery = if inner_select.op != pg_sys::SetOperation::SETOP_NONE {
-        unsafe { parse_set_operation(inner_select, cte_ctx)? }
+    // Same graceful fallback for the raw-SQL code path.
+    let subquery = match if inner_select.op != pg_sys::SetOperation::SETOP_NONE {
+        unsafe { parse_set_operation(inner_select, cte_ctx) }
     } else {
-        unsafe { parse_select_stmt(inner_select, "", cte_ctx)? }
+        unsafe { parse_select_stmt(inner_select, "", cte_ctx) }
+    } {
+        Ok(tree) => tree,
+        Err(_) => return Ok(None),
     };
 
     let mut source_oids = subquery.source_oids();
@@ -11493,6 +11510,19 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                 let op_name = unsafe { extract_operator_name(aexpr.name)? };
                 Ok(Expr::Raw(format!(
                     "{} {op_name} ALL({})",
+                    left.to_sql(),
+                    right.to_sql()
+                )))
+            }
+            pg_sys::A_Expr_Kind::AEXPR_NULLIF => {
+                // NULLIF(a, b) — evaluates to a when a <> b, else NULL.
+                // Represented in the raw parse tree as AEXPR_NULLIF; handled
+                // here so expressions like `NULLIF(col, '')::bigint` in the
+                // SELECT list don't cause an unsupported-operator error.
+                let left = unsafe { node_to_expr(aexpr.lexpr)? };
+                let right = unsafe { node_to_expr(aexpr.rexpr)? };
+                Ok(Expr::Raw(format!(
+                    "NULLIF({}, {})",
                     left.to_sql(),
                     right.to_sql()
                 )))
