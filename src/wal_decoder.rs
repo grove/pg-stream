@@ -1372,6 +1372,19 @@ pub fn finish_wal_transition(
         Some(slot_lsn),
     )?;
 
+    // Pre-advance the slot to the current WAL position so the lag check
+    // on the next scheduler tick sees near-zero lag and completes the
+    // transition promptly.  During TRANSITIONING both triggers and the
+    // WAL decoder are active, so any changes between the slot's creation
+    // LSN and now are already captured by triggers — no data is lost.
+    if let Err(e) = advance_slot_to_current(slot_name) {
+        log!(
+            "pg_trickle: could not pre-advance slot '{}' (non-fatal): {}",
+            slot_name,
+            e
+        );
+    }
+
     info!(
         "pg_trickle: started WAL transition for source OID {} \
          (slot: {}, slot LSN: {})",
