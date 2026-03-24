@@ -11316,33 +11316,37 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             }
             2 => {
                 let table_alias = unsafe { node_to_string(fields.get_ptr(0).unwrap())? };
-                let col_name = unsafe { node_to_string(fields.get_ptr(1).unwrap())? };
-                if col_name == "*" {
-                    Ok(Expr::Star {
+                let last = fields.get_ptr(1).unwrap();
+                // `table.*` arrives as ColumnRef with fields [T_String, T_A_Star].
+                // T_A_Star is not a T_String, so node_to_string falls back to
+                // "node_T_A_Star" — check explicitly before calling it.
+                if unsafe { pgrx::is_a(last, pg_sys::NodeTag::T_A_Star) } {
+                    return Ok(Expr::Star {
                         table_alias: Some(table_alias),
-                    })
-                } else {
-                    Ok(Expr::ColumnRef {
-                        table_alias: Some(table_alias),
-                        column_name: col_name,
-                    })
+                    });
                 }
+                let col_name = unsafe { node_to_string(last)? };
+                Ok(Expr::ColumnRef {
+                    table_alias: Some(table_alias),
+                    column_name: col_name,
+                })
             }
             3 => {
                 // schema.table.column — drop the schema, use table.column
                 let _schema = unsafe { node_to_string(fields.get_ptr(0).unwrap())? };
                 let table_alias = unsafe { node_to_string(fields.get_ptr(1).unwrap())? };
-                let col_name = unsafe { node_to_string(fields.get_ptr(2).unwrap())? };
-                if col_name == "*" {
-                    Ok(Expr::Star {
+                let last = fields.get_ptr(2).unwrap();
+                // `schema.table.*` — same T_A_Star guard as the 2-field case.
+                if unsafe { pgrx::is_a(last, pg_sys::NodeTag::T_A_Star) } {
+                    return Ok(Expr::Star {
                         table_alias: Some(table_alias),
-                    })
-                } else {
-                    Ok(Expr::ColumnRef {
-                        table_alias: Some(table_alias),
-                        column_name: col_name,
-                    })
+                    });
                 }
+                let col_name = unsafe { node_to_string(last)? };
+                Ok(Expr::ColumnRef {
+                    table_alias: Some(table_alias),
+                    column_name: col_name,
+                })
             }
             n => Err(PgTrickleError::QueryParseError(format!(
                 "Unexpected ColumnRef with {n} fields",
