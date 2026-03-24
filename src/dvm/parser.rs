@@ -11492,6 +11492,36 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
                     right.to_sql()
                 )))
             }
+            pg_sys::A_Expr_Kind::AEXPR_LIKE => {
+                // [NOT] LIKE — name is "~~" (LIKE) or "!~~" (NOT LIKE).
+                let left = unsafe { node_to_expr(aexpr.lexpr)? };
+                let right = unsafe { node_to_expr(aexpr.rexpr)? };
+                let op_name = unsafe { extract_operator_name(aexpr.name) }
+                    .unwrap_or_else(|_| "~~".to_string());
+                let kw = if op_name == "!~~" { "NOT LIKE" } else { "LIKE" };
+                Ok(Expr::Raw(format!(
+                    "{} {kw} {}",
+                    left.to_sql(),
+                    right.to_sql()
+                )))
+            }
+            pg_sys::A_Expr_Kind::AEXPR_ILIKE => {
+                // [NOT] ILIKE — name is "~~*" (ILIKE) or "!~~*" (NOT ILIKE).
+                let left = unsafe { node_to_expr(aexpr.lexpr)? };
+                let right = unsafe { node_to_expr(aexpr.rexpr)? };
+                let op_name = unsafe { extract_operator_name(aexpr.name) }
+                    .unwrap_or_else(|_| "~~*".to_string());
+                let kw = if op_name == "!~~*" {
+                    "NOT ILIKE"
+                } else {
+                    "ILIKE"
+                };
+                Ok(Expr::Raw(format!(
+                    "{} {kw} {}",
+                    left.to_sql(),
+                    right.to_sql()
+                )))
+            }
             pg_sys::A_Expr_Kind::AEXPR_OP_ANY => {
                 // expr op ANY(array)
                 let left = unsafe { node_to_expr(aexpr.lexpr)? };

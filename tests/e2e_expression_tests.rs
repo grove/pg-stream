@@ -1192,6 +1192,76 @@ async fn test_nullif_in_select_auto_mode_resolves_to_differential() {
     assert_eq!(rank, Some(5), "Updated NULLIF rank should be 5");
 }
 
+/// Before the AEXPR_LIKE fix, `col LIKE '%pattern%'` in a WHERE clause caused
+/// the DVM parser to bail with "A_Expr kind AEXPR_LIKE is not supported",
+/// silently downgrading AUTO to FULL.  Verify LIKE is now handled.
+#[tokio::test]
+async fn test_like_in_where_auto_mode_resolves_to_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE like_regr_src (id INT PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO like_regr_src VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Alicia'), (4, 'Charlie')",
+    )
+    .await;
+
+    let q = "SELECT id, name FROM like_regr_src WHERE name LIKE 'Ali%'";
+
+    db.create_st("like_regr_st", q, "1m", "AUTO").await;
+
+    let (status, mode, populated, errors) = db.pgt_status("like_regr_st").await;
+    assert_eq!(status, "ACTIVE");
+    assert_eq!(
+        mode, "DIFFERENTIAL",
+        "LIKE in WHERE must not prevent DIFFERENTIAL mode (AEXPR_LIKE regression)"
+    );
+    assert!(populated);
+    assert_eq!(errors, 0);
+
+    db.assert_st_matches_query("like_regr_st", q).await;
+
+    // Incremental: insert a matching row
+    db.execute("INSERT INTO like_regr_src VALUES (5, 'Aline')")
+        .await;
+    db.refresh_st("like_regr_st").await;
+    db.assert_st_matches_query("like_regr_st", q).await;
+}
+
+/// Same as above but for ILIKE (case-insensitive LIKE).
+#[tokio::test]
+async fn test_ilike_in_where_auto_mode_resolves_to_differential() {
+    let db = E2eDb::new().await.with_extension().await;
+
+    db.execute("CREATE TABLE ilike_regr_src (id INT PRIMARY KEY, name TEXT)")
+        .await;
+    db.execute(
+        "INSERT INTO ilike_regr_src VALUES (1, 'Alice'), (2, 'bob'), (3, 'ALICE'), (4, 'Charlie')",
+    )
+    .await;
+
+    let q = "SELECT id, name FROM ilike_regr_src WHERE name ILIKE 'ali%'";
+
+    db.create_st("ilike_regr_st", q, "1m", "AUTO").await;
+
+    let (status, mode, populated, errors) = db.pgt_status("ilike_regr_st").await;
+    assert_eq!(status, "ACTIVE");
+    assert_eq!(
+        mode, "DIFFERENTIAL",
+        "ILIKE in WHERE must not prevent DIFFERENTIAL mode (AEXPR_ILIKE regression)"
+    );
+    assert!(populated);
+    assert_eq!(errors, 0);
+
+    db.assert_st_matches_query("ilike_regr_st", q).await;
+
+    // Incremental: insert a matching row (mixed case)
+    db.execute("INSERT INTO ilike_regr_src VALUES (5, 'aLiCiA')")
+        .await;
+    db.refresh_st("ilike_regr_st").await;
+    db.assert_st_matches_query("ilike_regr_st", q).await;
+}
+
 #[tokio::test]
 async fn test_expression_invalid_query_fails() {
     let db = E2eDb::new().await.with_extension().await;
