@@ -213,7 +213,7 @@ The only mandatory setting is adding pg_trickle to `shared_preload_libraries` in
 shared_preload_libraries = 'pg_trickle'
 ```
 
-All other GUC parameters have sensible defaults and can be tuned later. The PostgreSQL default of `max_worker_processes = 8` is sufficient for most deployments — pg_trickle uses one background worker per database.
+All other GUC parameters have sensible defaults and can be tuned later. However, **`max_worker_processes` often needs to be raised** from its default of 8 — see the next question.
 
 ### Can I install pg_trickle on a managed PostgreSQL service (RDS, Cloud SQL, etc.)?
 
@@ -2066,15 +2066,46 @@ partitioned tables, and multi-database deployments.
 
 ### How many background workers does pg_trickle use?
 
-pg_trickle registers **1 background worker per database** that contains stream tables. The worker is registered during `_PG_init()` (extension load) and starts automatically when PostgreSQL starts.
+pg_trickle uses a **two-tier background worker model**:
+
+1. **Launcher** (`pg_trickle launcher`) — one per cluster, static. Scans `pg_database` every ~10 seconds and spawns a per-database scheduler for every database where pg_trickle is installed. Automatically re-spawns schedulers that exit.
+2. **Per-database scheduler** (`pg_trickle scheduler`) — one dynamic worker per database with pg_trickle installed.
 
 | Component | Workers | Notes |
 |---|---|---|
-| Scheduler | 1 per database | Persistent; checks for stale STs every `scheduler_interval_ms` |
+| Launcher | 1 (static) | Cluster-wide; connects to `postgres` database |
+| Scheduler | 1 per database (dynamic) | Persistent per database; drives all refreshes |
+| Parallel refresh workers | 0–N per database | Only when `pg_trickle.parallel_refresh_mode = 'on'` |
 | WAL decoder | 0 (shared) | Shares the scheduler's SPI connection |
 | Manual refresh | 0 | Runs in the caller's session |
 
-Ensure `max_worker_processes` (default 8) has room for the pg_trickle worker plus any other extensions.
+### How do I size `max_worker_processes`?
+
+When `max_worker_processes` is too low, the launcher silently fails to spawn schedulers for some databases and retries every **5 minutes**. Those databases stop refreshing with no error in the stream table itself — you only see it in the PostgreSQL log:
+
+```
+WARNING:  pg_trickle launcher: could not spawn scheduler for database 'mydb'
+```
+
+The minimum formula:
+
+```
+max_worker_processes ≥
+  1 (pg_trickle launcher)
+  + N  (one scheduler per database with pg_trickle installed)
+  + max_dynamic_refresh_workers  (only if parallel_refresh_mode = 'on'; default 4)
+  + autovacuum_max_workers        (default 3)
+  + parallel query workers        (max_parallel_workers_per_gather × concurrent queries)
+  + slots for other extensions    (logical replication launcher, etc.)
+```
+
+A practical starting point for a cluster with a handful of databases:
+
+```ini
+max_worker_processes = 32
+```
+
+This value requires a full PostgreSQL restart (not just reload).
 
 ### How do I upgrade pg_trickle to a new version?
 
@@ -2167,7 +2198,15 @@ Key considerations:
 
 **Yes.** Each database gets its own independent scheduler background worker, its own catalog tables, and its own change buffers. Stream tables in different databases do not interact.
 
-**Resource planning:** Each database with stream tables requires 1 background worker slot in `max_worker_processes`. If you have 3 databases using pg_trickle, you need at least 3 worker slots.
+**Resource planning:** Each database with stream tables requires 1 background worker slot in `max_worker_processes`. If you have many databases, the default of 8 is easily exhausted.
+
+> **Important:** When `max_worker_processes` is exhausted, the launcher silently skips databases it cannot spawn a scheduler for and retries every **5 minutes**. This means stream tables in those databases stop refreshing with no visible error — they just go stale. Check the PostgreSQL log for:
+> ```
+> WARNING:  pg_trickle launcher: could not spawn scheduler for database 'mydb'
+> ```
+> If you see this, increase `max_worker_processes` and restart PostgreSQL.
+
+See [How do I size `max_worker_processes`?](#how-do-i-size-max_worker_processes) for the full formula.
 
 ```sql
 -- On each database where you want pg_trickle:
@@ -2495,7 +2534,10 @@ FROM pg_stat_activity
 WHERE backend_type = 'pg_trickle scheduler';
 ```
 
-If no rows are returned, the scheduler is not running. Common causes: `pg_trickle.enabled = false`, extension not in `shared_preload_libraries`, or `max_worker_processes` exhausted.
+If no rows are returned, the scheduler is not running. Common causes:
+- `pg_trickle.enabled = false`
+- Extension not in `shared_preload_libraries`
+- `max_worker_processes` exhausted — the launcher silently skips databases it cannot accommodate and retries every **5 minutes**. Check the PostgreSQL log for `WARNING: pg_trickle launcher: could not spawn scheduler for database '...'`.
 
 **2. Check recent refresh activity:**
 ```sql

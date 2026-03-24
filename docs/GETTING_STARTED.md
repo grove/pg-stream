@@ -76,6 +76,7 @@ By the end you will have:
 
 - PostgreSQL 18.x with pg_trickle installed (see [INSTALL.md](../INSTALL.md))
 - `shared_preload_libraries = 'pg_trickle'` in `postgresql.conf`
+- `max_worker_processes` raised to at least 32 (see [INSTALL.md](../INSTALL.md#postgresql-configuration)); the PostgreSQL default of 8 is often exhausted if you have several databases, causing stream tables to silently stop refreshing
 - `psql` or any SQL client
 
 > **Quick start with Docker:** If you don't have a local PostgreSQL 18 install, [INSTALL.md](../INSTALL.md) has a Docker-based setup that mounts the extension into a stock `postgres:18` container — no installation required.
