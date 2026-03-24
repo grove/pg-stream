@@ -1099,7 +1099,65 @@ result with existing infrastructure.
 
 ---
 
-## 13. References
+## 13. Related Plans and Synergies
+
+### PLAN_STRATIFICATION.md
+
+[PLAN_STRATIFICATION.md](PLAN_STRATIFICATION.md) designs explicit Datalog
+stratification for pg_trickle and has several concrete synergies with this
+plan. The two should be developed with shared infrastructure in mind:
+
+**1. Shared edge classification foundation.**
+Stratification Phase 1 builds `classify_edge_monotonicity()` — a function
+that classifies each dependency edge as monotone or non-monotone per source.
+The mutual recursion Approach B (diagnostic detection) needs the same
+analysis to determine which cross-CTE references are safe when generating
+rewrite suggestions. Building it once in Stratification Phase 1 avoids
+duplicating this logic.
+
+**2. S-1 unlocks richer decomposed patterns.**
+Stratification Feature S-1 (stratum-aware cycle validation) replaces the
+current whole-tree monotonicity check with per-edge classification. This
+directly unblocks decomposed mutual recursion patterns where individual
+stream tables use `NOT EXISTS` or `EXCEPT` against base tables outside the
+cycle. Today those patterns are rejected; with S-1 they are accepted because
+the non-monotone edge targets a lower-stratum source.
+
+Example from Section 3.4 of this plan (reach_red with `NOT EXISTS` on
+`blocked_edges`): currently rejected, allowed after S-1.
+
+**3. S-2 reduces waste during SCC convergence.**
+Decomposed mutual recursion creates a cyclic SCC plus downstream consumers.
+Stratification Feature S-2 (stratum-based scheduler skip) prevents those
+downstream consumers from running wasted refreshes while the SCC is still
+iterating to its fixed point.
+
+**4. S-3 speeds up the inner recursive CTEs.**
+Each decomposed stream table contains a `WITH RECURSIVE` CTE. If those CTEs
+use cycle elimination (`WHERE dst <> ALL(path)`) the current code falls back
+to full recomputation. Stratification Feature S-3 (stratified DRed) enables
+incremental DRed for exactly this pattern, making each outer fixed-point
+iteration faster.
+
+**5. Stratum info enriches rewrite suggestions.**
+With stratum assignment available (from Stratification Phase 1), the
+Approach B diagnostic can include concrete stratum information in its output:
+"Stream table A and B will form a cyclic SCC at stratum 0; downstream
+consumer C will be at stratum 1."
+
+**Recommended sequencing**: Build Stratification Phase 1 first, then
+implement Approach B of this plan and Stratification Phases 2–4 in parallel
+on top of the shared foundation.
+
+### PLAN_CIRCULAR_REFERENCES.md
+
+Existing plan for circular stream table dependencies — the core runtime
+mechanism (SCC detection, monotonicity validation, fixed-point iteration)
+that mutual recursion decomposition builds on.
+
+---
+
+## 14. References
 
 - Knaster-Tarski Fixed-Point Theorem: guarantees least fixed point for
   monotone functions over complete lattices.
@@ -1118,7 +1176,7 @@ result with existing infrastructure.
 
 ---
 
-## Implementation Status
+## 15. Implementation Status
 
 | Phase | Description | Status |
 |-------|-------------|--------|
