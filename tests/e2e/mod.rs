@@ -124,15 +124,29 @@ fn coverage_mount() -> Option<Mount> {
 /// found locally.  For local-only image names (like `pg_trickle_e2e`) that
 /// produces a confusing "pull access denied" 404.  This check panics early
 /// with a clear, actionable message instead.
+///
+/// Uses `docker image ls --format` rather than `docker image inspect` because
+/// on macOS Docker Desktop with the containerd image store enabled,
+/// `docker image inspect <name>:<tag>` returns exit code 1 even for images
+/// that are listed by `docker images`.  The `--format` filter approach works
+/// consistently across both classic and containerd image stores.
 async fn assert_docker_image_exists(name: &str, tag: &str) {
-    let status = tokio::process::Command::new("docker")
-        .args(["image", "inspect", &format!("{}:{}", name, tag)])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "image",
+            "ls",
+            "--format",
+            "{{.Repository}}:{{.Tag}}",
+            &format!("{}:{}", name, tag),
+        ])
+        .output()
         .await
-        .expect("Failed to run `docker image inspect` — is Docker running?");
-    if !status.success() {
+        .expect("Failed to run `docker image ls` — is Docker running?");
+    let found = std::str::from_utf8(&output.stdout)
+        .unwrap_or("")
+        .lines()
+        .any(|line| line.trim() == format!("{name}:{tag}"));
+    if !found {
         panic!(
             "Docker image {name}:{tag} not found locally.\n\
              Build it first:\n\
