@@ -761,6 +761,11 @@ Phase 4 is technically independent of Phases 2 and 3 (it operates at the
 intra-CTE level, not the inter-table level) and could be done in
 parallel.
 
+**Shared foundation with PLAN_TRULY_MUTUALLY_RECURSIVE_CTES.md**: Phase 1
+(`classify_edge_monotonicity()`, `assign_strata()`) is also required by the
+mutual recursion plan's Approach B (diagnostic detection). These plans should
+share Phase 1 implementation. See Section 15 below.
+
 ---
 
 ## 9. Testing Strategy
@@ -1007,7 +1012,58 @@ infrastructure investment is worthwhile.
 
 ---
 
-## 14. References
+## 14. Related Plans and Synergies
+
+### PLAN_TRULY_MUTUALLY_RECURSIVE_CTES.md
+
+[PLAN_TRULY_MUTUALLY_RECURSIVE_CTES.md](PLAN_TRULY_MUTUALLY_RECURSIVE_CTES.md)
+designs support for mutually recursive query patterns via decomposition into
+circular stream tables. The two plans share infrastructure and are best
+developed together:
+
+**1. Phase 1 is shared infrastructure.**
+`classify_edge_monotonicity()` and `assign_strata()` (built in Stratification
+Phase 1) are also required by the mutual recursion plan's Approach B. They
+should be built once and used by both plans.
+
+**2. S-1 directly unblocks mutual recursion patterns with negation.**
+The most compelling real-world mutual recursion patterns (graph traversal
+with blocking edges, reachability with exclusions) involve `NOT EXISTS` on
+external base tables. Today these are rejected by the whole-tree monotonicity
+check. Stratification S-1 reclassifies these as safe because the
+non-monotone edge targets a lower-stratum source outside the cycle. Resolving
+S-1 removes a major friction point for users following the mutual recursion
+decomposition pattern.
+
+**3. S-2 makes mutual recursion convergence cheaper.**
+After the mutual recursion SCC converges, downstream consumers currently
+always run change detection. S-2 skips entire downstream strata when the
+upstream SCC produced no changes, reducing per-tick overhead.
+
+**4. S-3 speeds up inner CTEs inside decomposed stream tables.**
+Decomposed stream tables commonly contain `WITH RECURSIVE` CTEs with cycle
+elimination guards (`WHERE dst <> ALL(path)`). S-3 allows DRed instead of
+full recomputation for these, making each outer fixed-point iteration
+faster.
+
+**5. Stratum info enriches mutual recursion diagnostics.**
+With `pgt_stratum_status()` (built in Phase 5), users following the mutual
+recursion tutorial can immediately see the stratum assignment of their
+decomposed stream tables and downstream consumers.
+
+**Recommended sequencing**: Build Stratification Phase 1 first. Then
+Stratification Phases 2–4 and the mutual recursion plan's Approach B can
+proceed in parallel, sharing the Phase 1 foundation.
+
+### PLAN_CIRCULAR_REFERENCES.md
+
+Existing plan (fully implemented) for circular stream table dependencies.
+Provides the SCC detection, monotonicity validation, and fixed-point
+iteration that both this plan and the mutual recursion plan depend on.
+
+---
+
+## 15. References
 
 - Abiteboul, S., Hull, R., Vianu, V. (1995). Foundations of Databases,
   Chapter 15: Stratified Datalog.
@@ -1024,7 +1080,7 @@ infrastructure investment is worthwhile.
 
 ---
 
-## 15. Implementation Status
+## 16. Implementation Status
 
 | Phase | Description | Status |
 |-------|-------------|--------|
