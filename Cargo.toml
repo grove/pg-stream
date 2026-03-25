@@ -44,8 +44,8 @@ postgres = "0.19"
 
 [dev-dependencies]
 pgrx-tests = "=0.17.0"
-testcontainers = "0.26"
-testcontainers-modules = { version = "0.14", features = ["postgres"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json"] }
 tokio-postgres = "0.7"
