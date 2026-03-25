@@ -42,6 +42,7 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
     - [pg\_trickle.parallel\_refresh\_mode](#pg_trickleparallel_refresh_mode)
     - [pg\_trickle.max\_dynamic\_refresh\_workers](#pg_tricklemax_dynamic_refresh_workers)
     - [pg\_trickle.max\_concurrent\_refreshes](#pg_tricklemax_concurrent_refreshes)
+    - [pg\_trickle.per\_database\_worker\_quota](#pg_trickleper_database_worker_quota)
   - [Advanced / Internal](#advanced--internal)
     - [pg\_trickle.change\_buffer\_schema](#pg_tricklechange_buffer_schema)
     - [pg\_trickle.foreign\_table\_polling](#pg_trickleforeign_table_polling)
@@ -927,6 +928,52 @@ SET pg_trickle.max_concurrent_refreshes = 8;
 
 ---
 
+### pg_trickle.per_database_worker_quota
+
+Per-database dynamic refresh worker quota for multi-tenant cluster isolation.
+
+| Property | Value |
+|---|---|
+| Type | `int` |
+| Default | `0` (disabled) |
+| Range | `0` – `64` |
+| Context | `SUSET` |
+| Restart Required | No |
+
+When greater than 0, each per-database scheduler limits itself to this many
+concurrently active dynamic refresh workers drawn from the shared
+`max_dynamic_refresh_workers` pool. This prevents a single busy database
+from starving others in multi-tenant clusters.
+
+**Burst capacity:** when the cluster is lightly loaded (active workers
+< 80% of `max_dynamic_refresh_workers`), a database may temporarily
+exceed its quota by up to 50% to absorb sudden change backlogs. The burst
+is reclaimed automatically within 1 scheduler cycle once global load rises
+back above the 80% threshold.
+
+**Priority dispatch:** within each dispatch tick, IMMEDIATE-trigger closures
+are dispatched before all other unit kinds, ensuring transactional
+consistency requirements are always met first, even under quota pressure.
+
+```sql
+-- Limit the analytics DB to 4 base workers (bursts to 6 when cluster is idle)
+ALTER DATABASE analytics SET pg_trickle.per_database_worker_quota = 4;
+-- Give the reporting DB only 2 base workers
+ALTER DATABASE reporting  SET pg_trickle.per_database_worker_quota = 2;
+SELECT pg_reload_conf();
+```
+
+When `per_database_worker_quota = 0` (the default), this feature is
+disabled and all databases share the `max_dynamic_refresh_workers` pool
+on a first-come-first-served basis, bounded per coordinator by
+`max_concurrent_refreshes`.
+
+> **Note:** Set this GUC per-database with `ALTER DATABASE` rather than
+> globally with `ALTER SYSTEM`, so different databases can have different
+> quotas.
+
+---
+
 ## Advanced / Internal
 
 ### pg_trickle.change_buffer_schema
@@ -1019,6 +1066,7 @@ documents these cross-dependencies to help avoid misconfiguration.
 | `auto_backoff` | `default_schedule_seconds` | The backoff multiplier is applied to `default_schedule_seconds` (or the per-ST override); raising this value gives backoff a wider range. |
 | `parallel_refresh_mode` | `max_concurrent_refreshes` | `parallel_refresh_mode = 'on'` dispatches independent STs to parallel workers, up to `max_concurrent_refreshes` per database. Setting `max_concurrent_refreshes = 1` effectively disables parallelism even when the mode is `'on'`. |
 | `parallel_refresh_mode` | `max_dynamic_refresh_workers` | `max_dynamic_refresh_workers` is a cluster-wide cap across all databases. If you have 4 databases each wanting 4 concurrent refreshes, set this to ≥16 (or accept queuing). |
+| `max_dynamic_refresh_workers` | `per_database_worker_quota` | When `per_database_worker_quota > 0`, each database claims at most that many workers from the shared `max_dynamic_refresh_workers` pool. Set `per_database_worker_quota` to `max_dynamic_refresh_workers / n_databases` for equal sharing. Burst to 150% is allowed when the cluster is < 80% loaded. |
 | `differential_max_change_ratio` | `fuse_default_ceiling` | Both guard against large change batches but at different levels: `differential_max_change_ratio` triggers a FULL refresh fallback (proportional to table size), while `fuse_default_ceiling` halts refresh entirely (absolute row count). The fuse fires first if the change count exceeds it, regardless of the ratio. |
 | `block_source_ddl` | DDL operations | When `true`, DDL on source tables (ALTER TABLE, DROP COLUMN) is blocked by an event trigger. Disable temporarily with `SET pg_trickle.block_source_ddl = false` before schema migrations, then re-enable. |
 | `cdc_mode` | `cdc_trigger_mode` | `cdc_trigger_mode` (`'statement'` / `'row'`) only applies when CDC is trigger-based. When `cdc_mode = 'wal'` (or after auto-transition to WAL), `cdc_trigger_mode` is irrelevant. |

@@ -47,7 +47,144 @@ This tutorial walks through a concrete org-chart example so you can see this flo
 
 ---
 
-## What you'll build
+## Prerequisites
+
+- PostgreSQL 18.x with pg_trickle installed (see [INSTALL.md](../INSTALL.md))
+- `shared_preload_libraries = 'pg_trickle'` in `postgresql.conf`
+- `max_worker_processes` raised to at least 32 (see [INSTALL.md](../INSTALL.md#postgresql-configuration)); the PostgreSQL default of 8 is often exhausted if you have several databases, causing stream tables to silently stop refreshing
+- `psql` or any SQL client
+
+> **Quick start with Docker:** If you don't have a local PostgreSQL 18 install, [INSTALL.md](../INSTALL.md) has a Docker-based setup that mounts the extension into a stock `postgres:18` container — no installation required.
+
+Connect to the database you want to use and enable the extension:
+
+```sql
+CREATE EXTENSION pg_trickle;
+```
+
+No additional configuration is needed. pg_trickle automatically discovers all databases on the server and starts a scheduler for each one where the extension is installed.
+
+---
+
+## Chapter 1: Hello World — Your First Stream Table
+
+Before diving into multi-table joins and recursive CTEs, start with the simplest
+possible stream table: a **single-source aggregate** with no joins.
+
+### 1.1 Setup
+
+Create one table and enable the extension:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trickle;
+
+CREATE TABLE products (
+    id       SERIAL PRIMARY KEY,
+    category TEXT           NOT NULL,
+    price    NUMERIC(10,2)  NOT NULL,
+    in_stock BOOLEAN        NOT NULL DEFAULT true
+);
+
+INSERT INTO products (category, price) VALUES
+    ('Electronics', 299.99),
+    ('Electronics', 49.99),
+    ('Books',       14.99),
+    ('Books',       24.99),
+    ('Books',        9.99);
+```
+
+### 1.2 Create the stream table
+
+```sql
+SELECT pgtrickle.create_stream_table(
+    name     => 'category_summary',
+    query    => $$
+        SELECT
+            category,
+            COUNT(*)                    AS product_count,
+            ROUND(AVG(price), 2)        AS avg_price,
+            MIN(price)                  AS min_price,
+            MAX(price)                  AS max_price,
+            COUNT(*) FILTER (WHERE in_stock) AS in_stock_count
+        FROM products
+        GROUP BY category
+    $$,
+    schedule => '1s'
+);
+```
+
+Query it immediately — it was populated by the initial full refresh:
+
+```sql
+SELECT * FROM category_summary ORDER BY category;
+```
+
+```
+   category    | product_count | avg_price | min_price | max_price | in_stock_count
+---------------+---------------+-----------+-----------+-----------+----------------
+ Books         |             3 |     16.66 |      9.99 |     24.99 |              3
+ Electronics   |             2 |    174.99 |     49.99 |    299.99 |              2
+```
+
+### 1.3 Watch an INSERT update one group
+
+```sql
+INSERT INTO products (category, price) VALUES ('Books', 39.99);
+```
+
+Within ~1 second (or call `SELECT pgtrickle.refresh_stream_table('category_summary')` to force it):
+
+```sql
+SELECT * FROM category_summary WHERE category = 'Books';
+```
+
+```
+ category | product_count | avg_price | min_price | max_price | in_stock_count
+----------+---------------+-----------+-----------+-----------+----------------
+ Books    |             4 |     22.49 |      9.99 |     39.99 |              4
+```
+
+The `Electronics` row was **not touched at all** — pg_trickle read exactly 1
+row from the change buffer, adjusted only the Books group.
+
+### 1.4 Watch an UPDATE propagate
+
+```sql
+UPDATE products SET price = 19.99 WHERE price = 299.99;
+```
+
+After the next refresh:
+
+```sql
+SELECT * FROM category_summary WHERE category = 'Electronics';
+```
+
+```
+  category   | product_count | avg_price | min_price | max_price | in_stock_count
+-------------+---------------+-----------+-----------+-----------+----------------
+ Electronics |             2 |     34.99 |     19.99 |     49.99 |              2
+```
+
+For `AVG`, pg_trickle maintains running sum and count columns internally, so
+re-aggregating a group is O(1) regardless of group size.
+
+### 1.5 What you just saw
+
+- A single function call created the storage table, installed CDC triggers,
+  ran the initial full refresh, and registered a 1-second schedule.
+- Every subsequent DML on `products` was captured in an `AFTER` trigger —
+  no polling, no logical replication.
+- Each refresh touched only the rows and groups that changed.
+- The stream table is a real PostgreSQL table — you can `SELECT`, index, and
+  join against `category_summary` like any other table.
+
+> **Clean up:** `SELECT pgtrickle.drop_stream_table('category_summary'); DROP TABLE products;`
+
+---
+
+## Chapter 2: Joins, Aggregates & Chains
+
+### What you'll build
 
 An **employee org-chart** system with two stream tables:
 
@@ -72,26 +209,9 @@ By the end you will have:
 > ```
 > See [examples/dbt_getting_started/](../examples/dbt_getting_started/) for full details.
 
-## Prerequisites
-
-- PostgreSQL 18.x with pg_trickle installed (see [INSTALL.md](../INSTALL.md))
-- `shared_preload_libraries = 'pg_trickle'` in `postgresql.conf`
-- `max_worker_processes` raised to at least 32 (see [INSTALL.md](../INSTALL.md#postgresql-configuration)); the PostgreSQL default of 8 is often exhausted if you have several databases, causing stream tables to silently stop refreshing
-- `psql` or any SQL client
-
-> **Quick start with Docker:** If you don't have a local PostgreSQL 18 install, [INSTALL.md](../INSTALL.md) has a Docker-based setup that mounts the extension into a stock `postgres:18` container — no installation required.
-
-Connect to the database you want to use and enable the extension:
-
-```sql
-CREATE EXTENSION pg_trickle;
-```
-
-No additional configuration is needed. pg_trickle automatically discovers all databases on the server and starts a scheduler for each one where the extension is installed.
-
 ---
 
-## Step 1: Create the Base Tables
+### 2.1 Create the Base Tables
 
 These are ordinary PostgreSQL tables — pg_trickle doesn't require any special column types, annotations, or schema conventions.
 
@@ -158,7 +278,7 @@ Company (1)
 
 ---
 
-## Step 2: Create the First Stream Table — Recursive Hierarchy
+### 2.2 Create the First Stream Table — Recursive Hierarchy
 
 Our first stream table flattens the department tree. For every department, it computes the full path from the root and the depth level. This uses `WITH RECURSIVE` — a SQL construct that can't be differentiated with simple algebraic rules (the recursion depends on itself), but pg_trickle handles it using **incremental strategies** (semi-naive evaluation for inserts, Delete-and-Rederive for mixed changes) that we'll explain later.
 
@@ -228,7 +348,7 @@ This is a **real PostgreSQL table** — you can create indexes on it, join it in
 
 ---
 
-## Step 3: Chain Stream Tables — Build the Downstream Layers
+### 2.3 Chain Stream Tables — Build the Downstream Layers
 
 Now create `department_stats`. The twist: instead of joining directly against `departments`, it joins against `department_tree` — the stream table we just created. This creates a **chain**: changes to `departments` update `department_tree`, whose changes then trigger `department_stats` to update.
 
@@ -350,7 +470,7 @@ SELECT * FROM department_report ORDER BY division;
 
 ---
 
-## Step 4: Watch a Change Cascade Through All Three Layers
+### 2.4 Watch a Change Cascade Through All Three Layers
 
 This is the heart of pg_trickle. We'll make four changes to the base tables and watch changes propagate automatically through the three-layer DAG — each layer doing only the minimum work.
 
@@ -383,7 +503,7 @@ This is the heart of pg_trickle. We'll make four changes to the base tables and 
 
 All three layers run in a single scheduled pass, in topological order.
 
-### 4a: A single INSERT ripples through all three layers
+#### 2.4a: INSERT ripples through all three layers
 
 ```sql
 INSERT INTO employees (name, department_id, salary) VALUES
@@ -430,7 +550,7 @@ The 6 other groups in `department_stats` were **not touched at all**.
 
 > **Contrast with a standard materialized view:** `REFRESH MATERIALIZED VIEW` would re-scan all 8 employees, re-join with all 7 departments, re-aggregate, and update all 7 rows. With pg_trickle, the work was proportional to the 1 changed row — across all three layers.
 
-### 4b: A department change cascades through the whole DAG
+#### 2.4b: A department change cascades through the whole DAG
 
 Now change the `departments` table — the root of the entire chain:
 
@@ -468,7 +588,7 @@ SELECT id, name, depth, path FROM department_tree WHERE name = 'DevOps';
 
 The recursive CTE automatically expanded to include the new department at the correct depth and path. One inserted row in `departments` produced one new row in the stream table.
 
-### 4c: UPDATE — A single rename that cascades everywhere
+#### 2.4c: UPDATE — A single rename that cascades everywhere
 
 Rename "Engineering" to "R&D":
 
@@ -506,7 +626,7 @@ SELECT name, path FROM department_tree WHERE path LIKE '%R&D%' ORDER BY depth;
 
 One `UPDATE` to a department name flowed through all three layers automatically — updating 5 + 5 + 2 rows across the chain.
 
-### 4d: DELETE — Remove an employee
+#### 2.4d: DELETE — Remove an employee
 
 ```sql
 DELETE FROM employees WHERE name = 'Bob';
@@ -530,7 +650,9 @@ Headcount dropped from 2 → 1 and the salary aggregates updated. Again, only th
 
 ---
 
-## Step 5: Automatic Scheduling — Let the DAG Drive Itself
+## Chapter 3: Scheduling & Backpressure
+
+### Automatic Scheduling — Let the DAG Drive Itself
 
 pg_trickle runs a **background scheduler** that automatically refreshes stale tables in topological order. In the Step 4 examples above, the scheduler handled every change within about a second. You can also call `refresh_stream_table()` directly when needed (e.g. in scripts or tests), but in normal operation the scheduler takes care of everything.
 
@@ -599,6 +721,14 @@ SELECT * FROM pgtrickle.change_buffer_sizes();
 
 See [SQL_REFERENCE.md](SQL_REFERENCE.md) for the full list of monitoring functions including `list_sources()`, `trigger_inventory()`, and `diamond_groups()`.
 
+---
+
+## Chapter 4: Monitoring In Depth
+
+All the monitoring capabilities from the monitoring quick reference above, expanded.
+For the five most important day-to-day introspection queries see the
+[Monitoring Quick Reference](#monitoring-quick-reference) at the end of this guide.
+
 ### Optional: WAL-based CDC
 
 By default pg_trickle uses triggers. If `wal_level = logical` is configured, set:
@@ -662,7 +792,9 @@ For high-churn tables, pg_trickle automatically compacts the pending change buff
 
 ---
 
-## Step 6: Understanding the Refresh Modes and IVM Strategies
+## Chapter 5: Advanced Topics
+
+### Refresh Modes and IVM Strategies
 
 You've now seen the IVM strategies pg_trickle uses for incremental view maintenance. Understanding the four refresh modes and when each strategy applies helps you write efficient stream table queries.
 
@@ -756,9 +888,120 @@ You don't choose — pg_trickle detects the strategy automatically based on the 
 | `ORDER BY … LIMIT N` (TopK) | Scoped recomputation | Re-evaluates top-N via MERGE; stores exactly N rows |
 | IMMEDIATE mode queries | In-transaction delta | Same algebraic strategies, applied synchronously via transition tables |
 
+### FUSE Circuit Breaker (v0.11.0+)
+
+The fuse is a **circuit breaker** that stops a stream table from processing an
+unexpectedly large batch of changes — for example from a runaway script or
+mass-delete migration — without operator review.
+
+```sql
+-- Arm a fuse: blow when pending changes exceed 50 000 rows
+SELECT pgtrickle.alter_stream_table(
+    'category_summary',
+    fuse           => 'on',
+    fuse_ceiling   => 50000
+);
+
+-- Check fuse status across all stream tables
+SELECT name, fuse_mode, fuse_state, fuse_ceiling, blown_at
+FROM pgtrickle.fuse_status();
+
+-- After investigating and deciding to apply the batch:
+SELECT pgtrickle.reset_fuse('category_summary', action => 'apply');
+
+-- Or skip the oversized batch entirely and resume from current state:
+SELECT pgtrickle.reset_fuse('category_summary', action => 'skip_changes');
+```
+
+`reset_fuse` supports three actions:
+- `'apply'` — process all pending changes and resume normal scheduling.
+- `'reinitialize'` — drop and repopulate the stream table from scratch.
+- `'skip_changes'` — discard pending changes and resume from the current frontier.
+
+A `pgtrickle_alert` NOTIFY is emitted when the fuse blows, making it easy to
+hook into alerting pipelines or `LISTEN` from application code.
+
+### Partitioned Stream Tables (v0.11.0+)
+
+For large stream tables, declare a **partition key** at creation time so
+MERGE operations are scoped to only the relevant partitions:
+
+```sql
+SELECT pgtrickle.create_stream_table(
+    name         => 'sales_by_month',
+    query        => $$
+        SELECT
+            DATE_TRUNC('month', sale_date) AS month,
+            product_id,
+            SUM(amount) AS total_sales
+        FROM sales
+        GROUP BY 1, 2
+    $$,
+    schedule     => '1m',
+    partition_by => 'month'    -- partition key must be in the SELECT output
+);
+```
+
+pg_trickle creates the storage table as `PARTITION BY RANGE (month)` with a
+catch-all partition, then on each refresh:
+1. Inspects the delta to find the `MIN` and `MAX` of the partition key.
+2. Injects `AND st.month BETWEEN min AND max` into the MERGE ON clause.
+3. PostgreSQL prunes all partitions outside the range — giving ~100× I/O
+   reduction for a 0.1% change rate on a 10M-row table.
+
+See [SQL_REFERENCE.md](SQL_REFERENCE.md#create_stream_table) for full partitioning options.
+
+### IMMEDIATE Mode — Real-Time In-Transaction IVM
+
+```sql
+-- Create a stream table that updates in the same transaction as its source
+SELECT pgtrickle.create_stream_table(
+    name         => 'live_headcount',
+    query        => $$
+    SELECT department_id, COUNT(*) AS headcount
+    FROM employees
+    GROUP BY department_id
+    $$,
+    refresh_mode => 'IMMEDIATE'
+);
+
+-- After any INSERT/UPDATE/DELETE on employees, live_headcount is already up-to-date:
+INSERT INTO employees (name, department_id, salary) VALUES ('Zara', 2, 95000);
+SELECT * FROM live_headcount WHERE department_id = 2;  -- 4 rows, immediately
+```
+
+IMMEDIATE mode uses statement-level `AFTER` triggers with transition tables —
+no change buffers, no scheduler, no background workers. The stream table is
+always consistent with the current transaction. Ideal for audit tables,
+real-time dashboards, and applications that need zero-latency reads.
+
+### Multi-Tenant Worker Quotas (v0.11.0+)
+
+In deployments with multiple databases, one busy database can starve others
+if all dynamic refresh workers are claimed. The `per_database_worker_quota`
+GUC prevents this:
+
+```sql
+-- Limit one performance-critical database to 4 workers (with burst to 6)
+ALTER DATABASE analytics  SET pg_trickle.per_database_worker_quota = 4;
+-- Allow a reporting database only 2 base workers
+ALTER DATABASE reporting  SET pg_trickle.per_database_worker_quota = 2;
+-- Apply changes
+SELECT pg_reload_conf();
+```
+
+When the cluster has spare capacity (active workers < 80% of
+`max_dynamic_refresh_workers`), a database may temporarily burst to 150% of
+its quota. Burst is reclaimed within 1 scheduler cycle once load rises.
+Within each dispatch tick, IMMEDIATE-trigger closures are always dispatched
+first, followed by atomic groups, singletons, and cyclic SCCs.
+
+See [CONFIGURATION.md](CONFIGURATION.md#c3-1-per-database-worker-quotas) for
+full quota tuning options.
+
 ---
 
-## Step 7: Clean Up
+## Clean Up
 
 When you're done experimenting, drop the stream tables. Drop dependents before their sources:
 
@@ -776,6 +1019,8 @@ DROP TABLE departments;
 - CDC triggers on source tables (removed only if no other stream table references the same source)
 - Change buffer tables in `pgtrickle_changes`
 - Catalog entries in `pgtrickle.pgt_stream_tables`
+
+---
 
 ---
 
