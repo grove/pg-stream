@@ -93,6 +93,11 @@ pub struct StreamTableMeta {
     pub blown_at: Option<TimestampWithTimeZone>,
     /// FUSE-1: Human-readable reason the fuse was blown.
     pub blow_reason: Option<String>,
+    /// A1-1: Partition key column for partitioned stream tables.
+    /// `None` means not partitioned. When set, the stream table storage is
+    /// created as a declaratively partitioned table (RANGE on this column),
+    /// and the refresh path will inject a partition-key range predicate (A1-3).
+    pub st_partition_key: Option<String>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -204,13 +209,14 @@ impl StreamTableMeta {
         requested_cdc_mode: Option<&str>,
         is_append_only: bool,
         pooler_compatibility_mode: bool,
+        st_partition_key: Option<&str>,
     ) -> Result<i64, PgTrickleError> {
         Spi::connect_mut(|client| {
             let row = client
                 .update(
                     "INSERT INTO pgtrickle.pgt_stream_tables \
-                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode, is_append_only, pooler_compatibility_mode) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+                     (pgt_relid, pgt_name, pgt_schema, defining_query, original_query, schedule, refresh_mode, functions_used, topk_limit, topk_order_by, topk_offset, diamond_consistency, diamond_schedule_policy, has_keyless_source, requested_cdc_mode, is_append_only, pooler_compatibility_mode, st_partition_key) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
                      RETURNING pgt_id",
                     None,
                     &[
@@ -231,6 +237,7 @@ impl StreamTableMeta {
                         requested_cdc_mode.into(),
                         is_append_only.into(),
                         pooler_compatibility_mode.into(),
+                        st_partition_key.into(),
                     ],
                 )
                 .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))?
@@ -257,7 +264,8 @@ impl StreamTableMeta {
                      COALESCE(refresh_tier, 'hot') AS refresh_tier, \
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
-                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
+                     st_partition_key \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -288,7 +296,8 @@ impl StreamTableMeta {
                      COALESCE(refresh_tier, 'hot') AS refresh_tier, \
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
-                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
+                     st_partition_key \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -324,7 +333,8 @@ impl StreamTableMeta {
                      COALESCE(refresh_tier, 'hot') AS refresh_tier, \
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
-                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
+                     st_partition_key \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -355,7 +365,8 @@ impl StreamTableMeta {
                      COALESCE(refresh_tier, 'hot') AS refresh_tier, \
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
-                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
+                     st_partition_key \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -390,7 +401,8 @@ impl StreamTableMeta {
                      COALESCE(refresh_tier, 'hot') AS refresh_tier, \
                      COALESCE(fuse_mode, 'off') AS fuse_mode, \
                      COALESCE(fuse_state, 'armed') AS fuse_state, \
-                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason, \
+                     st_partition_key \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -963,6 +975,7 @@ impl StreamTableMeta {
         let fuse_sensitivity = table.get::<i32>(34).map_err(map_spi)?;
         let blown_at = table.get::<TimestampWithTimeZone>(35).map_err(map_spi)?;
         let blow_reason = table.get::<String>(36).map_err(map_spi)?;
+        let st_partition_key = table.get::<String>(37).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1001,6 +1014,7 @@ impl StreamTableMeta {
             fuse_sensitivity,
             blown_at,
             blow_reason,
+            st_partition_key,
         })
     }
 
@@ -1103,6 +1117,7 @@ impl StreamTableMeta {
         let fuse_sensitivity = row.get::<i32>(34).map_err(map_spi)?;
         let blown_at = row.get::<TimestampWithTimeZone>(35).map_err(map_spi)?;
         let blow_reason = row.get::<String>(36).map_err(map_spi)?;
+        let st_partition_key = row.get::<String>(37).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1141,6 +1156,7 @@ impl StreamTableMeta {
             fuse_sensitivity,
             blown_at,
             blow_reason,
+            st_partition_key,
         })
     }
 }

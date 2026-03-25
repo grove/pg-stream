@@ -149,6 +149,7 @@ fn create_stream_table(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
+    partition_by: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -161,6 +162,7 @@ fn create_stream_table(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -186,6 +188,7 @@ fn create_stream_table_if_not_exists(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
+    partition_by: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_if_not_exists_impl(
         name,
@@ -198,6 +201,7 @@ fn create_stream_table_if_not_exists(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -216,6 +220,7 @@ fn create_stream_table_if_not_exists_impl(
     cdc_mode: Option<&str>,
     append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -239,6 +244,7 @@ fn create_stream_table_if_not_exists_impl(
             cdc_mode,
             append_only,
             pooler_compatibility_mode,
+            partition_by,
         ),
         Err(e) => Err(e),
     }
@@ -269,6 +275,7 @@ fn create_or_replace_stream_table(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
+    partition_by: default!(Option<&str>, "NULL"),
 ) {
     let result = create_or_replace_stream_table_impl(
         name,
@@ -281,6 +288,7 @@ fn create_or_replace_stream_table(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -412,6 +420,7 @@ fn create_or_replace_stream_table_impl(
     cdc_mode: Option<&str>,
     append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -497,6 +506,7 @@ fn create_or_replace_stream_table_impl(
                 cdc_mode,
                 append_only,
                 pooler_compatibility_mode,
+                partition_by,
             )
         }
         Err(e) => Err(e),
@@ -1007,6 +1017,8 @@ fn setup_storage_table(
     sum2_aux_columns: &[(String, String)],
     covar_aux_columns: &[(String, String)],
     nonnull_aux_columns: &[(String, String)],
+    // A1-1: partition key column name, or None for non-partitioned STs.
+    partition_key: Option<&str>,
 ) -> Result<pg_sys::Oid, PgTrickleError> {
     let storage_needs_pgt_count = needs_pgt_count;
     let storage_ddl = build_create_table_sql(
@@ -1019,9 +1031,26 @@ fn setup_storage_table(
         sum2_aux_columns,
         covar_aux_columns,
         nonnull_aux_columns,
+        partition_key,
     );
     Spi::run(&storage_ddl)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
+
+    // A1-1: For partitioned storage tables, create a catch-all default partition
+    // so that rows are never rejected due to missing partition coverage.
+    // Users add explicit partitions via standard PostgreSQL DDL (ATTACH PARTITION).
+    if let Some(_pk) = partition_key {
+        let default_partition_sql = format!(
+            "CREATE TABLE {}.{} PARTITION OF {}.{} DEFAULT",
+            quote_identifier(schema),
+            quote_identifier(&format!("{table_name}_default")),
+            quote_identifier(schema),
+            quote_identifier(table_name),
+        );
+        Spi::run(&default_partition_sql).map_err(|e| {
+            PgTrickleError::SpiError(format!("Failed to create default partition: {}", e))
+        })?;
+    }
 
     let pgt_relid = get_table_oid(schema, table_name)?;
 
@@ -1031,6 +1060,9 @@ fn setup_storage_table(
     // index with INCLUDE clause to enable index-only scans during MERGE.
     // This eliminates the heap fetch for matched rows, giving 20-50%
     // MERGE time reduction for small-delta / large-target scenarios.
+    //
+    // A1-1: PostgreSQL does not support global UNIQUE indexes on partitioned
+    // tables. Force a non-unique index when the storage table is partitioned.
     const COVERING_INDEX_MAX_COLUMNS: usize = 8;
     let include_clause = if columns.len() <= COVERING_INDEX_MAX_COLUMNS && !columns.is_empty() {
         let include_cols: Vec<String> = columns
@@ -1041,7 +1073,8 @@ fn setup_storage_table(
     } else {
         String::new()
     };
-    let index_sql = if has_keyless_source {
+    let is_partitioned = partition_key.is_some();
+    let index_sql = if has_keyless_source || is_partitioned {
         format!(
             "CREATE INDEX ON {}.{} (__pgt_row_id){include_clause}",
             quote_identifier(schema),
@@ -1100,6 +1133,7 @@ fn insert_catalog_and_deps(
     requested_cdc_mode: Option<&str>,
     is_append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = StreamTableMeta::insert(
         pgt_relid,
@@ -1121,6 +1155,7 @@ fn insert_catalog_and_deps(
         requested_cdc_mode,
         is_append_only,
         pooler_compatibility_mode,
+        partition_by,
     )?;
 
     // Build per-source column usage map
@@ -1761,6 +1796,7 @@ fn alter_stream_table_query(
                 &vq.sum2_aux_columns,
                 &vq.covar_aux_columns,
                 &vq.nonnull_aux_columns,
+                None, // alter_stream_table: partition_key changes not supported
             )?
         }
     };
@@ -2039,6 +2075,7 @@ fn create_stream_table_impl(
     requested_cdc_mode: Option<&str>,
     append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -2170,6 +2207,21 @@ fn create_stream_table_impl(
         )));
     }
 
+    // A1-1: Validate partition_by if provided.
+    if let Some(pk) = partition_by {
+        validate_partition_key(pk, &vq.columns)?;
+        // Partitioned stream tables with IMMEDIATE refresh are not supported —
+        // IMMEDIATE triggers fire at DML time and the partition-key range is
+        // not known until the delta is accumulated.
+        if refresh_mode.is_immediate() {
+            return Err(PgTrickleError::InvalidArgument(
+                "partition_by is not supported with IMMEDIATE refresh mode. \
+                 Use DIFFERENTIAL or AUTO refresh mode."
+                    .to_string(),
+            ));
+        }
+    }
+
     // Cycle detection
     check_for_cycles(&vq.source_relids)?;
 
@@ -2190,6 +2242,7 @@ fn create_stream_table_impl(
         &vq.sum2_aux_columns,
         &vq.covar_aux_columns,
         &vq.nonnull_aux_columns,
+        partition_by,
     )?;
 
     // Insert catalog entry + dependency edges
@@ -2222,6 +2275,7 @@ fn create_stream_table_impl(
         requested_cdc_mode_override.as_deref(),
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     )?;
 
     // ── Phase 2: CDC / IVM trigger setup ──
@@ -4999,6 +5053,38 @@ fn parse_qualified_name(name: &str) -> Result<(String, String), PgTrickleError> 
     }
 }
 
+/// A1-1: Validate the `partition_by` column name against the stream table's
+/// SELECT output columns.
+///
+/// Checks:
+/// 1. The supplied column name is non-empty.
+/// 2. The column appears in the stream table's SELECT output (from `columns`).
+///
+/// A valid partition key ensures the refresh path can inject a range predicate
+/// (A1-3) and that the partitioned storage table can be created correctly.
+fn validate_partition_key(
+    partition_key: &str,
+    columns: &[ColumnDef],
+) -> Result<(), PgTrickleError> {
+    let trimmed = partition_key.trim();
+    if trimmed.is_empty() {
+        return Err(PgTrickleError::InvalidArgument(
+            "partition_by must be a non-empty column name".to_string(),
+        ));
+    }
+    let found = columns.iter().any(|c| c.name.eq_ignore_ascii_case(trimmed));
+    if !found {
+        let available: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "partition_by column '{}' is not in the stream table's SELECT output. \
+             Available columns: {}",
+            trimmed,
+            available.join(", "),
+        )));
+    }
+    Ok(())
+}
+
 /// Column metadata from a defining query.
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
@@ -5910,6 +5996,8 @@ fn build_create_table_sql(
     sum2_aux_columns: &[(String, String)],
     covar_aux_columns: &[(String, String)],
     nonnull_aux_columns: &[(String, String)],
+    // A1-1: when Some, emit PARTITION BY RANGE (<key>) suffix.
+    partition_key: Option<&str>,
 ) -> String {
     let col_defs: Vec<String> = columns
         .iter()
@@ -5983,8 +6071,13 @@ fn build_create_table_sql(
         ));
     }
 
+    // A1-1: partition clause — appended after the closing ')' of CREATE TABLE.
+    let partition_clause = partition_key
+        .map(|k| format!("\nPARTITION BY RANGE ({})", quote_identifier(k)))
+        .unwrap_or_default();
+
     format!(
-        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}{}{}\n)",
+        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}{}{}\n){}",
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
@@ -5993,6 +6086,7 @@ fn build_create_table_sql(
         sum2_aux_sql,
         covar_aux_sql,
         nonnull_aux_sql,
+        partition_clause,
     )
 }
 
@@ -6148,7 +6242,7 @@ fn initialize_st(
 }
 
 /// Quote a SQL identifier (escape double quotes).
-fn quote_identifier(ident: &str) -> String {
+pub(crate) fn quote_identifier(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
@@ -7183,6 +7277,7 @@ mod tests {
             fuse_sensitivity: None,
             blown_at: None,
             blow_reason: None,
+            st_partition_key: None,
         }
     }
 

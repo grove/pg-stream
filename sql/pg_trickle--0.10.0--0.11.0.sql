@@ -23,6 +23,12 @@
 --           on the first refresh cycle after upgrade, which uses CREATE OR REPLACE.
 --           The scheduler issues LISTEN pgtrickle_wake at startup when
 --           pg_trickle.event_driven_wake = true (the default).
+--
+--   A1-1: Add st_partition_key column to pgt_stream_tables.
+--         Stores the user-declared partition key column name for partitioned
+--         stream tables. NULL = not partitioned. Used by the refresh path to
+--         inject a partition-key range predicate into the MERGE ON clause for
+--         partition pruning (A1-3). All existing stream tables keep NULL.
 
 -- ── Schema Changes ─────────────────────────────────────────────────────────
 
@@ -66,3 +72,11 @@ BEGIN
     END IF;
 END
 $$;
+
+-- A1-1: Partition key column for partitioned stream tables.
+--       NULL = not partitioned (all existing tables keep NULL).
+--       When set, the stream table storage was created as PARTITION BY RANGE
+--       on this column, and the refresh path will inject a partition-key
+--       range predicate to enable partition pruning during MERGE.
+ALTER TABLE pgtrickle.pgt_stream_tables
+    ADD COLUMN IF NOT EXISTS st_partition_key TEXT;

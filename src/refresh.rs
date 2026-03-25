@@ -90,6 +90,11 @@ struct CachedMergeTemplate {
     /// USING clause template with LSN placeholders (for materializing delta
     /// into a temp table in the user-trigger path).
     trigger_using_template: String,
+    /// A1-2: Raw delta SQL template with LSN placeholders.
+    /// Used at refresh time to compute partition key range (MIN/MAX) for A1-3
+    /// predicate injection. Only populated when `st_partition_key` is set,
+    /// but stored for all STs to keep the struct layout consistent.
+    delta_sql_template: String,
 }
 
 thread_local! {
@@ -1310,13 +1315,18 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
     let merge_template = format!(
         "MERGE INTO {quoted_table} AS st \
          USING {using_clause} AS d \
-         ON st.__pgt_row_id = d.__pgt_row_id \
+         ON st.__pgt_row_id = d.__pgt_row_id{part_pred_placeholder} \
          WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE \
          WHEN MATCHED AND d.__pgt_action = 'I' AND ({is_distinct_clause}) THEN \
            UPDATE SET {update_set_clause} \
          WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN \
            INSERT (__pgt_row_id, {user_col_list}) \
            VALUES (d.__pgt_row_id, {d_user_col_list})",
+        part_pred_placeholder = if st.st_partition_key.is_some() {
+            " __PGT_PART_PRED__"
+        } else {
+            ""
+        },
     );
 
     // Build cleanup template.
@@ -1415,6 +1425,7 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
                 trigger_update_template,
                 trigger_insert_template,
                 trigger_using_template: using_clause.clone(),
+                delta_sql_template: delta_sql_template.clone(),
             },
         );
     });
@@ -2114,6 +2125,54 @@ fn execute_incremental_truncate_delete(st: &StreamTableMeta) -> Result<(i64, i64
     Ok((0, rows_deleted))
 }
 
+// ── A1-2: Partition key range extraction ────────────────────────────────────
+
+/// Safely quote a SQL string literal (standard SQL single-quote escaping).
+/// Used to embed partition key range values in MERGE ON-clause predicates.
+fn pg_quote_literal(val: &str) -> String {
+    format!("'{}'", val.replace('\'', "''"))
+}
+
+/// A1-2: Extract the MIN and MAX of the partition key column from the resolved
+/// delta SQL. Returns `None` when the delta is empty (no changes to apply).
+///
+/// The returned strings are the column values cast to `TEXT`, which PostgreSQL
+/// can implicitly cast back to the actual column type in the BETWEEN predicate.
+fn extract_partition_range(
+    resolved_delta_sql: &str,
+    partition_key: &str,
+) -> Result<Option<(String, String)>, PgTrickleError> {
+    let qk = crate::api::quote_identifier(partition_key);
+    let min_sql = format!("SELECT MIN({qk})::text FROM ({resolved_delta_sql}) AS __pgt_part_probe");
+    let max_sql = format!("SELECT MAX({qk})::text FROM ({resolved_delta_sql}) AS __pgt_part_probe");
+    let min_val = Spi::get_one::<String>(&min_sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("partition range MIN: {e}")))?;
+    let max_val = Spi::get_one::<String>(&max_sql)
+        .map_err(|e| PgTrickleError::SpiError(format!("partition range MAX: {e}")))?;
+    Ok(min_val.zip(max_val))
+}
+
+/// A1-3: Replace the `__PGT_PART_PRED__` placeholder in the MERGE SQL with
+/// an explicit partition-key range predicate for the current delta.
+///
+/// The injected predicate `AND st.<key> BETWEEN <min> AND <max>` is added to
+/// the MERGE ON clause. Because it is a literal range (not a parameter), the
+/// PostgreSQL planner can use it for partition pruning during MERGE execution.
+fn inject_partition_predicate(
+    merge_sql: &str,
+    partition_key: &str,
+    min_val: &str,
+    max_val: &str,
+) -> String {
+    let qk = crate::api::quote_identifier(partition_key);
+    let pred = format!(
+        " AND st.{qk} BETWEEN {} AND {}",
+        pg_quote_literal(min_val),
+        pg_quote_literal(max_val),
+    );
+    merge_sql.replace("__PGT_PART_PRED__", &pred)
+}
+
 pub fn execute_differential_refresh(
     st: &StreamTableMeta,
     prev_frontier: &Frontier,
@@ -2627,9 +2686,13 @@ pub fn execute_differential_refresh(
         /// USING clause with resolved LSN values (for materializing delta
         /// into a temp table in the user-trigger path).
         trigger_using_sql: String,
+        /// A1-2: Resolved delta SQL (LSN placeholders replaced with actual
+        /// LSN values). Used to compute partition key range for A1-3 predicate
+        /// injection on partitioned stream tables.
+        resolved_delta_sql: String,
     }
 
-    let resolved = if let Some(entry) = cached {
+    let mut resolved = if let Some(entry) = cached {
         // ── Cache hit: resolve LSN placeholders ──────────────────────
         pgrx::debug1!("[pg_trickle] cache HIT for pgt_id={}", st.pgt_id);
         // Substitute __PGS_PREV/NEW_LSN_{oid}__ tokens with actual values.
@@ -2650,6 +2713,13 @@ pub fn execute_differential_refresh(
             trigger_insert_sql: entry.trigger_insert_template.clone(),
             trigger_using_sql: resolve_lsn_placeholders(
                 &entry.trigger_using_template,
+                &entry.source_oids,
+                prev_frontier,
+                new_frontier,
+                &zero_change_oids,
+            ),
+            resolved_delta_sql: resolve_lsn_placeholders(
+                &entry.delta_sql_template,
                 &entry.source_oids,
                 prev_frontier,
                 new_frontier,
@@ -2752,13 +2822,18 @@ pub fn execute_differential_refresh(
         let merge_template = format!(
             "MERGE INTO {quoted_table} AS st \
              USING {template_using} AS d \
-             ON st.__pgt_row_id = d.__pgt_row_id \
+             ON st.__pgt_row_id = d.__pgt_row_id{part_pred_placeholder} \
              WHEN MATCHED AND d.__pgt_action = 'D' THEN DELETE \
              WHEN MATCHED AND d.__pgt_action = 'I' AND ({is_distinct_clause}) THEN \
                UPDATE SET {update_set_clause} \
              WHEN NOT MATCHED AND d.__pgt_action = 'I' THEN \
                INSERT (__pgt_row_id, {user_col_list}) \
                VALUES (d.__pgt_row_id, {d_user_col_list})",
+            part_pred_placeholder = if st.st_partition_key.is_some() {
+                " __PGT_PART_PRED__"
+            } else {
+                ""
+            },
         );
         // QF-1: Log at LOG level only when pg_trickle.log_merge_sql = on.
         if crate::config::pg_trickle_log_merge_sql() {
@@ -2844,6 +2919,7 @@ pub fn execute_differential_refresh(
                         trigger_update_template: trigger_update_template.clone(),
                         trigger_insert_template: trigger_insert_template.clone(),
                         trigger_using_template: template_using.clone(),
+                        delta_sql_template: delta_sql_template.clone(),
                     },
                 );
             });
@@ -2865,6 +2941,13 @@ pub fn execute_differential_refresh(
             trigger_insert_sql: trigger_insert_template,
             trigger_using_sql: resolve_lsn_placeholders(
                 &template_using,
+                &source_oids,
+                prev_frontier,
+                new_frontier,
+                &zero_change_oids,
+            ),
+            resolved_delta_sql: resolve_lsn_placeholders(
+                &delta_sql_template,
                 &source_oids,
                 prev_frontier,
                 new_frontier,
@@ -3033,11 +3116,49 @@ pub fn execute_differential_refresh(
     // Always use MERGE. The delete_insert path was removed in v0.2.0
     // (pg_trickle.merge_strategy GUC removed — C1 cleanup).
 
+    // ── A1-2/A1-3: Partition-key range predicate injection ───────────
+    // For partitioned stream tables, compute the MIN/MAX of the partition
+    // key across the current delta and inject it as a literal range
+    // predicate into the MERGE ON clause. This enables PostgreSQL partition
+    // pruning: only partitions overlapping [min, max] are visited, reducing
+    // MERGE I/O proportionally to the number of affected partitions.
+    //
+    // If the delta is empty (all changes cancel out), return early —
+    // there is nothing to MERGE.
+    if let Some(ref pk) = st.st_partition_key {
+        match extract_partition_range(&resolved.resolved_delta_sql, pk)? {
+            None => {
+                // Delta produced no rows for the partition key — fast path.
+                pgrx::debug1!(
+                    "[pg_trickle] A1-3: empty partition-key delta for {}.{}, skipping MERGE",
+                    schema,
+                    name,
+                );
+                return Ok((0, 0));
+            }
+            Some((min_val, max_val)) => {
+                pgrx::debug1!(
+                    "[pg_trickle] A1-3: partition range for {}.{}: [{}, {}]",
+                    schema,
+                    name,
+                    min_val,
+                    max_val,
+                );
+                resolved.merge_sql =
+                    inject_partition_predicate(&resolved.merge_sql, pk, &min_val, &max_val);
+            }
+        }
+    }
+
     // ── D-2: Prepared-statement flag ─────────────────────────────────
     // PB2: Disable prepared statements when pooler_compatibility_mode is on.
+    // A1-3: Disable for partitioned STs — the partition predicate is a
+    // literal range that changes every refresh; a generic plan cannot prune
+    // partitions from parameter values.
     let use_prepared = crate::config::pg_trickle_use_prepared_statements()
         && was_cache_hit
-        && !st.pooler_compatibility_mode;
+        && !st.pooler_compatibility_mode
+        && st.st_partition_key.is_none();
 
     let (merge_count, strategy_label) = if use_explicit_dml {
         // ── User-trigger path: explicit DML ─────────────────────────
@@ -3517,6 +3638,7 @@ mod tests {
             fuse_sensitivity: None,
             blown_at: None,
             blow_reason: None,
+            st_partition_key: None,
         }
     }
 
@@ -3811,6 +3933,7 @@ mod tests {
                     trigger_update_template: String::new(),
                     trigger_insert_template: String::new(),
                     trigger_using_template: String::new(),
+                    delta_sql_template: String::new(),
                 },
             );
         });
@@ -3840,6 +3963,7 @@ mod tests {
                     trigger_update_template: String::new(),
                     trigger_insert_template: String::new(),
                     trigger_using_template: String::new(),
+                    delta_sql_template: String::new(),
                 },
             );
         });

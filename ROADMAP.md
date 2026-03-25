@@ -3,7 +3,7 @@
 > **Last updated:** 2026-03-26
 > **Latest release:** 0.10.0 (2026-03-25)
 > **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
-> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (PR #282, Prometheus/Grafana) · Phase 4 ✅ (PR #283, correctness guards) · Phase 5 ✅ (PR #284, VARBIT bitmask) · Phase 6 ✅ (PR #285, fuse circuit breaker) · Phase 7 ✅ (PR #286, event-driven wake)
+> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (PR #282, Prometheus/Grafana) · Phase 4 ✅ (PR #283, correctness guards) · Phase 5 ✅ (PR #284, VARBIT bitmask) · Phase 6 ✅ (PR #285, fuse circuit breaker) · Phase 7 ✅ (PR #286, event-driven wake) · Partitioning Spike ✅ (STRETCH-1 RFC + A1-1 catalog+DDL + A1-2 delta range + A1-3 MERGE predicate)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -29,7 +29,7 @@ coverage, all in plain language.
 - [v0.9.0 — Incremental Aggregate Maintenance](#v090--incremental-aggregate-maintenance)
 - [v0.10.0 — DVM Hardening, Connection Pooler Compatibility, Core Refresh Optimizations & Infrastructure Prep](#v0100--dvm-hardening-connection-pooler-compatibility-core-refresh-optimizations--infrastructure-prep)
 - [v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness](#v0110--partitioned-stream-tables-prometheus--grafana-observability-safety-hardening--correctness)
-- [v0.12.0 — Scalability Foundations, Anomalous Change Detection & CDC Research](#v0120--scalability-foundations-anomalous-change-detection--cdc-research)
+- [v0.12.0 — Scalability Foundations, Partitioning Enhancements, Anomalous Change Detection & CDC Research](#v0120--scalability-foundations-partitioning-enhancements-anomalous-change-detection--cdc-research)
 - [v0.13.0 — Tiered Scheduling, PG Backward Compatibility & UNLOGGED Buffers](#v0130--tiered-scheduling-pg-backward-compatibility--unlogged-buffers)
 - [v0.14.0 — Native DDL Syntax, External Test Suites & Integration](#v0140--native-ddl-syntax-external-test-suites--integration)
 - [v1.0.0 — Stable Release](#v100--stable-release)
@@ -2039,9 +2039,13 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| STRETCH-1 | **Partitioned stream tables — design spike only.** Produce a written implementation plan (2–4 days) before committing to A1-1. Validates partition-key predicate injection, per-partition MERGE loop feasibility, and catalog requirements. Full A-1 implementation only starts if the spike is complete and the RFC is approved. | 2–4d | [PLAN_NEW_STUFF.md §A-1](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~STRETCH-1~~ | ~~**Partitioned stream tables — design spike only.**~~ ✅ Done in v0.11.0 Partitioning Spike — RFC written ([PLAN_PARTITIONING_SPIKE.md](plans/PLAN_PARTITIONING_SPIKE.md)), go/no-go decision: **Go**. A1-1 implemented (catalog column, API parameter, validation). | 2–4d | [PLAN_PARTITIONING_SPIKE.md](plans/PLAN_PARTITIONING_SPIKE.md) |
+| ~~A1-1~~ | ~~**DDL: `CREATE STREAM TABLE … PARTITION BY`; `st_partition_key` catalog column.**~~ ✅ Done — `partition_by` parameter added to all three `create_stream_table*` functions; `st_partition_key TEXT` column in catalog; `validate_partition_key()` validates column exists in output; `build_create_table_sql` emits `PARTITION BY RANGE (key)`; `setup_storage_table` creates default catch-all partition and non-unique `__pgt_row_id` index. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md](plans/PLAN_PARTITIONING_SPIKE.md) |
+| ~~A1-2~~ | ~~**Delta min/max inspection.**~~ ✅ Done — `extract_partition_range()` in `refresh.rs` runs `SELECT MIN/MAX(key)::text` on the resolved delta SQL; returns `None` on empty delta (MERGE skipped). | 1 wk | [PLAN_PARTITIONING_SPIKE.md §8](plans/PLAN_PARTITIONING_SPIKE.md) |
+| ~~A1-3~~ | ~~**MERGE rewrite.**~~ ✅ Done — `inject_partition_predicate()` replaces `__PGT_PART_PRED__` placeholder in MERGE ON clause with `AND st."key" BETWEEN 'min' AND 'max'`; `CachedMergeTemplate` stores `delta_sql_template`; D-2 prepared statements disabled for partitioned STs. | 2–3 wk | [PLAN_PARTITIONING_SPIKE.md §8](plans/PLAN_PARTITIONING_SPIKE.md) |
+| ~~A1-4~~ | ~~**E2E benchmarks: 10M-row partitioned ST, 0.1%/0.2%/100% change rate scenarios; `EXPLAIN (ANALYZE, BUFFERS)` partition-scan verification.**~~ ✅ Done — 7 E2E tests added to `tests/e2e_partition_tests.rs` covering: initial populate, differential inserts, updates/deletes, empty-delta fast path, EXPLAIN plan verification, invalid partition key rejection; added to light-E2E allowlist. | 1 wk | [PLAN_PARTITIONING_SPIKE.md §9](plans/PLAN_PARTITIONING_SPIKE.md) |
 
-> **Stretch subtotal: 2–4 days (STRETCH-1 spike)**
+> **Stretch subtotal: STRETCH-1 + A1-1 + A1-2 + A1-3 + A1-4 ✅ All complete**
 
 ### DAG Refresh Performance Improvements (from PLAN_DAG_PERFORMANCE.md §8)
 
@@ -2065,8 +2069,10 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 > **v0.11.0 total: ~7–10 weeks (partitioning + isolation) + ~12h observability + ~14–21h default tuning + ~7–12h safety hardening + ~2–4 weeks should-ship (bitmask + fuse + external corpus) + ~4.5–6.5 weeks ST-to-ST differential + ~2–3 weeks event-driven wake + ~1–2 days correctness quick-wins + ~2–3 days documentation + ~8–12 weeks DAG performance**
 
 **Exit criteria:**
-- [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog
-- [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction)
+- [x] Declaratively partitioned stream tables accepted; partition key tracked in catalog — ✅ Done in v0.11.0 Partitioning Spike (STRETCH-1 RFC + A1-1)
+- [x] Partitioned storage table created with `PARTITION BY RANGE` + default catch-all partition — ✅ Done (A1-1 physical DDL)
+- [x] Partition-key range predicate injected into MERGE ON clause; empty-delta fast-path skips MERGE — ✅ Done (A1-2 + A1-3)
+- [x] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction) — ✅ Done (A1-4 E2E tests)
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped — ✅ Done in v0.11.0 Phase 3 (`monitoring/` directory)
 - [x] DEF-1: `parallel_refresh_mode` default is `'on'`; unit test updated — ✅ Done in v0.11.0 Phase 1 (concurrent-refresh E2E test still pending)
@@ -2098,7 +2104,7 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 ---
 
-## v0.12.0 — Scalability Foundations, Anomalous Change Detection & CDC Research
+## v0.12.0 — Scalability Foundations, Partitioning Enhancements, Anomalous Change Detection & CDC Research
 
 **Goal:** Deliver scalability foundations that directly serve the project's
 performance and throughput goals — columnar change tracking for 50–90%
@@ -2276,6 +2282,27 @@ action.
 
 > **Scalability foundations subtotal: ~6–8 weeks**
 
+### Partitioning Enhancements (A1 follow-ons from v0.11.0 spike)
+
+> **In plain terms:** The v0.11.0 spike delivered RANGE partitioning end-to-end.
+> These follow-on items extend coverage to the use cases deliberately deferred
+> from A1: multi-column keys, retrofitting existing stream tables, LIST-based
+> partitions, HASH partitions (which need a different strategy than predicate
+> injection), and operational quality-of-life improvements.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| A1-1b | **Multi-column partition keys.** Extend `partition_by` to accept a comma-separated list of columns; emit `PARTITION BY RANGE (col_a, col_b)`; extend `extract_partition_range()` to compute min/max tuples; inject composite `BETWEEN (a_min, b_min) AND (a_max, b_max)` predicate into MERGE ON clause. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-1c | **`alter_stream_table(partition_by => …)` support.** Allow adding or changing the partition key on an existing stream table. Requires repartitioning the underlying storage table in-place (`CREATE TABLE … AS SELECT` + rename + drop + rename sequence), updating the catalog, and rebuilding the MERGE template. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-1d | **LIST partitioning support.** Let `partition_by` name a low-cardinality column for `PARTITION BY LIST` storage. Requires a new predicate style (`IN (…)` collecting the distinct partition-key values from the delta) instead of `BETWEEN`. | 1 wk | [PLAN_PARTITIONING_SPIKE.md §10](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-3b | **HASH partitioning via per-partition MERGE loop.** Predicate injection cannot prune HASH partitions (the hash function is not invertible). Implement Approach 2 from PLAN_PARTITIONING_SPIKE.md §3: at refresh time, query which child partitions contain delta rows, then issue one targeted MERGE per affected partition. | 2–3 wk | [PLAN_PARTITIONING_SPIKE.md §3](plans/PLAN_PARTITIONING_SPIKE.md) |
+| PART-WARN | **Default-partition growth warning.** Emit a PostgreSQL `WARNING` (via `pgrx::warning!()`) when the default catch-all partition of a partitioned stream table contains rows after a refresh, prompting the user to create named partition ranges. | 1–2d | [PLAN_PARTITIONING_SPIKE.md §11](plans/PLAN_PARTITIONING_SPIKE.md) |
+
+> **Auto-partition creation** (TimescaleDB-style automatic chunk management) remains
+> a post-1.0 item as stated in PLAN_PARTITIONING_SPIKE.md §10.
+
+> **Partitioning enhancements subtotal: ~5–8 weeks**
+
 ### Performance Defaults (from REPORT_OVERALL_STATUS.md)
 
 Targeted improvements identified in the overall status report. None require
@@ -2298,7 +2325,7 @@ large design changes; all build on existing infrastructure.
 > impactful while that work is fresh.
 
 
-> **v0.12.0 total: ~18–27 weeks + ~6–8 weeks scalability + ~1–3 weeks defaults + ~3–5 weeks developer tooling & observability**
+> **v0.12.0 total: ~18–27 weeks + ~6–8 weeks scalability + ~5–8 weeks partitioning enhancements + ~1–3 weeks defaults + ~3–5 weeks developer tooling & observability**
 
 
 **Exit criteria:**
@@ -2323,6 +2350,11 @@ large design changes; all build on existing infrastructure.
 - [ ] G12-SQL-IN: Multi-column IN subquery behavior documented or fixed; regression test added
 - [ ] G14-MDED: Deduplication frequency profiling complete; RFC written if compaction threshold exceeded
 - [ ] G17-MERGEEX: MERGE template EXPLAIN validation runs at E2E test startup
+- [ ] A1-1b: Multi-column RANGE partition keys work end-to-end; composite predicate triggers partition pruning
+- [ ] A1-1c: `alter_stream_table(partition_by => …)` repartitions existing storage table without data loss
+- [ ] A1-1d: LIST partitioning creates `PARTITION BY LIST` storage; IN-list predicate confirmed via `EXPLAIN`
+- [ ] A1-3b: HASH partitioning uses per-partition MERGE loop; only affected child partitions are targeted
+- [ ] PART-WARN: `WARNING` emitted when default partition has rows after refresh
 - [ ] Extension upgrade path tested (`0.11.0 → 0.12.0`)
 
 ---
