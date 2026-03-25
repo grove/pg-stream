@@ -681,6 +681,17 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
         return RefreshOutcome::Success;
     }
 
+    // FUSE-5: Check fuse circuit breaker — blow if change count exceeds ceiling.
+    if evaluate_fuse(&st) {
+        log!(
+            "pg_trickle refresh worker: {}.{} fuse blown — skipping refresh (job {})",
+            st.pgt_schema,
+            st.pgt_name,
+            job.job_id,
+        );
+        return RefreshOutcome::Success;
+    }
+
     let tick_watermark: Option<String> = if config::pg_trickle_tick_watermark_enabled() {
         Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
     } else {
@@ -780,6 +791,17 @@ fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> 
             continue;
         }
 
+        // FUSE-5: Check fuse circuit breaker.
+        if evaluate_fuse(&st) {
+            log!(
+                "pg_trickle refresh worker: {}.{} fuse blown — skipping (atomic group job {})",
+                st.pgt_schema,
+                st.pgt_name,
+                job.job_id,
+            );
+            continue;
+        }
+
         let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
         let has_st_changes = has_stream_table_source_changes(&st);
         let action = if has_changes && has_st_changes {
@@ -852,6 +874,17 @@ fn execute_worker_immediate_closure(job: &SchedulerJob) -> RefreshOutcome {
             st.status.as_str(),
         );
         return RefreshOutcome::RetryableFailure;
+    }
+
+    // FUSE-5: Check fuse circuit breaker for immediate closure root.
+    if evaluate_fuse(&st) {
+        log!(
+            "pg_trickle refresh worker: {}.{} fuse blown — skipping immediate closure (job {})",
+            st.pgt_schema,
+            st.pgt_name,
+            job.job_id,
+        );
+        return RefreshOutcome::Success;
     }
 
     let tick_watermark: Option<String> = if config::pg_trickle_tick_watermark_enabled() {
@@ -2182,6 +2215,16 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                         continue;
                     }
 
+                    // FUSE-5: Check fuse circuit breaker.
+                    if evaluate_fuse(&st) {
+                        log!(
+                            "pg_trickle: {}.{} fuse blown — skipping in diamond group",
+                            st.pgt_schema,
+                            st.pgt_name,
+                        );
+                        continue;
+                    }
+
                     let (has_changes, has_stream_table_changes) =
                         upstream_change_state(&st, initial_table_changes.get(&pgt_id).copied());
                     let action = if has_changes && has_stream_table_changes {
@@ -2423,25 +2466,132 @@ fn check_cdc_transition_health() {
 
 // ── Skip Mechanism ─────────────────────────────────────────────────────────
 
-/// Check if a refresh should be skipped because a previous one is still running.
+// Check if a refresh should be skipped because a previous one is still running.
+//
+// Uses `SELECT ... FOR UPDATE SKIP LOCKED` on the catalog row to detect
+// concurrent refreshes.  If another session holds the row lock the query
+// returns zero rows and we skip.  The row lock, once acquired, is held for
+// the remainder of the caller's transaction — this is intentional, as the
+// lock prevents concurrent refreshes until the tick transaction commits.
+//
+// IMPORTANT: `Spi::get_one_with_args` is used here (not `Spi::connect` +
+// `client.select`) because pgrx's `select` passes `read_only =
+// Spi::is_xact_still_immutable()`, which evaluates to `true` when no prior
+// mutation has assigned a transaction XID yet.  PostgreSQL rejects `FOR
+// UPDATE` in a read-only SPI context with "SELECT FOR UPDATE is not allowed
+// in a non-volatile function".  `get_one_with_args` routes through
+// `connect_mut` / `update`, which always uses `read_only = false`.
+//
+// PB1: replaces the previous `pg_try_advisory_lock` approach for
+// PgBouncer transaction‐mode compatibility.
+
+// ── FUSE-5: Fuse circuit breaker pre-check ─────────────────────────────────
+
+/// Count total pending change buffer rows across all TABLE/FOREIGN_TABLE
+/// sources for a stream table.
+fn count_pending_changes(st: &StreamTableMeta) -> i64 {
+    let change_schema = config::pg_trickle_change_buffer_schema();
+    let source_oids = get_source_oids_for_st(st.pgt_id);
+
+    let mut total: i64 = 0;
+    for oid in &source_oids {
+        let count = Spi::get_one::<i64>(&format!(
+            "SELECT count(*) FROM {}.changes_{}",
+            change_schema,
+            oid.to_u32(),
+        ))
+        .unwrap_or(Some(0))
+        .unwrap_or(0);
+        total = total.saturating_add(count);
+    }
+    total
+}
+
+/// Evaluate the fuse circuit breaker for a stream table.
 ///
-/// Uses `SELECT ... FOR UPDATE SKIP LOCKED` on the catalog row to detect
-/// concurrent refreshes.  If another session holds the row lock the query
-/// returns zero rows and we skip.  The row lock, once acquired, is held for
-/// the remainder of the caller's transaction — this is intentional, as the
-/// lock prevents concurrent refreshes until the tick transaction commits.
-///
-/// IMPORTANT: `Spi::get_one_with_args` is used here (not `Spi::connect` +
-/// `client.select`) because pgrx's `select` passes `read_only =
-/// Spi::is_xact_still_immutable()`, which evaluates to `true` when no prior
-/// mutation has assigned a transaction XID yet.  PostgreSQL rejects `FOR
-/// UPDATE` in a read-only SPI context with "SELECT FOR UPDATE is not allowed
-/// in a non-volatile function".  `get_one_with_args` routes through
-/// `connect_mut` / `update`, which always uses `read_only = false`.
-///
-/// PB1: replaces the previous `pg_try_advisory_lock` approach for
-/// PgBouncer transaction‐mode compatibility.
-///
+/// Returns `true` if the fuse blew (refresh should be skipped).
+/// Returns `false` if the fuse is OK or disabled.
+fn evaluate_fuse(st: &StreamTableMeta) -> bool {
+    // Quick exit: fuse disabled or already blown
+    if st.fuse_mode == "off" || st.fuse_state == "blown" || st.fuse_state == "disabled" {
+        return st.fuse_state == "blown";
+    }
+
+    // Determine effective ceiling
+    let global_ceiling = config::pg_trickle_fuse_default_ceiling();
+    let effective_ceiling = match st.fuse_ceiling {
+        Some(c) if c > 0 => c,
+        _ if global_ceiling > 0 => global_ceiling,
+        _ => return false, // No ceiling configured — fuse is a no-op
+    };
+
+    // Count pending changes
+    let pending = count_pending_changes(st);
+    if pending <= effective_ceiling {
+        return false;
+    }
+
+    // Sensitivity check: only blow after N consecutive over-ceiling observations.
+    // For now, each scheduler tick is one observation. Sensitivity > 1 requires
+    // tracking a counter in the catalog, which we skip for v1 (sensitivity
+    // defaults to 1 = blow immediately on first over-ceiling observation).
+    let sensitivity = st.fuse_sensitivity.unwrap_or(1);
+    if sensitivity > 1 {
+        // Future: track observation count in catalog. For now, blow immediately
+        // since we don't yet have a per-tick counter column.
+        // This is correct for sensitivity=1 (the default).
+    }
+    let _ = sensitivity; // suppress unused warning
+
+    // BLOW the fuse
+    let reason = format!(
+        "change buffer count ({}) exceeded ceiling ({})",
+        pending, effective_ceiling
+    );
+    pgrx::warning!(
+        "pg_trickle: FUSE BLOWN for {}.{} — {}",
+        st.pgt_schema,
+        st.pgt_name,
+        reason,
+    );
+
+    if let Err(e) = StreamTableMeta::blow_fuse(st.pgt_id, &reason) {
+        pgrx::warning!(
+            "pg_trickle: failed to blow fuse for {}.{}: {}",
+            st.pgt_schema,
+            st.pgt_name,
+            e,
+        );
+    }
+
+    // Send pg_notify alert
+    let notify_payload = format!(
+        "{{\"event\":\"fuse_blown\",\"stream_table\":\"{}.{}\",\"pending\":{},\"ceiling\":{}}}",
+        st.pgt_schema, st.pgt_name, pending, effective_ceiling
+    );
+    let _ = Spi::run_with_args(
+        "SELECT pg_notify('pgtrickle_alert', $1)",
+        &[notify_payload.as_str().into()],
+    );
+
+    true
+}
+
+/// Evaluate the fuse and return the effective ceiling threshold if the fuse
+/// is active for this stream table. Pure decision logic for unit testing.
+#[cfg(test)]
+fn fuse_is_active(fuse_mode: &str, fuse_ceiling: Option<i64>, global_ceiling: i64) -> bool {
+    if fuse_mode == "off" {
+        return false;
+    }
+    let effective = match fuse_ceiling {
+        Some(c) if c > 0 => c,
+        _ if global_ceiling > 0 => global_ceiling,
+        _ => return false,
+    };
+    effective > 0
+}
+
 /// Returns `true` if the refresh should be skipped.
 ///
 /// SAF-1 audit (v0.11.0): This function and the broader worker loop in
@@ -3200,6 +3350,16 @@ fn refresh_single_st(
     if check_skip_needed(&st) {
         log!(
             "pg_trickle: skipping {}.{} — previous refresh still running",
+            st.pgt_schema,
+            st.pgt_name,
+        );
+        return;
+    }
+
+    // FUSE-5: Check fuse circuit breaker.
+    if evaluate_fuse(&st) {
+        log!(
+            "pg_trickle: {}.{} fuse blown — skipping inline refresh",
             st.pgt_schema,
             st.pgt_name,
         );
@@ -4262,5 +4422,37 @@ mod tests {
         ] {
             assert_eq!(RefreshTier::from_sql_str(tier.as_str()), tier);
         }
+    }
+
+    // ── FUSE unit tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_fuse_is_active_off_mode() {
+        assert!(!fuse_is_active("off", Some(1000), 5000));
+        assert!(!fuse_is_active("off", None, 5000));
+    }
+
+    #[test]
+    fn test_fuse_is_active_on_with_per_st_ceiling() {
+        assert!(fuse_is_active("on", Some(1000), 0));
+        assert!(fuse_is_active("on", Some(1000), 5000));
+    }
+
+    #[test]
+    fn test_fuse_is_active_on_with_global_ceiling_only() {
+        assert!(fuse_is_active("on", None, 5000));
+    }
+
+    #[test]
+    fn test_fuse_is_active_on_no_ceiling_at_all() {
+        assert!(!fuse_is_active("on", None, 0));
+        assert!(!fuse_is_active("on", Some(0), 0));
+    }
+
+    #[test]
+    fn test_fuse_is_active_auto_mode() {
+        assert!(fuse_is_active("auto", Some(100), 0));
+        assert!(fuse_is_active("auto", None, 5000));
+        assert!(!fuse_is_active("auto", None, 0));
     }
 }

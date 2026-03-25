@@ -78,6 +78,21 @@ pub struct StreamTableMeta {
     /// Controls the effective schedule multiplier when
     /// `pg_trickle.tiered_scheduling` is enabled.
     pub refresh_tier: String,
+    /// FUSE-1: Fuse circuit breaker mode ('off', 'on', 'auto').
+    /// 'off' = disabled, 'on' = always active, 'auto' = inherit from global GUC.
+    pub fuse_mode: String,
+    /// FUSE-1: Current fuse state ('armed', 'blown', 'disabled').
+    pub fuse_state: String,
+    /// FUSE-1: Per-ST change count threshold that triggers the fuse.
+    /// None means use the global `pg_trickle.fuse_default_ceiling` GUC.
+    pub fuse_ceiling: Option<i64>,
+    /// FUSE-1: Sensitivity — number of consecutive over-ceiling observations
+    /// required before the fuse actually blows. None means 1 (immediate).
+    pub fuse_sensitivity: Option<i32>,
+    /// FUSE-1: Timestamp when the fuse was blown. None if never blown.
+    pub blown_at: Option<TimestampWithTimeZone>,
+    /// FUSE-1: Human-readable reason the fuse was blown.
+    pub blow_reason: Option<String>,
 }
 
 /// CDC mode for a source dependency — tracks whether change capture uses
@@ -239,7 +254,10 @@ impl StreamTableMeta {
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
                      scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
-                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier, \
+                     COALESCE(fuse_mode, 'off') AS fuse_mode, \
+                     COALESCE(fuse_state, 'armed') AS fuse_state, \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_schema = $1 AND pgt_name = $2",
                     None,
@@ -267,7 +285,10 @@ impl StreamTableMeta {
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
                      scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
-                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier, \
+                     COALESCE(fuse_mode, 'off') AS fuse_mode, \
+                     COALESCE(fuse_state, 'armed') AS fuse_state, \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_relid = $1",
                     None,
@@ -300,7 +321,10 @@ impl StreamTableMeta {
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
                      scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
-                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier, \
+                     COALESCE(fuse_mode, 'off') AS fuse_mode, \
+                     COALESCE(fuse_state, 'armed') AS fuse_state, \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE pgt_id = $1",
                     None,
@@ -328,7 +352,10 @@ impl StreamTableMeta {
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
                      scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
-                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier, \
+                     COALESCE(fuse_mode, 'off') AS fuse_mode, \
+                     COALESCE(fuse_state, 'armed') AS fuse_state, \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
                      FROM pgtrickle.pgt_stream_tables",
                     None,
                     &[],
@@ -360,7 +387,10 @@ impl StreamTableMeta {
                      topk_offset, diamond_consistency, diamond_schedule_policy, \
                      has_keyless_source, function_hashes, requested_cdc_mode, is_append_only, \
                      scc_id, last_fixpoint_iterations, pooler_compatibility_mode, \
-                     COALESCE(refresh_tier, 'hot') AS refresh_tier \
+                     COALESCE(refresh_tier, 'hot') AS refresh_tier, \
+                     COALESCE(fuse_mode, 'off') AS fuse_mode, \
+                     COALESCE(fuse_state, 'armed') AS fuse_state, \
+                     fuse_ceiling, fuse_sensitivity, blown_at, blow_reason \
                      FROM pgtrickle.pgt_stream_tables \
                      WHERE status = 'ACTIVE'",
                     None,
@@ -774,6 +804,53 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    // ── Fuse circuit breaker CRUD ──────────────────────────────────────
+
+    /// FUSE-1: Update fuse configuration for a stream table.
+    pub fn update_fuse_config(
+        pgt_id: i64,
+        fuse_mode: &str,
+        fuse_ceiling: Option<i64>,
+        fuse_sensitivity: Option<i32>,
+    ) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET fuse_mode = $1, fuse_ceiling = $2, fuse_sensitivity = $3, updated_at = now() \
+             WHERE pgt_id = $4",
+            &[
+                fuse_mode.into(),
+                fuse_ceiling.into(),
+                fuse_sensitivity.into(),
+                pgt_id.into(),
+            ],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// FUSE-5: Blow the fuse for a stream table.
+    pub fn blow_fuse(pgt_id: i64, reason: &str) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET fuse_state = 'blown', blown_at = now(), blow_reason = $1, \
+             status = 'SUSPENDED', updated_at = now() \
+             WHERE pgt_id = $2",
+            &[reason.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
+    /// FUSE-3: Reset the fuse (re-arm) for a stream table.
+    pub fn reset_fuse(pgt_id: i64) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET fuse_state = 'armed', blown_at = NULL, blow_reason = NULL, \
+             status = 'ACTIVE', consecutive_errors = 0, updated_at = now() \
+             WHERE pgt_id = $1",
+            &[pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     // ── Private helpers ────────────────────────────────────────────────
 
     /// Extract a StreamTableMeta from a positioned SpiTupleTable (after first()).
@@ -863,6 +940,18 @@ impl StreamTableMeta {
             .get::<String>(30)
             .map_err(map_spi)?
             .unwrap_or_else(|| "hot".into());
+        let fuse_mode = table
+            .get::<String>(31)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "off".into());
+        let fuse_state = table
+            .get::<String>(32)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "armed".into());
+        let fuse_ceiling = table.get::<i64>(33).map_err(map_spi)?;
+        let fuse_sensitivity = table.get::<i32>(34).map_err(map_spi)?;
+        let blown_at = table.get::<TimestampWithTimeZone>(35).map_err(map_spi)?;
+        let blow_reason = table.get::<String>(36).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -895,6 +984,12 @@ impl StreamTableMeta {
             last_fixpoint_iterations,
             pooler_compatibility_mode,
             refresh_tier,
+            fuse_mode,
+            fuse_state,
+            fuse_ceiling,
+            fuse_sensitivity,
+            blown_at,
+            blow_reason,
         })
     }
 
@@ -985,6 +1080,18 @@ impl StreamTableMeta {
             .get::<String>(30)
             .map_err(map_spi)?
             .unwrap_or_else(|| "hot".into());
+        let fuse_mode = row
+            .get::<String>(31)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "off".into());
+        let fuse_state = row
+            .get::<String>(32)
+            .map_err(map_spi)?
+            .unwrap_or_else(|| "armed".into());
+        let fuse_ceiling = row.get::<i64>(33).map_err(map_spi)?;
+        let fuse_sensitivity = row.get::<i32>(34).map_err(map_spi)?;
+        let blown_at = row.get::<TimestampWithTimeZone>(35).map_err(map_spi)?;
+        let blow_reason = row.get::<String>(36).map_err(map_spi)?;
 
         Ok(StreamTableMeta {
             pgt_id,
@@ -1017,6 +1124,12 @@ impl StreamTableMeta {
             last_fixpoint_iterations,
             pooler_compatibility_mode,
             refresh_tier,
+            fuse_mode,
+            fuse_state,
+            fuse_ceiling,
+            fuse_sensitivity,
+            blown_at,
+            blow_reason,
         })
     }
 }

@@ -3129,6 +3129,12 @@ mod tests {
             last_fixpoint_iterations: None,
             pooler_compatibility_mode: false,
             refresh_tier: "hot".to_string(),
+            fuse_mode: "off".to_string(),
+            fuse_state: "armed".to_string(),
+            fuse_ceiling: None,
+            fuse_sensitivity: None,
+            blown_at: None,
+            blow_reason: None,
         }
     }
 

@@ -369,6 +369,16 @@ pub static PGS_TIERED_SCHEDULING: GucSetting<bool> = GucSetting::<bool>::new(fal
 /// the server log.
 pub static PGS_LOG_MERGE_SQL: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// FUSE-5: Global default change-count ceiling for the fuse circuit breaker.
+///
+/// When a stream table's fuse_mode is 'on' or 'auto' and no per-ST
+/// `fuse_ceiling` is configured, this global ceiling is used. If the total
+/// pending change buffer rows across all sources of an ST exceed this value,
+/// the fuse blows and the ST is suspended.
+///
+/// Set to 0 to disable the global default ceiling (per-ST ceiling only).
+pub static PGS_FUSE_DEFAULT_CEILING: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -830,6 +840,19 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.fuse_default_ceiling",
+        c"Global default change-count ceiling for the fuse circuit breaker.",
+        c"When a stream table has fuse_mode='on' or 'auto' and no per-ST fuse_ceiling, \
+           this value is used. If pending changes exceed this count, the fuse blows \
+           and the ST is suspended. Set to 0 to disable the global default.",
+        &PGS_FUSE_DEFAULT_CEILING,
+        0,             // min (disabled)
+        2_000_000_000, // max (~2B rows)
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -1076,6 +1099,11 @@ pub fn pg_trickle_tiered_scheduling() -> bool {
 /// QF-1: Returns whether MERGE SQL template logging is enabled.
 pub fn pg_trickle_log_merge_sql() -> bool {
     PGS_LOG_MERGE_SQL.get()
+}
+
+/// FUSE-5: Returns the global default fuse ceiling (0 = disabled).
+pub fn pg_trickle_fuse_default_ceiling() -> i64 {
+    PGS_FUSE_DEFAULT_CEILING.get() as i64
 }
 
 /// WAKE-1: Returns whether event-driven scheduler wake is enabled.
