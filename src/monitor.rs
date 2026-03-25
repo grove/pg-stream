@@ -902,29 +902,40 @@ pub fn emit_cdc_transition_notify(
 
 /// Check all tracked change buffers and WAL replication slots and emit alerts
 /// when either exceeds the configured threshold. Called from the scheduler loop.
+///
+/// This function must be called in its own clean transaction (separate from the
+/// Phase 1 WAL poll transaction). If Phase 1's WAL poll for a missing slot
+/// leaves the SPI session in an inconsistent state, the EC-34 slot-existence
+/// check inside this function would fail silently and the TRIGGER fallback
+/// would never fire. Running here in a fresh transaction guarantees SPI works.
 pub fn check_slot_health_and_alert() {
     // With trigger-based CDC, we check pending change buffer size instead
     // of replication slot WAL retention. Alert if buffer tables grow too large.
     let change_schema = config::pg_trickle_change_buffer_schema();
 
-    let sources = Spi::connect(|client| {
-        let result = client
-            .select(
-                "SELECT ct.slot_name, ct.source_relid::bigint \
-                 FROM pgtrickle.pgt_change_tracking ct",
-                None,
-                &[],
-            )
-            .map_err(|e| pgrx::error!("slot_health: SPI select failed: {e}"))
-            .expect("unreachable after error!()");
-
-        let mut out = Vec::new();
-        for row in result {
-            let trigger = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
-            let relid = row.get::<i64>(2).unwrap_or(None).unwrap_or(0);
-            out.push((trigger, relid));
+    // Gracefully handle SPI failures (e.g. if called during transaction
+    // recovery or in a degraded state) — skip rather than panic.
+    let sources = Spi::connect(|client| -> Vec<(String, i64)> {
+        match client.select(
+            "SELECT ct.slot_name, ct.source_relid::bigint \
+             FROM pgtrickle.pgt_change_tracking ct",
+            None,
+            &[],
+        ) {
+            Ok(result) => {
+                let mut out = Vec::new();
+                for row in result {
+                    let trigger = row.get::<String>(1).unwrap_or(None).unwrap_or_default();
+                    let relid = row.get::<i64>(2).unwrap_or(None).unwrap_or(0);
+                    out.push((trigger, relid));
+                }
+                out
+            }
+            Err(_) => {
+                // SPI error in this query is non-fatal — skip buffer check.
+                Vec::new()
+            }
         }
-        out
     });
 
     for (trigger_name, relid) in sources {

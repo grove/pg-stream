@@ -1610,6 +1610,23 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
                 }
                 Err(e) => log!("pg_trickle: WAL transition phase 1 error: {}", e),
             }
+            // NOTE: check_slot_health_and_alert() is intentionally NOT called
+            // here.  Phase 1's WAL poll for a missing/invalid replication slot
+            // can abort the current SPI session (even when the Rust-level
+            // catch_unwind absorbs the panic), which silently breaks subsequent
+            // SPI calls — including the EC-34 slot-existence check inside
+            // check_slot_health_and_alert().  Running the health check in its
+            // own transaction (below) guarantees a pristine SPI connection and
+            // ensures reliable fallback-to-TRIGGER detection.
+        }));
+
+        // Slot / buffer health check in its own pristine transaction.
+        // Must be separate from Phase 1 so that WAL poll errors (which can
+        // corrupt the Phase 1 SPI session) do not prevent the EC-34 missing-
+        // slot detection from running.  This is the primary path for automatic
+        // fallback from WAL mode to TRIGGER mode when a replication slot is
+        // externally dropped.
+        BackgroundWorker::transaction(AssertUnwindSafe(|| {
             monitor::check_slot_health_and_alert();
         }));
 
