@@ -698,12 +698,7 @@ fn execute_worker_singleton(job: &SchedulerJob) -> RefreshOutcome {
         None
     };
     let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
-    let has_st_changes = has_stream_table_source_changes(&st);
-    let action = if has_changes && has_st_changes {
-        RefreshAction::Full
-    } else {
-        refresh::determine_refresh_action(&st, has_changes)
-    };
+    let action = refresh::determine_refresh_action(&st, has_changes);
 
     execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None)
 }
@@ -803,12 +798,7 @@ fn execute_worker_atomic_group(job: &SchedulerJob, is_repeatable_read: bool) -> 
         }
 
         let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
-        let has_st_changes = has_stream_table_source_changes(&st);
-        let action = if has_changes && has_st_changes {
-            RefreshAction::Full
-        } else {
-            refresh::determine_refresh_action(&st, has_changes)
-        };
+        let action = refresh::determine_refresh_action(&st, has_changes);
 
         let result = execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None);
         match result {
@@ -893,12 +883,7 @@ fn execute_worker_immediate_closure(job: &SchedulerJob) -> RefreshOutcome {
         None
     };
     let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
-    let has_st_changes = has_stream_table_source_changes(&st);
-    let action = if has_changes && has_st_changes {
-        RefreshAction::Full
-    } else {
-        refresh::determine_refresh_action(&st, has_changes)
-    };
+    let action = refresh::determine_refresh_action(&st, has_changes);
 
     execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None)
 }
@@ -3008,38 +2993,65 @@ fn has_table_source_changes(st: &StreamTableMeta) -> bool {
     false
 }
 
-/// Returns `true` if any STREAM_TABLE upstream has a `data_timestamp` more
-/// recent than our own `data_timestamp`.
+/// Returns `true` if any STREAM_TABLE upstream has buffered changes beyond
+/// the current frontier.
 ///
-/// STREAM_TABLE upstreams have no CDC change buffer.  We detect staleness via
-/// a `data_timestamp` comparison instead.  When this returns `true`, the
-/// caller **must** use `RefreshAction::Full` — a differential refresh cannot
-/// incorporate stream-table changes (no change buffer to diff against).
+/// For each upstream ST dependency that has a change buffer
+/// (`changes_pgt_{pgt_id}`), we check whether rows exist with an LSN greater
+/// than the LSN recorded in our frontier.  If no buffer exists yet (e.g.
+/// before the first refresh), we fall back to the timestamp comparison.
 fn has_stream_table_source_changes(st: &StreamTableMeta) -> bool {
     let deps = crate::catalog::StDependency::get_for_st(st.pgt_id).unwrap_or_default();
+    let change_schema = config::pg_trickle_change_buffer_schema();
+    let frontier = st.frontier.clone().unwrap_or_default();
 
     for dep in &deps {
         if dep.source_type != "STREAM_TABLE" {
             continue;
         }
 
-        let upstream_newer = Spi::get_one::<bool>(&format!(
-            "SELECT EXISTS ( \
-               SELECT 1 \
-               FROM pgtrickle.pgt_stream_tables upstream \
-               JOIN pgtrickle.pgt_stream_tables us ON us.pgt_id = {} \
-               WHERE upstream.pgt_relid = {}::oid \
-                 AND upstream.data_timestamp \
-                     > COALESCE(us.data_timestamp, '-infinity'::timestamptz) \
-             )",
-            st.pgt_id,
-            dep.source_relid.to_u32(),
-        ))
-        .unwrap_or(Some(false))
-        .unwrap_or(false);
+        let upstream_pgt_id =
+            match crate::catalog::StreamTableMeta::pgt_id_for_relid(dep.source_relid) {
+                Some(id) => id,
+                None => continue,
+            };
 
-        if upstream_newer {
-            return true;
+        // If a change buffer exists, check for rows beyond the frontier LSN.
+        if crate::cdc::has_st_change_buffer(upstream_pgt_id, &change_schema) {
+            let prev_lsn = frontier.get_st_lsn(upstream_pgt_id);
+            let has_new_rows = Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {schema}.changes_pgt_{id} \
+                 WHERE lsn > '{lsn}'::pg_lsn)",
+                schema = change_schema,
+                id = upstream_pgt_id,
+                lsn = prev_lsn,
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
+
+            if has_new_rows {
+                return true;
+            }
+        } else {
+            // Fallback: no buffer yet — use timestamp comparison.
+            let upstream_newer = Spi::get_one::<bool>(&format!(
+                "SELECT EXISTS ( \
+                   SELECT 1 \
+                   FROM pgtrickle.pgt_stream_tables upstream \
+                   JOIN pgtrickle.pgt_stream_tables us ON us.pgt_id = {} \
+                   WHERE upstream.pgt_relid = {}::oid \
+                     AND upstream.data_timestamp \
+                         > COALESCE(us.data_timestamp, '-infinity'::timestamptz) \
+                 )",
+                st.pgt_id,
+                dep.source_relid.to_u32(),
+            ))
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
+
+            if upstream_newer {
+                return true;
+            }
         }
     }
     false
@@ -3565,6 +3577,34 @@ fn execute_scheduled_refresh(
     let _ = Spi::run("SET LOCAL row_security = off");
 
     // Execute the refresh
+
+    // Collect current WAL positions for upstream ST sources so we can
+    // embed them in the frontier.
+    let change_schema_for_st = crate::config::pg_trickle_change_buffer_schema();
+    let st_source_positions: Vec<(i64, String)> =
+        crate::catalog::StDependency::get_for_st(st.pgt_id)
+            .unwrap_or_default()
+            .iter()
+            .filter(|dep| dep.source_type == "STREAM_TABLE")
+            .filter_map(|dep| {
+                let upstream_pgt_id =
+                    crate::catalog::StreamTableMeta::pgt_id_for_relid(dep.source_relid)?;
+                if !crate::cdc::has_st_change_buffer(upstream_pgt_id, &change_schema_for_st) {
+                    return None;
+                }
+                let lsn = Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text")
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "0/0".to_string());
+                Some((upstream_pgt_id, lsn))
+            })
+            .collect();
+
+    let augment_frontier = |frontier: &mut version::Frontier| {
+        for (upstream_pgt_id, lsn) in &st_source_positions {
+            frontier.set_st_source(*upstream_pgt_id, lsn.clone(), data_ts_frontier.clone());
+        }
+    };
+
     let result = if st.topk_limit.is_some() {
         // TopK tables bypass the normal Full/Differential refresh paths and use
         // scoped-recomputation MERGE (ORDER BY … LIMIT N) instead.
@@ -3573,8 +3613,9 @@ fn execute_scheduled_refresh(
         match action {
             RefreshAction::NoData => refresh::execute_no_data_refresh(st).map(|_| (0i64, 0i64)),
             RefreshAction::Full => {
-                let new_frontier =
+                let mut new_frontier =
                     version::compute_initial_frontier(&slot_positions, &data_ts_frontier);
+                augment_frontier(&mut new_frontier);
                 match refresh::execute_full_refresh(st) {
                     Ok((ins, del)) => {
                         if let Err(e) = StreamTableMeta::store_frontier(st.pgt_id, &new_frontier) {
@@ -3599,8 +3640,9 @@ fn execute_scheduled_refresh(
                 }
             }
             RefreshAction::Reinitialize => {
-                let new_frontier =
+                let mut new_frontier =
                     version::compute_initial_frontier(&slot_positions, &data_ts_frontier);
+                augment_frontier(&mut new_frontier);
                 match refresh::execute_reinitialize_refresh(st) {
                     Ok((ins, del)) => {
                         if let Err(e) = StreamTableMeta::store_frontier(st.pgt_id, &new_frontier) {
@@ -3634,8 +3676,9 @@ fn execute_scheduled_refresh(
                         st.pgt_schema,
                         st.pgt_name
                     );
-                    let new_frontier =
+                    let mut new_frontier =
                         version::compute_initial_frontier(&slot_positions, &data_ts_frontier);
+                    augment_frontier(&mut new_frontier);
                     match refresh::execute_full_refresh(st) {
                         Ok((ins, del)) => {
                             if let Err(e) =
@@ -3656,8 +3699,9 @@ fn execute_scheduled_refresh(
                         Err(e) => Err(e),
                     }
                 } else {
-                    let new_frontier =
+                    let mut new_frontier =
                         version::compute_new_frontier(&slot_positions, &data_ts_frontier);
+                    augment_frontier(&mut new_frontier);
 
                     match refresh::execute_differential_refresh(st, &prev_frontier, &new_frontier) {
                         Ok((ins, del)) => {

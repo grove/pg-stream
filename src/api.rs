@@ -1224,6 +1224,14 @@ fn setup_trigger_infrastructure(
                 cdc::setup_foreign_table_polling(*source_oid, pgt_id, &change_schema)?;
             } else if source_type == "MATVIEW" {
                 cdc::setup_matview_polling(*source_oid, pgt_id, &change_schema)?;
+            } else if source_type == "STREAM_TABLE" {
+                // ST-ST-1: Ensure the upstream ST has a change buffer so
+                // downstream STs can consume differential deltas.
+                let upstream_pgt_id =
+                    crate::catalog::StreamTableMeta::pgt_id_for_relid(*source_oid);
+                if let Some(up_id) = upstream_pgt_id {
+                    cdc::ensure_st_change_buffer(up_id, *source_oid, &change_schema)?;
+                }
             }
         }
     }
@@ -2919,6 +2927,38 @@ fn drop_stream_table_impl_inner(
             } else {
                 cleanup_cdc_for_source(dep.source_relid, dep.cdc_mode, None)?;
             }
+        } else if dep.source_type == "STREAM_TABLE" {
+            // ST-ST-1: If this was the last downstream consumer of an
+            // upstream ST's change buffer, drop the buffer.
+            let upstream_pgt_id =
+                crate::catalog::StreamTableMeta::pgt_id_for_relid(dep.source_relid);
+            if let Some(up_id) = upstream_pgt_id {
+                let consumers = cdc::count_downstream_st_consumers(up_id);
+                if consumers == 0 {
+                    let change_schema = config::pg_trickle_change_buffer_schema();
+                    if let Err(e) = cdc::drop_st_change_buffer_table(up_id, &change_schema) {
+                        pgrx::warning!(
+                            "Failed to drop ST change buffer for upstream pgt_id {}: {}",
+                            up_id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ST-ST-1: Drop this ST's own change buffer (if it had downstream consumers).
+    {
+        let change_schema = config::pg_trickle_change_buffer_schema();
+        if cdc::has_st_change_buffer(st.pgt_id, &change_schema)
+            && let Err(e) = cdc::drop_st_change_buffer_table(st.pgt_id, &change_schema)
+        {
+            pgrx::warning!(
+                "Failed to drop own ST change buffer for pgt_id {}: {}",
+                st.pgt_id,
+                e
+            );
         }
     }
 

@@ -73,6 +73,21 @@ impl Frontier {
         self.data_timestamp = Some(ts);
     }
 
+    /// Set the frontier for an ST source, keyed by `pgt_{pgt_id}`.
+    pub fn set_st_source(&mut self, pgt_id: i64, lsn: String, snapshot_ts: String) {
+        let key = format!("pgt_{pgt_id}");
+        self.sources.insert(key, SourceVersion { lsn, snapshot_ts });
+    }
+
+    /// Get the LSN for an ST source, or "0/0" if not tracked.
+    pub fn get_st_lsn(&self, pgt_id: i64) -> String {
+        let key = format!("pgt_{pgt_id}");
+        self.sources
+            .get(&key)
+            .map(|sv| sv.lsn.clone())
+            .unwrap_or_else(|| "0/0".to_string())
+    }
+
     /// Get all source OIDs tracked by this frontier.
     pub fn source_oids(&self) -> Vec<u32> {
         self.sources

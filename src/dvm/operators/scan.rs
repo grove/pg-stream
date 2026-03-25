@@ -195,11 +195,21 @@ fn diff_scan_change_buffer(
     pk_columns: &[String],
     alias: &str,
 ) -> Result<DiffResult, PgTrickleError> {
-    let change_table = format!(
-        "{}.changes_{}",
-        quote_ident(&ctx.change_buffer_schema),
-        table_oid,
-    );
+    // ST-ST-4: Use `changes_pgt_{pgt_id}` for ST sources, `changes_{oid}` for base tables.
+    let is_st_source = ctx.st_source_pgt_ids.contains_key(&table_oid);
+    let change_table = if let Some(&pgt_id) = ctx.st_source_pgt_ids.get(&table_oid) {
+        format!(
+            "{}.changes_pgt_{}",
+            quote_ident(&ctx.change_buffer_schema),
+            pgt_id,
+        )
+    } else {
+        format!(
+            "{}.changes_{}",
+            quote_ident(&ctx.change_buffer_schema),
+            table_oid,
+        )
+    };
 
     let prev_lsn = ctx.get_prev_lsn(table_oid);
     let new_lsn = ctx.get_new_lsn(table_oid);
@@ -255,9 +265,13 @@ fn diff_scan_change_buffer(
     } else {
         pk_columns.iter().map(|s| s.as_str()).collect()
     };
+    // ST-ST-4: ST change buffers have no old_* columns. For ST sources,
+    // the "old" pk hash is the same as the new pk hash (no UPDATEs in
+    // ST deltas — only I/D pairs), so we use new_* columns for old hash.
+    let old_col_prefix = if is_st_source { "new" } else { "old" };
     let old_hash_args: Vec<String> = hash_cols
         .iter()
-        .map(|c| format!("c.{}::TEXT", quote_ident(&format!("old_{c}"))))
+        .map(|c| format!("c.{}::TEXT", quote_ident(&format!("{old_col_prefix}_{c}"))))
         .collect();
     let old_pk_hash_expr = if old_hash_args.len() == 1 {
         format!("pgtrickle.pg_trickle_hash({})", old_hash_args[0])
@@ -268,16 +282,28 @@ fn diff_scan_change_buffer(
         )
     };
 
-    // Build typed column references for the raw CTE
+    // Build typed column references for the raw CTE.
+    // ST-ST-4: ST buffers only have new_* columns; emit new_* twice
+    // (aliased as old_*) so downstream CTEs can reference both uniformly.
     let mut typed_col_refs = Vec::new();
     for c in columns {
         typed_col_refs.push(format!("c.{}", quote_ident(&format!("new_{}", c.name))));
-        typed_col_refs.push(format!("c.{}", quote_ident(&format!("old_{}", c.name))));
+        if is_st_source {
+            // Alias new_* as old_* since ST buffers lack old_* columns
+            typed_col_refs.push(format!(
+                "c.{} AS {}",
+                quote_ident(&format!("new_{}", c.name)),
+                quote_ident(&format!("old_{}", c.name)),
+            ));
+        } else {
+            typed_col_refs.push(format!("c.{}", quote_ident(&format!("old_{}", c.name))));
+        }
     }
     let typed_col_refs_str = typed_col_refs.join(",\n       ");
 
     // Build output column references: old_* for DELETE, new_* for INSERT.
     // Each is aliased to the original column name for downstream CTEs.
+    // For ST sources, old_* columns are already aliased from new_* above.
     let old_col_refs: Vec<String> = columns
         .iter()
         .map(|c| {

@@ -265,6 +265,9 @@ pub fn generate_delta_query(
     // scan operator can build a changed_cols bitmask filter.
     ctx.source_cdc_columns = resolve_cdc_columns_for_sources(&source_oids);
 
+    // ST-ST-4: Resolve which sources are STs for proper buffer table routing.
+    ctx.st_source_pgt_ids = resolve_st_source_pgt_ids(&source_oids);
+
     let (delta_sql, output_columns, diff_dedup) = ctx.differentiate_with_columns(&result.tree)?;
 
     Ok(DeltaQueryResult {
@@ -357,6 +360,9 @@ pub fn generate_delta_query_cached(
     // P2-5: Resolve CDC column ordinals for bitmask filter.
     ctx.source_cdc_columns = resolve_cdc_columns_for_sources(&source_oids);
 
+    // ST-ST-4: Resolve which sources are STs for proper buffer table routing.
+    ctx.st_source_pgt_ids = resolve_st_source_pgt_ids(&source_oids);
+
     let (template_sql, output_columns, diff_dedup) =
         ctx.differentiate_with_columns(&result.tree)?;
 
@@ -396,6 +402,23 @@ fn resolve_cdc_columns_for_sources(source_oids: &[u32]) -> HashMap<u32, Vec<Stri
     for &oid in source_oids {
         if let Ok(cols) = crate::cdc::resolve_referenced_column_defs(pgrx::pg_sys::Oid::from(oid)) {
             map.insert(oid, cols.into_iter().map(|(name, _)| name).collect());
+        }
+    }
+    map
+}
+
+/// ST-ST-4: Resolve which source OIDs are stream tables and map them
+/// to their upstream `pgt_id`.
+///
+/// Returns a map of `table_oid → pgt_id` for sources that are stream tables.
+/// Base tables (no entry in `pgt_stream_tables`) are not included.
+fn resolve_st_source_pgt_ids(source_oids: &[u32]) -> HashMap<u32, i64> {
+    let mut map = HashMap::new();
+    for &oid in source_oids {
+        if let Some(pgt_id) =
+            crate::catalog::StreamTableMeta::pgt_id_for_relid(pgrx::pg_sys::Oid::from(oid))
+        {
+            map.insert(oid, pgt_id);
         }
     }
     map
