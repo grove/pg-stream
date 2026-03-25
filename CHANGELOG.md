@@ -8,7 +8,8 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [0.10.0 — 2026-03-23](#0100--2026-03-23)
+- [0.11.0 — Unreleased](#0110--unreleased)
+- [0.10.0 — 2026-03-25](#0100--2026-03-25)
 - [0.9.0 — 2026-03-20](#090--2026-03-20)
 - [0.8.0 — 2026-03-17](#080--2026-03-17)
 - [0.7.0 — 2026-03-16](#070--2026-03-16)
@@ -28,7 +29,15 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [0.10.0] — 2026-03-23
+## [0.11.0] — Unreleased
+
+### Added
+
+<!-- 0.11.0 changes go here -->
+
+---
+
+## [0.10.0] — 2026-03-25
 
 The headline features of 0.10.0 are **cloud deployment compatibility**, **query
 engine correctness**, **refresh performance**, and **improved developer
