@@ -381,11 +381,18 @@ levels (64–256 STs) benefit from parallelism.
    interval, and when there are enough independent STs to fill the worker
    budget.
 
-4. **Stream-table sources force FULL refresh.** STs that depend on other STs
-   (rather than base tables) always get `RefreshAction::Full` because there is
-   no CDC change buffer for stream-table-to-stream-table propagation. This
-   means deep chains of STs do progressively more work per refresh as the
-   defining queries grow more complex.
+4. **Stream-table sources force FULL refresh (when ST-upstream changes are
+   detected).** When an upstream stream table's `data_timestamp` advances,
+   the downstream ST is forced to `RefreshAction::Full` because there is no
+   CDC change buffer for ST-to-ST propagation — a DIFFERENTIAL refresh would
+   be a no-op with nothing to merge. Critically, this is conditional: if an
+   ST has mixed sources (both a base table and an upstream ST) and only the
+   *base table* has changes, `has_stream_table_changes` is false and the
+   normal `determine_refresh_action()` path runs, which can return
+   `Differential`. The FULL override triggers **only** when `has_changes &&
+   has_stream_table_changes` are both true. Each FULL refresh reads from the
+   already-materialized upstream ST table — it does not re-execute upstream
+   queries — so work does not compound with depth.
 
 5. **Worker processes are ephemeral.** Each parallel refresh worker is a
    separate OS process with its own SPI connection — spawned, used, and
