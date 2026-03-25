@@ -344,27 +344,21 @@ fn diff_scan_change_buffer(
     // from multi-change PKs (require FIRST_VALUE/LAST_VALUE).
     let mut lsn_filter = format!("c.lsn > '{prev_lsn}'::pg_lsn AND c.lsn <= '{new_lsn}'::pg_lsn");
 
-    // ── P2-5: changed_cols bitmask filter ────────────────────────────
+    // ── P2-5 / WB-1: changed_cols VARBIT filter ─────────────────────
     //
-    // For PK-based tables with ≤63 columns, the CDC trigger stores a
-    // bitmask in `changed_cols` indicating which columns were modified
-    // by an UPDATE (NULL for INSERT/DELETE). When column pruning has
-    // reduced the referenced column set, we can skip UPDATE rows where
-    // none of the referenced columns actually changed.
+    // The CDC trigger stores a VARBIT in `changed_cols` for UPDATE rows:
+    // bit at position i (leftmost=0) is B'1' when column i changed.
+    // NULL for INSERT/DELETE (all columns populated). When column pruning
+    // has reduced the referenced set, we can skip UPDATE rows where none
+    // of the referenced columns actually changed. Works for any column count.
     if !is_keyless
         && let Some(cdc_cols) = ctx.source_cdc_columns.get(&table_oid)
-        && cdc_cols.len() <= 63
+        && let Some((mask_str, zero_str)) = compute_varbit_changed_cols_mask(columns, cdc_cols)
     {
-        let mask = compute_changed_cols_mask(columns, cdc_cols);
-        // Only add the filter when the mask is a strict subset
-        // (i.e. we pruned at least one column). A full mask
-        // would match every UPDATE row anyway.
-        let full_mask: i64 = (1i64 << cdc_cols.len()) - 1;
-        if mask != 0 && mask != full_mask {
-            lsn_filter.push_str(&format!(
-                " AND (c.changed_cols IS NULL OR (c.changed_cols & {mask}) != 0)"
-            ));
-        }
+        lsn_filter.push_str(&format!(
+            " AND (c.changed_cols IS NULL \
+             OR (c.changed_cols & B'{mask_str}') != B'{zero_str}')"
+        ));
     }
 
     // ── EC-06: Keyless net-counting path ─────────────────────────────
@@ -685,21 +679,38 @@ fn find_pk_columns(pk_columns: &[String], columns: &[crate::dvm::parser::Column]
 ///
 /// For each column in `scan_columns` (the pruned set), finds its index in
 /// `cdc_columns` (the full CDC column list ordered by `attnum`) and sets
-/// the corresponding bit. The resulting mask can be ANDed with the trigger's
-/// `changed_cols` value to determine if any referenced column changed.
+/// WB-1: Compute a VARBIT mask string for the `changed_cols` scan filter.
 ///
-/// Returns 0 if no columns could be mapped (should not happen in practice).
-fn compute_changed_cols_mask(
+/// Returns `Some((mask_bits, zero_bits))` where each string has one character
+/// per CDC column in ordinal order: '1' if the column is referenced by the scan,
+/// '0' otherwise. Both strings have length `cdc_columns.len()`.
+///
+/// Returns `None` when the mask is trivially unfiltered:
+/// - No scan columns mapped to CDC columns (mask = all zeros).
+/// - Every CDC column is referenced (full mask — any UPDATE passes).
+fn compute_varbit_changed_cols_mask(
     scan_columns: &[crate::dvm::parser::Column],
     cdc_columns: &[String],
-) -> i64 {
-    let mut mask: i64 = 0;
+) -> Option<(String, String)> {
+    let n = cdc_columns.len();
+    if n == 0 {
+        return None;
+    }
+    let mut mask_bits: Vec<char> = vec!['0'; n];
     for col in scan_columns {
         if let Some(idx) = cdc_columns.iter().position(|c| c == &col.name) {
-            mask |= 1i64 << idx;
+            mask_bits[idx] = '1';
         }
     }
-    mask
+    let any_set = mask_bits.contains(&'1');
+    let any_unset = mask_bits.contains(&'0');
+    // Only useful when it is a strict subset (not empty, not fully set).
+    if !any_set || !any_unset {
+        return None;
+    }
+    let mask_str: String = mask_bits.iter().collect();
+    let zero_str: String = "0".repeat(n);
+    Some((mask_str, zero_str))
 }
 
 // ── P2-7: Predicate pushdown helpers ────────────────────────────────────
@@ -1202,10 +1213,10 @@ mod tests {
         assert_sql_contains(&sql, "MAX(");
     }
 
-    // ── P2-5: changed_cols bitmask ──────────────────────────────────
+    // ── P2-5 / WB-1: changed_cols VARBIT mask ──────────────────────
 
     #[test]
-    fn test_compute_changed_cols_mask_basic() {
+    fn test_compute_varbit_changed_cols_mask_basic() {
         use crate::dvm::parser::Column;
         let cdc_cols = vec!["id".into(), "name".into(), "amount".into(), "region".into()];
         // Pruned: only "id" and "amount" are referenced.
@@ -1221,13 +1232,14 @@ mod tests {
                 is_nullable: true,
             },
         ];
-        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
-        // id=bit0, amount=bit2 → mask = 0b0101 = 5
-        assert_eq!(mask, 5);
+        let result = compute_varbit_changed_cols_mask(&scan_cols, &cdc_cols);
+        // id=pos0, name=pos1, amount=pos2, region=pos3
+        // referenced: id(0), amount(2) → mask = '1010', zero = '0000'
+        assert_eq!(result, Some(("1010".into(), "0000".into())));
     }
 
     #[test]
-    fn test_compute_changed_cols_mask_all_columns() {
+    fn test_compute_varbit_changed_cols_mask_all_columns() {
         use crate::dvm::parser::Column;
         let cdc_cols = vec!["a".into(), "b".into(), "c".into()];
         let scan_cols = vec![
@@ -1247,13 +1259,13 @@ mod tests {
                 is_nullable: false,
             },
         ];
-        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
-        // All columns → mask = 0b111 = 7 = (1 << 3) - 1
-        assert_eq!(mask, 7);
+        // All columns referenced — no filter needed.
+        let result = compute_varbit_changed_cols_mask(&scan_cols, &cdc_cols);
+        assert_eq!(result, None);
     }
 
     #[test]
-    fn test_compute_changed_cols_mask_single_column() {
+    fn test_compute_varbit_changed_cols_mask_single_column() {
         use crate::dvm::parser::Column;
         let cdc_cols = vec!["id".into(), "name".into(), "status".into()];
         let scan_cols = vec![Column {
@@ -1261,15 +1273,43 @@ mod tests {
             type_oid: 25,
             is_nullable: true,
         }];
-        let mask = compute_changed_cols_mask(&scan_cols, &cdc_cols);
-        // status=bit2 → mask = 0b100 = 4
-        assert_eq!(mask, 4);
+        // status at position 2 → mask = '001', zero = '000'
+        let result = compute_varbit_changed_cols_mask(&scan_cols, &cdc_cols);
+        assert_eq!(result, Some(("001".into(), "000".into())));
+    }
+
+    #[test]
+    fn test_compute_varbit_changed_cols_mask_wide_table() {
+        use crate::dvm::parser::Column;
+        // >63 columns — WB-1 must handle these without cap.
+        let cdc_cols: Vec<String> = (0..70).map(|i| format!("col{i}")).collect();
+        let scan_cols = vec![
+            Column {
+                name: "col0".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+            Column {
+                name: "col64".into(),
+                type_oid: 23,
+                is_nullable: false,
+            },
+        ];
+        let result = compute_varbit_changed_cols_mask(&scan_cols, &cdc_cols);
+        let (mask, zero) = result.expect("should produce a filter for wide tables");
+        assert_eq!(mask.len(), 70);
+        assert_eq!(zero.len(), 70);
+        assert_eq!(&mask[..1], "1"); // col0 referenced
+        assert_eq!(&mask[1..64], &"0".repeat(63)); // cols 1-63 not referenced
+        assert_eq!(&mask[64..65], "1"); // col64 referenced
+        assert_eq!(&mask[65..], &"0".repeat(5)); // cols 65-69 not referenced
+        assert_eq!(zero, "0".repeat(70));
     }
 
     #[test]
     fn test_p2_5_bitmask_filter_in_sql() {
         // When source_cdc_columns is populated and columns are pruned,
-        // the generated SQL should contain a changed_cols bitmask filter.
+        // the generated SQL should contain a changed_cols VARBIT filter.
         let mut ctx = test_ctx();
         ctx.source_cdc_columns.insert(
             100,
@@ -1280,8 +1320,11 @@ mod tests {
         let result = diff_scan(&mut ctx, &tree).unwrap();
         let sql = ctx.build_with_query(&result.cte_name);
 
-        // Should have the bitmask filter: mask = 1|4 = 5
-        assert_sql_contains(&sql, "c.changed_cols IS NULL OR (c.changed_cols & 5) != 0");
+        // id=pos0, amount=pos2 → mask='1010', zero='0000'
+        assert_sql_contains(
+            &sql,
+            "c.changed_cols IS NULL OR (c.changed_cols & B'1010') != B'0000'",
+        );
     }
 
     #[test]

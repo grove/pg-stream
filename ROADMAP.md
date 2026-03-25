@@ -3,7 +3,7 @@
 > **Last updated:** 2026-03-26
 > **Latest release:** 0.10.0 (2026-03-25)
 > **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
-> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (Prometheus/Grafana observability stack)
+> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (Prometheus/Grafana observability stack) · Phase 4 ✅ (Correctness guards & regression net) · Phase 5 🟡 (Wider changed-column VARBIT bitmask)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH

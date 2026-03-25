@@ -290,16 +290,15 @@ pub fn drop_change_trigger(
 ///
 /// `columns` contains the source table column definitions as
 /// `(column_name, sql_type_name)` pairs from `resolve_source_column_defs()`.
-/// Task 3.1: Build the PL/pgSQL expression for the `changed_cols` BIGINT bitmask.
+/// WB-1: Build the PL/pgSQL expression for the `changed_cols` VARBIT bitmask.
 ///
-/// Bit `i` is set when `NEW.col_i IS DISTINCT FROM OLD.col_i`, allowing the
-/// scan delta to determine which columns were actually modified by an UPDATE.
+/// Bit at position `i` (leftmost = 0) is B'1' when
+/// `NEW.col_i IS DISTINCT FROM OLD.col_i`, allowing the scan delta to
+/// determine which columns were actually modified by an UPDATE.
+/// VARBIT supports tables with arbitrarily many columns — one bit per column.
 ///
-/// Returns `None` when the optimization is not applicable:
-/// - Keyless tables (`pk_columns` empty): all columns contribute to
-///   the content hash and must always be present.
-/// - Tables with > 63 columns: a `BIGINT` bitmask cannot represent them
-///   all (bits 0–62 fit; bit 63 is the sign bit — use 63 as the cap).
+/// Returns `None` for keyless tables (`pk_columns` empty): all columns
+/// contribute to the content hash and must always be present.
 ///
 /// For INSERT and DELETE rows `changed_cols` is stored as `NULL`, indicating
 /// that all new_*/old_* column values are populated (backward-compatible).
@@ -310,22 +309,17 @@ pub fn build_changed_cols_bitmask_expr(
     if pk_columns.is_empty() {
         return None; // keyless: must always write all columns
     }
-    if columns.len() > 63 {
-        return None; // too many columns for a BIGINT bitmask
-    }
     let parts: Vec<String> = columns
         .iter()
-        .enumerate()
-        .map(|(i, (col_name, _))| {
+        .map(|(col_name, _)| {
             let qcol = col_name.replace('"', "\"\"");
-            let bit: i64 = 1 << i;
             format!(
                 "(CASE WHEN NEW.\"{qcol}\" IS DISTINCT FROM OLD.\"{qcol}\" \
-                 THEN {bit}::BIGINT ELSE 0 END)"
+                 THEN B'1' ELSE B'0' END)::varbit"
             )
         })
         .collect();
-    Some(parts.join(" |\n        "))
+    Some(parts.join(" ||\n        "))
 }
 
 /// Build typed column definitions for a change buffer table.
@@ -349,9 +343,9 @@ pub fn create_change_buffer_table(
     columns: &[(String, String)],
 ) -> Result<(), PgTrickleError> {
     // pk_hash is always present (PK hash or all-column content hash).
-    // changed_cols is a BIGINT bitmask for UPDATE rows — bit i set when column i
-    // changed. NULL for INSERT and DELETE rows (all columns always populated).
-    let pk_col = ",pk_hash BIGINT,changed_cols BIGINT";
+    // changed_cols is a VARBIT bitmask for UPDATE rows — bit i (leftmost=0)
+    // is B'1' when column i changed. NULL for INSERT/DELETE rows.
+    let pk_col = ",pk_hash BIGINT,changed_cols VARBIT";
 
     // Build typed column definitions: "new_col" TYPE, "old_col" TYPE
     let typed_col_defs = build_typed_col_defs(columns);
@@ -781,10 +775,10 @@ pub fn alter_change_buffer_add_columns(
     })?;
 
     // For each source column missing from the buffer, add both new_ and old_ variants.
-    // Also ensure changed_cols BIGINT column exists (Task 3.1 migration).
+    // Ensure changed_cols VARBIT column exists (WB-1: migrated from BIGINT).
     if !existing_set.contains("changed_cols") {
         let add_sql = format!(
-            "ALTER TABLE {schema}.changes_{oid} ADD COLUMN IF NOT EXISTS changed_cols BIGINT",
+            "ALTER TABLE {schema}.changes_{oid} ADD COLUMN IF NOT EXISTS changed_cols VARBIT",
             schema = change_schema,
             oid = source_oid.to_u32(),
         );
@@ -792,6 +786,36 @@ pub fn alter_change_buffer_add_columns(
             pgrx::debug1!(
                 "[pg_trickle] alter_change_buffer_add_columns: failed to add changed_cols: {e}"
             );
+        }
+    } else {
+        // WB-1 migration: convert BIGINT bitmask column to VARBIT.
+        // atttypid 20 = int8 (BIGINT). NULL-out existing rows — changed_cols
+        // is a performance hint only; losing old bitmasks is safe.
+        let is_bigint: bool = Spi::get_one::<bool>(&format!(
+            "SELECT a.atttypid = 20 \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{schema}' AND c.relname = 'changes_{oid}' \
+             AND a.attname = 'changed_cols' AND a.attnum > 0 AND NOT a.attisdropped",
+            schema = change_schema,
+            oid = source_oid.to_u32(),
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+        if is_bigint {
+            let migrate_sql = format!(
+                "ALTER TABLE {schema}.changes_{oid} \
+                 ALTER COLUMN changed_cols TYPE VARBIT USING NULL",
+                schema = change_schema,
+                oid = source_oid.to_u32(),
+            );
+            if let Err(e) = Spi::run(&migrate_sql) {
+                pgrx::debug1!(
+                    "[pg_trickle] alter_change_buffer_add_columns: \
+                     failed to migrate changed_cols to VARBIT: {e}"
+                );
+            }
         }
     }
 
@@ -1298,30 +1322,29 @@ fn build_pk_hash_stmt_expr(
     }
 }
 
-/// Build the `changed_cols` bitmask expression for statement-level UPDATE triggers.
+/// WB-1: Build the `changed_cols` VARBIT expression for statement-level UPDATE triggers.
 ///
 /// Uses `n."col" IS DISTINCT FROM o."col"` (transition table aliases) instead
 /// of `NEW."col" IS DISTINCT FROM OLD."col"`.
+/// Bit at position `i` (leftmost = 0) is B'1' when column `i` changed.
 fn build_changed_cols_bitmask_stmt_expr(
     pk_columns: &[String],
     columns: &[(String, String)],
 ) -> Option<String> {
-    if pk_columns.is_empty() || columns.len() > 63 {
+    if pk_columns.is_empty() {
         return None;
     }
     let parts: Vec<String> = columns
         .iter()
-        .enumerate()
-        .map(|(i, (col_name, _))| {
+        .map(|(col_name, _)| {
             let qcol = col_name.replace('"', "\"\"");
-            let bit: i64 = 1 << i;
             format!(
                 "(CASE WHEN n.\"{qcol}\" IS DISTINCT FROM o.\"{qcol}\" \
-                 THEN {bit}::BIGINT ELSE 0 END)"
+                 THEN B'1' ELSE B'0' END)::varbit"
             )
         })
         .collect();
-    Some(parts.join(" |\n        "))
+    Some(parts.join(" ||\n\t\t        "))
 }
 
 /// Build the JOIN condition for the UPDATE path in statement-level triggers.
@@ -1736,12 +1759,33 @@ fn sync_change_buffer_columns(
             .copied()
             .collect();
 
-    // Ensure changed_cols column exists (Task 3.1 migration for existing buffers).
+    // Ensure changed_cols VARBIT column exists (WB-1: migrated from BIGINT).
     if !existing_cols.contains("changed_cols") {
         let add_sql =
-            format!("ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS changed_cols BIGINT");
+            format!("ALTER TABLE {buffer_table} ADD COLUMN IF NOT EXISTS changed_cols VARBIT");
         if let Err(e) = Spi::run(&add_sql) {
             pgrx::debug1!("pg_trickle_cdc: failed to add changed_cols to {buffer_table}: {e}");
+        }
+    } else {
+        // WB-1 migration: convert BIGINT bitmask column to VARBIT on existing buffers.
+        let is_bigint: bool = Spi::get_one::<bool>(&format!(
+            "SELECT a.atttypid = 20 \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             WHERE c.oid = '{buffer_table}'::regclass \
+             AND a.attname = 'changed_cols' AND a.attnum > 0 AND NOT a.attisdropped",
+        ))
+        .unwrap_or(Some(false))
+        .unwrap_or(false);
+        if is_bigint {
+            let migrate_sql = format!(
+                "ALTER TABLE {buffer_table} ALTER COLUMN changed_cols TYPE VARBIT USING NULL"
+            );
+            if let Err(e) = Spi::run(&migrate_sql) {
+                pgrx::debug1!(
+                    "pg_trickle_cdc: failed to migrate changed_cols to VARBIT on {buffer_table}: {e}"
+                );
+            }
         }
     }
 
@@ -2336,12 +2380,16 @@ mod tests {
     }
 
     #[test]
-    fn test_bitmask_none_when_over_63_cols() {
+    fn test_bitmask_wide_table_64plus_cols_is_ok() {
+        // WB-1: 64+ column tables must produce a bitmask (VARBIT, no cap).
         let pk = vec!["id".to_string()];
         let cols: Vec<_> = (0..64)
             .map(|i| (format!("c{i}"), "int".to_string()))
             .collect();
-        assert!(build_changed_cols_bitmask_expr(&pk, &cols).is_none());
+        assert!(
+            build_changed_cols_bitmask_expr(&pk, &cols).is_some(),
+            "WB-1: should produce VARBIT bitmask for 64 columns"
+        );
     }
 
     #[test]
@@ -2371,7 +2419,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bitmask_bit_values_are_powers_of_two() {
+    fn test_bitmask_uses_varbit_concatenation() {
+        // WB-1: bitmask expression must use VARBIT (not BIGINT) and concat (||).
         let pk = vec!["id".to_string()];
         let cols = vec![
             ("a".to_string(), "int".to_string()),
@@ -2379,10 +2428,14 @@ mod tests {
             ("c".to_string(), "int".to_string()),
         ];
         let expr = build_changed_cols_bitmask_expr(&pk, &cols).unwrap();
-        // Bit 0 = 1, bit 1 = 2, bit 2 = 4
-        assert!(expr.contains("1::BIGINT"), "should have bit 0 = 1: {expr}");
-        assert!(expr.contains("2::BIGINT"), "should have bit 1 = 2: {expr}");
-        assert!(expr.contains("4::BIGINT"), "should have bit 2 = 4: {expr}");
+        assert!(expr.contains("::varbit"), "should use VARBIT type: {expr}");
+        assert!(expr.contains("B'1'"), "should use B'1' literal: {expr}");
+        assert!(expr.contains("B'0'"), "should use B'0' literal: {expr}");
+        assert!(expr.contains("||"), "should use || concatenation: {expr}");
+        assert!(
+            !expr.contains("::BIGINT"),
+            "must not use BIGINT (old format): {expr}"
+        );
     }
 
     #[test]

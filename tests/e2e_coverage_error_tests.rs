@@ -304,6 +304,60 @@ async fn test_alter_source_change_column_type() {
 
 // ── Concurrent Refresh / Advisory Lock Path ────────────────────────────
 
+// ── WB-2: Wide-table CDC selectivity ──────────────────────────────────
+
+#[tokio::test]
+async fn test_wb2_wide_table_gt63_cols_differential_refresh() {
+    // WB-2: Source table with 65 columns (> 63-column BIGINT cap).
+    // After WB-1 the trigger stores a VARBIT bitmask of length 65, enabling
+    // the scan to skip UPDATE rows where only unreferenced columns changed.
+    let db = E2eDb::new().await.with_extension().await;
+
+    // Build CREATE TABLE with 65 columns: id + col1..col64
+    let extra_cols: String = (1..=64).map(|i| format!(", col{i} INT")).collect();
+    db.execute(&format!(
+        "CREATE TABLE wide_src (id INT PRIMARY KEY{extra_cols})"
+    ))
+    .await;
+    db.execute("INSERT INTO wide_src (id, col1, col2) VALUES (1, 10, 20)")
+        .await;
+
+    // ST only selects a small subset of the 65 columns.
+    db.create_st(
+        "wide_st",
+        "SELECT id, col1, col2 FROM wide_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    assert_eq!(db.count("public.wide_st").await, 1);
+
+    // Update a column NOT in the defining query — bitmask filter should skip this.
+    db.execute("UPDATE wide_src SET col63 = 99 WHERE id = 1")
+        .await;
+
+    // Update a column that IS in the defining query.
+    db.execute("UPDATE wide_src SET col1 = 999 WHERE id = 1")
+        .await;
+
+    db.refresh_st("wide_st").await;
+
+    // After refresh, the row should reflect the col1 update.
+    let val: i32 = db
+        .query_scalar("SELECT col1 FROM public.wide_st WHERE id = 1")
+        .await;
+    assert_eq!(
+        val, 999,
+        "col1 update should be reflected after differential refresh"
+    );
+
+    // Insert a second row and verify count.
+    db.execute("INSERT INTO wide_src (id, col1, col2) VALUES (2, 11, 21)")
+        .await;
+    db.refresh_st("wide_st").await;
+    assert_eq!(db.count("public.wide_st").await, 2);
+}
+
 #[tokio::test]
 async fn test_advisory_lock_blocks_concurrent_refresh() {
     let db = E2eDb::new().await.with_extension().await;
