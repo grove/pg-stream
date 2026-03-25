@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: pg_trickle
+    orgId: 1
+    folder: pg_trickle
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

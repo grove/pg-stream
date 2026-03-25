@@ -1,0 +1,103 @@
+# pg_trickle Observability Demo Stack
+#
+# Starts:
+#   - PostgreSQL 18.3 with pg_trickle pre-installed
+#   - postgres_exporter (Prometheus custom queries for pg_trickle)
+#   - Prometheus (scrapes metrics every 15 s, evaluates alert rules)
+#   - Grafana (pre-provisioned pg_trickle Overview dashboard)
+#
+# Usage:
+#   docker compose up -d
+#   open http://localhost:3000    # Grafana (admin/admin)
+#   open http://localhost:9090    # Prometheus
+#   open http://localhost:9187/metrics  # postgres_exporter raw metrics
+#
+# To connect to an external PostgreSQL instance instead of the bundled one,
+# set DATA_SOURCE_NAME in the postgres-exporter service and comment out the
+# postgres service dependency.
+
+services:
+
+  # ── PostgreSQL + pg_trickle ────────────────────────────────────────────────
+  postgres:
+    image: ghcr.io/pgstream/pg-trickle:latest
+    # Alternatively, build from the repo root:
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile.hub
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: demo
+      # Pre-load pg_trickle extension on startup
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── postgres_exporter ──────────────────────────────────────────────────────
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:postgres@postgres:5432/demo?sslmode=disable"
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres_exporter/pg_trickle_queries.yml
+      # Disable default built-in collectors that require superuser if not needed:
+      # PG_EXPORTER_DISABLE_DEFAULT_METRICS: "true"
+      # PG_EXPORTER_DISABLE_SETTINGS_METRICS: "true"
+    volumes:
+      - ./prometheus/pg_trickle_queries.yml:/etc/postgres_exporter/pg_trickle_queries.yml:ro
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Prometheus ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - postgres-exporter
+    restart: unless-stopped
+
+  # ── Grafana ────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:10.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  prometheus_data:
+  grafana_data:
