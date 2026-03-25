@@ -3485,6 +3485,22 @@ fn execute_scheduled_refresh(
                 was_full_fallback,
             );
 
+            // G12-ERM-1: Persist the effective refresh mode actually used.
+            // `take_effective_mode()` reflects any internal fallback that
+            // occurred (e.g., adaptive threshold or CTE triggering FULL
+            // inside execute_differential_refresh).
+            let eff_mode = refresh::take_effective_mode();
+            if !eff_mode.is_empty()
+                && let Err(e) = StreamTableMeta::update_effective_refresh_mode(st.pgt_id, eff_mode)
+            {
+                log!(
+                    "pg_trickle: failed to update effective_refresh_mode for {}.{}: {}",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    e
+                );
+            }
+
             // For NO_DATA refreshes, data_timestamp must NOT be updated —
             // execute_no_data_refresh already updated last_refresh_at only.
             // Updating data_timestamp here would cause downstream stream

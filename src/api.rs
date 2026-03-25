@@ -19,6 +19,112 @@ use crate::shmem;
 use crate::version;
 use crate::wal_decoder;
 
+// ── G13-EH: Enriched error reporting ────────────────────────────────────────
+
+/// Raise a `PgTrickleError` as a PostgreSQL ERROR, adding DETAIL and HINT
+/// fields for well-known error types that benefit from additional context.
+///
+/// For the four targeted variants (`UnsupportedOperator`, `CycleDetected`,
+/// `UpstreamSchemaChanged`, `QueryParseError`) this uses `ErrorReport` with
+/// `set_detail` / `set_hint` so the extra information appears in the
+/// `DETAIL:` and `HINT:` sections of the PostgreSQL error message.
+/// All other error types fall back to `pgrx::error!()`.
+#[track_caller]
+fn raise_error_with_context(e: PgTrickleError) -> ! {
+    use pgrx::pg_sys::panic::ErrorReport;
+    use pgrx::{PgLogLevel, PgSqlErrorCode};
+
+    match &e {
+        PgTrickleError::UnsupportedOperator(op) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_FEATURE_NOT_SUPPORTED,
+                format!("unsupported operator for DIFFERENTIAL mode: {}", op),
+                "",
+            )
+            .set_detail(
+                "DIFFERENTIAL mode supports SELECT, WHERE, simple JOINs (INNER/LEFT/RIGHT), \
+                 GROUP BY, HAVING, ORDER BY, and LIMIT. CTEs (WITH …), FULL OUTER JOINs, \
+                 window functions without a writable equivalent, and certain aggregate forms \
+                 are not supported."
+                    .to_string(),
+            )
+            .set_hint(
+                "Use refresh_mode = 'FULL' or refresh_mode = 'AUTO' to handle queries that \
+                 contain unsupported constructs. AUTO will try DIFFERENTIAL first and fall \
+                 back to FULL when needed."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
+        PgTrickleError::CycleDetected(path) => {
+            let cycle_str = path.join(" -> ");
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INVALID_SCHEMA_DEFINITION,
+                format!("cycle detected in dependency graph: {}", cycle_str),
+                "",
+            )
+            .set_detail(
+                "Stream tables form a directed acyclic graph (DAG). Adding this stream \
+                 table would introduce a cycle, which is not allowed."
+                    .to_string(),
+            )
+            .set_hint(
+                "Review the defining query and ensure it does not reference any stream \
+                 table that transitively depends on this table. Use \
+                 pgtrickle.pgt_dependencies to inspect the current dependency graph."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
+        PgTrickleError::UpstreamSchemaChanged(oid) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_INVALID_TABLE_DEFINITION,
+                format!("upstream table schema changed: OID {}", oid),
+                "",
+            )
+            .set_detail(
+                "An upstream source table was modified (ALTER TABLE) after the stream table \
+                 was created. The change buffer schema may no longer match the source."
+                    .to_string(),
+            )
+            .set_hint(
+                "Call pgtrickle.refresh_stream_table('<name>') which will automatically \
+                 reinitialize the stream table, or call pgtrickle.alter_stream_table(\
+                 '<name>') with the updated query."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
+        PgTrickleError::QueryParseError(msg) => {
+            ErrorReport::new(
+                PgSqlErrorCode::ERRCODE_SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION,
+                format!("query parse error: {}", msg),
+                "",
+            )
+            .set_detail(
+                "The defining query could not be validated or rewritten. This can happen \
+                 when the query references objects that do not exist yet, uses types \
+                 incompatible with the storage schema, or triggers a validation check."
+                    .to_string(),
+            )
+            .set_hint(
+                "Verify the query runs successfully as a standalone SELECT before creating \
+                 the stream table. Check that all referenced tables and columns exist."
+                    .to_string(),
+            )
+            .report(PgLogLevel::ERROR);
+            unreachable!()
+        }
+        // All other error types: plain message without detail/hint.
+        other => {
+            pgrx::error!("{}", other);
+        }
+    }
+}
+
 /// Create a new stream table.
 ///
 /// # Arguments
@@ -57,7 +163,7 @@ fn create_stream_table(
         pooler_compatibility_mode,
     );
     if let Err(e) = result {
-        pgrx::error!("{}", e);
+        raise_error_with_context(e);
     }
 }
 
@@ -94,7 +200,7 @@ fn create_stream_table_if_not_exists(
         pooler_compatibility_mode,
     );
     if let Err(e) = result {
-        pgrx::error!("{}", e);
+        raise_error_with_context(e);
     }
 }
 
@@ -177,7 +283,7 @@ fn create_or_replace_stream_table(
         pooler_compatibility_mode,
     );
     if let Err(e) = result {
-        pgrx::error!("{}", e);
+        raise_error_with_context(e);
     }
 }
 
@@ -1938,6 +2044,19 @@ fn create_stream_table_impl(
         None => DiamondSchedulePolicy::Fastest,
     };
 
+    // G15-PV: diamond_schedule_policy='slowest' only makes sense when
+    // diamond_consistency='atomic'.  Without atomic reads the 'slowest'
+    // policy delays refreshes at convergence nodes without providing any
+    // consistency guarantee.
+    if dsp == DiamondSchedulePolicy::Slowest && dc == DiamondConsistency::None {
+        return Err(PgTrickleError::InvalidArgument(
+            "diamond_schedule_policy = 'slowest' requires diamond_consistency = 'atomic'. \
+             The 'slowest' policy is only meaningful when atomic cross-branch reads are \
+             enabled. Set diamond_consistency = 'atomic' or use diamond_schedule_policy = 'fastest'."
+                .to_string(),
+        ));
+    }
+
     // Parse schema.name
     let (schema, table_name) = parse_qualified_name(name)?;
     let qualified_name = format!("{schema}.{table_name}");
@@ -2233,7 +2352,7 @@ fn alter_stream_table(
         tier,
     );
     if let Err(e) = result {
-        pgrx::error!("{}", e);
+        raise_error_with_context(e);
     }
 }
 
@@ -2490,6 +2609,19 @@ fn alter_stream_table_impl(
         match val.as_str() {
             "none" | "atomic" => {
                 let dc = DiamondConsistency::from_sql_str(&val);
+                // G15-PV: Validate combined diamond params before persisting.
+                let effective_dsp = diamond_schedule_policy
+                    .and_then(DiamondSchedulePolicy::from_sql_str)
+                    .unwrap_or(st.diamond_schedule_policy);
+                if effective_dsp == DiamondSchedulePolicy::Slowest && dc == DiamondConsistency::None
+                {
+                    return Err(PgTrickleError::InvalidArgument(
+                        "diamond_schedule_policy = 'slowest' requires diamond_consistency = 'atomic'. \
+                         The 'slowest' policy is only meaningful when atomic cross-branch reads are \
+                         enabled. Set diamond_consistency = 'atomic' or use diamond_schedule_policy = 'fastest'."
+                            .to_string(),
+                    ));
+                }
                 StreamTableMeta::set_diamond_consistency(st.pgt_id, dc)?;
             }
             other => {
@@ -2504,6 +2636,21 @@ fn alter_stream_table_impl(
     if let Some(dsp_str) = diamond_schedule_policy {
         match DiamondSchedulePolicy::from_sql_str(dsp_str) {
             Some(p) => {
+                // G15-PV: Validate combined diamond params.  Only check when
+                // dc is not also being changed (handled in the dc block above).
+                if diamond_consistency.is_none() {
+                    let effective_dc = st.diamond_consistency;
+                    if p == DiamondSchedulePolicy::Slowest
+                        && effective_dc == DiamondConsistency::None
+                    {
+                        return Err(PgTrickleError::InvalidArgument(
+                            "diamond_schedule_policy = 'slowest' requires diamond_consistency = 'atomic'. \
+                             The 'slowest' policy is only meaningful when atomic cross-branch reads are \
+                             enabled. Set diamond_consistency = 'atomic' or use diamond_schedule_policy = 'fastest'."
+                                .to_string(),
+                        ));
+                    }
+                }
                 StreamTableMeta::set_diamond_schedule_policy(st.pgt_id, p)?;
             }
             None => {
@@ -2575,7 +2722,7 @@ fn alter_stream_table_impl(
 fn drop_stream_table(name: &str) {
     let result = drop_stream_table_impl(name);
     if let Err(e) = result {
-        pgrx::error!("{}", e);
+        raise_error_with_context(e);
     }
 }
 
@@ -2682,7 +2829,7 @@ fn drop_stream_table_impl_inner(
 fn resume_stream_table(name: &str) {
     let result = resume_stream_table_impl(name);
     if let Err(e) = result {
-        pgrx::error!("{}", e);
+        raise_error_with_context(e);
     }
 }
 
@@ -2723,7 +2870,7 @@ fn resume_stream_table_impl(name: &str) -> Result<(), PgTrickleError> {
 fn refresh_stream_table(name: &str) {
     let result = refresh_stream_table_impl(name);
     if let Err(e) = result {
-        pgrx::error!("{}", e);
+        raise_error_with_context(e);
     }
 }
 
@@ -3528,6 +3675,98 @@ fn pgt_scc_status() -> TableIterator<
     });
 
     TableIterator::new(rows)
+}
+
+/// G12-ERM-2: Explain the configured vs. effective refresh mode for a stream table.
+///
+/// Reports three pieces of information useful for diagnosing unexpected
+/// FULL-refresh behaviour in AUTO mode:
+///
+/// - `configured_mode`  — the mode stored in `pgt_stream_tables.refresh_mode`
+///   (`FULL`, `DIFFERENTIAL`, `IMMEDIATE`, or `AUTO`).
+/// - `effective_mode`   — the mode that was **actually used** on the most
+///   recent completed refresh. NULL until the first refresh fires.
+///   One of `FULL`, `DIFFERENTIAL`, `APPEND_ONLY`, `TOP_K`, `NO_DATA`.
+/// - `downgrade_reason` — a human-readable explanation when `effective_mode`
+///   differs from the non-AUTO configured expectation, or when the
+///   configured mode is `AUTO` and the effective mode is `FULL` (i.e. a
+///   downgrade occurred).
+///
+/// Example:
+/// ```sql
+/// SELECT * FROM pgtrickle.explain_refresh_mode('public.orders_summary');
+/// ```
+#[pg_extern(schema = "pgtrickle")]
+#[allow(clippy::type_complexity)]
+fn explain_refresh_mode(
+    name: &str,
+) -> TableIterator<
+    'static,
+    (
+        name!(configured_mode, String),
+        name!(effective_mode, Option<String>),
+        name!(downgrade_reason, Option<String>),
+    ),
+> {
+    let rows = explain_refresh_mode_impl(name);
+    TableIterator::new(rows)
+}
+
+fn explain_refresh_mode_impl(name: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let (schema, table_name) = match crate::api::parse_qualified_name(name) {
+        Ok(pair) => pair,
+        Err(e) => {
+            raise_error_with_context(e);
+        }
+    };
+
+    let row = Spi::connect(|client| {
+        client
+            .select(
+                "SELECT refresh_mode, effective_refresh_mode \
+                 FROM pgtrickle.pgt_stream_tables \
+                 WHERE pgt_schema = $1 AND pgt_name = $2",
+                None,
+                &[schema.as_str().into(), table_name.as_str().into()],
+            )
+            .map_err(|e| pgrx::error!("explain_refresh_mode: SPI error: {e}"))
+            .expect("unreachable after error!")
+            .first()
+            .get_two::<String, String>()
+            .unwrap_or((None, None))
+    });
+
+    let (configured_opt, effective_opt) = row;
+    let configured = configured_opt.unwrap_or_else(|| {
+        pgrx::error!("stream table '{}' not found", name);
+    });
+
+    let downgrade_reason: Option<String> = match (configured.as_str(), effective_opt.as_deref()) {
+        // AUTO mode chose FULL — explain why we can't know for certain,
+        // but point operators to the refresh history for details.
+        ("AUTO" | "DIFFERENTIAL", Some("FULL")) => Some(
+            "The most recent refresh used FULL mode. Possible causes: defining query \
+             contains a CTE or unsupported operator, adaptive change-ratio threshold \
+             was exceeded, or aggregate saturation occurred. \
+             Check pgtrickle.pgt_refresh_history for details."
+                .to_string(),
+        ),
+        // DIFFERENTIAL configured but actual was APPEND_ONLY — informational.
+        ("DIFFERENTIAL" | "AUTO", Some("APPEND_ONLY")) => Some(
+            "The most recent refresh used the APPEND_ONLY INSERT fast-path because \
+             no DELETE or UPDATE was detected in the change buffer."
+                .to_string(),
+        ),
+        // IMMEDIATE mode — effective_mode is always NULL (triggers handle it).
+        ("IMMEDIATE", _) => Some(
+            "IMMEDIATE mode is maintained by in-transaction IVM triggers; \
+             the background scheduler does not run refreshes for this table."
+                .to_string(),
+        ),
+        _ => None,
+    };
+
+    vec![(configured, effective_opt, downgrade_reason)]
 }
 
 /// Show detected diamond consistency groups.

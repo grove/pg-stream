@@ -219,9 +219,12 @@ async fn test_alter_source_drop_column_not_in_query() {
 
     assert_eq!(db.count("public.drop_col_st").await, 1);
 
+    // Disable the DDL guard so we can alter the source table
+    db.execute("SET pg_trickle.block_source_ddl = false").await;
     // Drop the unused column
     db.execute("ALTER TABLE drop_col_src DROP COLUMN extra")
         .await;
+    db.execute("SET pg_trickle.block_source_ddl = true").await;
 
     // Insert a new row and refresh — should still work
     db.execute("INSERT INTO drop_col_src (id, val) VALUES (2, 'world')")
@@ -249,9 +252,12 @@ async fn test_alter_source_drop_column_in_query() {
     )
     .await;
 
+    // Disable the DDL guard so we can alter the source table
+    db.execute("SET pg_trickle.block_source_ddl = false").await;
     // Drop a column that IS used by the defining query
     db.execute("ALTER TABLE drop_used_src DROP COLUMN amount CASCADE")
         .await;
+    db.execute("SET pg_trickle.block_source_ddl = true").await;
 
     // Refresh should fail since the defining query references a dropped column
     let result = db
@@ -276,9 +282,12 @@ async fn test_alter_source_change_column_type() {
 
     assert_eq!(db.count("public.type_st").await, 1);
 
+    // Disable the DDL guard so we can alter the source table
+    db.execute("SET pg_trickle.block_source_ddl = false").await;
     // Change column type (TEXT → VARCHAR)
     db.execute("ALTER TABLE type_src ALTER COLUMN val TYPE VARCHAR(255)")
         .await;
+    db.execute("SET pg_trickle.block_source_ddl = true").await;
 
     // Refresh should still work since VARCHAR is compatible with TEXT
     db.execute("INSERT INTO type_src VALUES (2, 'hello')").await;

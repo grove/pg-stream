@@ -614,6 +614,22 @@ impl StreamTableMeta {
         .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
     }
 
+    /// G12-ERM-1: Record the effective refresh mode used in the most recent refresh.
+    ///
+    /// `mode` — one of `"FULL"`, `"DIFFERENTIAL"`, `"APPEND_ONLY"`, `"TOP_K"`,
+    /// `"NO_DATA"`.  Populated by the scheduler after every completed refresh so
+    /// operators can see which mode was actually executed (useful when AUTO
+    /// downgrades DIFFERENTIAL → FULL due to adaptive thresholds, CTEs, etc.).
+    pub fn update_effective_refresh_mode(pgt_id: i64, mode: &str) -> Result<(), PgTrickleError> {
+        Spi::run_with_args(
+            "UPDATE pgtrickle.pgt_stream_tables \
+             SET effective_refresh_mode = $1, updated_at = now() \
+             WHERE pgt_id = $2",
+            &[mode.into(), pgt_id.into()],
+        )
+        .map_err(|e: pgrx::spi::SpiError| PgTrickleError::SpiError(e.to_string()))
+    }
+
     /// Update the append-only flag for a stream table.
     ///
     /// Called by the CDC heuristic fallback when a DELETE or UPDATE is

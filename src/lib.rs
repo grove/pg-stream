@@ -263,6 +263,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE,
     refresh_tier    TEXT NOT NULL DEFAULT 'hot'
                      CHECK (refresh_tier IN ('hot', 'warm', 'cold', 'frozen')),
+    effective_refresh_mode TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

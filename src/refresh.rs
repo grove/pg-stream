@@ -19,6 +19,33 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::catalog::{StDependency, StreamTableMeta};
+
+// ── G12-ERM-1: Effective refresh mode tracking ──────────────────────────
+
+// Thread-local that records the mode actually used for the current refresh.
+//
+// Set by each concrete execution path (`execute_full_refresh`,
+// `execute_differential_refresh`, etc.) so the scheduler can write the
+// actual mode to `pgt_stream_tables.effective_refresh_mode` after the
+// refresh completes — even when an internal fallback changed the mode.
+thread_local! {
+    static LAST_EFFECTIVE_MODE: Cell<&'static str> = const { Cell::new("") };
+}
+
+/// Record the effective refresh mode for the currently-executing refresh.
+///
+/// Called at the concrete execution point so fallbacks (e.g. adaptive
+/// threshold → FULL, CTE → FULL) overwrite the initial mode correctly.
+pub(crate) fn set_effective_mode(mode: &'static str) {
+    LAST_EFFECTIVE_MODE.with(|m| m.set(mode));
+}
+
+/// Take (read and reset) the effective mode recorded by the most recent
+/// execution path.  Returns `""` if no refresh has been recorded yet
+/// in this thread.
+pub fn take_effective_mode() -> &'static str {
+    LAST_EFFECTIVE_MODE.with(|m| m.get())
+}
 use crate::dag::RefreshMode;
 use crate::dvm;
 use crate::error::PgTrickleError;
@@ -1152,6 +1179,9 @@ pub fn determine_refresh_action(st: &StreamTableMeta, has_upstream_changes: bool
 /// TopK tables. The caller decides whether to invoke it (DIFFERENTIAL mode
 /// checks change buffers first and skips if no changes exist).
 pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    // G12-ERM-1: Record the effective mode for this execution path.
+    set_effective_mode("TOP_K");
+
     // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
     // triggers allow the refresh executor to modify the storage table.
     Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
@@ -1272,6 +1302,9 @@ pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
 /// Users who need per-row trigger semantics should use `REFRESH MODE
 /// DIFFERENTIAL`. See PLAN_USER_TRIGGERS_EXPLICIT_DML.md §2.
 pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickleError> {
+    // G12-ERM-1: Record the effective mode for this execution path.
+    set_effective_mode("FULL");
+
     // EC-25/EC-26: Ensure the internal_refresh flag is set so DML guard
     // triggers allow the refresh executor to modify the storage table.
     Spi::run("SET LOCAL pg_trickle.internal_refresh = 'true'")
@@ -1496,6 +1529,9 @@ pub fn poll_foreign_table_sources_for_st(st: &StreamTableMeta) -> Result<(), PgT
 
 /// Execute a NO_DATA refresh: just advance the data timestamp.
 pub fn execute_no_data_refresh(st: &StreamTableMeta) -> Result<(), PgTrickleError> {
+    // G12-ERM-1: Record the effective mode for this execution path.
+    set_effective_mode("NO_DATA");
+
     // Record that we checked — but do NOT update data_timestamp.
     // data_timestamp is reserved for refreshes that actually write rows.
     // Downstream stream tables compare upstream.data_timestamp against their
@@ -2498,6 +2534,9 @@ pub fn execute_differential_refresh(
             rows_inserted,
         );
 
+        // G12-ERM-1: Record the effective mode for this execution path.
+        set_effective_mode("APPEND_ONLY");
+
         return Ok((rows_inserted, 0));
     }
 
@@ -2797,6 +2836,9 @@ pub fn execute_differential_refresh(
     // Since we already verified `any_changes=true` above, the MERGE must
     // have processed at least one change buffer entry.
     let effective_count = (merge_count as i64).max(1);
+
+    // G12-ERM-1: Record the effective mode for this execution path.
+    set_effective_mode("DIFFERENTIAL");
 
     Ok((effective_count, 0))
 }
