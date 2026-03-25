@@ -2897,14 +2897,14 @@ fn drop_stream_table_impl_inner(
     // ST-ST-1: Drop this ST's own change buffer (if it had downstream consumers).
     {
         let change_schema = config::pg_trickle_change_buffer_schema();
-        if cdc::has_st_change_buffer(st.pgt_id, &change_schema) {
-            if let Err(e) = cdc::drop_st_change_buffer_table(st.pgt_id, &change_schema) {
-                pgrx::warning!(
-                    "Failed to drop own ST change buffer for pgt_id {}: {}",
-                    st.pgt_id,
-                    e
-                );
-            }
+        if cdc::has_st_change_buffer(st.pgt_id, &change_schema)
+            && let Err(e) = cdc::drop_st_change_buffer_table(st.pgt_id, &change_schema)
+        {
+            pgrx::warning!(
+                "Failed to drop own ST change buffer for pgt_id {}: {}",
+                st.pgt_id,
+                e
+            );
         }
     }
 
