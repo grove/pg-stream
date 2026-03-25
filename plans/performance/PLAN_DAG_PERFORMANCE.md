@@ -60,9 +60,10 @@ $$L_{\text{calc}} = I_s + N \times T_r$$
 The scheduler interval is the wait for the tick to begin; once inside the
 tick, all $N$ STs are refreshed sequentially in topological order.
 
-Stream-table-sourced STs always receive `RefreshAction::Full` (not
-differential), because there is no CDC change buffer to diff against — the
-scheduler detects staleness via `data_timestamp` comparison only.
+When an upstream ST's `data_timestamp` has advanced, the downstream ST
+receives `RefreshAction::Full` rather than differential, because there is no
+CDC change buffer for ST-to-ST propagation — the scheduler detects staleness
+via `data_timestamp` comparison only (see Section 6, insight 4).
 
 ### 2.2 Scheduled Mode (explicit `SCHEDULE`)
 
@@ -88,19 +89,29 @@ capped at $C_g$ cluster-wide. Each worker is a separate PostgreSQL background
 worker process with its own SPI connection — spawned on demand, not pooled.
 
 Between dispatch rounds, the scheduler sleeps for $I_p = 200\text{ms}$ (the
-short poll interval used when workers are in-flight). Each round dispatches
-workers for all ready execution units (those whose upstream dependencies have
-completed).
+short poll interval used when workers are in-flight). Workers run as separate
+background processes **concurrently** with this latch wait — $T_r$ is
+absorbed into the poll period when $T_r \leq I_p$. When $T_r > I_p$, the
+coordinator polls multiple times per batch; per-batch time ≈
+$\lceil T_r / I_p \rceil \times I_p$.
+
+Each round dispatches workers for all ready execution units (those whose
+upstream dependencies have completed in the same tick via Step 1→Step 3 of
+the dispatch loop).
 
 **Propagation latency for a single level of width $W_l$:**
 
-$$L_{\text{level}} = \left\lceil \frac{W_l}{C_{\text{eff}}} \right\rceil \times (I_p + T_r)$$
+$$L_{\text{level}} = \left\lceil \frac{W_l}{C_{\text{eff}}} \right\rceil \times \max(I_p, T_r)$$
 
 where $C_{\text{eff}} = \min(C, C_g - \text{workers\_used\_by\_other\_dbs})$.
 
 **Total propagation latency:**
 
-$$L_{\text{parallel}} = \sum_{l=1}^{D} \left\lceil \frac{W_l}{C_{\text{eff}}} \right\rceil \times (I_p + T_r)$$
+$$L_{\text{parallel}} = \sum_{l=1}^{D} \left\lceil \frac{W_l}{C_{\text{eff}}} \right\rceil \times \max(I_p, T_r)$$
+
+For the common case $T_r \leq I_p = 200\text{ms}$, this simplifies to
+$B \times I_p$ where $B = \sum_l \lceil W_l / C_{\text{eff}} \rceil$ is the
+total number of dispatch rounds.
 
 ---
 
@@ -119,7 +130,7 @@ zero parallelism is possible.
 |------|-----------------|
 | CALCULATED | $1\text{s} + 500 \times T_r$ |
 | SCHEDULE '1s' | $500 \times 1\text{s} = 8.3\text{min}$ |
-| Parallel | $500 \times (200\text{ms} + T_r)$ — **worse than sequential** |
+| Parallel | $500 \times I_p \approx 100\text{s}$ — **worse than sequential** |
 
 **Recommendation:** Use CALCULATED mode (sequential). Parallel mode adds
 ~200 ms of poll overhead per hop with no concurrency benefit, turning a
@@ -139,20 +150,22 @@ N=500, D=10, ~50 STs per level. Siblings at the same level are independent.
 |------|---------|
 | CALCULATED | $1\text{s} + 500 \times T_r$ (same as linear — all 500 run sequentially) |
 | SCHEDULE '1s' | $10 \times 1\text{s} = 10\text{s}$ |
-| Parallel (C=4) | $10 \times 13 \times (200\text{ms} + T_r)$ |
-| Parallel (C=16) | $10 \times 4 \times (200\text{ms} + T_r)$ |
+| Parallel (C=4) | $10 \times 13 \times I_p \approx 26\text{s}$ |
+| Parallel (C=16) | $10 \times 4 \times I_p \approx 8\text{s}$ |
 
 **At $T_r = 100\text{ms}$:**
 
 | Mode | Latency |
 |------|---------|
 | CALCULATED | $\approx 51\text{s}$ |
-| Parallel (C=16) | $10 \times 4 \times 300\text{ms} \approx 12\text{s}$ |
+| Parallel (C=16) | $10 \times 4 \times 200\text{ms} \approx 8\text{s}$ |
 
-**Recommendation:** Parallel mode with $C = 16$ delivers ~4× speedup over
-sequential for expensive refreshes. For cheap refreshes ($T_r < 20\text{ms}$),
-the 200 ms poll overhead dominates and sequential CALCULATED mode may be
-faster.
+**Recommendation:** Parallel mode with $C = 16$ delivers significant speedup
+over sequential for expensive refreshes. The cross-over point is where
+CALCULATED cost ($I_s + N \times T_r$) equals parallel cost ($B \times I_p$);
+for N=500, D=10, C=16 this is $T_r \approx 15\text{ms}$. For cheaper
+refreshes, the 200 ms poll overhead dominates and sequential CALCULATED mode
+is faster.
 
 ### 3.3 Fan-Out Tree (depth = D, exponentially widening)
 
@@ -178,7 +191,7 @@ domain-specific materialized views at each level.
 
 **Recommendation:** Parallel mode helps significantly at the leaves. Set $C$
 to match the expected leaf-level width, but keep in mind that the narrow upper
-levels cannot benefit. A fan-out tree of depth 10 and 500 STs has ~256 STs at
+levels cannot benefit. A fan-out tree of depth 9 and 511 STs has 256 STs at
 the leaf level — $C = 16..32$ is practical.
 
 ### 3.4 Diamond / Convergence Pattern
@@ -299,22 +312,28 @@ fraction of the tick, especially with 100+ STs.
 ### 4.5 Poll Interval & Dispatch Overhead
 
 In parallel mode, the scheduler polls for worker completion every 200 ms
-(hardcoded as `min(scheduler_interval_ms, 200)`). This creates a per-level
-overhead that dominates for cheap refreshes:
+(`min(scheduler_interval_ms, 200)`). Workers run concurrently during this
+wait. The "wasted wait" — fraction of the poll period spent idle after workers
+have already completed — is:
 
-$$\text{overhead ratio} = \frac{I_p}{I_p + T_r}$$
+$$\text{wasted wait} = \frac{I_p - T_r}{I_p} \quad (T_r \leq I_p)$$
 
-| $T_r$ | Overhead Ratio | Assessment |
-|--------|---------------|------------|
-| 10 ms | 95% | Poll overhead dominates — sequential is faster |
-| 50 ms | 80% | Marginal benefit from parallelism |
-| 100 ms | 67% | Parallelism starts to pay off |
-| 200 ms | 50% | Clear win for wide DAGs |
-| 500 ms+ | 29% | Strong parallelism benefit |
+When $T_r > I_p$, workers outlast one poll cycle; overhead becomes
+$(\lceil T_r / I_p \rceil \times I_p - T_r)\,/\,(\lceil T_r / I_p \rceil \times I_p)$.
 
-**Rule of thumb:** Enable parallel mode only when per-ST refresh time
-exceeds ~100 ms **and** the DAG has meaningful width (≥ 4 independent STs
-per level).
+| $T_r$ | Wasted Wait | Assessment |
+|--------|-------------|------------|
+| 10 ms | 95% | Poll overhead dominates — sequential is faster at this scale |
+| 50 ms | 75% | Marginal benefit; near break-even for N=500 workloads |
+| 100 ms | 50% | Parallelism pays off for wide DAGs |
+| 200 ms | ~0% | Maximum efficiency — workers fill the entire poll window |
+| 300 ms+ | ~33% | $T_r > I_p$ regime; coordinator takes two polls per batch |
+
+**Rule of thumb:** Enable parallel mode when $N \times T_r$ (sequential cost)
+substantially exceeds $B \times I_p$ (parallel cost), where
+$B = \sum \lceil W_l / C \rceil$ is the total dispatch rounds. For N=500,
+D=10, C=16 the threshold is $T_r \approx 15\text{ms}$. The DAG must also
+have meaningful width (≥ 4 independent STs per level) to benefit.
 
 ---
 
@@ -326,8 +345,8 @@ per level).
 |------|---------------------|----------------------|
 | CALCULATED | **6 s** | **51 s** |
 | SCHEDULE '1s' | 500 s (8.3 min) | 500 s (8.3 min) |
-| Parallel (C=4) | 105 s | 150 s |
-| Parallel (C=16) | 105 s | 150 s |
+| Parallel (C=4) | ~100 s | ~100 s |
+| Parallel (C=16) | ~100 s | ~100 s |
 
 ### 5.2 Wide DAG (N=500, D=10, W≈50)
 
@@ -335,16 +354,16 @@ per level).
 |------|---------------------|----------------------|
 | CALCULATED | **6 s** | **51 s** |
 | SCHEDULE '1s' | 10 s | 10 s |
-| Parallel (C=4) | 27 s | 39 s |
-| Parallel (C=16) | 8.4 s | **12 s** |
-| Parallel (C=32) | 6.0 s | 6.0 s |
+| Parallel (C=4) | ~26 s | ~26 s |
+| Parallel (C=16) | ~8 s | ~8 s |
+| Parallel (C=32) | ~4 s | ~4 s |
 
 ### 5.3 Fan-Out Tree (N=511, D=9, binary)
 
 | Mode | $T_r = 10\text{ms}$ | $T_r = 100\text{ms}$ |
 |------|---------------------|----------------------|
 | CALCULATED | **6.1 s** | **52 s** |
-| Parallel (C=16) | ~5.5 s | ~13 s |
+| Parallel (C=16) | ~7 s | ~7 s |
 
 The narrow upper levels (1–4 STs) are sequential bottlenecks; the wide lower
 levels (64–256 STs) benefit from parallelism.
