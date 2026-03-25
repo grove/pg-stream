@@ -788,6 +788,26 @@ impl E2eDb {
         self.execute(&sql).await;
     }
 
+    /// Create a partitioned stream table (A1-1: `partition_by` parameter).
+    ///
+    /// The storage table is created as `PARTITION BY RANGE (partition_key)` with a
+    /// default catch-all partition. Partition pruning during MERGE is enabled
+    /// automatically by the A1-3 predicate injection path.
+    pub async fn create_st_partitioned(
+        &self,
+        name: &str,
+        query: &str,
+        schedule: &str,
+        refresh_mode: &str,
+        partition_key: &str,
+    ) {
+        let sql = format!(
+            "SELECT pgtrickle.create_stream_table('{name}', $${query}$$, \
+             '{schedule}', '{refresh_mode}', partition_by => '{partition_key}')"
+        );
+        self.execute(&sql).await;
+    }
+
     /// Create a stream table with explicit `initialize` parameter.
     pub async fn create_st_with_init(
         &self,
