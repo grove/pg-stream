@@ -152,6 +152,12 @@ pub struct DiffContext {
     /// `WHERE c."old_col" ...` / `c."new_col" ...` clauses into the
     /// final scan CTE's DELETE/INSERT branches.
     pub scan_pushed_predicate: Option<crate::dvm::parser::Expr>,
+    /// ST-ST-4: Maps storage-table OIDs to upstream pgt_ids for ST sources.
+    ///
+    /// When a source OID is a stream table (not a base table), the scan
+    /// operator reads from `changes_pgt_{pgt_id}` instead of `changes_{oid}`
+    /// and uses `pgt_`-prefixed LSN placeholder tokens.
+    pub st_source_pgt_ids: HashMap<u32, i64>,
 }
 
 impl DiffContext {
@@ -178,6 +184,7 @@ impl DiffContext {
             having_filter: false,
             source_cdc_columns: HashMap::new(),
             scan_pushed_predicate: None,
+            st_source_pgt_ids: HashMap::new(),
         }
     }
 
@@ -207,6 +214,7 @@ impl DiffContext {
             having_filter: false,
             source_cdc_columns: HashMap::new(),
             scan_pushed_predicate: None,
+            st_source_pgt_ids: HashMap::new(),
         }
     }
 
@@ -224,9 +232,23 @@ impl DiffContext {
 
     /// Get the previous LSN for a source table. In placeholder mode,
     /// returns a substitution token; otherwise returns the literal value.
+    ///
+    /// ST-ST-4: For ST sources, uses `pgt_{pgt_id}` in the token name
+    /// instead of the raw OID, matching the `changes_pgt_{id}` buffer name.
     pub fn get_prev_lsn(&self, source_oid: u32) -> String {
         if self.use_placeholders {
-            format!("__PGS_PREV_LSN_{source_oid}__")
+            if let Some(&pgt_id) = self.st_source_pgt_ids.get(&source_oid) {
+                format!("__PGS_PREV_LSN_pgt_{pgt_id}__")
+            } else {
+                format!("__PGS_PREV_LSN_{source_oid}__")
+            }
+        } else if let Some(&pgt_id) = self.st_source_pgt_ids.get(&source_oid) {
+            // ST sources use pgt_{id} as the frontier key
+            self.prev_frontier
+                .sources
+                .get(&format!("pgt_{pgt_id}"))
+                .map(|sv| sv.lsn.clone())
+                .unwrap_or_else(|| "0/0".to_string())
         } else {
             self.prev_frontier.get_lsn(source_oid)
         }
@@ -236,7 +258,17 @@ impl DiffContext {
     /// returns a substitution token; otherwise returns the literal value.
     pub fn get_new_lsn(&self, source_oid: u32) -> String {
         if self.use_placeholders {
-            format!("__PGS_NEW_LSN_{source_oid}__")
+            if let Some(&pgt_id) = self.st_source_pgt_ids.get(&source_oid) {
+                format!("__PGS_NEW_LSN_pgt_{pgt_id}__")
+            } else {
+                format!("__PGS_NEW_LSN_{source_oid}__")
+            }
+        } else if let Some(&pgt_id) = self.st_source_pgt_ids.get(&source_oid) {
+            self.new_frontier
+                .sources
+                .get(&format!("pgt_{pgt_id}"))
+                .map(|sv| sv.lsn.clone())
+                .unwrap_or_else(|| "0/0".to_string())
         } else {
             self.new_frontier.get_lsn(source_oid)
         }

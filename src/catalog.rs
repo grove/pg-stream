@@ -411,6 +411,17 @@ impl StreamTableMeta {
         })
     }
 
+    /// Look up a stream table's `pgt_id` by its storage table OID.
+    ///
+    /// Lightweight alternative to `get_by_relid` when only the ID is needed.
+    pub fn pgt_id_for_relid(relid: pg_sys::Oid) -> Option<i64> {
+        Spi::get_one_with_args::<i64>(
+            "SELECT pgt_id FROM pgtrickle.pgt_stream_tables WHERE pgt_relid = $1",
+            &[relid.into()],
+        )
+        .unwrap_or(None)
+    }
+
     /// Find pgt_ids of stream tables whose `functions_used` array contains
     /// the given function name (case-insensitive match via `@>`).
     /// Used by DDL hooks to detect which STs are affected when a function

@@ -462,6 +462,59 @@ fn cleanup_change_buffers_by_frontier(change_schema: &str, source_oids: &[u32]) 
     }
 }
 
+/// Frontier-based cleanup for ST change buffers (`changes_pgt_{id}`).
+///
+/// For each upstream ST source, computes the minimum frontier LSN across all
+/// downstream stream tables that depend on it, then deletes consumed rows.
+fn cleanup_st_change_buffers_by_frontier(change_schema: &str, st_source_pgt_ids: &[i64]) {
+    if st_source_pgt_ids.is_empty() {
+        return;
+    }
+
+    for &upstream_pgt_id in st_source_pgt_ids {
+        let key = format!("pgt_{upstream_pgt_id}");
+
+        // Check that the ST change buffer table exists.
+        if !crate::cdc::has_st_change_buffer(upstream_pgt_id, change_schema) {
+            continue;
+        }
+
+        // Compute the minimum frontier LSN for this ST source across ALL
+        // downstream consumers.
+        let min_lsn: Option<String> = Spi::get_one::<String>(&format!(
+            "SELECT MIN((st.frontier->'sources'->'{key}'->>'lsn')::pg_lsn)::TEXT \
+             FROM pgtrickle.pgt_stream_tables st \
+             JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id \
+             WHERE dep.source_type = 'STREAM_TABLE' \
+               AND dep.source_relid = ( \
+                   SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {upstream_pgt_id} \
+               ) \
+               AND st.frontier IS NOT NULL \
+               AND st.frontier->'sources'->'{key}'->>'lsn' IS NOT NULL",
+        ))
+        .unwrap_or(None);
+
+        let safe_lsn = match min_lsn {
+            Some(lsn) if lsn != "0/0" => lsn,
+            _ => continue,
+        };
+
+        let delete_sql = format!(
+            "DELETE FROM \"{schema}\".changes_pgt_{id} \
+             WHERE lsn <= '{safe_lsn}'::pg_lsn",
+            schema = change_schema,
+            id = upstream_pgt_id,
+        );
+        if let Err(e) = Spi::run(&delete_sql) {
+            pgrx::debug1!(
+                "[pg_trickle] ST buffer cleanup DELETE failed for changes_pgt_{}: {}",
+                upstream_pgt_id,
+                e,
+            );
+        }
+    }
+}
+
 /// Flush pending cleanup entries that reference any of the given source OIDs.
 ///
 /// Called during `drop_stream_table` to prevent stale cleanup entries from
@@ -556,6 +609,225 @@ fn apply_planner_hints(estimated_delta: i64, st_relid: pg_sys::Oid) {
     }
 }
 
+// ── ST-to-ST Delta Capture (Phase 8.2/8.3) ─────────────────────────────
+
+/// Capture delta rows from a materialized delta temp table into the ST's
+/// change buffer for downstream ST consumption.
+///
+/// Called after the MERGE (or explicit DML) when the ST has downstream
+/// consumers. The delta is already materialized in `__pgt_delta_{pgt_id}`
+/// as a temp table with `__pgt_row_id`, `__pgt_action`, and user columns.
+///
+/// Only `'I'` (insert) and `'D'` (delete) actions are captured — updates
+/// in the delta are already expressed as D+I pairs by the DVM.
+fn capture_delta_to_st_buffer(
+    st: &StreamTableMeta,
+    user_cols: &[String],
+) -> Result<i64, PgTrickleError> {
+    let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
+    let pgt_id = st.pgt_id;
+
+    if !crate::cdc::has_st_change_buffer(pgt_id, &change_schema) {
+        return Ok(0);
+    }
+
+    let new_col_list: String = user_cols
+        .iter()
+        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let d_col_list: String = user_cols
+        .iter()
+        .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+         (lsn, action, pk_hash, {new_col_list}) \
+         SELECT pg_current_wal_lsn(), d.__pgt_action, d.__pgt_row_id, \
+                {d_col_list} \
+         FROM __pgt_delta_{pgt_id} d \
+         WHERE d.__pgt_action IN ('I', 'D')"
+    );
+
+    let count = Spi::connect_mut(|client| {
+        let result = client
+            .update(&sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+
+    if count > 0 {
+        pgrx::debug1!(
+            "[pg_trickle] ST-ST: captured {} delta rows to changes_pgt_{} for {}.{}",
+            count,
+            pgt_id,
+            st.pgt_schema,
+            st.pgt_name,
+        );
+    }
+
+    Ok(count)
+}
+
+/// Capture the full-refresh diff into the ST's change buffer.
+///
+/// Called after a FULL refresh when the ST has downstream consumers.
+/// Compares a pre-refresh snapshot (`__pgt_pre_{pgt_id}`) against the
+/// post-refresh state to produce I/D pairs.
+fn capture_full_refresh_diff_to_st_buffer(
+    st: &StreamTableMeta,
+    user_cols: &[String],
+) -> Result<i64, PgTrickleError> {
+    let change_schema = crate::config::pg_trickle_change_buffer_schema().replace('"', "\"\"");
+    let pgt_id = st.pgt_id;
+
+    if !crate::cdc::has_st_change_buffer(pgt_id, &change_schema) {
+        return Ok(0);
+    }
+
+    let schema = &st.pgt_schema;
+    let name = &st.pgt_name;
+    let quoted_table = format!(
+        "\"{}\".\"{}\"",
+        schema.replace('"', "\"\""),
+        name.replace('"', "\"\""),
+    );
+
+    let new_col_list: String = user_cols
+        .iter()
+        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let pre_col_refs: String = user_cols
+        .iter()
+        .map(|c| format!("pre.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let post_col_refs: String = user_cols
+        .iter()
+        .map(|c| format!("post.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // IS DISTINCT FROM comparison for detecting changed rows
+    let is_distinct_pairs: String = user_cols
+        .iter()
+        .map(|c| {
+            let qc = format!("\"{}\"", c.replace('"', "\"\""));
+            format!("pre.{qc} IS DISTINCT FROM post.{qc}")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let mut total_count: i64 = 0;
+
+    // Deleted rows: in pre but not in post
+    let deleted_sql = format!(
+        "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+         (lsn, action, pk_hash, {new_col_list}) \
+         SELECT pg_current_wal_lsn(), 'D', pre.__pgt_row_id, {pre_col_refs} \
+         FROM __pgt_pre_{pgt_id} pre \
+         LEFT JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
+         WHERE post.__pgt_row_id IS NULL"
+    );
+    let del_count = Spi::connect_mut(|client| {
+        let result = client
+            .update(&deleted_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+    total_count += del_count;
+
+    // Inserted rows: in post but not in pre
+    let inserted_sql = format!(
+        "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+         (lsn, action, pk_hash, {new_col_list}) \
+         SELECT pg_current_wal_lsn(), 'I', post.__pgt_row_id, {post_col_refs} \
+         FROM {quoted_table} post \
+         LEFT JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
+         WHERE pre.__pgt_row_id IS NULL"
+    );
+    let ins_count = Spi::connect_mut(|client| {
+        let result = client
+            .update(&inserted_sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+    total_count += ins_count;
+
+    // Changed rows: same row_id but different content — emit as D+I pair
+    if !is_distinct_pairs.is_empty() {
+        let changed_del_sql = format!(
+            "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+             (lsn, action, pk_hash, {new_col_list}) \
+             SELECT pg_current_wal_lsn(), 'D', pre.__pgt_row_id, {pre_col_refs} \
+             FROM __pgt_pre_{pgt_id} pre \
+             JOIN {quoted_table} post ON pre.__pgt_row_id = post.__pgt_row_id \
+             WHERE {is_distinct_pairs}"
+        );
+        let chg_del = Spi::connect_mut(|client| {
+            let result = client
+                .update(&changed_del_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<i64, PgTrickleError>(result.len() as i64)
+        })?;
+        total_count += chg_del;
+
+        let changed_ins_sql = format!(
+            "INSERT INTO \"{change_schema}\".changes_pgt_{pgt_id} \
+             (lsn, action, pk_hash, {new_col_list}) \
+             SELECT pg_current_wal_lsn(), 'I', post.__pgt_row_id, {post_col_refs} \
+             FROM {quoted_table} post \
+             JOIN __pgt_pre_{pgt_id} pre ON post.__pgt_row_id = pre.__pgt_row_id \
+             WHERE {is_distinct_pairs}"
+        );
+        let chg_ins = Spi::connect_mut(|client| {
+            let result = client
+                .update(&changed_ins_sql, None, &[])
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            Ok::<i64, PgTrickleError>(result.len() as i64)
+        })?;
+        total_count += chg_ins;
+    }
+
+    if total_count > 0 {
+        pgrx::debug1!(
+            "[pg_trickle] ST-ST FULL: captured {} diff rows to changes_pgt_{} for {}.{} \
+             (deleted={}, inserted={}, changed={})",
+            total_count,
+            pgt_id,
+            st.pgt_schema,
+            st.pgt_name,
+            del_count,
+            ins_count,
+            total_count - del_count - ins_count,
+        );
+    }
+
+    Ok(total_count)
+}
+
+/// Get user-facing output columns for an ST (for delta capture).
+///
+/// Excludes internal columns (__pgt_row_id, __pgt_count, etc.).
+fn get_st_user_columns(st: &StreamTableMeta) -> Vec<String> {
+    crate::cdc::resolve_st_output_columns(st.pgt_relid)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Check whether this ST has downstream ST consumers that need delta capture.
+fn has_downstream_st_consumers(pgt_id: i64) -> bool {
+    crate::cdc::count_downstream_st_consumers(pgt_id) > 0
+}
+
 /// Resolve LSN placeholders in a SQL template with actual frontier values.
 ///
 /// B3-1: When `zero_change_oids` contains a source OID, the entire LSN-range
@@ -604,6 +876,47 @@ fn resolve_lsn_placeholders(
             );
         }
     }
+
+    // ST-ST-4: Resolve pgt_-prefixed placeholders for ST source frontiers.
+    // These use the format `__PGS_PREV_LSN_pgt_{id}__` / `__PGS_NEW_LSN_pgt_{id}__`.
+    // The frontier stores ST sources under the key "pgt_{id}".
+    let pgt_prefix = "__PGS_PREV_LSN_pgt_";
+    if sql.contains(pgt_prefix) {
+        // Extract all pgt_ IDs from the template
+        let mut search_from = 0usize;
+        let mut pgt_ids: Vec<i64> = Vec::new();
+        while let Some(pos) = sql[search_from..].find(pgt_prefix) {
+            let start = search_from + pos + pgt_prefix.len();
+            let end = sql[start..]
+                .find("__")
+                .map(|p| start + p)
+                .unwrap_or(sql.len());
+            if let Ok(id) = sql[start..end].parse::<i64>()
+                && !pgt_ids.contains(&id)
+            {
+                pgt_ids.push(id);
+            }
+            search_from = end;
+        }
+
+        for pgt_id in &pgt_ids {
+            let key = format!("pgt_{pgt_id}");
+            let prev_lsn = prev_frontier
+                .sources
+                .get(&key)
+                .map(|sv| sv.lsn.clone())
+                .unwrap_or_else(|| "0/0".to_string());
+            let new_lsn = new_frontier
+                .sources
+                .get(&key)
+                .map(|sv| sv.lsn.clone())
+                .unwrap_or_else(|| "0/0".to_string());
+
+            sql = sql.replace(&format!("__PGS_PREV_LSN_pgt_{pgt_id}__"), &prev_lsn);
+            sql = sql.replace(&format!("__PGS_NEW_LSN_pgt_{pgt_id}__"), &new_lsn);
+        }
+    }
+
     sql
 }
 
@@ -904,19 +1217,6 @@ pub fn prewarm_merge_cache(st: &StreamTableMeta) {
 
     let schema = &st.pgt_schema;
     let name = &st.pgt_name;
-
-    let has_stream_table_source = StDependency::get_for_st(st.pgt_id)
-        .map(|deps| deps.iter().any(|dep| dep.source_type == "STREAM_TABLE"))
-        .unwrap_or(false);
-
-    if has_stream_table_source {
-        pgrx::debug1!(
-            "[pg_trickle] cache pre-warm skipped for {}.{}: upstream stream tables use full-refresh fallback",
-            schema,
-            name,
-        );
-        return;
-    }
 
     if matches!(dvm::query_has_recursive_cte(&st.defining_query), Ok(true)) {
         pgrx::debug1!(
@@ -1452,6 +1752,39 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
         query.clone()
     };
 
+    // ST-ST-3: Snapshot pre-state for diff capture when this ST has
+    // downstream ST consumers. The snapshot is compared against the
+    // post-refresh state to produce I/D pairs for the change buffer.
+    let needs_diff_capture = has_downstream_st_consumers(st.pgt_id);
+    let user_cols = if needs_diff_capture {
+        let cols = get_st_user_columns(st);
+        let col_list: String = cols
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let snapshot_sql = format!(
+            "CREATE TEMP TABLE __pgt_pre_{pgt_id} ON COMMIT DROP AS \
+             SELECT __pgt_row_id, {col_list} FROM {quoted_table}",
+            pgt_id = st.pgt_id,
+        );
+        if let Err(e) = Spi::run(&snapshot_sql) {
+            pgrx::warning!(
+                "[pg_trickle] ST-ST: pre-snapshot failed for {}.{}: {} — \
+                 downstream STs will not receive differential delta",
+                schema,
+                name,
+                e,
+            );
+            Vec::new()
+        } else {
+            cols
+        }
+    } else {
+        Vec::new()
+    };
+
     // Truncate
     Spi::run(&format!("TRUNCATE {quoted_table}"))
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
@@ -1493,6 +1826,19 @@ pub fn execute_full_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
         Ok::<usize, PgTrickleError>(result.len())
     })?;
+
+    // ST-ST-3: Capture the full-refresh diff into the change buffer.
+    if needs_diff_capture
+        && !user_cols.is_empty()
+        && let Err(e) = capture_full_refresh_diff_to_st_buffer(st, &user_cols)
+    {
+        pgrx::warning!(
+            "[pg_trickle] ST-ST: full-refresh diff capture failed for {}.{}: {}",
+            schema,
+            name,
+            e,
+        );
+    }
 
     // Re-enable user triggers and emit NOTIFY so listeners know a FULL
     // refresh occurred.
@@ -1593,6 +1939,14 @@ pub fn post_full_refresh_cleanup(st: &StreamTableMeta) {
     // refresh already captured them.  Prevents the next differential cycle
     // from re-examining them and re-triggering another adaptive fallback.
     cleanup_change_buffers_by_frontier(&change_schema, &source_oids);
+
+    // G4b: Also clean up ST change buffers for upstream ST sources.
+    let st_source_pgt_ids: Vec<i64> = deps
+        .iter()
+        .filter(|dep| dep.source_type == "STREAM_TABLE")
+        .filter_map(|dep| crate::catalog::StreamTableMeta::pgt_id_for_relid(dep.source_relid))
+        .collect();
+    cleanup_st_change_buffers_by_frontier(&change_schema, &st_source_pgt_ids);
 }
 
 /// Poll all FOREIGN_TABLE and MATVIEW dependencies for a stream table before
@@ -1860,6 +2214,16 @@ pub fn execute_differential_refresh(
     // ensuring stale change buffer rows are removed even when the
     // thread-local queue is empty.
     cleanup_change_buffers_by_frontier(&change_schema, &catalog_source_oids);
+
+    // C-1c: ST buffer cleanup — delete consumed rows from upstream ST
+    // change buffers (changes_pgt_{id}) using frontier thresholds.
+    let st_source_pgt_ids: Vec<i64> = StDependency::get_for_st(st.pgt_id)
+        .unwrap_or_default()
+        .iter()
+        .filter(|dep| dep.source_type == "STREAM_TABLE")
+        .filter_map(|dep| crate::catalog::StreamTableMeta::pgt_id_for_relid(dep.source_relid))
+        .collect();
+    cleanup_st_change_buffers_by_frontier(&change_schema, &st_source_pgt_ids);
 
     // C-4: Compact change buffers that exceed the configured threshold.
     // This reduces delta scan overhead by eliminating net-zero changes
@@ -2646,6 +3010,11 @@ pub fn execute_differential_refresh(
     let is_dedup_flag = crate::dvm::is_delta_deduplicated(st.pgt_id);
     let use_explicit_dml = use_explicit_dml || (st.has_keyless_source && !is_dedup_flag);
 
+    // ST-ST-2: Force explicit DML when this ST has downstream ST consumers.
+    // The explicit DML path materializes the delta into __pgt_delta_{pgt_id},
+    // which we then capture into the ST's change buffer for downstream use.
+    let use_explicit_dml = use_explicit_dml || has_downstream_st_consumers(st.pgt_id);
+
     // When user_triggers = 'off' but there ARE user triggers on the ST,
     // suppress them during the MERGE to prevent spurious firing.
     let suppress_triggers = user_triggers_mode == crate::config::UserTriggersMode::Off
@@ -2730,6 +3099,19 @@ pub fn execute_differential_refresh(
             schema,
             name,
         );
+
+        // ST-ST-2: Capture delta to change buffer for downstream ST consumers.
+        if has_downstream_st_consumers(st.pgt_id) {
+            let user_cols = get_st_user_columns(st);
+            if let Err(e) = capture_delta_to_st_buffer(st, &user_cols) {
+                pgrx::warning!(
+                    "[pg_trickle] ST-ST: delta capture failed for {}.{}: {}",
+                    schema,
+                    name,
+                    e,
+                );
+            }
+        }
 
         (del_count + upd_count + ins_count, "explicit_dml")
     } else if use_prepared {

@@ -435,6 +435,166 @@ pub fn create_change_buffer_table(
     Ok(())
 }
 
+// ── ST-to-ST Change Buffer Infrastructure (Phase 8) ────────────────────
+
+/// Create a change buffer table for a stream table source.
+///
+/// ST change buffers use `changes_pgt_{pgt_id}` naming to avoid collision
+/// with base-table buffers (`changes_{oid}`). The schema mirrors base-table
+/// buffers but only stores `new_*` columns (no `old_*`) because ST deltas
+/// are expressed as I/D pairs, not UPDATEs.
+///
+/// `columns` are the output columns of the upstream ST (name, type pairs).
+pub fn create_st_change_buffer_table(
+    pgt_id: i64,
+    change_schema: &str,
+    columns: &[(String, String)],
+) -> Result<(), PgTrickleError> {
+    // Build typed column definitions: "new_col" TYPE only (no old_ columns)
+    let typed_col_defs: String = columns
+        .iter()
+        .map(|(name, typ)| format!(",\"new_{}\" {}", name.replace('"', "\"\""), typ,))
+        .collect::<Vec<_>>()
+        .join("");
+
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {schema}.changes_pgt_{id} (\
+            change_id   BIGSERIAL,\
+            lsn         PG_LSN NOT NULL,\
+            action      CHAR(1) NOT NULL,\
+            pk_hash     BIGINT\
+            {typed_col_defs}\
+        )",
+        schema = change_schema,
+        id = pgt_id,
+    );
+
+    Spi::run(&sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to create ST change buffer table: {}", e))
+    })?;
+
+    // Disable RLS on ST change buffer
+    let disable_rls_sql = format!(
+        "ALTER TABLE {schema}.changes_pgt_{id} DISABLE ROW LEVEL SECURITY",
+        schema = change_schema,
+        id = pgt_id,
+    );
+    Spi::run(&disable_rls_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to disable RLS on ST change buffer: {}", e))
+    })?;
+
+    // Covering index matching base-table buffer pattern
+    let idx_sql = format!(
+        "CREATE INDEX IF NOT EXISTS idx_changes_pgt_{id}_lsn_pk_cid \
+         ON {schema}.changes_pgt_{id} (lsn, pk_hash, change_id) INCLUDE (action)",
+        schema = change_schema,
+        id = pgt_id,
+    );
+    Spi::run(&idx_sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to create ST change buffer index: {}", e))
+    })?;
+
+    Ok(())
+}
+
+/// Drop the change buffer table for a stream table source.
+pub fn drop_st_change_buffer_table(pgt_id: i64, change_schema: &str) -> Result<(), PgTrickleError> {
+    let sql = format!(
+        "DROP TABLE IF EXISTS {schema}.changes_pgt_{id} CASCADE",
+        schema = change_schema,
+        id = pgt_id,
+    );
+    Spi::run(&sql).map_err(|e| {
+        PgTrickleError::SpiError(format!("Failed to drop ST change buffer table: {}", e))
+    })?;
+    Ok(())
+}
+
+/// Check whether a ST change buffer table exists.
+pub fn has_st_change_buffer(pgt_id: i64, change_schema: &str) -> bool {
+    Spi::get_one::<bool>(&format!(
+        "SELECT EXISTS(\
+           SELECT 1 FROM pg_class c \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+           WHERE n.nspname = '{schema}' \
+             AND c.relname = 'changes_pgt_{id}'\
+         )",
+        schema = change_schema,
+        id = pgt_id,
+    ))
+    .unwrap_or(Some(false))
+    .unwrap_or(false)
+}
+
+/// Resolve the output columns of a stream table for ST change buffer creation.
+///
+/// Returns `(column_name, column_type)` pairs from the ST's storage table,
+/// excluding internal columns (`__pgt_row_id`, `__pgt_count`, etc.).
+pub fn resolve_st_output_columns(
+    pgt_relid: pg_sys::Oid,
+) -> Result<Vec<(String, String)>, PgTrickleError> {
+    let columns = Spi::connect(|client| {
+        let table = client
+            .select(
+                "SELECT a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod) AS type_name \
+                 FROM pg_attribute a \
+                 WHERE a.attrelid = $1 \
+                   AND a.attnum > 0 \
+                   AND NOT a.attisdropped \
+                   AND a.attname::text NOT LIKE '__pgt_%' \
+                 ORDER BY a.attnum",
+                None,
+                &[pgt_relid.into()],
+            )
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        let mut cols = Vec::new();
+        for row in table {
+            let name = row
+                .get::<String>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or_default();
+            let typ = row
+                .get::<String>(2)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .unwrap_or_else(|| "text".to_string());
+            cols.push((name, typ));
+        }
+        Ok(cols)
+    })?;
+    Ok(columns)
+}
+
+/// Ensure a ST change buffer exists for an upstream ST that has downstream consumers.
+///
+/// Called when a new dependency is created (create_stream_table with ST source)
+/// or during upgrade migration. Idempotent — skips if buffer already exists.
+pub fn ensure_st_change_buffer(
+    upstream_pgt_id: i64,
+    upstream_pgt_relid: pg_sys::Oid,
+    change_schema: &str,
+) -> Result<(), PgTrickleError> {
+    if has_st_change_buffer(upstream_pgt_id, change_schema) {
+        return Ok(());
+    }
+
+    let columns = resolve_st_output_columns(upstream_pgt_relid)?;
+    create_st_change_buffer_table(upstream_pgt_id, change_schema, &columns)
+}
+
+/// Count how many downstream STs depend on a given upstream ST.
+pub fn count_downstream_st_consumers(pgt_id: i64) -> i64 {
+    // The upstream ST's pgt_relid is stored as source_relid in pgt_dependencies
+    Spi::get_one::<i64>(&format!(
+        "SELECT COUNT(*)::bigint FROM pgtrickle.pgt_dependencies \
+         WHERE source_relid = (\
+           SELECT pgt_relid FROM pgtrickle.pgt_stream_tables WHERE pgt_id = {pgt_id}\
+         ) AND source_type = 'STREAM_TABLE'"
+    ))
+    .unwrap_or(Some(0))
+    .unwrap_or(0)
+}
+
 /// C-4: Compact a change buffer by eliminating net-zero pk_hash groups
 /// (INSERT followed by DELETE that cancel out) and collapsing multi-change
 /// groups to retain only the first and last entries per pk_hash.
