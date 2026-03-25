@@ -9,7 +9,9 @@ Targets PostgreSQL 18.x.
 **Primary goals:** Maximum performance, low latency, and high throughput for
 stream tables are the top priorities. Differential refresh mode must be used
 wherever possible — full refresh is a fallback of last resort. The performance
-and scalability of this extension should be world-class.
+and scalability of this extension should be world-class. Data loss is
+unacceptable — correctness and durability of committed changes must never be
+sacrificed for performance gains.
 
 Key docs: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 [docs/SQL_REFERENCE.md](docs/SQL_REFERENCE.md) ·
