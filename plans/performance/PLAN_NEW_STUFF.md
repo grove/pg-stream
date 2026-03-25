@@ -780,9 +780,12 @@ However, operators using streaming replication for read scaling (queries
 against the standby) will see the stream tables on the standby as
 potentially stale if the primary's change buffers haven't been flushed
 recently. This is an existing limitation but becomes more visible once the
-buffers are UNLOGGED (previously data loss was crash-only; now it also
-happens on any standby restart). The documentation should call this out
-explicitly.
+buffers are UNLOGGED (previously the **in-flight CDC buffer contents** — not
+the stream table output — were truncated on crash only; with UNLOGGED buffers
+this also happens on any standby restart). In both cases the stream table
+output is recovered correctly via FULL refresh on the next scheduler tick:
+no committed user data is ever permanently lost. The documentation should
+call out the temporary staleness window explicitly.
 
 **Migration for existing installations.** `ALTER TABLE ... SET UNLOGGED`
 transparently rewrites the table and acquires `ACCESS EXCLUSIVE`. For
