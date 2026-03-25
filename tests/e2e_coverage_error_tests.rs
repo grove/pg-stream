@@ -343,7 +343,7 @@ async fn test_wb2_wide_table_gt63_cols_differential_refresh() {
     db.refresh_st("wide_st").await;
 
     // After refresh, the row should reflect the col1 update.
-    let val: i64 = db
+    let val: i32 = db
         .query_scalar("SELECT col1 FROM public.wide_st WHERE id = 1")
         .await;
     assert_eq!(
