@@ -1,9 +1,9 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-25
+> **Last updated:** 2026-03-26
 > **Latest release:** 0.10.0 (2026-03-25)
 > **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
-> **v0.11.0 progress:** Phase 1 complete (PR #279)
+> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (Prometheus/Grafana observability stack)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -1839,12 +1839,12 @@ Zero-code monitoring integration. All config files live in a new
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| OBS-1 | **Prometheus metrics out of the box.** A YAML config file for the standard `postgres_exporter` that turns pg_trickle's existing SQL views into Prometheus metrics: refresh count, success/failure rates, staleness, rows changed, CDC lag, and alerts. Drop the file in and your existing Prometheus setup starts scraping pg_trickle data. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-2 | **Get paged when things go wrong.** Pre-built Prometheus alerting rules that fire when a stream table has been stale for over 5 minutes, when 3+ consecutive refreshes fail, when CDC replication lag exceeds 1 GB, or when any CDC source has an active alert. Copy the file into your Prometheus config directory. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 2 |
-| OBS-3 | **See everything at a glance.** A Grafana dashboard with five sections: an overview row (active tables, stale count, error count), refresh performance charts (duration trends, throughput), staleness heatmap, CDC health panel (mode per source, replication lag), and a per-table drill-down you can filter with a dropdown. Import the JSON file into Grafana. | 4h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
-| OBS-4 | **Try it all in one command.** A `docker-compose.yml` that spins up PostgreSQL with pg_trickle, postgres_exporter, Prometheus, and Grafana — pre-wired together. Run `docker compose up`, open `localhost:3000`, and see the dashboard with live data. Great for demos and evaluation. | 2h | [PLAN_ECO_SYSTEM.md](plans/ecosystem/PLAN_ECO_SYSTEM.md) §Project 3 |
+| ~~OBS-1~~ | ~~**Prometheus metrics out of the box.**~~ ✅ Done in v0.11.0 Phase 3 — `monitoring/prometheus/pg_trickle_queries.yml` exports 14 metrics (per-table refresh stats, health summary, CDC buffer sizes, status counts, recent error rate) via postgres_exporter. | — | [monitoring/prometheus/pg_trickle_queries.yml](monitoring/prometheus/pg_trickle_queries.yml) |
+| ~~OBS-2~~ | ~~**Get paged when things go wrong.**~~ ✅ Done in v0.11.0 Phase 3 — `monitoring/prometheus/alerts.yml` has 8 alerting rules: staleness > 5 min, ≥3 consecutive failures, table SUSPENDED, CDC buffer > 1 GB, scheduler down, high refresh duration, cluster WARNING/CRITICAL. | — | [monitoring/prometheus/alerts.yml](monitoring/prometheus/alerts.yml) |
+| ~~OBS-3~~ | ~~**See everything at a glance.**~~ ✅ Done in v0.11.0 Phase 3 — `monitoring/grafana/dashboards/pg_trickle_overview.json` has 6 sections: cluster overview stat panels, refresh performance time-series, staleness heatmap, CDC health graphs, per-table drill-down table with schema/table variable filters. | — | [monitoring/grafana/dashboards/pg_trickle_overview.json](monitoring/grafana/dashboards/pg_trickle_overview.json) |
+| ~~OBS-4~~ | ~~**Try it all in one command.**~~ ✅ Done in v0.11.0 Phase 3 — `monitoring/docker-compose.yml` spins up PostgreSQL + pg_trickle + postgres_exporter + Prometheus + Grafana with pre-wired config and demo seed data (`monitoring/init/01_demo.sql`). `docker compose up` → Grafana at :3000. | — | [monitoring/docker-compose.yml](monitoring/docker-compose.yml) |
 
-> **Observability subtotal: ~12 hours**
+> **Observability subtotal: ~12 hours** ✅
 
 ### Default Tuning & Safety Defaults (from REPORT_OVERALL_STATUS.md)
 
@@ -2049,7 +2049,7 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog
 - [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction)
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
-- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
+- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped — ✅ Done in v0.11.0 Phase 3 (`monitoring/` directory)
 - [x] DEF-1: `parallel_refresh_mode` default is `'on'`; unit test updated — ✅ Done in v0.11.0 Phase 1 (concurrent-refresh E2E test still pending)
 - [x] DEF-2: `auto_backoff` default is `true`; CONFIGURATION.md updated — ✅ Done in v0.10.0
 - [x] DEF-3: SemiJoin delta-key pre-filter verified already implemented — ✅ Done in v0.11.0 Phase 2 (pre-existing in `semi_join.rs`)

@@ -1,0 +1,163 @@
+groups:
+  - name: pg_trickle
+    interval: 60s
+    rules:
+
+      # ── Staleness ────────────────────────────────────────────────────────
+
+      # A stream table's data is more than (schedule + 5 min) old.
+      # Fires once per affected table so alerting rules can route per-table.
+      - alert: PgTrickleTableStale
+        expr: |
+          (
+            pg_trickle_table_stats_staleness_seconds{stale="1"} -
+            pg_trickle_table_stats_staleness_seconds{stale="1"}
+            -- staleness_seconds > 300 s (5 min) beyond the scheduled interval
+          ) == 0
+          or
+          pg_trickle_table_stats_staleness_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream table {{ $labels.schema }}.{{ $labels.name }} is stale"
+          description: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} has not been
+            refreshed for {{ $value | humanizeDuration }}. Expected interval:
+            {{ $labels.refresh_mode }}.
+
+      # Simpler form: any table whose staleness flag is set for > 5 minutes.
+      - alert: PgTrickleTableStaleFlag
+        expr: pg_trickle_table_stats_stale == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream table {{ $labels.schema }}.{{ $labels.name }} data is overdue"
+          description: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} has data
+            older than its configured schedule. Staleness:
+            {{ $value | humanizeDuration }}.
+
+      # ── Consecutive refresh failures ─────────────────────────────────────
+
+      # 3 or more consecutive failures — table approaching auto-suspend.
+      - alert: PgTrickleConsecutiveErrors
+        expr: pg_trickle_table_stats_consecutive_errors >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream table {{ $labels.schema }}.{{ $labels.name }} has {{ $value }} consecutive errors"
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} has experienced
+            {{ $value }} consecutive refresh failures. The table will be
+            automatically suspended after 5 failures. Investigate the last
+            error via:
+              SELECT * FROM pgtrickle.pgt_refresh_history
+              WHERE pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables
+                              WHERE pgt_schema='{{ $labels.schema }}'
+                                AND pgt_name='{{ $labels.name }}')
+              ORDER BY refresh_id DESC LIMIT 5;
+
+      # Table has been auto-suspended due to repeated failures.
+      - alert: PgTrickleTableSuspended
+        expr: pg_trickle_status_counts_stream_tables_total{status="SUSPENDED"} > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} stream table(s) are SUSPENDED"
+          description: >
+            One or more stream tables have been automatically suspended due to
+            repeated refresh failures. Resume with:
+              SELECT pgtrickle.alter_stream_table(name, status => 'ACTIVE');
+
+      # ── CDC change buffer size ────────────────────────────────────────────
+
+      # CDC buffer exceeds 1 GB — scheduler may be stalled or throughput
+      # cannot keep up with write volume.
+      - alert: PgTrickleCdcBufferLarge
+        expr: pg_trickle_cdc_buffers_buffer_bytes > 1073741824
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            CDC buffer for {{ $labels.stream_table }} ←
+            {{ $labels.source_table }} exceeds 1 GB
+          description: >
+            The CDC change buffer for stream table {{ $labels.stream_table }}
+            (source: {{ $labels.source_table }}, mode: {{ $labels.cdc_mode }})
+            currently holds {{ $value | humanize1024 }}B of unprocessed changes.
+            This may indicate a scheduler stall or sustained high write volume.
+            Check pg_trickle.enabled and the scheduler health:
+              SELECT * FROM pgtrickle.health_check();
+
+      # ── Scheduler availability ───────────────────────────────────────────
+
+      # Scheduler background worker not detected in pg_stat_activity.
+      - alert: PgTrickleSchedulerDown
+        expr: pg_trickle_health_scheduler_running == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pg_trickle scheduler is not running"
+          description: >
+            The pg_trickle scheduler background worker has not been detected
+            for at least 2 minutes. Stream tables are NOT being refreshed.
+            Check PostgreSQL logs for worker crash messages. Verify:
+              SHOW pg_trickle.enabled;
+              SELECT * FROM pg_stat_activity
+              WHERE backend_type = 'pg_trickle scheduler';
+
+      # ── Refresh duration ─────────────────────────────────────────────────
+
+      # Average refresh taking longer than 30 seconds — may indicate a
+      # table that should switch to DIFFERENTIAL mode, or a query needing
+      # an index.
+      - alert: PgTrickleHighRefreshDuration
+        expr: pg_trickle_table_stats_avg_duration_ms > 30000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} has high
+            avg refresh duration ({{ $value | humanizePercentage }}ms)
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} average refresh duration
+            is {{ $value }}ms (mode: {{ $labels.refresh_mode }}).
+            Consider switching to DIFFERENTIAL mode or adding indexes on the
+            source table. Run:
+              SELECT pgtrickle.explain_refresh_mode('{{ $labels.schema }}.{{ $labels.name }}');
+
+      # ── Overall health ───────────────────────────────────────────────────
+
+      # quick_health view shows CRITICAL (score = 2).
+      - alert: PgTrickleClusterCritical
+        expr: pg_trickle_health_health_status_code == 2
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pg_trickle cluster health is CRITICAL"
+          description: >
+            The overall pg_trickle health check reports CRITICAL status.
+            One or more stream tables are SUSPENDED. Check:
+              SELECT * FROM pgtrickle.quick_health;
+              SELECT * FROM pgtrickle.health_check();
+
+      # quick_health view shows WARNING (score = 1).
+      - alert: PgTrickleClusterWarning
+        expr: pg_trickle_health_health_status_code == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_trickle cluster health is WARNING"
+          description: >
+            The overall pg_trickle health check reports WARNING status.
+            Some tables may have errors or stale data. Check:
+              SELECT * FROM pgtrickle.quick_health;

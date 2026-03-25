@@ -1,0 +1,199 @@
+# postgres_exporter custom queries for pg_trickle
+#
+# Usage: pass this file to postgres_exporter via --extend.query-path
+# (or PG_EXPORTER_EXTEND_QUERY_PATH env var).
+#
+# All metrics are prefixed "pg_trickle_".
+# Requires pg_trickle 0.10.0+ with:
+#   pgtrickle.pg_stat_stream_tables view
+#   pgtrickle.quick_health view
+#   pgtrickle.change_buffer_sizes() function
+
+# ── Per-table refresh statistics ─────────────────────────────────────────────
+
+pg_trickle_table_stats:
+  query: |
+    SELECT
+        pgt_schema                                    AS schema,
+        pgt_name                                      AS name,
+        status,
+        refresh_mode,
+        COALESCE(effective_refresh_mode, refresh_mode) AS effective_refresh_mode,
+        CASE WHEN is_populated THEN 1 ELSE 0 END      AS is_populated,
+        EXTRACT(EPOCH FROM staleness)::float8          AS staleness_seconds,
+        CASE WHEN stale THEN 1 ELSE 0 END              AS stale,
+        consecutive_errors,
+        COALESCE(total_refreshes, 0)                  AS total_refreshes,
+        COALESCE(successful_refreshes, 0)             AS successful_refreshes,
+        COALESCE(failed_refreshes, 0)                 AS failed_refreshes,
+        COALESCE(total_rows_inserted, 0)              AS rows_inserted_total,
+        COALESCE(total_rows_deleted, 0)               AS rows_deleted_total,
+        COALESCE(avg_duration_ms, 0)                  AS avg_duration_ms
+    FROM pgtrickle.pg_stat_stream_tables
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Schema of the stream table"
+    - name:
+        usage: LABEL
+        description: "Name of the stream table"
+    - status:
+        usage: LABEL
+        description: "Current lifecycle status (ACTIVE, SUSPENDED, ERROR, INITIALIZING)"
+    - refresh_mode:
+        usage: LABEL
+        description: "Configured refresh mode (FULL, DIFFERENTIAL, AUTO, IMMEDIATE)"
+    - effective_refresh_mode:
+        usage: LABEL
+        description: "Effective refresh mode used in the last refresh"
+    - is_populated:
+        usage: GAUGE
+        description: "1 if the stream table has been populated at least once"
+    - staleness_seconds:
+        usage: GAUGE
+        description: "Seconds since last successful refresh (NULL = never refreshed)"
+    - stale:
+        usage: GAUGE
+        description: "1 if the table data is older than its configured schedule"
+    - consecutive_errors:
+        usage: GAUGE
+        description: "Number of consecutive refresh failures (resets on success)"
+    - total_refreshes:
+        usage: COUNTER
+        description: "Total number of refresh cycles completed"
+    - successful_refreshes:
+        usage: COUNTER
+        description: "Number of refresh cycles that completed successfully"
+    - failed_refreshes:
+        usage: COUNTER
+        description: "Number of refresh cycles that failed"
+    - rows_inserted_total:
+        usage: COUNTER
+        description: "Total rows inserted across all refreshes"
+    - rows_deleted_total:
+        usage: COUNTER
+        description: "Total rows deleted across all refreshes"
+    - avg_duration_ms:
+        usage: GAUGE
+        description: "Rolling average refresh duration in milliseconds"
+
+# ── Overall health summary ────────────────────────────────────────────────────
+
+pg_trickle_health:
+  query: |
+    SELECT
+        total_stream_tables,
+        error_tables,
+        stale_tables,
+        CASE WHEN scheduler_running THEN 1 ELSE 0 END AS scheduler_running,
+        CASE
+            WHEN status = 'OK'       THEN 0
+            WHEN status = 'WARNING'  THEN 1
+            WHEN status = 'CRITICAL' THEN 2
+            ELSE 3
+        END AS health_status_code
+    FROM pgtrickle.quick_health
+  metrics:
+    - total_stream_tables:
+        usage: GAUGE
+        description: "Total number of registered stream tables"
+    - error_tables:
+        usage: GAUGE
+        description: "Number of tables currently in ERROR state or with consecutive errors"
+    - stale_tables:
+        usage: GAUGE
+        description: "Number of tables with data older than their configured schedule"
+    - scheduler_running:
+        usage: GAUGE
+        description: "1 if the pg_trickle scheduler background worker is alive"
+    - health_status_code:
+        usage: GAUGE
+        description: "Overall cluster health: 0=OK, 1=WARNING, 2=CRITICAL"
+
+# ── CDC change buffer sizes ───────────────────────────────────────────────────
+
+pg_trickle_cdc_buffers:
+  query: |
+    SELECT
+        stream_table                 AS stream_table,
+        source_table                 AS source_table,
+        cdc_mode,
+        COALESCE(pending_rows, 0)    AS pending_rows,
+        COALESCE(buffer_bytes, 0)    AS buffer_bytes
+    FROM pgtrickle.change_buffer_sizes()
+  metrics:
+    - stream_table:
+        usage: LABEL
+        description: "Fully qualified name of the stream table"
+    - source_table:
+        usage: LABEL
+        description: "Fully qualified name of the upstream source table"
+    - cdc_mode:
+        usage: LABEL
+        description: "CDC mode in use for this source (trigger, wal, transitioning)"
+    - pending_rows:
+        usage: GAUGE
+        description: "Rows currently pending in the CDC change buffer"
+    - buffer_bytes:
+        usage: GAUGE
+        description: "Size in bytes of the CDC change buffer (on-disk)"
+
+# ── Stream table status counts ────────────────────────────────────────────────
+
+pg_trickle_status_counts:
+  query: |
+    SELECT
+        status,
+        count(*)::bigint AS stream_tables_total
+    FROM pgtrickle.pgt_stream_tables
+    GROUP BY status
+  metrics:
+    - status:
+        usage: LABEL
+        description: "Lifecycle status"
+    - stream_tables_total:
+        usage: GAUGE
+        description: "Number of stream tables in this status"
+
+# ── Refresh history: recent error rate ───────────────────────────────────────
+
+pg_trickle_recent_refresh_stats:
+  query: |
+    SELECT
+        st.pgt_schema                                         AS schema,
+        st.pgt_name                                           AS name,
+        count(*) FILTER (WHERE h.status = 'FAILED')          AS recent_failures,
+        count(*) FILTER (WHERE h.status = 'COMPLETED')       AS recent_successes,
+        COALESCE(
+            avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)
+            FILTER (WHERE h.status = 'COMPLETED' AND h.end_time IS NOT NULL),
+            0.0
+        )::float8                                            AS recent_avg_duration_ms,
+        COALESCE(
+            max(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)
+            FILTER (WHERE h.status = 'COMPLETED' AND h.end_time IS NOT NULL),
+            0.0
+        )::float8                                            AS recent_max_duration_ms
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_refresh_history h ON h.pgt_id = st.pgt_id
+    WHERE h.start_time > now() - interval '1 hour'
+    GROUP BY st.pgt_schema, st.pgt_name
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Schema of the stream table"
+    - name:
+        usage: LABEL
+        description: "Name of the stream table"
+    - recent_failures:
+        usage: GAUGE
+        description: "Number of failed refreshes in the last hour"
+    - recent_successes:
+        usage: GAUGE
+        description: "Number of successful refreshes in the last hour"
+    - recent_avg_duration_ms:
+        usage: GAUGE
+        description: "Average refresh duration (ms) over the last hour"
+    - recent_max_duration_ms:
+        usage: GAUGE
+        description: "Maximum refresh duration (ms) over the last hour"
