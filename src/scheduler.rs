@@ -1106,6 +1106,76 @@ fn is_unit_due(unit: &ExecutionUnit, dag: &StDag) -> bool {
     })
 }
 
+// ── C3-1: Per-database worker quota helpers ───────────────────────────────
+
+/// C3-1: Compute the effective per-database worker quota for this dispatch tick.
+///
+/// When `per_db_quota == 0` (disabled), falls back to `max_concurrent_refreshes`
+/// (the legacy per-coordinator cap, not cluster-aware).
+///
+/// When `per_db_quota > 0`, the base entitlement is `per_db_quota`. If the
+/// cluster has spare capacity (active workers < 80% of `max_cluster`), the
+/// effective quota is increased to `per_db_quota * 3 / 2` to absorb a burst
+/// without wasting idle cluster resources. The burst is reclaimed automatically
+/// within 1 scheduler cycle once global load rises.
+///
+/// Pure logic — extracted for unit-testability.
+pub fn compute_per_db_quota(
+    per_db_quota: i32,
+    max_concurrent_refreshes: i32,
+    max_cluster: u32,
+    current_active: u32,
+) -> u32 {
+    if per_db_quota <= 0 {
+        // C3-1 disabled — fall back to per-coordinator cap (legacy).
+        return max_concurrent_refreshes.max(1) as u32;
+    }
+    let base = per_db_quota.max(1) as u32;
+    // Burst threshold: 80% of cluster capacity.
+    let burst_threshold = ((max_cluster as f64) * 0.8).ceil() as u32;
+    if current_active < burst_threshold {
+        // Spare capacity — allow up to 150% of base quota.
+        (base * 3 / 2).max(base + 1)
+    } else {
+        base
+    }
+}
+
+/// C3-1: Sort an execution unit ready queue by dispatch priority.
+///
+/// Priority ordering (lowest number = dispatched first):
+/// 1. `ImmediateClosure` — transactional consistency, must not be delayed.
+/// 2. `AtomicGroup` / `RepeatableReadGroup` — consistency group members.
+/// 3. `Singleton` — normal scheduled stream tables.
+/// 4. `CyclicScc` — fixpoint groups, lowest urgency.
+///
+/// Topological order is preserved within each priority tier because the
+/// input queue was built by iterating `topo_order`.
+fn sort_ready_queue_by_priority(
+    queue: VecDeque<ExecutionUnitId>,
+    eu_dag: &ExecutionUnitDag,
+) -> VecDeque<ExecutionUnitId> {
+    use crate::dag::ExecutionUnitKind;
+    fn unit_priority(kind: ExecutionUnitKind) -> u8 {
+        match kind {
+            ExecutionUnitKind::ImmediateClosure => 0,
+            ExecutionUnitKind::AtomicGroup | ExecutionUnitKind::RepeatableReadGroup => 1,
+            ExecutionUnitKind::Singleton => 2,
+            ExecutionUnitKind::CyclicScc => 3,
+        }
+    }
+    let mut items: Vec<ExecutionUnitId> = queue.into_iter().collect();
+    // stable sort preserves topological order within each priority tier.
+    items.sort_by_key(|&uid| {
+        eu_dag
+            .units()
+            .find(|u| u.id == uid)
+            .map(|u| unit_priority(u.kind))
+            .unwrap_or(u8::MAX)
+    });
+    items.into_iter().collect()
+}
+
 /// Run one tick of the parallel dispatch loop.
 ///
 /// Called from the main scheduler loop when `parallel_refresh_mode == On`.
@@ -1125,8 +1195,14 @@ fn parallel_dispatch_tick(
         None => return,
     };
 
-    let max_per_db = config::pg_trickle_max_concurrent_refreshes().max(1) as u32;
     let max_cluster = config::pg_trickle_max_dynamic_refresh_workers().max(1) as u32;
+    // C3-1: Per-database quota with burst capacity.
+    let max_per_db = compute_per_db_quota(
+        config::pg_trickle_per_database_worker_quota(),
+        config::pg_trickle_max_concurrent_refreshes(),
+        max_cluster,
+        shmem::active_worker_count(),
+    );
     let dag_version_i64 = state.dag_version as i64;
     // SAFETY: MyProcPid is always valid inside a background worker.
     let scheduler_pid: i32 = unsafe { pg_sys::MyProcPid };
@@ -1289,7 +1365,13 @@ fn parallel_dispatch_tick(
         ready_queue.push_back(uid);
     }
 
+    // C3-1: Priority sort — IMMEDIATE closures first for transactional safety,
+    // then atomic groups, singletons, cyclic SCCs.  Topological order within
+    // each priority tier is preserved (we appended in topo_order above).
+    let ready_queue = sort_ready_queue_by_priority(ready_queue, eu_dag);
+
     // ── Step 3: Dispatch ready units within budget ───────────────────────
+    let mut ready_queue = ready_queue;
     while let Some(uid) = ready_queue.pop_front() {
         if state.per_db_inflight >= max_per_db {
             break;
@@ -4498,5 +4580,59 @@ mod tests {
         assert!(fuse_is_active("auto", Some(100), 0));
         assert!(fuse_is_active("auto", None, 5000));
         assert!(!fuse_is_active("auto", None, 0));
+    }
+
+    // ── C3-1: compute_per_db_quota tests ──────────────────────────────────
+
+    #[test]
+    fn test_quota_disabled_falls_back_to_max_concurrent_refreshes() {
+        // per_db_quota=0 → legacy behaviour, use max_concurrent_refreshes
+        assert_eq!(compute_per_db_quota(0, 4, 8, 0), 4);
+        assert_eq!(compute_per_db_quota(0, 1, 8, 6), 1);
+        // max_concurrent_refreshes=0 is clamped to 1
+        assert_eq!(compute_per_db_quota(0, 0, 8, 0), 1);
+    }
+
+    #[test]
+    fn test_quota_base_case_no_burst_when_cluster_busy() {
+        // active (7) >= 80% of max_cluster (10) = 8 → no burst, return base
+        assert_eq!(compute_per_db_quota(3, 4, 10, 8), 3);
+        assert_eq!(compute_per_db_quota(3, 4, 10, 9), 3);
+        assert_eq!(compute_per_db_quota(3, 4, 10, 10), 3);
+    }
+
+    #[test]
+    fn test_quota_burst_when_cluster_has_spare_capacity() {
+        // active (4) < 80% of max_cluster (10) = 8 → burst to 150% of base
+        // base=4, burst = 4*3/2 = 6
+        assert_eq!(compute_per_db_quota(4, 4, 10, 4), 6);
+        // base=2, burst = 2*3/2 = 3
+        assert_eq!(compute_per_db_quota(2, 4, 10, 0), 3);
+    }
+
+    #[test]
+    fn test_quota_burst_minimum_is_base_plus_one() {
+        // base=1, 1*3/2 = 1 (integer div), but min is base+1=2
+        assert_eq!(compute_per_db_quota(1, 4, 10, 0), 2);
+    }
+
+    #[test]
+    fn test_quota_negative_per_db_quota_falls_back_to_legacy() {
+        assert_eq!(compute_per_db_quota(-1, 3, 10, 0), 3);
+    }
+
+    #[test]
+    fn test_quota_cluster_idle_gives_burst() {
+        // max_cluster=8, 80% threshold = ceil(6.4)=7, active=0 < 7 → burst
+        // base=2, burst=3
+        assert_eq!(compute_per_db_quota(2, 4, 8, 0), 3);
+    }
+
+    #[test]
+    fn test_quota_burst_threshold_at_exactly_80_percent() {
+        // max_cluster=10, ceil(10*0.8)=8, active=7 < 8 → burst allowed
+        assert_eq!(compute_per_db_quota(4, 4, 10, 7), 6);
+        // active=8 == threshold → no burst
+        assert_eq!(compute_per_db_quota(4, 4, 10, 8), 4);
     }
 }

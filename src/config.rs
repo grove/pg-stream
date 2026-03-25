@@ -379,6 +379,28 @@ pub static PGS_LOG_MERGE_SQL: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// Set to 0 to disable the global default ceiling (per-ST ceiling only).
 pub static PGS_FUSE_DEFAULT_CEILING: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// C3-1: Per-database dynamic refresh worker quota.
+///
+/// When > 0, each per-database scheduler limits itself to this many
+/// concurrently active dynamic refresh workers drawn from the cluster-wide
+/// `max_dynamic_refresh_workers` pool. This prevents a single busy database
+/// from starving other databases in multi-tenant clusters.
+///
+/// **Burst capacity:** when the cluster has spare capacity (active workers
+/// < 80% of `max_dynamic_refresh_workers`), a database may temporarily
+/// exceed its quota by up to 50% to absorb sudden backlogs. Burst is
+/// reclaimed automatically within 1 scheduler cycle once global load rises.
+///
+/// **Priority dispatch:** within each dispatch tick, IMMEDIATE-trigger
+/// closures are dispatched before other units, followed by atomic groups,
+/// singletons, and cyclic SCCs — ensuring transactional consistency
+/// requirements are always satisfied first.
+///
+/// Set to 0 (default) to disable per-database quotas — all databases share
+/// `max_dynamic_refresh_workers` on a first-come-first-served basis,
+/// bounded per coordinator by `max_concurrent_refreshes`.
+pub static PGS_PER_DATABASE_WORKER_QUOTA: GucSetting<i32> = GucSetting::<i32>::new(0);
+
 /// Register all GUC variables. Called from `_PG_init()`.
 pub fn register_gucs() {
     GucRegistry::define_bool_guc(
@@ -853,6 +875,22 @@ pub fn register_gucs() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_int_guc(
+        c"pg_trickle.per_database_worker_quota",
+        c"Per-database dynamic refresh worker quota for multi-tenant isolation.",
+        c"When > 0, limits each database's concurrent refresh workers to this count \
+           from the shared cluster budget (max_dynamic_refresh_workers). Prevents one \
+           busy database from starving others. Burst to 150% allowed when cluster has \
+           spare capacity (active workers < 80% of max_dynamic_refresh_workers). \
+           0 (default) disables per-DB quotas (first-come-first-served from pool). \
+           Within each tick, IMMEDIATE closures are dispatched before other units.",
+        &PGS_PER_DATABASE_WORKER_QUOTA,
+        0,  // min: 0 (disabled)
+        64, // max: matches max_dynamic_refresh_workers ceiling
+        GucContext::Suset,
+        GucFlags::default(),
+    );
 }
 
 // ── Convenience accessors ──────────────────────────────────────────────────
@@ -1104,6 +1142,11 @@ pub fn pg_trickle_log_merge_sql() -> bool {
 /// FUSE-5: Returns the global default fuse ceiling (0 = disabled).
 pub fn pg_trickle_fuse_default_ceiling() -> i64 {
     PGS_FUSE_DEFAULT_CEILING.get() as i64
+}
+
+/// C3-1: Returns the per-database worker quota (0 = disabled).
+pub fn pg_trickle_per_database_worker_quota() -> i32 {
+    PGS_PER_DATABASE_WORKER_QUOTA.get()
 }
 
 /// WAKE-1: Returns whether event-driven scheduler wake is enabled.
