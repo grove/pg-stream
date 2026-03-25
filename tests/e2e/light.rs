@@ -466,6 +466,37 @@ impl E2eDb {
         self.execute(&sql).await;
     }
 
+    /// Create a partitioned stream table via `pgtrickle.create_stream_table()` with `partition_by`.
+    pub async fn create_st_partitioned(
+        &self,
+        name: &str,
+        query: &str,
+        schedule: &str,
+        refresh_mode: &str,
+        partition_key: &str,
+    ) {
+        let sql = format!(
+            "SELECT pgtrickle.create_stream_table('{name}', $${query}$$, \
+             '{schedule}', '{refresh_mode}', partition_by => '{partition_key}')"
+        );
+        self.execute(&sql).await;
+    }
+
+    /// Execute a query returning text rows and join them into a single `String`.
+    /// Useful for capturing `EXPLAIN` output.
+    pub async fn query_text(&self, sql: &str) -> Option<String> {
+        let rows: Vec<(String,)> = sqlx::query_as(sql).fetch_all(&self.pool).await.ok()?;
+        if rows.is_empty() {
+            return None;
+        }
+        Some(
+            rows.into_iter()
+                .map(|(line,)| line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     /// Refresh a stream table via `pgtrickle.refresh_stream_table()`.
     pub async fn refresh_st(&self, name: &str) {
         self.execute(&format!("SELECT pgtrickle.refresh_stream_table('{name}')"))
