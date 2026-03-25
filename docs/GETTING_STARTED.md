@@ -779,6 +779,77 @@ DROP TABLE departments;
 
 ---
 
+## Monitoring Quick Reference
+
+pg_trickle ships several built-in monitoring functions and a ready-made
+Prometheus/Grafana stack. Here are the five most useful functions for
+day-to-day operations.
+
+### Stream Table Status
+
+```sql
+-- Overview of all stream tables: status, staleness, last refresh time, errors
+SELECT name, status, staleness, last_refresh_at, last_error
+FROM pgtrickle.pgt_status();
+```
+
+### Health Check
+
+```sql
+-- Run all built-in health checks; returns severity (OK/WARNING/CRITICAL) per check
+SELECT check_name, severity, detail FROM pgtrickle.health_check();
+```
+
+### Change Buffer Sizes
+
+```sql
+-- Show CDC buffer row counts per source table — useful for spotting backlogs
+SELECT * FROM pgtrickle.change_buffer_sizes();
+```
+
+### Dependency Tree
+
+```sql
+-- Visualize the DAG: which stream tables depend on what
+SELECT * FROM pgtrickle.dependency_tree();
+```
+
+### Fuse Status
+
+```sql
+-- Check circuit breaker state for all stream tables (v0.11.0+)
+SELECT * FROM pgtrickle.fuse_status();
+```
+
+### Prometheus & Grafana
+
+For production monitoring, pg_trickle ships a ready-made observability stack
+in the `monitoring/` directory:
+
+```bash
+cd monitoring && docker compose up
+```
+
+This starts PostgreSQL + postgres_exporter + Prometheus + Grafana with
+pre-configured dashboards and alerting rules. Grafana is available at
+`http://localhost:3000` (admin/admin). See [monitoring/README.md](../monitoring/README.md)
+for the full list of exported metrics and alert conditions.
+
+**Key Prometheus metrics:**
+
+| Metric | Description |
+|--------|-------------|
+| `pgtrickle_refresh_total` | Cumulative refresh count per table |
+| `pgtrickle_refresh_duration_seconds` | Last refresh duration per table |
+| `pgtrickle_staleness_seconds` | Seconds since last successful refresh |
+| `pgtrickle_consecutive_errors` | Current error streak per table |
+| `pgtrickle_cdc_buffer_rows` | Pending change buffer rows per source table |
+
+**Pre-configured alerts:** staleness > 5 min, ≥3 consecutive failures, table
+SUSPENDED, CDC buffer > 1 GB, scheduler down, high refresh duration.
+
+---
+
 ## Summary: What You Learned
 
 | Concept | What you saw |

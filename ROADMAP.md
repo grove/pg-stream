@@ -1939,9 +1939,9 @@ revert if needed.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | G16-GS | **Restructure `GETTING_STARTED.md` with progressive complexity.** Five chapters: (1) Hello World — single-table ST with no join; (2) Multi-table join; (3) Scheduling & backpressure; (4) Monitoring — 5 key functions; (5) Advanced — FUSE, wide bitmask, partitions. Remove the current flat wall-of-SQL structure. | ~1–2d | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
-| G16-SM | **SQL/mode operator support matrix.** Add a table to `docs/DVM_OPERATORS.md`: rows = SQL construct, columns = `FULL` / `DIFFERENTIAL` / `AUTO` / `IMMEDIATE`; cells = ✅ / ⚠️ caveat / ❌ unsupported, with footnotes for caveats. | ~4–8h | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) |
-| G16-MQR | **Monitoring quick reference.** Add a "Monitoring Quick Reference" section to `docs/GETTING_STARTED.md` covering `stream_table_status()`, `change_buffer_stats()`, `refresh_history()`, `refresh_metrics()`, and `scheduler_status()` with one-line examples. | ~2h | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
-| G15-GUC | **GUC interaction matrix.** Add to `docs/CONFIGURATION.md`: a matrix of GUCs with cross-dependencies (which GUCs interact, which override others), plus three named tuning profiles (low-latency, high-throughput, balanced). | ~4h | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
+| ~~G16-SM~~ | ~~**SQL/mode operator support matrix.**~~ ✅ Done — 60+ row operator support matrix added to `docs/DVM_OPERATORS.md` covering all operators × FULL/DIFFERENTIAL/IMMEDIATE modes with caveat footnotes. | — | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) |
+| ~~G16-MQR~~ | ~~**Monitoring quick reference.**~~ ✅ Done — Monitoring Quick Reference section added to `docs/GETTING_STARTED.md` with `pgt_status()`, `health_check()`, `change_buffer_sizes()`, `dependency_tree()`, `fuse_status()`, Prometheus/Grafana stack, key metrics table, and alert summary. | — | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
+| ~~G15-GUC~~ | ~~**GUC interaction matrix.**~~ ✅ Done — GUC Interaction Matrix (14 interaction pairs) and three named Tuning Profiles (Low-Latency, High-Throughput, Resource-Constrained) added to `docs/CONFIGURATION.md`. | — | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 
 > **Documentation subtotal: ~2–3 days**
 
@@ -2067,7 +2067,7 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [x] G15-PV: Incompatible `cdc_mode`/`refresh_mode` and `diamond_schedule_policy` combinations rejected at creation time with structured `HINT` — ✅ Done in v0.11.0 Phase 2
 - [x] G13-EH: `UnsupportedOperator`, `CycleDetected`, `UpstreamSchemaChanged`, `QueryParseError` include `DETAIL` and `HINT` fields — ✅ Done in v0.11.0 Phase 2
 - [x] G17-EC01B-NEG: Negative regression test documents ≥3-scan fall-back behavior; linked to v0.12.0 EC01B fix — ✅ Done in v0.11.0 Phase 4
-- [ ] G16-GS/SM/MQR/GUC: GETTING_STARTED restructured with progressive complexity; DVM_OPERATORS support matrix added; monitoring quick reference added; CONFIGURATION.md GUC matrix added
+- [ ] G16-GS/SM/MQR/GUC: ~~GETTING_STARTED restructured with progressive complexity~~; ~~DVM_OPERATORS support matrix added~~; ~~monitoring quick reference added~~; ~~CONFIGURATION.md GUC matrix added~~ — G16-SM ✅, G16-MQR ✅, G15-GUC ✅; G16-GS deferred to post-Phase 9
 - [x] ST-ST-1–6: All ST-to-ST dependencies refresh differentially when upstream has a change buffer; FULL refreshes on an upstream ST produce a pre/post I/D diff so downstream STs never cascade FULL through the chain; auto-migration creates buffers for existing ST-to-ST dependencies on upgrade; 3-level E2E chain test passes
 - [x] WAKE-1: Event-driven scheduler wake implemented; latency E2E test shows sub-50ms median response for single-source workloads — ✅ Done in v0.11.0 Phase 7
 - [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)

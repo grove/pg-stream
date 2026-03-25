@@ -41,6 +41,81 @@ DIFFERENTIAL and IMMEDIATE maintenance require deterministic expressions. VOLATI
 
 ---
 
+## Operator Support Matrix
+
+The following table shows which SQL constructs are supported under each refresh mode.
+
+| SQL Construct | FULL | DIFFERENTIAL | IMMEDIATE | Notes |
+|---|:---:|:---:|:---:|---|
+| **Basic** | | | | |
+| Simple `SELECT` / projection | ✅ | ✅ | ✅ | |
+| `WHERE` filter | ✅ | ✅ | ✅ | |
+| Column expressions / aliases | ✅ | ✅ | ✅ | |
+| `DISTINCT` | ✅ | ✅ | ✅ | Uses `__pgt_dup_count` reference counting |
+| `DISTINCT ON` | ✅ | ✅ | ✅ | |
+| **Joins** | | | | |
+| `INNER JOIN` | ✅ | ✅ | ✅ | Hybrid delta strategy |
+| `LEFT OUTER JOIN` | ✅ | ✅ | ✅ | NULL-padding transitions tracked |
+| `RIGHT OUTER JOIN` | ✅ | ✅ | ✅ | |
+| `FULL OUTER JOIN` | ✅ | ✅ | ✅ | 8-part UNION ALL delta |
+| `CROSS JOIN` | ✅ | ✅ | ✅ | |
+| `LATERAL JOIN` | ✅ | ✅ | ✅ | Row-scoped re-execution |
+| Multi-table join (≤2 right scans) | ✅ | ✅ | ✅ | Full phantom-row-after-DELETE fix |
+| Multi-table join (≥3 right scans) | ✅ | ⚠️ | ⚠️ | Falls back to post-change snapshot for right subtree (EC-01 boundary, fix planned for v0.12.0) |
+| **Subqueries** | | | | |
+| `EXISTS` / `IN` (semi-join) | ✅ | ✅ | ✅ | Delta-key pre-filter on left side |
+| `NOT EXISTS` / `NOT IN` (anti-join) | ✅ | ✅ | ✅ | Inverted semantics; two-part delta |
+| Scalar subquery (SELECT-list) | ✅ | ✅ | ✅ | Pre/post snapshot EXCEPT ALL diff |
+| Correlated `LATERAL` subquery | ✅ | ✅ | ✅ | |
+| **Set Operations** | | | | |
+| `UNION ALL` | ✅ | ✅ | ✅ | Dual-branch merge |
+| `INTERSECT` / `INTERSECT ALL` | ✅ | ✅ | ✅ | Dual-count tracking |
+| `EXCEPT` / `EXCEPT ALL` | ✅ | ✅ | ✅ | |
+| **Aggregates** | | | | |
+| `COUNT`, `SUM`, `AVG` | ✅ | ✅ | ✅ | Algebraic — fully invertible delta |
+| `MIN`, `MAX` | ✅ | ✅ | ✅ | Semi-algebraic — group rescan on ambiguous delete |
+| `COUNT(DISTINCT)`, `SUM(DISTINCT)` | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
+| `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR` | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
+| `EVERY` | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
+| `STRING_AGG`, `ARRAY_AGG` | ✅ | ⚠️ | ⚠️ | Group-rescan strategy — warning emitted at creation time in DIFFERENTIAL mode |
+| `STDDEV`, `VARIANCE`, `STDDEV_POP`, `VAR_POP` | ✅ | ✅ | ✅ | Algebraic via auxiliary M2/sum/count columns |
+| `COVAR_SAMP`, `COVAR_POP`, `CORR` | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
+| `REGR_*` (all 9 regression functions) | ✅ | ✅ | ✅ | Algebraic via auxiliary columns |
+| `PERCENTILE_CONT`, `PERCENTILE_DISC` | ✅ | ⚠️ | ⚠️ | Group-rescan strategy |
+| `MODE` | ✅ | ⚠️ | ⚠️ | Group-rescan strategy |
+| `XMLAGG`, `JSON_AGG`, `JSONB_AGG` | ✅ | ⚠️ | ⚠️ | Group-rescan strategy |
+| `JSON_OBJECT_AGG`, `JSONB_OBJECT_AGG` | ✅ | ⚠️ | ⚠️ | Group-rescan strategy |
+| `GROUP BY` / `HAVING` | ✅ | ✅ | ✅ | |
+| `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS` | ✅ | ✅ | ✅ | Branch count capped by `max_grouping_set_branches` (default 64) |
+| **Window Functions** | | | | |
+| `ROW_NUMBER`, `RANK`, `DENSE_RANK` | ✅ | ✅ | ✅ | Partition-scoped recompute |
+| `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE` | ✅ | ✅ | ✅ | Partition-scoped recompute |
+| `NTILE`, `CUME_DIST`, `PERCENT_RANK` | ✅ | ✅ | ✅ | Partition-scoped recompute |
+| Window `frame` clauses (`ROWS`, `RANGE`, `GROUPS`) | ✅ | ✅ | ✅ | |
+| **CTEs** | | | | |
+| Non-recursive `WITH` | ✅ | ✅ | ✅ | Inlined or delta-cached (multi-ref) |
+| `WITH RECURSIVE` (INSERT-only workload) | ✅ | ✅ | ✅ | Semi-naive evaluation |
+| `WITH RECURSIVE` (mixed INSERT/DELETE/UPDATE) | ✅ | ✅ | ✅ | Delete-and-Rederive (DRed) strategy |
+| **TopK** | | | | |
+| `ORDER BY … LIMIT N` | ✅ | ✅ | ✅ | Scoped recomputation; metadata validated each refresh |
+| `ORDER BY … LIMIT N OFFSET M` | ✅ | ✅ | ✅ | |
+| **Lateral / SRF** | | | | |
+| `LATERAL` with set-returning function | ✅ | ✅ | ✅ | Row-scoped re-execution |
+| `JSON_TABLE` | ✅ | ✅ | ✅ | Via lateral function operator |
+| `generate_series()` | ✅ | ✅ | ✅ | |
+| `unnest()` | ✅ | ✅ | ✅ | |
+| **ST-to-ST Dependencies** | | | | |
+| Stream table reading from another stream table | ✅ | ✅ | ✅ | Differential via `changes_pgt_` buffers (v0.11.0); FULL upstream produces I/D diff so downstream stays differential |
+| Multi-level ST chains | ✅ | ✅ | ✅ | Topological order; per-level delta propagation |
+| **Function Volatility** | | | | |
+| `IMMUTABLE` functions | ✅ | ✅ | ✅ | |
+| `STABLE` functions (`now()`, `current_timestamp`) | ✅ | ⚠️ | ⚠️ | Allowed with warning — value may differ between initial load and delta evaluation |
+| `VOLATILE` functions (`random()`, `clock_timestamp()`) | ✅ | ❌ | ❌ | Rejected at creation time — re-evaluation corrupts delta semantics |
+
+**Legend:** ✅ = fully supported — ⚠️ = supported with caveats (see Notes column) — ❌ = not supported (blocked at creation time)
+
+---
+
 ## Operators
 
 ### Scan

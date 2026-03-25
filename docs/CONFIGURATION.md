@@ -48,6 +48,11 @@ Complete reference for all pg_trickle GUC (Grand Unified Configuration) variable
   - [Circular Dependencies](#circular-dependencies)
     - [pg\_trickle.allow\_circular](#pg_trickleallow_circular)
     - [pg\_trickle.max\_fixpoint\_iterations](#pg_tricklemax_fixpoint_iterations)
+- [GUC Interaction Matrix](#guc-interaction-matrix)
+- [Tuning Profiles](#tuning-profiles)
+  - [Low-Latency Profile](#low-latency-profile)
+  - [High-Throughput Profile](#high-throughput-profile)
+  - [Resource-Constrained Profile](#resource-constrained-profile)
 - [Complete postgresql.conf Example](#complete-postgresqlconf-example)
 - [Runtime Configuration](#runtime-configuration)
 - [Further Reading](#further-reading)
@@ -997,6 +1002,136 @@ headroom.
 
 ```sql
 SET pg_trickle.max_fixpoint_iterations = 50;
+```
+
+---
+
+## GUC Interaction Matrix
+
+Some GUC variables interact with or depend on each other. The table below
+documents these cross-dependencies to help avoid misconfiguration.
+
+| GUC A | GUC B | Interaction |
+|-------|-------|-------------|
+| `event_driven_wake` | `scheduler_interval_ms` | When `event_driven_wake = true`, the scheduler wakes on NOTIFY and `scheduler_interval_ms` serves only as the poll-based fallback interval. Lowering `scheduler_interval_ms` below 100 ms with event-driven wake enabled adds little value and wastes CPU. |
+| `event_driven_wake` | `wake_debounce_ms` | `wake_debounce_ms` only takes effect when `event_driven_wake = true`. It coalesces rapid-fire notifications during bulk DML. Set higher (50–100 ms) for write-heavy workloads, lower (5–10 ms) for latency-sensitive workloads. |
+| `auto_backoff` | `min_schedule_seconds` | `auto_backoff` stretches the effective interval up to 8× the configured schedule, but never below `min_schedule_seconds`. If `min_schedule_seconds` is high, backoff has limited room to operate. |
+| `auto_backoff` | `default_schedule_seconds` | The backoff multiplier is applied to `default_schedule_seconds` (or the per-ST override); raising this value gives backoff a wider range. |
+| `parallel_refresh_mode` | `max_concurrent_refreshes` | `parallel_refresh_mode = 'on'` dispatches independent STs to parallel workers, up to `max_concurrent_refreshes` per database. Setting `max_concurrent_refreshes = 1` effectively disables parallelism even when the mode is `'on'`. |
+| `parallel_refresh_mode` | `max_dynamic_refresh_workers` | `max_dynamic_refresh_workers` is a cluster-wide cap across all databases. If you have 4 databases each wanting 4 concurrent refreshes, set this to ≥16 (or accept queuing). |
+| `differential_max_change_ratio` | `fuse_default_ceiling` | Both guard against large change batches but at different levels: `differential_max_change_ratio` triggers a FULL refresh fallback (proportional to table size), while `fuse_default_ceiling` halts refresh entirely (absolute row count). The fuse fires first if the change count exceeds it, regardless of the ratio. |
+| `block_source_ddl` | DDL operations | When `true`, DDL on source tables (ALTER TABLE, DROP COLUMN) is blocked by an event trigger. Disable temporarily with `SET pg_trickle.block_source_ddl = false` before schema migrations, then re-enable. |
+| `cdc_mode` | `cdc_trigger_mode` | `cdc_trigger_mode` (`'statement'` / `'row'`) only applies when CDC is trigger-based. When `cdc_mode = 'wal'` (or after auto-transition to WAL), `cdc_trigger_mode` is irrelevant. |
+| `cdc_mode` | `wal_transition_timeout` | `wal_transition_timeout` only applies when `cdc_mode = 'auto'`. It controls how many seconds to wait for the first WAL-based refresh to succeed before falling back to triggers. |
+| `cleanup_use_truncate` | `compact_threshold` | `cleanup_use_truncate = true` uses TRUNCATE to clear consumed change buffers (fastest, acquires AccessExclusiveLock briefly). `compact_threshold` controls when fully-consumed buffers are compacted via DELETE — only relevant when TRUNCATE is disabled. |
+| `allow_circular` | `max_fixpoint_iterations` | `max_fixpoint_iterations` is only evaluated when `allow_circular = true`. It caps the number of convergence iterations for circular dependency chains. |
+| `ivm_topk_max_limit` | TopK queries | Queries with `LIMIT > ivm_topk_max_limit` fall back to FULL refresh instead of the optimized TopK path. Raise this if you have legitimate large TopK queries. |
+| `ivm_recursive_max_depth` | Recursive CTEs | Recursive expansion beyond `ivm_recursive_max_depth` iterations is terminated with a warning and falls back to FULL refresh. Set to 0 to disable the guard (not recommended). |
+
+---
+
+## Tuning Profiles
+
+Three named profiles for common deployment patterns. Copy the relevant
+settings into your `postgresql.conf` and adjust to taste.
+
+### Low-Latency Profile
+
+**Goal:** Minimize end-to-end latency from base table write to stream table
+update. Best for dashboards, real-time analytics, and operational monitoring.
+
+```ini
+# Event-driven wake — sub-50ms median latency
+pg_trickle.event_driven_wake = true
+pg_trickle.wake_debounce_ms = 5              # aggressive: 5ms coalesce
+
+# Fast scheduling
+pg_trickle.scheduler_interval_ms = 200       # poll fallback (rarely used)
+pg_trickle.min_schedule_seconds = 1
+pg_trickle.default_schedule_seconds = 1
+
+# Parallel refresh for independent STs
+pg_trickle.parallel_refresh_mode = 'on'
+pg_trickle.max_concurrent_refreshes = 4
+
+# Lean merge
+pg_trickle.merge_planner_hints = true
+pg_trickle.merge_work_mem_mb = 128           # more memory = fewer disk sorts
+pg_trickle.cleanup_use_truncate = true
+pg_trickle.use_prepared_statements = true
+
+# Guardrails
+pg_trickle.auto_backoff = true               # prevent CPU runaway
+pg_trickle.fuse_default_ceiling = 0          # disabled — latency over safety
+pg_trickle.block_source_ddl = true
+```
+
+### High-Throughput Profile
+
+**Goal:** Maximize rows-per-second processed across many stream tables under
+heavy write load. Accepts slightly higher latency in exchange for better
+batching and resource efficiency.
+
+```ini
+# Batched wake — coalesce writes into larger deltas
+pg_trickle.event_driven_wake = true
+pg_trickle.wake_debounce_ms = 50             # 50ms coalesce window
+
+# Relaxed scheduling
+pg_trickle.scheduler_interval_ms = 2000      # 2-second poll fallback
+pg_trickle.min_schedule_seconds = 2
+pg_trickle.default_schedule_seconds = 5
+
+# Heavy parallelism
+pg_trickle.parallel_refresh_mode = 'on'
+pg_trickle.max_concurrent_refreshes = 8
+pg_trickle.max_dynamic_refresh_workers = 8
+
+# Aggressive performance
+pg_trickle.merge_planner_hints = true
+pg_trickle.merge_work_mem_mb = 256           # large work_mem for big deltas
+pg_trickle.merge_seqscan_threshold = 0.01    # allow seq scans for >1% changes
+pg_trickle.cleanup_use_truncate = true
+pg_trickle.use_prepared_statements = true
+pg_trickle.auto_backoff = true
+
+# Safety for bulk workloads
+pg_trickle.fuse_default_ceiling = 500000     # pause on >500K changes
+pg_trickle.differential_max_change_ratio = 0.25  # FULL fallback at 25%
+pg_trickle.block_source_ddl = true
+```
+
+### Resource-Constrained Profile
+
+**Goal:** Minimize CPU and memory footprint for small instances, shared
+hosting, or development environments. Accepts higher latency and slower
+throughput.
+
+```ini
+# Poll-based only — no NOTIFY overhead
+pg_trickle.event_driven_wake = false
+pg_trickle.scheduler_interval_ms = 5000      # 5-second poll
+
+# Conservative scheduling
+pg_trickle.min_schedule_seconds = 5
+pg_trickle.default_schedule_seconds = 10
+
+# Minimal parallelism
+pg_trickle.parallel_refresh_mode = 'off'     # single-threaded refresh
+pg_trickle.max_concurrent_refreshes = 1
+pg_trickle.max_dynamic_refresh_workers = 1
+
+# Conservative memory
+pg_trickle.merge_work_mem_mb = 32
+pg_trickle.merge_planner_hints = true
+pg_trickle.cleanup_use_truncate = true
+
+# Tight guardrails
+pg_trickle.auto_backoff = true
+pg_trickle.fuse_default_ceiling = 100000
+pg_trickle.differential_max_change_ratio = 0.10
+pg_trickle.block_source_ddl = true
+pg_trickle.buffer_alert_threshold = 500000
 ```
 
 ---
