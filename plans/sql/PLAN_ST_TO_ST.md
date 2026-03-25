@@ -2,6 +2,7 @@
 
 > **Status:** Proposed  
 > **Date:** 2026-03-25  
+> **Design Goal:** Maximum performance and differential propagation — FULL refreshes never cascade as FULL to downstream STs.  
 > **Related:** [PLAN_DAG_PERFORMANCE.md](../performance/PLAN_DAG_PERFORMANCE.md) ·
 > [ARCHITECTURE.md](../../docs/ARCHITECTURE.md) ·
 > [CONFIGURATION.md](../../docs/CONFIGURATION.md)
@@ -455,7 +456,13 @@ FULL refresh is the trickiest case. When an ST does a FULL refresh (truncate +
 rewrite), we still need to capture the **diff** between the old and new state
 so downstream STs can consume it differentially. Two approaches:
 
-### Option A: Pre/Post Diff (Recommended)
+### Chosen Approach: Pre/Post Diff
+
+**Decision:** Option A is implemented from day one. The design goal is that
+FULL refreshes on an upstream ST never force downstream STs to also do FULL.
+The ~2× FULL refresh cost is an accepted and bounded tradeoff: it is O(N)
+with the upstream table size, exactly the same complexity class as the FULL
+refresh itself, and it eliminates unbounded FULL cascading through deep chains.
 
 Before the FULL refresh, snapshot the current `__pgt_row_id` set. After the
 refresh, compare:
@@ -499,20 +506,8 @@ WHERE (pre.col1, pre.col2, ...) IS DISTINCT FROM (post.col1, post.col2, ...);
 **Cost:** Two table scans (pre-state + diff). For large STs this is
 meaningful overhead, but it's O(N) with the table size — the same as the
 FULL refresh itself. The constant factor roughly doubles the refresh time.
-
-### Option B: Skip FULL Capture (Simpler)
-
-When an ST does a FULL refresh, just **don't** write to the change buffer.
-Instead, clear the buffer and force downstream STs to FULL as well (the
-current behavior). This means FULL refreshes cascade as FULL through the
-chain, but DIFFERENTIAL refreshes cascade as DIFFERENTIAL.
-
-This is simpler to implement and still captures the majority of the benefit:
-in steady state, most refreshes are DIFFERENTIAL. FULL only happens during
-reinit, drift reset, or when the `refresh_mode = Full`.
-
-**Recommendation:** Start with Option B for the initial implementation, then
-add Option A as a follow-up when benchmarks show FULL cascading is a problem.
+This cost is accepted: a FULL refresh is already expensive, and protecting
+all downstream STs from a cascading FULL is worth the constant overhead.
 
 ---
 
@@ -564,14 +559,16 @@ interval already dominates at low $T_r$.
 
 ## 9. Migration & Compatibility
 
-- **Existing STs are unaffected.** Change buffers are only created when
-  downstream STs are added. Existing ST-to-ST dependencies continue to use
-  FULL until the buffer is created.
-- **Opt-out:** A future GUC (`pg_trickle.st_change_buffers = on|off`) can
-  disable buffer creation for deployments that prefer FULL simplicity.
-- **Upgrade path:** On extension upgrade, no automatic buffer creation. Users
-  run `ALTER STREAM TABLE ... REFRESH MODE DIFFERENTIAL` or we detect the
-  opportunity during the next DAG rebuild.
+- **Always-on.** ST change buffers are created unconditionally whenever a
+  stream table is used as a source by another stream table. There is no
+  opt-out GUC — the feature is always active. Deployments that want FULL
+  propagation can set `refresh_mode = Full` on downstream STs explicitly.
+- **Upgrade path:** On extension upgrade, automatically scan `pgt_dependencies`
+  for all existing `source_type = 'STREAM_TABLE'` rows and create the missing
+  `changes_pgt_{id}` buffers. Existing ST-to-ST dependencies immediately gain
+  differential propagation without any user action. The upgrade step runs
+  inside the extension update transaction and is idempotent (uses
+  `CREATE TABLE IF NOT EXISTS`).
 
 ---
 
@@ -581,8 +578,9 @@ interval already dominates at low $T_r$.
 |------|------------|
 | Buffer tables increase catalog bloat | Only created for STs with downstream dependents; dropped when last consumer is removed |
 | Large deltas cause buffer table bloat | Cleanup runs at min-frontier; buffer_partitioning GUC enables partition-based cleanup |
-| `pg_current_wal_lsn()` not advancing on read-only workloads | Use a synthetic monotonic counter (e.g., `pg_current_xact_id()`) as fallback; or accept the existing WAL-based model |
-| FULL refresh capture (Option A) doubles the FULL cost | Start with Option B (skip capture on FULL, cascade FULL). Add Option A later based on demand |
+| `pg_current_wal_lsn()` not advancing on read-only workloads | **Dismissed.** The INSERT into `changes_pgt_{id}` is itself a WAL write, which always advances `pg_current_wal_lsn()`. A valid LSN is always available at capture time. |
+| Pre/post diff doubles the FULL refresh time | **Accepted tradeoff.** The cost is O(N) — same complexity class as the FULL refresh itself. It eliminates unbounded FULL cascading through downstream chains. |
+| No opt-out for ST change buffers | By design: always-on maximises differential propagation. Downstream STs can still be set to `refresh_mode = Full` individually if needed. |
 | DVM scan template cache invalidation | Existing `get_delta_sql_template()` cache must be invalidated when a source switches from TABLE to STREAM_TABLE source type (this shouldn't happen in practice) |
 | Schema changes on upstream ST | Handled by dropping/recreating the buffer; downstream STs already handle source schema changes via `needs_reinit` |
 

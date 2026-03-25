@@ -1995,6 +1995,28 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 > **External correctness gate subtotal: ~1–3 days**
 
+#### Differential ST-to-ST Refresh
+
+> **In plain terms:** When stream table B's defining query reads from stream
+> table A, pg_trickle currently forces a FULL refresh of B every time A
+> updates — re-executing B's entire query even when only a handful of rows
+> changed. This feature gives ST-to-ST dependencies the same CDC change
+> buffer that base tables already have, so B refreshes differentially (applying
+> only the delta). Crucially, even when A itself does a FULL refresh, a
+> pre/post snapshot diff is captured so B still receives a small I/D delta
+> rather than cascading FULL through the chain.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ST-ST-1 | **Change buffer infrastructure.** Add `create_st_change_buffer_table()` / `drop_st_change_buffer_table()` in `cdc.rs`; lifecycle hooks in `api.rs` (create when a STREAM TABLE source is registered, drop when last consumer is removed); auto-create during extension upgrade for all existing ST-to-ST dependencies (idempotent). | 1 wk | [PLAN_ST_TO_ST.md §Phase 1](plans/sql/PLAN_ST_TO_ST.md) |
+| ST-ST-2 | **Delta capture — DIFFERENTIAL path.** In `execute_differential_refresh()`, use `MERGE … RETURNING` (PG 17+) to atomically apply the MERGE and insert delta rows into `changes_pgt_{id}` in a single round-trip. The explicit-DML path reads from the already-materialised `__pgt_delta_{id}` temp table. | 1–2 wk | [PLAN_ST_TO_ST.md §Phase 2](plans/sql/PLAN_ST_TO_ST.md) |
+| ST-ST-3 | **Delta capture — FULL path.** In `execute_full_refresh()`, snapshot the pre-refresh row set into a temp table, run the FULL refresh, then diff pre/post and write I/D pairs to `changes_pgt_{id}`. Downstream STs always receive a differential delta regardless of whether the upstream did FULL or DIFFERENTIAL. Cost is O(N) — accepted tradeoff that eliminates cascading FULL through deep ST chains. | 1 wk | [PLAN_ST_TO_ST.md §7](plans/sql/PLAN_ST_TO_ST.md) |
+| ST-ST-4 | **DVM scan operator for ST sources.** Extend `dvm/operators/scan.rs`: ST sources read from `changes_pgt_{id}` instead of `changes_{oid}`; introduce `pgt_`-prefixed LSN placeholder tokens; extend the frontier computation and placeholder resolver in `refresh.rs`. | 1–2 wk | [PLAN_ST_TO_ST.md §Phase 3](plans/sql/PLAN_ST_TO_ST.md) |
+| ST-ST-5 | **Scheduler integration.** Rewrite `has_stream_table_source_changes()` to check the ST buffer for rows beyond the frontier (mirrors `has_table_source_changes()`). Remove the `has_stream_table_changes → Full` override when upstream has a buffer; retain FULL + timestamp fallback when no buffer exists. | 0.5 wk | [PLAN_ST_TO_ST.md §Phase 4](plans/sql/PLAN_ST_TO_ST.md) |
+| ST-ST-6 | **Cleanup, lifecycle & tests.** Extend `drain_pending_cleanups()` for ST buffers; wire DDL lifecycle hooks in `hooks.rs` for schema changes. Unit tests for buffer lifecycle and DVM scan SQL; integration tests for the ST → ST DIFFERENTIAL chain; E2E tests for 3-level chain, DROP-middle-ST fallback, schema change buffer recreation, and min-frontier cleanup. | 1 wk | [PLAN_ST_TO_ST.md §Phase 5–6](plans/sql/PLAN_ST_TO_ST.md) |
+
+> **ST-to-ST differential subtotal: ~4.5–6.5 weeks**
+
 ### Stretch Goals (if capacity allows after Must-Ship)
 
 | Item | Description | Effort | Ref |
@@ -2004,7 +2026,7 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 > **Stretch subtotal: ~2–3 weeks (STRETCH-1) + 2–4 days (STRETCH-2 spike)**
 
-> **v0.11.0 total: ~7–10 weeks (partitioning + isolation) + ~12h observability + ~14–21h default tuning + ~7–12h safety hardening + ~2–4 weeks should-ship (bitmask + fuse + external corpus) + ~1–2 days correctness quick-wins + ~2–3 days documentation**
+> **v0.11.0 total: ~7–10 weeks (partitioning + isolation) + ~12h observability + ~14–21h default tuning + ~7–12h safety hardening + ~2–4 weeks should-ship (bitmask + fuse + external corpus) + ~4.5–6.5 weeks ST-to-ST differential + ~1–2 days correctness quick-wins + ~2–3 days documentation**
 
 **Exit criteria:**
 - [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog *(or STRETCH-2 design spike complete with RFC)*
@@ -2028,6 +2050,7 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [ ] G13-EH: `UnsupportedOperator`, `CycleDetected`, `UpstreamSchemaChanged`, `QueryParseError` include `DETAIL` and `HINT` fields
 - [ ] G17-EC01B-NEG: Negative regression test documents ≥3-scan fall-back behavior; linked to v0.12.0 EC01B fix
 - [ ] G16-GS/SM/MQR/GUC: GETTING_STARTED restructured with progressive complexity; DVM_OPERATORS support matrix added; monitoring quick reference added; CONFIGURATION.md GUC matrix added
+- [ ] ST-ST-1–6: All ST-to-ST dependencies refresh differentially when upstream has a change buffer; FULL refreshes on an upstream ST produce a pre/post I/D diff so downstream STs never cascade FULL through the chain; auto-migration creates buffers for existing ST-to-ST dependencies on upgrade; 3-level E2E chain test passes
 - [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)
 
 ---
