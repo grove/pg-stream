@@ -1,8 +1,9 @@
 # pg_trickle — Project Roadmap
 
-> **Last updated:** 2026-03-23
+> **Last updated:** 2026-03-25
 > **Latest release:** 0.10.0 (2026-03-23)
 > **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
+> **v0.11.0 progress:** Phase 1 complete (PR #279)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -1854,11 +1855,11 @@ revert if needed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| DEF-1 | **Flip `parallel_refresh_mode` default to `'on'`.** The feature has been stable since v0.4.0 (six releases). Keeping it `'off'` forces every operator to discover the opt-in manually. Change the default, update CONFIGURATION.md, and add an E2E test that verifies two independent STs refresh concurrently. | 2–4h | [REPORT_OVERALL_STATUS.md §R1](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~DEF-1~~ | ~~**Flip `parallel_refresh_mode` default to `'on'`.**~~ ✅ Done in v0.11.0 Phase 1 — default flipped; `normalize_parallel_refresh_mode` maps `None`/unknown → `On`; unit test renamed to `defaults_to_on`. | — | [REPORT_OVERALL_STATUS.md §R1](plans/performance/REPORT_OVERALL_STATUS.md) |
 | DEF-2 | ~~**Flip `auto_backoff` default to `true`.**~~ ✅ Done in v0.10.0 — default flipped to `true`; trigger threshold raised to 95%, cap reduced to 8×, log level raised to WARNING. CONFIGURATION.md updated. | 1–2h | [REPORT_OVERALL_STATUS.md §R10](plans/performance/REPORT_OVERALL_STATUS.md) |
 | DEF-3 | **SemiJoin delta-key pre-filter (O-1).** SemiJoin Part 2 currently rescans the full left table even when only a handful of left-side rows match the delta. Inject a `WHERE left_key IN (SELECT key FROM delta)` pre-filter before the full join. TPC-H Q18, Q20, Q21 are the canonical slow queries. Effort estimate from PLAN_TPC_H_BENCHMARKING.md: 8–10h, expected 15–26× speedup. | 8–10h | [REPORT_OVERALL_STATUS.md §R4](plans/performance/REPORT_OVERALL_STATUS.md) · [PLAN_TPC_H_BENCHMARKING.md](plans/performance/PLAN_TPC_H_BENCHMARKING.md) §O-1 |
-| DEF-4 | **Increase invalidation ring capacity from 32 to 128 slots.** Deployments with frequent DDL (CI pipelines, dbt model rebuilds, schema migrations) can overflow the 32-slot ring, forcing a full O(V+E) DAG rebuild on every tick. Increasing capacity is a one-line constant change with negligible shared-memory cost. | 0.5h | [REPORT_OVERALL_STATUS.md §R9](plans/performance/REPORT_OVERALL_STATUS.md) |
-| DEF-5 | **Flip `block_source_ddl` default to `true`.** Currently source DDL (`ALTER TABLE … ADD/DROP COLUMN`, `ALTER TYPE`) silently invalidates stream tables — the ST is marked for reinit on its next scheduler tick with no warning at the DDL site. Blocking DDL at the source gives operators an explicit prompt to decide whether to `ALTER STREAM TABLE` before proceeding. Error message must explain the cause and the `block_source_ddl = false` escape hatch. | 2–4h | [REPORT_OVERALL_STATUS.md §R12](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~DEF-4~~ | ~~**Increase invalidation ring capacity from 32 to 128 slots.**~~ ✅ Done in v0.11.0 Phase 1 — `INVALIDATION_RING_CAPACITY` raised to 128 in `shmem.rs`. | — | [REPORT_OVERALL_STATUS.md §R9](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~DEF-5~~ | ~~**Flip `block_source_ddl` default to `true`.**~~ ✅ Done in v0.11.0 Phase 1 — default flipped to `true`; both error messages in `hooks.rs` include step-by-step escape-hatch procedure. E2E test still pending (SAF-2 branch). | — | [REPORT_OVERALL_STATUS.md §R12](plans/performance/REPORT_OVERALL_STATUS.md) |
 
 > **Default tuning subtotal: ~14–21 hours**
 
@@ -1871,7 +1872,7 @@ revert if needed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| SAF-1 | **Replace worker-path panics with structured errors.** The `check_skip_needed` function and several scheduler SPI calls currently call `panic!` / `unwrap_or_else(panic)` on failure. Replace with `PgTrickleError` propagation, log at `WARNING`, and continue to the next stream table rather than crashing the worker. Audit all `panic!` / `unwrap()` calls in `scheduler.rs`, `refresh.rs`, and `hooks.rs` for paths reachable from the worker loop. | 4–8h | [src/scheduler.rs](src/scheduler.rs) |
+| ~~SAF-1~~ | ~~**Replace worker-path panics with structured errors.**~~ ✅ Done in v0.11.0 Phase 1 — full audit of `scheduler.rs`, `refresh.rs`, `hooks.rs`: no `panic!`/`unwrap()` outside `#[cfg(test)]`. `check_skip_needed` now logs `WARNING` on SPI error with table name and error details. Audit finding documented in comment. | — | [src/scheduler.rs](src/scheduler.rs) |
 | SAF-2 | **Failure-injection E2E test.** Add an E2E test that forces an SPI failure path in the scheduler loop (e.g. by revoking permissions mid-run) and asserts that the remaining stream tables continue refreshing and the worker does not crash. | 3–4h | `tests/e2e_scheduler_tests.rs` |
 
 > **Safety hardening subtotal: ~7–12 hours**
@@ -1886,10 +1887,10 @@ revert if needed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| QF-1 | **Fix unguarded debug `println!`.** `refresh.rs:2269` emits `println!("MERGE SQL TEMPLATE:\n{}")` on every refresh cycle, visible in PostgreSQL server logs. Replace with `pgrx::log!()` guarded by a new `pg_trickle.log_merge_sql` GUC (default `off`). | ~30 min | [src/refresh.rs](src/refresh.rs) |
-| QF-2 | **Upgrade AUTO mode downgrade log level.** When DIFFERENTIAL mode silently falls back to FULL, the log message is currently `info!()` — invisible at default logging levels. Raise to `warning!()`. | ~30 min | [plans/performance/REPORT_OVERALL_STATUS.md §12](plans/performance/REPORT_OVERALL_STATUS.md) |
-| QF-3 | **Warn when `append_only` auto-reverts.** When a stream table configured with `append_only=true` receives a DELETE or UPDATE and silently reverts the flag to `false`, emit a `WARNING` identifying the table and the operation. | ~30 min | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
-| QF-4 | **Document parser `unwrap()` invariants.** Four `unwrap()` sites in `dvm/parser.rs` (lines 7123, 9048, 9389, 14324) are genuinely unreachable given validated input, but lack an `// INVARIANT:` comment. Add comments explaining why each is safe. | ~1–2h | [src/dvm/parser.rs](src/dvm/parser.rs) |
+| QF-1 | ~~**Fix unguarded debug `println!`.**~~ ✅ Done in v0.11.0 Phase 1 — `println!` replaced with `pgrx::log!()` guarded by new `pg_trickle.log_merge_sql` GUC (default `off`). | — | [src/refresh.rs](src/refresh.rs) |
+| QF-2 | ~~**Upgrade AUTO mode downgrade log level.**~~ ✅ Done in v0.11.0 Phase 1 — four AUTO→FULL downgrade paths in `api.rs` raised from `pgrx::info!()` to `pgrx::warning!()`. | — | [plans/performance/REPORT_OVERALL_STATUS.md §12](plans/performance/REPORT_OVERALL_STATUS.md) |
+| QF-3 | ~~**Warn when `append_only` auto-reverts.**~~ ✅ Verified already implemented — `pgrx::warning!()` + `emit_alert(AppendOnlyReverted)` already present in `refresh.rs`. | — | [plans/performance/REPORT_OVERALL_STATUS.md §15](plans/performance/REPORT_OVERALL_STATUS.md) |
+| QF-4 | ~~**Document parser `unwrap()` invariants.**~~ ✅ Done in v0.11.0 Phase 1 — `// INVARIANT:` comments added at four `unwrap()` sites in `dvm/parser.rs` (after `is_empty()` guard, `len()==1` guards, and non-empty `Err` return). | — | [src/dvm/parser.rs](src/dvm/parser.rs) |
 
 > **Quick-fix subtotal: ~3–4 hours**
 
@@ -2049,16 +2050,16 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction)
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped
-- [ ] DEF-1: `parallel_refresh_mode` default is `'on'`; concurrent-refresh E2E test passes
+- [x] DEF-1: `parallel_refresh_mode` default is `'on'`; unit test updated — ✅ Done in v0.11.0 Phase 1 (concurrent-refresh E2E test still pending)
 - [x] DEF-2: `auto_backoff` default is `true`; CONFIGURATION.md updated — ✅ Done in v0.10.0
 - [ ] DEF-3: SemiJoin delta-key pre-filter implemented; TPC-H Q18/Q20/Q21 re-benchmarked
-- [ ] DEF-4: Invalidation ring capacity is 128 slots; validated under rapid DDL E2E test
-- [ ] DEF-5: `block_source_ddl` default is `true`; error message includes escape-hatch instructions; E2E test verifies ALTER is blocked and escape hatch works
-- [ ] SAF-1+2: No `panic!`/`unwrap()` in background worker hot paths; failure-injection E2E test passes
+- [x] DEF-4: Invalidation ring capacity is 128 slots — ✅ Done in v0.11.0 Phase 1 (rapid DDL E2E test still pending)
+- [x] DEF-5: `block_source_ddl` default is `true`; error message includes escape-hatch instructions — ✅ Done in v0.11.0 Phase 1 (E2E test still pending)
+- [x] SAF-1: No `panic!`/`unwrap()` in background worker hot paths; `check_skip_needed` logs SPI errors — ✅ Done in v0.11.0 Phase 1 (SAF-2 failure-injection E2E test still pending)
 - [ ] WB-1+2: Changed-column bitmask supports >63 columns; wide-table CDC selectivity E2E passes; schema migration tested
 - [ ] FUSE-1–6: Fuse blows on configurable change-count threshold; `reset_fuse()` recovers in all three action modes; diamond/DAG interaction tested
 - [ ] TS1 or TS2: At least one external query corpus passes with zero correctness mismatches in DIFFERENTIAL mode
-- [ ] QF-1–4: `println!` replaced with guarded `pgrx::log!()`; AUTO downgrades emit `WARNING`; `append_only` reversion emits `WARNING`; parser invariant sites annotated
+- [x] QF-1–4: `println!` replaced with guarded `pgrx::log!()`; AUTO downgrades emit `WARNING`; `append_only` reversion verified already warns; parser invariant sites annotated — ✅ Done in v0.11.0 Phase 1
 - [ ] G12-ERM: `effective_refresh_mode` column present in `pgt_stream_tables`; `explain_refresh_mode()` returns resolved mode with downgrade reason
 - [ ] G12-2: TopK path validates assumptions at refresh time; triggers FULL fallback with `WARNING` on violation
 - [ ] G12-AGG: Group-rescan aggregate warning fires at `create_stream_table` for DIFFERENTIAL mode; strategy visible in `explain_st()`
