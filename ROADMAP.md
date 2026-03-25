@@ -3,7 +3,7 @@
 > **Last updated:** 2026-03-26
 > **Latest release:** 0.10.0 (2026-03-25)
 > **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
-> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (PR #282, Prometheus/Grafana) · Phase 4 ✅ (PR #283, correctness guards) · Phase 5 ✅ (PR #284, VARBIT bitmask) · Phase 6 ✅ (PR #285, fuse circuit breaker) · Phase 7 ✅ (PR #286, event-driven wake) · Partitioning Spike ✅ (STRETCH-1 RFC + A1-1 catalog+DDL + A1-2 delta range + A1-3 MERGE predicate)
+> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (PR #282, Prometheus/Grafana) · Phase 4 ✅ (PR #283, correctness guards) · Phase 5 ✅ (PR #284, VARBIT bitmask) · Phase 6 ✅ (PR #285, fuse circuit breaker) · Phase 7 ✅ (PR #286, event-driven wake) · Partitioning Spike ✅ (STRETCH-1 RFC + A1-1 catalog+DDL + A1-2 delta range + A1-3 MERGE predicate) · Phase 8 ✅ (PR #288, ST-to-ST differential) · Phase 11 ✅ (C3-1 per-DB quotas + G16-GS docs restructure)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -1817,9 +1817,9 @@ SemiJoin delta-key pre-filtering, and `block_source_ddl` default flip.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| C3-1 | Per-database worker quotas (`pg_trickle.per_database_worker_quota`); priority ordering (IMMEDIATE > Hot > Warm > Cold); burst capacity up to 150% when other DBs are under budget | 2–3 wk | [PLAN_NEW_STUFF.md §C-3](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~C3-1~~ | ~~Per-database worker quotas (`pg_trickle.per_database_worker_quota`); priority ordering (IMMEDIATE > Hot > Warm > Cold); burst capacity up to 150% when other DBs are under budget~~ ✅ Done in v0.11.0 Phase 11 — `compute_per_db_quota()` helper with burst threshold at 80% cluster utilisation; `sort_ready_queue_by_priority()` dispatches ImmediateClosure first; 7 unit tests. | — | [src/scheduler.rs](src/scheduler.rs) |
 
-> **Multi-DB isolation subtotal: ~2–3 weeks**
+> **Multi-DB isolation subtotal: ✅ Complete**
 
 ### Prometheus & Grafana Observability
 
@@ -1938,7 +1938,7 @@ revert if needed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G16-GS | **Restructure `GETTING_STARTED.md` with progressive complexity.** Five chapters: (1) Hello World — single-table ST with no join; (2) Multi-table join; (3) Scheduling & backpressure; (4) Monitoring — 5 key functions; (5) Advanced — FUSE, wide bitmask, partitions. Remove the current flat wall-of-SQL structure. | ~1–2d | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
+| G16-GS | **Restructure `GETTING_STARTED.md` with progressive complexity.** Five chapters: (1) Hello World — single-table ST with no join; (2) Multi-table join; (3) Scheduling & backpressure; (4) Monitoring — 5 key functions; (5) Advanced — FUSE, wide bitmask, partitions. Remove the current flat wall-of-SQL structure. ✅ Done in v0.11.0 Phase 11 — 5-chapter structure implemented; Chapter 1 Hello World example added; Chapter 5 Advanced Topics adds inline FUSE, partitioning, IMMEDIATE, and multi-tenant quota examples. | — | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
 | ~~G16-SM~~ | ~~**SQL/mode operator support matrix.**~~ ✅ Done — 60+ row operator support matrix added to `docs/DVM_OPERATORS.md` covering all operators × FULL/DIFFERENTIAL/IMMEDIATE modes with caveat footnotes. | — | [docs/DVM_OPERATORS.md](docs/DVM_OPERATORS.md) |
 | ~~G16-MQR~~ | ~~**Monitoring quick reference.**~~ ✅ Done — Monitoring Quick Reference section added to `docs/GETTING_STARTED.md` with `pgt_status()`, `health_check()`, `change_buffer_sizes()`, `dependency_tree()`, `fuse_status()`, Prometheus/Grafana stack, key metrics table, and alert summary. | — | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
 | ~~G15-GUC~~ | ~~**GUC interaction matrix.**~~ ✅ Done — GUC Interaction Matrix (14 interaction pairs) and three named Tuning Profiles (Low-Latency, High-Throughput, Resource-Constrained) added to `docs/CONFIGURATION.md`. | — | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
@@ -2073,7 +2073,7 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [x] Partitioned storage table created with `PARTITION BY RANGE` + default catch-all partition — ✅ Done (A1-1 physical DDL)
 - [x] Partition-key range predicate injected into MERGE ON clause; empty-delta fast-path skips MERGE — ✅ Done (A1-2 + A1-3)
 - [x] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction) — ✅ Done (A1-4 E2E tests)
-- [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
+- [x] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle — ✅ Done in v0.11.0 Phase 11 (`pg_trickle.per_database_worker_quota` GUC; burst to 150% at < 80% cluster load)
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped — ✅ Done in v0.11.0 Phase 3 (`monitoring/` directory)
 - [x] DEF-1: `parallel_refresh_mode` default is `'on'`; unit test updated — ✅ Done in v0.11.0 Phase 1 (concurrent-refresh E2E test still pending)
 - [x] DEF-2: `auto_backoff` default is `true`; CONFIGURATION.md updated — ✅ Done in v0.10.0
@@ -2092,7 +2092,7 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [x] G15-PV: Incompatible `cdc_mode`/`refresh_mode` and `diamond_schedule_policy` combinations rejected at creation time with structured `HINT` — ✅ Done in v0.11.0 Phase 2
 - [x] G13-EH: `UnsupportedOperator`, `CycleDetected`, `UpstreamSchemaChanged`, `QueryParseError` include `DETAIL` and `HINT` fields — ✅ Done in v0.11.0 Phase 2
 - [x] G17-EC01B-NEG: Negative regression test documents ≥3-scan fall-back behavior; linked to v0.12.0 EC01B fix — ✅ Done in v0.11.0 Phase 4
-- [ ] G16-GS/SM/MQR/GUC: ~~GETTING_STARTED restructured with progressive complexity~~; ~~DVM_OPERATORS support matrix added~~; ~~monitoring quick reference added~~; ~~CONFIGURATION.md GUC matrix added~~ — G16-SM ✅, G16-MQR ✅, G15-GUC ✅; G16-GS deferred to post-Phase 9
+- [x] G16-GS/SM/MQR/GUC: ~~GETTING_STARTED restructured with progressive complexity~~; ~~DVM_OPERATORS support matrix added~~; ~~monitoring quick reference added~~; ~~CONFIGURATION.md GUC matrix added~~ — G16-SM ✅, G16-MQR ✅, G15-GUC ✅, G16-GS ✅ (Phase 11)
 - [x] ST-ST-1–6: All ST-to-ST dependencies refresh differentially when upstream has a change buffer; FULL refreshes on an upstream ST produce a pre/post I/D diff so downstream STs never cascade FULL through the chain; auto-migration creates buffers for existing ST-to-ST dependencies on upgrade; 3-level E2E chain test passes
 - [x] WAKE-1: Event-driven scheduler wake implemented; latency E2E test shows sub-50ms median response for single-source workloads — ✅ Done in v0.11.0 Phase 7
 - [ ] DAG-1: Intra-tick pipelining dispatches downstream STs immediately on upstream completion; latency benchmark shows improvement for mixed-cost DAGs
