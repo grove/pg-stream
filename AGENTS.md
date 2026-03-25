@@ -34,10 +34,24 @@ just test-all          # All of the above + pgrx tests
 > E2E tests require a Docker image. Run `just build-e2e-image` if the image is
 > stale, or use `just test-e2e` which rebuilds automatically.
 
-When you're done and have edited files always remember to output git commands 
-for staging and committing the changes. The git commit message should summarize 
-the changes made. Feel free to put discrete changes into separate git commit 
-commands. Never commit directly to git without asking for permission.
+When you're done and have edited files always remember to output git commands
+for staging and committing the changes. The git commit message should summarize
+the changes made. Feel free to put discrete changes into separate git commit
+commands. Do not commit directly to git unless the user explicitly says it is
+fine.
+
+Never create a new git branch unless the current branch is `main`.
+
+When creating a pull request, always write the PR description to a temporary
+file first and pass it to `gh` via `--body-file` to avoid shell quoting and
+garbling issues with special characters:
+
+```bash
+cat > /tmp/pr_description.md << 'EOF'
+<PR description here>
+EOF
+gh pr create --title "..." --body-file /tmp/pr_description.md
+```
 
 ---
 
