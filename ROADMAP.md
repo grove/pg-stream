@@ -3,7 +3,7 @@
 > **Last updated:** 2026-03-26
 > **Latest release:** 0.10.0 (2026-03-25)
 > **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
-> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (Prometheus/Grafana observability stack)
+> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (Prometheus/Grafana observability stack) · Phase 4 ✅ (correctness guards) · Phase 6 ✅ (fuse circuit breaker)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -1973,14 +1973,14 @@ revert if needed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| FUSE-1 | Catalog: fuse state columns on `pgt_stream_tables` (`fuse_mode`, `fuse_state`, `fuse_ceiling`, `fuse_sensitivity`, `blown_at`, `blow_reason`) | 1–2h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-2 | `alter_stream_table()` new params: `fuse`, `fuse_ceiling`, `fuse_sensitivity` | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-3 | `reset_fuse(name, action => 'apply'\|'reinitialize'\|'skip_changes')` SQL function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-4 | `fuse_status()` introspection function | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-5 | Scheduler pre-check: count change buffer rows; evaluate threshold; blow fuse + NOTIFY if exceeded | 2–3h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
-| FUSE-6 | E2E tests: normal baseline, spike → blow, reset (`apply`/`reinitialize`/`skip_changes`), diamond/DAG interaction | 4–6h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| ~~FUSE-1~~ ✅ | ~~Catalog: fuse state columns on `pgt_stream_tables` (`fuse_mode`, `fuse_state`, `fuse_ceiling`, `fuse_sensitivity`, `blown_at`, `blow_reason`)~~ | 1–2h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| ~~FUSE-2~~ ✅ | ~~`alter_stream_table()` new params: `fuse`, `fuse_ceiling`, `fuse_sensitivity`~~ | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| ~~FUSE-3~~ ✅ | ~~`reset_fuse(name, action => 'apply'\|'reinitialize'\|'skip_changes')` SQL function~~ | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| ~~FUSE-4~~ ✅ | ~~`fuse_status()` introspection function~~ | 1h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| ~~FUSE-5~~ ✅ | ~~Scheduler pre-check: count change buffer rows; evaluate threshold; blow fuse + NOTIFY if exceeded~~ | 2–3h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
+| ~~FUSE-6~~ ✅ | ~~E2E tests: normal baseline, spike → blow, reset (`apply`/`reinitialize`/`skip_changes`), diamond/DAG interaction~~ | 4–6h | [PLAN_FUSE.md](plans/sql/PLAN_FUSE.md) |
 
-> **Fuse subtotal: ~10–14 hours**
+> **Fuse subtotal: ~10–14 hours — ✅ Complete**
 
 #### External Correctness Gate (TS1 or TS2)
 

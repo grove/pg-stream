@@ -469,6 +469,9 @@ fn create_or_replace_stream_table_impl(
                 config_diff.append_only,
                 config_diff.pooler_compatibility_mode,
                 None, // tier: not set via create_or_replace
+                None, // fuse: not set via create_or_replace
+                None, // fuse_ceiling: not set via create_or_replace
+                None, // fuse_sensitivity: not set via create_or_replace
             )?;
 
             pgrx::info!(
@@ -2356,6 +2359,9 @@ fn alter_stream_table(
     append_only: default!(Option<bool>, "NULL"),
     pooler_compatibility_mode: default!(Option<bool>, "NULL"),
     tier: default!(Option<&str>, "NULL"),
+    fuse: default!(Option<&str>, "NULL"),
+    fuse_ceiling: default!(Option<i64>, "NULL"),
+    fuse_sensitivity: default!(Option<i32>, "NULL"),
 ) {
     let result = alter_stream_table_impl(
         name,
@@ -2369,6 +2375,9 @@ fn alter_stream_table(
         append_only,
         pooler_compatibility_mode,
         tier,
+        fuse,
+        fuse_ceiling,
+        fuse_sensitivity,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -2388,6 +2397,9 @@ fn alter_stream_table_impl(
     append_only: Option<bool>,
     pooler_compatibility_mode: Option<bool>,
     tier: Option<&str>,
+    fuse: Option<&str>,
+    fuse_ceiling_arg: Option<i64>,
+    fuse_sensitivity_arg: Option<i32>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
     let mut st = StreamTableMeta::get_by_name(&schema, &table_name)?;
@@ -2728,6 +2740,44 @@ fn alter_stream_table_impl(
         }
         let normalized = tier_str.to_lowercase();
         StreamTableMeta::update_refresh_tier(st.pgt_id, &normalized)?;
+    }
+
+    // FUSE-2: Update fuse configuration if any fuse parameter is set.
+    if fuse.is_some() || fuse_ceiling_arg.is_some() || fuse_sensitivity_arg.is_some() {
+        let fuse_mode = match fuse {
+            Some(mode_str) => {
+                let normalized = mode_str.to_lowercase();
+                match normalized.as_str() {
+                    "off" | "on" | "auto" => normalized,
+                    _ => {
+                        return Err(PgTrickleError::InvalidArgument(format!(
+                            "invalid fuse value: '{}' (expected 'off', 'on', or 'auto')",
+                            mode_str
+                        )));
+                    }
+                }
+            }
+            None => st.fuse_mode.clone(),
+        };
+        let ceiling = fuse_ceiling_arg.or(st.fuse_ceiling);
+        let sensitivity = fuse_sensitivity_arg.or(st.fuse_sensitivity);
+
+        if let Some(c) = ceiling
+            && c <= 0
+        {
+            return Err(PgTrickleError::InvalidArgument(
+                "fuse_ceiling must be a positive integer".into(),
+            ));
+        }
+        if let Some(s) = sensitivity
+            && s <= 0
+        {
+            return Err(PgTrickleError::InvalidArgument(
+                "fuse_sensitivity must be a positive integer".into(),
+            ));
+        }
+
+        StreamTableMeta::update_fuse_config(st.pgt_id, &fuse_mode, ceiling, sensitivity)?;
     }
 
     shmem::signal_dag_invalidation(st.pgt_id);
@@ -3786,6 +3836,160 @@ fn explain_refresh_mode_impl(name: &str) -> Vec<(String, Option<String>, Option<
     };
 
     vec![(configured, effective_opt, downgrade_reason)]
+}
+
+// ── FUSE-3: reset_fuse() ───────────────────────────────────────────────────
+
+/// Reset a blown fuse on a stream table.
+///
+/// The `action` parameter controls how pending changes are handled:
+/// - `'apply'` (default): Re-arm the fuse and let the next scheduler tick
+///   process the buffered changes normally. The stream table resumes as ACTIVE.
+/// - `'reinitialize'`: Re-arm the fuse and mark the stream table for full
+///   reinitialization. All buffered changes are consumed by the full refresh.
+/// - `'skip_changes'`: Re-arm the fuse, drain (discard) all pending change
+///   buffer rows for this stream table's sources, then resume as ACTIVE.
+///
+/// Returns nothing on success; raises an ERROR if the stream table does not
+/// exist or the fuse is not blown.
+#[pg_extern(schema = "pgtrickle")]
+fn reset_fuse(name: &str, action: default!(&str, "'apply'")) {
+    let result = reset_fuse_impl(name, action);
+    if let Err(e) = result {
+        raise_error_with_context(e);
+    }
+}
+
+fn reset_fuse_impl(name: &str, action: &str) -> Result<(), PgTrickleError> {
+    let (schema, table_name) = parse_qualified_name(name)?;
+    let st = StreamTableMeta::get_by_name(&schema, &table_name)?;
+
+    if st.fuse_state != "blown" {
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "fuse is not blown for {}.{} (current state: {})",
+            schema, table_name, st.fuse_state
+        )));
+    }
+
+    let normalized_action = action.trim().to_lowercase();
+    match normalized_action.as_str() {
+        "apply" => {
+            // Re-arm fuse and set status to ACTIVE — changes processed on next tick.
+            StreamTableMeta::reset_fuse(st.pgt_id)?;
+        }
+        "reinitialize" => {
+            // Re-arm fuse, mark needs_reinit, set ACTIVE.
+            StreamTableMeta::reset_fuse(st.pgt_id)?;
+            StreamTableMeta::mark_for_reinitialize(st.pgt_id)?;
+        }
+        "skip_changes" => {
+            // Re-arm fuse then drain all pending changes for this ST's sources.
+            StreamTableMeta::reset_fuse(st.pgt_id)?;
+            let change_schema = config::pg_trickle_change_buffer_schema();
+            let deps = crate::catalog::StDependency::get_for_st(st.pgt_id)?;
+            for dep in &deps {
+                if dep.source_type == "TABLE" || dep.source_type == "FOREIGN_TABLE" {
+                    let drain_sql = format!(
+                        "TRUNCATE {}.changes_{}",
+                        change_schema,
+                        dep.source_relid.to_u32(),
+                    );
+                    if let Err(e) = Spi::run(&drain_sql) {
+                        pgrx::warning!(
+                            "reset_fuse: failed to drain change buffer for source OID {}: {}",
+                            dep.source_relid.to_u32(),
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(PgTrickleError::InvalidArgument(format!(
+                "invalid reset_fuse action: '{}' (expected 'apply', 'reinitialize', or 'skip_changes')",
+                action
+            )));
+        }
+    }
+
+    pgrx::info!(
+        "pg_trickle: fuse reset for {}.{} with action '{}'",
+        schema,
+        table_name,
+        normalized_action,
+    );
+    Ok(())
+}
+
+// ── FUSE-4: fuse_status() ──────────────────────────────────────────────────
+
+/// Show the fuse circuit breaker status for all stream tables.
+///
+/// Returns one row per stream table with fuse configuration and state.
+#[pg_extern(schema = "pgtrickle")]
+#[allow(clippy::type_complexity)]
+fn fuse_status() -> TableIterator<
+    'static,
+    (
+        name!(stream_table, String),
+        name!(fuse_mode, String),
+        name!(fuse_state, String),
+        name!(fuse_ceiling, Option<i64>),
+        name!(effective_ceiling, Option<i64>),
+        name!(fuse_sensitivity, Option<i32>),
+        name!(blown_at, Option<TimestampWithTimeZone>),
+        name!(blow_reason, Option<String>),
+    ),
+> {
+    let rows = fuse_status_impl();
+    TableIterator::new(rows)
+}
+
+#[allow(clippy::type_complexity)]
+fn fuse_status_impl() -> Vec<(
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i32>,
+    Option<TimestampWithTimeZone>,
+    Option<String>,
+)> {
+    let sts = match StreamTableMeta::get_all() {
+        Ok(sts) => sts,
+        Err(e) => {
+            pgrx::warning!("fuse_status: failed to load stream tables: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let global_ceiling = config::pg_trickle_fuse_default_ceiling();
+
+    sts.into_iter()
+        .map(|st| {
+            let qualified = format!("{}.{}", st.pgt_schema, st.pgt_name);
+            let effective_ceiling = if st.fuse_mode == "off" {
+                None
+            } else {
+                st.fuse_ceiling.or(if global_ceiling > 0 {
+                    Some(global_ceiling)
+                } else {
+                    None
+                })
+            };
+            (
+                qualified,
+                st.fuse_mode,
+                st.fuse_state,
+                st.fuse_ceiling,
+                effective_ceiling,
+                st.fuse_sensitivity,
+                st.blown_at,
+                st.blow_reason,
+            )
+        })
+        .collect()
 }
 
 /// Show detected diamond consistency groups.
@@ -6933,6 +7137,12 @@ mod tests {
             last_fixpoint_iterations: None,
             pooler_compatibility_mode: false,
             refresh_tier: "hot".to_string(),
+            fuse_mode: "off".to_string(),
+            fuse_state: "armed".to_string(),
+            fuse_ceiling: None,
+            fuse_sensitivity: None,
+            blown_at: None,
+            blow_reason: None,
         }
     }
 
