@@ -1,7 +1,7 @@
 # DAG Topology & Refresh Propagation Performance
 
 > **Status:** Analysis  
-> **Date:** 2026-03-24  
+> **Date:** 2026-03-25 (updated for ST-to-ST differential, v0.11.0)  
 > **Related:** [ARCHITECTURE.md](../../docs/ARCHITECTURE.md) ·
 > [CONFIGURATION.md](../../docs/CONFIGURATION.md) ·
 > [REPORT_PARALLELIZATION.md](REPORT_PARALLELIZATION.md) ·
@@ -49,9 +49,11 @@ tick**. A key property of the implementation:
 
 After refreshing ST₁, the scheduler updates `data_timestamp` via SPI. When
 ST₂ is evaluated next (same tick, same transaction),
-`has_stream_table_source_changes()` compares `data_timestamp` values and sees
-the write from earlier in the same transaction. The change cascades through
-the **entire DAG in a single tick**, regardless of depth.
+`has_stream_table_source_changes()` compares the downstream's last-consumed
+frontier position against the upstream ST's change buffer
+(`changes_pgt_<pgt_id>`) and sees pending deltas from the refresh earlier in
+the same tick. The change cascades through the **entire DAG in a single
+tick**, regardless of depth.
 
 **Propagation latency:**
 
@@ -60,10 +62,14 @@ $$L_{\text{calc}} = I_s + N \times T_r$$
 The scheduler interval is the wait for the tick to begin; once inside the
 tick, all $N$ STs are refreshed sequentially in topological order.
 
-When an upstream ST's `data_timestamp` has advanced, the downstream ST
-receives `RefreshAction::Full` rather than differential, because there is no
-CDC change buffer for ST-to-ST propagation — the scheduler detects staleness
-via `data_timestamp` comparison only (see Section 6, insight 4).
+Since v0.11.0, ST-to-ST dependencies use dedicated change buffers
+(`changes_pgt_<pgt_id>`), so downstream STs refresh **differentially** —
+only the rows that changed in the upstream ST are propagated. Even when the
+upstream ST performs a FULL refresh, a pre/post snapshot diff captures the
+minimal INSERT/DELETE delta into the ST buffer, preventing FULL from
+cascading through the chain. This means $T_r$ for downstream STs in an
+ST-to-ST chain is proportional to the upstream delta size, not the full
+table size.
 
 ### 2.2 Scheduled Mode (explicit `SCHEDULE`)
 
@@ -125,6 +131,11 @@ source → ST₁ → ST₂ → ST₃ → ... → ST_N
 
 The worst case for propagation depth. Every ST depends on the previous one —
 zero parallelism is possible.
+
+Since v0.11.0, each hop is differential (O(delta), not O(table)), so $T_r$ at
+each level depends on the upstream delta size rather than the full table size.
+For a linear chain where 10 rows change at the base, each hop processes ~10
+rows — $T_r$ stays constant (~5–20 ms) regardless of table size.
 
 | Mode | Latency (N=500) |
 |------|-----------------|
@@ -379,6 +390,11 @@ levels (64–256 STs) benefit from parallelism.
 | Small DAG (< 20 STs) | CALCULATED | Not worth the complexity |
 | Mixed production | Parallel + tiered scheduling | Balance latency vs. resource usage |
 
+> **Note (v0.11.0+):** All topologies above now benefit from differential
+> ST-to-ST refresh. The per-hop $T_r$ for ST-sourced STs is proportional to the
+> upstream delta size, not the full table size. This makes deep chains and
+> fan-out trees significantly cheaper than the pre-v0.11.0 analysis assumed.
+
 ---
 
 ## 6. Key Architectural Insights
@@ -400,18 +416,17 @@ levels (64–256 STs) benefit from parallelism.
    interval, and when there are enough independent STs to fill the worker
    budget.
 
-4. **Stream-table sources force FULL refresh (when ST-upstream changes are
-   detected).** When an upstream stream table's `data_timestamp` advances,
-   the downstream ST is forced to `RefreshAction::Full` because there is no
-   CDC change buffer for ST-to-ST propagation — a DIFFERENTIAL refresh would
-   be a no-op with nothing to merge. Critically, this is conditional: if an
-   ST has mixed sources (both a base table and an upstream ST) and only the
-   *base table* has changes, `has_stream_table_changes` is false and the
-   normal `determine_refresh_action()` path runs, which can return
-   `Differential`. The FULL override triggers **only** when `has_changes &&
-   has_stream_table_changes` are both true. Each FULL refresh reads from the
-   already-materialized upstream ST table — it does not re-execute upstream
-   queries — so work does not compound with depth.
+4. **Stream-table sources refresh differentially (v0.11.0+).** Since v0.11.0,
+   upstream stream tables write their delta (INSERT/DELETE pairs) into
+   dedicated ST change buffers (`changes_pgt_<pgt_id>`). The downstream ST's
+   DVM scan operator reads from this buffer just like it reads from a
+   base-table change buffer — enabling the full differential refresh path.
+   When the upstream ST performs a FULL refresh, a pre/post `EXCEPT ALL`
+   diff is captured into the ST buffer, so downstream STs still receive a
+   minimal delta and never cascade to FULL. Frontier tracking uses
+   `pgt_<upstream_pgt_id>` keys in the JSONB frontier to record the
+   last-consumed position. This eliminates the previous limitation where
+   ST-to-ST chains forced FULL refresh at each hop.
 
 5. **Worker processes are ephemeral.** Each parallel refresh worker is a
    separate OS process with its own SPI connection — spawned, used, and
@@ -433,9 +448,11 @@ levels (64–256 STs) benefit from parallelism.
 
 - Keep DAG depth ≤ 5.
 - Use CALCULATED mode (no explicit schedule).
-- Optimize per-ST refresh time via differential mode for base-table sources.
-- Avoid stream-table-to-stream-table chains longer than 3 hops (each hop is
-  a FULL refresh).
+- Ensure event-driven wake is enabled (`pg_trickle.event_driven_wake = true`)
+  for sub-50ms trigger-to-tick latency.
+- ST-to-ST chains are now fully differential (v0.11.0+) — depth adds
+  per-hop delta cost (proportional to changes) rather than full-table cost.
+  Chains of 5–10 hops are practical when per-hop delta is small.
 
 ### For high-throughput wide DAGs (100+ STs)
 
@@ -457,11 +474,146 @@ levels (64–256 STs) benefit from parallelism.
 
 ### When to restructure the DAG
 
-- **Linear chains > 10 deep:** Consider flattening by having downstream STs
-  query source tables directly (with appropriate WHERE clauses) instead of
-  chaining through intermediate STs.
+- **Linear chains > 20 deep:** With differential ST-to-ST (v0.11.0+), each
+  hop costs O(delta) rather than O(table). Chains of 10–15 hops are now
+  practical. Consider flattening only if per-hop overhead accumulates
+  significantly (e.g., complex multi-join aggregates at each level).
 - **Diamonds with 5+ members:** Simplify the query structure to reduce the
   consistency group size, or accept eventual consistency
   (`diamond_consistency = 'eventual'`) to allow independent refresh.
 - **Circular dependencies:** Keep SCCs to 2–3 members maximum. Each fixpoint
   iteration is $|SCC| \times T_r$ and convergence is not guaranteed to be fast.
+
+---
+
+## 8. Further Improvement Opportunities
+
+The following are potential optimizations that could further improve ST-to-ST
+and general DAG refresh performance. Items are ordered by estimated
+impact-to-effort ratio.
+
+### 8.1 Intra-Tick Pipelining (High Impact)
+
+**Problem:** In CALCULATED mode, the entire DAG is processed sequentially
+within a single tick. Level $l+1$ cannot start until **all** of level $l$ is
+complete, even when some level $l+1$ STs only depend on one completed ST
+from level $l$.
+
+**Proposal:** Within a single tick, begin processing an ST as soon as all its
+upstream dependencies have completed — not when the entire previous level is
+done. This is effectively **intra-tick parallelism with fine-grained
+dependency tracking**.
+
+**Expected gain:** For DAGs with mixed-cost levels (e.g., level 2 has one
+expensive 500 ms ST and nine cheap 5 ms STs), level 3 STs that depend only
+on cheap level 2 STs could start 495 ms earlier. For a depth-10 DAG with
+heterogeneous costs, this could reduce end-to-end latency by 30–50%.
+
+**Complexity:** Medium. Requires the parallel dispatch loop to track per-ST
+completion (not per-level) and immediately enqueue newly-ready STs.
+
+### 8.2 Adaptive Poll Interval (Medium Impact)
+
+**Problem:** The 200 ms poll interval in parallel mode is a fixed constant.
+For STs that complete in 5–10 ms, 95% of each poll period is wasted idle
+time. For STs that take 300+ ms, the coordinator polls unnecessarily during
+the first 200 ms.
+
+**Proposal:** Use adaptive polling — start with a short poll (e.g., 20 ms),
+double on each idle poll (exponential backoff to 200 ms), and reset to the
+short poll when a worker completes. Alternatively, use `WaitLatch` with
+worker completion signaling via shared memory flags.
+
+**Expected gain:** For cheap refreshes ($T_r \approx 10\text{ms}$), this
+could reduce the effective poll interval from 200 ms to ~20 ms, making
+parallel mode competitive with CALCULATED even for DAGs with moderate width.
+
+**Complexity:** Low–Medium. The latch-based approach is cleaner but requires
+shared memory coordination; the adaptive poll is simpler to implement.
+
+### 8.3 ST Buffer Compaction / Pruning (Medium Impact)
+
+**Problem:** When a deep ST chain propagates a large batch, each level writes
+the full delta to its ST change buffer (`changes_pgt_<pgt_id>`) and the next
+level reads it. For a 10-level chain with a 10,000-row delta, this creates
+10 × 10,000 = 100,000 rows of intermediate buffer data that is immediately
+consumed and cleaned up.
+
+**Proposal:** For single-consumer ST buffers (the common case), skip the
+buffer write entirely — pass the delta directly in-memory to the downstream
+ST within the same tick. This eliminates SPI overhead for the buffer INSERT
+and DELETE cycle.
+
+**Expected gain:** For deep chains with large deltas, eliminates 2 × SPI
+DML operations per hop. At ~1 ms per DML for 10K rows, this saves ~20 ms
+per hop — significant for chains deeper than 5 levels.
+
+**Complexity:** High. Requires changing the DVM scan operator to optionally
+read from an in-memory delta rather than a buffer table. Only applicable
+when the downstream refresh happens within the same tick (CALCULATED mode).
+
+### 8.4 Delta Amplification Detection (Medium Impact)
+
+**Problem:** In multi-join ST chains, a small base-table delta can amplify
+at each hop. For example, 1 changed row in a dimension table that joins with
+a 1M-row fact table produces a 1M-row delta at the join level. If this ST
+feeds another join, the delta amplifies further.
+
+**Proposal:** Track delta size at each hop (already partially done via
+`pgt_refresh_history`). When delta amplification exceeds a configurable
+threshold (e.g., output delta > 100× input delta), emit a performance
+warning and optionally fall back to FULL refresh for that specific hop
+(which may be cheaper when the delta has exploded).
+
+**Expected gain:** Prevents pathological cases where differential refresh is
+actually slower than FULL due to delta amplification. The `explain_st()`
+function could expose amplification metrics.
+
+**Complexity:** Low. Most of the infrastructure exists — `pgt_refresh_history`
+already tracks delta sizes. Just needs threshold comparison and a fallback.
+
+### 8.5 Batch Coalescing for ST Buffers (Low–Medium Impact)
+
+**Problem:** When event-driven wake triggers rapid-fire refreshes (low
+`wake_debounce_ms`), an upstream ST may be refreshed 3 times before the
+downstream reads its buffer. Each upstream refresh writes separate rows to
+the ST buffer. The downstream then processes all 3 batches in one read.
+
+**Proposal:** Coalesce matching INSERT/DELETE pairs within the ST buffer
+before the downstream reads it. A net-effect pass (similar to
+`compute_net_effect()` for base-table buffers) could cancel out INSERTs
+followed by DELETEs for the same `__pgt_row_id`, reducing the delta size.
+
+**Expected gain:** For rapidly-updating upstream STs, reduces downstream
+delta size by eliminating intermediate states. Most impactful for
+high-frequency OLTP workloads with many small updates to the same rows.
+
+**Complexity:** Medium. The net-effect computation exists for base-table
+buffers but needs adaptation for the ST buffer schema (no `old_*` columns).
+
+### 8.6 Parallel ST-to-ST Within Atomic Groups (Low Impact)
+
+**Problem:** Diamond consistency groups serialize all member refreshes into
+a single sub-transaction on one worker. A group of 8 STs with $T_r = 50\text{ms}$
+each takes 400 ms sequentially.
+
+**Proposal:** Allow intra-group parallelism for members that don't share
+sources — e.g., in a group `{A, B, C}` where A and B are independent but
+C depends on both, A and B could run concurrently.
+
+**Expected gain:** Limited to large diamond groups (5+ members) with
+independent subsets — a niche but painful case.
+
+**Complexity:** High. Requires sub-transaction coordination across workers,
+which conflicts with the single-connection-per-worker model.
+
+### Summary: Improvement Priority Matrix
+
+| Improvement | Impact | Effort | Priority |
+|-------------|--------|--------|----------|
+| 8.1 Intra-tick pipelining | High | Medium | **P1** |
+| 8.2 Adaptive poll interval | Medium | Low–Medium | **P2** |
+| 8.4 Delta amplification detection | Medium | Low | **P2** |
+| 8.3 ST buffer compaction | Medium | High | P3 |
+| 8.5 Batch coalescing for ST buffers | Low–Medium | Medium | P3 |
+| 8.6 Parallel within atomic groups | Low | High | P4 |

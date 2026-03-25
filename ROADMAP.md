@@ -2043,7 +2043,26 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 > **Stretch subtotal: 2–4 days (STRETCH-1 spike)**
 
-> **v0.11.0 total: ~7–10 weeks (partitioning + isolation) + ~12h observability + ~14–21h default tuning + ~7–12h safety hardening + ~2–4 weeks should-ship (bitmask + fuse + external corpus) + ~4.5–6.5 weeks ST-to-ST differential + ~2–3 weeks event-driven wake + ~1–2 days correctness quick-wins + ~2–3 days documentation**
+### DAG Refresh Performance Improvements (from PLAN_DAG_PERFORMANCE.md §8)
+
+> **In plain terms:** Now that ST-to-ST differential refresh eliminates the
+> "every hop is FULL" bottleneck, the next performance frontier is reducing
+> per-hop overhead and exploiting DAG structure more aggressively. These items
+> target the scheduling and dispatch layer — not the DVM engine — and
+> collectively can reduce end-to-end propagation latency by 30–50% for
+> heterogeneous DAGs.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| DAG-1 | **Intra-tick pipelining.** Within a single scheduler tick, begin processing a downstream ST as soon as all its specific upstream dependencies have completed — not when the entire topological level finishes. Requires per-ST completion tracking in the parallel dispatch loop and immediate enqueuing of newly-ready STs. Expected 30–50% latency reduction for DAGs with mixed-cost levels. | 2–3 wk | [PLAN_DAG_PERFORMANCE.md §8.1](plans/performance/PLAN_DAG_PERFORMANCE.md) |
+| DAG-2 | **Adaptive poll interval.** Replace the fixed 200 ms parallel dispatch poll with exponential backoff (20 ms → 200 ms), resetting on worker completion. Makes parallel mode competitive with CALCULATED for cheap refreshes ($T_r \approx 10\text{ms}$). Alternative: `WaitLatch` with shared-memory completion flags. | 1–2 wk | [PLAN_DAG_PERFORMANCE.md §8.2](plans/performance/PLAN_DAG_PERFORMANCE.md) |
+| DAG-3 | **Delta amplification detection.** Track input→output delta ratio per hop via `pgt_refresh_history`. When a join ST amplifies delta beyond a configurable threshold (e.g., output > 100× input), emit a performance WARNING and optionally fall back to FULL for that hop. Expose amplification metrics in `explain_st()`. | 3–5d | [PLAN_DAG_PERFORMANCE.md §8.4](plans/performance/PLAN_DAG_PERFORMANCE.md) |
+| DAG-4 | **ST buffer bypass for single-consumer CALCULATED chains.** For ST dependencies with exactly one downstream consumer refreshing in the same tick, pass the delta in-memory instead of writing/reading from the `changes_pgt_` buffer table. Eliminates 2× SPI DML per hop (~20 ms savings per hop for 10K-row deltas). | 3–4 wk | [PLAN_DAG_PERFORMANCE.md §8.3](plans/performance/PLAN_DAG_PERFORMANCE.md) |
+| DAG-5 | **ST buffer batch coalescing.** Apply net-effect computation to ST change buffers before downstream reads — cancel INSERT/DELETE pairs for the same `__pgt_row_id` that accumulate between reads during rapid-fire upstream refreshes. Adapts existing `compute_net_effect()` logic to the ST buffer schema. | 1–2 wk | [PLAN_DAG_PERFORMANCE.md §8.5](plans/performance/PLAN_DAG_PERFORMANCE.md) |
+
+> **DAG refresh performance subtotal: ~8–12 weeks**
+
+> **v0.11.0 total: ~7–10 weeks (partitioning + isolation) + ~12h observability + ~14–21h default tuning + ~7–12h safety hardening + ~2–4 weeks should-ship (bitmask + fuse + external corpus) + ~4.5–6.5 weeks ST-to-ST differential + ~2–3 weeks event-driven wake + ~1–2 days correctness quick-wins + ~2–3 days documentation + ~8–12 weeks DAG performance**
 
 **Exit criteria:**
 - [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog
@@ -2070,6 +2089,11 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [ ] G16-GS/SM/MQR/GUC: ~~GETTING_STARTED restructured with progressive complexity~~; ~~DVM_OPERATORS support matrix added~~; ~~monitoring quick reference added~~; ~~CONFIGURATION.md GUC matrix added~~ — G16-SM ✅, G16-MQR ✅, G15-GUC ✅; G16-GS deferred to post-Phase 9
 - [x] ST-ST-1–6: All ST-to-ST dependencies refresh differentially when upstream has a change buffer; FULL refreshes on an upstream ST produce a pre/post I/D diff so downstream STs never cascade FULL through the chain; auto-migration creates buffers for existing ST-to-ST dependencies on upgrade; 3-level E2E chain test passes
 - [x] WAKE-1: Event-driven scheduler wake implemented; latency E2E test shows sub-50ms median response for single-source workloads — ✅ Done in v0.11.0 Phase 7
+- [ ] DAG-1: Intra-tick pipelining dispatches downstream STs immediately on upstream completion; latency benchmark shows improvement for mixed-cost DAGs
+- [ ] DAG-2: Adaptive poll interval reduces wasted wait for cheap refreshes; parallel mode competitive at $T_r \leq 20\text{ms}$
+- [ ] DAG-3: Delta amplification detection emits WARNING when output/input ratio exceeds threshold; `explain_st()` exposes amplification metrics
+- [ ] DAG-4: ST buffer bypass eliminates buffer I/O for single-consumer CALCULATED chains; benchmark shows per-hop savings
+- [ ] DAG-5: ST buffer batch coalescing cancels redundant I/D pairs; verified under rapid-fire upstream refresh workload
 - [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)
 
 ---
@@ -2266,6 +2290,12 @@ large design changes; all build on existing infrastructure.
 | ~~PERF-5~~ | ~~**Wider changed-column bitmask (>63 columns).**~~ ➡️ Pulled forward to v0.11.0 as WB-1/WB-2. | — | [REPORT_OVERALL_STATUS.md §R13](plans/performance/REPORT_OVERALL_STATUS.md) |
 
 > **Performance defaults subtotal: ~1–3 weeks**
+
+### DAG Refresh Performance Improvements (from PLAN_DAG_PERFORMANCE.md §8)
+
+> ➡️ **Moved to v0.11.0** — these items build directly on the ST-to-ST
+> differential infrastructure shipped in v0.11.0 Phase 8 and are most
+> impactful while that work is fresh.
 
 
 > **v0.12.0 total: ~18–27 weeks + ~6–8 weeks scalability + ~1–3 weeks defaults + ~3–5 weeks developer tooling & observability**
