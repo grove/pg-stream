@@ -3135,6 +3135,7 @@ mod tests {
             fuse_sensitivity: None,
             blown_at: None,
             blow_reason: None,
+            st_partition_key: None,
         }
     }
 

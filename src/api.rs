@@ -149,6 +149,7 @@ fn create_stream_table(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
+    partition_by: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_impl(
         name,
@@ -161,6 +162,7 @@ fn create_stream_table(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -186,6 +188,7 @@ fn create_stream_table_if_not_exists(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
+    partition_by: default!(Option<&str>, "NULL"),
 ) {
     let result = create_stream_table_if_not_exists_impl(
         name,
@@ -198,6 +201,7 @@ fn create_stream_table_if_not_exists(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -216,6 +220,7 @@ fn create_stream_table_if_not_exists_impl(
     cdc_mode: Option<&str>,
     append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -239,6 +244,7 @@ fn create_stream_table_if_not_exists_impl(
             cdc_mode,
             append_only,
             pooler_compatibility_mode,
+            partition_by,
         ),
         Err(e) => Err(e),
     }
@@ -269,6 +275,7 @@ fn create_or_replace_stream_table(
     cdc_mode: default!(Option<&str>, "NULL"),
     append_only: default!(bool, false),
     pooler_compatibility_mode: default!(bool, false),
+    partition_by: default!(Option<&str>, "NULL"),
 ) {
     let result = create_or_replace_stream_table_impl(
         name,
@@ -281,6 +288,7 @@ fn create_or_replace_stream_table(
         cdc_mode,
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     );
     if let Err(e) = result {
         raise_error_with_context(e);
@@ -412,6 +420,7 @@ fn create_or_replace_stream_table_impl(
     cdc_mode: Option<&str>,
     append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let (schema, table_name) = parse_qualified_name(name)?;
 
@@ -497,6 +506,7 @@ fn create_or_replace_stream_table_impl(
                 cdc_mode,
                 append_only,
                 pooler_compatibility_mode,
+                partition_by,
             )
         }
         Err(e) => Err(e),
@@ -1100,6 +1110,7 @@ fn insert_catalog_and_deps(
     requested_cdc_mode: Option<&str>,
     is_append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<i64, PgTrickleError> {
     let pgt_id = StreamTableMeta::insert(
         pgt_relid,
@@ -1121,6 +1132,7 @@ fn insert_catalog_and_deps(
         requested_cdc_mode,
         is_append_only,
         pooler_compatibility_mode,
+        partition_by,
     )?;
 
     // Build per-source column usage map
@@ -2031,6 +2043,7 @@ fn create_stream_table_impl(
     requested_cdc_mode: Option<&str>,
     append_only: bool,
     pooler_compatibility_mode: bool,
+    partition_by: Option<&str>,
 ) -> Result<(), PgTrickleError> {
     let is_auto = RefreshMode::is_auto_str(refresh_mode_str);
     let mut refresh_mode = RefreshMode::from_str(refresh_mode_str)?;
@@ -2162,6 +2175,21 @@ fn create_stream_table_impl(
         )));
     }
 
+    // A1-1: Validate partition_by if provided.
+    if let Some(pk) = partition_by {
+        validate_partition_key(pk, &vq.columns)?;
+        // Partitioned stream tables with IMMEDIATE refresh are not supported —
+        // IMMEDIATE triggers fire at DML time and the partition-key range is
+        // not known until the delta is accumulated.
+        if refresh_mode.is_immediate() {
+            return Err(PgTrickleError::InvalidArgument(
+                "partition_by is not supported with IMMEDIATE refresh mode. \
+                 Use DIFFERENTIAL or AUTO refresh mode."
+                    .to_string(),
+            ));
+        }
+    }
+
     // Cycle detection
     check_for_cycles(&vq.source_relids)?;
 
@@ -2214,6 +2242,7 @@ fn create_stream_table_impl(
         requested_cdc_mode_override.as_deref(),
         append_only,
         pooler_compatibility_mode,
+        partition_by,
     )?;
 
     // ── Phase 2: CDC / IVM trigger setup ──
@@ -4959,6 +4988,38 @@ fn parse_qualified_name(name: &str) -> Result<(String, String), PgTrickleError> 
     }
 }
 
+/// A1-1: Validate the `partition_by` column name against the stream table's
+/// SELECT output columns.
+///
+/// Checks:
+/// 1. The supplied column name is non-empty.
+/// 2. The column appears in the stream table's SELECT output (from `columns`).
+///
+/// A valid partition key ensures the refresh path can inject a range predicate
+/// (A1-3) and that the partitioned storage table can be created correctly.
+fn validate_partition_key(
+    partition_key: &str,
+    columns: &[ColumnDef],
+) -> Result<(), PgTrickleError> {
+    let trimmed = partition_key.trim();
+    if trimmed.is_empty() {
+        return Err(PgTrickleError::InvalidArgument(
+            "partition_by must be a non-empty column name".to_string(),
+        ));
+    }
+    let found = columns.iter().any(|c| c.name.eq_ignore_ascii_case(trimmed));
+    if !found {
+        let available: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        return Err(PgTrickleError::InvalidArgument(format!(
+            "partition_by column '{}' is not in the stream table's SELECT output. \
+             Available columns: {}",
+            trimmed,
+            available.join(", "),
+        )));
+    }
+    Ok(())
+}
+
 /// Column metadata from a defining query.
 #[derive(Debug, Clone)]
 pub struct ColumnDef {
@@ -7143,6 +7204,7 @@ mod tests {
             fuse_sensitivity: None,
             blown_at: None,
             blow_reason: None,
+            st_partition_key: None,
         }
     }
 

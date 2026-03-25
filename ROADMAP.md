@@ -3,7 +3,7 @@
 > **Last updated:** 2026-03-26
 > **Latest release:** 0.10.0 (2026-03-25)
 > **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
-> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (PR #282, Prometheus/Grafana) · Phase 4 ✅ (PR #283, correctness guards) · Phase 5 ✅ (PR #284, VARBIT bitmask) · Phase 6 ✅ (PR #285, fuse circuit breaker) · Phase 7 ✅ (PR #286, event-driven wake)
+> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (PR #282, Prometheus/Grafana) · Phase 4 ✅ (PR #283, correctness guards) · Phase 5 ✅ (PR #284, VARBIT bitmask) · Phase 6 ✅ (PR #285, fuse circuit breaker) · Phase 7 ✅ (PR #286, event-driven wake) · Partitioning Spike ✅ (STRETCH-1 RFC + A1-1 catalog+DDL)
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -2039,15 +2039,19 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| STRETCH-1 | **Partitioned stream tables — design spike only.** Produce a written implementation plan (2–4 days) before committing to A1-1. Validates partition-key predicate injection, per-partition MERGE loop feasibility, and catalog requirements. Full A-1 implementation only starts if the spike is complete and the RFC is approved. | 2–4d | [PLAN_NEW_STUFF.md §A-1](plans/performance/PLAN_NEW_STUFF.md) |
+| ~~STRETCH-1~~ | ~~**Partitioned stream tables — design spike only.**~~ ✅ Done in v0.11.0 Partitioning Spike — RFC written ([PLAN_PARTITIONING_SPIKE.md](plans/PLAN_PARTITIONING_SPIKE.md)), go/no-go decision: **Go**. A1-1 implemented (catalog column, API parameter, validation). | 2–4d | [PLAN_PARTITIONING_SPIKE.md](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-1 | ~~**DDL: `CREATE STREAM TABLE … PARTITION BY`; `st_partition_key` catalog column.**~~ ✅ Done — `partition_by` parameter added to all three `create_stream_table*` functions; `st_partition_key TEXT` column in catalog; `validate_partition_key()` validates column exists in output. | 1–2 wk | [PLAN_PARTITIONING_SPIKE.md](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-2 | Delta min/max inspection: `extract_partition_range()` in `refresh.rs`; scans delta CTE for `MIN/MAX(partition_key_column)` per tick | 1 wk | [PLAN_PARTITIONING_SPIKE.md §8](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-3 | MERGE rewrite: inject `AND tgt.<key> BETWEEN :min AND :max` into ON clause when `st_partition_key` is set | 2–3 wk | [PLAN_PARTITIONING_SPIKE.md §8](plans/PLAN_PARTITIONING_SPIKE.md) |
+| A1-4 | E2E benchmarks: 10M-row partitioned ST, 0.1%/0.2%/100% change rate scenarios; EXPLAIN-based partition-scan verification | 1 wk | [PLAN_PARTITIONING_SPIKE.md §9](plans/PLAN_PARTITIONING_SPIKE.md) |
 
-> **Stretch subtotal: 2–4 days (STRETCH-1 spike)**
+> **Stretch subtotal: STRETCH-1 + A1-1 ✅ Complete; A1-2 through A1-4 pending (~4–5 weeks)**
 
 > **v0.11.0 total: ~7–10 weeks (partitioning + isolation) + ~12h observability + ~14–21h default tuning + ~7–12h safety hardening + ~2–4 weeks should-ship (bitmask + fuse + external corpus) + ~4.5–6.5 weeks ST-to-ST differential + ~2–3 weeks event-driven wake + ~1–2 days correctness quick-wins + ~2–3 days documentation**
 
 **Exit criteria:**
-- [ ] Declaratively partitioned stream tables accepted; partition key tracked in catalog
-- [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction)
+- [x] Declaratively partitioned stream tables accepted; partition key tracked in catalog — ✅ Done in v0.11.0 Partitioning Spike (STRETCH-1 RFC + A1-1)
+- [ ] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction) — pending A1-2/A1-3/A1-4
 - [ ] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle
 - [ ] Prometheus queries + alerting rules + Grafana dashboard shipped — ✅ Done in v0.11.0 Phase 3 (`monitoring/` directory)
 - [x] DEF-1: `parallel_refresh_mode` default is `'on'`; unit test updated — ✅ Done in v0.11.0 Phase 1 (concurrent-refresh E2E test still pending)

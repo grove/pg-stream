@@ -272,6 +272,7 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     fuse_sensitivity INT,
     blown_at        TIMESTAMPTZ,
     blow_reason     TEXT,
+    st_partition_key TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
