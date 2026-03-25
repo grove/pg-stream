@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
     scc_id          INT,
     last_fixpoint_iterations INT,
     pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE,
+    refresh_tier    TEXT NOT NULL DEFAULT 'hot'
+                     CHECK (refresh_tier IN ('hot', 'warm', 'cold', 'frozen')),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -332,7 +334,8 @@ SELECT
      FROM pgtrickle.pgt_dependencies d
      WHERE d.pgt_id = st.pgt_id AND d.source_type = 'TABLE') AS cdc_modes,
     st.scc_id,
-    st.last_fixpoint_iterations
+    st.last_fixpoint_iterations,
+    st.refresh_tier
 FROM pgtrickle.pgt_stream_tables st
 LEFT JOIN LATERAL (
     SELECT
@@ -560,7 +563,8 @@ CREATE  FUNCTION pgtrickle."alter_stream_table"(
 	"diamond_schedule_policy" TEXT DEFAULT NULL, /* core::option::Option<&str> */
 	"cdc_mode" TEXT DEFAULT NULL, /* core::option::Option<&str> */
 	"append_only" bool DEFAULT NULL, /* core::option::Option<bool> */
-	"pooler_compatibility_mode" bool DEFAULT NULL /* core::option::Option<bool> */
+	"pooler_compatibility_mode" bool DEFAULT NULL, /* core::option::Option<bool> */
+	"tier" TEXT DEFAULT NULL /* core::option::Option<&str> */
 ) RETURNS void
 
 LANGUAGE c /* Rust */
