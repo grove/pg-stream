@@ -1017,6 +1017,8 @@ fn setup_storage_table(
     sum2_aux_columns: &[(String, String)],
     covar_aux_columns: &[(String, String)],
     nonnull_aux_columns: &[(String, String)],
+    // A1-1: partition key column name, or None for non-partitioned STs.
+    partition_key: Option<&str>,
 ) -> Result<pg_sys::Oid, PgTrickleError> {
     let storage_needs_pgt_count = needs_pgt_count;
     let storage_ddl = build_create_table_sql(
@@ -1029,9 +1031,26 @@ fn setup_storage_table(
         sum2_aux_columns,
         covar_aux_columns,
         nonnull_aux_columns,
+        partition_key,
     );
     Spi::run(&storage_ddl)
         .map_err(|e| PgTrickleError::SpiError(format!("Failed to create storage table: {}", e)))?;
+
+    // A1-1: For partitioned storage tables, create a catch-all default partition
+    // so that rows are never rejected due to missing partition coverage.
+    // Users add explicit partitions via standard PostgreSQL DDL (ATTACH PARTITION).
+    if let Some(_pk) = partition_key {
+        let default_partition_sql = format!(
+            "CREATE TABLE {}.{} PARTITION OF {}.{} DEFAULT",
+            quote_identifier(schema),
+            quote_identifier(&format!("{table_name}_default")),
+            quote_identifier(schema),
+            quote_identifier(table_name),
+        );
+        Spi::run(&default_partition_sql).map_err(|e| {
+            PgTrickleError::SpiError(format!("Failed to create default partition: {}", e))
+        })?;
+    }
 
     let pgt_relid = get_table_oid(schema, table_name)?;
 
@@ -1041,6 +1060,9 @@ fn setup_storage_table(
     // index with INCLUDE clause to enable index-only scans during MERGE.
     // This eliminates the heap fetch for matched rows, giving 20-50%
     // MERGE time reduction for small-delta / large-target scenarios.
+    //
+    // A1-1: PostgreSQL does not support global UNIQUE indexes on partitioned
+    // tables. Force a non-unique index when the storage table is partitioned.
     const COVERING_INDEX_MAX_COLUMNS: usize = 8;
     let include_clause = if columns.len() <= COVERING_INDEX_MAX_COLUMNS && !columns.is_empty() {
         let include_cols: Vec<String> = columns
@@ -1051,7 +1073,8 @@ fn setup_storage_table(
     } else {
         String::new()
     };
-    let index_sql = if has_keyless_source {
+    let is_partitioned = partition_key.is_some();
+    let index_sql = if has_keyless_source || is_partitioned {
         format!(
             "CREATE INDEX ON {}.{} (__pgt_row_id){include_clause}",
             quote_identifier(schema),
@@ -1765,6 +1788,7 @@ fn alter_stream_table_query(
                 &vq.sum2_aux_columns,
                 &vq.covar_aux_columns,
                 &vq.nonnull_aux_columns,
+                None, // alter_stream_table: partition_key changes not supported
             )?
         }
     };
@@ -2210,6 +2234,7 @@ fn create_stream_table_impl(
         &vq.sum2_aux_columns,
         &vq.covar_aux_columns,
         &vq.nonnull_aux_columns,
+        partition_by,
     )?;
 
     // Insert catalog entry + dependency edges
@@ -5931,6 +5956,8 @@ fn build_create_table_sql(
     sum2_aux_columns: &[(String, String)],
     covar_aux_columns: &[(String, String)],
     nonnull_aux_columns: &[(String, String)],
+    // A1-1: when Some, emit PARTITION BY RANGE (<key>) suffix.
+    partition_key: Option<&str>,
 ) -> String {
     let col_defs: Vec<String> = columns
         .iter()
@@ -6004,8 +6031,13 @@ fn build_create_table_sql(
         ));
     }
 
+    // A1-1: partition clause — appended after the closing ')' of CREATE TABLE.
+    let partition_clause = partition_key
+        .map(|k| format!("\nPARTITION BY RANGE ({})", quote_identifier(k)))
+        .unwrap_or_default();
+
     format!(
-        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}{}{}\n)",
+        "CREATE TABLE {}.{} (\n    __pgt_row_id BIGINT,\n{}{}{}{}{}{}\n){}",
         quote_identifier(schema),
         quote_identifier(name),
         col_defs.join(",\n"),
@@ -6014,6 +6046,7 @@ fn build_create_table_sql(
         sum2_aux_sql,
         covar_aux_sql,
         nonnull_aux_sql,
+        partition_clause,
     )
 }
 
@@ -6169,7 +6202,7 @@ fn initialize_st(
 }
 
 /// Quote a SQL identifier (escape double quotes).
-fn quote_identifier(ident: &str) -> String {
+pub(crate) fn quote_identifier(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 

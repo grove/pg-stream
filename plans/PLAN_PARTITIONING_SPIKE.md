@@ -1,10 +1,10 @@
 # PLAN_PARTITIONING_SPIKE.md — Partitioned Stream Tables Design Spike (STRETCH-1)
 
-> **Status:** ✅ Spike complete — RFC approved, A1-1 implemented
+> **Status:** ✅ A1-1 + A1-2 + A1-3 complete — partitioned storage DDL + MERGE predicate injection done
 > **Date:** 2026-03-25
 > **Branch:** `0.11-partitioning-spike`
-> **Effort:** 2–4 days (spike) + 1–2 wk (A1-1)
-> **Next:** A1-2 (delta min/max inspection), A1-3 (MERGE rewrite), A1-4 (benchmarks)
+> **Effort:** 2–4 days (spike) + 1–2 wk (A1-1) + 1 wk (A1-2 + A1-3)
+> **Next:** A1-4 (E2E benchmarks — `EXPLAIN (ANALYZE, BUFFERS)` partition-pruning validation)
 
 ---
 
@@ -367,10 +367,10 @@ SELECT pgtrickle.create_stream_table(
 | Item | Description | Effort | Status |
 |------|-------------|--------|--------|
 | STRETCH-1 | This RFC document | 2–4d | ✅ Done |
-| A1-1 | DDL: `CREATE STREAM TABLE … PARTITION BY`; `st_partition_key` catalog column; partitioned storage table creation; default partition; composite PK | 1–2 wk | ✅ Done |
-| A1-2 | Delta min/max inspection: `extract_partition_range()` in `refresh.rs`; returns `None` on empty delta (fast path) | 1 wk | Not started |
-| A1-3 | MERGE rewrite: inject `AND tgt.<key> BETWEEN :min AND :max` into ON clause when `st_partition_key` is set; maintain non-partitioned path for non-partitioned STs | 2–3 wk | Not started |
-| A1-4 | E2E benchmarks: 10M-row partitioned ST, 0.1%/0.2%/100% change scenarios; EXPLAIN-based partition-scan verification | 1 wk | Not started |
+| A1-1 | DDL: `CREATE STREAM TABLE … PARTITION BY`; `st_partition_key` catalog column; partitioned storage table creation (`PARTITION BY RANGE`); default catch-all partition; non-unique `__pgt_row_id` index; composite PK | 1–2 wk | ✅ Done |
+| A1-2 | Delta min/max inspection: `extract_partition_range()` in `refresh.rs`; returns `None` on empty delta (fast path → skip MERGE) | 1 wk | ✅ Done |
+| A1-3 | MERGE rewrite: inject `AND st.<key> BETWEEN <min> AND <max>` literal into ON clause via `__PGT_PART_PRED__` placeholder; stored in `CachedMergeTemplate.delta_sql_template`; D-2 prepared statements disabled for partitioned STs | 2–3 wk | ✅ Done |
+| A1-4 | E2E benchmarks: 10M-row partitioned ST, 0.1%/0.2%/100% change scenarios; `EXPLAIN (ANALYZE, BUFFERS)` partition-scan verification | 1 wk | Not started |
 
 ---
 
