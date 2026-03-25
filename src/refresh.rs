@@ -1168,6 +1168,77 @@ pub fn determine_refresh_action(st: &StreamTableMeta, has_upstream_changes: bool
     }
 }
 
+/// G12-2: Validate stored TopK metadata fields (pure logic — no SPI/parser).
+///
+/// Returns `Ok(())` when the fields are valid, or `Err(reason)` with a
+/// human-readable message when something is inconsistent.  This can be
+/// fully unit-tested without a PostgreSQL backend.
+pub fn validate_topk_metadata_fields(
+    stored_limit: i32,
+    stored_order_by: &str,
+    stored_offset: Option<i32>,
+) -> Result<(), String> {
+    if stored_limit < 0 {
+        return Err(format!("stored topk_limit is negative ({})", stored_limit));
+    }
+    if stored_order_by.trim().is_empty() {
+        return Err("stored topk_order_by is empty".to_string());
+    }
+    if let Some(off) = stored_offset
+        && off < 0
+    {
+        return Err(format!("stored topk_offset is negative ({})", off));
+    }
+    Ok(())
+}
+
+/// G12-2: Full TopK runtime validation — validates stored fields and
+/// re-parses the reconstructed query to verify the TopK pattern.
+/// Requires a PostgreSQL backend (calls parser).
+pub fn validate_topk_metadata(
+    defining_query: &str,
+    stored_limit: i32,
+    stored_order_by: &str,
+    stored_offset: Option<i32>,
+) -> Result<(), String> {
+    validate_topk_metadata_fields(stored_limit, stored_order_by, stored_offset)?;
+
+    // Reconstruct the full query and re-parse the TopK pattern.
+    let full_query = if let Some(offset) = stored_offset {
+        format!(
+            "{} ORDER BY {} LIMIT {} OFFSET {}",
+            defining_query, stored_order_by, stored_limit, offset
+        )
+    } else {
+        format!(
+            "{} ORDER BY {} LIMIT {}",
+            defining_query, stored_order_by, stored_limit
+        )
+    };
+    match crate::dvm::detect_topk_pattern(&full_query) {
+        Ok(Some(info)) => {
+            if info.limit_value != stored_limit as i64 {
+                return Err(format!(
+                    "re-parsed LIMIT {} differs from stored topk_limit {}",
+                    info.limit_value, stored_limit,
+                ));
+            }
+            let expected_offset = stored_offset.map(|o| o as i64);
+            if info.offset_value != expected_offset {
+                return Err(format!(
+                    "re-parsed OFFSET {:?} differs from stored topk_offset {:?}",
+                    info.offset_value, stored_offset,
+                ));
+            }
+            Ok(())
+        }
+        Ok(None) => Err("reconstructed query no longer matches the TopK pattern \
+             (ORDER BY + LIMIT with constant integers)"
+            .to_string()),
+        Err(e) => Err(format!("failed to re-parse TopK pattern: {}", e)),
+    }
+}
+
 /// Execute a TopK refresh: re-execute the ORDER BY + LIMIT query and MERGE
 /// the result into the stream table.
 ///
@@ -1196,6 +1267,26 @@ pub fn execute_topk_refresh(st: &StreamTableMeta) -> Result<(i64, i64), PgTrickl
     let topk_order_by = st.topk_order_by.as_deref().ok_or_else(|| {
         PgTrickleError::InternalError("TopK stream table missing order_by metadata".into())
     })?;
+
+    // G12-2: TopK runtime validation — re-parse the reconstructed full query
+    // and verify the detected TopK pattern matches stored catalog metadata.
+    // On mismatch, fall back to FULL refresh to prevent silent correctness issues.
+    if let Err(reason) = validate_topk_metadata(
+        &st.defining_query,
+        topk_limit,
+        topk_order_by,
+        st.topk_offset,
+    ) {
+        pgrx::warning!(
+            "pg_trickle: TopK metadata inconsistency for {}.{}: {}. \
+             Falling back to FULL refresh.",
+            schema,
+            name,
+            reason,
+        );
+        set_effective_mode("FULL");
+        return execute_full_refresh(st);
+    }
 
     let quoted_table = format!(
         "\"{}\".\"{}\"",
@@ -3647,5 +3738,50 @@ mod pg_tests {
 
         Spi::run("SELECT pgtrickle.drop_stream_table('public.test_refresh_st')");
         Spi::run("DROP TABLE public.test_refresh_src CASCADE");
+    }
+
+    // ── G12-2: validate_topk_metadata_fields tests ─────────────────
+
+    #[test]
+    fn test_topk_metadata_valid() {
+        assert!(validate_topk_metadata_fields(10, "score DESC", None).is_ok());
+    }
+
+    #[test]
+    fn test_topk_metadata_valid_with_offset() {
+        assert!(validate_topk_metadata_fields(10, "score DESC", Some(5)).is_ok());
+    }
+
+    #[test]
+    fn test_topk_metadata_zero_limit() {
+        assert!(validate_topk_metadata_fields(0, "score DESC", None).is_ok());
+    }
+
+    #[test]
+    fn test_topk_metadata_negative_limit() {
+        let result = validate_topk_metadata_fields(-1, "score DESC", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("negative"));
+    }
+
+    #[test]
+    fn test_topk_metadata_empty_order_by() {
+        let result = validate_topk_metadata_fields(10, "", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_topk_metadata_whitespace_order_by() {
+        let result = validate_topk_metadata_fields(10, "   ", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn test_topk_metadata_negative_offset() {
+        let result = validate_topk_metadata_fields(10, "score DESC", Some(-3));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("negative"));
     }
 }

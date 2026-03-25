@@ -1400,4 +1400,79 @@ mod tests {
             "Non-join child (Aggregate) should use pre-change snapshot"
         );
     }
+
+    // ── G17-EC01B-NEG: ≥3-scan join subtrees must NOT use pre-change snapshot ──
+    //
+    // These tests assert the current correctness boundary: join subtrees with
+    // ≥3 scan nodes fall back to the post-change snapshot (L₁/R₁) to avoid
+    // cascading CTE materialization that exhausts temp_file_limit.
+    //
+    // This means the EC-01 phantom-row-after-DELETE bug is **still present**
+    // for these queries — the tests exist to prevent regressions that might
+    // accidentally enable pre-change snapshots for wide join trees before the
+    // underlying fix is implemented.
+    //
+    // TODO: Remove when EC01B-1/EC01B-2 fixed in v0.12.0
+
+    #[test]
+    fn test_ec01b_neg_three_way_join_no_pre_change_snapshot() {
+        // a ⋈ b ⋈ c → 3 scan nodes → must NOT use pre-change snapshot
+        let a = scan(1, "a", "public", "a", &["id", "b_id"]);
+        let b = scan(2, "b", "public", "b", &["id", "c_id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let inner = inner_join(eq_cond("b", "c_id", "c", "id"), b, c);
+        let outer = inner_join(eq_cond("a", "b_id", "b", "id"), a, inner);
+        assert_eq!(join_scan_count(&outer), 3);
+        assert!(
+            !use_pre_change_snapshot(&outer, false),
+            "≥3-scan join subtree must fall back to post-change snapshot (EC-01 boundary)"
+        );
+    }
+
+    #[test]
+    fn test_ec01b_neg_four_way_join_no_pre_change_snapshot() {
+        // a ⋈ b ⋈ c ⋈ d → 4 scan nodes
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let c = scan(3, "c", "public", "c", &["id"]);
+        let d = scan(4, "d", "public", "d", &["id"]);
+        let bc = inner_join(eq_cond("b", "id", "c", "id"), b, c);
+        let bcd = inner_join(eq_cond("c", "id", "d", "id"), bc, d);
+        let abcd = inner_join(eq_cond("a", "id", "b", "id"), a, bcd);
+        assert_eq!(join_scan_count(&abcd), 4);
+        assert!(
+            !use_pre_change_snapshot(&abcd, false),
+            "4-scan join subtree must fall back to post-change snapshot"
+        );
+    }
+
+    #[test]
+    fn test_ec01b_neg_right_subtree_three_scans() {
+        // For a join (left ⋈ right) where right has 3 scans, the right
+        // side must NOT use pre-change snapshot.
+        let r1 = scan(2, "r1", "public", "r1", &["id"]);
+        let r2 = scan(3, "r2", "public", "r2", &["id"]);
+        let r3 = scan(4, "r3", "public", "r3", &["id"]);
+        let right_inner = inner_join(eq_cond("r1", "id", "r2", "id"), r1, r2);
+        let right_outer = inner_join(eq_cond("r2", "id", "r3", "id"), right_inner, r3);
+        assert_eq!(join_scan_count(&right_outer), 3);
+        // The right subtree alone has ≥3 scans → no pre-change snapshot
+        assert!(
+            !use_pre_change_snapshot(&right_outer, false),
+            "Right subtree with 3 scans must not use pre-change snapshot"
+        );
+    }
+
+    #[test]
+    fn test_ec01b_boundary_two_scan_join_allows_pre_change_snapshot() {
+        // 2-scan join → IS allowed (the boundary is > 2)
+        let a = scan(1, "a", "public", "a", &["id"]);
+        let b = scan(2, "b", "public", "b", &["id"]);
+        let j = inner_join(eq_cond("a", "id", "b", "id"), a, b);
+        assert_eq!(join_scan_count(&j), 2);
+        assert!(
+            use_pre_change_snapshot(&j, false),
+            "2-scan join should allow pre-change snapshot"
+        );
+    }
 }

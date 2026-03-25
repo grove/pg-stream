@@ -909,6 +909,25 @@ fn validate_and_parse_query(
         }
     }
 
+    // G12-AGG: Warn when DIFFERENTIAL mode is used with group-rescan aggregates.
+    // These aggregates (STRING_AGG, ARRAY_AGG, JSON_AGG, etc.) require full
+    // re-aggregation of affected groups on every refresh, which is correct but
+    // slower than the algebraic path used by COUNT/SUM/AVG.
+    if let Some(ref pr) = parsed_tree {
+        let rescan_names = pr.tree.group_rescan_aggregate_names();
+        if !rescan_names.is_empty() {
+            let names_str = rescan_names.join(", ");
+            pgrx::warning!(
+                "pg_trickle: DIFFERENTIAL mode with group-rescan aggregates [{}]. \
+                 These aggregates re-scan affected groups from source data on each \
+                 refresh. This is correct but may be slower than algebraic aggregates \
+                 (COUNT, SUM, AVG). Use FULL mode if group-rescan performance is \
+                 unacceptable, or replace with algebraic alternatives where possible.",
+                names_str,
+            );
+        }
+    }
+
     let needs_pgt_count = parsed_tree
         .as_ref()
         .is_some_and(|pr| pr.tree.needs_pgt_count());

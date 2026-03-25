@@ -224,9 +224,14 @@ async fn test_alter_source_table_add_column() {
 
     assert_eq!(db.count("public.alter_src_st").await, 1);
 
-    // Add a column to the source table
-    db.execute("ALTER TABLE alter_src ADD COLUMN new_col INT DEFAULT 42")
-        .await;
+    // Add a column to the source table (disable the DDL guard, alter, re-enable —
+    // all on the same connection so the session-local SET is visible to the ALTER).
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE alter_src ADD COLUMN new_col INT DEFAULT 42",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     // Insert a row with the new column
     db.execute("INSERT INTO alter_src VALUES (2, 'world', 99)")

@@ -728,6 +728,19 @@ fn explain_st_impl(
                     .join(", "),
             ));
 
+            // G12-AGG: Expose per-aggregate maintenance strategies.
+            let strategies = op_tree.aggregate_strategies();
+            if !strategies.is_empty() {
+                let strategy_json: Vec<String> = strategies
+                    .iter()
+                    .map(|(alias, strategy)| format!("\"{}\": \"{}\"", alias, strategy))
+                    .collect();
+                props.push((
+                    "aggregate_strategies".to_string(),
+                    format!("{{{}}}", strategy_json.join(", ")),
+                ));
+            }
+
             // Try generating delta query
             let prev_frontier = crate::version::Frontier::new();
             let new_frontier = crate::version::Frontier::new();

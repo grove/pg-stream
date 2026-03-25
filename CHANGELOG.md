@@ -35,6 +35,25 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 <!-- 0.11.0 changes go here -->
 
+- **G12-2: TopK runtime validation.** `execute_topk_refresh()` now re-parses the
+  reconstructed full query on each refresh and verifies LIMIT/OFFSET metadata
+  matches the stored catalog values. On mismatch, falls back to FULL refresh
+  with a `WARNING` instead of silently returning incorrect results.
+
+- **G12-AGG: Group-rescan aggregate warning.** `create_stream_table()` now emits
+  a `WARNING` when DIFFERENTIAL mode is used with group-rescan aggregates
+  (`STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, etc.) that require full re-aggregation
+  of affected groups on each delta. The `explain_st()` function now includes an
+  `aggregate_strategies` property classifying each aggregate's maintenance
+  strategy (ALGEBRAIC_INVERTIBLE, ALGEBRAIC_VIA_AUX, SEMI_ALGEBRAIC, or
+  GROUP_RESCAN).
+
+- **G17-EC01B-NEG: EC-01 boundary regression tests.** Unit tests in
+  `join_common.rs` now assert that join subtrees with ≥3 scan nodes fall back
+  to the post-change snapshot (no pre-change EXCEPT ALL). This documents the
+  known EC-01 phantom-row-after-DELETE boundary and prevents accidental
+  regressions before the planned v0.12.0 fix.
+
 ---
 
 ## [0.10.0] — 2026-03-25

@@ -330,6 +330,25 @@ impl E2eDb {
         sqlx::query(sql).execute(&self.pool).await.map(|_| ())
     }
 
+    /// Execute multiple SQL statements sequentially on the **same** connection.
+    ///
+    /// Use this whenever one statement sets session state (e.g. a GUC via
+    /// `SET`) that must be visible to the next statement — a connection pool
+    /// may dispatch each `execute()` call to a different backend connection.
+    pub async fn execute_seq(&self, stmts: &[&str]) {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .expect("Failed to acquire DB connection for execute_seq");
+        for sql in stmts {
+            sqlx::query(sql)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("SQL failed: {}\nSQL: {}", e, sql));
+        }
+    }
+
     /// Reload PostgreSQL configuration and wait briefly for SIGHUP settings to apply.
     pub async fn reload_config_and_wait(&self) {
         self.execute("SELECT pg_reload_conf()").await;

@@ -568,6 +568,176 @@ pub struct AggExpr {
     pub order_within_group: Option<Vec<SortExpr>>,
 }
 
+/// G12-AGG: Classify the maintenance strategy for a single aggregate expression.
+///
+/// Returns one of:
+/// - `"ALGEBRAIC_INVERTIBLE"` — COUNT, COUNT(*), SUM
+/// - `"ALGEBRAIC_VIA_AUX"` — AVG, STDDEV, VAR, CORR, REGR_*
+/// - `"SEMI_ALGEBRAIC"` — MIN, MAX
+/// - `"GROUP_RESCAN"` — STRING_AGG, ARRAY_AGG, BIT_AND, etc.
+///
+/// DISTINCT aggregates are always classified as `"GROUP_RESCAN"` because
+/// the algebraic and semi-algebraic paths do not support DISTINCT.
+pub fn classify_agg_strategy(agg: &AggExpr) -> &'static str {
+    if agg.is_distinct {
+        return "GROUP_RESCAN";
+    }
+    match &agg.function {
+        AggFunc::Count | AggFunc::CountStar | AggFunc::Sum => "ALGEBRAIC_INVERTIBLE",
+        f if f.is_algebraic_via_aux() => "ALGEBRAIC_VIA_AUX",
+        AggFunc::Min | AggFunc::Max => "SEMI_ALGEBRAIC",
+        _ => "GROUP_RESCAN",
+    }
+}
+
+#[cfg(test)]
+mod classify_agg_strategy_tests {
+    use super::*;
+
+    fn make_agg(func: AggFunc, distinct: bool) -> AggExpr {
+        AggExpr {
+            function: func,
+            argument: None,
+            alias: "test_agg".to_string(),
+            is_distinct: distinct,
+            second_arg: None,
+            filter: None,
+            order_within_group: None,
+        }
+    }
+
+    #[test]
+    fn test_count_is_algebraic_invertible() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Count, false)),
+            "ALGEBRAIC_INVERTIBLE"
+        );
+    }
+
+    #[test]
+    fn test_count_star_is_algebraic_invertible() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::CountStar, false)),
+            "ALGEBRAIC_INVERTIBLE"
+        );
+    }
+
+    #[test]
+    fn test_sum_is_algebraic_invertible() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Sum, false)),
+            "ALGEBRAIC_INVERTIBLE"
+        );
+    }
+
+    #[test]
+    fn test_avg_is_algebraic_via_aux() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Avg, false)),
+            "ALGEBRAIC_VIA_AUX"
+        );
+    }
+
+    #[test]
+    fn test_stddev_pop_is_algebraic_via_aux() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::StddevPop, false)),
+            "ALGEBRAIC_VIA_AUX"
+        );
+    }
+
+    #[test]
+    fn test_corr_is_algebraic_via_aux() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Corr, false)),
+            "ALGEBRAIC_VIA_AUX"
+        );
+    }
+
+    #[test]
+    fn test_min_is_semi_algebraic() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Min, false)),
+            "SEMI_ALGEBRAIC"
+        );
+    }
+
+    #[test]
+    fn test_max_is_semi_algebraic() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Max, false)),
+            "SEMI_ALGEBRAIC"
+        );
+    }
+
+    #[test]
+    fn test_string_agg_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::StringAgg, false)),
+            "GROUP_RESCAN"
+        );
+    }
+
+    #[test]
+    fn test_array_agg_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::ArrayAgg, false)),
+            "GROUP_RESCAN"
+        );
+    }
+
+    #[test]
+    fn test_json_agg_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::JsonAgg, false)),
+            "GROUP_RESCAN"
+        );
+    }
+
+    #[test]
+    fn test_bool_and_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::BoolAnd, false)),
+            "GROUP_RESCAN"
+        );
+    }
+
+    #[test]
+    fn test_user_defined_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(
+                AggFunc::UserDefined("custom_agg(x)".into()),
+                false
+            )),
+            "GROUP_RESCAN",
+        );
+    }
+
+    #[test]
+    fn test_distinct_count_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Count, true)),
+            "GROUP_RESCAN"
+        );
+    }
+
+    #[test]
+    fn test_distinct_sum_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Sum, true)),
+            "GROUP_RESCAN"
+        );
+    }
+
+    #[test]
+    fn test_mode_is_group_rescan() {
+        assert_eq!(
+            classify_agg_strategy(&make_agg(AggFunc::Mode, false)),
+            "GROUP_RESCAN"
+        );
+    }
+}
+
 /// Sort expression for ORDER BY or window functions.
 #[derive(Debug, Clone)]
 pub struct SortExpr {
@@ -1911,6 +2081,47 @@ impl OpTree {
                 oids
             }
         }
+    }
+
+    /// G12-AGG: Classify the maintenance strategy for each aggregate in the
+    /// tree.  Returns a list of `(alias, strategy)` pairs.
+    ///
+    /// Strategies:
+    /// - `"ALGEBRAIC_INVERTIBLE"` — COUNT, COUNT(*), SUM: O(1) algebraic delta.
+    /// - `"ALGEBRAIC_VIA_AUX"` — AVG, STDDEV, VAR, CORR, REGR_*: maintained via
+    ///   auxiliary columns on the storage table.
+    /// - `"SEMI_ALGEBRAIC"` — MIN, MAX: algebraic for inserts, group-rescan on
+    ///   extremum deletion.
+    /// - `"GROUP_RESCAN"` — STRING_AGG, ARRAY_AGG, JSON_AGG, etc.: any change
+    ///   in the group triggers full re-aggregation from source data.
+    ///
+    /// Returns an empty vec when there is no `Aggregate` node.
+    pub fn aggregate_strategies(&self) -> Vec<(String, &'static str)> {
+        match self {
+            OpTree::Aggregate { aggregates, .. } => aggregates
+                .iter()
+                .map(|agg| {
+                    let strategy = classify_agg_strategy(agg);
+                    (agg.alias.clone(), strategy)
+                })
+                .collect(),
+            OpTree::Project { child, .. }
+            | OpTree::Filter { child, .. }
+            | OpTree::Subquery { child, .. }
+            | OpTree::Window { child, .. }
+            | OpTree::Distinct { child } => child.aggregate_strategies(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// G12-AGG: Return the names of group-rescan aggregates in the tree.
+    /// Used to emit a warning at `create_stream_table` time.
+    pub fn group_rescan_aggregate_names(&self) -> Vec<String> {
+        self.aggregate_strategies()
+            .into_iter()
+            .filter(|(_, strategy)| *strategy == "GROUP_RESCAN")
+            .map(|(alias, _)| alias)
+            .collect()
     }
 
     /// Collect `(table_oid, Vec<column_name>)` pairs from all Scan nodes.

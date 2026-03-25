@@ -58,13 +58,14 @@ pub mod row_id;
 pub use diff::DiffContext;
 pub use parser::{
     CteRegistry, ParseResult, TopKInfo, check_ivm_support, check_ivm_support_with_registry,
-    check_monotonicity, detect_topk_pattern, has_order_by_without_limit, parse_defining_query,
-    parse_defining_query_full, query_has_cte, query_has_recursive_cte, reject_limit_offset,
-    reject_materialized_views, reject_unsupported_constructs, rewrite_correlated_scalar_in_select,
-    rewrite_demorgan_sublinks, rewrite_distinct_on, rewrite_grouping_sets,
-    rewrite_nested_window_exprs, rewrite_rows_from, rewrite_scalar_subquery_in_where,
-    rewrite_sublinks_in_or, rewrite_views_inline, tree_worst_volatility_with_registry,
-    validate_immediate_mode_support, warn_limit_without_order_in_subqueries,
+    check_monotonicity, classify_agg_strategy, detect_topk_pattern, has_order_by_without_limit,
+    parse_defining_query, parse_defining_query_full, query_has_cte, query_has_recursive_cte,
+    reject_limit_offset, reject_materialized_views, reject_unsupported_constructs,
+    rewrite_correlated_scalar_in_select, rewrite_demorgan_sublinks, rewrite_distinct_on,
+    rewrite_grouping_sets, rewrite_nested_window_exprs, rewrite_rows_from,
+    rewrite_scalar_subquery_in_where, rewrite_sublinks_in_or, rewrite_views_inline,
+    tree_worst_volatility_with_registry, validate_immediate_mode_support,
+    warn_limit_without_order_in_subqueries,
 };
 
 use crate::error::PgTrickleError;

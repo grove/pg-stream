@@ -1912,10 +1912,10 @@ revert if needed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G12-2 | **TopK runtime validation.** The TopK refresh path in `refresh.rs` validates its `LIMIT`/`OFFSET` assumption only at creation time. Add a runtime assertion on each refresh; if the assumption is violated, fall back to FULL refresh with a `WARNING` rather than silently returning incorrect results. | ~2h | [src/refresh.rs](src/refresh.rs) |
-| G12-AGG | **Group-rescan aggregate warning.** At `create_stream_table` time, when the query uses a group-rescan aggregate (`STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, `JSONB_AGG`, `JSONB_OBJECT_AGG`, `BIT_AND`, `BIT_OR`, `BOOL_AND`, `BOOL_OR`, `XML_AGG`, `RANGE_AGG`) in `DIFFERENTIAL` mode, emit a `WARNING` explaining that these require a full re-aggregation of the group on every delta. Also expose the aggregate strategy classification in `explain_st()`. | ~3–4h | [plans/performance/REPORT_OVERALL_STATUS.md §12](plans/performance/REPORT_OVERALL_STATUS.md) |
+| ~~G12-2~~ | ~~**TopK runtime validation.**~~ ✅ Done in v0.11.0 Phase 4 — `validate_topk_metadata()` re-parses the reconstructed full query on each TopK refresh; `validate_topk_metadata_fields()` validates stored fields (pure logic, unit-testable). Falls back to FULL + `WARNING` on mismatch. 7 unit tests. | — | [src/refresh.rs](src/refresh.rs) |
+| ~~G12-AGG~~ | ~~**Group-rescan aggregate warning.**~~ ✅ Done in v0.11.0 Phase 4 — `classify_agg_strategy()` classifies each aggregate as ALGEBRAIC_INVERTIBLE / ALGEBRAIC_VIA_AUX / SEMI_ALGEBRAIC / GROUP_RESCAN. Warning emitted at `create_stream_table` time for DIFFERENTIAL + group-rescan aggs. Strategy exposed in `explain_st()` as `aggregate_strategies` JSON. 18 unit tests. | — | [src/dvm/parser.rs](src/dvm/parser.rs) |
 
-> **Correctness guards subtotal: ~5–6 hours**
+> **Correctness guards subtotal: ✅ Complete**
 
 #### Parameter & Error Hardening (G15-PV, G13-EH)
 
@@ -1930,9 +1930,9 @@ revert if needed.
 
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
-| G17-EC01B-NEG | Add a negative regression test asserting that ≥3-scan join right subtrees currently fall back to FULL refresh (not phantom-row drop). Include a `// TODO: Remove this test when EC01B-1/EC01B-2 are fixed in v0.12.0` comment. | ~2h | `tests/e2e_dvm_tests.rs` |
+| ~~G17-EC01B-NEG~~ | ~~Add a negative regression test asserting that ≥3-scan join right subtrees currently fall back to FULL refresh.~~ ✅ Done in v0.11.0 Phase 4 — 4 unit tests in `join_common.rs` covering 3-way join, 4-way join, right-subtree ≥3 scans, and 2-scan boundary. `// TODO: Remove when EC01B-1/EC01B-2 fixed in v0.12.0` | — | [src/dvm/operators/join_common.rs](src/dvm/operators/join_common.rs) |
 
-> **EC-01 boundary regression subtotal: ~2 hours**
+> **EC-01 boundary regression subtotal: ✅ Complete**
 
 #### Documentation Quick Wins (G16-GS, G16-SM, G16-MQR, G15-GUC)
 
@@ -2062,11 +2062,11 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [ ] TS1 or TS2: At least one external query corpus passes with zero correctness mismatches in DIFFERENTIAL mode
 - [x] QF-1–4: `println!` replaced with guarded `pgrx::log!()`; AUTO downgrades emit `WARNING`; `append_only` reversion verified already warns; parser invariant sites annotated — ✅ Done in v0.11.0 Phase 1
 - [x] G12-ERM: `effective_refresh_mode` column present in `pgt_stream_tables`; `explain_refresh_mode()` returns configured mode, effective mode, downgrade reason — ✅ Done in v0.11.0 Phase 2
-- [ ] G12-2: TopK path validates assumptions at refresh time; triggers FULL fallback with `WARNING` on violation
-- [ ] G12-AGG: Group-rescan aggregate warning fires at `create_stream_table` for DIFFERENTIAL mode; strategy visible in `explain_st()`
+- [x] G12-2: TopK path validates assumptions at refresh time; triggers FULL fallback with `WARNING` on violation — ✅ Done in v0.11.0 Phase 4
+- [x] G12-AGG: Group-rescan aggregate warning fires at `create_stream_table` for DIFFERENTIAL mode; strategy visible in `explain_st()` — ✅ Done in v0.11.0 Phase 4
 - [x] G15-PV: Incompatible `cdc_mode`/`refresh_mode` and `diamond_schedule_policy` combinations rejected at creation time with structured `HINT` — ✅ Done in v0.11.0 Phase 2
 - [x] G13-EH: `UnsupportedOperator`, `CycleDetected`, `UpstreamSchemaChanged`, `QueryParseError` include `DETAIL` and `HINT` fields — ✅ Done in v0.11.0 Phase 2
-- [ ] G17-EC01B-NEG: Negative regression test documents ≥3-scan fall-back behavior; linked to v0.12.0 EC01B fix
+- [x] G17-EC01B-NEG: Negative regression test documents ≥3-scan fall-back behavior; linked to v0.12.0 EC01B fix — ✅ Done in v0.11.0 Phase 4
 - [ ] G16-GS/SM/MQR/GUC: GETTING_STARTED restructured with progressive complexity; DVM_OPERATORS support matrix added; monitoring quick reference added; CONFIGURATION.md GUC matrix added
 - [ ] ST-ST-1–6: All ST-to-ST dependencies refresh differentially when upstream has a change buffer; FULL refreshes on an upstream ST produce a pre/post I/D diff so downstream STs never cascade FULL through the chain; auto-migration creates buffers for existing ST-to-ST dependencies on upgrade; 3-level E2E chain test passes
 - [ ] WAKE-1: Event-driven scheduler wake implemented; latency E2E test shows sub-50ms median response for single-source workloads
