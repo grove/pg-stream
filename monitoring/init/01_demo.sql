@@ -23,23 +23,25 @@ CREATE TABLE IF NOT EXISTS products (
 
 -- ── Stream tables ──────────────────────────────────────────────────────────
 
--- Daily sales totals per product
+-- Daily sales totals per product and day
+-- Schedule: every minute (* * * * *)
 SELECT pgtrickle.create_stream_table(
     'public.daily_sales',
     $$
         SELECT
             product,
-            date_trunc('day', created_at) AS day,
-            count(*)                       AS order_count,
-            sum(amount)                    AS total_amount
+            (date_trunc('day', created_at))::date AS day,
+            count(*) AS order_count,
+            sum(amount) AS total_amount
         FROM orders
-        GROUP BY product, date_trunc('day', created_at)
+        GROUP BY product, (date_trunc('day', created_at))::date
     $$,
-    schedule => '30 seconds',
-    refresh_mode => 'DIFFERENTIAL'
+    schedule => '* * * * *',
+    refresh_mode => 'FULL'
 );
 
 -- Hot products: top-10 by order count in last 24 h
+-- Schedule: every 5 minutes (*/5 * * * *)
 SELECT pgtrickle.create_stream_table(
     'public.hot_products',
     $$
@@ -50,7 +52,7 @@ SELECT pgtrickle.create_stream_table(
         ORDER BY order_count DESC
         LIMIT 10
     $$,
-    schedule => '1 minute',
+    schedule => '*/5 * * * *',
     refresh_mode => 'FULL'
 );
 
@@ -70,3 +72,10 @@ SELECT
     (ARRAY['Widget A', 'Widget B', 'Gadget X', 'Gadget Y'])[1 + (random()*3)::int],
     (random() * 100 + 5)::numeric(10,2)
 FROM generate_series(1, 1000);
+
+-- ── Populate stream tables ──────────────────────────────────────────────────
+
+-- Refresh both stream tables immediately so they have data
+-- and metrics will show populated tables from the start
+SELECT pgtrickle.refresh_stream_table('public.daily_sales');
+SELECT pgtrickle.refresh_stream_table('public.hot_products');

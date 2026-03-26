@@ -8,14 +8,7 @@ groups:
       # A stream table's data is more than (schedule + 5 min) old.
       # Fires once per affected table so alerting rules can route per-table.
       - alert: PgTrickleTableStale
-        expr: |
-          (
-            pg_trickle_table_stats_staleness_seconds{stale="1"} -
-            pg_trickle_table_stats_staleness_seconds{stale="1"}
-            -- staleness_seconds > 300 s (5 min) beyond the scheduled interval
-          ) == 0
-          or
-          pg_trickle_table_stats_staleness_seconds > 300
+        expr: pg_trickle_table_stats_staleness_seconds > 300
         for: 5m
         labels:
           severity: warning
