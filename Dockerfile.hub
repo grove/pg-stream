@@ -72,28 +72,26 @@ RUN mkdir -p src/bin src/dvm/operators benches && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs
 
-# Pre-fetch and compile dependencies. Docker caches this layer independently.
-# If only src/ changes on next build, this layer is skipped, saving ~10–15 min.
+# Pre-fetch dependencies. Docker caches this layer independently.
+# If only src/ changes on next build, this layer is skipped, saving 10–15 min.
+# This just warms the cargo cache; the actual compilation happens in the
+# builder stage against real source code.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    cargo fetch && \
-    cargo build --release 2>&1 | grep -v "warning:" || true
+    cargo fetch
 
 # ── Stage 3: Build the extension ────────────────────────────────────────────
 FROM build-env AS builder
 
 WORKDIR /build
 
-# Copy pre-compiled dependencies from the build-deps stage
-COPY --from=build-deps /build/target target
-COPY --from=build-deps /root/.cargo /root/.cargo
-
 # Copy source code and configuration
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY pg_trickle.control ./
 
-# Compile the extension against cached dependencies
+# Compile the extension. Cargo will automatically use cached dependencies
+# from the build-deps stage's `cargo fetch` (stored in /root/.cargo).
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo pgrx package --pg-config /usr/bin/pg_config && \
