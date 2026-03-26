@@ -63,6 +63,18 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   known EC-01 phantom-row-after-DELETE boundary and prevents accidental
   regressions before the planned v0.12.0 fix.
 
+- **DAG-3: Delta amplification detection.** After each DIFFERENTIAL refresh, the
+  input→output delta ratio is checked against `pg_trickle.delta_amplification_threshold`
+  (default 100×). When exceeded, a `WARNING` is emitted with the stream table name,
+  input/output counts, computed ratio, and tuning hint. `explain_st()` now exposes
+  `amplification_stats` JSON from the last 20 DIFFERENTIAL refreshes.
+
+- **DAG-2: Adaptive poll interval.** The fixed 200 ms parallel dispatch poll is
+  replaced with exponential backoff (20 ms → 200 ms) that resets to 20 ms on
+  worker completion. This makes parallel mode competitive with CALCULATED
+  schedule resolution for cheap refreshes ($T_r \leq 20\text{ms}$), reducing
+  wasted wait time by up to 90% in fast-completing DAGs.
+
 ---
 
 ## [0.10.0] — 2026-03-25
