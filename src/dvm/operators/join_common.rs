@@ -42,7 +42,66 @@ pub fn build_snapshot_sql(op: &OpTree) -> String {
                 table_name.replace('"', "\"\""),
             )
         }
-        OpTree::CteScan { alias, .. } => quote_ident(alias),
+        OpTree::CteScan {
+            alias,
+            body,
+            columns,
+            cte_def_aliases,
+            column_aliases,
+            ..
+        } => {
+            // Delegate to the body's snapshot when available (always in
+            // production; `None` only in unit-test stubs that never call
+            // this function).  This prevents the old bug where the CTE alias
+            // (e.g. "p") was emitted as a bare relation name, causing
+            // "relation 'p' does not exist" errors at refresh time.
+            let Some(body) = body else {
+                // Unit-test fallback — alias is not a real relation but we
+                // cannot do better without a body.
+                return quote_ident(alias);
+            };
+
+            let body_snap = build_snapshot_sql(body);
+            let body_cols = body.output_columns();
+
+            // Determine the CTE's effective output column names.
+            let effective_cols: Vec<&str> = if !column_aliases.is_empty() {
+                column_aliases.iter().map(|s| s.as_str()).collect()
+            } else if !cte_def_aliases.is_empty() {
+                cte_def_aliases.iter().map(|s| s.as_str()).collect()
+            } else {
+                columns.iter().map(|s| s.as_str()).collect()
+            };
+
+            // When body columns differ from effective CTE columns (due to
+            // CTE-level column aliases), wrap in a renaming SELECT.
+            if body_cols
+                .iter()
+                .zip(effective_cols.iter())
+                .any(|(b, e)| b.as_str() != *e)
+                || body_cols.len() != effective_cols.len()
+            {
+                let selects: Vec<String> = body_cols
+                    .iter()
+                    .zip(effective_cols.iter())
+                    .map(|(src, dst)| {
+                        if src.as_str() == *dst {
+                            quote_ident(src)
+                        } else {
+                            format!("{} AS {}", quote_ident(src), quote_ident(dst))
+                        }
+                    })
+                    .collect();
+                format!(
+                    "(SELECT {} FROM {} {})",
+                    selects.join(", "),
+                    body_snap,
+                    quote_ident(body.alias()),
+                )
+            } else {
+                body_snap
+            }
+        }
         OpTree::InnerJoin {
             condition,
             left,

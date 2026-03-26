@@ -27,6 +27,7 @@ pub fn diff_cte_scan(ctx: &mut DiffContext, op: &OpTree) -> Result<DiffResult, P
         columns: _,
         cte_def_aliases,
         column_aliases,
+        body: _,
     } = op
     else {
         return Err(PgTrickleError::InternalError(

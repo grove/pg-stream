@@ -953,6 +953,14 @@ pub enum OpTree {
         /// Column aliases from `FROM cte AS alias(c1, c2, ...)`.
         /// When non-empty, these override `cte_def_aliases` / `columns` in output.
         column_aliases: Vec<String>,
+        /// Parsed body of the CTE, stored for snapshot SQL generation.
+        ///
+        /// When this `CteScan` appears as a join child, [`build_snapshot_sql`]
+        /// recurses into `body` to produce a valid SQL expression for the
+        /// CTE's current state instead of using the alias (which is not a
+        /// real relation).  `None` only in unit-test constructions that do
+        /// not exercise the snapshot path.
+        body: Option<Box<OpTree>>,
     },
     /// Recursive CTE: `WITH RECURSIVE name AS (base UNION [ALL] recursive)`.
     ///
@@ -11093,11 +11101,12 @@ unsafe fn parse_from_item(
                 .unwrap_or_default();
 
             // Check if this CTE has already been parsed (reuse cte_id)
-            let (cte_id, columns) = if let Some(id) = cte_ctx.lookup_id(&table_name) {
+            let (cte_id, columns, body_clone) = if let Some(id) = cte_ctx.lookup_id(&table_name) {
                 // Already parsed — reuse the existing entry
                 let (_, body) = &cte_ctx.registry.entries[id];
                 let cols = body.output_columns();
-                (id, cols)
+                let body_clone = body.clone();
+                (id, cols, body_clone)
             } else {
                 // First reference — parse the CTE body and register it.
                 // Check `op` field to handle UNION ALL CTE bodies (e.g.,
@@ -11109,8 +11118,9 @@ unsafe fn parse_from_item(
                     unsafe { parse_select_stmt(cte_stmt, "", cte_ctx)? }
                 };
                 let cols = cte_tree.output_columns();
+                let body_clone = cte_tree.clone();
                 let id = cte_ctx.register(&table_name, cte_tree);
-                (id, cols)
+                (id, cols, body_clone)
             };
 
             return Ok(OpTree::CteScan {
@@ -11120,6 +11130,7 @@ unsafe fn parse_from_item(
                 columns,
                 cte_def_aliases: def_aliases,
                 column_aliases: col_aliases,
+                body: Some(Box::new(body_clone)),
             });
         }
 
@@ -16382,6 +16393,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.alias(), "t1");
     }
@@ -16395,6 +16407,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["user_id", "total"]);
     }
@@ -16408,6 +16421,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec!["uid".to_string(), "amt".to_string()],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["uid", "amt"]);
     }
@@ -16422,6 +16436,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert!(node.source_oids().is_empty());
     }
@@ -16435,6 +16450,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert!(check_ivm_support(&node).is_ok());
     }
@@ -16509,6 +16525,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let mut registry = CteRegistry::default();
         registry.entries.push((
@@ -16535,6 +16552,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let t2 = OpTree::CteScan {
             cte_id: 0,
@@ -16543,6 +16561,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let tree = OpTree::InnerJoin {
             condition: Expr::BinaryOp {
@@ -16582,6 +16601,7 @@ mod tests {
             columns: vec!["id".to_string(), "amount".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let tree = OpTree::CteScan {
             cte_id: 1,
@@ -16590,6 +16610,7 @@ mod tests {
             columns: vec!["id".to_string(), "amount".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
 
         let mut registry = CteRegistry::default();
@@ -16657,6 +16678,7 @@ mod tests {
             columns: vec!["id".to_string(), "name".to_string()],
             cte_def_aliases: vec!["a".to_string(), "b".to_string()],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["a", "b"]);
     }
@@ -16672,6 +16694,7 @@ mod tests {
             columns: vec!["id".to_string(), "name".to_string()],
             cte_def_aliases: vec!["a".to_string(), "b".to_string()],
             column_aliases: vec!["c".to_string(), "d".to_string()],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["c", "d"]);
     }
@@ -16686,6 +16709,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec!["uid".to_string(), "amt".to_string()],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["uid", "amt"]);
     }
@@ -17653,6 +17677,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(tree.row_id_key_columns(), Some(vec!["id".to_string()]));
     }
@@ -17756,6 +17781,7 @@ mod tests {
                 columns: vec![],
                 cte_def_aliases: vec![],
                 column_aliases: vec![],
+                body: None,
             }
             .node_kind(),
             "cte scan"
@@ -17975,6 +18001,7 @@ mod tests {
             columns: vec![],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert!(resolves_to_base_table(&cte));
     }
@@ -18085,6 +18112,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let mut registry = CteRegistry::default();
         registry.entries.push((
@@ -19891,6 +19919,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(tree.source_oids(), Vec::<u32>::new());
     }

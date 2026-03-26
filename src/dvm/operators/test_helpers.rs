@@ -230,6 +230,7 @@ pub fn cte_scan(
         columns: cols.into_iter().map(|c| c.to_string()).collect(),
         cte_def_aliases: cte_def_aliases.into_iter().map(|c| c.to_string()).collect(),
         column_aliases: column_aliases.into_iter().map(|c| c.to_string()).collect(),
+        body: None,
     }
 }
 
