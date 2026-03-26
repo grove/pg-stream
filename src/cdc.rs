@@ -708,6 +708,127 @@ pub fn compact_change_buffer(
     Ok(deleted)
 }
 
+/// DAG-5: Compact an ST change buffer (`changes_pgt_{pgt_id}`).
+///
+/// Applies the same net-effect computation as [`compact_change_buffer`] to
+/// ST-to-ST change buffers. During rapid-fire upstream refreshes, multiple
+/// rounds of I/D pairs for the same `pk_hash` accumulate between downstream
+/// reads. This function:
+///
+/// 1. Removes net-zero groups (INSERT followed by DELETE for the same `pk_hash`).
+/// 2. Removes intermediate rows in multi-change groups, keeping only the first
+///    and last rows per `pk_hash`.
+///
+/// Called from `execute_refresh()` before the downstream reads its ST sources'
+/// change buffers. Uses the same compaction threshold as base-table compaction.
+pub fn compact_st_change_buffer(
+    change_schema: &str,
+    pgt_id: i64,
+    prev_lsn: &str,
+    new_lsn: &str,
+) -> Result<i64, PgTrickleError> {
+    let threshold = crate::config::pg_trickle_compact_threshold();
+    if threshold <= 0 {
+        return Ok(0);
+    }
+
+    // Quick count check — skip if below threshold.
+    let pending_count: i64 = Spi::get_one::<i64>(&format!(
+        "SELECT count(*)::bigint FROM (\
+           SELECT 1 FROM \"{schema}\".changes_pgt_{id} \
+           WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn \
+           LIMIT {limit}\
+         ) __pgt_cnt",
+        schema = change_schema,
+        id = pgt_id,
+        limit = threshold + 1,
+    ))
+    .unwrap_or(Some(0))
+    .unwrap_or(0);
+
+    if pending_count <= threshold {
+        return Ok(0);
+    }
+
+    // Advisory lock keyed on pgt_id to serialise with refresh.
+    // Use a different namespace offset from base-table compaction to avoid collisions.
+    let lock_key = compact_st_advisory_lock_key(pgt_id);
+    let got_lock = Spi::get_one_with_args::<bool>(
+        "SELECT pg_try_advisory_xact_lock($1::bigint)",
+        &[lock_key.into()],
+    )
+    .unwrap_or(Some(false))
+    .unwrap_or(false);
+
+    if !got_lock {
+        pgrx::debug1!(
+            "[pg_trickle] DAG-5: skipping ST buffer compaction for changes_pgt_{} (advisory lock busy)",
+            pgt_id,
+        );
+        return Ok(0);
+    }
+
+    let compact_sql = build_st_compact_sql(change_schema, pgt_id, prev_lsn, new_lsn);
+
+    let deleted = Spi::connect_mut(|client| {
+        let result = client.update(&compact_sql, None, &[]).map_err(|e| {
+            PgTrickleError::SpiError(format!("DAG-5 ST buffer compaction failed: {}", e))
+        })?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+
+    if deleted > 0 {
+        pgrx::info!(
+            "[pg_trickle] DAG-5: compacted changes_pgt_{} — removed {} rows ({} pending → {})",
+            pgt_id,
+            deleted,
+            pending_count,
+            pending_count - deleted,
+        );
+    }
+
+    Ok(deleted)
+}
+
+/// DAG-5: Build the compaction SQL for an ST change buffer.
+///
+/// Pure function for unit-testability. Generates a DELETE that removes:
+/// - Net-zero groups: first_action='I' and last_action='D' for the same pk_hash.
+/// - Intermediate rows: all rows except the first and last per pk_hash group.
+fn build_st_compact_sql(change_schema: &str, pgt_id: i64, prev_lsn: &str, new_lsn: &str) -> String {
+    format!(
+        "DELETE FROM \"{schema}\".changes_pgt_{id} \
+         WHERE change_id IN (\
+           SELECT change_id FROM (\
+             SELECT change_id, \
+                    ROW_NUMBER() OVER (PARTITION BY pk_hash ORDER BY change_id) AS rn_asc, \
+                    ROW_NUMBER() OVER (PARTITION BY pk_hash ORDER BY change_id DESC) AS rn_desc, \
+                    FIRST_VALUE(action) OVER (\
+                      PARTITION BY pk_hash ORDER BY change_id\
+                    ) AS first_act, \
+                    LAST_VALUE(action) OVER (\
+                      PARTITION BY pk_hash ORDER BY change_id \
+                      ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING\
+                    ) AS last_act \
+             FROM \"{schema}\".changes_pgt_{id} \
+             WHERE lsn > '{prev_lsn}'::pg_lsn AND lsn <= '{new_lsn}'::pg_lsn\
+           ) __pgt_ranked \
+           WHERE (first_act = 'I' AND last_act = 'D') \
+              OR (rn_asc > 1 AND rn_desc > 1)\
+         )",
+        schema = change_schema,
+        id = pgt_id,
+    )
+}
+
+/// DAG-5: Compute the advisory lock key for ST buffer compaction.
+///
+/// Uses a different namespace offset (0x5047_5500) from base-table compaction
+/// (0x5047_5400) to avoid collisions.
+fn compact_st_advisory_lock_key(pgt_id: i64) -> i64 {
+    0x5047_5500_i64 | pgt_id
+}
+
 /// Task 3.3: Check whether the given source table's effective refresh schedule
 /// warrants auto-partitioning (>= 30 s).
 fn should_auto_partition(source_oid: pg_sys::Oid) -> bool {
@@ -2860,5 +2981,90 @@ mod tests {
     #[test]
     fn test_pk_join_empty_returns_true() {
         assert_eq!(build_pk_join_condition(&[]), "TRUE");
+    }
+
+    // ── DAG-5: ST buffer compaction tests ─────────────────────────────
+
+    #[test]
+    fn test_build_st_compact_sql_contains_table_name() {
+        let sql = build_st_compact_sql("pgtrickle_changes", 42, "0/0", "0/FFFF");
+        assert!(
+            sql.contains("changes_pgt_42"),
+            "SQL should reference the ST change buffer table, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_st_compact_sql_uses_lsn_range() {
+        let sql = build_st_compact_sql("pgtrickle_changes", 1, "0/1000", "0/2000");
+        assert!(
+            sql.contains("'0/1000'::pg_lsn"),
+            "SQL should contain prev_lsn, got: {sql}"
+        );
+        assert!(
+            sql.contains("'0/2000'::pg_lsn"),
+            "SQL should contain new_lsn, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_st_compact_sql_removes_net_zero_groups() {
+        let sql = build_st_compact_sql("pgtrickle_changes", 1, "0/0", "0/FFFF");
+        assert!(
+            sql.contains("first_act = 'I' AND last_act = 'D'"),
+            "Should remove net-zero INSERT→DELETE groups, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_st_compact_sql_removes_intermediates() {
+        let sql = build_st_compact_sql("pgtrickle_changes", 1, "0/0", "0/FFFF");
+        assert!(
+            sql.contains("rn_asc > 1 AND rn_desc > 1"),
+            "Should remove intermediate rows, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_st_compact_sql_uses_schema() {
+        let sql = build_st_compact_sql("my_schema", 99, "0/0", "0/FFFF");
+        assert!(
+            sql.contains("\"my_schema\".changes_pgt_99"),
+            "SQL should use the provided schema, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_st_compact_sql_partitions_by_pk_hash() {
+        let sql = build_st_compact_sql("pgtrickle_changes", 1, "0/0", "0/FFFF");
+        assert!(
+            sql.contains("PARTITION BY pk_hash"),
+            "Should partition by pk_hash, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_compact_st_advisory_lock_key_different_from_base_table() {
+        // ST compaction uses 0x5047_5500, base-table uses 0x5047_5400.
+        let st_key = compact_st_advisory_lock_key(42);
+        let base_key = 0x5047_5400_i64 | 42;
+        assert_ne!(
+            st_key, base_key,
+            "ST and base-table lock keys must not collide"
+        );
+    }
+
+    #[test]
+    fn test_compact_st_advisory_lock_key_embeds_pgt_id() {
+        assert_eq!(compact_st_advisory_lock_key(0), 0x5047_5500);
+        assert_eq!(compact_st_advisory_lock_key(1), 0x5047_5501);
+        assert_eq!(compact_st_advisory_lock_key(255), 0x5047_55FF);
+    }
+
+    #[test]
+    fn test_compact_st_advisory_lock_key_different_pgt_ids_differ() {
+        let k1 = compact_st_advisory_lock_key(1);
+        let k2 = compact_st_advisory_lock_key(2);
+        assert_ne!(k1, k2, "Different pgt_ids must produce different keys");
     }
 }

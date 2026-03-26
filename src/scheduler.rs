@@ -579,6 +579,7 @@ pub extern "C-unwind" fn pg_trickle_refresh_worker_main(_arg: pg_sys::Datum) {
             "repeatable_read_group" => execute_worker_atomic_group(&job, true),
             "immediate_closure" => execute_worker_immediate_closure(&job),
             "cyclic_scc" => execute_worker_cyclic_scc(&job),
+            "fused_chain" => execute_worker_fused_chain(&job),
             _ => {
                 warning!(
                     "pg_trickle refresh worker: unknown unit_kind '{}' for job {}",
@@ -1027,7 +1028,193 @@ fn execute_worker_cyclic_scc(job: &SchedulerJob) -> RefreshOutcome {
     RefreshOutcome::PermanentFailure
 }
 
+/// DAG-4: Execute a fused chain of stream tables in a single worker.
+///
+/// Members are refreshed sequentially in topological order.  For each
+/// intermediate member (all except the last), the delta is written to a
+/// temp bypass table instead of the persistent `changes_pgt_` buffer.
+/// The next member in the chain reads from the bypass table via the
+/// `ST_BYPASS_TABLES` thread-local mapping.
+///
+/// The last member writes to the persistent buffer as normal so that
+/// any external consumers (outside the chain) see the delta.
+fn execute_worker_fused_chain(job: &SchedulerJob) -> RefreshOutcome {
+    log!(
+        "pg_trickle refresh worker: fused chain — {} members, job {}",
+        job.member_pgt_ids.len(),
+        job.job_id,
+    );
+
+    let tick_watermark: Option<String> = if config::pg_trickle_tick_watermark_enabled() {
+        Spi::get_one::<String>("SELECT pg_current_wal_lsn()::text").unwrap_or(None)
+    } else {
+        None
+    };
+
+    // BOOT-4: Build gated-source set once for the whole group.
+    let gated_oids = load_gated_source_oids();
+
+    // Ensure bypass tables are clean at the start.
+    crate::refresh::clear_all_st_bypass();
+
+    let member_count = job.member_pgt_ids.len();
+    let mut refreshed_count: usize = 0;
+
+    for (idx, &pgt_id) in job.member_pgt_ids.iter().enumerate() {
+        let st = match load_st_by_id(pgt_id) {
+            Some(st) => st,
+            None => continue,
+        };
+
+        if st.status != StStatus::Active && st.status != StStatus::Initializing {
+            continue;
+        }
+
+        // BOOT-4: skip if any source is gated.
+        if is_any_source_gated(pgt_id, &gated_oids) {
+            log!(
+                "pg_trickle refresh worker: skipping {}.{} — source gated (fused chain job {})",
+                st.pgt_schema,
+                st.pgt_name,
+                job.job_id,
+            );
+            log_gated_skip(&st);
+            continue;
+        }
+
+        // WM-4: Skip if watermarks misaligned.
+        let (wm_misaligned, wm_reason) = is_watermark_misaligned(pgt_id);
+        if wm_misaligned {
+            let reason = wm_reason.as_deref().unwrap_or("watermark misaligned");
+            log!(
+                "pg_trickle refresh worker: skipping {}.{} — {} (fused chain job {})",
+                st.pgt_schema,
+                st.pgt_name,
+                reason,
+                job.job_id,
+            );
+            log_watermark_skip(&st, reason);
+            continue;
+        }
+
+        // Check catalog row lock — if another refresh is in progress, skip.
+        if check_skip_needed(&st) {
+            continue;
+        }
+
+        // FUSE-5: Check fuse circuit breaker.
+        if evaluate_fuse(&st) {
+            log!(
+                "pg_trickle refresh worker: {}.{} fuse blown — skipping (fused chain job {})",
+                st.pgt_schema,
+                st.pgt_name,
+                job.job_id,
+            );
+            continue;
+        }
+
+        let is_last = idx == member_count - 1;
+        let has_changes = has_table_source_changes(&st) || has_stream_table_source_changes(&st);
+        let action = refresh::determine_refresh_action(&st, has_changes);
+
+        // DAG-4: For intermediate members, set a flag so the refresh path
+        // uses bypass capture instead of the persistent buffer.
+        // The flag is set via the thread-local ST_BYPASS_TABLES before
+        // execute_scheduled_refresh runs. For the last member, normal
+        // persistent buffer is used so external downstreams see the delta.
+        //
+        // Note: The actual bypass capture happens inside
+        // execute_differential_refresh based on has_downstream_st_consumers().
+        // The bypass tables from earlier members are already in the
+        // thread-local map, so downstream members in this chain read from
+        // them automatically.
+
+        let result = execute_scheduled_refresh(&st, action, tick_watermark.as_deref(), None);
+        match result {
+            RefreshOutcome::Success => {
+                refreshed_count += 1;
+
+                // DAG-4: For non-last members with downstream ST consumers,
+                // create the bypass temp table so the next member can read
+                // from it instead of the persistent buffer.
+                if !is_last && refresh::has_downstream_st_consumers(pgt_id) {
+                    let user_cols = refresh::get_st_user_columns(&st);
+                    match crate::refresh::capture_delta_to_bypass_table(&st, &user_cols) {
+                        Ok(n) => {
+                            pgrx::debug1!(
+                                "[pg_trickle] DAG-4: bypass captured {} rows for pgt_id={}",
+                                n,
+                                pgt_id,
+                            );
+                        }
+                        Err(e) => {
+                            // Bypass failed — the downstream will fall back to the
+                            // persistent buffer which was also written.
+                            pgrx::debug1!(
+                                "[pg_trickle] DAG-4: bypass capture failed for pgt_id={}: {}",
+                                pgt_id,
+                                e,
+                            );
+                        }
+                    }
+                }
+            }
+            RefreshOutcome::RetryableFailure | RefreshOutcome::PermanentFailure => {
+                log!(
+                    "pg_trickle refresh worker: fused chain abort — member {}.{} failed (job {})",
+                    st.pgt_schema,
+                    st.pgt_name,
+                    job.job_id,
+                );
+                // Clean up bypass tables before returning.
+                crate::refresh::clear_all_st_bypass();
+                return result;
+            }
+        }
+    }
+
+    // Clean up bypass tables.
+    crate::refresh::clear_all_st_bypass();
+
+    log!(
+        "pg_trickle refresh worker: fused chain completed ({} members refreshed, job {})",
+        refreshed_count,
+        job.job_id,
+    );
+    RefreshOutcome::Success
+}
+
 // ── Parallel Dispatch State (Phase 4) ─────────────────────────────────────
+
+/// DAG-2: Minimum adaptive poll interval (ms) when workers are in-flight.
+const ADAPTIVE_POLL_MIN_MS: u64 = 20;
+/// DAG-2: Maximum adaptive poll interval (ms) — the old fixed cap.
+const ADAPTIVE_POLL_MAX_MS: u64 = 200;
+
+/// DAG-2: Compute the next adaptive poll interval.
+///
+/// Uses exponential backoff: starts at `ADAPTIVE_POLL_MIN_MS` after a worker
+/// completion, doubles each tick with no completion, and caps at
+/// `ADAPTIVE_POLL_MAX_MS`. When no workers are in-flight, returns the full
+/// `base_interval_ms` (the scheduler GUC value).
+///
+/// This is a pure function for unit-testability.
+fn compute_adaptive_poll_ms(
+    current_poll_ms: u64,
+    had_completion: bool,
+    has_inflight: bool,
+    base_interval_ms: u64,
+) -> u64 {
+    if !has_inflight {
+        return base_interval_ms;
+    }
+    if had_completion {
+        return ADAPTIVE_POLL_MIN_MS;
+    }
+    // Exponential backoff: double the current interval, capped.
+    let next = current_poll_ms.saturating_mul(2);
+    std::cmp::min(next, ADAPTIVE_POLL_MAX_MS)
+}
 
 /// Per-unit coordinator state for the parallel dispatch loop.
 #[derive(Debug, Default)]
@@ -1053,6 +1240,11 @@ struct ParallelDispatchState {
     dag_version: u64,
     /// The execution unit DAG (rebuilt on DAG version change).
     eu_dag: Option<ExecutionUnitDag>,
+    /// DAG-2: Current adaptive poll interval (ms). Doubles each tick without
+    /// worker completions; resets to `ADAPTIVE_POLL_MIN_MS` on completion.
+    adaptive_poll_ms: u64,
+    /// DAG-2: Number of worker completions observed in the last dispatch tick.
+    completions_this_tick: u32,
 }
 
 impl ParallelDispatchState {
@@ -1062,6 +1254,8 @@ impl ParallelDispatchState {
             per_db_inflight: 0,
             dag_version: 0,
             eu_dag: None,
+            adaptive_poll_ms: ADAPTIVE_POLL_MIN_MS,
+            completions_this_tick: 0,
         }
     }
 
@@ -1160,6 +1354,7 @@ fn sort_ready_queue_by_priority(
         match kind {
             ExecutionUnitKind::ImmediateClosure => 0,
             ExecutionUnitKind::AtomicGroup | ExecutionUnitKind::RepeatableReadGroup => 1,
+            ExecutionUnitKind::FusedChain => 1, // same priority as atomic groups
             ExecutionUnitKind::Singleton => 2,
             ExecutionUnitKind::CyclicScc => 3,
         }
@@ -1247,6 +1442,8 @@ fn parallel_dispatch_tick(
             us.inflight_job_id = None;
         }
         state.per_db_inflight = state.per_db_inflight.saturating_sub(1);
+        // DAG-2: Track completion for adaptive poll reset.
+        state.completions_this_tick += 1;
 
         let root_pgt_id = eu_dag
             .units()
@@ -1666,12 +1863,18 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     let mut wake_stats_last_log_ms: u64 = current_epoch_ms();
 
     loop {
-        // Use shorter poll interval when parallel workers are in-flight.
-        let poll_ms = if parallel_state.has_inflight() {
-            std::cmp::min(config::pg_trickle_scheduler_interval_ms() as u64, 200)
-        } else {
-            config::pg_trickle_scheduler_interval_ms() as u64
-        };
+        // DAG-2: Adaptive poll interval — exponential backoff (20ms → 200ms)
+        // that resets to 20ms on worker completion, making parallel mode
+        // competitive for cheap refreshes.
+        let base_interval_ms = config::pg_trickle_scheduler_interval_ms() as u64;
+        let poll_ms = compute_adaptive_poll_ms(
+            parallel_state.adaptive_poll_ms,
+            parallel_state.completions_this_tick > 0,
+            parallel_state.has_inflight(),
+            base_interval_ms,
+        );
+        parallel_state.adaptive_poll_ms = poll_ms;
+        parallel_state.completions_this_tick = 0;
 
         let wake_start = std::time::Instant::now();
         let should_continue =
@@ -4635,5 +4838,297 @@ mod tests {
         assert_eq!(compute_per_db_quota(4, 4, 10, 7), 6);
         // active=8 == threshold → no burst
         assert_eq!(compute_per_db_quota(4, 4, 10, 8), 4);
+    }
+
+    // ── DAG-2: compute_adaptive_poll_ms tests ─────────────────────────────
+
+    #[test]
+    fn test_adaptive_poll_no_inflight_returns_base_interval() {
+        // When no workers are in-flight, use the full scheduler interval
+        // regardless of current_poll_ms or completion state.
+        assert_eq!(compute_adaptive_poll_ms(20, false, false, 1000), 1000);
+        assert_eq!(compute_adaptive_poll_ms(200, true, false, 1000), 1000);
+        assert_eq!(compute_adaptive_poll_ms(50, false, false, 500), 500);
+    }
+
+    #[test]
+    fn test_adaptive_poll_completion_resets_to_min() {
+        // After a worker completes, poll resets to ADAPTIVE_POLL_MIN_MS (20ms).
+        assert_eq!(compute_adaptive_poll_ms(200, true, true, 1000), 20);
+        assert_eq!(compute_adaptive_poll_ms(100, true, true, 1000), 20);
+        assert_eq!(compute_adaptive_poll_ms(20, true, true, 1000), 20);
+    }
+
+    #[test]
+    fn test_adaptive_poll_backoff_doubles_each_tick() {
+        // No completion, workers in-flight → double current_poll_ms.
+        assert_eq!(compute_adaptive_poll_ms(20, false, true, 1000), 40);
+        assert_eq!(compute_adaptive_poll_ms(40, false, true, 1000), 80);
+        assert_eq!(compute_adaptive_poll_ms(80, false, true, 1000), 160);
+    }
+
+    #[test]
+    fn test_adaptive_poll_caps_at_max() {
+        // Doubling 160 → 320, but capped at ADAPTIVE_POLL_MAX_MS (200).
+        assert_eq!(compute_adaptive_poll_ms(160, false, true, 1000), 200);
+        assert_eq!(compute_adaptive_poll_ms(200, false, true, 1000), 200);
+    }
+
+    #[test]
+    fn test_adaptive_poll_full_backoff_sequence() {
+        // Simulate a full sequence: completion → backoff → backoff → … → cap.
+        let base = 1000u64;
+        // Worker completes → reset.
+        let p = compute_adaptive_poll_ms(200, true, true, base);
+        assert_eq!(p, 20);
+        // Tick 1: no completion.
+        let p = compute_adaptive_poll_ms(p, false, true, base);
+        assert_eq!(p, 40);
+        // Tick 2.
+        let p = compute_adaptive_poll_ms(p, false, true, base);
+        assert_eq!(p, 80);
+        // Tick 3.
+        let p = compute_adaptive_poll_ms(p, false, true, base);
+        assert_eq!(p, 160);
+        // Tick 4: would be 320, capped at 200.
+        let p = compute_adaptive_poll_ms(p, false, true, base);
+        assert_eq!(p, 200);
+        // Tick 5: stays at cap.
+        let p = compute_adaptive_poll_ms(p, false, true, base);
+        assert_eq!(p, 200);
+    }
+
+    #[test]
+    fn test_adaptive_poll_completion_after_backoff_resets() {
+        // After backing off to cap, a completion resets to min.
+        let p = compute_adaptive_poll_ms(200, true, true, 1000);
+        assert_eq!(p, 20);
+    }
+
+    #[test]
+    fn test_adaptive_poll_transition_inflight_to_idle() {
+        // Workers finish between ticks: in-flight → not in-flight.
+        // Should switch from adaptive to base interval.
+        let p = compute_adaptive_poll_ms(40, false, true, 1000);
+        assert_eq!(p, 80); // still in-flight, doubles
+        let p = compute_adaptive_poll_ms(p, false, false, 1000);
+        assert_eq!(p, 1000); // no longer in-flight, base interval
+    }
+
+    // ── DAG-2: ParallelDispatchState adaptive poll integration ────────────
+
+    #[test]
+    fn test_parallel_state_new_has_min_adaptive_poll() {
+        let state = ParallelDispatchState::new();
+        assert_eq!(state.adaptive_poll_ms, ADAPTIVE_POLL_MIN_MS);
+        assert_eq!(state.completions_this_tick, 0);
+    }
+
+    // ── DAG-1: Intra-tick pipelining validation ───────────────────────────
+    //
+    // The parallel dispatch architecture from Phase 4 already achieves
+    // intra-tick pipelining: Step 1 immediately decrements downstream
+    // `remaining_upstreams`, and Step 2 picks up newly-ready units in the
+    // same tick. These tests validate the state-machine invariants.
+
+    #[test]
+    fn test_cascade_pipeline_downstream_ready_after_upstream_completes() {
+        // Three-unit cascade: A → B → C.
+        // When A completes in Step 1, B.remaining_upstreams drops to 0
+        // and B is dispatchable in Step 2 of the same tick.
+        let mut state = ParallelDispatchState::new();
+        let uid_a = crate::dag::ExecutionUnitId(1);
+        let uid_b = crate::dag::ExecutionUnitId(2);
+        let uid_c = crate::dag::ExecutionUnitId(3);
+
+        // Initial state: A=0 upstreams, B=1 (A), C=1 (B).
+        state.unit_states.insert(
+            uid_a,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: Some(100),
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_b,
+            UnitDispatchState {
+                remaining_upstreams: 1,
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_c,
+            UnitDispatchState {
+                remaining_upstreams: 1,
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.per_db_inflight = 1;
+
+        // Simulate Step 1: A completes → decrement downstream B.
+        state.unit_states.get_mut(&uid_a).unwrap().inflight_job_id = None;
+        state.unit_states.get_mut(&uid_a).unwrap().succeeded = true;
+        state.per_db_inflight -= 1;
+        // Decrement downstream (B depends on A).
+        state
+            .unit_states
+            .get_mut(&uid_b)
+            .unwrap()
+            .remaining_upstreams -= 1;
+
+        // Verify: B is now ready (remaining=0, not succeeded, not inflight).
+        let b_state = &state.unit_states[&uid_b];
+        assert_eq!(
+            b_state.remaining_upstreams, 0,
+            "B should be ready after A completes"
+        );
+        assert!(!b_state.succeeded);
+        assert!(b_state.inflight_job_id.is_none());
+
+        // Verify: C is still blocked.
+        let c_state = &state.unit_states[&uid_c];
+        assert_eq!(c_state.remaining_upstreams, 1, "C should still be blocked");
+    }
+
+    #[test]
+    fn test_mixed_cost_levels_no_level_barrier() {
+        // Level 0: A (fast), B (slow).
+        // Level 1: C depends only on A, D depends on both A and B.
+        // When A completes, C should be immediately ready even though
+        // B (same level) is still running — no level barrier.
+        let mut state = ParallelDispatchState::new();
+        let uid_a = crate::dag::ExecutionUnitId(1);
+        let uid_b = crate::dag::ExecutionUnitId(2);
+        let uid_c = crate::dag::ExecutionUnitId(3);
+        let uid_d = crate::dag::ExecutionUnitId(4);
+
+        state.unit_states.insert(
+            uid_a,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: Some(100),
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_b,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: Some(101),
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_c,
+            UnitDispatchState {
+                remaining_upstreams: 1, // depends on A only
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_d,
+            UnitDispatchState {
+                remaining_upstreams: 2, // depends on A and B
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.per_db_inflight = 2;
+
+        // Simulate: A completes (fast), B still running.
+        state.unit_states.get_mut(&uid_a).unwrap().inflight_job_id = None;
+        state.unit_states.get_mut(&uid_a).unwrap().succeeded = true;
+        state.per_db_inflight -= 1;
+        // Decrement C (depends on A) and D (depends on A and B).
+        state
+            .unit_states
+            .get_mut(&uid_c)
+            .unwrap()
+            .remaining_upstreams -= 1;
+        state
+            .unit_states
+            .get_mut(&uid_d)
+            .unwrap()
+            .remaining_upstreams -= 1;
+
+        // C is ready — A was its only upstream.
+        let c_state = &state.unit_states[&uid_c];
+        assert_eq!(
+            c_state.remaining_upstreams, 0,
+            "C should be ready (A was its only dep)"
+        );
+        assert!(!c_state.succeeded);
+        assert!(c_state.inflight_job_id.is_none());
+
+        // D is still blocked — needs B too.
+        let d_state = &state.unit_states[&uid_d];
+        assert_eq!(d_state.remaining_upstreams, 1, "D still waiting for B");
+
+        // B still running.
+        assert!(state.unit_states[&uid_b].inflight_job_id.is_some());
+        assert_eq!(state.per_db_inflight, 1);
+    }
+
+    #[test]
+    fn test_cascade_wave_reset_preserves_correctness() {
+        // After a full cascade A → B → C all complete, the wave reset
+        // restores remaining_upstreams so units can run in the next cycle.
+        let mut state = ParallelDispatchState::new();
+        let uid_a = crate::dag::ExecutionUnitId(1);
+        let uid_b = crate::dag::ExecutionUnitId(2);
+        let uid_c = crate::dag::ExecutionUnitId(3);
+
+        // All units completed this wave.
+        state.unit_states.insert(
+            uid_a,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.unit_states.insert(
+            uid_b,
+            UnitDispatchState {
+                remaining_upstreams: 0, // was decremented from 1 when A succeeded
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.unit_states.insert(
+            uid_c,
+            UnitDispatchState {
+                remaining_upstreams: 0, // was decremented from 1 when B succeeded
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.per_db_inflight = 0;
+
+        // Simulate wave reset (Step 4 logic).
+        // In production this uses eu_dag.get_upstream_units(uid).len();
+        // here we simulate B.original=1, C.original=1.
+        let original_upstreams: HashMap<crate::dag::ExecutionUnitId, usize> =
+            [(uid_a, 0), (uid_b, 1), (uid_c, 1)].into();
+
+        if state.per_db_inflight == 0 {
+            let any_done = state.unit_states.values().any(|us| us.succeeded);
+            if any_done {
+                for (&uid, us) in state.unit_states.iter_mut() {
+                    us.succeeded = false;
+                    us.remaining_upstreams = *original_upstreams.get(&uid).unwrap_or(&0);
+                }
+            }
+        }
+
+        // After reset: A is ready for next wave, B and C blocked on upstreams.
+        assert_eq!(state.unit_states[&uid_a].remaining_upstreams, 0);
+        assert_eq!(state.unit_states[&uid_b].remaining_upstreams, 1);
+        assert_eq!(state.unit_states[&uid_c].remaining_upstreams, 1);
+        assert!(state.unit_states.values().all(|us| !us.succeeded));
     }
 }

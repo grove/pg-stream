@@ -158,6 +158,11 @@ pub struct DiffContext {
     /// operator reads from `changes_pgt_{pgt_id}` instead of `changes_{oid}`
     /// and uses `pgt_`-prefixed LSN placeholder tokens.
     pub st_source_pgt_ids: HashMap<u32, i64>,
+    /// DAG-4: Maps upstream pgt_id → temp bypass table name.
+    ///
+    /// When set (by fused-chain execution), `diff_scan_change_buffer` reads
+    /// from the bypass temp table instead of the persistent change buffer.
+    pub st_bypass_tables: HashMap<i64, String>,
 }
 
 impl DiffContext {
@@ -185,6 +190,7 @@ impl DiffContext {
             source_cdc_columns: HashMap::new(),
             scan_pushed_predicate: None,
             st_source_pgt_ids: HashMap::new(),
+            st_bypass_tables: HashMap::new(),
         }
     }
 
@@ -215,6 +221,7 @@ impl DiffContext {
             source_cdc_columns: HashMap::new(),
             scan_pushed_predicate: None,
             st_source_pgt_ids: HashMap::new(),
+            st_bypass_tables: HashMap::new(),
         }
     }
 

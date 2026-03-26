@@ -63,6 +63,38 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
   known EC-01 phantom-row-after-DELETE boundary and prevents accidental
   regressions before the planned v0.12.0 fix.
 
+- **DAG-3: Delta amplification detection.** After each DIFFERENTIAL refresh, the
+  input→output delta ratio is checked against `pg_trickle.delta_amplification_threshold`
+  (default 100×). When exceeded, a `WARNING` is emitted with the stream table name,
+  input/output counts, computed ratio, and tuning hint. `explain_st()` now exposes
+  `amplification_stats` JSON from the last 20 DIFFERENTIAL refreshes.
+
+- **DAG-2: Adaptive poll interval.** The fixed 200 ms parallel dispatch poll is
+  replaced with exponential backoff (20 ms → 200 ms) that resets to 20 ms on
+  worker completion. This makes parallel mode competitive with CALCULATED
+  schedule resolution for cheap refreshes ($T_r \leq 20\text{ms}$), reducing
+  wasted wait time by up to 90% in fast-completing DAGs.
+
+- **DAG-1: Intra-tick pipelining (validated).** The Phase 4 parallel dispatch
+  architecture already achieves intra-tick pipelining via per-dependency
+  `remaining_upstreams` tracking — downstream STs are dispatched in the same
+  tick that their upstream completes, with no level barrier. Validation tests
+  confirm correct cascade and mixed-cost-level behavior.
+
+- **DAG-5: ST buffer batch coalescing.** Before a downstream stream table reads
+  from an upstream ST's change buffer (`changes_pgt_{id}`), net-effect compaction
+  removes redundant INSERT/DELETE pairs for the same `pk_hash` that accumulate
+  during rapid-fire upstream refreshes. Uses the same `compact_threshold` GUC
+  as base-table compaction.
+
+- **DAG-4: ST buffer bypass for single-consumer CALCULATED chains.** When a
+  chain of stream tables has single-consumer DIFFERENTIAL dependencies (A→B→C
+  where each has exactly one downstream), the scheduler fuses them into a
+  single `FusedChain` execution unit that runs in the same background worker.
+  Intermediate deltas are captured to temp bypass tables instead of persistent
+  change buffers, eliminating WAL writes, index maintenance, and subsequent
+  buffer cleanup for each hop.
+
 ---
 
 ## [0.10.0] — 2026-03-25

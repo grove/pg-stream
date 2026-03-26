@@ -268,6 +268,9 @@ pub fn generate_delta_query(
     // ST-ST-4: Resolve which sources are STs for proper buffer table routing.
     ctx.st_source_pgt_ids = resolve_st_source_pgt_ids(&source_oids);
 
+    // DAG-4: Apply any active bypass table mappings from fused-chain execution.
+    ctx.st_bypass_tables = crate::refresh::get_st_bypass_tables();
+
     let (delta_sql, output_columns, diff_dedup) = ctx.differentiate_with_columns(&result.tree)?;
 
     Ok(DeltaQueryResult {
@@ -297,6 +300,19 @@ pub fn generate_delta_query_cached(
     pgt_schema: &str,
     pgt_name: &str,
 ) -> Result<DeltaQueryResult, PgTrickleError> {
+    // DAG-4: When bypass tables are active, the cached SQL template
+    // has the wrong table names.  Fall back to the uncached path.
+    let bypass_tables = crate::refresh::get_st_bypass_tables();
+    if !bypass_tables.is_empty() {
+        return generate_delta_query(
+            defining_query,
+            prev_frontier,
+            new_frontier,
+            pgt_schema,
+            pgt_name,
+        );
+    }
+
     let query_hash = hash_string(defining_query);
 
     // G8.1: Cross-session cache invalidation — flush if the shared

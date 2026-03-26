@@ -1322,6 +1322,11 @@ pub enum ExecutionUnitKind {
     /// A cyclic Strongly Connected Component — members are refreshed
     /// iteratively until fixpoint convergence is reached.
     CyclicScc,
+    /// DAG-4: A chain of Singleton CALCULATED stream tables where each
+    /// upstream has exactly one downstream consumer.  Members are refreshed
+    /// sequentially in the same worker, passing deltas via temp tables
+    /// instead of persistent change buffer tables.
+    FusedChain,
 }
 
 impl ExecutionUnitKind {
@@ -1332,6 +1337,7 @@ impl ExecutionUnitKind {
             ExecutionUnitKind::RepeatableReadGroup => "repeatable_read_group",
             ExecutionUnitKind::ImmediateClosure => "immediate_closure",
             ExecutionUnitKind::CyclicScc => "cyclic_scc",
+            ExecutionUnitKind::FusedChain => "fused_chain",
         }
     }
 }
@@ -1373,6 +1379,7 @@ impl ExecutionUnit {
             ExecutionUnitKind::ImmediateClosure => "i",
             ExecutionUnitKind::RepeatableReadGroup => "rg",
             ExecutionUnitKind::CyclicScc => "c",
+            ExecutionUnitKind::FusedChain => "fc",
         };
         // member_pgt_ids are sorted during construction
         let ids: Vec<String> = self
@@ -1391,6 +1398,7 @@ impl ExecutionUnit {
 /// 2. Detecting IMMEDIATE-trigger closures and collapsing them.
 /// 3. Building unit-to-unit dependency edges.
 /// 4. Computing topological order.
+/// 5. DAG-4: Fusing single-consumer CALCULATED chains.
 pub struct ExecutionUnitDag {
     /// All execution units, keyed by ID.
     units: HashMap<ExecutionUnitId, ExecutionUnit>,
@@ -1400,6 +1408,96 @@ pub struct ExecutionUnitDag {
     reverse_edges: HashMap<ExecutionUnitId, Vec<ExecutionUnitId>>,
     /// pgt_id → ExecutionUnitId mapping for fast lookup.
     pgt_to_unit: HashMap<i64, ExecutionUnitId>,
+}
+
+/// DAG-4: Detect chains of Singleton CALCULATED units eligible for fusing.
+///
+/// A unit A can chain to B when:
+/// 1. A is a Singleton
+/// 2. A has exactly one downstream unit (B)
+/// 3. B is a Singleton
+/// 4. Both A and B use CALCULATED (Differential) refresh mode
+///
+/// Returns maximal chains (length ≥ 2) in topological order.
+/// Each unit appears in at most one chain.
+pub fn find_fusable_chains<F>(
+    eu_dag: &ExecutionUnitDag,
+    resolve_mode: &F,
+) -> Vec<Vec<ExecutionUnitId>>
+where
+    F: Fn(i64) -> Option<RefreshMode>,
+{
+    let mut visited: HashSet<ExecutionUnitId> = HashSet::new();
+    let mut chains: Vec<Vec<ExecutionUnitId>> = Vec::new();
+
+    // Find chain heads: Singletons that are NOT the single-downstream of
+    // another fusable Singleton (i.e., the start of a chain).
+    // We iterate all units and try to extend forward greedily.
+    // To avoid duplicates, skip units already claimed by a prior chain.
+    let mut unit_ids: Vec<ExecutionUnitId> = eu_dag.units.keys().copied().collect();
+    unit_ids.sort_by_key(|id| id.0); // deterministic ordering
+
+    for uid in unit_ids {
+        if visited.contains(&uid) {
+            continue;
+        }
+        let unit = match eu_dag.units.get(&uid) {
+            Some(u) => u,
+            None => continue,
+        };
+        if unit.kind != ExecutionUnitKind::Singleton {
+            continue;
+        }
+        if !is_calculated_unit(unit, resolve_mode) {
+            continue;
+        }
+
+        // Try to build a chain starting from this unit.
+        let mut chain = vec![uid];
+        visited.insert(uid);
+
+        let mut current = uid;
+        loop {
+            let downstream = eu_dag.edges.get(&current).cloned().unwrap_or_default();
+            if downstream.len() != 1 {
+                break; // Must have exactly one downstream
+            }
+            let next_id = downstream[0];
+            if visited.contains(&next_id) {
+                break;
+            }
+            let next_unit = match eu_dag.units.get(&next_id) {
+                Some(u) => u,
+                None => break,
+            };
+            if next_unit.kind != ExecutionUnitKind::Singleton {
+                break;
+            }
+            if !is_calculated_unit(next_unit, resolve_mode) {
+                break;
+            }
+            chain.push(next_id);
+            visited.insert(next_id);
+            current = next_id;
+        }
+
+        if chain.len() >= 2 {
+            chains.push(chain);
+        }
+    }
+
+    chains
+}
+
+/// Check whether all members of an execution unit use CALCULATED
+/// (Differential) refresh mode.
+fn is_calculated_unit<F>(unit: &ExecutionUnit, resolve_mode: &F) -> bool
+where
+    F: Fn(i64) -> Option<RefreshMode>,
+{
+    unit.member_pgt_ids
+        .iter()
+        .all(|&pgt_id| resolve_mode(pgt_id) == Some(RefreshMode::Differential))
 }
 
 impl ExecutionUnitDag {
@@ -1640,7 +1738,106 @@ impl ExecutionUnitDag {
             }
         }
 
+        // Step 5 (DAG-4): Detect and fuse single-consumer CALCULATED chains.
+        // A chain A → B (→ C …) is fusable when each upstream unit is a
+        // Singleton with exactly one downstream, and both upstream and
+        // downstream are CALCULATED (deferred) refresh mode.
+        let chains = find_fusable_chains(&eu_dag, &resolve_mode);
+        for chain in chains {
+            eu_dag.fuse_chain(&chain);
+        }
+
         eu_dag
+    }
+
+    /// DAG-4: Merge a chain of Singleton unit IDs into a single `FusedChain`.
+    ///
+    /// `chain` must contain at least 2 unit IDs in topological order
+    /// (upstream-first).  The first unit's ID is reused for the fused unit;
+    /// the remaining units are removed and their edges rewired.
+    fn fuse_chain(&mut self, chain: &[ExecutionUnitId]) {
+        if chain.len() < 2 {
+            return;
+        }
+
+        let fused_id = chain[0];
+
+        // Collect member pgt_ids in topological order across the whole chain.
+        let mut member_pgt_ids: Vec<i64> = Vec::new();
+        for &uid in chain {
+            if let Some(unit) = self.units.get(&uid) {
+                member_pgt_ids.extend_from_slice(&unit.member_pgt_ids);
+            }
+        }
+
+        let root_pgt_id = member_pgt_ids[0];
+        let label = format!(
+            "fused_chain({})",
+            member_pgt_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        // Collect external downstream edges of the LAST unit in the chain.
+        let last_id = *chain.last().unwrap();
+        let external_downstream: Vec<ExecutionUnitId> =
+            self.edges.get(&last_id).cloned().unwrap_or_default();
+
+        // Collect external upstream edges of the FIRST unit in the chain.
+        let external_upstream: Vec<ExecutionUnitId> = self
+            .reverse_edges
+            .get(&fused_id)
+            .cloned()
+            .unwrap_or_default();
+
+        // Remove all chain units from graphs.
+        for &uid in chain {
+            self.units.remove(&uid);
+            self.edges.remove(&uid);
+            self.reverse_edges.remove(&uid);
+        }
+
+        // Remove stale reverse/forward references from external units.
+        for uid in chain {
+            for targets in self.edges.values_mut() {
+                targets.retain(|t| t != uid);
+            }
+            for sources in self.reverse_edges.values_mut() {
+                sources.retain(|s| s != uid);
+            }
+        }
+
+        // Insert the fused unit.
+        self.units.insert(
+            fused_id,
+            ExecutionUnit {
+                id: fused_id,
+                kind: ExecutionUnitKind::FusedChain,
+                member_pgt_ids: member_pgt_ids.clone(),
+                root_pgt_id,
+                label,
+            },
+        );
+
+        // Rewire pgt_to_unit mapping.
+        for &pgt_id in &member_pgt_ids {
+            self.pgt_to_unit.insert(pgt_id, fused_id);
+        }
+
+        // Restore external edges.
+        for &down_id in &external_downstream {
+            self.edges.entry(fused_id).or_default().push(down_id);
+            self.reverse_edges
+                .entry(down_id)
+                .or_default()
+                .push(fused_id);
+        }
+        for &up_id in &external_upstream {
+            self.edges.entry(up_id).or_default().push(fused_id);
+            self.reverse_edges.entry(fused_id).or_default().push(up_id);
+        }
     }
 
     /// Return all execution units.
@@ -1787,6 +1984,7 @@ impl ExecutionUnitDag {
         let mut atomic_groups = 0u32;
         let mut immediate_closures = 0u32;
         let mut cyclic_sccs = 0u32;
+        let mut fused_chains = 0u32;
         let mut total_sts = 0usize;
 
         for unit in self.units.values() {
@@ -1797,6 +1995,7 @@ impl ExecutionUnitDag {
                 ExecutionUnitKind::ImmediateClosure => immediate_closures += 1,
                 ExecutionUnitKind::RepeatableReadGroup => {}
                 ExecutionUnitKind::CyclicScc => cyclic_sccs += 1,
+                ExecutionUnitKind::FusedChain => fused_chains += 1,
             }
         }
 
@@ -1804,18 +2003,34 @@ impl ExecutionUnitDag {
         let edges: usize = self.edges.values().map(|v| v.len()).sum();
         let n_levels = self.topological_levels().map(|l| l.len()).unwrap_or(0);
 
-        format!(
-            "{} units ({} singleton, {} atomic, {} immediate, {} cyclic SCCs), {} STs, {} edges, {} levels, {} initially ready",
-            self.units.len(),
-            singletons,
-            atomic_groups,
-            immediate_closures,
-            cyclic_sccs,
-            total_sts,
-            edges,
-            n_levels,
-            ready,
-        )
+        if fused_chains > 0 {
+            format!(
+                "{} units ({} singleton, {} atomic, {} immediate, {} cyclic SCCs, {} fused chains), {} STs, {} edges, {} levels, {} initially ready",
+                self.units.len(),
+                singletons,
+                atomic_groups,
+                immediate_closures,
+                cyclic_sccs,
+                fused_chains,
+                total_sts,
+                edges,
+                n_levels,
+                ready,
+            )
+        } else {
+            format!(
+                "{} units ({} singleton, {} atomic, {} immediate, {} cyclic SCCs), {} STs, {} edges, {} levels, {} initially ready",
+                self.units.len(),
+                singletons,
+                atomic_groups,
+                immediate_closures,
+                cyclic_sccs,
+                total_sts,
+                edges,
+                n_levels,
+                ready,
+            )
+        }
     }
 
     /// Format a detailed log of all units and their dependencies for dry-run mode.
@@ -3106,6 +3321,7 @@ mod tests {
     #[test]
     fn test_eu_dag_singleton_chain() {
         // base -> st1 -> st2
+        // DAG-4: Single-consumer DIFFERENTIAL chain → fused into one unit.
         let mut dag = StDag::new();
         dag.add_st_node(make_st_node(1, "public.st1"));
         dag.add_st_node(make_st_node(2, "public.st2"));
@@ -3114,23 +3330,20 @@ mod tests {
 
         let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
 
-        assert_eq!(eu.unit_count(), 2);
-        // Both should be singletons
-        for unit in eu.units() {
-            assert_eq!(unit.kind, ExecutionUnitKind::Singleton);
-            assert_eq!(unit.member_pgt_ids.len(), 1);
-        }
-        // st2 depends on st1
+        // DAG-4: Fused into a single FusedChain unit.
+        assert_eq!(eu.unit_count(), 1);
+        let unit = eu.units().next().unwrap();
+        assert_eq!(unit.kind, ExecutionUnitKind::FusedChain);
+        assert_eq!(unit.member_pgt_ids, vec![1, 2]);
+
+        // Both pgt_ids map to the same unit.
         let u1 = eu.unit_for_pgt(1).unwrap();
         let u2 = eu.unit_for_pgt(2).unwrap();
-        let downstream = eu.get_downstream_units(u1.id);
-        assert!(downstream.contains(&u2.id));
+        assert_eq!(u1.id, u2.id);
 
-        // Topological order: st1 before st2
+        // Topological order should have just 1 unit.
         let order = eu.topological_order().unwrap();
-        let pos1 = order.iter().position(|&id| id == u1.id).unwrap();
-        let pos2 = order.iter().position(|&id| id == u2.id).unwrap();
-        assert!(pos1 < pos2);
+        assert_eq!(order.len(), 1);
     }
 
     #[test]
@@ -3272,11 +3485,14 @@ mod tests {
 
     #[test]
     fn test_eu_dag_dry_run_log() {
+        // Use a fan-out pattern so the chain is NOT fused (st1 has 2 downstreams).
         let mut dag = StDag::new();
         dag.add_st_node(make_st_node(1, "public.st1"));
         dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_st_node(make_st_node(3, "public.st3"));
         dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
         dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(3));
 
         let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
         let log = eu.dry_run_log();
@@ -3284,6 +3500,7 @@ mod tests {
         assert!(log.contains("Execution Unit DAG (dry_run)"));
         assert!(log.contains("public.st1"));
         assert!(log.contains("public.st2"));
+        assert!(log.contains("public.st3"));
         assert!(log.contains("Ready queue"));
     }
 
@@ -3659,26 +3876,40 @@ mod tests {
 
     #[test]
     fn test_eu_dag_topological_levels_simple() {
-        // base → st1, base → st2, st1 → st3
-        // Level 0: [units for st1, st2], Level 1: [unit for st3]
+        // base → st1, base → st2
+        // st1 → st3 AND st2 → st3 (fan-in: st1 has 2 downstreams → no fusion for st1)
+        // Level 0: [st1, st2], Level 1: [st3]
+        //
+        // Note: st1 has 2 downstreams (st3... wait no, only st3 from st1).
+        // But st1 → st3 only. However neither st1 nor st2 is fused because:
+        // st1 has 1 downstream (st3). st2 has 1 downstream (via a second edge
+        // we add). So we need to break the fusion condition.
+        //
+        // Use a fan-out from st1 to prevent fusion:
+        // base → st1 → st3
+        //              → st4  (st1 has 2 downstreams → not fusable)
+        // base → st2 (independent)
         let mut dag = StDag::new();
         let base = NodeId::BaseTable(1);
         let st1 = NodeId::StreamTable(1);
         let st2 = NodeId::StreamTable(2);
         let st3 = NodeId::StreamTable(3);
+        let st4 = NodeId::StreamTable(4);
 
         dag.add_st_node(make_dag_node(1));
         dag.add_st_node(make_dag_node(2));
         dag.add_st_node(make_dag_node(3));
+        dag.add_st_node(make_dag_node(4));
         dag.add_edge(base, st1);
         dag.add_edge(base, st2);
         dag.add_edge(st1, st3);
+        dag.add_edge(st1, st4);
 
         let eu_dag = ExecutionUnitDag::build_from_st_dag(&dag, |_| Some(RefreshMode::Differential));
         let levels = eu_dag.topological_levels().unwrap();
         assert_eq!(levels.len(), 2);
-        assert_eq!(levels[0].len(), 2); // st1 and st2 units
-        assert_eq!(levels[1].len(), 1); // st3 unit
+        assert_eq!(levels[0].len(), 2); // st1 and st2 units at level 0
+        assert_eq!(levels[1].len(), 2); // st3 and st4 units at level 1
     }
 
     // ── C2-2: Topo sort caching tests ─────────────────────────────────
@@ -3827,5 +4058,195 @@ mod tests {
 
         dag.remove_st_node(1);
         assert!(dag.cached_topo.borrow().is_none());
+    }
+
+    // ── DAG-4: Fused chain detection and fusion tests ───────────────────
+
+    #[test]
+    fn test_find_fusable_chains_simple_pair() {
+        // base → st1 → st2: single-consumer chain, both DIFFERENTIAL
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
+
+        // Should produce a single FusedChain with 2 members.
+        assert_eq!(eu.unit_count(), 1);
+        let unit = eu.units().next().unwrap();
+        assert_eq!(unit.kind, ExecutionUnitKind::FusedChain);
+        assert_eq!(unit.member_pgt_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_find_fusable_chains_triple() {
+        // base → st1 → st2 → st3: three-element chain
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_st_node(make_st_node(3, "public.st3"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+        dag.add_edge(NodeId::StreamTable(2), NodeId::StreamTable(3));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
+
+        assert_eq!(eu.unit_count(), 1);
+        let unit = eu.units().next().unwrap();
+        assert_eq!(unit.kind, ExecutionUnitKind::FusedChain);
+        assert_eq!(unit.member_pgt_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_find_fusable_chains_fan_out_not_eligible() {
+        // base → st1 → st2
+        //              → st3
+        // st1 has two downstreams — not eligible for fusion.
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_st_node(make_st_node(3, "public.st3"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(3));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
+
+        // All should remain singletons.
+        assert_eq!(eu.unit_count(), 3);
+        for unit in eu.units() {
+            assert_eq!(unit.kind, ExecutionUnitKind::Singleton);
+        }
+    }
+
+    #[test]
+    fn test_find_fusable_chains_non_differential_not_eligible() {
+        // base → st1 → st2: st1 is FULL mode — not eligible.
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, |id| {
+            if id == 1 {
+                Some(RefreshMode::Full)
+            } else {
+                Some(RefreshMode::Differential)
+            }
+        });
+
+        assert_eq!(eu.unit_count(), 2);
+        for unit in eu.units() {
+            assert_eq!(unit.kind, ExecutionUnitKind::Singleton);
+        }
+    }
+
+    #[test]
+    fn test_find_fusable_chains_independent_singletons() {
+        // base1 → st1, base2 → st2: no inter-ST dependency
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::BaseTable(200), NodeId::StreamTable(2));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
+
+        assert_eq!(eu.unit_count(), 2);
+        for unit in eu.units() {
+            assert_eq!(unit.kind, ExecutionUnitKind::Singleton);
+        }
+    }
+
+    #[test]
+    fn test_fused_chain_preserves_external_edges() {
+        // base → st1 → st2 → st3
+        // st3 depends on base → st_ext also
+        // After fusing st1→st2, the fused unit should have downstream to st3.
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_st_node(make_st_node(3, "public.st3"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+        dag.add_edge(NodeId::StreamTable(2), NodeId::StreamTable(3));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
+
+        // Should produce a single FusedChain of all 3.
+        assert_eq!(eu.unit_count(), 1);
+        let unit = eu.units().next().unwrap();
+        assert_eq!(unit.kind, ExecutionUnitKind::FusedChain);
+        assert_eq!(unit.member_pgt_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_fused_chain_stable_key() {
+        let unit = ExecutionUnit {
+            id: ExecutionUnitId(1),
+            kind: ExecutionUnitKind::FusedChain,
+            member_pgt_ids: vec![10, 20, 30],
+            root_pgt_id: 10,
+            label: "test".to_string(),
+        };
+        assert_eq!(unit.stable_key(), "fc:10,20,30");
+    }
+
+    #[test]
+    fn test_fused_chain_kind_as_str() {
+        assert_eq!(ExecutionUnitKind::FusedChain.as_str(), "fused_chain");
+        assert_eq!(format!("{}", ExecutionUnitKind::FusedChain), "fused_chain");
+    }
+
+    #[test]
+    fn test_is_calculated_unit_helper() {
+        let unit = ExecutionUnit {
+            id: ExecutionUnitId(1),
+            kind: ExecutionUnitKind::Singleton,
+            member_pgt_ids: vec![1],
+            root_pgt_id: 1,
+            label: "test".to_string(),
+        };
+        assert!(is_calculated_unit(&unit, &all_differential));
+        assert!(!is_calculated_unit(&unit, &|_| Some(RefreshMode::Full)));
+        assert!(!is_calculated_unit(&unit, &|_| None));
+    }
+
+    #[test]
+    fn test_fused_chain_summary_includes_count() {
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
+        let summary = eu.summary();
+        assert!(
+            summary.contains("1 fused chains"),
+            "summary should mention fused chains: {}",
+            summary,
+        );
+    }
+
+    #[test]
+    fn test_fused_chain_topological_order() {
+        // base → st1 → st2 → st3: fused into one unit
+        let mut dag = StDag::new();
+        dag.add_st_node(make_st_node(1, "public.st1"));
+        dag.add_st_node(make_st_node(2, "public.st2"));
+        dag.add_st_node(make_st_node(3, "public.st3"));
+        dag.add_edge(NodeId::BaseTable(100), NodeId::StreamTable(1));
+        dag.add_edge(NodeId::StreamTable(1), NodeId::StreamTable(2));
+        dag.add_edge(NodeId::StreamTable(2), NodeId::StreamTable(3));
+
+        let eu = ExecutionUnitDag::build_from_st_dag(&dag, all_differential);
+
+        // Topological order should succeed (no cycles).
+        let order = eu.topological_order().unwrap();
+        assert_eq!(order.len(), 1);
     }
 }

@@ -80,3 +80,24 @@ $$;
 --       range predicate to enable partition pruning during MERGE.
 ALTER TABLE pgtrickle.pgt_stream_tables
     ADD COLUMN IF NOT EXISTS st_partition_key TEXT;
+
+-- DAG-4: Widen pgt_scheduler_jobs.unit_kind CHECK to include new kinds.
+-- The table may be absent on fresh installs (created by _PG_init) but
+-- exists on upgrades.  Safe to run unconditionally.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'pgtrickle' AND c.relname = 'pgt_scheduler_jobs'
+    ) THEN
+        -- Drop the old CHECK and add a wider one.
+        ALTER TABLE pgtrickle.pgt_scheduler_jobs
+            DROP CONSTRAINT IF EXISTS pgt_scheduler_jobs_unit_kind_check;
+        ALTER TABLE pgtrickle.pgt_scheduler_jobs
+            ADD CONSTRAINT pgt_scheduler_jobs_unit_kind_check
+            CHECK (unit_kind IN ('singleton', 'atomic_group', 'immediate_closure',
+                                 'cyclic_scc', 'repeatable_read_group', 'fused_chain'));
+    END IF;
+END
+$$;

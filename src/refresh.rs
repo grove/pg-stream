@@ -149,6 +149,40 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
+// ── DAG-4: ST bypass tables for fused-chain execution ───────────────
+
+thread_local! {
+    /// Maps upstream `pgt_id` → temp bypass table name.
+    ///
+    /// When a fused-chain worker refreshes an upstream member, instead of
+    /// writing delta rows to the persistent `changes_pgt_{id}` buffer, it
+    /// creates a TEMP TABLE with the same schema and stores the mapping
+    /// here.  Downstream members in the same chain read from the temp
+    /// table via this mapping.
+    static ST_BYPASS_TABLES: RefCell<HashMap<i64, String>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Register a bypass temp table for the given upstream pgt_id.
+pub fn set_st_bypass(pgt_id: i64, temp_table: String) {
+    ST_BYPASS_TABLES.with(|m| m.borrow_mut().insert(pgt_id, temp_table));
+}
+
+/// Remove the bypass mapping for a pgt_id.
+pub fn clear_st_bypass(pgt_id: i64) {
+    ST_BYPASS_TABLES.with(|m| m.borrow_mut().remove(&pgt_id));
+}
+
+/// Clear all bypass mappings.
+pub fn clear_all_st_bypass() {
+    ST_BYPASS_TABLES.with(|m| m.borrow_mut().clear());
+}
+
+/// Return the current bypass table mappings.
+pub fn get_st_bypass_tables() -> HashMap<i64, String> {
+    ST_BYPASS_TABLES.with(|m| m.borrow().clone())
+}
+
 /// Execute any pending cleanups from previous refresh cycles.
 ///
 /// Called at the start of `execute_differential_refresh` to drain the
@@ -677,6 +711,82 @@ fn capture_delta_to_st_buffer(
     Ok(count)
 }
 
+/// DAG-4: Capture delta to a temp bypass table instead of the persistent
+/// `changes_pgt_{id}` buffer.
+///
+/// Creates `pg_temp.__pgt_bypass_{pgt_id}` (ON COMMIT DROP) with the same
+/// schema as the persistent buffer, inserts I/D rows from the delta temp
+/// table, and registers the bypass mapping so that downstream refresh
+/// reads from this temp table instead.
+///
+/// Returns the number of captured rows.
+pub fn capture_delta_to_bypass_table(
+    st: &StreamTableMeta,
+    user_cols: &[String],
+) -> Result<i64, PgTrickleError> {
+    let pgt_id = st.pgt_id;
+    let bypass_table = format!("pg_temp.__pgt_bypass_{}", pgt_id);
+
+    let sql = build_bypass_capture_sql(pgt_id, user_cols, &bypass_table);
+
+    let count = Spi::connect_mut(|client| {
+        let result = client
+            .update(&sql, None, &[])
+            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+        Ok::<i64, PgTrickleError>(result.len() as i64)
+    })?;
+
+    set_st_bypass(pgt_id, bypass_table.clone());
+
+    if count > 0 {
+        pgrx::debug1!(
+            "[pg_trickle] DAG-4: captured {} delta rows to bypass table {} for {}.{}",
+            count,
+            bypass_table,
+            st.pgt_schema,
+            st.pgt_name,
+        );
+    }
+
+    Ok(count)
+}
+
+/// Build the SQL for creating a bypass temp table and inserting delta rows.
+///
+/// Pure-logic helper for unit testing.
+pub fn build_bypass_capture_sql(pgt_id: i64, user_cols: &[String], bypass_table: &str) -> String {
+    let col_defs: String = std::iter::once("lsn pg_lsn".to_string())
+        .chain(std::iter::once("action \"char\"".to_string()))
+        .chain(std::iter::once("pk_hash bigint".to_string()))
+        .chain(
+            user_cols
+                .iter()
+                .map(|c| format!("\"new_{}\" text", c.replace('"', "\"\""))),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let new_col_list: String = user_cols
+        .iter()
+        .map(|c| format!("\"new_{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let d_col_list: String = user_cols
+        .iter()
+        .map(|c| format!("d.\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "CREATE TEMP TABLE IF NOT EXISTS {bypass_table} ({col_defs}) ON COMMIT DROP;\n\
+         INSERT INTO {bypass_table} (lsn, action, pk_hash, {new_col_list}) \
+         SELECT pg_current_wal_lsn(), d.__pgt_action, d.__pgt_row_id, {d_col_list} \
+         FROM __pgt_delta_{pgt_id} d \
+         WHERE d.__pgt_action IN ('I', 'D')"
+    )
+}
+
 /// Capture the full-refresh diff into the ST's change buffer.
 ///
 /// Called after a FULL refresh when the ST has downstream consumers.
@@ -820,7 +930,7 @@ fn capture_full_refresh_diff_to_st_buffer(
 /// Get user-facing output columns for an ST (for delta capture).
 ///
 /// Excludes internal columns (__pgt_row_id, __pgt_count, etc.).
-fn get_st_user_columns(st: &StreamTableMeta) -> Vec<String> {
+pub fn get_st_user_columns(st: &StreamTableMeta) -> Vec<String> {
     crate::cdc::resolve_st_output_columns(st.pgt_relid)
         .unwrap_or_default()
         .into_iter()
@@ -829,7 +939,7 @@ fn get_st_user_columns(st: &StreamTableMeta) -> Vec<String> {
 }
 
 /// Check whether this ST has downstream ST consumers that need delta capture.
-fn has_downstream_st_consumers(pgt_id: i64) -> bool {
+pub fn has_downstream_st_consumers(pgt_id: i64) -> bool {
     crate::cdc::count_downstream_st_consumers(pgt_id) > 0
 }
 
@@ -2327,6 +2437,39 @@ pub fn execute_differential_refresh(
             pgrx::debug1!(
                 "[pg_trickle] C-4: compaction failed for changes_{}: {}",
                 oid,
+                e,
+            );
+        }
+    }
+
+    // DAG-5: Compact ST change buffers that exceed the threshold.
+    // During rapid-fire upstream refreshes, multiple rounds of I/D pairs
+    // accumulate in changes_pgt_{id} between downstream reads. Compaction
+    // cancels net-zero INSERT/DELETE pairs and removes intermediate rows.
+    for &upstream_pgt_id in &st_source_pgt_ids {
+        if !crate::cdc::has_st_change_buffer(upstream_pgt_id, &change_schema) {
+            continue;
+        }
+        let key = format!("pgt_{upstream_pgt_id}");
+        let prev_lsn = prev_frontier
+            .sources
+            .get(&key)
+            .map(|sv| sv.lsn.clone())
+            .unwrap_or_else(|| "0/0".to_string());
+        let new_lsn = new_frontier
+            .sources
+            .get(&key)
+            .map(|sv| sv.lsn.clone())
+            .unwrap_or_else(|| "0/0".to_string());
+        if let Err(e) = crate::cdc::compact_st_change_buffer(
+            &change_schema,
+            upstream_pgt_id,
+            &prev_lsn,
+            &new_lsn,
+        ) {
+            pgrx::debug1!(
+                "[pg_trickle] DAG-5: compaction failed for changes_pgt_{}: {}",
+                upstream_pgt_id,
                 e,
             );
         }
@@ -4426,5 +4569,65 @@ mod pg_tests {
         let result = validate_topk_metadata_fields(10, "score DESC", Some(-3));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("negative"));
+    }
+
+    // ── DAG-4: Bypass capture SQL tests ─────────────────────────────────
+
+    #[test]
+    fn test_build_bypass_capture_sql_basic() {
+        let sql = build_bypass_capture_sql(
+            42,
+            &["id".to_string(), "name".to_string()],
+            "pg_temp.__pgt_bypass_42",
+        );
+        assert!(sql.contains("CREATE TEMP TABLE IF NOT EXISTS pg_temp.__pgt_bypass_42"));
+        assert!(sql.contains("ON COMMIT DROP"));
+        assert!(sql.contains("\"new_id\""));
+        assert!(sql.contains("\"new_name\""));
+        assert!(sql.contains("FROM __pgt_delta_42 d"));
+        assert!(sql.contains("d.__pgt_action IN ('I', 'D')"));
+    }
+
+    #[test]
+    fn test_build_bypass_capture_sql_quoted_columns() {
+        let sql = build_bypass_capture_sql(7, &["col\"name".to_string()], "pg_temp.__pgt_bypass_7");
+        // Column with quote should be properly escaped.
+        assert!(sql.contains(r#""new_col""name""#));
+        assert!(sql.contains(r#"d."col""name""#));
+    }
+
+    #[test]
+    fn test_build_bypass_capture_sql_column_defs() {
+        let sql = build_bypass_capture_sql(
+            1,
+            &["a".to_string(), "b".to_string()],
+            "pg_temp.__pgt_bypass_1",
+        );
+        // Verify the column definitions in CREATE TEMP TABLE.
+        assert!(sql.contains("lsn pg_lsn"));
+        assert!(sql.contains("action \"char\""));
+        assert!(sql.contains("pk_hash bigint"));
+        assert!(sql.contains("\"new_a\" text"));
+        assert!(sql.contains("\"new_b\" text"));
+    }
+
+    #[test]
+    fn test_st_bypass_thread_local_set_get_clear() {
+        clear_all_st_bypass();
+        assert!(get_st_bypass_tables().is_empty());
+
+        set_st_bypass(10, "pg_temp.__pgt_bypass_10".to_string());
+        set_st_bypass(20, "pg_temp.__pgt_bypass_20".to_string());
+
+        let tables = get_st_bypass_tables();
+        assert_eq!(tables.len(), 2);
+        assert_eq!(tables[&10], "pg_temp.__pgt_bypass_10");
+        assert_eq!(tables[&20], "pg_temp.__pgt_bypass_20");
+
+        clear_st_bypass(10);
+        assert_eq!(get_st_bypass_tables().len(), 1);
+
+        clear_all_st_bypass();
+        assert!(get_st_bypass_tables().is_empty());
     }
 }

@@ -196,13 +196,18 @@ fn diff_scan_change_buffer(
     alias: &str,
 ) -> Result<DiffResult, PgTrickleError> {
     // ST-ST-4: Use `changes_pgt_{pgt_id}` for ST sources, `changes_{oid}` for base tables.
+    // DAG-4: When a bypass table is registered (fused-chain), read from it instead.
     let is_st_source = ctx.st_source_pgt_ids.contains_key(&table_oid);
     let change_table = if let Some(&pgt_id) = ctx.st_source_pgt_ids.get(&table_oid) {
-        format!(
-            "{}.changes_pgt_{}",
-            quote_ident(&ctx.change_buffer_schema),
-            pgt_id,
-        )
+        if let Some(bypass) = ctx.st_bypass_tables.get(&pgt_id) {
+            bypass.clone()
+        } else {
+            format!(
+                "{}.changes_pgt_{}",
+                quote_ident(&ctx.change_buffer_schema),
+                pgt_id,
+            )
+        }
     } else {
         format!(
             "{}.changes_{}",
