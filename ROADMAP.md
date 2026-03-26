@@ -2186,7 +2186,7 @@ action.
 | Item | Description | Effort | Ref |
 |------|-------------|--------|-----|
 | ~~DAG-B1~~ | ~~Session 1: Infrastructure, linear chain topology builder, latency + throughput measurement drivers, reporting (ASCII/JSON), 7 benchmark tests~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.1 |
-| ~~DAG-B2~~ | ~~Session 2: Wide DAG + fan-out tree topology builders; 7 latency + throughput tests~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.2 |
+| ~~DAG-B2~~ | ~~Session 2: Wide DAG + fan-out tree topology builders; 9 latency + throughput tests (5 wide + 2 fan-out latency, 2 throughput)~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.2 |
 | ~~DAG-B3~~ | ~~Session 3: Diamond + mixed topology builders; 5 latency + throughput tests; per-level breakdown reporting~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.3 |
 | ~~DAG-B4~~ | ~~Session 4: Update `docs/BENCHMARK.md`, full suite validation run~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.4 |
 
