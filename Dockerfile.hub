@@ -25,8 +25,8 @@
 # Default GUC settings are documented in docker/pg_trickle-defaults.conf.
 # =============================================================================
 
-# ── Stage 1: Build the extension ────────────────────────────────────────────
-FROM postgres:18-bookworm AS builder
+# ── Stage 1: Prepare build environment ─────────────────────────────────────
+FROM postgres:18-bookworm AS build-env
 
 ARG VERSION=0.11.0
 
@@ -55,11 +55,14 @@ RUN cargo install --locked cargo-pgrx --version 0.17.0
 # Initialise pgrx for PostgreSQL 18 using the system pg_config
 RUN cargo pgrx init --pg18 /usr/bin/pg_config
 
-# ── Dependency caching layer ────────────────────────────────────────────────
+# ── Stage 2: Compile dependencies (cached layer) ────────────────────────────
+FROM build-env AS build-deps
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 
-# Minimal stubs so cargo can fetch deps without the full source tree.
+# Minimal stubs so cargo can compile deps without the full source tree.
+# These stubs will be replaced in the build stage below.
 RUN mkdir -p src/bin src/dvm/operators benches && \
     echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
     echo '#![allow(warnings)]' > src/lib.rs && \
@@ -69,17 +72,34 @@ RUN mkdir -p src/bin src/dvm/operators benches && \
     echo 'fn main() {}' > benches/refresh_bench.rs && \
     echo 'fn main() {}' > benches/diff_operators.rs
 
+# Pre-fetch dependencies. Docker caches this layer independently.
+# If only src/ changes on next build, this layer is skipped, saving 10–15 min.
+# This just warms the cargo cache; the actual compilation happens in the
+# builder stage against real source code.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo fetch
 
-# ── Compile the extension ────────────────────────────────────────────────────
+# ── Stage 3: Build the extension ────────────────────────────────────────────
+FROM build-env AS builder
+
+WORKDIR /build
+
+# Copy source code and configuration
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY pg_trickle.control ./
 
+# Create placeholder bench files (required by Cargo.toml but not needed for
+# extension package)
+RUN mkdir -p benches && \
+    echo 'fn main() {}' > benches/diff_operators.rs && \
+    echo 'fn main() {}' > benches/refresh_bench.rs
+
+# Compile the extension. Cargo will automatically use cached dependencies
+# from the build-deps stage's `cargo fetch` (stored in /root/.cargo).
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/build/target \
     cargo pgrx package --pg-config /usr/bin/pg_config && \
     mkdir -p /artefacts && \
     cp -r target/release/pg_trickle-pg18 /artefacts/
