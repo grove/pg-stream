@@ -135,3 +135,143 @@ pub async fn max_orderkey(db: &E2eDb) -> usize {
         .await;
     max as usize
 }
+
+/// Apply RF1 (bulk INSERT into orders + lineitem).
+pub async fn apply_rf1(db: &E2eDb, next_orderkey: usize) {
+    let sql = substitute_rf(RF1_SQL, next_orderkey);
+    exec_sql(db, &sql).await;
+}
+
+/// Apply RF2 (bulk DELETE from orders + lineitem).
+pub async fn apply_rf2(db: &E2eDb) {
+    let sql = RF2_SQL.replace("__RF_COUNT__", &rf_count().to_string());
+    exec_sql(db, &sql).await;
+}
+
+/// Apply RF3 (targeted UPDATEs).
+pub async fn apply_rf3(db: &E2eDb) {
+    let sql = RF3_SQL.replace("__RF_COUNT__", &rf_count().to_string());
+    exec_sql(db, &sql).await;
+}
+
+/// Assert that a stream table is multiset-equal to its defining query.
+///
+/// Returns `Ok(())` on match; `Err(description)` with diagnostic details on
+/// mismatch so the caller can decide whether to soft-skip or hard-fail.
+///
+/// Also checks for negative `__pgt_count` (over-retraction bug).
+pub async fn assert_invariant(
+    db: &E2eDb,
+    st_name: &str,
+    query: &str,
+    qname: &str,
+    cycle: usize,
+) -> Result<(), String> {
+    let st_table = format!("public.{st_name}");
+
+    let cols: String = db
+        .query_scalar(&format!(
+            "SELECT string_agg(column_name, ', ' ORDER BY ordinal_position) \
+             FROM information_schema.columns \
+             WHERE (table_schema || '.' || table_name = 'public.{st_name}' \
+                OR table_name = '{st_name}') \
+             AND left(column_name, 6) <> '__pgt_'"
+        ))
+        .await;
+
+    // Negative __pgt_count guard (over-retraction).
+    let has_pgt_count: bool = db
+        .query_scalar(&format!(
+            "SELECT EXISTS ( \
+                SELECT 1 FROM information_schema.columns \
+                WHERE table_name = '{st_name}' \
+                  AND column_name = '__pgt_count' \
+            )"
+        ))
+        .await;
+    if has_pgt_count {
+        let neg_count: i64 = db
+            .query_scalar(&format!(
+                "SELECT count(*) FROM {st_table} WHERE __pgt_count < 0"
+            ))
+            .await;
+        if neg_count > 0 {
+            return Err(format!(
+                "NEGATIVE __pgt_count: {qname} cycle {cycle} — \
+                 {neg_count} rows with __pgt_count < 0 (over-retraction bug)"
+            ));
+        }
+    }
+
+    // Multiset equality via symmetric EXCEPT ALL.
+    let matches: bool = db
+        .query_scalar(&format!(
+            "SELECT NOT EXISTS ( \
+                (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) \
+                UNION ALL \
+                (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) \
+            )"
+        ))
+        .await;
+
+    if matches {
+        return Ok(());
+    }
+
+    // Collect diagnostics.
+    let st_count: i64 = db
+        .query_scalar(&format!("SELECT count(*) FROM {st_table}"))
+        .await;
+    let q_count: i64 = db
+        .query_scalar(&format!("SELECT count(*) FROM ({query}) _q"))
+        .await;
+    let extra: i64 = db
+        .query_scalar(&format!(
+            "SELECT count(*) FROM \
+             (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) _x"
+        ))
+        .await;
+    let missing: i64 = db
+        .query_scalar(&format!(
+            "SELECT count(*) FROM \
+             (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) _x"
+        ))
+        .await;
+
+    let extra_rows: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT row_to_json(x)::text FROM \
+         (SELECT {cols} FROM {st_table} EXCEPT ALL ({query})) x \
+         LIMIT 5"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
+
+    let missing_rows: Vec<(String,)> = sqlx::query_as(&format!(
+        "SELECT row_to_json(x)::text FROM \
+         (({query}) EXCEPT ALL SELECT {cols} FROM {st_table}) x \
+         LIMIT 5"
+    ))
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
+
+    if !extra_rows.is_empty() {
+        println!("    EXTRA rows in ST (not in query):");
+        for (row,) in &extra_rows {
+            println!("      {row}");
+        }
+    }
+    if !missing_rows.is_empty() {
+        println!("    MISSING rows from ST (in query, not in ST):");
+        for (row,) in &missing_rows {
+            println!("      {row}");
+        }
+    }
+
+    Err(format!(
+        "INVARIANT VIOLATION: {qname} cycle {cycle} — \
+         ST rows: {st_count}, Q rows: {q_count}, \
+         extra: {extra}, missing: {missing}"
+    ))
+}

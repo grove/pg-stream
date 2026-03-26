@@ -247,6 +247,12 @@ jobs:
       - name: Run E2E test suite
         run: cargo nextest run --profile ci --test 'e2e_*'
 
+      - name: Run Phase 9 correctness gate (TPC-H-derived, DIFFERENTIAL mode)
+        # Five curated TPC-H queries in DIFFERENTIAL mode — zero-tolerance gate.
+        # Included in the e2e_* sweep above; run again explicitly for visibility.
+        run: |
+          cargo nextest run --profile ci --test e2e_correctness_gate_tests --no-capture
+
       - name: Run TPC-H-derived correctness tests
         run: |
           cargo nextest run --profile ci --test e2e_tpch_tests --run-ignored all

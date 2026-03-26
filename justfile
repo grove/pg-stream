@@ -175,6 +175,19 @@ test-tpch-fast:
 test-tpch-large: build-e2e-image
     TPCH_SCALE=0.1 ./scripts/run_e2e_tests.sh --test e2e_tpch_tests --run-ignored all --no-capture
 
+# ── Correctness Gate (Phase 9) ────────────────────────────────────────────
+
+# Run Phase 9 external correctness gate (rebuilds Docker image, ~5-10 min)
+# Five TPC-H-derived queries in DIFFERENTIAL mode; zero tolerance for failures.
+[group: "test"]
+test-correctness-gate: build-e2e-image
+    ./scripts/run_e2e_tests.sh --test e2e_correctness_gate_tests --no-capture
+
+# Run Phase 9 correctness gate, skip Docker image rebuild
+[group: "test"]
+test-correctness-gate-fast:
+    ./scripts/run_e2e_tests.sh --test e2e_correctness_gate_tests --no-capture
+
 # ── dbt Tests ─────────────────────────────────────────────────────────────
 
 # Run dbt-pgtrickle integration tests (builds Docker image)
