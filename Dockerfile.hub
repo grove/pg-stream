@@ -90,6 +90,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY pg_trickle.control ./
 
+# Create placeholder bench files (required by Cargo.toml but not needed for
+# extension package)
+RUN mkdir -p benches && \
+    echo 'fn main() {}' > benches/diff_operators.rs && \
+    echo 'fn main() {}' > benches/refresh_bench.rs
+
 # Compile the extension. Cargo will automatically use cached dependencies
 # from the build-deps stage's `cargo fetch` (stored in /root/.cargo).
 RUN --mount=type=cache,target=/root/.cargo/registry \
