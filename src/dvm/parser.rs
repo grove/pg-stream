@@ -12,7 +12,23 @@
 
 use crate::error::PgTrickleError;
 use pgrx::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+// Thread-local accumulator for advisory warnings emitted during one
+// `parse_defining_query_inner` call.  The accumulator is initialized at the
+// start of each parse and drained into `ParseResult.warnings` at the end so
+// they are emitted exactly once by the caller, not once per internal parse
+// invocation (e.g. `row_id_expr_for_query`, `prewarm_merge_cache`).
+thread_local! {
+    static PARSE_ADVISORY_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push an advisory warning into the current parse warning accumulator.
+/// No-op when called outside of `parse_defining_query_inner`.
+fn push_parse_warning(msg: String) {
+    PARSE_ADVISORY_WARNINGS.with(|w| w.borrow_mut().push(msg));
+}
 
 // ── Safe FFI helpers ───────────────────────────────────────────────────
 //
@@ -1132,6 +1148,11 @@ pub struct ParseResult {
     /// When `true`, the OpTree may be incomplete — recursive CTE bodies
     /// are not parsed into the tree. Only FULL refresh mode is supported.
     pub has_recursion: bool,
+    /// Advisory warnings collected during parsing (e.g. NATURAL JOIN column
+    /// drift risk). Emit these once at the call site that presents diagnostics
+    /// to the user; downstream parser calls (cache pre-warm, row-id derivation)
+    /// should silently discard them.
+    pub warnings: Vec<String>,
 }
 
 impl ParseResult {
@@ -8929,7 +8950,9 @@ fn check_select_unsupported(
     // function in the DVM parser (`rewrite_distinct_on()`). No rejection
     // needed here.
 
-    // ── Unsupported join features (currently: NATURAL JOIN) ─────────
+    // ── FROM clause items (TABLESAMPLE) ─────────────────────────────
+    // NATURAL JOIN is supported (S9): common columns are resolved and an
+    // explicit equi-join is synthesized. Only TABLESAMPLE is rejected here.
     if !select.fromClause.is_null() {
         let from_list = pg_list::<pg_sys::Node>(select.fromClause);
         for node_ptr in from_list.iter_ptr() {
@@ -10201,6 +10224,9 @@ pub fn parse_defining_query_full(query: &str) -> Result<ParseResult, PgTrickleEr
 }
 
 unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrickleError> {
+    // Clear the per-parse warning accumulator so each invocation starts fresh.
+    PARSE_ADVISORY_WARNINGS.with(|w| w.borrow_mut().clear());
+
     let list = parse_query(query)?;
     if list.len() != 1 {
         return Err(PgTrickleError::QueryParseError(format!(
@@ -10310,10 +10336,14 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrick
         cte_tree.prune_scan_columns();
     }
 
+    // Drain advisory warnings accumulated during this parse.
+    let warnings = PARSE_ADVISORY_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+
     Ok(ParseResult {
         tree,
         cte_registry: cte_ctx.registry,
         has_recursion,
+        warnings,
     })
 }
 
@@ -11237,12 +11267,14 @@ unsafe fn parse_from_item(
             // If columns are added to either table that happen to match a column
             // on the other side, the join semantics change silently. Explicit
             // JOIN ... ON is recommended for production stream tables.
-            pgrx::warning!(
+            // Push to the per-parse accumulator; the top-level caller emits
+            // this exactly once via ParseResult.warnings.
+            push_parse_warning(format!(
                 "pg_trickle: NATURAL JOIN resolved on columns [{}]. \
                  Adding a same-named column to either table will silently change \
                  join semantics. Consider using explicit JOIN ... ON instead.",
                 common.join(", "),
-            );
+            ));
 
             // Build condition: left.col1 = right.col1 AND left.col2 = right.col2 ...
             let left_alias = left.alias();
@@ -16461,6 +16493,7 @@ mod tests {
             tree: tree.clone(),
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert_eq!(result.tree.alias(), "orders");
         assert_eq!(result.cte_registry.entries.len(), 1);
@@ -16486,6 +16519,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
     }
@@ -16529,6 +16563,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
         // Only one entry in the registry despite two CteScan nodes
@@ -16565,6 +16600,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
         assert_eq!(result.cte_registry.entries.len(), 2);
@@ -16581,6 +16617,7 @@ mod tests {
             tree: scan_node("t", 1, &["id"]),
             cte_registry: CteRegistry::default(),
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(!result.has_recursion);
     }
@@ -16591,6 +16628,7 @@ mod tests {
             tree: scan_node("t", 1, &["id"]),
             cte_registry: CteRegistry::default(),
             has_recursion: true,
+            warnings: vec![],
         };
         assert!(result.has_recursion);
     }
@@ -16601,6 +16639,7 @@ mod tests {
             tree: scan_node("t", 1, &["id"]),
             cte_registry: CteRegistry::default(),
             has_recursion: true,
+            warnings: vec![],
         };
         let cloned = result.clone();
         assert!(cloned.has_recursion);
@@ -18068,6 +18107,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
     }

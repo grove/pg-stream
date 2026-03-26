@@ -886,7 +886,15 @@ fn validate_and_parse_query(
         && topk_info.is_none()
     {
         match crate::dvm::parse_defining_query_full(q) {
-            Ok(tree) => Some(tree),
+            Ok(tree) => {
+                // Emit advisory warnings (e.g. NATURAL JOIN column drift) exactly
+                // once here — downstream parse calls (cache pre-warm, row-id
+                // derivation) silently discard them via ParseResult.warnings.
+                for msg in &tree.warnings {
+                    pgrx::warning!("{}", msg);
+                }
+                Some(tree)
+            }
             Err(e) if is_auto && *refresh_mode == RefreshMode::Differential => {
                 pgrx::warning!(
                     "[pg_trickle] Falling back to FULL refresh: query cannot use \
