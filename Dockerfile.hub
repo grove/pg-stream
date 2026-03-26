@@ -12,16 +12,23 @@
 # which is scratch-based and extension-files only.
 #
 # Build (from project root):
-#   docker build -t pgtrickle/pg_trickle:0.7.0-pg18 -f Dockerfile.hub .
+#   docker build -t pgtrickle/pg_trickle:0.11.0-pg18 -f Dockerfile.hub .
 #
-# Run:
-#   docker run --rm -e POSTGRES_PASSWORD=secret pgtrickle/pg_trickle:0.7.0-pg18
+# Run (getting started):
+#   docker run --rm -e POSTGRES_PASSWORD=secret pgtrickle/pg_trickle:0.11.0-pg18
+#
+# Scale up memory at runtime without rebuilding:
+#   docker run --rm -e POSTGRES_PASSWORD=secret \
+#     pgtrickle/pg_trickle:0.11.0-pg18 \
+#     -c shared_buffers=2GB -c work_mem=64MB -c effective_cache_size=6GB
+#
+# Default GUC settings are documented in docker/pg_trickle-defaults.conf.
 # =============================================================================
 
 # ── Stage 1: Build the extension ────────────────────────────────────────────
 FROM postgres:18-bookworm AS builder
 
-ARG VERSION=0.7.0
+ARG VERSION=0.11.0
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -80,7 +87,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # ── Stage 2: Runtime image ────────────────────────────────────────────────────
 FROM postgres:18-bookworm
 
-ARG VERSION=0.7.0
+ARG VERSION=0.11.0
 ARG REPO_URL=https://github.com/grove/pg-trickle
 
 LABEL org.opencontainers.image.title="pg_trickle" \
@@ -100,13 +107,13 @@ COPY --from=builder \
     /usr/lib/postgresql/18/lib/
 
 # Configure pg_trickle in the default postgresql.conf template so any
-# cluster created from this image has the extension auto-loaded.
+# cluster created from this image has the extension auto-loaded with
+# sensible defaults.  The full set of defaults is documented in
+# docker/pg_trickle-defaults.conf (included in the build context).
+COPY docker/pg_trickle-defaults.conf /tmp/pg_trickle-defaults.conf
 RUN echo "" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "# pg_trickle configuration" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "shared_preload_libraries = 'pg_trickle'" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "wal_level = logical" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "max_replication_slots = 10" >> /usr/share/postgresql/postgresql.conf.sample && \
-    echo "max_worker_processes = 16" >> /usr/share/postgresql/postgresql.conf.sample
+    cat /tmp/pg_trickle-defaults.conf >> /usr/share/postgresql/postgresql.conf.sample && \
+    rm /tmp/pg_trickle-defaults.conf
 
 # Create the extension on the default 'postgres' database during initdb so
 # the background worker launcher finds it immediately on first startup.
