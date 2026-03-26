@@ -3977,13 +3977,17 @@ fn resolve_relkind(schema: &str, relname: &str) -> Result<Option<String>, PgTric
         relname.replace('\'', "''"),
     );
     Spi::connect(|client| {
-        let result = client
+        let mut result = client
             .select(&sql, None, &[])
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        result
-            .first()
-            .get::<String>(1)
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))
+        // Use iterator to safely handle empty result sets (avoids
+        // "SpiTupleTable positioned before the start or after the end" on empty results).
+        if let Some(row) = result.next() {
+            return row
+                .get::<String>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()));
+        }
+        Ok(None)
     })
 }
 
@@ -3997,19 +4001,25 @@ fn get_view_definition(schema: &str, relname: &str) -> Result<String, PgTrickleE
         relname.replace('\'', "''"),
     );
     Spi::connect(|client| {
-        let result = client
+        let mut result = client
             .select(&sql, None, &[])
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        let raw = result
-            .first()
-            .get::<String>(1)
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
-            .ok_or_else(|| {
-                PgTrickleError::QueryParseError(format!(
-                    "Could not retrieve view definition for {schema}.{relname}"
-                ))
-            })?;
-        Ok(strip_view_definition_suffix(&raw))
+        // Use iterator to safely handle empty result sets (avoids
+        // "SpiTupleTable positioned before the start or after the end" on empty results).
+        if let Some(row) = result.next() {
+            let raw = row
+                .get::<String>(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?
+                .ok_or_else(|| {
+                    PgTrickleError::QueryParseError(format!(
+                        "Could not retrieve view definition for {schema}.{relname}"
+                    ))
+                })?;
+            return Ok(strip_view_definition_suffix(&raw));
+        }
+        Err(PgTrickleError::QueryParseError(format!(
+            "Could not retrieve view definition for {schema}.{relname}: view not found"
+        )))
     })
 }
 
@@ -10857,12 +10867,17 @@ unsafe fn parse_from_item(
     cte_ctx: &mut CteParseContext,
 ) -> Result<OpTree, PgTrickleError> {
     if let Some(rv) = cast_node!(node, T_RangeVar, pg_sys::RangeVar) {
-        let schema_name = if rv.schemaname.is_null() {
-            "public".to_string()
+        // Explicit schema qualifier: use as-is.
+        // Unqualified name: defer resolution to after the CTE check so we
+        // don't do a search_path lookup for names that are CTE aliases.
+        let explicit_schema: Option<String> = if rv.schemaname.is_null() {
+            None
         } else {
-            pg_cstr_to_str(rv.schemaname)
-                .unwrap_or("public")
-                .to_string()
+            Some(
+                pg_cstr_to_str(rv.schemaname)
+                    .unwrap_or("public")
+                    .to_string(),
+            )
         };
         let table_name = pg_cstr_to_str(rv.relname)?.to_string();
         let alias = if !rv.alias.is_null() {
@@ -10941,6 +10956,25 @@ unsafe fn parse_from_item(
                 column_aliases: col_aliases,
             });
         }
+
+        // Resolve the schema: use the explicit qualifier if present, otherwise
+        // look up the table via the session search_path.  This avoids the
+        // previous bug where unqualified names were hardcoded to "public",
+        // causing a cryptic SPI error for tables in other schemas.
+        let schema_name = match explicit_schema {
+            Some(s) => s,
+            None => match resolve_rangevar_schema(rv)? {
+                Some(s) => s,
+                None => {
+                    return Err(PgTrickleError::NotFound(format!(
+                        "table '{}' not found in the current search_path. \
+                         Use a schema-qualified name (e.g. \"my_schema\".\"{}\") \
+                         or add the schema to the search_path.",
+                        table_name, table_name
+                    )));
+                }
+            },
+        };
 
         let table_oid = resolve_table_oid(&schema_name, &table_name)?;
         let columns = resolve_columns(table_oid)?;
@@ -11515,15 +11549,26 @@ fn resolve_table_oid(schema: &str, table: &str) -> Result<u32, PgTrickleError> {
     );
 
     Spi::connect(|client| {
-        let result = client
+        let mut result = client
             .select(&sql, None, &[])
             .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        let oid: Option<pg_sys::Oid> = result
-            .first()
-            .get(1)
-            .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
-        oid.map(|o| o.to_u32())
-            .ok_or_else(|| PgTrickleError::NotFound(format!("{schema}.{table}")))
+        // Use iterator to safely handle empty result sets — calling
+        // .first().get() on an empty SpiTupleTable throws "positioned
+        // before the start or after the end" instead of a useful error.
+        if let Some(row) = result.next() {
+            let oid: Option<pg_sys::Oid> = row
+                .get(1)
+                .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+            return oid
+                .map(|o| o.to_u32())
+                .ok_or_else(|| PgTrickleError::NotFound(format!("{schema}.{table}")));
+        }
+        Err(PgTrickleError::NotFound(format!(
+            "table '{schema}.{table}' not found in pg_class — \
+             if the table is not in schema '{schema}', use a schema-qualified \
+             name in the query (e.g. \"my_schema\".\"{}\")",
+            table
+        )))
     })
 }
 
