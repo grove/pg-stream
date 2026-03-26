@@ -774,7 +774,76 @@ fn explain_st_impl(
         props.push(("frontier".to_string(), "null".to_string()));
     }
 
+    // DAG-3: Amplification metrics from recent refresh history.
+    // Query the last 20 DIFFERENTIAL refreshes and compute min/max/avg/latest
+    // amplification ratio from existing columns (delta_row_count as input,
+    // rows_inserted + rows_deleted as output).
+    if let Ok(stats) = amplification_stats(st.pgt_id) {
+        props.push(("amplification_stats".to_string(), stats));
+    }
+
     Ok(props)
+}
+
+// ── DAG-3: Amplification Statistics ─────────────────────────────────────
+
+/// Query the last 20 DIFFERENTIAL refreshes for a stream table and compute
+/// amplification ratio statistics (min, max, avg, latest).
+///
+/// Returns a JSON string like:
+/// `{"samples":15,"min":1.0,"max":42.5,"avg":8.3,"latest":12.1,"threshold":100.0}`
+///
+/// Returns an error if no DIFFERENTIAL refreshes are recorded yet.
+fn amplification_stats(pgt_id: i64) -> Result<String, PgTrickleError> {
+    let threshold = crate::config::pg_trickle_delta_amplification_threshold();
+
+    let sql = format!(
+        "SELECT delta_row_count, rows_inserted, rows_deleted \
+         FROM pgtrickle.pgt_refresh_history \
+         WHERE pgt_id = {pgt_id} \
+           AND action = 'DIFFERENTIAL' \
+           AND status = 'COMPLETED' \
+           AND delta_row_count > 0 \
+         ORDER BY refresh_id DESC \
+         LIMIT 20"
+    );
+
+    let mut ratios: Vec<f64> = Vec::new();
+    Spi::connect(|client| {
+        let cursor = client.select(&sql, None, &[]).map_err(|e| {
+            PgTrickleError::SpiError(format!("amplification_stats query failed: {e}"))
+        })?;
+        for row in cursor {
+            let input: i64 = row.get::<i64>(1).unwrap_or(Some(0)).unwrap_or(0);
+            let inserted: i64 = row.get::<i64>(2).unwrap_or(Some(0)).unwrap_or(0);
+            let deleted: i64 = row.get::<i64>(3).unwrap_or(Some(0)).unwrap_or(0);
+            let output = inserted + deleted;
+            let ratio = crate::refresh::compute_amplification_ratio(input, output);
+            ratios.push(ratio);
+        }
+        Ok::<(), PgTrickleError>(())
+    })?;
+
+    if ratios.is_empty() {
+        return Err(PgTrickleError::InternalError(
+            "no DIFFERENTIAL refresh history available".to_string(),
+        ));
+    }
+
+    let min = ratios.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = ratios.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
+    let latest = ratios[0]; // first row = most recent
+
+    Ok(format!(
+        "{{\"samples\":{},\"min\":{:.2},\"max\":{:.2},\"avg\":{:.2},\"latest\":{:.2},\"threshold\":{:.1}}}",
+        ratios.len(),
+        min,
+        max,
+        avg,
+        latest,
+        threshold,
+    ))
 }
 
 // ── CDC Health Monitoring ───────────────────────────────────────────────────

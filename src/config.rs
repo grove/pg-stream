@@ -379,6 +379,17 @@ pub static PGS_LOG_MERGE_SQL: GucSetting<bool> = GucSetting::<bool>::new(false);
 /// Set to 0 to disable the global default ceiling (per-ST ceiling only).
 pub static PGS_FUSE_DEFAULT_CEILING: GucSetting<i32> = GucSetting::<i32>::new(0);
 
+/// DAG-3: Delta amplification detection threshold.
+///
+/// When a DIFFERENTIAL refresh produces `output_delta / input_delta` rows
+/// exceeding this ratio, pg_trickle emits a WARNING indicating pathological
+/// delta amplification (common with many-to-many joins or large fan-out).
+/// The warning includes the stream table name, input/output counts, and
+/// the computed ratio, helping operators identify and tune problematic hops.
+///
+/// Set to 0.0 to disable amplification detection.
+pub static PGS_DELTA_AMPLIFICATION_THRESHOLD: GucSetting<f64> = GucSetting::<f64>::new(100.0);
+
 /// C3-1: Per-database dynamic refresh worker quota.
 ///
 /// When > 0, each per-database scheduler limits itself to this many
@@ -876,6 +887,19 @@ pub fn register_gucs() {
         GucFlags::default(),
     );
 
+    GucRegistry::define_float_guc(
+        c"pg_trickle.delta_amplification_threshold",
+        c"Delta amplification detection threshold (output/input ratio).",
+        c"When a DIFFERENTIAL refresh produces more than this multiple of the input \
+           delta rows, a WARNING is emitted so operators can identify pathological \
+           join fan-out or many-to-many amplification. Set to 0.0 to disable.",
+        &PGS_DELTA_AMPLIFICATION_THRESHOLD,
+        0.0,       // min (disabled)
+        100_000.0, // max
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+
     GucRegistry::define_int_guc(
         c"pg_trickle.per_database_worker_quota",
         c"Per-database dynamic refresh worker quota for multi-tenant isolation.",
@@ -1147,6 +1171,11 @@ pub fn pg_trickle_fuse_default_ceiling() -> i64 {
 /// C3-1: Returns the per-database worker quota (0 = disabled).
 pub fn pg_trickle_per_database_worker_quota() -> i32 {
     PGS_PER_DATABASE_WORKER_QUOTA.get()
+}
+
+/// DAG-3: Returns the delta amplification threshold (0.0 = disabled).
+pub fn pg_trickle_delta_amplification_threshold() -> f64 {
+    PGS_DELTA_AMPLIFICATION_THRESHOLD.get()
 }
 
 /// WAKE-1: Returns whether event-driven scheduler wake is enabled.

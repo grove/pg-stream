@@ -2173,6 +2173,38 @@ fn inject_partition_predicate(
     merge_sql.replace("__PGT_PART_PRED__", &pred)
 }
 
+// ── DAG-3: Delta amplification detection ────────────────────────────
+
+/// Compute the amplification ratio between input delta and output delta.
+///
+/// Returns `output / input` when `input > 0`, otherwise `0.0` (no
+/// amplification measurable when there was no input).
+///
+/// This is a pure function separated from the SPI layer so it can be
+/// unit-tested without a PostgreSQL backend.
+pub(crate) fn compute_amplification_ratio(input_delta: i64, output_delta: i64) -> f64 {
+    if input_delta <= 0 {
+        return 0.0;
+    }
+    output_delta as f64 / input_delta as f64
+}
+
+/// Determine whether the amplification ratio exceeds the configured
+/// threshold and a WARNING should be emitted.
+///
+/// Returns `false` when detection is disabled (threshold ≤ 0) or when
+/// there is no meaningful input (input_delta ≤ 0).
+pub(crate) fn should_warn_amplification(
+    input_delta: i64,
+    output_delta: i64,
+    threshold: f64,
+) -> bool {
+    if threshold <= 0.0 || input_delta <= 0 {
+        return false;
+    }
+    compute_amplification_ratio(input_delta, output_delta) > threshold
+}
+
 pub fn execute_differential_refresh(
     st: &StreamTableMeta,
     prev_frontier: &Frontier,
@@ -3431,6 +3463,28 @@ pub fn execute_differential_refresh(
     // have processed at least one change buffer entry.
     let effective_count = (merge_count as i64).max(1);
 
+    // ── DAG-3: Delta amplification detection ────────────────────────
+    // After the MERGE completes, check whether the output delta is
+    // disproportionately larger than the input delta (common with
+    // many-to-many joins or high fan-out).  Emit a WARNING so operators
+    // can identify and tune the problematic hop.
+    let amplification_threshold = crate::config::pg_trickle_delta_amplification_threshold();
+    if should_warn_amplification(total_change_count, effective_count, amplification_threshold) {
+        let ratio = compute_amplification_ratio(total_change_count, effective_count);
+        pgrx::warning!(
+            "[pg_trickle] DAG-3: Delta amplification detected for {}.{}: \
+             {} input rows → {} output rows ({:.1}× amplification, \
+             threshold is {:.0}×). Consider restructuring the query to \
+             reduce join fan-out, or raise pg_trickle.delta_amplification_threshold.",
+            schema,
+            name,
+            total_change_count,
+            effective_count,
+            ratio,
+            amplification_threshold,
+        );
+    }
+
     // G12-ERM-1: Record the effective mode for this execution path.
     set_effective_mode("DIFFERENTIAL");
 
@@ -4191,6 +4245,89 @@ mod tests {
         assert!(result.contains(r#"INSERT INTO "myschema"."events""#));
         assert!(result.contains(r#"__pgt_row_id, "id", "type", "payload""#));
         assert!(result.contains(r#"d.__pgt_row_id, d."id", d."type", d."payload""#));
+    }
+
+    // ── DAG-3: compute_amplification_ratio tests ────────────────────
+
+    #[test]
+    fn test_amplification_ratio_normal() {
+        let ratio = compute_amplification_ratio(10, 1000);
+        assert!((ratio - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_amplification_ratio_one_to_one() {
+        let ratio = compute_amplification_ratio(50, 50);
+        assert!((ratio - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_amplification_ratio_reduction() {
+        // Output smaller than input (e.g. aggregation)
+        let ratio = compute_amplification_ratio(1000, 10);
+        assert!((ratio - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_amplification_ratio_zero_input_returns_zero() {
+        assert!((compute_amplification_ratio(0, 500)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_amplification_ratio_negative_input_returns_zero() {
+        assert!((compute_amplification_ratio(-1, 500)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_amplification_ratio_zero_output() {
+        assert!((compute_amplification_ratio(100, 0)).abs() < f64::EPSILON);
+    }
+
+    // ── DAG-3: should_warn_amplification tests ──────────────────────
+
+    #[test]
+    fn test_should_warn_above_threshold() {
+        // 1000 / 5 = 200× > 100×
+        assert!(should_warn_amplification(5, 1000, 100.0));
+    }
+
+    #[test]
+    fn test_should_not_warn_below_threshold() {
+        // 50 / 5 = 10× < 100×
+        assert!(!should_warn_amplification(5, 50, 100.0));
+    }
+
+    #[test]
+    fn test_should_not_warn_at_threshold() {
+        // Exactly at threshold — not exceeded, no warning.
+        assert!(!should_warn_amplification(1, 100, 100.0));
+    }
+
+    #[test]
+    fn test_should_not_warn_disabled() {
+        // threshold = 0 → detection disabled
+        assert!(!should_warn_amplification(1, 10_000, 0.0));
+    }
+
+    #[test]
+    fn test_should_not_warn_negative_threshold() {
+        assert!(!should_warn_amplification(1, 10_000, -5.0));
+    }
+
+    #[test]
+    fn test_should_not_warn_zero_input() {
+        assert!(!should_warn_amplification(0, 500, 100.0));
+    }
+
+    #[test]
+    fn test_should_not_warn_negative_input() {
+        assert!(!should_warn_amplification(-1, 500, 100.0));
+    }
+
+    #[test]
+    fn test_should_warn_low_threshold() {
+        // threshold = 2.0, ratio = 10/2 = 5.0 → warn
+        assert!(should_warn_amplification(2, 10, 2.0));
     }
 }
 
