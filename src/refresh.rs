@@ -2722,9 +2722,18 @@ pub fn execute_differential_refresh(
     }
 
     if should_fallback {
-        pgrx::notice!(
-            "[pg_trickle] Adaptive fallback: change ratio exceeds threshold {:.0}% — using FULL refresh",
+        pgrx::warning!(
+            "[pg_trickle] Falling back to FULL refresh for {}.{}: change ratio exceeds \
+             adaptive threshold ({:.0}% of source table size).\n\
+             This means too many rows changed since the last refresh for differential \
+             mode to be efficient. \n\
+             Suggestion: increase pg_trickle.differential_max_change_ratio (currently {:.2}), \
+             adjust the per-table auto_threshold via ALTER STREAM TABLE ... SET (auto_threshold = ...), \
+             or refresh more frequently to reduce the change volume per cycle.",
+            st.pgt_schema,
+            st.pgt_name,
             max_ratio * 100.0,
+            max_ratio,
         );
         let t_full_start = Instant::now();
         let result = execute_full_refresh(st);
@@ -2770,12 +2779,18 @@ pub fn execute_differential_refresh(
         .unwrap_or(0);
 
         if st_group_count > 0 && total_change_count >= st_group_count {
-            pgrx::info!(
-                "[pg_trickle] Aggregate saturation: {} changes >= {} groups — using FULL refresh for {}.{}",
-                total_change_count,
-                st_group_count,
+            pgrx::warning!(
+                "[pg_trickle] Falling back to FULL refresh for {}.{}: aggregate saturation \
+                 — {} changes >= {} groups.\n\
+                 When the number of source changes meets or exceeds the number of aggregate \
+                 groups, FULL recomputation is faster than per-group differential MERGE. \n\
+                 Suggestion: if this happens regularly, the workload may suit FULL refresh \
+                 mode. Otherwise, refresh more frequently to keep the per-cycle change count \
+                 below the group count.",
                 schema,
                 name,
+                total_change_count,
+                st_group_count,
             );
             let t_full_start = Instant::now();
             let result = execute_full_refresh(st);

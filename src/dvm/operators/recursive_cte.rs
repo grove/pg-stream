@@ -491,7 +491,8 @@ fn generate_dred_delta(
 
     // ── Phase 1: INSERT propagation (semi-naive) ──────────────────────
 
-    let ins_delta = generate_semi_naive_ins_only(ctx, alias, columns, base_delta, recursive)?;
+    let ins_delta =
+        generate_semi_naive_ins_only(ctx, alias, columns, base_delta, recursive, union_all)?;
 
     // ── Phase 2: Over-deletion ────────────────────────────────────────
     //
@@ -620,6 +621,7 @@ fn generate_semi_naive_ins_only(
     columns: &[String],
     base_delta: &DiffResult,
     recursive: &OpTree,
+    union_all: bool,
 ) -> Result<DiffResult, PgTrickleError> {
     let st_table = ctx
         .st_qualified_name
@@ -690,7 +692,10 @@ fn generate_semi_naive_ins_only(
     }
     parts.extend(nonlinear_seeds);
     parts.push(propagation);
-    let recursive_sql = parts.join("\nUNION ALL\n");
+    // Mirror the original query's set/multiset semantics so that cyclic
+    // graphs terminate (UNION deduplicates each iteration; UNION ALL does not).
+    let union_kw = if union_all { "UNION ALL" } else { "UNION" };
+    let recursive_sql = parts.join(&format!("\n{union_kw}\n"));
 
     ctx.add_recursive_cte(delta_cte.clone(), recursive_sql);
 
@@ -790,7 +795,6 @@ fn generate_query_sql_cascade(
             aliases,
             child,
         } => {
-            let child_sql = generate_query_sql_cascade(child, cascade_cte, st_table)?;
             let proj_exprs: Vec<String> = expressions
                 .iter()
                 .zip(aliases.iter())
@@ -803,10 +807,44 @@ fn generate_query_sql_cascade(
                     }
                 })
                 .collect();
-            Ok(format!(
-                "SELECT {projs}\nFROM (\n{child_sql}\n) __p",
-                projs = proj_exprs.join(", "),
-            ))
+            // Inline the FROM clause for Join children so that project
+            // expressions (which use original table aliases, e.g. `n.id`)
+            // resolve correctly — wrapping in a subquery would hide aliases.
+            match child.as_ref() {
+                OpTree::InnerJoin {
+                    condition,
+                    left,
+                    right,
+                } => {
+                    let left_from = generate_cascade_from(left, cascade_cte, st_table)?;
+                    let right_from = generate_cascade_from(right, cascade_cte, st_table)?;
+                    Ok(format!(
+                        "SELECT {projs}\nFROM {left_from}\nJOIN {right_from}\n  ON {cond}",
+                        projs = proj_exprs.join(", "),
+                        cond = condition.to_sql(),
+                    ))
+                }
+                OpTree::LeftJoin {
+                    condition,
+                    left,
+                    right,
+                } => {
+                    let left_from = generate_cascade_from(left, cascade_cte, st_table)?;
+                    let right_from = generate_cascade_from(right, cascade_cte, st_table)?;
+                    Ok(format!(
+                        "SELECT {projs}\nFROM {left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                        projs = proj_exprs.join(", "),
+                        cond = condition.to_sql(),
+                    ))
+                }
+                _ => {
+                    let child_sql = generate_query_sql_cascade(child, cascade_cte, st_table)?;
+                    Ok(format!(
+                        "SELECT {projs}\nFROM (\n{child_sql}\n) __p",
+                        projs = proj_exprs.join(", "),
+                    ))
+                }
+            }
         }
 
         OpTree::Filter { predicate, child } => {
@@ -856,6 +894,34 @@ fn generate_cascade_from(
             ))
         }
 
+        // Expand nested joins inline so that table aliases remain in scope
+        // for the enclosing ON condition.
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_cascade_from(left, cascade_cte, st_table)?;
+            let right_from = generate_cascade_from(right, cascade_cte, st_table)?;
+            Ok(format!(
+                "{left_from}\nJOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_cascade_from(left, cascade_cte, st_table)?;
+            let right_from = generate_cascade_from(right, cascade_cte, st_table)?;
+            Ok(format!(
+                "{left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
         _ => {
             let sql = generate_query_sql_cascade(op, cascade_cte, st_table)?;
             Ok(format!("(\n{sql}\n) AS __sub"))
@@ -869,14 +935,25 @@ fn generate_cascade_from(
 /// ST storage in cascade context). Self-references output columns using
 /// their alias (which references the cascade CTE).
 fn collect_cascade_cols(op: &OpTree, out: &mut Vec<String>) {
-    let alias = match op {
-        OpTree::Scan { alias, .. } => alias.as_str(),
-        OpTree::RecursiveSelfRef { alias, .. } => alias.as_str(),
-        OpTree::Subquery { alias, .. } => alias.as_str(),
-        _ => "__sub",
-    };
-    for col in op.output_columns() {
-        out.push(format!("{}.{}", quote_ident(alias), quote_ident(&col)));
+    match op {
+        OpTree::Scan { alias, .. }
+        | OpTree::RecursiveSelfRef { alias, .. }
+        | OpTree::Subquery { alias, .. } => {
+            for col in op.output_columns() {
+                out.push(format!("{}.{}", quote_ident(alias), quote_ident(&col)));
+            }
+        }
+        // Recursively expand nested join chains.
+        OpTree::InnerJoin { left, right, .. } | OpTree::LeftJoin { left, right, .. } => {
+            collect_cascade_cols(left, out);
+            collect_cascade_cols(right, out);
+        }
+        _ => {
+            let alias = "__sub";
+            for col in op.output_columns() {
+                out.push(format!("{}.{}", quote_ident(alias), quote_ident(&col)));
+            }
+        }
     }
 }
 
@@ -995,7 +1072,7 @@ fn generate_semi_naive_delta(
     columns: &[String],
     base_delta: &DiffResult,
     recursive: &OpTree,
-    _union_all: bool,
+    union_all: bool,
 ) -> Result<DiffResult, PgTrickleError> {
     // We need the ST storage table name
     let st_table = ctx
@@ -1079,6 +1156,7 @@ fn generate_semi_naive_delta(
                     seed_from_existing,
                     nonlinear_seeds,
                     prop_plain,
+                    union_all,
                 );
             }
         };
@@ -1105,6 +1183,7 @@ fn generate_semi_naive_delta(
         seed_from_existing,
         nonlinear_seeds,
         propagation,
+        union_all,
     )
 }
 
@@ -1121,15 +1200,24 @@ fn build_semi_naive_result(
     seed_from_existing: Option<String>,
     nonlinear_seeds: Vec<String>,
     propagation: String,
+    union_all: bool,
 ) -> Result<DiffResult, PgTrickleError> {
     // Build the complete recursive delta CTE.
+    //
+    // When the original query uses UNION (set semantics), we mirror that
+    // here so that the recursive delta CTE deduplicates on each iteration.
+    // This is essential for correctness in cyclic graphs: without UNION the
+    // delta would loop forever re-deriving the same pairs via cycles.
+    // UNION ALL is kept only when the original query explicitly opts into
+    // multiset semantics.
+    let union_kw = if union_all { "UNION ALL" } else { "UNION" };
     let mut parts = vec![seed_from_base];
     if let Some(existing_seed) = seed_from_existing {
         parts.push(existing_seed);
     }
     parts.extend(nonlinear_seeds);
     parts.push(propagation);
-    let recursive_sql = parts.join("\nUNION ALL\n");
+    let recursive_sql = parts.join(&format!("\n{union_kw}\n"));
 
     ctx.add_recursive_cte(delta_cte.to_string(), recursive_sql);
 
@@ -1419,6 +1507,36 @@ fn generate_from_sql(
             ))
         }
 
+        // Expand nested joins inline so that table aliases from the outer
+        // ON condition remain visible to the enclosing SELECT. Wrapping a
+        // multi-table join in a subquery would hide those aliases and cause
+        // "missing FROM-clause entry for table" errors.
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_sql = generate_from_sql(left, self_ref_replacement)?;
+            let right_sql = generate_from_sql(right, self_ref_replacement)?;
+            Ok(format!(
+                "{left_sql}\nJOIN {right_sql}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_sql = generate_from_sql(left, self_ref_replacement)?;
+            let right_sql = generate_from_sql(right, self_ref_replacement)?;
+            Ok(format!(
+                "{left_sql}\nLEFT JOIN {right_sql}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
         _ => {
             // For complex sub-trees, wrap in a subquery
             let sql = generate_query_sql(op, self_ref_replacement)?;
@@ -1429,14 +1547,26 @@ fn generate_from_sql(
 
 /// Collect prefixed column references for a SELECT list from a FROM source.
 fn collect_select_cols(op: &OpTree, out: &mut Vec<String>) {
-    let alias = match op {
-        OpTree::Scan { alias, .. } => alias.as_str(),
-        OpTree::RecursiveSelfRef { alias, .. } => alias.as_str(),
-        OpTree::Subquery { alias, .. } => alias.as_str(),
-        _ => "__sub",
-    };
-    for col in op.output_columns() {
-        out.push(format!("{}.{}", quote_ident(alias), quote_ident(&col)));
+    match op {
+        OpTree::Scan { alias, .. }
+        | OpTree::RecursiveSelfRef { alias, .. }
+        | OpTree::Subquery { alias, .. } => {
+            for col in op.output_columns() {
+                out.push(format!("{}.{}", quote_ident(alias), quote_ident(&col)));
+            }
+        }
+        // Recursively expand nested join chains so that all table aliases
+        // are collected correctly (rather than using the placeholder "__sub").
+        OpTree::InnerJoin { left, right, .. } | OpTree::LeftJoin { left, right, .. } => {
+            collect_select_cols(left, out);
+            collect_select_cols(right, out);
+        }
+        _ => {
+            let alias = "__sub";
+            for col in op.output_columns() {
+                out.push(format!("{}.{}", quote_ident(alias), quote_ident(&col)));
+            }
+        }
     }
 }
 
@@ -1753,6 +1883,35 @@ fn generate_change_buffer_from(
             ))
         }
 
+        // Expand nested join chains inline so that table aliases produced
+        // by each child remain visible to the enclosing ON condition.
+        // Wrapping in (SELECT ...) AS __sub would hide those aliases.
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nJOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
         _ => {
             // For other node types, fall back to normal SQL generation
             let sql = generate_query_sql(op, Some(st_table))?;
@@ -1840,6 +1999,33 @@ fn generate_old_change_buffer_from(
             "{st_table} AS {alias_q}",
             alias_q = quote_ident(alias),
         )),
+
+        // Expand nested join chains inline to keep table aliases visible.
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_old_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_old_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nJOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_old_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_old_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
 
         _ => {
             let sql = generate_query_sql(op, Some(st_table))?;

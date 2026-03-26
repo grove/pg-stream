@@ -794,10 +794,10 @@ fn validate_and_parse_query(
     if let Err(e) = crate::dvm::reject_unsupported_constructs(q) {
         if is_auto {
             pgrx::warning!(
-                "[pg_trickle] AUTO mode: query uses constructs not supported by differential \
-                 maintenance ({}) — falling back to FULL refresh. \
-                 See docs/DVM_OPERATORS.md for supported operators.",
-                e
+                "[pg_trickle] Falling back to FULL refresh: unsupported construct \
+                 in defining query.\n\
+                 Construct: {e}\n\
+                 See docs/DVM_OPERATORS.md for the full list of supported operators."
             );
             *refresh_mode = RefreshMode::Full;
         } else {
@@ -812,8 +812,11 @@ fn validate_and_parse_query(
     {
         if is_auto && *refresh_mode == RefreshMode::Differential {
             pgrx::warning!(
-                "[pg_trickle] AUTO mode: query references materialized views or foreign \
-                 tables ({}) — falling back to FULL refresh.",
+                "[pg_trickle] Falling back to FULL refresh: query references materialized \
+                 views or foreign tables ({}).\n\
+                 Suggestion: replace materialized view references with regular views or \
+                 tables, or convert them to stream tables so changes can be tracked \
+                 incrementally.",
                 e
             );
             *refresh_mode = RefreshMode::Full;
@@ -831,8 +834,10 @@ fn validate_and_parse_query(
     {
         if is_auto {
             pgrx::warning!(
-                "[pg_trickle] AUTO mode: query contains window functions inside expressions \
-                 (e.g. CASE WHEN window_fn() ...) -- falling back to FULL refresh."
+                "[pg_trickle] Falling back to FULL refresh: query contains window functions \
+                 inside expressions (e.g. CASE WHEN ROW_NUMBER() OVER (...) ...).\n\
+                 Suggestion: move the window function into a subquery or CTE and apply \
+                 the surrounding expression (CASE, arithmetic, etc.) in the outer query."
             );
             *refresh_mode = RefreshMode::Full;
         } else {
@@ -840,7 +845,10 @@ fn validate_and_parse_query(
                 "pg_trickle: Query contains window functions inside expressions \
                  (e.g. CASE WHEN ROW_NUMBER() OVER (...) ...). This pattern is not \
                  supported by differential maintenance and will fall back to full \
-                 recomputation at refresh time. Consider using FULL or AUTO refresh mode."
+                 recomputation at refresh time.\n\
+                 Suggestion: move the window function into a subquery or CTE and apply \
+                 the surrounding expression in the outer query, or use FULL or AUTO \
+                 refresh mode."
             );
         }
     }
@@ -878,12 +886,24 @@ fn validate_and_parse_query(
         && topk_info.is_none()
     {
         match crate::dvm::parse_defining_query_full(q) {
-            Ok(tree) => Some(tree),
+            Ok(tree) => {
+                // Emit advisory warnings (e.g. NATURAL JOIN column drift) exactly
+                // once here — downstream parse calls (cache pre-warm, row-id
+                // derivation) silently discard them via ParseResult.warnings.
+                for msg in &tree.warnings {
+                    pgrx::warning!("{}", msg);
+                }
+                Some(tree)
+            }
             Err(e) if is_auto && *refresh_mode == RefreshMode::Differential => {
                 pgrx::warning!(
-                    "[pg_trickle] AUTO mode: query cannot use differential maintenance \
-                     ({}) — falling back to FULL refresh. \
-                     See docs/DVM_OPERATORS.md for supported operators.",
+                    "[pg_trickle] Falling back to FULL refresh: query cannot use \
+                     differential maintenance ({}).\n\
+                     Suggestion: simplify the query to use supported SQL constructs, \
+                     or break it into multiple stream tables chained together. \
+                     Run SELECT * FROM pgtrickle.explain_refresh_mode('<table>') after \
+                     creation for diagnostics. \
+                     See docs/DVM_OPERATORS.md for the full list of supported operators.",
                     e
                 );
                 *refresh_mode = RefreshMode::Full;
@@ -2173,6 +2193,20 @@ fn create_stream_table_impl(
     // Warnings
     warn_source_table_properties(&vq.source_relids);
     warn_select_star(query);
+
+    // Summary warning when AUTO mode resulted in FULL refresh
+    if is_auto && refresh_mode == RefreshMode::Full {
+        pgrx::warning!(
+            "[pg_trickle] Stream table '{}' will use FULL refresh instead of DIFFERENTIAL. \
+             Each refresh will recompute the entire result set from scratch, which is slower \
+             than incremental maintenance. See the warnings above for the specific reason \
+             and how to fix it. \
+             Use SELECT * FROM pgtrickle.explain_refresh_mode('{}') to check the effective \
+             mode after the first refresh.",
+            name,
+            name,
+        );
+    }
 
     // Validate append_only flag
     if append_only {

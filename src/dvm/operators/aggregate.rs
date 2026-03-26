@@ -11,7 +11,7 @@
 
 use crate::dvm::diff::{DeltaSource, DiffContext, DiffResult, quote_ident};
 use crate::dvm::operators::scan::build_hash_expr;
-use crate::dvm::parser::{AggExpr, AggFunc, Expr, OpTree};
+use crate::dvm::parser::{AggExpr, AggFunc, CteRegistry, Expr, OpTree};
 use crate::error::PgTrickleError;
 
 /// Resolve a column reference expression against child CTE column names.
@@ -147,7 +147,12 @@ fn child_has_full_join(op: &OpTree) -> bool {
 /// Returns the SQL fragment for `FROM ...` suitable for the rescan CTE.
 /// Returns `None` for complex children (CTEs, subqueries, unions) that
 /// cannot be reconstructed reliably.
-fn child_to_from_sql(child: &OpTree) -> Option<String> {
+///
+/// The `registry` is used to resolve [`OpTree::CteScan`] nodes: instead of
+/// emitting the CTE alias as a bare table reference (which would fail at
+/// SQL execution time for chained CTEs that are not real relations), we
+/// recursively resolve the CTE body and emit its underlying source.
+fn child_to_from_sql(child: &OpTree, registry: &CteRegistry) -> Option<String> {
     match child {
         OpTree::Scan {
             schema,
@@ -161,7 +166,7 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             alias.replace('"', "\"\""),
         )),
         OpTree::Filter { predicate, child } => {
-            let inner = child_to_from_sql(child)?;
+            let inner = child_to_from_sql(child, registry)?;
             Some(format!("{inner} WHERE {}", predicate.to_sql()))
         }
         OpTree::InnerJoin {
@@ -169,8 +174,8 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             left,
             right,
         } => {
-            let l = child_to_from_sql(left)?;
-            let r = child_to_from_sql(right)?;
+            let l = child_to_from_sql(left, registry)?;
+            let r = child_to_from_sql(right, registry)?;
             Some(format!("{l} INNER JOIN {r} ON {}", condition.to_sql()))
         }
         OpTree::LeftJoin {
@@ -178,8 +183,8 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             left,
             right,
         } => {
-            let l = child_to_from_sql(left)?;
-            let r = child_to_from_sql(right)?;
+            let l = child_to_from_sql(left, registry)?;
+            let r = child_to_from_sql(right, registry)?;
             Some(format!("{l} LEFT JOIN {r} ON {}", condition.to_sql()))
         }
         OpTree::FullJoin {
@@ -187,8 +192,8 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             left,
             right,
         } => {
-            let l = child_to_from_sql(left)?;
-            let r = child_to_from_sql(right)?;
+            let l = child_to_from_sql(left, registry)?;
+            let r = child_to_from_sql(right, registry)?;
             Some(format!("{l} FULL JOIN {r} ON {}", condition.to_sql()))
         }
         OpTree::Project {
@@ -201,7 +206,7 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             // that reference the Project's output aliases (e.g., `o_year`
             // from `EXTRACT(year FROM o_orderdate) AS o_year`) resolve
             // correctly in the rescan CTE.
-            let inner = child_to_from_sql(child)?;
+            let inner = child_to_from_sql(child, registry)?;
             let select_items: Vec<String> = expressions
                 .iter()
                 .zip(aliases.iter())
@@ -220,12 +225,15 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
                 inner,
             ))
         }
-        OpTree::CteScan { alias, .. } => {
-            // CTE scans behave like simple named sources in downstream
-            // differential SQL. Use their visible alias so filters and joins
-            // above them can resolve references positionally against the
-            // current-query reconstruction.
-            Some(quote_ident(alias))
+        OpTree::CteScan { cte_id, .. } => {
+            // Resolve the CTE body via the registry and recursively determine
+            // the FROM clause. This handles chained CTEs where the aggregate's
+            // child is a CTE alias (e.g., `FROM raw`) that is not a real
+            // relation — using the alias directly would cause a PostgreSQL
+            // "relation does not exist" error in the rescan CTE.
+            registry
+                .get(*cte_id)
+                .and_then(|(_, body)| child_to_from_sql(body, registry))
         }
         OpTree::Subquery {
             child,
@@ -243,7 +251,7 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             // that are lost when child_to_from_sql recurses through them.
             match child.as_ref() {
                 OpTree::Aggregate { .. } => {
-                    let inner = child_to_from_sql(child)?;
+                    let inner = child_to_from_sql(child, registry)?;
                     if column_aliases.is_empty() {
                         Some(format!("{inner} AS {}", quote_ident(alias)))
                     } else {
@@ -268,7 +276,7 @@ fn child_to_from_sql(child: &OpTree) -> Option<String> {
             child,
             ..
         } => {
-            let inner_from = child_to_from_sql(child)?;
+            let inner_from = child_to_from_sql(child, registry)?;
             let mut selects = Vec::new();
             for expr in group_by {
                 selects.push(expr.to_sql());
@@ -463,7 +471,7 @@ fn build_intermediate_agg_delta(
     aggregates: &[AggExpr],
     delta_cte: &str,
 ) -> Result<DiffResult, PgTrickleError> {
-    let source_from = child_to_from_sql(child);
+    let source_from = child_to_from_sql(child, &ctx.cte_registry);
 
     // We need the child's source SQL for rescanning. If we can't reconstruct
     // it, fall back to the defining query approach.
@@ -943,7 +951,7 @@ fn build_rescan_cte(
     };
 
     // Try to reconstruct the FROM clause from the child OpTree
-    let source_from = child_to_from_sql(child);
+    let source_from = child_to_from_sql(child, &ctx.cte_registry);
 
     let rescan_sql = if let Some(from_sql) = source_from {
         // Direct source reconstruction: more efficient since we can push
@@ -4877,7 +4885,7 @@ mod tests {
             ),
         );
 
-        let result = child_to_from_sql(&child);
+        let result = child_to_from_sql(&child, &CteRegistry::default());
         assert!(result.is_some(), "Project over Scan should return Some");
         let sql = result.unwrap();
         // Should be a subquery wrapping the scan
@@ -4913,10 +4921,63 @@ mod tests {
             },
         );
 
-        let result = child_to_from_sql(&child);
+        let result = child_to_from_sql(&child, &CteRegistry::default());
         assert!(
             result.is_none(),
             "Project over non-Aggregate Subquery should return None"
+        );
+    }
+
+    #[test]
+    fn test_child_to_from_sql_cte_scan_resolves_via_registry() {
+        // CteScan whose body is a Scan should resolve to the underlying
+        // table's FROM clause, not the CTE alias. This covers the
+        // chained-CTE case: WITH raw AS (SELECT ... FROM metrics), averages
+        // AS (SELECT ... FROM raw GROUP BY ...) — where `raw` is not a real
+        // relation and must be resolved through the registry.
+        let metrics_scan = scan(
+            1,
+            "metrics",
+            "public",
+            "metrics",
+            &["id", "sensor", "reading"],
+        );
+        let registry = CteRegistry {
+            entries: vec![("raw".to_string(), metrics_scan)],
+        };
+
+        let cte_child = cte_scan(
+            0,
+            "raw",
+            "raw",
+            vec!["id", "sensor", "reading"],
+            vec![],
+            vec![],
+        );
+        let result = child_to_from_sql(&cte_child, &registry);
+
+        assert!(result.is_some(), "CteScan over Scan should resolve to Some");
+        let sql = result.unwrap();
+        assert!(
+            sql.contains("metrics"),
+            "Should resolve to the underlying table, not the CTE alias: {sql}"
+        );
+        assert!(
+            !sql.contains("\"raw\""),
+            "Should NOT emit the CTE alias as a bare table reference: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_child_to_from_sql_cte_scan_unresolvable_returns_none() {
+        // CteScan with a cte_id that is not in the registry should return None
+        // so callers fall back to the defining-query approach.
+        let registry = CteRegistry::default(); // empty
+        let cte_child = cte_scan(0, "missing", "missing", vec!["id"], vec![], vec![]);
+        let result = child_to_from_sql(&cte_child, &registry);
+        assert!(
+            result.is_none(),
+            "CteScan with missing registry entry should return None"
         );
     }
 }

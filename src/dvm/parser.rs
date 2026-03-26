@@ -12,7 +12,23 @@
 
 use crate::error::PgTrickleError;
 use pgrx::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
+
+// Thread-local accumulator for advisory warnings emitted during one
+// `parse_defining_query_inner` call.  The accumulator is initialized at the
+// start of each parse and drained into `ParseResult.warnings` at the end so
+// they are emitted exactly once by the caller, not once per internal parse
+// invocation (e.g. `row_id_expr_for_query`, `prewarm_merge_cache`).
+thread_local! {
+    static PARSE_ADVISORY_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push an advisory warning into the current parse warning accumulator.
+/// No-op when called outside of `parse_defining_query_inner`.
+fn push_parse_warning(msg: String) {
+    PARSE_ADVISORY_WARNINGS.with(|w| w.borrow_mut().push(msg));
+}
 
 // ── Safe FFI helpers ───────────────────────────────────────────────────
 //
@@ -937,6 +953,14 @@ pub enum OpTree {
         /// Column aliases from `FROM cte AS alias(c1, c2, ...)`.
         /// When non-empty, these override `cte_def_aliases` / `columns` in output.
         column_aliases: Vec<String>,
+        /// Parsed body of the CTE, stored for snapshot SQL generation.
+        ///
+        /// When this `CteScan` appears as a join child, [`build_snapshot_sql`]
+        /// recurses into `body` to produce a valid SQL expression for the
+        /// CTE's current state instead of using the alias (which is not a
+        /// real relation).  `None` only in unit-test constructions that do
+        /// not exercise the snapshot path.
+        body: Option<Box<OpTree>>,
     },
     /// Recursive CTE: `WITH RECURSIVE name AS (base UNION [ALL] recursive)`.
     ///
@@ -1132,6 +1156,11 @@ pub struct ParseResult {
     /// When `true`, the OpTree may be incomplete — recursive CTE bodies
     /// are not parsed into the tree. Only FULL refresh mode is supported.
     pub has_recursion: bool,
+    /// Advisory warnings collected during parsing (e.g. NATURAL JOIN column
+    /// drift risk). Emit these once at the call site that presents diagnostics
+    /// to the user; downstream parser calls (cache pre-warm, row-id derivation)
+    /// should silently discard them.
+    pub warnings: Vec<String>,
 }
 
 impl ParseResult {
@@ -8879,6 +8908,20 @@ fn resolve_range_subselect_alias(sub: &pg_sys::RangeSubselect) -> String {
 ///
 /// This avoids running the full DVM parser (which resolves table OIDs,
 /// builds the operator tree, etc.) for queries that would fail anyway.
+/// Convert a byte offset from a PostgreSQL parser `location` field into a
+/// 1-based (line, column) pair within `query`.  Returns `None` when the
+/// offset is unknown (PostgreSQL sets it to `-1` when unavailable).
+fn query_byte_offset_to_linecol(query: &str, offset: i32) -> Option<(usize, usize)> {
+    if offset < 0 {
+        return None;
+    }
+    let offset = (offset as usize).min(query.len());
+    let prefix = &query[..offset];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = prefix.rfind('\n').map_or(offset + 1, |pos| offset - pos);
+    Some((line, col))
+}
+
 pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgTrickleError> {
     let select = match parse_first_select(query)? {
         Some(s) => unsafe { &*s },
@@ -8889,36 +8932,41 @@ pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgTrickleError> 
     if select.op != pg_sys::SetOperation::SETOP_NONE {
         if !select.larg.is_null() {
             // SAFETY: larg points to a valid SelectStmt
-            check_select_unsupported(unsafe { &*select.larg })?;
+            check_select_unsupported(unsafe { &*select.larg }, query)?;
         }
         if !select.rarg.is_null() {
             // SAFETY: rarg points to a valid SelectStmt
-            check_select_unsupported(unsafe { &*select.rarg })?;
+            check_select_unsupported(unsafe { &*select.rarg }, query)?;
         }
         return Ok(());
     }
 
     // SAFETY: select is a valid SelectStmt
-    check_select_unsupported(select)
+    check_select_unsupported(select, query)
 }
 
 /// Check a single SelectStmt for unsupported constructs.
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
-fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickleError> {
+fn check_select_unsupported(
+    select: &pg_sys::SelectStmt,
+    query: &str,
+) -> Result<(), PgTrickleError> {
     // ── DISTINCT ON ─────────────────────────────────────────────────
     // DISTINCT ON is handled by auto-rewriting to a ROW_NUMBER() window
     // function in the DVM parser (`rewrite_distinct_on()`). No rejection
     // needed here.
 
-    // ── Unsupported join features (currently: NATURAL JOIN) ─────────
+    // ── FROM clause items (TABLESAMPLE) ─────────────────────────────
+    // NATURAL JOIN is supported (S9): common columns are resolved and an
+    // explicit equi-join is synthesized. Only TABLESAMPLE is rejected here.
     if !select.fromClause.is_null() {
         let from_list = pg_list::<pg_sys::Node>(select.fromClause);
         for node_ptr in from_list.iter_ptr() {
             if !node_ptr.is_null() {
                 // SAFETY: node_ptr is valid from the from_list
-                check_from_item_unsupported(node_ptr)?;
+                check_from_item_unsupported(node_ptr, query)?;
             }
         }
     }
@@ -8961,27 +9009,29 @@ fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickle
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgTrickleError> {
+fn check_from_item_unsupported(node: *mut pg_sys::Node, query: &str) -> Result<(), PgTrickleError> {
     if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         // Recursively check join children
         if !join.larg.is_null() {
             // SAFETY: larg is valid from JoinExpr
-            check_from_item_unsupported(join.larg)?;
+            check_from_item_unsupported(join.larg, query)?;
         }
         if !join.rarg.is_null() {
             // SAFETY: rarg is valid from JoinExpr
-            check_from_item_unsupported(join.rarg)?;
+            check_from_item_unsupported(join.rarg, query)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeTableSample) } {
+    } else if let Some(rts) = cast_node!(node, T_RangeTableSample, pg_sys::RangeTableSample) {
         // TABLESAMPLE: SELECT * FROM t TABLESAMPLE BERNOULLI(10)
         // Stream tables materialize complete result sets; non-deterministic
         // sampling is not meaningful. Reject in both FULL and DIFFERENTIAL modes.
-        return Err(PgTrickleError::UnsupportedOperator(
-            "TABLESAMPLE is not supported in defining queries. \
+        let loc = query_byte_offset_to_linecol(query, rts.location)
+            .map(|(l, c)| format!(" at line {l}, column {c}"))
+            .unwrap_or_default();
+        return Err(PgTrickleError::UnsupportedOperator(format!(
+            "TABLESAMPLE{loc} is not supported in defining queries. \
              Stream tables materialize the complete result set; \
              use a WHERE condition with random() if sampling is needed."
-                .into(),
-        ));
+        )));
     }
     // RangeVar and RangeSubselect are fine — no check needed
     Ok(())
@@ -10182,6 +10232,9 @@ pub fn parse_defining_query_full(query: &str) -> Result<ParseResult, PgTrickleEr
 }
 
 unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrickleError> {
+    // Clear the per-parse warning accumulator so each invocation starts fresh.
+    PARSE_ADVISORY_WARNINGS.with(|w| w.borrow_mut().clear());
+
     let list = parse_query(query)?;
     if list.len() != 1 {
         return Err(PgTrickleError::QueryParseError(format!(
@@ -10291,10 +10344,14 @@ unsafe fn parse_defining_query_inner(query: &str) -> Result<ParseResult, PgTrick
         cte_tree.prune_scan_columns();
     }
 
+    // Drain advisory warnings accumulated during this parse.
+    let warnings = PARSE_ADVISORY_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+
     Ok(ParseResult {
         tree,
         cte_registry: cte_ctx.registry,
         has_recursion,
+        warnings,
     })
 }
 
@@ -11044,11 +11101,12 @@ unsafe fn parse_from_item(
                 .unwrap_or_default();
 
             // Check if this CTE has already been parsed (reuse cte_id)
-            let (cte_id, columns) = if let Some(id) = cte_ctx.lookup_id(&table_name) {
+            let (cte_id, columns, body_clone) = if let Some(id) = cte_ctx.lookup_id(&table_name) {
                 // Already parsed — reuse the existing entry
                 let (_, body) = &cte_ctx.registry.entries[id];
                 let cols = body.output_columns();
-                (id, cols)
+                let body_clone = body.clone();
+                (id, cols, body_clone)
             } else {
                 // First reference — parse the CTE body and register it.
                 // Check `op` field to handle UNION ALL CTE bodies (e.g.,
@@ -11060,8 +11118,9 @@ unsafe fn parse_from_item(
                     unsafe { parse_select_stmt(cte_stmt, "", cte_ctx)? }
                 };
                 let cols = cte_tree.output_columns();
+                let body_clone = cte_tree.clone();
                 let id = cte_ctx.register(&table_name, cte_tree);
-                (id, cols)
+                (id, cols, body_clone)
             };
 
             return Ok(OpTree::CteScan {
@@ -11071,6 +11130,7 @@ unsafe fn parse_from_item(
                 columns,
                 cte_def_aliases: def_aliases,
                 column_aliases: col_aliases,
+                body: Some(Box::new(body_clone)),
             });
         }
 
@@ -11218,12 +11278,14 @@ unsafe fn parse_from_item(
             // If columns are added to either table that happen to match a column
             // on the other side, the join semantics change silently. Explicit
             // JOIN ... ON is recommended for production stream tables.
-            pgrx::warning!(
+            // Push to the per-parse accumulator; the top-level caller emits
+            // this exactly once via ParseResult.warnings.
+            push_parse_warning(format!(
                 "pg_trickle: NATURAL JOIN resolved on columns [{}]. \
                  Adding a same-named column to either table will silently change \
                  join semantics. Consider using explicit JOIN ... ON instead.",
                 common.join(", "),
-            );
+            ));
 
             // Build condition: left.col1 = right.col1 AND left.col2 = right.col2 ...
             let left_alias = left.alias();
@@ -16331,6 +16393,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.alias(), "t1");
     }
@@ -16344,6 +16407,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["user_id", "total"]);
     }
@@ -16357,6 +16421,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec!["uid".to_string(), "amt".to_string()],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["uid", "amt"]);
     }
@@ -16371,6 +16436,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert!(node.source_oids().is_empty());
     }
@@ -16384,6 +16450,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert!(check_ivm_support(&node).is_ok());
     }
@@ -16442,6 +16509,7 @@ mod tests {
             tree: tree.clone(),
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert_eq!(result.tree.alias(), "orders");
         assert_eq!(result.cte_registry.entries.len(), 1);
@@ -16457,6 +16525,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let mut registry = CteRegistry::default();
         registry.entries.push((
@@ -16467,6 +16536,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
     }
@@ -16482,6 +16552,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let t2 = OpTree::CteScan {
             cte_id: 0,
@@ -16490,6 +16561,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let tree = OpTree::InnerJoin {
             condition: Expr::BinaryOp {
@@ -16510,6 +16582,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
         // Only one entry in the registry despite two CteScan nodes
@@ -16528,6 +16601,7 @@ mod tests {
             columns: vec!["id".to_string(), "amount".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let tree = OpTree::CteScan {
             cte_id: 1,
@@ -16536,6 +16610,7 @@ mod tests {
             columns: vec!["id".to_string(), "amount".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
 
         let mut registry = CteRegistry::default();
@@ -16546,6 +16621,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
         assert_eq!(result.cte_registry.entries.len(), 2);
@@ -16562,6 +16638,7 @@ mod tests {
             tree: scan_node("t", 1, &["id"]),
             cte_registry: CteRegistry::default(),
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(!result.has_recursion);
     }
@@ -16572,6 +16649,7 @@ mod tests {
             tree: scan_node("t", 1, &["id"]),
             cte_registry: CteRegistry::default(),
             has_recursion: true,
+            warnings: vec![],
         };
         assert!(result.has_recursion);
     }
@@ -16582,6 +16660,7 @@ mod tests {
             tree: scan_node("t", 1, &["id"]),
             cte_registry: CteRegistry::default(),
             has_recursion: true,
+            warnings: vec![],
         };
         let cloned = result.clone();
         assert!(cloned.has_recursion);
@@ -16599,6 +16678,7 @@ mod tests {
             columns: vec!["id".to_string(), "name".to_string()],
             cte_def_aliases: vec!["a".to_string(), "b".to_string()],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["a", "b"]);
     }
@@ -16614,6 +16694,7 @@ mod tests {
             columns: vec!["id".to_string(), "name".to_string()],
             cte_def_aliases: vec!["a".to_string(), "b".to_string()],
             column_aliases: vec!["c".to_string(), "d".to_string()],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["c", "d"]);
     }
@@ -16628,6 +16709,7 @@ mod tests {
             columns: vec!["user_id".to_string(), "total".to_string()],
             cte_def_aliases: vec!["uid".to_string(), "amt".to_string()],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(node.output_columns(), vec!["uid", "amt"]);
     }
@@ -17595,6 +17677,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(tree.row_id_key_columns(), Some(vec!["id".to_string()]));
     }
@@ -17698,6 +17781,7 @@ mod tests {
                 columns: vec![],
                 cte_def_aliases: vec![],
                 column_aliases: vec![],
+                body: None,
             }
             .node_kind(),
             "cte scan"
@@ -17917,6 +18001,7 @@ mod tests {
             columns: vec![],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert!(resolves_to_base_table(&cte));
     }
@@ -18027,6 +18112,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         let mut registry = CteRegistry::default();
         registry.entries.push((
@@ -18049,6 +18135,7 @@ mod tests {
             tree,
             cte_registry: registry,
             has_recursion: false,
+            warnings: vec![],
         };
         assert!(check_ivm_support_with_registry(&result).is_ok());
     }
@@ -19832,6 +19919,7 @@ mod tests {
             columns: vec!["id".to_string()],
             cte_def_aliases: vec![],
             column_aliases: vec![],
+            body: None,
         };
         assert_eq!(tree.source_oids(), Vec::<u32>::new());
     }
