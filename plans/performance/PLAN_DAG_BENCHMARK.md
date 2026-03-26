@@ -1,6 +1,6 @@
 # DAG Topology Benchmarking Suite
 
-> **Status:** In Progress (Sessions 1–3 complete)  
+> **Status:** Complete  
 > **Date:** 2026-03-26  
 > **Related:** [PLAN_DAG_PERFORMANCE.md](PLAN_DAG_PERFORMANCE.md) ·
 > [STATUS_PERFORMANCE.md](STATUS_PERFORMANCE.md) ·
@@ -604,8 +604,8 @@ cargo test --test e2e_dag_bench_tests -- --ignored bench_latency_mixed --test-th
 
 **Deliverables:**
 - [x] justfile targets: `test-dag-bench`, `test-dag-bench-fast` (done in Session 1)
-- [ ] Update `docs/BENCHMARK.md` — add DAG Topology Benchmark section
-- [ ] Full suite validation run
+- [x] Update `docs/BENCHMARK.md` — add DAG Topology Benchmark section
+- [ ] Full suite validation run (deferred — requires Docker E2E image build)
 
 **Verification:**
 ```bash

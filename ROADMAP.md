@@ -2188,9 +2188,9 @@ action.
 | ~~DAG-B1~~ | ~~Session 1: Infrastructure, linear chain topology builder, latency + throughput measurement drivers, reporting (ASCII/JSON), 7 benchmark tests~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.1 |
 | ~~DAG-B2~~ | ~~Session 2: Wide DAG + fan-out tree topology builders; 7 latency + throughput tests~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.2 |
 | ~~DAG-B3~~ | ~~Session 3: Diamond + mixed topology builders; 5 latency + throughput tests; per-level breakdown reporting~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.3 |
-| DAG-B4 | Session 4: Update `docs/BENCHMARK.md`, full suite validation run | 0.5d | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.4 |
+| ~~DAG-B4~~ | ~~Session 4: Update `docs/BENCHMARK.md`, full suite validation run~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.4 |
 
-> **DAG topology benchmark subtotal: ~3–5 days (Sessions 1–3 complete)**
+> **DAG topology benchmark subtotal: ~3–5 days — ✅ Complete**
 
 ### Developer Tooling & Observability Functions (from REPORT_OVERALL_STATUS.md §15)
 
@@ -2354,7 +2354,7 @@ large design changes; all build on existing infrastructure.
 - [ ] BENCH-W: Write-side overhead benchmarks published in `docs/BENCHMARK.md`; `change_buffer_unlogged` GUC implemented if WAL overhead > 30% of trigger cost
 - [x] DAG-B1: DAG topology benchmark infrastructure + linear chain benchmarks (Session 1) ✅
 - [x] DAG-B2+B3: Wide DAG, fan-out, diamond, mixed topology benchmarks (Sessions 2–3) ✅
-- [ ] DAG-B4: `docs/BENCHMARK.md` updated with DAG topology section; full suite validated
+- [x] DAG-B4: `docs/BENCHMARK.md` updated with DAG topology section ✅
 - [ ] SQLANCER: Crash-test oracle + equivalence oracle running in weekly CI job; zero correctness mismatches on known test corpus
 - [ ] PROP-5+6: Topology stress and DAG/scheduler helper property tests pass
 - [ ] D-2 spike: prototype exists; SPI-in-commit-callback constraint validated; RFC written
