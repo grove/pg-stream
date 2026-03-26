@@ -31,7 +31,7 @@ services:
       # Pre-load pg_trickle extension on startup
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
       - ./init:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
