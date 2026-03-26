@@ -2672,21 +2672,15 @@ pub fn execute_differential_refresh(
         hasher.finish()
     };
 
-    let has_any_cte = dvm::query_has_cte(&st.defining_query)?;
     let has_recursive_cte = dvm::query_has_recursive_cte(&st.defining_query)?;
 
-    if has_any_cte {
-        pgrx::info!(
-            "[pg_trickle] CTE-backed differential refresh fallback: using FULL refresh for {}.{}",
-            schema,
-            name,
-        );
-        let result = execute_full_refresh(st);
-        if result.is_ok() {
-            post_full_refresh_cleanup(st);
-        }
-        return result;
-    }
+    // Non-recursive CTEs (WITH … AS (…)) are fully supported by the DVM
+    // engine: parse_defining_query_full() builds CteScan nodes and the
+    // diff engine processes them via diff_cte_scan().  There is no need for
+    // a FULL fallback here.  Recursive CTEs (WITH RECURSIVE) use a
+    // semi-naive / DRed strategy and bypass the MERGE template cache (they
+    // generate their delta SQL on every refresh instead of caching a
+    // template with LSN placeholders).
 
     let cached = if has_recursive_cte {
         None
