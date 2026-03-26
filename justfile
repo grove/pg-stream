@@ -23,6 +23,16 @@ build:
 build-release:
     cargo build --release --features pg{{pg}}
 
+# Build the Docker Hub image (PostgreSQL 18 with pg_trickle pre-installed)
+[group: "build"]
+build-hub:
+    docker build -t pgtrickle/pg_trickle:0.11.0-pg18 -f Dockerfile.hub .
+
+# Build the Docker Hub image with 'latest' tag
+[group: "build"]
+build-hub-latest:
+    docker build -t pgtrickle/pg_trickle:latest -f Dockerfile.hub .
+
 # ── Lint & Format ─────────────────────────────────────────────────────────
 
 # Format source code
