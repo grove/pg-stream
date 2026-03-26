@@ -232,7 +232,12 @@ pub static PGS_IVM_RECURSIVE_MAX_DEPTH: GucSetting<i32> = GucSetting::<i32>::new
 /// Falls back to poll-based wake (using `scheduler_interval_ms`) when no
 /// notifications arrive. Disable if the NOTIFY overhead is measurable on
 /// extremely high-throughput write paths (> 100K DML/s).
-pub static PGS_EVENT_DRIVEN_WAKE: GucSetting<bool> = GucSetting::<bool>::new(true);
+// WAKE-1: PostgreSQL's LISTEN command is not allowed in background workers
+// (MyBackendType != B_BACKEND — see async.c:Async_Listen()). The scheduler is
+// always a background worker, so event-driven wake via LISTEN/NOTIFY cannot
+// function as designed. Default is off until a background-worker-compatible
+// wake mechanism is implemented (e.g., shared-memory latch signalling).
+pub static PGS_EVENT_DRIVEN_WAKE: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// WAKE-1: Coalesce debounce interval in milliseconds.
 ///
@@ -839,11 +844,11 @@ pub fn register_gucs() {
     // WAKE-1: Event-driven scheduler wake GUCs.
     GucRegistry::define_bool_guc(
         c"pg_trickle.event_driven_wake",
-        c"Enable event-driven scheduler wake via LISTEN/NOTIFY (default on).",
-        c"When enabled, CDC triggers emit pg_notify('pgtrickle_wake') and the \
-           scheduler LISTENs on that channel, waking immediately instead of \
-           waiting for the poll interval. Reduces median latency ~34x for \
-           low-volume workloads. Disable for extreme write throughput (>100K DML/s).",
+        c"Enable event-driven scheduler wake via LISTEN/NOTIFY (default off; not yet functional in background workers).",
+        c"Reserved for future use. PostgreSQL LISTEN is not allowed in background \
+           worker processes (MyBackendType != B_BACKEND), so enabling this has no \
+           effect — the scheduler operates in polling-only mode regardless. \
+           CDC triggers still emit pg_notify('pgtrickle_wake') for future use.",
         &PGS_EVENT_DRIVEN_WAKE,
         GucContext::Suset,
         GucFlags::default(),

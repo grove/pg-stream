@@ -1638,24 +1638,25 @@ pub extern "C-unwind" fn pg_trickle_scheduler_main(_arg: pg_sys::Datum) {
     }));
 
     // WAKE-1: Event-driven wake via LISTEN/NOTIFY.
-    // When enabled, the scheduler LISTENs on the 'pgtrickle_wake' channel.
-    // CDC triggers emit pg_notify('pgtrickle_wake', '') after writing to the
-    // change buffer.  PostgreSQL sets the scheduler's latch when a notification
-    // arrives (after the notifying transaction commits), causing wait_latch()
-    // to return immediately instead of sleeping for the full poll interval.
-    let event_driven = config::pg_trickle_event_driven_wake();
-    if event_driven {
-        BackgroundWorker::transaction(AssertUnwindSafe(|| {
-            if let Err(e) = Spi::run("LISTEN pgtrickle_wake") {
-                warning!(
-                    "pg_trickle scheduler: failed to LISTEN pgtrickle_wake: {}",
-                    e
-                );
-            }
-        }));
-        log!(
-            "pg_trickle scheduler: event-driven wake enabled (debounce={}ms)",
-            config::pg_trickle_wake_debounce_ms()
+    //
+    // PostgreSQL's LISTEN command is restricted to regular backends
+    // (MyBackendType == B_BACKEND). Background workers — which the scheduler
+    // always is — are rejected with "cannot execute LISTEN within a background
+    // process" (async.c:Async_Listen()). Attempting LISTEN causes an elog(ERROR)
+    // that escapes pgrx's catch_unwind and exits the process with exit code 1.
+    //
+    // Until a background-worker-compatible notification mechanism is implemented
+    // (e.g., direct latch signalling via shared memory), event_driven_wake is
+    // always forced to false here regardless of the GUC value. CDC triggers still
+    // emit pg_notify('pgtrickle_wake') for future use once this is re-enabled.
+    let event_driven = false;
+    if config::pg_trickle_event_driven_wake() {
+        // GUC is on but feature is not yet functional in BGWs — warn once at startup.
+        warning!(
+            "pg_trickle scheduler: event_driven_wake=on is not supported in background \
+             workers (PostgreSQL LISTEN is restricted to B_BACKEND processes). \
+             Operating in polling-only mode. Set pg_trickle.event_driven_wake=off \
+             to suppress this warning."
         );
     }
 
