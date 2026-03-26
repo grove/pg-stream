@@ -4714,6 +4714,114 @@ fn check_from_item_for_matview_or_foreign(node: *mut pg_sys::Node) -> Result<(),
 /// For set-operation queries (UNION/INTERSECT/EXCEPT), LIMIT/OFFSET on
 /// the top-level wrapper is checked. LIMIT inside subqueries or LATERAL
 /// is intentionally allowed.
+/// Rewrite `SELECT DISTINCT ON (...)` inside `WITH` clause CTE bodies.
+///
+/// The top-level `rewrite_distinct_on` function only handles `DISTINCT ON` at
+/// the outermost SELECT. When a CTE body itself uses `DISTINCT ON`, it escapes
+/// the rewrite and the DVM parser later rejects it with `UnsupportedOperator`.
+///
+/// This helper iterates every non-recursive CTE in the `WITH` clause, deparsed
+/// each CTE body that contains `DISTINCT ON` back to SQL, runs
+/// `rewrite_distinct_on` recursively on that body, and reassembles the full
+/// query with the rewritten bodies.
+///
+/// Returns the original query string unchanged when no CTE body uses
+/// `DISTINCT ON`.
+fn rewrite_cte_bodies_for_distinct_on(query: &str) -> Result<String, PgTrickleError> {
+    let select = match parse_first_select(query)? {
+        Some(s) => unsafe { &*s },
+        None => return Ok(query.to_string()),
+    };
+
+    // Only applies to plain SELECT with a WITH clause (not set operations).
+    if select.withClause.is_null() || select.op != pg_sys::SetOperation::SETOP_NONE {
+        return Ok(query.to_string());
+    }
+
+    // SAFETY: withClause is non-null, confirmed above.
+    let wc = unsafe { &*select.withClause };
+    let cte_list = pg_list::<pg_sys::Node>(wc.ctes);
+
+    // First pass: check whether any CTE body uses DISTINCT ON.
+    let has_distinct_on_cte = cte_list.iter_ptr().any(|node_ptr| {
+        if !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
+            return false;
+        }
+        // SAFETY: pgrx::is_a confirmed T_CommonTableExpr.
+        let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
+        if cte.ctequery.is_null()
+            || !unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            return false;
+        }
+        // SAFETY: pgrx::is_a confirmed T_SelectStmt.
+        let body = unsafe { &*(cte.ctequery as *const pg_sys::SelectStmt) };
+        if body.distinctClause.is_null() {
+            return false;
+        }
+        let distinct_list = pg_list::<pg_sys::Node>(body.distinctClause);
+        // DISTINCT ON has real (non-null) expression nodes; plain DISTINCT uses null nodes.
+        distinct_list.iter_ptr().any(|ptr| !ptr.is_null())
+    });
+    if !has_distinct_on_cte {
+        return Ok(query.to_string());
+    }
+
+    // Second pass: rebuild the WITH clause with rewritten CTE bodies.
+    let mut new_cte_parts: Vec<String> = Vec::new();
+    for node_ptr in cte_list.iter_ptr() {
+        if !unsafe { pgrx::is_a(node_ptr, pg_sys::NodeTag::T_CommonTableExpr) } {
+            continue;
+        }
+        // SAFETY: pgrx::is_a confirmed T_CommonTableExpr.
+        let cte = unsafe { &*(node_ptr as *const pg_sys::CommonTableExpr) };
+        let cte_name = pg_cstr_to_str(cte.ctename).unwrap_or("cte").to_string();
+        let quoted_name = format!("\"{}\"", cte_name.replace('"', "\"\""));
+
+        let col_aliases = extract_cte_def_colnames(cte)?;
+        let alias_part = if col_aliases.is_empty() {
+            String::new()
+        } else {
+            let q: Vec<String> = col_aliases
+                .iter()
+                .map(|a| format!("\"{}\"", a.replace('"', "\"\"")))
+                .collect();
+            format!("({})", q.join(", "))
+        };
+
+        if !cte.ctequery.is_null()
+            && unsafe { pgrx::is_a(cte.ctequery, pg_sys::NodeTag::T_SelectStmt) }
+        {
+            // Deparse the CTE body and recursively rewrite DISTINCT ON.
+            // (Handles nested WITH…DISTINCT ON inside the body as well.)
+            let body_sql =
+                deparse_select_stmt_with_view_subs(cte.ctequery as *const pg_sys::SelectStmt, &[])?;
+            let rewritten = rewrite_distinct_on(&body_sql)?;
+            new_cte_parts.push(format!("{quoted_name}{alias_part} AS ({rewritten})"));
+        } else {
+            // Non-SELECT CTE body — should not arise for valid SQL, kept for safety.
+            new_cte_parts.push(format!("{quoted_name}{alias_part} AS (SELECT 1)"));
+        }
+    }
+
+    let recursive = if wc.recursive { "RECURSIVE " } else { "" };
+    let new_with = format!("WITH {recursive}{}", new_cte_parts.join(",\n  "));
+
+    // Reconstruct the full query as: <new WITH clause>\n<original main SELECT body>.
+    // Both the full deparsed form and the WITH prefix are produced by the same
+    // deparsing logic from the same parse tree, so stripping the prefix is exact.
+    let full_deparsed = deparse_select_stmt_with_view_subs(select, &[])?;
+    let with_prefix = deparse_with_clause_with_view_subs(select.withClause, &[])?;
+    let main_body = if let Some(rest) = full_deparsed.strip_prefix(&with_prefix) {
+        rest.trim_start().to_string()
+    } else {
+        // Fallback: should not happen; return the full statement as-is.
+        full_deparsed
+    };
+
+    Ok(format!("{new_with}\n{main_body}"))
+}
+
 /// Detect and rewrite `DISTINCT ON (...)` queries.
 ///
 /// `SELECT DISTINCT ON (e1, e2) col1, col2 FROM t ORDER BY e1, e2, col3`
@@ -4727,8 +4835,17 @@ fn check_from_item_for_matview_or_foreign(node: *mut pg_sys::Node) -> Result<(),
 /// ) __pgt_do WHERE __pgt_rn = 1
 /// ```
 ///
+/// Also rewrites `DISTINCT ON` inside `WITH` clause CTE bodies so that the
+/// DVM parser never encounters unsupported `DISTINCT ON` in a CTE SelectStmt.
+///
 /// Returns the original query unchanged if it does not use DISTINCT ON.
 pub fn rewrite_distinct_on(query: &str) -> Result<String, PgTrickleError> {
+    // Rewrite DISTINCT ON inside any CTE bodies first.  The DVM parser calls
+    // parse_select_stmt on CTE bodies and rejects DISTINCT ON there; doing the
+    // rewrite here lets those CTE bodies through to the differential path.
+    let owned = rewrite_cte_bodies_for_distinct_on(query)?;
+    let query = owned.as_str();
+
     let select = match parse_first_select(query)? {
         Some(s) => unsafe { &*s },
         None => return Ok(query.to_string()),
@@ -12173,7 +12290,12 @@ unsafe fn node_to_expr(node: *mut pg_sys::Node) -> Result<Expr, PgTrickleError> 
             if let Some(indices) = cast_node!(ind_node, T_A_Indices, pg_sys::A_Indices) {
                 if !indices.uidx.is_null() {
                     let idx = unsafe { node_to_expr(indices.uidx)? };
-                    sql = format!("{sql}[{}]", idx.to_sql());
+                    // Parenthesize `sql` so that complex base expressions such as
+                    // `array_agg(...) FILTER (WHERE ...)` deparse as
+                    // `(array_agg(...) FILTER (WHERE ...))[1]` — the subscript
+                    // operator binds tighter than FILTER/aggregate syntax, so
+                    // omitting the parens produces invalid SQL.
+                    sql = format!("({sql})[{}]", idx.to_sql());
                 }
             } else if let Some(s) = cast_node!(ind_node, T_String, pg_sys::String) {
                 let field_name = pg_cstr_to_str(s.sval).unwrap_or("");
