@@ -8879,6 +8879,20 @@ fn resolve_range_subselect_alias(sub: &pg_sys::RangeSubselect) -> String {
 ///
 /// This avoids running the full DVM parser (which resolves table OIDs,
 /// builds the operator tree, etc.) for queries that would fail anyway.
+/// Convert a byte offset from a PostgreSQL parser `location` field into a
+/// 1-based (line, column) pair within `query`.  Returns `None` when the
+/// offset is unknown (PostgreSQL sets it to `-1` when unavailable).
+fn query_byte_offset_to_linecol(query: &str, offset: i32) -> Option<(usize, usize)> {
+    if offset < 0 {
+        return None;
+    }
+    let offset = (offset as usize).min(query.len());
+    let prefix = &query[..offset];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = prefix.rfind('\n').map_or(offset + 1, |pos| offset - pos);
+    Some((line, col))
+}
+
 pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgTrickleError> {
     let select = match parse_first_select(query)? {
         Some(s) => unsafe { &*s },
@@ -8889,24 +8903,27 @@ pub fn reject_unsupported_constructs(query: &str) -> Result<(), PgTrickleError> 
     if select.op != pg_sys::SetOperation::SETOP_NONE {
         if !select.larg.is_null() {
             // SAFETY: larg points to a valid SelectStmt
-            check_select_unsupported(unsafe { &*select.larg })?;
+            check_select_unsupported(unsafe { &*select.larg }, query)?;
         }
         if !select.rarg.is_null() {
             // SAFETY: rarg points to a valid SelectStmt
-            check_select_unsupported(unsafe { &*select.rarg })?;
+            check_select_unsupported(unsafe { &*select.rarg }, query)?;
         }
         return Ok(());
     }
 
     // SAFETY: select is a valid SelectStmt
-    check_select_unsupported(select)
+    check_select_unsupported(select, query)
 }
 
 /// Check a single SelectStmt for unsupported constructs.
 ///
 /// # Safety
 /// Caller must ensure `select` points to a valid `pg_sys::SelectStmt`.
-fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickleError> {
+fn check_select_unsupported(
+    select: &pg_sys::SelectStmt,
+    query: &str,
+) -> Result<(), PgTrickleError> {
     // ── DISTINCT ON ─────────────────────────────────────────────────
     // DISTINCT ON is handled by auto-rewriting to a ROW_NUMBER() window
     // function in the DVM parser (`rewrite_distinct_on()`). No rejection
@@ -8918,7 +8935,7 @@ fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickle
         for node_ptr in from_list.iter_ptr() {
             if !node_ptr.is_null() {
                 // SAFETY: node_ptr is valid from the from_list
-                check_from_item_unsupported(node_ptr)?;
+                check_from_item_unsupported(node_ptr, query)?;
             }
         }
     }
@@ -8961,27 +8978,29 @@ fn check_select_unsupported(select: &pg_sys::SelectStmt) -> Result<(), PgTrickle
 ///
 /// # Safety
 /// Caller must ensure `node` points to a valid `pg_sys::Node`.
-fn check_from_item_unsupported(node: *mut pg_sys::Node) -> Result<(), PgTrickleError> {
+fn check_from_item_unsupported(node: *mut pg_sys::Node, query: &str) -> Result<(), PgTrickleError> {
     if let Some(join) = cast_node!(node, T_JoinExpr, pg_sys::JoinExpr) {
         // Recursively check join children
         if !join.larg.is_null() {
             // SAFETY: larg is valid from JoinExpr
-            check_from_item_unsupported(join.larg)?;
+            check_from_item_unsupported(join.larg, query)?;
         }
         if !join.rarg.is_null() {
             // SAFETY: rarg is valid from JoinExpr
-            check_from_item_unsupported(join.rarg)?;
+            check_from_item_unsupported(join.rarg, query)?;
         }
-    } else if unsafe { pgrx::is_a(node, pg_sys::NodeTag::T_RangeTableSample) } {
+    } else if let Some(rts) = cast_node!(node, T_RangeTableSample, pg_sys::RangeTableSample) {
         // TABLESAMPLE: SELECT * FROM t TABLESAMPLE BERNOULLI(10)
         // Stream tables materialize complete result sets; non-deterministic
         // sampling is not meaningful. Reject in both FULL and DIFFERENTIAL modes.
-        return Err(PgTrickleError::UnsupportedOperator(
-            "TABLESAMPLE is not supported in defining queries. \
+        let loc = query_byte_offset_to_linecol(query, rts.location)
+            .map(|(l, c)| format!(" at line {l}, column {c}"))
+            .unwrap_or_default();
+        return Err(PgTrickleError::UnsupportedOperator(format!(
+            "TABLESAMPLE{loc} is not supported in defining queries. \
              Stream tables materialize the complete result set; \
              use a WHERE condition with random() if sampling is needed."
-                .into(),
-        ));
+        )));
     }
     // RangeVar and RangeSubselect are fine — no check needed
     Ok(())

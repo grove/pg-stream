@@ -794,12 +794,10 @@ fn validate_and_parse_query(
     if let Err(e) = crate::dvm::reject_unsupported_constructs(q) {
         if is_auto {
             pgrx::warning!(
-                "[pg_trickle] Falling back to FULL refresh: query uses constructs not \
-                 yet supported by differential maintenance ({}).\n\
-                 Suggestion: rewrite NATURAL JOINs as explicit JOIN ... ON conditions, \
-                 and replace correlated subquery expressions with JOINs or CTEs. \
-                 See docs/DVM_OPERATORS.md for the full list of supported operators.",
-                e
+                "[pg_trickle] Falling back to FULL refresh: unsupported construct \
+                 in defining query.\n\
+                 Construct: {e}\n\
+                 See docs/DVM_OPERATORS.md for the full list of supported operators."
             );
             *refresh_mode = RefreshMode::Full;
         } else {
