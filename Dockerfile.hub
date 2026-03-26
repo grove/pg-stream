@@ -76,7 +76,6 @@ RUN mkdir -p src/bin src/dvm/operators benches && \
 # If only src/ changes on next build, this layer is skipped, saving ~10–15 min.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/build/target \
     cargo fetch && \
     cargo build --release 2>&1 | grep -v "warning:" || true
 
@@ -97,7 +96,6 @@ COPY pg_trickle.control ./
 # Compile the extension against cached dependencies
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/build/target \
     cargo pgrx package --pg-config /usr/bin/pg_config && \
     mkdir -p /artefacts && \
     cp -r target/release/pg_trickle-pg18 /artefacts/
