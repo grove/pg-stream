@@ -20,11 +20,10 @@ services:
 
   # ── PostgreSQL + pg_trickle ────────────────────────────────────────────────
   postgres:
-    image: ghcr.io/pgstream/pg-trickle:latest
-    # Alternatively, build from the repo root:
-    # build:
-    #   context: ..
-    #   dockerfile: Dockerfile.hub
+    # image: ghcr.io/pgstream/pg-trickle:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile.hub
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
