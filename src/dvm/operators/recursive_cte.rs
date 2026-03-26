@@ -1883,6 +1883,35 @@ fn generate_change_buffer_from(
             ))
         }
 
+        // Expand nested join chains inline so that table aliases produced
+        // by each child remain visible to the enclosing ON condition.
+        // Wrapping in (SELECT ...) AS __sub would hide those aliases.
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nJOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
         _ => {
             // For other node types, fall back to normal SQL generation
             let sql = generate_query_sql(op, Some(st_table))?;
@@ -1970,6 +1999,33 @@ fn generate_old_change_buffer_from(
             "{st_table} AS {alias_q}",
             alias_q = quote_ident(alias),
         )),
+
+        // Expand nested join chains inline to keep table aliases visible.
+        OpTree::InnerJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_old_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_old_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nJOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
+
+        OpTree::LeftJoin {
+            condition,
+            left,
+            right,
+        } => {
+            let left_from = generate_old_change_buffer_from(ctx, left, st_table)?;
+            let right_from = generate_old_change_buffer_from(ctx, right, st_table)?;
+            Ok(format!(
+                "{left_from}\nLEFT JOIN {right_from}\n  ON {cond}",
+                cond = condition.to_sql(),
+            ))
+        }
 
         _ => {
             let sql = generate_query_sql(op, Some(st_table))?;
