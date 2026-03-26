@@ -151,9 +151,12 @@ async fn test_concurrent_insert_during_pipeline_refresh() {
         }
     });
 
-    // Run 5 pipeline refresh cycles concurrently with the inserts
+    // Run 5 pipeline refresh cycles concurrently with the inserts.
+    // Use retry for both layers because the background scheduler can race
+    // with our manual refresh calls when CDC triggers fire from the
+    // concurrent insert task.
     for _ in 0..5 {
-        db.refresh_st("conc_dag_l1").await;
+        db.refresh_st_with_retry("conc_dag_l1").await;
         db.refresh_st_with_retry("conc_dag_l2").await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
