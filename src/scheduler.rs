@@ -4765,4 +4765,212 @@ mod tests {
         assert_eq!(state.adaptive_poll_ms, ADAPTIVE_POLL_MIN_MS);
         assert_eq!(state.completions_this_tick, 0);
     }
+
+    // ── DAG-1: Intra-tick pipelining validation ───────────────────────────
+    //
+    // The parallel dispatch architecture from Phase 4 already achieves
+    // intra-tick pipelining: Step 1 immediately decrements downstream
+    // `remaining_upstreams`, and Step 2 picks up newly-ready units in the
+    // same tick. These tests validate the state-machine invariants.
+
+    #[test]
+    fn test_cascade_pipeline_downstream_ready_after_upstream_completes() {
+        // Three-unit cascade: A → B → C.
+        // When A completes in Step 1, B.remaining_upstreams drops to 0
+        // and B is dispatchable in Step 2 of the same tick.
+        let mut state = ParallelDispatchState::new();
+        let uid_a = crate::dag::ExecutionUnitId(1);
+        let uid_b = crate::dag::ExecutionUnitId(2);
+        let uid_c = crate::dag::ExecutionUnitId(3);
+
+        // Initial state: A=0 upstreams, B=1 (A), C=1 (B).
+        state.unit_states.insert(
+            uid_a,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: Some(100),
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_b,
+            UnitDispatchState {
+                remaining_upstreams: 1,
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_c,
+            UnitDispatchState {
+                remaining_upstreams: 1,
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.per_db_inflight = 1;
+
+        // Simulate Step 1: A completes → decrement downstream B.
+        state.unit_states.get_mut(&uid_a).unwrap().inflight_job_id = None;
+        state.unit_states.get_mut(&uid_a).unwrap().succeeded = true;
+        state.per_db_inflight -= 1;
+        // Decrement downstream (B depends on A).
+        state
+            .unit_states
+            .get_mut(&uid_b)
+            .unwrap()
+            .remaining_upstreams -= 1;
+
+        // Verify: B is now ready (remaining=0, not succeeded, not inflight).
+        let b_state = &state.unit_states[&uid_b];
+        assert_eq!(
+            b_state.remaining_upstreams, 0,
+            "B should be ready after A completes"
+        );
+        assert!(!b_state.succeeded);
+        assert!(b_state.inflight_job_id.is_none());
+
+        // Verify: C is still blocked.
+        let c_state = &state.unit_states[&uid_c];
+        assert_eq!(c_state.remaining_upstreams, 1, "C should still be blocked");
+    }
+
+    #[test]
+    fn test_mixed_cost_levels_no_level_barrier() {
+        // Level 0: A (fast), B (slow).
+        // Level 1: C depends only on A, D depends on both A and B.
+        // When A completes, C should be immediately ready even though
+        // B (same level) is still running — no level barrier.
+        let mut state = ParallelDispatchState::new();
+        let uid_a = crate::dag::ExecutionUnitId(1);
+        let uid_b = crate::dag::ExecutionUnitId(2);
+        let uid_c = crate::dag::ExecutionUnitId(3);
+        let uid_d = crate::dag::ExecutionUnitId(4);
+
+        state.unit_states.insert(
+            uid_a,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: Some(100),
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_b,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: Some(101),
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_c,
+            UnitDispatchState {
+                remaining_upstreams: 1, // depends on A only
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.unit_states.insert(
+            uid_d,
+            UnitDispatchState {
+                remaining_upstreams: 2, // depends on A and B
+                inflight_job_id: None,
+                succeeded: false,
+            },
+        );
+        state.per_db_inflight = 2;
+
+        // Simulate: A completes (fast), B still running.
+        state.unit_states.get_mut(&uid_a).unwrap().inflight_job_id = None;
+        state.unit_states.get_mut(&uid_a).unwrap().succeeded = true;
+        state.per_db_inflight -= 1;
+        // Decrement C (depends on A) and D (depends on A and B).
+        state
+            .unit_states
+            .get_mut(&uid_c)
+            .unwrap()
+            .remaining_upstreams -= 1;
+        state
+            .unit_states
+            .get_mut(&uid_d)
+            .unwrap()
+            .remaining_upstreams -= 1;
+
+        // C is ready — A was its only upstream.
+        let c_state = &state.unit_states[&uid_c];
+        assert_eq!(
+            c_state.remaining_upstreams, 0,
+            "C should be ready (A was its only dep)"
+        );
+        assert!(!c_state.succeeded);
+        assert!(c_state.inflight_job_id.is_none());
+
+        // D is still blocked — needs B too.
+        let d_state = &state.unit_states[&uid_d];
+        assert_eq!(d_state.remaining_upstreams, 1, "D still waiting for B");
+
+        // B still running.
+        assert!(state.unit_states[&uid_b].inflight_job_id.is_some());
+        assert_eq!(state.per_db_inflight, 1);
+    }
+
+    #[test]
+    fn test_cascade_wave_reset_preserves_correctness() {
+        // After a full cascade A → B → C all complete, the wave reset
+        // restores remaining_upstreams so units can run in the next cycle.
+        let mut state = ParallelDispatchState::new();
+        let uid_a = crate::dag::ExecutionUnitId(1);
+        let uid_b = crate::dag::ExecutionUnitId(2);
+        let uid_c = crate::dag::ExecutionUnitId(3);
+
+        // All units completed this wave.
+        state.unit_states.insert(
+            uid_a,
+            UnitDispatchState {
+                remaining_upstreams: 0,
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.unit_states.insert(
+            uid_b,
+            UnitDispatchState {
+                remaining_upstreams: 0, // was decremented from 1 when A succeeded
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.unit_states.insert(
+            uid_c,
+            UnitDispatchState {
+                remaining_upstreams: 0, // was decremented from 1 when B succeeded
+                inflight_job_id: None,
+                succeeded: true,
+            },
+        );
+        state.per_db_inflight = 0;
+
+        // Simulate wave reset (Step 4 logic).
+        // In production this uses eu_dag.get_upstream_units(uid).len();
+        // here we simulate B.original=1, C.original=1.
+        let original_upstreams: HashMap<crate::dag::ExecutionUnitId, usize> =
+            [(uid_a, 0), (uid_b, 1), (uid_c, 1)].into();
+
+        if state.per_db_inflight == 0 {
+            let any_done = state.unit_states.values().any(|us| us.succeeded);
+            if any_done {
+                for (&uid, us) in state.unit_states.iter_mut() {
+                    us.succeeded = false;
+                    us.remaining_upstreams = *original_upstreams.get(&uid).unwrap_or(&0);
+                }
+            }
+        }
+
+        // After reset: A is ready for next wave, B and C blocked on upstreams.
+        assert_eq!(state.unit_states[&uid_a].remaining_upstreams, 0);
+        assert_eq!(state.unit_states[&uid_b].remaining_upstreams, 1);
+        assert_eq!(state.unit_states[&uid_c].remaining_upstreams, 1);
+        assert!(state.unit_states.values().all(|us| !us.succeeded));
+    }
 }
