@@ -353,6 +353,16 @@ test-bench-e2e: build-e2e-image
 test-bench-e2e-fast:
     ./scripts/run_e2e_tests.sh --test e2e_bench_tests --features pg18 --run-ignored all --no-capture
 
+# Run DAG topology benchmark suite (rebuilds Docker image)
+[group: "bench"]
+test-dag-bench: build-e2e-image
+    ./scripts/run_e2e_tests.sh --test e2e_dag_bench_tests --features pg18 --run-ignored all --no-capture
+
+# Run DAG topology benchmarks, skip Docker image rebuild
+[group: "bench"]
+test-dag-bench-fast:
+    ./scripts/run_e2e_tests.sh --test e2e_dag_bench_tests --features pg18 --run-ignored all --no-capture
+
 # Run diff-operator benchmarks only
 [group: "bench"]
 bench-diff:

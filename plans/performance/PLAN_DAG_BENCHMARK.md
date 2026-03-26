@@ -1,6 +1,6 @@
 # DAG Topology Benchmarking Suite
 
-> **Status:** Plan  
+> **Status:** In Progress (Session 1 complete)  
 > **Date:** 2026-03-26  
 > **Related:** [PLAN_DAG_PERFORMANCE.md](PLAN_DAG_PERFORMANCE.md) ·
 > [STATUS_PERFORMANCE.md](STATUS_PERFORMANCE.md) ·
@@ -545,18 +545,18 @@ disabled server-wide.
 ### Session 1: Infrastructure & Linear Chain (est. effort: large)
 
 **Deliverables:**
-- [ ] `tests/e2e_dag_bench_tests.rs` — file structure, imports, constants
-- [ ] `DagBenchResult`, `StTimingEntry`, `DagTopology` structs
-- [ ] `build_linear_chain()` topology builder
-- [ ] `measure_latency()` and `measure_throughput()` drivers
-- [ ] `collect_per_st_timing()`, `wait_for_leaf_refresh()` helpers
-- [ ] `theoretical_latency_ms()` formula implementation
-- [ ] `apply_dml_mix()` DML generator
-- [ ] `print_dag_results_table()`, `write_dag_results_json()` reporting
-- [ ] `configure_latency_scheduler()` helper
-- [ ] `bench_latency_linear_5_calc`, `bench_latency_linear_10_calc`,
+- [x] `tests/e2e_dag_bench_tests.rs` — file structure, imports, constants
+- [x] `DagBenchResult`, `StTimingEntry`, `DagTopology` structs
+- [x] `build_linear_chain()` topology builder
+- [x] `measure_latency()` and `measure_throughput()` drivers
+- [x] `collect_per_st_timing()`, `wait_for_leaf_refresh()` helpers
+- [x] `theoretical_latency_ms()` formula implementation
+- [x] `apply_dml_mix()` DML generator
+- [x] `print_dag_results_table()`, `write_dag_results_json()` reporting
+- [x] `configure_latency_scheduler()` helper
+- [x] `bench_latency_linear_5_calc`, `bench_latency_linear_10_calc`,
   `bench_latency_linear_20_calc`, `bench_latency_linear_10_par4` tests
-- [ ] `bench_throughput_linear_5`, `bench_throughput_linear_10`,
+- [x] `bench_throughput_linear_5`, `bench_throughput_linear_10`,
   `bench_throughput_linear_20` tests
 
 **Verification:**

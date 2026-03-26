@@ -2174,6 +2174,24 @@ action.
 
 > **CDC write-side benchmark subtotal: ~3–5 days**
 
+### DAG Topology Benchmark Suite (from PLAN_DAG_BENCHMARK.md)
+
+> **In plain terms:** Production deployments form DAGs with 10–500+ stream
+> tables arranged in chains, fan-outs, diamonds, and mixed topologies. This
+> benchmark suite measures end-to-end propagation latency and throughput
+> through these DAG shapes, validates the theoretical latency formulas from
+> PLAN_DAG_PERFORMANCE.md, and provides regression detection for DAG
+> propagation overhead.
+
+| Item | Description | Effort | Ref |
+|------|-------------|--------|-----|
+| ~~DAG-B1~~ | ~~Session 1: Infrastructure, linear chain topology builder, latency + throughput measurement drivers, reporting (ASCII/JSON), 7 benchmark tests~~ ✅ Done | — | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.1 |
+| DAG-B2 | Session 2: Wide DAG + fan-out tree topology builders; 7 latency + throughput tests | 1–2d | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.2 |
+| DAG-B3 | Session 3: Diamond + mixed topology builders; 5 latency + throughput tests; per-level breakdown reporting | 1–2d | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.3 |
+| DAG-B4 | Session 4: Integration (`just test-dag-bench` targets), update `docs/BENCHMARK.md`, full suite validation | 0.5d | [PLAN_DAG_BENCHMARK.md](plans/performance/PLAN_DAG_BENCHMARK.md) §11.4 |
+
+> **DAG topology benchmark subtotal: ~3–5 days (Session 1 complete)**
+
 ### Developer Tooling & Observability Functions (from REPORT_OVERALL_STATUS.md §15)
 
 > **In plain terms:** pg_trickle's diagnostic toolbox today is limited to
@@ -2334,6 +2352,8 @@ large design changes; all build on existing infrastructure.
 - [ ] Fuse triggers on configurable change-count threshold; `reset_fuse()` recovers *(skip if FUSE-1–6 shipped in v0.11.0)*
 - [ ] EC01B: No phantom-row drop for ≥3-scan right-subtree joins; TPC-H Q7/Q8/Q9 DELETE regression tests pass
 - [ ] BENCH-W: Write-side overhead benchmarks published in `docs/BENCHMARK.md`; `change_buffer_unlogged` GUC implemented if WAL overhead > 30% of trigger cost
+- [x] DAG-B1: DAG topology benchmark infrastructure + linear chain benchmarks (Session 1) ✅
+- [ ] DAG-B2–B4: Wide DAG, fan-out, diamond, mixed topology benchmarks; `docs/BENCHMARK.md` updated
 - [ ] SQLANCER: Crash-test oracle + equivalence oracle running in weekly CI job; zero correctness mismatches on known test corpus
 - [ ] PROP-5+6: Topology stress and DAG/scheduler helper property tests pass
 - [ ] D-2 spike: prototype exists; SPI-in-commit-callback constraint validated; RFC written
