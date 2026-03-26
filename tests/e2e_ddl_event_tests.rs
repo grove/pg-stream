@@ -94,8 +94,12 @@ async fn test_alter_source_fires_event_trigger() {
     .await;
 
     // ALTER the source table — event trigger should fire
-    db.execute("ALTER TABLE evt_alter_src ADD COLUMN extra INT")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE evt_alter_src ADD COLUMN extra INT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     // ST should still be queryable (the added column isn't part of the defining query)
     let count = db.count("public.evt_alter_st").await;
@@ -317,8 +321,12 @@ async fn test_add_column_on_source_st_still_functional() {
     .await;
 
     // Add a column that is NOT in the defining query
-    db.execute("ALTER TABLE ddl_add_src ADD COLUMN extra TEXT")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE ddl_add_src ADD COLUMN extra TEXT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     // After the column change, the ST should still be refreshable
     db.refresh_st("ddl_add_st").await;
@@ -352,8 +360,12 @@ async fn test_add_column_unused_st_survives_refresh() {
     .await;
 
     // Add column 'b' (not used)
-    db.execute("ALTER TABLE ddl_add2_src ADD COLUMN b INT DEFAULT 0")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE ddl_add2_src ADD COLUMN b INT DEFAULT 0",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
     db.execute("UPDATE ddl_add2_src SET b = 99 WHERE id = 1")
         .await;
     db.refresh_st("ddl_add2_st").await;
@@ -395,8 +407,12 @@ async fn test_drop_unused_column_st_survives() {
     .await;
 
     // Drop the column that is NOT in the defining query
-    db.execute("ALTER TABLE ddl_drop_col_src DROP COLUMN unused")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE ddl_drop_col_src DROP COLUMN unused",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     let status: String = db
         .query_scalar(
@@ -447,8 +463,12 @@ async fn test_alter_column_type_triggers_reinit() {
     .await;
 
     // Change type of 'score' — column is in defining query
-    db.execute("ALTER TABLE ddl_type_src ALTER COLUMN score TYPE BIGINT")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE ddl_type_src ALTER COLUMN score TYPE BIGINT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     let needs_reinit: bool = db
         .query_scalar(
@@ -573,22 +593,32 @@ async fn test_block_source_ddl_guc_prevents_alter() {
     )
     .await;
 
-    // Enable blocking GUC (use ALTER SYSTEM + reload so it applies to all
-    // pool connections, not just the current session which the pool may not
-    // reuse for the next query).
-    db.alter_system_set_and_wait("pg_trickle.block_source_ddl", "true", "on")
-        .await;
-
-    // ALTER on a monitored source should now return an error
+    // The GUC defaults to true (on), so ALTER on a monitored source should
+    // be blocked out of the box.
     let result = db
         .try_execute("ALTER TABLE ddl_block_src ADD COLUMN extra TEXT")
         .await;
     assert!(
         result.is_err(),
-        "ALTER on monitored source should be blocked when block_source_ddl = true"
+        "ALTER on monitored source should be blocked when block_source_ddl = true (default)"
     );
 
-    db.alter_system_reset_and_wait("pg_trickle.block_source_ddl", "off")
+    // Disable blocking GUC (use ALTER SYSTEM + reload so it applies to all
+    // pool connections, not just the current session which the pool may not
+    // reuse for the next query).
+    db.alter_system_set_and_wait("pg_trickle.block_source_ddl", "false", "off")
+        .await;
+
+    // ALTER on a monitored source should now succeed
+    let result = db
+        .try_execute("ALTER TABLE ddl_block_src ADD COLUMN extra TEXT")
+        .await;
+    assert!(
+        result.is_ok(),
+        "ALTER on monitored source should be allowed when block_source_ddl = false"
+    );
+
+    db.alter_system_reset_and_wait("pg_trickle.block_source_ddl", "on")
         .await;
 }
 
@@ -619,8 +649,12 @@ async fn test_add_column_on_joined_source_st_survives() {
     assert_eq!(db.count("public.ddl_nj_st").await, 2);
 
     // ADD COLUMN to one source
-    db.execute("ALTER TABLE ddl_nj_a ADD COLUMN extra TEXT")
-        .await;
+    db.execute_seq(&[
+        "SET pg_trickle.block_source_ddl = false",
+        "ALTER TABLE ddl_nj_a ADD COLUMN extra TEXT",
+        "SET pg_trickle.block_source_ddl = true",
+    ])
+    .await;
 
     let status: String = db
         .query_scalar("SELECT status FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'ddl_nj_st'")

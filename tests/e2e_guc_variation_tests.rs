@@ -122,25 +122,18 @@ async fn test_guc_block_source_ddl_on() {
         .await;
     db.assert_st_matches_query("guc_st", GUC_QUERY).await;
 
-    // Use ALTER SYSTEM + reload so the GUC applies to all pool connections,
-    // not just the current session which the pool may not reuse.
-    db.alter_system_set_and_wait("pg_trickle.block_source_ddl", "true", "on")
-        .await;
-
-    // Column-altering DDL should be blocked
+    // The GUC defaults to true (on), so column-altering DDL should be
+    // blocked out of the box.
     let result = db
         .try_execute("ALTER TABLE guc_src ADD COLUMN new_col TEXT")
         .await;
     assert!(
         result.is_err(),
-        "DDL should be blocked when block_source_ddl=on"
+        "DDL should be blocked when block_source_ddl=on (default)"
     );
 
     // Data DML should still work
     mutate_and_verify(&db).await;
-
-    db.alter_system_reset_and_wait("pg_trickle.block_source_ddl", "off")
-        .await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
