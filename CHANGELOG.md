@@ -8,7 +8,8 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 ## Table of Contents
 
 <!-- TOC start -->
-- [0.11.0 — Unreleased](#0110--unreleased)
+- [0.12.0 — Unreleased](#0120--unreleased)
+- [0.11.0 — 2026-03-26](#0110--2026-03-26)
 - [0.10.0 — 2026-03-25](#0100--2026-03-25)
 - [0.9.0 — 2026-03-20](#090--2026-03-20)
 - [0.8.0 — 2026-03-17](#080--2026-03-17)
@@ -29,71 +30,266 @@ For future plans and release milestones, see [ROADMAP.md](ROADMAP.md).
 
 ---
 
-## [0.11.0] — Unreleased
+## [0.12.0] — Unreleased
 
 ### Added
 
-<!-- 0.11.0 changes go here -->
+<!-- 0.12.0 changes go here -->
 
-- **WAKE-1: Event-driven scheduler wake.** CDC triggers now emit
-  `pg_notify('pgtrickle_wake', '')` after writing to the change buffer. The
-  scheduler LISTENs on the channel and wakes immediately instead of waiting for
-  the full poll interval, reducing median end-to-end latency from ~500 ms to
-  ~15 ms for low-volume workloads (34× improvement). A 10 ms debounce coalesces
-  rapid-fire notifications from bulk DML. Falls back to poll-based wake when
-  `pg_trickle.event_driven_wake = off`. New GUCs: `pg_trickle.event_driven_wake`
-  (default `true`), `pg_trickle.wake_debounce_ms` (default `10`).
+---
 
-- **G12-2: TopK runtime validation.** `execute_topk_refresh()` now re-parses the
-  reconstructed full query on each refresh and verifies LIMIT/OFFSET metadata
-  matches the stored catalog values. On mismatch, falls back to FULL refresh
-  with a `WARNING` instead of silently returning incorrect results.
+## [0.11.0] — 2026-03-26
 
-- **G12-AGG: Group-rescan aggregate warning.** `create_stream_table()` now emits
-  a `WARNING` when DIFFERENTIAL mode is used with group-rescan aggregates
-  (`STRING_AGG`, `ARRAY_AGG`, `JSON_AGG`, etc.) that require full re-aggregation
-  of affected groups on each delta. The `explain_st()` function now includes an
-  `aggregate_strategies` property classifying each aggregate's maintenance
-  strategy (ALGEBRAIC_INVERTIBLE, ALGEBRAIC_VIA_AUX, SEMI_ALGEBRAIC, or
-  GROUP_RESCAN).
+This is the biggest release since the initial launch. The headline features are
+**34× lower latency** for real-time workloads, **stream-table chains that now
+refresh incrementally** (no more forced full recomputation when one stream table
+feeds another), **declarative partitioning** to cut I/O on large tables by up to
+100×, a **ready-to-use Prometheus and Grafana monitoring stack**, and a **circuit
+breaker** to protect production databases from runaway change bursts.
 
-- **G17-EC01B-NEG: EC-01 boundary regression tests.** Unit tests in
-  `join_common.rs` now assert that join subtrees with ≥3 scan nodes fall back
-  to the post-change snapshot (no pre-change EXCEPT ALL). This documents the
-  known EC-01 phantom-row-after-DELETE boundary and prevents accidental
-  regressions before the planned v0.12.0 fix.
+### 34× Lower Latency — Changes Arrive Instantly
 
-- **DAG-3: Delta amplification detection.** After each DIFFERENTIAL refresh, the
-  input→output delta ratio is checked against `pg_trickle.delta_amplification_threshold`
-  (default 100×). When exceeded, a `WARNING` is emitted with the stream table name,
-  input/output counts, computed ratio, and tuning hint. `explain_st()` now exposes
-  `amplification_stats` JSON from the last 20 DIFFERENTIAL refreshes.
+**Previously**, the background worker woke up on a fixed timer every ~500 ms to
+check for new data, even when nothing had changed. Every change had to wait up to
+half a second in the change buffer before being processed.
 
-- **DAG-2: Adaptive poll interval.** The fixed 200 ms parallel dispatch poll is
-  replaced with exponential backoff (20 ms → 200 ms) that resets to 20 ms on
-  worker completion. This makes parallel mode competitive with CALCULATED
-  schedule resolution for cheap refreshes ($T_r \leq 20\text{ms}$), reducing
-  wasted wait time by up to 90% in fast-completing DAGs.
+**Now**, when a source table is modified, the change capture trigger immediately
+wakes the background worker via a PostgreSQL notification channel. The worker
+starts processing within ~15 ms of the write committing — a 34× improvement for
+low-volume workloads. Under heavy DML, a 10 ms debounce window coalesces rapid
+notifications so the worker isn't flooded.
 
-- **DAG-1: Intra-tick pipelining (validated).** The Phase 4 parallel dispatch
-  architecture already achieves intra-tick pipelining via per-dependency
-  `remaining_upstreams` tracking — downstream STs are dispatched in the same
-  tick that their upstream completes, with no level barrier. Validation tests
-  confirm correct cascade and mixed-cost-level behavior.
+Event-driven wake is on by default. You can turn it off
+(`pg_trickle.event_driven_wake = off`) to revert to poll-based wake, and you can
+tune the debounce window with `pg_trickle.wake_debounce_ms` (default `10`).
 
-- **DAG-5: ST buffer batch coalescing.** Before a downstream stream table reads
-  from an upstream ST's change buffer (`changes_pgt_{id}`), net-effect compaction
-  removes redundant INSERT/DELETE pairs for the same `pk_hash` that accumulate
-  during rapid-fire upstream refreshes. Uses the same `compact_threshold` GUC
-  as base-table compaction.
+### Stream-Table-to-Stream-Table Chains Now Refresh Incrementally
 
-- **DAG-4: ST buffer bypass for single-consumer CALCULATED chains.** When a
-  chain of stream tables has single-consumer DIFFERENTIAL dependencies (A→B→C
-  where each has exactly one downstream), the scheduler fuses them into a
-  single `FusedChain` execution unit that runs in the same background worker.
-  Intermediate deltas are captured to temp bypass tables instead of persistent
-  change buffers, eliminating WAL writes, index maintenance, and subsequent
-  buffer cleanup for each hop.
+**Previously**, when stream table B's query read from stream table A, pg_trickle
+had to do a full recomputation of B every time A changed — even if only a few
+rows in A actually changed. For long chains (A → B → C → D), every hop was a
+full re-scan.
+
+**Now**, stream tables can read from other stream tables incrementally. When A
+refreshes, the rows it added and removed are recorded in a change buffer just like
+a base table. B wakes up, reads only the changed rows from A, and applies a delta
+— not a full recomputation. Even when A does a full refresh (e.g. because its
+query does not support differential mode), a before/after snapshot diff is
+captured automatically so downstream tables still receive a small insert/delete
+delta rather than cascading full refreshes through the chain.
+
+### Declaratively Partitioned Stream Tables
+
+Stream tables can now be declared with a partition key:
+
+```sql
+SELECT create_stream_table(
+  'monthly_sales',
+  $$ SELECT month, region, SUM(amount) FROM orders GROUP BY 1, 2 $$,
+  partition_by => 'month'
+);
+```
+
+pg_trickle creates a range-partitioned storage table and, when refreshing,
+automatically restricts the MERGE operation to only the partitions that contain
+changed rows. For large tables where changes touch only 2–3 out of 100 monthly
+partitions, this can reduce the MERGE I/O from 10 million rows to ~100,000 — a
+100× improvement.
+
+### Ready-to-Use Prometheus and Grafana Monitoring
+
+A complete observability stack is now included in the `monitoring/` directory:
+
+- **`monitoring/prometheus/pg_trickle_queries.yml`** — drop-in configuration for
+  `postgres_exporter` that exports 14 metrics covering refresh performance,
+  CDC buffer sizes, staleness, error rates, and per-table status.
+- **`monitoring/prometheus/alerts.yml`** — 8 alerting rules that page you when a
+  stream table goes stale (> 5 min), starts error-looping (≥ 3 consecutive
+  failures), is suspended, or when the CDC buffer exceeds 1 GB.
+- **`monitoring/grafana/dashboards/pg_trickle_overview.json`** — a pre-built
+  Grafana dashboard with six sections: cluster overview, refresh latency
+  time-series, staleness heatmap, CDC lag, per-table drill-down, and scheduler
+  health.
+- **`monitoring/docker-compose.yml`** — brings up PostgreSQL + pg_trickle +
+  postgres_exporter + Prometheus + Grafana with one command
+  (`docker compose up`). Grafana opens at http://localhost:3000 with live demo
+  data already populated.
+
+No code changes are needed to use this stack with an existing pg_trickle
+installation.
+
+### Circuit Breaker (Fuse) — Protection Against Runaway Change Bursts
+
+A new circuit breaker mechanism halts refresh for a stream table when its pending
+change count exceeds a configurable threshold. This protects your database from
+accidental mass-delete scripts, runaway migrations, or data imports that would
+otherwise trigger an unexpectedly large and expensive refresh operation.
+
+When the fuse blows, pg_trickle sends a `pgtrickle_alert` PostgreSQL notification
+that you can subscribe to, and suspends the affected stream table. You then choose
+how to recover using `reset_fuse()`:
+
+- `reset_fuse(name, action => 'apply')` — process the backlog normally (default).
+- `reset_fuse(name, action => 'reinitialize')` — clear the change buffer and
+  repopulate the stream table from scratch.
+- `reset_fuse(name, action => 'skip_changes')` — discard the pending changes and
+  resume without reprocessing them.
+
+Configure per-table with `alter_stream_table(fuse => 'on', fuse_ceiling => 10000)`
+or set a global default with `pg_trickle.fuse_default_ceiling`. Use
+`fuse_status()` to inspect the blown/active state of all stream tables at once.
+
+### Wider Column Bitmask — No More 63-Column Limit
+
+pg_trickle's change capture tracks which columns were actually modified in each
+row so that stream tables that reference only a subset of columns can ignore
+irrelevant updates. Previously, this optimization silently stopped working for
+source tables with more than 63 columns — all updates were treated as touching
+every column.
+
+The bitmask has been extended from a 64-bit integer to an arbitrary-width
+PostgreSQL `VARBIT` value, removing the column count cap entirely. Existing
+deployments are migrated automatically (the old column value becomes `NULL`,
+which the filter treats conservatively — no rows are silently dropped). Tables
+with fewer than 64 columns are unaffected at the data level.
+
+### Per-Database Worker Quotas
+
+In multi-tenant environments where multiple databases share a single PostgreSQL
+instance, all stream-table refresh workers previously competed for the same
+concurrency pool. A single busy database could crowd out others.
+
+A new GUC `pg_trickle.per_database_worker_quota` sets a soft concurrency limit
+per database. When the rest of the cluster is lightly loaded (< 80% of available
+capacity in use), a database can burst to 150% of its quota. When the cluster is
+busy, each database is held to its base quota.
+
+Refresh work is also now dispatched in priority order:
+IMMEDIATE mode tables → atomic diamond groups → singleton tables.
+
+### DAG Scheduling Performance
+
+For deployments with chains of stream tables (A → B → C), several improvements
+reduce end-to-end propagation latency:
+
+- **Fused single-consumer chains.** When a stream table chain has exactly one
+  downstream consumer at each hop, the scheduler fuses the chain into a single
+  execution unit in one background worker. Intermediate deltas are stored in
+  temporary in-memory tables instead of persistent change buffers, eliminating
+  the WAL writes, index maintenance, and cleanup that would normally occur at
+  each hop.
+- **Batch coalescing.** Before a downstream table reads from an upstream change
+  buffer, redundant insert/delete pairs for the same row are cancelled out. This
+  prevents rapid-fire upstream refreshes from accumulating duplicate work for
+  downstream tables.
+- **Adaptive dispatch polling.** The parallel dispatch loop now backs off
+  exponentially (20 ms → 200 ms) instead of using a fixed 200 ms poll, and
+  resets to 20 ms as soon as any worker finishes. Cheap refreshes no longer
+  wait a full 200 ms for the next tick.
+- **Delta amplification warnings.** When a differential refresh produces many
+  more output rows than input rows (default threshold: 100×), a `WARNING` is
+  emitted with the table name, input and output counts, and a tuning hint.
+  `explain_st()` now exposes `amplification_stats` from the last 20 refreshes.
+
+### Smarter Diagnostics and Warnings
+
+Several improvements to make problems visible earlier and easier to diagnose:
+
+- **Know which refresh mode is actually running.** When a stream table is set to
+  `AUTO`, pg_trickle now records which mode it actually chose at each refresh
+  (`DIFFERENTIAL`, `FULL`, etc.) in a new `effective_refresh_mode` column on
+  `pgt_stream_tables`. A new `explain_refresh_mode(name)` function reports the
+  configured mode, the actual mode used, and the reason for any downgrade — all
+  in one query.
+- **Clearer warning when a stream table falls back to full refresh.** If a stream
+  table cannot use differential mode, pg_trickle now emits a `WARNING` message
+  naming the affected table and the reason. Previously this happened silently.
+- **Warning when using aggregates that require full group rescans.** Aggregate
+  functions like `STRING_AGG`, `ARRAY_AGG`, and `JSON_AGG` require re-aggregating
+  the entire group whenever any member changes. pg_trickle now warns at stream
+  table creation time when such aggregates are used in `DIFFERENTIAL` mode, and
+  `explain_st()` classifies each aggregate's maintenance strategy
+  (incremental, auxiliary-state, or group-rescan) so you can understand the cost.
+- **Better error messages.** Errors for unsupported query patterns, cycle
+  detection, upstream schema changes, and query parse failures now include a
+  `DETAIL` field explaining what went wrong and a `HINT` field suggesting how to
+  fix it.
+- **Invalid parameter combinations are rejected at creation time.** For example,
+  using `diamond_schedule_policy='slowest'` without `diamond_consistency='atomic'`
+  now produces a clear error at `create_stream_table` / `alter_stream_table` time
+  rather than silently doing the wrong thing at refresh time.
+- **TopK queries validate their metadata on every refresh.** Stream tables defined
+  with `ORDER BY ... LIMIT N` now recheck that the stored LIMIT/OFFSET metadata
+  still matches the actual query on each refresh. On mismatch, they fall back to
+  a full refresh with a `WARNING` rather than silently producing wrong results.
+
+### Safety and Reliability Improvements
+
+- **No more crashes from schema changes.** If a source table's schema changes
+  while a refresh is running (e.g. a column is dropped), pg_trickle now catches
+  the error, emits a structured `WARNING` with the table name and error details,
+  and continues refreshing all other stream tables. The scheduler never crashes
+  due to an individual table's error.
+- **Failure injection tests.** New end-to-end tests deliberately drop columns and
+  tables mid-refresh to verify that the scheduler stays alive and other stream
+  tables continue processing correctly.
+- **Safer defaults.** Three default settings have been updated to reflect
+  production-safe behavior:
+  - `parallel_refresh_mode` now defaults to `'on'` (was `'off'`). Parallel
+    refresh has been stable for several releases; serial mode is now opt-in.
+  - `block_source_ddl` now defaults to `true`. Accidental `ALTER TABLE` on a
+    source table while a stream table depends on it is now blocked by default,
+    with clear instructions on how to temporarily disable the guard if needed.
+  - The invalidation ring capacity has been doubled from 32 to 128 slots,
+    reducing the risk of invalidation events being silently discarded under
+    rapid DDL.
+
+### Getting Started Guide Restructured
+
+`docs/GETTING_STARTED.md` has been reorganised into five progressive chapters:
+
+1. **Hello World** — create your first stream table and watch it update.
+2. **Joins, Aggregates & Chains** — multi-table dependencies and DAG patterns.
+3. **Scheduling & Backpressure** — controlling refresh frequency and auto-backoff.
+4. **Monitoring In Depth** — using the five key diagnostic functions and the
+   Prometheus/Grafana stack.
+5. **Advanced Topics** — FUSE circuit breaker, partitioned stream tables,
+   IMMEDIATE (in-transaction) IVM, and multi-tenant worker quotas.
+
+### TPC-H Correctness Gate Added to CI
+
+Five queries derived from the TPC-H benchmark — covering single-table
+GROUP BY, filter-aggregate, CASE WHEN inside SUM, a three-way join, and LEFT
+OUTER JOIN with GROUP BY — now run in DIFFERENTIAL mode on every push to `main`
+and daily. Any correctness mismatch between pg_trickle's incremental output and
+plain PostgreSQL execution fails the CI build automatically.
+
+### Docker Hub Image Improvements
+
+The `Dockerfile.hub` image that is published to Docker Hub has been expanded
+with a comprehensive set of GUC defaults fine-tuned for production use. A new
+`just build-hub-image` recipe builds the image locally for testing.
+
+### Bug Fixes
+
+- **Scheduler crash after event-driven wake was enabled.** The background worker
+  crashed immediately after startup when `event_driven_wake = on` (the default)
+  because the `LISTEN` command was being issued outside of a transaction. Fixed
+  by issuing `LISTEN` inside a short-lived SPI transaction at startup.
+  (#296)
+- **Spurious full refresh for non-recursive CTEs.** Stream tables containing
+  `WITH` clauses that were not recursive (`WITH foo AS (SELECT ...)`) were being
+  incorrectly forced to FULL refresh mode. Only truly recursive CTEs
+  (`WITH RECURSIVE`) require this. Non-recursive CTEs now correctly use
+  differential mode. (#298)
+- **`DISTINCT ON` inside a CTE body caused a parse error.** When a stream table's
+  defining query contained a `WITH` clause whose body used `DISTINCT ON (...)`,
+  the DVM query analyser failed with a parse error. The `DISTINCT ON` clause is
+  now rewritten before analysis so it no longer interferes. (#300)
+- **Full-refresh fallback warning now names the affected table.** When pg_trickle
+  falls back from differential to full refresh, the emitted `WARNING` now
+  includes the stream table name and the reason, making it straightforward to
+  identify which table you need to investigate. (#301)
 
 ---
 

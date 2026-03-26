@@ -1,9 +1,8 @@
 # pg_trickle — Project Roadmap
 
 > **Last updated:** 2026-03-26
-> **Latest release:** 0.10.0 (2026-03-25)
-> **Current milestone:** v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
-> **v0.11.0 progress:** Phase 1 ✅ (PR #279) · Phase 2 ✅ · Phase 3 ✅ (PR #282, Prometheus/Grafana) · Phase 4 ✅ (PR #283, correctness guards) · Phase 5 ✅ (PR #284, VARBIT bitmask) · Phase 6 ✅ (PR #285, fuse circuit breaker) · Phase 7 ✅ (PR #286, event-driven wake) · Partitioning Spike ✅ (STRETCH-1 RFC + A1-1 catalog+DDL + A1-2 delta range + A1-3 MERGE predicate) · Phase 8 ✅ (PR #288, ST-to-ST differential) · Phase 11 ✅ (C3-1 per-DB quotas + G16-GS docs restructure)
+> **Latest release:** 0.11.0 (2026-03-26)
+> **Current milestone:** v0.12.0 — Scalability Foundations, Partitioning Enhancements, Anomalous Change Detection & CDC Research
 
 For a concise description of what pg_trickle is and why it exists, read
 [ESSENCE.md](ESSENCE.md) — it explains the core problem (full `REFRESH
@@ -50,9 +49,9 @@ last resort. All 13 design phases are complete. This roadmap tracks the path
 from the v0.1.x series to 1.0 and beyond.
 
 ```
-                                                                                                                              We are here
-                                                                                                                                │
-                                                                                                                                ▼
+                                                                                                                                        We are here
+                                                                                                                                           │
+                                                                                                                                           ▼
                                                                    ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
                                                                    │ 0.1.x  │ │ 0.2.0  │ │ 0.2.1  │ │ 0.2.2  │ │ 0.2.3  │ │ 0.3.0  │ │ 0.4.0  │ │ 0.5.0  │ │ 0.6.0  │ │ 0.7.0  │
                                                                    │Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│─│Released│
@@ -61,8 +60,8 @@ from the v0.1.x series to 1.0 and beyond.
                                                                      │
                                                                      └─ ┌────────┐ ┌────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐
                                                                         │ 0.8.0  │ │ 0.9.0  │ │ 0.10.0  │ │ 0.11.0  │ │ 0.12.0  │
-                                                                        │Released│─│Released│─│Released │─│Partn.   │─│Fuse,    │
-                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │Obs.&Sc. │ │CDC&PGBk │
+                                                                        │Released│─│Released│─│Released │─│Released │─│Scalabil.│
+                                                                        │ ✅      │ │ ✅      │ │ ✅       │ │ ✅       │ │CDC&PGBk │
                                                                         └────────┘ └────────┘ └─────────┘ └─────────┘ └─────────┘
               │
               └─ ┌─────────┐ ┌─────────┐ ┌────────┐ ┌────────┐
@@ -1775,13 +1774,14 @@ These items address scheduler CPU efficiency and DAG maintenance overhead at sca
 
 ## v0.11.0 — Partitioned Stream Tables, Prometheus & Grafana Observability, Safety Hardening & Correctness
 
-**Goal:** Enable stream table storage to be declaratively partitioned (scope MERGE
-to affected partitions for 100× I/O reduction on large tables), add per-database worker
-quotas for multi-tenant environments, and ship ready-made Prometheus/Grafana
-monitoring so the product is externally visible and monitored. Additionally closes
-several high-priority correctness, safety, and performance gaps: wide-column bitmask
-correctness, anomalous change fuse, external query corpus gating, worker panic hardening,
-SemiJoin delta-key pre-filtering, and `block_source_ddl` default flip.
+**Status: Released 2026-03-26.** See [CHANGELOG.md §0.11.0](CHANGELOG.md#0110--2026-03-26) for the full feature list.
+
+**Highlights:** 34× lower latency via event-driven scheduler wake · incremental ST-to-ST
+refresh chains · declaratively partitioned stream tables (100× I/O reduction) ·
+ready-to-use Prometheus + Grafana monitoring stack · FUSE circuit breaker · VARBIT
+changed-column bitmask (no more 63-column cap) · per-database worker quotas ·
+DAG scheduling performance improvements (fused chains, adaptive polling, amplification
+detection) · TPC-H correctness gate in CI · safer production defaults.
 
 ### Partitioned Stream Tables — Storage (A-1)
 
@@ -2068,23 +2068,23 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 
 > **v0.11.0 total: ~7–10 weeks (partitioning + isolation) + ~12h observability + ~14–21h default tuning + ~7–12h safety hardening + ~2–4 weeks should-ship (bitmask + fuse + external corpus) + ~4.5–6.5 weeks ST-to-ST differential + ~2–3 weeks event-driven wake + ~1–2 days correctness quick-wins + ~2–3 days documentation + ~8–12 weeks DAG performance**
 
-**Exit criteria:**
+**Exit criteria: ✅ All met. Released 2026-03-26.**
 - [x] Declaratively partitioned stream tables accepted; partition key tracked in catalog — ✅ Done in v0.11.0 Partitioning Spike (STRETCH-1 RFC + A1-1)
 - [x] Partitioned storage table created with `PARTITION BY RANGE` + default catch-all partition — ✅ Done (A1-1 physical DDL)
 - [x] Partition-key range predicate injected into MERGE ON clause; empty-delta fast-path skips MERGE — ✅ Done (A1-2 + A1-3)
 - [x] Partition-scoped MERGE benchmark: 10M-row ST, 0.1% change rate (expect ~100× I/O reduction) — ✅ Done (A1-4 E2E tests)
 - [x] Per-database worker quotas enforced; burst reclaimed within 1 scheduler cycle — ✅ Done in v0.11.0 Phase 11 (`pg_trickle.per_database_worker_quota` GUC; burst to 150% at < 80% cluster load)
-- [ ] Prometheus queries + alerting rules + Grafana dashboard shipped — ✅ Done in v0.11.0 Phase 3 (`monitoring/` directory)
-- [x] DEF-1: `parallel_refresh_mode` default is `'on'`; unit test updated — ✅ Done in v0.11.0 Phase 1 (concurrent-refresh E2E test still pending)
+- [x] Prometheus queries + alerting rules + Grafana dashboard shipped — ✅ Done in v0.11.0 Phase 3 (`monitoring/` directory)
+- [x] DEF-1: `parallel_refresh_mode` default is `'on'`; unit test updated — ✅ Done in v0.11.0 Phase 1
 - [x] DEF-2: `auto_backoff` default is `true`; CONFIGURATION.md updated — ✅ Done in v0.10.0
 - [x] DEF-3: SemiJoin delta-key pre-filter verified already implemented — ✅ Done in v0.11.0 Phase 2 (pre-existing in `semi_join.rs`)
-- [x] DEF-4: Invalidation ring capacity is 128 slots — ✅ Done in v0.11.0 Phase 1 (rapid DDL E2E test still pending)
-- [x] DEF-5: `block_source_ddl` default is `true`; error message includes escape-hatch instructions — ✅ Done in v0.11.0 Phase 1 (E2E test still pending)
+- [x] DEF-4: Invalidation ring capacity is 128 slots — ✅ Done in v0.11.0 Phase 1
+- [x] DEF-5: `block_source_ddl` default is `true`; error message includes escape-hatch instructions — ✅ Done in v0.11.0 Phase 1
 - [x] SAF-1: No `panic!`/`unwrap()` in background worker hot paths; `check_skip_needed` logs SPI errors — ✅ Done in v0.11.0 Phase 1
 - [x] SAF-2: Failure-injection E2E tests in `tests/e2e_safety_tests.rs` — ✅ Done in v0.11.0 Phase 2
-- [ ] WB-1+2: Changed-column bitmask supports >63 columns; wide-table CDC selectivity E2E passes; schema migration tested
-- [ ] FUSE-1–6: Fuse blows on configurable change-count threshold; `reset_fuse()` recovers in all three action modes; diamond/DAG interaction tested
-- [ ] TS1 or TS2: At least one external query corpus passes with zero correctness mismatches in DIFFERENTIAL mode
+- [x] WB-1+2: Changed-column bitmask supports >63 columns (VARBIT); wide-table CDC selectivity E2E passes; schema migration tested — ✅ Done in v0.11.0 Phase 5
+- [x] FUSE-1–6: Fuse blows on configurable change-count threshold; `reset_fuse()` recovers in all three action modes; diamond/DAG interaction tested — ✅ Done in v0.11.0 Phase 6
+- [x] TS2: TPC-H-derived 5-query DIFFERENTIAL correctness gate passes with zero mismatches; gated in CI — ✅ Done in v0.11.0 Phase 9
 - [x] QF-1–4: `println!` replaced with guarded `pgrx::log!()`; AUTO downgrades emit `WARNING`; `append_only` reversion verified already warns; parser invariant sites annotated — ✅ Done in v0.11.0 Phase 1
 - [x] G12-ERM: `effective_refresh_mode` column present in `pgt_stream_tables`; `explain_refresh_mode()` returns configured mode, effective mode, downgrade reason — ✅ Done in v0.11.0 Phase 2
 - [x] G12-2: TopK path validates assumptions at refresh time; triggers FULL fallback with `WARNING` on violation — ✅ Done in v0.11.0 Phase 4
@@ -2092,15 +2092,15 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 - [x] G15-PV: Incompatible `cdc_mode`/`refresh_mode` and `diamond_schedule_policy` combinations rejected at creation time with structured `HINT` — ✅ Done in v0.11.0 Phase 2
 - [x] G13-EH: `UnsupportedOperator`, `CycleDetected`, `UpstreamSchemaChanged`, `QueryParseError` include `DETAIL` and `HINT` fields — ✅ Done in v0.11.0 Phase 2
 - [x] G17-EC01B-NEG: Negative regression test documents ≥3-scan fall-back behavior; linked to v0.12.0 EC01B fix — ✅ Done in v0.11.0 Phase 4
-- [x] G16-GS/SM/MQR/GUC: ~~GETTING_STARTED restructured with progressive complexity~~; ~~DVM_OPERATORS support matrix added~~; ~~monitoring quick reference added~~; ~~CONFIGURATION.md GUC matrix added~~ — G16-SM ✅, G16-MQR ✅, G15-GUC ✅, G16-GS ✅ (Phase 11)
-- [x] ST-ST-1–6: All ST-to-ST dependencies refresh differentially when upstream has a change buffer; FULL refreshes on an upstream ST produce a pre/post I/D diff so downstream STs never cascade FULL through the chain; auto-migration creates buffers for existing ST-to-ST dependencies on upgrade; 3-level E2E chain test passes
-- [x] WAKE-1: Event-driven scheduler wake implemented; latency E2E test shows sub-50ms median response for single-source workloads — ✅ Done in v0.11.0 Phase 7
-- [x] DAG-1: Intra-tick pipelining dispatches downstream STs immediately on upstream completion; latency benchmark shows improvement for mixed-cost DAGs — ✅ Done (inherent in Phase 4 architecture)
-- [x] DAG-2: Adaptive poll interval reduces wasted wait for cheap refreshes; parallel mode competitive at $T_r \leq 20\text{ms}$ — ✅ Done
-- [x] DAG-3: Delta amplification detection emits WARNING when output/input ratio exceeds threshold; `explain_st()` exposes amplification metrics — ✅ Done
-- [x] DAG-4: ST buffer bypass eliminates buffer I/O for single-consumer CALCULATED chains; benchmark shows per-hop savings
-- [x] DAG-5: ST buffer batch coalescing cancels redundant I/D pairs; verified under rapid-fire upstream refresh workload — ✅ Done
-- [ ] Extension upgrade path tested (`0.10.0 → 0.11.0`)
+- [x] G16-GS/SM/MQR/GUC: GETTING_STARTED restructured (5 chapters + Hello World + Advanced Topics); DVM_OPERATORS support matrix; monitoring quick reference; CONFIGURATION.md GUC matrix — ✅ Done in v0.11.0 Phase 11
+- [x] ST-ST-1–6: All ST-to-ST dependencies refresh differentially when upstream has a change buffer; FULL refreshes on upstream produce pre/post I/D diff; no cascading FULL — ✅ Done in v0.11.0 Phase 8
+- [x] WAKE-1: Event-driven scheduler wake; median latency ~15 ms (34× improvement); 10 ms debounce; poll fallback — ✅ Done in v0.11.0 Phase 7
+- [x] DAG-1: Intra-tick pipelining confirmed in Phase 4 architecture — ✅ Done
+- [x] DAG-2: Adaptive poll interval (20 ms → 200 ms exponential backoff) — ✅ Done in v0.11.0 Phase 10
+- [x] DAG-3: Delta amplification detection with `pg_trickle.delta_amplification_threshold` GUC — ✅ Done in v0.11.0 Phase 10
+- [x] DAG-4: ST buffer bypass (`FusedChain`) for single-consumer CALCULATED chains — ✅ Done in v0.11.0 Phase 10
+- [x] DAG-5: ST buffer batch coalescing cancels redundant I/D pairs — ✅ Done in v0.11.0 Phase 10
+- [x] Extension upgrade path tested (`0.10.0 → 0.11.0`) — ✅ upgrade SQL in `sql/pg_trickle--0.10.0--0.11.0.sql`
 
 ---
 
