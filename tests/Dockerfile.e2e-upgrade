@@ -42,14 +42,19 @@ LABEL org.opencontainers.image.description="PostgreSQL 18.3 with pg_trickle for 
 # NOTE: We save the pgrx-generated install SQL for TO_VERSION before this
 # COPY overwrites it, then restore it afterward. The archive copy of the
 # current version lags behind pgrx output and would silently drop columns.
+# When TO_VERSION is an old release (e.g. upgrading 0.2.2→0.2.3 where the
+# base image has 0.11.0), the file won't exist — the archive provides it.
 RUN cp /usr/share/postgresql/18/extension/pg_trickle--${TO_VERSION}.sql \
-       /tmp/pg_trickle--current.sql
+       /tmp/pg_trickle--current.sql 2>/dev/null || true
 COPY sql/archive/pg_trickle--*.sql \
      /usr/share/postgresql/18/extension/
-# Restore the authoritative pgrx-generated SQL for the current version.
-RUN cp /tmp/pg_trickle--current.sql \
-       /usr/share/postgresql/18/extension/pg_trickle--${TO_VERSION}.sql && \
-    rm /tmp/pg_trickle--current.sql
+# Restore the authoritative pgrx-generated SQL for the current version only
+# if it was saved above (i.e. when TO_VERSION is the current release).
+RUN if [ -f /tmp/pg_trickle--current.sql ]; then \
+      cp /tmp/pg_trickle--current.sql \
+         /usr/share/postgresql/18/extension/pg_trickle--${TO_VERSION}.sql && \
+      rm /tmp/pg_trickle--current.sql; \
+    fi
 
 # Copy ALL upgrade scripts so PostgreSQL can automatically chain through
 # intermediate versions (e.g. 0.1.3→0.2.0→0.2.1→0.2.2 via BFS path-finding).
