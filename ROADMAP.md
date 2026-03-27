@@ -2109,8 +2109,9 @@ Deliver **one** of TS1 or TS2; whichever is completed first meets the exit crite
 **Goal:** Deliver scalability foundations that directly serve the project's
 performance and throughput goals — columnar change tracking for 50–90%
 delta-volume reduction and shared change buffers for multi-ST deployments.
-Also land the anomalous change fuse, conduct the D-2 CDC research spike,
-and ship developer tooling and correctness improvements.
+Also land the anomalous change fuse and ship developer tooling and correctness
+improvements. PG 16/17 backward compatibility and the D-2 async CDC research
+spike are **deferred to v0.13.0** and the post-1.0 research backlog respectively.
 
 ### Anomalous Change Detection (Fuse)
 
@@ -2336,10 +2337,8 @@ large design changes; all build on existing infrastructure.
 - [ ] BENCH-W: Write-side overhead benchmarks published in `docs/BENCHMARK.md`; `change_buffer_unlogged` GUC implemented if WAL overhead > 30% of trigger cost
 - [ ] SQLANCER: Crash-test oracle + equivalence oracle running in weekly CI job; zero correctness mismatches on known test corpus
 - [ ] PROP-5+6: Topology stress and DAG/scheduler helper property tests pass
-- [ ] D-2 spike: prototype exists; SPI-in-commit-callback constraint validated; RFC written
-- [ ] PG 16 and PG 17 pass full E2E suite (trigger CDC mode)
-- [ ] WAL decoder validated against PG 16–17 `pgoutput` format
-- [ ] CI matrix covers PG 16, 17, 18
+- [x] ~~D-2 spike~~ ➡️ Deferred to post-1.0 research backlog (SPI-in-change-callback infeasibility; Very High risk; no production code until a separate feasibility study produces an RFC)
+- [x] ~~PG 16/17 backward compatibility~~ ➡️ Deferred to v0.13.0 (BC1–BC5)
 - [ ] PERF-2: `buffer_partitioning = 'auto'` implemented; auto-promote benchmark passes
 - [ ] PERF-3: `tiered_scheduling` default is `true`; CONFIGURATION.md documents tier thresholds
 - [x] ~~PERF-4: `block_source_ddl` default is `true`~~ ➡️ Pulled to v0.11.0 as DEF-5
@@ -2355,6 +2354,8 @@ large design changes; all build on existing infrastructure.
 - [ ] A1-1d: LIST partitioning creates `PARTITION BY LIST` storage; IN-list predicate confirmed via `EXPLAIN`
 - [ ] A1-3b: HASH partitioning uses per-partition MERGE loop; only affected child partitions are targeted
 - [ ] PART-WARN: `WARNING` emitted when default partition has rows after refresh
+- [ ] `docs/UPGRADING.md` updated with v0.11.0→v0.12.0 migration notes and supported upgrade chain
+- [ ] `scripts/check_upgrade_completeness.sh` passes (all catalog changes in `sql/pg_trickle--0.11.0--0.12.0.sql`)
 - [ ] Extension upgrade path tested (`0.11.0 → 0.12.0`)
 
 ---

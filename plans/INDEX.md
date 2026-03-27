@@ -12,6 +12,7 @@ new entries when creating documents.
 | File | Type | Status | Summary |
 |------|------|--------|---------|
 | [PLAN.md](PLAN.md) | PLAN | — | Master implementation plan (Phases 0–12) |
+| [PLAN_0_12_0.md](PLAN_0_12_0.md) | PLAN | In progress | v0.12.0 implementation order (Phases 1–7) |
 | [PLAN_EDGE_CASES.md](PLAN_EDGE_CASES.md) | PLAN | Proposed | Edge case catalogue with workarounds & prioritised remediation |
 | [PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md](PLAN_EDGE_CASES_TIVM_IMPL_ORDER.md) | PLAN | Proposed | Combined implementation order for PLAN_EDGE_CASES + PLAN_TRANSACTIONAL_IVM_PART_2 |
 | [PLAN_FEATURE_CLEANUP.md](PLAN_FEATURE_CLEANUP.md) | PLAN | In progress | Remove low-value surface before public release |
